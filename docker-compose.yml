@@ -1,0 +1,32 @@
+version: "3"
+services:
+  backend-monolith:
+    container_name: RbsBackendMonolith
+    image: backend-monolith
+    build: ./backends/monolith
+    volumes:
+      - ./backends/monolith:/app-backend
+    restart: always
+
+  frontend-web:
+    container_name: RbsFrontendWeb
+    image: frontend-web
+    build: ./frontends/web
+    ports:
+      - 3403:3403
+    volumes:
+      - ./frontends/web:/app-frontend
+    depends_on:
+      - backend-monolith
+    restart: always
+
+  nginx_backend_server:
+    container_name: rbs_nginx_backend_server
+    image: rbs_nginx_backend_server_img
+    build: ./backends/nginx_monolith
+    ports:
+        - 8403:8403
+    depends_on:
+        - backend-monolith
+    restart: always
+
