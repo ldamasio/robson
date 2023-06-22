@@ -7,8 +7,6 @@ from django.http import JsonResponse, HttpResponse
 from binance.client import Client
 from binance import ThreadedWebsocketManager
 
-API_KEY='YrgvYXdB2IqfhNpXSvxtRX0vnCMKnNdg3rxcUAtOfS146brYGdiyKr7x1CkoyfDj'
-SECRET_KEY='OmZS256Ud1j8yo8Lti2UjsKlMtLRlNCId4e8jJEG0i8JbD8SMke7ZfE8gSoLNo70'
 client=Client(API_KEY, SECRET_KEY)
 
 # General Binance Endpoints 
