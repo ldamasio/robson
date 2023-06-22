@@ -6,6 +6,13 @@ from django.shortcuts import render
 from django.http import JsonResponse, HttpResponse
 from binance.client import Client
 from binance import ThreadedWebsocketManager
+from dotenv import load_dotenv
+import os 
+
+load_dotenv()
+
+API_KEY=os.getenv("API_KEY")
+SECRET_KEY=os.getenv("SECRET_KEY")
 
 client=Client(API_KEY, SECRET_KEY)
 
