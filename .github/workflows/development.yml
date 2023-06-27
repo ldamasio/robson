@@ -18,14 +18,15 @@ jobs:
           SSH_PRIVATE_KEY: ${{secrets.SSH_PRIVATE_KEY}}
           SSH_KNOWN_HOSTS: ${{secrets.SSH_KNOWN_HOSTS}}
           SSH_KEY_PATH: ${{ github.workspace }}/../private.key
-      - name: List Server Home
-        shell: bash
-        env:
-          HOST: ${{ secrets.HOST }}
+      - name: Executing remote command
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST }}
           USERNAME: ${{ secrets.USERNAME }}
-        run: |
-          ssh -i $SSH_KEY_PATH $USERNAME@$HOST
-          ls ~
+          PORT: ${{ secrets.PORT }}
+          KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd ~
+            ls
+            echo "Deploy finalizado"
 
-
-        
