@@ -3,7 +3,18 @@ import React from 'react'
 function Position() {
   return(
     <div>
-      Ps
+      <div>
+        Position Name
+        {/* <PositionName /> */}
+      </div>
+      <div>
+        Buyer Side
+        {/* <PositionNow /> */}
+      </div>
+      <div>
+        Target
+        {/* <TargetNow /> */}
+      </div>
     </div>
   )
 }
