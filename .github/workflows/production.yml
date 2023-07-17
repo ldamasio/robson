@@ -7,8 +7,8 @@ jobs:
   build:
     runs-on: ubuntu-latest
     steps:
+
       - name: Create ssh key
-        uses: actions/checkout@v3
         shell: bash
         env:
           SSH_PRIVATE_KEY: ${{secrets.SSH_PRIVATE_KEY}}
@@ -19,6 +19,8 @@ jobs:
           echo "$SSH_PRIVATE_KEY" > ../private.key
           sudo chmod 600 ../private.key
           echo "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+
+      - uses: actions/checkout@v3
       - name: Copy file via ssh key
         uses: appleboy/scp-action@v0.1.4
         with:
@@ -28,6 +30,7 @@ jobs:
           port: ${{ secrets.PORT }}
           source: "README.md,LICENSE,main.c,.gitignore,.github,docker-compose.yml,frontends,backends"
           target: ~/apps/rbs/src
+
       - name: Executing docker-compose remote script
         uses: appleboy/ssh-action@master
         with:
@@ -37,5 +40,5 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
             cd ~/apps/rbs/src"
-            docker-compose up -d --build
+            sudo docker-compose up -d --build
             echo "Deploy finalizado"
