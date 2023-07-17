@@ -20,16 +20,29 @@ jobs:
           sudo chmod 600 ../private.key
           echo "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
 
-      - name: Executing remote command
-        uses: appleboy/ssh-action@master
-        env:
-          APP_PATH: ${{ secrets.APP_PATH }}
+      - uses: actions/checkout@v3
+      - name: copy file via ssh password
+        uses: appleboy/scp-action@v0.1.4
         with:
-          HOST: ${{ secrets.HOST }}
-          USERNAME: ${{ secrets.USERNAME }}
-          PORT: ${{ secrets.PORT }}
-          KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          script: |
-            scp . "${USERNAME}@${HOST}:~/apps/rbs/src"
-            ls -la ~/apps/rbs/src
-            echo "Deploy finalizado"
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          port: ${{ secrets.PORT }}
+          source: "frontends/web,backends/monolith"
+          target: ~/apps/rbs/src
+
+
+
+      # - name: Executing remote command
+      #   uses: appleboy/ssh-action@master
+      #   env:
+      #     APP_PATH: ${{ secrets.APP_PATH }}
+      #   with:
+      #     host: ${{ secrets.HOST }}
+      #     username: ${{ secrets.USERNAME }}
+      #     port: ${{ secrets.PORT }}
+      #     key: ${{ secrets.SSH_PRIVATE_KEY }}
+      #     script: |
+      #       scp . "${USERNAME}@${HOST}:~/apps/rbs/src"
+      #       ls -la ~/apps/rbs/src
+      #       echo "Deploy finalizado"
