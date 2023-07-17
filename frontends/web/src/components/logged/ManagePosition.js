@@ -1,24 +1,22 @@
 import React from 'react'
 
-function Trend() {
-  return (
+function ManagePosition() {
+  return(
     <div>
       <div>
-        Trendable Market
+        Position Size: 
         {/* <PositionName /> */}
       </div>
       <div>
-        Direction
+        Close Position
         {/* <PositionNow /> */}
       </div>
       <div>
-        Trend Force
+        Trailing Stop
         {/* <TargetNow /> */}
       </div>
-
-
     </div>
   )
 }
 
-export default Trend
+export default ManagePosition
