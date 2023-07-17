@@ -27,7 +27,7 @@ jobs:
           KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           APP_PATH: ${{ secrets.APP_PATH }}
           script: |
-            cd APP_PATH
+            cd $APP_PATH
             ls
             echo "Deploy finalizado"
 
