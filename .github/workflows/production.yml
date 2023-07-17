@@ -40,5 +40,5 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
             cd ~/apps/rbs/src"
-            sudo docker-compose up -d --build
+            docker-compose up -d --build
             echo "Deploy finalizado"
