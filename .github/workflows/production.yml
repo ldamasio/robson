@@ -39,6 +39,6 @@ jobs:
           port: ${{ secrets.PORT }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            cd ~/apps/rbs/src"
+            cd ~/apps/rbs/src
             docker-compose up -d --build
             echo "Deploy finalizado"
