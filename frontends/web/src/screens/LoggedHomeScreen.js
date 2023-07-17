@@ -30,7 +30,7 @@ function LoggedHomeScreen() {
             <Tab eventKey="1" title="Control Panel">
               <h1>Command Button</h1>
               <CommandButton />
-              <h1>Star new operation</h1>
+              <h1>Start new operation</h1>
               <StartNewOperation />
               <h1>Manage position</h1>
               <ManagePosition />
