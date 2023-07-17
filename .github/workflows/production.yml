@@ -2,10 +2,7 @@ name: Robson Production Pipeline
 on:
   push:
     branches:
-    - master
-  pull_request:
-    branches:
-    - master
+      - master
 jobs:
   build:
     runs-on: ubuntu-latest
