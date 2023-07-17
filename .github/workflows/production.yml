@@ -30,6 +30,6 @@ jobs:
           PORT: ${{ secrets.PORT }}
           KEY: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            cd /app/rbs/src
-            ls -la
+            scp . "${USERNAME}@${HOST}:~/apps/rbs/src"
+            ls -la ~/apps/rbs/src
             echo "Deploy finalizado"
