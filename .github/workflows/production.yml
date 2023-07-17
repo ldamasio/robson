@@ -20,16 +20,31 @@ jobs:
           sudo chmod 600 ../private.key
           echo "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
 
-      - name: Executing remote command
-        uses: appleboy/ssh-action@master
+      - name: Remove old files
+        shell: bash
         env:
-          APP_PATH: ${{ secrets.APP_PATH }}
-        with:
-          HOST: ${{ secrets.HOST }}
-          USERNAME: ${{ secrets.USERNAME }}
-          PORT: ${{ secrets.PORT }}
-          KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          script: |
-            cd /app/rbs/src
-            ls -la
-            echo "Deploy finalizado"
+          SSH_USER: ${{ secrets.USERNAME }}
+          SSH_HOST: ${{ secrets.HOST }}
+          SSH_PATH: ${{ secrets.APP_PATH }}
+        run: ssh
+          -o UserKnownHostsFile=/dev/null
+          -o StrictHostKeyChecking=no
+          -i ../private.key
+          -v
+          "${USERNAME}@${HOST}"
+          "ls -la"
+
+
+      # - name: Executing remote command
+      #   uses: appleboy/ssh-action@master
+      #   env:
+      #     APP_PATH: ${{ secrets.APP_PATH }}
+      #   with:
+      #     HOST: ${{ secrets.HOST }}
+      #     USERNAME: ${{ secrets.USERNAME }}
+      #     PORT: ${{ secrets.PORT }}
+      #     KEY: ${{ secrets.SSH_PRIVATE_KEY }}
+      #     script: |
+      #       cd /app/rbs/src
+      #       ls -la
+      #       echo "Deploy finalizado"
