@@ -20,12 +20,13 @@ jobs:
           SSH_KEY_PATH: ${{ github.workspace }}/../private.key
       - name: Executing remote command
         uses: appleboy/ssh-action@master
+        env:
+          APP_PATH: ${{ secrets.APP_PATH }}
         with:
           HOST: ${{ secrets.HOST }}
           USERNAME: ${{ secrets.USERNAME }}
           PORT: ${{ secrets.PORT }}
           KEY: ${{ secrets.SSH_PRIVATE_KEY }}
-          APP_PATH: ${{ secrets.APP_PATH }}
           script: |
             cd $APP_PATH
             ls
