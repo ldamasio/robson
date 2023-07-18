@@ -20,28 +20,41 @@ function StartNewOperationModal(props) {
             <Col xs={12} md={8}>
               <label>Select Strategy</label>
               <Form.Select size="md">
-                <option>Strategy 0001</option>
+                <option>Strategy 0001 - Rescue Forces</option>
               </Form.Select>
-              <br />
             </Col>
             <Col xs={6} md={4}>
-            <label>Pair</label>
+              <label>Trading Pair</label>
               <Form.Select size="md">
                 <option>BTC/USDT</option>
               </Form.Select>
-              <br />
             </Col>
           </Row>
 
           <Row>
             <Col xs={6} md={4}>
-              Stop Loss
+              <Form.Check // prettier-ignore
+                type="switch"
+                id="custom-switch"
+                label="Stop Loss 1% Capital"
+              />
+              <Form.Check // prettier-ignore
+                type="switch"
+                id="custom-switch"
+                label="Stop Gain 15% Proft"
+              />
             </Col>
             <Col xs={6} md={4}>
-              Stop Gain
+              <label>Time Frame</label>
+              <Form.Select size="md">
+                <option>1h</option>
+              </Form.Select>
             </Col>
             <Col xs={6} md={4}>
-              Position Size
+              <label>Position Size</label>
+              <Form.Select size="md">
+                <option>10%</option>
+              </Form.Select>
             </Col>
           </Row>
         </Container>
