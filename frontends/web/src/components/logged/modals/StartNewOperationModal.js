@@ -4,6 +4,7 @@ import Col from 'react-bootstrap/Col';
 import Container from 'react-bootstrap/Container';
 import Modal from 'react-bootstrap/Modal';
 import Row from 'react-bootstrap/Row';
+import Form from 'react-bootstrap/Form';
 
 function StartNewOperationModal(props) {
   return (
@@ -17,28 +18,36 @@ function StartNewOperationModal(props) {
         <Container>
           <Row>
             <Col xs={12} md={8}>
-              .col-xs-12 .col-md-8
+              <label>Select Strategy</label>
+              <Form.Select size="md">
+                <option>Strategy 0001</option>
+              </Form.Select>
+              <br />
             </Col>
             <Col xs={6} md={4}>
-              .col-xs-6 .col-md-4
+            <label>Pair</label>
+              <Form.Select size="md">
+                <option>BTC/USDT</option>
+              </Form.Select>
+              <br />
             </Col>
           </Row>
 
           <Row>
             <Col xs={6} md={4}>
-              .col-xs-6 .col-md-4
+              Stop Loss
             </Col>
             <Col xs={6} md={4}>
-              .col-xs-6 .col-md-4
+              Stop Gain
             </Col>
             <Col xs={6} md={4}>
-              .col-xs-6 .col-md-4
+              Position Size
             </Col>
           </Row>
         </Container>
       </Modal.Body>
       <Modal.Footer>
-        <Button onClick={props.onHide}>Close</Button>
+        <Button onClick={props.onHide}>Start New Operation</Button>
       </Modal.Footer>
     </Modal>
   );
