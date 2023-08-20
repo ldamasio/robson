@@ -41,3 +41,4 @@ jobs:
           script: |
             cd ~/apps/rbs/src
             docker-compose up -d --build
+
