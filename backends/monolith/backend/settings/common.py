@@ -8,7 +8,7 @@ client=Client(BINANCE_API_KEY_TEST, BINANCE_SECRET_KEY_TEST)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 
-SECRET_KEY = 'django-insecure-2mmpn-2t!ik^g__ixmq3jt0gbel26-faatssu2&9$4m)(xe77^'
+SECRET_KEY = config("SECRET_KEY")
 
 DEBUG = True
 
@@ -59,17 +59,16 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'backend.wsgi.application'
 
-
 # Database
 # https://docs.djangoproject.com/en/4.1/ref/settings/#databases
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql_psycopg2',
-        'NAME': 'rbs',
-        'USER': 'ldamasio',
-        'PASSWORD': 'admin',
-        'HOST': 'leandrodamasio.com.br',
-        'PORT': 5432,
+        'NAME': config("PG_DATABASE"),
+        'USER': config("PG_USER"),
+        'PASSWORD': config("PG_PASSWORD"),
+        'HOST': config("PG_HOST"),
+        'PORT': config("PG_PORT"),
     }
 }
 
@@ -90,7 +89,6 @@ AUTH_PASSWORD_VALIDATORS = [
     },
 ]
 
-
 # Internationalization
 # https://docs.djangoproject.com/en/4.1/topics/i18n/
 
@@ -101,7 +99,6 @@ TIME_ZONE = 'UTC'
 USE_I18N = True
 
 USE_TZ = True
-
 
 # Static files (CSS, JavaScript, Images)
 # https://docs.djangoproject.com/en/4.1/howto/static-files/
