@@ -2,17 +2,15 @@ from pathlib import Path
 from decouple import config
 from binance.client import Client
 
-BINANCE_API_KEY_TEST=config("BINANCE_API_KEY_TEST")
-BINANCE_SECRET_KEY_TEST=config("BINANCE_SECRET_KEY_TEST")
+BINANCE_API_KEY_TEST=config("RBS_BINANCE_API_KEY_TEST")
+BINANCE_SECRET_KEY_TEST=config("RBS_BINANCE_SECRET_KEY_TEST")
 client=Client(BINANCE_API_KEY_TEST, BINANCE_SECRET_KEY_TEST)
 
 BASE_DIR = Path(__file__).resolve().parent.parent
-
-SECRET_KEY = config("SECRET_KEY")
-
+SECRET_KEY = config("RBS_SECRET_KEY")
 DEBUG = True
-
 ALLOWED_HOSTS = ['*']
+AUTH_USER_MODEL = 'clients.CustomUser'
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -22,10 +20,18 @@ INSTALLED_APPS = [
     'django.contrib.messages',
     'django.contrib.staticfiles',
 
+    'clients.apps.ClientsConfig',
     'api.apps.ApiConfig',
 
     'corsheaders',
+    'rest_framework',
 ]
+
+REST_FRAMEWORK = {
+    'DEFAULT_PERMISSION_CLASSES': [
+        'rest_framework.permissions.DjangoModelPermissionsOrAnonReadOnly'
+    ]
+}
 
 MIDDLEWARE = [
     'django.middleware.security.SecurityMiddleware',
@@ -37,6 +43,8 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 
     'corsheaders.middleware.CorsMiddleware',
+    'api.middleware.MultitenantMiddleware',
+    # 'django_multitenant.middleware.MultitenantMiddleware',
 ]
 
 ROOT_URLCONF = 'backend.urls'
@@ -59,21 +67,17 @@ TEMPLATES = [
 
 WSGI_APPLICATION = 'backend.wsgi.application'
 
-# Database
-# https://docs.djangoproject.com/en/4.1/ref/settings/#databases
 DATABASES = {
     'default': {
-        'ENGINE': 'django.db.backends.postgresql_psycopg2',
-        'NAME': config("PG_DATABASE"),
-        'USER': config("PG_USER"),
-        'PASSWORD': config("PG_PASSWORD"),
-        'HOST': config("PG_HOST"),
-        'PORT': config("PG_PORT"),
+        'ENGINE': config('RBS_DATABASES_ENGINE'),
+        'NAME': config("RBS_PG_DATABASE"),
+        'USER': config("RBS_PG_USER"),
+        'PASSWORD': config("RBS_PG_PASSWORD"),
+        'HOST': config("RBS_PG_HOST"),
+        'PORT': config("RBS_PG_PORT"),
     }
 }
 
-# Password validation
-# https://docs.djangoproject.com/en/4.1/ref/settings/#auth-password-validators
 AUTH_PASSWORD_VALIDATORS = [
     {
         'NAME': 'django.contrib.auth.password_validation.UserAttributeSimilarityValidator',
@@ -89,30 +93,11 @@ AUTH_PASSWORD_VALIDATORS = [
     },
 ]
 
-# Internationalization
-# https://docs.djangoproject.com/en/4.1/topics/i18n/
-
 LANGUAGE_CODE = 'en-us'
-
 TIME_ZONE = 'UTC'
-
 USE_I18N = True
-
 USE_TZ = True
 
-# Static files (CSS, JavaScript, Images)
-# https://docs.djangoproject.com/en/4.1/howto/static-files/
-
 STATIC_URL = 'static/'
-
-# Default primary key field type
-# https://docs.djangoproject.com/en/4.1/ref/settings/#default-auto-field
-
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
-
 CORS_ORIGIN_ALLOW_ALL = True
-
-#CSRF_TRUSTED_ORIGINS = [
-#    "https://robson.srv.br",
-#]
-
