@@ -1,18 +1,40 @@
+from binance.client import Client
 # import time
 import datetime
-# import json
+import json
 import pandas as pd
 from django.shortcuts import render
-from django.http import JsonResponse, HttpResponse
+from django.http import JsonResponse
+from decouple import config
+from django.conf import settings
+from rest_framework.response import Response
+from rest_framework.decorators import api_view
+from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
+from rest_framework_simplejwt.views import TokenObtainPairView
 
+client=Client(settings.BINANCE_API_KEY_TEST, settings.BINANCE_SECRET_KEY_TEST)
+
+class MyTokenObtainPairSerializer(TokenObtainPairSerializer):
+    @classmethod
+    def get_token(cls, user):
+        token = super().get_token(user)
+
+        # Add custom claims
+        token['username'] = user.username
+        # ...
+
+        return token
+
+class MyTokenObtainPairView(TokenObtainPairView):
+    serializer_class = MyTokenObtainPairSerializer
 
 def Ping(request):
     result_ping = client.ping()
-    return JsonResponse({result_ping})
+    return JsonResponse({"pong": result_ping})
 
 def ServerTime(request):
     result_time = client.get_server_time()
-    return JsonResponse({result_time})
+    return JsonResponse({"time": result_time})
 
 def SystemStatus(request):
     
