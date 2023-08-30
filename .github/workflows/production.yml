@@ -28,7 +28,7 @@ jobs:
           port: ${{ secrets.PORT }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            cd ~/apps/rbs/src
+            cd /apps/rbs/src
             rm -rf *
 
       - uses: actions/checkout@v3
@@ -40,7 +40,7 @@ jobs:
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           port: ${{ secrets.PORT }}
           source: "README.md,LICENSE,main.c,.gitignore,.github,docker-compose.yml,frontends,backends"
-          target: ~/apps/rbs/src
+          target: /apps/rbs/src
 
       - name: Executing docker-compose remote script
         uses: appleboy/ssh-action@master
@@ -50,6 +50,6 @@ jobs:
           port: ${{ secrets.PORT }}
           key: ${{ secrets.SSH_PRIVATE_KEY }}
           script: |
-            cd ~/apps/rbs/src
+            cd /apps/rbs/src
             docker-compose up -d --build
 
