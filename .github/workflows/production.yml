@@ -53,3 +53,15 @@ jobs:
             cd /apps/rbs/src
             docker-compose up -d --build
 
+      - name: Executing remote script providing .env files
+        uses: appleboy/ssh-action@master
+        with:
+          host: ${{ secrets.HOST }}
+          username: ${{ secrets.USERNAME }}
+          port: ${{ secrets.PORT }}
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            cd /apps/rbs/src
+            cp ../.env .env
+            cp ../.env.backends.monolith ./backends/monolith/.env
+            cp ../.env.production.frontends.web ./frontends/web/.env.production

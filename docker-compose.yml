@@ -27,8 +27,10 @@ services:
 
   backend-monolith:
     container_name: backendMonolith
-    image: backend-monolith
+    image: backend-monolith    
     build: ./backends/monolith
+    environment:
+      - DJANGO_SETTINGS_MODULE=backend.settings
     volumes:
       - ./backends/monolith:/app-backend
     restart: always
