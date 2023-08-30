@@ -5,4 +5,3 @@ class StrategySerializer(ModelSerializer):
     class Meta:
         model = Strategy
         fields = ['id', 'name']
-
