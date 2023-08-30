@@ -3,7 +3,7 @@ import { Container, Row, Col } from 'react-bootstrap'
 import Header from "../components/common/Header"
 import Footer from "../components/common/Footer"
 
-function LoginScreen() {
+const LoginScreen = () => {
   return(
     <div>
       <Header />

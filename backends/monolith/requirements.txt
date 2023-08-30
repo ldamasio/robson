@@ -18,7 +18,6 @@ dateparser==1.1.1
 distro==1.4.0
 Django==4.1.10
 django-cors-headers==4.2.0
-django-multitenant==3.2.1
 djangorestframework==3.14.0
 djangorestframework-jwt==1.11.0
 djangorestframework-simplejwt==5.2.2

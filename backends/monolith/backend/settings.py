@@ -2,12 +2,14 @@ from pathlib import Path
 from decouple import config
 from datetime import timedelta
 
-BINANCE_API_KEY_TEST=config("RBS_BINANCE_API_KEY_TEST")
-BINANCE_SECRET_KEY_TEST=config("RBS_BINANCE_SECRET_KEY_TEST")
+BINANCE_API_KEY_TEST = config("RBS_BINANCE_API_KEY_TEST")
+BINANCE_SECRET_KEY_TEST = config("RBS_BINANCE_SECRET_KEY_TEST")
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = config("RBS_SECRET_KEY")
+
 DEBUG = True
+
 ALLOWED_HOSTS = ['*']
 AUTH_USER_MODEL = 'clients.CustomUser'
 
@@ -28,10 +30,9 @@ INSTALLED_APPS = [
 ]
 
 REST_FRAMEWORK = {
-    'DEFAULT_PERMISSION_CLASSES': [
+    'DEFAULT_AUTHENTICATION_CLASSES': (
         'rest_framework_simplejwt.authentication.JWTAuthentication',
-        'rest_framework.permissions.DjangoModelPermissionsOrAnonReadOnly'
-    ]
+    )
 }
 
 SIMPLE_JWT = {
@@ -84,7 +85,7 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 
     'corsheaders.middleware.CorsMiddleware',
-    'api.middleware.MultitenantMiddleware',
+    # 'api.middleware.MultitenantMiddleware',
 ]
 
 ROOT_URLCONF = 'backend.urls'
@@ -141,3 +142,4 @@ USE_TZ = True
 STATIC_URL = 'static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 CORS_ORIGIN_ALLOW_ALL = True
+CORS_ALLOW_CREDENTIALS = True

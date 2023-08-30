@@ -2,11 +2,11 @@ version: "3"
 services:
   robsondb:
     container_name: robsonDatabase
-    image: citusdata/citus
+    image: postgres:15.4-bookworm
     environment:
-      POSTGRES_USER: 'postgres'
-      POSTGRES_PASSWORD: 'mypass'
-      POSTGRES_DB: 'postgres'
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: ${PG_DATABASE}
     # volumes:
     #   - pgdata:${PG_DATA}
     ports:

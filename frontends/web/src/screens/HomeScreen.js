@@ -7,7 +7,7 @@ import Download from "../components/Download"
 import Hire from "../components/Hire"
 import Demo from "../components/Demo"
 
-function HomeScreen() {
+const HomeScreen = () => {
   return(
     <div>
       <Header />

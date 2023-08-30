@@ -1,4 +1,6 @@
-import { BrowserRouter, Routes, Route } from 'react-router-dom'
+import { BrowserRouter as Router, Routes, Route } from 'react-router-dom'
+import PrivateRoutes from './utils/PrivateRoutes'
+import AuthContext, { AuthProvider } from './context/AuthContext'
 import HomeScreen from './screens/HomeScreen'
 import FeaturesScreen from './screens/FeaturesScreen'
 import PricingScreen from './screens/PricingScreen'
@@ -17,24 +19,29 @@ import NoPageScreen from "./screens/NoPageScreen"
 function App() {
   return (
     <>
-    <BrowserRouter>
-      <Routes>
-        <Route exact path="/" element={<HomeScreen />} />
-        <Route path="/features" element={<FeaturesScreen/>} />
-        <Route path="/pricing" element={<PricingScreen/>} />
-        <Route path="/about-us" element={<AboutUsScreen/>} />
-        <Route path="/our-team" element={<OurTeamScreen/>} />
-        <Route path="/careers" element={<CareersScreen/>} />
-        <Route path="/contact" element={<ContactScreen/>} />
-        <Route path="/signup" element={<SignupScreen/>} />
-        <Route path="/login" element={<LoginScreen/>} />
-        <Route path="/download" element={<DownloadScreen/>} />
-        <Route path="/hire" element={<HireScreen/>} />
-        <Route path="/demo" element={<DemoScreen/>} />
-        <Route path="/feed" element={<LoggedHomeScreen/>} />
-        <Route path="*" element={<NoPageScreen/>} />
-      </Routes>
-    </BrowserRouter>
+      <Router>
+        <AuthProvider>
+          <Routes>
+            <Route element={<NoPageScreen/>} path="*"/>
+            <Route element={<HomeScreen />} path="/" exact />
+            <Route element={<LoginScreen />} path="/login" />
+            <Route element={<FeaturesScreen/>} path="/features" />
+            <Route element={<PricingScreen/>} path="/pricing" />
+            <Route element={<AboutUsScreen/>} path="/about-us"/>
+            <Route element={<OurTeamScreen/>} path="/our-team" />
+            <Route element={<CareersScreen/>} path="/careers" />
+            <Route element={<ContactScreen/>} path="/contact" />
+            <Route element={<SignupScreen/>} path="/signup" />
+            <Route element={<LoginScreen/>} path="/login" />
+            <Route element={<DownloadScreen/>} path="/download" />
+            <Route element={<HireScreen/>} path="/hire" />
+            <Route element={<DemoScreen/>} path="/demo"/>
+            <Route element={<PrivateRoutes />}>
+              <Route element={<LoggedHomeScreen />} path="/feed" />
+            </Route>
+          </Routes>
+        </AuthProvider>
+      </Router>
     </>
   );
 }

@@ -8,9 +8,15 @@ from django.http import JsonResponse
 from decouple import config
 from django.conf import settings
 from rest_framework.response import Response
-from rest_framework.decorators import api_view
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import IsAuthenticated
 from rest_framework_simplejwt.serializers import TokenObtainPairSerializer
 from rest_framework_simplejwt.views import TokenObtainPairView
+from .serializers import StrategySerializer
+from .models import Strategy
+# from django_multitenant import views
+# from django_multitenant.views import TenantModelViewSet
+from clients.models import CustomUser
 
 client=Client(settings.BINANCE_API_KEY_TEST, settings.BINANCE_SECRET_KEY_TEST)
 
@@ -18,16 +24,25 @@ class MyTokenObtainPairSerializer(TokenObtainPairSerializer):
     @classmethod
     def get_token(cls, user):
         token = super().get_token(user)
-
-        # Add custom claims
         token['username'] = user.username
-        # ...
-
         return token
 
 class MyTokenObtainPairView(TokenObtainPairView):
     serializer_class = MyTokenObtainPairSerializer
 
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def getStrategies (request):
+    try:
+        tenant_id = request.user.client.id
+    except:
+        tenant_id = 0
+    strategies = Strategy.objects.filter(client=tenant_id)
+    serializer = StrategySerializer(strategies, many=True)
+    return Response(serializer.data)
+    # return JsonResponse({"name":"a"})
+ 
 def Ping(request):
     result_ping = client.ping()
     return JsonResponse({"pong": result_ping})
@@ -248,7 +263,7 @@ def Patrimony(request):
     # return JsonResponse(result_balance)
 
 def Week(request):
-    client=Client(API_KEY, SECRET_KEY)
+    client=Client(settings.BINANCE_API_KEY_TEST, settings.BINANCE_SECRET_KEY_TEST)
     asset="BTCUSDT"
     today_date = datetime.date.today()
     last_week = today_date + datetime.timedelta(days=-7)

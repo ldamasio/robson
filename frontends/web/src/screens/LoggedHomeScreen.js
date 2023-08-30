@@ -1,3 +1,4 @@
+import React, { useState, useEffect, useContext } from 'react'
 import { Container, Tab, Tabs } from 'react-bootstrap'
 import Header from '../components/common/Header'
 import Footer from '../components/common/Footer'
@@ -14,8 +15,9 @@ import Risk from '../components/logged/Risk'
 import Volume from '../components/logged/Volume'
 import Chart from '../components/logged/Chart'
 import Dataframe from '../components/logged/Dataframe'
+import AuthContext from 'context/AuthContext'
 
-function LoggedHomeScreen() {
+const LoggedHomeScreen = () => {
   return (
     <div>
       <Header />
@@ -55,13 +57,13 @@ function LoggedHomeScreen() {
               <h1>BTC USDT 4 Hour Chart</h1>
               <Chart />
               <h1>BTC USDT Last Week Dataframe</h1>
-            <Dataframe />
+              <Dataframe />
             </Tab>
             <Tab eventKey="3" title="Operations">
               Conteudo 3
             </Tab>
           </Tabs>
-        </Container> 
+        </Container>
       </main>
       <Footer />
     </div>
