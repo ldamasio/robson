@@ -1,5 +1,5 @@
 import React, { useContext } from 'react'
-import AuthContext from 'context/AuthContext'
+import AuthContext from '../context/AuthContext'
 // import { Link, useHistory } from 'react-router-dom';
 import { Container, Row, Col } from 'react-bootstrap'
 import Header from "../components/common/Header"

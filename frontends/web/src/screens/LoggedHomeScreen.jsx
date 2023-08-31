@@ -15,7 +15,7 @@ import Risk from '../components/logged/Risk'
 import Volume from '../components/logged/Volume'
 import Chart from '../components/logged/Chart'
 import Dataframe from '../components/logged/Dataframe'
-import AuthContext from 'context/AuthContext'
+import AuthContext from '../context/AuthContext'
 
 const LoggedHomeScreen = () => {
   return (
@@ -24,9 +24,9 @@ const LoggedHomeScreen = () => {
       <main className="py-5">
         <Container>
           <p>
-            <small>You are running this application in <b>{process.env.NODE_ENV}</b> mode.</small>
+            <small>You are running this application in <b>{import.meta.env.NODE_ENV}</b> mode.</small>
             <br />
-            <small>BACKEND_URL is <b>{process.env.REACT_APP_BACKEND_URL}</b></small>
+            <small>BACKEND_URL is <b>{import.meta.env.REACT_APP_BACKEND_URL}</b></small>
           </p>
           <Tabs defaultActiveKey="1">
             <Tab eventKey="1" title="Control Panel">
