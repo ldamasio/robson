@@ -1,8 +1,0 @@
-#!/media/psyctrl/8707edd0-4d16-41c5-bc83-94c6defc8a2f4/hd/apps/rbs/src/backends/monolith/.venv/bin/python
-# -*- coding: utf-8 -*-
-import re
-import sys
-from twisted.conch.scripts.cftp import run
-if __name__ == '__main__':
-    sys.argv[0] = re.sub(r'(-script\.pyw|\.exe)?$', '', sys.argv[0])
-    sys.exit(run())
