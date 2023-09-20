@@ -1,6 +1,4 @@
 import React, { useState, useEffect } from 'react'
-import { Card } from 'react-bootstrap'
-import axios from 'axios';
 import useWebSocket from 'react-use-websocket';
 
 function ActualPrice() {

@@ -1,3 +1,4 @@
+import React, { useState, useEffect, useContext } from 'react'
 import { Container, Tab, Tabs } from 'react-bootstrap'
 import Header from '../components/common/Header'
 import Footer from '../components/common/Footer'
@@ -14,23 +15,24 @@ import Risk from '../components/logged/Risk'
 import Volume from '../components/logged/Volume'
 import Chart from '../components/logged/Chart'
 import Dataframe from '../components/logged/Dataframe'
+import AuthContext from '../context/AuthContext'
 
-function LoggedHomeScreen() {
+const LoggedHomeScreen = () => {
   return (
     <div>
       <Header />
       <main className="py-5">
         <Container>
           <p>
-            <small>You are running this application in <b>{process.env.NODE_ENV}</b> mode.</small>
+            <small>You are running this application in <b>{import.meta.env.NODE_ENV}</b> mode.</small>
             <br />
-            <small>BACKEND_URL is <b>{process.env.REACT_APP_BACKEND_URL}</b></small>
+            <small>BACKEND_URL is <b>{import.meta.env.REACT_APP_BACKEND_URL}</b></small>
           </p>
           <Tabs defaultActiveKey="1">
             <Tab eventKey="1" title="Control Panel">
               <h1>Command Button</h1>
               <CommandButton />
-              <h1>Star new operation</h1>
+              <h1>Start new operation</h1>
               <StartNewOperation />
               <h1>Manage position</h1>
               <ManagePosition />
@@ -55,13 +57,13 @@ function LoggedHomeScreen() {
               <h1>BTC USDT 4 Hour Chart</h1>
               <Chart />
               <h1>BTC USDT Last Week Dataframe</h1>
-            <Dataframe />
+              <Dataframe />
             </Tab>
             <Tab eventKey="3" title="Operations">
               Conteudo 3
             </Tab>
           </Tabs>
-        </Container> 
+        </Container>
       </main>
       <Footer />
     </div>

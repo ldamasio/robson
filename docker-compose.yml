@@ -1,32 +1,60 @@
 version: "3"
 services:
+  robsondb:
+    container_name: robsonDatabase
+    image: postgres:15.4-bookworm
+    environment:
+      POSTGRES_USER: ${PG_USER}
+      POSTGRES_PASSWORD: ${PG_PASSWORD}
+      POSTGRES_DB: ${PG_DATABASE}
+    # volumes:
+    #   - pgdata:${PG_DATA}
+    ports:
+      - 5450:5432
+    restart: always
+
+    # cronjob:
+    #   container_name: dump
+    #   build: ./dump
+    #   environment:
+    #     PG_HOST: ${PG_HOST}
+    #     POSTGRES_USER: ${PG_USER}
+    #     POSTGRES_PASSWORD: ${PG_PASSWORD}
+    #     POSTGRES_DB: ${PG_DATABASE}
+    #     PGDATA: ${PG_DATA}
+    #     PGPORT: ${PG_PORT}
+    #   restart: always
+
   backend-monolith:
-    container_name: RbsBackendMonolith
-    image: backend-monolith
+    container_name: backendMonolith
+    image: backend-monolith    
     build: ./backends/monolith
+    environment:
+      - DJANGO_SETTINGS_MODULE=backend.settings
     volumes:
       - ./backends/monolith:/app-backend
     restart: always
 
   frontend-web:
-    container_name: RbsFrontendWeb
+    container_name: frontendWeb
     image: frontend-web
     build: ./frontends/web
-    ports:
-      - 3403:3403
     volumes:
       - ./frontends/web:/app-frontend
+    ports:
+      - 3403:3403
     depends_on:
       - backend-monolith
     restart: always
 
   nginx_backend_server:
-    container_name: rbs_nginx_backend_server
-    image: rbs_nginx_backend_server_img
+    depends_on:
+        - backend-monolith
+    container_name: nginxMonolith
     build: ./backends/nginx_monolith
     ports:
         - 8403:8403
-    depends_on:
-        - backend-monolith
     restart: always
 
+volumes:
+  pgdata:
