@@ -1,13 +1,15 @@
-import React from 'react'
+import React, { useContext } from 'react'
 import { Container, Nav, Navbar, NavDropdown } from 'react-bootstrap'
 import { LinkContainer } from 'react-router-bootstrap'
+import AuthContext from '../../context/AuthContext'
 
 function Header() {
-  return(
+  let { user, logoutUser } = useContext(AuthContext)
+  return (
     <header>
       <Navbar collapseOnSelect expand="lg" bg="dark" variant="dark">
         <Container>
-          <LinkContainer to ="/">
+          <LinkContainer to="/">
             <Navbar.Brand>
               Robson
             </Navbar.Brand>
@@ -30,11 +32,18 @@ function Header() {
               </NavDropdown>
             </Nav>
             <Nav className="text-nowrap">
+              {user ? (
+                <p onClick={logoutUser}>Logout</p>
+              ) : (
+                <Nav.Link eventKey={2} href="/login">
+                  Login
+                </Nav.Link>
+              )}
               <Nav.Link href="/signup">Sign up</Nav.Link>
-              <Nav.Link eventKey={2} href="/login">
-                Login
-              </Nav.Link>
             </Nav>
+            {user &&
+              <p>Hello {user.username}</p>
+            }
           </Navbar.Collapse>
         </Container>
       </Navbar>

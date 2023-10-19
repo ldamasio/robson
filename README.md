@@ -16,3 +16,8 @@ The command interface makes it possible to activate a Dashboard with its main in
 ## The Dashboard offers special string conversion calculators. 
 
 For example, if you need to withdraw an amount of BRL, but would like to convert your USDT to ADA before transferring, in addition to needing to anticipate spread values from other financial services.
+
+## Development Environment
+
+In wsgi.py and manage.py "backend.settings" was changed to "backend.settings.development"
+

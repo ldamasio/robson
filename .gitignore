@@ -3,6 +3,7 @@
 **/node_modules/
 **/__pycache__
 **/.vscode
+**/venv
 
 pgdata
 
@@ -109,3 +110,6 @@ typings/
 
 # TernJS port file
 .tern-port
+
+#Vscode config file
+.vscode

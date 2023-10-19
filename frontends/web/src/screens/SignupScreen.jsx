@@ -2,12 +2,8 @@ import React from 'react'
 import { Container, Row, Col } from 'react-bootstrap'
 import Header from "../components/common/Header"
 import Footer from "../components/common/Footer"
-import Robson from "../components/Robson"
-import Download from "../components/Download"
-import Hire from "../components/Hire"
-import Demo from "../components/Demo"
 
-function HomeScreen() {
+const LoginScreen = () => {
   return(
     <div>
       <Header />
@@ -15,12 +11,7 @@ function HomeScreen() {
         <Container fluid="md">
           <Row>
             <Col>
-              <Robson />
-            </Col>
-            <Col>
-              <Download />
-              <Hire />
-              <Demo />
+              teste
             </Col>
           </Row>
         </Container> 
@@ -30,4 +21,4 @@ function HomeScreen() {
   )
 }
 
-export default HomeScreen
+export default LoginScreen
