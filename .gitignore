@@ -4,6 +4,8 @@
 **/__pycache__
 **/.vscode
 
+pgdata
+
 # Logs
 logs
 *.log

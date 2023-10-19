@@ -1,5 +1,18 @@
 version: "3"
 services:
+
+  db:
+    container_name: RbsDb
+    image: postgres:16.0-bookworm
+    environment:
+      - POSTGRES_USER=$POSTGRES_USER
+      - POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+    ports:
+      - 5450:5432
+    volumes:
+    - ./pgdata:/var/lib/postgesql/data
+    restart: always
+
   backend-monolith:
     container_name: RbsBackendMonolith
     image: backend-monolith
