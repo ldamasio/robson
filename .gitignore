@@ -5,6 +5,8 @@
 **/.vscode
 **/venv
 
+pgdata
+
 # Logs
 logs
 *.log

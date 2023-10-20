@@ -2,39 +2,38 @@ version: "3"
 services:
   robsondb:
     container_name: robsonDatabase
-    image: postgres:15.4-bookworm
+    image: postgres
     environment:
-      POSTGRES_USER: ${PG_USER}
-      POSTGRES_PASSWORD: ${PG_PASSWORD}
-      POSTGRES_DB: ${PG_DATABASE}
-    # volumes:
-    #   - pgdata:${PG_DATA}
+      - POSTGRES_PASSWORD=$POSTGRES_PASSWORD
     ports:
-      - 5450:5432
+      -  "${POSTGRES_PORT:-5450}:5432"
+    volumes:
+      - ./backends/database/:/docker-entrypoint-initdb.d
     restart: always
-
-    # cronjob:
-    #   container_name: dump
-    #   build: ./dump
-    #   environment:
-    #     PG_HOST: ${PG_HOST}
-    #     POSTGRES_USER: ${PG_USER}
-    #     POSTGRES_PASSWORD: ${PG_PASSWORD}
-    #     POSTGRES_DB: ${PG_DATABASE}
-    #     PGDATA: ${PG_DATA}
-    #     PGPORT: ${PG_PORT}
-    #   restart: always
-
+  cronjob:
+    container_name: cronjob
+    build: ./backends/cronjob
+    environment:
+      - POSTGRES_HOST=${POSTGRES_HOST}
+      - POSTGRES_USER=${POSTGRES_USER}
+      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
+      - POSTGRES_DATABASE=${POSTGRES_DATABASE}
+      - POSTGRES_PORT=${POSTGRES_PORT}
+    restart: always
   backend-monolith:
     container_name: backendMonolith
     image: backend-monolith    
     build: ./backends/monolith
     environment:
       - DJANGO_SETTINGS_MODULE=backend.settings
+      - POSTGRES_HOST=${POSTGRES_HOST}
+      - POSTGRES_USER={$POSTGRES_USER}
+      - POSTGRES_PASSWORD={$POSTGRES_PASSWORD}
+      - POSTGRES_DATABASE=${POSTGRES_DATABASE}
+      - POSTGRES_PORT={$POSTGRES_PORT}
     volumes:
       - ./backends/monolith:/app-backend
     restart: always
-
   frontend-web:
     container_name: frontendWeb
     image: frontend-web
@@ -46,7 +45,6 @@ services:
     depends_on:
       - backend-monolith
     restart: always
-
   nginx_backend_server:
     depends_on:
         - backend-monolith
@@ -55,6 +53,5 @@ services:
     ports:
         - 8403:8403
     restart: always
-
 volumes:
   pgdata:

@@ -2,16 +2,16 @@ from pathlib import Path
 from decouple import config
 from datetime import timedelta
 
-BINANCE_API_KEY_TEST = config("RBS_BINANCE_API_KEY_TEST")
-BINANCE_SECRET_KEY_TEST = config("RBS_BINANCE_SECRET_KEY_TEST")
-
 BASE_DIR = Path(__file__).resolve().parent.parent
 SECRET_KEY = config("RBS_SECRET_KEY")
 
-DEBUG = True
-
+DEBUG = config('DEBUG', default=False, cast=bool)
 ALLOWED_HOSTS = ['*']
+
 AUTH_USER_MODEL = 'clients.CustomUser'
+
+BINANCE_API_KEY_TEST = config("RBS_BINANCE_API_KEY_TEST")
+BINANCE_SECRET_KEY_TEST = config("RBS_BINANCE_SECRET_KEY_TEST")
 
 INSTALLED_APPS = [
     'django.contrib.admin',
@@ -66,7 +66,6 @@ SIMPLE_JWT = {
     "SLIDING_TOKEN_LIFETIME": timedelta(minutes=5),
     "SLIDING_TOKEN_REFRESH_LIFETIME": timedelta(days=1),
 
-    # "TOKEN_OBTAIN_SERIALIZER": "api.serializers.MyTokenObtainPairSerializer",
     "TOKEN_OBTAIN_SERIALIZER": "rest_framework_simplejwt.serializers.TokenObtainPairSerializer",
     "TOKEN_REFRESH_SERIALIZER": "rest_framework_simplejwt.serializers.TokenRefreshSerializer",
     "TOKEN_VERIFY_SERIALIZER": "rest_framework_simplejwt.serializers.TokenVerifySerializer",
@@ -85,7 +84,6 @@ MIDDLEWARE = [
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
 
     'corsheaders.middleware.CorsMiddleware',
-    # 'api.middleware.MultitenantMiddleware',
 ]
 
 ROOT_URLCONF = 'backend.urls'
@@ -110,12 +108,12 @@ WSGI_APPLICATION = 'backend.wsgi.application'
 
 DATABASES = {
     'default': {
-        'ENGINE': config('RBS_DATABASES_ENGINE'),
-        'NAME': config("RBS_PG_DATABASE"),
-        'USER': config("RBS_PG_USER"),
-        'PASSWORD': config("RBS_PG_PASSWORD"),
-        'HOST': config("RBS_PG_HOST"),
-        'PORT': config("RBS_PG_PORT"),
+        'ENGINE': 'django.db.backends.postgresql_psycopg2',
+        'NAME': config('POSTGRES_DATABASE'),
+        'USER': config('POSTGRES_USER'),
+        'PASSWORD': config('POSTGRES_PASSWORD'),
+        'HOST': config('POSTGRES_HOST'),
+        'PORT': config('POSTGRES_PORT'),
     }
 }
 
@@ -141,5 +139,8 @@ USE_TZ = True
 
 STATIC_URL = 'static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
+
 CORS_ORIGIN_ALLOW_ALL = True
-CORS_ALLOW_CREDENTIALS = True
+#CSRF_TRUSTED_ORIGINS = [
+#    "https://robsonbot.com.br",
+#]
