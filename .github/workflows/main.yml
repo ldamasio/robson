@@ -24,18 +24,18 @@ jobs:
           file: ./frontends/web/docker/Dockerfile
           push: true
           tags: | 
-            ldamasio/rbs-frontend:0.0.${{github.run_number}}
-            ldamasio/rbs-frontend:latest
+            ldamasio/rbs-frontend-prod:0.0.${{github.run_number}}
+            ldamasio/rbs-frontend-prod:latest
 
-      - name: Build and push Docker monolith backend image
-        uses: docker/build-push-action@v5.0.0
-        with: 
-          context: ./backends/monolith
-          file: ./backends/monolith/docker/Dockerfile
-          push: true
-          tags: | 
-            ldamasio/rbs-backend-monolith:1.0.${{github.run_number}}
-            ldamasio/rbs-backend-monolith:latest
+      # - name: Build and push Docker monolith backend image
+      #   uses: docker/build-push-action@v5.0.0
+      #   with: 
+      #     context: ./backends/monolith
+      #     file: ./backends/monolith/docker/Dockerfile
+      #     push: true
+      #     tags: | 
+      #       ldamasio/rbs-backend-monolith:1.0.${{github.run_number}}
+      #       ldamasio/rbs-backend-monolith:latest
 
   # CD:
   #   runs-on: ubuntu-latest
