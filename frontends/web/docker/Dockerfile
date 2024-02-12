@@ -1,8 +1,11 @@
-FROM node:14-alpine AS builder
-WORKDIR /opt/web
-COPY . ./
+FROM node:14 as build
+WORKDIR /app
+COPY package*.json ./
 RUN npm install
-ENV PATH="./node_modules/.bin:$PATH"
+COPY . .
 RUN npm run build
-EXPOSE 4173
-CMD [ "npm", "run", "preview" ]
+
+FROM nginx:stable-alpine as prod
+COPY --from=build /app/dist /usr/share/nginx/html
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
