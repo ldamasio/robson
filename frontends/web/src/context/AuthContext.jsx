@@ -5,32 +5,47 @@ import { useNavigate } from 'react-router-dom'
 const AuthContext = createContext()
 export default AuthContext;
 
+function ErrorMessage({ error }) {
+  return (
+    <div style={{ color: "red" }}>
+      <p>Error: {error}</p>
+    </div>
+  );
+}
+
 export const AuthProvider = ({ children }) => {
 
   let [authTokens, setAuthTokens] = useState(() => localStorage.getItem('authTokens') ? JSON.parse(localStorage.getItem('authTokens')) : null)
   let [user, setUser] = useState(() => localStorage.getItem('authTokens') ? jwt_decode(localStorage.getItem('authTokens')) : null)
   let [loading, setLoading] = useState(true)
+  let [error, setError] = useState(null);
 
   const navigate = useNavigate()
 
   let loginUser = async (e) => {
     e.preventDefault()
-    let response = await fetch('http://127.0.0.1:8403/api/token/', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ 'username': e.target.username.value, 'password': e.target.password.value })
-    })
-    let data = await response.json()
-
-    if (response.status === 200) {
-      setAuthTokens(data)
-      setUser(jwt_decode(data.access))
-      localStorage.setItem('authTokens', JSON.stringify(data))
-      navigate('/feed')
-    } else {
-      alert('Something went wrong!')
+    try {
+      let response = await fetch('http://127.0.0.1:8403/api/token/', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ 'username': e.target.username.value, 'password': e.target.password.value })
+      })
+      let data = await response.json()
+      if (response.status !== 200) {
+        throw new Error('Something went wrong!')
+      }
+      if (response.status === 200) {
+        setAuthTokens(data)
+        setUser(jwt_decode(data.access))
+        localStorage.setItem('authTokens', JSON.stringify(data))
+        navigate('/feed')
+      } else {
+        alert('Something went wrong!')
+      }
+    } catch (err) {
+      setError(err.message);
     }
   }
 
@@ -42,22 +57,28 @@ export const AuthProvider = ({ children }) => {
   }
 
   let updateToken = async () => {
-    console.log('Updated token.');
-    let response = await fetch('http://127.0.0.1:8403/api/token/refresh/', {
-      method: 'POST',
-      headers: {
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ 'refresh': authTokens?.refresh })
-    })
-    let data = await response.json()
-
-    if (response.status === 200) {
-      setAuthTokens(data)
-      setUser(jwt_decode(data.access))
-      localStorage.setItem('authTokens', JSON.stringify(data))
-    } else {
-      logoutUser()
+    try {
+      console.log('Updated token.');
+      let response = await fetch('http://127.0.0.1:8403/api/token/refresh/', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json'
+        },
+        body: JSON.stringify({ 'refresh': authTokens?.refresh })
+      })
+      let data = await response.json()
+      if (response.status !== 200) {
+        throw new Error('Something went wrong!')
+      }
+      if (response.status === 200) {
+        setAuthTokens(data)
+        setUser(jwt_decode(data.access))
+        localStorage.setItem('authTokens', JSON.stringify(data))
+      } else {
+        logoutUser()
+      }
+    } catch (err) {
+      setError(err.message);
     }
 
     if (loading) {
@@ -90,7 +111,8 @@ export const AuthProvider = ({ children }) => {
 
   return (
     <AuthContext.Provider value={contextData}>
-      {loading ? null : children}
+      {error && <ErrorMessage error={error} />}
+      {children}
     </AuthContext.Provider>
   )
 }
