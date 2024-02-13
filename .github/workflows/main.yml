@@ -34,8 +34,8 @@ jobs:
       #     file: ./backends/monolith/docker/Dockerfile
       #     push: true
       #     tags: | 
-      #       ldamasio/rbs-backend-monolith:1.0.${{github.run_number}}
-      #       ldamasio/rbs-backend-monolith:latest
+      #       ldamasio/rbs-backend-prod:1.0.${{github.run_number}}
+      #       ldamasio/rbs-backend-prod:latest
 
   # CD:
   #   runs-on: ubuntu-latest
