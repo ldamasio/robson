@@ -27,31 +27,22 @@ jobs:
             ldamasio/rbs-frontend-prod:0.0.${{github.run_number}}
             ldamasio/rbs-frontend-prod:latest
 
-      # - name: Build and push Docker monolith backend image
-      #   uses: docker/build-push-action@v5.0.0
-      #   with: 
-      #     context: ./backends/monolith
-      #     file: ./backends/monolith/docker/Dockerfile
-      #     push: true
-      #     tags: | 
-      #       ldamasio/rbs-backend-prod:1.0.${{github.run_number}}
-      #       ldamasio/rbs-backend-prod:latest
+      - name: Build and push Docker monolith backend image
+        uses: docker/build-push-action@v5.0.0
+        with: 
+          context: ./backends/monolith
+          file: ./backends/monolith/docker/Dockerfile_django
+          push: true
+          tags: | 
+            ldamasio/rbs-backend-monolith-prod:1.0.${{github.run_number}}
+            ldamasio/rbs-backend-monolith-prod:latest
 
-  # CD:
-  #   runs-on: ubuntu-latest
-  #   needs: [CI]
-  #   steps:
-  #     - uses: actions/checkout@v4.1.1
-
-  #     - name: Define context
-  #       uses: Azure/k8s-set-context@v3.0
-  #       with: 
-  #         method: kubeconfig
-  #         kubeconfig: ${{secrets.K8S_CONFIG}}
-  #     - name: Deploy to Kubernetes cluster
-  #       uses: Azure/k8s-deploy@v4.9
-  #       with:
-  #         images: ldamasio/gph-marketplace:${{github.run_number}}
-  #         manifests:
-  #           k8s/deployment.yaml
-
+      - name: Build and push Docker monolith backend image
+        uses: docker/build-push-action@v5.0.0
+        with: 
+          context: ./backends/monolith
+          file: ./backends/monolith/docker/Dockerfile_nginx
+          push: true
+          tags: | 
+            ldamasio/rbs-backend-nginx-prod:1.0.${{github.run_number}}
+            ldamasio/rbs-backend-nginx-prod:latest
