@@ -6,5 +6,5 @@ WORKDIR /app
 COPY ../requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
 COPY . /app/
-EXPOSE 8000
+EXPOSE 8080
 CMD gunicorn -b 0.0.0.0:8080 --worker-class=gevent --worker-connections=1000 --workers=5 backend.wsgi
