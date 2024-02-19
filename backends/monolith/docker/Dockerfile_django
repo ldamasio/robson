@@ -3,6 +3,7 @@ RUN apt-get update && apt-get install -y gcc
 ENV PYTHONDONTWRITEBYTECODE 1
 ENV PYTHONUNBUFFERED 1
 ENV DJANGO_MODULES_SETTINGS=backend.settings
+ENV DEBUG=True
 WORKDIR /app
 COPY ../requirements.txt .
 RUN pip install --upgrade pip && pip install -r requirements.txt
