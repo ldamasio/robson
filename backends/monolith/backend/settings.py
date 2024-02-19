@@ -141,6 +141,6 @@ STATIC_URL = 'static/'
 DEFAULT_AUTO_FIELD = 'django.db.models.BigAutoField'
 
 CORS_ORIGIN_ALLOW_ALL = True
-#CSRF_TRUSTED_ORIGINS = [
-#    "https://robsonbot.com.br",
-#]
+CSRF_TRUSTED_ORIGINS = [
+   "https://backend.robsonbot.com",
+]
