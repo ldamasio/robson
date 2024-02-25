@@ -16,7 +16,7 @@ jobs:
         with:
           username: ${{secrets.DOCKERHUB_USER}}
           password: ${{secrets.DOCKERHUB_PWD}}
-      
+
       - name: Build and push Docker frontend image
         uses: docker/build-push-action@v5.0.0
         with: 
@@ -46,3 +46,4 @@ jobs:
           tags: | 
             ldamasio/rbs-backend-nginx-prod:1.0.${{github.run_number}}
             ldamasio/rbs-backend-nginx-prod:latest
+

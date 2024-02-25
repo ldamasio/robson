@@ -46,3 +46,15 @@ class Operation(models.Model):
 class Note(models.Model):
     user = models.ForeignKey(CustomUser, on_delete=models.DO_NOTHING)
     body = models.TextField()
+
+class Argument():
+    type = ('Bullish', 'Bearish')
+
+class Accumulation():
+    type = ('Bullish', 'Bearish')
+
+class Rectangle():
+    type = ('Bullish', 'Bearish')
+
+class Triangle():
+    type = ('Bullish', 'Bearish')
