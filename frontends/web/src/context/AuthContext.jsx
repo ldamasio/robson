@@ -59,7 +59,7 @@ export const AuthProvider = ({ children }) => {
   let updateToken = async () => {
     try {
       console.log('Updated token.');
-      let response = await fetch('http://127.0.0.1:8403/api/token/refresh/', {
+      let response = await fetch('https://backend.robsonbot.com/api/token/refresh/', {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'

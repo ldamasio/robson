@@ -58,3 +58,8 @@ class Rectangle():
 
 class Triangle():
     type = ('Bullish', 'Bearish')
+
+class MorningStart():
+    thre_candles = ('Closure', 'Opening', 'Closure')
+    type = ('Bullish')
+    
