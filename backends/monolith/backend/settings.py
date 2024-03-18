@@ -1,8 +1,15 @@
 from pathlib import Path
-from decouple import config
+from decouple import AutoConfig
 from datetime import timedelta
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+config = AutoConfig(search_path=BASE_DIR)
+
+print ('          >>>>>> Sócrates')
+print (BASE_DIR)
+
+
 SECRET_KEY = config("RBS_SECRET_KEY")
 
 DEBUG = config('DEBUG', default=False, cast=bool)
@@ -109,11 +116,11 @@ WSGI_APPLICATION = 'backend.wsgi.application'
 DATABASES = {
     'default': {
         'ENGINE': 'django.db.backends.postgresql_psycopg2',
-        'NAME': config('POSTGRES_DATABASE'),
-        'USER': config('POSTGRES_USER'),
-        'PASSWORD': config('POSTGRES_PASSWORD'),
-        'HOST': config('POSTGRES_HOST'),
-        'PORT': config('POSTGRES_PORT'),
+        'NAME': config('RBS_PG_DATABASE'),
+        'USER': config('RBS_PG_USER'),
+        'PASSWORD': config('RBS_PG_PASSWORD'),
+        'HOST': config('RBS_PG_HOST'),
+        'PORT': config('RBS_PG_PORT'),
     }
 }
 

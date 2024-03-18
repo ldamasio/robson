@@ -3,7 +3,9 @@ Robson Bot
 
 Just another crypto robot
 
-The Robson robot is a tool for anyone who researches and monitors stocks to trigger signals or automate order flows for the stock market.
+ROBSON BOT is an open source algo trade project. It is a robot specialized in cryptocurrency trading (automatic buying and selling of digital assets), programmed, with backend and data modeling in Python, to monitor the market in real time, using asynchronous communication between the exchange and the application, that is, your dashboard and your “brain”. With this, Robson Bot is capable of making intelligent decisions based on a set of strategies guided by probabilistic analysis and technical analysis. The open source project includes a risk management system, tools for disseminating trade signals and functions as a platform, enabling multiple users with security and data isolation (multi-tenant).
+
+The Robson Bot is a tool for researchers, traders that monitors stocks to trigger signals or automate order flows for the binance crypto stock market.
 
 ## Research, communication and trade functions.
 
@@ -17,10 +19,35 @@ The command interface makes it possible to activate a Dashboard with its main in
 
 For example, if you need to withdraw an amount of BRL, but would like to convert your USDT to ADA before transferring, in addition to needing to anticipate spread values from other financial services.
 
-## Development Backend Environment
+## INSTALL
+
+Some tips for development environment
+
+### Clone robson repository
+
+git clone https://github.com/ldamasio/robson.git
+
+### Try run docker-compose
+
+docker-compose up -d --build
+
+### Development Backend Environment
 
 Commands that may be util:
-export PYTHONPATH=$PYTHONPATH:~/rbs/robson/backends/monolith
-export PYTHONPATH=$PYTHONPATH:~/rbs/robson/backends/monolith/.venv/lib/python3.10/site-packages
+
+```
+cd backends/monolith/
+cp .env.example .env
+python -m venv .venv
+python -m pip install -r requirements.txt
 export DJANGO_SETTINGS_MODULE=backend.settings
 cp -r staticfiles/* docker/static/
+```
+
+### Development Frontend Environment
+
+cd frontends/web
+nvm use 14
+npm i
+npm start
+
