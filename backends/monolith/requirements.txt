@@ -1,4 +1,3 @@
-aiohttp==3.8.3
 aiosignal==1.2.0
 asgiref==3.5.2
 async-timeout==4.0.2
@@ -22,9 +21,8 @@ djangorestframework==3.14.0
 djangorestframework-jwt==1.11.0
 djangorestframework-simplejwt==5.2.2
 entrypoints==0.3
-frozenlist==1.3.1
 gevent
-greenlet==1.1.3
+greenlet
 gunicorn==20.1.0
 httplib2==0.14.0
 hyperlink==19.0.0
@@ -42,13 +40,13 @@ lazr.uri==1.0.3
 MarkupSafe==1.1.0
 more-itertools==4.2.0
 multidict==6.0.2
-netifaces==0.10.4
-numpy==1.23.3
+netifaces
+numpy
 oauthlib==3.1.0
 pandas==1.5.0
 pbr==5.10.0
 pexpect==4.6.0
-psycopg2-binary==2.9.7
+psycopg2-binary
 ptyprocess==0.7.0
 pyasn1==0.4.2
 pyasn1-modules==0.2.1
@@ -84,7 +82,7 @@ ujson==5.5.0
 urllib3==1.25.8
 wadllib==1.3.3
 websockets==10.3
-yarl==1.8.1
+yarl
 zipp==1.0.0
 zope.event==4.5.0
 zope.interface==5.4.0

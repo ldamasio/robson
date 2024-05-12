@@ -39,6 +39,8 @@ Commands that may be util:
 cd backends/monolith/
 cp .env.example .env
 python -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade setuptools
 python -m pip install -r requirements.txt
 export DJANGO_SETTINGS_MODULE=backend.settings
 cp -r staticfiles/* docker/static/
