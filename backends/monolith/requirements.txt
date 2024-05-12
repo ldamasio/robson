@@ -1,3 +1,4 @@
+setuptools
 aiosignal==1.2.0
 asgiref==3.5.2
 async-timeout==4.0.2
@@ -15,7 +16,7 @@ constantly==15.1.0
 cryptography==41.0.3
 dateparser==1.1.1
 distro==1.4.0
-Django==4.1.10
+Django
 django-cors-headers==4.2.0
 djangorestframework==3.14.0
 djangorestframework-jwt==1.11.0
@@ -79,7 +80,7 @@ Twisted==21.2.0
 tzdata==2022.4
 tzlocal==4.2
 ujson==5.5.0
-urllib3==1.25.8
+urllib3
 wadllib==1.3.3
 websockets==10.3
 yarl
