@@ -42,6 +42,8 @@ class Operation(models.Model):
     stop_gain_percent = models.IntegerField(blank=True)
     stop_loss_percent = models.IntegerField(blank=True)
 
+# Technica Analysis
+
 class TechnicalEvent():
     type = ('Bullish', 'Bearish')
 
