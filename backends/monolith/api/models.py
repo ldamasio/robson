@@ -53,6 +53,18 @@ class Argument():
 class Accumulation():
     type = ('Bullish', 'Bearish')
 
+class Breakout():
+    type = ('Bullish', 'Bearish')
+
+class Uptrend():
+    type = ('Bullish', 'Bearish')
+
+class Downtrend():
+    type = ('Bullish', 'Bearish')
+
+class Sideways():
+    type = ('Bullish', 'Bearish')
+
 # Chart Patterns
 
 class Rectangle():
@@ -89,3 +101,20 @@ class MorningStart():
 class EveningStart():
     thre_candles = ('Closure', 'Opening', 'Closure')
     type = ('Bullish')
+
+# Statistical Indicators
+
+class MovingAverage():
+    type = ('Bullish', 'Bearish')
+
+class RelativeStrengthIndex():
+    type = ('Bullish', 'Bearish')
+
+class MovingAverageConvergenceDivergence():
+    type = ('Bullish', 'Bearish')
+
+class BollingerBands():
+    type = ('Bullish', 'Bearish')
+
+class StochasticOscillator():
+        type = ('Bullish', 'Bearish')
