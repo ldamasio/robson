@@ -1,6 +1,6 @@
 setuptools
 aiosignal==1.2.0
-asgiref==3.5.2
+asgiref
 async-timeout==4.0.2
 attrs==19.3.0
 Automat==0.8.0
