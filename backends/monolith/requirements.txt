@@ -67,12 +67,12 @@ pytz==2022.4
 pytz-deprecation-shim==0.1.0.post0
 PyYAML==5.3.1
 regex==2022.3.2
-requests==2.22.0
+requests
 requests-unixsocket==0.2.0
 SecretStorage==2.3.1
 service-identity==18.1.0
 simplejson==3.16.0
-six==1.14.0
+six
 sqlparse==0.4.2
 ssh-import-id==5.10
 testresources==2.0.1
