@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rbs-frontend-prod-deploy
+spec:
+  selector:
+    matchLabels:
+      app: rbs-frontend-prod-deploy
+  template:
+    metadata:
+      labels:
+        app: rbs-frontend-prod-deploy
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "80"
+        prometheus.io/path: "/metrics"
+    spec:
+      containers:
+        - name: rbs-frontend-prod-deploy
+          image: ldamasio/rbs-frontend-prod:latest
+          ports:
+          - containerPort: 80
+          resources:
+            requests:
+              memory: "100Mi"
+              cpu: "250m"
+            limits:
+              memory: "200Mi"
+              cpu: "500m"

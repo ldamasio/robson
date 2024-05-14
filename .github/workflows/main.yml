@@ -37,7 +37,7 @@ jobs:
             ldamasio/rbs-backend-monolith-prod:1.0.${{github.run_number}}
             ldamasio/rbs-backend-monolith-prod:latest
 
-      - name: Build and push Docker monolith backend image
+      - name: Build and push Docker monolith backend nginx image
         uses: docker/build-push-action@v5.0.0
         with: 
           context: ./backends/monolith
