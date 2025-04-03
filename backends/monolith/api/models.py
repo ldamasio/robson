@@ -90,15 +90,15 @@ class Piercing():
 class Engulfing():
     type = ('Bullish', 'Bearish')
 
-class ShootingStart():
+class ShootingStar():
     thre_candles = ('Closure', 'Opening', 'Closure')
     type = ('Bullish')
 
-class MorningStart():
+class MorningStar():
     thre_candles = ('Closure', 'Opening', 'Closure')
     type = ('Bullish')
 
-class EveningStart():
+class EveningStar():
     thre_candles = ('Closure', 'Opening', 'Closure')
     type = ('Bullish')
 
