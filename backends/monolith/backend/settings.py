@@ -6,10 +6,6 @@ BASE_DIR = Path(__file__).resolve().parent.parent
 
 config = AutoConfig(search_path=BASE_DIR)
 
-print ('          >>>>>> Sócrates')
-print (BASE_DIR)
-
-
 SECRET_KEY = config("RBS_SECRET_KEY")
 
 DEBUG = config('DEBUG', default=False, cast=bool)
