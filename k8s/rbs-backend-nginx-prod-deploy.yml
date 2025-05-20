@@ -1,0 +1,22 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rbs-backend-nginx-prod-deploy
+  labels:
+    app: rbs-backend-nginx-prod-deploy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rbs-backend-nginx-prod-deploy
+  template:
+    metadata:
+      labels:
+        app: rbs-backend-nginx-prod-deploy
+    spec:
+      initContainers:
+      containers:
+      - name: rbs-backend-nginx-prod-deploy
+        image: ldamasio/rbs-backend-nginx-prod
+        ports:
+        - containerPort: 80

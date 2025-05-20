@@ -3,7 +3,9 @@
 **/node_modules/
 **/__pycache__
 **/.vscode
+**/.http
 **/venv
+**/build
 
 # Logs
 logs

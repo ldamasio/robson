@@ -13,7 +13,6 @@ class Symbol(models.Model):
     class Meta(object):
         unique_together = ["id", "client"]
 
-
 class Order(models.Model):
     client = models.ForeignKey(
         Client, blank=True, null=True, on_delete=models.SET_NULL)
@@ -43,6 +42,79 @@ class Operation(models.Model):
     stop_gain_percent = models.IntegerField(blank=True)
     stop_loss_percent = models.IntegerField(blank=True)
 
-class Note(models.Model):
-    user = models.ForeignKey(CustomUser, on_delete=models.DO_NOTHING)
-    body = models.TextField()
+# Technica Analysis
+
+class TechnicalEvent():
+    type = ('Bullish', 'Bearish')
+
+class Argument():
+    type = ('Bullish', 'Bearish')
+
+class Accumulation():
+    type = ('Bullish', 'Bearish')
+
+class Breakout():
+    type = ('Bullish', 'Bearish')
+
+class Uptrend():
+    type = ('Bullish', 'Bearish')
+
+class Downtrend():
+    type = ('Bullish', 'Bearish')
+
+class Sideways():
+    type = ('Bullish', 'Bearish')
+
+# Chart Patterns
+
+class Rectangle():
+    type = ('Bullish', 'Bearish')
+
+class Triangle():
+    type = ('Bullish', 'Bearish')
+
+class Hammer():
+    type = ('Bullish', 'Bearish')
+
+class InvertedHammer():
+    type = ('Bullish', 'Bearish')
+
+class HangingMan():
+    type = ('Bullish', 'Bearish')
+
+class Piercing():
+    type = ('Bullish', 'Bearish')
+
+# Reversal Patterns
+
+class Engulfing():
+    type = ('Bullish', 'Bearish')
+
+class ShootingStar():
+    thre_candles = ('Closure', 'Opening', 'Closure')
+    type = ('Bullish')
+
+class MorningStar():
+    thre_candles = ('Closure', 'Opening', 'Closure')
+    type = ('Bullish')
+
+class EveningStar():
+    thre_candles = ('Closure', 'Opening', 'Closure')
+    type = ('Bullish')
+
+# Statistical Indicators
+
+class MovingAverage():
+    type = ('Bullish', 'Bearish')
+
+class RelativeStrengthIndex():
+    type = ('Bullish', 'Bearish')
+
+class MovingAverageConvergenceDivergence():
+    type = ('Bullish', 'Bearish')
+
+class BollingerBands():
+    type = ('Bullish', 'Bearish')
+
+class StochasticOscillator():
+        type = ('Bullish', 'Bearish')

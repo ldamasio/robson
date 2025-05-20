@@ -8,7 +8,7 @@ function Download() {
       <Container>
         <Row>
           <Col className="text-left py-3" xs={6}>
-            <h4>Open source code for download.</h4>
+            <h4>Open source code for download</h4>
           </Col>
           <Col className="text-right py-3" xs={6}>
             <LinkContainer to='/download'>
