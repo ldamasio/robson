@@ -1,0 +1,86 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rbs-backend-monolith-prod-deploy
+  labels:
+    app: rbs-backend-monolith-prod-deploy
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rbs-backend-monolith-prod-deploy
+  template:
+    metadata:
+      labels:
+        app: rbs-backend-monolith-prod-deploy
+    spec:
+      containers:
+      - name: rbs-backend-monolith-prod-deploy
+        image: ldamasio/rbs-backend-monolith-prod:latest
+        env:
+        - name: DJANGO_SETTINGS_MODULE
+          value: "backend.settings"
+        - name: RBS_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: rbs-django-secret
+              key: RBS_SECRET_KEY
+        - name: RBS_BINANCE_API_KEY_TEST
+          valueFrom:
+            secretKeyRef:
+              name: rbs-django-secret
+              key: RBS_BINANCE_API_KEY_TEST
+        - name: RBS_BINANCE_SECRET_KEY_TEST
+          valueFrom:
+            secretKeyRef:
+              name: rbs-django-secret
+              key: RBS_BINANCE_SECRET_KEY_TEST
+        - name: RBS_BINANCE_API_KEY_PROD
+          valueFrom:
+            secretKeyRef:
+              name: rbs-django-secret
+              key: RBS_BINANCE_API_KEY_PROD
+        - name: RBS_BINANCE_SECRET_KEY_PROD
+          valueFrom:
+            secretKeyRef:
+              name: rbs-django-secret
+              key: RBS_BINANCE_SECRET_KEY_PROD
+        - name: RBS_BINANCE_API_URL_TEST
+          valueFrom:
+            secretKeyRef:
+              name: rbs-django-secret
+              key: RBS_BINANCE_API_URL_TEST
+        - name: POSTGRES_DATABASE
+          valueFrom:
+            secretKeyRef:
+              name: rbs-django-secret
+              key: POSTGRES_DATABASE
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: rbs-django-secret
+              key: POSTGRES_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: rbs-django-secret
+              key: POSTGRES_PASSWORD
+        - name: POSTGRES_HOST
+          valueFrom:
+            secretKeyRef:
+              name: rbs-django-secret
+              key: POSTGRES_HOST
+        - name: POSTGRES_PORT
+          valueFrom:
+            secretKeyRef:
+              name: rbs-django-secret
+              key: POSTGRES_PORT
+        ports:
+        - containerPort: 8000
+        resources:
+          requests:
+            memory: "1000Mi"
+            cpu: "750m"
+          limits:
+            memory: "1000Mi"
+            cpu: "1500m"

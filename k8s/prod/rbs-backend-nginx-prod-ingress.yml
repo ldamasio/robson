@@ -1,0 +1,25 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rbs-backend-nginx-prod-ingress
+  annotations:
+    cert-manager.io/cluster-issuer: "rbs-backend-prod-clusterissuer"
+    spec.ingressClassName: "public"
+    nginx.ingress.kubernetes.io/from-to-www-redirect: "true"
+spec:
+  tls:
+  - hosts:
+    - backend.robsonbot.com
+    secretName: rbs-backend-nginx-prod-tls
+  rules:
+  - host: backend.robsonbot.com
+    http:
+      paths:
+      - pathType: Prefix
+        path: "/"
+        backend:
+          service:
+            name: rbs-backend-nginx-prod-svc
+            port:
+              number: 80
+
