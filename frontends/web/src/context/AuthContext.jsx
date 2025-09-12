@@ -1,3 +1,5 @@
+
+
 import { createContext, useState, useEffect } from 'react'
 import jwt_decode from 'jwt-decode'
 import { useNavigate } from 'react-router-dom'
@@ -25,7 +27,7 @@ export const AuthProvider = ({ children }) => {
   let loginUser = async (e) => {
     e.preventDefault()
     try {
-      let response = await fetch('https://backend.robsonbot.com/api/token/', {
+      let response = await fetch(`${import.meta.env.VITE_API_BASE_URL}/api/token/`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
@@ -49,6 +51,12 @@ export const AuthProvider = ({ children }) => {
     }
   }
 
+  useEffect(() => {
+    if (import.meta.env.VITE_API_BASE_URL) {
+      console.log('import.meta.env.VITE_API_BASE_URL', import.meta.env.VITE_API_BASE_URL)
+    }
+  }, [import.meta.env.VITE_API_BASE_URL])
+
   let logoutUser = () => {
     setAuthTokens(null)
     setUser(null)
@@ -59,7 +67,7 @@ export const AuthProvider = ({ children }) => {
   let updateToken = async () => {
     try {
       console.log('Updated token.');
-      let response = await fetch('https://backend.robsonbot.com/api/token/refresh/', {
+      let response = await fetch(`${import.meta.env.VITE_API_BASE_URL}/api/token/refresh/`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
