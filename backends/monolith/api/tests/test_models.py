@@ -1,148 +1,159 @@
-class TestStrategyModel(BaseTestCase):
-    """Tests for Strategy model"""
-    
-    def test_strategy_creation(self):
-        """Test basic strategy creation"""
-        strategy = Strategy.objects.create(
-            client=self.client,
-            name="New Strategy",
-            description="Test strategy",
-            config={"test": "value"}
-        )
-        
-        self.assertEqual(strategy.name, "New Strategy")
-        self.assertTrue(strategy.is_active)
-        self.assertEqual(strategy.config["test"], "value")
-        self.assertEqual(strategy.total_trades, 0)
-        self.assertEqual(strategy.win_rate, 0)
-    
-    def test_strategy_config_methods(self):
-        """Test configuration methods"""
-        # Test get_config_value
-        self.assertEqual(self.strategy.get_config_value("sma_fast"), 10)
-        self.assertEqual(self.strategy.get_config_value("nonexistent", "default"), "default")
-        
-        # Test set_config_value
-        self.strategy.set_config_value("new_param", "new_value")
-        self.strategy.refresh_from_db()
-        self.assertEqual(self.strategy.get_config_value("new_param"), "new_value")
-    
-    def test_strategy_performance_tracking(self):
-        """Test performance tracking"""
-        # Simulate trades
-        self.strategy.update_performance(Decimal('100.0'), is_winner=True)
-        self.strategy.update_performance(Decimal('-50.0'), is_winner=False)
-        
-        self.assertEqual(self.strategy.total_trades, 2)
-        self.assertEqual(self.strategy.winning_trades, 1)
-        self.assertEqual(self.strategy.total_pnl, Decimal('50.0'))
-        self.assertEqual(self.strategy.win_rate, 50.0)
-        self.assertEqual(self.strategy.average_pnl_per_trade, Decimal('25.0'))
-
-class TestOrderModel(BaseTestCase):
-    """Tests for Order model"""
-    
-    def test_order_creation(self):
-        """Test basic order creation"""
-        order = Order.objects.create(
-            client=self.client,
-            symbol=self.symbol,
-            strategy=self.strategy,
-            side='BUY',
-            order_type='MARKET',
-            quantity=Decimal('0.1'),
-            price=Decimal('50000.0')
-        )
-        
-        self.assertEqual(order.side, 'BUY')
-        self.assertEqual(order.quantity, Decimal('0.1'))
-        self.assertEqual(order.status, 'PENDING')
-        self.assertEqual(order.remaining_quantity, Decimal('0.1'))
-        self.assertTrue(order.is_active)
-        self.assertFalse(order.is_filled)
-    
-    def test_order_str_method(self):
-        """Test Order __str__ method"""
-        order = Order.objects.create(
-            client=self.client,
-            symbol=self.symbol,
-            side='BUY',
-            quantity=Decimal('0.1'),
-            price=Decimal('50000.0')
-        )
-        
-        expected = "BUY 0.1 BTCUSDT @ 50000.0"
-        self.assertEqual(str(order), expected)
-    
-    def test_order_fill_tracking(self):
-        """Test order fill tracking"""
-        order = Order.objects.create(
-            client=self.client,
-            symbol=self.symbol,
-            side='BUY',
-            quantity=Decimal('0.1'),
-            price=Decimal('50000.0')
-        )
-        
-        # Mark as partially filled
-        order.mark_as_filled(Decimal('49000.0'), Decimal('0.05'))
-        
-        self.assertEqual(order.filled_quantity, Decimal('0.05'))
-        self.assertEqual(order.avg_fill_price, Decimal('49000.0'))
-        self.assertEqual(order.status, 'PARTIALLY_FILLED')
-        self.assertEqual(order.remaining_quantity, Decimal('0.05'))
-        self.assertEqual(order.fill_percentage, 50.0)
-        
-        # Fill completely
-        order.mark_as_filled(Decimal('49000.0'), Decimal('0.1'))
-        
-        self.assertEqual(order.status, 'FILLED')
-        self.assertTrue(order.is_filled)
-        self.assertFalse(order.is_active)
-        self.assertIsNotNone(order.filled_at)# api/tests/test_models.py
-"""
-Tests for refactored models.
+"""Tests for refactored models.
 Ensures refactoring doesn't break existing functionality.
 """
 
-from django.test import TestCase
-from django.core.exceptions import ValidationError
-from django.utils import timezone
 from decimal import Decimal
+
+from django.core.exceptions import ValidationError
+from django.test import TestCase
+from django.utils import timezone
+
 from clients.models import Client
 from api.models import Symbol, Strategy, Order, Operation, Position, Trade
 
+
 class BaseTestCase(TestCase):
-    """Base class for model tests"""
-    
     def setUp(self):
-        """Common setup for all tests"""
         self.client = Client.objects.create(name="Test Client")
-        
         self.symbol = Symbol.objects.create(
             client=self.client,
             name="BTCUSDT",
             description="Bitcoin/USDT pair",
             base_asset="BTC",
-            quote_asset="USDT"
+            quote_asset="USDT",
         )
-        
         self.strategy = Strategy.objects.create(
             client=self.client,
             name="Test Strategy",
             description="Strategy for testing",
-            config={
-                "sma_fast": 10,
-                "sma_slow": 30,
-                "rsi_period": 14
-            },
-            risk_config={
-                "max_position_size": 0.02,
-                "stop_loss_pct": 0.03
-            }
+            config={"sma_fast": 10, "sma_slow": 30, "rsi_period": 14},
+            risk_config={"max_position_size": 0.02, "stop_loss_pct": 0.03},
         )
 
+
+class TestStrategyModel(BaseTestCase):
+    def test_strategy_creation(self):
+        strategy = Strategy.objects.create(
+            client=self.client,
+            name="New Strategy",
+            description="Test strategy",
+            config={"test": "value"},
+        )
+        self.assertEqual(strategy.name, "New Strategy")
+        self.assertTrue(strategy.is_active)
+        self.assertEqual(strategy.config["test"], "value")
+        self.assertEqual(strategy.total_trades, 0)
+        self.assertEqual(strategy.win_rate, 0)
+
+    def test_strategy_config_methods(self):
+        self.assertEqual(self.strategy.get_config_value("sma_fast"), 10)
+        self.assertEqual(
+            self.strategy.get_config_value("nonexistent", "default"), "default"
+        )
+        self.strategy.set_config_value("new_param", "new_value")
+        self.strategy.refresh_from_db()
+        self.assertEqual(self.strategy.get_config_value("new_param"), "new_value")
+
+    def test_strategy_performance_tracking(self):
+        self.strategy.update_performance(Decimal("100.0"), is_winner=True)
+        self.strategy.update_performance(Decimal("-50.0"), is_winner=False)
+        self.assertEqual(self.strategy.total_trades, 2)
+        self.assertEqual(self.strategy.winning_trades, 1)
+        self.assertEqual(self.strategy.total_pnl, Decimal("50.0"))
+        self.assertEqual(self.strategy.win_rate, 50.0)
+        self.assertEqual(self.strategy.average_pnl_per_trade, Decimal("25.0"))
+
+
+class TestOrderModel(BaseTestCase):
+    def test_order_creation(self):
+        order = Order.objects.create(
+            client=self.client,
+            symbol=self.symbol,
+            strategy=self.strategy,
+            side="BUY",
+            order_type="MARKET",
+            quantity=Decimal("0.1"),
+            price=Decimal("50000.0"),
+        )
+        self.assertEqual(order.side, "BUY")
+        self.assertEqual(order.quantity, Decimal("0.1"))
+        self.assertEqual(order.status, "PENDING")
+        self.assertEqual(order.remaining_quantity, Decimal("0.1"))
+        self.assertTrue(order.is_active)
+        self.assertFalse(order.is_filled)
+
+    def test_order_str_method(self):
+        order = Order.objects.create(
+            client=self.client,
+            symbol=self.symbol,
+            side="BUY",
+            quantity=Decimal("0.1"),
+            price=Decimal("50000.0"),
+        )
+        expected = "BUY 0.1 BTCUSDT @ 50000.0"
+        self.assertEqual(str(order), expected)
+
+    def test_order_fill_tracking(self):
+        order = Order.objects.create(
+            client=self.client,
+            symbol=self.symbol,
+            side="BUY",
+            quantity=Decimal("0.1"),
+            price=Decimal("50000.0"),
+        )
+        order.mark_as_filled(Decimal("49000.0"), Decimal("0.05"))
+        self.assertEqual(order.filled_quantity, Decimal("0.05"))
+        self.assertEqual(order.avg_fill_price, Decimal("49000.0"))
+        self.assertEqual(order.status, "PARTIALLY_FILLED")
+        self.assertEqual(order.remaining_quantity, Decimal("0.05"))
+        self.assertEqual(order.fill_percentage, 50.0)
+        order.mark_as_filled(Decimal("49000.0"), Decimal("0.1"))
+        self.assertEqual(order.status, "FILLED")
+        self.assertTrue(order.is_filled)
+        self.assertFalse(order.is_active)
+        self.assertIsNotNone(order.filled_at)
+
 class TestSymbolModel(BaseTestCase):
+    def test_symbol_creation(self):
+        symbol = Symbol.objects.create(
+            client=self.client,
+            name="ETHUSDT",
+            description="Ethereum/USDT pair",
+            base_asset="ETH",
+            quote_asset="USDT",
+        )
+        self.assertEqual(symbol.name, "ETHUSDT")
+        self.assertEqual(symbol.base_asset, "ETH")
+        self.assertEqual(symbol.quote_asset, "USDT")
+        self.assertTrue(symbol.is_active)
+        self.assertIsNotNone(symbol.created_at)
+
+    def test_symbol_str_method(self):
+        expected = f"BTCUSDT ({self.client.name})"
+        self.assertEqual(str(self.symbol), expected)
+
+    def test_symbol_display_properties(self):
+        self.assertEqual(self.symbol.display_name, "BTCUSDT")
+        self.assertEqual(self.symbol.pair_display, "BTC/USDT")
+
+    def test_symbol_name_uppercase(self):
+        symbol = Symbol.objects.create(
+            client=self.client,
+            name="btcusdt",
+            description="Test",
+            base_asset="BTC",
+            quote_asset="USDT",
+        )
+        symbol.clean()
+        symbol.save()
+        self.assertEqual(symbol.name, "BTCUSDT")
+
+    def test_quantity_validation(self):
+        self.assertTrue(self.symbol.is_quantity_valid(Decimal("0.001")))
+        self.assertFalse(self.symbol.is_quantity_valid(Decimal("0.000000001")))
+        self.symbol.max_qty = Decimal("100.0")
+        self.symbol.save()
+        self.assertFalse(self.symbol.is_quantity_valid(Decimal("1000.0")))
     """Tests for Symbol model"""
     
     def test_symbol_creation(self):
@@ -584,28 +595,6 @@ class TestModelChoices(TestCase):
         # Test ORDER_TYPES
         self.assertIn(('MARKET', 'Market'), ModelChoices.ORDER_TYPES)
         self.assertIn(('LIMIT', 'Limit'), ModelChoices.ORDER_TYPES)
-
-class TestOrderModel(BaseTestCase):
-    """Testes para o model Order"""
-    
-    def test_order_creation(self):
-        """Testa criação básica de ordem"""
-        order = Order.objects.create(
-            client=self.client,
-            symbol=self.symbol,
-            strategy=self.strategy,
-            side='BUY',
-            order_type='MARKET',
-            quantity=Decimal('0.1'),
-            price=Decimal('50000.0')
-        )
-        
-        self.assertEqual(order.side, 'BUY')
-        self.assertEqual(order.quantity, Decimal('0.1'))
-        self.assertEqual(order.status, 'PENDING')
-        self.assertEqual(order.remaining_quantity, Decimal('0.1'))
-        self.assertTrue(order.is_active)
-        self.assertFalse(order.is_filled)
     
     def test_order_str_method(self):
         """Testa método __str__ da Order"""
@@ -681,10 +670,10 @@ class TestOrderModel(BaseTestCase):
         self.assertEqual(pnl, expected)
 
 class TestOperationModel(BaseTestCase):
-    """Testes para o model Operation"""
-    
+    """Tests for Operation model (pt duplicate removed)"""
+
     def test_operation_creation(self):
-        """Testa criação básica de operação"""
+        """Basic creation"""
         operation = Operation.objects.create(
             client=self.client,
             strategy=self.strategy,
@@ -700,7 +689,7 @@ class TestOperationModel(BaseTestCase):
         self.assertFalse(operation.is_complete)
     
     def test_operation_with_orders(self):
-        """Testa operação com ordens associadas"""
+        """With associated orders"""
         operation = Operation.objects.create(
             client=self.client,
             strategy=self.strategy,
@@ -708,7 +697,7 @@ class TestOperationModel(BaseTestCase):
             side='BUY'
         )
         
-        # Criar ordem de entrada
+        # Create entry order
         entry_order = Order.objects.create(
             client=self.client,
             symbol=self.symbol,
@@ -718,7 +707,7 @@ class TestOperationModel(BaseTestCase):
         )
         entry_order.mark_as_filled(Decimal('49000.0'))
         
-        # Criar ordem de saída
+        # Create exit order
         exit_order = Order.objects.create(
             client=self.client,
             symbol=self.symbol,
@@ -728,18 +717,18 @@ class TestOperationModel(BaseTestCase):
         )
         exit_order.mark_as_filled(Decimal('52000.0'))
         
-        # Associar ordens à operação
+        # Associate
         operation.entry_orders.add(entry_order)
         operation.exit_orders.add(exit_order)
         
-        # Testar propriedades calculadas
+        # Calculated properties
         self.assertEqual(operation.total_entry_quantity, Decimal('0.1'))
         self.assertEqual(operation.total_exit_quantity, Decimal('0.1'))
         self.assertEqual(operation.average_entry_price, Decimal('49000.0'))
         self.assertEqual(operation.average_exit_price, Decimal('52000.0'))
     
     def test_operation_pnl_calculation(self):
-        """Testa cálculo de P&L da operação"""
+        """Unrealized P&L"""
         operation = Operation.objects.create(
             client=self.client,
             strategy=self.strategy,
@@ -747,7 +736,7 @@ class TestOperationModel(BaseTestCase):
             side='BUY'
         )
         
-        # Simular entrada
+        # Simulate entry
         entry_order = Order.objects.create(
             client=self.client,
             symbol=self.symbol,
@@ -757,13 +746,13 @@ class TestOperationModel(BaseTestCase):
         entry_order.mark_as_filled(Decimal('50000.0'))
         operation.entry_orders.add(entry_order)
         
-        # Calcular P&L não realizado
+        # Calculate unrealized P&L
         unrealized = operation.calculate_unrealized_pnl(Decimal('55000.0'))
         expected = (Decimal('55000.0') - Decimal('50000.0')) * Decimal('0.1')
         self.assertEqual(unrealized, expected)
 
 class TestPositionModel(BaseTestCase):
-    """Testes para o model Position"""
+    """Tests for Position model (pt duplicate removed)"""
     
     def test_position_creation(self):
         """Testa criação básica de posição"""
@@ -835,7 +824,7 @@ class TestPositionModel(BaseTestCase):
             average_price=Decimal('50000.0')
         )
         
-        # Fechar posição
+        # Close position
         final_pnl = position.close_position(Decimal('55000.0'))
         
         self.assertEqual(position.status, 'CLOSED')
@@ -844,10 +833,10 @@ class TestPositionModel(BaseTestCase):
         self.assertEqual(final_pnl, expected_pnl)
 
 class TestTradeModel(BaseTestCase):
-    """Testes para o model Trade"""
+    """Tests for Trade model (pt duplicate removed)"""
     
     def test_trade_creation(self):
-        """Testa criação básica de trade"""
+        """Basic trade creation"""
         trade = Trade.objects.create(
             client=self.client,
             symbol=self.symbol,
@@ -883,9 +872,9 @@ class TestTradeModel(BaseTestCase):
             exit_time=exit_time
         )
         
-        # P&L deve ser calculado automaticamente no save
+        # P&L should be calculated automatically on save
         expected_gross = (Decimal('55000.0') - Decimal('50000.0')) * Decimal('0.1')
-        expected_net = expected_gross - Decimal('10.0')  # Descontando fees
+        expected_net = expected_gross - Decimal('10.0')
         
         self.assertEqual(trade.pnl, expected_net)
         self.assertEqual(trade.total_fees, Decimal('10.0'))
@@ -897,7 +886,7 @@ class TestTradeModel(BaseTestCase):
         self.assertEqual(trade.pnl_percentage, expected_pct)
     
     def test_trade_properties(self):
-        """Testa propriedades do trade"""
+        """Trade properties"""
         # Trade vencedor
         winning_trade = Trade.objects.create(
             client=self.client,
@@ -926,10 +915,10 @@ class TestTradeModel(BaseTestCase):
         self.assertFalse(losing_trade.is_winner)
 
 class TestMixinsAndBaseClasses(BaseTestCase):
-    """Testes para mixins e classes base"""
+    """Tests for mixins and base classes (pt duplicate removed)"""
     
     def test_timestamp_mixin(self):
-        """Testa TimestampMixin"""
+        """TimestampMixin"""
         symbol = Symbol.objects.create(
             client=self.client,
             name="TESTUSDT",
@@ -941,10 +930,10 @@ class TestMixinsAndBaseClasses(BaseTestCase):
         self.assertIsNotNone(symbol.created_at)
         self.assertIsNotNone(symbol.updated_at)
         self.assertIsNotNone(symbol.age)
-        self.assertIsNotNone(symbol.last_updated_ago)
+        self.assertIsNotNone(symbol.time_since_last_update)
     
     def test_tenant_mixin(self):
-        """Testa TenantMixin"""
+        """TenantMixin"""
         symbol = Symbol.objects.create(
             client=self.client,
             name="TESTUSDT",
@@ -957,7 +946,7 @@ class TestMixinsAndBaseClasses(BaseTestCase):
         self.assertEqual(symbol.client_name, self.client.name)
     
     def test_status_mixin(self):
-        """Testa StatusMixin"""
+        """StatusMixin"""
         symbol = Symbol.objects.create(
             client=self.client,
             name="TESTUSDT",
@@ -1008,27 +997,18 @@ class TestMixinsAndBaseClasses(BaseTestCase):
         self.assertEqual(active_client_symbols.count(), 2)  # Apenas os ativos
 
 class TestModelChoices(TestCase):
-    """Testes para ModelChoices"""
-    
+    """Tests for ModelChoices"""
+
     def test_choices_availability(self):
-        """Testa se todas as choices estão disponíveis"""
         from api.models.base import ModelChoices
-        
-        # Testar ORDER_SIDES
-        self.assertIn(('BUY', 'Buy'), ModelChoices.ORDER_SIDES)
-        self.assertIn(('SELL', 'Sell'), ModelChoices.ORDER_SIDES)
-        
-        # Testar ORDER_STATUS
-        self.assertIn(('PENDING', 'Pending'), ModelChoices.ORDER_STATUS)
-        self.assertIn(('FILLED', 'Filled'), ModelChoices.ORDER_STATUS)
-        
-        # Testar TIMEFRAMES
-        self.assertIn(('1m', '1 Minute'), ModelChoices.TIMEFRAMES)
-        self.assertIn(('1d', '1 Day'), ModelChoices.TIMEFRAMES)
-        
-        # Testar ORDER_TYPES
-        self.assertIn(('MARKET', 'Market'), ModelChoices.ORDER_TYPES)
-        self.assertIn(('LIMIT', 'Limit'), ModelChoices.ORDER_TYPES)
+        self.assertIn(("BUY", "Buy"), ModelChoices.ORDER_SIDES)
+        self.assertIn(("SELL", "Sell"), ModelChoices.ORDER_SIDES)
+        self.assertIn(("PENDING", "Pending"), ModelChoices.ORDER_STATUS)
+        self.assertIn(("FILLED", "Filled"), ModelChoices.ORDER_STATUS)
+        self.assertIn(("1m", "1 Minute"), ModelChoices.TIMEFRAMES)
+        self.assertIn(("1d", "1 Day"), ModelChoices.TIMEFRAMES)
+        self.assertIn(("MARKET", "Market"), ModelChoices.ORDER_TYPES)
+        self.assertIn(("LIMIT", "Limit"), ModelChoices.ORDER_TYPES)
         
         
     

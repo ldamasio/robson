@@ -18,8 +18,8 @@ AUTH_USER_MODEL = 'clients.CustomUser'
 # ==========================================
 # TRADING/BINANCE CONFIGURATION
 # ==========================================
-BINANCE_API_KEY_TEST = config("RBS_BINANCE_API_KEY_TEST")
-BINANCE_SECRET_KEY_TEST = config("RBS_BINANCE_SECRET_KEY_TEST")
+BINANCE_API_KEY_TEST = config("RBS_BINANCE_API_KEY_TEST", default="")
+BINANCE_SECRET_KEY_TEST = config("RBS_BINANCE_SECRET_KEY_TEST", default="")
 BINANCE_API_KEY = config("RBS_BINANCE_API_KEY", default="")
 BINANCE_SECRET_KEY = config("RBS_BINANCE_SECRET_KEY", default="")
 BINANCE_USE_TESTNET = config('BINANCE_USE_TESTNET', default=True, cast=bool)

@@ -76,7 +76,7 @@ try:
     from ..models import TechnicalAnalysisInterpretation
     from ..models import TechnicalEvent
     from ..models import Argument
-    from ..models import Reaseon  # TODO: Fix typo to Reason
+    from ..models import Reason
     
     # Facts
     from ..models import Resistance
@@ -152,7 +152,7 @@ __all__ = [
     'TechnicalAnalysisInterpretation',
     'TechnicalEvent',
     'Argument',
-    'Reaseon',  # Typo - fix to Reason
+    'Reason',
     'Resistance',
     'Support',
     'Line',
@@ -191,7 +191,7 @@ MIGRATION_STATUS = {
         'TechnicalAnalysisInterpretation',
         'TechnicalEvent', 
         'Argument',
-        'Reaseon',  # Fix typo
+        'Reason',
         'Resistance',
         'Support',
         'Line',
@@ -214,4 +214,3 @@ def get_migration_status():
 def list_available_models():
     """List all available models"""
     return __all__
-

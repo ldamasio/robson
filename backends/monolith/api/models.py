@@ -126,7 +126,7 @@ class Argument(models.Model):
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
 
-class Reaseon(models.Model):
+class Reason(models.Model):
     client = models.ForeignKey(
         Client, blank=True, null=True, on_delete=models.SET_NULL)
     tenant_id = 'client_id'
@@ -365,4 +365,3 @@ class AlocatedCapitalPercent(models.Model):
     description = models.TextField()
     created_at = models.DateTimeField(auto_now_add=True)
     updated_at = models.DateTimeField(auto_now=True)
-
