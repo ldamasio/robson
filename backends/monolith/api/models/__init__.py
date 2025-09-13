@@ -53,6 +53,14 @@ from .trading import (
     Trade,
 )
 
+# Import technical analysis models (refactored)
+from .analysis import (
+    TechnicalAnalysisInterpretation,
+    TechnicalEvent,
+    Argument,
+    Reason,
+)
+
 # ==========================================
 # MAINTAIN COMPATIBILITY WITH OLD MODELS
 # ==========================================
@@ -73,10 +81,7 @@ try:
     from ..models import Attribute
     
     # Technical Analysis
-    from ..models import TechnicalAnalysisInterpretation
-    from ..models import TechnicalEvent
-    from ..models import Argument
-    from ..models import Reason
+    # Technical analysis models migrated to api/models/analysis.py
     
     # Facts
     from ..models import Resistance

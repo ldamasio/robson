@@ -88,6 +88,43 @@ class Migration(migrations.Migration):
     operations = [migrations.RunPython(split_symbol)]
 ```
 
+7) Clean‑slate reset (development)
+- If you do not need to preserve data and want to avoid interactive rename prompts:
+```bash
+# from repo root
+make dev-reset-api
+```
+This drops the dev Postgres volume, removes `api` migrations (except `__init__.py`), then recreates and applies migrations from the current models.
+
+8) Rollback & recovery
+- Roll back a specific app (example):
+```bash
+./bin/dj migrate api 0001
+```
+- Roll back all apps to zero (dangerous):
+```bash
+./bin/dj migrate zero
+```
+- Restore from backup (if you exported fixtures):
+```bash
+./bin/dj loaddata backup_clients.json
+./bin/dj loaddata backup_api.json
+```
+
+9) Post‑migration cleanup
+- Once all legacy models are migrated, remove temporary imports from `api/models/__init__.py` that point to legacy `api/models.py`.
+- Remove any unused legacy classes from `backends/monolith/api/models.py`.
+- Search and replace old import paths in code/tests to the new locations (`api/models/trading.py`, etc.).
+
+10) Environment prerequisites
+- Ensure these variables exist in `backends/monolith/.env`:
+  - `RBS_SECRET_KEY`, `DEBUG=True`
+  - `RBS_PG_DATABASE`, `RBS_PG_USER`, `RBS_PG_PASSWORD`, `RBS_PG_HOST=localhost`, `RBS_PG_PORT=5432`
+  - Optional for development: `BINANCE_USE_TESTNET=True`, `TRADING_ENABLED=False`, `RBS_BINANCE_API_KEY_TEST`, `RBS_BINANCE_SECRET_KEY_TEST`
+
+11) CI notes (optional)
+- A GitHub Actions workflow (`.github/workflows/backend-tests.yml`) runs migrations and tests on every push/PR. Keep the suite green before merging.
+
 New features available
 - Managers: `Symbol.active.all()`, `Symbol.objects.for_client(client_id)`, `Symbol.objects.active_for_client(client_id)`.
 - Computed properties: `Symbol.display_name`, `Symbol.pair_display`, `Order.remaining_quantity`, `Order.fill_percentage`, `Position.is_long`, `Strategy.win_rate`, `Strategy.average_pnl_per_trade`.
