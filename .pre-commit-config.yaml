@@ -1,0 +1,31 @@
+repos:
+  - repo: https://github.com/pre-commit/pre-commit-hooks
+    rev: v4.6.0
+    hooks:
+      - id: trailing-whitespace
+      - id: end-of-file-fixer
+      - id: check-yaml
+      - id: check-added-large-files
+
+  - repo: https://github.com/psf/black
+    rev: 24.8.0
+    hooks:
+      - id: black
+        language_version: python3.12
+
+  - repo: https://github.com/pycqa/isort
+    rev: 5.13.2
+    hooks:
+      - id: isort
+        args: ["--profile", "black"]
+        language_version: python3.12
+
+  - repo: local
+    hooks:
+      - id: enforce-english-only
+        name: Enforce English-only comments/docstrings
+        entry: bash -c 'rg -n "[áàâãéèêíìîóòôõúùûçÁÀÂÃÉÈÊÍÌÎÓÒÔÕÚÙÛÇ]" -S --hidden --glob "!docs/vendor/**" --glob "!backends/monolith/staticfiles/**" --glob "!.venv/**" || true | tee /dev/stderr | (! rg .)'
+        language: system
+        pass_filenames: false
+        types: [text]
+

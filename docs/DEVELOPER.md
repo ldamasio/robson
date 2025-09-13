@@ -170,5 +170,6 @@ Coding Style
     - `flake8 api/ backends/monolith/backend/`
     - `mypy api/` (if types are adopted)
 - Pre‑commit (optional)
-  - `python -m pip install pre-commit && pre-commit install`
-  - Example hooks: black, isort, flake8. Configure to your flow.
+  - Install once: `make pre-commit-install` (or `python -m pip install pre-commit && pre-commit install`)
+  - Run on all files: `make lint` (wraps `pre-commit run --all-files`)
+  - Default hooks include: trailing whitespace, EOF fix, YAML check, black, isort, and an English‑only checker for comments/docstrings.

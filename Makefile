@@ -67,3 +67,19 @@ dev-reset-api:
 	@cd $(MONO_DIR) && python manage.py makemigrations api
 	@cd $(MONO_DIR) && python manage.py migrate
 	@echo "✓ Reset complete. You can now run: make dev-test"
+
+# ==============================
+# Pre-commit helpers
+# ==============================
+
+.PHONY: pre-commit-install lint format
+
+pre-commit-install:
+	@python -m pip install pre-commit
+	@pre-commit install
+	@echo "✓ pre-commit installed and git hook enabled"
+
+lint:
+	@pre-commit run --all-files
+
+format: lint
