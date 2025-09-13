@@ -1,13 +1,13 @@
-# api/views/binance_endpoints.py - NOVA ESTRUTURA ORGANIZADA
-"""
-Mapeamento completo da API Binance
-Baseado na documentação oficial: https://binance-docs.github.io/apidocs/spot/en/
+"""api/views/binance_endpoints.py - Organized mapping for Binance endpoints.
 
-Estrutura:
-✅ = Implementado
-🔄 = Em desenvolvimento  
-📋 = Planejado (placeholder)
-❌ = Não aplicável ao bot
+This module maps Binance REST endpoints used by the project.
+Based on the official docs: https://binance-docs.github.io/apidocs/spot/en/
+
+Legend:
+✅ = Implemented
+🔄 = In development
+📋 = Planned (placeholder)
+❌ = Not applicable for the bot
 """
 
 from django.http import JsonResponse
@@ -19,7 +19,7 @@ from ..services import BinanceService
 # GENERAL ENDPOINTS
 # ==========================================
 class GeneralEndpoints:
-    """Endpoints gerais da Binance"""
+    """General Binance endpoints."""
     
     @staticmethod
     @api_view(['GET'])
@@ -47,7 +47,7 @@ class GeneralEndpoints:
     @api_view(['GET'])
     def system_status(request):
         """📋 Fetch system status"""
-        # TODO: Implementar quando necessário para monitoramento
+        # TODO: implement if/when monitoring requires it
         return JsonResponse({
             "status": "planned",
             "message": "System status endpoint planned for monitoring phase",
@@ -58,7 +58,7 @@ class GeneralEndpoints:
     @api_view(['GET'])
     def exchange_info(request):
         """📋 Current exchange trading rules and symbol information"""
-        # TODO: Importante para validar símbolos disponíveis
+        # TODO: important to validate available symbols
         return JsonResponse({
             "status": "planned",
             "message": "Exchange info endpoint planned for symbol validation",
@@ -69,7 +69,7 @@ class GeneralEndpoints:
 # MARKET DATA ENDPOINTS
 # ==========================================
 class MarketDataEndpoints:
-    """Endpoints de dados de mercado"""
+    """Market data endpoints."""
     
     @staticmethod
     @api_view(['GET'])
@@ -95,7 +95,7 @@ class MarketDataEndpoints:
 # SPOT ACCOUNT ENDPOINTS
 # ==========================================
 class SpotAccountEndpoints:
-    """Endpoints da conta spot"""
+    """Spot account endpoints."""
     
     @staticmethod
     @api_view(['GET'])
@@ -146,13 +146,13 @@ class SpotAccountEndpoints:
 # SPOT TRADING ENDPOINTS
 # ==========================================
 class SpotTradingEndpoints:
-    """Endpoints de trading spot"""
+    """Spot trading endpoints."""
     
     @staticmethod
     @api_view(['POST'])
     @permission_classes([IsAuthenticated])
     def place_order(request):
-        """🔄 Place a new order - CRÍTICO para o bot"""
+        """🔄 Place a new order — critical for the bot."""
         return JsonResponse({
             "status": "in_development",
             "message": "Order placement is critical - implementing with risk management",
@@ -163,7 +163,7 @@ class SpotTradingEndpoints:
     @api_view(['POST'])
     @permission_classes([IsAuthenticated])
     def place_test_order(request):
-        """✅ Test new order creation - Ótimo para desenvolvimento"""
+        """✅ Test new order creation — great for development."""
         return JsonResponse({
             "status": "ready_for_implementation",
             "message": "Test orders are safe for development and testing",
@@ -207,7 +207,7 @@ class SpotTradingEndpoints:
 # MARGIN TRADING ENDPOINTS  
 # ==========================================
 class MarginTradingEndpoints:
-    """Endpoints de trading com margem"""
+    """Margin trading endpoints."""
     
     @staticmethod
     @api_view(['GET'])
@@ -232,16 +232,16 @@ class MarginTradingEndpoints:
         })
 
 # ==========================================
-# FUTURES ENDPOINTS (quando implementar)
+# FUTURES ENDPOINTS (future work)
 # ==========================================
 class FuturesEndpoints:
-    """Endpoints de futuros - Fase 2 do projeto"""
+    """Futures endpoints — Phase 2 scope."""
     
     @staticmethod
     @api_view(['GET'])
     @permission_classes([IsAuthenticated])
     def futures_account(request):
-        """❌ Futures account information - Não implementar ainda"""
+        """❌ Futures account information — not implementing yet."""
         return JsonResponse({
             "status": "future_phase",
             "message": "Futures trading planned for Phase 2 - too risky for MVP",
@@ -252,7 +252,7 @@ class FuturesEndpoints:
 # UTILITY ENDPOINTS
 # ==========================================
 class UtilityEndpoints:
-    """Endpoints utilitários e informativos"""
+    """Utility and informational endpoints."""
     
     @staticmethod
     @api_view(['GET'])
@@ -280,14 +280,14 @@ class UtilityEndpoints:
 # CUSTOM ROBSON BOT ENDPOINTS
 # ==========================================
 class RobsonBotEndpoints:
-    """Endpoints específicos do Robson Bot"""
+    """Robson Bot specific endpoints."""
     
     @staticmethod
     @api_view(['GET'])
     @permission_classes([IsAuthenticated])
     def patrimony(request):
-        """✅ Calculate total portfolio value - Já implementado"""
-        # Sua implementação atual está funcionando
+        """✅ Calculate total portfolio value — implemented."""
+        # Current implementation works
         result_patrimony = {"patrimony": 400}
         return JsonResponse(result_patrimony)
     
@@ -295,16 +295,15 @@ class RobsonBotEndpoints:
     @api_view(['GET'])
     @permission_classes([IsAuthenticated])
     def historical_data(request):
-        """✅ Get historical market data - Já implementado (Week)"""
-        # Sua função Week() já faz isso bem
-        # TODO: Mover lógica para MarketDataService
+        """✅ Get historical market data — implemented (Week)."""
+        # The existing Week() function handles this well
+        # TODO: move logic to MarketDataService
         pass
 
 # ==========================================
 # URL MAPPING ORGANIZADO
 # ==========================================
-"""
-Sugestão de organização das URLs:
+"""URL mapping suggestion:
 
 api/urls.py:
 - /general/ping/
