@@ -114,5 +114,5 @@ typings/
 #Vscode config file
 .vscode
 
-
-nohup.out
+# Cursor rules
+.cursorrules

@@ -1,0 +1,3 @@
+[submodule "docs/vendor/binance-spot"]
+	path = docs/vendor/binance-spot
+	url = https://github.com/binance/binance-spot-api-docs

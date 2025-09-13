@@ -14,8 +14,8 @@ function Patrimony() {
     const fetchData = async () => {
       setLoading(true);
       try {
-        const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
-        const {data: response} = await axios.get(BACKEND_URL + '/api/patrimony/');
+        const BACKEND_URL = import.meta.env.VITE_API_BASE_URL;
+        const {data: response} = await axios.get(VITE_API_BASE_URL + '/api/patrimony/');
         setData(response);
       } catch (error) {
         console.error(error.message);

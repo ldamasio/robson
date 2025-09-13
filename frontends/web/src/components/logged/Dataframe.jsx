@@ -38,8 +38,8 @@ function Dataframe() {
     const fetchData = async () =>{
       setLoading(true);
       try {
-        const BACKEND_URL = process.env.REACT_APP_BACKEND_URL;
-        const {data: response} = await axios.get(BACKEND_URL + '/api/last-week/');
+        const BACKEND_URL = import.meta.env.VITE_API_BASE_URL;
+        const {data: response} = await axios.get(VITE_API_BASE_URL + '/api/last-week/');
         var response_clean = response.last_week
         response_clean = response_clean.trim();
         var response_json = JSON.parse(response_clean);

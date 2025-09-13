@@ -1,6 +1,8 @@
 
 Robson Bot
 
+[![Backend Tests](https://github.com/ldamasio/robson/actions/workflows/backend-tests.yml/badge.svg)](https://github.com/ldamasio/robson/actions/workflows/backend-tests.yml)
+
 Just another crypto robot
 
 ROBSON BOT is an open source algo trade project. It is a robot specialized in cryptocurrency trading (automatic buying and selling of digital assets), programmed, with backend and data modeling in Python, to monitor the market in real time, using asynchronous communication between the exchange and the application, that is, your dashboard and your “brain”. With this, Robson Bot is capable of making intelligent decisions based on a set of strategies guided by probabilistic analysis and technical analysis. The open source project includes a risk management system, tools for disseminating trade signals and functions as a platform, enabling multiple users with security and data isolation (multi-tenant).
@@ -33,18 +35,34 @@ docker-compose up -d --build
 
 ### Development Backend Environment
 
-Commands that may be util:
+Recommended local dev setup (Postgres via Docker + helper script):
 
 ```
 cd backends/monolith/
-cp .env.example .env
-py -m venv .venv
+# 1) Prepare .env for development (localhost Postgres)
+cp .env.development.example .env
+
+# 2) Create venv and install deps
+python -m venv .venv
 source .venv/bin/activate
-py -m pip install --upgrade pip
-# py -m pip install --upgrade setuptools
-py -m pip install -r requirements.txt
+python -m pip install --upgrade pip
+# python -m pip install --upgrade setuptools
+python -m pip install -r requirements.txt
 export DJANGO_SETTINGS_MODULE=backend.settings
-cp -r staticfiles/* docker/static/
+
+# 3) Start local Postgres (Docker Compose)
+cd ..
+make dev-db-up
+cd monolith
+
+# 4) Migrate and run tests using the helper script
+chmod +x bin/dj
+./bin/dj makemigrations api
+./bin/dj migrate
+./bin/dj test
+
+# 5) Run server
+./bin/dj runserver
 ```
 
 ### Development Frontend Environment
@@ -54,3 +72,25 @@ nvm use 14
 npm i
 npm start
 
+
+
+
+To update vendor docs in the future, run:
+
+```bash
+make sync-binance-docs
+```
+
+## Contributing
+
+Robson is 100% open source and contributions are welcome. For how to prepare your dev environment, run tests, create migrations, and submit PRs, see:
+
+- docs/DEVELOPER.md
+- docs/STYLE_GUIDE.md
+
+Deploys de produção são feitos via GitOps/CI (GitHub Actions + ArgoCD + k3s). O script `./bin/dj` e o `docker-compose.dev.yml` são destinados apenas ao desenvolvimento local.
+
+Notes
+- The `./bin/dj` script is for local development only. Production deploys should be performed via your GitOps/CI pipeline (e.g., GitHub Actions + ArgoCD + k3s).
+- The local Postgres runs with Docker Compose using `backends/monolith/docker-compose.dev.yml` and credentials from `backends/monolith/.env`.
+  - Makefile helpers: `make dev-db-up`, `make dev-db-down`, `make dev-db-destroy`, `make dev-test`.

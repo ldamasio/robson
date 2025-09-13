@@ -1,0 +1,62 @@
+name: Backend Tests
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+    branches: ["**"]
+
+jobs:
+  tests:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_DB: robson_ci
+          POSTGRES_USER: robson
+          POSTGRES_PASSWORD: robson
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd="pg_isready -U robson -d robson_ci"
+          --health-interval=10s
+          --health-timeout=5s
+          --health-retries=10
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: 'pip'
+          cache-dependency-path: backends/monolith/requirements.txt
+
+      - name: Install dependencies
+        working-directory: backends/monolith
+        run: |
+          python -m pip install --upgrade pip
+          python -m pip install -r requirements.txt
+
+
+      - name: Migrate and run tests
+        working-directory: backends/monolith
+        env:
+          RBS_SECRET_KEY: ci-secret-key
+          DEBUG: 'True'
+          RBS_PG_DATABASE: robson_ci
+          RBS_PG_USER: robson
+          RBS_PG_PASSWORD: robson
+          RBS_PG_HOST: 127.0.0.1
+          RBS_PG_PORT: '5432'
+          BINANCE_USE_TESTNET: 'True'
+          TRADING_ENABLED: 'False'
+          RBS_BINANCE_API_KEY_TEST: ''
+          RBS_BINANCE_SECRET_KEY_TEST: ''
+        run: |
+          python manage.py migrate --noinput
+          python manage.py test -v 2

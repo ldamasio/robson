@@ -1,3 +1,7 @@
+# api/views.py 
+
+from .services import BinanceService  # NOVA IMPORT
+
 from binance.client import Client
 # import time
 import datetime
@@ -18,17 +22,19 @@ from .models import Strategy
 # from django_multitenant.views import TenantModelViewSet
 from clients.models import CustomUser
 
+
+
 client=Client(settings.BINANCE_API_KEY_TEST, settings.BINANCE_SECRET_KEY_TEST)
 
-class MyTokenObtainPairSerializer(TokenObtainPairSerializer):
-    @classmethod
-    def get_token(cls, user):
-        token = super().get_token(user)
-        token['username'] = user.username
-        return token
+# class MyTokenObtainPairSerializer(TokenObtainPairSerializer):
+#     @classmethod
+#     def get_token(cls, user):
+#         token = super().get_token(user)
+#         token['username'] = user.username
+#         return token
 
-class MyTokenObtainPairView(TokenObtainPairView):
-    serializer_class = MyTokenObtainPairSerializer
+# class MyTokenObtainPairView(TokenObtainPairView):
+#     serializer_class = MyTokenObtainPairSerializer
 
 
 @api_view(['GET'])
@@ -43,13 +49,31 @@ def getStrategies (request):
     return Response(serializer.data)
     # return JsonResponse({"name":"a"})
  
+# def Ping(request):
+#     result_ping = client.ping()
+#     return JsonResponse({"pong": result_ping})
+
 def Ping(request):
-    result_ping = client.ping()
-    return JsonResponse({"pong": result_ping})
+    """Refatorada para usar BinanceService"""
+    try:
+        service = BinanceService()
+        result = service.ping()
+        return JsonResponse({"pong": result})
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
+
+# def ServerTime(request):
+#     result_time = client.get_server_time()
+#     return JsonResponse({"time": result_time})
 
 def ServerTime(request):
-    result_time = client.get_server_time()
-    return JsonResponse({"time": result_time})
+    """Refatorada para usar BinanceService"""
+    try:
+        service = BinanceService()
+        result = service.get_server_time()
+        return JsonResponse({"time": result})
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
 
 def SystemStatus(request):
     
