@@ -144,6 +144,8 @@ Contributing
   - Never commit secrets. Use local `.env` and keep `.env.example` updated.
 - Production
   - Production deploys via GitOps/CI (GitHub Actions + ArgoCD + k3s). Do not use `bin/dj` for prod.
+ - AI collaboration
+   - Follow docs/AI_WORKFLOW.md: English‑only, Conventional Commits, and always propose a semantic commit message after changes.
 
 Support
 - Open issues with clear reproduction, logs, and environment version.

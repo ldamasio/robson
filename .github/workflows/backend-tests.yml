@@ -61,5 +61,4 @@ jobs:
           RBS_BINANCE_SECRET_KEY_TEST: ''
         run: |
           python manage.py migrate --noinput
-          python manage.py test api.tests.test_models -v 2
-
+          python manage.py test -v 2

@@ -36,4 +36,4 @@ Tooling
 Commits & PRs
 - Use Conventional Commits for messages (e.g., `feat:`, `fix:`, `chore:`, `docs:`, `ci:`).
 - Keep PRs small and focused; include migration notes and test coverage.
-
+ - AI assistants: after every modification (file add/update/delete or directory change), always propose an English semantic commit message to the user.
