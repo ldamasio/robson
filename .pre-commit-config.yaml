@@ -3,28 +3,48 @@ repos:
     rev: v4.6.0
     hooks:
       - id: trailing-whitespace
+        files: |
+          (?x)^(
+            backends/monolith/(api|backend)/.*|
+            docs/(?!vendor/).*|
+            \.github/workflows/.*|
+            README\.md|Makefile|\.pre-commit-config\.yaml
+          )$
         exclude: |
           (?x)(
             ^backends/monolith/\.venv/|
             ^backends/monolith/\.old/|
             ^backends/monolith/staticfiles/|
+            ^backends/monolith/docker/static/|
             ^docs/vendor/|
             ^frontends/web/node_modules/|
             ^frontends/web/(dist|build)/|
             \.min\.(js|css)$
           )
       - id: end-of-file-fixer
+        files: |
+          (?x)^(
+            backends/monolith/(api|backend)/.*|
+            docs/(?!vendor/).*|
+            \.github/workflows/.*|
+            README\.md|Makefile|\.pre-commit-config\.yaml
+          )$
         exclude: |
           (?x)(
             ^backends/monolith/\.venv/|
             ^backends/monolith/\.old/|
             ^backends/monolith/staticfiles/|
+            ^backends/monolith/docker/static/|
             ^docs/vendor/|
             ^frontends/web/node_modules/|
             ^frontends/web/(dist|build)/|
             \.min\.(js|css)$
           )
       - id: check-yaml
+        files: |
+          (?x)^(
+            \.github/workflows/.*|.*\.ya?ml$
+          )
         exclude: |
           (?x)(
             ^backends/monolith/\.venv/|
@@ -57,18 +77,7 @@ repos:
     hooks:
       - id: enforce-english-only
         name: Enforce English-only comments/docstrings
-        entry: bash -c 'rg -n "[áàâãéèêíìîóòôõúùûçÁÀÂÃÉÈÊÍÌÎÓÒÔÕÚÙÛÇ]" -S --hidden \
-          --glob "!docs/vendor/**" \
-          --glob "!backends/monolith/staticfiles/**" \
-          --glob "!backends/monolith/.old/**" \
-          --glob "!.venv/**" \
-          --glob "!backends/monolith/.venv/**" \
-          --glob "!frontends/web/node_modules/**" \
-          --glob "!frontends/web/dist/**" \
-          --glob "!frontends/web/build/**" \
-          --glob "!**/*.min.css" \
-          --glob "!**/*.min.js" \
-          || true | tee /dev/stderr | (! rg .)'
-        language: system
-        pass_filenames: false
+        entry: python scripts/check_english_only.py
+        language: python
+        pass_filenames: true
         types: [text]
