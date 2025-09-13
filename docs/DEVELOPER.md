@@ -1,29 +1,29 @@
 Robson Bot – Developer Guide
 
 Overview
-- Robson é open source. Este guia padroniza o ambiente de desenvolvimento local, ciclo de migrações/testes e boas práticas de contribuição, mantendo produção isolada (GitOps/CI/CD).
+- Robson is open source. This guide standardizes local development, migrations/tests, and contribution practices, keeping production isolated (GitOps/CI/CD).
 
-Project Layout (essencial)
+Project Layout (essentials)
 - Backend (Django): `backends/monolith/`
   - `manage.py`, `backend/settings.py`
-  - `api/models/` (modelos refatorados: `base.py`, `trading.py`)
+  - `api/models/` (refactored models: `base.py`, `trading.py`)
   - `api/tests/test_models.py`
-  - `docker-compose.dev.yml` (Postgres local para dev)
-  - `bin/dj` (helper script para dev)
+  - `docker-compose.dev.yml` (local Postgres for dev)
+  - `bin/dj` (dev helper script)
 - Frontend (Vite/React): `frontends/web/`
 - Docs: `docs/`
-  - `DEVELOPER.md` (este arquivo)
+  - `DEVELOPER.md` (this file)
   - `AUTH_FLOW.md`
-  - `vendor/` (submódulos de referência, ex.: Binance)
+  - `vendor/` (reference submodules, e.g., Binance)
 
-Prerequisitos
+Prerequisites
 - Python 3.12+
-- Node.js (para o front; ver versões no projeto)
+- Node.js (front; see versions in the project)
 - Docker + Docker Compose
-- Postgres client (opcional, para inspeção via psql)
+- Postgres client (optional, for psql)
 
-Setup Rápido (backend)
-1) Clone e prepare venv
+Backend quick start
+1) Create venv and install deps
 ```
 cd backends/monolith
 cp .env.development.example .env
@@ -31,52 +31,52 @@ python -m venv .venv
 source .venv/bin/activate
 python -m pip install -r requirements.txt
 ```
-Importante: garanta que as chaves de testnet da Binance existam no `.env` (mesmo que dummy), pois o settings as lê sem default:
+Important: ensure Binance testnet keys exist in `.env` (can be dummy), since settings read them without secrets:
 ```
 RBS_BINANCE_API_KEY_TEST=dev-test-api-key
 RBS_BINANCE_SECRET_KEY_TEST=dev-test-secret-key
 ```
-2) Suba Postgres local (Docker)
-Execute este comando a partir da raiz do repositório:
+2) Start local Postgres (Docker)
+Run from the repo root:
 ```
 # na raiz do repositório
 make dev-db-up
 ```
-Alternativa direta sem Makefile:
+Direct alternative without Makefile:
 ```
 docker compose -f backends/monolith/docker-compose.dev.yml up -d
 ```
 
-Subir Postgres a partir da raiz do projeto
+Postgres from the repo root
 ```
-# na raiz do repositório
-make dev-db-up       # sobe o Postgres de desenvolvimento
-make dev-db-logs     # acompanha logs do container
-make dev-db-down     # para o container
-make dev-db-destroy  # para e remove o volume de dados
+# at repo root
+make dev-db-up       # start dev Postgres
+make dev-db-logs     # follow container logs
+make dev-db-down     # stop container
+make dev-db-destroy  # remove container and volume
 ```
-Alternativa direta sem Makefile:
+Direct alternative without Makefile:
 ```
 docker compose -f backends/monolith/docker-compose.dev.yml up -d
 docker compose -f backends/monolith/docker-compose.dev.yml down
 ```
 
-Reset rápido de ambiente (clean slate)
-- Se você não precisa preservar dados e deseja evitar prompts interativos do `makemigrations`, use o reset completo de dev (apaga volume do Postgres e migrações do app `api`):
+Clean‑slate reset (fast path)
+- If you don’t need to preserve data and want to avoid interactive `makemigrations` prompts, use the full dev reset (drops Postgres volume and `api` migrations):
 ```
-# na raiz do repositório
+# from repo root
 make dev-reset-api
 ```
-O alvo executa:
-- `docker compose down -v` e `up -d` do Postgres de dev
-- remove todos os arquivos de migração em `api/migrations` (exceto `__init__.py`)
-- recria e aplica as migrações com o estado atual dos models
-Depois disso, rode os testes normalmente:
+The target performs:
+- `docker compose down -v` and `up -d` for dev Postgres
+- removes all migration files in `api/migrations` (except `__init__.py`)
+- recreates and applies migrations from the current models
+Then run tests as usual:
 ```
 cd backends/monolith
 ./bin/dj test
 ```
-3) Migre e rode testes com o helper script
+3) Run migrations and tests with the helper script
 ```
 chmod +x bin/dj
 ./bin/dj makemigrations api
@@ -89,36 +89,36 @@ chmod +x bin/dj
 ```
 
 Helper Script `bin/dj`
-- Objetivo: encurtar comandos e aplicar “guard rails” para evitar uso de DB de produção.
-- Requer `.env` apontando para Postgres local (localhost).
-- Comandos úteis:
-  - `./bin/dj db:up | db:down | db:destroy` – controla o Postgres local via Makefile
-  - `./bin/dj makemigrations [app]` – cria migrations
-  - `./bin/dj migrate` – aplica migrations
-  - `./bin/dj test` – roda testes de models do app `api`
-  - `./bin/dj runserver` – sobe o servidor local
+- Purpose: shorten commands and add guard rails to prevent using production DB.
+- Requires `.env` pointing to local Postgres (localhost).
+- Useful commands:
+  - `./bin/dj db:up | db:down | db:destroy` – control local Postgres via Makefile
+  - `./bin/dj makemigrations [app]` – create migrations
+  - `./bin/dj migrate` – apply migrations
+  - `./bin/dj test` – run API model tests
+  - `./bin/dj runserver` – start local server
 
-Banco de Dados (Dev vs Prod)
-- Nunca use o banco de produção em desenvolvimento/testes.
-- Em dev: use o Postgres local via `docker-compose.dev.yml` (porta 5432, bind em localhost). Variáveis em `.env`:
+Databases (Dev vs Prod)
+- Never use the production DB in dev/tests.
+- In dev: use local Postgres via `docker-compose.dev.yml` (port 5432, localhost). `.env` variables:
   - `RBS_PG_HOST=localhost`, `RBS_PG_PORT=5432`, `RBS_PG_DATABASE=robson_dev`, `RBS_PG_USER=robson`, `RBS_PG_PASSWORD=robson`
-- Para resetar: `make dev-db-destroy` e reaplicar migrations.
+- To reset: `make dev-db-destroy` and re‑apply migrations.
 
-Política de Migrações
-- Prefira migrations explícitas a auto renames ambíguos.
-- Quando renomear campos, use `migrations.RenameField` e, se necessário, complemente com `RunPython` para migração de dados.
-- Evite `--fake-initial` salvo em cenários específicos e compreendidos.
-- Em dev, se não houver dados valiosos, dropar o DB e recriar pode simplificar.
+Migration policy
+- Prefer explicit migrations over ambiguous auto‑renames.
+- When renaming fields, use `migrations.RenameField` and add `RunPython` for data if needed.
+- Avoid `--fake-initial` unless you know it matches the DB schema.
+- In dev, if no valuable data, dropping the DB can simplify.
 
-Testes
-- Rodar testes do app `api`:
+Tests
+- Run API tests:
 ```
 ./bin/dj test
 ```
-- O Django criará automaticamente um banco de testes temporário no Postgres local.
-- Escreva testes focados por domínio (ex.: `tests/test_models.py`).
+- Django will create a temporary test DB in local Postgres.
+- Write domain‑focused tests (e.g., `tests/test_models.py`).
 
-Frontend (rápido)
+Frontend (quick)
 ```
 cd frontends/web
 nvm use 14
@@ -126,49 +126,49 @@ npm i
 npm start
 ```
 
-Integrações e Docs de Terceiros
-- Submódulos e materiais de referência vivem em `docs/vendor`.
-- Para sincronizar docs Binance: `make sync-binance-docs` (ver Makefile).
+Third‑party integrations & docs
+- Submodules and reference material live in `docs/vendor`.
+- To sync Binance docs: `make sync-binance-docs` (see Makefile).
 
-Guia de Contribuição
-- Workflow sugerido:
-  - Fork → branch de feature → PR com escopo pequeno e testes.
-  - Descreva o impacto (schema/migrações, endpoints, breaking changes) no corpo do PR.
-- Código
-  - Mantenha a organização por domínio (`api/models/trading.py`, etc.).
-  - Reuso via mixins e managers comuns (`api/models/base.py`).
-  - Evite acessar serviços externos em testes; use flags (ex.: `TRADING_ENABLED=False`).
+Contributing
+- Suggested workflow:
+  - Fork → feature branch → PR with small scope and tests.
+  - Describe impact (schema/migrations, endpoints, breaking changes) in the PR body.
+- Code
+  - Keep domain organization (`api/models/trading.py`, etc.).
+  - Reuse via common mixins/managers (`api/models/base.py`).
+  - Avoid external services in tests; use flags (e.g., `TRADING_ENABLED=False`).
 - Migrations
-  - Inclua migrations relevantes e, se houver dados, considere `RunPython` para manter compatibilidade.
-- Segurança e Dados
-  - Jamais inclua segredos em commits. Use `.env` local e mantenha `.env.example` atualizado.
-- Produção
-  - Deploys para produção são feitos via GitOps/CI (GitHub Actions + ArgoCD + k3s). Não use o `bin/dj` para prod.
+  - Include relevant migrations and consider `RunPython` for data when needed.
+- Security & Data
+  - Never commit secrets. Use local `.env` and keep `.env.example` updated.
+- Production
+  - Production deploys via GitOps/CI (GitHub Actions + ArgoCD + k3s). Do not use `bin/dj` for prod.
 
-Contato e Suporte
-- Abra issues com reprodução clara, logs e versão do ambiente.
-- PRs são bem-vindos! Consulte este guia antes de submeter.
+Support
+- Open issues with clear reproduction, logs, and environment version.
+- PRs are welcome! Please read this guide before submitting.
 
 Coding Style
-- Filosofia
-  - Código simples, legível e com responsabilidade única por módulo/objeto.
-  - Use type hints quando ajudar clareza/manutenção.
-  - Nomeie com consistência (`snake_case` em Python; `PascalCase` para classes; `UPPER_SNAKE_CASE` para constantes).
-- Estrutura
-  - Imports: padrão → terceiros → locais. Evite imports circulares.
-  - Models: prefira mixins e bases comuns (`api/models/base.py`).
-  - Views/APIs: endpoints consistentes (snake_case), separação por domínio.
-- Docstrings & Comentários
-  - Docstrings em funções/métodos públicos, breves e úteis.
-  - Comentários para “por quê”, não “o quê” (o código deve explicar o quê).
-- Ferramentas (opcionais, recomendadas)
-  - Black (formatador), isort (organiza imports), Flake8 (lint), Mypy (tipos).
-  - Instalação no venv de dev: `python -m pip install black isort flake8 mypy`
-  - Comandos úteis (executar em backends/monolith):
+- Philosophy
+  - Simple, readable code with single responsibility per module/object.
+  - Use type hints when they aid clarity/maintenance.
+  - Consistent naming (`snake_case` in Python; `PascalCase` for classes; `UPPER_SNAKE_CASE` for constants).
+- Structure
+  - Imports: stdlib → third‑party → local. Avoid circular imports.
+  - Models: prefer common mixins/base (`api/models/base.py`).
+  - Views/APIs: consistent endpoints (snake_case), domain‑based separation.
+- Docstrings & Comments
+  - Docstrings for public functions/methods, concise and helpful.
+  - Comments for “why”, not “what” (the code explains “what”).
+- Tooling (optional, recommended)
+  - Black (formatter), isort (imports), Flake8 (lint), Mypy (types).
+  - Install in dev venv: `python -m pip install black isort flake8 mypy`
+  - Useful commands (in backends/monolith):
     - `black .`
     - `isort .`
     - `flake8 api/ backends/monolith/backend/`
-    - `mypy api/` (se tipos forem adotados nos módulos)
-- Pre-commit (opcional)
+    - `mypy api/` (if types are adopted)
+- Pre‑commit (optional)
   - `python -m pip install pre-commit && pre-commit install`
-  - Exemplo de hooks: black, isort, flake8. Configure conforme seu fluxo.
+  - Example hooks: black, isort, flake8. Configure to your flow.

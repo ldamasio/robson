@@ -6,18 +6,17 @@ import logging
 logger = logging.getLogger(__name__)
 
 class PortfolioService:
-    """Serviço para gerenciamento de portfólio"""
+    """Service for portfolio management."""
     
     def __init__(self):
         self.binance = BinanceService()
     
     def get_portfolio_value(self, client_id):
-        """Calcula valor total do portfólio"""
+        """Calculate total portfolio value (placeholder)."""
         try:
-            # Implementar lógica de cálculo
-            # Por enquanto, retorna valor mockado
+            # TODO: implement proper valuation logic
+            # For now, return mocked value
             return {"patrimony": 400}
         except Exception as e:
             logger.error(f"Failed to calculate portfolio: {e}")
             raise
-

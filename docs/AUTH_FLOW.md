@@ -1,153 +1,153 @@
-# Fluxo de Autenticação JWT - Explicação Detalhada
+# JWT Authentication Flow – Detailed Guide
 
-## 1. Login (Obter Tokens)
+## 1) Login (Obtain Tokens)
 
-### Rotas disponíveis:
+### Available routes
 - `POST /api/token/` (legacy)
-- `POST /api/auth/token/` (organizada)
-- `POST /api/login/` (alternativa)
+- `POST /api/auth/token/` (organized)
+- `POST /api/login/` (alternative)
 
-### Request:
+### Request
 ```json
 {
-    "username": "user@example.com",
-    "password": "password123"
+  "username": "user@example.com",
+  "password": "password123"
 }
 ```
 
-### Response:
+### Response
 ```json
 {
-    "access": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...",
-    "refresh": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...",
-    "username": "user@example.com",
-    "email": "user@example.com",
-    "user_id": 123,
-    "client_id": 456,
-    "client_name": "Company ABC"
+  "access": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...",
+  "refresh": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...",
+  "username": "user@example.com",
+  "email": "user@example.com",
+  "user_id": 123,
+  "client_id": 456,
+  "client_name": "Company ABC"
 }
 ```
 
-## 2. Usar Access Token
+## 2) Use Access Token
 
-### Headers para requests autenticados:
+### Headers for authenticated requests
 ```
 Authorization: Bearer eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9...
 ```
 
-### Exemplo:
+### Example
 ```bash
 curl -X GET https://127.0.0.1:8000/api/strategies/ \
   -H "Authorization: Bearer YOUR_ACCESS_TOKEN" \
   -H "Content-Type: application/json"
 ```
 
-## 3. Refresh Token (quando access expira)
+## 3) Refresh Token (when access expires)
 
-### Rota:
+### Routes
 - `POST /api/token/refresh/`
 - `POST /api/auth/token/refresh/`
 
-### Request:
+### Request
 ```json
 {
-    "refresh": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..."
+  "refresh": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..."
 }
 ```
 
-### Response:
+### Response
 ```json
 {
-    "access": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..."
+  "access": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..."
 }
 ```
 
-## 4. Verificar Token
+## 4) Verify Token
 
-### Rota:
+### Routes
 - `POST /api/token/verify/`
 - `POST /api/auth/token/verify/`
 
-### Request:
+### Request
 ```json
 {
-    "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..."
+  "token": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..."
 }
 ```
 
-### Response:
-- `200 OK` se válido
-- `401 Unauthorized` se inválido
+### Response
+- `200 OK` if valid
+- `401 Unauthorized` if invalid
 
-## 5. Logout (Invalidar Tokens)
+## 5) Logout (Blacklist Tokens)
 
-### Rotas:
+### Routes
 - `POST /api/token/blacklist/`
 - `POST /api/auth/token/blacklist/`
-- `POST /api/logout/` (alternativa)
+- `POST /api/logout/` (alternative)
 
-### Request:
+### Request
 ```json
 {
-    "refresh": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..."
+  "refresh": "eyJ0eXAiOiJKV1QiLCJhbGciOiJIUzI1NiJ9..."
 }
 ```
 
-## 6. Perfil do Usuário
+## 6) User Profile
 
-### Rota:
+### Route
 - `GET /api/user/`
 
-### Headers:
+### Headers
 ```
 Authorization: Bearer YOUR_ACCESS_TOKEN
 ```
 
-### Response:
+### Response
 ```json
 {
-    "user_id": 123,
-    "username": "user@example.com",
-    "email": "user@example.com",
-    "first_name": "John",
-    "last_name": "Doe",
-    "client_id": 456,
-    "client_name": "Company ABC",
-    "is_active": true,
-    "date_joined": "2025-01-01T00:00:00Z",
-    "last_login": "2025-06-15T15:30:00Z"
+  "user_id": 123,
+  "username": "user@example.com",
+  "email": "user@example.com",
+  "first_name": "John",
+  "last_name": "Doe",
+  "client_id": 456,
+  "client_name": "Company ABC",
+  "is_active": true,
+  "date_joined": "2025-01-01T00:00:00Z",
+  "last_login": "2025-06-15T15:30:00Z"
 }
 ```
 
-## 7. Teste de Autenticação
+## 7) Auth Test Endpoint
 
-### Rota:
+### Route
 - `POST /api/test-auth/`
 
-### Response:
+### Response
 ```json
 {
-    "message": "JWT authentication is working",
-    "authenticated": true,
-    "user": "user@example.com"
+  "message": "JWT authentication is working",
+  "authenticated": true,
+  "user": "user@example.com"
 }
 ```
 
-## Por que tantas rotas?
+## Why multiple routes?
 
-### 🎯 **Flexibilidade**
-- Frontend pode escolher o padrão que prefere
-- `/api/token/` para compatibilidade
-- `/api/auth/token/` para organização
+### 🎯 Flexibility
+- Frontend can choose preferred pattern
+- `/api/token/` for compatibility
+- `/api/auth/token/` for organization
 
-### 🔄 **Migração gradual**
-- Sistemas antigos continuam funcionando
-- Novos sistemas usam rotas organizadas
+### 🔄 Gradual Migration
+- Legacy systems keep working
+- New systems use organized routes
 
-### 🛠️ **Funcionalidades extras**
-- `/api/user/` para dados do perfil
-- `/api/test-auth/` para debugging
+### 🛠️ Extra Functionality
+- `/api/user/` for profile data
+- `/api/test-auth/` for debugging
 
-### 🏢 **Multi-tenant**
-- Suporte a `client_id` nos tokens
-- Isolamento de dados por cliente
+### 🏢 Multi‑tenant
+- `client_id` support in tokens
+- Per‑client data isolation

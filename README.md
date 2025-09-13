@@ -73,7 +73,7 @@ npm start
 
 
 
-Quando quiser atualizar as docs no futuro, basta rodar:
+To update vendor docs in the future, run:
 
 ```bash
 make sync-binance-docs
@@ -81,9 +81,10 @@ make sync-binance-docs
 
 ## Contributing
 
-Robson é um projeto 100% open source e contribuições são muito bem-vindas. Para saber como preparar seu ambiente de desenvolvimento, executar testes, criar migrations e enviar PRs, consulte:
+Robson is 100% open source and contributions are welcome. For how to prepare your dev environment, run tests, create migrations, and submit PRs, see:
 
 - docs/DEVELOPER.md
+- docs/STYLE_GUIDE.md
 
 Deploys de produção são feitos via GitOps/CI (GitHub Actions + ArgoCD + k3s). O script `./bin/dj` e o `docker-compose.dev.yml` são destinados apenas ao desenvolvimento local.
 

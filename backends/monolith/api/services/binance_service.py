@@ -7,7 +7,7 @@ import logging
 logger = logging.getLogger(__name__)
 
 class BinanceService:
-    """Serviço para interação com a API da Binance"""
+    """Service for interacting with the Binance API."""
     
     def __init__(self, use_testnet=True):
         self.use_testnet = use_testnet
@@ -15,7 +15,7 @@ class BinanceService:
     
     @property
     def client(self):
-        """Lazy loading do cliente Binance"""
+        """Lazy-initialize Binance client."""
         if not self._client:
             if self.use_testnet:
                 api_key = settings.BINANCE_API_KEY_TEST
@@ -29,7 +29,7 @@ class BinanceService:
         return self._client
     
     def ping(self):
-        """Testa conexão com a Binance"""
+        """Ping Binance API to test connectivity."""
         try:
             return self.client.ping()
         except Exception as e:
@@ -37,7 +37,7 @@ class BinanceService:
             raise
     
     def get_server_time(self):
-        """Obtém tempo do servidor Binance"""
+        """Get Binance server time."""
         try:
             return self.client.get_server_time()
         except Exception as e:
@@ -45,10 +45,9 @@ class BinanceService:
             raise
     
     def get_account_info(self):
-        """Obtém informações da conta"""
+        """Get account information."""
         try:
             return self.client.get_account()
         except Exception as e:
             logger.error(f"Failed to get account info: {e}")
             raise
-

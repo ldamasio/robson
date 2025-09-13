@@ -1,57 +1,57 @@
-🚀 Migration Guide - Robson Bot (Models)
+🚀 Migration Guide – Robson Bot (Models)
 
-Este guia descreve a migração dos models antigos para a nova estrutura organizada em `api/models`.
+This guide explains migrating legacy models to the organized structure under `api/models`.
 
-Status atual
-- Concluído: `Symbol`, `Strategy`, `Order`, `Operation`, `Position`, `Trade` (refatorados com managers, propriedades calculadas e validações).
-- Próximos: `TechnicalAnalysisInterpretation`, `TechnicalEvent`, `Argument`, `Reaseon → Reason` (rename), padrões de gráfico e indicadores estatísticos.
+Current Status
+- Completed: `Symbol`, `Strategy`, `Order`, `Operation`, `Position`, `Trade` (refactored with managers, computed properties, validations).
+- Next: `TechnicalAnalysisInterpretation`, `TechnicalEvent`, `Argument`, `Reaseon → Reason` (rename), chart patterns and statistical indicators.
 
-Antes de começar
-- Caminho do manage.py: `backends/monolith/manage.py`.
-- Banco: PostgreSQL via variáveis `RBS_PG_*` no `.env` de `backends/monolith/`.
-- Rodar comandos a partir de `backends/monolith`.
+Before You Start
+- `manage.py` path: `backends/monolith/manage.py`.
+- Database: PostgreSQL via `RBS_PG_*` variables in `backends/monolith/.env`.
+- Run commands from `backends/monolith`.
 
-1) Backup dos dados
+1) Back up data
 ```bash
 cd backends/monolith
 python manage.py dumpdata clients > backup_clients.json
 python manage.py dumpdata api > backup_api.json
 ```
 
-2) Estrutura de diretórios (já criada)
-- `api/models/base.py`: mixins, bases, managers e choices.
-- `api/models/trading.py`: models de trading refatorados.
-- `api/models/__init__.py`: centraliza imports e mantém compatibilidade.
-- `api/tests/test_models.py`: testes de regressão/contrato para os models.
+2) Directory structure (already created)
+- `api/models/base.py`: mixins, bases, managers, choices.
+- `api/models/trading.py`: refactored trading models.
+- `api/models/__init__.py`: centralized imports for compatibility.
+- `api/tests/test_models.py`: regression/contract tests for the models.
 
-3) Gerar e aplicar migrações
-Você pode usar o wrapper `./bin/dj` (recomendado em dev) ou chamar `manage.py` diretamente.
+3) Generate and apply migrations
+Use the `./bin/dj` wrapper (recommended for dev) or call `manage.py` directly.
 ```bash
 cd backends/monolith
 ./bin/dj makemigrations api
 ./bin/dj migrate
-# ou
+# or
 python manage.py makemigrations api && python manage.py migrate
 ```
-Notas importantes
-- Evite `--fake-initial` a menos que você saiba que a migration inicial corresponde exatamente ao schema atual já existente no banco. Prefira corrigir o histórico ou criar migrations adicionais coerentes.
+Important notes
+- Avoid `--fake-initial` unless the initial migration exactly matches the current DB schema. Prefer fixing history or adding consistent follow‑ups.
 
-4) Rodar testes dos models
+4) Run model tests
 ```bash
 cd backends/monolith
 ./bin/dj test
 ```
-Os testes cobrem: managers (`objects`/`active`), propriedades calculadas (ex.: `display_name`, `pair_display`, `win_rate`, `remaining_quantity`), validações (ex.: `stop_loss_price`), métodos (`mark_as_filled`, `update_performance`, `calculate_unrealized_pnl`, etc.).
+Tests cover: managers (`objects`/`active`), computed properties (e.g., `display_name`, `pair_display`, `win_rate`, `remaining_quantity`), validations (e.g., `stop_loss_price`), methods (`mark_as_filled`, `update_performance`, `calculate_unrealized_pnl`, etc.).
 
-5) Verificações pós-migração
-- Imports funcionam: `from api.models import Symbol, Strategy, Order, Operation, Position, Trade`.
-- Admin lista os models (arquivo `api/admin.py` já registra todos).
+5) Post‑migration checks
+- Imports work: `from api.models import Symbol, Strategy, Order, Operation, Position, Trade`.
+- Admin lists the models (file `api/admin.py` registers them).
 ```bash
 cd backends/monolith
 python manage.py runserver
-# Acesse /admin/
+# Visit /admin/
 ```
-- Criar um registro básico no shell:
+- Create a basic record in the shell:
 ```bash
 cd backends/monolith
 python manage.py shell
@@ -69,9 +69,9 @@ Symbol.objects.create(
 )
 ```
 
-6) Migração de dados (quando necessário)
-- Prefira uma migration de dados com `RunPython` para remapear/normalizar campos (ex.: uppercase de `name`, split em `base_asset`/`quote_asset`).
-- Exemplo (esboço):
+6) Data migration (when needed)
+- Prefer a `RunPython` data migration to remap/normalize fields (e.g., uppercase `name`, split into `base_asset`/`quote_asset`).
+- Example (sketch):
 ```python
 from django.db import migrations
 
@@ -88,22 +88,22 @@ class Migration(migrations.Migration):
     operations = [migrations.RunPython(split_symbol)]
 ```
 
-Novos recursos disponíveis
+New features available
 - Managers: `Symbol.active.all()`, `Symbol.objects.for_client(client_id)`, `Symbol.objects.active_for_client(client_id)`.
-- Propriedades calculadas: `Symbol.display_name`, `Symbol.pair_display`, `Order.remaining_quantity`, `Order.fill_percentage`, `Position.is_long`, `Strategy.win_rate`, `Strategy.average_pnl_per_trade`.
-- Validações: `Order.stop_loss_price` coerente com o `side` e `price`; normalização de uppercase em `Symbol`.
-- Config JSON flexível: `Strategy.config` e `Strategy.risk_config` com helpers `get_config_value` e `get_risk_config_value`.
+- Computed properties: `Symbol.display_name`, `Symbol.pair_display`, `Order.remaining_quantity`, `Order.fill_percentage`, `Position.is_long`, `Strategy.win_rate`, `Strategy.average_pnl_per_trade`.
+- Validations: `Order.stop_loss_price` coherent with `side`/`price`; uppercase normalization in `Symbol`.
+- Flexible JSON config: `Strategy.config` and `Strategy.risk_config` with helpers `get_config_value` and `get_risk_config_value`.
 
-Pendências planejadas
-- Corrigir o typo `Reaseon` → `Reason` via migration de rename.
-- Migrar models de análise técnica, padrões de gráfico (Rectangle, Triangle, etc.) e indicadores (MA, RSI, MACD) com testes.
-- Integrar metadados de símbolos/precisões a partir da API da Binance (`docs/vendor`) para popular/validar `min_qty`, `max_qty`, `tickSize`/`stepSize`.
+Planned
+- Fix typo `Reaseon` → `Reason` via rename migration.
+- Migrate technical analysis models, chart patterns (Rectangle, Triangle, etc.), and indicators (MA, RSI, MACD) with tests.
+- Integrate symbol metadata from Binance (`docs/vendor`) to populate/validate `min_qty`, `max_qty`, `tickSize`/`stepSize`.
 
-Solução de problemas
-- ImportError de models: verifique `api/models/__init__.py`.
-- Conflitos de migração: revise histórico e dependências; evite `--fake-initial` sem necessidade.
-- Models não aparecem no admin: confirme imports em `api/admin.py`.
-- Testes falhando: alinhe campos/métodos aos contratos dos testes e gere novas migrations quando campos mudarem.
+Troubleshooting
+- Model ImportError: check `api/models/__init__.py`.
+- Migration conflicts: review history and dependencies; avoid `--fake-initial` unless required.
+- Models not visible in admin: confirm imports in `api/admin.py`.
+- Failing tests: align fields/methods to test contracts and generate migrations when fields change.
 
-Observações
-- Este guia reflete o estado atual do código e remove placeholders/duplicações. Ajuste conforme novas migrações sejam criadas.
+Notes
+- This guide reflects the current code state and removes placeholders/duplication. Adjust as new migrations are introduced.

@@ -6,16 +6,16 @@ from django.core.cache import cache
 from .binance_service import BinanceService
 
 class MarketDataService:
-    """Serviço para dados de mercado"""
+    """Service for market data."""
     
     def __init__(self):
         self.binance = BinanceService()
     
     def get_historical_data(self, symbol, interval, days=7):
-        """Obtém dados históricos com cache"""
+        """Get historical data with caching."""
         cache_key = f"historical_{symbol}_{interval}_{days}"
         
-        # Tenta cache primeiro
+        # Try cache first
         cached_data = cache.get(cache_key)
         if cached_data:
             return cached_data
@@ -24,16 +24,16 @@ class MarketDataService:
             end_date = datetime.date.today()
             start_date = end_date - datetime.timedelta(days=days)
             
-            # Formata datas para API
+            # Format dates for API
             start_str = start_date.strftime("%Y.%m.%d")
             end_str = end_date.strftime("%Y.%m.%d")
             
-            # Busca dados da Binance
+            # Fetch Binance data
             klines = self.binance.client.get_historical_klines(
                 symbol, interval, start_str, end_str
             )
             
-            # Processa com pandas
+            # Process with pandas
             df = pd.DataFrame(klines)
             df = df.iloc[:, :6]
             df.columns = ["Date", "Open", "High", "Low", "Close", "Volume"]
@@ -41,10 +41,10 @@ class MarketDataService:
             df.index = pd.to_datetime(df.index, unit="ms")
             df = df.astype("float")
             
-            # Converte para JSON
+            # Convert to JSON
             result = df.to_json(orient='records', date_format='iso')
             
-            # Cache por 5 minutos
+            # Cache for 5 minutes
             cache.set(cache_key, result, 300)
             
             return result
@@ -52,4 +52,3 @@ class MarketDataService:
         except Exception as e:
             logger.error(f"Failed to get historical data: {e}")
             raise
-

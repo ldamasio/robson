@@ -597,7 +597,7 @@ class TestModelChoices(TestCase):
         self.assertIn(('LIMIT', 'Limit'), ModelChoices.ORDER_TYPES)
     
     def test_order_str_method(self):
-        """Testa método __str__ da Order"""
+        """Test Order __str__ method"""
         order = Order.objects.create(
             client=self.client,
             symbol=self.symbol,
@@ -610,7 +610,7 @@ class TestModelChoices(TestCase):
         self.assertEqual(str(order), expected)
     
     def test_order_fill_tracking(self):
-        """Testa rastreamento de execução da ordem"""
+        """Test order fill tracking"""
         order = Order.objects.create(
             client=self.client,
             symbol=self.symbol,
@@ -637,7 +637,7 @@ class TestModelChoices(TestCase):
         self.assertIsNotNone(order.filled_at)
     
     def test_order_validation(self):
-        """Testa validações da ordem"""
+        """Test order validations"""
         # Ordem com stop loss inválido para compra
         order = Order(
             client=self.client,
@@ -652,7 +652,7 @@ class TestModelChoices(TestCase):
             order.clean()
     
     def test_order_pnl_calculation(self):
-        """Testa cálculo de P&L"""
+        """Test P&L calculation"""
         order = Order.objects.create(
             client=self.client,
             symbol=self.symbol,
@@ -755,7 +755,7 @@ class TestPositionModel(BaseTestCase):
     """Tests for Position model (pt duplicate removed)"""
     
     def test_position_creation(self):
-        """Testa criação básica de posição"""
+        """Test basic position creation"""
         position = Position.objects.create(
             client=self.client,
             symbol=self.symbol,
@@ -772,7 +772,7 @@ class TestPositionModel(BaseTestCase):
         self.assertEqual(position.cost_basis, Decimal('5000.0'))
     
     def test_position_pnl_update(self):
-        """Testa atualização de P&L não realizado"""
+        """Test unrealized P&L update"""
         position = Position.objects.create(
             client=self.client,
             symbol=self.symbol,
@@ -788,7 +788,7 @@ class TestPositionModel(BaseTestCase):
         self.assertEqual(position.unrealized_pnl, expected_pnl)
     
     def test_position_add_order(self):
-        """Testa adição de ordem à posição"""
+        """Test adding order to position"""
         position = Position.objects.create(
             client=self.client,
             symbol=self.symbol,
@@ -815,7 +815,7 @@ class TestPositionModel(BaseTestCase):
         self.assertEqual(position.quantity, Decimal('0.2'))
     
     def test_position_close(self):
-        """Testa fechamento de posição"""
+        """Test position closing"""
         position = Position.objects.create(
             client=self.client,
             symbol=self.symbol,
@@ -855,7 +855,7 @@ class TestTradeModel(BaseTestCase):
         self.assertIsNotNone(trade.duration)
     
     def test_trade_pnl_calculation(self):
-        """Testa cálculo automático de P&L no save"""
+        """Test automatic P&L calculation on save"""
         entry_time = timezone.now()
         exit_time = entry_time + timezone.timedelta(hours=2)
         
@@ -964,7 +964,7 @@ class TestMixinsAndBaseClasses(BaseTestCase):
         self.assertEqual(symbol.status_icon, '❌')
     
     def test_managers(self):
-        """Testa managers customizados"""
+        """Test custom managers"""
         # Criar símbolos ativos e inativos
         active_symbol = Symbol.objects.create(
             client=self.client,
