@@ -5,7 +5,7 @@ Implements a simple singleton to share the underlying client.
 """
 
 # api/services/binance_service.py
-from . import Client  # re-exported in api.services.__init__ for patching
+from importlib import import_module
 from django.conf import settings
 from django.core.cache import cache
 import logging
@@ -39,8 +39,12 @@ class BinanceService:
                 api_key = settings.BINANCE_API_KEY
                 secret_key = settings.BINANCE_SECRET_KEY
 
-            # Client is imported from api.services for test patching
-            BinanceService._client = Client(api_key, secret_key, testnet=self.use_testnet)
+            # Resolve Client dynamically to respect test patching of `api.services.Client`
+            services_pkg = import_module('api.services')
+            client_cls = getattr(services_pkg, 'Client', None)
+            if client_cls is None:
+                raise RuntimeError('Binance Client not available')
+            BinanceService._client = client_cls(api_key, secret_key, testnet=self.use_testnet)
 
         return BinanceService._client
     
