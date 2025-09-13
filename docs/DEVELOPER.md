@@ -172,6 +172,4 @@ Coding Style
     - `flake8 api/ backends/monolith/backend/`
     - `mypy api/` (if types are adopted)
 - Pre‑commit (optional)
-  - Install once: `make pre-commit-install` (or `python -m pip install pre-commit && pre-commit install`)
-  - Run on all files: `make lint` (wraps `pre-commit run --all-files`)
-  - Default hooks include: trailing whitespace, EOF fix, YAML check, black, isort, and an English‑only checker for comments/docstrings.
+  - You may use pre-commit locally if you prefer, but it is not required and is not part of CI.
