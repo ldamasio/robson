@@ -4,16 +4,16 @@ from unittest.mock import patch, MagicMock
 from .services import BinanceService
 
 class TestBinanceService(TestCase):
-    """Testes para BinanceService"""
+    """Tests for BinanceService."""
     
     def setUp(self):
-        # Reset singleton para cada teste
+        # Reset instance for each test
         BinanceService._instance = None
         BinanceService._client = None
     
     @patch('api.services.Client')
     def test_binance_service_singleton(self, mock_client):
-        """Testa se BinanceService é singleton"""
+        """Ensure BinanceService behaves as a singleton."""
         service1 = BinanceService()
         service2 = BinanceService()
         
@@ -21,7 +21,7 @@ class TestBinanceService(TestCase):
     
     @patch('api.services.Client')
     def test_ping_success(self, mock_client):
-        """Testa ping com sucesso"""
+        """Ping succeeds when client returns 200-like response."""
         mock_instance = MagicMock()
         mock_instance.ping.return_value = {}
         mock_client.return_value = mock_instance
@@ -34,7 +34,7 @@ class TestBinanceService(TestCase):
     
     @patch('api.services.Client')
     def test_ping_failure(self, mock_client):
-        """Testa ping com falha"""
+        """Ping raises on client error."""
         mock_instance = MagicMock()
         mock_instance.ping.side_effect = Exception("Connection failed")
         mock_client.return_value = mock_instance
@@ -43,4 +43,3 @@ class TestBinanceService(TestCase):
         
         with self.assertRaises(Exception):
             service.ping()
-
