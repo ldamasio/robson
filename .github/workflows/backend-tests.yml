@@ -2,12 +2,9 @@ name: Backend Tests
 
 on:
   push:
-    paths:
-      - 'backends/monolith/**'
-      - '.github/workflows/backend-tests.yml'
+    branches: ["**"]
   pull_request:
-    paths:
-      - 'backends/monolith/**'
+    branches: ["**"]
 
 jobs:
   tests:
