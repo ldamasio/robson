@@ -3,8 +3,34 @@ repos:
     rev: v4.6.0
     hooks:
       - id: trailing-whitespace
+        exclude: |
+          (?x)(
+            ^backends/monolith/\.venv/|
+            ^backends/monolith/\.old/|
+            ^backends/monolith/staticfiles/|
+            ^docs/vendor/|
+            ^frontends/web/node_modules/|
+            ^frontends/web/(dist|build)/|
+            \.min\.(js|css)$
+          )
       - id: end-of-file-fixer
+        exclude: |
+          (?x)(
+            ^backends/monolith/\.venv/|
+            ^backends/monolith/\.old/|
+            ^backends/monolith/staticfiles/|
+            ^docs/vendor/|
+            ^frontends/web/node_modules/|
+            ^frontends/web/(dist|build)/|
+            \.min\.(js|css)$
+          )
       - id: check-yaml
+        exclude: |
+          (?x)(
+            ^backends/monolith/\.venv/|
+            ^backends/monolith/\.old/|
+            ^docs/vendor/
+          )
       - id: check-added-large-files
 
   - repo: https://github.com/psf/black
@@ -31,7 +57,18 @@ repos:
     hooks:
       - id: enforce-english-only
         name: Enforce English-only comments/docstrings
-        entry: bash -c 'rg -n "[áàâãéèêíìîóòôõúùûçÁÀÂÃÉÈÊÍÌÎÓÒÔÕÚÙÛÇ]" -S --hidden --glob "!docs/vendor/**" --glob "!backends/monolith/staticfiles/**" --glob "!.venv/**" || true | tee /dev/stderr | (! rg .)'
+        entry: bash -c 'rg -n "[áàâãéèêíìîóòôõúùûçÁÀÂÃÉÈÊÍÌÎÓÒÔÕÚÙÛÇ]" -S --hidden \
+          --glob "!docs/vendor/**" \
+          --glob "!backends/monolith/staticfiles/**" \
+          --glob "!backends/monolith/.old/**" \
+          --glob "!.venv/**" \
+          --glob "!backends/monolith/.venv/**" \
+          --glob "!frontends/web/node_modules/**" \
+          --glob "!frontends/web/dist/**" \
+          --glob "!frontends/web/build/**" \
+          --glob "!**/*.min.css" \
+          --glob "!**/*.min.js" \
+          || true | tee /dev/stderr | (! rg .)'
         language: system
         pass_filenames: false
         types: [text]
