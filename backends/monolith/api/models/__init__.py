@@ -61,6 +61,33 @@ from .analysis import (
     Reason,
 )
 
+# Chart patterns
+from .patterns import (
+    Rectangle,
+    Triangle,
+)
+
+# Indicators
+from .indicators import (
+    MovingAverage,
+    RSIIndicator,
+    MACDIndicator,
+)
+
+# Facts (refactored)
+from .facts import (
+    Resistance,
+    Support,
+    Line,
+    TrendLine,
+    Channel,
+    Accumulation,
+    Sideways,
+    Breakout,
+    Uptrend,
+    Downtrend,
+)
+
 # ==========================================
 # MAINTAIN COMPATIBILITY WITH OLD MODELS
 # ==========================================
@@ -73,30 +100,17 @@ try:
     # Import models that haven't been refactored yet
     # Comment out as each one gets migrated
     
-    # Principles
+    # Principles (legacy) — compatibility layer
     from ..models import OddsYourFavor
     from ..models import LimitLosses
-    
-    # Attributes  
-    from ..models import Attribute
     
     # Technical Analysis
     # Technical analysis models migrated to api/models/analysis.py
     
-    # Facts
-    from ..models import Resistance
-    from ..models import Support
-    from ..models import Line
-    from ..models import TrendLine
-    from ..models import Channel
-    from ..models import Accumulation
-    from ..models import Sideways
-    from ..models import Breakout
-    from ..models import Uptrend
-    from ..models import Downtrend
+    # Facts migrated to api/models/facts.py
     
     # Chart Patterns
-    from ..models import Rectangle
+    # Chart Patterns migrated to api/models/patterns.py
     # Triangle, Hammer, etc. (incomplete classes in original)
     
     # Reversal Patterns
@@ -105,15 +119,14 @@ try:
     # Statistical Indicators
     # MovingAverage, RSI, etc. (incomplete classes in original)
     
-    # Rules
+    # Attributes (legacy) — compatibility layer
+    from ..models import Attribute
+
+    # Rules/Config/Reports (legacy) — compatibility layer
     from ..models import OnePercentOfCapital
     from ..models import JustBet4percent
-    
-    # Config
     from ..models import OnlyTradeReversal
     from ..models import MaxTradePerDay
-    
-    # Reports
     from ..models import AlocatedCapitalPercent
 
 except ImportError as e:
@@ -149,15 +162,23 @@ __all__ = [
     'Position',
     'Trade',
     
-    # Old models (not migrated yet)
-    # TODO: Remove as each gets migrated
-    'OddsYourFavor',
-    'LimitLosses',
-    'Attribute',
+    # Refactored technical analysis
     'TechnicalAnalysisInterpretation',
     'TechnicalEvent',
     'Argument',
     'Reason',
+
+    # Refactored patterns and indicators
+    'Rectangle',
+    'Triangle',
+    'MovingAverage',
+    'RSIIndicator',
+    'MACDIndicator',
+
+    # Old models (kept for compatibility)
+    'OddsYourFavor',
+    'LimitLosses',
+    'Attribute',
     'Resistance',
     'Support',
     'Line',
@@ -168,7 +189,6 @@ __all__ = [
     'Breakout',
     'Uptrend',
     'Downtrend',
-    'Rectangle',
     'OnePercentOfCapital',
     'JustBet4percent',
     'OnlyTradeReversal',
@@ -188,23 +208,34 @@ MIGRATION_STATUS = {
         'Operation',   # ✅ Significantly improved
         'Position',    # ✅ New model for positions
         'Trade',       # ✅ New model for history
-    ],
-    'in_progress': [
-        # Next to be migrated
-    ],
-    'planned': [
+        # ✅ Technical analysis
         'TechnicalAnalysisInterpretation',
-        'TechnicalEvent', 
+        'TechnicalEvent',
         'Argument',
         'Reason',
+        # ✅ Patterns
+        'Rectangle',
+        'Triangle',
+        # ✅ Indicators
+        'MovingAverage',
+        'RSIIndicator',
+        'MACDIndicator',
+        # ✅ Facts
         'Resistance',
         'Support',
         'Line',
         'TrendLine',
         'Channel',
-        'Rectangle',
-        # Chart patterns
-        # Indicators
+        'Accumulation',
+        'Sideways',
+        'Breakout',
+        'Uptrend',
+        'Downtrend',
+    ],
+    'in_progress': [
+        # Next to be migrated
+    ],
+    'planned': [
         # Rules and configs
     ],
     'deprecated': [

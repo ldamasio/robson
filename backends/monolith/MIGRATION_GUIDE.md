@@ -3,8 +3,14 @@
 This guide explains migrating legacy models to the organized structure under `api/models`.
 
 Current Status
-- Completed: `Symbol`, `Strategy`, `Order`, `Operation`, `Position`, `Trade` (refactored with managers, computed properties, validations).
-- Next: `TechnicalAnalysisInterpretation`, `TechnicalEvent`, `Argument`, `Reaseon → Reason` (rename), chart patterns and statistical indicators.
+- Completed:
+  - Trading: `Symbol`, `Strategy`, `Order`, `Operation`, `Position`, `Trade`
+  - Technical Analysis: `TechnicalAnalysisInterpretation`, `TechnicalEvent`, `Argument`, `Reason`
+  - Patterns: `Rectangle`, `Triangle`
+  - Indicators: `MovingAverage`, `RSIIndicator`, `MACDIndicator`
+- Facts: `Resistance`, `Support`, `Line`, `TrendLine`, `Channel`, `Accumulation`, `Sideways`, `Breakout`, `Uptrend`, `Downtrend`
+- Next (remaining):
+  - Legacy rules/config/reports (evaluate migration or deprecation)
 
 Before You Start
 - `manage.py` path: `backends/monolith/manage.py`.
@@ -132,9 +138,11 @@ New features available
 - Flexible JSON config: `Strategy.config` and `Strategy.risk_config` with helpers `get_config_value` and `get_risk_config_value`.
 
 Planned
-- Fix typo `Reaseon` → `Reason` via rename migration.
-- Migrate technical analysis models, chart patterns (Rectangle, Triangle, etc.), and indicators (MA, RSI, MACD) with tests.
 - Integrate symbol metadata from Binance (`docs/vendor`) to populate/validate `min_qty`, `max_qty`, `tickSize`/`stepSize`.
+
+Archival Note
+- Once legacy rules/config/reports are migrated or deprecated and all legacy imports removed,
+  this guide can be archived to `docs/history/` and replaced by a short "Model Architecture Overview".
 
 Troubleshooting
 - Model ImportError: check `api/models/__init__.py`.
