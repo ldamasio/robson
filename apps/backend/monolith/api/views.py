@@ -7,6 +7,7 @@ from binance.client import Client
 import datetime
 import json
 import pandas as pd
+from decimal import Decimal
 from django.shortcuts import render
 from django.http import JsonResponse
 from decouple import config
@@ -21,6 +22,15 @@ from .models import Strategy
 # from django_multitenant import views
 # from django_multitenant.views import TenantModelViewSet
 from clients.models import CustomUser
+
+# Hexagonal use case wiring
+try:
+    from apps.backend.core.domain.trade import Symbol as DomainSymbol
+    from apps.backend.core.wiring.container import get_place_order_uc
+except Exception:  # keep views importable even if core is missing in certain envs
+    DomainSymbol = None
+    def get_place_order_uc():
+        raise RuntimeError("Hexagonal core not available")
 
 
 
@@ -135,7 +145,33 @@ def Orders(request):
     return JsonResponse({})
 
 def PlaceOrder(request):
-    return JsonResponse({})
+    """Place order via hexagonal use case. Input JSON:
+    {"base":"BTC","quote":"USDT","side":"BUY","qty":0.1,"limit":50000}
+    """
+    if request.method != 'POST':
+        return JsonResponse({"error": "Method not allowed"}, status=405)
+    try:
+        data = json.loads(request.body.decode()) if request.body else {}
+        base = data.get("base")
+        quote = data.get("quote")
+        side = data.get("side")
+        qty = Decimal(str(data.get("qty"))) if data.get("qty") is not None else None
+        limit = Decimal(str(data.get("limit"))) if data.get("limit") is not None else None
+        if not all([base, quote, side, qty is not None]):
+            return JsonResponse({"error": "Missing required fields"}, status=400)
+
+        symbol = DomainSymbol(base, quote) if DomainSymbol else f"{base}{quote}"
+        uc = get_place_order_uc()
+        placed = uc.execute(symbol, side, qty, limit)
+        return JsonResponse({
+            "id": placed["id"],
+            "symbol": getattr(symbol, "as_pair", lambda: str(symbol))(),
+            "side": side,
+            "qty": str(qty),
+            "price": str(placed["price"]),
+        }, status=201)
+    except Exception as e:
+        return JsonResponse({"error": str(e)}, status=500)
 
 def PlaceTestOrder(request):
     return JsonResponse({})

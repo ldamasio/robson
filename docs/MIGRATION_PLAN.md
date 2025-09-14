@@ -29,11 +29,12 @@ Steps
   - [x] Fix env var placeholders in `docker-compose.yml`
   - [ ] Verify any CI workflows referencing old paths
 4) Hexagonal refactor (incremental)
-   - [ ] Identify domain entities/services → move to `core/domain`
+   - [x] Identify domain entities/services → move to `core/domain` (Symbol, Order)
    - [x] Bootstrap `core/application/ports.py` with initial contracts
-   - [ ] Wrap existing persistence as adapters under `core/adapters/driven`
-   - [ ] Wrap REST endpoints to call use cases in `core/application`
+   - [x] Wrap existing persistence as adapters under `core/adapters/driven` (DjangoOrderRepository)
+   - [x] Wrap REST endpoints to call use cases in `core/application` (PlaceOrder)
    - [x] Add wiring factories in `core/wiring`
+   - [x] Provide external stubs/adapters (BinanceMarketData, StubExecution, NoopEventBus, RealClock)
 5) Frontend alignment
    - [ ] Add `src/{domain,ports,adapters,application}` and map API calls via ports
    - [ ] Replace direct fetches with `TradeService`-like interfaces
@@ -49,3 +50,4 @@ Notes
 - Keep migrations and Django app structure working while extracting domain/application code.
 - Avoid breaking API/URLs during refactor; adapt views to use use cases internally.
 - Use import boundaries (e.g., import-linter) later to enforce layer rules.
+- Ensure Python importability for `apps.*` packages (added `__init__.py`).
