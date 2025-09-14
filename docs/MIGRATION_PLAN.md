@@ -48,6 +48,8 @@ Steps
    - [x] Add minimal contract tests for adapters (mock fetch for TradeHttp via Vitest)
    - [x] Add WebSocket port+adapter and contract test (MarketWS)
 6) GitOps/Infra alignment
+   - [x] Add Helm chart skeletons for backend and frontend (Gateway API)
+   - [x] Add ApplicationSet skeleton for branch previews
    - [ ] Restructure manifests to `infra/k8s/{base,overlays}` using Helm charts
    - [ ] Add ArgoCD app-of-apps and ApplicationSets
    - [ ] Update image build contexts in any GitOps refs to new `apps/*` paths
@@ -55,10 +57,10 @@ Steps
    - [ ] Install and configure Istio (Ambient Mode) with Gateway API (mandatory)
 
 8) Infra specifics (Contabo + k3s + Ansible + Helm + GitOps previews)
-   - [ ] Ansible cluster bootstrap (k3s)
-       - [ ] `infra/ansible/inventory/contabo` with 4 VPS hosts (roles: server/agent)
-       - [ ] `infra/ansible/roles/k3s` to install and join nodes; idempotent; supports adding new VPS
-       - [ ] `infra/ansible/site.yml` to run full cluster bootstrap (k3s + prerequisites)
+   - [x] Ansible cluster bootstrap (k3s) — skeleton
+       - [x] `infra/ansible/inventory/contabo` with server/agent groups
+       - [x] `infra/ansible/roles/k3s` minimal tasks
+       - [x] `infra/ansible/site.yml` playbook scaffold
    - [ ] Base platform via Helm
        - [ ] cert-manager, external-dns
        - [ ] Istio Ambient Mode (sidecarless): install istio-base/istiod with ambient, ztunnel daemonset and CNI; enable mTLS by default

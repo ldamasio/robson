@@ -1,0 +1,34 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: robson-backend
+spec:
+  replicas: {{ .Values.replicaCount }}
+  selector:
+    matchLabels:
+      app: robson-backend
+  template:
+    metadata:
+      labels:
+        app: robson-backend
+    spec:
+      containers:
+        - name: backend
+          image: "{{ .Values.image.repository }}:{{ .Values.image.tag }}"
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          ports:
+            - containerPort: {{ .Values.service.port }}
+          env:
+            - name: DJANGO_SETTINGS_MODULE
+              value: backend.settings
+            - name: RBS_PG_HOST
+              value: postgres
+            - name: RBS_PG_PORT
+              value: "5432"
+          readinessProbe:
+            httpGet:
+              path: /admin/login/
+              port: {{ .Values.service.port }}
+            initialDelaySeconds: 15
+            periodSeconds: 10
+

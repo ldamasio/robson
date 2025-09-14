@@ -1,0 +1,53 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: robson-branch-previews
+  namespace: argocd
+spec:
+  generators:
+    - git:
+        repoURL: https://github.com/OWNER/REPO
+        revision: HEAD
+        directories:
+          - path: charts/*
+        filters:
+          - path: '^(?!main$).*' # exclude main (dummy; adjust with matrix if needed)
+    - pullRequest:
+        repoURL: https://github.com/OWNER/REPO
+        # Optionally generate from PRs
+  template:
+    metadata:
+      name: 'robson-{{branch}}'
+      labels:
+        robson/preview: 'true'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/OWNER/REPO
+        targetRevision: '{{branch}}'
+        path: charts/robson-backend
+        helm:
+          values: |
+            host: h-{{branch}}.robson.rbx.ia.br
+            image:
+              tag: '{{branch}}-{{short_sha}}'
+            gateway:
+              className: istio
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: 'h-{{branch}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+      ignoreDifferences:
+        - group: ""
+          kind: Secret
+  templatePatch: |
+    metadata:
+      annotations:
+        argocd.argoproj.io/sync-options: Validate=false
+    spec:
+      destination:
+        namespace: 'h-{{branch}}'
+
