@@ -24,6 +24,7 @@ Steps
    - [x] Move `backends/database` SQLs → `infra/data/postgres`
    - [x] Move `backends/cronjob` → `apps/backend/cronjob`
    - [x] Move `backends/nginx_monolith` → `apps/backend/nginx_monolith`
+   - [x] Clean up legacy `backends/` directory (removed after migration)
 3) Update tooling and compose
    - [x] Update `docker-compose.yml` paths
    - [x] Update `Makefile` dev paths

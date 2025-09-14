@@ -59,7 +59,7 @@ python manage.py runserver
 ```
 - Create a basic record in the shell:
 ```bash
-cd backends/monolith
+cd apps/backend/monolith
 python manage.py shell
 ```
 ```python
