@@ -45,6 +45,7 @@ Steps
    - [x] Normalize env usage in Patrimony.jsx and Balance.jsx
    - [x] Parameterize Binance WS URL in ActualPrice.jsx via `VITE_WS_URL_BINANCE`
    - [x] Add minimal contract tests for adapters (mock fetch for TradeHttp via Vitest)
+   - [x] Add WebSocket port+adapter and contract test (MarketWS)
 6) GitOps/Infra alignment
    - [ ] Restructure manifests to `infra/k8s/{base,overlays}` or Helm/Kustomize
    - [ ] Add ArgoCD app-of-apps if applicable
