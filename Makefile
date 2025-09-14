@@ -24,7 +24,7 @@ sync-binance-docs:
 # Dev helpers (Django + Postgres)
 # ==============================
 
-MONO_DIR ?= backends/monolith
+MONO_DIR ?= apps/backend/monolith
 DC_DEV   ?= $(MONO_DIR)/docker-compose.dev.yml
 
 .PHONY: dev-db-up dev-db-down dev-db-destroy dev-db-logs dev-makemigrations dev-migrate dev-test

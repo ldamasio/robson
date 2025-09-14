@@ -21,6 +21,24 @@ The command interface makes it possible to activate a Dashboard with its main in
 
 For example, if you need to withdraw an amount of BRL, but would like to convert your USDT to ADA before transferring, in addition to needing to anticipate spread values from other financial services.
 
+## Monorepo and Architecture
+
+This repository is being migrated to a monorepo layout adopting Hexagonal Architecture (Ports & Adapters).
+
+High-level structure:
+
+```
+apps/
+  backend/            # Django monolith with hexagonal core under apps/backend/core
+  frontend/           # React (Vite) app
+infra/                # Terraform, Ansible, K8s, GitOps, Observability, DB
+docs/                 # ADRs, architecture, developer guides
+```
+
+Read more: `docs/ARCHITECTURE.md`.
+
+Legacy paths like `backends/monolith` and `frontends/web` are being moved to `apps/backend/monolith` and `apps/frontend` respectively.
+
 ## INSTALL
 
 Some tips for development environment
@@ -38,7 +56,7 @@ docker-compose up -d --build
 Recommended local dev setup (Postgres via Docker + helper script):
 
 ```
-cd backends/monolith/
+cd apps/backend/monolith/
 # 1) Prepare .env for development (localhost Postgres)
 cp .env.development.example .env
 
@@ -67,7 +85,7 @@ chmod +x bin/dj
 
 ### Development Frontend Environment
 
-cd frontends/web
+cd apps/frontend
 nvm use 14
 npm i
 npm start
@@ -92,5 +110,5 @@ Deploys de produção são feitos via GitOps/CI (GitHub Actions + ArgoCD + k3s).
 
 Notes
 - The `./bin/dj` script is for local development only. Production deploys should be performed via your GitOps/CI pipeline (e.g., GitHub Actions + ArgoCD + k3s).
-- The local Postgres runs with Docker Compose using `backends/monolith/docker-compose.dev.yml` and credentials from `backends/monolith/.env`.
+- The local Postgres runs with Docker Compose using `apps/backend/monolith/docker-compose.dev.yml` and credentials from `apps/backend/monolith/.env`.
   - Makefile helpers: `make dev-db-up`, `make dev-db-down`, `make dev-db-destroy`, `make dev-test`.

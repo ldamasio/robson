@@ -4,13 +4,13 @@ Overview
 - Robson is open source. This guide standardizes local development, migrations/tests, and contribution practices, keeping production isolated (GitOps/CI/CD).
 
 Project Layout (essentials)
-- Backend (Django): `backends/monolith/`
+- Backend (Django): `apps/backend/monolith/`
   - `manage.py`, `backend/settings.py`
   - `api/models/` (refactored models: `base.py`, `trading.py`)
   - `api/tests/test_models.py`
   - `docker-compose.dev.yml` (local Postgres for dev)
   - `bin/dj` (dev helper script)
-- Frontend (Vite/React): `frontends/web/`
+- Frontend (Vite/React): `apps/frontend/`
 - Docs: `docs/`
   - `DEVELOPER.md` (this file)
   - `AUTH_FLOW.md`
@@ -25,7 +25,7 @@ Prerequisites
 Backend quick start
 1) Create venv and install deps
 ```
-cd backends/monolith
+cd apps/backend/monolith
 cp .env.development.example .env
 python -m venv .venv
 source .venv/bin/activate
@@ -44,7 +44,7 @@ make dev-db-up
 ```
 Direct alternative without Makefile:
 ```
-docker compose -f backends/monolith/docker-compose.dev.yml up -d
+docker compose -f apps/backend/monolith/docker-compose.dev.yml up -d
 ```
 
 Postgres from the repo root
@@ -57,8 +57,8 @@ make dev-db-destroy  # remove container and volume
 ```
 Direct alternative without Makefile:
 ```
-docker compose -f backends/monolith/docker-compose.dev.yml up -d
-docker compose -f backends/monolith/docker-compose.dev.yml down
+docker compose -f apps/backend/monolith/docker-compose.dev.yml up -d
+docker compose -f apps/backend/monolith/docker-compose.dev.yml down
 ```
 
 Clean‑slate reset (fast path)
@@ -73,7 +73,7 @@ The target performs:
 - recreates and applies migrations from the current models
 Then run tests as usual:
 ```
-cd backends/monolith
+cd apps/backend/monolith
 ./bin/dj test
 ```
 3) Run migrations and tests with the helper script
@@ -120,7 +120,7 @@ Tests
 
 Frontend (quick)
 ```
-cd frontends/web
+cd apps/frontend
 nvm use 14
 npm i
 npm start
