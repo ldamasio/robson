@@ -19,6 +19,7 @@ Steps
 2) Relocate code
    - [x] Move `backends/monolith` → `apps/backend/monolith`
    - [x] Move `frontends/web` → `apps/frontend` (legacy README kept as `README.LEGACY.md`)
+   - [x] Clean up legacy `frontends/` directory and migrate env files to new `.env.example`
    - [x] Move `k8s` → `infra/k8s`
    - [x] Move `backends/database` SQLs → `infra/data/postgres`
    - [x] Move `backends/cronjob` → `apps/backend/cronjob`
