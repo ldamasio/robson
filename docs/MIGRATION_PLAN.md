@@ -36,6 +36,7 @@ Steps
    - [x] Wrap REST endpoints to call use cases in `core/application` (PlaceOrder)
    - [x] Add wiring factories in `core/wiring`
    - [x] Provide external stubs/adapters (BinanceMarketData, StubExecution, NoopEventBus, RealClock)
+   - [x] Add unit tests for PlaceOrderUseCase (fakes; no DB)
 5) Frontend alignment
    - [x] Add `src/{domain,ports,adapters,application}` and map API calls via ports (created domain/ports/adapters; wired Strategies)
    - [x] Replace direct fetches with `TradeService`-like interfaces (Strategies.jsx)
