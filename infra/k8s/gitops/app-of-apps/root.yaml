@@ -86,3 +86,23 @@ spec:
     automated:
       prune: true
       selfHeal: true
+---
+# Child app: platform cert-manager
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: platform-cert-manager
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/ldamasio/robson
+    targetRevision: main
+    path: infra/k8s/platform/cert-manager
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true

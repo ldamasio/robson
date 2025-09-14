@@ -61,6 +61,7 @@ Steps
          - [ ] external-dns provider (delegate subzone or RFC2136) — see `docs/infra/EXTERNAL_DNS.md`
        - [ ] If wildcard-only: add a single wildcard record `*.robson.rbx.ia.br -> <Gateway_IP>` and configure TLS (HTTP-01 per host or bring-your-own wildcard cert)
        - [ ] If provider-based: create credentials Secret/SealedSecret and set domainFilters
+   - [x] Add cert-manager Application and ClusterIssuer manifests (HTTP-01 via Gateway API)
    - [ ] Install and configure Istio (Ambient Mode) with Gateway API (mandatory)
 
 8) Infra specifics (Contabo + k3s + Ansible + Helm + GitOps previews)
