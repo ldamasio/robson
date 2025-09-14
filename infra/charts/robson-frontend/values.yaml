@@ -17,4 +17,8 @@ tls:
   enabled: true
   secretName: robson-frontend-tls
 
+namespace:
+  create: false
+  ambient: false
+
 resources: {}

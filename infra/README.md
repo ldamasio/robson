@@ -46,6 +46,7 @@ Ansible (bootstrap)
 
 Platform via Helm
 - Install cert-manager (HTTP-01 with Gateway API solver) and optionally external-dns.
+- Install Gateway API CRDs (v1.1.0) and Istio Ambient components (istio-base, istiod with ambient, ztunnel, cni).
 - Install Istio (Ambient Mode): base, istiod with ambient enabled, ztunnel DS, CNI.
 - Install ArgoCD via Helm; apply App of Apps.
 
@@ -55,6 +56,7 @@ GitOps Previews (ApplicationSet)
   - values: image tag `<branch>-<sha>`, host `h-<branch>.robson.rbx.ia.br`
   - Gateway API resources (Gateway/HTTPRoute) templated from chart values
 - Auto-sync enabled; delete on branch removal.
+- Sanitization: branch names are normalized (lowercase, '/' and '_' → '-') to form namespace/host.
 
 App Charts (Helm)
 - Values: `image.repository`, `image.tag`, `host`, `env`, `resources`.

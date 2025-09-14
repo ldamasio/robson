@@ -64,7 +64,7 @@ Steps
        - [ ] If wildcard-only: add a single wildcard record `*.robson.rbx.ia.br -> <Gateway_IP>` and configure TLS (HTTP-01 per host or bring-your-own wildcard cert)
        - [ ] If provider-based: create credentials Secret/SealedSecret and set domainFilters
    - [x] Add cert-manager Application and ClusterIssuer manifests (HTTP-01 via Gateway API)
-   - [ ] Install and configure Istio (Ambient Mode) with Gateway API (mandatory)
+   - [x] Install and configure Istio (Ambient Mode) with Gateway API (manifests added)
 
 8) Infra specifics (Contabo + k3s + Ansible + Helm + GitOps previews)
    - [x] Ansible baseline security & bootstrap
@@ -74,20 +74,21 @@ Steps
        - [x] `infra/ansible/roles/k3s` minimal tasks
        - [x] `infra/ansible/site.yml` (bootstrap precedes k3s)
    - [ ] Base platform via Helm
-       - [ ] cert-manager, external-dns
-       - [ ] Istio Ambient Mode (sidecarless): install istio-base/istiod with ambient, ztunnel daemonset and CNI; enable mTLS by default
-       - [ ] Gateway API CRDs and Istio integration: GatewayClass `istio`, per-env Gateways and HTTPRoutes
+       - [x] cert-manager Application (ArgoCD) and ClusterIssuer (HTTP-01 via Gateway API)
+       - [x] Gateway API CRDs Application
+       - [x] Istio Ambient components Applications (base, istiod ambient, ztunnel, CNI)
+       - [ ] external-dns (optional if not using wildcard-only)
        - [ ] ArgoCD install via Helm and App of Apps (gitops root)
    - [ ] Service packaging via Helm
        - [ ] Charts for `apps/backend/monolith` and `apps/frontend` with values for host/image/tag/env
        - [ ] Gateway API resources (Gateway/HTTPRoute/TLS) templated in charts (no Ingress)
-   - [ ] GitOps previews per branch (non-main)
-       - [ ] ArgoCD ApplicationSet using Git generator to create env per branch (exclude `main`)
-       - [ ] Namespace pattern `h-<branch>` (labels/annotations to opt-in Ambient: `istio.io/dataplane-mode: ambient`)
-       - [ ] Host `h-<branch>.robson.rbx.ia.br`
-       - [ ] Gateway API manifests from values; TLS via cert-manager (Certificate + ReferencePolicy to Gateway)
-       - [ ] external-dns manages DNS for Gateway public IP/LoadBalancer
-       - [ ] Branch name sanitization (lowercase, alnum and dashes)
+   - [x] GitOps previews per branch (non-main)
+       - [x] ArgoCD ApplicationSet using Git generator to create env per branch (exclude `main`)
+       - [x] Namespace pattern `h-<branch>` (labels to opt-in Ambient: `istio.io/dataplane-mode: ambient`)
+       - [x] Host `h-<branch>.robson.rbx.ia.br`
+       - [x] Gateway API manifests from values; TLS via cert-manager (Certificate)
+       - [ ] external-dns manages DNS for Gateway public IP/LoadBalancer (if chosen)
+       - [x] Branch name sanitization (lowercase and dashes)
    - [ ] CI integration for previews
        - [ ] Build/push images for non-main with tag `<branch>-<sha>`
        - [ ] Expose image tag to ApplicationSet via values or ArgoCD Image Updater

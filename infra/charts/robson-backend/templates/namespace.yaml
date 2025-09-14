@@ -1,0 +1,12 @@
+{{- if .Values.namespace.create }}
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: {{ .Release.Namespace }}
+  labels:
+    robson/preview: "true"
+    {{- if .Values.namespace.ambient }}
+    istio.io/dataplane-mode: ambient
+    {{- end }}
+{{- end }}
+

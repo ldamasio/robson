@@ -4,6 +4,7 @@ metadata:
   name: robson-branch-previews
   namespace: argocd
 spec:
+  goTemplate: true
   generators:
     - git:
         repoURL: https://github.com/ldamasio/robson
@@ -17,29 +18,34 @@ spec:
         # Optionally generate from PRs
   template:
     metadata:
-      name: 'robson-{{branch}}'
+      name: 'robson-{{ lower (replace (replace .branch "/" "-") "_" "-") }}'
       labels:
         robson/preview: 'true'
     spec:
       project: default
       source:
         repoURL: https://github.com/ldamasio/robson
-        targetRevision: '{{branch}}'
+        targetRevision: '{{ .branch }}'
         path: charts/robson-backend
         helm:
           values: |
-            host: h-{{branch}}.robson.rbx.ia.br
+            host: h-{{ lower (replace (replace .branch "/" "-") "_" "-") }}.robson.rbx.ia.br
             image:
-              tag: '{{branch}}-{{short_sha}}'
+              tag: '{{ lower (replace (replace .branch "/" "-") "_" "-") }}-{{ .short_sha }}'
             gateway:
               className: istio
+            namespace:
+              create: true
+              ambient: true
       destination:
         server: https://kubernetes.default.svc
-        namespace: 'h-{{branch}}'
+        namespace: 'h-{{ lower (replace (replace .branch "/" "-") "_" "-") }}'
       syncPolicy:
         automated:
           prune: true
           selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
       ignoreDifferences:
         - group: ""
           kind: Secret
@@ -49,4 +55,4 @@ spec:
         argocd.argoproj.io/sync-options: Validate=false
     spec:
       destination:
-        namespace: 'h-{{branch}}'
+        namespace: 'h-{{ lower (replace (replace .branch "/" "-") "_" "-") }}'
