@@ -28,6 +28,7 @@ Steps
    - [x] Update `Makefile` dev paths
    - [x] Fix env var placeholders in `docker-compose.yml`
    - [x] Verify and update CI workflows referencing old paths (`.github/workflows/*`)
+   - [x] Add frontend unit tests to CI (Vitest workflow)
 4) Hexagonal refactor (incremental)
    - [x] Identify domain entities/services → move to `core/domain` (Symbol, Order)
    - [x] Bootstrap `core/application/ports.py` with initial contracts
@@ -42,7 +43,7 @@ Steps
    - [x] Normalize env usage in Dataframe.jsx (use VITE_API_BASE_URL)
    - [x] Normalize env usage in Patrimony.jsx and Balance.jsx
    - [x] Parameterize Binance WS URL in ActualPrice.jsx via `VITE_WS_URL_BINANCE`
-   - [ ] Add minimal contract tests for adapters (mock fetch/WS)
+   - [x] Add minimal contract tests for adapters (mock fetch for TradeHttp via Vitest)
 6) GitOps/Infra alignment
    - [ ] Restructure manifests to `infra/k8s/{base,overlays}` or Helm/Kustomize
    - [ ] Add ArgoCD app-of-apps if applicable

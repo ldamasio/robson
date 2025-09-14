@@ -13,6 +13,7 @@
 
 - How to verify:
   - [ ] `cd apps/backend/monolith && ./bin/dj test`
+  - [ ] `cd apps/frontend && npm ci && npm test`
 - Added/updated tests:
   - 
 
