@@ -48,6 +48,7 @@ Steps
    - [x] Update `docs/DEVELOPER.md` paths
    - [x] Add Hexagonal code examples in `apps/backend/core`
    - [ ] Add contribution notes for adapters and ports
+   - [x] Record decision: add ADR for Hexagonal Architecture (Ports & Adapters)
 
 Notes
 - Keep migrations and Django app structure working while extracting domain/application code.
