@@ -24,10 +24,10 @@ Steps
    - [x] Move `backends/cronjob` → `apps/backend/cronjob`
    - [x] Move `backends/nginx_monolith` → `apps/backend/nginx_monolith`
 3) Update tooling and compose
- - [x] Update `docker-compose.yml` paths
-  - [x] Update `Makefile` dev paths
-  - [x] Fix env var placeholders in `docker-compose.yml`
-  - [ ] Verify any CI workflows referencing old paths
+   - [x] Update `docker-compose.yml` paths
+   - [x] Update `Makefile` dev paths
+   - [x] Fix env var placeholders in `docker-compose.yml`
+   - [x] Verify and update CI workflows referencing old paths (`.github/workflows/*`)
 4) Hexagonal refactor (incremental)
    - [x] Identify domain entities/services → move to `core/domain` (Symbol, Order)
    - [x] Bootstrap `core/application/ports.py` with initial contracts

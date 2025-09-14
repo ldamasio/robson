@@ -20,8 +20,8 @@ jobs:
       - name: Build and push Docker frontend image
         uses: docker/build-push-action@v5.0.0
         with: 
-          context: ./frontends/web
-          file: ./frontends/web/docker/Dockerfile
+          context: ./apps/frontend
+          file: ./apps/frontend/docker/Dockerfile
           push: true
           tags: | 
             ldamasio/rbs-frontend-prod:0.0.${{github.run_number}}
@@ -30,8 +30,8 @@ jobs:
       - name: Build and push Docker monolith backend image
         uses: docker/build-push-action@v5.0.0
         with: 
-          context: ./backends/monolith
-          file: ./backends/monolith/docker/Dockerfile_django
+          context: ./apps/backend/monolith
+          file: ./apps/backend/monolith/docker/Dockerfile_django
           push: true
           tags: | 
             ldamasio/rbs-backend-monolith-prod:1.0.${{github.run_number}}
@@ -40,10 +40,9 @@ jobs:
       - name: Build and push Docker monolith backend nginx image
         uses: docker/build-push-action@v5.0.0
         with: 
-          context: ./backends/monolith
-          file: ./backends/monolith/docker/Dockerfile_nginx
+          context: ./apps/backend/monolith
+          file: ./apps/backend/monolith/docker/Dockerfile_nginx
           push: true
           tags: | 
             ldamasio/rbs-backend-nginx-prod:1.0.${{github.run_number}}
             ldamasio/rbs-backend-nginx-prod:latest
-
