@@ -40,7 +40,7 @@ Steps
    - [x] Replace direct fetches with `TradeService`-like interfaces (Strategies.jsx)
    - [x] Configure envs (`VITE_API_BASE_URL`, `VITE_WS_URL`) and update README
    - [x] Normalize env usage in Dataframe.jsx (use VITE_API_BASE_URL)
-   - [ ] Normalize env usage in Patrimony.jsx and Balance.jsx
+   - [x] Normalize env usage in Patrimony.jsx and Balance.jsx
    - [ ] Add minimal contract tests for adapters (mock fetch/WS)
 6) GitOps/Infra alignment
    - [ ] Restructure manifests to `infra/k8s/{base,overlays}` or Helm/Kustomize

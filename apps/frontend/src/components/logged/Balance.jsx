@@ -12,7 +12,7 @@ function Balance() {
       setLoading(true);
       try {
         const BACKEND_URL = import.meta.env.VITE_API_BASE_URL;
-        const {data: response} = await axios.get(VITE_API_BASE_URL + '/api/balance/');
+        const { data: response } = await axios.get(`${BACKEND_URL}/api/balance/`);
         setData(response);
         console.log(response)
       } catch (error) {
