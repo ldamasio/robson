@@ -52,7 +52,7 @@ Steps
    - [ ] Add ArgoCD app-of-apps and ApplicationSets
    - [ ] Update image build contexts in any GitOps refs to new `apps/*` paths
    - [ ] Configure cert-manager and external-dns for `robson.rbx.ia.br`
-   - [ ] Configure Istio Ambient (optional) for mTLS/ingress gateways
+   - [ ] Install and configure Istio (Ambient Mode) with Gateway API (mandatory)
 
 8) Infra specifics (Contabo + k3s + Ansible + Helm + GitOps previews)
    - [ ] Ansible cluster bootstrap (k3s)
@@ -60,14 +60,19 @@ Steps
        - [ ] `infra/ansible/roles/k3s` to install and join nodes; idempotent; supports adding new VPS
        - [ ] `infra/ansible/site.yml` to run full cluster bootstrap (k3s + prerequisites)
    - [ ] Base platform via Helm
-       - [ ] cert-manager, external-dns, ingress/mesh (Istio Ambient if chosen)
+       - [ ] cert-manager, external-dns
+       - [ ] Istio Ambient Mode (sidecarless): install istio-base/istiod with ambient, ztunnel daemonset and CNI; enable mTLS by default
+       - [ ] Gateway API CRDs and Istio integration: GatewayClass `istio`, per-env Gateways and HTTPRoutes
        - [ ] ArgoCD install via Helm and App of Apps (gitops root)
    - [ ] Service packaging via Helm
        - [ ] Charts for `apps/backend/monolith` and `apps/frontend` with values for host/image/tag/env
+       - [ ] Gateway API resources (Gateway/HTTPRoute/TLS) templated in charts (no Ingress)
    - [ ] GitOps previews per branch (non-main)
        - [ ] ArgoCD ApplicationSet using Git generator to create env per branch (exclude `main`)
-       - [ ] Namespace pattern `h-<branch>` and host `h-<branch>.robson.rbx.ia.br`
-       - [ ] Ingress templated from values; TLS via cert-manager; DNS via external-dns
+       - [ ] Namespace pattern `h-<branch>` (labels/annotations to opt-in Ambient: `istio.io/dataplane-mode: ambient`)
+       - [ ] Host `h-<branch>.robson.rbx.ia.br`
+       - [ ] Gateway API manifests from values; TLS via cert-manager (Certificate + ReferencePolicy to Gateway)
+       - [ ] external-dns manages DNS for Gateway public IP/LoadBalancer
        - [ ] Branch name sanitization (lowercase, alnum and dashes)
    - [ ] CI integration for previews
        - [ ] Build/push images for non-main with tag `<branch>-<sha>`
@@ -85,4 +90,5 @@ Notes
 - Use import boundaries (e.g., import-linter) later to enforce layer rules.
 - Ensure Python importability for `apps.*` packages (added `__init__.py`).
 - DNS: prefer delegated zone for `robson.rbx.ia.br` and wildcard or external-dns automation for `h-*.robson.rbx.ia.br`.
+- Istio Ambient + Gateway API: use Gateway resources for ingress, Waypoint proxies for L7 where needed, and Namespace-level ambient opt-in. Avoid classic Ingress objects.
 - Secrets: manage with SealedSecrets or SOPS; bootstrap secrets with Ansible Vault as needed.
