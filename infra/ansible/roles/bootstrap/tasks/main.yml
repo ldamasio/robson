@@ -92,3 +92,31 @@
 - name: Reset SSH connection to apply new port
   ansible.builtin.meta: reset_connection
 
+# Optional: open basic k3s ports for cluster communication
+- name: Allow k3s API server 6443/tcp (server only)
+  when: bootstrap_open_k3s_ports | default(false) and (inventory_hostname in groups['k3s_server'])
+  community.general.ufw:
+    rule: allow
+    port: "6443"
+    proto: tcp
+
+- name: Allow k3s supervisor 9345/tcp (server only)
+  when: bootstrap_open_k3s_ports | default(false) and (inventory_hostname in groups['k3s_server'])
+  community.general.ufw:
+    rule: allow
+    port: "9345"
+    proto: tcp
+
+- name: Allow flannel VXLAN 8472/udp (all nodes)
+  when: bootstrap_open_k3s_ports | default(false)
+  community.general.ufw:
+    rule: allow
+    port: "8472"
+    proto: udp
+
+- name: Allow kubelet 10250/tcp (agents) when enabled
+  when: (k3s_allow_kubelet_port | default(false)) and (inventory_hostname in groups['k3s_agent'])
+  community.general.ufw:
+    rule: allow
+    port: "10250"
+    proto: tcp

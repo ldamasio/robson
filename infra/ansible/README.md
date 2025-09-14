@@ -49,7 +49,11 @@ This README summarizes how to harden fresh Contabo Ubuntu 24.04 VPSs and bring u
 
 ## Notes & troubleshooting
 - Idempotent: you can re-run the playbooks; the bootstrap role resets the Ansible connection after changing the SSH port.
-- UFW: currently only SSH is allowed. When you install an ingress/gateway, open TCP `80/443` on gateway nodes.
+- UFW: by default, SSH is allowed; and basic k3s ports are opened automatically (`bootstrap_open_k3s_ports=true`):
+  - server: 6443/tcp (API), 9345/tcp (supervisor)
+  - all nodes: 8472/udp (flannel VXLAN)
+  - optional: 10250/tcp on agents (`k3s_allow_kubelet_port=true`)
+  - When you install an ingress/gateway, open TCP `80/443` on gateway nodes.
 - Service name is `ssh` on Ubuntu 24.04 (handled by the role).
 - Secrets: never commit tokens/passwords unencrypted; always use `ansible-vault`.
 
@@ -57,4 +61,3 @@ This README summarizes how to harden fresh Contabo Ubuntu 24.04 VPSs and bring u
 - Install ArgoCD via Helm and apply the App-of-Apps.
 - Install Istio ingress/gateway (Service: LoadBalancer) to obtain a public IP.
 - Configure Registro.br wildcard `*.robson.rbx.ia.br` to the gateway IP and validate TLS via cert-manager HTTP-01.
-
