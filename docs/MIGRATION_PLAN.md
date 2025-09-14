@@ -57,10 +57,12 @@ Steps
    - [ ] Install and configure Istio (Ambient Mode) with Gateway API (mandatory)
 
 8) Infra specifics (Contabo + k3s + Ansible + Helm + GitOps previews)
-   - [x] Ansible cluster bootstrap (k3s) — skeleton
+   - [x] Ansible baseline security & bootstrap
+       - [x] `infra/ansible/roles/bootstrap` (admin user, SSH hardening with Vault port, UFW; safe reconnect)
+       - [x] `infra/ansible/group_vars/all/{main.yml,vault.yml}` with Vault-managed secrets
        - [x] `infra/ansible/inventory/contabo` with server/agent groups
        - [x] `infra/ansible/roles/k3s` minimal tasks
-       - [x] `infra/ansible/site.yml` playbook scaffold
+       - [x] `infra/ansible/site.yml` (bootstrap precedes k3s)
    - [ ] Base platform via Helm
        - [ ] cert-manager, external-dns
        - [ ] Istio Ambient Mode (sidecarless): install istio-base/istiod with ambient, ztunnel daemonset and CNI; enable mTLS by default

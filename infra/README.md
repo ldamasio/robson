@@ -31,8 +31,11 @@ infra/
 
 Ansible (bootstrap)
 - Define hosts: `infra/ansible/inventory/contabo/hosts.ini`
+- Set secrets: edit `infra/ansible/group_vars/all/vault.yml` with `vault_ssh_port` and `vault_admin_pubkey`, then encrypt with `ansible-vault encrypt`.
 - Run: `ansible-playbook -i inventory/contabo site.yml`
-- Role `k3s` should install server/agents and join; store kubeconfig.
+- Roles:
+  - `bootstrap`: secure baseline (admin user + SSH hardening + UFW); changes SSH port to the Vault-defined port safely.
+  - `k3s`: install server/agents and join; store kubeconfig.
 
 Platform via Helm
 - Install cert-manager, external-dns.
@@ -54,4 +57,3 @@ App Charts (Helm)
 Security & Secrets
 - Use SealedSecrets or SOPS for Kubernetes secrets.
 - Bootstrap sensitive values via Ansible Vault as needed.
-
