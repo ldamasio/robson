@@ -1,0 +1,89 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: robson-root
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/OWNER/REPO
+    targetRevision: main
+    path: infra/k8s/gitops/app-of-apps
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+---
+# Child app: robson-backend (Helm chart in-repo)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: robson-backend
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/OWNER/REPO
+    targetRevision: main
+    path: infra/charts/robson-backend
+    helm:
+      values: |
+        host: backend.robson.rbx.ia.br
+        gateway:
+          className: istio
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: robson
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+---
+# Child app: robson-frontend (Helm chart in-repo)
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: robson-frontend
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/OWNER/REPO
+    targetRevision: main
+    path: infra/charts/robson-frontend
+    helm:
+      values: |
+        host: app.robson.rbx.ia.br
+        gateway:
+          className: istio
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: robson
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+---
+# Child app: ApplicationSet for branch previews
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: robson-branch-previews
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: https://github.com/OWNER/REPO
+    targetRevision: main
+    path: infra/k8s/gitops/applicationsets
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: argocd
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+

@@ -50,6 +50,8 @@ Steps
 6) GitOps/Infra alignment
    - [x] Add Helm chart skeletons for backend and frontend (Gateway API)
    - [x] Add ApplicationSet skeleton for branch previews
+   - [x] Add App-of-Apps (ArgoCD) root with child apps (backend/front) and ApplicationSet
+   - [x] Add CI workflow to build preview images for non-main branches
    - [ ] Restructure manifests to `infra/k8s/{base,overlays}` using Helm charts
    - [ ] Add ArgoCD app-of-apps and ApplicationSets
    - [ ] Update image build contexts in any GitOps refs to new `apps/*` paths
