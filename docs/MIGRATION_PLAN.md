@@ -83,6 +83,9 @@ Steps
    - [x] Add Hexagonal code examples in `apps/backend/core`
    - [x] Add contribution notes for adapters and ports (docs/CONTRIBUTING-ADAPTERS.md)
    - [x] Record decision: add ADR for Hexagonal Architecture (Ports & Adapters)
+   - [x] Record decision: add ADR for Istio Ambient + Gateway API
+   - [x] Record decision: add ADR for GitOps preview envs per branch
+   - [x] Add infra overview and instructions (infra/README.md)
 
 Notes
 - Keep migrations and Django app structure working while extracting domain/application code.

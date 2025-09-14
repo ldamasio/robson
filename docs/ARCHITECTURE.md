@@ -65,4 +65,10 @@ Migration guidelines:
 3) Implement adapters in `core/adapters/*` and wire them in `core/wiring`.
 4) Make REST/WS call use cases only (no domain logic in views).
 5) Keep migrations and infra in `infra/` or adapter-specific folders.
+Platform: Istio Ambient + Gateway API
+
+- Service mesh: Istio Ambient (sidecarless) with mTLS default; namespaces opt-in via labels.
+- Ingress: Gateway API resources (`Gateway`, `HTTPRoute`) with GatewayClass `istio`.
+- DNS and TLS: external-dns manages `*.robson.rbx.ia.br`; cert-manager issues certificates referenced by Gateways.
+- Per-branch previews: for every non-main branch, deploy to namespace `h-<branch>` and host `h-<branch>.robson.rbx.ia.br` via ArgoCD ApplicationSet.
 
