@@ -1,0 +1,26 @@
+image:
+  repository: ldamasio/rbs-frontend-prod
+  tag: latest
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+service:
+  port: 3403
+
+host: app.robson.rbx.ia.br
+
+gateway:
+  className: istio
+
+tls:
+  enabled: true
+  secretName: robson-frontend-tls
+  createIssuer: false
+  acmeEmail: ""
+
+namespace:
+  create: false
+  ambient: false
+
+resources: {}

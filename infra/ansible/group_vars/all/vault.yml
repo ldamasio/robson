@@ -1,0 +1,5 @@
+# Encrypt this file with Ansible Vault: `ansible-vault encrypt infra/ansible/group_vars/all/vault.yml`
+# Example variables (replace values before encrypting):
+vault_ssh_port: 22222
+vault_admin_pubkey: "ssh-ed25519 AAAA... your_key_comment"
+

@@ -1,0 +1,4 @@
+ssh_port: "{{ vault_ssh_port | default(22) }}"
+admin_user: robson
+admin_pubkey: "{{ vault_admin_pubkey | default('') }}"
+

@@ -1,0 +1,61 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: robson-branch-previews
+  namespace: argocd
+spec:
+  goTemplate: true
+  generators:
+    - git:
+        repoURL: https://github.com/ldamasio/robson
+        revision: HEAD
+        directories:
+          - path: charts/*
+        filters:
+          - path: '^(?!main$).*' # exclude main (dummy; adjust with matrix if needed)
+    - pullRequest:
+        repoURL: https://github.com/ldamasio/robson
+        # Optionally generate from PRs
+  template:
+    metadata:
+      name: 'robson-{{ lower (replace (replace .branch "/" "-") "_" "-") }}'
+      labels:
+        robson/preview: 'true'
+    spec:
+      project: default
+      source:
+        repoURL: https://github.com/ldamasio/robson
+        targetRevision: '{{ .branch }}'
+        path: charts/robson-backend
+        helm:
+          values: |
+            host: h-{{ lower (replace (replace .branch "/" "-") "_" "-") }}.robson.rbx.ia.br
+            image:
+              tag: '{{ lower (replace (replace .branch "/" "-") "_" "-") }}-{{ .short_sha }}'
+            gateway:
+              className: istio
+            namespace:
+              create: true
+              ambient: true
+            tls:
+              createIssuer: true
+              acmeEmail: ldamasio@gmail.com
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: 'h-{{ lower (replace (replace .branch "/" "-") "_" "-") }}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true
+        syncOptions:
+          - CreateNamespace=true
+      ignoreDifferences:
+        - group: ""
+          kind: Secret
+  templatePatch: |
+    metadata:
+      annotations:
+        argocd.argoproj.io/sync-options: Validate=false
+    spec:
+      destination:
+        namespace: 'h-{{ lower (replace (replace .branch "/" "-") "_" "-") }}'

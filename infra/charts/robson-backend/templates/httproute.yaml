@@ -1,0 +1,18 @@
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: HTTPRoute
+metadata:
+  name: robson-backend-route
+spec:
+  parentRefs:
+    - name: robson-backend-gateway
+  hostnames:
+    - {{ .Values.host | quote }}
+  rules:
+    - matches:
+        - path:
+            type: PathPrefix
+            value: /
+      backendRefs:
+        - name: robson-backend
+          port: 80
+

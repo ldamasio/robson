@@ -1,0 +1,94 @@
+- name: Ensure admin user exists
+  ansible.builtin.user:
+    name: "{{ admin_user }}"
+    groups: sudo
+    append: true
+    create_home: true
+    shell: /bin/bash
+
+- name: Allow admin user passwordless sudo
+  ansible.builtin.copy:
+    dest: "/etc/sudoers.d/99-{{ admin_user }}"
+    content: "{{ admin_user }} ALL=(ALL) NOPASSWD:ALL\n"
+    owner: root
+    group: root
+    mode: '0440'
+
+- name: Install required packages (OpenSSH server, UFW)
+  ansible.builtin.apt:
+    name:
+      - openssh-server
+      - ufw
+    state: present
+    update_cache: yes
+  when: ansible_os_family == 'Debian'
+
+- name: Ensure admin authorized_keys is present
+  ansible.builtin.authorized_key:
+    user: "{{ admin_user }}"
+    state: present
+    key: "{{ admin_pubkey }}"
+  when: admin_pubkey | length > 0
+
+- name: Configure SSHD - set port
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?Port\s+'
+    line: "Port {{ ssh_port }}"
+    state: present
+
+- name: Configure SSHD - disable password auth
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?PasswordAuthentication\s+'
+    line: 'PasswordAuthentication no'
+    state: present
+
+- name: Configure SSHD - disable root password login
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?PermitRootLogin\s+'
+    line: 'PermitRootLogin prohibit-password'
+    state: present
+
+- name: Configure SSHD - ensure PubkeyAuthentication yes
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^#?PubkeyAuthentication\s+'
+    line: 'PubkeyAuthentication yes'
+    state: present
+
+- name: Allow new SSH port on UFW
+  community.general.ufw:
+    rule: allow
+    port: "{{ ssh_port }}"
+    proto: tcp
+
+- name: Deny all incoming by default (UFW)
+  community.general.ufw:
+    state: enabled
+    policy: deny
+    direction: incoming
+
+- name: Allow all outgoing by default (UFW)
+  community.general.ufw:
+    state: enabled
+    policy: allow
+    direction: outgoing
+
+- name: Ensure UFW is enabled
+  community.general.ufw:
+    state: enabled
+
+- name: Restart SSH service
+  ansible.builtin.service:
+    name: ssh
+    state: restarted
+
+- name: Switch Ansible connection to new SSH port for subsequent tasks
+  ansible.builtin.set_fact:
+    ansible_port: "{{ ssh_port }}"
+
+- name: Reset SSH connection to apply new port
+  ansible.builtin.meta: reset_connection
+

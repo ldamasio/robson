@@ -1,0 +1,24 @@
+- name: Install dependencies
+  apt:
+    name:
+      - curl
+      - ca-certificates
+    update_cache: yes
+  when: ansible_os_family == 'Debian'
+
+- name: Install k3s server
+  shell: |
+    curl -sfL https://get.k3s.io | INSTALL_K3S_EXEC="server --write-kubeconfig-mode=644" sh -
+  when: inventory_hostname in groups['k3s_server']
+  args:
+    creates: /usr/local/bin/k3s
+
+- name: Install k3s agent
+  shell: |
+    curl -sfL https://get.k3s.io | K3S_URL="https://{{ hostvars[groups['k3s_server'][0]]['ansible_host'] | default(groups['k3s_server'][0]) }}:6443" K3S_TOKEN="{{ hostvars[groups['k3s_server'][0]]['k3s_token'] | default('CHANGE_ME') }}" sh -
+  when: inventory_hostname in groups['k3s_agent']
+  args:
+    creates: /usr/local/bin/k3s-agent
+
+# NOTE: Ambient Mode (Istio) and platform components are installed via Helm after bootstrap.
+

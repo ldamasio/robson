@@ -12,7 +12,8 @@
 ## Tests
 
 - How to verify:
-  - [ ] `cd backends/monolith && ./bin/dj test`
+  - [ ] `cd apps/backend/monolith && ./bin/dj test`
+  - [ ] `cd apps/frontend && npm ci && npm test`
 - Added/updated tests:
   - 
 
@@ -39,4 +40,3 @@
 - [ ] Migrations created (if needed) and rationale explained
 - [ ] Tests added/updated and passing locally
 - [ ] Docs updated (README/DEVELOPER/MIGRATION_GUIDE as applicable)
-

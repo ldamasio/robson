@@ -1,0 +1,26 @@
+image:
+  repository: ldamasio/rbs-backend-monolith-prod
+  tag: latest
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+
+service:
+  port: 8000
+
+host: backend.robson.rbx.ia.br
+
+gateway:
+  className: istio
+
+tls:
+  enabled: true
+  secretName: robson-backend-tls
+  createIssuer: false
+  acmeEmail: ""
+
+namespace:
+  create: false
+  ambient: false
+
+resources: {}
