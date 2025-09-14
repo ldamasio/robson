@@ -5,7 +5,8 @@ function ActualPrice() {
 
   const [numero,setNumero] = useState(0);
 
-  const { lastJsonMessage, sendMessage } = useWebSocket('wss://stream.binance.com:9443/ws/btcusdt@ticker', {
+  const WS_URL = import.meta.env.VITE_WS_URL_BINANCE || 'wss://stream.binance.com:9443/ws/btcusdt@ticker'
+  const { lastJsonMessage, sendMessage } = useWebSocket(WS_URL, {
     onOpen: () => console.log(`Connected to App WS`),
     onMessage: () => {
       if (lastJsonMessage) {
