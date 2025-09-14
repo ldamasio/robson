@@ -27,10 +27,9 @@ Alternatives
 - Module‑level client instance: similar trade‑offs to singleton, harder to reset in tests.
 
 Implementation Notes
-- Code: `backends/monolith/api/services/binance_service.py`
+- Code: `apps/backend/monolith/api/services/binance_service.py`
   - Class‑level `_instance`, `_client` enforce singleton.
   - `import_module('api.services')` dynamically loads `Client` to honor test patches.
-- Tests: `backends/monolith/api/tests_services.py`
+- Tests: `apps/backend/monolith/api/tests_services.py`
   - Reset singleton state in `setUp()` and patch `api.services.Client`.
 - Related docs: `docs/STYLE_GUIDE.md`, `docs/AI_WORKFLOW.md`.
-

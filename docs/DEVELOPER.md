@@ -166,10 +166,10 @@ Coding Style
 - Tooling (optional, recommended)
   - Black (formatter), isort (imports), Flake8 (lint), Mypy (types).
   - Install in dev venv: `python -m pip install black isort flake8 mypy`
-  - Useful commands (in backends/monolith):
+  - Useful commands (in apps/backend/monolith):
     - `black .`
     - `isort .`
-    - `flake8 api/ backends/monolith/backend/`
+    - `flake8 api/ apps/backend/monolith/backend/`
     - `mypy api/` (if types are adopted)
 - Pre‑commit (optional)
   - You may use pre-commit locally if you prefer, but it is not required and is not part of CI.

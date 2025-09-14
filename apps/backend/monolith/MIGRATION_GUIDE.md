@@ -13,13 +13,13 @@ Current Status
   - Legacy rules/config/reports (evaluate migration or deprecation)
 
 Before You Start
-- `manage.py` path: `backends/monolith/manage.py`.
-- Database: PostgreSQL via `RBS_PG_*` variables in `backends/monolith/.env`.
-- Run commands from `backends/monolith`.
+- `manage.py` path: `apps/backend/monolith/manage.py`.
+- Database: PostgreSQL via `RBS_PG_*` variables in `apps/backend/monolith/.env`.
+- Run commands from `apps/backend/monolith`.
 
 1) Back up data
 ```bash
-cd backends/monolith
+cd apps/backend/monolith
 python manage.py dumpdata clients > backup_clients.json
 python manage.py dumpdata api > backup_api.json
 ```
@@ -33,7 +33,7 @@ python manage.py dumpdata api > backup_api.json
 3) Generate and apply migrations
 Use the `./bin/dj` wrapper (recommended for dev) or call `manage.py` directly.
 ```bash
-cd backends/monolith
+cd apps/backend/monolith
 ./bin/dj makemigrations api
 ./bin/dj migrate
 # or
@@ -44,7 +44,7 @@ Important notes
 
 4) Run model tests
 ```bash
-cd backends/monolith
+cd apps/backend/monolith
 ./bin/dj test
 ```
 Tests cover: managers (`objects`/`active`), computed properties (e.g., `display_name`, `pair_display`, `win_rate`, `remaining_quantity`), validations (e.g., `stop_loss_price`), methods (`mark_as_filled`, `update_performance`, `calculate_unrealized_pnl`, etc.).
@@ -53,7 +53,7 @@ Tests cover: managers (`objects`/`active`), computed properties (e.g., `display_
 - Imports work: `from api.models import Symbol, Strategy, Order, Operation, Position, Trade`.
 - Admin lists the models (file `api/admin.py` registers them).
 ```bash
-cd backends/monolith
+cd apps/backend/monolith
 python manage.py runserver
 # Visit /admin/
 ```
@@ -119,11 +119,11 @@ This drops the dev Postgres volume, removes `api` migrations (except `__init__.p
 
 9) Post‑migration cleanup
 - Once all legacy models are migrated, remove temporary imports from `api/models/__init__.py` that point to legacy `api/models.py`.
-- Remove any unused legacy classes from `backends/monolith/api/models.py`.
+- Remove any unused legacy classes from `apps/backend/monolith/api/models.py`.
 - Search and replace old import paths in code/tests to the new locations (`api/models/trading.py`, etc.).
 
 10) Environment prerequisites
-- Ensure these variables exist in `backends/monolith/.env`:
+- Ensure these variables exist in `apps/backend/monolith/.env`:
   - `RBS_SECRET_KEY`, `DEBUG=True`
   - `RBS_PG_DATABASE`, `RBS_PG_USER`, `RBS_PG_PASSWORD`, `RBS_PG_HOST=localhost`, `RBS_PG_PORT=5432`
   - Optional for development: `BINANCE_USE_TESTNET=True`, `TRADING_ENABLED=False`, `RBS_BINANCE_API_KEY_TEST`, `RBS_BINANCE_SECRET_KEY_TEST`

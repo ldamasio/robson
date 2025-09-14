@@ -25,7 +25,7 @@ env_guard() {
   local debug="${DEBUG:-True}"
   if [[ "${debug}" != "True" ]] || [[ "${host}" != "localhost" && "${host}" != "127.0.0.1" ]]; then
     echo "⚠️  Refusing to run outside local dev (DEBUG=True, HOST=localhost required)." >&2
-    echo "Set DEBUG=True and RBS_PG_HOST=localhost in backends/monolith/.env for development." >&2
+    echo "Set DEBUG=True and RBS_PG_HOST=localhost in apps/backend/monolith/.env for development." >&2
     echo "For production, use your CI/CD (GitOps/ArgoCD) pipeline." >&2
     exit 1
   fi
@@ -52,7 +52,7 @@ Dev DB (Docker):
 
 Notes:
   - This script is for local dev only. Production deploys should go via GitOps/CI.
-  - Requires backends/monolith/.env pointing to localhost Postgres.
+  - Requires apps/backend/monolith/.env pointing to localhost Postgres.
 EOF
 }
 
@@ -107,4 +107,3 @@ main() {
 }
 
 main "$@"
-

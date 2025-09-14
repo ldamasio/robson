@@ -3,9 +3,15 @@ from pathlib import Path
 from decouple import AutoConfig
 from datetime import timedelta
 import os
+import sys
 
 BASE_DIR = Path(__file__).resolve().parent.parent
 config = AutoConfig(search_path=BASE_DIR)
+
+# Ensure repository root is in sys.path so `apps.*` packages are importable
+REPO_ROOT = BASE_DIR.parent.parent.parent  # <repo>/
+if str(REPO_ROOT) not in sys.path:
+    sys.path.insert(0, str(REPO_ROOT))
 
 # ==========================================
 # BASIC CONFIGURATION

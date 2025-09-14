@@ -38,9 +38,12 @@ Steps
 5) Frontend alignment
    - [ ] Add `src/{domain,ports,adapters,application}` and map API calls via ports
    - [ ] Replace direct fetches with `TradeService`-like interfaces
+   - [ ] Configure envs (`VITE_API_URL`, `VITE_WS_URL`) and update README
+   - [ ] Add minimal contract tests for adapters (mock fetch/WS)
 6) GitOps/Infra alignment
    - [ ] Restructure manifests to `infra/k8s/{base,overlays}` or Helm/Kustomize
    - [ ] Add ArgoCD app-of-apps if applicable
+   - [ ] Update image build contexts in any GitOps refs to new `apps/*` paths
 7) Documentation updates
    - [x] Update `docs/DEVELOPER.md` paths
    - [x] Add Hexagonal code examples in `apps/backend/core`
