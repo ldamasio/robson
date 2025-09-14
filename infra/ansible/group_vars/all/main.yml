@@ -6,3 +6,6 @@ admin_pubkey: "{{ vault_admin_pubkey | default('') }}"
 bootstrap_open_k3s_ports: true
 # Also open kubelet port 10250/tcp on agents (usually not needed externally)
 k3s_allow_kubelet_port: false
+
+# Open HTTP/HTTPS on gateway nodes (Istio Gateway/Ingress)
+open_gateway_ports: true

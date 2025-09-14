@@ -88,13 +88,12 @@ Expected: 1 control‑plane + 3 workers Ready
 
 Notes
 - Idempotent: plays can be re-run; bootstrap resets Ansible connection after the SSH port change.
-- UFW: currently allows only SSH. When we install an ingress/gateway, we will open TCP 80/443 in the gateway node(s).
-- Ubuntu 24.04: roles target Ubuntu/Debian (apt, openssh-server, ufw). Service name "ssh" is valid.
-- Secrets: use ansible-vault, never commit plaintext tokens/passwords.
+ - UFW: SSH is allowed; basic k3s ports open automatically (server: 6443/tcp, 9345/tcp; all: 8472/udp). Gateway ports 80/443/tcp open when `open_gateway_ports=true` (default enabled on server; or define `k3s_gateway` group).
+ - Ubuntu 24.04: roles target Ubuntu/Debian (apt, openssh-server, ufw). Service name "ssh" is valid.
+ - Secrets: use ansible-vault, never commit plaintext tokens/passwords.
 
 Next (out of scope for this run)
 - Install ArgoCD via Helm; apply App‑of‑Apps.
 - Install Istio Ingress/Gateway (Service LoadBalancer) to get public IP.
 - Configure Registro.br wildcard `*.robson.rbx.ia.br` → `<Gateway_IP>`.
 - Validate cert-manager HTTP‑01 issuance.
-

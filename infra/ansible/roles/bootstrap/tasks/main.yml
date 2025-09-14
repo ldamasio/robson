@@ -120,3 +120,24 @@
     rule: allow
     port: "10250"
     proto: tcp
+
+# Optional: open gateway (HTTP/HTTPS) on server or dedicated gateway group
+- name: Allow HTTP 80/tcp on gateway nodes
+  when: open_gateway_ports | default(false) and (
+          (inventory_hostname in groups['k3s_server']) or
+          ("k3s_gateway" in groups and (inventory_hostname in groups['k3s_gateway']))
+        )
+  community.general.ufw:
+    rule: allow
+    port: "80"
+    proto: tcp
+
+- name: Allow HTTPS 443/tcp on gateway nodes
+  when: open_gateway_ports | default(false) and (
+          (inventory_hostname in groups['k3s_server']) or
+          ("k3s_gateway" in groups and (inventory_hostname in groups['k3s_gateway']))
+        )
+  community.general.ufw:
+    rule: allow
+    port: "443"
+    proto: tcp

@@ -53,7 +53,7 @@ This README summarizes how to harden fresh Contabo Ubuntu 24.04 VPSs and bring u
   - server: 6443/tcp (API), 9345/tcp (supervisor)
   - all nodes: 8472/udp (flannel VXLAN)
   - optional: 10250/tcp on agents (`k3s_allow_kubelet_port=true`)
-  - When you install an ingress/gateway, open TCP `80/443` on gateway nodes.
+  - Gateway: HTTP/HTTPS `80/443` are opened when `open_gateway_ports=true`. By default it targets the `k3s_server` host; you can also define a `k3s_gateway` group in the inventory to open only on dedicated nodes.
 - Service name is `ssh` on Ubuntu 24.04 (handled by the role).
 - Secrets: never commit tokens/passwords unencrypted; always use `ansible-vault`.
 
