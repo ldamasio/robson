@@ -54,14 +54,14 @@ Steps
    - [x] Add ApplicationSet skeleton for branch previews
    - [x] Add App-of-Apps (ArgoCD) root with child apps (backend/front) and ApplicationSet
    - [x] Add CI workflow to build preview images for non-main branches
-   - [ ] Restructure manifests to `infra/k8s/{base,overlays}` using Helm charts
-   - [ ] Add ArgoCD app-of-apps and ApplicationSets
-   - [ ] Update image build contexts in any GitOps refs to new `apps/*` paths
-   - [ ] Configure cert-manager and external-dns (or wildcard-only) for `robson.rbx.ia.br`
+   - [x] Restructure manifests under `infra/k8s` and `infra/charts` (Helm-first; overlays not required)
+   - [x] Add ArgoCD app-of-apps and ApplicationSets (completed)
+   - [x] Update image build contexts in CI to new `apps/*` paths
+   - [x] Configure TLS with cert-manager (HTTP-01) and wildcard DNS strategy for `robson.rbx.ia.br`
        - [ ] Choose DNS strategy:
-         - [ ] Wildcard-only A/AAAA at Registro.br (no external-dns)
+         - [x] Wildcard-only A/AAAA at Registro.br (no external-dns)
          - [ ] external-dns provider (delegate subzone or RFC2136) — see `docs/infra/EXTERNAL_DNS.md`
-       - [ ] If wildcard-only: add a single wildcard record `*.robson.rbx.ia.br -> <Gateway_IP>` and configure TLS (HTTP-01 per host or bring-your-own wildcard cert)
+       - [x] If wildcard-only: add a single wildcard record `*.robson.rbx.ia.br -> <Gateway_IP>` and configure TLS (HTTP-01 per host) — documented
        - [ ] If provider-based: create credentials Secret/SealedSecret and set domainFilters
    - [x] Add cert-manager Application and ClusterIssuer manifests (HTTP-01 via Gateway API)
    - [x] Install and configure Istio (Ambient Mode) with Gateway API (manifests added)
@@ -73,16 +73,16 @@ Steps
        - [x] `infra/ansible/inventory/contabo` with server/agent groups
        - [x] `infra/ansible/roles/k3s` minimal tasks
        - [x] `infra/ansible/site.yml` (bootstrap precedes k3s)
-   - [ ] Base platform via Helm
+   - [ ] Base platform via Helm (apply later on cluster)
        - [x] cert-manager Application (ArgoCD) and ClusterIssuer (HTTP-01 via Gateway API)
        - [x] Gateway API CRDs Application
        - [x] Istio Ambient components Applications (base, istiod ambient, ztunnel, CNI)
        - [x] ArgoCD Application manifest (Helm chart) added for later bootstrap
        - [ ] external-dns (optional if not using wildcard-only)
        - [ ] ArgoCD install via Helm (one-time bootstrap), then apply App of Apps
-   - [ ] Service packaging via Helm
-       - [ ] Charts for `apps/backend/monolith` and `apps/frontend` with values for host/image/tag/env
-       - [ ] Gateway API resources (Gateway/HTTPRoute/TLS) templated in charts (no Ingress)
+   - [x] Service packaging via Helm
+       - [x] Charts for `apps/backend/monolith` and `apps/frontend` with values for host/image/tag/env
+       - [x] Gateway API resources (Gateway/HTTPRoute/TLS) templated in charts (no Ingress)
    - [x] GitOps previews per branch (non-main)
        - [x] ArgoCD ApplicationSet using Git generator to create env per branch (exclude `main`)
        - [x] Namespace pattern `h-<branch>` (labels to opt-in Ambient: `istio.io/dataplane-mode: ambient`)
@@ -90,10 +90,10 @@ Steps
        - [x] Gateway API manifests from values; TLS via cert-manager (Certificate)
        - [ ] external-dns manages DNS for Gateway public IP/LoadBalancer (if chosen)
        - [x] Branch name sanitization (lowercase and dashes)
-   - [ ] CI integration for previews
-       - [ ] Build/push images for non-main with tag `<branch>-<sha>`
-       - [ ] Expose image tag to ApplicationSet via values or ArgoCD Image Updater
-       - [ ] Auto-sync enabled; destroy env on branch deletion
+   - [x] CI integration for previews
+       - [x] Build/push images for non-main with tag `<branch>-<sha>`
+       - [x] Expose image tag to ApplicationSet via values
+       - [x] Auto-sync enabled; destroy env on branch deletion
 7) Documentation updates
    - [x] Update `docs/DEVELOPER.md` paths
    - [x] Add Hexagonal code examples in `apps/backend/core`
