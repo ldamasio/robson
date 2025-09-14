@@ -100,6 +100,7 @@ Steps
    - [x] Record decision: add ADR for Istio Ambient + Gateway API
    - [x] Record decision: add ADR for GitOps preview envs per branch
    - [x] Add infra overview and instructions (infra/README.md)
+   - [x] Archive legacy monolith `MIGRATION_GUIDE.md` to `docs/history/monolith/`
 
 Notes
 - Keep migrations and Django app structure working while extracting domain/application code.

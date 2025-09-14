@@ -13,7 +13,12 @@ Core Rules
 
 Operational Guidance
 - Small, focused changes: Make targeted patches and propose a concise commit message.
-- Documentation updates: Whenever behavior or developer UX changes, update relevant docs (README, DEVELOPER.md, MIGRATION_GUIDE.md, STYLE_GUIDE.md) and include those docs files in the proposed commit.
+- Documentation updates: Whenever behavior or developer UX changes, update relevant docs and include them in the proposed commit. Primary docs to maintain:
+  - `README.md`, `docs/DEVELOPER.md`, `docs/ARCHITECTURE.md`, `docs/MIGRATION_PLAN.md`
+  - ADRs under `docs/adr/` (add or amend decisions)
+  - Infra guides: `infra/README.md`, `docs/infra/*`
+  - Contribution guides: `docs/CONTRIBUTING-ADAPTERS.md`, `docs/STYLE_GUIDE.md`
+  - Note: Archived guides live under `docs/history/` and are not targets for ongoing updates.
 - English‑only enforcement: Avoid introducing Portuguese or other non‑English text in code or docs. If encountered, translate as part of the change.
 
 Suggested Commit Message Template
@@ -25,4 +30,3 @@ Examples
 - `feat(api): add trade duration property and winner logic`
 - `fix(ci): make Order.price nullable in migrations to satisfy tests`
 - `docs(dev): add pre-commit usage and style guide link`
-
