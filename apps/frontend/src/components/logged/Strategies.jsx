@@ -1,30 +1,26 @@
-import React, { useState, useEffect, useContext } from 'react'
+import React, { useState, useEffect, useContext, useMemo } from 'react'
 import AuthContext from '../../context/AuthContext'
+import { TradeHttp } from '../../adapters/http/TradeHttp'
 
 function Strategies() {
 
   let [strategies, setStrategies] = useState([])
   let { authTokens, logoutUser } = useContext(AuthContext)
+
+  const service = useMemo(() => new TradeHttp({
+    baseUrl: import.meta.env.VITE_API_BASE_URL,
+    getAuthToken: () => authTokens?.access || null,
+  }), [authTokens])
   useEffect(() => {
     getStrategies()
   }, [])
 
   let getStrategies = async () => {
-    console.log('getStrategies().');
-    let response = await fetch('http://127.0.0.1:8000/api/strategies/', {
-      method: 'GET',
-      headers: {
-        'Content-Type': 'application/json',
-        'Authorization': 'Bearer ' + String(authTokens.access)
-      }
-    })
-    let data = await response.json()
-
-    if (response.status === 200) {
-      console.log(data)
+    try {
+      const data = await service.getStrategies()
       setStrategies(data)
-    } else {
-      console.log("not 200 strat")
+    } catch (e) {
+      console.log('Failed to load strategies', e)
     }
   }
 

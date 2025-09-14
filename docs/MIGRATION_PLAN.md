@@ -36,9 +36,9 @@ Steps
    - [x] Add wiring factories in `core/wiring`
    - [x] Provide external stubs/adapters (BinanceMarketData, StubExecution, NoopEventBus, RealClock)
 5) Frontend alignment
-   - [ ] Add `src/{domain,ports,adapters,application}` and map API calls via ports
-   - [ ] Replace direct fetches with `TradeService`-like interfaces
-   - [ ] Configure envs (`VITE_API_URL`, `VITE_WS_URL`) and update README
+   - [x] Add `src/{domain,ports,adapters,application}` and map API calls via ports (created domain/ports/adapters; wired Strategies)
+   - [x] Replace direct fetches with `TradeService`-like interfaces (Strategies.jsx)
+   - [x] Configure envs (`VITE_API_BASE_URL`, `VITE_WS_URL`) and update README
    - [ ] Add minimal contract tests for adapters (mock fetch/WS)
 6) GitOps/Infra alignment
    - [ ] Restructure manifests to `infra/k8s/{base,overlays}` or Helm/Kustomize
