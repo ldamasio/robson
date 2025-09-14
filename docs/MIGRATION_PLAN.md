@@ -48,9 +48,31 @@ Steps
    - [x] Add minimal contract tests for adapters (mock fetch for TradeHttp via Vitest)
    - [x] Add WebSocket port+adapter and contract test (MarketWS)
 6) GitOps/Infra alignment
-   - [ ] Restructure manifests to `infra/k8s/{base,overlays}` or Helm/Kustomize
-   - [ ] Add ArgoCD app-of-apps if applicable
+   - [ ] Restructure manifests to `infra/k8s/{base,overlays}` using Helm charts
+   - [ ] Add ArgoCD app-of-apps and ApplicationSets
    - [ ] Update image build contexts in any GitOps refs to new `apps/*` paths
+   - [ ] Configure cert-manager and external-dns for `robson.rbx.ia.br`
+   - [ ] Configure Istio Ambient (optional) for mTLS/ingress gateways
+
+8) Infra specifics (Contabo + k3s + Ansible + Helm + GitOps previews)
+   - [ ] Ansible cluster bootstrap (k3s)
+       - [ ] `infra/ansible/inventory/contabo` with 4 VPS hosts (roles: server/agent)
+       - [ ] `infra/ansible/roles/k3s` to install and join nodes; idempotent; supports adding new VPS
+       - [ ] `infra/ansible/site.yml` to run full cluster bootstrap (k3s + prerequisites)
+   - [ ] Base platform via Helm
+       - [ ] cert-manager, external-dns, ingress/mesh (Istio Ambient if chosen)
+       - [ ] ArgoCD install via Helm and App of Apps (gitops root)
+   - [ ] Service packaging via Helm
+       - [ ] Charts for `apps/backend/monolith` and `apps/frontend` with values for host/image/tag/env
+   - [ ] GitOps previews per branch (non-main)
+       - [ ] ArgoCD ApplicationSet using Git generator to create env per branch (exclude `main`)
+       - [ ] Namespace pattern `h-<branch>` and host `h-<branch>.robson.rbx.ia.br`
+       - [ ] Ingress templated from values; TLS via cert-manager; DNS via external-dns
+       - [ ] Branch name sanitization (lowercase, alnum and dashes)
+   - [ ] CI integration for previews
+       - [ ] Build/push images for non-main with tag `<branch>-<sha>`
+       - [ ] Expose image tag to ApplicationSet via values or ArgoCD Image Updater
+       - [ ] Auto-sync enabled; destroy env on branch deletion
 7) Documentation updates
    - [x] Update `docs/DEVELOPER.md` paths
    - [x] Add Hexagonal code examples in `apps/backend/core`
@@ -62,3 +84,5 @@ Notes
 - Avoid breaking API/URLs during refactor; adapt views to use use cases internally.
 - Use import boundaries (e.g., import-linter) later to enforce layer rules.
 - Ensure Python importability for `apps.*` packages (added `__init__.py`).
+- DNS: prefer delegated zone for `robson.rbx.ia.br` and wildcard or external-dns automation for `h-*.robson.rbx.ia.br`.
+- Secrets: manage with SealedSecrets or SOPS; bootstrap secrets with Ansible Vault as needed.
