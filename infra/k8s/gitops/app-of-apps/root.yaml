@@ -6,7 +6,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/OWNER/REPO
+    repoURL: https://github.com/ldamasio/robson
     targetRevision: main
     path: infra/k8s/gitops/app-of-apps
   destination:
@@ -26,7 +26,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/OWNER/REPO
+    repoURL: https://github.com/ldamasio/robson
     targetRevision: main
     path: infra/charts/robson-backend
     helm:
@@ -51,7 +51,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/OWNER/REPO
+    repoURL: https://github.com/ldamasio/robson
     targetRevision: main
     path: infra/charts/robson-frontend
     helm:
@@ -76,7 +76,7 @@ metadata:
 spec:
   project: default
   source:
-    repoURL: https://github.com/OWNER/REPO
+    repoURL: https://github.com/ldamasio/robson
     targetRevision: main
     path: infra/k8s/gitops/applicationsets
   destination:
@@ -86,4 +86,3 @@ spec:
     automated:
       prune: true
       selfHeal: true
-

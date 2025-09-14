@@ -6,14 +6,14 @@ metadata:
 spec:
   generators:
     - git:
-        repoURL: https://github.com/OWNER/REPO
+        repoURL: https://github.com/ldamasio/robson
         revision: HEAD
         directories:
           - path: charts/*
         filters:
           - path: '^(?!main$).*' # exclude main (dummy; adjust with matrix if needed)
     - pullRequest:
-        repoURL: https://github.com/OWNER/REPO
+        repoURL: https://github.com/ldamasio/robson
         # Optionally generate from PRs
   template:
     metadata:
@@ -23,7 +23,7 @@ spec:
     spec:
       project: default
       source:
-        repoURL: https://github.com/OWNER/REPO
+        repoURL: https://github.com/ldamasio/robson
         targetRevision: '{{branch}}'
         path: charts/robson-backend
         helm:
@@ -50,4 +50,3 @@ spec:
     spec:
       destination:
         namespace: 'h-{{branch}}'
-
