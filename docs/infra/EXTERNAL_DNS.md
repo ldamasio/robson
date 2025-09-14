@@ -18,6 +18,14 @@ Next steps
 - Create Kubernetes Secret with credentials (use SealedSecrets in Git).
 - Helm values for external-dns will set `provider`, `domainFilters`, and credentials refs.
 
+Wildcard-only strategy (no external-dns)
+- Create a wildcard A/AAAA record at Registro.br pointing to the Gateway’s public IP:
+  - `*.robson.rbx.ia.br -> <GATEWAY_LB_IP>` (or narrow to preview hosts `*.robson.rbx.ia.br` still matches `h-<branch>...`).
+- Pros: no DNS API or external provider required; previews work because all hosts resolve to the same IP.
+- TLS options:
+  - Per-host certs via cert-manager HTTP-01 + Gateway API solver (automated) — subject to Let’s Encrypt rate limits.
+  - Single wildcard certificate `*.robson.rbx.ia.br` (from a CA) stored as a Kubernetes Secret and referenced by the Gateway — renewal handled outside or via DNS-01 automation if you later add a DNS provider.
+- Cons: manual management of the single wildcard record; LB IP changes require a manual update.
+
 References
 - https://kubernetes-sigs.github.io/external-dns/latest/
-

@@ -6,7 +6,14 @@ Stack
 - Packaging: Helm (platform and apps).
 - GitOps: ArgoCD (App of Apps) + ApplicationSet (per-branch previews).
 - Mesh & Ingress: Istio Ambient Mode + Gateway API.
-- DNS/TLS: external-dns + cert-manager for `robson.rbx.ia.br`.
+- DNS/TLS:
+  - Option A (simple): wildcard DNS at Registro.br
+    - Create `*.robson.rbx.ia.br` → Gateway LB IP (covers `h-<branch>.robson.rbx.ia.br`).
+    - TLS:
+      - Automated per-host via cert-manager HTTP-01 (Gateway API solver) — watch Let’s Encrypt rate limits.
+      - Or provide a wildcard cert `*.robson.rbx.ia.br` as a Secret and reference in the Gateway.
+  - Option B (dynamic DNS): external-dns + cert-manager for `robson.rbx.ia.br`
+    - Delegate subzone to a supported provider or use RFC2136; external-dns manages records.
 
 Layout
 ```

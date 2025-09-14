@@ -55,10 +55,12 @@ Steps
    - [ ] Restructure manifests to `infra/k8s/{base,overlays}` using Helm charts
    - [ ] Add ArgoCD app-of-apps and ApplicationSets
    - [ ] Update image build contexts in any GitOps refs to new `apps/*` paths
-   - [ ] Configure cert-manager and external-dns for `robson.rbx.ia.br`
-       - [ ] Decide external-dns provider (see `docs/infra/EXTERNAL_DNS.md`)
-       - [ ] If using delegation, create subzone in supported provider and delegate from Registro.br
-       - [ ] If using RFC2136, provision TSIG and target DNS server
+   - [ ] Configure cert-manager and external-dns (or wildcard-only) for `robson.rbx.ia.br`
+       - [ ] Choose DNS strategy:
+         - [ ] Wildcard-only A/AAAA at Registro.br (no external-dns)
+         - [ ] external-dns provider (delegate subzone or RFC2136) — see `docs/infra/EXTERNAL_DNS.md`
+       - [ ] If wildcard-only: add a single wildcard record `*.robson.rbx.ia.br -> <Gateway_IP>` and configure TLS (HTTP-01 per host or bring-your-own wildcard cert)
+       - [ ] If provider-based: create credentials Secret/SealedSecret and set domainFilters
    - [ ] Install and configure Istio (Ambient Mode) with Gateway API (mandatory)
 
 8) Infra specifics (Contabo + k3s + Ansible + Helm + GitOps previews)
