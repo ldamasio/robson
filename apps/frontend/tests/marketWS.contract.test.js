@@ -5,8 +5,8 @@ class FakeWS {
   constructor(url) {
     this.url = url
     FakeWS.instances.push(this)
-    // open immediately (sync) for deterministic test
-    this.onopen && this.onopen()
+    // open on microtask to simulate async onopen
+    queueMicrotask(() => this.onopen && this.onopen())
   }
   send(data) { this.lastSent = data }
   close() { this.closed = true }
@@ -28,7 +28,10 @@ describe('MarketWS adapter', () => {
 
     // simulate server tick
     const ws = FakeWS.instances[0]
+    // wait a microtask for onopen->send to run
+    await Promise.resolve()
     ws.emit({ type: 'tick', pair: 'BTCUSDT', bid: '1', ask: '2' })
+    await Promise.resolve()
 
     // assertions
     expect(ws.url).toBe('ws://test.local/ws')
