@@ -77,8 +77,9 @@ Steps
        - [x] cert-manager Application (ArgoCD) and ClusterIssuer (HTTP-01 via Gateway API)
        - [x] Gateway API CRDs Application
        - [x] Istio Ambient components Applications (base, istiod ambient, ztunnel, CNI)
+       - [x] ArgoCD Application manifest (Helm chart) added for later bootstrap
        - [ ] external-dns (optional if not using wildcard-only)
-       - [ ] ArgoCD install via Helm and App of Apps (gitops root)
+       - [ ] ArgoCD install via Helm (one-time bootstrap), then apply App of Apps
    - [ ] Service packaging via Helm
        - [ ] Charts for `apps/backend/monolith` and `apps/frontend` with values for host/image/tag/env
        - [ ] Gateway API resources (Gateway/HTTPRoute/TLS) templated in charts (no Ingress)
