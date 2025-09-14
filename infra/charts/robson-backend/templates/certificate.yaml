@@ -8,7 +8,11 @@ spec:
   dnsNames:
     - {{ .Values.host | quote }}
   issuerRef:
+    {{- if .Values.tls.createIssuer }}
+    name: robson-letsencrypt-http01
+    kind: Issuer
+    {{- else }}
     name: letsencrypt-http01
     kind: ClusterIssuer
+    {{- end }}
 {{- end }}
-

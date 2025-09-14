@@ -19,3 +19,8 @@ See `.env.example` and copy to `.env.local` for development.
 Migration note
 - Deprecated `REACT_APP_BACKEND_URL` from the old app is replaced by `VITE_API_BASE_URL`.
 - If you had `frontends/web/.env.development`, map its values into `.env.local` here.
+
+Production note
+- Use HTTPS/WSS in production envs:
+  - `VITE_API_BASE_URL=https://api.robson.rbx.ia.br` (example)
+  - `VITE_WS_URL=wss://ws.robson.rbx.ia.br/ws`

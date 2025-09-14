@@ -37,6 +37,9 @@ spec:
             namespace:
               create: true
               ambient: true
+            tls:
+              createIssuer: true
+              acmeEmail: ldamasio@gmail.com
       destination:
         server: https://kubernetes.default.svc
         namespace: 'h-{{ lower (replace (replace .branch "/" "-") "_" "-") }}'

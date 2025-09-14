@@ -16,6 +16,8 @@ gateway:
 tls:
   enabled: true
   secretName: robson-backend-tls
+  createIssuer: false
+  acmeEmail: ""
 
 namespace:
   create: false

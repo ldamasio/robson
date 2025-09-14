@@ -1,0 +1,18 @@
+{{- if and .Values.tls.createIssuer .Values.tls.acmeEmail }}
+apiVersion: cert-manager.io/v1
+kind: Issuer
+metadata:
+  name: robson-letsencrypt-http01
+spec:
+  acme:
+    email: {{ .Values.tls.acmeEmail | quote }}
+    server: https://acme-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: robson-letsencrypt-http01
+    solvers:
+      - http01:
+          gatewayHTTPRoute:
+            parentRefs:
+              - name: robson-frontend-gateway
+{{- end }}
+
