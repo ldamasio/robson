@@ -1,6 +1,6 @@
 FROM python:3.12-slim-bookworm
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends build-essential gcc \
+    && apt-get install -y --no-install-recommends build-essential gcc libffi-dev python3-dev \
     && rm -rf /var/lib/apt/lists/*
 ENV PYTHONDONTWRITEBYTECODE=1
 ENV PYTHONUNBUFFERED=1
@@ -8,7 +8,7 @@ ENV DJANGO_MODULES_SETTINGS=backend.settings
 ENV DEBUG=True
 WORKDIR /app
 COPY ../requirements.txt .
-RUN pip install --upgrade pip && pip install -r requirements.txt
+RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 COPY . /app/
 EXPOSE 8000
 CMD ["gunicorn","-b","0.0.0.0:8000","--worker-class=gevent","--worker-connections=1000","--workers=5","backend.wsgi"]
