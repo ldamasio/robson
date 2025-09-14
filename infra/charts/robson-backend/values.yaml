@@ -13,5 +13,8 @@ host: backend.robson.rbx.ia.br
 gateway:
   className: istio
 
-resources: {}
+tls:
+  enabled: true
+  secretName: robson-backend-tls
 
+resources: {}

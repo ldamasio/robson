@@ -12,4 +12,16 @@ spec:
       allowedRoutes:
         namespaces:
           from: Same
-
+    {{- if .Values.tls.enabled }}
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: {{ .Values.host | quote }}
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - name: {{ .Values.tls.secretName }}
+      allowedRoutes:
+        namespaces:
+          from: Same
+    {{- end }}

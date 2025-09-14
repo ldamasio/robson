@@ -45,7 +45,7 @@ Ansible (bootstrap)
   - `k3s`: install server/agents and join; store kubeconfig.
 
 Platform via Helm
-- Install cert-manager, external-dns.
+- Install cert-manager (HTTP-01 with Gateway API solver) and optionally external-dns.
 - Install Istio (Ambient Mode): base, istiod with ambient enabled, ztunnel DS, CNI.
 - Install ArgoCD via Helm; apply App of Apps.
 
@@ -59,7 +59,7 @@ GitOps Previews (ApplicationSet)
 App Charts (Helm)
 - Values: `image.repository`, `image.tag`, `host`, `env`, `resources`.
 - Gateway API: define `Gateway` (per env) and `HTTPRoute` mapping host → Service.
-- TLS secret referenced by Gateway; Certificate managed by cert-manager.
+- TLS: charts create a Certificate (ClusterIssuer `letsencrypt-http01`) and add HTTPS listener referencing the Secret.
 
 Security & Secrets
 - Use SealedSecrets or SOPS for Kubernetes secrets.

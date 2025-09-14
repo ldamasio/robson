@@ -1,0 +1,14 @@
+{{- if .Values.tls.enabled }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: robson-backend-cert
+spec:
+  secretName: {{ .Values.tls.secretName }}
+  dnsNames:
+    - {{ .Values.host | quote }}
+  issuerRef:
+    name: letsencrypt-http01
+    kind: ClusterIssuer
+{{- end }}
+
