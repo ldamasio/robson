@@ -41,5 +41,4 @@ Implementation Notes
 Related
 - ADR-0001: BinanceService Singleton (legacy service compatibility and testing strategy)
 - docs/ARCHITECTURE.md
-- docs/MIGRATION_PLAN.md
-
+- docs/history/MIGRATION_PLAN.md

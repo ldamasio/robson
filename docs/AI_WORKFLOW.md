@@ -14,7 +14,7 @@ Core Rules
 Operational Guidance
 - Small, focused changes: Make targeted patches and propose a concise commit message.
 - Documentation updates: Whenever behavior or developer UX changes, update relevant docs and include them in the proposed commit. Primary docs to maintain:
-  - `README.md`, `docs/DEVELOPER.md`, `docs/ARCHITECTURE.md`, `docs/MIGRATION_PLAN.md`
+  - `README.md`, `docs/DEVELOPER.md`, `docs/ARCHITECTURE.md`
   - ADRs under `docs/adr/` (add or amend decisions)
   - Infra guides: `infra/README.md`, `docs/infra/*`
   - Contribution guides: `docs/CONTRIBUTING-ADAPTERS.md`, `docs/STYLE_GUIDE.md`

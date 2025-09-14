@@ -24,5 +24,4 @@ Implementation Notes
 
 Related
 - ADR-0003 Istio Ambient + Gateway API
-- infra/README.md; docs/MIGRATION_PLAN.md
-
+- infra/README.md; docs/history/MIGRATION_PLAN.md
