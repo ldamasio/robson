@@ -9,3 +9,6 @@ k3s_allow_kubelet_port: false
 
 # Open HTTP/HTTPS on gateway nodes (Istio Gateway/Ingress)
 open_gateway_ports: true
+
+# Safer SSH port migration: keep 22 while adopting the new port
+ssh_keep_port_22: true

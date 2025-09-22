@@ -10,8 +10,9 @@ This README summarizes how to harden fresh Contabo Ubuntu 24.04 VPSs and bring u
 
 ## Inventory
 - Edit `infra/ansible/inventory/contabo/hosts.ini` (already filled with your hosts):
-  - Server (8GB): `164.68.96.68`
-  - Agents (8GB/4GB): `158.220.116.31`, `149.102.139.33`, `167.86.92.97`
+  - Server (8GB): tiger (158.220.116.31)
+  - Agents (8GB/4GB): bengal (164.68.96.68), pantera (149.102.139.33), eagle (167.86.92.97)
+  - Optional gateway group: `k3s_gateway` (defaults to the server)
 
 ## Vault variables
 - File: `infra/ansible/group_vars/all/vault.yml`
@@ -30,20 +31,21 @@ This README summarizes how to harden fresh Contabo Ubuntu 24.04 VPSs and bring u
 
 - Bootstrap security on all hosts (creates `robson`, installs your key, disables password login, enables UFW, moves SSH to vault port):
   - `ansible-playbook -i inventory/contabo/hosts.ini site.yml -u root -k`
-  - Verify SSH: `ssh -p 49731 robson@164.68.96.68`
+  - Safe migration: by default we keep both ports (22 and 49731) until you turn `ssh_keep_port_22=false` later.
+  - Verify SSH: `ssh -p 49731 robson@158.220.116.31` (and `ssh -p 22 robson@...` still works during migration)
 
 - Install k3s server only:
   - `ansible-playbook -i inventory/contabo/hosts.ini site.yml -u robson --private-key ~/.ssh/id_ed25519 -e ansible_port=49731 --limit k3s_server`
 
 - Capture node-token and save to Vault:
-  - `ssh -p 49731 robson@164.68.96.68 'sudo cat /var/lib/rancher/k3s/server/node-token'`
+  - `ssh -p 49731 robson@158.220.116.31 'sudo cat /var/lib/rancher/k3s/server/node-token'`
   - `ansible-vault edit infra/ansible/group_vars/all/vault.yml` (add `vault_k3s_token`)
 
 - Join agents to the cluster:
   - `ansible-playbook -i inventory/contabo/hosts.ini site.yml -u robson --private-key ~/.ssh/id_ed25519 -e ansible_port=49731 --limit k3s_agent`
 
 - Validate cluster from your machine:
-  - `scp -P 49731 robson@164.68.96.68:/etc/rancher/k3s/k3s.yaml ~/.kube/config-robson`
+  - `scp -P 49731 robson@158.220.116.31:/etc/rancher/k3s/k3s.yaml ~/.kube/config-robson`
   - `export KUBECONFIG=~/.kube/config-robson`
   - `kubectl get nodes -o wide`
 
@@ -54,6 +56,7 @@ This README summarizes how to harden fresh Contabo Ubuntu 24.04 VPSs and bring u
   - all nodes: 8472/udp (flannel VXLAN)
   - optional: 10250/tcp on agents (`k3s_allow_kubelet_port=true`)
   - Gateway: HTTP/HTTPS `80/443` are opened when `open_gateway_ports=true`. By default it targets the `k3s_server` host; you can also define a `k3s_gateway` group in the inventory to open only on dedicated nodes.
+  - SSH port migration: both ports are allowed/listened by default (`ssh_keep_port_22=true`). Once stable, set `ssh_keep_port_22=false` and re-run to close 22.
 - Service name is `ssh` on Ubuntu 24.04 (handled by the role).
 - Secrets: never commit tokens/passwords unencrypted; always use `ansible-vault`.
 

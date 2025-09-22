@@ -4,7 +4,7 @@ Status: Completed
 Archived: This plan has been executed and is kept for historical reference. Current architecture and workflows are documented in:
 - docs/ARCHITECTURE.md
 - docs/adr/* (Hexagonal, Istio Ambient + Gateway API, GitOps Previews, Ansible Bootstrap)
-- infra/README.md and docs/infra/*
+- infra/README.md and docs/plan/infra/*
 
 Scope (achieved)
 - Monorepo structure with services under `apps/`, infra under `infra/`, docs under `docs/`.
@@ -61,10 +61,9 @@ Steps (final state)
 
 Documentation updates
 - [x] ADR-0002 Hexagonal, ADR-0003 Istio Ambient + Gateway API, ADR-0004 GitOps Previews, ADR-0005 Ansible Bootstrap
-- [x] infra/README.md, docs/infra/*
+- [x] infra/README.md, docs/plan/infra/*
 - [x] Archived legacy monolith MIGRATION_GUIDE.md to docs/history/
 
 Notes
 - DNS: wildcard-only at Registro.br is adopted; external-dns remains optional for future dynamic DNS.
 - Cluster bootstrap (Ansible, ArgoCD install, platform apply) is an operational step and will be run separately from this migration.
-

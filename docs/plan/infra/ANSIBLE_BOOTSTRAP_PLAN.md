@@ -3,10 +3,11 @@ Ansible Bootstrap + k3s — Execution Plan
 Status: Ready to execute
 Scope: Secure‑bootstrap Ubuntu 24.04 VPSs (Contabo), then install k3s (1 server + 3 agents). No Istio/ArgoCD yet.
 
-Hosts and roles
-- 8GB (server): 164.68.96.68
-- 8GB (agent): 158.220.116.31
-- 4GB (agents): 149.102.139.33, 167.86.92.97
+Hosts and roles (aliases → IP)
+- tiger (server, 8GB): 158.220.116.31
+- bengal (agent, 8GB): 164.68.96.68
+- pantera (agent, 4GB): 149.102.139.33
+- eagle (agent, 4GB): 167.86.92.97
 
 Decisions
 - Admin user: robson
@@ -18,12 +19,15 @@ Decisions
 Inventory (infra/ansible/inventory/contabo/hosts.ini)
 ```
 [k3s_server]
-164.68.96.68 ansible_user=root
+tiger  ansible_host=158.220.116.31 ansible_user=root
 
 [k3s_agent]
-158.220.116.31 ansible_user=root
-149.102.139.33 ansible_user=root
-167.86.92.97 ansible_user=root
+bengal ansible_host=164.68.96.68 ansible_user=root
+pantera ansible_host=149.102.139.33 ansible_user=root
+eagle   ansible_host=167.86.92.97 ansible_user=root
+
+[k3s_gateway]
+tiger
 ```
 
 Vault and vars (infra/ansible/group_vars/all)
@@ -66,7 +70,7 @@ ansible-playbook -i inventory/contabo/hosts.ini site.yml \
 
 Step 4 — Capture node-token and save to Vault
 ```
-ssh -p 49731 robson@164.68.96.68 'sudo cat /var/lib/rancher/k3s/server/node-token'
+ssh -p 49731 robson@158.220.116.31 'sudo cat /var/lib/rancher/k3s/server/node-token'
 ansible-vault edit infra/ansible/group_vars/all/vault.yml
 # Add: vault_k3s_token: "K10...:server:..."
 ```
@@ -80,7 +84,7 @@ ansible-playbook -i inventory/contabo/hosts.ini site.yml \
 
 Step 6 — Validate cluster
 ```
-scp -P 49731 robson@164.68.96.68:/etc/rancher/k3s/k3s.yaml ~/.kube/config-robson
+scp -P 49731 robson@158.220.116.31:/etc/rancher/k3s/k3s.yaml ~/.kube/config-robson
 export KUBECONFIG=~/.kube/config-robson
 kubectl get nodes -o wide
 ```

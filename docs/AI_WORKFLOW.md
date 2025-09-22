@@ -16,7 +16,8 @@ Operational Guidance
 - Documentation updates: Whenever behavior or developer UX changes, update relevant docs and include them in the proposed commit. Primary docs to maintain:
   - `README.md`, `docs/DEVELOPER.md`, `docs/ARCHITECTURE.md`
   - ADRs under `docs/adr/` (add or amend decisions)
-  - Infra guides: `infra/README.md`, `docs/infra/*`
+  - Infra guides: `infra/README.md`, `docs/plan/infra/*`
+  - App plans: `docs/plan/apps/*`
   - Contribution guides: `docs/CONTRIBUTING-ADAPTERS.md`, `docs/STYLE_GUIDE.md`
   - Note: Archived guides live under `docs/history/` and are not targets for ongoing updates.
 - English‑only enforcement: Avoid introducing Portuguese or other non‑English text in code or docs. If encountered, translate as part of the change.

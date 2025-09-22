@@ -30,12 +30,29 @@
     key: "{{ admin_pubkey }}"
   when: admin_pubkey | length > 0
 
-- name: Configure SSHD - set port
+- name: Ensure SSHD listens on hardened port
   ansible.builtin.lineinfile:
     path: /etc/ssh/sshd_config
-    regexp: '^#?Port\s+'
+    regexp: '^Port\s+{{ ssh_port }}$'
     line: "Port {{ ssh_port }}"
     state: present
+    insertafter: EOF
+
+- name: Keep SSHD also on port 22 during migration (safer)
+  when: ssh_keep_port_22 | default(true)
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^Port\s+22$'
+    line: 'Port 22'
+    state: present
+    insertafter: EOF
+
+- name: Remove SSHD port 22 when migration toggle is off
+  when: not (ssh_keep_port_22 | default(true))
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^Port\s+22$'
+    state: absent
 
 - name: Configure SSHD - disable password auth
   ansible.builtin.lineinfile:
@@ -62,6 +79,13 @@
   community.general.ufw:
     rule: allow
     port: "{{ ssh_port }}"
+    proto: tcp
+
+- name: Allow SSH 22/tcp on UFW during migration
+  when: ssh_keep_port_22 | default(true)
+  community.general.ufw:
+    rule: allow
+    port: "22"
     proto: tcp
 
 - name: Deny all incoming by default (UFW)
