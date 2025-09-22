@@ -65,6 +65,14 @@ from .analysis import (
 from .patterns import (
     Rectangle,
     Triangle,
+    Hammer,
+    InvertedHammer,
+    HangingMan,
+    Piercing,
+    Engulfing,
+    ShootingStar,
+    MorningStar,
+    EveningStar,
 )
 
 # Indicators
@@ -72,6 +80,10 @@ from .indicators import (
     MovingAverage,
     RSIIndicator,
     MACDIndicator,
+    RelativeStrengthIndex,
+    MovingAverageConvergenceDivergence,
+    BollingerBands,
+    StochasticOscillator,
 )
 
 # Facts (refactored)
@@ -88,51 +100,28 @@ from .facts import (
     Downtrend,
 )
 
-# ==========================================
-# MAINTAIN COMPATIBILITY WITH OLD MODELS
-# ==========================================
+# Principles and qualitative data
+from .principles import (
+    OddsYourFavor,
+    LimitLosses,
+    Attribute,
+)
 
-# Old models that haven't been migrated yet
-# Temporarily import from original models.py to avoid breaking anything
+# Risk & configuration
+from .risk import (
+    OnePercentOfCapital,
+    JustBet4percent,
+)
 
-# TODO: Migrate these models gradually
-try:
-    # Import models that haven't been refactored yet
-    # Comment out as each one gets migrated
-    
-    # Principles (legacy) — compatibility layer
-    from ..models import OddsYourFavor
-    from ..models import LimitLosses
-    
-    # Technical Analysis
-    # Technical analysis models migrated to api/models/analysis.py
-    
-    # Facts migrated to api/models/facts.py
-    
-    # Chart Patterns
-    # Chart Patterns migrated to api/models/patterns.py
-    # Triangle, Hammer, etc. (incomplete classes in original)
-    
-    # Reversal Patterns
-    # Engulfing, ShootingStar, etc. (incomplete classes in original)
-    
-    # Statistical Indicators
-    # MovingAverage, RSI, etc. (incomplete classes in original)
-    
-    # Attributes (legacy) — compatibility layer
-    from ..models import Attribute
+from .config import (
+    OnlyTradeReversal,
+    MaxTradePerDay,
+)
 
-    # Rules/Config/Reports (legacy) — compatibility layer
-    from ..models import OnePercentOfCapital
-    from ..models import JustBet4percent
-    from ..models import OnlyTradeReversal
-    from ..models import MaxTradePerDay
-    from ..models import AlocatedCapitalPercent
-
-except ImportError as e:
-    # If can't import from original models.py, no problem
-    # Means we already migrated everything or models.py doesn't exist anymore
-    pass
+# Reports
+from .reports import (
+    AlocatedCapitalPercent,
+)
 
 # ==========================================
 # LIST OF ALL AVAILABLE MODELS
@@ -171,11 +160,23 @@ __all__ = [
     # Refactored patterns and indicators
     'Rectangle',
     'Triangle',
+    'Hammer',
+    'InvertedHammer',
+    'HangingMan',
+    'Piercing',
+    'Engulfing',
+    'ShootingStar',
+    'MorningStar',
+    'EveningStar',
     'MovingAverage',
     'RSIIndicator',
     'MACDIndicator',
+    'RelativeStrengthIndex',
+    'MovingAverageConvergenceDivergence',
+    'BollingerBands',
+    'StochasticOscillator',
 
-    # Old models (kept for compatibility)
+    # Legacy models now fully migrated
     'OddsYourFavor',
     'LimitLosses',
     'Attribute',
@@ -216,10 +217,22 @@ MIGRATION_STATUS = {
         # ✅ Patterns
         'Rectangle',
         'Triangle',
+        'Hammer',
+        'InvertedHammer',
+        'HangingMan',
+        'Piercing',
+        'Engulfing',
+        'ShootingStar',
+        'MorningStar',
+        'EveningStar',
         # ✅ Indicators
         'MovingAverage',
         'RSIIndicator',
         'MACDIndicator',
+        'RelativeStrengthIndex',
+        'MovingAverageConvergenceDivergence',
+        'BollingerBands',
+        'StochasticOscillator',
         # ✅ Facts
         'Resistance',
         'Support',
@@ -231,6 +244,15 @@ MIGRATION_STATUS = {
         'Breakout',
         'Uptrend',
         'Downtrend',
+        # ✅ Principles and risk/config
+        'OddsYourFavor',
+        'LimitLosses',
+        'Attribute',
+        'OnePercentOfCapital',
+        'JustBet4percent',
+        'OnlyTradeReversal',
+        'MaxTradePerDay',
+        'AlocatedCapitalPercent',
     ],
     'in_progress': [
         # Next to be migrated
