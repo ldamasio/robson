@@ -2,3 +2,13 @@ ssh_port: "{{ vault_ssh_port | default(22) }}"
 admin_user: robson
 admin_pubkey: "{{ vault_admin_pubkey | default('') }}"
 
+# Bootstrap network allowances
+bootstrap_open_k3s_ports: true
+# Also open kubelet port 10250/tcp on agents (usually not needed externally)
+k3s_allow_kubelet_port: false
+
+# Open HTTP/HTTPS on gateway nodes (Istio Gateway/Ingress)
+open_gateway_ports: true
+
+# Safer SSH port migration: keep 22 while adopting the new port
+ssh_keep_port_22: true

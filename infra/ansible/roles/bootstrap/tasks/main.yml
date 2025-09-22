@@ -30,12 +30,29 @@
     key: "{{ admin_pubkey }}"
   when: admin_pubkey | length > 0
 
-- name: Configure SSHD - set port
+- name: Ensure SSHD listens on hardened port
   ansible.builtin.lineinfile:
     path: /etc/ssh/sshd_config
-    regexp: '^#?Port\s+'
+    regexp: '^Port\s+{{ ssh_port }}$'
     line: "Port {{ ssh_port }}"
     state: present
+    insertafter: EOF
+
+- name: Keep SSHD also on port 22 during migration (safer)
+  when: ssh_keep_port_22 | default(true)
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^Port\s+22$'
+    line: 'Port 22'
+    state: present
+    insertafter: EOF
+
+- name: Remove SSHD port 22 when migration toggle is off
+  when: not (ssh_keep_port_22 | default(true))
+  ansible.builtin.lineinfile:
+    path: /etc/ssh/sshd_config
+    regexp: '^Port\s+22$'
+    state: absent
 
 - name: Configure SSHD - disable password auth
   ansible.builtin.lineinfile:
@@ -62,6 +79,13 @@
   community.general.ufw:
     rule: allow
     port: "{{ ssh_port }}"
+    proto: tcp
+
+- name: Allow SSH 22/tcp on UFW during migration
+  when: ssh_keep_port_22 | default(true)
+  community.general.ufw:
+    rule: allow
+    port: "22"
     proto: tcp
 
 - name: Deny all incoming by default (UFW)
@@ -92,3 +116,52 @@
 - name: Reset SSH connection to apply new port
   ansible.builtin.meta: reset_connection
 
+# Optional: open basic k3s ports for cluster communication
+- name: Allow k3s API server 6443/tcp (server only)
+  when: bootstrap_open_k3s_ports | default(false) and (inventory_hostname in groups['k3s_server'])
+  community.general.ufw:
+    rule: allow
+    port: "6443"
+    proto: tcp
+
+- name: Allow k3s supervisor 9345/tcp (server only)
+  when: bootstrap_open_k3s_ports | default(false) and (inventory_hostname in groups['k3s_server'])
+  community.general.ufw:
+    rule: allow
+    port: "9345"
+    proto: tcp
+
+- name: Allow flannel VXLAN 8472/udp (all nodes)
+  when: bootstrap_open_k3s_ports | default(false)
+  community.general.ufw:
+    rule: allow
+    port: "8472"
+    proto: udp
+
+- name: Allow kubelet 10250/tcp (agents) when enabled
+  when: (k3s_allow_kubelet_port | default(false)) and (inventory_hostname in groups['k3s_agent'])
+  community.general.ufw:
+    rule: allow
+    port: "10250"
+    proto: tcp
+
+# Optional: open gateway (HTTP/HTTPS) on server or dedicated gateway group
+- name: Allow HTTP 80/tcp on gateway nodes
+  when: open_gateway_ports | default(false) and (
+          (inventory_hostname in groups['k3s_server']) or
+          ("k3s_gateway" in groups and (inventory_hostname in groups['k3s_gateway']))
+        )
+  community.general.ufw:
+    rule: allow
+    port: "80"
+    proto: tcp
+
+- name: Allow HTTPS 443/tcp on gateway nodes
+  when: open_gateway_ports | default(false) and (
+          (inventory_hostname in groups['k3s_server']) or
+          ("k3s_gateway" in groups and (inventory_hostname in groups['k3s_gateway']))
+        )
+  community.general.ufw:
+    rule: allow
+    port: "443"
+    proto: tcp
