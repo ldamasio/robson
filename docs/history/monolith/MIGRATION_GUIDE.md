@@ -11,7 +11,7 @@ Current Status
 - Completed:
   - Trading: `Symbol`, `Strategy`, `Order`, `Operation`, `Position`, `Trade`
   - Technical Analysis: `TechnicalAnalysisInterpretation`, `TechnicalEvent`, `Argument`, `Reason`
-  - Patterns: `Rectangle`, `Triangle`
+  - Patterns: `PatternCatalog`, `PatternInstance`, `PatternPoint`, `PatternOutcome`, `PatternAlert` + category detail models (chart/candlestick/harmonic/elliott/wyckoff/indicator/cyclical)
   - Indicators: `MovingAverage`, `RSIIndicator`, `MACDIndicator`
 - Facts: `Resistance`, `Support`, `Line`, `TrendLine`, `Channel`, `Accumulation`, `Sideways`, `Breakout`, `Uptrend`, `Downtrend`
 - Next (remaining):
@@ -157,4 +157,3 @@ Troubleshooting
 
 Notes
 - This guide reflects the current code state and removes placeholders/duplication. Adjust as new migrations are introduced.
-
