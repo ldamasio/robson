@@ -39,7 +39,7 @@ RBS_BINANCE_SECRET_KEY_TEST=dev-test-secret-key
 2) Start local Postgres (Docker)
 Run from the repo root:
 ```
-# na raiz do repositório
+# at repo root
 make dev-db-up
 ```
 Direct alternative without Makefile:

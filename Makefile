@@ -6,19 +6,19 @@ BINANCE_DOCS_REF  ?= master
 sync-binance-docs:
 	@mkdir -p $$(dirname "$(BINANCE_DOCS_DIR)")
 	@if git config --file .gitmodules --name-only --get-regexp '^submodule\.$(BINANCE_DOCS_DIR)\.path$$' >/dev/null 2>&1; then \
-		echo "Submódulo já registrado: atualizando..."; \
+		echo "Submodule already registered: updating..."; \
 		git submodule sync --recursive; \
 		git submodule update --init --recursive; \
 	else \
-		echo "Registrando submódulo em $(BINANCE_DOCS_DIR) ..."; \
+		echo "Registering submodule at $(BINANCE_DOCS_DIR) ..."; \
 		git submodule add "$(BINANCE_DOCS_REPO)" "$(BINANCE_DOCS_DIR)" || true; \
 		git submodule update --init --recursive; \
 	fi; \
-	echo "Fixando em $(BINANCE_DOCS_REF) ..."; \
+	echo "Pinning to $(BINANCE_DOCS_REF) ..."; \
 	git -C "$(BINANCE_DOCS_DIR)" fetch --all --tags --prune; \
 	git -C "$(BINANCE_DOCS_DIR)" checkout --quiet "$(BINANCE_DOCS_REF)"; \
 	git -C "$(BINANCE_DOCS_DIR)" pull --ff-only || true; \
-	echo "✓ Docs Binance prontas em $(BINANCE_DOCS_DIR)"
+	echo "✓ Binance docs ready at $(BINANCE_DOCS_DIR)"
 
 # ==============================
 # Dev helpers (Django + Postgres)

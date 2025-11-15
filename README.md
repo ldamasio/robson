@@ -106,7 +106,7 @@ Robson is 100% open source and contributions are welcome. For how to prepare you
 - docs/DEVELOPER.md
 - docs/STYLE_GUIDE.md
 
-Deploys de produção são feitos via GitOps/CI (GitHub Actions + ArgoCD + k3s) usando Istio (Ambient Mode) com Gateway API. Cada branch ≠ main cria um ambiente de homolog automático em `h-<branch>.robson.rbx.ia.br`. O script `./bin/dj` e o `docker-compose.dev.yml` são destinados apenas ao desenvolvimento local. Veja `infra/README.md`.
+Production deployments are performed via GitOps/CI (GitHub Actions + ArgoCD + k3s) using Istio (Ambient Mode) with Gateway API. Each branch ≠ main creates an automatic staging environment at `h-<branch>.robson.rbx.ia.br`. The `./bin/dj` script and `docker-compose.dev.yml` are intended for local development only. See `infra/README.md`.
 
 Notes
 - The `./bin/dj` script is for local development only. Production deploys should be performed via your GitOps/CI pipeline (e.g., GitHub Actions + ArgoCD + k3s).

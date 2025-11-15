@@ -1,0 +1,483 @@
+openapi: 3.1.0
+
+info:
+  title: Robson Bot API
+  version: 1.0.0
+  description: |
+    **Robson Bot** is an open-source cryptocurrency trading platform with automated strategies,
+    risk management, and multi-tenant support.
+
+    ## Features
+    - **Trading**: Place, manage, and track orders across exchanges
+    - **Strategies**: Configure and backtest trading strategies
+    - **Risk Management**: Position limits, exposure controls
+    - **Market Data**: Real-time market data via WebSocket
+    - **Multi-Tenant**: Isolated user data and resources
+
+    ## Authentication
+    All endpoints (except `/auth/login`) require JWT authentication via Bearer token.
+
+    ## Rate Limiting
+    - 100 requests per minute per user
+    - 1000 requests per hour per user
+
+    ## Pagination
+    List endpoints support pagination via `limit` and `offset` query parameters.
+
+  contact:
+    name: Robson Bot Support
+    url: https://github.com/rbxrobotica/robson
+    email: support@rbx.ia.br
+
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: https://api.robsonbot.com/v1
+    description: Production server
+  - url: https://staging.robsonbot.com/v1
+    description: Staging server
+  - url: http://localhost:8000/api
+    description: Local development
+
+tags:
+  - name: Authentication
+    description: User authentication and token management
+  - name: Orders
+    description: Trading order operations
+  - name: Positions
+    description: Current position management
+  - name: Strategies
+    description: Trading strategy configuration
+  - name: Signals
+    description: Trading signal generation
+  - name: Market Data
+    description: Real-time market data access
+  - name: Risk
+    description: Risk management settings
+  - name: Users
+    description: User profile and settings
+
+paths:
+  # ============================================================================
+  # Authentication
+  # ============================================================================
+  /auth/login:
+    post:
+      tags: [Authentication]
+      summary: Login
+      description: Authenticate user and receive JWT tokens
+      operationId: login
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                  example: trader@example.com
+                password:
+                  type: string
+                  format: password
+                  example: SecureP@ssw0rd
+      responses:
+        '200':
+          description: Successful login
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  access:
+                    type: string
+                    description: JWT access token (15 min TTL)
+                    example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+                  refresh:
+                    type: string
+                    description: JWT refresh token (7 days TTL)
+                    example: eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9...
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /auth/refresh:
+    post:
+      tags: [Authentication]
+      summary: Refresh access token
+      description: Get a new access token using refresh token
+      operationId: refreshToken
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [refresh]
+              properties:
+                refresh:
+                  type: string
+                  description: JWT refresh token
+      responses:
+        '200':
+          description: New access token
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  access:
+                    type: string
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ============================================================================
+  # Orders
+  # ============================================================================
+  /orders:
+    get:
+      tags: [Orders]
+      summary: List orders
+      description: Get all orders for the authenticated user
+      operationId: listOrders
+      security:
+        - BearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Limit'
+        - $ref: '#/components/parameters/Offset'
+        - name: status
+          in: query
+          schema:
+            type: string
+            enum: [PENDING, FILLED, CANCELLED, FAILED]
+          description: Filter by order status
+        - name: symbol
+          in: query
+          schema:
+            type: string
+            example: BTCUSDT
+          description: Filter by trading symbol
+      responses:
+        '200':
+          description: List of orders
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  count:
+                    type: integer
+                    example: 42
+                  results:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Order'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    post:
+      tags: [Orders]
+      summary: Place order
+      description: Create a new trading order
+      operationId: placeOrder
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OrderCreate'
+      responses:
+        '201':
+          description: Order created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /orders/{order_id}:
+    get:
+      tags: [Orders]
+      summary: Get order
+      description: Retrieve order details by ID
+      operationId: getOrder
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '200':
+          description: Order details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Order'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+    delete:
+      tags: [Orders]
+      summary: Cancel order
+      description: Cancel a pending order
+      operationId: cancelOrder
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: order_id
+          in: path
+          required: true
+          schema:
+            type: string
+            format: uuid
+      responses:
+        '204':
+          description: Order cancelled successfully
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ============================================================================
+  # Market Data
+  # ============================================================================
+  /market/price/{symbol}:
+    get:
+      tags: [Market Data]
+      summary: Get current price
+      description: Get current market price for a symbol
+      operationId: getCurrentPrice
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: symbol
+          in: path
+          required: true
+          schema:
+            type: string
+            example: BTCUSDT
+      responses:
+        '200':
+          description: Current price
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  symbol:
+                    type: string
+                    example: BTCUSDT
+                  price:
+                    type: string
+                    example: "50000.00"
+                  timestamp:
+                    type: string
+                    format: date-time
+
+# ==============================================================================
+# Components
+# ==============================================================================
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT access token obtained from /auth/login
+
+  parameters:
+    Limit:
+      name: limit
+      in: query
+      description: Number of results to return
+      schema:
+        type: integer
+        default: 20
+        minimum: 1
+        maximum: 100
+
+    Offset:
+      name: offset
+      in: query
+      description: Number of results to skip
+      schema:
+        type: integer
+        default: 0
+        minimum: 0
+
+  schemas:
+    # ==========================================================================
+    # Order Schemas
+    # ==========================================================================
+    Order:
+      type: object
+      required:
+        - id
+        - symbol
+        - side
+        - type
+        - quantity
+        - status
+        - created_at
+      properties:
+        id:
+          type: string
+          format: uuid
+          example: 550e8400-e29b-41d4-a716-446655440000
+        symbol:
+          type: string
+          example: BTCUSDT
+          description: Trading pair symbol
+        side:
+          type: string
+          enum: [BUY, SELL]
+          description: Order side
+        type:
+          type: string
+          enum: [MARKET, LIMIT, STOP_LOSS, TAKE_PROFIT]
+          description: Order type
+        quantity:
+          type: string
+          example: "0.1"
+          description: Order quantity (decimal as string)
+        price:
+          type: string
+          example: "50000.00"
+          description: Limit price (null for market orders)
+          nullable: true
+        stop_price:
+          type: string
+          example: "49000.00"
+          description: Stop price for stop-loss/take-profit
+          nullable: true
+        status:
+          type: string
+          enum: [PENDING, FILLED, PARTIALLY_FILLED, CANCELLED, FAILED]
+          description: Order status
+        filled_quantity:
+          type: string
+          example: "0.05"
+          description: Quantity filled so far
+        average_price:
+          type: string
+          example: "50125.50"
+          description: Average fill price
+          nullable: true
+        strategy_id:
+          type: string
+          format: uuid
+          description: Associated strategy ID
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+          example: "2025-11-14T10:30:00Z"
+        updated_at:
+          type: string
+          format: date-time
+          example: "2025-11-14T10:31:00Z"
+
+    OrderCreate:
+      type: object
+      required:
+        - symbol
+        - side
+        - type
+        - quantity
+      properties:
+        symbol:
+          type: string
+          example: BTCUSDT
+        side:
+          type: string
+          enum: [BUY, SELL]
+        type:
+          type: string
+          enum: [MARKET, LIMIT, STOP_LOSS, TAKE_PROFIT]
+        quantity:
+          type: string
+          example: "0.1"
+          description: Order quantity (decimal as string)
+        price:
+          type: string
+          example: "50000.00"
+          description: Required for LIMIT orders
+        stop_price:
+          type: string
+          example: "49000.00"
+          description: Required for STOP_LOSS/TAKE_PROFIT orders
+        strategy_id:
+          type: string
+          format: uuid
+          description: Optional strategy association
+
+    # ==========================================================================
+    # Error Schemas
+    # ==========================================================================
+    Error:
+      type: object
+      required:
+        - error
+        - message
+      properties:
+        error:
+          type: string
+          example: validation_error
+        message:
+          type: string
+          example: Invalid order quantity
+        details:
+          type: object
+          additionalProperties: true
+
+  responses:
+    BadRequest:
+      description: Invalid request
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: validation_error
+            message: Invalid request parameters
+            details:
+              quantity: ["Must be greater than 0"]
+
+    Unauthorized:
+      description: Authentication required or token invalid
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: unauthorized
+            message: Invalid or expired token
+
+    NotFound:
+      description: Resource not found
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+          example:
+            error: not_found
+            message: Order not found
+
+# ==============================================================================
+# External Documentation
+# ==============================================================================
+externalDocs:
+  description: Robson Bot Documentation
+  url: https://docs.robsonbot.com
