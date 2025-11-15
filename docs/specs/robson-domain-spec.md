@@ -16,8 +16,12 @@
 4. [Calculations and Formulas](#4-calculations-and-formulas)
 5. [Risk Management](#5-risk-management)
 6. [Technical Indicators](#6-technical-indicators)
-7. [Multi-Tenant Data Isolation](#7-multi-tenant-data-isolation)
-8. [Future Planned Features](#8-future-planned-features)
+7. [Pattern Recognition System](#7-pattern-recognition-system)
+8. [Trading Configuration Rules](#8-trading-configuration-rules)
+9. [Technical Analysis Workflow](#9-technical-analysis-workflow)
+10. [Domain Principles](#10-domain-principles)
+11. [Multi-Tenant Data Isolation](#11-multi-tenant-data-isolation)
+12. [Future Planned Features](#12-future-planned-features)
 
 ---
 
@@ -1022,11 +1026,769 @@ stoch = StochasticOscillator(
 
 ---
 
-## 7. Multi-Tenant Data Isolation
+## 7. Pattern Recognition System
+
+**Purpose**: Formal catalog and detection of technical chart patterns with lifecycle tracking.
+
+### 7.1 Pattern Categories
+
+**Enum**: `PatternCategory`
+
+| Category | Description | Examples |
+|----------|-------------|----------|
+| CHART | Classical chart patterns | Head & Shoulders, Triangles, Wedges |
+| CANDLESTICK | Japanese candlestick formations | Doji, Hammer, Engulfing |
+| HARMONIC | Harmonic price patterns | Gartley, Butterfly, Bat, Crab |
+| ELLIOTT | Elliott Wave structures | Impulse waves, Corrective waves |
+| WYCKOFF | Wyckoff methodology patterns | Accumulation, Distribution phases |
+| INDICATOR | Indicator-based patterns | Divergences, Crossovers |
+| CYCLE | Cyclical/seasonal patterns | Market cycles, Seasonal trends |
+| HYBRID | Multi-method combinations | Combined pattern signals |
+
+### 7.2 Pattern Catalog
+
+**Model**: `PatternCatalog`
+
+**Purpose**: Formal definition of all supported technical patterns.
+
+**Fields**:
+- `pattern_code`: Unique identifier (e.g., "HS", "GARTLEY_222")
+- `name`: Human-readable name
+- `category`: PatternCategory enum
+- `direction_bias`: Expected market direction (BULLISH, BEARISH, CONTINUATION, NEUTRAL)
+- `reliability_score`: Decimal (0-100) - Historical success rate
+- `minimum_bars`: Integer - Minimum candles required
+- `description`: Detailed pattern description
+- `entry_rules`: JSONField - Entry trigger conditions
+- `exit_rules`: JSONField - Exit trigger conditions
+- `stop_rules`: JSONField - Stop-loss placement rules
+- `target_calculation`: JSONField - Price target formula
+
+**Example**:
+```python
+pattern = PatternCatalog(
+    pattern_code="HS",
+    name="Head and Shoulders",
+    category=PatternCategory.CHART,
+    direction_bias=PatternDirectionBias.BEARISH,
+    reliability_score=Decimal("72.50"),
+    minimum_bars=15,
+    description="Reversal pattern indicating trend exhaustion",
+    entry_rules={
+        "trigger": "neckline_break",
+        "confirmation": "close_below_neckline",
+        "volume_requirement": "rising"
+    },
+    exit_rules={
+        "target": "neckline_to_head_distance",
+        "partial_exit": "50_percent_at_half_target"
+    },
+    stop_rules={
+        "method": StopMethod.STRUCTURE,
+        "placement": "above_right_shoulder"
+    }
+)
+```
+
+### 7.3 Pattern Instance Lifecycle
+
+**Base Model**: `PatternInstance` (abstract)
+
+**States**: `PatternStatus` enum
+
+```
+FORMING
+  │
+  ├─> CONFIRMED (pattern fully formed)
+  │     │
+  │     ├─> TARGET_HIT (price target achieved)
+  │     ├─> FAILED (price reversed before target)
+  │     └─> INVALIDATED (pattern structure broken)
+  │
+  ├─> INVALIDATED (formation failed)
+  └─> EXPIRED (timeout before confirmation)
+```
+
+#### 7.3.1 State Transitions
+
+| From | Event | To | Condition |
+|------|-------|-----|-----------|
+| FORMING | All pattern points identified | CONFIRMED | Structure meets catalog requirements |
+| FORMING | Structure breaks | INVALIDATED | Price violates pattern rules |
+| FORMING | Timeout | EXPIRED | Time exceeds max_formation_time |
+| CONFIRMED | Target price reached | TARGET_HIT | Price >= target_price (bullish) or <= target_price (bearish) |
+| CONFIRMED | Stop hit | FAILED | Price hits stop_loss_price |
+| CONFIRMED | Structure invalidated | INVALIDATED | Pattern rules violated post-confirmation |
+
+#### 7.3.2 Common Pattern Instance Fields
+
+**Fields** (all pattern types):
+- `catalog`: ForeignKey to PatternCatalog
+- `symbol`: ForeignKey to Symbol
+- `timeframe`: CharField (e.g., "1h", "4h", "1d")
+- `status`: PatternStatus enum
+- `detected_at`: DateTimeField - Detection timestamp
+- `confirmed_at`: DateTimeField, optional
+- `completed_at`: DateTimeField, optional
+- `confidence_score`: Decimal (0-100) - Detection confidence
+- `target_price`: Decimal, optional
+- `stop_loss_price`: Decimal, optional
+- `breakout_direction`: BreakoutDirection enum (UP, DOWN, NONE)
+- `volume_profile`: VolumeProfile enum (RISING, FALLING, MIXED)
+
+### 7.4 Harmonic Patterns
+
+**Model**: `HarmonicPattern` (extends PatternInstance)
+
+**Additional Fields**:
+- `point_x`: Decimal - X point price
+- `point_a`: Decimal - A point price
+- `point_b`: Decimal - B point price
+- `point_c`: Decimal - C point price
+- `point_d`: Decimal - D point price (completion point)
+- `xab_ratio`: Decimal - Fibonacci ratio XA to AB
+- `abc_ratio`: Decimal - Fibonacci ratio AB to BC
+- `bcd_ratio`: Decimal - Fibonacci ratio BC to CD
+- `xad_ratio`: Decimal - Fibonacci ratio XA to AD
+
+**Common Harmonic Patterns**:
+- **Gartley**: XAB=0.618, ABC=0.382-0.886, BCD=1.13-1.618, XAD=0.786
+- **Butterfly**: XAB=0.786, ABC=0.382-0.886, BCD=1.618-2.24, XAD=1.27-1.618
+- **Bat**: XAB=0.382-0.50, ABC=0.382-0.886, BCD=1.618-2.618, XAD=0.886
+- **Crab**: XAB=0.382-0.618, ABC=0.382-0.886, BCD=2.618-3.618, XAD=1.618
+
+**Example**:
+```python
+gartley = HarmonicPattern(
+    catalog=gartley_catalog,
+    symbol=btc_symbol,
+    timeframe="4h",
+    status=PatternStatus.CONFIRMED,
+    point_x=Decimal("48000"),
+    point_a=Decimal("52000"),
+    point_b=Decimal("50000"),
+    point_c=Decimal("51200"),
+    point_d=Decimal("48800"),
+    xab_ratio=Decimal("0.618"),
+    abc_ratio=Decimal("0.618"),
+    bcd_ratio=Decimal("1.27"),
+    xad_ratio=Decimal("0.786"),
+    confidence_score=Decimal("85.00"),
+    target_price=Decimal("52500"),
+    stop_loss_price=Decimal("48500")
+)
+```
+
+### 7.5 Elliott Wave Patterns
+
+**Model**: `ElliottWavePattern` (extends PatternInstance)
+
+**Additional Fields**:
+- `wave_degree`: CharField - Wave degree (Grand Supercycle to Subminuette)
+- `wave_structure`: CharField - Structure type (IMPULSE, ZIGZAG, FLAT, TRIANGLE)
+- `wave_1_high`: Decimal
+- `wave_1_low`: Decimal
+- `wave_2_low`: Decimal (for impulse) / wave_2_high (for zigzag)
+- `wave_3_high`: Decimal
+- `wave_4_low`: Decimal
+- `wave_5_high`: Decimal (projected or actual)
+- `fibonacci_extensions`: JSONField - Extension levels for targets
+
+**Wave Degrees** (largest to smallest):
+1. Grand Supercycle
+2. Supercycle
+3. Cycle
+4. Primary
+5. Intermediate
+6. Minor
+7. Minute
+8. Minuette
+9. Subminuette
+
+**Validation Rules**:
+- Wave 2 never retraces more than 100% of Wave 1
+- Wave 3 is never the shortest of waves 1, 3, and 5
+- Wave 4 does not overlap Wave 1 price territory (in impulse)
+
+### 7.6 Wyckoff Patterns
+
+**Model**: `WyckoffPattern` (extends PatternInstance)
+
+**Additional Fields**:
+- `phase`: CharField - Wyckoff phase (ACCUMULATION, MARKUP, DISTRIBUTION, MARKDOWN)
+- `schematic`: CharField - Specific schematic (e.g., "ACCUMULATION_1", "DISTRIBUTION_2")
+- `preliminary_support`: Decimal, optional - PS level
+- `selling_climax`: Decimal, optional - SC level
+- `automatic_rally`: Decimal, optional - AR level
+- `secondary_test`: Decimal, optional - ST level
+- `spring`: Decimal, optional - Spring level
+- `sign_of_strength`: Decimal, optional - SOS level
+- `last_point_of_support`: Decimal, optional - LPS level
+- `backup_to_edge`: Decimal, optional - BUEC/LPSY level
+
+**Wyckoff Phases**:
+1. **Accumulation**: Smart money buying (schematics #1, #2, #3)
+2. **Markup**: Uptrend following accumulation
+3. **Distribution**: Smart money selling (schematics #1, #2)
+4. **Markdown**: Downtrend following distribution
+
+### 7.7 Chart Patterns
+
+**Model**: `ChartPattern` (extends PatternInstance)
+
+**Additional Fields**:
+- `pattern_type`: CharField - Specific pattern (HEAD_SHOULDERS, TRIANGLE, WEDGE, etc.)
+- `neckline_price`: Decimal, optional
+- `left_shoulder_high`: Decimal, optional
+- `head_high`: Decimal, optional
+- `right_shoulder_high`: Decimal, optional
+- `support_line_slope`: Decimal, optional
+- `resistance_line_slope`: Decimal, optional
+- `apex_date`: DateTimeField, optional - For triangles
+- `width`: Decimal, optional - Pattern width in price
+- `height`: Decimal, optional - Pattern height in price
+
+**Common Chart Patterns**:
+- **Reversal**: Head & Shoulders, Inverse H&S, Double Top/Bottom, Triple Top/Bottom
+- **Continuation**: Flags, Pennants, Triangles (Ascending, Descending, Symmetrical)
+- **Bilateral**: Rectangles, Expanding formations
+
+**Example - Head & Shoulders**:
+```python
+hs_pattern = ChartPattern(
+    catalog=hs_catalog,
+    symbol=btc_symbol,
+    timeframe="1d",
+    status=PatternStatus.CONFIRMED,
+    pattern_type="HEAD_SHOULDERS",
+    left_shoulder_high=Decimal("52000"),
+    head_high=Decimal("54000"),
+    right_shoulder_high=Decimal("51500"),
+    neckline_price=Decimal("48000"),
+    target_price=Decimal("42000"),  # Head to neckline distance
+    stop_loss_price=Decimal("52000"),  # Above right shoulder
+    breakout_direction=BreakoutDirection.DOWN,
+    confidence_score=Decimal("78.00")
+)
+```
+
+### 7.8 Candlestick Patterns
+
+**Model**: `CandlestickPattern` (extends PatternInstance)
+
+**Additional Fields**:
+- `pattern_type`: CharField - Candlestick formation name
+- `candle_count`: IntegerField - Number of candles in pattern
+- `body_to_wick_ratio`: Decimal, optional
+- `first_candle_open`: Decimal
+- `first_candle_close`: Decimal
+- `first_candle_high`: Decimal
+- `first_candle_low`: Decimal
+- `second_candle_open`: Decimal, optional
+- `second_candle_close`: Decimal, optional
+- `third_candle_open`: Decimal, optional
+- `third_candle_close`: Decimal, optional
+
+**Common Patterns**:
+- **Single**: Doji, Hammer, Shooting Star, Spinning Top
+- **Double**: Engulfing (Bullish/Bearish), Harami, Piercing/Dark Cloud
+- **Triple**: Morning/Evening Star, Three White Soldiers, Three Black Crows
+
+**Example - Bullish Engulfing**:
+```python
+engulfing = CandlestickPattern(
+    catalog=engulfing_catalog,
+    symbol=btc_symbol,
+    timeframe="4h",
+    status=PatternStatus.CONFIRMED,
+    pattern_type="BULLISH_ENGULFING",
+    candle_count=2,
+    first_candle_open=Decimal("50000"),
+    first_candle_close=Decimal("49500"),  # Bearish
+    first_candle_high=Decimal("50200"),
+    first_candle_low=Decimal("49400"),
+    second_candle_open=Decimal("49400"),
+    second_candle_close=Decimal("50500"),  # Bullish, engulfs first
+    second_candle_high=Decimal("50600"),
+    direction_bias=PatternDirectionBias.BULLISH,
+    confidence_score=Decimal("82.00")
+)
+```
+
+### 7.9 Indicator-Based Patterns
+
+**Model**: `IndicatorPattern` (extends PatternInstance)
+
+**Additional Fields**:
+- `indicator_type`: CharField - Indicator name (RSI, MACD, STOCH, etc.)
+- `pattern_type`: CharField - Pattern within indicator (DIVERGENCE, CROSSOVER, OVERBOUGHT, etc.)
+- `divergence_type`: CharField, optional - REGULAR, HIDDEN, EXAGGERATED
+- `indicator_value_1`: Decimal - First reference value
+- `indicator_value_2`: Decimal, optional - Second reference value (for divergences)
+- `price_at_value_1`: Decimal
+- `price_at_value_2`: Decimal, optional
+
+**Common Indicator Patterns**:
+- **Divergences**: Regular Bullish/Bearish, Hidden Bullish/Bearish
+- **Crossovers**: MA crossover, MACD line/signal cross
+- **Extremes**: RSI overbought (>70), RSI oversold (<30)
+- **Breakouts**: Bollinger Band squeeze breakout
+
+**Example - RSI Bullish Divergence**:
+```python
+rsi_div = IndicatorPattern(
+    catalog=rsi_div_catalog,
+    symbol=btc_symbol,
+    timeframe="1h",
+    status=PatternStatus.CONFIRMED,
+    indicator_type="RSI",
+    pattern_type="DIVERGENCE",
+    divergence_type="REGULAR_BULLISH",
+    indicator_value_1=Decimal("35.00"),  # First low
+    indicator_value_2=Decimal("40.00"),  # Higher low
+    price_at_value_1=Decimal("48000"),   # Lower price low
+    price_at_value_2=Decimal("47500"),   # Lower price low (divergence!)
+    direction_bias=PatternDirectionBias.BULLISH,
+    confidence_score=Decimal("75.00")
+)
+```
+
+### 7.10 Pattern-to-Trade Workflow
+
+**Sequence**:
+```
+1. Pattern Detection
+   ├─> PatternInstance created (status: FORMING)
+   └─> Confidence score calculated
+
+2. Pattern Confirmation
+   ├─> Structure validation passed
+   ├─> Status → CONFIRMED
+   ├─> Entry trigger activated
+   └─> Signal generation (if enabled)
+
+3. Trade Execution
+   ├─> Order created (linked to pattern)
+   ├─> Entry price set from pattern rules
+   ├─> Stop-loss from pattern.stop_loss_price
+   └─> Target from pattern.target_price
+
+4. Pattern Resolution
+   ├─> TARGET_HIT → Close position (profit)
+   ├─> FAILED → Stop-loss hit (loss)
+   └─> INVALIDATED → Manual review
+```
+
+**Integration Points**:
+- `Order.pattern`: ForeignKey to PatternInstance (optional)
+- `Strategy.config['patterns']`: List of enabled pattern codes
+- `Signal.pattern`: ForeignKey to PatternInstance (future)
+
+---
+
+## 8. Trading Configuration Rules
+
+**Purpose**: Configurable business rules that govern trading behavior.
+
+### 8.1 Base Configuration Model
+
+**Base Class**: `BaseConfigModel`
+
+**Common Fields** (via mixins):
+- `name`: CharField - Rule name
+- `description`: TextField - Rule description
+- `client`: ForeignKey to Client (multi-tenant)
+- `created_at`, `updated_at`: Timestamps
+
+### 8.2 Only Trade Reversal Rule
+
+**Model**: `OnlyTradeReversal`
+
+**Purpose**: Enforce trading only when reversal patterns are confirmed.
+
+**Fields**:
+- `is_enabled`: BooleanField (default: True)
+- `minimum_confirmation`: PositiveIntegerField (default: 1)
+
+**Behavior**:
+- When `is_enabled = True`, system blocks trades that are NOT based on reversal patterns
+- `minimum_confirmation` specifies how many reversal confirmations required
+- Reversal patterns: Head & Shoulders, Double Top/Bottom, Reversal candlesticks
+
+**Rationale**: "Reversals reinforce the trend of the opposing technical event within the chart pattern."
+
+**Example**:
+```python
+rule = OnlyTradeReversal(
+    client=client,
+    is_enabled=True,
+    minimum_confirmation=2
+)
+
+# Before creating order:
+if rule.is_enabled:
+    reversal_patterns = order.get_supporting_patterns(category="REVERSAL")
+    if len(reversal_patterns) < rule.minimum_confirmation:
+        raise ValidationError(
+            f"Order requires {rule.minimum_confirmation} reversal confirmations, "
+            f"found {len(reversal_patterns)}"
+        )
+```
+
+### 8.3 Max Trades Per Day Rule
+
+**Model**: `MaxTradePerDay`
+
+**Purpose**: Limit trading frequency to prevent overtrading.
+
+**Fields**:
+- `max_trades`: PositiveIntegerField (default: 3)
+
+**Behavior**:
+- Counts completed trades in rolling 24-hour window
+- Blocks new orders if limit reached
+- Applies per client (multi-tenant)
+
+**Example**:
+```python
+rule = MaxTradePerDay(client=client, max_trades=3)
+
+# Before creating order:
+recent_trades = Trade.objects.filter(
+    client=client,
+    created_at__gte=timezone.now() - timedelta(days=1)
+).count()
+
+if recent_trades >= rule.max_trades:
+    raise ValidationError(
+        f"Daily trade limit reached ({rule.max_trades}). "
+        f"Try again after {next_allowed_time}"
+    )
+```
+
+### 8.4 Configuration Rule Lifecycle
+
+**Creation**:
+1. Admin/user creates configuration rule
+2. `clean()` method sets default name/description if missing
+3. Rule saved with client association
+
+**Enforcement**:
+- Rules checked at order creation time
+- ValidationError raised if rule violated
+- User notified of specific rule that blocked trade
+
+**Deactivation**:
+- Set `is_enabled = False` (if field exists)
+- Or delete rule instance
+- Existing orders unaffected (rules apply only at creation)
+
+---
+
+## 9. Technical Analysis Workflow
+
+**Purpose**: Structured workflow for documenting technical analysis reasoning.
+
+### 9.1 Analysis Hierarchy
+
+```
+TechnicalAnalysisInterpretation (Catalog)
+  │
+  └─> TechnicalEvent (Instance)
+        │
+        └─> Argument (Supporting evidence)
+              │
+              └─> Reason (Rationale)
+```
+
+### 9.2 Technical Analysis Interpretation
+
+**Model**: `TechnicalAnalysisInterpretation`
+
+**Purpose**: Catalog of recognized technical analysis concepts.
+
+**Fields**:
+- `name`: CharField - Interpretation name (e.g., "Bullish Breakout", "Trend Reversal")
+- `description`: TextField - Detailed explanation
+- `experience`: IntegerField (1-5) - Required experience level
+
+**Experience Levels**:
+1. **Beginner**: Basic patterns, simple indicators
+2. **Intermediate**: Multiple indicator combinations
+3. **Advanced**: Complex patterns, divergences
+4. **Expert**: Multi-timeframe analysis, harmonic patterns
+5. **Master**: Full market structure analysis, Wyckoff, Elliott Wave
+
+**Example**:
+```python
+interpretation = TechnicalAnalysisInterpretation(
+    name="Bullish Harmonic Pattern Completion",
+    description="Price completes bullish harmonic pattern at key Fibonacci level with RSI divergence",
+    experience=4  # Expert level
+)
+```
+
+### 9.3 Technical Event
+
+**Model**: `TechnicalEvent`
+
+**Purpose**: Concrete occurrence of a technical interpretation in market data.
+
+**Fields**:
+- `interpretation`: ForeignKey to TechnicalAnalysisInterpretation
+- `strategy`: ForeignKey to Strategy
+- `timeframe`: CharField (e.g., "1h", "4h", "1d")
+- `detected_at`: DateTimeField
+- `symbol`: ForeignKey to Symbol (via BaseTechnicalModel)
+
+**Relationships**:
+- `arguments`: Reverse FK from Argument
+
+**Example**:
+```python
+event = TechnicalEvent(
+    interpretation=bullish_breakout_interpretation,
+    strategy=my_strategy,
+    symbol=btc_symbol,
+    timeframe="4h",
+    detected_at=timezone.now()
+)
+```
+
+### 9.4 Argument
+
+**Model**: `Argument`
+
+**Purpose**: Supporting evidence for a technical event.
+
+**Fields**:
+- `technical_event`: ForeignKey to TechnicalEvent
+- `name`: CharField - Argument description
+- `created_at`: DateTimeField
+
+**Relationships**:
+- `reasons`: Reverse FK from Reason
+
+**Example**:
+```python
+argument1 = Argument(
+    technical_event=event,
+    name="Price broke above 200-period MA with strong volume"
+)
+
+argument2 = Argument(
+    technical_event=event,
+    name="RSI showing bullish divergence on 1h timeframe"
+)
+```
+
+### 9.5 Reason
+
+**Model**: `Reason`
+
+**Purpose**: Detailed rationale explaining an argument.
+
+**Fields**:
+- `argument`: ForeignKey to Argument
+- `name`: CharField - Reasoning text
+- `created_at`: DateTimeField
+
+**Example**:
+```python
+reason = Reason(
+    argument=argument1,
+    name="Volume spike of 300% confirms institutional buying pressure at breakout level"
+)
+```
+
+### 9.6 Complete Analysis Workflow
+
+**Sequence Diagram**:
+```
+Analyst                   System                    Database
+   │                         │                          │
+   │──1. Detect Pattern────>│                          │
+   │                         │──Create Event──────────>│
+   │                         │<─Event ID───────────────│
+   │                         │                          │
+   │──2. Add Arguments────>│                          │
+   │   (Evidence)            │──Save Arguments───────>│
+   │                         │                          │
+   │──3. Add Reasons──────>│                          │
+   │   (Rationale)           │──Save Reasons─────────>│
+   │                         │                          │
+   │──4. Generate Signal──>│                          │
+   │                         │──Check Rules──────────>│
+   │                         │<─Rules OK───────────────│
+   │                         │──Create Order─────────>│
+   │<─Order Created─────────│                          │
+```
+
+**Full Example**:
+```python
+# 1. Create interpretation (catalog entry)
+interpretation = TechnicalAnalysisInterpretation.objects.create(
+    name="Double Bottom Reversal",
+    description="Price forms two equal lows with intervening rally",
+    experience=2
+)
+
+# 2. Detect event
+event = TechnicalEvent.objects.create(
+    interpretation=interpretation,
+    strategy=strategy,
+    symbol=symbol,
+    timeframe="4h"
+)
+
+# 3. Add supporting arguments
+arg1 = Argument.objects.create(
+    technical_event=event,
+    name="Second bottom at 48,000 matches first bottom within 0.5%"
+)
+
+arg2 = Argument.objects.create(
+    technical_event=event,
+    name="Price broke above neckline at 50,000 with volume confirmation"
+)
+
+# 4. Add detailed reasoning
+Reason.objects.create(
+    argument=arg1,
+    name="Equal lows indicate strong support level where buyers consistently enter"
+)
+
+Reason.objects.create(
+    argument=arg2,
+    name="Volume on neckline break 2x average, confirming institutional participation"
+)
+
+# 5. Use event to justify order
+order = Order.objects.create(
+    symbol=symbol,
+    side="BUY",
+    quantity=Decimal("1.0"),
+    price=Decimal("50200"),
+    technical_event=event,  # Link order to analysis
+    stop_loss_price=Decimal("47500"),  # Below second bottom
+    target_price=Decimal("52000")  # Neckline to bottom distance projected up
+)
+```
+
+---
+
+## 10. Domain Principles
+
+**Purpose**: Qualitative knowledge and trading principles encoded in the domain.
+
+### 10.1 Base Principle Model
+
+**Base Class**: `BasePrinciple`
+
+**Common Fields** (via mixins):
+- `name`: CharField - Principle name
+- `description`: TextField - Detailed explanation
+- `experience`: IntegerField - Recommended experience level
+- `client`: ForeignKey to Client
+- `created_at`, `updated_at`: Timestamps
+
+### 10.2 Odds In Your Favor
+
+**Model**: `OddsYourFavor`
+
+**Purpose**: Principles for stacking probabilities toward successful trades.
+
+**Concept**: Only take trades when multiple factors align in your favor.
+
+**Examples**:
+```python
+principle = OddsYourFavor.objects.create(
+    name="Multi-Timeframe Confluence",
+    description="""
+    Trade only when:
+    1. Daily timeframe shows bullish trend
+    2. 4h timeframe shows bullish pattern
+    3. 1h timeframe shows entry trigger
+    4. Volume confirms direction
+    5. RSI not overbought
+    All 5 factors must align to stack odds in your favor.
+    """,
+    experience=3
+)
+```
+
+**Application**:
+- Pre-trade checklist validation
+- Score trades based on number of favorable factors
+- Reject trades below minimum score threshold
+
+### 10.3 Limit Losses
+
+**Model**: `LimitLosses`
+
+**Purpose**: Loss mitigation strategies and best practices.
+
+**Concept**: Protect capital through strict loss limits and disciplined exits.
+
+**Examples**:
+```python
+principle = LimitLosses.objects.create(
+    name="Never Risk More Than 2% Per Trade",
+    description="""
+    Calculate position size such that if stop-loss hits,
+    total loss = 2% of account balance.
+
+    Formula:
+    position_size = (account_balance * 0.02) / (entry_price - stop_loss_price)
+
+    This ensures no single trade can significantly damage account.
+    """,
+    experience=1
+)
+```
+
+**Application**:
+- Automatic position sizing calculation
+- Pre-trade risk validation
+- Daily/weekly loss limits
+
+### 10.4 Attributes
+
+**Model**: `Attribute`
+
+**Purpose**: Qualitative attributes describing strategies, events, or market conditions.
+
+**Fields** (methods):
+- `context()`: Situational context
+- `primary_implication()`: Main takeaway
+- `underlying_objective()`: Strategic goal
+- `volume()`: Volume characteristics
+- `perspective()`: Market viewpoint
+
+**Example**:
+```python
+attribute = Attribute.objects.create(
+    name="High-Probability Setup",
+    description="""
+    Context: Strong uptrend with pullback to support
+    Primary Implication: Likely continuation of trend
+    Underlying Objective: Buy dip in established trend
+    Volume: Rising on rallies, falling on pullbacks
+    Perspective: Bullish with confirmation
+    """,
+    experience=2
+)
+```
+
+**Usage**: Tag strategies and events with qualitative attributes for filtering and analysis.
+
+---
+
+## 11. Multi-Tenant Data Isolation
 
 **References**: REQ-CUR-DOMAIN-028, REQ-CUR-CORE-002
 
-### 7.1 Tenant Mixin
+### 11.1 Tenant Mixin
 
 **Base Class**: `TenantMixin`
 
@@ -1040,7 +1802,7 @@ stoch = StochasticOscillator(
 - All risk rules
 - All indicators
 
-### 7.2 Automatic Filtering
+### 11.2 Automatic Filtering
 
 **Manager**: `TenantManager` (custom QuerySet manager)
 
@@ -1059,7 +1821,7 @@ orders = Order.objects.all()
 # SQL: SELECT * FROM orders WHERE client_id = 2
 ```
 
-### 7.3 Validation
+### 11.3 Validation
 
 **Method**: `TenantMixin.clean()`
 
@@ -1069,11 +1831,11 @@ orders = Order.objects.all()
 
 ---
 
-## 8. Future Planned Features
+## 12. Future Planned Features
 
-### 8.1 Enhanced Validations
+### 12.1 Enhanced Validations
 
-#### 8.1.1 Order Quantity Validation (REQ-FUT-DOMAIN-001)
+#### 12.1.1 Order Quantity Validation (REQ-FUT-DOMAIN-001)
 
 **Status**: Planned (Priority: High)
 
@@ -1088,7 +1850,7 @@ def clean(self):
         )
 ```
 
-#### 8.1.2 Position Size Limits (REQ-FUT-DOMAIN-002)
+#### 12.1.2 Position Size Limits (REQ-FUT-DOMAIN-002)
 
 **Status**: Planned (Priority: High)
 
@@ -1111,9 +1873,9 @@ def add_order(self, order):
 
 ---
 
-### 8.2 Advanced Calculations
+### 12.2 Advanced Calculations
 
-#### 8.2.1 Risk-Adjusted Returns (REQ-FUT-DOMAIN-004)
+#### 12.2.1 Risk-Adjusted Returns (REQ-FUT-DOMAIN-004)
 
 **Status**: Planned (Priority: Low)
 
@@ -1130,7 +1892,7 @@ strategy.sortino_ratio  # 2.10
 strategy.risk_reward_ratio  # 2.5
 ```
 
-#### 8.2.2 Position Netting (REQ-FUT-DOMAIN-005)
+#### 12.2.2 Position Netting (REQ-FUT-DOMAIN-005)
 
 **Status**: Planned (Priority: Medium)
 
@@ -1151,9 +1913,9 @@ net_pos = Position(symbol="BTCUSDT", side="LONG", quantity=Decimal("1.5"))
 
 ---
 
-### 8.3 State Machine Enhancements
+### 12.3 State Machine Enhancements
 
-#### 8.3.1 Order Timeout (REQ-FUT-DOMAIN-007)
+#### 12.3.1 Order Timeout (REQ-FUT-DOMAIN-007)
 
 **Status**: Planned (Priority: Medium)
 
@@ -1164,7 +1926,7 @@ net_pos = Position(symbol="BTCUSDT", side="LONG", quantity=Decimal("1.5"))
 - Background job checks for expired orders
 - Orders exceeding timeout auto-transition to CANCELLED
 
-#### 8.3.2 Position Auto-Close on Stop-Loss (REQ-FUT-DOMAIN-008)
+#### 12.3.2 Position Auto-Close on Stop-Loss (REQ-FUT-DOMAIN-008)
 
 **Status**: Planned (Priority: High)
 
@@ -1193,7 +1955,7 @@ Position (CLOSED)
 Trade created (realized loss)
 ```
 
-#### 8.3.3 Operation State Transitions (REQ-FUT-DOMAIN-009)
+#### 12.3.3 Operation State Transitions (REQ-FUT-DOMAIN-009)
 
 **Status**: Planned (Priority: Low)
 
@@ -1212,9 +1974,9 @@ PLANNED/ACTIVE → CANCELLED (user cancels)
 
 ---
 
-## 9. Known Gaps and Unclear Behavior
+## 13. Known Gaps and Unclear Behavior
 
-### 9.1 Risk Rule Enforcement
+### 13.1 Risk Rule Enforcement
 
 **Gap**: Risk rules defined but **not enforced** at order creation.
 
@@ -1229,7 +1991,7 @@ PLANNED/ACTIVE → CANCELLED (user cancels)
 
 ---
 
-### 9.2 Indicator Calculation
+### 13.2 Indicator Calculation
 
 **Gap**: Indicator models store values but **calculation logic missing**.
 
@@ -1247,7 +2009,7 @@ PLANNED/ACTIVE → CANCELLED (user cancels)
 
 ---
 
-### 9.3 Order-Position Linkage
+### 13.3 Order-Position Linkage
 
 **Gap**: Unclear how orders **automatically create/update** positions.
 
@@ -1265,7 +2027,7 @@ PLANNED/ACTIVE → CANCELLED (user cancels)
 
 ---
 
-### 9.4 Strategy-Order Association
+### 13.4 Strategy-Order Association
 
 **Gap**: Order has optional `strategy` FK but **usage not specified**.
 
@@ -1283,7 +2045,7 @@ PLANNED/ACTIVE → CANCELLED (user cancels)
 
 ---
 
-### 9.5 Symbol Unique Constraint
+### 13.5 Symbol Unique Constraint
 
 **Gap**: Symbol has `unique_together = ["id", "client"]` which is redundant.
 
@@ -1298,7 +2060,7 @@ PLANNED/ACTIVE → CANCELLED (user cancels)
 
 ---
 
-### 9.6 Operation Status Lifecycle
+### 13.6 Operation Status Lifecycle
 
 **Gap**: Operation has STATUS_CHOICES but **no state transition logic**.
 
@@ -1313,7 +2075,7 @@ PLANNED/ACTIVE → CANCELLED (user cancels)
 
 ---
 
-### 9.7 Trade P&L vs Position P&L
+### 13.7 Trade P&L vs Position P&L
 
 **Gap**: Trade and Position both calculate P&L independently.
 
@@ -1329,9 +2091,64 @@ PLANNED/ACTIVE → CANCELLED (user cancels)
 
 **Related**: REQ-CUR-DOMAIN-013, REQ-CUR-DOMAIN-015
 
+### 13.8 Pattern Detection Implementation
+
+**Gap**: Pattern models defined but **detection logic not implemented**.
+
+**Questions**:
+- How are patterns detected in real-time market data?
+- What algorithm identifies harmonic ratios, Elliott waves, etc.?
+- Is detection manual, semi-automated, or fully automated?
+
+**Recommendation**:
+- Document pattern detection service architecture
+- Specify detection algorithms for each pattern type
+- Add confidence score calculation methodology
+- Implement automated testing with historical data
+
+**Related**: Section 7 (Pattern Recognition System)
+
 ---
 
-## 10. Traceability
+### 13.9 Analysis Workflow Enforcement
+
+**Gap**: Technical analysis workflow (Event → Argument → Reason) defined but **not enforced**.
+
+**Questions**:
+- Is analysis workflow optional or required for trades?
+- Can orders be created without linked TechnicalEvent?
+- How is analysis quality validated?
+
+**Recommendation**:
+- Clarify when analysis workflow is required
+- Add validation rules if analysis is mandatory
+- Implement analysis completeness scoring
+- Link Strategy.config to required analysis depth
+
+**Related**: Section 9 (Technical Analysis Workflow)
+
+---
+
+### 13.10 Configuration Rule Enforcement
+
+**Gap**: Configuration rules defined but **enforcement mechanism unclear**.
+
+**Questions**:
+- Where are rules checked (view layer, service layer, model clean)?
+- What happens when multiple rules conflict?
+- Can users override rules temporarily?
+
+**Recommendation**:
+- Implement centralized rule validation service
+- Define rule priority/precedence for conflicts
+- Add audit log for rule violations
+- Document override mechanism (if allowed)
+
+**Related**: Section 8 (Trading Configuration Rules)
+
+---
+
+## 14. Traceability
 
 ### Requirements → Specification Sections
 
@@ -1345,8 +2162,83 @@ PLANNED/ACTIVE → CANCELLED (user cancels)
 | REQ-CUR-DOMAIN-014-017 | [2.3 Trade Lifecycle](#23-trade-lifecycle) |
 | REQ-CUR-DOMAIN-018-020 | [5. Risk Management](#5-risk-management) |
 | REQ-CUR-DOMAIN-021-026 | [6. Technical Indicators](#6-technical-indicators) |
-| REQ-CUR-DOMAIN-027 | [7. Multi-Tenant Data Isolation](#7-multi-tenant-data-isolation) |
-| REQ-CUR-DOMAIN-028 | [7. Multi-Tenant Data Isolation](#7-multi-tenant-data-isolation) |
+| REQ-CUR-DOMAIN-027 | [11. Multi-Tenant Data Isolation](#11-multi-tenant-data-isolation) |
+| REQ-CUR-DOMAIN-028 | [11. Multi-Tenant Data Isolation](#11-multi-tenant-data-isolation) |
+
+### New Domain Areas (No Specific REQs Yet)
+
+| Domain Area | Specification Section |
+|-------------|----------------------|
+| Pattern Recognition | [7. Pattern Recognition System](#7-pattern-recognition-system) |
+| Trading Configuration | [8. Trading Configuration Rules](#8-trading-configuration-rules) |
+| Analysis Workflow | [9. Technical Analysis Workflow](#9-technical-analysis-workflow) |
+| Domain Principles | [10. Domain Principles](#10-domain-principles) |
+
+---
+
+## 15. Document Summary
+
+### Coverage Statistics
+
+**Total Sections**: 14
+
+**Domain Entities Documented**:
+- Core Trading Entities: 6 (Symbol, Strategy, Order, Operation, Position, Trade)
+- Technical Indicators: 6 (MA, RSI, MACD, Bollinger Bands, Stochastic, Base)
+- Pattern Types: 5 (Harmonic, Elliott Wave, Wyckoff, Chart, Candlestick, Indicator-based)
+- Risk Rules: 2 (OnePercentOfCapital, JustBet4percent)
+- Configuration Rules: 2 (OnlyTradeReversal, MaxTradePerDay)
+- Analysis Entities: 4 (Interpretation, Event, Argument, Reason)
+- Principles: 3 (OddsYourFavor, LimitLosses, Attribute)
+
+**Total Entity Behaviors Documented**: 50+
+
+**State Machines Defined**: 3 (Order, Position, Pattern)
+
+**Calculation Formulas Documented**: 15+
+
+**Known Gaps Identified**: 10
+
+### Document Completeness
+
+| Aspect | Status | Notes |
+|--------|--------|-------|
+| Core Trading Lifecycle | ✅ Complete | Orders, Positions, Trades fully specified |
+| Business Rules | ✅ Complete | Validations and constraints documented |
+| Calculations | ✅ Complete | All P&L and averaging formulas specified |
+| Risk Management | 🟡 Partial | Models defined, enforcement pending |
+| Technical Indicators | 🟡 Partial | Storage defined, calculation logic missing |
+| Pattern Recognition | 🟡 Partial | Comprehensive models, detection logic missing |
+| Configuration Rules | 🟡 Partial | Rules defined, enforcement mechanism unclear |
+| Analysis Workflow | 🟡 Partial | Structure defined, enforcement unclear |
+| Multi-Tenancy | ✅ Complete | Full isolation mechanism documented |
+| Future Features | ✅ Complete | All planned enhancements cataloged |
+
+### Next Steps for Implementation
+
+**High Priority**:
+1. Implement risk rule enforcement (Section 13.1)
+2. Implement order quantity validation (Section 12.1.1)
+3. Implement position size limits (Section 12.1.2)
+4. Clarify order-position linkage mechanism (Section 13.3)
+
+**Medium Priority**:
+1. Implement indicator calculation service (Section 13.2)
+2. Implement pattern detection algorithms (Section 13.8)
+3. Clarify configuration rule enforcement (Section 13.10)
+4. Implement operation state transitions (Section 12.3.3)
+
+**Low Priority**:
+1. Implement risk-adjusted returns (Section 12.2.1)
+2. Implement position netting (Section 12.2.2)
+3. Clarify analysis workflow enforcement (Section 13.9)
+
+### Change History
+
+| Version | Date | Author | Changes |
+|---------|------|--------|---------|
+| 1.0 | 2025-11-14 | System | Initial comprehensive specification |
+| 1.1 | 2025-11-15 | Claude | Added Pattern Recognition, Configuration, Analysis, Principles sections |
 
 ---
 
