@@ -800,6 +800,36 @@ Authorization: Bearer <access_token>
 
 ---
 
+### 2.5 Risk & Position Sizing
+
+**REQ-FUT-API-016**: Automatic Position Sizing from Technical Event Stop-Loss
+
+**Description**: API should calculate position size automatically using the **second technical event** stop-loss on the **15-minute chart** as the sizing anchor (no client-provided quantity).
+
+**Rationale**: Enforce consistent risk sizing and avoid manual quantity errors.
+
+**Dependencies**:
+- Technical events and stop-loss detection available in analytics
+- Operation/Order creation flow able to accept event/stop context
+- Risk rules (e.g., OnePercentOfCapital) to cap exposure
+
+**Priority**: Medium
+
+**Estimated Complexity**: Moderate
+
+**Behavior** (when implemented):
+- Client submits the triggering technical event (or its ID) plus stop-loss price derived from the 15m chart.
+- API derives quantity from configured risk rule (e.g., max % capital per trade) and symbol price/precision.
+- API persists the computed sizing rationale (event reference, stop-loss used, rule applied).
+- Optional: Endpoint to **preview** sizing before creating the order/operation.
+
+**Acceptance Criteria** (when implemented):
+- [ ] Order/operation creation can omit `quantity`; API fills it using the sizing rule.
+- [ ] Sizing uses the **second technical event** stop-loss on **15m** timeframe.
+- [ ] Result respects risk caps (percent-of-capital / max per-trade).
+- [ ] Response returns computed quantity and the inputs (event reference, stop-loss, rule version).
+- [ ] Validation error if required context (event/stop-loss) is missing.
+
 ## 3. Known Gaps or Unclear Behavior
 
 ### 3.1 URL Structure Inconsistency
