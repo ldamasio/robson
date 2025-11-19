@@ -116,3 +116,7 @@ typings/
 
 # Cursor rules
 .cursorrules
+
+# --- AI/LLM Tool Configuration & Local Settings ---
+# Ignore Claude Code CLI's local/sensitive settings (Contains API keys, local paths, etc.)
+.claude/settings.local.json
