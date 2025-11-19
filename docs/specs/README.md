@@ -27,9 +27,24 @@ specs/
 
 ## Spec-Driven Development Workflow
 
+**Mode-First Governance**: See `.ai-agents/MODES.md` for complete guidance.
+
+### Creating Specs (INTERACTIVE MODE)
 1. **Write Spec First**: Define feature behavior in markdown
+   - Mode: INTERACTIVE (Cursor Chat or Codex)
+   - Input: Requirement from `docs/requirements/`
+   - Output: Technical spec in `docs/specs/`
+   - Tag: `docs: add X spec [i:cursor-sonnet]`
+
+### Implementing Specs (AUTONOMOUS MODE)
 2. **Generate Tests**: Create test scaffolding from specs
 3. **Implement**: Write code to satisfy specs
+   - Mode: AUTONOMOUS (Cursor Agent or Claude CLI)
+   - Input: Complete spec from `docs/specs/`
+   - Output: Code + tests
+   - Tag: `feat: implement X [a:claude-cli]`
+
+### Validation
 4. **Validate**: Automated tests ensure compliance
 5. **Update**: Keep specs in sync with implementation
 

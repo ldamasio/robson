@@ -114,6 +114,9 @@ typings/
 #Vscode config file
 .vscode
 
+# AI Agents session logs (keep directory, ignore contents)
+.ai-agents/session-logs/*
+!.ai-agents/session-logs/.gitkeep
 # Cursor rules
 .cursorrules
 

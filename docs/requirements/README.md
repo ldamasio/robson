@@ -135,13 +135,30 @@ REQ-FUT-XXX-001: Description
 
 ### For AI Agents
 
-1. **Code generation**:
+**Mode-First Governance**: See `.ai-agents/MODES.md` for when to use interactive vs autonomous modes.
+
+**INTERACTIVE MODE** (requirement refinement):
+1. **Refine requirements into specs**:
+   - Read `REQ-CUR-*` or `REQ-FUT-*`
+   - Convert to technical spec in `docs/specs/`
+   - Iterate with feedback until spec is complete
+   - Tag commit: `docs: add X spec [i:cursor-sonnet]`
+
+**AUTONOMOUS MODE** (implementation):
+2. **Implement from spec**:
+   - Validate spec is 100% clear
+   - Generate code + tests
+   - Tag commit: `feat: implement X [a:claude-cli]`
+
+**Workflow**: Requirements → [INTERACTIVE] → Specs → [AUTONOMOUS] → Code
+
+3. **Code generation**:
    - Read `REQ-CUR-*` to understand existing behavior
    - Check `REQ-FUT-*` for planned features
    - Reference requirement IDs in code comments
    - Generate tests with requirement traceability
 
-2. **Requirements analysis**:
+4. **Requirements analysis**:
    - Extract requirements from code
    - Identify gaps between code and requirements
    - Suggest missing requirements
