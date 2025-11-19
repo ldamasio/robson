@@ -1,0 +1,347 @@
+# Cursor AI Rules: Robson Bot
+
+# Project Context
+Project: Robson Bot - Open-source cryptocurrency trading platform
+Architecture: Hexagonal (Ports & Adapters)
+Backend: Django 5.2 + Python 3.12
+Frontend: React 18 + Vite
+Deployment: Kubernetes (k3s) + GitOps (ArgoCD)
+
+# ===========================
+# AI GOVERNANCE: MODE-FIRST
+# ===========================
+
+## MANDATORY READING BEFORE ANY IMPLEMENTATION
+
+This project uses **mode-first governance**:
+1. **.ai-agents/CONTEXT.md** - Project context (CRITICAL)
+2. **.ai-agents/MODES.md** - When to use each mode/tool
+3. **.ai-agents/DECISION-MATRIX.md** - Decision guide
+
+**Key Concept**: Decide MODE (interactive vs autonomous) BEFORE choosing tool.
+
+### Work Modes
+
+**INTERACTIVE MODE** (you in Cursor Chat):
+- Code exploration, debugging, discussions
+- Architectural decisions, requirement refinement
+- When: Need continuous feedback
+
+**AUTONOMOUS MODE** (Cursor Agent or Claude CLI):
+- Implementing clear specs, batch generation
+- When: Spec is 100% clear, can delegate
+
+### Commit Tags
+
+Format: `type: subject [mode:tool-model]`
+
+Examples:
+- `feat: add risk calculator [i:cursor-sonnet]` (interactive, Cursor Chat, Sonnet 4.5)
+- `feat: implement from spec [a:cursor-agent-sonnet]` (autonomous, Cursor Agent, Sonnet)
+- `fix: resolve race condition [i:cursor-gpt4o]` (interactive, Cursor Chat, GPT-4o)
+
+See **.ai-agents/MODES.md** for complete guidance.
+
+# ===========================
+# CRITICAL RULES (NON-NEGOTIABLE)
+# ===========================
+
+## Rule 1: English Only
+ALL code, comments, documentation, and commit messages MUST be in English.
+Never use Portuguese or any other language in technical content.
+See docs/LANGUAGE-POLICY.md for rationale.
+
+## Rule 2: Hexagonal Architecture
+New backend code MUST follow Ports & Adapters pattern:
+- Domain (apps/backend/core/domain/): Pure entities, NO framework dependencies
+- Application (apps/backend/core/application/): Use cases + port definitions
+- Adapters (apps/backend/core/adapters/): Concrete implementations
+- NEVER import Django in core/domain/ or core/application/
+
+## Rule 3: Type Hints Required
+Always use type hints in Python:
+```python
+from typing import Protocol
+def my_function(param: str) -> int:
+    pass
+```
+
+## Rule 4: Test-Driven Development
+Write tests BEFORE implementation when possible.
+Minimum 80% coverage for new code.
+
+## Rule 5: Conventional Commits
+Format: <type>(<scope>): <subject>
+Types: feat, fix, docs, style, refactor, test, chore
+
+# ===========================
+# CODE GENERATION GUIDELINES
+# ===========================
+
+## Python Code Style
+- Follow PEP 8
+- Use snake_case for variables/functions
+- Use PascalCase for classes
+- Use UPPER_SNAKE_CASE for constants
+- Prefer dataclasses for domain entities
+- Use Protocol for port definitions
+- Add comprehensive docstrings (Google style)
+
+## Django Conventions
+- Models in apps/backend/monolith/api/models/*.py (modular)
+- Views in apps/backend/monolith/api/views/*.py
+- Services in apps/backend/monolith/api/services/*.py
+- Use DRF for REST APIs
+- Multi-tenant: Always filter by user
+
+## React/JavaScript Style
+- Functional components with hooks
+- PropTypes for type checking
+- Use const/let, never var
+- Async/await over promises chains
+- Destructure props and state
+
+## File Naming
+- Python modules: snake_case.py
+- React components: PascalCase.jsx
+- Tests: test_*.py or *.test.js
+- Config files: lowercase or kebab-case
+
+# ===========================
+# ARCHITECTURE PATTERNS
+# ===========================
+
+## Use Case Pattern
+```python
+class MyUseCase:
+    def __init__(self, repo: MyRepository):
+        self._repo = repo
+
+    def execute(self, command: MyCommand) -> MyResult:
+        # Validate
+        # Execute business logic
+        # Persist
+        # Return result
+        pass
+```
+
+## Port Definition
+```python
+from typing import Protocol
+
+class MyRepository(Protocol):
+    def save(self, entity: MyEntity) -> MyEntity:
+        ...
+    def find_by_id(self, id: str) -> Optional[MyEntity]:
+        ...
+```
+
+## Adapter Implementation
+```python
+class DjangoMyRepository:
+    def save(self, entity: MyEntity) -> MyEntity:
+        # Django ORM operations
+        pass
+```
+
+## REST Endpoint
+```python
+from rest_framework.decorators import api_view, permission_classes
+from rest_framework.permissions import IsAuthenticated
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def my_endpoint(request):
+    # Validate
+    # Call use case
+    # Return response
+    pass
+```
+
+# ===========================
+# TESTING PATTERNS
+# ===========================
+
+## Unit Test (Domain)
+```python
+import pytest
+
+def test_my_entity():
+    entity = MyEntity(...)
+    assert entity.is_valid()
+```
+
+## Integration Test (Django)
+```python
+@pytest.mark.django_db
+def test_my_api(client, user):
+    client.force_authenticate(user=user)
+    response = client.post('/api/endpoint/', data)
+    assert response.status_code == 201
+```
+
+## Frontend Test (Vitest)
+```javascript
+import { render, screen } from '@testing-library/react';
+import { describe, it, expect } from 'vitest';
+
+describe('MyComponent', () => {
+  it('renders correctly', () => {
+    render(<MyComponent />);
+    expect(screen.getByText('Hello')).toBeInTheDocument();
+  });
+});
+```
+
+# ===========================
+# FILE PATH PATTERNS
+# ===========================
+
+Domain entities: apps/backend/core/domain/*.py
+Use cases: apps/backend/core/application/*.py
+Ports: apps/backend/core/application/ports.py
+Adapters: apps/backend/core/adapters/driven/*/*.py
+Django models: apps/backend/monolith/api/models/*.py
+Django views: apps/backend/monolith/api/views/*.py
+React components: apps/frontend/src/components/*/*.jsx
+Tests (backend): apps/backend/monolith/api/tests/test_*.py
+Tests (frontend): apps/frontend/tests/*.test.js
+
+# ===========================
+# DEPENDENCIES
+# ===========================
+
+Backend:
+- Django 5.2, DRF 3.14
+- python-binance 1.0.16
+- pandas 2.1, numpy 1.26
+- gunicorn 20.1, gevent 24.11
+
+Frontend:
+- React 18.2, Vite 4.5
+- Vitest 1.6, Axios 1.1
+
+# ===========================
+# DOMAIN TERMINOLOGY
+# ===========================
+
+Trading:
+- Order: Buy/sell instruction
+- Position: Currently held asset
+- Strategy: Trading algorithm
+- Signal: Generated recommendation
+- Symbol: Trading pair (e.g., BTCUSDT)
+
+Architecture:
+- Port: Interface definition
+- Adapter: Implementation of port
+- Entity: Business object with identity
+- Value Object: Immutable object
+- Use Case: Single business operation
+- Repository: Data access abstraction
+
+# ===========================
+# CODE QUALITY CHECKLIST
+# ===========================
+
+When generating code, ensure:
+✓ English only (no Portuguese)
+✓ Type hints for Python
+✓ PropTypes for React
+✓ Docstrings for public functions
+✓ Tests written
+✓ Follows hexagonal architecture
+✓ No Django in core/domain/ or core/application/
+✓ Conventional commit message format
+
+# ===========================
+# DOCUMENTATION REFERENCES
+# ===========================
+
+## Mode-First Governance (NEW)
+- **.ai-agents/ADR-0001-ai-governance.md** - Mode-first decision record
+- **.ai-agents/MODES.md** - Interactive vs Autonomous modes
+- **.ai-agents/DECISION-MATRIX.md** - Mode selection guide
+- **.ai-agents/AI-WORKFLOW.md** - Workflows by mode
+- **.ai-agents/CONTEXT.md** - Complete project context
+
+## Architecture & Patterns (Existing)
+- **docs/AGENTS.md** - Complete AI guide
+- **docs/ARCHITECTURE.md** - Architecture overview
+- **docs/DEVELOPER.md** - Development workflow
+- **docs/INDEX.md** - Navigation hub
+- **docs/adr/** - Architecture decisions
+- **CLAUDE.md** - Quick reference
+
+## Requirements & Specs
+- **docs/requirements/** - Business requirements (REQ-CUR-*, REQ-FUT-*)
+- **docs/specs/** - Technical specifications (executable specs)
+- **docs/plan/** - Weekly planning documents
+
+# ===========================
+# COMMON TASKS
+# ===========================
+
+Add domain entity:
+1. Create apps/backend/core/domain/my_entity.py
+2. Use @dataclass(frozen=True) for immutability
+3. No framework dependencies
+
+Add use case:
+1. Define port in apps/backend/core/application/ports.py
+2. Implement use case in apps/backend/core/application/my_use_case.py
+3. Inject dependencies via __init__
+4. Write tests first
+
+Add REST endpoint:
+1. Create view in apps/backend/monolith/api/views/my_views.py
+2. Add URL route
+3. Call use case from view
+4. Update OpenAPI spec
+5. Write integration tests
+
+# ===========================
+# SECURITY GUIDELINES
+# ===========================
+
+- All endpoints require JWT authentication (except /auth/login)
+- Multi-tenant: ALWAYS filter by user
+- Input validation with DRF serializers
+- Use @permission_classes([IsAuthenticated])
+- Never expose sensitive data in responses
+- Use environment variables for secrets
+
+# ===========================
+# PERFORMANCE GUIDELINES
+# ===========================
+
+- Use select_related() for foreign keys (avoid N+1)
+- Use prefetch_related() for many-to-many
+- Async for I/O-bound operations
+- Cache market data (1-second TTL)
+- Code splitting for React routes
+- Memoize expensive calculations
+
+# ===========================
+# ERROR HANDLING
+# ===========================
+
+Domain: Raise domain-specific exceptions
+Application: Translate to application errors
+Views: Return appropriate HTTP status codes
+Frontend: Display user-friendly error messages
+
+# ===========================
+# GIT WORKFLOW
+# ===========================
+
+1. Create feature branch: git checkout -b feature/my-feature
+2. Implement + test
+3. Commit: git commit -m "feat(scope): description"
+4. Push: git push origin feature/my-feature
+5. Create PR (triggers CI + preview environment)
+6. Preview at: https://h-feature-my-feature.preview.robsonbot.com
+
+# ===========================
+# END OF RULES
+# ===========================
