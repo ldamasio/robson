@@ -67,3 +67,12 @@ dev-reset-api:
 	@cd $(MONO_DIR) && python manage.py makemigrations api
 	@cd $(MONO_DIR) && python manage.py migrate
 	@echo "✓ Reset complete. You can now run: make dev-test"
+
+# ==============================
+# AI Governance Validation
+# ==============================
+
+.PHONY: validate
+validate:
+	@echo "🔍 Validating AI Governance Framework..."
+	@./.ai-agents/validate.sh
