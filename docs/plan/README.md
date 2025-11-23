@@ -30,6 +30,16 @@ See `.ai-agents/AI-WORKFLOW.md` for detailed planning workflows.
 - **Location**: `docs/execution-plans/`
 - **Purpose**: Detailed multi-day feature implementation plans
 
+### Infrastructure Plans
+- **Location**: `infra/`
+- **Purpose**: Infrastructure deployment and configuration plans
+- **Format**: Detailed execution plans with prerequisites, steps, validations
+- **Examples**:
+  - `infra/INFRASTRUCTURE_DEPLOYMENT_PLAN.md` - Full cluster deployment (F1-F6)
+  - `infra/ANSIBLE_BOOTSTRAP_PLAN.md` - k3s bootstrap
+  - `infra/TLS_CERT_MANAGER_HTTP01.md` - TLS configuration
+  - `infra/dns/` - DNS setup guides
+
 ---
 
 ## Weekly Plan Template
@@ -238,5 +248,5 @@ grep "\[a:" docs/plan/week-*.md | wc -l  # Autonomous
 ---
 
 **Maintained by**: Robson Bot Core Team
-**Last Updated**: 2024-11-16
-**Version**: 1.0
+**Last Updated**: 2025-11-23
+**Version**: 1.1
