@@ -1,0 +1,47 @@
+# Plan 02: Django ParadeDB Migration
+
+## Context
+Migrate Django to use ParadeDB (ADR-0007). Requires Plan 01 completed.
+
+## Goal
+Update Django settings and environment to use ParadeDB.
+
+## Steps
+
+1. Update `apps/backend/monolith/backend/settings.py`:
+   Add comment noting ParadeDB usage (no code changes needed)
+
+2. Update `.env.development.example`:
+   ```bash
+   RBS_PG_HOST=robsonDatabase
+   RBS_PG_DATABASE=robson_dev
+   # Note: ParadeDB with pg_search + vector extensions
+   ```
+
+3. Update production deployment env vars:
+   Point RBS_PG_HOST to paradedb.database.svc.cluster.local
+
+4. Test Django ORM compatibility:
+   ```bash
+   cd apps/backend/monolith
+   ./bin/dj migrate
+   ./bin/dj test -v 2
+   ```
+
+5. Verify extensions accessible from Django shell:
+   ```python
+   from django.db import connection
+   cursor = connection.cursor()
+   cursor.execute("SELECT extname FROM pg_extension")
+   print(cursor.fetchall())
+   ```
+
+## Acceptance Criteria
+- Django connects to ParadeDB successfully
+- All existing tests pass
+- Extensions visible from Django
+- Dev and prod environments working
+
+## Related
+- ADR-0007: ParadeDB as Primary Database
+- Next: Plan 03 or 04

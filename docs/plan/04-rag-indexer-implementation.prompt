@@ -1,0 +1,60 @@
+# Plan 04: RAG Indexer Implementation
+
+## Context
+Implement ingestion pipeline to index GitHub data into ParadeDB (ADR-0009, ADR-0010).
+Requires Plans 01, 02, 03 completed.
+
+## Goal
+Create rag-indexer service that ingests PRs/issues/docs into ParadeDB.
+
+## Steps
+
+1. Create RAG schema migration:
+   ```python
+   # apps/backend/monolith/api/migrations/XXXX_create_rag_schema.py
+   # CREATE TABLE rag_knowledge_entries (...)
+   # See docs/ai-first/SQL_SCHEMA.md
+   ```
+
+2. Create rag-indexer service in `apps/backend/rag-indexer/`:
+   - processor.py: Event processing, chunking, embedding
+   - chunker.py: Text chunking (512 tokens, 128 overlap)
+   - github_client.py: GitHub API wrapper
+   - batch.py: Scheduled batch job
+
+3. Implement chunking logic:
+   - Clean markdown (remove code fences, excessive whitespace)
+   - Chunk into 512-token segments with overlap
+   - Generate SHA256 hash for deduplication
+
+4. Implement indexing:
+   - Generate embeddings via DeepSeek gateway
+   - Upsert into rag_knowledge_entries table
+   - Handle idempotency with unique constraint
+
+5. Create webhook handler in Django:
+   `apps/backend/monolith/api/views/webhook_views.py`
+
+6. Create k8s CronJob for batch indexing:
+   `infra/k8s/apps/rag-indexer/cronjob.yaml` (daily at 2 AM)
+
+7. Test end-to-end:
+   ```bash
+   # Trigger indexing for test PR
+   python processor.py  # Should create chunks in ParadeDB
+   # Verify: SELECT COUNT(*) FROM rag_knowledge_entries
+   ```
+
+## Acceptance Criteria
+- RAG schema created with all indexes
+- Indexer processes PR events and creates chunks
+- Each chunk has 768-dim embedding
+- Webhook validates GitHub HMAC signature
+- Batch CronJob runs successfully
+- No duplicate chunks (upsert works)
+
+## Related
+- ADR-0009: RAG Architecture
+- ADR-0010: Ingestion Strategy
+- docs/ai-first/SQL_SCHEMA.md
+- docs/ai-first/INGESTION_EVENTS.md

@@ -250,3 +250,51 @@ grep "\[a:" docs/plan/week-*.md | wc -l  # Autonomous
 **Maintained by**: Robson Bot Core Team
 **Last Updated**: 2025-11-23
 **Version**: 1.1
+
+---
+
+## AI-First Execution Plans
+
+**Added**: 2025-12-07
+
+This directory now contains execution plan prompts for the AI-First transformation of Robson Bot, implementing RAG (Retrieval-Augmented Generation) capabilities.
+
+### Plan Files
+
+1. **01-paradedb-infrastructure.prompt** - Deploy ParadeDB to k3s and docker-compose
+2. **02-django-paradedb-migration.prompt** - Migrate Django to use ParadeDB
+3. **03-deepseek-gateway-setup.prompt** - Deploy DeepSeek Gateway LLM service
+4. **04-rag-indexer-implementation.prompt** - Implement GitHub data ingestion pipeline
+5. **05-rag-retriever-integration.prompt** - Implement RAG retriever and API endpoint
+6. **06-observability-metrics.prompt** - Add Prometheus metrics and Grafana dashboards
+
+### Usage
+
+Execute plans sequentially with Claude Code CLI:
+
+```bash
+# Example: Execute Plan 01
+claude-code < docs/plan/01-paradedb-infrastructure.prompt
+```
+
+### Dependencies
+
+- **Plans 01 & 03** can run in parallel
+- **Plan 02** requires Plan 01 completed
+- **Plan 04** requires Plans 01, 02, 03 completed
+- **Plan 05** requires Plan 04 completed
+- **Plan 06** requires Plan 05 completed
+
+### Tracking
+
+Progress tracked in: `docs/history/AI_FIRST_TRANSFORMATION.md`
+
+### Related Documentation
+
+- **ADRs**: docs/adr/ADR-0007.md to ADR-0010.md
+- **Architecture**: docs/ai-first/ARCHITECTURE.md
+- **SQL Schema**: docs/ai-first/SQL_SCHEMA.md
+- **Event Format**: docs/ai-first/INGESTION_EVENTS.md
+- **Gateway Protocol**: docs/ai-first/DEEPSEEK_GATEWAY.md
+
+---

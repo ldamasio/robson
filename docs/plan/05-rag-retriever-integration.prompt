@@ -1,0 +1,62 @@
+# Plan 05: RAG Retriever Integration
+
+## Context
+Implement RAG retriever and Django API endpoint (ADR-0009).
+Requires Plan 04 completed (data indexed).
+
+## Goal
+Create RAG retriever with hybrid search and LLM integration.
+
+## Steps
+
+1. Define KnowledgeRepository port:
+   ```python
+   # apps/backend/core/application/ports.py
+   class KnowledgeRepository(Protocol):
+       def hybrid_search(self, query: str, top_k: int) -> List[RetrievedChunk]:
+           ...
+   ```
+
+2. Implement ParadeDB adapter:
+   ```python
+   # apps/backend/core/adapters/driven/persistence/paradedb_knowledge_repo.py
+   class ParadeDBKnowledgeRepository:
+       def hybrid_search(self, query, top_k):
+           # Execute BM25 + vector hybrid search
+           # Return top-K chunks
+   ```
+
+3. Create RAG Retriever use case:
+   ```python
+   # apps/backend/core/application/rag_retriever.py
+   class RAGRetriever:
+       def query(self, user_query: str) -> dict:
+           # Retrieve chunks
+           # Construct prompt
+           # Call DeepSeek gateway
+           # Return answer + sources
+   ```
+
+4. Create Django API:
+   - Serializers: `api/serializers/knowledge_serializers.py`
+   - View: `api/views/knowledge_views.py`
+   - Endpoint: POST /api/v1/knowledge/query
+
+5. Test end-to-end:
+   ```bash
+   curl -X POST http://localhost:8000/api/v1/knowledge/query \
+     -H "Authorization: Bearer $TOKEN" \
+     -d '{"query": "How do I add a new strategy?", "top_k": 5}'
+   ```
+
+## Acceptance Criteria
+- Hybrid search returns relevant chunks
+- LLM generates coherent answers
+- /api/v1/knowledge/query endpoint works
+- Response includes answer + source citations
+- End-to-end latency <5s (p95)
+- Graceful handling of no-result queries
+
+## Related
+- ADR-0009: RAG Architecture
+- docs/ai-first/DEEPSEEK_GATEWAY.md

@@ -1,0 +1,50 @@
+# Plan 03: DeepSeek Gateway Setup
+
+## Context
+Deploy DeepSeek Gateway for self-hosted LLM inference (ADR-0008).
+
+## Goal
+Deploy DeepSeek Gateway service to k3s and docker-compose.
+
+## Steps
+
+1. Create service in `apps/backend/deepseek-gateway/`:
+   - app.py (FastAPI server with /v1/completions, /v1/embeddings, /health)
+   - inference.py (Model loading with transformers)
+   - requirements.txt (fastapi, transformers, torch)
+   - Dockerfile
+
+2. Implement endpoints:
+   - POST /v1/completions: Text generation
+   - POST /v1/embeddings: Vector generation
+   - GET /health: Kubernetes probes
+
+3. Create k8s manifests in `infra/k8s/apps/deepseek-gateway/`:
+   - deployment.yaml (replicas: 1, resources: 4 CPU, 8GB RAM)
+   - service.yaml (ClusterIP)
+
+4. Add to docker-compose.yml:
+   ```yaml
+   deepseek-gateway:
+     build: ./apps/backend/deepseek-gateway
+     ports: ["8001:8000"]
+     environment:
+       - DEEPSEEK_MODEL_NAME=deepseek-ai/DeepSeek-R1-Distill-Qwen-1.5B
+   ```
+
+5. Test locally:
+   ```bash
+   curl -X POST http://localhost:8001/v1/completions \
+     -d '{"model": "deepseek-r1", "prompt": "Hello", "max_tokens": 10}'
+   ```
+
+## Acceptance Criteria
+- Gateway pod running in production namespace
+- /health returns model_loaded: true
+- Completions endpoint generates text
+- Embeddings endpoint returns 768-dim vectors
+- Dev docker-compose service responsive
+
+## Related
+- ADR-0008: DeepSeek as Primary LLM
+- docs/ai-first/DEEPSEEK_GATEWAY.md

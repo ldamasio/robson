@@ -1,0 +1,47 @@
+# Plan 01: ParadeDB Infrastructure Deployment
+
+## Context
+Deploy ParadeDB as unified database for Django ORM + RAG search (ADR-0007).
+
+## Goal
+Deploy ParadeDB to k3s (production) and docker-compose (dev).
+
+## Steps
+
+1. Create k8s manifests in `infra/k8s/apps/paradedb/`:
+   - namespace.yaml
+   - statefulset.yaml (image: paradedb/paradedb:v0.5.0)
+   - service.yaml
+   - secret.yaml (DB credentials)
+
+2. Update `docker-compose.yml`:
+   - Replace postgres image with paradedb/paradedb:v0.5.0
+
+3. Create init script `infra/data/postgres/01-enable-extensions.sql`:
+   ```sql
+   CREATE EXTENSION IF NOT EXISTS pg_search;
+   CREATE EXTENSION IF NOT EXISTS vector;
+   ```
+
+4. Create ArgoCD Application `infra/k8s/gitops/argocd-apps/paradedb.yaml`
+
+5. Deploy to production:
+   ```bash
+   kubectl apply -f infra/k8s/gitops/argocd-apps/paradedb.yaml
+   argocd app sync paradedb
+   ```
+
+6. Verify:
+   ```bash
+   kubectl exec -it paradedb-0 -n database -- psql -U robson -c "SELECT * FROM pg_extension WHERE extname IN ('pg_search', 'vector');"
+   ```
+
+## Acceptance Criteria
+- ParadeDB StatefulSet running in database namespace
+- Extensions pg_search and vector enabled
+- Service accessible from other pods
+- Dev docker-compose starts ParadeDB successfully
+
+## Related
+- ADR-0007: Adopt ParadeDB as Primary Database
+- Next: Plan 02 (Django Migration)

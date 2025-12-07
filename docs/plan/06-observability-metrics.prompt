@@ -1,0 +1,57 @@
+# Plan 06: Observability & Metrics
+
+## Context
+Add monitoring for ParadeDB, DeepSeek, and RAG pipeline.
+Requires Plans 01-05 completed.
+
+## Goal
+Implement Prometheus metrics and Grafana dashboards.
+
+## Steps
+
+1. Add postgres_exporter for ParadeDB:
+   ```yaml
+   # infra/k8s/apps/paradedb/postgres-exporter.yaml
+   # Deploy prometheuscommunity/postgres-exporter
+   ```
+
+2. Add Prometheus metrics to DeepSeek Gateway:
+   ```python
+   # apps/backend/deepseek-gateway/app.py
+   from prometheus_client import Counter, Histogram
+   request_count = Counter('deepseek_requests_total', ...)
+   request_latency = Histogram('deepseek_request_duration_seconds', ...)
+   ```
+
+3. Add metrics to RAG Indexer:
+   ```python
+   chunks_indexed = Counter('rag_chunks_indexed_total', ...)
+   indexing_lag = Gauge('rag_ingestion_lag_seconds', ...)
+   ```
+
+4. Create ServiceMonitors:
+   - postgres-exporter
+   - deepseek-gateway
+
+5. Create Grafana dashboard:
+   `infra/monitoring/grafana/dashboards/ai-first.json`
+   - RAG query latency (p95)
+   - DeepSeek requests/sec
+   - Indexing lag
+
+6. Create alerting rules:
+   ```yaml
+   # infra/monitoring/prometheus/rules/ai-first-alerts.yaml
+   - alert: HighRAGLatency
+     expr: histogram_quantile(0.95, ...) > 5
+   ```
+
+## Acceptance Criteria
+- Prometheus scrapes metrics from all services
+- Grafana dashboard shows key metrics
+- Alerts trigger appropriately
+- No performance degradation from metrics collection
+
+## Related
+- Prometheus Operator docs
+- Grafana dashboard documentation
