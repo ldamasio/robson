@@ -6,6 +6,11 @@ Date: YYYY-MM-DD
 Context
 - What problem or forces led to this decision?
 
+Needs Input  
+- <Input 1> — description of what is missing  
+- <Input 2> — description of what is missing  
+*(If the inputs above are not provided, the recommendation should not be made.)*
+
 Decision
 - What do we decide and how does it work?
 
