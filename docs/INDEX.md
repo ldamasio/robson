@@ -116,6 +116,7 @@ docs/
 - [Troubleshooting](runbooks/troubleshooting.md) - Common issues and fixes
 - [Monitoring](runbooks/monitoring.md) - Observability and alerting
 - [Incident Response](runbooks/incident-response.md) - Emergency procedures
+- [K9s Operations](../infra/K9S-OPERATIONS.md) - Terminal UI for cluster debugging
 
 **Infrastructure**:
 - [ADR-0003: Istio Ambient](adr/ADR-0003-istio-ambient-gateway-api.md)
@@ -199,6 +200,7 @@ docs/
 | **Troubleshooting** | [runbooks/troubleshooting.md](runbooks/troubleshooting.md) |
 | **Monitoring** | [runbooks/monitoring.md](runbooks/monitoring.md) |
 | **Incident Response** | [runbooks/incident-response.md](runbooks/incident-response.md) |
+| **K9s Operations** | [../infra/K9S-OPERATIONS.md](../infra/K9S-OPERATIONS.md) |
 | **Infrastructure** | [../infra/README.md](../infra/README.md) |
 
 ### API & Specs

@@ -366,6 +366,7 @@ describe('MyComponent', () => {
 - k3s (Kubernetes), Istio Ambient (service mesh)
 - ArgoCD (GitOps), cert-manager (TLS)
 - Ansible (node provisioning)
+- K9s (terminal UI for cluster operations, read-mostly debugging)
 
 ---
 
@@ -467,6 +468,9 @@ docker-compose logs -f backend       # View backend logs
 kubectl get pods -n production       # List pods
 kubectl logs -f pod/name             # View logs
 argocd app sync robson-backend       # Force sync
+make k9s                             # Launch K9s (terminal UI)
+make k9s-ns NAMESPACE=<name>         # K9s for specific namespace
+make k9s-preview BRANCH=<branch>     # K9s for preview environment
 ```
 
 ---

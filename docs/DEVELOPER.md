@@ -173,3 +173,10 @@ Coding Style
     - `mypy api/` (if types are adopted)
 - Pre‑commit (optional)
   - You may use pre-commit locally if you prefer, but it is not required and is not part of CI.
+
+Kubernetes Tooling (Optional)
+- **K9s** (terminal UI for Kubernetes):
+  - Recommended for developers who interact with deployed environments (staging, preview, production).
+  - Used for cluster inspection, pod debugging, and log tailing.
+  - See [../infra/K9S-OPERATIONS.md](../infra/K9S-OPERATIONS.md) for installation and workflows.
+  - Note: K9s is read-mostly; permanent changes must go through GitOps (not manual edits).

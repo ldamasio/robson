@@ -66,3 +66,7 @@ App Charts (Helm)
 Security & Secrets
 - Use SealedSecrets or SOPS for Kubernetes secrets.
 - Bootstrap sensitive values via Ansible Vault as needed.
+
+Operations & Debugging
+- For hands-on cluster inspection, pod debugging, and log tailing, see [K9S-OPERATIONS.md](K9S-OPERATIONS.md).
+- K9s is a terminal UI for Kubernetes that complements GitOps workflows (read-mostly, debug-only).
