@@ -1,0 +1,36 @@
+PROMPT 04 OF 04
+SCOPE: Execution semantics and safety.
+
+You are working in the local repository "robson".
+
+CONCEPTUAL RATIONALE
+Execution is where ideas touch reality.
+In trading, this is LIVE trading.
+In agentic coding, this is production execution.
+
+The system must be SAFE BY DEFAULT.
+
+TASKS
+1) DRY-RUN (default behavior):
+   - Full execution simulation.
+   - No real orders.
+   - Persist execution report.
+   - Always allowed.
+
+2) LIVE execution:
+   - Requires --live AND explicit acknowledgement flag.
+   - Requires successful validation beforehand.
+   - Enforce max-orders, max-notional, max-loss.
+   - Require explicit client_id context.
+
+3) Policy/Middleware:
+   - Allow only approved plan types/modes.
+   - Block unsafe combinations early.
+
+DELIVERABLES
+- Safe execution flow implemented
+- Guardrails enforced
+- Audit trail recorded
+- Commands to verify behavior locally
+
+STOP AFTER THIS PROMPT.

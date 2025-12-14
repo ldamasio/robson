@@ -4,10 +4,7 @@ from datetime import datetime, timedelta, timezone
 
 from django.test import TestCase
 
-from apps.backend.core.adapters.driven.persistence.django_order_repo import (
-    DjangoOrderRepository,
-)
-from apps.backend.core.domain.trade import Symbol as DomainSymbol
+from api.application import DjangoOrderRepository, Symbol as DomainSymbol
 from api.models import Order as DjangoOrder, Symbol as DjangoSymbol
 
 

@@ -1,0 +1,42 @@
+PROMPT 03 OF 04
+SCOPE: Business and risk validation for end-users.
+
+You are working in the local repository "robson".
+
+CONCEPTUAL RATIONALE
+In trading, paper trading exists to validate operational reality WITHOUT capital risk.
+In agentic coding, validation exists to confirm correctness WITHOUT production impact.
+
+robson validate is the PAPER TRADING stage of the agentic workflow.
+
+It must:
+- reduce uncertainty
+- expose hidden risks
+- block unsafe execution
+- increase confidence
+
+This is NOT developer CI.
+This is operational and financial validation.
+
+TASKS
+1) Implement robson validate:
+   - client_id (tenant) must be mandatory.
+   - All queries must be explicitly scoped by client_id.
+   - Fail validation if tenant context is missing or ambiguous.
+
+2) Risk validation:
+   - Validate presence and sanity of risk_config.
+   - Enforce invariant rules (drawdown, stop-loss logic, sizing constraints).
+   - Explicitly block LIVE execution if invariants are not satisfied.
+
+3) Output:
+   - Clear PASS / FAIL result.
+   - Enumerated, human-readable reasons.
+   - Optional machine-readable output (--json).
+
+DELIVERABLES
+- Validation logic in Django
+- robson-go invoking validation via management command
+- Clear validation report format
+
+STOP AFTER THIS PROMPT.

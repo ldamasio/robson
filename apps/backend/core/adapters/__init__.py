@@ -1,2 +1,0 @@
-"""Adapters package (driven/driving)."""
-

@@ -23,14 +23,8 @@ from .models import Strategy
 # from django_multitenant.views import TenantModelViewSet
 from clients.models import CustomUser
 
-# Hexagonal use case wiring
-try:
-    from apps.backend.core.domain.trade import Symbol as DomainSymbol
-    from apps.backend.core.wiring.container import get_place_order_uc
-except Exception:  # keep views importable even if core is missing in certain envs
-    DomainSymbol = None
-    def get_place_order_uc():
-        raise RuntimeError("Hexagonal core not available")
+# Application layer imports (Hexagonal Architecture INSIDE Django)
+from .application import Symbol as DomainSymbol, get_place_order_uc
 
 
 

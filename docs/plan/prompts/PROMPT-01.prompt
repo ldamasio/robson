@@ -1,0 +1,55 @@
+PROMPT 01 OF 04
+SCOPE: Establish the CLI foundation and execution contract. Do NOT go beyond this scope.
+
+You are working in the local repository "robson".
+
+IMPORTANT OPERATING RULES
+- Modify files locally in the working tree.
+- Do NOT create git commits.
+- Do NOT push or open PRs.
+- I will review all changes manually in Cursor.
+
+CONTEXT AND RATIONALE
+Robson is evolving toward an agentic workflow inspired by modern agentic coding principles.
+In this model, the CLI is not just a command interface, but a CONTRACT OF INTENT.
+
+Just like in trading, where we separate:
+- idea formulation
+- validation
+- execution
+
+we must separate:
+- planning
+- validation
+- execution
+
+at the CLI level, before any real-world impact happens.
+
+ARCHITECTURAL DECISIONS (FIXED)
+- main.c must be preserved for historical continuity.
+- main.c must become a THIN ROUTER ONLY.
+- All real logic must be delegated to an external Go binary ("robson-go").
+- "robson" remains the user-facing command.
+- Legacy flags (--buy, --sell, etc.) must continue to work.
+
+TASKS
+1) Refactor main.c so that:
+   - argv[1] is treated as a subcommand (plan, validate, execute, etc.).
+   - Legacy flags are translated into subcommands.
+   - Execution is delegated via execvp() to robson-go.
+   - No business or trading logic exists in C.
+
+2) Create a Go-based CLI (robson-go):
+   - Subcommands:
+     help, report, say, buy, sell
+     plan, validate, execute
+   - Clear, human-readable output by default.
+   - Optional --json output for automation/agents.
+
+DELIVERABLES
+- Updated main.c acting as a router
+- Initial robson-go CLI scaffold
+- Summary of modified/created files
+- Commands to build and smoke-test the CLI
+
+STOP AFTER THIS PROMPT.

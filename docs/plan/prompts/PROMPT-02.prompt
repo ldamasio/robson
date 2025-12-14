@@ -1,0 +1,36 @@
+PROMPT 02 OF 04
+SCOPE: Architectural consolidation inside the Django monolith.
+
+You are working in the local repository "robson".
+
+RATIONALE
+Robson previously attempted to maintain a separate "hexagonal core" outside Django.
+This introduced ambiguity and false promises of decoupling that cannot be fulfilled
+given the current runtime, persistence and execution model.
+
+The new principle is:
+- ONE system
+- ONE runtime
+- ONE source of truth
+
+Hexagonal principles remain, but are applied INSIDE Django.
+
+TASKS
+1) Identify dependencies on the external core package.
+2) Migrate useful logic (e.g. PlaceOrder use case) into Django:
+   - Suggested location: api/application or equivalent.
+3) Update views to reference the new application-layer code.
+4) Ensure persistence uses Django ORM directly.
+5) Remove the external core directory once no dependencies remain.
+
+NON-GOALS
+- Do not implement trading loops or schedulers.
+- Do not add real exchange execution.
+- Do not refactor unrelated code.
+
+DELIVERABLES
+- Consolidated Django application structure
+- External core removed
+- Summary explaining what was migrated and why
+
+STOP AFTER THIS PROMPT.

@@ -3,8 +3,7 @@ import unittest
 from decimal import Decimal
 from datetime import datetime, timezone
 
-from apps.backend.core.application.place_order import PlaceOrderUseCase
-from apps.backend.core.domain.trade import Symbol as DomainSymbol
+from api.application import PlaceOrderUseCase, Symbol as DomainSymbol
 
 
 class FakeRepo:

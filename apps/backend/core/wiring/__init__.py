@@ -1,2 +1,0 @@
-"""Wiring/composition package."""
-
