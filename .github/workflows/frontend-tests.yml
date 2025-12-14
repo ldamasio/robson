@@ -18,12 +18,12 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: '20'
-          cache: 'npm'
-          cache-dependency-path: apps/frontend/package-lock.json
 
-      - name: Install dependencies
+      - name: Clean and install dependencies
         working-directory: apps/frontend
-        run: npm install
+        run: |
+          rm -rf node_modules package-lock.json
+          npm install
 
       - name: Run unit tests (Vitest)
         working-directory: apps/frontend
