@@ -16,7 +16,11 @@ package cmd
 import (
 	"crypto/sha256"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
+	"os"
+	"os/exec"
+	"strconv"
 	"time"
 
 	"github.com/spf13/cobra"
@@ -89,73 +93,55 @@ Examples:
 
 // validateCmd validates an execution plan
 var validateCmd = &cobra.Command{
-	Use:   "validate <plan-id>",
+	Use:   "validate <plan-id> --client-id <id> [options]",
 	Short: "Validate an execution plan",
 	Long: `Validate an execution plan before execution.
 
-This is the SECOND step in the agentic workflow. Validation:
-  - Checks all parameters are valid
-  - Verifies account has sufficient balance
-  - Ensures market conditions are suitable
-  - Calculates risk metrics
-  - Does NOT execute the plan
+This is the SECOND step in the agentic workflow (PAPER TRADING stage).
+
+Validation performs operational and financial checks:
+  - Tenant isolation (client_id is mandatory)
+  - Risk configuration (drawdown, stop-loss, position sizing)
+  - Operation parameters (symbol, quantity, price)
+  - Does NOT execute anything
 
 Philosophy:
   "Validate before you commit. Catch errors before they cost money."
 
-Example:
-  robson validate abc123def456`,
+This is NOT developer CI. This is operational and financial validation.
+
+Examples:
+  robson validate abc123 --client-id 1 --strategy-id 5
+  robson validate abc123 --client-id 1 --operation-type buy --symbol BTCUSDT --quantity 0.001 --price 50000
+  robson validate abc123 --client-id 1 --json`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		planID := args[0]
 
-		// TODO: Load plan from storage
-		// TODO: Perform actual validation checks
+		// Get flags
+		clientID, _ := cmd.Flags().GetInt("client-id")
+		strategyID, _ := cmd.Flags().GetInt("strategy-id")
+		opType, _ := cmd.Flags().GetString("operation-type")
+		symbol, _ := cmd.Flags().GetString("symbol")
+		quantity, _ := cmd.Flags().GetString("quantity")
+		price, _ := cmd.Flags().GetString("price")
 
-		validation := map[string]interface{}{
-			"planID":     planID,
-			"validatedAt": time.Now().Format(time.RFC3339),
-			"status":     "valid",
-			"checks": map[string]interface{}{
-				"parametersValid":   true,
-				"balanceSufficient": true,
-				"marketConditions":  true,
-				"riskAcceptable":    true,
-			},
-			"warnings": []string{
-				// TODO: Add actual risk warnings
-			},
-		}
-
-		if jsonOutput {
-			return outputJSON(validation)
-		}
-
-		fmt.Println("╔════════════════════════════════════════════════════════════╗")
-		fmt.Println("║                   PLAN VALIDATION                         ║")
-		fmt.Println("╚════════════════════════════════════════════════════════════╝")
-		fmt.Println()
-		fmt.Printf("Plan ID:      %s\n", planID)
-		fmt.Printf("Validated at: %s\n", time.Now().Format("2006-01-02 15:04:05"))
-		fmt.Println()
-		fmt.Println("VALIDATION CHECKS:")
-		fmt.Println("  ✓ Parameters are valid")
-		fmt.Println("  ✓ Account balance is sufficient")
-		fmt.Println("  ✓ Market conditions are suitable")
-		fmt.Println("  ✓ Risk level is acceptable")
-		fmt.Println()
-		fmt.Println("STATUS: ✓ PLAN IS VALID")
-		fmt.Println()
-		fmt.Println("NEXT STEP:")
-		fmt.Printf("  Execute this plan: robson execute %s\n", planID)
-		fmt.Println()
-		fmt.Println("⚠️  Validation passed, but plan has NOT been executed yet.")
-		fmt.Println()
-		fmt.Println("TODO: Implement actual validation logic (balance check, market data, etc.)")
-		fmt.Println()
-
-		return nil
+		// Invoke Django management command
+		return invokeDjangoValidation(planID, clientID, strategyID, opType, symbol, quantity, price, jsonOutput)
 	},
+}
+
+func init() {
+	// Add flags to validate command
+	validateCmd.Flags().Int("client-id", 0, "Client ID (tenant) - MANDATORY for tenant isolation")
+	validateCmd.Flags().Int("strategy-id", 0, "Strategy ID to load risk configuration from")
+	validateCmd.Flags().String("operation-type", "", "Operation type (buy, sell, cancel)")
+	validateCmd.Flags().String("symbol", "", "Trading symbol (e.g., BTCUSDT)")
+	validateCmd.Flags().String("quantity", "", "Order quantity")
+	validateCmd.Flags().String("price", "", "Order price (for limit orders)")
+
+	// Mark client-id as required
+	validateCmd.MarkFlagRequired("client-id")
 }
 
 // executeCmd executes a validated plan
@@ -227,4 +213,79 @@ Example:
 
 		return nil
 	},
+}
+
+// invokeDjangoValidation invokes the Django management command for validation
+func invokeDjangoValidation(planID string, clientID, strategyID int, opType, symbol, quantity, price string, useJSON bool) error {
+	// Find Django manage.py
+	managePy := findDjangoManagePy()
+	if managePy == "" {
+		return fmt.Errorf("Django manage.py not found. Make sure you're running from the robson repository root")
+	}
+
+	// Build command
+	args := []string{
+		managePy,
+		"validate_plan",
+		"--plan-id", planID,
+		"--client-id", strconv.Itoa(clientID),
+	}
+
+	// Add optional arguments
+	if strategyID > 0 {
+		args = append(args, "--strategy-id", strconv.Itoa(strategyID))
+	}
+	if opType != "" {
+		args = append(args, "--operation-type", opType)
+	}
+	if symbol != "" {
+		args = append(args, "--symbol", symbol)
+	}
+	if quantity != "" {
+		args = append(args, "--quantity", quantity)
+	}
+	if price != "" {
+		args = append(args, "--price", price)
+	}
+	if useJSON {
+		args = append(args, "--json")
+	}
+
+	// Execute Django command
+	cmd := exec.Command("python", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	err := cmd.Run()
+	if err != nil {
+		// Exit code 1 = validation failed (expected)
+		// Other errors = actual command failure
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if exitErr.ExitCode() == 1 {
+				// Validation failed (Django already printed the report)
+				return fmt.Errorf("validation failed")
+			}
+		}
+		return fmt.Errorf("failed to execute Django validation: %w", err)
+	}
+
+	return nil
+}
+
+// findDjangoManagePy finds the Django manage.py file
+func findDjangoManagePy() string {
+	// Try common locations
+	candidates := []string{
+		"apps/backend/monolith/manage.py",
+		"../apps/backend/monolith/manage.py",
+		"../../apps/backend/monolith/manage.py",
+	}
+
+	for _, path := range candidates {
+		if _, err := os.Stat(path); err == nil {
+			return path
+		}
+	}
+
+	return ""
 }

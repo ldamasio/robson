@@ -43,6 +43,17 @@ from .wiring import get_place_order_uc, clear_singletons
 
 from .domain import Symbol
 
+from .validation import (
+    ValidationStatus,
+    ValidationIssue,
+    ValidationReport,
+    Validator,
+    TenantIsolationValidator,
+    RiskConfigurationValidator,
+    OperationValidator,
+    ValidatePlanUseCase,
+)
+
 
 __all__ = [
     # Ports
@@ -54,6 +65,7 @@ __all__ = [
     "UnitOfWork",
     # Use Cases
     "PlaceOrderUseCase",
+    "ValidatePlanUseCase",
     # Adapters
     "DjangoOrderRepository",
     "BinanceMarketData",
@@ -69,4 +81,13 @@ __all__ = [
     "clear_singletons",
     # Domain
     "Symbol",
+    # Validation
+    "ValidationStatus",
+    "ValidationIssue",
+    "ValidationReport",
+    "Validator",
+    "TenantIsolationValidator",
+    "RiskConfigurationValidator",
+    "OperationValidator",
+    "ValidatePlanUseCase",
 ]
