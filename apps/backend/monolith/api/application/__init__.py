@@ -54,6 +54,19 @@ from .validation import (
     ValidatePlanUseCase,
 )
 
+from .execution import (
+    ExecutionMode,
+    ExecutionStatus,
+    ExecutionGuard,
+    ExecutionResult,
+    ExecutionGuardProtocol,
+    ValidationRequiredGuard,
+    TenantContextGuard,
+    ExecutionLimitsGuard,
+    AcknowledgementGuard,
+    ExecutePlanUseCase,
+)
+
 
 __all__ = [
     # Ports
@@ -90,4 +103,15 @@ __all__ = [
     "RiskConfigurationValidator",
     "OperationValidator",
     "ValidatePlanUseCase",
+    # Execution
+    "ExecutionMode",
+    "ExecutionStatus",
+    "ExecutionGuard",
+    "ExecutionResult",
+    "ExecutionGuardProtocol",
+    "ValidationRequiredGuard",
+    "TenantContextGuard",
+    "ExecutionLimitsGuard",
+    "AcknowledgementGuard",
+    "ExecutePlanUseCase",
 ]

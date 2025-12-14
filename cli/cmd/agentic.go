@@ -144,75 +144,86 @@ func init() {
 	validateCmd.MarkFlagRequired("client-id")
 }
 
-// executeCmd executes a validated plan
+// executeCmd executes a plan (DRY-RUN by default, LIVE requires explicit flags)
 var executeCmd = &cobra.Command{
-	Use:   "execute <plan-id>",
-	Short: "Execute a validated plan",
-	Long: `Execute a previously validated execution plan.
+	Use:   "execute <plan-id> --client-id <id> [options]",
+	Short: "Execute a plan (DRY-RUN by default)",
+	Long: `Execute a plan with SAFE BY DEFAULT semantics.
 
-This is the FINAL step in the agentic workflow. Execution:
-  - Requires the plan to be validated first
-  - Sends actual orders to the exchange
-  - Records all actions in audit log
-  - Returns execution confirmation
+This is the FINAL step in the agentic workflow: PLAN → VALIDATE → EXECUTE
+
+SAFE BY DEFAULT:
+  - DRY-RUN is the default (simulation, no real orders)
+  - LIVE requires --live AND --acknowledge-risk flags
+  - LIVE requires prior validation
+  - All executions are audited
+
+DRY-RUN Mode (default):
+  - Simulates execution
+  - No real orders placed
+  - Always allowed
+  - Useful for testing and verification
+
+LIVE Mode (requires explicit acknowledgement):
+  - Places REAL orders on the exchange
+  - Requires --live flag
+  - Requires --acknowledge-risk flag
+  - Requires prior validation
+  - Enforces execution limits
 
 Philosophy:
-  "Execute with intent. Only act on validated plans."
+  "Execute with intent. Safety first, always."
 
-Safety:
-  - Plans must be validated before execution
-  - Unvalidated plans will be rejected
-  - All executions are logged and auditable
+Examples:
+  # DRY-RUN (default, safe)
+  robson execute abc123 --client-id 1
 
-Example:
-  robson execute abc123def456`,
+  # LIVE (requires explicit acknowledgement)
+  robson execute abc123 --client-id 1 --live --acknowledge-risk
+
+  # With strategy limits
+  robson execute abc123 --client-id 1 --strategy-id 5 --live --acknowledge-risk`,
 	Args: cobra.ExactArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		planID := args[0]
 
-		// TODO: Load plan from storage
-		// TODO: Verify plan is validated
-		// TODO: Execute actual trading logic
+		// Get flags
+		clientID, _ := cmd.Flags().GetInt("client-id")
+		strategyID, _ := cmd.Flags().GetInt("strategy-id")
+		opType, _ := cmd.Flags().GetString("operation-type")
+		symbol, _ := cmd.Flags().GetString("symbol")
+		quantity, _ := cmd.Flags().GetString("quantity")
+		price, _ := cmd.Flags().GetString("price")
+		live, _ := cmd.Flags().GetBool("live")
+		acknowledgeRisk, _ := cmd.Flags().GetBool("acknowledge-risk")
+		validated, _ := cmd.Flags().GetBool("validated")
+		validationPassed, _ := cmd.Flags().GetBool("validation-passed")
 
-		result := map[string]interface{}{
-			"planID":      planID,
-			"executedAt":  time.Now().Format(time.RFC3339),
-			"status":      "executed",
-			"orderID":     "ORDER-" + planID,
-			"confirmation": map[string]interface{}{
-				"success": true,
-				"message": "Order executed successfully (simulated)",
-			},
-		}
-
-		if jsonOutput {
-			return outputJSON(result)
-		}
-
-		fmt.Println("╔════════════════════════════════════════════════════════════╗")
-		fmt.Println("║                   PLAN EXECUTION                          ║")
-		fmt.Println("╚════════════════════════════════════════════════════════════╝")
-		fmt.Println()
-		fmt.Printf("Plan ID:      %s\n", planID)
-		fmt.Printf("Executed at:  %s\n", time.Now().Format("2006-01-02 15:04:05"))
-		fmt.Println()
-		fmt.Println("EXECUTION RESULT:")
-		fmt.Println("  ✓ Plan loaded successfully")
-		fmt.Println("  ✓ Validation confirmed")
-		fmt.Println("  ✓ Order sent to exchange")
-		fmt.Println("  ✓ Confirmation received")
-		fmt.Println()
-		fmt.Printf("Order ID: ORDER-%s\n", planID)
-		fmt.Println()
-		fmt.Println("STATUS: ✓ EXECUTION SUCCESSFUL")
-		fmt.Println()
-		fmt.Println("⚠️  This is a SIMULATED execution. No real orders were placed.")
-		fmt.Println()
-		fmt.Println("TODO: Implement actual exchange integration")
-		fmt.Println()
-
-		return nil
+		// Invoke Django execution
+		return invokeDjangoExecution(
+			planID, clientID, strategyID,
+			opType, symbol, quantity, price,
+			live, acknowledgeRisk, validated, validationPassed,
+			jsonOutput,
+		)
 	},
+}
+
+func init() {
+	// Add flags to execute command
+	executeCmd.Flags().Int("client-id", 0, "Client ID (tenant) - MANDATORY")
+	executeCmd.Flags().Int("strategy-id", 0, "Strategy ID for limits and configuration")
+	executeCmd.Flags().String("operation-type", "", "Operation type (buy, sell, cancel)")
+	executeCmd.Flags().String("symbol", "", "Trading symbol (e.g., BTCUSDT)")
+	executeCmd.Flags().String("quantity", "", "Order quantity")
+	executeCmd.Flags().String("price", "", "Order price (for limit orders)")
+	executeCmd.Flags().Bool("live", false, "LIVE mode (real orders) - requires --acknowledge-risk")
+	executeCmd.Flags().Bool("acknowledge-risk", false, "Acknowledge risk of LIVE execution (REQUIRED for --live)")
+	executeCmd.Flags().Bool("validated", false, "Mark as validated (set by validation step)")
+	executeCmd.Flags().Bool("validation-passed", false, "Mark validation as passed (set by validation step)")
+
+	// Mark client-id as required
+	executeCmd.MarkFlagRequired("client-id")
 }
 
 // invokeDjangoValidation invokes the Django management command for validation
@@ -288,4 +299,78 @@ func findDjangoManagePy() string {
 	}
 
 	return ""
+}
+
+// invokeDjangoExecution invokes the Django management command for execution
+func invokeDjangoExecution(
+	planID string,
+	clientID, strategyID int,
+	opType, symbol, quantity, price string,
+	live, acknowledgeRisk, validated, validationPassed bool,
+	useJSON bool,
+) error {
+	// Find Django manage.py
+	managePy := findDjangoManagePy()
+	if managePy == "" {
+		return fmt.Errorf("Django manage.py not found. Make sure you're running from the robson repository root")
+	}
+
+	// Build command
+	args := []string{
+		managePy,
+		"execute_plan",
+		"--plan-id", planID,
+		"--client-id", strconv.Itoa(clientID),
+	}
+
+	// Add optional arguments
+	if strategyID > 0 {
+		args = append(args, "--strategy-id", strconv.Itoa(strategyID))
+	}
+	if opType != "" {
+		args = append(args, "--operation-type", opType)
+	}
+	if symbol != "" {
+		args = append(args, "--symbol", symbol)
+	}
+	if quantity != "" {
+		args = append(args, "--quantity", quantity)
+	}
+	if price != "" {
+		args = append(args, "--price", price)
+	}
+	if live {
+		args = append(args, "--live")
+	}
+	if acknowledgeRisk {
+		args = append(args, "--acknowledge-risk")
+	}
+	if validated {
+		args = append(args, "--validated")
+	}
+	if validationPassed {
+		args = append(args, "--validation-passed")
+	}
+	if useJSON {
+		args = append(args, "--json")
+	}
+
+	// Execute Django command
+	cmd := exec.Command("python", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	err := cmd.Run()
+	if err != nil {
+		// Exit code 1 = execution failed or blocked
+		if exitErr, ok := err.(*exec.ExitError); ok {
+			if exitErr.ExitCode() == 1 {
+				// Execution blocked or failed (Django already printed the report)
+				return fmt.Errorf("execution blocked or failed")
+			}
+		}
+		return fmt.Errorf("failed to execute Django command: %w", err)
+	}
+
+	return nil
 }
