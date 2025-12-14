@@ -21,23 +21,89 @@ The command interface makes it possible to activate a Dashboard with its main in
 
 For example, if you need to withdraw an amount of BRL, but would like to convert your USDT to ADA before transferring, in addition to needing to anticipate spread values from other financial services.
 
+## CLI Quick Start
+
+Robson Bot provides a command-line interface that implements an **agentic workflow** for safe trading execution:
+
+**PLAN → VALIDATE → EXECUTE**
+
+This mirrors professional trading: formulate ideas, paper trade (validate), then execute with intent.
+
+### Building the CLI
+
+```bash
+# Build both C router and Go CLI
+make build-cli
+
+# Run smoke tests
+make test-cli
+
+# Install to system PATH (optional)
+make install-cli
+```
+
+### Using the CLI
+
+```bash
+# 1. PLAN - Create an execution plan (no real orders)
+robson plan buy BTCUSDT 0.001 --limit 50000
+
+# Output: Plan ID: abc123def456
+
+# 2. VALIDATE - Check operational and financial constraints
+robson validate abc123def456 --client-id 1 --strategy-id 5
+
+# Output: ✅ PASS or ❌ FAIL with detailed report
+
+# 3. EXECUTE - Execute the plan (DRY-RUN by default)
+# DRY-RUN (safe, simulation only)
+robson execute abc123def456 --client-id 1
+
+# LIVE (real orders - requires explicit acknowledgement)
+robson execute abc123def456 --client-id 1 --live --acknowledge-risk
+```
+
+**Safety by default:**
+- **DRY-RUN** is the default mode (simulation, no real orders)
+- **LIVE** requires both `--live` AND `--acknowledge-risk` flags
+- LIVE execution requires prior validation
+- All executions are audited
+
+### CLI Architecture
+
+```
+robson (C)
+  └─> robson-go (Go + Cobra)
+       └─> python manage.py {validate_plan,execute_plan} (Django)
+```
+
+The CLI is a thin router that delegates to Django management commands, ensuring all business logic remains in the application layer.
+
 ## Monorepo and Architecture
 
-This repository is being migrated to a monorepo layout adopting Hexagonal Architecture (Ports & Adapters).
+This repository follows a monorepo layout with **Hexagonal Architecture (Ports & Adapters)** integrated within the Django monolith.
 
 High-level structure:
 
 ```
 apps/
-  backend/            # Django monolith with hexagonal core under apps/backend/core
-  frontend/           # React (Vite) app
-infra/                # Terraform, Ansible, K8s, GitOps, Observability, DB
-docs/                 # ADRs, architecture, developer guides
+  backend/
+    monolith/
+      api/
+        application/      # Hexagonal core (ports, use cases, adapters)
+        models/           # Django models
+        views/            # REST endpoints
+        tests/            # Test suite
+  frontend/               # React (Vite) app
+cli/                      # Go-based CLI (robson-go)
+main.c                    # C router (robson)
+infra/                    # Terraform, Ansible, K8s, GitOps, Observability, DB
+docs/                     # ADRs, architecture, developer guides
 ```
 
-Read more: `docs/ARCHITECTURE.md`.
+**Key principle:** Hexagonal architecture is implemented **INSIDE** Django at `apps/backend/monolith/api/application/`, not as an external package. This provides clear separation of concerns while maintaining a single runtime.
 
-Legacy paths like `backends/monolith` and `frontends/web` are being moved to `apps/backend/monolith` and `apps/frontend` respectively.
+Read more: `docs/ARCHITECTURE.md`.
 
 ## INSTALL
 

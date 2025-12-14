@@ -88,6 +88,148 @@ chmod +x bin/dj
 ./bin/dj runserver
 ```
 
+Building the CLI
+Robson Bot includes a command-line interface implementing the **agentic workflow**: PLAN → VALIDATE → EXECUTE
+
+The CLI consists of:
+- **C router** (`main.c`) - Thin wrapper that delegates to robson-go
+- **Go CLI** (`cli/robson-go`) - Main CLI implementation using Cobra framework
+
+Prerequisites for CLI:
+- GCC (C compiler)
+- Go 1.20+ (for building robson-go)
+
+1) Build CLI from repo root:
+```bash
+# Build both C router and Go CLI
+make build-cli
+
+# Or build individually
+make build-c     # gcc -o robson main.c
+make build-go    # cd cli && go build -o robson-go .
+```
+
+2) Run smoke tests:
+```bash
+make test-cli
+```
+
+3) Install to system PATH (optional):
+```bash
+make install-cli
+# Installs to /usr/local/bin by default
+# Override with: make install-cli INSTALL_PATH=/custom/path
+```
+
+4) Verify installation:
+```bash
+robson --help
+```
+
+CLI Agentic Workflow
+The CLI enforces a safe three-step workflow for trading operations:
+
+**PLAN** - Create execution blueprint
+```bash
+robson plan buy BTCUSDT 0.001 --limit 50000
+# Output: Plan ID: abc123def456
+```
+- Creates an execution plan (NO real orders)
+- Generates unique plan ID
+- Specifies strategy and parameters
+
+**VALIDATE** - Paper trading stage
+```bash
+robson validate abc123def456 --client-id 1 --strategy-id 5
+# Output: Validation report (PASS/FAIL/WARNING)
+```
+- Validates operational and financial constraints
+- Checks:
+  - Tenant isolation (client_id is MANDATORY)
+  - Risk configuration (drawdown, stop-loss, position sizing)
+  - Operation parameters (symbol, quantity, price)
+- Output: Clear PASS/FAIL/WARNING report
+
+**EXECUTE** - Final execution (SAFE BY DEFAULT)
+```bash
+# DRY-RUN mode (default, simulation only)
+robson execute abc123def456 --client-id 1
+
+# LIVE mode (real orders - requires explicit acknowledgement)
+robson execute abc123def456 --client-id 1 --live --acknowledge-risk
+```
+- **DRY-RUN** (default):
+  - Simulates execution
+  - NO real orders placed
+  - Always allowed
+  - Useful for testing and verification
+- **LIVE** (real orders):
+  - Requires `--live` flag
+  - Requires `--acknowledge-risk` flag
+  - Requires prior validation
+  - Places REAL orders on exchange
+  - Enforces execution limits
+
+CLI Architecture
+```
+robson (C)
+  └─> robson-go (Go + Cobra)
+       └─> python manage.py {validate_plan,execute_plan} (Django)
+```
+
+The CLI delegates to Django management commands, ensuring all business logic remains in the application layer.
+
+Django Management Commands (Advanced)
+You can also invoke validation/execution directly via Django:
+
+```bash
+# Validation
+python manage.py validate_plan \
+  --plan-id abc123 \
+  --client-id 1 \
+  --strategy-id 5 \
+  --operation-type buy \
+  --symbol BTCUSDT \
+  --quantity 0.001 \
+  --price 50000
+
+# Execution (DRY-RUN)
+python manage.py execute_plan \
+  --plan-id abc123 \
+  --client-id 1
+
+# Execution (LIVE)
+python manage.py execute_plan \
+  --plan-id abc123 \
+  --client-id 1 \
+  --live \
+  --acknowledge-risk \
+  --validated \
+  --validation-passed
+```
+
+CLI Troubleshooting
+- **"robson-go: command not found"**
+  - Ensure `robson-go` is in your PATH
+  - Or run from repo root: `./cli/robson-go`
+  - Or reinstall: `make install-cli`
+
+- **"Django manage.py not found"**
+  - CLI looks for manage.py in standard locations
+  - Ensure you're running from repo root
+  - Or set DJANGO_MANAGE_PY environment variable
+
+- **Build failures**
+  - C compilation: Ensure gcc is installed
+  - Go build: Run `cd cli && go mod download`
+  - Check build logs for specific errors
+
+- **Validation/Execution failures**
+  - Check that Django backend is running
+  - Verify database is accessible
+  - Review validation report for specific issues
+  - Ensure client_id exists in database
+
 Helper Script `bin/dj`
 - Purpose: shorten commands and add guard rails to prevent using production DB.
 - Requires `.env` pointing to local Postgres (localhost).

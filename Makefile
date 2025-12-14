@@ -21,6 +21,59 @@ sync-binance-docs:
 	echo "✓ Binance docs ready at $(BINANCE_DOCS_DIR)"
 
 # ==============================
+# CLI Build (C Router + Go)
+# ==============================
+
+CLI_DIR      ?= cli
+CLI_BIN_C    ?= robson
+CLI_BIN_GO   ?= robson-go
+INSTALL_PATH ?= /usr/local/bin
+
+.PHONY: build-cli build-c build-go clean-cli install-cli test-cli
+
+build-cli: build-c build-go
+	@echo "✓ CLI built successfully"
+	@echo "  - C router: $(CLI_BIN_C)"
+	@echo "  - Go CLI:   $(CLI_DIR)/$(CLI_BIN_GO)"
+	@echo ""
+	@echo "Next steps:"
+	@echo "  1. Test: make test-cli"
+	@echo "  2. Install: make install-cli"
+
+build-c:
+	@echo "Building C router..."
+	@gcc -o $(CLI_BIN_C) main.c
+	@echo "✓ C router built: $(CLI_BIN_C)"
+
+build-go:
+	@echo "Building Go CLI..."
+	@cd $(CLI_DIR) && go mod download
+	@cd $(CLI_DIR) && go build -o $(CLI_BIN_GO) .
+	@echo "✓ Go CLI built: $(CLI_DIR)/$(CLI_BIN_GO)"
+
+clean-cli:
+	@echo "Cleaning CLI binaries..."
+	@rm -f $(CLI_BIN_C)
+	@rm -f $(CLI_DIR)/$(CLI_BIN_GO)
+	@echo "✓ CLI binaries removed"
+
+install-cli: build-cli
+	@echo "Installing CLI to $(INSTALL_PATH)..."
+	@sudo cp $(CLI_BIN_C) $(INSTALL_PATH)/$(CLI_BIN_C)
+	@sudo cp $(CLI_DIR)/$(CLI_BIN_GO) $(INSTALL_PATH)/$(CLI_BIN_GO)
+	@sudo chmod +x $(INSTALL_PATH)/$(CLI_BIN_C)
+	@sudo chmod +x $(INSTALL_PATH)/$(CLI_BIN_GO)
+	@echo "✓ CLI installed to $(INSTALL_PATH)"
+	@echo ""
+	@echo "Verify installation:"
+	@echo "  robson --help"
+
+test-cli: build-cli
+	@echo "Running CLI smoke tests..."
+	@cd $(CLI_DIR) && ./smoke-test.sh
+	@echo "✓ CLI smoke tests passed"
+
+# ==============================
 # Dev helpers (Django + Postgres)
 # ==============================
 

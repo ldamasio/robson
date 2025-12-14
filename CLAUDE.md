@@ -27,17 +27,20 @@ No exceptions. See [docs/LANGUAGE-POLICY.md](docs/LANGUAGE-POLICY.md).
 
 ### 2. Hexagonal Architecture
 
-New backend code follows **Ports & Adapters** pattern:
+Backend code follows **Ports & Adapters** pattern **INSIDE** Django monolith:
 
 ```
-core/
-├── domain/        # Pure entities (NO Django)
-├── application/   # Use cases + port definitions
-├── adapters/      # Concrete implementations
-└── wiring/        # Dependency injection
+api/application/
+├── domain.py        # Pure entities (NO Django deps)
+├── ports.py         # Port definitions (Protocol interfaces)
+├── use_cases.py     # Business logic (use cases)
+├── adapters.py      # Concrete implementations
+├── wiring.py        # Dependency injection
+├── validation.py    # Validation framework (PLAN → VALIDATE step)
+└── execution.py     # Execution framework (EXECUTE step, SAFE BY DEFAULT)
 ```
 
-**Rule**: `core/domain/` and `core/application/` have **zero framework dependencies**.
+**Rule**: `api/application/domain.py`, `ports.py`, and `use_cases.py` have **zero Django dependencies**. Only `adapters.py` imports Django.
 
 ### 3. Type Hints Required
 
@@ -84,16 +87,22 @@ Types: `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`
 robson/
 ├── apps/
 │   ├── backend/
-│   │   ├── core/                    # ⭐ Hexagonal architecture
-│   │   │   ├── domain/              # Entities (NO Django)
-│   │   │   ├── application/         # Use cases + ports
-│   │   │   ├── adapters/            # Implementations
-│   │   │   └── wiring/              # DI container
-│   │   └── monolith/                # Legacy Django (migrating)
+│   │   └── monolith/                # Django monolith
 │   │       └── api/
+│   │           ├── application/     # ⭐ Hexagonal core (INSIDE Django)
+│   │           │   ├── domain.py    # Entities (NO Django deps)
+│   │           │   ├── ports.py     # Interface definitions
+│   │           │   ├── use_cases.py # Business logic
+│   │           │   ├── adapters.py  # Implementations
+│   │           │   ├── wiring.py    # DI container
+│   │           │   ├── validation.py    # ⭐ Validation framework
+│   │           │   └── execution.py     # ⭐ Execution framework
 │   │           ├── models/          # Django models
 │   │           ├── views/           # REST endpoints
-│   │           ├── services/        # Business logic
+│   │           ├── management/      # Django commands
+│   │           │   └── commands/
+│   │           │       ├── validate_plan.py  # ⭐ Validation command
+│   │           │       └── execute_plan.py   # ⭐ Execution command
 │   │           └── tests/           # Tests
 │   └── frontend/                    # React 18
 │       └── src/
@@ -101,6 +110,14 @@ robson/
 │           ├── ports/               # Interfaces
 │           ├── adapters/            # HTTP/WS clients
 │           └── components/          # React components
+├── cli/                             # ⭐ Go-based CLI (robson-go)
+│   ├── main.go                      # Entry point
+│   ├── cmd/
+│   │   ├── root.go                  # Root command
+│   │   ├── legacy.go                # Legacy commands
+│   │   └── agentic.go               # ⭐ PLAN → VALIDATE → EXECUTE
+│   └── go.mod                       # Go dependencies
+├── main.c                           # ⭐ C router (thin wrapper)
 ├── docs/                            # ⭐ Comprehensive docs
 │   ├── AGENTS.md                    # Full AI guide
 │   ├── INDEX.md                     # Navigation hub
@@ -113,9 +130,17 @@ robson/
 ```
 
 **Key Paths**:
-- Domain entities: `apps/backend/core/domain/`
-- Use cases: `apps/backend/core/application/`
+- Domain entities: `apps/backend/monolith/api/application/domain.py`
+- Use cases: `apps/backend/monolith/api/application/use_cases.py`
+- Ports: `apps/backend/monolith/api/application/ports.py`
+- Adapters: `apps/backend/monolith/api/application/adapters.py`
+- Validation framework: `apps/backend/monolith/api/application/validation.py`
+- Execution framework: `apps/backend/monolith/api/application/execution.py`
 - Django models: `apps/backend/monolith/api/models/`
+- Django views: `apps/backend/monolith/api/views/`
+- Django commands: `apps/backend/monolith/api/management/commands/`
+- CLI (Go): `cli/cmd/*.go`
+- CLI (C router): `main.c`
 - React components: `apps/frontend/src/components/`
 - Tests: `apps/backend/monolith/api/tests/`
 
@@ -126,11 +151,11 @@ robson/
 ### Adding a Use Case
 
 ```python
-# 1. Define port (apps/backend/core/application/ports.py)
+# 1. Define port (apps/backend/monolith/api/application/ports.py)
 class MyRepository(Protocol):
     def save(self, entity: MyEntity) -> MyEntity: ...
 
-# 2. Implement use case (apps/backend/core/application/my_use_case.py)
+# 2. Implement use case (apps/backend/monolith/api/application/use_cases.py)
 class MyUseCase:
     def __init__(self, repo: MyRepository):
         self._repo = repo
@@ -142,7 +167,7 @@ class MyUseCase:
         # Event publishing
         pass
 
-# 3. Implement adapter (apps/backend/core/adapters/driven/persistence/)
+# 3. Implement adapter (apps/backend/monolith/api/application/adapters.py)
 class DjangoMyRepository:
     def save(self, entity: MyEntity) -> MyEntity:
         # Django ORM operations
@@ -247,20 +272,15 @@ export default MyComponent;
 ```python
 import pytest
 from decimal import Decimal
-from apps.backend.core.domain.trade import Order, Symbol
+from api.application import Symbol
 
-def test_order_total_value():
-    """Test order total value calculation."""
-    order = Order(
-        id="123",
-        symbol=Symbol("BTCUSDT"),
-        quantity=Decimal("0.5"),
-        price=Decimal("50000"),
-        status=OrderStatus.PENDING,
-        created_at=datetime.now(),
-    )
+def test_symbol_as_pair():
+    """Test symbol pair formatting."""
+    symbol = Symbol.from_pair("BTCUSDT")
 
-    assert order.total_value == Decimal("25000")
+    assert symbol.base == "BTC"
+    assert symbol.quote == "USDT"
+    assert symbol.as_pair() == "BTCUSDT"
 ```
 
 ### Integration Test (Django)
@@ -330,18 +350,33 @@ describe('MyComponent', () => {
 - **Use Case**: Single business operation
 - **Repository**: Data access abstraction
 
+**Agentic Workflow Terms**:
+- **PLAN**: Create execution plan (no real orders, just blueprint)
+- **VALIDATE**: Paper trading stage - check operational/financial constraints
+- **EXECUTE**: Final step - DRY-RUN (simulation) or LIVE (real orders)
+- **DRY-RUN**: Default execution mode - simulation, no real orders
+- **LIVE**: Real execution mode - requires `--live` AND `--acknowledge-risk`
+- **Guard**: Safety check that can PASS or FAIL (blocks execution if failed)
+- **Validation Report**: Result of validation with PASS/FAIL/WARNING status
+- **Execution Result**: Result of execution with guards, actions, audit trail
+
 ---
 
 ## File Path Patterns
 
 | Task | Path |
 |------|------|
-| Domain entity | `apps/backend/core/domain/*.py` |
-| Use case | `apps/backend/core/application/*.py` |
-| Port | `apps/backend/core/application/ports.py` |
-| Adapter | `apps/backend/core/adapters/driven/*/*.py` |
+| Domain entity | `apps/backend/monolith/api/application/domain.py` |
+| Use case | `apps/backend/monolith/api/application/use_cases.py` |
+| Port | `apps/backend/monolith/api/application/ports.py` |
+| Adapter | `apps/backend/monolith/api/application/adapters.py` |
+| Validation framework | `apps/backend/monolith/api/application/validation.py` |
+| Execution framework | `apps/backend/monolith/api/application/execution.py` |
 | Django model | `apps/backend/monolith/api/models/*.py` |
 | Django view | `apps/backend/monolith/api/views/*.py` |
+| Django command | `apps/backend/monolith/api/management/commands/*.py` |
+| CLI command (Go) | `cli/cmd/*.go` |
+| CLI router (C) | `main.c` |
 | React component | `apps/frontend/src/components/*/*.jsx` |
 | Test (backend) | `apps/backend/monolith/api/tests/test_*.py` |
 | Test (frontend) | `apps/frontend/tests/*.test.js` |
@@ -438,7 +473,8 @@ When generating code, ensure:
 - [ ] Docstrings for public functions/classes
 - [ ] Tests written
 - [ ] Follows hexagonal architecture
-- [ ] No Django in `core/domain/` or `core/application/`
+- [ ] No Django dependencies in `api/application/domain.py`, `ports.py`, or `use_cases.py`
+- [ ] Only `api/application/adapters.py` imports Django
 - [ ] Conventional commit message
 - [ ] Updated OpenAPI spec (if endpoint changed)
 
@@ -447,6 +483,23 @@ When generating code, ensure:
 ## Common Commands
 
 ```bash
+# CLI Build & Install
+make build-cli                       # Build C router + Go CLI
+make test-cli                        # Run CLI smoke tests
+make install-cli                     # Install to system PATH
+make clean-cli                       # Remove built binaries
+
+# Agentic Workflow (CLI)
+robson plan buy BTCUSDT 0.001        # Create execution plan
+robson validate <plan-id> --client-id 1  # Validate plan
+robson execute <plan-id> --client-id 1   # Execute (DRY-RUN)
+robson execute <plan-id> --client-id 1 --live --acknowledge-risk  # LIVE execution
+
+# Django Management Commands
+python manage.py validate_plan --plan-id <id> --client-id 1  # Validate
+python manage.py execute_plan --plan-id <id> --client-id 1   # Execute (DRY-RUN)
+python manage.py execute_plan --plan-id <id> --client-id 1 --live --acknowledge-risk  # LIVE
+
 # Backend
 python manage.py test -v 2          # Run tests
 python manage.py migrate             # Apply migrations
@@ -500,6 +553,6 @@ This guide provides quick context. The full AGENTS.md has comprehensive details 
 
 ---
 
-**Last Updated**: 2025-11-14
-**Repository**: C:\app\robson
-**Version**: 1.0
+**Last Updated**: 2025-12-14
+**Repository**: C:\app\notes\robson
+**Version**: 1.1 (Updated for CLI and agentic workflow)
