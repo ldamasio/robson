@@ -1,31 +1,86 @@
 # external-dns Provider Options
 
-We need automated DNS records for preview envs `h-<branch>.robson.rbx.ia.br` and production hosts. external-dns supports multiple providers.
+## Current Strategy: Manual DNS Records
 
-Registro.br “DNS Avançado” may not be directly supported by external-dns. Options:
+Registro.br does not support wildcard DNS records (`*` or `*.subdomain`), so we use **explicit A records** for each subdomain.
 
-- Delegate a subzone to a supported provider (recommended):
-  - Create a subzone (e.g., `rbx.ia.br` or `robson.rbx.ia.br`) in Cloudflare, Route53, DigitalOcean, etc.
-  - Delegate NS records from Registro.br to that provider.
-  - Configure external-dns with the provider’s API credentials (SealedSecret/SOPS).
+- **Production hosts** (`app.robson`, `backend.robson`, etc.) are pre-configured
+- **Preview environments** are added manually when a branch is selected for UAT/homologação
 
-- Use RFC2136 provider (if your authoritative DNS supports TSIG updates):
-  - external-dns `--provider=rfc2136` with TSIG key and target DNS server.
-  - Works if your DNS service allows dynamic updates. Verify Registro.br support; often not available.
+See `WILDCARD_GUIDE.md` for the complete DNS configuration.
 
-Next steps
-- Decide provider: Cloudflare/Route53 (delegate subdomain) or RFC2136 with TSIG.
-- Create Kubernetes Secret with credentials (use SealedSecrets in Git).
-- Helm values for external-dns will set `provider`, `domainFilters`, and credentials refs.
+---
 
-Wildcard-only strategy (no external-dns)
-- Create a wildcard A/AAAA record at Registro.br pointing to the Gateway’s public IP:
-  - `*.robson.rbx.ia.br -> <GATEWAY_LB_IP>` (or narrow to preview hosts `*.robson.rbx.ia.br` still matches `h-<branch>...`).
-- Pros: no DNS API or external provider required; previews work because all hosts resolve to the same IP.
-- TLS options:
-  - Per-host certs via cert-manager HTTP-01 + Gateway API solver (automated) — subject to Let’s Encrypt rate limits.
-  - Single wildcard certificate `*.robson.rbx.ia.br` (from a CA) stored as a Kubernetes Secret and referenced by the Gateway — renewal handled outside or via DNS-01 automation if you later add a DNS provider.
-- Cons: manual management of the single wildcard record; LB IP changes require a manual update.
+## Future: Automated DNS with external-dns
 
-References
+For full automation of preview environments, we can delegate the `robson.rbx.ia.br` subzone to a provider that supports external-dns.
+
+### Option A: Cloudflare (Recommended)
+
+1. **Create subzone** `robson.rbx.ia.br` in Cloudflare (free tier)
+2. **Delegate from Registro.br**:
+   - Add NS records: `robson` → Cloudflare nameservers
+3. **Configure external-dns** with Cloudflare API token:
+   ```yaml
+   provider: cloudflare
+   domainFilters:
+     - robson.rbx.ia.br
+   ```
+4. **Enable wildcard** `*.robson.rbx.ia.br` in Cloudflare for immediate resolution
+5. **Optional**: external-dns can create individual records for each preview
+
+### Option B: AWS Route53
+
+Same delegation approach with Route53 hosted zone:
+```yaml
+provider: aws
+domainFilters:
+  - robson.rbx.ia.br
+```
+
+### Option C: RFC2136 (TSIG)
+
+If using a DNS server that supports dynamic updates:
+```yaml
+provider: rfc2136
+rfc2136:
+  host: <dns-server>
+  port: 53
+  tsigKeyname: <key>
+  tsigSecret: <secret>
+```
+
+Note: Registro.br does not support RFC2136/TSIG.
+
+---
+
+## external-dns Helm Values (when ready)
+
+```yaml
+# values-external-dns.yaml
+provider: cloudflare
+domainFilters:
+  - robson.rbx.ia.br
+env:
+  - name: CF_API_TOKEN
+    valueFrom:
+      secretKeyRef:
+        name: cloudflare-api-token
+        key: token
+policy: sync
+txtOwnerId: robson-cluster
+```
+
+Store the Cloudflare API token as a SealedSecret:
+```bash
+kubectl create secret generic cloudflare-api-token \
+  --from-literal=token=<your-token> \
+  --dry-run=client -o yaml | kubeseal -o yaml > sealed-cf-token.yaml
+```
+
+---
+
+## References
+
 - https://kubernetes-sigs.github.io/external-dns/latest/
+- https://developers.cloudflare.com/dns/

@@ -1,59 +1,123 @@
-Short and practical: point the wildcard to the Gateway public endpoint (for now, use the "tiger" IP), not to the entire cluster or specific services.
+# DNS Configuration for rbx.ia.br
 
-How to configure at Registro.br (Advanced DNS) for rbx.ia.br
+## Limitation: Registro.br does not support wildcards
 
-Goal: resolve any h-<branch>.robson.rbx.ia.br to the same Gateway public IP (HTTP-01 TLS, previews, etc.).
-Main rule (wildcard):
-Subdomain: *.robson
-Type: A
-Value: 158.220.116.31 (public IP of "tiger", temporary)
-TTL: 300–600
-IPv6 (if available): repeat as AAAA for the "tiger" IPv6.
-What this enables: h-anything.robson.rbx.ia.br → 158.220.116.31 (covers the hosts created by ApplicationSet).
+Registro.br's Advanced DNS does not accept wildcard records (`*` or `*.subdomain`).  
+As a result, we use **explicit A records** for each subdomain.
 
-Yes — also configure the apex rbx.ia.br pointing to the gateway public IP (for now, "tiger").
+---
 
-What to create in Registro.br (Advanced DNS)
+## Current DNS Strategy
 
-A (apex)
-Name: @ (or leave the subdomain field blank)
-Type: A
-Value: 158.220.116.31
-TTL: 300–600
-A (wildcard for previews)
-Name: *.robson
-Type: A
-Value: 158.220.116.31
-TTL: 300–600
-(Optional) AAAA for IPv6, if "tiger" has public IPv6
-Name: @ and *.robson
-Type: AAAA
-Value: <tiger IPv6>
-(Optional) Convenience records for management/SSH
-tiger.rbx.ia.br → 158.220.116.31
-bengal.rbx.ia.br → 164.68.96.68
-pantera.rbx.ia.br → 149.102.139.33
-eagle.rbx.ia.br → 167.86.92.97
-Quick validation (after saving)
+### Gateway IP
 
+All application subdomains point to the **tiger** server (K3s gateway with Istio):
+
+```
+158.220.116.31
+```
+
+### Production Records (Registro.br)
+
+| Type | Name | Value | Purpose |
+|------|------|-------|---------|
+| A | `@` (apex) | 158.220.116.31 | `rbx.ia.br` - Company landing |
+| A | `robson` | 158.220.116.31 | `robson.rbx.ia.br` - Product landing |
+| A | `app.robson` | 158.220.116.31 | `app.robson.rbx.ia.br` - Frontend SPA |
+| A | `backend.robson` | 158.220.116.31 | `backend.robson.rbx.ia.br` - API |
+
+### Server Management Records
+
+| Type | Name | Value | Purpose |
+|------|------|-------|---------|
+| A | `tiger` | 158.220.116.31 | K3s server (gateway) |
+| A | `bengal` | 164.68.96.68 | K3s agent |
+| A | `pantera` | 149.102.139.33 | K3s agent |
+| A | `eagle` | 167.86.92.97 | K3s agent |
+
+---
+
+## Preview Environments (UAT/Homologação)
+
+Since wildcards are not supported, preview environments require **manual DNS registration**.
+
+### When to create a preview DNS record
+
+- Branch is selected for UAT/homologação
+- Stakeholders need external access to review features
+- QA team needs a stable URL for testing
+
+### How to add a preview environment
+
+1. **Choose the branch** to be promoted to preview
+2. **Create DNS record** in Registro.br:
+
+| Type | Name | Value |
+|------|------|-------|
+| A | `h-<branch-name>.robson` | 158.220.116.31 |
+
+Example for branch `feature/login-sso`:
+
+| Type | Name | Value |
+|------|------|-------|
+| A | `h-feature-login-sso.robson` | 158.220.116.31 |
+
+3. **Wait for DNS propagation** (usually 1-5 minutes)
+4. **Verify**:
+
+```bash
+dig +short h-feature-login-sso.robson.rbx.ia.br
+# Should return: 158.220.116.31
+```
+
+### Naming convention for preview hosts
+
+The ApplicationSet generates hosts using this pattern:
+
+```
+h-{{ branch | lowercase | replace "/" "-" | replace "_" "-" }}.robson.rbx.ia.br
+```
+
+Examples:
+- `feature/dark-mode` → `h-feature-dark-mode.robson.rbx.ia.br`
+- `bugfix/auth_fix` → `h-bugfix-auth-fix.robson.rbx.ia.br`
+- `release/v2.0` → `h-release-v2-0.robson.rbx.ia.br`
+
+---
+
+## Validation Commands
+
+```bash
+# Production hosts
 dig +short rbx.ia.br
-dig +short feature-x.robson.rbx.ia.br
-Both should return 158.220.116.31.
-To serve content at rbx.ia.br (once Istio/Gateway is installed)
+dig +short robson.rbx.ia.br
+dig +short app.robson.rbx.ia.br
+dig +short backend.robson.rbx.ia.br
 
-We need:
-Gateway with a listener for rbx.ia.br (HTTP 80 and HTTPS 443),
-HTTPRoute routing rbx.ia.br to the target service (frontend or a landing),
-Certificate for rbx.ia.br (cert-manager HTTP-01). Our charts already create a Certificate for the host defined in values.
-Options:
-Adjust the frontend chart values so host: rbx.ia.br (prod).
-Or create a separate release/route for rbx.ia.br (landing), keeping app.robson.rbx.ia.br for the SPA.
-Important
+# All should return: 158.220.116.31
+```
 
-We have already opened 80/443 on the local UFW (server/gateway), but if there is a Contabo Cloud Firewall, allow 80/443 TCP as well (and later 41753/22 for SSH, per the plan).
-Until we install the Gateway/Routes/Certificates, DNS will resolve but there will not yet be an HTTP response. That is expected until the platform stage.
-Next step
+---
 
-Once you create the records in Registro.br, let me know "ok" and we will run the join of the first agent (bengal) to validate the cluster, then continue with pantera and eagle.
-Suggested commit message (if you want to record this decision in the docs):
-docs(infra): add DNS guidance for apex rbx.ia.br and wildcard *.robson.rbx.ia.br pointing to gateway IP
+## Future: Delegate to Cloudflare
+
+To enable automatic DNS for all preview environments, consider delegating the `robson.rbx.ia.br` subzone to Cloudflare:
+
+1. Create zone `robson.rbx.ia.br` in Cloudflare (free tier)
+2. Add NS records in Registro.br:
+   - `robson` NS → Cloudflare nameservers
+3. Configure wildcard `*.robson.rbx.ia.br` in Cloudflare
+4. Optionally integrate with external-dns for full automation
+
+See `EXTERNAL_DNS.md` for details on external-dns integration.
+
+---
+
+## TLS Certificates
+
+TLS is handled by cert-manager with HTTP-01 challenge:
+- Each host gets its own certificate automatically
+- Certificates are stored as Kubernetes Secrets
+- Renewal is automatic (cert-manager handles it)
+
+The Helm charts already configure Certificate resources for the `host` value.

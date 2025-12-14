@@ -1,22 +1,69 @@
-# Wildcard DNS at Registro.br
+# Registro.br DNS Limitations
 
-Objective
-- Resolve all preview and production hosts like `h-<branch>.robson.rbx.ia.br` and `app.robson.rbx.ia.br` to the same public IP of your Gateway (Istio) without needing a DNS API.
+## Wildcard Records Not Supported
 
-Steps
-1) Find your Gateway public IP (LoadBalancer):
-   - After installing Istio + Gateway, run: `kubectl get svc -A | rg -i loadbalancer`
-   - Identify the external IP assigned to the Gateway data-plane (e.g., istio ingress/gateway service).
-2) In Registro.br (DNS Avançado):
-   - Create an A record: `*.robson.rbx.ia.br` → `<GATEWAY_LB_IP>`.
-   - If IPv6 is used, add AAAA: `*.robson.rbx.ia.br` → `<GATEWAY_LB_IPV6>`.
-   - TTL: 300–600 seconds is a good starting point.
-3) Propagation
-   - Wait DNS propagation (usually a few minutes).
-   - Verify with `dig h-test.robson.rbx.ia.br A +short`.
+Registro.br's "DNS Avançado" (Advanced DNS) does **not accept wildcard records**.
 
-Notes
-- This wildcard covers all preview hosts `h-<branch>.robson.rbx.ia.br` automatically.
-- If the LoadBalancer IP changes, update the single wildcard record.
-- TLS is handled separately via cert-manager HTTP-01 or a wildcard certificate.
+Tested and rejected:
+- `*` → "Nome do record inválido"
+- `*.robson` → "Nome do record inválido"
 
+This is a known limitation of Registro.br's DNS management interface.
+
+---
+
+## Workaround: Explicit A Records
+
+Instead of wildcards, we create individual A records for each subdomain:
+
+### Production (always configured)
+
+```
+robson.rbx.ia.br        → 158.220.116.31
+app.robson.rbx.ia.br    → 158.220.116.31
+backend.robson.rbx.ia.br → 158.220.116.31
+```
+
+### Preview Environments (manual, on-demand)
+
+When a branch is selected for UAT/homologação:
+
+```
+h-<branch>.robson.rbx.ia.br → 158.220.116.31
+```
+
+Example:
+```
+h-feature-login-sso.robson.rbx.ia.br → 158.220.116.31
+```
+
+---
+
+## Alternative: Delegate Subzone
+
+For automatic wildcard support, delegate `robson.rbx.ia.br` to Cloudflare:
+
+1. Create zone in Cloudflare
+2. In Registro.br, add NS records:
+   ```
+   robson NS → cloudflare-ns1
+   robson NS → cloudflare-ns2
+   ```
+3. Configure wildcard in Cloudflare: `*.robson.rbx.ia.br`
+
+See `EXTERNAL_DNS.md` for full automation with external-dns.
+
+---
+
+## Current Records in Registro.br
+
+| Type | Name | Value | Purpose |
+|------|------|-------|---------|
+| A | `@` | 158.220.116.31 | Apex (rbx.ia.br) |
+| A | `tiger` | 158.220.116.31 | K3s server |
+| A | `bengal` | 164.68.96.68 | K3s agent |
+| A | `pantera` | 149.102.139.33 | K3s agent |
+| A | `eagle` | 167.86.92.97 | K3s agent |
+| A | `robson` | 158.220.116.31 | Product landing |
+| A | `app.robson` | 158.220.116.31 | Frontend |
+| A | `backend.robson` | 158.220.116.31 | API |
