@@ -23,7 +23,7 @@ jobs:
 
       - name: Install dependencies
         working-directory: apps/frontend
-        run: npm ci
+        run: npm install
 
       - name: Run unit tests (Vitest)
         working-directory: apps/frontend
