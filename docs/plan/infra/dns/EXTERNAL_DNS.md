@@ -4,7 +4,7 @@
 
 Registro.br does not support wildcard DNS records (`*` or `*.subdomain`), so we use **explicit A records** for each subdomain.
 
-- **Production hosts** (`app.robson`, `backend.robson`, etc.) are pre-configured
+- **Production hosts** (`app.robson`, `api.robson`, etc.) are pre-configured
 - **Preview environments** are added manually when a branch is selected for UAT/homologação
 
 See `WILDCARD_GUIDE.md` for the complete DNS configuration.

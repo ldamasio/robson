@@ -24,7 +24,7 @@ All application subdomains point to the **tiger** server (K3s gateway with Istio
 | A | `@` (apex) | 158.220.116.31 | `rbx.ia.br` - Company landing |
 | A | `robson` | 158.220.116.31 | `robson.rbx.ia.br` - Product landing |
 | A | `app.robson` | 158.220.116.31 | `app.robson.rbx.ia.br` - Frontend SPA |
-| A | `backend.robson` | 158.220.116.31 | `backend.robson.rbx.ia.br` - API |
+| A | `api.robson` | 158.220.116.31 | `api.robson.rbx.ia.br` - API |
 
 ### Server Management Records
 
@@ -92,7 +92,7 @@ Examples:
 dig +short rbx.ia.br
 dig +short robson.rbx.ia.br
 dig +short app.robson.rbx.ia.br
-dig +short backend.robson.rbx.ia.br
+dig +short api.robson.rbx.ia.br
 
 # All should return: 158.220.116.31
 ```

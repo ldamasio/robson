@@ -70,7 +70,7 @@ spec:
     path: infra/charts/robson-backend
     helm:
       values: |
-        host: backend.robson.rbx.ia.br
+        host: api.robson.rbx.ia.br
         gateway:
           className: istio
   destination:

@@ -21,7 +21,7 @@ Instead of wildcards, we create individual A records for each subdomain:
 ```
 robson.rbx.ia.br        → 158.220.116.31
 app.robson.rbx.ia.br    → 158.220.116.31
-backend.robson.rbx.ia.br → 158.220.116.31
+api.robson.rbx.ia.br    → 158.220.116.31
 ```
 
 ### Preview Environments (manual, on-demand)
@@ -66,4 +66,4 @@ See `EXTERNAL_DNS.md` for full automation with external-dns.
 | A | `eagle` | 167.86.92.97 | K3s agent |
 | A | `robson` | 158.220.116.31 | Product landing |
 | A | `app.robson` | 158.220.116.31 | Frontend |
-| A | `backend.robson` | 158.220.116.31 | API |
+| A | `api.robson` | 158.220.116.31 | API |

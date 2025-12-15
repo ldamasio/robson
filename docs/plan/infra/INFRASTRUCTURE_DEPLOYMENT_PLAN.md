@@ -52,7 +52,7 @@
 
 **Domains**:
 - Base: `robson.rbx.ia.br`
-- Backend: `backend.robson.rbx.ia.br`
+- Backend: `api.robson.rbx.ia.br`
 - Frontend: `app.robson.rbx.ia.br`
 - Previews: `h-<branch>.robson.rbx.ia.br` (wildcard)
 
@@ -467,14 +467,14 @@ kubectl get gateway -n robson robson-backend-gateway -o jsonpath='{.status.addre
 **Required DNS Records**:
 ```
 Type    Name                            Value               TTL
-A       backend.robson.rbx.ia.br       158.220.116.31      3600
+A       api.robson.rbx.ia.br           158.220.116.31      3600
 A       app.robson.rbx.ia.br           158.220.116.31      3600
 A       *.robson.rbx.ia.br             158.220.116.31      3600  (wildcard)
 ```
 
 **Validation (wait ~10 min for DNS propagation)**:
 ```bash
-dig +short backend.robson.rbx.ia.br
+dig +short api.robson.rbx.ia.br
 # Should return: 158.220.116.31
 
 dig +short h-test.robson.rbx.ia.br
@@ -501,10 +501,10 @@ kubectl get secret -n robson robson-backend-tls
 #### 4. Test HTTPS Endpoints
 ```bash
 # Test backend (may return 503 if app not ready, but TLS should work)
-curl -I https://backend.robson.rbx.ia.br
+curl -I https://api.robson.rbx.ia.br
 
 # Verify certificate issuer
-curl -vI https://backend.robson.rbx.ia.br 2>&1 | grep issuer
+curl -vI https://api.robson.rbx.ia.br 2>&1 | grep issuer
 # Should show: issuer: C=US; O=Let's Encrypt; CN=R3
 ```
 
@@ -532,7 +532,7 @@ kubectl logs -n robson [challenge-solver-pod]
 - **Rate limit**: Use staging ClusterIssuer first
 
 ### Done Criteria
-- [ ] DNS resolving `backend.robson.rbx.ia.br` → Gateway IP
+- [ ] DNS resolving `api.robson.rbx.ia.br` → Gateway IP
 - [ ] Wildcard `*.robson.rbx.ia.br` resolving
 - [ ] Certificates `Ready=True`
 - [ ] HTTPS working (curl returns 200/503, not TLS error)
