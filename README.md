@@ -79,6 +79,95 @@ robson (C)
 
 The CLI is a thin router that delegates to Django management commands, ensuring all business logic remains in the application layer.
 
+## Command-Line Tools
+
+Robson Bot provides **three complementary command-line tools**, each optimized for different tasks:
+
+### 1. `robson` - Trading Operations (Domain CLI)
+
+**Use for:** All trading and business operations
+
+```bash
+# Agentic trading workflow
+robson plan buy BTCUSDT 0.001
+robson validate <plan-id> --client-id 1
+robson execute <plan-id> --client-id 1
+
+# Get help
+robson --help
+```
+
+### 2. `just` - Development Tasks (Task Runner)
+
+**Use for:** Daily development workflow
+
+Install `just`:
+```bash
+# macOS
+brew install just
+
+# Linux
+curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash
+
+# Windows (via scoop)
+scoop install just
+```
+
+Common tasks:
+```bash
+# See all available tasks
+just --list
+
+# First-time setup
+just setup
+
+# Start database
+just db-up
+
+# Run migrations
+just db-migrate
+
+# Run all tests
+just test
+
+# Start dev servers
+just dev-backend    # Terminal 1
+just dev-frontend   # Terminal 2
+
+# Environment info
+just info
+```
+
+### 3. `make` - Build & Install
+
+**Use for:** Compiling binaries and system-wide installation
+
+```bash
+# Build CLI
+make build-cli
+
+# Install CLI to system PATH
+make install-cli
+
+# Sync vendor documentation
+make sync-binance-docs
+```
+
+### Quick Reference: Which Tool When?
+
+| Task | Command |
+|------|---------|
+| **Trading operations** | `robson plan/validate/execute` |
+| **Build CLI** | `make build-cli` |
+| **Install CLI** | `make install-cli` |
+| **Run tests** | `just test` |
+| **Database setup** | `just db-up && just db-migrate` |
+| **Start dev server** | `just dev-backend` |
+| **Reset database** | `just db-reset` |
+| **Environment check** | `just info` |
+
+**Architecture guide:** See [`docs/COMMAND-RUNNERS.md`](docs/COMMAND-RUNNERS.md) for detailed guidelines on which tool to use when.
+
 ## Monorepo and Architecture
 
 This repository follows a monorepo layout with **Hexagonal Architecture (Ports & Adapters)** integrated within the Django monolith.
