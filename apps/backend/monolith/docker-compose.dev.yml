@@ -1,21 +1,21 @@
 services:
   db:
-    image: postgres:16
-    container_name: robson-postgres-dev
+    image: paradedb/paradedb:latest
+    container_name: robson-paradedb-dev
     restart: unless-stopped
     environment:
-      POSTGRES_DB: robson_dev
+      POSTGRES_DB: robson
       POSTGRES_USER: robson
-      POSTGRES_PASSWORD: robson
+      POSTGRES_PASSWORD: robson123
     ports:
       - "5450:5432"  # bind em localhost
     volumes:
-      - db-data:/var/lib/postgresql/data
+      - paradedb-data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U robson -d robson_dev"]
+      test: ["CMD-SHELL", "pg_isready -U robson -d robson"]
       interval: 5s
       timeout: 3s
       retries: 10
 
 volumes:
-  db-data:
+  paradedb-data:
