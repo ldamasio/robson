@@ -1,0 +1,82 @@
+---
+# Simplified k3s Installation Playbook
+# No SSH hardening - Quick production deployment
+# Date: 2024-12-20
+
+- name: Install k3s server
+  hosts: k3s_server
+  become: yes
+  gather_facts: yes
+  
+  tasks:
+    - name: Install required packages
+      apt:
+        name:
+          - curl
+          - ca-certificates
+        update_cache: yes
+      when: ansible_os_family == 'Debian'
+
+    - name: Check if k3s is already installed
+      stat:
+        path: /usr/local/bin/k3s
+      register: k3s_binary
+
+    - name: Install k3s server
+      shell: |
+        curl -sfL https://get.k3s.io | sh -s - server \
+          --write-kubeconfig-mode=644 \
+          --disable=traefik
+      when: not k3s_binary.stat.exists
+      environment:
+        INSTALL_K3S_EXEC: "server"
+
+    - name: Wait for k3s to be ready
+      wait_for:
+        port: 6443
+        delay: 5
+        timeout: 60
+
+    - name: Display k3s token location
+      debug:
+        msg: "k3s token is at: /var/lib/rancher/k3s/server/node-token"
+
+- name: Install k3s agents
+  hosts: k3s_agent
+  become: yes
+  gather_facts: yes
+  
+  tasks:
+    - name: Install required packages
+      apt:
+        name:
+          - curl
+          - ca-certificates
+        update_cache: yes
+      when: ansible_os_family == 'Debian'
+
+    - name: Check if k3s agent is already installed
+      stat:
+        path: /usr/local/bin/k3s-agent
+      register: k3s_agent_binary
+
+    - name: Get k3s server IP
+      set_fact:
+        k3s_server_ip: "{{ hostvars[groups['k3s_server'][0]]['ansible_host'] }}"
+
+    - name: Install k3s agent
+      shell: |
+        curl -sfL https://get.k3s.io | K3S_URL="https://{{ k3s_server_ip }}:6443" \
+          K3S_TOKEN="{{ vault_k3s_token }}" sh -
+      when: 
+        - not k3s_agent_binary.stat.exists
+        - vault_k3s_token is defined
+      environment:
+        INSTALL_K3S_EXEC: "agent"
+
+    - name: Wait for kubelet to be ready
+      wait_for:
+        port: 10250
+        delay: 5
+        timeout: 60
+      when: not k3s_agent_binary.stat.exists
