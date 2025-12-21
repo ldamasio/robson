@@ -45,6 +45,8 @@
   hosts: k3s_agent
   become: yes
   gather_facts: yes
+  vars_files:
+    - ../group_vars/all/vault.yml
   
   tasks:
     - name: Install required packages

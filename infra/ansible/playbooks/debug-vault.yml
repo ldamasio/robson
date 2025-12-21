@@ -1,0 +1,15 @@
+---
+# Debug vault variables
+- name: Debug vault
+  hosts: k3s_agent
+  gather_facts: no
+  
+  tasks:
+    - name: Check if vault_k3s_token is defined
+      debug:
+        msg: "vault_k3s_token is defined: {{ vault_k3s_token is defined }}"
+    
+    - name: Show vault_k3s_token value (first 20 chars)
+      debug:
+        msg: "Token starts with: {{ vault_k3s_token[:20] if vault_k3s_token is defined else 'NOT DEFINED' }}"
+      when: vault_k3s_token is defined

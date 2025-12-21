@@ -1,0 +1,43 @@
+---
+# Clean k3s agents - Remove partial installations
+# Date: 2024-12-20
+
+- name: Clean k3s agents
+  hosts: k3s_agent
+  become: yes
+  gather_facts: no
+  
+  tasks:
+    - name: Stop k3s-agent service if running
+      systemd:
+        name: k3s-agent
+        state: stopped
+      ignore_errors: yes
+
+    - name: Remove k3s agent binary
+      file:
+        path: /usr/local/bin/k3s-agent
+        state: absent
+
+    - name: Remove k3s binary
+      file:
+        path: /usr/local/bin/k3s
+        state: absent
+
+    - name: Remove k3s systemd service
+      file:
+        path: /etc/systemd/system/k3s-agent.service
+        state: absent
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Remove k3s data directory
+      file:
+        path: /var/lib/rancher/k3s
+        state: absent
+
+    - name: Display cleanup status
+      debug:
+        msg: "k3s agent cleaned on {{ inventory_hostname }}"

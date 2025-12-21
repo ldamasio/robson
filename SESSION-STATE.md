@@ -9,7 +9,12 @@
 5. ✅ SSH root access confirmed (port 22)
 6. ✅ `passwords.yml` created (not in Git)
 7. ✅ `vault.yml` created and encrypted
-8. ✅ **STEP 4 COMPLETE: All 4 VPS responding to Ansible ping**
+8. ✅ **STEP 4**: All 4 VPS responding to Ansible ping
+9. ✅ **STEP 5**: k3s server installed on tiger
+10. ✅ **STEP 6**: k3s token captured
+11. ✅ **STEP 7**: Token added to vault
+12. ✅ **STEP 8**: 3 k3s agents installed and joined
+13. ✅ **STEP 9**: Kubeconfig obtained, 4 nodes Ready
 
 ## 🔴 ISSUES RESOLVED
 
@@ -50,14 +55,23 @@ podman run --rm -it \
 
 ## 📋 NEXT STEPS (for new session)
 
-### Next: STEP 5 - Install k3s Server
+### Next: STEP 10 - Install ArgoCD
 
-Open: `docs/plan/infra/COMMANDS-QUICK-REFERENCE.md` and run STEP 5.
+**Current Status**: k3s cluster ready with 4 nodes (1 server + 3 agents)
 
-**Important reminders**:
-- Add `-e ANSIBLE_HOST_KEY_CHECKING=False` to ALL Podman commands
-- Add `--ask-vault-pass` to ALL playbook commands
-- Use Windows path `C:/app/notes/robson/...` instead of `$(pwd)`
+**kubectl alias configured** (Cygwin/Git Bash):
+```bash
+alias kubectl='podman run --rm -it -v "C:/app/notes/kubeconfig:/kubeconfig:ro" -e KUBECONFIG=/kubeconfig docker.io/bitnami/kubectl:latest'
+```
+
+**Remaining Steps**:
+- STEP 10: Install ArgoCD
+- STEP 11: Install cert-manager + Gateway API CRDs
+- STEP 12: Create Kubernetes secrets
+- STEP 13: Update image tags
+- STEP 14: Deploy application via ArgoCD
+- STEP 15: Configure DNS
+- STEP 16: Verify production deployment
 
 ---
 
@@ -75,23 +89,24 @@ Open: `docs/plan/infra/COMMANDS-QUICK-REFERENCE.md` and run STEP 5.
 
 ## 🎯 NEXT STEP
 
-**STEP 5: Install k3s Server**
+**STEP 10: Install ArgoCD**
 
 ```bash
-cd /c/app/notes/robson/infra/ansible
+# Create namespace
+kubectl create namespace argocd
 
-podman run --rm -it \
-  -e ANSIBLE_HOST_KEY_CHECKING=False \
-  -v "C:/app/notes/robson/infra/ansible:/work" -w /work \
-  docker.io/alpine/ansible:latest \
-  ansible-playbook -i inventory/contabo/hosts.ini \
-  playbooks/k3s-simple-install.yml \
-  --ask-vault-pass \
-  --extra-vars "@inventory/contabo/passwords.yml" \
-  --limit k3s_server
+# Install ArgoCD
+kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/v2.10.0/manifests/install.yaml
+
+# Wait for ready
+kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd
+
+# Get admin password
+kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
+echo
 ```
 
-Expected: k3s server installed on `tiger` (158.220.116.31)
+Expected: ArgoCD installed and running
 
 ---
 
@@ -106,6 +121,6 @@ rm group_vars/all/vault.yml
 
 ---
 
-**Last Updated**: 2024-12-20 16:45  
-**Phase**: k3s Installation (Step 5)  
-**Status**: ✅ Step 4 complete, ready for k3s server install
+**Last Updated**: 2024-12-21 19:20  
+**Phase**: Platform Setup (Step 10)  
+**Status**: ✅ k3s cluster ready (4 nodes), ready for ArgoCD install
