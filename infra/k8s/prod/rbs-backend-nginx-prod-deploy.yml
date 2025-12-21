@@ -17,6 +17,6 @@ spec:
       initContainers:
       containers:
       - name: rbs-backend-nginx-prod-deploy
-        image: ldamasio/rbs-backend-nginx-prod:sha-CHANGEME  # Update with actual SHA from CI
+        image: ldamasio/rbs-backend-nginx-prod:latest
         ports:
         - containerPort: 80

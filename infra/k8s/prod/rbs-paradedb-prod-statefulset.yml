@@ -1,0 +1,81 @@
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rbs-paradedb
+  namespace: robson
+  labels:
+    app: rbs-paradedb
+spec:
+  serviceName: rbs-paradedb
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rbs-paradedb
+  template:
+    metadata:
+      labels:
+        app: rbs-paradedb
+    spec:
+      containers:
+      - name: paradedb
+        image: paradedb/paradedb:latest
+        ports:
+        - containerPort: 5432
+          name: postgres
+        env:
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: rbs-paradedb-secret
+              key: POSTGRES_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: rbs-paradedb-secret
+              key: POSTGRES_PASSWORD
+        - name: POSTGRES_DB
+          valueFrom:
+            secretKeyRef:
+              name: rbs-paradedb-secret
+              key: POSTGRES_DB
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+        volumeMounts:
+        - name: paradedb-data
+          mountPath: /var/lib/postgresql/data
+        resources:
+          requests:
+            memory: "512Mi"
+            cpu: "250m"
+          limits:
+            memory: "1Gi"
+            cpu: "1000m"
+        livenessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - robson
+            - -d
+            - rbsdb
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+        readinessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - robson
+            - -d
+            - rbsdb
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+      volumes:
+      - name: paradedb-data
+        persistentVolumeClaim:
+          claimName: rbs-paradedb-data
+

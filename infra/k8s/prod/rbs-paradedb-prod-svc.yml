@@ -1,0 +1,17 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: paradedb
+  namespace: robson
+  labels:
+    app: rbs-paradedb
+spec:
+  type: ClusterIP
+  ports:
+  - port: 5432
+    targetPort: 5432
+    protocol: TCP
+    name: postgres
+  selector:
+    app: rbs-paradedb
+

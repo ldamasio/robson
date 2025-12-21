@@ -15,6 +15,10 @@
 11. ✅ **STEP 7**: Token added to vault
 12. ✅ **STEP 8**: 3 k3s agents installed and joined
 13. ✅ **STEP 9**: Kubeconfig obtained, 4 nodes Ready
+14. ✅ **STEP 10**: ArgoCD installed and running (7 pods)
+15. ✅ **STEP 11**: cert-manager + Gateway API CRDs installed
+16. ✅ **STEP 12a**: ParadeDB installed and running (PostgreSQL 17.7 + pg_search + vector)
+17. ⏳ **STEP 12b**: Waiting for user to create Django secret with Binance credentials
 
 ## 🔴 ISSUES RESOLVED
 
@@ -55,19 +59,23 @@ podman run --rm -it \
 
 ## 📋 NEXT STEPS (for new session)
 
-### Next: STEP 10 - Install ArgoCD
+### Next: STEP 12b - Create Django Secret (USER ACTION)
 
-**Current Status**: k3s cluster ready with 4 nodes (1 server + 3 agents)
+**Current Status**: 
+- k3s cluster ready with 4 nodes (1 server + 3 agents)
+- ArgoCD installed (admin password: `6LzfEG9USLpv2cz0`)
+- cert-manager installed
+- Gateway API CRDs installed
+- robson namespace created
+- **ParadeDB running** (PostgreSQL 17.7 + pg_search + vector)
 
-**kubectl alias configured** (Cygwin/Git Bash):
+**kubectl via SSH** (recommended):
 ```bash
-alias kubectl='podman run --rm -it -v "C:/app/notes/kubeconfig:/kubeconfig:ro" -e KUBECONFIG=/kubeconfig docker.io/bitnami/kubectl:latest'
+ssh root@158.220.116.31 "kubectl <command>"
 ```
 
 **Remaining Steps**:
-- STEP 10: Install ArgoCD
-- STEP 11: Install cert-manager + Gateway API CRDs
-- STEP 12: Create Kubernetes secrets
+- STEP 12b: Create Django secret with Binance keys ⏳ (USER ACTION)
 - STEP 13: Update image tags
 - STEP 14: Deploy application via ArgoCD
 - STEP 15: Configure DNS
@@ -83,30 +91,50 @@ alias kubectl='podman run --rm -it -v "C:/app/notes/kubeconfig:/kubeconfig:ro" -
 | `docs/plan/infra/COMMANDS-QUICK-REFERENCE.md` | Command list | ✅ Ready |
 | `infra/ansible/SECURE-PASSWORDS.md` | Password guide | ✅ Ready |
 | `infra/ansible/inventory/contabo/passwords.yml` | VPS passwords | ✅ Created (not in Git) |
-| `infra/ansible/group_vars/all/vault.yml` | Ansible vault | ⏳ Need to verify/recreate |
+| `infra/ansible/group_vars/all/vault.yml` | Ansible vault | ✅ Created |
+| `infra/k8s/prod/rbs-paradedb-prod-*.yml` | ParadeDB manifests | ✅ Deployed |
 
 ---
 
 ## 🎯 NEXT STEP
 
-**STEP 10: Install ArgoCD**
+**STEP 12b: Create Django Secret (USER ACTION REQUIRED)**
+
+ParadeDB is running! Now create the Django secret with your Binance credentials.
+
+**Replace ONLY the 5 values marked with `<YOUR_...>`:**
 
 ```bash
-# Create namespace
-kubectl create namespace argocd
-
-# Install ArgoCD
-kubectl apply -n argocd -f https://raw.githubusercontent.com/argoproj/argo-cd/v2.10.0/manifests/install.yaml
-
-# Wait for ready
-kubectl wait --for=condition=available --timeout=300s deployment/argocd-server -n argocd
-
-# Get admin password
-kubectl -n argocd get secret argocd-initial-admin-secret -o jsonpath="{.data.password}" | base64 -d
-echo
+ssh root@158.220.116.31 "kubectl create secret generic rbs-django-secret \
+  --namespace=robson \
+  --from-literal=RBS_SECRET_KEY='$(openssl rand -base64 50 | tr -d '\n')' \
+  --from-literal=RBS_BINANCE_API_KEY_TEST='<YOUR_TESTNET_API_KEY>' \
+  --from-literal=RBS_BINANCE_SECRET_KEY_TEST='<YOUR_TESTNET_SECRET_KEY>' \
+  --from-literal=RBS_BINANCE_API_KEY_PROD='<YOUR_PROD_API_KEY>' \
+  --from-literal=RBS_BINANCE_SECRET_KEY_PROD='<YOUR_PROD_SECRET_KEY>' \
+  --from-literal=RBS_BINANCE_API_URL_TEST='https://testnet.binance.vision' \
+  --from-literal=POSTGRES_DATABASE='rbsdb' \
+  --from-literal=POSTGRES_USER='robson' \
+  --from-literal=POSTGRES_PASSWORD='RbsParade2024Secure!' \
+  --from-literal=POSTGRES_HOST='paradedb.robson.svc.cluster.local' \
+  --from-literal=POSTGRES_PORT='5432'"
 ```
 
-Expected: ArgoCD installed and running
+**Notes:**
+- `RBS_SECRET_KEY` is auto-generated (50 random chars)
+- `POSTGRES_PASSWORD` matches ParadeDB secret (`RbsParade2024Secure!`)
+- `POSTGRES_HOST` points to ParadeDB service (`paradedb.robson.svc.cluster.local`)
+
+**ArgoCD Credentials** (saved):
+- Username: `admin`
+- Password: `6LzfEG9USLpv2cz0`
+
+**ParadeDB Info:**
+- Host: `paradedb.robson.svc.cluster.local`
+- Port: `5432`
+- Database: `rbsdb`
+- User: `robson`
+- Password: `RbsParade2024Secure!`
 
 ---
 
@@ -121,6 +149,6 @@ rm group_vars/all/vault.yml
 
 ---
 
-**Last Updated**: 2024-12-21 19:20  
-**Phase**: Platform Setup (Step 10)  
-**Status**: ✅ k3s cluster ready (4 nodes), ready for ArgoCD install
+**Last Updated**: 2024-12-21 16:50  
+**Phase**: Platform Setup (Step 12b)  
+**Status**: ✅ ParadeDB running, waiting for user to create Django secret
