@@ -114,10 +114,9 @@ podman run --rm -it \
 
 ## 📚 Related Documentation
 
-- `SESSION-STATE.md` → Current deployment status
-- `COMMANDS-QUICK-REFERENCE.md` → All corrected commands
+- `docs/plan/infra/COMMANDS-QUICK-REFERENCE.md` → All corrected commands
 - `SECURE-PASSWORDS.md` → Password management guide
-- `WINDOWS-PATH-FIX.md` → Detailed Cygwin path explanation (legacy doc)
+- `docs/infra/K3S-CLUSTER-GUIDE.md` → Complete k3s cluster deployment guide
 
 ---
 

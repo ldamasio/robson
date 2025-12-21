@@ -553,6 +553,6 @@ This guide provides quick context. The full AGENTS.md has comprehensive details 
 
 ---
 
-**Last Updated**: 2025-12-14
-**Repository**: C:\app\notes\robson
-**Version**: 1.1 (Updated for CLI and agentic workflow)
+**Last Updated**: 2024-12-21
+**Repository**: https://github.com/ldamasio/robson
+**Version**: 1.2 (Updated for ParadeDB and k3s deployment)

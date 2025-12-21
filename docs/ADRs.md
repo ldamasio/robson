@@ -21,4 +21,18 @@ ADR Template (inline)
 ---
 
 Index
-- ADR-0001: BinanceService Singleton — docs/adr/ADR-0001-binance-service-singleton.md
+
+| ID | Title | Status | Date |
+|----|-------|--------|------|
+| ADR-0001 | BinanceService Singleton | Accepted | 2024-11 |
+| ADR-0002 | Hexagonal Architecture | Accepted | 2024-11 |
+| ADR-0003 | Istio Ambient + Gateway API | Accepted | 2024-11 |
+| ADR-0004 | GitOps Preview Environments | Accepted | 2024-11 |
+| ADR-0005 | Ansible Bootstrap Hardening | Accepted | 2024-11 |
+| ADR-0006 | English-Only Codebase | Accepted | 2024-11 |
+| ADR-0007 | ParadeDB Primary Database | Accepted | 2024-12 |
+| ADR-0008 | DeepSeek Primary LLM | Accepted | 2024-12 |
+| ADR-0009 | RAG Architecture ParadeDB | Accepted | 2024-12 |
+| ADR-0010 | GitHub Data Ingestion | Accepted | 2024-12 |
+
+Files located in `docs/adr/`.
