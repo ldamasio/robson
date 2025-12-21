@@ -1,0 +1,42 @@
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: robson-prod
+  namespace: argocd
+  labels:
+    app.kubernetes.io/name: robson-prod
+    app.kubernetes.io/component: production
+spec:
+  project: default
+  
+  source:
+    repoURL: https://github.com/ldamasio/robson
+    targetRevision: main
+    path: infra/k8s/prod
+  
+  destination:
+    server: https://kubernetes.default.svc
+    namespace: robson
+  
+  syncPolicy:
+    automated:
+      prune: true      # Delete resources that are no longer defined in Git
+      selfHeal: true   # Sync when cluster state differs from Git
+      allowEmpty: false
+    syncOptions:
+      - CreateNamespace=true  # Auto-create namespace if it doesn't exist
+      - PrunePropagationPolicy=foreground
+      - PruneLast=true
+    retry:
+      limit: 5
+      backoff:
+        duration: 5s
+        factor: 2
+        maxDuration: 3m
+  
+  # Health assessment
+  ignoreDifferences:
+    - group: apps
+      kind: Deployment
+      jsonPointers:
+        - /spec/replicas  # Ignore replicas if using HPA in the future
