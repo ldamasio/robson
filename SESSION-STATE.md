@@ -18,7 +18,10 @@
 14. ✅ **STEP 10**: ArgoCD installed and running (7 pods)
 15. ✅ **STEP 11**: cert-manager + Gateway API CRDs installed
 16. ✅ **STEP 12a**: ParadeDB installed and running (PostgreSQL 17.7 + pg_search + vector)
-17. ⏳ **STEP 12b**: Waiting for user to create Django secret with Binance credentials
+17. ✅ **STEP 12b**: Django secret created with Binance credentials
+18. ✅ **STEP 13**: Image tags updated to `latest`
+19. ✅ **STEP 14**: Application deployed via ArgoCD (5 pods running)
+20. ⏳ **STEP 15**: DNS configuration required
 
 ## 🔴 ISSUES RESOLVED
 
@@ -75,10 +78,7 @@ ssh root@158.220.116.31 "kubectl <command>"
 ```
 
 **Remaining Steps**:
-- STEP 12b: Create Django secret with Binance keys ⏳ (USER ACTION)
-- STEP 13: Update image tags
-- STEP 14: Deploy application via ArgoCD
-- STEP 15: Configure DNS
+- STEP 15: Configure DNS ⏳ (USER ACTION)
 - STEP 16: Verify production deployment
 
 ---
@@ -98,34 +98,44 @@ ssh root@158.220.116.31 "kubectl <command>"
 
 ## 🎯 NEXT STEP
 
-**STEP 12b: Create Django Secret (USER ACTION REQUIRED)**
+**STEP 15: Configure DNS (USER ACTION REQUIRED)**
 
-ParadeDB is running! Now create the Django secret with your Binance credentials.
+All pods are running! Configure DNS records:
 
-**Replace ONLY the 5 values marked with `<YOUR_...>`:**
+| Type | Name | Value | TTL |
+|------|------|-------|-----|
+| A | `www.robsonbot.com` | `158.220.116.31` | 3600 |
+| A | `backend.robsonbot.com` | `158.220.116.31` | 3600 |
 
+After DNS propagation (~10-15 min), certificates will be issued automatically.
+
+**Verify with:**
 ```bash
-ssh root@158.220.116.31 "kubectl create secret generic rbs-django-secret \
-  --namespace=robson \
-  --from-literal=RBS_SECRET_KEY='$(openssl rand -base64 50 | tr -d '\n')' \
-  --from-literal=RBS_BINANCE_API_KEY_TEST='<YOUR_TESTNET_API_KEY>' \
-  --from-literal=RBS_BINANCE_SECRET_KEY_TEST='<YOUR_TESTNET_SECRET_KEY>' \
-  --from-literal=RBS_BINANCE_API_KEY_PROD='<YOUR_PROD_API_KEY>' \
-  --from-literal=RBS_BINANCE_SECRET_KEY_PROD='<YOUR_PROD_SECRET_KEY>' \
-  --from-literal=RBS_BINANCE_API_URL_TEST='https://testnet.binance.vision' \
-  --from-literal=POSTGRES_DATABASE='rbsdb' \
-  --from-literal=POSTGRES_USER='robson' \
-  --from-literal=POSTGRES_PASSWORD='RbsParade2024Secure!' \
-  --from-literal=POSTGRES_HOST='paradedb.robson.svc.cluster.local' \
-  --from-literal=POSTGRES_PORT='5432'"
+# Check DNS
+dig +short www.robsonbot.com
+dig +short backend.robsonbot.com
+
+# Check certificates
+ssh root@158.220.116.31 "kubectl get certificate -n robson"
+
+# Test HTTPS
+curl -I https://www.robsonbot.com
+curl -I https://backend.robsonbot.com
 ```
 
-**Notes:**
-- `RBS_SECRET_KEY` is auto-generated (50 random chars)
-- `POSTGRES_PASSWORD` matches ParadeDB secret (`RbsParade2024Secure!`)
-- `POSTGRES_HOST` points to ParadeDB service (`paradedb.robson.svc.cluster.local`)
+---
 
-**ArgoCD Credentials** (saved):
+## 📊 CURRENT CLUSTER STATUS
+
+**Pods Running:**
+- `rbs-frontend-prod-deploy` ✅
+- `rbs-backend-monolith-prod-deploy` ✅  
+- `rbs-backend-nginx-prod-deploy` ✅
+- `rbs-paradedb-0` ✅
+
+**ArgoCD:** Synced ✅
+
+**ArgoCD Credentials:**
 - Username: `admin`
 - Password: `6LzfEG9USLpv2cz0`
 
@@ -149,6 +159,6 @@ rm group_vars/all/vault.yml
 
 ---
 
-**Last Updated**: 2024-12-21 16:50  
-**Phase**: Platform Setup (Step 12b)  
-**Status**: ✅ ParadeDB running, waiting for user to create Django secret
+**Last Updated**: 2024-12-21 17:40  
+**Phase**: Platform Setup (Step 15)  
+**Status**: ✅ All pods running! Waiting for DNS configuration
