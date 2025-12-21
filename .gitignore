@@ -129,3 +129,4 @@ infra/ansible/inventory/contabo/passwords.yml
 
 # Temporary inventory with passwords (NEVER COMMIT)
 infra/ansible/inventory/contabo/hosts.ini.local
+apps/backend/monolith/.old/
