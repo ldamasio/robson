@@ -9,30 +9,33 @@
 5. ✅ SSH root access confirmed (port 22)
 6. ✅ `passwords.yml` created (not in Git)
 
-## 🔴 CURRENT ISSUE
+## 🔴 ISSUES RESOLVED
 
-**Error**: `Attempting to decrypt but no vault secrets found`
+### Issue 1: Vault password not provided
+**Error**: `Attempting to decrypt but no vault secrets found`  
+**Solution**: Add `--ask-vault-pass` to ALL Ansible commands ✅
 
-**Cause**: Ansible is loading `group_vars/all/vault.yml` (encrypted) but no vault password provided.
+### Issue 2: Cygwin path not recognized by Podman
+**Error**: `statfs /cygdrive/c/...: no such file or directory`  
+**Solution**: Use Windows-style path `C:/app/notes/robson/...` instead of `$(pwd)` ✅
 
-**Solution**: Add `--ask-vault-pass` to ALL Ansible commands.
+## ⚡ WORKING COMMANDS (Windows/Cygwin)
 
-## ⚡ QUICK FIX
-
-The correct command for STEP 4 is:
+For Windows/Cygwin, use explicit path instead of `$(pwd)`:
 
 ```bash
 cd /c/app/notes/robson/infra/ansible
 
+# Test connectivity
 podman run --rm -it \
-  -v "$(pwd):/work" -w /work \
+  -v "C:/app/notes/robson/infra/ansible:/work" -w /work \
   docker.io/alpine/ansible:latest \
   ansible -i inventory/contabo/hosts.ini all -m ping \
   --extra-vars "@inventory/contabo/passwords.yml" \
   --ask-vault-pass
 ```
 
-**Note**: Even though you're not using vault variables yet, Ansible loads `vault.yml` automatically from `group_vars/`.
+**Note**: Cygwin's `$(pwd)` returns `/cygdrive/c/...` which Podman doesn't understand. Use Windows path `C:/...` directly.
 
 ---
 
@@ -43,8 +46,10 @@ podman run --rm -it \
 See: `infra/ansible/VAULT-TEMPLATE.md`
 
 ```bash
+cd /c/app/notes/robson/infra/ansible
+
 podman run --rm -it \
-  -v "$(pwd):/work" -w /work \
+  -v "C:/app/notes/robson/infra/ansible:/work" -w /work \
   docker.io/alpine/ansible:latest \
   ansible-vault create group_vars/all/vault.yml
 ```
@@ -87,8 +92,10 @@ Open: `docs/plan/infra/COMMANDS-QUICK-REFERENCE.md`
 
 2. **Test ping** (with vault password):
    ```bash
+   cd /c/app/notes/robson/infra/ansible
+   
    podman run --rm -it \
-     -v "$(pwd):/work" -w /work \
+     -v "C:/app/notes/robson/infra/ansible:/work" -w /work \
      docker.io/alpine/ansible:latest \
      ansible -i inventory/contabo/hosts.ini all -m ping \
      --extra-vars "@inventory/contabo/passwords.yml" \
