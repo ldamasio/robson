@@ -122,4 +122,10 @@ typings/
 
 # --- AI/LLM Tool Configuration & Local Settings ---
 # Ignore Claude Code CLI's local/sensitive settings (Contains API keys, local paths, etc.)
-.claude/settings.local.json
+.claude/settings.local.json# Ansible - Sensitive Files
+
+# VPS passwords (NEVER COMMIT)
+infra/ansible/inventory/contabo/passwords.yml
+
+# Temporary inventory with passwords (NEVER COMMIT)
+infra/ansible/inventory/contabo/hosts.ini.local

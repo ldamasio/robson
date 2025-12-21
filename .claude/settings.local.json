@@ -1,0 +1,32 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(tree:*)",
+      "Bash(find:*)",
+      "Bash(cat:*)",
+      "Bash(xargs cat:*)",
+      "Bash(xargs ls:*)",
+      "Bash(detect-secrets scan:*)",
+      "Bash(C:/app/robson/.secrets.baseline)",
+      "Bash(git checkout:*)",
+      "Bash(git push:*)",
+      "Bash(gh pr create:*)",
+      "Bash(git add:*)",
+      "Bash(git commit:*)",
+      "Bash(echo:*)",
+      "Bash(if [ -n \"$GITHUB_TOKEN\" ])",
+      "Bash([ -n \"$GH_TOKEN\" ])",
+      "Bash(then echo \"Token found\")",
+      "Bash(else echo \"No GitHub token available\")",
+      "Bash(fi)",
+      "Bash(chmod:*)",
+      "Bash(go mod download:*)",
+      "Bash(just:*)",
+      "Bash(curl:*)",
+      "Bash(bash -s:*)",
+      "Bash(export PATH=\"$HOME/bin:$PATH\")"
+    ],
+    "deny": [],
+    "ask": []
+  }
+}
