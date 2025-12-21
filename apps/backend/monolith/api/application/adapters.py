@@ -13,12 +13,17 @@ Hexagonal Architecture INSIDE Django:
 - Use cases depend on ports, not adapters
 
 ONE system, ONE runtime, ONE source of truth.
+
+Multi-tenant aware:
+- System adapters use K8s secrets (admin credentials)
+- Client adapters use per-client credentials from database (future)
 """
 
 from __future__ import annotations
 from typing import Optional, Iterable
 from datetime import datetime
 from decimal import Decimal
+import logging
 
 from django.conf import settings
 from django.utils import timezone
@@ -31,6 +36,8 @@ from .ports import (
     EventBusPort,
     ClockPort,
 )
+
+logger = logging.getLogger(__name__)
 
 
 # ==========================================
@@ -117,15 +124,52 @@ class DjangoOrderRepository(OrderRepository):
 # ==========================================
 
 
-class BinanceMarketData(MarketDataPort):
-    """Market data adapter using Binance API."""
+def _get_binance_client(use_testnet: bool = None) -> Client:
+    """
+    Create a Binance client with appropriate credentials.
+    
+    Args:
+        use_testnet: Override testnet setting. If None, uses settings.BINANCE_USE_TESTNET
+        
+    Returns:
+        Configured Binance Client instance
+    """
+    if use_testnet is None:
+        use_testnet = getattr(settings, 'BINANCE_USE_TESTNET', True)
+    
+    if use_testnet:
+        api_key = settings.BINANCE_API_KEY_TEST
+        secret_key = settings.BINANCE_SECRET_KEY_TEST
+    else:
+        api_key = settings.BINANCE_API_KEY
+        secret_key = settings.BINANCE_SECRET_KEY
+    
+    if not api_key or not secret_key:
+        mode = "testnet" if use_testnet else "production"
+        raise RuntimeError(f'Binance API credentials not configured for {mode} mode')
+    
+    mode_str = "TESTNET" if use_testnet else "PRODUCTION"
+    logger.info(f"Creating Binance client in {mode_str} mode")
+    
+    return Client(api_key, secret_key, testnet=use_testnet)
 
-    def __init__(self, client: Client | None = None):
-        self.client = client or Client(
-            settings.BINANCE_API_KEY_TEST,
-            settings.BINANCE_SECRET_KEY_TEST,
-            testnet=True,
-        )
+
+class BinanceMarketData(MarketDataPort):
+    """
+    Market data adapter using Binance API.
+    
+    Respects BINANCE_USE_TESTNET setting for environment selection.
+    """
+
+    def __init__(self, client: Client | None = None, use_testnet: bool = None):
+        """
+        Initialize market data adapter.
+        
+        Args:
+            client: Optional pre-configured Binance client
+            use_testnet: Override testnet setting. If None, uses settings.BINANCE_USE_TESTNET
+        """
+        self.client = client or _get_binance_client(use_testnet)
 
     def best_bid(self, symbol: object) -> Decimal:
         """Get best bid price from Binance order book."""
@@ -161,18 +205,34 @@ class BinanceExecution(ExchangeExecutionPort):
 
     WARNING: This places REAL orders on Binance.
     Use with caution and proper risk management.
+    
+    Respects BINANCE_USE_TESTNET setting for environment selection.
+    When BINANCE_USE_TESTNET=False, trades with REAL money!
     """
 
-    def __init__(self, client: Client | None = None):
-        self.client = client or Client(
-            settings.BINANCE_API_KEY_TEST,
-            settings.BINANCE_SECRET_KEY_TEST,
-            testnet=True,
-        )
+    def __init__(self, client: Client | None = None, use_testnet: bool = None):
+        """
+        Initialize execution adapter.
+        
+        Args:
+            client: Optional pre-configured Binance client
+            use_testnet: Override testnet setting. If None, uses settings.BINANCE_USE_TESTNET
+        """
+        if use_testnet is None:
+            use_testnet = getattr(settings, 'BINANCE_USE_TESTNET', True)
+        
+        self.use_testnet = use_testnet
+        self.client = client or _get_binance_client(use_testnet)
+        
+        if not use_testnet:
+            logger.warning("⚠️ BinanceExecution initialized in PRODUCTION mode - REAL MONEY!")
 
     def place_limit(self, order: object) -> str:
         """Place a real limit order on Binance."""
         pair = getattr(order["symbol"], "as_pair", lambda: str(order["symbol"]))()
+        
+        mode = "TESTNET" if self.use_testnet else "PRODUCTION"
+        logger.info(f"Placing LIMIT order on {mode}: {order['side']} {order['qty']} {pair} @ {order['price']}")
 
         # Place limit order via Binance API
         response = self.client.create_order(
@@ -183,9 +243,75 @@ class BinanceExecution(ExchangeExecutionPort):
             quantity=str(order["qty"]),
             price=str(order["price"]),
         )
+        
+        order_id = str(response["orderId"])
+        logger.info(f"Order placed successfully: {order_id}")
 
         # Return Binance order ID
-        return str(response["orderId"])
+        return order_id
+    
+    def place_market(self, symbol: str, side: str, quantity: Decimal) -> dict:
+        """
+        Place a market order on Binance.
+        
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDC")
+            side: "BUY" or "SELL"
+            quantity: Amount to trade
+            
+        Returns:
+            Full order response from Binance
+        """
+        mode = "TESTNET" if self.use_testnet else "PRODUCTION"
+        logger.info(f"Placing MARKET order on {mode}: {side} {quantity} {symbol}")
+        
+        response = self.client.create_order(
+            symbol=symbol,
+            side=side,
+            type="MARKET",
+            quantity=str(quantity),
+        )
+        
+        order_id = str(response["orderId"])
+        logger.info(f"Market order placed successfully: {order_id}")
+        
+        return response
+    
+    def get_account_balance(self, asset: str = None) -> dict:
+        """
+        Get account balance(s).
+        
+        Args:
+            asset: Specific asset to get balance for. If None, returns all.
+            
+        Returns:
+            Balance information
+        """
+        account = self.client.get_account()
+        balances = account.get("balances", [])
+        
+        if asset:
+            for balance in balances:
+                if balance["asset"] == asset:
+                    return {
+                        "asset": asset,
+                        "free": Decimal(balance["free"]),
+                        "locked": Decimal(balance["locked"]),
+                    }
+            return {"asset": asset, "free": Decimal("0"), "locked": Decimal("0")}
+        
+        # Return all non-zero balances
+        non_zero = []
+        for balance in balances:
+            free = Decimal(balance["free"])
+            locked = Decimal(balance["locked"])
+            if free > 0 or locked > 0:
+                non_zero.append({
+                    "asset": balance["asset"],
+                    "free": free,
+                    "locked": locked,
+                })
+        return {"balances": non_zero}
 
 
 # ==========================================

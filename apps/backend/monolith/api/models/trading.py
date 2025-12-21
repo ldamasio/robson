@@ -150,6 +150,9 @@ class Order(BaseModel):
     price = models.DecimalField(max_digits=20, decimal_places=8, null=True, blank=True)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="PENDING")
 
+    # External exchange reference
+    binance_order_id = models.CharField(max_length=100, blank=True, null=True, db_index=True)
+    
     # Fills
     filled_quantity = models.DecimalField(max_digits=20, decimal_places=8, default=Decimal("0"))
     avg_fill_price = models.DecimalField(max_digits=20, decimal_places=8, null=True, blank=True)

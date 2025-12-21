@@ -75,6 +75,11 @@ spec:
             secretKeyRef:
               name: rbs-django-secret
               key: POSTGRES_PORT
+        # Trading configuration - set to False for production trading
+        - name: BINANCE_USE_TESTNET
+          value: "False"
+        - name: TRADING_ENABLED
+          value: "True"
         ports:
         - containerPort: 8000
         resources:

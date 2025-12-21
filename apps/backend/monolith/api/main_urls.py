@@ -2,9 +2,12 @@
 """
 Main URL configuration for API endpoints.
 Debug version with direct imports and explicit error handling.
+
+Includes production trading endpoints for executing real trades.
 """
 
 from django.urls import path
+from django.http import JsonResponse
 from . import views
 from rest_framework_simplejwt.views import (
     TokenObtainPairView,
@@ -38,6 +41,22 @@ except ImportError as e:
         from django.http import JsonResponse
         return JsonResponse({"message": "Token test endpoint"})
 
+# Import trading views for production trading
+try:
+    from .views.trading import (
+        trading_status,
+        account_balance as trading_balance,
+        buy_btc,
+        sell_btc,
+        trade_history,
+        pnl_summary,
+    )
+    TRADING_VIEWS_AVAILABLE = True
+    print("✅ Trading views imported successfully")
+except ImportError as e:
+    print(f"⚠️  Could not import trading views: {e}")
+    TRADING_VIEWS_AVAILABLE = False
+
 # Main API URL patterns
 urlpatterns = [
     # ==========================================
@@ -66,6 +85,17 @@ urlpatterns = [
     # TRADING ROUTES
     # ==========================================
     path('strategies/', views.getStrategies, name='get_strategies'),
+    
+    # ==========================================
+    # PRODUCTION TRADING ROUTES (REAL MONEY!)
+    # ==========================================
+    # These endpoints execute real trades when BINANCE_USE_TESTNET=False
+    path('trade/status/', trading_status, name='trading_status') if TRADING_VIEWS_AVAILABLE else path('trade/status/', lambda r: JsonResponse({'error': 'Trading views not available'}), name='trading_status'),
+    path('trade/balance/', trading_balance, name='trading_balance') if TRADING_VIEWS_AVAILABLE else path('trade/balance/', lambda r: JsonResponse({'error': 'Trading views not available'}), name='trading_balance'),
+    path('trade/buy-btc/', buy_btc, name='buy_btc') if TRADING_VIEWS_AVAILABLE else path('trade/buy-btc/', lambda r: JsonResponse({'error': 'Trading views not available'}), name='buy_btc'),
+    path('trade/sell-btc/', sell_btc, name='sell_btc') if TRADING_VIEWS_AVAILABLE else path('trade/sell-btc/', lambda r: JsonResponse({'error': 'Trading views not available'}), name='sell_btc'),
+    path('trade/history/', trade_history, name='trade_history') if TRADING_VIEWS_AVAILABLE else path('trade/history/', lambda r: JsonResponse({'error': 'Trading views not available'}), name='trade_history'),
+    path('trade/pnl/', pnl_summary, name='pnl_summary') if TRADING_VIEWS_AVAILABLE else path('trade/pnl/', lambda r: JsonResponse({'error': 'Trading views not available'}), name='pnl_summary'),
     
     # ==========================================
     # MARKET DATA ROUTES

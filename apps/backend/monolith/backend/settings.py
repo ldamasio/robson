@@ -24,12 +24,22 @@ AUTH_USER_MODEL = 'clients.CustomUser'
 # ==========================================
 # TRADING/BINANCE CONFIGURATION
 # ==========================================
+# Testnet credentials (for development and testing)
 BINANCE_API_KEY_TEST = config("RBS_BINANCE_API_KEY_TEST", default="")
 BINANCE_SECRET_KEY_TEST = config("RBS_BINANCE_SECRET_KEY_TEST", default="")
-BINANCE_API_KEY = config("RBS_BINANCE_API_KEY", default="")
-BINANCE_SECRET_KEY = config("RBS_BINANCE_SECRET_KEY", default="")
+
+# Production credentials (for real trading)
+# Note: K8s uses RBS_BINANCE_API_KEY_PROD, we support both naming conventions
+BINANCE_API_KEY = config("RBS_BINANCE_API_KEY_PROD", default=config("RBS_BINANCE_API_KEY", default=""))
+BINANCE_SECRET_KEY = config("RBS_BINANCE_SECRET_KEY_PROD", default=config("RBS_BINANCE_SECRET_KEY", default=""))
+
+# Trading flags
 BINANCE_USE_TESTNET = config('BINANCE_USE_TESTNET', default=True, cast=bool)
 TRADING_ENABLED = config('TRADING_ENABLED', default=False, cast=bool)
+
+# Encryption key for client credentials stored in database
+# Uses Django's SECRET_KEY if not explicitly provided
+CREDENTIAL_ENCRYPTION_KEY = config("RBS_CREDENTIAL_ENCRYPTION_KEY", default="")
 
 # ==========================================
 # DJANGO APPS
