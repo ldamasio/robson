@@ -8,6 +8,8 @@
 4. ✅ 4 VPS reinstalled (Ubuntu 24.04 fresh)
 5. ✅ SSH root access confirmed (port 22)
 6. ✅ `passwords.yml` created (not in Git)
+7. ✅ `vault.yml` created and encrypted
+8. ✅ **STEP 4 COMPLETE: All 4 VPS responding to Ansible ping**
 
 ## 🔴 ISSUES RESOLVED
 
@@ -19,15 +21,20 @@
 **Error**: `statfs /cygdrive/c/...: no such file or directory`  
 **Solution**: Use Windows-style path `C:/app/notes/robson/...` instead of `$(pwd)` ✅
 
+### Issue 3: SSH Host Key Checking blocking password auth
+**Error**: `Using a SSH password instead of a key is not possible because Host Key checking is enabled`  
+**Solution**: Add `-e ANSIBLE_HOST_KEY_CHECKING=False` to all Podman commands ✅
+
 ## ⚡ WORKING COMMANDS (Windows/Cygwin)
 
-For Windows/Cygwin, use explicit path instead of `$(pwd)`:
+For Windows/Cygwin, use explicit path and disable host key checking:
 
 ```bash
 cd /c/app/notes/robson/infra/ansible
 
 # Test connectivity
 podman run --rm -it \
+  -e ANSIBLE_HOST_KEY_CHECKING=False \
   -v "C:/app/notes/robson/infra/ansible:/work" -w /work \
   docker.io/alpine/ansible:latest \
   ansible -i inventory/contabo/hosts.ini all -m ping \
@@ -35,37 +42,22 @@ podman run --rm -it \
   --ask-vault-pass
 ```
 
-**Note**: Cygwin's `$(pwd)` returns `/cygdrive/c/...` which Podman doesn't understand. Use Windows path `C:/...` directly.
+**Notes**: 
+- Cygwin's `$(pwd)` returns `/cygdrive/c/...` which Podman doesn't understand. Use Windows path `C:/...` directly.
+- `-e ANSIBLE_HOST_KEY_CHECKING=False` is required because the container has no `known_hosts` file.
 
 ---
 
 ## 📋 NEXT STEPS (for new session)
 
-### Step 1: Create vault.yml (if not done)
+### Next: STEP 5 - Install k3s Server
 
-See: `infra/ansible/VAULT-TEMPLATE.md`
+Open: `docs/plan/infra/COMMANDS-QUICK-REFERENCE.md` and run STEP 5.
 
-```bash
-cd /c/app/notes/robson/infra/ansible
-
-podman run --rm -it \
-  -v "C:/app/notes/robson/infra/ansible:/work" -w /work \
-  docker.io/alpine/ansible:latest \
-  ansible-vault create group_vars/all/vault.yml
-```
-
-Content:
-```yaml
----
-vault_ssh_port: 22
-vault_admin_pubkey: "ssh-ed25519 AAAA... (from: cat ~/.ssh/id_ed25519.pub)"
-```
-
-### Step 2: Continue from STEP 4
-
-Open: `docs/plan/infra/COMMANDS-QUICK-REFERENCE.md`
-
-**Important**: Add `--ask-vault-pass` to ALL commands.
+**Important reminders**:
+- Add `-e ANSIBLE_HOST_KEY_CHECKING=False` to ALL Podman commands
+- Add `--ask-vault-pass` to ALL playbook commands
+- Use Windows path `C:/app/notes/robson/...` instead of `$(pwd)`
 
 ---
 
@@ -81,28 +73,25 @@ Open: `docs/plan/infra/COMMANDS-QUICK-REFERENCE.md`
 
 ---
 
-## 🎯 RESUME FROM HERE
+## 🎯 NEXT STEP
 
-1. **Verify vault exists**: 
-   ```bash
-   cat infra/ansible/group_vars/all/vault.yml
-   ```
-   - If encrypted → you have it, just need password
-   - If missing → create new one (VAULT-TEMPLATE.md)
+**STEP 5: Install k3s Server**
 
-2. **Test ping** (with vault password):
-   ```bash
-   cd /c/app/notes/robson/infra/ansible
-   
-   podman run --rm -it \
-     -v "C:/app/notes/robson/infra/ansible:/work" -w /work \
-     docker.io/alpine/ansible:latest \
-     ansible -i inventory/contabo/hosts.ini all -m ping \
-     --extra-vars "@inventory/contabo/passwords.yml" \
-     --ask-vault-pass
-   ```
+```bash
+cd /c/app/notes/robson/infra/ansible
 
-3. **Continue to STEP 5** (install k3s server)
+podman run --rm -it \
+  -e ANSIBLE_HOST_KEY_CHECKING=False \
+  -v "C:/app/notes/robson/infra/ansible:/work" -w /work \
+  docker.io/alpine/ansible:latest \
+  ansible-playbook -i inventory/contabo/hosts.ini \
+  playbooks/k3s-simple-install.yml \
+  --ask-vault-pass \
+  --extra-vars "@inventory/contabo/passwords.yml" \
+  --limit k3s_server
+```
+
+Expected: k3s server installed on `tiger` (158.220.116.31)
 
 ---
 
@@ -117,6 +106,6 @@ rm group_vars/all/vault.yml
 
 ---
 
-**Last Updated**: 2024-12-20 15:30  
-**Phase**: Ansible Setup (Step 4)  
-**Blocker**: Need vault password for Ansible commands
+**Last Updated**: 2024-12-20 16:45  
+**Phase**: k3s Installation (Step 5)  
+**Status**: ✅ Step 4 complete, ready for k3s server install

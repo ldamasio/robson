@@ -29,7 +29,7 @@ git mv group_vars/all/vault.yml group_vars/all/vault.yml.orphaned-2024-12
 
 # Create new vault
 podman run --rm -it \
-  -v "$(pwd):/work" -w /work \
+  -v "C:/app/notes/robson/infra/ansible:/work" -w /work \
   docker.io/alpine/ansible:latest \
   ansible-vault create group_vars/all/vault.yml
 ```
@@ -54,16 +54,18 @@ Replace entire content with:
 
 ```ini
 [k3s_server]
-tiger  ansible_host=158.220.116.31 ansible_user=root ansible_ssh_pass=TIGER_PASSWORD
+tiger  ansible_host=158.220.116.31 ansible_user=root
 
 [k3s_agent]
-bengal ansible_host=164.68.96.68 ansible_user=root ansible_ssh_pass=BENGAL_PASSWORD
-pantera ansible_host=149.102.139.33 ansible_user=root ansible_ssh_pass=PANTERA_PASSWORD
-eagle   ansible_host=167.86.92.97 ansible_user=root ansible_ssh_pass=EAGLE_PASSWORD
+bengal ansible_host=164.68.96.68 ansible_user=root
+pantera ansible_host=149.102.139.33 ansible_user=root
+eagle   ansible_host=167.86.92.97 ansible_user=root
 
 [k3s_gateway]
 tiger
 ```
+
+**Note**: Passwords are in `passwords.yml` (not in Git)
 
 ---
 
@@ -73,12 +75,15 @@ tiger
 cd /c/app/notes/robson/infra/ansible
 
 podman run --rm -it \
-  -v "$(pwd):/work" -w /work \
+  -e ANSIBLE_HOST_KEY_CHECKING=False \
+  -v "C:/app/notes/robson/infra/ansible:/work" -w /work \
   docker.io/alpine/ansible:latest \
-  ansible -i inventory/contabo/hosts.ini all -m ping
+  ansible -i inventory/contabo/hosts.ini all -m ping \
+  --extra-vars "@inventory/contabo/passwords.yml" \
+  --ask-vault-pass
 ```
 
-Expected: `SUCCESS` for all 4 hosts
+Expected: `SUCCESS => { "ping": "pong" }` for all 4 hosts
 
 ---
 
@@ -88,11 +93,13 @@ Expected: `SUCCESS` for all 4 hosts
 cd /c/app/notes/robson/infra/ansible
 
 podman run --rm -it \
-  -v "$(pwd):/work" -w /work \
+  -e ANSIBLE_HOST_KEY_CHECKING=False \
+  -v "C:/app/notes/robson/infra/ansible:/work" -w /work \
   docker.io/alpine/ansible:latest \
   ansible-playbook -i inventory/contabo/hosts.ini \
   playbooks/k3s-simple-install.yml \
   --ask-vault-pass \
+  --extra-vars "@inventory/contabo/passwords.yml" \
   --limit k3s_server
 ```
 
@@ -113,7 +120,7 @@ ssh root@158.220.116.31 "cat /var/lib/rancher/k3s/server/node-token"
 cd /c/app/notes/robson/infra/ansible
 
 podman run --rm -it \
-  -v "$(pwd):/work" -w /work \
+  -v "C:/app/notes/robson/infra/ansible:/work" -w /work \
   docker.io/alpine/ansible:latest \
   ansible-vault edit group_vars/all/vault.yml
 ```
@@ -134,11 +141,13 @@ Save: ESC, `:wq`, ENTER
 cd /c/app/notes/robson/infra/ansible
 
 podman run --rm -it \
-  -v "$(pwd):/work" -w /work \
+  -e ANSIBLE_HOST_KEY_CHECKING=False \
+  -v "C:/app/notes/robson/infra/ansible:/work" -w /work \
   docker.io/alpine/ansible:latest \
   ansible-playbook -i inventory/contabo/hosts.ini \
   playbooks/k3s-simple-install.yml \
   --ask-vault-pass \
+  --extra-vars "@inventory/contabo/passwords.yml" \
   --limit k3s_agent
 ```
 

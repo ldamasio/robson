@@ -68,11 +68,14 @@ ansible -i inventory/contabo/hosts.ini all -m ping \
 **With Podman**:
 ```bash
 podman run --rm -it \
-  -v "$(pwd):/work" -w /work \
+  -e ANSIBLE_HOST_KEY_CHECKING=False \
+  -v "C:/app/notes/robson/infra/ansible:/work" -w /work \
   docker.io/alpine/ansible:latest \
   ansible -i inventory/contabo/hosts.ini all -m ping \
   --extra-vars "@inventory/contabo/passwords.yml"
 ```
+
+**Note**: `-e ANSIBLE_HOST_KEY_CHECKING=False` is required for fresh VPS installs.
 
 ---
 
@@ -84,17 +87,20 @@ podman run --rm -it \
 cd /c/app/notes/robson/infra/ansible
 
 podman run --rm -it \
-  -v "$(pwd):/work" -w /work \
+  -e ANSIBLE_HOST_KEY_CHECKING=False \
+  -v "C:/app/notes/robson/infra/ansible:/work" -w /work \
   docker.io/alpine/ansible:latest \
   ansible -i inventory/contabo/hosts.ini all -m ping \
-  --extra-vars "@inventory/contabo/passwords.yml"
+  --extra-vars "@inventory/contabo/passwords.yml" \
+  --ask-vault-pass
 ```
 
 ### STEP 5: Install k3s Server
 
 ```bash
 podman run --rm -it \
-  -v "$(pwd):/work" -w /work \
+  -e ANSIBLE_HOST_KEY_CHECKING=False \
+  -v "C:/app/notes/robson/infra/ansible:/work" -w /work \
   docker.io/alpine/ansible:latest \
   ansible-playbook -i inventory/contabo/hosts.ini \
   playbooks/k3s-simple-install.yml \
@@ -107,7 +113,8 @@ podman run --rm -it \
 
 ```bash
 podman run --rm -it \
-  -v "$(pwd):/work" -w /work \
+  -e ANSIBLE_HOST_KEY_CHECKING=False \
+  -v "C:/app/notes/robson/infra/ansible:/work" -w /work \
   docker.io/alpine/ansible:latest \
   ansible-playbook -i inventory/contabo/hosts.ini \
   playbooks/k3s-simple-install.yml \
