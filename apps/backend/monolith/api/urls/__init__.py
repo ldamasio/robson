@@ -2,9 +2,12 @@
 """
 Organized URL configuration following the project's established patterns.
 Uses the existing strategy_views.py and market_views.py structure.
+
+Includes production trading endpoints for executing real trades.
 """
 
 from django.urls import path, include
+from django.http import JsonResponse
 from ..views.auth import user_profile, logout, login, token_test, MyTokenObtainPairView
 from ..views.strategy_views import get_strategies
 from ..views.market_views import ping, server_time, historical_data
@@ -20,6 +23,21 @@ try:
     OLD_VIEWS_AVAILABLE = True
 except ImportError:
     OLD_VIEWS_AVAILABLE = False
+
+# Import trading views for production trading
+try:
+    from ..views.trading import (
+        trading_status,
+        account_balance as trading_balance,
+        buy_btc,
+        sell_btc,
+        trade_history,
+        pnl_summary,
+    )
+    TRADING_VIEWS_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️  Could not import trading views: {e}")
+    TRADING_VIEWS_AVAILABLE = False
 
 # Fallback function for missing views
 def fallback_view(request):
@@ -116,6 +134,23 @@ urlpatterns = [
          getattr(old_views, 'Patrimony', fallback_view) if OLD_VIEWS_AVAILABLE else fallback_view, 
          name='patrimony'),
 ]
+
+# ==========================================
+# PRODUCTION TRADING ROUTES (REAL MONEY!)
+# ==========================================
+# These endpoints execute real trades when BINANCE_USE_TESTNET=False
+if TRADING_VIEWS_AVAILABLE:
+    urlpatterns += [
+        path('trade/status/', trading_status, name='trading_status'),
+        path('trade/balance/', trading_balance, name='trading_balance'),
+        path('trade/buy-btc/', buy_btc, name='buy_btc'),
+        path('trade/sell-btc/', sell_btc, name='sell_btc'),
+        path('trade/history/', trade_history, name='trade_history'),
+        path('trade/pnl/', pnl_summary, name='pnl_summary'),
+    ]
+    print("✅ Trading views loaded: /api/trade/status/, /api/trade/buy-btc/, etc.")
+else:
+    print("⚠️  Trading views not available")
 
 # Debug info
 print("🎯 URLs loaded following project patterns!")
