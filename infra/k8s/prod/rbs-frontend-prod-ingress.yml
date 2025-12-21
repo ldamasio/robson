@@ -4,15 +4,14 @@ metadata:
   name: rbs-frontend-prod-ingress
   annotations:
     cert-manager.io/cluster-issuer: "rbs-frontend-prod-clusterissuer"
-    spec.ingressClassName: "public"
-    nginx.ingress.kubernetes.io/from-to-www-redirect: "true"
 spec:
+  ingressClassName: traefik
   tls:
   - hosts:
-    - www.robsonbot.com
-    secretName: rbs-frontend-prod-secret
+    - app.robson.rbx.ia.br
+    secretName: rbs-frontend-prod-tls
   rules:
-  - host: www.robsonbot.com
+  - host: app.robson.rbx.ia.br
     http:
       paths:
       - pathType: Prefix

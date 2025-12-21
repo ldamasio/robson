@@ -4,14 +4,14 @@ metadata:
   name: rbs-backend-prod-ingress
   annotations:
     cert-manager.io/cluster-issuer: "rbs-backend-prod-clusterissuer"
-    spec.ingressClassName: "public"
 spec:
+  ingressClassName: traefik
   tls:
   - hosts:
-    - backend.robsonbot.com
-    secretName: rbs-backend-prod-secret
+    - api.robson.rbx.ia.br
+    secretName: rbs-backend-prod-tls
   rules:
-  - host: backend.robsonbot.com
+  - host: api.robson.rbx.ia.br
     http:
       paths:
       - pathType: Prefix
