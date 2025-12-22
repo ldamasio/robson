@@ -1,0 +1,105 @@
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: rbs-stop-monitor-cronjob
+  namespace: robson
+  labels:
+    app: rbs-stop-monitor
+spec:
+  # Run every minute to check for stop-loss/take-profit triggers
+  schedule: "* * * * *"
+  # Keep last 3 successful and 1 failed job for debugging
+  successfulJobsHistoryLimit: 3
+  failedJobsHistoryLimit: 1
+  # Don't start a new job if previous is still running
+  concurrencyPolicy: Forbid
+  jobTemplate:
+    spec:
+      # Clean up completed pods after 5 minutes
+      ttlSecondsAfterFinished: 300
+      template:
+        metadata:
+          labels:
+            app: rbs-stop-monitor
+        spec:
+          restartPolicy: Never
+          containers:
+          - name: stop-monitor
+            image: ldamasio/rbs-backend-monolith-prod:latest
+            command:
+            - python
+            - manage.py
+            - monitor_stops
+            # IMPORTANT: Remove --dry-run to execute real stop orders in production
+            # For safety, starting with dry-run mode enabled
+            - --dry-run
+            env:
+            - name: DJANGO_SETTINGS_MODULE
+              value: "backend.settings"
+            - name: RBS_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: rbs-django-secret
+                  key: RBS_SECRET_KEY
+            - name: RBS_BINANCE_API_KEY_TEST
+              valueFrom:
+                secretKeyRef:
+                  name: rbs-django-secret
+                  key: RBS_BINANCE_API_KEY_TEST
+            - name: RBS_BINANCE_SECRET_KEY_TEST
+              valueFrom:
+                secretKeyRef:
+                  name: rbs-django-secret
+                  key: RBS_BINANCE_SECRET_KEY_TEST
+            - name: RBS_BINANCE_API_KEY_PROD
+              valueFrom:
+                secretKeyRef:
+                  name: rbs-django-secret
+                  key: RBS_BINANCE_API_KEY_PROD
+            - name: RBS_BINANCE_SECRET_KEY_PROD
+              valueFrom:
+                secretKeyRef:
+                  name: rbs-django-secret
+                  key: RBS_BINANCE_SECRET_KEY_PROD
+            - name: RBS_BINANCE_API_URL_TEST
+              valueFrom:
+                secretKeyRef:
+                  name: rbs-django-secret
+                  key: RBS_BINANCE_API_URL_TEST
+            - name: RBS_PG_DATABASE
+              valueFrom:
+                secretKeyRef:
+                  name: rbs-django-secret
+                  key: POSTGRES_DATABASE
+            - name: RBS_PG_USER
+              valueFrom:
+                secretKeyRef:
+                  name: rbs-django-secret
+                  key: POSTGRES_USER
+            - name: RBS_PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: rbs-django-secret
+                  key: POSTGRES_PASSWORD
+            - name: RBS_PG_HOST
+              valueFrom:
+                secretKeyRef:
+                  name: rbs-django-secret
+                  key: POSTGRES_HOST
+            - name: RBS_PG_PORT
+              valueFrom:
+                secretKeyRef:
+                  name: rbs-django-secret
+                  key: POSTGRES_PORT
+            # Trading configuration - production mode
+            - name: BINANCE_USE_TESTNET
+              value: "False"
+            - name: TRADING_ENABLED
+              value: "True"
+            resources:
+              requests:
+                memory: "256Mi"
+                cpu: "100m"
+              limits:
+                memory: "512Mi"
+                cpu: "500m"

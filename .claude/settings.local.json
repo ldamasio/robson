@@ -24,7 +24,14 @@
       "Bash(just:*)",
       "Bash(curl:*)",
       "Bash(bash -s:*)",
-      "Bash(export PATH=\"$HOME/bin:$PATH\")"
+      "Bash(export PATH=\"$HOME/bin:$PATH\")",
+      "Bash(gh run list:*)",
+      "Bash(ssh root@158.220.116.31 \"crictl pull docker.io/ldamasio/rbs-backend-monolith-prod:latest && kubectl -n robson rollout restart deployment rbs-backend-monolith-prod-deploy\")",
+      "Bash(ssh root@158.220.116.31 \"kubectl -n robson rollout status deployment rbs-backend-monolith-prod-deploy --timeout=60s\")",
+      "Bash(ssh root@158.220.116.31:*)",
+      "Bash(ping:*)",
+      "Bash(ssh:*)",
+      "Bash(scp:*)"
     ],
     "deny": [],
     "ask": []

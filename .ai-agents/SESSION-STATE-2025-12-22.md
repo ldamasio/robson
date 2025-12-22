@@ -32,6 +32,8 @@ Records created in production:
 2. `79a69c72` - docs(plan): add strategic operations execution plan
 3. `fbbf9bc1` - feat(risk): add position sizing calculator with 1% rule
 4. `2cb385c0` - feat(trading): add stop loss monitor and executor
+5. `ad0b8f5d` - chore: save session state for continuity
+6. **PENDING** - chore: remove rocketry and add K8s CronJob for stop monitor
 
 ## Files Created/Modified
 
@@ -41,20 +43,30 @@ Records created in production:
 - `apps/backend/monolith/api/tests/test_position_sizing.py` - 16 unit tests
 - `apps/backend/monolith/api/application/stop_monitor.py` - Price monitor + stop executor
 - `apps/backend/monolith/api/management/commands/monitor_stops.py` - CLI command
+- `infra/k8s/prod/rbs-stop-monitor-cronjob.yml` - K8s CronJob for stop monitoring
 
 ### Modified Files
 - `apps/backend/monolith/api/views/trading.py` - Added `/api/trade/position-size/` endpoint
 - `apps/backend/monolith/api/urls/__init__.py` - Added route for position-size
 - `apps/backend/monolith/api/tests_services.py` - Fixed binance credential mocks
+- `docs/AGENTS.md` - Updated container diagram (K8s CronJob instead of Rocketry)
+- `docs/INITIAL-AUDIT.md` - Removed Rocketry reference
+- `CLAUDE.md` - Added stop monitor commands and K8s CronJob commands
 
-## Pending Deploy
+### Deleted Files
+- `apps/backend/cronjob/` - Entire directory (Rocketry removed)
 
-The latest commits (fbbf9bc1, 2cb385c0) have NOT been deployed to K8s yet.
-GitHub Actions needs to build the new image.
+## Deployment Status
 
-To deploy when ready:
+✅ **Latest image deployed** (commit: ad0b8f5d)
+- GitHub Actions built image successfully
+- Deployed to K8s cluster
+- Pod: `rbs-backend-monolith-prod-deploy-86447998cf-q4rft`
+- `monitor_stops` command tested and working
+
+⏳ **Pending**: K8s CronJob application
 ```bash
-ssh root@158.220.116.31 "crictl pull docker.io/ldamasio/rbs-backend-monolith-prod:latest && kubectl -n robson rollout restart deployment rbs-backend-monolith-prod-deploy"
+kubectl apply -f infra/k8s/prod/rbs-stop-monitor-cronjob.yml -n robson
 ```
 
 ## K8s Cluster Info
@@ -69,18 +81,21 @@ ssh root@158.220.116.31 "crictl pull docker.io/ldamasio/rbs-backend-monolith-pro
 1. ✅ Connection to Binance PRODUCTION
 2. ✅ First trade executed (BUY 0.00033 BTC)
 3. ✅ Trade/Order/Operation recorded in database
-4. ✅ Position Sizing Calculator (code complete, pending deploy)
-5. ✅ Stop Monitor + Executor (code complete, pending deploy)
+4. ✅ Position Sizing Calculator (deployed)
+5. ✅ Stop Monitor + Executor (deployed and tested)
+6. ✅ K8s CronJob manifest created (ready to apply)
 
 ## Next Steps
 
-1. Wait for GitHub Actions to build new image (~5-10 min)
-2. Deploy new image to K8s
-3. Test `manage.py monitor_stops --dry-run`
-4. Run continuous monitoring as background process
-5. Consider CronJob/Celery for production monitoring
-6. Integrate monitor with robson CLI
-7. Add alerting (Slack/Discord/Telegram)
+1. ✅ ~~Wait for GitHub Actions to build new image~~ (DONE)
+2. ✅ ~~Deploy new image to K8s~~ (DONE)
+3. ✅ ~~Test `manage.py monitor_stops --dry-run`~~ (DONE - working perfectly)
+4. ✅ ~~Remove Rocketry from project~~ (DONE)
+5. ⏳ **Apply K8s CronJob to cluster** (READY)
+6. Monitor CronJob execution for 5-10 minutes
+7. When confident, remove `--dry-run` to enable live stop execution
+8. Add alerting (Slack/Discord/Telegram)
+9. Integrate monitor with robson CLI
 
 ## Risk Config (Strategy: BTC Spot Manual)
 

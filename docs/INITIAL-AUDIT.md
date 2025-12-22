@@ -42,8 +42,7 @@ robson/
 ├── apps/
 │   ├── backend/                    # Python 3.12 + Django 5.2
 │   │   ├── core/                   # Hexagonal architecture (400 LOC)
-│   │   ├── monolith/               # Legacy Django app (74 files)
-│   │   └── cronjob/                # Rocketry scheduler
+│   │   └── monolith/               # Django monolith (74+ files)
 │   └── frontend/                   # React 18 + Vite (47 files)
 ├── docs/                           # 15+ documentation files
 │   ├── adr/                        # 5 Architecture Decision Records

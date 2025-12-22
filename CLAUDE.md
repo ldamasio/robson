@@ -102,7 +102,8 @@ robson/
 │   │           ├── management/      # Django commands
 │   │           │   └── commands/
 │   │           │       ├── validate_plan.py  # ⭐ Validation command
-│   │           │       └── execute_plan.py   # ⭐ Execution command
+│   │           │       ├── execute_plan.py   # ⭐ Execution command
+│   │           │       └── monitor_stops.py  # ⭐ Stop monitor command
 │   │           └── tests/           # Tests
 │   └── frontend/                    # React 18
 │       └── src/
@@ -500,6 +501,11 @@ python manage.py validate_plan --plan-id <id> --client-id 1  # Validate
 python manage.py execute_plan --plan-id <id> --client-id 1   # Execute (DRY-RUN)
 python manage.py execute_plan --plan-id <id> --client-id 1 --live --acknowledge-risk  # LIVE
 
+# Stop Monitor Commands
+python manage.py monitor_stops --dry-run     # Check stops without executing
+python manage.py monitor_stops               # Execute stop-loss/take-profit orders
+python manage.py monitor_stops --continuous  # Run continuously (loop mode)
+
 # Backend
 python manage.py test -v 2          # Run tests
 python manage.py migrate             # Apply migrations
@@ -524,6 +530,11 @@ argocd app sync robson-backend       # Force sync
 make k9s                             # Launch K9s (terminal UI)
 make k9s-ns NAMESPACE=<name>         # K9s for specific namespace
 make k9s-preview BRANCH=<branch>     # K9s for preview environment
+
+# Stop Monitor CronJob
+kubectl get cronjob -n robson                              # List CronJobs
+kubectl get jobs -n robson -l app=rbs-stop-monitor         # List monitor jobs
+kubectl logs -n robson -l app=rbs-stop-monitor --tail=50   # View monitor logs
 ```
 
 ---

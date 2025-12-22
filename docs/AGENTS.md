@@ -121,7 +121,7 @@ C4Container
 
     Container(frontend, "Frontend", "React 18 + Vite", "User interface")
     Container(backend, "Backend", "Django 5.2 + DRF", "Business logic, API")
-    Container(cronjob, "Cronjob Runner", "Rocketry", "Scheduled tasks")
+    Container(cronjob, "CronJob", "K8s CronJob", "Scheduled tasks (stop monitor)")
     ContainerDb(database, "Database", "PostgreSQL 16", "Persistent storage")
 
     System_Ext(binance, "Binance", "Exchange API")
