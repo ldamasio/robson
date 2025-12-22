@@ -585,3 +585,110 @@ def pnl_summary(request):
         'timestamp': timezone.now().isoformat(),
     })
 
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def calculate_position_size(request):
+    """
+    Calculate optimal position size based on the 1% risk rule.
+    
+    The 1% Rule: Never risk more than 1% of capital on a single trade.
+    
+    Request body:
+        - capital: Total available capital in quote currency (required)
+        - entry_price: Entry price for the trade (required)
+        - stop_loss_percent: Stop loss distance as % (default: 2)
+        - take_profit_percent: Take profit distance as % (default: 4)
+        - side: "BUY" or "SELL" (default: "BUY")
+        - max_risk_percent: Max risk per trade as % (default: 1)
+        - max_position_percent: Max position size as % (default: 50)
+    
+    Returns:
+        Position sizing calculation with:
+        - quantity: Calculated position size
+        - position_value: Total value of position
+        - risk_amount: Maximum loss if stopped
+        - risk_percent: Risk as % of capital
+        - stop_loss_price: Calculated stop loss price
+        - take_profit_price: Calculated take profit price
+        - risk_reward_ratio: Reward/Risk ratio
+    
+    Example:
+        POST /api/trade/position-size/
+        {
+            "capital": 1000,
+            "entry_price": 90000,
+            "stop_loss_percent": 2,
+            "take_profit_percent": 4
+        }
+    """
+    from api.application.risk import PositionSizingCalculator
+    
+    try:
+        # Parse request data
+        capital = request.data.get('capital')
+        entry_price = request.data.get('entry_price')
+        
+        if not capital or not entry_price:
+            return Response({
+                'success': False,
+                'error': 'capital and entry_price are required',
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Convert to Decimal
+        try:
+            capital = Decimal(str(capital))
+            entry_price = Decimal(str(entry_price))
+        except (InvalidOperation, ValueError) as e:
+            return Response({
+                'success': False,
+                'error': f'Invalid number format: {e}',
+            }, status=status.HTTP_400_BAD_REQUEST)
+        
+        # Optional parameters
+        stop_loss_percent = Decimal(str(request.data.get('stop_loss_percent', 2)))
+        take_profit_percent = Decimal(str(request.data.get('take_profit_percent', 4)))
+        max_risk_percent = Decimal(str(request.data.get('max_risk_percent', 1)))
+        max_position_percent = Decimal(str(request.data.get('max_position_percent', 50)))
+        side = request.data.get('side', 'BUY').upper()
+        
+        # Create calculator with parameters
+        calculator = PositionSizingCalculator(
+            max_risk_percent=max_risk_percent,
+            max_position_percent=max_position_percent,
+        )
+        
+        # Calculate position size
+        result = calculator.calculate(
+            capital=capital,
+            entry_price=entry_price,
+            stop_loss_percent=stop_loss_percent,
+            take_profit_percent=take_profit_percent,
+            side=side,
+        )
+        
+        return Response({
+            'success': True,
+            'calculation': result.to_dict(),
+            'summary': {
+                'message': f"Buy {result.quantity} at {result.entry_price}",
+                'risk': f"${result.risk_amount} ({result.risk_percent}% of capital)",
+                'stop_loss': f"${result.stop_loss_price} (-{result.stop_distance_percent}%)",
+                'take_profit': f"${result.take_profit_price} (+{result.target_distance_percent}%)" if result.take_profit_price else None,
+                'risk_reward': f"1:{result.risk_reward_ratio}" if result.risk_reward_ratio else None,
+                'is_capped': result.is_capped,
+            },
+            'timestamp': timezone.now().isoformat(),
+        })
+        
+    except ValueError as e:
+        return Response({
+            'success': False,
+            'error': str(e),
+        }, status=status.HTTP_400_BAD_REQUEST)
+    except Exception as e:
+        logger.error(f"Position sizing calculation failed: {e}", exc_info=True)
+        return Response({
+            'success': False,
+            'error': str(e),
+        }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)

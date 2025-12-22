@@ -33,6 +33,7 @@ try:
         sell_btc,
         trade_history,
         pnl_summary,
+        calculate_position_size,
     )
     TRADING_VIEWS_AVAILABLE = True
 except ImportError as e:
@@ -147,6 +148,7 @@ if TRADING_VIEWS_AVAILABLE:
         path('trade/sell-btc/', sell_btc, name='sell_btc'),
         path('trade/history/', trade_history, name='trade_history'),
         path('trade/pnl/', pnl_summary, name='pnl_summary'),
+        path('trade/position-size/', calculate_position_size, name='calculate_position_size'),
     ]
     print("✅ Trading views loaded: /api/trade/status/, /api/trade/buy-btc/, etc.")
 else:
