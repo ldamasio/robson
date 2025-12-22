@@ -33,11 +33,12 @@ Records created in production:
 3. `fbbf9bc1` - feat(risk): add position sizing calculator with 1% rule
 4. `2cb385c0` - feat(trading): add stop loss monitor and executor
 5. `ad0b8f5d` - chore: save session state for continuity
-6. **PENDING** - chore: remove rocketry and add K8s CronJob for stop monitor
+6. `0e1761d7` - chore: remove rocketry and add K8s CronJob for stop monitor
+7. `027d71fa` - feat(risk): add technical stop calculation module
 
 ## Files Created/Modified
 
-### New Files
+### New Files (Phase 1 - Stop Monitor)
 - `docs/plan/EXECUTION-PLAN-STRATEGIC-OPERATIONS.md` - Strategic operations roadmap
 - `apps/backend/monolith/api/application/risk.py` - Position sizing calculator
 - `apps/backend/monolith/api/tests/test_position_sizing.py` - 16 unit tests
@@ -45,10 +46,15 @@ Records created in production:
 - `apps/backend/monolith/api/management/commands/monitor_stops.py` - CLI command
 - `infra/k8s/prod/rbs-stop-monitor-cronjob.yml` - K8s CronJob for stop monitoring
 
+### New Files (Phase 2 - Technical Stop)
+- `docs/specs/TECHNICAL-STOP-RULE.md` - Core business rule documentation
+- `apps/backend/monolith/api/application/technical_analysis.py` - Support/resistance module
+
 ### Modified Files
 - `apps/backend/monolith/api/views/trading.py` - Added `/api/trade/position-size/` endpoint
 - `apps/backend/monolith/api/urls/__init__.py` - Added route for position-size
 - `apps/backend/monolith/api/tests_services.py` - Fixed binance credential mocks
+- `apps/backend/monolith/api/application/adapters.py` - Added get_klines() method
 - `docs/AGENTS.md` - Updated container diagram (K8s CronJob instead of Rocketry)
 - `docs/INITIAL-AUDIT.md` - Removed Rocketry reference
 - `CLAUDE.md` - Added stop monitor commands and K8s CronJob commands
@@ -83,19 +89,34 @@ kubectl apply -f infra/k8s/prod/rbs-stop-monitor-cronjob.yml -n robson
 3. ✅ Trade/Order/Operation recorded in database
 4. ✅ Position Sizing Calculator (deployed)
 5. ✅ Stop Monitor + Executor (deployed and tested)
-6. ✅ K8s CronJob manifest created (ready to apply)
+6. ✅ K8s CronJob deployed and running (monitoring every minute)
+7. ✅ Technical analysis module (support/resistance detection)
+8. ✅ Binance klines integration (15min candles)
 
 ## Next Steps
 
-1. ✅ ~~Wait for GitHub Actions to build new image~~ (DONE)
-2. ✅ ~~Deploy new image to K8s~~ (DONE)
-3. ✅ ~~Test `manage.py monitor_stops --dry-run`~~ (DONE - working perfectly)
-4. ✅ ~~Remove Rocketry from project~~ (DONE)
-5. ⏳ **Apply K8s CronJob to cluster** (READY)
-6. Monitor CronJob execution for 5-10 minutes
-7. When confident, remove `--dry-run` to enable live stop execution
-8. Add alerting (Slack/Discord/Telegram)
-9. Integrate monitor with robson CLI
+### Completed ✅
+1. ✅ Wait for GitHub Actions to build new image
+2. ✅ Deploy new image to K8s
+3. ✅ Test `manage.py monitor_stops --dry-run`
+4. ✅ Remove Rocketry from project
+5. ✅ Apply K8s CronJob to cluster (running every minute)
+6. ✅ Document technical stop rule
+7. ✅ Implement technical analysis module (support/resistance)
+
+### In Progress ⏳
+8. ⏳ **Complete technical stop implementation**:
+   - Create use case for technical stop calculation
+   - Create REST endpoint `POST /api/trade/calculate-entry/`
+   - Integrate with CLI (`robson plan buy BTCUSDT`)
+   - Create frontend chart visualization
+   - Write tests for technical analysis
+
+### Pending 📋
+9. Monitor CronJob for production confidence
+10. Remove `--dry-run` from CronJob to enable live stops
+11. Add alerting (Slack/Discord/Telegram)
+12. Implement Margin Isolated trading (with same risk rules)
 
 ## Risk Config (Strategy: BTC Spot Manual)
 
