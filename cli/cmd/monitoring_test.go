@@ -134,7 +134,7 @@ func newMockAPIServer() *httptest.Server {
 					"status": "OPEN"
 				}]
 			}`))
-		case "/api/market/price/BTCUSDC/":
+	case "/api/market/price/BTCUSDC/":
 			_, _ = w.Write([]byte(`{
 				"symbol": "BTCUSDC",
 				"bid": "100.00",
@@ -143,8 +143,10 @@ func newMockAPIServer() *httptest.Server {
 				"timestamp": 1700000000,
 				"source": "binance"
 			}`))
-		case "/api/account/balance/":
-			_, _ = w.Write([]byte(`{"spot": "1000.00", "isolated_margin": "0.00"}`))
+	case "/api/trade/balance/":
+		_, _ = w.Write([]byte(`{"spot": "1000.00", "isolated_margin": "0.00"}`))
+	case "/api/account/balance/":
+		_, _ = w.Write([]byte(`{"spot": "1000.00", "isolated_margin": "0.00"}`))
 		case "/api/portfolio/patrimony/":
 			_, _ = w.Write([]byte(`{"patrimony": "1000.00"}`))
 		default:

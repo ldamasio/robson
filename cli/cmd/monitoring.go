@@ -208,12 +208,12 @@ func fetchPositions(cmd *cobra.Command) (positionsResponse, float64, error) {
 }
 
 func fetchBalance(cmd *cobra.Command) (map[string]interface{}, error) {
-	payload, status, err := fetchAPI(cmd, "/api/account/balance/")
+	payload, status, err := fetchAPI(cmd, "/api/trade/balance/")
 	if err == nil {
 		return decodeJSONMap(payload)
 	}
 	if status == http.StatusNotFound {
-		fallbackPayload, _, fallbackErr := fetchAPI(cmd, "/api/trade/balance/")
+		fallbackPayload, _, fallbackErr := fetchAPI(cmd, "/api/account/balance/")
 		if fallbackErr != nil {
 			return nil, fallbackErr
 		}
