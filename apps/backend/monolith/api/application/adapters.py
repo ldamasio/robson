@@ -185,6 +185,45 @@ class BinanceMarketData(MarketDataPort):
         ask = ob["asks"][0][0]
         return Decimal(str(ask))
 
+    def get_klines(
+        self,
+        symbol: object,
+        interval: str = "15m",
+        limit: int = 200
+    ) -> list[dict]:
+        """
+        Get historical klines (candlestick data) from Binance.
+
+        Args:
+            symbol: Trading symbol (can be Symbol object or string)
+            interval: Kline interval (1m, 3m, 5m, 15m, 30m, 1h, 4h, 1d, etc.)
+            limit: Number of klines to fetch (max 1000, default 200)
+
+        Returns:
+            List of klines, each containing:
+            [
+                open_time,
+                open,
+                high,
+                low,
+                close,
+                volume,
+                close_time,
+                quote_asset_volume,
+                number_of_trades,
+                taker_buy_base_asset_volume,
+                taker_buy_quote_asset_volume,
+                ignore
+            ]
+        """
+        pair = getattr(symbol, "as_pair", lambda: str(symbol))()
+        klines = self.client.get_klines(
+            symbol=pair,
+            interval=interval,
+            limit=limit
+        )
+        return klines
+
 
 class StubExecution(ExchangeExecutionPort):
     """
