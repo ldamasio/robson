@@ -35,6 +35,8 @@ Records created in production:
 5. `ad0b8f5d` - chore: save session state for continuity
 6. `0e1761d7` - chore: remove rocketry and add K8s CronJob for stop monitor
 7. `027d71fa` - feat(risk): add technical stop calculation module
+8. `ae5485a1` - feat(dashboard): ship phase 0 monitoring
+9. `993bcdf1` - fix(cli): prefer trade balance endpoint
 
 ## Files Created/Modified
 
@@ -50,6 +52,20 @@ Records created in production:
 - `docs/specs/TECHNICAL-STOP-RULE.md` - Core business rule documentation
 - `apps/backend/monolith/api/application/technical_analysis.py` - Support/resistance module
 
+### New Files (Phase 0 - Monitoring Dashboard)
+- `apps/backend/monolith/api/services/market_price_cache.py` - Price cache helper
+- `apps/backend/monolith/api/views/portfolio.py` - Positions endpoint
+- `apps/backend/monolith/api/tests/test_portfolio.py` - Positions + price tests
+- `apps/frontend/src/components/common/ErrorBoundary.jsx` - UI error boundary
+- `apps/frontend/src/components/common/LoadingSpinner.jsx` - Loading spinner
+- `apps/frontend/tests/ActualPrice.test.jsx` - Price component test
+- `apps/frontend/tests/Chart.test.jsx` - Chart component test
+- `apps/frontend/tests/ErrorBoundary.test.jsx` - Error boundary test
+- `apps/frontend/tests/LoadingSpinner.test.jsx` - Loading spinner test
+- `apps/frontend/tests/Position.test.jsx` - Position component test
+- `cli/cmd/monitoring.go` - CLI monitoring commands
+- `cli/cmd/monitoring_test.go` - CLI monitoring tests
+
 ### Modified Files
 - `apps/backend/monolith/api/views/trading.py` - Added `/api/trade/position-size/` endpoint
 - `apps/backend/monolith/api/urls/__init__.py` - Added route for position-size
@@ -58,6 +74,23 @@ Records created in production:
 - `docs/AGENTS.md` - Updated container diagram (K8s CronJob instead of Rocketry)
 - `docs/INITIAL-AUDIT.md` - Removed Rocketry reference
 - `CLAUDE.md` - Added stop monitor commands and K8s CronJob commands
+- `apps/backend/monolith/api/views/market_views.py` - Added current price endpoint
+- `apps/backend/monolith/api/urls/__init__.py` - Added portfolio + market routes
+- `apps/backend/monolith/backend/settings.py` - Redis cache configuration toggle
+- `apps/backend/monolith/requirements.in` - Added django-redis
+- `apps/backend/monolith/requirements.txt` - Added django-redis
+- `apps/backend/monolith/.env.development.example` - Added REDIS_URL example
+- `apps/backend/monolith/docker-compose.dev.yml` - Added Redis service
+- `apps/frontend/src/App.jsx` - Added ToastContainer for error notifications
+- `apps/frontend/src/screens/LoggedHomeScreen.jsx` - Wrapped key widgets in ErrorBoundary
+- `apps/frontend/src/components/logged/Position.jsx` - Positions polling UI
+- `apps/frontend/src/components/logged/ActualPrice.jsx` - Price polling UI
+- `apps/frontend/src/components/logged/Chart.jsx` - Recharts candlestick view
+- `apps/frontend/package.json` - Added recharts + react-toastify
+- `apps/frontend/package-lock.json` - Dependency lockfile update
+- `cli/cmd/legacy.go` - Fixed JSON output writer
+- `docs/specs/api/openapi.yaml` - Updated market price schema + positions endpoint
+- `docs/plan/PHASE-0-EMERGENCY-DASHBOARD-REVISED.md` - Task checklist updates
 
 ### Deleted Files
 - `apps/backend/cronjob/` - Entire directory (Rocketry removed)
@@ -92,6 +125,9 @@ kubectl apply -f infra/k8s/prod/rbs-stop-monitor-cronjob.yml -n robson
 6. ✅ K8s CronJob deployed and running (monitoring every minute)
 7. ✅ Technical analysis module (support/resistance detection)
 8. ✅ Binance klines integration (15min candles)
+9. ✅ Phase 0 monitoring endpoints (positions + market price)
+10. ✅ CLI monitoring commands (positions, price, account)
+11. ✅ Frontend monitoring components (Position, ActualPrice, Chart)
 
 ## Next Steps
 
@@ -117,6 +153,7 @@ kubectl apply -f infra/k8s/prod/rbs-stop-monitor-cronjob.yml -n robson
 10. Remove `--dry-run` from CronJob to enable live stops
 11. Add alerting (Slack/Discord/Telegram)
 12. Implement Margin Isolated trading (with same risk rules)
+13. Run backend/CLI/frontend tests in a supported environment (WSL2 or native Linux)
 
 ## Risk Config (Strategy: BTC Spot Manual)
 
