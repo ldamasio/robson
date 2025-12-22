@@ -10,7 +10,8 @@ from django.urls import path, include
 from django.http import JsonResponse
 from ..views.auth import user_profile, logout, login, token_test, MyTokenObtainPairView
 from ..views.strategy_views import get_strategies
-from ..views.market_views import ping, server_time, historical_data
+from ..views.market_views import ping, server_time, historical_data, current_price
+from ..views.portfolio import active_positions
 from rest_framework_simplejwt.views import (
     TokenRefreshView,
     TokenVerifyView,
@@ -75,6 +76,7 @@ urlpatterns = [
     path('ping/', ping, name='binance_ping'),
     path('server-time/', server_time, name='server_time'),
     path('historical-data/', historical_data, name='historical_data'),
+    path('market/price/<str:symbol>/', current_price, name='current_price'),
     
     # ==========================================
     # LEGACY ROUTES (FROM OLD VIEWS.PY)
@@ -134,6 +136,7 @@ urlpatterns = [
     path('portfolio/patrimony/', 
          getattr(old_views, 'Patrimony', fallback_view) if OLD_VIEWS_AVAILABLE else fallback_view, 
          name='patrimony'),
+    path('portfolio/positions/', active_positions, name='portfolio_positions'),
 ]
 
 # ==========================================

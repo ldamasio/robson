@@ -17,5 +17,12 @@ services:
       timeout: 3s
       retries: 10
 
+  redis:
+    image: redis:7-alpine
+    container_name: robson-redis-dev
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+
 volumes:
   paradedb-data:

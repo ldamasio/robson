@@ -1,4 +1,6 @@
 import { BrowserRouter as Router, Routes, Route } from 'react-router-dom'
+import { ToastContainer } from 'react-toastify'
+import 'react-toastify/dist/ReactToastify.css'
 import PrivateRoutes from './utils/PrivateRoutes'
 import AuthContext, { AuthProvider } from './context/AuthContext'
 import HomeScreen from './screens/HomeScreen'
@@ -40,6 +42,16 @@ function App() {
               <Route element={<LoggedHomeScreen />} path="/feed" />
             </Route>
           </Routes>
+          <ToastContainer
+            position="bottom-right"
+            autoClose={5000}
+            hideProgressBar={false}
+            newestOnTop={false}
+            closeOnClick
+            pauseOnFocusLoss
+            pauseOnHover
+            theme="light"
+          />
         </AuthProvider>
       </Router>
     </>

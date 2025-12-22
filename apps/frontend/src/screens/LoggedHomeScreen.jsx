@@ -16,6 +16,7 @@ import Volume from '../components/logged/Volume'
 import Chart from '../components/logged/Chart'
 import Dataframe from '../components/logged/Dataframe'
 import AuthContext from '../context/AuthContext'
+import ErrorBoundary from '../components/common/ErrorBoundary'
 
 const LoggedHomeScreen = () => {
   return (
@@ -37,7 +38,9 @@ const LoggedHomeScreen = () => {
               <h1>Manage position</h1>
               <ManagePosition />
               <h1>Actual Price</h1>
-              <ActualPrice />
+              <ErrorBoundary>
+                <ActualPrice />
+              </ErrorBoundary>
               <h1>Trend Now</h1>
               <Trend />
               <h1>Best Strategies</h1>
@@ -47,7 +50,9 @@ const LoggedHomeScreen = () => {
               <h1>Balance</h1>
               <Balance />
               <h1>Position</h1>
-              <Position />
+              <ErrorBoundary>
+                <Position />
+              </ErrorBoundary>
               <h1>Risk Indicator</h1>
               <Risk />
             </Tab>
@@ -55,7 +60,9 @@ const LoggedHomeScreen = () => {
               <h1>Volume BTC USDT Last 24h</h1>
               <Volume />
               <h1>BTC USDT 4 Hour Chart</h1>
-              <Chart />
+              <ErrorBoundary>
+                <Chart />
+              </ErrorBoundary>
               <h1>BTC USDT Last Week Dataframe</h1>
               <Dataframe />
             </Tab>

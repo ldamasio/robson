@@ -240,18 +240,18 @@ response = {
 **File**: `apps/backend/monolith/api/views/portfolio.py` (NEW)
 
 **Checklist**:
-- [ ] Create view function `active_positions(request)`
-- [ ] Extract `client_id` from `request.user.client_id`
-- [ ] Query `Operation.objects.filter(client_id=..., status='ACTIVE')`
-- [ ] For each operation:
-  - [ ] Get entry order via `entry_orders.filter(status='FILLED').first()`
-  - [ ] Get current price from `BinanceMarketData().best_bid(symbol)` (uses cache)
-  - [ ] Calculate P&L using Decimal arithmetic
-  - [ ] Calculate stop/target distances
-- [ ] Return JSON (all values as strings)
-- [ ] Add `@permission_classes([IsAuthenticated])`
-- [ ] Add URL route: `path('portfolio/positions/', views.active_positions)`
-- [ ] Write tests (see Task 12)
+- [x] Create view function `active_positions(request)`
+- [x] Extract `client_id` from `request.user.client_id`
+- [x] Query `Operation.objects.filter(client_id=..., status='ACTIVE')`
+- [x] For each operation:
+  - [x] Get entry order via `entry_orders.filter(status='FILLED').first()`
+  - [x] Get current price from `BinanceMarketData().best_bid(symbol)` (uses cache)
+  - [x] Calculate P&L using Decimal arithmetic
+  - [x] Calculate stop/target distances
+- [x] Return JSON (all values as strings)
+- [x] Add `@permission_classes([IsAuthenticated])`
+- [x] Add URL route: `path('portfolio/positions/', views.active_positions)`
+- [x] Write tests (see Task 12)
 
 **Dependencies**: None (uses existing models)
 
@@ -261,18 +261,18 @@ response = {
 **File**: `apps/backend/monolith/api/views/market_views.py` (EXISTS - add endpoint)
 
 **Checklist**:
-- [ ] Create view function `current_price(request, symbol)`
-- [ ] Use `BinanceMarketData().best_bid(symbol)` and `.best_ask(symbol)`
-- [ ] Add `@cache_page(1)` decorator for Redis caching
-- [ ] Return JSON with bid/ask/last/timestamp
-- [ ] Handle errors (invalid symbol, Binance API down)
-- [ ] Add URL route: `path('market/price/<str:symbol>/', views.current_price)`
-- [ ] Write tests (see Task 12)
+- [x] Create view function `current_price(request, symbol)`
+- [x] Use `BinanceMarketData().best_bid(symbol)` and `.best_ask(symbol)`
+- [x] Add `@cache_page(1)` decorator for Redis caching
+- [x] Return JSON with bid/ask/last/timestamp
+- [x] Handle errors (invalid symbol, Binance API down)
+- [x] Add URL route: `path('market/price/<str:symbol>/', views.current_price)`
+- [x] Write tests (see Task 12)
 
 **Dependencies**:
-- [ ] Add `django-redis==5.4.0` to `requirements.txt`
-- [ ] Configure `CACHES` in `backend/settings.py`
-- [ ] Update `.env.example` with `REDIS_URL` (optional for dev)
+- [x] Add `django-redis==5.4.0` to `requirements.txt`
+- [x] Configure `CACHES` in `backend/settings.py`
+- [x] Update `.env.example` with `REDIS_URL` (optional for dev)
 
 ---
 
@@ -282,10 +282,10 @@ response = {
 **File**: `cli/cmd/monitoring.go` (NEW)
 
 **Checklist**:
-- [ ] Create `positionsCmd` using Cobra pattern
-- [ ] HTTP GET `/api/portfolio/positions/` with JWT auth
-- [ ] Parse JSON response
-- [ ] Format table output:
+- [x] Create `positionsCmd` using Cobra pattern
+- [x] HTTP GET `/api/portfolio/positions/` with JWT auth
+- [x] Parse JSON response
+- [x] Format table output:
   ```
   ╔════════════════════════════════════╗
   ║        ACTIVE POSITIONS            ║
@@ -295,10 +295,10 @@ response = {
   ║ P&L: +$134.50 (+0.46%)             ║
   ╚════════════════════════════════════╝
   ```
-- [ ] Color P&L (green if >0, red if <0)
-- [ ] Support `--json` flag for raw output
-- [ ] Add to `rootCmd` in `cmd/root.go`
-- [ ] Write tests (see Task 13)
+- [x] Color P&L (green if >0, red if <0)
+- [x] Support `--json` flag for raw output
+- [x] Add to `rootCmd` in `cmd/root.go`
+- [x] Write tests (see Task 13)
 
 ---
 
@@ -306,12 +306,12 @@ response = {
 **File**: `cli/cmd/monitoring.go`
 
 **Checklist**:
-- [ ] Create `priceCmd` with symbol argument
-- [ ] HTTP GET `/api/market/price/{symbol}/`
-- [ ] Format output: `BTC/USDC: Bid $89,245.00 | Ask $89,246.00 | Spread $1.00`
-- [ ] Support `--watch` flag (poll every 1s, clear screen)
-- [ ] Support `--json` flag
-- [ ] Write tests
+- [x] Create `priceCmd` with symbol argument
+- [x] HTTP GET `/api/market/price/{symbol}/`
+- [x] Format output: `BTC/USDC: Bid $89,245.00 | Ask $89,246.00 | Spread $1.00`
+- [x] Support `--watch` flag (poll every 1s, clear screen)
+- [x] Support `--json` flag
+- [x] Write tests
 
 ---
 
@@ -319,13 +319,13 @@ response = {
 **File**: `cli/cmd/monitoring.go`
 
 **Checklist**:
-- [ ] HTTP GET `/api/balance/` (existing endpoint)
-- [ ] HTTP GET `/api/patrimony/` (existing endpoint)
-- [ ] HTTP GET `/api/portfolio/positions/` (Task 1)
-- [ ] Calculate: `available = balance - sum(positions_value)`
-- [ ] Display summary table
-- [ ] Support `--json` flag
-- [ ] Write tests
+- [x] HTTP GET `/api/account/balance/` (existing endpoint)
+- [x] HTTP GET `/api/portfolio/patrimony/` (existing endpoint)
+- [x] HTTP GET `/api/portfolio/positions/` (Task 1)
+- [x] Calculate: `available = balance - sum(positions_value)`
+- [x] Display summary table
+- [x] Support `--json` flag
+- [x] Write tests
 
 ---
 
@@ -335,18 +335,18 @@ response = {
 **File**: `apps/frontend/src/components/logged/Position.jsx`
 
 **Checklist**:
-- [ ] Create `useEffect` with `setInterval(fetchPositions, 5000)`
-- [ ] Fetch `/api/portfolio/positions/` with JWT from AuthContext
-- [ ] Parse and store in state: `const [positions, setPositions] = useState([])`
-- [ ] Render Bootstrap card for each position:
+- [x] Create `useEffect` with `setInterval(fetchPositions, 5000)`
+- [x] Fetch `/api/portfolio/positions/` with JWT from AuthContext
+- [x] Parse and store in state: `const [positions, setPositions] = useState([])`
+- [x] Render Bootstrap card for each position:
   - Symbol, side, quantity
   - Entry price, current price
   - P&L with badge (green/red)
   - Stop-loss and take-profit with distance
-- [ ] Add loading spinner (`LoadingSpinner` component)
-- [ ] Handle errors with `ErrorBoundary`
-- [ ] Cleanup interval on unmount
-- [ ] Write tests (see Task 14)
+- [x] Add loading spinner (`LoadingSpinner` component)
+- [x] Handle errors with `ErrorBoundary`
+- [x] Cleanup interval on unmount
+- [x] Write tests (see Task 14)
 
 **Code Snippet**:
 ```javascript
@@ -374,12 +374,12 @@ useEffect(() => {
 **File**: `apps/frontend/src/components/logged/ActualPrice.jsx`
 
 **Checklist**:
-- [ ] Poll `/api/market/price/BTCUSDC/` every 1 second
-- [ ] Format price: `$89,245.50` (comma thousands separator)
-- [ ] Show bid/ask spread: `Spread: $1.00 (0.001%)`
-- [ ] Track previous price to show direction: ↑ (green) or ↓ (red)
-- [ ] Cleanup interval on unmount
-- [ ] Write tests
+- [x] Poll `/api/market/price/BTCUSDC/` every 1 second
+- [x] Format price: `$89,245.50` (comma thousands separator)
+- [x] Show bid/ask spread: `Spread: $1.00 (0.001%)`
+- [x] Track previous price to show direction: ↑ (green) or ↓ (red)
+- [x] Cleanup interval on unmount
+- [x] Write tests
 
 ---
 
@@ -387,16 +387,16 @@ useEffect(() => {
 **File**: `apps/frontend/src/components/logged/Chart.jsx`
 
 **Checklist**:
-- [ ] Install: `npm install recharts`
-- [ ] Fetch `/api/historical-data/?symbol=BTCUSDC&interval=15m&limit=100`
-- [ ] Parse OHLCV data into Recharts format
-- [ ] Render candlestick chart (use Recharts `CandlestickChart` or custom)
-- [ ] Add reference lines:
+- [x] Install: `npm install recharts`
+- [x] Fetch `/api/historical-data/?symbol=BTCUSDC&interval=15m&days=7`
+- [x] Parse OHLCV data into Recharts format
+- [x] Render candlestick chart (use Recharts `CandlestickChart` or custom)
+- [x] Add reference lines:
   - Entry: `$88,837.92` (blue)
   - Stop: `$87,061.16` (red)
   - Target: `$92,391.44` (green)
-- [ ] Update chart every 15 minutes (new candle)
-- [ ] Write tests
+- [x] Update chart every 15 minutes (new candle)
+- [x] Write tests
 
 **Note**: Phase 2 can upgrade to TradingView Lightweight Charts for better performance
 
@@ -408,12 +408,12 @@ useEffect(() => {
 - `apps/frontend/src/components/common/LoadingSpinner.jsx` (NEW)
 
 **Checklist**:
-- [ ] `ErrorBoundary`: React class component with `componentDidCatch`
-- [ ] `LoadingSpinner`: Bootstrap spinner component
-- [ ] Install: `npm install react-toastify` for error notifications
-- [ ] Wrap Position, ActualPrice, Chart with `ErrorBoundary`
-- [ ] Show `LoadingSpinner` while fetching data
-- [ ] Write tests
+- [x] `ErrorBoundary`: React class component with `componentDidCatch`
+- [x] `LoadingSpinner`: Bootstrap spinner component
+- [x] Install: `npm install react-toastify` for error notifications
+- [x] Wrap Position, ActualPrice, Chart with `ErrorBoundary`
+- [x] Show `LoadingSpinner` while fetching data
+- [x] Write tests
 
 ---
 

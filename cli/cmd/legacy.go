@@ -9,6 +9,7 @@ package cmd
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 
 	"github.com/spf13/cobra"
 )
@@ -224,7 +225,7 @@ Example:
 
 // outputJSON is a helper function to output data in JSON format
 func outputJSON(data interface{}) error {
-	encoder := json.NewEncoder(fmt.Printf)
+	encoder := json.NewEncoder(os.Stdout)
 	encoder.SetIndent("", "  ")
 	return encoder.Encode(data)
 }

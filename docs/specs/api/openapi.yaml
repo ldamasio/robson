@@ -279,12 +279,88 @@ paths:
                   symbol:
                     type: string
                     example: BTCUSDT
-                  price:
+                  bid:
                     type: string
-                    example: "50000.00"
+                    example: "89245.00"
+                  ask:
+                    type: string
+                    example: "89246.00"
+                  last:
+                    type: string
+                    example: "89245.50"
                   timestamp:
+                    type: integer
+                    example: 1703251200
+                  source:
                     type: string
-                    format: date-time
+                    example: binance
+
+  # ============================================================================
+  # Portfolio
+  # ============================================================================
+  /portfolio/positions:
+    get:
+      tags: [Portfolio]
+      summary: Get active positions
+      description: Returns active positions with current price and unrealized P&L
+      operationId: getActivePositions
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Active positions
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  positions:
+                    type: array
+                    items:
+                      type: object
+                      properties:
+                        id:
+                          type: integer
+                          example: 1
+                        operation_id:
+                          type: integer
+                          example: 1
+                        symbol:
+                          type: string
+                          example: BTCUSDC
+                        side:
+                          type: string
+                          example: BUY
+                        quantity:
+                          type: string
+                          example: "0.00033"
+                        entry_price:
+                          type: string
+                          example: "88837.92"
+                        current_price:
+                          type: string
+                          example: "89245.50"
+                        unrealized_pnl:
+                          type: string
+                          example: "134.50"
+                        unrealized_pnl_percent:
+                          type: string
+                          example: "0.46"
+                        stop_loss:
+                          type: string
+                          example: "87061.16"
+                        take_profit:
+                          type: string
+                          example: "92391.44"
+                        distance_to_stop_percent:
+                          type: string
+                          example: "-15.3"
+                        distance_to_target_percent:
+                          type: string
+                          example: "3.5"
+                        status:
+                          type: string
+                          example: OPEN
 
 # ==============================================================================
 # Components
