@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import React from 'react'
 import { render, screen } from '@testing-library/react'
-import { vi } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import ErrorBoundary from '../src/components/common/ErrorBoundary'
 
 const Bomb = () => {

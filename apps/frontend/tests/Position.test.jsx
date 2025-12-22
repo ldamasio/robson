@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import React from 'react'
 import { render, screen, waitFor } from '@testing-library/react'
-import { vi } from 'vitest'
+import { describe, expect, it, vi } from 'vitest'
 import Position from '../src/components/logged/Position'
 import AuthContext from '../src/context/AuthContext'
 
