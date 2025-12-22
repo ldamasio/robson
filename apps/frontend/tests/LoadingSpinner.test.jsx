@@ -7,6 +7,7 @@ import LoadingSpinner from '../src/components/common/LoadingSpinner'
 describe('LoadingSpinner', () => {
   it('renders the loading label', () => {
     render(<LoadingSpinner label="Loading data..." />)
-    expect(screen.getByText('Loading data...')).toBeTruthy()
+    expect(screen.getByLabelText('Loading data...')).toBeTruthy()
+    expect(screen.getAllByText('Loading data...').length).toBeGreaterThan(0)
   })
 })

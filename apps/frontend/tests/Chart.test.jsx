@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import React from 'react'
 import { render, waitFor } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
+import { beforeAll, describe, expect, it, vi } from 'vitest'
 import Chart from '../src/components/logged/Chart'
 import AuthContext from '../src/context/AuthContext'
 
@@ -20,6 +20,19 @@ vi.mock('react-toastify', () => ({
 import axios from 'axios'
 
 describe('Chart component', () => {
+  beforeAll(() => {
+    globalThis.ResizeObserver = class {
+      constructor(callback) {
+        this.callback = callback
+      }
+      observe() {
+        this.callback([{ contentRect: { width: 800, height: 400 } }])
+      }
+      unobserve() {}
+      disconnect() {}
+    }
+  })
+
   it('renders candlestick chart with data', async () => {
     const candlePayload = JSON.stringify([
       {
