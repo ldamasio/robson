@@ -135,6 +135,9 @@ class Command(BaseCommand):
             current_price = get_cached_bid(op.symbol.name)
             self.stdout.write(f"Current price: ${current_price}")
 
+            # Initialize Binance service for placing orders
+            binance = BinanceService()
+
             if dry_run:
                 self.stdout.write(self.style.WARNING(
                     f"DRY RUN: Would place SELL order for {total_qty} {op.symbol.name} at market price ~${current_price}"
