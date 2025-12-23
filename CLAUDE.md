@@ -81,6 +81,88 @@ Types: `feat`, `fix`, `docs`, `style`, `refactor`, `test`, `chore`
 
 ---
 
+## **CRITICAL: Semantic Clarity - Strategy & Robson's Intelligence**
+
+### Robson is a Risk Management Assistant, NOT an Auto-Trader
+
+**Core Principle**: USER initiates → ROBSON calculates → USER confirms
+
+**What Robson IS**:
+- ✅ Position sizing calculator (1% risk rule)
+- ✅ Risk limit validator (drawdown, exposure)
+- ✅ Stop-loss monitor (24/7 automation for safety)
+- ✅ Performance tracker (analytics by strategy)
+
+**What Robson is NOT**:
+- ❌ Autonomous trading system
+- ❌ Signal generator (user decides when to trade)
+- ❌ Auto-trader (no trades without user confirmation)
+
+### Strategy = User's Choice
+
+**Definition**: Strategy is the **trading approach selected by the USER**.
+
+Examples: "Mean Reversion MA99", "Breakout Consolidation", "Manual Analysis"
+
+**NOT**: System-generated trading algorithm
+
+**Database Model**:
+```python
+class Strategy:
+    name: str           # User-chosen name
+    description: str    # User's documented plan
+    config: dict        # Reference settings (NOT automation logic)
+    risk_config: dict   # Risk parameters
+```
+
+### Robson's Primary Intelligence: Position Sizing
+
+**The 1% Risk Rule**:
+```python
+Capital: $1,000
+Entry: $90,000
+Stop: $88,200 (2% stop)
+
+Risk Amount = $1,000 × 0.01 = $10
+Stop Distance = $90,000 - $88,200 = $1,800
+Quantity = $10 / $1,800 = 0.00555556 BTC
+
+If stopped: Loss = 0.00555556 × $1,800 = $10 = 1% ✓
+```
+
+**Service**: `api/services/position_sizing.py`
+
+### User-Initiated Flow
+
+1. **User provides intent**:
+   - Symbol, side (BUY/SELL)
+   - Entry price, stop price
+   - Strategy choice (from dropdown)
+
+2. **Robson calculates** (THE INTELLIGENCE):
+   - Optimal position size (1% risk)
+   - Validates exposure limits
+   - Checks monthly drawdown
+
+3. **User reviews**:
+   - Sees calculated quantity
+   - Reviews risk amount
+   - Confirms or cancels
+
+4. **Robson executes** (if confirmed):
+   - Places order on exchange
+   - Activates stop monitor
+   - Records audit trail
+
+**CLI Command**: `python manage.py create_user_operation`
+**API Endpoints**:
+- `POST /api/operations/calculate-size/` (preview)
+- `POST /api/operations/create/` (create & execute)
+
+See: **ADR-0007**, **STRATEGY-SEMANTIC-CLARITY.md**
+
+---
+
 ## Project Structure
 
 ```
