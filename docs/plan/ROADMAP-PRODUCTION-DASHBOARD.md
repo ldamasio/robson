@@ -99,18 +99,18 @@
 **Goal**: Give user ability to monitor live position
 
 **CLI:**
-- [ ] `robson positions` - List open positions with P&L
-- [ ] `robson price <symbol>` - Get current market price
-- [ ] `robson account` - View balance and exposure
+- [x] `robson positions` - List open positions with P&L
+- [x] `robson price <symbol>` - Get current market price
+- [x] `robson account` - View balance and exposure
 
 **Frontend:**
-- [ ] Complete Position component (entry, current, P&L)
-- [ ] Real-time price display with formatting
-- [ ] Basic chart (candlestick 15min, last 100 candles)
+- [x] Complete Position component (entry, current, P&L)
+- [x] Real-time price display with formatting
+- [x] Basic chart (candlestick 15min, last 100 candles)
 
 **Backend:**
-- [ ] `GET /api/operations/active/` - Active operations
-- [ ] `GET /api/market/price/<symbol>/` - Current price
+- [x] `GET /api/portfolio/positions/` - Active operations
+- [x] `GET /api/market/price/<symbol>/` - Current price
 - [ ] `GET /api/portfolio/summary/` - Portfolio overview
 
 **Outcome**: Trader can see what they own and current status
