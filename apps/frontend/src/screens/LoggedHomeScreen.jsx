@@ -17,6 +17,9 @@ import Chart from '../components/logged/Chart'
 import Dataframe from '../components/logged/Dataframe'
 import AuthContext from '../context/AuthContext'
 import ErrorBoundary from '../components/common/ErrorBoundary'
+import EmotionalGuard from '../components/logged/EmotionalGuard'
+import MarginPositionCalculator from '../components/logged/MarginPositionCalculator'
+import MarginPositions from '../components/logged/MarginPositions'
 
 const LoggedHomeScreen = () => {
   return (
@@ -66,8 +69,24 @@ const LoggedHomeScreen = () => {
               <h1>BTC USDT Last Week Dataframe</h1>
               <Dataframe />
             </Tab>
-            <Tab eventKey="3" title="Operations">
-              Conteudo 3
+            <Tab eventKey="3" title="🛡️ Emotional Guard">
+              <div className="py-4">
+                <ErrorBoundary>
+                  <EmotionalGuard />
+                </ErrorBoundary>
+              </div>
+            </Tab>
+            <Tab eventKey="4" title="📊 Margin Trading">
+              <div className="py-4">
+                <ErrorBoundary>
+                  <MarginPositionCalculator />
+                </ErrorBoundary>
+                <div className="mt-4">
+                  <ErrorBoundary>
+                    <MarginPositions />
+                  </ErrorBoundary>
+                </div>
+              </div>
             </Tab>
           </Tabs>
         </Container>
