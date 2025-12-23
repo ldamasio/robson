@@ -586,11 +586,11 @@ robson positions
 ## Success Criteria
 
 ### Functionality
-- [ ] CLI: `robson positions` shows Operation #1 with accurate P&L
-- [ ] CLI: `robson price BTCUSDC` returns current price in <1s
-- [ ] Frontend: Position component displays and updates every 5s
-- [ ] Frontend: Price updates every 1s
-- [ ] Frontend: Chart shows 15min candles with entry/stop/target
+- [x] CLI: `robson positions` shows Operation #1 with accurate P&L
+- [x] CLI: `robson price BTCUSDC` returns current price in <1s
+- [x] Frontend: Position component displays and updates every 5s
+- [x] Frontend: Price updates every 1s
+- [x] Frontend: Chart shows 15min candles with entry/stop/target
 
 ### Performance
 - [ ] API response time <500ms (p95)
