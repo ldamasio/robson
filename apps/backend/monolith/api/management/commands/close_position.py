@@ -170,11 +170,11 @@ class Command(BaseCommand):
                 self.stdout.write(f"Created exit order #{exit_order.id}")
 
                 # Execute order on Binance
-                result = binance.place_order(
+                result = binance.client.create_order(
                     symbol=op.symbol.name,
                     side='SELL',
-                    order_type='MARKET',
-                    quantity=float(total_qty)
+                    type='MARKET',
+                    quantity=str(total_qty)
                 )
 
                 # Update order with results
