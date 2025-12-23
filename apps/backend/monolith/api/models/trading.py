@@ -441,3 +441,168 @@ class Trade(BaseModel):
                 gross = (self.entry_price - self.exit_price) * self.quantity
             self.pnl = gross - self.total_fees
         super().save(*args, **kwargs)
+
+
+class TradingIntent(BaseModel):
+    """
+    Systematic trading intent - records what the algorithm decided to do.
+
+    This is the audit trail for systematic trading decisions, separate from
+    user-initiated operations. Captures the full context of WHY a decision
+    was made, including market regime, confidence, and risk calculations.
+
+    Status flow: PENDING → VALIDATED → EXECUTING → EXECUTED (or FAILED/CANCELLED)
+    """
+
+    SIDE_CHOICES = [("BUY", "Buy"), ("SELL", "Sell")]
+    STATUS_CHOICES = [
+        ("PENDING", "Pending"),
+        ("VALIDATED", "Validated"),
+        ("EXECUTING", "Executing"),
+        ("EXECUTED", "Executed"),
+        ("FAILED", "Failed"),
+        ("CANCELLED", "Cancelled"),
+    ]
+
+    # Unique identifier for this intent
+    intent_id = models.CharField(max_length=255, unique=True, db_index=True)
+
+    # Trading parameters
+    symbol = models.ForeignKey(Symbol, on_delete=models.CASCADE)
+    strategy = models.ForeignKey(Strategy, on_delete=models.CASCADE)
+    side = models.CharField(max_length=10, choices=SIDE_CHOICES)
+    status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="PENDING", db_index=True)
+
+    # Quantities and prices
+    quantity = models.DecimalField(max_digits=20, decimal_places=8)
+    entry_price = models.DecimalField(max_digits=20, decimal_places=8)
+    stop_price = models.DecimalField(max_digits=20, decimal_places=8)
+    target_price = models.DecimalField(max_digits=20, decimal_places=8, null=True, blank=True)
+
+    # Decision context (WHY this intent was created)
+    regime = models.CharField(max_length=50, help_text="Market regime: bull, bear, sideways")
+    confidence = models.FloatField(help_text="Confidence level 0.0 to 1.0")
+    reason = models.TextField(help_text="Human-readable explanation of decision")
+
+    # Timestamps
+    validated_at = models.DateTimeField(null=True, blank=True)
+    executed_at = models.DateTimeField(null=True, blank=True)
+
+    # Execution results
+    order = models.ForeignKey(Order, null=True, blank=True, on_delete=models.SET_NULL, related_name="intents")
+    exchange_order_id = models.CharField(max_length=100, blank=True, null=True)
+    actual_fill_price = models.DecimalField(max_digits=20, decimal_places=8, null=True, blank=True)
+    actual_fill_quantity = models.DecimalField(max_digits=20, decimal_places=8, null=True, blank=True)
+
+    # Risk calculations
+    risk_amount = models.DecimalField(max_digits=20, decimal_places=8, default=Decimal("0"))
+    risk_percent = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal("0"))
+
+    # Event correlation (for distributed tracing)
+    correlation_id = models.CharField(max_length=255, blank=True, null=True, db_index=True)
+
+    # Error tracking
+    error_message = models.TextField(blank=True, null=True)
+
+    class Meta:
+        ordering = ["-created_at"]
+        verbose_name = "Trading Intent"
+        verbose_name_plural = "Trading Intents"
+        indexes = [
+            models.Index(fields=["client", "status", "created_at"]),
+            models.Index(fields=["symbol", "created_at"]),
+            models.Index(fields=["strategy", "created_at"]),
+        ]
+
+    def __str__(self):
+        return f"Intent {self.intent_id}: {self.side} {self.quantity} {self.symbol.name} ({self.status})"
+
+    # Computed properties
+    @property
+    def is_pending(self) -> bool:
+        return self.status == "PENDING"
+
+    @property
+    def is_executed(self) -> bool:
+        return self.status == "EXECUTED"
+
+    @property
+    def is_failed(self) -> bool:
+        return self.status in {"FAILED", "CANCELLED"}
+
+    @property
+    def position_value(self) -> Decimal:
+        """Total value of position (entry_price * quantity)."""
+        return self.entry_price * self.quantity
+
+    @property
+    def stop_distance(self) -> Decimal:
+        """Distance from entry to stop (always positive)."""
+        return abs(self.entry_price - self.stop_price)
+
+    @property
+    def stop_distance_percent(self) -> Decimal:
+        """Stop distance as % of entry price."""
+        if self.entry_price == 0:
+            return Decimal("0")
+        return (self.stop_distance / self.entry_price) * Decimal("100")
+
+    # State transitions
+    def mark_as_validated(self):
+        """Mark intent as validated."""
+        self.status = "VALIDATED"
+        self.validated_at = timezone.now()
+        self.save(update_fields=["status", "validated_at", "updated_at"])
+
+    def mark_as_executing(self):
+        """Mark intent as executing."""
+        self.status = "EXECUTING"
+        self.save(update_fields=["status", "updated_at"])
+
+    def mark_as_executed(self, order: Order, fill_price: Decimal, fill_quantity: Decimal):
+        """Mark intent as successfully executed."""
+        self.status = "EXECUTED"
+        self.executed_at = timezone.now()
+        self.order = order
+        self.exchange_order_id = order.binance_order_id
+        self.actual_fill_price = fill_price
+        self.actual_fill_quantity = fill_quantity
+        self.save(update_fields=[
+            "status",
+            "executed_at",
+            "order",
+            "exchange_order_id",
+            "actual_fill_price",
+            "actual_fill_quantity",
+            "updated_at",
+        ])
+
+    def mark_as_failed(self, error_message: str):
+        """Mark intent as failed."""
+        self.status = "FAILED"
+        self.error_message = error_message
+        self.save(update_fields=["status", "error_message", "updated_at"])
+
+    def clean(self):
+        """Validate business rules."""
+        super().clean()
+
+        # Validate quantity is positive
+        if self.quantity <= 0:
+            raise ValidationError("Quantity must be positive")
+
+        # Validate prices are positive
+        if self.entry_price <= 0:
+            raise ValidationError("Entry price must be positive")
+        if self.stop_price <= 0:
+            raise ValidationError("Stop price must be positive")
+
+        # Validate stop price direction
+        if self.side == "BUY" and self.stop_price >= self.entry_price:
+            raise ValidationError("Stop price for BUY must be below entry price")
+        if self.side == "SELL" and self.stop_price <= self.entry_price:
+            raise ValidationError("Stop price for SELL must be above entry price")
+
+        # Validate confidence range
+        if not (0.0 <= self.confidence <= 1.0):
+            raise ValidationError("Confidence must be between 0.0 and 1.0")

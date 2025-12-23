@@ -51,6 +51,7 @@ from .trading import (
     Operation,
     Position,
     Trade,
+    TradingIntent,
 )
 
 # Import technical analysis models (refactored)
@@ -137,6 +138,7 @@ from .principles import (
 from .risk import (
     OnePercentOfCapital,
     JustBet4percent,
+    PolicyState,
 )
 
 from .config import (
@@ -176,6 +178,7 @@ __all__ = [
     'Operation',
     'Position',
     'Trade',
+    'TradingIntent',
     
     # Refactored technical analysis
     'TechnicalAnalysisInterpretation',
@@ -246,6 +249,7 @@ __all__ = [
     'Downtrend',
     'OnePercentOfCapital',
     'JustBet4percent',
+    'PolicyState',
     'OnlyTradeReversal',
     'MaxTradePerDay',
     'AlocatedCapitalPercent',
