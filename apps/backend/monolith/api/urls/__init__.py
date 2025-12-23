@@ -59,6 +59,19 @@ except ImportError as e:
     print(f"⚠️  Could not import margin views: {e}")
     MARGIN_VIEWS_AVAILABLE = False
 
+# Import emotional trading guard views
+try:
+    from ..views.emotional_guard import (
+        analyze_intent,
+        list_signals,
+        trading_tips,
+        risk_levels,
+    )
+    EMOTIONAL_GUARD_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️  Could not import emotional guard views: {e}")
+    EMOTIONAL_GUARD_AVAILABLE = False
+
 # Fallback function for missing views
 def fallback_view(request):
     from django.http import JsonResponse
@@ -212,6 +225,21 @@ if MARGIN_VIEWS_AVAILABLE:
     print("✅ Margin views loaded: /api/margin/account/, /api/margin/positions/, etc.")
 else:
     print("⚠️  Margin views not available")
+
+# ==========================================
+# EMOTIONAL TRADING GUARD ROUTES
+# ==========================================
+# Protects traders from emotional decision-making
+if EMOTIONAL_GUARD_AVAILABLE:
+    urlpatterns += [
+        path('guard/analyze/', analyze_intent, name='guard_analyze_intent'),
+        path('guard/signals/', list_signals, name='guard_list_signals'),
+        path('guard/tips/', trading_tips, name='guard_trading_tips'),
+        path('guard/risk-levels/', risk_levels, name='guard_risk_levels'),
+    ]
+    print("✅ Emotional Guard views loaded: /api/guard/analyze/, etc.")
+else:
+    print("⚠️  Emotional Guard views not available")
 
 # Debug info
 print("🎯 URLs loaded following project patterns!")

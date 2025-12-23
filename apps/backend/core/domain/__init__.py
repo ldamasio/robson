@@ -38,6 +38,16 @@ from apps.backend.core.domain.margin import (
     calculate_margin_position_size,
 )
 
+# Emotional Trading Guard domain
+from apps.backend.core.domain.emotional_guard import (
+    SignalType,
+    RiskLevel,
+    EmotionalSignal,
+    ExtractedParameters,
+    IntentAnalysis,
+    calculate_risk_level,
+)
+
 __all__ = [
     # Trading
     "TradingIntent",
@@ -55,4 +65,11 @@ __all__ = [
     "MarginOrderResult",
     "MarginPositionSizingResult",
     "calculate_margin_position_size",
+    # Emotional Guard
+    "SignalType",
+    "RiskLevel",
+    "EmotionalSignal",
+    "ExtractedParameters",
+    "IntentAnalysis",
+    "calculate_risk_level",
 ]
