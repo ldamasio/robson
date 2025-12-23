@@ -571,14 +571,20 @@ REDIS_URL=redis://localhost:6379/1
 
 ### Smoke Tests
 ```bash
-# API
+# API (TESTED 2025-12-23)
 curl -H "Authorization: Bearer $TOKEN" https://api.robson/api/portfolio/positions/
+# ✅ PASSED - Returns active position with correct P&L calculation
 
-# CLI
+curl -H "Authorization: Bearer $TOKEN" https://api.robson/api/market/price/BTCUSDC/
+# ✅ PASSED - Returns current BTC price from Binance with Redis caching
+
+# CLI (NOT TESTED - Build issues on Windows)
 robson positions
+# ⚠️  SKIPPED - Requires gcc for C router compilation
 
-# Frontend
+# Frontend (NOT TESTED - Requires deployment)
 # Login → Dashboard → Verify positions visible
+# ⚠️  PENDING - Frontend integration not tested yet
 ```
 
 ---
