@@ -15,6 +15,7 @@ import json
 from api.models import Operation, Order, Strategy, Symbol
 from clients.models import Client
 from api.services.binance_service import BinanceService
+from api.services.market_price_cache import get_cached_bid
 
 
 class Command(BaseCommand):
@@ -131,8 +132,7 @@ class Command(BaseCommand):
             self.stdout.write(f"Position to close: {total_qty} {op.symbol.name}")
 
             # Get current price
-            binance = BinanceService()
-            current_price = binance.get_symbol_price(op.symbol.name)
+            current_price = get_cached_bid(op.symbol.name)
             self.stdout.write(f"Current price: ${current_price}")
 
             if dry_run:
