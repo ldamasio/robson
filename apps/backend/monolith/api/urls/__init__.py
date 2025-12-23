@@ -133,10 +133,19 @@ urlpatterns = [
     # ==========================================
     # PORTFOLIO & ANALYTICS ROUTES
     # ==========================================
-    path('portfolio/patrimony/', 
-         getattr(old_views, 'Patrimony', fallback_view) if OLD_VIEWS_AVAILABLE else fallback_view, 
+    path('portfolio/patrimony/',
+         getattr(old_views, 'Patrimony', fallback_view) if OLD_VIEWS_AVAILABLE else fallback_view,
          name='patrimony'),
     path('portfolio/positions/', active_positions, name='portfolio_positions'),
+
+    # ==========================================
+    # ANALYTICS ROUTES (NEW)
+    # ==========================================
+    # User operations endpoints (user-initiated trading)
+    path('', include('api.urls.user_operations')),
+
+    # Analytics endpoints (performance tracking)
+    path('', include('api.urls.analytics')),
 ]
 
 # ==========================================
