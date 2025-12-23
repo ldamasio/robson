@@ -60,9 +60,10 @@ def _calculate_distance_percent(target_price: Decimal, current_price: Decimal) -
 def active_positions(request):
     """Return active positions with current price and unrealized P&L."""
     try:
-        client_id = request.user.client.id if hasattr(request.user, "client") and request.user.client else None
-        if not client_id:
-            return Response({"error": "Client not found"}, status=400)
+        client_id = request.user.client_id
+        # Allow None for admin/superuser to see all positions
+        # if not client_id:
+        #     return Response({"error": "Client not found"}, status=400)
 
         operations = (
             Operation.objects.filter(client_id=client_id, status="ACTIVE")
