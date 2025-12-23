@@ -15,7 +15,7 @@ All ports use Protocol (PEP 544) for structural subtyping.
 from typing import Protocol, Any, Callable, Optional
 from decimal import Decimal
 from datetime import datetime
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 
 # ============================================================================
@@ -35,53 +35,49 @@ class DomainEvent:
     timestamp: datetime
     aggregate_id: str  # ID of the entity that generated this event
     correlation_id: Optional[str] = None  # For tracing related events
-    metadata: dict[str, Any] = None
-
-    def __post_init__(self):
-        if self.metadata is None:
-            object.__setattr__(self, 'metadata', {})
+    metadata: dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass(frozen=True)
 class IntentCreatedEvent(DomainEvent):
     """Event: Trading intent was created by decision engine."""
-    intent_id: str
-    client_id: int
-    symbol: str
-    side: str
-    strategy_name: str
-    reason: str  # Why this intent was created
+    intent_id: str = ""
+    client_id: int = 0
+    symbol: str = ""
+    side: str = ""
+    strategy_name: str = ""
+    reason: str = ""  # Why this intent was created
 
 
 @dataclass(frozen=True)
 class OrderPlacedEvent(DomainEvent):
     """Event: Order was placed on exchange."""
-    order_id: str
-    intent_id: Optional[str]
-    client_id: int
-    symbol: str
-    side: str
-    quantity: Decimal
-    price: Optional[Decimal]
-    exchange_order_id: str
+    order_id: str = ""
+    intent_id: Optional[str] = None
+    client_id: int = 0
+    symbol: str = ""
+    side: str = ""
+    quantity: Decimal = Decimal("0")
+    price: Optional[Decimal] = None
+    exchange_order_id: str = ""
 
 
 @dataclass(frozen=True)
 class OrderFilledEvent(DomainEvent):
     """Event: Order was filled on exchange."""
-    order_id: str
-    exchange_order_id: str
-    filled_quantity: Decimal
-    avg_fill_price: Decimal
+    order_id: str = ""
+    exchange_order_id: str = ""
+    filled_quantity: Decimal = Decimal("0")
+    avg_fill_price: Decimal = Decimal("0")
 
 
 @dataclass(frozen=True)
 class PolicyPausedEvent(DomainEvent):
     """Event: Risk policy paused trading (e.g., drawdown limit hit)."""
-    client_id: int
-    reason: str
-    drawdown_percent: Decimal
-    limit_percent: Decimal
+    client_id: int = 0
+    reason: str = ""
+    drawdown_percent: Decimal = Decimal("0")
+    limit_percent: Decimal = Decimal("0")
 
 
 class MessageBusPort(Protocol):

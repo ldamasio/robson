@@ -66,7 +66,6 @@ class TradingIntent:
     quantity: Decimal
     entry_price: Decimal
     stop_price: Decimal
-    target_price: Optional[Decimal] = None
 
     # Decision context (WHY this intent was created)
     strategy_name: str
@@ -76,6 +75,9 @@ class TradingIntent:
 
     # Timestamps
     created_at: datetime
+
+    # Optional fields with defaults
+    target_price: Optional[Decimal] = None
     validated_at: Optional[datetime] = None
     executed_at: Optional[datetime] = None
 
