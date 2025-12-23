@@ -208,6 +208,10 @@ Tag: [a:claude-cli]
 | **Mechanical refactoring** | Autonomous | Any Agent | Claude CLI | `[a:cursor-agent-sonnet]` |
 | **Structural migration** | Autonomous | Claude CLI | - | `[a:claude-cli]` |
 | **Add feature (no spec)** | Interactive → Autonomous | Cursor Chat → Agent | - | `[i:*]` then `[a:*]` |
+| **kubectl operations** | Autonomous | Claude CLI | ⛔ None | `[a:claude-cli]` |
+| **Production deployment** | Autonomous | Claude CLI | ⛔ None | `[a:claude-cli]` |
+| **Smoke tests (cluster)** | Autonomous | Claude CLI | ⛔ None | `[a:claude-cli]` |
+| **SSH remote commands** | Autonomous | Claude CLI | ⛔ None | `[a:claude-cli]` |
 
 ---
 
@@ -262,6 +266,87 @@ Tag: [a:claude-cli]
 │    → AUTONOMOUS (Claude CLI)            │
 └─────────────────────────────────────────┘
 ```
+
+---
+
+## Technical Constraints and Tool Limitations
+
+### SSH and Remote Operations
+
+**Constraint**: Codex and Cursor **cannot handle interactive SSH sessions** that require password input or interactive prompts.
+
+**Why it matters**: Production deployments often require SSH access to Kubernetes clusters, remote servers, or deployment pipelines.
+
+**Decision Rule**:
+```
+Task requires SSH operations (kubectl, remote commands)?
+├─ YES
+│  └─ Tool: Claude Code CLI ONLY
+│     ├─ Reason: Pre-configured key-based SSH auth
+│     ├─ No interactive prompts needed
+│     └─ Can execute: kubectl, scp, ssh commands
+│
+└─ NO
+   └─ Tool: Any (Cursor/Codex/Claude)
+```
+
+**Use Cases Requiring Claude Code CLI**:
+
+| Scenario | Why Claude Code | Why Not Codex/Cursor |
+|----------|----------------|---------------------|
+| **kubectl operations** | SSH key auth to cluster | Cannot prompt for password |
+| **Production deployments** | Remote command execution | No interactive SSH support |
+| **Smoke tests on cluster** | Access pods via kubectl exec | Requires SSH tunnel |
+| **Database migrations (prod)** | SSH to DB server | Cannot handle prompts |
+| **Log inspection (remote)** | kubectl logs via SSH | No SSH capability |
+| **File transfers (scp/rsync)** | Key-based authentication | Cannot input credentials |
+
+**Example Decision Flow**:
+```
+Task: "Deploy backend to production and run smoke tests"
+
+Step 1: Does it need SSH?
+→ YES (kubectl commands to production cluster)
+
+Step 2: Can Codex/Cursor do it?
+→ NO (they lack SSH support)
+
+Step 3: Use Claude Code CLI
+→ Tag: [a:claude-cli]
+→ Reason: SSH key auth pre-configured
+```
+
+**Anti-Pattern to Avoid**:
+```
+❌ WRONG: Using Codex Agent for production deployment
+Symptom: "Cannot connect to cluster" or "Password required"
+Cause: Codex cannot execute interactive SSH
+
+✅ CORRECT: Use Claude Code CLI for all SSH operations
+Result: Commands execute seamlessly with key-based auth
+```
+
+**Local vs Remote Operations**:
+```
+┌─────────────────────────────────────────────────┐
+│ TOOL SELECTION BY OPERATION TYPE                │
+├─────────────────────────────────────────────────┤
+│ Local development (no SSH)                      │
+│    → Codex/Cursor/Claude (any works)            │
+│                                                  │
+│ Remote operations (requires SSH)                │
+│    → Claude Code CLI ONLY                       │
+│                                                  │
+│ Hybrid (local code + remote verify)             │
+│    1. Code: Codex/Cursor                        │
+│    2. Deploy/verify: Claude Code CLI            │
+└─────────────────────────────────────────────────┘
+```
+
+**Quick Decision**:
+- Task needs `kubectl`, `ssh`, `scp`? → **Claude Code CLI**
+- Task is code-only? → **Codex/Cursor/Claude (your choice)**
+- Task is discussion/exploration? → **Codex/Cursor Chat**
 
 ---
 
