@@ -247,7 +247,8 @@ class Command(BaseCommand):
                     strategy.total_trades += 1
                     if realized_pnl > 0:
                         strategy.winning_trades += 1
-                    strategy.total_pnl += realized_pnl
+                    # Quantize to 8 decimal places to match database constraint
+                    strategy.total_pnl += realized_pnl.quantize(Decimal('0.00000001'))
                     strategy.save()
 
                     self.stdout.write(f"\n✅ Updated strategy performance:")
