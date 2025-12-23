@@ -41,6 +41,24 @@ except ImportError as e:
     print(f"⚠️  Could not import trading views: {e}")
     TRADING_VIEWS_AVAILABLE = False
 
+# Import margin trading views
+try:
+    from ..views.margin_views import (
+        margin_account,
+        transfer_to_margin,
+        transfer_from_margin,
+        calculate_position_size as margin_position_size,
+        open_position,
+        close_position,
+        list_positions,
+        get_position,
+        monitor_margins,
+    )
+    MARGIN_VIEWS_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️  Could not import margin views: {e}")
+    MARGIN_VIEWS_AVAILABLE = False
+
 # Fallback function for missing views
 def fallback_view(request):
     from django.http import JsonResponse
@@ -166,6 +184,35 @@ if TRADING_VIEWS_AVAILABLE:
 else:
     print("⚠️  Trading views not available")
 
+# ==========================================
+# MARGIN TRADING ROUTES (ISOLATED MARGIN!)
+# ==========================================
+# These endpoints handle isolated margin trading operations
+if MARGIN_VIEWS_AVAILABLE:
+    urlpatterns += [
+        # Account status
+        path('margin/account/<str:symbol>/', margin_account, name='margin_account'),
+        
+        # Transfers
+        path('margin/transfer/to/', transfer_to_margin, name='transfer_to_margin'),
+        path('margin/transfer/from/', transfer_from_margin, name='transfer_from_margin'),
+        
+        # Position sizing
+        path('margin/position/calculate/', margin_position_size, name='margin_position_size'),
+        
+        # Position management
+        path('margin/position/open/', open_position, name='margin_open_position'),
+        path('margin/position/<str:position_id>/close/', close_position, name='margin_close_position'),
+        path('margin/positions/', list_positions, name='margin_positions_list'),
+        path('margin/positions/<str:position_id>/', get_position, name='margin_position_detail'),
+        
+        # Monitoring
+        path('margin/monitor/', monitor_margins, name='margin_monitor'),
+    ]
+    print("✅ Margin views loaded: /api/margin/account/, /api/margin/positions/, etc.")
+else:
+    print("⚠️  Margin views not available")
+
 # Debug info
 print("🎯 URLs loaded following project patterns!")
 print("📁 Using organized views: strategy_views.py, market_views.py")
@@ -174,6 +221,7 @@ print("   - POST /api/token/ (JWT login)")
 print("   - GET /api/strategies/ (using strategy_views.py)")
 print("   - GET /api/ping/ (using market_views.py)")
 print("   - GET /api/historical-data/ (using market_views.py)")
+print("   - GET /api/margin/positions/ (using margin_views.py)")
 
 # Working URL structure following project patterns:
 """

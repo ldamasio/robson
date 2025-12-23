@@ -151,6 +151,12 @@ from .reports import (
     AlocatedCapitalPercent,
 )
 
+# Margin Trading
+from .margin import (
+    MarginPosition,
+    MarginTransfer,
+)
+
 # ==========================================
 # LIST OF ALL AVAILABLE MODELS
 # ==========================================
@@ -253,6 +259,10 @@ __all__ = [
     'OnlyTradeReversal',
     'MaxTradePerDay',
     'AlocatedCapitalPercent',
+    
+    # Margin Trading
+    'MarginPosition',
+    'MarginTransfer',
 ]
 
 # ==========================================
