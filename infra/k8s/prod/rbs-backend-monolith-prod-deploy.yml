@@ -75,6 +75,8 @@ spec:
             secretKeyRef:
               name: rbs-django-secret
               key: POSTGRES_PORT
+        - name: REDIS_URL
+          value: "redis://redis-service:6379/1"
         # Trading configuration - set to False for production trading
         - name: BINANCE_USE_TESTNET
           value: "False"
