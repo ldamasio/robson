@@ -8,6 +8,11 @@ const rootDir = dirname(fileURLToPath(import.meta.url));
 export default defineConfig(() => {
   return {
     root: rootDir,
+    resolve: {
+      alias: {
+        'react-dom/test-utils': 'react',
+      },
+    },
     build: {
       outDir: 'build',
     },
