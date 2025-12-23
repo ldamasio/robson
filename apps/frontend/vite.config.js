@@ -18,6 +18,9 @@ export default defineConfig(() => {
     },
     test: {
       environment: 'jsdom',
+      deps: {
+        inline: ['@testing-library/react'],
+      },
     },
     plugins: [react()],
   };
