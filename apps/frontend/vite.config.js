@@ -1,7 +1,7 @@
 import { defineConfig } from 'vite';
 import react from '@vitejs/plugin-react';
 import { fileURLToPath } from 'url';
-import { dirname } from 'path';
+import { dirname, resolve as pathResolve } from 'path';
 
 const rootDir = dirname(fileURLToPath(import.meta.url));
 
@@ -10,7 +10,16 @@ export default defineConfig(() => {
     root: rootDir,
     resolve: {
       alias: {
-        'react-dom/test-utils': 'react',
+        'react-dom/test-utils': pathResolve(
+          rootDir,
+          'tests',
+          'react-dom-test-utils.js',
+        ),
+      },
+    },
+    server: {
+      deps: {
+        inline: ['@testing-library/react'],
       },
     },
     build: {
@@ -18,9 +27,6 @@ export default defineConfig(() => {
     },
     test: {
       environment: 'jsdom',
-      deps: {
-        inline: ['@testing-library/react'],
-      },
     },
     plugins: [react()],
   };
