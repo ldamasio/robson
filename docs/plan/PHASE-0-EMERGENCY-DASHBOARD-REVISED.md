@@ -558,9 +558,9 @@ REDIS_URL=redis://localhost:6379/1
 ```
 
 ### Configuration Files
-- [ ] Update `backend/settings.py` with `CACHES` config
-- [ ] Update `.env.example` with `REDIS_URL`
-- [ ] Add Redis service to `docker-compose.yml` (dev)
+- [x] Update `apps/backend/monolith/backend/settings.py` with `CACHES` config
+- [x] Update `apps/backend/monolith/.env.development.example` with `REDIS_URL`
+- [x] Add Redis service to `apps/backend/monolith/docker-compose.dev.yml` (dev)
 - [ ] Add Redis to K8s manifests (prod)
 
 ### Deployment Order
