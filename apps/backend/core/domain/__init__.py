@@ -15,3 +15,44 @@ CRITICAL RULES:
 If you need Django models, put them in apps/backend/monolith/api/models/
 This layer is for the PURE business domain.
 """
+
+# Trading domain
+from apps.backend.core.domain.trading import (
+    TradingIntent,
+    IntentStatus,
+    PolicyState,
+    PolicyStatus,
+    ExecutionEvent,
+)
+
+# Margin trading domain
+from apps.backend.core.domain.margin import (
+    MarginPosition,
+    MarginPositionStatus,
+    MarginSide,
+    MarginLevel,
+    MarginAccountInfo,
+    TransferResult,
+    MarginOrderResult,
+    MarginPositionSizingResult,
+    calculate_margin_position_size,
+)
+
+__all__ = [
+    # Trading
+    "TradingIntent",
+    "IntentStatus",
+    "PolicyState",
+    "PolicyStatus",
+    "ExecutionEvent",
+    # Margin
+    "MarginPosition",
+    "MarginPositionStatus",
+    "MarginSide",
+    "MarginLevel",
+    "MarginAccountInfo",
+    "TransferResult",
+    "MarginOrderResult",
+    "MarginPositionSizingResult",
+    "calculate_margin_position_size",
+]

@@ -428,3 +428,220 @@ class AuditTrailPort(Protocol):
     def get_history(self, aggregate_id: str) -> list[dict[str, Any]]:
         """Get audit history for entity."""
         ...
+
+
+# ============================================================================
+# Margin Trading Ports
+# ============================================================================
+
+# Import margin domain types for type hints
+# Note: These are imported at runtime to avoid circular imports
+# In actual use, they come from apps.backend.core.domain.margin
+
+
+@dataclass(frozen=True)
+class MarginTransferResult:
+    """Result of a margin transfer operation."""
+    success: bool
+    transaction_id: Optional[str]
+    asset: str
+    amount: Decimal
+    from_account: str
+    to_account: str
+    error_message: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class MarginAccountSnapshot:
+    """Snapshot of Isolated Margin account for a symbol."""
+    symbol: str
+    base_asset: str
+    base_free: Decimal
+    base_locked: Decimal
+    base_borrowed: Decimal
+    quote_asset: str
+    quote_free: Decimal
+    quote_locked: Decimal
+    quote_borrowed: Decimal
+    margin_level: Decimal
+    liquidation_price: Decimal
+    is_margin_trade_enabled: bool
+
+
+@dataclass(frozen=True)
+class MarginOrderExecutionResult:
+    """Result of margin order execution."""
+    success: bool
+    order_id: Optional[str]
+    binance_order_id: Optional[str]
+    symbol: str
+    side: str
+    order_type: str
+    quantity: Decimal
+    price: Optional[Decimal]
+    filled_quantity: Decimal
+    avg_fill_price: Optional[Decimal]
+    status: str
+    error_message: Optional[str] = None
+
+
+class MarginExecutionPort(Protocol):
+    """
+    Port for Isolated Margin trading operations.
+    
+    Implementations:
+    - BinanceMarginAdapter: Real execution on Binance
+    - MockMarginAdapter: Paper trading / testing
+    
+    Key Principle: Isolated Margin means risk is LIMITED to the margin
+    allocated for each specific position. No cross-contamination.
+    """
+    
+    def transfer_to_margin(
+        self,
+        symbol: str,
+        asset: str,
+        amount: Decimal,
+    ) -> MarginTransferResult:
+        """
+        Transfer asset from Spot wallet to Isolated Margin account.
+        
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDC")
+            asset: Asset to transfer (e.g., "USDC")
+            amount: Amount to transfer
+            
+        Returns:
+            MarginTransferResult with success/failure and transaction ID
+        """
+        ...
+    
+    def transfer_from_margin(
+        self,
+        symbol: str,
+        asset: str,
+        amount: Decimal,
+    ) -> MarginTransferResult:
+        """
+        Transfer asset from Isolated Margin account back to Spot wallet.
+        
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDC")
+            asset: Asset to transfer (e.g., "USDC")
+            amount: Amount to transfer
+            
+        Returns:
+            MarginTransferResult with success/failure
+            
+        Note:
+            Will fail if transfer would cause margin call.
+        """
+        ...
+    
+    def get_margin_account(self, symbol: str) -> MarginAccountSnapshot:
+        """
+        Get Isolated Margin account info for a symbol.
+        
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDC")
+            
+        Returns:
+            MarginAccountSnapshot with balances and margin level
+            
+        Raises:
+            ValueError: If symbol not found in margin account
+        """
+        ...
+    
+    def place_margin_order(
+        self,
+        symbol: str,
+        side: str,
+        order_type: str,
+        quantity: Decimal,
+        price: Optional[Decimal] = None,
+        stop_price: Optional[Decimal] = None,
+        side_effect_type: Optional[str] = None,
+    ) -> MarginOrderExecutionResult:
+        """
+        Place an order on Isolated Margin account.
+        
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDC")
+            side: "BUY" or "SELL"
+            order_type: "MARKET", "LIMIT", "STOP_LOSS_LIMIT", "TAKE_PROFIT_LIMIT"
+            quantity: Order quantity in base asset
+            price: Limit price (required for LIMIT and STOP_LOSS_LIMIT)
+            stop_price: Trigger price (required for STOP_LOSS_LIMIT)
+            side_effect_type: "MARGIN_BUY" (auto-borrow) or "AUTO_REPAY" (auto-repay)
+            
+        Returns:
+            MarginOrderExecutionResult with order details or error
+        """
+        ...
+    
+    def cancel_margin_order(
+        self,
+        symbol: str,
+        order_id: str,
+    ) -> bool:
+        """
+        Cancel an open Isolated Margin order.
+        
+        Args:
+            symbol: Trading pair
+            order_id: Binance order ID to cancel
+            
+        Returns:
+            True if cancelled successfully, False otherwise
+        """
+        ...
+    
+    def get_margin_level(self, symbol: str) -> Decimal:
+        """
+        Get current margin level for symbol.
+        
+        Margin Level = Total Asset Value / (Total Borrowed + Total Interest)
+        
+        Returns:
+            Margin level as Decimal:
+            - >= 2.0: SAFE (can open new positions)
+            - >= 1.5: CAUTION
+            - >= 1.3: WARNING
+            - >= 1.1: CRITICAL
+            - < 1.1: DANGER (approaching liquidation)
+        """
+        ...
+    
+    def get_open_margin_orders(self, symbol: str) -> list[dict]:
+        """
+        Get all open margin orders for a symbol.
+        
+        Returns:
+            List of open orders with details
+        """
+        ...
+
+
+class MarginPositionRepository(Protocol):
+    """Repository for margin positions."""
+    
+    def save(self, position: Any) -> Any:
+        """Save or update a margin position."""
+        ...
+    
+    def find_by_id(self, position_id: str) -> Optional[Any]:
+        """Find position by ID."""
+        ...
+    
+    def find_open_by_client(self, client_id: int) -> list[Any]:
+        """Find all open positions for a client."""
+        ...
+    
+    def find_by_symbol(self, client_id: int, symbol: str) -> list[Any]:
+        """Find all positions for a symbol (open and closed)."""
+        ...
+    
+    def find_open_by_symbol(self, client_id: int, symbol: str) -> Optional[Any]:
+        """Find open position for a symbol (only one allowed per symbol)."""
+        ...
