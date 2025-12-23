@@ -1,0 +1,29 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rbs-redis-prod-deploy
+  namespace: robson
+  labels:
+    app: rbs-redis-prod
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: rbs-redis-prod
+  template:
+    metadata:
+      labels:
+        app: rbs-redis-prod
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        ports:
+        - containerPort: 6379
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "500m"
