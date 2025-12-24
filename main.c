@@ -24,8 +24,8 @@ static const char* translate_legacy_flag(const char* arg) {
 	if (strcmp(arg, "--say") == 0) return "say";
 	if (strcmp(arg, "--buy") == 0) return "buy";
 	if (strcmp(arg, "--sell") == 0) return "sell";
-	if (strcmp(arg, "--status") == 0) return "status";
-	if (strcmp(arg, "--positions") == 0) return "positions";
+	if (strcmp(arg, "--margin-status") == 0) return "margin-status";
+	if (strcmp(arg, "--margin-positions") == 0) return "margin-positions";
 	if (strcmp(arg, "--margin-buy") == 0) return "margin-buy";
 	return NULL;
 }

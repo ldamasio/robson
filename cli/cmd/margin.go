@@ -19,10 +19,10 @@ import (
 	"github.com/spf13/cobra"
 )
 
-// statusCmd shows account status
-var statusCmd = &cobra.Command{
-	Use:   "status",
-	Short: "Show account status and positions overview",
+// marginStatusCmd shows account status via Django
+var marginStatusCmd = &cobra.Command{
+	Use:   "margin-status",
+	Short: "Show margin account status and positions overview",
 	Long: `Display a comprehensive overview of your Robson trading account.
 
 Shows:
@@ -45,10 +45,10 @@ Examples:
 	},
 }
 
-// positionsCmd shows detailed positions
-var positionsCmd = &cobra.Command{
-	Use:   "positions",
-	Short: "Show detailed margin positions",
+// marginPositionsCmd shows detailed margin positions via Django
+var marginPositionsCmd = &cobra.Command{
+	Use:   "margin-positions",
+	Short: "Show detailed isolated margin positions",
 	Long: `Display detailed information about your margin positions.
 
 Shows for each position:
@@ -119,15 +119,15 @@ Examples:
 }
 
 func init() {
-	// Status command flags
-	statusCmd.Flags().Int("client-id", 1, "Client ID (tenant)")
-	statusCmd.Flags().Bool("detailed", false, "Show detailed position information")
+	// Margin-status command flags
+	marginStatusCmd.Flags().Int("client-id", 1, "Client ID (tenant)")
+	marginStatusCmd.Flags().Bool("detailed", false, "Show detailed position information")
 
-	// Positions command flags
-	positionsCmd.Flags().Int("client-id", 1, "Client ID (tenant)")
-	positionsCmd.Flags().Bool("live", false, "Fetch real-time prices from Binance")
-	positionsCmd.Flags().Bool("all", false, "Include closed positions")
-	positionsCmd.Flags().String("symbol", "", "Filter by symbol (e.g., BTCUSDC)")
+	// Margin-positions command flags
+	marginPositionsCmd.Flags().Int("client-id", 1, "Client ID (tenant)")
+	marginPositionsCmd.Flags().Bool("live", false, "Fetch real-time prices from Binance")
+	marginPositionsCmd.Flags().Bool("all", false, "Include closed positions")
+	marginPositionsCmd.Flags().String("symbol", "", "Filter by symbol (e.g., BTCUSDC)")
 
 	// Margin-buy command flags
 	marginBuyCmd.Flags().String("capital", "", "Capital to use for position (REQUIRED)")
@@ -141,8 +141,8 @@ func init() {
 	marginBuyCmd.MarkFlagRequired("capital")
 
 	// Register commands
-	rootCmd.AddCommand(statusCmd)
-	rootCmd.AddCommand(positionsCmd)
+	rootCmd.AddCommand(marginStatusCmd)
+	rootCmd.AddCommand(marginPositionsCmd)
 	rootCmd.AddCommand(marginBuyCmd)
 }
 
