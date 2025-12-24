@@ -11,7 +11,7 @@ from typing import List, Optional
 
 from django.conf import settings
 
-from apps.backend.core.domain.technical_stop import (
+from api.domain.technical_stop import (
     TechnicalStopCalculator,
     TechnicalStopResult,
     OHLCV,

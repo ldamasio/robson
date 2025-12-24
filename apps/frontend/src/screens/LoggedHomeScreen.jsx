@@ -20,6 +20,7 @@ import ErrorBoundary from '../components/common/ErrorBoundary'
 import EmotionalGuard from '../components/logged/EmotionalGuard'
 import MarginPositionCalculator from '../components/logged/MarginPositionCalculator'
 import MarginPositions from '../components/logged/MarginPositions'
+import PositionsDashboard from '../components/logged/PositionsDashboard'
 
 const LoggedHomeScreen = () => {
   return (
@@ -86,6 +87,13 @@ const LoggedHomeScreen = () => {
                     <MarginPositions />
                   </ErrorBoundary>
                 </div>
+              </div>
+            </Tab>
+            <Tab eventKey="5" title="💼 Portfolio">
+              <div className="py-4">
+                <ErrorBoundary>
+                  <PositionsDashboard />
+                </ErrorBoundary>
               </div>
             </Tab>
           </Tabs>
