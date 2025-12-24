@@ -7,8 +7,8 @@ on:
       - 'v*'  # Trigger on version tags (v0.1.0, v1.0.0, etc.)
 
 permissions:
-  contents: read
-  actions: write  # Required for cache-to: type=gha
+  contents: write  # Required for pushing manifest updates
+  actions: write   # Required for cache-to: type=gha
 
 concurrency:
   group: robson-prod-${{ github.ref }}
@@ -139,6 +139,54 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
+      # ===== GITOPS: UPDATE MANIFESTS =====
+      - name: Update K8s manifests with new image tags
+        run: |
+          SHA_TAG="${{ steps.meta.outputs.sha_tag }}"
+          echo "Updating manifests to use: ${SHA_TAG}"
+          
+          # Update frontend deployment
+          sed -i "s|image: ldamasio/rbs-frontend-prod:sha-[a-f0-9]*|image: ldamasio/rbs-frontend-prod:${SHA_TAG}|g" \
+            infra/k8s/prod/rbs-frontend-prod-deploy.yml
+          
+          # Update backend monolith deployment
+          sed -i "s|image: ldamasio/rbs-backend-monolith-prod:sha-[a-f0-9]*|image: ldamasio/rbs-backend-monolith-prod:${SHA_TAG}|g" \
+            infra/k8s/prod/rbs-backend-monolith-prod-deploy.yml
+          
+          # Update backend nginx deployment
+          sed -i "s|image: ldamasio/rbs-backend-nginx-prod:sha-[a-f0-9]*|image: ldamasio/rbs-backend-nginx-prod:${SHA_TAG}|g" \
+            infra/k8s/prod/rbs-backend-nginx-prod-deploy.yml
+          
+          # Update stop-monitor cronjob (also uses backend image)
+          sed -i "s|image: ldamasio/rbs-backend-monolith-prod:.*|image: ldamasio/rbs-backend-monolith-prod:${SHA_TAG}|g" \
+            infra/k8s/prod/rbs-stop-monitor-cronjob.yml
+          
+          echo "✅ Manifests updated"
+
+      - name: Commit and push manifest changes
+        run: |
+          SHA_TAG="${{ steps.meta.outputs.sha_tag }}"
+          
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          git add infra/k8s/prod/*.yml
+          
+          # Check if there are changes to commit
+          if git diff --staged --quiet; then
+            echo "No manifest changes to commit"
+          else
+            git commit -m "chore(gitops): update image tags to ${SHA_TAG}
+            
+            Automated manifest update by GitHub Actions.
+            ArgoCD will automatically sync this change.
+            
+            [skip ci]"
+            
+            git push
+            echo "✅ Manifests pushed - ArgoCD will auto-sync"
+          fi
+
       - name: Summary
         run: |
           echo "## 🐳 Images Published" >> $GITHUB_STEP_SUMMARY
@@ -149,4 +197,6 @@ jobs:
           echo "| Backend Monolith | \`${{ steps.meta.outputs.sha_tag }}\` | ${{ steps.meta.outputs.is_release == 'true' && format('`{0}`', steps.meta.outputs.version_tag) || '-' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Backend Nginx | \`${{ steps.meta.outputs.sha_tag }}\` | ${{ steps.meta.outputs.is_release == 'true' && format('`{0}`', steps.meta.outputs.version_tag) || '-' }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "> ⚠️ **Production**: Use \`:sha-*\` tags. Update \`infra/k8s/prod/*.yml\` and let ArgoCD sync." >> $GITHUB_STEP_SUMMARY
+          echo "### 🚀 GitOps Status" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Manifests updated to \`${{ steps.meta.outputs.sha_tag }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- ⏳ ArgoCD will auto-sync within 3 minutes" >> $GITHUB_STEP_SUMMARY
