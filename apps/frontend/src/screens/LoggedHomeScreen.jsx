@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useContext } from 'react'
-import { Container, Tab, Tabs } from 'react-bootstrap'
+import { Container, Tab, Tabs, Alert } from 'react-bootstrap'
+import { useLocation } from 'react-router-dom'
 import Header from '../components/common/Header'
 import Footer from '../components/common/Footer'
 import CommandButton from '../components/logged/CommandButton'
@@ -23,11 +24,52 @@ import MarginPositions from '../components/logged/MarginPositions'
 import PositionsDashboard from '../components/logged/PositionsDashboard'
 
 const LoggedHomeScreen = () => {
-  return (
+  const location = useLocation()
+  const { user } = useContext(AuthContext)
+  
+  // Check if we're in demo mode via query parameters
+  const searchParams = new URLSearchParams(location.search)
+  const isDemoMode = searchParams.get('demo') === 'true'
+  const demoModeType = searchParams.get('mode')
+  const demoApiKey = searchParams.get('apiKey')
+  const demoSecretKey = searchParams.get('secretKey')
+  
+  // Demo user data for view-only mode
+   const demoUser = {
+     username: 'demo_user',
+     email: 'demo@robsonbot.com',
+     first_name: 'Demo',
+     last_name: 'User'
+   }
+   
+   // Get current user for display (real user or demo user)
+   const currentUser = isDemoMode ? demoUser : user
+   
+   return (
     <div>
       <Header />
       <main className="py-5">
         <Container>
+          {/* Demo Mode Alerts */}
+          {isDemoMode && (
+            <>
+              {demoModeType === 'viewonly' && (
+                <Alert variant="info" className="mb-4">
+                  <strong>👁️ Modo Demo - Visualização Apenas</strong><br />
+                  Você está no modo de demonstração. Todas as funcionalidades são exibidas 
+                  mas nenhuma operação real será executada.
+                </Alert>
+              )}
+              
+              {demoModeType === 'testnet' && (
+                <Alert variant="warning" className="mb-4">
+                  <strong>🔑 Modo Demo - Testnet com Suas Chaves</strong><br />
+                  Você está usando suas próprias chaves da Binance Testnet. 
+                  Esta demo tem limite de 3 dias. Após esse período, considere assinar o plano Pro.
+                </Alert>
+              )}
+            </>
+          )}
           <p>
             <small>You are running this application in <b>{import.meta.env.NODE_ENV}</b> mode.</small>
             <br />
