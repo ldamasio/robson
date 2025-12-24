@@ -493,6 +493,26 @@ kubectl get application my-app -n argocd -o yaml
 3. **Resource limits** - Always set CPU/memory limits to prevent resource exhaustion
 4. **Image tags** - Prefer SHA-based tags over `latest` for production stability
 
+### Binance API IP Restrictions
+
+The production Binance API key (`RBS_BINANCE_API_KEY_PROD`) is **restricted to cluster IPs only**:
+
+| Node | IP Address | Allowed |
+|------|------------|---------|
+| tiger | 158.220.116.31 | ✅ |
+| bengal | 164.68.96.68 | ✅ |
+| pantera | 149.102.139.33 | ✅ |
+| eagle | 167.86.92.97 | ✅ |
+| Local dev machines | * | ❌ |
+
+⚠️ **Trading commands can ONLY be executed from within the cluster.**
+
+If you get `APIError(code=-2015)`, your IP is not authorized. Execute via:
+```bash
+ssh root@158.220.116.31
+kubectl exec -n robson <backend-pod> -- python manage.py <command>
+```
+
 ---
 
 ## 📞 Support

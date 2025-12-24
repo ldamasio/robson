@@ -270,10 +270,83 @@ python manage.py migrate clients 0002_client_is_active
 
 ## Security Considerations
 
+### API Key IP Restrictions
+
+The production Binance API key is **restricted to Contabo VPS IPs only**:
+
+| Server | IP Address | Role |
+|--------|------------|------|
+| tiger | 158.220.116.31 | K3s Master |
+| bengal | 164.68.96.68 | K3s Agent |
+| pantera | 149.102.139.33 | K3s Agent |
+| eagle | 167.86.92.97 | K3s Agent |
+
+⚠️ **IMPORTANT**: Trading commands can ONLY be executed from within the K8s cluster.
+Local development machines cannot execute real trades (API will return `code=-2015`).
+
+To execute trades in production:
+```bash
+# SSH to master node
+ssh root@158.220.116.31
+
+# Execute command in backend pod
+kubectl exec -n robson <pod-name> -- python manage.py <command>
+```
+
+### Additional Security Measures
+
 1. **Credentials Encryption**: Client credentials are encrypted using Fernet symmetric encryption
 2. **API Key Permissions**: Use Binance API keys with only spot trading permissions (no withdrawals)
 3. **Rate Limiting**: The API has built-in rate limiting (1000 requests/hour for authenticated users)
 4. **Multi-Tenant Isolation**: Each client's trades are isolated by tenant
+5. **IP Whitelist**: Production API keys are restricted to Contabo VPS IPs only
+
+## ⚠️ MANDATORY: Risk Management Rules
+
+### The 1% Rule (NON-NEGOTIABLE)
+
+**No trade may be executed without proper risk management.**
+
+Every order MUST include:
+1. **Stop-Loss Price**: Where the trade is invalidated
+2. **Entry Price**: Planned entry point
+3. **Position Size**: Calculated to risk maximum 1% of capital
+
+### Position Sizing Formula
+
+```
+Risk Amount = Total Capital × 1%
+Stop Distance = |Entry Price - Stop Price|
+Position Size = Risk Amount / Stop Distance
+```
+
+**Example:**
+- Capital: $1,000
+- Risk Amount: $10 (1%)
+- Entry: $100,000
+- Stop: $98,000
+- Stop Distance: $2,000
+- Position Size: $10 / $2,000 = 0.005 BTC
+
+### Monthly Drawdown Limit (4% Rule)
+
+If monthly losses exceed 4% of capital:
+- Trading is automatically PAUSED
+- Review required before resuming
+- PolicyState tracks this in database
+
+### Enforcement
+
+The system BLOCKS orders that:
+- ❌ Have no stop-loss defined
+- ❌ Risk more than 1% of capital
+- ❌ Exceed monthly drawdown limit
+- ❌ Skip the PLAN → VALIDATE → EXECUTE workflow
+
+Use these endpoints for risk-managed trading:
+- `POST /api/margin/position/calculate/` - Calculate safe position size
+- `POST /api/margin/position/open/` - Open with automatic stop-loss
+- `POST /api/guard/analyze/` - Check for emotional trading patterns
 
 ## Troubleshooting
 
