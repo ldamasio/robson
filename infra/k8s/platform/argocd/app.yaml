@@ -14,6 +14,11 @@ spec:
         configs:
           params:
             server.insecure: "true" # behind mesh/gateway; adjust later
+        # GitHub webhook for instant sync (eliminates 3-min polling delay)
+        notifications:
+          secret:
+            items:
+              webhook.github.secret: "iUiLrt+kFZJVIxtLvWpEIQuAunn6DraqC2/1EuojFUk="
         server:
           service:
             type: LoadBalancer

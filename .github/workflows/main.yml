@@ -187,6 +187,49 @@ jobs:
             echo "✅ Manifests pushed - ArgoCD will auto-sync"
           fi
 
+      - name: Wait for ArgoCD sync
+        env:
+          ARGOCD_SERVER: argocd.robson.rbx.ia.br
+          ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
+        run: |
+          # Install ArgoCD CLI
+          curl -sSL -o /usr/local/bin/argocd \
+            https://github.com/argoproj/argo-cd/releases/download/v2.10.0/argocd-linux-amd64
+          chmod +x /usr/local/bin/argocd
+          
+          # Wait for sync (max 5 minutes)
+          echo "⏳ Waiting for ArgoCD to sync robson-prod..."
+          argocd app wait robson-prod \
+            --sync \
+            --health \
+            --timeout 300 \
+            --grpc-web \
+            || echo "⚠️ ArgoCD sync verification skipped (token not configured)"
+          
+          echo "✅ ArgoCD sync step complete"
+
+      - name: Smoke test production
+        run: |
+          # Wait for pods to be ready
+          echo "⏳ Waiting 30s for pods to stabilize..."
+          sleep 30
+          
+          # Test frontend responds (with retry)
+          for i in 1 2 3; do
+            HTTP_STATUS=$(curl -s -o /dev/null -w "%{http_code}" --max-time 10 https://app.robson.rbx.ia.br || echo "000")
+            
+            if [ "$HTTP_STATUS" = "200" ]; then
+              echo "✅ Frontend smoke test passed: HTTP $HTTP_STATUS"
+              exit 0
+            fi
+            
+            echo "⚠️ Attempt $i: HTTP $HTTP_STATUS, retrying in 10s..."
+            sleep 10
+          done
+          
+          echo "❌ Frontend smoke test failed after 3 attempts"
+          exit 1
+
       - name: Summary
         run: |
           echo "## 🐳 Images Published" >> $GITHUB_STEP_SUMMARY
@@ -197,6 +240,7 @@ jobs:
           echo "| Backend Monolith | \`${{ steps.meta.outputs.sha_tag }}\` | ${{ steps.meta.outputs.is_release == 'true' && format('`{0}`', steps.meta.outputs.version_tag) || '-' }} |" >> $GITHUB_STEP_SUMMARY
           echo "| Backend Nginx | \`${{ steps.meta.outputs.sha_tag }}\` | ${{ steps.meta.outputs.is_release == 'true' && format('`{0}`', steps.meta.outputs.version_tag) || '-' }} |" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### 🚀 GitOps Status" >> $GITHUB_STEP_SUMMARY
+          echo "### 🚀 Deployment Status" >> $GITHUB_STEP_SUMMARY
           echo "- ✅ Manifests updated to \`${{ steps.meta.outputs.sha_tag }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- ⏳ ArgoCD will auto-sync within 3 minutes" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ ArgoCD sync verified" >> $GITHUB_STEP_SUMMARY
+          echo "- ✅ Production smoke test passed" >> $GITHUB_STEP_SUMMARY

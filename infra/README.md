@@ -67,6 +67,16 @@ Security & Secrets
 - Use SealedSecrets or SOPS for Kubernetes secrets.
 - Bootstrap sensitive values via Ansible Vault as needed.
 
+GitHub Webhook → ArgoCD (Instant Sync)
+For immediate deployment sync instead of 3-minute polling:
+1. GitHub repo → Settings → Webhooks → Add webhook
+2. Payload URL: `https://argocd.robson.rbx.ia.br/api/webhook`
+3. Content type: `application/json`
+4. Secret: (configured in `infra/k8s/platform/argocd/app.yaml` under `notifications.secret`)
+5. Events: `push`, `pull_request`
+
+The webhook secret is already configured in ArgoCD Helm values. Just add the webhook in GitHub.
+
 Operations & Debugging
 - For hands-on cluster inspection, pod debugging, and log tailing, see [K9S-OPERATIONS.md](K9S-OPERATIONS.md).
 - K9s is a terminal UI for Kubernetes that complements GitOps workflows (read-mostly, debug-only).
