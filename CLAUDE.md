@@ -231,7 +231,9 @@ robson/
 │   ├── cmd/
 │   │   ├── root.go                  # Root command
 │   │   ├── legacy.go                # Legacy commands
-│   │   └── agentic.go               # ⭐ PLAN → VALIDATE → EXECUTE
+│   │   ├── agentic.go               # ⭐ PLAN → VALIDATE → EXECUTE
+│   │   ├── margin.go                # ⭐ Margin trading commands
+│   │   └── monitoring.go            # Portfolio monitoring
 │   └── go.mod                       # Go dependencies
 ├── main.c                           # ⭐ C router (thin wrapper)
 ├── docs/                            # ⭐ Comprehensive docs
@@ -650,6 +652,24 @@ make k9s-preview BRANCH=<branch>     # K9s for preview environment
 kubectl get cronjob -n robson                              # List CronJobs
 kubectl get jobs -n robson -l app=rbs-stop-monitor         # List monitor jobs
 kubectl logs -n robson -l app=rbs-stop-monitor --tail=50   # View monitor logs
+
+# Margin Trading Commands (CLI)
+robson margin-status                 # Account overview (via Django → Binance)
+robson margin-status --detailed      # With position details
+robson margin-positions              # List margin positions
+robson margin-positions --live       # With real-time prices
+robson margin-positions --json       # JSON for automation
+robson margin-buy --capital 100 --stop-percent 2 --leverage 3  # DRY-RUN
+robson margin-buy --capital 100 --stop-percent 2 --leverage 3 --live --confirm  # LIVE
+
+# Django Margin Commands
+python manage.py status              # Account status
+python manage.py status --detailed   # With position details
+python manage.py positions           # List positions
+python manage.py positions --live    # Real-time prices
+python manage.py positions --json    # JSON output
+python manage.py isolated_margin_buy --capital 100 --stop-percent 2 --leverage 3  # DRY-RUN
+python manage.py isolated_margin_buy --capital 100 --leverage 3 --live --confirm  # LIVE
 ```
 
 ---

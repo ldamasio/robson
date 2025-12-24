@@ -120,21 +120,44 @@ robson execute abc123def456
 
 ### Margin Trading Commands
 
-```bash
-# Account status overview
-robson status                      # Quick summary
-robson status --detailed           # With position details
+These commands interact directly with Binance Isolated Margin via Django management commands.
 
-# View positions
-robson positions                   # Open positions
-robson positions --live            # With real-time prices
-robson positions --all             # Include closed positions
-robson positions --json            # JSON output for scripts
+```bash
+# Account status overview (via Django → Binance)
+robson margin-status               # Quick summary
+robson margin-status --detailed    # With position details
+
+# View isolated margin positions (via Django → Binance)
+robson margin-positions            # Open positions
+robson margin-positions --live     # With real-time prices
+robson margin-positions --all      # Include closed positions
+robson margin-positions --json     # JSON output for scripts
 
 # Open leveraged position (Golden Rule enforced)
+# DRY-RUN by default (safe)
 robson margin-buy --capital 100 --stop-percent 2 --leverage 3
+
+# LIVE execution (requires explicit confirmation)
 robson margin-buy --capital 100 --stop-price 85000 --leverage 5 --live --confirm
 ```
+
+#### The Golden Rule
+
+The `margin-buy` command enforces the **Golden Rule** for position sizing:
+
+```
+Position Size = (1% of Capital) / Stop Distance
+```
+
+This ensures that if your stop-loss is hit, you lose at most **1% of your capital**.
+
+#### Margin Command Details
+
+| Command | Description | Django Command |
+|---------|-------------|----------------|
+| `margin-status` | Account balances, equity, open P&L | `python manage.py status` |
+| `margin-positions` | Detailed position cards with risk metrics | `python manage.py positions` |
+| `margin-buy` | Open leveraged LONG with risk management | `python manage.py isolated_margin_buy` |
 
 ### JSON Output (for automation)
 
