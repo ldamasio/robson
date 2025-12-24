@@ -3,6 +3,8 @@ kind: Deployment
 metadata:
   name: rbs-backend-monolith-prod-deploy
   namespace: robson
+  annotations:
+    robson.rbx.ia.br/last-rollout: "2025-12-24T11:15:00Z"
   labels:
     app: rbs-backend-monolith-prod-deploy
 spec:
@@ -17,7 +19,7 @@ spec:
     spec:
       containers:
       - name: rbs-backend-monolith-prod-deploy
-        image: ldamasio/rbs-backend-monolith-prod:sha-e76d40c
+        image: ldamasio/rbs-backend-monolith-prod:sha-2932224
         imagePullPolicy: Always
         env:
         - name: DJANGO_SETTINGS_MODULE

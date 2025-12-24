@@ -3,6 +3,8 @@ kind: Deployment
 metadata:
   name: rbs-frontend-prod-deploy
   namespace: robson
+  annotations:
+    robson.rbx.ia.br/last-rollout: "2025-12-24T11:15:00Z"
 spec:
   selector:
     matchLabels:
@@ -18,7 +20,7 @@ spec:
     spec:
       containers:
         - name: rbs-frontend-prod-deploy
-          image: ldamasio/rbs-frontend-prod:sha-e76d40c
+          image: ldamasio/rbs-frontend-prod:sha-2932224
           imagePullPolicy: Always
           ports:
           - containerPort: 80

@@ -3,6 +3,8 @@ kind: Deployment
 metadata:
   name: rbs-backend-nginx-prod-deploy
   namespace: robson
+  annotations:
+    robson.rbx.ia.br/last-rollout: "2025-12-24T11:15:00Z"
   labels:
     app: rbs-backend-nginx-prod-deploy
 spec:
@@ -18,7 +20,7 @@ spec:
       initContainers:
       containers:
       - name: rbs-backend-nginx-prod-deploy
-        image: ldamasio/rbs-backend-nginx-prod:sha-e76d40c
+        image: ldamasio/rbs-backend-nginx-prod:sha-2932224
         imagePullPolicy: Always
         ports:
         - containerPort: 80
