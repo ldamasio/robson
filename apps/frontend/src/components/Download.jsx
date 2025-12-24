@@ -3,8 +3,8 @@ import { Container, Row, Col, Button } from 'react-bootstrap'
 import { LinkContainer } from 'react-router-bootstrap'
 
 function Download() {
-  return(
-    <footer>
+  return (
+    <section>
       <Container>
         <Row>
           <Col className="text-left py-3" xs={6}>
@@ -19,7 +19,7 @@ function Download() {
           </Col>
         </Row>
       </Container>
-    </footer>
+    </section>
   )
 }
 

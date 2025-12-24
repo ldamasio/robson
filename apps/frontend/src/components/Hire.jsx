@@ -3,8 +3,8 @@ import { Container, Row, Col, Button } from 'react-bootstrap'
 import { LinkContainer } from 'react-router-bootstrap'
 
 function Hire() {
-  return(
-    <footer>
+  return (
+    <section>
       <Container>
         <Row>
           <Col className="text-right py-3" xs={6}>
@@ -19,7 +19,7 @@ function Hire() {
           </Col>
         </Row>
       </Container>
-    </footer>
+    </section>
   )
 }
 

@@ -505,3 +505,4 @@ kubectl get application my-app -n argocd -o yaml
 
 **Last Updated**: 2024-12-21
 
+
