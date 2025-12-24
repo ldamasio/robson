@@ -19,7 +19,7 @@ function MarginPositions() {
   const [monitorData, setMonitorData] = useState(null);
 
   const marginService = new MarginHttp({
-    baseUrl: import.meta.env.VITE_BACKEND_URL || '',
+    baseUrl: import.meta.env.VITE_API_BASE_URL || '',
     getAuthToken: () => authTokens?.access,
   });
 

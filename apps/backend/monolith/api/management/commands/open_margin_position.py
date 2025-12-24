@@ -22,7 +22,36 @@ from django.core.management.base import BaseCommand
 
 from api.application.margin_adapters import BinanceMarginAdapter, MockMarginAdapter
 from api.application.adapters import LoggingEventBus, RealClock
-from apps.backend.core.domain.margin import calculate_margin_position_size
+
+
+def calculate_margin_position_size(
+    capital,
+    entry_price,
+    stop_price,
+    max_risk_percent=1.0,
+):
+    """
+    Calculate position size for margin trading using the Golden Rule.
+    
+    Position Size = (Risk Amount) / (Stop Distance)
+    
+    Where:
+    - Risk Amount = Capital × (max_risk_percent / 100)
+    - Stop Distance = |Entry Price - Stop Price|
+    """
+    capital = Decimal(str(capital))
+    entry_price = Decimal(str(entry_price))
+    stop_price = Decimal(str(stop_price))
+    max_risk_percent = Decimal(str(max_risk_percent))
+    
+    risk_amount = capital * (max_risk_percent / Decimal('100'))
+    stop_distance = abs(entry_price - stop_price)
+    
+    if stop_distance == 0:
+        return Decimal('0')
+    
+    quantity = risk_amount / stop_distance
+    return quantity
 
 
 class SimpleAuditTrail:

@@ -14,11 +14,146 @@ from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated, AllowAny
 from rest_framework.response import Response
 from rest_framework import status
-
-from apps.backend.core.application.emotional_guard_use_case import AnalyzeIntentUseCase
-from apps.backend.core.domain.emotional_guard import SignalType, RiskLevel
-
+from enum import Enum
 import random
+import re
+
+
+# ============================================================================
+# Local Domain Entities (to avoid container import path issues)
+# ============================================================================
+
+class SignalType(Enum):
+    """Types of emotional signals detected in trading messages."""
+    URGENCY = "urgency"
+    NOW_OR_NEVER = "now_or_never"
+    FOMO = "fomo"
+    ABSOLUTE_CERTAINTY = "absolute_certainty"
+    GUARANTEED_WIN = "guaranteed_win"
+    NO_STOP_LOSS = "no_stop_loss"
+    ALL_IN = "all_in"
+    EXCESSIVE_LEVERAGE = "excessive_leverage"
+    REVENGE_TRADING = "revenge_trading"
+    RECOVER_LOSSES = "recover_losses"
+    HAS_STOP_LOSS = "has_stop_loss"
+    HAS_ENTRY_PLAN = "has_entry_plan"
+    HAS_TARGET = "has_target"
+    RISK_DEFINED = "risk_defined"
+
+
+class RiskLevel(Enum):
+    """Risk level classification for trading intentions."""
+    LOW = "low"
+    MEDIUM = "medium"
+    HIGH = "high"
+    CRITICAL = "critical"
+
+
+class AnalyzeIntentUseCase:
+    """
+    Simplified local implementation of intent analysis.
+    Detects emotional patterns in trading messages.
+    """
+    
+    # Patterns that indicate urgency/FOMO
+    URGENCY_PATTERNS = [
+        r'\bagora\b', r'\brapido\b', r'\burgente\b', r'\bimediato\b',
+        r'\bnow\b', r'\bquick\b', r'\bhurry\b', r'\bfast\b', r'\bimmediately\b',
+    ]
+    
+    # Patterns that indicate overconfidence
+    CERTAINTY_PATTERNS = [
+        r'\bcom certeza\b', r'\b100%\b', r'\bgarantido\b', r'\bsempre\b',
+        r'\bcertain\b', r'\bguaranteed\b', r'\balways\b', r'\bdefinitely\b',
+    ]
+    
+    # Patterns that indicate risk blindness
+    RISK_PATTERNS = [
+        r'\bsem stop\b', r'\ball in\b', r'\btudo\b', r'\bmaximo\b',
+        r'\bno stop\b', r'\bmax leverage\b', r'\byolo\b',
+    ]
+    
+    # Patterns that indicate good habits
+    GOOD_PATTERNS = [
+        r'\bstop[ -]?loss\b', r'\brisk\b', r'\btarget\b', r'\bentry\b',
+        r'\bgestao de risco\b', r'\banalise\b',
+    ]
+    
+    def execute(self, message: str) -> dict:
+        """Analyze a trading message for emotional patterns."""
+        message_lower = message.lower()
+        
+        signals = []
+        risk_score = 0
+        
+        # Check urgency patterns
+        for pattern in self.URGENCY_PATTERNS:
+            if re.search(pattern, message_lower, re.IGNORECASE):
+                signals.append({
+                    'type': SignalType.URGENCY.value,
+                    'confidence': 0.8,
+                    'is_positive': False,
+                })
+                risk_score += 20
+                break
+        
+        # Check certainty patterns
+        for pattern in self.CERTAINTY_PATTERNS:
+            if re.search(pattern, message_lower, re.IGNORECASE):
+                signals.append({
+                    'type': SignalType.ABSOLUTE_CERTAINTY.value,
+                    'confidence': 0.7,
+                    'is_positive': False,
+                })
+                risk_score += 15
+                break
+        
+        # Check risk patterns
+        for pattern in self.RISK_PATTERNS:
+            if re.search(pattern, message_lower, re.IGNORECASE):
+                signals.append({
+                    'type': SignalType.ALL_IN.value,
+                    'confidence': 0.9,
+                    'is_positive': False,
+                })
+                risk_score += 30
+                break
+        
+        # Check good patterns (reduce risk)
+        for pattern in self.GOOD_PATTERNS:
+            if re.search(pattern, message_lower, re.IGNORECASE):
+                signals.append({
+                    'type': SignalType.HAS_STOP_LOSS.value,
+                    'confidence': 0.7,
+                    'is_positive': True,
+                })
+                risk_score -= 10
+        
+        # Determine risk level
+        if risk_score >= 40:
+            risk_level = RiskLevel.CRITICAL
+        elif risk_score >= 25:
+            risk_level = RiskLevel.HIGH
+        elif risk_score >= 10:
+            risk_level = RiskLevel.MEDIUM
+        else:
+            risk_level = RiskLevel.LOW
+        
+        # Generate response
+        response_messages = {
+            RiskLevel.LOW: "Your trading approach looks well-planned. Remember to always use stop-losses!",
+            RiskLevel.MEDIUM: "I detected some emotional language. Consider reviewing your risk parameters before trading.",
+            RiskLevel.HIGH: "Warning: I detected several concerning patterns. Please slow down and review your trading plan.",
+            RiskLevel.CRITICAL: "STOP! Multiple red flags detected. This looks like emotional trading. Please step away and review tomorrow.",
+        }
+        
+        return {
+            'risk_level': risk_level.value,
+            'risk_score': max(0, min(100, risk_score)),
+            'signals': signals,
+            'response': response_messages[risk_level],
+            'should_proceed': risk_level in [RiskLevel.LOW, RiskLevel.MEDIUM],
+        }
 
 
 # ============================================================================

@@ -15,15 +15,77 @@ import logging
 from django.conf import settings
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
-
-from apps.backend.core.application.ports import (
-    MarginExecutionPort,
-    MarginTransferResult,
-    MarginAccountSnapshot,
-    MarginOrderExecutionResult,
-)
+from dataclasses import dataclass
+from typing import Protocol
 
 logger = logging.getLogger(__name__)
+
+
+# ============================================================================
+# Local Port Definitions (to avoid container import path issues)
+# ============================================================================
+
+@dataclass(frozen=True)
+class MarginTransferResult:
+    """Result of a margin transfer operation."""
+    success: bool
+    transaction_id: Optional[str]
+    asset: str
+    amount: Decimal
+    from_account: str
+    to_account: str
+    error_message: Optional[str] = None
+
+
+@dataclass(frozen=True)
+class MarginAccountSnapshot:
+    """Snapshot of Isolated Margin account for a symbol."""
+    symbol: str
+    base_asset: str
+    base_free: Decimal
+    base_locked: Decimal
+    base_borrowed: Decimal
+    quote_asset: str
+    quote_free: Decimal
+    quote_locked: Decimal
+    quote_borrowed: Decimal
+    margin_level: Decimal
+    liquidation_price: Decimal
+    is_margin_trade_enabled: bool
+
+
+@dataclass(frozen=True)
+class MarginOrderExecutionResult:
+    """Result of margin order execution."""
+    success: bool
+    order_id: Optional[str]
+    binance_order_id: Optional[str]
+    symbol: str
+    side: str
+    order_type: str
+    quantity: Decimal
+    price: Optional[Decimal]
+    filled_quantity: Decimal
+    avg_fill_price: Optional[Decimal]
+    status: str
+    error_message: Optional[str] = None
+
+
+class MarginExecutionPort(Protocol):
+    """Port for Isolated Margin trading operations."""
+    
+    def transfer_to_margin(self, symbol: str, asset: str, amount: Decimal) -> MarginTransferResult:
+        ...
+    
+    def transfer_from_margin(self, symbol: str, asset: str, amount: Decimal) -> MarginTransferResult:
+        ...
+    
+    def get_margin_account(self, symbol: str) -> MarginAccountSnapshot:
+        ...
+    
+    def place_margin_order(self, symbol: str, side: str, order_type: str, quantity: Decimal, 
+                          price: Optional[Decimal] = None, stop_price: Optional[Decimal] = None) -> MarginOrderExecutionResult:
+        ...
 
 
 def _get_binance_client(use_testnet: bool = None) -> Client:

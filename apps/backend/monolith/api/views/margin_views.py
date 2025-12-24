@@ -23,7 +23,38 @@ from django.utils import timezone
 
 from api.models import MarginPosition, MarginTransfer
 from api.application.margin_adapters import BinanceMarginAdapter, MockMarginAdapter
-from apps.backend.core.domain.margin import calculate_margin_position_size
+
+# Import margin position sizing - use local implementation to avoid path issues in container
+def calculate_margin_position_size(
+    capital,
+    entry_price,
+    stop_price,
+    max_risk_percent=1.0,
+):
+    """
+    Calculate position size for margin trading using the Golden Rule.
+    
+    Position Size = (Risk Amount) / (Stop Distance)
+    
+    Where:
+    - Risk Amount = Capital × (max_risk_percent / 100)
+    - Stop Distance = |Entry Price - Stop Price|
+    """
+    from decimal import Decimal
+    
+    capital = Decimal(str(capital))
+    entry_price = Decimal(str(entry_price))
+    stop_price = Decimal(str(stop_price))
+    max_risk_percent = Decimal(str(max_risk_percent))
+    
+    risk_amount = capital * (max_risk_percent / Decimal('100'))
+    stop_distance = abs(entry_price - stop_price)
+    
+    if stop_distance == 0:
+        return Decimal('0')
+    
+    quantity = risk_amount / stop_distance
+    return quantity
 
 
 def _get_adapter(use_testnet: bool = None):

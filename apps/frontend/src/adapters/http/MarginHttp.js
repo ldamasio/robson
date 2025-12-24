@@ -8,7 +8,8 @@ import { MarginService } from '../../ports/MarginService'
 export class MarginHttp extends MarginService {
   constructor({ baseUrl, getAuthToken }) {
     super()
-    this.baseUrl = baseUrl
+    // Use provided baseUrl, or fallback to VITE_API_BASE_URL
+    this.baseUrl = baseUrl || import.meta.env.VITE_API_BASE_URL || ''
     this.getAuthToken = getAuthToken || (() => null)
   }
 
