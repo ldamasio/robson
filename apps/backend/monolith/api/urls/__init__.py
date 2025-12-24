@@ -176,6 +176,9 @@ urlpatterns = [
     path('account/balance/', 
          getattr(old_views, 'Balance', fallback_view) if OLD_VIEWS_AVAILABLE else fallback_view, 
          name='account_balance'),
+    path('balance/', 
+         getattr(old_views, 'Balance', fallback_view) if OLD_VIEWS_AVAILABLE else fallback_view, 
+         name='legacy_account_balance'),
     path('account/status/', 
          getattr(old_views, 'Status', fallback_view) if OLD_VIEWS_AVAILABLE else fallback_view, 
          name='account_status'),
@@ -199,6 +202,9 @@ urlpatterns = [
     path('portfolio/patrimony/',
          getattr(old_views, 'Patrimony', fallback_view) if OLD_VIEWS_AVAILABLE else fallback_view,
          name='patrimony'),
+    path('patrimony/',
+         getattr(old_views, 'Patrimony', fallback_view) if OLD_VIEWS_AVAILABLE else fallback_view,
+         name='legacy_patrimony'),
     path('portfolio/positions/', active_positions, name='portfolio_positions'),
 
     # ==========================================
