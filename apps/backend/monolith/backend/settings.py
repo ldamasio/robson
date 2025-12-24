@@ -287,6 +287,11 @@ if DEBUG:
     CORS_ALLOW_CREDENTIALS = True
 else:
     CORS_ALLOWED_ORIGINS = [
+        # Production domains (rbx.ia.br)
+        "https://api.robson.rbx.ia.br",
+        "https://app.robson.rbx.ia.br",
+        "https://robson.rbx.ia.br",
+        # Legacy domains (robsonbot.com) - keep for now
         "https://backend.robsonbot.com",
         "https://app.robsonbot.com",
         "https://www.robsonbot.com",
@@ -324,7 +329,13 @@ CORS_EXPOSE_HEADERS = [
 # CSRF CONFIGURATION
 # ==========================================
 CSRF_TRUSTED_ORIGINS = [
+    # Production domains
+    "https://api.robson.rbx.ia.br",
+    "https://app.robson.rbx.ia.br",
+    "https://robson.rbx.ia.br",
+    # Legacy domains
     "https://backend.robsonbot.com",
+    # Development
     "http://localhost:3000",
     "http://127.0.0.1:3000",
     "https://localhost:3000",
