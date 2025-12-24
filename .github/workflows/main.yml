@@ -77,6 +77,8 @@ jobs:
           file: ./apps/frontend/docker/Dockerfile
           push: true
           tags: ${{ steps.fe_tags.outputs.tags }}
+          build-args: |
+            VITE_API_BASE_URL=https://api.robson.rbx.ia.br
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
