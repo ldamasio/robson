@@ -1,41 +1,41 @@
 // @vitest-environment jsdom
 import React from 'react'
 import { render, screen, waitFor } from '@testing-library/react'
-import { describe, expect, it, vi } from 'vitest'
+import { describe, expect, it, vi, beforeEach } from 'vitest'
 import ActualPrice from '../src/components/logged/ActualPrice'
-import AuthContext from '../src/context/AuthContext'
 
-vi.mock('axios', () => ({
-  default: {
-    get: vi.fn()
-  }
+// Mock the useWebSocket hook
+const mockUseWebSocket = vi.fn()
+vi.mock('../src/hooks/useWebSocket', () => ({
+  default: (url) => mockUseWebSocket(url)
 }))
 
-vi.mock('react-toastify', () => ({
-  toast: {
-    error: vi.fn()
-  }
+vi.mock('../src/context/AuthContext', () => ({
+  default: React.createContext({ authTokens: { access: 'token' } })
 }))
-
-import axios from 'axios'
 
 describe('ActualPrice component', () => {
-  it('renders current price data', async () => {
-    axios.get.mockResolvedValue({
+  beforeEach(() => {
+    vi.restoreAllMocks()
+  })
+
+  it('renders loading state initially', () => {
+    mockUseWebSocket.mockReturnValue({ data: null, isConnected: false })
+    render(<ActualPrice />)
+    expect(screen.getByLabelText(/connecting/i)).toBeTruthy()
+  })
+
+  it('renders current price data from websocket', async () => {
+    mockUseWebSocket.mockReturnValue({
       data: {
         symbol: 'BTCUSDC',
-        bid: '89245.00',
-        ask: '89246.00',
-        last: '89245.50',
+        price: 89245.50,
         timestamp: 1700000000
-      }
+      },
+      isConnected: true
     })
 
-    render(
-      <AuthContext.Provider value={{ authTokens: { access: 'token' } }}>
-        <ActualPrice />
-      </AuthContext.Provider>
-    )
+    render(<ActualPrice />)
 
     await waitFor(() => {
       expect(screen.getByText('$89,245.50')).toBeTruthy()

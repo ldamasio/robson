@@ -16,6 +16,16 @@ services:
     ports:
       - "6379:6379"
     restart: always
+  market-stream:
+    container_name: marketStream
+    build: ./cli
+    ports:
+      - "8080:8080"
+    environment:
+      - REDIS_ADDR=robsonRedis:6379
+    depends_on:
+      - redis
+    restart: always
   cronjob:
     container_name: cronjob
     build: ./apps/backend/cronjob

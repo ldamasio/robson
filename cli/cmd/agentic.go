@@ -2,7 +2,8 @@
 Package cmd - Agentic workflow commands
 
 These commands implement the core philosophy:
-  PLAN → VALIDATE → EXECUTE
+
+	PLAN → VALIDATE → EXECUTE
 
 Just as in trading we separate:
   - Idea formulation
@@ -16,7 +17,6 @@ package cmd
 import (
 	"crypto/sha256"
 	"encoding/hex"
-	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
