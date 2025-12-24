@@ -52,7 +52,7 @@ export const AuthProvider = ({ children }) => {
         setAuthTokens(data)
         setUser(jwt_decode(data.access))
         localStorage.setItem('authTokens', JSON.stringify(data))
-        navigate('/feed')
+        navigate('/dashboard')
       } else {
         // API returned an error (e.g. 401 Unauthorized)
         setError(data?.detail || 'Invalid username or password');

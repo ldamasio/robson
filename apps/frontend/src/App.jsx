@@ -39,7 +39,8 @@ function App() {
             <Route element={<HireScreen />} path="/hire" />
             <Route element={<DemoScreen />} path="/demo" />
             <Route element={<PrivateRoutes />}>
-              <Route element={<LoggedHomeScreen />} path="/feed" />
+              <Route element={<LoggedHomeScreen />} path="/dashboard" />
+              <Route element={<LoggedHomeScreen />} path="/feed" /> {/* Legacy route */}
             </Route>
           </Routes>
           <ToastContainer

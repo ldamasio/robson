@@ -44,7 +44,7 @@ function Header() {
               {user ? (
                 <>
                   <span className="text-light">Hi, {user.username}</span>
-                  <LinkContainer to="/feed">
+                  <LinkContainer to="/dashboard">
                     <Button variant="outline-light" size="sm">Dashboard</Button>
                   </LinkContainer>
                   <Button variant="link" className="text-decoration-none text-light" onClick={logoutUser}>Logout</Button>
