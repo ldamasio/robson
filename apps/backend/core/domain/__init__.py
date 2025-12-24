@@ -48,6 +48,17 @@ from apps.backend.core.domain.emotional_guard import (
     calculate_risk_level,
 )
 
+# Technical Stop domain
+from apps.backend.core.domain.technical_stop import (
+    TechnicalStopCalculator,
+    TechnicalStopResult,
+    PriceLevel,
+    OHLCV,
+    StopMethod,
+    Confidence,
+    calculate_position_from_technical_stop,
+)
+
 __all__ = [
     # Trading
     "TradingIntent",
@@ -72,4 +83,12 @@ __all__ = [
     "ExtractedParameters",
     "IntentAnalysis",
     "calculate_risk_level",
+    # Technical Stop
+    "TechnicalStopCalculator",
+    "TechnicalStopResult",
+    "PriceLevel",
+    "OHLCV",
+    "StopMethod",
+    "Confidence",
+    "calculate_position_from_technical_stop",
 ]
