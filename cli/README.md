@@ -40,7 +40,8 @@ cli/
 ├── cmd/
 │   ├── root.go         # Root command + global flags
 │   ├── legacy.go       # Legacy commands (help, report, say, buy, sell)
-│   └── agentic.go      # Agentic workflow (plan, validate, execute)
+│   ├── agentic.go      # Agentic workflow (plan, validate, execute)
+│   └── margin.go       # Margin trading (status, positions, margin-buy)
 └── README.md           # This file
 ```
 
@@ -117,6 +118,24 @@ robson execute abc123def456
 # Only if validated successfully
 ```
 
+### Margin Trading Commands
+
+```bash
+# Account status overview
+robson status                      # Quick summary
+robson status --detailed           # With position details
+
+# View positions
+robson positions                   # Open positions
+robson positions --live            # With real-time prices
+robson positions --all             # Include closed positions
+robson positions --json            # JSON output for scripts
+
+# Open leveraged position (Golden Rule enforced)
+robson margin-buy --capital 100 --stop-percent 2 --leverage 3
+robson margin-buy --capital 100 --stop-price 85000 --leverage 5 --live --confirm
+```
+
 ### JSON Output (for automation)
 
 All commands support `--json` flag for machine-readable output:
@@ -126,6 +145,7 @@ robson help --json
 robson plan buy BTCUSDT 0.001 --json
 robson validate abc123def456 --json
 robson execute abc123def456 --json
+robson positions --json            # Position data for scripts
 ```
 
 ## Smoke Tests
