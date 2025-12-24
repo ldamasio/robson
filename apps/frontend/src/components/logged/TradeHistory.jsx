@@ -125,8 +125,8 @@ function TradeHistory() {
                                             {trade.pnl_percentage ? <small className="d-block opacity-75">{trade.pnl_percentage}%</small> : ''}
                                         </td>
                                         <td className="text-center">
-                                            <Badge bg={trade.is_closed ? 'secondary' : 'primary'}>
-                                                {trade.is_closed ? 'CLOSED' : 'OPEN'}
+                                            <Badge bg={trade.is_closed ? 'info' : 'success'}>
+                                                {trade.is_closed ? 'CLOSED' : 'FILLED'}
                                             </Badge>
                                         </td>
                                     </tr>

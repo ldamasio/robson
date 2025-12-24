@@ -89,12 +89,19 @@ function Position() {
         const sideLabel = position.side === 'BUY' ? 'LONG' : 'SHORT'
         const key = position.operation_id || position.id || position.symbol
 
+        const isMargin = position.type === 'margin'
+        const leverageLabel = isMargin && position.leverage ? `${position.leverage}x` : null
+
         return (
           <Card key={key} className="card-premium mb-3">
             <Card.Body>
               <div className="d-flex justify-content-between align-items-center mb-3">
                 <div>
-                  <h5 className="mb-1 text-light fw-bold">{position.symbol}</h5>
+                  <h5 className="mb-1 text-light fw-bold">
+                    {position.symbol}
+                    {isMargin && <Badge bg="warning" className="ms-2 text-dark">MARGIN</Badge>}
+                    {leverageLabel && <Badge bg="secondary" className="ms-1">{leverageLabel}</Badge>}
+                  </h5>
                   <small className="text-secondary">Side: <span className={position.side === 'BUY' ? 'text-success' : 'text-danger'}>{sideLabel}</span></small>
                 </div>
                 <Badge bg={pnlBadge}>
@@ -115,6 +122,17 @@ function Position() {
                   Target: {position.take_profit ? formatCurrency(position.take_profit) : 'N/A'}{' '}
                   {position.distance_to_target_percent ? `(${position.distance_to_target_percent}% to go)` : ''}
                 </div>
+                {isMargin && (
+                  <div className="mt-2 pt-2 border-top border-secondary">
+                    <small className="text-muted">
+                      <strong>Margin Info:</strong>{' '}
+                      {position.leverage && `${position.leverage}x leverage`}
+                      {position.risk_amount && ` | Risk: ${formatCurrency(position.risk_amount)}`}
+                      {position.risk_percent && ` (${position.risk_percent}%)`}
+                      {position.margin_level && ` | Margin Level: ${position.margin_level}%`}
+                    </small>
+                  </div>
+                )}
               </div>
             </Card.Body>
           </Card>
