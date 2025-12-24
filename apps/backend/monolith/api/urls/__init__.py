@@ -122,6 +122,9 @@ urlpatterns = [
     path('user/', user_profile, name='user_profile'),
     path('test-auth/', token_test, name='token_test'),
     
+    # Demo routes
+    path('demo/', include('api.urls.demo')),
+    
     # ==========================================
     # TRADING/STRATEGY ROUTES (NEW PATTERN)
     # ==========================================

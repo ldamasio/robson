@@ -46,6 +46,11 @@ class Client(models.Model):
     # Trading preferences
     is_active = models.BooleanField(default=True)
     
+    # Demo trial period
+    demo_created_at = models.DateTimeField(blank=True, null=True)
+    demo_expires_at = models.DateTimeField(blank=True, null=True)
+    is_demo_account = models.BooleanField(default=False)
+    
     class Meta:
         ordering = ['-created_at']
     
@@ -95,6 +100,61 @@ class Client(models.Model):
         if not key or len(key) < 12:
             return "****"
         return f"{key[:4]}...{key[-4:]}"
+    
+    def start_demo_trial(self, days: int = 3) -> None:
+        """
+        Start a demo trial period for this client.
+        
+        Args:
+            days: Number of days for the trial (default: 3)
+        """
+        from django.utils.timezone import now
+        from datetime import timedelta
+        
+        self.demo_created_at = now()
+        self.demo_expires_at = now() + timedelta(days=days)
+        self.is_demo_account = True
+        self.save()
+    
+    def is_demo_expired(self) -> bool:
+        """
+        Check if the demo trial has expired.
+        
+        Returns:
+            True if demo has expired, False otherwise
+        """
+        from django.utils.timezone import now
+        
+        if not self.is_demo_account or not self.demo_expires_at:
+            return False
+        
+        return now() > self.demo_expires_at
+    
+    def get_demo_remaining_days(self) -> int:
+        """
+        Get remaining days in demo trial.
+        
+        Returns:
+            Number of days remaining (0 if expired or not demo)
+        """
+        from django.utils.timezone import now
+        
+        if not self.is_demo_account or not self.demo_expires_at:
+            return 0
+        
+        if self.is_demo_expired():
+            return 0
+        
+        remaining = self.demo_expires_at - now()
+        return max(0, remaining.days)
+    
+    def upgrade_to_pro(self) -> None:
+        """
+        Upgrade demo account to full Pro account.
+        """
+        self.is_demo_account = False
+        self.demo_expires_at = None
+        self.save()
 
 
 class CustomUser(AbstractUser):
