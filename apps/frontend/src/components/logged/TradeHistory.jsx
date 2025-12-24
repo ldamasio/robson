@@ -95,6 +95,7 @@ function TradeHistory() {
                             <tr className="text-secondary">
                                 <th>Date</th>
                                 <th>Symbol</th>
+                                <th>Type</th>
                                 <th>Side</th>
                                 <th className="text-end">Px Entry</th>
                                 <th className="text-end">Px Exit</th>
@@ -107,11 +108,20 @@ function TradeHistory() {
                             {trades.map((trade) => {
                                 const isWin = trade.is_winner
                                 const pnlColor = isWin === true ? 'text-success' : isWin === false ? 'text-danger' : 'text-light'
+                                const isMargin = trade.type === 'margin'
+                                const leverageLabel = isMargin && trade.leverage ? `${trade.leverage}x` : null
+                                const status = trade.status || (trade.is_closed ? 'CLOSED' : 'FILLED')
 
                                 return (
                                     <tr key={trade.id}>
                                         <td className="small text-muted">{formatDate(trade.entry_time)}</td>
                                         <td className="fw-bold">{trade.symbol}</td>
+                                        <td>
+                                            <Badge bg={isMargin ? 'warning' : 'secondary'} className={isMargin ? 'text-dark' : ''}>
+                                                {isMargin ? 'MARGIN' : 'SPOT'}
+                                            </Badge>
+                                            {leverageLabel && <Badge bg="dark" className="ms-1">{leverageLabel}</Badge>}
+                                        </td>
                                         <td>
                                             <Badge bg={trade.side === 'BUY' ? 'success' : 'danger'}>
                                                 {trade.side}
@@ -125,8 +135,8 @@ function TradeHistory() {
                                             {trade.pnl_percentage ? <small className="d-block opacity-75">{trade.pnl_percentage}%</small> : ''}
                                         </td>
                                         <td className="text-center">
-                                            <Badge bg={trade.is_closed ? 'info' : 'success'}>
-                                                {trade.is_closed ? 'CLOSED' : 'FILLED'}
+                                            <Badge bg={status === 'CLOSED' ? 'info' : 'success'}>
+                                                {status}
                                             </Badge>
                                         </td>
                                     </tr>

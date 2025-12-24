@@ -23,6 +23,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 
 from api.models import Trade, Symbol, Order
+from api.models.audit import AuditTransaction, TransactionType, MovementCategory
 from api.application.adapters import BinanceExecution, BinanceMarketData
 
 logger = logging.getLogger(__name__)
@@ -438,37 +439,37 @@ def sell_btc(request):
 @permission_classes([IsAuthenticated])
 def trade_history(request):
     """
-    Get trade history with P&L information.
+    Get unified trade history with P&L information.
+    
+    Includes BOTH spot trades (Trade model) AND margin trades (AuditTransaction).
     
     Query params:
         - symbol: Filter by trading pair (e.g., 'BTCUSDC')
         - days: Number of days to look back (default: 30)
         - limit: Maximum number of trades to return (default: 100)
+        - type: Filter by type ('spot', 'margin', or 'all' - default: 'all')
     """
     symbol_filter = request.query_params.get('symbol')
     days = int(request.query_params.get('days', 30))
     limit = int(request.query_params.get('limit', 100))
+    type_filter = request.query_params.get('type', 'all')
     
     since = timezone.now() - timedelta(days=days)
     
-    queryset = Trade.objects.filter(entry_time__gte=since).order_by('-entry_time')
+    all_trades = []
     
-    if symbol_filter:
-        queryset = queryset.filter(symbol__name=symbol_filter)
-    
-    trades = queryset[:limit]
-    
-    # Calculate summary stats
-    closed_trades = [t for t in trades if t.is_closed]
-    total_pnl = sum(t.pnl for t in closed_trades if t.pnl)
-    winners = len([t for t in closed_trades if t.is_winner])
-    losers = len(closed_trades) - winners
-    win_rate = (winners / len(closed_trades) * 100) if closed_trades else 0
-    
-    return Response({
-        'trades': [
-            {
-                'id': t.id,
+    # ============================================
+    # PART 1: Spot Trades (from Trade model)
+    # ============================================
+    if type_filter in ('all', 'spot'):
+        spot_queryset = Trade.objects.filter(entry_time__gte=since).order_by('-entry_time')
+        
+        if symbol_filter:
+            spot_queryset = spot_queryset.filter(symbol__name=symbol_filter)
+        
+        for t in spot_queryset[:limit]:
+            all_trades.append({
+                'id': f'spot-{t.id}',
                 'symbol': t.symbol.name,
                 'side': t.side,
                 'quantity': str(t.quantity),
@@ -478,18 +479,80 @@ def trade_history(request):
                 'pnl_percentage': str(t.pnl_percentage) if t.pnl_percentage else None,
                 'is_winner': t.is_winner if t.is_closed else None,
                 'is_closed': t.is_closed,
+                'status': 'CLOSED' if t.is_closed else 'FILLED',  # Fixed semantics
                 'duration_hours': t.duration_hours,
                 'entry_time': t.entry_time.isoformat(),
                 'exit_time': t.exit_time.isoformat() if t.exit_time else None,
                 'entry_fee': str(t.entry_fee),
                 'exit_fee': str(t.exit_fee) if t.exit_fee else None,
-            }
-            for t in trades
-        ],
+                'type': 'spot',
+                'leverage': None,
+            })
+    
+    # ============================================
+    # PART 2: Margin Trades (from AuditTransaction)
+    # ============================================
+    if type_filter in ('all', 'margin'):
+        margin_types = [
+            TransactionType.MARGIN_BUY,
+            TransactionType.MARGIN_SELL,
+        ]
+        
+        margin_queryset = AuditTransaction.objects.filter(
+            transaction_type__in=margin_types,
+            created_at__gte=since,
+        ).order_by('-created_at')
+        
+        if symbol_filter:
+            margin_queryset = margin_queryset.filter(symbol=symbol_filter)
+        
+        for tx in margin_queryset[:limit]:
+            # Determine side from transaction type
+            side = 'BUY' if tx.transaction_type == TransactionType.MARGIN_BUY else 'SELL'
+            
+            all_trades.append({
+                'id': f'margin-{tx.id}',
+                'symbol': tx.symbol,
+                'side': side,
+                'quantity': str(tx.quantity) if tx.quantity else '0',
+                'entry_price': str(tx.price) if tx.price else '0',
+                'exit_price': None,  # Margin trades are individual fills
+                'pnl': None,  # P&L calculated at operation level
+                'pnl_percentage': None,
+                'is_winner': None,
+                'is_closed': False,  # Individual fills are part of open positions
+                'status': 'FILLED',  # Margin trades are always executed
+                'duration_hours': None,
+                'entry_time': tx.created_at.isoformat(),
+                'exit_time': None,
+                'entry_fee': str(tx.fee) if tx.fee else '0',
+                'exit_fee': None,
+                'type': 'margin',
+                'leverage': tx.leverage,
+            })
+    
+    # Sort combined list by entry_time descending
+    all_trades.sort(key=lambda x: x['entry_time'], reverse=True)
+    all_trades = all_trades[:limit]
+    
+    # Calculate summary stats
+    closed_trades = [t for t in all_trades if t['is_closed']]
+    total_pnl = sum(Decimal(t['pnl']) for t in closed_trades if t['pnl'])
+    winners = len([t for t in closed_trades if t['is_winner']])
+    losers = len(closed_trades) - winners
+    win_rate = (winners / len(closed_trades) * 100) if closed_trades else 0
+    
+    spot_count = len([t for t in all_trades if t['type'] == 'spot'])
+    margin_count = len([t for t in all_trades if t['type'] == 'margin'])
+    
+    return Response({
+        'trades': all_trades,
         'summary': {
-            'total_trades': len(trades),
+            'total_trades': len(all_trades),
+            'spot_trades': spot_count,
+            'margin_trades': margin_count,
             'closed_trades': len(closed_trades),
-            'open_trades': len(trades) - len(closed_trades),
+            'open_trades': len(all_trades) - len(closed_trades),
             'total_pnl': str(total_pnl),
             'winners': winners,
             'losers': losers,
