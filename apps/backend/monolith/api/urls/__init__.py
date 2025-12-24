@@ -85,6 +85,19 @@ except ImportError as e:
     print(f"⚠️  Could not import risk-managed trading views: {e}")
     RISK_MANAGED_TRADING_AVAILABLE = False
 
+# Import audit trail views (COMPLETE TRANSPARENCY)
+try:
+    from ..views.audit_views import (
+        transaction_history,
+        all_activity,
+        balance_history,
+        sync_transactions,
+    )
+    AUDIT_VIEWS_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️  Could not import audit views: {e}")
+    AUDIT_VIEWS_AVAILABLE = False
+
 # Fallback function for missing views
 def fallback_view(request):
     from django.http import JsonResponse
@@ -271,6 +284,28 @@ if RISK_MANAGED_TRADING_AVAILABLE:
     print("✅ Risk-managed trading loaded: /api/trade/risk-managed/buy/, etc.")
 else:
     print("⚠️  Risk-managed trading views not available")
+
+# ==========================================
+# AUDIT TRAIL ROUTES (COMPLETE TRANSPARENCY!)
+# ==========================================
+# These endpoints provide full auditability of all account activity
+if AUDIT_VIEWS_AVAILABLE:
+    urlpatterns += [
+        # Transaction history - all recorded transactions
+        path('audit/transactions/', transaction_history, name='audit_transactions'),
+        
+        # All activity - combines trades, orders, positions, transfers
+        path('audit/activity/', all_activity, name='audit_all_activity'),
+        
+        # Balance history - historical snapshots
+        path('audit/balances/', balance_history, name='audit_balance_history'),
+        
+        # Sync from Binance - fill in any missing transactions
+        path('audit/sync/', sync_transactions, name='audit_sync'),
+    ]
+    print("✅ Audit views loaded: /api/audit/transactions/, /api/audit/activity/, etc.")
+else:
+    print("⚠️  Audit views not available")
 
 # Debug info
 print("🎯 URLs loaded following project patterns!")

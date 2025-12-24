@@ -157,6 +157,14 @@ from .margin import (
     MarginTransfer,
 )
 
+# Audit Trail
+from .audit import (
+    AuditTransaction,
+    BalanceSnapshot,
+    TransactionType,
+    TransactionStatus,
+)
+
 # ==========================================
 # LIST OF ALL AVAILABLE MODELS
 # ==========================================
@@ -263,6 +271,12 @@ __all__ = [
     # Margin Trading
     'MarginPosition',
     'MarginTransfer',
+    
+    # Audit Trail
+    'AuditTransaction',
+    'BalanceSnapshot',
+    'TransactionType',
+    'TransactionStatus',
 ]
 
 # ==========================================

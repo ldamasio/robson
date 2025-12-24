@@ -2,6 +2,7 @@ import React, { useState } from 'react'
 import { Tab, Tabs } from 'react-bootstrap'
 import Position from './Position'
 import TradeHistory from './TradeHistory'
+import ActivityHistory from './ActivityHistory'
 
 function PositionsDashboard() {
     const [key, setKey] = useState('active')
@@ -30,6 +31,9 @@ function PositionsDashboard() {
                 </Tab>
                 <Tab eventKey="history" title="Trade History">
                     <TradeHistory />
+                </Tab>
+                <Tab eventKey="activity" title="📋 All Activity">
+                    <ActivityHistory />
                 </Tab>
             </Tabs>
 
