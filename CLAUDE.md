@@ -117,20 +117,53 @@ class Strategy:
 
 ### Robson's Primary Intelligence: Position Sizing
 
-**The 1% Risk Rule**:
-```python
-Capital: $1,000
-Entry: $90,000
-Stop: $88,200 (2% stop)
+## ⚠️ GOLDEN RULE: Position Size is DERIVED from Technical Stop
 
-Risk Amount = $1,000 × 0.01 = $10
-Stop Distance = $90,000 - $88,200 = $1,800
-Quantity = $10 / $1,800 = 0.00555556 BTC
+**CRITICAL**: The position size is NEVER arbitrary. It is ALWAYS calculated
+backwards from the technical stop-loss level.
 
-If stopped: Loss = 0.00555556 × $1,800 = $10 = 1% ✓
+**THE ORDER OF OPERATIONS**:
+1. **FIRST**: Identify technical stop (2nd support level on chart)
+2. **THEN**: Calculate stop distance = |Entry - Technical Stop|
+3. **THEN**: Max Risk = Capital × 1%
+4. **FINALLY**: Position Size = Max Risk / Stop Distance
+
+**The Formula**:
+```
+Position Size = (Capital × 1%) / |Entry Price - Technical Stop|
 ```
 
-**Service**: `api/services/position_sizing.py`
+**Example with TECHNICAL Stop**:
+```python
+Capital: $10,000
+Entry Price: $95,000
+Technical Stop: $93,500  # 2nd support level on 15m chart (FROM CHART!)
+
+Stop Distance = |$95,000 - $93,500| = $1,500
+Max Risk (1%) = $10,000 × 0.01 = $100
+Position Size = $100 / $1,500 = 0.0667 BTC
+Position Value = 0.0667 × $95,000 = $6,333.33
+
+If stopped at $93,500: Loss = 0.0667 × $1,500 = $100 = 1% ✓
+```
+
+**Key Insight**:
+- Wide technical stop → Smaller position size
+- Tight technical stop → Larger position size
+- Risk amount stays CONSTANT at 1%
+
+**For AI Agents**:
+- ❌ NEVER ask "how much do you want to invest?"
+- ✅ ALWAYS ask "where is your technical invalidation level?"
+- The investment amount is CALCULATED, not chosen
+- The stop-loss comes from CHART ANALYSIS, not arbitrary percentage
+
+**Services**:
+- `apps/backend/core/domain/technical_stop.py` - Technical stop calculator
+- `api/application/technical_stop_adapter.py` - Binance integration
+- `api/management/commands/technical_stop_buy.py` - CLI command
+
+**See**: `docs/requirements/POSITION-SIZING-GOLDEN-RULE.md`
 
 ### User-Initiated Flow
 

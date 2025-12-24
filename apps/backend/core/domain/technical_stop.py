@@ -9,6 +9,47 @@ The stop should be placed where the trade thesis is invalidated:
 - Above key resistance levels (for SHORT)
 
 This module is PURE DOMAIN LOGIC - no framework dependencies.
+
+================================================================================
+GOLDEN RULE: POSITION SIZE IS DERIVED FROM THE TECHNICAL STOP
+================================================================================
+
+The position size is NEVER arbitrary. It is ALWAYS calculated backwards
+from the technical stop-loss level determined by chart analysis.
+
+THE CORRECT ORDER OF OPERATIONS:
+1. FIRST  → Analyze chart → Find 2nd support level → This is TECHNICAL STOP
+2. THEN   → Calculate STOP DISTANCE = |Entry Price - Technical Stop|
+3. THEN   → Calculate MAX RISK = Capital × 1%
+4. FINALLY → DERIVE POSITION SIZE = Max Risk / Stop Distance
+
+THE FORMULA:
+    Position Size = (Capital × 1%) / |Entry Price - Technical Stop|
+
+EXAMPLE:
+    Capital         = $10,000
+    Entry Price     = $95,000
+    Technical Stop  = $93,500 (2nd support on 15m chart)
+    
+    Stop Distance   = $1,500
+    Max Risk (1%)   = $100
+    Position Size   = $100 / $1,500 = 0.0667 BTC
+    
+    If stopped: Loss = 0.0667 × $1,500 = $100 = 1% ✓
+
+KEY INSIGHT:
+- Wide technical stop  → Smaller position size
+- Tight technical stop → Larger position size  
+- Risk amount stays CONSTANT at 1%
+
+FOR AI AGENTS:
+- ❌ NEVER ask "how much do you want to invest?"
+- ✅ ALWAYS ask "where is your technical invalidation level?"
+- The investment amount is CALCULATED, not chosen
+- The stop comes from CHART ANALYSIS, not arbitrary percentage
+
+See: docs/requirements/POSITION-SIZING-GOLDEN-RULE.md
+================================================================================
 """
 
 from __future__ import annotations
@@ -468,17 +509,34 @@ def calculate_position_from_technical_stop(
     """
     Calculate position size from technical stop level.
     
-    This is the KEY formula:
-    Position Size = (Capital × Risk%) / Stop Distance
+    ⚠️ THIS IS THE GOLDEN RULE IMPLEMENTATION ⚠️
+    
+    Position Size = (Capital × Risk%) / |Entry - Technical Stop|
+    
+    The position size is DERIVED from the technical stop, never arbitrary.
+    The technical stop comes FIRST (from chart analysis), then we calculate
+    how much we can buy while risking exactly 1% of capital.
     
     Args:
-        capital: Total available capital
-        entry_price: Entry price
-        technical_stop: Technical stop price
+        capital: Total available capital (e.g., $10,000)
+        entry_price: Entry price (e.g., $95,000)
+        technical_stop: Stop price from chart analysis (e.g., $93,500)
         max_risk_percent: Maximum risk per trade (default: 1%)
         
     Returns:
-        Tuple of (quantity, risk_amount, position_value)
+        Tuple of:
+        - quantity: Position size in base asset (e.g., 0.0667 BTC)
+        - risk_amount: Amount at risk in quote (e.g., $100)
+        - position_value: Total position value (e.g., $6,333)
+    
+    Example:
+        >>> qty, risk, value = calculate_position_from_technical_stop(
+        ...     capital=Decimal("10000"),
+        ...     entry_price=Decimal("95000"),
+        ...     technical_stop=Decimal("93500"),  # From chart!
+        ... )
+        >>> print(f"Buy {qty} BTC, risking ${risk}")
+        Buy 0.0667 BTC, risking $100
     """
     stop_distance = abs(entry_price - technical_stop)
     
