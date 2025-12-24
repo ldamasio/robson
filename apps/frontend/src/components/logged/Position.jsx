@@ -55,28 +55,33 @@ function Position() {
     }
 
     loadPositions()
-    const interval = setInterval(loadPositions, 5000)
     return () => {
       isActive = false
-      clearInterval(interval)
     }
   }, [authTokens?.access])
 
-  if (loading) {
-    return <LoadingSpinner label="Loading positions..." />
-  }
-
-  if (error) {
-    return <div className="text-danger">{error}</div>
-  }
-
-  if (positions.length === 0) {
-    return <div>No active positions.</div>
+  const handleRefresh = () => {
+    setLoading(true)
+    fetchPositions()
   }
 
   return (
     <div className="d-grid gap-3">
-      {positions.map((position) => {
+      <div className="d-flex justify-content-end mb-2">
+        <button className="btn btn-sm btn-outline-primary" onClick={handleRefresh} disabled={loading}>
+          {loading ? 'Refreshing...' : 'Refresh Positions'}
+        </button>
+      </div>
+
+      {loading && <LoadingSpinner label="Loading positions..." />}
+
+      {!loading && error && <div className="text-danger">{error}</div>}
+
+      {!loading && !error && positions.length === 0 && (
+        <div className="text-muted text-center py-4">No active positions.</div>
+      )}
+
+      {!loading && !error && positions.map((position) => {
         const pnl = Number(position.unrealized_pnl)
         const pnlPercent = Number(position.unrealized_pnl_percent)
         const pnlPositive = pnl > 0
