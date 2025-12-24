@@ -31,13 +31,25 @@ import logging
 from decimal import Decimal, InvalidOperation
 
 from django.core.management.base import BaseCommand, CommandError
+from django.db import transaction
+from django.utils import timezone
 
 from api.application.adapters import BinanceExecution, BinanceMarketData
 from api.application.execution import ExecutionMode
 from api.application.risk_managed_trade import RiskManagedTradeUseCase
+from api.models import Order, Symbol, Trade
 from api.views.risk_managed_trading import DjangoPnLRepository
 
 logger = logging.getLogger(__name__)
+
+
+def _get_or_create_symbol(symbol_str: str) -> Symbol:
+    """Get or create a Symbol from a symbol string like 'BTCUSDC'."""
+    symbol_obj, _ = Symbol.objects.get_or_create(
+        name=symbol_str,
+        defaults={'base': symbol_str[:-4], 'quote': symbol_str[-4:]}
+    )
+    return symbol_obj
 
 
 class Command(BaseCommand):
@@ -262,13 +274,49 @@ class Command(BaseCommand):
 
         self.stdout.write('')
 
+        # AUDIT: Record trade in database if LIVE and successful
+        if mode == ExecutionMode.LIVE and result.is_success():
+            self.stdout.write(self.style.HTTP_INFO('--- Recording to Database (Audit) ---'))
+            try:
+                with transaction.atomic():
+                    symbol_obj = _get_or_create_symbol(symbol)
+                    order_data = result.metadata.get('order', {})
+                    
+                    # Create Trade record
+                    trade = Trade.objects.create(
+                        symbol=symbol_obj,
+                        side='BUY',
+                        quantity=quantity,
+                        entry_price=entry_price,
+                        entry_time=timezone.now(),
+                    )
+                    
+                    # Create Order record
+                    order = Order.objects.create(
+                        symbol=symbol_obj,
+                        binance_order_id=order_data.get('orderId'),
+                        side='BUY',
+                        order_type='MARKET',
+                        quantity=quantity,
+                        avg_fill_price=Decimal(str(order_data.get('avgFillPrice', entry_price))),
+                        status='FILLED',
+                    )
+                    
+                    self.stdout.write(self.style.SUCCESS(f'  Trade ID: {trade.id}'))
+                    self.stdout.write(self.style.SUCCESS(f'  Order ID: {order.id}'))
+                    self.stdout.write(self.style.SUCCESS(f'  Binance Order: {order.binance_order_id}'))
+                    
+            except Exception as e:
+                self.stdout.write(self.style.ERROR(f'  Failed to save to DB: {e}'))
+                logger.error(f"Failed to save trade to database: {e}", exc_info=True)
+
         if mode == ExecutionMode.DRY_RUN:
             self.stdout.write(self.style.WARNING(
                 'This was a DRY-RUN. No real order was placed.\n'
                 'To execute a real order, add: --live --confirm'
             ))
         else:
-            self.stdout.write(self.style.SUCCESS('LIVE order executed!'))
+            self.stdout.write(self.style.SUCCESS('LIVE order executed and recorded!'))
 
         self.stdout.write('')
         self.stdout.write(self.style.HTTP_INFO('=' * 60))
