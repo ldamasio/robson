@@ -43,6 +43,7 @@ from api.application.adapters import BinanceExecution, BinanceMarketData
 from api.application.execution import ExecutionMode
 from api.models import Symbol
 from api.models.margin import MarginPosition, MarginTransfer
+from api.services.audit_service import AuditService
 from clients.models import Client
 
 logger = logging.getLogger(__name__)
@@ -386,6 +387,7 @@ class Command(BaseCommand):
 
         # Step 5: Record position to database
         self.stdout.write(self.style.HTTP_INFO('Step 5: Record Position (Audit)'))
+        position = None
         try:
             with transaction.atomic():
                 position = MarginPosition.objects.create(
@@ -413,6 +415,51 @@ class Command(BaseCommand):
         except Exception as e:
             self.stdout.write(self.style.ERROR(f'  Failed to save position: {e}'))
             logger.error(f"Failed to save margin position: {e}", exc_info=True)
+
+        # Step 6: Record to unified audit trail
+        self.stdout.write(self.style.HTTP_INFO('Step 6: Record to Audit Trail'))
+        try:
+            audit_service = AuditService(client, execution)
+            
+            # Record borrow
+            if borrow_tran_id:
+                audit_service.record_margin_borrow(
+                    symbol=symbol,
+                    asset='USDC',
+                    amount=usdc_needed.quantize(Decimal('0.01')),
+                    binance_transaction_id=str(borrow_tran_id),
+                )
+                self.stdout.write(self.style.SUCCESS('  Recorded: Margin Borrow'))
+            
+            # Record entry order
+            audit_service.record_margin_buy(
+                symbol=symbol,
+                quantity=quantity,
+                price=fill_price,
+                binance_order_id=str(order_id),
+                leverage=leverage,
+                stop_price=stop_price,
+                risk_amount=risk_amount,
+                risk_percent=risk_percent,
+                position=position,
+            )
+            self.stdout.write(self.style.SUCCESS('  Recorded: Margin Buy'))
+            
+            # Record stop-loss
+            if stop_order_id:
+                audit_service.record_stop_loss_placed(
+                    symbol=symbol,
+                    quantity=quantity,
+                    stop_price=stop_price,
+                    binance_order_id=str(stop_order_id),
+                    is_margin=True,
+                    position=position,
+                )
+                self.stdout.write(self.style.SUCCESS('  Recorded: Stop-Loss Order'))
+            
+        except Exception as e:
+            self.stdout.write(self.style.WARNING(f'  Audit recording failed: {e}'))
+            logger.warning(f"Failed to record audit trail: {e}", exc_info=True)
 
         # Summary
         self.stdout.write('')

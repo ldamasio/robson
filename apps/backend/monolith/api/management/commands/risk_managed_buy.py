@@ -38,7 +38,9 @@ from api.application.adapters import BinanceExecution, BinanceMarketData
 from api.application.execution import ExecutionMode
 from api.application.risk_managed_trade import RiskManagedTradeUseCase
 from api.models import Order, Symbol, Trade
+from api.services.audit_service import AuditService
 from api.views.risk_managed_trading import DjangoPnLRepository
+from clients.models import Client
 
 logger = logging.getLogger(__name__)
 
@@ -305,6 +307,25 @@ class Command(BaseCommand):
                     self.stdout.write(self.style.SUCCESS(f'  Trade ID: {trade.id}'))
                     self.stdout.write(self.style.SUCCESS(f'  Order ID: {order.id}'))
                     self.stdout.write(self.style.SUCCESS(f'  Binance Order: {order.binance_order_id}'))
+                    
+                    # Record to unified audit trail
+                    try:
+                        client = Client.objects.filter(is_active=True).first()
+                        if client:
+                            audit_service = AuditService(client, execution)
+                            audit_service.record_spot_buy(
+                                symbol=symbol,
+                                quantity=quantity,
+                                price=entry_price,
+                                binance_order_id=str(order_data.get('orderId', '')),
+                                stop_price=stop_price,
+                                risk_amount=risk_amount,
+                                risk_percent=risk_percent,
+                                raw_response=order_data,
+                            )
+                            self.stdout.write(self.style.SUCCESS('  Recorded to Audit Trail'))
+                    except Exception as audit_err:
+                        self.stdout.write(self.style.WARNING(f'  Audit recording failed: {audit_err}'))
                     
             except Exception as e:
                 self.stdout.write(self.style.ERROR(f'  Failed to save to DB: {e}'))
