@@ -85,12 +85,12 @@ function Position() {
         const key = position.operation_id || position.id || position.symbol
 
         return (
-          <Card key={key} className="shadow-sm">
+          <Card key={key} className="card-premium mb-3">
             <Card.Body>
               <div className="d-flex justify-content-between align-items-center mb-3">
                 <div>
-                  <h5 className="mb-1">{position.symbol}</h5>
-                  <small className="text-muted">Side: {sideLabel}</small>
+                  <h5 className="mb-1 text-light fw-bold">{position.symbol}</h5>
+                  <small className="text-secondary">Side: <span className={position.side === 'BUY' ? 'text-success' : 'text-danger'}>{sideLabel}</span></small>
                 </div>
                 <Badge bg={pnlBadge}>
                   {formatCurrency(position.unrealized_pnl)} ({formatPercent(position.unrealized_pnl_percent)})

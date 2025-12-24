@@ -351,6 +351,95 @@ class BinanceExecution(ExchangeExecutionPort):
                     "locked": locked,
                 })
         return {"balances": non_zero}
+    
+    def place_stop_loss(self, symbol: str, side: str, quantity: Decimal, stop_price: Decimal) -> dict:
+        """
+        Place a stop-loss order on Binance.
+        
+        This places a STOP_LOSS_LIMIT order that triggers when price
+        reaches the stop_price, then executes as a limit order.
+        
+        Args:
+            symbol: Trading pair (e.g., "BTCUSDC")
+            side: "SELL" for long stop-loss, "BUY" for short stop-loss
+            quantity: Amount to trade
+            stop_price: Price at which stop triggers
+            
+        Returns:
+            Full order response from Binance
+        """
+        mode = "TESTNET" if self.use_testnet else "PRODUCTION"
+        logger.info(f"Placing STOP-LOSS order on {mode}: {side} {quantity} {symbol} @ stop={stop_price}")
+        
+        # For STOP_LOSS_LIMIT, we need both stopPrice and price (limit price)
+        # We set the limit price slightly worse than stop to ensure execution
+        if side == "SELL":
+            # For sell stop-loss, limit price slightly below stop
+            limit_price = stop_price * Decimal("0.999")
+        else:
+            # For buy stop-loss (short cover), limit price slightly above stop
+            limit_price = stop_price * Decimal("1.001")
+        
+        # Quantize to proper precision (BTCUSDC uses 2 decimal places for price)
+        stop_price_str = str(stop_price.quantize(Decimal("0.01")))
+        limit_price_str = str(limit_price.quantize(Decimal("0.01")))
+        quantity_str = str(quantity.quantize(Decimal("0.00001")))
+        
+        try:
+            response = self.client.create_order(
+                symbol=symbol,
+                side=side,
+                type="STOP_LOSS_LIMIT",
+                timeInForce="GTC",
+                quantity=quantity_str,
+                stopPrice=stop_price_str,
+                price=limit_price_str,
+            )
+            
+            order_id = str(response["orderId"])
+            logger.info(f"Stop-loss order placed successfully: {order_id}")
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"Failed to place stop-loss order: {e}")
+            raise
+    
+    def cancel_order(self, symbol: str, order_id: str) -> dict:
+        """
+        Cancel an open order.
+        
+        Args:
+            symbol: Trading pair
+            order_id: Order ID to cancel
+            
+        Returns:
+            Cancellation response from Binance
+        """
+        mode = "TESTNET" if self.use_testnet else "PRODUCTION"
+        logger.info(f"Cancelling order on {mode}: {order_id} for {symbol}")
+        
+        response = self.client.cancel_order(
+            symbol=symbol,
+            orderId=int(order_id),
+        )
+        
+        logger.info(f"Order cancelled: {order_id}")
+        return response
+    
+    def get_open_orders(self, symbol: str = None) -> list:
+        """
+        Get open orders.
+        
+        Args:
+            symbol: Optional trading pair to filter by
+            
+        Returns:
+            List of open orders
+        """
+        if symbol:
+            return self.client.get_open_orders(symbol=symbol)
+        return self.client.get_open_orders()
 
 
 # ==========================================
