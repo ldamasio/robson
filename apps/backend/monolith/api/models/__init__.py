@@ -157,12 +157,14 @@ from .margin import (
     MarginTransfer,
 )
 
-# Audit Trail
+# Audit Trail (Movements)
 from .audit import (
     AuditTransaction,
     BalanceSnapshot,
     TransactionType,
     TransactionStatus,
+    MovementCategory,
+    AccountType,
 )
 
 # ==========================================
@@ -272,11 +274,13 @@ __all__ = [
     'MarginPosition',
     'MarginTransfer',
     
-    # Audit Trail
+    # Audit Trail (Movements)
     'AuditTransaction',
     'BalanceSnapshot',
     'TransactionType',
     'TransactionStatus',
+    'MovementCategory',
+    'AccountType',
 ]
 
 # ==========================================
