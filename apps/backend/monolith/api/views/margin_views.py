@@ -614,6 +614,8 @@ def list_positions(request):
                 "total_pnl": str(p.total_pnl),
                 "margin_level": str(p.margin_level),
                 "margin_health": p.margin_health,
+                "binance_stop_order_id": p.binance_stop_order_id,
+                "transfer_count": p.transfers.count(),
                 "opened_at": p.opened_at.isoformat() if p.opened_at else None,
                 "closed_at": p.closed_at.isoformat() if p.closed_at else None,
             }
@@ -667,6 +669,7 @@ def get_position(request, position_id):
         "is_at_risk": position.is_at_risk,
         "binance_entry_order_id": position.binance_entry_order_id,
         "binance_stop_order_id": position.binance_stop_order_id,
+        "transfer_count": position.transfers.count(),
         "close_reason": position.close_reason,
         "created_at": position.created_at.isoformat(),
         "opened_at": position.opened_at.isoformat() if position.opened_at else None,

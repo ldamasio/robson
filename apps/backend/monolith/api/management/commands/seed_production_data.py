@@ -4,7 +4,7 @@ from datetime import timedelta
 from django.core.management.base import BaseCommand
 from django.contrib.auth import get_user_model
 from django.utils import timezone
-from api.models import Symbol, Strategy, Order, Operation, Trade
+from api.models import Symbol, Strategy, Order, Operation, Trade, MarginPosition, MarginTransfer
 
 class Command(BaseCommand):
     help = 'Seeds database with realistic production-like data for user robson'
@@ -105,6 +105,9 @@ class Command(BaseCommand):
         # 4. Create Historical Trades
         self._create_history(client, symbols, strategies)
 
+        # 5. Create Margin Positions & Transfers
+        self._create_margin_data(client, symbols)
+
         self.stdout.write(self.style.SUCCESS('Successfully seeded production-like data!'))
 
     def _create_active_position(self, client, symbol, strategy, side, entry_price, quantity, current_mock_price):
@@ -183,3 +186,48 @@ class Command(BaseCommand):
             )
         
         self.stdout.write(f"Created {len(history_scenarios)} historical trades.")
+
+    def _create_margin_data(self, client, symbols):
+        import uuid
+        
+        # Scenario 1: BTCUSDC Long (Requested style)
+        entry_price = Decimal("87193.34")
+        stop_price = Decimal("85449.47")
+        quantity = Decimal("0.00047985")
+        risk_amount = Decimal("0.28")
+        
+        pos = MarginPosition.objects.create(
+            position_id=f"margin-{uuid.uuid4()}",
+            client=client,
+            symbol="BTCUSDC",
+            side="LONG",
+            status="OPEN",
+            leverage=3,
+            entry_price=entry_price,
+            stop_price=stop_price,
+            quantity=quantity,
+            position_value=entry_price * quantity,
+            margin_allocated=Decimal("14.00"),
+            risk_amount=risk_amount,
+            risk_percent=Decimal("1.00"),
+            current_price=Decimal("87350.00"),
+            binance_entry_order_id="99887766",
+            binance_stop_order_id="7634794756",
+            margin_level=Decimal("3.06"),
+            opened_at=timezone.now() - timedelta(hours=2)
+        )
+        
+        # Add 3 transfers
+        for i in range(3):
+            MarginTransfer.objects.create(
+                transaction_id=f"tx-{uuid.uuid4()}",
+                client=client,
+                symbol="BTCUSDC",
+                asset="USDC",
+                amount=Decimal("10.00"),
+                direction="TO_MARGIN" if i == 0 else "FROM_MARGIN",
+                success=True,
+                position=pos
+            )
+            
+        self.stdout.write(f"Created Margin Position: {pos.symbol} (ID: {pos.id}) with 3 transfers.")

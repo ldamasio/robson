@@ -2,6 +2,7 @@ import React, { useState, useEffect, useContext } from 'react';
 import { Card, Table, Badge, Button, Spinner, Alert, ButtonGroup } from 'react-bootstrap';
 import AuthContext from '../../context/AuthContext';
 import { MarginHttp } from '../../adapters/http/MarginHttp';
+import MarginPositionCard from './MarginPositionCard';
 
 /**
  * Margin Positions List
@@ -196,11 +197,19 @@ function MarginPositions() {
           </div>
         )}
 
-        {!loading && !error && positions.length > 0 && (
+        {!loading && !error && positions.length > 0 && filter === 'OPEN' && (
+          <div className="mt-4">
+            {positions.map((pos, idx) => (
+              <MarginPositionCard key={pos.position_id || idx} position={pos} />
+            ))}
+          </div>
+        )}
+
+        {!loading && !error && positions.length > 0 && filter !== 'OPEN' && (
           <div style={{ overflowX: 'auto' }}>
-            <Table 
-              hover 
-              style={{ 
+            <Table
+              hover
+              style={{
                 color: '#e2e8f0',
                 marginBottom: 0,
               }}
@@ -221,7 +230,7 @@ function MarginPositions() {
               </thead>
               <tbody>
                 {positions.map((pos, idx) => (
-                  <tr 
+                  <tr
                     key={pos.position_id || idx}
                     style={{ borderBottom: '1px solid #1e293b' }}
                   >
@@ -249,8 +258,8 @@ function MarginPositions() {
                     <td>{formatPnl(pos.total_pnl)}</td>
                     <td>{getHealthBadge(pos.margin_health)}</td>
                     <td style={{ color: '#94a3b8', fontSize: '0.85rem' }}>
-                      {pos.opened_at 
-                        ? new Date(pos.opened_at).toLocaleDateString() 
+                      {pos.opened_at
+                        ? new Date(pos.opened_at).toLocaleDateString()
                         : '-'}
                     </td>
                   </tr>
@@ -262,7 +271,7 @@ function MarginPositions() {
 
         {/* Summary Stats */}
         {monitorData && (
-          <div 
+          <div
             className="d-flex justify-content-around mt-3 pt-3"
             style={{ borderTop: '1px solid #334155' }}
           >
@@ -274,10 +283,10 @@ function MarginPositions() {
             </div>
             <div className="text-center">
               <div style={{ color: '#64748b', fontSize: '0.85rem' }}>At Risk</div>
-              <div style={{ 
-                color: monitorData.at_risk > 0 ? '#ef4444' : '#22c55e', 
-                fontSize: '1.5rem', 
-                fontWeight: 700 
+              <div style={{
+                color: monitorData.at_risk > 0 ? '#ef4444' : '#22c55e',
+                fontSize: '1.5rem',
+                fontWeight: 700
               }}>
                 {monitorData.at_risk}
               </div>
@@ -285,7 +294,7 @@ function MarginPositions() {
             <div className="text-center">
               <div style={{ color: '#64748b', fontSize: '0.85rem' }}>Last Update</div>
               <div style={{ color: '#94a3b8', fontSize: '0.9rem' }}>
-                {monitorData.timestamp 
+                {monitorData.timestamp
                   ? new Date(monitorData.timestamp).toLocaleTimeString()
                   : '-'}
               </div>

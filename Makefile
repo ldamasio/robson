@@ -106,6 +106,10 @@ dev-migrate:
 dev-test:
 	@cd $(MONO_DIR) && python manage.py test api.tests.test_models -v 2
 
+dev-reseed:
+	@cd $(MONO_DIR) && python manage.py seed_production_data
+	@echo "✓ Database re-seeded with production-like data"
+
 # Reset dev DB and api migrations (clean slate)
 .PHONY: dev-reset-api
 dev-reset-api:
