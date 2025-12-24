@@ -55,20 +55,31 @@ def transaction_history(request):
         limit = int(request.query_params.get('limit', 50))
         offset = int(request.query_params.get('offset', 0))
         
-        # Build query
-        queryset = AuditTransaction.objects.filter(client=client)
-        
-        if tx_type:
-            queryset = queryset.filter(transaction_type=tx_type.upper())
-        
-        if symbol:
-            queryset = queryset.filter(symbol=symbol.upper())
-        
-        # Get total count before pagination
-        total = queryset.count()
-        
-        # Apply pagination
-        transactions = queryset.order_by('-created_at')[offset:offset + limit]
+        # Build query (with fallback if table doesn't exist yet)
+        try:
+            queryset = AuditTransaction.objects.filter(client=client)
+            
+            if tx_type:
+                queryset = queryset.filter(transaction_type=tx_type.upper())
+            
+            if symbol:
+                queryset = queryset.filter(symbol=symbol.upper())
+            
+            # Get total count before pagination
+            total = queryset.count()
+            
+            # Apply pagination
+            transactions = queryset.order_by('-created_at')[offset:offset + limit]
+        except Exception:
+            # Table doesn't exist yet
+            return Response({
+                'success': True,
+                'transactions': [],
+                'total': 0,
+                'limit': limit,
+                'offset': offset,
+                'message': 'Audit table not yet created. Use /api/audit/activity/ for all activity.',
+            })
         
         # Serialize
         data = []
@@ -145,20 +156,24 @@ def all_activity(request):
         
         activities = []
         
-        # Get audit transactions
-        for tx in AuditTransaction.objects.filter(client=client).order_by('-created_at')[:limit]:
-            activities.append({
-                'type': 'audit_transaction',
-                'subtype': tx.transaction_type,
-                'description': tx.description,
-                'symbol': tx.symbol,
-                'side': tx.side,
-                'quantity': str(tx.quantity),
-                'price': str(tx.price) if tx.price else None,
-                'status': tx.status,
-                'timestamp': tx.created_at.isoformat(),
-                'binance_id': tx.binance_order_id,
-            })
+        # Get audit transactions (if table exists)
+        try:
+            for tx in AuditTransaction.objects.filter(client=client).order_by('-created_at')[:limit]:
+                activities.append({
+                    'type': 'audit_transaction',
+                    'subtype': tx.transaction_type,
+                    'description': tx.description,
+                    'symbol': tx.symbol,
+                    'side': tx.side,
+                    'quantity': str(tx.quantity),
+                    'price': str(tx.price) if tx.price else None,
+                    'status': tx.status,
+                    'timestamp': tx.created_at.isoformat(),
+                    'binance_id': tx.binance_order_id,
+                })
+        except Exception:
+            # Table doesn't exist yet - skip
+            pass
         
         # Get trades
         for trade in Trade.objects.all().order_by('-entry_time')[:limit]:
@@ -269,7 +284,16 @@ def balance_history(request):
         
         limit = int(request.query_params.get('limit', 100))
         
-        snapshots = BalanceSnapshot.objects.filter(client=client).order_by('-snapshot_time')[:limit]
+        try:
+            snapshots = BalanceSnapshot.objects.filter(client=client).order_by('-snapshot_time')[:limit]
+        except Exception:
+            # Table doesn't exist yet
+            return Response({
+                'success': True,
+                'snapshots': [],
+                'total': 0,
+                'message': 'Balance snapshot table not yet created.',
+            })
         
         data = []
         for snap in snapshots:
