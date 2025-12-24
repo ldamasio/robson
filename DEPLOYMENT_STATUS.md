@@ -41,67 +41,67 @@ api
 
 ---
 
-## 🔴 Problemas críticos encontrados
+## 🔴 Critical problems documented
 
-### 1. **DEBUG=True em produção** (CRÍTICO)
+### 1. **DEBUG=True in production** (CRITICAL)
 ```bash
 $ kubectl exec <pod> -- env | grep DEBUG
 DEBUG=True
 ```
 
-**Impacto**:
-- 🔴 Vazamento de informações sensíveis em stack traces
-- 🔴 Performance degradada
-- 🔴 Logs excessivos (stack completo em erros)
-- 🔴 Possível exposição de secrets
+**Impact**:
+- 🔴 Sensitive data exposure via stack traces
+- 🔴 Degraded performance
+- 🔴 Excessive logs (full stack traces on errors)
+- 🔴 Potential secret exposure
 
-**Ação necessária**:
-- [ ] Criar/atualizar ConfigMap/Secret com `DEBUG=False`
-- [ ] Adicionar env var `ENV=production` ou similar
-- [ ] Validar ALLOWED_HOSTS e CORS para produção
+**Required action**:
+- [ ] Create/update ConfigMap/Secret with `DEBUG=False`
+- [ ] Add env var `ENV=production` or similar
+- [ ] Validate ALLOWED_HOSTS and CORS for production
 
-### 2. **Banco de dados vazio** (BLOQUEADOR para validação)
+### 2. **Empty database** (BLOCKER for validation)
 ```bash
 $ kubectl exec <pod> -- python manage.py shell -c "from clients.models import Client; print(Client.objects.count())"
 0
 ```
 
-**Impacto**:
-- ⚠️ Audit command não pode rodar (precisa de Client)
-- ⚠️ Analytics retornam vazio
-- ⚠️ User operations não funcionam (FK para Client)
+**Impact**:
+- ⚠️ Audit command cannot run (requires a Client)
+- ⚠️ Analytics return empty results
+- ⚠️ User operations fail (FK to Client)
 
-**Ação necessária**:
-- [ ] Popular banco com Client inicial
-- [ ] Criar comando de bootstrap/seed para dados essenciais
+**Required action**:
+- [ ] Seed database with an initial Client
+- [ ] Create a bootstrap/seed command for essential data
 
-### 3. **Migration 0012 não aplicada**
+### 3. **Migration 0012 not applied**
 ```bash
 $ kubectl exec <pod> -- python manage.py showmigrations api
 ...
  [X] 0011_margin_models
- # 0012 não existe ainda no pod
+ # 0012 does not exist yet in the pod
 ```
 
-**Impacto**:
-- ⚠️ Tabelas `api_tradingintent` e `api_policystate` **não existem**
-- ⚠️ Qualquer código que usar esses models vai quebrar com "relation does not exist"
+**Impact**:
+- ⚠️ Tables `api_tradingintent` and `api_policystate` do not exist
+- ⚠️ Any code using those models will fail with "relation does not exist"
 
-**Ação necessária**:
-- [ ] Deploy do código com migration 0012
-- [ ] Executar `python manage.py migrate` no pod (ou via helm hook)
+**Required action**:
+- [ ] Deploy code with migration 0012
+- [ ] Run `python manage.py migrate` in the pod (or via Helm hook)
 
-### 4. **Alguns módulos falhando no import**
+### 4. **Some modules failing to import**
 ```
 ⚠️ Could not import margin views: No module named 'apps'
 ⚠️ Could not import emotional guard views: No module named 'apps'
 ```
 
-**Impacto**:
-- ⚠️ Endpoints de margin trading não disponíveis
-- ⚠️ Emotional guard não disponível
+**Impact**:
+- ⚠️ Margin trading endpoints unavailable
+- ⚠️ Emotional guard unavailable
 
-**Causa provável**: Path incorreto ou módulo não deployado
+**Likely cause**: Incorrect path or module not deployed
 
 ---
 
