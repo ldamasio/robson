@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: rbs-backend-nginx-prod-deploy
+  namespace: robson
   labels:
     app: rbs-backend-nginx-prod-deploy
 spec:
@@ -18,5 +19,6 @@ spec:
       containers:
       - name: rbs-backend-nginx-prod-deploy
         image: ldamasio/rbs-backend-nginx-prod:sha-e76d40c
+        imagePullPolicy: Always
         ports:
         - containerPort: 80

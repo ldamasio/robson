@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: rbs-backend-monolith-prod-deploy
+  namespace: robson
   labels:
     app: rbs-backend-monolith-prod-deploy
 spec:
@@ -17,6 +18,7 @@ spec:
       containers:
       - name: rbs-backend-monolith-prod-deploy
         image: ldamasio/rbs-backend-monolith-prod:sha-e76d40c
+        imagePullPolicy: Always
         env:
         - name: DJANGO_SETTINGS_MODULE
           value: "backend.settings"

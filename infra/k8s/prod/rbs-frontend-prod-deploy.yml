@@ -2,6 +2,7 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: rbs-frontend-prod-deploy
+  namespace: robson
 spec:
   selector:
     matchLabels:
@@ -18,6 +19,7 @@ spec:
       containers:
         - name: rbs-frontend-prod-deploy
           image: ldamasio/rbs-frontend-prod:sha-e76d40c
+          imagePullPolicy: Always
           ports:
           - containerPort: 80
           resources:
