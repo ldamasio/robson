@@ -17,7 +17,7 @@ spec:
     spec:
       containers:
         - name: rbs-frontend-prod-deploy
-          image: ldamasio/rbs-frontend-prod:latest
+          image: ldamasio/rbs-frontend-prod:sha-a68c144
           ports:
           - containerPort: 80
           resources:

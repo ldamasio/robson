@@ -79,6 +79,7 @@ jobs:
           tags: ${{ steps.fe_tags.outputs.tags }}
           build-args: |
             VITE_API_BASE_URL=https://api.robson.rbx.ia.br
+            VITE_APP_VERSION=${{ steps.meta.outputs.sha_tag }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
