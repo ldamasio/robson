@@ -7,14 +7,6 @@ import { useNavigate } from 'react-router-dom'
 const AuthContext = createContext()
 export default AuthContext;
 
-function ErrorMessage({ error }) {
-  return (
-    <div style={{ color: "red" }}>
-      <p>Error: {error}</p>
-    </div>
-  );
-}
-
 export const AuthProvider = ({ children }) => {
 
   let [authTokens, setAuthTokens] = useState(() => localStorage.getItem('authTokens') ? JSON.parse(localStorage.getItem('authTokens')) : null)
@@ -26,36 +18,56 @@ export const AuthProvider = ({ children }) => {
 
   let loginUser = async (e) => {
     e.preventDefault()
+    setError(null) // Clear previous errors
+
+    // Defensive check for API Base URL
+    const baseUrl = import.meta.env.VITE_API_BASE_URL;
+    if (!baseUrl || baseUrl === 'undefined' || baseUrl === '') {
+      setError("System Error: API URL is not configured. Please check .env file.");
+      return;
+    }
+
     try {
-      let response = await fetch(`${import.meta.env.VITE_API_BASE_URL}/api/token/`, {
+      let response = await fetch(`${baseUrl}/api/token/`, {
         method: 'POST',
         headers: {
           'Content-Type': 'application/json'
         },
         body: JSON.stringify({ 'username': e.target.username.value, 'password': e.target.password.value })
       })
-      let data = await response.json()
-      if (response.status !== 200) {
-        throw new Error('Something went wrong!')
+
+      let data;
+      // Robust JSON parsing
+      const contentType = response.headers.get("content-type");
+      if (contentType && contentType.indexOf("application/json") !== -1) {
+        data = await response.json();
+      } else {
+        // Handle non-JSON response (likely 404 html or empty)
+        if (!response.ok) {
+          throw new Error(`Server connection failed (${response.status} ${response.statusText})`);
+        }
       }
+
       if (response.status === 200) {
         setAuthTokens(data)
         setUser(jwt_decode(data.access))
         localStorage.setItem('authTokens', JSON.stringify(data))
         navigate('/feed')
       } else {
-        alert('Something went wrong!')
+        // API returned an error (e.g. 401 Unauthorized)
+        setError(data?.detail || 'Invalid username or password');
       }
     } catch (err) {
-      setError(err.message);
+      console.error("Login failed:", err)
+      setError(err.message || 'Network request failed');
     }
   }
 
   useEffect(() => {
     if (import.meta.env.VITE_API_BASE_URL) {
-      console.log('import.meta.env.VITE_API_BASE_URL', import.meta.env.VITE_API_BASE_URL)
+      console.log('API_BASE_URL:', import.meta.env.VITE_API_BASE_URL)
     }
-  }, [import.meta.env.VITE_API_BASE_URL])
+  }, [])
 
   let logoutUser = () => {
     setAuthTokens(null)
@@ -74,10 +86,9 @@ export const AuthProvider = ({ children }) => {
         },
         body: JSON.stringify({ 'refresh': authTokens?.refresh })
       })
+
       let data = await response.json()
-      if (response.status !== 200) {
-        throw new Error('Something went wrong!')
-      }
+
       if (response.status === 200) {
         setAuthTokens(data)
         setUser(jwt_decode(data.access))
@@ -86,7 +97,8 @@ export const AuthProvider = ({ children }) => {
         logoutUser()
       }
     } catch (err) {
-      setError(err.message);
+      console.error("Token refresh failed", err)
+      logoutUser()
     }
 
     if (loading) {
@@ -98,7 +110,8 @@ export const AuthProvider = ({ children }) => {
     user: user,
     authTokens: authTokens,
     loginUser: loginUser,
-    logoutUser: logoutUser
+    logoutUser: logoutUser,
+    error: error // Expose error state
   }
 
   useEffect(() => {
@@ -119,7 +132,6 @@ export const AuthProvider = ({ children }) => {
 
   return (
     <AuthContext.Provider value={contextData}>
-      {error && <ErrorMessage error={error} />}
       {children}
     </AuthContext.Provider>
   )

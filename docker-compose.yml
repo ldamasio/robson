@@ -10,6 +10,12 @@ services:
     volumes:
       - ./infra/data/postgres/:/docker-entrypoint-initdb.d
     restart: always
+  redis:
+    container_name: robsonRedis
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+    restart: always
   cronjob:
     container_name: cronjob
     build: ./apps/backend/cronjob

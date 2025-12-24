@@ -72,6 +72,19 @@ except ImportError as e:
     print(f"⚠️  Could not import emotional guard views: {e}")
     EMOTIONAL_GUARD_AVAILABLE = False
 
+# Import risk-managed trading views (PRODUCTION-SAFE)
+try:
+    from ..views.risk_managed_trading import (
+        validate_trade,
+        risk_managed_buy,
+        risk_managed_sell,
+        risk_status,
+    )
+    RISK_MANAGED_TRADING_AVAILABLE = True
+except ImportError as e:
+    print(f"⚠️  Could not import risk-managed trading views: {e}")
+    RISK_MANAGED_TRADING_AVAILABLE = False
+
 # Fallback function for missing views
 def fallback_view(request):
     from django.http import JsonResponse
@@ -240,6 +253,24 @@ if EMOTIONAL_GUARD_AVAILABLE:
     print("✅ Emotional Guard views loaded: /api/guard/analyze/, etc.")
 else:
     print("⚠️  Emotional Guard views not available")
+
+# ==========================================
+# RISK-MANAGED TRADING ROUTES (PRODUCTION-SAFE!)
+# ==========================================
+# These endpoints ENFORCE mandatory risk management rules:
+# - Stop-loss REQUIRED for every trade
+# - Risk per trade ≤ 1% of capital
+# - Monthly drawdown ≤ 4%
+if RISK_MANAGED_TRADING_AVAILABLE:
+    urlpatterns += [
+        path('trade/risk-managed/validate/', validate_trade, name='validate_trade'),
+        path('trade/risk-managed/buy/', risk_managed_buy, name='risk_managed_buy'),
+        path('trade/risk-managed/sell/', risk_managed_sell, name='risk_managed_sell'),
+        path('trade/risk-managed/status/', risk_status, name='risk_status'),
+    ]
+    print("✅ Risk-managed trading loaded: /api/trade/risk-managed/buy/, etc.")
+else:
+    print("⚠️  Risk-managed trading views not available")
 
 # Debug info
 print("🎯 URLs loaded following project patterns!")

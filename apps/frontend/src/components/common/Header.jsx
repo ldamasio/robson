@@ -1,29 +1,32 @@
 import React, { useContext } from 'react'
-import { Container, Nav, Navbar, NavDropdown } from 'react-bootstrap'
+import { Container, Nav, Navbar, NavDropdown, Button } from 'react-bootstrap'
 import { LinkContainer } from 'react-router-bootstrap'
 import AuthContext from '../../context/AuthContext'
 
 function Header() {
   let { user, logoutUser } = useContext(AuthContext)
+
   return (
-    <header>
-      <Navbar collapseOnSelect expand="lg" bg="dark" variant="dark">
+    <header className="sticky-top">
+      <Navbar collapseOnSelect expand="lg" variant="dark" className="bg-glass py-3">
         <Container>
           <LinkContainer to="/">
-            <Navbar.Brand>Robson</Navbar.Brand>
+            <Navbar.Brand className="fw-bold fs-4">
+              <span className="text-gradient">Robson</span>
+            </Navbar.Brand>
           </LinkContainer>
-          <Navbar.Toggle aria-controls="responsive-navbar-nav" />
+          <Navbar.Toggle aria-controls="responsive-navbar-nav" className="border-0" />
           <Navbar.Collapse id="responsive-navbar-nav">
-            <Nav className="justify-content-end" style={{ width: "100%", marginRight: "40px" }}>
+            <Nav className="mx-auto">
               <LinkContainer to="/features">
-                <Nav.Link>Features</Nav.Link>
+                <Nav.Link className="px-3">Features</Nav.Link>
               </LinkContainer>
               <LinkContainer to="/pricing">
-                <Nav.Link>Pricing</Nav.Link>
+                <Nav.Link className="px-3">Pricing</Nav.Link>
               </LinkContainer>
-              <NavDropdown title="Company" id="collasible-nav-dropdown">
+              <NavDropdown title="Company" id="collasible-nav-dropdown" className="px-2">
                 <LinkContainer to="/about-us">
-                  <NavDropdown.Item>About Us</NavDropdown.Item>
+                  <NavDropdown.Item>About RBX Robótica</NavDropdown.Item>
                 </LinkContainer>
                 <LinkContainer to="/our-team">
                   <NavDropdown.Item>Our Team</NavDropdown.Item>
@@ -33,25 +36,30 @@ function Header() {
                 </LinkContainer>
                 <NavDropdown.Divider />
                 <LinkContainer to="/contact">
-                  <NavDropdown.Item>Contact</NavDropdown.Item>
+                  <NavDropdown.Item>Contact Us</NavDropdown.Item>
                 </LinkContainer>
               </NavDropdown>
             </Nav>
-            <Nav className="text-nowrap">
+            <Nav className="align-items-center gap-3">
               {user ? (
-                <p onClick={logoutUser}>Logout</p>
+                <>
+                  <span className="text-light">Hi, {user.username}</span>
+                  <LinkContainer to="/feed">
+                    <Button variant="outline-light" size="sm">Dashboard</Button>
+                  </LinkContainer>
+                  <Button variant="link" className="text-decoration-none text-light" onClick={logoutUser}>Logout</Button>
+                </>
               ) : (
-                <LinkContainer to="/login">
-                  <Nav.Link>Login</Nav.Link>
-                </LinkContainer>
+                <>
+                  <LinkContainer to="/login">
+                    <Nav.Link>Login</Nav.Link>
+                  </LinkContainer>
+                  <LinkContainer to="/signup">
+                    <Button variant="primary" className="btn-primary rounded-pill px-4">Sign Up</Button>
+                  </LinkContainer>
+                </>
               )}
-              <LinkContainer to="/signup">
-                <Nav.Link>Sign up</Nav.Link>
-              </LinkContainer>
             </Nav>
-            {user &&
-              <p>Hello {user.username}</p>
-            }
           </Navbar.Collapse>
         </Container>
       </Navbar>
