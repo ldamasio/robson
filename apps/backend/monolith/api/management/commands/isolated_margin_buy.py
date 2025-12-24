@@ -318,8 +318,37 @@ class Command(BaseCommand):
             self.stdout.write(self.style.ERROR(f'  Transfer failed: {e}'))
             # Continue if we already have collateral in margin
 
-        # Step 2: Place margin order
-        self.stdout.write(self.style.HTTP_INFO('Step 2: Place Margin Entry Order'))
+        # Step 2: Borrow USDC for leveraged position
+        self.stdout.write(self.style.HTTP_INFO('Step 2: Borrow USDC'))
+        usdc_needed = quantity * entry_price
+        borrow_tran_id = None
+        try:
+            borrow_result = execution.client.create_margin_loan(
+                asset='USDC',
+                amount=str(usdc_needed.quantize(Decimal('0.01'))),
+                isIsolated='TRUE',
+                symbol=symbol
+            )
+            borrow_tran_id = borrow_result.get('tranId', 'N/A')
+            self.stdout.write(self.style.SUCCESS(f'  Borrowed {usdc_needed:.2f} USDC (ID: {borrow_tran_id})'))
+            
+            # Record borrow as transfer
+            with transaction.atomic():
+                MarginTransfer.objects.create(
+                    transaction_id=str(borrow_tran_id),
+                    client=client,
+                    symbol=symbol,
+                    asset='USDC',
+                    amount=usdc_needed.quantize(Decimal('0.01')),
+                    direction=MarginTransfer.Direction.TO_MARGIN,
+                    success=True,
+                )
+        except Exception as e:
+            self.stdout.write(self.style.ERROR(f'  Borrow failed: {e}'))
+            raise CommandError(f'Cannot proceed without borrowing USDC: {e}')
+
+        # Step 3: Place margin order
+        self.stdout.write(self.style.HTTP_INFO('Step 3: Place Margin Entry Order'))
         try:
             order_result = execution.client.create_margin_order(
                 symbol=symbol,
@@ -335,8 +364,8 @@ class Command(BaseCommand):
         except Exception as e:
             raise CommandError(f'Entry order failed: {e}')
 
-        # Step 3: Place stop-loss as margin order
-        self.stdout.write(self.style.HTTP_INFO('Step 3: Place Margin Stop-Loss'))
+        # Step 4: Place stop-loss as margin order
+        self.stdout.write(self.style.HTTP_INFO('Step 4: Place Margin Stop-Loss'))
         try:
             stop_order_result = execution.client.create_margin_order(
                 symbol=symbol,
@@ -355,8 +384,8 @@ class Command(BaseCommand):
             self.stdout.write(self.style.ERROR(f'  Stop order failed: {e}'))
             self.stdout.write(self.style.WARNING('  MANUAL STOP-LOSS REQUIRED!'))
 
-        # Step 4: Record position to database
-        self.stdout.write(self.style.HTTP_INFO('Step 4: Record Position (Audit)'))
+        # Step 5: Record position to database
+        self.stdout.write(self.style.HTTP_INFO('Step 5: Record Position (Audit)'))
         try:
             with transaction.atomic():
                 position = MarginPosition.objects.create(
