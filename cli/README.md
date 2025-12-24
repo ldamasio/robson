@@ -151,13 +151,49 @@ Position Size = (1% of Capital) / Stop Distance
 
 This ensures that if your stop-loss is hit, you lose at most **1% of your capital**.
 
-#### Margin Command Details
+### Operations (Audit Trail)
+
+View operations with their complete movement history:
+
+```bash
+# Show all recent operations with movements
+robson operations
+
+# Only open operations
+robson operations --open
+
+# Only closed operations
+robson operations --closed
+
+# Specific operation by ID
+robson operations --id OP-2024-12-24
+
+# JSON output for automation
+robson operations --json
+```
+
+The output shows the complete audit trail for each operation:
+
+```
++--------------------------------------------------------------------+
+|  📊 OPERACAO: OP-2024-12-24-001 (3x LONG BTCUSDC)                  |
++--------------------------------------------------------------------+
+|  12:00:01  ↔️ TRANSFER   30 USDC    Spot → Isolated               |
+|  12:00:02  💰 BORROW     60 USDC    Isolated Margin               |
+|  12:00:03  🟢 MARGIN_BUY 0.00095 BTC @ $95,000                    |
+|  12:00:04  🛑 STOP_LOSS  Colocado @ $93,000                       |
+|            ⏳ AGUARDANDO FECHAMENTO...                             |
++--------------------------------------------------------------------+
+```
+
+#### Command Details
 
 | Command | Description | Django Command |
 |---------|-------------|----------------|
 | `margin-status` | Account balances, equity, open P&L | `python manage.py status` |
 | `margin-positions` | Detailed position cards with risk metrics | `python manage.py positions` |
 | `margin-buy` | Open leveraged LONG with risk management | `python manage.py isolated_margin_buy` |
+| `operations` | Operations with movement audit trail | `python manage.py operations` |
 
 ### JSON Output (for automation)
 

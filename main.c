@@ -27,6 +27,7 @@ static const char* translate_legacy_flag(const char* arg) {
 	if (strcmp(arg, "--margin-status") == 0) return "margin-status";
 	if (strcmp(arg, "--margin-positions") == 0) return "margin-positions";
 	if (strcmp(arg, "--margin-buy") == 0) return "margin-buy";
+	if (strcmp(arg, "--operations") == 0) return "operations";
 	return NULL;
 }
 

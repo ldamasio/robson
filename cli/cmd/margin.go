@@ -80,6 +80,37 @@ Examples:
 	},
 }
 
+// operationsCmd shows operations with their movements
+var operationsCmd = &cobra.Command{
+	Use:   "operations",
+	Short: "Show operations with all movements (audit trail)",
+	Long: `Display trading operations with their complete movement history.
+
+Shows for each operation:
+  - Entry and exit trades
+  - Transfers (Spot <-> Isolated Margin)
+  - Borrows and repayments
+  - Stop-loss orders
+  - Fees charged
+
+This provides complete transparency - you can see exactly what happened.
+
+Examples:
+  robson operations                 # All recent operations
+  robson operations --open          # Only open operations
+  robson operations --id OP-2024    # Specific operation
+  robson operations --json          # JSON for automation`,
+	RunE: func(cmd *cobra.Command, args []string) error {
+		clientID, _ := cmd.Flags().GetInt("client-id")
+		showOpen, _ := cmd.Flags().GetBool("open")
+		showClosed, _ := cmd.Flags().GetBool("closed")
+		operationID, _ := cmd.Flags().GetString("id")
+		limit, _ := cmd.Flags().GetInt("limit")
+
+		return invokeDjangoOperations(clientID, showOpen, showClosed, operationID, limit, jsonOutput)
+	},
+}
+
 // marginBuyCmd opens a leveraged long position
 var marginBuyCmd = &cobra.Command{
 	Use:   "margin-buy",
@@ -129,6 +160,13 @@ func init() {
 	marginPositionsCmd.Flags().Bool("all", false, "Include closed positions")
 	marginPositionsCmd.Flags().String("symbol", "", "Filter by symbol (e.g., BTCUSDC)")
 
+	// Operations command flags
+	operationsCmd.Flags().Int("client-id", 1, "Client ID (tenant)")
+	operationsCmd.Flags().Bool("open", false, "Show only open operations")
+	operationsCmd.Flags().Bool("closed", false, "Show only closed operations")
+	operationsCmd.Flags().String("id", "", "Show specific operation by ID")
+	operationsCmd.Flags().Int("limit", 10, "Maximum number of operations to show")
+
 	// Margin-buy command flags
 	marginBuyCmd.Flags().String("capital", "", "Capital to use for position (REQUIRED)")
 	marginBuyCmd.Flags().String("stop-percent", "2", "Stop-loss as percentage below entry")
@@ -143,6 +181,7 @@ func init() {
 	// Register commands
 	rootCmd.AddCommand(marginStatusCmd)
 	rootCmd.AddCommand(marginPositionsCmd)
+	rootCmd.AddCommand(operationsCmd)
 	rootCmd.AddCommand(marginBuyCmd)
 }
 
@@ -191,6 +230,40 @@ func invokeDjangoPositions(clientID int, live, all bool, symbol string, useJSON 
 	}
 	if symbol != "" {
 		args = append(args, "--symbol", symbol)
+	}
+	if useJSON {
+		args = append(args, "--json")
+	}
+
+	cmd := exec.Command("python", args...)
+	cmd.Stdout = os.Stdout
+	cmd.Stderr = os.Stderr
+
+	return cmd.Run()
+}
+
+// invokeDjangoOperations invokes the Django operations command
+func invokeDjangoOperations(clientID int, showOpen, showClosed bool, operationID string, limit int, useJSON bool) error {
+	managePy := findDjangoManagePy()
+	if managePy == "" {
+		return fmt.Errorf("Django manage.py not found")
+	}
+
+	args := []string{
+		managePy,
+		"operations",
+		"--client-id", strconv.Itoa(clientID),
+		"--limit", strconv.Itoa(limit),
+	}
+
+	if showOpen {
+		args = append(args, "--open")
+	}
+	if showClosed {
+		args = append(args, "--closed")
+	}
+	if operationID != "" {
+		args = append(args, "--id", operationID)
 	}
 	if useJSON {
 		args = append(args, "--json")
