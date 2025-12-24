@@ -16,7 +16,7 @@ from django.utils.timezone import now
 from datetime import timedelta
 import logging
 
-from clients.models import Client, CustomUser
+from clients.models import Client, CustomUser, WaitlistEntry
 from .auth import MyTokenObtainPairSerializer
 
 logger = logging.getLogger(__name__)
@@ -245,5 +245,112 @@ def validate_demo_credentials(request):
         logger.error(f"Error validating demo credentials: {str(e)}")
         return Response(
             {'error': 'Erro ao validar credenciais'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@api_view(['POST'])
+@permission_classes([AllowAny])
+def join_waitlist(request):
+    """
+    Join the Pro plan waitlist.
+    
+    Users can join the waitlist to be notified when Pro plan
+    becomes available with payment integration.
+    
+    Request body:
+    {
+        "email": "user@example.com",
+        "is_demo_user": true  # Optional, defaults to false
+    }
+    """
+    try:
+        data = request.data
+        
+        if 'email' not in data or not data['email']:
+            return Response(
+                {'error': 'Email é obrigatório'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        email = data['email'].strip().lower()
+        is_demo_user = data.get('is_demo_user', False)
+        client_id = data.get('client_id')
+        
+        # Check if email already exists in waitlist
+        if WaitlistEntry.objects.filter(email=email).exists():
+            return Response(
+                {'error': 'Este email já está na lista de espera'},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+        
+        # Get client if provided
+        client = None
+        if client_id:
+            try:
+                client = Client.objects.get(id=client_id)
+            except Client.DoesNotExist:
+                pass
+        
+        # Create waitlist entry
+        waitlist_entry = WaitlistEntry.objects.create(
+            email=email,
+            client=client,
+            is_demo_user=is_demo_user
+        )
+        
+        logger.info(f"New waitlist entry: {email} (Demo: {is_demo_user})")
+        
+        return Response({
+            'success': True,
+            'message': 'Inscrito na lista de espera com sucesso!',
+            'email': email,
+            'is_demo_user': is_demo_user,
+            'created_at': waitlist_entry.created_at
+        }, status=status.HTTP_201_CREATED)
+        
+    except Exception as e:
+        logger.error(f"Error joining waitlist: {str(e)}")
+        return Response(
+            {'error': 'Erro ao se inscrever na lista de espera'},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@api_view(['GET'])
+@permission_classes([IsAuthenticated])
+def get_waitlist_status(request):
+    """
+    Get the current user's waitlist status.
+    
+    Returns whether the current user is on the waitlist
+    and their position/status.
+    """
+    try:
+        user = request.user
+        
+        # Check if user is on waitlist by email
+        waitlist_entry = WaitlistEntry.objects.filter(email=user.email).first()
+        
+        if waitlist_entry:
+            return Response({
+                'on_waitlist': True,
+                'email': waitlist_entry.email,
+                'is_demo_user': waitlist_entry.is_demo_user,
+                'created_at': waitlist_entry.created_at,
+                'notified': waitlist_entry.notified_at is not None,
+                'notified_at': waitlist_entry.notified_at,
+                'message': 'Você está na lista de espera do plano Pro!'
+            })
+        else:
+            return Response({
+                'on_waitlist': False,
+                'message': 'Você não está na lista de espera'
+            })
+        
+    except Exception as e:
+        logger.error(f"Error getting waitlist status: {str(e)}")
+        return Response(
+            {'error': 'Erro ao verificar status da lista de espera'},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )

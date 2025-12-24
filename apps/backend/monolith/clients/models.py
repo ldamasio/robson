@@ -157,6 +157,40 @@ class Client(models.Model):
         self.save()
 
 
+class WaitlistEntry(models.Model):
+    """
+    Model for Pro plan waitlist entries.
+    
+    Users can join the waitlist to be notified when Pro plan
+    becomes available with payment integration.
+    """
+    
+    email = models.EmailField(unique=True)
+    client = models.ForeignKey(
+        Client, 
+        blank=True, 
+        null=True, 
+        on_delete=models.SET_NULL,
+        related_name='waitlist_entries'
+    )
+    is_demo_user = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+    notified_at = models.DateTimeField(blank=True, null=True)
+    
+    class Meta:
+        verbose_name_plural = "Waitlist entries"
+        ordering = ['created_at']
+    
+    def __str__(self):
+        return f"{self.email} ({'Demo' if self.is_demo_user else 'New'})"
+    
+    def mark_notified(self) -> None:
+        """Mark this waitlist entry as notified."""
+        from django.utils.timezone import now
+        self.notified_at = now()
+        self.save()
+
+
 class CustomUser(AbstractUser):
     """
     Extended user model with client (tenant) association.

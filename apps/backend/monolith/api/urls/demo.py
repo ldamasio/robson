@@ -12,7 +12,9 @@ from ..views.demo import (
     create_demo_account,
     check_demo_status,
     upgrade_to_pro,
-    validate_demo_credentials
+    validate_demo_credentials,
+    join_waitlist,
+    get_waitlist_status
 )
 
 # Demo URL patterns
@@ -22,6 +24,10 @@ urlpatterns = [
     path('demo/status/', check_demo_status, name='demo_status'),
     path('demo/upgrade/', upgrade_to_pro, name='demo_upgrade'),
     path('demo/validate-credentials/', validate_demo_credentials, name='demo_validate_credentials'),
+    
+    # Waitlist endpoints
+    path('waitlist/join/', join_waitlist, name='waitlist_join'),
+    path('waitlist/status/', get_waitlist_status, name='waitlist_status'),
 ]
 
 # For easy reference in frontend
