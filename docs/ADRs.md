@@ -35,5 +35,6 @@ Index
 | ADR-0009 | RAG Architecture ParadeDB | Accepted | 2024-12 |
 | ADR-0010 | GitHub Data Ingestion | Accepted | 2024-12 |
 | ADR-0011 | GitOps Automatic Manifest Updates | Accepted | 2024-12 |
+| ADR-0012 | Production Deployment Integrity | Accepted | 2024-12 |
 
 Files located in `docs/adr/`.

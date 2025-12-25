@@ -37,6 +37,8 @@ docs/
 ├── adr/                             # Architecture Decision Records
 │   ├── ADR-TEMPLATE.md
 │   ├── ADR-0001 to ADR-0010
+├── policies/                        # Organizational policies
+│   └── PRODUCTION-DEPLOYMENT.md     # Production deployment integrity policy
 ├── ai-first/                        # AI-First transformation docs
 │   ├── ARCHITECTURE.md
 │   ├── DEEPSEEK_GATEWAY.md
@@ -84,6 +86,9 @@ docs/
 
 ### For **Operations / SRE**
 
+**Policies** (READ FIRST):
+- [Production Deployment Policy](policies/PRODUCTION-DEPLOYMENT.md) - **CRITICAL**: GitOps-only deployments
+
 **Deployment**:
 - [Infrastructure README](../infra/README.md) - Infrastructure overview
 - [K3s Cluster Guide](infra/K3S-CLUSTER-GUIDE.md) - k3s deployment guide
@@ -95,6 +100,7 @@ docs/
 - [ADR-0003: Istio Ambient](adr/ADR-0003-istio-ambient-gateway-api.md)
 - [ADR-0004: GitOps Previews](adr/ADR-0004-gitops-preview-envs.md)
 - [ADR-0005: Ansible Bootstrap](adr/ADR-0005-ansible-bootstrap-hardening.md)
+- [ADR-0011: GitOps Auto-Deploy](adr/ADR-0011-gitops-automatic-manifest-updates.md)
 
 ### For **AI Agents**
 
@@ -135,6 +141,7 @@ docs/
 | **ParadeDB Database** | [ADR-0007](adr/ADR-0007-paradedb-primary-database.md) |
 | **Transaction Hierarchy** | [architecture/TRANSACTION-HIERARCHY.md](architecture/TRANSACTION-HIERARCHY.md) |
 | **GitOps Auto-Deploy** | [ADR-0011](adr/ADR-0011-gitops-automatic-manifest-updates.md) |
+| **Production Integrity** | [ADR-0012](adr/ADR-0012-production-deployment-integrity.md) |
 
 ### Development
 
@@ -163,6 +170,13 @@ docs/
 | **REST API** | [specs/api/openapi.yaml](specs/api/openapi.yaml) |
 | **Spec-Driven Development** | [specs/README.md](specs/README.md) |
 | **Requirements** | [requirements/README.md](requirements/README.md) |
+
+### Policies & Governance
+
+| Topic | Document |
+|-------|----------|
+| **Production Deployment Policy** | [policies/PRODUCTION-DEPLOYMENT.md](policies/PRODUCTION-DEPLOYMENT.md) |
+| **Language Policy** | [LANGUAGE-POLICY.md](LANGUAGE-POLICY.md) |
 
 ---
 
@@ -200,10 +214,12 @@ Robson Bot is optimized for AI-assisted development:
 
 ### Path 3: New DevOps Engineer
 
-1. [Infrastructure Overview](../infra/README.md)
-2. [K3s Cluster Guide](infra/K3S-CLUSTER-GUIDE.md)
-3. [ADR-0004: GitOps Previews](adr/ADR-0004-gitops-preview-envs.md)
-4. [ArgoCD Setup](runbooks/argocd-initial-setup.md)
+1. [Production Deployment Policy](policies/PRODUCTION-DEPLOYMENT.md) ⚠️ **READ FIRST**
+2. [Infrastructure Overview](../infra/README.md)
+3. [K3s Cluster Guide](infra/K3S-CLUSTER-GUIDE.md)
+4. [ADR-0011: GitOps Auto-Deploy](adr/ADR-0011-gitops-automatic-manifest-updates.md)
+5. [ADR-0004: GitOps Previews](adr/ADR-0004-gitops-preview-envs.md)
+6. [ArgoCD Setup](runbooks/argocd-initial-setup.md)
 
 ### Path 4: Understanding Architecture
 
@@ -247,6 +263,6 @@ Robson Bot is optimized for AI-assisted development:
 
 ---
 
-**Last Updated**: 2024-12-24
+**Last Updated**: 2024-12-25
 **Maintained by**: Robson Bot Core Team
 **License**: Same as project
