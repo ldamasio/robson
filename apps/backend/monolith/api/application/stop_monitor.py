@@ -101,21 +101,15 @@ class PriceMonitor:
             logger.warning(f"Operation {operation.id} has no entry price")
             return None
         
-        # Calculate stop and target prices
-        stop_loss_price = None
-        take_profit_price = None
-        
-        if operation.stop_loss_percent:
-            if operation.side == "BUY":
-                stop_loss_price = entry_price * (1 - operation.stop_loss_percent / 100)
-            else:
-                stop_loss_price = entry_price * (1 + operation.stop_loss_percent / 100)
-        
-        if operation.stop_gain_percent:
-            if operation.side == "BUY":
-                take_profit_price = entry_price * (1 + operation.stop_gain_percent / 100)
-            else:
-                take_profit_price = entry_price * (1 - operation.stop_gain_percent / 100)
+        # ⭐ ADR-0012: Use absolute stop/target prices (NEVER recalculate from percentage)
+        # Get stop and target prices (absolute levels, FIXED when operation was created)
+        stop_loss_price = operation.stop_price  # May be None
+        take_profit_price = operation.target_price  # May be None
+
+        # Skip if no stop or target configured
+        if stop_loss_price is None and take_profit_price is None:
+            logger.debug(f"Operation {operation.id} has no stop_price or target_price configured")
+            return None
         
         # Get quantity
         quantity = operation.total_entry_quantity
@@ -179,13 +173,21 @@ class PriceMonitor:
     def check_all_operations(self) -> List[TriggerEvent]:
         """
         Check all active operations for triggers.
-        
+
+        ADR-0012: Only check operations with stop_price or target_price configured.
+
         Returns:
             List of TriggerEvent for any triggered stops/targets
         """
         from api.models import Operation
-        
-        active_operations = Operation.objects.filter(status="ACTIVE")
+        from django.db.models import Q
+
+        # Only check operations with stop_price or target_price configured
+        active_operations = Operation.objects.filter(
+            status="ACTIVE"
+        ).filter(
+            Q(stop_price__isnull=False) | Q(target_price__isnull=False)
+        )
         triggers = []
         
         for op in active_operations:
@@ -221,20 +223,35 @@ class StopExecutor:
             self._execution = BinanceExecution()
         return self._execution
     
-    def execute(self, trigger: TriggerEvent) -> ExecutionResult:
+    def execute(self, trigger: TriggerEvent, source: str = "cron") -> ExecutionResult:
         """
-        Execute a stop loss or take profit order.
-        
+        Execute a stop loss or take profit order with Event Sourcing and idempotency.
+
+        ADR-0012: Event-Sourced Stop-Loss Monitor
+        - Emits immutable events to stop_events (append-only log)
+        - Uses execution_token for idempotency (prevents duplicate executions)
+        - Updates stop_executions projection (materialized view)
+
         Args:
             trigger: TriggerEvent from PriceMonitor
-            
+            source: Execution source ('ws', 'cron', 'manual')
+
         Returns:
             ExecutionResult with order details
         """
         from api.models import Operation, Order, Trade
-        
+        from api.models.event_sourcing import (
+            StopEvent, StopExecution, StopEventType, ExecutionSource, ExecutionStatus
+        )
+        from django.db import IntegrityError
+        import uuid
+
         logger.info(f"⚡ Executing {trigger.trigger_type.value} for Operation {trigger.operation_id}")
-        
+
+        # Generate idempotency token: {operation_id}:{stop_price}:{timestamp_ms}
+        timestamp_ms = int(timezone.now().timestamp() * 1000)
+        execution_token = f"{trigger.operation_id}:{trigger.trigger_price}:{timestamp_ms}"
+
         try:
             with transaction.atomic():
                 # Get operation
@@ -247,21 +264,99 @@ class StopExecutor:
                         trigger_type=trigger.trigger_type,
                         error="Operation is not active",
                     )
-                
+
+                # ⭐ IDEMPOTENCY CHECK: Try to claim execution token
+                # If token already exists, another process already handled this trigger
+                try:
+                    trigger_event = StopEvent.objects.create(
+                        operation=operation,
+                        client=operation.client,
+                        symbol=trigger.symbol,
+                        event_type=StopEventType.STOP_TRIGGERED,
+                        trigger_price=trigger.current_price,
+                        stop_price=trigger.trigger_price,
+                        quantity=trigger.quantity,
+                        side="SELL" if operation.side == "BUY" else "BUY",  # Closing direction
+                        execution_token=execution_token,
+                        source=source,
+                        payload_json={
+                            "trigger_type": trigger.trigger_type.value,
+                            "entry_price": str(trigger.entry_price),
+                            "expected_pnl": str(trigger.expected_pnl),
+                        },
+                    )
+                except IntegrityError:
+                    # Token already exists - execution already in progress/completed
+                    logger.warning(
+                        f"⚠️  Execution token collision for Operation {trigger.operation_id}: "
+                        f"Another process already claimed this execution (token: {execution_token})"
+                    )
+                    return ExecutionResult(
+                        success=False,
+                        operation_id=trigger.operation_id,
+                        trigger_type=trigger.trigger_type,
+                        error="Duplicate execution prevented (idempotency)",
+                    )
+
+                # Create/update execution projection
+                execution, created = StopExecution.objects.update_or_create(
+                    operation=operation,
+                    defaults={
+                        'client': operation.client,
+                        'execution_token': execution_token,
+                        'status': ExecutionStatus.PENDING,
+                        'stop_price': trigger.trigger_price,
+                        'trigger_price': trigger.current_price,
+                        'quantity': trigger.quantity,
+                        'side': "SELL" if operation.side == "BUY" else "BUY",
+                        'source': source,
+                        'triggered_at': timezone.now(),
+                    }
+                )
+
+                # Update operation tracking
+                operation.stop_execution_token = execution_token
+                operation.last_stop_check_at = timezone.now()
+                operation.stop_check_count = (operation.stop_check_count or 0) + 1
+                operation.save()
+
                 # Determine order side (opposite of position)
                 close_side = "SELL" if operation.side == "BUY" else "BUY"
                 
+                # ⭐ EMIT EXECUTION_SUBMITTED EVENT
+                StopEvent.objects.create(
+                    operation=operation,
+                    client=operation.client,
+                    symbol=trigger.symbol,
+                    event_type=StopEventType.EXECUTION_SUBMITTED,
+                    trigger_price=trigger.current_price,
+                    stop_price=trigger.trigger_price,
+                    quantity=trigger.quantity,
+                    side=close_side,
+                    execution_token=execution_token,
+                    source=source,
+                    payload_json={
+                        "trigger_type": trigger.trigger_type.value,
+                        "entry_price": str(trigger.entry_price),
+                    },
+                )
+
+                # Update execution status
+                execution.status = ExecutionStatus.SUBMITTED
+                execution.submitted_at = timezone.now()
+                execution.save()
+
                 # Place market order
                 order_response = self.execution.place_market(
                     symbol=trigger.symbol,
                     side=close_side,
                     quantity=trigger.quantity,
                 )
-                
+
                 # Extract execution details
                 order_id = str(order_response.get("orderId"))
                 executed_qty = Decimal(order_response.get("executedQty", "0"))
-                
+
                 fills = order_response.get("fills", [])
                 if fills:
                     total_value = sum(Decimal(f["price"]) * Decimal(f["qty"]) for f in fills)
@@ -271,13 +366,48 @@ class StopExecutor:
                 else:
                     avg_price = trigger.current_price
                     total_fee = Decimal("0")
-                
+
+                # Calculate slippage
+                expected_price = trigger.trigger_price
+                slippage_pct = abs((avg_price - expected_price) / expected_price * 100) if expected_price else Decimal("0")
+
                 # Calculate P&L
                 if operation.side == "BUY":
                     pnl = (avg_price - trigger.entry_price) * executed_qty - total_fee
                 else:
                     pnl = (trigger.entry_price - avg_price) * executed_qty - total_fee
                 
+                # ⭐ EMIT EXECUTED EVENT
+                StopEvent.objects.create(
+                    operation=operation,
+                    client=operation.client,
+                    symbol=trigger.symbol,
+                    event_type=StopEventType.EXECUTED,
+                    trigger_price=trigger.current_price,
+                    stop_price=trigger.trigger_price,
+                    quantity=executed_qty,
+                    side=close_side,
+                    execution_token=execution_token,
+                    source=source,
+                    exchange_order_id=order_id,
+                    fill_price=avg_price,
+                    slippage_pct=slippage_pct,
+                    payload_json={
+                        "trigger_type": trigger.trigger_type.value,
+                        "entry_price": str(trigger.entry_price),
+                        "pnl": str(pnl),
+                        "fee": str(total_fee),
+                    },
+                )
+
+                # Update execution projection
+                execution.status = ExecutionStatus.EXECUTED
+                execution.executed_at = timezone.now()
+                execution.exchange_order_id = order_id
+                execution.fill_price = avg_price
+                execution.slippage_pct = slippage_pct
+                execution.save()
+
                 # Create exit order
                 exit_order = Order.objects.create(
                     symbol=operation.symbol,
@@ -289,30 +419,30 @@ class StopExecutor:
                     status="FILLED",
                     binance_order_id=order_id,
                 )
-                
+
                 # Add to operation
                 operation.exit_orders.add(exit_order)
                 operation.status = "CLOSED"
                 operation.save()
-                
+
                 # Update trade if exists
                 trade = Trade.objects.filter(
                     symbol=operation.symbol,
                     exit_price__isnull=True,
                 ).order_by("entry_time").first()
-                
+
                 if trade:
                     trade.exit_price = avg_price
                     trade.exit_fee = total_fee
                     trade.exit_time = timezone.now()
                     trade.save()
-                
+
                 # Update strategy stats
                 if operation.strategy:
                     operation.strategy.update_performance(pnl, pnl > 0)
-                
-                logger.info(f"✅ {trigger.trigger_type.value} executed: Order {order_id}, PnL: {pnl}")
-                
+
+                logger.info(f"✅ {trigger.trigger_type.value} executed: Order {order_id}, PnL: {pnl}, Slippage: {slippage_pct}%")
+
                 return ExecutionResult(
                     success=True,
                     operation_id=trigger.operation_id,
@@ -325,6 +455,42 @@ class StopExecutor:
                 
         except Exception as e:
             logger.error(f"❌ Execution failed: {e}", exc_info=True)
+
+            # ⭐ EMIT FAILED EVENT (even if outside transaction)
+            try:
+                from api.models import Operation
+                from api.models.event_sourcing import StopEvent, StopExecution, StopEventType, ExecutionStatus
+
+                operation = Operation.objects.get(id=trigger.operation_id)
+
+                StopEvent.objects.create(
+                    operation=operation,
+                    client=operation.client,
+                    symbol=trigger.symbol,
+                    event_type=StopEventType.FAILED,
+                    trigger_price=trigger.current_price,
+                    stop_price=trigger.trigger_price,
+                    quantity=trigger.quantity,
+                    side="SELL" if operation.side == "BUY" else "BUY",
+                    execution_token=execution_token,
+                    source=source,
+                    error_message=str(e),
+                    payload_json={
+                        "trigger_type": trigger.trigger_type.value,
+                        "entry_price": str(trigger.entry_price),
+                    },
+                )
+
+                # Update execution projection (if it exists)
+                StopExecution.objects.filter(operation=operation).update(
+                    status=ExecutionStatus.FAILED,
+                    failed_at=timezone.now(),
+                    error_message=str(e),
+                )
+
+            except Exception as event_error:
+                logger.error(f"Failed to emit FAILED event: {event_error}")
+
             return ExecutionResult(
                 success=False,
                 operation_id=trigger.operation_id,

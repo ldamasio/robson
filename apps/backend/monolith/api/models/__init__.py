@@ -167,6 +167,19 @@ from .audit import (
     AccountType,
 )
 
+# Event Sourcing (Stop-Loss Monitor)
+from .event_sourcing import (
+    StopEvent,
+    StopExecution,
+    TenantConfig,
+    CircuitBreakerStateModel,
+    Outbox,
+    StopEventType,
+    ExecutionSource,
+    ExecutionStatus,
+    CircuitBreakerState,
+)
+
 # ==========================================
 # LIST OF ALL AVAILABLE MODELS
 # ==========================================
@@ -281,6 +294,17 @@ __all__ = [
     'TransactionStatus',
     'MovementCategory',
     'AccountType',
+
+    # Event Sourcing (Stop-Loss Monitor)
+    'StopEvent',
+    'StopExecution',
+    'TenantConfig',
+    'CircuitBreakerStateModel',
+    'Outbox',
+    'StopEventType',
+    'ExecutionSource',
+    'ExecutionStatus',
+    'CircuitBreakerState',
 ]
 
 # ==========================================

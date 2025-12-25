@@ -302,13 +302,22 @@ def create_user_operation(request):
                 }
             )
 
-            # Create Operation
+            # Create Operation with ABSOLUTE stop/target prices
+            # ⭐ ADR-0012: Always use absolute prices (FIXED levels)
             operation = Operation.objects.create(
                 client=client,
                 symbol=symbol,
                 strategy=strategy,
                 side=side,
                 status='PLANNED',
+                stop_price=stop_price,  # ⭐ Absolute stop level (from user)
+                target_price=target_price,  # ⭐ Absolute target level (optional)
+                # Also calculate percentages for reference (DEPRECATED fields)
+                stop_loss_percent=calc['stop_distance_percent'],  # Reference only
+                stop_gain_percent=(
+                    abs((target_price - entry_price) / entry_price * 100)
+                    if target_price else None
+                ),
             )
 
             # Create Entry Order
