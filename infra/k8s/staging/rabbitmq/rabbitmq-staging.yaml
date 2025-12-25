@@ -1,0 +1,139 @@
+# RabbitMQ Staging
+# Message queue for event sourcing and async tasks
+# Created: 2024-12-25
+
+---
+# PersistentVolumeClaim for RabbitMQ data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: rabbitmq-staging-data
+  namespace: staging
+  labels:
+    app: rabbitmq-staging
+    environment: staging
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi  # 5GB for staging
+  storageClassName: local-path
+
+---
+# Service for RabbitMQ
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq-staging
+  namespace: staging
+  labels:
+    app: rabbitmq-staging
+    environment: staging
+spec:
+  type: ClusterIP
+  ports:
+  - port: 5672
+    targetPort: 5672
+    protocol: TCP
+    name: amqp
+  - port: 15672
+    targetPort: 15672
+    protocol: TCP
+    name: management
+  selector:
+    app: rabbitmq-staging
+
+---
+# Deployment for RabbitMQ
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rabbitmq-staging
+  namespace: staging
+  labels:
+    app: rabbitmq-staging
+    environment: staging
+spec:
+  replicas: 1  # Single instance in staging
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: rabbitmq-staging
+  template:
+    metadata:
+      labels:
+        app: rabbitmq-staging
+        environment: staging
+    spec:
+      containers:
+      - name: rabbitmq
+        image: rabbitmq:3-management-alpine
+        imagePullPolicy: Always
+
+        ports:
+        - containerPort: 5672
+          name: amqp
+        - containerPort: 15672
+          name: management
+
+        env:
+        - name: RABBITMQ_DEFAULT_USER
+          valueFrom:
+            secretKeyRef:
+              name: rabbitmq-staging
+              key: RABBITMQ_DEFAULT_USER
+        - name: RABBITMQ_DEFAULT_PASS
+          valueFrom:
+            secretKeyRef:
+              name: rabbitmq-staging
+              key: RABBITMQ_DEFAULT_PASS
+        - name: RABBITMQ_ERLANG_COOKIE
+          value: "robson-staging-cookie-$(cat /dev/urandom | tr -dc 'a-zA-Z0-9' | fold -w 32 | head -n 1)"
+
+        volumeMounts:
+        - name: rabbitmq-data
+          mountPath: /var/lib/rabbitmq
+
+        resources:
+          requests:
+            cpu: 100m
+            memory: 256Mi
+          limits:
+            cpu: 500m
+            memory: 1Gi
+
+        # Liveness probe
+        livenessProbe:
+          exec:
+            command:
+            - rabbitmq-diagnostics
+            - -q
+            - ping
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+
+        # Readiness probe
+        readinessProbe:
+          exec:
+            command:
+            - rabbitmq-diagnostics
+            - -q
+            - check_running
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+      volumes:
+      - name: rabbitmq-data
+        persistentVolumeClaim:
+          claimName: rabbitmq-staging-data
+
+      securityContext:
+        fsGroup: 999
+        runAsUser: 999
+        runAsNonRoot: true

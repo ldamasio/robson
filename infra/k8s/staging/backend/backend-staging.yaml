@@ -1,0 +1,241 @@
+# Backend Staging (Django Monolith)
+# Event Sourcing Stop Monitor + Trading API
+# Created: 2024-12-25
+
+---
+# Service for Backend
+apiVersion: v1
+kind: Service
+metadata:
+  name: backend-staging
+  namespace: staging
+  labels:
+    app: backend-staging
+    environment: staging
+spec:
+  type: ClusterIP
+  ports:
+  - port: 8000
+    targetPort: 8000
+    protocol: TCP
+    name: http
+  selector:
+    app: backend-staging
+
+---
+# Deployment for Backend
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: backend-staging
+  namespace: staging
+  labels:
+    app: backend-staging
+    environment: staging
+spec:
+  replicas: 2  # 2 replicas (vs 3 in production)
+  strategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 1
+      maxUnavailable: 0  # Zero downtime deployments
+
+  selector:
+    matchLabels:
+      app: backend-staging
+
+  template:
+    metadata:
+      labels:
+        app: backend-staging
+        environment: staging
+        version: staging  # For Istio traffic routing
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "9090"
+        prometheus.io/path: "/metrics"
+
+    spec:
+      # Init container to wait for PostgreSQL
+      initContainers:
+      - name: wait-for-postgres
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - |
+          until nc -z postgres-staging 5432; do
+            echo "Waiting for PostgreSQL..."
+            sleep 2
+          done
+          echo "PostgreSQL is ready!"
+
+      containers:
+      - name: backend
+        image: ghcr.io/ldamasio/rbs-backend-monolith:staging-latest
+        imagePullPolicy: Always
+
+        ports:
+        - containerPort: 8000
+          name: http
+        - containerPort: 9090
+          name: metrics
+
+        env:
+        # Environment
+        - name: ENVIRONMENT
+          value: "staging"
+
+        - name: DEBUG
+          value: "False"  # Never debug=True in staging/production
+
+        - name: ALLOWED_HOSTS
+          value: "api.staging.rbx.ia.br,backend-staging,backend-staging.staging.svc.cluster.local"
+
+        # Database (PostgreSQL)
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: django-staging
+              key: DATABASE_URL
+
+        # Redis
+        - name: REDIS_URL
+          valueFrom:
+            secretKeyRef:
+              name: django-staging
+              key: REDIS_URL
+
+        # RabbitMQ
+        - name: RABBITMQ_URL
+          valueFrom:
+            secretKeyRef:
+              name: django-staging
+              key: RABBITMQ_URL
+
+        # Django Secret Key
+        - name: SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: django-staging
+              key: SECRET_KEY
+
+        # Binance API (TESTNET for staging)
+        - name: BINANCE_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: django-staging
+              key: BINANCE_API_KEY
+
+        - name: BINANCE_API_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: django-staging
+              key: BINANCE_API_SECRET
+
+        - name: BINANCE_TESTNET
+          value: "True"  # Use Binance Testnet in staging
+
+        # Gunicorn settings
+        - name: GUNICORN_WORKERS
+          value: "2"  # 2 workers (vs 4 in production)
+
+        - name: GUNICORN_THREADS
+          value: "4"
+
+        - name: GUNICORN_TIMEOUT
+          value: "120"
+
+        resources:
+          requests:
+            cpu: 500m      # Lower than production (1000m)
+            memory: 1Gi    # Lower than production (2Gi)
+          limits:
+            cpu: 2000m
+            memory: 4Gi
+
+        # Liveness probe (restart if unhealthy)
+        livenessProbe:
+          httpGet:
+            path: /health/
+            port: 8000
+            httpHeaders:
+            - name: Host
+              value: api.staging.rbx.ia.br
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+
+        # Readiness probe (don't send traffic if not ready)
+        readinessProbe:
+          httpGet:
+            path: /health/
+            port: 8000
+            httpHeaders:
+            - name: Host
+              value: api.staging.rbx.ia.br
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        # Startup probe (allow slow startups)
+        startupProbe:
+          httpGet:
+            path: /health/
+            port: 8000
+            httpHeaders:
+            - name: Host
+              value: api.staging.rbx.ia.br
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 12  # 12 * 10s = 2 minutes to start
+
+      # Security context
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+
+---
+# HorizontalPodAutoscaler (optional, for load testing)
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: backend-staging-hpa
+  namespace: staging
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: backend-staging
+  minReplicas: 2
+  maxReplicas: 5  # Lower than production (max 10)
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300  # Wait 5 min before scaling down
+      policies:
+      - type: Percent
+        value: 50
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0  # Scale up immediately
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 30

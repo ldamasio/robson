@@ -1,0 +1,173 @@
+# PostgreSQL Staging
+# Database: ParadeDB (PostgreSQL + pgvector + pg_search)
+# Environment: Staging (isolated from production)
+# Created: 2024-12-25
+
+---
+# PersistentVolumeClaim for PostgreSQL data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: postgres-staging-data
+  namespace: staging
+  labels:
+    app: postgres-staging
+    environment: staging
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 10Gi  # 10GB for staging (vs 50GB in production)
+  storageClassName: local-path  # k3s default
+
+---
+# Service for PostgreSQL
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgres-staging
+  namespace: staging
+  labels:
+    app: postgres-staging
+    environment: staging
+spec:
+  type: ClusterIP
+  ports:
+  - port: 5432
+    targetPort: 5432
+    protocol: TCP
+    name: postgres
+  selector:
+    app: postgres-staging
+
+---
+# Deployment for PostgreSQL
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: postgres-staging
+  namespace: staging
+  labels:
+    app: postgres-staging
+    environment: staging
+spec:
+  replicas: 1  # Single instance (no replication in staging)
+  strategy:
+    type: Recreate  # Cannot have 2 pods writing to same PVC
+  selector:
+    matchLabels:
+      app: postgres-staging
+  template:
+    metadata:
+      labels:
+        app: postgres-staging
+        environment: staging
+    spec:
+      containers:
+      - name: postgres
+        image: paradedb/paradedb:latest  # ParadeDB (PostgreSQL 16 + extensions)
+        imagePullPolicy: Always
+
+        ports:
+        - containerPort: 5432
+          name: postgres
+
+        env:
+        - name: POSTGRES_USER
+          valueFrom:
+            secretKeyRef:
+              name: postgres-staging
+              key: POSTGRES_USER
+        - name: POSTGRES_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-staging
+              key: POSTGRES_PASSWORD
+        - name: POSTGRES_DB
+          valueFrom:
+            secretKeyRef:
+              name: postgres-staging
+              key: POSTGRES_DB
+        - name: PGDATA
+          value: /var/lib/postgresql/data/pgdata
+
+        volumeMounts:
+        - name: postgres-data
+          mountPath: /var/lib/postgresql/data
+
+        resources:
+          requests:
+            cpu: 200m      # Lower than production (500m)
+            memory: 512Mi  # Lower than production (2Gi)
+          limits:
+            cpu: 1000m
+            memory: 2Gi
+
+        # Liveness probe (restart if unhealthy)
+        livenessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - robson_staging
+            - -d
+            - robson_staging
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        # Readiness probe (don't send traffic if not ready)
+        readinessProbe:
+          exec:
+            command:
+            - pg_isready
+            - -U
+            - robson_staging
+            - -d
+            - robson_staging
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+
+      volumes:
+      - name: postgres-data
+        persistentVolumeClaim:
+          claimName: postgres-staging-data
+
+      # Security context
+      securityContext:
+        fsGroup: 999  # postgres user
+        runAsUser: 999
+        runAsNonRoot: true
+
+---
+# ConfigMap for PostgreSQL initialization scripts (optional)
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgres-staging-init
+  namespace: staging
+data:
+  init.sql: |
+    -- PostgreSQL initialization script for staging
+    -- Extensions are already installed by ParadeDB
+
+    -- Create additional schemas if needed
+    CREATE SCHEMA IF NOT EXISTS audit;
+    CREATE SCHEMA IF NOT EXISTS monitoring;
+
+    -- Grant permissions
+    GRANT ALL PRIVILEGES ON SCHEMA public TO robson_staging;
+    GRANT ALL PRIVILEGES ON SCHEMA audit TO robson_staging;
+    GRANT ALL PRIVILEGES ON SCHEMA monitoring TO robson_staging;
+
+    -- Enable extensions (already included in ParadeDB)
+    CREATE EXTENSION IF NOT EXISTS pg_trgm;      -- Text search
+    CREATE EXTENSION IF NOT EXISTS btree_gin;    -- Indexing
+    CREATE EXTENSION IF NOT EXISTS btree_gist;   -- Indexing
+
+    -- Log
+    SELECT 'PostgreSQL staging initialized' AS status;

@@ -1,0 +1,70 @@
+# Namespace: staging
+# Environment: Staging (isolated from production)
+# Owner: Robson Bot Team
+# Created: 2024-12-25
+
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: staging
+  labels:
+    name: staging
+    environment: staging
+    istio-injection: enabled  # Enable Istio sidecar injection
+
+---
+# Resource Quota for Staging
+# Limits total resources in staging namespace
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: staging-quota
+  namespace: staging
+spec:
+  hard:
+    # CPU/Memory limits
+    requests.cpu: "4"      # Total CPU requests: 4 cores
+    requests.memory: 8Gi   # Total memory requests: 8GB
+    limits.cpu: "8"        # Total CPU limits: 8 cores
+    limits.memory: 16Gi    # Total memory limits: 16GB
+
+    # Storage limits
+    persistentvolumeclaims: "10"  # Max 10 PVCs
+    requests.storage: 50Gi        # Total storage: 50GB
+
+    # Object counts
+    services.loadbalancers: "1"   # Max 1 LoadBalancer (use Istio Gateway instead)
+    services: "20"                # Max 20 services
+    pods: "50"                    # Max 50 pods
+
+---
+# Limit Range for Staging
+# Default resource limits/requests for pods without explicit values
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: staging-limit-range
+  namespace: staging
+spec:
+  limits:
+  # Default limits for containers
+  - default:
+      cpu: 500m
+      memory: 1Gi
+    defaultRequest:
+      cpu: 100m
+      memory: 256Mi
+    max:
+      cpu: 2000m    # Max CPU per container: 2 cores
+      memory: 4Gi   # Max memory per container: 4GB
+    min:
+      cpu: 50m      # Min CPU per container: 50 millicores
+      memory: 64Mi  # Min memory per container: 64MB
+    type: Container
+
+  # Limits for PVCs
+  - max:
+      storage: 20Gi  # Max PVC size: 20GB
+    min:
+      storage: 1Gi   # Min PVC size: 1GB
+    type: PersistentVolumeClaim

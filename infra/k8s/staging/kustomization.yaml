@@ -1,0 +1,55 @@
+# Kustomization for Staging Environment
+# Apply all staging resources with: kubectl apply -k infra/k8s/staging/
+# Created: 2024-12-25
+
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: staging
+
+# Common labels for all resources
+commonLabels:
+  environment: staging
+  managed-by: kustomize
+
+# Common annotations
+commonAnnotations:
+  docs: "https://github.com/ldamasio/robson/blob/main/docs/infrastructure/STAGING-ARCHITECTURE.md"
+  owner: "robson-team"
+
+# Resources to deploy (in order)
+resources:
+# 1. Namespace and network policies
+- ../namespaces/staging.yaml
+- network-policies/isolation.yaml
+
+# 2. Persistent storage
+- postgres/postgres-staging.yaml
+- redis/redis-staging.yaml
+- rabbitmq/rabbitmq-staging.yaml
+
+# 3. Backend application
+- backend/backend-staging.yaml
+- backend/cronjob-stop-monitor.yaml
+
+# 4. Istio routing
+- istio/gateway-staging.yaml
+- istio/certificate-staging.yaml
+
+# Images (will be updated by CI/CD)
+images:
+- name: ghcr.io/ldamasio/rbs-backend-monolith
+  newName: ghcr.io/ldamasio/rbs-backend-monolith
+  newTag: staging-latest  # Updated by GitHub Actions
+
+# ConfigMap generator (if needed)
+# configMapGenerator:
+# - name: app-config
+#   literals:
+#   - ENVIRONMENT=staging
+
+# Secret generator (NEVER commit real secrets, use sealed-secrets instead)
+# secretGenerator:
+# - name: example-secret
+#   literals:
+#   - key=value

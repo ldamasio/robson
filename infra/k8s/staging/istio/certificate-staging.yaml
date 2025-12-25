@@ -1,0 +1,135 @@
+# TLS Certificate for Staging (Let's Encrypt)
+# cert-manager will automatically issue and renew certificates
+# Created: 2024-12-25
+
+---
+# Certificate for *.staging.rbx.ia.br
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: staging-rbx-ia-br-tls
+  namespace: staging
+spec:
+  # Secret name (referenced by Istio Gateway)
+  secretName: staging-rbx-ia-br-tls
+
+  # Issuer (Let's Encrypt production)
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+    group: cert-manager.io
+
+  # Common name
+  commonName: staging.rbx.ia.br
+
+  # Subject Alternative Names (SAN)
+  # NOTE: registro.br doesn't support wildcard, so list all subdomains
+  dnsNames:
+  - staging.rbx.ia.br
+  - api.staging.rbx.ia.br
+  - ws.staging.rbx.ia.br
+  - criticws.staging.rbx.ia.br
+  - rabbitmq.staging.rbx.ia.br
+  - grafana.staging.rbx.ia.br
+
+  # ACME challenge (HTTP-01)
+  # cert-manager will create temporary pods to prove domain ownership
+  secretTemplate:
+    annotations:
+      cert-manager.io/certificate-name: staging-rbx-ia-br-tls
+      cert-manager.io/cluster-issuer: letsencrypt-prod
+
+  # Renewal settings
+  renewBefore: 720h  # Renew 30 days before expiry (cert is valid 90 days)
+
+  # Key settings
+  privateKey:
+    algorithm: RSA
+    size: 2048
+    rotationPolicy: Always  # Rotate key on renewal
+
+  # Usages
+  usages:
+  - digital signature
+  - key encipherment
+  - server auth
+
+---
+# Ingress for HTTP-01 Challenge (cert-manager will use this)
+# This allows Let's Encrypt to access /.well-known/acme-challenge/
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: acme-challenge-staging
+  namespace: staging
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    cert-manager.io/acme-challenge-type: http01
+spec:
+  ingressClassName: istio  # Use Istio as ingress controller
+  rules:
+  - host: staging.rbx.ia.br
+    http:
+      paths:
+      - path: /.well-known/acme-challenge
+        pathType: Prefix
+        backend:
+          service:
+            name: cm-acme-http-solver  # cert-manager creates this service
+            port:
+              number: 8089
+
+  - host: api.staging.rbx.ia.br
+    http:
+      paths:
+      - path: /.well-known/acme-challenge
+        pathType: Prefix
+        backend:
+          service:
+            name: cm-acme-http-solver
+            port:
+              number: 8089
+
+  - host: ws.staging.rbx.ia.br
+    http:
+      paths:
+      - path: /.well-known/acme-challenge
+        pathType: Prefix
+        backend:
+          service:
+            name: cm-acme-http-solver
+            port:
+              number: 8089
+
+  - host: criticws.staging.rbx.ia.br
+    http:
+      paths:
+      - path: /.well-known/acme-challenge
+        pathType: Prefix
+        backend:
+          service:
+            name: cm-acme-http-solver
+            port:
+              number: 8089
+
+  - host: rabbitmq.staging.rbx.ia.br
+    http:
+      paths:
+      - path: /.well-known/acme-challenge
+        pathType: Prefix
+        backend:
+          service:
+            name: cm-acme-http-solver
+            port:
+              number: 8089
+
+  - host: grafana.staging.rbx.ia.br
+    http:
+      paths:
+      - path: /.well-known/acme-challenge
+        pathType: Prefix
+        backend:
+          service:
+            name: cm-acme-http-solver
+            port:
+              number: 8089

@@ -1,0 +1,172 @@
+# Istio Gateway for Staging
+# Routes traffic from *.staging.rbx.ia.br to staging services
+# Created: 2024-12-25
+
+---
+# Gateway: Staging
+apiVersion: networking.istio.io/v1beta1
+kind: Gateway
+metadata:
+  name: gateway-staging
+  namespace: staging
+spec:
+  selector:
+    istio: ingressgateway  # Use default Istio ingress gateway
+  servers:
+  # HTTPS for all staging subdomains
+  - port:
+      number: 443
+      name: https-staging
+      protocol: HTTPS
+    tls:
+      mode: SIMPLE
+      credentialName: staging-rbx-ia-br-tls  # TLS secret (created by cert-manager)
+    hosts:
+    - staging.rbx.ia.br
+    - api.staging.rbx.ia.br
+    - ws.staging.rbx.ia.br
+    - criticws.staging.rbx.ia.br
+    - rabbitmq.staging.rbx.ia.br
+    - grafana.staging.rbx.ia.br
+
+  # HTTP redirect to HTTPS
+  - port:
+      number: 80
+      name: http-staging
+      protocol: HTTP
+    hosts:
+    - staging.rbx.ia.br
+    - api.staging.rbx.ia.br
+    - ws.staging.rbx.ia.br
+    - criticws.staging.rbx.ia.br
+    - rabbitmq.staging.rbx.ia.br
+    - grafana.staging.rbx.ia.br
+    tls:
+      httpsRedirect: true  # Redirect HTTP → HTTPS
+
+---
+# VirtualService: Frontend Staging
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: frontend-staging
+  namespace: staging
+spec:
+  hosts:
+  - staging.rbx.ia.br
+  gateways:
+  - gateway-staging
+  http:
+  - match:
+    - uri:
+        prefix: /
+    route:
+    - destination:
+        host: frontend-staging.staging.svc.cluster.local
+        port:
+          number: 3000
+
+---
+# VirtualService: Backend API Staging
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: backend-staging
+  namespace: staging
+spec:
+  hosts:
+  - api.staging.rbx.ia.br
+  gateways:
+  - gateway-staging
+  http:
+  - match:
+    - uri:
+        prefix: /
+    route:
+    - destination:
+        host: backend-staging.staging.svc.cluster.local
+        port:
+          number: 8000
+    timeout: 30s
+    retries:
+      attempts: 3
+      perTryTimeout: 10s
+      retryOn: gateway-error,connect-failure,refused-stream
+
+---
+# VirtualService: Rust WebSocket (criticws) Staging
+# NOTE: This service doesn't exist yet (future Phase 2)
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: criticws-staging
+  namespace: staging
+spec:
+  hosts:
+  - criticws.staging.rbx.ia.br
+  gateways:
+  - gateway-staging
+  http:
+  - match:
+    - uri:
+        prefix: /ws
+    route:
+    - destination:
+        host: rust-ws-staging.staging.svc.cluster.local
+        port:
+          number: 8080
+    websocketUpgrade: true  # Enable WebSocket upgrade
+
+  # Health check endpoint
+  - match:
+    - uri:
+        prefix: /health
+    route:
+    - destination:
+        host: rust-ws-staging.staging.svc.cluster.local
+        port:
+          number: 8080
+
+---
+# VirtualService: RabbitMQ Management UI Staging
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: rabbitmq-staging
+  namespace: staging
+spec:
+  hosts:
+  - rabbitmq.staging.rbx.ia.br
+  gateways:
+  - gateway-staging
+  http:
+  - match:
+    - uri:
+        prefix: /
+    route:
+    - destination:
+        host: rabbitmq-staging.staging.svc.cluster.local
+        port:
+          number: 15672  # Management UI port
+
+---
+# VirtualService: Grafana Staging (future)
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: grafana-staging
+  namespace: staging
+spec:
+  hosts:
+  - grafana.staging.rbx.ia.br
+  gateways:
+  - gateway-staging
+  http:
+  - match:
+    - uri:
+        prefix: /
+    route:
+    - destination:
+        host: grafana-staging.staging.svc.cluster.local
+        port:
+          number: 3000

@@ -1,0 +1,185 @@
+# Network Policies for Staging Isolation
+# ADR-0012: Staging MUST NOT communicate with production namespace
+# Created: 2024-12-25
+
+---
+# Policy 1: Deny all ingress/egress by default (whitelist approach)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all-default
+  namespace: staging
+spec:
+  podSelector: {}  # Apply to all pods in staging
+  policyTypes:
+  - Ingress
+  - Egress
+  # No ingress/egress rules = deny all (except what's explicitly allowed below)
+
+---
+# Policy 2: Allow internal staging communication
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-staging-internal
+  namespace: staging
+spec:
+  podSelector: {}  # Apply to all pods
+  policyTypes:
+  - Ingress
+  - Egress
+
+  # Allow ingress from same namespace
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: staging
+
+  # Allow egress to same namespace
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: staging
+
+---
+# Policy 3: Allow DNS (kube-dns / CoreDNS)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: staging
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+
+  egress:
+  # Allow DNS queries to kube-system
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+
+---
+# Policy 4: Allow Istio ingress (from istio-system)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-istio-ingress
+  namespace: staging
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+
+  ingress:
+  # Allow traffic from Istio Gateway
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: istio-system
+    ports:
+    - protocol: TCP
+      port: 8000  # Backend port
+    - protocol: TCP
+      port: 3000  # Frontend port
+    - protocol: TCP
+      port: 8080  # Rust WS port (future)
+
+---
+# Policy 5: Allow external egress (Internet)
+# Required for:
+# - Binance API calls
+# - Package downloads
+# - cert-manager ACME challenges
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-external-egress
+  namespace: staging
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+
+  egress:
+  # Allow HTTPS to Internet
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 443  # HTTPS
+    - protocol: TCP
+      port: 80   # HTTP (for cert-manager HTTP-01 challenge)
+
+  # Allow WebSocket to Binance
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 9443  # Binance WebSocket (wss://)
+
+---
+# Policy 6: CRITICAL - Block production namespace
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: block-production
+  namespace: staging
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+
+  # Explicitly deny traffic to/from production namespace
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchExpressions:
+        - key: name
+          operator: NotIn
+          values:
+          - robson  # Production namespace
+          - production
+
+  egress:
+  - to:
+    - namespaceSelector:
+        matchExpressions:
+        - key: name
+          operator: NotIn
+          values:
+          - robson  # Production namespace
+          - production
+
+---
+# Policy 7: Allow monitoring (Prometheus scraping)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-prometheus
+  namespace: staging
+spec:
+  podSelector:
+    matchLabels:
+      app: backend-staging  # Pods to monitor
+  policyTypes:
+  - Ingress
+
+  ingress:
+  # Allow Prometheus to scrape metrics
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring  # Prometheus namespace
+    ports:
+    - protocol: TCP
+      port: 9090  # Metrics port (default for /metrics endpoint)

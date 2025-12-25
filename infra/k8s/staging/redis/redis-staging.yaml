@@ -1,0 +1,135 @@
+# Redis Staging
+# Cache and session storage for staging environment
+# Created: 2024-12-25
+
+---
+# PersistentVolumeClaim for Redis data
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: redis-staging-data
+  namespace: staging
+  labels:
+    app: redis-staging
+    environment: staging
+spec:
+  accessModes:
+  - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi  # 5GB for staging (vs 20GB in production)
+  storageClassName: local-path
+
+---
+# Service for Redis
+apiVersion: v1
+kind: Service
+metadata:
+  name: redis-staging
+  namespace: staging
+  labels:
+    app: redis-staging
+    environment: staging
+spec:
+  type: ClusterIP
+  ports:
+  - port: 6379
+    targetPort: 6379
+    protocol: TCP
+    name: redis
+  selector:
+    app: redis-staging
+
+---
+# Deployment for Redis
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: redis-staging
+  namespace: staging
+  labels:
+    app: redis-staging
+    environment: staging
+spec:
+  replicas: 1  # Single instance in staging
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: redis-staging
+  template:
+    metadata:
+      labels:
+        app: redis-staging
+        environment: staging
+    spec:
+      containers:
+      - name: redis
+        image: redis:7-alpine
+        imagePullPolicy: Always
+
+        ports:
+        - containerPort: 6379
+          name: redis
+
+        command:
+        - redis-server
+        - --appendonly
+        - "yes"
+        - --requirepass
+        - $(REDIS_PASSWORD)
+
+        env:
+        - name: REDIS_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: redis-staging
+              key: REDIS_PASSWORD
+
+        volumeMounts:
+        - name: redis-data
+          mountPath: /data
+
+        resources:
+          requests:
+            cpu: 100m       # Lower than production
+            memory: 256Mi   # Lower than production
+          limits:
+            cpu: 500m
+            memory: 1Gi
+
+        # Liveness probe
+        livenessProbe:
+          exec:
+            command:
+            - redis-cli
+            - --pass
+            - $(REDIS_PASSWORD)
+            - ping
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        # Readiness probe
+        readinessProbe:
+          exec:
+            command:
+            - redis-cli
+            - --pass
+            - $(REDIS_PASSWORD)
+            - ping
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+          failureThreshold: 3
+
+      volumes:
+      - name: redis-data
+        persistentVolumeClaim:
+          claimName: redis-staging-data
+
+      securityContext:
+        fsGroup: 999
+        runAsUser: 999
+        runAsNonRoot: true
