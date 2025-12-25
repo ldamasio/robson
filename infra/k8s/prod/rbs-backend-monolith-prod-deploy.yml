@@ -19,7 +19,7 @@ spec:
     spec:
       containers:
       - name: rbs-backend-monolith-prod-deploy
-        image: ldamasio/rbs-backend-monolith-prod:sha-d672bbd
+        image: ldamasio/rbs-backend-monolith-prod:sha-edb6c99
         imagePullPolicy: Always
         env:
         - name: DJANGO_SETTINGS_MODULE
