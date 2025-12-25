@@ -241,8 +241,37 @@ class Operation(BaseModel):
     side = models.CharField(max_length=10, choices=SIDE_CHOICES)
     status = models.CharField(max_length=20, choices=STATUS_CHOICES, default="PLANNED")
 
-    stop_gain_percent = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
-    stop_loss_percent = models.DecimalField(max_digits=10, decimal_places=2, null=True, blank=True)
+    # Deprecated percentage fields (kept for reference only)
+    stop_gain_percent = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True,
+        help_text='[DEPRECATED] Use target_price instead. Kept for reference only.'
+    )
+    stop_loss_percent = models.DecimalField(
+        max_digits=10, decimal_places=2, null=True, blank=True,
+        help_text='[DEPRECATED] Use stop_price instead. Kept for reference only.'
+    )
+
+    # ADR-0012: Absolute stop/target prices (FIXED levels, never recalculated)
+    stop_price = models.DecimalField(
+        max_digits=20, decimal_places=8, null=True, blank=True, db_index=True,
+        help_text='Absolute technical stop price (FIXED level, never recalculated)'
+    )
+    target_price = models.DecimalField(
+        max_digits=20, decimal_places=8, null=True, blank=True, db_index=True,
+        help_text='Absolute target/take-profit price (FIXED level)'
+    )
+    stop_execution_token = models.CharField(
+        max_length=64, null=True, blank=True, db_index=True,
+        help_text='Idempotency token of current/last stop execution'
+    )
+    last_stop_check_at = models.DateTimeField(
+        null=True, blank=True,
+        help_text='Last time stop monitor checked this operation'
+    )
+    stop_check_count = models.IntegerField(
+        null=True, blank=True, default=0,
+        help_text='Number of times stop monitor has checked this operation'
+    )
 
     entry_orders = models.ManyToManyField(Order, related_name="operation_entries", blank=True)
     exit_orders = models.ManyToManyField(Order, related_name="operation_exits", blank=True)

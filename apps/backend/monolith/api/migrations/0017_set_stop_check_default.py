@@ -21,7 +21,7 @@ class Migration(migrations.Migration):
     operations = [
         # Set default for stop_check_count (metadata-only in PG 11+)
         migrations.RunSQL(
-            sql="ALTER TABLE operation ALTER COLUMN stop_check_count SET DEFAULT 0;",
-            reverse_sql="ALTER TABLE operation ALTER COLUMN stop_check_count DROP DEFAULT;",
+            sql="ALTER TABLE api_operation ALTER COLUMN stop_check_count SET DEFAULT 0;",
+            reverse_sql="ALTER TABLE api_operation ALTER COLUMN stop_check_count DROP DEFAULT;",
         ),
     ]

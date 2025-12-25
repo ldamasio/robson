@@ -265,31 +265,17 @@ class StopExecutor:
                         error="Operation is not active",
                     )
 
-                # ⭐ IDEMPOTENCY CHECK: Try to claim execution token
-                # If token already exists, another process already handled this trigger
-                try:
-                    trigger_event = StopEvent.objects.create(
-                        operation=operation,
-                        client=operation.client,
-                        symbol=trigger.symbol,
-                        event_type=StopEventType.STOP_TRIGGERED,
-                        trigger_price=trigger.current_price,
-                        stop_price=trigger.trigger_price,
-                        quantity=trigger.quantity,
-                        side="SELL" if operation.side == "BUY" else "BUY",  # Closing direction
-                        execution_token=execution_token,
-                        source=source,
-                        payload_json={
-                            "trigger_type": trigger.trigger_type.value,
-                            "entry_price": str(trigger.entry_price),
-                            "expected_pnl": str(trigger.expected_pnl),
-                        },
-                    )
-                except IntegrityError:
-                    # Token already exists - execution already in progress/completed
+                # ⭐ IDEMPOTENCY CHECK: Check if execution already in progress/completed
+                # Uses StopExecution projection to prevent duplicate executions
+                existing_execution = StopExecution.objects.filter(
+                    operation=operation,
+                    status__in=[ExecutionStatus.SUBMITTED, ExecutionStatus.EXECUTED, ExecutionStatus.FAILED]
+                ).first()
+                
+                if existing_execution:
                     logger.warning(
-                        f"⚠️  Execution token collision for Operation {trigger.operation_id}: "
-                        f"Another process already claimed this execution (token: {execution_token})"
+                        f"⚠️  Execution already exists for Operation {trigger.operation_id}: "
+                        f"status={existing_execution.status}, token={existing_execution.execution_token}"
                     )
                     return ExecutionResult(
                         success=False,
@@ -297,6 +283,25 @@ class StopExecutor:
                         trigger_type=trigger.trigger_type,
                         error="Duplicate execution prevented (idempotency)",
                     )
+                
+                # Create TRIGGERED event
+                trigger_event = StopEvent.objects.create(
+                    operation=operation,
+                    client=operation.client,
+                    symbol=trigger.symbol,
+                    event_type=StopEventType.STOP_TRIGGERED,
+                    trigger_price=trigger.current_price,
+                    stop_price=trigger.trigger_price,
+                    quantity=trigger.quantity,
+                    side="SELL" if operation.side == "BUY" else "BUY",  # Closing direction
+                    execution_token=execution_token,
+                    source=source,
+                    payload_json={
+                        "trigger_type": trigger.trigger_type.value,
+                        "entry_price": str(trigger.entry_price),
+                        "expected_pnl": str(trigger.expected_pnl),
+                    },
+                )
 
                 # Create/update execution projection
                 execution, created = StopExecution.objects.update_or_create(

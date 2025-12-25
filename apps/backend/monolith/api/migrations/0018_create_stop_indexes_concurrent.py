@@ -28,7 +28,7 @@ class Migration(migrations.Migration):
         migrations.RunSQL(
             sql="""
             CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_operation_status_stop
-            ON operation (status, stop_price)
+            ON api_operation (status, stop_price)
             WHERE status = 'ACTIVE' AND stop_price IS NOT NULL;
             """,
             reverse_sql="DROP INDEX CONCURRENTLY IF EXISTS idx_operation_status_stop;",
@@ -38,7 +38,7 @@ class Migration(migrations.Migration):
         migrations.RunSQL(
             sql="""
             CREATE INDEX CONCURRENTLY IF NOT EXISTS idx_operation_exec_token
-            ON operation (stop_execution_token)
+            ON api_operation (stop_execution_token)
             WHERE stop_execution_token IS NOT NULL;
             """,
             reverse_sql="DROP INDEX CONCURRENTLY IF EXISTS idx_operation_exec_token;",

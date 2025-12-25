@@ -9,6 +9,7 @@ import uuid
 class Migration(migrations.Migration):
     dependencies = [
         ('api', '0014_alter_audittransaction_options_and_more'),
+        ('clients', '0001_initial'),  # Required for Client FK
     ]
 
     operations = [
@@ -25,10 +26,12 @@ class Migration(migrations.Migration):
                     editable=False,
                     help_text='Unique event identifier'
                 )),
-                ('event_seq', models.BigAutoField(
+                ('event_seq', models.BigIntegerField(
                     unique=True,
                     editable=False,
-                    help_text='Global sequence number for event ordering'
+                    null=True,
+                    blank=True,
+                    help_text='Global sequence number for event ordering (auto-populated via DB sequence)'
                 )),
                 ('occurred_at', models.DateTimeField(
                     auto_now_add=True,
@@ -45,7 +48,7 @@ class Migration(migrations.Migration):
                 )),
                 ('client', models.ForeignKey(
                     on_delete=models.CASCADE,
-                    to='api.client',
+                    to='clients.client',
                     related_name='stop_events',
                     help_text='Tenant/client for multi-tenant isolation'
                 )),
@@ -103,14 +106,13 @@ class Migration(migrations.Migration):
                     help_text='Order side (closing direction)'
                 )),
 
-                # Idempotency
+                # Idempotency - NOT unique because multiple events share same token
                 ('execution_token', models.CharField(
                     max_length=64,
-                    unique=True,
                     null=True,
                     blank=True,
                     db_index=True,
-                    help_text='Global idempotency token (prevents duplicate executions)'
+                    help_text='Execution token (shared by all events in same execution)'
                 )),
 
                 # Payload (full context for debugging)
@@ -210,7 +212,7 @@ class Migration(migrations.Migration):
                 )),
                 ('client', models.ForeignKey(
                     on_delete=models.CASCADE,
-                    to='api.client',
+                    to='clients.client',
                     related_name='stop_executions',
                     help_text='Tenant/client for multi-tenant isolation'
                 )),
@@ -360,7 +362,7 @@ class Migration(migrations.Migration):
                 ('client', models.OneToOneField(
                     primary_key=True,
                     on_delete=models.CASCADE,
-                    to='api.client',
+                    to='clients.client',
                     related_name='risk_config',
                     help_text='Associated client/tenant'
                 )),

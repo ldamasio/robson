@@ -47,13 +47,19 @@ class Command(BaseCommand):
         self.stdout.write("")
 
         # Query operations that need backfill
-        operations_to_backfill = Operation.objects.filter(
+        # Note: average_entry_price is a property (not a DB field), so we filter in memory
+        operations_to_backfill = list(Operation.objects.filter(
             stop_price__isnull=True,  # No stop_price set yet
             stop_loss_percent__isnull=False,  # Has percentage
-            average_entry_price__isnull=False,  # Has entry price (required for calculation)
-        )
+        ).prefetch_related('entry_orders'))
+        
+        # Filter in memory: only those with entry orders (average_entry_price != None)
+        operations_to_backfill = [
+            op for op in operations_to_backfill 
+            if op.average_entry_price is not None
+        ]
 
-        total_count = operations_to_backfill.count()
+        total_count = len(operations_to_backfill)
 
         if total_count == 0:
             self.stdout.write(self.style.SUCCESS("✅ No operations need backfill"))
@@ -67,10 +73,10 @@ class Command(BaseCommand):
         skipped_count = 0
         error_count = 0
 
-        for offset in range(0, total_count, batch_size):
+        for batch_num, offset in enumerate(range(0, total_count, batch_size)):
             batch = operations_to_backfill[offset:offset + batch_size]
 
-            self.stdout.write(f"Processing batch {offset // batch_size + 1} ({offset + 1}-{min(offset + batch_size, total_count)} of {total_count})...")
+            self.stdout.write(f"Processing batch {batch_num + 1} ({offset + 1}-{min(offset + batch_size, total_count)} of {total_count})...")
 
             # Prepare updates
             to_update = []
@@ -162,11 +168,12 @@ class Command(BaseCommand):
 
         # Verify backfill success
         if not dry_run:
-            remaining = Operation.objects.filter(
+            # Note: average_entry_price is a property, so we filter in memory
+            remaining_ops = Operation.objects.filter(
                 stop_price__isnull=True,
                 stop_loss_percent__isnull=False,
-                average_entry_price__isnull=False,
-            ).count()
+            ).prefetch_related('entry_orders')
+            remaining = len([op for op in remaining_ops if op.average_entry_price is not None])
 
             if remaining > 0:
                 self.stdout.write("")
