@@ -581,6 +581,52 @@ gh pr create --title "feat: stop-loss orders"
 
 ---
 
+## GitOps Auto-Deploy (NEW - December 2024)
+
+**Zero-touch production deployments!**
+
+Push to `main` → GitHub Actions builds images → Updates manifests → ArgoCD syncs → Production live.
+
+```
+Push to main → Build (sha-XXXXXX) → Update manifests → ArgoCD sync → ✅ Live
+```
+
+**No manual `kubectl rollout restart` required!**
+
+See: [ADR-0011: GitOps Automatic Manifest Updates](docs/adr/ADR-0011-gitops-automatic-manifest-updates.md)
+
+---
+
+## Audit Trail (NEW - December 2024)
+
+All financial movements are recorded in `AuditTransaction` for complete transparency.
+
+### Transaction Hierarchy
+
+```
+STRATEGY (e.g., "Mean Reversion MA99")
+    └── OPERATION (e.g., "3x LONG BTCUSDC")
+        └── MOVEMENT (atomic, auditable)
+            - SPOT_BUY, MARGIN_BUY
+            - TRANSFER_SPOT_TO_ISOLATED
+            - MARGIN_BORROW, MARGIN_REPAY
+            - STOP_LOSS_PLACED, STOP_LOSS_TRIGGERED
+            - TRADING_FEE, INTEREST_CHARGED
+```
+
+**Key Models**:
+- `api.models.audit.AuditTransaction` - Every financial movement
+- `api.models.audit.BalanceSnapshot` - Periodic balance snapshots
+
+**CLI Command**:
+```bash
+python manage.py operations  # Show operations with movements
+```
+
+See: [docs/architecture/TRANSACTION-HIERARCHY.md](docs/architecture/TRANSACTION-HIERARCHY.md)
+
+---
+
 ## Code Quality Checklist
 
 When generating code, ensure:
@@ -670,6 +716,12 @@ python manage.py positions --live    # Real-time prices
 python manage.py positions --json    # JSON output
 python manage.py isolated_margin_buy --capital 100 --stop-percent 2 --leverage 3  # DRY-RUN
 python manage.py isolated_margin_buy --capital 100 --leverage 3 --live --confirm  # LIVE
+
+# Audit Trail Commands (NEW)
+python manage.py operations          # Show operations with movements
+python manage.py operations --open   # Only open operations
+python manage.py operations --json   # JSON output
+python manage.py sync_transactions   # Sync trades from Binance
 ```
 
 ---
@@ -699,6 +751,6 @@ This guide provides quick context. The full AGENTS.md has comprehensive details 
 
 ---
 
-**Last Updated**: 2024-12-21
+**Last Updated**: 2024-12-24
 **Repository**: https://github.com/ldamasio/robson
-**Version**: 1.2 (Updated for ParadeDB and k3s deployment)
+**Version**: 1.3 (Updated for GitOps auto-deploy, Audit Trail, Margin Trading)

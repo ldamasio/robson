@@ -87,7 +87,54 @@ Tags published:
 
 **Production manifests in `infra/k8s/prod/` MUST use SHA tags.**
 
-### Promoting an Image to Production
+### Automatic Deployment (NEW - December 2024)
+
+**Deployments are now fully automatic!** When you push to `main`:
+
+```
+Developer pushes to main
+         │
+         ▼
+GitHub Actions builds images (sha-XXXXXX)
+         │
+         ▼
+GitHub Actions updates manifests in infra/k8s/prod/*.yml
+         │
+         ▼
+GitHub Actions commits + pushes with [skip ci]
+         │
+         ▼
+ArgoCD detects manifest change
+         │
+         ▼
+ArgoCD syncs automatically (rolling update)
+         │
+         ▼
+Smoke test verifies production is healthy
+         │
+         ▼
+✅ Deploy complete (~6-10 minutes)
+```
+
+**No manual intervention required!**
+
+### What the CI/CD Pipeline Does
+
+1. **Updates 4 manifests** automatically:
+   - `rbs-frontend-prod-deploy.yml`
+   - `rbs-backend-monolith-prod-deploy.yml`
+   - `rbs-backend-nginx-prod-deploy.yml`
+   - `rbs-stop-monitor-cronjob.yml`
+
+2. **Commits with `[skip ci]`** to avoid infinite loop
+
+3. **Waits for ArgoCD sync** (optional, requires `ARGOCD_AUTH_TOKEN` secret)
+
+4. **Runs smoke test** on `https://app.robson.rbx.ia.br`
+
+### Manual Promotion (Fallback)
+
+If automation fails, you can still promote manually:
 
 1. **Get the SHA tag** from GitHub Actions summary or commit hash:
    ```bash

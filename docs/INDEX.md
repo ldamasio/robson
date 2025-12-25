@@ -133,6 +133,8 @@ docs/
 | **Hexagonal Architecture** | [ADR-0002](adr/ADR-0002-hexagonal-architecture.md) |
 | **AI-First Architecture** | [ai-first/ARCHITECTURE.md](ai-first/ARCHITECTURE.md) |
 | **ParadeDB Database** | [ADR-0007](adr/ADR-0007-paradedb-primary-database.md) |
+| **Transaction Hierarchy** | [architecture/TRANSACTION-HIERARCHY.md](architecture/TRANSACTION-HIERARCHY.md) |
+| **GitOps Auto-Deploy** | [ADR-0011](adr/ADR-0011-gitops-automatic-manifest-updates.md) |
 
 ### Development
 
@@ -149,8 +151,10 @@ docs/
 |-------|----------|
 | **K3s Cluster Deployment** | [infra/K3S-CLUSTER-GUIDE.md](infra/K3S-CLUSTER-GUIDE.md) |
 | **ArgoCD Setup** | [runbooks/argocd-initial-setup.md](runbooks/argocd-initial-setup.md) |
+| **CI/CD & Image Tagging** | [runbooks/ci-cd-image-tagging.md](runbooks/ci-cd-image-tagging.md) |
 | **Deployment Checklist** | [runbooks/deployment-checklist.md](runbooks/deployment-checklist.md) |
 | **Infrastructure** | [../infra/README.md](../infra/README.md) |
+| **First Leveraged Position** | [operations/2025-12-24-first-leveraged-position.md](operations/2025-12-24-first-leveraged-position.md) |
 
 ### API & Specs
 
@@ -243,6 +247,6 @@ Robson Bot is optimized for AI-assisted development:
 
 ---
 
-**Last Updated**: 2024-12-21
+**Last Updated**: 2024-12-24
 **Maintained by**: Robson Bot Core Team
 **License**: Same as project

@@ -250,9 +250,21 @@ REQ-FUT-XXX-001: Description
 
 ## References
 
+### Core Requirements
 - [Core Requirements](robson-core-requirements.md)
 - [Domain Requirements](robson-domain-requirements.md)
 - [API Requirements](robson-api-requirements.md)
+
+### Feature Requirements
+- [Isolated Margin Trading](isolated-margin-requirements.md) - Leveraged trading with risk management
+- [Technical Stop Rule](technical-stop-requirements.md) - Stop-loss derived from chart analysis
+- [Position Sizing Golden Rule](POSITION-SIZING-GOLDEN-RULE.md) - 1% risk per trade
+- [Strategy Semantic Clarity](STRATEGY-SEMANTIC-CLARITY.md) - User-driven strategy selection
+
+### Dashboard Requirements
+- [Critical Dashboard Requirements](CRITICAL-REQUIREMENTS-DASHBOARD.md)
+
+### Related Documents
 - [Specifications](../specs/README.md)
 - [Traceability Matrix](../development/TRACEABILITY.md)
 - [AI-First Strategy](../development/AI-FIRST-STRATEGY.md)
@@ -260,5 +272,5 @@ REQ-FUT-XXX-001: Description
 ---
 
 **Maintained by**: Robson Bot Core Team
-**Last Updated**: 2025-11-14
-**Version**: 1.0
+**Last Updated**: 2024-12-24
+**Version**: 1.1

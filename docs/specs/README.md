@@ -14,16 +14,29 @@ Specifications serve as:
 
 ```
 specs/
-├── features/           # Feature specifications (BDD-style)
+├── features/                      # Feature specifications (BDD-style)
+│   ├── isolated-margin-spec.md    # Isolated Margin trading
 │   ├── risk-management.spec.md
 │   ├── trading-strategies.spec.md
 │   ├── signal-distribution.spec.md
 │   └── multi-tenant-isolation.spec.md
-└── api/                # API specifications
-    ├── openapi.yaml    # REST API (OpenAPI 3.1)
-    ├── asyncapi.yaml   # WebSocket/Events (AsyncAPI)
-    └── README.md
+├── api/                           # API specifications
+│   ├── openapi.yaml               # REST API (OpenAPI 3.1)
+│   ├── asyncapi.yaml              # WebSocket/Events (AsyncAPI)
+│   └── README.md
+├── robson-api-v1-spec.md          # API v1 specification
+├── robson-domain-spec.md          # Domain model specification
+└── TECHNICAL-STOP-RULE.md         # Technical stop-loss specification
 ```
+
+## Current Specifications
+
+| Spec | Description | Status |
+|------|-------------|--------|
+| [Isolated Margin](features/isolated-margin-spec.md) | Leveraged trading with isolated margin | ✅ Implemented |
+| [Technical Stop Rule](TECHNICAL-STOP-RULE.md) | Stop-loss from chart analysis | ✅ Implemented |
+| [API v1](robson-api-v1-spec.md) | REST API specification | 🔄 In Progress |
+| [Domain Model](robson-domain-spec.md) | Domain entities and rules | 🔄 In Progress |
 
 ## Spec-Driven Development Workflow
 
