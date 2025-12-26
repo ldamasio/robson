@@ -217,7 +217,7 @@ describe('BTCPortfolioDashboard', () => {
 
       await waitFor(() => {
         expect(screen.getByText(/Spot:/i)).toBeInTheDocument();
-        expect(screen.getByText(/Margin:/i).toBeInTheDocument();
+        expect(screen.getByText(/Margin:/i)).toBeInTheDocument();
         expect(screen.getByText(/Margin Debt:/i)).toBeInTheDocument();
       });
     });
