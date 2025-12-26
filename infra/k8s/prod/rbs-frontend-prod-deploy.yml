@@ -15,8 +15,8 @@ spec:
         app: rbs-frontend-prod-deploy
       annotations:
         prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
         prometheus.io/port: "80"
-        prometheus.io/path: "/metrics"
     spec:
       containers:
         - name: rbs-frontend-prod-deploy
