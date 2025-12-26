@@ -10,6 +10,7 @@ import ActualPrice from '../components/logged/ActualPrice'
 import Trend from '../components/logged/Trend'
 import Strategies from '../components/logged/Strategies'
 import Patrimony from '../components/logged/Patrimony'
+import BTCPortfolioDashboard from '../components/logged/BTCPortfolioDashboard'
 import Balance from '../components/logged/Balance'
 import Position from '../components/logged/Position'
 import Risk from '../components/logged/Risk'
@@ -70,11 +71,6 @@ const LoggedHomeScreen = () => {
               )}
             </>
           )}
-          <p>
-            <small>You are running this application in <b>{import.meta.env.NODE_ENV}</b> mode.</small>
-            <br />
-            <small>BACKEND_URL is <b>{import.meta.env.REACT_APP_BACKEND_URL}</b></small>
-          </p>
           <Tabs defaultActiveKey="1">
             <Tab eventKey="1" title="Control Panel">
               <h1>Command Button</h1>
@@ -133,6 +129,10 @@ const LoggedHomeScreen = () => {
             </Tab>
             <Tab eventKey="5" title="💼 Portfolio">
               <div className="py-4">
+                <ErrorBoundary>
+                  <BTCPortfolioDashboard />
+                </ErrorBoundary>
+                <hr className="my-4" />
                 <ErrorBoundary>
                   <PositionsDashboard />
                 </ErrorBoundary>

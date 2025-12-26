@@ -168,6 +168,86 @@ make sync-binance-docs
 
 **Architecture guide:** See [`docs/COMMAND-RUNNERS.md`](docs/COMMAND-RUNNERS.md) for detailed guidelines on which tool to use when.
 
+## BTC Portfolio Tracking
+
+Robson Bot now supports **complete portfolio tracking in BTC terms**, the preferred metric for crypto investors.
+
+### Why BTC?
+
+Crypto investors prefer to measure their wealth in BTC (not USD) because:
+- BTC is the base currency of the crypto market
+- USD inflation can distort portfolio performance
+- BTC shows true purchasing power in the crypto ecosystem
+
+### Features
+
+#### Backend Services
+- **BTCConversionService**: Multi-route price discovery (direct pair, USDT, BUSD)
+- **PortfolioBTCService**: Complete portfolio valuation in BTC
+- **Binance Sync**: Automatic deposit/withdrawal synchronization
+- **Audit Trail**: All external flows are recorded and audited
+
+#### REST API Endpoints
+```bash
+GET /api/portfolio/btc/total/          # Current value in BTC
+GET /api/portfolio/btc/profit/         # Profit since inception
+GET /api/portfolio/btc/history/        # Historical chart data
+GET /api/portfolio/deposits-withdrawals/  # Transaction list
+```
+
+#### CLI Commands
+```bash
+# Show portfolio in BTC
+python manage.py portfolio_btc
+
+# Show profit in BTC
+python manage.py portfolio_btc --profit
+
+# Sync deposits/withdrawals from Binance (last 90 days)
+python manage.py sync_deposits --days-back 90
+```
+
+#### Profit Formula
+```
+Profit (BTC) = Current Balance (BTC) + Withdrawals (BTC) - Deposits (BTC)
+```
+
+This formula considers:
+- **Current holdings**: What you have now
+- **Withdrawals**: Past profits taken out (count as gains)
+- **Deposits**: Your capital input (investment)
+
+#### Frontend Dashboard
+The **Portfolio tab** (💼 Portfolio) provides:
+- **Overview**: Total value, profit metrics, account breakdown
+- **History**: Interactive chart with timeline filtering (7d, 30d, 90d, 1y)
+- **Transactions**: Filterable table of deposits/withdrawals
+
+All values are displayed in BTC with:
+- Color-coded profit (green) / loss (red)
+- Auto-refresh every 60 seconds
+- Clean tab-based navigation
+
+### Quick Start
+
+```bash
+# 1. Apply database migration
+python manage.py migrate api
+
+# 2. Sync historical deposits
+python manage.py sync_deposits --days-back 90
+
+# 3. View portfolio in BTC
+python manage.py portfolio_btc --profit
+
+# 4. Open dashboard: http://localhost:3000/dashboard
+# Navigate to "💼 Portfolio" tab
+```
+
+### Documentation
+- See [`CHANGELOG.md`](CHANGELOG.md) for detailed changes
+- See [`docs/AGENTS.md`](docs/AGENTS.md) for architecture details
+
 ## Monorepo and Architecture
 
 This repository follows a monorepo layout with **Hexagonal Architecture (Ports & Adapters)** integrated within the Django monolith.

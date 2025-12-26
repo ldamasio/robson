@@ -183,6 +183,14 @@ urlpatterns = [
     # ==========================================
     path('portfolio/patrimony/', views.Patrimony, name='patrimony'),
     path('products/', views.Products, name='products'),
+
+    # ==========================================
+    # BTC PORTFOLIO TRACKING (NEW)
+    # ==========================================
+    path('portfolio/btc/total/', views.portfolio_btc.portfolio_btc_total, name='portfolio_btc_total'),
+    path('portfolio/btc/profit/', views.portfolio_btc.portfolio_btc_profit, name='portfolio_btc_profit'),
+    path('portfolio/btc/history/', views.portfolio_btc.portfolio_btc_history, name='portfolio_btc_history'),
+    path('portfolio/deposits-withdrawals/', views.portfolio_btc.deposits_withdrawals, name='deposits_withdrawals'),
 ]
 
 # Debug info

@@ -55,6 +55,7 @@ class MovementCategory(models.TextChoices):
     ORDER = "ORDER", "Order Lifecycle"
     FEE = "FEE", "Fees & Interest"
     RISK = "RISK", "Risk Events"
+    EXTERNAL = "EXTERNAL", "External Flows (Deposit/Withdrawal)"
 
 
 class AccountType(models.TextChoices):
@@ -121,6 +122,12 @@ class TransactionType(models.TextChoices):
     """
     LIQUIDATION = "LIQUIDATION", "Liquidation"
     MARGIN_CALL = "MARGIN_CALL", "Margin Call Warning"
+
+    """
+    CATEGORY G: EXTERNAL FLOWS (deposits/withdrawals from exchange)
+    """
+    DEPOSIT = "DEPOSIT", "Deposit (External → Exchange)"
+    WITHDRAWAL = "WITHDRAWAL", "Withdrawal (Exchange → External)"
 
 
 class TransactionStatus(models.TextChoices):
@@ -384,60 +391,68 @@ class AuditTransaction(models.Model):
     def _infer_category(self) -> str:
         """Infer the movement category from transaction type."""
         tx_type = self.transaction_type
-        
+
         # Trading
         if tx_type in [TransactionType.SPOT_BUY, TransactionType.SPOT_SELL,
                        TransactionType.MARGIN_BUY, TransactionType.MARGIN_SELL]:
             return MovementCategory.TRADING
-        
+
         # Transfers
         if tx_type in [TransactionType.TRANSFER_SPOT_TO_ISOLATED,
                        TransactionType.TRANSFER_ISOLATED_TO_SPOT,
                        TransactionType.TRANSFER_TO_MARGIN,
                        TransactionType.TRANSFER_FROM_MARGIN]:
             return MovementCategory.TRANSFER
-        
+
         # Credit
         if tx_type in [TransactionType.MARGIN_BORROW, TransactionType.MARGIN_REPAY,
                        TransactionType.INTEREST_CHARGED]:
             return MovementCategory.CREDIT
-        
+
         # Order lifecycle
         if tx_type in [TransactionType.STOP_LOSS_PLACED, TransactionType.STOP_LOSS_TRIGGERED,
                        TransactionType.STOP_LOSS_CANCELLED, TransactionType.TAKE_PROFIT_PLACED,
                        TransactionType.TAKE_PROFIT_TRIGGERED, TransactionType.LIMIT_ORDER_PLACED,
                        TransactionType.LIMIT_ORDER_FILLED, TransactionType.LIMIT_ORDER_CANCELLED]:
             return MovementCategory.ORDER
-        
+
         # Fees
         if tx_type in [TransactionType.TRADING_FEE, TransactionType.FEE_PAID]:
             return MovementCategory.FEE
-        
+
         # Risk events
         if tx_type in [TransactionType.LIQUIDATION, TransactionType.MARGIN_CALL]:
             return MovementCategory.RISK
-        
+
+        # External flows (deposits/withdrawals)
+        if tx_type in [TransactionType.DEPOSIT, TransactionType.WITHDRAWAL]:
+            return MovementCategory.EXTERNAL
+
         return MovementCategory.TRADING  # Default
     
     def _infer_account_type(self) -> str:
         """Infer the account type from transaction type."""
         tx_type = self.transaction_type
-        
+
         # Spot operations
         if tx_type in [TransactionType.SPOT_BUY, TransactionType.SPOT_SELL]:
             return AccountType.SPOT
-        
+
         # Margin operations
         if tx_type in [TransactionType.MARGIN_BUY, TransactionType.MARGIN_SELL,
                        TransactionType.MARGIN_BORROW, TransactionType.MARGIN_REPAY]:
             return AccountType.ISOLATED_MARGIN if self.is_isolated_margin else AccountType.CROSS_MARGIN
-        
+
         # Transfers - use the destination for transfers TO, source for transfers FROM
         if tx_type in [TransactionType.TRANSFER_SPOT_TO_ISOLATED, TransactionType.TRANSFER_TO_MARGIN]:
             return AccountType.ISOLATED_MARGIN  # Destination
         if tx_type in [TransactionType.TRANSFER_ISOLATED_TO_SPOT, TransactionType.TRANSFER_FROM_MARGIN]:
             return AccountType.SPOT  # Destination
-        
+
+        # External flows (deposits/withdrawals typically go to spot)
+        if tx_type in [TransactionType.DEPOSIT, TransactionType.WITHDRAWAL]:
+            return AccountType.SPOT
+
         # Default to spot
         return AccountType.SPOT
     
@@ -538,7 +553,30 @@ class BalanceSnapshot(models.Model):
         blank=True,
         help_text="Margin level at snapshot",
     )
-    
+
+    # BTC-denominated values (NEW)
+    total_equity_btc = models.DecimalField(
+        max_digits=20,
+        decimal_places=8,
+        null=True,
+        blank=True,
+        help_text="Total equity denominated in BTC",
+    )
+
+    spot_btc_value = models.DecimalField(
+        max_digits=20,
+        decimal_places=8,
+        default=Decimal("0"),
+        help_text="Total spot balances converted to BTC",
+    )
+
+    margin_btc_value = models.DecimalField(
+        max_digits=20,
+        decimal_places=8,
+        default=Decimal("0"),
+        help_text="Total margin positions converted to BTC (net of debt)",
+    )
+
     created_at = models.DateTimeField(auto_now_add=True)
     
     class Meta:

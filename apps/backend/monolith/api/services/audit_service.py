@@ -393,7 +393,7 @@ class AuditService:
     def _sync_transfers(self, days_back: int) -> int:
         """Sync transfers from Binance."""
         count = 0
-        
+
         try:
             # Get transfer history
             # Note: Binance API for transfer history is limited
@@ -401,9 +401,183 @@ class AuditService:
             pass
         except Exception as e:
             logger.error(f"Failed to sync transfers: {e}")
-        
+
         return count
-    
+
+    def sync_deposits_and_withdrawals(self, days_back: int = 30) -> int:
+        """
+        Sync deposit and withdrawal history from Binance.
+
+        This method fetches the deposit/withdrawal history from Binance
+        and creates AuditTransaction records for DEPOSIT and WITHDRAWAL types.
+
+        Args:
+            days_back: How many days back to sync (default: 30)
+
+        Returns:
+            Number of new transactions synced
+
+        Example:
+            >>> service = AuditService(client)
+            >>> count = service.sync_deposits_and_withdrawals(days_back=90)
+            >>> print(f"Synced {count} transactions")
+        """
+        count = 0
+        count += self._sync_deposits(days_back)
+        count += self._sync_withdrawals(days_back)
+
+        logger.info(f"Synced {count} deposits/withdrawals from Binance for client {self.client.id}")
+        return count
+
+    def _sync_deposits(self, days_back: int) -> int:
+        """
+        Sync deposit history from Binance.
+
+        Uses python-binance's get_deposit_history() method.
+
+        Args:
+            days_back: How many days back to sync
+
+        Returns:
+            Number of new deposit records created
+        """
+        count = 0
+
+        try:
+            # Calculate start time
+            start_time = timezone.now() - timedelta(days=days_back)
+            start_timestamp = int(start_time.timestamp() * 1000)
+
+            # Get deposit history from Binance
+            # Note: python-binance uses get_deposit_history()
+            deposits = self.execution.client.get_deposit_history(
+                startTime=start_timestamp,
+            )
+
+            for deposit in deposits:
+                # Check if already recorded
+                tx_id = str(deposit.get('txId', ''))
+                if not tx_id:
+                    continue
+
+                if AuditTransaction.objects.filter(
+                    binance_order_id=tx_id,
+                    transaction_type=TransactionType.DEPOSIT
+                ).exists():
+                    continue
+
+                # Extract details
+                asset = deposit.get('asset', '')
+                amount = Decimal(str(deposit.get('amount', '0')))
+                status = deposit.get('status', 0)
+
+                # Only insert successful deposits
+                # Status codes: 0=Email Sent, 1=Cancelled, 2=Awaiting Approval, 3=Rejected, 4=Processing, 5=Failure, 6=Completed, 7=Pending
+                # We want status = 6 (success) or status = 7 (pending)
+                if status not in [1, 6]:  # 6=success, 1=cancelled (should we include cancelled?)
+                    logger.warning(f"Skipping incomplete deposit: {tx_id} (status={status})")
+                    continue
+
+                # Determine transaction status
+                tx_status = TransactionStatus.FILLED if status == 6 else TransactionStatus.PENDING
+
+                # Create audit transaction
+                AuditTransaction.objects.create(
+                    transaction_id=str(uuid.uuid4()),
+                    binance_order_id=tx_id,
+                    client=self.client,
+                    transaction_type=TransactionType.DEPOSIT,
+                    status=tx_status,
+                    symbol=f"{asset}USDT",  # Deposits don't have a symbol, use placeholder
+                    asset=asset,
+                    quantity=amount,
+                    side="BUY",  # Deposits increase balance
+                    account_type="SPOT",
+                    description=f"Deposit of {amount} {asset} from external wallet",
+                    raw_response=deposit,
+                    executed_at=timezone.now(),  # Binance may not provide precise time
+                    source="binance_sync",
+                )
+                count += 1
+                logger.info(f"Recorded deposit: {amount} {asset} (tx: {tx_id})")
+
+        except Exception as e:
+            logger.error(f"Failed to sync deposits: {e}")
+
+        return count
+
+    def _sync_withdrawals(self, days_back: int) -> int:
+        """
+        Sync withdrawal history from Binance.
+
+        Uses python-binance's get_withdraw_history() method.
+
+        Args:
+            days_back: How many days back to sync
+
+        Returns:
+            Number of new withdrawal records created
+        """
+        count = 0
+
+        try:
+            # Calculate start time
+            start_time = timezone.now() - timedelta(days=days_back)
+            start_timestamp = int(start_time.timestamp() * 1000)
+
+            # Get withdrawal history from Binance
+            withdrawals = self.execution.client.get_withdraw_history(
+                startTime=start_timestamp,
+            )
+
+            for withdrawal in withdrawals:
+                # Check if already recorded
+                tx_id = str(withdrawal.get('id', ''))
+                if not tx_id:
+                    continue
+
+                if AuditTransaction.objects.filter(
+                    binance_order_id=tx_id,
+                    transaction_type=TransactionType.WITHDRAWAL
+                ).exists():
+                    continue
+
+                # Extract details
+                asset = withdrawal.get('asset', '')
+                amount = Decimal(str(withdrawal.get('amount', '0')))
+                status = withdrawal.get('status', 0)
+
+                # Only insert completed withdrawals (status=6)
+                # Status codes: 0=Email Sent, 1=Cancelled, 2=Awaiting Approval, 3=Rejected, 4=Processing, 5=Failure, 6=Completed
+                if status != 6:
+                    logger.warning(f"Skipping incomplete withdrawal: {tx_id} (status={status})")
+                    continue
+
+                # Create audit transaction
+                AuditTransaction.objects.create(
+                    transaction_id=str(uuid.uuid4()),
+                    binance_order_id=tx_id,
+                    client=self.client,
+                    transaction_type=TransactionType.WITHDRAWAL,
+                    status=TransactionStatus.FILLED,
+                    symbol=f"{asset}USDT",  # Placeholder
+                    asset=asset,
+                    quantity=amount,
+                    side="SELL",  # Withdrawals decrease balance
+                    account_type="SPOT",
+                    description=f"Withdrawal of {amount} {asset} to external address",
+                    raw_response=withdrawal,
+                    executed_at=timezone.now(),
+                    source="binance_sync",
+                )
+                count += 1
+                logger.info(f"Recorded withdrawal: {amount} {asset} (tx: {tx_id})")
+
+        except Exception as e:
+            logger.error(f"Failed to sync withdrawals: {e}")
+
+        return count
+
     def take_balance_snapshot(self) -> BalanceSnapshot:
         """Take a snapshot of current balances."""
         
