@@ -58,7 +58,7 @@ describe('BTCPortfolioDashboard', () => {
 
       render(<BTCPortfolioDashboard />);
 
-      expect(screen.getByText(/Loading portfolio data/i)).toBeInTheDocument();
+      expect(screen.getByText(/Loading portfolio data/i)).toBeTruthy();
     });
 
     it('should hide spinner after data loads', async () => {
@@ -70,7 +70,7 @@ describe('BTCPortfolioDashboard', () => {
       render(<BTCPortfolioDashboard />);
 
       await waitFor(() => {
-        expect(screen.queryByText(/Loading portfolio data/i)).not.toBeInTheDocument();
+        expect(screen.queryByText(/Loading portfolio data/i)).toBeNull();
       });
     });
   });
@@ -83,7 +83,7 @@ describe('BTCPortfolioDashboard', () => {
       render(<BTCPortfolioDashboard />);
 
       await waitFor(() => {
-        expect(screen.getByText(/Error: Network error/i)).toBeInTheDocument();
+        expect(screen.getByText(/Error: Network error/i)).toBeTruthy();
       });
     });
 
@@ -114,7 +114,7 @@ describe('BTCPortfolioDashboard', () => {
       render(<BTCPortfolioDashboard />);
 
       await waitFor(() => {
-        expect(screen.getByText(/0\.52340000 BTC/i)).toBeInTheDocument();
+        expect(screen.getByText(/0\.52340000 BTC/i)).toBeTruthy();
       });
     });
 
@@ -130,7 +130,7 @@ describe('BTCPortfolioDashboard', () => {
 
       await waitFor(() => {
         const profitBadge = screen.getByText(/↑/i);
-        expect(profitBadge).toBeInTheDocument();
+        expect(profitBadge).toBeTruthy();
       });
     });
 
@@ -145,9 +145,9 @@ describe('BTCPortfolioDashboard', () => {
       render(<BTCPortfolioDashboard />);
 
       await waitFor(() => {
-        expect(screen.getByText(/Spot:/i)).toBeInTheDocument();
-        expect(screen.getByText(/Margin:/i)).toBeInTheDocument();
-        expect(screen.getByText(/Margin Debt:/i)).toBeInTheDocument();
+        expect(screen.getByText(/Spot:/i)).toBeTruthy();
+        expect(screen.getByText(/Margin:/i)).toBeTruthy();
+        expect(screen.getByText(/Margin Debt:/i)).toBeTruthy();
       });
     });
   });
@@ -161,14 +161,14 @@ describe('BTCPortfolioDashboard', () => {
       render(<BTCPortfolioDashboard />);
 
       await waitFor(() => {
-        expect(screen.getByText(/📊 Overview/i)).toBeInTheDocument();
+        expect(screen.getByText(/📊 Overview/i)).toBeTruthy();
       });
 
       // Click history tab
       fireEvent.click(screen.getByText(/📈 History/i));
 
       await waitFor(() => {
-        expect(screen.getByText(/Time Range/i)).toBeInTheDocument();
+        expect(screen.getByText(/Time Range/i)).toBeTruthy();
       });
     });
 
@@ -180,14 +180,14 @@ describe('BTCPortfolioDashboard', () => {
       render(<BTCPortfolioDashboard />);
 
       await waitFor(() => {
-        expect(screen.getByText(/📊 Overview/i)).toBeInTheDocument();
+        expect(screen.getByText(/📊 Overview/i)).toBeTruthy();
       });
 
       // Click transactions tab
       fireEvent.click(screen.getByText(/💰 Transactions/i));
 
       await waitFor(() => {
-        expect(screen.getByText(/Filter by Type/i)).toBeInTheDocument();
+        expect(screen.getByText(/Filter by Type/i)).toBeTruthy();
       });
     });
   });
@@ -203,9 +203,9 @@ describe('BTCPortfolioDashboard', () => {
       });
 
       await waitFor(() => {
-        expect(screen.getByLabelText(/Time Range/i)).toBeInTheDocument();
-        expect(screen.getByText(/Last 7 days/i)).toBeInTheDocument();
-        expect(screen.getByText(/Last 30 days/i)).toBeInTheDocument();
+        expect(screen.getByLabelText(/Time Range/i)).toBeTruthy();
+        expect(screen.getByText(/Last 7 days/i)).toBeTruthy();
+        expect(screen.getByText(/Last 30 days/i)).toBeTruthy();
       });
     });
   });
@@ -221,7 +221,7 @@ describe('BTCPortfolioDashboard', () => {
       });
 
       await waitFor(() => {
-        expect(screen.getByLabelText(/Filter by Type/i)).toBeInTheDocument();
+        expect(screen.getByLabelText(/Filter by Type/i)).toBeTruthy();
       });
     });
   });

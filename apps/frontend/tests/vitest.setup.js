@@ -1,6 +1,5 @@
 import { act } from 'react'
-import { vi, expect } from 'vitest'
-import '@testing-library/jest-dom'
+import { vi } from 'vitest'
 
 vi.mock('react-dom/test-utils', () => ({
   act,
