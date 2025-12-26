@@ -52,7 +52,7 @@ describe('BTCPortfolioDashboard', () => {
       axios.get.mockImplementation(() => new Promise(() => {}));
 
       const { BTCPortfolioDashboard } = await import(
-        '../BTCPortfolioDashboard'
+        '../src/components/logged/BTCPortfolioDashboard'
       );
 
       render(<BTCPortfolioDashboard />);
@@ -73,7 +73,7 @@ describe('BTCPortfolioDashboard', () => {
       });
 
       const { BTCPortfolioDashboard } = await import(
-        '../BTCPortfolioDashboard'
+        '../src/components/logged/BTCPortfolioDashboard'
       );
 
       render(<BTCPortfolioDashboard />);
@@ -92,7 +92,7 @@ describe('BTCPortfolioDashboard', () => {
       axios.get.mockRejectedValue(new Error('Network error'));
 
       const { BTCPortfolioDashboard } = await import(
-        '../BTCPortfolioDashboard'
+        '../src/components/logged/BTCPortfolioDashboard'
       );
 
       render(<BTCPortfolioDashboard />);
@@ -108,7 +108,7 @@ describe('BTCPortfolioDashboard', () => {
       axios.get.mockRejectedValue(new Error('API Error'));
 
       const { BTCPortfolioDashboard } = await import(
-        '../BTCPortfolioDashboard'
+        '../src/components/logged/BTCPortfolioDashboard'
       );
 
       render(<BTCPortfolioDashboard />);
@@ -137,7 +137,7 @@ describe('BTCPortfolioDashboard', () => {
       });
 
       const { BTCPortfolioDashboard } = await import(
-        '../BTCPortfolioDashboard'
+        '../src/components/logged/BTCPortfolioDashboard'
       );
 
       render(<BTCPortfolioDashboard />);
@@ -158,7 +158,7 @@ describe('BTCPortfolioDashboard', () => {
       });
 
       const { BTCPortfolioDashboard } = await import(
-        '../BTCPortfolioDashboard'
+        '../src/components/logged/BTCPortfolioDashboard'
       );
 
       render(<BTCPortfolioDashboard />);
@@ -187,7 +187,7 @@ describe('BTCPortfolioDashboard', () => {
       });
 
       const { BTCPortfolioDashboard } = await import(
-        '../BTCPortfolioDashboard'
+        '../src/components/logged/BTCPortfolioDashboard'
       );
 
       render(<BTCPortfolioDashboard />);
@@ -210,7 +210,7 @@ describe('BTCPortfolioDashboard', () => {
       });
 
       const { BTCPortfolioDashboard } = await import(
-        '../BTCPortfolioDashboard'
+        '../src/components/logged/BTCPortfolioDashboard'
       );
 
       render(<BTCPortfolioDashboard />);
@@ -232,7 +232,7 @@ describe('BTCPortfolioDashboard', () => {
       });
 
       const { BTCPortfolioDashboard } = await import(
-        '../BTCPortfolioDashboard'
+        '../src/components/logged/BTCPortfolioDashboard'
       );
 
       render(<BTCPortfolioDashboard />);
@@ -257,7 +257,7 @@ describe('BTCPortfolioDashboard', () => {
       });
 
       const { BTCPortfolioDashboard } = await import(
-        '../BTCPortfolioDashboard'
+        '../src/components/logged/BTCPortfolioDashboard'
       );
 
       render(<BTCPortfolioDashboard />);
@@ -282,7 +282,7 @@ describe('BTCPortfolioDashboard', () => {
       axios.get.mockResolvedValue({ data: mockPortfolioData });
 
       const { BTCPortfolioDashboard } = await import(
-        '../BTCPortfolioDashboard'
+        '../src/components/logged/BTCPortfolioDashboard'
       );
 
       render(<BTCPortfolioDashboard />);
@@ -304,7 +304,7 @@ describe('BTCPortfolioDashboard', () => {
       axios.get.mockResolvedValue({ data: mockPortfolioData });
 
       const { BTCPortfolioDashboard } = await import(
-        '../BTCPortfolioDashboard'
+        '../src/components/logged/BTCPortfolioDashboard'
       );
 
       render(<BTCPortfolioDashboard />);
@@ -334,7 +334,7 @@ describe('BTCPortfolioDashboard', () => {
       axios.get.mockResolvedValue({ data: mockPortfolioData });
 
       const { BTCPortfolioDashboard } = await import(
-        '../BTCPortfolioDashboard'
+        '../src/components/logged/BTCPortfolioDashboard'
       );
 
       render(<BTCPortfolioDashboard />);
@@ -371,7 +371,7 @@ describe('BTCPortfolioDashboard', () => {
       });
 
       const { BTCPortfolioDashboard } = await import(
-        '../BTCPortfolioDashboard'
+        '../src/components/logged/BTCPortfolioDashboard'
       );
 
       render(<BTCPortfolioDashboard />);
@@ -411,7 +411,7 @@ describe('BTCPortfolioDashboard', () => {
       });
 
       const { BTCPortfolioDashboard } = await import(
-        '../BTCPortfolioDashboard'
+        '../src/components/logged/BTCPortfolioDashboard'
       );
 
       render(<BTCPortfolioDashboard />);
@@ -441,7 +441,7 @@ describe('BTCPortfolioDashboard', () => {
       });
 
       const { BTCPortfolioDashboard } = await import(
-        '../BTCPortfolioDashboard'
+        '../src/components/logged/BTCPortfolioDashboard'
       );
 
       render(<BTCPortfolioDashboard />);
