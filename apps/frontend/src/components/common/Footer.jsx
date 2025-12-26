@@ -34,6 +34,11 @@ function Footer() {
             <div className="d-flex flex-column text-secondary small">
               <span>&copy; {new Date().getFullYear()} RBX Robótica. All rights reserved.</span>
               <span className="mt-1">Designed by RBX Robótica</span>
+              {import.meta.env.VITE_APP_VERSION && (
+                <span className="mt-2 opacity-50 x-small" style={{ fontSize: '0.65rem' }}>
+                  Build: {import.meta.env.VITE_APP_VERSION}
+                </span>
+              )}
             </div>
           </Col>
         </Row>

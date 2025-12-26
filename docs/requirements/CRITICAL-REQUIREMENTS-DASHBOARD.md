@@ -349,12 +349,59 @@ class PortfolioSummary:
 - [ ] Environment variables documented
 - [ ] Rollback plan prepared
 - [ ] Monitoring/alerts configured
+- [ ] **Build SHA visible in Footer** (MANDATORY - see below)
+
+### Build SHA in Footer (MANDATORY REQUIREMENT)
+
+**🔴 CRITICAL: The Footer component MUST ALWAYS display the build SHA!**
+
+**Requirement**:
+- The frontend Footer MUST display `Build: {VITE_APP_VERSION}` at all times
+- This is the ONLY way to verify which version is running in production
+- NEVER remove this indicator for any reason
+
+**Implementation**:
+```jsx
+// apps/frontend/src/components/common/Footer.jsx
+{import.meta.env.VITE_APP_VERSION && (
+  <span className="mt-2 opacity-50 x-small" style={{ fontSize: '0.65rem' }}>
+    Build: {import.meta.env.VITE_APP_VERSION}
+  </span>
+)}
+```
+
+**Build Pipeline**:
+- GitHub Actions MUST set `VITE_APP_VERSION` to SHA tag (e.g., `sha-abc1234`)
+- Format: `VITE_APP_VERSION=${{ steps.meta.outputs.sha_tag }}`
+- Docker build args MUST include: `--build-arg VITE_APP_VERSION=${VITE_APP_VERSION}`
+
+**Verification**:
+- Check production: `curl -s https://app.robson.rbx.ia.br | grep "Build:"`
+- Check staging: `curl -s https://staging.robson.rbx.ia.br | grep "Build:"`
+- Output format: `Build: sha-abc1234`
+
+**Why This Is Critical**:
+1. **Debugging**: Know exactly which code is running when bugs are reported
+2. **Rollback**: Quickly identify if bad deploy needs rollback
+3. **Auditing**: Track which version handled which operations
+4. **Support**: Users can report their build version for faster troubleshooting
+
+**Enforcement**:
+- Pre-commit hook: Check Footer.jsx has build SHA display
+- CI/CD check: Fail build if `VITE_APP_VERSION` not set
+- Code review: ANY change to Footer.jsx must preserve build SHA
+
+**Related Documents**:
+- ADR-0011: GitOps Automatic Manifest Updates
+- .github/workflows/main.yml: Build pipeline with SHA tagging
+- docs/adr/ADR-0012-gitops-auto-sync-troubleshooting.md
 
 ### Rollout Strategy
 - **Phase 1**: Deploy backend API (non-breaking)
 - **Phase 2**: Deploy CLI (backward compatible)
 - **Phase 3**: Deploy frontend (feature flag if needed)
 - **Monitoring**: Check error rates for 24h post-deploy
+- **Verification**: Confirm build SHA in Footer matches deployed commit
 
 ---
 
