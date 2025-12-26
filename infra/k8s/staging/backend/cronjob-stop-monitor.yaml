@@ -45,6 +45,10 @@ spec:
         spec:
           restartPolicy: Never
 
+          # Pull secret for GHCR private registry
+          imagePullSecrets:
+          - name: ghcr-secret
+
           # Init container to wait for backend
           initContainers:
           - name: wait-for-backend
@@ -123,6 +127,34 @@ spec:
             - name: BINANCE_TESTNET
               value: "True"
 
+            # RBS-prefixed variables (for production image compatibility)
+            - name: RBS_SECRET_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: django-staging
+                  key: SECRET_KEY
+
+            - name: RBS_PG_DATABASE
+              value: "robson_staging"
+
+            - name: RBS_PG_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-staging
+                  key: POSTGRES_USER
+
+            - name: RBS_PG_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgres-staging
+                  key: POSTGRES_PASSWORD
+
+            - name: RBS_PG_HOST
+              value: "postgres-staging"
+
+            - name: RBS_PG_PORT
+              value: "5432"
+
             resources:
               requests:
                 cpu: 100m
@@ -131,11 +163,12 @@ spec:
                 cpu: 500m
                 memory: 512Mi
 
-          # Security context
-          securityContext:
-            runAsNonRoot: true
-            runAsUser: 1000
-            fsGroup: 1000
+          # Security context - COMMENTED OUT (prevents log directory creation)
+          # TODO: Re-enable with proper volume permissions later
+          # securityContext:
+          #   runAsNonRoot: true
+          #   runAsUser: 1000
+          #   fsGroup: 1000
 
 ---
 # ServiceMonitor for Prometheus (optional, for monitoring CronJob metrics)

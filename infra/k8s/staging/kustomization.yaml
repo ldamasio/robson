@@ -32,9 +32,13 @@ resources:
 - backend/backend-staging.yaml
 - backend/cronjob-stop-monitor.yaml
 
-# 4. Istio routing
-- istio/gateway-staging.yaml
-- istio/certificate-staging.yaml
+# 4. Ingress routing (Traefik)
+- ingress/traefik-staging.yaml
+
+# NOTE: Istio Gateway files exist but are NOT used (cluster uses Traefik)
+# Keeping files for reference/future migration:
+# - istio/gateway-staging.yaml
+# - istio/certificate-staging.yaml
 
 # Images (will be updated by CI/CD)
 images:

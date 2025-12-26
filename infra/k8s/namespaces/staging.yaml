@@ -58,8 +58,8 @@ spec:
       cpu: 2000m    # Max CPU per container: 2 cores
       memory: 4Gi   # Max memory per container: 4GB
     min:
-      cpu: 50m      # Min CPU per container: 50 millicores
-      memory: 64Mi  # Min memory per container: 64MB
+      cpu: 10m      # Min CPU per container: 10 millicores (lowered for cert-manager HTTP solver)
+      memory: 32Mi  # Min memory per container: 32MB
     type: Container
 
   # Limits for PVCs

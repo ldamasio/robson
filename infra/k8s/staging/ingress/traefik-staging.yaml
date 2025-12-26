@@ -1,0 +1,113 @@
+# Traefik Ingress for Staging Environment
+# Routes external traffic to staging services
+# Created: 2024-12-25
+
+---
+# Ingress for Backend API (api.staging.rbx.ia.br)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: api-staging
+  namespace: staging
+  labels:
+    app: backend-staging
+    environment: staging
+  annotations:
+    # cert-manager will automatically create TLS certificate
+    cert-manager.io/cluster-issuer: argocd-letsencrypt-issuer
+
+    # Traefik configuration
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+
+    # Optional: Middleware for rate limiting (add if needed)
+    # traefik.ingress.kubernetes.io/router.middlewares: staging-ratelimit@kubernetescrd
+spec:
+  ingressClassName: traefik
+
+  tls:
+  - hosts:
+    - api.staging.rbx.ia.br
+    secretName: api-staging-tls  # cert-manager will create this
+
+  rules:
+  - host: api.staging.rbx.ia.br
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: backend-staging
+            port:
+              number: 8000
+
+---
+# Ingress for Frontend (staging.rbx.ia.br) - COMMENTED OUT UNTIL FRONTEND IS DEPLOYED
+# Uncomment when frontend deployment is ready
+#
+# apiVersion: networking.k8s.io/v1
+# kind: Ingress
+# metadata:
+#   name: frontend-staging
+#   namespace: staging
+#   labels:
+#     app: frontend-staging
+#     environment: staging
+#   annotations:
+#     cert-manager.io/cluster-issuer: letsencrypt-prod
+#     traefik.ingress.kubernetes.io/router.entrypoints: websecure
+#     traefik.ingress.kubernetes.io/router.tls: "true"
+# spec:
+#   ingressClassName: traefik
+#
+#   tls:
+#   - hosts:
+#     - staging.rbx.ia.br
+#     secretName: staging-tls
+#
+#   rules:
+#   - host: staging.rbx.ia.br
+#     http:
+#       paths:
+#       - path: /
+#         pathType: Prefix
+#         backend:
+#           service:
+#             name: frontend-staging
+#             port:
+#               number: 3000
+
+---
+# Ingress for RabbitMQ Management UI (rabbitmq.staging.rbx.ia.br)
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rabbitmq-staging
+  namespace: staging
+  labels:
+    app: rabbitmq-staging
+    environment: staging
+  annotations:
+    cert-manager.io/cluster-issuer: letsencrypt-prod
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+spec:
+  ingressClassName: traefik
+
+  tls:
+  - hosts:
+    - rabbitmq.staging.rbx.ia.br
+    secretName: rabbitmq-staging-tls
+
+  rules:
+  - host: rabbitmq.staging.rbx.ia.br
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: rabbitmq-staging
+            port:
+              number: 15672  # Management UI port

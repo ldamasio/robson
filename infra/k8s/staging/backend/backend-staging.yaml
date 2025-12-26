@@ -56,6 +56,10 @@ spec:
         prometheus.io/path: "/metrics"
 
     spec:
+      # Pull secret for GHCR private registry
+      imagePullSecrets:
+      - name: ghcr-secret
+
       # Init container to wait for PostgreSQL
       initContainers:
       - name: wait-for-postgres
@@ -136,6 +140,34 @@ spec:
         - name: BINANCE_TESTNET
           value: "True"  # Use Binance Testnet in staging
 
+        # RBS-prefixed variables (for production image compatibility)
+        - name: RBS_SECRET_KEY
+          valueFrom:
+            secretKeyRef:
+              name: django-staging
+              key: SECRET_KEY
+
+        - name: RBS_PG_DATABASE
+          value: "robson_staging"
+
+        - name: RBS_PG_USER
+          valueFrom:
+            secretKeyRef:
+              name: postgres-staging
+              key: POSTGRES_USER
+
+        - name: RBS_PG_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: postgres-staging
+              key: POSTGRES_PASSWORD
+
+        - name: RBS_PG_HOST
+          value: "postgres-staging"
+
+        - name: RBS_PG_PORT
+          value: "5432"
+
         # Gunicorn settings
         - name: GUNICORN_WORKERS
           value: "2"  # 2 workers (vs 4 in production)
@@ -154,50 +186,39 @@ spec:
             cpu: 2000m
             memory: 4Gi
 
-        # Liveness probe (restart if unhealthy)
+        # Liveness probe (restart if unhealthy) - Using TCP probe
         livenessProbe:
-          httpGet:
-            path: /health/
+          tcpSocket:
             port: 8000
-            httpHeaders:
-            - name: Host
-              value: api.staging.rbx.ia.br
           initialDelaySeconds: 60
           periodSeconds: 30
           timeoutSeconds: 10
           failureThreshold: 3
 
-        # Readiness probe (don't send traffic if not ready)
+        # Readiness probe (don't send traffic if not ready) - Using TCP probe
         readinessProbe:
-          httpGet:
-            path: /health/
+          tcpSocket:
             port: 8000
-            httpHeaders:
-            - name: Host
-              value: api.staging.rbx.ia.br
           initialDelaySeconds: 30
           periodSeconds: 10
           timeoutSeconds: 5
           failureThreshold: 3
 
-        # Startup probe (allow slow startups)
+        # Startup probe (allow slow startups) - Using TCP probe
         startupProbe:
-          httpGet:
-            path: /health/
+          tcpSocket:
             port: 8000
-            httpHeaders:
-            - name: Host
-              value: api.staging.rbx.ia.br
           initialDelaySeconds: 10
           periodSeconds: 10
           timeoutSeconds: 5
           failureThreshold: 12  # 12 * 10s = 2 minutes to start
 
-      # Security context
-      securityContext:
-        runAsNonRoot: true
-        runAsUser: 1000
-        fsGroup: 1000
+      # Security context - COMMENTED OUT (prevents log directory creation)
+      # TODO: Re-enable with proper volume permissions later
+      # securityContext:
+      #   runAsNonRoot: true
+      #   runAsUser: 1000
+      #   fsGroup: 1000
 
 ---
 # HorizontalPodAutoscaler (optional, for load testing)
