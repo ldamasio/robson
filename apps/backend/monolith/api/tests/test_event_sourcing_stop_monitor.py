@@ -542,3 +542,237 @@ def test_price_monitor_skips_operation_without_stop_price(client_user, btc_symbo
 
     # THEN: No trigger (operation skipped)
     assert trigger is None
+
+
+# =====================================================================
+# OUTBOX PATTERN TESTS (ADR-0015)
+# =====================================================================
+
+@pytest.mark.django_db
+def test_outbox_create_command_message(client_user, btc_symbol):
+    """Test creating a command message in outbox (Python → RabbitMQ → Rust)."""
+    from api.models.event_sourcing import Outbox
+
+    # GIVEN: Command payload for stop execution
+    command_payload = {
+        "command_id": "cmd-123",
+        "operation_id": 456,
+        "symbol": "BTCUSDC",
+        "side": "SELL",
+        "quantity": "0.001",
+        "stop_price": "95000.00",
+    }
+
+    # WHEN: Create outbox entry for command
+    outbox = Outbox.objects.create(
+        aggregate_type='stop_command',
+        aggregate_id=456,
+        event_type='COMMAND_ISSUED',
+        correlation_id='456:95000.00:1703520934123',
+        routing_key='stop.command.456.BTCUSDC',
+        exchange='stop_commands',
+        payload=command_payload,
+    )
+
+    # THEN: Outbox entry created
+    assert outbox.outbox_id is not None
+    assert outbox.aggregate_type == 'stop_command'
+    assert outbox.aggregate_id == 456
+    assert outbox.event_type == 'COMMAND_ISSUED'
+    assert outbox.correlation_id == '456:95000.00:1703520934123'
+    assert outbox.event is None  # Commands don't reference StopEvent
+    assert outbox.published is False
+    assert outbox.published_at is None
+    assert outbox.retry_count == 0
+
+
+@pytest.mark.django_db
+def test_outbox_create_event_message(client_user, btc_symbol, test_strategy):
+    """Test creating an event message in outbox (Rust → RabbitMQ → Fanout)."""
+    from api.models.event_sourcing import Outbox, StopEvent, StopEventType, ExecutionSource
+
+    # GIVEN: StopEvent for execution result
+    operation = Operation.objects.create(
+        client=client_user,
+        symbol=btc_symbol,
+        strategy=test_strategy,
+        side="BUY",
+        status="ACTIVE",
+    )
+
+    stop_event = StopEvent.objects.create(
+        operation=operation,
+        client=client_user,
+        symbol=btc_symbol.name,
+        event_type=StopEventType.EXECUTED,
+        source=ExecutionSource.RUST,
+        stop_price=Decimal("95000.00"),
+        trigger_price=Decimal("94800.00"),
+        quantity=Decimal("0.001"),
+        side="SELL",
+        execution_token='789:95000.00:1703520934456',
+    )
+
+    # Event payload
+    event_payload = {
+        "event_id": str(stop_event.event_id),
+        "operation_id": operation.id,
+        "event_type": "EXECUTED",
+        "fill_price": "94750.00",
+    }
+
+    # WHEN: Create outbox entry for event
+    outbox = Outbox.objects.create(
+        aggregate_type='stop_event',
+        aggregate_id=operation.id,
+        event_type='EXECUTED',
+        correlation_id='789:95000.00:1703520934456',
+        event=stop_event,  # Events reference StopEvent
+        routing_key=f'stop.event.executed.{operation.id}.BTCUSDC',
+        exchange='stop_events',
+        payload=event_payload,
+    )
+
+    # THEN: Outbox entry created with event reference
+    assert outbox.outbox_id is not None
+    assert outbox.aggregate_type == 'stop_event'
+    assert outbox.event == stop_event
+    assert outbox.event_type == 'EXECUTED'
+    assert outbox.published is False
+
+
+@pytest.mark.django_db
+def test_outbox_correlation_id_uniqueness():
+    """Test correlation_id uniqueness constraint (idempotency)."""
+    from api.models.event_sourcing import Outbox
+
+    correlation_id = '123:95000.00:1703520934789'
+
+    # GIVEN: First outbox entry
+    Outbox.objects.create(
+        aggregate_type='stop_command',
+        aggregate_id=123,
+        event_type='COMMAND_ISSUED',
+        correlation_id=correlation_id,
+        routing_key='stop.command.123.BTCUSDC',
+        exchange='stop_commands',
+        payload={"test": "data"},
+    )
+
+    # WHEN: Attempt to create duplicate correlation_id
+    # THEN: IntegrityError raised (unique constraint)
+    with pytest.raises(IntegrityError):
+        Outbox.objects.create(
+            aggregate_type='stop_command',
+            aggregate_id=123,
+            event_type='COMMAND_ISSUED',
+            correlation_id=correlation_id,  # DUPLICATE
+            routing_key='stop.command.123.BTCUSDC',
+            exchange='stop_commands',
+            payload={"test": "data2"},
+        )
+
+
+@pytest.mark.django_db
+def test_outbox_query_unpublished():
+    """Test querying unpublished messages (worker query)."""
+    from api.models.event_sourcing import Outbox
+
+    # GIVEN: Mix of published and unpublished messages
+    unpublished1 = Outbox.objects.create(
+        aggregate_type='stop_command',
+        aggregate_id=1,
+        event_type='COMMAND_ISSUED',
+        correlation_id='1:95000.00:1',
+        routing_key='stop.command.1.BTCUSDC',
+        exchange='stop_commands',
+        payload={},
+    )
+
+    published = Outbox.objects.create(
+        aggregate_type='stop_command',
+        aggregate_id=2,
+        event_type='COMMAND_ISSUED',
+        correlation_id='2:95000.00:2',
+        routing_key='stop.command.2.BTCUSDC',
+        exchange='stop_commands',
+        payload={},
+        published=True,
+        published_at=timezone.now(),
+    )
+
+    unpublished2 = Outbox.objects.create(
+        aggregate_type='stop_event',
+        aggregate_id=3,
+        event_type='EXECUTED',
+        correlation_id='3:95000.00:3',
+        routing_key='stop.event.executed.3.BTCUSDC',
+        exchange='stop_events',
+        payload={},
+    )
+
+    # WHEN: Query unpublished messages
+    unpublished = Outbox.objects.filter(published=False).order_by('created_at')
+
+    # THEN: Only unpublished messages returned
+    assert unpublished.count() == 2
+    assert list(unpublished) == [unpublished1, unpublished2]
+    assert published not in unpublished
+
+
+@pytest.mark.django_db
+def test_outbox_mark_as_published():
+    """Test marking outbox entry as published (worker success)."""
+    from api.models.event_sourcing import Outbox
+
+    # GIVEN: Unpublished outbox entry
+    outbox = Outbox.objects.create(
+        aggregate_type='stop_command',
+        aggregate_id=1,
+        event_type='COMMAND_ISSUED',
+        correlation_id='1:95000.00:1',
+        routing_key='stop.command.1.BTCUSDC',
+        exchange='stop_commands',
+        payload={},
+    )
+
+    assert outbox.published is False
+    assert outbox.published_at is None
+
+    # WHEN: Mark as published
+    outbox.published = True
+    outbox.published_at = timezone.now()
+    outbox.save()
+
+    # THEN: Published state updated
+    outbox.refresh_from_db()
+    assert outbox.published is True
+    assert outbox.published_at is not None
+
+
+@pytest.mark.django_db
+def test_outbox_retry_count_increment():
+    """Test incrementing retry count on publish failure."""
+    from api.models.event_sourcing import Outbox
+
+    # GIVEN: Outbox entry with failed publish attempt
+    outbox = Outbox.objects.create(
+        aggregate_type='stop_command',
+        aggregate_id=1,
+        event_type='COMMAND_ISSUED',
+        correlation_id='1:95000.00:1',
+        routing_key='stop.command.1.BTCUSDC',
+        exchange='stop_commands',
+        payload={},
+    )
+
+    # WHEN: Simulate publish failure
+    outbox.retry_count += 1
+    outbox.last_error = "Connection timeout to RabbitMQ"
+    outbox.save()
+
+    # THEN: Retry count and error recorded
+    outbox.refresh_from_db()
+    assert outbox.retry_count == 1
+    assert outbox.last_error == "Connection timeout to RabbitMQ"
+    assert outbox.published is False

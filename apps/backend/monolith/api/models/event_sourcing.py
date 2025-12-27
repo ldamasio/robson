@@ -622,23 +622,30 @@ class CircuitBreakerStateModel(models.Model):
 
 class Outbox(models.Model):
     """
-    Outbox for reliable event publishing to RabbitMQ.
+    Generic outbox for reliable command/event publishing to RabbitMQ.
 
     Implements the Transactional Outbox pattern:
-    1. Event inserted into stop_events (within transaction)
-    2. Outbox entry inserted (same transaction)
-    3. Transaction commits (atomic)
-    4. Background worker publishes to RabbitMQ
-    5. Marks as published after successful publish
+    1. Domain change + Outbox entry inserted (same transaction)
+    2. Transaction commits (atomic)
+    3. Background worker polls outbox and publishes to RabbitMQ
+    4. Marks as published after successful publish
 
-    This guarantees at-least-once delivery of events.
+    This guarantees at-least-once delivery of messages.
+
+    Supports TWO message types:
+    - **Commands** (stop_command): Trigger execution (Python → RabbitMQ → Rust)
+    - **Events** (stop_event): Execution results (Rust → RabbitMQ → Fanout)
 
     Attributes:
         outbox_id: Unique outbox entry identifier
-        event: Associated stop event
+        aggregate_type: Message type ('stop_command' or 'stop_event')
+        aggregate_id: Operation ID (for correlation)
+        event_type: Semantic type ('COMMAND_ISSUED', 'EVENT_TRIGGERED', etc.)
+        correlation_id: Global idempotency key (unique across all messages)
+        event: Associated stop event (nullable, only for events)
         routing_key: RabbitMQ routing key
         exchange: RabbitMQ exchange name
-        payload: Event payload to publish
+        payload: Command/event payload to publish
         published: Has this been published?
         published_at: When successfully published
         retry_count: Number of publish attempts
@@ -653,12 +660,38 @@ class Outbox(models.Model):
         help_text='Unique outbox entry identifier'
     )
 
-    # Event reference
+    # Aggregate metadata (generic for commands/events)
+    aggregate_type = models.CharField(
+        max_length=50,
+        db_index=True,
+        help_text="Message type: 'stop_command' or 'stop_event'"
+    )
+    aggregate_id = models.BigIntegerField(
+        db_index=True,
+        help_text='Operation ID (for correlation)'
+    )
+    event_type = models.CharField(
+        max_length=50,
+        db_index=True,
+        help_text="Semantic type: 'COMMAND_ISSUED', 'EVENT_TRIGGERED', 'EXECUTED', etc."
+    )
+
+    # Idempotency key (UNIQUE across ALL messages)
+    correlation_id = models.CharField(
+        max_length=64,
+        unique=True,
+        db_index=True,
+        help_text='Global idempotency key (format: {operation_id}:{stop_price}:{timestamp_ms})'
+    )
+
+    # Event reference (optional, only for event messages)
     event = models.ForeignKey(
         StopEvent,
         on_delete=models.CASCADE,
+        null=True,
+        blank=True,
         related_name='outbox_entries',
-        help_text='Associated stop event'
+        help_text='Associated stop event (null for commands)'
     )
 
     # Routing
@@ -711,13 +744,24 @@ class Outbox(models.Model):
         verbose_name_plural = 'Outbox Entries'
         ordering = ['created_at']
         indexes = [
+            # Partial index for unpublished messages (worker query optimization)
             models.Index(
                 fields=['published', 'created_at'],
                 name='idx_outbox_unpublished',
                 condition=models.Q(published=False),
             ),
+            # Composite index for filtering by aggregate type
+            models.Index(
+                fields=['aggregate_type', 'aggregate_id'],
+                name='idx_outbox_aggregate',
+            ),
+            # Index for correlation tracking
+            models.Index(
+                fields=['correlation_id'],
+                name='idx_outbox_correlation',
+            ),
         ]
 
     def __str__(self):
         status = "✅ Published" if self.published else f"⏳ Pending (retry: {self.retry_count})"
-        return f"Outbox[{self.routing_key}]: {status}"
+        return f"Outbox[{self.aggregate_type}:{self.event_type}] Op#{self.aggregate_id}: {status}"
