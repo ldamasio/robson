@@ -1,0 +1,80 @@
+# RabbitMQ Services - Staging
+# ADR-0016: Separate AMQP (internal) and Management UI (public via ingress)
+# Created: 2024-12-26
+
+---
+# AMQP Service (Internal-only, ClusterIP)
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq-amqp
+  namespace: staging
+  labels:
+    app: rabbitmq
+    component: amqp
+    environment: staging
+spec:
+  type: ClusterIP  # ⚠️ CRITICAL: NEVER LoadBalancer or NodePort
+  clusterIP: None  # Headless service for StatefulSet
+  publishNotReadyAddresses: true
+  ports:
+  - port: 5672
+    targetPort: 5672
+    protocol: TCP
+    name: amqp
+  - port: 4369
+    targetPort: 4369
+    protocol: TCP
+    name: epmd
+  - port: 25672
+    targetPort: 25672
+    protocol: TCP
+    name: dist
+  selector:
+    app: rabbitmq
+
+---
+# Management UI Service (Public via Ingress)
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq-management
+  namespace: staging
+  labels:
+    app: rabbitmq
+    component: management
+    environment: staging
+spec:
+  type: ClusterIP
+  ports:
+  - port: 15672
+    targetPort: 15672
+    protocol: TCP
+    name: http
+  selector:
+    app: rabbitmq
+
+---
+# Prometheus Metrics Service
+apiVersion: v1
+kind: Service
+metadata:
+  name: rabbitmq-prometheus
+  namespace: staging
+  labels:
+    app: rabbitmq
+    component: metrics
+    environment: staging
+  annotations:
+    prometheus.io/scrape: "true"
+    prometheus.io/port: "15692"
+    prometheus.io/path: "/metrics"
+spec:
+  type: ClusterIP
+  ports:
+  - port: 15692
+    targetPort: 15692
+    protocol: TCP
+    name: prometheus
+  selector:
+    app: rabbitmq

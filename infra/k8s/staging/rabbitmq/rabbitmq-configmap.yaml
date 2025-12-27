@@ -1,0 +1,213 @@
+# RabbitMQ Configuration - Staging
+# ADR-0016: Admin Plane hardening
+# Created: 2024-12-26
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: rabbitmq-config
+  namespace: staging
+  labels:
+    app: rabbitmq
+    environment: staging
+data:
+  # RabbitMQ Configuration
+  rabbitmq.conf: |
+    # Cluster configuration (single node in staging, 3 nodes in prod)
+    cluster_formation.peer_discovery_backend = rabbit_peer_discovery_k8s
+    cluster_formation.k8s.host = kubernetes.default.svc.cluster.local
+    cluster_formation.k8s.address_type = hostname
+    cluster_formation.node_cleanup.interval = 30
+    cluster_formation.node_cleanup.only_log_warning = true
+    cluster_partition_handling = autoheal
+
+    # Memory and disk limits
+    vm_memory_high_watermark.relative = 0.6
+    disk_free_limit.absolute = 2GB
+
+    # Network configuration
+    listeners.tcp.default = 5672
+    management.tcp.port = 15672
+
+    # Enable Prometheus plugin
+    management.load_definitions = /etc/rabbitmq/definitions.json
+    prometheus.return_per_object_metrics = true
+
+    # Logging
+    log.console = true
+    log.console.level = info
+    log.file.level = warning
+
+  # Topology definitions (exchanges, queues, bindings, users)
+  definitions.json: |
+    {
+      "users": [
+        {
+          "name": "admin",
+          "password_hash": "replace-with-bcrypt-hash-in-secret",
+          "hashing_algorithm": "rabbit_password_hashing_sha256",
+          "tags": ["administrator"]
+        },
+        {
+          "name": "robson-app",
+          "password_hash": "replace-with-bcrypt-hash-in-secret",
+          "hashing_algorithm": "rabbit_password_hashing_sha256",
+          "tags": ["monitoring"]
+        }
+      ],
+      "vhosts": [
+        {
+          "name": "/robson"
+        }
+      ],
+      "permissions": [
+        {
+          "user": "admin",
+          "vhost": "/robson",
+          "configure": ".*",
+          "write": ".*",
+          "read": ".*"
+        },
+        {
+          "user": "robson-app",
+          "vhost": "/robson",
+          "configure": "^$",
+          "write": "^stop_commands$|^stop_events$",
+          "read": "^stop_commands.*$|^stop_events.*$"
+        }
+      ],
+      "topic_permissions": [],
+      "parameters": [],
+      "global_parameters": [
+        {
+          "name": "cluster_name",
+          "value": "robson-staging"
+        }
+      ],
+      "policies": [
+        {
+          "vhost": "/robson",
+          "name": "ha-all",
+          "pattern": ".*",
+          "apply-to": "all",
+          "definition": {
+            "ha-mode": "all",
+            "ha-sync-mode": "automatic"
+          },
+          "priority": 0
+        }
+      ],
+      "queues": [
+        {
+          "name": "stop_commands.critical",
+          "vhost": "/robson",
+          "durable": true,
+          "auto_delete": false,
+          "arguments": {
+            "x-queue-type": "classic",
+            "x-dead-letter-exchange": "stop_commands.dlx",
+            "x-message-ttl": 300000,
+            "x-max-length": 10000
+          }
+        },
+        {
+          "name": "stop_commands.dlq",
+          "vhost": "/robson",
+          "durable": true,
+          "auto_delete": false,
+          "arguments": {}
+        },
+        {
+          "name": "stop_events.audit",
+          "vhost": "/robson",
+          "durable": true,
+          "auto_delete": false,
+          "arguments": {
+            "x-message-ttl": 7776000000
+          }
+        },
+        {
+          "name": "stop_events.notify",
+          "vhost": "/robson",
+          "durable": true,
+          "auto_delete": false,
+          "arguments": {}
+        }
+      ],
+      "exchanges": [
+        {
+          "name": "stop_commands",
+          "vhost": "/robson",
+          "type": "topic",
+          "durable": true,
+          "auto_delete": false,
+          "internal": false,
+          "arguments": {}
+        },
+        {
+          "name": "stop_commands.dlx",
+          "vhost": "/robson",
+          "type": "fanout",
+          "durable": true,
+          "auto_delete": false,
+          "internal": false,
+          "arguments": {}
+        },
+        {
+          "name": "stop_events",
+          "vhost": "/robson",
+          "type": "topic",
+          "durable": true,
+          "auto_delete": false,
+          "internal": false,
+          "arguments": {}
+        }
+      ],
+      "bindings": [
+        {
+          "source": "stop_commands",
+          "vhost": "/robson",
+          "destination": "stop_commands.critical",
+          "destination_type": "queue",
+          "routing_key": "stop.command.#",
+          "arguments": {}
+        },
+        {
+          "source": "stop_commands.dlx",
+          "vhost": "/robson",
+          "destination": "stop_commands.dlq",
+          "destination_type": "queue",
+          "routing_key": "",
+          "arguments": {}
+        },
+        {
+          "source": "stop_events",
+          "vhost": "/robson",
+          "destination": "stop_events.audit",
+          "destination_type": "queue",
+          "routing_key": "stop.event.#",
+          "arguments": {}
+        },
+        {
+          "source": "stop_events",
+          "vhost": "/robson",
+          "destination": "stop_events.notify",
+          "destination_type": "queue",
+          "routing_key": "stop.event.executed.#",
+          "arguments": {}
+        },
+        {
+          "source": "stop_events",
+          "vhost": "/robson",
+          "destination": "stop_events.notify",
+          "destination_type": "queue",
+          "routing_key": "stop.event.failed.#",
+          "arguments": {}
+        }
+      ]
+    }
+
+  # Enabled plugins
+  enabled_plugins: |
+    [rabbitmq_management,rabbitmq_prometheus,rabbitmq_peer_discovery_k8s].

@@ -1,0 +1,137 @@
+# Traefik Middlewares - Staging
+# ADR-0016: Hardened ingress (BasicAuth, IP allowlist, rate limiting)
+# Created: 2024-12-26
+
+---
+# BasicAuth Middleware for RabbitMQ Management UI
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: rabbitmq-basicauth
+  namespace: staging
+  labels:
+    app: rabbitmq
+    environment: staging
+spec:
+  basicAuth:
+    secret: rabbitmq-basicauth-secret  # Contains bcrypt hashed credentials
+    realm: "RabbitMQ Management - Staging"
+    removeHeader: false
+
+---
+# IP Allowlist Middleware for RabbitMQ Management UI
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: rabbitmq-ipallowlist
+  namespace: staging
+  labels:
+    app: rabbitmq
+    environment: staging
+spec:
+  ipWhiteList:
+    sourceRange:
+    # Example IPs - Replace with actual office/VPN IPs
+    - "203.0.113.0/24"  # Office network
+    - "198.51.100.0/24"  # VPN network
+    - "127.0.0.1/32"     # Localhost (for testing)
+    ipStrategy:
+      depth: 1  # Trust X-Forwarded-For from Traefik
+
+---
+# Rate Limiting Middleware for Admin Interfaces
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: ratelimit-admin
+  namespace: staging
+  labels:
+    environment: staging
+spec:
+  rateLimit:
+    average: 60  # 60 requests/minute per IP
+    burst: 10    # Allow short bursts
+    period: 1m
+    sourceCriterion:
+      ipStrategy:
+        depth: 1
+
+---
+# IP Allowlist Middleware for criticws (more restrictive)
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: criticws-ipallowlist
+  namespace: staging
+  labels:
+    app: criticws
+    environment: staging
+spec:
+  ipWhiteList:
+    sourceRange:
+    # More restrictive than RabbitMQ (admin/operator only)
+    - "203.0.113.10/32"  # Admin workstation
+    - "198.51.100.50/32"  # Operator VPN
+    ipStrategy:
+      depth: 1
+
+---
+# Rate Limiting Middleware for criticws
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: criticws-ratelimit
+  namespace: staging
+  labels:
+    app: criticws
+    environment: staging
+spec:
+  rateLimit:
+    average: 100  # 100 connections/minute per IP
+    burst: 20
+    period: 1m
+    sourceCriterion:
+      ipStrategy:
+        depth: 1
+
+---
+# Rate Limiting Middleware for UI WebSocket (less restrictive)
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: ws-ratelimit
+  namespace: staging
+  labels:
+    app: ws
+    environment: staging
+spec:
+  rateLimit:
+    average: 500  # 500 connections/minute per IP (non-critical)
+    burst: 50
+    period: 1m
+    sourceCriterion:
+      ipStrategy:
+        depth: 1
+
+---
+# Security Headers Middleware (all public ingresses)
+apiVersion: traefik.io/v1alpha1
+kind: Middleware
+metadata:
+  name: security-headers
+  namespace: staging
+  labels:
+    environment: staging
+spec:
+  headers:
+    frameDeny: true
+    browserXssFilter: true
+    contentTypeNosniff: true
+    stsSeconds: 31536000
+    stsIncludeSubdomains: true
+    stsPreload: true
+    customResponseHeaders:
+      X-Frame-Options: "DENY"
+      X-Content-Type-Options: "nosniff"
+      X-XSS-Protection: "1; mode=block"
+      Referrer-Policy: "strict-origin-when-cross-origin"

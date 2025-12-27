@@ -1,0 +1,191 @@
+# RabbitMQ StatefulSet - Staging
+# ADR-0016: Admin Plane with HA and persistence
+# Created: 2024-12-26
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: rabbitmq
+  namespace: staging
+  labels:
+    app: rabbitmq
+    environment: staging
+spec:
+  serviceName: rabbitmq-amqp  # Headless service for stable network IDs
+  replicas: 1  # Single replica in staging (3 in production)
+  selector:
+    matchLabels:
+      app: rabbitmq
+  template:
+    metadata:
+      labels:
+        app: rabbitmq
+        tier: backend  # For NetworkPolicy
+        environment: staging
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "15692"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: rabbitmq  # For K8s peer discovery
+      terminationGracePeriodSeconds: 10
+
+      initContainers:
+      # Copy configuration files with proper permissions
+      - name: config-init
+        image: busybox:1.36
+        command:
+        - sh
+        - -c
+        - |
+          cp /tmp/rabbitmq-config/* /etc/rabbitmq/
+          chmod 644 /etc/rabbitmq/*
+        volumeMounts:
+        - name: config
+          mountPath: /tmp/rabbitmq-config
+        - name: rabbitmq-config-rw
+          mountPath: /etc/rabbitmq
+
+      containers:
+      - name: rabbitmq
+        image: rabbitmq:3.12-management-alpine  # Pinned version
+        imagePullPolicy: IfNotPresent
+
+        ports:
+        - containerPort: 5672
+          name: amqp
+          protocol: TCP
+        - containerPort: 15672
+          name: management
+          protocol: TCP
+        - containerPort: 15692
+          name: prometheus
+          protocol: TCP
+        - containerPort: 4369
+          name: epmd
+          protocol: TCP
+        - containerPort: 25672
+          name: dist
+          protocol: TCP
+
+        env:
+        # Admin credentials (from Secret)
+        - name: RABBITMQ_DEFAULT_USER
+          valueFrom:
+            secretKeyRef:
+              name: rabbitmq-credentials
+              key: admin-username
+        - name: RABBITMQ_DEFAULT_PASS
+          valueFrom:
+            secretKeyRef:
+              name: rabbitmq-credentials
+              key: admin-password
+
+        # Erlang cookie (from Secret, for clustering)
+        - name: RABBITMQ_ERLANG_COOKIE
+          valueFrom:
+            secretKeyRef:
+              name: rabbitmq-credentials
+              key: erlang-cookie
+
+        # Cluster configuration
+        - name: RABBITMQ_USE_LONGNAME
+          value: "true"
+        - name: RABBITMQ_NODENAME
+          value: "rabbit@$(hostname -f)"
+        - name: K8S_SERVICE_NAME
+          value: "rabbitmq-amqp"
+        - name: POD_NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace
+
+        volumeMounts:
+        # Data persistence
+        - name: data
+          mountPath: /var/lib/rabbitmq
+
+        # Configuration (read-write copy from ConfigMap)
+        - name: rabbitmq-config-rw
+          mountPath: /etc/rabbitmq
+
+        resources:
+          requests:
+            cpu: 200m
+            memory: 512Mi
+          limits:
+            cpu: 1000m
+            memory: 2Gi
+
+        # Liveness probe
+        livenessProbe:
+          exec:
+            command:
+            - rabbitmq-diagnostics
+            - -q
+            - ping
+          initialDelaySeconds: 60
+          periodSeconds: 30
+          timeoutSeconds: 10
+          failureThreshold: 3
+
+        # Readiness probe
+        readinessProbe:
+          exec:
+            command:
+            - rabbitmq-diagnostics
+            - -q
+            - check_running
+          initialDelaySeconds: 20
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 3
+
+        # Startup probe (allow more time for cluster formation)
+        startupProbe:
+          exec:
+            command:
+            - rabbitmq-diagnostics
+            - -q
+            - check_running
+          initialDelaySeconds: 10
+          periodSeconds: 10
+          timeoutSeconds: 5
+          failureThreshold: 30
+
+      volumes:
+      # ConfigMap (read-only)
+      - name: config
+        configMap:
+          name: rabbitmq-config
+          items:
+          - key: rabbitmq.conf
+            path: rabbitmq.conf
+          - key: enabled_plugins
+            path: enabled_plugins
+          - key: definitions.json
+            path: definitions.json
+
+      # Empty dir for read-write config (copied from ConfigMap)
+      - name: rabbitmq-config-rw
+        emptyDir: {}
+
+      securityContext:
+        fsGroup: 999
+        runAsUser: 999
+        runAsNonRoot: true
+
+  # VolumeClaimTemplate for persistence
+  volumeClaimTemplates:
+  - metadata:
+      name: data
+      labels:
+        app: rabbitmq
+    spec:
+      accessModes:
+      - ReadWriteOnce
+      resources:
+        requests:
+          storage: 10Gi
+      storageClassName: local-path

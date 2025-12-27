@@ -1,0 +1,51 @@
+# RabbitMQ Management UI Ingress - Staging
+# ADR-0016: Hardened public access (BasicAuth, IP allowlist, rate limiting, TLS)
+# Created: 2024-12-26
+
+---
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rabbitmq-management
+  namespace: staging
+  labels:
+    app: rabbitmq
+    component: management
+    environment: staging
+  annotations:
+    # TLS certificate (Let's Encrypt via cert-manager)
+    cert-manager.io/cluster-issuer: letsencrypt-staging
+
+    # Traefik ingress class
+    traefik.ingress.kubernetes.io/router.entrypoints: websecure
+    traefik.ingress.kubernetes.io/router.tls: "true"
+
+    # Apply middlewares (order matters!)
+    traefik.ingress.kubernetes.io/router.middlewares: >-
+      staging-security-headers@kubernetescrd,
+      staging-rabbitmq-ipallowlist@kubernetescrd,
+      staging-ratelimit-admin@kubernetescrd,
+      staging-rabbitmq-basicauth@kubernetescrd
+
+    # Force HTTPS redirect
+    traefik.ingress.kubernetes.io/redirect-entry-point: https
+    traefik.ingress.kubernetes.io/redirect-permanent: "true"
+
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - rabbitmq.staging.rbx.ia.br
+    secretName: rabbitmq-management-tls
+
+  rules:
+  - host: rabbitmq.staging.rbx.ia.br
+    http:
+      paths:
+      - path: /
+        pathType: Prefix
+        backend:
+          service:
+            name: rabbitmq-management
+            port:
+              number: 15672

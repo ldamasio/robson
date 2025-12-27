@@ -1,0 +1,48 @@
+# RabbitMQ RBAC - Staging
+# ServiceAccount + Role + RoleBinding for K8s peer discovery
+# Created: 2024-12-26
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: rabbitmq
+  namespace: staging
+  labels:
+    app: rabbitmq
+    environment: staging
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: rabbitmq-peer-discovery
+  namespace: staging
+  labels:
+    app: rabbitmq
+    environment: staging
+rules:
+- apiGroups: [""]
+  resources: ["endpoints"]
+  verbs: ["get", "list", "watch"]
+- apiGroups: [""]
+  resources: ["events"]
+  verbs: ["create"]
+
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: rabbitmq-peer-discovery
+  namespace: staging
+  labels:
+    app: rabbitmq
+    environment: staging
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: rabbitmq-peer-discovery
+subjects:
+- kind: ServiceAccount
+  name: rabbitmq
+  namespace: staging

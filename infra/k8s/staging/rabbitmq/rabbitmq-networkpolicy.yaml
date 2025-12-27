@@ -1,0 +1,97 @@
+# RabbitMQ NetworkPolicy - Staging
+# ADR-0016: Admin Plane hardening - AMQP internal-only
+# Created: 2024-12-26
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: rabbitmq-amqp-internal-only
+  namespace: staging
+  labels:
+    app: rabbitmq
+    environment: staging
+spec:
+  podSelector:
+    matchLabels:
+      app: rabbitmq
+  policyTypes:
+  - Ingress
+  - Egress
+
+  ingress:
+  # Allow AMQP (5672) from backend pods ONLY
+  - from:
+    - podSelector:
+        matchLabels:
+          tier: backend  # Rust Stop Engine, Python Outbox Publisher
+    ports:
+    - protocol: TCP
+      port: 5672
+
+  # Allow Management UI (15672) from Traefik ingress ONLY
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: traefik
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: traefik
+    ports:
+    - protocol: TCP
+      port: 15672
+
+  # Allow Prometheus scraping (15692) from monitoring namespace
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: monitoring
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: prometheus
+    ports:
+    - protocol: TCP
+      port: 15692
+
+  # Allow inter-pod communication for clustering (4369, 25672)
+  - from:
+    - podSelector:
+        matchLabels:
+          app: rabbitmq
+    ports:
+    - protocol: TCP
+      port: 4369  # EPMD
+    - protocol: TCP
+      port: 25672  # Erlang distribution
+
+  egress:
+  # Allow DNS resolution
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+
+  # Allow Kubernetes API access (for peer discovery)
+  - to:
+    - namespaceSelector: {}
+      podSelector:
+        matchLabels:
+          component: apiserver
+    ports:
+    - protocol: TCP
+      port: 443
+
+  # Allow inter-pod communication for clustering
+  - to:
+    - podSelector:
+        matchLabels:
+          app: rabbitmq
+    ports:
+    - protocol: TCP
+      port: 4369
+    - protocol: TCP
+      port: 25672
