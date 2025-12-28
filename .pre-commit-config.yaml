@@ -129,47 +129,42 @@ repos:
   # ============================================================================
   # JavaScript/React: Prettier (formatter)
   # ============================================================================
-  # DISABLED: npm registry private issue - use VS Code Prettier extension instead
-  # To enable: configure npm to use public registry or remove Enforce registry
-  # - repo: https://github.com/pre-commit/mirrors-prettier
-  #   rev: v4.0.0-alpha.8
-  #   hooks:
-  #     - id: prettier
-  #       name: Format JS/JSX/JSON/YAML (Prettier)
-  #       types_or: [javascript, jsx, json, yaml, markdown]
-  #       files: ^apps/frontend/
-  #       args: [--write, --prose-wrap=always]
+  - repo: https://github.com/pre-commit/mirrors-prettier
+    rev: v4.0.0-alpha.8
+    hooks:
+      - id: prettier
+        name: Format JS/JSX/JSON/YAML (Prettier)
+        types_or: [javascript, jsx, json, yaml, markdown]
+        files: ^apps/frontend/
+        args: [--write, --prose-wrap=always]
 
   # ============================================================================
   # JavaScript: ESLint (linter)
   # ============================================================================
-  # DISABLED: npm registry private issue - use VS Code ESLint extension instead
-  # To enable: configure npm to use public registry or remove Enforce registry
-  # - repo: https://github.com/pre-commit/mirrors-eslint
-  #   rev: v9.13.0
-  #   hooks:
-  #     - id: eslint
-  #       name: Lint JavaScript/React (ESLint)
-  #       files: ^apps/frontend/src/.*\.[jt]sx?$
-  #       types: [file]
-  #       args: [--fix, --max-warnings=0]
-  #       additional_dependencies:
-  #         - eslint@8.57.0
-  #         - eslint-config-react-app
-  #         - eslint-plugin-react
-  #         - eslint-plugin-react-hooks
+  - repo: https://github.com/pre-commit/mirrors-eslint
+    rev: v9.13.0
+    hooks:
+      - id: eslint
+        name: Lint JavaScript/React (ESLint)
+        files: ^apps/frontend/src/.*\.[jt]sx?$
+        types: [file]
+        args: [--fix, --max-warnings=0]
+        additional_dependencies:
+          - eslint@8.57.0
+          - eslint-config-react-app
+          - eslint-plugin-react
+          - eslint-plugin-react-hooks
 
   # ============================================================================
   # Markdown: markdownlint
   # ============================================================================
-  # DISABLED: npm registry private issue - use VS Code markdownlint extension instead
-  # - repo: https://github.com/igorshubovych/markdownlint-cli
-  #   rev: v0.42.0
-  #   hooks:
-  #     - id: markdownlint
-  #       name: Lint Markdown files
-  #       args: [--fix]
-  #       files: \.md$
+  - repo: https://github.com/igorshubovych/markdownlint-cli
+    rev: v0.42.0
+    hooks:
+      - id: markdownlint
+        name: Lint Markdown files
+        args: [--fix]
+        files: \.md$
 
   # ============================================================================
   # YAML: yamllint
