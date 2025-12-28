@@ -164,6 +164,77 @@ validate:
 	@./.ai-agents/validate.sh
 
 # ==============================
+# Code Quality (Pre-commit)
+# ==============================
+
+.PHONY: pre-commit-install pre-commit-run pre-commit-update pre-commit-all \
+        format-python format-go format-js lint-python lint-go lint-js \
+        quality-all
+
+# Install pre-commit hooks locally
+pre-commit-install:
+	@echo "Installing pre-commit hooks..."
+	@pre-commit install
+	@pre-commit install --hook-type commit-msg
+	@echo "✓ Pre-commit hooks installed"
+	@echo ""
+	@echo "Hooks will run automatically on: git commit"
+	@echo "Run manually: make pre-commit-run"
+
+# Run pre-commit on all files
+pre-commit-run:
+	@echo "Running pre-commit hooks on all files..."
+	@pre-commit run --all-files
+
+# Update pre-commit hook versions
+pre-commit-update:
+	@echo "Updating pre-commit hook versions..."
+	@pre-commit autoupdate
+	@echo "✓ Hooks updated (review .pre-commit-config.yaml)"
+
+# Run all pre-commit checks (alias)
+pre-commit-all: pre-commit-run
+
+# Format Python code
+format-python:
+	@echo "Formatting Python code..."
+	@cd apps/backend/monolith && black . && isort .
+	@echo "✓ Python code formatted"
+
+# Format Go code
+format-go:
+	@echo "Formatting Go code..."
+	@gofmt -w cli/
+	@echo "✓ Go code formatted"
+
+# Format JS/JSX code
+format-js:
+	@echo "Formatting JS/JSX code..."
+	@cd apps/frontend && npx prettier --write "src/**/*.{js,jsx,json,css}"
+	@echo "✓ JS/JSX code formatted"
+
+# Lint Python code
+lint-python:
+	@echo "Linting Python code..."
+	@ruff check apps/backend/
+	@echo "✓ Python lint passed"
+
+# Lint Go code
+lint-go:
+	@echo "Linting Go code..."
+	@gofmt -l cli/ | read || echo "✓ Go lint passed (no formatting needed)"
+
+# Lint JS/JSX code
+lint-js:
+	@echo "Linting JS/JSX code..."
+	@cd apps/frontend && npx eslint src/
+	@echo "✓ JS/JSX lint passed"
+
+# Run all quality checks
+quality-all: format-python format-go format-js lint-python lint-go lint-js
+	@echo "✓ All quality checks passed"
+
+# ==============================
 # Deep Storage / Data Lake
 # ==============================
 

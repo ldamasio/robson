@@ -115,6 +115,19 @@ repos:
   #       files: requirements.txt
 
   # ============================================================================
+  # Go: gofmt (formatter)
+  # ============================================================================
+  - repo: local
+    hooks:
+      - id: gofmt
+        name: Format Go code (gofmt)
+        entry: gofmt
+        language: system
+        args: [-w]
+        files: ^cli/.*\.go$
+        types: [go]
+
+  # ============================================================================
   # JavaScript/React: Prettier (formatter)
   # ============================================================================
   - repo: https://github.com/pre-commit/mirrors-prettier
@@ -203,7 +216,7 @@ repos:
     hooks:
       - id: check-language-policy
         name: Check English-only policy
-        entry: bash -c 'if grep -rn --include="*.py" --include="*.js" --include="*.jsx" -P "[àáâãäåèéêëìíîïòóôõöùúûüýÿñçÀÁÂÃÄÅÈÉÊËÌÍÎÏÒÓÔÕÖÙÚÛÜÝŸÑÇ]" apps/ 2>/dev/null; then echo "ERROR: Non-English characters detected. See docs/LANGUAGE-POLICY.md"; exit 1; fi'
+        entry: 'bash -c ''if grep -rn --include="*.py" --include="*.js" --include="*.jsx" -P "[àáâãäåèéêëìíîïòóôõöùúûüýÿñçÀÁÂÃÄÅÈÉÊËÌÍÎÏÒÓÔÕÖÙÚÛÜÝŸÑÇ]" apps/ 2>/dev/null; then echo "ERROR: Non-English characters detected. See docs/LANGUAGE-POLICY.md"; exit 1; fi'''
         language: system
         pass_filenames: false
         files: ^apps/.*\.(py|js|jsx)$
@@ -215,7 +228,7 @@ repos:
     hooks:
       - id: check-no-django-in-core
         name: Check no Django in core domain/application
-        entry: bash -c 'if grep -rn "from django\|import django" apps/backend/core/domain/ apps/backend/core/application/ 2>/dev/null; then echo "ERROR: Django imports not allowed in core domain/application. See docs/ARCHITECTURE.md"; exit 1; fi'
+        entry: 'bash -c ''if grep -rn "from django\|import django" apps/backend/core/domain/ apps/backend/core/application/ 2>/dev/null; then echo "ERROR: Django imports not allowed in core domain/application. See docs/ARCHITECTURE.md"; exit 1; fi'''
         language: system
         pass_filenames: false
         files: ^apps/backend/core/(domain|application)/.*\.py$

@@ -44,6 +44,9 @@ docs/
 │   ├── DEEPSEEK_GATEWAY.md
 │   ├── INGESTION_EVENTS.md
 │   └── SQL_SCHEMA.md
+├── quality/                         # Code quality tooling
+│   ├── README.md                    # Quality guide (pre-commit, SonarLint, SonarQube)
+│   └── sonarlint.md                 # SonarLint IDE setup
 ├── specs/                           # Specifications (TDD/BDD)
 │   ├── README.md
 │   └── api/openapi.yaml             # REST API (OpenAPI 3.1)
@@ -75,6 +78,7 @@ docs/
 - [Developer Workflow](DEVELOPER.md) - Day-to-day development practices
 - [Code Style Guide](STYLE_GUIDE.md) - Coding conventions
 - [Language Policy](LANGUAGE-POLICY.md) - English-only requirement
+- [Quality Tooling](quality/README.md) - Pre-commit, SonarLint, SonarQube
 
 **Architecture**:
 - [System Architecture](ARCHITECTURE.md) - Hexagonal architecture overview
@@ -151,6 +155,15 @@ docs/
 | **Code Style** | [STYLE_GUIDE.md](STYLE_GUIDE.md) |
 | **Contributing** | [../CONTRIBUTING.md](../CONTRIBUTING.md) |
 | **Adapter Development** | [CONTRIBUTING-ADAPTERS.md](CONTRIBUTING-ADAPTERS.md) |
+
+### Code Quality
+
+| Topic | Document |
+|-------|----------|
+| **Quality Tooling Overview** | [quality/README.md](quality/README.md) |
+| **Pre-commit Hooks** | [.pre-commit-config.yaml](../.pre-commit-config.yaml) |
+| **SonarLint (IDE)** | [quality/sonarlint.md](quality/sonarlint.md) |
+| **SonarQube (CI)** | [sonar-project.properties](../sonar-project.properties) |
 
 ### Operations
 
