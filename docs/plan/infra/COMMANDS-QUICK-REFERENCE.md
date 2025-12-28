@@ -251,7 +251,7 @@ git push
 
 ```bash
 # Apply ArgoCD Application
-kubectl apply -f infra/k8s/gitops/applications/robson-prod.yaml
+kubectl apply -f infra/k8s/gitops/applications/robson-prod.yml
 
 # Watch pods
 kubectl get pods -n robson -w

@@ -32,7 +32,7 @@ echo "=========================================="
 echo ""
 
 # Apply the fixed backend deployment
-scp infra/k8s/staging/backend/backend-staging.yaml $SSH_HOST:/tmp/backend-staging-fixed.yaml
+scp infra/k8s/staging/backend/backend-staging.yml $SSH_HOST:/tmp/backend-staging-fixed.yml
 ssh $SSH_HOST "kubectl apply -f /tmp/backend-staging-fixed.yaml"
 
 echo "✅ Backend deployment updated"
@@ -44,7 +44,7 @@ echo "=========================================="
 echo ""
 
 # Apply the Traefik ingress
-scp infra/k8s/staging/ingress/traefik-staging.yaml $SSH_HOST:/tmp/traefik-staging.yaml
+scp infra/k8s/staging/ingress/traefik-staging.yml $SSH_HOST:/tmp/traefik-staging.yml
 ssh $SSH_HOST "kubectl apply -f /tmp/traefik-staging.yaml"
 
 echo "✅ Traefik ingress created"

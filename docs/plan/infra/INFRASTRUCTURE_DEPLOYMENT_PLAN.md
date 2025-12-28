@@ -233,16 +233,16 @@ kubectl port-forward svc/argocd-server -n argocd 8080:443
 #### 2. Apply Platform Applications
 ```bash
 # Gateway API CRDs
-kubectl apply -f infra/k8s/platform/gateway-api-crds/app.yaml
+kubectl apply -f infra/k8s/platform/gateway-api-crds/app.yml
 
 # cert-manager
-kubectl apply -f infra/k8s/platform/cert-manager/app.yaml
+kubectl apply -f infra/k8s/platform/cert-manager/app.yml
 
 # Istio Ambient (order matters: base → CNI → istiod → ztunnel)
-kubectl apply -f infra/k8s/platform/istio-ambient/base.yaml
-kubectl apply -f infra/k8s/platform/istio-ambient/cni.yaml
-kubectl apply -f infra/k8s/platform/istio-ambient/istiod.yaml
-kubectl apply -f infra/k8s/platform/istio-ambient/ztunnel.yaml
+kubectl apply -f infra/k8s/platform/istio-ambient/base.yml
+kubectl apply -f infra/k8s/platform/istio-ambient/cni.yml
+kubectl apply -f infra/k8s/platform/istio-ambient/istiod.yml
+kubectl apply -f infra/k8s/platform/istio-ambient/ztunnel.yml
 ```
 
 **Validation**:
@@ -325,12 +325,12 @@ kubectl apply -f /tmp/cluster-issuer-staging.yaml
 ```bash
 kubectl delete application -n argocd --all
 
-kubectl delete -f infra/k8s/platform/istio-ambient/ztunnel.yaml
-kubectl delete -f infra/k8s/platform/istio-ambient/istiod.yaml
-kubectl delete -f infra/k8s/platform/istio-ambient/cni.yaml
-kubectl delete -f infra/k8s/platform/istio-ambient/base.yaml
+kubectl delete -f infra/k8s/platform/istio-ambient/ztunnel.yml
+kubectl delete -f infra/k8s/platform/istio-ambient/istiod.yml
+kubectl delete -f infra/k8s/platform/istio-ambient/cni.yml
+kubectl delete -f infra/k8s/platform/istio-ambient/base.yml
 
-kubectl delete -f infra/k8s/platform/cert-manager/app.yaml
+kubectl delete -f infra/k8s/platform/cert-manager/app.yml
 kubectl delete namespace cert-manager
 ```
 
@@ -350,7 +350,7 @@ kubectl delete namespace cert-manager
 ```bash
 export KUBECONFIG=~/.kube/config-robson
 
-kubectl apply -f infra/k8s/gitops/app-of-apps/root.yaml
+kubectl apply -f infra/k8s/gitops/app-of-apps/root.yml
 
 kubectl get application -n argocd robson-root
 ```

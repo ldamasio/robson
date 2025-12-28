@@ -107,31 +107,31 @@ kubectl apply -k infra/k8s/staging/
 # OU aplicar manualmente em ordem:
 
 # 1. Namespace
-kubectl apply -f infra/k8s/namespaces/staging.yaml
+kubectl apply -f infra/k8s/namespaces/staging.yml
 
 # 2. Network Policies
-kubectl apply -f infra/k8s/staging/network-policies/isolation.yaml
+kubectl apply -f infra/k8s/staging/network-policies/isolation.yml
 
 # 3. PostgreSQL
-kubectl apply -f infra/k8s/staging/postgres/postgres-staging.yaml
+kubectl apply -f infra/k8s/staging/postgres/postgres-staging.yml
 
 # 4. Redis
-kubectl apply -f infra/k8s/staging/redis/redis-staging.yaml
+kubectl apply -f infra/k8s/staging/redis/redis-staging.yml
 
 # 5. RabbitMQ
-kubectl apply -f infra/k8s/staging/rabbitmq/rabbitmq-staging.yaml
+kubectl apply -f infra/k8s/staging/rabbitmq/rabbitmq-staging.yml
 
 # 6. Backend
-kubectl apply -f infra/k8s/staging/backend/backend-staging.yaml
+kubectl apply -f infra/k8s/staging/backend/backend-staging.yml
 
 # 7. CronJob Stop Monitor
-kubectl apply -f infra/k8s/staging/backend/cronjob-stop-monitor.yaml
+kubectl apply -f infra/k8s/staging/backend/cronjob-stop-monitor.yml
 
 # 8. Istio Gateway
-kubectl apply -f infra/k8s/staging/istio/gateway-staging.yaml
+kubectl apply -f infra/k8s/staging/istio/gateway-staging.yml
 
 # 9. TLS Certificate
-kubectl apply -f infra/k8s/staging/istio/certificate-staging.yaml
+kubectl apply -f infra/k8s/staging/istio/certificate-staging.yml
 ```
 
 ---

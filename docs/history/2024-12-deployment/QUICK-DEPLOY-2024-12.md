@@ -261,7 +261,7 @@ kubectl wait --for=condition=available --timeout=300s \
   deployment/cert-manager -n cert-manager
 
 # Create ClusterIssuer
-kubectl apply -f infra/k8s/platform/cert-manager/cluster-issuer.yaml
+kubectl apply -f infra/k8s/platform/cert-manager/cluster-issuer.yml
 ```
 
 ### 4.2 Install Gateway API CRDs
@@ -316,7 +316,7 @@ git push
 
 ```bash
 # Apply ArgoCD Application
-kubectl apply -f infra/k8s/gitops/applications/robson-prod.yaml
+kubectl apply -f infra/k8s/gitops/applications/robson-prod.yml
 
 # Watch deployment
 kubectl get pods -n robson -w

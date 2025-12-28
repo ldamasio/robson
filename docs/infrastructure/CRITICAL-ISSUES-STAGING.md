@@ -8,7 +8,7 @@
 
 ## Issue #1: Missing imagePullSecrets
 
-**File**: `infra/k8s/staging/backend/backend-staging.yaml`
+**File**: `infra/k8s/staging/backend/backend-staging.yml`
 **Lines**: 58 (spec.template.spec section)
 
 **Problem**: Deployment doesn't include `imagePullSecrets` to pull from GHCR private registry.
@@ -39,7 +39,7 @@ spec:
 
 ## Issue #2: securityContext Blocks Log Directory Creation
 
-**File**: `infra/k8s/staging/backend/backend-staging.yaml`
+**File**: `infra/k8s/staging/backend/backend-staging.yml`
 **Lines**: 197-200
 
 **Problem**: Container runs as non-root user 1000, but `/app/logs` directory needs creation.
@@ -89,7 +89,7 @@ spec:
 
 ## Issue #3: Health Endpoint May Not Exist
 
-**File**: `infra/k8s/staging/backend/backend-staging.yaml`
+**File**: `infra/k8s/staging/backend/backend-staging.yml`
 **Lines**: 160, 173, 186 (livenessProbe, readinessProbe, startupProbe)
 
 **Problem**: Probes use `/health/` endpoint which may not be implemented in Django.
@@ -136,7 +136,7 @@ def health(request):
 
 ## Issue #4: Missing Environment Variables
 
-**File**: `infra/k8s/staging/backend/backend-staging.yaml`
+**File**: `infra/k8s/staging/backend/backend-staging.yml`
 **Lines**: 84-147
 
 **Problem**: Deployment expects `DATABASE_URL`, `REDIS_URL`, `RABBITMQ_URL` from secret, but `deploy-staging.sh` creates individual variables (`RBS_PG_*`, etc.).
@@ -207,7 +207,7 @@ env:
 
 **Required**: Create Traefik Ingress
 
-**File to create**: `infra/k8s/staging/ingress/traefik-staging.yaml`
+**File to create**: `infra/k8s/staging/ingress/traefik-staging.yml`
 
 ```yaml
 ---
@@ -275,7 +275,7 @@ spec:
 
 ## Issue #6: Istio Gateway Not Used
 
-**File**: `infra/k8s/staging/istio/gateway-staging.yaml`
+**File**: `infra/k8s/staging/istio/gateway-staging.yml`
 **Status**: Created but not applied
 
 **Problem**: Documentation mentions Istio Gateway but cluster uses Traefik.

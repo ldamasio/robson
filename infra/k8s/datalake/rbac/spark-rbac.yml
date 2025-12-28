@@ -1,0 +1,54 @@
+# ServiceAccount and RBAC for Spark on Kubernetes
+# Purpose: Allow Spark driver to create executor pods in analytics-jobs namespace
+# ADR-0013: Deep Storage Architecture
+# Created: 2024-12-27
+
+---
+# ServiceAccount for Spark jobs
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: spark-jobs
+  namespace: analytics-jobs
+  labels:
+    app: spark
+    component: driver
+
+---
+# Role: Create and manage pods (executors)
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: spark-role
+  namespace: analytics-jobs
+rules:
+  # Create/delete executor pods
+  - apiGroups: [""]
+    resources: ["pods", "pods/log"]
+    verbs: ["get", "list", "watch", "create", "delete", "deletecollection"]
+
+  # Create services for Spark UI (optional)
+  - apiGroups: [""]
+    resources: ["services"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+
+  # Create configmaps for Spark configuration
+  - apiGroups: [""]
+    resources: ["configmaps"]
+    verbs: ["get", "list", "watch", "create", "delete", "update"]
+
+---
+# RoleBinding: Bind spark-role to spark-jobs ServiceAccount
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: spark-role-binding
+  namespace: analytics-jobs
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: spark-role
+subjects:
+  - kind: ServiceAccount
+    name: spark-jobs
+    namespace: analytics-jobs

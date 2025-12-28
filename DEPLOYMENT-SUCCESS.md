@@ -147,11 +147,11 @@ Quando `READY=True`, os certificados estarão instalados e o HTTPS estará segur
 ## Arquivos Modificados/Criados
 
 ### Manifests Kubernetes (Modificados)
-- ✅ `infra/k8s/staging/backend/backend-staging.yaml`
-- ✅ `infra/k8s/staging/kustomization.yaml`
+- ✅ `infra/k8s/staging/backend/backend-staging.yml`
+- ✅ `infra/k8s/staging/kustomization.yml`
 
 ### Manifests Kubernetes (Novos)
-- ✅ `infra/k8s/staging/ingress/traefik-staging.yaml`
+- ✅ `infra/k8s/staging/ingress/traefik-staging.yml`
 
 ### Documentação (Nova)
 - ✅ `docs/infrastructure/STAGING-DEPLOYMENT-STATE.md`

@@ -21,7 +21,7 @@ python -c "import yaml; yaml.safe_load(open('.github/workflows/main.yml'))"
 kubectl apply --dry-run=client -f infra/k8s/prod/
 
 # Check ArgoCD Application manifest
-kubectl apply --dry-run=client -f infra/k8s/gitops/applications/robson-prod.yaml
+kubectl apply --dry-run=client -f infra/k8s/gitops/applications/robson-prod.yml
 ```
 
 ---
@@ -123,7 +123,7 @@ git push
 - [ ] Application manifest applied to cluster
 
 ```bash
-kubectl apply -f infra/k8s/gitops/applications/robson-prod.yaml
+kubectl apply -f infra/k8s/gitops/applications/robson-prod.yml
 ```
 
 ### Verify Application

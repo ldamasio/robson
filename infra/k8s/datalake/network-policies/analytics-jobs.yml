@@ -1,0 +1,217 @@
+# Network Policies for analytics-jobs Namespace
+# Purpose: Isolate Spark jobs, allow S3 and Hive Metastore access
+# ADR-0013: Deep Storage Architecture
+# Created: 2024-12-27
+
+---
+# Policy 1: Deny all ingress/egress by default (whitelist approach)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all-default
+  namespace: analytics-jobs
+spec:
+  podSelector: {}  # Apply to all pods in analytics-jobs
+  policyTypes:
+  - Ingress
+  - Egress
+  # No ingress/egress rules = deny all (except what's explicitly allowed below)
+
+---
+# Policy 2: Allow DNS (kube-dns / CoreDNS)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: analytics-jobs
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+
+  egress:
+  # Allow DNS queries to kube-system
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+
+---
+# Policy 2.5: Allow Kubernetes API (Spark driver creates executor pods)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-kubernetes-api
+  namespace: analytics-jobs
+spec:
+  podSelector:
+    matchLabels:
+      spark-app-selector: "true"  # Spark driver needs k8s API
+  policyTypes:
+  - Egress
+
+  egress:
+  # Allow HTTPS to Kubernetes API server
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 443
+
+---
+# Policy 3: Allow internal Spark communication (driver ↔ executors)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-spark-internal
+  namespace: analytics-jobs
+spec:
+  podSelector:
+    matchLabels:
+      spark-app-selector: "true"  # Spark pods must have this label
+  policyTypes:
+  - Ingress
+  - Egress
+
+  # Allow ingress from same namespace (Spark pods talking to each other)
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: analytics-jobs
+    ports:
+    - protocol: TCP
+      port: 7077  # Spark driver port
+    - protocol: TCP
+      port: 7078  # Spark driver port (SSL)
+    - protocol: TCP
+      port: 7777  # Spark driver port
+    - protocol: TCP
+      port: 4040  # Spark UI
+
+  # Allow egress to same namespace
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: analytics-jobs
+    ports:
+    - protocol: TCP
+      port: 7077
+    - protocol: TCP
+      port: 7078
+    - protocol: TCP
+      port: 7777
+
+---
+# Policy 4: Allow Hive Metastore Thrift access
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-hive-metastore
+  namespace: analytics-jobs
+spec:
+  podSelector:
+    matchLabels:
+      spark-app-selector: "true"  # Spark driver needs Hive Metastore
+  policyTypes:
+  - Egress
+
+  egress:
+  # Allow Thrift connections to datalake-system namespace
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: datalake-system
+      podSelector:
+        matchLabels:
+          app: hive-metastore
+    ports:
+    - protocol: TCP
+      port: 9083  # Hive Metastore Thrift port
+
+---
+# Policy 5: Allow Contabo S3 egress (Object Storage)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-s3-egress
+  namespace: analytics-jobs
+spec:
+  podSelector:
+    matchLabels:
+      spark-app-selector: "true"  # Spark executors need S3
+  policyTypes:
+  - Egress
+
+  egress:
+  # Allow HTTPS to Contabo S3 endpoint
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 443  # HTTPS
+
+---
+# Policy 6: Allow Django Outbox read access (bronze ingestion)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-django-outbox
+  namespace: analytics-jobs
+spec:
+  podSelector:
+    matchLabels:
+      app: bronze-ingest  # Only bronze job needs Django DB
+  policyTypes:
+  - Egress
+
+  egress:
+  # Allow PostgreSQL connections to robson-prod namespace
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: robson  # Production namespace
+      podSelector:
+        matchLabels:
+          app: postgres
+    ports:
+    - protocol: TCP
+      port: 5432  # PostgreSQL port
+
+---
+# Policy 7: Block staging namespace (production isolation)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: block-staging
+  namespace: analytics-jobs
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+
+  # Explicitly deny traffic to/from staging namespace
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchExpressions:
+        - key: name
+          operator: NotIn
+          values:
+          - staging
+
+  egress:
+  - to:
+    - namespaceSelector:
+        matchExpressions:
+        - key: name
+          operator: NotIn
+          values:
+          - staging

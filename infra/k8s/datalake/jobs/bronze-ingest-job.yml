@@ -1,0 +1,204 @@
+# Bronze Ingestion Job: Django Outbox → Contabo Object Storage (S3)
+# Phase 0: Reads StopEvent from Django, writes Parquet to bronze layer
+# ADR-0013: Deep Storage Architecture
+# Created: 2024-12-27
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: bronze-ingest-manual
+  namespace: analytics-jobs
+  labels:
+    app: bronze-ingest
+    spark-app-selector: "true"
+    spark-role: driver
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: bronze-ingest
+        spark-app-selector: "true"
+        spark-role: driver
+    spec:
+      serviceAccountName: spark-jobs
+
+      # Schedule on analytics pool (24GB dedicated node - Contabo Cloud VPS 30)
+      nodeSelector:
+        robson.io/pool: analytics
+      tolerations:
+      - key: robson.io/dedicated
+        operator: Equal
+        value: analytics
+        effect: NoSchedule
+
+      restartPolicy: Never
+
+      containers:
+      - name: spark-driver
+        image: ghcr.io/ldamasio/rbs-spark:3.5.0-phase0
+        imagePullPolicy: IfNotPresent
+
+        # Bronze job: minimal resources (1 executor × 2GB)
+        resources:
+          requests:
+            cpu: 500m
+            memory: 2Gi
+          limits:
+            cpu: 1000m
+            memory: 4Gi
+
+        command: ["/bin/bash"]
+        args:
+          - -c
+          - |
+            set -eo pipefail
+
+            # Add PySpark to PYTHONPATH
+            export SPARK_HOME=/opt/spark
+            export PY4J_ZIP=$(ls $SPARK_HOME/python/lib/py4j-*-src.zip 2>/dev/null | head -1)
+            export PYTHONPATH="${PYTHONPATH:-}"
+            export PYTHONPATH=$SPARK_HOME/python:$PY4J_ZIP:$PYTHONPATH
+
+            # Run bronze ingestion (PySpark and JDBC drivers are pre-installed)
+            echo "=== Bronze Ingestion Job ==="
+            echo "Date: ${JOB_DATE}"
+            echo "Target: s3a://rbs/bronze/events/date=${JOB_DATE}/"
+
+            # Run Python script (embedded for Phase 0)
+            python3 - <<'PYEOF'
+            import os
+            import sys
+            from datetime import datetime
+            from pyspark.sql import SparkSession
+            from pyspark.sql.functions import col, lit, to_timestamp
+
+            # Configuration
+            JOB_DATE = os.getenv("JOB_DATE") or datetime.now().strftime("%Y-%m-%d")
+            DJANGO_DB_HOST = os.getenv("DJANGO_DB_HOST", "paradedb.robson.svc.cluster.local")
+            DJANGO_DB_NAME = os.getenv("DJANGO_DB_NAME", "rbsdb")
+            DJANGO_DB_USER = os.getenv("DJANGO_DB_USER", "robson")
+            DJANGO_DB_PASSWORD = os.getenv("DJANGO_DB_PASSWORD")
+            S3_BUCKET = os.getenv("S3_BUCKET", "rbs")
+            S3_ENDPOINT = os.getenv("S3_ENDPOINT", "eu2.contabostorage.com")
+            S3_PATH = f"s3a://{S3_BUCKET}"
+
+            # Create Spark session
+            # Note: JARs are pre-installed in custom image (hadoop-aws, postgresql)
+            spark = SparkSession.builder \
+                .appName("bronze-ingest") \
+                .config("spark.hadoop.fs.s3a.access.key", os.getenv("AWS_ACCESS_KEY_ID")) \
+                .config("spark.hadoop.fs.s3a.secret.key", os.getenv("AWS_SECRET_ACCESS_KEY")) \
+                .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT) \
+                .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+                .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+                .getOrCreate()
+
+            print(f"Spark version: {spark.version}")
+
+            # Read from Django PostgreSQL
+            jdbc_url = f"jdbc:postgresql://{DJANGO_DB_HOST}:5432/{DJANGO_DB_NAME}"
+
+            query = f"""
+            SELECT
+                event_id::text,
+                event_seq,
+                occurred_at,
+                operation_id,
+                client_id,
+                symbol,
+                event_type,
+                trigger_price,
+                stop_price,
+                quantity,
+                side,
+                execution_token,
+                payload_json::text,
+                exchange_order_id,
+                fill_price,
+                slippage_pct,
+                source,
+                error_message,
+                retry_count
+            FROM stop_events
+            WHERE occurred_at >= '{JOB_DATE} 00:00:00'
+              AND occurred_at < '{JOB_DATE} 23:59:59'
+            ORDER BY event_seq
+            """
+
+            df = spark.read \
+                .format("jdbc") \
+                .option("url", jdbc_url) \
+                .option("dbtable", f"({query}) AS subquery") \
+                .option("user", DJANGO_DB_USER) \
+                .option("password", DJANGO_DB_PASSWORD) \
+                .option("driver", "org.postgresql.Driver") \
+                .load()
+
+            row_count = df.count()
+            print(f"Read {row_count} rows from Django Outbox")
+
+            if row_count == 0:
+                print("WARNING: No events found for this date")
+                sys.exit(0)
+
+            # Write to S3 as Parquet
+            output_path = f"{S3_PATH}/bronze/events/date={JOB_DATE}/"
+            df.coalesce(1).write.mode("overwrite").parquet(output_path)
+
+            print(f"Written to {output_path}")
+
+            # Validation
+            print("=== Validation ===")
+            print(f"Total rows: {row_count}")
+            print(f"Clients: {df.select('client_id').distinct().count()}")
+            print(f"Symbols: {[row.symbol for row in df.select('symbol').distinct().collect()]}")
+
+            spark.stop()
+            print("Bronze ingestion completed successfully")
+            PYEOF
+
+        env:
+        # Django DB credentials (from Outbox)
+        - name: DJANGO_DB_HOST
+          valueFrom:
+            secretKeyRef:
+              name: django-db-credentials
+              key: DJANGO_DB_HOST
+        - name: DJANGO_DB_NAME
+          valueFrom:
+            secretKeyRef:
+              name: django-db-credentials
+              key: DJANGO_DB_NAME
+        - name: DJANGO_DB_USER
+          valueFrom:
+            secretKeyRef:
+              name: django-db-credentials
+              key: DJANGO_DB_USER
+        - name: DJANGO_DB_PASSWORD
+          valueFrom:
+            secretKeyRef:
+              name: django-db-credentials
+              key: DJANGO_DB_PASSWORD
+
+        # Contabo S3 credentials
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: contabo-s3-credentials
+              key: AWS_ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: contabo-s3-credentials
+              key: AWS_SECRET_ACCESS_KEY
+        - name: AWS_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: contabo-s3-credentials
+              key: AWS_ENDPOINT
+        - name: S3_BUCKET
+          valueFrom:
+            secretKeyRef:
+              name: contabo-s3-credentials
+              key: S3_BUCKET

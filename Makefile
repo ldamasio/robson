@@ -162,3 +162,134 @@ k9s-preview:
 validate:
 	@echo "🔍 Validating AI Governance Framework..."
 	@./.ai-agents/validate.sh
+
+# ==============================
+# Deep Storage / Data Lake
+# ==============================
+
+DATA_DIR ?= data
+PYTHON ?= python3
+SPARK_HOME ?= /opt/spark  # or set SPARK_HOME environment variable
+DATE ?= $(shell date +%Y-%m-%d)
+
+# Spark Image Build Configuration
+SPARK_IMAGE_DIR ?= infra/images/spark
+SPARK_IMAGE_NAME ?= ghcr.io/ldamasio/rbs-spark
+SPARK_IMAGE_TAG ?= 3.5.0-phase0
+SPARK_FULL_IMAGE ?= $(SPARK_IMAGE_NAME):$(SPARK_IMAGE_TAG)
+
+.PHONY: spark-image-build spark-image-push spark-image-build-push datalake-deploy datalake-deploy-namespaces datalake-deploy-policies \
+        datalake-run-bronze datalake-run-silver datalake-run-gold \
+        datalake-smoke-test datalake-rollback datalake-status datalake-clean
+
+# Build custom Spark image with baked-in dependencies
+spark-image-build:
+	@echo "🏗️  Building custom Spark image: $(SPARK_FULL_IMAGE)"
+	@echo "   Dockerfile: $(SPARK_IMAGE_DIR)/Dockerfile"
+	docker build -t $(SPARK_FULL_IMAGE) $(SPARK_IMAGE_DIR)/
+	@echo "✅ Spark image built: $(SPARK_FULL_IMAGE)"
+	@echo ""
+	@echo "Verify with:"
+	@echo "  docker run --rm $(SPARK_FULL_IMAGE) spark-submit --version"
+	@echo ""
+	@echo "Next: make spark-image-push"
+
+# Push Spark image to registry
+spark-image-push:
+	@echo "📤 Pushing Spark image to registry: $(SPARK_FULL_IMAGE)"
+	docker push $(SPARK_FULL_IMAGE)
+	@echo "✅ Spark image pushed: $(SPARK_FULL_IMAGE)"
+	@echo ""
+	@echo "Image available at: https://github.com/ldamasio?tab=packages"
+	@echo ""
+	@echo "Next: Update job manifests to use: $(SPARK_FULL_IMAGE)"
+
+# Build and push Spark image (combined)
+spark-image-build-push: spark-image-build
+	@make spark-image-push
+
+# Deploy deep storage infrastructure (namespaces, network policies)
+datalake-deploy: datalake-deploy-namespaces datalake-deploy-policies
+	@echo "✅ Deep storage infrastructure deployed"
+
+datalake-deploy-namespaces:
+	@echo "Deploying datalake namespaces..."
+	kubectl apply -f infra/k8s/datalake/namespaces/
+	@echo "✅ Namespaces created: datalake-system, analytics-jobs"
+
+datalake-deploy-policies:
+	@echo "Deploying datalake network policies..."
+	kubectl apply -f infra/k8s/datalake/network-policies/
+	@echo "✅ Network policies applied"
+
+# Run bronze ingestion job (Django → S3)
+datalake-run-bronze:
+	@echo "Running bronze ingestion for $(DATE)..."
+	kubectl create job bronze-manual-$(shell date +%s) \
+		-n analytics-jobs \
+		--from=cronjob/bronze-ingest \
+		--dry-run=client -o yaml | kubectl apply -f -
+	@echo "✅ Bronze job started"
+
+# Run silver transformation job (bronze → silver)
+datalake-run-silver:
+	@echo "Running silver transformation for $(DATE)..."
+	kubectl create job silver-manual-$(shell date +%s) \
+		-n analytics-jobs \
+		--from=cronjob/silver-transform \
+		--dry-run=client -o yaml | kubectl apply -f -
+	@echo "✅ Silver job started"
+
+# Run gold feature generation job (silver → gold)
+datalake-run-gold:
+	@echo "Running gold feature generation for $(DATE)..."
+	kubectl create job gold-manual-$(shell date +%s) \
+		-n analytics-jobs \
+		--from=cronjob/gold-features \
+		--dry-run=client -o yaml | kubectl apply -f -
+	@echo "✅ Gold job started"
+
+# Smoke test: validate deep storage deployment
+datalake-smoke-test:
+	@echo "Running deep storage smoke test..."
+	@echo "1. Checking namespaces..."
+	@kubectl get ns datalake-system analytics-jobs
+	@echo "2. Checking network policies..."
+	@kubectl get networkpolicies -n datalake-system
+	@kubectl get networkpolicies -n analytics-jobs
+	@echo "3. Checking Hive Metastore..."
+	@kubectl get pods -n datalake-system -l app=hive-metastore
+	@echo "4. Checking recent jobs..."
+	@kubectl get jobs -n analytics-jobs --sort-by=.metadata.creationTimestamp | tail -5
+	@echo "✅ Smoke test passed"
+
+# Rollback: delete deep storage infrastructure
+datalake-rollback:
+	@echo "⚠️  WARNING: This will delete all deep storage infrastructure"
+	@echo "Press Ctrl+C to cancel, or wait 5 seconds to continue..."
+	@sleep 5
+	kubectl delete namespace analytics-jobs datalake-system
+	@echo "✅ Deep storage infrastructure removed"
+
+# Status: check deep storage health
+datalake-status:
+	@echo "=== Deep Storage Status ==="
+	@echo "Namespaces:"
+	@kubectl get ns datalake-system analytics-jobs
+	@echo ""
+	@echo "Hive Metastore:"
+	@kubectl get pods -n datalake-system -l app=hive-metastore
+	@echo ""
+	@echo "Recent Jobs:"
+	@kubectl get jobs -n analytics-jobs --sort-by=.metadata.creationTimestamp | tail -5
+	@echo ""
+	@echo "Pod Resources:"
+	@kubectl top pods -n datalake-system 2>/dev/null || echo "  (metrics not available)"
+	@kubectl top pods -n analytics-jobs 2>/dev/null || echo "  (metrics not available)"
+
+# Clean: remove failed jobs and old data
+datalake-clean:
+	@echo "Cleaning failed jobs..."
+	kubectl delete jobs -n analytics-jobs --field-selector status.failed=true
+	@echo "✅ Failed jobs removed"
+	@echo "⚠️  Note: S3 data cleanup must be done manually via AWS CLI"

@@ -186,7 +186,7 @@ Liveness probe failed: Get "http://10.x.x.x:8000/health": dial tcp 10.x.x.x:8000
 
 ### Fix 1.1: Add Init Container to Wait for PostgreSQL
 
-Edit `infra/k8s/staging/backend/backend-staging.yaml`:
+Edit `infra/k8s/staging/backend/backend-staging.yml`:
 
 ```yaml
 spec:
@@ -224,7 +224,7 @@ ssh root@158.220.116.31 "kubectl rollout restart deployment/backend-staging -n s
 
 ### Fix 3.1: Create Migration Job
 
-Create `infra/k8s/staging/backend/job-migrate.yaml`:
+Create `infra/k8s/staging/backend/job-migrate.yml`:
 
 ```yaml
 apiVersion: batch/v1
@@ -267,13 +267,13 @@ spec:
 
 Apply:
 ```bash
-ssh root@158.220.116.31 "kubectl apply -f infra/k8s/staging/backend/job-migrate.yaml"
+ssh root@158.220.116.31 "kubectl apply -f infra/k8s/staging/backend/job-migrate.yml"
 ssh root@158.220.116.31 "kubectl wait --for=condition=complete job/migrate-staging -n staging --timeout=300s"
 ```
 
 ### Fix 7.1: Add Startup Probe
 
-Edit `infra/k8s/staging/backend/backend-staging.yaml`:
+Edit `infra/k8s/staging/backend/backend-staging.yml`:
 
 ```yaml
 spec:
@@ -474,7 +474,7 @@ ssh root@158.220.116.31 "kubectl scale deployment backend-staging -n staging --r
 ssh root@158.220.116.31 "kubectl scale deployment backend-staging -n staging --replicas=0"
 
 # 2. Run migration job
-ssh root@158.220.116.31 "kubectl apply -f infra/k8s/staging/backend/job-migrate.yaml"
+ssh root@158.220.116.31 "kubectl apply -f infra/k8s/staging/backend/job-migrate.yml"
 
 # 3. Wait for completion
 ssh root@158.220.116.31 "kubectl wait --for=condition=complete job/migrate-staging -n staging --timeout=5m"

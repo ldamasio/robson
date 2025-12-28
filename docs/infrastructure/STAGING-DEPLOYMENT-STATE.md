@@ -417,16 +417,16 @@ kubectl describe quota staging-quota -n staging
 - **docs/infrastructure/STAGING-DEPLOYMENT-STATE.md** - THIS FILE
 
 ### Kubernetes Manifests
-- **infra/k8s/namespaces/staging.yaml** - Namespace, ResourceQuota, LimitRange
-- **infra/k8s/staging/network-policies/isolation.yaml** - 7 network policies
-- **infra/k8s/staging/postgres/postgres-staging.yaml** - PostgreSQL deployment
-- **infra/k8s/staging/redis/redis-staging.yaml** - Redis deployment
-- **infra/k8s/staging/rabbitmq/rabbitmq-staging.yaml** - RabbitMQ deployment
-- **infra/k8s/staging/backend/backend-staging.yaml** - Backend deployment
-- **infra/k8s/staging/backend/cronjob-stop-monitor.yaml** - Stop monitor CronJob
-- **infra/k8s/staging/istio/gateway-staging.yaml** - Istio Gateway (NOT USED - Traefik instead)
-- **infra/k8s/staging/istio/certificate-staging.yaml** - Istio Certificate (NOT USED)
-- **infra/k8s/staging/kustomization.yaml** - Kustomize config
+- **infra/k8s/namespaces/staging.yml** - Namespace, ResourceQuota, LimitRange
+- **infra/k8s/staging/network-policies/isolation.yml** - 7 network policies
+- **infra/k8s/staging/postgres/postgres-staging.yml** - PostgreSQL deployment
+- **infra/k8s/staging/redis/redis-staging.yml** - Redis deployment
+- **infra/k8s/staging/rabbitmq/rabbitmq-staging.yml** - RabbitMQ deployment
+- **infra/k8s/staging/backend/backend-staging.yml** - Backend deployment
+- **infra/k8s/staging/backend/cronjob-stop-monitor.yml** - Stop monitor CronJob
+- **infra/k8s/staging/istio/gateway-staging.yml** - Istio Gateway (NOT USED - Traefik instead)
+- **infra/k8s/staging/istio/certificate-staging.yml** - Istio Certificate (NOT USED)
+- **infra/k8s/staging/kustomization.yml** - Kustomize config
 - **infra/k8s/staging/secrets/SECRETS-README.md** - Secrets documentation
 - **infra/k8s/staging/DEPLOY-STAGING.md** - Deployment guide
 

@@ -31,7 +31,7 @@ We're using a **single Application** that points directly to `infra/k8s/prod/`.
 ### Apply the Application
 
 ```bash
-kubectl apply -f infra/k8s/gitops/applications/robson-prod.yaml
+kubectl apply -f infra/k8s/gitops/applications/robson-prod.yml
 ```
 
 ### Verify

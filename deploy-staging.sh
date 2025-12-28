@@ -8,7 +8,7 @@ echo "🚀 Starting Staging Deployment..."
 
 # Step 1: Create namespace
 echo "📦 Creating namespace staging..."
-kubectl apply -f infra/k8s/namespaces/staging.yaml
+kubectl apply -f infra/k8s/namespaces/staging.yml
 
 # Step 2: Create secrets
 echo "🔐 Creating secrets..."

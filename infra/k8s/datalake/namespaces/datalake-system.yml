@@ -1,0 +1,72 @@
+# Namespace: datalake-system
+# Purpose: Deep storage infrastructure (Hive Metastore, Spark driver coordination)
+# Owner: Robson Bot Team
+# Created: 2024-12-27
+# Related: ADR-0013, deep-storage.md runbook
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: datalake-system
+  labels:
+    name: datalake-system
+    purpose: deep-storage
+    istio-injection: disabled  # No service mesh needed for batch jobs
+
+---
+# Resource Quota for datalake-system
+# Limits total resources for Hive Metastore and coordination services
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: datalake-system-quota
+  namespace: datalake-system
+spec:
+  hard:
+    # CPU/Memory limits
+    requests.cpu: "1"       # Total CPU requests: 1 core
+    requests.memory: 2Gi    # Total memory requests: 2GB
+    limits.cpu: "2"         # Total CPU limits: 2 cores
+    limits.memory: 4Gi      # Total memory limits: 4GB
+
+    # Storage limits
+    persistentvolumeclaims: "5"  # Max 5 PVCs (Hive Metastore DB + future)
+    requests.storage: 50Gi       # Total storage: 50GB
+
+    # Object counts
+    services: "10"          # Max 10 services
+    pods: "20"              # Max 20 pods
+    secrets: "10"           # Max 10 secrets
+
+---
+# Limit Range for datalake-system
+# Default resource limits/requests for pods without explicit values
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: datalake-system-limit-range
+  namespace: datalake-system
+spec:
+  limits:
+  # Default limits for containers
+  - default:
+      cpu: 500m
+      memory: 1Gi
+    defaultRequest:
+      cpu: 100m
+      memory: 256Mi
+    max:
+      cpu: 1000m    # Max CPU per container: 1 core
+      memory: 2Gi   # Max memory per container: 2GB
+    min:
+      cpu: 50m      # Min CPU per container: 50 millicores
+      memory: 128Mi # Min memory per container: 128MB
+    type: Container
+
+  # Limits for PVCs
+  - max:
+      storage: 30Gi  # Max PVC size: 30GB
+    min:
+      storage: 1Gi   # Min PVC size: 1GB
+    type: PersistentVolumeClaim

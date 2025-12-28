@@ -72,7 +72,7 @@ For immediate deployment sync instead of 3-minute polling:
 1. GitHub repo → Settings → Webhooks → Add webhook
 2. Payload URL: `https://argocd.robson.rbx.ia.br/api/webhook`
 3. Content type: `application/json`
-4. Secret: (configured in `infra/k8s/platform/argocd/app.yaml` under `notifications.secret`)
+4. Secret: (configured in `infra/k8s/platform/argocd/app.yml` under `notifications.secret`)
 5. Events: `push`, `pull_request`
 
 The webhook secret is already configured in ArgoCD Helm values. Just add the webhook in GitHub.

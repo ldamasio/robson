@@ -88,7 +88,7 @@ git push
 
 ```bash
 # Apply the Application manifest
-kubectl apply -f infra/k8s/gitops/applications/robson-prod.yaml
+kubectl apply -f infra/k8s/gitops/applications/robson-prod.yml
 
 # Output should be:
 # application.argoproj.io/robson-prod created

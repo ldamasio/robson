@@ -1,0 +1,207 @@
+# Silver Transformation Job: Bronze → Silver (Cleaned Features)
+# Phase 0: Reads bronze Parquet, writes silver Parquet
+# ADR-0013: Deep Storage Architecture
+# Created: 2024-12-27
+
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: silver-transform-manual
+  namespace: analytics-jobs
+  labels:
+    app: silver-transform
+    spark-app-selector: "true"
+    spark-role: driver
+spec:
+  backoffLimit: 0
+  template:
+    metadata:
+      labels:
+        app: silver-transform
+        spark-app-selector: "true"
+        spark-role: driver
+    spec:
+      serviceAccountName: spark-jobs
+
+      # Schedule on analytics pool (24GB dedicated node - Contabo Cloud VPS 30)
+      nodeSelector:
+        robson.io/pool: analytics
+      tolerations:
+      - key: robson.io/dedicated
+        operator: Equal
+        value: analytics
+        effect: NoSchedule
+
+      restartPolicy: Never
+
+      containers:
+      - name: spark-driver
+        image: ghcr.io/ldamasio/rbs-spark:3.5.0-phase0
+        imagePullPolicy: IfNotPresent
+
+        # Silver job: 2 executors (runs on 24GB analytics node)
+        resources:
+          requests:
+            cpu: 1000m
+            memory: 4Gi
+          limits:
+            cpu: 2000m
+            memory: 8Gi
+
+        command: ["/bin/bash"]
+        args:
+          - -c
+          - |
+            set -eo pipefail
+
+            # Add PySpark to PYTHONPATH
+            export SPARK_HOME=/opt/spark
+            export PY4J_ZIP=$(ls $SPARK_HOME/python/lib/py4j-*-src.zip 2>/dev/null | head -1)
+            export PYTHONPATH="${PYTHONPATH:-}"
+            export PYTHONPATH=$SPARK_HOME/python:$PY4J_ZIP:$PYTHONPATH
+
+            echo "=== Silver Transformation Job ==="
+            echo "Date: ${JOB_DATE}"
+            echo "Target: s3a://rbs/silver/"
+
+            # Run Python script (embedded for Phase 0)
+            python3 - <<'PYEOF'
+            import os
+            import sys
+            from datetime import datetime
+            from pyspark.sql import SparkSession
+            from pyspark.sql.functions import col, lit, when, row_number
+            from pyspark.sql.window import Window
+
+            # Configuration
+            JOB_DATE = os.getenv("JOB_DATE") or datetime.now().strftime("%Y-%m-%d")
+            S3_BUCKET = os.getenv("S3_BUCKET", "rbs")
+            S3_ENDPOINT = os.getenv("S3_ENDPOINT", "eu2.contabostorage.com")
+            S3_PATH = f"s3a://{S3_BUCKET}"
+
+            # Create Spark session
+            # Note: JARs are pre-installed in custom image (hadoop-aws)
+            spark = SparkSession.builder \
+                .appName("silver-transform") \
+                .config("spark.hadoop.fs.s3a.access.key", os.getenv("AWS_ACCESS_KEY_ID")) \
+                .config("spark.hadoop.fs.s3a.secret.key", os.getenv("AWS_SECRET_ACCESS_KEY")) \
+                .config("spark.hadoop.fs.s3a.endpoint", S3_ENDPOINT) \
+                .config("spark.hadoop.fs.s3a.path.style.access", "true") \
+                .config("spark.hadoop.fs.s3a.impl", "org.apache.hadoop.fs.s3a.S3AFileSystem") \
+                .config("spark.sql.shuffle.partitions", "2") \
+                .getOrCreate()
+
+            print(f"Spark version: {spark.version}")
+
+            # Read bronze events
+            bronze_path = f"{S3_PATH}/bronze/events/date={JOB_DATE}/"
+
+            try:
+                df = spark.read.parquet(bronze_path)
+                print(f"Read {df.count()} rows from bronze layer")
+            except Exception as e:
+                print(f"ERROR reading bronze: {e}")
+                print(f"Path: {bronze_path}")
+                print("Ensure bronze job has run for this date")
+                sys.exit(1)
+
+            # Filter execution-related events
+            execution_events = df.filter(
+                col("event_type").isin([
+                    "STOP_TRIGGERED",
+                    "EXECUTION_SUBMITTED",
+                    "EXECUTED",
+                    "FAILED",
+                    "BLOCKED"
+                ])
+            )
+
+            # Get latest state per operation_id (materialized view)
+            window_spec = Window.partitionBy("operation_id").orderBy(col("event_seq").desc())
+            latest_events = execution_events \
+                .withColumn("row_num", row_number().over(window_spec)) \
+                .filter(col("row_num") == 1) \
+                .drop("row_num")
+
+            # Derive status from latest event_type
+            latest_events = latest_events \
+                .withColumn("status",
+                    when(col("event_type") == "STOP_TRIGGERED", "PENDING")
+                    .when(col("event_type") == "EXECUTION_SUBMITTED", "SUBMITTED")
+                    .when(col("event_type") == "EXECUTED", "EXECUTED")
+                    .when(col("event_type") == "FAILED", "FAILED")
+                    .when(col("event_type") == "BLOCKED", "BLOCKED")
+                    .otherwise("UNKNOWN")
+                )
+
+            # Transform to silver schema
+            silver_df = latest_events.select(
+                col("event_id").alias("execution_id"),
+                col("operation_id"),
+                col("client_id"),
+                col("symbol"),
+                col("stop_price"),
+                col("trigger_price"),
+                col("quantity"),
+                col("side"),
+                col("status"),
+                when(col("event_type") == "STOP_TRIGGERED", col("occurred_at")).alias("triggered_at"),
+                lit(None).cast("timestamp").alias("submitted_at"),
+                lit(None).cast("timestamp").alias("executed_at"),
+                col("exchange_order_id"),
+                col("fill_price"),
+                col("slippage_pct"),
+                col("source")
+            )
+
+            print(f"Transformed to {silver_df.count()} stop_executions")
+
+            # Write to silver layer (partitioned by client_id)
+            clients = [row.client_id for row in silver_df.select("client_id").distinct().collect()]
+
+            for client_id in clients:
+                client_df = silver_df.filter(col("client_id") == client_id)
+                output_path = f"{S3_PATH}/silver/stop_executions/client_id={client_id}/date={JOB_DATE}/"
+                client_df.coalesce(1).write.mode("overwrite").parquet(output_path)
+                print(f"Written client {client_id} to {output_path}")
+
+            # Summary statistics
+            print("=== Summary Statistics ===")
+            status_dist = silver_df.groupBy("status").count().collect()
+            print("Status distribution:")
+            for row in status_dist:
+                print(f"  {row.status}: {row['count']}")
+
+            symbol_dist = silver_df.groupBy("symbol").count().orderBy("count", ascending=False).collect()
+            print("Top symbols:")
+            for row in symbol_dist[:5]:
+                print(f"  {row.symbol}: {row['count']}")
+
+            spark.stop()
+            print("Silver transformation completed successfully")
+            PYEOF
+
+        env:
+        # JOB_DATE removed - Python code defaults to datetime.now()
+
+        # Contabo S3 credentials
+        - name: AWS_ACCESS_KEY_ID
+          valueFrom:
+            secretKeyRef:
+              name: contabo-s3-credentials
+              key: AWS_ACCESS_KEY_ID
+        - name: AWS_SECRET_ACCESS_KEY
+          valueFrom:
+            secretKeyRef:
+              name: contabo-s3-credentials
+              key: AWS_SECRET_ACCESS_KEY
+        - name: AWS_ENDPOINT
+          valueFrom:
+            secretKeyRef:
+              name: contabo-s3-credentials
+              key: AWS_ENDPOINT
+        - name: S3_BUCKET
+          valueFrom:
+            secretKeyRef:
+              name: contabo-s3-credentials
+              key: S3_BUCKET

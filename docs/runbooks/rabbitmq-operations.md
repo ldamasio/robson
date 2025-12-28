@@ -584,11 +584,11 @@ kubectl -n staging get pvc rabbitmq-data-rabbitmq-0
 2. **Update Secrets**:
    ```bash
    # Create new secret YAML (use TEMPLATE)
-   cp infra/k8s/staging/rabbitmq/rabbitmq-secrets-TEMPLATE.yaml \
-      infra/k8s/staging/rabbitmq/rabbitmq-secrets.yaml
+   cp infra/k8s/staging/rabbitmq/rabbitmq-secrets-TEMPLATE.yml \
+      infra/k8s/staging/rabbitmq/rabbitmq-secrets.yml
 
    # Edit with new passwords
-   vim infra/k8s/staging/rabbitmq/rabbitmq-secrets.yaml
+   vim infra/k8s/staging/rabbitmq/rabbitmq-secrets.yml
 
    # Create sealed secret
    kubeseal < rabbitmq-secrets.yaml > rabbitmq-secrets-sealed.yaml

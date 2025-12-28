@@ -1,0 +1,25 @@
+# Policy: Allow Kubernetes API access (Spark driver creates executor pods)
+# Purpose: Spark driver needs to reach kubernetes.default.svc:443
+# ADR-0013: Deep Storage Architecture
+# Created: 2024-12-27
+
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-kubernetes-api
+  namespace: analytics-jobs
+spec:
+  podSelector:
+    matchLabels:
+      spark-app-selector: "true"  # Spark driver needs k8s API
+  policyTypes:
+  - Egress
+
+  egress:
+  # Allow HTTPS to Kubernetes API (create executor pods)
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 443

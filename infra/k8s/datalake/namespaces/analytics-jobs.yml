@@ -1,0 +1,75 @@
+# Namespace: analytics-jobs
+# Purpose: Spark jobs (bronze/silver/gold ingestion and transformation)
+# Owner: Robson Bot Team
+# Created: 2024-12-27
+# Related: ADR-0013, deep-storage.md runbook
+
+---
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: analytics-jobs
+  labels:
+    name: analytics-jobs
+    purpose: analytics
+    istio-injection: disabled  # No service mesh for batch jobs
+
+---
+# Resource Quota for analytics-jobs
+# Limits total resources for Spark jobs (ephemeral, job-specific)
+# Scaled for 24GB analytics node (Conservative Baseline: Driver 1C/2GB + 2 executors × 2C/6GB = 5C/14GB)
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: analytics-jobs-quota
+  namespace: analytics-jobs
+spec:
+  hard:
+    # CPU/Memory limits (scaled for 24GB analytics node)
+    requests.cpu: "5"       # Total CPU requests: 5 cores (driver + executors)
+    requests.memory: 14Gi   # Total memory requests: 14GB
+    limits.cpu: "7"         # Total CPU limits: 7 cores (2 cores headroom)
+    limits.memory: 18Gi     # Total memory limits: 18GB (4GB headroom for OS/k8s)
+
+    # Storage limits (minimal, jobs use S3)
+    persistentvolumeclaims: "2"  # Max 2 PVCs (scratch space only)
+    requests.storage: 10Gi       # Total storage: 10GB
+
+    # Object counts
+    services: "5"          # Max 5 services
+    pods: "50"             # Max 50 pods (Spark executors are ephemeral)
+    secrets: "10"          # Max 10 secrets
+    requests.count/pods: "20"  # Max 20 concurrent pods (Jobs create pods)
+
+---
+# Limit Range for analytics-jobs
+# Default resource limits/requests for Spark pods
+# Scaled for 24GB analytics node with 6GB executors
+apiVersion: v1
+kind: LimitRange
+metadata:
+  name: analytics-jobs-limit-range
+  namespace: analytics-jobs
+spec:
+  limits:
+  # Default limits for containers (Spark driver/executors)
+  - default:
+      cpu: 2000m     # 2 CPU (typical executor size)
+      memory: 6Gi    # 6GB (conservative executor for 24GB node)
+    defaultRequest:
+      cpu: 1000m     # 1 CPU
+      memory: 3Gi    # 3GB
+    max:
+      cpu: 3000m     # Max CPU per container: 3 cores (for large executors)
+      memory: 8Gi    # Max memory per container: 8GB
+    min:
+      cpu: 100m      # Min CPU per container: 100 millicores
+      memory: 512Mi  # Min memory per container: 512MB
+    type: Container
+
+  # Limits for PVCs (scratch space)
+  - max:
+      storage: 5Gi   # Max PVC size: 5GB
+    min:
+      storage: 1Gi   # Min PVC size: 1GB
+    type: PersistentVolumeClaim

@@ -1,0 +1,148 @@
+# Network Policies for datalake-system Namespace
+# Purpose: Isolate Hive Metastore and coordination services
+# ADR-0013: Deep Storage Architecture
+# Created: 2024-12-27
+
+---
+# Policy 1: Deny all ingress/egress by default (whitelist approach)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: deny-all-default
+  namespace: datalake-system
+spec:
+  podSelector: {}  # Apply to all pods in datalake-system
+  policyTypes:
+  - Ingress
+  - Egress
+  # No ingress/egress rules = deny all (except what's explicitly allowed below)
+
+---
+# Policy 2: Allow DNS (kube-dns / CoreDNS)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+  namespace: datalake-system
+spec:
+  podSelector: {}
+  policyTypes:
+  - Egress
+
+  egress:
+  # Allow DNS queries to kube-system
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: kube-system
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+
+---
+# Policy 3: Allow Hive Metastore Thrift access from analytics-jobs
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-hive-metastore
+  namespace: datalake-system
+spec:
+  podSelector:
+    matchLabels:
+      app: hive-metastore  # Apply only to Hive Metastore pods
+  policyTypes:
+  - Ingress
+
+  ingress:
+  # Allow Thrift connections from analytics-jobs namespace
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          name: analytics-jobs
+    - namespaceSelector:
+        matchLabels:
+          name: datalake-system  # Also allow same-namespace access
+    ports:
+    - protocol: TCP
+      port: 9083  # Hive Metastore Thrift port
+
+---
+# Policy 4: Allow PostgreSQL access from Hive Metastore
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-postgresql
+  namespace: datalake-system
+spec:
+  podSelector:
+    matchLabels:
+      app: hive-metastore  # Hive Metastore needs DB access
+  policyTypes:
+  - Egress
+
+  egress:
+  # Allow PostgreSQL connections to same namespace
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          name: datalake-system
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: postgresql
+    ports:
+    - protocol: TCP
+      port: 5432  # PostgreSQL port
+
+---
+# Policy 5: Allow Contabo S3 egress (Object Storage)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-s3-egress
+  namespace: datalake-system
+spec:
+  podSelector: {}  # Apply to all pods
+  policyTypes:
+  - Egress
+
+  egress:
+  # Allow HTTPS to Contabo S3 endpoint
+  - to:
+    - namespaceSelector: {}
+    ports:
+    - protocol: TCP
+      port: 443  # HTTPS
+
+---
+# Policy 6: Block staging namespace (production isolation)
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: block-staging
+  namespace: datalake-system
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+
+  # Explicitly deny traffic to/from staging namespace
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchExpressions:
+        - key: name
+          operator: NotIn
+          values:
+          - staging
+
+  egress:
+  - to:
+    - namespaceSelector:
+        matchExpressions:
+        - key: name
+          operator: NotIn
+          values:
+          - staging
