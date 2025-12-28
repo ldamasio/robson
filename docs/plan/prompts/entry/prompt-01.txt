@@ -1,0 +1,80 @@
+You are working inside the Robson monorepo (AI-first). Goal: introduce code-quality tooling incrementally WITHOUT changing the existing architecture, repo structure, runtime behavior, or deployment topology.
+
+IMPORTANT CONSTRAINTS
+- Do NOT move files, rename directories, or restructure modules.
+- Do NOT change application code logic, public APIs, database schema, migrations, or infrastructure manifests.
+- The change MUST be additive and reversible.
+- Prefer minimal, deterministic tooling that runs fast locally.
+- Any “heavy” checks (full test suite, Sonar scanner, etc.) must be CI-only and optional.
+- If tooling prerequisites are missing, degrade gracefully (skip or provide clear instructions) instead of forcing new system dependencies.
+
+DELIVERABLES
+1) Add pre-commit to the repo with a minimal-but-solid default set of hooks.
+2) Add editor-friendly SonarLint setup guidance (VS Code and JetBrains) without requiring repo-wide IDE configs.
+3) Add SonarQube scaffolding as OPTIONAL (CI-ready), but do not enable it by default unless a CI pipeline already exists and is safe to extend without breaking.
+4) Document everything in a concise docs file and update any existing docs index if present.
+
+EXECUTION PLAN (must follow)
+A) REPO DISCOVERY
+- Inspect the repo root and identify:
+  - Is it a Python/Django backend? Where? (e.g., apps/backend/monolith)
+  - Are there Go and/or Rust components? Where?
+  - Is there Node/Next or frontend? Where?
+  - Is there already a lint/format/test setup (ruff/black/isort/mypy/pytest, golangci-lint, cargo fmt/clippy, eslint/prettier)?
+  - Is there CI (GitHub Actions / GitLab CI / Azure / etc.)? Locate pipelines.
+- Print a short “Detected stacks” summary.
+
+B) PRE-COMMIT (ADD ONLY)
+- Create .pre-commit-config.yaml at repo root.
+- Keep hooks fast and deterministic. Split into:
+  - Always-on: whitespace, EOF fixer, YAML checks, detect private keys
+  - Python: ruff + ruff-format if Python exists; otherwise skip Python hooks
+  - Go: gofmt if Go exists; otherwise skip
+  - Rust: rustfmt if Rust exists; otherwise skip
+  - Node: prettier/eslint only if config exists; otherwise skip
+- Do NOT introduce new toolchains that aren’t already used unless they are lightweight and justify value.
+- Add a Makefile target or simple script (choose the repo’s existing conventions) to run:
+  - pre-commit install
+  - pre-commit run --all-files
+- Add README/docs instructions for developers.
+
+C) SONARLINT (LOCAL-ONLY GUIDANCE)
+- Do NOT add IDE workspace configs.
+- Add a docs page: docs/quality/sonarlint.md (or similar, following repo conventions).
+- Include:
+  - How to install SonarLint in VS Code / JetBrains
+  - How to use it in “connected mode” later (optional), but do not require SonarQube now.
+  - Suggested rule focus: bugs + security + maintainability (avoid style-only conflicts with formatter)
+
+D) SONARQUBE (OPTIONAL, SAFE SCAFFOLDING)
+- Only add SonarQube support if it can be done without affecting deployments:
+  - Add a sonar-project.properties (or equivalent) that points to existing code directories.
+  - Add exclusions for migrations, generated files, vendor, node_modules, dist, etc.
+  - Do NOT require a running SonarQube server.
+- If CI exists:
+  - Add a CI job that runs only on main and/or pull requests, but mark it non-blocking at first (allowed to fail) OR provide it as a commented template users can enable.
+- If CI does not exist:
+  - Only document how it would be integrated.
+- Do NOT add Docker Compose services or cluster manifests for SonarQube unless explicitly asked. Keep it minimal.
+
+E) DOCUMENTATION
+- Create docs/quality/README.md summarizing:
+  - Why pre-commit
+  - How to install/run
+  - What is enforced locally vs CI
+  - How SonarLint fits
+  - How SonarQube could be enabled later
+- Update docs index if such file exists, but do not reorganize documentation.
+
+F) QUALITY BAR
+- Ensure pre-commit runs successfully on the repo (or explain precisely why not and what is missing).
+- Any tool versions pinned in config must be stable.
+- Do not break Windows developer experience. Prefer cross-platform commands.
+- Provide a short “How to rollback” section.
+
+OUTPUT FORMAT
+- First: a brief plan.
+- Then: the exact files you changed/added (paths + content diffs).
+- Then: commands to run locally to validate.
+
+Now implement.

@@ -1,0 +1,83 @@
+You are Claude Code CLI working inside the Robson monorepo.
+
+MISSION
+Implement a SECOND CORE for Robson: “MARKET RESEARCH & CONTEXT ENGINE”.
+This core transforms derivatives + selected on-chain signals into explainable, auditable outputs:
+- market_regime
+- risk_bias
+- stop_vulnerability
+- recommended_posture
+This is a context/risk interpretation engine (NOT an autotrader).
+
+IMPORTANT CONTEXT
+Binance derivatives data for BTC/USDT isolated margin already exists and is collecting.
+
+EXECUTION MODEL (must follow exactly)
+PHASE 0 (PLAN + DOCS, no risky refactors)
+1) DISCOVERY
+   - Locate the existing Binance derivatives collector (paths/files).
+   - Identify current ADR conventions (location, naming/numbering) and docs structure.
+   - Identify current persistence patterns (Django models/tables/outbox/events) and job runner patterns.
+
+2) DESIGN OUTPUTS (create files)
+   A) ADR: official Robson ADR describing this second core.
+   B) README: “Market Research & Context Engine” explaining goals, concepts, signals, outputs, and how to run.
+   C) Implementation plan with milestones and test plan.
+
+Stop after PHASE 0 and present the plan for validation.
+
+PHASE 1 (IMPLEMENTATION, minimal disruption; do only after plan is validated)
+Your task is to turn the existing derivatives feed into production-grade signals.
+
+GOALS (PHASE 1 REQUIREMENTS)
+1) Add a canonical storage layer for derivatives metrics:
+   - Persist normalized points (ts, symbol, metric_name, value, source, tags)
+   - Enforce idempotency uniqueness on (source, symbol, metric_name, ts)
+
+2) Implement feature builders for BTC/USDT:
+   - funding_zscore_24h, funding_ma_8h, funding_extreme_flag
+   - oi_delta_1h/4h/24h, oi_zscore_7d
+   - realized_vol_1h/4h
+   - squeeze_risk_score based on (OI up + funding extreme + price flat)
+
+3) Implement a lightweight “market regime” classifier:
+   - outputs: {NORMAL, CHOP_RISK, SQUEEZE_RISK, HIGH_VOL}
+   - produce an event/log entry with the regime and key contributing metrics
+
+4) Add a freshness monitor:
+   - if new derivative datapoints are older than threshold (e.g., 5 minutes), emit warning and set system state to CONSERVATIVE
+
+5) Tests:
+   - unit tests for z-score / moving average / squeeze heuristic
+   - integration test for upsert/idempotency
+
+CONSTRAINTS (PHASE 1)
+- Do not redesign existing architecture.
+- Follow existing logging and job execution conventions (management command / CLI).
+- Keep it BTC/USDT initially, but structure code to support more symbols later.
+- Secrets must come from env vars only.
+- Ensure auditability: every MarketContextSnapshot includes sources_used, timestamps, and logic_version.
+
+DELIVERABLES (PHASE 1)
+- Code + tests + short doc explaining metrics, thresholds, and how to run.
+
+ON-CHAIN SCOPE (optional after derivatives are done)
+- Start with a minimal on-chain proxy (e.g., DeFiLlama TVL trend) and normalize it as MetricPoints.
+- Do not add many providers in the first iteration.
+
+DATA MODEL REQUIREMENTS (PHASE 0 ADR must define these)
+- MetricPoint (normalized input)
+- FeatureVector (computed features per time window)
+- MarketContextSnapshot (final output; includes explanation payload)
+- MarketThesis (optional, versioned hypothesis object)
+
+TASK NOW
+Execute PHASE 0 only:
+- scan the repo
+- produce the full plan
+- create the ADR + README in the correct folders
+- include explicit file paths and commands
+Do NOT implement PHASE 1 until the plan is validated.
+
+
+esse core deve expor um snapshot consumível pelo EntryGate e pelo PositionManager

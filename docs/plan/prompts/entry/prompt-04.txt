@@ -1,0 +1,23 @@
+You are Claude Code CLI working inside the Robson monorepo.
+
+MISSION
+Implement “ENTRY GATING + OPPORTUNITY EXECUTION” as a controlled layer.
+Entry happens only if Robson:
+- detects a valid technical opportunity
+- is available (no conflicting orders)
+- has not exceeded monthly loss quota
+This layer decides WHEN an entry is permitted, not how to predict price.
+
+REQUIREMENTS
+- Add an EntryGate service that checks:
+  - max concurrent positions/orders
+  - monthly loss limit
+  - cooldown after stop-outs
+  - market context constraints from MarketContextSnapshot (if available)
+- Provide a clear decision output:
+  - {ALLOW_ENTRY, DENY_ENTRY} + reasons list
+- Must be auditable: log/event with reasons and inputs
+- Must integrate with existing strategy detection without refactors.
+
+DELIVERABLES
+- Code + tests + docs describing gating rules and configuration.

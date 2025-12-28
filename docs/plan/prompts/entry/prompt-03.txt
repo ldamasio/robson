@@ -1,0 +1,47 @@
+You are Claude Code CLI working inside the Robson monorepo.
+
+MISSION
+Implement a position management module: “HAND-SPAN TRAILING STOP” (palmo da mão).
+This is a discrete trailing-stop system derived from the initial technical stop distance at entry.
+
+DEFINITION
+Let:
+- entry_price = price at entry
+- technical_stop_loss = stop loss defined at entry by the strategy
+- span = abs(entry_price - technical_stop_loss)  # “one hand span”
+Rules:
+1) When price moves +1*span in favor of the position:
+   - move stop to approximately break-even (0 PnL / minimal loss), respecting fees/slippage config.
+2) For each additional +1*span in favor (2*span, 3*span, ...):
+   - move stop by +1 additional span towards current price (discrete steps).
+3) Once stop is above entry (long) or below entry (short), it becomes a stop-gain.
+
+REQUIREMENTS
+- Must support both LONG and SHORT positions.
+- Must support Spot and Isolated Margin (as abstractions; do not couple to exchange specifics).
+- Must be auditable: every stop adjustment emits an event/log with:
+  - ts, symbol, position_id, old_stop, new_stop, span, step_index, reason
+- Must be deterministic and idempotent:
+  - same inputs cannot create duplicate stop-adjust events (use a token or uniqueness key).
+- Must integrate with existing execution/position objects in the repo with minimal disruption.
+- Must respect risk constraints (monthly loss quota, max concurrent orders) already present or to be stubbed.
+
+DELIVERABLES
+1) Code implementing the algorithm as pure functions + an orchestrator.
+2) Tests:
+   - unit tests for step thresholds and stop updates (long/short)
+   - property-style tests: stop never loosens (for long stop never decreases; for short stop never increases)
+3) Docs:
+   - docs/strategy/HAND_SPAN_TRAILING_STOP.md with examples and edge cases.
+
+CONSTRAINTS
+- Do not redesign architecture.
+- Use existing job/loop patterns (websocket loop, scheduler, etc.) only where already present.
+- Provide safe defaults for fees/slippage and make them configurable.
+
+TASK
+Scan the repo to locate:
+- position model/state
+- stop loss handling
+- event/outbox patterns (if any)
+Then implement the module, integrate it minimally, and add tests + docs.

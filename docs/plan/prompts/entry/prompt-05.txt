@@ -1,0 +1,170 @@
+You are Claude Code CLI working inside the Robson monorepo.
+
+CONTEXT (broader system)
+Robson is being evolved into 3 cooperating cores with monitoring/auditability:
+- CORE 2: Market Research & Context Engine produces MarketContextSnapshot (regime/risk/posture) with evidence + logic_version.
+- CORE 1.2: EntryGate decides if entries are allowed (availability + monthly loss quota + optional context filter).
+- CORE 1.1: Hand-Span Trailing Stop manages stop updates deterministically and emits stop-adjust events.
+
+THIS TASK (Pattern Engine)
+Implement (or refine) a “Pattern Detection Engine” that continuously scans OHLCV for BTC/USDT on 15m (initially),
+creates/updates PatternInstance lifecycle records in Django, and emits PatternAlerts that downstream cores can consume.
+This engine MUST be deterministic, reproducible, auditable, and minimal-disruption.
+
+IMPORTANT: The Django data model for patterns already exists in production and must be used.
+Do NOT redesign these models. Use PatternCatalog, PatternInstance, PatternPoint, PatternOutcome, PatternAlert,
+and the category-specific *Detail models (CandlestickPatternDetail, ChartPatternDetail, IndicatorPatternDetail, etc.).
+
+PRIMARY GOAL
+Turn raw candles into structured, versioned PatternInstances with evidence payloads suitable for:
+- EntryGate (CORE 1.2): “entry opportunity” signals gated by risk limits and market context
+- Position management (CORE 1.1): optional posture hints; do NOT move stops directly here
+- Market context (CORE 2): patterns can be treated as inputs/signals, but optional
+
+SCOPE (strict v1)
+To avoid unbounded scope, implement ONLY:
+A) Candlestick: HAMMER, INVERTED_HAMMER, ENGULFING_BULL, ENGULFING_BEAR
+B) Chart: HEAD_AND_SHOULDERS, INVERTED_HEAD_AND_SHOULDERS
+Everything else in the enums is OUT OF SCOPE for this iteration (do not implement triangles, wedges, harmonic, elliott, etc).
+However: you must ensure the architecture allows adding them later without refactor.
+
+INPUTS
+- Existing candle ingestion / storage / stream logic in repo. Use what’s already there.
+- Use 15m timeframe initially. Design to support more timeframes later.
+
+OUTPUTS (persisted + emitted)
+1) PatternInstance lifecycle:
+- Create PatternInstance when FORMING starts
+- Update to CONFIRMED on confirmation conditions
+- Update to FAILED/INVALIDATED/EXPIRED when rules indicate
+- Populate:
+  - timeframe, start_ts, end_ts, breakout_ts, status
+  - trend_precondition and pre_pattern_return_pct if computed
+  - confirm_method, confirm_strength, invalidation_level, measured_move and tp levels if applicable
+  - detected_version: set to a detector version string, e.g. "pattern_engine_v1.0.0"
+  - features JSON: keep lightweight; heavy numeric fields belong in Detail models
+
+2) Detail models:
+- For candlesticks, create CandlestickPatternDetail (body_pct_main, wick pcts, prior trend stats, engulf_ratio, etc)
+- For chart patterns, create ChartPatternDetail (neckline_slope, head_prominence_pct, shoulder_symmetry, width_bars, etc)
+Fill only fields you can compute reliably; leave others null/blank.
+
+3) PatternPoint:
+- For candlestick patterns: optional (at least store the candle ts/price levels if useful)
+- For HNS/IHNS: MUST store pivot points with labels (LS, HEAD, RS, neckline points), for reproducibility.
+
+4) PatternAlert:
+- Emit FORMING when a new instance starts
+- Emit CONFIRM when confirmed
+- Emit INVALIDATE when invalidated
+- Emit TARGET_HIT if tp1/tp2/tp3 touched (optional if you have price follow-up logic)
+Each alert must include confidence and payload with evidence (numbers, thresholds, window length, etc).
+
+DETERMINISM + IDEMPOTENCY REQUIREMENTS
+- Running the detector repeatedly over the same candle history must NOT create duplicate PatternInstances/Alerts.
+- Define a stable uniqueness strategy:
+  - Prefer: per (pattern_code, symbol, timeframe, start_ts) for instance identity
+  - Alerts: per (instance_id, alert_type, breakout_ts or computed event_ts) uniqueness
+- Implement idempotent upsert/update logic.
+
+RULE DEFINITIONS (numeric, no subjective “looks like”)
+Provide a config module with thresholds; defaults below (unless repo already defines):
+CANDLE HELPERS:
+- body = abs(close - open)
+- range = high - low (guard range > 0)
+- upper_wick = high - max(open, close)
+- lower_wick = min(open, close) - low
+- body_pct = body / range
+- upper_wick_pct = upper_wick / range
+- lower_wick_pct = lower_wick / range
+
+A) HAMMER (bullish candidate)
+- lower_wick_pct >= 0.60
+- body_pct <= 0.30
+- upper_wick_pct <= 0.15
+- Optional context filter (configurable):
+  - prior_return_pct over N bars <= -X (down move), OR price below MA(N)
+- Confirmation (configurable):
+  - CLOSE above candle midpoint on next candle OR CLOSE above hammer high within M bars
+
+B) INVERTED_HAMMER (bullish candidate)
+- upper_wick_pct >= 0.60
+- body_pct <= 0.30
+- lower_wick_pct <= 0.15
+- Similar context/confirmation options
+
+C) ENGULFING
+Bullish engulfing:
+- prev candle bearish (close < open)
+- current candle bullish (close > open)
+- current real body engulfs prev real body:
+  - open_curr <= close_prev AND close_curr >= open_prev
+- engulf_ratio = body_curr / max(body_prev, epsilon)
+Bearish engulfing symmetric.
+Confirmation (optional):
+- next candle closes in direction of engulfing
+
+D) HNS / IHNS (pivot-based)
+- Compute swing pivots using fractal window k (configurable):
+  - pivot high at i if high[i] is max in [i-k, i+k]
+  - pivot low similarly
+- Pattern recognition uses last M pivots:
+  - HNS_TOP: LS high, Head high, RS high with Head highest
+    shoulders within tolerance: abs(LS - RS) / Head <= shoulder_tol
+  - neckline derived from troughs between LS-Head and Head-RS
+- CONFIRM triggers on close beyond neckline by break_tol
+- INVALIDATION level:
+  - HNS_TOP invalidates if price closes above RS high (or above head, configurable)
+  - IHNS invalidates if price closes below RS low (inverse symmetry)
+
+INTEGRATION WITH OTHER CORES (must be designed now)
+- Pattern Engine outputs are consumed by CORE 1.2 EntryGate as “opportunity signals”.
+- EntryGate will decide ALLOW/DENY entry using:
+  - monthly loss quota, max concurrent orders, cooldowns, etc
+  - optional MarketContextSnapshot gating (CORE 2), e.g. deny in HIGH_VOL if configured
+Therefore:
+- PatternEngine must expose a clean internal event interface:
+  - e.g. a Python function returning newly generated alerts/instances for a given candle window,
+    OR publish through existing outbox/event system if present.
+- Do NOT place orders directly in PatternEngine.
+- Do NOT move stops directly in PatternEngine.
+
+MONITORING / OBSERVABILITY (must align with other prompts)
+- Logging: follow repo conventions; log key metrics and decisions at INFO, anomalies at WARNING.
+- “Freshness”:
+  - If candle feed is stale (no new 15m candle beyond threshold), emit a warning and optionally a PatternAlert-like system event (if existing mechanism).
+- Versioning:
+  - detected_version must be set for every created/updated PatternInstance.
+  - Include thresholds used in the alert payload.
+
+DELIVERABLES
+PHASE 0 (required first): PLAN + DOCS
+1) Repo scan: find where candle ingestion happens, and where pattern models live.
+2) Write an ADR describing:
+   - this Pattern Engine as a subsystem
+   - boundaries vs Core 2 / EntryGate / Hand-Span stop manager
+   - determinism, idempotency, and audit trail strategy
+3) Write docs:
+   - docs/strategy/PATTERN_ENGINE_V1.md with the numeric rules, thresholds, and lifecycle
+4) Provide an implementation plan with milestones + test plan + exact file paths to change.
+
+Stop after PHASE 0 and present the plan for validation.
+
+PHASE 1 (only after validation): IMPLEMENTATION
+- Implement detectors (candlestick + HNS/IHNS) using the existing Django models.
+- Add tests:
+  - unit tests for rule functions (golden OHLC sequences)
+  - integration tests for idempotent instance creation + alert emission
+  - property tests: no duplicates for repeated runs
+
+CONSTRAINTS
+- Minimal disruption; do not refactor unrelated modules.
+- No ML, no image recognition, no external heavy deps.
+- Use Python and Django patterns already used in Robson.
+- BTC/USDT 15m initially.
+
+TASK NOW
+Execute PHASE 0 only:
+- scan the repo for candle ingestion, patterns app, ADR conventions, and existing monitors
+- produce the ADR + docs + plan
+Do not implement PHASE 1 until the plan is validated.
