@@ -161,6 +161,10 @@ jobs:
           sed -i "s|image: ldamasio/rbs-backend-monolith-prod:.*|image: ldamasio/rbs-backend-monolith-prod:${SHA_TAG}|g" \
             infra/k8s/prod/rbs-stop-monitor-cronjob.yml
           
+          # Update trailing-stop cronjob (also uses backend image)
+          sed -i "s|image: ldamasio/rbs-backend-monolith-prod:.*|image: ldamasio/rbs-backend-monolith-prod:${SHA_TAG}|g" \
+            infra/k8s/prod/rbs-trailing-stop-cronjob.yml
+          
           echo "✅ Manifests updated"
 
       - name: Commit and push manifest changes
