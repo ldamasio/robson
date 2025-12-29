@@ -7,11 +7,12 @@ ENV PYTHONUNBUFFERED=1
 ENV DJANGO_MODULES_SETTINGS=backend.settings
 ENV DEBUG=True
 WORKDIR /app
-COPY ../requirements.txt .
+# Copy requirements from monolith (context is ./apps/backend)
+COPY monolith/requirements.txt .
 RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 # Copy monolith code
-COPY . /app/
+COPY monolith/ /app/
 # Copy core hexagonal architecture modules
-COPY ../core /app/core/
+COPY core/ /app/core/
 EXPOSE 8000
 CMD ["gunicorn","-b","0.0.0.0:8000","--worker-class=gevent","--worker-connections=1000","--workers=5","backend.wsgi"]

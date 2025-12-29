@@ -28,7 +28,7 @@ jobs:
       - name: Build and push backend image (branch)
         uses: docker/build-push-action@v5.0.0
         with:
-          context: ./apps/backend/monolith
+          context: ./apps/backend
           file: ./apps/backend/monolith/docker/Dockerfile_django
           push: true
           tags: |
