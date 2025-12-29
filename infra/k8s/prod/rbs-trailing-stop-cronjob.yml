@@ -1,12 +1,12 @@
 apiVersion: batch/v1
 kind: CronJob
 metadata:
-  name: rbs-stop-monitor-cronjob
+  name: rbs-trailing-stop-cronjob
   namespace: robson
   labels:
-    app: rbs-stop-monitor
+    app: rbs-trailing-stop
 spec:
-  # Run every minute to check for stop-loss/take-profit triggers
+  # Run every minute to adjust trailing stops
   schedule: "* * * * *"
   # Keep last 3 successful and 1 failed job for debugging
   successfulJobsHistoryLimit: 3
@@ -20,19 +20,18 @@ spec:
       template:
         metadata:
           labels:
-            app: rbs-stop-monitor
+            app: rbs-trailing-stop
         spec:
           restartPolicy: Never
           containers:
-          - name: stop-monitor
+          - name: trailing-stop
             image: ldamasio/rbs-backend-monolith-prod:sha-b1ae4d9
             command:
             - python
             - manage.py
-            - monitor_stops
-            # PRODUCTION MODE ACTIVE: Executing real stop orders!
-            # Changed from --dry-run to active mode on 2025-12-29
-            # - --dry-run  # DISABLED - Now executing real stops
+            - adjust_trailing_stops
+            # PRODUCTION MODE ACTIVE: Adjusting real trailing stops!
+            # Created on 2025-12-29 to implement Hand-Span trailing stop
             env:
             - name: DJANGO_SETTINGS_MODULE
               value: "backend.settings"
