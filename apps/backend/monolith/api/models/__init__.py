@@ -180,6 +180,19 @@ from .event_sourcing import (
     CircuitBreakerState,
 )
 
+# Market Research & Context Engine (Core 2)
+from .market_context import (
+    MetricPoint,
+    FeatureVector,
+    MarketContextSnapshot,
+)
+
+# Entry Gate (Opportunity Execution Control)
+from .entry_gate import (
+    EntryGateConfig,
+    EntryGateDecisionModel,
+)
+
 # ==========================================
 # LIST OF ALL AVAILABLE MODELS
 # ==========================================
@@ -305,6 +318,15 @@ __all__ = [
     'ExecutionSource',
     'ExecutionStatus',
     'CircuitBreakerState',
+
+    # Market Research & Context Engine (Core 2)
+    'MetricPoint',
+    'FeatureVector',
+    'MarketContextSnapshot',
+
+    # Entry Gate (Opportunity Execution Control)
+    'EntryGateConfig',
+    'EntryGateDecisionModel',
 ]
 
 # ==========================================
