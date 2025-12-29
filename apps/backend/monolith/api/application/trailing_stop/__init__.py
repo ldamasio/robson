@@ -24,7 +24,7 @@ from .domain import (
     AdjustmentReason,
 )
 from .calculator import HandSpanCalculator
-from .use_cases import AdjustTrailingStopUseCase
+from .use_cases import AdjustTrailingStopUseCase, AdjustAllTrailingStopsUseCase
 
 __all__ = [
     "TrailingStopState",
@@ -33,4 +33,5 @@ __all__ = [
     "AdjustmentReason",
     "HandSpanCalculator",
     "AdjustTrailingStopUseCase",
+    "AdjustAllTrailingStopsUseCase",
 ]
