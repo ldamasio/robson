@@ -1,13 +1,79 @@
-# Próximos Passos - Event Sourcing Stop Monitor
+# Próximos Passos - Production Operations
 
-**Status Atual**: ✅ Código implementado, pronto para deployment
-**Data**: 2024-12-25
+**Status Atual**: ✅ Features implemented, pending VPS deployment
+**Last Updated**: 2025-12-29
+
+---
+
+## 🚨 IMMEDIATE ACTION REQUIRED (VPS Commands)
+
+### Step 1: Create Groq Secret
+
+```bash
+kubectl create secret generic rbs-groq-secret \
+  --from-literal=GROQ_API_KEY=<YOUR_GROQ_API_KEY> \
+  -n robson \
+  --dry-run=client -o yaml | kubectl apply -f -
+```
+
+### Step 2: Apply CronJobs
+
+```bash
+cd /path/to/robson
+git pull origin main
+kubectl apply -f infra/k8s/prod/rbs-stop-monitor-cronjob.yml
+kubectl apply -f infra/k8s/prod/rbs-trailing-stop-cronjob.yml
+kubectl get cronjobs -n robson
+```
+
+### Step 3: Verify CronJobs Are Running
+
+```bash
+kubectl logs -n robson -l app=rbs-stop-monitor --tail=20
+kubectl logs -n robson -l app=rbs-trailing-stop --tail=20
+```
+
+---
+
+## Session Summary: 2025-12-29
+
+### ✅ Completed
+
+1. **Closed BTC Position with Profit**
+   - Entry: $87,193.34 → Exit: ~$90,058
+   - Profit: +3.28% (with 3x leverage = ~+9.9%)
+
+2. **Removed Dry-Run from Stop Monitor**
+   - File: `infra/k8s/prod/rbs-stop-monitor-cronjob.yml`
+   - CronJob now executes real stop orders
+
+3. **Created Trailing Stop CronJob**
+   - File: `infra/k8s/prod/rbs-trailing-stop-cronjob.yml`
+   - Implements Hand-Span trailing stop algorithm
+
+4. **Implemented AI Chat (Robson AI)**
+   - Backend: Groq adapter, use case, views
+   - Frontend: Floating chat component
+   - Endpoints: `/api/chat/`, `/api/chat/status/`, `/api/chat/context/`
+
+### ⏳ Pending Deployment
+
+- [ ] Create Groq secret in Kubernetes
+- [ ] Apply updated stop-monitor cronjob
+- [ ] Apply new trailing-stop cronjob
+- [ ] Update backend deployment with GROQ_API_KEY env var
+- [ ] Rebuild and deploy Docker image with `groq` dependency
+
+---
+
+## Previous: Event Sourcing Stop Monitor (2024-12-25)
 
 ---
 
 ## Resumo do que foi implementado
 
 ✅ **Backend completo** para Stop-Loss Monitor com Event Sourcing:
+
 - Migrations production-safe (zero downtime)
 - Idempotência via execution_token (previne duplicações)
 - Stop-loss por preço absoluto (não recalcula de porcentagem)
@@ -105,6 +171,7 @@ python manage.py backfill_stop_price --dry-run
 ```
 
 **Esperado**:
+
 ```
 🔄 Starting stop_price backfill...
    DRY RUN MODE (no changes will be made)
@@ -235,12 +302,14 @@ python manage.py monitor_stops --dry-run --json
 ```
 
 **Esperado** (se houver stops triggered):
+
 ```
 🛑 STOP_LOSS: Op#123 BTCUSDC @ 88000.00
    Expected PnL: -20.00 USDC
 ```
 
 **Esperado** (se não houver triggers):
+
 ```
 ✓ No triggers
 ```
@@ -531,7 +600,7 @@ kubectl logs -n robson -l app=rbs-stop-monitor --tail=50 -f | grep -E "(STOP_LOS
 
 ## Passo 10: Próxima Fase (Rust WebSocket Service)
 
-### Quando backend estiver estável em produção:
+### Quando backend estiver estável em produção
 
 1. **Implementar Rust WebSocket Service**
    - Ver ADR-0012 para arquitetura
@@ -624,6 +693,7 @@ for op in active_ops[:5]:
 ## Documentação Completa
 
 Ver documentação detalhada em:
+
 - `docs/guides/IMPLEMENTATION-SUMMARY-ADR-0012.md` - Resumo completo
 - `docs/guides/MIGRATION-DIFF-REVIEW.md` - Review de migrations
 - `docs/adr/ADR-0012-rust-stop-monitor-event-sourcing.md` - Decisão arquitetural

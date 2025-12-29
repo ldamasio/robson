@@ -50,6 +50,7 @@ The production deployment at `infra/k8s/prod/rbs-backend-monolith-prod-deploy.ym
 ### Admin/Operator Credentials (K8s Secrets)
 
 Your credentials stored in K8s secrets (`rbs-django-secret`) are used for:
+
 - System-level operations
 - Your personal trading account (as the platform operator)
 - Fallback when client credentials are not configured
@@ -91,6 +92,7 @@ Authorization: Bearer <token>
 ```
 
 Response:
+
 ```json
 {
     "trading_enabled": true,
@@ -112,6 +114,7 @@ Authorization: Bearer <token>
 ```
 
 Response:
+
 ```json
 {
     "success": true,
@@ -151,6 +154,7 @@ Content-Type: application/json
 ```
 
 Response:
+
 ```json
 {
     "success": true,
@@ -194,6 +198,7 @@ Authorization: Bearer <token>
 ```
 
 Response:
+
 ```json
 {
     "trades": [
@@ -233,6 +238,7 @@ Authorization: Bearer <token>
 ```
 
 Response:
+
 ```json
 {
     "period_type": "monthly",
@@ -285,6 +291,7 @@ The production Binance API key is **restricted to Contabo VPS IPs only**:
 Local development machines cannot execute real trades (API will return `code=-2015`).
 
 To execute trades in production:
+
 ```bash
 # SSH to master node
 ssh root@158.220.116.31
@@ -308,6 +315,7 @@ kubectl exec -n robson <pod-name> -- python manage.py <command>
 **No trade may be executed without proper risk management.**
 
 Every order MUST include:
+
 1. **Stop-Loss Price**: Where the trade is invalidated
 2. **Entry Price**: Planned entry point
 3. **Position Size**: Calculated to risk maximum 1% of capital
@@ -321,6 +329,7 @@ Position Size = Risk Amount / Stop Distance
 ```
 
 **Example:**
+
 - Capital: $1,000
 - Risk Amount: $10 (1%)
 - Entry: $100,000
@@ -331,6 +340,7 @@ Position Size = Risk Amount / Stop Distance
 ### Monthly Drawdown Limit (4% Rule)
 
 If monthly losses exceed 4% of capital:
+
 - Trading is automatically PAUSED
 - Review required before resuming
 - PolicyState tracks this in database
@@ -338,12 +348,14 @@ If monthly losses exceed 4% of capital:
 ### Enforcement
 
 The system BLOCKS orders that:
+
 - ❌ Have no stop-loss defined
 - ❌ Risk more than 1% of capital
 - ❌ Exceed monthly drawdown limit
 - ❌ Skip the PLAN → VALIDATE → EXECUTE workflow
 
 Use these endpoints for risk-managed trading:
+
 - `POST /api/margin/position/calculate/` - Calculate safe position size
 - `POST /api/margin/position/open/` - Open with automatic stop-loss
 - `POST /api/guard/analyze/` - Check for emotional trading patterns
@@ -388,4 +400,167 @@ After 6+ years of development, when you execute your first production trade, Rob
 
 Congratulations on this milestone!
 
+---
 
+## Stop Monitoring & Trailing Stops
+
+### CronJobs Architecture
+
+Two separate CronJobs handle stop management in production:
+
+| CronJob | Schedule | Purpose |
+|---------|----------|---------|
+| `rbs-stop-monitor-cronjob` | Every minute | Execute stop-loss and take-profit orders |
+| `rbs-trailing-stop-cronjob` | Every minute | Adjust trailing stop prices |
+
+### Stop Monitor CronJob
+
+**File**: `infra/k8s/prod/rbs-stop-monitor-cronjob.yml`
+
+Monitors open positions and executes:
+
+- **Stop-Loss**: When price drops below stop_price (for LONG positions)
+- **Take-Profit**: When price reaches target_price
+
+**Command**: `python manage.py monitor_stops`
+
+> **Note**: As of 2025-12-29, the `--dry-run` flag was removed and the CronJob now executes real orders.
+
+### Trailing Stop CronJob
+
+**File**: `infra/k8s/prod/rbs-trailing-stop-cronjob.yml`
+
+Implements the **Hand-Span Trailing Stop** algorithm:
+
+1. **Span Definition**: Distance between entry price and initial stop-loss
+2. **Break-Even at 1 Span**: When profit equals 1 span, move stop to entry price
+3. **Trail at 2+ Spans**: Move stop by (spans - 1) × span distance
+4. **Monotonic**: Stop only moves in favorable direction (never retreats)
+
+**Example** (LONG position):
+
+- Entry: $100
+- Initial Stop: $98 (span = $2)
+- Price reaches $102 (1 span profit) → Stop moves to $100 (break-even)
+- Price reaches $104 (2 spans profit) → Stop moves to $102
+- Price reaches $106 (3 spans profit) → Stop moves to $104
+
+**Command**: `python manage.py adjust_trailing_stops`
+
+### Applying CronJobs
+
+```bash
+# From the master node
+kubectl apply -f infra/k8s/prod/rbs-stop-monitor-cronjob.yml
+kubectl apply -f infra/k8s/prod/rbs-trailing-stop-cronjob.yml
+
+# Verify
+kubectl get cronjobs -n robson
+```
+
+---
+
+## AI Chat Assistant (Robson AI)
+
+### Overview
+
+Robson includes an AI-powered chat assistant for conversational trading assistance. The assistant can:
+
+- Provide technical analysis
+- Check account balances and positions
+- Calculate position sizes
+- Execute trades (with confirmation)
+- Offer risk management advice
+
+### API Endpoints
+
+**Chat with Robson**:
+
+```http
+POST /api/chat/
+Authorization: Bearer <token>
+Content-Type: application/json
+
+{
+    "message": "What is my current BTC position?",
+    "conversation_id": null  // Optional: for conversation continuity
+}
+```
+
+Response:
+
+```json
+{
+    "success": true,
+    "message": "You have an open LONG position...",
+    "conversation_id": "uuid-here",
+    "detected_intent": "positions",
+    "requires_confirmation": false,
+    "model": "llama3-8b-8192"
+}
+```
+
+**Check AI Status**:
+
+```http
+GET /api/chat/status/
+Authorization: Bearer <token>
+```
+
+Response:
+
+```json
+{
+    "available": true,
+    "model": "llama3-8b-8192",
+    "provider": "Groq"
+}
+```
+
+**Get Trading Context**:
+
+```http
+GET /api/chat/context/
+Authorization: Bearer <token>
+```
+
+### Configuration
+
+**Environment Variables**:
+
+```bash
+# Groq API key (from Kubernetes secret)
+GROQ_API_KEY=gsk_xxx...
+
+# Optional: Override default model
+ROBSON_AI_MODEL=llama3-8b-8192
+
+# Optional: Max tokens per response
+ROBSON_AI_MAX_TOKENS=4096
+```
+
+**Kubernetes Secret**:
+
+```bash
+kubectl create secret generic rbs-groq-secret \
+  --from-literal=GROQ_API_KEY=your_key_here \
+  -n robson
+```
+
+### Supported Models
+
+Currently using Groq's free tier:
+
+- `llama3-8b-8192` (default)
+- `llama3-70b-8192`
+- `mixtral-8x7b-32768`
+
+**Future**: Multi-cloud support (OpenAI, Anthropic, DeepSeek) with user-configurable API keys.
+
+### Frontend Component
+
+The chat is available as a floating component on the logged-in dashboard:
+
+- Click the 🤖 button to open
+- Quick actions for common queries
+- Full conversation history

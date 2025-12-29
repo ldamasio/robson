@@ -9,7 +9,7 @@ ROBSON BOT is an open source algo trade project. It is a robot specialized in cr
 
 The Robson Bot is a tool for researchers, traders that monitors stocks to trigger signals or automate order flows for the binance crypto stock market.
 
-## Research, communication and trade functions.
+## Research, communication and trade functions
 
 Designed as a cryptocurrency robot, it also has the ability to communicate and interact via Metaverse, providing services and remuneration to its users, with instructions for risk management.
 
@@ -17,7 +17,7 @@ Designed as a cryptocurrency robot, it also has the ability to communicate and i
 
 The command interface makes it possible to activate a Dashboard with its main indicators or special features for you to carry out day-to-day activities.
 
-## The Dashboard offers special string conversion calculators. 
+## The Dashboard offers special string conversion calculators
 
 For example, if you need to withdraw an amount of BRL, but would like to convert your USDT to ADA before transferring, in addition to needing to anticipate spread values from other financial services.
 
@@ -64,6 +64,7 @@ robson execute abc123def456 --client-id 1 --live --acknowledge-risk
 ```
 
 **Safety by default:**
+
 - **DRY-RUN** is the default mode (simulation, no real orders)
 - **LIVE** requires both `--live` AND `--acknowledge-risk` flags
 - LIVE execution requires prior validation
@@ -102,6 +103,7 @@ robson --help
 **Use for:** Daily development workflow
 
 Install `just`:
+
 ```bash
 # macOS
 brew install just
@@ -114,6 +116,7 @@ scoop install just
 ```
 
 Common tasks:
+
 ```bash
 # See all available tasks
 just --list
@@ -175,6 +178,7 @@ Robson Bot now supports **complete portfolio tracking in BTC terms**, the prefer
 ### Why BTC?
 
 Crypto investors prefer to measure their wealth in BTC (not USD) because:
+
 - BTC is the base currency of the crypto market
 - USD inflation can distort portfolio performance
 - BTC shows true purchasing power in the crypto ecosystem
@@ -182,12 +186,15 @@ Crypto investors prefer to measure their wealth in BTC (not USD) because:
 ### Features
 
 #### Backend Services
+
+- **Pattern Detection Engine (CORE 1.0)**: Deterministic, idempotent pattern detection (7 patterns: Hammer, Inverted Hammer, Bullish/Bearish Engulfing, Morning Star, Head & Shoulders, Inverted H&S)
 - **BTCConversionService**: Multi-route price discovery (direct pair, USDT, BUSD)
 - **PortfolioBTCService**: Complete portfolio valuation in BTC
 - **Binance Sync**: Automatic deposit/withdrawal synchronization
 - **Audit Trail**: All external flows are recorded and audited
 
 #### REST API Endpoints
+
 ```bash
 GET /api/portfolio/btc/total/          # Current value in BTC
 GET /api/portfolio/btc/profit/         # Profit since inception
@@ -196,7 +203,13 @@ GET /api/portfolio/deposits-withdrawals/  # Transaction list
 ```
 
 #### CLI Commands
+
 ```bash
+# Pattern detection (CORE 1.0)
+python manage.py detect_patterns BTCUSDT 15m --all      # All patterns
+python manage.py detect_patterns BTCUSDT 1h --candlestick  # Candlestick only
+python manage.py detect_patterns BTCUSDT 4h --chart     # Chart patterns only
+
 # Show portfolio in BTC
 python manage.py portfolio_btc
 
@@ -208,22 +221,27 @@ python manage.py sync_deposits --days-back 90
 ```
 
 #### Profit Formula
+
 ```
 Profit (BTC) = Current Balance (BTC) + Withdrawals (BTC) - Deposits (BTC)
 ```
 
 This formula considers:
+
 - **Current holdings**: What you have now
 - **Withdrawals**: Past profits taken out (count as gains)
 - **Deposits**: Your capital input (investment)
 
 #### Frontend Dashboard
+
 The **Portfolio tab** (💼 Portfolio) provides:
+
 - **Overview**: Total value, profit metrics, account breakdown
 - **History**: Interactive chart with timeline filtering (7d, 30d, 90d, 1y)
 - **Transactions**: Filterable table of deposits/withdrawals
 
 All values are displayed in BTC with:
+
 - Color-coded profit (green) / loss (red)
 - Auto-refresh every 60 seconds
 - Clean tab-based navigation
@@ -245,6 +263,7 @@ python manage.py portfolio_btc --profit
 ```
 
 ### Documentation
+
 - See [`CHANGELOG.md`](CHANGELOG.md) for detailed changes
 - See [`docs/AGENTS.md`](docs/AGENTS.md) for architecture details
 
@@ -280,7 +299,7 @@ Some tips for development environment
 
 ### Clone robson repository
 
-git clone https://github.com/ldamasio/robson.git
+git clone <https://github.com/ldamasio/robson.git>
 
 ### Try run docker-compose
 
@@ -325,9 +344,6 @@ nvm use 14
 npm i
 npm start
 
-
-
-
 To update vendor docs in the future, run:
 
 ```bash
@@ -344,6 +360,7 @@ Robson is 100% open source and contributions are welcome. For how to prepare you
 Production deployments are performed via GitOps/CI (GitHub Actions + ArgoCD + k3s) using Istio (Ambient Mode) with Gateway API. Each branch ≠ main creates an automatic staging environment at `h-<branch>.robson.rbx.ia.br`. The `./bin/dj` script and `docker-compose.dev.yml` are intended for local development only. See `infra/README.md`.
 
 Notes
+
 - The `./bin/dj` script is for local development only. Production deploys should be performed via your GitOps/CI pipeline (e.g., GitHub Actions + ArgoCD + k3s).
 - The local Postgres runs with Docker Compose using `apps/backend/monolith/docker-compose.dev.yml` and credentials from `apps/backend/monolith/.env`.
   - Makefile helpers: `make dev-db-up`, `make dev-db-down`, `make dev-db-destroy`, `make dev-test`.
