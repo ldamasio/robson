@@ -1,1 +1,1 @@
-"""Outbound (Driven) Adapters"""
+"""Driven adapters (infrastructure implementations)."""
