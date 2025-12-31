@@ -47,6 +47,9 @@ function Header() {
                   <LinkContainer to="/dashboard">
                     <Button variant="outline-light" size="sm">Dashboard</Button>
                   </LinkContainer>
+                  <LinkContainer to="/patterns">
+                    <Button variant="outline-info" size="sm">🎯 Opportunity Detector</Button>
+                  </LinkContainer>
                   <Button variant="link" className="text-decoration-none text-light" onClick={logoutUser}>Logout</Button>
                 </>
               ) : (

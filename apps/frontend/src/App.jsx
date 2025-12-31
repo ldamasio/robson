@@ -16,6 +16,7 @@ import DownloadScreen from './screens/DownloadScreen'
 import HireScreen from './screens/HireScreen'
 import DemoScreen from './screens/DemoScreen'
 import LoggedHomeScreen from './screens/LoggedHomeScreen'
+import PatternDetectorScreen from './screens/logged/PatternDetectorScreen'
 import NoPageScreen from "./screens/NoPageScreen"
 
 function App() {
@@ -41,6 +42,7 @@ function App() {
             <Route element={<PrivateRoutes />}>
               <Route element={<LoggedHomeScreen />} path="/dashboard" />
               <Route element={<LoggedHomeScreen />} path="/feed" /> {/* Legacy route */}
+              <Route element={<PatternDetectorScreen />} path="/patterns" />
             </Route>
           </Routes>
           <ToastContainer
