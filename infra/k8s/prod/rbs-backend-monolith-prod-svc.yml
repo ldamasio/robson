@@ -3,11 +3,14 @@ kind: Service
 metadata:
   name: rbs-backend-monolith-prod-svc
   namespace: robson
+  labels:
+    app: rbs-backend-monolith-prod-deploy
 spec:
   selector:
     app: rbs-backend-monolith-prod-deploy
   ports:
-    - protocol: TCP
+    - name: http
+      protocol: TCP
       port: 8000
       targetPort: 8000
   type: LoadBalancer

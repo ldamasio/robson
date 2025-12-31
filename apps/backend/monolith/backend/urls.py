@@ -12,36 +12,21 @@ from django.conf.urls.static import static
 urlpatterns = [
     # Admin interface
     path('admin/', admin.site.urls),
-    
+
     # API routes
     path('api/', include('api.urls')),
-    
+
     # Client routes (if any)
     path('clients/', include('clients.urls')) if hasattr(settings, 'clients') else path('', lambda r: None),
+
+    # Observability endpoints
+    path('metrics/', include('django_prometheus.urls')),       # Prometheus metrics
+    path('health/', include('health_check.urls')),             # Detailed health checks
 ]
 
 # Serve static files in development
 if settings.DEBUG:
     urlpatterns += static(settings.STATIC_URL, document_root=settings.STATIC_ROOT)
-
-# Add health check endpoint
-from django.http import JsonResponse
-from django.views.decorators.csrf import csrf_exempt
-
-@csrf_exempt
-def health_check(request):
-    """Health check endpoint for monitoring"""
-    return JsonResponse({
-        'status': 'healthy',
-        'service': 'robson-bot-api',
-        'version': '1.0.0',
-        'environment': 'development' if settings.DEBUG else 'production'
-    })
-
-# Add health check to URL patterns
-urlpatterns += [
-    path('health/', health_check, name='health_check'),
-]
 
 # URL structure overview for frontend developers:
 """
@@ -74,6 +59,7 @@ Account:
 Admin:
 - GET  /admin/                    - Django admin interface
 
-Monitoring:
-- GET  /health/                   - Health check endpoint
+Observability & Monitoring:
+- GET  /health/                   - Comprehensive health checks (DB, cache, storage)
+- GET  /metrics/                  - Prometheus metrics (requests, latency, errors)
 """

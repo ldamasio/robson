@@ -200,6 +200,10 @@ LOGGING = {
             'format': '{levelname} {message}',
             'style': '{',
         },
+        'json': {
+            '()': 'pythonjsonlogger.jsonlogger.JsonFormatter',
+            'format': '%(asctime)s %(name)s %(levelname)s %(message)s %(pathname)s %(lineno)d %(funcName)s',
+        },
     },
     'handlers': {
         'file': {
@@ -211,7 +215,7 @@ LOGGING = {
         'console': {
             'level': 'DEBUG' if DEBUG else 'INFO',
             'class': 'logging.StreamHandler',
-            'formatter': 'simple',
+            'formatter': 'simple' if DEBUG else 'json',  # JSON in production for k8s
         },
     },
     'loggers': {
