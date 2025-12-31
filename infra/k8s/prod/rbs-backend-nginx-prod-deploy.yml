@@ -20,7 +20,7 @@ spec:
       initContainers:
       containers:
       - name: rbs-backend-nginx-prod-deploy
-        image: ldamasio/rbs-backend-nginx-prod:sha-d388fa7
+        image: ldamasio/rbs-backend-nginx-prod:sha-46065d0
         imagePullPolicy: Always
         ports:
         - containerPort: 80
