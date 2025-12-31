@@ -14,9 +14,13 @@ Output: PatternInstances, PatternAlerts in database (NO order placement).
 import logging
 
 from django.core.management.base import BaseCommand, CommandError
+from django.conf import settings
 
 from api.application.pattern_engine import PatternScanCommand, PatternScanUseCase
-from api.application.pattern_engine.adapters import BinanceCandleProvider, DjangoPatternRepository
+from api.application.pattern_engine.adapters import (
+    BinanceCandleProvider,
+    DjangoPatternRepository,
+)
 from api.application.pattern_engine.detectors import (
     EngulfingDetector,
     HammerDetector,
@@ -25,7 +29,7 @@ from api.application.pattern_engine.detectors import (
     InvertedHeadAndShouldersDetector,
     MorningStarDetector,
 )
-from api.models import BinanceClient
+from api.services.binance_service import BinanceService
 
 logger = logging.getLogger(__name__)
 
@@ -98,9 +102,9 @@ class Command(BaseCommand):
 
         # Additional options
         parser.add_argument(
-            "--client-id",
-            type=int,
-            help="BinanceClient ID (defaults to first active client)",
+            "--testnet",
+            action="store_true",
+            help="Use Binance testnet instead of production",
         )
         parser.add_argument(
             "--candle-limit",
@@ -133,27 +137,18 @@ class Command(BaseCommand):
                 f"Symbol:    {symbol}\n"
                 f"Timeframe: {timeframe}\n"
                 f"Candles:   {candle_limit}\n"
+                f"Testnet:   {options['testnet']}\n"
                 f"{'='*60}\n"
             )
         )
 
-        # Get BinanceClient
-        try:
-            if options["client_id"]:
-                client = BinanceClient.objects.get(id=options["client_id"])
-            else:
-                client = BinanceClient.objects.filter(is_active=True).first()
-                if not client:
-                    raise CommandError("No active BinanceClient found")
-
-            self.stdout.write(f"Using client: {client.name} (ID: {client.id})\n")
-
-        except BinanceClient.DoesNotExist:
-            raise CommandError(f"BinanceClient with ID {options['client_id']} not found")
-
         # Initialize adapters
-        candle_provider = BinanceCandleProvider(client)
-        pattern_repository = DjangoPatternRepository()
+        # BinanceService is a singleton that uses settings for credentials
+        use_testnet = options.get("testnet", getattr(settings, "BINANCE_USE_TESTNET", False))
+        binance_service = BinanceService(use_testnet=use_testnet)
+        candle_provider = BinanceCandleProvider(binance_service)
+        # For manual scans, client=None creates system-owned patterns
+        pattern_repository = DjangoPatternRepository(client=None)
 
         # Initialize detectors based on arguments
         detectors = self._select_detectors(options)
