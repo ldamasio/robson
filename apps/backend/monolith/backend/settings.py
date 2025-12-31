@@ -113,6 +113,12 @@ SIMPLE_JWT = {
 # MIDDLEWARE
 # ==========================================
 MIDDLEWARE = [
+    # Prometheus metrics - must be first
+    'django_prometheus.middleware.PrometheusBeforeMiddleware',
+
+    # Correlation ID - early for request tracking
+    'api.middleware.correlation_id.CorrelationIDMiddleware',
+
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
@@ -121,6 +127,9 @@ MIDDLEWARE = [
     'django.contrib.auth.middleware.AuthenticationMiddleware',
     'django.contrib.messages.middleware.MessageMiddleware',
     'django.middleware.clickjacking.XFrameOptionsMiddleware',
+
+    # Prometheus metrics - must be last
+    'django_prometheus.middleware.PrometheusAfterMiddleware',
 ]
 
 ROOT_URLCONF = 'backend.urls'
@@ -202,7 +211,12 @@ LOGGING = {
         },
         'json': {
             '()': 'pythonjsonlogger.jsonlogger.JsonFormatter',
-            'format': '%(asctime)s %(name)s %(levelname)s %(message)s %(pathname)s %(lineno)d %(funcName)s',
+            'format': '%(asctime)s %(name)s %(levelname)s %(message)s %(pathname)s %(lineno)d %(funcName)s %(correlation_id)s',
+        },
+    },
+    'filters': {
+        'correlation_id': {
+            '()': 'api.middleware.logging_filter.CorrelationIDFilter',
         },
     },
     'handlers': {
@@ -211,11 +225,13 @@ LOGGING = {
             'class': 'logging.FileHandler',
             'filename': BASE_DIR / 'logs' / 'robson.log',
             'formatter': 'verbose',
+            'filters': ['correlation_id'],
         },
         'console': {
             'level': 'DEBUG' if DEBUG else 'INFO',
             'class': 'logging.StreamHandler',
             'formatter': 'simple' if DEBUG else 'json',  # JSON in production for k8s
+            'filters': ['correlation_id'],
         },
     },
     'loggers': {

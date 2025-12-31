@@ -20,8 +20,16 @@ urlpatterns = [
     path('clients/', include('clients.urls')) if hasattr(settings, 'clients') else path('', lambda r: None),
 
     # Observability endpoints
-    path('metrics/', include('django_prometheus.urls')),       # Prometheus metrics
-    path('health/', include('health_check.urls')),             # Detailed health checks
+    path('metrics/', include('django_prometheus.urls')),       # Prometheus metrics (internal only)
+    path('health/', include('health_check.urls')),             # Detailed diagnostics (internal only)
+]
+
+# Add Kubernetes-compatible health endpoints
+from api.views.health import healthz, readyz
+
+urlpatterns += [
+    path('healthz', healthz, name='healthz'),     # Liveness probe (public OK)
+    path('readyz', readyz, name='readyz'),        # Readiness probe (public OK)
 ]
 
 # Serve static files in development
