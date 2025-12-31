@@ -92,12 +92,9 @@ spec:
                 secretKeyRef:
                   name: rbs-django-secret
                   key: POSTGRES_PORT
-            # Binance configuration - use testnet for pattern scanning
+            # Binance configuration - use testnet for pattern scanning (read-only)
             - name: BINANCE_USE_TESTNET
-              valueFrom:
-                secretKeyRef:
-                  name: rbs-django-secret
-                  key: BINANCE_USE_TESTNET
+              value: "True"
             resources:
               requests:
                 memory: "256Mi"
