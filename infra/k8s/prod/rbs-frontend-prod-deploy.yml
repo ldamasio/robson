@@ -20,7 +20,7 @@ spec:
     spec:
       containers:
         - name: rbs-frontend-prod-deploy
-          image: ldamasio/rbs-frontend-prod:sha-7d6dc25
+          image: ldamasio/rbs-frontend-prod:sha-5b09d68
           imagePullPolicy: Always
           ports:
           - containerPort: 80
