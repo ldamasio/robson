@@ -170,25 +170,83 @@ jobs:
       - name: Commit and push manifest changes
         run: |
           SHA_TAG="${{ steps.meta.outputs.sha_tag }}"
-          
+
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
-          
+
           git add infra/k8s/prod/*.yml
-          
+
           # Check if there are changes to commit
           if git diff --staged --quiet; then
-            echo "No manifest changes to commit"
+            echo "ℹ️ No manifest changes to commit (already up-to-date)"
+            exit 0
+          fi
+
+          # Commit the changes
+          git commit -m "chore(gitops): update image tags to ${SHA_TAG}
+
+          Automated manifest update by GitHub Actions.
+          ArgoCD will automatically sync this change.
+
+          [skip ci]"
+
+          # Robust push with retry logic (handles concurrent workflows)
+          MAX_RETRIES=3
+          RETRY_COUNT=0
+          PUSH_SUCCESS=false
+
+          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
+            echo "📤 Attempt $((RETRY_COUNT + 1))/$MAX_RETRIES: Pushing manifest updates..."
+
+            if git push origin main; then
+              echo "✅ Manifests pushed successfully - ArgoCD will auto-sync"
+              PUSH_SUCCESS=true
+              break
+            else
+              echo "⚠️ Push failed (likely due to concurrent workflow)"
+              RETRY_COUNT=$((RETRY_COUNT + 1))
+
+              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
+                echo "🔄 Pulling and rebasing before retry..."
+                git pull --rebase origin main
+
+                # Check if our commit is still needed after rebase
+                if git log -1 --grep="chore(gitops): update image tags to ${SHA_TAG}" --format="%s" | grep -q "${SHA_TAG}"; then
+                  echo "✓ Gitops commit preserved after rebase"
+                else
+                  echo "⚠️ Gitops commit lost during rebase - checking if manifests already updated..."
+
+                  # Check if another workflow already updated to this SHA
+                  if grep -q "${SHA_TAG}" infra/k8s/prod/rbs-frontend-prod-deploy.yml; then
+                    echo "✅ Manifests already updated to ${SHA_TAG} by another workflow"
+                    PUSH_SUCCESS=true
+                    break
+                  else
+                    echo "❌ Manifests not updated and commit lost - this should not happen"
+                    exit 1
+                  fi
+                fi
+
+                sleep $((2 ** RETRY_COUNT))  # Exponential backoff
+              fi
+            fi
+          done
+
+          if [ "$PUSH_SUCCESS" = false ]; then
+            echo "❌ Failed to push manifests after $MAX_RETRIES attempts"
+            echo "::error::GitOps manifest push failed - deployment NOT updated"
+            exit 1
+          fi
+
+          # Final validation: Verify gitops commit exists on remote
+          sleep 2  # Brief wait for GitHub to process push
+
+          if git ls-remote --heads origin main | grep -q "$(git rev-parse HEAD)"; then
+            echo "✅ Validation passed: Gitops commit confirmed on remote"
           else
-            git commit -m "chore(gitops): update image tags to ${SHA_TAG}
-            
-            Automated manifest update by GitHub Actions.
-            ArgoCD will automatically sync this change.
-            
-            [skip ci]"
-            
-            git push
-            echo "✅ Manifests pushed - ArgoCD will auto-sync"
+            echo "❌ Validation failed: Gitops commit not found on remote"
+            echo "::error::Gitops commit push validation failed"
+            exit 1
           fi
 
       - name: Wait for ArgoCD sync

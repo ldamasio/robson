@@ -1,0 +1,175 @@
+name: GitOps Sync Checker
+
+# Safety net: Detects when Docker images exist but manifests are outdated
+# Automatically fixes gitops gaps caused by failed workflow runs
+
+on:
+  # Manual trigger for immediate fixes
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: 'Dry run (check only, do not update)'
+        required: false
+        default: 'false'
+        type: choice
+        options:
+          - 'true'
+          - 'false'
+
+  # Automated check every 6 hours
+  schedule:
+    - cron: '0 */6 * * *'  # Every 6 hours
+
+permissions:
+  contents: write
+
+jobs:
+  check-and-sync:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Detect gitops gaps
+        id: detect
+        run: |
+          echo "🔍 Checking for gitops synchronization gaps..."
+
+          # Get current tags from manifests
+          MANIFEST_FRONTEND=$(grep "image: ldamasio/rbs-frontend-prod:" infra/k8s/prod/rbs-frontend-prod-deploy.yml | sed 's/.*://g' | tr -d ' ')
+          MANIFEST_BACKEND=$(grep "image: ldamasio/rbs-backend-monolith-prod:" infra/k8s/prod/rbs-backend-monolith-prod-deploy.yml | sed 's/.*://g' | tr -d ' ')
+          MANIFEST_NGINX=$(grep "image: ldamasio/rbs-backend-nginx-prod:" infra/k8s/prod/rbs-backend-nginx-prod-deploy.yml | sed 's/.*://g' | tr -d ' ')
+
+          echo "📦 Current manifest tags:"
+          echo "  Frontend: $MANIFEST_FRONTEND"
+          echo "  Backend:  $MANIFEST_BACKEND"
+          echo "  Nginx:    $MANIFEST_NGINX"
+
+          # Get latest commit SHA
+          LATEST_SHA=$(git rev-parse HEAD | cut -c1-7)
+          EXPECTED_TAG="sha-${LATEST_SHA}"
+
+          echo "📌 Latest commit: $EXPECTED_TAG"
+
+          # Check if images exist on DockerHub for latest commit
+          echo "🐳 Checking DockerHub for $EXPECTED_TAG..."
+
+          FRONTEND_EXISTS=$(curl -s "https://hub.docker.com/v2/repositories/ldamasio/rbs-frontend-prod/tags/?page_size=100" | grep -o "\"name\":\"${EXPECTED_TAG}\"" || echo "")
+          BACKEND_EXISTS=$(curl -s "https://hub.docker.com/v2/repositories/ldamasio/rbs-backend-monolith-prod/tags/?page_size=100" | grep -o "\"name\":\"${EXPECTED_TAG}\"" || echo "")
+          NGINX_EXISTS=$(curl -s "https://hub.docker.com/v2/repositories/ldamasio/rbs-backend-nginx-prod/tags/?page_size=100" | grep -o "\"name\":\"${EXPECTED_TAG}\"" || echo "")
+
+          IMAGES_EXIST=true
+          if [ -z "$FRONTEND_EXISTS" ] || [ -z "$BACKEND_EXISTS" ] || [ -z "$NGINX_EXISTS" ]; then
+            echo "⚠️ Not all images exist for $EXPECTED_TAG on DockerHub"
+            IMAGES_EXIST=false
+          else
+            echo "✅ All images exist for $EXPECTED_TAG"
+          fi
+
+          # Determine if sync is needed
+          SYNC_NEEDED=false
+          if [ "$IMAGES_EXIST" = true ]; then
+            if [ "$MANIFEST_FRONTEND" != "$EXPECTED_TAG" ] || \
+               [ "$MANIFEST_BACKEND" != "$EXPECTED_TAG" ] || \
+               [ "$MANIFEST_NGINX" != "$EXPECTED_TAG" ]; then
+              echo "🚨 GITOPS GAP DETECTED!"
+              echo "  Images exist for $EXPECTED_TAG but manifests are outdated"
+              SYNC_NEEDED=true
+            else
+              echo "✅ Manifests are in sync with latest images"
+            fi
+          else
+            echo "ℹ️ Images not yet built for $EXPECTED_TAG (workflow may be in progress)"
+          fi
+
+          echo "sync_needed=$SYNC_NEEDED" >> $GITHUB_OUTPUT
+          echo "expected_tag=$EXPECTED_TAG" >> $GITHUB_OUTPUT
+          echo "images_exist=$IMAGES_EXIST" >> $GITHUB_OUTPUT
+
+      - name: Update manifests (if needed)
+        if: steps.detect.outputs.sync_needed == 'true' && github.event.inputs.dry_run != 'true'
+        run: |
+          SHA_TAG="${{ steps.detect.outputs.expected_tag }}"
+
+          echo "🔧 Updating manifests to $SHA_TAG..."
+
+          # Update all manifests
+          sed -i "s|image: ldamasio/rbs-frontend-prod:sha-[a-f0-9]*|image: ldamasio/rbs-frontend-prod:${SHA_TAG}|g" \
+            infra/k8s/prod/rbs-frontend-prod-deploy.yml
+
+          sed -i "s|image: ldamasio/rbs-backend-monolith-prod:sha-[a-f0-9]*|image: ldamasio/rbs-backend-monolith-prod:${SHA_TAG}|g" \
+            infra/k8s/prod/rbs-backend-monolith-prod-deploy.yml
+
+          sed -i "s|image: ldamasio/rbs-backend-nginx-prod:sha-[a-f0-9]*|image: ldamasio/rbs-backend-nginx-prod:${SHA_TAG}|g" \
+            infra/k8s/prod/rbs-backend-nginx-prod-deploy.yml
+
+          sed -i "s|image: ldamasio/rbs-backend-monolith-prod:.*|image: ldamasio/rbs-backend-monolith-prod:${SHA_TAG}|g" \
+            infra/k8s/prod/rbs-stop-monitor-cronjob.yml
+
+          sed -i "s|image: ldamasio/rbs-backend-monolith-prod:.*|image: ldamasio/rbs-backend-monolith-prod:${SHA_TAG}|g" \
+            infra/k8s/prod/rbs-trailing-stop-cronjob.yml
+
+          echo "✅ Manifests updated"
+
+      - name: Commit and push recovery
+        if: steps.detect.outputs.sync_needed == 'true' && github.event.inputs.dry_run != 'true'
+        run: |
+          SHA_TAG="${{ steps.detect.outputs.expected_tag }}"
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+
+          git add infra/k8s/prod/*.yml
+
+          git commit -m "chore(gitops): recover missing manifest update to ${SHA_TAG}
+
+          Automated recovery by GitOps Sync Checker.
+          This commit fixes a gitops gap where images were built
+          but manifests were not updated due to workflow failure.
+
+          [skip ci]"
+
+          # Use robust push (same as main workflow)
+          MAX_RETRIES=3
+          for i in $(seq 1 $MAX_RETRIES); do
+            if git push origin main; then
+              echo "✅ Recovery commit pushed successfully"
+              exit 0
+            else
+              echo "⚠️ Push attempt $i failed, retrying..."
+              git pull --rebase origin main
+              sleep 2
+            fi
+          done
+
+          echo "❌ Failed to push recovery commit"
+          exit 1
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## GitOps Sync Check Results" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${{ steps.detect.outputs.sync_needed }}" = "true" ]; then
+            echo "### 🚨 Gap Detected and Fixed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "- Expected tag: \`${{ steps.detect.outputs.expected_tag }}\`" >> $GITHUB_STEP_SUMMARY
+            echo "- Images exist: ✅" >> $GITHUB_STEP_SUMMARY
+            echo "- Manifests were outdated: ⚠️" >> $GITHUB_STEP_SUMMARY
+
+            if [ "${{ github.event.inputs.dry_run }}" = "true" ]; then
+              echo "- Action taken: **DRY RUN** (no changes made)" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- Action taken: **Manifests updated** ✅" >> $GITHUB_STEP_SUMMARY
+            fi
+          elif [ "${{ steps.detect.outputs.images_exist }}" = "false" ]; then
+            echo "### ℹ️ No Action Needed" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Images not yet built for latest commit (workflow may be in progress)" >> $GITHUB_STEP_SUMMARY
+          else
+            echo "### ✅ All In Sync" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "Manifests match latest Docker images - no action needed" >> $GITHUB_STEP_SUMMARY
+          fi
