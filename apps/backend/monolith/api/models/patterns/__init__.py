@@ -60,6 +60,8 @@ from .cyclical import (
     CyclicalPatternDetail,
 )
 
+from .strategy_config import StrategyPatternConfig
+
 __all__ = [
     "PatternCatalog",
     "PatternInstance",
@@ -97,4 +99,5 @@ __all__ = [
     "CyclicalPatternCode",
     "RegimeDependency",
     "CyclicalPatternDetail",
+    "StrategyPatternConfig",
 ]

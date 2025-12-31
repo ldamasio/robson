@@ -102,6 +102,9 @@ from .patterns import (
     CyclicalPatternDetail,
 )
 
+# Pattern strategy configuration
+from .patterns.strategy_config import StrategyPatternConfig
+
 # Indicators
 from .indicators import (
     MovingAverage,
@@ -265,6 +268,7 @@ __all__ = [
     'CyclicalPatternCode',
     'RegimeDependency',
     'CyclicalPatternDetail',
+    'StrategyPatternConfig',  # Pattern strategy configuration
 
     # Refactored indicators
     'MovingAverage',

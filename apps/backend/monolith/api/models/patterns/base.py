@@ -264,7 +264,21 @@ class PatternInstance(BaseModel):
         indexes = [
             models.Index(fields=["symbol", "status", "breakout_ts"]),
             models.Index(fields=["pattern", "status"]),
+            models.Index(fields=["client", "symbol", "timeframe", "status"]),
         ]
+        constraints = [
+            # UniqueConstraint for deduplication: same client, pattern, symbol, timeframe, start_ts
+            # This ensures concurrent scans cannot create duplicate pattern instances
+            # nulls_distinct=False ensures NULL values are treated as equal (for system-wide patterns)
+            models.UniqueConstraint(
+                fields=["client", "pattern", "symbol", "timeframe", "start_ts"],
+                name="unique_pattern_instance",
+                violation_error_message="A pattern instance with these attributes already exists.",
+                nulls_distinct=False,  # Treat NULL as a distinct value for deduplication
+            )
+        ]
+        verbose_name = "Pattern Instance"
+        verbose_name_plural = "Pattern Instances"
 
     def __str__(self) -> str:  # pragma: no cover - readability helper
         return f"{self.pattern.pattern_code} @ {self.symbol.name} ({self.timeframe})"
@@ -348,7 +362,7 @@ class PatternAlert(BaseModel):
         on_delete=models.CASCADE,
         related_name="alerts",
     )
-    alert_ts = models.DateTimeField(auto_now_add=True)
+    alert_ts = models.DateTimeField()
     alert_type = models.CharField(max_length=16, choices=AlertType.choices)
     confidence = models.DecimalField(
         max_digits=5,
@@ -360,6 +374,11 @@ class PatternAlert(BaseModel):
 
     class Meta:
         ordering = ["-alert_ts"]
+        indexes = [
+            models.Index(fields=["instance", "alert_type", "alert_ts"]),
+        ]
+        verbose_name = "Pattern Alert"
+        verbose_name_plural = "Pattern Alerts"
 
     def __str__(self) -> str:  # pragma: no cover - readability helper
         return f"Alert {self.alert_type} for {self.instance_id}"

@@ -105,6 +105,33 @@ except ImportError as e:
     print(f"⚠️  Could not import chat views: {e}")
     CHAT_VIEWS_AVAILABLE = False
 
+# Import pattern detection engine views
+try:
+    from ..views.pattern_views import (
+        list_pattern_catalog,
+        get_pattern_detail,
+        list_pattern_instances,
+        get_pattern_instance,
+        list_pattern_alerts,
+        get_recent_confirms,
+        list_strategy_configs,
+        create_strategy_config,
+        manage_strategy_config,
+        get_active_configs_for_pattern,
+        trigger_pattern_scan,
+        process_pattern_to_plan,
+        pattern_dashboard,
+    )
+    PATTERN_VIEWS_AVAILABLE = True
+    print("✅ Pattern detection views imported successfully")
+except ImportError as e:
+    print(f"⚠️  Could not import pattern views: ImportError: {e}")
+    PATTERN_VIEWS_AVAILABLE = False
+except Exception as e:
+    # Unexpected exception - fail loudly
+    print(f"❌ Unexpected error importing pattern views: {type(e).__name__}: {e}")
+    raise
+
 
 # Fallback function for missing views
 def fallback_view(request):
@@ -365,6 +392,30 @@ if CHAT_VIEWS_AVAILABLE:
     print("✅ Chat views loaded: /api/chat/, /api/chat/status/, etc.")
 else:
     print("⚠️  Chat views not available")
+
+# ==========================================
+# PATTERN DETECTION ENGINE ROUTES
+# ==========================================
+# Pattern catalog, instances, alerts, and strategy configuration
+if PATTERN_VIEWS_AVAILABLE:
+    urlpatterns += [
+        path("patterns/catalog/", list_pattern_catalog, name="list_pattern_catalog"),
+        path("patterns/catalog/<str:pattern_code>/", get_pattern_detail, name="get_pattern_detail"),
+        path("patterns/instances/", list_pattern_instances, name="list_pattern_instances"),
+        path("patterns/instances/<int:instance_id>/", get_pattern_instance, name="get_pattern_instance"),
+        path("patterns/alerts/", list_pattern_alerts, name="list_pattern_alerts"),
+        path("patterns/alerts/recent-confirms/", get_recent_confirms, name="get_recent_confirms"),
+        path("patterns/configs/", list_strategy_configs, name="list_strategy_configs"),
+        path("patterns/configs/create/", create_strategy_config, name="create_strategy_config"),
+        path("patterns/configs/<int:config_id>/", manage_strategy_config, name="manage_strategy_config"),
+        path("patterns/configs/active-for-pattern/", get_active_configs_for_pattern, name="get_active_configs_for_pattern"),
+        path("patterns/scan/", trigger_pattern_scan, name="trigger_pattern_scan"),
+        path("patterns/to-plan/", process_pattern_to_plan, name="process_pattern_to_plan"),
+        path("patterns/dashboard/", pattern_dashboard, name="pattern_dashboard"),
+    ]
+    print("✅ Pattern detection views loaded: /api/patterns/catalog/, /api/patterns/instances/, etc.")
+else:
+    print("⚠️  Pattern detection views not available")
 
 # Debug info
 print("🎯 URLs loaded following project patterns!")
