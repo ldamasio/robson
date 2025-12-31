@@ -27,7 +27,6 @@ const PatternConfigForm = ({ catalog, editConfig, onSave, onCancel }) => {
     symbols: [],
     require_volume_confirmation: false,
     only_with_trend: false,
-    notes: '',
     is_active: true,
   });
 
@@ -74,7 +73,6 @@ const PatternConfigForm = ({ catalog, editConfig, onSave, onCancel }) => {
         symbols: editConfig.symbols || [],
         require_volume_confirmation: editConfig.require_volume_confirmation || false,
         only_with_trend: editConfig.only_with_trend || false,
-        notes: editConfig.notes || '',
         is_active: editConfig.is_active ?? true,
       });
     }
@@ -150,7 +148,6 @@ const PatternConfigForm = ({ catalog, editConfig, onSave, onCancel }) => {
         symbols: formData.symbols.map(s => s.toUpperCase().trim()),
         require_volume_confirmation: formData.require_volume_confirmation,
         only_with_trend: formData.only_with_trend,
-        notes: formData.notes,
         is_active: formData.is_active,
       };
 
@@ -419,19 +416,6 @@ const PatternConfigForm = ({ catalog, editConfig, onSave, onCancel }) => {
             <Form.Text className="text-muted">
               Common: {commonSymbols.join(', ')}
             </Form.Text>
-          </Form.Group>
-
-          {/* Notes */}
-          <Form.Group className="mb-3">
-            <Form.Label>Notes</Form.Label>
-            <Form.Control
-              as="textarea"
-              rows={3}
-              name="notes"
-              value={formData.notes}
-              onChange={handleChange}
-              placeholder="Optional notes about this configuration..."
-            />
           </Form.Group>
 
           {/* Action Buttons */}

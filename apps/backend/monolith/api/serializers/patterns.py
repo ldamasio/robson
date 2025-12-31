@@ -180,7 +180,6 @@ class StrategyPatternConfigSerializer(serializers.ModelSerializer):
             "symbols",
             "require_volume_confirmation",
             "only_with_trend",
-            "notes",
             "is_active",
         ]
 
@@ -204,7 +203,7 @@ class CreateStrategyPatternConfigSerializer(serializers.ModelSerializer):
             "symbols",
             "require_volume_confirmation",
             "only_with_trend",
-            "notes",
+            "is_active",
         ]
 
     def validate(self, data):
@@ -237,7 +236,6 @@ class UpdateStrategyPatternConfigSerializer(serializers.ModelSerializer):
             "symbols",
             "require_volume_confirmation",
             "only_with_trend",
-            "notes",
             "is_active",
         ]
 

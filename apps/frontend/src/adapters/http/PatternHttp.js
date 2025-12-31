@@ -42,6 +42,11 @@ export class PatternHttp extends PatternService {
       );
     }
 
+    // Handle 204 NO CONTENT responses (no body to parse)
+    if (response.status === 204) {
+      return null;
+    }
+
     return response.json();
   }
 
@@ -123,7 +128,7 @@ export class PatternHttp extends PatternService {
 
   /**
    * Create strategy pattern configuration.
-   * POST /api/patterns/configs/
+   * POST /api/patterns/configs/create/
    * @param {Object} configData
    * @param {number} configData.strategy - Strategy ID
    * @param {number} configData.pattern - Pattern ID
@@ -133,10 +138,9 @@ export class PatternHttp extends PatternService {
    * @param {string[]} configData.symbols - Symbols to scan
    * @param {boolean} configData.require_volume_confirmation - Require volume confirmation
    * @param {boolean} configData.only_with_trend - Only trade with trend
-   * @param {string} configData.notes - Optional notes
    */
   async createConfig(configData) {
-    return this._request('/api/patterns/configs/', {
+    return this._request('/api/patterns/configs/create/', {
       method: 'POST',
       body: JSON.stringify(configData),
     });
