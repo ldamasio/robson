@@ -744,4 +744,40 @@ docs/strategy/
 
 ---
 
-**Last Updated**: 2025-12-28
+## Patch Notes
+
+### 2025-12-31: Dashboard Endpoint Contract Stabilization
+
+**Bug**: The `/api/patterns/dashboard/` endpoint referenced a non-existent field `detected_at` in the PatternInstance query, causing HTTP 500 errors.
+
+**Root Cause**: PatternInstance inherits from BaseModel → TimestampMixin, which provides `created_at` and `updated_at` fields. The code incorrectly referenced `detected_at` which does not exist.
+
+**Fix**: Changed line 692 in `api/views/pattern_views.py`:
+```python
+# Before (BROKEN):
+recent_patterns = PatternInstance.objects.filter(detected_at__gte=cutoff)
+
+# After (FIXED):
+recent_patterns = PatternInstance.objects.filter(created_at__gte=cutoff)
+```
+
+**Contract Enforcement**: The dashboard now ALWAYS returns HTTP 200 with a stable schema, even with zero data:
+```json
+{
+  "period": "Last 24 hours",
+  "patterns": {"total_detected": 0, "by_status": {...}},
+  "alerts": {"total": 0, "by_type": {...}},
+  "configs": {"active_auto_entry": 0}
+}
+```
+
+**Impact**: UX-critical fix that unblocks the Opportunity Detector frontend dashboard. Ensures tenant-scoped queries remain intact while providing a zero-safe contract for empty datasets.
+
+**Tests Added**: Three tests in `api/tests/test_adr_0018.py` under `TestPatternDashboardContract`:
+1. `test_dashboard_returns_200_with_zero_data` - Verifies HTTP 200 and stable schema with no patterns
+2. `test_dashboard_returns_200_with_pattern_data` - Verifies correct counts with patterns
+3. `test_dashboard_preserves_period_type` - Verifies period field type stability
+
+---
+
+**Last Updated**: 2025-12-31

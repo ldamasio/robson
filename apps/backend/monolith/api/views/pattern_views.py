@@ -689,7 +689,7 @@ def pattern_dashboard(request):
         # Recent patterns (last 24 hours)
         cutoff = timezone.now() - timedelta(hours=24)
 
-        recent_patterns = PatternInstance.objects.filter(detected_at__gte=cutoff)
+        recent_patterns = PatternInstance.objects.filter(created_at__gte=cutoff)
         recent_alerts = PatternAlert.objects.filter(alert_ts__gte=cutoff)
 
         # Status breakdown

@@ -27,6 +27,7 @@ from api.models.patterns.base import (
     PatternAlert,
 )
 from api.models.trading import Symbol
+from clients.models import Client
 
 User = get_user_model()
 
@@ -435,3 +436,163 @@ class TestPatternAPISmoke:
         response = client.get("/api/patterns/alerts/")
 
         assert response.status_code == 200, f"Expected 200, got {response.status_code}"
+
+
+# ============================================================
+# SECTION E: DASHBOARD ENDPOINT CONTRACT TESTS
+# ============================================================
+
+
+@pytest.mark.django_db
+class TestPatternDashboardContract:
+    """
+    CRITICAL: Test that /api/patterns/dashboard/ maintains a stable contract.
+
+    The dashboard MUST ALWAYS return HTTP 200 with this exact shape:
+    {
+        "period": "Last 24 hours",
+        "patterns": {"total_detected": N, "by_status": {...}},
+        "alerts": {"total": N, "by_type": {...}},
+        "configs": {"active_auto_entry": N}
+    }
+
+    Even with ZERO data, all keys must be present with zeros.
+    """
+
+    def test_dashboard_returns_200_with_zero_data(self):
+        """
+        Test that dashboard returns HTTP 200 with stable schema when no patterns exist.
+        
+        This is UX-CRITICAL: the frontend Opportunity Detector depends on this
+        endpoint never returning 500/400 for empty datasets.
+        """
+        client = APIClient()
+
+        # Create user with client (tenant context)
+        test_client = Client.objects.create(name="Test Client", email="test@example.com")
+        user = User.objects.create_user(username="dashboard_user", password="testpass")
+        user.client = test_client
+        user.save()
+
+        client.force_authenticate(user=user)
+
+        # Ensure no pattern instances exist for this tenant
+        PatternInstance.objects.filter(client=test_client).delete()
+
+        # Call dashboard endpoint
+        response = client.get("/api/patterns/dashboard/")
+
+        # CRITICAL: Must return HTTP 200, never 500/400 for empty data
+        assert response.status_code == 200, f"Expected 200, got {response.status_code}"
+
+        data = response.json()
+
+        # Verify ALL top-level keys exist
+        assert "period" in data, "Response must include 'period' key"
+        assert "patterns" in data, "Response must include 'patterns' key"
+        assert "alerts" in data, "Response must include 'alerts' key"
+        assert "configs" in data, "Response must include 'configs' key"
+
+        # Verify zero counts when no data exists
+        assert data["patterns"]["total_detected"] == 0, "total_detected must be 0 with no patterns"
+        assert data["alerts"]["total"] == 0, "alerts.total must be 0 with no alerts"
+        assert data["configs"]["active_auto_entry"] == 0, "configs.active_auto_entry must be 0 with no configs"
+
+        # Verify breakdown objects exist (even if empty)
+        assert "by_status" in data["patterns"], "patterns.by_status must exist"
+        assert "by_type" in data["alerts"], "alerts.by_type must exist"
+
+    def test_dashboard_returns_200_with_pattern_data(self):
+        """
+        Test that dashboard returns correct counts when patterns exist.
+        """
+        client = APIClient()
+
+        # Create user with client
+        test_client = Client.objects.create(name="Test Client 2", email="test2@example.com")
+        user = User.objects.create_user(username="dashboard_user2", password="testpass")
+        user.client = test_client
+        user.save()
+
+        client.force_authenticate(user=user)
+
+        # Create test data
+        symbol, _ = Symbol.objects.get_or_create(
+            name="BTCUSDT",
+            defaults={"base_asset": "BTC", "quote_asset": "USDT", "client": None}
+        )
+        pattern, _ = PatternCatalog.objects.get_or_create(
+            pattern_code="HAMMER",
+            defaults={
+                "name": "Hammer",
+                "category": "CANDLESTICK",
+                "direction_bias": "BULLISH",
+                "client": None,
+            }
+        )
+
+        # Create a pattern instance for this tenant
+        PatternInstance.objects.create(
+            client=test_client,
+            symbol=symbol,
+            pattern=pattern,
+            timeframe="15m",
+            start_ts=datetime(2025, 12, 31, 10, 0, 0, tzinfo=zoneinfo.ZoneInfo("UTC")),
+            status="FORMING",
+            features={},
+        )
+
+        # Create another one
+        PatternInstance.objects.create(
+            client=test_client,
+            symbol=symbol,
+            pattern=pattern,
+            timeframe="1h",
+            start_ts=datetime(2025, 12, 31, 11, 0, 0, tzinfo=zoneinfo.ZoneInfo("UTC")),
+            status="CONFIRMED",
+            features={},
+        )
+
+        # Call dashboard endpoint
+        response = client.get("/api/patterns/dashboard/")
+
+        assert response.status_code == 200
+        data = response.json()
+
+        # Verify all keys exist
+        assert "period" in data
+        assert "patterns" in data
+        assert "alerts" in data
+        assert "configs" in data
+
+        # Verify counts (at least 2 patterns created in last 24h)
+        assert data["patterns"]["total_detected"] >= 2, \
+            f"Expected at least 2 patterns, got {data['patterns']['total_detected']}"
+
+        # Verify status breakdown
+        assert data["patterns"]["by_status"]["FORMING"] >= 1
+        assert data["patterns"]["by_status"]["CONFIRMED"] >= 1
+
+    def test_dashboard_preserves_period_type(self):
+        """
+        Test that the period field type is preserved (string).
+        
+        This ensures frontend contract stability.
+        """
+        client = APIClient()
+
+        test_client = Client.objects.create(name="Test Client 3", email="test3@example.com")
+        user = User.objects.create_user(username="dashboard_user3", password="testpass")
+        user.client = test_client
+        user.save()
+
+        client.force_authenticate(user=user)
+
+        response = client.get("/api/patterns/dashboard/")
+
+        assert response.status_code == 200
+        data = response.json()
+
+        # period must be a string
+        assert isinstance(data["period"], str), "period must be a string"
+        assert len(data["period"]) > 0, "period must not be empty"
