@@ -278,7 +278,7 @@ def validate_trading_intent(request, intent_id):
         intent = repo.get_by_intent_id(intent_id, client.id)
 
         # Validate using the validation framework
-        validation_framework = ValidationFramework(client_id=client.id)
+        validation_framework = ValidationFramework()
         report = validation_framework.validate(intent)
 
         # Update intent with validation result
@@ -505,7 +505,7 @@ def pattern_trigger(request):
         # Auto-validate if requested
         validation_result = None
         if data.get("auto_validate", True):
-            validation_framework = ValidationFramework(client_id=client.id)
+            validation_framework = ValidationFramework()
             report = validation_framework.validate(intent)
 
             intent.validation_result = report.to_dict()
