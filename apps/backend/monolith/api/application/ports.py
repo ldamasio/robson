@@ -84,3 +84,43 @@ class UnitOfWork(Protocol):
     def commit(self) -> None:
         """Commit the current transaction."""
         ...
+
+
+class SymbolRepository(Protocol):
+    """Port for symbol data access."""
+
+    def get_by_id(self, symbol_id: int, client_id: int) -> object:
+        """Get symbol by ID for a specific client."""
+        ...
+
+
+class StrategyRepository(Protocol):
+    """Port for strategy data access."""
+
+    def get_by_id(self, strategy_id: int, client_id: int) -> object:
+        """Get strategy by ID for a specific client."""
+        ...
+
+
+class TradingIntentRepository(Protocol):
+    """Port for trading intent persistence."""
+
+    def save(self, intent: dict) -> object:
+        """Save a trading intent and return the persisted object."""
+        ...
+
+    def get_by_intent_id(self, intent_id: str, client_id: int) -> object:
+        """Get trading intent by intent_id for a specific client."""
+        ...
+
+    def list_by_client(
+        self,
+        client_id: int,
+        status: Optional[str] = None,
+        strategy_id: Optional[int] = None,
+        symbol_id: Optional[int] = None,
+        limit: int = 100,
+        offset: int = 0
+    ) -> Iterable[object]:
+        """List trading intents for a client with optional filters."""
+        ...

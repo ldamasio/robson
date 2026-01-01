@@ -524,8 +524,13 @@ class TradingIntent(BaseModel):
     actual_fill_quantity = models.DecimalField(max_digits=20, decimal_places=8, null=True, blank=True)
 
     # Risk calculations
+    capital = models.DecimalField(max_digits=20, decimal_places=8, default=Decimal("0"), help_text="Capital allocated for this intent")
     risk_amount = models.DecimalField(max_digits=20, decimal_places=8, default=Decimal("0"))
     risk_percent = models.DecimalField(max_digits=10, decimal_places=2, default=Decimal("0"))
+
+    # Agentic workflow results (PLAN → VALIDATE → EXECUTE)
+    validation_result = models.JSONField(null=True, blank=True, help_text="ValidationReport.to_dict() result")
+    execution_result = models.JSONField(null=True, blank=True, help_text="ExecutionResult.to_dict() result")
 
     # Event correlation (for distributed tracing)
     correlation_id = models.CharField(max_length=255, blank=True, null=True, db_index=True)

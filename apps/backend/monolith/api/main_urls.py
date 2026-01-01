@@ -57,6 +57,23 @@ except ImportError as e:
     print(f"⚠️  Could not import trading views: {e}")
     TRADING_VIEWS_AVAILABLE = False
 
+# Import trading intent views for agentic workflow
+try:
+    from .views.trading_intent_views import (
+        create_trading_intent,
+        get_trading_intent,
+        list_trading_intents,
+        validate_trading_intent,
+        execute_trading_intent,
+    )
+    TRADING_INTENT_VIEWS_AVAILABLE = True
+    print("✅ Trading intent views imported successfully")
+except Exception as e:
+    import traceback
+    print(f"⚠️  Could not import trading intent views: {e}")
+    traceback.print_exc()
+    TRADING_INTENT_VIEWS_AVAILABLE = False
+
 # Main API URL patterns
 urlpatterns = [
     # ==========================================
@@ -192,6 +209,18 @@ urlpatterns = [
     path('portfolio/btc/history/', views.portfolio_btc.portfolio_btc_history, name='portfolio_btc_history'),
     path('portfolio/deposits-withdrawals/', views.portfolio_btc.deposits_withdrawals, name='deposits_withdrawals'),
 ]
+
+# ==========================================
+# TRADING INTENTS - AGENTIC WORKFLOW API
+# ==========================================
+if TRADING_INTENT_VIEWS_AVAILABLE:
+    urlpatterns += [
+        path('trading-intents/create/', create_trading_intent, name='create_trading_intent'),
+        path('trading-intents/', list_trading_intents, name='list_trading_intents'),
+        path('trading-intents/<str:intent_id>/', get_trading_intent, name='get_trading_intent'),
+        path('trading-intents/<str:intent_id>/validate/', validate_trading_intent, name='validate_trading_intent'),
+        path('trading-intents/<str:intent_id>/execute/', execute_trading_intent, name='execute_trading_intent'),
+    ]
 
 # Debug info
 print(f"🔍 Django URLs loaded. Auth views available: {AUTH_VIEWS_AVAILABLE}")

@@ -517,3 +517,145 @@ class FixedClock(ClockPort):
     def now(self) -> datetime:
         """Return the fixed datetime."""
         return self._fixed
+
+
+# ==========================================
+# TRADING INTENT ADAPTERS (NEW)
+# ==========================================
+
+
+class DjangoSymbolRepository:
+    """
+    Symbol repository backed by Django ORM.
+
+    Multi-tenant aware - filters by client_id.
+    """
+
+    def __init__(self):
+        from api.models import Symbol as DjangoSymbol
+        self._Symbol = DjangoSymbol
+
+    def get_by_id(self, symbol_id: int, client_id: int) -> object:
+        """Get symbol by ID for a specific client."""
+        try:
+            return self._Symbol.objects.get(id=symbol_id, client_id=client_id)
+        except self._Symbol.DoesNotExist:
+            raise ValueError(f"Symbol with id={symbol_id} not found for client {client_id}")
+
+
+class DjangoStrategyRepository:
+    """
+    Strategy repository backed by Django ORM.
+
+    Multi-tenant aware - filters by client_id.
+    """
+
+    def __init__(self):
+        from api.models import Strategy as DjangoStrategy
+        self._Strategy = DjangoStrategy
+
+    def get_by_id(self, strategy_id: int, client_id: int) -> object:
+        """Get strategy by ID for a specific client."""
+        try:
+            return self._Strategy.objects.get(id=strategy_id, client_id=client_id)
+        except self._Strategy.DoesNotExist:
+            raise ValueError(f"Strategy with id={strategy_id} not found for client {client_id}")
+
+
+class DjangoTradingIntentRepository:
+    """
+    Trading intent repository backed by Django ORM.
+
+    Multi-tenant aware - filters by client_id.
+    Implements CRUD operations for TradingIntent model.
+    """
+
+    def __init__(self):
+        from api.models import TradingIntent as DjangoTradingIntent
+        self._TradingIntent = DjangoTradingIntent
+
+    def save(self, intent: dict) -> object:
+        """
+        Save a trading intent and return the persisted object.
+
+        Args:
+            intent: Dictionary with TradingIntent fields
+
+        Returns:
+            Persisted TradingIntent model instance
+        """
+        # Check if updating existing intent
+        intent_id = intent.get("intent_id")
+        if intent_id:
+            try:
+                existing = self._TradingIntent.objects.get(intent_id=intent_id)
+                # Update existing
+                for key, value in intent.items():
+                    if hasattr(existing, key):
+                        setattr(existing, key, value)
+                existing.save()
+                return existing
+            except self._TradingIntent.DoesNotExist:
+                pass  # Create new below
+
+        # Create new intent
+        return self._TradingIntent.objects.create(**intent)
+
+    def get_by_intent_id(self, intent_id: str, client_id: int) -> object:
+        """
+        Get trading intent by intent_id for a specific client.
+
+        Args:
+            intent_id: Unique intent identifier
+            client_id: Client ID for multi-tenant filtering
+
+        Returns:
+            TradingIntent model instance
+
+        Raises:
+            ValueError: If intent not found
+        """
+        try:
+            return self._TradingIntent.objects.select_related(
+                "symbol", "strategy", "order"
+            ).get(intent_id=intent_id, client_id=client_id)
+        except self._TradingIntent.DoesNotExist:
+            raise ValueError(f"TradingIntent with intent_id={intent_id} not found for client {client_id}")
+
+    def list_by_client(
+        self,
+        client_id: int,
+        status: Optional[str] = None,
+        strategy_id: Optional[int] = None,
+        symbol_id: Optional[int] = None,
+        limit: int = 100,
+        offset: int = 0
+    ) -> Iterable[object]:
+        """
+        List trading intents for a client with optional filters.
+
+        Args:
+            client_id: Client ID for multi-tenant filtering
+            status: Optional status filter
+            strategy_id: Optional strategy filter
+            symbol_id: Optional symbol filter
+            limit: Maximum number of results
+            offset: Offset for pagination
+
+        Returns:
+            List of TradingIntent model instances
+        """
+        queryset = self._TradingIntent.objects.filter(client_id=client_id)
+
+        if status:
+            queryset = queryset.filter(status=status)
+        if strategy_id:
+            queryset = queryset.filter(strategy_id=strategy_id)
+        if symbol_id:
+            queryset = queryset.filter(symbol_id=symbol_id)
+
+        queryset = queryset.select_related("symbol", "strategy", "order")
+        queryset = queryset.order_by("-created_at")
+        queryset = queryset[offset:offset + limit]
+
+        return list(queryset)
