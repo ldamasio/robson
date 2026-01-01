@@ -261,6 +261,101 @@
 
 ---
 
+## Phase 5 Validation Evidence
+
+**Date:** 2026-01-01
+**Command:** `python manage.py validate_phase5_mvp --client-id 1`
+
+### Validation Summary
+
+The Phase 5 MVP implementation has been validated with automated tests covering all critical functionality:
+
+```
+VALIDATION SUMMARY
+================================================================================
+
+Total tests: 13
+  ✅ PASSED:  10
+  ❌ FAILED:  0
+  ⏭️  SKIPPED: 3
+
+✅ VALIDATION PASSED
+
+All critical tests passed. Phase 5 MVP is validated.
+```
+
+### Validated Capabilities
+
+1. **Pattern Trigger Endpoint** (`POST /api/pattern-triggers/`)
+   - ✅ Creates TradingIntent from pattern detection events
+   - ✅ Auto-validates when `auto_validate=true`
+   - ✅ Returns comprehensive response with intent_id and validation_result
+
+2. **Idempotency Protection**
+   - ✅ Duplicate `pattern_event_id` returns `ALREADY_PROCESSED`
+   - ✅ No duplicate intents created
+   - ✅ Original intent_id returned on duplicate requests
+
+3. **Safety Guardrails**
+   - ✅ LIVE auto-execution blocked (returns 400 error)
+   - ✅ Dry-run auto-execution allowed
+   - ✅ Pattern metadata stored for audit trail
+
+4. **Data Integrity**
+   - ✅ Decimal precision clamped to model constraints
+   - ✅ All pattern fields populated (pattern_code, pattern_source, pattern_event_id)
+   - ✅ PatternTrigger model records all trigger events
+
+### How to Run Locally
+
+To validate Phase 5 MVP on your local environment:
+
+```bash
+# Navigate to Django project directory
+cd apps/backend/monolith
+
+# Activate virtual environment
+source .venv/bin/activate
+
+# Run validation command
+python manage.py validate_phase5_mvp --client-id 1
+
+# Expected output: All tests pass (10 PASSED, 0 FAILED)
+```
+
+**Prerequisites:**
+- PostgreSQL database with test client (ID=1)
+- Test symbol: BTCUSDT
+- Test strategy configured
+- Django migrations applied
+
+**Test Data Setup:**
+The validation command automatically creates test data using the `seed_production_data` command.
+If client_id 1 doesn't exist, create it first or adjust the `--client-id` parameter.
+
+### Test Coverage (Phase 6)
+
+Comprehensive automated tests added in Phase 6:
+
+**File:** `api/tests/test_pattern_triggers_phase6.py`
+
+**Test Classes:**
+1. `TestPatternTriggerHappyPath` - Successful pattern trigger creation
+2. `TestPatternTriggerIdempotency` - Duplicate pattern_event_id handling
+3. `TestPatternTriggerLiveExecutionBlock` - LIVE auto-execution safety
+4. `TestDecimalQuantizationRegression` - Decimal precision regression tests
+
+**Run Tests:**
+```bash
+cd apps/backend/monolith
+source .venv/bin/activate
+pytest api/tests/test_pattern_triggers_phase6.py -v
+```
+
+**Expected Result:** All tests pass (no failures)
+
+---
+
 **Last Updated:** 2026-01-01
-**Phase:** 4 - Frontend Integration & UX
+**Phase:** 5 - Pattern Auto-Trigger (MVP Validated ✅)
 **Status:** Ready for testing

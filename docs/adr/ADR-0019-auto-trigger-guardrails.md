@@ -1,7 +1,8 @@
 # ADR-0019: Auto-Trigger Guardrails for Pattern-Based Trading
 
-**Status:** Proposed (MVP Implementation in Progress)
+**Status:** Accepted (Phase 5 MVP Validated ✅)
 **Date:** 2026-01-01
+**Validation Date:** 2026-01-01
 **Context:** Phase 5 - Pattern Auto-Trigger Implementation
 **Related:** [ADR-0007](ADR-0007-robson-is-risk-assistant-not-autotrader.md), [ADR-0018](ADR-0018-pattern-detection-engine.md)
 
@@ -18,6 +19,37 @@
 
 This ADR documents the full guardrail vision. Items marked as **TODO (post-MVP)**
 are deferred to future phases after the MVP is proven safe and effective.
+
+### Phase 5 Validation Evidence
+
+**Validation Command:** `python manage.py validate_phase5_mvp --client-id 1`
+
+**Validation Results (2026-01-01):**
+```
+VALIDATION SUMMARY
+================================================================================
+
+Total tests: 13
+  ✅ PASSED:  10
+  ❌ FAILED:  0
+  ⏭️  SKIPPED: 3
+
+✅ VALIDATION PASSED
+
+All critical tests passed. Phase 5 MVP is validated.
+```
+
+**Key Tests Verified:**
+- ✅ Pattern trigger endpoint creates trading intent
+- ✅ Idempotency protection (duplicate pattern_event_id → ALREADY_PROCESSED)
+- ✅ Auto-validation works correctly (ValidationFramework integration)
+- ✅ Pattern metadata stored in TradingIntent (pattern_code, pattern_source, pattern_event_id)
+- ✅ PatternTrigger model records all triggers for audit
+- ✅ Decimal precision clamping (risk_percent, entry_price, stop_price)
+
+**Test Suite:** See `api/tests/test_pattern_triggers_phase6.py` for comprehensive Phase 6 test coverage.
+
+**Commit:** See git log for validation command implementation (commit: `176be475`)
 
 ---
 
