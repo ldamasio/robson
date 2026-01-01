@@ -19,9 +19,10 @@ urlpatterns = [
     # Client routes (if any)
     path('clients/', include('clients.urls')) if hasattr(settings, 'clients') else path('', lambda r: None),
 
-    # Observability endpoints
-    path('metrics/', include('django_prometheus.urls')),       # Prometheus metrics (internal only)
-    path('health/', include('health_check.urls')),             # Detailed diagnostics (internal only)
+    # Observability endpoints - REMOVED from URL routing for security
+    # Internal monitoring should use Pod IP directly or kubectl port-forward
+    # path('metrics/', include('django_prometheus.urls')),       # Prometheus metrics (internal only)
+    # path('health/', include('health_check.urls')),             # Detailed diagnostics (internal only)
 ]
 
 # Add Kubernetes-compatible health endpoints

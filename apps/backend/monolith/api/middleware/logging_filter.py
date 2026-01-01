@@ -17,6 +17,12 @@ def get_correlation_id():
     return getattr(_thread_locals, 'correlation_id', None)
 
 
+def clear_correlation_id():
+    """Clear correlation ID from thread-local storage."""
+    if hasattr(_thread_locals, 'correlation_id'):
+        delattr(_thread_locals, 'correlation_id')
+
+
 class CorrelationIDFilter(logging.Filter):
     """
     Logging filter that adds correlation_id to log records.

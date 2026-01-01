@@ -15,23 +15,7 @@ spec:
   - host: api.robson.rbx.ia.br
     http:
       paths:
-      # Block internal endpoints - return 404 via non-existent service
-      # Kubernetes Ingress processes paths in order, most specific first
-      - pathType: Prefix
-        path: "/metrics"
-        backend:
-          service:
-            name: blocked-endpoint  # Non-existent service = 503/404
-            port:
-              number: 1
-      - pathType: Prefix
-        path: "/health/"
-        backend:
-          service:
-            name: blocked-endpoint  # Non-existent service = 503/404
-            port:
-              number: 1
-      # Public endpoints (allowed)
+      # Public endpoints
       - pathType: Prefix
         path: "/static"
         backend:

@@ -6,7 +6,7 @@ propagates it through logs and returns it in response headers.
 """
 import uuid
 from django.utils.deprecation import MiddlewareMixin
-from .logging_filter import set_correlation_id
+from .logging_filter import set_correlation_id, clear_correlation_id
 
 
 class CorrelationIDMiddleware(MiddlewareMixin):
@@ -31,8 +31,17 @@ class CorrelationIDMiddleware(MiddlewareMixin):
         set_correlation_id(request_id)
 
     def process_response(self, request, response):
-        """Add correlation ID to response headers."""
-        if hasattr(request, 'correlation_id'):
-            response['X-Request-ID'] = request.correlation_id
+        """Add correlation ID to response headers and clear thread-local."""
+        try:
+            if hasattr(request, 'correlation_id'):
+                response['X-Request-ID'] = request.correlation_id
+        finally:
+            # Always clear thread-local to prevent leakage between requests
+            clear_correlation_id()
 
         return response
+
+    def process_exception(self, request, exception):
+        """Clear thread-local on exception to prevent leakage."""
+        clear_correlation_id()
+        return None  # Let Django handle the exception normally
