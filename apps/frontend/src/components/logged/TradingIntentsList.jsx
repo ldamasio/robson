@@ -1,4 +1,4 @@
-import React, { useState, useEffect, useContext } from 'react';
+import React, { useContext } from 'react';
 import Card from 'react-bootstrap/Card';
 import Row from 'react-bootstrap/Row';
 import Col from 'react-bootstrap/Col';
@@ -9,6 +9,7 @@ import Placeholder from 'react-bootstrap/Placeholder';
 import Alert from 'react-bootstrap/Alert';
 import AuthContext from '../../context/AuthContext';
 import { useNavigate } from 'react-router-dom';
+import { useTradingIntentsList } from '../../hooks/useTradingIntentsList';
 import PropTypes from 'prop-types';
 
 /**
@@ -17,69 +18,26 @@ import PropTypes from 'prop-types';
  * Shows cards for recent PENDING and VALIDATED trading intents with action buttons.
  *
  * @param {Object} props
- * @param {Function} props.onIntentCreated - Callback when a new intent is created
  * @param {string} props.highlightIntentId - Intent ID to highlight (flash animation)
  */
-function TradingIntentsList({ onIntentCreated, highlightIntentId }) {
+function TradingIntentsList({ highlightIntentId }) {
   const { authTokens } = useContext(AuthContext);
   const navigate = useNavigate();
 
-  const [intents, setIntents] = useState([]);
-  const [isLoading, setIsLoading] = useState(true);
-  const [error, setError] = useState(null);
-  const [autoRefresh, setAutoRefresh] = useState(true);
-
-  // Fetch trading intents
-  const fetchIntents = async () => {
-    if (!authTokens?.access) return;
-
-    try {
-      setError(null);
-      const response = await fetch(
-        `${import.meta.env.VITE_API_BASE_URL}/api/trading-intents/?limit=10&status=PENDING&status=VALIDATED`,
-        {
-          headers: {
-            'Content-Type': 'application/json',
-            Authorization: `Bearer ${authTokens.access}`,
-          },
-        }
-      );
-
-      if (!response.ok) {
-        throw new Error('Failed to fetch trading intents');
-      }
-
-      const data = await response.json();
-      setIntents(data.results || data);
-    } catch (err) {
-      console.error('Failed to fetch trading intents:', err);
-      setError(err.message);
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  // Initial fetch and auto-refresh
-  useEffect(() => {
-    fetchIntents();
-
-    let interval;
-    if (autoRefresh) {
-      interval = setInterval(fetchIntents, 30000); // Refresh every 30s
-    }
-
-    return () => {
-      if (interval) clearInterval(interval);
-    };
-  }, [authTokens, autoRefresh]);
-
-  // Handle intent created callback
-  useEffect(() => {
-    if (highlightIntentId) {
-      // Refresh to show the new intent
-      fetchIntents();
-    }
-  }, [highlightIntentId]);
+  const {
+    intents,
+    isLoading,
+    error,
+    refetch,
+    autoRefreshEnabled,
+    toggleAutoRefresh,
+  } = useTradingIntentsList({
+    authToken: authTokens?.access,
+    statuses: ['PENDING', 'VALIDATED'],
+    limit: 10,
+    enableAutoRefresh: true,
+    refreshInterval: 30000,
+  });
 
   // Handle view details
   const handleViewDetails = (intentId) => {
@@ -102,6 +60,22 @@ function TradingIntentsList({ onIntentCreated, highlightIntentId }) {
       default:
         return 'secondary';
     }
+  };
+
+  // Format date safely
+  const formatDate = (dateString) => {
+    if (!dateString) return 'Unknown';
+    try {
+      return new Date(dateString).toLocaleString();
+    } catch {
+      return 'Invalid date';
+    }
+  };
+
+  // Get safe intent ID display
+  const getIntentIdDisplay = (intent) => {
+    if (!intent?.id) return 'Unknown ID';
+    return `${intent.id.substring(0, 8)}...`;
   };
 
   // Render loading skeleton
@@ -132,8 +106,8 @@ function TradingIntentsList({ onIntentCreated, highlightIntentId }) {
         Create your first trading plan to get started. It will be validated against
         your account constraints before execution.
       </p>
-      <Button variant="primary" onClick={() => navigate('/dashboard')}>
-        Create Your First Plan
+      <Button variant="primary" onClick={() => document.getElementById('start-new-operation-btn')?.scrollIntoView({ behavior: 'smooth' })}>
+        Go to Start New Operation
       </Button>
     </Alert>
   );
@@ -151,14 +125,14 @@ function TradingIntentsList({ onIntentCreated, highlightIntentId }) {
       >
         <Card.Header className="d-flex justify-content-between align-items-start">
           <div>
-            <small className="text-muted">ID: {intent.id?.substring(0, 8)}...</small>
+            <small className="text-muted">ID: {getIntentIdDisplay(intent)}</small>
             <br />
             <Badge bg={getStatusVariant(intent.status)} className="mt-1">
               {intent.status}
             </Badge>
           </div>
           <small className="text-muted">
-            {new Date(intent.created_at).toLocaleString()}
+            {formatDate(intent.created_at)}
           </small>
         </Card.Header>
 
@@ -191,7 +165,7 @@ function TradingIntentsList({ onIntentCreated, highlightIntentId }) {
             onClick={() => handleViewDetails(intent.id)}
             className="flex-grow-1"
           >
-            View Details
+            Open
           </Button>
           {intent.status === 'PENDING' && (
             <Button
@@ -199,7 +173,7 @@ function TradingIntentsList({ onIntentCreated, highlightIntentId }) {
               size="sm"
               onClick={() => handleViewDetails(intent.id)}
             >
-              Validate
+              Validate →
             </Button>
           )}
           {intent.status === 'VALIDATED' && (
@@ -208,7 +182,7 @@ function TradingIntentsList({ onIntentCreated, highlightIntentId }) {
               size="sm"
               onClick={() => handleViewDetails(intent.id)}
             >
-              Execute
+              Execute →
             </Button>
           )}
         </Card.Footer>
@@ -224,7 +198,7 @@ function TradingIntentsList({ onIntentCreated, highlightIntentId }) {
           <Button
             variant="outline-secondary"
             size="sm"
-            onClick={fetchIntents}
+            onClick={refetch}
             disabled={isLoading}
           >
             {isLoading ? (
@@ -234,17 +208,17 @@ function TradingIntentsList({ onIntentCreated, highlightIntentId }) {
             )}
           </Button>
           <Button
-            variant={autoRefresh ? 'primary' : 'outline-primary'}
+            variant={autoRefreshEnabled ? 'primary' : 'outline-primary'}
             size="sm"
-            onClick={() => setAutoRefresh(!autoRefresh)}
+            onClick={toggleAutoRefresh}
           >
-            {autoRefresh ? 'Auto-refresh On' : 'Auto-refresh Off'}
+            {autoRefreshEnabled ? 'Auto-refresh On' : 'Auto-refresh Off'}
           </Button>
         </div>
       </div>
 
       {error && (
-        <Alert variant="danger" dismissible onClose={() => setError(null)}>
+        <Alert variant="danger" dismissible onClose={() => {}}>
           Failed to load trading plans: {error}
         </Alert>
       )}
@@ -270,7 +244,6 @@ function TradingIntentsList({ onIntentCreated, highlightIntentId }) {
 }
 
 TradingIntentsList.propTypes = {
-  onIntentCreated: PropTypes.func,
   highlightIntentId: PropTypes.string,
 };
 
