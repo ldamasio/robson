@@ -1,0 +1,313 @@
+You are working inside the Robson monorepo (AI-first cryptocurrency trading platform).
+
+MISSION
+Integrate and polish the complete frontend user journey for the agentic workflow (PLAN → VALIDATE → EXECUTE).
+Connect StartNewOperationModal → TradingIntentStatus → Validation/Execution actions into a seamless UX.
+
+IMPORTANT CONTEXT
+- Phase 1 (Backend API): REST endpoints implemented
+- Phase 2 (Frontend Modal): StartNewOperationModal creates TradingIntent
+- Phase 3 (Status Component): TradingIntentStatus displays lifecycle
+- This phase: Connect all pieces + add polish (notifications, error recovery, user guidance)
+- Frontend tech: React 18 + Vite + Bootstrap + React-Toastify (or similar)
+
+CONSTRAINTS
+- Do NOT break existing functionality (Dashboard, Operations, other features)
+- Follow existing UI patterns and styling
+- Mobile-responsive design required
+- Clear user feedback for all actions (toasts, loading states, errors)
+- Graceful error recovery (retry buttons, helpful messages)
+- Accessibility (keyboard navigation, ARIA labels)
+
+DELIVERABLES
+1) Improved Dashboard with integrated workflow
+2) Toast/notification system for user feedback
+3) Error boundary for graceful error handling
+4) Loading states and skeleton screens
+5) User guidance (tooltips, help text, onboarding hints)
+6) Keyboard shortcuts (optional)
+7) E2E test script
+
+EXECUTION PLAN (follow exactly)
+
+A) ADD NOTIFICATION SYSTEM (apps/frontend/src/utils/notifications.js + App.jsx)
+   Use react-toastify or similar library
+
+   Install: npm install react-toastify
+
+   Setup in App.jsx:
+   import { ToastContainer } from 'react-toastify';
+   import 'react-toastify/dist/ReactToastify.css';
+
+   Add <ToastContainer position="top-right" autoClose={5000} />
+
+   Create helper utilities:
+   - showSuccess(message): Green toast with checkmark
+   - showError(message): Red toast with error icon
+   - showInfo(message): Blue toast with info icon
+   - showWarning(message): Yellow toast with warning icon
+
+   Examples:
+   - showSuccess("Trading plan created! Review it below.")
+   - showError("Validation failed: Insufficient balance.")
+   - showWarning("Dry-run mode: No real orders will be placed.")
+
+B) ENHANCE DASHBOARD INTEGRATION (apps/frontend/src/components/logged/Dashboard.jsx)
+   Add new section: "Trading Intents" (above or below "Active Operations")
+
+   1) Intent List Component:
+      - Fetch recent intents: GET /api/trading-intents/?limit=10&status=PENDING,VALIDATED
+      - Show cards (not just table):
+        - Card header: Intent ID + Status badge + Timestamp
+        - Card body: Symbol, Strategy, Side, Entry/Stop prices
+        - Card footer: Action buttons (Validate, Execute, View Details)
+      - Refresh button + auto-refresh every 30 seconds
+      - "Show All" link → /trading-intents page (future)
+
+   2) Success Flow from Modal:
+      When StartNewOperationModal succeeds:
+      - Show success toast: "Plan created successfully!"
+      - Auto-scroll to Trading Intents section
+      - Highlight the new intent (flash animation)
+      - Expand TradingIntentStatus for the new intent
+
+   3) Empty State:
+      If no intents exist:
+      - Show empty state illustration + message
+      - "Create your first trading plan" button → opens StartNewOperationModal
+
+C) ADD VALIDATION/EXECUTION HANDLERS (Dashboard.jsx)
+   Implement callbacks for TradingIntentStatus component
+
+   async function handleValidateIntent(intentId) {
+     try {
+       setValidatingIntent(intentId);
+       const response = await fetch(`/api/trading-intents/${intentId}/validate/`, {
+         method: 'POST',
+         headers: { 'Authorization': `Bearer ${authTokens.access}` },
+       });
+
+       if (!response.ok) throw new Error('Validation failed');
+
+       const result = await response.json();
+
+       if (result.status === 'PASS') {
+         showSuccess('Validation passed! Ready to execute.');
+       } else {
+         showError('Validation failed. Check the details below.');
+       }
+
+       // Trigger intent refresh
+       refetchIntents();
+     } catch (error) {
+       showError(`Validation error: ${error.message}`);
+     } finally {
+       setValidatingIntent(null);
+     }
+   }
+
+   async function handleExecuteIntent(intentId, mode = 'dry-run') {
+     // Confirm if mode === 'live'
+     if (mode === 'live') {
+       const confirmed = window.confirm(
+         'You are about to execute a LIVE trade with real money. This action cannot be undone. Continue?'
+       );
+       if (!confirmed) return;
+     }
+
+     try {
+       setExecutingIntent(intentId);
+       const response = await fetch(`/api/trading-intents/${intentId}/execute/?mode=${mode}`, {
+         method: 'POST',
+         headers: { 'Authorization': `Bearer ${authTokens.access}` },
+       });
+
+       if (!response.ok) throw new Error('Execution failed');
+
+       const result = await response.json();
+
+       if (result.status === 'SUCCESS') {
+         if (mode === 'live') {
+           showSuccess('Live execution successful! Orders placed on Binance.');
+         } else {
+           showInfo('Dry-run completed. No real orders placed.');
+         }
+       } else {
+         showError('Execution failed. Check the details below.');
+       }
+
+       refetchIntents();
+     } catch (error) {
+       showError(`Execution error: ${error.message}`);
+     } finally {
+       setExecutingIntent(null);
+     }
+   }
+
+   Pass to TradingIntentStatus:
+   <TradingIntentStatus
+     intentId={intent.intent_id}
+     onValidate={() => handleValidateIntent(intent.intent_id)}
+     onExecute={(mode) => handleExecuteIntent(intent.intent_id, mode)}
+   />
+
+D) ADD ERROR BOUNDARY (apps/frontend/src/components/ErrorBoundary.jsx)
+   Catch React errors and show user-friendly message
+
+   class ErrorBoundary extends React.Component {
+     state = { hasError: false, error: null };
+
+     static getDerivedStateFromError(error) {
+       return { hasError: true, error };
+     }
+
+     componentDidCatch(error, errorInfo) {
+       console.error('Error caught by boundary:', error, errorInfo);
+       // Optional: send to error tracking service (Sentry, etc.)
+     }
+
+     render() {
+       if (this.state.hasError) {
+         return (
+           <div className="alert alert-danger">
+             <h4>Something went wrong</h4>
+             <p>{this.state.error?.message}</p>
+             <button onClick={() => window.location.reload()}>Reload Page</button>
+           </div>
+         );
+       }
+
+       return this.props.children;
+     }
+   }
+
+   Wrap Dashboard:
+   <ErrorBoundary>
+     <Dashboard />
+   </ErrorBoundary>
+
+E) ADD LOADING STATES AND SKELETONS
+   Use Bootstrap Spinner or custom skeleton component
+
+   1) Intent List Loading:
+      While fetching intents, show skeleton cards:
+      <Card>
+        <Card.Body>
+          <Placeholder as="p" animation="wave">
+            <Placeholder xs={6} />
+          </Placeholder>
+        </Card.Body>
+      </Card>
+
+   2) Status Component Loading:
+      Show spinner while fetching intent details
+
+   3) Button Loading States:
+      Validate button: "Validating..." + spinner
+      Execute button: "Executing..." + spinner
+
+F) ADD USER GUIDANCE
+   1) Tooltips (use react-bootstrap Tooltip):
+      - Hover over "Entry Price" → "The price at which you want to enter the position"
+      - Hover over "Stop Price" → "Technical invalidation level (2nd support for BUY)"
+      - Hover over "Dry-Run" → "Simulates execution without placing real orders"
+
+   2) Help Icons:
+      - Add (?) icon next to complex fields
+      - Click opens popover with detailed explanation
+
+   3) First-Time Onboarding (optional):
+      - Detect if user has never created an intent
+      - Show guided tour (use react-joyride or similar)
+      - Highlight: "Start New Operation" → Fill form → Validate → Execute
+
+   4) Status Explanations:
+      - PENDING: "Waiting for validation. Click 'Validate Now' to proceed."
+      - VALIDATED: "Ready for execution. Choose 'Dry-Run' to test or 'Live' for real trade."
+      - EXECUTING: "Executing your trade on Binance..."
+      - EXECUTED: "Trade executed successfully!"
+      - FAILED: "Execution failed. Check error details below."
+
+G) KEYBOARD SHORTCUTS (optional, nice-to-have)
+   Use react-hotkeys-hook
+
+   - Ctrl+N: Open StartNewOperationModal
+   - Ctrl+R: Refresh intent list
+   - Esc: Close modal
+
+   Add shortcuts hint in footer or help menu
+
+H) RESPONSIVE DESIGN POLISH
+   1) Mobile View:
+      - Intent cards stack vertically
+      - Action buttons full-width on mobile
+      - Modal fills screen on mobile (Bootstrap modal-fullscreen-sm-down)
+
+   2) Tablet View:
+      - 2 columns for intent cards
+
+   3) Desktop View:
+      - 3 columns for intent cards
+      - Modal centered, max-width 600px
+
+I) CREATE E2E TEST SCRIPT (docs/testing/e2e-agentic-workflow.md)
+   Manual testing checklist:
+
+   HAPPY PATH:
+   1. Login to Dashboard
+   2. Click "Start New Operation"
+   3. Select Symbol: BTCUSDC
+   4. Select Strategy: "All In"
+   5. Select Side: BUY
+   6. Enter Entry Price: 95000
+   7. Enter Stop Price: 93500
+   8. Enter Capital: 100
+   9. Click "Create Plan"
+   10. Verify: Success toast shown
+   11. Verify: Intent appears in "Trading Intents" section with PENDING status
+   12. Click "Validate Now" on the intent
+   13. Verify: Validation section expands, guards shown (PASS/FAIL)
+   14. If PASS: Click "Execute Now" → Select "Dry-Run"
+   15. Verify: Execution section shows simulated results
+   16. Verify: Intent status changes to EXECUTED
+
+   ERROR PATH:
+   1. Create intent with invalid data (entry = stop)
+   2. Verify: Client-side validation error shown
+   3. Create intent with insufficient capital
+   4. Verify: Validation guard fails (balance check)
+   5. Try to execute without validation
+   6. Verify: Error shown "Intent must be validated first"
+
+   LIVE EXECUTION (CAREFUL!):
+   1. Create and validate intent
+   2. Click "Execute Now" → Select "Live"
+   3. Verify: Confirmation dialog shown
+   4. Cancel → Verify no execution
+   5. Confirm → Verify real order placed on Binance (check Binance account)
+
+QUALITY BAR
+- All user actions provide immediate feedback (toast, loading state, or error)
+- No silent failures (every error shown to user with actionable message)
+- Loading states prevent double-submission
+- Responsive design works on mobile, tablet, desktop
+- Toasts auto-dismiss after 5 seconds
+- Error messages are user-friendly (not technical jargon)
+- Keyboard shortcuts work without conflicts
+- Accessibility: all interactive elements keyboard-navigable
+
+OUTPUT FORMAT
+1. Brief plan summary
+2. File paths + code changes (full component code for major changes, diffs for minor)
+3. Manual test script (step-by-step)
+4. Screenshots or video recording of the flow (optional)
+
+SUCCESS CRITERIA
+- User can complete entire flow: Create → Validate → Execute without confusion
+- All errors handled gracefully with retry options
+- Success feedback clear and rewarding
+- Mobile experience smooth (no horizontal scroll, buttons accessible)
+- No console errors or warnings
+- E2E test script passes completely
+
+Now implement.

@@ -1,0 +1,409 @@
+You are working inside the Robson monorepo (AI-first cryptocurrency trading platform).
+
+MISSION
+Complete comprehensive testing and documentation for the Agentic Workflow (PLAN → VALIDATE → EXECUTE).
+Ensure production-ready quality with full test coverage, user documentation, API documentation, and runbooks.
+
+IMPORTANT CONTEXT
+- Phases 1-5 implemented complete workflow (Backend API, Frontend, Integration, Auto-trigger)
+- System is functional but needs thorough testing and documentation before production deployment
+- Multiple user personas: Traders (manual), System (auto), Developers, Operations
+- Critical: This is a trading system - bugs can cause financial loss
+- Documentation must be accessible to non-technical users
+
+CONSTRAINTS
+- Test coverage must be ≥80% for all new code
+- Integration tests must use test Binance account or comprehensive mocks
+- Load tests required for API endpoints (handle 100+ concurrent requests)
+- Documentation must be in English (per LANGUAGE-POLICY.md)
+- Follow existing docs structure (docs/INDEX.md, docs/ARCHITECTURE.md, etc.)
+- API documentation must follow OpenAPI 3.1 spec (docs/specs/api/openapi.yaml)
+
+DELIVERABLES
+1) Unit tests for all use cases, adapters, serializers (≥80% coverage)
+2) Integration tests for API endpoints (all status codes, error cases)
+3) E2E tests for complete user journeys (manual and auto)
+4) Load/performance tests for API endpoints
+5) User documentation (docs/AGENTIC-WORKFLOW.md)
+6) Developer documentation (inline code docs, ADR if needed)
+7) API documentation (OpenAPI spec update)
+8) Runbook for operations (troubleshooting, monitoring)
+9) Test data generators (realistic production-like data)
+10) CI/CD pipeline updates (run new tests)
+
+EXECUTION PLAN (follow exactly)
+
+A) UNIT TESTS (apps/backend/monolith/api/tests/)
+   Target: ≥80% coverage for new code
+
+   1) test_trading_intent_use_cases.py
+      - test_create_trading_intent_success
+      - test_create_trading_intent_invalid_prices (entry == stop)
+      - test_create_trading_intent_zero_capital
+      - test_create_trading_intent_missing_strategy
+      - test_position_size_calculation (verify math)
+      - test_risk_calculation (verify 1% rule)
+
+   2) test_trading_intent_adapters.py
+      - test_django_repository_save
+      - test_django_repository_get_by_id
+      - test_django_repository_list_by_client (multi-tenant isolation)
+      - test_django_repository_not_found
+
+   3) test_trading_intent_serializers.py
+      - test_create_serializer_valid
+      - test_create_serializer_invalid_entry_stop
+      - test_create_serializer_negative_capital
+      - test_intent_serializer_output (verify all fields)
+      - test_validation_report_serializer
+      - test_execution_result_serializer
+
+   4) test_pattern_to_plan_auto_trigger.py
+      - test_auto_validate_flag_enabled
+      - test_auto_validate_flag_disabled
+      - test_auto_execute_dry_run
+      - test_auto_execute_live (mocked)
+      - test_daily_limit_enforcement
+      - test_validation_failure_stops_execution
+
+   Run tests:
+   cd apps/backend/monolith
+   python manage.py test api.tests.test_trading_intent* -v 2
+   pytest --cov=api.application --cov=api.views --cov-report=html
+
+B) INTEGRATION TESTS (apps/backend/monolith/api/tests/test_trading_intent_api_integration.py)
+   Test complete API flows with database
+
+   1) test_create_intent_api_e2e
+      - POST /api/trading-intents/create/ with valid data
+      - Verify 201 Created
+      - Verify intent saved in database
+      - Verify client isolation (can't access other client's intents)
+
+   2) test_get_intent_api
+      - Create intent
+      - GET /api/trading-intents/{intent_id}/
+      - Verify 200 OK with correct data
+
+   3) test_list_intents_api_filtered
+      - Create multiple intents (different statuses, strategies)
+      - GET /api/trading-intents/?status=PENDING&strategy_id=1
+      - Verify correct filtering
+
+   4) test_validate_intent_api_e2e
+      - Create intent
+      - POST /api/trading-intents/{intent_id}/validate/
+      - Verify validation guards executed
+      - Verify status updated
+
+   5) test_execute_intent_api_dry_run
+      - Create and validate intent
+      - POST /api/trading-intents/{intent_id}/execute/?mode=dry-run
+      - Verify execution simulated (no real orders)
+      - Verify execution_result populated
+
+   6) test_execute_intent_api_live (CAREFUL - use test account)
+      - Use test Binance account or comprehensive mock
+      - Create and validate intent
+      - POST /api/trading-intents/{intent_id}/execute/?mode=live
+      - Verify real order placed (or mocked)
+
+   7) test_error_cases
+      - Unauthorized (no JWT)
+      - Not found (invalid intent_id)
+      - Bad request (invalid data)
+      - Conflict (execute before validate)
+
+   Run tests:
+   python manage.py test api.tests.test_trading_intent_api_integration -v 2
+
+C) E2E TESTS (apps/frontend/tests/e2e/)
+   Use Playwright or Cypress for browser automation
+
+   1) test_manual_flow_complete.spec.js
+      - Login
+      - Click "Start New Operation"
+      - Fill form (Symbol, Strategy, Entry, Stop, Capital)
+      - Submit
+      - Verify success toast
+      - Verify intent appears in list
+      - Click "Validate Now"
+      - Verify validation results shown
+      - Click "Execute Now" → Dry-Run
+      - Verify execution results shown
+
+   2) test_auto_trigger_flow.spec.js
+      - Login
+      - Go to "Pattern Configuration"
+      - Create config with auto_execute=True, execution_mode=dry-run
+      - Trigger pattern detection (backend command)
+      - Refresh frontend
+      - Verify intent auto-created and executed
+      - Verify notification shown
+
+   3) test_error_handling.spec.js
+      - Submit invalid form (entry == stop)
+      - Verify client-side validation error
+      - Submit with insufficient balance
+      - Verify validation failure shown
+      - Try execute before validate
+      - Verify error shown
+
+   Run tests:
+   cd apps/frontend
+   npm run test:e2e
+
+D) LOAD/PERFORMANCE TESTS (tests/performance/)
+   Use Locust or k6 for load testing
+
+   1) load_test_create_intents.py
+      - Simulate 100 concurrent users creating intents
+      - Verify response time <500ms (p95)
+      - Verify no errors under load
+
+   2) load_test_list_intents.py
+      - Simulate 200 concurrent users listing intents
+      - Verify response time <200ms (p95)
+
+   3) load_test_validate_execute.py
+      - Simulate 50 concurrent validations/executions
+      - Verify no race conditions
+      - Verify database locks work correctly
+
+   Run tests:
+   cd tests/performance
+   locust -f load_test_create_intents.py
+
+E) USER DOCUMENTATION (docs/AGENTIC-WORKFLOW.md)
+   Comprehensive user guide for traders
+
+   Structure:
+   1. Overview
+      - What is the Agentic Workflow?
+      - PLAN → VALIDATE → EXECUTE explained
+      - When to use manual vs auto
+
+   2. Manual Trading Flow
+      - Step-by-step tutorial with screenshots
+      - How to create a plan (Start New Operation)
+      - Understanding validation results
+      - Dry-run vs live execution
+      - Best practices
+
+   3. Auto Trading Flow
+      - What is auto-execution?
+      - Setting up pattern configurations
+      - Safety limits and controls
+      - Monitoring auto trades
+      - When to use auto vs manual
+
+   4. Strategy Guide
+      - All In strategy (manual, technical stop)
+      - Rescue Forces strategy (auto, MA crossover)
+      - How to create custom strategies
+
+   5. Risk Management
+      - Position sizing (1% rule)
+      - Daily limits
+      - Validation guards explained
+      - What to do if validation fails
+
+   6. Troubleshooting
+      - Common errors and solutions
+      - How to cancel an intent
+      - How to view execution history
+      - Support contact
+
+   7. FAQ
+
+F) DEVELOPER DOCUMENTATION
+   1) Inline code documentation
+      - Docstrings for all public functions/classes
+      - Type hints for all function signatures
+      - Comments for complex logic
+
+   2) ADR (if needed): docs/adr/ADR-XXXX-agentic-workflow.md
+      - Context: Why agentic workflow?
+      - Decision: PLAN → VALIDATE → EXECUTE pattern
+      - Consequences: Safer trading, better UX
+      - Alternatives considered
+
+   3) Architecture diagram
+      - Update docs/ARCHITECTURE.md with workflow diagram
+      - Show: Frontend → API → Use Cases → Validation → Execution → Binance
+
+G) API DOCUMENTATION (docs/specs/api/openapi.yaml)
+   Update OpenAPI spec with new endpoints
+
+   paths:
+     /api/trading-intents/create/:
+       post:
+         summary: Create a new trading intent (PLAN step)
+         requestBody:
+           required: true
+           content:
+             application/json:
+               schema:
+                 $ref: '#/components/schemas/CreateTradingIntentRequest'
+         responses:
+           201:
+             description: Trading intent created
+             content:
+               application/json:
+                 schema:
+                   $ref: '#/components/schemas/TradingIntent'
+           400:
+             description: Invalid request
+           401:
+             description: Unauthorized
+
+     /api/trading-intents/{intent_id}/validate/:
+       post:
+         summary: Validate a trading intent (VALIDATE step)
+         # ... (complete spec)
+
+     /api/trading-intents/{intent_id}/execute/:
+       post:
+         summary: Execute a trading intent (EXECUTE step)
+         parameters:
+           - name: mode
+             in: query
+             schema:
+               type: string
+               enum: [dry-run, live]
+               default: dry-run
+         # ... (complete spec)
+
+   components:
+     schemas:
+       CreateTradingIntentRequest:
+         type: object
+         required: [symbol, strategy, side, entry_price, stop_price, capital]
+         properties:
+           symbol:
+             type: integer
+           strategy:
+             type: integer
+           side:
+             type: string
+             enum: [BUY, SELL]
+           entry_price:
+             type: string
+             format: decimal
+           stop_price:
+             type: string
+             format: decimal
+           capital:
+             type: string
+             format: decimal
+
+       TradingIntent:
+         # ... (complete schema)
+
+       ValidationReport:
+         # ... (complete schema)
+
+       ExecutionResult:
+         # ... (complete schema)
+
+H) OPERATIONS RUNBOOK (docs/runbooks/agentic-workflow.md)
+   For DevOps/SRE teams
+
+   1) Deployment Checklist
+      - Database migrations required
+      - Environment variables needed
+      - Cron job setup (auto_execute_patterns)
+
+   2) Monitoring
+      - Key metrics to track:
+        - Intent creation rate
+        - Validation pass/fail ratio
+        - Execution success rate
+        - API response times
+        - Error rates
+      - Grafana dashboard queries
+      - Alert thresholds
+
+   3) Troubleshooting
+      - "Intent stuck in PENDING" → Check validation guards
+      - "Execution failed" → Check Binance API status, credentials
+      - "Auto-trigger not working" → Check cron job, pattern detection
+      - Database queries for debugging
+
+   4) Backup/Recovery
+      - How to cancel stuck intents
+      - How to reprocess failed validations
+      - How to rollback a deployment
+
+   5) Performance Tuning
+      - Database indexes needed
+      - API rate limiting settings
+      - Caching strategies
+
+I) TEST DATA GENERATORS (apps/backend/monolith/api/management/commands/seed_agentic_workflow.py)
+   Create realistic production-like test data
+
+   class Command(BaseCommand):
+       help = 'Seed database with agentic workflow test data'
+
+       def handle(self, *args, **options):
+           # Create 50 TradingIntents with various statuses
+           # 10 PENDING
+           # 15 VALIDATED
+           # 20 EXECUTED (success)
+           # 5 FAILED
+           # Realistic validation_result and execution_result payloads
+           # Different strategies, symbols, sides
+           # Created at different times (last 30 days)
+
+   Usage:
+   python manage.py seed_agentic_workflow
+
+J) CI/CD PIPELINE UPDATES (.github/workflows/*)
+   Add new test stages to CI pipeline
+
+   1) .github/workflows/backend-tests.yml
+      - Add step: Run trading intent tests
+      - Add step: Generate coverage report
+      - Fail if coverage <80%
+
+   2) .github/workflows/frontend-tests.yml
+      - Add step: Run E2E tests (if not too slow for CI)
+      - Or: Run E2E tests on nightly build
+
+   3) .github/workflows/load-tests.yml (optional)
+      - Run load tests on staging before production deploy
+
+QUALITY BAR
+- Unit test coverage ≥80% (verified by pytest-cov)
+- All integration tests pass
+- E2E tests cover happy path and error cases
+- Load tests show system handles 100 concurrent users
+- Documentation is beginner-friendly (no jargon without explanation)
+- API docs are complete (all endpoints, schemas, error codes)
+- Runbook tested by operations team
+- No TODO or FIXME comments in production code
+
+OUTPUT FORMAT
+1. Brief plan summary
+2. Test results:
+   - Unit tests: X/Y passed, coverage: Z%
+   - Integration tests: X/Y passed
+   - E2E tests: X/Y passed
+   - Load tests: response times, error rate
+3. Documentation files created (list)
+4. CI/CD changes made
+5. Deployment readiness checklist
+
+SUCCESS CRITERIA
+- All tests pass (unit, integration, E2E)
+- Test coverage ≥80%
+- Load tests show acceptable performance (<500ms p95)
+- User documentation complete and reviewed
+- API documentation complete and validated (swagger-ui)
+- Runbook tested by operations team
+- CI/CD pipeline green
+- No critical bugs in test environment
+- Ready for production deployment
+
+Now implement.

@@ -1,0 +1,207 @@
+You are working inside the Robson monorepo (AI-first cryptocurrency trading platform).
+
+MISSION
+Refactor the StartNewOperationModal frontend component to implement the PLAN step of the agentic workflow.
+Transform the modal from a static UI into a functional component that creates TradingIntent via the REST API.
+
+IMPORTANT CONTEXT
+- Backend API already implemented (POST /api/trading-intents/create/)
+- TradingIntent model has status flow: PENDING → VALIDATED → EXECUTED
+- Modal currently shows strategies but doesn't submit (just closes)
+- "All In" strategy uses technical stop (2nd support on 15m chart)
+- Position sizing is CALCULATED (not user-selected): Size = (Capital × 1%) / |Entry - Stop|
+- Frontend tech: React 18 + Vite + Bootstrap
+- AuthContext provides JWT tokens
+
+CONSTRAINTS
+- Do NOT change the modal's visual design significantly
+- Do NOT remove existing fields (keep Symbol, Strategy, Side, etc.)
+- Follow React 18 best practices (hooks, functional components)
+- Use existing AuthContext for authentication
+- Handle loading states and errors gracefully
+- Show user-friendly error messages
+- Keep decimal precision (use string for Decimal fields, not number)
+
+DELIVERABLES
+1) Refactored StartNewOperationModal.jsx with:
+   - Form submission handler
+   - API integration (POST /api/trading-intents/create/)
+   - Loading states
+   - Error handling
+   - Success feedback
+2) New shared component: apps/frontend/src/components/shared/DecimalInput.jsx
+3) Updated Dashboard.jsx to handle modal success callback
+4) Tests: apps/frontend/tests/StartNewOperationModal.test.jsx
+
+EXECUTION PLAN (follow exactly)
+
+A) CREATE DECIMAL INPUT COMPONENT (apps/frontend/src/components/shared/DecimalInput.jsx)
+   Controlled input for Decimal fields (entry_price, stop_price, capital)
+   - Props: value, onChange, label, placeholder, min, max, step, disabled, error
+   - Validates decimal format (no scientific notation, max 8 decimals)
+   - Shows error state with Bootstrap styling
+   - Example: <DecimalInput label="Capital (USDC)" value={capital} onChange={setCapital} min="1" step="0.01" />
+
+B) REFACTOR MODAL (apps/frontend/src/components/logged/modals/StartNewOperationModal.jsx)
+   Current state: strategies loaded from API, but form doesn't submit
+
+   NEW STATE VARIABLES:
+   - formData: { symbol_id, strategy_id, side, entry_price, stop_price, capital }
+   - isSubmitting (boolean)
+   - error (string or null)
+   - calculatedSize (Decimal or null, optional preview)
+
+   NEW HANDLERS:
+   1) handleFieldChange(field, value)
+      - Update formData[field]
+      - Clear error
+
+   2) validateForm()
+      - All fields required
+      - entry_price != stop_price
+      - capital > 0
+      - Return { valid: boolean, errors: string[] }
+
+   3) handleSubmit(e)
+      e.preventDefault()
+      - Validate form
+      - Set isSubmitting = true
+      - POST /api/trading-intents/create/ with formData
+      - On success:
+        - Show success message (toast or alert)
+        - Call props.onSuccess(createdIntent)
+        - Close modal
+      - On error:
+        - Set error message
+        - Set isSubmitting = false
+      - Always: set isSubmitting = false
+
+   FORM FIELDS:
+   - Symbol: Select dropdown (fetch from /api/symbols/)
+   - Strategy: Select dropdown (already implemented, fetch from /api/strategies/)
+   - Side: Radio buttons (BUY / SELL)
+   - Entry Price: DecimalInput (required, min="0.01", step="0.01")
+   - Stop Price: DecimalInput (required, min="0.01", step="0.01")
+   - Capital: DecimalInput (required, min="1", step="1")
+
+   HELP TEXT (add below fields):
+   - Entry Price: "Price at which you want to enter the position"
+   - Stop Price: "Technical invalidation level (2nd support for BUY, 2nd resistance for SELL)"
+   - Capital: "Total capital to risk (position size will be calculated to risk 1%)"
+
+   OPTIONAL PREVIEW (nice-to-have):
+   - Show calculated position size as user types
+   - Formula: size = (capital × 0.01) / |entry_price - stop_price|
+   - Display: "Calculated position size: {size} {base_asset}"
+
+   LOADING STATE:
+   - Disable all inputs when isSubmitting
+   - Show spinner on submit button
+   - Button text: "Creating Plan..." when loading, "Create Plan" when ready
+
+   ERROR DISPLAY:
+   - Show error alert at top of modal if error != null
+   - Bootstrap alert-danger styling
+   - Clear error when user edits form
+
+C) UPDATE DASHBOARD (apps/frontend/src/components/logged/Dashboard.jsx)
+   Add callback handler:
+
+   const handleOperationCreated = (intent) => {
+     // Show success toast/notification
+     console.log('Trading intent created:', intent);
+
+     // Optional: refresh operations list or show in UI
+     // Optional: navigate to intent status page
+   };
+
+   Pass to modal:
+   <StartNewOperationModal
+     show={showModal}
+     onHide={() => setShowModal(false)}
+     onSuccess={handleOperationCreated}
+   />
+
+D) CREATE TESTS (apps/frontend/tests/StartNewOperationModal.test.jsx)
+   Use Vitest + React Testing Library
+
+   1) test_renders_all_fields
+      - Verify Symbol, Strategy, Side, Entry, Stop, Capital fields present
+
+   2) test_validates_required_fields
+      - Submit empty form
+      - Verify error messages shown
+
+   3) test_validates_entry_not_equal_stop
+      - Set entry_price = stop_price
+      - Submit
+      - Verify validation error
+
+   4) test_submits_successfully
+      - Mock fetch POST /api/trading-intents/create/ → 201 Created
+      - Fill form
+      - Submit
+      - Verify fetch called with correct payload
+      - Verify onSuccess callback called
+      - Verify modal closes
+
+   5) test_shows_api_error
+      - Mock fetch POST → 400 Bad Request
+      - Submit
+      - Verify error message displayed
+      - Verify modal stays open
+
+   6) test_disables_form_during_submission
+      - Mock fetch with delay
+      - Submit
+      - Verify inputs disabled
+      - Verify button shows loading state
+
+E) API INTEGRATION HELPERS (apps/frontend/src/utils/api.js or inline)
+   Create helper function for API calls:
+
+   async function createTradingIntent(intentData, authToken) {
+     const response = await fetch(`${import.meta.env.VITE_API_BASE_URL}/api/trading-intents/create/`, {
+       method: 'POST',
+       headers: {
+         'Content-Type': 'application/json',
+         'Authorization': `Bearer ${authToken}`,
+       },
+       body: JSON.stringify(intentData),
+     });
+
+     if (!response.ok) {
+       const errorData = await response.json();
+       throw new Error(errorData.detail || 'Failed to create trading intent');
+     }
+
+     return await response.json();
+   }
+
+QUALITY BAR
+- Form validation works client-side before API call
+- Loading states prevent double-submission
+- Error messages are user-friendly (not raw API errors)
+- DecimalInput prevents invalid input (non-numeric, too many decimals)
+- Success flow closes modal and notifies parent component
+- Tests cover happy path and error cases
+- No console errors in browser
+- Accessible (keyboard navigation, screen reader labels)
+
+OUTPUT FORMAT
+1. Brief plan summary
+2. File paths + code changes (full component code for modified files)
+3. Manual test script:
+   - How to test in browser
+   - Expected behavior for success case
+   - Expected behavior for error cases
+
+SUCCESS CRITERIA
+- Click "Start New Operation" → Modal opens
+- Fill all fields → Click "Create Plan" → Success toast + modal closes
+- Leave required field empty → Validation error shown
+- Enter invalid data → API error shown gracefully
+- During submission → Button disabled + spinner shown
+- All Vitest tests pass
+
+Now implement.

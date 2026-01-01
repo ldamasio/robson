@@ -1,0 +1,229 @@
+You are working inside the Robson monorepo (AI-first cryptocurrency trading platform).
+
+MISSION
+Implement the TradingIntentStatus component to display the agentic workflow status (PLAN → VALIDATE → EXECUTE).
+This component shows a trading intent's lifecycle, validation results, and execution results in real-time.
+
+IMPORTANT CONTEXT
+- Backend API provides: GET /api/trading-intents/{intent_id}/
+- TradingIntent status flow: PENDING → VALIDATED → EXECUTING → EXECUTED
+- ValidationReport structure: { status, guards: [...], warnings: [...], timestamp }
+- ExecutionResult structure: { status, actions: [...], order_ids: [...], errors: [...], timestamp }
+- Frontend tech: React 18 + Vite + Bootstrap
+- Need to show validation guards (PASS/FAIL) with explanations
+- Need to show execution actions (orders placed, transfers made)
+- Should refresh automatically when status changes
+
+CONSTRAINTS
+- Component must be reusable (not tied to specific page)
+- Mobile-responsive design (Bootstrap grid)
+- Real-time updates without manual refresh
+- Clear visual distinction between PENDING/VALIDATED/EXECUTED states
+- Show both validation and execution details in expandable sections
+- Handle loading and error states gracefully
+- Use Bootstrap styling for consistency
+
+DELIVERABLES
+1) New component: apps/frontend/src/components/logged/TradingIntentStatus.jsx
+2) New component: apps/frontend/src/components/logged/TradingIntentResults.jsx (execution details)
+3) New hook: apps/frontend/src/hooks/useTradingIntent.js (fetch + polling)
+4) Integration into Dashboard.jsx (show intents list)
+5) Tests: apps/frontend/tests/TradingIntentStatus.test.jsx
+
+EXECUTION PLAN (follow exactly)
+
+A) CREATE HOOK (apps/frontend/src/hooks/useTradingIntent.js)
+   Custom hook for fetching and polling TradingIntent
+
+   useTradingIntent(intentId, authToken, options = {})
+   - Fetches intent from GET /api/trading-intents/{intentId}/
+   - Polls every 5 seconds if status is PENDING or EXECUTING
+   - Stops polling when status is VALIDATED or EXECUTED or FAILED
+   - Returns: { intent, isLoading, error, refetch }
+
+   Options:
+   - pollingInterval (default: 5000ms)
+   - enablePolling (default: true)
+
+   Implementation:
+   - useEffect for initial fetch
+   - useInterval for polling (only when status is transitional)
+   - Cleanup on unmount
+   - Handle 404 (intent not found)
+   - Handle 401 (auth error)
+
+B) CREATE STATUS COMPONENT (apps/frontend/src/components/logged/TradingIntentStatus.jsx)
+   Props:
+   - intentId (string, required)
+   - showDetails (boolean, default: true) - expand/collapse validation/execution
+   - onValidate (function, optional) - callback for "Validate Now" button
+   - onExecute (function, optional) - callback for "Execute Now" button
+
+   STRUCTURE:
+   1) Header Section
+      - Intent ID (monospace font)
+      - Status Badge (color-coded: PENDING=warning, VALIDATED=info, EXECUTED=success, FAILED=danger)
+      - Timestamp (created_at, updated_at)
+      - Copy intent_id button
+
+   2) Trade Details Section
+      - Symbol: {symbol.name} ({symbol.base_asset}/{symbol.quote_asset})
+      - Strategy: {strategy.name}
+      - Side: BUY/SELL (badge)
+      - Entry Price: {entry_price}
+      - Stop Price: {stop_price}
+      - Quantity: {quantity}
+      - Capital: {capital}
+      - Risk Amount: {risk_amount} ({risk_percent}%)
+      - Stop Distance: {calculated, show as percentage}
+
+   3) Validation Section (collapsible, shown if validation_result exists)
+      - Validation Status: PASS/FAIL badge
+      - Timestamp
+      - Guards List:
+        - Each guard: Name, Status (PASS/FAIL icon), Message, Details (expandable)
+        - Color-coded: PASS = green checkmark, FAIL = red X
+        - Example:
+          ✓ Balance Check: USDC balance sufficient (100.00 > 50.00)
+          ✗ Risk Limit: Monthly risk exceeded (5.2% > 5.0%)
+      - Warnings List (if any):
+        - Yellow warning icon + message
+      - "Validate Now" button (if status == PENDING and onValidate provided)
+
+   4) Execution Section (collapsible, shown if execution_result exists)
+      - Execution Status: SUCCESS/FAILED badge
+      - Mode: DRY-RUN / LIVE badge
+      - Timestamp
+      - Actions List:
+        - Each action: Type, Details, Order ID (link to Binance if available)
+        - Example:
+          BUY Order: 0.0005 BTC @ $95,000.00 (Order #123456789)
+          STOP Order: Placed @ $93,500.00 (Order #987654321)
+      - Errors List (if any):
+        - Red error icon + message
+      - "Execute Now" button (if status == VALIDATED and onExecute provided)
+        - Shows dropdown: "Dry-Run" or "Live Execution"
+
+   5) Actions Section (bottom)
+      - "Refresh" button (manual refresh)
+      - "View in Binance" link (if execution_result.order_ids exist)
+      - "Cancel" button (if status == PENDING, optional future feature)
+
+   STATE:
+   - expanded: { validation: boolean, execution: boolean }
+   - executionMode: 'dry-run' | 'live'
+
+   POLLING:
+   - Use useTradingIntent hook
+   - Show "Live updates enabled" indicator when polling
+   - Show "Last updated: {timestamp}" (relative time)
+
+C) CREATE RESULTS COMPONENT (apps/frontend/src/components/logged/TradingIntentResults.jsx)
+   Detailed view of execution results
+
+   Props:
+   - executionResult (object)
+   - intentId (string)
+
+   Displays:
+   - Execution mode badge (DRY-RUN / LIVE)
+   - Status badge (SUCCESS / FAILED)
+   - Actions table:
+     - Column: Action Type (BUY, SELL, TRANSFER, etc.)
+     - Column: Asset
+     - Column: Amount
+     - Column: Price (if applicable)
+     - Column: Order ID (link)
+     - Column: Status
+   - Total fees (sum of all trading fees)
+   - Errors/Warnings accordion (if any)
+   - Audit trail link (view full audit log)
+
+D) INTEGRATE INTO DASHBOARD (apps/frontend/src/components/logged/Dashboard.jsx)
+   Add new section: "Trading Intents"
+
+   1) List Recent Intents
+      - Fetch from GET /api/trading-intents/?limit=5
+      - Show table:
+        - Intent ID (link)
+        - Symbol
+        - Strategy
+        - Status badge
+        - Created
+      - "View All" link → navigate to /trading-intents page (future)
+
+   2) Link from StartNewOperationModal success
+      - After creating intent, show success message with link
+      - "Plan created! View status →" (link to intent details)
+
+   3) Click intent → Expand TradingIntentStatus inline or navigate to detail page
+
+   OPTIONAL: Create separate page /trading-intents/{intentId} for full view
+
+E) CREATE TESTS (apps/frontend/tests/TradingIntentStatus.test.jsx)
+   Use Vitest + React Testing Library
+
+   1) test_renders_pending_intent
+      - Mock intent with status=PENDING
+      - Verify status badge shows "PENDING"
+      - Verify "Validate Now" button visible
+
+   2) test_renders_validated_intent
+      - Mock intent with status=VALIDATED + validation_result
+      - Verify validation section shows guards
+      - Verify "Execute Now" button visible
+
+   3) test_renders_executed_intent
+      - Mock intent with status=EXECUTED + execution_result
+      - Verify execution section shows actions
+      - Verify order IDs displayed
+
+   4) test_expands_collapses_sections
+      - Click validation section header
+      - Verify details expand/collapse
+
+   5) test_polling_stops_when_executed
+      - Mock intent transitioning PENDING → VALIDATED → EXECUTED
+      - Verify polling stops after EXECUTED
+
+   6) test_shows_validation_failures
+      - Mock intent with validation_result.status=FAIL
+      - Verify failed guards shown in red
+      - Verify "Execute Now" button disabled or hidden
+
+   7) test_handles_api_errors
+      - Mock 404 error
+      - Verify error message displayed
+
+QUALITY BAR
+- Status badges use Bootstrap contextual colors (primary, success, warning, danger)
+- Icons use Bootstrap Icons or Font Awesome (choose one, be consistent)
+- Timestamps use relative time ("2 minutes ago") with tooltip showing absolute time
+- Long intent IDs truncated with "..." and full ID in tooltip
+- Copy-to-clipboard works in all browsers
+- Polling stops on unmount (no memory leaks)
+- Loading states show skeleton/spinner
+- Mobile responsive (stacks vertically on small screens)
+- Accessible (ARIA labels, keyboard navigation)
+
+OUTPUT FORMAT
+1. Brief plan summary
+2. File paths + code changes (full component code)
+3. Manual test script:
+   - Create intent via modal
+   - Watch status component update
+   - Trigger validation
+   - Trigger execution
+   - Verify polling behavior
+
+SUCCESS CRITERIA
+- Component renders all intent states correctly (PENDING, VALIDATED, EXECUTED)
+- Validation guards displayed with PASS/FAIL icons and explanations
+- Execution actions displayed with order details
+- Polling updates component automatically
+- "Validate Now" and "Execute Now" buttons work
+- Expandable sections work smoothly
+- No console errors
+- All Vitest tests pass
+
+Now implement.

@@ -1,0 +1,174 @@
+You are working inside the Robson monorepo (AI-first cryptocurrency trading platform).
+
+MISSION
+Implement the Backend REST API for the Agentic Workflow (PLAN → VALIDATE → EXECUTE).
+This API bridges the frontend manual entry flow with the existing TradingIntent model and validation/execution frameworks.
+
+IMPORTANT CONTEXT
+- TradingIntent model already exists at api/models/trading.py
+- Validation framework exists at api/application/validation.py
+- Execution framework exists at api/application/execution.py
+- Pattern-to-plan bridge exists at api/application/pattern_engine/pattern_to_plan.py
+- This is the MANUAL ENTRY flow - user provides parameters, system creates plan
+- Hexagonal architecture MUST be followed (domain.py, ports.py, use_cases.py, adapters.py)
+
+CONSTRAINTS
+- Do NOT change TradingIntent model structure
+- Do NOT modify existing validation/execution frameworks
+- Follow hexagonal architecture strictly (NO Django in domain/ports/use_cases)
+- All API endpoints require JWT authentication
+- Multi-tenant: filter by client
+- Use DRF serializers for validation
+- Type hints required
+- Docstrings required
+
+DELIVERABLES
+1) New use case: CreateTradingIntentUseCase in api/application/use_cases/trading_intent.py
+2) New serializers in api/serializers/trading_intent_serializers.py:
+   - CreateTradingIntentSerializer (input)
+   - TradingIntentSerializer (output)
+   - ValidationReportSerializer (output)
+   - ExecutionResultSerializer (output)
+3) New views in api/views/trading_intent_views.py:
+   - create_trading_intent (POST)
+   - get_trading_intent (GET)
+   - list_trading_intents (GET)
+   - validate_trading_intent (POST)
+   - execute_trading_intent (POST)
+4) URL routing in api/urls.py
+5) Tests in api/tests/test_trading_intent_api.py
+
+EXECUTION PLAN (follow exactly)
+
+A) CREATE USE CASE (api/application/use_cases/trading_intent.py)
+   - CreateTradingIntentUseCase class
+   - Input: CreateTradingIntentCommand (symbol, strategy, side, entry_price, stop_price, capital)
+   - Logic:
+     1. Load strategy and symbol from repository
+     2. Calculate position size using risk formula (capital * 1% / |entry - stop|)
+     3. Calculate risk amount, risk percent
+     4. Generate unique intent_id (uuid4)
+     5. Create TradingIntent entity with status=PENDING
+     6. Save to repository
+     7. Return TradingIntent
+   - Port: TradingIntentRepository (save, get_by_id, list_by_client)
+   - Adapter: DjangoTradingIntentRepository (implement in api/application/adapters.py)
+
+B) CREATE SERIALIZERS (api/serializers/trading_intent_serializers.py)
+   CreateTradingIntentSerializer:
+   - symbol (int, FK to Symbol)
+   - strategy (int, FK to Strategy)
+   - side (str, choices: BUY/SELL)
+   - entry_price (Decimal)
+   - stop_price (Decimal)
+   - capital (Decimal)
+   - Validation: ensure entry_price != stop_price, capital > 0
+
+   TradingIntentSerializer:
+   - All TradingIntent model fields
+   - Nested symbol, strategy details
+   - formatted timestamps
+   - calculated fields (risk_reward_ratio, distance_to_stop_percent)
+
+   ValidationReportSerializer:
+   - status (PASS/FAIL)
+   - guards (list of guard results)
+   - warnings
+   - timestamp
+
+   ExecutionResultSerializer:
+   - status (SUCCESS/FAILED)
+   - actions (list of executed actions)
+   - order_ids
+   - errors
+   - timestamp
+
+C) CREATE VIEWS (api/views/trading_intent_views.py)
+   All views use @api_view and @permission_classes([IsAuthenticated])
+
+   1) create_trading_intent
+      POST /api/trading-intents/create/
+      - Validate input with CreateTradingIntentSerializer
+      - Call CreateTradingIntentUseCase
+      - Return TradingIntentSerializer (201 Created)
+
+   2) get_trading_intent
+      GET /api/trading-intents/{intent_id}/
+      - Fetch by intent_id
+      - Filter by client
+      - Return TradingIntentSerializer (200 OK)
+
+   3) list_trading_intents
+      GET /api/trading-intents/
+      - Query params: status, strategy_id, symbol_id, limit, offset
+      - Filter by client
+      - Order by created_at desc
+      - Return paginated TradingIntentSerializer
+
+   4) validate_trading_intent
+      POST /api/trading-intents/{intent_id}/validate/
+      - Fetch TradingIntent by intent_id
+      - Call ValidationFramework.validate(intent)
+      - Update intent.validation_result
+      - Update intent.status = VALIDATED or keep PENDING
+      - Return ValidationReportSerializer (200 OK)
+
+   5) execute_trading_intent
+      POST /api/trading-intents/{intent_id}/execute/
+      - Query params: mode (dry-run/live, default=dry-run)
+      - Fetch TradingIntent by intent_id
+      - Verify status == VALIDATED
+      - Call ExecutionFramework.execute(intent, mode)
+      - Update intent.execution_result
+      - Update intent.status = EXECUTED or FAILED
+      - Return ExecutionResultSerializer (200 OK)
+
+D) URL ROUTING (api/urls.py)
+   Add to urlpatterns:
+   path('trading-intents/create/', trading_intent_views.create_trading_intent),
+   path('trading-intents/', trading_intent_views.list_trading_intents),
+   path('trading-intents/<str:intent_id>/', trading_intent_views.get_trading_intent),
+   path('trading-intents/<str:intent_id>/validate/', trading_intent_views.validate_trading_intent),
+   path('trading-intents/<str:intent_id>/execute/', trading_intent_views.execute_trading_intent),
+
+E) TESTS (api/tests/test_trading_intent_api.py)
+   Use pytest + Django test client
+   Test fixtures: user, client, symbol, strategy
+
+   1) test_create_trading_intent_success
+   2) test_create_trading_intent_invalid_input
+   3) test_get_trading_intent_success
+   4) test_get_trading_intent_not_found
+   5) test_list_trading_intents_filtered
+   6) test_validate_trading_intent_success
+   7) test_validate_trading_intent_already_validated
+   8) test_execute_trading_intent_dry_run
+   9) test_execute_trading_intent_live
+   10) test_execute_trading_intent_not_validated
+
+QUALITY BAR
+- All endpoints return proper HTTP status codes (200, 201, 400, 404, 500)
+- Error messages are user-friendly JSON responses
+- Type hints on all functions
+- Docstrings on all public functions
+- Tests achieve >80% coverage
+- No Django imports in domain.py, ports.py, use_cases.py
+- All decimal calculations use Decimal type (not float)
+- Multi-tenant filtering enforced (no cross-client data leakage)
+
+OUTPUT FORMAT
+1. Brief plan summary
+2. File paths + code changes (full file contents for new files, diffs for modifications)
+3. Commands to run locally:
+   python manage.py test api.tests.test_trading_intent_api -v 2
+   curl examples for each endpoint
+
+SUCCESS CRITERIA
+- All tests pass
+- curl POST /api/trading-intents/create/ creates PENDING intent
+- curl POST /api/trading-intents/{id}/validate/ returns validation report
+- curl POST /api/trading-intents/{id}/execute/?mode=dry-run simulates execution
+- No 500 errors
+- Multi-tenant isolation verified
+
+Now implement.

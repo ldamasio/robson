@@ -1,0 +1,339 @@
+You are working inside the Robson monorepo (AI-first cryptocurrency trading platform).
+
+MISSION
+Connect the Pattern Detection Engine to the Agentic Workflow (PLAN → VALIDATE → EXECUTE) for automatic trade triggering.
+Enable the "Rescue Forces" and other auto-entry strategies to automatically create, validate, and execute trading intents when patterns are detected.
+
+IMPORTANT CONTEXT
+- Pattern detection engine exists: api/application/pattern_engine/
+- Pattern-to-plan bridge exists: pattern_to_plan.py (PatternToPlanUseCase)
+- StrategyPatternConfig model links strategies to patterns with auto-entry rules
+- Manual flow already working (Phase 1-4): User creates intent → validates → executes
+- This phase: AUTO flow - Pattern detected → Auto create intent → Auto validate → Auto execute
+- "Rescue Forces" strategy: Auto-entry on MA4/MA9 crossover
+- Critical: Must respect user preferences (auto_execute flag in StrategyPatternConfig)
+
+CONSTRAINTS
+- Do NOT modify existing pattern detection logic (keep pattern_engine/ intact)
+- Do NOT auto-execute LIVE trades without explicit user opt-in
+- Default execution mode: DRY-RUN (require user to enable LIVE in config)
+- Must log all auto-triggered intents in audit trail
+- Must handle failures gracefully (if auto-validation fails, notify user, don't retry infinitely)
+- Multi-tenant isolation (only trigger for correct client)
+
+DELIVERABLES
+1) Enhanced PatternToPlanUseCase in api/application/pattern_engine/pattern_to_plan.py
+2) New command: python manage.py auto_execute_patterns (cron job)
+3) Updated StrategyPatternConfig model with auto-execute settings
+4) Migration for StrategyPatternConfig changes
+5) Frontend: Enable/disable auto-execute in PatternConfigForm
+6) Notification system for auto-triggered intents (email/webhook/UI notification)
+7) Tests for auto-trigger flow
+
+EXECUTION PLAN (follow exactly)
+
+A) ENHANCE PATTERN-TO-PLAN BRIDGE (api/application/pattern_engine/pattern_to_plan.py)
+   Current: PatternToPlanUseCase creates TradingIntent from pattern
+
+   ADDITIONS:
+   1) Add auto-validation step:
+      - After creating TradingIntent, check if config.auto_validate == True
+      - If yes, call ValidationFramework.validate(intent)
+      - Update intent.validation_result and status
+
+   2) Add auto-execution step:
+      - After auto-validation, check if config.auto_execute == True
+      - Only execute if validation_result.status == PASS
+      - Check config.execution_mode (dry-run or live)
+      - Call ExecutionFramework.execute(intent, mode=config.execution_mode)
+      - Update intent.execution_result and status
+
+   3) Add notification step:
+      - After each step (plan, validate, execute), emit event
+      - Event types:
+        - INTENT_CREATED (pattern detected, intent created)
+        - INTENT_VALIDATED (validation passed/failed)
+        - INTENT_EXECUTED (execution succeeded/failed)
+      - Send notifications via configured channels (email, webhook, UI)
+
+   Implementation:
+   class PatternToPlanUseCase:
+       def __init__(self, intent_repo, validation_framework, execution_framework, notifier):
+           self._intent_repo = intent_repo
+           self._validation_framework = validation_framework
+           self._execution_framework = execution_framework
+           self._notifier = notifier
+
+       def execute(self, pattern: ConfirmedPattern, config: StrategyPatternConfig) -> TradingIntent:
+           # 1. Create intent
+           intent = self._create_intent_from_pattern(pattern, config)
+           intent = self._intent_repo.save(intent)
+           self._notifier.notify(IntentCreatedEvent(intent))
+
+           # 2. Auto-validate if configured
+           if config.auto_validate:
+               validation_result = self._validation_framework.validate(intent)
+               intent.validation_result = validation_result
+               intent.status = 'VALIDATED' if validation_result.status == 'PASS' else 'PENDING'
+               intent = self._intent_repo.save(intent)
+               self._notifier.notify(IntentValidatedEvent(intent, validation_result))
+
+           # 3. Auto-execute if configured and validated
+           if config.auto_execute and intent.status == 'VALIDATED':
+               execution_mode = config.execution_mode or 'dry-run'
+               execution_result = self._execution_framework.execute(intent, mode=execution_mode)
+               intent.execution_result = execution_result
+               intent.status = 'EXECUTED' if execution_result.status == 'SUCCESS' else 'FAILED'
+               intent = self._intent_repo.save(intent)
+               self._notifier.notify(IntentExecutedEvent(intent, execution_result))
+
+           return intent
+
+B) UPDATE STRATEGYPATTERNCONFIG MODEL (api/models/pattern_detection.py)
+   Add new fields:
+
+   class StrategyPatternConfig(BaseModel):
+       # Existing fields...
+       strategy = models.ForeignKey(Strategy, on_delete=models.CASCADE)
+       pattern_type = models.CharField(max_length=50)
+       timeframes = models.JSONField()
+       min_confidence = models.DecimalField(max_digits=5, decimal_places=2)
+
+       # NEW FIELDS:
+       auto_validate = models.BooleanField(default=False)  # Auto-validate after plan creation
+       auto_execute = models.BooleanField(default=False)   # Auto-execute after validation (DANGEROUS!)
+       execution_mode = models.CharField(
+           max_length=20,
+           choices=[('dry-run', 'Dry-Run'), ('live', 'Live')],
+           default='dry-run'
+       )
+       max_daily_auto_executions = models.IntegerField(default=5)  # Safety limit
+       notification_channels = models.JSONField(default=list)  # ['email', 'webhook', 'ui']
+
+       # Audit fields
+       last_auto_execution = models.DateTimeField(null=True, blank=True)
+       total_auto_executions = models.IntegerField(default=0)
+
+   Create migration:
+   python manage.py makemigrations -n add_auto_execute_to_pattern_config
+
+C) CREATE AUTO-EXECUTE COMMAND (api/management/commands/auto_execute_patterns.py)
+   Django command to be run as a cron job
+
+   class Command(BaseCommand):
+       help = 'Automatically execute trading intents from detected patterns'
+
+       def add_arguments(self, parser):
+           parser.add_argument('--dry-run', action='store_true', help='Preview what would be executed')
+           parser.add_argument('--client-id', type=int, help='Run for specific client only')
+
+       def handle(self, *args, **options):
+           dry_run = options['dry_run']
+           client_id = options.get('client_id')
+
+           # 1. Fetch StrategyPatternConfigs with auto_execute=True
+           configs = StrategyPatternConfig.objects.filter(
+               auto_execute=True,
+               is_active=True
+           )
+           if client_id:
+               configs = configs.filter(client_id=client_id)
+
+           # 2. For each config, check daily execution limit
+           for config in configs:
+               if self._exceeds_daily_limit(config):
+                   self.stdout.write(self.style.WARNING(
+                       f'Config {config.id} exceeded daily limit ({config.max_daily_auto_executions})'
+                   ))
+                   continue
+
+               # 3. Fetch CONFIRMED patterns for this config
+               patterns = ConfirmedPattern.objects.filter(
+                   pattern_type=config.pattern_type,
+                   timeframe__in=config.timeframes,
+                   confidence__gte=config.min_confidence,
+                   status='CONFIRMED',
+                   processed=False  # Only new patterns
+               )
+
+               # 4. For each pattern, trigger PatternToPlanUseCase
+               for pattern in patterns:
+                   if dry_run:
+                       self.stdout.write(f'Would create intent from pattern {pattern.id}')
+                   else:
+                       try:
+                           intent = pattern_to_plan_use_case.execute(pattern, config)
+                           pattern.processed = True
+                           pattern.save()
+                           self.stdout.write(self.style.SUCCESS(
+                               f'Created intent {intent.intent_id} from pattern {pattern.id}'
+                           ))
+                       except Exception as e:
+                           self.stdout.write(self.style.ERROR(f'Failed to process pattern {pattern.id}: {e}'))
+
+           self.stdout.write(self.style.SUCCESS('Auto-execution completed'))
+
+       def _exceeds_daily_limit(self, config):
+           today_start = timezone.now().replace(hour=0, minute=0, second=0, microsecond=0)
+           today_executions = TradingIntent.objects.filter(
+               strategy=config.strategy,
+               created_at__gte=today_start
+           ).count()
+           return today_executions >= config.max_daily_auto_executions
+
+   Cron setup (add to deployment):
+   # Run every 5 minutes
+   */5 * * * * python manage.py auto_execute_patterns --client-id 1
+
+D) FRONTEND: UPDATE PATTERN CONFIG FORM (apps/frontend/src/components/logged/modals/PatternConfigForm.jsx)
+   Add auto-execute settings section
+
+   NEW FIELDS:
+   1) Auto-Validate Toggle:
+      <Form.Check
+        type="switch"
+        label="Auto-validate plans"
+        checked={formData.auto_validate}
+        onChange={(e) => setFormData({...formData, auto_validate: e.target.checked})}
+      />
+      Help text: "Automatically validate trading plans when patterns are detected"
+
+   2) Auto-Execute Toggle:
+      <Form.Check
+        type="switch"
+        label="Auto-execute trades (ADVANCED)"
+        checked={formData.auto_execute}
+        onChange={(e) => setFormData({...formData, auto_execute: e.target.checked})}
+        disabled={!formData.auto_validate}
+      />
+      Help text: "⚠️ WARNING: Automatically execute validated trades. Use with extreme caution!"
+
+   3) Execution Mode (shown if auto_execute enabled):
+      <Form.Select value={formData.execution_mode} onChange={...}>
+        <option value="dry-run">Dry-Run (Simulation Only)</option>
+        <option value="live">Live (Real Trades) ⚠️</option>
+      </Form.Select>
+
+   4) Daily Limit:
+      <Form.Control
+        type="number"
+        label="Max auto-executions per day"
+        value={formData.max_daily_auto_executions}
+        onChange={...}
+        min={1}
+        max={50}
+      />
+
+   5) Notification Channels (checkboxes):
+      - Email
+      - Webhook
+      - UI Notification
+
+   SAFETY WARNINGS:
+   - Show big red warning if execution_mode === 'live'
+   - Require confirmation checkbox: "I understand this will place real trades with real money"
+   - Disable submit button until confirmation checked
+
+E) NOTIFICATION SYSTEM (api/application/notifications.py)
+   Create notification dispatcher
+
+   class NotificationChannel(Protocol):
+       def send(self, event: Event) -> None: ...
+
+   class EmailNotifier:
+       def send(self, event: IntentExecutedEvent):
+           # Send email with intent details
+           send_mail(
+               subject=f'Trade Executed: {event.intent.symbol.name}',
+               message=f'Your {event.intent.side} order for {event.intent.quantity} {event.intent.symbol.base_asset} was executed.',
+               recipient_list=[event.intent.client.email],
+           )
+
+   class WebhookNotifier:
+       def send(self, event: Event):
+           # POST to configured webhook URL
+           requests.post(event.intent.client.webhook_url, json=event.to_dict())
+
+   class UINotifier:
+       def send(self, event: Event):
+           # Save to database notification table for frontend to fetch
+           Notification.objects.create(
+               client=event.intent.client,
+               type=event.type,
+               title=event.get_title(),
+               message=event.get_message(),
+               link=f'/trading-intents/{event.intent.intent_id}',
+               read=False
+           )
+
+   class NotificationDispatcher:
+       def __init__(self, channels: List[NotificationChannel]):
+           self._channels = channels
+
+       def notify(self, event: Event):
+           for channel in self._channels:
+               try:
+                   channel.send(event)
+               except Exception as e:
+                   logger.error(f'Failed to send notification via {channel}: {e}')
+
+F) TESTS (api/tests/test_auto_trigger.py)
+   1) test_pattern_creates_intent_auto_validates
+      - Create StrategyPatternConfig with auto_validate=True
+      - Create ConfirmedPattern
+      - Call PatternToPlanUseCase
+      - Verify intent created with status=VALIDATED
+
+   2) test_pattern_auto_executes_dry_run
+      - Config: auto_execute=True, execution_mode='dry-run'
+      - Trigger pattern
+      - Verify intent executed in dry-run mode
+      - Verify no real orders placed
+
+   3) test_pattern_auto_executes_live (CAREFUL!)
+      - Use test Binance account or mock
+      - Config: auto_execute=True, execution_mode='live'
+      - Trigger pattern
+      - Verify real order placed (or mocked)
+
+   4) test_daily_limit_enforced
+      - Create 5 auto-executed intents today
+      - Trigger 6th pattern
+      - Verify 6th pattern NOT executed (limit reached)
+
+   5) test_notification_sent
+      - Mock email/webhook
+      - Trigger auto-execute
+      - Verify notification sent
+
+QUALITY BAR
+- Auto-execute NEVER defaults to 'live' (always dry-run unless explicitly set)
+- Daily limits enforced strictly (safety mechanism)
+- Failed auto-validations logged but don't crash system
+- Notifications include enough detail for user to take action
+- Cron job runs reliably without missing patterns
+- Multi-tenant isolation perfect (no cross-client triggers)
+- Audit trail complete (every auto-triggered intent logged)
+
+OUTPUT FORMAT
+1. Brief plan summary
+2. File paths + code changes
+3. Cron setup instructions
+4. Manual test script:
+   - Create StrategyPatternConfig with auto-execute
+   - Trigger pattern detection
+   - Verify intent auto-created, validated, executed
+   - Check notifications received
+
+SUCCESS CRITERIA
+- Pattern detected → Intent created automatically
+- Auto-validate flag works (skips manual validation step)
+- Auto-execute flag works (executes after validation)
+- Dry-run mode works (no real orders)
+- Live mode works (real orders, with user confirmation required)
+- Daily limit prevents runaway executions
+- Notifications sent on all events
+- Cron job runs without errors
+- All tests pass
+
+Now implement.
