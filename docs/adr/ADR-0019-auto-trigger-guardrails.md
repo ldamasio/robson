@@ -1,0 +1,303 @@
+# ADR-0019: Auto-Trigger Guardrails for Pattern-Based Trading
+
+**Status:** Accepted
+**Date:** 2026-01-01
+**Context:** Phase 5 - Pattern Auto-Trigger Implementation
+**Related:** [ADR-0007](ADR-0007-robson-is-risk-assistant-not-autotrader.md), [ADR-0018](ADR-0018-pattern-detection-engine.md)
+
+---
+
+## Context
+
+Phase 5 introduces **pattern auto-trigger**, where detected patterns can automatically
+validate and execute trading intents. This is a **high-risk feature** because:
+
+1. **Real money at stake**: Auto-trigger with LIVE mode can place real orders
+2. **No human in the loop**: Unlike manual flow, user isn't reviewing each trade
+3. **Cascading failures**: Pattern detection bug → multiple bad trades
+4. **Regulatory risk**: Automated trading requires safety measures
+
+**Core Principle** (from ADR-0007): Robson is a **risk management assistant**, NOT an
+auto-trader. Auto-trigger must respect this principle.
+
+---
+
+## Decision
+
+### 1. Safe Defaults (Non-Negotiable)
+
+**Auto-execute is OFF by default.**
+```javascript
+// Default configuration
+const autoTriggerConfig = {
+  autoValidate: false,  // User must explicitly enable
+  autoExecute: false,   // User must explicitly enable
+  executionMode: 'dry-run',  // DRY-RUN is default, not LIVE
+};
+```
+
+**Rationale:**
+- New users start with manual flow
+- Existing behavior unchanged (explicit opt-in)
+- Prevents accidental LIVE execution
+
+### 2. Typed Confirmation Remains Mandatory for LIVE
+
+Even with auto-trigger enabled, LIVE execution requires **typed confirmation**.
+
+```javascript
+// Pseudo-code for auto-trigger LIVE execution
+if (autoExecute && executionMode === 'live') {
+  // First attempt: Show confirmation modal with typed input
+  const confirmed = await showConfirmationDialog({
+    title: 'Confirm LIVE Auto-Execution',
+    message: 'Type CONFIRM to proceed with LIVE execution:',
+    patternName: pattern.name,
+    intentDetails: intent,
+  });
+
+  if (!confirmed) {
+    // User cancelled or typed wrong
+    logger.info('Auto-trigger LIVE execution cancelled by user');
+    return;
+  }
+}
+```
+
+**Rationale:**
+- User must explicitly approve LIVE trades
+- Prevents "fire and forget" LIVE trading
+- Regulatory compliance (user affirmation)
+
+### 3. Rate Limits / Safety Limits (Per-User Per-Day)
+
+**Maximum auto-executions per user per day: 10**
+```python
+# Backend validation (pseudo-code)
+MAX_AUTO_EXECUTIONS_PER_DAY = 10
+
+def validate_auto_trigger_limit(client_id):
+    today = datetime.now().date()
+    count = AutoTriggerEvent.objects.filter(
+        client_id=client_id,
+        timestamp__date=today,
+        event_type='execute'
+    ).count()
+
+    if count >= MAX_AUTO_EXECUTIONS_PER_DAY:
+        raise AutoTriggerLimitExceeded(
+            f"Daily auto-execution limit reached ({MAX_AUTO_EXECUTIONS_PER_DAY})"
+        )
+```
+
+**Kill switch flag (emergency override):**
+```python
+# Backend setting
+AUTO_TRIGGER_KILL_SWITCH = False  # Global off switch
+
+if AUTO_TRIGGER_KILL_SWITCH:
+    logger.warning("Auto-trigger kill switch engaged, blocking all auto-triggers")
+    raise AutoTriggerDisabled("Auto-trigger temporarily disabled by admin")
+```
+
+**Rationale:**
+- Limiting blast radius of bugs/attacks
+- Emergency shutdown capability
+- Per-user isolation (one user can't affect others)
+
+### 4. Idempotency Protection (Prevent Double-Runs)
+
+**Pattern auto-trigger must be idempotent.**
+```python
+# Backend validation (pseudo-code)
+def validate_idempotency(pattern_id, intent_id):
+    # Check if this pattern+intent was already auto-triggered
+    existing = AutoTriggerEvent.objects.filter(
+        pattern_id=pattern_id,
+        intent_id=intent_id,
+        event_type__in=['validate', 'execute']
+    ).first()
+
+    if existing:
+        logger.info(f"Auto-trigger already executed for pattern={pattern_id}, intent={intent_id}")
+        raise IdempotencyViolation("This intent was already processed by auto-trigger")
+```
+
+**Frontend de-duplication:**
+```javascript
+// Frontend: Skip if intent already processed
+if (intent.auto_triggered) {
+  logger.info('Intent already auto-triggered, skipping');
+  return;
+}
+```
+
+**Rationale:**
+- Retries/restarts shouldn't double-execute
+- Prevents race conditions in distributed systems
+- Audit trail integrity
+
+### 5. Audit Events (Who/What/When/Result)
+
+**All auto-trigger events must be logged with full context.**
+```python
+# Backend audit model
+class AutoTriggerEvent(models.Model):
+    event_id = models.UUIDField(primary_key=True, default=uuid.uuid4)
+    client_id = models.IntegerField()  # Who
+    pattern_id = models.IntegerField()  # What pattern
+    intent_id = models.UUIDField()  # What intent
+    event_type = models.CharField(choices=['validate', 'execute', 'cancel'])
+    execution_mode = models.CharField(choices=['dry-run', 'live'])
+    status = models.CharField(choices=['started', 'success', 'failed', 'cancelled'])
+    error_message = models.TextField(null=True, blank=True)
+    timestamp = models.DateTimeField(auto_now_add=True)
+
+    # Risk context
+    auto_validate_enabled = models.BooleanField()
+    auto_execute_enabled = models.BooleanField()
+    user_confirmed_live = models.BooleanField()  # For LIVE mode
+```
+
+**Audit query examples:**
+```sql
+-- How many auto-executions today per user?
+SELECT client_id, COUNT(*)
+FROM auto_trigger_event
+WHERE event_type = 'execute'
+  AND DATE(timestamp) = CURRENT_DATE
+GROUP BY client_id;
+
+-- Which patterns are triggering most frequently?
+SELECT pattern_id, COUNT(*) as trigger_count
+FROM auto_trigger_event
+GROUP BY pattern_id
+ORDER BY trigger_count DESC
+LIMIT 10;
+```
+
+**Rationale:**
+- Regulatory compliance (audit trail)
+- Debugging (what happened when)
+- Risk monitoring (unusual patterns)
+
+### 6. UX Visibility (Never Silent)
+
+**Auto-trigger activity must always be visible in the UI.**
+
+**Banner on intent status screen (when auto-trigger enabled):**
+```jsx
+<Alert variant="info" className="mb-3">
+  <strong>Auto-Trigger Enabled:</strong> This intent will be automatically
+  validated and executed when pattern conditions are met.
+  <br />
+  <small>Pattern: {pattern.name} | Mode: {executionMode}</small>
+</Alert>
+```
+
+**Toast notifications for each auto-trigger step:**
+```javascript
+// Pattern detected
+showLoading(`Pattern detected: ${pattern.name}. Validating...`);
+
+// Validation complete
+updateLoadingToSuccess(toastId, 'Validation passed. Ready to execute.');
+
+// Execution (dry-run)
+updateLoadingToSuccess(toastId, 'Dry-run execution complete. No real orders placed.');
+
+// Execution (LIVE) - requires confirmation
+showWarning('LIVE auto-execution: Type CONFIRM to proceed.');
+```
+
+**Activity log on dashboard:**
+```jsx
+<AutoTriggerActivityLog>
+  <ActivityItem
+    timestamp="2026-01-01 10:23:45"
+    pattern="MA4/MA9 Crossover"
+    intent="BTCUSDC BUY @ $95000"
+    status="success"
+    mode="dry-run"
+  />
+</AutoTriggerActivityLog>
+```
+
+**Rationale:**
+- User awareness (no silent background activity)
+- Trust (transparency builds confidence)
+- Control (user can disable if needed)
+
+---
+
+## Consequences
+
+### Positive
+
+1. **Safety first**: Multiple layers prevent accidental LIVE trading
+2. **Auditability**: Full traceability of all auto-trigger activity
+3. **Compliance**: Meets regulatory requirements for automated trading
+4. **User trust**: Transparency and control build confidence
+5. **Limiting blast radius**: Per-user limits and kill switch limit damage
+
+### Negative
+
+1. **Friction**: Typed confirmation for LIVE may feel tedious
+2. **Development overhead**: Audit logging adds complexity
+3. **Maintenance**: Rate limits require monitoring and adjustment
+
+### Mitigations
+
+1. **Friction**: Only require confirmation for LIVE, not dry-run
+2. **Development overhead**: Reuse existing audit infrastructure
+3. **Maintenance**: Set alerts for limit breaches, review quarterly
+
+---
+
+## Implementation Checklist
+
+### Backend (Django)
+- [ ] Add `AutoTriggerEvent` model with audit fields
+- [ ] Add rate limit validation (`MAX_AUTO_EXECUTIONS_PER_DAY`)
+- [ ] Add idempotency check (prevent double-runs)
+- [ ] Add kill switch setting (`AUTO_TRIGGER_KILL_SWITCH`)
+- [ ] Add auto-trigger endpoints (`POST /api/patterns/{id}/enable-auto-trigger`)
+- [ ] Update validation/execution views to check auto-trigger flags
+
+### Frontend (React)
+- [ ] Add auto-trigger banner to intent status screen
+- [ ] Add toast notifications for auto-trigger steps
+- [ ] Add activity log component to dashboard
+- [ ] Add auto-trigger settings modal (enable/disable, mode selection)
+- [ ] Add confirmation dialog for LIVE auto-execution
+
+### Documentation
+- [ ] Update user docs with auto-trigger safety info
+- [ ] Add operations runbook for kill switch usage
+- [ ] Add monitoring dashboard for auto-trigger metrics
+
+---
+
+## Alternatives Considered
+
+### Alternative 1: No Rate Limits
+**Rejected:** Too risky. A bug could drain accounts in minutes.
+
+### Alternative 2: No Typed Confirmation for LIVE
+**Rejected:** Violates regulatory requirements and ADR-0007 principles.
+
+### Alternative 3: Silent Auto-Trigger (No UI Until Complete)
+**Rejected:** Users need to see what's happening. Silent execution erodes trust.
+
+---
+
+## References
+
+- [ADR-0007: Robson is Risk Assistant, Not Auto-Trader](ADR-0007-robson-is-risk-assistant-not-autotrader.md)
+- [ADR-0018: Pattern Detection Engine](ADR-0018-pattern-detection-engine.md)
+- [Phase 5 Prompt](../plan/prompts/agentic-workflow/prompt-05-pattern-auto-trigger.txt)
+
+---
+
+**Approved by:** Engineering Decision Record
+**Review date:** 2026-04-01 (6 months post-implementation)

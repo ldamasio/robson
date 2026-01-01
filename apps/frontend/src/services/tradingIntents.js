@@ -31,8 +31,28 @@ const buildQueryParams = (params) => {
 /**
  * List trading intents with optional filtering.
  *
- * Note: Backend currently only supports single status filter, so for multiple
- * statuses we fetch all and filter client-side (temporary pragmatic solution).
+ * BACKEND LIMITATION (TODO: Follow-up required):
+ * The backend view at `apps/backend/monolith/api/views/trading_intent_views.py`
+ * (line 200: `status_filter = request.query_params.get("status")`) only supports
+ * a SINGLE status value, not multiple. This is a Django limitation where
+ * `.get()` returns only the first value for repeated query params.
+ *
+ * Current workaround:
+ * - For multiple statuses, we fetch with limit=100 and filter client-side
+ * - For single status, we use the backend filter directly
+ *
+ * Known issues with this approach:
+ * 1. We may miss intents beyond the first 100 (pagination problem)
+ * 2. Client-side filtering doesn't scale with large datasets
+ * 3. The `count` field becomes inaccurate after filtering
+ *
+ * Future options (choose one when this becomes a bottleneck):
+ * A. Backend fix: Change `request.query_params.get("status")` to `getlist()`
+ * B. Backend fix: Add support for `status__in=PENDING,VALIDATED` format
+ * C. Backend fix: Add dedicated endpoint `/api/trading-intents/by-statuses/`
+ * D. Frontend: Make multiple parallel requests and merge results
+ *
+ * Tracking: Tag with "tech-debt-status-filter" in issue tracker
  *
  * @param {Object} options - Fetch options
  * @param {string} options.baseUrl - API base URL
@@ -84,6 +104,7 @@ export const listTradingIntents = async ({
   const data = await response.json();
 
   // Client-side filtering for multiple statuses
+  // NOTE: This may miss intents beyond fetchLimit (pagination issue)
   if (shouldFilterClientSide && data.results) {
     const statusSet = new Set(statuses);
     const filteredResults = data.results.filter((intent) => statusSet.has(intent.status));
