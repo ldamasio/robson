@@ -154,7 +154,7 @@ class CreateTradingIntentUseCase:
             "regime": command.regime,
             "confidence": command.confidence,
             "reason": command.reason,
-            "capital": command.capital,
+            "capital": self._quantize_decimal(command.capital, decimal_places=8),
             "risk_amount": calculations["risk_amount"],
             "risk_percent": calculations["risk_percent"],
         }
@@ -220,11 +220,29 @@ class CreateTradingIntentUseCase:
         # Calculate risk as percentage of entry price
         risk_percent = (stop_distance / entry_price) * Decimal("100")
 
+        # Quantize to match TradingIntent model constraints
         return {
-            "quantity": quantity,
-            "risk_amount": risk_amount,
-            "risk_percent": risk_percent,
+            "quantity": self._quantize_decimal(quantity, decimal_places=8),
+            "risk_amount": self._quantize_decimal(risk_amount, decimal_places=8),
+            "risk_percent": self._quantize_decimal(risk_percent, decimal_places=2),
         }
+
+    def _quantize_decimal(self, value: Decimal, decimal_places: int) -> Decimal:
+        """
+        Quantize a Decimal to the specified number of decimal places.
+
+        This prevents ValidationError when saving to DecimalField with
+        max_digits/decimal_places constraints.
+
+        Args:
+            value: The Decimal value to quantize
+            decimal_places: Number of decimal places to round to
+
+        Returns:
+            Quantized Decimal value
+        """
+        quantizer = Decimal(10) ** -decimal_places
+        return value.quantize(quantizer)
 
     def _generate_intent_id(self) -> str:
         """Generate a unique intent ID."""
