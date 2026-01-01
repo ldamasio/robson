@@ -124,15 +124,17 @@ describe('StartNewOperationModal', () => {
     renderWithAuth(<StartNewOperationModal {...defaultProps} />);
 
     await waitFor(() => {
-      expect(screen.getByText('Create Plan')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Create Plan/ })).toBeInTheDocument();
     });
 
     // Fill form with same entry and stop price
-    const symbolSelect = screen.getByLabelText(/Trading Pair/);
-    const strategySelect = screen.getByLabelText(/Strategy/);
-    const entryPriceInput = screen.getByLabelText(/Entry Price/);
-    const stopPriceInput = screen.getByLabelText(/Stop Price/);
-    const capitalInput = screen.getByLabelText(/Capital/);
+    // Use document.querySelectorAll since modal renders in portal
+    const allSelects = screen.getAllByRole('combobox');
+    const symbolSelect = allSelects[0];
+    const strategySelect = allSelects[1];
+    const entryPriceInput = screen.getAllByPlaceholderText('0.00')[0];
+    const stopPriceInput = screen.getAllByPlaceholderText('0.00')[1];
+    const capitalInput = screen.getByPlaceholderText('1000.00');
 
     fireEvent.change(symbolSelect, { target: { value: '1' } });
     fireEvent.change(strategySelect, { target: { value: '1' } });
@@ -141,7 +143,7 @@ describe('StartNewOperationModal', () => {
     fireEvent.change(capitalInput, { target: { value: '10000' } });
 
     // Submit
-    const submitButton = screen.getByText('Create Plan');
+    const submitButton = screen.getByRole('button', { name: /Create Plan/ });
     fireEvent.click(submitButton);
 
     // Wait for validation error
@@ -191,15 +193,16 @@ describe('StartNewOperationModal', () => {
     renderWithAuth(<StartNewOperationModal {...defaultProps} />);
 
     await waitFor(() => {
-      expect(screen.getByText('Create Plan')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Create Plan/ })).toBeInTheDocument();
     });
 
     // Fill form
-    const symbolSelect = screen.getByLabelText(/Trading Pair/);
-    const strategySelect = screen.getByLabelText(/Strategy/);
-    const entryPriceInput = screen.getByLabelText(/Entry Price/);
-    const stopPriceInput = screen.getByLabelText(/Stop Price/);
-    const capitalInput = screen.getByLabelText(/Capital/);
+    const allSelects = screen.getAllByRole('combobox');
+    const symbolSelect = allSelects[0];
+    const strategySelect = allSelects[1];
+    const entryPriceInput = screen.getAllByPlaceholderText('0.00')[0];
+    const stopPriceInput = screen.getAllByPlaceholderText('0.00')[1];
+    const capitalInput = screen.getByPlaceholderText('1000.00');
 
     fireEvent.change(symbolSelect, { target: { value: '1' } });
     fireEvent.change(strategySelect, { target: { value: '1' } });
@@ -208,7 +211,7 @@ describe('StartNewOperationModal', () => {
     fireEvent.change(capitalInput, { target: { value: '10000' } });
 
     // Submit
-    const submitButton = screen.getByText('Create Plan');
+    const submitButton = screen.getByRole('button', { name: /Create Plan/ });
     fireEvent.click(submitButton);
 
     // Wait for success
@@ -259,15 +262,16 @@ describe('StartNewOperationModal', () => {
     renderWithAuth(<StartNewOperationModal {...defaultProps} />);
 
     await waitFor(() => {
-      expect(screen.getByText('Create Plan')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Create Plan/ })).toBeInTheDocument();
     });
 
     // Fill form
-    const symbolSelect = screen.getByLabelText(/Trading Pair/);
-    const strategySelect = screen.getByLabelText(/Strategy/);
-    const entryPriceInput = screen.getByLabelText(/Entry Price/);
-    const stopPriceInput = screen.getByLabelText(/Stop Price/);
-    const capitalInput = screen.getByLabelText(/Capital/);
+    const allSelects = screen.getAllByRole('combobox');
+    const symbolSelect = allSelects[0];
+    const strategySelect = allSelects[1];
+    const entryPriceInput = screen.getAllByPlaceholderText('0.00')[0];
+    const stopPriceInput = screen.getAllByPlaceholderText('0.00')[1];
+    const capitalInput = screen.getByPlaceholderText('1000.00');
 
     fireEvent.change(symbolSelect, { target: { value: '1' } });
     fireEvent.change(strategySelect, { target: { value: '1' } });
@@ -276,7 +280,7 @@ describe('StartNewOperationModal', () => {
     fireEvent.change(capitalInput, { target: { value: '10000' } });
 
     // Submit
-    const submitButton = screen.getByText('Create Plan');
+    const submitButton = screen.getByRole('button', { name: /Create Plan/ });
     fireEvent.click(submitButton);
 
     // Wait for error message
@@ -319,15 +323,16 @@ describe('StartNewOperationModal', () => {
     renderWithAuth(<StartNewOperationModal {...defaultProps} />);
 
     await waitFor(() => {
-      expect(screen.getByText('Create Plan')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Create Plan/ })).toBeInTheDocument();
     });
 
     // Fill form
-    const symbolSelect = screen.getByLabelText(/Trading Pair/);
-    const strategySelect = screen.getByLabelText(/Strategy/);
-    const entryPriceInput = screen.getByLabelText(/Entry Price/);
-    const stopPriceInput = screen.getByLabelText(/Stop Price/);
-    const capitalInput = screen.getByLabelText(/Capital/);
+    const allSelects = screen.getAllByRole('combobox');
+    const symbolSelect = allSelects[0];
+    const strategySelect = allSelects[1];
+    const entryPriceInput = screen.getAllByPlaceholderText('0.00')[0];
+    const stopPriceInput = screen.getAllByPlaceholderText('0.00')[1];
+    const capitalInput = screen.getByPlaceholderText('1000.00');
 
     fireEvent.change(symbolSelect, { target: { value: '1' } });
     fireEvent.change(strategySelect, { target: { value: '1' } });
@@ -336,7 +341,7 @@ describe('StartNewOperationModal', () => {
     fireEvent.change(capitalInput, { target: { value: '10000' } });
 
     // Submit
-    const submitButton = screen.getByText('Create Plan');
+    const submitButton = screen.getByRole('button', { name: /Create Plan/ });
     fireEvent.click(submitButton);
 
     // Wait for loading state
@@ -372,14 +377,15 @@ describe('StartNewOperationModal', () => {
     renderWithAuth(<StartNewOperationModal {...defaultProps} />);
 
     await waitFor(() => {
-      expect(screen.getByText('Create Plan')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Create Plan/ })).toBeInTheDocument();
     });
 
     // Fill form
-    const symbolSelect = screen.getByLabelText(/Trading Pair/);
-    const entryPriceInput = screen.getByLabelText(/Entry Price/);
-    const stopPriceInput = screen.getByLabelText(/Stop Price/);
-    const capitalInput = screen.getByLabelText(/Capital/);
+    const allSelects = screen.getAllByRole('combobox');
+    const symbolSelect = allSelects[0];
+    const entryPriceInput = screen.getAllByPlaceholderText('0.00')[0];
+    const stopPriceInput = screen.getAllByPlaceholderText('0.00')[1];
+    const capitalInput = screen.getByPlaceholderText('1000.00');
 
     fireEvent.change(symbolSelect, { target: { value: '1' } });
     fireEvent.change(entryPriceInput, { target: { value: '50000' } });
@@ -391,9 +397,10 @@ describe('StartNewOperationModal', () => {
       expect(screen.getByText(/Calculated Position Size:/)).toBeInTheDocument();
     });
 
-    // Check calculation is displayed
+    // Check calculation is displayed - use more specific selector
     // Position Size = (10000 × 0.01) / |50000 - 48000| = 100 / 2000 = 0.05 BTC
-    expect(screen.getByText(/0\.0500/)).toBeInTheDocument();
-    expect(screen.getByText(/BTC/)).toBeInTheDocument();
+    expect(screen.getByText(/0\.05/)).toBeInTheDocument();
+    // Use getAllByText since BTC appears in multiple places
+    expect(screen.getAllByText(/BTC/).length).toBeGreaterThan(0);
   });
 });
