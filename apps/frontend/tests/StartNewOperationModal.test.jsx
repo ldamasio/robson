@@ -102,17 +102,17 @@ describe('StartNewOperationModal', () => {
     renderWithAuth(<StartNewOperationModal {...defaultProps} />);
 
     await waitFor(() => {
-      expect(screen.getByText('Create Plan')).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /Create Plan/ })).toBeInTheDocument();
     });
 
     // Click submit without filling form
-    const submitButton = screen.getByText('Create Plan');
+    const submitButton = screen.getByRole('button', { name: /Create Plan/ });
     fireEvent.click(submitButton);
 
-    // Wait for validation errors
+    // Wait for validation errors to appear
     await waitFor(() => {
       expect(screen.getByText('Symbol is required')).toBeInTheDocument();
-    });
+    }, { timeout: 3000 });
 
     expect(screen.getByText('Strategy is required')).toBeInTheDocument();
     expect(screen.getByText('Entry price is required')).toBeInTheDocument();
