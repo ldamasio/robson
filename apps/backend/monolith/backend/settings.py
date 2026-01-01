@@ -119,6 +119,9 @@ MIDDLEWARE = [
     # Correlation ID - early for request tracking
     'api.middleware.correlation_id.CorrelationIDMiddleware',
 
+    # Kubernetes probe endpoints - bypass SSL redirect BEFORE SecurityMiddleware
+    'api.middleware.probe_no_redirect.ProbeNoRedirectMiddleware',
+
     'corsheaders.middleware.CorsMiddleware',
     'django.middleware.security.SecurityMiddleware',
     'django.contrib.sessions.middleware.SessionMiddleware',
