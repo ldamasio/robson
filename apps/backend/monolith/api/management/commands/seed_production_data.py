@@ -52,28 +52,67 @@ class Command(BaseCommand):
             if created:
                 self.stdout.write(f"Created symbol: {name}")
 
-        # 2. Create Strategies
-        strategies_data = ["Trend Following", "Mean Reversion", "Breakout"]
+        # 2. Create Strategies (Pre-defined strategies for Robson)
+        strategies_data = [
+            {
+                "name": "Strategy 0001 - Rescue Forces",
+                "description": "Primary rescue strategy for market reversals and oversold conditions",
+                "config": {
+                    "timeframe": "15m",
+                    "indicators": ["RSI", "MACD", "Support/Resistance"],
+                    "entry_type": "reversal"
+                }
+            },
+            {
+                "name": "Trend Following",
+                "description": "Standard trend following strategy using moving averages",
+                "config": {
+                    "timeframe": "1h",
+                    "indicators": ["MA50", "MA200"],
+                    "entry_type": "trend"
+                }
+            },
+            {
+                "name": "Mean Reversion",
+                "description": "Mean reversion strategy for range-bound markets",
+                "config": {
+                    "timeframe": "30m",
+                    "indicators": ["Bollinger Bands", "RSI"],
+                    "entry_type": "reversion"
+                }
+            },
+            {
+                "name": "Breakout",
+                "description": "Breakout strategy for high volatility conditions",
+                "config": {
+                    "timeframe": "1h",
+                    "indicators": ["Volume", "ATR", "Support/Resistance"],
+                    "entry_type": "breakout"
+                }
+            }
+        ]
+
         strategies = {}
-        for s_name in strategies_data:
+        for s_data in strategies_data:
             strategy, created = Strategy.objects.get_or_create(
-                name=s_name,
+                name=s_data["name"],
                 client=client,
                 defaults={
-                    "description": f"Standard {s_name} strategy",
+                    "description": s_data["description"],
+                    "config": s_data.get("config", {}),
                     "is_active": True
                 }
             )
-            strategies[s_name] = strategy
+            strategies[s_data["name"]] = strategy
             if created:
-                self.stdout.write(f"Created strategy: {s_name}")
+                self.stdout.write(f"Created strategy: {s_data['name']}")
 
         # 3. Create active Operations (Positions)
-        # Position 1: BTCUSDC Long (Winning)
+        # Position 1: BTCUSDC Long (Winning) - Using Rescue Forces strategy
         self._create_active_position(
-            client, 
-            symbols["BTCUSDC"], 
-            strategies["Trend Following"],
+            client,
+            symbols["BTCUSDC"],
+            strategies["Strategy 0001 - Rescue Forces"],
             side="BUY",
             entry_price=Decimal("95000.00"),
             quantity=Decimal("0.15"),
@@ -82,19 +121,19 @@ class Command(BaseCommand):
 
         # Position 2: ETHUSDC Long (Losing)
         self._create_active_position(
-            client, 
-            symbols["ETHUSDC"], 
+            client,
+            symbols["ETHUSDC"],
             strategies["Mean Reversion"],
             side="BUY",
             entry_price=Decimal("3500.00"),
             quantity=Decimal("2.5"),
             current_mock_price=Decimal("3420.00") # $80 loss/unit
         )
-        
+
         # Position 3: SOLUSDC Short (Winning)
         self._create_active_position(
-            client, 
-            symbols["SOLUSDC"], 
+            client,
+            symbols["SOLUSDC"],
             strategies["Breakout"],
             side="SELL",
             entry_price=Decimal("190.00"),
