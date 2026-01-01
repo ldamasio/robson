@@ -1,3 +1,12 @@
+> ⚠️ **SUPERSEDED**
+>
+> This execution plan has been **superseded** by
+> **[UNIFIED-EXECUTION-PLAN.md](docs/plan/execution/UNIFIED-EXECUTION-PLAN.md)**.
+>
+> It is kept **for historical reference only** and should not be used for new development.
+>
+> **Superseded on:** 2026-01-01
+
 # Execution Plan: Agentic Workflow End-to-End Implementation
 
 **Date**: 2026-01-01
