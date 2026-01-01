@@ -24,7 +24,11 @@ function StartNewOperation() {
 
   return (
     <>
-      <Button variant="primary" onClick={() => setModalShow(true)}>
+      <Button
+        id="start-new-operation-btn"
+        variant="primary"
+        onClick={() => setModalShow(true)}
+      >
         Start New Operation
       </Button>
 
