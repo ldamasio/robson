@@ -122,6 +122,17 @@ docs/
 - [../CLAUDE.md](../CLAUDE.md) - Claude Code integration
 - [../.cursorrules](../.cursorrules) - Cursor AI rules
 
+### For **Traders / Users**
+
+**Getting Started**:
+- **[Strategies Guide](STRATEGIES.md)** - Pre-built trading strategies (All In, Rescue Forces, etc.)
+- [Position Sizing Golden Rule](requirements/POSITION-SIZING-GOLDEN-RULE.md) - How position sizes are calculated
+- [Technical Stop Documentation](requirements/TECHNICAL-STOP.md) - Understanding technical stop-loss
+
+**Trading**:
+- [Risk Management](RISK-MANAGEMENT.md) - Risk controls and limits
+- [Pattern Detection](PATTERN-DETECTION.md) - Automated pattern recognition
+
 ### For **Product / Business**
 
 **Overview**:

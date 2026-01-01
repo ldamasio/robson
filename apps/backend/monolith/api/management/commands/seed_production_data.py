@@ -52,42 +52,68 @@ class Command(BaseCommand):
             if created:
                 self.stdout.write(f"Created symbol: {name}")
 
-        # 2. Create Strategies (Pre-defined strategies for Robson)
+        # 2. Create Strategies (Pre-defined strategies for Robson - Playful names for better UX)
         strategies_data = [
             {
-                "name": "Strategy 0001 - Rescue Forces",
-                "description": "Primary rescue strategy for market reversals and oversold conditions",
+                "name": "All In",
+                "description": "Go all-in with technical stop precision. Buy maximum position size with stop at second technical support (15m chart).",
                 "config": {
                     "timeframe": "15m",
-                    "indicators": ["RSI", "MACD", "Support/Resistance"],
-                    "entry_type": "reversal"
+                    "indicators": ["Support/Resistance", "Technical Stop"],
+                    "entry_type": "manual",
+                    "risk_percent": 1.0,
+                    "use_technical_stop": True,
+                    "leverage": 3,
+                    "account_type": "isolated_margin"
+                },
+                "risk_config": {
+                    "max_risk_per_trade": 1.0,
+                    "use_technical_stop": True,
+                    "stop_placement": "second_support_15m"
                 }
             },
             {
-                "name": "Trend Following",
-                "description": "Standard trend following strategy using moving averages",
+                "name": "Rescue Forces",
+                "description": "Automatic rescue on bullish momentum. Enters when MA4 crosses above MA9 with short-term uptrend confirmed.",
+                "config": {
+                    "timeframe": "15m",
+                    "indicators": ["MA4", "MA9", "Trend"],
+                    "entry_type": "auto",
+                    "entry_conditions": {
+                        "ma_cross": "MA4 > MA9",
+                        "trend": "short_term_bullish",
+                        "confirmation": "volume_spike"
+                    },
+                    "risk_percent": 1.0,
+                    "leverage": 3,
+                    "account_type": "isolated_margin"
+                },
+                "risk_config": {
+                    "max_risk_per_trade": 1.0,
+                    "use_technical_stop": True,
+                    "stop_placement": "below_ma9"
+                }
+            },
+            {
+                "name": "Smooth Sailing",
+                "description": "Ride the calm waves of trending markets with moving average crossovers.",
                 "config": {
                     "timeframe": "1h",
                     "indicators": ["MA50", "MA200"],
-                    "entry_type": "trend"
+                    "entry_type": "trend",
+                    "risk_percent": 0.5,
+                    "account_type": "spot"
                 }
             },
             {
-                "name": "Mean Reversion",
-                "description": "Mean reversion strategy for range-bound markets",
+                "name": "Bounce Back",
+                "description": "Catch the bounce when price returns to mean in range-bound markets.",
                 "config": {
                     "timeframe": "30m",
                     "indicators": ["Bollinger Bands", "RSI"],
-                    "entry_type": "reversion"
-                }
-            },
-            {
-                "name": "Breakout",
-                "description": "Breakout strategy for high volatility conditions",
-                "config": {
-                    "timeframe": "1h",
-                    "indicators": ["Volume", "ATR", "Support/Resistance"],
-                    "entry_type": "breakout"
+                    "entry_type": "reversion",
+                    "risk_percent": 0.5,
+                    "account_type": "spot"
                 }
             }
         ]
@@ -108,33 +134,33 @@ class Command(BaseCommand):
                 self.stdout.write(f"Created strategy: {s_data['name']}")
 
         # 3. Create active Operations (Positions)
-        # Position 1: BTCUSDC Long (Winning) - Using Rescue Forces strategy
+        # Position 1: BTCUSDC Long (Winning) - Using All In strategy
         self._create_active_position(
             client,
             symbols["BTCUSDC"],
-            strategies["Strategy 0001 - Rescue Forces"],
+            strategies["All In"],
             side="BUY",
             entry_price=Decimal("95000.00"),
             quantity=Decimal("0.15"),
             current_mock_price=Decimal("96500.00") # $1500 profit/unit
         )
 
-        # Position 2: ETHUSDC Long (Losing)
+        # Position 2: ETHUSDC Long (Losing) - Using Rescue Forces
         self._create_active_position(
             client,
             symbols["ETHUSDC"],
-            strategies["Mean Reversion"],
+            strategies["Rescue Forces"],
             side="BUY",
             entry_price=Decimal("3500.00"),
             quantity=Decimal("2.5"),
             current_mock_price=Decimal("3420.00") # $80 loss/unit
         )
 
-        # Position 3: SOLUSDC Short (Winning)
+        # Position 3: SOLUSDC Short (Winning) - Using Smooth Sailing
         self._create_active_position(
             client,
             symbols["SOLUSDC"],
-            strategies["Breakout"],
+            strategies["Smooth Sailing"],
             side="SELL",
             entry_price=Decimal("190.00"),
             quantity=Decimal("15.0"),
@@ -186,13 +212,13 @@ class Command(BaseCommand):
         
         history_scenarios = [
             # (Symbol, Strategy, Side, Entry, Exit, Qty, is_win)
-            ("BTCUSDC", "Trend Following", "BUY", 92000, 94500, 0.1, True),
-            ("BTCUSDC", "Trend Following", "BUY", 94000, 93200, 0.1, False),
-            ("ETHUSDC", "Mean Reversion", "SELL", 3550, 3400, 2.0, True),
-            ("ETHUSDC", "Mean Reversion", "BUY", 3300, 3350, 2.0, True),
-            ("SOLUSDC", "Breakout", "BUY", 150, 180, 10.0, True),
-            ("SOLUSDC", "Breakout", "SELL", 185, 190, 10.0, False), # Short sold at 185, buy back at 190 (Loss)
-            ("BNBUSDC", "Trend Following", "BUY", 600, 610, 5.0, True),
+            ("BTCUSDC", "All In", "BUY", 92000, 94500, 0.1, True),
+            ("BTCUSDC", "All In", "BUY", 94000, 93200, 0.1, False),
+            ("ETHUSDC", "Rescue Forces", "SELL", 3550, 3400, 2.0, True),
+            ("ETHUSDC", "Rescue Forces", "BUY", 3300, 3350, 2.0, True),
+            ("SOLUSDC", "Smooth Sailing", "BUY", 150, 180, 10.0, True),
+            ("SOLUSDC", "Bounce Back", "SELL", 185, 190, 10.0, False), # Short sold at 185, buy back at 190 (Loss)
+            ("BNBUSDC", "All In", "BUY", 600, 610, 5.0, True),
         ]
 
         for sym_name, strat_name, side, entry, exit_val, qty, is_win in history_scenarios:

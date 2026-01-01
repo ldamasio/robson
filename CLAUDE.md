@@ -717,7 +717,23 @@ python manage.py positions --json    # JSON output
 python manage.py isolated_margin_buy --capital 100 --stop-percent 2 --leverage 3  # DRY-RUN
 python manage.py isolated_margin_buy --capital 100 --leverage 3 --live --confirm  # LIVE
 
-# Audit Trail Commands (NEW)
+# Strategy Commands (NEW - Playful UX)
+# See docs/STRATEGIES.md for full guide
+
+# Seed pre-defined strategies (All In, Rescue Forces, Smooth Sailing, Bounce Back)
+python manage.py seed_production_data
+
+# Execute "All In" strategy (BUY with technical stop from 15m chart)
+python manage.py technical_stop_buy --capital 100 --strategy "All In"  # DRY-RUN
+python manage.py technical_stop_buy --capital 100 --strategy "All In" --live --confirm  # LIVE
+
+# Use 4h timeframe instead of 15m
+python manage.py technical_stop_buy --capital 100 --strategy "All In" --timeframe 4h --live --confirm
+
+# Scan for "Rescue Forces" setups (MA4/MA9 crossover)
+python manage.py scan_patterns --strategy "Rescue Forces" --timeframe 15m
+
+# Audit Trail Commands
 python manage.py operations          # Show operations with movements
 python manage.py operations --open   # Only open operations
 python manage.py operations --json   # JSON output
