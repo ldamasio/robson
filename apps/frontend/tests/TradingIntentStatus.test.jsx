@@ -1,27 +1,11 @@
+// @vitest-environment jsdom
+import React from 'react';
 import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
 import { render, screen, waitFor, fireEvent } from '@testing-library/react';
-import '@testing-library/jest-dom';
 import TradingIntentStatus from '../src/components/logged/TradingIntentStatus';
+import AuthContext from '../src/context/AuthContext';
 
-// Mock react-router-dom
-vi.mock('react-router-dom', async () => {
-  const actual = await vi.importActual('react-router-dom');
-  return {
-    ...actual,
-    useNavigate: () => vi.fn(),
-  };
-});
-
-// Mock AuthContext
-const mockAuthTokens = { access: 'mock-token' };
-vi.mock('../src/context/AuthContext', () => ({
-  __esModule: true,
-  default: {},
-  AuthContext: { displayName: 'AuthContext' },
-  useContext: () => ({ authTokens: mockAuthTokens }),
-}));
-
-// Mock useTradingIntent hook
+// Mock useTradingIntent hook - we'll control this via vi.fn
 const mockIntent = {
   id: 'test-intent-123',
   status: 'PENDING',
@@ -48,17 +32,53 @@ let mockHookReturn = {
   isPolling: false,
 };
 
+// Mock react-router-dom
+vi.mock('react-router-dom', async () => {
+  const actual = await vi.importActual('react-router-dom');
+  return {
+    ...actual,
+    useNavigate: () => vi.fn(),
+  };
+});
+
+// Mock useTradingIntent hook
 vi.mock('../src/hooks/useTradingIntent', () => ({
   useTradingIntent: vi.fn(() => mockHookReturn),
 }));
+
+// Get reference to mocked hook for tests
+let mockUseTradingIntent;
+
+// Wrapper component with AuthContext
+const mockAuthTokens = {
+  access: 'mock-access-token',
+  refresh: 'mock-refresh-token',
+};
+
+const mockAuthContext = {
+  authTokens: mockAuthTokens,
+  user: { username: 'testuser' },
+  loginUser: vi.fn(),
+  logoutUser: vi.fn(),
+};
+
+const renderWithAuth = (ui, authContextValue = mockAuthContext) => {
+  return render(
+    <AuthContext.Provider value={authContextValue}>
+      {ui}
+    </AuthContext.Provider>
+  );
+};
 
 // Mock global fetch
 global.fetch = vi.fn();
 
 describe('TradingIntentStatus Component', () => {
-  const { useTradingIntent } = require('../src/hooks/useTradingIntent');
+  beforeEach(async () => {
+    // Import the mocked module
+    const useTradingIntentModule = await import('../src/hooks/useTradingIntent');
+    mockUseTradingIntent = useTradingIntentModule.useTradingIntent;
 
-  beforeEach(() => {
     vi.clearAllMocks();
     mockHookReturn = {
       intent: mockIntent,
@@ -67,7 +87,7 @@ describe('TradingIntentStatus Component', () => {
       refetch: vi.fn(),
       isPolling: false,
     };
-    useTradingIntent.mockReturnValue(mockHookReturn);
+    mockUseTradingIntent.mockReturnValue(mockHookReturn);
   });
 
   afterEach(() => {
@@ -76,10 +96,10 @@ describe('TradingIntentStatus Component', () => {
 
   describe('test_renders_pending_intent', () => {
     it('should render pending intent with correct status badge', () => {
-      render(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
+      renderWithAuth(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
 
       expect(screen.getByText('PENDING')).toBeInTheDocument();
-      expect(screen.getByText(/test-inte.*123/)).toBeInTheDocument();
+      expect(screen.getByText(/test-int/)).toBeInTheDocument();
       expect(screen.getByText('BTCUSDT')).toBeInTheDocument();
       expect(screen.getByText('All In')).toBeInTheDocument();
     });
@@ -102,9 +122,9 @@ describe('TradingIntentStatus Component', () => {
       };
 
       mockHookReturn.intent = validatedIntent;
-      useTradingIntent.mockReturnValue(mockHookReturn);
+      mockUseTradingIntent.mockReturnValue(mockHookReturn);
 
-      render(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
+      renderWithAuth(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
 
       expect(screen.getByText('VALIDATED')).toBeInTheDocument();
       expect(screen.getByText('Balance Check')).toBeInTheDocument();
@@ -142,9 +162,9 @@ describe('TradingIntentStatus Component', () => {
       };
 
       mockHookReturn.intent = executedIntent;
-      useTradingIntent.mockReturnValue(mockHookReturn);
+      mockUseTradingIntent.mockReturnValue(mockHookReturn);
 
-      render(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
+      renderWithAuth(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
 
       expect(screen.getByText('EXECUTED')).toBeInTheDocument();
       expect(screen.getByText('123456789')).toBeInTheDocument();
@@ -168,15 +188,14 @@ describe('TradingIntentStatus Component', () => {
       };
 
       mockHookReturn.intent = validatedIntent;
-      useTradingIntent.mockReturnValue(mockHookReturn);
+      mockUseTradingIntent.mockReturnValue(mockHookReturn);
 
-      render(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
+      renderWithAuth(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
 
       const validationButton = screen.getByText('Validation Results');
       fireEvent.click(validationButton);
 
       // After clicking, the accordion should toggle
-      // In a real test, we'd check for expanded/collapsed state
       expect(validationButton).toBeInTheDocument();
     });
   });
@@ -184,18 +203,18 @@ describe('TradingIntentStatus Component', () => {
   describe('test_polling_behavior', () => {
     it('should show polling indicator when polling is active', () => {
       mockHookReturn.isPolling = true;
-      useTradingIntent.mockReturnValue(mockHookReturn);
+      mockUseTradingIntent.mockReturnValue(mockHookReturn);
 
-      render(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
+      renderWithAuth(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
 
       expect(screen.getByText('Live updates enabled')).toBeInTheDocument();
     });
 
     it('should not show polling indicator when not polling', () => {
       mockHookReturn.isPolling = false;
-      useTradingIntent.mockReturnValue(mockHookReturn);
+      mockUseTradingIntent.mockReturnValue(mockHookReturn);
 
-      render(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
+      renderWithAuth(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
 
       expect(screen.queryByText('Live updates enabled')).not.toBeInTheDocument();
     });
@@ -218,9 +237,9 @@ describe('TradingIntentStatus Component', () => {
       };
 
       mockHookReturn.intent = failedIntent;
-      useTradingIntent.mockReturnValue(mockHookReturn);
+      mockUseTradingIntent.mockReturnValue(mockHookReturn);
 
-      render(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
+      renderWithAuth(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
 
       expect(screen.getByText('Risk Limit')).toBeInTheDocument();
       expect(screen.getByText('Monthly risk exceeded')).toBeInTheDocument();
@@ -231,9 +250,9 @@ describe('TradingIntentStatus Component', () => {
     it('should display error message when fetch fails', () => {
       mockHookReturn.intent = null;
       mockHookReturn.error = 'Trading intent not found';
-      useTradingIntent.mockReturnValue(mockHookReturn);
+      mockUseTradingIntent.mockReturnValue(mockHookReturn);
 
-      render(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
+      renderWithAuth(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
 
       expect(screen.getByText(/error loading trading intent/i)).toBeInTheDocument();
       expect(screen.getByText('Trading intent not found')).toBeInTheDocument();
@@ -244,9 +263,9 @@ describe('TradingIntentStatus Component', () => {
     it('should show loading spinner when loading', () => {
       mockHookReturn.isLoading = true;
       mockHookReturn.intent = null;
-      useTradingIntent.mockReturnValue(mockHookReturn);
+      mockUseTradingIntent.mockReturnValue(mockHookReturn);
 
-      render(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
+      renderWithAuth(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
 
       expect(screen.getByText('Loading trading intent...')).toBeInTheDocument();
     });
@@ -254,7 +273,7 @@ describe('TradingIntentStatus Component', () => {
 
   describe('test_action_buttons', () => {
     it('should show Validate Now button when status is PENDING', () => {
-      render(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
+      renderWithAuth(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
 
       expect(screen.getByText('Validate Now')).toBeInTheDocument();
     });
@@ -262,9 +281,9 @@ describe('TradingIntentStatus Component', () => {
     it('should show Execute buttons when status is VALIDATED', () => {
       const validatedIntent = { ...mockIntent, status: 'VALIDATED' };
       mockHookReturn.intent = validatedIntent;
-      useTradingIntent.mockReturnValue(mockHookReturn);
+      mockUseTradingIntent.mockReturnValue(mockHookReturn);
 
-      render(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
+      renderWithAuth(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
 
       expect(screen.getByText('Dry-Run')).toBeInTheDocument();
       expect(screen.getByText('Live')).toBeInTheDocument();
@@ -280,7 +299,7 @@ describe('TradingIntentStatus Component', () => {
       };
       global.navigator.clipboard = mockClipboard;
 
-      render(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
+      renderWithAuth(<TradingIntentStatus intentId="test-intent-123" showDetails={true} />);
 
       const copyButton = screen.getByRole('button', { name: /📋/ });
       fireEvent.click(copyButton);

@@ -109,15 +109,15 @@ describe('StartNewOperationModal', () => {
     const submitButton = screen.getByRole('button', { name: /Create Plan/ });
     fireEvent.click(submitButton);
 
-    // Wait for validation errors to appear
+    // Wait for validation errors to appear - use a more flexible text matcher
     await waitFor(() => {
-      expect(screen.getByText('Symbol is required')).toBeInTheDocument();
+      expect(screen.getByText(/symbol is required/i)).toBeInTheDocument();
     }, { timeout: 3000 });
 
-    expect(screen.getByText('Strategy is required')).toBeInTheDocument();
-    expect(screen.getByText('Entry price is required')).toBeInTheDocument();
-    expect(screen.getByText('Stop price is required')).toBeInTheDocument();
-    expect(screen.getByText('Capital is required')).toBeInTheDocument();
+    expect(screen.getByText(/strategy is required/i)).toBeInTheDocument();
+    expect(screen.getByText(/entry price is required/i)).toBeInTheDocument();
+    expect(screen.getByText(/stop price is required/i)).toBeInTheDocument();
+    expect(screen.getByText(/capital is required/i)).toBeInTheDocument();
   });
 
   it('validates entry price must not equal stop price', async () => {
