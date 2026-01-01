@@ -246,6 +246,11 @@ function TradingIntentStatus({ intentId, showDetails = true, onValidate, onExecu
     execution_result,
     created_at,
     updated_at,
+    // Pattern trigger metadata (Phase 5 MVP)
+    pattern_code,
+    pattern_source,
+    pattern_event_id,
+    pattern_triggered_at,
   } = intent;
 
   // Calculate stop distance percentage
@@ -278,6 +283,25 @@ function TradingIntentStatus({ intentId, showDetails = true, onValidate, onExecu
           <Button variant="link" className="p-0 text-decoration-none" onClick={refetch}>
             Refresh now
           </Button>
+        </Alert>
+      )}
+
+      {/* Pattern trigger info (Phase 5 MVP) */}
+      {pattern_source === 'pattern' && (
+        <Alert variant="primary" className="mb-3">
+          <strong>Triggered by Pattern:</strong> {pattern_code || 'Unknown'}
+          {pattern_triggered_at && (
+            <small className="ms-2">
+              at {new Date(pattern_triggered_at).toLocaleString()}
+            </small>
+          )}
+          {pattern_event_id && (
+            <div className="mt-1">
+              <small className="text-muted">
+                Event ID: {pattern_event_id.substring(0, 32)}...
+              </small>
+            </div>
+          )}
         </Alert>
       )}
 

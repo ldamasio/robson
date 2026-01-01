@@ -538,6 +538,13 @@ class TradingIntent(BaseModel):
     # Error tracking
     error_message = models.TextField(blank=True, null=True)
 
+    # Pattern trigger metadata (Phase 5 MVP)
+    # These fields are populated when the intent is created by pattern auto-trigger
+    pattern_code = models.CharField(max_length=50, blank=True, null=True, db_index=True, help_text="Pattern code that triggered this intent (e.g., HAMMER, MA_CROSSOVER)")
+    pattern_source = models.CharField(max_length=50, blank=True, null=True, default="manual", help_text="Source: 'pattern' or 'manual'")
+    pattern_event_id = models.CharField(max_length=255, blank=True, null=True, db_index=True, help_text="Unique event ID from pattern engine for idempotency")
+    pattern_triggered_at = models.DateTimeField(blank=True, null=True, help_text="When the pattern triggered this intent")
+
     class Meta:
         ordering = ["-created_at"]
         verbose_name = "Trading Intent"
@@ -640,3 +647,72 @@ class TradingIntent(BaseModel):
         # Validate confidence range
         if not (0.0 <= self.confidence <= 1.0):
             raise ValidationError("Confidence must be between 0.0 and 1.0")
+
+
+class PatternTrigger(BaseModel):
+    """
+    Idempotency tracking for pattern auto-triggers (Phase 5 MVP).
+
+    Ensures that each pattern event creates at most one trading intent.
+    Key: (client, pattern_event_id) is unique.
+
+    This is a minimal MVP implementation for idempotency only.
+    Full audit logging with AutoTriggerEvent model is post-MVP (see ADR-0019).
+    """
+
+    # Unique event identifier from pattern engine
+    pattern_event_id = models.CharField(max_length=255, unique=True, db_index=True, help_text="Unique event ID from pattern engine")
+
+    # Pattern identification
+    pattern_code = models.CharField(max_length=50, db_index=True, help_text="Pattern code (e.g., HAMMER, MA_CROSSOVER)")
+
+    # Reference to created intent
+    intent = models.ForeignKey(TradingIntent, on_delete=models.CASCADE, related_name="pattern_triggers", null=True, blank=True)
+
+    # Status tracking
+    status = models.CharField(
+        max_length=20,
+        choices=[
+            ("processed", "Processed"),
+            ("failed", "Failed"),
+        ],
+        default="processed",
+    )
+
+    # Error message (if failed)
+    error_message = models.TextField(blank=True, null=True)
+
+    # Timestamps
+    processed_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        verbose_name = "Pattern Trigger"
+        verbose_name_plural = "Pattern Triggers"
+        indexes = [
+            models.Index(fields=["client", "pattern_event_id"]),
+            models.Index(fields=["pattern_code", "processed_at"]),
+        ]
+
+    def __str__(self):
+        return f"PatternTrigger {self.pattern_event_id}: {self.pattern_code} ({self.status})"
+
+    @classmethod
+    def has_been_processed(cls, client_id, pattern_event_id):
+        """Check if a pattern event has already been processed."""
+        return cls.objects.filter(
+            client_id=client_id,
+            pattern_event_id=pattern_event_id
+        ).exists()
+
+    @classmethod
+    def record_trigger(cls, client_id, pattern_event_id, pattern_code, intent=None, error_message=None):
+        """Record a pattern trigger event."""
+        return cls.objects.create(
+            client_id=client_id,
+            pattern_event_id=pattern_event_id,
+            pattern_code=pattern_code,
+            intent=intent,
+            status="failed" if error_message else "processed",
+            error_message=error_message,
+        )
+

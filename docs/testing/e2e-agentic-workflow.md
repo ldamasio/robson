@@ -204,9 +204,39 @@
 
 ---
 
+### Scenario 9: PATTERN TRIGGER MVP (NEW)
+
+**Purpose:** Verify pattern auto-trigger workflow with idempotency (Phase 5 MVP).
+
+| Step | Action | Expected Result |
+|------|--------|-----------------|
+| 1 | POST `/api/pattern-triggers/` with payload | 201 Created |
+| 2 | Payload: `{pattern_code: "HAMMER", pattern_event_id: "evt_001", symbol: 1, side: "BUY", entry_price: "95000", stop_price: "93500", capital: "100", auto_validate: true}` | Intent created and validated |
+| 3 | Verify: Response status = `"PROCESSED"` | Intent was created |
+| 4 | Verify: Response has `intent_id` | UUID returned |
+| 5 | Verify: Response has `validation_result` | Auto-validation completed |
+| 6 | Navigate to `/trading-intent/{intent_id}` | Status screen loads |
+| 7 | Verify: "Triggered by Pattern" banner (blue) | Pattern code displayed |
+| 8 | Verify: Intent status = `"VALIDATED"` | Auto-validated successfully |
+| 9 | POST `/api/pattern-triggers/` again with SAME `pattern_event_id` | 200 OK (idempotency) |
+| 10 | Verify: Response status = `"ALREADY_PROCESSED"` | No duplicate created |
+| 11 | Verify: Response `intent_id` matches first call | Same intent returned |
+| 12 | POST with pattern_event_id = "evt_002" | New intent created |
+| 13 | Verify: Two intents total in database | Idempotency works per-event |
+
+**Test LIVE auto-execution block:**
+| Step | Action | Expected Result |
+|------|--------|-----------------|
+| 14 | POST `/api/pattern-triggers/` with `auto_execute: true, execution_mode: "live"` | 400 Bad Request |
+| 15 | Verify: Error message contains "LIVE auto-execution is not enabled in MVP" | Hard block works |
+
+**Result:** ✅ PASS if all steps pass
+
+---
+
 ## Success Criteria
 
-- ✅ All 8 scenarios pass
+- ✅ All 9 scenarios pass (including pattern trigger MVP)
 - ✅ No console errors or warnings
 - ✅ All toast notifications clear and actionable
 - ✅ Loading states prevent double-submission

@@ -1,9 +1,23 @@
 # ADR-0019: Auto-Trigger Guardrails for Pattern-Based Trading
 
-**Status:** Accepted
+**Status:** Proposed (MVP Implementation in Progress)
 **Date:** 2026-01-01
 **Context:** Phase 5 - Pattern Auto-Trigger Implementation
 **Related:** [ADR-0007](ADR-0007-robson-is-risk-assistant-not-autotrader.md), [ADR-0018](ADR-0018-pattern-detection-engine.md)
+
+---
+
+## MVP Scope Note
+
+**Phase 5 MVP (current implementation):**
+- ✅ Trigger endpoint with idempotency
+- ✅ Auto-validate (dry-run only)
+- ✅ Pattern metadata visibility in UI
+- ✅ Hard block on LIVE auto-execution
+- ⏳ Rate limits, kill switch, full audit: **TODO (post-MVP)**
+
+This ADR documents the full guardrail vision. Items marked as **TODO (post-MVP)**
+are deferred to future phases after the MVP is proven safe and effective.
 
 ---
 
@@ -69,7 +83,7 @@ if (autoExecute && executionMode === 'live') {
 - Prevents "fire and forget" LIVE trading
 - Regulatory compliance (user affirmation)
 
-### 3. Rate Limits / Safety Limits (Per-User Per-Day)
+### 3. Rate Limits / Safety Limits (Per-User Per-Day) ⏳ TODO (post-MVP)
 
 **Maximum auto-executions per user per day: 10**
 ```python
@@ -137,7 +151,10 @@ if (intent.auto_triggered) {
 - Prevents race conditions in distributed systems
 - Audit trail integrity
 
-### 5. Audit Events (Who/What/When/Result)
+### 5. Audit Events (Who/What/When/Result) ⏳ TODO (post-MVP)
+
+**MVP:** Basic idempotency tracking only (PatternTrigger model).
+**Post-MVP:** Full audit logging with detailed AutoTriggerEvent model.
 
 **All auto-trigger events must be logged with full context.**
 ```python
@@ -210,7 +227,7 @@ updateLoadingToSuccess(toastId, 'Dry-run execution complete. No real orders plac
 showWarning('LIVE auto-execution: Type CONFIRM to proceed.');
 ```
 
-**Activity log on dashboard:**
+**Activity log on dashboard:** ⏳ TODO (post-MVP)
 ```jsx
 <AutoTriggerActivityLog>
   <ActivityItem
@@ -257,21 +274,37 @@ showWarning('LIVE auto-execution: Type CONFIRM to proceed.');
 ## Implementation Checklist
 
 ### Backend (Django)
-- [ ] Add `AutoTriggerEvent` model with audit fields
+
+**MVP (Phase 5 - Current):**
+- [x] Add `PatternTrigger` model for idempotency
+- [x] Add idempotency check (prevent double-runs)
+- [x] Add pattern trigger endpoint (`POST /api/pattern-triggers/`)
+- [x] Hard block on LIVE auto-execution (400 error)
+- [x] Add pattern metadata to `TradingIntent`
+
+**Post-MVP:**
+- [ ] Add `AutoTriggerEvent` model with full audit fields
 - [ ] Add rate limit validation (`MAX_AUTO_EXECUTIONS_PER_DAY`)
-- [ ] Add idempotency check (prevent double-runs)
 - [ ] Add kill switch setting (`AUTO_TRIGGER_KILL_SWITCH`)
-- [ ] Add auto-trigger endpoints (`POST /api/patterns/{id}/enable-auto-trigger`)
-- [ ] Update validation/execution views to check auto-trigger flags
+- [ ] Add auto-trigger settings endpoints
 
 ### Frontend (React)
-- [ ] Add auto-trigger banner to intent status screen
-- [ ] Add toast notifications for auto-trigger steps
+
+**MVP (Phase 5 - Current):**
+- [x] Add pattern metadata display to intent status screen
+- [x] Add toast notifications for pattern trigger events
+
+**Post-MVP:**
 - [ ] Add activity log component to dashboard
 - [ ] Add auto-trigger settings modal (enable/disable, mode selection)
 - [ ] Add confirmation dialog for LIVE auto-execution
 
 ### Documentation
+
+**MVP (Phase 5 - Current):**
+- [x] Update e2e test doc with pattern trigger steps
+
+**Post-MVP:**
 - [ ] Update user docs with auto-trigger safety info
 - [ ] Add operations runbook for kill switch usage
 - [ ] Add monitoring dashboard for auto-trigger metrics

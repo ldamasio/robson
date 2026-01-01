@@ -19,6 +19,8 @@ from api.serializers.trading_intent_serializers import (
     TradingIntentSerializer,
     ValidationReportSerializer,
     ExecutionResultSerializer,
+    PatternTriggerSerializer,
+    PatternTriggerResponseSerializer,
 )
 from api.application.use_cases.trading_intent import (
     CreateTradingIntentCommand,
@@ -33,6 +35,7 @@ from api.application.validation_framework import ValidationFramework
 from api.application.execution_framework import ExecutionFramework
 from api.application.execution import ExecutionMode
 from api.models import TradingIntent
+from api.models.trading import PatternTrigger
 
 logger = logging.getLogger(__name__)
 
@@ -391,6 +394,166 @@ def execute_trading_intent(request, intent_id):
         )
     except Exception as e:
         logger.error(f"Unexpected error executing trading intent: {e}", exc_info=True)
+        return Response(
+            {"error": "Internal server error"},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def pattern_trigger(request):
+    """
+    Pattern auto-trigger endpoint (Phase 5 MVP).
+
+    Creates a TradingIntent when a pattern is detected, with idempotency protection.
+
+    POST /api/pattern-triggers/
+
+    Request body:
+        pattern_code (str): Pattern code (e.g., "HAMMER", "MA_CROSSOVER")
+        pattern_event_id (str): Unique event ID for idempotency
+        symbol (int): Symbol ID
+        side (str): "BUY" or "SELL"
+        entry_price (Decimal): Entry price
+        stop_price (Decimal): Stop-loss price
+        capital (Decimal): Capital allocated
+        strategy (int, optional): Strategy ID
+        target_price (Decimal, optional): Take-profit price
+        auto_validate (bool, default: true): Auto-validate the intent
+        auto_execute (bool, default: false): Auto-execute (MVP: must be false)
+        execution_mode (str, default: "dry-run"): Execution mode
+
+    Returns:
+        200 OK: Pattern trigger response
+        400 Bad Request: Validation error or LIVE auto-execution attempt
+        500 Internal Server Error: Unexpected error
+
+    Idempotency:
+        If the same pattern_event_id is sent twice, returns ALREADY_PROCESSED
+        with the original intent_id.
+    """
+    try:
+        # Get client from user
+        client = request.user.client
+        if not client:
+            return Response(
+                {"error": "User has no associated client"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Validate input
+        serializer = PatternTriggerSerializer(data=request.data)
+        if not serializer.is_valid():
+            return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+
+        data = serializer.validated_data
+
+        # Check idempotency (has this pattern_event_id been processed?)
+        pattern_event_id = data["pattern_event_id"]
+        pattern_code = data["pattern_code"]
+
+        if PatternTrigger.has_been_processed(client.id, pattern_event_id):
+            # Already processed - return the original intent
+            existing_trigger = PatternTrigger.objects.get(
+                client_id=client.id,
+                pattern_event_id=pattern_event_id
+            )
+
+            response_data = {
+                "status": "ALREADY_PROCESSED",
+                "intent_id": existing_trigger.intent.intent_id if existing_trigger.intent else None,
+                "message": f"Pattern event {pattern_event_id} was already processed",
+                "pattern_code": pattern_code,
+            }
+
+            logger.info(f"Pattern trigger {pattern_event_id} for client {client.id} was already processed")
+
+            return Response(response_data, status=status.HTTP_200_OK)
+
+        # Create trading intent with pattern metadata
+        # Use the CreateTradingIntentUseCase to create the intent
+        command = CreateTradingIntentCommand(
+            symbol_id=data["symbol"],
+            strategy_id=data.get("strategy"),
+            side=data["side"],
+            entry_price=data["entry_price"],
+            stop_price=data["stop_price"],
+            capital=data["capital"],
+            target_price=data.get("target_price"),
+            regime="pattern",  # Indicate this came from pattern detection
+            confidence=0.8,  # Default confidence for pattern triggers
+            reason=f"Pattern trigger: {pattern_code}",
+            client_id=client.id,
+        )
+
+        use_case = CreateTradingIntentUseCase(
+            symbol_repo=DjangoSymbolRepository(),
+            strategy_repo=DjangoStrategyRepository(),
+            intent_repo=DjangoTradingIntentRepository(),
+        )
+
+        intent = use_case.execute(command)
+
+        # Add pattern metadata to the intent
+        intent.pattern_code = pattern_code
+        intent.pattern_source = "pattern"
+        intent.pattern_event_id = pattern_event_id
+        intent.pattern_triggered_at = timezone.now()
+        intent.save(update_fields=["pattern_code", "pattern_source", "pattern_event_id", "pattern_triggered_at", "updated_at"])
+
+        # Auto-validate if requested
+        validation_result = None
+        if data.get("auto_validate", True):
+            validation_framework = ValidationFramework(client_id=client.id)
+            report = validation_framework.validate(intent)
+
+            intent.validation_result = report.to_dict()
+            if not report.has_failures():
+                intent.status = "VALIDATED"
+                intent.validated_at = timezone.now()
+            intent.save(update_fields=["status", "validated_at", "validation_result", "updated_at"])
+
+            validation_result = report.to_dict()
+
+        # MVP: Auto-execute is blocked (dry-run only for manual execution)
+        # If auto_execute=true, we still only dry-run and mark as VALIDATED (not EXECUTED)
+        # User must manually execute from the UI.
+
+        # Record the pattern trigger (idempotency record)
+        PatternTrigger.record_trigger(
+            client_id=client.id,
+            pattern_event_id=pattern_event_id,
+            pattern_code=pattern_code,
+            intent=intent,
+        )
+
+        # Prepare response
+        response_data = {
+            "status": "PROCESSED",
+            "intent_id": intent.intent_id,
+            "message": f"Pattern {pattern_code} triggered trading intent {intent.intent_id}",
+            "pattern_code": pattern_code,
+        }
+
+        if validation_result:
+            response_data["validation_result"] = validation_result
+
+        logger.info(
+            f"Pattern trigger {pattern_code} (event {pattern_event_id}) "
+            f"for client {client.id}: created intent {intent.intent_id}"
+        )
+
+        return Response(response_data, status=status.HTTP_201_CREATED)
+
+    except ValueError as e:
+        logger.warning(f"Validation error in pattern trigger: {e}")
+        return Response(
+            {"error": str(e)},
+            status=status.HTTP_400_BAD_REQUEST
+        )
+    except Exception as e:
+        logger.error(f"Unexpected error in pattern trigger: {e}", exc_info=True)
         return Response(
             {"error": "Internal server error"},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR

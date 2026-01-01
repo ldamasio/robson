@@ -202,6 +202,12 @@ class TradingIntentSerializer(serializers.ModelSerializer):
             "correlation_id",
             "error_message",
 
+            # Pattern trigger metadata (Phase 5 MVP)
+            "pattern_code",
+            "pattern_source",
+            "pattern_event_id",
+            "pattern_triggered_at",
+
             # Timestamps
             "created_at",
             "updated_at",
@@ -311,3 +317,94 @@ class ExecutionResultSerializer(serializers.Serializer):
         allow_null=True,
         help_text="Error message if execution failed"
     )
+
+
+class PatternTriggerSerializer(serializers.Serializer):
+    """
+    Input serializer for pattern trigger endpoint (Phase 5 MVP).
+
+    Validates pattern trigger requests and creates TradingIntents with idempotency.
+    """
+
+    # Pattern identification
+    pattern_code = serializers.CharField(
+        max_length=50,
+        help_text="Pattern code (e.g., HAMMER, MA_CROSSOVER)"
+    )
+    pattern_event_id = serializers.CharField(
+        max_length=255,
+        help_text="Unique event ID from pattern engine for idempotency"
+    )
+
+    # Trading parameters
+    symbol = serializers.IntegerField(help_text="Symbol ID")
+    side = serializers.ChoiceField(choices=["BUY", "SELL"])
+    entry_price = serializers.DecimalField(max_digits=20, decimal_places=8)
+    stop_price = serializers.DecimalField(max_digits=20, decimal_places=8)
+    capital = serializers.DecimalField(max_digits=20, decimal_places=8)
+
+    # Optional fields
+    strategy = serializers.IntegerField(
+        required=False,
+        default=None,
+        allow_null=True,
+        help_text="Strategy ID (optional)"
+    )
+    target_price = serializers.DecimalField(
+        required=False,
+        allow_null=True,
+        max_digits=20,
+        decimal_places=8,
+        help_text="Optional take-profit target price"
+    )
+
+    # Auto-trigger flags
+    auto_validate = serializers.BooleanField(
+        required=False,
+        default=True,
+        help_text="Automatically validate the intent (default: true)"
+    )
+    auto_execute = serializers.BooleanField(
+        required=False,
+        default=False,
+        help_text="Automatically execute the intent (MVP: must be false)"
+    )
+    execution_mode = serializers.ChoiceField(
+        choices=["dry-run", "live"],
+        required=False,
+        default="dry-run",
+        help_text="Execution mode (MVP: only dry-run allowed)"
+    )
+
+    def validate(self, data):
+        """Cross-field validation and MVP safety checks."""
+        # MVP: Hard block on LIVE auto-execution
+        if data.get("auto_execute", False) and data.get("execution_mode", "dry-run") == "live":
+            raise serializers.ValidationError(
+                "LIVE auto-execution is not enabled in MVP. Use manual execution."
+            )
+
+        # Validate entry != stop
+        entry_price = data.get("entry_price")
+        stop_price = data.get("stop_price")
+        side = data.get("side")
+
+        if entry_price == stop_price:
+            raise serializers.ValidationError("Entry price and stop price cannot be equal")
+
+        if side == "BUY" and stop_price >= entry_price:
+            raise serializers.ValidationError("For BUY orders, stop price must be below entry price")
+
+        if side == "SELL" and stop_price <= entry_price:
+            raise serializers.ValidationError("For SELL orders, stop price must be above entry price")
+
+        return data
+
+
+class PatternTriggerResponseSerializer(serializers.Serializer):
+    """Response serializer for pattern trigger endpoint."""
+
+    status = serializers.CharField(help_text="Status: PROCESSED, ALREADY_PROCESSED, or FAILED")
+    intent_id = serializers.CharField(required=False, allow_null=True, help_text="TradingIntent intent_id if created")
+    message = serializers.CharField(help_text="Human-readable message")
+    pattern_code = serializers.CharField(help_text="Pattern code that was triggered")

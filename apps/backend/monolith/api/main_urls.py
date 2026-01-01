@@ -65,6 +65,7 @@ try:
         list_trading_intents,
         validate_trading_intent,
         execute_trading_intent,
+        pattern_trigger,
     )
     TRADING_INTENT_VIEWS_AVAILABLE = True
     print("✅ Trading intent views imported successfully")
@@ -220,6 +221,7 @@ if TRADING_INTENT_VIEWS_AVAILABLE:
         path('trading-intents/<str:intent_id>/', get_trading_intent, name='get_trading_intent'),
         path('trading-intents/<str:intent_id>/validate/', validate_trading_intent, name='validate_trading_intent'),
         path('trading-intents/<str:intent_id>/execute/', execute_trading_intent, name='execute_trading_intent'),
+        path('pattern-triggers/', pattern_trigger, name='pattern_trigger'),
     ]
 
 # Debug info
