@@ -13,6 +13,7 @@ import Tooltip from 'react-bootstrap/Tooltip';
 import AuthContext from '../../context/AuthContext';
 import { useTradingIntent } from '../../hooks/useTradingIntent';
 import TradingIntentResults from './TradingIntentResults';
+import { showSuccess, showInfo, showError, showWarning } from '../../utils/notifications';
 import PropTypes from 'prop-types';
 
 /**
@@ -61,9 +62,16 @@ function TradingIntentStatus({ intentId, showDetails = true, onValidate, onExecu
         if (!response.ok) {
           throw new Error('Validation failed');
         }
+        const result = await response.json();
+        if (result.validation_result?.status === 'PASS') {
+          showSuccess('Validation passed! Ready to execute.');
+        } else {
+          showWarning('Validation completed with warnings. Check details below.');
+        }
         refetch();
       } catch (err) {
         console.error('Failed to validate:', err);
+        showError('Validation failed. Please try again.');
       }
     } else {
       onValidate(intentId);
@@ -72,17 +80,13 @@ function TradingIntentStatus({ intentId, showDetails = true, onValidate, onExecu
 
   // Handle execute button click
   const handleExecute = async () => {
-    if (executionMode === 'live' && !window.confirm(
-      'WARNING: This will execute a LIVE trade on Binance!\n\n' +
-      'Please confirm:\n' +
-      '- You understand this will use REAL funds\n' +
-      '- You have reviewed the trading plan\n' +
-      '- You acknowledge the risks involved\n\n' +
-      'Type "CONFIRM" to proceed.'
-    )) {
-      // Simple confirmation - could be enhanced with typed confirmation
+    if (executionMode === 'live') {
+      // Show warning toast for live execution
+      showWarning('LIVE execution mode: Real orders will be placed on Binance!');
+      // Still require typed confirmation for safety
       const typed = window.prompt('Type "CONFIRM" to proceed with LIVE execution:');
       if (typed !== 'CONFIRM') {
+        showError('Live execution cancelled.');
         return;
       }
     }
@@ -111,13 +115,24 @@ function TradingIntentStatus({ intentId, showDetails = true, onValidate, onExecu
           const errorData = await response.json();
           throw new Error(errorData.detail || 'Execution failed');
         }
+
+        const result = await response.json();
+        if (result.execution_result?.status === 'SUCCESS') {
+          if (executionMode === 'live') {
+            showSuccess('Live execution successful! Orders placed on Binance.');
+          } else {
+            showInfo('Dry-run completed. No real orders placed.');
+          }
+        } else {
+          showError('Execution failed. Check the details below.');
+        }
       } else {
         onExecute(intentId, payload);
       }
       refetch();
     } catch (err) {
       console.error('Failed to execute:', err);
-      alert(err.message || 'Failed to execute trading intent');
+      showError(err.message || 'Failed to execute trading intent');
     } finally {
       setIsExecuting(false);
     }
@@ -143,10 +158,11 @@ function TradingIntentStatus({ intentId, showDetails = true, onValidate, onExecu
       if (!response.ok) {
         throw new Error('Cancel failed');
       }
+      showInfo('Trading intent cancelled successfully.');
       refetch();
     } catch (err) {
       console.error('Failed to cancel:', err);
-      alert('Failed to cancel trading intent');
+      showError('Failed to cancel trading intent');
     }
   };
 

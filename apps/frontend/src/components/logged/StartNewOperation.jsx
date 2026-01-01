@@ -1,13 +1,12 @@
 import { useState } from 'react';
 import { useNavigate } from 'react-router-dom';
 import Button from 'react-bootstrap/Button';
-import Alert from 'react-bootstrap/Alert';
 import StartNewOperationModal from "./modals/StartNewOperationModal";
+import { showSuccess } from '../../utils/notifications';
 
 function StartNewOperation() {
   const navigate = useNavigate();
   const [modalShow, setModalShow] = useState(false);
-  const [createdIntentId, setCreatedIntentId] = useState(null);
 
   /**
    * Handle successful trading intent creation
@@ -16,36 +15,15 @@ function StartNewOperation() {
   const handleOperationCreated = (intent) => {
     console.log('Trading intent created:', intent);
 
-    // Store intent ID for showing link
-    setCreatedIntentId(intent.id);
+    // Show success toast notification
+    showSuccess('Trading plan created successfully!');
 
-    // Auto-hide after 10 seconds
-    setTimeout(() => {
-      setCreatedIntentId(null);
-    }, 10000);
-  };
-
-  const handleViewStatus = () => {
-    if (createdIntentId) {
-      navigate(`/trading-intent/${createdIntentId}`);
-    }
+    // Navigate to status screen
+    navigate(`/trading-intent/${intent.id}`);
   };
 
   return (
     <>
-      {createdIntentId && (
-        <Alert variant="success" dismissible onClose={() => setCreatedIntentId(null)} className="mb-3">
-          <Alert.Heading>Trading Intent Created!</Alert.Heading>
-          <p className="mb-2">Your trading plan has been created successfully.</p>
-          <hr />
-          <div className="d-flex justify-content-end">
-            <Button variant="outline-success" size="sm" onClick={handleViewStatus}>
-              View Status →
-            </Button>
-          </div>
-        </Alert>
-      )}
-
       <Button variant="primary" onClick={() => setModalShow(true)}>
         Start New Operation
       </Button>

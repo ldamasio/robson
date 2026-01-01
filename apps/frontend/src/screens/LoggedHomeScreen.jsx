@@ -24,6 +24,7 @@ import MarginPositionCalculator from "../components/logged/MarginPositionCalcula
 import MarginPositions from "../components/logged/MarginPositions";
 import PositionsDashboard from "../components/logged/PositionsDashboard";
 import RobsonChat from "../components/logged/RobsonChat";
+import TradingIntentsList from "../components/logged/TradingIntentsList";
 
 const LoggedHomeScreen = () => {
   const location = useLocation();
@@ -81,6 +82,9 @@ const LoggedHomeScreen = () => {
               <CommandButton />
               <h1>Start new operation</h1>
               <StartNewOperation />
+              <ErrorBoundary>
+                <TradingIntentsList />
+              </ErrorBoundary>
               <h1>Manage position</h1>
               <ManagePosition />
               <h1>Actual Price</h1>
