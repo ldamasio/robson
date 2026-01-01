@@ -1,11 +1,13 @@
 import { useState } from 'react';
+import { useNavigate } from 'react-router-dom';
 import Button from 'react-bootstrap/Button';
 import Alert from 'react-bootstrap/Alert';
 import StartNewOperationModal from "./modals/StartNewOperationModal";
 
 function StartNewOperation() {
+  const navigate = useNavigate();
   const [modalShow, setModalShow] = useState(false);
-  const [successMessage, setSuccessMessage] = useState(null);
+  const [createdIntentId, setCreatedIntentId] = useState(null);
 
   /**
    * Handle successful trading intent creation
@@ -14,27 +16,33 @@ function StartNewOperation() {
   const handleOperationCreated = (intent) => {
     console.log('Trading intent created:', intent);
 
-    // Show success message
-    setSuccessMessage(
-      `Trading intent created successfully! Plan ID: ${intent.id} (${intent.side} ${intent.symbol_display})`
-    );
+    // Store intent ID for showing link
+    setCreatedIntentId(intent.id);
 
-    // Auto-hide success message after 5 seconds
+    // Auto-hide after 10 seconds
     setTimeout(() => {
-      setSuccessMessage(null);
-    }, 5000);
+      setCreatedIntentId(null);
+    }, 10000);
+  };
 
-    // Future enhancements:
-    // - Navigate to intent status page
-    // - Refresh operations list
-    // - Show toast notification instead of inline alert
+  const handleViewStatus = () => {
+    if (createdIntentId) {
+      navigate(`/trading-intent/${createdIntentId}`);
+    }
   };
 
   return (
     <>
-      {successMessage && (
-        <Alert variant="success" dismissible onClose={() => setSuccessMessage(null)} className="mb-3">
-          {successMessage}
+      {createdIntentId && (
+        <Alert variant="success" dismissible onClose={() => setCreatedIntentId(null)} className="mb-3">
+          <Alert.Heading>Trading Intent Created!</Alert.Heading>
+          <p className="mb-2">Your trading plan has been created successfully.</p>
+          <hr />
+          <div className="d-flex justify-content-end">
+            <Button variant="outline-success" size="sm" onClick={handleViewStatus}>
+              View Status →
+            </Button>
+          </div>
         </Alert>
       )}
 

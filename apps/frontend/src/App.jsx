@@ -17,6 +17,7 @@ import HireScreen from './screens/HireScreen'
 import DemoScreen from './screens/DemoScreen'
 import LoggedHomeScreen from './screens/LoggedHomeScreen'
 import PatternDetectorScreen from './screens/logged/PatternDetectorScreen'
+import TradingIntentScreen from './screens/logged/TradingIntentScreen'
 import NoPageScreen from "./screens/NoPageScreen"
 
 function App() {
@@ -43,6 +44,7 @@ function App() {
               <Route element={<LoggedHomeScreen />} path="/dashboard" />
               <Route element={<LoggedHomeScreen />} path="/feed" /> {/* Legacy route */}
               <Route element={<PatternDetectorScreen />} path="/patterns" />
+              <Route element={<TradingIntentScreen />} path="/trading-intent/:intentId" />
             </Route>
           </Routes>
           <ToastContainer
