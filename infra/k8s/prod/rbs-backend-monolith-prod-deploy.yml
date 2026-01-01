@@ -5,6 +5,7 @@ metadata:
   namespace: robson
   annotations:
     robson.rbx.ia.br/last-rollout: "2025-12-24T11:20:00Z"
+    robson.rbx.ia.br/probe-fix: "2025-12-31-httpGet-only"
   labels:
     app: rbs-backend-monolith-prod-deploy
 spec:
