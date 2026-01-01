@@ -25,7 +25,7 @@ spec:
           restartPolicy: Never
           containers:
           - name: trailing-stop
-            image: ldamasio/rbs-backend-monolith-prod:sha-60088b6
+            image: ldamasio/rbs-backend-monolith-prod:sha-50e5cb7
             command:
             - python
             - manage.py
