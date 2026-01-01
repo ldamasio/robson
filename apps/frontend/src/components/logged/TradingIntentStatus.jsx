@@ -65,6 +65,8 @@ function TradingIntentStatus({ intentId, showDetails = true, onValidate, onExecu
         const result = await response.json();
         if (result.validation_result?.status === 'PASS') {
           showSuccess('Validation passed! Ready to execute.');
+        } else if (result.validation_result?.status === 'FAIL') {
+          showError('Validation failed. Please check the details below.');
         } else {
           showWarning('Validation completed with warnings. Check details below.');
         }
