@@ -4,7 +4,8 @@ import useWebSocket from '../../hooks/useWebSocket'
 import LoadingSpinner from '../common/LoadingSpinner'
 
 function ActualPrice() {
-  const wsUrl = import.meta.env.VITE_MARKET_DATA_WS_URL || 'ws://localhost:8080/ws';
+  // Use Binance public WebSocket for market data (always available)
+  const wsUrl = import.meta.env.VITE_WS_URL_BINANCE || 'wss://stream.binance.com:9443/ws/btcusdt@ticker';
   const { data: priceData, isConnected } = useWebSocket(wsUrl);
 
   const [direction, setDirection] = useState('neutral')
@@ -21,17 +22,21 @@ function ActualPrice() {
   }
 
   useEffect(() => {
-    if (priceData && priceData.price) {
-      const last = Number(priceData.price);
+    if (priceData) {
+      // Handle both custom format (price) and Binance ticker format (c = last price)
+      const currentPrice = priceData.price || priceData.c;
+      if (currentPrice) {
+        const last = Number(currentPrice);
 
-      if (lastPriceRef.current !== null) {
-        if (last > lastPriceRef.current) {
-          setDirection('up');
-        } else if (last < lastPriceRef.current) {
-          setDirection('down');
+        if (lastPriceRef.current !== null) {
+          if (last > lastPriceRef.current) {
+            setDirection('up');
+          } else if (last < lastPriceRef.current) {
+            setDirection('down');
+          }
         }
+        lastPriceRef.current = last;
       }
-      lastPriceRef.current = last;
     }
   }, [priceData]);
 
@@ -43,7 +48,8 @@ function ActualPrice() {
     return <div>Waiting for market data...</div>
   }
 
-  const lastPrice = priceData.price;
+  // Handle both custom format (price) and Binance ticker format (c = last price)
+  const lastPrice = priceData.price || priceData.c;
   const trendLabel = direction === 'up' ? '↑' : direction === 'down' ? '↓' : '→'
   const trendVariant = direction === 'up' ? 'success' : direction === 'down' ? 'danger' : 'secondary'
 

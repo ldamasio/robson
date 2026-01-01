@@ -26,6 +26,9 @@ from clients.models import CustomUser
 # Application layer imports (Hexagonal Architecture INSIDE Django)
 from .application import Symbol as DomainSymbol, get_place_order_uc
 
+# Portfolio BTC endpoints (new module-based views)
+from .views import portfolio_btc
+
 
 
 client=Client(settings.BINANCE_API_KEY_TEST, settings.BINANCE_SECRET_KEY_TEST)
