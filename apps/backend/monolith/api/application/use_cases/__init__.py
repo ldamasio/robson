@@ -12,6 +12,11 @@ from .trading_intent import (
     StrategyRepository,
     TradingIntentRepository,
 )
+from .operation import (
+    CancelOperationUseCase,
+    CancelOperationCommand,
+    CancelOperationResult,
+)
 
 __all__ = [
     # Order use cases
@@ -22,4 +27,8 @@ __all__ = [
     "SymbolRepository",
     "StrategyRepository",
     "TradingIntentRepository",
+    # Operation use cases (Gate 6)
+    "CancelOperationUseCase",
+    "CancelOperationCommand",
+    "CancelOperationResult",
 ]
