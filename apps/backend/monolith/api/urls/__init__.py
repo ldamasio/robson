@@ -152,6 +152,22 @@ except Exception as e:
     traceback.print_exc()
     OPERATION_VIEWS_AVAILABLE = False
 
+# Import symbol views
+try:
+    from ..views.symbol_views import list_symbols
+    SYMBOL_VIEWS_AVAILABLE = True
+    print("✅ Symbol views imported successfully")
+except ImportError as e:
+    import traceback
+    print(f"⚠️  Could not import symbol views: {e}")
+    traceback.print_exc()
+    SYMBOL_VIEWS_AVAILABLE = False
+except Exception as e:
+    import traceback
+    print(f"❌ Unexpected error importing symbol views: {type(e).__name__}: {e}")
+    traceback.print_exc()
+    SYMBOL_VIEWS_AVAILABLE = False
+
 
 # Fallback function for missing views
 def fallback_view(request):
@@ -180,6 +196,7 @@ urlpatterns = [
     # TRADING/STRATEGY ROUTES (NEW PATTERN)
     # ==========================================
     path("strategies/", get_strategies, name="get_strategies"),
+    path("symbols/", list_symbols, name="list_symbols") if SYMBOL_VIEWS_AVAILABLE else path("symbols/", fallback_view, name="list_symbols"),
     # ==========================================
     # MARKET DATA ROUTES (NEW PATTERN)
     # ==========================================
