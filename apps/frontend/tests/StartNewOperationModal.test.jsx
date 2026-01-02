@@ -114,8 +114,8 @@ describe('StartNewOperationModal', () => {
     await waitFor(() => {
       // The component should show either the general error message or field errors
       const hasGeneralError = screen.queryByText(/Please fix the errors above/i);
-      const hasFieldError = screen.queryByText(/is required/i);
-      expect(hasGeneralError || hasFieldError).toBeTruthy();
+      const fieldErrors = screen.queryAllByText(/is required/i);
+      expect(hasGeneralError || fieldErrors.length > 0).toBeTruthy();
     }, { timeout: 3000 });
 
     // Verify select fields have invalid styling (isInvalid prop)
