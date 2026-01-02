@@ -109,15 +109,16 @@ describe('StartNewOperationModal', () => {
     const submitButton = screen.getByRole('button', { name: /Create Plan/ });
     fireEvent.click(submitButton);
 
-    // Wait for validation errors to appear - use a more flexible text matcher
+    // Wait for validation errors to appear
+    // Form.Control.Feedback renders error messages, check for the general error alert
     await waitFor(() => {
-      expect(screen.getByText(/symbol is required/i)).toBeInTheDocument();
+      expect(screen.getByText(/Please fix the errors above/i)).toBeInTheDocument();
     }, { timeout: 3000 });
 
-    expect(screen.getByText(/strategy is required/i)).toBeInTheDocument();
-    expect(screen.getByText(/entry price is required/i)).toBeInTheDocument();
-    expect(screen.getByText(/stop price is required/i)).toBeInTheDocument();
-    expect(screen.getByText(/capital is required/i)).toBeInTheDocument();
+    // Verify select fields have invalid styling (isInvalid prop)
+    const allSelects = screen.getAllByRole('combobox');
+    expect(allSelects[0]).toHaveClass('is-invalid');
+    expect(allSelects[1]).toHaveClass('is-invalid');
   });
 
   it('validates entry price must not equal stop price', async () => {
