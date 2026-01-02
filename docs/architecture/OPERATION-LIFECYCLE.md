@@ -191,16 +191,92 @@ The following are **explicitly out of scope** for Gate 5:
 - Background polling of order status
 - Scheduled status reconciliation
 - RabbitMQ/async event propagation
-- New REST endpoints for status updates
 - CANCEL status flow implementation (guardrails only)
+
+**Implemented in Gate 6 & 7**:
+- ✅ Gate 6: `CancelOperationUseCase` (domain/application level)
+- ✅ Gate 7: REST API endpoint for operation cancellation
+
+## Gate 7: REST API Endpoint (Implemented)
+
+**Endpoint**: `POST /api/operations/<int:operation_id>/cancel/`
+
+**File**: `api/views/operation_views.py:cancel_operation`
+
+### Usage
+
+```bash
+# Using curl
+curl -X POST "http://localhost:8000/api/operations/123/cancel/" \
+  -H "Authorization: Bearer <your_jwt_token>"
+
+# Example response (200 OK):
+{
+  "success": true,
+  "operation_id": 123,
+  "previous_status": "ACTIVE",
+  "new_status": "CANCELLED"
+}
+
+# Example response (409 Conflict - cannot cancel CLOSED operation):
+{
+  "success": false,
+  "operation_id": 123,
+  "error": "Cannot cancel operation in CLOSED state"
+}
+```
+
+### Behavior
+
+- **200 OK**: Operation cancelled (or already cancelled - idempotent)
+- **404 Not Found**: Operation not found or access denied (tenant isolation)
+- **409 Conflict**: Operation cannot be cancelled (invalid state)
+- **401 Unauthorized**: Authentication required
+
+### Implementation
+
+The REST endpoint is a **thin adapter** that calls `CancelOperationUseCase` (Gate 6):
+
+```python
+# api/views/operation_views.py
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def cancel_operation(request, operation_id):
+    # Get client from authenticated user
+    client = request.user.client
+
+    # Call use case (Gate 6: business logic)
+    use_case = CancelOperationUseCase()
+    command = CancelOperationCommand(
+        operation_id=operation_id,
+        client_id=client.id  # Tenant isolation
+    )
+    result = use_case.execute(command)
+
+    # Map result to HTTP response
+    return Response(...)
+```
+
+**Key Points**:
+- No business logic in the view (delegated to use case)
+- Tenant isolation enforced at use case level via `client_id`
+- Idempotent: cancelling `CANCELLED` operation returns 200 OK
+
+### Tests
+
+See `api/tests/test_gate_7_cancel_operation_api.py` for integration tests.
 
 ## Related Documentation
 
 - [Transaction Hierarchy](./TRANSACTION-HIERARCHY.md) - Operation in L2 hierarchy
 - [Gate 4 Implementation](../specs/gate-4-operation-creation.md) - Operation creation semantics
+- [Gate 6 Implementation](../adr/ADR-0020-gate-6-operation-cancellation.md) - Use case design
 - [ADR-0007](../adr/ADR-0007-trading-intent.md) - Agentic workflow
 
 ---
 
-**Last Updated**: 2025-01-01 (Gate 5)
-**See Also**: `api/models/trading.py:Operation.set_status()`
+**Last Updated**: 2025-01-02 (Gate 7)
+**See Also**:
+- `api/models/trading.py:Operation.set_status()` (Gate 5)
+- `api/application/use_cases/operation.py:CancelOperationUseCase` (Gate 6)
+- `api/views/operation_views.py:cancel_operation` (Gate 7)

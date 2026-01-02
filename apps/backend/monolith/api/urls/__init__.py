@@ -132,6 +132,26 @@ except Exception as e:
     print(f"❌ Unexpected error importing pattern views: {type(e).__name__}: {e}")
     raise
 
+# Import operation views (Level 2 - Trade lifecycle)
+try:
+    from ..views.operation_views import (
+        cancel_operation,
+        get_operation,
+        list_operations,
+    )
+    OPERATION_VIEWS_AVAILABLE = True
+    print("✅ Operation views imported successfully")
+except ImportError as e:
+    import traceback
+    print(f"⚠️  Could not import operation views: {e}")
+    traceback.print_exc()
+    OPERATION_VIEWS_AVAILABLE = False
+except Exception as e:
+    import traceback
+    print(f"❌ Unexpected error importing operation views: {type(e).__name__}: {e}")
+    traceback.print_exc()
+    OPERATION_VIEWS_AVAILABLE = False
+
 
 # Fallback function for missing views
 def fallback_view(request):
@@ -416,6 +436,20 @@ if PATTERN_VIEWS_AVAILABLE:
     print("✅ Pattern detection views loaded: /api/patterns/catalog/, /api/patterns/instances/, etc.")
 else:
     print("⚠️  Pattern detection views not available")
+
+# ==========================================
+# OPERATION LIFECYCLE ROUTES (LEVEL 2 - TRADE LIFECYCLE)
+# ==========================================
+# Operations are created from LIVE TradingIntent executions
+if OPERATION_VIEWS_AVAILABLE:
+    urlpatterns += [
+        path("operations/", list_operations, name="list_operations"),
+        path("operations/<int:operation_id>/", get_operation, name="get_operation"),
+        path("operations/<int:operation_id>/cancel/", cancel_operation, name="cancel_operation"),
+    ]
+    print("✅ Operation views loaded: /api/operations/, /api/operations/<id>/cancel/")
+else:
+    print("⚠️  Operation views not available")
 
 # Debug info
 print("🎯 URLs loaded following project patterns!")

@@ -15,6 +15,10 @@ import logging
 
 from api.models import Operation
 from api.serializers.operation_serializers import OperationSerializer
+from api.application.use_cases import (
+    CancelOperationUseCase,
+    CancelOperationCommand,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -141,6 +145,89 @@ def get_operation(request, operation_id):
 
     except Exception as e:
         logger.error(f"Unexpected error fetching operation: {e}", exc_info=True)
+        return Response(
+            {"error": "Internal server error"},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@api_view(['POST'])
+@permission_classes([IsAuthenticated])
+def cancel_operation(request, operation_id):
+    """
+    Cancel an operation (Gate 7).
+
+    POST /api/operations/{operation_id}/cancel/
+
+    Cancels an operation using the CancelOperationUseCase (Gate 6).
+    Only PLANNED or ACTIVE operations can be cancelled.
+    CANCELLED operations return 200 OK (idempotent).
+
+    Args:
+        operation_id: ID of the operation to cancel
+
+    Returns:
+        200 OK: Operation cancelled successfully
+        404 Not Found: Operation not found or access denied
+        409 Conflict: Operation cannot be cancelled (invalid state)
+        401 Unauthorized: Authentication required
+        500 Internal Server Error: Unexpected error
+    """
+    try:
+        # Get client from user
+        client = request.user.client
+        if not client:
+            return Response(
+                {"error": "User has no associated client"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Execute use case (Gate 6: business logic layer)
+        use_case = CancelOperationUseCase()
+        command = CancelOperationCommand(
+            operation_id=operation_id,
+            client_id=client.id  # Tenant isolation enforced at use case level
+        )
+        result = use_case.execute(command)
+
+        # Map result to HTTP response
+        if result.success:
+            return Response(
+                {
+                    "success": True,
+                    "operation_id": result.operation_id,
+                    "previous_status": result.previous_status,
+                    "new_status": result.new_status,
+                },
+                status=status.HTTP_200_OK
+            )
+        else:
+            # Determine error type from error message
+            error_msg = result.error_message or "Unknown error"
+
+            # Not found or access denied (tenant isolation)
+            if "not found" in error_msg.lower() or "access denied" in error_msg.lower():
+                return Response(
+                    {
+                        "success": False,
+                        "operation_id": operation_id,
+                        "error": "Operation not found"
+                    },
+                    status=status.HTTP_404_NOT_FOUND
+                )
+
+            # Invalid state (e.g., CLOSED operation)
+            return Response(
+                {
+                    "success": False,
+                    "operation_id": result.operation_id,
+                    "error": error_msg
+                },
+                status=status.HTTP_409_CONFLICT
+            )
+
+    except Exception as e:
+        logger.error(f"Unexpected error cancelling operation {operation_id}: {e}", exc_info=True)
         return Response(
             {"error": "Internal server error"},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
