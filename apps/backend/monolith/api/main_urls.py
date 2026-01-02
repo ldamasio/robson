@@ -75,6 +75,20 @@ except Exception as e:
     traceback.print_exc()
     TRADING_INTENT_VIEWS_AVAILABLE = False
 
+# Import operation views (Level 2 - Trade lifecycle)
+try:
+    from .views.operation_views import (
+        list_operations,
+        get_operation,
+    )
+    OPERATION_VIEWS_AVAILABLE = True
+    print("✅ Operation views imported successfully")
+except Exception as e:
+    import traceback
+    print(f"⚠️  Could not import operation views: {e}")
+    traceback.print_exc()
+    OPERATION_VIEWS_AVAILABLE = False
+
 # Main API URL patterns
 urlpatterns = [
     # ==========================================
@@ -222,6 +236,15 @@ if TRADING_INTENT_VIEWS_AVAILABLE:
         path('trading-intents/<str:intent_id>/validate/', validate_trading_intent, name='validate_trading_intent'),
         path('trading-intents/<str:intent_id>/execute/', execute_trading_intent, name='execute_trading_intent'),
         path('pattern-triggers/', pattern_trigger, name='pattern_trigger'),
+    ]
+
+# ==========================================
+# OPERATIONS - TRADE LIFECYCLE (LEVEL 2)
+# ==========================================
+if OPERATION_VIEWS_AVAILABLE:
+    urlpatterns += [
+        path('operations/', list_operations, name='list_operations'),
+        path('operations/<int:operation_id>/', get_operation, name='get_operation'),
     ]
 
 # Debug info

@@ -226,7 +226,18 @@ class Order(BaseModel):
 
 
 class Operation(BaseModel):
-    """Operation groups entry/exit orders and tracks pnl."""
+    """
+    Operation (Level 2 in transaction hierarchy): Complete trade cycle.
+
+    Represents a trade lifecycle from entry to exit. Can be created from:
+    1. TradingIntent LIVE execution (agentic workflow)
+    2. Manual user operation (legacy create_user_operation flow)
+
+    Hierarchy:
+        Strategy (L1) → Operation (L2) → Movement/AuditTransaction (L3)
+
+    See: docs/architecture/TRANSACTION-HIERARCHY.md
+    """
 
     SIDE_CHOICES = [("BUY", "Buy"), ("SELL", "Sell")]
     STATUS_CHOICES = [
@@ -235,6 +246,18 @@ class Operation(BaseModel):
         ("CLOSED", "Closed"),
         ("CANCELLED", "Cancelled"),
     ]
+
+    # Link to TradingIntent (agentic workflow)
+    # OneToOne: One LIVE TradingIntent creates exactly one Operation
+    # Nullable: Operation can exist without TradingIntent (manual flow, backward compat)
+    trading_intent = models.OneToOneField(
+        'TradingIntent',
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name='operation',
+        help_text='TradingIntent that created this operation (agentic workflow only)'
+    )
 
     strategy = models.ForeignKey(Strategy, on_delete=models.CASCADE)
     symbol = models.ForeignKey(Symbol, on_delete=models.CASCADE)
@@ -278,6 +301,10 @@ class Operation(BaseModel):
 
     class Meta:
         ordering = ["-created_at"]
+        indexes = [
+            models.Index(fields=['client', 'status', 'created_at'], name='operation_portfolio_idx'),
+            models.Index(fields=['trading_intent'], name='operation_intent_idx'),
+        ]
 
     # Aggregations
     @property
