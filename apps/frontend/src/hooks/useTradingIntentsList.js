@@ -58,6 +58,11 @@ export const useTradingIntentsList = ({
       console.error('Failed to fetch trading intents:', err);
       if (isMountedRef.current) {
         setError(err.message);
+        // Disable auto-refresh if endpoint doesn't exist (404)
+        if (err.message?.includes('404') || err.message?.includes('Not Found')) {
+          console.warn('Endpoint not found (404), disabling auto-refresh');
+          setAutoRefreshEnabled(false);
+        }
       }
     } finally {
       if (isMountedRef.current) {
