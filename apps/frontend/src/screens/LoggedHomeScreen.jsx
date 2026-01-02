@@ -82,9 +82,12 @@ const LoggedHomeScreen = () => {
               <CommandButton />
               <h1>Start new operation</h1>
               <StartNewOperation />
+              {/* TEMPORARILY DISABLED: TradingIntentsList causing infinite loop due to 404 on /api/trading-intents/
+                  Will re-enable after backend endpoint is deployed.
               <ErrorBoundary>
                 <TradingIntentsList />
               </ErrorBoundary>
+              */}
               <h1>Manage position</h1>
               <ManagePosition />
               <h1>Actual Price</h1>
