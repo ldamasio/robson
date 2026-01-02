@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Container, Row, Col, Card, Button, Badge, Alert, Spinner } from 'react-bootstrap';
-import { Download, Github, BookOpen, Code, GitBranch, Calendar } from 'react-bootstrap-icons';
+import { Download, Github, BookOpen, Code, Git, Calendar } from 'react-bootstrap-icons';
 import Header from '../components/common/Header';
 import Footer from '../components/common/Footer';
 
@@ -71,7 +71,7 @@ function DownloadScreen() {
                 <Card.Body className="p-5">
                   <div className="text-center mb-4">
                     <h3 className="mb-3">
-                      <GitBranch className="me-2" />
+                      <Git className="me-2" />
                       Latest Version from <Badge bg="dark">{GITHUB_BRANCH}</Badge>
                     </h3>
 
