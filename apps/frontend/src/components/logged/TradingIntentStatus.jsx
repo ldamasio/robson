@@ -10,6 +10,7 @@ import Row from 'react-bootstrap/Row';
 import Col from 'react-bootstrap/Col';
 import OverlayTrigger from 'react-bootstrap/OverlayTrigger';
 import Tooltip from 'react-bootstrap/Tooltip';
+import Table from 'react-bootstrap/Table';
 import AuthContext from '../../context/AuthContext';
 import { useTradingIntent } from '../../hooks/useTradingIntent';
 import TradingIntentResults from './TradingIntentResults';
@@ -94,6 +95,12 @@ function TradingIntentStatus({ intentId, showDetails = true, onValidate, onExecu
     }
 
     setIsExecuting(true);
+    // Show waiting state
+    if (executionMode === 'live') {
+      showInfo('Connecting to exchange. Placing order...');
+    } else {
+      showInfo('Running simulation...');
+    }
     try {
       const payload = {
         mode: executionMode.toUpperCase(),
@@ -492,6 +499,92 @@ function TradingIntentStatus({ intentId, showDetails = true, onValidate, onExecu
           </div>
         </Card.Body>
       </Card>
+
+      {/* Execution Result Panel - shows for EXECUTED intents */}
+      {status === 'EXECUTED' && execution_result && (
+        <Card className="mt-3 border-success">
+          <Card.Header className="bg-success text-white d-flex justify-content-between align-items-center">
+            <h5 className="mb-0">
+              {execution_result.mode === 'LIVE' ? '🔴 Live Execution' : '🔵 Dry-Run Complete'}
+            </h5>
+            <Badge bg={execution_result.mode === 'LIVE' ? 'danger' : 'primary'}>
+              {execution_result.mode}
+            </Badge>
+          </Card.Header>
+          <Card.Body>
+            <p className="mb-2">
+              <strong>Causality:</strong> You authorized execution → {
+                execution_result.mode === 'LIVE' ? 'Authorization submitted' : 'Simulation completed'
+              }
+            </p>
+
+            {/* Order details from execution_result.actions - defensive rendering */}
+            {execution_result.actions && execution_result.actions.length > 0 ? (
+              <div className="mt-3">
+                <h6>Order Details</h6>
+                <Table size="sm" bordered>
+                  <thead>
+                    <tr>
+                      <th>Type</th>
+                      <th>Symbol</th>
+                      <th>Side</th>
+                      <th>Quantity</th>
+                      <th>Price</th>
+                      <th>Status</th>
+                    </tr>
+                  </thead>
+                  <tbody>
+                    {execution_result.actions.map((action, idx) => (
+                      <tr key={idx}>
+                        <td><Badge bg="secondary">{action.type || 'UNKNOWN'}</Badge></td>
+                        <td>{action.symbol || '-'}</td>
+                        <td>
+                          {action.side ? (
+                            <Badge bg={action.side === 'BUY' ? 'success' : 'danger'}>{action.side}</Badge>
+                          ) : '-'}
+                        </td>
+                        <td>{action.quantity || '-'}</td>
+                        <td>{action.price || action.stop_price || '-'}</td>
+                        <td>
+                          <Badge bg={
+                            action.status === 'SIMULATED' ? 'primary' :
+                            action.status === 'FILLED' ? 'success' :
+                            action.status === 'PENDING' ? 'warning' :
+                            action.status === 'FAILED' ? 'danger' : 'secondary'
+                          }>
+                            {action.status || 'UNKNOWN'}
+                          </Badge>
+                        </td>
+                      </tr>
+                    ))}
+                  </tbody>
+                </Table>
+
+                {/* Stop price from SIMULATED_STOP action - defensive */}
+                {execution_result.actions.find(a => a?.type === 'SIMULATED_STOP' && a?.stop_price) && (
+                  <p className="mt-2 mb-0 small text-muted">
+                    Stop Loss: {execution_result.actions.find(a => a?.type === 'SIMULATED_STOP')?.stop_price}
+                  </p>
+                )}
+              </div>
+            ) : (
+              <p className="text-muted small mb-0">No order details available.</p>
+            )}
+
+            {/* External verification link for LIVE mode - defensive */}
+            {execution_result.mode === 'LIVE' && (
+              <div className="mt-3">
+                <Alert variant="info" className="mb-0">
+                  <strong>Verify on Binance:</strong> Check your orders on exchange.{' '}
+                  <Alert.Link href="https://www.binance.com/en/my/orders" target="_blank" rel="noopener noreferrer">
+                    View Binance orders →
+                  </Alert.Link>
+                </Alert>
+              </div>
+            )}
+          </Card.Body>
+        </Card>
+      )}
     </div>
   );
 }

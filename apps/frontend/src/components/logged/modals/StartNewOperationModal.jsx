@@ -252,7 +252,7 @@ function StartNewOperationModal({ show, onHide, onSuccess }) {
   return (
     <Modal show={show} onHide={handleClose} aria-labelledby="contained-modal-title-vcenter" size="lg">
       <Modal.Header closeButton>
-        <Modal.Title id="contained-modal-title-vcenter">Start New Operation</Modal.Title>
+        <Modal.Title id="contained-modal-title-vcenter">Create Trading Plan</Modal.Title>
       </Modal.Header>
       <Modal.Body className="grid-example">
         <Container>
@@ -261,6 +261,19 @@ function StartNewOperationModal({ show, onHide, onSuccess }) {
               {error}
             </Alert>
           )}
+
+          {/* Causality explanation */}
+          <Alert variant="info" className="mb-3">
+            <strong>Understanding the flow:</strong>
+            <ol className="mb-0 mt-2 small">
+              <li><strong>Plan</strong> - Declare your intent (no orders placed)</li>
+              <li><strong>Validate</strong> - Check risk limits and constraints</li>
+              <li><strong>Execute</strong> - Authorize live trading (orders placed then)</li>
+            </ol>
+            <p className="mb-0 mt-2 small text-muted">
+              <em>You are the causal agent. Execution requires your explicit authorization.</em>
+            </p>
+          </Alert>
 
           <Form onSubmit={handleSubmit}>
             {/* Symbol and Strategy Selection */}
