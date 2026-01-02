@@ -1,6 +1,6 @@
 import React, { useState, useEffect } from 'react';
 import { Container, Row, Col, Card, Button, Badge, Alert, Spinner } from 'react-bootstrap';
-import { Download, Github, BookOpen, Code, Git, Calendar } from 'react-bootstrap-icons';
+import { Download, Github, Book, Code, Git, Calendar } from 'react-bootstrap-icons';
 import Header from '../components/common/Header';
 import Footer from '../components/common/Footer';
 
@@ -164,7 +164,7 @@ function DownloadScreen() {
                 <Col md={6}>
                   <Card className="h-100 border-0 shadow-sm hover-shadow">
                     <Card.Body className="text-center">
-                      <BookOpen size={32} className="text-primary mb-2" />
+                      <Book size={32} className="text-primary mb-2" />
                       <Card.Title as="h5">Documentation</Card.Title>
                       <Card.Text className="text-muted small">
                         Setup guides, API docs, and architecture
