@@ -6,7 +6,6 @@ Exports all serializers for the API.
 
 from rest_framework.serializers import ModelSerializer
 
-from api.models import Strategy, Symbol
 from .patterns import (
     PatternCatalogSerializer,
     PatternInstanceSerializer,
@@ -21,6 +20,8 @@ class StrategySerializer(ModelSerializer):
     """Serializer for Strategy model."""
 
     class Meta:
+        # Lazy import to avoid circular dependency
+        from api.models import Strategy
         model = Strategy
         fields = ['id', 'name']
 
@@ -29,6 +30,8 @@ class SymbolSerializer(ModelSerializer):
     """Serializer for Symbol model (trading pairs)."""
 
     class Meta:
+        # Lazy import to avoid circular dependency
+        from api.models import Symbol
         model = Symbol
         fields = [
             'id',
