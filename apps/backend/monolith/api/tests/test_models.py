@@ -11,6 +11,7 @@ from django.utils import timezone
 
 from clients.models import Client
 from api.models import Symbol, Strategy, Order, Operation, Position, Trade
+from api.models.trading import InvalidOperationStatusError
 
 
 class BaseTestCase(TestCase):
@@ -286,6 +287,157 @@ class TestOperationModel(BaseTestCase):
         unrealized = operation.calculate_unrealized_pnl(Decimal("55000.0"))
         expected = (Decimal("55000.0") - Decimal("50000.0")) * Decimal("0.1")
         self.assertEqual(unrealized, expected)
+
+
+class TestOperationLifecycle(BaseTestCase):
+    """Tests for Operation lifecycle state transitions (Gate 5)."""
+
+    def test_allowed_transition_planned_to_active(self):
+        """Test PLANNED -> ACTIVE is allowed."""
+        operation = Operation.objects.create(
+            client=self.client,
+            strategy=self.strategy,
+            symbol=self.symbol,
+            side="BUY",
+            status="PLANNED",
+        )
+        operation.set_status("ACTIVE")
+        self.assertEqual(operation.status, "ACTIVE")
+
+    def test_allowed_transition_active_to_closed(self):
+        """Test ACTIVE -> CLOSED is allowed (normal exit)."""
+        operation = Operation.objects.create(
+            client=self.client,
+            strategy=self.strategy,
+            symbol=self.symbol,
+            side="BUY",
+            status="ACTIVE",
+        )
+        operation.set_status("CLOSED")
+        self.assertEqual(operation.status, "CLOSED")
+        self.assertTrue(operation.is_complete)
+
+    def test_allowed_transition_planned_to_cancelled(self):
+        """Test PLANNED -> CANCELLED is allowed."""
+        operation = Operation.objects.create(
+            client=self.client,
+            strategy=self.strategy,
+            symbol=self.symbol,
+            side="BUY",
+            status="PLANNED",
+        )
+        operation.set_status("CANCELLED")
+        self.assertEqual(operation.status, "CANCELLED")
+
+    def test_allowed_transition_active_to_cancelled(self):
+        """Test ACTIVE -> CANCELLED is allowed."""
+        operation = Operation.objects.create(
+            client=self.client,
+            strategy=self.strategy,
+            symbol=self.symbol,
+            side="BUY",
+            status="ACTIVE",
+        )
+        operation.set_status("CANCELLED")
+        self.assertEqual(operation.status, "CANCELLED")
+
+    def test_reject_closed_to_active(self):
+        """Test CLOSED -> ACTIVE is rejected (no backwards transitions)."""
+        operation = Operation.objects.create(
+            client=self.client,
+            strategy=self.strategy,
+            symbol=self.symbol,
+            side="BUY",
+            status="CLOSED",
+        )
+        with self.assertRaises(InvalidOperationStatusError) as cm:
+            operation.set_status("ACTIVE")
+        # Machine-readable error format
+        self.assertIn("current=CLOSED", str(cm.exception))
+        self.assertIn("new=ACTIVE", str(cm.exception))
+        self.assertIn("allowed=(none)", str(cm.exception))
+
+    def test_reject_cancelled_to_active(self):
+        """Test CANCELLED -> ACTIVE is rejected (no backwards transitions)."""
+        operation = Operation.objects.create(
+            client=self.client,
+            strategy=self.strategy,
+            symbol=self.symbol,
+            side="BUY",
+            status="CANCELLED",
+        )
+        with self.assertRaises(InvalidOperationStatusError) as cm:
+            operation.set_status("ACTIVE")
+        # Machine-readable error format
+        self.assertIn("current=CANCELLED", str(cm.exception))
+        self.assertIn("new=ACTIVE", str(cm.exception))
+
+    def test_reject_closed_to_cancelled(self):
+        """Test CLOSED -> CANCELLED is rejected (terminal to terminal)."""
+        operation = Operation.objects.create(
+            client=self.client,
+            strategy=self.strategy,
+            symbol=self.symbol,
+            side="BUY",
+            status="CLOSED",
+        )
+        with self.assertRaises(InvalidOperationStatusError) as cm:
+            operation.set_status("CANCELLED")
+        # Machine-readable error format
+        self.assertIn("current=CLOSED", str(cm.exception))
+        self.assertIn("new=CANCELLED", str(cm.exception))
+
+    def test_reject_cancelled_to_closed(self):
+        """Test CANCELLED -> CLOSED is rejected (terminal to terminal)."""
+        operation = Operation.objects.create(
+            client=self.client,
+            strategy=self.strategy,
+            symbol=self.symbol,
+            side="BUY",
+            status="CANCELLED",
+        )
+        with self.assertRaises(InvalidOperationStatusError) as cm:
+            operation.set_status("CLOSED")
+        # Machine-readable error format
+        self.assertIn("current=CANCELLED", str(cm.exception))
+        self.assertIn("new=CLOSED", str(cm.exception))
+
+    def test_invalid_status_value(self):
+        """Test that invalid status values are rejected."""
+        operation = Operation.objects.create(
+            client=self.client,
+            strategy=self.strategy,
+            symbol=self.symbol,
+            side="BUY",
+            status="ACTIVE",
+        )
+        with self.assertRaises(InvalidOperationStatusError) as cm:
+            operation.set_status("INVALID_STATUS")
+        error_msg = str(cm.exception)
+        self.assertIn("Invalid status value", error_msg)
+        self.assertIn("INVALID_STATUS", error_msg)
+        # Check that valid statuses are listed
+        self.assertIn("ACTIVE", error_msg)
+        self.assertIn("CANCELLED", error_msg)
+        self.assertIn("CLOSED", error_msg)
+        self.assertIn("PLANNED", error_msg)
+
+    def test_transition_persists_after_save(self):
+        """Test that status transitions persist after save()."""
+        operation = Operation.objects.create(
+            client=self.client,
+            strategy=self.strategy,
+            symbol=self.symbol,
+            side="BUY",
+            status="ACTIVE",
+        )
+        operation.set_status("CLOSED")
+        operation.save()
+
+        # Refresh from DB and verify
+        operation.refresh_from_db()
+        self.assertEqual(operation.status, "CLOSED")
+        self.assertTrue(operation.is_complete)
 
 
 class TestPositionModel(BaseTestCase):

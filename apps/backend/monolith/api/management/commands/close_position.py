@@ -10,6 +10,7 @@ Usage:
 from decimal import Decimal
 from django.core.management.base import BaseCommand
 from django.utils import timezone
+from django.db import transaction
 import json
 
 from api.models import Operation, Order, Strategy, Symbol
@@ -199,12 +200,11 @@ class Command(BaseCommand):
                     f"✅ Exit order FILLED: {exit_order.filled_quantity} @ ${exit_order.avg_fill_price}"
                 ))
 
-                # Link to operation
-                op.exit_orders.add(exit_order)
-
-                # Update operation status
-                op.status = 'CLOSED'
-                op.save()
+                # Link exit order and update status (atomic)
+                with transaction.atomic():
+                    op.exit_orders.add(exit_order)
+                    op.set_status("CLOSED")
+                    op.save()
 
                 self.stdout.write(self.style.SUCCESS(f"✅ Operation #{op.id} marked as CLOSED"))
 

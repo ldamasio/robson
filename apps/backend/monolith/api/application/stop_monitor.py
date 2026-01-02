@@ -425,10 +425,11 @@ class StopExecutor:
                     binance_order_id=order_id,
                 )
 
-                # Add to operation
-                operation.exit_orders.add(exit_order)
-                operation.status = "CLOSED"
-                operation.save()
+                # Link exit order and update status (atomic)
+                with transaction.atomic():
+                    operation.exit_orders.add(exit_order)
+                    operation.set_status("CLOSED")
+                    operation.save()
 
                 # Update trade if exists
                 trade = Trade.objects.filter(

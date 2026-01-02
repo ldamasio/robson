@@ -1,11 +1,17 @@
 # api/models/trading.py
 
 from decimal import Decimal
+from typing import ClassVar
 from django.db import models
 from django.utils import timezone
 from django.core.exceptions import ValidationError
 
 from .base import BaseModel, ActiveManager, TenantManager
+
+
+class InvalidOperationStatusError(ValidationError):
+    """Raised when an invalid status transition is attempted."""
+    pass
 
 
 class Symbol(BaseModel):
@@ -360,6 +366,56 @@ class Operation(BaseModel):
             return (Decimal(current_price) - avg_entry) * qty
         else:
             return (avg_entry - Decimal(current_price)) * qty
+
+    # Lifecycle state machine (Gate 5)
+    # Allowed transitions: current_state -> {next_states}
+    # ClassVar prevents Django from treating this as a model field
+    _ALLOWED_TRANSITIONS: ClassVar[dict[str, set[str]]] = {
+        "PLANNED": {"ACTIVE", "CANCELLED"},
+        "ACTIVE": {"CLOSED", "CANCELLED"},
+        "CLOSED": set(),  # Terminal state
+        "CANCELLED": set(),  # Terminal state
+    }
+
+    # Extract valid status values from STATUS_CHOICES for validation
+    _VALID_STATUSES: ClassVar[set[str]] = {"PLANNED", "ACTIVE", "CLOSED", "CANCELLED"}
+
+    def set_status(self, new_status: str) -> None:
+        """
+        Set operation status with transition validation.
+
+        This method enforces the Operation lifecycle state machine.
+        Only valid transitions are allowed; backwards transitions
+        (e.g., CLOSED -> ACTIVE) are rejected.
+
+        Args:
+            new_status: New status to set (must be in STATUS_CHOICES)
+
+        Raises:
+            InvalidOperationStatusError: If transition is not allowed or status is invalid
+
+        Example:
+            >>> operation.set_status("CLOSED")  # ACTIVE -> CLOSED: OK
+            >>> operation.set_status("ACTIVE")   # CLOSED -> ACTIVE: raises
+        """
+        # Validate status value
+        if new_status not in self._VALID_STATUSES:
+            raise InvalidOperationStatusError(
+                f"Invalid status value: '{new_status}'. "
+                f"Valid statuses: {', '.join(sorted(self._VALID_STATUSES))}"
+            )
+
+        current = self.status
+        allowed = self._ALLOWED_TRANSITIONS.get(current, set())
+
+        if new_status not in allowed:
+            # Machine-readable error format
+            raise InvalidOperationStatusError(
+                f"Invalid status transition: current={current}, new={new_status}, "
+                f"allowed={','.join(sorted(allowed)) if allowed else '(none)'}"
+            )
+
+        self.status = new_status
 
 
 class Position(BaseModel):
