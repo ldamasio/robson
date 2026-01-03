@@ -124,6 +124,119 @@ class PlaceOrderUseCase:
         return persisted
 
 
+class AutoCalculateTradingParametersUseCase:
+    """
+    Use case for auto-calculating trading parameters from strategy configuration.
+
+    This orchestrates:
+    1. Determining trade side from strategy's market_bias or config
+    2. Determining capital allocation from strategy config
+    3. Calculating technical stop-loss using market data
+    4. Calculating position size based on 1% risk rule
+
+    Used by both create_trading_intent and auto_calculate_parameters endpoints
+    to avoid logic duplication.
+    """
+
+    def __init__(self, tech_stop_service, timeout: float = 5.0):
+        """
+        Initialize the use case.
+
+        Args:
+            tech_stop_service: BinanceTechnicalStopService instance
+            timeout: Timeout for API calls in seconds
+        """
+        self.tech_stop_service = tech_stop_service
+        self.timeout = timeout
+
+    def execute(self, symbol_obj, strategy_obj) -> dict:
+        """
+        Calculate trading parameters from symbol and strategy.
+
+        Args:
+            symbol_obj: Symbol model instance (has .name attribute)
+            strategy_obj: Strategy model instance (has .market_bias, .get_config_value())
+
+        Returns:
+            Dictionary with calculated parameters:
+            {
+                "side": "BUY" | "SELL",
+                "entry_price": Decimal,
+                "stop_price": Decimal,
+                "capital": Decimal,
+                "quantity": Decimal,
+                "risk_amount": Decimal,
+                "position_value": Decimal,
+                "timeframe": str,
+                "method_used": str,
+                "confidence": str,
+                "side_source": str,
+                "capital_source": str,
+                "stop_result": TechnicalStopResult
+            }
+
+        Raises:
+            TimeoutError: If Binance API calls exceed timeout
+            Exception: If calculation fails
+        """
+        from decimal import Decimal
+
+        # Determine side from Strategy.market_bias or config.default_side
+        if hasattr(strategy_obj, 'market_bias') and strategy_obj.market_bias:
+            if strategy_obj.market_bias == "BULLISH":
+                side = "BUY"
+            elif strategy_obj.market_bias == "BEARISH":
+                side = "SELL"
+            else:  # NEUTRAL
+                side = strategy_obj.get_config_value("default_side", "BUY")
+            side_source = "strategy.market_bias"
+        else:
+            side = strategy_obj.get_config_value("default_side", "BUY")
+            side_source = "strategy.config.default_side"
+
+        # Determine capital from Strategy.config
+        capital_mode = strategy_obj.get_config_value("capital_mode", "fixed")
+        if capital_mode == "fixed":
+            capital = Decimal(strategy_obj.get_config_value("capital_fixed", "1000.00"))
+            capital_source = "strategy.config.capital_fixed"
+        else:
+            # TODO: Implement balance mode (fetch from Binance)
+            capital = Decimal("1000.00")
+            capital_source = "fallback (balance mode not implemented)"
+
+        # Get timeframe from strategy
+        timeframe = strategy_obj.get_config_value("timeframe", "15m")
+
+        # Calculate technical stop and position size
+        result = self.tech_stop_service.calculate_position_with_technical_stop(
+            symbol=symbol_obj.name,
+            side=side,
+            capital=capital,
+            entry_price=None,  # Will fetch current price
+            timeframe=timeframe,
+            max_risk_percent=Decimal("1.0")
+        )
+
+        # Extract and enrich result
+        stop_result = result["stop_result"]
+
+        return {
+            "side": side,
+            "entry_price": stop_result.entry_price,
+            "stop_price": stop_result.stop_price,
+            "capital": capital,
+            "quantity": result["quantity"],
+            "risk_amount": result["risk_amount"],
+            "position_value": result["position_value"],
+            "timeframe": timeframe,
+            "method_used": result["method_used"],
+            "confidence": result["confidence"],
+            "side_source": side_source,
+            "capital_source": capital_source,
+            "stop_result": stop_result,
+        }
+
+
 class _NullUoW:
     """Null Object pattern for UnitOfWork when none is provided."""
 

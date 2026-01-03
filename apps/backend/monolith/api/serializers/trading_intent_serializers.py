@@ -12,7 +12,7 @@ from api.models import TradingIntent, Symbol, Strategy
 
 class CreateTradingIntentSerializer(serializers.Serializer):
     """
-    Input serializer for creating a new trading intent.
+    Input serializer for creating a new trading intent (manual mode).
 
     Validates user input and prepares data for CreateTradingIntentUseCase.
     """
@@ -25,22 +25,26 @@ class CreateTradingIntentSerializer(serializers.Serializer):
     )
     side = serializers.ChoiceField(
         choices=["BUY", "SELL"],
-        help_text="Order side (BUY or SELL)"
+        help_text="Order side (BUY or SELL)",
+        required=False  # Optional for auto-mode
     )
     entry_price = serializers.DecimalField(
         max_digits=20,
         decimal_places=8,
-        help_text="Entry price for the trade"
+        help_text="Entry price for the trade",
+        required=False  # Optional for auto-mode
     )
     stop_price = serializers.DecimalField(
         max_digits=20,
         decimal_places=8,
-        help_text="Stop-loss price"
+        help_text="Stop-loss price",
+        required=False  # Optional for auto-mode
     )
     capital = serializers.DecimalField(
         max_digits=20,
         decimal_places=8,
-        help_text="Capital allocated for this trade"
+        help_text="Capital allocated for this trade",
+        required=False  # Optional for auto-mode
     )
     target_price = serializers.DecimalField(
         max_digits=20,
@@ -69,12 +73,24 @@ class CreateTradingIntentSerializer(serializers.Serializer):
     )
 
     def validate(self, data):
-        """Cross-field validation."""
+        """
+        Cross-field validation.
+
+        Supports both manual and auto modes:
+        - Manual mode: All fields provided, validate them
+        - Auto mode: Missing fields will be auto-calculated, skip validation
+        """
         entry_price = data.get("entry_price")
         stop_price = data.get("stop_price")
         side = data.get("side")
         capital = data.get("capital")
 
+        # Auto mode detection: if any required field is missing, skip validation
+        # The backend will auto-calculate these values
+        if not all([entry_price, stop_price, side, capital]):
+            return data
+
+        # Manual mode: validate all fields
         # Validate prices are positive
         if capital <= 0:
             raise serializers.ValidationError("Capital must be positive")

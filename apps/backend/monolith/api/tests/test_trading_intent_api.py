@@ -175,6 +175,160 @@ class TestCreateTradingIntent:
 
         assert response.status_code == 401
 
+    def test_create_trading_intent_auto_mode_success(self, api_client, user, symbol, strategy, monkeypatch):
+        """Test auto-mode: no manual fields provided."""
+        from unittest.mock import MagicMock
+        from api.application.technical_stop_adapter import BinanceTechnicalStopService
+        from api.domain.technical_stop import TechnicalStopResult, StopMethod, Confidence
+
+        # Update strategy with market_bias and config
+        strategy.market_bias = "BULLISH"
+        strategy.config = {
+            "default_side": "BUY",
+            "capital_mode": "fixed",
+            "capital_fixed": "1000.00",
+            "timeframe": "15m"
+        }
+        strategy.save()
+
+        # Mock the BinanceTechnicalStopService
+        mock_result = {
+            "stop_result": TechnicalStopResult(
+                stop_price=Decimal("49000"),
+                entry_price=Decimal("50000"),
+                side="BUY",
+                timeframe="15m",
+                method_used=StopMethod.SUPPORT_RESISTANCE,
+                confidence=Confidence.HIGH,
+                levels_found=[],
+                warnings=[]
+            ),
+            "quantity": Decimal("0.02"),
+            "risk_amount": Decimal("10"),
+            "position_value": Decimal("1000"),
+            "method_used": "support_resistance",
+            "confidence": "high"
+        }
+
+        mock_service = MagicMock()
+        mock_service.calculate_position_with_technical_stop.return_value = mock_result
+
+        def mock_init(self, *args, **kwargs):
+            return None
+
+        monkeypatch.setattr(BinanceTechnicalStopService, "__init__", mock_init)
+        monkeypatch.setattr(BinanceTechnicalStopService, "calculate_position_with_technical_stop",
+                           lambda self, **kwargs: mock_result)
+
+        # Authenticate
+        api_client.force_authenticate(user=user)
+
+        # Request with only symbol and strategy (auto mode)
+        data = {
+            "symbol": symbol.id,
+            "strategy": strategy.id,
+        }
+
+        # Make request
+        response = api_client.post("/api/trading-intents/create/", data, format="json")
+
+        # Assert
+        assert response.status_code == 201
+        assert response.data["side"] == "BUY"
+        assert response.data["regime"] == "auto"
+        assert "Auto-calculated" in response.data["reason"]
+
+    def test_create_trading_intent_auto_mode_explicit(self, api_client, user, symbol, strategy, monkeypatch):
+        """Test auto-mode: explicit mode='auto'."""
+        from unittest.mock import MagicMock
+        from api.application.technical_stop_adapter import BinanceTechnicalStopService
+        from api.domain.technical_stop import TechnicalStopResult, StopMethod, Confidence
+
+        # Update strategy
+        strategy.market_bias = "BULLISH"
+        strategy.config = {
+            "default_side": "BUY",
+            "capital_mode": "fixed",
+            "capital_fixed": "1000.00",
+            "timeframe": "15m"
+        }
+        strategy.save()
+
+        # Mock the service
+        mock_result = {
+            "stop_result": TechnicalStopResult(
+                stop_price=Decimal("49000"),
+                entry_price=Decimal("50000"),
+                side="BUY",
+                timeframe="15m",
+                method_used=StopMethod.SUPPORT_RESISTANCE,
+                confidence=Confidence.HIGH,
+                levels_found=[],
+                warnings=[]
+            ),
+            "quantity": Decimal("0.02"),
+            "risk_amount": Decimal("10"),
+            "position_value": Decimal("1000"),
+            "method_used": "support_resistance",
+            "confidence": "high"
+        }
+
+        monkeypatch.setattr(BinanceTechnicalStopService, "__init__", lambda self, *args, **kwargs: None)
+        monkeypatch.setattr(BinanceTechnicalStopService, "calculate_position_with_technical_stop",
+                           lambda self, **kwargs: mock_result)
+
+        api_client.force_authenticate(user=user)
+
+        # Request with mode='auto'
+        data = {
+            "symbol": symbol.id,
+            "strategy": strategy.id,
+            "mode": "auto"
+        }
+
+        response = api_client.post("/api/trading-intents/create/", data, format="json")
+
+        assert response.status_code == 201
+        assert response.data["regime"] == "auto"
+
+    def test_create_trading_intent_auto_mode_strict_validation(self, api_client, user, symbol, strategy):
+        """Test strict validation: mode='auto' with manual fields should fail."""
+        api_client.force_authenticate(user=user)
+
+        # Request with mode='auto' AND manual fields (should fail)
+        data = {
+            "symbol": symbol.id,
+            "strategy": strategy.id,
+            "mode": "auto",
+            "side": "BUY",  # Manual field - not allowed with mode='auto'
+        }
+
+        response = api_client.post("/api/trading-intents/create/", data, format="json")
+
+        assert response.status_code == 400
+        assert "fields_not_allowed" in response.data
+        assert "side" in response.data["fields_not_allowed"]
+
+    def test_create_trading_intent_partial_payload_validation(self, api_client, user, symbol, strategy):
+        """Test partial payload validation: some manual fields but not all."""
+        api_client.force_authenticate(user=user)
+
+        # Request with only some manual fields (should fail)
+        data = {
+            "symbol": symbol.id,
+            "strategy": strategy.id,
+            "side": "BUY",  # Provided
+            "entry_price": "50000.00",  # Provided
+            # Missing: stop_price, capital
+        }
+
+        response = api_client.post("/api/trading-intents/create/", data, format="json")
+
+        assert response.status_code == 400
+        assert "missing_fields" in response.data
+        assert "stop_price" in response.data["missing_fields"]
+        assert "capital" in response.data["missing_fields"]
+
 
 @pytest.mark.django_db
 class TestGetTradingIntent:

@@ -46,9 +46,13 @@ def create_trading_intent(request):
     """
     Create a new trading intent (PLAN step).
 
+    Supports two modes:
+    1. Manual mode: All fields provided (side, entry_price, stop_price, capital)
+    2. Auto mode: Only symbol and strategy provided, backend auto-calculates all parameters
+
     POST /api/trading-intents/create/
 
-    Request body:
+    Request body (Manual mode):
         symbol (int): Symbol ID
         strategy (int): Strategy ID
         side (str): BUY or SELL
@@ -60,11 +64,19 @@ def create_trading_intent(request):
         confidence (float, optional): Confidence level 0.0-1.0
         reason (str, optional): Reason for this intent
 
+    Request body (Auto mode):
+        symbol (int): Symbol ID
+        strategy (int): Strategy ID
+
     Returns:
         201 Created: TradingIntent object
         400 Bad Request: Validation errors
         500 Internal Server Error: Unexpected error
     """
+    from decimal import Decimal
+    from api.models import Symbol, Strategy
+    from api.application.technical_stop_adapter import BinanceTechnicalStopService
+
     try:
         # Get client from user
         client = request.user.client
@@ -79,18 +91,141 @@ def create_trading_intent(request):
         if not serializer.is_valid():
             return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
-        # Create command
+        validated_data = serializer.validated_data
+
+        # Detect auto mode: explicit mode="auto" OR all manual fields absent
+        # Partial payload (some fields missing) = 400 error
+        has_side = validated_data.get("side") is not None
+        has_entry = validated_data.get("entry_price") is not None
+        has_stop = validated_data.get("stop_price") is not None
+        has_capital = validated_data.get("capital") is not None
+
+        manual_fields_present = [has_side, has_entry, has_stop, has_capital]
+        has_any_manual = any(manual_fields_present)
+        has_all_manual = all(manual_fields_present)
+
+        # Check for explicit auto mode
+        mode = request.data.get("mode")
+        is_explicit_auto = mode == "auto"
+
+        # STRICT: If mode="auto" is explicit, reject ANY manual fields
+        if is_explicit_auto and has_any_manual:
+            provided_fields = []
+            if has_side:
+                provided_fields.append("side")
+            if has_entry:
+                provided_fields.append("entry_price")
+            if has_stop:
+                provided_fields.append("stop_price")
+            if has_capital:
+                provided_fields.append("capital")
+
+            return Response(
+                {
+                    "error": "Invalid payload: mode='auto' cannot have manual fields. Remove manual fields or remove mode='auto'.",
+                    "fields_not_allowed": provided_fields,
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Auto mode: explicit OR all fields absent
+        is_auto_mode = is_explicit_auto or not has_any_manual
+
+        # Reject partial payloads (some manual fields but not all)
+        if has_any_manual and not has_all_manual and not is_explicit_auto:
+            missing = []
+            if not has_side:
+                missing.append("side")
+            if not has_entry:
+                missing.append("entry_price")
+            if not has_stop:
+                missing.append("stop_price")
+            if not has_capital:
+                missing.append("capital")
+
+            return Response(
+                {
+                    "error": "Invalid payload: partial manual mode. Either provide ALL manual fields (side, entry_price, stop_price, capital) or use auto mode (mode='auto' or omit all fields).",
+                    "missing_fields": missing,
+                },
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        if is_auto_mode:
+            # AUTO MODE: Calculate all parameters automatically
+            logger.info(f"Auto mode detected for client {client.id}")
+
+            try:
+                # Get symbol and strategy
+                symbol = Symbol.objects.get(id=validated_data["symbol"], client=client)
+                strategy = Strategy.objects.get(id=validated_data["strategy"], client=client)
+
+                # Use shared auto-calculation use case
+                tech_stop_service = BinanceTechnicalStopService(
+                    client_id=client.id,
+                    timeout=5.0
+                )
+
+                from api.application.use_cases import AutoCalculateTradingParametersUseCase
+                auto_calc_use_case = AutoCalculateTradingParametersUseCase(
+                    tech_stop_service=tech_stop_service,
+                    timeout=5.0
+                )
+
+                try:
+                    result = auto_calc_use_case.execute(
+                        symbol_obj=symbol,
+                        strategy_obj=strategy
+                    )
+
+                    logger.info(
+                        f"Auto-calculated for client {client.id}: "
+                        f"side={result['side']} (source: {result['side_source']}), "
+                        f"capital={result['capital']} (source: {result['capital_source']}), "
+                        f"entry={result['entry_price']}, stop={result['stop_price']}, "
+                        f"method={result['method_used']}, confidence={result['confidence']}"
+                    )
+
+                except Exception as calc_error:
+                    # Log and return error
+                    # Note: Timeout fallback is handled inside BinanceTechnicalStopService
+                    logger.error(f"Auto-calculation failed: {calc_error}", exc_info=True)
+                    return Response(
+                        {"error": f"Auto-calculation failed: {str(calc_error)}. The system could not calculate trading parameters automatically."},
+                        status=status.HTTP_400_BAD_REQUEST
+                    )
+
+                # Update validated_data with auto-calculated values
+                validated_data["side"] = result["side"]
+                validated_data["entry_price"] = result["entry_price"]
+                validated_data["stop_price"] = result["stop_price"]
+                validated_data["capital"] = result["capital"]
+                validated_data["regime"] = "auto"
+                validated_data["reason"] = f"Auto-calculated (side: {result['side_source']}, capital: {result['capital_source']})"
+
+            except Symbol.DoesNotExist:
+                return Response(
+                    {"error": f"Symbol with id {validated_data['symbol']} not found"},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+            except Strategy.DoesNotExist:
+                return Response(
+                    {"error": f"Strategy with id {validated_data['strategy']} not found"},
+                    status=status.HTTP_404_NOT_FOUND
+                )
+
+        # Create command (works for both manual and auto modes now)
         command = CreateTradingIntentCommand(
-            symbol_id=serializer.validated_data["symbol"],
-            strategy_id=serializer.validated_data["strategy"],
-            side=serializer.validated_data["side"],
-            entry_price=serializer.validated_data["entry_price"],
-            stop_price=serializer.validated_data["stop_price"],
-            capital=serializer.validated_data["capital"],
-            target_price=serializer.validated_data.get("target_price"),
-            regime=serializer.validated_data.get("regime", "manual"),
-            confidence=serializer.validated_data.get("confidence", 0.5),
-            reason=serializer.validated_data.get("reason", "Manual entry via UI"),
+            symbol_id=validated_data["symbol"],
+            strategy_id=validated_data["strategy"],
+            side=validated_data["side"],
+            entry_price=validated_data["entry_price"],
+            stop_price=validated_data["stop_price"],
+            capital=validated_data["capital"],
+            target_price=validated_data.get("target_price"),
+            regime=validated_data.get("regime", "manual"),
+            confidence=validated_data.get("confidence", 0.5),
+            reason=validated_data.get("reason", "Manual entry via UI"),
             client_id=client.id,
         )
 
@@ -108,7 +243,8 @@ def create_trading_intent(request):
 
         logger.info(
             f"Created trading intent {intent.intent_id} for client {client.id}: "
-            f"{intent.side} {intent.quantity} {intent.symbol.name} @ {intent.entry_price}"
+            f"{intent.side} {intent.quantity} {intent.symbol.name} @ {intent.entry_price} "
+            f"(mode: {'auto' if is_auto_mode else 'manual'})"
         )
 
         return Response(response_serializer.data, status=status.HTTP_201_CREATED)
@@ -554,6 +690,141 @@ def pattern_trigger(request):
         )
     except Exception as e:
         logger.error(f"Unexpected error in pattern trigger: {e}", exc_info=True)
+        return Response(
+            {"error": "Internal server error"},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+        )
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def auto_calculate_parameters(request):
+    """
+    Auto-calculate trading parameters (compatibility wrapper).
+
+    This endpoint calculates parameters WITHOUT creating a TradingIntent.
+    Useful for preview/validation flows.
+
+    POST /api/trading-intents/auto-calculate/
+
+    Request body:
+        symbol_id (int): Symbol ID
+        strategy_id (int): Strategy ID
+
+    Returns:
+        200 OK: Calculated parameters
+        {
+            "symbol_id": int,
+            "strategy_id": int,
+            "side": "BUY" | "SELL",
+            "entry_price": str,
+            "stop_price": str,
+            "capital": str,
+            "quantity": str,
+            "risk_amount": str,
+            "position_value": str,
+            "timeframe": str,
+            "method_used": str,
+            "confidence": str,
+            "side_source": str,
+            "capital_source": str
+        }
+        400 Bad Request: Invalid input or calculation failed
+        408 Request Timeout: Binance API timeout
+        500 Internal Server Error: Unexpected error
+    """
+    from decimal import Decimal
+    from api.models import Symbol, Strategy
+    from api.application.technical_stop_adapter import BinanceTechnicalStopService
+
+    try:
+        # Get client from user
+        client = request.user.client
+        if not client:
+            return Response(
+                {"error": "User has no associated client"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Validate input
+        symbol_id = request.data.get("symbol_id")
+        strategy_id = request.data.get("strategy_id")
+
+        if not symbol_id or not strategy_id:
+            return Response(
+                {"error": "symbol_id and strategy_id are required"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Get symbol and strategy
+        try:
+            symbol = Symbol.objects.get(id=symbol_id, client=client)
+            strategy = Strategy.objects.get(id=strategy_id, client=client)
+        except Symbol.DoesNotExist:
+            return Response(
+                {"error": f"Symbol with id {symbol_id} not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+        except Strategy.DoesNotExist:
+            return Response(
+                {"error": f"Strategy with id {strategy_id} not found"},
+                status=status.HTTP_404_NOT_FOUND
+            )
+
+        # Use shared auto-calculation use case
+        tech_stop_service = BinanceTechnicalStopService(
+            client_id=client.id,
+            timeout=5.0
+        )
+
+        from api.application.use_cases import AutoCalculateTradingParametersUseCase
+        auto_calc_use_case = AutoCalculateTradingParametersUseCase(
+            tech_stop_service=tech_stop_service,
+            timeout=5.0
+        )
+
+        try:
+            result = auto_calc_use_case.execute(
+                symbol_obj=symbol,
+                strategy_obj=strategy
+            )
+        except Exception as calc_error:
+            # Log and return error
+            # Note: Timeout fallback is handled inside BinanceTechnicalStopService
+            logger.error(f"Auto-calculation failed: {calc_error}", exc_info=True)
+            return Response(
+                {"error": f"Auto-calculation failed: {str(calc_error)}"},
+                status=status.HTTP_400_BAD_REQUEST
+            )
+
+        # Format response
+        response_data = {
+            "symbol_id": symbol.id,
+            "strategy_id": strategy.id,
+            "side": result["side"],
+            "entry_price": str(result["entry_price"]),
+            "stop_price": str(result["stop_price"]),
+            "capital": str(result["capital"]),
+            "quantity": str(result["quantity"]),
+            "risk_amount": str(result["risk_amount"]),
+            "position_value": str(result["position_value"]),
+            "timeframe": result["timeframe"],
+            "method_used": result["method_used"],
+            "confidence": result["confidence"],
+            "side_source": result["side_source"],
+            "capital_source": result["capital_source"],
+        }
+
+        logger.info(
+            f"Auto-calculated parameters for client {client.id}: "
+            f"{result['side']} {symbol.name} @ {result['entry_price']}, "
+            f"stop @ {result['stop_price']}, qty {result['quantity']}"
+        )
+
+        return Response(response_data, status=status.HTTP_200_OK)
+
+    except Exception as e:
+        logger.error(f"Unexpected error in auto-calculate: {e}", exc_info=True)
         return Response(
             {"error": "Internal server error"},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR

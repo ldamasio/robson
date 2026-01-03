@@ -66,6 +66,7 @@ try:
         validate_trading_intent,
         execute_trading_intent,
         pattern_trigger,
+        auto_calculate_parameters,
     )
     TRADING_INTENT_VIEWS_AVAILABLE = True
     print("✅ Trading intent views imported successfully")
@@ -230,6 +231,7 @@ urlpatterns = [
 # ==========================================
 if TRADING_INTENT_VIEWS_AVAILABLE:
     urlpatterns += [
+        path('trading-intents/auto-calculate/', auto_calculate_parameters, name='auto_calculate_parameters'),
         path('trading-intents/create/', create_trading_intent, name='create_trading_intent'),
         path('trading-intents/', list_trading_intents, name='list_trading_intents'),
         path('trading-intents/<str:intent_id>/', get_trading_intent, name='get_trading_intent'),

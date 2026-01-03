@@ -51,22 +51,29 @@ class BinanceTechnicalStopService:
         level_n: int = 2,
         default_timeframe: str = "15m",
         lookback_periods: int = 100,
+        timeout: float = 5.0,
+        client_id: Optional[int] = None,
     ):
         """
         Initialize the service.
-        
+
         Args:
             level_n: Which support/resistance level to use (2nd by default)
             default_timeframe: Default chart timeframe
             lookback_periods: Number of candles to analyze
+            timeout: Timeout for Binance API calls in seconds (default: 5.0)
+            client_id: Optional client ID for multi-tenant setup
         """
         self.level_n = level_n
         self.default_timeframe = default_timeframe
         self.lookback_periods = lookback_periods
-        
-        self.market_data = BinanceMarketData()
+        self.timeout = timeout
+        self.client_id = client_id
+
+        # Pass timeout to market data adapter for HTTP-level timeout
+        self.market_data = BinanceMarketData(client_id=client_id, timeout=timeout)
         self.calculator = TechnicalStopCalculator(level_n=level_n)
-    
+
     def calculate_stop(
         self,
         symbol: str,
@@ -76,26 +83,31 @@ class BinanceTechnicalStopService:
     ) -> TechnicalStopResult:
         """
         Calculate technical stop for a trade.
-        
+
         Args:
             symbol: Trading pair (e.g., "BTCUSDC")
             side: "BUY" or "SELL"
             entry_price: Entry price (fetched from market if not provided)
             timeframe: Chart timeframe (default: 15m)
-            
+
         Returns:
             TechnicalStopResult with stop price and context
+
+        Raises:
+            TimeoutError: If Binance API calls exceed timeout
         """
         timeframe = timeframe or self.default_timeframe
-        
+
         # Get current price if not provided
+        # Timeout is handled at HTTP client level (requests library)
         if entry_price is None:
             if side == "BUY":
                 entry_price = self.market_data.best_ask(symbol)
             else:
                 entry_price = self.market_data.best_bid(symbol)
-        
+
         # Fetch OHLCV data
+        # Timeout is handled at HTTP client level (requests library)
         candles = self._fetch_ohlcv(symbol, timeframe, self.lookback_periods)
         
         if not candles:
@@ -187,14 +199,11 @@ class BinanceTechnicalStopService:
     ) -> List[OHLCV]:
         """Fetch OHLCV data from Binance."""
         try:
-            # Get the Binance client
-            client = self.market_data._get_client()
-            
             # Map timeframe
             binance_interval = self.TIMEFRAME_MAP.get(timeframe, "15m")
-            
-            # Fetch klines
-            klines = client.get_klines(
+
+            # Fetch klines using market data adapter
+            klines = self.market_data.get_klines(
                 symbol=symbol,
                 interval=binance_interval,
                 limit=limit,

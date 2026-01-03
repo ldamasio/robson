@@ -57,6 +57,7 @@ class Command(BaseCommand):
             {
                 "name": "All In",
                 "description": "Go all-in with technical stop precision. Buy maximum position size with stop at second technical support (15m chart).",
+                "market_bias": "BULLISH",
                 "config": {
                     "timeframe": "15m",
                     "indicators": ["Support/Resistance", "Technical Stop"],
@@ -64,7 +65,10 @@ class Command(BaseCommand):
                     "risk_percent": 1.0,
                     "use_technical_stop": True,
                     "leverage": 3,
-                    "account_type": "isolated_margin"
+                    "account_type": "isolated_margin",
+                    "default_side": "BUY",
+                    "capital_mode": "fixed",
+                    "capital_fixed": "1000.00"
                 },
                 "risk_config": {
                     "max_risk_per_trade": 1.0,
@@ -75,6 +79,7 @@ class Command(BaseCommand):
             {
                 "name": "Rescue Forces",
                 "description": "Automatic rescue on bullish momentum. Enters when MA4 crosses above MA9 with short-term uptrend confirmed.",
+                "market_bias": "BULLISH",
                 "config": {
                     "timeframe": "15m",
                     "indicators": ["MA4", "MA9", "Trend"],
@@ -86,7 +91,10 @@ class Command(BaseCommand):
                     },
                     "risk_percent": 1.0,
                     "leverage": 3,
-                    "account_type": "isolated_margin"
+                    "account_type": "isolated_margin",
+                    "default_side": "BUY",
+                    "capital_mode": "fixed",
+                    "capital_fixed": "1000.00"
                 },
                 "risk_config": {
                     "max_risk_per_trade": 1.0,
@@ -97,23 +105,31 @@ class Command(BaseCommand):
             {
                 "name": "Smooth Sailing",
                 "description": "Ride the calm waves of trending markets with moving average crossovers.",
+                "market_bias": "NEUTRAL",
                 "config": {
                     "timeframe": "1h",
                     "indicators": ["MA50", "MA200"],
                     "entry_type": "trend",
                     "risk_percent": 0.5,
-                    "account_type": "spot"
+                    "account_type": "spot",
+                    "default_side": "BUY",
+                    "capital_mode": "fixed",
+                    "capital_fixed": "500.00"
                 }
             },
             {
                 "name": "Bounce Back",
                 "description": "Catch the bounce when price returns to mean in range-bound markets.",
+                "market_bias": "NEUTRAL",
                 "config": {
                     "timeframe": "30m",
                     "indicators": ["Bollinger Bands", "RSI"],
                     "entry_type": "reversion",
                     "risk_percent": 0.5,
-                    "account_type": "spot"
+                    "account_type": "spot",
+                    "default_side": "BUY",
+                    "capital_mode": "fixed",
+                    "capital_fixed": "500.00"
                 }
             }
         ]
@@ -126,12 +142,13 @@ class Command(BaseCommand):
                 defaults={
                     "description": s_data["description"],
                     "config": s_data.get("config", {}),
+                    "market_bias": s_data.get("market_bias", "BULLISH"),
                     "is_active": True
                 }
             )
             strategies[s_data["name"]] = strategy
             if created:
-                self.stdout.write(f"Created strategy: {s_data['name']}")
+                self.stdout.write(f"Created strategy: {s_data['name']} (bias: {s_data.get('market_bias', 'BULLISH')})")
 
         # 3. Create active Operations (Positions)
         # Position 1: BTCUSDC Long (Winning) - Using All In strategy

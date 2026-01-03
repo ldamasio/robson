@@ -76,11 +76,24 @@ class Symbol(BaseModel):
 
 class Strategy(BaseModel):
     """Trading strategies with flexible configuration and performance stats."""
+
+    MARKET_BIAS_CHOICES = [
+        ("BULLISH", "Bullish - Buy/Long positions"),
+        ("BEARISH", "Bearish - Sell/Short positions"),
+        ("NEUTRAL", "Neutral - Analyze market conditions"),
+    ]
+
     name = models.CharField(max_length=255)
     description = models.TextField(blank=True, default="")
     config = models.JSONField(default=dict, blank=True, help_text="Strategy configuration")
     risk_config = models.JSONField(default=dict, blank=True, help_text="Risk configuration")
     is_active = models.BooleanField(default=True)
+    market_bias = models.CharField(
+        max_length=20,
+        choices=MARKET_BIAS_CHOICES,
+        default="BULLISH",
+        help_text="Market direction bias for this strategy"
+    )
 
     # Performance tracking
     total_trades = models.IntegerField(default=0)

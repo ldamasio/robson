@@ -9,20 +9,20 @@ import Alert from 'react-bootstrap/Alert';
 import Spinner from 'react-bootstrap/Spinner';
 import PropTypes from 'prop-types';
 import AuthContext from '../../../context/AuthContext';
-import DecimalInput from '../../shared/DecimalInput';
 
 /**
- * StartNewOperationModal - Modal for creating new trading intents (PLAN step).
+ * StartNewOperationModal - Simplified one-click trading plan creation.
  *
- * This modal allows users to:
- * 1. Select trading pair (symbol)
- * 2. Choose strategy
- * 3. Specify side (BUY/SELL)
- * 4. Enter entry price and stop price (technical invalidation level)
- * 5. Enter capital amount
+ * User only selects:
+ * 1. Trading pair (symbol)
+ * 2. Strategy
  *
- * The backend will calculate optimal position size using the 1% risk rule:
- * Position Size = (Capital × 1%) / |Entry Price - Stop Price|
+ * Backend automatically calculates:
+ * - Entry price (current market price)
+ * - Stop price (technical analysis)
+ * - Capital (from strategy config)
+ * - Side (from strategy market_bias)
+ * - Position size (1% risk rule)
  *
  * @param {Object} props
  * @param {boolean} props.show - Whether modal is visible
@@ -39,19 +39,14 @@ function StartNewOperationModal({ show, onHide, onSuccess }) {
 
   // Form state
   const [formData, setFormData] = useState({
-    symbol_id: '',
-    strategy_id: '',
-    side: 'BUY',
-    entry_price: '',
-    stop_price: '',
-    capital: '',
+    symbol: '',
+    strategy: '',
   });
 
   // UI state
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [error, setError] = useState(null);
   const [fieldErrors, setFieldErrors] = useState({});
-  const [calculatedSize, setCalculatedSize] = useState(null);
 
   // Fetch symbols and strategies on mount
   useEffect(() => {
@@ -101,32 +96,6 @@ function StartNewOperationModal({ show, onHide, onSuccess }) {
     }
   }, [authTokens, show]);
 
-  // Calculate position size preview (optional feature)
-  useEffect(() => {
-    const { entry_price, stop_price, capital } = formData;
-
-    if (entry_price && stop_price && capital) {
-      try {
-        const entry = parseFloat(entry_price);
-        const stop = parseFloat(stop_price);
-        const cap = parseFloat(capital);
-
-        if (!isNaN(entry) && !isNaN(stop) && !isNaN(cap) && entry !== stop) {
-          const stopDistance = Math.abs(entry - stop);
-          const maxRisk = cap * 0.01; // 1% risk
-          const size = maxRisk / stopDistance;
-          setCalculatedSize(size.toFixed(8));
-        } else {
-          setCalculatedSize(null);
-        }
-      } catch {
-        setCalculatedSize(null);
-      }
-    } else {
-      setCalculatedSize(null);
-    }
-  }, [formData.entry_price, formData.stop_price, formData.capital]);
-
   // Handle field changes
   const handleFieldChange = (field, value) => {
     setFormData((prev) => ({ ...prev, [field]: value }));
@@ -137,30 +106,10 @@ function StartNewOperationModal({ show, onHide, onSuccess }) {
   // Validate form
   const validateForm = () => {
     const errors = {};
-    const { symbol_id, strategy_id, entry_price, stop_price, capital } = formData;
+    const { symbol, strategy } = formData;
 
-    if (!symbol_id) errors.symbol_id = 'Symbol is required';
-    if (!strategy_id) errors.strategy_id = 'Strategy is required';
-    if (!entry_price) {
-      errors.entry_price = 'Entry price is required';
-    } else if (parseFloat(entry_price) <= 0) {
-      errors.entry_price = 'Entry price must be greater than 0';
-    }
-    if (!stop_price) {
-      errors.stop_price = 'Stop price is required';
-    } else if (parseFloat(stop_price) <= 0) {
-      errors.stop_price = 'Stop price must be greater than 0';
-    }
-    if (!capital) {
-      errors.capital = 'Capital is required';
-    } else if (parseFloat(capital) <= 0) {
-      errors.capital = 'Capital must be greater than 0';
-    }
-
-    // Entry price must not equal stop price
-    if (entry_price && stop_price && parseFloat(entry_price) === parseFloat(stop_price)) {
-      errors.stop_price = 'Stop price must be different from entry price';
-    }
+    if (!symbol) errors.symbol = 'Symbol is required';
+    if (!strategy) errors.strategy = 'Strategy is required';
 
     setFieldErrors(errors);
     return Object.keys(errors).length === 0;
@@ -172,7 +121,7 @@ function StartNewOperationModal({ show, onHide, onSuccess }) {
 
     // Validate
     if (!validateForm()) {
-      setError('Please fix the errors above before submitting.');
+      setError('Please select both symbol and strategy.');
       return;
     }
 
@@ -180,14 +129,11 @@ function StartNewOperationModal({ show, onHide, onSuccess }) {
     setError(null);
 
     try {
-      // Prepare payload
+      // Prepare payload - only symbol and strategy
+      // Backend will auto-calculate all other parameters
       const payload = {
-        symbol: parseInt(formData.symbol_id),
-        strategy: parseInt(formData.strategy_id),
-        side: formData.side,
-        entry_price: formData.entry_price,
-        stop_price: formData.stop_price,
-        capital: formData.capital,
+        symbol: parseInt(formData.symbol),
+        strategy: parseInt(formData.strategy),
       };
 
       // Submit to API
@@ -205,7 +151,7 @@ function StartNewOperationModal({ show, onHide, onSuccess }) {
 
       if (!response.ok) {
         const errorData = await response.json();
-        throw new Error(errorData.detail || errorData.message || 'Failed to create trading intent');
+        throw new Error(errorData.error || errorData.detail || errorData.message || 'Failed to create trading intent');
       }
 
       const createdIntent = await response.json();
@@ -217,14 +163,9 @@ function StartNewOperationModal({ show, onHide, onSuccess }) {
 
       // Reset form
       setFormData({
-        symbol_id: '',
-        strategy_id: '',
-        side: 'BUY',
-        entry_price: '',
-        stop_price: '',
-        capital: '',
+        symbol: '',
+        strategy: '',
       });
-      setCalculatedSize(null);
 
       // Close modal
       onHide();
@@ -245,16 +186,12 @@ function StartNewOperationModal({ show, onHide, onSuccess }) {
     }
   };
 
-  // Get selected symbol for display
-  const selectedSymbol = symbols.find((s) => s.id === parseInt(formData.symbol_id));
-  const baseAsset = selectedSymbol?.base_asset || '';
-
   return (
-    <Modal show={show} onHide={handleClose} aria-labelledby="contained-modal-title-vcenter" size="lg">
+    <Modal show={show} onHide={handleClose} aria-labelledby="contained-modal-title-vcenter">
       <Modal.Header closeButton>
         <Modal.Title id="contained-modal-title-vcenter">Create Trading Plan</Modal.Title>
       </Modal.Header>
-      <Modal.Body className="grid-example">
+      <Modal.Body>
         <Container>
           {error && (
             <Alert variant="danger" dismissible onClose={() => setError(null)}>
@@ -262,176 +199,64 @@ function StartNewOperationModal({ show, onHide, onSuccess }) {
             </Alert>
           )}
 
-          {/* Causality explanation */}
+          {/* Simplified explanation */}
           <Alert variant="info" className="mb-3">
-            <strong>Understanding the flow:</strong>
-            <ol className="mb-0 mt-2 small">
-              <li><strong>Plan</strong> - Declare your intent (no orders placed)</li>
-              <li><strong>Validate</strong> - Check risk limits and constraints</li>
-              <li><strong>Execute</strong> - Authorize live trading (orders placed then)</li>
-            </ol>
-            <p className="mb-0 mt-2 small text-muted">
-              <em>You are the causal agent. Execution requires your explicit authorization.</em>
+            <strong>One-click plan creation</strong>
+            <p className="mb-0 mt-2 small">
+              Select symbol and strategy. Backend will automatically calculate entry, stop, capital, and position size
+              using technical analysis and your strategy settings.
             </p>
           </Alert>
 
           <Form onSubmit={handleSubmit}>
-            {/* Symbol and Strategy Selection */}
-            <Row>
-              <Col xs={12} md={6}>
-                <Form.Group className="mb-3">
-                  <Form.Label>
-                    Trading Pair <span className="text-danger">*</span>
-                  </Form.Label>
-                  <Form.Select
-                    value={formData.symbol_id}
-                    onChange={(e) => handleFieldChange('symbol_id', e.target.value)}
-                    disabled={isSubmitting || loadingData}
-                    isInvalid={!!fieldErrors.symbol_id}
-                  >
-                    <option value="">Select trading pair...</option>
-                    {symbols.map((symbol) => (
-                      <option key={symbol.id} value={symbol.id}>
-                        {symbol.base_asset}/{symbol.quote_asset}
-                      </option>
-                    ))}
-                  </Form.Select>
-                  {fieldErrors.symbol_id && (
-                    <Form.Control.Feedback type="invalid">{fieldErrors.symbol_id}</Form.Control.Feedback>
-                  )}
-                </Form.Group>
-              </Col>
+            {/* Symbol Selection */}
+            <Form.Group className="mb-3">
+              <Form.Label>
+                Trading Pair <span className="text-danger">*</span>
+              </Form.Label>
+              <Form.Select
+                value={formData.symbol}
+                onChange={(e) => handleFieldChange('symbol', e.target.value)}
+                disabled={isSubmitting || loadingData}
+                isInvalid={!!fieldErrors.symbol}
+              >
+                <option value="">Select trading pair...</option>
+                {symbols.map((symbol) => (
+                  <option key={symbol.id} value={symbol.id}>
+                    {symbol.base_asset}/{symbol.quote_asset}
+                  </option>
+                ))}
+              </Form.Select>
+              {fieldErrors.symbol && (
+                <Form.Control.Feedback type="invalid">{fieldErrors.symbol}</Form.Control.Feedback>
+              )}
+            </Form.Group>
 
-              <Col xs={12} md={6}>
-                <Form.Group className="mb-3">
-                  <Form.Label>
-                    Strategy <span className="text-danger">*</span>
-                  </Form.Label>
-                  <Form.Select
-                    value={formData.strategy_id}
-                    onChange={(e) => handleFieldChange('strategy_id', e.target.value)}
-                    disabled={isSubmitting || loadingData}
-                    isInvalid={!!fieldErrors.strategy_id}
-                  >
-                    <option value="">Select strategy...</option>
-                    {strategies.map((strategy) => (
-                      <option key={strategy.id} value={strategy.id}>
-                        {strategy.name}
-                      </option>
-                    ))}
-                  </Form.Select>
-                  {fieldErrors.strategy_id && (
-                    <Form.Control.Feedback type="invalid">{fieldErrors.strategy_id}</Form.Control.Feedback>
-                  )}
-                </Form.Group>
-              </Col>
-            </Row>
-
-            {/* Side Selection */}
-            <Row>
-              <Col xs={12}>
-                <Form.Group className="mb-3">
-                  <Form.Label>
-                    Side <span className="text-danger">*</span>
-                  </Form.Label>
-                  <div>
-                    <Form.Check
-                      inline
-                      type="radio"
-                      label="BUY (Long)"
-                      name="side"
-                      id="side-buy"
-                      value="BUY"
-                      checked={formData.side === 'BUY'}
-                      onChange={(e) => handleFieldChange('side', e.target.value)}
-                      disabled={isSubmitting}
-                    />
-                    <Form.Check
-                      inline
-                      type="radio"
-                      label="SELL (Short)"
-                      name="side"
-                      id="side-sell"
-                      value="SELL"
-                      checked={formData.side === 'SELL'}
-                      onChange={(e) => handleFieldChange('side', e.target.value)}
-                      disabled={isSubmitting}
-                    />
-                  </div>
-                </Form.Group>
-              </Col>
-            </Row>
-
-            {/* Price Inputs */}
-            <Row>
-              <Col xs={12} md={6}>
-                <DecimalInput
-                  label="Entry Price"
-                  value={formData.entry_price}
-                  onChange={(value) => handleFieldChange('entry_price', value)}
-                  placeholder="0.00"
-                  min="0.01"
-                  step="0.01"
-                  disabled={isSubmitting}
-                  error={fieldErrors.entry_price}
-                  helpText="Price at which you want to enter the position"
-                  required
-                />
-              </Col>
-
-              <Col xs={12} md={6}>
-                <DecimalInput
-                  label="Stop Price"
-                  value={formData.stop_price}
-                  onChange={(value) => handleFieldChange('stop_price', value)}
-                  placeholder="0.00"
-                  min="0.01"
-                  step="0.01"
-                  disabled={isSubmitting}
-                  error={fieldErrors.stop_price}
-                  helpText={
-                    formData.side === 'BUY'
-                      ? 'Technical invalidation level (2nd support level)'
-                      : 'Technical invalidation level (2nd resistance level)'
-                  }
-                  required
-                />
-              </Col>
-            </Row>
-
-            {/* Capital Input */}
-            <Row>
-              <Col xs={12}>
-                <DecimalInput
-                  label="Capital"
-                  value={formData.capital}
-                  onChange={(value) => handleFieldChange('capital', value)}
-                  placeholder="1000.00"
-                  min="1"
-                  step="1"
-                  disabled={isSubmitting}
-                  error={fieldErrors.capital}
-                  helpText="Total capital to risk (position size will be calculated to risk 1%)"
-                  required
-                />
-              </Col>
-            </Row>
-
-            {/* Calculated Position Size Preview */}
-            {calculatedSize && (
-              <Row>
-                <Col xs={12}>
-                  <Alert variant="info">
-                    <strong>Calculated Position Size:</strong> {calculatedSize} {baseAsset}
-                    <br />
-                    <small>
-                      Based on 1% risk rule: risking ${(parseFloat(formData.capital) * 0.01).toFixed(2)} on this
-                      trade
-                    </small>
-                  </Alert>
-                </Col>
-              </Row>
-            )}
+            {/* Strategy Selection */}
+            <Form.Group className="mb-3">
+              <Form.Label>
+                Strategy <span className="text-danger">*</span>
+              </Form.Label>
+              <Form.Select
+                value={formData.strategy}
+                onChange={(e) => handleFieldChange('strategy', e.target.value)}
+                disabled={isSubmitting || loadingData}
+                isInvalid={!!fieldErrors.strategy}
+              >
+                <option value="">Select strategy...</option>
+                {strategies.map((strategy) => (
+                  <option key={strategy.id} value={strategy.id}>
+                    {strategy.name}
+                  </option>
+                ))}
+              </Form.Select>
+              {fieldErrors.strategy && (
+                <Form.Control.Feedback type="invalid">{fieldErrors.strategy}</Form.Control.Feedback>
+              )}
+              <Form.Text className="text-muted">
+                Strategy settings determine side, risk level, and capital allocation
+              </Form.Text>
+            </Form.Group>
           </Form>
         </Container>
       </Modal.Body>

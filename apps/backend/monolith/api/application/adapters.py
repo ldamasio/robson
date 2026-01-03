@@ -124,34 +124,40 @@ class DjangoOrderRepository(OrderRepository):
 # ==========================================
 
 
-def _get_binance_client(use_testnet: bool = None) -> Client:
+def _get_binance_client(use_testnet: bool = None, timeout: float = 5.0) -> Client:
     """
-    Create a Binance client with appropriate credentials.
-    
+    Create a Binance client with appropriate credentials and timeout.
+
     Args:
         use_testnet: Override testnet setting. If None, uses settings.BINANCE_USE_TESTNET
-        
+        timeout: HTTP request timeout in seconds (default: 5.0)
+
     Returns:
         Configured Binance Client instance
     """
     if use_testnet is None:
         use_testnet = getattr(settings, 'BINANCE_USE_TESTNET', True)
-    
+
     if use_testnet:
         api_key = settings.BINANCE_API_KEY_TEST
         secret_key = settings.BINANCE_SECRET_KEY_TEST
     else:
         api_key = settings.BINANCE_API_KEY
         secret_key = settings.BINANCE_SECRET_KEY
-    
+
     if not api_key or not secret_key:
         mode = "testnet" if use_testnet else "production"
         raise RuntimeError(f'Binance API credentials not configured for {mode} mode')
-    
+
     mode_str = "TESTNET" if use_testnet else "PRODUCTION"
-    logger.info(f"Creating Binance client in {mode_str} mode")
-    
-    return Client(api_key, secret_key, testnet=use_testnet)
+    logger.info(f"Creating Binance client in {mode_str} mode with timeout={timeout}s")
+
+    # Configure timeout for all HTTP requests
+    requests_params = {
+        "timeout": timeout  # Single value = connect + read timeout
+    }
+
+    return Client(api_key, secret_key, testnet=use_testnet, requests_params=requests_params)
 
 
 class BinanceMarketData(MarketDataPort):
@@ -161,15 +167,19 @@ class BinanceMarketData(MarketDataPort):
     Respects BINANCE_USE_TESTNET setting for environment selection.
     """
 
-    def __init__(self, client: Client | None = None, use_testnet: bool = None):
+    def __init__(self, client: Client | None = None, use_testnet: bool = None, client_id: int | None = None, timeout: float = 5.0):
         """
         Initialize market data adapter.
-        
+
         Args:
             client: Optional pre-configured Binance client
             use_testnet: Override testnet setting. If None, uses settings.BINANCE_USE_TESTNET
+            client_id: Optional client ID for multi-tenant setup (unused, for compatibility)
+            timeout: HTTP request timeout in seconds (default: 5.0)
         """
-        self.client = client or _get_binance_client(use_testnet)
+        self.client = client or _get_binance_client(use_testnet, timeout)
+        self.client_id = client_id  # Store for potential future use
+        self.timeout = timeout
 
     def best_bid(self, symbol: object) -> Decimal:
         """Get best bid price from Binance order book."""
