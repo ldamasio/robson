@@ -109,9 +109,12 @@ describe('StartNewOperationModal', () => {
     const submitButton = screen.getByRole('button', { name: /Create Plan/ });
     fireEvent.click(submitButton);
 
-    // Wait for validation error
+    // Wait for error to appear - use a text query with container option
     await waitFor(() => {
-      expect(screen.getByText('Please select both symbol and strategy')).toBeInTheDocument();
+      const alerts = screen.getAllByRole('alert');
+      const errorAlert = alerts.find(alert => alert.textContent.includes('Please select both'));
+      expect(errorAlert).toBeDefined();
+      expect(errorAlert.textContent).toContain('Please select both symbol and strategy');
     });
 
     // Verify select fields have invalid styling
