@@ -190,7 +190,7 @@ def create_trading_intent(request):
                     if result.get("warnings"):
                         for warning in result["warnings"]:
                             logger.warning(
-                                f"Balance mode warning for client {client.id}: {warning}"
+                                f"Auto-calc warning for client {client.id}: {warning}"
                             )
 
                     logger.info(
@@ -216,6 +216,7 @@ def create_trading_intent(request):
                 validated_data["stop_price"] = result["stop_price"]
                 validated_data["capital"] = result["capital"]
                 validated_data["confidence"] = result["confidence_float"]  # P0-4: Persist confidence as float
+                validated_data["quantity"] = result["quantity"]  # P0-3: Use exact quantized quantity
                 validated_data["regime"] = "auto"
                 validated_data["reason"] = f"Auto-calculated (side: {result['side_source']}, capital: {result['capital_source']})"
 
@@ -243,6 +244,7 @@ def create_trading_intent(request):
             confidence=validated_data.get("confidence", 0.5),
             reason=validated_data.get("reason", "Manual entry via UI"),
             client_id=client.id,
+            quantity=validated_data.get("quantity"),  # P0 Fix #3: Use exact quantized quantity in auto mode
         )
 
         # Execute use case
@@ -821,6 +823,20 @@ def auto_calculate_parameters(request):
             )
 
         # Format response
+        # P0 Fix #1: Ensure confidence_float is ALWAYS numeric string
+        confidence_float = result.get("confidence_float")
+        if confidence_float is None:
+            # Compute from confidence string using same mapping as use case
+            from decimal import Decimal
+            CONFIDENCE_MAP = {
+                "HIGH": Decimal("0.8"),
+                "MEDIUM": Decimal("0.6"),
+                "MED": Decimal("0.6"),
+                "LOW": Decimal("0.4"),
+            }
+            key = result.get("confidence", "LOW").upper()
+            confidence_float = CONFIDENCE_MAP.get(key, Decimal("0.4"))
+
         response_data = {
             "symbol_id": symbol.id,
             "strategy_id": strategy.id,
@@ -835,7 +851,7 @@ def auto_calculate_parameters(request):
             "timeframe": result["timeframe"],
             "method_used": result["method_used"],
             "confidence": result["confidence"],
-            "confidence_float": str(result.get("confidence_float", result["confidence"])),  # P0-4
+            "confidence_float": str(confidence_float),  # P0 Fix #1: Always numeric
             "side_source": result["side_source"],
             "capital_source": result["capital_source"],
             "warnings": result.get("warnings", []),

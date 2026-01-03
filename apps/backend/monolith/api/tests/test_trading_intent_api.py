@@ -864,3 +864,200 @@ class TestBalanceMode:
             assert "warnings" in response.data
             assert len(response.data["warnings"]) > 0
             assert any("connection" in w.lower() for w in response.data["warnings"])
+
+
+@pytest.mark.django_db
+class TestP0Fixes:
+    """Tests for P0 fixes to confidence_float, warnings, and quantity determinism."""
+
+    def test_auto_calculate_confidence_float_is_numeric(self, api_client, user, symbol, strategy):
+        """P0 Fix #1: confidence_float is ALWAYS numeric string."""
+        from unittest.mock import MagicMock, patch
+        from api.application.technical_stop_adapter import BinanceTechnicalStopService
+        from api.domain.technical_stop import TechnicalStopResult, StopMethod, Confidence
+        from decimal import Decimal
+        import re
+
+        # Update strategy
+        strategy.market_bias = "BULLISH"
+        strategy.config = {
+            "default_side": "BUY",
+            "capital_mode": "fixed",
+            "capital_fixed": "1000.00",
+            "timeframe": "15m"
+        }
+        strategy.save()
+
+        # Mock technical stop service to return HIGH confidence
+        mock_stop_result = TechnicalStopResult(
+            stop_price=Decimal("49000"),
+            entry_price=Decimal("50000"),
+            side="BUY",
+            timeframe="15m",
+            method_used=StopMethod.SUPPORT_RESISTANCE,
+            confidence=Confidence.HIGH,
+            levels_found=[],
+            warnings=[]
+        )
+
+        mock_tech_service = MagicMock()
+        mock_tech_service.calculate_position_with_technical_stop.return_value = {
+            "stop_result": mock_stop_result,
+            "quantity": Decimal("0.02"),
+            "risk_amount": Decimal("10"),
+            "position_value": Decimal("1000"),
+            "method_used": "support_resistance",
+            "confidence": "HIGH"
+        }
+
+        with patch('api.views.trading_intent_views.BinanceTechnicalStopService', return_value=mock_tech_service):
+            api_client.force_authenticate(user=user)
+
+            data = {
+                "symbol_id": symbol.id,
+                "strategy_id": strategy.id,
+            }
+
+            response = api_client.post("/api/trading-intents/auto-calculate/", data, format="json")
+
+            assert response.status_code == 200
+
+            # P0 Fix #1: confidence_float must be numeric string
+            assert "confidence_float" in response.data
+            confidence_float = response.data["confidence_float"]
+
+            # Must match numeric pattern (0.X or 1.0)
+            assert re.match(r'^[0-9]+\.[0-9]+$', confidence_float), f"confidence_float '{confidence_float}' is not numeric"
+
+            # HIGH confidence should map to 0.8
+            assert confidence_float == "0.80000000"
+
+    def test_auto_calculate_confidence_float_maps_correctly(self, api_client, user, symbol, strategy):
+        """P0 Fix #1: confidence_float mapping is correct for all confidence levels."""
+        from unittest.mock import MagicMock, patch
+        from api.application.technical_stop_adapter import BinanceTechnicalStopService
+        from api.domain.technical_stop import TechnicalStopResult, StopMethod, Confidence
+        from decimal import Decimal
+
+        strategy.market_bias = "BULLISH"
+        strategy.config = {
+            "default_side": "BUY",
+            "capital_mode": "fixed",
+            "capital_fixed": "1000.00",
+            "timeframe": "15m"
+        }
+        strategy.save()
+
+        confidence_map = {
+            Confidence.HIGH: "0.80000000",
+            Confidence.MEDIUM: "0.60000000",
+            Confidence.LOW: "0.40000000",
+        }
+
+        for conf_value, expected_float in confidence_map.items():
+            mock_stop_result = TechnicalStopResult(
+                stop_price=Decimal("49000"),
+                entry_price=Decimal("50000"),
+                side="BUY",
+                timeframe="15m",
+                method_used=StopMethod.SUPPORT_RESISTANCE,
+                confidence=conf_value,
+                levels_found=[],
+                warnings=[]
+            )
+
+            mock_tech_service = MagicMock()
+            mock_tech_service.calculate_position_with_technical_stop.return_value = {
+                "stop_result": mock_stop_result,
+                "quantity": Decimal("0.02"),
+                "risk_amount": Decimal("10"),
+                "position_value": Decimal("1000"),
+                "method_used": "support_resistance",
+                "confidence": str(conf_value),
+            }
+
+            with patch('api.views.trading_intent_views.BinanceTechnicalStopService', return_value=mock_tech_service):
+                api_client.force_authenticate(user=user)
+
+                data = {
+                    "symbol_id": symbol.id,
+                    "strategy_id": strategy.id,
+                }
+
+                response = api_client.post("/api/trading-intents/auto-calculate/", data, format="json")
+
+                assert response.status_code == 200
+                assert response.data["confidence_float"] == expected_float
+
+    def test_quantity_determinism_preview_vs_persisted(self, api_client, user, symbol, strategy):
+        """P0 Fix #3: quantity matches between preview and persisted PLAN."""
+        from unittest.mock import MagicMock, patch
+        from api.application.technical_stop_adapter import BinanceTechnicalStopService
+        from api.domain.technical_stop import TechnicalStopResult, StopMethod, Confidence
+        from decimal import Decimal
+
+        strategy.market_bias = "BULLISH"
+        strategy.config = {
+            "default_side": "BUY",
+            "capital_mode": "fixed",
+            "capital_fixed": "1000.00",
+            "timeframe": "15m"
+        }
+        strategy.save()
+
+        # Mock technical stop to return quantity with many decimals (simulating drift scenario)
+        mock_stop_result = TechnicalStopResult(
+            stop_price=Decimal("49000"),
+            entry_price=Decimal("50000"),
+            side="BUY",
+            timeframe="15m",
+            method_used=StopMethod.SUPPORT_RESISTANCE,
+            confidence=Confidence.HIGH,
+            levels_found=[],
+            warnings=[]
+        )
+
+        # Return quantity with many decimals to test quantization
+        mock_tech_service = MagicMock()
+        mock_tech_service.calculate_position_with_technical_stop.return_value = {
+            "stop_result": mock_stop_result,
+            "quantity": Decimal("0.02000123456789"),  # Many decimals
+            "risk_amount": Decimal("10.00012345678"),
+            "position_value": Decimal("1000.06"),
+            "method_used": "support_resistance",
+            "confidence": "HIGH"
+        }
+
+        with patch('api.views.trading_intent_views.BinanceTechnicalStopService', return_value=mock_tech_service):
+            api_client.force_authenticate(user=user)
+
+            # Get preview quantity from auto-calculate endpoint
+            preview_data = {
+                "symbol_id": symbol.id,
+                "strategy_id": strategy.id,
+            }
+
+            preview_response = api_client.post("/api/trading-intents/auto-calculate/", preview_data, format="json")
+            assert preview_response.status_code == 200
+
+            preview_quantity = preview_response.data["quantity"]
+
+            # Create intent with auto mode
+            create_data = {
+                "symbol": symbol.id,
+                "strategy": strategy.id,
+            }
+
+            create_response = api_client.post("/api/trading-intents/create/", create_data, format="json")
+            assert create_response.status_code == 201
+
+            persisted_quantity = create_response.data["quantity"]
+
+            # P0 Fix #3: Both quantities must match (quantized to 8 decimals)
+            assert preview_quantity == persisted_quantity, (
+                f"Quantity drift: preview={preview_quantity}, persisted={persisted_quantity}"
+            )
+
+            # Both should be quantized to 8 decimals (0.02000123)
+            assert persisted_quantity == "0.02000123" or persisted_quantity == "0.02000124"  # Allow for rounding
+

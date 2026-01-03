@@ -23,6 +23,7 @@ class CreateTradingIntentCommand:
     Command for creating a new trading intent.
 
     This represents the user's input in the manual entry flow.
+    For auto-calculated intents, quantity can be provided to avoid recalculation drift.
     """
     symbol_id: int
     strategy_id: int
@@ -35,6 +36,7 @@ class CreateTradingIntentCommand:
     regime: str = "unknown"
     confidence: float = 0.5
     reason: str = "Manual entry via UI"
+    quantity: Decimal | None = None  # P0-3: Optional pre-calculated quantity (auto mode)
 
 
 class SymbolRepository(Protocol):
@@ -129,12 +131,21 @@ class CreateTradingIntentUseCase:
         strategy = self.strategy_repo.get_by_id(command.strategy_id, command.client_id)
 
         # Calculate position size and risk
-        calculations = self._calculate_position_and_risk(
-            capital=command.capital,
-            entry_price=command.entry_price,
-            stop_price=command.stop_price,
-            side=command.side,
-        )
+        # P0-3: Use provided quantity if available (auto mode), otherwise calculate
+        if command.quantity is not None:
+            calculations = self._extract_risk_from_quantity(
+                quantity=command.quantity,
+                capital=command.capital,
+                entry_price=command.entry_price,
+                stop_price=command.stop_price,
+            )
+        else:
+            calculations = self._calculate_position_and_risk(
+                capital=command.capital,
+                entry_price=command.entry_price,
+                stop_price=command.stop_price,
+                side=command.side,
+            )
 
         # Generate unique intent_id
         intent_id = self._generate_intent_id()
@@ -219,6 +230,47 @@ class CreateTradingIntentUseCase:
 
         # Calculate risk as percentage of entry price
         risk_percent = (stop_distance / entry_price) * Decimal("100")
+
+        # Quantize to match TradingIntent model constraints
+        return {
+            "quantity": self._quantize_decimal(quantity, decimal_places=8),
+            "risk_amount": self._quantize_decimal(risk_amount, decimal_places=8),
+            "risk_percent": self._quantize_decimal(risk_percent, decimal_places=2),
+        }
+
+    def _extract_risk_from_quantity(
+        self,
+        quantity: Decimal,
+        capital: Decimal,
+        entry_price: Decimal,
+        stop_price: Decimal,
+    ) -> dict:
+        """
+        Extract risk metrics from a pre-calculated quantity (auto mode).
+
+        P0-3: Used when quantity is already calculated by auto-calculation use case.
+        Derives risk_amount and risk_percent from the known quantity.
+
+        Args:
+            quantity: Pre-calculated and quantized quantity
+            capital: Capital amount
+            entry_price: Entry price
+            stop_price: Stop price
+
+        Returns:
+            dict with keys: quantity, risk_amount, risk_percent
+        """
+        # Calculate stop distance
+        stop_distance = abs(entry_price - stop_price)
+
+        # Risk amount from quantity and stop distance
+        risk_amount = quantity * stop_distance
+
+        # Calculate risk as percentage of entry price
+        risk_percent = (stop_distance / entry_price) * Decimal("100")
+
+        # Position value
+        position_value = quantity * entry_price
 
         # Quantize to match TradingIntent model constraints
         return {
