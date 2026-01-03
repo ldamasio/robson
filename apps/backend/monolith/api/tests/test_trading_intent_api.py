@@ -586,3 +586,281 @@ class TestExecuteTradingIntent:
 
         assert response.status_code == 400
         assert "VALIDATED" in response.data["error"]
+
+
+@pytest.mark.django_db
+class TestBalanceMode:
+    """Tests for BALANCE mode capital calculation."""
+
+    def test_auto_mode_balance_success(self, api_client, user, symbol, strategy, monkeypatch):
+        """Test BALANCE mode: successfully fetches and uses available balance."""
+        from unittest.mock import MagicMock, patch
+        from api.application.technical_stop_adapter import BinanceTechnicalStopService
+        from api.domain.technical_stop import TechnicalStopResult, StopMethod, Confidence
+        from decimal import Decimal
+
+        # Update strategy for BALANCE mode
+        strategy.market_bias = "BULLISH"
+        strategy.config = {
+            "default_side": "BUY",
+            "capital_mode": "balance",
+            "capital_balance_percent": "50",  # Use 50% of available balance
+            "capital_fixed": "1000.00",  # Fallback
+            "timeframe": "15m"
+        }
+        strategy.save()
+
+        # Mock the BinanceTechnicalStopService
+        mock_stop_result = TechnicalStopResult(
+            stop_price=Decimal("49000"),
+            entry_price=Decimal("50000"),
+            side="BUY",
+            timeframe="15m",
+            method_used=StopMethod.SUPPORT_RESISTANCE,
+            confidence=Confidence.HIGH,
+            levels_found=[],
+            warnings=[]
+        )
+
+        mock_tech_service = MagicMock()
+        mock_tech_service.calculate_position_with_technical_stop.return_value = {
+            "stop_result": mock_stop_result,
+            "quantity": Decimal("0.05"),
+            "risk_amount": Decimal("25"),
+            "position_value": Decimal("2500"),
+            "method_used": "support_resistance",
+            "confidence": "HIGH"
+        }
+
+        # Mock BinanceAccountBalanceAdapter to return available balance
+        mock_balance_adapter = MagicMock()
+        mock_balance_adapter.get_available_quote_balance.return_value = Decimal("5000.00")
+
+        # Patch the use case to use our mocks
+        with patch('api.views.trading_intent_views.BinanceTechnicalStopService', return_value=mock_tech_service), \
+             patch('api.views.trading_intent_views.BinanceAccountBalanceAdapter', return_value=mock_balance_adapter):
+
+            api_client.force_authenticate(user=user)
+
+            # Request with auto mode
+            data = {
+                "symbol": symbol.id,
+                "strategy": strategy.id,
+            }
+
+            response = api_client.post("/api/trading-intents/create/", data, format="json")
+
+            # Assert success
+            assert response.status_code == 201
+            assert "intent_id" in response.data
+
+            # Verify BALANCE mode was used
+            # 50% of 5000 = 2500 capital
+            # With 1% risk: position value = 2500
+            assert response.data["capital"] == "2500.00"
+
+            # Verify balance adapter was called
+            mock_balance_adapter.get_available_quote_balance.assert_called_once_with(
+                client_id=user.client.id,
+                quote_asset="USDT"
+            )
+
+    def test_auto_mode_balance_timeout_fallback(self, api_client, user, symbol, strategy, monkeypatch):
+        """Test BALANCE mode: timeout triggers safe fallback to fixed capital."""
+        from unittest.mock import MagicMock, patch
+        from api.application.technical_stop_adapter import BinanceTechnicalStopService
+        from api.domain.technical_stop import TechnicalStopResult, StopMethod, Confidence
+        from decimal import Decimal
+
+        # Update strategy for BALANCE mode
+        strategy.market_bias = "BULLISH"
+        strategy.config = {
+            "default_side": "BUY",
+            "capital_mode": "balance",
+            "capital_balance_percent": "100",
+            "capital_fixed": "1000.00",  # Fallback
+            "timeframe": "15m"
+        }
+        strategy.save()
+
+        # Mock the BinanceTechnicalStopService
+        mock_stop_result = TechnicalStopResult(
+            stop_price=Decimal("49000"),
+            entry_price=Decimal("50000"),
+            side="BUY",
+            timeframe="15m",
+            method_used=StopMethod.SUPPORT_RESISTANCE,
+            confidence=Confidence.HIGH,
+            levels_found=[],
+            warnings=[]
+        )
+
+        mock_tech_service = MagicMock()
+        mock_tech_service.calculate_position_with_technical_stop.return_value = {
+            "stop_result": mock_stop_result,
+            "quantity": Decimal("0.02"),
+            "risk_amount": Decimal("10"),
+            "position_value": Decimal("1000"),
+            "method_used": "support_resistance",
+            "confidence": "HIGH"
+        }
+
+        # Mock BinanceAccountBalanceAdapter to raise TimeoutError
+        mock_balance_adapter = MagicMock()
+        mock_balance_adapter.get_available_quote_balance.side_effect = TimeoutError("Binance API timeout")
+
+        # Patch the use case to use our mocks
+        with patch('api.views.trading_intent_views.BinanceTechnicalStopService', return_value=mock_tech_service), \
+             patch('api.views.trading_intent_views.BinanceAccountBalanceAdapter', return_value=mock_balance_adapter):
+
+            api_client.force_authenticate(user=user)
+
+            # Request with auto mode
+            data = {
+                "symbol": symbol.id,
+                "strategy": strategy.id,
+            }
+
+            response = api_client.post("/api/trading-intents/create/", data, format="json")
+
+            # Assert success - intent created despite timeout!
+            assert response.status_code == 201
+            assert "intent_id" in response.data
+
+            # Verify fallback capital was used
+            assert response.data["capital"] == "1000.00"
+
+            # Verify balance adapter was called (timeout occurred)
+            mock_balance_adapter.get_available_quote_balance.assert_called_once()
+
+    def test_auto_mode_balance_guardrails_min(self, api_client, user, symbol, strategy, monkeypatch):
+        """Test BALANCE mode: minimum capital guardrail."""
+        from unittest.mock import MagicMock, patch
+        from api.application.technical_stop_adapter import BinanceTechnicalStopService
+        from api.domain.technical_stop import TechnicalStopResult, StopMethod, Confidence
+        from decimal import Decimal
+
+        # Update strategy for BALANCE mode
+        strategy.market_bias = "BULLISH"
+        strategy.config = {
+            "default_side": "BUY",
+            "capital_mode": "balance",
+            "capital_balance_percent": "100",
+            "capital_fixed": "1000.00",
+            "timeframe": "15m"
+        }
+        strategy.save()
+
+        # Mock the BinanceTechnicalStopService
+        mock_stop_result = TechnicalStopResult(
+            stop_price=Decimal("49000"),
+            entry_price=Decimal("50000"),
+            side="BUY",
+            timeframe="15m",
+            method_used=StopMethod.SUPPORT_RESISTANCE,
+            confidence=Confidence.HIGH,
+            levels_found=[],
+            warnings=[]
+        )
+
+        mock_tech_service = MagicMock()
+        # Use minimum capital (10.00) for position calc
+        mock_tech_service.calculate_position_with_technical_stop.return_value = {
+            "stop_result": mock_stop_result,
+            "quantity": Decimal("0.0002"),
+            "risk_amount": Decimal("0.10"),
+            "position_value": Decimal("10"),
+            "method_used": "support_resistance",
+            "confidence": "HIGH"
+        }
+
+        # Mock balance adapter to return very low balance (below minimum)
+        mock_balance_adapter = MagicMock()
+        mock_balance_adapter.get_available_quote_balance.return_value = Decimal("5.00")
+
+        with patch('api.views.trading_intent_views.BinanceTechnicalStopService', return_value=mock_tech_service), \
+             patch('api.views.trading_intent_views.BinanceAccountBalanceAdapter', return_value=mock_balance_adapter):
+
+            api_client.force_authenticate(user=user)
+
+            data = {
+                "symbol": symbol.id,
+                "strategy": strategy.id,
+            }
+
+            response = api_client.post("/api/trading-intents/create/", data, format="json")
+
+            # Assert success - minimum capital guardrail applied
+            assert response.status_code == 201
+            assert "intent_id" in response.data
+
+            # Verify minimum capital was used (MIN_CAPITAL = 10.00)
+            assert response.data["capital"] == "10.00"
+
+    def test_auto_calculate_balance_mode_warnings(self, api_client, user, symbol, strategy):
+        """Test auto-calculate endpoint returns warnings for BALANCE mode."""
+        from unittest.mock import MagicMock, patch
+        from api.application.technical_stop_adapter import BinanceTechnicalStopService
+        from api.domain.technical_stop import TechnicalStopResult, StopMethod, Confidence
+        from decimal import Decimal
+
+        # Update strategy for BALANCE mode
+        strategy.market_bias = "BULLISH"
+        strategy.config = {
+            "default_side": "BUY",
+            "capital_mode": "balance",
+            "capital_balance_percent": "100",
+            "capital_fixed": "1000.00",
+            "timeframe": "15m"
+        }
+        strategy.save()
+
+        # Mock the BinanceTechnicalStopService
+        mock_stop_result = TechnicalStopResult(
+            stop_price=Decimal("49000"),
+            entry_price=Decimal("50000"),
+            side="BUY",
+            timeframe="15m",
+            method_used=StopMethod.SUPPORT_RESISTANCE,
+            confidence=Confidence.HIGH,
+            levels_found=[],
+            warnings=[]
+        )
+
+        mock_tech_service = MagicMock()
+        mock_tech_service.calculate_position_with_technical_stop.return_value = {
+            "stop_result": mock_stop_result,
+            "quantity": Decimal("0.02"),
+            "risk_amount": Decimal("10"),
+            "position_value": Decimal("1000"),
+            "method_used": "support_resistance",
+            "confidence": "HIGH"
+        }
+
+        # Mock balance adapter to raise ConnectionError
+        mock_balance_adapter = MagicMock()
+        mock_balance_adapter.get_available_quote_balance.side_effect = ConnectionError("Network error")
+
+        with patch('api.views.trading_intent_views.BinanceTechnicalStopService', return_value=mock_tech_service), \
+             patch('api.views.trading_intent_views.BinanceAccountBalanceAdapter', return_value=mock_balance_adapter):
+
+            api_client.force_authenticate(user=user)
+
+            data = {
+                "symbol_id": symbol.id,
+                "strategy_id": strategy.id,
+            }
+
+            response = api_client.post("/api/trading-intents/auto-calculate/", data, format="json")
+
+            # Assert success - even with connection error
+            assert response.status_code == 200
+
+            # Verify fallback capital was used
+            assert response.data["capital"] == "1000.00"
+            assert response.data["capital_source"] == "FALLBACK"
+
+            # Verify warnings are returned
+            assert "warnings" in response.data
+            assert len(response.data["warnings"]) > 0
+            assert any("connection" in w.lower() for w in response.data["warnings"])

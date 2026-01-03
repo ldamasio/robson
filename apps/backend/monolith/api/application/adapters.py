@@ -35,6 +35,7 @@ from .ports import (
     ExchangeExecutionPort,
     EventBusPort,
     ClockPort,
+    AccountBalancePort,
 )
 
 logger = logging.getLogger(__name__)
@@ -440,16 +441,122 @@ class BinanceExecution(ExchangeExecutionPort):
     def get_open_orders(self, symbol: str = None) -> list:
         """
         Get open orders.
-        
+
         Args:
             symbol: Optional trading pair to filter by
-            
+
         Returns:
             List of open orders
         """
         if symbol:
             return self.client.get_open_orders(symbol=symbol)
         return self.client.get_open_orders()
+
+
+class BinanceAccountBalanceAdapter(AccountBalancePort):
+    """
+    Binance adapter for retrieving account balance information.
+
+    Implements the AccountBalancePort using Binance API.
+    Uses FREE (available) balance, not total balance.
+
+    Hexagonal Architecture:
+    - Implements AccountBalancePort interface
+    - Handles Binance API communication
+    - Safe timeout and error handling at HTTP client level
+    - Does NOT use signal.alarm or threads
+    """
+
+    def __init__(self, client: Client | None = None, use_testnet: bool = None, timeout: float = 5.0):
+        """
+        Initialize the balance adapter.
+
+        Args:
+            client: Optional pre-configured Binance client
+            use_testnet: Override testnet setting. If None, uses settings.BINANCE_USE_TESTNET
+            timeout: HTTP request timeout in seconds (default: 5.0)
+        """
+        self.client = client or _get_binance_client(use_testnet, timeout)
+        self.timeout = timeout
+        self.use_testnet = use_testnet if use_testnet is not None else getattr(settings, 'BINANCE_USE_TESTNET', True)
+
+        logger.info(
+            f"BinanceAccountBalanceAdapter initialized: "
+            f"mode={'TESTNET' if self.use_testnet else 'PRODUCTION'}, timeout={timeout}s"
+        )
+
+    def get_available_quote_balance(
+        self,
+        client_id: int,
+        quote_asset: str
+    ) -> Decimal:
+        """
+        Get the available (free) balance for a quote asset from Binance.
+
+        Args:
+            client_id: Client ID for multi-tenant balance retrieval (logged, not used for API call)
+            quote_asset: Quote asset symbol (e.g., "USDT", "BUSD")
+
+        Returns:
+            Available (free) balance as Decimal
+
+        Raises:
+            ConnectionError: If exchange API is unreachable
+            TimeoutError: If request times out
+            Exception: For other API errors
+        """
+        mode = "TESTNET" if self.use_testnet else "PRODUCTION"
+        logger.info(
+            f"Fetching {quote_asset} balance for client {client_id} from {mode} "
+            f"(timeout={self.timeout}s)"
+        )
+
+        try:
+            # Get account information from Binance
+            # Timeout is handled at HTTP client level (configured in _get_binance_client)
+            account = self.client.get_account()
+
+            # Find the requested asset balance
+            balances = account.get("balances", [])
+            for balance in balances:
+                if balance["asset"] == quote_asset:
+                    free_balance = Decimal(str(balance["free"]))
+                    logger.info(
+                        f"Retrieved {quote_asset} balance for client {client_id}: "
+                        f"free={free_balance} (mode={mode})"
+                    )
+                    return free_balance
+
+            # Asset not found in balances - return zero
+            logger.warning(
+                f"Asset {quote_asset} not found in balances for client {client_id}, "
+                f"returning 0 (mode={mode})"
+            )
+            return Decimal("0")
+
+        except Exception as e:
+            # Categorize error types for proper handling
+            error_msg = str(e).lower()
+
+            if "timeout" in error_msg or "timed out" in error_msg:
+                logger.error(
+                    f"Timeout fetching {quote_asset} balance for client {client_id}: {e}"
+                )
+                raise TimeoutError(
+                    f"Binance API timeout while fetching {quote_asset} balance"
+                ) from e
+            elif "connection" in error_msg or "network" in error_msg:
+                logger.error(
+                    f"Connection error fetching {quote_asset} balance for client {client_id}: {e}"
+                )
+                raise ConnectionError(
+                    f"Cannot connect to Binance API for balance fetch"
+                ) from e
+            else:
+                logger.error(
+                    f"Error fetching {quote_asset} balance for client {client_id}: {e}"
+                )
+                raise  # Re-raise original exception for use case to handle
 
 
 # ==========================================

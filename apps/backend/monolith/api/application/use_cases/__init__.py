@@ -17,6 +17,7 @@ from .operation import (
     CancelOperationCommand,
     CancelOperationResult,
 )
+from .auto_calculate_trading_parameters import AutoCalculateTradingParametersUseCase
 
 __all__ = [
     # Order use cases
@@ -31,4 +32,6 @@ __all__ = [
     "CancelOperationUseCase",
     "CancelOperationCommand",
     "CancelOperationResult",
+    # Auto-calculation use case
+    "AutoCalculateTradingParametersUseCase",
 ]

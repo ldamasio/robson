@@ -30,6 +30,7 @@ from api.application.adapters import (
     DjangoSymbolRepository,
     DjangoStrategyRepository,
     DjangoTradingIntentRepository,
+    BinanceAccountBalanceAdapter,
 )
 from api.application.validation_framework import ValidationFramework
 from api.application.execution_framework import ExecutionFramework
@@ -166,17 +167,31 @@ def create_trading_intent(request):
                     timeout=5.0
                 )
 
+                # Create balance provider for BALANCE mode
+                balance_provider = BinanceAccountBalanceAdapter(
+                    use_testnet=None,  # Uses settings.BINANCE_USE_TESTNET
+                    timeout=5.0
+                )
+
                 from api.application.use_cases import AutoCalculateTradingParametersUseCase
                 auto_calc_use_case = AutoCalculateTradingParametersUseCase(
                     tech_stop_service=tech_stop_service,
-                    timeout=5.0
+                    balance_provider=balance_provider,
                 )
 
                 try:
                     result = auto_calc_use_case.execute(
                         symbol_obj=symbol,
-                        strategy_obj=strategy
+                        strategy_obj=strategy,
+                        client_id=client.id
                     )
+
+                    # Log warnings if any
+                    if result.get("warnings"):
+                        for warning in result["warnings"]:
+                            logger.warning(
+                                f"Balance mode warning for client {client.id}: {warning}"
+                            )
 
                     logger.info(
                         f"Auto-calculated for client {client.id}: "
@@ -200,6 +215,7 @@ def create_trading_intent(request):
                 validated_data["entry_price"] = result["entry_price"]
                 validated_data["stop_price"] = result["stop_price"]
                 validated_data["capital"] = result["capital"]
+                validated_data["confidence"] = result["confidence_float"]  # P0-4: Persist confidence as float
                 validated_data["regime"] = "auto"
                 validated_data["reason"] = f"Auto-calculated (side: {result['side_source']}, capital: {result['capital_source']})"
 
@@ -777,16 +793,23 @@ def auto_calculate_parameters(request):
             timeout=5.0
         )
 
+        # Create balance provider for BALANCE mode
+        balance_provider = BinanceAccountBalanceAdapter(
+            use_testnet=None,  # Uses settings.BINANCE_USE_TESTNET
+            timeout=5.0
+        )
+
         from api.application.use_cases import AutoCalculateTradingParametersUseCase
         auto_calc_use_case = AutoCalculateTradingParametersUseCase(
             tech_stop_service=tech_stop_service,
-            timeout=5.0
+            balance_provider=balance_provider,
         )
 
         try:
             result = auto_calc_use_case.execute(
                 symbol_obj=symbol,
-                strategy_obj=strategy
+                strategy_obj=strategy,
+                client_id=client.id
             )
         except Exception as calc_error:
             # Log and return error
@@ -805,14 +828,17 @@ def auto_calculate_parameters(request):
             "entry_price": str(result["entry_price"]),
             "stop_price": str(result["stop_price"]),
             "capital": str(result["capital"]),
+            "capital_used": str(result.get("capital_used", result["capital"])),
             "quantity": str(result["quantity"]),
             "risk_amount": str(result["risk_amount"]),
             "position_value": str(result["position_value"]),
             "timeframe": result["timeframe"],
             "method_used": result["method_used"],
             "confidence": result["confidence"],
+            "confidence_float": str(result.get("confidence_float", result["confidence"])),  # P0-4
             "side_source": result["side_source"],
             "capital_source": result["capital_source"],
+            "warnings": result.get("warnings", []),
         }
 
         logger.info(

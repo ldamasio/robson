@@ -124,3 +124,36 @@ class TradingIntentRepository(Protocol):
     ) -> Iterable[object]:
         """List trading intents for a client with optional filters."""
         ...
+
+
+class AccountBalancePort(Protocol):
+    """
+    Port for retrieving account balance information.
+
+    Hexagonal Architecture:
+    - This port defines the interface for balance retrieval
+    - Concrete implementations (Binance, etc.) implement this port
+    - Use cases depend on this port, not concrete implementations
+    """
+
+    def get_available_quote_balance(
+        self,
+        client_id: int,
+        quote_asset: str
+    ) -> Decimal:
+        """
+        Get the available (free) balance for a quote asset.
+
+        Args:
+            client_id: Client ID for multi-tenant balance retrieval
+            quote_asset: Quote asset symbol (e.g., "USDT", "BUSD")
+
+        Returns:
+            Available (free) balance as Decimal
+
+        Raises:
+            ConnectionError: If exchange API is unreachable
+            TimeoutError: If request times out
+            Exception: For other API errors
+        """
+        ...
