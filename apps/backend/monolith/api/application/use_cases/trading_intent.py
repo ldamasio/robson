@@ -216,7 +216,7 @@ class CreateTradingIntentUseCase:
             quantity = (capital × 1%) / |entry_price - stop_price|
 
         Returns:
-            dict with keys: quantity, risk_amount, risk_percent
+            dict with keys: quantity, risk_amount, risk_percent, position_value
         """
         # Calculate stop distance
         stop_distance = abs(entry_price - stop_price)
@@ -231,11 +231,15 @@ class CreateTradingIntentUseCase:
         # Calculate risk as percentage of entry price
         risk_percent = (stop_distance / entry_price) * Decimal("100")
 
+        # Position value (quantity * entry_price)
+        position_value = quantity * entry_price
+
         # Quantize to match TradingIntent model constraints
         return {
             "quantity": self._quantize_decimal(quantity, decimal_places=8),
             "risk_amount": self._quantize_decimal(risk_amount, decimal_places=8),
             "risk_percent": self._quantize_decimal(risk_percent, decimal_places=2),
+            "position_value": self._quantize_decimal(position_value, decimal_places=8),
         }
 
     def _extract_risk_from_quantity(
@@ -258,7 +262,7 @@ class CreateTradingIntentUseCase:
             stop_price: Stop price
 
         Returns:
-            dict with keys: quantity, risk_amount, risk_percent
+            dict with keys: quantity, risk_amount, risk_percent, position_value
         """
         # Calculate stop distance
         stop_distance = abs(entry_price - stop_price)
@@ -269,7 +273,7 @@ class CreateTradingIntentUseCase:
         # Calculate risk as percentage of entry price
         risk_percent = (stop_distance / entry_price) * Decimal("100")
 
-        # Position value
+        # Position value (quantity * entry_price)
         position_value = quantity * entry_price
 
         # Quantize to match TradingIntent model constraints
@@ -277,6 +281,7 @@ class CreateTradingIntentUseCase:
             "quantity": self._quantize_decimal(quantity, decimal_places=8),
             "risk_amount": self._quantize_decimal(risk_amount, decimal_places=8),
             "risk_percent": self._quantize_decimal(risk_percent, decimal_places=2),
+            "position_value": self._quantize_decimal(position_value, decimal_places=8),
         }
 
     def _quantize_decimal(self, value: Decimal, decimal_places: int) -> Decimal:

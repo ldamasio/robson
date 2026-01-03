@@ -929,8 +929,8 @@ class TestP0Fixes:
             # Must match numeric pattern (0.X or 1.0)
             assert re.match(r'^[0-9]+\.[0-9]+$', confidence_float), f"confidence_float '{confidence_float}' is not numeric"
 
-            # HIGH confidence should map to 0.8
-            assert confidence_float == "0.80000000"
+            # HIGH confidence should map to 0.8 (compare numerically, not as string)
+            assert Decimal(confidence_float) == Decimal("0.8")
 
     def test_auto_calculate_confidence_float_maps_correctly(self, api_client, user, symbol, strategy):
         """P0 Fix #1: confidence_float mapping is correct for all confidence levels."""
@@ -949,9 +949,9 @@ class TestP0Fixes:
         strategy.save()
 
         confidence_map = {
-            Confidence.HIGH: "0.80000000",
-            Confidence.MEDIUM: "0.60000000",
-            Confidence.LOW: "0.40000000",
+            Confidence.HIGH: Decimal("0.8"),
+            Confidence.MEDIUM: Decimal("0.6"),
+            Confidence.LOW: Decimal("0.4"),
         }
 
         for conf_value, expected_float in confidence_map.items():
@@ -987,7 +987,8 @@ class TestP0Fixes:
                 response = api_client.post("/api/trading-intents/auto-calculate/", data, format="json")
 
                 assert response.status_code == 200
-                assert response.data["confidence_float"] == expected_float
+                # Compare numerically, not as string
+                assert Decimal(response.data["confidence_float"]) == expected_float
 
     def test_quantity_determinism_preview_vs_persisted(self, api_client, user, symbol, strategy):
         """P0 Fix #3: quantity matches between preview and persisted PLAN."""
@@ -1058,6 +1059,7 @@ class TestP0Fixes:
                 f"Quantity drift: preview={preview_quantity}, persisted={persisted_quantity}"
             )
 
-            # Both should be quantized to 8 decimals (0.02000123)
-            assert persisted_quantity == "0.02000123" or persisted_quantity == "0.02000124"  # Allow for rounding
+            # 0.02000123456789 quantized to 8 decimals is 0.02000123 (rounds down)
+            assert persisted_quantity == "0.02000123"
+
 
