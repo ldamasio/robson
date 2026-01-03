@@ -84,18 +84,18 @@ describe('StartNewOperationModal', () => {
     // Check all fields are present
     expect(screen.getByText('Trading Pair')).toBeInTheDocument();
     expect(screen.getByText('Strategy')).toBeInTheDocument();
-    expect(screen.getByText('Side')).toBeInTheDocument();
-    expect(screen.getByText('Entry Price')).toBeInTheDocument();
-    expect(screen.getByText('Stop Price')).toBeInTheDocument();
-    expect(screen.getByText('Capital')).toBeInTheDocument();
 
-    // Check radio buttons
-    expect(screen.getByLabelText('BUY (Long)')).toBeInTheDocument();
-    expect(screen.getByLabelText('SELL (Short)')).toBeInTheDocument();
+    // Check info alert
+    expect(screen.getByText('One-click plan creation')).toBeInTheDocument();
+    expect(screen.getByText(/Backend will automatically calculate/)).toBeInTheDocument();
 
     // Check buttons
     expect(screen.getByText('Create Plan')).toBeInTheDocument();
     expect(screen.getByText('Cancel')).toBeInTheDocument();
+
+    // Check dropdowns
+    const selects = screen.getAllByRole('combobox');
+    expect(selects.length).toBe(2); // Symbol and Strategy selects
   });
 
   it('validates required fields on submit', async () => {
@@ -109,53 +109,17 @@ describe('StartNewOperationModal', () => {
     const submitButton = screen.getByRole('button', { name: /Create Plan/ });
     fireEvent.click(submitButton);
 
-    // Wait for validation errors to appear
-    // Check for field-specific error messages or general error
-    await waitFor(() => {
-      // The component should show either the general error message or field errors
-      const hasGeneralError = screen.queryByText(/Please fix the errors above/i);
-      const fieldErrors = screen.queryAllByText(/is required/i);
-      expect(hasGeneralError || fieldErrors.length > 0).toBeTruthy();
-    }, { timeout: 3000 });
-
-    // Verify select fields have invalid styling (isInvalid prop)
-    const allSelects = screen.getAllByRole('combobox');
-    expect(allSelects.length).toBeGreaterThan(0);
-    // At least one select should have is-invalid class
-    const hasInvalidSelect = allSelects.some(select => select.classList.contains('is-invalid'));
-    expect(hasInvalidSelect).toBe(true);
-  });
-
-  it('validates entry price must not equal stop price', async () => {
-    renderWithAuth(<StartNewOperationModal {...defaultProps} />);
-
-    await waitFor(() => {
-      expect(screen.getByRole('button', { name: /Create Plan/ })).toBeInTheDocument();
-    });
-
-    // Fill form with same entry and stop price
-    // Use document.querySelectorAll since modal renders in portal
-    const allSelects = screen.getAllByRole('combobox');
-    const symbolSelect = allSelects[0];
-    const strategySelect = allSelects[1];
-    const entryPriceInput = screen.getAllByPlaceholderText('0.00')[0];
-    const stopPriceInput = screen.getAllByPlaceholderText('0.00')[1];
-    const capitalInput = screen.getByPlaceholderText('1000.00');
-
-    fireEvent.change(symbolSelect, { target: { value: '1' } });
-    fireEvent.change(strategySelect, { target: { value: '1' } });
-    fireEvent.change(entryPriceInput, { target: { value: '50000' } });
-    fireEvent.change(stopPriceInput, { target: { value: '50000' } });
-    fireEvent.change(capitalInput, { target: { value: '10000' } });
-
-    // Submit
-    const submitButton = screen.getByRole('button', { name: /Create Plan/ });
-    fireEvent.click(submitButton);
-
     // Wait for validation error
     await waitFor(() => {
-      expect(screen.getByText('Stop price must be different from entry price')).toBeInTheDocument();
+      expect(screen.getByText('Please select both symbol and strategy')).toBeInTheDocument();
     });
+
+    // Verify select fields have invalid styling
+    const allSelects = screen.getAllByRole('combobox');
+    expect(allSelects.length).toBe(2);
+    // Both selects should have is-invalid class
+    const hasInvalidSelect = allSelects.some(select => select.classList.contains('is-invalid'));
+    expect(hasInvalidSelect).toBe(true);
   });
 
   it('submits successfully with valid data', async () => {
@@ -181,14 +145,16 @@ describe('StartNewOperationModal', () => {
         return Promise.resolve({
           ok: true,
           json: async () => ({
+            intent_id: 'abc-123',
             id: 123,
             symbol: 1,
             symbol_display: 'BTC/USDT',
             strategy: 1,
             side: 'BUY',
             entry_price: '50000',
-            stop_price: '48000',
-            capital: '10000',
+            stop_price: '49000',
+            capital: '1000',
+            quantity: '0.005',
             status: 'PENDING',
           }),
         });
@@ -202,19 +168,13 @@ describe('StartNewOperationModal', () => {
       expect(screen.getByRole('button', { name: /Create Plan/ })).toBeInTheDocument();
     });
 
-    // Fill form
+    // Fill form - only symbol and strategy needed
     const allSelects = screen.getAllByRole('combobox');
     const symbolSelect = allSelects[0];
     const strategySelect = allSelects[1];
-    const entryPriceInput = screen.getAllByPlaceholderText('0.00')[0];
-    const stopPriceInput = screen.getAllByPlaceholderText('0.00')[1];
-    const capitalInput = screen.getByPlaceholderText('1000.00');
 
     fireEvent.change(symbolSelect, { target: { value: '1' } });
     fireEvent.change(strategySelect, { target: { value: '1' } });
-    fireEvent.change(entryPriceInput, { target: { value: '50000' } });
-    fireEvent.change(stopPriceInput, { target: { value: '48000' } });
-    fireEvent.change(capitalInput, { target: { value: '10000' } });
 
     // Submit
     const submitButton = screen.getByRole('button', { name: /Create Plan/ });
@@ -224,7 +184,7 @@ describe('StartNewOperationModal', () => {
     await waitFor(() => {
       expect(mockOnSuccess).toHaveBeenCalledWith(
         expect.objectContaining({
-          id: 123,
+          intent_id: 'abc-123',
           side: 'BUY',
           symbol_display: 'BTC/USDT',
         })
@@ -258,7 +218,7 @@ describe('StartNewOperationModal', () => {
           ok: false,
           status: 400,
           json: async () => ({
-            detail: 'Insufficient balance to execute this trade',
+            error: 'Insufficient balance to execute this trade',
           }),
         });
       }
@@ -275,15 +235,9 @@ describe('StartNewOperationModal', () => {
     const allSelects = screen.getAllByRole('combobox');
     const symbolSelect = allSelects[0];
     const strategySelect = allSelects[1];
-    const entryPriceInput = screen.getAllByPlaceholderText('0.00')[0];
-    const stopPriceInput = screen.getAllByPlaceholderText('0.00')[1];
-    const capitalInput = screen.getByPlaceholderText('1000.00');
 
     fireEvent.change(symbolSelect, { target: { value: '1' } });
     fireEvent.change(strategySelect, { target: { value: '1' } });
-    fireEvent.change(entryPriceInput, { target: { value: '50000' } });
-    fireEvent.change(stopPriceInput, { target: { value: '48000' } });
-    fireEvent.change(capitalInput, { target: { value: '10000' } });
 
     // Submit
     const submitButton = screen.getByRole('button', { name: /Create Plan/ });
@@ -336,15 +290,9 @@ describe('StartNewOperationModal', () => {
     const allSelects = screen.getAllByRole('combobox');
     const symbolSelect = allSelects[0];
     const strategySelect = allSelects[1];
-    const entryPriceInput = screen.getAllByPlaceholderText('0.00')[0];
-    const stopPriceInput = screen.getAllByPlaceholderText('0.00')[1];
-    const capitalInput = screen.getByPlaceholderText('1000.00');
 
     fireEvent.change(symbolSelect, { target: { value: '1' } });
     fireEvent.change(strategySelect, { target: { value: '1' } });
-    fireEvent.change(entryPriceInput, { target: { value: '50000' } });
-    fireEvent.change(stopPriceInput, { target: { value: '48000' } });
-    fireEvent.change(capitalInput, { target: { value: '10000' } });
 
     // Submit
     const submitButton = screen.getByRole('button', { name: /Create Plan/ });
@@ -355,58 +303,92 @@ describe('StartNewOperationModal', () => {
       expect(screen.getByText('Creating Plan...')).toBeInTheDocument();
     });
 
-    // Check inputs are disabled
-    expect(entryPriceInput).toBeDisabled();
-    expect(stopPriceInput).toBeDisabled();
-    expect(capitalInput).toBeDisabled();
+    // Check selects are disabled
+    expect(symbolSelect).toBeDisabled();
+    expect(strategySelect).toBeDisabled();
 
     // Resolve the promise
     if (resolveSubmit) {
       resolveSubmit({
         ok: true,
         json: async () => ({
+          intent_id: 'abc-123',
           id: 123,
           symbol: 1,
           symbol_display: 'BTC/USDT',
           strategy: 1,
           side: 'BUY',
           entry_price: '50000',
-          stop_price: '48000',
-          capital: '10000',
+          stop_price: '49000',
+          capital: '1000',
           status: 'PENDING',
         }),
       });
     }
   });
 
-  it('displays calculated position size preview', async () => {
+  it('displays strategy helper text', async () => {
+    renderWithAuth(<StartNewOperationModal {...defaultProps} />);
+
+    await waitFor(() => {
+      expect(screen.getByText('Strategy')).toBeInTheDocument();
+    });
+
+    // Check helper text
+    expect(screen.getByText('Strategy settings determine side, risk level, and capital allocation')).toBeInTheDocument();
+  });
+
+  it('resets form after successful submission', async () => {
+    // Mock successful POST request
+    global.fetch.mockImplementation((url, options) => {
+      if (url.includes('/api/symbols/')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            results: [{ id: 1, base_asset: 'BTC', quote_asset: 'USDT' }],
+          }),
+        });
+      }
+      if (url.includes('/api/strategies/')) {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            results: [{ id: 1, name: 'Mean Reversion MA99' }],
+          }),
+        });
+      }
+      if (url.includes('/api/trading-intents/create/') && options?.method === 'POST') {
+        return Promise.resolve({
+          ok: true,
+          json: async () => ({
+            intent_id: 'abc-123',
+            id: 123,
+          }),
+        });
+      }
+      return Promise.reject(new Error('Unknown URL'));
+    });
+
     renderWithAuth(<StartNewOperationModal {...defaultProps} />);
 
     await waitFor(() => {
       expect(screen.getByRole('button', { name: /Create Plan/ })).toBeInTheDocument();
     });
 
-    // Fill form
+    // Fill and submit
     const allSelects = screen.getAllByRole('combobox');
     const symbolSelect = allSelects[0];
-    const entryPriceInput = screen.getAllByPlaceholderText('0.00')[0];
-    const stopPriceInput = screen.getAllByPlaceholderText('0.00')[1];
-    const capitalInput = screen.getByPlaceholderText('1000.00');
+    const strategySelect = allSelects[1];
 
     fireEvent.change(symbolSelect, { target: { value: '1' } });
-    fireEvent.change(entryPriceInput, { target: { value: '50000' } });
-    fireEvent.change(stopPriceInput, { target: { value: '48000' } });
-    fireEvent.change(capitalInput, { target: { value: '10000' } });
+    fireEvent.change(strategySelect, { target: { value: '1' } });
 
-    // Wait for calculation
+    const submitButton = screen.getByRole('button', { name: /Create Plan/ });
+    fireEvent.click(submitButton);
+
+    // Wait for success and modal close
     await waitFor(() => {
-      expect(screen.getByText(/Calculated Position Size:/)).toBeInTheDocument();
+      expect(mockOnHide).toHaveBeenCalled();
     });
-
-    // Check calculation is displayed - use more specific selector
-    // Position Size = (10000 × 0.01) / |50000 - 48000| = 100 / 2000 = 0.05 BTC
-    expect(screen.getByText(/0\.05/)).toBeInTheDocument();
-    // Use getAllByText since BTC appears in multiple places
-    expect(screen.getAllByText(/BTC/).length).toBeGreaterThan(0);
   });
 });
