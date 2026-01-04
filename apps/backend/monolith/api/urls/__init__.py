@@ -168,6 +168,30 @@ except Exception as e:
     traceback.print_exc()
     SYMBOL_VIEWS_AVAILABLE = False
 
+# Import trading intent views for agentic workflow
+try:
+    from ..views.trading_intent_views import (
+        create_trading_intent,
+        get_trading_intent,
+        list_trading_intents,
+        validate_trading_intent,
+        execute_trading_intent,
+        pattern_trigger,
+        auto_calculate_parameters,
+    )
+    TRADING_INTENT_VIEWS_AVAILABLE = True
+    print("✅ Trading intent views imported successfully")
+except ImportError as e:
+    import traceback
+    print(f"⚠️  Could not import trading intent views: {e}")
+    traceback.print_exc()
+    TRADING_INTENT_VIEWS_AVAILABLE = False
+except Exception as e:
+    import traceback
+    print(f"❌ Unexpected error importing trading intent views: {type(e).__name__}: {e}")
+    traceback.print_exc()
+    TRADING_INTENT_VIEWS_AVAILABLE = False
+
 
 # Fallback function for missing views
 def fallback_view(request):
@@ -197,6 +221,16 @@ urlpatterns = [
     # ==========================================
     path("strategies/", get_strategies, name="get_strategies"),
     path("symbols/", list_symbols, name="list_symbols") if SYMBOL_VIEWS_AVAILABLE else path("symbols/", fallback_view, name="list_symbols"),
+    # ==========================================
+    # TRADING INTENT ROUTES (AGENTIC WORKFLOW)
+    # ==========================================
+    path("trading-intents/auto-calculate/", auto_calculate_parameters, name="auto_calculate_parameters") if TRADING_INTENT_VIEWS_AVAILABLE else path("trading-intents/auto-calculate/", fallback_view, name="auto_calculate_parameters"),
+    path("trading-intents/create/", create_trading_intent, name="create_trading_intent") if TRADING_INTENT_VIEWS_AVAILABLE else path("trading-intents/create/", fallback_view, name="create_trading_intent"),
+    path("trading-intents/", list_trading_intents, name="list_trading_intents") if TRADING_INTENT_VIEWS_AVAILABLE else path("trading-intents/", fallback_view, name="list_trading_intents"),
+    path("trading-intents/<str:intent_id>/", get_trading_intent, name="get_trading_intent") if TRADING_INTENT_VIEWS_AVAILABLE else path("trading-intents/<str:intent_id>/", fallback_view, name="get_trading_intent"),
+    path("trading-intents/<str:intent_id>/validate/", validate_trading_intent, name="validate_trading_intent") if TRADING_INTENT_VIEWS_AVAILABLE else path("trading-intents/<str:intent_id>/validate/", fallback_view, name="validate_trading_intent"),
+    path("trading-intents/<str:intent_id>/execute/", execute_trading_intent, name="execute_trading_intent") if TRADING_INTENT_VIEWS_AVAILABLE else path("trading-intents/<str:intent_id>/execute/", fallback_view, name="execute_trading_intent"),
+    path("trading-intents/pattern/trigger/", pattern_trigger, name="pattern_trigger") if TRADING_INTENT_VIEWS_AVAILABLE else path("trading-intents/pattern/trigger/", fallback_view, name="pattern_trigger"),
     # ==========================================
     # MARKET DATA ROUTES (NEW PATTERN)
     # ==========================================
