@@ -1,14 +1,46 @@
+# NOTE: Postgres memory limits set to avoid OOM on low-RAM dev machines.
 version: "3"
 services:
   robsondb:
     container_name: robsonDatabase
-    image: postgres
+    image: postgres:16-alpine
     environment:
-      - POSTGRES_PASSWORD=$POSTGRES_PASSWORD
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
     ports:
-      -  "${POSTGRES_PORT:-5450}:5432"
+      - "${POSTGRES_PORT:-5450}:5432"
     volumes:
+      - pgdata:/var/lib/postgresql/data
       - ./infra/data/postgres/:/docker-entrypoint-initdb.d
+    shm_size: 128m
+    mem_limit: 512m
+    memswap_limit: 512m
+    command:
+      - postgres
+      - -c
+      - shared_buffers=128MB
+      - -c
+      - work_mem=4MB
+      - -c
+      - maintenance_work_mem=64MB
+      - -c
+      - effective_cache_size=256MB
+      - -c
+      - wal_buffers=8MB
+      - -c
+      - max_wal_size=1GB
+      - -c
+      - checkpoint_timeout=10min
+      - -c
+      - max_connections=50
+      - -c
+      - log_min_duration_statement=500ms
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
     restart: always
   redis:
     container_name: robsonRedis
@@ -38,7 +70,7 @@ services:
     restart: always
   backend-monolith:
     container_name: backendMonolith
-    image: backend-monolith    
+    image: backend-monolith
     build: ./apps/backend/monolith
     environment:
       - DJANGO_SETTINGS_MODULE=backend.settings
@@ -63,11 +95,11 @@ services:
     restart: always
   nginx_backend_server:
     depends_on:
-        - backend-monolith
+      - backend-monolith
     container_name: nginxMonolith
     build: ./apps/backend/nginx_monolith
     ports:
-        - 8403:8403
+      - 8403:8403
     restart: always
 volumes:
   pgdata:
