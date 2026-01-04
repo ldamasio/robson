@@ -1,4 +1,4 @@
-import React, { useContext } from 'react';
+import React, { useContext, useMemo } from 'react';
 import Card from 'react-bootstrap/Card';
 import Row from 'react-bootstrap/Row';
 import Col from 'react-bootstrap/Col';
@@ -24,6 +24,10 @@ function TradingIntentsList({ highlightIntentId }) {
   const { authTokens } = useContext(AuthContext);
   const navigate = useNavigate();
 
+  // Memoize statuses array to prevent infinite loop
+  // (new array reference on every render triggers fetchIntents to recreate)
+  const statuses = useMemo(() => ['PENDING', 'VALIDATED'], []);
+
   const {
     intents,
     isLoading,
@@ -33,7 +37,7 @@ function TradingIntentsList({ highlightIntentId }) {
     toggleAutoRefresh,
   } = useTradingIntentsList({
     authToken: authTokens?.access,
-    statuses: ['PENDING', 'VALIDATED'],
+    statuses,
     limit: 10,
     enableAutoRefresh: true,
     refreshInterval: 30000,
