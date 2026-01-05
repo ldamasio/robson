@@ -186,6 +186,7 @@ docs/
 | **Deployment Checklist** | [runbooks/deployment-checklist.md](runbooks/deployment-checklist.md) |
 | **Infrastructure** | [../infra/README.md](../infra/README.md) |
 | **First Leveraged Position** | [operations/2025-12-24-first-leveraged-position.md](operations/2025-12-24-first-leveraged-position.md) |
+| **Isolated Margin SHORT (BTCUSDC)** | [operations/2026-01-05-isolated-margin-short-btcusdc.md](operations/2026-01-05-isolated-margin-short-btcusdc.md) |
 
 ### API & Specs
 
