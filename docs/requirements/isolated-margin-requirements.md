@@ -222,9 +222,34 @@ client.create_margin_order(
 
 ---
 
+#### REQ-FUT-MARGIN-007: Internal Stop Execution (Robson Monitor)
+
+**Description**: System must execute stop-loss for isolated margin positions
+via Robson infrastructure, using a **market order** when the stop price is hit.
+
+**Rationale**: For Iron Exit Protocol, stop-loss is not pre-placed on Binance.
+Robson monitors price and executes the exit to ensure reliability.
+
+**Dependencies**:
+- REQ-FUT-MARGIN-003 (Query account)
+- Stop monitor infrastructure (cron/worker)
+
+**Priority**: High (P0)
+
+**Estimated Complexity**: Moderate
+
+**Acceptance Criteria**:
+- [ ] Stop price is stored on the Operation (Level 2)
+- [ ] No STOP_LOSS_LIMIT order is placed on Binance for Iron Exit Protocol
+- [ ] Stop monitor executes a **market** close at trigger
+- [ ] Stop execution is recorded in AuditService (`STOP_LOSS_TRIGGERED`)
+- [ ] Margin position is closed with AUTO_REPAY where applicable
+
+---
+
 ### 2.3 Position Management
 
-#### REQ-FUT-MARGIN-007: Position Sizing for Margin
+#### REQ-FUT-MARGIN-008: Position Sizing for Margin
 
 **Description**: System must calculate optimal position size for margin trades using the 1% risk rule, accounting for leverage.
 
@@ -247,7 +272,7 @@ client.create_margin_order(
 
 **Formula**:
 ```
-Capital = Total USDC (Spot + Margin)
+Capital = Isolated Margin Equity (quote net + base net * price)
 Risk Amount = Capital × 0.01 (1% rule)
 Stop Distance = |Entry Price - Stop Price|
 Base Quantity = Risk Amount / Stop Distance
@@ -259,9 +284,9 @@ If Margin Required > Available Margin:
 
 ---
 
-#### REQ-FUT-MARGIN-008: Margin Stop-Loss Orders
+#### REQ-FUT-MARGIN-009: Margin Stop-Loss Handling
 
-**Description**: System must place stop-loss orders to protect margin positions.
+**Description**: System must support stop-loss handling for margin positions.
 
 **Rationale**: Critical for risk management - prevents losses beyond 1% per trade.
 
@@ -274,7 +299,8 @@ If Margin Required > Available Margin:
 **Estimated Complexity**: Complex
 
 **Acceptance Criteria**:
-- [ ] Automatically place STOP_LOSS_LIMIT order when position opened
+- [ ] For Robson-monitored strategies, stop is internal (no exchange stop order)
+- [ ] For exchange-managed strategies, support STOP_LOSS_LIMIT placement
 - [ ] Stop price from user's technical analysis
 - [ ] Monitor stop status continuously
 - [ ] Handle stop execution events
@@ -297,7 +323,7 @@ client.create_margin_order(
 
 ---
 
-#### REQ-FUT-MARGIN-009: Margin Take-Profit Orders
+#### REQ-FUT-MARGIN-010: Margin Take-Profit Orders
 
 **Description**: System must support take-profit orders to lock in gains.
 
@@ -321,7 +347,7 @@ client.create_margin_order(
 
 ### 2.4 Risk Management
 
-#### REQ-FUT-MARGIN-010: Margin Level Monitoring
+#### REQ-FUT-MARGIN-011: Margin Level Monitoring
 
 **Description**: System must continuously monitor margin level to prevent liquidation.
 
@@ -354,7 +380,7 @@ Level <= 1.0   → LIQUIDATION
 
 ---
 
-#### REQ-FUT-MARGIN-011: Monthly Drawdown Tracking (Margin)
+#### REQ-FUT-MARGIN-012: Monthly Drawdown Tracking (Margin)
 
 **Description**: System must track cumulative monthly P&L including margin trades, enforcing 4% max drawdown.
 
@@ -377,7 +403,7 @@ Level <= 1.0   → LIQUIDATION
 
 ---
 
-#### REQ-FUT-MARGIN-012: Daily Trade Limit
+#### REQ-FUT-MARGIN-013: Daily Trade Limit
 
 **Description**: System must enforce maximum 50 trades per day for medium-frequency operation.
 
@@ -401,7 +427,7 @@ Level <= 1.0   → LIQUIDATION
 
 ### 2.5 Borrowing and Interest
 
-#### REQ-FUT-MARGIN-013: Automatic Borrow on Trade
+#### REQ-FUT-MARGIN-014: Automatic Borrow on Trade
 
 **Description**: System must handle automatic borrowing when placing margin orders.
 
@@ -434,14 +460,14 @@ client.create_margin_order(
 
 ---
 
-#### REQ-FUT-MARGIN-014: Repay Borrowed Assets
+#### REQ-FUT-MARGIN-015: Repay Borrowed Assets
 
 **Description**: System must support repaying borrowed assets.
 
 **Rationale**: Reduce interest charges and close margin positions cleanly.
 
 **Dependencies**:
-- REQ-FUT-MARGIN-013
+- REQ-FUT-MARGIN-014
 
 **Priority**: Medium (P1)
 
@@ -465,6 +491,7 @@ class MarginPosition:
     """Represents an Isolated Margin position."""
     position_id: str
     client_id: int
+    operation_id: Optional[int]  # Link to Operation (Level 2)
     symbol: str
     side: str  # "LONG" or "SHORT"
     
@@ -583,23 +610,24 @@ class MarginExecutionPort(Protocol):
 1. REQ-FUT-MARGIN-001: Transfer to margin
 2. REQ-FUT-MARGIN-002: Transfer from margin
 3. REQ-FUT-MARGIN-003: Query account
-4. REQ-FUT-MARGIN-007: Position sizing
+4. REQ-FUT-MARGIN-007: Internal stop execution
+5. REQ-FUT-MARGIN-008: Position sizing
 
 ### Phase 2: Trading (Critical)
-5. REQ-FUT-MARGIN-004: Market orders
-6. REQ-FUT-MARGIN-008: Stop-loss orders
-7. REQ-FUT-MARGIN-010: Margin monitoring
-8. REQ-FUT-MARGIN-011: Drawdown tracking
+6. REQ-FUT-MARGIN-004: Market orders
+7. REQ-FUT-MARGIN-009: Stop-loss handling
+8. REQ-FUT-MARGIN-011: Margin monitoring
+9. REQ-FUT-MARGIN-012: Drawdown tracking
 
 ### Phase 3: Advanced (High)
-9. REQ-FUT-MARGIN-005: Limit orders
-10. REQ-FUT-MARGIN-006: Cancel orders
-11. REQ-FUT-MARGIN-009: Take-profit orders
+10. REQ-FUT-MARGIN-005: Limit orders
+11. REQ-FUT-MARGIN-006: Cancel orders
+12. REQ-FUT-MARGIN-010: Take-profit orders
 
 ### Phase 4: Polish (Medium)
-12. REQ-FUT-MARGIN-012: Daily trade limit
-13. REQ-FUT-MARGIN-013: Auto-borrow
-14. REQ-FUT-MARGIN-014: Repay borrowed
+13. REQ-FUT-MARGIN-013: Daily trade limit
+14. REQ-FUT-MARGIN-014: Auto-borrow
+15. REQ-FUT-MARGIN-015: Repay borrowed
 
 ---
 
@@ -614,4 +642,3 @@ class MarginExecutionPort(Protocol):
 
 **Last Updated**: 2024-12-23  
 **Version**: 1.0 (Draft)
-

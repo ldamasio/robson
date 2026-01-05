@@ -7,36 +7,37 @@ PLAN → VALIDATE → EXECUTE
 All endpoints require JWT authentication and enforce multi-tenant isolation.
 """
 
+import logging
+
+from django.utils import timezone
+from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from rest_framework import status
-from django.utils import timezone
-import logging
 
-from api.serializers.trading_intent_serializers import (
-    CreateTradingIntentSerializer,
-    TradingIntentSerializer,
-    ValidationReportSerializer,
-    ExecutionResultSerializer,
-    PatternTriggerSerializer,
-    PatternTriggerResponseSerializer,
+from api.application.adapters import (
+    BinanceAccountBalanceAdapter,
+    DjangoStrategyRepository,
+    DjangoSymbolRepository,
+    DjangoTradingIntentRepository,
 )
+from api.application.execution import ExecutionMode
+from api.application.execution_framework import ExecutionFramework
 from api.application.use_cases.trading_intent import (
     CreateTradingIntentCommand,
     CreateTradingIntentUseCase,
 )
-from api.application.adapters import (
-    DjangoSymbolRepository,
-    DjangoStrategyRepository,
-    DjangoTradingIntentRepository,
-    BinanceAccountBalanceAdapter,
-)
 from api.application.validation_framework import ValidationFramework
-from api.application.execution_framework import ExecutionFramework
-from api.application.execution import ExecutionMode
 from api.models import TradingIntent
 from api.models.trading import PatternTrigger
+from api.serializers.trading_intent_serializers import (
+    CreateTradingIntentSerializer,
+    ExecutionResultSerializer,
+    PatternTriggerResponseSerializer,
+    PatternTriggerSerializer,
+    TradingIntentSerializer,
+    ValidationReportSerializer,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -75,16 +76,14 @@ def create_trading_intent(request):
         500 Internal Server Error: Unexpected error
     """
     from decimal import Decimal
-    from api.models import Symbol, Strategy
+
     from api.application.technical_stop_adapter import BinanceTechnicalStopService
+    from api.models import Strategy, Symbol
 
     try:
         # Get client from user
         client = request.user.client
-        if not client:
-            return Response(
-                {"error": "User has no associated client"},
-                status=status.HTTP_400_BAD_REQUEST
+                {"error": "User has no associated client"}, status=status.HTTP_400_BAD_REQUEST
             )
 
         # Validate input
@@ -126,7 +125,7 @@ def create_trading_intent(request):
                     "error": "Invalid payload: mode='auto' cannot have manual fields. Remove manual fields or remove mode='auto'.",
                     "fields_not_allowed": provided_fields,
                 },
-                status=status.HTTP_400_BAD_REQUEST
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         # Auto mode: explicit OR all fields absent
@@ -149,7 +148,7 @@ def create_trading_intent(request):
                     "error": "Invalid payload: partial manual mode. Either provide ALL manual fields (side, entry_price, stop_price, capital) or use auto mode (mode='auto' or omit all fields).",
                     "missing_fields": missing,
                 },
-                status=status.HTTP_400_BAD_REQUEST
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         if is_auto_mode:
@@ -159,21 +158,25 @@ def create_trading_intent(request):
             try:
                 # Get symbol and strategy
                 symbol = Symbol.objects.get(id=validated_data["symbol"], client=client)
-                strategy = Strategy.objects.get(id=validated_data["strategy"], client=client)
+                strategy = Strategy.objects.filter(
+                    id=validated_data["strategy"], client=client
+                ).first()
+                if strategy is None:
+                    strategy = Strategy.objects.get(
+                        id=validated_data["strategy"], client__isnull=True
+                    )
 
                 # Use shared auto-calculation use case
-                tech_stop_service = BinanceTechnicalStopService(
-                    client_id=client.id,
-                    timeout=5.0
-                )
+                tech_stop_service = BinanceTechnicalStopService(client_id=client.id, timeout=5.0)
 
                 # Create balance provider for BALANCE mode
                 balance_provider = BinanceAccountBalanceAdapter(
                     use_testnet=None,  # Uses settings.BINANCE_USE_TESTNET
-                    timeout=5.0
+                    timeout=5.0,
                 )
 
                 from api.application.use_cases import AutoCalculateTradingParametersUseCase
+
                 auto_calc_use_case = AutoCalculateTradingParametersUseCase(
                     tech_stop_service=tech_stop_service,
                     balance_provider=balance_provider,
@@ -181,17 +184,13 @@ def create_trading_intent(request):
 
                 try:
                     result = auto_calc_use_case.execute(
-                        symbol_obj=symbol,
-                        strategy_obj=strategy,
-                        client_id=client.id
+                        symbol_obj=symbol, strategy_obj=strategy, client_id=client.id
                     )
 
                     # Log warnings if any
                     if result.get("warnings"):
                         for warning in result["warnings"]:
-                            logger.warning(
-                                f"Auto-calc warning for client {client.id}: {warning}"
-                            )
+                            logger.warning(f"Auto-calc warning for client {client.id}: {warning}")
 
                     logger.info(
                         f"Auto-calculated for client {client.id}: "
@@ -206,8 +205,10 @@ def create_trading_intent(request):
                     # Note: Timeout fallback is handled inside BinanceTechnicalStopService
                     logger.error(f"Auto-calculation failed: {calc_error}", exc_info=True)
                     return Response(
-                        {"error": f"Auto-calculation failed: {str(calc_error)}. The system could not calculate trading parameters automatically."},
-                        status=status.HTTP_400_BAD_REQUEST
+                        {
+                            "error": f"Auto-calculation failed: {str(calc_error)}. The system could not calculate trading parameters automatically."
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
                     )
 
                 # Update validated_data with auto-calculated values
@@ -215,20 +216,26 @@ def create_trading_intent(request):
                 validated_data["entry_price"] = result["entry_price"]
                 validated_data["stop_price"] = result["stop_price"]
                 validated_data["capital"] = result["capital"]
-                validated_data["confidence"] = result["confidence_float"]  # P0-4: Persist confidence as float
-                validated_data["quantity"] = result["quantity"]  # P0-3: Use exact quantized quantity
+                validated_data["confidence"] = result[
+                    "confidence_float"
+                ]  # P0-4: Persist confidence as float
+                validated_data["quantity"] = result[
+                    "quantity"
+                ]  # P0-3: Use exact quantized quantity
                 validated_data["regime"] = "auto"
-                validated_data["reason"] = f"Auto-calculated (side: {result['side_source']}, capital: {result['capital_source']})"
+                validated_data["reason"] = (
+                    f"Auto-calculated (side: {result['side_source']}, capital: {result['capital_source']})"
+                )
 
             except Symbol.DoesNotExist:
                 return Response(
                     {"error": f"Symbol with id {validated_data['symbol']} not found"},
-                    status=status.HTTP_404_NOT_FOUND
+                    status=status.HTTP_404_NOT_FOUND,
                 )
             except Strategy.DoesNotExist:
                 return Response(
                     {"error": f"Strategy with id {validated_data['strategy']} not found"},
-                    status=status.HTTP_404_NOT_FOUND
+                    status=status.HTTP_404_NOT_FOUND,
                 )
 
         # Create command (works for both manual and auto modes now)
@@ -244,7 +251,9 @@ def create_trading_intent(request):
             confidence=validated_data.get("confidence", 0.5),
             reason=validated_data.get("reason", "Manual entry via UI"),
             client_id=client.id,
-            quantity=validated_data.get("quantity"),  # P0 Fix #3: Use exact quantized quantity in auto mode
+            quantity=validated_data.get(
+                "quantity"
+            ),  # P0 Fix #3: Use exact quantized quantity in auto mode
         )
 
         # Execute use case
@@ -269,15 +278,11 @@ def create_trading_intent(request):
 
     except ValueError as e:
         logger.warning(f"Validation error creating trading intent: {e}")
-        return Response(
-            {"error": str(e)},
-            status=status.HTTP_400_BAD_REQUEST
-        )
+        return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
     except Exception as e:
         logger.error(f"Unexpected error creating trading intent: {e}", exc_info=True)
         return Response(
-            {"error": "Internal server error"},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            {"error": "Internal server error"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
 
@@ -299,8 +304,7 @@ def get_trading_intent(request, intent_id):
         client = request.user.client
         if not client:
             return Response(
-                {"error": "User has no associated client"},
-                status=status.HTTP_400_BAD_REQUEST
+                {"error": "User has no associated client"}, status=status.HTTP_400_BAD_REQUEST
             )
 
         # Get intent with multi-tenant filtering
@@ -312,15 +316,11 @@ def get_trading_intent(request, intent_id):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     except ValueError as e:
-        return Response(
-            {"error": str(e)},
-            status=status.HTTP_404_NOT_FOUND
-        )
+        return Response({"error": str(e)}, status=status.HTTP_404_NOT_FOUND)
     except Exception as e:
         logger.error(f"Unexpected error fetching trading intent: {e}", exc_info=True)
         return Response(
-            {"error": "Internal server error"},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            {"error": "Internal server error"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
 
@@ -349,8 +349,7 @@ def list_trading_intents(request):
         client = request.user.client
         if not client:
             return Response(
-                {"error": "User has no associated client"},
-                status=status.HTTP_400_BAD_REQUEST
+                {"error": "User has no associated client"}, status=status.HTTP_400_BAD_REQUEST
             )
 
         # Parse query parameters
@@ -363,15 +362,13 @@ def list_trading_intents(request):
             offset = int(request.query_params.get("offset", 0))
         except ValueError:
             return Response(
-                {"error": "limit and offset must be integers"},
-                status=status.HTTP_400_BAD_REQUEST
+                {"error": "limit and offset must be integers"}, status=status.HTTP_400_BAD_REQUEST
             )
 
         # Validate limit
         if limit < 1 or limit > 1000:
             return Response(
-                {"error": "limit must be between 1 and 1000"},
-                status=status.HTTP_400_BAD_REQUEST
+                {"error": "limit must be between 1 and 1000"}, status=status.HTTP_400_BAD_REQUEST
             )
 
         # Get intents
@@ -393,14 +390,13 @@ def list_trading_intents(request):
                 "count": len(intents),
                 "results": serializer.data,
             },
-            status=status.HTTP_200_OK
+            status=status.HTTP_200_OK,
         )
 
     except Exception as e:
         logger.error(f"Unexpected error listing trading intents: {e}", exc_info=True)
         return Response(
-            {"error": "Internal server error"},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            {"error": "Internal server error"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
 
@@ -423,8 +419,7 @@ def validate_trading_intent(request, intent_id):
         client = request.user.client
         if not client:
             return Response(
-                {"error": "User has no associated client"},
-                status=status.HTTP_400_BAD_REQUEST
+                {"error": "User has no associated client"}, status=status.HTTP_400_BAD_REQUEST
             )
 
         # Get intent
@@ -453,15 +448,11 @@ def validate_trading_intent(request, intent_id):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     except ValueError as e:
-        return Response(
-            {"error": str(e)},
-            status=status.HTTP_404_NOT_FOUND
-        )
+        return Response({"error": str(e)}, status=status.HTTP_404_NOT_FOUND)
     except Exception as e:
         logger.error(f"Unexpected error validating trading intent: {e}", exc_info=True)
         return Response(
-            {"error": "Internal server error"},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            {"error": "Internal server error"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
 
@@ -487,8 +478,7 @@ def execute_trading_intent(request, intent_id):
         client = request.user.client
         if not client:
             return Response(
-                {"error": "User has no associated client"},
-                status=status.HTTP_400_BAD_REQUEST
+                {"error": "User has no associated client"}, status=status.HTTP_400_BAD_REQUEST
             )
 
         # Parse mode parameter
@@ -500,7 +490,7 @@ def execute_trading_intent(request, intent_id):
         else:
             return Response(
                 {"error": f"Invalid mode: {mode_str}. Must be 'dry-run' or 'live'"},
-                status=status.HTTP_400_BAD_REQUEST
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         # Get intent
@@ -510,8 +500,10 @@ def execute_trading_intent(request, intent_id):
         # Verify intent is validated
         if intent.status != "VALIDATED":
             return Response(
-                {"error": f"Intent must be VALIDATED before execution. Current status: {intent.status}"},
-                status=status.HTTP_400_BAD_REQUEST
+                {
+                    "error": f"Intent must be VALIDATED before execution. Current status: {intent.status}"
+                },
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         # Execute using the execution framework
@@ -542,15 +534,11 @@ def execute_trading_intent(request, intent_id):
         return Response(serializer.data, status=status.HTTP_200_OK)
 
     except ValueError as e:
-        return Response(
-            {"error": str(e)},
-            status=status.HTTP_404_NOT_FOUND
-        )
+        return Response({"error": str(e)}, status=status.HTTP_404_NOT_FOUND)
     except Exception as e:
         logger.error(f"Unexpected error executing trading intent: {e}", exc_info=True)
         return Response(
-            {"error": "Internal server error"},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            {"error": "Internal server error"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
 
@@ -592,8 +580,7 @@ def pattern_trigger(request):
         client = request.user.client
         if not client:
             return Response(
-                {"error": "User has no associated client"},
-                status=status.HTTP_400_BAD_REQUEST
+                {"error": "User has no associated client"}, status=status.HTTP_400_BAD_REQUEST
             )
 
         # Validate input
@@ -610,8 +597,7 @@ def pattern_trigger(request):
         if PatternTrigger.has_been_processed(client.id, pattern_event_id):
             # Already processed - return the original intent
             existing_trigger = PatternTrigger.objects.get(
-                client_id=client.id,
-                pattern_event_id=pattern_event_id
+                client_id=client.id, pattern_event_id=pattern_event_id
             )
 
             response_data = {
@@ -621,7 +607,9 @@ def pattern_trigger(request):
                 "pattern_code": pattern_code,
             }
 
-            logger.info(f"Pattern trigger {pattern_event_id} for client {client.id} was already processed")
+            logger.info(
+                f"Pattern trigger {pattern_event_id} for client {client.id} was already processed"
+            )
 
             return Response(response_data, status=status.HTTP_200_OK)
 
@@ -654,7 +642,15 @@ def pattern_trigger(request):
         intent.pattern_source = "pattern"
         intent.pattern_event_id = pattern_event_id
         intent.pattern_triggered_at = timezone.now()
-        intent.save(update_fields=["pattern_code", "pattern_source", "pattern_event_id", "pattern_triggered_at", "updated_at"])
+        intent.save(
+            update_fields=[
+                "pattern_code",
+                "pattern_source",
+                "pattern_event_id",
+                "pattern_triggered_at",
+                "updated_at",
+            ]
+        )
 
         # Auto-validate if requested
         validation_result = None
@@ -702,15 +698,11 @@ def pattern_trigger(request):
 
     except ValueError as e:
         logger.warning(f"Validation error in pattern trigger: {e}")
-        return Response(
-            {"error": str(e)},
-            status=status.HTTP_400_BAD_REQUEST
-        )
+        return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
     except Exception as e:
         logger.error(f"Unexpected error in pattern trigger: {e}", exc_info=True)
         return Response(
-            {"error": "Internal server error"},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            {"error": "Internal server error"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
         )
 
 
@@ -760,8 +752,7 @@ def auto_calculate_parameters(request):
         client = request.user.client
         if not client:
             return Response(
-                {"error": "User has no associated client"},
-                status=status.HTTP_400_BAD_REQUEST
+                {"error": "User has no associated client"}, status=status.HTTP_400_BAD_REQUEST
             )
 
         # Validate input
@@ -771,37 +762,36 @@ def auto_calculate_parameters(request):
         if not symbol_id or not strategy_id:
             return Response(
                 {"error": "symbol_id and strategy_id are required"},
-                status=status.HTTP_400_BAD_REQUEST
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         # Get symbol and strategy
         try:
             symbol = Symbol.objects.get(id=symbol_id, client=client)
-            strategy = Strategy.objects.get(id=strategy_id, client=client)
+            strategy = Strategy.objects.filter(id=strategy_id, client=client).first()
+            if strategy is None:
+                strategy = Strategy.objects.get(id=strategy_id, client__isnull=True)
         except Symbol.DoesNotExist:
             return Response(
-                {"error": f"Symbol with id {symbol_id} not found"},
-                status=status.HTTP_404_NOT_FOUND
+                {"error": f"Symbol with id {symbol_id} not found"}, status=status.HTTP_404_NOT_FOUND
             )
         except Strategy.DoesNotExist:
             return Response(
                 {"error": f"Strategy with id {strategy_id} not found"},
-                status=status.HTTP_404_NOT_FOUND
+                status=status.HTTP_404_NOT_FOUND,
             )
 
         # Use shared auto-calculation use case
-        tech_stop_service = BinanceTechnicalStopService(
-            client_id=client.id,
-            timeout=5.0
-        )
+        tech_stop_service = BinanceTechnicalStopService(client_id=client.id, timeout=5.0)
 
         # Create balance provider for BALANCE mode
         balance_provider = BinanceAccountBalanceAdapter(
             use_testnet=None,  # Uses settings.BINANCE_USE_TESTNET
-            timeout=5.0
+            timeout=5.0,
         )
 
         from api.application.use_cases import AutoCalculateTradingParametersUseCase
+
         auto_calc_use_case = AutoCalculateTradingParametersUseCase(
             tech_stop_service=tech_stop_service,
             balance_provider=balance_provider,
@@ -809,9 +799,7 @@ def auto_calculate_parameters(request):
 
         try:
             result = auto_calc_use_case.execute(
-                symbol_obj=symbol,
-                strategy_obj=strategy,
-                client_id=client.id
+                symbol_obj=symbol, strategy_obj=strategy, client_id=client.id
             )
         except Exception as calc_error:
             # Log and return error
@@ -819,7 +807,7 @@ def auto_calculate_parameters(request):
             logger.error(f"Auto-calculation failed: {calc_error}", exc_info=True)
             return Response(
                 {"error": f"Auto-calculation failed: {str(calc_error)}"},
-                status=status.HTTP_400_BAD_REQUEST
+                status=status.HTTP_400_BAD_REQUEST,
             )
 
         # Format response
@@ -828,6 +816,7 @@ def auto_calculate_parameters(request):
         if confidence_float is None:
             # Compute from confidence string using same mapping as use case
             from decimal import Decimal
+
             CONFIDENCE_MAP = {
                 "HIGH": Decimal("0.8"),
                 "MEDIUM": Decimal("0.6"),
@@ -867,6 +856,8 @@ def auto_calculate_parameters(request):
 
     except Exception as e:
         logger.error(f"Unexpected error in auto-calculate: {e}", exc_info=True)
+        return Response(
+            {"error": "Internal server error"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
         return Response(
             {"error": "Internal server error"},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR

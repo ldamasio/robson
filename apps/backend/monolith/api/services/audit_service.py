@@ -249,6 +249,37 @@ class AuditService:
             description=description,
         )
 
+    def record_stop_loss_triggered(
+        self,
+        symbol: str,
+        quantity: Decimal,
+        price: Decimal,
+        stop_price: Decimal,
+        binance_order_id: str,
+        is_margin: bool = False,
+        position=None,
+        raw_response: Optional[dict] = None,
+        side: str = "SELL",
+    ) -> AuditTransaction:
+        """Record a stop-loss execution."""
+        description = (
+            f"Stop-loss triggered: {side} {quantity} {symbol[:-4]} @ ${price} (stop {stop_price})"
+        )
+        return self._create_transaction(
+            transaction_type=TransactionType.STOP_LOSS_TRIGGERED,
+            symbol=symbol,
+            asset=symbol[:-4],
+            quantity=quantity,
+            price=price,
+            stop_price=stop_price,
+            side=side,
+            binance_order_id=binance_order_id,
+            is_isolated_margin=is_margin,
+            related_position=position,
+            raw_response=raw_response,
+            description=description,
+        )
+
     def _create_transaction(
         self,
         transaction_type: str,

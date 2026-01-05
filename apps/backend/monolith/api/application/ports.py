@@ -10,9 +10,10 @@ ONE system, ONE runtime, ONE source of truth.
 """
 
 from __future__ import annotations
-from typing import Protocol, Optional, Iterable
-from decimal import Decimal
+
 from datetime import datetime
+from decimal import Decimal
+from typing import Iterable, Optional, Protocol
 
 
 class OrderRepository(Protocol):
@@ -119,7 +120,7 @@ class TradingIntentRepository(Protocol):
         status: Optional[str] = None,
         strategy_id: Optional[int] = None,
         symbol_id: Optional[int] = None,
-        limit: int = 100,
+        offset: int = 0,
         offset: int = 0
     ) -> Iterable[object]:
         """List trading intents for a client with optional filters."""
@@ -139,7 +140,9 @@ class AccountBalancePort(Protocol):
     def get_available_quote_balance(
         self,
         client_id: int,
-        quote_asset: str
+        quote_asset: str,
+        account_type: str = "spot",
+        symbol: Optional[str] = None,
     ) -> Decimal:
         """
         Get the available (free) balance for a quote asset.
@@ -147,6 +150,8 @@ class AccountBalancePort(Protocol):
         Args:
             client_id: Client ID for multi-tenant balance retrieval
             quote_asset: Quote asset symbol (e.g., "USDT", "BUSD")
+            account_type: "spot" or "isolated_margin"
+            symbol: Required for isolated margin (e.g., "BTCUSDC")
 
         Returns:
             Available (free) balance as Decimal

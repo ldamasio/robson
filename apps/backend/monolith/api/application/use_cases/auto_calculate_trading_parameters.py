@@ -5,11 +5,10 @@ This module contains the use case for calculating trading parameters
 including side, capital, technical stop, and position size.
 """
 
-from decimal import Decimal, InvalidOperation
 import logging
+from decimal import Decimal, InvalidOperation
 
 from ..ports import AccountBalancePort
-
 
 logger = logging.getLogger(__name__)
 
@@ -118,7 +117,7 @@ class AutoCalculateTradingParametersUseCase:
         warnings = []
 
         # Determine side from Strategy.market_bias or config.default_side
-        if hasattr(strategy_obj, 'market_bias') and strategy_obj.market_bias:
+        if hasattr(strategy_obj, "market_bias") and strategy_obj.market_bias:
             if strategy_obj.market_bias == "BULLISH":
                 side = "BUY"
             elif strategy_obj.market_bias == "BEARISH":
@@ -164,7 +163,7 @@ class AutoCalculateTradingParametersUseCase:
                 quote_asset = symbol_obj.quote_asset
 
                 # Get client_id from strategy if not provided
-                if client_id is None and hasattr(strategy_obj, 'client_id'):
+                if client_id is None and hasattr(strategy_obj, "client_id"):
                     client_id = strategy_obj.client_id
 
                 if client_id is None:
@@ -177,25 +176,27 @@ class AutoCalculateTradingParametersUseCase:
                     )
                     logger.warning("Balance mode requested but client_id is None. Using fallback.")
                 else:
-                    # Check if margin account type is requested (not supported yet)
                     account_type = strategy_obj.get_config_value("account_type", "spot")
-                    if account_type != "spot":
+                    if account_type not in ("spot", "isolated_margin"):
                         warnings.append(
-                            f"BALANCE mode currently uses SPOT available balance only. "
-                            f"Requested account_type '{account_type}' is not supported yet. "
-                            f"Using SPOT balance."
+                            f"Unknown account_type '{account_type}'. Falling back to SPOT."
                         )
+                        account_type = "spot"
 
                     # Fetch balance from exchange with safe fallback
                     try:
                         available_balance = self.balance_provider.get_available_quote_balance(
                             client_id=client_id,
-                            quote_asset=quote_asset
+                            quote_asset=quote_asset,
+                            account_type=account_type,
+                            symbol=symbol_obj.name if account_type == "isolated_margin" else None,
                         )
 
                         # P0-1: If available balance is zero or negative, fall back
                         if available_balance <= 0:
-                            capital = Decimal(strategy_obj.get_config_value("capital_fixed", "1000.00"))
+                            capital = Decimal(
+                                strategy_obj.get_config_value("capital_fixed", "1000.00")
+                            )
                             capital_source = "FALLBACK"
                             warnings.append(
                                 f"Available {quote_asset} balance is {available_balance}. "
@@ -233,7 +234,7 @@ class AutoCalculateTradingParametersUseCase:
                             capital_source = "BALANCE"
                             logger.info(
                                 f"Using BALANCE mode (SPOT): {available_balance} {quote_asset} available, "
-                                f"{balance_percent*100}% = {capital} capital"
+                                f"{balance_percent * 100}% = {capital} capital"
                             )
 
                     except (TimeoutError, ConnectionError) as e:
@@ -280,7 +281,7 @@ class AutoCalculateTradingParametersUseCase:
             capital=capital,
             entry_price=None,  # Will fetch current price
             timeframe=timeframe,
-            max_risk_percent=Decimal("1.0")
+            max_risk_percent=Decimal("1.0"),
         )
 
         # Extract and enrich result
@@ -294,7 +295,7 @@ class AutoCalculateTradingParametersUseCase:
         confidence_float = self._map_confidence_to_float(confidence_str)
 
         # P0-2: Merge stop warnings into response warnings
-        if hasattr(stop_result, 'warnings') and stop_result.warnings:
+        if hasattr(stop_result, "warnings") and stop_result.warnings:
             warnings.extend(stop_result.warnings)
 
         return {
@@ -352,8 +353,7 @@ class AutoCalculateTradingParametersUseCase:
             return Decimal("0.0")
         elif percent > 100:
             warnings.append(
-                f"capital_balance_percent cannot exceed 100% (got {percent}%). "
-                f"Using 100%."
+                f"capital_balance_percent cannot exceed 100% (got {percent}%). Using 100%."
             )
             return Decimal("1.0")
 

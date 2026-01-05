@@ -426,6 +426,9 @@ Monitors open positions and executes:
 
 > **Note**: As of 2025-12-29, the `--dry-run` flag was removed and the CronJob now executes real orders.
 
+**Iron Exit Protocol**: Stop-loss is **internal**. No STOP_LOSS_LIMIT is placed
+on Binance. The stop monitor executes a **market** close when the trigger is hit.
+
 ### Trailing Stop CronJob
 
 **File**: `infra/k8s/prod/rbs-trailing-stop-cronjob.yml`

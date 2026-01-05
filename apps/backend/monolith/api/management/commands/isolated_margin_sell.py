@@ -10,8 +10,9 @@ Flow:
 3. Transfer collateral (USDT) from Spot to Isolated Margin
 4. Borrow BTC
 5. Place SELL entry order
-6. Place BUY stop-loss order (STOP_LOSS_LIMIT)
-7. Record everything in AuditService
+6. Record stop-loss for internal monitoring (no exchange order)
+7. Stop monitor executes market close when triggered
+8. Record everything in AuditService
 """
 
 import logging
@@ -20,21 +21,27 @@ from decimal import ROUND_DOWN, Decimal, InvalidOperation
 
 from clients.models import Client
 from django.core.management.base import BaseCommand, CommandError
-from django.db import transaction
 from django.utils import timezone
 
 from api.application.adapters import BinanceExecution
-from api.application.execution import ExecutionMode
+from api.application.execution import ExecutionMode, ExecutionStatus
+from api.application.execution_framework import ExecutionFramework
 from api.application.technical_stop_adapter import BinanceTechnicalStopService
-from api.models.margin import MarginPosition, MarginTransfer
-from api.services.audit_service import AuditService
+from api.models import Strategy, Symbol, TradingIntent
 
 logger = logging.getLogger(__name__)
 
 DEFAULT_SYMBOL = "BTCUSDT"
 DEFAULT_TIMEFRAME = "15m"
 DEFAULT_LEVEL_N = 2
+DEFAULT_STRATEGY_NAME = "Iron Exit Protocol"
 MAX_RISK_PERCENT = Decimal("1.0")
+CONFIDENCE_MAP = {
+    "HIGH": Decimal("0.8"),
+    "MEDIUM": Decimal("0.6"),
+    "MED": Decimal("0.6"),
+    "LOW": Decimal("0.4"),
+}
 
 
 def _split_symbol(symbol: str) -> tuple[str, str]:
@@ -60,6 +67,12 @@ class Command(BaseCommand):
             type=str,
             default=DEFAULT_SYMBOL,
             help=f"Trading pair (default: {DEFAULT_SYMBOL})",
+        )
+        parser.add_argument(
+            "--strategy",
+            type=str,
+            default=DEFAULT_STRATEGY_NAME,
+            help=f"Strategy name (default: {DEFAULT_STRATEGY_NAME})",
         )
         parser.add_argument(
             "--client-id",
@@ -90,6 +103,7 @@ class Command(BaseCommand):
             raise CommandError(f"Invalid capital: {options['capital']}")
 
         symbol = options["symbol"].upper()
+        strategy_name = options["strategy"]
         client_id = options["client_id"]
         is_live = options["live"]
         is_confirmed = options["confirm"]
@@ -112,6 +126,7 @@ class Command(BaseCommand):
         self.stdout.write(f"Environment: {env}")
         self.stdout.write(f"Mode: {mode.value}")
         self.stdout.write(f"Symbol: {symbol}")
+        self.stdout.write(f"Strategy: {strategy_name}")
         self.stdout.write(f"Timeframe: {DEFAULT_TIMEFRAME} (level {DEFAULT_LEVEL_N})")
         self.stdout.write("")
 
@@ -233,207 +248,84 @@ class Command(BaseCommand):
             client = Client.objects.get(id=client_id)
         except Client.DoesNotExist:
             raise CommandError(f"Client {client_id} not found")
+        symbol_obj, _ = Symbol.objects.get_or_create(
+            client=client,
+            name=symbol,
+            defaults={
+                "base_asset": base_asset,
+                "quote_asset": quote_asset,
+                "is_active": True,
+            },
+        )
 
-        audit_service = AuditService(client, execution)
-        position_id = str(uuid.uuid4())
+        strategy = Strategy.objects.filter(name=strategy_name, client=client).first()
+        if strategy is None:
+            strategy = Strategy.objects.filter(name=strategy_name, client__isnull=True).first()
+        if strategy is None:
+            strategy = Strategy.objects.create(
+                client=client,
+                name=strategy_name,
+                description="Iron Exit Protocol (CLI-created)",
+                config={
+                    "account_type": "isolated_margin",
+                    "capital_mode": "fixed",
+                    "capital_fixed": str(capital),
+                    "technical_stop": {
+                        "timeframe": DEFAULT_TIMEFRAME,
+                        "level": DEFAULT_LEVEL_N,
+                        "side": "SELL",
+                    },
+                    "stop_execution": "robson_market",
+                    "risk_percent": float(MAX_RISK_PERCENT),
+                },
+                risk_config={
+                    "max_risk_per_trade": float(MAX_RISK_PERCENT),
+                    "use_technical_stop": True,
+                    "stop_execution": "robson_market",
+                },
+                market_bias="BEARISH",
+                is_active=True,
+            )
+
+        confidence_key = str(result.get("confidence", "LOW")).upper()
+        confidence_float = CONFIDENCE_MAP.get(confidence_key, Decimal("0.4"))
+
+        intent = TradingIntent.objects.create(
+            intent_id=str(uuid.uuid4()),
+            client=client,
+            symbol=symbol_obj,
+            strategy=strategy,
+            side="SELL",
+            status="VALIDATED",
+            quantity=quantity,
+            entry_price=entry_price,
+            stop_price=stop_price,
+            target_price=None,
+            regime="unknown",
+            confidence=float(confidence_float),
+            reason="Iron Exit Protocol (CLI)",
+            capital=capital,
+            risk_amount=actual_risk.quantize(Decimal("0.01")),
+            risk_percent=risk_percent,
+            validation_result={"status": "PASS", "source": "cli"},
+            validated_at=timezone.now(),
+        )
 
         self.stdout.write("=== EXECUTING LIVE ===")
         self.stdout.write("")
 
-        # Step 1: Transfer collateral to isolated margin
-        self.stdout.write("Step 1: Transfer to Isolated Margin")
-        try:
-            spot_quote_free = Decimal(spot_quote.get("free", "0"))
-            transfer_amount = min(capital, spot_quote_free)
-            if transfer_amount < capital:
-                self.stdout.write(
-                    f"Insufficient {margin_quote_asset}. Have: {transfer_amount}, Need: {capital}"
-                )
-                self.stdout.write("Will use existing margin collateral if available...")
-
-            if transfer_amount > 0:
-                transfer_result = execution.client.transfer_spot_to_isolated_margin(
-                    asset=margin_quote_asset,
-                    symbol=symbol,
-                    amount=str(transfer_amount),
-                )
-                tran_id = transfer_result.get("tranId", "N/A")
-                self.stdout.write(
-                    f"Transferred {transfer_amount} {margin_quote_asset} (ID: {tran_id})"
-                )
-
-                with transaction.atomic():
-                    MarginTransfer.objects.create(
-                        transaction_id=str(tran_id),
-                        client=client,
-                        symbol=symbol,
-                        asset=margin_quote_asset,
-                        amount=transfer_amount,
-                        direction=MarginTransfer.Direction.TO_MARGIN,
-                        success=True,
-                    )
-
-                audit_service.record_transfer_to_margin(
-                    symbol=symbol,
-                    asset=margin_quote_asset,
-                    amount=transfer_amount,
-                    binance_transaction_id=str(tran_id),
-                    raw_response=transfer_result,
-                )
-        except Exception as e:
-            self.stdout.write(f"Transfer failed: {e}")
-
-        # Step 2: Borrow BTC for short
-        self.stdout.write("Step 2: Borrow BTC")
-        borrow_tran_id = None
-        borrow_amount = quantity.quantize(Decimal("0.00001"))
-        try:
-            borrow_result = execution.client.create_margin_loan(
-                asset=margin_base_asset,
-                amount=str(borrow_amount),
-                isIsolated="TRUE",
-                symbol=symbol,
-            )
-            borrow_tran_id = borrow_result.get("tranId", "N/A")
-            self.stdout.write(
-                f"Borrowed {borrow_amount} {margin_base_asset} (ID: {borrow_tran_id})"
-            )
-
-            with transaction.atomic():
-                MarginTransfer.objects.create(
-                    transaction_id=str(borrow_tran_id),
-                    client=client,
-                    symbol=symbol,
-                    asset=margin_base_asset,
-                    amount=borrow_amount,
-                    direction=MarginTransfer.Direction.TO_MARGIN,
-                    success=True,
-                )
-
-            audit_service.record_margin_borrow(
-                symbol=symbol,
-                asset=margin_base_asset,
-                amount=borrow_amount,
-                binance_transaction_id=str(borrow_tran_id),
-                raw_response=borrow_result,
-            )
-        except Exception as e:
-            raise CommandError(f"Cannot proceed without borrowing {margin_base_asset}: {e}")
-
-        # Step 3: Place entry SELL order
-        self.stdout.write("Step 3: Place Margin Entry Order")
-        try:
-            order_result = execution.client.create_margin_order(
-                symbol=symbol,
-                side="SELL",
-                type="MARKET",
-                quantity=str(quantity),
-                isIsolated="TRUE",
-            )
-            order_id = order_result.get("orderId", "N/A")
-            executed_qty = Decimal(str(order_result.get("executedQty", "0")))
-            quote_qty = Decimal(str(order_result.get("cummulativeQuoteQty", "0")))
-            fill_price = quote_qty / executed_qty if executed_qty else entry_price
-            self.stdout.write(f"Entry Order ID: {order_id}")
-            self.stdout.write(f"Fill Price: ${fill_price:.2f}")
-        except Exception as e:
-            raise CommandError(f"Entry order failed: {e}")
-
-        # Step 4: Place stop-loss BUY order
-        self.stdout.write("Step 4: Place Margin Stop-Loss")
-        stop_order_id = None
-        stop_order_result = None
-        try:
-            stop_limit = (stop_price * Decimal("1.001")).quantize(Decimal("0.01"))
-            stop_order_result = execution.client.create_margin_order(
-                symbol=symbol,
-                side="BUY",
-                type="STOP_LOSS_LIMIT",
-                quantity=str(quantity),
-                price=str(stop_limit),
-                stopPrice=str(stop_price.quantize(Decimal("0.01"))),
-                timeInForce="GTC",
-                isIsolated="TRUE",
-                sideEffectType="AUTO_REPAY",
-            )
-            stop_order_id = stop_order_result.get("orderId", "N/A")
-            self.stdout.write(f"Stop Order ID: {stop_order_id}")
-        except Exception as e:
-            self.stdout.write(f"Stop order failed: {e}")
-            self.stdout.write("MANUAL STOP-LOSS REQUIRED")
-
-        # Step 5: Record position in database
-        self.stdout.write("Step 5: Record Position (Audit)")
-        position = None
-        try:
-            with transaction.atomic():
-                position = MarginPosition.objects.create(
-                    position_id=position_id,
-                    client=client,
-                    symbol=symbol,
-                    side=MarginPosition.Side.SHORT,
-                    status=MarginPosition.Status.OPEN,
-                    leverage=1,
-                    entry_price=fill_price,
-                    stop_price=stop_price,
-                    current_price=fill_price,
-                    quantity=quantity,
-                    position_value=quantity * fill_price,
-                    margin_allocated=capital,
-                    borrowed_amount=borrow_amount,
-                    risk_amount=actual_risk.quantize(Decimal("0.01")),
-                    risk_percent=risk_percent,
-                    binance_entry_order_id=str(order_id),
-                    binance_stop_order_id=str(stop_order_id) if stop_order_id else None,
-                    opened_at=timezone.now(),
-                )
-                self.stdout.write(f"Position ID: {position.id}")
-                self.stdout.write(f"DB Record: {position.position_id}")
-        except Exception as e:
-            self.stdout.write(f"Failed to save position: {e}")
-            logger.error("Failed to save margin position", exc_info=True)
-
-        # Step 6: Record to audit trail
-        self.stdout.write("Step 6: Record to Audit Trail")
-        try:
-            audit_service.record_margin_sell(
-                symbol=symbol,
-                quantity=quantity,
-                price=fill_price,
-                binance_order_id=str(order_id),
-                leverage=1,
-                stop_price=stop_price,
-                risk_amount=actual_risk,
-                risk_percent=risk_percent,
-                position=position,
-                raw_response=order_result,
-            )
-            self.stdout.write("Recorded: Margin Sell")
-
-            if stop_order_id:
-                audit_service.record_stop_loss_placed(
-                    symbol=symbol,
-                    quantity=quantity,
-                    stop_price=stop_price,
-                    binance_order_id=str(stop_order_id),
-                    is_margin=True,
-                    position=position,
-                    side="BUY",
-                    raw_response=stop_order_result,
-                )
-                self.stdout.write("Recorded: Stop-Loss Order")
-        except Exception as e:
-            self.stdout.write(f"Audit recording failed: {e}")
-            logger.warning("Failed to record audit trail", exc_info=True)
-
-        self.stdout.write("")
-        self.stdout.write("=" * 70)
-        self.stdout.write("POSITION OPENED SUCCESSFULLY")
-        self.stdout.write("")
-        self.stdout.write(f"Position: SHORT {quantity} {base_asset} @ ${fill_price:.2f}")
-        self.stdout.write(f"Stop-Loss: ${stop_price:.2f}")
-        self.stdout.write(
-            f"Risk: ${actual_risk.quantize(Decimal('0.01'))} ({risk_percent.quantize(Decimal('0.01'))}%)"
-        )
-        self.stdout.write("")
-        self.stdout.write("=" * 70)
+        framework = ExecutionFramework(client_id=client.id)
+        exec_result = framework.execute(intent, mode="live")
+        if exec_result.is_success():
+            intent.status = "EXECUTED"
+            intent.executed_at = timezone.now()
+            intent.save(update_fields=["status", "executed_at", "updated_at"])
+        elif exec_result.is_blocked():
+            intent.status = "FAILED"
+            intent.error_message = exec_result.error or "Execution blocked by safety guard"
+            intent.save(update_fields=["status", "error_message", "updated_at"])
+        elif exec_result.status == ExecutionStatus.FAILED:
+            intent.status = "FAILED"
+            intent.error_message = exec_result.error or "Execution failed"
+            intent.save(update_fields=["status", "error_message", "updated_at"])
+        self.stdout.write(exec_result.to_human_readable())

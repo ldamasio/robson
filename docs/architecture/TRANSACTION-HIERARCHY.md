@@ -44,6 +44,7 @@ This document establishes **crystal-clear definitions** of each abstraction leve
 │    - Multiple exits (scaling out)                                    │
 │    - Transfers between accounts                                      │
 │    - Borrowing (for margin)                                         │
+│    - Isolated margin positions (still an Operation)                  │
 │                                                                      │
 │  Database Model: api.Operation                                       │
 │  Contains: strategy_id, status, entry_orders[], exit_orders[]       │
@@ -110,6 +111,11 @@ These represent order state changes:
 | `LIMIT_ORDER_FILLED` | Limit order executed |
 | `LIMIT_ORDER_CANCELLED` | Limit order cancelled |
 
+**Important**: For Robson-monitored stops (e.g., Iron Exit Protocol),
+`STOP_LOSS_PLACED` is an **internal** movement. No stop-limit order is
+pre-placed on the exchange. The stop monitor executes a **market** exit
+when the trigger is reached and records `STOP_LOSS_TRIGGERED`.
+
 ### Category E: Risk Events
 
 | Type | Description |
@@ -173,13 +179,12 @@ These represent order state changes:
 │     Account: BTCUSDC Isolated Margin                            │
 │                                                                  │
 │  #5 STOP_LOSS_PLACED                                            │
-│     Type: STOP_LOSS_LIMIT                                       │
+│     Type: INTERNAL_MONITOR                                      │
 │     Quantity: 0.000947 BTC                                      │
 │     Trigger Price: $93,000                                      │
-│     Limit Price: $93,000                                        │
 │     Account: BTCUSDC Isolated Margin                            │
-│     Binance OrderID: 7634794756                                 │
-│     Purpose: Risk management - limit loss to 1% of capital      │
+│     Binance OrderID: (none - internal)                          │
+│     Purpose: Robson executes market close at trigger            │
 │                                                                  │
 └─────────────────────────────────────────────────────────────────┘
 ```
@@ -193,7 +198,7 @@ These represent order state changes:
 ├─────────────────────────────────────────────────────────────────┤
 │                                                                  │
 │  #6 STOP_LOSS_CANCELLED                                         │
-│     OrderID: 7634794756                                         │
+│     OrderID: (none - internal)                                  │
 │     Reason: Manual close (take profit)                          │
 │                                                                  │
 │  #7 MARGIN_SELL                                                 │
@@ -348,4 +353,3 @@ This hierarchy enables:
 2. ✅ Performance analysis (P&L per operation, per strategy)
 3. ✅ Regulatory compliance (can trace every dollar)
 4. ✅ User transparency (understand what happened and why)
-

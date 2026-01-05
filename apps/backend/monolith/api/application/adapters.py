@@ -20,22 +20,23 @@ Multi-tenant aware:
 """
 
 from __future__ import annotations
-from typing import Optional, Iterable
+
+import logging
 from datetime import datetime
 from decimal import Decimal
-import logging
+from typing import Iterable, Optional
 
+from binance.client import Client
 from django.conf import settings
 from django.utils import timezone
-from binance.client import Client
 
 from .ports import (
-    OrderRepository,
-    MarketDataPort,
-    ExchangeExecutionPort,
-    EventBusPort,
-    ClockPort,
     AccountBalancePort,
+    ClockPort,
+    EventBusPort,
+    ExchangeExecutionPort,
+    MarketDataPort,
+    OrderRepository,
 )
 
 logger = logging.getLogger(__name__)
@@ -61,7 +62,8 @@ class DjangoOrderRepository(OrderRepository):
 
     def __init__(self):
         # Lazy import to avoid circular dependencies
-        from api.models import Order as DjangoOrder, Symbol as DjangoSymbol
+        from api.models import Order as DjangoOrder
+        from api.models import Symbol as DjangoSymbol
 
         self._Order = DjangoOrder
         self._Symbol = DjangoSymbol
@@ -137,7 +139,7 @@ def _get_binance_client(use_testnet: bool = None, timeout: float = 5.0) -> Clien
         Configured Binance Client instance
     """
     if use_testnet is None:
-        use_testnet = getattr(settings, 'BINANCE_USE_TESTNET', True)
+        use_testnet = getattr(settings, "BINANCE_USE_TESTNET", True)
 
     if use_testnet:
         api_key = settings.BINANCE_API_KEY_TEST
@@ -148,7 +150,7 @@ def _get_binance_client(use_testnet: bool = None, timeout: float = 5.0) -> Clien
 
     if not api_key or not secret_key:
         mode = "testnet" if use_testnet else "production"
-        raise RuntimeError(f'Binance API credentials not configured for {mode} mode')
+        raise RuntimeError(f"Binance API credentials not configured for {mode} mode")
 
     mode_str = "TESTNET" if use_testnet else "PRODUCTION"
     logger.info(f"Creating Binance client in {mode_str} mode with timeout={timeout}s")
@@ -164,11 +166,17 @@ def _get_binance_client(use_testnet: bool = None, timeout: float = 5.0) -> Clien
 class BinanceMarketData(MarketDataPort):
     """
     Market data adapter using Binance API.
-    
+
     Respects BINANCE_USE_TESTNET setting for environment selection.
     """
 
-    def __init__(self, client: Client | None = None, use_testnet: bool = None, client_id: int | None = None, timeout: float = 5.0):
+    def __init__(
+        self,
+        client: Client | None = None,
+        use_testnet: bool = None,
+        client_id: int | None = None,
+        timeout: float = 5.0,
+    ):
         """
         Initialize market data adapter.
 
@@ -196,12 +204,7 @@ class BinanceMarketData(MarketDataPort):
         ask = ob["asks"][0][0]
         return Decimal(str(ask))
 
-    def get_klines(
-        self,
-        symbol: object,
-        interval: str = "15m",
-        limit: int = 200
-    ) -> list[dict]:
+    def get_klines(self, symbol: object, interval: str = "15m", limit: int = 200) -> list[dict]:
         """
         Get historical klines (candlestick data) from Binance.
 
@@ -228,11 +231,7 @@ class BinanceMarketData(MarketDataPort):
             ]
         """
         pair = getattr(symbol, "as_pair", lambda: str(symbol))()
-        klines = self.client.get_klines(
-            symbol=pair,
-            interval=interval,
-            limit=limit
-        )
+        klines = self.client.get_klines(symbol=pair, interval=interval, limit=limit)
         return klines
 
 
@@ -255,7 +254,7 @@ class BinanceExecution(ExchangeExecutionPort):
 
     WARNING: This places REAL orders on Binance.
     Use with caution and proper risk management.
-    
+
     Respects BINANCE_USE_TESTNET setting for environment selection.
     When BINANCE_USE_TESTNET=False, trades with REAL money!
     """
@@ -263,26 +262,28 @@ class BinanceExecution(ExchangeExecutionPort):
     def __init__(self, client: Client | None = None, use_testnet: bool = None):
         """
         Initialize execution adapter.
-        
+
         Args:
             client: Optional pre-configured Binance client
             use_testnet: Override testnet setting. If None, uses settings.BINANCE_USE_TESTNET
         """
         if use_testnet is None:
-            use_testnet = getattr(settings, 'BINANCE_USE_TESTNET', True)
-        
+            use_testnet = getattr(settings, "BINANCE_USE_TESTNET", True)
+
         self.use_testnet = use_testnet
         self.client = client or _get_binance_client(use_testnet)
-        
+
         if not use_testnet:
             logger.warning("⚠️ BinanceExecution initialized in PRODUCTION mode - REAL MONEY!")
 
     def place_limit(self, order: object) -> str:
         """Place a real limit order on Binance."""
         pair = getattr(order["symbol"], "as_pair", lambda: str(order["symbol"]))()
-        
+
         mode = "TESTNET" if self.use_testnet else "PRODUCTION"
-        logger.info(f"Placing LIMIT order on {mode}: {order['side']} {order['qty']} {pair} @ {order['price']}")
+        logger.info(
+            f"Placing LIMIT order on {mode}: {order['side']} {order['qty']} {pair} @ {order['price']}"
+        )
 
         # Place limit order via Binance API
         response = self.client.create_order(
@@ -293,53 +294,53 @@ class BinanceExecution(ExchangeExecutionPort):
             quantity=str(order["qty"]),
             price=str(order["price"]),
         )
-        
+
         order_id = str(response["orderId"])
         logger.info(f"Order placed successfully: {order_id}")
 
         # Return Binance order ID
         return order_id
-    
+
     def place_market(self, symbol: str, side: str, quantity: Decimal) -> dict:
         """
         Place a market order on Binance.
-        
+
         Args:
             symbol: Trading pair (e.g., "BTCUSDC")
             side: "BUY" or "SELL"
             quantity: Amount to trade
-            
+
         Returns:
             Full order response from Binance
         """
         mode = "TESTNET" if self.use_testnet else "PRODUCTION"
         logger.info(f"Placing MARKET order on {mode}: {side} {quantity} {symbol}")
-        
+
         response = self.client.create_order(
             symbol=symbol,
             side=side,
             type="MARKET",
             quantity=str(quantity),
         )
-        
+
         order_id = str(response["orderId"])
         logger.info(f"Market order placed successfully: {order_id}")
-        
+
         return response
-    
+
     def get_account_balance(self, asset: str = None) -> dict:
         """
         Get account balance(s).
-        
+
         Args:
             asset: Specific asset to get balance for. If None, returns all.
-            
+
         Returns:
             Balance information
         """
         account = self.client.get_account()
         balances = account.get("balances", [])
-        
+
         if asset:
             for balance in balances:
                 if balance["asset"] == asset:
@@ -349,39 +350,45 @@ class BinanceExecution(ExchangeExecutionPort):
                         "locked": Decimal(balance["locked"]),
                     }
             return {"asset": asset, "free": Decimal("0"), "locked": Decimal("0")}
-        
+
         # Return all non-zero balances
         non_zero = []
         for balance in balances:
             free = Decimal(balance["free"])
             locked = Decimal(balance["locked"])
             if free > 0 or locked > 0:
-                non_zero.append({
-                    "asset": balance["asset"],
-                    "free": free,
-                    "locked": locked,
-                })
+                non_zero.append(
+                    {
+                        "asset": balance["asset"],
+                        "free": free,
+                        "locked": locked,
+                    }
+                )
         return {"balances": non_zero}
-    
-    def place_stop_loss(self, symbol: str, side: str, quantity: Decimal, stop_price: Decimal) -> dict:
+
+    def place_stop_loss(
+        self, symbol: str, side: str, quantity: Decimal, stop_price: Decimal
+    ) -> dict:
         """
         Place a stop-loss order on Binance.
-        
+
         This places a STOP_LOSS_LIMIT order that triggers when price
         reaches the stop_price, then executes as a limit order.
-        
+
         Args:
             symbol: Trading pair (e.g., "BTCUSDC")
             side: "SELL" for long stop-loss, "BUY" for short stop-loss
             quantity: Amount to trade
             stop_price: Price at which stop triggers
-            
+
         Returns:
             Full order response from Binance
         """
         mode = "TESTNET" if self.use_testnet else "PRODUCTION"
-        logger.info(f"Placing STOP-LOSS order on {mode}: {side} {quantity} {symbol} @ stop={stop_price}")
-        
+        logger.info(
+            f"Placing STOP-LOSS order on {mode}: {side} {quantity} {symbol} @ stop={stop_price}"
+        )
+
         # For STOP_LOSS_LIMIT, we need both stopPrice and price (limit price)
         # We set the limit price slightly worse than stop to ensure execution
         if side == "SELL":
@@ -390,12 +397,12 @@ class BinanceExecution(ExchangeExecutionPort):
         else:
             # For buy stop-loss (short cover), limit price slightly above stop
             limit_price = stop_price * Decimal("1.001")
-        
+
         # Quantize to proper precision (BTCUSDC uses 2 decimal places for price)
         stop_price_str = str(stop_price.quantize(Decimal("0.01")))
         limit_price_str = str(limit_price.quantize(Decimal("0.01")))
         quantity_str = str(quantity.quantize(Decimal("0.00001")))
-        
+
         try:
             response = self.client.create_order(
                 symbol=symbol,
@@ -406,38 +413,38 @@ class BinanceExecution(ExchangeExecutionPort):
                 stopPrice=stop_price_str,
                 price=limit_price_str,
             )
-            
+
             order_id = str(response["orderId"])
             logger.info(f"Stop-loss order placed successfully: {order_id}")
-            
+
             return response
-            
+
         except Exception as e:
             logger.error(f"Failed to place stop-loss order: {e}")
             raise
-    
+
     def cancel_order(self, symbol: str, order_id: str) -> dict:
         """
         Cancel an open order.
-        
+
         Args:
             symbol: Trading pair
             order_id: Order ID to cancel
-            
+
         Returns:
             Cancellation response from Binance
         """
         mode = "TESTNET" if self.use_testnet else "PRODUCTION"
         logger.info(f"Cancelling order on {mode}: {order_id} for {symbol}")
-        
+
         response = self.client.cancel_order(
             symbol=symbol,
             orderId=int(order_id),
         )
-        
+
         logger.info(f"Order cancelled: {order_id}")
         return response
-    
+
     def get_open_orders(self, symbol: str = None) -> list:
         """
         Get open orders.
@@ -467,7 +474,9 @@ class BinanceAccountBalanceAdapter(AccountBalancePort):
     - Does NOT use signal.alarm or threads
     """
 
-    def __init__(self, client: Client | None = None, use_testnet: bool = None, timeout: float = 5.0):
+    def __init__(
+        self, client: Client | None = None, use_testnet: bool = None, timeout: float = 5.0
+    ):
         """
         Initialize the balance adapter.
 
@@ -478,7 +487,11 @@ class BinanceAccountBalanceAdapter(AccountBalancePort):
         """
         self.client = client or _get_binance_client(use_testnet, timeout)
         self.timeout = timeout
-        self.use_testnet = use_testnet if use_testnet is not None else getattr(settings, 'BINANCE_USE_TESTNET', True)
+        self.use_testnet = (
+            use_testnet
+            if use_testnet is not None
+            else getattr(settings, "BINANCE_USE_TESTNET", True)
+        )
 
         logger.info(
             f"BinanceAccountBalanceAdapter initialized: "
@@ -488,7 +501,9 @@ class BinanceAccountBalanceAdapter(AccountBalancePort):
     def get_available_quote_balance(
         self,
         client_id: int,
-        quote_asset: str
+        quote_asset: str,
+        account_type: str = "spot",
+        symbol: str | None = None,
     ) -> Decimal:
         """
         Get the available (free) balance for a quote asset from Binance.
@@ -496,6 +511,8 @@ class BinanceAccountBalanceAdapter(AccountBalancePort):
         Args:
             client_id: Client ID for multi-tenant balance retrieval (logged, not used for API call)
             quote_asset: Quote asset symbol (e.g., "USDT", "BUSD")
+            account_type: "spot" or "isolated_margin"
+            symbol: Required for isolated margin (e.g., "BTCUSDC")
 
         Returns:
             Available (free) balance as Decimal
@@ -508,15 +525,49 @@ class BinanceAccountBalanceAdapter(AccountBalancePort):
         mode = "TESTNET" if self.use_testnet else "PRODUCTION"
         logger.info(
             f"Fetching {quote_asset} balance for client {client_id} from {mode} "
-            f"(timeout={self.timeout}s)"
+            f"(timeout={self.timeout}s, account_type={account_type})"
         )
 
         try:
-            # Get account information from Binance
-            # Timeout is handled at HTTP client level (configured in _get_binance_client)
-            account = self.client.get_account()
+            if account_type == "isolated_margin":
+                if not symbol:
+                    logger.warning("Isolated margin balance requested without symbol; returning 0.")
+                    return Decimal("0")
 
-            # Find the requested asset balance
+                account = self.client.get_isolated_margin_account(symbols=symbol)
+                assets = account.get("assets", [])
+                if not assets:
+                    logger.warning(f"No isolated margin account found for {symbol}; returning 0.")
+                    return Decimal("0")
+
+                base_info = assets[0].get("baseAsset", {})
+                quote_info = assets[0].get("quoteAsset", {})
+
+                base_net = Decimal(str(base_info.get("netAsset", "0")))
+                quote_net = Decimal(str(quote_info.get("netAsset", "0")))
+
+                if quote_asset != quote_info.get("asset", quote_asset):
+                    logger.warning(
+                        f"Quote asset mismatch for {symbol}: "
+                        f"requested {quote_asset}, account has {quote_info.get('asset')}"
+                    )
+
+                price = BinanceMarketData().best_bid(symbol)
+                equity = quote_net + (base_net * price)
+
+                if equity < 0:
+                    logger.warning(
+                        f"Isolated margin equity negative for {symbol}: {equity}. Returning 0."
+                    )
+                    return Decimal("0")
+
+                logger.info(
+                    f"Retrieved isolated margin equity for {symbol}: {equity} {quote_asset}"
+                )
+                return equity
+
+            # Default: SPOT balance
+            account = self.client.get_account()
             balances = account.get("balances", [])
             for balance in balances:
                 if balance["asset"] == quote_asset:
@@ -527,7 +578,6 @@ class BinanceAccountBalanceAdapter(AccountBalancePort):
                     )
                     return free_balance
 
-            # Asset not found in balances - return zero
             logger.warning(
                 f"Asset {quote_asset} not found in balances for client {client_id}, "
                 f"returning 0 (mode={mode})"
@@ -539,9 +589,7 @@ class BinanceAccountBalanceAdapter(AccountBalancePort):
             error_msg = str(e).lower()
 
             if "timeout" in error_msg or "timed out" in error_msg:
-                logger.error(
-                    f"Timeout fetching {quote_asset} balance for client {client_id}: {e}"
-                )
+                logger.error(f"Timeout fetching {quote_asset} balance for client {client_id}: {e}")
                 raise TimeoutError(
                     f"Binance API timeout while fetching {quote_asset} balance"
                 ) from e
@@ -549,13 +597,9 @@ class BinanceAccountBalanceAdapter(AccountBalancePort):
                 logger.error(
                     f"Connection error fetching {quote_asset} balance for client {client_id}: {e}"
                 )
-                raise ConnectionError(
-                    f"Cannot connect to Binance API for balance fetch"
-                ) from e
+                raise ConnectionError(f"Cannot connect to Binance API for balance fetch") from e
             else:
-                logger.error(
-                    f"Error fetching {quote_asset} balance for client {client_id}: {e}"
-                )
+                logger.error(f"Error fetching {quote_asset} balance for client {client_id}: {e}")
                 raise  # Re-raise original exception for use case to handle
 
 
@@ -650,6 +694,7 @@ class DjangoSymbolRepository:
 
     def __init__(self):
         from api.models import Symbol as DjangoSymbol
+
         self._Symbol = DjangoSymbol
 
     def get_by_id(self, symbol_id: int, client_id: int) -> object:
@@ -669,6 +714,7 @@ class DjangoStrategyRepository:
 
     def __init__(self):
         from api.models import Strategy as DjangoStrategy
+
         self._Strategy = DjangoStrategy
 
     def get_by_id(self, strategy_id: int, client_id: int) -> object:
@@ -676,7 +722,11 @@ class DjangoStrategyRepository:
         try:
             return self._Strategy.objects.get(id=strategy_id, client_id=client_id)
         except self._Strategy.DoesNotExist:
-            raise ValueError(f"Strategy with id={strategy_id} not found for client {client_id}")
+            # Fallback to global strategy templates (client is null)
+            try:
+                return self._Strategy.objects.get(id=strategy_id, client__isnull=True)
+            except self._Strategy.DoesNotExist:
+                raise ValueError(f"Strategy with id={strategy_id} not found for client {client_id}")
 
 
 class DjangoTradingIntentRepository:
@@ -689,6 +739,7 @@ class DjangoTradingIntentRepository:
 
     def __init__(self):
         from api.models import TradingIntent as DjangoTradingIntent
+
         self._TradingIntent = DjangoTradingIntent
 
     def save(self, intent: dict) -> object:
@@ -733,11 +784,13 @@ class DjangoTradingIntentRepository:
             ValueError: If intent not found
         """
         try:
-            return self._TradingIntent.objects.select_related(
-                "symbol", "strategy", "order"
-            ).get(intent_id=intent_id, client_id=client_id)
+            return self._TradingIntent.objects.select_related("symbol", "strategy", "order").get(
+                intent_id=intent_id, client_id=client_id
+            )
         except self._TradingIntent.DoesNotExist:
-            raise ValueError(f"TradingIntent with intent_id={intent_id} not found for client {client_id}")
+            raise ValueError(
+                f"TradingIntent with intent_id={intent_id} not found for client {client_id}"
+            )
 
     def list_by_client(
         self,
@@ -746,7 +799,7 @@ class DjangoTradingIntentRepository:
         strategy_id: Optional[int] = None,
         symbol_id: Optional[int] = None,
         limit: int = 100,
-        offset: int = 0
+        offset: int = 0,
     ) -> Iterable[object]:
         """
         List trading intents for a client with optional filters.
@@ -773,6 +826,6 @@ class DjangoTradingIntentRepository:
 
         queryset = queryset.select_related("symbol", "strategy", "order")
         queryset = queryset.order_by("-created_at")
-        queryset = queryset[offset:offset + limit]
+        queryset = queryset[offset : offset + limit]
 
         return list(queryset)

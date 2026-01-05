@@ -176,6 +176,12 @@ docs/
 | **SonarLint (IDE)** | [quality/sonarlint.md](quality/sonarlint.md) |
 | **SonarQube (CI)** | [sonar-project.properties](../sonar-project.properties) |
 
+### Strategies
+
+| Topic | Document |
+|-------|----------|
+| **Iron Exit Protocol** | [strategy/IRON_EXIT_PROTOCOL.md](strategy/IRON_EXIT_PROTOCOL.md) |
+
 ### Operations
 
 | Topic | Document |

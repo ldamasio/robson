@@ -92,6 +92,16 @@ margin_adapters.py (driven)
     └── imports: django.conf.settings
 ```
 
+### 2.3 Stop Execution Model (Robson Monitor)
+
+For Iron Exit Protocol and other Robson-monitored strategies:
+
+- The stop price is stored on the **Operation** (Level 2).
+- No STOP_LOSS_LIMIT order is pre-placed on Binance.
+- The stop monitor evaluates price and executes a **market** close when triggered.
+- `STOP_LOSS_PLACED` is an internal movement (no exchange order id).
+- Slippage is acceptable; missed exits are not.
+
 ---
 
 ## 3. Domain Model
@@ -99,6 +109,9 @@ margin_adapters.py (driven)
 ### 3.1 MarginPosition Entity
 
 **Location**: `apps/backend/core/domain/margin.py`
+
+**Architecture note**: In the monolith database, each isolated margin
+position is linked to a single **Operation (Level 2)** for full traceability.
 
 ```python
 """
@@ -1168,4 +1181,3 @@ def test_get_margin_account(mock_binance_client):
 
 **Last Updated**: 2024-12-23  
 **Version**: 1.0 (Draft)
-
