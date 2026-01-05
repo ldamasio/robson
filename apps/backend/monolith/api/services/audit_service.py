@@ -9,16 +9,16 @@ This service ensures complete transparency by:
 
 import logging
 import uuid
+from datetime import datetime, timedelta
 from decimal import Decimal
 from typing import Optional
-from datetime import datetime, timedelta
 
+from clients.models import Client
 from django.db import transaction
 from django.utils import timezone
 
-from api.models.audit import AuditTransaction, BalanceSnapshot, TransactionType, TransactionStatus
 from api.application.adapters import BinanceExecution
-from clients.models import Client
+from api.models.audit import AuditTransaction, BalanceSnapshot, TransactionStatus, TransactionType
 
 logger = logging.getLogger(__name__)
 
@@ -26,14 +26,14 @@ logger = logging.getLogger(__name__)
 class AuditService:
     """
     Service for recording and managing audit transactions.
-    
+
     Every operation goes through this service to ensure complete auditability.
     """
-    
+
     def __init__(self, client: Client, execution: Optional[BinanceExecution] = None):
         self.client = client
         self.execution = execution or BinanceExecution()
-    
+
     def record_spot_buy(
         self,
         symbol: str,
@@ -64,7 +64,7 @@ class AuditService:
             raw_response=raw_response,
             description=f"Spot buy {quantity} {symbol[:-4]} @ ${price}",
         )
-    
+
     def record_spot_sell(
         self,
         symbol: str,
@@ -89,7 +89,7 @@ class AuditService:
             raw_response=raw_response,
             description=f"Spot sell {quantity} {symbol[:-4]} @ ${price}",
         )
-    
+
     def record_margin_buy(
         self,
         symbol: str,
@@ -121,7 +121,39 @@ class AuditService:
             raw_response=raw_response,
             description=f"Margin buy {quantity} {symbol[:-4]} @ ${price} ({leverage}x leverage)",
         )
-    
+
+    def record_margin_sell(
+        self,
+        symbol: str,
+        quantity: Decimal,
+        price: Decimal,
+        binance_order_id: str,
+        leverage: int = 1,
+        stop_price: Optional[Decimal] = None,
+        risk_amount: Optional[Decimal] = None,
+        risk_percent: Optional[Decimal] = None,
+        position=None,
+        raw_response: Optional[dict] = None,
+    ) -> AuditTransaction:
+        """Record a margin sell order."""
+        return self._create_transaction(
+            transaction_type=TransactionType.MARGIN_SELL,
+            symbol=symbol,
+            asset=symbol[:-4],
+            quantity=quantity,
+            price=price,
+            side="SELL",
+            binance_order_id=binance_order_id,
+            leverage=leverage,
+            is_isolated_margin=True,
+            stop_price=stop_price,
+            risk_amount=risk_amount,
+            risk_percent=risk_percent,
+            related_position=position,
+            raw_response=raw_response,
+            description=f"Margin sell {quantity} {symbol[:-4]} @ ${price} ({leverage}x leverage)",
+        )
+
     def record_margin_borrow(
         self,
         symbol: str,
@@ -142,7 +174,7 @@ class AuditService:
             raw_response=raw_response,
             description=f"Borrowed {amount} {asset} for isolated margin",
         )
-    
+
     def record_transfer_to_margin(
         self,
         symbol: str,
@@ -163,7 +195,7 @@ class AuditService:
             raw_response=raw_response,
             description=f"Transfer {amount} {asset} from Spot to Isolated Margin ({symbol})",
         )
-    
+
     def record_transfer_from_margin(
         self,
         symbol: str,
@@ -184,7 +216,7 @@ class AuditService:
             raw_response=raw_response,
             description=f"Transfer {amount} {asset} from Isolated Margin ({symbol}) to Spot",
         )
-    
+
     def record_stop_loss_placed(
         self,
         symbol: str,
@@ -194,8 +226,14 @@ class AuditService:
         is_margin: bool = False,
         position=None,
         raw_response: Optional[dict] = None,
+        side: str = "SELL",
     ) -> AuditTransaction:
         """Record a stop-loss order placement."""
+        direction = "drops" if side == "SELL" else "rises"
+        description = (
+            f"Stop-loss placed: {side} {quantity} {symbol[:-4]} "
+            f"if price {direction} to ${stop_price}"
+        )
         return self._create_transaction(
             transaction_type=TransactionType.STOP_LOSS_PLACED,
             symbol=symbol,
@@ -203,14 +241,14 @@ class AuditService:
             quantity=quantity,
             price=stop_price,
             stop_price=stop_price,
-            side="SELL",
+            side=side,
             binance_order_id=binance_order_id,
             is_isolated_margin=is_margin,
             related_position=position,
             raw_response=raw_response,
-            description=f"Stop-loss placed: Sell {quantity} {symbol[:-4]} if price drops to ${stop_price}",
+            description=description,
         )
-    
+
     def _create_transaction(
         self,
         transaction_type: str,
@@ -232,11 +270,11 @@ class AuditService:
         raw_response: Optional[dict] = None,
     ) -> AuditTransaction:
         """Create an audit transaction."""
-        
+
         total_value = None
         if price and quantity:
             total_value = price * quantity
-        
+
         with transaction.atomic():
             audit_tx = AuditTransaction.objects.create(
                 transaction_id=str(uuid.uuid4()),
@@ -263,57 +301,57 @@ class AuditService:
                 executed_at=timezone.now(),
                 source="robson",
             )
-            
+
             logger.info(f"Recorded audit transaction: {audit_tx}")
             return audit_tx
-    
+
     def sync_from_binance(self, days_back: int = 7) -> int:
         """
         Sync transactions from Binance that might have been missed.
-        
+
         Returns the number of new transactions synced.
         """
         count = 0
-        
+
         # Sync spot trades
         count += self._sync_spot_trades(days_back)
-        
+
         # Sync margin trades
         count += self._sync_margin_trades(days_back)
-        
+
         # Sync transfers
         count += self._sync_transfers(days_back)
-        
+
         logger.info(f"Synced {count} transactions from Binance")
         return count
-    
+
     def _sync_spot_trades(self, days_back: int) -> int:
         """Sync spot trades from Binance."""
         count = 0
-        
+
         try:
             # Get recent trades from Binance
             trades = self.execution.client.get_my_trades(
                 symbol="BTCUSDC",
                 limit=100,
             )
-            
+
             for trade in trades:
-                order_id = str(trade.get('orderId', ''))
-                
+                order_id = str(trade.get("orderId", ""))
+
                 # Skip if already recorded
                 if AuditTransaction.objects.filter(binance_order_id=order_id).exists():
                     continue
-                
+
                 # Record the trade
-                qty = Decimal(str(trade.get('qty', '0')))
-                price = Decimal(str(trade.get('price', '0')))
-                is_buyer = trade.get('isBuyer', False)
-                commission = Decimal(str(trade.get('commission', '0')))
-                commission_asset = trade.get('commissionAsset', 'USDC')
-                
+                qty = Decimal(str(trade.get("qty", "0")))
+                price = Decimal(str(trade.get("price", "0")))
+                is_buyer = trade.get("isBuyer", False)
+                commission = Decimal(str(trade.get("commission", "0")))
+                commission_asset = trade.get("commissionAsset", "USDC")
+
                 tx_type = TransactionType.SPOT_BUY if is_buyer else TransactionType.SPOT_SELL
-                
+
                 AuditTransaction.objects.create(
                     transaction_id=str(uuid.uuid4()),
                     binance_order_id=order_id,
@@ -334,36 +372,36 @@ class AuditService:
                     source="binance_sync",
                 )
                 count += 1
-                
+
         except Exception as e:
             logger.error(f"Failed to sync spot trades: {e}")
-        
+
         return count
-    
+
     def _sync_margin_trades(self, days_back: int) -> int:
         """Sync margin trades from Binance."""
         count = 0
-        
+
         try:
             # Get margin trades
             trades = self.execution.client.get_margin_trades(
                 symbol="BTCUSDC",
                 isIsolated="TRUE",
             )
-            
+
             for trade in trades:
-                order_id = str(trade.get('orderId', ''))
-                
+                order_id = str(trade.get("orderId", ""))
+
                 if AuditTransaction.objects.filter(binance_order_id=order_id).exists():
                     continue
-                
-                qty = Decimal(str(trade.get('qty', '0')))
-                price = Decimal(str(trade.get('price', '0')))
-                is_buyer = trade.get('isBuyer', False)
-                commission = Decimal(str(trade.get('commission', '0')))
-                
+
+                qty = Decimal(str(trade.get("qty", "0")))
+                price = Decimal(str(trade.get("price", "0")))
+                is_buyer = trade.get("isBuyer", False)
+                commission = Decimal(str(trade.get("commission", "0")))
+
                 tx_type = TransactionType.MARGIN_BUY if is_buyer else TransactionType.MARGIN_SELL
-                
+
                 AuditTransaction.objects.create(
                     transaction_id=str(uuid.uuid4()),
                     binance_order_id=order_id,
@@ -384,12 +422,12 @@ class AuditService:
                     source="binance_sync",
                 )
                 count += 1
-                
+
         except Exception as e:
             logger.error(f"Failed to sync margin trades: {e}")
-        
+
         return count
-    
+
     def _sync_transfers(self, days_back: int) -> int:
         """Sync transfers from Binance."""
         count = 0
@@ -456,20 +494,19 @@ class AuditService:
 
             for deposit in deposits:
                 # Check if already recorded
-                tx_id = str(deposit.get('txId', ''))
+                tx_id = str(deposit.get("txId", ""))
                 if not tx_id:
                     continue
 
                 if AuditTransaction.objects.filter(
-                    binance_order_id=tx_id,
-                    transaction_type=TransactionType.DEPOSIT
+                    binance_order_id=tx_id, transaction_type=TransactionType.DEPOSIT
                 ).exists():
                     continue
 
                 # Extract details
-                asset = deposit.get('asset', '')
-                amount = Decimal(str(deposit.get('amount', '0')))
-                status = deposit.get('status', 0)
+                asset = deposit.get("asset", "")
+                amount = Decimal(str(deposit.get("amount", "0")))
+                status = deposit.get("status", 0)
 
                 # Only insert successful deposits
                 # Status codes: 0=Email Sent, 1=Cancelled, 2=Awaiting Approval, 3=Rejected, 4=Processing, 5=Failure, 6=Completed, 7=Pending
@@ -532,20 +569,19 @@ class AuditService:
 
             for withdrawal in withdrawals:
                 # Check if already recorded
-                tx_id = str(withdrawal.get('id', ''))
+                tx_id = str(withdrawal.get("id", ""))
                 if not tx_id:
                     continue
 
                 if AuditTransaction.objects.filter(
-                    binance_order_id=tx_id,
-                    transaction_type=TransactionType.WITHDRAWAL
+                    binance_order_id=tx_id, transaction_type=TransactionType.WITHDRAWAL
                 ).exists():
                     continue
 
                 # Extract details
-                asset = withdrawal.get('asset', '')
-                amount = Decimal(str(withdrawal.get('amount', '0')))
-                status = withdrawal.get('status', 0)
+                asset = withdrawal.get("asset", "")
+                amount = Decimal(str(withdrawal.get("amount", "0")))
+                status = withdrawal.get("status", 0)
 
                 # Only insert completed withdrawals (status=6)
                 # Status codes: 0=Email Sent, 1=Cancelled, 2=Awaiting Approval, 3=Rejected, 4=Processing, 5=Failure, 6=Completed
@@ -580,40 +616,40 @@ class AuditService:
 
     def take_balance_snapshot(self) -> BalanceSnapshot:
         """Take a snapshot of current balances."""
-        
+
         # Get spot balances
-        spot_usdc = self.execution.get_account_balance('USDC')
-        spot_btc = self.execution.get_account_balance('BTC')
-        
-        spot_usdc_free = Decimal(spot_usdc.get('free', '0'))
-        spot_btc_free = Decimal(spot_btc.get('free', '0'))
-        
+        spot_usdc = self.execution.get_account_balance("USDC")
+        spot_btc = self.execution.get_account_balance("BTC")
+
+        spot_usdc_free = Decimal(spot_usdc.get("free", "0"))
+        spot_btc_free = Decimal(spot_btc.get("free", "0"))
+
         # Get margin balances
-        margin_info = self.execution.client.get_isolated_margin_account(symbols='BTCUSDC')
-        assets = margin_info.get('assets', [])
-        
-        margin_btc_free = Decimal('0')
-        margin_btc_borrowed = Decimal('0')
-        margin_usdc_free = Decimal('0')
-        margin_usdc_borrowed = Decimal('0')
+        margin_info = self.execution.client.get_isolated_margin_account(symbols="BTCUSDC")
+        assets = margin_info.get("assets", [])
+
+        margin_btc_free = Decimal("0")
+        margin_btc_borrowed = Decimal("0")
+        margin_usdc_free = Decimal("0")
+        margin_usdc_borrowed = Decimal("0")
         margin_level = None
-        btc_price = Decimal('0')
-        
+        btc_price = Decimal("0")
+
         if assets:
-            base = assets[0].get('baseAsset', {})
-            quote = assets[0].get('quoteAsset', {})
-            margin_btc_free = Decimal(base.get('free', '0'))
-            margin_btc_borrowed = Decimal(base.get('borrowed', '0'))
-            margin_usdc_free = Decimal(quote.get('free', '0'))
-            margin_usdc_borrowed = Decimal(quote.get('borrowed', '0'))
-            margin_level = Decimal(assets[0].get('marginLevel', '0'))
-            btc_price = Decimal(assets[0].get('indexPrice', '0'))
-        
+            base = assets[0].get("baseAsset", {})
+            quote = assets[0].get("quoteAsset", {})
+            margin_btc_free = Decimal(base.get("free", "0"))
+            margin_btc_borrowed = Decimal(base.get("borrowed", "0"))
+            margin_usdc_free = Decimal(quote.get("free", "0"))
+            margin_usdc_borrowed = Decimal(quote.get("borrowed", "0"))
+            margin_level = Decimal(assets[0].get("marginLevel", "0"))
+            btc_price = Decimal(assets[0].get("indexPrice", "0"))
+
         # Calculate total equity
         total_btc = spot_btc_free + margin_btc_free
         total_btc_value = total_btc * btc_price
         total_equity = spot_usdc_free + margin_usdc_free + total_btc_value - margin_usdc_borrowed
-        
+
         snapshot = BalanceSnapshot.objects.create(
             client=self.client,
             snapshot_time=timezone.now(),
@@ -627,7 +663,6 @@ class AuditService:
             total_equity=total_equity,
             margin_level=margin_level,
         )
-        
+
         logger.info(f"Balance snapshot taken: ${total_equity}")
         return snapshot
-
