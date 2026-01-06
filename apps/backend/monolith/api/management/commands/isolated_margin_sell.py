@@ -199,6 +199,12 @@ class Command(BaseCommand):
                 self.stdout.write(f"Warning: {warning}")
         self.stdout.write("")
 
+        self.stdout.write("--- Stop Execution ---")
+        self.stdout.write("Stop Execution: INTERNAL (robson_market)")
+        self.stdout.write("Exchange stop order: NOT PLACED")
+        self.stdout.write("Stop monitor will execute a market BUY when stop is hit.")
+        self.stdout.write("")
+
         if not stop_result.is_valid():
             self.stdout.write("INVALID: Stop price is on wrong side of entry!")
             return
