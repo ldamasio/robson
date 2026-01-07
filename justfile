@@ -138,14 +138,14 @@ db-shell:
     docker compose -f apps/backend/monolith/docker-compose.dev.yml exec postgres psql -U robson -d robson_dev
 
 # Destroy database and volumes (REQUIRES CONFIRMATION)
-[confirm("⚠️  This will DELETE all local database data. Continue?")]
+[confirm]
 db-destroy:
     @echo "🗑️  Destroying database..."
     docker compose -f apps/backend/monolith/docker-compose.dev.yml down -v
     @echo "✅ Database destroyed"
 
 # Reset database: destroy + recreate + migrate (REQUIRES CONFIRMATION)
-[confirm("⚠️  This will RESET the database and REMOVE migrations. Continue?")]
+[confirm]
 db-reset: db-destroy db-up
     @echo "⏳ Waiting for Postgres to be ready..."
     @sleep 3
@@ -240,6 +240,14 @@ k9s-preview BRANCH:
 # Sync Binance API docs (delegates to Make)
 docs-sync-binance:
     make sync-binance-docs
+
+# ============================================================================
+# Worktrees & Sessions
+# ============================================================================
+
+# Create a git worktree and tmux session (claude|codex|shell)
+wt-new AGENT NAME BRANCH:
+    ./devtools/robson-wt-new.sh "{{AGENT}}" "{{NAME}}" "{{BRANCH}}"
 
 # ============================================================================
 # Domain Actions (Thin wrappers - prefer using `robson` directly)

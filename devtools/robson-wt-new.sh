@@ -1,69 +1,71 @@
 #!/usr/bin/env bash
-# robson-wt-new.sh
-# Create a git worktree for Robson and open a dedicated tmux session (Claude/Codex/Shell).
+# devtools/robson-wt.sh
 #
-# Usage examples:
-#   ./robson-wt-new.sh claude strategy "feat/strategy-refactor"
-#   ./robson-wt-new.sh codex backend  "feat/backend-adjust"
-#   ./robson-wt-new.sh shell infra   "infra/k8s-tasks"
+# Robson worktree + tmux session bootstrapper.
+# Opinionated layout:
+#   - 1 tmux session per worktree
+#   - window "agents" with 4 panes:
+#       [0] Claude (Anthropic)
+#       [1] Claude (GLM)
+#       [2] Codex
+#       [3] Shell
 #
-# Optional env vars:
+# Usage:
+#   ./devtools/robson-wt.sh <name> <branch>
+#
+# Examples:
+#   ./devtools/robson-wt.sh fix-operations "fix/fix-operations"
+#   ./devtools/robson-wt.sh fix-stop-loss  "fix/fix-stop-loss"
+#
+# Optional env vars (Robson-focused now, but generalizable later):
 #   ROBSON_TRUNK=~/apps/robson
 #   ROBSON_WT_PARENT=~/apps
-#   ROBSON_AGENT_CMD_CLAUDE="claude ."
-#   ROBSON_AGENT_CMD_CODEX="codex"   # adjust if your command differs
+#   ROBSON_SESSION_PREFIX="robson"
+#   ROBSON_WT_PREFIX="robson-wt"
+#
+# Agent commands (customize as needed):
+#   ROBSON_CLAUDE_CMD_ANTHROPIC='claude .'
+#   ROBSON_CLAUDE_CMD_GLM='claude .'
+#   ROBSON_CODEX_CMD='codex'
+#
+# Notes:
+# - This script creates/reuses a worktree at:  $ROBSON_WT_PARENT/$ROBSON_WT_PREFIX-<name>
+# - It creates a tmux session named:          $ROBSON_SESSION_PREFIX-<name>
+# - If the session already exists, it attaches and exits.
 
 set -euo pipefail
 
-AGENT="${1:-}"
-NAME="${2:-}"
-BRANCH="${3:-}"
+NAME="${1:-}"
+BRANCH="${2:-}"
 
-if [[ -z "${AGENT}" || -z "${NAME}" || -z "${BRANCH}" ]]; then
-  echo "Usage: $0 <claude|codex|shell> <name> <branch>"
+if [[ -z "${NAME}" || -z "${BRANCH}" ]]; then
+  echo "Usage: $0 <name> <branch>"
   exit 1
 fi
 
-case "${AGENT}" in
-  claude|codex|shell) ;;
-  *)
-    echo "Invalid agent: ${AGENT} (use: claude | codex | shell)"
-    exit 1
-    ;;
-esac
+# Normalize name -> safe slug
+SAFE_NAME="$(echo "${NAME}" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9._-')"
+if [[ -z "${SAFE_NAME}" ]]; then
+  echo "Invalid name after normalization: '${NAME}'"
+  exit 1
+fi
 
 TRUNK="${ROBSON_TRUNK:-$HOME/apps/robson}"
 WT_PARENT="${ROBSON_WT_PARENT:-$HOME/apps}"
+SESSION_PREFIX="${ROBSON_SESSION_PREFIX:-robson}"
+WT_PREFIX="${ROBSON_WT_PREFIX:-robson-wt}"
+
+SESSION="${SESSION_PREFIX}-${SAFE_NAME}"
+WT_DIR="${WT_PARENT}/${WT_PREFIX}-${SAFE_NAME}"
+
+CLAUDE_ANTHROPIC_CMD="${ROBSON_CLAUDE_CMD_ANTHROPIC:-claude .}"
+CLAUDE_GLM_CMD="${ROBSON_CLAUDE_CMD_GLM:-claude .}"
+CODEX_CMD="${ROBSON_CODEX_CMD:-codex}"
 
 if [[ ! -d "${TRUNK}/.git" ]]; then
   echo "TRUNK does not look like a git repo: ${TRUNK}"
   exit 1
 fi
-
-# Ensure trunk is on disk and usable
-cd "${TRUNK}"
-
-# If you want to enforce clean trunk, uncomment:
-# if [[ -n "$(git status --porcelain)" ]]; then
-#   echo "Trunk has uncommitted changes. Commit/stash first: ${TRUNK}"
-#   exit 1
-# fi
-
-# Normalize names
-SAFE_NAME="$(echo "${NAME}" | tr '[:upper:] ' '[:lower:]-' | tr -cd 'a-z0-9._-')"
-SESSION="${AGENT}-${SAFE_NAME}"
-WT_DIR="${WT_PARENT}/robson-wt-${SAFE_NAME}"
-
-# Pick agent command
-CMD_CLAUDE="${ROBSON_AGENT_CMD_CLAUDE:-claude .}"
-CMD_CODEX="${ROBSON_AGENT_CMD_CODEX:-codex}"
-
-AGENT_CMD=""
-case "${AGENT}" in
-  claude) AGENT_CMD="${CMD_CLAUDE}" ;;
-  codex)  AGENT_CMD="${CMD_CODEX}"  ;;
-  shell)  AGENT_CMD=""              ;;
-esac
 
 # If tmux session exists, just attach
 if tmux has-session -t "${SESSION}" 2>/dev/null; then
@@ -71,7 +73,10 @@ if tmux has-session -t "${SESSION}" 2>/dev/null; then
   exec tmux attach -t "${SESSION}"
 fi
 
-# Create worktree (or reuse if exists)
+# Ensure trunk is on disk and usable
+cd "${TRUNK}"
+
+# Create or reuse worktree
 if [[ -d "${WT_DIR}" ]]; then
   if [[ ! -d "${WT_DIR}/.git" && ! -f "${WT_DIR}/.git" ]]; then
     echo "Worktree dir exists but is not a git worktree: ${WT_DIR}"
@@ -80,7 +85,7 @@ if [[ -d "${WT_DIR}" ]]; then
   echo "Reusing existing worktree: ${WT_DIR}"
 else
   echo "Creating worktree: ${WT_DIR} (branch: ${BRANCH})"
-  # If branch already exists locally/remotely, create worktree without -b
+  # If branch exists locally, create worktree without -b; else create new branch.
   if git show-ref --verify --quiet "refs/heads/${BRANCH}"; then
     git worktree add "${WT_DIR}" "${BRANCH}"
   else
@@ -88,28 +93,44 @@ else
   fi
 fi
 
-# Start tmux session in the worktree
 echo "Starting tmux session: ${SESSION} (cwd: ${WT_DIR})"
-tmux new-session -d -s "${SESSION}" -c "${WT_DIR}"
 
-# Split into two panes: left agent, right shell
-tmux split-window -h -t "${SESSION}" -c "${WT_DIR}"
+# Create session detached in WT_DIR
+tmux new-session -d -s "${SESSION}" -c "${WT_DIR}" -n "agents"
 
-# Left pane = agent (if any)
-if [[ -n "${AGENT_CMD}" ]]; then
-  tmux select-pane -t "${SESSION}:.0"
-  tmux send-keys -t "${SESSION}:.0" "${AGENT_CMD}" C-m
+# Pane 0 (default) -> Claude Anthropic
+tmux send-keys -t "${SESSION}:agents.0" "cd \"${WT_DIR}\"" C-m
+tmux send-keys -t "${SESSION}:agents.0" "${CLAUDE_ANTHROPIC_CMD}" C-m
+
+# Split right -> Pane 1 (Claude GLM)
+tmux split-window -h -t "${SESSION}:agents" -c "${WT_DIR}"
+tmux send-keys -t "${SESSION}:agents.1" "cd \"${WT_DIR}\"" C-m
+tmux send-keys -t "${SESSION}:agents.1" "${CLAUDE_GLM_CMD}" C-m
+
+# Split bottom-left -> Pane 2 (Codex)
+tmux split-window -v -t "${SESSION}:agents.0" -c "${WT_DIR}"
+tmux send-keys -t "${SESSION}:agents.2" "cd \"${WT_DIR}\"" C-m
+tmux send-keys -t "${SESSION}:agents.2" "${CODEX_CMD}" C-m
+
+# Split bottom-right -> Pane 3 (Shell)
+tmux split-window -v -t "${SESSION}:agents.1" -c "${WT_DIR}"
+tmux send-keys -t "${SESSION}:agents.3" "cd \"${WT_DIR}\"" C-m
+
+# Make it readable
+tmux select-layout -t "${SESSION}:agents" tiled
+
+# Optional: add a second window for running tests/logs (comment out if you don't want it)
+tmux new-window -t "${SESSION}" -n "run" -c "${WT_DIR}"
+tmux send-keys -t "${SESSION}:run.0" "cd \"${WT_DIR}\"" C-m
+
+# Focus agents window
+tmux select-window -t "${SESSION}:agents"
+tmux select-pane -t "${SESSION}:agents.3"
+
+if [[ -n "${TMUX:-}" ]]; then
+  echo "ℹ️  Already inside tmux → switching client to session: ${SESSION}"
+  exec tmux switch-client -t "${SESSION}"
 else
-  tmux select-pane -t "${SESSION}:.0"
-  tmux send-keys -t "${SESSION}:.0" "cd \"${WT_DIR}\"" C-m
+  exec tmux attach -t "${SESSION}"
 fi
 
-# Right pane = shell in repo (useful for git/tests/rg)
-tmux select-pane -t "${SESSION}:.1"
-tmux send-keys -t "${SESSION}:.1" "cd \"${WT_DIR}\"" C-m
-
-# Nice window name
-tmux rename-window -t "${SESSION}:0" "${SAFE_NAME}"
-
-# Attach
-exec tmux attach -t "${SESSION}"

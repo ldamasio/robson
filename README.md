@@ -137,6 +137,9 @@ just test
 just dev-backend    # Terminal 1
 just dev-frontend   # Terminal 2
 
+# Create a worktree + tmux session (claude|codex|shell)
+just wt-new codex backend feat/backend-adjust
+
 # Environment info
 just info
 ```
@@ -166,6 +169,7 @@ make sync-binance-docs
 | **Run tests** | `just test` |
 | **Database setup** | `just db-up && just db-migrate` |
 | **Start dev server** | `just dev-backend` |
+| **Create worktree + tmux session** | `just wt-new <agent> <name> <branch>` |
 | **Reset database** | `just db-reset` |
 | **Environment check** | `just info` |
 

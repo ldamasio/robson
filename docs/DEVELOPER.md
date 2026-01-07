@@ -22,6 +22,25 @@ Prerequisites
 - Docker + Docker Compose
 - Postgres client (optional, for psql)
 
+Worktrees and tmux sessions (optional)
+- Use this to create an isolated git worktree and a dedicated tmux session.
+- Requires tmux installed.
+
+From repo root:
+```
+just wt-new codex backend feat/backend-adjust
+```
+
+Direct script (same behavior):
+```
+./devtools/robson-wt-new.sh codex backend feat/backend-adjust
+```
+
+Optional env vars:
+- ROBSON_TRUNK (default ~/apps/robson)
+- ROBSON_WT_PARENT (default ~/apps)
+- ROBSON_AGENT_CMD_CLAUDE, ROBSON_AGENT_CMD_CODEX
+
 Backend quick start
 1) Create venv and install deps
 ```
