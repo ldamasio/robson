@@ -191,6 +191,8 @@ docs/
 | **CI/CD & Image Tagging** | [runbooks/ci-cd-image-tagging.md](runbooks/ci-cd-image-tagging.md) |
 | **Deployment Checklist** | [runbooks/deployment-checklist.md](runbooks/deployment-checklist.md) |
 | **Infrastructure** | [../infra/README.md](../infra/README.md) |
+| **K9s Operations** | [../infra/K9S-OPERATIONS.md](../infra/K9S-OPERATIONS.md) |
+| **ktop Operations** | [../infra/KTOP-OPERATIONS.md](../infra/KTOP-OPERATIONS.md) |
 | **First Leveraged Position** | [operations/2025-12-24-first-leveraged-position.md](operations/2025-12-24-first-leveraged-position.md) |
 | **Isolated Margin SHORT (BTCUSDC)** | [operations/2026-01-05-isolated-margin-short-btcusdc.md](operations/2026-01-05-isolated-margin-short-btcusdc.md) |
 
@@ -294,6 +296,6 @@ Robson Bot is optimized for AI-assisted development:
 
 ---
 
-**Last Updated**: 2024-12-25
+**Last Updated**: 2026-01-13
 **Maintained by**: Robson Bot Core Team
 **License**: Same as project

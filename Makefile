@@ -155,6 +155,35 @@ k9s-preview:
 	@./infra/scripts/k9s-preview.sh "$(BRANCH)"
 
 # ==============================
+# ktop Helpers (Kubernetes top-style Monitor)
+# ==============================
+
+.PHONY: ktop ktop-ns ktop-preview
+
+ktop:
+	@echo "🚀 Launching ktop with current kubeconfig context..."
+	@echo "   (Ensure KUBECONFIG is set or ~/.kube/config is configured)"
+	@ktop
+
+ktop-ns:
+	@if [ -z "$(NAMESPACE)" ]; then \
+		echo "❌ Error: NAMESPACE is required."; \
+		echo "   Usage: make ktop-ns NAMESPACE=<name>"; \
+		exit 1; \
+	fi
+	@echo "🚀 Launching ktop for namespace: $(NAMESPACE)"
+	@./infra/scripts/ktop-ns.sh "$(NAMESPACE)"
+
+ktop-preview:
+	@if [ -z "$(BRANCH)" ]; then \
+		echo "❌ Error: BRANCH is required."; \
+		echo "   Usage: make ktop-preview BRANCH=<branch-name>"; \
+		exit 1; \
+	fi
+	@echo "🚀 Launching ktop for preview environment: $(BRANCH)"
+	@./infra/scripts/ktop-preview.sh "$(BRANCH)"
+
+# ==============================
 # AI Governance Validation
 # ==============================
 
