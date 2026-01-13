@@ -80,3 +80,5 @@ The webhook secret is already configured in ArgoCD Helm values. Just add the web
 Operations & Debugging
 - For hands-on cluster inspection, pod debugging, and log tailing, see [K9S-OPERATIONS.md](K9S-OPERATIONS.md).
 - K9s is a terminal UI for Kubernetes that complements GitOps workflows (read-mostly, debug-only).
+- For quick resource monitoring (CPU, memory, network), see [KTOP-OPERATIONS.md](KTOP-OPERATIONS.md).
+- ktop is a Unix/Linux top-style tool for Kubernetes that provides real-time metrics visualization.

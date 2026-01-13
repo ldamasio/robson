@@ -520,6 +520,7 @@ describe('MyComponent', () => {
 - ArgoCD (GitOps), cert-manager (TLS)
 - Ansible (node provisioning)
 - K9s (terminal UI for cluster operations, read-mostly debugging)
+- ktop (top-style Kubernetes resource monitoring)
 
 ---
 
@@ -693,6 +694,9 @@ argocd app sync robson-backend       # Force sync
 make k9s                             # Launch K9s (terminal UI)
 make k9s-ns NAMESPACE=<name>         # K9s for specific namespace
 make k9s-preview BRANCH=<branch>     # K9s for preview environment
+make ktop                            # Launch ktop (top-style monitor)
+make ktop-ns NAMESPACE=<name>        # ktop for specific namespace
+make ktop-preview BRANCH=<branch>    # ktop for preview environment
 
 # Stop Monitor CronJob
 kubectl get cronjob -n robson                              # List CronJobs
@@ -767,6 +771,6 @@ This guide provides quick context. The full AGENTS.md has comprehensive details 
 
 ---
 
-**Last Updated**: 2024-12-24
+**Last Updated**: 2026-01-13
 **Repository**: https://github.com/ldamasio/robson
-**Version**: 1.3 (Updated for GitOps auto-deploy, Audit Trail, Margin Trading)
+**Version**: 1.4 (Added ktop Kubernetes monitoring tool)
