@@ -5,10 +5,14 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+postgres = ["sqlx"]
+
 [dependencies]
 robson-domain = { path = "../robson-domain" }
 tokio = { workspace = true }
-sqlx = { workspace = true }
+sqlx = { workspace = true, optional = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
 uuid = { workspace = true }
@@ -16,7 +20,9 @@ chrono = { workspace = true }
 rust_decimal = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
 dotenvy = { workspace = true }
+rust_decimal_macros = { workspace = true }
