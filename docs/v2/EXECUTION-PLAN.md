@@ -14,15 +14,15 @@
 | 1 - Domain | ✅ Complete | 38 | Entities, value objects, events, state machine |
 | 2 - Engine | ✅ Complete | 21 | Entry logic, trailing stop, exit triggers |
 | 3 - Storage | ✅ Complete | 14 | Repository pattern, in-memory store |
-| 4 - Execution | ⏳ Ready | - | Ports, intent journal, executor |
-| 5 - Daemon | ⏳ Blocked | - | Runtime orchestration |
+| 4 - Execution | ✅ Complete | 17 | Ports, intent journal, executor, stubs |
+| 5 - Daemon | ⏳ Ready | - | Runtime orchestration |
 | 6 - CLI | ⏳ Blocked | - | TypeScript commands |
 | 7 - Detector | ⏳ Blocked | - | Pluggable interface |
 | 8 - E2E Test | ⏳ Blocked | - | Full workflow validation |
 | 9 - Exchange | ⏳ Blocked | - | Binance connector |
 | 10 - Production | ⏳ Blocked | - | Observability, deployment |
 
-**Total Tests**: 73 passing
+**Total Tests**: 92 passing
 
 ---
 
@@ -204,7 +204,7 @@ The original design had a backup stop on exchange. Removed for simplicity:
 
 ---
 
-## Phase 4: Execution Layer ⏳ READY
+## Phase 4: Execution Layer ✅ COMPLETE
 
 **Goal**: Idempotent order execution with intent journal and port definitions
 
@@ -400,15 +400,41 @@ impl ExchangePort for StubExchange {
 
 ### Acceptance Criteria
 
-- [ ] Port traits defined (`ExchangePort`, `MarketDataPort`)
-- [ ] Intent journal with idempotency
-- [ ] Executor orchestrates engine → exchange
-- [ ] Stub exchange for testing
-- [ ] Tests pass: `cargo test -p robson-exec`
+- [x] Port traits defined (`ExchangePort`, `MarketDataPort`)
+- [x] Intent journal with idempotency
+- [x] Executor orchestrates engine → exchange
+- [x] Stub exchange and market data for testing
+- [x] Tests pass: `cargo test -p robson-exec` (17 tests)
+
+### Delivered
+
+- [x] **Port Definitions** (`robson-exec/src/ports.rs`)
+  - `ExchangePort`: place_market_order, cancel_order, get_price, health_check
+  - `MarketDataPort`: subscribe, unsubscribe, get_price
+  - `OrderResult`, `PriceUpdate` types
+
+- [x] **Intent Journal** (`robson-exec/src/intent.rs`)
+  - `Intent` with Pending → Executing → Completed lifecycle
+  - `IntentAction` enum (PlaceEntryOrder, PlaceExitOrder, CancelOrder)
+  - `IntentJournal` for at-most-once execution semantics
+  - signal_id as idempotency key for entry orders
+
+- [x] **Executor** (`robson-exec/src/executor.rs`)
+  - `Executor<E: ExchangePort, S: Store>` generic over adapters
+  - Handles: PlaceEntryOrder, PlaceExitOrder, EmitEvent, UpdateTrailingStop, TriggerExit
+  - Idempotent entry order execution via intent journal
+  - Event persistence to store
+
+- [x] **Stub Implementations** (`robson-exec/src/stub.rs`)
+  - `StubExchange`: Configurable prices, fee simulation, failure injection
+  - `StubMarketData`: Subscription management, price injection for testing
+
+- [x] **Error Types** (`robson-exec/src/error.rs`)
+  - `ExecError` enum: Exchange, IntentJournal, Store, AlreadyProcessed
 
 ---
 
-## Phase 5: Daemon Runtime
+## Phase 5: Daemon Runtime ⏳ READY
 
 **Goal**: Orchestrate engine, execution, and position lifecycle
 
@@ -787,21 +813,21 @@ cd v2 && ./scripts/verify.sh
 cargo test -p robson-domain    # 38 tests
 cargo test -p robson-engine    # 21 tests
 cargo test -p robson-store     # 14 tests
-cargo test -p robson-exec      # Phase 4
+cargo test -p robson-exec      # 17 tests
 cargo test -p robsond          # Phase 5
 
 # All tests
-cargo test --all               # 73 tests currently
+cargo test --all               # 92 tests currently
 ```
 
 ---
 
 ## Next Action
 
-**Phase 4**: Implement execution layer ports and intent journal.
+**Phase 5**: Implement daemon runtime with event bus and position manager.
 
 Start with:
-1. Define `ExchangePort` and `MarketDataPort` traits
-2. Implement `IntentJournal` for idempotency
-3. Create `Executor` to orchestrate engine → exchange
-4. Add `StubExchange` for testing
+1. Create event bus for internal communication (detector → engine)
+2. Implement position manager with detector lifecycle
+3. Build daemon main loop with graceful shutdown
+4. Add basic API endpoints (health, status)

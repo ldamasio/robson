@@ -27,3 +27,10 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dotenvy = { workspace = true }
+rust_decimal = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+rust_decimal_macros = { workspace = true }
+reqwest = { version = "0.12", features = ["json"] }
+http-body-util = "0.1"
