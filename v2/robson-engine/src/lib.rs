@@ -30,8 +30,8 @@
 
 use chrono::{DateTime, Utc};
 use robson_domain::{
-    Event, ExitReason, Position, PositionId, PositionState, Price, Quantity, RiskConfig, Side,
-    Symbol, TechnicalStopDistance,
+    calculate_position_size, DetectorSignal, Event, ExitReason, Position, PositionId,
+    PositionState, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -113,6 +113,22 @@ impl MarketData {
 /// These are pure data - the execution layer handles actual I/O.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub enum EngineAction {
+    /// Place entry order (market order to open position)
+    ///
+    /// Emitted by `decide_entry` when detector signal is valid.
+    PlaceEntryOrder {
+        /// Position entering
+        position_id: PositionId,
+        /// Symbol to trade
+        symbol: Symbol,
+        /// Order side (Long → Buy, Short → Sell)
+        side: robson_domain::OrderSide,
+        /// Calculated quantity (from position sizing)
+        quantity: Quantity,
+        /// Signal ID for idempotency tracking
+        signal_id: uuid::Uuid,
+    },
+
     /// Update the trailing stop price (favorable price movement)
     UpdateTrailingStop {
         /// Position to update
@@ -241,6 +257,196 @@ impl Engine {
     pub fn risk_config(&self) -> &RiskConfig {
         &self.risk_config
     }
+
+    // =========================================================================
+    // Entry Logic
+    // =========================================================================
+
+    /// Process detector signal to decide entry
+    ///
+    /// Called when a DetectorTask fires a signal for an Armed position.
+    /// Validates the signal, calculates position size, and returns entry actions.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - The armed position (must be in Armed state)
+    /// * `signal` - The detector signal with entry parameters
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(EngineDecision)` with PlaceEntryOrder action and updated position
+    /// * `Err(EngineError)` if validation fails
+    ///
+    /// # State Transition
+    ///
+    /// ```text
+    /// Armed → Entering (with signal_id for idempotency)
+    /// ```
+    pub fn decide_entry(
+        &self,
+        position: &Position,
+        signal: &DetectorSignal,
+    ) -> Result<EngineDecision, EngineError> {
+        // 1. Validate position is Armed
+        if !matches!(position.state, PositionState::Armed) {
+            return Err(EngineError::InvalidPositionState {
+                expected: "armed".to_string(),
+                actual: position.state.name().to_string(),
+            });
+        }
+
+        // 2. Validate signal matches position
+        signal
+            .validate_for_position(position)
+            .map_err(|e| EngineError::DomainError(e))?;
+
+        // 3. Validate and get tech stop distance
+        let tech_stop = signal.tech_stop_distance();
+        tech_stop
+            .validate()
+            .map_err(|e| EngineError::DomainError(e))?;
+
+        // 4. Calculate position size (Golden Rule)
+        let quantity = calculate_position_size(&self.risk_config, &tech_stop)
+            .map_err(|e| EngineError::DomainError(e))?;
+
+        debug!(
+            position_id = %position.id,
+            signal_id = %signal.signal_id,
+            entry_price = %signal.entry_price,
+            stop_loss = %signal.stop_loss,
+            quantity = %quantity,
+            "Entry signal received, placing order"
+        );
+
+        // 5. Create updated position in Entering state
+        let mut updated_position = position.clone();
+        updated_position.state = PositionState::Entering {
+            entry_order_id: uuid::Uuid::now_v7(),
+            expected_entry: signal.entry_price,
+            signal_id: signal.signal_id,
+        };
+        updated_position.entry_price = Some(signal.entry_price);
+        updated_position.tech_stop_distance = Some(tech_stop);
+        updated_position.quantity = quantity;
+        updated_position.updated_at = Utc::now();
+
+        // 6. Build actions
+        let actions = vec![
+            // Emit signal received event
+            EngineAction::EmitEvent(Event::EntrySignalReceived {
+                position_id: position.id,
+                signal_id: signal.signal_id,
+                entry_price: signal.entry_price,
+                stop_loss: signal.stop_loss,
+                quantity,
+                timestamp: Utc::now(),
+            }),
+            // Place entry order
+            EngineAction::PlaceEntryOrder {
+                position_id: position.id,
+                symbol: position.symbol.clone(),
+                side: position.side.entry_action(),
+                quantity,
+                signal_id: signal.signal_id,
+            },
+        ];
+
+        Ok(EngineDecision::with_position(actions, updated_position))
+    }
+
+    /// Process entry order fill
+    ///
+    /// Called when the entry market order is filled.
+    /// Transitions position to Active state with initial trailing stop.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - The entering position (must be in Entering state)
+    /// * `fill_price` - Actual fill price from exchange
+    /// * `filled_quantity` - Actual filled quantity
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(EngineDecision)` with updated position in Active state
+    /// * `Err(EngineError)` if validation fails
+    ///
+    /// # State Transition
+    ///
+    /// ```text
+    /// Entering → Active (trailing stop = entry - tech_distance)
+    /// ```
+    pub fn process_entry_fill(
+        &self,
+        position: &Position,
+        fill_price: Price,
+        filled_quantity: Quantity,
+    ) -> Result<EngineDecision, EngineError> {
+        // 1. Validate position is Entering
+        let entry_order_id = match &position.state {
+            PositionState::Entering {
+                entry_order_id,
+                expected_entry: _,
+                signal_id: _,
+            } => *entry_order_id,
+            other => {
+                return Err(EngineError::InvalidPositionState {
+                    expected: "entering".to_string(),
+                    actual: other.name().to_string(),
+                });
+            }
+        };
+
+        // 2. Get tech stop distance
+        let tech_stop = position.tech_stop_distance.as_ref().ok_or_else(|| {
+            EngineError::MissingData("Position missing tech_stop_distance".to_string())
+        })?;
+
+        // 3. Calculate initial trailing stop
+        let initial_trailing_stop = match position.side {
+            Side::Long => tech_stop.calculate_trailing_stop_long(fill_price.as_decimal()),
+            Side::Short => tech_stop.calculate_trailing_stop_short(fill_price.as_decimal()),
+        };
+
+        debug!(
+            position_id = %position.id,
+            fill_price = %fill_price,
+            filled_quantity = %filled_quantity,
+            initial_trailing_stop = %initial_trailing_stop,
+            "Entry filled, position now active"
+        );
+
+        // 4. Create updated position in Active state
+        let mut updated_position = position.clone();
+        updated_position.state = PositionState::Active {
+            current_price: fill_price,
+            trailing_stop: initial_trailing_stop,
+            favorable_extreme: fill_price,
+            extreme_at: Utc::now(),
+            insurance_stop_id: None, // No insurance stop (Robson manages exits)
+        };
+        updated_position.entry_price = Some(fill_price);
+        updated_position.quantity = filled_quantity;
+        updated_position.entry_filled_at = Some(Utc::now());
+        updated_position.updated_at = Utc::now();
+
+        // 5. Build actions (emit event)
+        let actions = vec![EngineAction::EmitEvent(Event::EntryFilled {
+            position_id: position.id,
+            order_id: entry_order_id,
+            fill_price,
+            filled_quantity,
+            fee: rust_decimal::Decimal::ZERO, // Will be updated by executor
+            initial_stop: initial_trailing_stop,
+            timestamp: Utc::now(),
+        })];
+
+        Ok(EngineDecision::with_position(actions, updated_position))
+    }
+
+    // =========================================================================
+    // Active Position Logic (Exit/Trailing Stop)
+    // =========================================================================
 
     /// Process an active position with current market data
     ///
@@ -845,5 +1051,319 @@ mod tests {
             matches!(a, EngineAction::TriggerExit { .. })
         });
         assert!(has_exit, "Exit should take priority");
+    }
+
+    // =========================================================================
+    // Entry Logic Tests
+    // =========================================================================
+
+    /// Helper to create an armed position for entry tests
+    fn create_armed_position(side: Side) -> Position {
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        Position::new(Uuid::now_v7(), symbol, side)
+    }
+
+    /// Helper to create a detector signal
+    fn create_detector_signal(
+        position: &Position,
+        entry_price: Decimal,
+        stop_loss: Decimal,
+    ) -> DetectorSignal {
+        DetectorSignal::new(
+            position.id,
+            position.symbol.clone(),
+            position.side,
+            Price::new(entry_price).unwrap(),
+            Price::new(stop_loss).unwrap(),
+        )
+    }
+
+    #[test]
+    fn test_decide_entry_long_success() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        let position = create_armed_position(Side::Long);
+        let signal = create_detector_signal(&position, dec!(95000), dec!(93500));
+
+        let decision = engine.decide_entry(&position, &signal).unwrap();
+
+        // Should have 2 actions: EmitEvent + PlaceEntryOrder
+        assert_eq!(decision.actions.len(), 2);
+
+        // Check PlaceEntryOrder action
+        let has_entry_order = decision.actions.iter().any(|a| {
+            matches!(
+                a,
+                EngineAction::PlaceEntryOrder {
+                    side: robson_domain::OrderSide::Buy,
+                    ..
+                }
+            )
+        });
+        assert!(has_entry_order, "Should have PlaceEntryOrder with Buy side");
+
+        // Check updated position
+        let updated_position = decision.updated_position.expect("Should have updated position");
+        assert!(matches!(
+            updated_position.state,
+            PositionState::Entering { signal_id, .. } if signal_id == signal.signal_id
+        ));
+
+        // Verify position sizing (Golden Rule)
+        // Capital: $10,000, Risk: 1% = $100 max risk
+        // Stop distance: $1,500
+        // Expected size: $100 / $1,500 = 0.0666... BTC
+        let expected_size = dec!(100) / dec!(1500);
+        assert_eq!(updated_position.quantity.as_decimal(), expected_size);
+    }
+
+    #[test]
+    fn test_decide_entry_short_success() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        let position = create_armed_position(Side::Short);
+        // For short: stop is above entry
+        let signal = create_detector_signal(&position, dec!(95000), dec!(96500));
+
+        let decision = engine.decide_entry(&position, &signal).unwrap();
+
+        // Check PlaceEntryOrder has Sell side (short entry)
+        let has_entry_order = decision.actions.iter().any(|a| {
+            matches!(
+                a,
+                EngineAction::PlaceEntryOrder {
+                    side: robson_domain::OrderSide::Sell,
+                    ..
+                }
+            )
+        });
+        assert!(has_entry_order, "Should have PlaceEntryOrder with Sell side for short");
+    }
+
+    #[test]
+    fn test_decide_entry_rejects_non_armed() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        // Create an Active position (not Armed)
+        let position = create_active_position(
+            Side::Long,
+            dec!(95000),
+            dec!(93500),
+            dec!(95000),
+            dec!(1500),
+        );
+
+        let signal = DetectorSignal::new(
+            position.id,
+            position.symbol.clone(),
+            position.side,
+            Price::new(dec!(95000)).unwrap(),
+            Price::new(dec!(93500)).unwrap(),
+        );
+
+        let result = engine.decide_entry(&position, &signal);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            EngineError::InvalidPositionState { expected, actual } => {
+                assert_eq!(expected, "armed");
+                assert_eq!(actual, "active");
+            }
+            _ => panic!("Expected InvalidPositionState error"),
+        }
+    }
+
+    #[test]
+    fn test_decide_entry_rejects_signal_mismatch() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        let position = create_armed_position(Side::Long);
+
+        // Create signal with different position_id
+        let signal = DetectorSignal::new(
+            Uuid::now_v7(), // Different position ID!
+            position.symbol.clone(),
+            position.side,
+            Price::new(dec!(95000)).unwrap(),
+            Price::new(dec!(93500)).unwrap(),
+        );
+
+        let result = engine.decide_entry(&position, &signal);
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), EngineError::DomainError(_)));
+    }
+
+    #[test]
+    fn test_decide_entry_validates_tech_stop() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        let position = create_armed_position(Side::Long);
+
+        // Create signal with stop too wide (>10%)
+        let signal = create_detector_signal(&position, dec!(100), dec!(80)); // 20% distance
+
+        let result = engine.decide_entry(&position, &signal);
+
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), EngineError::DomainError(_)));
+    }
+
+    #[test]
+    fn test_process_entry_fill_long() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        // First, create a position in Entering state
+        let position = create_armed_position(Side::Long);
+        let signal = create_detector_signal(&position, dec!(95000), dec!(93500));
+        let entry_decision = engine.decide_entry(&position, &signal).unwrap();
+        let entering_position = entry_decision.updated_position.unwrap();
+
+        // Now process the fill
+        let fill_price = Price::new(dec!(95100)).unwrap(); // Slightly higher than expected
+        let filled_quantity = Quantity::new(dec!(0.0666666666666666666666666667)).unwrap();
+
+        let fill_decision = engine
+            .process_entry_fill(&entering_position, fill_price, filled_quantity)
+            .unwrap();
+
+        // Check updated position is Active
+        let active_position = fill_decision.updated_position.expect("Should have updated position");
+        match &active_position.state {
+            PositionState::Active {
+                current_price,
+                trailing_stop,
+                favorable_extreme,
+                ..
+            } => {
+                assert_eq!(current_price.as_decimal(), dec!(95100));
+                assert_eq!(favorable_extreme.as_decimal(), dec!(95100));
+                // Initial trailing stop = 95100 - 1500 = 93600
+                assert_eq!(trailing_stop.as_decimal(), dec!(93600));
+            }
+            other => panic!("Expected Active state, got {:?}", other.name()),
+        }
+    }
+
+    #[test]
+    fn test_process_entry_fill_short() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        // Create a short position in Entering state
+        let position = create_armed_position(Side::Short);
+        let signal = create_detector_signal(&position, dec!(95000), dec!(96500)); // Short: stop above
+        let entry_decision = engine.decide_entry(&position, &signal).unwrap();
+        let entering_position = entry_decision.updated_position.unwrap();
+
+        // Process the fill
+        let fill_price = Price::new(dec!(94900)).unwrap(); // Slightly lower (favorable for short)
+        let filled_quantity = Quantity::new(dec!(0.0666666666666666666666666667)).unwrap();
+
+        let fill_decision = engine
+            .process_entry_fill(&entering_position, fill_price, filled_quantity)
+            .unwrap();
+
+        // Check trailing stop for short
+        let active_position = fill_decision.updated_position.expect("Should have updated position");
+        match &active_position.state {
+            PositionState::Active {
+                trailing_stop,
+                favorable_extreme,
+                ..
+            } => {
+                assert_eq!(favorable_extreme.as_decimal(), dec!(94900));
+                // Initial trailing stop = 94900 + 1500 = 96400
+                assert_eq!(trailing_stop.as_decimal(), dec!(96400));
+            }
+            other => panic!("Expected Active state, got {:?}", other.name()),
+        }
+    }
+
+    #[test]
+    fn test_process_entry_fill_rejects_non_entering() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        // Use an Armed position (not Entering)
+        let position = create_armed_position(Side::Long);
+
+        let fill_price = Price::new(dec!(95000)).unwrap();
+        let filled_quantity = Quantity::new(dec!(0.1)).unwrap();
+
+        let result = engine.process_entry_fill(&position, fill_price, filled_quantity);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            EngineError::InvalidPositionState { expected, actual } => {
+                assert_eq!(expected, "entering");
+                assert_eq!(actual, "armed");
+            }
+            _ => panic!("Expected InvalidPositionState error"),
+        }
+    }
+
+    #[test]
+    fn test_full_entry_to_exit_flow() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        // 1. Armed position
+        let position = create_armed_position(Side::Long);
+        assert!(position.can_enter());
+        assert!(!position.can_exit());
+
+        // 2. Detector fires signal
+        let signal = create_detector_signal(&position, dec!(95000), dec!(93500));
+        let entry_decision = engine.decide_entry(&position, &signal).unwrap();
+        let entering_position = entry_decision.updated_position.unwrap();
+
+        // Position is now Entering
+        assert!(matches!(entering_position.state, PositionState::Entering { .. }));
+
+        // 3. Entry fill received
+        let fill_price = Price::new(dec!(95000)).unwrap();
+        let filled_quantity = entering_position.quantity;
+        let fill_decision = engine
+            .process_entry_fill(&entering_position, fill_price, filled_quantity)
+            .unwrap();
+        let active_position = fill_decision.updated_position.unwrap();
+
+        // Position is now Active
+        assert!(active_position.can_exit());
+        assert!(!active_position.can_enter());
+
+        // 4. Price moves up, trailing stop updates
+        let market_up = create_market_data(dec!(97000));
+        let update_decision = engine.process_active_position(&active_position, &market_up).unwrap();
+        assert!(update_decision.has_actions());
+
+        // 5. Simulate price hitting trailing stop (exit)
+        // After price went to 97k, trailing stop should be 97k - 1.5k = 95.5k
+        // Create position with updated trailing stop for this test
+        let mut position_after_update = active_position.clone();
+        position_after_update.state = PositionState::Active {
+            current_price: Price::new(dec!(97000)).unwrap(),
+            trailing_stop: Price::new(dec!(95500)).unwrap(),
+            favorable_extreme: Price::new(dec!(97000)).unwrap(),
+            extreme_at: Utc::now(),
+            insurance_stop_id: None,
+        };
+
+        // Price drops to trailing stop
+        let market_exit = create_market_data(dec!(95500));
+        let exit_decision = engine.process_active_position(&position_after_update, &market_exit).unwrap();
+
+        // Should trigger exit
+        let has_exit = exit_decision.actions.iter().any(|a| {
+            matches!(a, EngineAction::TriggerExit { .. })
+        });
+        assert!(has_exit, "Should trigger exit when trailing stop is hit");
     }
 }

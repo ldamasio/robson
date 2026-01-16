@@ -192,20 +192,39 @@ cli/
 
 ---
 
-## What's NOT Implemented Yet
+## Implementation Status (Updated 2026-01-16)
+
+### Completed ✅
+
+- [x] **Phase 0: Bootstrap** - Workspace, crates, tooling
+- [x] **Phase 1: Domain Types** (38 tests)
+  - Value objects: Price, Quantity, Symbol, Side, TechnicalStopDistance, RiskConfig
+  - Entities: Position, Order, DetectorSignal with signal_id
+  - Events: 12 event types covering full lifecycle
+  - State machine: Armed → Entering → Active → Exiting → Closed
+  - Position sizing: Golden Rule calculation
+
+- [x] **Phase 2: Engine** (21 tests)
+  - Entry: `decide_entry()`, `process_entry_fill()`
+  - Exit: `process_active_position()` with trailing stop
+  - Full entry-to-exit flow tested
+
+- [x] **Phase 3: Storage** (14 tests)
+  - Repository pattern: PositionRepository, OrderRepository, EventRepository
+  - In-memory store with thread-safe RwLock
+  - Error types prepared for PostgreSQL
+
+**Total Tests**: 73 passing
 
 ### Awaiting Implementation
 
-- [ ] Domain types (value objects, entities, state machine)
-- [ ] Engine logic (entry/exit decisions, monitoring)
-- [ ] PostgreSQL store (event log, snapshots, leases)
-- [ ] Execution layer (intent journal, order manager)
-- [ ] Daemon runtime (main loop, API server, reconciliation)
-- [ ] CLI integration (real API calls, table formatting)
-- [ ] Detector interface (pluggable, stub provided)
-- [ ] Exchange connector (Binance REST + WebSocket)
-- [ ] End-to-end tests
-- [ ] Production deployment (Kubernetes, monitoring)
+- [ ] Phase 4: Execution layer (ports, intent journal)
+- [ ] Phase 5: Daemon runtime (event bus, position manager)
+- [ ] Phase 6: CLI integration (real API calls)
+- [ ] Phase 7: Detector interface (pluggable)
+- [ ] Phase 8: End-to-end tests
+- [ ] Phase 9: Exchange connector (Binance)
+- [ ] Phase 10: Production deployment
 
 ---
 

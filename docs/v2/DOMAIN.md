@@ -1,8 +1,8 @@
 # Robson v2 Domain Model
 
 **Version**: 2.0.0-alpha
-**Last Updated**: 2026-01-12
-**Status**: Planning Phase
+**Last Updated**: 2026-01-16
+**Status**: Implementation Phase (Phases 0-3 Complete)
 
 ---
 
@@ -12,11 +12,13 @@
 2. [Entities](#entities)
 3. [Value Objects](#value-objects)
 4. [State Machine](#state-machine)
-5. [Palma da Mão (Technical Stop Distance)](#palma-da-mão-technical-stop-distance)
-6. [Position Sizing](#position-sizing)
-7. [Risk Management](#risk-management)
-8. [Invariants](#invariants)
-9. [Events](#events)
+5. [Technical Stop Distance](#technical-stop-distance)
+6. [Trailing Stop Strategy](#trailing-stop-strategy)
+7. [Position Sizing](#position-sizing)
+8. [Detector Architecture](#detector-architecture)
+9. [Risk Management](#risk-management)
+10. [Events](#events)
+11. [Invariants](#invariants)
 
 ---
 
@@ -24,41 +26,67 @@
 
 ### User-Initiated, System-Managed
 
-**Key Principle**: User arms positions; system decides entries/exits based on technical analysis and risk rules.
+**Key Principle**: User arms positions; system decides entries/exits based on detector signals and risk rules.
 
-- **User**: Chooses symbol, strategy, capital allocation
-- **System**: Decides entry price, stop loss, stop gain, position size, exit timing
+- **User**: Chooses symbol, strategy, capital allocation, arms position
+- **Detector**: Monitors market, fires single entry signal when conditions met
+- **Engine**: Validates signal, calculates position size, manages trailing stop
+- **Executor**: Places orders on exchange with idempotency guarantees
 
-### "Palma da Mão" (Palm of the Hand)
+### Technical Stop Distance (formerly "Palma da Mão")
 
-**Definition**: Distance between entry price and technical stop loss
+**Definition**: Distance between entry price and technical invalidation level (stop loss from chart analysis).
 
 **Why Universal?**:
-- Structural foundation for position sizing
+- Structural foundation for position sizing (Golden Rule)
 - Risk is ALWAYS defined by technical invalidation level
 - NOT arbitrary percentage or dollar amount
+- Position size is DERIVED from this distance
 
 **Formula**:
 ```
-Palma = |Entry Price - Technical Stop Loss|
-Palma % = (Palma / Entry Price) × 100
+Tech Stop Distance = |Entry Price - Technical Stop Loss|
+Tech Stop % = (Distance / Entry Price) × 100
 ```
 
 **Example**:
 ```
 Entry: $95,000
 Technical SL: $93,500
-Palma: $1,500 (1.58%)
+Distance: $1,500 (1.58%)
 ```
+
+### Trailing Stop (Single Exit Mechanism)
+
+**Key Decision**: Robson v2 uses a **single trailing stop** instead of separate stop-loss and stop-gain.
+
+**How it works**:
+1. Initial trailing stop = Entry price - Tech stop distance (for Long)
+2. When price moves favorably, trailing stop follows by tech stop distance
+3. When price hits trailing stop, exit triggers
+
+**Benefits**:
+- Captures more profit in trending markets
+- Maintains consistent risk per trade
+- Simpler logic, fewer edge cases
 
 ### All Exits Are Market Orders
 
-**Rule**: NO limit orders for exits (SL/SG)
+**Rule**: NO limit orders for exits
 
 **Rationale**:
 - Guarantee execution (no slippage risk denial)
 - Market moves fast; we need certainty
-- Profit target is guidance, not hard requirement
+- Trailing stop provides dynamic target
+
+### No Insurance Stop on Exchange
+
+**Decision**: Robson manages all exits in runtime. No backup stop-limit on exchange.
+
+**Rationale**:
+- Simpler architecture
+- Avoids race conditions between local monitor and exchange stop
+- Daemon reliability is the safety mechanism
 
 ---
 
@@ -66,27 +94,24 @@ Palma: $1,500 (1.58%)
 
 ### Position
 
-**Definition**: A managed trading position with lifecycle management
+**Definition**: A managed trading position with full lifecycle management.
 
 ```rust
 pub struct Position {
+    // Identity
     pub id: PositionId,
     pub account_id: AccountId,
     pub symbol: Symbol,
-    pub side: Side,                 // Long or Short
+    pub side: Side,
     pub state: PositionState,
-    pub strategy: StrategyConfig,
 
     // Entry
     pub entry_price: Option<Price>,
     pub entry_filled_at: Option<DateTime<Utc>>,
 
     // Risk Parameters
-    pub palma: Option<PalmaDaMao>,
-    pub stop_loss: Price,
-    pub stop_gain: Price,
+    pub tech_stop_distance: Option<TechnicalStopDistance>,
     pub quantity: Quantity,
-    pub leverage: Leverage,
 
     // P&L Tracking
     pub realized_pnl: Decimal,
@@ -95,7 +120,6 @@ pub struct Position {
     // Orders
     pub entry_order_id: Option<OrderId>,
     pub exit_order_id: Option<OrderId>,
-    pub insurance_stop_id: Option<OrderId>,
 
     // Audit
     pub created_at: DateTime<Utc>,
@@ -104,74 +128,44 @@ pub struct Position {
 }
 
 impl Position {
-    pub fn new(
-        account_id: AccountId,
-        symbol: Symbol,
-        side: Side,
-        strategy: StrategyConfig,
-    ) -> Self {
-        Self {
-            id: PositionId::new(),
-            account_id,
-            symbol,
-            side,
-            state: PositionState::Armed { detector_config: strategy.detector },
-            strategy,
-            entry_price: None,
-            entry_filled_at: None,
-            palma: None,
-            stop_loss: Price::zero(),
-            stop_gain: Price::zero(),
-            quantity: Quantity::zero(),
-            leverage: Leverage::one(),
-            realized_pnl: Decimal::ZERO,
-            fees_paid: Decimal::ZERO,
-            entry_order_id: None,
-            exit_order_id: None,
-            insurance_stop_id: None,
-            created_at: Utc::now(),
-            updated_at: Utc::now(),
-            closed_at: None,
-        }
-    }
-
-    pub fn can_enter(&self) -> bool {
-        matches!(self.state, PositionState::Armed { .. })
-    }
-
-    pub fn can_exit(&self) -> bool {
-        matches!(self.state, PositionState::Active { .. })
-    }
-
-    pub fn is_closed(&self) -> bool {
-        matches!(self.state, PositionState::Closed { .. })
-    }
+    pub fn new(account_id: AccountId, symbol: Symbol, side: Side) -> Self;
+    pub fn can_enter(&self) -> bool;  // true if Armed
+    pub fn can_exit(&self) -> bool;   // true if Active
+    pub fn is_closed(&self) -> bool;  // true if Closed
 }
 ```
 
+**Key Design Notes**:
+- No `leverage` field (fixed 10x for Binance isolated margin)
+- No `stop_gain` field (trailing stop handles exits)
+- `tech_stop_distance` captures the risk distance
+
 ### Order
 
-**Definition**: An instruction to buy/sell on the exchange
+**Definition**: An instruction to buy/sell on the exchange.
 
 ```rust
 pub struct Order {
     pub id: OrderId,
     pub position_id: PositionId,
     pub exchange_order_id: Option<String>,
-    pub client_order_id: String,  // intent_id
+    pub client_order_id: String,  // UUID v7 for idempotency
 
     pub symbol: Symbol,
-    pub side: Side,
+    pub side: OrderSide,
     pub order_type: OrderType,
     pub quantity: Quantity,
     pub price: Option<Price>,     // None for market orders
 
     pub status: OrderStatus,
-    pub filled_quantity: Quantity,
-    pub average_fill_price: Option<Price>,
+
+    // Fill information (consolidated from Trade)
+    pub filled_quantity: Option<Quantity>,
+    pub fill_price: Option<Price>,
+    pub filled_at: Option<DateTime<Utc>>,
+    pub fee_paid: Option<Decimal>,
 
     pub created_at: DateTime<Utc>,
-    pub filled_at: Option<DateTime<Utc>>,
 }
 
 pub enum OrderType {
@@ -185,77 +179,97 @@ pub enum OrderStatus {
     Submitted,    // Sent to exchange
     PartialFill,  // Partially filled
     Filled,       // Completely filled
-    Cancelled,    // Cancelled by user or system
+    Cancelled,    // Cancelled
     Rejected,     // Rejected by exchange
-    Expired,      // Expired (GTC not used)
 }
 ```
 
-### Trade
+**Design Note**: `Trade` entity was removed. Fill information is stored directly in `Order` since market orders fill immediately in isolated margin.
 
-**Definition**: An executed fill (part of an order)
+### DetectorSignal
+
+**Definition**: Single-shot signal from a detector to trigger entry.
 
 ```rust
-pub struct Trade {
-    pub id: TradeId,
-    pub order_id: OrderId,
-    pub exchange_trade_id: String,
-
+pub struct DetectorSignal {
+    /// Unique signal identifier for idempotency
+    pub signal_id: Uuid,
+    /// Position this signal belongs to (detector is per-position)
+    pub position_id: PositionId,
+    /// Trading pair symbol
     pub symbol: Symbol,
+    /// Position direction (must match armed position)
     pub side: Side,
-    pub quantity: Quantity,
-    pub price: Price,
-    pub fee: Decimal,
-    pub fee_asset: String,
+    /// Suggested entry price (current market price when signal fired)
+    pub entry_price: Price,
+    /// Technical stop loss from chart analysis
+    pub stop_loss: Price,
+    /// When the signal was generated
+    pub timestamp: DateTime<Utc>,
+}
 
-    pub executed_at: DateTime<Utc>,
+impl DetectorSignal {
+    pub fn new(position_id, symbol, side, entry_price, stop_loss) -> Self;
+    pub fn tech_stop_distance(&self) -> TechnicalStopDistance;
+    pub fn validate_for_position(&self, position: &Position) -> Result<(), DomainError>;
 }
 ```
+
+**Key Design Notes**:
+- `signal_id` enables idempotent processing (same signal processed only once)
+- No `stop_gain` - trailing stop handles profit taking
+- Detector is **per-position** (not market scanner)
 
 ---
 
 ## Value Objects
 
-### PalmaDaMao
+### TechnicalStopDistance
+
+**Renamed from**: `PalmaDaMao` (clearer, self-documenting name)
 
 ```rust
-pub struct PalmaDaMao {
-    pub distance: Decimal,         // Absolute distance in quote currency
-    pub distance_pct: Decimal,     // Percentage of entry price
-    pub entry_price: Price,
-    pub stop_loss: Price,
+pub struct TechnicalStopDistance {
+    distance: Decimal,         // Absolute distance in quote currency
+    distance_percent: Decimal, // Percentage of entry price
 }
 
-impl PalmaDaMao {
-    pub fn from_entry_and_stop(entry: Price, stop_loss: Price) -> Self {
-        let distance = (entry.as_decimal() - stop_loss.as_decimal()).abs();
-        let distance_pct = distance / entry.as_decimal() * Decimal::from(100);
-
-        Self {
-            distance,
-            distance_pct,
-            entry_price: entry,
-            stop_loss,
-        }
-    }
+impl TechnicalStopDistance {
+    pub fn from_entry_and_stop(entry: Price, stop_loss: Price) -> Self;
 
     pub fn validate(&self) -> Result<(), DomainError> {
-        if self.distance <= Decimal::ZERO {
-            return Err(DomainError::InvalidPalma("Distance must be positive"));
-        }
-
-        if self.distance_pct > Decimal::from(10) {
-            return Err(DomainError::InvalidPalma("Stop too wide (>10%)"));
-        }
-
-        if self.distance_pct < Decimal::new(1, 1) {  // 0.1%
-            return Err(DomainError::InvalidPalma("Stop too tight (<0.1%)"));
-        }
-
-        Ok(())
+        // Too tight: < 0.1%
+        // Too wide: > 10%
     }
+
+    /// Calculate initial trailing stop for Long position
+    pub fn calculate_trailing_stop_long(&self, current_price: Decimal) -> Price;
+
+    /// Calculate initial trailing stop for Short position
+    pub fn calculate_trailing_stop_short(&self, current_price: Decimal) -> Price;
 }
 ```
+
+**Validation Rules**:
+- Minimum: 0.1% (prevents noise-triggered exits)
+- Maximum: 10% (prevents excessive risk)
+
+### RiskConfig
+
+```rust
+pub struct RiskConfig {
+    capital: Decimal,           // Total capital allocated
+    risk_percent: Decimal,      // Risk per trade (default: 1%)
+    max_drawdown_percent: Decimal, // Max account drawdown (default: 10%)
+}
+
+impl RiskConfig {
+    pub fn new(capital: Decimal, risk_percent: Decimal) -> Result<Self, DomainError>;
+    pub fn max_risk_amount(&self) -> Decimal;  // capital × risk_percent / 100
+}
+```
+
+**Design Note**: No `max_leverage` - leverage is fixed at 10x.
 
 ### Price
 
@@ -263,20 +277,8 @@ impl PalmaDaMao {
 pub struct Price(Decimal);
 
 impl Price {
-    pub fn new(value: Decimal) -> Result<Self, DomainError> {
-        if value <= Decimal::ZERO {
-            return Err(DomainError::InvalidPrice("Price must be positive"));
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_decimal(&self) -> Decimal {
-        self.0
-    }
-
-    pub fn zero() -> Self {
-        Self(Decimal::ZERO)
-    }
+    pub fn new(value: Decimal) -> Result<Self, DomainError>;  // Must be > 0
+    pub fn as_decimal(&self) -> Decimal;
 }
 ```
 
@@ -286,20 +288,9 @@ impl Price {
 pub struct Quantity(Decimal);
 
 impl Quantity {
-    pub fn new(value: Decimal) -> Result<Self, DomainError> {
-        if value <= Decimal::ZERO {
-            return Err(DomainError::InvalidQuantity("Quantity must be positive"));
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_decimal(&self) -> Decimal {
-        self.0
-    }
-
-    pub fn zero() -> Self {
-        Self(Decimal::ZERO)
-    }
+    pub fn new(value: Decimal) -> Result<Self, DomainError>;  // Must be > 0
+    pub fn as_decimal(&self) -> Decimal;
+    pub fn zero() -> Self;
 }
 ```
 
@@ -307,19 +298,13 @@ impl Quantity {
 
 ```rust
 pub struct Symbol {
-    pub base: String,    // e.g., "BTC"
-    pub quote: String,   // e.g., "USDT"
+    base: String,    // e.g., "BTC"
+    quote: String,   // e.g., "USDT"
 }
 
 impl Symbol {
-    pub fn from_pair(pair: &str) -> Result<Self, DomainError> {
-        // Parse "BTCUSDT" → base: "BTC", quote: "USDT"
-        // (Implementation with known quote assets: USDT, USDC, BTC, ETH)
-    }
-
-    pub fn as_pair(&self) -> String {
-        format!("{}{}", self.base, self.quote)
-    }
+    pub fn from_pair(pair: &str) -> Result<Self, DomainError>;
+    pub fn as_pair(&self) -> String;  // "BTCUSDT"
 }
 ```
 
@@ -332,42 +317,8 @@ pub enum Side {
 }
 
 impl Side {
-    pub fn entry_action(&self) -> OrderSide {
-        match self {
-            Side::Long => OrderSide::Buy,
-            Side::Short => OrderSide::Sell,
-        }
-    }
-
-    pub fn exit_action(&self) -> OrderSide {
-        match self {
-            Side::Long => OrderSide::Sell,
-            Side::Short => OrderSide::Buy,
-        }
-    }
-}
-```
-
-### Leverage
-
-```rust
-pub struct Leverage(u8);
-
-impl Leverage {
-    pub fn new(value: u8) -> Result<Self, DomainError> {
-        if value == 0 || value > 10 {
-            return Err(DomainError::InvalidLeverage("Leverage must be 1-10"));
-        }
-        Ok(Self(value))
-    }
-
-    pub fn as_u8(&self) -> u8 {
-        self.0
-    }
-
-    pub fn one() -> Self {
-        Self(1)
-    }
+    pub fn entry_action(&self) -> OrderSide;  // Long→Buy, Short→Sell
+    pub fn exit_action(&self) -> OrderSide;   // Long→Sell, Short→Buy
 }
 ```
 
@@ -379,31 +330,43 @@ impl Leverage {
 ┌──────────┐
 │  Armed   │  (Waiting for detector signal)
 └────┬─────┘
-     │ detector_signal(entry_price, side)
+     │ DetectorSignal received
+     │ → validate signal
+     │ → calculate position size
+     │ → place entry order
      ▼
 ┌──────────┐
-│ Entering │  (Entry market order placed)
+│ Entering │  (Entry market order placed, waiting for fill)
+│          │  Contains: entry_order_id, expected_entry, signal_id
 └────┬─────┘
-     │ entry_filled(fill_price, quantity)
+     │ Entry order filled
+     │ → set initial trailing stop
+     │ → start monitoring
      ▼
 ┌──────────┐
-│  Active  │  (Monitoring SL/SG)
+│  Active  │  (Monitoring price, managing trailing stop)
+│          │  Contains: current_price, trailing_stop, favorable_extreme
 └────┬─────┘
-     │ trigger_exit(reason) OR user_panic()
+     │ Price hits trailing stop
+     │ → place exit order
      ▼
 ┌──────────┐
-│ Exiting  │  (Exit market order placed)
+│ Exiting  │  (Exit market order placed, waiting for fill)
+│          │  Contains: exit_order_id, exit_reason
 └────┬─────┘
-     │ exit_filled(fill_price)
+     │ Exit order filled
+     │ → calculate PnL
      ▼
 ┌──────────┐
-│  Closed  │  (PnL calculated)
+│  Closed  │  (Position closed, PnL realized)
+│          │  Contains: exit_price, realized_pnl, exit_reason
 └──────────┘
 
-     │ error_at_any_stage()
+     │ Error at any stage
      ▼
 ┌──────────┐
 │  Error   │  (Manual intervention required)
+│          │  Contains: error message, recoverable flag
 └──────────┘
 ```
 
@@ -411,22 +374,23 @@ impl Leverage {
 
 ```rust
 pub enum PositionState {
-    /// Position armed, waiting for entry signal
-    Armed {
-        detector_config: DetectorConfig,
-    },
+    /// Position armed, waiting for detector signal
+    Armed,
 
     /// Entry order submitted, waiting for fill
     Entering {
         entry_order_id: OrderId,
         expected_entry: Price,
+        signal_id: Uuid,  // For idempotency
     },
 
-    /// Position active, monitoring stop loss/gain
+    /// Position active, monitoring trailing stop
     Active {
-        monitor_active: bool,
-        last_price: Price,
-        insurance_stop_id: Option<OrderId>,
+        current_price: Price,
+        trailing_stop: Price,
+        favorable_extreme: Price,  // Highest (Long) or lowest (Short) price seen
+        extreme_at: DateTime<Utc>,
+        insurance_stop_id: Option<OrderId>,  // Always None in v2 (no insurance stop)
     },
 
     /// Exit order submitted, waiting for fill
@@ -442,312 +406,155 @@ pub enum PositionState {
         exit_reason: ExitReason,
     },
 
-    /// Error state, requires manual intervention
+    /// Error state, requires intervention
     Error {
-        error: DomainError,
+        error: String,
         recoverable: bool,
     },
 }
 
 pub enum ExitReason {
-    StopLoss,
-    StopGain,
-    UserPanic,
-    DegradedMode,
-    InsuranceStop,
-}
-```
-
-### State Transitions
-
-```rust
-impl Position {
-    pub fn apply_detector_signal(
-        &mut self,
-        signal: DetectorSignal,
-    ) -> Result<EngineAction, DomainError> {
-        match self.state {
-            PositionState::Armed { .. } => {
-                // Calculate palma, stop loss, stop gain, position size
-                let palma = PalmaDaMao::from_entry_and_stop(
-                    signal.entry_price,
-                    signal.stop_loss,
-                );
-                palma.validate()?;
-
-                let position_size = self.calculate_position_size(
-                    signal.entry_price,
-                    signal.stop_loss,
-                )?;
-
-                // Transition to Entering
-                self.state = PositionState::Entering {
-                    entry_order_id: OrderId::new(),
-                    expected_entry: signal.entry_price,
-                };
-                self.palma = Some(palma);
-                self.entry_price = Some(signal.entry_price);
-                self.stop_loss = signal.stop_loss;
-                self.stop_gain = signal.stop_gain;
-                self.quantity = position_size;
-
-                Ok(EngineAction::PlaceOrder(OrderIntent {
-                    symbol: self.symbol.clone(),
-                    side: self.side.entry_action(),
-                    quantity: position_size,
-                    order_type: OrderType::Market,
-                }))
-            }
-            _ => Err(DomainError::InvalidStateTransition {
-                from: self.state.clone(),
-                event: "detector_signal",
-            }),
-        }
-    }
-
-    pub fn apply_entry_filled(
-        &mut self,
-        fill: OrderFill,
-    ) -> Result<EngineAction, DomainError> {
-        match self.state {
-            PositionState::Entering { .. } => {
-                // Transition to Active
-                self.state = PositionState::Active {
-                    monitor_active: true,
-                    last_price: fill.price,
-                    insurance_stop_id: None,
-                };
-                self.entry_filled_at = Some(Utc::now());
-
-                // Place insurance stop (optional)
-                if self.strategy.insurance_stop_enabled {
-                    let insurance_stop = self.calculate_insurance_stop()?;
-                    return Ok(EngineAction::PlaceOrder(insurance_stop));
-                }
-
-                Ok(EngineAction::EmitEvent(Event::PositionActivated {
-                    position_id: self.id,
-                    entry_price: fill.price,
-                }))
-            }
-            _ => Err(DomainError::InvalidStateTransition {
-                from: self.state.clone(),
-                event: "entry_filled",
-            }),
-        }
-    }
-
-    pub fn apply_stop_loss_trigger(
-        &mut self,
-        current_price: Price,
-    ) -> Result<EngineAction, DomainError> {
-        match self.state {
-            PositionState::Active { .. } => {
-                // Transition to Exiting
-                self.state = PositionState::Exiting {
-                    exit_order_id: OrderId::new(),
-                    exit_reason: ExitReason::StopLoss,
-                };
-
-                Ok(EngineAction::PlaceOrder(OrderIntent {
-                    symbol: self.symbol.clone(),
-                    side: self.side.exit_action(),
-                    quantity: self.quantity,
-                    order_type: OrderType::Market,
-                }))
-            }
-            _ => Err(DomainError::InvalidStateTransition {
-                from: self.state.clone(),
-                event: "stop_loss_trigger",
-            }),
-        }
-    }
-
-    pub fn apply_exit_filled(
-        &mut self,
-        fill: OrderFill,
-    ) -> Result<(), DomainError> {
-        match self.state {
-            PositionState::Exiting { exit_reason, .. } => {
-                // Calculate PnL
-                let entry_value = self.entry_price.unwrap().as_decimal()
-                    * self.quantity.as_decimal();
-                let exit_value = fill.price.as_decimal()
-                    * self.quantity.as_decimal();
-
-                let pnl = match self.side {
-                    Side::Long => exit_value - entry_value,
-                    Side::Short => entry_value - exit_value,
-                };
-
-                let pnl_with_fees = pnl - self.fees_paid;
-
-                // Transition to Closed
-                self.state = PositionState::Closed {
-                    exit_price: fill.price,
-                    realized_pnl: pnl_with_fees,
-                    exit_reason,
-                };
-                self.closed_at = Some(Utc::now());
-
-                Ok(())
-            }
-            _ => Err(DomainError::InvalidStateTransition {
-                from: self.state.clone(),
-                event: "exit_filled",
-            }),
-        }
-    }
+    TrailingStop,   // Price hit trailing stop
+    UserPanic,      // User triggered emergency exit
+    Error,          // System error forced exit
 }
 ```
 
 ---
 
-## Palma da Mão (Technical Stop Distance)
+## Technical Stop Distance
 
 ### Calculation
 
-**Input**: Detector signal with entry price and technical stop loss
-
-**Output**: Palma structure with distance and percentage
-
 ```rust
-pub fn calculate_palma(
+pub fn calculate_tech_stop_distance(
     entry_price: Price,
     stop_loss: Price,
-) -> Result<PalmaDaMao, DomainError> {
+) -> Result<TechnicalStopDistance, DomainError> {
     let distance = (entry_price.as_decimal() - stop_loss.as_decimal()).abs();
-    let distance_pct = distance / entry_price.as_decimal() * Decimal::from(100);
+    let distance_percent = distance / entry_price.as_decimal() * dec!(100);
 
-    let palma = PalmaDaMao {
-        distance,
-        distance_pct,
-        entry_price,
-        stop_loss,
-    };
+    let tech_stop = TechnicalStopDistance::new(distance, distance_percent);
+    tech_stop.validate()?;
 
-    palma.validate()?;
-    Ok(palma)
+    Ok(tech_stop)
 }
 ```
 
-### Validation Rules
+### Validation
 
-```rust
-impl PalmaDaMao {
-    pub fn validate(&self) -> Result<(), DomainError> {
-        // 1. Distance must be positive
-        if self.distance <= Decimal::ZERO {
-            return Err(DomainError::InvalidPalma(
-                "Stop loss must be different from entry"
-            ));
-        }
-
-        // 2. Stop cannot be too wide (>10%)
-        if self.distance_pct > Decimal::from(10) {
-            return Err(DomainError::InvalidPalma(
-                format!("Stop too wide: {:.2}% (max 10%)", self.distance_pct)
-            ));
-        }
-
-        // 3. Stop cannot be too tight (<0.1%)
-        if self.distance_pct < Decimal::new(1, 1) {  // 0.1%
-            return Err(DomainError::InvalidPalma(
-                format!("Stop too tight: {:.2}% (min 0.1%)", self.distance_pct)
-            ));
-        }
-
-        Ok(())
-    }
-}
-```
+| Constraint | Value | Reason |
+|------------|-------|--------|
+| Minimum | 0.1% | Prevents noise-triggered exits |
+| Maximum | 10% | Prevents excessive risk per trade |
 
 ### Example
 
 ```
 Entry Price: $95,000
-Technical SL: $93,500
-Palma Distance: $1,500
-Palma %: 1.58%
+Technical SL: $93,500 (from chart: 2nd support level on 15m)
+
+Distance: $1,500
+Distance %: 1.58%
 
 ✅ Valid (0.1% < 1.58% < 10%)
 ```
 
 ---
 
-## Position Sizing
+## Trailing Stop Strategy
 
-### Formula
+### How It Works
 
-**Golden Rule**: Position size is DERIVED from technical stop, NOT chosen arbitrarily.
+The trailing stop **follows** favorable price movement by maintaining a fixed distance (tech stop distance) from the most favorable price seen.
+
+#### For Long Positions
 
 ```
-Position Size = (Capital × Risk %) / Palma Distance
+Initial: trailing_stop = entry_price - tech_distance
+Update:  IF current_price > favorable_extreme THEN
+           favorable_extreme = current_price
+           trailing_stop = current_price - tech_distance
+Exit:    IF current_price <= trailing_stop THEN trigger exit
+```
+
+#### For Short Positions
+
+```
+Initial: trailing_stop = entry_price + tech_distance
+Update:  IF current_price < favorable_extreme THEN
+           favorable_extreme = current_price
+           trailing_stop = current_price + tech_distance
+Exit:    IF current_price >= trailing_stop THEN trigger exit
+```
+
+### Example: Long Position
+
+```
+Entry: $95,000
+Tech Distance: $1,500
+Initial Stop: $93,500
+
+Price moves to $96,000 (new high!)
+→ favorable_extreme = $96,000
+→ trailing_stop = $96,000 - $1,500 = $94,500
+
+Price moves to $97,000 (new high!)
+→ favorable_extreme = $97,000
+→ trailing_stop = $97,000 - $1,500 = $95,500
+
+Price drops to $95,500 (hits trailing stop)
+→ EXIT TRIGGERED
+→ Profit: $95,500 - $95,000 = $500
+
+Without trailing: would have exited at fixed stop gain or held longer
+With trailing: captured $2,000 of the $2,000 move, then protected $500 profit
+```
+
+### Why Trailing Stop Instead of Fixed Stop Gain?
+
+| Fixed Stop Gain | Trailing Stop |
+|-----------------|---------------|
+| Exits at predetermined target | Follows favorable movement |
+| May exit too early in trends | Captures more profit in trends |
+| Requires predicting target | No prediction needed |
+| Two parameters (SL + SG) | One parameter (tech distance) |
+
+---
+
+## Position Sizing
+
+### Golden Rule
+
+**Position size is DERIVED from technical stop, NOT chosen arbitrarily.**
+
+```
+Position Size = Max Risk Amount / Tech Stop Distance
+             = (Capital × Risk%) / |Entry - Stop|
 ```
 
 ### Implementation
 
 ```rust
-impl Position {
-    pub fn calculate_position_size(
-        &self,
-        entry_price: Price,
-        stop_loss: Price,
-    ) -> Result<Quantity, DomainError> {
-        // 1. Calculate palma
-        let palma = PalmaDaMao::from_entry_and_stop(entry_price, stop_loss);
-        palma.validate()?;
+pub fn calculate_position_size(
+    risk_config: &RiskConfig,
+    tech_stop: &TechnicalStopDistance,
+) -> Result<Quantity, DomainError> {
+    // 1. Validate tech stop
+    tech_stop.validate()?;
 
-        // 2. Get risk config
-        let risk_config = &self.strategy.risk_config;
-        let capital = risk_config.capital;
-        let risk_pct = risk_config.risk_per_trade_pct;  // Default: 1%
+    // 2. Calculate max risk amount
+    let max_risk = risk_config.max_risk_amount();
 
-        // 3. Calculate max risk amount
-        let max_risk = capital * risk_pct / Decimal::from(100);
+    // 3. Calculate position size
+    let size = max_risk / tech_stop.distance();
 
-        // 4. Calculate position size
-        let position_size_quote = max_risk / palma.distance;
-        let position_size_base = position_size_quote / entry_price.as_decimal();
-
-        // 5. Apply leverage
-        let leveraged_size = position_size_base * Decimal::from(self.leverage.as_u8());
-
-        // 6. Round to exchange precision
-        let quantity = self.round_to_precision(leveraged_size)?;
-
-        // 7. Validate min/max notional
-        self.validate_notional(quantity, entry_price)?;
-
-        Ok(Quantity::new(quantity)?)
+    // 4. Validate minimum
+    if size < Decimal::from_str("0.00001")? {
+        return Err(DomainError::PositionSizingError("Size too small"));
     }
 
-    fn validate_notional(
-        &self,
-        quantity: Decimal,
-        price: Price,
-    ) -> Result<(), DomainError> {
-        let notional = quantity * price.as_decimal();
-
-        // Binance min notional: $10
-        if notional < Decimal::from(10) {
-            return Err(DomainError::PositionTooSmall(
-                format!("Notional ${} < $10 min", notional)
-            ));
-        }
-
-        // Max notional: Check against available capital
-        let max_notional = self.strategy.risk_config.capital
-            * Decimal::from(self.leverage.as_u8());
-
-        if notional > max_notional {
-            return Err(DomainError::PositionTooLarge(
-                format!("Notional ${} > ${} available", notional, max_notional)
-            ));
-        }
-
-        Ok(())
-    }
+    Ok(Quantity::new(size)?)
 }
 ```
 
@@ -758,15 +565,81 @@ Capital: $10,000
 Risk per trade: 1%
 Entry: $95,000
 Technical SL: $93,500
-Palma: $1,500
-Leverage: 3x
 
-Max Risk: $10,000 × 0.01 = $100
-Position Size (quote): $100 / $1,500 = 0.0667 BTC
-Leveraged Size: 0.0667 × 3 = 0.2001 BTC
-Notional: 0.2001 × $95,000 = $19,009.50
+Max Risk: $10,000 × 1% = $100
+Tech Distance: $1,500
+Position Size: $100 / $1,500 = 0.0667 BTC
 
-✅ Valid (> $10 min, < $30,000 max)
+Notional Value: 0.0667 × $95,000 = $6,333
+
+If stopped at $93,500:
+  Loss = 0.0667 × $1,500 = $100 = 1% ✓
+```
+
+---
+
+## Detector Architecture
+
+### Per-Position Watchers
+
+Detectors are **per-position watchers**, NOT market scanners.
+
+```
+┌─────────────────────────────────────────────────────────────────┐
+│                         DAEMON                                  │
+│                                                                 │
+│   Position Armed                                                │
+│        │                                                        │
+│        ▼                                                        │
+│   ┌─────────────────────────────────────────────────────────┐  │
+│   │              DetectorTask(position_id)                   │  │
+│   │                                                          │  │
+│   │  1. Load position context (symbol, side, strategy)       │  │
+│   │  2. Subscribe to market data feed                        │  │
+│   │  3. Evaluate entry conditions in loop                    │  │
+│   │  4. On condition met: emit ONE DetectorSignal            │  │
+│   │  5. Die (single-shot)                                    │  │
+│   │                                                          │  │
+│   └──────────────────────────┬──────────────────────────────┘  │
+│                              │                                  │
+│                              ▼                                  │
+│                    DetectorSignal {                             │
+│                      signal_id,      // UUID for idempotency    │
+│                      position_id,    // Which position          │
+│                      entry_price,    // Current market price    │
+│                      stop_loss,      // From chart analysis     │
+│                    }                                            │
+│                              │                                  │
+│                              ▼                                  │
+│                         Event Bus                               │
+│                              │                                  │
+│                              ▼                                  │
+│                          Engine                                 │
+│                    (validates, sizes, executes)                 │
+└─────────────────────────────────────────────────────────────────┘
+```
+
+### Lifecycle
+
+| Event | Detector Action |
+|-------|-----------------|
+| Position Armed | Daemon spawns DetectorTask |
+| Condition Met | Detector emits ONE signal, then dies |
+| Position Cancelled | Daemon kills DetectorTask |
+| Position Enters | DetectorTask already dead (fired signal) |
+
+### Idempotency
+
+The `signal_id` in `DetectorSignal` ensures:
+1. Engine checks if signal already processed before transitioning
+2. Duplicate signals (e.g., from retry) are safely ignored
+3. `Entering` state stores `signal_id` for double-check
+
+```rust
+// In Engine::decide_entry
+if position.state == Entering { signal_id } && signal_id == new_signal.signal_id {
+    return Ok(EngineDecision::no_action());  // Already processed
+}
 ```
 
 ---
@@ -777,88 +650,148 @@ Notional: 0.2001 × $95,000 = $19,009.50
 
 ```rust
 pub struct RiskConfig {
-    pub capital: Decimal,                  // Total capital allocated
-    pub risk_per_trade_pct: Decimal,       // Default: 1%
-    pub max_open_positions: usize,         // Default: 3
-    pub max_daily_loss_pct: Decimal,       // Default: 3%
-    pub max_leverage: u8,                  // Default: 3x
-    pub insurance_stop_enabled: bool,      // Default: true
-    pub insurance_stop_buffer_pct: Decimal,// Default: 1%
+    pub capital: Decimal,              // Total allocated capital
+    pub risk_percent: Decimal,         // Risk per trade (default: 1%)
+    pub max_drawdown_percent: Decimal, // Max account drawdown (default: 10%)
 }
+```
 
-impl Default for RiskConfig {
-    fn default() -> Self {
-        Self {
-            capital: Decimal::ZERO,
-            risk_per_trade_pct: Decimal::ONE,  // 1%
-            max_open_positions: 3,
-            max_daily_loss_pct: Decimal::from(3),  // 3%
-            max_leverage: 3,
-            insurance_stop_enabled: true,
-            insurance_stop_buffer_pct: Decimal::ONE,  // 1%
-        }
+**Removed from original design**:
+- `max_leverage` - Fixed at 10x (Binance isolated margin)
+- `insurance_stop_enabled` - No insurance stops in v2
+
+### Risk Checks (Future: Phase 5)
+
+```rust
+impl RiskManager {
+    /// Check if new position can be opened
+    pub fn can_open_position(&self, account: &Account) -> Result<(), RiskError> {
+        // 1. Check daily drawdown limit
+        // 2. Check max open positions
+        // 3. Check account equity
     }
 }
 ```
 
-### Risk Checks
+---
+
+## Events
+
+### Event Types
 
 ```rust
-pub struct RiskManager {
-    config: RiskConfig,
+pub enum Event {
+    // === Position Lifecycle ===
+
+    /// Position created and armed
+    PositionArmed {
+        position_id: PositionId,
+        account_id: AccountId,
+        symbol: Symbol,
+        side: Side,
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Detector fired entry signal
+    EntrySignalReceived {
+        position_id: PositionId,
+        signal_id: Uuid,
+        entry_price: Price,
+        stop_loss: Price,
+        quantity: Quantity,
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Entry order placed on exchange
+    EntryOrderPlaced {
+        position_id: PositionId,
+        order_id: OrderId,
+        symbol: Symbol,
+        side: OrderSide,
+        quantity: Quantity,
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Entry order filled
+    EntryFilled {
+        position_id: PositionId,
+        order_id: OrderId,
+        fill_price: Price,
+        filled_quantity: Quantity,
+        fee: Decimal,
+        initial_stop: Price,  // Initial trailing stop
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Trailing stop updated (price moved favorably)
+    TrailingStopUpdated {
+        position_id: PositionId,
+        previous_stop: Price,
+        new_stop: Price,
+        trigger_price: Price,  // Price that triggered update
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Exit triggered (trailing stop hit)
+    ExitTriggered {
+        position_id: PositionId,
+        trigger_price: Price,
+        stop_price: Price,
+        reason: ExitReason,
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Exit order placed
+    ExitOrderPlaced {
+        position_id: PositionId,
+        order_id: OrderId,
+        symbol: Symbol,
+        side: OrderSide,
+        quantity: Quantity,
+        reason: ExitReason,
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Exit order filled
+    ExitFilled {
+        position_id: PositionId,
+        order_id: OrderId,
+        fill_price: Price,
+        filled_quantity: Quantity,
+        fee: Decimal,
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Position closed
+    PositionClosed {
+        position_id: PositionId,
+        entry_price: Price,
+        exit_price: Price,
+        quantity: Quantity,
+        realized_pnl: Decimal,
+        fees_paid: Decimal,
+        exit_reason: ExitReason,
+        duration_seconds: u64,
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Position error
+    PositionError {
+        position_id: PositionId,
+        error: String,
+        recoverable: bool,
+        timestamp: DateTime<Utc>,
+    },
 }
+```
 
-impl RiskManager {
-    pub fn can_open_position(
-        &self,
-        position: &Position,
-        open_positions: &[Position],
-    ) -> Result<(), RiskError> {
-        // 1. Check max open positions
-        if open_positions.len() >= self.config.max_open_positions {
-            return Err(RiskError::MaxPositionsReached);
-        }
+### Event Accessors
 
-        // 2. Check daily loss limit
-        let today_pnl = self.calculate_daily_pnl(open_positions);
-        let max_daily_loss = self.config.capital
-            * self.config.max_daily_loss_pct
-            / Decimal::from(100);
-
-        if today_pnl < -max_daily_loss {
-            return Err(RiskError::DailyLossLimitReached {
-                current: today_pnl,
-                limit: max_daily_loss,
-            });
-        }
-
-        // 3. Check leverage limit
-        if position.leverage.as_u8() > self.config.max_leverage {
-            return Err(RiskError::LeverageTooHigh {
-                requested: position.leverage.as_u8(),
-                max: self.config.max_leverage,
-            });
-        }
-
-        Ok(())
-    }
-
-    fn calculate_daily_pnl(&self, positions: &[Position]) -> Decimal {
-        let today = Utc::now().date_naive();
-
-        positions
-            .iter()
-            .filter(|p| {
-                p.closed_at
-                    .map(|closed| closed.date_naive() == today)
-                    .unwrap_or(false)
-            })
-            .map(|p| match &p.state {
-                PositionState::Closed { realized_pnl, .. } => *realized_pnl,
-                _ => Decimal::ZERO,
-            })
-            .sum()
-    }
+```rust
+impl Event {
+    pub fn position_id(&self) -> PositionId;
+    pub fn timestamp(&self) -> DateTime<Utc>;
+    pub fn event_type(&self) -> &'static str;
 }
 ```
 
@@ -869,147 +802,56 @@ impl RiskManager {
 ### Position Invariants
 
 1. **Entry price must be positive**: `entry_price > 0`
-2. **Stop loss must be valid**: `0 < |entry - stop_loss| < entry × 10%`
+2. **Tech stop must be valid**: `0.1% <= distance_percent <= 10%`
 3. **Quantity must be positive**: `quantity > 0`
-4. **Leverage must be 1-10x**: `1 <= leverage <= 10`
-5. **State transitions must be valid**: See state machine
-6. **Closed position must have PnL**: `state == Closed → realized_pnl != null`
+4. **State transitions must be valid**: Armed → Entering → Active → Exiting → Closed
+5. **Signal ID is unique**: No duplicate signal processing
 
 ### System Invariants
 
-1. **Single active trader per (account, symbol)**: Enforced by lease
-2. **All orders must have intent journal entry**: WAL before execution
-3. **Total risk across positions <= capital**: Sum of position risks
-4. **No manual closes**: All exits via system (SL/SG/panic)
+1. **One detector per armed position**: Detector spawned on arm, killed on transition
+2. **Single-shot signals**: Each detector emits at most ONE signal
+3. **Idempotent execution**: Same signal_id processed only once
+4. **All exits via system**: No manual closes (trailing stop, panic, or error)
 
----
+### Trailing Stop Invariants
 
-## Events
-
-### Event Types
-
-```rust
-pub enum Event {
-    // Position lifecycle
-    PositionArmed {
-        position_id: PositionId,
-        symbol: Symbol,
-        strategy: String,
-    },
-
-    EntrySignalReceived {
-        position_id: PositionId,
-        entry_price: Price,
-        stop_loss: Price,
-        stop_gain: Price,
-    },
-
-    EntryOrderPlaced {
-        position_id: PositionId,
-        order_id: OrderId,
-        quantity: Quantity,
-    },
-
-    EntryOrderFilled {
-        position_id: PositionId,
-        order_id: OrderId,
-        fill_price: Price,
-        fill_quantity: Quantity,
-    },
-
-    PositionActivated {
-        position_id: PositionId,
-        entry_price: Price,
-    },
-
-    StopLossTriggered {
-        position_id: PositionId,
-        trigger_price: Price,
-        stop_loss: Price,
-    },
-
-    StopGainTriggered {
-        position_id: PositionId,
-        trigger_price: Price,
-        stop_gain: Price,
-    },
-
-    ExitOrderPlaced {
-        position_id: PositionId,
-        order_id: OrderId,
-        reason: ExitReason,
-    },
-
-    ExitOrderFilled {
-        position_id: PositionId,
-        order_id: OrderId,
-        fill_price: Price,
-    },
-
-    PositionClosed {
-        position_id: PositionId,
-        realized_pnl: Decimal,
-        exit_reason: ExitReason,
-    },
-
-    // Error events
-    PositionError {
-        position_id: PositionId,
-        error: String,
-    },
-
-    // Reconciliation
-    ReconciliationStarted {
-        position_id: PositionId,
-    },
-
-    DiscrepancyDetected {
-        position_id: PositionId,
-        discrepancy: Discrepancy,
-    },
-
-    DegradedModeEntered {
-        position_id: PositionId,
-        reason: String,
-    },
-}
-```
-
-### Event Sourcing
-
-All events are stored in append-only log:
-
-```sql
-CREATE TABLE events (
-    id BIGSERIAL PRIMARY KEY,
-    position_id UUID NOT NULL,
-    event_type TEXT NOT NULL,
-    event_data JSONB NOT NULL,
-    created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
-);
-
-CREATE INDEX idx_events_position_id ON events(position_id);
-CREATE INDEX idx_events_created_at ON events(created_at);
-```
+1. **Never moves against position**:
+   - Long: trailing stop only increases
+   - Short: trailing stop only decreases
+2. **Distance is constant**: Always equals tech_stop_distance
+3. **Exit is immediate**: When price hits stop, exit triggers (no delay)
 
 ---
 
 ## Validation Checklist
 
-Before marking domain model complete:
+Domain model implementation status:
 
-- [ ] All entities have clear identity and lifecycle
-- [ ] All value objects are immutable and validated
-- [ ] State machine transitions are exhaustive
-- [ ] Palma da Mão calculation is correct
-- [ ] Position sizing formula matches golden rule
-- [ ] Risk management checks all constraints
-- [ ] Invariants are enforced at compile time where possible
-- [ ] Events capture all state changes
-- [ ] Examples validate realistic scenarios
+- [x] All entities have clear identity and lifecycle
+- [x] All value objects are immutable and validated
+- [x] State machine transitions are exhaustive
+- [x] Technical stop distance calculation is correct
+- [x] Trailing stop logic handles Long and Short
+- [x] Position sizing formula matches Golden Rule
+- [x] DetectorSignal includes signal_id for idempotency
+- [x] Events capture all state changes
+- [x] 73 tests validate all business logic
 
 ---
 
-**Next Steps**: Implement domain types in `robson-domain` crate
+## Implementation Reference
 
-See [EXECUTION-PLAN.md](./EXECUTION-PLAN.md) for detailed roadmap.
+| Concept | File | Tests |
+|---------|------|-------|
+| Value Objects | `robson-domain/src/value_objects.rs` | 22 |
+| Entities | `robson-domain/src/entities.rs` | 10 |
+| Events | `robson-domain/src/events.rs` | 6 |
+| Engine (Entry) | `robson-engine/src/lib.rs` | 9 |
+| Engine (Exit) | `robson-engine/src/lib.rs` | 12 |
+| Repository | `robson-store/src/repository.rs` | - |
+| Memory Store | `robson-store/src/memory.rs` | 14 |
+
+---
+
+**Next**: See [EXECUTION-PLAN.md](./EXECUTION-PLAN.md) for implementation roadmap (Phase 4+)

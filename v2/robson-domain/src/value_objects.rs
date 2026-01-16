@@ -33,6 +33,14 @@ pub enum DomainError {
     /// Position sizing error
     #[error("Position sizing error: {0}")]
     PositionSizingError(String),
+
+    /// Invalid signal (mismatched position, symbol, or side)
+    #[error("Invalid signal: {0}")]
+    InvalidSignal(String),
+
+    /// Invalid state transition
+    #[error("Invalid state transition: {0}")]
+    InvalidStateTransition(String),
 }
 
 // =============================================================================

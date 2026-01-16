@@ -30,6 +30,22 @@ pub enum Event {
         timestamp: DateTime<Utc>,
     },
 
+    /// Detector fired entry signal
+    EntrySignalReceived {
+        /// Position identifier
+        position_id: PositionId,
+        /// Signal ID for idempotency
+        signal_id: uuid::Uuid,
+        /// Entry price from signal
+        entry_price: Price,
+        /// Technical stop loss from signal
+        stop_loss: Price,
+        /// Calculated position size
+        quantity: Quantity,
+        /// When the signal was received
+        timestamp: DateTime<Utc>,
+    },
+
     /// Entry order placed on exchange
     EntryOrderPlaced {
         /// Position identifier
@@ -184,6 +200,7 @@ impl Event {
     pub fn position_id(&self) -> PositionId {
         match self {
             Event::PositionArmed { position_id, .. }
+            | Event::EntrySignalReceived { position_id, .. }
             | Event::EntryOrderPlaced { position_id, .. }
             | Event::EntryFilled { position_id, .. }
             | Event::TrailingStopUpdated { position_id, .. }
@@ -201,6 +218,7 @@ impl Event {
     pub fn timestamp(&self) -> DateTime<Utc> {
         match self {
             Event::PositionArmed { timestamp, .. }
+            | Event::EntrySignalReceived { timestamp, .. }
             | Event::EntryOrderPlaced { timestamp, .. }
             | Event::EntryFilled { timestamp, .. }
             | Event::TrailingStopUpdated { timestamp, .. }
@@ -218,6 +236,7 @@ impl Event {
     pub fn event_type(&self) -> &'static str {
         match self {
             Event::PositionArmed { .. } => "position_armed",
+            Event::EntrySignalReceived { .. } => "entry_signal_received",
             Event::EntryOrderPlaced { .. } => "entry_order_placed",
             Event::EntryFilled { .. } => "entry_filled",
             Event::TrailingStopUpdated { .. } => "trailing_stop_updated",

@@ -223,8 +223,12 @@ pub enum PositionState {
 
     /// Entry order submitted, waiting for fill
     Entering {
+        /// Order ID for the entry order
         entry_order_id: OrderId,
+        /// Expected entry price from signal
         expected_entry: Price,
+        /// Signal ID for idempotency (prevents duplicate processing)
+        signal_id: Uuid,
     },
 
     /// Position active, monitoring trailing stop (1x technical stop distance)
@@ -444,19 +448,82 @@ pub enum OrderStatus {
 // =============================================================================
 
 /// Signal from detector to trigger entry
+///
+/// Emitted by a DetectorTask when entry conditions are met.
+/// Each detector emits at most ONE signal per position (single-shot).
+///
+/// # Idempotency
+///
+/// The `signal_id` ensures idempotent processing:
+/// - Engine checks if signal was already processed before transitioning
+/// - Duplicate signals with same `signal_id` are safely ignored
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct DetectorSignal {
+    /// Unique signal identifier for idempotency
+    pub signal_id: Uuid,
+    /// Position this signal belongs to (detector is per-position)
     pub position_id: PositionId,
+    /// Trading pair symbol
     pub symbol: Symbol,
+    /// Position direction (must match armed position)
     pub side: Side,
+    /// Suggested entry price (current market price when signal fired)
     pub entry_price: Price,
-    pub stop_loss: Price,  // Technical stop (from chart analysis)
+    /// Technical stop loss from chart analysis
+    pub stop_loss: Price,
+    /// When the signal was generated
+    pub timestamp: DateTime<Utc>,
 }
 
 impl DetectorSignal {
+    /// Create a new detector signal
+    pub fn new(
+        position_id: PositionId,
+        symbol: Symbol,
+        side: Side,
+        entry_price: Price,
+        stop_loss: Price,
+    ) -> Self {
+        Self {
+            signal_id: Uuid::now_v7(),
+            position_id,
+            symbol,
+            side,
+            entry_price,
+            stop_loss,
+            timestamp: Utc::now(),
+        }
+    }
+
     /// Calculate technical stop distance from signal
     pub fn tech_stop_distance(&self) -> TechnicalStopDistance {
         TechnicalStopDistance::from_entry_and_stop(self.entry_price, self.stop_loss)
+    }
+
+    /// Validate the signal matches the position
+    pub fn validate_for_position(&self, position: &Position) -> Result<(), DomainError> {
+        if self.position_id != position.id {
+            return Err(DomainError::InvalidSignal(format!(
+                "Signal position_id {} does not match position {}",
+                self.position_id, position.id
+            )));
+        }
+
+        if self.symbol != position.symbol {
+            return Err(DomainError::InvalidSignal(format!(
+                "Signal symbol {} does not match position symbol {}",
+                self.symbol, position.symbol
+            )));
+        }
+
+        if self.side != position.side {
+            return Err(DomainError::InvalidSignal(format!(
+                "Signal side {:?} does not match position side {:?}",
+                self.side, position.side
+            )));
+        }
+
+        Ok(())
     }
 }
 
