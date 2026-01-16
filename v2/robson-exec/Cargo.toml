@@ -16,6 +16,10 @@ serde_json = { workspace = true }
 uuid = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+rust_decimal = { workspace = true }
+chrono = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }
+rust_decimal_macros = { workspace = true }
+tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
