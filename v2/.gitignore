@@ -1,0 +1,55 @@
+# Rust
+/target/
+Cargo.lock
+**/*.rs.bk
+*.pdb
+
+# CLI (Bun/TypeScript)
+/cli/node_modules/
+/cli/dist/
+/cli/bun.lockb
+
+# MCP Configuration (contains secrets)
+.mcp.json
+.env.mcp
+
+# Environment variables
+.env
+.env.local
+.env.*.local
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+
+# Database
+*.db
+*.sqlite
+*.sqlite3
+
+# Test coverage
+coverage/
+*.lcov
+
+# Build artifacts
+*.wasm
+*.so
+*.dylib
+*.dll
+
+# Documentation build
+docs/_build/
+site/

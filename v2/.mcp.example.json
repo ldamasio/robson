@@ -1,0 +1,121 @@
+{
+  "$schema": "https://modelcontextprotocol.io/schema/mcp.json",
+  "version": "1.0",
+  "description": "MCP configuration for Robson v2 development",
+  "mcpServers": {
+    "github": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-github"],
+      "env": {
+        "GITHUB_TOKEN": "${GITHUB_TOKEN}",
+        "GITHUB_OWNER": "ldamasio",
+        "GITHUB_REPO": "robson"
+      },
+      "description": "GitHub integration for issues, PRs, code search",
+      "capabilities": [
+        "search_code",
+        "get_file_contents",
+        "list_issues",
+        "create_issue",
+        "get_pull_request",
+        "create_pull_request",
+        "list_commits"
+      ],
+      "useCase": [
+        "Search for similar code patterns across the codebase",
+        "Create issues for bugs found during development",
+        "Review PRs and provide feedback",
+        "Check recent commits and changes"
+      ]
+    },
+    "postgres": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-postgres"],
+      "env": {
+        "POSTGRES_CONNECTION_STRING": "${ROBSON_DATABASE_URL}"
+      },
+      "description": "PostgreSQL integration for database schema and queries",
+      "capabilities": [
+        "list_tables",
+        "describe_table",
+        "execute_query",
+        "explain_query"
+      ],
+      "useCase": [
+        "Inspect database schema for robson-store crate",
+        "Test SQLx queries before adding to code",
+        "Analyze query performance with EXPLAIN",
+        "Validate migration scripts"
+      ],
+      "security": {
+        "readOnly": false,
+        "warning": "⚠️ This MCP can execute write queries. Use with caution in production databases!"
+      }
+    },
+    "sentry": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-sentry"],
+      "env": {
+        "SENTRY_AUTH_TOKEN": "${SENTRY_AUTH_TOKEN}",
+        "SENTRY_ORG": "robson-bot",
+        "SENTRY_PROJECT": "robson-v2"
+      },
+      "description": "Sentry integration for error monitoring and debugging",
+      "capabilities": [
+        "list_issues",
+        "get_issue_details",
+        "resolve_issue",
+        "search_events"
+      ],
+      "useCase": [
+        "Debug production errors from Sentry events",
+        "Analyze error patterns and stack traces",
+        "Correlate errors with code changes",
+        "Create fixes based on error context"
+      ]
+    },
+    "filesystem": {
+      "command": "npx",
+      "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+      "env": {
+        "ALLOWED_DIRECTORIES": "/home/psyctl/apps/robson/v2"
+      },
+      "description": "Filesystem access for reading project files",
+      "capabilities": [
+        "read_file",
+        "list_directory",
+        "search_files"
+      ],
+      "useCase": [
+        "Quick file access without explicit Read tool",
+        "Search across multiple files efficiently",
+        "List directory contents recursively"
+      ]
+    }
+  },
+  "defaultServers": ["filesystem"],
+  "settings": {
+    "timeout": 30000,
+    "retries": 3,
+    "logLevel": "info"
+  },
+  "notes": {
+    "setup": "Copy this file to .mcp.json and configure environment variables",
+    "envVars": {
+      "GITHUB_TOKEN": "GitHub personal access token with repo scope",
+      "ROBSON_DATABASE_URL": "PostgreSQL connection string (postgresql://user:pass@localhost/robson_v2)",
+      "SENTRY_AUTH_TOKEN": "Sentry API token with project:read and project:write scopes"
+    },
+    "security": [
+      "Never commit .mcp.json with real credentials",
+      "Use environment variables for sensitive data",
+      "Limit database access to development/staging only",
+      "Review MCP permissions before enabling"
+    ],
+    "optional": [
+      "All MCP servers are optional - enable only what you need",
+      "Start with 'filesystem' and add others as needed",
+      "Some servers require external accounts (GitHub, Sentry)"
+    ]
+  }
+}

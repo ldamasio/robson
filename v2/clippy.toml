@@ -1,0 +1,75 @@
+# Clippy Configuration for Robson v2
+# Lint rules specific to this project
+# See: https://rust-lang.github.io/rust-clippy/master/index.html
+
+# Cognitive complexity threshold
+# (max complexity before clippy warns - lower is stricter)
+cognitive-complexity-threshold = 15
+
+# Type complexity threshold
+# (max complexity for type definitions)
+type-complexity-threshold = 250
+
+# Single char binding names allowed in closures
+# (e.g., |x| x + 1 is OK, but let x = ... is not)
+single-char-binding-names-threshold = 4
+
+# Too many arguments threshold
+# (max function parameters before warning)
+too-many-arguments-threshold = 7
+
+# Too many lines threshold
+# (max lines in a function before warning)
+too-many-lines-threshold = 100
+
+# Vec box size threshold
+# (warn if Vec<Box<T>> where sizeof(T) < this)
+vec-box-size-threshold = 4096
+
+# Enum variant name threshold
+# (max length of enum variant names)
+enum-variant-name-threshold = 3
+
+# Literal representation threshold
+# (warn on large literals without separators, e.g., 1000000 vs 1_000_000)
+literal-representation-threshold = 65536
+
+# Disallowed methods
+# (methods that should never be used in this codebase)
+disallowed-methods = [
+    # Financial calculations should use Decimal, not f64
+    { path = "f64::from_str", reason = "Use Decimal::from_str_exact instead" },
+    { path = "std::primitive::f64::from", reason = "Use Decimal for financial amounts" },
+
+    # Avoid panic in production code
+    { path = "std::panic::panic", reason = "Return Result instead of panicking" },
+]
+
+# Disallowed types
+# (types that should not be used in this codebase)
+disallowed-types = [
+    # Financial amounts must use Decimal
+    { path = "f32", reason = "Use rust_decimal::Decimal for financial amounts" },
+    { path = "f64", reason = "Use rust_decimal::Decimal for financial amounts" },
+]
+
+# Avoid breaking exported API
+# (warn when public API changes)
+avoid-breaking-exported-api = true
+
+# Check private items
+# (also lint private functions/types, not just public API)
+check-private-items = false
+
+# Allow expect in tests
+# (expect/unwrap are OK in test code)
+allow-expect-in-tests = true
+allow-unwrap-in-tests = true
+
+# Suppress warnings for these specific lints
+# (use sparingly - prefer fixing the code instead)
+# allowed-lints = []
+
+# Warn on these specific lints
+# (upgrade warnings to errors)
+# warn-lints = []

@@ -1,0 +1,21 @@
+[package]
+name = "robson-exec"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+robson-domain = { path = "../robson-domain" }
+robson-engine = { path = "../robson-engine" }
+robson-store = { path = "../robson-store" }
+tokio = { workspace = true }
+async-trait = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }

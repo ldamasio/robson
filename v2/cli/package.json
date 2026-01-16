@@ -1,0 +1,35 @@
+{
+  "name": "robson-cli",
+  "version": "2.0.0-alpha",
+  "description": "Robson v2 CLI - Trading automation platform",
+  "main": "src/index.ts",
+  "type": "module",
+  "bin": {
+    "robson": "./src/index.ts"
+  },
+  "scripts": {
+    "dev": "bun run src/index.ts",
+    "build": "bun build src/index.ts --target=bun --outdir=dist",
+    "test": "bun test"
+  },
+  "keywords": [
+    "trading",
+    "crypto",
+    "binance",
+    "automation"
+  ],
+  "author": "Robson Team",
+  "license": "MIT",
+  "dependencies": {
+    "commander": "^11.1.0",
+    "axios": "^1.6.2",
+    "chalk": "^5.3.0",
+    "cli-table3": "^0.6.3",
+    "dotenv": "^16.3.1"
+  },
+  "devDependencies": {
+    "@types/node": "^20.10.5",
+    "bun-types": "^1.0.18",
+    "typescript": "^5.3.3"
+  }
+}

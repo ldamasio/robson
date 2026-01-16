@@ -1,0 +1,29 @@
+[package]
+name = "robsond"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "robsond"
+path = "src/main.rs"
+
+[dependencies]
+robson-domain = { path = "../robson-domain" }
+robson-engine = { path = "../robson-engine" }
+robson-exec = { path = "../robson-exec" }
+robson-connectors = { path = "../robson-connectors" }
+robson-store = { path = "../robson-store" }
+tokio = { workspace = true }
+axum = { workspace = true }
+tower = { workspace = true }
+tower-http = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+uuid = { workspace = true }
+anyhow = { workspace = true }
+thiserror = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+dotenvy = { workspace = true }

@@ -1,0 +1,70 @@
+# Cargo Configuration for Robson v2 Workspace
+# Workspace-level settings for build, clippy, and other tools
+
+# Clippy configuration (linting rules)
+[target.'cfg(all())']
+# No special target configuration needed for now
+
+# Clippy lints - STRICT mode for financial application
+[build]
+# Increase rustc optimization for debug builds (faster local dev)
+# Note: This doesn't affect --release builds
+
+# Clippy configuration via environment
+# (Clippy rules are configured via command-line flags in verify scripts)
+# See: ./scripts/verify.sh for full lint configuration
+
+# Alias for common commands
+[alias]
+# cargo xtask - custom build tasks (future use)
+xtask = "run --package xtask --"
+
+# cargo verify - run all quality checks
+verify = "run --package verify --"  # Will create this later if needed
+
+# Build configuration
+[build]
+# Jobs = number of parallel rustc processes (default: # of CPUs)
+# Uncomment to override: jobs = 4
+
+# Target directory (default: ./target)
+# target-dir = "target"
+
+# Incremental compilation (enabled by default in debug)
+incremental = true
+
+# Profile configuration (these override workspace Cargo.toml if needed)
+# [profile.dev]
+# opt-level = 0
+# debug = true
+
+# [profile.release]
+# Already configured in workspace Cargo.toml
+# (LTO, codegen-units, opt-level)
+
+# Network configuration
+[net]
+# Git fetch with CLI (better compatibility)
+git-fetch-with-cli = true
+
+# Retry failed downloads
+retry = 3
+
+# HTTP configuration
+[http]
+# Timeout for HTTP operations (30 seconds)
+timeout = 30
+
+# Registry configuration
+[registry]
+# Default registry (crates.io)
+# No changes needed
+
+# Source replacement (for vendoring or mirrors)
+# [source.crates-io]
+# replace-with = "vendored-sources"  # Uncomment for offline builds
+
+# Future: Cargo-deny configuration reference
+# See: https://github.com/EmbarkStudios/cargo-deny
+# Run: cargo install cargo-deny
+# Then: cargo deny check

@@ -1,0 +1,68 @@
+# Rust Formatter Configuration for Robson v2
+# Enforces consistent code style across all crates
+
+# Edition (align with workspace Cargo.toml)
+edition = "2021"
+
+# Line width (default: 100, we use 100 for readability)
+max_width = 100
+
+# Hard tabs vs spaces (use spaces for consistency)
+hard_tabs = false
+tab_spaces = 4
+
+# Imports
+imports_granularity = "Crate"  # Group imports by crate
+group_imports = "StdExternalCrate"  # std, external, local
+reorder_imports = true
+
+# Functions
+fn_params_layout = "Tall"  # Each param on new line if exceeds max_width
+fn_call_width = 80
+
+# Structs and enums
+struct_lit_width = 40  # Max width before breaking struct literals
+enum_discrim_align_threshold = 20
+
+# Chains (method calls)
+chain_width = 80
+use_small_heuristics = "Default"
+
+# Comments
+wrap_comments = true
+comment_width = 80
+normalize_comments = true
+normalize_doc_attributes = true
+
+# Formatting
+use_field_init_shorthand = true  # Use `field` instead of `field: field`
+use_try_shorthand = true  # Use `?` instead of `try!`
+force_explicit_abi = true  # Require explicit `extern "C"`
+
+# Newlines
+newline_style = "Unix"  # LF only (not CRLF)
+blank_lines_upper_bound = 2  # Max consecutive blank lines
+blank_lines_lower_bound = 0
+
+# Match statements
+match_arm_blocks = true  # Force braces for match arms with single expr
+match_block_trailing_comma = true
+
+# Control flow
+control_brace_style = "AlwaysSameLine"  # `} else {` on same line
+brace_style = "SameLineWhere"
+
+# Where clauses
+where_single_line = false  # Always break where clauses to new lines
+
+# Version (use stable features only)
+version = "Two"  # rustfmt v2 (stable)
+
+# Miscellaneous
+edition_idioms = true  # Use edition-specific idioms
+remove_nested_parens = true  # Simplify `((x))` to `(x)`
+spaces_around_ranges = false  # `0..10` not `0 .. 10`
+overflow_delimited_expr = true  # Allow breaking long expressions
+
+# Doc comments
+format_code_in_doc_comments = true  # Format code blocks in /// comments
