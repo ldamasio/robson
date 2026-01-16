@@ -18,16 +18,19 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+// Macro for creating Decimal literals
+use rust_decimal_macros::dec;
+
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
 use robson_engine::Engine;
-use robson_exec::{ExchangePort, Executor, IntentJournal, MarketDataPort, StubExchange};
+use robson_exec::{ExchangePort, Executor, IntentJournal, StubExchange};
 use robson_store::{MemoryStore, Store};
 
 use crate::api::{create_router, ApiState};
-use crate::config::{Config, Environment};
+use crate::config::Config;
 use crate::error::{DaemonError, DaemonResult};
 use crate::event_bus::{DaemonEvent, EventBus};
 use crate::position_manager::PositionManager;
@@ -51,12 +54,15 @@ pub struct Daemon<E: ExchangePort + 'static, S: Store + 'static> {
 impl Daemon<StubExchange, MemoryStore> {
     /// Create a new daemon with stub components (for testing/development).
     pub fn new_stub(config: Config) -> Self {
-        let exchange = Arc::new(StubExchange::new(rust_decimal_macros::dec!(95000)));
+        use robson_domain::RiskConfig;
+
+        let exchange = Arc::new(StubExchange::new(dec!(95000)));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
         let event_bus = Arc::new(EventBus::new(1000));
-        let engine = Engine::new();
+        let risk_config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(risk_config);
 
         let position_manager = Arc::new(RwLock::new(PositionManager::new(
             engine,

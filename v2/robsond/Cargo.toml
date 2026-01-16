@@ -28,6 +28,7 @@ tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 dotenvy = { workspace = true }
 rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
 chrono = { workspace = true }
 
 [dev-dependencies]

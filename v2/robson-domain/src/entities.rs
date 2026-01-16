@@ -116,6 +116,30 @@ impl Position {
             _ => None,
         }
     }
+
+    /// Calculate realized P&L for this position
+    ///
+    /// For active positions, returns unrealized P&L.
+    /// For closed positions, returns realized P&L from state.
+    pub fn calculate_pnl(&self) -> rust_decimal::Decimal {
+        let entry_price = match self.entry_price {
+            Some(p) => p.as_decimal(),
+            None => return rust_decimal::Decimal::ZERO,
+        };
+
+        match &self.state {
+            PositionState::Active { current_price, .. } => {
+                // Unrealized P&L
+                let quantity = self.quantity.as_decimal();
+                match self.side {
+                    Side::Long => (current_price.as_decimal() - entry_price) * quantity,
+                    Side::Short => (entry_price - current_price.as_decimal()) * quantity,
+                }
+            }
+            PositionState::Closed { realized_pnl, .. } => *realized_pnl,
+            _ => rust_decimal::Decimal::ZERO,
+        }
+    }
 }
 
 // =============================================================================

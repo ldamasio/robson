@@ -78,12 +78,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         &self,
         symbol: Symbol,
         side: Side,
-        risk_config: RiskConfig,
+        _risk_config: RiskConfig,  // Used by Engine for position sizing
         tech_stop_distance: TechnicalStopDistance,
         account_id: Uuid,
     ) -> DaemonResult<Position> {
-        // Create position
-        let position = Position::arm(symbol.clone(), side, risk_config, tech_stop_distance, account_id);
+        // Create position in Armed state
+        // Note: risk_config is used by Engine for position sizing, not stored here
+        // tech_stop_distance is stored for reference
+        let mut position = Position::new(account_id, symbol.clone(), side);
+        position.tech_stop_distance = Some(tech_stop_distance);
         let position_id = position.id;
 
         info!(
@@ -147,13 +150,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Delete position (it never entered, so no need to keep it)
         self.store.positions().delete(position_id).await?;
 
-        // Emit event
-        let event = Event::PositionDisarmed {
-            position_id,
-            timestamp: chrono::Utc::now(),
-        };
-        self.store.events().append(&event).await?;
-
         Ok(())
     }
 
@@ -168,7 +164,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         );
 
         // Load position
-        let mut position = self
+        let position = self
             .store
             .positions()
             .find_by_id(position_id)
@@ -181,16 +177,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Use engine to decide entry
         let decision = self.engine.decide_entry(&position, &signal)?;
 
-        // Apply state transition
-        if let Some(new_state) = decision.new_state {
+        // Apply state transition if any
+        if let Some(updated_position) = decision.updated_position {
             let old_state = format!("{:?}", position.state);
-            position.state = new_state;
-            self.store.positions().save(&position).await?;
+            self.store.positions().save(&updated_position).await?;
 
             self.event_bus.send(DaemonEvent::PositionStateChanged {
                 position_id,
                 previous_state: old_state,
-                new_state: format!("{:?}", position.state),
+                new_state: format!("{:?}", updated_position.state),
                 timestamp: chrono::Utc::now(),
             });
         }
@@ -239,7 +234,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         filled_quantity: Quantity,
     ) -> DaemonResult<()> {
         // Load position
-        let mut position = self
+        let position = self
             .store
             .positions()
             .find_by_id(position_id)
@@ -249,11 +244,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Use engine to process fill
         let decision = self.engine.process_entry_fill(&position, fill_price, filled_quantity)?;
 
-        // Apply state transition
-        if let Some(new_state) = decision.new_state {
+        // Apply state transition if any
+        if let Some(updated_position) = decision.updated_position {
             let old_state = format!("{:?}", position.state);
-            position.state = new_state;
-            self.store.positions().save(&position).await?;
+            self.store.positions().save(&updated_position).await?;
 
             info!(
                 %position_id,
@@ -264,7 +258,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             self.event_bus.send(DaemonEvent::PositionStateChanged {
                 position_id,
                 previous_state: old_state,
-                new_state: format!("{:?}", position.state),
+                new_state: format!("{:?}", updated_position.state),
                 timestamp: chrono::Utc::now(),
             });
         }
@@ -292,19 +286,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             }
 
             // Use engine to process
+            let symbol_clone = data.symbol.clone();
+            let market_data = robson_engine::MarketData::new(symbol_clone, data.price);
             let decision = self
                 .engine
-                .process_active_position(&position, data.price)?;
+                .process_active_position(&position, &market_data)?;
 
             // Apply state transition if any
-            if let Some(new_state) = decision.new_state {
+            if let Some(updated_position) = decision.updated_position {
                 let old_state = format!("{:?}", position.state);
-                let mut updated_position = position.clone();
-                updated_position.state = new_state;
                 self.store.positions().save(&updated_position).await?;
 
                 self.event_bus.send(DaemonEvent::PositionStateChanged {
-                    position_id: position.id,
+                    position_id: updated_position.id,
                     previous_state: old_state,
                     new_state: format!("{:?}", updated_position.state),
                     timestamp: chrono::Utc::now(),
@@ -351,20 +345,23 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Transition to Closed
         position.state = PositionState::Closed {
             exit_price: fill_price,
-            exit_reason: robson_domain::ExitReason::TrailingStopHit,
-            closed_at: chrono::Utc::now(),
+            realized_pnl: position.calculate_pnl(),
+            exit_reason: robson_domain::ExitReason::TrailingStop,
         };
         position.closed_at = Some(chrono::Utc::now());
 
         self.store.positions().save(&position).await?;
 
         // Emit closed event
+        let entry_price = position.entry_price.unwrap_or(fill_price);
         let pnl = position.calculate_pnl();
         let event = Event::PositionClosed {
             position_id,
+            exit_reason: robson_domain::ExitReason::TrailingStop,
+            entry_price,
             exit_price: fill_price,
-            exit_reason: robson_domain::ExitReason::TrailingStopHit,
-            pnl,
+            realized_pnl: pnl,
+            total_fees: position.fees_paid,
             timestamp: chrono::Utc::now(),
         };
         self.store.events().append(&event).await?;
@@ -425,18 +422,25 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         // Mark as closed with panic reason
         let mut closed_position = position.clone();
+        let pnl = closed_position.calculate_pnl();
         closed_position.state = PositionState::Closed {
             exit_price: current_price,
-            exit_reason: robson_domain::ExitReason::PanicClose,
-            closed_at: chrono::Utc::now(),
+            realized_pnl: pnl,
+            exit_reason: robson_domain::ExitReason::UserPanic,
         };
         closed_position.closed_at = Some(chrono::Utc::now());
 
         self.store.positions().save(&closed_position).await?;
 
-        // Emit panic event
-        let event = Event::PanicClose {
+        // Emit PositionClosed event
+        let entry_price = closed_position.entry_price.unwrap_or(current_price);
+        let event = Event::PositionClosed {
             position_id,
+            exit_reason: robson_domain::ExitReason::UserPanic,
+            entry_price,
+            exit_price: current_price,
+            realized_pnl: pnl,
+            total_fees: closed_position.fees_paid,
             timestamp: chrono::Utc::now(),
         };
         self.store.events().append(&event).await?;
@@ -490,20 +494,24 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
         let event_bus = Arc::new(EventBus::new(100));
-        let engine = Engine::new();
+        let risk_config = RiskConfig::new(dec!(10000), dec!(1)).unwrap(); // 1% risk
+        let engine = Engine::new(risk_config);
 
         PositionManager::new(engine, executor, store, event_bus)
     }
 
     fn create_test_risk_config() -> RiskConfig {
-        RiskConfig::new(dec!(10000), dec!(0.01), dec!(0.05)).unwrap()
+        RiskConfig::new(dec!(10000), dec!(1)).unwrap() // 1% risk
     }
 
     #[tokio::test]
     async fn test_arm_position() {
         let manager = create_test_manager().await;
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
-        let tech_stop = TechnicalStopDistance::new(dec!(0.02)).unwrap();
+        // Create tech stop distance: entry $100, stop $98 (2% distance)
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(98)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let position = manager
             .arm_position(
@@ -527,7 +535,10 @@ mod tests {
     async fn test_disarm_position() {
         let manager = create_test_manager().await;
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
-        let tech_stop = TechnicalStopDistance::new(dec!(0.02)).unwrap();
+        // Create tech stop distance: entry $100, stop $98 (2% distance)
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(98)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let position = manager
             .arm_position(
@@ -551,7 +562,10 @@ mod tests {
     async fn test_handle_signal() {
         let manager = create_test_manager().await;
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
-        let tech_stop = TechnicalStopDistance::new(dec!(0.02)).unwrap();
+        // Create tech stop distance: entry $100, stop $98 (2% distance)
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(98)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let position = manager
             .arm_position(
@@ -586,7 +600,10 @@ mod tests {
     async fn test_disarm_non_armed_fails() {
         let manager = create_test_manager().await;
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
-        let tech_stop = TechnicalStopDistance::new(dec!(0.02)).unwrap();
+        // Create tech stop distance: entry $100, stop $98 (2% distance)
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(98)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let position = manager
             .arm_position(
