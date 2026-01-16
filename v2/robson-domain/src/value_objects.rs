@@ -22,10 +22,6 @@ pub enum DomainError {
     #[error("Invalid symbol: {0}")]
     InvalidSymbol(String),
 
-    /// Leverage must be between 1-10x
-    #[error("Invalid leverage: {0}")]
-    InvalidLeverage(String),
-
     /// TechnicalStopDistance validation error
     #[error("Invalid technical stop distance: {0}")]
     InvalidTechnicalStopDistance(String),
@@ -246,48 +242,6 @@ impl fmt::Display for OrderSide {
             OrderSide::Buy => write!(f, "BUY"),
             OrderSide::Sell => write!(f, "SELL"),
         }
-    }
-}
-
-// =============================================================================
-// Leverage
-// =============================================================================
-
-/// Leverage represents position leverage
-///
-/// # Invariants
-/// - Must be between 1 and 10 (inclusive)
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-pub struct Leverage(u8);
-
-impl Leverage {
-    /// Create a new Leverage with validation
-    ///
-    /// # Errors
-    /// Returns `DomainError::InvalidLeverage` if value < 1 or > 10
-    pub fn new(value: u8) -> Result<Self, DomainError> {
-        if !(1..=10).contains(&value) {
-            return Err(DomainError::InvalidLeverage(
-                "Leverage must be between 1 and 10".to_string(),
-            ));
-        }
-        Ok(Self(value))
-    }
-
-    /// Get the leverage value
-    pub fn value(&self) -> u8 {
-        self.0
-    }
-
-    /// Create 1x leverage
-    pub fn one() -> Self {
-        Self(1)
-    }
-}
-
-impl fmt::Display for Leverage {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{}x", self.0)
     }
 }
 
@@ -528,22 +482,6 @@ mod tests {
         assert_eq!(Side::Long.exit_action(), OrderSide::Sell);
         assert_eq!(Side::Short.entry_action(), OrderSide::Sell);
         assert_eq!(Side::Short.exit_action(), OrderSide::Buy);
-    }
-
-    // Leverage tests
-    #[test]
-    fn test_leverage_validation() {
-        assert!(Leverage::new(1).is_ok());
-        assert!(Leverage::new(5).is_ok());
-        assert!(Leverage::new(10).is_ok());
-        assert!(Leverage::new(0).is_err());
-        assert!(Leverage::new(11).is_err());
-    }
-
-    #[test]
-    fn test_leverage_one() {
-        let leverage = Leverage::one();
-        assert_eq!(leverage.value(), 1);
     }
 
     // TechnicalStopDistance tests

@@ -16,5 +16,5 @@ pub use entities::{
     Position, PositionId, PositionState,
 };
 pub use value_objects::{
-    DomainError, Leverage, OrderSide, Price, Quantity, Side, Symbol, TechnicalStopDistance,
+    DomainError, OrderSide, Price, Quantity, Side, Symbol, TechnicalStopDistance,
 };

@@ -3,7 +3,7 @@
 //! Core business entities with lifecycle management.
 //! All entities have identity and state transitions.
 
-use crate::value_objects::{DomainError, Price, Quantity, Side, Symbol, Leverage, TechnicalStopDistance, OrderSide};
+use crate::value_objects::{DomainError, Price, Quantity, Side, Symbol, TechnicalStopDistance, OrderSide};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -31,6 +31,7 @@ pub type AccountId = Uuid;
 /// - NO stop_gain: Exit happens when trailing stop is hit
 /// - Trailing stop uses 1x technical stop distance technique
 /// - Isolated margin trading (not spot)
+/// - **FIXED 10x leverage** (no configuration needed)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
     pub id: PositionId,
@@ -46,9 +47,8 @@ pub struct Position {
     // Technical stop distance (trailing stop anchor)
     pub tech_stop_distance: Option<TechnicalStopDistance>,
 
-    // Position sizing
+    // Position sizing (10x leverage is implicit)
     pub quantity: Quantity,
-    pub leverage: Leverage,
 
     // P&L Tracking
     pub realized_pnl: rust_decimal::Decimal,
@@ -71,7 +71,6 @@ impl Position {
         account_id: AccountId,
         symbol: Symbol,
         side: Side,
-        leverage: Leverage,
     ) -> Self {
         let now = Utc::now();
         Self {
@@ -84,7 +83,6 @@ impl Position {
             entry_filled_at: None,
             tech_stop_distance: None,
             quantity: Quantity::zero(),
-            leverage,
             realized_pnl: rust_decimal::Decimal::ZERO,
             fees_paid: rust_decimal::Decimal::ZERO,
             entry_order_id: None,
@@ -385,7 +383,6 @@ mod tests {
             Uuid::now_v7(),
             symbol,
             Side::Long,
-            Leverage::new(3).unwrap(),
         );
 
         assert_eq!(position.state.name(), "armed");
