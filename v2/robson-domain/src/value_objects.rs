@@ -25,6 +25,14 @@ pub enum DomainError {
     /// TechnicalStopDistance validation error
     #[error("Invalid technical stop distance: {0}")]
     InvalidTechnicalStopDistance(String),
+
+    /// RiskConfig validation error
+    #[error("Invalid risk config: {0}")]
+    InvalidRiskConfig(String),
+
+    /// Position sizing error
+    #[error("Position sizing error: {0}")]
+    PositionSizingError(String),
 }
 
 // =============================================================================
@@ -242,6 +250,114 @@ impl fmt::Display for OrderSide {
             OrderSide::Buy => write!(f, "BUY"),
             OrderSide::Sell => write!(f, "SELL"),
         }
+    }
+}
+
+// =============================================================================
+// RiskConfig
+// =============================================================================
+
+/// Risk configuration for position sizing
+///
+/// Defines the capital and risk parameters used to calculate position sizes.
+/// With fixed 10x leverage, position size is derived from:
+///
+/// ```text
+/// Position Size = (Capital × Risk%) / Stop Distance
+/// ```
+///
+/// # Example
+///
+/// ```
+/// # use robson_domain::value_objects::RiskConfig;
+/// # use rust_decimal_macros::dec;
+/// let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+/// assert_eq!(config.capital(), dec!(10000));
+/// assert_eq!(config.risk_per_trade_pct(), dec!(1));
+/// assert_eq!(config.max_risk_amount(), dec!(100)); // 1% of 10000
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RiskConfig {
+    /// Available capital in quote currency (e.g., USDT)
+    capital: Decimal,
+    /// Risk per trade as percentage (e.g., 1 = 1%)
+    risk_per_trade_pct: Decimal,
+}
+
+impl RiskConfig {
+    /// Fixed leverage for all positions (10x isolated margin)
+    pub const LEVERAGE: u8 = 10;
+
+    /// Create a new RiskConfig with validation
+    ///
+    /// # Errors
+    /// Returns `DomainError::InvalidRiskConfig` if:
+    /// - Capital <= 0
+    /// - Risk percentage <= 0 or > 5%
+    pub fn new(capital: Decimal, risk_per_trade_pct: Decimal) -> Result<Self, DomainError> {
+        if capital <= Decimal::ZERO {
+            return Err(DomainError::InvalidRiskConfig(
+                "Capital must be positive".to_string(),
+            ));
+        }
+
+        if risk_per_trade_pct <= Decimal::ZERO {
+            return Err(DomainError::InvalidRiskConfig(
+                "Risk percentage must be positive".to_string(),
+            ));
+        }
+
+        if risk_per_trade_pct > Decimal::from(5) {
+            return Err(DomainError::InvalidRiskConfig(
+                "Risk percentage cannot exceed 5%".to_string(),
+            ));
+        }
+
+        Ok(Self {
+            capital,
+            risk_per_trade_pct,
+        })
+    }
+
+    /// Get capital
+    pub fn capital(&self) -> Decimal {
+        self.capital
+    }
+
+    /// Get risk percentage
+    pub fn risk_per_trade_pct(&self) -> Decimal {
+        self.risk_per_trade_pct
+    }
+
+    /// Calculate max risk amount in quote currency
+    ///
+    /// Returns: Capital × Risk% / 100
+    pub fn max_risk_amount(&self) -> Decimal {
+        self.capital * self.risk_per_trade_pct / Decimal::from(100)
+    }
+
+    /// Get fixed leverage
+    pub fn leverage(&self) -> u8 {
+        Self::LEVERAGE
+    }
+}
+
+impl Default for RiskConfig {
+    fn default() -> Self {
+        Self {
+            capital: Decimal::from(10000),
+            risk_per_trade_pct: Decimal::ONE, // 1%
+        }
+    }
+}
+
+impl fmt::Display for RiskConfig {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "RiskConfig {{ capital: {}, risk: {}%, leverage: {}x }}",
+            self.capital, self.risk_per_trade_pct, Self::LEVERAGE
+        )
     }
 }
 
@@ -482,6 +598,53 @@ mod tests {
         assert_eq!(Side::Long.exit_action(), OrderSide::Sell);
         assert_eq!(Side::Short.entry_action(), OrderSide::Sell);
         assert_eq!(Side::Short.exit_action(), OrderSide::Buy);
+    }
+
+    // RiskConfig tests
+    #[test]
+    fn test_risk_config_validation() {
+        // Valid config
+        assert!(RiskConfig::new(dec!(10000), dec!(1)).is_ok());
+        assert!(RiskConfig::new(dec!(1000), dec!(0.5)).is_ok());
+        assert!(RiskConfig::new(dec!(100000), dec!(5)).is_ok());
+
+        // Invalid: zero capital
+        assert!(RiskConfig::new(dec!(0), dec!(1)).is_err());
+
+        // Invalid: negative capital
+        assert!(RiskConfig::new(dec!(-1000), dec!(1)).is_err());
+
+        // Invalid: zero risk
+        assert!(RiskConfig::new(dec!(10000), dec!(0)).is_err());
+
+        // Invalid: negative risk
+        assert!(RiskConfig::new(dec!(10000), dec!(-1)).is_err());
+
+        // Invalid: risk > 5%
+        assert!(RiskConfig::new(dec!(10000), dec!(6)).is_err());
+    }
+
+    #[test]
+    fn test_risk_config_max_risk_amount() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        assert_eq!(config.max_risk_amount(), dec!(100)); // 1% of 10000
+
+        let config2 = RiskConfig::new(dec!(50000), dec!(2)).unwrap();
+        assert_eq!(config2.max_risk_amount(), dec!(1000)); // 2% of 50000
+    }
+
+    #[test]
+    fn test_risk_config_leverage() {
+        let config = RiskConfig::default();
+        assert_eq!(config.leverage(), 10);
+        assert_eq!(RiskConfig::LEVERAGE, 10);
+    }
+
+    #[test]
+    fn test_risk_config_default() {
+        let config = RiskConfig::default();
+        assert_eq!(config.capital(), dec!(10000));
+        assert_eq!(config.risk_per_trade_pct(), dec!(1));
     }
 
     // TechnicalStopDistance tests

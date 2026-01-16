@@ -3,7 +3,7 @@
 //! Core business entities with lifecycle management.
 //! All entities have identity and state transitions.
 
-use crate::value_objects::{DomainError, Price, Quantity, Side, Symbol, TechnicalStopDistance, OrderSide};
+use crate::value_objects::{DomainError, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance, OrderSide};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -116,6 +116,99 @@ impl Position {
             _ => None,
         }
     }
+}
+
+// =============================================================================
+// Position Sizing (Golden Rule)
+// =============================================================================
+
+/// Calculate position size based on risk management rules
+///
+/// **THE GOLDEN RULE**: Position size is DERIVED from technical stop distance.
+///
+/// ```text
+/// Position Size = Max Risk Amount / Stop Distance
+///               = (Capital × Risk%) / |Entry - Technical Stop|
+/// ```
+///
+/// # Example
+///
+/// ```
+/// # use robson_domain::value_objects::{RiskConfig, Price, TechnicalStopDistance};
+/// # use robson_domain::entities::calculate_position_size;
+/// # use rust_decimal_macros::dec;
+/// let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap(); // $10k, 1% risk
+/// let entry = Price::new(dec!(95000)).unwrap();
+/// let stop = Price::new(dec!(93500)).unwrap();
+/// let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+///
+/// let size = calculate_position_size(&config, &tech_stop).unwrap();
+///
+/// // Max Risk = $10,000 × 1% = $100
+/// // Stop Distance = $1,500
+/// // Position Size = $100 / $1,500 = 0.0666... BTC
+/// assert!(size.as_decimal() > dec!(0.066) && size.as_decimal() < dec!(0.067));
+/// ```
+///
+/// # Key Insight
+///
+/// - Wide technical stop → Smaller position size
+/// - Tight technical stop → Larger position size
+/// - **Risk amount stays CONSTANT at the configured percentage**
+///
+/// # Errors
+///
+/// Returns `DomainError::PositionSizingError` if:
+/// - Technical stop distance is zero
+/// - Calculated quantity would be <= 0
+pub fn calculate_position_size(
+    risk_config: &RiskConfig,
+    tech_stop: &TechnicalStopDistance,
+) -> Result<Quantity, DomainError> {
+    // Validate tech stop first
+    tech_stop.validate()?;
+
+    let stop_distance = tech_stop.distance;
+
+    if stop_distance <= rust_decimal::Decimal::ZERO {
+        return Err(DomainError::PositionSizingError(
+            "Stop distance must be positive".to_string(),
+        ));
+    }
+
+    // Golden Rule: Position Size = Max Risk / Stop Distance
+    let max_risk = risk_config.max_risk_amount();
+    let position_size = max_risk / stop_distance;
+
+    if position_size <= rust_decimal::Decimal::ZERO {
+        return Err(DomainError::PositionSizingError(
+            "Calculated position size must be positive".to_string(),
+        ));
+    }
+
+    Quantity::new(position_size)
+        .map_err(|e| DomainError::PositionSizingError(e.to_string()))
+}
+
+/// Calculate notional value of position
+///
+/// Notional = Quantity × Entry Price
+pub fn calculate_notional_value(
+    quantity: &Quantity,
+    entry_price: &Price,
+) -> rust_decimal::Decimal {
+    quantity.as_decimal() * entry_price.as_decimal()
+}
+
+/// Calculate margin required for position
+///
+/// Margin = Notional / Leverage = Notional / 10
+pub fn calculate_margin_required(
+    quantity: &Quantity,
+    entry_price: &Price,
+) -> rust_decimal::Decimal {
+    let notional = calculate_notional_value(quantity, entry_price);
+    notional / rust_decimal::Decimal::from(RiskConfig::LEVERAGE)
 }
 
 // =============================================================================
@@ -443,5 +536,120 @@ mod tests {
         assert!(result.is_ok());
         assert!(order.is_filled());
         assert_eq!(order.fill_price.unwrap().as_decimal(), dec!(95000.0));
+    }
+
+    // Position Sizing tests (Golden Rule)
+    #[test]
+    fn test_calculate_position_size_basic() {
+        // Setup: $10,000 capital, 1% risk
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+
+        // Entry: $95,000, Stop: $93,500 (distance = $1,500)
+        let entry = Price::new(dec!(95000)).unwrap();
+        let stop = Price::new(dec!(93500)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        let size = calculate_position_size(&config, &tech_stop).unwrap();
+
+        // Expected: $100 risk / $1,500 distance = 0.0666... BTC
+        // Check it's approximately 0.0666...
+        let expected = dec!(100) / dec!(1500);
+        assert_eq!(size.as_decimal(), expected);
+    }
+
+    #[test]
+    fn test_calculate_position_size_wider_stop() {
+        // Wider stop = smaller position
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+
+        // Wide stop: $3,000 distance
+        let entry = Price::new(dec!(95000)).unwrap();
+        let stop = Price::new(dec!(92000)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        let size = calculate_position_size(&config, &tech_stop).unwrap();
+
+        // Expected: $100 / $3,000 = 0.0333... BTC
+        let expected = dec!(100) / dec!(3000);
+        assert_eq!(size.as_decimal(), expected);
+    }
+
+    #[test]
+    fn test_calculate_position_size_tighter_stop() {
+        // Tighter stop = larger position
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+
+        // Tight stop: $500 distance (still valid, ~0.5%)
+        let entry = Price::new(dec!(95000)).unwrap();
+        let stop = Price::new(dec!(94500)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        let size = calculate_position_size(&config, &tech_stop).unwrap();
+
+        // Expected: $100 / $500 = 0.2 BTC
+        assert_eq!(size.as_decimal(), dec!(0.2));
+    }
+
+    #[test]
+    fn test_calculate_position_size_higher_risk() {
+        // 2% risk = double position size
+        let config = RiskConfig::new(dec!(10000), dec!(2)).unwrap();
+
+        let entry = Price::new(dec!(95000)).unwrap();
+        let stop = Price::new(dec!(93500)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        let size = calculate_position_size(&config, &tech_stop).unwrap();
+
+        // Expected: $200 / $1,500 = 0.1333... BTC
+        let expected = dec!(200) / dec!(1500);
+        assert_eq!(size.as_decimal(), expected);
+    }
+
+    #[test]
+    fn test_calculate_notional_value() {
+        let quantity = Quantity::new(dec!(0.1)).unwrap();
+        let price = Price::new(dec!(95000)).unwrap();
+
+        let notional = calculate_notional_value(&quantity, &price);
+        assert_eq!(notional, dec!(9500)); // 0.1 * 95000
+    }
+
+    #[test]
+    fn test_calculate_margin_required() {
+        let quantity = Quantity::new(dec!(0.1)).unwrap();
+        let price = Price::new(dec!(95000)).unwrap();
+
+        let margin = calculate_margin_required(&quantity, &price);
+        // Notional = $9,500, Leverage = 10x, Margin = $950
+        assert_eq!(margin, dec!(950));
+    }
+
+    #[test]
+    fn test_position_sizing_risk_stays_constant() {
+        // This test validates the golden rule:
+        // Regardless of stop distance, the risk amount is always 1% of capital
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap(); // $100 risk
+
+        // Test 1: Wide stop ($3,000)
+        let entry1 = Price::new(dec!(95000)).unwrap();
+        let stop1 = Price::new(dec!(92000)).unwrap();
+        let tech_stop1 = TechnicalStopDistance::from_entry_and_stop(entry1, stop1);
+        let size1 = calculate_position_size(&config, &tech_stop1).unwrap();
+        // If stopped out: loss = 0.0333... * $3,000 = $100 ✓
+        let loss1 = size1.as_decimal() * dec!(3000);
+        // Use round to handle decimal precision
+        assert_eq!(loss1.round_dp(2), dec!(100));
+
+        // Test 2: Tight stop ($1,000)
+        let entry2 = Price::new(dec!(95000)).unwrap();
+        let stop2 = Price::new(dec!(94000)).unwrap();
+        let tech_stop2 = TechnicalStopDistance::from_entry_and_stop(entry2, stop2);
+        let size2 = calculate_position_size(&config, &tech_stop2).unwrap();
+        // If stopped out: loss = 0.1 * $1,000 = $100 ✓
+        let loss2 = size2.as_decimal() * dec!(1000);
+        assert_eq!(loss2, dec!(100));
+
+        // Both positions risk exactly $100 (1% of capital)
     }
 }
