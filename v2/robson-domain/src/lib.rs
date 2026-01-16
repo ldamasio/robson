@@ -6,12 +6,15 @@
 #![warn(missing_docs)]
 #![warn(clippy::all)]
 
-// Module declarations will be added as we implement
+// Public modules
+pub mod entities;
+pub mod value_objects;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
-    }
-}
+// Re-export commonly used types
+pub use entities::{
+    AccountId, DetectorSignal, ExitReason, Order, OrderId, OrderStatus, OrderType,
+    Position, PositionId, PositionState,
+};
+pub use value_objects::{
+    DomainError, Leverage, OrderSide, Price, Quantity, Side, Symbol, TechnicalStopDistance,
+};

@@ -5,15 +5,6 @@
 [target.'cfg(all())']
 # No special target configuration needed for now
 
-# Clippy lints - STRICT mode for financial application
-[build]
-# Increase rustc optimization for debug builds (faster local dev)
-# Note: This doesn't affect --release builds
-
-# Clippy configuration via environment
-# (Clippy rules are configured via command-line flags in verify scripts)
-# See: ./scripts/verify.sh for full lint configuration
-
 # Alias for common commands
 [alias]
 # cargo xtask - custom build tasks (future use)
