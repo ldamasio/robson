@@ -1,16 +1,849 @@
 //! Robson v2 Engine Layer
 //!
-//! Pure decision logic, deterministic, no I/O.
-//! Takes input → Returns actions to execute.
+//! Pure decision logic for position management.
+//! The Engine is deterministic: same input always produces same output.
+//!
+//! # Key Concepts
+//!
+//! - **No I/O**: Engine never touches network, database, or filesystem
+//! - **Pure Functions**: `process(input) -> decisions`
+//! - **Trailing Stop**: Exit when price hits trailing stop (1x tech distance)
+//!
+//! # Example
+//!
+//! ```
+//! use robson_engine::{Engine, MarketData, EngineAction};
+//! use robson_domain::{Position, Symbol, Side, Price, RiskConfig};
+//! use rust_decimal_macros::dec;
+//! use chrono::Utc;
+//! use uuid::Uuid;
+//!
+//! // Create engine with risk config
+//! let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+//! let engine = Engine::new(config);
+//!
+//! // Engine processes active positions and returns actions
+//! // (See process_active_position for full example)
+//! ```
 
 #![warn(clippy::all)]
 
-// Module declarations will be added as we implement
+use chrono::{DateTime, Utc};
+use robson_domain::{
+    Event, ExitReason, Position, PositionId, PositionState, Price, Quantity, RiskConfig, Side,
+    Symbol, TechnicalStopDistance,
+};
+use serde::{Deserialize, Serialize};
+use thiserror::Error;
+use tracing::debug;
+
+// =============================================================================
+// Engine Errors
+// =============================================================================
+
+/// Errors that can occur during engine processing
+#[derive(Debug, Clone, Error)]
+pub enum EngineError {
+    /// Position is not in expected state for operation
+    #[error("Invalid position state: expected {expected}, got {actual}")]
+    InvalidPositionState {
+        /// Expected state name
+        expected: String,
+        /// Actual state name
+        actual: String,
+    },
+
+    /// Missing required data
+    #[error("Missing required data: {0}")]
+    MissingData(String),
+
+    /// Invalid market data
+    #[error("Invalid market data: {0}")]
+    InvalidMarketData(String),
+
+    /// Domain error passthrough
+    #[error("Domain error: {0}")]
+    DomainError(#[from] robson_domain::DomainError),
+}
+
+// =============================================================================
+// Market Data
+// =============================================================================
+
+/// Real-time market data for a symbol
+///
+/// Contains the current price and timestamp.
+/// Will be extended in future phases for OHLCV data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarketData {
+    /// Trading pair symbol
+    pub symbol: Symbol,
+    /// Current market price
+    pub current_price: Price,
+    /// When this data was captured
+    pub timestamp: DateTime<Utc>,
+}
+
+impl MarketData {
+    /// Create new market data
+    pub fn new(symbol: Symbol, current_price: Price) -> Self {
+        Self {
+            symbol,
+            current_price,
+            timestamp: Utc::now(),
+        }
+    }
+
+    /// Create market data with explicit timestamp
+    pub fn with_timestamp(symbol: Symbol, current_price: Price, timestamp: DateTime<Utc>) -> Self {
+        Self {
+            symbol,
+            current_price,
+            timestamp,
+        }
+    }
+}
+
+// =============================================================================
+// Engine Actions
+// =============================================================================
+
+/// Actions that the Engine decides should be executed
+///
+/// These are pure data - the execution layer handles actual I/O.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub enum EngineAction {
+    /// Update the trailing stop price (favorable price movement)
+    UpdateTrailingStop {
+        /// Position to update
+        position_id: PositionId,
+        /// Previous stop price
+        previous_stop: Price,
+        /// New stop price
+        new_stop: Price,
+        /// Price that triggered the update
+        trigger_price: Price,
+    },
+
+    /// Trigger position exit (trailing stop hit)
+    TriggerExit {
+        /// Position to exit
+        position_id: PositionId,
+        /// Reason for exit
+        reason: ExitReason,
+        /// Price that triggered the exit
+        trigger_price: Price,
+        /// Stop price that was hit
+        stop_price: Price,
+    },
+
+    /// Place exit order (market order to close position)
+    PlaceExitOrder {
+        /// Position being exited
+        position_id: PositionId,
+        /// Symbol to trade
+        symbol: Symbol,
+        /// Order side (opposite of position side)
+        side: robson_domain::OrderSide,
+        /// Quantity to exit
+        quantity: Quantity,
+        /// Reason for exit
+        reason: ExitReason,
+    },
+
+    /// Emit domain event for audit/persistence
+    EmitEvent(Event),
+}
+
+// =============================================================================
+// Engine Decision
+// =============================================================================
+
+/// Result of engine processing
+///
+/// Contains the actions to execute and the updated position state.
+#[derive(Debug, Clone)]
+pub struct EngineDecision {
+    /// Actions to execute (in order)
+    pub actions: Vec<EngineAction>,
+    /// Updated position state (if changed)
+    pub updated_position: Option<Position>,
+}
+
+impl EngineDecision {
+    /// Create an empty decision (no actions needed)
+    pub fn no_action() -> Self {
+        Self {
+            actions: vec![],
+            updated_position: None,
+        }
+    }
+
+    /// Create a decision with actions
+    pub fn with_actions(actions: Vec<EngineAction>) -> Self {
+        Self {
+            actions,
+            updated_position: None,
+        }
+    }
+
+    /// Create a decision with actions and updated position
+    pub fn with_position(actions: Vec<EngineAction>, position: Position) -> Self {
+        Self {
+            actions,
+            updated_position: Some(position),
+        }
+    }
+
+    /// Check if any actions were decided
+    pub fn has_actions(&self) -> bool {
+        !self.actions.is_empty()
+    }
+}
+
+// =============================================================================
+// Engine
+// =============================================================================
+
+/// Pure decision engine for position management
+///
+/// The Engine processes positions and market data to decide actions.
+/// It is completely deterministic and performs no I/O.
+///
+/// # Responsibilities
+///
+/// 1. **Trailing Stop Updates**: When price moves favorably, update the stop
+/// 2. **Exit Triggers**: When price hits trailing stop, trigger exit
+/// 3. **Event Generation**: Emit events for all state changes
+///
+/// # Example
+///
+/// ```ignore
+/// let engine = Engine::new(risk_config);
+/// let decision = engine.process_active_position(&position, &market_data)?;
+/// for action in decision.actions {
+///     executor.execute(action).await?;
+/// }
+/// ```
+#[derive(Debug, Clone)]
+pub struct Engine {
+    /// Risk configuration
+    risk_config: RiskConfig,
+}
+
+impl Engine {
+    /// Create a new Engine with risk configuration
+    pub fn new(risk_config: RiskConfig) -> Self {
+        Self { risk_config }
+    }
+
+    /// Get the risk configuration
+    pub fn risk_config(&self) -> &RiskConfig {
+        &self.risk_config
+    }
+
+    /// Process an active position with current market data
+    ///
+    /// This is the main entry point for the engine.
+    /// It checks if the trailing stop should be updated or if exit should trigger.
+    ///
+    /// # Arguments
+    ///
+    /// * `position` - The active position to process
+    /// * `market_data` - Current market data
+    ///
+    /// # Returns
+    ///
+    /// * `Ok(EngineDecision)` - Actions to execute
+    /// * `Err(EngineError)` - If position is not active or data is invalid
+    pub fn process_active_position(
+        &self,
+        position: &Position,
+        market_data: &MarketData,
+    ) -> Result<EngineDecision, EngineError> {
+        // Validate position is active
+        let (_current_price_in_state, trailing_stop, favorable_extreme) = match &position.state {
+            PositionState::Active {
+                current_price,
+                trailing_stop,
+                favorable_extreme,
+                ..
+            } => (*current_price, *trailing_stop, *favorable_extreme),
+            other => {
+                return Err(EngineError::InvalidPositionState {
+                    expected: "active".to_string(),
+                    actual: other.name().to_string(),
+                });
+            }
+        };
+
+        // Validate symbol matches
+        if position.symbol != market_data.symbol {
+            return Err(EngineError::InvalidMarketData(format!(
+                "Symbol mismatch: position={}, market={}",
+                position.symbol, market_data.symbol
+            )));
+        }
+
+        // Get tech stop distance
+        let tech_stop = position.tech_stop_distance.as_ref().ok_or_else(|| {
+            EngineError::MissingData("Position missing tech_stop_distance".to_string())
+        })?;
+
+        let current_price = market_data.current_price;
+
+        // Check exit first (higher priority)
+        if self.should_exit(position.side, current_price, trailing_stop) {
+            debug!(
+                position_id = %position.id,
+                current_price = %current_price,
+                trailing_stop = %trailing_stop,
+                "Exit triggered"
+            );
+            return Ok(self.create_exit_decision(position, current_price, trailing_stop));
+        }
+
+        // Check if trailing stop should be updated
+        if let Some(new_stop) =
+            self.calculate_new_trailing_stop(position.side, current_price, favorable_extreme, tech_stop)
+        {
+            // Only update if new stop is more favorable
+            if self.is_more_favorable_stop(position.side, new_stop, trailing_stop) {
+                debug!(
+                    position_id = %position.id,
+                    current_price = %current_price,
+                    old_stop = %trailing_stop,
+                    new_stop = %new_stop,
+                    "Trailing stop updated"
+                );
+                return Ok(self.create_update_stop_decision(
+                    position,
+                    trailing_stop,
+                    new_stop,
+                    current_price,
+                ));
+            }
+        }
+
+        // No action needed
+        Ok(EngineDecision::no_action())
+    }
+
+    /// Check if position should exit (trailing stop hit)
+    fn should_exit(&self, side: Side, current_price: Price, trailing_stop: Price) -> bool {
+        match side {
+            // LONG: exit when price drops to or below trailing stop
+            Side::Long => current_price.as_decimal() <= trailing_stop.as_decimal(),
+            // SHORT: exit when price rises to or above trailing stop
+            Side::Short => current_price.as_decimal() >= trailing_stop.as_decimal(),
+        }
+    }
+
+    /// Calculate new trailing stop based on favorable price movement
+    ///
+    /// Returns `Some(new_stop)` if price has moved favorably beyond current extreme.
+    /// Returns `None` if no update is needed.
+    fn calculate_new_trailing_stop(
+        &self,
+        side: Side,
+        current_price: Price,
+        favorable_extreme: Price,
+        tech_stop: &TechnicalStopDistance,
+    ) -> Option<Price> {
+        match side {
+            Side::Long => {
+                // LONG: check if we have a new high
+                if current_price.as_decimal() > favorable_extreme.as_decimal() {
+                    Some(tech_stop.calculate_trailing_stop_long(current_price.as_decimal()))
+                } else {
+                    None
+                }
+            }
+            Side::Short => {
+                // SHORT: check if we have a new low
+                if current_price.as_decimal() < favorable_extreme.as_decimal() {
+                    Some(tech_stop.calculate_trailing_stop_short(current_price.as_decimal()))
+                } else {
+                    None
+                }
+            }
+        }
+    }
+
+    /// Check if new stop is more favorable than current stop
+    fn is_more_favorable_stop(&self, side: Side, new_stop: Price, current_stop: Price) -> bool {
+        match side {
+            // LONG: higher stop is more favorable
+            Side::Long => new_stop.as_decimal() > current_stop.as_decimal(),
+            // SHORT: lower stop is more favorable
+            Side::Short => new_stop.as_decimal() < current_stop.as_decimal(),
+        }
+    }
+
+    /// Create decision for exit trigger
+    fn create_exit_decision(
+        &self,
+        position: &Position,
+        trigger_price: Price,
+        stop_price: Price,
+    ) -> EngineDecision {
+        let reason = ExitReason::TrailingStop;
+        let exit_side = position.side.exit_action();
+
+        let actions = vec![
+            // 1. Trigger exit event
+            EngineAction::TriggerExit {
+                position_id: position.id,
+                reason,
+                trigger_price,
+                stop_price,
+            },
+            // 2. Place exit order
+            EngineAction::PlaceExitOrder {
+                position_id: position.id,
+                symbol: position.symbol.clone(),
+                side: exit_side,
+                quantity: position.quantity,
+                reason,
+            },
+            // 3. Emit event
+            EngineAction::EmitEvent(Event::ExitTriggered {
+                position_id: position.id,
+                reason,
+                trigger_price,
+                stop_price,
+                timestamp: Utc::now(),
+            }),
+        ];
+
+        EngineDecision::with_actions(actions)
+    }
+
+    /// Create decision for trailing stop update
+    fn create_update_stop_decision(
+        &self,
+        position: &Position,
+        previous_stop: Price,
+        new_stop: Price,
+        trigger_price: Price,
+    ) -> EngineDecision {
+        let actions = vec![
+            // 1. Update trailing stop
+            EngineAction::UpdateTrailingStop {
+                position_id: position.id,
+                previous_stop,
+                new_stop,
+                trigger_price,
+            },
+            // 2. Emit event
+            EngineAction::EmitEvent(Event::TrailingStopUpdated {
+                position_id: position.id,
+                previous_stop,
+                new_stop,
+                trigger_price,
+                timestamp: Utc::now(),
+            }),
+        ];
+
+        EngineDecision::with_actions(actions)
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use rust_decimal::Decimal;
+    use rust_decimal_macros::dec;
+    use uuid::Uuid;
+
+    /// Helper to create a test position in Active state
+    fn create_active_position(
+        side: Side,
+        entry_price: Decimal,
+        trailing_stop: Decimal,
+        favorable_extreme: Decimal,
+        tech_distance: Decimal,
+    ) -> Position {
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let mut position = Position::new(Uuid::now_v7(), symbol, side);
+
+        // Set entry price
+        position.entry_price = Some(Price::new(entry_price).unwrap());
+
+        // Set tech stop distance
+        let stop_price = if side == Side::Long {
+            entry_price - tech_distance
+        } else {
+            entry_price + tech_distance
+        };
+        position.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(
+            Price::new(entry_price).unwrap(),
+            Price::new(stop_price).unwrap(),
+        ));
+
+        // Set quantity
+        position.quantity = Quantity::new(dec!(0.1)).unwrap();
+
+        // Set active state
+        position.state = PositionState::Active {
+            current_price: Price::new(entry_price).unwrap(),
+            trailing_stop: Price::new(trailing_stop).unwrap(),
+            favorable_extreme: Price::new(favorable_extreme).unwrap(),
+            extreme_at: Utc::now(),
+            insurance_stop_id: None,
+        };
+
+        position
+    }
+
+    fn create_market_data(price: Decimal) -> MarketData {
+        MarketData::new(
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            Price::new(price).unwrap(),
+        )
+    }
+
+    // =========================================================================
+    // Long Position Tests
+    // =========================================================================
+
     #[test]
-    fn it_works() {
-        assert_eq!(2 + 2, 4);
+    fn test_long_no_action_price_stable() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        // Position: entry $95k, stop $93.5k, distance $1.5k
+        let position = create_active_position(
+            Side::Long,
+            dec!(95000),
+            dec!(93500),  // trailing stop
+            dec!(95000),  // favorable extreme (entry)
+            dec!(1500),   // tech distance
+        );
+
+        // Price stable at entry
+        let market = create_market_data(dec!(95000));
+        let decision = engine.process_active_position(&position, &market).unwrap();
+
+        assert!(!decision.has_actions());
+    }
+
+    #[test]
+    fn test_long_trailing_stop_update_new_high() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        // Position: entry $95k, stop $93.5k, distance $1.5k
+        let position = create_active_position(
+            Side::Long,
+            dec!(95000),
+            dec!(93500),  // trailing stop
+            dec!(95000),  // favorable extreme
+            dec!(1500),   // tech distance
+        );
+
+        // Price moved up to $96k (new high!)
+        let market = create_market_data(dec!(96000));
+        let decision = engine.process_active_position(&position, &market).unwrap();
+
+        assert!(decision.has_actions());
+        assert_eq!(decision.actions.len(), 2);
+
+        // Check first action is UpdateTrailingStop
+        match &decision.actions[0] {
+            EngineAction::UpdateTrailingStop {
+                new_stop,
+                previous_stop,
+                ..
+            } => {
+                // New stop should be $96k - $1.5k = $94.5k
+                assert_eq!(new_stop.as_decimal(), dec!(94500));
+                assert_eq!(previous_stop.as_decimal(), dec!(93500));
+            }
+            _ => panic!("Expected UpdateTrailingStop action"),
+        }
+    }
+
+    #[test]
+    fn test_long_trailing_stop_no_update_price_below_extreme() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        // Position already made a high at $96k
+        let position = create_active_position(
+            Side::Long,
+            dec!(95000),
+            dec!(94500),  // trailing stop (from $96k high)
+            dec!(96000),  // favorable extreme
+            dec!(1500),   // tech distance
+        );
+
+        // Price pulled back to $95.5k (still above stop, below extreme)
+        let market = create_market_data(dec!(95500));
+        let decision = engine.process_active_position(&position, &market).unwrap();
+
+        // No update - price is below favorable extreme
+        assert!(!decision.has_actions());
+    }
+
+    #[test]
+    fn test_long_exit_triggered_stop_hit() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        let position = create_active_position(
+            Side::Long,
+            dec!(95000),
+            dec!(94500),  // trailing stop
+            dec!(96000),  // favorable extreme
+            dec!(1500),   // tech distance
+        );
+
+        // Price dropped to stop level
+        let market = create_market_data(dec!(94500));
+        let decision = engine.process_active_position(&position, &market).unwrap();
+
+        assert!(decision.has_actions());
+
+        // Check for TriggerExit action
+        let has_exit = decision.actions.iter().any(|a| {
+            matches!(a, EngineAction::TriggerExit { reason, .. } if *reason == ExitReason::TrailingStop)
+        });
+        assert!(has_exit, "Should have TriggerExit action");
+
+        // Check for PlaceExitOrder action
+        let has_order = decision.actions.iter().any(|a| {
+            matches!(a, EngineAction::PlaceExitOrder { side, .. } if *side == robson_domain::OrderSide::Sell)
+        });
+        assert!(has_order, "Should have PlaceExitOrder with Sell side");
+    }
+
+    #[test]
+    fn test_long_exit_triggered_price_below_stop() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        let position = create_active_position(
+            Side::Long,
+            dec!(95000),
+            dec!(94500),  // trailing stop
+            dec!(96000),  // favorable extreme
+            dec!(1500),   // tech distance
+        );
+
+        // Price crashed below stop (gap down scenario)
+        let market = create_market_data(dec!(94000));
+        let decision = engine.process_active_position(&position, &market).unwrap();
+
+        assert!(decision.has_actions());
+        let has_exit = decision.actions.iter().any(|a| {
+            matches!(a, EngineAction::TriggerExit { .. })
+        });
+        assert!(has_exit);
+    }
+
+    // =========================================================================
+    // Short Position Tests
+    // =========================================================================
+
+    #[test]
+    fn test_short_no_action_price_stable() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        // Short position: entry $95k, stop $96.5k, distance $1.5k
+        let position = create_active_position(
+            Side::Short,
+            dec!(95000),
+            dec!(96500),  // trailing stop (above entry for short)
+            dec!(95000),  // favorable extreme (entry)
+            dec!(1500),   // tech distance
+        );
+
+        let market = create_market_data(dec!(95000));
+        let decision = engine.process_active_position(&position, &market).unwrap();
+
+        assert!(!decision.has_actions());
+    }
+
+    #[test]
+    fn test_short_trailing_stop_update_new_low() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        let position = create_active_position(
+            Side::Short,
+            dec!(95000),
+            dec!(96500),  // trailing stop
+            dec!(95000),  // favorable extreme
+            dec!(1500),   // tech distance
+        );
+
+        // Price moved down to $94k (new low!)
+        let market = create_market_data(dec!(94000));
+        let decision = engine.process_active_position(&position, &market).unwrap();
+
+        assert!(decision.has_actions());
+
+        match &decision.actions[0] {
+            EngineAction::UpdateTrailingStop {
+                new_stop,
+                previous_stop,
+                ..
+            } => {
+                // New stop should be $94k + $1.5k = $95.5k
+                assert_eq!(new_stop.as_decimal(), dec!(95500));
+                assert_eq!(previous_stop.as_decimal(), dec!(96500));
+            }
+            _ => panic!("Expected UpdateTrailingStop action"),
+        }
+    }
+
+    #[test]
+    fn test_short_exit_triggered_stop_hit() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        let position = create_active_position(
+            Side::Short,
+            dec!(95000),
+            dec!(95500),  // trailing stop (tightened from gains)
+            dec!(94000),  // favorable extreme (made money)
+            dec!(1500),   // tech distance
+        );
+
+        // Price rose to stop level
+        let market = create_market_data(dec!(95500));
+        let decision = engine.process_active_position(&position, &market).unwrap();
+
+        assert!(decision.has_actions());
+
+        // Check for PlaceExitOrder with Buy side (closing short)
+        let has_order = decision.actions.iter().any(|a| {
+            matches!(a, EngineAction::PlaceExitOrder { side, .. } if *side == robson_domain::OrderSide::Buy)
+        });
+        assert!(has_order, "Should have PlaceExitOrder with Buy side for short exit");
+    }
+
+    // =========================================================================
+    // Error Cases
+    // =========================================================================
+
+    #[test]
+    fn test_error_position_not_active() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        // Create armed position (not active)
+        let position = Position::new(
+            Uuid::now_v7(),
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            Side::Long,
+        );
+
+        let market = create_market_data(dec!(95000));
+        let result = engine.process_active_position(&position, &market);
+
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            EngineError::InvalidPositionState { expected, actual } => {
+                assert_eq!(expected, "active");
+                assert_eq!(actual, "armed");
+            }
+            _ => panic!("Expected InvalidPositionState error"),
+        }
+    }
+
+    #[test]
+    fn test_error_symbol_mismatch() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        let position = create_active_position(
+            Side::Long,
+            dec!(95000),
+            dec!(93500),
+            dec!(95000),
+            dec!(1500),
+        );
+
+        // Market data for different symbol
+        let market = MarketData::new(
+            Symbol::from_pair("ETHUSDT").unwrap(),
+            Price::new(dec!(3000)).unwrap(),
+        );
+
+        let result = engine.process_active_position(&position, &market);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), EngineError::InvalidMarketData(_)));
+    }
+
+    // =========================================================================
+    // Edge Cases
+    // =========================================================================
+
+    #[test]
+    fn test_long_multiple_updates_sequence() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        // Simulate price moving up in steps
+        let mut current_stop = dec!(93500);
+        let mut favorable_extreme = dec!(95000);
+
+        for new_price in [dec!(96000), dec!(97000), dec!(98000)] {
+            let position = create_active_position(
+                Side::Long,
+                dec!(95000),
+                current_stop,
+                favorable_extreme,
+                dec!(1500),
+            );
+
+            let market = create_market_data(new_price);
+            let decision = engine.process_active_position(&position, &market).unwrap();
+
+            if decision.has_actions() {
+                if let EngineAction::UpdateTrailingStop { new_stop, .. } = &decision.actions[0] {
+                    // Update for next iteration
+                    current_stop = new_stop.as_decimal();
+                    favorable_extreme = new_price;
+                }
+            }
+        }
+
+        // After three moves up ($95k -> $96k -> $97k -> $98k)
+        // Stop should be at $98k - $1.5k = $96.5k
+        assert_eq!(current_stop, dec!(96500));
+    }
+
+    #[test]
+    fn test_exit_takes_priority_over_update() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        // Edge case: price gaps through both update and exit levels
+        // This shouldn't happen in practice, but let's ensure exit takes priority
+        let position = create_active_position(
+            Side::Long,
+            dec!(95000),
+            dec!(94000),  // trailing stop
+            dec!(95000),  // favorable extreme
+            dec!(1500),   // tech distance
+        );
+
+        // Price crashed below stop
+        let market = create_market_data(dec!(93000));
+        let decision = engine.process_active_position(&position, &market).unwrap();
+
+        // Should exit, not update
+        let has_exit = decision.actions.iter().any(|a| {
+            matches!(a, EngineAction::TriggerExit { .. })
+        });
+        assert!(has_exit, "Exit should take priority");
     }
 }
