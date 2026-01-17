@@ -10,7 +10,7 @@
 
 ### 1. Architecture Decision Pack ✅
 
-Complete architectural documentation in `docs/v2/`:
+Complete architectural documentation in `docs/`:
 
 - **ARCHITECTURE.md** (5,500 words)
   - System overview with component diagram
@@ -254,7 +254,7 @@ cli/
 
 ### Follow Prompt Pack
 
-Execute prompts sequentially from `docs/v2/PROMPT-PACK.md`:
+Execute prompts sequentially from `docs/PROMPT-PACK.md`:
 
 **Week 1**: Phases 0-2 (Bootstrap + Domain + Engine)
 - Prompt 0.1-0.3: Setup (DONE ✅)
@@ -317,12 +317,12 @@ cd v2/cli && bun run dev status
 ## Key Files Reference
 
 ### Documentation
-- `docs/v2/ARCHITECTURE.md` - System architecture
-- `docs/v2/RELIABILITY.md` - HA, failover, reconciliation
-- `docs/v2/DOMAIN.md` - Domain model, state machine
-- `docs/v2/CLI.md` - CLI reference
-- `docs/v2/EXECUTION-PLAN.md` - Implementation roadmap
-- `docs/v2/PROMPT-PACK.md` - Agentic coding prompts
+- `docs/ARCHITECTURE.md` - System architecture
+- `docs/RELIABILITY.md` - HA, failover, reconciliation
+- `docs/DOMAIN.md` - Domain model, state machine
+- `docs/CLI.md` - CLI reference
+- `docs/EXECUTION-PLAN.md` - Implementation roadmap
+- `docs/PROMPT-PACK.md` - Agentic coding prompts
 
 ### Code
 - `v2/Cargo.toml` - Rust workspace root
@@ -381,7 +381,7 @@ cd v2/cli && bun run dev status
 ## Contact & Support
 
 For questions or clarifications, refer to:
-- Architecture docs in `docs/v2/`
+- Architecture docs in `docs/`
 - Prompt pack for step-by-step guidance
 - Execution plan for acceptance criteria
 
@@ -777,7 +777,7 @@ The new tooling **enhances** but doesn't replace existing project tools:
 | `Makefile` (root) | `scripts/verify.sh` | v2-specific verification |
 | `.pre-commit-config.yaml` | Claude Code hooks | AI-assistant validation |
 | GitHub Actions | (Future: v2 CI) | Will add v2 workflows |
-| `docs/v2/PROMPT-PACK.md` | `CLAUDE.md` | Context + Execution guide |
+| `docs/PROMPT-PACK.md` | `CLAUDE.md` | Context + Execution guide |
 
 #### Workflow Integration
 

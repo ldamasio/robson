@@ -763,11 +763,11 @@ mod tests {
 ## When to Reference Full Documentation
 
 For comprehensive context:
-- **[../docs/v2/ARCHITECTURE.md](../docs/v2/ARCHITECTURE.md)** - System design
-- **[../docs/v2/DOMAIN.md](../docs/v2/DOMAIN.md)** - Domain model
-- **[../docs/v2/RELIABILITY.md](../docs/v2/RELIABILITY.md)** - HA/failover
-- **[../docs/v2/CLI.md](../docs/v2/CLI.md)** - Command reference
-- **[../docs/v2/EXECUTION-PLAN.md](../docs/v2/EXECUTION-PLAN.md)** - Implementation roadmap
+- **[./docs/ARCHITECTURE.md](./docs/ARCHITECTURE.md)** - System design
+- **[./docs/DOMAIN.md](./docs/DOMAIN.md)** - Domain model
+- **[./docs/RELIABILITY.md](./docs/RELIABILITY.md)** - HA/failover
+- **[./docs/CLI.md](./docs/CLI.md)** - Command reference
+- **[./docs/EXECUTION-PLAN.md](./docs/EXECUTION-PLAN.md)** - Implementation roadmap
 
 ---
 

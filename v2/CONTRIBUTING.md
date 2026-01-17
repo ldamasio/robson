@@ -614,9 +614,9 @@ pub fn new(symbol: Symbol, side: OrderSide, quantity: Decimal, price: Decimal) -
 When making changes that affect:
 
 - **Public APIs**: Update inline doc comments
-- **Architecture**: Update `docs/v2/ARCHITECTURE.md`
-- **Domain model**: Update `docs/v2/DOMAIN.md`
-- **CLI commands**: Update `docs/v2/CLI.md`
+- **Architecture**: Update `docs/ARCHITECTURE.md`
+- **Domain model**: Update `docs/DOMAIN.md`
+- **CLI commands**: Update `docs/CLI.md`
 - **Setup process**: Update `v2/README.md`
 
 ---
@@ -661,7 +661,7 @@ new-crate = { workspace = true }
 
 ### Resources
 
-- **Documentation**: `docs/v2/`
+- **Documentation**: `docs/`
 - **CLAUDE.md**: Repository context for AI assistants
 - **GitHub Issues**: Bug reports, feature requests
 - **Discussions**: General questions, ideas
@@ -669,8 +669,8 @@ new-crate = { workspace = true }
 ### Questions?
 
 If you're unsure about:
-- Architecture decisions: Check `docs/v2/ARCHITECTURE.md`
-- Domain model: Check `docs/v2/DOMAIN.md`
+- Architecture decisions: Check `docs/ARCHITECTURE.md`
+- Domain model: Check `docs/DOMAIN.md`
 - Code patterns: Check `v2/CLAUDE.md`
 - Still stuck: Open a GitHub Discussion
 

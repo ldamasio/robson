@@ -7,16 +7,6 @@
 
 ## Quick Navigation
 
-| Document | Purpose | Words | Status |
-|----------|---------|-------|--------|
-| [ARCHITECTURE.md](./ARCHITECTURE.md) | System architecture, component design | ~5,500 | ✅ Complete |
-| [RELIABILITY.md](./RELIABILITY.md) | HA, failover, reconciliation, idempotency | ~7,000 | ✅ Complete |
-| [DOMAIN.md](./DOMAIN.md) | Domain model, state machine, business rules | ~6,500 | ✅ Complete |
-| [CLI.md](./CLI.md) | CLI commands, usage, automation | ~4,000 | ✅ Complete |
-| [EXECUTION-PLAN.md](./EXECUTION-PLAN.md) | Implementation roadmap, phases, acceptance criteria | ~8,000 | ✅ Complete |
-| [PROMPT-PACK.md](./PROMPT-PACK.md) | Copy-paste prompts for agentic coding | ~5,000 | ✅ Complete |
-
-**Total Documentation**: ~36,000 words
 
 ---
 

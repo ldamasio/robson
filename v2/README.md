@@ -62,12 +62,13 @@ bun run src/index.ts status
 
 ## Documentation
 
-- [Architecture](../docs/v2/ARCHITECTURE.md)
-- [Domain Model](../docs/v2/DOMAIN.md)
-- [Reliability](../docs/v2/RELIABILITY.md)
-- [CLI Reference](../docs/v2/CLI.md)
-- [Execution Plan](../docs/v2/EXECUTION-PLAN.md)
-- [Prompt Pack](../docs/v2/PROMPT-PACK.md) (for agentic coding)
+- [Architecture](./docs/ARCHITECTURE.md)
+- [Domain Model](./docs/DOMAIN.md)
+- [Reliability](./docs/RELIABILITY.md)
+- [CLI Reference](./docs/CLI.md)
+- [Execution Plan](./docs/EXECUTION-PLAN.md)
+- [Phase 6: Detector Runtime](./docs/PHASE_6.md) ← NEW
+- [Prompt Pack](./docs/PROMPT-PACK.md) (for agentic coding)
 
 ## Development
 
@@ -77,7 +78,7 @@ bun run src/index.ts status
 
 1. **[CONTRIBUTING.md](CONTRIBUTING.md)** - Contribution guidelines, code standards, PR process
 2. **[CLAUDE.md](CLAUDE.md)** - Repository context for AI assistants and development conventions
-3. **[Prompt Pack](../docs/v2/PROMPT-PACK.md)** - Step-by-step implementation guide
+3. **[Prompt Pack](./docs/PROMPT-PACK.md)** - Step-by-step implementation guide
 
 ### Development Workflow
 
@@ -177,7 +178,7 @@ v2/
 ├── cli/                # Bun + TypeScript CLI
 ├── scripts/            # Development scripts (verify.sh)
 ├── .claude/            # Claude Code hooks & MCP config
-└── docs/               # Documentation (in ../docs/v2/)
+└── docs/               # Documentation (in v2/docs/)
 ```
 
 ## License
