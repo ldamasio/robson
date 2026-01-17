@@ -53,17 +53,7 @@ export type ExitReason =
   | 'degraded_mode'      // Emergency exit
   | 'position_error';    // Position error (margin call, etc.)
 
-export interface Summary {
-  active_count: number;
-  armed_count: number;
-  closed_today_count: number;
-  total_pnl_today: number;
-}
-
-export interface StatusResponse {
-  positions: Position[];
-  summary: Summary;
-}
+// Note: StatusResponse is defined below in API types section
 
 // Active position details (with trailing stop info)
 export interface ActivePosition extends Position {
@@ -83,36 +73,63 @@ export interface ClosedPosition extends Position {
   exit_reason: ExitReason;
 }
 
-// Request/Response types
+// Request/Response types matching robsond API
+
+/**
+ * Request to arm a new position.
+ *
+ * Note: leverage is fixed at 10x (not configurable).
+ * Position size is calculated via Golden Rule: (capital × risk%) / tech_stop_distance
+ */
 export interface ArmRequest {
   symbol: string;
-  strategy: string;
-  capital?: number;
-  leverage?: number;
-  dry_run?: boolean;
+  side: 'long' | 'short';
+  capital: number;        // Capital to allocate (e.g., 1000 USDT)
+  risk_percent: number;   // Risk per trade (e.g., 1 = 1%)
 }
 
+/**
+ * Response after arming a position.
+ */
 export interface ArmResponse {
   position_id: string;
   symbol: string;
-  state: PositionState;
+  side: string;
+  state: string;
 }
 
-export interface DisarmRequest {
-  position_id: string;
-  force?: boolean;
+/**
+ * Response from status endpoint.
+ */
+export interface StatusResponse {
+  active_positions: number;
+  positions: PositionSummary[];
 }
 
-export interface PanicRequest {
-  symbol?: string;  // If omitted, panic all positions
-  confirm?: boolean;
-  dry_run?: boolean;
+/**
+ * Summary of a position (from daemon API).
+ */
+export interface PositionSummary {
+  id: string;
+  symbol: string;
+  side: string;
+  state: string;
+  entry_price?: number;
+  trailing_stop?: number;
+  pnl?: number;
 }
 
+/**
+ * Response from panic endpoint.
+ */
+export interface PanicResponse {
+  closed_positions: string[];
+  count: number;
+}
+
+/**
+ * Error response from daemon API.
+ */
 export interface ErrorResponse {
-  error: {
-    code: string;
-    message: string;
-    details?: Record<string, unknown>;
-  };
+  error: string;
 }
