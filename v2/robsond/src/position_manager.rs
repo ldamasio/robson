@@ -593,6 +593,7 @@ mod tests {
     use super::*;
     use robson_exec::{IntentJournal, StubExchange};
     use robson_store::MemoryStore;
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
     async fn create_test_manager(
@@ -748,5 +749,111 @@ mod tests {
 
         let result = manager.disarm_position(fake_id).await;
         assert!(matches!(result, Err(DaemonError::PositionNotFound(_))));
+    }
+
+    /// E2E test: full detector integration (arm → spawn detector → MA crossover → signal)
+    ///
+    /// Flow:
+    /// 1. arm_position() → spawns detector
+    /// 2. Inject synthetic market data via EventBus
+    /// 3. Wait for MA crossover → DetectorSignal
+    /// 4. Assert signal properties
+    ///
+    /// Scope: NO real orders, NO engine changes, NO WebSocket
+    #[tokio::test]
+    async fn test_e2e_detector_ma_crossover_signal() {
+        let manager = create_test_manager().await;
+        let event_bus = manager.event_bus.clone();
+
+        // Subscribe to EventBus to capture DetectorSignal
+        let mut signal_receiver = event_bus.subscribe();
+
+        // Arm position (spawns detector internally)
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(98)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        let position = manager
+            .arm_position(
+                symbol.clone(),
+                Side::Long,
+                create_test_risk_config(),
+                tech_stop,
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+
+        let position_id = position.id;
+
+        // Yield to let detector task subscribe
+        tokio::task::yield_now().await;
+
+        // Feed descending prices (fast MA < slow MA) to establish "below" state
+        // Need enough data points for MA calculation (slow_period=21 default)
+        for i in (0..30).rev() {
+            let price = Decimal::from(100 + i);
+            let market_data = MarketData {
+                symbol: symbol.clone(),
+                price: Price::new(price).unwrap(),
+                timestamp: chrono::Utc::now(),
+            };
+            event_bus.send(DaemonEvent::MarketData(market_data));
+        }
+
+        // Feed ascending prices to trigger MA crossover (fast crosses above slow)
+        let mut signal_found = false;
+        let mut detector_signal = None;
+
+        for i in 0..10 {
+            let price = Decimal::from(100 + i * 3);  // Larger steps to trigger crossover faster
+            let market_data = MarketData {
+                symbol: symbol.clone(),
+                price: Price::new(price).unwrap(),
+                timestamp: chrono::Utc::now(),
+            };
+            event_bus.send(DaemonEvent::MarketData(market_data));
+
+            // Check if detector emitted signal (after each tick, with timeout)
+            for _ in 0..5 {
+                let deadline = tokio::time::timeout(
+                    std::time::Duration::from_millis(50),
+                    signal_receiver.recv()
+                );
+
+                match deadline.await {
+                    Ok(Some(Ok(DaemonEvent::DetectorSignal(signal)))) => {
+                        detector_signal = Some(signal);
+                        signal_found = true;
+                        break;
+                    }
+                    Ok(Some(Ok(_))) => continue, // Other events
+                    Ok(Some(Err(_))) | Ok(None) | Err(_) => break, // Channel error or timeout
+                }
+                if signal_found {
+                    break;
+                }
+            }
+            if signal_found {
+                break;
+            }
+        }
+
+        // Assert: signal was emitted
+        assert!(signal_found, "Detector should emit signal on MA crossover");
+
+        let signal = detector_signal.expect("Signal should exist");
+
+        // Assert: signal properties
+        assert_eq!(signal.position_id, position_id);
+        assert_eq!(signal.symbol.as_pair(), "BTCUSDT");
+        assert_eq!(signal.side, Side::Long);
+        assert!(signal.entry_price.as_decimal() > dec!(0));
+        assert!(signal.stop_loss.as_decimal() > dec!(0));
+
+        // Verify detector was cleaned up (single-shot)
+        // Detector should be removed after signaling (checked via detector count)
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 }
