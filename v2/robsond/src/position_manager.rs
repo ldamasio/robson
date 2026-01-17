@@ -5,6 +5,7 @@
 //! - Processing detector signals (entry logic)
 //! - Processing market data (trailing stop updates, exit triggers)
 //! - Managing position state transitions
+//! - Graceful shutdown of all detector tasks
 //!
 //! # Architecture
 //!
@@ -14,6 +15,8 @@
 //!          EventBus (signals, market data)
 //!                  ↓
 //!              Engine → Executor → Exchange
+//!
+//! Shutdown → CancellationToken.cancel() → all detectors exit
 //! ```
 
 use std::collections::HashMap;
@@ -21,6 +24,7 @@ use std::sync::Arc;
 
 use tokio::sync::RwLock;
 use tokio::task::JoinHandle;
+use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
@@ -32,6 +36,7 @@ use robson_engine::Engine;
 use robson_exec::{ActionResult, ExchangePort, Executor};
 use robson_store::Store;
 
+use crate::detector::DetectorTask;
 use crate::error::{DaemonError, DaemonResult};
 use crate::event_bus::{DaemonEvent, EventBus, MarketData};
 
@@ -49,8 +54,10 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     store: Arc<S>,
     /// Event bus for publishing events
     event_bus: Arc<EventBus>,
+    /// Master cancellation token for all detector tasks
+    shutdown_token: CancellationToken,
     /// Active detector tasks (position_id → task handle)
-    detectors: RwLock<HashMap<PositionId, JoinHandle<()>>>,
+    detectors: RwLock<HashMap<PositionId, JoinHandle<Option<DetectorSignal>>>>,
 }
 
 impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
@@ -61,13 +68,109 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         store: Arc<S>,
         event_bus: Arc<EventBus>,
     ) -> Self {
-        Self {
+        let shutdown_token = CancellationToken::new();
+
+        let manager = Self {
             engine,
             executor,
             store,
             event_bus,
+            shutdown_token,
             detectors: RwLock::new(HashMap::new()),
+        };
+
+        // Start background task to listen for detector signals
+        manager.start_signal_listener();
+
+        manager
+    }
+
+    /// Initiate graceful shutdown of all detector tasks.
+    ///
+    /// This cancels the shutdown token, causing all active detectors
+    /// to exit cooperatively.
+    pub async fn shutdown(&self) {
+        info!("Initiating position manager shutdown");
+
+        // Cancel all detectors
+        self.shutdown_token.cancel();
+
+        // Wait for all detectors to finish
+        let mut detectors = self.detectors.write().await;
+        let count = detectors.len();
+
+        for (position_id, handle) in detectors.drain() {
+            debug!(%position_id, "Waiting for detector to finish");
+
+            // Give each detector a moment to finish gracefully
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(500),
+                handle
+            ).await {
+                Ok(_) => debug!(%position_id, "Detector finished gracefully"),
+                Err(_) => {
+                    // Timeout - detector will be aborted when handle drops
+                    warn!(%position_id, "Detector did not finish in time, will be aborted");
+                }
+            }
         }
+
+        info!("Position manager shutdown complete ({count} detectors terminated)");
+    }
+
+    /// Get a child cancellation token for a new detector.
+    ///
+    /// Child tokens are cancelled when the parent is cancelled.
+    fn child_cancel_token(&self) -> CancellationToken {
+        self.shutdown_token.child_token()
+    }
+
+    /// Start background task to listen for detector signals.
+    ///
+    /// This task subscribes to the EventBus and processes DetectorSignal events
+    /// by calling handle_signal() for each received signal.
+    fn start_signal_listener(&self) {
+        let event_bus = Arc::clone(&self.event_bus);
+
+        tokio::spawn(async move {
+            let mut receiver = event_bus.subscribe();
+
+            info!("Position manager signal listener started");
+
+            loop {
+                match receiver.recv().await {
+                    Some(Ok(DaemonEvent::DetectorSignal(signal))) => {
+                        // Note: We can't directly call self.handle_signal() here
+                        // because we're in a spawned task without a reference.
+                        // For now, we'll need to restructure this.
+                        //
+                        // Options:
+                        // 1. Make PositionManager cloneable (Arc wrapped)
+                        // 2. Use a channel to send signals back to main thread
+                        // 3. Have Daemon orchestrate this instead
+                        //
+                        // For Phase 6.2, we'll rely on tests to call handle_signal()
+                        // directly. Full event-driven integration will be in Phase 7.
+                        warn!(
+                            position_id = %signal.position_id,
+                            "Received detector signal via EventBus (orchestration pending)"
+                        );
+                    }
+                    Some(Err(lag_msg)) => {
+                        warn!(error = %lag_msg, "Signal receiver lagged");
+                    }
+                    None => {
+                        info!("Signal receiver channel closed");
+                        break;
+                    }
+                    Some(Ok(_)) => {
+                        // Ignore other event types
+                    }
+                }
+            }
+
+            warn!("Position manager signal listener terminated");
+        });
     }
 
     /// Arm a new position.
@@ -115,11 +218,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             timestamp: chrono::Utc::now(),
         });
 
-        // Note: In a real implementation, we would spawn a detector task here.
-        // For now, detectors will be triggered externally (e.g., by tests or CLI).
-        // The detector interface will be implemented in Phase 7.
+        // Spawn detector task
+        let cancel_token = self.child_cancel_token();
+        let detector = DetectorTask::from_position(&position, Arc::clone(&self.event_bus), cancel_token)?;
+        let handle = detector.spawn();
 
-        debug!(%position_id, "Position armed, waiting for detector signal");
+        // Store detector handle for cancellation
+        let mut detectors = self.detectors.write().await;
+        detectors.insert(position_id, handle);
+
+        debug!(%position_id, "Position armed, detector spawned");
 
         Ok(position)
     }

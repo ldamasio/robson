@@ -259,17 +259,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
     async fn shutdown(&self) -> DaemonResult<()> {
         info!("Initiating graceful shutdown");
 
-        // In production, we might:
-        // 1. Stop accepting new positions
-        // 2. Wait for pending orders to complete
-        // 3. Persist any in-memory state
-        // 4. Close connections
+        // Shutdown position manager (cancels all detector tasks)
+        // Clone the Arc to drop the read lock before calling shutdown
+        let position_manager = Arc::clone(&self.position_manager);
+        position_manager.read().await.shutdown().await;
 
-        // For now, just log
-        let manager = self.position_manager.read().await;
-        let count = manager.position_count().await?;
-        info!(active_positions = count, "Shutdown complete");
-
+        info!("Shutdown complete");
         Ok(())
     }
 }
@@ -321,5 +316,15 @@ mod tests {
 
         // Should not fail with empty store
         daemon.restore_positions().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_daemon_shutdown() {
+        // Test that daemon shutdown properly calls position manager shutdown
+        let config = Config::test();
+        let daemon = Daemon::new_stub(config);
+
+        // Shutdown should complete without errors
+        daemon.shutdown().await.unwrap();
     }
 }
