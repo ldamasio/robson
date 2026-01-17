@@ -1,8 +1,8 @@
 # Robson v2 Execution Plan
 
 **Version**: 2.0.0-alpha
-**Last Updated**: 2026-01-16
-**Status**: Phase 4 Ready
+**Last Updated**: 2026-01-17
+**Status**: Phase 6 Complete (Detector Runtime)
 
 ---
 
@@ -11,18 +11,39 @@
 | Phase | Status | Tests | Key Deliverables |
 |-------|--------|-------|------------------|
 | 0 - Bootstrap | ✅ Complete | - | Workspace, crates, tooling |
-| 1 - Domain | ✅ Complete | 38 | Entities, value objects, events, state machine |
+| 1 - Domain | ✅ Complete | 43 | Entities, value objects, events, state machine |
 | 2 - Engine | ✅ Complete | 21 | Entry logic, trailing stop, exit triggers |
 | 3 - Storage | ✅ Complete | 14 | Repository pattern, in-memory store |
 | 4 - Execution | ✅ Complete | 17 | Ports, intent journal, executor, stubs |
-| 5 - Daemon | ⏳ Ready | - | Runtime orchestration |
-| 6 - CLI | ⏳ Blocked | - | TypeScript commands |
-| 7 - Detector | ⏳ Blocked | - | Pluggable interface |
-| 8 - E2E Test | ⏳ Blocked | - | Full workflow validation |
+| 5 - Daemon | ✅ Complete | 35 | Runtime orchestration, API, position manager |
+| 6 - Detector | ✅ Complete | (incl.) | MA crossover, graceful shutdown, E2E test |
+| 6b - CLI Wire-up | ⏳ In Progress | - | CLI ↔ Daemon API alignment |
+| 7 - Detector Trait | ⏳ Blocked | - | Pluggable interface (deferred) |
+| 8 - E2E Test | ⏳ Partial | 1 | test_e2e_detector_ma_crossover_signal |
 | 9 - Exchange | ⏳ Blocked | - | Binance connector |
 | 10 - Production | ⏳ Blocked | - | Observability, deployment |
 
-**Total Tests**: 92 passing
+**Total Tests**: 139 passing (connectors:2 + domain:43 + engine:21 + exec:17 + sim:1 + store:14 + robsond:35 + docs:6)
+
+### Phase 5 & 6 Delivered Components
+
+- **robsond/event_bus.rs**: Broadcast channel for detector→engine communication
+- **robsond/daemon.rs**: Main runtime with graceful shutdown
+- **robsond/position_manager.rs**: Position lifecycle + detector task management
+- **robsond/api.rs**: HTTP endpoints (health, status, /positions, /panic)
+- **robsond/detector.rs**: MA crossover detection, CancellationToken
+- **robsond/config.rs**: Environment-based configuration
+
+### Current Gap: CLI ↔ Daemon Route Mismatch
+
+| CLI Call | Current Route | Daemon Route |
+|----------|---------------|--------------|
+| arm() | POST /arm | POST /positions |
+| disarm() | POST /disarm | DELETE /positions/:id |
+| status() | GET /status | GET /status ✅ |
+| panic() | POST /panic | POST /panic ✅ |
+
+See PHASE_6.md for detailed detector runtime documentation.
 
 ---
 
@@ -824,10 +845,44 @@ cargo test --all               # 92 tests currently
 
 ## Next Action
 
-**Phase 5**: Implement daemon runtime with event bus and position manager.
+**Phase 6b**: Wire CLI to Daemon for MVP isolated margin flow.
 
-Start with:
-1. Create event bus for internal communication (detector → engine)
-2. Implement position manager with detector lifecycle
-3. Build daemon main loop with graceful shutdown
-4. Add basic API endpoints (health, status)
+### Immediate Tasks (MVP CLI/Isolated):
+
+1. **Fix CLI routes** - Align `cli/src/api/client.ts` with daemon API:
+   - `arm()` → POST /positions (with capital, risk_percent, symbol, side)
+   - `disarm()` → DELETE /positions/:id
+   - (status and panic already aligned)
+
+2. **Add isolated margin safety check** in executor/connector:
+   - Assert leverage=10x and isolated mode before order execution
+   - Fail-safe if account is not in expected state
+
+3. **Complete signal orchestration** in PositionManager:
+   - Currently: `start_signal_listener()` logs warning "orchestration pending"
+   - Wire: DetectorSignal → handle_signal() → Engine → Executor
+
+4. **Trailing stop distance invariant**:
+   - Ensure trailing_distance = tech_stop_distance (constant throughout position)
+   - Already implemented in Engine, verify in E2E
+
+### Success Criteria (MVP):
+
+```bash
+# 1. Start daemon
+cargo run -p robsond
+
+# 2. Arm position via CLI
+robson arm BTCUSDT --capital 1000 --risk 1 --side long
+
+# 3. Detector fires signal (real or injected via /positions/:id/signal)
+# 4. Entry executes with qty = (capital × risk%) / tech_stop_distance
+# 5. Position becomes Active with trailing stop
+# 6. On trailing stop hit → exit executes → position closed
+```
+
+### NOT in scope for Phase 6b:
+- New strategies or detector types
+- Replay/simulation
+- Reconnection/backpressure
+- Real Binance connector (use stub)
