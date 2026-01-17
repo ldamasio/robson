@@ -7,6 +7,7 @@ license.workspace = true
 
 [dependencies]
 robson-domain = { path = "../robson-domain" }
+rust_decimal = { workspace = true }
 tokio = { workspace = true }
 async-trait = { workspace = true }
 serde = { workspace = true }
@@ -15,6 +16,8 @@ reqwest = { workspace = true }
 tokio-tungstenite = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }
+futures-util = "0.3"
+chrono = { workspace = true }
 
 [dev-dependencies]
 anyhow = { workspace = true }

@@ -12,8 +12,9 @@
 //! 2. Initialize components
 //! 3. Restore active positions from store
 //! 4. Start API server
-//! 5. Main event loop (process events, market data)
-//! 6. Graceful shutdown on SIGINT/SIGTERM
+//! 5. Spawn WebSocket clients (market data)
+//! 6. Main event loop (process events, market data)
+//! 7. Graceful shutdown on SIGINT/SIGTERM
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -25,6 +26,7 @@ use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
+use robson_domain::Symbol;
 use robson_engine::Engine;
 use robson_exec::{ExchangePort, Executor, IntentJournal, StubExchange};
 use robson_store::{MemoryStore, Store};
@@ -33,6 +35,7 @@ use crate::api::{create_router, ApiState};
 use crate::config::Config;
 use crate::error::{DaemonError, DaemonResult};
 use crate::event_bus::{DaemonEvent, EventBus};
+use crate::market_data::MarketDataManager;
 use crate::position_manager::PositionManager;
 
 // =============================================================================
@@ -113,10 +116,17 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         let api_addr = self.start_api_server().await?;
         info!(%api_addr, "API server started");
 
-        // 3. Subscribe to event bus
+        // 3. Spawn WebSocket client (Phase 6: Market Data)
+        // TODO: Make this configurable (symbols list from config)
+        let market_data_manager = MarketDataManager::new(self.event_bus.clone());
+        let btcusdt = Symbol::from_pair("BTCUSDT").unwrap();
+        let _ws_handle = market_data_manager.spawn_ws_client(btcusdt)?;
+        info!("WebSocket client spawned for BTCUSDT");
+
+        // 4. Subscribe to event bus
         let mut event_receiver = self.event_bus.subscribe();
 
-        // 4. Main event loop
+        // 5. Main event loop
         info!("Entering main event loop");
         loop {
             tokio::select! {
@@ -142,7 +152,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             }
         }
 
-        // 5. Graceful shutdown
+        // 6. Graceful shutdown
         self.shutdown().await?;
 
         Ok(())

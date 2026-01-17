@@ -5,7 +5,11 @@
 
 #![warn(clippy::all)]
 
-// Module declarations will be added as we implement
+// Public modules
+pub mod binance_ws;
+
+// Re-exports
+pub use binance_ws::{BinanceMarketDataClient, BinanceWsError};
 
 #[cfg(test)]
 mod tests {

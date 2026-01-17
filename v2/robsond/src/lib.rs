@@ -40,6 +40,7 @@ pub mod config;
 pub mod daemon;
 pub mod error;
 pub mod event_bus;
+pub mod market_data;
 pub mod position_manager;
 
 // Re-exports for convenience
