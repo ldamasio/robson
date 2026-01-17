@@ -62,6 +62,8 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
 
 impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// Create a new position manager.
+    ///
+    /// After creation, call `start(Arc::clone(&manager))` to start the signal listener.
     pub fn new(
         engine: Engine,
         executor: Arc<Executor<E, S>>,
@@ -70,19 +72,28 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     ) -> Self {
         let shutdown_token = CancellationToken::new();
 
-        let manager = Self {
+        Self {
             engine,
             executor,
             store,
             event_bus,
             shutdown_token,
             detectors: RwLock::new(HashMap::new()),
-        };
+        }
+    }
 
-        // Start background task to listen for detector signals
-        manager.start_signal_listener();
-
-        manager
+    /// Start the position manager's background tasks.
+    ///
+    /// This spawns the signal listener that processes DetectorSignal events
+    /// from the EventBus and calls `handle_signal()`.
+    ///
+    /// Must be called after wrapping in Arc:
+    /// ```ignore
+    /// let manager = Arc::new(PositionManager::new(...));
+    /// PositionManager::start(Arc::clone(&manager));
+    /// ```
+    pub fn start(manager: Arc<Self>) {
+        Self::start_signal_listener(manager);
     }
 
     /// Initiate graceful shutdown of all detector tasks.
@@ -129,8 +140,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     ///
     /// This task subscribes to the EventBus and processes DetectorSignal events
     /// by calling handle_signal() for each received signal.
-    fn start_signal_listener(&self) {
-        let event_bus = Arc::clone(&self.event_bus);
+    fn start_signal_listener(manager: Arc<Self>) {
+        let event_bus = Arc::clone(&manager.event_bus);
+        let shutdown_token = manager.shutdown_token.clone();
 
         tokio::spawn(async move {
             let mut receiver = event_bus.subscribe();
@@ -138,38 +150,57 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             info!("Position manager signal listener started");
 
             loop {
-                match receiver.recv().await {
-                    Some(Ok(DaemonEvent::DetectorSignal(signal))) => {
-                        // Note: We can't directly call self.handle_signal() here
-                        // because we're in a spawned task without a reference.
-                        // For now, we'll need to restructure this.
-                        //
-                        // Options:
-                        // 1. Make PositionManager cloneable (Arc wrapped)
-                        // 2. Use a channel to send signals back to main thread
-                        // 3. Have Daemon orchestrate this instead
-                        //
-                        // For Phase 6.2, we'll rely on tests to call handle_signal()
-                        // directly. Full event-driven integration will be in Phase 7.
-                        warn!(
-                            position_id = %signal.position_id,
-                            "Received detector signal via EventBus (orchestration pending)"
-                        );
-                    }
-                    Some(Err(lag_msg)) => {
-                        warn!(error = %lag_msg, "Signal receiver lagged");
-                    }
-                    None => {
-                        info!("Signal receiver channel closed");
+                tokio::select! {
+                    // Handle shutdown
+                    _ = shutdown_token.cancelled() => {
+                        info!("Signal listener received shutdown signal");
                         break;
                     }
-                    Some(Ok(_)) => {
-                        // Ignore other event types
+                    // Process events
+                    event = receiver.recv() => {
+                        match event {
+                            Some(Ok(DaemonEvent::DetectorSignal(signal))) => {
+                                let position_id = signal.position_id;
+                                let signal_id = signal.signal_id;
+
+                                info!(
+                                    %position_id,
+                                    %signal_id,
+                                    "Processing detector signal from EventBus"
+                                );
+
+                                // Call handle_signal - now we have Arc<Self>!
+                                if let Err(e) = manager.handle_signal(signal).await {
+                                    error!(
+                                        %position_id,
+                                        %signal_id,
+                                        error = %e,
+                                        "Failed to process detector signal"
+                                    );
+                                } else {
+                                    info!(
+                                        %position_id,
+                                        %signal_id,
+                                        "Detector signal processed successfully"
+                                    );
+                                }
+                            }
+                            Some(Err(lag_msg)) => {
+                                warn!(error = %lag_msg, "Signal receiver lagged");
+                            }
+                            None => {
+                                info!("Signal receiver channel closed");
+                                break;
+                            }
+                            Some(Ok(_)) => {
+                                // Ignore other event types (MarketData, StateChanged, etc.)
+                            }
+                        }
                     }
                 }
             }
 
-            warn!("Position manager signal listener terminated");
+            info!("Position manager signal listener terminated");
         });
     }
 
@@ -596,8 +627,9 @@ mod tests {
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
-    async fn create_test_manager(
-    ) -> PositionManager<StubExchange, MemoryStore> {
+    /// Create a test manager without starting the signal listener.
+    /// Use this for unit tests that call handle_signal() directly.
+    async fn create_test_manager() -> Arc<PositionManager<StubExchange, MemoryStore>> {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
@@ -606,7 +638,15 @@ mod tests {
         let risk_config = RiskConfig::new(dec!(10000), dec!(1)).unwrap(); // 1% risk
         let engine = Engine::new(risk_config);
 
-        PositionManager::new(engine, executor, store, event_bus)
+        Arc::new(PositionManager::new(engine, executor, store, event_bus))
+    }
+
+    /// Create a test manager WITH signal listener running.
+    /// Use this for E2E tests that need full event-driven flow.
+    async fn create_test_manager_with_listener() -> Arc<PositionManager<StubExchange, MemoryStore>> {
+        let manager = create_test_manager().await;
+        PositionManager::start(Arc::clone(&manager));
+        manager
     }
 
     fn create_test_risk_config() -> RiskConfig {
@@ -751,18 +791,19 @@ mod tests {
         assert!(matches!(result, Err(DaemonError::PositionNotFound(_))));
     }
 
-    /// E2E test: full detector integration (arm → spawn detector → MA crossover → signal)
+    /// E2E test: full detector integration (arm → spawn detector → MA crossover → signal → entry)
     ///
     /// Flow:
     /// 1. arm_position() → spawns detector
     /// 2. Inject synthetic market data via EventBus
     /// 3. Wait for MA crossover → DetectorSignal
-    /// 4. Assert signal properties
+    /// 4. Signal listener processes signal → Entry order → Position becomes Active
     ///
-    /// Scope: NO real orders, NO engine changes, NO WebSocket
+    /// Scope: Uses stub exchange, NO real orders, NO WebSocket
     #[tokio::test]
     async fn test_e2e_detector_ma_crossover_signal() {
-        let manager = create_test_manager().await;
+        // Use manager WITH signal listener for full E2E flow
+        let manager = create_test_manager_with_listener().await;
         let event_bus = manager.event_bus.clone();
 
         // Subscribe to EventBus to capture DetectorSignal
