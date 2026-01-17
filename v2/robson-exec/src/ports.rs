@@ -23,6 +23,25 @@ use crate::error::ExecError;
 /// - `BinanceAdapter` - Real Binance isolated margin (Phase 9)
 #[async_trait]
 pub trait ExchangePort: Send + Sync {
+    /// Validate account is in isolated margin mode with expected leverage.
+    ///
+    /// **SAFETY CHECK**: Must be called before placing any order.
+    /// Fails if account is not in isolated margin mode or leverage != expected.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - Trading pair to check
+    /// * `expected_leverage` - Expected leverage multiplier (e.g., 10)
+    ///
+    /// # Returns
+    ///
+    /// `Ok(MarginSettings)` if valid, `Err` with explanation if not.
+    async fn validate_margin_settings(
+        &self,
+        symbol: &Symbol,
+        expected_leverage: u8,
+    ) -> Result<MarginSettings, ExecError>;
+
     /// Place a market order.
     ///
     /// # Arguments
@@ -68,6 +87,17 @@ pub trait ExchangePort: Send + Sync {
 
     /// Check if exchange is healthy/connected.
     async fn health_check(&self) -> Result<(), ExecError>;
+}
+
+/// Margin account settings for a symbol.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MarginSettings {
+    /// Is this an isolated margin account (not cross)
+    pub is_isolated: bool,
+    /// Current leverage multiplier
+    pub leverage: u8,
+    /// Symbol this applies to
+    pub symbol: String,
 }
 
 /// Result of a successful order execution.

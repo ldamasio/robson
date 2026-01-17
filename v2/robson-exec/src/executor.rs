@@ -45,13 +45,17 @@ pub enum ActionResult {
 // Executor
 // =============================================================================
 
+/// Fixed leverage for isolated margin trading.
+pub const FIXED_LEVERAGE: u8 = 10;
+
 /// Executes engine actions with idempotency guarantees.
 ///
 /// The Executor:
 /// 1. Receives actions from the Engine
 /// 2. Records intents before execution
-/// 3. Executes via Exchange port
-/// 4. Records results for audit trail
+/// 3. **Validates margin settings before orders** (isolated + 10x)
+/// 4. Executes via Exchange port
+/// 5. Records results for audit trail
 pub struct Executor<E: ExchangePort, S: Store> {
     /// Exchange port for placing orders
     exchange: Arc<E>,
@@ -181,7 +185,18 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             }
         }
 
-        // 2. Record intent
+        // 2. SAFETY CHECK: Validate margin settings (isolated + 10x)
+        // This MUST succeed before any order placement
+        info!(
+            %position_id,
+            symbol = %symbol.as_pair(),
+            "Validating margin settings (isolated + {}x)", FIXED_LEVERAGE
+        );
+        self.exchange
+            .validate_margin_settings(&symbol, FIXED_LEVERAGE)
+            .await?;
+
+        // 3. Record intent
         let intent = Intent::new(
             signal_id,
             position_id,
@@ -199,7 +214,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             }
         }
 
-        // 3. Mark as executing
+        // 4. Mark as executing
         self.journal.mark_executing(signal_id)?;
 
         info!(
@@ -211,13 +226,13 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             "Placing entry order"
         );
 
-        // 4. Execute on exchange
+        // 5. Execute on exchange
         let result = self
             .exchange
             .place_market_order(&symbol, side, quantity, &signal_id.to_string())
             .await;
 
-        // 5. Record result
+        // 6. Record result
         match &result {
             Ok(order_result) => {
                 info!(
@@ -251,7 +266,18 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         // Generate unique intent ID for exit
         let intent_id = Uuid::now_v7();
 
-        // 1. Record intent
+        // 1. SAFETY CHECK: Validate margin settings (isolated + 10x)
+        // Even for exits, we verify account state hasn't changed
+        info!(
+            %position_id,
+            symbol = %symbol.as_pair(),
+            "Validating margin settings for exit (isolated + {}x)", FIXED_LEVERAGE
+        );
+        self.exchange
+            .validate_margin_settings(&symbol, FIXED_LEVERAGE)
+            .await?;
+
+        // 2. Record intent
         let intent = Intent::new(
             intent_id,
             position_id,
@@ -276,13 +302,13 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             "Placing exit order"
         );
 
-        // 2. Execute on exchange
+        // 3. Execute on exchange
         let result = self
             .exchange
             .place_market_order(&symbol, side, quantity, &intent_id.to_string())
             .await;
 
-        // 3. Record result
+        // 4. Record result
         match &result {
             Ok(order_result) => {
                 info!(

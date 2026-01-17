@@ -12,7 +12,7 @@ use std::sync::RwLock;
 use robson_domain::{OrderSide, Price, Quantity, Symbol};
 
 use crate::error::ExecError;
-use crate::ports::{ExchangePort, MarketDataPort, OrderResult, PriceUpdate};
+use crate::ports::{ExchangePort, MarginSettings, MarketDataPort, OrderResult, PriceUpdate};
 
 // =============================================================================
 // Stub Exchange
@@ -21,6 +21,7 @@ use crate::ports::{ExchangePort, MarketDataPort, OrderResult, PriceUpdate};
 /// Stub exchange for testing.
 ///
 /// Simulates immediate fills at a configured price.
+/// Default configuration: isolated margin, 10x leverage.
 pub struct StubExchange {
     /// Current prices by symbol
     prices: RwLock<HashMap<String, Decimal>>,
@@ -32,10 +33,14 @@ pub struct StubExchange {
     order_counter: RwLock<u64>,
     /// Whether to simulate failures
     fail_next: RwLock<bool>,
+    /// Simulated margin settings (is_isolated, leverage)
+    margin_settings: RwLock<(bool, u8)>,
 }
 
 impl StubExchange {
     /// Create a new stub exchange with default price.
+    ///
+    /// Default margin settings: isolated=true, leverage=10
     pub fn new(default_price: Decimal) -> Self {
         Self {
             prices: RwLock::new(HashMap::new()),
@@ -43,7 +48,19 @@ impl StubExchange {
             fee_rate: Decimal::new(1, 3), // 0.001 = 0.1%
             order_counter: RwLock::new(0),
             fail_next: RwLock::new(false),
+            margin_settings: RwLock::new((true, 10)), // Default: isolated, 10x
         }
+    }
+
+    /// Set simulated margin settings (for testing failure scenarios).
+    ///
+    /// # Arguments
+    ///
+    /// * `is_isolated` - Whether margin is isolated (false = cross)
+    /// * `leverage` - Leverage multiplier
+    pub fn set_margin_settings(&self, is_isolated: bool, leverage: u8) {
+        let mut settings = self.margin_settings.write().unwrap();
+        *settings = (is_isolated, leverage);
     }
 
     /// Set price for a specific symbol.
@@ -82,6 +99,45 @@ impl StubExchange {
 
 #[async_trait]
 impl ExchangePort for StubExchange {
+    async fn validate_margin_settings(
+        &self,
+        symbol: &Symbol,
+        expected_leverage: u8,
+    ) -> Result<MarginSettings, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated margin check failure".to_string()));
+        }
+
+        let (is_isolated, leverage) = {
+            let settings = self.margin_settings.read().unwrap();
+            *settings
+        };
+
+        // Safety check: fail if not isolated margin
+        if !is_isolated {
+            return Err(ExecError::MarginSafetyViolation {
+                expected: "isolated margin".to_string(),
+                actual: "cross margin".to_string(),
+                advice: "Switch to isolated margin mode before trading".to_string(),
+            });
+        }
+
+        // Safety check: fail if leverage doesn't match
+        if leverage != expected_leverage {
+            return Err(ExecError::MarginSafetyViolation {
+                expected: format!("{}x leverage", expected_leverage),
+                actual: format!("{}x leverage", leverage),
+                advice: format!("Set leverage to {}x before trading", expected_leverage),
+            });
+        }
+
+        Ok(MarginSettings {
+            is_isolated,
+            leverage,
+            symbol: symbol.as_pair(),
+        })
+    }
+
     async fn place_market_order(
         &self,
         symbol: &Symbol,
