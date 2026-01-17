@@ -90,6 +90,24 @@ except Exception as e:
     traceback.print_exc()
     OPERATION_VIEWS_AVAILABLE = False
 
+# Import thesis views (Trading Thesis - v1 Chat feature)
+try:
+    from .views.thesis_views import (
+        thesis_templates,
+        create_thesis,
+        list_theses,
+        get_thesis,
+        update_thesis_status,
+        thesis_summary,
+    )
+    THESIS_VIEWS_AVAILABLE = True
+    print("✅ Thesis views imported successfully")
+except Exception as e:
+    import traceback
+    print(f"⚠️  Could not import thesis views: {e}")
+    traceback.print_exc()
+    THESIS_VIEWS_AVAILABLE = False
+
 # Main API URL patterns
 urlpatterns = [
     # ==========================================
@@ -247,6 +265,19 @@ if OPERATION_VIEWS_AVAILABLE:
     urlpatterns += [
         path('operations/', list_operations, name='list_operations'),
         path('operations/<int:operation_id>/', get_operation, name='get_operation'),
+    ]
+
+# ==========================================
+# TRADING THESIS - V1 CHAT FEATURE
+# ==========================================
+if THESIS_VIEWS_AVAILABLE:
+    urlpatterns += [
+        path('thesis/templates/', thesis_templates, name='thesis_templates'),
+        path('thesis/create/', create_thesis, name='create_thesis'),
+        path('thesis/', list_theses, name='list_theses'),
+        path('thesis/summary/', thesis_summary, name='thesis_summary'),
+        path('thesis/<int:thesis_id>/', get_thesis, name='get_thesis'),
+        path('thesis/<int:thesis_id>/status/', update_thesis_status, name='update_thesis_status'),
     ]
 
 # Debug info

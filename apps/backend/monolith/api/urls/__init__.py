@@ -105,6 +105,31 @@ except ImportError as e:
     print(f"⚠️  Could not import chat views: {e}")
     CHAT_VIEWS_AVAILABLE = False
 
+# Import thesis views for Trading Thesis feature
+# TODO: Fix import path issue - temporarily disabled
+try:
+    from ..views.thesis_views import (
+        thesis_templates,
+        create_thesis,
+        list_theses,
+        get_thesis,
+        update_thesis_status,
+        thesis_summary,
+    )
+
+    THESIS_VIEWS_AVAILABLE = True
+    print("✅ Thesis views imported successfully")
+except ImportError as e:
+    import traceback
+    print(f"⚠️  Could not import thesis views: {e}")
+    # Don't print traceback for now
+    THESIS_VIEWS_AVAILABLE = False
+except Exception as e:
+    import traceback
+    print(f"❌ Unexpected error importing thesis views: {type(e).__name__}: {e}")
+    traceback.print_exc()
+    THESIS_VIEWS_AVAILABLE = False
+
 # Import pattern detection engine views
 try:
     from ..views.pattern_views import (
@@ -463,6 +488,29 @@ if CHAT_VIEWS_AVAILABLE:
     print("✅ Chat views loaded: /api/chat/, /api/chat/status/, etc.")
 else:
     print("⚠️  Chat views not available")
+
+# ==========================================
+# TRADING THESIS ROUTES (V1 CHAT FEATURE)
+# ==========================================
+# Trading Thesis - structured market hypotheses (NO execution)
+if THESIS_VIEWS_AVAILABLE:
+    urlpatterns += [
+        # Thesis templates
+        path("thesis/templates/", thesis_templates, name="thesis_templates"),
+        # Create new thesis
+        path("thesis/create/", create_thesis, name="create_thesis"),
+        # List user's theses
+        path("thesis/", list_theses, name="list_theses"),
+        # Thesis summary/stats
+        path("thesis/summary/", thesis_summary, name="thesis_summary"),
+        # Get specific thesis
+        path("thesis/<int:thesis_id>/", get_thesis, name="get_thesis"),
+        # Update thesis status
+        path("thesis/<int:thesis_id>/status/", update_thesis_status, name="update_thesis_status"),
+    ]
+    print("✅ Thesis views loaded: /api/thesis/, /api/thesis/create/, etc.")
+else:
+    print("⚠️  Thesis views not available")
 
 # ==========================================
 # PATTERN DETECTION ENGINE ROUTES

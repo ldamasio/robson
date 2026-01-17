@@ -54,6 +54,11 @@ from .trading import (
     TradingIntent,
 )
 
+# Import thesis models
+from .thesis import (
+    TradingThesisModel,
+)
+
 # Import technical analysis models (refactored)
 from .analysis import (
     TechnicalAnalysisInterpretation,
@@ -224,6 +229,9 @@ __all__ = [
     'Position',
     'Trade',
     'TradingIntent',
+
+    # Thesis models
+    'TradingThesisModel',
     
     # Refactored technical analysis
     'TechnicalAnalysisInterpretation',

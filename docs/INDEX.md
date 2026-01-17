@@ -63,6 +63,8 @@ docs/
 ├── plan/                            # Planning documents
 │   ├── infra/                       # Infrastructure deployment plans
 │   └── prompts/                     # AI prompts for implementation
+├── FEATURES/                        # Feature documentation
+│   └── trading-thesis.md            # Trading Thesis feature (v1 Chat)
 └── history/                         # Legacy/archived docs
     ├── 2024-12-deployment/          # December 2024 deployment archive
     └── monolith/
@@ -294,6 +296,6 @@ Robson Bot is optimized for AI-assisted development:
 
 ---
 
-**Last Updated**: 2024-12-25
+**Last Updated**: 2025-01-17
 **Maintained by**: Robson Bot Core Team
 **License**: Same as project
