@@ -38,6 +38,7 @@
 pub mod api;
 pub mod config;
 pub mod daemon;
+pub mod detector;
 pub mod error;
 pub mod event_bus;
 pub mod market_data;
@@ -46,6 +47,7 @@ pub mod position_manager;
 // Re-exports for convenience
 pub use config::{ApiConfig, Config, EngineConfig, Environment};
 pub use daemon::Daemon;
+pub use detector::{DetectorConfig, DetectorTask};
 pub use error::{DaemonError, DaemonResult};
 pub use event_bus::{DaemonEvent, EventBus, EventReceiver, MarketData, OrderFill};
 pub use position_manager::PositionManager;
