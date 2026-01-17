@@ -121,7 +121,6 @@ class TradingIntentRepository(Protocol):
         strategy_id: Optional[int] = None,
         symbol_id: Optional[int] = None,
         offset: int = 0,
-        offset: int = 0
     ) -> Iterable[object]:
         """List trading intents for a client with optional filters."""
         ...

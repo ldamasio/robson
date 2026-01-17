@@ -1,17 +1,27 @@
 # backend/settings.py - CLEAN AND TESTED VERSION
-from pathlib import Path
-from decouple import AutoConfig
-from datetime import timedelta
 import os
 import sys
+from pathlib import Path
 
+# IMPORTANT: Add paths to sys.path BEFORE any imports
+# This must be done early to support core.* imports
 BASE_DIR = Path(__file__).resolve().parent.parent
-config = AutoConfig(search_path=BASE_DIR)
 
-# Ensure repository root is in sys.path so `apps.*` packages are importable
-REPO_ROOT = BASE_DIR.parent.parent.parent  # <repo>/
+# Add apps/backend to sys.path FIRST (for core.* imports)
+BACKEND_ROOT = BASE_DIR.parent.parent  # apps/backend/
+if str(BACKEND_ROOT) not in sys.path:
+    sys.path.insert(0, str(BACKEND_ROOT))
+
+# Also add repository root (for apps.* imports) - need one more level up
+REPO_ROOT = BASE_DIR.parent.parent.parent.parent  # <repo>/
 if str(REPO_ROOT) not in sys.path:
-    sys.path.insert(0, str(REPO_ROOT))
+    sys.path.append(str(REPO_ROOT))
+
+# Now safe to import other modules
+from decouple import AutoConfig
+from datetime import timedelta
+
+config = AutoConfig(search_path=BASE_DIR)
 
 # ==========================================
 # BASIC CONFIGURATION

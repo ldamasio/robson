@@ -83,6 +83,8 @@ def create_trading_intent(request):
     try:
         # Get client from user
         client = request.user.client
+        if not client:
+            return Response(
                 {"error": "User has no associated client"}, status=status.HTTP_400_BAD_REQUEST
             )
 
@@ -856,8 +858,6 @@ def auto_calculate_parameters(request):
 
     except Exception as e:
         logger.error(f"Unexpected error in auto-calculate: {e}", exc_info=True)
-        return Response(
-            {"error": "Internal server error"}, status=status.HTTP_500_INTERNAL_SERVER_ERROR
         return Response(
             {"error": "Internal server error"},
             status=status.HTTP_500_INTERNAL_SERVER_ERROR
