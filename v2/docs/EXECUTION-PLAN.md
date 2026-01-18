@@ -34,14 +34,14 @@
 - **robsond/detector.rs**: MA crossover detection, CancellationToken
 - **robsond/config.rs**: Environment-based configuration
 
-### Current Gap: CLI ↔ Daemon Route Mismatch
+### ✅ CLI ↔ Daemon Routes ALIGNED
 
-| CLI Call | Current Route | Daemon Route |
-|----------|---------------|--------------|
-| arm() | POST /arm | POST /positions |
-| disarm() | POST /disarm | DELETE /positions/:id |
-| status() | GET /status | GET /status ✅ |
-| panic() | POST /panic | POST /panic ✅ |
+| CLI Call | Route | Status |
+|----------|-------|--------|
+| arm() | POST /positions | ✅ |
+| disarm() | DELETE /positions/:id | ✅ |
+| status() | GET /status | ✅ |
+| panic() | POST /panic | ✅ |
 
 See PHASE_6.md for detailed detector runtime documentation.
 
