@@ -8,8 +8,8 @@ use crate::repository::{EventRepository, OrderRepository, PositionRepository, St
 use async_trait::async_trait;
 use robson_domain::{Event, Order, OrderId, OrderStatus, Position, PositionId};
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::RwLock;
+use std::sync::atomic::{AtomicI64, Ordering};
 use uuid::Uuid;
 
 /// In-memory store for testing
@@ -86,29 +86,17 @@ impl PositionRepository for MemoryStore {
 
     async fn find_by_account(&self, account_id: Uuid) -> Result<Vec<Position>, StoreError> {
         let positions = self.positions.read().unwrap();
-        Ok(positions
-            .values()
-            .filter(|p| p.account_id == account_id)
-            .cloned()
-            .collect())
+        Ok(positions.values().filter(|p| p.account_id == account_id).cloned().collect())
     }
 
     async fn find_active(&self) -> Result<Vec<Position>, StoreError> {
         let positions = self.positions.read().unwrap();
-        Ok(positions
-            .values()
-            .filter(|p| p.can_enter() || p.can_exit())
-            .cloned()
-            .collect())
+        Ok(positions.values().filter(|p| p.can_enter() || p.can_exit()).cloned().collect())
     }
 
     async fn find_by_state(&self, state: &str) -> Result<Vec<Position>, StoreError> {
         let positions = self.positions.read().unwrap();
-        Ok(positions
-            .values()
-            .filter(|p| p.state.name() == state)
-            .cloned()
-            .collect())
+        Ok(positions.values().filter(|p| p.state.name() == state).cloned().collect())
     }
 
     async fn delete(&self, id: PositionId) -> Result<(), StoreError> {
@@ -140,11 +128,7 @@ impl OrderRepository for MemoryStore {
 
     async fn find_by_position(&self, position_id: PositionId) -> Result<Vec<Order>, StoreError> {
         let orders = self.orders.read().unwrap();
-        Ok(orders
-            .values()
-            .filter(|o| o.position_id == position_id)
-            .cloned()
-            .collect())
+        Ok(orders.values().filter(|o| o.position_id == position_id).cloned().collect())
     }
 
     async fn find_by_exchange_id(&self, exchange_id: &str) -> Result<Option<Order>, StoreError> {
@@ -157,10 +141,7 @@ impl OrderRepository for MemoryStore {
 
     async fn find_by_client_id(&self, client_id: &str) -> Result<Option<Order>, StoreError> {
         let orders = self.orders.read().unwrap();
-        Ok(orders
-            .values()
-            .find(|o| o.client_order_id == client_id)
-            .cloned())
+        Ok(orders.values().find(|o| o.client_order_id == client_id).cloned())
     }
 
     async fn find_pending(&self) -> Result<Vec<Order>, StoreError> {
@@ -181,10 +162,7 @@ impl OrderRepository for MemoryStore {
 impl EventRepository for MemoryStore {
     async fn append(&self, event: &Event) -> Result<i64, StoreError> {
         let seq = self.event_seq.fetch_add(1, Ordering::SeqCst) + 1;
-        let stored = StoredEvent {
-            seq,
-            event: event.clone(),
-        };
+        let stored = StoredEvent { seq, event: event.clone() };
         let mut events = self.events.write().unwrap();
         events.push(stored);
         Ok(seq)
@@ -254,11 +232,7 @@ mod tests {
     use rust_decimal_macros::dec;
 
     fn create_test_position() -> Position {
-        Position::new(
-            Uuid::now_v7(),
-            Symbol::from_pair("BTCUSDT").unwrap(),
-            Side::Long,
-        )
+        Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long)
     }
 
     fn create_test_order(position_id: PositionId) -> Order {
@@ -323,9 +297,7 @@ mod tests {
         let pos3 = create_test_position();
         PositionRepository::save(&store, &pos3).await.unwrap();
 
-        let found = PositionRepository::find_by_account(&store, account_id)
-            .await
-            .unwrap();
+        let found = PositionRepository::find_by_account(&store, account_id).await.unwrap();
         assert_eq!(found.len(), 2);
     }
 
@@ -379,9 +351,7 @@ mod tests {
         OrderRepository::save(&store, &order2).await.unwrap();
         OrderRepository::save(&store, &order3).await.unwrap();
 
-        let found = OrderRepository::find_by_position(&store, position_id)
-            .await
-            .unwrap();
+        let found = OrderRepository::find_by_position(&store, position_id).await.unwrap();
         assert_eq!(found.len(), 2);
     }
 
@@ -393,9 +363,7 @@ mod tests {
 
         OrderRepository::save(&store, &order).await.unwrap();
 
-        let found = OrderRepository::find_by_client_id(&store, &client_id)
-            .await
-            .unwrap();
+        let found = OrderRepository::find_by_client_id(&store, &client_id).await.unwrap();
         assert!(found.is_some());
     }
 
@@ -437,9 +405,7 @@ mod tests {
         EventRepository::append(&store, &event2).await.unwrap();
         EventRepository::append(&store, &event3).await.unwrap();
 
-        let found = EventRepository::find_by_position(&store, position_id)
-            .await
-            .unwrap();
+        let found = EventRepository::find_by_position(&store, position_id).await.unwrap();
         assert_eq!(found.len(), 2);
     }
 
@@ -453,9 +419,7 @@ mod tests {
         EventRepository::append(&store, &event).await.unwrap(); // seq 2
         EventRepository::append(&store, &event).await.unwrap(); // seq 3
 
-        let found = EventRepository::find_by_position_after(&store, position_id, 1)
-            .await
-            .unwrap();
+        let found = EventRepository::find_by_position_after(&store, position_id, 1).await.unwrap();
         assert_eq!(found.len(), 2); // seq 2 and 3
     }
 
@@ -464,9 +428,7 @@ mod tests {
         let store = MemoryStore::new();
         let position_id = Uuid::now_v7();
 
-        let seq = EventRepository::get_latest_seq(&store, position_id)
-            .await
-            .unwrap();
+        let seq = EventRepository::get_latest_seq(&store, position_id).await.unwrap();
         assert!(seq.is_none());
 
         let event = create_test_event(position_id);
@@ -474,9 +436,7 @@ mod tests {
         EventRepository::append(&store, &event).await.unwrap();
         EventRepository::append(&store, &event).await.unwrap();
 
-        let seq = EventRepository::get_latest_seq(&store, position_id)
-            .await
-            .unwrap();
+        let seq = EventRepository::get_latest_seq(&store, position_id).await.unwrap();
         assert_eq!(seq, Some(3));
     }
 

@@ -11,10 +11,7 @@ use sqlx::PgPool;
 ///
 /// This is idempotent and safe for replay - handlers use UPSERT
 /// and check sequence numbers to prevent double-application.
-pub async fn apply_event_to_projections(
-    pool: &PgPool,
-    envelope: &EventEnvelope,
-) -> Result<()> {
+pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
     match envelope.event_type.as_str() {
         // Order events
         "ORDER_SUBMITTED" => handlers::orders::handle_order_submitted(pool, envelope).await?,
@@ -42,7 +39,7 @@ pub async fn apply_event_to_projections(
         _ => {
             tracing::warn!("Unknown event type: {}", envelope.event_type);
             return Err(ProjectionError::UnknownEventType(envelope.event_type.clone()));
-        }
+        },
     }
 
     Ok(())

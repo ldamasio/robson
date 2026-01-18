@@ -304,9 +304,7 @@ impl RiskConfig {
     /// - Risk percentage <= 0 or > 5%
     pub fn new(capital: Decimal, risk_per_trade_pct: Decimal) -> Result<Self, DomainError> {
         if capital <= Decimal::ZERO {
-            return Err(DomainError::InvalidRiskConfig(
-                "Capital must be positive".to_string(),
-            ));
+            return Err(DomainError::InvalidRiskConfig("Capital must be positive".to_string()));
         }
 
         if risk_per_trade_pct <= Decimal::ZERO {
@@ -321,10 +319,7 @@ impl RiskConfig {
             ));
         }
 
-        Ok(Self {
-            capital,
-            risk_per_trade_pct,
-        })
+        Ok(Self { capital, risk_per_trade_pct })
     }
 
     /// Get capital
@@ -364,7 +359,9 @@ impl fmt::Display for RiskConfig {
         write!(
             f,
             "RiskConfig {{ capital: {}, risk: {}%, leverage: {}x }}",
-            self.capital, self.risk_per_trade_pct, Self::LEVERAGE
+            self.capital,
+            self.risk_per_trade_pct,
+            Self::LEVERAGE
         )
     }
 }

@@ -3,8 +3,8 @@
 //! Events represent state changes in the domain.
 //! Used for event sourcing and audit trails.
 
-use crate::value_objects::{Price, Quantity, Side, Symbol};
 use crate::entities::{AccountId, ExitReason, OrderId, PositionId};
+use crate::value_objects::{Price, Quantity, Side, Symbol};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};

@@ -26,6 +26,14 @@ pub enum DaemonError {
     #[error("Store error: {0}")]
     Store(#[from] StoreError),
 
+    /// Database error
+    #[error("Database error: {0}")]
+    Database(#[from] sqlx::Error),
+
+    /// Projection error
+    #[error("Projection error: {0}")]
+    Projection(#[from] robson_projector::ProjectionError),
+
     /// Position not found
     #[error("Position not found: {0}")]
     PositionNotFound(Uuid),

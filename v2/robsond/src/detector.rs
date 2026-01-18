@@ -100,8 +100,8 @@ impl DetectorConfig {
             position_id: position.id,
             symbol: position.symbol.clone(),
             side: position.side,
-            ma_fast_period: 9,   // Default fast MA
-            ma_slow_period: 21,  // Default slow MA
+            ma_fast_period: 9,             // Default fast MA
+            ma_slow_period: 21,            // Default slow MA
             stop_loss_percent: dec!(0.02), // 2% default
         })
     }
@@ -168,7 +168,11 @@ impl DetectorTask {
     /// * `config` - Detector configuration (from armed position)
     /// * `event_bus` - Shared event bus for receiving market data and emitting signals
     /// * `cancel_token` - Cancellation token for graceful shutdown
-    pub fn new(config: DetectorConfig, event_bus: Arc<EventBus>, cancel_token: CancellationToken) -> Self {
+    pub fn new(
+        config: DetectorConfig,
+        event_bus: Arc<EventBus>,
+        cancel_token: CancellationToken,
+    ) -> Self {
         // Validate configuration
         if let Err(e) = config.validate() {
             warn!(error = %e, "Invalid detector config, using defaults");
@@ -187,7 +191,11 @@ impl DetectorTask {
     /// Create detector directly from an armed position.
     ///
     /// Convenience method that extracts config from position.
-    pub fn from_position(position: &Position, event_bus: Arc<EventBus>, cancel_token: CancellationToken) -> DaemonResult<Self> {
+    pub fn from_position(
+        position: &Position,
+        event_bus: Arc<EventBus>,
+        cancel_token: CancellationToken,
+    ) -> DaemonResult<Self> {
         let config = DetectorConfig::from_position(position)?;
         Ok(Self::new(config, event_bus, cancel_token))
     }
@@ -224,13 +232,13 @@ impl DetectorTask {
                         entry_price = %signal.entry_price.as_decimal(),
                         "Detector emitted signal"
                     );
-                }
+                },
                 None => {
                     info!(
                         position_id = %position_id,
                         "Detector terminated without signal"
                     );
-                }
+                },
             }
 
             result
@@ -296,9 +304,7 @@ impl DetectorTask {
     /// Returns `Some(signal)` if detection triggered, `None` otherwise.
     fn handle_event(&mut self, event: DaemonEvent) -> Option<DetectorSignal> {
         match event {
-            DaemonEvent::MarketData(market_data) => {
-                self.handle_market_data(&market_data)
-            }
+            DaemonEvent::MarketData(market_data) => self.handle_market_data(&market_data),
             DaemonEvent::Shutdown => {
                 debug!(
                     position_id = %self.config.position_id,
@@ -308,11 +314,11 @@ impl DetectorTask {
                 // Note: This doesn't directly exit, but we could restructure
                 // to handle shutdown more explicitly if needed
                 None
-            }
+            },
             _ => {
                 // Ignore other event types
                 None
-            }
+            },
         }
     }
 
@@ -385,7 +391,7 @@ impl DetectorTask {
                     Side::Long => !was_above && is_above,  // Crossed above
                     Side::Short => was_above && !is_above, // Crossed below
                 }
-            }
+            },
             _ => {
                 // No previous state, wait for next tick
                 debug!(
@@ -393,7 +399,7 @@ impl DetectorTask {
                     "No previous MA values, waiting for next tick"
                 );
                 false
-            }
+            },
         };
 
         // Store current MA values for next tick
@@ -418,9 +424,7 @@ impl DetectorTask {
     /// Returns the average of the last `period` prices.
     fn calculate_ma(&self, period: usize) -> Decimal {
         let start_idx = self.price_buffer.len().saturating_sub(period);
-        let sum: Decimal = self.price_buffer
-            .range(start_idx..)
-            .sum();
+        let sum: Decimal = self.price_buffer.range(start_idx..).sum();
         sum / Decimal::from(period)
     }
 
@@ -475,8 +479,8 @@ mod tests {
             position_id: Uuid::now_v7(),
             symbol: robson_domain::Symbol::from_pair("BTCUSDT").unwrap(),
             side: Side::Long,
-            ma_fast_period: 3,   // Small for faster tests
-            ma_slow_period: 5,   // Small for faster tests
+            ma_fast_period: 3, // Small for faster tests
+            ma_slow_period: 5, // Small for faster tests
             stop_loss_percent: dec!(0.02),
         }
     }
@@ -585,8 +589,13 @@ mod tests {
         // Feed prices where fast MA < slow MA (descending trend)
         // This establishes the "previous state"
         let prices_below = vec![
-            dec!(100), dec!(99), dec!(98), dec!(97), dec!(96), // All descending
-            dec!(95), dec!(94),  // More data to establish state
+            dec!(100),
+            dec!(99),
+            dec!(98),
+            dec!(97),
+            dec!(96), // All descending
+            dec!(95),
+            dec!(94), // More data to establish state
         ];
 
         for price in prices_below {
@@ -595,9 +604,7 @@ mod tests {
         }
 
         // Now feed prices where fast MA crosses ABOVE slow MA (ascending trend)
-        let prices_above = vec![
-            dec!(96), dec!(98), dec!(100), dec!(102), dec!(104),
-        ];
+        let prices_above = vec![dec!(96), dec!(98), dec!(100), dec!(102), dec!(104)];
 
         let mut result = None;
         for price in prices_above {
@@ -632,8 +639,13 @@ mod tests {
         // Feed prices where fast MA > slow MA (ascending trend)
         // This establishes the "previous state"
         let prices_above = vec![
-            dec!(100), dec!(101), dec!(102), dec!(103), dec!(104), // All ascending
-            dec!(105), dec!(106), // More data to establish state
+            dec!(100),
+            dec!(101),
+            dec!(102),
+            dec!(103),
+            dec!(104), // All ascending
+            dec!(105),
+            dec!(106), // More data to establish state
         ];
 
         for price in prices_above {
@@ -642,9 +654,7 @@ mod tests {
         }
 
         // Now feed prices where fast MA crosses BELOW slow MA (descending trend)
-        let prices_below = vec![
-            dec!(104), dec!(102), dec!(100), dec!(98), dec!(96),
-        ];
+        let prices_below = vec![dec!(104), dec!(102), dec!(100), dec!(98), dec!(96)];
 
         let mut result = None;
         for price in prices_below {
@@ -701,9 +711,7 @@ mod tests {
         let mut detector = DetectorTask::new(config, event_bus, cancel_token);
 
         // Feed prices where fast is above slow (already crossed)
-        let prices = vec![
-            dec!(110), dec!(110), dec!(110), dec!(100), dec!(100),
-        ];
+        let prices = vec![dec!(110), dec!(110), dec!(110), dec!(100), dec!(100)];
 
         for price in prices {
             let data = create_test_market_data("BTCUSDT", price);
@@ -783,13 +791,10 @@ mod tests {
         }
 
         // Wait for detector to complete with timeout
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            handle,
-        )
-        .await
-        .expect("Detector timed out")
-        .expect("Detector task panicked");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("Detector timed out")
+            .expect("Detector task panicked");
 
         assert!(result.is_some());
 
@@ -807,8 +812,8 @@ mod tests {
                     assert_eq!(s.position_id, position_id);
                     found_signal = true;
                     break;
-                }
-                Some(Ok(_)) => continue, // Other events
+                },
+                Some(Ok(_)) => continue,      // Other events
                 Some(Err(_)) | None => break, // Channel closed or error
             }
         }
@@ -841,13 +846,10 @@ mod tests {
         }
 
         // Wait for detector to complete
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            handle,
-        )
-        .await
-        .expect("Detector timed out")
-        .expect("Detector task panicked");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("Detector timed out")
+            .expect("Detector task panicked");
 
         // Should have emitted exactly one signal
         assert!(result.is_some());
@@ -880,13 +882,10 @@ mod tests {
         cancel_token.cancel();
 
         // Wait for detector to finish
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            handle,
-        )
-        .await
-        .expect("Detector should finish quickly after cancellation")
-        .expect("Detector task panicked");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("Detector should finish quickly after cancellation")
+            .expect("Detector task panicked");
 
         // Should return None (no signal) due to cancellation
         assert!(result.is_none(), "Detector should not emit signal on cancellation");
@@ -915,13 +914,10 @@ mod tests {
         cancel_token.cancel();
 
         // Wait for detector to finish
-        let result = tokio::time::timeout(
-            std::time::Duration::from_secs(1),
-            handle,
-        )
-        .await
-        .expect("Detector should finish after cancellation")
-        .expect("Detector task panicked");
+        let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+            .await
+            .expect("Detector should finish after cancellation")
+            .expect("Detector task panicked");
 
         // Should return None (cancelled before signal)
         assert!(result.is_none(), "Detector should be cancelled before emitting signal");
@@ -950,13 +946,10 @@ mod tests {
 
         // Wait for all to finish
         for handle in handles {
-            let result = tokio::time::timeout(
-                std::time::Duration::from_secs(1),
-                handle,
-            )
-            .await
-            .expect("Detector should finish quickly after cancellation")
-            .expect("Detector task panicked");
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1), handle)
+                .await
+                .expect("Detector should finish quickly after cancellation")
+                .expect("Detector task panicked");
 
             // All should return None (cancelled)
             assert!(result.is_none(), "Detector should not emit signal on cancellation");

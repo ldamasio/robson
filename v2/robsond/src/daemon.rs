@@ -5,6 +5,7 @@
 //! - Event Bus (internal communication)
 //! - API Server (HTTP endpoints)
 //! - Market Data (price updates)
+//! - Projection Worker (event log → projections)
 //!
 //! # Lifecycle
 //!
@@ -13,8 +14,9 @@
 //! 3. Restore active positions from store
 //! 4. Start API server
 //! 5. Spawn WebSocket clients (market data)
-//! 6. Main event loop (process events, market data)
-//! 7. Graceful shutdown on SIGINT/SIGTERM
+//! 6. Spawn projection worker (if database configured)
+//! 7. Main event loop (process events, market data)
+//! 8. Graceful shutdown on SIGINT/SIGTERM
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -31,12 +33,13 @@ use robson_engine::Engine;
 use robson_exec::{ExchangePort, Executor, IntentJournal, StubExchange};
 use robson_store::{MemoryStore, Store};
 
-use crate::api::{create_router, ApiState};
+use crate::api::{ApiState, create_router};
 use crate::config::Config;
 use crate::error::{DaemonError, DaemonResult};
 use crate::event_bus::{DaemonEvent, EventBus};
 use crate::market_data::MarketDataManager;
 use crate::position_manager::PositionManager;
+use crate::projection_worker::ProjectionWorker;
 
 // =============================================================================
 // Daemon
@@ -109,6 +112,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             "Starting Robson daemon"
         );
 
+        // Create shutdown token for coordinating graceful shutdown
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let shutdown_sig = shutdown.clone();
+
         // 1. Restore active positions
         self.restore_positions().await?;
 
@@ -123,13 +130,48 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         let _ws_handle = market_data_manager.spawn_ws_client(btcusdt)?;
         info!("WebSocket client spawned for BTCUSDT");
 
-        // 4. Subscribe to event bus
+        // 4. Spawn projection worker (if database configured)
+        let projection_handle = if let Some(database_url) = &self.config.projection.database_url {
+            info!(stream_key = %self.config.projection.stream_key, "Starting projection worker");
+
+            let pool = sqlx::PgPool::connect(database_url).await?;
+            let tenant_id = uuid::Uuid::new_v4(); // TODO: load from config
+            let worker = ProjectionWorker::new(pool, self.config.projection.clone(), tenant_id);
+
+            let worker_shutdown = shutdown.clone();
+            Some(tokio::spawn(async move {
+                if let Err(e) = worker.run(worker_shutdown).await {
+                    error!(error = %e, "Projection worker failed");
+                }
+            }))
+        } else {
+            info!("No DATABASE_URL configured, projection worker disabled");
+            None
+        };
+
+        // 5. Subscribe to event bus
         let mut event_receiver = self.event_bus.subscribe();
 
-        // 5. Main event loop
+        // 6. Spawn ctrl+c handler
+        let ctrl_c_shutdown = shutdown.clone();
+        tokio::spawn(async move {
+            if let Err(_) = tokio::signal::ctrl_c().await {
+                error!("Failed to install ctrl+c handler");
+            }
+            info!("Received ctrl+c, initiating shutdown");
+            ctrl_c_shutdown.cancel();
+        });
+
+        // 7. Main event loop
         info!("Entering main event loop");
         loop {
             tokio::select! {
+                // Shutdown requested
+                _ = shutdown.cancelled() => {
+                    info!("Shutdown requested");
+                    break;
+                }
+
                 // Process events from event bus
                 Some(event_result) = event_receiver.recv() => {
                     match event_result {
@@ -143,16 +185,17 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                         }
                     }
                 }
-
-                // Handle shutdown signals
-                _ = tokio::signal::ctrl_c() => {
-                    info!("Received shutdown signal");
-                    break;
-                }
             }
         }
 
-        // 6. Graceful shutdown
+        // 8. Graceful shutdown
+        shutdown_sig.cancel(); // Ensure any remaining tasks are cancelled
+
+        if let Some(handle) = projection_handle {
+            info!("Waiting for projection worker to finish...");
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(30), handle).await;
+        }
+
         self.shutdown().await?;
 
         Ok(())
@@ -185,13 +228,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         let router = create_router(state);
         let addr = format!("{}:{}", self.config.api.host, self.config.api.port);
 
-        let listener = TcpListener::bind(&addr).await.map_err(|e| {
-            DaemonError::Config(format!("Failed to bind to {}: {}", addr, e))
-        })?;
+        let listener = TcpListener::bind(&addr)
+            .await
+            .map_err(|e| DaemonError::Config(format!("Failed to bind to {}: {}", addr, e)))?;
 
-        let local_addr = listener.local_addr().map_err(|e| {
-            DaemonError::Config(format!("Failed to get local address: {}", e))
-        })?;
+        let local_addr = listener
+            .local_addr()
+            .map_err(|e| DaemonError::Config(format!("Failed to get local address: {}", e)))?;
 
         // Spawn the server task
         tokio::spawn(async move {
@@ -214,12 +257,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                 );
                 let manager = self.position_manager.write().await;
                 manager.handle_signal(signal).await?;
-            }
+            },
 
             DaemonEvent::MarketData(data) => {
                 let manager = self.position_manager.read().await;
                 manager.process_market_data(data).await?;
-            }
+            },
 
             DaemonEvent::OrderFill(fill) => {
                 info!(
@@ -230,13 +273,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                 );
                 // Order fills are handled internally by executor
                 // This is just for logging/monitoring
-            }
+            },
 
             DaemonEvent::PositionStateChanged {
-                position_id,
-                previous_state,
-                new_state,
-                ..
+                position_id, previous_state, new_state, ..
             } => {
                 info!(
                     %position_id,
@@ -244,12 +284,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                     %new_state,
                     "Position state changed"
                 );
-            }
+            },
 
             DaemonEvent::Shutdown => {
                 info!("Shutdown event received");
                 return Err(DaemonError::Shutdown);
-            }
+            },
         }
 
         Ok(())
@@ -300,11 +340,7 @@ mod tests {
 
         // Can make a health check request
         let client = reqwest::Client::new();
-        let response = client
-            .get(format!("http://{}/health", addr))
-            .send()
-            .await
-            .unwrap();
+        let response = client.get(format!("http://{}/health", addr)).send().await.unwrap();
 
         assert!(response.status().is_success());
     }

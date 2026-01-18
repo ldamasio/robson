@@ -14,9 +14,9 @@ pub mod value_objects;
 
 // Re-export commonly used types
 pub use entities::{
-    calculate_margin_required, calculate_notional_value, calculate_position_size, AccountId,
-    DetectorSignal, ExitReason, Order, OrderId, OrderStatus, OrderType, Position, PositionId,
-    PositionState,
+    AccountId, DetectorSignal, ExitReason, Order, OrderId, OrderStatus, OrderType, Position,
+    PositionId, PositionState, calculate_margin_required, calculate_notional_value,
+    calculate_position_size,
 };
 pub use events::Event;
 pub use market_data::{Candle, MarketDataEvent, OrderBookSnapshot, Tick};

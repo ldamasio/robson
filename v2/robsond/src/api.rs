@@ -8,10 +8,10 @@
 //! - Panic (emergency close all)
 
 use axum::{
+    Json, Router,
     extract::{Path, State},
     http::StatusCode,
     routing::{delete, get, post},
-    Json, Router,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -20,8 +20,7 @@ use tokio::sync::RwLock;
 use uuid::Uuid;
 
 use robson_domain::{
-    DetectorSignal, Position, PositionState, Price, RiskConfig, Side, Symbol,
-    TechnicalStopDistance,
+    DetectorSignal, Position, PositionState, Price, RiskConfig, Side, Symbol, TechnicalStopDistance,
 };
 use robson_exec::ExchangePort;
 use robson_store::Store;
@@ -158,10 +157,7 @@ where
     S: Store + 'static,
 {
     let manager = state.position_manager.read().await;
-    let positions = manager
-        .get_active_positions()
-        .await
-        .map_err(|e| to_error_response(e))?;
+    let positions = manager.get_active_positions().await.map_err(|e| to_error_response(e))?;
 
     let summaries: Vec<PositionSummary> = positions.iter().map(position_to_summary).collect();
 
@@ -181,18 +177,19 @@ where
     S: Store + 'static,
 {
     let manager = state.position_manager.read().await;
-    let position = manager
-        .get_position(id)
-        .await
-        .map_err(|e| to_error_response(e))?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("Position not found: {}", id),
-                }),
-            )
-        })?;
+    let position =
+        manager
+            .get_position(id)
+            .await
+            .map_err(|e| to_error_response(e))?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: format!("Position not found: {}", id),
+                    }),
+                )
+            })?;
 
     Ok(Json(position_to_summary(&position)))
 }
@@ -210,9 +207,7 @@ where
     let symbol = Symbol::from_pair(&req.symbol).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
-            Json(ErrorResponse {
-                error: format!("Invalid symbol: {}", e),
-            }),
+            Json(ErrorResponse { error: format!("Invalid symbol: {}", e) }),
         )
     })?;
 
@@ -226,8 +221,8 @@ where
                 Json(ErrorResponse {
                     error: format!("Invalid side: {}. Expected: LONG or SHORT", req.side),
                 }),
-            ))
-        }
+            ));
+        },
     };
 
     // Create risk config
@@ -275,10 +270,7 @@ where
     S: Store + 'static,
 {
     let manager = state.position_manager.write().await;
-    manager
-        .disarm_position(id)
-        .await
-        .map_err(|e| to_error_response(e))?;
+    manager.disarm_position(id).await.map_err(|e| to_error_response(e))?;
 
     Ok(StatusCode::NO_CONTENT)
 }
@@ -296,18 +288,19 @@ where
     let manager = state.position_manager.write().await;
 
     // Load position to get symbol and side
-    let position = manager
-        .get_position(id)
-        .await
-        .map_err(|e| to_error_response(e))?
-        .ok_or_else(|| {
-            (
-                StatusCode::NOT_FOUND,
-                Json(ErrorResponse {
-                    error: format!("Position not found: {}", id),
-                }),
-            )
-        })?;
+    let position =
+        manager
+            .get_position(id)
+            .await
+            .map_err(|e| to_error_response(e))?
+            .ok_or_else(|| {
+                (
+                    StatusCode::NOT_FOUND,
+                    Json(ErrorResponse {
+                        error: format!("Position not found: {}", id),
+                    }),
+                )
+            })?;
 
     // Create signal
     let signal = DetectorSignal {
@@ -334,10 +327,7 @@ where
         timestamp: chrono::Utc::now(),
     };
 
-    manager
-        .handle_signal(signal)
-        .await
-        .map_err(|e| to_error_response(e))?;
+    manager.handle_signal(signal).await.map_err(|e| to_error_response(e))?;
 
     Ok(StatusCode::OK)
 }
@@ -351,10 +341,7 @@ where
     S: Store + 'static,
 {
     let manager = state.position_manager.write().await;
-    let closed = manager
-        .panic_close_all()
-        .await
-        .map_err(|e| to_error_response(e))?;
+    let closed = manager.panic_close_all().await.map_err(|e| to_error_response(e))?;
 
     Ok(Json(PanicResponse {
         count: closed.len(),
@@ -374,28 +361,16 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
         _ => StatusCode::BAD_REQUEST,
     };
 
-    (
-        status,
-        Json(ErrorResponse {
-            error: error.to_string(),
-        }),
-    )
+    (status, Json(ErrorResponse { error: error.to_string() }))
 }
 
 fn position_to_summary(position: &Position) -> PositionSummary {
     let (state_str, entry_price, trailing_stop, pnl) = match &position.state {
         PositionState::Armed => ("Armed".to_string(), None, None, None),
-        PositionState::Entering {
-            expected_entry, ..
-        } => (
-            "Entering".to_string(),
-            Some(expected_entry.as_decimal()),
-            None,
-            None,
-        ),
-        PositionState::Active {
-            trailing_stop, ..
-        } => (
+        PositionState::Entering { expected_entry, .. } => {
+            ("Entering".to_string(), Some(expected_entry.as_decimal()), None, None)
+        },
+        PositionState::Active { trailing_stop, .. } => (
             "Active".to_string(),
             position.entry_price.map(|p| p.as_decimal()),
             Some(trailing_stop.as_decimal()),
@@ -407,11 +382,7 @@ fn position_to_summary(position: &Position) -> PositionSummary {
             None,
             Some(position.calculate_pnl()),
         ),
-        PositionState::Closed {
-            exit_price,
-            exit_reason,
-            ..
-        } => {
+        PositionState::Closed { exit_price, exit_reason, .. } => {
             let realized_pnl = if let PositionState::Closed { realized_pnl, .. } = &position.state {
                 *realized_pnl
             } else {
@@ -423,7 +394,7 @@ fn position_to_summary(position: &Position) -> PositionSummary {
                 Some(exit_price.as_decimal()),
                 Some(realized_pnl),
             )
-        }
+        },
         PositionState::Error { error, .. } => (format!("Error: {}", error), None, None, None),
     };
 

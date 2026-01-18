@@ -86,12 +86,11 @@ async fn test_order_submitted_creates_projection(pool: sqlx::PgPool) -> sqlx::Re
     assert!(result.is_ok());
 
     // Assert
-    let (status, last_seq): (String, i64) = sqlx::query_as(
-        "SELECT status, last_seq FROM orders_current WHERE order_id = $1"
-    )
-    .bind(order_id)
-    .fetch_one(&pool)
-    .await?;
+    let (status, last_seq): (String, i64) =
+        sqlx::query_as("SELECT status, last_seq FROM orders_current WHERE order_id = $1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await?;
 
     assert_eq!(status, "pending");
     assert_eq!(last_seq, 1);
@@ -180,7 +179,7 @@ async fn test_position_opened_enforces_invariants(pool: sqlx::PgPool) -> sqlx::R
     assert!(result.is_ok());
 
     let (state, trailing_stop): (String, Option<Decimal>) = sqlx::query_as(
-        "SELECT state, trailing_stop_price FROM positions_current WHERE position_id = $1"
+        "SELECT state, trailing_stop_price FROM positions_current WHERE position_id = $1",
     )
     .bind(position_id)
     .fetch_one(&pool)
@@ -279,12 +278,11 @@ async fn test_fill_received_idempotent(pool: sqlx::PgPool) -> sqlx::Result<()> {
     apply_event_to_projections(&pool, &fill_env).await.unwrap();
 
     // Assert: filled_quantity should only be applied once
-    let (filled_quantity,): (Decimal,) = sqlx::query_as(
-        "SELECT filled_quantity FROM orders_current WHERE order_id = $1"
-    )
-    .bind(order_id)
-    .fetch_one(&pool)
-    .await?;
+    let (filled_quantity,): (Decimal,) =
+        sqlx::query_as("SELECT filled_quantity FROM orders_current WHERE order_id = $1")
+            .bind(order_id)
+            .fetch_one(&pool)
+            .await?;
 
     assert_eq!(filled_quantity, Decimal::from(1)); // Not 2!
 
@@ -318,7 +316,7 @@ async fn test_strategy_enabled(pool: sqlx::PgPool) -> sqlx::Result<()> {
     assert!(result.is_ok());
 
     let (is_enabled, strategy_name): (bool, String) = sqlx::query_as(
-        "SELECT is_enabled, strategy_name FROM strategy_state_current WHERE strategy_id = $1"
+        "SELECT is_enabled, strategy_name FROM strategy_state_current WHERE strategy_id = $1",
     )
     .bind(strategy_id)
     .fetch_one(&pool)
@@ -356,12 +354,11 @@ async fn test_balance_sampled(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Assert
     assert!(result.is_ok());
 
-    let (free, locked, total): (Decimal, Decimal, Decimal) = sqlx::query_as(
-        "SELECT free, locked, total FROM balances_current WHERE balance_id = $1"
-    )
-    .bind(balance_id)
-    .fetch_one(&pool)
-    .await?;
+    let (free, locked, total): (Decimal, Decimal, Decimal) =
+        sqlx::query_as("SELECT free, locked, total FROM balances_current WHERE balance_id = $1")
+            .bind(balance_id)
+            .fetch_one(&pool)
+            .await?;
 
     assert_eq!(free, Decimal::from(15) / Decimal::from(10)); // 1.5
     assert_eq!(locked, Decimal::from(5) / Decimal::from(10)); // 0.5
@@ -393,7 +390,7 @@ async fn test_risk_check_failed(pool: sqlx::PgPool) -> sqlx::Result<()> {
     assert!(result.is_ok());
 
     let (is_violated, reason): (bool, Option<String>) = sqlx::query_as(
-        "SELECT is_violated, violation_reason FROM risk_state_current WHERE account_id = $1"
+        "SELECT is_violated, violation_reason FROM risk_state_current WHERE account_id = $1",
     )
     .bind(account_id)
     .fetch_one(&pool)

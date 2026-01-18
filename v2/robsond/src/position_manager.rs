@@ -114,15 +114,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             debug!(%position_id, "Waiting for detector to finish");
 
             // Give each detector a moment to finish gracefully
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(500),
-                handle
-            ).await {
+            match tokio::time::timeout(std::time::Duration::from_millis(500), handle).await {
                 Ok(_) => debug!(%position_id, "Detector finished gracefully"),
                 Err(_) => {
                     // Timeout - detector will be aborted when handle drops
                     warn!(%position_id, "Detector did not finish in time, will be aborted");
-                }
+                },
             }
         }
 
@@ -212,7 +209,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         &self,
         symbol: Symbol,
         side: Side,
-        _risk_config: RiskConfig,  // Used by Engine for position sizing
+        _risk_config: RiskConfig, // Used by Engine for position sizing
         tech_stop_distance: TechnicalStopDistance,
         account_id: Uuid,
     ) -> DaemonResult<Position> {
@@ -251,7 +248,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         // Spawn detector task
         let cancel_token = self.child_cancel_token();
-        let detector = DetectorTask::from_position(&position, Arc::clone(&self.event_bus), cancel_token)?;
+        let detector =
+            DetectorTask::from_position(&position, Arc::clone(&self.event_bus), cancel_token)?;
         let handle = detector.spawn();
 
         // Store detector handle for cancellation
@@ -346,19 +344,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     // Process the fill
                     self.handle_entry_fill(position_id, order.fill_price, order.filled_quantity)
                         .await?;
-                }
+                },
                 ActionResult::AlreadyProcessed(id) => {
                     warn!(%position_id, %id, "Signal already processed (idempotent skip)");
-                }
+                },
                 ActionResult::EventEmitted(event) => {
                     debug!(%position_id, event_type = event.event_type(), "Event emitted");
-                }
+                },
                 ActionResult::StateUpdated => {
                     debug!(%position_id, "State updated");
-                }
+                },
                 ActionResult::Skipped(reason) => {
                     debug!(%position_id, %reason, "Action skipped");
-                }
+                },
             }
         }
 
@@ -427,9 +425,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             // Use engine to process
             let symbol_clone = data.symbol.clone();
             let market_data = robson_engine::MarketData::new(symbol_clone, data.price);
-            let decision = self
-                .engine
-                .process_active_position(&position, &market_data)?;
+            let decision = self.engine.process_active_position(&position, &market_data)?;
 
             // Apply state transition if any
             if let Some(updated_position) = decision.updated_position {
@@ -643,7 +639,8 @@ mod tests {
 
     /// Create a test manager WITH signal listener running.
     /// Use this for E2E tests that need full event-driven flow.
-    async fn create_test_manager_with_listener() -> Arc<PositionManager<StubExchange, MemoryStore>> {
+    async fn create_test_manager_with_listener() -> Arc<PositionManager<StubExchange, MemoryStore>>
+    {
         let manager = create_test_manager().await;
         PositionManager::start(Arc::clone(&manager));
         manager
@@ -663,13 +660,7 @@ mod tests {
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let position = manager
-            .arm_position(
-                symbol,
-                Side::Long,
-                create_test_risk_config(),
-                tech_stop,
-                Uuid::now_v7(),
-            )
+            .arm_position(symbol, Side::Long, create_test_risk_config(), tech_stop, Uuid::now_v7())
             .await
             .unwrap();
 
@@ -690,13 +681,7 @@ mod tests {
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let position = manager
-            .arm_position(
-                symbol,
-                Side::Long,
-                create_test_risk_config(),
-                tech_stop,
-                Uuid::now_v7(),
-            )
+            .arm_position(symbol, Side::Long, create_test_risk_config(), tech_stop, Uuid::now_v7())
             .await
             .unwrap();
 
@@ -848,7 +833,7 @@ mod tests {
         let mut detector_signal = None;
 
         for i in 0..10 {
-            let price = Decimal::from(100 + i * 3);  // Larger steps to trigger crossover faster
+            let price = Decimal::from(100 + i * 3); // Larger steps to trigger crossover faster
             let market_data = MarketData {
                 symbol: symbol.clone(),
                 price: Price::new(price).unwrap(),
@@ -860,7 +845,7 @@ mod tests {
             for _ in 0..5 {
                 let deadline = tokio::time::timeout(
                     std::time::Duration::from_millis(50),
-                    signal_receiver.recv()
+                    signal_receiver.recv(),
                 );
 
                 match deadline.await {
@@ -868,7 +853,7 @@ mod tests {
                         detector_signal = Some(signal);
                         signal_found = true;
                         break;
-                    }
+                    },
                     Ok(Some(Ok(_))) => continue, // Other events
                     Ok(Some(Err(_))) | Ok(None) | Err(_) => break, // Channel error or timeout
                 }

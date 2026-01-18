@@ -30,8 +30,8 @@
 
 use chrono::{DateTime, Utc};
 use robson_domain::{
-    calculate_position_size, DetectorSignal, Event, ExitReason, Position, PositionId,
-    PositionState, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance,
+    DetectorSignal, Event, ExitReason, Position, PositionId, PositionState, Price, Quantity,
+    RiskConfig, Side, Symbol, TechnicalStopDistance, calculate_position_size,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -96,11 +96,7 @@ impl MarketData {
 
     /// Create market data with explicit timestamp
     pub fn with_timestamp(symbol: Symbol, current_price: Price, timestamp: DateTime<Utc>) -> Self {
-        Self {
-            symbol,
-            current_price,
-            timestamp,
-        }
+        Self { symbol, current_price, timestamp }
     }
 }
 
@@ -189,18 +185,12 @@ pub struct EngineDecision {
 impl EngineDecision {
     /// Create an empty decision (no actions needed)
     pub fn no_action() -> Self {
-        Self {
-            actions: vec![],
-            updated_position: None,
-        }
+        Self { actions: vec![], updated_position: None }
     }
 
     /// Create a decision with actions
     pub fn with_actions(actions: Vec<EngineAction>) -> Self {
-        Self {
-            actions,
-            updated_position: None,
-        }
+        Self { actions, updated_position: None }
     }
 
     /// Create a decision with actions and updated position
@@ -302,9 +292,7 @@ impl Engine {
 
         // 3. Validate and get tech stop distance
         let tech_stop = signal.tech_stop_distance();
-        tech_stop
-            .validate()
-            .map_err(|e| EngineError::DomainError(e))?;
+        tech_stop.validate().map_err(|e| EngineError::DomainError(e))?;
 
         // 4. Calculate position size (Golden Rule)
         let quantity = calculate_position_size(&self.risk_config, &tech_stop)
@@ -394,7 +382,7 @@ impl Engine {
                     expected: "entering".to_string(),
                     actual: other.name().to_string(),
                 });
-            }
+            },
         };
 
         // 2. Get tech stop distance
@@ -480,7 +468,7 @@ impl Engine {
                     expected: "active".to_string(),
                     actual: other.name().to_string(),
                 });
-            }
+            },
         };
 
         // Validate symbol matches
@@ -510,9 +498,12 @@ impl Engine {
         }
 
         // Check if trailing stop should be updated
-        if let Some(new_stop) =
-            self.calculate_new_trailing_stop(position.side, current_price, favorable_extreme, tech_stop)
-        {
+        if let Some(new_stop) = self.calculate_new_trailing_stop(
+            position.side,
+            current_price,
+            favorable_extreme,
+            tech_stop,
+        ) {
             // Only update if new stop is more favorable
             if self.is_more_favorable_stop(position.side, new_stop, trailing_stop) {
                 debug!(
@@ -564,7 +555,7 @@ impl Engine {
                 } else {
                     None
                 }
-            }
+            },
             Side::Short => {
                 // SHORT: check if we have a new low
                 if current_price.as_decimal() < favorable_extreme.as_decimal() {
@@ -572,7 +563,7 @@ impl Engine {
                 } else {
                     None
                 }
-            }
+            },
         }
     }
 
@@ -707,10 +698,7 @@ mod tests {
     }
 
     fn create_market_data(price: Decimal) -> MarketData {
-        MarketData::new(
-            Symbol::from_pair("BTCUSDT").unwrap(),
-            Price::new(price).unwrap(),
-        )
+        MarketData::new(Symbol::from_pair("BTCUSDT").unwrap(), Price::new(price).unwrap())
     }
 
     // =========================================================================
@@ -726,9 +714,9 @@ mod tests {
         let position = create_active_position(
             Side::Long,
             dec!(95000),
-            dec!(93500),  // trailing stop
-            dec!(95000),  // favorable extreme (entry)
-            dec!(1500),   // tech distance
+            dec!(93500), // trailing stop
+            dec!(95000), // favorable extreme (entry)
+            dec!(1500),  // tech distance
         );
 
         // Price stable at entry
@@ -747,9 +735,9 @@ mod tests {
         let position = create_active_position(
             Side::Long,
             dec!(95000),
-            dec!(93500),  // trailing stop
-            dec!(95000),  // favorable extreme
-            dec!(1500),   // tech distance
+            dec!(93500), // trailing stop
+            dec!(95000), // favorable extreme
+            dec!(1500),  // tech distance
         );
 
         // Price moved up to $96k (new high!)
@@ -761,15 +749,11 @@ mod tests {
 
         // Check first action is UpdateTrailingStop
         match &decision.actions[0] {
-            EngineAction::UpdateTrailingStop {
-                new_stop,
-                previous_stop,
-                ..
-            } => {
+            EngineAction::UpdateTrailingStop { new_stop, previous_stop, .. } => {
                 // New stop should be $96k - $1.5k = $94.5k
                 assert_eq!(new_stop.as_decimal(), dec!(94500));
                 assert_eq!(previous_stop.as_decimal(), dec!(93500));
-            }
+            },
             _ => panic!("Expected UpdateTrailingStop action"),
         }
     }
@@ -783,9 +767,9 @@ mod tests {
         let position = create_active_position(
             Side::Long,
             dec!(95000),
-            dec!(94500),  // trailing stop (from $96k high)
-            dec!(96000),  // favorable extreme
-            dec!(1500),   // tech distance
+            dec!(94500), // trailing stop (from $96k high)
+            dec!(96000), // favorable extreme
+            dec!(1500),  // tech distance
         );
 
         // Price pulled back to $95.5k (still above stop, below extreme)
@@ -804,9 +788,9 @@ mod tests {
         let position = create_active_position(
             Side::Long,
             dec!(95000),
-            dec!(94500),  // trailing stop
-            dec!(96000),  // favorable extreme
-            dec!(1500),   // tech distance
+            dec!(94500), // trailing stop
+            dec!(96000), // favorable extreme
+            dec!(1500),  // tech distance
         );
 
         // Price dropped to stop level
@@ -836,9 +820,9 @@ mod tests {
         let position = create_active_position(
             Side::Long,
             dec!(95000),
-            dec!(94500),  // trailing stop
-            dec!(96000),  // favorable extreme
-            dec!(1500),   // tech distance
+            dec!(94500), // trailing stop
+            dec!(96000), // favorable extreme
+            dec!(1500),  // tech distance
         );
 
         // Price crashed below stop (gap down scenario)
@@ -846,9 +830,8 @@ mod tests {
         let decision = engine.process_active_position(&position, &market).unwrap();
 
         assert!(decision.has_actions());
-        let has_exit = decision.actions.iter().any(|a| {
-            matches!(a, EngineAction::TriggerExit { .. })
-        });
+        let has_exit =
+            decision.actions.iter().any(|a| matches!(a, EngineAction::TriggerExit { .. }));
         assert!(has_exit);
     }
 
@@ -865,9 +848,9 @@ mod tests {
         let position = create_active_position(
             Side::Short,
             dec!(95000),
-            dec!(96500),  // trailing stop (above entry for short)
-            dec!(95000),  // favorable extreme (entry)
-            dec!(1500),   // tech distance
+            dec!(96500), // trailing stop (above entry for short)
+            dec!(95000), // favorable extreme (entry)
+            dec!(1500),  // tech distance
         );
 
         let market = create_market_data(dec!(95000));
@@ -884,9 +867,9 @@ mod tests {
         let position = create_active_position(
             Side::Short,
             dec!(95000),
-            dec!(96500),  // trailing stop
-            dec!(95000),  // favorable extreme
-            dec!(1500),   // tech distance
+            dec!(96500), // trailing stop
+            dec!(95000), // favorable extreme
+            dec!(1500),  // tech distance
         );
 
         // Price moved down to $94k (new low!)
@@ -896,15 +879,11 @@ mod tests {
         assert!(decision.has_actions());
 
         match &decision.actions[0] {
-            EngineAction::UpdateTrailingStop {
-                new_stop,
-                previous_stop,
-                ..
-            } => {
+            EngineAction::UpdateTrailingStop { new_stop, previous_stop, .. } => {
                 // New stop should be $94k + $1.5k = $95.5k
                 assert_eq!(new_stop.as_decimal(), dec!(95500));
                 assert_eq!(previous_stop.as_decimal(), dec!(96500));
-            }
+            },
             _ => panic!("Expected UpdateTrailingStop action"),
         }
     }
@@ -917,9 +896,9 @@ mod tests {
         let position = create_active_position(
             Side::Short,
             dec!(95000),
-            dec!(95500),  // trailing stop (tightened from gains)
-            dec!(94000),  // favorable extreme (made money)
-            dec!(1500),   // tech distance
+            dec!(95500), // trailing stop (tightened from gains)
+            dec!(94000), // favorable extreme (made money)
+            dec!(1500),  // tech distance
         );
 
         // Price rose to stop level
@@ -945,11 +924,8 @@ mod tests {
         let engine = Engine::new(config);
 
         // Create armed position (not active)
-        let position = Position::new(
-            Uuid::now_v7(),
-            Symbol::from_pair("BTCUSDT").unwrap(),
-            Side::Long,
-        );
+        let position =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
 
         let market = create_market_data(dec!(95000));
         let result = engine.process_active_position(&position, &market);
@@ -959,7 +935,7 @@ mod tests {
             EngineError::InvalidPositionState { expected, actual } => {
                 assert_eq!(expected, "active");
                 assert_eq!(actual, "armed");
-            }
+            },
             _ => panic!("Expected InvalidPositionState error"),
         }
     }
@@ -969,19 +945,12 @@ mod tests {
         let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
         let engine = Engine::new(config);
 
-        let position = create_active_position(
-            Side::Long,
-            dec!(95000),
-            dec!(93500),
-            dec!(95000),
-            dec!(1500),
-        );
+        let position =
+            create_active_position(Side::Long, dec!(95000), dec!(93500), dec!(95000), dec!(1500));
 
         // Market data for different symbol
-        let market = MarketData::new(
-            Symbol::from_pair("ETHUSDT").unwrap(),
-            Price::new(dec!(3000)).unwrap(),
-        );
+        let market =
+            MarketData::new(Symbol::from_pair("ETHUSDT").unwrap(), Price::new(dec!(3000)).unwrap());
 
         let result = engine.process_active_position(&position, &market);
         assert!(result.is_err());
@@ -1037,9 +1006,9 @@ mod tests {
         let position = create_active_position(
             Side::Long,
             dec!(95000),
-            dec!(94000),  // trailing stop
-            dec!(95000),  // favorable extreme
-            dec!(1500),   // tech distance
+            dec!(94000), // trailing stop
+            dec!(95000), // favorable extreme
+            dec!(1500),  // tech distance
         );
 
         // Price crashed below stop
@@ -1047,9 +1016,8 @@ mod tests {
         let decision = engine.process_active_position(&position, &market).unwrap();
 
         // Should exit, not update
-        let has_exit = decision.actions.iter().any(|a| {
-            matches!(a, EngineAction::TriggerExit { .. })
-        });
+        let has_exit =
+            decision.actions.iter().any(|a| matches!(a, EngineAction::TriggerExit { .. }));
         assert!(has_exit, "Exit should take priority");
     }
 
@@ -1093,13 +1061,7 @@ mod tests {
 
         // Check PlaceEntryOrder action
         let has_entry_order = decision.actions.iter().any(|a| {
-            matches!(
-                a,
-                EngineAction::PlaceEntryOrder {
-                    side: robson_domain::OrderSide::Buy,
-                    ..
-                }
-            )
+            matches!(a, EngineAction::PlaceEntryOrder { side: robson_domain::OrderSide::Buy, .. })
         });
         assert!(has_entry_order, "Should have PlaceEntryOrder with Buy side");
 
@@ -1131,13 +1093,7 @@ mod tests {
 
         // Check PlaceEntryOrder has Sell side (short entry)
         let has_entry_order = decision.actions.iter().any(|a| {
-            matches!(
-                a,
-                EngineAction::PlaceEntryOrder {
-                    side: robson_domain::OrderSide::Sell,
-                    ..
-                }
-            )
+            matches!(a, EngineAction::PlaceEntryOrder { side: robson_domain::OrderSide::Sell, .. })
         });
         assert!(has_entry_order, "Should have PlaceEntryOrder with Sell side for short");
     }
@@ -1148,13 +1104,8 @@ mod tests {
         let engine = Engine::new(config);
 
         // Create an Active position (not Armed)
-        let position = create_active_position(
-            Side::Long,
-            dec!(95000),
-            dec!(93500),
-            dec!(95000),
-            dec!(1500),
-        );
+        let position =
+            create_active_position(Side::Long, dec!(95000), dec!(93500), dec!(95000), dec!(1500));
 
         let signal = DetectorSignal::new(
             position.id,
@@ -1171,7 +1122,7 @@ mod tests {
             EngineError::InvalidPositionState { expected, actual } => {
                 assert_eq!(expected, "armed");
                 assert_eq!(actual, "active");
-            }
+            },
             _ => panic!("Expected InvalidPositionState error"),
         }
     }
@@ -1246,7 +1197,7 @@ mod tests {
                 assert_eq!(favorable_extreme.as_decimal(), dec!(95100));
                 // Initial trailing stop = 95100 - 1500 = 93600
                 assert_eq!(trailing_stop.as_decimal(), dec!(93600));
-            }
+            },
             other => panic!("Expected Active state, got {:?}", other.name()),
         }
     }
@@ -1273,15 +1224,11 @@ mod tests {
         // Check trailing stop for short
         let active_position = fill_decision.updated_position.expect("Should have updated position");
         match &active_position.state {
-            PositionState::Active {
-                trailing_stop,
-                favorable_extreme,
-                ..
-            } => {
+            PositionState::Active { trailing_stop, favorable_extreme, .. } => {
                 assert_eq!(favorable_extreme.as_decimal(), dec!(94900));
                 // Initial trailing stop = 94900 + 1500 = 96400
                 assert_eq!(trailing_stop.as_decimal(), dec!(96400));
-            }
+            },
             other => panic!("Expected Active state, got {:?}", other.name()),
         }
     }
@@ -1304,7 +1251,7 @@ mod tests {
             EngineError::InvalidPositionState { expected, actual } => {
                 assert_eq!(expected, "entering");
                 assert_eq!(actual, "armed");
-            }
+            },
             _ => panic!("Expected InvalidPositionState error"),
         }
     }
@@ -1358,12 +1305,14 @@ mod tests {
 
         // Price drops to trailing stop
         let market_exit = create_market_data(dec!(95500));
-        let exit_decision = engine.process_active_position(&position_after_update, &market_exit).unwrap();
+        let exit_decision =
+            engine.process_active_position(&position_after_update, &market_exit).unwrap();
 
         // Should trigger exit
-        let has_exit = exit_decision.actions.iter().any(|a| {
-            matches!(a, EngineAction::TriggerExit { .. })
-        });
+        let has_exit = exit_decision
+            .actions
+            .iter()
+            .any(|a| matches!(a, EngineAction::TriggerExit { .. }));
         assert!(has_exit, "Should trigger exit when trailing stop is hit");
     }
 }

@@ -49,12 +49,8 @@ pub async fn append_event_tx(
     let event_id = Uuid::new_v4();
 
     // 3. Compute idempotency key
-    let idempotency_key = compute_idempotency_key(
-        event.tenant_id,
-        stream_key,
-        event.command_id,
-        &event.payload,
-    );
+    let idempotency_key =
+        compute_idempotency_key(event.tenant_id, stream_key, event.command_id, &event.payload);
 
     // 4. Insert event
     let result = sqlx::query(
@@ -98,15 +94,14 @@ pub async fn append_event_tx(
             );
 
             Ok(event_id)
-        }
+        },
         Err(sqlx::Error::Database(db_err)) if is_unique_violation(db_err.as_ref()) => {
             // Idempotent duplicate - return existing event ID
-            let existing_event_id: Uuid = sqlx::query_scalar(
-                "SELECT event_id FROM event_log WHERE idempotency_key = $1",
-            )
-            .bind(&idempotency_key)
-            .fetch_one(&mut **tx)
-            .await?;
+            let existing_event_id: Uuid =
+                sqlx::query_scalar("SELECT event_id FROM event_log WHERE idempotency_key = $1")
+                    .bind(&idempotency_key)
+                    .fetch_one(&mut **tx)
+                    .await?;
 
             warn!(
                 existing_event_id = %existing_event_id,
@@ -115,7 +110,7 @@ pub async fn append_event_tx(
             );
 
             Err(EventLogError::IdempotentDuplicate(existing_event_id))
-        }
+        },
         Err(e) => Err(EventLogError::Database(e)),
     }
 }
@@ -138,10 +133,9 @@ async fn get_next_seq(
 
         match current_seq {
             Some(seq) if seq == exp_seq => Ok(seq + 1),
-            Some(seq) => Err(EventLogError::ConcurrentModification {
-                expected: exp_seq,
-                actual: seq,
-            }),
+            Some(seq) => {
+                Err(EventLogError::ConcurrentModification { expected: exp_seq, actual: seq })
+            },
             None if exp_seq == 0 => Ok(1),
             None => Err(EventLogError::StreamNotFound(stream_key.to_string())),
         }

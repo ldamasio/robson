@@ -321,7 +321,12 @@ mod tests {
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
 
         let result = exchange
-            .place_market_order(&symbol, OrderSide::Buy, Quantity::new(dec!(0.1)).unwrap(), "test-1")
+            .place_market_order(
+                &symbol,
+                OrderSide::Buy,
+                Quantity::new(dec!(0.1)).unwrap(),
+                "test-1",
+            )
             .await
             .unwrap();
 
@@ -362,7 +367,12 @@ mod tests {
         exchange.set_fail_next(true);
 
         let result = exchange
-            .place_market_order(&symbol, OrderSide::Buy, Quantity::new(dec!(0.1)).unwrap(), "fail-1")
+            .place_market_order(
+                &symbol,
+                OrderSide::Buy,
+                Quantity::new(dec!(0.1)).unwrap(),
+                "fail-1",
+            )
             .await;
 
         assert!(result.is_err());

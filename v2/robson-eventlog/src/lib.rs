@@ -37,5 +37,5 @@ pub mod types;
 
 pub use append::append_event;
 pub use idempotency::compute_idempotency_key;
-pub use query::{query_events, QueryOptions};
+pub use query::{QueryOptions, query_events};
 pub use types::{ActorType, Event, EventEnvelope, EventLogError};

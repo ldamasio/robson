@@ -10,8 +10,8 @@ use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
-use crate::event_bus::{DaemonEvent, EventBus};
 use crate::error::DaemonResult;
+use crate::event_bus::{DaemonEvent, EventBus};
 
 /// Market data manager - spawns and manages WebSocket tasks.
 pub struct MarketDataManager {
@@ -39,15 +39,16 @@ impl MarketDataManager {
         // Spawn the WebSocket client task
         let client_task = tokio::spawn(async move {
             // TODO: In production, handle reconnect logic here
-            let mut client = match BinanceMarketDataClient::new(symbol.clone(), event_sender).await {
+            let mut client = match BinanceMarketDataClient::new(symbol.clone(), event_sender).await
+            {
                 Ok(c) => {
                     info!(symbol = %symbol.as_pair(), "WebSocket client connected");
                     c
-                }
+                },
                 Err(e) => {
                     error!(error = %e, symbol = %symbol.as_pair(), "Failed to create WebSocket client");
                     return;
-                }
+                },
             };
 
             info!(symbol = %symbol.as_pair(), "WebSocket client task started");
@@ -56,10 +57,10 @@ impl MarketDataManager {
             match client.run().await {
                 Ok(_) => {
                     info!(symbol = %symbol.as_pair(), "WebSocket client disconnected gracefully");
-                }
+                },
                 Err(e) => {
                     error!(error = %e, symbol = %symbol.as_pair(), "WebSocket client error");
-                }
+                },
             }
         });
 
@@ -91,10 +92,10 @@ impl MarketDataManager {
                         });
 
                         event_bus.send(daemon_event);
-                    }
+                    },
                     _ => {
                         // Other event types (Candle, OrderBookSnapshot) not implemented yet
-                    }
+                    },
                 }
             }
 

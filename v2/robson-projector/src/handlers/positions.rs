@@ -8,14 +8,13 @@ use crate::types::{PositionClosed, PositionOpened};
 use robson_eventlog::EventEnvelope;
 use sqlx::PgPool;
 
-pub(crate) async fn handle_position_opened(
-    pool: &PgPool,
-    envelope: &EventEnvelope,
-) -> Result<()> {
-    let payload: PositionOpened = serde_json::from_value(envelope.payload.clone())
-        .map_err(|e| ProjectionError::InvalidPayload {
-            event_type: envelope.event_type.clone(),
-            reason: e.to_string(),
+pub(crate) async fn handle_position_opened(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
+    let payload: PositionOpened =
+        serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+            ProjectionError::InvalidPayload {
+                event_type: envelope.event_type.clone(),
+                reason: e.to_string(),
+            }
         })?;
 
     // INVARIANT CHECK: technical_stop_price and distance must be present
@@ -39,7 +38,7 @@ pub(crate) async fn handle_position_opened(
 
     // Idempotency check
     let existing = sqlx::query_scalar::<_, i64>(
-        "SELECT last_seq FROM positions_current WHERE position_id = $1"
+        "SELECT last_seq FROM positions_current WHERE position_id = $1",
     )
     .bind(payload.position_id)
     .fetch_optional(pool)
@@ -104,14 +103,13 @@ pub(crate) async fn handle_position_opened(
     Ok(())
 }
 
-pub(crate) async fn handle_position_closed(
-    pool: &PgPool,
-    envelope: &EventEnvelope,
-) -> Result<()> {
-    let payload: PositionClosed = serde_json::from_value(envelope.payload.clone())
-        .map_err(|e| ProjectionError::InvalidPayload {
-            event_type: envelope.event_type.clone(),
-            reason: e.to_string(),
+pub(crate) async fn handle_position_closed(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
+    let payload: PositionClosed =
+        serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+            ProjectionError::InvalidPayload {
+                event_type: envelope.event_type.clone(),
+                reason: e.to_string(),
+            }
         })?;
 
     sqlx::query(

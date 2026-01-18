@@ -3,15 +3,15 @@
 //! Connects to Binance WebSocket API for real-time market data.
 //! Normalizes Binance-specific messages to canonical domain types.
 
+use futures_util::stream::StreamExt;
 use robson_domain::{MarketDataEvent, Symbol, Tick};
 use rust_decimal::Decimal;
 use serde_json::Value;
 use std::time::Duration;
 use thiserror::Error;
-use tokio::time::timeout;
 use tokio::sync::broadcast;
-use tokio_tungstenite::{connect_async, tungstenite::Message as WebSocketMessage, WebSocketStream};
-use futures_util::stream::StreamExt;
+use tokio::time::timeout;
+use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message as WebSocketMessage};
 use tracing::{debug, error, info, warn};
 
 /// Type alias for the WebSocket stream (with auto TLS).
@@ -109,33 +109,28 @@ impl BinanceMarketDataClient {
     /// is closed or an error occurs.
     pub async fn run(&mut self) -> Result<(), BinanceWsError> {
         while self.connected {
-            match timeout(
-                Duration::from_secs(READ_TIMEOUT_SECS),
-                self.next_message(),
-            )
-            .await
-            {
+            match timeout(Duration::from_secs(READ_TIMEOUT_SECS), self.next_message()).await {
                 Ok(Ok(Some(msg))) => {
                     if let Err(e) = self.handle_message(msg).await {
                         error!(error = %e, "Error handling message");
                         // Continue processing other messages
                     }
-                }
+                },
                 Ok(Ok(None)) => {
                     warn!("WebSocket stream closed");
                     self.connected = false;
                     return Err(BinanceWsError::ChannelClosed);
-                }
+                },
                 Ok(Err(e)) => {
                     error!(error = %e, "Error reading from WebSocket");
                     self.connected = false;
                     return Err(e);
-                }
+                },
                 Err(_) => {
                     error!("Timeout waiting for message");
                     self.connected = false;
                     return Err(BinanceWsError::Timeout);
-                }
+                },
             }
         }
 
@@ -149,12 +144,12 @@ impl BinanceMarketDataClient {
             Some(Err(e)) => {
                 error!(error = %e, "WebSocket error");
                 Err(BinanceWsError::ReceiveError(format!("{:?}", e)))
-            }
+            },
             None => {
                 warn!("WebSocket stream ended");
                 self.connected = false;
                 Ok(None)
-            }
+            },
         }
     }
 
@@ -187,24 +182,24 @@ impl BinanceMarketDataClient {
         match msg {
             WebSocketMessage::Text(text) => {
                 self.handle_text_message(&text).await?;
-            }
+            },
             WebSocketMessage::Ping(_) => {
                 // Respond to ping with pong
                 // Note: For Binance, ping/pong is handled automatically by the connection
                 debug!("Received ping from Binance");
-            }
+            },
             WebSocketMessage::Pong(_) => {
                 // Ignore pong
                 debug!("Received pong from Binance");
-            }
+            },
             WebSocketMessage::Close(_) => {
                 self.connected = false;
                 warn!("WebSocket connection closed");
                 return Err(BinanceWsError::ChannelClosed);
-            }
+            },
             _ => {
                 // Ignore other message types
-            }
+            },
         }
 
         Ok(())
@@ -233,17 +228,12 @@ impl BinanceMarketDataClient {
             .map_err(|e| BinanceWsError::InvalidMessage(format!("Invalid trade event: {}", e)))?;
 
         // Convert Unix timestamp (milliseconds) to DateTime<Utc>
-        let timestamp = chrono::DateTime::from_timestamp(event.T / 1000, ((event.T % 1000) * 1_000_000) as u32)
-            .unwrap_or_else(|| chrono::Utc::now());
+        let timestamp =
+            chrono::DateTime::from_timestamp(event.T / 1000, ((event.T % 1000) * 1_000_000) as u32)
+                .unwrap_or_else(|| chrono::Utc::now());
 
         // Convert to domain Tick
-        let tick = Tick::new(
-            self.symbol.clone(),
-            event.p,
-            event.q,
-            timestamp,
-            event.t.to_string(),
-        );
+        let tick = Tick::new(self.symbol.clone(), event.p, event.q, timestamp, event.t.to_string());
 
         debug!(
             symbol = %self.symbol.as_pair(),

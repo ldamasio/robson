@@ -76,7 +76,7 @@ fn normalize_payload(payload: &serde_json::Value) -> String {
                 let normalized_value = match value {
                     serde_json::Value::Object(_) => {
                         serde_json::from_str(&normalize_payload(value)).unwrap_or(value.clone())
-                    }
+                    },
                     _ => value.clone(),
                 };
 
@@ -84,7 +84,7 @@ fn normalize_payload(payload: &serde_json::Value) -> String {
             }
 
             serde_json::Value::Object(normalized_map)
-        }
+        },
         other => other.clone(),
     };
 

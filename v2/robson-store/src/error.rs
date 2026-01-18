@@ -83,7 +83,7 @@ impl From<sqlx::Error> for StoreError {
                 } else {
                     StoreError::Database(db_err.to_string())
                 }
-            }
+            },
             _ => StoreError::Database(err.to_string()),
         }
     }

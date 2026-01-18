@@ -10,25 +10,23 @@ use robson_eventlog::EventEnvelope;
 use sqlx::PgPool;
 use uuid::Uuid;
 
-pub(crate) async fn handle_order_submitted(
-    pool: &PgPool,
-    envelope: &EventEnvelope,
-) -> Result<()> {
-    let payload: OrderSubmitted = serde_json::from_value(envelope.payload.clone())
-        .map_err(|e| ProjectionError::InvalidPayload {
-            event_type: envelope.event_type.clone(),
-            reason: e.to_string(),
+pub(crate) async fn handle_order_submitted(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
+    let payload: OrderSubmitted =
+        serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+            ProjectionError::InvalidPayload {
+                event_type: envelope.event_type.clone(),
+                reason: e.to_string(),
+            }
         })?;
 
     let mut tx = pool.begin().await?;
 
     // Check if already applied (idempotency via seq check)
-    let existing = sqlx::query_scalar::<_, i64>(
-        "SELECT last_seq FROM orders_current WHERE order_id = $1"
-    )
-    .bind(payload.order_id)
-    .fetch_optional(&mut *tx)
-    .await?;
+    let existing =
+        sqlx::query_scalar::<_, i64>("SELECT last_seq FROM orders_current WHERE order_id = $1")
+            .bind(payload.order_id)
+            .fetch_optional(&mut *tx)
+            .await?;
 
     if let Some(seq) = existing {
         if seq >= envelope.seq {
@@ -80,15 +78,13 @@ pub(crate) async fn handle_order_submitted(
     Ok(())
 }
 
-pub(crate) async fn handle_order_acked(
-    pool: &PgPool,
-    envelope: &EventEnvelope,
-) -> Result<()> {
-    let payload: OrderAcked = serde_json::from_value(envelope.payload.clone())
-        .map_err(|e| ProjectionError::InvalidPayload {
+pub(crate) async fn handle_order_acked(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
+    let payload: OrderAcked = serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+        ProjectionError::InvalidPayload {
             event_type: envelope.event_type.clone(),
             reason: e.to_string(),
-        })?;
+        }
+    })?;
 
     sqlx::query(
         r#"
@@ -113,15 +109,13 @@ pub(crate) async fn handle_order_acked(
     Ok(())
 }
 
-pub(crate) async fn handle_order_rejected(
-    pool: &PgPool,
-    envelope: &EventEnvelope,
-) -> Result<()> {
-    let payload: OrderRejected = serde_json::from_value(envelope.payload.clone())
-        .map_err(|e| ProjectionError::InvalidPayload {
+pub(crate) async fn handle_order_rejected(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
+    let payload: OrderRejected = serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+        ProjectionError::InvalidPayload {
             event_type: envelope.event_type.clone(),
             reason: e.to_string(),
-        })?;
+        }
+    })?;
 
     sqlx::query(
         r#"
@@ -144,15 +138,13 @@ pub(crate) async fn handle_order_rejected(
     Ok(())
 }
 
-pub(crate) async fn handle_order_canceled(
-    pool: &PgPool,
-    envelope: &EventEnvelope,
-) -> Result<()> {
-    let payload: OrderCanceled = serde_json::from_value(envelope.payload.clone())
-        .map_err(|e| ProjectionError::InvalidPayload {
+pub(crate) async fn handle_order_canceled(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
+    let payload: OrderCanceled = serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+        ProjectionError::InvalidPayload {
             event_type: envelope.event_type.clone(),
             reason: e.to_string(),
-        })?;
+        }
+    })?;
 
     sqlx::query(
         r#"
@@ -175,21 +167,19 @@ pub(crate) async fn handle_order_canceled(
     Ok(())
 }
 
-pub(crate) async fn handle_fill_received(
-    pool: &PgPool,
-    envelope: &EventEnvelope,
-) -> Result<()> {
-    let payload: FillReceived = serde_json::from_value(envelope.payload.clone())
-        .map_err(|e| ProjectionError::InvalidPayload {
+pub(crate) async fn handle_fill_received(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
+    let payload: FillReceived = serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+        ProjectionError::InvalidPayload {
             event_type: envelope.event_type.clone(),
             reason: e.to_string(),
-        })?;
+        }
+    })?;
 
     let mut tx = pool.begin().await?;
 
     // Idempotency check for fill
     let fill_exists = sqlx::query_scalar::<_, bool>(
-        "SELECT EXISTS(SELECT 1 FROM fills WHERE exchange_trade_id = $1 AND tenant_id = $2)"
+        "SELECT EXISTS(SELECT 1 FROM fills WHERE exchange_trade_id = $1 AND tenant_id = $2)",
     )
     .bind(&payload.exchange_trade_id)
     .bind(payload.tenant_id)

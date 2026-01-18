@@ -3,7 +3,9 @@
 //! Core business entities with lifecycle management.
 //! All entities have identity and state transitions.
 
-use crate::value_objects::{DomainError, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance, OrderSide};
+use crate::value_objects::{
+    DomainError, OrderSide, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance,
+};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
@@ -57,7 +59,7 @@ pub struct Position {
     // Associated orders
     pub entry_order_id: Option<OrderId>,
     pub exit_order_id: Option<OrderId>,
-    pub insurance_stop_id: Option<OrderId>,  // Exchange insurance stop (if enabled)
+    pub insurance_stop_id: Option<OrderId>, // Exchange insurance stop (if enabled)
 
     // Audit
     pub created_at: DateTime<Utc>,
@@ -67,11 +69,7 @@ pub struct Position {
 
 impl Position {
     /// Create a new armed position
-    pub fn new(
-        account_id: AccountId,
-        symbol: Symbol,
-        side: Side,
-    ) -> Self {
+    pub fn new(account_id: AccountId, symbol: Symbol, side: Side) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::now_v7(),
@@ -135,7 +133,7 @@ impl Position {
                     Side::Long => (current_price.as_decimal() - entry_price) * quantity,
                     Side::Short => (entry_price - current_price.as_decimal()) * quantity,
                 }
-            }
+            },
             PositionState::Closed { realized_pnl, .. } => *realized_pnl,
             _ => rust_decimal::Decimal::ZERO,
         }
@@ -195,9 +193,7 @@ pub fn calculate_position_size(
     let stop_distance = tech_stop.distance;
 
     if stop_distance <= rust_decimal::Decimal::ZERO {
-        return Err(DomainError::PositionSizingError(
-            "Stop distance must be positive".to_string(),
-        ));
+        return Err(DomainError::PositionSizingError("Stop distance must be positive".to_string()));
     }
 
     // Golden Rule: Position Size = Max Risk / Stop Distance
@@ -210,17 +206,13 @@ pub fn calculate_position_size(
         ));
     }
 
-    Quantity::new(position_size)
-        .map_err(|e| DomainError::PositionSizingError(e.to_string()))
+    Quantity::new(position_size).map_err(|e| DomainError::PositionSizingError(e.to_string()))
 }
 
 /// Calculate notional value of position
 ///
 /// Notional = Quantity × Entry Price
-pub fn calculate_notional_value(
-    quantity: &Quantity,
-    entry_price: &Price,
-) -> rust_decimal::Decimal {
+pub fn calculate_notional_value(quantity: &Quantity, entry_price: &Price) -> rust_decimal::Decimal {
     quantity.as_decimal() * entry_price.as_decimal()
 }
 
@@ -283,10 +275,7 @@ pub enum PositionState {
     },
 
     /// Error state, requires manual intervention
-    Error {
-        error: String,
-        recoverable: bool,
-    },
+    Error { error: String, recoverable: bool },
 }
 
 impl PositionState {
@@ -331,13 +320,13 @@ pub struct Order {
     pub id: OrderId,
     pub position_id: PositionId,
     pub exchange_order_id: Option<String>,
-    pub client_order_id: String,  // intent_id (UUID v7)
+    pub client_order_id: String, // intent_id (UUID v7)
 
     pub symbol: Symbol,
     pub side: OrderSide,
     pub order_type: OrderType,
     pub quantity: Quantity,
-    pub price: Option<Price>,  // None for market orders
+    pub price: Option<Price>, // None for market orders
 
     pub status: OrderStatus,
 
@@ -384,7 +373,7 @@ impl Order {
         symbol: Symbol,
         side: OrderSide,
         quantity: Quantity,
-        _stop_price: Price,  // Stop price (stored on exchange, not locally)
+        _stop_price: Price, // Stop price (stored on exchange, not locally)
         limit_price: Price,
     ) -> Self {
         let now = Utc::now();
@@ -397,7 +386,7 @@ impl Order {
             side,
             order_type: OrderType::StopLossLimit,
             quantity,
-            price: Some(limit_price),  // Limit price
+            price: Some(limit_price), // Limit price
             status: OrderStatus::Pending,
             filled_quantity: None,
             fill_price: None,
@@ -563,11 +552,7 @@ mod tests {
     #[test]
     fn test_position_creation() {
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
-        let position = Position::new(
-            Uuid::now_v7(),
-            symbol,
-            Side::Long,
-        );
+        let position = Position::new(Uuid::now_v7(), symbol, Side::Long);
 
         assert_eq!(position.state.name(), "armed");
         assert!(position.can_enter());

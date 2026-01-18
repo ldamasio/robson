@@ -20,6 +20,9 @@ pub struct Config {
     /// Engine configuration
     pub engine: EngineConfig,
 
+    /// Projection configuration
+    pub projection: ProjectionConfig,
+
     /// Environment (test, development, production)
     pub environment: Environment,
 }
@@ -31,6 +34,17 @@ pub struct ApiConfig {
     pub host: String,
     /// Port to bind to
     pub port: u16,
+}
+
+/// Projection configuration.
+#[derive(Debug, Clone)]
+pub struct ProjectionConfig {
+    /// Database connection URL
+    pub database_url: Option<String>,
+    /// Stream key to poll events from
+    pub stream_key: String,
+    /// Poll interval in milliseconds
+    pub poll_interval_ms: u64,
 }
 
 /// Engine configuration.
@@ -64,12 +78,9 @@ impl Config {
         let environment = Self::load_environment()?;
         let api = Self::load_api_config()?;
         let engine = Self::load_engine_config()?;
+        let projection = Self::load_projection_config()?;
 
-        Ok(Self {
-            api,
-            engine,
-            environment,
-        })
+        Ok(Self { api, engine, projection, environment })
     }
 
     /// Create test configuration.
@@ -80,9 +91,14 @@ impl Config {
                 port: 0, // Let OS assign port
             },
             engine: EngineConfig {
-                default_risk_percent: Decimal::new(1, 2),     // 1%
-                min_tech_stop_percent: Decimal::new(1, 3),    // 0.1%
-                max_tech_stop_percent: Decimal::new(10, 2),   // 10%
+                default_risk_percent: Decimal::new(1, 2),   // 1%
+                min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
+                max_tech_stop_percent: Decimal::new(10, 2), // 10%
+            },
+            projection: ProjectionConfig {
+                database_url: None,
+                stream_key: "test:stream".to_string(),
+                poll_interval_ms: 100,
             },
             environment: Environment::Test,
         }
@@ -143,19 +159,42 @@ impl Config {
             Err(_) => Ok(default),
         }
     }
+
+    fn load_projection_config() -> DaemonResult<ProjectionConfig> {
+        let database_url = env::var("DATABASE_URL").ok();
+        let stream_key =
+            env::var("PROJECTION_STREAM_KEY").unwrap_or_else(|_| "robson:daemon".to_string());
+
+        let poll_interval_str =
+            env::var("PROJECTION_POLL_INTERVAL_MS").unwrap_or_else(|_| "100".to_string());
+        let poll_interval_ms = poll_interval_str.parse::<u64>().map_err(|_| {
+            DaemonError::Config(format!(
+                "Invalid PROJECTION_POLL_INTERVAL_MS: {}",
+                poll_interval_str
+            ))
+        })?;
+
+        Ok(ProjectionConfig {
+            database_url,
+            stream_key,
+            poll_interval_ms,
+        })
+    }
 }
 
 impl Default for Config {
     fn default() -> Self {
         Self {
-            api: ApiConfig {
-                host: "0.0.0.0".to_string(),
-                port: 8080,
-            },
+            api: ApiConfig { host: "0.0.0.0".to_string(), port: 8080 },
             engine: EngineConfig {
-                default_risk_percent: Decimal::new(1, 2),     // 1%
-                min_tech_stop_percent: Decimal::new(1, 3),    // 0.1%
-                max_tech_stop_percent: Decimal::new(10, 2),   // 10%
+                default_risk_percent: Decimal::new(1, 2),   // 1%
+                min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
+                max_tech_stop_percent: Decimal::new(10, 2), // 10%
+            },
+            projection: ProjectionConfig {
+                database_url: None,
+                stream_key: "robson:daemon".to_string(),
+                poll_interval_ms: 100,
             },
             environment: Environment::Development,
         }

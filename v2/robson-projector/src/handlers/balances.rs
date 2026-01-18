@@ -5,23 +5,21 @@ use crate::types::BalanceSampled;
 use robson_eventlog::EventEnvelope;
 use sqlx::PgPool;
 
-pub(crate) async fn handle_balance_sampled(
-    pool: &PgPool,
-    envelope: &EventEnvelope,
-) -> Result<()> {
-    let payload: BalanceSampled = serde_json::from_value(envelope.payload.clone())
-        .map_err(|e| ProjectionError::InvalidPayload {
-            event_type: envelope.event_type.clone(),
-            reason: e.to_string(),
+pub(crate) async fn handle_balance_sampled(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
+    let payload: BalanceSampled =
+        serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+            ProjectionError::InvalidPayload {
+                event_type: envelope.event_type.clone(),
+                reason: e.to_string(),
+            }
         })?;
 
     // Idempotency check via seq
-    let existing = sqlx::query_scalar::<_, i64>(
-        "SELECT last_seq FROM balances_current WHERE balance_id = $1"
-    )
-    .bind(payload.balance_id)
-    .fetch_optional(pool)
-    .await?;
+    let existing =
+        sqlx::query_scalar::<_, i64>("SELECT last_seq FROM balances_current WHERE balance_id = $1")
+            .bind(payload.balance_id)
+            .fetch_optional(pool)
+            .await?;
 
     if let Some(seq) = existing {
         if seq >= envelope.seq {

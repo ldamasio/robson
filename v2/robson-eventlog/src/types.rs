@@ -2,10 +2,12 @@
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
+use sqlx::FromRow;
 use uuid::Uuid;
 
 /// Actor type that emitted the event
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, sqlx::Type)]
+#[sqlx(type_name = "varchar")]
 pub enum ActorType {
     /// CLI command
     CLI,
@@ -29,7 +31,7 @@ impl ActorType {
 }
 
 /// Event envelope with all metadata
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize, FromRow)]
 pub struct EventEnvelope {
     // Identity
     pub event_id: Uuid,

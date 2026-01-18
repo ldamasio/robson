@@ -93,10 +93,7 @@ pub enum IntentAction {
     },
 
     /// Cancel an order
-    CancelOrder {
-        symbol: Symbol,
-        order_id: String,
-    },
+    CancelOrder { symbol: Symbol, order_id: String },
 }
 
 /// Status of an intent.
@@ -136,9 +133,7 @@ pub struct IntentJournal {
 impl IntentJournal {
     /// Create a new intent journal.
     pub fn new() -> Self {
-        Self {
-            intents: RwLock::new(HashMap::new()),
-        }
+        Self { intents: RwLock::new(HashMap::new()) }
     }
 
     /// Record a new intent before execution.
@@ -159,23 +154,22 @@ impl IntentJournal {
 
     /// Check if intent exists and get its current state.
     pub fn get(&self, intent_id: Uuid) -> ExecResult<Option<Intent>> {
-        let intents = self.intents.read().map_err(|e| {
-            ExecError::IntentJournal(format!("Failed to acquire read lock: {}", e))
-        })?;
+        let intents = self
+            .intents
+            .read()
+            .map_err(|e| ExecError::IntentJournal(format!("Failed to acquire read lock: {}", e)))?;
 
         Ok(intents.get(&intent_id).cloned())
     }
 
     /// Check if intent was already processed (completed or executing).
     pub fn is_processed(&self, intent_id: Uuid) -> ExecResult<bool> {
-        let intents = self.intents.read().map_err(|e| {
-            ExecError::IntentJournal(format!("Failed to acquire read lock: {}", e))
-        })?;
+        let intents = self
+            .intents
+            .read()
+            .map_err(|e| ExecError::IntentJournal(format!("Failed to acquire read lock: {}", e)))?;
 
-        Ok(intents
-            .get(&intent_id)
-            .map(|i| !i.is_pending())
-            .unwrap_or(false))
+        Ok(intents.get(&intent_id).map(|i| !i.is_pending()).unwrap_or(false))
     }
 
     /// Mark intent as executing.
@@ -184,9 +178,9 @@ impl IntentJournal {
             ExecError::IntentJournal(format!("Failed to acquire write lock: {}", e))
         })?;
 
-        let intent = intents.get_mut(&intent_id).ok_or_else(|| {
-            ExecError::IntentJournal(format!("Intent not found: {}", intent_id))
-        })?;
+        let intent = intents
+            .get_mut(&intent_id)
+            .ok_or_else(|| ExecError::IntentJournal(format!("Intent not found: {}", intent_id)))?;
 
         intent.status = IntentStatus::Executing;
         Ok(())
@@ -198,9 +192,9 @@ impl IntentJournal {
             ExecError::IntentJournal(format!("Failed to acquire write lock: {}", e))
         })?;
 
-        let intent = intents.get_mut(&intent_id).ok_or_else(|| {
-            ExecError::IntentJournal(format!("Intent not found: {}", intent_id))
-        })?;
+        let intent = intents
+            .get_mut(&intent_id)
+            .ok_or_else(|| ExecError::IntentJournal(format!("Intent not found: {}", intent_id)))?;
 
         intent.status = IntentStatus::Completed;
         intent.completed_at = Some(Utc::now());
@@ -211,24 +205,22 @@ impl IntentJournal {
 
     /// Get all pending intents (for recovery on restart).
     pub fn get_pending(&self) -> ExecResult<Vec<Intent>> {
-        let intents = self.intents.read().map_err(|e| {
-            ExecError::IntentJournal(format!("Failed to acquire read lock: {}", e))
-        })?;
+        let intents = self
+            .intents
+            .read()
+            .map_err(|e| ExecError::IntentJournal(format!("Failed to acquire read lock: {}", e)))?;
 
         Ok(intents.values().filter(|i| i.is_pending()).cloned().collect())
     }
 
     /// Get intents for a specific position.
     pub fn get_by_position(&self, position_id: PositionId) -> ExecResult<Vec<Intent>> {
-        let intents = self.intents.read().map_err(|e| {
-            ExecError::IntentJournal(format!("Failed to acquire read lock: {}", e))
-        })?;
+        let intents = self
+            .intents
+            .read()
+            .map_err(|e| ExecError::IntentJournal(format!("Failed to acquire read lock: {}", e)))?;
 
-        Ok(intents
-            .values()
-            .filter(|i| i.position_id == position_id)
-            .cloned()
-            .collect())
+        Ok(intents.values().filter(|i| i.position_id == position_id).cloned().collect())
     }
 
     /// Clear all intents (for testing).
@@ -320,9 +312,7 @@ mod tests {
             filled_at: Utc::now(),
         };
 
-        journal
-            .complete(id, IntentResult::Success(order_result))
-            .unwrap();
+        journal.complete(id, IntentResult::Success(order_result)).unwrap();
 
         let completed = journal.get(id).unwrap().unwrap();
         assert!(!completed.is_pending());
@@ -364,9 +354,7 @@ mod tests {
 
         // Complete one
         journal.mark_executing(id1).unwrap();
-        journal
-            .complete(id1, IntentResult::Skipped("test".to_string()))
-            .unwrap();
+        journal.complete(id1, IntentResult::Skipped("test".to_string())).unwrap();
 
         // Only one pending
         assert_eq!(journal.get_pending().unwrap().len(), 1);

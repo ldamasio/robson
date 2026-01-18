@@ -10,10 +10,12 @@ pub(crate) async fn handle_risk_check_failed(
     pool: &PgPool,
     envelope: &EventEnvelope,
 ) -> Result<()> {
-    let payload: RiskCheckFailed = serde_json::from_value(envelope.payload.clone())
-        .map_err(|e| ProjectionError::InvalidPayload {
-            event_type: envelope.event_type.clone(),
-            reason: e.to_string(),
+    let payload: RiskCheckFailed =
+        serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+            ProjectionError::InvalidPayload {
+                event_type: envelope.event_type.clone(),
+                reason: e.to_string(),
+            }
         })?;
 
     // Generate or use existing risk_state_current record

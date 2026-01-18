@@ -20,7 +20,7 @@ pub struct OrderSubmitted {
     pub position_id: Option<Uuid>,
     pub client_order_id: String,
     pub symbol: String,
-    pub side: String, // "buy" or "sell"
+    pub side: String,       // "buy" or "sell"
     pub order_type: String, // "market", "limit", "stop_loss", "stop_loss_limit"
     pub quantity: Decimal,
     pub price: Option<Decimal>,

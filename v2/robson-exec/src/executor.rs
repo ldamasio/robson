@@ -68,11 +68,7 @@ pub struct Executor<E: ExchangePort, S: Store> {
 impl<E: ExchangePort, S: Store> Executor<E, S> {
     /// Create a new executor.
     pub fn new(exchange: Arc<E>, journal: Arc<IntentJournal>, store: Arc<S>) -> Self {
-        Self {
-            exchange,
-            journal,
-            store,
-        }
+        Self { exchange, journal, store }
     }
 
     /// Execute a list of engine actions.
@@ -99,10 +95,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                 side,
                 quantity,
                 signal_id,
-            } => {
-                self.execute_entry_order(position_id, symbol, side, quantity, signal_id)
-                    .await
-            }
+            } => self.execute_entry_order(position_id, symbol, side, quantity, signal_id).await,
 
             EngineAction::PlaceExitOrder {
                 position_id,
@@ -110,10 +103,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                 side,
                 quantity,
                 reason,
-            } => {
-                self.execute_exit_order(position_id, symbol, side, quantity, reason)
-                    .await
-            }
+            } => self.execute_exit_order(position_id, symbol, side, quantity, reason).await,
 
             EngineAction::UpdateTrailingStop {
                 position_id,
@@ -130,7 +120,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                 );
                 // No exchange interaction needed
                 Ok(ActionResult::StateUpdated)
-            }
+            },
 
             EngineAction::TriggerExit {
                 position_id,
@@ -147,7 +137,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                 );
                 // The actual exit order is placed via PlaceExitOrder action
                 Ok(ActionResult::StateUpdated)
-            }
+            },
 
             EngineAction::EmitEvent(event) => {
                 debug!(
@@ -160,7 +150,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                 self.store.events().append(&event).await?;
 
                 Ok(ActionResult::EventEmitted(event))
-            }
+            },
         }
     }
 
@@ -192,19 +182,13 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             symbol = %symbol.as_pair(),
             "Validating margin settings (isolated + {}x)", FIXED_LEVERAGE
         );
-        self.exchange
-            .validate_margin_settings(&symbol, FIXED_LEVERAGE)
-            .await?;
+        self.exchange.validate_margin_settings(&symbol, FIXED_LEVERAGE).await?;
 
         // 3. Record intent
         let intent = Intent::new(
             signal_id,
             position_id,
-            IntentAction::PlaceEntryOrder {
-                symbol: symbol.clone(),
-                side,
-                quantity,
-            },
+            IntentAction::PlaceEntryOrder { symbol: symbol.clone(), side, quantity },
         );
 
         if let Err(ExecError::AlreadyProcessed(id)) = self.journal.record(intent) {
@@ -241,14 +225,12 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                     fill_price = %order_result.fill_price.as_decimal(),
                     "Entry order filled"
                 );
-                self.journal
-                    .complete(signal_id, IntentResult::Success(order_result.clone()))?;
-            }
+                self.journal.complete(signal_id, IntentResult::Success(order_result.clone()))?;
+            },
             Err(e) => {
                 error!(%position_id, error = %e, "Entry order failed");
-                self.journal
-                    .complete(signal_id, IntentResult::Failed(e.to_string()))?;
-            }
+                self.journal.complete(signal_id, IntentResult::Failed(e.to_string()))?;
+            },
         }
 
         result.map(ActionResult::OrderPlaced)
@@ -273,9 +255,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             symbol = %symbol.as_pair(),
             "Validating margin settings for exit (isolated + {}x)", FIXED_LEVERAGE
         );
-        self.exchange
-            .validate_margin_settings(&symbol, FIXED_LEVERAGE)
-            .await?;
+        self.exchange.validate_margin_settings(&symbol, FIXED_LEVERAGE).await?;
 
         // 2. Record intent
         let intent = Intent::new(
@@ -318,14 +298,12 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                     ?reason,
                     "Exit order filled"
                 );
-                self.journal
-                    .complete(intent_id, IntentResult::Success(order_result.clone()))?;
-            }
+                self.journal.complete(intent_id, IntentResult::Success(order_result.clone()))?;
+            },
             Err(e) => {
                 error!(%position_id, error = %e, "Exit order failed");
-                self.journal
-                    .complete(intent_id, IntentResult::Failed(e.to_string()))?;
-            }
+                self.journal.complete(intent_id, IntentResult::Failed(e.to_string()))?;
+            },
         }
 
         result.map(ActionResult::OrderPlaced)
@@ -390,7 +368,7 @@ mod tests {
             ActionResult::OrderPlaced(order) => {
                 assert_eq!(order.fill_price.as_decimal(), dec!(95000));
                 assert_eq!(order.filled_quantity.as_decimal(), dec!(0.1));
-            }
+            },
             _ => panic!("Expected OrderPlaced"),
         }
 
@@ -446,17 +424,12 @@ mod tests {
         match &results[0] {
             ActionResult::EventEmitted(e) => {
                 assert_eq!(e.position_id(), event.position_id());
-            }
+            },
             _ => panic!("Expected EventEmitted"),
         }
 
         // Event should be persisted
-        let events = executor
-            .store
-            .events()
-            .find_by_position(event.position_id())
-            .await
-            .unwrap();
+        let events = executor.store.events().find_by_position(event.position_id()).await.unwrap();
         assert_eq!(events.len(), 1);
     }
 

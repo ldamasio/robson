@@ -5,19 +5,18 @@ use crate::types::{StrategyDisabled, StrategyEnabled};
 use robson_eventlog::EventEnvelope;
 use sqlx::PgPool;
 
-pub(crate) async fn handle_strategy_enabled(
-    pool: &PgPool,
-    envelope: &EventEnvelope,
-) -> Result<()> {
-    let payload: StrategyEnabled = serde_json::from_value(envelope.payload.clone())
-        .map_err(|e| ProjectionError::InvalidPayload {
-            event_type: envelope.event_type.clone(),
-            reason: e.to_string(),
+pub(crate) async fn handle_strategy_enabled(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
+    let payload: StrategyEnabled =
+        serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+            ProjectionError::InvalidPayload {
+                event_type: envelope.event_type.clone(),
+                reason: e.to_string(),
+            }
         })?;
 
     // Idempotency check
     let existing = sqlx::query_scalar::<_, i64>(
-        "SELECT last_seq FROM strategy_state_current WHERE strategy_id = $1"
+        "SELECT last_seq FROM strategy_state_current WHERE strategy_id = $1",
     )
     .bind(payload.strategy_id)
     .fetch_optional(pool)
@@ -78,10 +77,12 @@ pub(crate) async fn handle_strategy_disabled(
     pool: &PgPool,
     envelope: &EventEnvelope,
 ) -> Result<()> {
-    let payload: StrategyDisabled = serde_json::from_value(envelope.payload.clone())
-        .map_err(|e| ProjectionError::InvalidPayload {
-            event_type: envelope.event_type.clone(),
-            reason: e.to_string(),
+    let payload: StrategyDisabled =
+        serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+            ProjectionError::InvalidPayload {
+                event_type: envelope.event_type.clone(),
+                reason: e.to_string(),
+            }
         })?;
 
     sqlx::query(

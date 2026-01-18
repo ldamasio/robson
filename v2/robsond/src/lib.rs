@@ -43,9 +43,10 @@ pub mod error;
 pub mod event_bus;
 pub mod market_data;
 pub mod position_manager;
+pub mod projection_worker;
 
 // Re-exports for convenience
-pub use config::{ApiConfig, Config, EngineConfig, Environment};
+pub use config::{ApiConfig, Config, EngineConfig, Environment, ProjectionConfig};
 pub use daemon::Daemon;
 pub use detector::{DetectorConfig, DetectorTask};
 pub use error::{DaemonError, DaemonResult};

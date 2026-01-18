@@ -32,7 +32,13 @@ pub struct Tick {
 
 impl Tick {
     /// Create a new tick.
-    pub fn new(symbol: Symbol, price: Decimal, quantity: Decimal, timestamp: DateTime<Utc>, trade_id: String) -> Self {
+    pub fn new(
+        symbol: Symbol,
+        price: Decimal,
+        quantity: Decimal,
+        timestamp: DateTime<Utc>,
+        trade_id: String,
+    ) -> Self {
         Self {
             symbol,
             price,
@@ -138,11 +144,7 @@ impl Candle {
     /// Get the candle's midpoint price.
     pub fn midpoint(&self) -> Option<Decimal> {
         let mid = (self.high + self.low) / Decimal::from(2);
-        if mid > Decimal::ZERO {
-            Some(mid)
-        } else {
-            None
-        }
+        if mid > Decimal::ZERO { Some(mid) } else { None }
     }
 }
 
@@ -167,13 +169,13 @@ pub struct OrderBookSnapshot {
 
 impl OrderBookSnapshot {
     /// Create a new order book snapshot.
-    pub fn new(symbol: Symbol, bids: Vec<(Decimal, Decimal)>, asks: Vec<(Decimal, Decimal)>, timestamp: DateTime<Utc>) -> Self {
-        Self {
-            symbol,
-            bids,
-            asks,
-            timestamp,
-        }
+    pub fn new(
+        symbol: Symbol,
+        bids: Vec<(Decimal, Decimal)>,
+        asks: Vec<(Decimal, Decimal)>,
+        timestamp: DateTime<Utc>,
+    ) -> Self {
+        Self { symbol, bids, asks, timestamp }
     }
 
     /// Get the best bid price (highest bid).
@@ -261,13 +263,7 @@ mod tests {
     #[test]
     fn test_tick_creation() {
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
-        let tick = Tick::new(
-            symbol,
-            dec!(95000),
-            dec!(0.1),
-            Utc::now(),
-            "12345".to_string(),
-        );
+        let tick = Tick::new(symbol, dec!(95000), dec!(0.1), Utc::now(), "12345".to_string());
 
         assert_eq!(tick.price, dec!(95000));
         assert_eq!(tick.quantity, dec!(0.1));

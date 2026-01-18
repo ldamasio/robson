@@ -8,7 +8,7 @@
 //! Uses tokio broadcast channels for fan-out to multiple receivers.
 
 use chrono::{DateTime, Utc};
-use robson_domain::{DetectorSignal, Price, PositionId, Symbol};
+use robson_domain::{DetectorSignal, PositionId, Price, Symbol};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -103,9 +103,7 @@ impl EventBus {
     ///
     /// Returns a receiver that will receive all events sent after subscription.
     pub fn subscribe(&self) -> EventReceiver {
-        EventReceiver {
-            receiver: self.sender.subscribe(),
-        }
+        EventReceiver { receiver: self.sender.subscribe() }
     }
 
     /// Get the number of active receivers.
@@ -136,7 +134,7 @@ impl EventReceiver {
             Err(broadcast::error::RecvError::Closed) => None,
             Err(broadcast::error::RecvError::Lagged(count)) => {
                 Some(Err(format!("Receiver lagged, missed {} events", count)))
-            }
+            },
         }
     }
 
@@ -150,7 +148,7 @@ impl EventReceiver {
             Err(broadcast::error::TryRecvError::Closed) => None,
             Err(broadcast::error::TryRecvError::Lagged(count)) => {
                 Some(Err(format!("Receiver lagged, missed {} events", count)))
-            }
+            },
         }
     }
 }
@@ -191,7 +189,7 @@ mod tests {
         match event {
             DaemonEvent::DetectorSignal(s) => {
                 assert_eq!(s.position_id, position_id);
-            }
+            },
             _ => panic!("Expected DetectorSignal event"),
         }
     }
@@ -241,7 +239,7 @@ mod tests {
         match event {
             DaemonEvent::MarketData(data) => {
                 assert_eq!(data.price.as_decimal(), dec!(96000));
-            }
+            },
             _ => panic!("Expected MarketData event"),
         }
     }
@@ -267,7 +265,7 @@ mod tests {
         match event {
             DaemonEvent::OrderFill(fill) => {
                 assert_eq!(fill.position_id, position_id);
-            }
+            },
             _ => panic!("Expected OrderFill event"),
         }
     }
