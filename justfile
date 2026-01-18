@@ -396,62 +396,69 @@ v2-test-projection-worker:
     # End-to-end test: insert 2 events and run projection worker
     set -e
 
+    STREAM_KEY="test:stream"
     TENANT_ID="$(podman exec -i robson-v2-db psql -U robson -d robson_v2 -t -c \
         "SELECT gen_random_uuid()::text" | tr -d ' ')"
 
-    # Insert event 1: valid BALANCE_SAMPLED
+    # Clean up cursor file from previous runs
+    rm -f "/tmp/robson_projection_cursor_${STREAM_KEY/:/_}.txt"
+
+    # Get account_id for both events
+    ACCOUNT_ID=$(podman exec -i robson-v2-db psql -U robson -d robson_v2 -t -c \
+        "SELECT gen_random_uuid()::text" | tr -d ' ')
+
+    # Insert event 1: valid BALANCE_SAMPLED (seq=1)
     podman exec -i robson-v2-db psql -U robson -d robson_v2 -c \
         "INSERT INTO event_idempotency (tenant_id, idempotency_key, event_id) \
-         VALUES ('$TENANT_ID'::uuid, 'balance-test-1', gen_random_uuid()) \
+         VALUES ('$TENANT_ID'::uuid, '${STREAM_KEY}:1:BALANCE_SAMPLED', gen_random_uuid()) \
          ON CONFLICT (tenant_id, idempotency_key) DO NOTHING"
 
     podman exec -i robson-v2-db psql -U robson -d robson_v2 -c \
         "INSERT INTO event_log (tenant_id, stream_key, seq, event_type, payload, payload_schema_version, \
          occurred_at, ingested_at, idempotency_key, actor_type, actor_id, event_id) \
-         SELECT '$TENANT_ID'::uuid, 'account:test', 1, 'BALANCE_SAMPLED', \
+         SELECT '$TENANT_ID'::uuid, '$STREAM_KEY', 1, 'BALANCE_SAMPLED', \
          jsonb_build_object('balance_id', gen_random_uuid(), 'tenant_id', '$TENANT_ID'::uuid, \
-         'account_id', gen_random_uuid(), 'asset', 'USDT', 'free', '10000.00', 'locked', '0.00', 'sampled_at', NOW()), \
-         1, NOW(), NOW(), 'balance-test-1', 'CLI', 'test-user', \
-         (SELECT event_id FROM event_idempotency WHERE idempotency_key = 'balance-test-1' AND tenant_id = '$TENANT_ID'::uuid)"
+         'account_id', '$ACCOUNT_ID'::uuid, 'asset', 'USDT', 'free', '10000.00', 'locked', '0.00', 'sampled_at', NOW()), \
+         1, NOW(), NOW(), '${STREAM_KEY}:1:BALANCE_SAMPLED', 'CLI', 'test-user', \
+         (SELECT event_id FROM event_idempotency WHERE idempotency_key = '${STREAM_KEY}:1:BALANCE_SAMPLED' AND tenant_id = '$TENANT_ID'::uuid)"
 
-    # Insert event 2: invalid POSITION_OPENED (stop_distance=0)
+    # Insert event 2: invalid POSITION_OPENED (seq=2, stop_distance=0)
     podman exec -i robson-v2-db psql -U robson -d robson_v2 -c \
         "INSERT INTO event_idempotency (tenant_id, idempotency_key, event_id) \
-         VALUES ('$TENANT_ID'::uuid, 'position-test-1', gen_random_uuid()) \
+         VALUES ('$TENANT_ID'::uuid, '${STREAM_KEY}:2:POSITION_OPENED', gen_random_uuid()) \
          ON CONFLICT (tenant_id, idempotency_key) DO NOTHING"
 
     podman exec -i robson-v2-db psql -U robson -d robson_v2 -c \
         "INSERT INTO event_log (tenant_id, stream_key, seq, event_type, payload, payload_schema_version, \
          occurred_at, ingested_at, idempotency_key, actor_type, actor_id, event_id) \
-         SELECT '$TENANT_ID'::uuid, 'position:test', 2, 'POSITION_OPENED', \
+         SELECT '$TENANT_ID'::uuid, '$STREAM_KEY', 2, 'POSITION_OPENED', \
          jsonb_build_object('position_id', gen_random_uuid(), 'tenant_id', '$TENANT_ID'::uuid, \
-         'account_id', (SELECT (payload->>'account_id')::uuid FROM event_log WHERE seq = 1 AND tenant_id = '$TENANT_ID'::uuid), \
-         'symbol', 'BTCUSDT', 'side', 'long', 'entry_price', '95000', 'entry_quantity', '0.1', \
-         'technical_stop_price', '94000', 'technical_stop_distance', '0', 'entry_filled_at', NOW()), \
-         1, NOW(), NOW(), 'position-test-1', 'CLI', 'test-user', \
-         (SELECT event_id FROM event_idempotency WHERE idempotency_key = 'position-test-1' AND tenant_id = '$TENANT_ID'::uuid)"
+         'account_id', '$ACCOUNT_ID'::uuid, 'symbol', 'BTCUSDT', 'side', 'long', \
+         'entry_price', '95000', 'entry_quantity', '0.1', \
+         'technical_stop_price', '94000', 'technical_stop_distance', '0', \
+         'entry_filled_at', NOW()), \
+         1, NOW(), NOW(), '${STREAM_KEY}:2:POSITION_OPENED', 'CLI', 'test-user', \
+         (SELECT event_id FROM event_idempotency WHERE idempotency_key = '${STREAM_KEY}:2:POSITION_OPENED' AND tenant_id = '$TENANT_ID'::uuid)"
 
-    # Run projection worker briefly
+    # Run projection worker with free port to avoid conflicts
     DATABASE_URL="postgresql://robson:robson@localhost:5432/robson_v2" \
     PROJECTION_TENANT_ID="$TENANT_ID" \
-    PROJECTION_STREAM_KEY="account:test" \
-    timeout 3 ./v2/target/release/robsond || true
+    PROJECTION_STREAM_KEY="$STREAM_KEY" \
+    ROBSON_API_PORT="0" \
+    timeout 5 ./v2/target/release/robsond 2>&1 | grep -E "(Applied event|Failed to apply)" || true
 
-    # Verification SQL outputs
+    # Verification SQL outputs (minimal)
     echo ""
     echo "=== Verification ==="
     echo ""
-    echo "Event log counts:"
-    podman exec -i robson-v2-db psql -U robson -d robson_v2 -t -c \
-        "SELECT event_type, COUNT(*) FROM event_log WHERE tenant_id = '$TENANT_ID'::uuid GROUP BY event_type;"
-    echo ""
-    echo "Balances current:"
-    podman exec -i robson-v2-db psql -U robson -d robson_v2 -t -c \
+    podman exec -i robson-v2-db psql -U robson -d robson_v2 -c \
         "SELECT asset, free, locked, total FROM balances_current WHERE tenant_id = '$TENANT_ID'::uuid;"
     echo ""
-    echo "Positions current (should be 0 - invariant blocked):"
     podman exec -i robson-v2-db psql -U robson -d robson_v2 -t -c \
         "SELECT COUNT(*) FROM positions_current WHERE tenant_id = '$TENANT_ID'::uuid;"
+    echo ""
+    podman exec -i robson-v2-db psql -U robson -d robson_v2 -t -c \
+        "SELECT seq, event_type FROM event_log WHERE tenant_id = '$TENANT_ID'::uuid AND stream_key = '$STREAM_KEY' ORDER BY seq;"
 
 # v2: Test idempotency (regression test)
 v2-test-idempotency:

@@ -101,6 +101,11 @@ impl ProjectionWorker {
         for event in &events {
             match apply_event_to_projections(&self.pool, event).await {
                 Ok(()) => {
+                    info!(
+                        seq = event.seq,
+                        event_type = %event.event_type,
+                        "Applied event to projections"
+                    );
                     *last_seq = event.seq;
                     applied += 1;
                 },
