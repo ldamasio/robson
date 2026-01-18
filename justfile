@@ -349,8 +349,8 @@ v2-check:
 # v2: Database lifecycle (Podman-first)
 v2-db-up:
     #!/usr/bin/env bash
-    # Start ParadeDB or Postgres container for v2
-    IMAGE="${PARADEDB_IMAGE:-ghcr.io/paradedb/paradedb:latest}"
+    # Start ParadeDB container for v2
+    IMAGE="${PARADEDB_IMAGE:-docker.io/paradedb/paradedb:latest-pg17}"
     CONTAINER_NAME="robson-v2-db"
 
     # Check if already running
