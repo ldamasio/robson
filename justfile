@@ -326,3 +326,173 @@ health: info
     @just test-cli
     @echo ""
     @echo "✅ Environment is healthy!"
+
+# ============================================================================
+# Robson v2 (Rust rewrite)
+# ============================================================================
+
+# v2: Build robsond binary
+v2-build:
+    @echo "🔨 Building robsond..."
+    cd v2 && cargo build --release --bin robsond
+
+# v2: Format code
+v2-fmt:
+    @echo "🎨 Formatting v2 code..."
+    cd v2 && cargo fmt --all
+
+# v2: Check compilation
+v2-check:
+    @echo "🔍 Checking v2 compilation..."
+    cd v2 && cargo check --workspace -q
+
+# v2: Database lifecycle (Podman-first)
+v2-db-up:
+    #!/usr/bin/env bash
+    # Start ParadeDB or Postgres container for v2
+    IMAGE="${PARADEDB_IMAGE:-ghcr.io/paradedb/paradedb:latest}"
+    CONTAINER_NAME="robson-v2-db"
+
+    # Check if already running
+    if podman ps -q -f name=${CONTAINER_NAME} | grep -q .; then
+        echo "Database already running"
+        exit 0
+    fi
+
+    podman run -d \
+        --name ${CONTAINER_NAME} \
+        -p 5432:5432 \
+        -e POSTGRES_USER=robson \
+        -e POSTGRES_PASSWORD=robson \
+        -e POSTGRES_DB=robson_v2 \
+        ${IMAGE}
+
+    # Wait for database to be ready
+    echo "Waiting for database to be ready..."
+    for i in {1..30}; do
+        if podman exec -i ${CONTAINER_NAME} pg_isready -U robson >/dev/null 2>&1; then
+            echo "Database is ready"
+            exit 0
+        fi
+        sleep 1
+    done
+    echo "Failed to start database"
+    exit 1
+
+v2-db-down:
+    podman rm -f robson-v2-db || true
+
+v2-db-migrate:
+    #!/usr/bin/env bash
+    # Apply migration 002 for v2
+    podman exec -i robson-v2-db psql -U robson -d robson_v2 < v2/migrations/002_event_log_phase9.sql
+
+v2-db-psql:
+    podman exec -it robson-v2-db psql -U robson -d robson_v2
+
+# v2: Test projection worker (end-to-end)
+v2-test-projection-worker:
+    #!/usr/bin/env bash
+    # End-to-end test: insert 2 events and run projection worker
+    set -e
+
+    TENANT_ID="$(podman exec -i robson-v2-db psql -U robson -d robson_v2 -t -c \
+        "SELECT gen_random_uuid()::text" | tr -d ' ')"
+
+    # Insert event 1: valid BALANCE_SAMPLED
+    podman exec -i robson-v2-db psql -U robson -d robson_v2 -c \
+        "INSERT INTO event_idempotency (tenant_id, idempotency_key, event_id) \
+         VALUES ('$TENANT_ID'::uuid, 'balance-test-1', gen_random_uuid()) \
+         ON CONFLICT (tenant_id, idempotency_key) DO NOTHING"
+
+    podman exec -i robson-v2-db psql -U robson -d robson_v2 -c \
+        "INSERT INTO event_log (tenant_id, stream_key, seq, event_type, payload, payload_schema_version, \
+         occurred_at, ingested_at, idempotency_key, actor_type, actor_id, event_id) \
+         SELECT '$TENANT_ID'::uuid, 'account:test', 1, 'BALANCE_SAMPLED', \
+         jsonb_build_object('balance_id', gen_random_uuid(), 'tenant_id', '$TENANT_ID'::uuid, \
+         'account_id', gen_random_uuid(), 'asset', 'USDT', 'free', '10000.00', 'locked', '0.00', 'sampled_at', NOW()), \
+         1, NOW(), NOW(), 'balance-test-1', 'CLI', 'test-user', \
+         (SELECT event_id FROM event_idempotency WHERE idempotency_key = 'balance-test-1' AND tenant_id = '$TENANT_ID'::uuid)"
+
+    # Insert event 2: invalid POSITION_OPENED (stop_distance=0)
+    podman exec -i robson-v2-db psql -U robson -d robson_v2 -c \
+        "INSERT INTO event_idempotency (tenant_id, idempotency_key, event_id) \
+         VALUES ('$TENANT_ID'::uuid, 'position-test-1', gen_random_uuid()) \
+         ON CONFLICT (tenant_id, idempotency_key) DO NOTHING"
+
+    podman exec -i robson-v2-db psql -U robson -d robson_v2 -c \
+        "INSERT INTO event_log (tenant_id, stream_key, seq, event_type, payload, payload_schema_version, \
+         occurred_at, ingested_at, idempotency_key, actor_type, actor_id, event_id) \
+         SELECT '$TENANT_ID'::uuid, 'position:test', 2, 'POSITION_OPENED', \
+         jsonb_build_object('position_id', gen_random_uuid(), 'tenant_id', '$TENANT_ID'::uuid, \
+         'account_id', (SELECT (payload->>'account_id')::uuid FROM event_log WHERE seq = 1 AND tenant_id = '$TENANT_ID'::uuid), \
+         'symbol', 'BTCUSDT', 'side', 'long', 'entry_price', '95000', 'entry_quantity', '0.1', \
+         'technical_stop_price', '94000', 'technical_stop_distance', '0', 'entry_filled_at', NOW()), \
+         1, NOW(), NOW(), 'position-test-1', 'CLI', 'test-user', \
+         (SELECT event_id FROM event_idempotency WHERE idempotency_key = 'position-test-1' AND tenant_id = '$TENANT_ID'::uuid)"
+
+    # Run projection worker briefly
+    DATABASE_URL="postgresql://robson:robson@localhost:5432/robson_v2" \
+    PROJECTION_TENANT_ID="$TENANT_ID" \
+    PROJECTION_STREAM_KEY="account:test" \
+    timeout 3 ./v2/target/release/robsond || true
+
+    # Verification SQL outputs
+    echo ""
+    echo "=== Verification ==="
+    echo ""
+    echo "Event log counts:"
+    podman exec -i robson-v2-db psql -U robson -d robson_v2 -t -c \
+        "SELECT event_type, COUNT(*) FROM event_log WHERE tenant_id = '$TENANT_ID'::uuid GROUP BY event_type;"
+    echo ""
+    echo "Balances current:"
+    podman exec -i robson-v2-db psql -U robson -d robson_v2 -t -c \
+        "SELECT asset, free, locked, total FROM balances_current WHERE tenant_id = '$TENANT_ID'::uuid;"
+    echo ""
+    echo "Positions current (should be 0 - invariant blocked):"
+    podman exec -i robson-v2-db psql -U robson -d robson_v2 -t -c \
+        "SELECT COUNT(*) FROM positions_current WHERE tenant_id = '$TENANT_ID'::uuid;"
+
+# v2: Test idempotency (regression test)
+v2-test-idempotency:
+    #!/usr/bin/env bash
+    # Test global idempotency: inserting same event twice should not duplicate
+    set -e
+
+    TENANT_ID="$(podman exec -i robson-v2-db psql -U robson -d robson_v2 -t -c \
+        "SELECT gen_random_uuid()::text" | tr -d ' ')"
+
+    # First insert - should succeed
+    echo "First insert (should succeed)..."
+    podman exec -i robson-v2-db psql -U robson -d robson_v2 -c \
+        "INSERT INTO event_idempotency (tenant_id, idempotency_key, event_id) \
+         VALUES ('$TENANT_ID'::uuid, 'idempotency-test-1', gen_random_uuid()) \
+         ON CONFLICT (tenant_id, idempotency_key) DO NOTHING"
+
+    podman exec -i robson-v2-db psql -U robson -d robson_v2 -c \
+        "INSERT INTO event_log (tenant_id, stream_key, seq, event_type, payload, payload_schema_version, \
+         occurred_at, ingested_at, idempotency_key, actor_type, actor_id, event_id) \
+         SELECT '$TENANT_ID'::uuid, 'account:idempotency-test', 1, 'BALANCE_SAMPLED', \
+         jsonb_build_object('balance_id', gen_random_uuid(), 'tenant_id', '$TENANT_ID'::uuid, \
+         'account_id', gen_random_uuid(), 'asset', 'USDT', 'free', '5000.00', 'locked', '0.00', 'sampled_at', NOW()), \
+         1, NOW(), NOW(), 'idempotency-test-1', 'CLI', 'test-user', \
+         (SELECT event_id FROM event_idempotency WHERE idempotency_key = 'idempotency-test-1' AND tenant_id = '$TENANT_ID'::uuid)"
+
+    # Second insert - should be blocked by event_idempotency
+    echo "Second insert (should be blocked by idempotency)..."
+    RESULT=$(podman exec -i robson-v2-db psql -U robson -d robson_v2 -t -c \
+        "INSERT INTO event_idempotency (tenant_id, idempotency_key, event_id) \
+         VALUES ('$TENANT_ID'::uuid, 'idempotency-test-1', gen_random_uuid()) \
+         ON CONFLICT (tenant_id, idempotency_key) DO NOTHING \
+         RETURNING 'inserted'")
+
+    if [ "$RESULT" = "inserted" ]; then
+        echo "ERROR: Second insert should have been blocked!"
+        exit 1
+    fi
+
+    # Verify only one row in event_log
+    echo ""
+    echo "=== Verification (should be 1 row) ==="
+    podman exec -i robson-v2-db psql -U robson -d robson_v2 -t -c \
+        "SELECT COUNT(*) FROM event_log WHERE tenant_id = '$TENANT_ID'::uuid AND idempotency_key = 'idempotency-test-1';"

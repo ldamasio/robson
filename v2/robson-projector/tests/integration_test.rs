@@ -401,3 +401,107 @@ async fn test_risk_check_failed(pool: sqlx::PgPool) -> sqlx::Result<()> {
 
     Ok(())
 }
+
+#[sqlx::test]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
+async fn test_global_idempotency(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    // Regression test: inserting same event twice should not duplicate
+    // Uses event_idempotency table for global idempotency by (tenant_id, idempotency_key)
+
+    let tenant_id = Uuid::new_v4();
+    let account_id = Uuid::new_v4();
+    let idempotency_key = "global-idempotency-test";
+    let stream_key = "account:global-test";
+
+    // Helper to insert via event_idempotency
+    let insert_via_idempotency = |stream_key: &str, seq: i64| -> sqlx::Result<Uuid> {
+        let event_id = Uuid::new_v4();
+
+        // First, insert into event_idempotency
+        sqlx::query(
+            r#"
+            INSERT INTO event_idempotency (tenant_id, idempotency_key, event_id)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(idempotency_key)
+        .bind(event_id)
+        .execute(&pool)
+        .await?;
+
+        // Check if this was a new insert
+        let existing = sqlx::query_scalar::<_, Uuid>(
+            "SELECT event_id FROM event_idempotency WHERE tenant_id = $1 AND idempotency_key = $2",
+        )
+        .bind(tenant_id)
+        .bind(idempotency_key)
+        .fetch_one(&pool)
+        .await?;
+
+        // Now insert into event_log
+        let payload = serde_json::json!({
+            "balance_id": Uuid::new_v4(),
+            "tenant_id": tenant_id,
+            "account_id": account_id,
+            "asset": "USDT",
+            "free": "2500.00",
+            "locked": "0.00",
+            "sampled_at": chrono::Utc::now()
+        });
+
+        sqlx::query(
+            r#"
+            INSERT INTO event_log (
+                tenant_id, stream_key, seq, event_type, payload, payload_schema_version,
+                occurred_at, ingested_at, idempotency_key, actor_type, actor_id, event_id
+            ) VALUES ($1, $2, $3, 'BALANCE_SAMPLED', $4, 1,
+                       NOW(), NOW(), $5, 'CLI', 'test-user', $6)
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(stream_key)
+        .bind(seq)
+        .bind(payload)
+        .bind(idempotency_key)
+        .bind(event_id)
+        .execute(&pool)
+        .await?;
+
+        Ok(existing)
+    };
+
+    // First insert - should succeed and create new row
+    let event_id_1 = insert_via_idempotency(stream_key, 1).await?;
+    assert!(event_id_1.is_some());
+
+    // Verify event_log has 1 row
+    let count_1: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM event_log WHERE tenant_id = $1 AND idempotency_key = $2",
+    )
+    .bind(tenant_id)
+    .bind(idempotency_key)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(count_1, 1, "First insert should create 1 row");
+
+    // Second insert - should be blocked by event_idempotency (ON CONFLICT DO NOTHING)
+    let event_id_2 = insert_via_idempotency(stream_key, 2).await?;
+    assert!(event_id_2.is_some());
+
+    // Verify still only 1 row in event_log (second insert blocked by idempotency)
+    let count_2: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM event_log WHERE tenant_id = $1 AND idempotency_key = $2",
+    )
+    .bind(tenant_id)
+    .bind(idempotency_key)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(count_2, 1, "Second insert should NOT create duplicate; should still be 1 row");
+
+    // Verify the event_id returned is the same (first insert)
+    assert_eq!(event_id_1, event_id_2, "Both inserts should return same event_id");
+
+    Ok(())
+)

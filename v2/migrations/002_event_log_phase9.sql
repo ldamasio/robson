@@ -62,7 +62,6 @@ CREATE TABLE IF NOT EXISTS event_log (
 
     -- Constraints
     CONSTRAINT uk_event_log_stream_seq UNIQUE (stream_key, seq, ingested_at),
-    CONSTRAINT uk_event_log_idempotency_key UNIQUE (idempotency_key, ingested_at),
     CONSTRAINT chk_actor_type CHECK (actor_type IN ('CLI', 'Daemon', 'System', 'Exchange')),
     CONSTRAINT pk_event_log PRIMARY KEY (event_id, ingested_at)
 ) PARTITION BY RANGE (ingested_at);
@@ -90,6 +89,28 @@ COMMENT ON TABLE event_log IS 'Append-only event log for audit trail and state r
 COMMENT ON COLUMN event_log.stream_key IS 'Logical partition key (e.g., position:{uuid})';
 COMMENT ON COLUMN event_log.seq IS 'Monotonic sequence number per stream_key for ordering';
 COMMENT ON COLUMN event_log.idempotency_key IS 'Hash of semantic payload for deduplication';
+
+-- =============================================================================
+-- 1.5 EVENT IDEMPOTENCY (Global deduplication)
+-- =============================================================================
+-- Non-partitioned table for global idempotency by (tenant_id, idempotency_key).
+-- This ensures events are not duplicated across the entire event log,
+-- regardless of partition (ingested_at time).
+CREATE TABLE event_idempotency (
+    tenant_id UUID NOT NULL,
+    idempotency_key TEXT NOT NULL,
+    event_id UUID NOT NULL,
+    first_ingested_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    CONSTRAINT pk_event_idempotency PRIMARY KEY (tenant_id, idempotency_key)
+);
+
+CREATE INDEX idx_event_idempotency_event_id ON event_idempotency(event_id);
+
+COMMENT ON TABLE event_idempotency IS 'Global idempotency tracking for event deduplication';
+COMMENT ON COLUMN event_idempotency.tenant_id IS 'Tenant scope for idempotency key';
+COMMENT ON COLUMN event_idempotency.idempotency_key IS 'Semantic hash of event payload';
+COMMENT ON COLUMN event_idempotency.event_id IS 'The event_id that was first inserted for this key';
+COMMENT ON COLUMN event_idempotency.first_ingested_at IS 'When this event was first seen';
 
 -- =============================================================================
 -- 2. PROJECTION TABLES (Current State)

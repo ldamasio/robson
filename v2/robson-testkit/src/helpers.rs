@@ -80,14 +80,31 @@ pub async fn append_event(
     let event_id = Uuid::now_v7();
     let actor_id = actor_id.unwrap_or_else(|| "test-user".to_string());
 
+    // Insert into event_idempotency first (for global idempotency)
+    sqlx::query(
+        r#"
+        INSERT INTO event_idempotency (tenant_id, idempotency_key, event_id)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(&idempotency_key)
+    .bind(event_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // Then insert the event log entry
     sqlx::query(
         r#"
         INSERT INTO event_log (
             tenant_id, stream_key, seq, event_type, payload, payload_schema_version,
-            occurred_at, ingested_at, idempotency_key, actor_type, actor_id
+            occurred_at, ingested_at, idempotency_key, actor_type, actor_id,
+            event_id
         ) VALUES (
             $1, $2, $3, $4, $5, 1,
-            $6, NOW(), $7, $8, $9
+            $6, NOW(), $7, $8, $9,
+            $10
         )
         "#,
     )
@@ -100,6 +117,7 @@ pub async fn append_event(
     .bind(&idempotency_key)
     .bind(actor_type as ActorType)
     .bind(&actor_id)
+    .bind(event_id)
     .execute(&mut *tx)
     .await?;
 

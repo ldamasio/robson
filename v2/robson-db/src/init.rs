@@ -43,6 +43,7 @@ pub async fn init_minimal_data(
 
     // Insert minimal strategy_state_current row
     let strategy_id = Uuid::now_v7();
+    let event_id = Uuid::now_v7();
     info!(
         "Creating minimal strategy: id={}, tenant={}, account={}",
         strategy_id, tenant_id, account_id
@@ -72,17 +73,34 @@ pub async fn init_minimal_data(
     .bind(strategy_id)
     .bind(tenant_id)
     .bind(account_id)
-    .bind(Uuid::now_v7()) // dummy event_id
+    .bind(event_id)
     .execute(&mut *tx)
     .await?;
 
-    // Insert corresponding event for audit trail
+    // Insert into event_idempotency first (for global idempotency)
     let stream_key = format!("strategy:{}", strategy_id);
+    let idempotency_key = format!("strategy-created-{}", strategy_id);
+
+    sqlx::query(
+        r#"
+        INSERT INTO event_idempotency (tenant_id, idempotency_key, event_id)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(&idempotency_key)
+    .bind(event_id)
+    .execute(&mut *tx)
+    .await?;
+
+    // Then insert the event log entry
     sqlx::query(
         r#"
         INSERT INTO event_log (
             tenant_id, stream_key, seq, event_type, payload, payload_schema_version,
-            occurred_at, ingested_at, idempotency_key, actor_type, actor_id
+            occurred_at, ingested_at, idempotency_key, actor_type, actor_id,
+            event_id
         ) VALUES (
             $1, $2, 1, 'STRATEGY_CREATED',
             $3::jsonb,
@@ -90,9 +108,9 @@ pub async fn init_minimal_data(
             NOW(), NOW(),
             $4,
             'System',
-            'db-init'
+            'db-init',
+            $5
         )
-        ON CONFLICT (idempotency_key, ingested_at) DO NOTHING
         "#,
     )
     .bind(tenant_id)
@@ -105,7 +123,8 @@ pub async fn init_minimal_data(
         "type": "manual",
         "risk_config": {"max_exposure": 10000, "daily_loss_limit": 100}
     }))
-    .bind(format!("strategy-created-{}", strategy_id))
+    .bind(&idempotency_key)
+    .bind(event_id)
     .execute(&mut *tx)
     .await?;
 

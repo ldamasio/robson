@@ -3,7 +3,7 @@
 use crate::idempotency::compute_idempotency_key;
 use crate::types::{ActorType, Event, EventEnvelope, EventLogError, Result};
 use chrono::Utc;
-use sqlx::{PgPool, Postgres, Transaction};
+use sqlx::{PgPool, Postgres, Row, Transaction};
 use tracing::{debug, warn};
 use uuid::Uuid;
 
@@ -52,7 +52,53 @@ pub async fn append_event_tx(
     let idempotency_key =
         compute_idempotency_key(event.tenant_id, stream_key, event.command_id, &event.payload);
 
-    // 4. Insert event
+    // 4. Check global idempotency via event_idempotency table
+    let idempotency_check = sqlx::query(
+        r#"
+        INSERT INTO event_idempotency (tenant_id, idempotency_key, event_id)
+        VALUES ($1, $2, $3)
+        ON CONFLICT (tenant_id, idempotency_key) DO NOTHING
+        RETURNING event_id
+        "#,
+    )
+    .bind(&event.tenant_id)
+    .bind(&idempotency_key)
+    .bind(&event_id)
+    .fetch_optional(&mut **tx)
+    .await;
+
+    match idempotency_check {
+        Ok(Some(returned_event_id)) => {
+            // This is a new event - the INSERT succeeded
+            debug!(
+                event_id = %event_id,
+                "Global idempotency check passed (new event)"
+            );
+        },
+        Ok(None) => {
+            // Duplicate detected - fetch the existing event_id
+            let existing_event_id: Uuid = sqlx::query_scalar(
+                "SELECT event_id FROM event_idempotency WHERE tenant_id = $1 AND idempotency_key = $2",
+            )
+            .bind(&event.tenant_id)
+            .bind(&idempotency_key)
+            .fetch_one(&mut **tx)
+            .await?;
+
+            warn!(
+                existing_event_id = %existing_event_id,
+                idempotency_key = %idempotency_key,
+                "Idempotent event duplicate detected (global check)"
+            );
+
+            return Err(EventLogError::IdempotentDuplicate(existing_event_id));
+        },
+        Err(e) => {
+            return Err(EventLogError::Database(e));
+        },
+    }
+
+    // 5. Insert event into event_log (partitioned)
     let result = sqlx::query(
         r#"
         INSERT INTO event_log (
@@ -94,22 +140,6 @@ pub async fn append_event_tx(
             );
 
             Ok(event_id)
-        },
-        Err(sqlx::Error::Database(db_err)) if is_unique_violation(db_err.as_ref()) => {
-            // Idempotent duplicate - return existing event ID
-            let existing_event_id: Uuid =
-                sqlx::query_scalar("SELECT event_id FROM event_log WHERE idempotency_key = $1")
-                    .bind(&idempotency_key)
-                    .fetch_one(&mut **tx)
-                    .await?;
-
-            warn!(
-                existing_event_id = %existing_event_id,
-                idempotency_key = %idempotency_key,
-                "Idempotent event duplicate detected"
-            );
-
-            Err(EventLogError::IdempotentDuplicate(existing_event_id))
         },
         Err(e) => Err(EventLogError::Database(e)),
     }
@@ -159,7 +189,7 @@ async fn update_stream_state(
     event_id: Uuid,
 ) -> Result<()> {
     sqlx::query(
-        "UPDATE stream_state SET last_seq = $1, last_event_id = $2, updated_at = NOW() WHERE stream_key = $3"
+        "UPDATE stream_state SET last_seq = $1, last_event_id = $2, updated_at = NOW() WHERE stream_key = $3",
     )
     .bind(seq)
     .bind(event_id)
@@ -169,21 +199,6 @@ async fn update_stream_state(
 
     Ok(())
 }
-
-/// Check if database error is a unique constraint violation
-fn is_unique_violation(db_err: &dyn sqlx::error::DatabaseError) -> bool {
-    db_err.code() == Some(std::borrow::Cow::Borrowed("23505"))
-}
-
-// TODO: Implement batch append for performance
-// pub async fn append_events_batch(
-//     pool: &PgPool,
-//     stream_key: &str,
-//     events: Vec<Event>,
-// ) -> Result<Vec<Uuid>> {
-//     // Batch insert for better performance
-//     todo!("Implement batch event append")
-// }
 
 #[cfg(test)]
 mod tests {
