@@ -439,6 +439,73 @@ impl TechnicalStopDistance {
         }
     }
 
+    /// Create TechnicalStopDistance with side-aware validation (hard-stop invariants)
+    ///
+    /// This constructor enforces critical domain invariants:
+    /// - Distance must be > 0 (not equal to entry)
+    /// - Distance must be between 0.1% and 10% of entry price
+    /// - For LONG: stop must be below entry
+    /// - For SHORT: stop must be above entry
+    ///
+    /// # Errors
+    ///
+    /// Returns `DomainError::InvalidTechnicalStopDistance` if invariants are violated.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// # use robson_domain::value_objects::{TechnicalStopDistance, Price, Side};
+    /// # use rust_decimal_macros::dec;
+    /// let entry = Price::new(dec!(95000)).unwrap();
+    /// let stop = Price::new(dec!(93500)).unwrap();
+    ///
+    /// // Valid LONG setup (stop below entry)
+    /// let tech_stop = TechnicalStopDistance::new_validated(entry, stop, Side::Long).unwrap();
+    ///
+    /// // Invalid LONG setup (stop above entry)
+    /// let bad_stop = Price::new(dec!(96500)).unwrap();
+    /// assert!(TechnicalStopDistance::new_validated(entry, bad_stop, Side::Long).is_err());
+    ///
+    /// // Invalid setup (stop at same price as entry)
+    /// let same_stop = Price::new(dec!(95000)).unwrap();
+    /// assert!(TechnicalStopDistance::new_validated(entry, same_stop, Side::Long).is_err());
+    /// ```
+    pub fn new_validated(
+        entry: Price,
+        initial_stop: Price,
+        side: Side,
+    ) -> Result<Self, DomainError> {
+        // Check distance > 0 (hard-stop: stop cannot be at same price as entry)
+        let distance = (entry.as_decimal() - initial_stop.as_decimal()).abs();
+        if distance <= Decimal::ZERO {
+            return Err(DomainError::InvalidTechnicalStopDistance(
+                "Stop distance must be positive (stop cannot equal entry price)".to_string(),
+            ));
+        }
+
+        // Check stop is on correct side for position direction
+        match side {
+            Side::Long => {
+                if initial_stop.as_decimal() >= entry.as_decimal() {
+                    return Err(DomainError::InvalidTechnicalStopDistance(
+                        "LONG position requires stop below entry price".to_string(),
+                    ));
+                }
+            },
+            Side::Short => {
+                if initial_stop.as_decimal() <= entry.as_decimal() {
+                    return Err(DomainError::InvalidTechnicalStopDistance(
+                        "SHORT position requires stop above entry price".to_string(),
+                    ));
+                }
+            },
+        }
+
+        let tech_stop = Self::from_entry_and_stop(entry, initial_stop);
+        tech_stop.validate()?;
+        Ok(tech_stop)
+    }
+
     /// Validate the TechnicalStopDistance
     ///
     /// # Errors
@@ -801,5 +868,84 @@ mod tests {
 
         // Price above stop - should exit
         assert!(tech_stop.should_exit_short(dec!(95600.0), trailing_stop));
+    }
+
+    // Tests for new_validated (hard-stop invariants)
+    #[test]
+    fn test_new_validated_long_rejects_stop_at_entry() {
+        let entry = Price::new(dec!(95000)).unwrap();
+        let stop = Price::new(dec!(95000)).unwrap(); // Same as entry
+
+        let result = TechnicalStopDistance::new_validated(entry, stop, Side::Long);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), DomainError::InvalidTechnicalStopDistance(_)));
+    }
+
+    #[test]
+    fn test_new_validated_long_rejects_stop_above_entry() {
+        let entry = Price::new(dec!(95000)).unwrap();
+        let stop = Price::new(dec!(96000)).unwrap(); // Above entry (wrong for long)
+
+        let result = TechnicalStopDistance::new_validated(entry, stop, Side::Long);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_validated_short_rejects_stop_at_entry() {
+        let entry = Price::new(dec!(95000)).unwrap();
+        let stop = Price::new(dec!(95000)).unwrap(); // Same as entry
+
+        let result = TechnicalStopDistance::new_validated(entry, stop, Side::Short);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_validated_short_rejects_stop_below_entry() {
+        let entry = Price::new(dec!(95000)).unwrap();
+        let stop = Price::new(dec!(94000)).unwrap(); // Below entry (wrong for short)
+
+        let result = TechnicalStopDistance::new_validated(entry, stop, Side::Short);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_validated_long_accepts_valid_setup() {
+        let entry = Price::new(dec!(95000)).unwrap();
+        let stop = Price::new(dec!(93500)).unwrap(); // Below entry (correct for long)
+
+        let result = TechnicalStopDistance::new_validated(entry, stop, Side::Long);
+        assert!(result.is_ok());
+        let tech_stop = result.unwrap();
+        assert_eq!(tech_stop.distance, dec!(1500));
+    }
+
+    #[test]
+    fn test_new_validated_short_accepts_valid_setup() {
+        let entry = Price::new(dec!(95000)).unwrap();
+        let stop = Price::new(dec!(96500)).unwrap(); // Above entry (correct for short)
+
+        let result = TechnicalStopDistance::new_validated(entry, stop, Side::Short);
+        assert!(result.is_ok());
+        let tech_stop = result.unwrap();
+        assert_eq!(tech_stop.distance, dec!(1500));
+    }
+
+    #[test]
+    fn test_new_validated_also_checks_distance_bounds() {
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(80)).unwrap(); // 20% distance (>10% limit)
+
+        // Should fail distance bounds check even though side is correct
+        let result = TechnicalStopDistance::new_validated(entry, stop, Side::Long);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_new_validated_distance_too_tight() {
+        let entry = Price::new(dec!(100000)).unwrap();
+        let stop = Price::new(dec!(99999)).unwrap(); // 0.001% (<0.1% limit)
+
+        let result = TechnicalStopDistance::new_validated(entry, stop, Side::Long);
+        assert!(result.is_err());
     }
 }
