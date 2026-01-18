@@ -242,8 +242,9 @@ where
 
     // Create a dummy tech stop distance (will be replaced by detector signal)
     // Note: In production, the detector signal provides the actual tech stop distance
+    // Use Price::zero() to bypass validation (allowed for initialization only)
     let entry_price = Price::new(rust_decimal::Decimal::ONE).unwrap();
-    let stop_loss = Price::new(rust_decimal::Decimal::ZERO).unwrap();
+    let stop_loss = Price::zero();
     let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry_price, stop_loss);
 
     // Arm position
