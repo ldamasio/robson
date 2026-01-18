@@ -137,6 +137,30 @@ robson panic --confirm
 
 ---
 
+### [SMOKE-TEST.md](./SMOKE-TEST.md)
+
+**Purpose**: Operational smoke test for MVP validation
+
+**Key Sections**:
+- Prerequisites (Rust, Bun only)
+- Copy/paste test cases for all CLI commands
+- Runtime invariants checklist (leverage, margin safety, sizing, etc.)
+- Troubleshooting guide (5+ common issues)
+
+**For**: QA, developers, anyone validating the MVP locally
+
+**Quick Start**:
+```bash
+# Start daemon
+cargo run -p robsond &
+
+# Run smoke test
+# See docs/SMOKE-TEST.md for full test suite
+bun run dev arm BTCUSDT --capital 1000 --risk 1 --side long
+```
+
+---
+
 ### [EXECUTION-PLAN.md](./EXECUTION-PLAN.md)
 
 **Purpose**: Step-by-step implementation roadmap
@@ -334,6 +358,7 @@ Armed → Entering → Active → Exiting → Closed
 - [ ] Position transitions through states
 - [ ] Events logged to database
 - [ ] Lease acquired successfully
+- [ ] **Smoke test passes**: See [SMOKE-TEST.md](./SMOKE-TEST.md)
 
 ---
 
