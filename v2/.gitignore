@@ -8,6 +8,7 @@ Cargo.lock
 /cli/node_modules/
 /cli/dist/
 /cli/bun.lockb
+/cli/bun.lock
 
 # MCP Configuration (contains secrets)
 .mcp.json
