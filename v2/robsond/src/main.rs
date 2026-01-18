@@ -27,9 +27,9 @@
 //! - `ROBSON_MIN_TECH_STOP_PERCENT`: Min tech stop (default: 0.001)
 //! - `ROBSON_MAX_TECH_STOP_PERCENT`: Max tech stop (default: 0.10)
 
+#[cfg(feature = "postgres")]
 mod db;
 
-use db::run_db_command;
 use robsond::{Config, Daemon};
 use std::sync::Arc;
 use tracing::info;
@@ -47,7 +47,9 @@ async fn main() -> anyhow::Result<()> {
     let args: Vec<String> = std::env::args().collect();
 
     // Check for db subcommand
+    #[cfg(feature = "postgres")]
     if args.len() > 1 && args[1] == "db" {
+        use db::run_db_command;
         return run_db_command(args).await;
     }
 

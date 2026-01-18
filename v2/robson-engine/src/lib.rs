@@ -632,24 +632,26 @@ impl Engine {
         new_stop: Price,
         trigger_price: Price,
     ) -> EngineDecision {
-        // Update position state with new last_emitted_stop
+        // Update position state with new trailing stop and favorable extreme
         let mut updated_position = position.clone();
         if let PositionState::Active {
-            current_price,
-            trailing_stop,
-            favorable_extreme,
-            extreme_at,
+            current_price: _,
+            trailing_stop: _,
+            favorable_extreme: _,
+            extreme_at: _,
             insurance_stop_id,
             ..
         } = updated_position.state
         {
+            // Monotonicity check: stop only moves in favorable direction
+            // (enforced by caller via is_more_favorable_stop check)
             updated_position.state = PositionState::Active {
-                current_price,
-                trailing_stop,
-                favorable_extreme,
-                extreme_at,
+                current_price: trigger_price,
+                trailing_stop: new_stop,
+                favorable_extreme: trigger_price,
+                extreme_at: Utc::now(),
                 insurance_stop_id,
-                last_emitted_stop: Some(new_stop), // Mark as emitted
+                last_emitted_stop: Some(new_stop),
             };
             updated_position.updated_at = Utc::now();
         }
