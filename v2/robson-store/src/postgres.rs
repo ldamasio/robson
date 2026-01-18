@@ -4,12 +4,15 @@
 //! - `ProjectionRecovery` trait for reading positions from projection
 //! - `PgProjectionReader` adapter implementing the trait
 //! - `find_active_from_projection` function for direct access
+//!
+//! This module uses dynamic queries (sqlx::query) instead of compile-time
+//! checked macros (sqlx::query!) to allow compilation without DATABASE_URL.
 
 use crate::error::StoreError;
 use async_trait::async_trait;
 use robson_domain::{Position, Price, Quantity, Side, Symbol, TechnicalStopDistance};
 use rust_decimal::Decimal;
-use sqlx::PgPool;
+use sqlx::{PgPool, Row};
 use std::sync::Arc;
 use uuid::Uuid;
 
@@ -60,6 +63,54 @@ impl ProjectionRecovery for PgProjectionReader {
     }
 }
 
+/// Row struct for positions_current query results.
+///
+/// Derived from the positions_current table schema in migrations.
+#[derive(Debug)]
+struct PositionCurrentRow {
+    position_id: Uuid,
+    account_id: Uuid,
+    symbol: String,
+    side: String,
+    state: String,
+    entry_price: Option<Decimal>,
+    entry_quantity: Option<Decimal>,
+    trailing_stop_price: Option<Decimal>,
+    favorable_extreme: Option<Decimal>,
+    extreme_at: Option<chrono::DateTime<chrono::Utc>>,
+    technical_stop_distance: Option<Decimal>,
+    technical_stop_price: Option<Decimal>,
+    created_at: chrono::DateTime<chrono::Utc>,
+    updated_at: chrono::DateTime<chrono::Utc>,
+}
+
+/// Helper function to parse a row from positions_current query.
+///
+/// Uses sqlx::Row trait with rust_decimal feature enabled.
+fn parse_position_row(row: &sqlx::postgres::PgRow) -> Result<PositionCurrentRow, sqlx::Error> {
+    // Helper to get optional decimal values
+    let try_get_decimal = |column: &str| -> Option<Decimal> {
+        row.try_get::<Decimal, _>(column).ok()
+    };
+
+    Ok(PositionCurrentRow {
+        position_id: row.try_get("position_id")?,
+        account_id: row.try_get("account_id")?,
+        symbol: row.try_get("symbol")?,
+        side: row.try_get("side")?,
+        state: row.try_get("state")?,
+        entry_price: try_get_decimal("entry_price"),
+        entry_quantity: try_get_decimal("entry_quantity"),
+        trailing_stop_price: try_get_decimal("trailing_stop_price"),
+        favorable_extreme: try_get_decimal("favorable_extreme"),
+        extreme_at: row.try_get("extreme_at").ok(),
+        technical_stop_distance: try_get_decimal("technical_stop_distance"),
+        technical_stop_price: try_get_decimal("technical_stop_price"),
+        created_at: row.try_get("created_at")?,
+        updated_at: row.try_get("updated_at")?,
+    })
+}
+
 /// Read active positions from the `positions_current` projection table.
 ///
 /// This function is used during crash recovery to restore active positions
@@ -101,7 +152,7 @@ pub async fn find_active_from_projection(
     pool: &PgPool,
     tenant_id: Uuid,
 ) -> Result<Vec<Position>, StoreError> {
-    let rows = sqlx::query!(
+    let rows = sqlx::query(
         r#"
         SELECT
             position_id,
@@ -122,8 +173,8 @@ pub async fn find_active_from_projection(
           AND state IN ('armed', 'active', 'exiting')
         ORDER BY created_at ASC
         "#,
-        tenant_id
     )
+    .bind(tenant_id)
     .fetch_all(pool)
     .await
     .map_err(|e| StoreError::Database(format!("Failed to read projection: {}", e)))?;
@@ -131,37 +182,40 @@ pub async fn find_active_from_projection(
     let mut positions = Vec::new();
 
     for row in rows {
+        let row_data = parse_position_row(&row)
+            .map_err(|e| StoreError::Database(format!("Failed to parse row: {}", e)))?;
+
         // Parse symbol
-        let symbol = Symbol::from_pair(&row.symbol)
-            .map_err(|e| StoreError::Deserialization(format!("Invalid symbol {}: {}", row.symbol, e)))?;
+        let symbol = Symbol::from_pair(&row_data.symbol)
+            .map_err(|e| StoreError::Deserialization(format!("Invalid symbol {}: {}", row_data.symbol, e)))?;
 
         // Parse side
-        let side = match row.side.as_str() {
+        let side = match row_data.side.as_str() {
             "long" => Side::Long,
             "short" => Side::Short,
-            _ => return Err(StoreError::Deserialization(format!("Invalid side: {}", row.side))),
+            _ => return Err(StoreError::Deserialization(format!("Invalid side: {}", row_data.side))),
         };
 
         // Create base position
-        let mut position = Position::new(row.account_id, symbol, side);
-        position.id = row.position_id;
+        let mut position = Position::new(row_data.account_id, symbol, side);
+        position.id = row_data.position_id;
 
         // Set entry data
-        if let Some(entry_price) = row.entry_price {
+        if let Some(entry_price) = row_data.entry_price {
             position.entry_price = Some(Price::new(entry_price).map_err(|e| {
                 StoreError::Deserialization(format!("Invalid entry_price {}: {}", entry_price, e))
             })?);
         }
 
-        if let Some(entry_quantity) = row.entry_quantity {
+        if let Some(entry_quantity) = row_data.entry_quantity {
             position.quantity = Quantity::new(entry_quantity).map_err(|e| {
                 StoreError::Deserialization(format!("Invalid entry_quantity {}: {}", entry_quantity, e))
             })?;
         }
 
         // Set tech stop distance
-        if let (Some(distance), Some(stop_price)) =
-            (row.technical_stop_distance, row.technical_stop_price)
+        if let (Some(_distance), Some(stop_price)) =
+            (row_data.technical_stop_distance, row_data.technical_stop_price)
         {
             let entry = position.entry_price.ok_or_else(|| {
                 StoreError::Deserialization("Missing entry_price for technical stop".to_string())
@@ -176,28 +230,26 @@ pub async fn find_active_from_projection(
         }
 
         // Set state based on row
-        // For now, we only restore Armed positions to be conservative
-        // Active positions will need to be reconstructed with full state
-        match row.state.as_str() {
+        match row_data.state.as_str() {
             "armed" => {
                 position.state = robson_domain::PositionState::Armed;
             }
             "active" => {
                 // For Active positions, we need to reconstruct the full Active state
                 // This requires: current_price, trailing_stop, favorable_extreme, extreme_at
-                let current_price = row
+                let current_price = row_data
                     .entry_price
                     .ok_or_else(|| StoreError::Deserialization("Missing entry_price for active position".to_string()))?;
 
-                let trailing_stop = row
+                let trailing_stop = row_data
                     .trailing_stop_price
                     .ok_or_else(|| StoreError::Deserialization("Missing trailing_stop_price for active position".to_string()))?;
 
-                let favorable_extreme = row.favorable_extreme.ok_or_else(|| {
+                let favorable_extreme = row_data.favorable_extreme.ok_or_else(|| {
                     StoreError::Deserialization("Missing favorable_extreme for active position".to_string())
                 })?;
 
-                let extreme_at = row.extreme_at.ok_or_else(|| {
+                let extreme_at = row_data.extreme_at.ok_or_else(|| {
                     StoreError::Deserialization("Missing extreme_at for active position".to_string())
                 })?;
 
@@ -213,7 +265,7 @@ pub async fn find_active_from_projection(
                     })?,
                     extreme_at,
                     insurance_stop_id: None,
-                    last_emitted_stop: row.trailing_stop_price.map(|p| Price::new(p).unwrap()),
+                    last_emitted_stop: row_data.trailing_stop_price.map(|p| Price::new(p).unwrap()),
                 };
             }
             _ => {
@@ -223,8 +275,8 @@ pub async fn find_active_from_projection(
         }
 
         // Set timestamps
-        position.created_at = row.created_at;
-        position.updated_at = row.updated_at;
+        position.created_at = row_data.created_at;
+        position.updated_at = row_data.updated_at;
 
         positions.push(position);
     }
@@ -246,43 +298,17 @@ mod tests {
     /// - Provides a PgPool for the test
     /// - Rolls back the transaction at the end
     ///
-    /// Run with: `cargo test -p robson-store --features postgres -- postgres_tests`
-    #[sqlx::test(migrations = "../migrations")]
+    /// Run with: `cargo test -p robson-store --features postgres`
+    #[sqlx::test(migrations = "../../../migrations")]
     async fn test_projection_recovery_restores_active_position(pool: PgPool) {
-        // 1. Create the positions_current projection table
-        sqlx::query(
-            r#"
-            CREATE TABLE positions_current (
-                position_id UUID PRIMARY KEY,
-                tenant_id UUID NOT NULL,
-                account_id UUID NOT NULL,
-                strategy_id UUID NOT NULL,
-                symbol VARCHAR(20) NOT NULL,
-                side VARCHAR(10) NOT NULL,
-                state VARCHAR(20) NOT NULL,
-                entry_price DECIMAL(20, 8),
-                entry_quantity DECIMAL(20, 8),
-                trailing_stop_price DECIMAL(20, 8),
-                favorable_extreme DECIMAL(20, 8),
-                extreme_at TIMESTAMPTZ,
-                technical_stop_distance DECIMAL(20, 8),
-                technical_stop_price DECIMAL(20, 8),
-                created_at TIMESTAMPTZ NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL
-            )
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to create positions_current table");
-
-        // 2. Insert a test ACTIVE position
+        // 1. Insert a test ACTIVE position directly into positions_current
         let tenant_id = Uuid::now_v7();
         let position_id = Uuid::now_v7();
         let account_id = Uuid::now_v7();
         let strategy_id = Uuid::now_v7();
         let now = Utc::now();
 
+        // Note: We use dynamic query to avoid sqlx::query! macro requiring DATABASE_URL
         sqlx::query(
             r#"
             INSERT INTO positions_current (
@@ -291,8 +317,10 @@ mod tests {
                 entry_price, entry_quantity,
                 trailing_stop_price, favorable_extreme, extreme_at,
                 technical_stop_distance, technical_stop_price,
+                current_quantity,
+                last_event_id, last_seq,
                 created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19)
             "#,
         )
         .bind(position_id)
@@ -309,20 +337,23 @@ mod tests {
         .bind(now)
         .bind(dec!(1500))
         .bind(dec!(93500))
+        .bind(dec!(0.01))
+        .bind(Uuid::now_v7())
+        .bind(1i64)
         .bind(now)
         .bind(now)
         .execute(&pool)
         .await
         .expect("Failed to insert test position");
 
-        // 3. Create PgProjectionReader and restore positions
+        // 2. Create PgProjectionReader and restore positions
         let reader = PgProjectionReader::new(Arc::new(pool));
         let restored = reader
             .find_active_from_projection(tenant_id)
             .await
             .expect("Failed to restore positions");
 
-        // 4. Verify the position was restored
+        // 3. Verify the position was restored
         assert_eq!(restored.len(), 1, "Should restore 1 position");
 
         let pos = &restored[0];
@@ -356,36 +387,11 @@ mod tests {
         assert_eq!(tech_stop.distance_pct, dec!(1.57894736842105260000)); // ~1.58%
     }
 
-    #[sqlx::test(migrations = "../migrations")]
+    #[sqlx::test(migrations = "../../../migrations")]
     async fn test_projection_recovery_skips_closed_positions(pool: PgPool) {
-        // Create the positions_current projection table
-        sqlx::query(
-            r#"
-            CREATE TABLE positions_current (
-                position_id UUID PRIMARY KEY,
-                tenant_id UUID NOT NULL,
-                account_id UUID NOT NULL,
-                strategy_id UUID NOT NULL,
-                symbol VARCHAR(20) NOT NULL,
-                side VARCHAR(10) NOT NULL,
-                state VARCHAR(20) NOT NULL,
-                entry_price DECIMAL(20, 8),
-                entry_quantity DECIMAL(20, 8),
-                trailing_stop_price DECIMAL(20, 8),
-                favorable_extreme DECIMAL(20, 8),
-                extreme_at TIMESTAMPTZ,
-                technical_stop_distance DECIMAL(20, 8),
-                technical_stop_price DECIMAL(20, 8),
-                created_at TIMESTAMPTZ NOT NULL,
-                updated_at TIMESTAMPTZ NOT NULL
-            )
-            "#,
-        )
-        .execute(&pool)
-        .await
-        .expect("Failed to create positions_current table");
-
         let tenant_id = Uuid::now_v7();
+        let account_id = Uuid::now_v7();
+        let strategy_id = Uuid::now_v7();
         let now = Utc::now();
 
         // Insert an ARMED position (should be restored)
@@ -397,19 +403,24 @@ mod tests {
                 entry_price, entry_quantity,
                 trailing_stop_price, favorable_extreme, extreme_at,
                 technical_stop_distance, technical_stop_price,
+                current_quantity,
+                last_event_id, last_seq,
                 created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, NULL, NULL, NULL, $10, $11)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, NULL, NULL, NULL, $10, $11, $12, $13, $14)
             "#,
         )
         .bind(Uuid::now_v7())
         .bind(tenant_id)
-        .bind(Uuid::now_v7())
-        .bind(Uuid::now_v7())
+        .bind(account_id)
+        .bind(strategy_id)
         .bind("BTCUSDT")
         .bind("long")
         .bind("armed")
         .bind(dec!(95000))
         .bind(dec!(0.01))
+        .bind(dec!(0.01))
+        .bind(Uuid::now_v7())
+        .bind(1i64)
         .bind(now)
         .bind(now)
         .execute(&pool)
@@ -425,19 +436,24 @@ mod tests {
                 entry_price, entry_quantity,
                 trailing_stop_price, favorable_extreme, extreme_at,
                 technical_stop_distance, technical_stop_price,
+                current_quantity,
+                last_event_id, last_seq,
                 created_at, updated_at
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, NULL, NULL, NULL, $10, $11)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, NULL, NULL, NULL, $10, $11, $12, $13, $14)
             "#,
         )
         .bind(Uuid::now_v7())
         .bind(tenant_id)
-        .bind(Uuid::now_v7())
-        .bind(Uuid::now_v7())
+        .bind(account_id)
+        .bind(strategy_id)
         .bind("BTCUSDT")
         .bind("long")
         .bind("closed")
         .bind(dec!(95000))
         .bind(dec!(0.01))
+        .bind(dec!(0.01))
+        .bind(Uuid::now_v7())
+        .bind(2i64)
         .bind(now)
         .bind(now)
         .execute(&pool)

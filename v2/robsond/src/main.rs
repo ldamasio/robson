@@ -31,8 +31,13 @@ mod db;
 
 use db::run_db_command;
 use robsond::{Config, Daemon};
+use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+
+// Optional PostgreSQL dependencies (only available with postgres feature)
+#[cfg(feature = "postgres")]
+use robson_store::PgProjectionReader;
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -61,9 +66,41 @@ async fn main() -> anyhow::Result<()> {
         "Robson v2 Daemon"
     );
 
-    // Create and run daemon
-    let daemon = Daemon::new_stub(config);
-    daemon.run().await?;
+    // Create daemon with or without PostgreSQL projection recovery
+    #[cfg(feature = "postgres")]
+    {
+        // If DATABASE_URL is set and tenant_id is configured, create PgPool and projection recovery
+        if let (Some(database_url), Some(tenant_id)) = (
+            &config.projection.database_url,
+            config.projection.tenant_id,
+        ) {
+            info!(
+                %tenant_id,
+                "PostgreSQL configured, enabling projection recovery"
+            );
+
+            // Create PostgreSQL connection pool
+            let pool = sqlx::PgPool::connect(database_url).await?;
+
+            // Create projection recovery adapter
+            let projection_recovery = Some(Arc::new(PgProjectionReader::new(Arc::new(pool))) as Arc<dyn robson_store::ProjectionRecovery>);
+
+            // Create daemon with projection recovery
+            let daemon = Daemon::new_stub_with_projection(config, projection_recovery);
+            daemon.run().await?;
+        } else {
+            info!("No DATABASE_URL or PROJECTION_TENANT_ID configured, using stub daemon");
+            let daemon = Daemon::new_stub(config);
+            daemon.run().await?;
+        }
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    {
+        // Without postgres feature, always use stub daemon
+        let daemon = Daemon::new_stub(config);
+        daemon.run().await?;
+    }
 
     Ok(())
 }

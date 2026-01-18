@@ -44,3 +44,5 @@ chrono = { workspace = true }
 rust_decimal_macros = { workspace = true }
 reqwest = { version = "0.12", features = ["json"] }
 http-body-util = "0.1"
+robson-eventlog = { path = "../robson-eventlog" }
+robson-projector = { path = "../robson-projector" }

@@ -93,6 +93,40 @@ impl Daemon<StubExchange, MemoryStore> {
             projection_recovery: None,
         }
     }
+
+    /// Create a new daemon with stub components and projection recovery.
+    ///
+    /// This is used in production when PostgreSQL is configured for crash recovery.
+    #[cfg(feature = "postgres")]
+    pub fn new_stub_with_projection(
+        config: Config,
+        projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
+    ) -> Self {
+        use robson_domain::RiskConfig;
+
+        let exchange = Arc::new(StubExchange::new(dec!(95000)));
+        let journal = Arc::new(IntentJournal::new());
+        let store = Arc::new(MemoryStore::new());
+        let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+        let event_bus = Arc::new(EventBus::new(1000));
+        let risk_config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(risk_config);
+
+        let position_manager = Arc::new(RwLock::new(PositionManager::new(
+            engine,
+            executor,
+            store.clone(),
+            event_bus.clone(),
+        )));
+
+        Self {
+            config,
+            position_manager,
+            event_bus,
+            store,
+            projection_recovery,
+        }
+    }
 }
 
 impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
@@ -112,6 +146,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             #[cfg(feature = "postgres")]
             projection_recovery,
         }
+    }
+
+    /// Get a reference to the store (for testing).
+    pub fn store(&self) -> &Arc<S> {
+        &self.store
     }
 
     /// Run the daemon.
