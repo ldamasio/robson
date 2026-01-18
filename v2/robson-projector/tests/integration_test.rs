@@ -1,0 +1,382 @@
+//! Integration tests for robson-projector
+//!
+//! Tests event handlers against a test database using sqlx-test fixtures.
+
+use chrono::Utc;
+use robson_eventlog::{ActorType, Event, EventEnvelope};
+use robson_projector::apply_event_to_projections;
+use rust_decimal::Decimal;
+use uuid::Uuid;
+
+/// Test helper: Create an event envelope from an event
+fn make_envelope(
+    stream_key: &str,
+    event_type: &str,
+    payload: serde_json::Value,
+    seq: i64,
+) -> EventEnvelope {
+    EventEnvelope {
+        event_id: Uuid::new_v4(),
+        tenant_id: Uuid::new_v4(),
+        stream_key: stream_key.to_string(),
+        seq,
+        event_type: event_type.to_string(),
+        payload,
+        payload_schema_version: 1,
+        occurred_at: Utc::now(),
+        ingested_at: Utc::now(),
+        idempotency_key: format!("{}:{}:{}", stream_key, seq, event_type),
+        trace_id: None,
+        causation_id: None,
+        command_id: None,
+        workflow_id: None,
+        actor_type: Some(ActorType::CLI),
+        actor_id: Some("test-user".to_string()),
+        prev_hash: None,
+        hash: None,
+    }
+}
+
+// =============================================================================
+// SQLX-TEST: These tests require DATABASE_URL to be set
+// =============================================================================
+
+#[sqlx::test]
+async fn test_order_submitted_creates_projection(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    // Arrange
+    let order_id = Uuid::new_v4();
+    let tenant_id = Uuid::new_v4();
+    let account_id = Uuid::new_v4();
+
+    let payload = serde_json::json!({
+        "order_id": order_id,
+        "tenant_id": tenant_id,
+        "account_id": account_id,
+        "position_id": null,
+        "client_order_id": "client-123",
+        "symbol": "BTCUSDT",
+        "side": "buy",
+        "order_type": "limit",
+        "quantity": "0.1",
+        "price": "50000",
+        "stop_price": null
+    });
+
+    let envelope = make_envelope("order:test", "ORDER_SUBMITTED", payload, 1);
+
+    // Act
+    let result = apply_event_to_projections(&pool, &envelope).await;
+    assert!(result.is_ok());
+
+    // Assert
+    let (status, last_seq): (String, i64) = sqlx::query_as(
+        "SELECT status, last_seq FROM orders_current WHERE order_id = $1"
+    )
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await?;
+
+    assert_eq!(status, "pending");
+    assert_eq!(last_seq, 1);
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn test_order_acked_updates_projection(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    // Arrange
+    let order_id = Uuid::new_v4();
+    let tenant_id = Uuid::new_v4();
+    let account_id = Uuid::new_v4();
+
+    // First submit
+    let submit_payload = serde_json::json!({
+        "order_id": order_id,
+        "tenant_id": tenant_id,
+        "account_id": account_id,
+        "position_id": null,
+        "client_order_id": "client-123",
+        "symbol": "BTCUSDT",
+        "side": "buy",
+        "order_type": "limit",
+        "quantity": "0.1",
+        "price": "50000",
+        "stop_price": null
+    });
+    let submit_env = make_envelope("order:test", "ORDER_SUBMITTED", submit_payload, 1);
+    apply_event_to_projections(&pool, &submit_env).await.unwrap();
+
+    // Act: Ack the order
+    let ack_payload = serde_json::json!({
+        "order_id": order_id,
+        "exchange_order_id": "exchange-456"
+    });
+    let ack_env = make_envelope("order:test", "ORDER_ACKED", ack_payload, 2);
+    apply_event_to_projections(&pool, &ack_env).await.unwrap();
+
+    // Assert
+    let (status, exchange_order_id, last_seq): (String, String, i64) = sqlx::query_as(
+        "SELECT status, COALESCE(exchange_order_id, ''), last_seq FROM orders_current WHERE order_id = $1"
+    )
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await?;
+
+    assert_eq!(status, "acknowledged");
+    assert_eq!(exchange_order_id, "exchange-456");
+    assert_eq!(last_seq, 2);
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn test_position_opened_enforces_invariants(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    // Arrange
+    let position_id = Uuid::new_v4();
+    let tenant_id = Uuid::new_v4();
+    let account_id = Uuid::new_v4();
+
+    let payload = serde_json::json!({
+        "position_id": position_id,
+        "tenant_id": tenant_id,
+        "account_id": account_id,
+        "strategy_id": null,
+        "symbol": "BTCUSDT",
+        "side": "long",
+        "entry_price": "50000",
+        "entry_quantity": "0.1",
+        "entry_filled_at": null,
+        "technical_stop_price": "49000",
+        "technical_stop_distance": "1000",
+        "entry_order_id": null,
+        "stop_loss_order_id": null
+    });
+
+    let envelope = make_envelope("position:test", "POSITION_OPENED", payload, 1);
+
+    // Act
+    let result = apply_event_to_projections(&pool, &envelope).await;
+
+    // Assert - should succeed
+    assert!(result.is_ok());
+
+    let (state, trailing_stop): (String, Option<Decimal>) = sqlx::query_as(
+        "SELECT state, trailing_stop_price FROM positions_current WHERE position_id = $1"
+    )
+    .bind(position_id)
+    .fetch_one(&pool)
+    .await?;
+
+    assert_eq!(state, "armed");
+    // INVARIANT: trailing_stop should be anchored to technical_stop_price
+    assert_eq!(trailing_stop, Some(Decimal::from(49000)));
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn test_position_opened_rejects_zero_stop_distance(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    // Arrange - invalid payload with zero stop distance
+    let position_id = Uuid::new_v4();
+    let tenant_id = Uuid::new_v4();
+    let account_id = Uuid::new_v4();
+
+    let payload = serde_json::json!({
+        "position_id": position_id,
+        "tenant_id": tenant_id,
+        "account_id": account_id,
+        "strategy_id": null,
+        "symbol": "BTCUSDT",
+        "side": "long",
+        "entry_price": "50000",
+        "entry_quantity": "0.1",
+        "entry_filled_at": null,
+        "technical_stop_price": "50000",
+        "technical_stop_distance": "0",
+        "entry_order_id": null,
+        "stop_loss_order_id": null
+    });
+
+    let envelope = make_envelope("position:test", "POSITION_OPENED", payload, 1);
+
+    // Act
+    let result = apply_event_to_projections(&pool, &envelope).await;
+
+    // Assert - should fail invariant check
+    assert!(result.is_err());
+    let err = result.unwrap_err();
+    assert!(err.to_string().contains("InvariantViolated"));
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn test_fill_received_idempotent(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    // Arrange
+    let order_id = Uuid::new_v4();
+    let tenant_id = Uuid::new_v4();
+    let account_id = Uuid::new_v4();
+
+    // Submit order first
+    let submit_payload = serde_json::json!({
+        "order_id": order_id,
+        "tenant_id": tenant_id,
+        "account_id": account_id,
+        "position_id": null,
+        "client_order_id": "client-123",
+        "symbol": "BTCUSDT",
+        "side": "buy",
+        "order_type": "limit",
+        "quantity": "0.1",
+        "price": "50000",
+        "stop_price": null
+    });
+    let submit_env = make_envelope("order:test", "ORDER_SUBMITTED", submit_payload, 1);
+    apply_event_to_projections(&pool, &submit_env).await.unwrap();
+
+    let fill_payload = serde_json::json!({
+        "fill_id": Uuid::new_v4(),
+        "tenant_id": tenant_id,
+        "account_id": account_id,
+        "order_id": order_id,
+        "exchange_order_id": "exchange-456",
+        "exchange_trade_id": "trade-789",
+        "symbol": "BTCUSDT",
+        "side": "buy",
+        "fill_price": "50000",
+        "fill_quantity": "0.1",
+        "fee": "0.001",
+        "fee_asset": "BTC",
+        "is_maker": true,
+        "filled_at": Utc::now()
+    });
+
+    let fill_env = make_envelope("order:test", "FILL_RECEIVED", fill_payload.clone(), 2);
+
+    // Act: Apply twice
+    apply_event_to_projections(&pool, &fill_env).await.unwrap();
+    apply_event_to_projections(&pool, &fill_env).await.unwrap();
+
+    // Assert: filled_quantity should only be applied once
+    let (filled_quantity,): (Decimal,) = sqlx::query_as(
+        "SELECT filled_quantity FROM orders_current WHERE order_id = $1"
+    )
+    .bind(order_id)
+    .fetch_one(&pool)
+    .await?;
+
+    assert_eq!(filled_quantity, Decimal::from(1)); // Not 2!
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn test_strategy_enabled(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    // Arrange
+    let strategy_id = Uuid::new_v4();
+    let tenant_id = Uuid::new_v4();
+    let account_id = Uuid::new_v4();
+
+    let payload = serde_json::json!({
+        "strategy_id": strategy_id,
+        "tenant_id": tenant_id,
+        "account_id": account_id,
+        "strategy_name": "Mean Reversion MA99",
+        "strategy_type": "trend_following",
+        "detector_config": null,
+        "risk_config": {"max_risk_percent": "1.0"}
+    });
+
+    let envelope = make_envelope("strategy:test", "STRATEGY_ENABLED", payload, 1);
+
+    // Act
+    let result = apply_event_to_projections(&pool, &envelope).await;
+
+    // Assert
+    assert!(result.is_ok());
+
+    let (is_enabled, strategy_name): (bool, String) = sqlx::query_as(
+        "SELECT is_enabled, strategy_name FROM strategy_state_current WHERE strategy_id = $1"
+    )
+    .bind(strategy_id)
+    .fetch_one(&pool)
+    .await?;
+
+    assert!(is_enabled);
+    assert_eq!(strategy_name, "Mean Reversion MA99");
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn test_balance_sampled(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    // Arrange
+    let balance_id = Uuid::new_v4();
+    let tenant_id = Uuid::new_v4();
+    let account_id = Uuid::new_v4();
+
+    let payload = serde_json::json!({
+        "balance_id": balance_id,
+        "tenant_id": tenant_id,
+        "account_id": account_id,
+        "asset": "BTC",
+        "free": "1.5",
+        "locked": "0.5",
+        "sampled_at": Utc::now()
+    });
+
+    let envelope = make_envelope("account:test", "BALANCE_SAMPLED", payload, 1);
+
+    // Act
+    let result = apply_event_to_projections(&pool, &envelope).await;
+
+    // Assert
+    assert!(result.is_ok());
+
+    let (free, locked, total): (Decimal, Decimal, Decimal) = sqlx::query_as(
+        "SELECT free, locked, total FROM balances_current WHERE balance_id = $1"
+    )
+    .bind(balance_id)
+    .fetch_one(&pool)
+    .await?;
+
+    assert_eq!(free, Decimal::from(15) / Decimal::from(10)); // 1.5
+    assert_eq!(locked, Decimal::from(5) / Decimal::from(10)); // 0.5
+    assert_eq!(total, Decimal::from(2)); // 1.5 + 0.5
+
+    Ok(())
+}
+
+#[sqlx::test]
+async fn test_risk_check_failed(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    // Arrange
+    let tenant_id = Uuid::new_v4();
+    let account_id = Uuid::new_v4();
+
+    let payload = serde_json::json!({
+        "tenant_id": tenant_id,
+        "account_id": account_id,
+        "strategy_id": null,
+        "violation_reason": "Daily loss limit exceeded"
+    });
+
+    let envelope = make_envelope("account:test", "RISK_CHECK_FAILED", payload, 1);
+
+    // Act
+    let result = apply_event_to_projections(&pool, &envelope).await;
+
+    // Assert
+    assert!(result.is_ok());
+
+    let (is_violated, reason): (bool, Option<String>) = sqlx::query_as(
+        "SELECT is_violated, violation_reason FROM risk_state_current WHERE account_id = $1"
+    )
+    .bind(account_id)
+    .fetch_one(&pool)
+    .await?;
+
+    assert!(is_violated);
+    assert_eq!(reason, Some("Daily loss limit exceeded".to_string()));
+
+    Ok(())
+}
