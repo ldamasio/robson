@@ -162,17 +162,18 @@ async fn test_trailing_stop_updated_monotonic(pool: PgPool) {
 
     append_and_project(&pool, update1).await;
 
-    // Verify monotonic update
-    let row1: (Option<rust_decimal::Decimal>, Option<rust_decimal::Decimal>) = sqlx::query_as(
-        "SELECT trailing_stop_price, favorable_extreme FROM positions_current WHERE position_id = $1"
+    // Verify monotonic update (all 3 fields)
+    let row1: (Option<rust_decimal::Decimal>, Option<rust_decimal::Decimal>, Option<chrono::DateTime<chrono::Utc>>) = sqlx::query_as(
+        "SELECT trailing_stop_price, favorable_extreme, extreme_at FROM positions_current WHERE position_id = $1"
     )
     .bind(position_id)
     .fetch_one(&pool)
     .await
     .unwrap();
 
-    assert_eq!(row1.0, Some(dec!(95000.0)));
-    assert_eq!(row1.1, Some(dec!(96500.0)));
+    assert_eq!(row1.0, Some(dec!(95000.0))); // trailing_stop_price
+    assert_eq!(row1.1, Some(dec!(96500.0))); // favorable_extreme
+    assert!(row1.2.is_some()); // extreme_at is set
 
     // Event 2: Another update (price to 97000, stop to 95500)
     let update2 = Event::new(
