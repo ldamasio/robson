@@ -15,10 +15,17 @@
 BEGIN;
 
 -- =============================================================================
+-- 0. EXTENSIONS
+-- =============================================================================
+
+-- Required for gen_random_uuid() and UUID operations
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+
+-- =============================================================================
 -- 1. EVENT LOG (Append-Only, Partitioned)
 -- =============================================================================
 
-CREATE TABLE event_log (
+CREATE TABLE IF NOT EXISTS event_log (
     -- Identity
     event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
     tenant_id UUID NOT NULL,
@@ -76,13 +83,7 @@ CREATE INDEX idx_event_log_position_events ON event_log(tenant_id, (payload->>'p
 CREATE INDEX idx_event_log_order_events ON event_log(tenant_id, (payload->>'order_id'), occurred_at DESC)
     WHERE payload ? 'order_id';
 
--- Create initial partitions (current month + 2 future months)
-CREATE TABLE event_log_2024_01 PARTITION OF event_log
-    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
-CREATE TABLE event_log_2024_02 PARTITION OF event_log
-    FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
-CREATE TABLE event_log_2024_03 PARTITION OF event_log
-    FOR VALUES FROM ('2024-03-01') TO ('2024-04-01');
+-- Note: Partitions will be created dynamically via create_event_log_partitions() at end of migration
 
 COMMENT ON TABLE event_log IS 'Append-only event log for audit trail and state reconstruction';
 COMMENT ON COLUMN event_log.stream_key IS 'Logical partition key (e.g., position:{uuid})';
@@ -361,13 +362,7 @@ CREATE INDEX idx_snapshots_scope ON snapshots(snapshot_scope, scope_id, as_of_ti
 CREATE INDEX idx_snapshots_event ON snapshots(as_of_event_id);
 CREATE INDEX idx_snapshots_created ON snapshots(created_at DESC);
 
--- Create initial snapshot partitions
-CREATE TABLE snapshots_2024_01 PARTITION OF snapshots
-    FOR VALUES FROM ('2024-01-01') TO ('2024-02-01');
-CREATE TABLE snapshots_2024_02 PARTITION OF snapshots
-    FOR VALUES FROM ('2024-02-01') TO ('2024-03-01');
-CREATE TABLE snapshots_2024_03 PARTITION OF snapshots
-    FOR VALUES FROM ('2024-03-01') TO ('2024-04-01');
+-- Note: Partitions will be created dynamically via create_snapshot_partitions() at end of migration
 
 COMMENT ON TABLE snapshots IS 'Periodic snapshots for optimization of replay';
 
@@ -499,7 +494,8 @@ DECLARE
     end_date DATE;
     partition_name TEXT;
 BEGIN
-    FOR i IN 1..months_ahead LOOP
+    -- Create current month + N future months (i=0 to months_ahead)
+    FOR i IN 0..months_ahead LOOP
         start_date := DATE_TRUNC('month', NOW() + (i || ' months')::INTERVAL)::DATE;
         end_date := (start_date + INTERVAL '1 month')::DATE;
         partition_name := 'event_log_' || TO_CHAR(start_date, 'YYYY_MM');
@@ -528,7 +524,8 @@ DECLARE
     end_date DATE;
     partition_name TEXT;
 BEGIN
-    FOR i IN 1..months_ahead LOOP
+    -- Create current month + N future months (i=0 to months_ahead)
+    FOR i IN 0..months_ahead LOOP
         start_date := DATE_TRUNC('month', NOW() + (i || ' months')::INTERVAL)::DATE;
         end_date := (start_date + INTERVAL '1 month')::DATE;
         partition_name := 'snapshots_' || TO_CHAR(start_date, 'YYYY_MM');
@@ -604,9 +601,19 @@ CREATE TRIGGER risk_updated_at BEFORE UPDATE ON risk_state_current
 CREATE TRIGGER strategy_updated_at BEFORE UPDATE ON strategy_state_current
     FOR EACH ROW EXECUTE FUNCTION update_updated_at_column();
 
+-- =============================================================================
+-- 7. INITIALIZE PARTITIONS
+-- =============================================================================
+
+-- Create current month + 2 future months for event_log (total: 3 partitions)
+SELECT create_event_log_partitions(2);
+
+-- Create current month + 2 future months for snapshots (total: 3 partitions)
+SELECT create_snapshot_partitions(2);
+
 COMMIT;
 
 -- Post-migration notes:
--- 1. Run: SELECT create_event_log_partitions(3); to create more future partitions
--- 2. Schedule monthly cron: psql -c "SELECT create_event_log_partitions(3);"
+-- 1. Partitions auto-created for current + 2 future months
+-- 2. Schedule monthly cron: psql -c "SELECT create_event_log_partitions(2); SELECT create_snapshot_partitions(2);"
 -- 3. Monitor partition coverage: SELECT * FROM check_partition_coverage();
