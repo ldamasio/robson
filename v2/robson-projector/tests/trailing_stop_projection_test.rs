@@ -1,6 +1,15 @@
 //! DB-backed integration test for trailing stop projections
 //!
 //! Tests that trailing stop events are correctly projected to positions_current table.
+//!
+//! # Running these tests
+//!
+//! These tests require DATABASE_URL to be set:
+//!
+//! ```bash
+//! DATABASE_URL="postgresql://postgres:test@localhost/postgres" \
+//!   cargo test -p robson-projector --test trailing_stop_projection_test -- --ignored
+//! ```
 
 use chrono::Utc;
 use robson_eventlog::{append_event, ActorType, Event};
