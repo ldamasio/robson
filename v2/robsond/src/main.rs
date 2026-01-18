@@ -43,14 +43,14 @@ async fn main() -> anyhow::Result<()> {
         .with(EnvFilter::from_default_env().add_directive("robsond=info".parse()?))
         .init();
 
-    // Parse CLI arguments
-    let args: Vec<String> = std::env::args().collect();
-
     // Check for db subcommand
     #[cfg(feature = "postgres")]
-    if args.len() > 1 && args[1] == "db" {
-        use db::run_db_command;
-        return run_db_command(args).await;
+    {
+        let args: Vec<String> = std::env::args().collect();
+        if args.len() > 1 && args[1] == "db" {
+            use db::run_db_command;
+            return run_db_command(args).await;
+        }
     }
 
     // Default: run daemon
