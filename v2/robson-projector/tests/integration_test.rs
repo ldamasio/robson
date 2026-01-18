@@ -1,9 +1,25 @@
 //! Integration tests for robson-projector
 //!
 //! Tests event handlers against a test database using sqlx-test fixtures.
+//!
+//! # Running these tests
+//!
+//! These tests require a PostgreSQL database with migration 002 applied:
+//!
+//! ```bash
+//! # 1. Start PostgreSQL (example with docker)
+//! docker run --rm -p 5432:5432 -e POSTGRES_PASSWORD=test postgres:16
+//!
+//! # 2. Apply migration 002
+//! psql -h localhost -U postgres -d postgres -f v2/migrations/002_event_log_phase9.sql
+//!
+//! # 3. Run tests
+//! DATABASE_URL="postgresql://postgres:test@localhost/postgres" \
+//!   cargo test -p robson-projector --test integration_test -- --ignored
+//! ```
 
 use chrono::Utc;
-use robson_eventlog::{ActorType, Event, EventEnvelope};
+use robson_eventlog::{ActorType, EventEnvelope};
 use robson_projector::apply_event_to_projections;
 use rust_decimal::Decimal;
 use uuid::Uuid;
@@ -38,10 +54,11 @@ fn make_envelope(
 }
 
 // =============================================================================
-// SQLX-TEST: These tests require DATABASE_URL to be set
+// SQLX-TEST: Integration tests require DATABASE_URL
 // =============================================================================
 
 #[sqlx::test]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_order_submitted_creates_projection(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Arrange
     let order_id = Uuid::new_v4();
@@ -83,6 +100,7 @@ async fn test_order_submitted_creates_projection(pool: sqlx::PgPool) -> sqlx::Re
 }
 
 #[sqlx::test]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_order_acked_updates_projection(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Arrange
     let order_id = Uuid::new_v4();
@@ -130,6 +148,7 @@ async fn test_order_acked_updates_projection(pool: sqlx::PgPool) -> sqlx::Result
 }
 
 #[sqlx::test]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_position_opened_enforces_invariants(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Arrange
     let position_id = Uuid::new_v4();
@@ -175,6 +194,7 @@ async fn test_position_opened_enforces_invariants(pool: sqlx::PgPool) -> sqlx::R
 }
 
 #[sqlx::test]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_position_opened_rejects_zero_stop_distance(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Arrange - invalid payload with zero stop distance
     let position_id = Uuid::new_v4();
@@ -211,6 +231,7 @@ async fn test_position_opened_rejects_zero_stop_distance(pool: sqlx::PgPool) -> 
 }
 
 #[sqlx::test]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_fill_received_idempotent(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Arrange
     let order_id = Uuid::new_v4();
@@ -271,6 +292,7 @@ async fn test_fill_received_idempotent(pool: sqlx::PgPool) -> sqlx::Result<()> {
 }
 
 #[sqlx::test]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_strategy_enabled(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Arrange
     let strategy_id = Uuid::new_v4();
@@ -309,6 +331,7 @@ async fn test_strategy_enabled(pool: sqlx::PgPool) -> sqlx::Result<()> {
 }
 
 #[sqlx::test]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_balance_sampled(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Arrange
     let balance_id = Uuid::new_v4();
@@ -348,6 +371,7 @@ async fn test_balance_sampled(pool: sqlx::PgPool) -> sqlx::Result<()> {
 }
 
 #[sqlx::test]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_risk_check_failed(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Arrange
     let tenant_id = Uuid::new_v4();
