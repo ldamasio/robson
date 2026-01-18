@@ -414,7 +414,7 @@ async fn test_global_idempotency(pool: sqlx::PgPool) -> sqlx::Result<()> {
     let stream_key = "account:global-test";
 
     // Helper to insert via event_idempotency
-    let insert_via_idempotency = |stream_key: &str, seq: i64| -> sqlx::Result<Uuid> {
+    async fn insert_via_idempotency(stream_key: &str, seq: i64, pool: &sqlx::PgPool, tenant_id: Uuid, idempotency_key: &str, account_id: Uuid) -> sqlx::Result<Option<Uuid>> {
         let event_id = Uuid::new_v4();
 
         // First, insert into event_idempotency
@@ -428,7 +428,7 @@ async fn test_global_idempotency(pool: sqlx::PgPool) -> sqlx::Result<()> {
         .bind(tenant_id)
         .bind(idempotency_key)
         .bind(event_id)
-        .execute(&pool)
+        .execute(pool)
         .await?;
 
         // Check if this was a new insert
@@ -437,7 +437,7 @@ async fn test_global_idempotency(pool: sqlx::PgPool) -> sqlx::Result<()> {
         )
         .bind(tenant_id)
         .bind(idempotency_key)
-        .fetch_one(&pool)
+        .fetch_one(pool)
         .await?;
 
         // Now insert into event_log
@@ -466,14 +466,14 @@ async fn test_global_idempotency(pool: sqlx::PgPool) -> sqlx::Result<()> {
         .bind(payload)
         .bind(idempotency_key)
         .bind(event_id)
-        .execute(&pool)
+        .execute(pool)
         .await?;
 
-        Ok(existing)
-    };
+        Ok(Some(existing))
+    }
 
     // First insert - should succeed and create new row
-    let event_id_1 = insert_via_idempotency(stream_key, 1).await?;
+    let event_id_1 = insert_via_idempotency(stream_key, 1, &pool, tenant_id, idempotency_key, account_id).await?;
     assert!(event_id_1.is_some());
 
     // Verify event_log has 1 row
@@ -487,7 +487,7 @@ async fn test_global_idempotency(pool: sqlx::PgPool) -> sqlx::Result<()> {
     assert_eq!(count_1, 1, "First insert should create 1 row");
 
     // Second insert - should be blocked by event_idempotency (ON CONFLICT DO NOTHING)
-    let event_id_2 = insert_via_idempotency(stream_key, 2).await?;
+    let event_id_2 = insert_via_idempotency(stream_key, 2, &pool, tenant_id, idempotency_key, account_id).await?;
     assert!(event_id_2.is_some());
 
     // Verify still only 1 row in event_log (second insert blocked by idempotency)
@@ -504,4 +504,4 @@ async fn test_global_idempotency(pool: sqlx::PgPool) -> sqlx::Result<()> {
     assert_eq!(event_id_1, event_id_2, "Both inserts should return same event_id");
 
     Ok(())
-)
+}

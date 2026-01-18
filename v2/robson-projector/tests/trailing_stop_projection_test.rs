@@ -30,6 +30,7 @@ async fn append_and_project(pool: &PgPool, event: Event) {
 
 /// Test that EntryFilled initializes trailing_stop_price and favorable_extreme
 #[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
 async fn test_entry_filled_initializes_trailing_stop(pool: PgPool) {
     let tenant_id = Uuid::now_v7();
     let account_id = Uuid::now_v7();
@@ -96,6 +97,7 @@ async fn test_entry_filled_initializes_trailing_stop(pool: PgPool) {
 
 /// Test that TrailingStopUpdated updates stop price and favorable_extreme
 #[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
 async fn test_trailing_stop_updated_monotonic(pool: PgPool) {
     let tenant_id = Uuid::now_v7();
     let account_id = Uuid::now_v7();
@@ -207,6 +209,7 @@ async fn test_trailing_stop_updated_monotonic(pool: PgPool) {
 
 /// Test that ExitTriggered marks position as exiting
 #[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
 async fn test_exit_triggered_marks_exiting(pool: PgPool) {
     let tenant_id = Uuid::now_v7();
     let account_id = Uuid::now_v7();
