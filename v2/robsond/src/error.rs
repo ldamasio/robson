@@ -26,11 +26,13 @@ pub enum DaemonError {
     #[error("Store error: {0}")]
     Store(#[from] StoreError),
 
-    /// Database error
+    /// Database error (only available with postgres feature)
+    #[cfg(feature = "postgres")]
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),
 
-    /// Projection error
+    /// Projection error (only available with postgres feature)
+    #[cfg(feature = "postgres")]
     #[error("Projection error: {0}")]
     Projection(#[from] robson_projector::ProjectionError),
 

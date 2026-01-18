@@ -7,7 +7,7 @@ license.workspace = true
 
 [features]
 default = []
-postgres = ["robson-store/postgres"]
+postgres = ["robson-store/postgres", "sqlx"]
 
 [[bin]]
 name = "robsond"
@@ -22,7 +22,7 @@ robson-store = { path = "../robson-store" }
 robson-eventlog = { path = "../robson-eventlog" }
 robson-projector = { path = "../robson-projector" }
 robson-db = { path = "../robson-db" }
-sqlx = { workspace = true }
+sqlx = { workspace = true, optional = true }
 tokio = { workspace = true }
 tokio-util = { version = "0.7" }
 axum = { workspace = true }

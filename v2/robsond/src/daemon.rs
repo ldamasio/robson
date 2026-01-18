@@ -39,6 +39,8 @@ use crate::error::{DaemonError, DaemonResult};
 use crate::event_bus::{DaemonEvent, EventBus};
 use crate::market_data::MarketDataManager;
 use crate::position_manager::PositionManager;
+
+#[cfg(feature = "postgres")]
 use crate::projection_worker::ProjectionWorker;
 
 // Optional projection recovery for crash recovery
@@ -59,9 +61,12 @@ pub struct Daemon<E: ExchangePort + 'static, S: Store + 'static> {
     event_bus: Arc<EventBus>,
     /// Store
     store: Arc<S>,
-    /// Optional projection recovery for crash recovery (PostgreSQL)
+    /// Optional projection recovery for crash recovery (injected trait object)
     #[cfg(feature = "postgres")]
     projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
+    /// Shared PostgreSQL connection pool for projection worker (injected)
+    #[cfg(feature = "postgres")]
+    pg_pool: Option<Arc<sqlx::PgPool>>,
 }
 
 impl Daemon<StubExchange, MemoryStore> {
@@ -91,16 +96,17 @@ impl Daemon<StubExchange, MemoryStore> {
             store,
             #[cfg(feature = "postgres")]
             projection_recovery: None,
+            #[cfg(feature = "postgres")]
+            pg_pool: None,
         }
     }
 
-    /// Create a new daemon with stub components and projection recovery.
-    ///
-    /// This is used in production when PostgreSQL is configured for crash recovery.
+    /// Create a new stub daemon with optional projection recovery and shared pool.
     #[cfg(feature = "postgres")]
-    pub fn new_stub_with_projection(
+    pub fn new_stub_with_recovery(
         config: Config,
         projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
+        pg_pool: Option<Arc<sqlx::PgPool>>,
     ) -> Self {
         use robson_domain::RiskConfig;
 
@@ -125,6 +131,7 @@ impl Daemon<StubExchange, MemoryStore> {
             event_bus,
             store,
             projection_recovery,
+            pg_pool,
         }
     }
 }
@@ -137,6 +144,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         event_bus: Arc<EventBus>,
         store: Arc<S>,
         #[cfg(feature = "postgres")] projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
+        #[cfg(feature = "postgres")] pg_pool: Option<Arc<sqlx::PgPool>>,
     ) -> Self {
         Self {
             config,
@@ -145,6 +153,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             store,
             #[cfg(feature = "postgres")]
             projection_recovery,
+            #[cfg(feature = "postgres")]
+            pg_pool,
         }
     }
 
@@ -181,38 +191,30 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         let _ws_handle = market_data_manager.spawn_ws_client(btcusdt)?;
         info!("WebSocket client spawned for BTCUSDT");
 
-        // 4. Spawn projection worker (if database configured)
-        let projection_handle = match &self.config.projection.database_url {
-            Some(database_url) => match self.config.projection.tenant_id {
-                Some(id) => {
-                    info!(
-                        stream_key = %self.config.projection.stream_key,
-                        %id,
-                        "Starting projection worker"
-                    );
+        // 4. Spawn projection worker (if pg_pool configured)
+        #[cfg(feature = "postgres")]
+        let projection_handle = if let (Some(pool), Some(tenant_id)) = (&self.pg_pool, self.config.projection.tenant_id) {
+            info!(
+                stream_key = %self.config.projection.stream_key,
+                %tenant_id,
+                "Starting projection worker with shared pool"
+            );
 
-                    let pool = sqlx::PgPool::connect(database_url).await?;
-                    let worker = ProjectionWorker::new(pool, self.config.projection.clone(), id);
+            let worker = ProjectionWorker::new((**pool).clone(), self.config.projection.clone(), tenant_id);
 
-                    let worker_shutdown = shutdown.clone();
-                    Some(tokio::spawn(async move {
-                        if let Err(e) = worker.run(worker_shutdown).await {
-                            error!(error = %e, "Projection worker failed");
-                        }
-                    }))
-                },
-                None => {
-                    warn!(
-                        "DATABASE_URL set but PROJECTION_TENANT_ID missing, projection worker disabled"
-                    );
-                    None
-                },
-            },
-            None => {
-                info!("No DATABASE_URL configured, projection worker disabled");
-                None
-            },
+            let worker_shutdown = shutdown.clone();
+            Some(tokio::spawn(async move {
+                if let Err(e) = worker.run(worker_shutdown).await {
+                    error!(error = %e, "Projection worker failed");
+                }
+            }))
+        } else {
+            info!("No projection worker configured");
+            None
         };
+
+        #[cfg(not(feature = "postgres"))]
+        let projection_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         // 5. Subscribe to event bus
         let mut event_receiver = self.event_bus.subscribe();

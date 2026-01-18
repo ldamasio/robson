@@ -43,6 +43,8 @@ pub mod error;
 pub mod event_bus;
 pub mod market_data;
 pub mod position_manager;
+
+#[cfg(feature = "postgres")]
 pub mod projection_worker;
 
 // Re-exports for convenience

@@ -87,10 +87,11 @@ struct PositionCurrentRow {
 /// Helper function to parse a row from positions_current query.
 ///
 /// Uses sqlx::Row trait with rust_decimal feature enabled.
+/// For nullable columns, we use try_get::<Option<Decimal>, _>() to handle NULL values correctly.
 fn parse_position_row(row: &sqlx::postgres::PgRow) -> Result<PositionCurrentRow, sqlx::Error> {
-    // Helper to get optional decimal values
+    // Helper to get optional decimal values (handles NULL correctly)
     let try_get_decimal = |column: &str| -> Option<Decimal> {
-        row.try_get::<Decimal, _>(column).ok()
+        row.try_get::<Option<Decimal>, _>(column).ok().flatten()
     };
 
     Ok(PositionCurrentRow {
@@ -298,8 +299,9 @@ mod tests {
     /// - Provides a PgPool for the test
     /// - Rolls back the transaction at the end
     ///
-    /// Run with: `cargo test -p robson-store --features postgres`
-    #[sqlx::test(migrations = "../../../migrations")]
+    /// Run with: `DATABASE_URL=postgresql://localhost/test cargo test -p robson-store --features postgres -- --ignored`
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
     async fn test_projection_recovery_restores_active_position(pool: PgPool) {
         // 1. Insert a test ACTIVE position directly into positions_current
         let tenant_id = Uuid::now_v7();
@@ -387,7 +389,8 @@ mod tests {
         assert_eq!(tech_stop.distance_pct, dec!(1.57894736842105260000)); // ~1.58%
     }
 
-    #[sqlx::test(migrations = "../../../migrations")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
     async fn test_projection_recovery_skips_closed_positions(pool: PgPool) {
         let tenant_id = Uuid::now_v7();
         let account_id = Uuid::now_v7();
