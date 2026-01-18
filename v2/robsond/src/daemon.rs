@@ -11,7 +11,7 @@
 //!
 //! 1. Load configuration
 //! 2. Initialize components
-//! 3. Restore active positions from store
+//! 3. Restore active positions from store/projection
 //! 4. Start API server
 //! 5. Spawn WebSocket clients (market data)
 //! 6. Spawn projection worker (if database configured)
@@ -41,6 +41,10 @@ use crate::market_data::MarketDataManager;
 use crate::position_manager::PositionManager;
 use crate::projection_worker::ProjectionWorker;
 
+// Optional projection recovery for crash recovery
+#[cfg(feature = "postgres")]
+use robson_store::ProjectionRecovery;
+
 // =============================================================================
 // Daemon
 // =============================================================================
@@ -55,6 +59,9 @@ pub struct Daemon<E: ExchangePort + 'static, S: Store + 'static> {
     event_bus: Arc<EventBus>,
     /// Store
     store: Arc<S>,
+    /// Optional projection recovery for crash recovery (PostgreSQL)
+    #[cfg(feature = "postgres")]
+    projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
 }
 
 impl Daemon<StubExchange, MemoryStore> {
@@ -82,6 +89,8 @@ impl Daemon<StubExchange, MemoryStore> {
             position_manager,
             event_bus,
             store,
+            #[cfg(feature = "postgres")]
+            projection_recovery: None,
         }
     }
 }
@@ -93,12 +102,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         position_manager: Arc<RwLock<PositionManager<E, S>>>,
         event_bus: Arc<EventBus>,
         store: Arc<S>,
+        #[cfg(feature = "postgres")] projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
     ) -> Self {
         Self {
             config,
             position_manager,
             event_bus,
             store,
+            #[cfg(feature = "postgres")]
+            projection_recovery,
         }
     }
 
@@ -215,18 +227,58 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         Ok(())
     }
 
-    /// Restore active positions from store.
+    /// Restore active positions from store or projection.
+    ///
+    /// First tries to restore from the in-memory store.
+    /// If projection_recovery is configured and store is empty,
+    /// falls back to reading from the PostgreSQL projection.
     async fn restore_positions(&self) -> DaemonResult<()> {
+        // First, try to restore from the store
         let positions = self.store.positions().find_active().await?;
-        let count = positions.len();
+        let store_count = positions.len();
 
-        if count > 0 {
-            info!(count, "Restored active positions from store");
+        if store_count > 0 {
+            info!(count = store_count, "Restored active positions from store");
+            return Ok(());
+        }
 
-            // For each Armed position, we'd spawn a detector
-            // For each Active position, we resume monitoring
-            // This will be implemented in Phase 7 (Detector Interface)
-        } else {
+        // Store is empty, try projection recovery if available
+        #[cfg(feature = "postgres")]
+        {
+            if let (Some(recovery), Some(tenant_id)) = (&self.projection_recovery, self.config.projection.tenant_id) {
+                info!("Store empty, attempting projection recovery");
+
+                match recovery.find_active_from_projection(tenant_id).await {
+                    Ok(restored_positions) => {
+                        let count = restored_positions.len();
+                        if count > 0 {
+                            // Save restored positions to store
+                            for position in restored_positions {
+                                if let Err(e) = self.store.positions().save(&position).await {
+                                    error!(
+                                        position_id = %position.id,
+                                        error = %e,
+                                        "Failed to save restored position to store"
+                                    );
+                                }
+                            }
+
+                            info!(count, "Restored active positions from projection");
+                        } else {
+                            info!("Projection recovery: no active positions found");
+                        }
+                    }
+                    Err(e) => {
+                        warn!(error = %e, "Projection recovery failed, continuing with empty store");
+                    }
+                }
+            } else {
+                info!("No projection recovery configured, starting with empty store");
+            }
+        }
+
+        #[cfg(not(feature = "postgres"))]
+        {
             info!("No active positions to restore");
         }
 

@@ -42,6 +42,10 @@ pub enum StoreError {
     #[error("Connection error: {0}")]
     Connection(String),
 
+    /// Deserialization error (reading from projection)
+    #[error("Deserialization error: {0}")]
+    Deserialization(String),
+
     /// Domain error passthrough
     #[error("Domain error: {0}")]
     Domain(#[from] robson_domain::DomainError),

@@ -1,13 +1,64 @@
 //! PostgreSQL projection reader for crash recovery.
 //!
-//! This module provides functions to read from the `positions_current`
-//! projection table for crash recovery purposes.
+//! This module provides:
+//! - `ProjectionRecovery` trait for reading positions from projection
+//! - `PgProjectionReader` adapter implementing the trait
+//! - `find_active_from_projection` function for direct access
 
 use crate::error::StoreError;
+use async_trait::async_trait;
 use robson_domain::{Position, Price, Quantity, Side, Symbol, TechnicalStopDistance};
 use rust_decimal::Decimal;
 use sqlx::PgPool;
+use std::sync::Arc;
 use uuid::Uuid;
+
+/// Trait for reading active positions from a projection table.
+///
+/// This trait allows the Daemon to restore positions from the database
+/// projection after a crash, without coupling the Daemon directly to PostgreSQL.
+#[async_trait]
+pub trait ProjectionRecovery: Send + Sync {
+    /// Find active positions from the projection for a given tenant.
+    ///
+    /// Returns positions with states: 'armed', 'active', 'exiting'
+    async fn find_active_from_projection(
+        &self,
+        tenant_id: Uuid,
+    ) -> Result<Vec<Position>, StoreError>;
+}
+
+/// PostgreSQL adapter for reading from the positions_current projection.
+///
+/// This adapter wraps a PgPool and implements `ProjectionRecovery` by
+/// delegating to the `find_active_from_projection` function.
+pub struct PgProjectionReader {
+    /// PostgreSQL connection pool
+    pool: Arc<PgPool>,
+}
+
+impl PgProjectionReader {
+    /// Create a new PostgreSQL projection reader.
+    pub fn new(pool: Arc<PgPool>) -> Self {
+        Self { pool }
+    }
+
+    /// Get a reference to the underlying pool (for testing).
+    pub fn pool(&self) -> &PgPool {
+        &self.pool
+    }
+}
+
+#[async_trait]
+impl ProjectionRecovery for PgProjectionReader {
+    /// Find active positions from the projection table.
+    async fn find_active_from_projection(
+        &self,
+        tenant_id: Uuid,
+    ) -> Result<Vec<Position>, StoreError> {
+        find_active_from_projection(&self.pool, tenant_id).await
+    }
+}
 
 /// Read active positions from the `positions_current` projection table.
 ///
@@ -116,7 +167,11 @@ pub async fn find_active_from_projection(
                 StoreError::Deserialization("Missing entry_price for technical stop".to_string())
             })?;
 
-            let tech_stop = TechnicalStopDistance::new(distance, entry.as_decimal() - stop_price);
+            let stop = Price::new(stop_price).map_err(|e| {
+                StoreError::Deserialization(format!("Invalid technical_stop_price: {}", e))
+            })?;
+
+            let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
             position.tech_stop_distance = Some(tech_stop);
         }
 
@@ -180,7 +235,226 @@ pub async fn find_active_from_projection(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use chrono::Utc;
+    use rust_decimal_macros::dec;
 
-    // Note: These tests require a running PostgreSQL database.
-    // In a real setup, use testcontainers or a separate test database.
+    /// Integration test for projection recovery.
+    ///
+    /// This test uses `sqlx::test` which automatically:
+    /// - Spins up a test database
+    /// - Runs migrations from the migrations/ directory
+    /// - Provides a PgPool for the test
+    /// - Rolls back the transaction at the end
+    ///
+    /// Run with: `cargo test -p robson-store --features postgres -- postgres_tests`
+    #[sqlx::test(migrations = "../migrations")]
+    async fn test_projection_recovery_restores_active_position(pool: PgPool) {
+        // 1. Create the positions_current projection table
+        sqlx::query(
+            r#"
+            CREATE TABLE positions_current (
+                position_id UUID PRIMARY KEY,
+                tenant_id UUID NOT NULL,
+                account_id UUID NOT NULL,
+                strategy_id UUID NOT NULL,
+                symbol VARCHAR(20) NOT NULL,
+                side VARCHAR(10) NOT NULL,
+                state VARCHAR(20) NOT NULL,
+                entry_price DECIMAL(20, 8),
+                entry_quantity DECIMAL(20, 8),
+                trailing_stop_price DECIMAL(20, 8),
+                favorable_extreme DECIMAL(20, 8),
+                extreme_at TIMESTAMPTZ,
+                technical_stop_distance DECIMAL(20, 8),
+                technical_stop_price DECIMAL(20, 8),
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create positions_current table");
+
+        // 2. Insert a test ACTIVE position
+        let tenant_id = Uuid::now_v7();
+        let position_id = Uuid::now_v7();
+        let account_id = Uuid::now_v7();
+        let strategy_id = Uuid::now_v7();
+        let now = Utc::now();
+
+        sqlx::query(
+            r#"
+            INSERT INTO positions_current (
+                position_id, tenant_id, account_id, strategy_id,
+                symbol, side, state,
+                entry_price, entry_quantity,
+                trailing_stop_price, favorable_extreme, extreme_at,
+                technical_stop_distance, technical_stop_price,
+                created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16)
+            "#,
+        )
+        .bind(position_id)
+        .bind(tenant_id)
+        .bind(account_id)
+        .bind(strategy_id)
+        .bind("BTCUSDT")
+        .bind("long")
+        .bind("active")
+        .bind(dec!(95000))
+        .bind(dec!(0.01))
+        .bind(dec!(93500))
+        .bind(dec!(97000))
+        .bind(now)
+        .bind(dec!(1500))
+        .bind(dec!(93500))
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("Failed to insert test position");
+
+        // 3. Create PgProjectionReader and restore positions
+        let reader = PgProjectionReader::new(Arc::new(pool));
+        let restored = reader
+            .find_active_from_projection(tenant_id)
+            .await
+            .expect("Failed to restore positions");
+
+        // 4. Verify the position was restored
+        assert_eq!(restored.len(), 1, "Should restore 1 position");
+
+        let pos = &restored[0];
+        assert_eq!(pos.id, position_id);
+        assert_eq!(pos.account_id, account_id);
+        assert_eq!(pos.symbol.as_pair(), "BTCUSDT");
+
+        // Verify Active state with trailing stop data
+        match &pos.state {
+            robson_domain::PositionState::Active {
+                current_price,
+                trailing_stop,
+                favorable_extreme,
+                extreme_at: _,
+                insurance_stop_id,
+                last_emitted_stop,
+            } => {
+                assert_eq!(current_price.as_decimal(), dec!(95000));
+                assert_eq!(trailing_stop.as_decimal(), dec!(93500));
+                assert_eq!(favorable_extreme.as_decimal(), dec!(97000));
+                assert!(insurance_stop_id.is_none());
+                assert_eq!(last_emitted_stop.as_ref().map(|p| p.as_decimal()), Some(dec!(93500)));
+            }
+            _ => panic!("Expected Active state, got {:?}", pos.state),
+        }
+
+        // Verify technical stop distance
+        assert!(pos.tech_stop_distance.is_some());
+        let tech_stop = pos.tech_stop_distance.as_ref().unwrap();
+        assert_eq!(tech_stop.distance, dec!(1500));
+        assert_eq!(tech_stop.distance_pct, dec!(1.57894736842105260000)); // ~1.58%
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    async fn test_projection_recovery_skips_closed_positions(pool: PgPool) {
+        // Create the positions_current projection table
+        sqlx::query(
+            r#"
+            CREATE TABLE positions_current (
+                position_id UUID PRIMARY KEY,
+                tenant_id UUID NOT NULL,
+                account_id UUID NOT NULL,
+                strategy_id UUID NOT NULL,
+                symbol VARCHAR(20) NOT NULL,
+                side VARCHAR(10) NOT NULL,
+                state VARCHAR(20) NOT NULL,
+                entry_price DECIMAL(20, 8),
+                entry_quantity DECIMAL(20, 8),
+                trailing_stop_price DECIMAL(20, 8),
+                favorable_extreme DECIMAL(20, 8),
+                extreme_at TIMESTAMPTZ,
+                technical_stop_distance DECIMAL(20, 8),
+                technical_stop_price DECIMAL(20, 8),
+                created_at TIMESTAMPTZ NOT NULL,
+                updated_at TIMESTAMPTZ NOT NULL
+            )
+            "#,
+        )
+        .execute(&pool)
+        .await
+        .expect("Failed to create positions_current table");
+
+        let tenant_id = Uuid::now_v7();
+        let now = Utc::now();
+
+        // Insert an ARMED position (should be restored)
+        sqlx::query(
+            r#"
+            INSERT INTO positions_current (
+                position_id, tenant_id, account_id, strategy_id,
+                symbol, side, state,
+                entry_price, entry_quantity,
+                trailing_stop_price, favorable_extreme, extreme_at,
+                technical_stop_distance, technical_stop_price,
+                created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, NULL, NULL, NULL, $10, $11)
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant_id)
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind("BTCUSDT")
+        .bind("long")
+        .bind("armed")
+        .bind(dec!(95000))
+        .bind(dec!(0.01))
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("Failed to insert armed position");
+
+        // Insert a CLOSED position (should NOT be restored)
+        sqlx::query(
+            r#"
+            INSERT INTO positions_current (
+                position_id, tenant_id, account_id, strategy_id,
+                symbol, side, state,
+                entry_price, entry_quantity,
+                trailing_stop_price, favorable_extreme, extreme_at,
+                technical_stop_distance, technical_stop_price,
+                created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, NULL, NULL, NULL, $10, $11)
+            "#,
+        )
+        .bind(Uuid::now_v7())
+        .bind(tenant_id)
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind("BTCUSDT")
+        .bind("long")
+        .bind("closed")
+        .bind(dec!(95000))
+        .bind(dec!(0.01))
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("Failed to insert closed position");
+
+        let reader = PgProjectionReader::new(Arc::new(pool));
+        let restored = reader
+            .find_active_from_projection(tenant_id)
+            .await
+            .expect("Failed to restore positions");
+
+        // Only armed position should be restored (closed is skipped)
+        assert_eq!(restored.len(), 1);
+        match &restored[0].state {
+            robson_domain::PositionState::Armed => {}
+            _ => panic!("Expected Armed state"),
+        }
+    }
 }

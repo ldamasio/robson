@@ -5,6 +5,10 @@ edition.workspace = true
 authors.workspace = true
 license.workspace = true
 
+[features]
+default = []
+postgres = ["robson-store/postgres"]
+
 [[bin]]
 name = "robsond"
 path = "src/main.rs"

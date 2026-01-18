@@ -171,6 +171,7 @@ mod tests {
     fn test_cursor_file_format() {
         let config = ProjectionConfig {
             database_url: None,
+            tenant_id: None,
             stream_key: "robson:daemon".to_string(),
             poll_interval_ms: 100,
         };
