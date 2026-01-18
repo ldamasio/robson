@@ -105,6 +105,38 @@ pub struct PositionClosed {
     pub closed_at: DateTime<Utc>,
 }
 
+/// ENTRY_FILLED payload (entry_filled event from domain)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntryFilled {
+    pub position_id: Uuid,
+    pub order_id: Uuid,
+    pub fill_price: Decimal,
+    pub filled_quantity: Decimal,
+    pub fee: Decimal,
+    pub initial_stop: Decimal,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// TRAILING_STOP_UPDATED payload (trailing_stop_updated event from domain)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrailingStopUpdated {
+    pub position_id: Uuid,
+    pub previous_stop: Decimal,
+    pub new_stop: Decimal,
+    pub trigger_price: Decimal,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// EXIT_TRIGGERED payload (exit_triggered event from domain)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExitTriggered {
+    pub position_id: Uuid,
+    pub reason: String,
+    pub trigger_price: Decimal,
+    pub stop_price: Decimal,
+    pub timestamp: DateTime<Utc>,
+}
+
 // =============================================================================
 // BALANCE EVENTS
 // =============================================================================

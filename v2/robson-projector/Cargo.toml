@@ -22,3 +22,4 @@ tracing = { workspace = true }
 [dev-dependencies]
 tokio = { workspace = true, features = ["test-util"] }
 robson-testkit = { path = "../robson-testkit" }
+rust_decimal_macros = { workspace = true }
