@@ -99,7 +99,7 @@ pub async fn append_event_tx(
 
             Ok(event_id)
         }
-        Err(sqlx::Error::Database(db_err)) if is_unique_violation(&db_err) => {
+        Err(sqlx::Error::Database(db_err)) if is_unique_violation(db_err.as_ref()) => {
             // Idempotent duplicate - return existing event ID
             let existing_event_id: Uuid = sqlx::query_scalar(
                 "SELECT event_id FROM event_log WHERE idempotency_key = $1",
@@ -177,8 +177,8 @@ async fn update_stream_state(
 }
 
 /// Check if database error is a unique constraint violation
-fn is_unique_violation(db_err: &sqlx::postgres::PgDatabaseError) -> bool {
-    db_err.code() == "23505" // PostgreSQL unique violation code
+fn is_unique_violation(db_err: &dyn sqlx::error::DatabaseError) -> bool {
+    db_err.code() == Some(std::borrow::Cow::Borrowed("23505"))
 }
 
 // TODO: Implement batch append for performance

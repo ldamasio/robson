@@ -5,6 +5,7 @@ members = [
     "robson-exec",
     "robson-connectors",
     "robson-store",
+    "robson-eventlog",
     "robsond",
     "robson-sim",
 ]
