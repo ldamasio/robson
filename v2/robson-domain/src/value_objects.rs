@@ -441,11 +441,13 @@ impl TechnicalStopDistance {
 
     /// Create TechnicalStopDistance with side-aware validation (hard-stop invariants)
     ///
-    /// This constructor enforces critical domain invariants:
-    /// - Distance must be > 0 (not equal to entry)
-    /// - Distance must be between 0.1% and 10% of entry price
+    /// This constructor enforces critical domain invariants ONLY:
+    /// - Distance must be > 0 (stop cannot equal entry price)
     /// - For LONG: stop must be below entry
     /// - For SHORT: stop must be above entry
+    ///
+    /// Note: Percentage bounds (0.1% to 10%) are enforced at the engine/policy level,
+    /// not in the domain. Use this constructor when you only need domain invariant validation.
     ///
     /// # Errors
     ///
@@ -501,9 +503,8 @@ impl TechnicalStopDistance {
             },
         }
 
-        let tech_stop = Self::from_entry_and_stop(entry, initial_stop);
-        tech_stop.validate()?;
-        Ok(tech_stop)
+        // Note: We do NOT call validate() here - percentage bounds are policy, not domain invariants
+        Ok(Self::from_entry_and_stop(entry, initial_stop))
     }
 
     /// Validate the TechnicalStopDistance
@@ -928,24 +929,5 @@ mod tests {
         assert!(result.is_ok());
         let tech_stop = result.unwrap();
         assert_eq!(tech_stop.distance, dec!(1500));
-    }
-
-    #[test]
-    fn test_new_validated_also_checks_distance_bounds() {
-        let entry = Price::new(dec!(100)).unwrap();
-        let stop = Price::new(dec!(80)).unwrap(); // 20% distance (>10% limit)
-
-        // Should fail distance bounds check even though side is correct
-        let result = TechnicalStopDistance::new_validated(entry, stop, Side::Long);
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_new_validated_distance_too_tight() {
-        let entry = Price::new(dec!(100000)).unwrap();
-        let stop = Price::new(dec!(99999)).unwrap(); // 0.001% (<0.1% limit)
-
-        let result = TechnicalStopDistance::new_validated(entry, stop, Side::Long);
-        assert!(result.is_err());
     }
 }

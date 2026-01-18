@@ -10,7 +10,6 @@
 pub mod entities;
 pub mod events;
 pub mod market_data;
-pub mod trailing;
 pub mod value_objects;
 
 // Re-export commonly used types
@@ -21,7 +20,6 @@ pub use entities::{
 };
 pub use events::Event;
 pub use market_data::{Candle, MarketDataEvent, OrderBookSnapshot, Tick};
-pub use trailing::{TrailingStopUpdate, is_trailing_stop_hit, update_trailing_stop_anchored};
 pub use value_objects::{
     DomainError, OrderSide, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance,
 };

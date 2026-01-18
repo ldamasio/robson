@@ -28,6 +28,9 @@
 
 #![warn(clippy::all)]
 
+// Trading strategy modules
+pub mod trailing_stop;
+
 use chrono::{DateTime, Utc};
 use robson_domain::{
     DetectorSignal, Event, ExitReason, Position, PositionId, PositionState, Price, Quantity,

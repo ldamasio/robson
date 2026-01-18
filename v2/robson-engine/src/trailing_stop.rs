@@ -1,9 +1,9 @@
-//! Trailing Stop Logic (Pure Functions)
+//! Trailing Stop Strategy Logic
 //!
-//! This module contains pure functions for calculating and updating trailing stops.
-//! All functions are deterministic and have no side effects.
+//! This module contains the pure strategy logic for trailing stop management.
+//! The trailing stop uses an "anchored 1x" technique based on technical stop distance.
 //!
-//! # Trailing Stop Algorithm (Anchored 1x)
+//! # Algorithm (Anchored 1x)
 //!
 //! The trailing stop is "anchored" to the technical stop distance:
 //! - LONG: Stop = peak_price - tech_stop_distance
@@ -14,7 +14,7 @@
 //! - Favorable extreme is monotonic (peak only rises, low only falls)
 //! - Stop is only updated when price makes a new favorable extreme
 
-use crate::value_objects::{Price, Side};
+use robson_domain::{Price, Side};
 use rust_decimal::Decimal;
 
 /// Result of a trailing stop update
@@ -68,8 +68,8 @@ pub struct TrailingStopUpdate {
 /// # Examples
 ///
 /// ```
-/// # use robson_domain::trailing::update_trailing_stop_anchored;
-/// # use robson_domain::value_objects::{Price, Side};
+/// # use robson_engine::trailing_stop::update_trailing_stop_anchored;
+/// # use robson_domain::{Price, Side};
 /// # use rust_decimal_macros::dec;
 /// // LONG: Start with entry at $95,000, stop at $93,500 (distance $1,500)
 /// let side = Side::Long;
@@ -117,7 +117,7 @@ pub fn update_trailing_stop_anchored(
             };
 
             // Calculate candidate stop from new peak
-            let candidate_stop = Decimal::from(new_peak.as_decimal()) - tech_stop_distance;
+            let candidate_stop = new_peak.as_decimal() - tech_stop_distance;
 
             // Only update if candidate stop is HIGHER (more favorable)
             if candidate_stop > current_trailing_stop.as_decimal() {
@@ -138,7 +138,7 @@ pub fn update_trailing_stop_anchored(
             };
 
             // Calculate candidate stop from new low
-            let candidate_stop = Decimal::from(new_low.as_decimal()) + tech_stop_distance;
+            let candidate_stop = new_low.as_decimal() + tech_stop_distance;
 
             // Only update if candidate stop is LOWER (more favorable)
             if candidate_stop < current_trailing_stop.as_decimal() {
@@ -169,8 +169,8 @@ pub fn update_trailing_stop_anchored(
 /// # Examples
 ///
 /// ```
-/// # use robson_domain::trailing::is_trailing_stop_hit;
-/// # use robson_domain::value_objects::{Price, Side};
+/// # use robson_engine::trailing_stop::is_trailing_stop_hit;
+/// # use robson_domain::{Price, Side};
 /// # use rust_decimal_macros::dec;
 /// // LONG: Exit when price drops TO or BELOW stop
 /// assert!(is_trailing_stop_hit(
@@ -475,12 +475,8 @@ mod tests {
             tech_dist,
         );
 
-        // No update because candidate_stop (98k - 0 = 98k) > current_stop (93.5k)
-        // Wait, actually with zero distance, candidate = new_peak
-        // And new_peak > current_stop, so it WOULD update
-        // Let's verify the actual behavior:
-        // candidate_stop = 98000 - 0 = 98000
-        // 98000 > 93500, so update happens
+        // With zero distance, candidate = new_peak = 98000
+        // 98000 > 93500, so update WOULD happen
         assert!(result.is_some());
     }
 
