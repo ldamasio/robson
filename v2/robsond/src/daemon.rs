@@ -131,22 +131,36 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         info!("WebSocket client spawned for BTCUSDT");
 
         // 4. Spawn projection worker (if database configured)
-        let projection_handle = if let Some(database_url) = &self.config.projection.database_url {
-            info!(stream_key = %self.config.projection.stream_key, "Starting projection worker");
+        let projection_handle = match &self.config.projection.database_url {
+            Some(database_url) => match self.config.projection.tenant_id {
+                Some(id) => {
+                    info!(
+                        stream_key = %self.config.projection.stream_key,
+                        %id,
+                        "Starting projection worker"
+                    );
 
-            let pool = sqlx::PgPool::connect(database_url).await?;
-            let tenant_id = uuid::Uuid::new_v4(); // TODO: load from config
-            let worker = ProjectionWorker::new(pool, self.config.projection.clone(), tenant_id);
+                    let pool = sqlx::PgPool::connect(database_url).await?;
+                    let worker = ProjectionWorker::new(pool, self.config.projection.clone(), id);
 
-            let worker_shutdown = shutdown.clone();
-            Some(tokio::spawn(async move {
-                if let Err(e) = worker.run(worker_shutdown).await {
-                    error!(error = %e, "Projection worker failed");
+                    let worker_shutdown = shutdown.clone();
+                    Some(tokio::spawn(async move {
+                        if let Err(e) = worker.run(worker_shutdown).await {
+                            error!(error = %e, "Projection worker failed");
+                        }
+                    }))
                 }
-            }))
-        } else {
-            info!("No DATABASE_URL configured, projection worker disabled");
-            None
+                None => {
+                    warn!(
+                        "DATABASE_URL set but PROJECTION_TENANT_ID missing, projection worker disabled"
+                    );
+                    None
+                }
+            },
+            None => {
+                info!("No DATABASE_URL configured, projection worker disabled");
+                None
+            }
         };
 
         // 5. Subscribe to event bus

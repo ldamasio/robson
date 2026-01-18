@@ -6,6 +6,7 @@ use crate::error::{DaemonError, DaemonResult};
 use rust_decimal::Decimal;
 use std::env;
 use std::str::FromStr;
+use uuid::Uuid;
 
 // =============================================================================
 // Configuration
@@ -41,6 +42,8 @@ pub struct ApiConfig {
 pub struct ProjectionConfig {
     /// Database connection URL
     pub database_url: Option<String>,
+    /// Tenant ID for event polling
+    pub tenant_id: Option<Uuid>,
     /// Stream key to poll events from
     pub stream_key: String,
     /// Poll interval in milliseconds
@@ -97,6 +100,7 @@ impl Config {
             },
             projection: ProjectionConfig {
                 database_url: None,
+                tenant_id: None,
                 stream_key: "test:stream".to_string(),
                 poll_interval_ms: 100,
             },
@@ -162,6 +166,19 @@ impl Config {
 
     fn load_projection_config() -> DaemonResult<ProjectionConfig> {
         let database_url = env::var("DATABASE_URL").ok();
+
+        let tenant_id = if database_url.is_some() {
+            let tenant_str = env::var("PROJECTION_TENANT_ID")
+                .map_err(|_| DaemonError::Config(
+                    "PROJECTION_TENANT_ID required when DATABASE_URL is set".to_string()
+                ))?;
+            Some(Uuid::parse_str(&tenant_str).map_err(|_| {
+                DaemonError::Config(format!("Invalid PROJECTION_TENANT_ID: {}", tenant_str))
+            })?)
+        } else {
+            None
+        };
+
         let stream_key =
             env::var("PROJECTION_STREAM_KEY").unwrap_or_else(|_| "robson:daemon".to_string());
 
@@ -176,6 +193,7 @@ impl Config {
 
         Ok(ProjectionConfig {
             database_url,
+            tenant_id,
             stream_key,
             poll_interval_ms,
         })
@@ -193,6 +211,7 @@ impl Default for Config {
             },
             projection: ProjectionConfig {
                 database_url: None,
+                tenant_id: None,
                 stream_key: "robson:daemon".to_string(),
                 poll_interval_ms: 100,
             },
