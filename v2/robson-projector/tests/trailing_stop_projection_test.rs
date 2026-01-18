@@ -32,9 +32,37 @@ async fn append_and_project(pool: &PgPool, event: Event) {
 #[sqlx::test(migrations = "../migrations")]
 async fn test_entry_filled_initializes_trailing_stop(pool: PgPool) {
     let tenant_id = Uuid::now_v7();
+    let account_id = Uuid::now_v7();
     let position_id = Uuid::now_v7();
+    let strategy_id = Uuid::now_v7();
 
-    let event = Event::new(
+    // First: Create position via POSITION_OPENED
+    let opened_event = Event::new(
+        tenant_id,
+        format!("position:{}", position_id),
+        "POSITION_OPENED",
+        serde_json::json!({
+            "position_id": position_id,
+            "tenant_id": tenant_id,
+            "account_id": account_id,
+            "strategy_id": strategy_id,
+            "symbol": "BTCUSDT",
+            "side": "long",
+            "entry_price": null,
+            "entry_quantity": null,
+            "entry_filled_at": null,
+            "technical_stop_price": "93500.0",
+            "technical_stop_distance": "1500.0",
+            "entry_order_id": null,
+            "stop_loss_order_id": null
+        }),
+    )
+    .with_actor(ActorType::Daemon, Some("test".to_string()));
+
+    append_and_project(&pool, opened_event).await;
+
+    // Second: Fill entry
+    let filled_event = Event::new(
         tenant_id,
         format!("position:{}", position_id),
         "entry_filled",
@@ -50,7 +78,7 @@ async fn test_entry_filled_initializes_trailing_stop(pool: PgPool) {
     )
     .with_actor(ActorType::Daemon, Some("test".to_string()));
 
-    append_and_project(&pool, event).await;
+    append_and_project(&pool, filled_event).await;
 
     // Verify: trailing_stop_price = initial_stop, favorable_extreme = fill_price
     let row: (String, Option<rust_decimal::Decimal>, Option<rust_decimal::Decimal>) = sqlx::query_as(
@@ -70,10 +98,36 @@ async fn test_entry_filled_initializes_trailing_stop(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 async fn test_trailing_stop_updated_monotonic(pool: PgPool) {
     let tenant_id = Uuid::now_v7();
+    let account_id = Uuid::now_v7();
     let position_id = Uuid::now_v7();
+    let strategy_id = Uuid::now_v7();
 
-    // Setup: Insert initial position via EntryFilled
-    let entry_event = Event::new(
+    // Setup: Create position and fill entry
+    let opened_event = Event::new(
+        tenant_id,
+        format!("position:{}", position_id),
+        "POSITION_OPENED",
+        serde_json::json!({
+            "position_id": position_id,
+            "tenant_id": tenant_id,
+            "account_id": account_id,
+            "strategy_id": strategy_id,
+            "symbol": "BTCUSDT",
+            "side": "long",
+            "entry_price": null,
+            "entry_quantity": null,
+            "entry_filled_at": null,
+            "technical_stop_price": "93500.0",
+            "technical_stop_distance": "1500.0",
+            "entry_order_id": null,
+            "stop_loss_order_id": null
+        }),
+    )
+    .with_actor(ActorType::Daemon, Some("test".to_string()));
+
+    append_and_project(&pool, opened_event).await;
+
+    let filled_event = Event::new(
         tenant_id,
         format!("position:{}", position_id),
         "entry_filled",
@@ -89,7 +143,7 @@ async fn test_trailing_stop_updated_monotonic(pool: PgPool) {
     )
     .with_actor(ActorType::Daemon, Some("test".to_string()));
 
-    append_and_project(&pool, entry_event).await;
+    append_and_project(&pool, filled_event).await;
 
     // Event 1: TrailingStopUpdated (price moved to 96500, stop to 95000)
     let update1 = Event::new(
@@ -154,10 +208,36 @@ async fn test_trailing_stop_updated_monotonic(pool: PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 async fn test_exit_triggered_marks_exiting(pool: PgPool) {
     let tenant_id = Uuid::now_v7();
+    let account_id = Uuid::now_v7();
     let position_id = Uuid::now_v7();
+    let strategy_id = Uuid::now_v7();
 
-    // Setup: Insert active position
-    let entry_event = Event::new(
+    // Setup: Create position and fill entry
+    let opened_event = Event::new(
+        tenant_id,
+        format!("position:{}", position_id),
+        "POSITION_OPENED",
+        serde_json::json!({
+            "position_id": position_id,
+            "tenant_id": tenant_id,
+            "account_id": account_id,
+            "strategy_id": strategy_id,
+            "symbol": "BTCUSDT",
+            "side": "long",
+            "entry_price": null,
+            "entry_quantity": null,
+            "entry_filled_at": null,
+            "technical_stop_price": "93500.0",
+            "technical_stop_distance": "1500.0",
+            "entry_order_id": null,
+            "stop_loss_order_id": null
+        }),
+    )
+    .with_actor(ActorType::Daemon, Some("test".to_string()));
+
+    append_and_project(&pool, opened_event).await;
+
+    let filled_event = Event::new(
         tenant_id,
         format!("position:{}", position_id),
         "entry_filled",
@@ -173,7 +253,7 @@ async fn test_exit_triggered_marks_exiting(pool: PgPool) {
     )
     .with_actor(ActorType::Daemon, Some("test".to_string()));
 
-    append_and_project(&pool, entry_event).await;
+    append_and_project(&pool, filled_event).await;
 
     // Event: ExitTriggered
     let exit_event = Event::new(

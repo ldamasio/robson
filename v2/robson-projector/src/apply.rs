@@ -25,11 +25,15 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
         // Position events
         "POSITION_OPENED" => handlers::positions::handle_position_opened(pool, envelope).await?,
         "POSITION_CLOSED" => handlers::positions::handle_position_closed(pool, envelope).await?,
-        "entry_filled" => handlers::positions::handle_entry_filled(pool, envelope).await?,
-        "trailing_stop_updated" => {
+        "entry_filled" | "ENTRY_FILLED" => {
+            handlers::positions::handle_entry_filled(pool, envelope).await?
+        },
+        "trailing_stop_updated" | "TRAILING_STOP_UPDATED" => {
             handlers::positions::handle_trailing_stop_updated(pool, envelope).await?
         },
-        "exit_triggered" => handlers::positions::handle_exit_triggered(pool, envelope).await?,
+        "exit_triggered" | "EXIT_TRIGGERED" => {
+            handlers::positions::handle_exit_triggered(pool, envelope).await?
+        },
 
         // Balance events
         "BALANCE_SAMPLED" => handlers::balances::handle_balance_sampled(pool, envelope).await?,
