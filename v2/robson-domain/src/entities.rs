@@ -259,6 +259,8 @@ pub enum PositionState {
         extreme_at: DateTime<Utc>,
         /// Insurance stop order on exchange (if enabled)
         insurance_stop_id: Option<OrderId>,
+        /// Last trailing stop price that was emitted (for idempotency)
+        last_emitted_stop: Option<Price>,
     },
 
     /// Exit order submitted, waiting for fill

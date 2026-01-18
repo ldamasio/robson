@@ -415,6 +415,7 @@ impl Engine {
             favorable_extreme: fill_price,
             extreme_at: Utc::now(),
             insurance_stop_id: None, // No insurance stop (Robson manages exits)
+            last_emitted_stop: None, // No stop emitted yet
         };
         updated_position.entry_price = Some(fill_price);
         updated_position.quantity = filled_quantity;
@@ -459,13 +460,14 @@ impl Engine {
         market_data: &MarketData,
     ) -> Result<EngineDecision, EngineError> {
         // Validate position is active
-        let (_current_price_in_state, trailing_stop, favorable_extreme) = match &position.state {
+        let (_current_price_in_state, trailing_stop, favorable_extreme, last_emitted_stop) = match &position.state {
             PositionState::Active {
                 current_price,
                 trailing_stop,
                 favorable_extreme,
+                last_emitted_stop,
                 ..
-            } => (*current_price, *trailing_stop, *favorable_extreme),
+            } => (*current_price, *trailing_stop, *favorable_extreme, *last_emitted_stop),
             other => {
                 return Err(EngineError::InvalidPositionState {
                     expected: "active".to_string(),
@@ -507,21 +509,24 @@ impl Engine {
             favorable_extreme,
             tech_stop,
         ) {
-            // Only update if new stop is more favorable
+            // Only update if new stop is more favorable than current stop
             if self.is_more_favorable_stop(position.side, new_stop, trailing_stop) {
-                debug!(
-                    position_id = %position.id,
-                    current_price = %current_price,
-                    old_stop = %trailing_stop,
-                    new_stop = %new_stop,
-                    "Trailing stop updated"
-                );
-                return Ok(self.create_update_stop_decision(
-                    position,
-                    trailing_stop,
-                    new_stop,
-                    current_price,
-                ));
+                // Idempotency check: only emit if different from last emitted
+                if last_emitted_stop != Some(new_stop) {
+                    debug!(
+                        position_id = %position.id,
+                        current_price = %current_price,
+                        old_stop = %trailing_stop,
+                        new_stop = %new_stop,
+                        "Trailing stop updated"
+                    );
+                    return Ok(self.create_update_stop_decision(
+                        position,
+                        trailing_stop,
+                        new_stop,
+                        current_price,
+                    ));
+                }
             }
         }
 
@@ -627,6 +632,28 @@ impl Engine {
         new_stop: Price,
         trigger_price: Price,
     ) -> EngineDecision {
+        // Update position state with new last_emitted_stop
+        let mut updated_position = position.clone();
+        if let PositionState::Active {
+            current_price,
+            trailing_stop,
+            favorable_extreme,
+            extreme_at,
+            insurance_stop_id,
+            ..
+        } = updated_position.state
+        {
+            updated_position.state = PositionState::Active {
+                current_price,
+                trailing_stop,
+                favorable_extreme,
+                extreme_at,
+                insurance_stop_id,
+                last_emitted_stop: Some(new_stop), // Mark as emitted
+            };
+            updated_position.updated_at = Utc::now();
+        }
+
         let actions = vec![
             // 1. Update trailing stop
             EngineAction::UpdateTrailingStop {
@@ -645,7 +672,7 @@ impl Engine {
             }),
         ];
 
-        EngineDecision::with_actions(actions)
+        EngineDecision::with_position(actions, updated_position)
     }
 }
 
@@ -695,6 +722,7 @@ mod tests {
             favorable_extreme: Price::new(favorable_extreme).unwrap(),
             extreme_at: Utc::now(),
             insurance_stop_id: None,
+            last_emitted_stop: None,
         };
 
         position
@@ -1304,6 +1332,7 @@ mod tests {
             favorable_extreme: Price::new(dec!(97000)).unwrap(),
             extreme_at: Utc::now(),
             insurance_stop_id: None,
+            last_emitted_stop: Some(Price::new(dec!(95500)).unwrap()),
         };
 
         // Price drops to trailing stop
@@ -1317,5 +1346,111 @@ mod tests {
             .iter()
             .any(|a| matches!(a, EngineAction::TriggerExit { .. }));
         assert!(has_exit, "Should trigger exit when trailing stop is hit");
+    }
+
+    // =========================================================================
+    // Idempotency Tests
+    // =========================================================================
+
+    #[test]
+    fn test_idempotent_trailing_stop_update_same_tick() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        // Position: entry $95k, stop $93.5k, distance $1.5k
+        // Price already moved to $97k, trailing stop moved to $95.5k
+        let position = create_active_position(
+            Side::Long,
+            dec!(95000),
+            dec!(94500), // trailing stop (previous update from $96k high)
+            dec!(96000), // favorable extreme
+            dec!(1500),  // tech distance
+        );
+
+        // Create position with last_emitted_stop set
+        let mut position_with_emitted = position.clone();
+        if let PositionState::Active {
+            current_price,
+            trailing_stop,
+            favorable_extreme,
+            extreme_at,
+            insurance_stop_id,
+            ..
+        } = position_with_emitted.state
+        {
+            position_with_emitted.state = PositionState::Active {
+                current_price,
+                trailing_stop,
+                favorable_extreme,
+                extreme_at,
+                insurance_stop_id,
+                last_emitted_stop: Some(Price::new(dec!(94500)).unwrap()), // Already emitted $94.5k
+            };
+        }
+
+        // Process same price again ($96k - same as favorable extreme)
+        // This should NOT trigger a new trailing stop update (idempotency)
+        let market = create_market_data(dec!(96000));
+        let decision = engine
+            .process_active_position(&position_with_emitted, &market)
+            .unwrap();
+
+        // No action should be taken because:
+        // 1. Price ($96k) is not above favorable_extreme ($96k) - it's equal
+        // 2. Even if calculated, the new stop would be same as last_emitted_stop
+        assert!(!decision.has_actions(), "Should not emit duplicate trailing stop update");
+    }
+
+    #[test]
+    fn test_idempotent_trailing_stop_update_repeated_same_price() {
+        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let engine = Engine::new(config);
+
+        // Position: entry $95k, stop $93.5k, distance $1.5k
+        let position = create_active_position(
+            Side::Long,
+            dec!(95000),
+            dec!(94500), // trailing stop
+            dec!(96000), // favorable extreme (price went to $96k)
+            dec!(1500),  // tech distance
+        );
+
+        // Create position with last_emitted_stop set to current trailing stop
+        let mut position_with_emitted = position.clone();
+        if let PositionState::Active {
+            current_price,
+            trailing_stop,
+            favorable_extreme,
+            extreme_at,
+            insurance_stop_id,
+            ..
+        } = position_with_emitted.state
+        {
+            position_with_emitted.state = PositionState::Active {
+                current_price,
+                trailing_stop,
+                favorable_extreme,
+                extreme_at,
+                insurance_stop_id,
+                last_emitted_stop: Some(Price::new(dec!(94500)).unwrap()), // Already emitted
+            };
+        }
+
+        // Process same price multiple times (simulating duplicate ticks)
+        let market = create_market_data(dec!(95500)); // Price below extreme, no update
+        let decision1 = engine
+            .process_active_position(&position_with_emitted, &market)
+            .unwrap();
+        let decision2 = engine
+            .process_active_position(&position_with_emitted, &market)
+            .unwrap();
+        let decision3 = engine
+            .process_active_position(&position_with_emitted, &market)
+            .unwrap();
+
+        // None should trigger updates
+        assert!(!decision1.has_actions());
+        assert!(!decision2.has_actions());
+        assert!(!decision3.has_actions());
     }
 }

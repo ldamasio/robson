@@ -38,9 +38,13 @@
 // Modules
 mod error;
 mod memory;
+#[cfg(feature = "postgres")]
+mod postgres;
 mod repository;
 
 // Re-exports
 pub use error::StoreError;
 pub use memory::MemoryStore;
+#[cfg(feature = "postgres")]
+pub use postgres::find_active_from_projection;
 pub use repository::{EventRepository, OrderRepository, PositionRepository, Store};
