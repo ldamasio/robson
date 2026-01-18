@@ -149,18 +149,18 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                             error!(error = %e, "Projection worker failed");
                         }
                     }))
-                }
+                },
                 None => {
                     warn!(
                         "DATABASE_URL set but PROJECTION_TENANT_ID missing, projection worker disabled"
                     );
                     None
-                }
+                },
             },
             None => {
                 info!("No DATABASE_URL configured, projection worker disabled");
                 None
-            }
+            },
         };
 
         // 5. Subscribe to event bus

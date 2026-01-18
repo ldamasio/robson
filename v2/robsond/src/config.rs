@@ -168,10 +168,11 @@ impl Config {
         let database_url = env::var("DATABASE_URL").ok();
 
         let tenant_id = if database_url.is_some() {
-            let tenant_str = env::var("PROJECTION_TENANT_ID")
-                .map_err(|_| DaemonError::Config(
-                    "PROJECTION_TENANT_ID required when DATABASE_URL is set".to_string()
-                ))?;
+            let tenant_str = env::var("PROJECTION_TENANT_ID").map_err(|_| {
+                DaemonError::Config(
+                    "PROJECTION_TENANT_ID required when DATABASE_URL is set".to_string(),
+                )
+            })?;
             Some(Uuid::parse_str(&tenant_str).map_err(|_| {
                 DaemonError::Config(format!("Invalid PROJECTION_TENANT_ID: {}", tenant_str))
             })?)

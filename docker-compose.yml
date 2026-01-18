@@ -1,105 +1,20 @@
-# NOTE: Postgres memory limits set to avoid OOM on low-RAM dev machines.
-version: "3"
 services:
-  robsondb:
-    container_name: robsonDatabase
-    image: postgres:16-alpine
+  paradedb:
+    image: ghcr.io/paradedb/paradedb:latest
+    container_name: robson-v2-db
     environment:
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_USER: robson
+      POSTGRES_PASSWORD: robson
+      POSTGRES_DB: robson_v2
     ports:
-      - "${POSTGRES_PORT:-5450}:5432"
+      - "5432:5432"
     volumes:
-      - pgdata:/var/lib/postgresql/data
-      - ./infra/data/postgres/:/docker-entrypoint-initdb.d
-    shm_size: 128m
-    mem_limit: 512m
-    memswap_limit: 512m
-    command:
-      - postgres
-      - -c
-      - shared_buffers=128MB
-      - -c
-      - work_mem=4MB
-      - -c
-      - maintenance_work_mem=64MB
-      - -c
-      - effective_cache_size=256MB
-      - -c
-      - wal_buffers=8MB
-      - -c
-      - max_wal_size=1GB
-      - -c
-      - checkpoint_timeout=10min
-      - -c
-      - max_connections=50
-      - -c
-      - log_min_duration_statement=500ms
+      - robson_v2_data:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres}"]
-      interval: 10s
+      test: ["CMD-SHELL", "pg_isready -U robson"]
+      interval: 5s
       timeout: 5s
       retries: 5
-      start_period: 10s
-    restart: always
-  redis:
-    container_name: robsonRedis
-    image: redis:alpine
-    ports:
-      - "6379:6379"
-    restart: always
-  market-stream:
-    container_name: marketStream
-    build: ./cli
-    ports:
-      - "8080:8080"
-    environment:
-      - REDIS_ADDR=robsonRedis:6379
-    depends_on:
-      - redis
-    restart: always
-  cronjob:
-    container_name: cronjob
-    build: ./apps/backend/cronjob
-    environment:
-      - POSTGRES_HOST=${POSTGRES_HOST}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DATABASE=${POSTGRES_DATABASE}
-      - POSTGRES_PORT=${POSTGRES_PORT}
-    restart: always
-  backend-monolith:
-    container_name: backendMonolith
-    image: backend-monolith
-    build: ./apps/backend/monolith
-    environment:
-      - DJANGO_SETTINGS_MODULE=backend.settings
-      - POSTGRES_HOST=${POSTGRES_HOST}
-      - POSTGRES_USER=${POSTGRES_USER}
-      - POSTGRES_PASSWORD=${POSTGRES_PASSWORD}
-      - POSTGRES_DATABASE=${POSTGRES_DATABASE}
-      - POSTGRES_PORT=${POSTGRES_PORT}
-    volumes:
-      - ./apps/backend/monolith:/app-backend
-    restart: always
-  frontend-web:
-    container_name: frontendWeb
-    image: frontend-web
-    build: ./apps/frontend
-    volumes:
-      - ./apps/frontend:/app-frontend
-    ports:
-      - 3403:3403
-    depends_on:
-      - backend-monolith
-    restart: always
-  nginx_backend_server:
-    depends_on:
-      - backend-monolith
-    container_name: nginxMonolith
-    build: ./apps/backend/nginx_monolith
-    ports:
-      - 8403:8403
-    restart: always
+
 volumes:
-  pgdata:
+  robson_v2_data:

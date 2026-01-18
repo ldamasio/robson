@@ -27,7 +27,7 @@ CREATE EXTENSION IF NOT EXISTS pgcrypto;
 
 CREATE TABLE IF NOT EXISTS event_log (
     -- Identity
-    event_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    event_id UUID NOT NULL DEFAULT gen_random_uuid(),
     tenant_id UUID NOT NULL,
 
     -- Stream Partitioning
@@ -61,9 +61,10 @@ CREATE TABLE IF NOT EXISTS event_log (
     hash TEXT,
 
     -- Constraints
-    CONSTRAINT uk_event_log_stream_seq UNIQUE (stream_key, seq),
-    CONSTRAINT uk_event_log_idempotency_key UNIQUE (idempotency_key),
-    CONSTRAINT chk_actor_type CHECK (actor_type IN ('CLI', 'Daemon', 'System', 'Exchange'))
+    CONSTRAINT uk_event_log_stream_seq UNIQUE (stream_key, seq, ingested_at),
+    CONSTRAINT uk_event_log_idempotency_key UNIQUE (idempotency_key, ingested_at),
+    CONSTRAINT chk_actor_type CHECK (actor_type IN ('CLI', 'Daemon', 'System', 'Exchange')),
+    CONSTRAINT pk_event_log PRIMARY KEY (event_id, ingested_at)
 ) PARTITION BY RANGE (ingested_at);
 
 -- Indexes (applied to all partitions)
@@ -135,9 +136,11 @@ CREATE TABLE orders_current (
     updated_at TIMESTAMPTZ NOT NULL,
     filled_at TIMESTAMPTZ,
 
-    CONSTRAINT uk_orders_client_order_id UNIQUE (client_order_id),
-    CONSTRAINT uk_orders_exchange_order_id UNIQUE (exchange_order_id) WHERE exchange_order_id IS NOT NULL
+    CONSTRAINT uk_orders_client_order_id UNIQUE (client_order_id)
 );
+
+-- Unique index for exchange_order_id (only non-null values)
+CREATE UNIQUE INDEX uk_orders_exchange_order_id ON orders_current(exchange_order_id) WHERE exchange_order_id IS NOT NULL;
 
 CREATE INDEX idx_orders_tenant_account ON orders_current(tenant_id, account_id);
 CREATE INDEX idx_orders_position ON orders_current(position_id) WHERE position_id IS NOT NULL;
@@ -331,7 +334,7 @@ COMMENT ON TABLE strategy_state_current IS 'Projection: Current state of all str
 
 CREATE TABLE snapshots (
     -- Identity
-    snapshot_id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    snapshot_id UUID NOT NULL DEFAULT gen_random_uuid(),
     tenant_id UUID NOT NULL,
 
     -- Scope
@@ -354,7 +357,8 @@ CREATE TABLE snapshots (
     -- Audit
     created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
 
-    CONSTRAINT uk_snapshots_scope_time UNIQUE (snapshot_scope, scope_id, as_of_time)
+    CONSTRAINT pk_snapshots PRIMARY KEY (snapshot_id, created_at),
+    CONSTRAINT uk_snapshots_scope_time UNIQUE (snapshot_scope, scope_id, as_of_time, created_at)
 ) PARTITION BY RANGE (created_at);
 
 CREATE INDEX idx_snapshots_tenant ON snapshots(tenant_id);

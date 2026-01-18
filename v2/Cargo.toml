@@ -7,6 +7,8 @@ members = [
     "robson-store",
     "robson-eventlog",
     "robson-projector",
+    "robson-db",
+    "robson-testkit",
     "robsond",
     "robson-sim",
 ]

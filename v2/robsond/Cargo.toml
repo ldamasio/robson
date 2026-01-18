@@ -17,6 +17,7 @@ robson-connectors = { path = "../robson-connectors" }
 robson-store = { path = "../robson-store" }
 robson-eventlog = { path = "../robson-eventlog" }
 robson-projector = { path = "../robson-projector" }
+robson-db = { path = "../robson-db" }
 sqlx = { workspace = true }
 tokio = { workspace = true }
 tokio-util = { version = "0.7" }
