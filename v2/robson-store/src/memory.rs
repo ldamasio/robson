@@ -60,14 +60,14 @@ impl MemoryStore {
         self.event_seq.store(0, Ordering::SeqCst);
     }
 
-    /// Apply an event to update the in-memory position projection.
+    /// Internal method to apply an event to the in-memory position projection.
     ///
-    /// This is called AFTER the event is appended to the EventLog.
+    /// This is called by the Store trait's apply_event method.
     /// Order is critical: append FIRST, apply AFTER.
     ///
     /// If apply fails, we fail-fast (error is ok).
     /// The EventLog remains the source of truth for recovery.
-    pub fn apply_event(&self, event: &Event) -> Result<(), StoreError> {
+    fn apply_event_internal(&self, event: &Event) -> Result<(), StoreError> {
         use robson_domain::{ExitReason, PositionState};
 
         match event {
@@ -326,7 +326,7 @@ impl Store for MemoryStore {
 
     /// Override to apply events to in-memory projection synchronously.
     fn apply_event(&self, event: &robson_domain::Event) -> Result<(), StoreError> {
-        self.apply_event(event)
+        self.apply_event_internal(event)
     }
 }
 
