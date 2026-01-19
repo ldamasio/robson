@@ -31,7 +31,6 @@
 mod db;
 
 use robsond::{Config, Daemon};
-use std::sync::Arc;
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
 
