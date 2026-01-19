@@ -112,15 +112,19 @@ impl MemoryStore {
                 let mut positions = self.positions.write().unwrap();
                 if let Some(mut position) = positions.get(position_id).cloned() {
                     if let PositionState::Active {
+                        ref mut current_price,
                         ref mut trailing_stop,
                         ref mut favorable_extreme,
                         ref mut extreme_at,
+                        ref mut last_emitted_stop,
                         ..
                     } = position.state
                     {
+                        *current_price = *trigger_price;
                         *trailing_stop = *new_stop;
                         *favorable_extreme = *trigger_price;
                         *extreme_at = chrono::Utc::now();
+                        *last_emitted_stop = Some(*new_stop);
                         position.updated_at = chrono::Utc::now();
 
                         positions.insert(*position_id, position);
