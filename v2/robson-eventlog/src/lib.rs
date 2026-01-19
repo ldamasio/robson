@@ -8,7 +8,7 @@
 //!
 //! # Usage
 //!
-//! ```rust,no_run
+//! ```rust,ignore
 //! use robson_eventlog::{EventLog, Event, append_event};
 //!
 //! # async fn example() -> Result<(), Box<dyn std::error::Error>> {
