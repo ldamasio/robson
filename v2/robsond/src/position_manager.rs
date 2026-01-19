@@ -32,7 +32,7 @@ use robson_domain::{
     DetectorSignal, Event, Position, PositionId, PositionState, Price, Quantity, RiskConfig, Side,
     Symbol, TechnicalStopDistance,
 };
-use robson_engine::Engine;
+use robson_engine::{Engine, EngineAction};
 use robson_exec::{ActionResult, ExchangePort, Executor};
 use robson_store::Store;
 
@@ -485,8 +485,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let entry_price = position.entry_price.unwrap_or(fill_price);
         let pnl = position.calculate_pnl();
 
-        // Emit PositionClosed event (EventLog is source of truth)
-        // MemoryStore will be updated via apply_event() called by executor
+        // Emit PositionClosed event via executor (ensures append->apply order)
         let event = Event::PositionClosed {
             position_id,
             exit_reason: robson_domain::ExitReason::TrailingStop,
@@ -496,10 +495,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             total_fees: position.fees_paid,
             timestamp: chrono::Utc::now(),
         };
-        self.store.events().append(&event).await?;
-
-        // Apply event to MemoryStore (synchronous update)
-        self.store.apply_event(&event)?;
+        self.executor.execute(vec![EngineAction::EmitEvent(event)]).await?;
 
         // Send to event bus for real-time notification
         self.event_bus.send(DaemonEvent::PositionStateChanged {
@@ -562,8 +558,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let pnl = position.calculate_pnl();
         let entry_price = position.entry_price.unwrap_or(current_price);
 
-        // Emit PositionClosed event (EventLog is source of truth)
-        // MemoryStore will be updated via apply_event() called by executor
+        // Emit PositionClosed event via executor (ensures append->apply order)
         let event = Event::PositionClosed {
             position_id,
             exit_reason: robson_domain::ExitReason::UserPanic,
@@ -573,10 +568,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             total_fees: position.fees_paid,
             timestamp: chrono::Utc::now(),
         };
-        self.store.events().append(&event).await?;
-
-        // Apply event to MemoryStore (synchronous update)
-        self.store.apply_event(&event)?;
+        self.executor.execute(vec![EngineAction::EmitEvent(event)]).await?;
 
         Ok(())
     }
