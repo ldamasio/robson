@@ -291,6 +291,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     }
 
     /// Handle a detector signal (entry signal received).
+    ///
+    /// Flow: Engine → Execute actions (emit events) → Save state → Process fill
     pub async fn handle_signal(&self, signal: DetectorSignal) -> DaemonResult<()> {
         let position_id = signal.position_id;
         info!(
@@ -311,13 +313,17 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Kill detector (it's single-shot)
         self.kill_detector(position_id).await;
 
-        // Use engine to decide entry
+        // Use engine to decide entry (pure: State+Signal → Decision)
         let decision = self.engine.decide_entry(&position, &signal)?;
 
-        // Apply state transition if any
-        if let Some(updated_position) = decision.updated_position {
+        // Execute actions FIRST (emits events via EventLog.append)
+        let results = self.executor.execute(decision.actions).await?;
+
+        // THEN save state (atomicity: events before state)
+        // Entering state must be persisted for handle_entry_fill to find it
+        if let Some(ref updated_position) = decision.updated_position {
             let old_state = format!("{:?}", position.state);
-            self.store.positions().save(&updated_position).await?;
+            self.store.positions().save(updated_position).await?;
 
             self.event_bus.send(DaemonEvent::PositionStateChanged {
                 position_id,
@@ -327,10 +333,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             });
         }
 
-        // Execute actions
-        let results = self.executor.execute(decision.actions).await?;
-
-        // Log results
+        // Log results and process fill if order was placed
         for result in results {
             match result {
                 ActionResult::OrderPlaced(order) => {
@@ -341,7 +344,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         "Entry order placed and filled"
                     );
 
-                    // Process the fill
+                    // Process the fill (position is now in Entering state)
                     self.handle_entry_fill(position_id, order.fill_price, order.filled_quantity)
                         .await?;
                 },
@@ -364,6 +367,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     }
 
     /// Handle entry fill (transition from Entering → Active).
+    ///
+    /// Flow: Load → Engine → Execute actions (emit events) → Save state
     async fn handle_entry_fill(
         &self,
         position_id: PositionId,
@@ -378,13 +383,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .await?
             .ok_or(DaemonError::PositionNotFound(position_id))?;
 
-        // Use engine to process fill
+        // Use engine to process fill (pure: State+Fill → Decision)
         let decision = self.engine.process_entry_fill(&position, fill_price, filled_quantity)?;
 
-        // Apply state transition if any
-        if let Some(updated_position) = decision.updated_position {
+        // Execute actions FIRST (emits events via EventLog.append)
+        self.executor.execute(decision.actions).await?;
+
+        // THEN save state (atomicity: events before state)
+        if let Some(ref updated_position) = decision.updated_position {
             let old_state = format!("{:?}", position.state);
-            self.store.positions().save(&updated_position).await?;
+            self.store.positions().save(updated_position).await?;
 
             info!(
                 %position_id,
@@ -400,17 +408,22 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             });
         }
 
-        // Execute actions (events, etc.)
-        self.executor.execute(decision.actions).await?;
-
         Ok(())
     }
 
     /// Process market data for active positions.
     ///
     /// This updates trailing stops and triggers exits when necessary.
+    ///
+    /// # Canonical Flow
+    ///
+    /// ```text
+    /// Tick → State (from projection) → Engine(State, Tick) → Decision
+    /// → Executor(Decision) → Result → EventLog.append(Event)
+    /// → Projection.apply(Event) (async)
+    /// ```
     pub async fn process_market_data(&self, data: MarketData) -> DaemonResult<()> {
-        // Find all active positions for this symbol
+        // Find all active positions for this symbol (from projection)
         let active_positions = self.store.positions().find_active().await?;
 
         for position in active_positions {
@@ -422,25 +435,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 continue;
             }
 
-            // Use engine to process
+            // Use engine to process (pure: State+Tick → Decision)
             let symbol_clone = data.symbol.clone();
             let market_data = robson_engine::MarketData::new(symbol_clone, data.price);
             let decision = self.engine.process_active_position(&position, &market_data)?;
 
-            // Apply state transition if any
-            if let Some(updated_position) = decision.updated_position {
-                let old_state = format!("{:?}", position.state);
-                self.store.positions().save(&updated_position).await?;
-
-                self.event_bus.send(DaemonEvent::PositionStateChanged {
-                    position_id: updated_position.id,
-                    previous_state: old_state,
-                    new_state: format!("{:?}", updated_position.state),
-                    timestamp: chrono::Utc::now(),
-                });
-            }
-
-            // Execute any actions
+            // Execute actions via Executor (side-effects: EventLog.append, Exchange orders)
+            // NOTE: State is NOT updated here - projections will update asynchronously
             if !decision.actions.is_empty() {
                 let results = self.executor.execute(decision.actions).await?;
 
@@ -458,13 +459,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     }
 
     /// Handle exit fill (transition to Closed).
+    ///
+    /// Called after exit order is filled. Emits PositionClosed event
+    /// which will be applied by projection to update state.
     async fn handle_exit_fill(
         &self,
         position_id: PositionId,
         fill_price: Price,
         _filled_quantity: Quantity,
     ) -> DaemonResult<()> {
-        let mut position = self
+        let position = self
             .store
             .positions()
             .find_by_id(position_id)
@@ -474,22 +478,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         info!(
             %position_id,
             fill_price = %fill_price.as_decimal(),
-            "Exit filled, position closed"
+            "Exit filled, emitting PositionClosed event"
         );
 
-        // Transition to Closed
-        position.state = PositionState::Closed {
-            exit_price: fill_price,
-            realized_pnl: position.calculate_pnl(),
-            exit_reason: robson_domain::ExitReason::TrailingStop,
-        };
-        position.closed_at = Some(chrono::Utc::now());
-
-        self.store.positions().save(&position).await?;
-
-        // Emit closed event
+        // Calculate PnL for event
         let entry_price = position.entry_price.unwrap_or(fill_price);
         let pnl = position.calculate_pnl();
+
+        // Emit PositionClosed event FIRST (atomicity: event before state)
+        // Projection will update position state asynchronously
         let event = Event::PositionClosed {
             position_id,
             exit_reason: robson_domain::ExitReason::TrailingStop,
@@ -501,6 +498,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         };
         self.store.events().append(&event).await?;
 
+        // Send to event bus for real-time notification
         self.event_bus.send(DaemonEvent::PositionStateChanged {
             position_id,
             previous_state: "Active".to_string(),
@@ -534,6 +532,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     }
 
     /// Emergency close a single position.
+    ///
+    /// Emits PositionClosed event which will be applied by projection.
     async fn panic_close_position(&self, position_id: PositionId) -> DaemonResult<()> {
         let position = self
             .store
@@ -555,27 +555,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             })
             .unwrap_or_else(|| Price::new(rust_decimal::Decimal::ZERO).unwrap());
 
-        // Mark as closed with panic reason
-        let mut closed_position = position.clone();
-        let pnl = closed_position.calculate_pnl();
-        closed_position.state = PositionState::Closed {
-            exit_price: current_price,
-            realized_pnl: pnl,
-            exit_reason: robson_domain::ExitReason::UserPanic,
-        };
-        closed_position.closed_at = Some(chrono::Utc::now());
+        // Calculate PnL for event
+        let pnl = position.calculate_pnl();
+        let entry_price = position.entry_price.unwrap_or(current_price);
 
-        self.store.positions().save(&closed_position).await?;
-
-        // Emit PositionClosed event
-        let entry_price = closed_position.entry_price.unwrap_or(current_price);
+        // Emit PositionClosed event FIRST (atomicity: event before state)
+        // Projection will update position state asynchronously
         let event = Event::PositionClosed {
             position_id,
             exit_reason: robson_domain::ExitReason::UserPanic,
             entry_price,
             exit_price: current_price,
             realized_pnl: pnl,
-            total_fees: closed_position.fees_paid,
+            total_fees: position.fees_paid,
             timestamp: chrono::Utc::now(),
         };
         self.store.events().append(&event).await?;
