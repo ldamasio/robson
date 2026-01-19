@@ -59,6 +59,112 @@ impl MemoryStore {
         self.events.write().unwrap().clear();
         self.event_seq.store(0, Ordering::SeqCst);
     }
+
+    /// Apply an event to update the in-memory position projection.
+    ///
+    /// This is called AFTER the event is appended to the EventLog.
+    /// Order is critical: append FIRST, apply AFTER.
+    ///
+    /// If apply fails, we fail-fast (error is ok).
+    /// The EventLog remains the source of truth for recovery.
+    pub fn apply_event(&self, event: &Event) -> Result<(), StoreError> {
+        use robson_domain::{ExitReason, PositionState};
+
+        match event {
+            // EntryFilled: Position becomes Active with initial trailing stop
+            Event::EntryFilled {
+                position_id,
+                fill_price,
+                filled_quantity,
+                initial_stop,
+                ..
+            } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    // Update position fields from event
+                    position.entry_price = Some(*fill_price);
+                    position.entry_filled_at = Some(chrono::Utc::now());
+                    position.quantity = *filled_quantity;
+
+                    // Transition to Active state with initial trailing stop
+                    position.state = PositionState::Active {
+                        current_price: *fill_price,
+                        trailing_stop: *initial_stop,
+                        favorable_extreme: *fill_price,
+                        extreme_at: chrono::Utc::now(),
+                        insurance_stop_id: None,
+                        last_emitted_stop: Some(*initial_stop),
+                    };
+                    position.updated_at = chrono::Utc::now();
+
+                    positions.insert(*position_id, position);
+                }
+                // If position not found, this is idempotent - nothing to update
+            },
+
+            // TrailingStopUpdated: Update the trailing stop in Active state
+            Event::TrailingStopUpdated {
+                position_id,
+                new_stop,
+                trigger_price,
+                ..
+            } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    if let PositionState::Active {
+                        ref mut trailing_stop,
+                        ref mut favorable_extreme,
+                        ref mut extreme_at,
+                        ..
+                    } = position.state
+                    {
+                        *trailing_stop = *new_stop;
+                        *favorable_extreme = *trigger_price;
+                        *extreme_at = chrono::Utc::now();
+                        position.updated_at = chrono::Utc::now();
+
+                        positions.insert(*position_id, position);
+                    }
+                }
+                // If position not found or not in Active state, idempotent
+            },
+
+            // PositionClosed: Mark position as closed
+            Event::PositionClosed {
+                position_id,
+                exit_price,
+                exit_reason,
+                realized_pnl,
+                ..
+            } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    position.state = PositionState::Closed {
+                        exit_price: *exit_price,
+                        realized_pnl: *realized_pnl,
+                        exit_reason: match exit_reason {
+                            robson_domain::ExitReason::TrailingStop => ExitReason::TrailingStop,
+                            robson_domain::ExitReason::InsuranceStop => ExitReason::InsuranceStop,
+                            robson_domain::ExitReason::UserPanic => ExitReason::UserPanic,
+                            _ => ExitReason::PositionError,
+                        },
+                    };
+                    position.closed_at = Some(chrono::Utc::now());
+                    position.updated_at = chrono::Utc::now();
+
+                    positions.insert(*position_id, position);
+                }
+                // If position not found, idempotent
+            },
+
+            // Other events don't affect the in-memory projection
+            _ => {
+                // No-op for events that don't change position state
+            },
+        }
+
+        Ok(())
+    }
 }
 
 impl Default for MemoryStore {
@@ -216,6 +322,11 @@ impl Store for MemoryStore {
 
     fn events(&self) -> &dyn EventRepository {
         self
+    }
+
+    /// Override to apply events to in-memory projection synchronously.
+    fn apply_event(&self, event: &robson_domain::Event) -> Result<(), StoreError> {
+        self.apply_event(event)
     }
 }
 

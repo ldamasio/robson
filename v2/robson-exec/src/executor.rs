@@ -146,8 +146,11 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                     "Emitting event"
                 );
 
-                // Persist event
+                // Persist event FIRST (EventLog is source of truth)
                 self.store.events().append(&event).await?;
+
+                // THEN apply to in-memory projection (updates positions)
+                self.store.apply_event(&event)?;
 
                 Ok(ActionResult::EventEmitted(event))
             },

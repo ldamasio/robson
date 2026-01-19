@@ -441,14 +441,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             let decision = self.engine.process_active_position(&position, &market_data)?;
 
             // Execute actions via Executor (side-effects: EventLog.append, Exchange orders)
+            // MemoryStore is updated via apply_event() called by executor after event append
             if !decision.actions.is_empty() {
                 let results = self.executor.execute(decision.actions).await?;
-
-                // CRITICAL: Save updated position to MemoryStore (runtime source of truth)
-                // Projection updates Postgres asynchronously, but runtime reads from MemoryStore
-                if let Some(ref updated_position) = decision.updated_position {
-                    self.store.positions().save(updated_position).await?;
-                }
 
                 for result in results {
                     if let ActionResult::OrderPlaced(order) = result {
@@ -490,7 +485,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let entry_price = position.entry_price.unwrap_or(fill_price);
         let pnl = position.calculate_pnl();
 
-        // Emit PositionClosed event FIRST (atomicity: event before state)
+        // Emit PositionClosed event (EventLog is source of truth)
+        // MemoryStore will be updated via apply_event() called by executor
         let event = Event::PositionClosed {
             position_id,
             exit_reason: robson_domain::ExitReason::TrailingStop,
@@ -502,17 +498,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         };
         self.store.events().append(&event).await?;
 
-        // CRITICAL: Update position to Closed state in MemoryStore (runtime source of truth)
-        // find_active() filters by can_enter()/can_exit(), so Closed positions won't appear
-        let mut closed_position = position.clone();
-        closed_position.state = PositionState::Closed {
-            exit_price: fill_price,
-            realized_pnl: pnl,
-            exit_reason: robson_domain::ExitReason::TrailingStop,
-        };
-        closed_position.closed_at = Some(chrono::Utc::now());
-        closed_position.updated_at = chrono::Utc::now();
-        self.store.positions().save(&closed_position).await?;
+        // Apply event to MemoryStore (synchronous update)
+        self.store.apply_event(&event)?;
 
         // Send to event bus for real-time notification
         self.event_bus.send(DaemonEvent::PositionStateChanged {
@@ -575,7 +562,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let pnl = position.calculate_pnl();
         let entry_price = position.entry_price.unwrap_or(current_price);
 
-        // Emit PositionClosed event FIRST (atomicity: event before state)
+        // Emit PositionClosed event (EventLog is source of truth)
+        // MemoryStore will be updated via apply_event() called by executor
         let event = Event::PositionClosed {
             position_id,
             exit_reason: robson_domain::ExitReason::UserPanic,
@@ -587,17 +575,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         };
         self.store.events().append(&event).await?;
 
-        // CRITICAL: Update position to Closed state in MemoryStore (runtime source of truth)
-        // find_active() filters by can_enter()/can_exit(), so Closed positions won't appear
-        let mut closed_position = position.clone();
-        closed_position.state = PositionState::Closed {
-            exit_price: current_price,
-            realized_pnl: pnl,
-            exit_reason: robson_domain::ExitReason::UserPanic,
-        };
-        closed_position.closed_at = Some(chrono::Utc::now());
-        closed_position.updated_at = chrono::Utc::now();
-        self.store.positions().save(&closed_position).await?;
+        // Apply event to MemoryStore (synchronous update)
+        self.store.apply_event(&event)?;
 
         Ok(())
     }

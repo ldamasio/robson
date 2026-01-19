@@ -84,6 +84,17 @@ pub trait Store: Send + Sync {
     /// Get event repository
     fn events(&self) -> &dyn EventRepository;
 
+    /// Apply an event to update the in-memory projection.
+    ///
+    /// This is called AFTER the event is appended to the EventLog.
+    /// Order is critical: append FIRST, apply AFTER.
+    ///
+    /// Default implementation is a no-op (for PostgreSQL stores).
+    /// MemoryStore overrides this to update positions synchronously.
+    fn apply_event(&self, _event: &robson_domain::Event) -> Result<(), StoreError> {
+        Ok(()) // Default no-op for non-in-memory stores
+    }
+
     /// Begin a transaction (for implementations that support it)
     async fn begin_transaction(&self) -> Result<(), StoreError> {
         Ok(()) // Default no-op for non-transactional stores
