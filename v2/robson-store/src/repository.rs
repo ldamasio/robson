@@ -70,6 +70,13 @@ pub trait EventRepository: Send + Sync {
 
     /// Get the latest event sequence number for a position
     async fn get_latest_seq(&self, position_id: PositionId) -> Result<Option<i64>, StoreError>;
+
+    /// Get all stored events in order (for crash recovery/rebuild).
+    ///
+    /// Returns all events from the event log in sequence order.
+    /// Used by MemoryStore to rebuild the in-memory projection on startup.
+    /// For PostgreSQL stores, this may return an empty Vec (no-op).
+    async fn get_all_events(&self) -> Result<Vec<Event>, StoreError>;
 }
 
 /// Combined store interface

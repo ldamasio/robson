@@ -177,6 +177,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         let shutdown = tokio_util::sync::CancellationToken::new();
         let shutdown_sig = shutdown.clone();
 
+        // 0. Rebuild store from event log (crash recovery)
+        self.rebuild_store().await?;
+
         // 1. Restore active positions
         self.restore_positions().await?;
 
@@ -265,6 +268,37 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
 
         self.shutdown().await?;
 
+        Ok(())
+    }
+
+    /// Rebuild store from EventLog on startup (crash recovery).
+    ///
+    /// Reads all stored events and re-applies them to rebuild the in-memory projection.
+    /// This is idempotent and safe to run on every boot.
+    async fn rebuild_store(&self) -> DaemonResult<()> {
+        let events = self.store.events().get_all_events().await?;
+        let count = events.len();
+
+        if count == 0 {
+            info!("No events to replay, starting with empty store");
+            return Ok(());
+        }
+
+        info!(count, "Replaying events to rebuild store projection");
+
+        // Apply each event in order to rebuild the projection
+        for event in &events {
+            if let Err(e) = self.store.apply_event(event) {
+                error!(
+                    error = %e,
+                    position_id = %event.position_id(),
+                    "Failed to apply event during rebuild"
+                );
+                // Continue with other events - apply_event should be idempotent
+            }
+        }
+
+        info!(count, "Successfully rebuilt store from event log");
         Ok(())
     }
 

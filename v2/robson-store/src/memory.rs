@@ -308,6 +308,15 @@ impl EventRepository for MemoryStore {
             .map(|e| e.seq)
             .max())
     }
+
+    async fn get_all_events(&self) -> Result<Vec<Event>, StoreError> {
+        let events = self.events.read().unwrap();
+        // Return events in sequence order (already sorted by append order)
+        Ok(events
+            .iter()
+            .map(|e| e.event.clone())
+            .collect())
+    }
 }
 
 // =============================================================================
