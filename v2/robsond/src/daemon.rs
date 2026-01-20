@@ -288,14 +288,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
 
         // Apply each event in order to rebuild the projection
         for event in &events {
-            if let Err(e) = self.store.apply_event(event) {
-                error!(
-                    error = %e,
-                    position_id = %event.position_id(),
-                    "Failed to apply event during rebuild"
-                );
-                // Continue with other events - apply_event should be idempotent
-            }
+            self.store.apply_event(event)?;
         }
 
         info!(count, "Successfully rebuilt store from event log");

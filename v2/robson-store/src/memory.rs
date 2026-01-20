@@ -21,6 +21,7 @@ pub struct MemoryStore {
 }
 
 /// Event with sequence number
+#[derive(Clone)]
 struct StoredEvent {
     seq: i64,
     event: Event,
@@ -311,11 +312,10 @@ impl EventRepository for MemoryStore {
 
     async fn get_all_events(&self) -> Result<Vec<Event>, StoreError> {
         let events = self.events.read().unwrap();
-        // Return events in sequence order (already sorted by append order)
-        Ok(events
-            .iter()
-            .map(|e| e.event.clone())
-            .collect())
+        // Clone and sort by sequence number to guarantee ordering
+        let mut sorted: Vec<StoredEvent> = events.iter().cloned().collect();
+        sorted.sort_by_key(|e| e.seq);
+        Ok(sorted.into_iter().map(|e| e.event).collect())
     }
 }
 
