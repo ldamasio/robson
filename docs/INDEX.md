@@ -15,8 +15,10 @@
 **For AI Agents?** Start here:
 
 1. **[AGENTS.md](AGENTS.md)** - Comprehensive guide for AI-assisted development
-2. **[../CLAUDE.md](../CLAUDE.md)** - Claude Code specific context
-3. **[AI_WORKFLOW.md](AI_WORKFLOW.md)** - AI collaboration guidelines
+2. **[SKILL.md](SKILL.md)** - AI Skills Framework and prompt engineering guide
+3. **[AI-MEMORY-DB.md](AI-MEMORY-DB.md)** - Runtime knowledge store (learns from PRs)
+4. **[../CLAUDE.md](../CLAUDE.md)** - Claude Code specific context
+5. **[AI_WORKFLOW.md](AI_WORKFLOW.md)** - AI collaboration guidelines
 
 ---
 
@@ -29,6 +31,8 @@ docs/
 ├── DEVELOPER.md                     # Developer workflow and practices
 ├── AI_WORKFLOW.md                   # AI collaboration guidelines
 ├── AGENTS.md                        # Comprehensive AI agent guide
+├── SKILL.md                         # AI Skills Framework (prompt engineering)
+├── AI-MEMORY-DB.md                  # Runtime knowledge store (learns from PRs)
 ├── AUTH_FLOW.md                     # Authentication flow documentation
 ├── CONTRIBUTING-ADAPTERS.md         # Adapter development guide
 ├── STYLE_GUIDE.md                   # Code style conventions
@@ -112,6 +116,8 @@ docs/
 
 **Start Here**:
 - **[AGENTS.md](AGENTS.md)** - Comprehensive guide for AI-assisted development
+- **[SKILL.md](SKILL.md)** - AI Skills Framework and prompt engineering
+- **[AI-MEMORY-DB.md](AI-MEMORY-DB.md)** - Runtime knowledge store (learns from PRs)
 - [AI Workflow](AI_WORKFLOW.md) - Collaboration guidelines
 - [Language Policy](LANGUAGE-POLICY.md) - English-only requirement
 
@@ -220,9 +226,11 @@ Robson Bot is optimized for AI-assisted development:
 ### Core AI Documents
 
 1. **[AGENTS.md](AGENTS.md)** - Master guide for all AI agents
-2. **[../CLAUDE.md](../CLAUDE.md)** - Claude Code specific context
-3. **[AI_WORKFLOW.md](AI_WORKFLOW.md)** - Collaboration rules
-4. **[LANGUAGE-POLICY.md](LANGUAGE-POLICY.md)** - Why English only
+2. **[SKILL.md](SKILL.md)** - AI Skills Framework and prompt engineering
+3. **[AI-MEMORY-DB.md](AI-MEMORY-DB.md)** - Runtime knowledge store (learns from PRs)
+4. **[../CLAUDE.md](../CLAUDE.md)** - Claude Code specific context
+5. **[AI_WORKFLOW.md](AI_WORKFLOW.md)** - Collaboration rules
+6. **[LANGUAGE-POLICY.md](LANGUAGE-POLICY.md)** - Why English only
 
 ### AI Tool Configuration
 

@@ -540,6 +540,7 @@ Read full context in `docs/adr/`:
 
 For comprehensive context:
 - **[docs/AGENTS.md](docs/AGENTS.md)** - Complete AI guide
+- **[docs/SKILL.md](docs/SKILL.md)** - AI Skills Framework and prompt engineering
 - **[docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)** - Architecture overview
 - **[docs/DEVELOPER.md](docs/DEVELOPER.md)** - Development workflow
 - **[docs/INDEX.md](docs/INDEX.md)** - Navigation hub
@@ -761,9 +762,9 @@ python manage.py sync_transactions   # Sync trades from Binance
 
 ---
 
-**For detailed information, see [docs/AGENTS.md](docs/AGENTS.md).**
+**For detailed information, see [docs/AGENTS.md](docs/AGENTS.md) and [docs/SKILL.md](docs/SKILL.md).**
 
-This guide provides quick context. The full AGENTS.md has comprehensive details on architecture, testing, deployment, troubleshooting, and more.
+This guide provides quick context. The full AGENTS.md has comprehensive details on architecture, testing, deployment, troubleshooting, and more. SKILL.md provides the AI Skills Framework with prompt engineering patterns and decision trees.
 
 ---
 
