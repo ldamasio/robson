@@ -42,7 +42,7 @@ describe("StartNewOperationModal", () => {
     render(
       <AuthContext.Provider value={mockAuthContext}>
         <StartNewOperationModal {...defaultProps} />
-      </AuthContext.Provider>
+      </AuthContext.Provider>,
     );
 
     expect(screen.getByText("Nova Operação BTC/USDC")).toBeInTheDocument();
@@ -62,7 +62,7 @@ describe("StartNewOperationModal", () => {
     render(
       <AuthContext.Provider value={mockAuthContext}>
         <StartNewOperationModal {...defaultProps} />
-      </AuthContext.Provider>
+      </AuthContext.Provider>,
     );
 
     const longCard = screen.getByText("LONG").closest(".card");
@@ -76,7 +76,7 @@ describe("StartNewOperationModal", () => {
           symbol: "BTCUSDC",
           account_type: "ISOLATED_MARGIN",
         },
-        expect.any(Object)
+        expect.any(Object),
       );
     });
 
@@ -95,7 +95,7 @@ describe("StartNewOperationModal", () => {
     render(
       <AuthContext.Provider value={mockAuthContext}>
         <StartNewOperationModal {...defaultProps} />
-      </AuthContext.Provider>
+      </AuthContext.Provider>,
     );
 
     const shortCard = screen.getByText("SHORT").closest(".card");
@@ -109,7 +109,7 @@ describe("StartNewOperationModal", () => {
           symbol: "BTCUSDC",
           account_type: "ISOLATED_MARGIN",
         },
-        expect.any(Object)
+        expect.any(Object),
       );
     });
 
