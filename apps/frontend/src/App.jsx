@@ -1,15 +1,15 @@
-import { BrowserRouter as Router, Routes, Route } from 'react-router-dom'
-import { ToastContainer } from 'react-toastify'
-import 'react-toastify/dist/ReactToastify.css'
-import PrivateRoutes from './utils/PrivateRoutes'
-import AuthContext, { AuthProvider } from './context/AuthContext'
-import HomeScreen from './screens/HomeScreen'
-import SignupScreen from './screens/SignupScreen'
-import LoginScreen from './screens/LoginScreen'
-import LoggedHomeScreen from './screens/LoggedHomeScreen'
-import PatternDetectorScreen from './screens/logged/PatternDetectorScreen'
-import TradingIntentScreen from './screens/logged/TradingIntentScreen'
-import NoPageScreen from "./screens/NoPageScreen"
+import { BrowserRouter as Router, Routes, Route } from "react-router-dom";
+import { ToastContainer } from "react-toastify";
+import "react-toastify/dist/ReactToastify.css";
+import PrivateRoutes from "./utils/PrivateRoutes";
+import AuthContext, { AuthProvider } from "./context/AuthContext";
+import HomeScreen from "./screens/HomeScreen";
+import SignupScreen from "./screens/SignupScreen";
+import LoginScreen from "./screens/LoginScreen";
+import LoggedHomeScreen from "./screens/LoggedHomeScreen";
+import NoPageScreen from "./screens/NoPageScreen";
+import PatternDetectorScreen from "./screens/logged/PatternDetectorScreen";
+import TradingIntentScreen from "./screens/logged/TradingIntentScreen";
 
 function App() {
   return (
@@ -44,4 +44,4 @@ function App() {
   );
 }
 
-export default App
+export default App;

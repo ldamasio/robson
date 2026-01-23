@@ -1,75 +1,85 @@
-import React, { useContext, useEffect, useState } from 'react'
-import { Badge, Card } from 'react-bootstrap'
-import axios from 'axios'
-import { toast } from 'react-toastify'
-import AuthContext from '../../context/AuthContext'
-import LoadingSpinner from '../common/LoadingSpinner'
+import React, { useContext, useEffect, useState } from "react";
+import { Badge, Card, Alert } from "react-bootstrap";
+import axios from "axios";
+import { toast } from "react-toastify";
+import AuthContext from "../../context/AuthContext";
+import LoadingSpinner from "../common/LoadingSpinner";
 
 function Position() {
-  const { authTokens } = useContext(AuthContext)
-  const [positions, setPositions] = useState([])
-  const [loading, setLoading] = useState(true)
-  const [error, setError] = useState(null)
+  const { authTokens } = useContext(AuthContext);
+  const [positions, setPositions] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(null);
 
-  const baseUrl = import.meta.env.VITE_API_BASE_URL || ''
+  const baseUrl = import.meta.env.VITE_API_BASE_URL || "";
 
   const formatCurrency = (value) => {
-    const number = Number(value)
-    if (Number.isNaN(number)) return value || 'N/A'
-    return new Intl.NumberFormat('en-US', {
-      style: 'currency',
-      currency: 'USD',
-      minimumFractionDigits: 2
-    }).format(number)
-  }
+    const number = Number(value);
+    if (Number.isNaN(number)) return value || "N/A";
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: "USD",
+      minimumFractionDigits: 2,
+    }).format(number);
+  };
 
   const formatPercent = (value) => {
-    const number = Number(value)
-    if (Number.isNaN(number)) return value || 'N/A'
-    const sign = number > 0 ? '+' : ''
-    return `${sign}${number.toFixed(2)}%`
-  }
+    const number = Number(value);
+    if (Number.isNaN(number)) return value || "N/A";
+    const sign = number > 0 ? "+" : "";
+    return `${sign}${number.toFixed(2)}%`;
+  };
 
   const fetchPositions = async () => {
     try {
       const response = await axios.get(`${baseUrl}/api/portfolio/positions/`, {
         headers: {
-          Authorization: `Bearer ${authTokens?.access}`
-        }
-      })
-      setPositions(response.data.positions || [])
-      setError(null)
+          Authorization: `Bearer ${authTokens?.access}`,
+        },
+      });
+      // Sort by margin level (ascending - most risky first)
+      const sortedPositions = (response.data.positions || []).sort((a, b) => {
+        const aLevel = parseFloat(a.margin_level) || 999;
+        const bLevel = parseFloat(b.margin_level) || 999;
+        return aLevel - bLevel;
+      });
+      setPositions(sortedPositions);
+      setError(null);
     } catch (err) {
-      setError('Failed to load positions.')
-      toast.error('Failed to load positions.')
+      setError("Failed to load positions.");
+      toast.error("Failed to load positions.");
     } finally {
-      setLoading(false)
+      setLoading(false);
     }
-  }
+  };
 
   useEffect(() => {
-    let isActive = true
+    let isActive = true;
     const loadPositions = async () => {
-      if (!isActive) return
-      await fetchPositions()
-    }
+      if (!isActive) return;
+      await fetchPositions();
+    };
 
-    loadPositions()
+    loadPositions();
     return () => {
-      isActive = false
-    }
-  }, [authTokens?.access])
+      isActive = false;
+    };
+  }, [authTokens?.access]);
 
   const handleRefresh = () => {
-    setLoading(true)
-    fetchPositions()
-  }
+    setLoading(true);
+    fetchPositions();
+  };
 
   return (
     <div className="d-grid gap-3">
       <div className="d-flex justify-content-end mb-2">
-        <button className="btn btn-sm btn-outline-primary" onClick={handleRefresh} disabled={loading}>
-          {loading ? 'Refreshing...' : 'Refresh Positions'}
+        <button
+          className="btn btn-sm btn-outline-primary"
+          onClick={handleRefresh}
+          disabled={loading}
+        >
+          {loading ? "Refreshing..." : "Refresh Positions"}
         </button>
       </div>
 
@@ -81,65 +91,133 @@ function Position() {
         <div className="text-muted text-center py-4">No active positions.</div>
       )}
 
-      {!loading && !error && positions.map((position) => {
-        const pnl = Number(position.unrealized_pnl)
-        const pnlPercent = Number(position.unrealized_pnl_percent)
-        const pnlPositive = pnl > 0
-        const pnlBadge = pnlPositive ? 'success' : pnl < 0 ? 'danger' : 'secondary'
-        const sideLabel = position.side === 'BUY' ? 'LONG' : 'SHORT'
-        const key = position.operation_id || position.id || position.symbol
+      {!loading &&
+        !error &&
+        positions.map((position) => {
+          const pnl = Number(position.unrealized_pnl);
+          const pnlPercent = Number(position.unrealized_pnl_percent);
+          const pnlPositive = pnl > 0;
+          const pnlBadge = pnlPositive
+            ? "success"
+            : pnl < 0
+              ? "danger"
+              : "secondary";
+          const sideLabel = position.side === "BUY" ? "LONG" : "SHORT";
+          const key = position.operation_id || position.id || position.symbol;
 
-        const isMargin = position.type === 'margin'
-        const leverageLabel = isMargin && position.leverage ? `${position.leverage}x` : null
+          const marginLevel = parseFloat(position.margin_level);
+          const isHighRisk = marginLevel < 1.5;
+          const isCriticalRisk = marginLevel < 1.2;
 
-        return (
-          <Card key={key} className="card-premium mb-3">
-            <Card.Body>
-              <div className="d-flex justify-content-between align-items-center mb-3">
-                <div>
-                  <h5 className="mb-1 text-light fw-bold">
-                    {position.symbol}
-                    {isMargin && <Badge bg="warning" className="ms-2 text-dark">MARGIN</Badge>}
-                    {leverageLabel && <Badge bg="secondary" className="ms-1">{leverageLabel}</Badge>}
-                  </h5>
-                  <small className="text-secondary">Side: <span className={position.side === 'BUY' ? 'text-success' : 'text-danger'}>{sideLabel}</span></small>
-                </div>
-                <Badge bg={pnlBadge}>
-                  {formatCurrency(position.unrealized_pnl)} ({formatPercent(position.unrealized_pnl_percent)})
-                </Badge>
-              </div>
-              <div className="d-grid gap-2">
-                <div>Quantity: {position.quantity}</div>
-                <div>Entry: {formatCurrency(position.entry_price)}</div>
-                <div>
-                  Current: {formatCurrency(position.current_price)} ({formatPercent(position.unrealized_pnl_percent)})
-                </div>
-                <div>
-                  Stop: {position.stop_loss ? formatCurrency(position.stop_loss) : 'N/A'}{' '}
-                  {position.distance_to_stop_percent ? `(${position.distance_to_stop_percent}% away)` : ''}
-                </div>
-                <div>
-                  Target: {position.take_profit ? formatCurrency(position.take_profit) : 'N/A'}{' '}
-                  {position.distance_to_target_percent ? `(${position.distance_to_target_percent}% to go)` : ''}
-                </div>
-                {isMargin && (
-                  <div className="mt-2 pt-2 border-top border-secondary">
-                    <small className="text-muted">
-                      <strong>Margin Info:</strong>{' '}
-                      {position.leverage && `${position.leverage}x leverage`}
-                      {position.risk_amount && ` | Risk: ${formatCurrency(position.risk_amount)}`}
-                      {position.risk_percent && ` (${position.risk_percent}%)`}
-                      {position.margin_level && ` | Margin Level: ${position.margin_level}%`}
-                    </small>
+          return (
+            <Card key={key} className="card-premium mb-3">
+              <Card.Body>
+                {/* Header: Symbol + Margin Level DESTACADO */}
+                <div className="d-flex justify-content-between align-items-start mb-3">
+                  <div>
+                    <h5 className="mb-1 text-light fw-bold">
+                      {position.symbol}
+                      <Badge
+                        bg={position.side === "BUY" ? "success" : "danger"}
+                        className="ms-2"
+                      >
+                        {sideLabel}
+                      </Badge>
+                    </h5>
                   </div>
+                  <div className="text-end">
+                    <small className="text-secondary d-block">
+                      Margin Level
+                    </small>
+                    <h3
+                      className={`mb-0 fw-bold ${isCriticalRisk ? "text-danger" : isHighRisk ? "text-warning" : "text-success"}`}
+                    >
+                      {position.margin_level || "N/A"}
+                    </h3>
+                    {isCriticalRisk && (
+                      <Badge bg="danger" className="mt-1">
+                        RISCO CRÍTICO
+                      </Badge>
+                    )}
+                    {isHighRisk && !isCriticalRisk && (
+                      <Badge bg="warning" text="dark" className="mt-1">
+                        RISCO ALTO
+                      </Badge>
+                    )}
+                  </div>
+                </div>
+
+                {/* Alert de risco se margin level baixo */}
+                {isCriticalRisk && (
+                  <Alert variant="danger" className="py-2 mb-3">
+                    ⚠️ Margin level crítico! Risco de liquidação.
+                  </Alert>
                 )}
-              </div>
-            </Card.Body>
-          </Card>
-        )
-      })}
+
+                {/* PnL */}
+                <div className="mb-3 pb-3 border-bottom border-secondary">
+                  <div className="d-flex justify-content-between align-items-center">
+                    <span className="text-secondary">PnL Não Realizado:</span>
+                    <Badge bg={pnlBadge} className="fs-6">
+                      {formatCurrency(position.unrealized_pnl)} (
+                      {formatPercent(position.unrealized_pnl_percent)})
+                    </Badge>
+                  </div>
+                </div>
+
+                {/* Informações da posição */}
+                <div className="d-grid gap-2">
+                  <div className="d-flex justify-content-between">
+                    <span className="text-secondary">Quantidade:</span>
+                    <span className="text-light">{position.quantity}</span>
+                  </div>
+                  <div className="d-flex justify-content-between">
+                    <span className="text-secondary">Preço de Entrada:</span>
+                    <span className="text-light">
+                      {formatCurrency(position.entry_price)}
+                    </span>
+                  </div>
+                  <div className="d-flex justify-content-between">
+                    <span className="text-secondary">Preço Atual:</span>
+                    <span className="text-light">
+                      {formatCurrency(position.current_price)}
+                    </span>
+                  </div>
+                  <div className="d-flex justify-content-between">
+                    <span className="text-secondary">Stop Loss:</span>
+                    <span className="text-light">
+                      {position.stop_loss
+                        ? formatCurrency(position.stop_loss)
+                        : "N/A"}
+                      {position.distance_to_stop_percent &&
+                        ` (${position.distance_to_stop_percent}% away)`}
+                    </span>
+                  </div>
+                  <div className="d-flex justify-content-between">
+                    <span className="text-secondary">Take Profit:</span>
+                    <span className="text-light">
+                      {position.take_profit
+                        ? formatCurrency(position.take_profit)
+                        : "N/A"}
+                      {position.distance_to_target_percent &&
+                        ` (${position.distance_to_target_percent}% to go)`}
+                    </span>
+                  </div>
+                  {position.leverage && (
+                    <div className="d-flex justify-content-between">
+                      <span className="text-secondary">Alavancagem:</span>
+                      <Badge bg="warning" text="dark">
+                        {position.leverage}x
+                      </Badge>
+                    </div>
+                  )}
+                </div>
+              </Card.Body>
+            </Card>
+          );
+        })}
     </div>
-  )
+  );
 }
 
-export default Position
+export default Position;

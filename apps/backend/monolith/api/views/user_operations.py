@@ -8,19 +8,20 @@ Key Principle: USER initiates, ROBSON calculates, USER confirms.
 """
 
 from decimal import Decimal
+
+from django.db import transaction
+from django.utils import timezone
+from rest_framework import status
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
-from rest_framework import status
-from django.db import transaction
-from django.utils import timezone
 
 from api.models import Operation, Order, Strategy, Symbol
-from api.services.position_sizing import PositionSizingCalculator
 from api.services.binance_service import BinanceService
+from api.services.position_sizing import PositionSizingCalculator
 
 
-@api_view(['POST'])
+@api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def calculate_position_size(request):
     """
@@ -58,21 +59,21 @@ def calculate_position_size(request):
     }
     """
     # Parse request
-    symbol_name = request.data.get('symbol')
-    side = request.data.get('side')
-    entry_price_str = request.data.get('entry_price')
-    stop_price_str = request.data.get('stop_price')
-    capital_str = request.data.get('capital')
-    max_risk_percent_str = request.data.get('max_risk_percent', '1.0')
+    symbol_name = request.data.get("symbol")
+    side = request.data.get("side")
+    entry_price_str = request.data.get("entry_price")
+    stop_price_str = request.data.get("stop_price")
+    capital_str = request.data.get("capital")
+    max_risk_percent_str = request.data.get("max_risk_percent", "1.0")
 
     # Validation
     if not all([symbol_name, side, entry_price_str, stop_price_str]):
         return Response(
             {
-                'error': 'Missing required fields',
-                'required': ['symbol', 'side', 'entry_price', 'stop_price']
+                "error": "Missing required fields",
+                "required": ["symbol", "side", "entry_price", "stop_price"],
             },
-            status=status.HTTP_400_BAD_REQUEST
+            status=status.HTTP_400_BAD_REQUEST,
         )
 
     try:
@@ -89,8 +90,7 @@ def calculate_position_size(request):
 
     except (ValueError, TypeError) as e:
         return Response(
-            {'error': f'Invalid decimal values: {e}'},
-            status=status.HTTP_400_BAD_REQUEST
+            {"error": f"Invalid decimal values: {e}"}, status=status.HTTP_400_BAD_REQUEST
         )
 
     # Calculate position size (Robson's intelligence)
@@ -103,61 +103,52 @@ def calculate_position_size(request):
             max_risk_percent=max_risk_percent,
         )
     except ValueError as e:
-        return Response(
-            {'error': str(e)},
-            status=status.HTTP_400_BAD_REQUEST
-        )
+        return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     # Perform additional validations
     warnings = []
     errors = []
 
     # Check if position is capped
-    if calc['is_capped']:
-        warnings.append(
-            f"Position capped at 50% of capital (${calc['position_value']})"
-        )
+    if calc["is_capped"]:
+        warnings.append(f"Position capped at 50% of capital (${calc['position_value']})")
 
     # Check risk percent
-    if calc['risk_percent'] > max_risk_percent:
-        errors.append(
-            f"Risk exceeds limit: {calc['risk_percent']}% > {max_risk_percent}%"
-        )
+    if calc["risk_percent"] > max_risk_percent:
+        errors.append(f"Risk exceeds limit: {calc['risk_percent']}% > {max_risk_percent}%")
 
     # Check stop distance (warn if too tight)
-    if calc['stop_distance_percent'] < Decimal("0.5"):
-        warnings.append(
-            f"Stop is very tight: {calc['stop_distance_percent']}% (consider widening)"
-        )
+    if calc["stop_distance_percent"] < Decimal("0.5"):
+        warnings.append(f"Stop is very tight: {calc['stop_distance_percent']}% (consider widening)")
 
     # Check stop distance (warn if too wide)
-    if calc['stop_distance_percent'] > Decimal("10.0"):
-        warnings.append(
-            f"Stop is very wide: {calc['stop_distance_percent']}% (high risk)"
-        )
+    if calc["stop_distance_percent"] > Decimal("10.0"):
+        warnings.append(f"Stop is very wide: {calc['stop_distance_percent']}% (high risk)")
 
     validation_passed = len(errors) == 0
 
     # Return calculation result
-    return Response({
-        'quantity': str(calc['quantity']),
-        'position_value': str(calc['position_value']),
-        'risk_amount': str(calc['risk_amount']),
-        'risk_percent': str(calc['risk_percent']),
-        'stop_distance': str(calc['stop_distance']),
-        'stop_distance_percent': str(calc['stop_distance_percent']),
-        'is_capped': calc['is_capped'],
-        'validation': {
-            'passed': validation_passed,
-            'warnings': warnings,
-            'errors': errors,
-        },
-        'capital_used': str(capital),
-        'max_risk_percent': str(max_risk_percent),
-    })
+    return Response(
+        {
+            "quantity": str(calc["quantity"]),
+            "position_value": str(calc["position_value"]),
+            "risk_amount": str(calc["risk_amount"]),
+            "risk_percent": str(calc["risk_percent"]),
+            "stop_distance": str(calc["stop_distance"]),
+            "stop_distance_percent": str(calc["stop_distance_percent"]),
+            "is_capped": calc["is_capped"],
+            "validation": {
+                "passed": validation_passed,
+                "warnings": warnings,
+                "errors": errors,
+            },
+            "capital_used": str(capital),
+            "max_risk_percent": str(max_risk_percent),
+        }
+    )
 
 
-@api_view(['POST'])
+@api_view(["POST"])
 @permission_classes([IsAuthenticated])
 def create_user_operation(request):
     """
@@ -203,25 +194,22 @@ def create_user_operation(request):
     }
     """
     # Parse request
-    symbol_name = request.data.get('symbol')
-    side = request.data.get('side')
-    entry_price_str = request.data.get('entry_price')
-    stop_price_str = request.data.get('stop_price')
-    target_price_str = request.data.get('target_price')
-    strategy_name = request.data.get('strategy_name')
-    execute = request.data.get('execute', False)
-    capital_str = request.data.get('capital')
-    max_risk_percent_str = request.data.get('max_risk_percent', '1.0')
+    symbol_name = request.data.get("symbol")
+    side = request.data.get("side")
+    entry_price_str = request.data.get("entry_price")
+    stop_price_str = request.data.get("stop_price")
+    target_price_str = request.data.get("target_price")
+    strategy_name = request.data.get("strategy_name")
+    execute = request.data.get("execute", False)
+    capital_str = request.data.get("capital")
+    max_risk_percent_str = request.data.get("max_risk_percent", "1.0")
 
     # Validation
-    required_fields = ['symbol', 'side', 'entry_price', 'stop_price', 'strategy_name']
+    required_fields = ["symbol", "side", "entry_price", "stop_price", "strategy_name"]
     if not all([symbol_name, side, entry_price_str, stop_price_str, strategy_name]):
         return Response(
-            {
-                'error': 'Missing required fields',
-                'required': required_fields
-            },
-            status=status.HTTP_400_BAD_REQUEST
+            {"error": "Missing required fields", "required": required_fields},
+            status=status.HTTP_400_BAD_REQUEST,
         )
 
     try:
@@ -238,8 +226,7 @@ def create_user_operation(request):
 
     except (ValueError, TypeError) as e:
         return Response(
-            {'error': f'Invalid decimal values: {e}'},
-            status=status.HTTP_400_BAD_REQUEST
+            {"error": f"Invalid decimal values: {e}"}, status=status.HTTP_400_BAD_REQUEST
         )
 
     # Get user's client
@@ -255,23 +242,20 @@ def create_user_operation(request):
             max_risk_percent=max_risk_percent,
         )
     except ValueError as e:
-        return Response(
-            {'error': str(e)},
-            status=status.HTTP_400_BAD_REQUEST
-        )
+        return Response({"error": str(e)}, status=status.HTTP_400_BAD_REQUEST)
 
     # Risk validation
-    if calc['risk_percent'] > max_risk_percent:
+    if calc["risk_percent"] > max_risk_percent:
         return Response(
             {
-                'error': 'Risk validation failed',
-                'details': {
-                    'risk_percent': str(calc['risk_percent']),
-                    'limit_percent': str(max_risk_percent),
-                    'reason': 'Risk exceeds limit'
-                }
+                "error": "Risk validation failed",
+                "details": {
+                    "risk_percent": str(calc["risk_percent"]),
+                    "limit_percent": str(max_risk_percent),
+                    "reason": "Risk exceeds limit",
+                },
             },
-            status=status.HTTP_400_BAD_REQUEST
+            status=status.HTTP_400_BAD_REQUEST,
         )
 
     # Create operation
@@ -282,10 +266,18 @@ def create_user_operation(request):
                 client=client,
                 name=symbol_name.upper(),
                 defaults={
-                    'base_asset': symbol_name[:-4] if symbol_name.endswith(('USDC', 'USDT')) else symbol_name[:3],
-                    'quote_asset': symbol_name[-4:] if symbol_name.endswith(('USDC', 'USDT')) else symbol_name[3:],
-                    'is_active': True,
-                }
+                    "base_asset": (
+                        symbol_name[:-4]
+                        if symbol_name.endswith(("USDC", "USDT"))
+                        else symbol_name[:3]
+                    ),
+                    "quote_asset": (
+                        symbol_name[-4:]
+                        if symbol_name.endswith(("USDC", "USDT"))
+                        else symbol_name[3:]
+                    ),
+                    "is_active": True,
+                },
             )
 
             # Get or create strategy
@@ -293,13 +285,13 @@ def create_user_operation(request):
                 client=client,
                 name=strategy_name,
                 defaults={
-                    'description': f'User-selected strategy: {strategy_name}',
-                    'is_active': True,
-                    'config': {},
-                    'risk_config': {
-                        'max_risk_per_trade_percent': str(max_risk_percent),
+                    "description": f"User-selected strategy: {strategy_name}",
+                    "is_active": True,
+                    "config": {},
+                    "risk_config": {
+                        "max_risk_per_trade_percent": str(max_risk_percent),
                     },
-                }
+                },
             )
 
             # Create Operation with ABSOLUTE stop/target prices
@@ -309,14 +301,13 @@ def create_user_operation(request):
                 symbol=symbol,
                 strategy=strategy,
                 side=side,
-                status='PLANNED',
+                status="PLANNED",
                 stop_price=stop_price,  # ⭐ Absolute stop level (from user)
                 target_price=target_price,  # ⭐ Absolute target level (optional)
                 # Also calculate percentages for reference (DEPRECATED fields)
-                stop_loss_percent=calc['stop_distance_percent'],  # Reference only
+                stop_loss_percent=calc["stop_distance_percent"],  # Reference only
                 stop_gain_percent=(
-                    abs((target_price - entry_price) / entry_price * 100)
-                    if target_price else None
+                    abs((target_price - entry_price) / entry_price * 100) if target_price else None
                 ),
             )
 
@@ -326,10 +317,10 @@ def create_user_operation(request):
                 symbol=symbol,
                 strategy=strategy,
                 side=side,
-                order_type='MARKET',
-                quantity=calc['quantity'],
+                order_type="MARKET",
+                quantity=calc["quantity"],
                 price=entry_price,
-                status='PENDING',
+                status="PENDING",
                 stop_loss_price=stop_price,
             )
 
@@ -346,22 +337,25 @@ def create_user_operation(request):
                 result = binance.client.create_order(
                     symbol=symbol_name.upper(),
                     side=side,
-                    type='MARKET',
-                    quantity=str(calc['quantity'])
+                    type="MARKET",
+                    quantity=str(calc["quantity"]),
                 )
 
                 # Update order with results
-                entry_order.binance_order_id = result.get('orderId')
-                entry_order.status = result.get('status', 'FILLED')
-                entry_order.filled_quantity = Decimal(str(result.get('executedQty', str(calc['quantity']))))
+                entry_order.binance_order_id = result.get("orderId")
+                entry_order.status = result.get("status", "FILLED")
+                entry_order.filled_quantity = Decimal(
+                    str(result.get("executedQty", str(calc["quantity"])))
+                )
 
-                if 'fills' in result:
+                if "fills" in result:
                     total_cost = sum(
-                        Decimal(f['price']) * Decimal(f['qty'])
-                        for f in result['fills']
+                        Decimal(f["price"]) * Decimal(f["qty"]) for f in result["fills"]
                     )
-                    total_filled = sum(Decimal(f['qty']) for f in result['fills'])
-                    entry_order.avg_fill_price = total_cost / total_filled if total_filled else entry_price
+                    total_filled = sum(Decimal(f["qty"]) for f in result["fills"])
+                    entry_order.avg_fill_price = (
+                        total_cost / total_filled if total_filled else entry_price
+                    )
                 else:
                     entry_order.avg_fill_price = entry_price
 
@@ -369,34 +363,41 @@ def create_user_operation(request):
                 entry_order.save()
 
                 # Update operation
-                operation.status = 'ACTIVE'
+                operation.status = "ACTIVE"
                 operation.save()
 
                 binance_order_id = entry_order.binance_order_id
                 fill_price = entry_order.avg_fill_price
 
             # Return success
-            return Response({
-                'operation_id': operation.id,
-                'order_id': entry_order.id,
-                'status': operation.status,
-                'calculated_quantity': str(calc['quantity']),
-                'calculated_risk': str(calc['risk_amount']),
-                'calculated_risk_percent': str(calc['risk_percent']),
-                'position_value': str(calc['position_value']),
-                'binance_order_id': str(binance_order_id) if binance_order_id else None,
-                'fill_price': str(fill_price) if fill_price else None,
-                'message': 'Operation created successfully' if not execute else 'Operation created and executed',
-            }, status=status.HTTP_201_CREATED)
+            return Response(
+                {
+                    "operation_id": operation.id,
+                    "order_id": entry_order.id,
+                    "status": operation.status,
+                    "calculated_quantity": str(calc["quantity"]),
+                    "calculated_risk": str(calc["risk_amount"]),
+                    "calculated_risk_percent": str(calc["risk_percent"]),
+                    "position_value": str(calc["position_value"]),
+                    "binance_order_id": str(binance_order_id) if binance_order_id else None,
+                    "fill_price": str(fill_price) if fill_price else None,
+                    "message": (
+                        "Operation created successfully"
+                        if not execute
+                        else "Operation created and executed"
+                    ),
+                },
+                status=status.HTTP_201_CREATED,
+            )
 
     except Exception as e:
         return Response(
-            {'error': f'Failed to create operation: {str(e)}'},
-            status=status.HTTP_500_INTERNAL_SERVER_ERROR
+            {"error": f"Failed to create operation: {e!s}"},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
         )
 
 
-@api_view(['GET'])
+@api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def list_user_strategies(request):
     """
@@ -426,16 +427,91 @@ def list_user_strategies(request):
 
     strategies_data = []
     for strategy in strategies:
-        strategies_data.append({
-            'id': strategy.id,
-            'name': strategy.name,
-            'description': strategy.description,
-            'is_active': strategy.is_active,
-            'performance': {
-                'total_trades': strategy.total_trades,
-                'win_rate': strategy.win_rate,
-                'total_pnl': str(strategy.total_pnl),
-            },
-        })
+        strategies_data.append(
+            {
+                "id": strategy.id,
+                "name": strategy.name,
+                "description": strategy.description,
+                "is_active": strategy.is_active,
+                "performance": {
+                    "total_trades": strategy.total_trades,
+                    "win_rate": strategy.win_rate,
+                    "total_pnl": str(strategy.total_pnl),
+                },
+            }
+        )
 
-    return Response({'strategies': strategies_data})
+    return Response({"strategies": strategies_data})
+
+
+@api_view(["POST"])
+@permission_classes([IsAuthenticated])
+def register_operation_intent(request):
+    """
+    Simplified endpoint for MVP to register a user's trading intent.
+    Focused on Isolated Margin BTC/USDC.
+
+    POST /api/operations/
+
+    Payload:
+    {
+        "strategy_name": "BTC Long",
+        "symbol": "BTCUSDC",
+        "account_type": "ISOLATED_MARGIN"
+    }
+    """
+    strategy_name = request.data.get("strategy_name")
+    symbol_name = request.data.get("symbol", "BTCUSDC")
+
+    client = request.user.client
+
+    try:
+        # 1. Get strategy and symbol
+        strategy = Strategy.objects.get(client=client, name=strategy_name)
+        symbol, _ = Symbol.objects.get_or_create(
+            client=client,
+            name=symbol_name.upper(),
+            defaults={
+                "base_asset": "BTC",
+                "quote_asset": "USDC",
+                "is_active": True,
+            },
+        )
+
+        # 2. Extract side from strategy config
+        side = strategy.config.get("side", "BUY")
+
+        # 3. Create Operation in PLANNED state
+        # This "prepares the ground" for async processing
+        operation = Operation.objects.create(
+            client=client,
+            symbol=symbol,
+            strategy=strategy,
+            side=side,
+            status="PLANNED",
+            # Note: stop_price and target_price will be set by the async monitor
+            # when it actually validates and opens the position on Binance.
+        )
+
+        return Response(
+            {
+                "operation_id": operation.id,
+                "strategy": strategy.name,
+                "symbol": symbol.name,
+                "side": side,
+                "status": operation.status,
+                "message": "Intenção de operação registrada com sucesso. Aguardando processamento.",
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    except Strategy.DoesNotExist:
+        return Response(
+            {"error": f'Estratégia "{strategy_name}" não encontrada para este cliente.'},
+            status=status.HTTP_404_NOT_FOUND,
+        )
+    except Exception as e:
+        return Response(
+            {"error": f"Falha ao registrar intenção: {e!s}"},
+            status=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        )

@@ -1,5 +1,6 @@
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import ROUND_HALF_UP, Decimal
 
+from clients.models import Client
 from rest_framework.decorators import api_view, permission_classes
 from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
@@ -7,7 +8,6 @@ from rest_framework.response import Response
 from api.models import Operation, Order
 from api.models.margin import MarginPosition
 from api.services.market_price_cache import get_cached_bid
-from clients.models import Client
 
 USD_QUANT = Decimal("0.01")
 PERCENT_QUANT = Decimal("0.01")
@@ -57,19 +57,19 @@ def _calculate_distance_percent(target_price: Decimal, current_price: Decimal) -
     return ((target_price - current_price) / current_price) * Decimal("100")
 
 
-@api_view(['GET'])
+@api_view(["GET"])
 @permission_classes([IsAuthenticated])
 def active_positions(request):
     """
     Return active positions with current price and unrealized P&L.
-    
+
     Includes BOTH:
     - Spot positions (from Operation model)
     - Margin positions (from MarginPosition model)
     """
     try:
         # Get client - try user.client_id first, then fallback to Client ID 1
-        client_id = getattr(request.user, 'client_id', None)
+        client_id = getattr(request.user, "client_id", None)
         client = None
         if client_id:
             try:
@@ -123,9 +123,13 @@ def active_positions(request):
             stop_loss_price = None
             take_profit_price = None
             if entry_price and operation.stop_loss_percent:
-                stop_loss_price = _calculate_stop_price(entry_price, operation.stop_loss_percent, operation.side)
+                stop_loss_price = _calculate_stop_price(
+                    entry_price, operation.stop_loss_percent, operation.side
+                )
             if entry_price and operation.stop_gain_percent:
-                take_profit_price = _calculate_target_price(entry_price, operation.stop_gain_percent, operation.side)
+                take_profit_price = _calculate_target_price(
+                    entry_price, operation.stop_gain_percent, operation.side
+                )
 
             distance_to_stop = None
             distance_to_target = None
@@ -134,23 +138,29 @@ def active_positions(request):
             if take_profit_price is not None:
                 distance_to_target = _calculate_distance_percent(take_profit_price, current_price)
 
-            positions.append({
-                "id": operation.id,
-                "operation_id": operation.id,
-                "symbol": symbol,
-                "side": operation.side,
-                "quantity": _format_decimal(quantity, QTY_QUANT),
-                "entry_price": _format_decimal(entry_price, USD_QUANT),
-                "current_price": _format_decimal(current_price, USD_QUANT),
-                "unrealized_pnl": _format_decimal(unrealized_pnl, USD_QUANT),
-                "unrealized_pnl_percent": _format_decimal(unrealized_pnl_percent, PERCENT_QUANT),
-                "stop_loss": _format_decimal(stop_loss_price, USD_QUANT),
-                "take_profit": _format_decimal(take_profit_price, USD_QUANT),
-                "distance_to_stop_percent": _format_decimal(distance_to_stop, PERCENT_QUANT),
-                "distance_to_target_percent": _format_decimal(distance_to_target, PERCENT_QUANT),
-                "status": "OPEN",
-                "type": "spot",
-            })
+            positions.append(
+                {
+                    "id": operation.id,
+                    "operation_id": operation.id,
+                    "symbol": symbol,
+                    "side": operation.side,
+                    "quantity": _format_decimal(quantity, QTY_QUANT),
+                    "entry_price": _format_decimal(entry_price, USD_QUANT),
+                    "current_price": _format_decimal(current_price, USD_QUANT),
+                    "unrealized_pnl": _format_decimal(unrealized_pnl, USD_QUANT),
+                    "unrealized_pnl_percent": _format_decimal(
+                        unrealized_pnl_percent, PERCENT_QUANT
+                    ),
+                    "stop_loss": _format_decimal(stop_loss_price, USD_QUANT),
+                    "take_profit": _format_decimal(take_profit_price, USD_QUANT),
+                    "distance_to_stop_percent": _format_decimal(distance_to_stop, PERCENT_QUANT),
+                    "distance_to_target_percent": _format_decimal(
+                        distance_to_target, PERCENT_QUANT
+                    ),
+                    "status": "OPEN",
+                    "type": "spot",
+                }
+            )
 
         # ============================================
         # PART 2: Margin Positions (new)
@@ -159,8 +169,35 @@ def active_positions(request):
         if client:
             margin_positions = margin_positions.filter(client=client)
 
+        # Soft Sync: Attempt to update margin level from Binance for open positions
+        # This ensures real-time data in production environment
+        try:
+            from .margin_views import _get_adapter
+
+            adapter = _get_adapter()
+        except ImportError:
+            adapter = None
+
         for mp in margin_positions:
             symbol = mp.symbol
+
+            # Real-time synchronization (Soft Sync)
+            current_margin_level = mp.margin_level
+            if adapter:
+                try:
+                    # In production, this will fetch the real-time value (e.g., 1.12)
+                    new_margin_level = adapter.get_margin_level(symbol)
+                    if new_margin_level:
+                        mp.margin_level = new_margin_level
+                        mp.save(update_fields=["margin_level", "updated_at"])
+                        current_margin_level = new_margin_level
+                except Exception as api_err:
+                    # Fail silently in local dev if IP is not whitelisted,
+                    # fallback to DB value (e.g., 3.06)
+                    import logging
+
+                    logging.getLogger("api").debug(f"Soft Sync failed for {symbol}: {api_err}")
+
             entry_price = mp.entry_price
             quantity = mp.quantity
             stop_price = mp.stop_price
@@ -190,30 +227,39 @@ def active_positions(request):
             # Determine side label for display
             side = "BUY" if mp.side == MarginPosition.Side.LONG else "SELL"
 
-            positions.append({
-                "id": f"margin-{mp.id}",
-                "operation_id": mp.position_id,
-                "symbol": symbol,
-                "side": side,
-                "quantity": _format_decimal(quantity, QTY_QUANT),
-                "entry_price": _format_decimal(entry_price, USD_QUANT),
-                "current_price": _format_decimal(current_price, USD_QUANT),
-                "unrealized_pnl": _format_decimal(unrealized_pnl, USD_QUANT),
-                "unrealized_pnl_percent": _format_decimal(unrealized_pnl_percent, PERCENT_QUANT),
-                "stop_loss": _format_decimal(stop_price, USD_QUANT),
-                "take_profit": None,  # Margin positions don't have take-profit yet
-                "distance_to_stop_percent": _format_decimal(distance_to_stop, PERCENT_QUANT),
-                "distance_to_target_percent": None,
-                "status": "OPEN",
-                "type": "margin",
-                "leverage": mp.leverage,
-                "risk_amount": _format_decimal(mp.risk_amount, USD_QUANT),
-                "risk_percent": _format_decimal(mp.risk_percent, PERCENT_QUANT),
-                "margin_level": _format_decimal(mp.margin_level, PERCENT_QUANT) if mp.margin_level else None,
-            })
+            positions.append(
+                {
+                    "id": f"margin-{mp.id}",
+                    "operation_id": mp.position_id,
+                    "symbol": symbol,
+                    "side": side,
+                    "quantity": _format_decimal(quantity, QTY_QUANT),
+                    "entry_price": _format_decimal(entry_price, USD_QUANT),
+                    "current_price": _format_decimal(current_price, USD_QUANT),
+                    "unrealized_pnl": _format_decimal(unrealized_pnl, USD_QUANT),
+                    "unrealized_pnl_percent": _format_decimal(
+                        unrealized_pnl_percent, PERCENT_QUANT
+                    ),
+                    "stop_loss": _format_decimal(stop_price, USD_QUANT),
+                    "take_profit": None,  # Margin positions don't have take-profit yet
+                    "distance_to_stop_percent": _format_decimal(distance_to_stop, PERCENT_QUANT),
+                    "distance_to_target_percent": None,
+                    "status": "OPEN",
+                    "type": "margin",
+                    "leverage": mp.leverage,
+                    "risk_amount": _format_decimal(mp.risk_amount, USD_QUANT),
+                    "risk_percent": _format_decimal(mp.risk_percent, PERCENT_QUANT),
+                    "margin_level": (
+                        _format_decimal(current_margin_level, PERCENT_QUANT)
+                        if current_margin_level
+                        else None
+                    ),
+                }
+            )
 
         return Response({"positions": positions})
     except Exception as e:
         import logging
+
         logging.error(f"Failed to get positions: {e}", exc_info=True)
-        return Response({"error": f"Failed to get positions: {str(e)}"}, status=500)
+        return Response({"error": f"Failed to get positions: {e!s}"}, status=500)
