@@ -20,7 +20,7 @@ vi.mock('react-toastify', () => ({
 import axios from 'axios'
 
 describe('Position component', () => {
-  it('renders active positions from the API', async () => {
+  it('renders active positions from the API with margin level', async () => {
     axios.get.mockResolvedValue({
       data: {
         positions: [
@@ -35,8 +35,7 @@ describe('Position component', () => {
             unrealized_pnl_percent: '0.46',
             stop_loss: '87061.16',
             take_profit: '92391.44',
-            distance_to_stop_percent: '-15.3',
-            distance_to_target_percent: '3.5'
+            margin_level: '1.55'
           }
         ]
       }
@@ -50,6 +49,8 @@ describe('Position component', () => {
 
     await waitFor(() => {
       expect(screen.getByText('BTCUSDC')).toBeTruthy()
+      expect(screen.getByText('1.55')).toBeTruthy()
+      expect(screen.getByText(/Margin Level/i)).toBeTruthy()
     })
   })
 })
