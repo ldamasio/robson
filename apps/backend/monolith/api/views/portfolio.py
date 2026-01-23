@@ -165,95 +165,124 @@ def active_positions(request):
         # ============================================
         # PART 2: Margin Positions (new)
         # ============================================
-        margin_positions = MarginPosition.objects.filter(status=MarginPosition.Status.OPEN)
+        margin_positions_raw = MarginPosition.objects.filter(status=MarginPosition.Status.OPEN)
         if client:
-            margin_positions = margin_positions.filter(client=client)
+            margin_positions_raw = margin_positions_raw.filter(client=client)
 
-        # Soft Sync: Attempt to update margin level from Binance for open positions
-        # This ensures real-time data in production environment
+        # Group by symbol to avoid duplicate cards for the same Isolated Margin account
+        grouped_margin = {}
+
         try:
             from .margin_views import _get_adapter
-
             adapter = _get_adapter()
         except ImportError:
             adapter = None
 
-        for mp in margin_positions:
+        for mp in margin_positions_raw:
             symbol = mp.symbol
+            if symbol not in grouped_margin:
+                # Get current price
+                if symbol not in price_cache:
+                    price_cache[symbol] = get_cached_bid(symbol)
+                current_price = price_cache[symbol]
 
-            # Real-time synchronization (Soft Sync)
-            current_margin_level = mp.margin_level
-            if adapter:
-                try:
-                    # In production, this will fetch the real-time value (e.g., 1.12)
-                    new_margin_level = adapter.get_margin_level(symbol)
-                    if new_margin_level:
-                        mp.margin_level = new_margin_level
-                        mp.save(update_fields=["margin_level", "updated_at"])
-                        current_margin_level = new_margin_level
-                except Exception as api_err:
-                    # Fail silently in local dev if IP is not whitelisted,
-                    # fallback to DB value (e.g., 3.06)
-                    import logging
+                # Soft Sync: Get live margin level from Binance
+                current_margin_level = mp.margin_level
+                if adapter:
+                    try:
+                        new_margin_level = adapter.get_margin_level(symbol)
+                        if new_margin_level:
+                            current_margin_level = new_margin_level
+                    except Exception:
+                        pass
 
-                    logging.getLogger("api").debug(f"Soft Sync failed for {symbol}: {api_err}")
+                grouped_margin[symbol] = {
+                    "symbol": symbol,
+                    "total_qty_long": Decimal("0"),
+                    "total_qty_short": Decimal("0"),
+                    "total_cost_long": Decimal("0"),
+                    "total_cost_short": Decimal("0"),
+                    "current_price": current_price,
+                    "margin_level": current_margin_level,
+                    "stop_loss": mp.stop_price, # Use most recent/valid stop
+                    "leverage": mp.leverage,
+                    "risk_amount": Decimal("0"),
+                    "risk_percent": Decimal("0"),
+                }
+            
+            # Aggregate weights
+            if mp.side == MarginPosition.Side.LONG:
+                grouped_margin[symbol]["total_qty_long"] += mp.quantity
+                grouped_margin[symbol]["total_cost_long"] += mp.quantity * mp.entry_price
+            else:
+                grouped_margin[symbol]["total_qty_short"] += mp.quantity
+                grouped_margin[symbol]["total_cost_short"] += mp.quantity * mp.entry_price
+            
+            grouped_margin[symbol]["risk_amount"] += mp.risk_amount
+            grouped_margin[symbol]["risk_percent"] += mp.risk_percent
+            # Keep the leverage of the largest part or simply the last one
+            grouped_margin[symbol]["leverage"] = max(grouped_margin[symbol]["leverage"], mp.leverage)
+            # Use most conservative stop (lowest for long, highest for short)
+            if mp.side == MarginPosition.Side.LONG:
+                grouped_margin[symbol]["stop_loss"] = min(grouped_margin[symbol]["stop_loss"], mp.stop_price)
+            else:
+                grouped_margin[symbol]["stop_loss"] = max(grouped_margin[symbol]["stop_loss"], mp.stop_price)
 
-            entry_price = mp.entry_price
-            quantity = mp.quantity
-            stop_price = mp.stop_price
-
-            # Get current price
-            if symbol not in price_cache:
-                price_cache[symbol] = get_cached_bid(symbol)
-            current_price = price_cache[symbol]
+        # Convert grouped to final format
+        for symbol, data in grouped_margin.items():
+            net_qty = data["total_qty_long"] - data["total_qty_short"]
+            if net_qty == 0:
+                continue # Skip if zeroized (rare but possible in this logic)
+            
+            net_side = "BUY" if net_qty > 0 else "SELL"
+            abs_qty = abs(net_qty)
+            
+            # Weighted entry price
+            if net_qty > 0:
+                avg_entry = data["total_cost_long"] / data["total_qty_long"] if data["total_qty_long"] else Decimal("0")
+            else:
+                avg_entry = data["total_cost_short"] / data["total_qty_short"] if data["total_qty_short"] else Decimal("0")
 
             # Calculate P&L
             unrealized_pnl = Decimal("0")
             unrealized_pnl_percent = Decimal("0")
-            if entry_price and quantity and current_price:
-                if mp.side == MarginPosition.Side.LONG:
-                    unrealized_pnl = (current_price - entry_price) * quantity
+            current_price = data["current_price"]
+            
+            if avg_entry and abs_qty and current_price:
+                if net_side == "BUY":
+                    unrealized_pnl = (current_price - avg_entry) * abs_qty
                 else:
-                    unrealized_pnl = (entry_price - current_price) * quantity
-                cost_basis = entry_price * quantity
+                    unrealized_pnl = (avg_entry - current_price) * abs_qty
+                
+                cost_basis = avg_entry * abs_qty
                 if cost_basis != 0:
                     unrealized_pnl_percent = (unrealized_pnl / cost_basis) * Decimal("100")
 
-            # Calculate distance to stop
             distance_to_stop = None
-            if stop_price and current_price:
-                distance_to_stop = _calculate_distance_percent(stop_price, current_price)
-
-            # Determine side label for display
-            side = "BUY" if mp.side == MarginPosition.Side.LONG else "SELL"
+            if data["stop_loss"] and current_price:
+                distance_to_stop = _calculate_distance_percent(data["stop_loss"], current_price)
 
             positions.append(
                 {
-                    "id": f"margin-{mp.id}",
-                    "operation_id": mp.position_id,
+                    "id": f"margin-{symbol}",
+                    "operation_id": f"agg-{symbol}",
                     "symbol": symbol,
-                    "side": side,
-                    "quantity": _format_decimal(quantity, QTY_QUANT),
-                    "entry_price": _format_decimal(entry_price, USD_QUANT),
+                    "side": net_side,
+                    "quantity": _format_decimal(abs_qty, QTY_QUANT),
+                    "entry_price": _format_decimal(avg_entry, USD_QUANT),
                     "current_price": _format_decimal(current_price, USD_QUANT),
                     "unrealized_pnl": _format_decimal(unrealized_pnl, USD_QUANT),
-                    "unrealized_pnl_percent": _format_decimal(
-                        unrealized_pnl_percent, PERCENT_QUANT
-                    ),
-                    "stop_loss": _format_decimal(stop_price, USD_QUANT),
-                    "take_profit": None,  # Margin positions don't have take-profit yet
+                    "unrealized_pnl_percent": _format_decimal(unrealized_pnl_percent, PERCENT_QUANT),
+                    "stop_loss": _format_decimal(data["stop_loss"], USD_QUANT),
+                    "take_profit": None,
                     "distance_to_stop_percent": _format_decimal(distance_to_stop, PERCENT_QUANT),
                     "distance_to_target_percent": None,
                     "status": "OPEN",
                     "type": "margin",
-                    "leverage": mp.leverage,
-                    "risk_amount": _format_decimal(mp.risk_amount, USD_QUANT),
-                    "risk_percent": _format_decimal(mp.risk_percent, PERCENT_QUANT),
-                    "margin_level": (
-                        _format_decimal(current_margin_level, PERCENT_QUANT)
-                        if current_margin_level
-                        else None
-                    ),
+                    "leverage": data["leverage"],
+                    "risk_amount": _format_decimal(data["risk_amount"], USD_QUANT),
+                    "risk_percent": _format_decimal(data["risk_percent"], PERCENT_QUANT),
+                    "margin_level": _format_decimal(data["margin_level"], PERCENT_QUANT) if data["margin_level"] else None,
                 }
             )
 
