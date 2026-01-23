@@ -14,5 +14,10 @@ RUN pip install --upgrade pip && pip install --no-cache-dir -r requirements.txt
 COPY monolith/ /app/
 # Copy core hexagonal architecture modules
 COPY core/ /app/core/
+
+# Copy and setup entrypoint
+COPY monolith/docker/entrypoint.sh /app/entrypoint.sh
+RUN chmod +x /app/entrypoint.sh
+
 EXPOSE 8000
-CMD ["gunicorn","-b","0.0.0.0:8000","--worker-class=gevent","--worker-connections=1000","--workers=5","backend.wsgi"]
+ENTRYPOINT ["/app/entrypoint.sh"]
