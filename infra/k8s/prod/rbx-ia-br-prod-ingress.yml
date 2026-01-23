@@ -1,0 +1,24 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: rbx-ia-br-prod-ingress
+  namespace: robson
+  annotations:
+    cert-manager.io/cluster-issuer: "rbx-ia-br-prod-clusterissuer"
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - rbx.ia.br
+    secretName: rbx-ia-br-prod-tls
+  rules:
+  - host: rbx.ia.br
+    http:
+      paths:
+      - pathType: Prefix
+        path: "/"
+        backend:
+          service:
+            name: rbx-ia-br-prod-svc
+            port:
+              number: 80

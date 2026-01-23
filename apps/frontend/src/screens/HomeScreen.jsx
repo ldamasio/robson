@@ -60,8 +60,8 @@ const HomeScreen = () => {
               <LinkContainer to="/signup">
                 <Button variant="primary" size="lg" className="rounded-pill px-5">Get Started</Button>
               </LinkContainer>
-              <LinkContainer to="/demo">
-                <Button variant="outline-light" size="lg" className="rounded-pill px-5">Live Demo</Button>
+              <LinkContainer to="/login">
+                <Button variant="outline-light" size="lg" className="rounded-pill px-5">Login</Button>
               </LinkContainer>
             </div>
           </Container>
@@ -116,9 +116,9 @@ const HomeScreen = () => {
               <p className="text-secondary mb-4">
                 Join our community of traders and developers using Robson to automate their strategies.
               </p>
-              <LinkContainer to="/download">
-                <Button variant="light" size="lg" className="rounded-pill fw-bold">Download Source</Button>
-              </LinkContainer>
+              <a href="https://github.com/ldamasio/robson" target="_blank" rel="noopener noreferrer">
+                <Button variant="light" size="lg" className="rounded-pill fw-bold">View on GitHub</Button>
+              </a>
             </div>
           </Container>
         </section>

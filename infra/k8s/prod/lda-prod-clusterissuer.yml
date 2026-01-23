@@ -1,0 +1,14 @@
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: lda-prod-clusterissuer
+spec:
+  acme:
+    email: ldamasio@gmail.com
+    server: https://acme-v02.api.letsencrypt.org/directory
+    privateKeySecretRef:
+      name: lda-letsencrypt-key
+    solvers:
+    - http01:
+        ingress:
+          class: traefik

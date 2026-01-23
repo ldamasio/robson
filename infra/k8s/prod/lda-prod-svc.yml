@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: lda-prod-svc
+  namespace: robson
+spec:
+  selector:
+    app: lda-prod
+  ports:
+    - port: 80
+      targetPort: 3000
+  type: LoadBalancer

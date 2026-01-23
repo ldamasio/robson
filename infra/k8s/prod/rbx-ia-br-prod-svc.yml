@@ -1,0 +1,12 @@
+apiVersion: v1
+kind: Service
+metadata:
+  name: rbx-ia-br-prod-svc
+  namespace: robson
+spec:
+  selector:
+    app: rbx-ia-br-prod
+  ports:
+    - port: 80
+      targetPort: 3000
+  type: LoadBalancer

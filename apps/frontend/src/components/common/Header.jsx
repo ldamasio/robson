@@ -17,29 +17,6 @@ function Header() {
           </LinkContainer>
           <Navbar.Toggle aria-controls="responsive-navbar-nav" className="border-0" />
           <Navbar.Collapse id="responsive-navbar-nav">
-            <Nav className="mx-auto">
-              <LinkContainer to="/features">
-                <Nav.Link className="px-3">Features</Nav.Link>
-              </LinkContainer>
-              <LinkContainer to="/pricing">
-                <Nav.Link className="px-3">Pricing</Nav.Link>
-              </LinkContainer>
-              <NavDropdown title="Company" id="collasible-nav-dropdown" className="px-2">
-                <LinkContainer to="/about-us">
-                  <NavDropdown.Item>About RBX Robótica</NavDropdown.Item>
-                </LinkContainer>
-                <LinkContainer to="/our-team">
-                  <NavDropdown.Item>Our Team</NavDropdown.Item>
-                </LinkContainer>
-                <LinkContainer to="/careers">
-                  <NavDropdown.Item>Careers</NavDropdown.Item>
-                </LinkContainer>
-                <NavDropdown.Divider />
-                <LinkContainer to="/contact">
-                  <NavDropdown.Item>Contact Us</NavDropdown.Item>
-                </LinkContainer>
-              </NavDropdown>
-            </Nav>
             <Nav className="align-items-center gap-3">
               {user ? (
                 <>

@@ -1,0 +1,24 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: lda-prod-ingress
+  namespace: robson
+  annotations:
+    cert-manager.io/cluster-issuer: "lda-prod-clusterissuer"
+spec:
+  ingressClassName: traefik
+  tls:
+  - hosts:
+    - leandrodamasio.rbx.ia.br
+    secretName: lda-prod-tls
+  rules:
+  - host: leandrodamasio.rbx.ia.br
+    http:
+      paths:
+      - pathType: Prefix
+        path: "/"
+        backend:
+          service:
+            name: lda-prod-svc
+            port:
+              number: 80

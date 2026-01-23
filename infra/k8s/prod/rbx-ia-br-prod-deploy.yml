@@ -1,0 +1,59 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: rbx-ia-br-prod-deploy
+  namespace: robson
+  annotations:
+    rbx.ia.br/last-rollout: "2025-12-29T00:00:00Z"
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: rbx-ia-br-prod
+  template:
+    metadata:
+      labels:
+        app: rbx-ia-br-prod
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/path: /metrics
+        prometheus.io/port: "3000"
+    spec:
+      affinity:
+        nodeAffinity:
+          requiredDuringSchedulingIgnoredDuringExecution:
+            nodeSelectorTerms:
+            - matchExpressions:
+              - key: workload
+                operator: NotIn
+                values:
+                - analytics
+      containers:
+        - name: rbx-frontend
+          image: docker.io/ldamasio/rbx-ia-br-prod:latest
+          imagePullPolicy: Always
+          ports:
+          - containerPort: 3000
+          readinessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 10
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 3
+          livenessProbe:
+            httpGet:
+              path: /
+              port: 3000
+            initialDelaySeconds: 20
+            periodSeconds: 10
+            timeoutSeconds: 3
+            failureThreshold: 3
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
