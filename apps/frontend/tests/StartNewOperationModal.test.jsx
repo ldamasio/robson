@@ -45,10 +45,10 @@ describe("StartNewOperationModal", () => {
       </AuthContext.Provider>,
     );
 
-    expect(screen.getByText("Nova Operação BTC/USDC")).toBeInTheDocument();
+    expect(screen.getByText("New BTC/USDC Operation")).toBeInTheDocument();
     expect(screen.getByText("LONG")).toBeInTheDocument();
     expect(screen.getByText("SHORT")).toBeInTheDocument();
-    expect(screen.getByText("Cancelar")).toBeInTheDocument();
+    expect(screen.getByText("Cancel")).toBeInTheDocument();
   });
 
   it("calls the API with correct parameters when LONG is clicked", async () => {
