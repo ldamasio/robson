@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useContext } from "react";
-import { Card } from "react-bootstrap";
+import { Card, Row, Col } from "react-bootstrap";
+import { Wallet2 } from "react-bootstrap-icons";
 import axios from "axios";
 import AuthContext from "../../context/AuthContext";
 import LoadingSpinner from "../common/LoadingSpinner";
@@ -58,27 +59,39 @@ function Balance() {
   return (
     <Card className="card-premium">
       <Card.Body>
-        <h5 className="text-light mb-3">Isolated Margin BTC/USDC</h5>
+        <div className="d-flex align-items-center mb-4">
+          <div className="bg-primary bg-opacity-10 p-2 rounded-3 me-3">
+            <Wallet2 className="text-primary" size={24} />
+          </div>
+          <h5 className="text-light mb-0 fw-bold">Carteira de Investimento</h5>
+        </div>
+
         {marginData ? (
           <>
-            <div className="mb-2">
-              <small className="text-secondary">Total USDC:</small>
-              <div className="h6 text-light">
-                {marginData.totalUSDC || "N/A"}
+            <div className="mb-4">
+              <small className="text-secondary d-block mb-1">Total Estimado (BTC)</small>
+              <div className="h3 fw-bold text-success mb-0 font-monospace">
+                {marginData.net_equity_btc || "N/A"}
               </div>
+              <small className="text-muted">Valor se todas as dívidas fossem pagas agora</small>
             </div>
-            <div className="mb-2">
-              <small className="text-secondary">USDC Disponível:</small>
-              <div className="h6 text-light">
-                {marginData.freeUSDC || "N/A"}
-              </div>
-            </div>
-            <div className="mb-2">
-              <small className="text-secondary">Margin Level:</small>
-              <div className="h5 fw-bold text-warning">
-                {marginData.marginLevel || "N/A"}
-              </div>
-            </div>
+
+            <hr className="border-secondary opacity-25 my-4" />
+
+            <Row className="g-3">
+              <Col xs={6}>
+                <small className="text-secondary d-block">USDC Total</small>
+                <div className="fw-bold text-light">
+                  {marginData.totalUSDC || "N/A"}
+                </div>
+              </Col>
+              <Col xs={6}>
+                <small className="text-secondary d-block">Margem (ML)</small>
+                <div className={`fw-bold ${parseFloat(marginData.marginLevel) < 1.3 ? 'text-danger' : 'text-warning'}`}>
+                  {marginData.marginLevel || "N/A"}
+                </div>
+              </Col>
+            </Row>
           </>
         ) : (
           <div className="text-muted">Nenhuma conta margin encontrada</div>

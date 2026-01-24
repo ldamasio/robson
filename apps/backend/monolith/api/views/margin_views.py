@@ -23,6 +23,7 @@ from django.utils import timezone
 
 from api.models import MarginPosition, MarginTransfer
 from api.application.margin_adapters import BinanceMarginAdapter, MockMarginAdapter
+from api.services.market_price_cache import get_cached_bid
 
 # Import margin position sizing - use local implementation to avoid path issues in container
 def calculate_margin_position_size(
@@ -111,8 +112,7 @@ def margin_account(request, symbol):
             health = "CRITICAL"
         else:
             health = "DANGER"
-        
-        return Response({
+        response_data = {
             "symbol": account.symbol,
             "base_asset": account.base_asset,
             "base_free": str(account.base_free),
@@ -129,7 +129,19 @@ def margin_account(request, symbol):
             "margin_health": health,
             "liquidation_price": str(account.liquidation_price),
             "can_trade": account.is_margin_trade_enabled,
-        })
+        }
+        
+        # Calculate Estimated Net BTC (Equity in BTC)
+        price = get_cached_bid(symbol.upper())
+        if price:
+            net_base = (account.base_free + account.base_locked) - account.base_borrowed
+            net_quote = (account.quote_free + account.quote_locked) - account.quote_borrowed
+            net_equity_btc = net_base + (net_quote / price)
+            response_data["net_equity_btc"] = str(net_equity_btc.quantize(Decimal("0.00000001")))
+        else:
+            response_data["net_equity_btc"] = "N/A"
+            
+        return Response(response_data)
         
     except ValueError as e:
         return Response(
