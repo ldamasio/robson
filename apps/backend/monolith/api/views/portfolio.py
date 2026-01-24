@@ -179,19 +179,13 @@ def active_positions(request):
             adapter = None
 
         for mp in margin_positions_raw:
-            # Sanitize symbol: force uppercase and remove slashes for consistent lookup
+            # Sanitize symbol for lookup
             symbol = mp.symbol.replace("/", "").upper()
             
             if symbol not in grouped_margin:
-                # Get current price
-                if symbol not in price_cache:
-                    price_cache[symbol] = get_cached_bid(symbol)
-                current_price = price_cache[symbol]
-
-                # Soft Sync: Determine REAL side from Binance
+                # 1. Fetch truth from Binance first
+                real_side = str(mp.side).upper()
                 current_margin_level = mp.margin_level
-                # Use current side as fallback
-                real_side = str(mp.side).strip().upper()
                 
                 if adapter:
                     try:
@@ -199,96 +193,86 @@ def active_positions(request):
                         if account_snapshot:
                             current_margin_level = account_snapshot.margin_level
                             
-                            # Net base = (Free + Locked) - Borrowed
-                            # LONG: Net Base > 0 (More owned than borrowed)
-                            # SHORT: Net Base < 0 (More borrowed than owned)
-                            net_base = (
-                                account_snapshot.base_free 
-                                + account_snapshot.base_locked 
-                                - account_snapshot.base_borrowed
-                            )
-                            
-                            threshold = Decimal("0.00000001")
-                            if net_base > threshold:
+                            # Get price for notion comparison
+                            if symbol not in price_cache:
+                                price_cache[symbol] = get_cached_bid(symbol)
+                            price = price_cache[symbol]
+
+                            # INFERENCE BASED ON DEBT (More robust for margin)
+                            # LONG: You owe USDC (borrowed quote)
+                            # SHORT: You owe BTC (borrowed base)
+                            quote_debt = account_snapshot.quote_borrowed
+                            base_debt_in_quote = account_snapshot.base_borrowed * price
+
+                            if quote_debt > base_debt_in_quote and quote_debt > Decimal("0.01"):
                                 real_side = "LONG"
-                            elif net_base < -threshold:
+                            elif base_debt_in_quote > quote_debt and base_debt_in_quote > Decimal("0.01"):
                                 real_side = "SHORT"
                             
-                            # Update the side for the aggregator pass below
-                            mp.side = real_side
+                            import logging
+                            logging.warning(
+                                f"MARGIN_SYNC: {symbol} | Debt: Quote={quote_debt}, BaseInQuote={base_debt_in_quote:.2f} | "
+                                f"Balances: Base={account_snapshot.base_free}, Quote={account_snapshot.quote_free} | "
+                                f"Side={real_side}"
+                            )
                     except Exception as e:
                         import logging
-                        logging.warning(f"Failed to sync margin side for {symbol}: {e}")
-                
-                import logging
-                logging.warning(f"MARGIN_DEBUG: Symbol={symbol}, RealSide={real_side}, ML={current_margin_level}")
+                        logging.warning(f"MARGIN_SYNC_ERROR: {symbol}: {e}")
+
+                # 2. Get price if not already fetched
+                if symbol not in price_cache:
+                    price_cache[symbol] = get_cached_bid(symbol)
+                current_price = price_cache[symbol]
 
                 grouped_margin[symbol] = {
                     "symbol": symbol,
-                    "total_qty_long": Decimal("0"),
-                    "total_qty_short": Decimal("0"),
-                    "total_cost_long": Decimal("0"),
-                    "total_cost_short": Decimal("0"),
+                    "total_qty": Decimal("0"),
+                    "total_cost": Decimal("0"),
                     "current_price": current_price,
                     "margin_level": current_margin_level,
                     "stop_loss": mp.stop_price,
                     "leverage": mp.leverage,
                     "risk_amount": Decimal("0"),
                     "risk_percent": Decimal("0"),
-                    "force_side": real_side, # Binance truth
+                    "side": real_side, # THIS IS THE SOVEREIGN SIDE
                 }
             
-            # Aggregate weights using the synced/normalized side
-            side_norm = str(mp.side).strip().upper()
-            is_long = side_norm in ["LONG", "BUY"]
-            
-            if is_long:
-                grouped_margin[symbol]["total_qty_long"] += mp.quantity
-                grouped_margin[symbol]["total_cost_long"] += mp.quantity * mp.entry_price
-            else:
-                grouped_margin[symbol]["total_qty_short"] += mp.quantity
-                grouped_margin[symbol]["total_cost_short"] += mp.quantity * mp.entry_price
+            # 3. Aggregate based on the SOVEREIGN SIDE
+            # We treat all entries for this symbol as part of the inferred side
+            grouped_margin[symbol]["total_qty"] += mp.quantity
+            grouped_margin[symbol]["total_cost"] += mp.quantity * mp.entry_price
             
             grouped_margin[symbol]["risk_amount"] += mp.risk_amount
             grouped_margin[symbol]["risk_percent"] += mp.risk_percent
             grouped_margin[symbol]["leverage"] = max(grouped_margin[symbol]["leverage"], mp.leverage)
             
-            # Most conservative stop
-            if is_long:
+            # Stop loss logic (most conservative)
+            if grouped_margin[symbol]["side"] == "LONG":
                 grouped_margin[symbol]["stop_loss"] = min(grouped_margin[symbol]["stop_loss"], mp.stop_price)
             else:
                 grouped_margin[symbol]["stop_loss"] = max(grouped_margin[symbol]["stop_loss"], mp.stop_price)
 
-        # Convert grouped results to final list
+        # Build final response list
         for symbol, data in grouped_margin.items():
-            net_qty = data["total_qty_long"] - data["total_qty_short"]
-            abs_qty = abs(net_qty)
-            
-            # Skip if no net position remains
-            if abs_qty < Decimal("0.00000001"):
+            qty = data["total_qty"]
+            if qty <= 0:
                 continue
 
-            # FINAL SIDE: Use coordinated Binance truth
-            final_side = data.get("force_side")
-            
-            # Weighted entry price based on the truth side
-            if final_side == "LONG":
-                avg_entry = data["total_cost_long"] / data["total_qty_long"] if data["total_qty_long"] else Decimal("0")
-            else:
-                avg_entry = data["total_cost_short"] / data["total_qty_short"] if data["total_qty_short"] else Decimal("0")
+            avg_entry = data["total_cost"] / qty if qty > 0 else Decimal("0")
+            current_price = data["current_price"]
+            side = data["side"]
 
-            # Calculate P&L using final_side
+            # Calculate P&L strictly according to the sovereign side
             unrealized_pnl = Decimal("0")
             unrealized_pnl_percent = Decimal("0")
-            current_price = data["current_price"]
             
-            if avg_entry and abs_qty and current_price:
-                if final_side == "LONG":
-                    unrealized_pnl = (current_price - avg_entry) * abs_qty
+            if avg_entry and current_price:
+                if side == "LONG":
+                    unrealized_pnl = (current_price - avg_entry) * qty
                 else:
-                    unrealized_pnl = (avg_entry - current_price) * abs_qty
+                    unrealized_pnl = (avg_entry - current_price) * qty
                 
-                cost_basis = avg_entry * abs_qty
+                cost_basis = avg_entry * qty
                 if cost_basis != 0:
                     unrealized_pnl_percent = (unrealized_pnl / cost_basis) * Decimal("100")
 
@@ -301,8 +285,8 @@ def active_positions(request):
                     "id": f"margin-{symbol}",
                     "operation_id": f"agg-{symbol}",
                     "symbol": symbol,
-                    "side": final_side,
-                    "quantity": _format_decimal(abs_qty, QTY_QUANT),
+                    "side": side,
+                    "quantity": _format_decimal(qty, QTY_QUANT),
                     "entry_price": _format_decimal(avg_entry, USD_QUANT),
                     "current_price": _format_decimal(current_price, USD_QUANT),
                     "unrealized_pnl": _format_decimal(unrealized_pnl, USD_QUANT),
@@ -319,7 +303,7 @@ def active_positions(request):
                     "margin_level": _format_decimal(data["margin_level"], PERCENT_QUANT) if data["margin_level"] else None,
                 }
             )
-
+        
         return Response({"positions": positions})
     except Exception as e:
         import logging
