@@ -1,5 +1,5 @@
 import React, { useState, useEffect, useContext } from "react";
-import { Card, Row, Col } from "react-bootstrap";
+import { Card, Row, Col, Badge } from "react-bootstrap";
 import { Wallet2 } from "react-bootstrap-icons";
 import axios from "axios";
 import AuthContext from "../../context/AuthContext";
@@ -57,44 +57,62 @@ function Balance() {
   }
 
   return (
-    <Card className="card-premium">
-      <Card.Body>
-        <div className="d-flex align-items-center mb-4">
-          <div className="bg-primary bg-opacity-10 p-2 rounded-3 me-3">
-            <Wallet2 className="text-primary" size={24} />
+    <Card className="card-premium border-0 shadow-lg overflow-hidden">
+      {/* Decorative top bar */}
+      <div className="bg-primary" style={{ height: '4px', opacity: 0.6 }}></div>
+
+      <Card.Body className="p-4">
+        <div className="d-flex align-items-center justify-content-between mb-4">
+          <div className="d-flex align-items-center">
+            <div className="bg-primary bg-opacity-10 p-2 rounded-circle me-3">
+              <Wallet2 className="text-primary" size={24} />
+            </div>
+            <h5 className="text-light mb-0 fw-bold">Carteira de Investimento</h5>
           </div>
-          <h5 className="text-light mb-0 fw-bold">Carteira de Investimento</h5>
+          <Badge bg="primary" className="bg-opacity-10 text-primary border border-primary border-opacity-25 py-2 px-3 fw-normal">
+            Isolated Margin
+          </Badge>
         </div>
 
         {marginData ? (
           <>
-            <div className="mb-4">
-              <small className="text-secondary d-block mb-1">Total Estimado (BTC)</small>
-              <div className="h3 fw-bold text-success mb-0 font-monospace">
-                {marginData.net_equity_btc || "N/A"}
+            <div className="mb-4 bg-glass p-3 rounded-3 border border-white border-opacity-5">
+              <small className="text-secondary d-block mb-1 text-uppercase letter-spacing-1">Patrimônio Líquido Estimado</small>
+              <div className="d-flex align-items-baseline">
+                <span className="h2 fw-bold text-success mb-0 font-monospace">
+                  {marginData.net_equity_btc || "0.00000000"}
+                </span>
+                <span className="ms-2 text-secondary fw-bold">BTC</span>
               </div>
-              <small className="text-muted">Valor se todas as dívidas fossem pagas agora</small>
+              <small className="text-muted d-block mt-2">
+                <i className="bi bi-info-circle me-1"></i>
+                Simulação de encerramento de todas as posições a mercado
+              </small>
             </div>
-
-            <hr className="border-secondary opacity-25 my-4" />
 
             <Row className="g-3">
               <Col xs={6}>
-                <small className="text-secondary d-block">USDC Total</small>
-                <div className="fw-bold text-light">
-                  {marginData.totalUSDC || "N/A"}
+                <div className="p-3 bg-dark bg-opacity-25 rounded-3 border border-white border-opacity-5">
+                  <small className="text-secondary d-block mb-1">Saldo USDC</small>
+                  <div className="fw-bold text-light h6 mb-0">
+                    {parseFloat(marginData.totalUSDC).toFixed(2) || "0.00"}
+                  </div>
                 </div>
               </Col>
               <Col xs={6}>
-                <small className="text-secondary d-block">Margem (ML)</small>
-                <div className={`fw-bold ${parseFloat(marginData.marginLevel) < 1.3 ? 'text-danger' : 'text-warning'}`}>
-                  {marginData.marginLevel || "N/A"}
+                <div className="p-3 bg-dark bg-opacity-25 rounded-3 border border-white border-opacity-5">
+                  <small className="text-secondary d-block mb-1">Margin Level</small>
+                  <div className={`fw-bold h6 mb-0 ${parseFloat(marginData.marginLevel) < 1.3 ? 'text-danger' : 'text-warning'}`}>
+                    {parseFloat(marginData.marginLevel).toFixed(4) || "N/A"}
+                  </div>
                 </div>
               </Col>
             </Row>
           </>
         ) : (
-          <div className="text-muted">Nenhuma conta margin encontrada</div>
+          <div className="text-muted text-center py-4">
+            <LoadingSpinner label="Sincronizando com Binance..." />
+          </div>
         )}
       </Card.Body>
     </Card>
