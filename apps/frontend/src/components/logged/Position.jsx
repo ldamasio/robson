@@ -155,64 +155,6 @@ function Position() {
                   </Alert>
                 )}
 
-                {/* PnL */}
-                <div className="mb-3 pb-3 border-bottom border-secondary">
-                  <div className="d-flex justify-content-between align-items-center">
-                    <span className="text-secondary">PnL Não Realizado:</span>
-                    <Badge bg={pnlBadge} className="fs-6">
-                      {formatCurrency(position.unrealized_pnl)} (
-                      {formatPercent(position.unrealized_pnl_percent)})
-                    </Badge>
-                  </div>
-                </div>
-
-                {/* Informações da posição */}
-                <div className="d-grid gap-2">
-                  <div className="d-flex justify-content-between">
-                    <span className="text-secondary">Quantidade:</span>
-                    <span className="text-light">{position.quantity}</span>
-                  </div>
-                  <div className="d-flex justify-content-between">
-                    <span className="text-secondary">Preço de Entrada:</span>
-                    <span className="text-light">
-                      {formatCurrency(position.entry_price)}
-                    </span>
-                  </div>
-                  <div className="d-flex justify-content-between">
-                    <span className="text-secondary">Preço Atual:</span>
-                    <span className="text-light">
-                      {formatCurrency(position.current_price)}
-                    </span>
-                  </div>
-                  <div className="d-flex justify-content-between">
-                    <span className="text-secondary">Stop Loss:</span>
-                    <span className="text-light">
-                      {position.stop_loss
-                        ? formatCurrency(position.stop_loss)
-                        : "N/A"}
-                      {position.distance_to_stop_percent &&
-                        ` (${position.distance_to_stop_percent}% away)`}
-                    </span>
-                  </div>
-                  <div className="d-flex justify-content-between">
-                    <span className="text-secondary">Take Profit:</span>
-                    <span className="text-light">
-                      {position.take_profit
-                        ? formatCurrency(position.take_profit)
-                        : "N/A"}
-                      {position.distance_to_target_percent &&
-                        ` (${position.distance_to_target_percent}% to go)`}
-                    </span>
-                  </div>
-                  {position.leverage && (
-                    <div className="d-flex justify-content-between">
-                      <span className="text-secondary">Alavancagem:</span>
-                      <Badge bg="warning" text="dark">
-                        {position.leverage}x
-                      </Badge>
-                    </div>
-                  )}
-                </div>
               </Card.Body>
             </Card>
           );

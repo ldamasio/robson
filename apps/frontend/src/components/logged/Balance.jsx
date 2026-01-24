@@ -90,24 +90,6 @@ function Balance() {
               </small>
             </div>
 
-            <Row className="g-3">
-              <Col xs={6}>
-                <div className="p-3 bg-dark bg-opacity-25 rounded-3 border border-white border-opacity-5">
-                  <small className="text-secondary d-block mb-1">Saldo USDC</small>
-                  <div className="fw-bold text-light h6 mb-0">
-                    {parseFloat(marginData.totalUSDC).toFixed(2) || "0.00"}
-                  </div>
-                </div>
-              </Col>
-              <Col xs={6}>
-                <div className="p-3 bg-dark bg-opacity-25 rounded-3 border border-white border-opacity-5">
-                  <small className="text-secondary d-block mb-1">Margin Level</small>
-                  <div className={`fw-bold h6 mb-0 ${parseFloat(marginData.marginLevel) < 1.3 ? 'text-danger' : 'text-warning'}`}>
-                    {parseFloat(marginData.marginLevel).toFixed(4) || "N/A"}
-                  </div>
-                </div>
-              </Col>
-            </Row>
           </>
         ) : (
           <div className="text-muted text-center py-4">
