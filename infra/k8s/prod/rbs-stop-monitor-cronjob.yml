@@ -25,7 +25,7 @@ spec:
           restartPolicy: Never
           containers:
           - name: stop-monitor
-            image: ldamasio/rbs-backend-monolith-prod:sha-1649ebc
+            image: ldamasio/rbs-backend-monolith-prod:sha-e07b779
             command:
             - python
             - manage.py
