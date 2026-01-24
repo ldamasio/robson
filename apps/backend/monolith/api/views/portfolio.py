@@ -306,7 +306,5 @@ def active_positions(request):
         
         return Response({"positions": positions})
     except Exception as e:
-        import logging
-
         logging.error(f"Failed to get positions: {e}", exc_info=True)
         return Response({"error": f"Failed to get positions: {e!s}"}, status=500)

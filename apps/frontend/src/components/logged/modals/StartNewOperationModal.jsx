@@ -31,7 +31,7 @@ function StartNewOperationModal(props) {
         },
       );
 
-      toast.success(`Operação ${strategyName} criada com sucesso!`);
+      toast.success(`${strategyName} operation created successfully!`);
       props.onHide();
 
       // Refresh the page or trigger a re-fetch of positions
@@ -41,7 +41,7 @@ function StartNewOperationModal(props) {
       const errorMsg =
         error.response?.data?.detail ||
         error.response?.data?.message ||
-        "Erro ao criar operação";
+        "Error creating operation";
       toast.error(errorMsg);
     } finally {
       setLoading(false);
@@ -52,14 +52,14 @@ function StartNewOperationModal(props) {
     <Modal {...props} aria-labelledby="contained-modal-title-vcenter" size="lg">
       <Modal.Header closeButton>
         <Modal.Title id="contained-modal-title-vcenter">
-          Nova Operação BTC/USDC
+          New BTC/USDC Operation
         </Modal.Title>
       </Modal.Header>
       <Modal.Body>
         <Container>
           <p className="text-center mb-4">
-            Você acha que o preço do BTC vai <strong>subir</strong> ou{" "}
-            <strong>descer</strong>?
+            Do you think BTC price will go <strong>up</strong> or{" "}
+            <strong>down</strong>?
           </p>
 
           <Row className="g-4">
@@ -79,10 +79,10 @@ function StartNewOperationModal(props) {
                   <div className="display-3 mb-3">📈</div>
                   <h3 className="text-success">LONG</h3>
                   <p className="text-muted">
-                    Aposta que vai <strong>SUBIR</strong>
+                    Bet that it will go <strong>UP</strong>
                   </p>
                   <small className="text-secondary">
-                    Compra BTC agora para vender depois mais caro
+                    Buy BTC now to sell later at a higher price
                   </small>
                 </Card.Body>
               </Card>
@@ -103,10 +103,10 @@ function StartNewOperationModal(props) {
                   <div className="display-3 mb-3">📉</div>
                   <h3 className="text-danger">SHORT</h3>
                   <p className="text-muted">
-                    Aposta que vai <strong>DESCER</strong>
+                    Bet that it will go <strong>DOWN</strong>
                   </p>
                   <small className="text-secondary">
-                    Vende BTC agora para recomprar depois mais barato
+                    Sell BTC now to buy back later at a lower price
                   </small>
                 </Card.Body>
               </Card>
@@ -118,14 +118,14 @@ function StartNewOperationModal(props) {
               <div className="spinner-border text-primary" role="status">
                 <span className="visually-hidden">Loading...</span>
               </div>
-              <p className="text-muted mt-2">Criando operação...</p>
+              <p className="text-muted mt-2">Creating operation...</p>
             </div>
           )}
         </Container>
       </Modal.Body>
       <Modal.Footer>
         <Button variant="secondary" onClick={props.onHide} disabled={loading}>
-          Cancelar
+          Cancel
         </Button>
       </Modal.Footer>
     </Modal>

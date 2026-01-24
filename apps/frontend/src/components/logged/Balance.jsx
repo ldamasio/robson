@@ -29,7 +29,7 @@ function Balance() {
         setError(null);
       } catch (error) {
         console.error("Error fetching margin account:", error);
-        setError("Erro ao carregar conta margin");
+        setError("Error loading margin account");
         setMarginData(null);
       } finally {
         setLoading(false);
@@ -42,7 +42,7 @@ function Balance() {
   }, [authTokens?.access]);
 
   if (loading) {
-    return <LoadingSpinner label="Carregando saldo..." />;
+    return <LoadingSpinner label="Loading balance..." />;
   }
 
   if (error) {
@@ -67,7 +67,7 @@ function Balance() {
             <div className="bg-primary bg-opacity-10 p-2 rounded-circle me-3">
               <Wallet2 className="text-primary" size={24} />
             </div>
-            <h5 className="text-light mb-0 fw-bold">Carteira de Investimento</h5>
+            <h5 className="text-light mb-0 fw-bold">Investment Wallet</h5>
           </div>
           <Badge bg="primary" className="bg-opacity-10 text-primary border border-primary border-opacity-25 py-2 px-3 fw-normal">
             Isolated Margin
@@ -77,7 +77,7 @@ function Balance() {
         {marginData ? (
           <>
             <div className="mb-4 bg-glass p-3 rounded-3 border border-white border-opacity-5">
-              <small className="text-secondary d-block mb-1 text-uppercase letter-spacing-1">Patrimônio Líquido Estimado</small>
+              <small className="text-secondary d-block mb-1 text-uppercase letter-spacing-1">Estimated Net Equity</small>
               <div className="d-flex align-items-baseline">
                 <span className="h2 fw-bold text-success mb-0 font-monospace">
                   {marginData.net_equity_btc || "0.00000000"}
@@ -86,14 +86,13 @@ function Balance() {
               </div>
               <small className="text-muted d-block mt-2">
                 <i className="bi bi-info-circle me-1"></i>
-                Simulação de encerramento de todas as posições a mercado
+                Simulation of closing all positions at market price
               </small>
             </div>
-
           </>
         ) : (
           <div className="text-muted text-center py-4">
-            <LoadingSpinner label="Sincronizando com Binance..." />
+            <LoadingSpinner label="Syncing with Binance..." />
           </div>
         )}
       </Card.Body>

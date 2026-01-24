@@ -137,12 +137,12 @@ function Position() {
                     </h3>
                     {isCriticalRisk && (
                       <Badge bg="danger" className="mt-1">
-                        RISCO CRÍTICO
+                        CRITICAL RISK
                       </Badge>
                     )}
                     {isHighRisk && !isCriticalRisk && (
                       <Badge bg="warning" text="dark" className="mt-1">
-                        RISCO ALTO
+                        HIGH RISK
                       </Badge>
                     )}
                   </div>
@@ -151,7 +151,7 @@ function Position() {
                 {/* Alert de risco se margin level baixo */}
                 {isCriticalRisk && (
                   <Alert variant="danger" className="py-2 mb-3">
-                    ⚠️ Margin level crítico! Risco de liquidação.
+                    ⚠️ Critical margin level! Liquidation risk.
                   </Alert>
                 )}
 
