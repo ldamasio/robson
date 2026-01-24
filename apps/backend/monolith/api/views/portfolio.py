@@ -190,9 +190,20 @@ def active_positions(request):
                 current_margin_level = mp.margin_level
                 if adapter:
                     try:
-                        new_margin_level = adapter.get_margin_level(symbol)
-                        if new_margin_level:
-                            current_margin_level = new_margin_level
+                        account_snapshot = adapter.get_margin_account(symbol)
+                        if account_snapshot:
+                            current_margin_level = account_snapshot.margin_level
+                            
+                            # Infer side: if we borrowed quote (USDC), we are LONG. 
+                            # If we borrowed base (BTC), we are SHORT.
+                            inferred_side = None
+                            if account_snapshot.quote_borrowed > 0:
+                                inferred_side = "LONG"
+                            elif account_snapshot.base_borrowed > 0:
+                                inferred_side = "SHORT"
+                                
+                            if inferred_side:
+                                mp.side = inferred_side
                     except Exception:
                         pass
 
