@@ -291,14 +291,15 @@ class BinanceMarginAdapter(MarginExecutionPort):
         try:
             response = self.client.get_isolated_margin_account()
             
-            # Find the specific symbol in the response
+            # Find the specific symbol in the response (case-insensitive and without slashes)
+            search_symbol = symbol.replace("/", "").upper()
             for asset_info in response.get("assets", []):
-                if asset_info.get("symbol") == symbol:
+                if asset_info.get("symbol", "").upper() == search_symbol:
                     base_asset = asset_info.get("baseAsset", {})
                     quote_asset = asset_info.get("quoteAsset", {})
                     
                     return MarginAccountSnapshot(
-                        symbol=symbol,
+                        symbol=asset_info.get("symbol"),
                         base_asset=base_asset.get("asset", ""),
                         base_free=Decimal(base_asset.get("free", "0")),
                         base_locked=Decimal(base_asset.get("locked", "0")),
@@ -312,7 +313,7 @@ class BinanceMarginAdapter(MarginExecutionPort):
                         is_margin_trade_enabled=asset_info.get("marginRatio", "") != "",
                     )
             
-            raise ValueError(f"Symbol {symbol} not found in Isolated Margin account")
+            raise ValueError(f"Symbol {symbol} (search: {search_symbol}) not found in Isolated Margin account")
             
         except BinanceAPIException as e:
             logger.error(f"Get margin account failed: {e.message} (code: {e.code})")

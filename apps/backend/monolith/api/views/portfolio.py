@@ -179,35 +179,46 @@ def active_positions(request):
             adapter = None
 
         for mp in margin_positions_raw:
-            symbol = mp.symbol
+            # Sanitize symbol: force uppercase and remove slashes for consistent lookup
+            symbol = mp.symbol.replace("/", "").upper()
+            
             if symbol not in grouped_margin:
                 # Get current price
                 if symbol not in price_cache:
                     price_cache[symbol] = get_cached_bid(symbol)
                 current_price = price_cache[symbol]
 
-                # Soft Sync: Get live margin level from Binance
+                # Soft Sync: Determine REAL side from Binance
                 current_margin_level = mp.margin_level
+                # Use current side as fallback
+                real_side = str(mp.side).strip().upper()
+                
                 if adapter:
                     try:
                         account_snapshot = adapter.get_margin_account(symbol)
                         if account_snapshot:
                             current_margin_level = account_snapshot.margin_level
                             
-                            # Determine side based on net base asset balance (Equity in Base Asset)
-                            # LONG: Net Base > 0 (User owns more than they borrowed)
-                            # SHORT: Net Base < 0 (User borrowed more than they own)
-                            net_base = account_snapshot.base_free + account_snapshot.base_locked - account_snapshot.base_borrowed
+                            # Net base = (Free + Locked) - Borrowed
+                            # LONG: Net Base > 0 (More owned than borrowed)
+                            # SHORT: Net Base < 0 (More borrowed than owned)
+                            net_base = (
+                                account_snapshot.base_free 
+                                + account_snapshot.base_locked 
+                                - account_snapshot.base_borrowed
+                            )
                             
-                            # Use a small threshold to ignore tiny dust/interest differences
                             threshold = Decimal("0.00000001")
                             if net_base > threshold:
-                                mp.side = "LONG"
+                                real_side = "LONG"
                             elif net_base < -threshold:
-                                mp.side = "SHORT"
-                            # else: keep current/db side if balanced or zero
-                    except Exception:
-                        pass
+                                real_side = "SHORT"
+                            
+                            # Update the side for the aggregator pass below
+                            mp.side = real_side
+                    except Exception as e:
+                        import logging
+                        logging.warning(f"Failed to sync margin side for {symbol}: {e}")
 
                 grouped_margin[symbol] = {
                     "symbol": symbol,
@@ -217,16 +228,16 @@ def active_positions(request):
                     "total_cost_short": Decimal("0"),
                     "current_price": current_price,
                     "margin_level": current_margin_level,
-                    "stop_loss": mp.stop_price, # Use most recent/valid stop
+                    "stop_loss": mp.stop_price,
                     "leverage": mp.leverage,
                     "risk_amount": Decimal("0"),
                     "risk_percent": Decimal("0"),
+                    "force_side": real_side, # Binance truth
                 }
             
-            # Aggregate weights
-            # Normalize side for aggregation (handle BUY/SELL if they slipped in)
+            # Aggregate weights using the synced/normalized side
             side_norm = str(mp.side).strip().upper()
-            is_long = side_norm in [MarginPosition.Side.LONG.upper(), "BUY", "LONG"]
+            is_long = side_norm in ["LONG", "BUY"]
             
             if is_long:
                 grouped_margin[symbol]["total_qty_long"] += mp.quantity
@@ -237,62 +248,39 @@ def active_positions(request):
             
             grouped_margin[symbol]["risk_amount"] += mp.risk_amount
             grouped_margin[symbol]["risk_percent"] += mp.risk_percent
-            # Keep the leverage of the largest part or simply the last one
             grouped_margin[symbol]["leverage"] = max(grouped_margin[symbol]["leverage"], mp.leverage)
-            # Use most conservative stop (lowest for long, highest for short)
+            
+            # Most conservative stop
             if is_long:
                 grouped_margin[symbol]["stop_loss"] = min(grouped_margin[symbol]["stop_loss"], mp.stop_price)
             else:
                 grouped_margin[symbol]["stop_loss"] = max(grouped_margin[symbol]["stop_loss"], mp.stop_price)
 
-        # Convert grouped to final format
+        # Convert grouped results to final list
         for symbol, data in grouped_margin.items():
             net_qty = data["total_qty_long"] - data["total_qty_short"]
-            if net_qty == 0:
-                continue # Skip if zeroized (rare but possible in this logic)
-            
             abs_qty = abs(net_qty)
             
-            # ============================================================
-            # CRITICAL FIX: Determine side from Binance account data
-            # This overrides any database or aggregation logic
-            # ============================================================
-            final_side = MarginPosition.Side.LONG if net_qty > 0 else MarginPosition.Side.SHORT
+            # Skip if no net position remains
+            if abs_qty < Decimal("0.00000001"):
+                continue
+
+            # FINAL SIDE: Use coordinated Binance truth
+            final_side = data.get("force_side")
             
-            if adapter:
-                try:
-                    account_snapshot = adapter.get_margin_account(symbol)
-                    if account_snapshot:
-                        # Net base = what you OWN - what you BORROWED
-                        # LONG: You own more base than you borrowed (net_base > 0)
-                        # SHORT: You borrowed more base than you own (net_base < 0)
-                        net_base = (
-                            account_snapshot.base_free 
-                            + account_snapshot.base_locked 
-                            - account_snapshot.base_borrowed
-                        )
-                        threshold = Decimal("0.00000001")
-                        if net_base > threshold:
-                            final_side = "LONG"
-                        elif net_base < -threshold:
-                            final_side = "SHORT"
-                except Exception:
-                    pass  # Fall back to net_qty logic
-            
-            # Weighted entry price
-            if net_qty > 0:
+            # Weighted entry price based on the truth side
+            if final_side == "LONG":
                 avg_entry = data["total_cost_long"] / data["total_qty_long"] if data["total_qty_long"] else Decimal("0")
             else:
                 avg_entry = data["total_cost_short"] / data["total_qty_short"] if data["total_qty_short"] else Decimal("0")
 
-            # Calculate P&L based on the CORRECT side
+            # Calculate P&L using final_side
             unrealized_pnl = Decimal("0")
             unrealized_pnl_percent = Decimal("0")
             current_price = data["current_price"]
             
             if avg_entry and abs_qty and current_price:
-                is_long_for_pnl = final_side == "LONG" or final_side == MarginPosition.Side.LONG
-                if is_long_for_pnl:
+                if final_side == "LONG":
                     unrealized_pnl = (current_price - avg_entry) * abs_qty
                 else:
                     unrealized_pnl = (avg_entry - current_price) * abs_qty
