@@ -251,9 +251,33 @@ def active_positions(request):
             if net_qty == 0:
                 continue # Skip if zeroized (rare but possible in this logic)
             
-            # Use consistent LONG/SHORT labels for margin
-            net_side = MarginPosition.Side.LONG if net_qty > 0 else MarginPosition.Side.SHORT
             abs_qty = abs(net_qty)
+            
+            # ============================================================
+            # CRITICAL FIX: Determine side from Binance account data
+            # This overrides any database or aggregation logic
+            # ============================================================
+            final_side = MarginPosition.Side.LONG if net_qty > 0 else MarginPosition.Side.SHORT
+            
+            if adapter:
+                try:
+                    account_snapshot = adapter.get_margin_account(symbol)
+                    if account_snapshot:
+                        # Net base = what you OWN - what you BORROWED
+                        # LONG: You own more base than you borrowed (net_base > 0)
+                        # SHORT: You borrowed more base than you own (net_base < 0)
+                        net_base = (
+                            account_snapshot.base_free 
+                            + account_snapshot.base_locked 
+                            - account_snapshot.base_borrowed
+                        )
+                        threshold = Decimal("0.00000001")
+                        if net_base > threshold:
+                            final_side = "LONG"
+                        elif net_base < -threshold:
+                            final_side = "SHORT"
+                except Exception:
+                    pass  # Fall back to net_qty logic
             
             # Weighted entry price
             if net_qty > 0:
@@ -261,13 +285,14 @@ def active_positions(request):
             else:
                 avg_entry = data["total_cost_short"] / data["total_qty_short"] if data["total_qty_short"] else Decimal("0")
 
-            # Calculate P&L
+            # Calculate P&L based on the CORRECT side
             unrealized_pnl = Decimal("0")
             unrealized_pnl_percent = Decimal("0")
             current_price = data["current_price"]
             
             if avg_entry and abs_qty and current_price:
-                if net_side == MarginPosition.Side.LONG:
+                is_long_for_pnl = final_side == "LONG" or final_side == MarginPosition.Side.LONG
+                if is_long_for_pnl:
                     unrealized_pnl = (current_price - avg_entry) * abs_qty
                 else:
                     unrealized_pnl = (avg_entry - current_price) * abs_qty
@@ -285,7 +310,7 @@ def active_positions(request):
                     "id": f"margin-{symbol}",
                     "operation_id": f"agg-{symbol}",
                     "symbol": symbol,
-                    "side": net_side,
+                    "side": final_side,
                     "quantity": _format_decimal(abs_qty, QTY_QUANT),
                     "entry_price": _format_decimal(avg_entry, USD_QUANT),
                     "current_price": _format_decimal(current_price, USD_QUANT),
