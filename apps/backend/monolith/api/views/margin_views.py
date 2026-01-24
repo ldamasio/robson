@@ -123,6 +123,9 @@ def margin_account(request, symbol):
             "quote_locked": str(account.quote_locked),
             "quote_borrowed": str(account.quote_borrowed),
             "margin_level": str(account.margin_level),
+            "marginLevel": str(account.margin_level), # Compatibility for Balance.jsx
+            "totalUSDC": str(account.quote_free + account.quote_locked), # Compatibility
+            "freeUSDC": str(account.quote_free), # Compatibility
             "margin_health": health,
             "liquidation_price": str(account.liquidation_price),
             "can_trade": account.is_margin_trade_enabled,

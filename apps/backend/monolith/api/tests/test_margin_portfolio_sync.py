@@ -29,10 +29,10 @@ class MarginPortfolioInferenceTestCase(TestCase):
 
     @patch("api.views.portfolio.get_cached_bid")
     @patch("api.views.portfolio._get_adapter")
-    def test_infer_long_from_quote_borrowed(self, mock_get_adapter, mock_bid):
+    def test_infer_long_from_net_base(self, mock_get_adapter, mock_bid):
         mock_bid.return_value = Decimal("105000")
         
-        # Mock adapter returns quote_borrowed > 0 (USDC borrowed -> LONG)
+        # Mock adapter returns net base > 0 (LONG)
         mock_adapter = MagicMock()
         mock_adapter.get_margin_account.return_value = MarginAccountSnapshot(
             symbol="BTCUSDC",
@@ -46,19 +46,15 @@ class MarginPortfolioInferenceTestCase(TestCase):
         self.assertEqual(response.status_code, 200)
         
         pos_data = response.json()["positions"][0]
-        self.assertEqual(pos_data["side"], "LONG") # Should be inferred as LONG
-        # PnL for LONG (105k - 100k) * 1 = 5000
+        self.assertEqual(pos_data["side"], "LONG") 
         self.assertEqual(pos_data["unrealized_pnl"], "5000.00")
 
     @patch("api.views.portfolio.get_cached_bid")
     @patch("api.views.portfolio._get_adapter")
-    def test_infer_short_from_base_borrowed(self, mock_get_adapter, mock_bid):
+    def test_infer_short_from_net_base(self, mock_get_adapter, mock_bid):
         mock_bid.return_value = Decimal("95000")
         
-        # Position in DB says LONG, but Binance shows base_borrowed > 0 (BTC borrowed -> SHORT)
-        self.position.side = "LONG"
-        self.position.save()
-        
+        # Mock adapter returns net base < 0 (SHORT)
         mock_adapter = MagicMock()
         mock_adapter.get_margin_account.return_value = MarginAccountSnapshot(
             symbol="BTCUSDC",
@@ -72,6 +68,5 @@ class MarginPortfolioInferenceTestCase(TestCase):
         self.assertEqual(response.status_code, 200)
         
         pos_data = response.json()["positions"][0]
-        self.assertEqual(pos_data["side"], "SHORT") # Should be inferred as SHORT
-        # PnL for SHORT (100k - 95k) * 1 = 5000
+        self.assertEqual(pos_data["side"], "SHORT")
         self.assertEqual(pos_data["unrealized_pnl"], "5000.00")

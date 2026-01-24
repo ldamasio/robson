@@ -194,16 +194,18 @@ def active_positions(request):
                         if account_snapshot:
                             current_margin_level = account_snapshot.margin_level
                             
-                            # Infer side: if we borrowed quote (USDC), we are LONG. 
-                            # If we borrowed base (BTC), we are SHORT.
-                            inferred_side = None
-                            if account_snapshot.quote_borrowed > 0:
-                                inferred_side = "LONG"
-                            elif account_snapshot.base_borrowed > 0:
-                                inferred_side = "SHORT"
-                                
-                            if inferred_side:
-                                mp.side = inferred_side
+                            # Determine side based on net base asset balance (Equity in Base Asset)
+                            # LONG: Net Base > 0 (User owns more than they borrowed)
+                            # SHORT: Net Base < 0 (User borrowed more than they own)
+                            net_base = account_snapshot.base_free + account_snapshot.base_locked - account_snapshot.base_borrowed
+                            
+                            # Use a small threshold to ignore tiny dust/interest differences
+                            threshold = Decimal("0.00000001")
+                            if net_base > threshold:
+                                mp.side = "LONG"
+                            elif net_base < -threshold:
+                                mp.side = "SHORT"
+                            # else: keep current/db side if balanced or zero
                     except Exception:
                         pass
 
