@@ -102,7 +102,8 @@ function Position() {
             : pnl < 0
               ? "danger"
               : "secondary";
-          const sideLabel = position.side === "BUY" ? "LONG" : "SHORT";
+          const isLong = position.side === "BUY" || position.side === "LONG";
+          const sideLabel = isLong ? "LONG" : "SHORT";
           const key = position.operation_id || position.id || position.symbol;
 
           const marginLevel = parseFloat(position.margin_level);
@@ -118,7 +119,7 @@ function Position() {
                     <h5 className="mb-1 text-light fw-bold">
                       {position.symbol}
                       <Badge
-                        bg={position.side === "BUY" ? "success" : "danger"}
+                        bg={isLong ? "success" : "danger"}
                         className="ms-2"
                       >
                         {sideLabel}

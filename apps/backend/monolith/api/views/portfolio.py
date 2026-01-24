@@ -212,7 +212,8 @@ def active_positions(request):
             
             # Aggregate weights
             # Normalize side for aggregation (handle BUY/SELL if they slipped in)
-            is_long = mp.side in [MarginPosition.Side.LONG, "BUY"]
+            side_norm = str(mp.side).strip().upper()
+            is_long = side_norm in [MarginPosition.Side.LONG.upper(), "BUY", "LONG"]
             
             if is_long:
                 grouped_margin[symbol]["total_qty_long"] += mp.quantity
