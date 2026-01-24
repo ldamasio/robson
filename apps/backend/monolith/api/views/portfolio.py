@@ -211,7 +211,10 @@ def active_positions(request):
                 }
             
             # Aggregate weights
-            if mp.side == MarginPosition.Side.LONG:
+            # Normalize side for aggregation (handle BUY/SELL if they slipped in)
+            is_long = mp.side in [MarginPosition.Side.LONG, "BUY"]
+            
+            if is_long:
                 grouped_margin[symbol]["total_qty_long"] += mp.quantity
                 grouped_margin[symbol]["total_cost_long"] += mp.quantity * mp.entry_price
             else:
@@ -223,7 +226,7 @@ def active_positions(request):
             # Keep the leverage of the largest part or simply the last one
             grouped_margin[symbol]["leverage"] = max(grouped_margin[symbol]["leverage"], mp.leverage)
             # Use most conservative stop (lowest for long, highest for short)
-            if mp.side == MarginPosition.Side.LONG:
+            if is_long:
                 grouped_margin[symbol]["stop_loss"] = min(grouped_margin[symbol]["stop_loss"], mp.stop_price)
             else:
                 grouped_margin[symbol]["stop_loss"] = max(grouped_margin[symbol]["stop_loss"], mp.stop_price)
@@ -234,7 +237,8 @@ def active_positions(request):
             if net_qty == 0:
                 continue # Skip if zeroized (rare but possible in this logic)
             
-            net_side = "BUY" if net_qty > 0 else "SELL"
+            # Use consistent LONG/SHORT labels for margin
+            net_side = MarginPosition.Side.LONG if net_qty > 0 else MarginPosition.Side.SHORT
             abs_qty = abs(net_qty)
             
             # Weighted entry price
@@ -249,7 +253,7 @@ def active_positions(request):
             current_price = data["current_price"]
             
             if avg_entry and abs_qty and current_price:
-                if net_side == "BUY":
+                if net_side == MarginPosition.Side.LONG:
                     unrealized_pnl = (current_price - avg_entry) * abs_qty
                 else:
                     unrealized_pnl = (avg_entry - current_price) * abs_qty

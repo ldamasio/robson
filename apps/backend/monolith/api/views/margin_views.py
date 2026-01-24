@@ -29,6 +29,8 @@ def calculate_margin_position_size(
     capital,
     entry_price,
     stop_price,
+    side=None,
+    leverage=3,
     max_risk_percent=1.0,
 ):
     """
@@ -407,7 +409,15 @@ def open_position(request):
     """
     try:
         symbol = request.data.get("symbol", "").upper()
-        side = request.data.get("side", "").upper()
+        raw_side = request.data.get("side", "").upper()
+        # Normalize side to standard internal LONG/SHORT
+        if raw_side in ["BUY", "LONG"]:
+            side = "LONG"
+        elif raw_side in ["SELL", "SHORT"]:
+            side = "SHORT"
+        else:
+            side = raw_side # Let cleaner/validator catch it
+            
         entry_price = Decimal(request.data.get("entry_price", "0"))
         stop_price = Decimal(request.data.get("stop_price", "0"))
         target_price_str = request.data.get("target_price")

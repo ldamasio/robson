@@ -28,6 +28,8 @@ def calculate_margin_position_size(
     capital,
     entry_price,
     stop_price,
+    side=None,
+    leverage=3,
     max_risk_percent=1.0,
 ):
     """
