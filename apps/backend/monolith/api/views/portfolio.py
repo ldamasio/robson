@@ -219,6 +219,9 @@ def active_positions(request):
                     except Exception as e:
                         import logging
                         logging.warning(f"Failed to sync margin side for {symbol}: {e}")
+                
+                import logging
+                logging.warning(f"MARGIN_DEBUG: Symbol={symbol}, RealSide={real_side}, ML={current_margin_level}")
 
                 grouped_margin[symbol] = {
                     "symbol": symbol,
