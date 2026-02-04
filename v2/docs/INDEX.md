@@ -279,6 +279,32 @@ Checklist:
 
 ---
 
+### ADR-0012: Event Sourcing with Postgres Event Log
+
+**File**: [adr/ADR-0012-event-sourcing.md](./adr/ADR-0012-event-sourcing.md)
+
+**Problem**: Audit trail, replay, reconciliation for trading decisions
+
+**Decision**: Postgres-based event sourcing (append-only event_log, projections, snapshots, S3 archival)
+
+**Why Postgres**: ACID, single DB, scale fits non-custodial volume; ParadeDB for search/vectors
+
+---
+
+### ADR-0013: CLI–Daemon IPC (UDS / Named Pipes)
+
+**File**: [adr/ADR-0013-cli-daemon-ipc.md](./adr/ADR-0013-cli-daemon-ipc.md)
+
+**Problem**: Atena CLI (Bun) ↔ Core (Rust) — avoid port binding, local-only, easy binary (Win/Linux/Mac)
+
+**Decision**: Local IPC — Unix Domain Sockets (Linux/macOS), named pipes (Windows); socket/pipe path configurable
+
+**Benefits**: No port, no firewall prompts; lower latency; aligns with “one easy binary” for end user
+
+**Alternatives considered**: HTTP local (current MVP), gRPC, stdio/in-process
+
+---
+
 ## Key Concepts Reference
 
 ### "Palma da Mão" (Palm of the Hand)
