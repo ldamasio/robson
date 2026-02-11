@@ -36,6 +36,8 @@
 #![warn(clippy::all)]
 
 // Modules
+mod credential_store;
+mod detected_position;
 mod error;
 mod memory;
 #[cfg(feature = "postgres")]
@@ -43,6 +45,15 @@ mod postgres;
 mod repository;
 
 // Re-exports
+pub use credential_store::{CredentialStore, MemoryCredentialStore};
+#[cfg(feature = "postgres")]
+pub use credential_store::PgCredentialStore;
+pub use detected_position::{
+    DetectedPositionDto, DetectedPositionRepository, MemoryDetectedPositionRepository,
+    SafetyExecutionDto,
+};
+#[cfg(feature = "postgres")]
+pub use detected_position::PgDetectedPositionRepository;
 pub use error::StoreError;
 pub use memory::MemoryStore;
 #[cfg(feature = "postgres")]

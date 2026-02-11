@@ -13,6 +13,7 @@ rust_decimal_macros = { workspace = true }
 uuid = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
+zeroize = { version = "1.8", features = ["derive"] }
 
 [dev-dependencies]
 anyhow = { workspace = true }

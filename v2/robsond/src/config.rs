@@ -24,6 +24,9 @@ pub struct Config {
     /// Projection configuration
     pub projection: ProjectionConfig,
 
+    /// Position monitor configuration (safety net)
+    pub position_monitor: PositionMonitorConfig,
+
     /// Environment (test, development, production)
     pub environment: Environment,
 }
@@ -61,6 +64,27 @@ pub struct EngineConfig {
     pub max_tech_stop_percent: Decimal,
 }
 
+/// Position monitor configuration (safety net for rogue positions).
+#[derive(Debug, Clone)]
+pub struct PositionMonitorConfig {
+    /// Whether the position monitor is enabled
+    pub enabled: bool,
+    /// Polling interval in seconds
+    pub poll_interval_secs: u64,
+    /// Symbols to monitor (e.g., ["BTCUSDT", "ETHUSDT"])
+    pub symbols: Vec<String>,
+}
+
+impl Default for PositionMonitorConfig {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            poll_interval_secs: 20,
+            symbols: vec!["BTCUSDT".to_string()],
+        }
+    }
+}
+
 /// Environment type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Environment {
@@ -82,8 +106,9 @@ impl Config {
         let api = Self::load_api_config()?;
         let engine = Self::load_engine_config()?;
         let projection = Self::load_projection_config()?;
+        let position_monitor = Self::load_position_monitor_config()?;
 
-        Ok(Self { api, engine, projection, environment })
+        Ok(Self { api, engine, projection, position_monitor, environment })
     }
 
     /// Create test configuration.
@@ -103,6 +128,11 @@ impl Config {
                 tenant_id: None,
                 stream_key: "test:stream".to_string(),
                 poll_interval_ms: 100,
+            },
+            position_monitor: PositionMonitorConfig {
+                enabled: false, // Disabled in tests
+                poll_interval_secs: 1,
+                symbols: vec!["BTCUSDT".to_string()],
             },
             environment: Environment::Test,
         }
@@ -199,6 +229,45 @@ impl Config {
             poll_interval_ms,
         })
     }
+
+    fn load_position_monitor_config() -> DaemonResult<PositionMonitorConfig> {
+        // Check if enabled
+        let enabled = env::var("ROBSON_POSITION_MONITOR_ENABLED")
+            .ok()
+            .and_then(|v| v.parse::<bool>().ok())
+            .unwrap_or(true); // Default: enabled
+
+        // Poll interval
+        let poll_interval_str = env::var("ROBSON_POSITION_MONITOR_POLL_INTERVAL")
+            .unwrap_or_else(|_| "20".to_string());
+        let poll_interval_secs = poll_interval_str.parse::<u64>().map_err(|_| {
+            DaemonError::Config(format!(
+                "Invalid ROBSON_POSITION_MONITOR_POLL_INTERVAL: {}",
+                poll_interval_str
+            ))
+        })?;
+
+        // Symbols to monitor
+        let symbols_str = env::var("ROBSON_POSITION_MONITOR_SYMBOLS")
+            .unwrap_or_else(|_| "BTCUSDT".to_string());
+        let symbols: Vec<String> = symbols_str
+            .split(',')
+            .map(|s| s.trim().to_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if symbols.is_empty() {
+            return Err(DaemonError::Config(
+                "ROBSON_POSITION_MONITOR_SYMBOLS cannot be empty".to_string(),
+            ));
+        }
+
+        Ok(PositionMonitorConfig {
+            enabled,
+            poll_interval_secs,
+            symbols,
+        })
+    }
 }
 
 impl Default for Config {
@@ -216,6 +285,7 @@ impl Default for Config {
                 stream_key: "robson:daemon".to_string(),
                 poll_interval_ms: 100,
             },
+            position_monitor: PositionMonitorConfig::default(),
             environment: Environment::Development,
         }
     }

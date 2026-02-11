@@ -36,6 +36,36 @@ pub enum DaemonEvent {
         timestamp: DateTime<Utc>,
     },
 
+    /// Rogue position detected (opened outside of Robson v2)
+    RoguePositionDetected {
+        symbol: String,
+        side: robson_domain::Side,
+        entry_price: Price,
+        stop_price: Price,
+    },
+
+    /// Safety exit executed successfully
+    SafetyExitExecuted {
+        symbol: String,
+        order_id: String,
+        executed_quantity: rust_decimal::Decimal,
+    },
+
+    /// Safety exit execution failed
+    SafetyExitFailed {
+        symbol: String,
+        error: String,
+    },
+
+    /// Panic mode activated (all retries exhausted)
+    SafetyPanic {
+        position_id: String,
+        symbol: String,
+        side: robson_domain::Side,
+        error: String,
+        consecutive_failures: u32,
+    },
+
     /// Shutdown signal
     Shutdown,
 }

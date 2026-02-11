@@ -7,12 +7,21 @@
 #![warn(clippy::all)]
 
 // Public modules
+pub mod context;
+pub mod credentials;
+pub mod detected_position;
 pub mod entities;
 pub mod events;
 pub mod market_data;
 pub mod value_objects;
 
 // Re-export commonly used types
+pub use context::IdentityScope;
+pub use credentials::{
+    ApiCredentials, CredentialError, CredentialId, CredentialProfile, CredentialStatus,
+    Exchange, StoredCredential,
+};
+pub use detected_position::{CalculatedStop, DetectedPosition, StopMethod};
 pub use entities::{
     AccountId, DetectorSignal, ExitReason, Order, OrderId, OrderStatus, OrderType, Position,
     PositionId, PositionState, calculate_margin_required, calculate_notional_value,

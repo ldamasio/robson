@@ -357,6 +357,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
     async fn start_api_server(&self) -> DaemonResult<SocketAddr> {
         let state = Arc::new(ApiState {
             position_manager: self.position_manager.clone(),
+            position_monitor: None, // TODO: Wire up PositionMonitor when Binance credentials are configured
         });
 
         let router = create_router(state);
@@ -423,6 +424,59 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             DaemonEvent::Shutdown => {
                 info!("Shutdown event received");
                 return Err(DaemonError::Shutdown);
+            },
+
+            DaemonEvent::RoguePositionDetected {
+                symbol,
+                side,
+                entry_price,
+                stop_price,
+            } => {
+                info!(
+                    %symbol,
+                    ?side,
+                    %entry_price,
+                    %stop_price,
+                    "Rogue position detected"
+                );
+            },
+
+            DaemonEvent::SafetyExitExecuted {
+                symbol,
+                order_id,
+                executed_quantity,
+            } => {
+                info!(
+                    %symbol,
+                    %order_id,
+                    %executed_quantity,
+                    "Safety exit executed"
+                );
+            },
+
+            DaemonEvent::SafetyExitFailed { symbol, error } => {
+                error!(
+                    %symbol,
+                    %error,
+                    "Safety exit failed"
+                );
+            },
+
+            DaemonEvent::SafetyPanic {
+                position_id,
+                symbol,
+                side,
+                error,
+                consecutive_failures,
+            } => {
+                error!(
+                    %position_id,
+                    %symbol,
+                    ?side,
+                    %error,
+                    %consecutive_failures,
+                    "PANIC: Safety exit failed repeatedly, position in panic mode"
+                );
             },
         }
 

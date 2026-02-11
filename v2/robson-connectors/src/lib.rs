@@ -6,9 +6,14 @@
 #![warn(clippy::all)]
 
 // Public modules
+pub mod binance_rest;
 pub mod binance_ws;
 
 // Re-exports
+pub use binance_rest::{
+    BinanceOrderResponse, BinanceRestClient, BinanceRestError, IsolatedMarginAccount,
+    IsolatedMarginAsset, IsolatedMarginPosition,
+};
 pub use binance_ws::{BinanceMarketDataClient, BinanceWsError};
 
 #[cfg(test)]

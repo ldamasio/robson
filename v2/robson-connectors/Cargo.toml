@@ -18,6 +18,12 @@ thiserror = { workspace = true }
 tracing = { workspace = true }
 futures-util = "0.3"
 chrono = { workspace = true }
+# Binance API authentication
+hmac = "0.12"
+sha2 = "0.10"
+base64 = "0.21"
+hex = "0.4"
 
 [dev-dependencies]
 anyhow = { workspace = true }
+rust_decimal_macros = { workspace = true }

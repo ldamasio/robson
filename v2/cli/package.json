@@ -21,11 +21,12 @@
   "author": "Robson Team",
   "license": "MIT",
   "dependencies": {
-    "commander": "^11.1.0",
     "axios": "^1.6.2",
     "chalk": "^5.3.0",
     "cli-table3": "^0.6.3",
-    "dotenv": "^16.3.1"
+    "commander": "^11.1.0",
+    "dotenv": "^16.3.1",
+    "smol-toml": "^1.6.0"
   },
   "devDependencies": {
     "@types/node": "^20.10.5",

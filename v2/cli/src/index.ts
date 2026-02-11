@@ -5,6 +5,9 @@ import { registerStatusCommand } from './commands/status';
 import { registerArmCommand } from './commands/arm';
 import { registerDisarmCommand } from './commands/disarm';
 import { registerPanicCommand } from './commands/panic';
+import { registerSafetyStatusCommand } from './commands/safety-status';
+import { registerSafetyTestCommand } from './commands/safety-test';
+import { registerCredentialsCommand } from './commands/credentials';
 
 const program = new Command();
 
@@ -18,5 +21,12 @@ registerStatusCommand(program);
 registerArmCommand(program);
 registerDisarmCommand(program);
 registerPanicCommand(program);
+
+// Safety net commands
+registerSafetyStatusCommand(program);
+registerSafetyTestCommand(program);
+
+// Credentials management
+registerCredentialsCommand(program);
 
 program.parse();

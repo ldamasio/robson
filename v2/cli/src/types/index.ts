@@ -133,3 +133,102 @@ export interface PanicResponse {
 export interface ErrorResponse {
   error: string;
 }
+
+// =============================================================================
+// Safety Net Types
+// =============================================================================
+
+/**
+ * Safety net status response.
+ */
+export interface SafetyStatusResponse {
+  enabled: boolean;
+  symbols: string[];
+  poll_interval_secs: number;
+  tracked_positions: DetectedPositionSummary[];
+  pending_executions: number;
+}
+
+/**
+ * Summary of a detected rogue position.
+ */
+export interface DetectedPositionSummary {
+  id: string;
+  symbol: string;
+  side: string;
+  entry_price: number;
+  quantity: number;
+  stop_price: number;
+  stop_distance_pct: number;
+  detected_at: string;
+}
+
+/**
+ * Safety net test response.
+ */
+export interface SafetyTestResponse {
+  success: boolean;
+  message: string;
+  positions?: BinancePositionInfo[];
+}
+
+/**
+ * Info about a Binance position (for testing).
+ */
+export interface BinancePositionInfo {
+  symbol: string;
+  side: string;
+  quantity: number;
+  entry_price: number;
+  calculated_stop: number;
+}
+
+// =============================================================================
+// Credentials Types
+// =============================================================================
+
+/**
+ * Request to store credentials.
+ */
+export interface SetCredentialsRequest {
+  tenant_id: string;
+  user_id: string;
+  profile: string;
+  exchange: string;
+  api_key: string;
+  api_secret: string;
+  label?: string;
+}
+
+/**
+ * Request to list credentials.
+ */
+export interface ListCredentialsRequest {
+  tenant_id?: string;
+  user_id?: string;
+}
+
+/**
+ * Request to revoke credentials.
+ */
+export interface RevokeCredentialsRequest {
+  tenant_id: string;
+  user_id: string;
+  profile: string;
+  exchange: string;
+  reason: string;
+}
+
+/**
+ * Credential metadata (no secrets).
+ */
+export interface CredentialMetadata {
+  tenant_id: string;
+  user_id: string;
+  profile: string;
+  exchange: string;
+  status: 'active' | 'revoked' | 'expired';
+  label?: string;
+  created_at: string;
+  last_used_at?: string;
+}
