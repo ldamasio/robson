@@ -223,7 +223,7 @@ impl PositionRepository for MemoryStore {
                     && p.side == side
                     && matches!(
                         p.state,
-                        robson_domain::PositionState::Armed { .. }
+                        robson_domain::PositionState::Armed
                             | robson_domain::PositionState::Entering { .. }
                             | robson_domain::PositionState::Active { .. }
                             | robson_domain::PositionState::Exiting { .. }

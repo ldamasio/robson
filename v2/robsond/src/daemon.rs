@@ -22,16 +22,23 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 
 // Macro for creating Decimal literals
+use async_trait::async_trait;
 use rust_decimal_macros::dec;
 
 use tokio::net::TcpListener;
 use tokio::sync::RwLock;
 use tracing::{error, info, warn};
 
-use robson_domain::Symbol;
+use robson_connectors::BinanceRestClient;
+use robson_domain::{Position, PositionId, Symbol};
 use robson_engine::Engine;
 use robson_exec::{ExchangePort, Executor, IntentJournal, StubExchange};
-use robson_store::{MemoryStore, Store};
+use robson_store::{
+    DetectedPositionRepository, MemoryDetectedPositionRepository, MemoryStore, PositionRepository,
+    Store, StoreError,
+};
+#[cfg(feature = "postgres")]
+use robson_store::PgDetectedPositionRepository;
 
 use crate::api::{ApiState, create_router};
 use crate::config::Config;
@@ -39,6 +46,7 @@ use crate::error::{DaemonError, DaemonResult};
 use crate::event_bus::{DaemonEvent, EventBus};
 use crate::market_data::MarketDataManager;
 use crate::position_manager::PositionManager;
+use crate::position_monitor::{PositionMonitor, PositionMonitorConfig as RuntimePositionMonitorConfig};
 
 #[cfg(feature = "postgres")]
 use crate::projection_worker::ProjectionWorker;
@@ -67,6 +75,49 @@ pub struct Daemon<E: ExchangePort + 'static, S: Store + 'static> {
     /// Shared PostgreSQL connection pool for projection worker (injected)
     #[cfg(feature = "postgres")]
     pg_pool: Option<Arc<sqlx::PgPool>>,
+}
+
+/// Adapts a generic `Store` into a concrete `PositionRepository` trait object.
+struct StorePositionRepositoryAdapter<S: Store + 'static> {
+    store: Arc<S>,
+}
+
+#[async_trait]
+impl<S: Store + 'static> PositionRepository for StorePositionRepositoryAdapter<S> {
+    async fn save(&self, position: &Position) -> Result<(), StoreError> {
+        self.store.positions().save(position).await
+    }
+
+    async fn find_by_id(&self, id: PositionId) -> Result<Option<Position>, StoreError> {
+        self.store.positions().find_by_id(id).await
+    }
+
+    async fn find_by_account(&self, account_id: uuid::Uuid) -> Result<Vec<Position>, StoreError> {
+        self.store.positions().find_by_account(account_id).await
+    }
+
+    async fn find_active(&self) -> Result<Vec<Position>, StoreError> {
+        self.store.positions().find_active().await
+    }
+
+    async fn find_by_state(&self, state: &str) -> Result<Vec<Position>, StoreError> {
+        self.store.positions().find_by_state(state).await
+    }
+
+    async fn find_active_by_symbol_and_side(
+        &self,
+        symbol: &robson_domain::Symbol,
+        side: robson_domain::Side,
+    ) -> Result<Option<Position>, StoreError> {
+        self.store
+            .positions()
+            .find_active_by_symbol_and_side(symbol, side)
+            .await
+    }
+
+    async fn delete(&self, id: PositionId) -> Result<(), StoreError> {
+        self.store.positions().delete(id).await
+    }
 }
 
 impl Daemon<StubExchange, MemoryStore> {
@@ -183,8 +234,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         // 1. Restore active positions
         self.restore_positions().await?;
 
+        // 2. Initialize safety net monitor (when configured with Binance credentials)
+        let position_monitor = self.initialize_position_monitor().await?;
+        let position_monitor_handle = position_monitor
+            .as_ref()
+            .map(|monitor| Arc::clone(monitor).start());
+
         // 2. Start API server
-        let api_addr = self.start_api_server().await?;
+        let api_addr = self.start_api_server(position_monitor.clone()).await?;
         info!(%api_addr, "API server started");
 
         // 3. Spawn WebSocket client (Phase 6: Market Data)
@@ -264,6 +321,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         if let Some(handle) = projection_handle {
             info!("Waiting for projection worker to finish...");
             let _ = tokio::time::timeout(tokio::time::Duration::from_secs(30), handle).await;
+        }
+
+        if let Some(monitor) = position_monitor {
+            monitor.shutdown().await;
+        }
+        if let Some(handle) = position_monitor_handle {
+            info!("Waiting for position monitor to finish...");
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), handle).await;
         }
 
         self.shutdown().await?;
@@ -354,10 +419,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
     }
 
     /// Start the API server.
-    async fn start_api_server(&self) -> DaemonResult<SocketAddr> {
+    async fn start_api_server(
+        &self,
+        position_monitor: Option<Arc<PositionMonitor>>,
+    ) -> DaemonResult<SocketAddr> {
         let state = Arc::new(ApiState {
             position_manager: self.position_manager.clone(),
-            position_monitor: None, // TODO: Wire up PositionMonitor when Binance credentials are configured
+            position_monitor,
         });
 
         let router = create_router(state);
@@ -379,6 +447,63 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         });
 
         Ok(local_addr)
+    }
+
+    async fn initialize_position_monitor(&self) -> DaemonResult<Option<Arc<PositionMonitor>>> {
+        if !self.config.position_monitor.enabled {
+            info!("Position monitor disabled by configuration");
+            return Ok(None);
+        }
+
+        let Some(api_key) = self.config.position_monitor.binance_api_key.clone() else {
+            info!("Position monitor enabled but Binance API key not configured; skipping");
+            return Ok(None);
+        };
+        let Some(api_secret) = self.config.position_monitor.binance_api_secret.clone() else {
+            info!("Position monitor enabled but Binance API secret not configured; skipping");
+            return Ok(None);
+        };
+
+        let monitor_config = RuntimePositionMonitorConfig {
+            poll_interval_secs: self.config.position_monitor.poll_interval_secs,
+            symbols: self.config.position_monitor.symbols.clone(),
+            enabled: self.config.position_monitor.enabled,
+            ..RuntimePositionMonitorConfig::default()
+        };
+
+        let detected_repo: Arc<dyn DetectedPositionRepository> = {
+            #[cfg(feature = "postgres")]
+            {
+                if let Some(pool) = &self.pg_pool {
+                    Arc::new(PgDetectedPositionRepository::new(pool.clone()))
+                } else {
+                    Arc::new(MemoryDetectedPositionRepository::new())
+                }
+            }
+            #[cfg(not(feature = "postgres"))]
+            {
+                Arc::new(MemoryDetectedPositionRepository::new())
+            }
+        };
+
+        let core_repo: Arc<dyn PositionRepository> =
+            Arc::new(StorePositionRepositoryAdapter { store: self.store.clone() });
+        let binance_client = Arc::new(BinanceRestClient::new(api_key, api_secret));
+
+        let monitor = Arc::new(PositionMonitor::with_core_exclusion(
+            binance_client,
+            self.event_bus.clone(),
+            monitor_config,
+            detected_repo,
+            core_repo,
+        ));
+
+        monitor.load_persisted_positions().await?;
+        info!(
+            symbols = ?self.config.position_monitor.symbols,
+            "Position monitor initialized"
+        );
+        Ok(Some(monitor))
     }
 
     /// Handle an event from the event bus.
@@ -521,7 +646,7 @@ mod tests {
         let config = Config::test();
         let daemon = Daemon::new_stub(config);
 
-        let addr = daemon.start_api_server().await.unwrap();
+        let addr = daemon.start_api_server(None).await.unwrap();
 
         // Server should be running on a port
         assert!(addr.port() > 0);
