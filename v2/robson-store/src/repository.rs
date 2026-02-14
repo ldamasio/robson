@@ -26,6 +26,16 @@ pub trait PositionRepository: Send + Sync {
     /// Find positions by state
     async fn find_by_state(&self, state: &str) -> Result<Vec<Position>, StoreError>;
 
+    /// Find active Core Trading position by symbol and side.
+    /// 
+    /// Returns Some(position) if found in Entering, Active, or Exiting state.
+    /// Used by Safety Net to exclude Core-managed positions.
+    async fn find_active_by_symbol_and_side(
+        &self,
+        symbol: &robson_domain::Symbol,
+        side: robson_domain::Side,
+    ) -> Result<Option<Position>, StoreError>;
+
     /// Delete a position (soft delete - marks as closed)
     async fn delete(&self, id: PositionId) -> Result<(), StoreError>;
 }

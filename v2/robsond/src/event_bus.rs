@@ -36,6 +36,21 @@ pub enum DaemonEvent {
         timestamp: DateTime<Utc>,
     },
 
+    /// Core Trading position opened (for Safety Net coordination)
+    CorePositionOpened {
+        position_id: PositionId,
+        symbol: Symbol,
+        side: robson_domain::Side,
+        binance_position_id: String,
+    },
+
+    /// Core Trading position closed (for Safety Net coordination)
+    CorePositionClosed {
+        position_id: PositionId,
+        symbol: Symbol,
+        side: robson_domain::Side,
+    },
+
     /// Rogue position detected (opened outside of Robson v2)
     RoguePositionDetected {
         symbol: String,

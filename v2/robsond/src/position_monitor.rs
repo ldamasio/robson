@@ -22,7 +22,7 @@ use tracing::{debug, error, info, warn};
 
 use robson_connectors::{BinanceRestClient, BinanceRestError, IsolatedMarginPosition};
 use robson_domain::{DetectedPosition, Price, Quantity, Side, Symbol};
-use robson_store::DetectedPositionRepository;
+use robson_store::{DetectedPositionRepository, PositionRepository};
 
 use crate::event_bus::{DaemonEvent, EventBus};
 
@@ -137,6 +137,8 @@ pub struct PositionMonitor {
     shutdown_token: CancellationToken,
     /// Optional repository for persistence (None = in-memory only)
     repository: Option<Arc<dyn DetectedPositionRepository>>,
+    /// Core position repository for exclusion filter
+    core_position_repo: Option<Arc<dyn PositionRepository>>,
 }
 
 impl PositionMonitor {
@@ -156,6 +158,7 @@ impl PositionMonitor {
             execution_attempts: RwLock::new(HashMap::new()),
             shutdown_token,
             repository: None,
+            core_position_repo: None,
         }
     }
 
@@ -176,6 +179,32 @@ impl PositionMonitor {
             execution_attempts: RwLock::new(HashMap::new()),
             shutdown_token,
             repository: Some(repository),
+            core_position_repo: None,
+        }
+    }
+
+    /// Create a new position monitor with Core Trading exclusion filter.
+    /// 
+    /// This variant accepts a Core position repository to exclude Core-managed positions
+    /// from Safety Net monitoring, preventing double execution.
+    pub fn with_core_exclusion(
+        binance_client: Arc<BinanceRestClient>,
+        event_bus: Arc<EventBus>,
+        config: PositionMonitorConfig,
+        repository: Arc<dyn DetectedPositionRepository>,
+        core_position_repo: Arc<dyn PositionRepository>,
+    ) -> Self {
+        let shutdown_token = CancellationToken::new();
+
+        Self {
+            binance_client,
+            event_bus,
+            config,
+            tracked_positions: RwLock::new(HashMap::new()),
+            execution_attempts: RwLock::new(HashMap::new()),
+            shutdown_token,
+            repository: Some(repository),
+            core_position_repo: Some(core_position_repo),
         }
     }
 
@@ -198,6 +227,39 @@ impl PositionMonitor {
             }
         }
         Ok(())
+    }
+
+    /// Check if a position is managed by Core Trading.
+    /// 
+    /// Returns true if there's an active Core position for this (symbol, side).
+    /// Used by Safety Net to exclude Core-managed positions from monitoring.
+    async fn is_core_managed(&self, symbol: &Symbol, side: Side) -> Result<bool, MonitorError> {
+        if let Some(repo) = &self.core_position_repo {
+            match repo.find_active_by_symbol_and_side(symbol, side).await {
+                Ok(Some(_)) => {
+                    debug!(
+                        symbol = %symbol.as_pair(),
+                        ?side,
+                        "Position is Core-managed, Safety Net will skip"
+                    );
+                    Ok(true)
+                }
+                Ok(None) => Ok(false),
+                Err(e) => {
+                    // Fail-safe: On error, skip monitoring (don't risk double execution)
+                    warn!(
+                        symbol = %symbol.as_pair(),
+                        ?side,
+                        error = %e,
+                        "Error checking Core positions, failing safe (skipping monitoring)"
+                    );
+                    Ok(true) // Err on the side of caution
+                }
+            }
+        } else {
+            // No core repo configured, Safety Net monitors everything
+            Ok(false)
+        }
     }
 
     /// Start the position monitor in the background.
@@ -277,6 +339,19 @@ impl PositionMonitor {
     ) -> Result<(), MonitorError> {
         let position_id = format!("{}:{}", binance_pos.symbol, binance_pos.side);
 
+        // EXCLUSION FILTER: Check if Core Trading is managing this position
+        let symbol = Symbol::from_pair(&binance_pos.symbol)
+            .map_err(|_| MonitorError::InvalidSymbol(binance_pos.symbol.clone()))?;
+        
+        if self.is_core_managed(&symbol, binance_pos.side).await? {
+            info!(
+                symbol = %binance_pos.symbol,
+                ?binance_pos.side,
+                "Safety Net: Skipping position (Core-managed)"
+            );
+            return Ok(());
+        }
+
         let mut tracked = self.tracked_positions.write().await;
 
         if let Some(existing) = tracked.get_mut(&position_id) {
@@ -326,8 +401,6 @@ impl PositionMonitor {
 
         } else {
             // New position detected
-            let symbol = Symbol::from_pair(&binance_pos.symbol)
-                .map_err(|_| MonitorError::InvalidSymbol(binance_pos.symbol.clone()))?;
 
             let mut detected = DetectedPosition::new(
                 position_id.clone(),

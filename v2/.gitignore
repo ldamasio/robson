@@ -19,6 +19,11 @@ Cargo.lock
 .env.local
 .env.*.local
 
+# Kubernetes secrets (NEVER commit actual secrets!)
+k8s/**/robsond-secret.yml
+k8s/**/*-secret.yml
+!k8s/**/*-secret.yml.template
+
 # IDE
 .vscode/
 .idea/

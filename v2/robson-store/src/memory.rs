@@ -210,6 +210,28 @@ impl PositionRepository for MemoryStore {
         Ok(positions.values().filter(|p| p.state.name() == state).cloned().collect())
     }
 
+    async fn find_active_by_symbol_and_side(
+        &self,
+        symbol: &robson_domain::Symbol,
+        side: robson_domain::Side,
+    ) -> Result<Option<Position>, StoreError> {
+        let positions = self.positions.read().unwrap();
+        Ok(positions
+            .values()
+            .find(|p| {
+                p.symbol == *symbol
+                    && p.side == side
+                    && matches!(
+                        p.state,
+                        robson_domain::PositionState::Armed { .. }
+                            | robson_domain::PositionState::Entering { .. }
+                            | robson_domain::PositionState::Active { .. }
+                            | robson_domain::PositionState::Exiting { .. }
+                    )
+            })
+            .cloned())
+    }
+
     async fn delete(&self, id: PositionId) -> Result<(), StoreError> {
         let mut positions = self.positions.write().unwrap();
         if positions.remove(&id).is_some() {

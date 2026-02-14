@@ -413,6 +413,42 @@ impl BinanceRestClient {
             BinanceRestError::ParseError(format!("Invalid price in response: {}", e))
         })?)
     }
+
+    /// Query order status.
+    /// 
+    /// # Arguments
+    /// 
+    /// * `symbol` - Trading pair (e.g., "BTCUSDT")
+    /// * `order_id` - Exchange order ID
+    pub async fn get_order_status(
+        &self,
+        symbol: &str,
+        order_id: u64,
+    ) -> Result<BinanceOrderResponse, BinanceRestError> {
+        let params = vec![
+            ("symbol", symbol.to_string()),
+            ("orderId", order_id.to_string()),
+        ];
+
+        let body = self.get_signed("/sapi/v1/margin/order", params).await?;
+
+        serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
+    }
+
+    /// Ping Binance API to check connectivity.
+    /// 
+    /// Uses public endpoint, no authentication required.
+    /// Returns Ok(()) if API is reachable, Err otherwise.
+    pub async fn ping(&self) -> Result<(), BinanceRestError> {
+        let body = self.get_public("/api/v3/ping", vec![]).await?;
+        
+        // Ping returns empty JSON object {}
+        if body.trim() == "{}" {
+            Ok(())
+        } else {
+            Err(BinanceRestError::ParseError(format!("Unexpected ping response: {}", body)))
+        }
+    }
 }
 
 // =============================================================================

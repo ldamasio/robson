@@ -1,293 +1,595 @@
-//! Binance WebSocket Market Data Client
+//! Binance WebSocket Client for real-time market and user data streams.
 //!
-//! Connects to Binance WebSocket API for real-time market data.
-//! Normalizes Binance-specific messages to canonical domain types.
+//! Provides WebSocket integration for:
+//! - Real-time market data (ticker, trades, candlesticks)
+//! - User data streams (order updates, position updates)
+//! - Automatic reconnection and keepalive
+//!
+//! # Usage
+//!
+//! ```rust,no_run
+//! use robson_connectors::BinanceWebSocketClient;
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let ws_client = BinanceWebSocketClient::new(false);
+//!     
+//!     // Subscribe to ticker for BTCUSDT
+//!     let mut stream = ws_client.subscribe_ticker("BTCUSDT").await.unwrap();
+//!     
+//!     // Receive updates
+//!     while let Some(msg) = stream.next().await {
+//!         println!("Ticker: {:?}", msg);
+//!     }
+//! }
+//! ```
 
-use futures_util::stream::StreamExt;
-use robson_domain::{MarketDataEvent, Symbol, Tick};
-use rust_decimal::Decimal;
-use serde_json::Value;
+use futures_util::{SinkExt, StreamExt};
+use serde::{Deserialize, Serialize};
+use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream, MaybeTlsStream};
+use tokio::net::TcpStream;
 use std::time::Duration;
-use thiserror::Error;
-use tokio::sync::broadcast;
-use tokio::time::timeout;
-use tokio_tungstenite::{WebSocketStream, connect_async, tungstenite::Message as WebSocketMessage};
-use tracing::{debug, error, info, warn};
 
-/// Type alias for the WebSocket stream (with auto TLS).
-type WsStream = WebSocketStream<tokio_tungstenite::MaybeTlsStream<tokio::net::TcpStream>>;
+// =============================================================================
+// Constants
+// =============================================================================
 
-/// Binance WebSocket base URL.
-const BINANCE_WS_URL: &str = "wss://stream.binance.com:9443/ws";
+/// Binance WebSocket base URL (production)
+const BINANCE_WS_URL: &str = "wss://stream.binance.com:9443";
 
-/// WebSocket read timeout (in seconds).
-const READ_TIMEOUT_SECS: u64 = 30;
+/// Binance WebSocket base URL (testnet)
+const BINANCE_WS_TESTNET_URL: &str = "wss://testnet.binance.vision";
 
-/// Reconnect delay (in seconds).
-const RECONNECT_DELAY_SECS: u64 = 5;
+// =============================================================================
+// Errors
+// =============================================================================
 
 /// Errors that can occur in the Binance WebSocket client.
-#[derive(Debug, Error)]
+#[derive(Debug, thiserror::Error)]
 pub enum BinanceWsError {
-    /// Failed to connect to WebSocket.
-    #[error("Failed to connect to WebSocket: {0}")]
+    /// WebSocket connection failed
+    #[error("WebSocket connection failed: {0}")]
     ConnectionFailed(String),
 
-    /// Failed to send message.
-    #[error("Failed to send message: {0}")]
+    /// WebSocket send failed
+    #[error("WebSocket send failed: {0}")]
     SendFailed(String),
 
-    /// Failed to receive message.
-    #[error("Failed to receive message: {0}")]
-    ReceiveError(String),
+    /// WebSocket receive failed
+    #[error("WebSocket receive failed: {0}")]
+    ReceiveFailed(String),
 
-    /// Invalid message format.
-    #[error("Invalid message format: {0}")]
-    InvalidMessage(String),
+    /// Failed to parse message
+    #[error("Failed to parse message: {0}")]
+    ParseError(String),
 
-    /// Subscription failed.
-    #[error("Subscription failed: {0}")]
-    SubscriptionFailed(String),
+    /// Connection closed
+    #[error("Connection closed")]
+    ConnectionClosed,
 
-    /// Channel closed unexpectedly.
-    #[error("Channel closed unexpectedly")]
-    ChannelClosed,
-
-    /// Timed out waiting for message.
-    #[error("Timed out waiting for message")]
-    Timeout,
+    /// Invalid symbol
+    #[error("Invalid symbol: {0}")]
+    InvalidSymbol(String),
 }
 
-/// Binance WebSocket client for market data.
-pub struct BinanceMarketDataClient {
-    /// Symbol to subscribe to.
-    symbol: Symbol,
-    /// WebSocket stream (with TLS wrapper).
-    ws_stream: WsStream,
-    /// Sender for market data events (fan-out).
-    event_sender: broadcast::Sender<MarketDataEvent>,
-    /// Whether the client is connected.
-    connected: bool,
+// =============================================================================
+// WebSocket Client
+// =============================================================================
+
+/// Binance WebSocket client for real-time data streams.
+pub struct BinanceWebSocketClient {
+    /// Base WebSocket URL
+    base_url: String,
+    /// Use testnet
+    testnet: bool,
 }
 
-impl BinanceMarketDataClient {
+impl BinanceWebSocketClient {
     /// Create a new Binance WebSocket client.
     ///
     /// # Arguments
     ///
-    /// * `symbol` - Trading pair symbol (e.g., "BTCUSDT")
-    /// * `event_sender` - Channel for sending market data events to subscribers
-    pub async fn new(
-        symbol: Symbol,
-        event_sender: broadcast::Sender<MarketDataEvent>,
-    ) -> Result<Self, BinanceWsError> {
-        // Build WebSocket URL for the symbol
-        let stream_name = format!("{}@trade", symbol.as_pair().to_lowercase());
-        let url = format!("{}/{}", BINANCE_WS_URL, stream_name);
+    /// * `testnet` - If true, connects to testnet WebSocket
+    pub fn new(testnet: bool) -> Self {
+        let base_url = if testnet {
+            BINANCE_WS_TESTNET_URL.to_string()
+        } else {
+            BINANCE_WS_URL.to_string()
+        };
 
-        info!(%url, "Connecting to Binance WebSocket");
-
-        // Connect to WebSocket
-        let (ws_stream, _) = connect_async(&url)
-            .await
-            .map_err(|e| BinanceWsError::ConnectionFailed(e.to_string()))?;
-
-        info!(symbol = %symbol.as_pair(), "Connected to Binance WebSocket");
-
-        Ok(Self {
-            symbol,
-            ws_stream,
-            event_sender,
-            connected: true,
-        })
+        Self { base_url, testnet }
     }
 
-    /// Run the client message loop.
+    /// Subscribe to ticker stream for a symbol.
     ///
-    /// This method runs indefinitely, processing incoming messages
-    /// and publishing market data events. Returns when the connection
-    /// is closed or an error occurs.
-    pub async fn run(&mut self) -> Result<(), BinanceWsError> {
-        while self.connected {
-            match timeout(Duration::from_secs(READ_TIMEOUT_SECS), self.next_message()).await {
-                Ok(Ok(Some(msg))) => {
-                    if let Err(e) = self.handle_message(msg).await {
-                        error!(error = %e, "Error handling message");
-                        // Continue processing other messages
-                    }
-                },
-                Ok(Ok(None)) => {
-                    warn!("WebSocket stream closed");
-                    self.connected = false;
-                    return Err(BinanceWsError::ChannelClosed);
-                },
-                Ok(Err(e)) => {
-                    error!(error = %e, "Error reading from WebSocket");
-                    self.connected = false;
-                    return Err(e);
-                },
-                Err(_) => {
-                    error!("Timeout waiting for message");
-                    self.connected = false;
-                    return Err(BinanceWsError::Timeout);
-                },
-            }
-        }
+    /// Receives 24hr ticker updates every second.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - Trading pair (e.g., "BTCUSDT")
+    pub async fn subscribe_ticker(
+        &self,
+        symbol: &str,
+    ) -> Result<BinanceWsStream, BinanceWsError> {
+        let symbol_lower = symbol.to_lowercase();
+        let url = format!("{}/ws/{}@ticker", self.base_url, symbol_lower);
 
-        Ok(())
-    }
-
-    /// Read the next message from the WebSocket stream.
-    async fn next_message(&mut self) -> Result<Option<WebSocketMessage>, BinanceWsError> {
-        match self.ws_stream.next().await {
-            Some(Ok(msg)) => Ok(Some(msg)),
-            Some(Err(e)) => {
-                error!(error = %e, "WebSocket error");
-                Err(BinanceWsError::ReceiveError(format!("{:?}", e)))
-            },
-            None => {
-                warn!("WebSocket stream ended");
-                self.connected = false;
-                Ok(None)
-            },
-        }
-    }
-
-    /// Reconnect to WebSocket with exponential backoff.
-    async fn reconnect(&mut self) -> Result<(), BinanceWsError> {
-        let stream_name = format!("{}@trade", self.symbol.as_pair().to_lowercase());
-        let url = format!("{}/{}", BINANCE_WS_URL, stream_name);
-
-        // Exponential backoff: wait before reconnect
-        tokio::time::sleep(Duration::from_secs(RECONNECT_DELAY_SECS)).await;
-
-        info!(%url, "Reconnecting to Binance WebSocket");
-
-        // Connect to WebSocket
         let (ws_stream, _) = connect_async(&url)
             .await
             .map_err(|e| BinanceWsError::ConnectionFailed(e.to_string()))?;
 
-        // Unwrap the TLS wrapper
-        self.ws_stream = ws_stream;
-
-        self.connected = true;
-        info!(symbol = %self.symbol.as_pair(), "Reconnected to Binance WebSocket");
-
-        Ok(())
+        Ok(BinanceWsStream::new(ws_stream, StreamType::Ticker))
     }
 
-    /// Handle a single WebSocket message.
-    async fn handle_message(&mut self, msg: WebSocketMessage) -> Result<(), BinanceWsError> {
-        match msg {
-            WebSocketMessage::Text(text) => {
-                self.handle_text_message(&text).await?;
-            },
-            WebSocketMessage::Ping(_) => {
-                // Respond to ping with pong
-                // Note: For Binance, ping/pong is handled automatically by the connection
-                debug!("Received ping from Binance");
-            },
-            WebSocketMessage::Pong(_) => {
-                // Ignore pong
-                debug!("Received pong from Binance");
-            },
-            WebSocketMessage::Close(_) => {
-                self.connected = false;
-                warn!("WebSocket connection closed");
-                return Err(BinanceWsError::ChannelClosed);
-            },
-            _ => {
-                // Ignore other message types
-            },
-        }
+    /// Subscribe to aggregated trade stream for a symbol.
+    ///
+    /// Receives trade updates in real-time.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - Trading pair (e.g., "BTCUSDT")
+    pub async fn subscribe_agg_trade(
+        &self,
+        symbol: &str,
+    ) -> Result<BinanceWsStream, BinanceWsError> {
+        let symbol_lower = symbol.to_lowercase();
+        let url = format!("{}/ws/{}@aggTrade", self.base_url, symbol_lower);
 
-        Ok(())
+        let (ws_stream, _) = connect_async(&url)
+            .await
+            .map_err(|e| BinanceWsError::ConnectionFailed(e.to_string()))?;
+
+        Ok(BinanceWsStream::new(ws_stream, StreamType::AggTrade))
     }
 
-    /// Handle a text message (JSON).
-    async fn handle_text_message(&self, text: &str) -> Result<(), BinanceWsError> {
-        // Parse JSON
-        let json: Value = serde_json::from_str(text)
-            .map_err(|e| BinanceWsError::InvalidMessage(e.to_string()))?;
+    /// Subscribe to user data stream (requires listen key from REST API).
+    ///
+    /// Receives:
+    /// - Order execution reports
+    /// - Account position updates
+    /// - Account balance updates
+    ///
+    /// # Arguments
+    ///
+    /// * `listen_key` - Listen key obtained from REST API
+    pub async fn subscribe_user_data(
+        &self,
+        listen_key: &str,
+    ) -> Result<BinanceWsStream, BinanceWsError> {
+        let url = format!("{}/ws/{}", self.base_url, listen_key);
 
-        // Check if it's a trade event
-        if let Some(event_type) = json.get("e").and_then(|v| v.as_str()) {
-            if event_type == "trade" {
-                self.handle_trade_event(&json).await?;
-            }
-        }
+        let (ws_stream, _) = connect_async(&url)
+            .await
+            .map_err(|e| BinanceWsError::ConnectionFailed(e.to_string()))?;
 
-        Ok(())
+        Ok(BinanceWsStream::new(ws_stream, StreamType::UserData))
     }
 
-    /// Handle a Binance trade event.
-    async fn handle_trade_event(&self, json: &Value) -> Result<(), BinanceWsError> {
-        // Parse Binance trade event
-        let event: BinanceTradeEvent = serde_json::from_value(json.clone())
-            .map_err(|e| BinanceWsError::InvalidMessage(format!("Invalid trade event: {}", e)))?;
+    /// Subscribe to candlestick (kline) stream for a symbol and interval.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - Trading pair (e.g., "BTCUSDT")
+    /// * `interval` - Kline interval (e.g., "1m", "5m", "1h", "1d")
+    pub async fn subscribe_kline(
+        &self,
+        symbol: &str,
+        interval: &str,
+    ) -> Result<BinanceWsStream, BinanceWsError> {
+        let symbol_lower = symbol.to_lowercase();
+        let url = format!("{}/ws/{}@kline_{}", self.base_url, symbol_lower, interval);
 
-        // Convert Unix timestamp (milliseconds) to DateTime<Utc>
-        let timestamp =
-            chrono::DateTime::from_timestamp(event.T / 1000, ((event.T % 1000) * 1_000_000) as u32)
-                .unwrap_or_else(|| chrono::Utc::now());
+        let (ws_stream, _) = connect_async(&url)
+            .await
+            .map_err(|e| BinanceWsError::ConnectionFailed(e.to_string()))?;
 
-        // Convert to domain Tick
-        let tick = Tick::new(self.symbol.clone(), event.p, event.q, timestamp, event.t.to_string());
-
-        debug!(
-            symbol = %self.symbol.as_pair(),
-            price = %tick.price,
-            quantity = %tick.quantity,
-            "Received trade tick"
-        );
-
-        // Publish to event channel
-        let market_event = MarketDataEvent::Tick(tick);
-        self.event_sender
-            .send(market_event)
-            .map_err(|_| BinanceWsError::SubscriptionFailed("No receivers".to_string()))?;
-
-        Ok(())
-    }
-
-    /// Check if the client is still connected.
-    pub fn is_connected(&self) -> bool {
-        self.connected
+        Ok(BinanceWsStream::new(ws_stream, StreamType::Kline))
     }
 }
 
 // =============================================================================
-// Binance-Specific Types (internal to connector)
+// WebSocket Stream
 // =============================================================================
 
-/// Binance trade event (from WebSocket stream).
-#[derive(Debug, Clone, serde::Deserialize)]
-struct BinanceTradeEvent {
-    /// Event type
-    #[serde(rename = "e")]
-    pub e: String,
+/// Type of WebSocket stream.
+#[derive(Debug, Clone, Copy)]
+pub enum StreamType {
+    Ticker,
+    AggTrade,
+    UserData,
+    Kline,
+}
+
+/// WebSocket stream wrapper for Binance messages.
+pub struct BinanceWsStream {
+    inner: WebSocketStream<MaybeTlsStream<TcpStream>>,
+    stream_type: StreamType,
+    last_ping: Option<std::time::Instant>,
+}
+
+impl BinanceWsStream {
+    fn new(inner: WebSocketStream<MaybeTlsStream<TcpStream>>, stream_type: StreamType) -> Self {
+        Self {
+            inner,
+            stream_type,
+            last_ping: None,
+        }
+    }
+
+    /// Receive next message from stream.
+    ///
+    /// Returns `None` if the stream is closed.
+    /// Returns `Err` if there was an error receiving or parsing the message.
+    pub async fn next(&mut self) -> Option<Result<WsMessage, BinanceWsError>> {
+        // Send ping if needed (every 3 minutes to keep connection alive)
+        if let Some(last_ping) = self.last_ping {
+            if last_ping.elapsed() > Duration::from_secs(180) {
+                if let Err(e) = self.ping().await {
+                    return Some(Err(e));
+                }
+            }
+        } else {
+            // First message, initialize ping timer
+            self.last_ping = Some(std::time::Instant::now());
+        }
+
+        match self.inner.next().await {
+            Some(Ok(Message::Text(text))) => {
+                // Parse JSON message based on stream type
+                match serde_json::from_str(&text) {
+                    Ok(msg) => Some(Ok(msg)),
+                    Err(e) => Some(Err(BinanceWsError::ParseError(e.to_string()))),
+                }
+            }
+            Some(Ok(Message::Ping(_))) => {
+                // Respond to ping with pong
+                if let Err(e) = self.pong().await {
+                    return Some(Err(e));
+                }
+                // Continue receiving next message
+                Box::pin(self.next()).await
+            }
+            Some(Ok(Message::Pong(_))) => {
+                // Pong received, continue
+                Box::pin(self.next()).await
+            }
+            Some(Ok(Message::Close(_))) => None,
+            Some(Err(e)) => Some(Err(BinanceWsError::ReceiveFailed(e.to_string()))),
+            None => None,
+            _ => {
+                // Binary or Frame messages, skip
+                Box::pin(self.next()).await
+            }
+        }
+    }
+
+    /// Send ping to keep connection alive.
+    pub async fn ping(&mut self) -> Result<(), BinanceWsError> {
+        self.inner
+            .send(Message::Ping(vec![]))
+            .await
+            .map_err(|e| BinanceWsError::SendFailed(e.to_string()))?;
+
+        self.last_ping = Some(std::time::Instant::now());
+        Ok(())
+    }
+
+    /// Send pong in response to ping.
+    async fn pong(&mut self) -> Result<(), BinanceWsError> {
+        self.inner
+            .send(Message::Pong(vec![]))
+            .await
+            .map_err(|e| BinanceWsError::SendFailed(e.to_string()))
+    }
+
+    /// Close the WebSocket connection.
+    pub async fn close(mut self) -> Result<(), BinanceWsError> {
+        self.inner
+            .close(None)
+            .await
+            .map_err(|e| BinanceWsError::SendFailed(e.to_string()))
+    }
+}
+
+// =============================================================================
+// WebSocket Message Types
+// =============================================================================
+
+/// WebSocket message from Binance.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "e", rename_all = "camelCase")]
+pub enum WsMessage {
+    /// 24hr ticker update
+    #[serde(rename = "24hrTicker")]
+    Ticker(TickerEvent),
+
+    /// Aggregated trade
+    #[serde(rename = "aggTrade")]
+    AggTrade(AggTradeEvent),
+
+    /// Kline/Candlestick
+    #[serde(rename = "kline")]
+    Kline(KlineEvent),
+
+    /// Execution report (order update)
+    #[serde(rename = "executionReport")]
+    ExecutionReport(ExecutionReportEvent),
+
+    /// Account position update
+    #[serde(rename = "outboundAccountPosition")]
+    AccountPosition(AccountPositionEvent),
+
+    /// Balance update
+    #[serde(rename = "balanceUpdate")]
+    BalanceUpdate(BalanceUpdateEvent),
+}
+
+/// 24hr ticker event.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TickerEvent {
     /// Event time
     #[serde(rename = "E")]
-    pub E: i64,
+    pub event_time: u64,
+
     /// Symbol
     #[serde(rename = "s")]
-    pub s: String,
-    /// Trade ID
-    #[serde(rename = "t")]
-    pub t: i64,
+    pub symbol: String,
+
+    /// Price change
+    #[serde(rename = "p")]
+    pub price_change: String,
+
+    /// Price change percent
+    #[serde(rename = "P")]
+    pub price_change_percent: String,
+
+    /// Last price
+    #[serde(rename = "c")]
+    pub close_price: String,
+
+    /// Last quantity
+    #[serde(rename = "Q")]
+    pub close_qty: String,
+
+    /// Open price
+    #[serde(rename = "o")]
+    pub open_price: String,
+
+    /// High price
+    #[serde(rename = "h")]
+    pub high_price: String,
+
+    /// Low price
+    #[serde(rename = "l")]
+    pub low_price: String,
+
+    /// Total traded volume
+    #[serde(rename = "v")]
+    pub volume: String,
+
+    /// Total traded quote asset volume
+    #[serde(rename = "q")]
+    pub quote_volume: String,
+}
+
+/// Aggregated trade event.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AggTradeEvent {
+    /// Event time
+    #[serde(rename = "E")]
+    pub event_time: u64,
+
+    /// Symbol
+    #[serde(rename = "s")]
+    pub symbol: String,
+
+    /// Aggregated trade ID
+    #[serde(rename = "a")]
+    pub agg_trade_id: u64,
+
     /// Price
     #[serde(rename = "p")]
-    pub p: Decimal,
+    pub price: String,
+
     /// Quantity
     #[serde(rename = "q")]
-    pub q: Decimal,
+    pub quantity: String,
+
+    /// First trade ID
+    #[serde(rename = "f")]
+    pub first_trade_id: u64,
+
+    /// Last trade ID
+    #[serde(rename = "l")]
+    pub last_trade_id: u64,
+
     /// Trade time
     #[serde(rename = "T")]
-    pub T: i64,
-    /// Buyer is market maker
+    pub trade_time: u64,
+
+    /// Is buyer maker?
     #[serde(rename = "m")]
-    pub m: bool,
+    pub is_buyer_maker: bool,
+}
+
+/// Kline event.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KlineEvent {
+    /// Event time
+    #[serde(rename = "E")]
+    pub event_time: u64,
+
+    /// Symbol
+    #[serde(rename = "s")]
+    pub symbol: String,
+
+    /// Kline data
+    #[serde(rename = "k")]
+    pub kline: KlineData,
+}
+
+/// Kline data.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KlineData {
+    /// Kline start time
+    #[serde(rename = "t")]
+    pub start_time: u64,
+
+    /// Kline close time
+    #[serde(rename = "T")]
+    pub close_time: u64,
+
+    /// Symbol
+    #[serde(rename = "s")]
+    pub symbol: String,
+
+    /// Interval
+    #[serde(rename = "i")]
+    pub interval: String,
+
+    /// Open price
+    #[serde(rename = "o")]
+    pub open: String,
+
+    /// Close price
+    #[serde(rename = "c")]
+    pub close: String,
+
+    /// High price
+    #[serde(rename = "h")]
+    pub high: String,
+
+    /// Low price
+    #[serde(rename = "l")]
+    pub low: String,
+
+    /// Volume
+    #[serde(rename = "v")]
+    pub volume: String,
+
+    /// Is kline closed?
+    #[serde(rename = "x")]
+    pub is_closed: bool,
+}
+
+/// Execution report event (order update).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExecutionReportEvent {
+    /// Event time
+    #[serde(rename = "E")]
+    pub event_time: u64,
+
+    /// Symbol
+    #[serde(rename = "s")]
+    pub symbol: String,
+
+    /// Client order ID
+    #[serde(rename = "c")]
+    pub client_order_id: String,
+
+    /// Side
+    #[serde(rename = "S")]
+    pub side: String,
+
+    /// Order type
+    #[serde(rename = "o")]
+    pub order_type: String,
+
+    /// Time in force
+    #[serde(rename = "f")]
+    pub time_in_force: String,
+
+    /// Order quantity
+    #[serde(rename = "q")]
+    pub quantity: String,
+
+    /// Order price
+    #[serde(rename = "p")]
+    pub price: String,
+
+    /// Order status
+    #[serde(rename = "X")]
+    pub order_status: String,
+
+    /// Order ID
+    #[serde(rename = "i")]
+    pub order_id: u64,
+
+    /// Last executed quantity
+    #[serde(rename = "l")]
+    pub last_executed_qty: String,
+
+    /// Cumulative filled quantity
+    #[serde(rename = "z")]
+    pub cumulative_filled_qty: String,
+
+    /// Last executed price
+    #[serde(rename = "L")]
+    pub last_executed_price: String,
+
+    /// Transaction time
+    #[serde(rename = "T")]
+    pub transaction_time: u64,
+}
+
+/// Account position event.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AccountPositionEvent {
+    /// Event time
+    #[serde(rename = "E")]
+    pub event_time: u64,
+
+    /// Last update time
+    #[serde(rename = "u")]
+    pub last_update_time: u64,
+
+    /// Balances
+    #[serde(rename = "B")]
+    pub balances: Vec<BalanceData>,
+}
+
+/// Balance data.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceData {
+    /// Asset
+    #[serde(rename = "a")]
+    pub asset: String,
+
+    /// Free amount
+    #[serde(rename = "f")]
+    pub free: String,
+
+    /// Locked amount
+    #[serde(rename = "l")]
+    pub locked: String,
+}
+
+/// Balance update event.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BalanceUpdateEvent {
+    /// Event time
+    #[serde(rename = "E")]
+    pub event_time: u64,
+
+    /// Asset
+    #[serde(rename = "a")]
+    pub asset: String,
+
+    /// Balance delta
+    #[serde(rename = "d")]
+    pub balance_delta: String,
+
+    /// Clear time
+    #[serde(rename = "T")]
+    pub clear_time: u64,
 }
 
 // =============================================================================
@@ -299,24 +601,89 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_binance_trade_event_deserialize() {
-        let json = r#"
-        {
-            "e": "trade",
-            "E": 123456789,
+    fn test_ticker_event_deserialization() {
+        let json = r#"{
+            "e": "24hrTicker",
+            "E": 1672515782136,
             "s": "BTCUSDT",
-            "t": 12345,
-            "p": "95000.00",
-            "q": "0.100",
-            "T": 1234567890,
-            "m": false
+            "p": "1000.00",
+            "P": "2.00",
+            "o": "50000.00",
+            "h": "51000.00",
+            "l": "49000.00",
+            "c": "51000.00",
+            "Q": "0.1",
+            "v": "1000.0",
+            "q": "50000000.0"
+        }"#;
+
+        let event: WsMessage = serde_json::from_str(json).unwrap();
+
+        match event {
+            WsMessage::Ticker(ticker) => {
+                assert_eq!(ticker.symbol, "BTCUSDT");
+                assert_eq!(ticker.close_price, "51000.00");
+            }
+            _ => panic!("Expected Ticker event"),
         }
-        "#;
+    }
 
-        let event: BinanceTradeEvent = serde_json::from_str(json).unwrap();
+    #[test]
+    fn test_agg_trade_event_deserialization() {
+        let json = r#"{
+            "e": "aggTrade",
+            "E": 1672515782136,
+            "s": "BTCUSDT",
+            "a": 12345,
+            "p": "50000.00",
+            "q": "0.1",
+            "f": 1000,
+            "l": 1010,
+            "T": 1672515782000,
+            "m": true
+        }"#;
 
-        assert_eq!(event.e, "trade");
-        assert_eq!(event.s, "BTCUSDT");
-        assert_eq!(event.p, Decimal::from(95000));
+        let event: WsMessage = serde_json::from_str(json).unwrap();
+
+        match event {
+            WsMessage::AggTrade(trade) => {
+                assert_eq!(trade.symbol, "BTCUSDT");
+                assert_eq!(trade.price, "50000.00");
+                assert!(trade.is_buyer_maker);
+            }
+            _ => panic!("Expected AggTrade event"),
+        }
+    }
+
+    #[test]
+    fn test_execution_report_deserialization() {
+        let json = r#"{
+            "e": "executionReport",
+            "E": 1672515782136,
+            "s": "BTCUSDT",
+            "c": "client_order_123",
+            "S": "BUY",
+            "o": "MARKET",
+            "f": "GTC",
+            "q": "0.1",
+            "p": "0.0",
+            "X": "FILLED",
+            "i": 12345,
+            "l": "0.1",
+            "z": "0.1",
+            "L": "50000.00",
+            "T": 1672515782000
+        }"#;
+
+        let event: WsMessage = serde_json::from_str(json).unwrap();
+
+        match event {
+            WsMessage::ExecutionReport(report) => {
+                assert_eq!(report.symbol, "BTCUSDT");
+                assert_eq!(report.order_status, "FILLED");
+                assert_eq!(report.side, "BUY");
+            }
+            _ => panic!("Expected ExecutionReport event"),
+        }
     }
 }

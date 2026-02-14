@@ -14,7 +14,10 @@ pub use binance_rest::{
     BinanceOrderResponse, BinanceRestClient, BinanceRestError, IsolatedMarginAccount,
     IsolatedMarginAsset, IsolatedMarginPosition,
 };
-pub use binance_ws::{BinanceMarketDataClient, BinanceWsError};
+pub use binance_ws::{
+    AggTradeEvent, BalanceUpdateEvent, BinanceWebSocketClient, BinanceWsError, BinanceWsStream,
+    ExecutionReportEvent, KlineEvent, StreamType, TickerEvent, WsMessage,
+};
 
 #[cfg(test)]
 mod tests {
