@@ -1,0 +1,213 @@
+---
+# PowerDNS NS1 Deployment (pinned to specific node)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: powerdns-ns1
+  namespace: dns
+  labels:
+    app: powerdns
+    nameserver: ns1
+    app.kubernetes.io/name: powerdns
+    app.kubernetes.io/component: authoritative-dns
+spec:
+  replicas: 1  # Single replica per node in NodePort scenario
+  selector:
+    matchLabels:
+      app: powerdns
+      nameserver: ns1
+  template:
+    metadata:
+      labels:
+        app: powerdns
+        nameserver: ns1
+        rbx.change_id: "CHANGE_ID_PLACEHOLDER"
+        rbx.agent_id: "AGENT_ID_PLACEHOLDER"
+        rbx.env: "prod"
+    spec:
+      # Pinned to tiger (158.220.116.31)
+      nodeSelector:
+        kubernetes.io/hostname: tiger
+      containers:
+        - name: powerdns
+          image: powerdns/pdns-auth-49:latest
+          ports:
+            - containerPort: 53
+              name: dns-udp
+              protocol: UDP
+            - containerPort: 53
+              name: dns-tcp
+              protocol: TCP
+            - containerPort: 8081
+              name: api
+              protocol: TCP
+          env:
+            - name: POSTGRES_HOST
+              value: "postgresql.dns.svc.cluster.local"
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-secret
+                  key: database
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-secret
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-secret
+                  key: password
+            - name: PDNS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: powerdns-secret
+                  key: api-key
+          volumeMounts:
+            - name: config
+              mountPath: /etc/powerdns/pdns.conf
+              subPath: pdns.conf
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          livenessProbe:
+            tcpSocket:
+              port: 53
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 53
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 100
+            runAsGroup: 101
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - NET_BIND_SERVICE
+            readOnlyRootFilesystem: false
+      volumes:
+        - name: config
+          configMap:
+            name: powerdns-config
+
+---
+# PowerDNS NS2 Deployment (pinned to different node)
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: powerdns-ns2
+  namespace: dns
+  labels:
+    app: powerdns
+    nameserver: ns2
+    app.kubernetes.io/name: powerdns
+    app.kubernetes.io/component: authoritative-dns
+spec:
+  replicas: 1  # Single replica per node in NodePort scenario
+  selector:
+    matchLabels:
+      app: powerdns
+      nameserver: ns2
+  template:
+    metadata:
+      labels:
+        app: powerdns
+        nameserver: ns2
+        rbx.change_id: "CHANGE_ID_PLACEHOLDER"
+        rbx.agent_id: "AGENT_ID_PLACEHOLDER"
+        rbx.env: "prod"
+    spec:
+      # Pinned to bengal (164.68.96.68)
+      nodeSelector:
+        kubernetes.io/hostname: bengal
+      containers:
+        - name: powerdns
+          image: powerdns/pdns-auth-49:latest
+          ports:
+            - containerPort: 53
+              name: dns-udp
+              protocol: UDP
+            - containerPort: 53
+              name: dns-tcp
+              protocol: TCP
+            - containerPort: 8081
+              name: api
+              protocol: TCP
+          env:
+            - name: POSTGRES_HOST
+              value: "postgresql.dns.svc.cluster.local"
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-secret
+                  key: database
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-secret
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-secret
+                  key: password
+            - name: PDNS_API_KEY
+              valueFrom:
+                secretKeyRef:
+                  name: powerdns-secret
+                  key: api-key
+          volumeMounts:
+            - name: config
+              mountPath: /etc/powerdns/pdns.conf
+              subPath: pdns.conf
+          resources:
+            requests:
+              memory: "128Mi"
+              cpu: "100m"
+            limits:
+              memory: "256Mi"
+              cpu: "500m"
+          livenessProbe:
+            tcpSocket:
+              port: 53
+            initialDelaySeconds: 10
+            periodSeconds: 10
+            timeoutSeconds: 5
+            failureThreshold: 3
+          readinessProbe:
+            tcpSocket:
+              port: 53
+            initialDelaySeconds: 5
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 2
+          securityContext:
+            runAsNonRoot: true
+            runAsUser: 100
+            runAsGroup: 101
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop:
+                - ALL
+              add:
+                - NET_BIND_SERVICE
+            readOnlyRootFilesystem: false
+      volumes:
+        - name: config
+          configMap:
+            name: powerdns-config

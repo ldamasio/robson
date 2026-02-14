@@ -1,0 +1,162 @@
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: zone-init-script
+  namespace: dns
+data:
+  init-zone.sh: |
+    #!/bin/bash
+    # Initialize strategos.gr zone in PowerDNS
+    set -e
+
+    echo "Waiting for PostgreSQL to be ready..."
+    until pg_isready -h postgresql.dns.svc.cluster.local -U "${POSTGRES_USER}" -d "${POSTGRES_DB}"; do
+      echo "PostgreSQL not ready, waiting..."
+      sleep 2
+    done
+    echo "PostgreSQL is ready!"
+
+    echo "Initializing strategos.gr zone..."
+
+    # Get current serial (YYYYMMDDNN format)
+    SERIAL=$(date +%Y%m%d)01
+
+    # Create SQL for zone initialization
+    cat > /tmp/init-zone.sql <<EOF
+    -- Create domain
+    INSERT INTO domains (name, type)
+    VALUES ('strategos.gr', 'NATIVE')
+    ON CONFLICT (name) DO NOTHING;
+
+    -- Get domain ID
+    DO \$\$
+    DECLARE
+        domain_id_var INT;
+    BEGIN
+        SELECT id INTO domain_id_var FROM domains WHERE name = 'strategos.gr';
+
+        -- Delete existing records (for idempotency)
+        DELETE FROM records WHERE domain_id = domain_id_var;
+
+        -- SOA Record
+        INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled, auth)
+        VALUES (
+            domain_id_var,
+            'strategos.gr',
+            'SOA',
+            'ns1.rbxsystems.ch. hostmaster.strategos.gr. ${SERIAL} 7200 3600 1209600 3600',
+            3600,
+            NULL,
+            false,
+            true
+        );
+
+        -- NS Records
+        INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled, auth)
+        VALUES
+            (domain_id_var, 'strategos.gr', 'NS', 'ns1.rbxsystems.ch.', 3600, NULL, false, true),
+            (domain_id_var, 'strategos.gr', 'NS', 'ns2.rbxsystems.ch.', 3600, NULL, false, true);
+
+        -- A Records (UPDATE THESE WITH ACTUAL IPs)
+        -- Main domain
+        INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled, auth)
+        VALUES (domain_id_var, 'strategos.gr', 'A', '${STRATEGOS_IP}', 3600, NULL, false, true);
+
+        -- WWW
+        INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled, auth)
+        VALUES (domain_id_var, 'www.strategos.gr', 'A', '${STRATEGOS_IP}', 3600, NULL, false, true);
+
+        -- Subdomains (if IPs are provided)
+        IF '${THALAMUS_IP}' != '' THEN
+            INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled, auth)
+            VALUES (domain_id_var, 'thalamus.strategos.gr', 'A', '${THALAMUS_IP}', 3600, NULL, false, true);
+        END IF;
+
+        IF '${ROBSON_IP}' != '' THEN
+            INSERT INTO records (domain_id, name, type, content, ttl, prio, disabled, auth)
+            VALUES (domain_id_var, 'robson.strategos.gr', 'A', '${ROBSON_IP}', 3600, NULL, false, true);
+        END IF;
+
+    END \$\$;
+    EOF
+
+    # Execute SQL
+    echo "Executing zone initialization SQL..."
+    PGPASSWORD="${POSTGRES_PASSWORD}" psql \
+      -h postgresql.dns.svc.cluster.local \
+      -U "${POSTGRES_USER}" \
+      -d "${POSTGRES_DB}" \
+      -f /tmp/init-zone.sql
+
+    echo "Zone initialization complete!"
+
+    # Verify records
+    echo "Verifying zone records..."
+    PGPASSWORD="${POSTGRES_PASSWORD}" psql \
+      -h postgresql.dns.svc.cluster.local \
+      -U "${POSTGRES_USER}" \
+      -d "${POSTGRES_DB}" \
+      -c "SELECT name, type, content FROM records WHERE domain_id = (SELECT id FROM domains WHERE name = 'strategos.gr') ORDER BY type, name;"
+
+    echo "Done!"
+
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: zone-init
+  namespace: dns
+  labels:
+    app: zone-init
+    app.kubernetes.io/component: initialization
+spec:
+  ttlSecondsAfterFinished: 86400  # Clean up after 24 hours
+  template:
+    metadata:
+      labels:
+        app: zone-init
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: zone-init
+          image: postgres:16-alpine
+          command: ["/bin/sh", "/scripts/init-zone.sh"]
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-secret
+                  key: database
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-secret
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-secret
+                  key: password
+            # IMPORTANT: Update these IPs before running
+            - name: STRATEGOS_IP
+              value: "CHANGEME_STRATEGOS_IP"
+            - name: THALAMUS_IP
+              value: ""  # Optional
+            - name: ROBSON_IP
+              value: ""  # Optional
+          volumeMounts:
+            - name: scripts
+              mountPath: /scripts
+          resources:
+            requests:
+              memory: "64Mi"
+              cpu: "50m"
+            limits:
+              memory: "128Mi"
+              cpu: "200m"
+      volumes:
+        - name: scripts
+          configMap:
+            name: zone-init-script
+            defaultMode: 0755

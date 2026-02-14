@@ -1,0 +1,77 @@
+---
+# LoadBalancer Service for NS1
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-ns1
+  namespace: dns
+  labels:
+    app: powerdns
+    nameserver: ns1
+  annotations:
+    metallb.universe.tf/address-pool: dns-pool
+    metallb.universe.tf/loadBalancerIPs: NS1_IP_PLACEHOLDER
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  ports:
+    - name: dns-udp
+      port: 53
+      targetPort: 53
+      protocol: UDP
+    - name: dns-tcp
+      port: 53
+      targetPort: 53
+      protocol: TCP
+  selector:
+    app: powerdns
+    nameserver: ns1
+
+---
+# LoadBalancer Service for NS2
+apiVersion: v1
+kind: Service
+metadata:
+  name: dns-ns2
+  namespace: dns
+  labels:
+    app: powerdns
+    nameserver: ns2
+  annotations:
+    metallb.universe.tf/address-pool: dns-pool
+    metallb.universe.tf/loadBalancerIPs: NS2_IP_PLACEHOLDER
+spec:
+  type: LoadBalancer
+  externalTrafficPolicy: Local
+  ports:
+    - name: dns-udp
+      port: 53
+      targetPort: 53
+      protocol: UDP
+    - name: dns-tcp
+      port: 53
+      targetPort: 53
+      protocol: TCP
+  selector:
+    app: powerdns
+    nameserver: ns2
+
+---
+# ClusterIP Service for API (internal only)
+apiVersion: v1
+kind: Service
+metadata:
+  name: powerdns-api
+  namespace: dns
+  labels:
+    app: powerdns
+    component: api
+spec:
+  type: ClusterIP
+  ports:
+    - name: api
+      port: 8081
+      targetPort: 8081
+      protocol: TCP
+  selector:
+    app: powerdns
