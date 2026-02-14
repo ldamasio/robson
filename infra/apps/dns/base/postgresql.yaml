@@ -1,0 +1,225 @@
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: postgresql-secret
+  namespace: dns
+type: Opaque
+stringData:
+  postgres-password: "CHANGEME_POSTGRES_ROOT_PASSWORD"
+  password: "CHANGEME_PDNS_PASSWORD"
+  username: "pdns_strategos"
+  database: "strategos_dns"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: postgresql-init
+  namespace: dns
+data:
+  init.sql: |
+    -- PowerDNS schema for PostgreSQL backend
+    CREATE TABLE IF NOT EXISTS domains (
+      id                    SERIAL PRIMARY KEY,
+      name                  VARCHAR(255) NOT NULL UNIQUE,
+      master                VARCHAR(128) DEFAULT NULL,
+      last_check            INT DEFAULT NULL,
+      type                  VARCHAR(8) NOT NULL,
+      notified_serial       BIGINT DEFAULT NULL,
+      account               VARCHAR(40) DEFAULT NULL
+    );
+
+    CREATE INDEX IF NOT EXISTS name_index ON domains(name);
+
+    CREATE TABLE IF NOT EXISTS records (
+      id                    BIGSERIAL PRIMARY KEY,
+      domain_id             INT DEFAULT NULL,
+      name                  VARCHAR(255) DEFAULT NULL,
+      type                  VARCHAR(10) DEFAULT NULL,
+      content               VARCHAR(65535) DEFAULT NULL,
+      ttl                   INT DEFAULT NULL,
+      prio                  INT DEFAULT NULL,
+      disabled              BOOL DEFAULT false,
+      ordername             VARCHAR(255),
+      auth                  BOOL DEFAULT true,
+      CONSTRAINT fk_records_domain_id
+        FOREIGN KEY(domain_id)
+        REFERENCES domains(id)
+        ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS rec_name_index ON records(name);
+    CREATE INDEX IF NOT EXISTS nametype_index ON records(name, type);
+    CREATE INDEX IF NOT EXISTS domain_id_index ON records(domain_id);
+    CREATE INDEX IF NOT EXISTS orderindex ON records(ordername);
+
+    CREATE TABLE IF NOT EXISTS supermasters (
+      ip                    INET NOT NULL,
+      nameserver            VARCHAR(255) NOT NULL,
+      account               VARCHAR(40) NOT NULL,
+      PRIMARY KEY(ip, nameserver)
+    );
+
+    CREATE TABLE IF NOT EXISTS comments (
+      id                    SERIAL PRIMARY KEY,
+      domain_id             INT NOT NULL,
+      name                  VARCHAR(255) NOT NULL,
+      type                  VARCHAR(10) NOT NULL,
+      modified_at           INT NOT NULL,
+      account               VARCHAR(40) DEFAULT NULL,
+      comment               VARCHAR(65535) NOT NULL,
+      CONSTRAINT fk_comments_domain_id
+        FOREIGN KEY(domain_id)
+        REFERENCES domains(id)
+        ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS comments_domain_id_index ON comments(domain_id);
+    CREATE INDEX IF NOT EXISTS comments_nametype_index ON comments(name, type);
+    CREATE INDEX IF NOT EXISTS comments_order_idx ON comments(domain_id, modified_at);
+
+    CREATE TABLE IF NOT EXISTS domainmetadata (
+      id                    SERIAL PRIMARY KEY,
+      domain_id             INT NOT NULL,
+      kind                  VARCHAR(32),
+      content               TEXT,
+      CONSTRAINT fk_domainmetadata_domain_id
+        FOREIGN KEY(domain_id)
+        REFERENCES domains(id)
+        ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS domainmetadata_idx ON domainmetadata(domain_id);
+
+    CREATE TABLE IF NOT EXISTS cryptokeys (
+      id                    SERIAL PRIMARY KEY,
+      domain_id             INT NOT NULL,
+      flags                 INT NOT NULL,
+      active                BOOL,
+      published             BOOL DEFAULT true,
+      content               TEXT,
+      CONSTRAINT fk_cryptokeys_domain_id
+        FOREIGN KEY(domain_id)
+        REFERENCES domains(id)
+        ON DELETE CASCADE
+    );
+
+    CREATE INDEX IF NOT EXISTS cryptokeys_idx ON cryptokeys(domain_id);
+
+    CREATE TABLE IF NOT EXISTS tsigkeys (
+      id                    SERIAL PRIMARY KEY,
+      name                  VARCHAR(255) UNIQUE,
+      algorithm             VARCHAR(50),
+      secret                VARCHAR(255)
+    );
+
+    CREATE INDEX IF NOT EXISTS tsigkeys_namealgo_index ON tsigkeys(name, algorithm);
+
+    -- Grant permissions
+    GRANT SELECT, INSERT, UPDATE, DELETE ON ALL TABLES IN SCHEMA public TO pdns_strategos;
+    GRANT USAGE, SELECT ON ALL SEQUENCES IN SCHEMA public TO pdns_strategos;
+
+---
+apiVersion: apps/v1
+kind: StatefulSet
+metadata:
+  name: postgresql
+  namespace: dns
+  labels:
+    app: postgresql
+    app.kubernetes.io/name: postgresql
+    app.kubernetes.io/component: database
+spec:
+  serviceName: postgresql
+  replicas: 1
+  selector:
+    matchLabels:
+      app: postgresql
+  template:
+    metadata:
+      labels:
+        app: postgresql
+    spec:
+      containers:
+        - name: postgresql
+          image: postgres:16-alpine
+          ports:
+            - containerPort: 5432
+              name: postgres
+          env:
+            - name: POSTGRES_DB
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-secret
+                  key: database
+            - name: POSTGRES_USER
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-secret
+                  key: username
+            - name: POSTGRES_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: postgresql-secret
+                  key: password
+            - name: PGDATA
+              value: /var/lib/postgresql/data/pgdata
+          volumeMounts:
+            - name: data
+              mountPath: /var/lib/postgresql/data
+            - name: init-scripts
+              mountPath: /docker-entrypoint-initdb.d
+          resources:
+            requests:
+              memory: "256Mi"
+              cpu: "100m"
+            limits:
+              memory: "512Mi"
+              cpu: "500m"
+          livenessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - pdns_strategos
+            initialDelaySeconds: 30
+            periodSeconds: 10
+          readinessProbe:
+            exec:
+              command:
+                - pg_isready
+                - -U
+                - pdns_strategos
+            initialDelaySeconds: 5
+            periodSeconds: 5
+      volumes:
+        - name: init-scripts
+          configMap:
+            name: postgresql-init
+  volumeClaimTemplates:
+    - metadata:
+        name: data
+      spec:
+        accessModes: ["ReadWriteOnce"]
+        resources:
+          requests:
+            storage: 5Gi
+
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: postgresql
+  namespace: dns
+  labels:
+    app: postgresql
+spec:
+  type: ClusterIP
+  ports:
+    - port: 5432
+      targetPort: 5432
+      protocol: TCP
+      name: postgres
+  selector:
+    app: postgresql

@@ -1,0 +1,28 @@
+---
+# MetalLB IP Address Pool for DNS nameservers
+apiVersion: metallb.io/v1beta1
+kind: IPAddressPool
+metadata:
+  name: dns-pool
+  namespace: metallb-system
+spec:
+  addresses:
+    # IMPORTANT: Replace these with your actual public IPs
+    # Example: - 203.0.113.10/32
+    #          - 203.0.113.11/32
+    - NS1_IP_PLACEHOLDER/32
+    - NS2_IP_PLACEHOLDER/32
+  autoAssign: false  # Manual assignment only
+
+---
+# L2 Advertisement for DNS pool
+apiVersion: metallb.io/v1beta1
+kind: L2Advertisement
+metadata:
+  name: dns-l2-advertisement
+  namespace: metallb-system
+spec:
+  ipAddressPools:
+    - dns-pool
+  interfaces:
+    - eth0  # Adjust to your actual network interface

@@ -1,0 +1,100 @@
+---
+# Firewall configuration documentation for NodePort scenario
+# This ConfigMap contains the UFW commands that MUST be executed on each VPS
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: firewall-documentation
+  namespace: dns
+data:
+  README.md: |
+    # Firewall Configuration for NodePort DNS
+
+    ## IMPORTANT: Manual Firewall Configuration Required
+
+    Since we're using NodePort services, you MUST configure UFW on each VPS node to forward external DNS traffic to the NodePort.
+
+    ### Commands to Execute
+
+    **On VPS hosting NS1 (NODE1_HOSTNAME_PLACEHOLDER):**
+    ```bash
+    # SSH into the node
+    ssh admin@NODE1_IP_PLACEHOLDER
+
+    # Allow DNS traffic (UDP and TCP port 53)
+    sudo ufw allow 53/tcp comment 'DNS TCP for ns1.rbxsystems.ch'
+    sudo ufw allow 53/udp comment 'DNS UDP for ns1.rbxsystems.ch'
+
+    # Verify rules
+    sudo ufw status numbered
+
+    # Test port forwarding
+    sudo iptables -t nat -L -n -v | grep 53
+    ```
+
+    **On VPS hosting NS2 (NODE2_HOSTNAME_PLACEHOLDER):**
+    ```bash
+    # SSH into the node
+    ssh admin@NODE2_IP_PLACEHOLDER
+
+    # Allow DNS traffic (UDP and TCP port 53)
+    sudo ufw allow 53/tcp comment 'DNS TCP for ns2.rbxsystems.ch'
+    sudo ufw allow 53/udp comment 'DNS UDP for ns2.rbxsystems.ch'
+
+    # Verify rules
+    sudo ufw status numbered
+
+    # Test port forwarding
+    sudo iptables -t nat -L -n -v | grep 53
+    ```
+
+    ### Port Forwarding (if not automatic)
+
+    If Kubernetes doesn't automatically forward port 53 to NodePort, add iptables rules:
+
+    **On NS1 node:**
+    ```bash
+    sudo iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-port 30053
+    sudo iptables -t nat -A PREROUTING -p tcp --dport 53 -j REDIRECT --to-port 30053
+
+    # Persist rules
+    sudo apt-get install iptables-persistent
+    sudo netfilter-persistent save
+    ```
+
+    **On NS2 node:**
+    ```bash
+    sudo iptables -t nat -A PREROUTING -p udp --dport 53 -j REDIRECT --to-port 30054
+    sudo iptables -t nat -A PREROUTING -p tcp --dport 53 -j REDIRECT --to-port 30054
+
+    # Persist rules
+    sudo apt-get install iptables-persistent
+    sudo netfilter-persistent save
+    ```
+
+    ### Verification
+
+    From an external machine:
+    ```bash
+    dig @NODE1_IP_PLACEHOLDER strategos.gr NS
+    dig @NODE2_IP_PLACEHOLDER strategos.gr NS
+    ```
+
+    ### Troubleshooting
+
+    **Check if port is listening:**
+    ```bash
+    sudo netstat -tulpn | grep :53
+    ```
+
+    **Check iptables NAT rules:**
+    ```bash
+    sudo iptables -t nat -L -n -v | grep 30053
+    sudo iptables -t nat -L -n -v | grep 30054
+    ```
+
+    **Test NodePort directly:**
+    ```bash
+    dig @NODE1_IP_PLACEHOLDER -p 30053 strategos.gr NS
+    dig @NODE2_IP_PLACEHOLDER -p 30054 strategos.gr NS
+    ```

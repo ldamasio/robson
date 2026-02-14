@@ -1,0 +1,77 @@
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: powerdns-secret
+  namespace: dns
+type: Opaque
+stringData:
+  api-key: "CHANGEME_PDNS_API_KEY"
+
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: powerdns-config
+  namespace: dns
+data:
+  pdns.conf: |
+    # PowerDNS Authoritative Server Configuration
+    # Security-hardened for public authoritative DNS
+
+    # Daemon
+    daemon=no
+    guardian=yes
+    setgid=pdns
+    setuid=pdns
+
+    # Logging
+    loglevel=4
+    log-dns-details=yes
+    log-dns-queries=no
+
+    # Network
+    local-address=0.0.0.0
+    local-port=53
+    query-local-address=0.0.0.0
+
+    # Authoritative only - NO RECURSION
+    primary=yes
+    secondary=no
+
+    # Security: Disable recursion completely
+    recursor=
+
+    # Security: Disable zone transfers
+    disable-axfr=yes
+    allow-axfr-ips=
+    allow-notify-from=
+    allow-unsigned-notify=no
+
+    # API (for internal management only)
+    api=yes
+    api-key=${PDNS_API_KEY}
+    webserver=yes
+    webserver-address=0.0.0.0
+    webserver-port=8081
+    webserver-allow-from=0.0.0.0/0
+
+    # Backend: PostgreSQL
+    launch=gpgsql
+
+    # PostgreSQL connection
+    gpgsql-host=${POSTGRES_HOST}
+    gpgsql-port=5432
+    gpgsql-dbname=${POSTGRES_DB}
+    gpgsql-user=${POSTGRES_USER}
+    gpgsql-password=${POSTGRES_PASSWORD}
+    gpgsql-dnssec=no
+
+    # Performance
+    cache-ttl=20
+    query-cache-ttl=20
+    negquery-cache-ttl=60
+
+    # Distribution
+    receiver-threads=2
+    distributor-threads=3
