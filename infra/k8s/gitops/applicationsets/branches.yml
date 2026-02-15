@@ -12,16 +12,8 @@ metadata:
 spec:
   goTemplate: true
   generators:
-    - git:
-        repoURL: https://github.com/ldamasio/robson
-        revision: HEAD
-        directories:
-          - path: charts/*
-        filters:
-          - path: '^(?!main$).*' # exclude main (dummy; adjust with matrix if needed)
     - pullRequest:
         repoURL: https://github.com/ldamasio/robson
-        # Optionally generate from PRs
   template:
     metadata:
       name: 'robson-{{ lower (replace (replace .branch "/" "-") "_" "-") }}'
