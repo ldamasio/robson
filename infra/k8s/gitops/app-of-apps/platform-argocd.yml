@@ -1,9 +1,10 @@
-# Root App-of-Apps: manages all child Applications in this directory.
-# MUST stay in project: default to avoid lockout.
+# ArgoCD self-management Application.
+# Stays in project: default intentionally. Do NOT move to rbx-platform
+# until ArgoCD RBAC and self-management migration is fully planned.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: robson-root
+  name: platform-argocd
   namespace: argocd
   labels:
     rbx.env: production
@@ -16,7 +17,7 @@ spec:
   source:
     repoURL: https://github.com/ldamasio/robson
     targetRevision: main
-    path: infra/k8s/gitops/app-of-apps
+    path: infra/k8s/platform/argocd
   destination:
     server: https://kubernetes.default.svc
     namespace: argocd

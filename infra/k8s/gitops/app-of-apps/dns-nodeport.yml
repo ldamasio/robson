@@ -12,11 +12,10 @@ metadata:
     rbx.product: dns
     rbx.agent_id: human
     rbx.change_id: CHANGE_ID_PLACEHOLDER
-  # Finalizers ensure Application is deleted properly
   finalizers:
     - resources-finalizer.argocd.argoproj.io
 spec:
-  project: default
+  project: rbx-applications
 
   source:
     repoURL: https://github.com/ldamasio/robson
@@ -39,11 +38,10 @@ spec:
     retry:
       limit: 5
       backoff:
-        duration: 5s
+        duration: 10s
         factor: 2
         maxDuration: 3m
 
-  # Health assessment
   ignoreDifferences:
     - group: apps
       kind: Deployment

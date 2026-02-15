@@ -28,7 +28,7 @@ spec:
       labels:
         robson/preview: 'true'
     spec:
-      project: default
+      project: rbx-previews
       source:
         repoURL: https://github.com/ldamasio/robson
         targetRevision: '{{ .branch }}'
@@ -55,6 +55,12 @@ spec:
           selfHeal: true
         syncOptions:
           - CreateNamespace=true
+        retry:
+          limit: 5
+          backoff:
+            duration: 10s
+            factor: 2
+            maxDuration: 3m
       ignoreDifferences:
         - group: ""
           kind: Secret
