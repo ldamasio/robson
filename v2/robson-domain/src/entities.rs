@@ -60,6 +60,8 @@ pub struct Position {
     pub entry_order_id: Option<OrderId>,
     pub exit_order_id: Option<OrderId>,
     pub insurance_stop_id: Option<OrderId>, // Exchange insurance stop (if enabled)
+    /// Binance exchange identifier captured on entry fill for Core/SafetyNet coordination.
+    pub binance_position_id: Option<String>,
 
     // Audit
     pub created_at: DateTime<Utc>,
@@ -86,6 +88,7 @@ impl Position {
             entry_order_id: None,
             exit_order_id: None,
             insurance_stop_id: None,
+            binance_position_id: None,
             created_at: now,
             updated_at: now,
             closed_at: None,

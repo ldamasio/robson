@@ -73,6 +73,10 @@ pub struct PositionMonitorConfig {
     pub poll_interval_secs: u64,
     /// Symbols to monitor (e.g., ["BTCUSDT", "ETHUSDT"])
     pub symbols: Vec<String>,
+    /// Binance API key (required to enable runtime monitor).
+    pub binance_api_key: Option<String>,
+    /// Binance API secret (required to enable runtime monitor).
+    pub binance_api_secret: Option<String>,
 }
 
 impl Default for PositionMonitorConfig {
@@ -81,6 +85,8 @@ impl Default for PositionMonitorConfig {
             enabled: true,
             poll_interval_secs: 20,
             symbols: vec!["BTCUSDT".to_string()],
+            binance_api_key: None,
+            binance_api_secret: None,
         }
     }
 }
@@ -133,6 +139,8 @@ impl Config {
                 enabled: false, // Disabled in tests
                 poll_interval_secs: 1,
                 symbols: vec!["BTCUSDT".to_string()],
+                binance_api_key: None,
+                binance_api_secret: None,
             },
             environment: Environment::Test,
         }
@@ -262,10 +270,21 @@ impl Config {
             ));
         }
 
+        let binance_api_key = env::var("ROBSON_BINANCE_API_KEY")
+            .ok()
+            .or_else(|| env::var("BINANCE_API_KEY").ok())
+            .filter(|v| !v.trim().is_empty());
+        let binance_api_secret = env::var("ROBSON_BINANCE_API_SECRET")
+            .ok()
+            .or_else(|| env::var("BINANCE_API_SECRET").ok())
+            .filter(|v| !v.trim().is_empty());
+
         Ok(PositionMonitorConfig {
             enabled,
             poll_interval_secs,
             symbols,
+            binance_api_key,
+            binance_api_secret,
         })
     }
 }

@@ -345,8 +345,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     );
 
                     // Process the fill (position is now in Entering state)
-                    self.handle_entry_fill(position_id, order.fill_price, order.filled_quantity)
-                        .await?;
+                    self.handle_entry_fill(
+                        position_id,
+                        order.fill_price,
+                        order.filled_quantity,
+                        Some(order.exchange_order_id),
+                    )
+                    .await?;
                 },
                 ActionResult::AlreadyProcessed(id) => {
                     warn!(%position_id, %id, "Signal already processed (idempotent skip)");
@@ -374,6 +379,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         position_id: PositionId,
         fill_price: Price,
         filled_quantity: Quantity,
+        binance_position_id: Option<String>,
     ) -> DaemonResult<()> {
         // Load position
         let position = self
@@ -391,8 +397,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         // THEN save state (atomicity: events before state)
         if let Some(ref updated_position) = decision.updated_position {
+            let mut updated_position = updated_position.clone();
+            if updated_position.binance_position_id.is_none() {
+                updated_position.binance_position_id = binance_position_id;
+            }
             let old_state = format!("{:?}", position.state);
-            self.store.positions().save(updated_position).await?;
+            self.store.positions().save(&updated_position).await?;
 
             info!(
                 %position_id,
@@ -405,6 +415,24 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 previous_state: old_state,
                 new_state: format!("{:?}", updated_position.state),
                 timestamp: chrono::Utc::now(),
+            });
+
+            let core_exchange_id = updated_position
+                .binance_position_id
+                .clone()
+                .unwrap_or_else(|| {
+                    warn!(
+                        %position_id,
+                        "Missing binance_position_id on Core open; using position_id fallback"
+                    );
+                    position_id.to_string()
+                });
+
+            self.event_bus.send(DaemonEvent::CorePositionOpened {
+                position_id,
+                symbol: updated_position.symbol.clone(),
+                side: updated_position.side,
+                binance_position_id: core_exchange_id,
             });
         }
 
@@ -504,6 +532,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             new_state: "Closed".to_string(),
             timestamp: chrono::Utc::now(),
         });
+        self.event_bus.send(DaemonEvent::CorePositionClosed {
+            position_id,
+            symbol: position.symbol.clone(),
+            side: position.side,
+        });
 
         Ok(())
     }
@@ -569,6 +602,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             timestamp: chrono::Utc::now(),
         };
         self.executor.execute(vec![EngineAction::EmitEvent(event)]).await?;
+
+        self.event_bus.send(DaemonEvent::CorePositionClosed {
+            position_id,
+            symbol: position.symbol.clone(),
+            side: position.side,
+        });
 
         Ok(())
     }
@@ -685,6 +724,7 @@ mod tests {
     #[tokio::test]
     async fn test_handle_signal() {
         let manager = create_test_manager().await;
+        let mut receiver = manager.event_bus.subscribe();
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
         // Create tech stop distance: entry $100, stop $98 (2% distance)
         let entry = Price::new(dec!(100)).unwrap();
@@ -718,6 +758,27 @@ mod tests {
         // Position should now be Active
         let updated = manager.get_position(position.id).await.unwrap().unwrap();
         assert!(matches!(updated.state, PositionState::Active { .. }));
+
+        // Core open event must be emitted when position becomes active
+        let mut opened = false;
+        for _ in 0..20 {
+            if let Ok(Some(event)) = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                receiver.recv(),
+            )
+            .await
+            {
+                if let Ok(DaemonEvent::CorePositionOpened { position_id, symbol, side, .. }) = event
+                {
+                    assert_eq!(position_id, position.id);
+                    assert_eq!(symbol.as_pair(), "BTCUSDT");
+                    assert_eq!(side, Side::Long);
+                    opened = true;
+                    break;
+                }
+            }
+        }
+        assert!(opened, "Expected CorePositionOpened event");
     }
 
     #[tokio::test]
@@ -764,6 +825,59 @@ mod tests {
 
         let result = manager.disarm_position(fake_id).await;
         assert!(matches!(result, Err(DaemonError::PositionNotFound(_))));
+    }
+
+    #[tokio::test]
+    async fn test_panic_close_emits_core_position_closed() {
+        let manager = create_test_manager().await;
+        let mut receiver = manager.event_bus.subscribe();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(98)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        let position = manager
+            .arm_position(
+                symbol.clone(),
+                Side::Long,
+                create_test_risk_config(),
+                tech_stop,
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol,
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(93100)).unwrap(),
+            timestamp: chrono::Utc::now(),
+        };
+        manager.handle_signal(signal).await.unwrap();
+
+        let _ = manager.panic_close_all().await.unwrap();
+
+        let mut closed = false;
+        for _ in 0..20 {
+            if let Ok(Some(event)) = tokio::time::timeout(
+                std::time::Duration::from_millis(50),
+                receiver.recv(),
+            )
+            .await
+            {
+                if let Ok(DaemonEvent::CorePositionClosed { position_id, symbol, side }) = event {
+                    assert_eq!(position_id, position.id);
+                    assert_eq!(symbol.as_pair(), "BTCUSDT");
+                    assert_eq!(side, Side::Long);
+                    closed = true;
+                    break;
+                }
+            }
+        }
+        assert!(closed, "Expected CorePositionClosed event");
     }
 
     /// E2E test: full detector integration (arm → spawn detector → MA crossover → signal → entry)

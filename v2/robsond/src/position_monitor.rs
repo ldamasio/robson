@@ -9,7 +9,7 @@
 //! This runs independently of the normal position flow to provide
 //! risk management even when the user bypasses Robson v2.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -139,6 +139,8 @@ pub struct PositionMonitor {
     repository: Option<Arc<dyn DetectedPositionRepository>>,
     /// Core position repository for exclusion filter
     core_position_repo: Option<Arc<dyn PositionRepository>>,
+    /// In-memory exclusion set maintained from Core open/close events.
+    core_exclusion_set: RwLock<HashSet<String>>,
 }
 
 impl PositionMonitor {
@@ -159,6 +161,7 @@ impl PositionMonitor {
             shutdown_token,
             repository: None,
             core_position_repo: None,
+            core_exclusion_set: RwLock::new(HashSet::new()),
         }
     }
 
@@ -180,11 +183,12 @@ impl PositionMonitor {
             shutdown_token,
             repository: Some(repository),
             core_position_repo: None,
+            core_exclusion_set: RwLock::new(HashSet::new()),
         }
     }
 
     /// Create a new position monitor with Core Trading exclusion filter.
-    /// 
+    ///
     /// This variant accepts a Core position repository to exclude Core-managed positions
     /// from Safety Net monitoring, preventing double execution.
     pub fn with_core_exclusion(
@@ -205,7 +209,27 @@ impl PositionMonitor {
             shutdown_token,
             repository: Some(repository),
             core_position_repo: Some(core_position_repo),
+            core_exclusion_set: RwLock::new(HashSet::new()),
         }
+    }
+
+    fn exclusion_key(symbol: &str, side: Side) -> String {
+        format!("{symbol}:{}", if side == Side::Long { "long" } else { "short" })
+    }
+
+    async fn is_core_excluded_in_memory(&self, symbol: &Symbol, side: Side) -> bool {
+        let key = Self::exclusion_key(&symbol.as_pair(), side);
+        self.core_exclusion_set.read().await.contains(&key)
+    }
+
+    async fn add_core_exclusion(&self, symbol: &Symbol, side: Side) {
+        let key = Self::exclusion_key(&symbol.as_pair(), side);
+        self.core_exclusion_set.write().await.insert(key);
+    }
+
+    async fn remove_core_exclusion(&self, symbol: &Symbol, side: Side) {
+        let key = Self::exclusion_key(&symbol.as_pair(), side);
+        self.core_exclusion_set.write().await.remove(&key);
     }
 
     /// Load persisted positions from repository on startup.
@@ -230,7 +254,7 @@ impl PositionMonitor {
     }
 
     /// Check if a position is managed by Core Trading.
-    /// 
+    ///
     /// Returns true if there's an active Core position for this (symbol, side).
     /// Used by Safety Net to exclude Core-managed positions from monitoring.
     async fn is_core_managed(&self, symbol: &Symbol, side: Side) -> Result<bool, MonitorError> {
@@ -267,6 +291,7 @@ impl PositionMonitor {
     /// Returns a JoinHandle that can be awaited or aborted.
     pub fn start(self: Arc<Self>) -> JoinHandle<()> {
         tokio::spawn(async move {
+            let mut event_receiver = self.event_bus.subscribe();
             info!(
                 interval_secs = self.config.poll_interval_secs,
                 symbols = ?self.config.symbols,
@@ -278,6 +303,32 @@ impl PositionMonitor {
                     _ = self.shutdown_token.cancelled() => {
                         info!("Position monitor received shutdown signal");
                         break;
+                    }
+                    Some(event_result) = event_receiver.recv() => {
+                        match event_result {
+                            Ok(DaemonEvent::CorePositionOpened { symbol, side, .. }) => {
+                                self.add_core_exclusion(&symbol, side).await;
+                                debug!(
+                                    symbol = %symbol.as_pair(),
+                                    ?side,
+                                    "Updated core exclusion set (add)"
+                                );
+                            }
+                            Ok(DaemonEvent::CorePositionClosed { symbol, side, .. }) => {
+                                self.remove_core_exclusion(&symbol, side).await;
+                                debug!(
+                                    symbol = %symbol.as_pair(),
+                                    ?side,
+                                    "Updated core exclusion set (remove)"
+                                );
+                            }
+                            Ok(_) => {
+                                // Ignore unrelated events
+                            }
+                            Err(lag_msg) => {
+                                warn!(%lag_msg, "Position monitor event receiver lagged");
+                            }
+                        }
                     }
                     _ = tokio::time::sleep(Duration::from_secs(self.config.poll_interval_secs)) => {
                         if let Err(e) = self.check_positions().await {
@@ -342,12 +393,20 @@ impl PositionMonitor {
         // EXCLUSION FILTER: Check if Core Trading is managing this position
         let symbol = Symbol::from_pair(&binance_pos.symbol)
             .map_err(|_| MonitorError::InvalidSymbol(binance_pos.symbol.clone()))?;
-        
+
         if self.is_core_managed(&symbol, binance_pos.side).await? {
             info!(
                 symbol = %binance_pos.symbol,
                 ?binance_pos.side,
                 "Safety Net: Skipping position (Core-managed)"
+            );
+            return Ok(());
+        }
+        if self.is_core_excluded_in_memory(&symbol, binance_pos.side).await {
+            info!(
+                symbol = %binance_pos.symbol,
+                ?binance_pos.side,
+                "Safety Net: Skipping position (Core-managed via event cache)"
             );
             return Ok(());
         }
@@ -485,6 +544,16 @@ impl PositionMonitor {
         quantity: Quantity,
         current_price: Price,
     ) -> Result<(), MonitorError> {
+        if self.is_core_excluded_in_memory(&symbol, side).await {
+            info!(
+                %position_id,
+                symbol = %symbol.as_pair(),
+                ?side,
+                "Safety Net execution skipped (Core-managed via event cache)"
+            );
+            return Ok(());
+        }
+
         // =========================================
         // 1. IDEMPOTENCY CHECK
         // =========================================
@@ -945,6 +1014,53 @@ mod tests {
             execution_cooldown_secs: 60,
             price_validation_tolerance_pct: dec!(0.1),
         }
+    }
+
+    #[tokio::test]
+    async fn test_core_exclusion_set_add_remove() {
+        let monitor = PositionMonitor::new(
+            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
+            Arc::new(EventBus::new(100)),
+            create_test_config(),
+        );
+
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        assert!(!monitor.is_core_excluded_in_memory(&symbol, Side::Long).await);
+
+        monitor.add_core_exclusion(&symbol, Side::Long).await;
+        assert!(monitor.is_core_excluded_in_memory(&symbol, Side::Long).await);
+
+        monitor.remove_core_exclusion(&symbol, Side::Long).await;
+        assert!(!monitor.is_core_excluded_in_memory(&symbol, Side::Long).await);
+    }
+
+    #[tokio::test]
+    async fn test_process_binance_position_skips_core_exclusion_cache() {
+        let monitor = PositionMonitor::new(
+            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
+            Arc::new(EventBus::new(100)),
+            create_test_config(),
+        );
+
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        monitor.add_core_exclusion(&symbol, Side::Long).await;
+
+        let binance_pos = IsolatedMarginPosition {
+            symbol: "BTCUSDT".to_string(),
+            side: Side::Long,
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            asset: "BTC".to_string(),
+        };
+        let current_price = Price::new(dec!(95000)).unwrap();
+
+        monitor
+            .process_binance_position(binance_pos, current_price)
+            .await
+            .unwrap();
+
+        // Position should not be tracked because it was excluded as Core-managed.
+        assert!(monitor.get_tracked_positions().await.is_empty());
     }
 
     #[test]
