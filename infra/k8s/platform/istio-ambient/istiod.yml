@@ -3,6 +3,12 @@ kind: Application
 metadata:
   name: istiod-ambient
   namespace: argocd
+  labels:
+    rbx.env: production
+    rbx.product: platform
+    rbx.agent_id: human
+    rbx.change_id: CHANGE_ID_PLACEHOLDER
+    app.kubernetes.io/part-of: rbx-systems
 spec:
   project: default
   source:
