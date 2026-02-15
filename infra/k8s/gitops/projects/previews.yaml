@@ -1,0 +1,53 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: rbx-previews
+  namespace: argocd
+  labels:
+    rbx.env: preview
+    rbx.product: platform
+    rbx.agent_id: human
+    rbx.change_id: CHANGE_ID_PLACEHOLDER
+    app.kubernetes.io/part-of: rbx-systems
+spec:
+  description: >
+    Ephemeral preview environments generated from pull requests.
+    Applications in this project are created and deleted automatically
+    by the branch previews ApplicationSet.
+
+  # Allowed source repositories
+  sourceRepos:
+    - https://github.com/ldamasio/robson
+    - https://github.com/ldamasio/robson.git
+
+  # Allowed destination clusters and namespaces
+  # Preview namespaces follow the pattern h-<branch-name>
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: "h-*"
+
+  # No cluster-scoped resources for previews
+  clusterResourceWhitelist: []
+
+  # Namespace-scoped resources (allow all within permitted namespaces)
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+
+  # Deny cluster-scoped resources explicitly
+  clusterResourceBlacklist:
+    - group: "*"
+      kind: Namespace
+
+  # Orphaned resources cleanup for preview environments
+  orphanedResources:
+    warn: true
+
+  # Roles for future RBAC integration
+  roles:
+    - name: preview-admin
+      description: Full access to preview environments
+      policies:
+        - p, proj:rbx-previews:preview-admin, applications, *, rbx-previews/*, allow
+      groups:
+        - developers

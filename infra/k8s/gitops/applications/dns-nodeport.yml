@@ -1,35 +1,39 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: robson-prod
+  name: dns-infrastructure-nodeport
   namespace: argocd
   labels:
-    app.kubernetes.io/name: robson-prod
-    app.kubernetes.io/component: production
+    app.kubernetes.io/name: dns-infrastructure
+    app.kubernetes.io/component: authoritative-dns
     app.kubernetes.io/part-of: rbx-systems
+    deployment-scenario: nodeport
     rbx.env: production
-    rbx.product: robson
+    rbx.product: dns
     rbx.agent_id: human
     rbx.change_id: CHANGE_ID_PLACEHOLDER
+  # Finalizers ensure Application is deleted properly
+  finalizers:
+    - resources-finalizer.argocd.argoproj.io
 spec:
   project: default
-  
+
   source:
     repoURL: https://github.com/ldamasio/robson
     targetRevision: main
-    path: infra/k8s/prod
-  
+    path: infra/apps/dns/overlays/nodeport
+
   destination:
     server: https://kubernetes.default.svc
-    namespace: robson
-  
+    namespace: dns
+
   syncPolicy:
     automated:
-      prune: true      # Delete resources that are no longer defined in Git
-      selfHeal: true   # Sync when cluster state differs from Git
+      prune: true
+      selfHeal: true
       allowEmpty: false
     syncOptions:
-      - CreateNamespace=true  # Auto-create namespace if it doesn't exist
+      - CreateNamespace=true
       - PrunePropagationPolicy=foreground
       - PruneLast=true
     retry:
@@ -38,10 +42,10 @@ spec:
         duration: 5s
         factor: 2
         maxDuration: 3m
-  
+
   # Health assessment
   ignoreDifferences:
     - group: apps
       kind: Deployment
       jsonPointers:
-        - /spec/replicas  # Ignore replicas if using HPA in the future
+        - /spec/replicas

@@ -1,0 +1,73 @@
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: rbx-platform
+  namespace: argocd
+  labels:
+    rbx.env: production
+    rbx.product: platform
+    rbx.agent_id: human
+    rbx.change_id: CHANGE_ID_PLACEHOLDER
+    app.kubernetes.io/part-of: rbx-systems
+spec:
+  description: >
+    Platform infrastructure components managed by RBX Systems.
+    Includes service mesh, certificate management, API gateway CRDs,
+    and ArgoCD self-management.
+
+  # Allowed source repositories
+  sourceRepos:
+    - https://github.com/ldamasio/robson
+    - https://github.com/ldamasio/robson.git
+    - https://istio-release.storage.googleapis.com/charts
+    - https://charts.jetstack.io
+    - https://argoproj.github.io/argo-helm
+    - https://github.com/kubernetes-sigs/gateway-api
+
+  # Allowed destination clusters and namespaces
+  destinations:
+    - server: https://kubernetes.default.svc
+      namespace: argocd
+    - server: https://kubernetes.default.svc
+      namespace: istio-system
+    - server: https://kubernetes.default.svc
+      namespace: cert-manager
+    - server: https://kubernetes.default.svc
+      namespace: kube-system
+
+  # Allowed cluster-scoped resources
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
+    - group: apiextensions.k8s.io
+      kind: CustomResourceDefinition
+    - group: admissionregistration.k8s.io
+      kind: MutatingWebhookConfiguration
+    - group: admissionregistration.k8s.io
+      kind: ValidatingWebhookConfiguration
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRole
+    - group: rbac.authorization.k8s.io
+      kind: ClusterRoleBinding
+    - group: cert-manager.io
+      kind: ClusterIssuer
+
+  # Namespace-scoped resources (allow all within permitted namespaces)
+  namespaceResourceWhitelist:
+    - group: "*"
+      kind: "*"
+
+  # Roles for future RBAC integration
+  roles:
+    - name: platform-admin
+      description: Full access to platform project
+      policies:
+        - p, proj:rbx-platform:platform-admin, applications, *, rbx-platform/*, allow
+      groups:
+        - platform-team
+    - name: platform-viewer
+      description: Read-only access to platform project
+      policies:
+        - p, proj:rbx-platform:platform-viewer, applications, get, rbx-platform/*, allow
+      groups:
+        - developers
