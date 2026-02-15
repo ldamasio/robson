@@ -1,31 +1,27 @@
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: dns-infrastructure-metallb
+  name: robson-prod
   namespace: argocd
   labels:
-    app.kubernetes.io/name: dns-infrastructure
-    app.kubernetes.io/component: authoritative-dns
+    app.kubernetes.io/name: robson-prod
+    app.kubernetes.io/component: production
     app.kubernetes.io/part-of: rbx-systems
-    deployment-scenario: metallb
     rbx.env: production
-    rbx.product: dns
+    rbx.product: robson
     rbx.agent_id: human
     rbx.change_id: CHANGE_ID_PLACEHOLDER
-  # Finalizers ensure Application is deleted properly
-  finalizers:
-    - resources-finalizer.argocd.argoproj.io
 spec:
-  project: default
+  project: rbx-applications
 
   source:
     repoURL: https://github.com/ldamasio/robson
     targetRevision: main
-    path: infra/apps/dns/overlays/metallb
+    path: infra/k8s/prod
 
   destination:
     server: https://kubernetes.default.svc
-    namespace: dns
+    namespace: robson
 
   syncPolicy:
     automated:
@@ -39,11 +35,10 @@ spec:
     retry:
       limit: 5
       backoff:
-        duration: 5s
+        duration: 10s
         factor: 2
         maxDuration: 3m
 
-  # Health assessment
   ignoreDifferences:
     - group: apps
       kind: Deployment

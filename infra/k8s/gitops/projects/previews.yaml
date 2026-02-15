@@ -26,18 +26,15 @@ spec:
     - server: https://kubernetes.default.svc
       namespace: "h-*"
 
-  # No cluster-scoped resources for previews
-  clusterResourceWhitelist: []
+  # Cluster-scoped resources needed by preview environments
+  clusterResourceWhitelist:
+    - group: ""
+      kind: Namespace
 
   # Namespace-scoped resources (allow all within permitted namespaces)
   namespaceResourceWhitelist:
     - group: "*"
       kind: "*"
-
-  # Deny cluster-scoped resources explicitly
-  clusterResourceBlacklist:
-    - group: "*"
-      kind: Namespace
 
   # Orphaned resources cleanup for preview environments
   orphanedResources:

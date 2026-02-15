@@ -1,9 +1,10 @@
-# Root App-of-Apps: manages all child Applications in this directory.
-# MUST stay in project: default to avoid lockout.
+# Manages AppProject resources via GitOps.
+# MUST stay in project: default to avoid circular dependency.
+# AppProjects must exist before Applications can reference them.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: robson-root
+  name: rbx-projects
   namespace: argocd
   labels:
     rbx.env: production
@@ -16,7 +17,7 @@ spec:
   source:
     repoURL: https://github.com/ldamasio/robson
     targetRevision: main
-    path: infra/k8s/gitops/app-of-apps
+    path: infra/k8s/gitops/projects
   destination:
     server: https://kubernetes.default.svc
     namespace: argocd

@@ -1,9 +1,7 @@
-# Root App-of-Apps: manages all child Applications in this directory.
-# MUST stay in project: default to avoid lockout.
 apiVersion: argoproj.io/v1alpha1
 kind: Application
 metadata:
-  name: robson-root
+  name: istio-ambient
   namespace: argocd
   labels:
     rbx.env: production
@@ -12,11 +10,11 @@ metadata:
     rbx.change_id: CHANGE_ID_PLACEHOLDER
     app.kubernetes.io/part-of: rbx-systems
 spec:
-  project: default
+  project: rbx-platform
   source:
     repoURL: https://github.com/ldamasio/robson
     targetRevision: main
-    path: infra/k8s/gitops/app-of-apps
+    path: infra/k8s/platform/istio-ambient
   destination:
     server: https://kubernetes.default.svc
     namespace: argocd
