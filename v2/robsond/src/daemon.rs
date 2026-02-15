@@ -240,7 +240,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             .as_ref()
             .map(|monitor| Arc::clone(monitor).start());
 
-        // 2. Start API server
+        // 3. Start API server
         let api_addr = self.start_api_server(position_monitor.clone()).await?;
         info!(%api_addr, "API server started");
 
