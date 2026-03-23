@@ -1,1 +1,0 @@
-CREATE DATABASE rbsdb OWNER postgres;

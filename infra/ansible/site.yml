@@ -1,6 +1,0 @@
-- hosts: k3s_server:k3s_agent
-  become: yes
-  gather_facts: yes
-  roles:
-    - bootstrap
-    - k3s
