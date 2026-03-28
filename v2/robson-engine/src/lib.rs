@@ -29,6 +29,7 @@
 #![warn(clippy::all)]
 
 // Trading strategy modules
+pub mod risk;
 pub mod trailing_stop;
 
 use chrono::{DateTime, Utc};
@@ -39,6 +40,9 @@ use robson_domain::{
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::debug;
+
+// Re-export risk types for convenience
+pub use risk::{PositionSummary, ProposedTrade, RiskCheck, RiskContext, RiskGate, RiskLimits, RiskVerdict};
 
 // =============================================================================
 // Engine Errors
@@ -310,10 +314,13 @@ impl Engine {
             "Entry signal received, placing order"
         );
 
-        // 5. Create updated position in Entering state
+        // 5. Generate entry order ID (used in both the Entering state and the event)
+        let entry_order_id = uuid::Uuid::now_v7();
+
+        // 6. Create updated position in Entering state
         let mut updated_position = position.clone();
         updated_position.state = PositionState::Entering {
-            entry_order_id: uuid::Uuid::now_v7(),
+            entry_order_id,
             expected_entry: signal.entry_price,
             signal_id: signal.signal_id,
         };
@@ -322,9 +329,9 @@ impl Engine {
         updated_position.quantity = quantity;
         updated_position.updated_at = Utc::now();
 
-        // 6. Build actions
+        // 7. Build actions
         let actions = vec![
-            // Emit signal received event
+            // Emit signal received event (audit)
             EngineAction::EmitEvent(Event::EntrySignalReceived {
                 position_id: position.id,
                 signal_id: signal.signal_id,
@@ -333,10 +340,19 @@ impl Engine {
                 quantity,
                 timestamp: Utc::now(),
             }),
-            // Place entry order
+            // Emit entry order placed event — apply_event transitions position to Entering
+            EngineAction::EmitEvent(Event::EntryOrderPlaced {
+                position_id: position.id,
+                order_id: entry_order_id,
+                expected_price: signal.entry_price,
+                quantity,
+                signal_id: signal.signal_id,
+                timestamp: Utc::now(),
+            }),
+            // Place entry order on exchange
             EngineAction::PlaceEntryOrder {
                 position_id: position.id,
-                symbol: position.symbol.clone(),
+                symbol: position.clone().symbol,
                 side: position.side.entry_action(),
                 quantity,
                 signal_id: signal.signal_id,
@@ -356,6 +372,7 @@ impl Engine {
     /// * `position` - The entering position (must be in Entering state)
     /// * `fill_price` - Actual fill price from exchange
     /// * `filled_quantity` - Actual filled quantity
+    /// * `binance_position_id` - Optional Binance isolated margin position ID
     ///
     /// # Returns
     ///
@@ -372,6 +389,7 @@ impl Engine {
         position: &Position,
         fill_price: Price,
         filled_quantity: Quantity,
+        binance_position_id: Option<String>,
     ) -> Result<EngineDecision, EngineError> {
         // 1. Validate position is Entering
         let entry_order_id = match &position.state {
@@ -430,6 +448,7 @@ impl Engine {
             filled_quantity,
             fee: rust_decimal::Decimal::ZERO, // Will be updated by executor
             initial_stop: initial_trailing_stop,
+            binance_position_id,
             timestamp: Utc::now(),
         })];
 
@@ -1089,8 +1108,8 @@ mod tests {
 
         let decision = engine.decide_entry(&position, &signal).unwrap();
 
-        // Should have 2 actions: EmitEvent + PlaceEntryOrder
-        assert_eq!(decision.actions.len(), 2);
+        // Should have 3 actions: EmitEvent(EntrySignalReceived) + EmitEvent(EntryOrderPlaced) + PlaceEntryOrder
+        assert_eq!(decision.actions.len(), 3);
 
         // Check PlaceEntryOrder action
         let has_entry_order = decision.actions.iter().any(|a| {
@@ -1214,7 +1233,7 @@ mod tests {
         let filled_quantity = Quantity::new(dec!(0.0666666666666666666666666667)).unwrap();
 
         let fill_decision = engine
-            .process_entry_fill(&entering_position, fill_price, filled_quantity)
+            .process_entry_fill(&entering_position, fill_price, filled_quantity, None)
             .unwrap();
 
         // Check updated position is Active
@@ -1251,7 +1270,7 @@ mod tests {
         let filled_quantity = Quantity::new(dec!(0.0666666666666666666666666667)).unwrap();
 
         let fill_decision = engine
-            .process_entry_fill(&entering_position, fill_price, filled_quantity)
+            .process_entry_fill(&entering_position, fill_price, filled_quantity, None)
             .unwrap();
 
         // Check trailing stop for short
@@ -1277,7 +1296,7 @@ mod tests {
         let fill_price = Price::new(dec!(95000)).unwrap();
         let filled_quantity = Quantity::new(dec!(0.1)).unwrap();
 
-        let result = engine.process_entry_fill(&position, fill_price, filled_quantity);
+        let result = engine.process_entry_fill(&position, fill_price, filled_quantity, None);
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -1311,7 +1330,7 @@ mod tests {
         let fill_price = Price::new(dec!(95000)).unwrap();
         let filled_quantity = entering_position.quantity;
         let fill_decision = engine
-            .process_entry_fill(&entering_position, fill_price, filled_quantity)
+            .process_entry_fill(&entering_position, fill_price, filled_quantity, None)
             .unwrap();
         let active_position = fill_decision.updated_position.unwrap();
 

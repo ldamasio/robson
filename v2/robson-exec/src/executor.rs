@@ -14,7 +14,7 @@ use std::sync::Arc;
 use tracing::{debug, error, info};
 use uuid::Uuid;
 
-use robson_domain::{Event, ExitReason, Position, PositionId};
+use robson_domain::{Event, ExitReason, Position, PositionId, RiskConfig};
 use robson_engine::EngineAction;
 use robson_store::Store;
 
@@ -44,9 +44,6 @@ pub enum ActionResult {
 // =============================================================================
 // Executor
 // =============================================================================
-
-/// Fixed leverage for isolated margin trading.
-pub const FIXED_LEVERAGE: u8 = 10;
 
 /// Executes engine actions with idempotency guarantees.
 ///
@@ -183,9 +180,9 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         info!(
             %position_id,
             symbol = %symbol.as_pair(),
-            "Validating margin settings (isolated + {}x)", FIXED_LEVERAGE
+            "Validating margin settings (isolated + {}x)", RiskConfig::LEVERAGE
         );
-        self.exchange.validate_margin_settings(&symbol, FIXED_LEVERAGE).await?;
+        self.exchange.validate_margin_settings(&symbol, RiskConfig::LEVERAGE).await?;
 
         // 3. Record intent
         let intent = Intent::new(
@@ -256,9 +253,9 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         info!(
             %position_id,
             symbol = %symbol.as_pair(),
-            "Validating margin settings for exit (isolated + {}x)", FIXED_LEVERAGE
+            "Validating margin settings for exit (isolated + {}x)", RiskConfig::LEVERAGE
         );
-        self.exchange.validate_margin_settings(&symbol, FIXED_LEVERAGE).await?;
+        self.exchange.validate_margin_settings(&symbol, RiskConfig::LEVERAGE).await?;
 
         // 2. Record intent
         let intent = Intent::new(
@@ -291,7 +288,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             .place_market_order(&symbol, side, quantity, &intent_id.to_string())
             .await;
 
-        // 4. Record result
+        // 4. Record result and emit ExitOrderPlaced event on success
         match &result {
             Ok(order_result) => {
                 info!(
@@ -302,6 +299,18 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                     "Exit order filled"
                 );
                 self.journal.complete(intent_id, IntentResult::Success(order_result.clone()))?;
+
+                // Emit ExitOrderPlaced → apply_event transitions position to Exiting
+                let exit_event = Event::ExitOrderPlaced {
+                    position_id,
+                    order_id: intent_id,
+                    expected_price: order_result.fill_price,
+                    quantity,
+                    exit_reason: reason,
+                    timestamp: chrono::Utc::now(),
+                };
+                self.store.events().append(&exit_event).await?;
+                self.store.apply_event(&exit_event)?;
             },
             Err(e) => {
                 error!(%position_id, error = %e, "Exit order failed");
@@ -320,12 +329,6 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
     /// Get the store (for state updates).
     pub fn store(&self) -> &S {
         &self.store
-    }
-
-    /// Update position in store after engine decision.
-    pub async fn update_position(&self, position: &Position) -> ExecResult<()> {
-        self.store.positions().save(position).await?;
-        Ok(())
     }
 }
 

@@ -310,6 +310,8 @@ pub enum ExitReason {
     DegradedMode,
     /// Position error (e.g., margin call)
     PositionError,
+    /// User disarmed the position before any entry order was placed
+    DisarmedByUser,
 }
 
 // =============================================================================

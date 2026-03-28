@@ -4,7 +4,7 @@
 //! Used for event sourcing and audit trails.
 
 use crate::entities::{AccountId, ExitReason, OrderId, PositionId};
-use crate::value_objects::{Price, Quantity, Side, Symbol};
+use crate::value_objects::{Price, Quantity, Side, Symbol, TechnicalStopDistance};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -26,6 +26,8 @@ pub enum Event {
         symbol: Symbol,
         /// Position direction
         side: Side,
+        /// Technical stop distance from chart analysis (needed for position sizing on signal)
+        tech_stop_distance: Option<TechnicalStopDistance>,
         /// When the position was armed
         timestamp: DateTime<Utc>,
     },
@@ -50,12 +52,14 @@ pub enum Event {
     EntryOrderPlaced {
         /// Position identifier
         position_id: PositionId,
-        /// Order identifier
+        /// Order identifier (matches entry_order_id in PositionState::Entering)
         order_id: OrderId,
         /// Expected entry price
         expected_price: Price,
         /// Order quantity
         quantity: Quantity,
+        /// Signal ID for idempotency (matches signal_id in PositionState::Entering)
+        signal_id: uuid::Uuid,
         /// When the order was placed
         timestamp: DateTime<Utc>,
     },
@@ -74,6 +78,8 @@ pub enum Event {
         fee: Decimal,
         /// Initial trailing stop price
         initial_stop: Price,
+        /// Binance isolated margin position ID (for SafetyNet coordination)
+        binance_position_id: Option<String>,
         /// When the fill occurred
         timestamp: DateTime<Utc>,
     },
@@ -110,12 +116,14 @@ pub enum Event {
     ExitOrderPlaced {
         /// Position identifier
         position_id: PositionId,
-        /// Order identifier
+        /// Order identifier (matches exit_order_id in PositionState::Exiting)
         order_id: OrderId,
         /// Expected exit price
         expected_price: Price,
         /// Order quantity
         quantity: Quantity,
+        /// Reason for exit (matches exit_reason in PositionState::Exiting)
+        exit_reason: ExitReason,
         /// When the order was placed
         timestamp: DateTime<Utc>,
     },
@@ -151,6 +159,19 @@ pub enum Event {
         /// Total fees paid
         total_fees: Decimal,
         /// When the position was closed
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Position disarmed by user before any entry order was placed
+    ///
+    /// Only valid when position is in Armed state.
+    /// Results in Closed state with zero P&L and ExitReason::DisarmedByUser.
+    PositionDisarmed {
+        /// Position identifier
+        position_id: PositionId,
+        /// Human-readable reason for disarming
+        reason: String,
+        /// When the position was disarmed
         timestamp: DateTime<Utc>,
     },
 
@@ -208,6 +229,7 @@ impl Event {
             | Event::ExitOrderPlaced { position_id, .. }
             | Event::ExitFilled { position_id, .. }
             | Event::PositionClosed { position_id, .. }
+            | Event::PositionDisarmed { position_id, .. }
             | Event::PositionError { position_id, .. }
             | Event::InsuranceStopPlaced { position_id, .. }
             | Event::InsuranceStopCancelled { position_id, .. } => *position_id,
@@ -226,6 +248,7 @@ impl Event {
             | Event::ExitOrderPlaced { timestamp, .. }
             | Event::ExitFilled { timestamp, .. }
             | Event::PositionClosed { timestamp, .. }
+            | Event::PositionDisarmed { timestamp, .. }
             | Event::PositionError { timestamp, .. }
             | Event::InsuranceStopPlaced { timestamp, .. }
             | Event::InsuranceStopCancelled { timestamp, .. } => *timestamp,
@@ -244,6 +267,7 @@ impl Event {
             Event::ExitOrderPlaced { .. } => "exit_order_placed",
             Event::ExitFilled { .. } => "exit_filled",
             Event::PositionClosed { .. } => "position_closed",
+            Event::PositionDisarmed { .. } => "position_disarmed",
             Event::PositionError { .. } => "position_error",
             Event::InsuranceStopPlaced { .. } => "insurance_stop_placed",
             Event::InsuranceStopCancelled { .. } => "insurance_stop_cancelled",
@@ -267,6 +291,7 @@ mod tests {
             account_id: Uuid::now_v7(),
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
             side: Side::Long,
+            tech_stop_distance: None,
             timestamp: Utc::now(),
         }
     }
@@ -279,6 +304,7 @@ mod tests {
             filled_quantity: Quantity::new(dec!(0.1)).unwrap(),
             fee: dec!(0.001),
             initial_stop: Price::new(dec!(93500)).unwrap(),
+            binance_position_id: None,
             timestamp: Utc::now(),
         }
     }
@@ -332,6 +358,7 @@ mod tests {
             account_id: Uuid::nil(),
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
             side: Side::Long,
+            tech_stop_distance: None,
             timestamp: DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
@@ -353,6 +380,7 @@ mod tests {
             account_id: Uuid::now_v7(),
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
             side: Side::Long,
+            tech_stop_distance: None,
             timestamp: Utc::now(),
         };
 

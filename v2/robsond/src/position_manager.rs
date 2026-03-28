@@ -33,7 +33,7 @@ use robson_domain::{
     Symbol, TechnicalStopDistance,
 };
 use robson_engine::{Engine, EngineAction};
-use robson_exec::{ActionResult, ExchangePort, Executor};
+use robson_exec::{ActionResult, ExecError, ExchangePort, Executor};
 use robson_store::Store;
 
 use crate::detector::DetectorTask;
@@ -213,12 +213,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         tech_stop_distance: TechnicalStopDistance,
         account_id: Uuid,
     ) -> DaemonResult<Position> {
-        // Create position in Armed state
-        // Note: risk_config is used by Engine for position sizing, not stored here
-        // tech_stop_distance is stored for reference
-        let mut position = Position::new(account_id, symbol.clone(), side);
-        position.tech_stop_distance = Some(tech_stop_distance);
-        let position_id = position.id;
+        // Generate position ID upfront (used in event and returned to caller)
+        let position_id = Uuid::now_v7();
 
         info!(
             %position_id,
@@ -227,24 +223,32 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             "Arming position"
         );
 
-        // Persist position
-        self.store.positions().save(&position).await?;
-
-        // Emit event
+        // Emit PositionArmed event → apply_event creates position in Armed state
+        let now = chrono::Utc::now();
         let event = Event::PositionArmed {
             position_id,
             account_id,
             symbol: symbol.clone(),
             side,
-            timestamp: chrono::Utc::now(),
+            tech_stop_distance: Some(tech_stop_distance),
+            timestamp: now,
         };
-        self.store.events().append(&event).await?;
+        self.executor.execute(vec![EngineAction::EmitEvent(event)]).await?;
+
         self.event_bus.send(DaemonEvent::PositionStateChanged {
             position_id,
             previous_state: "None".to_string(),
             new_state: "Armed".to_string(),
-            timestamp: chrono::Utc::now(),
+            timestamp: now,
         });
+
+        // Load position from projection for detector and return
+        let position = self
+            .store
+            .positions()
+            .find_by_id(position_id)
+            .await?
+            .ok_or(DaemonError::PositionNotFound(position_id))?;
 
         // Spawn detector task
         let cancel_token = self.child_cancel_token();
@@ -284,8 +288,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Kill detector task if exists
         self.kill_detector(position_id).await;
 
-        // Delete position (it never entered, so no need to keep it)
-        self.store.positions().delete(position_id).await?;
+        // Emit PositionDisarmed event → apply_event transitions position to Closed
+        let event = Event::PositionDisarmed {
+            position_id,
+            reason: "user_disarmed".to_string(),
+            timestamp: chrono::Utc::now(),
+        };
+        self.executor.execute(vec![EngineAction::EmitEvent(event)]).await?;
+
+        self.event_bus.send(DaemonEvent::PositionStateChanged {
+            position_id,
+            previous_state: "Armed".to_string(),
+            new_state: "Closed".to_string(),
+            timestamp: chrono::Utc::now(),
+        });
 
         Ok(())
     }
@@ -316,22 +332,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Use engine to decide entry (pure: State+Signal → Decision)
         let decision = self.engine.decide_entry(&position, &signal)?;
 
-        // Execute actions FIRST (emits events via EventLog.append)
+        // Execute actions (events are appended and applied; exchange orders are placed)
+        // EntryOrderPlaced event transitions position to Entering via apply_event
         let results = self.executor.execute(decision.actions).await?;
-
-        // THEN save state (atomicity: events before state)
-        // Entering state must be persisted for handle_entry_fill to find it
-        if let Some(ref updated_position) = decision.updated_position {
-            let old_state = format!("{:?}", position.state);
-            self.store.positions().save(updated_position).await?;
-
-            self.event_bus.send(DaemonEvent::PositionStateChanged {
-                position_id,
-                previous_state: old_state,
-                new_state: format!("{:?}", updated_position.state),
-                timestamp: chrono::Utc::now(),
-            });
-        }
 
         // Log results and process fill if order was placed
         for result in results {
@@ -390,51 +393,40 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .ok_or(DaemonError::PositionNotFound(position_id))?;
 
         // Use engine to process fill (pure: State+Fill → Decision)
-        let decision = self.engine.process_entry_fill(&position, fill_price, filled_quantity)?;
+        // binance_position_id is passed through to EntryFilled event
+        let decision =
+            self.engine.process_entry_fill(&position, fill_price, filled_quantity, binance_position_id.clone())?;
 
-        // Execute actions FIRST (emits events via EventLog.append)
+        // Execute actions (EntryFilled event transitions position to Active via apply_event)
         self.executor.execute(decision.actions).await?;
 
-        // THEN save state (atomicity: events before state)
-        if let Some(ref updated_position) = decision.updated_position {
-            let mut updated_position = updated_position.clone();
-            if updated_position.binance_position_id.is_none() {
-                updated_position.binance_position_id = binance_position_id;
-            }
-            let old_state = format!("{:?}", position.state);
-            self.store.positions().save(&updated_position).await?;
+        info!(
+            %position_id,
+            fill_price = %fill_price.as_decimal(),
+            "Entry filled, position now Active"
+        );
 
-            info!(
+        self.event_bus.send(DaemonEvent::PositionStateChanged {
+            position_id,
+            previous_state: "Entering".to_string(),
+            new_state: "Active".to_string(),
+            timestamp: chrono::Utc::now(),
+        });
+
+        let core_exchange_id = binance_position_id.unwrap_or_else(|| {
+            warn!(
                 %position_id,
-                fill_price = %fill_price.as_decimal(),
-                "Entry filled, position now Active"
+                "Missing binance_position_id on Core open; using position_id fallback"
             );
+            position_id.to_string()
+        });
 
-            self.event_bus.send(DaemonEvent::PositionStateChanged {
-                position_id,
-                previous_state: old_state,
-                new_state: format!("{:?}", updated_position.state),
-                timestamp: chrono::Utc::now(),
-            });
-
-            let core_exchange_id = updated_position
-                .binance_position_id
-                .clone()
-                .unwrap_or_else(|| {
-                    warn!(
-                        %position_id,
-                        "Missing binance_position_id on Core open; using position_id fallback"
-                    );
-                    position_id.to_string()
-                });
-
-            self.event_bus.send(DaemonEvent::CorePositionOpened {
-                position_id,
-                symbol: updated_position.symbol.clone(),
-                side: updated_position.side,
-                binance_position_id: core_exchange_id,
-            });
-        }
+        self.event_bus.send(DaemonEvent::CorePositionOpened {
+            position_id,
+            symbol: position.symbol.clone(),
+            side: position.side,
+            binance_position_id: core_exchange_id,
+        });
 
         Ok(())
     }
@@ -503,9 +495,23 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .await?
             .ok_or(DaemonError::PositionNotFound(position_id))?;
 
+        // Extract exit reason from position's Exiting state.
+        // By this point, executor.execute_exit_order has already emitted and applied
+        // ExitOrderPlaced, transitioning the position to Exiting { exit_reason }.
+        let exit_reason = match &position.state {
+            PositionState::Exiting { exit_reason, .. } => *exit_reason,
+            other => {
+                return Err(DaemonError::InvalidPositionState {
+                    expected: "Exiting".to_string(),
+                    actual: format!("{:?}", other),
+                });
+            },
+        };
+
         info!(
             %position_id,
             fill_price = %fill_price.as_decimal(),
+            ?exit_reason,
             "Exit filled, emitting PositionClosed event"
         );
 
@@ -516,7 +522,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Emit PositionClosed event via executor (ensures append->apply order)
         let event = Event::PositionClosed {
             position_id,
-            exit_reason: robson_domain::ExitReason::TrailingStop,
+            exit_reason,
             entry_price,
             exit_price: fill_price,
             realized_pnl: pnl,
@@ -528,7 +534,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Send to event bus for real-time notification
         self.event_bus.send(DaemonEvent::PositionStateChanged {
             position_id,
-            previous_state: "Active".to_string(),
+            previous_state: "Exiting".to_string(),
             new_state: "Closed".to_string(),
             timestamp: chrono::Utc::now(),
         });
@@ -574,29 +580,40 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .await?
             .ok_or(DaemonError::PositionNotFound(position_id))?;
 
-        // Get current price from executor's exchange
-        let current_price = self
+        let exit_side = position.side.exit_action();
+
+        // Place market exit order on exchange (executor also emits ExitOrderPlaced → Active → Exiting)
+        let results = self
             .executor
-            .store()
-            .positions()
-            .find_by_id(position_id)
-            .await?
-            .and_then(|p| match p.state {
-                PositionState::Active { trailing_stop, .. } => Some(trailing_stop),
-                _ => None,
+            .execute(vec![EngineAction::PlaceExitOrder {
+                position_id,
+                symbol: position.symbol.clone(),
+                side: exit_side,
+                quantity: position.quantity,
+                reason: robson_domain::ExitReason::UserPanic,
+            }])
+            .await?;
+
+        // Extract actual fill price from exchange result
+        let fill_price = results
+            .into_iter()
+            .find_map(|r| {
+                if let ActionResult::OrderPlaced(order) = r { Some(order.fill_price) } else { None }
             })
-            .unwrap_or_else(|| Price::new(rust_decimal::Decimal::ZERO).unwrap());
+            .ok_or(DaemonError::Exec(ExecError::InvalidState(
+                "Panic close: PlaceExitOrder did not return OrderPlaced".to_string(),
+            )))?;
 
-        // Calculate PnL for event
+        // Calculate PnL with actual fill price
+        let entry_price = position.entry_price.unwrap_or(fill_price);
         let pnl = position.calculate_pnl();
-        let entry_price = position.entry_price.unwrap_or(current_price);
 
-        // Emit PositionClosed event via executor (ensures append->apply order)
+        // Emit PositionClosed with actual fill price (Exiting → Closed)
         let event = Event::PositionClosed {
             position_id,
             exit_reason: robson_domain::ExitReason::UserPanic,
             entry_price,
-            exit_price: current_price,
+            exit_price: fill_price,
             realized_pnl: pnl,
             total_fees: position.fees_paid,
             timestamp: chrono::Utc::now(),

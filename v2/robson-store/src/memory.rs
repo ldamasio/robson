@@ -69,45 +69,92 @@ impl MemoryStore {
     /// If apply fails, we fail-fast (error is ok).
     /// The EventLog remains the source of truth for recovery.
     fn apply_event_internal(&self, event: &Event) -> Result<(), StoreError> {
-        use robson_domain::{ExitReason, PositionState};
+        use robson_domain::{ExitReason, Position, PositionState};
 
         match event {
-            // EntryFilled: Position becomes Active with initial trailing stop
-            Event::EntryFilled {
+            // PositionArmed: Create position in Armed state (initial projection entry)
+            Event::PositionArmed {
                 position_id,
-                fill_price,
-                filled_quantity,
-                initial_stop,
+                account_id,
+                symbol,
+                side,
+                tech_stop_distance,
+                timestamp,
+            } => {
+                let mut positions = self.positions.write().unwrap();
+                // Idempotent: skip if already exists
+                if positions.contains_key(position_id) {
+                    return Ok(());
+                }
+                let mut position = Position::new(*account_id, symbol.clone(), *side);
+                position.id = *position_id;
+                position.tech_stop_distance = *tech_stop_distance;
+                position.created_at = *timestamp;
+                position.updated_at = *timestamp;
+                positions.insert(*position_id, position);
+            },
+
+            // EntryOrderPlaced: Transition Armed → Entering
+            Event::EntryOrderPlaced {
+                position_id,
+                order_id,
+                expected_price,
+                signal_id,
                 ..
             } => {
                 let mut positions = self.positions.write().unwrap();
                 if let Some(mut position) = positions.get(position_id).cloned() {
-                    // Update position fields from event
-                    position.entry_price = Some(*fill_price);
-                    position.entry_filled_at = Some(chrono::Utc::now());
-                    position.quantity = *filled_quantity;
+                    position.state = PositionState::Entering {
+                        entry_order_id: *order_id,
+                        expected_entry: *expected_price,
+                        signal_id: *signal_id,
+                    };
+                    position.entry_price = Some(*expected_price);
+                    position.entry_order_id = Some(*order_id);
+                    position.updated_at = chrono::Utc::now();
+                    positions.insert(*position_id, position);
+                }
+            },
 
-                    // Transition to Active state with initial trailing stop
+            // EntryFilled: Transition Entering → Active with initial trailing stop
+            Event::EntryFilled {
+                position_id,
+                order_id,
+                fill_price,
+                filled_quantity,
+                initial_stop,
+                binance_position_id,
+                timestamp,
+                ..
+            } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    position.entry_price = Some(*fill_price);
+                    position.entry_filled_at = Some(*timestamp);
+                    position.quantity = *filled_quantity;
+                    position.entry_order_id = Some(*order_id);
+                    if binance_position_id.is_some() {
+                        position.binance_position_id = binance_position_id.clone();
+                    }
                     position.state = PositionState::Active {
                         current_price: *fill_price,
                         trailing_stop: *initial_stop,
                         favorable_extreme: *fill_price,
-                        extreme_at: chrono::Utc::now(),
+                        extreme_at: *timestamp,
                         insurance_stop_id: None,
                         last_emitted_stop: Some(*initial_stop),
                     };
                     position.updated_at = chrono::Utc::now();
-
                     positions.insert(*position_id, position);
                 }
-                // If position not found, this is idempotent - nothing to update
             },
 
-            // TrailingStopUpdated: Update the trailing stop in Active state
+            // TrailingStopUpdated: Update trailing stop within Active state
             Event::TrailingStopUpdated {
                 position_id,
                 new_stop,
                 trigger_price,
+                timestamp,
                 ..
             } => {
                 let mut positions = self.positions.write().unwrap();
@@ -124,22 +171,40 @@ impl MemoryStore {
                         *current_price = *trigger_price;
                         *trailing_stop = *new_stop;
                         *favorable_extreme = *trigger_price;
-                        *extreme_at = chrono::Utc::now();
+                        *extreme_at = *timestamp;
                         *last_emitted_stop = Some(*new_stop);
                         position.updated_at = chrono::Utc::now();
-
                         positions.insert(*position_id, position);
                     }
                 }
-                // If position not found or not in Active state, idempotent
             },
 
-            // PositionClosed: Mark position as closed
+            // ExitOrderPlaced: Transition Active → Exiting
+            Event::ExitOrderPlaced {
+                position_id,
+                order_id,
+                exit_reason,
+                ..
+            } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    position.state = PositionState::Exiting {
+                        exit_order_id: *order_id,
+                        exit_reason: *exit_reason,
+                    };
+                    position.exit_order_id = Some(*order_id);
+                    position.updated_at = chrono::Utc::now();
+                    positions.insert(*position_id, position);
+                }
+            },
+
+            // PositionClosed: Transition Exiting → Closed with realized P&L
             Event::PositionClosed {
                 position_id,
                 exit_price,
                 exit_reason,
                 realized_pnl,
+                timestamp,
                 ..
             } => {
                 let mut positions = self.positions.write().unwrap();
@@ -147,25 +212,36 @@ impl MemoryStore {
                     position.state = PositionState::Closed {
                         exit_price: *exit_price,
                         realized_pnl: *realized_pnl,
-                        exit_reason: match exit_reason {
-                            robson_domain::ExitReason::TrailingStop => ExitReason::TrailingStop,
-                            robson_domain::ExitReason::InsuranceStop => ExitReason::InsuranceStop,
-                            robson_domain::ExitReason::UserPanic => ExitReason::UserPanic,
-                            _ => ExitReason::PositionError,
-                        },
+                        exit_reason: *exit_reason,
                     };
-                    position.closed_at = Some(chrono::Utc::now());
+                    position.realized_pnl = *realized_pnl;
+                    position.closed_at = Some(*timestamp);
                     position.updated_at = chrono::Utc::now();
-
                     positions.insert(*position_id, position);
                 }
-                // If position not found, idempotent
             },
 
-            // Other events don't affect the in-memory projection
-            _ => {
-                // No-op for events that don't change position state
+            // PositionDisarmed: Armed → Closed with zero P&L (no entry ever happened)
+            Event::PositionDisarmed { position_id, timestamp, .. } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    // Disarmed positions have no fill price; use a sentinel of 1
+                    // to satisfy Price's non-zero invariant. P&L is always 0.
+                    let sentinel_price = robson_domain::Price::new(rust_decimal::Decimal::ONE)
+                        .map_err(StoreError::Domain)?;
+                    position.state = PositionState::Closed {
+                        exit_price: sentinel_price,
+                        realized_pnl: rust_decimal::Decimal::ZERO,
+                        exit_reason: ExitReason::DisarmedByUser,
+                    };
+                    position.closed_at = Some(*timestamp);
+                    position.updated_at = chrono::Utc::now();
+                    positions.insert(*position_id, position);
+                }
             },
+
+            // All other events are audit-only and do not affect the position projection
+            _ => {},
         }
 
         Ok(())
@@ -396,6 +472,7 @@ mod tests {
             account_id: Uuid::now_v7(),
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
             side: Side::Long,
+            tech_stop_distance: None,
             timestamp: Utc::now(),
         }
     }
