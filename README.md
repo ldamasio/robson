@@ -1,281 +1,24 @@
-
-Robson Bot
+# Robson — Execution & Risk Engine for Leveraged Markets
 
 [![Backend Tests](https://github.com/ldamasio/robson/actions/workflows/backend-tests.yml/badge.svg)](https://github.com/ldamasio/robson/actions/workflows/backend-tests.yml)
 
-Just another crypto robot
+Robson is an execution and risk management engine designed for leveraged cryptocurrency markets. It is not a trading bot. It does not generate signals, predict prices, or optimize entries.
 
-ROBSON BOT is an open source algo trade project. It is a robot specialized in cryptocurrency trading (automatic buying and selling of digital assets), programmed, with backend and data modeling in Python, to monitor the market in real time, using asynchronous communication between the exchange and the application, that is, your dashboard and your “brain”. With this, Robson Bot is capable of making intelligent decisions based on a set of strategies guided by probabilistic analysis and technical analysis. The open source project includes a risk management system, tools for disseminating trade signals and functions as a platform, enabling multiple users with security and data isolation (multi-tenant).
+Robson is concerned with what happens **after** a trading decision is made: how orders are executed, how risk is enforced, how positions are managed through their lifecycle, and how failures are handled safely under volatile conditions.
 
-The Robson Bot is a tool for researchers, traders that monitors stocks to trigger signals or automate order flows for the binance crypto stock market.
+The system provides a multi-tenant runtime with deterministic execution semantics, explicit risk controls, full auditability, and a clear separation between signal interpretation and order execution.
 
-## Research, communication and trade functions
+## Why Robson Exists
 
-Designed as a cryptocurrency robot, it also has the ability to communicate and interact via Metaverse, providing services and remuneration to its users, with instructions for risk management.
+Most open-source trading systems conflate signal generation with execution. The result is software where risk management is an afterthought bolted onto an indicator library.
 
-## Command interface
+Robson inverts this. The execution and risk layers are the primary concern. Signal interpretation exists as an input boundary, not as the core of the system.
 
-The command interface makes it possible to activate a Dashboard with its main indicators or special features for you to carry out day-to-day activities.
+This design reflects a simple observation: in leveraged markets, **how** you execute matters more than **what** you execute. A sound signal with poor execution, missing stop logic, or uncontrolled position sizing will lose capital. Robson exists to make the execution path deterministic, auditable, and safe by default.
 
-## The Dashboard offers special string conversion calculators
+## Architecture
 
-For example, if you need to withdraw an amount of BRL, but would like to convert your USDT to ADA before transferring, in addition to needing to anticipate spread values from other financial services.
-
-## CLI Quick Start
-
-Robson Bot provides a command-line interface that implements an **agentic workflow** for safe trading execution:
-
-**PLAN → VALIDATE → EXECUTE**
-
-This mirrors professional trading: formulate ideas, paper trade (validate), then execute with intent.
-
-### Building the CLI
-
-```bash
-# Build both C router and Go CLI
-make build-cli
-
-# Run smoke tests
-make test-cli
-
-# Install to system PATH (optional)
-make install-cli
-```
-
-### Using the CLI
-
-```bash
-# 1. PLAN - Create an execution plan (no real orders)
-robson plan buy BTCUSDT 0.001 --limit 50000
-
-# Output: Plan ID: abc123def456
-
-# 2. VALIDATE - Check operational and financial constraints
-robson validate abc123def456 --client-id 1 --strategy-id 5
-
-# Output: ✅ PASS or ❌ FAIL with detailed report
-
-# 3. EXECUTE - Execute the plan (DRY-RUN by default)
-# DRY-RUN (safe, simulation only)
-robson execute abc123def456 --client-id 1
-
-# LIVE (real orders - requires explicit acknowledgement)
-robson execute abc123def456 --client-id 1 --live --acknowledge-risk
-```
-
-**Safety by default:**
-
-- **DRY-RUN** is the default mode (simulation, no real orders)
-- **LIVE** requires both `--live` AND `--acknowledge-risk` flags
-- LIVE execution requires prior validation
-- All executions are audited
-
-### CLI Architecture
-
-```
-robson (C)
-  └─> robson-go (Go + Cobra)
-       └─> python manage.py {validate_plan,execute_plan} (Django)
-```
-
-The CLI is a thin router that delegates to Django management commands, ensuring all business logic remains in the application layer.
-
-## Command-Line Tools
-
-Robson Bot provides **three complementary command-line tools**, each optimized for different tasks:
-
-### 1. `robson` - Trading Operations (Domain CLI)
-
-**Use for:** All trading and business operations
-
-```bash
-# Agentic trading workflow
-robson plan buy BTCUSDT 0.001
-robson validate <plan-id> --client-id 1
-robson execute <plan-id> --client-id 1
-
-# Get help
-robson --help
-```
-
-### 2. `just` - Development Tasks (Task Runner)
-
-**Use for:** Daily development workflow
-
-Install `just`:
-
-```bash
-# macOS
-brew install just
-
-# Linux
-curl --proto '=https' --tlsv1.2 -sSf https://just.systems/install.sh | bash
-
-# Windows (via scoop)
-scoop install just
-```
-
-Common tasks:
-
-```bash
-# See all available tasks
-just --list
-
-# First-time setup
-just setup
-
-# Start database
-just db-up
-
-# Run migrations
-just db-migrate
-
-# Run all tests
-just test
-
-# Start dev servers
-just dev-backend    # Terminal 1
-just dev-frontend   # Terminal 2
-
-# Create a worktree + tmux session (claude|codex|shell)
-just wt-new codex backend feat/backend-adjust
-
-# Environment info
-just info
-```
-
-### 3. `make` - Build & Install
-
-**Use for:** Compiling binaries and system-wide installation
-
-```bash
-# Build CLI
-make build-cli
-
-# Install CLI to system PATH
-make install-cli
-
-# Sync vendor documentation
-make sync-binance-docs
-```
-
-### Quick Reference: Which Tool When?
-
-| Task | Command |
-|------|---------|
-| **Trading operations** | `robson plan/validate/execute` |
-| **Build CLI** | `make build-cli` |
-| **Install CLI** | `make install-cli` |
-| **Run tests** | `just test` |
-| **Database setup** | `just db-up && just db-migrate` |
-| **Start dev server** | `just dev-backend` |
-| **Create worktree + tmux session** | `just wt-new <agent> <name> <branch>` |
-| **Reset database** | `just db-reset` |
-| **Environment check** | `just info` |
-
-**Architecture guide:** See [`docs/COMMAND-RUNNERS.md`](docs/COMMAND-RUNNERS.md) for detailed guidelines on which tool to use when.
-
-## BTC Portfolio Tracking
-
-Robson Bot now supports **complete portfolio tracking in BTC terms**, the preferred metric for crypto investors.
-
-### Why BTC?
-
-Crypto investors prefer to measure their wealth in BTC (not USD) because:
-
-- BTC is the base currency of the crypto market
-- USD inflation can distort portfolio performance
-- BTC shows true purchasing power in the crypto ecosystem
-
-### Features
-
-#### Backend Services
-
-- **Pattern Detection Engine (CORE 1.0)**: Deterministic, idempotent pattern detection (7 patterns: Hammer, Inverted Hammer, Bullish/Bearish Engulfing, Morning Star, Head & Shoulders, Inverted H&S)
-- **BTCConversionService**: Multi-route price discovery (direct pair, USDT, BUSD)
-- **PortfolioBTCService**: Complete portfolio valuation in BTC
-- **Binance Sync**: Automatic deposit/withdrawal synchronization
-- **Audit Trail**: All external flows are recorded and audited
-
-#### REST API Endpoints
-
-```bash
-GET /api/portfolio/btc/total/          # Current value in BTC
-GET /api/portfolio/btc/profit/         # Profit since inception
-GET /api/portfolio/btc/history/        # Historical chart data
-GET /api/portfolio/deposits-withdrawals/  # Transaction list
-```
-
-#### CLI Commands
-
-```bash
-# Pattern detection (CORE 1.0)
-python manage.py detect_patterns BTCUSDT 15m --all      # All patterns
-python manage.py detect_patterns BTCUSDT 1h --candlestick  # Candlestick only
-python manage.py detect_patterns BTCUSDT 4h --chart     # Chart patterns only
-
-# Show portfolio in BTC
-python manage.py portfolio_btc
-
-# Show profit in BTC
-python manage.py portfolio_btc --profit
-
-# Sync deposits/withdrawals from Binance (last 90 days)
-python manage.py sync_deposits --days-back 90
-```
-
-#### Profit Formula
-
-```
-Profit (BTC) = Current Balance (BTC) + Withdrawals (BTC) - Deposits (BTC)
-```
-
-This formula considers:
-
-- **Current holdings**: What you have now
-- **Withdrawals**: Past profits taken out (count as gains)
-- **Deposits**: Your capital input (investment)
-
-#### Frontend Dashboard
-
-The **Portfolio tab** (💼 Portfolio) provides:
-
-- **Overview**: Total value, profit metrics, account breakdown
-- **History**: Interactive chart with timeline filtering (7d, 30d, 90d, 1y)
-- **Transactions**: Filterable table of deposits/withdrawals
-
-All values are displayed in BTC with:
-
-- Color-coded profit (green) / loss (red)
-- Auto-refresh every 60 seconds
-- Clean tab-based navigation
-
-### Quick Start
-
-```bash
-# 1. Apply database migration
-python manage.py migrate api
-
-# 2. Sync historical deposits
-python manage.py sync_deposits --days-back 90
-
-# 3. View portfolio in BTC
-python manage.py portfolio_btc --profit
-
-# 4. Open dashboard: http://localhost:3000/dashboard
-# Navigate to "💼 Portfolio" tab
-```
-
-### Documentation
-
-- See [`CHANGELOG.md`](CHANGELOG.md) for detailed changes
-- See [`docs/AGENTS.md`](docs/AGENTS.md) for architecture details
-
-## Monorepo and Architecture
-
-This repository follows a monorepo layout with **Hexagonal Architecture (Ports & Adapters)** integrated within the Django monolith.
-
-High-level structure:
+The system follows a **Hexagonal Architecture (Ports & Adapters)** within a Django monolith, with clear domain boundaries between execution, risk, and external integrations.
 
 ```
 apps/
@@ -283,88 +26,184 @@ apps/
     monolith/
       api/
         application/      # Hexagonal core (ports, use cases, adapters)
-        models/           # Django models
-        views/            # REST endpoints
+        models/           # Domain models and state persistence
+        views/            # REST API surface
         tests/            # Test suite
-  frontend/               # React (Vite) app
-cli/                      # Go-based CLI (robson-go)
-main.c                    # C router (robson)
+  frontend/               # Operations dashboard (React/Vite)
+cli/                      # Execution CLI (Go + C router)
+main.c                    # CLI entrypoint (C router)
 infra/                    # Terraform, Ansible, K8s, GitOps, Observability, DB
 docs/                     # ADRs, architecture, developer guides
 ```
 
-**Key principle:** Hexagonal architecture is implemented **INSIDE** Django at `apps/backend/monolith/api/application/`, not as an external package. This provides clear separation of concerns while maintaining a single runtime.
+### Core Subsystems
 
-Read more: `docs/ARCHITECTURE.md`.
+**Execution Engine** — Manages the full order lifecycle: plan creation, pre-execution validation, dry-run simulation, and live execution. All state transitions are explicit and auditable. The engine enforces a strict `PLAN -> VALIDATE -> EXECUTE` pipeline that prevents unvalidated orders from reaching the exchange.
 
-## INSTALL
+**Risk Engine** — Enforces position-level and portfolio-level constraints before and during execution. This includes market stop exits, liquidation distance checks, maximum position sizing, and controlled teardown of positions that violate risk parameters. Every exit carries an explicit reason code.
 
-Some tips for development environment
+**Signal Layer** — An input boundary, not a decision-maker. Robson accepts signals (pattern detections, external triggers, manual commands) and routes them through validation and risk checks before any execution occurs. The signal layer includes a deterministic, idempotent pattern detection engine (Hammer, Inverted Hammer, Bullish/Bearish Engulfing, Morning Star, Head & Shoulders, Inverted H&S) that operates as a diagnostic tool, not an autonomous trading agent.
 
-### Clone robson repository
+**Event and State System** — All position state transitions, risk events, execution outcomes, and external flows (deposits, withdrawals) are recorded as an append-only audit trail. Portfolio valuation is tracked in BTC terms to reflect actual purchasing power independent of fiat inflation.
 
-git clone <https://github.com/ldamasio/robson.git>
+**API and Multi-Tenant Layer** — A REST API provides programmatic access to execution plans, portfolio state, and risk parameters. The system supports multiple isolated tenants with per-client data boundaries.
 
-### Try run docker-compose
+### Determinism and Traceability
 
-docker-compose up -d --build
+Every execution path through the system produces a traceable sequence of events: plan creation, validation result, risk check outcome, execution attempt, and final state. There are no implicit side effects. The same inputs under the same market conditions produce the same execution behavior.
 
-### Development Backend Environment
+## Risk Management
 
-Recommended local dev setup (Postgres via Docker + helper script):
+Risk is not a feature of Robson. It is the architecture.
+
+**Market Stop Exits** — Positions carry explicit stop parameters. When market conditions breach these thresholds, the system initiates controlled exits without waiting for external signals.
+
+**Liquidation Protection** — For leveraged positions, the system monitors liquidation distance and enforces minimum margin requirements. Positions approaching liquidation thresholds are flagged or closed before the exchange liquidation engine intervenes.
+
+**Explicit Exit Reasons** — Every closed position carries a typed exit reason (stop hit, risk limit, manual close, validation failure, timeout). There are no silent exits.
+
+**Controlled Position Lifecycle** — Positions move through defined states with validated transitions. A position cannot be modified without passing through the risk layer. Orphaned or inconsistent positions are detected and surfaced.
+
+**Dry-Run by Default** — The execution pipeline defaults to simulation mode. Live execution requires explicit flags (`--live --acknowledge-risk`) and a prior passing validation. This makes it structurally difficult to execute unintended orders.
+
+## Observability
+
+**Event Tracking** — All system events (order submissions, risk checks, state transitions, external sync operations) are recorded with timestamps, context, and causality links.
+
+**State Transitions** — Position and order state changes are logged as discrete events, enabling reconstruction of the full lifecycle of any position at any point in time.
+
+**Portfolio Audit Trail** — External capital flows (deposits, withdrawals) are synchronized from the exchange and recorded. Portfolio valuation history is maintained for forensic analysis.
+
+**Debugging** — The `PLAN -> VALIDATE -> EXECUTE` pipeline produces structured output at each stage, making it possible to diagnose failures without reproducing market conditions.
+
+### REST API
 
 ```
-cd apps/backend/monolith/
-# 1) Prepare .env for development (localhost Postgres)
-cp .env.development.example .env
+GET /api/portfolio/btc/total/              # Current portfolio value (BTC)
+GET /api/portfolio/btc/profit/             # Profit since inception (BTC)
+GET /api/portfolio/btc/history/            # Historical valuation series
+GET /api/portfolio/deposits-withdrawals/   # External capital flows
+```
 
-# 2) Create venv and install deps
+### CLI
+
+```bash
+# Execution pipeline
+robson plan buy BTCUSDT 0.001 --limit 50000
+robson validate <plan-id> --client-id 1 --strategy-id 5
+robson execute <plan-id> --client-id 1                          # dry-run (default)
+robson execute <plan-id> --client-id 1 --live --acknowledge-risk  # live
+
+# Pattern detection (diagnostic)
+python manage.py detect_patterns BTCUSDT 15m --all
+python manage.py detect_patterns BTCUSDT 1h --candlestick
+python manage.py detect_patterns BTCUSDT 4h --chart
+
+# Portfolio state
+python manage.py portfolio_btc --profit
+python manage.py sync_deposits --days-back 90
+```
+
+### CLI Architecture
+
+```
+robson (C router)
+  └─> robson-go (Go + Cobra)
+       └─> python manage.py {validate_plan,execute_plan} (Django)
+```
+
+The CLI is a thin routing layer. All business logic, risk validation, and execution semantics remain in the application core.
+
+## Positioning
+
+**Robson is not a trading bot.**
+
+It does not tell you what to buy. It does not scan for opportunities. It does not promise returns.
+
+Robson is:
+
+- An **execution system** that manages the lifecycle of orders from plan to settlement
+- A **risk-aware runtime** that enforces safety invariants on every position
+- An **experimental platform** for building and testing financial execution infrastructure
+
+It is designed for engineers and researchers who need a controlled, auditable environment for studying execution behavior in leveraged markets.
+
+## Development
+
+### Prerequisites
+
+```bash
+git clone https://github.com/ldamasio/robson.git
+```
+
+### Backend
+
+```bash
+cd apps/backend/monolith/
+cp .env.development.example .env
 python -m venv .venv
 source .venv/bin/activate
-python -m pip install --upgrade pip
-# python -m pip install --upgrade setuptools
-python -m pip install -r requirements.txt
+pip install --upgrade pip
+pip install -r requirements.txt
 export DJANGO_SETTINGS_MODULE=backend.settings
 
-# 3) Start local Postgres (Docker Compose)
-cd ..
-make dev-db-up
-cd monolith
-
-# 4) Migrate and run tests using the helper script
-chmod +x bin/dj
+# Database
+cd .. && make dev-db-up && cd monolith
 ./bin/dj makemigrations api
 ./bin/dj migrate
 ./bin/dj test
-
-# 5) Run server
 ./bin/dj runserver
 ```
 
-### Development Frontend Environment
+### Frontend
 
+```bash
 cd apps/frontend
 nvm use 14
 npm i
 npm start
+```
 
-To update vendor docs in the future, run:
+### Build CLI
 
 ```bash
-make sync-binance-docs
+make build-cli
+make test-cli
+make install-cli    # optional: install to system PATH
 ```
+
+### Task Runner
+
+Install [just](https://just.systems) for daily development tasks:
+
+```bash
+just --list         # see all tasks
+just setup          # first-time setup
+just db-up          # start database
+just db-migrate     # run migrations
+just test           # run all tests
+just dev-backend    # start backend server
+just dev-frontend   # start frontend server
+just info           # environment info
+```
+
+## Deployment
+
+Production deployments are performed via GitOps (GitHub Actions + ArgoCD + k3s) using Istio Ambient Mode with Gateway API. Each non-main branch creates a staging environment at `h-<branch>.robson.rbx.ia.br`.
+
+The `./bin/dj` script and `docker-compose.dev.yml` are for local development only.
+
+See `infra/README.md` for deployment details.
 
 ## Contributing
 
-Robson is 100% open source and contributions are welcome. For how to prepare your dev environment, run tests, create migrations, and submit PRs, see:
+Robson is open source. Contributions are welcome.
 
-- docs/DEVELOPER.md
-- docs/STYLE_GUIDE.md
+- `docs/DEVELOPER.md` — development setup and workflow
+- `docs/STYLE_GUIDE.md` — code conventions
+- `docs/ARCHITECTURE.md` — system design
+- `docs/COMMAND-RUNNERS.md` — CLI tool guidelines
 
-Production deployments are performed via GitOps/CI (GitHub Actions + ArgoCD + k3s) using Istio (Ambient Mode) with Gateway API. Each branch ≠ main creates an automatic staging environment at `h-<branch>.robson.rbx.ia.br`. The `./bin/dj` script and `docker-compose.dev.yml` are intended for local development only. See `infra/README.md`.
+## License
 
-Notes
-
-- The `./bin/dj` script is for local development only. Production deploys should be performed via your GitOps/CI pipeline (e.g., GitHub Actions + ArgoCD + k3s).
-- The local Postgres runs with Docker Compose using `apps/backend/monolith/docker-compose.dev.yml` and credentials from `apps/backend/monolith/.env`.
-  - Makefile helpers: `make dev-db-up`, `make dev-db-down`, `make dev-db-destroy`, `make dev-test`.
+Open source. See repository for license details.
