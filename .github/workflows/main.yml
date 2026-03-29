@@ -139,119 +139,63 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # ===== GITOPS: UPDATE MANIFESTS =====
-      - name: Update K8s manifests with new image tags
+      # ===== GITOPS: UPDATE MANIFESTS IN rbx-infra =====
+      - name: Update manifests in rbx-infra
+        env:
+          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
         run: |
           SHA_TAG="${{ steps.meta.outputs.sha_tag }}"
-          echo "Updating manifests to use: ${SHA_TAG}"
-          
+
+          git clone https://x-access-token:${GITOPS_TOKEN}@github.com/rbxrobotica/rbx-infra.git /tmp/rbx-infra
+          cd /tmp/rbx-infra
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
           # Update frontend deployment
           sed -i "s|image: ldamasio/rbs-frontend-prod:sha-[a-f0-9]*|image: ldamasio/rbs-frontend-prod:${SHA_TAG}|g" \
-            infra/k8s/prod/rbs-frontend-prod-deploy.yml
-          
-          # Update backend monolith deployment
+            apps/prod/robson/frontend-deploy.yml
+
+          # Update backend deployment
           sed -i "s|image: ldamasio/rbs-backend-monolith-prod:sha-[a-f0-9]*|image: ldamasio/rbs-backend-monolith-prod:${SHA_TAG}|g" \
-            infra/k8s/prod/rbs-backend-monolith-prod-deploy.yml
-          
-          # Update backend nginx deployment
-          sed -i "s|image: ldamasio/rbs-backend-nginx-prod:sha-[a-f0-9]*|image: ldamasio/rbs-backend-nginx-prod:${SHA_TAG}|g" \
-            infra/k8s/prod/rbs-backend-nginx-prod-deploy.yml
-          
-          # Update stop-monitor cronjob (also uses backend image)
-          sed -i "s|image: ldamasio/rbs-backend-monolith-prod:.*|image: ldamasio/rbs-backend-monolith-prod:${SHA_TAG}|g" \
-            infra/k8s/prod/rbs-stop-monitor-cronjob.yml
-          
-          # Update trailing-stop cronjob (also uses backend image)
-          sed -i "s|image: ldamasio/rbs-backend-monolith-prod:.*|image: ldamasio/rbs-backend-monolith-prod:${SHA_TAG}|g" \
-            infra/k8s/prod/rbs-trailing-stop-cronjob.yml
-          
-          echo "✅ Manifests updated"
+            apps/prod/robson/backend-deploy.yml
 
-      - name: Commit and push manifest changes
-        run: |
-          SHA_TAG="${{ steps.meta.outputs.sha_tag }}"
+          # Update all cronjobs (stop-monitor, trailing-stop, pattern-scan)
+          sed -i "s|image: ldamasio/rbs-backend-monolith-prod:sha-[a-f0-9]*|image: ldamasio/rbs-backend-monolith-prod:${SHA_TAG}|g" \
+            apps/prod/robson/cronjobs.yml
 
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git add apps/prod/robson/frontend-deploy.yml \
+                  apps/prod/robson/backend-deploy.yml \
+                  apps/prod/robson/cronjobs.yml
 
-          git add infra/k8s/prod/*.yml
-
-          # Check if there are changes to commit
           if git diff --staged --quiet; then
-            echo "ℹ️ No manifest changes to commit (already up-to-date)"
+            echo "No manifest changes needed (already at ${SHA_TAG})"
             exit 0
           fi
 
-          # Commit the changes
-          git commit -m "chore(gitops): update image tags to ${SHA_TAG}
+          git commit -m "chore(robson): update image tags to ${SHA_TAG}
 
-          Automated manifest update by GitHub Actions.
-          ArgoCD will automatically sync this change.
+          Automated update by Robson CI/CD pipeline.
+          Triggered by: ${{ github.repository }}@${{ github.sha }}
 
           [skip ci]"
 
-          # Robust push with retry logic (handles concurrent workflows)
-          MAX_RETRIES=3
-          RETRY_COUNT=0
-          PUSH_SUCCESS=false
-
-          while [ $RETRY_COUNT -lt $MAX_RETRIES ]; do
-            echo "📤 Attempt $((RETRY_COUNT + 1))/$MAX_RETRIES: Pushing manifest updates..."
-
+          # Push with retry on concurrent conflicts
+          for i in 1 2 3; do
             if git push origin main; then
-              echo "✅ Manifests pushed successfully - ArgoCD will auto-sync"
-              PUSH_SUCCESS=true
-              break
-            else
-              echo "⚠️ Push failed (likely due to concurrent workflow)"
-              RETRY_COUNT=$((RETRY_COUNT + 1))
-
-              if [ $RETRY_COUNT -lt $MAX_RETRIES ]; then
-                echo "🔄 Pulling and rebasing before retry..."
-                git pull --rebase origin main
-
-                # Check if our commit is still needed after rebase
-                if git log -1 --grep="chore(gitops): update image tags to ${SHA_TAG}" --format="%s" | grep -q "${SHA_TAG}"; then
-                  echo "✓ Gitops commit preserved after rebase"
-                else
-                  echo "⚠️ Gitops commit lost during rebase - checking if manifests already updated..."
-
-                  # Check if another workflow already updated to this SHA
-                  if grep -q "${SHA_TAG}" infra/k8s/prod/rbs-frontend-prod-deploy.yml; then
-                    echo "✅ Manifests already updated to ${SHA_TAG} by another workflow"
-                    PUSH_SUCCESS=true
-                    break
-                  else
-                    echo "❌ Manifests not updated and commit lost - this should not happen"
-                    exit 1
-                  fi
-                fi
-
-                sleep $((2 ** RETRY_COUNT))  # Exponential backoff
-              fi
+              echo "Manifests pushed — ArgoCD will auto-sync"
+              exit 0
             fi
+            echo "Push attempt $i failed, rebasing..."
+            git pull --rebase origin main
           done
 
-          if [ "$PUSH_SUCCESS" = false ]; then
-            echo "❌ Failed to push manifests after $MAX_RETRIES attempts"
-            echo "::error::GitOps manifest push failed - deployment NOT updated"
-            exit 1
-          fi
-
-          # Final validation: Verify gitops commit exists on remote
-          sleep 2  # Brief wait for GitHub to process push
-
-          if git ls-remote --heads origin main | grep -q "$(git rev-parse HEAD)"; then
-            echo "✅ Validation passed: Gitops commit confirmed on remote"
-          else
-            echo "❌ Validation failed: Gitops commit not found on remote"
-            echo "::error::Gitops commit push validation failed"
-            exit 1
-          fi
+          echo "::error::Failed to push to rbx-infra after 3 attempts"
+          exit 1
 
       - name: Wait for ArgoCD sync
         env:
-          ARGOCD_SERVER: argocd.robson.rbx.ia.br
+          ARGOCD_SERVER: argocd.rbx.ia.br
           ARGOCD_AUTH_TOKEN: ${{ secrets.ARGOCD_AUTH_TOKEN }}
         run: |
           # Install ArgoCD CLI
