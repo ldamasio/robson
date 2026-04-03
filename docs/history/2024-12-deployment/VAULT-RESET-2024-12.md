@@ -56,9 +56,7 @@ This reset follows best practices:
 
 ## References
 
-- Main deployment plan: `docs/plan/infra/QUICK-DEPLOY-2024-12.md`
-- Vault template: `infra/ansible/VAULT-TEMPLATE.md`
-- Inventory template: `infra/ansible/INVENTORY-TEMPLATE.md`
+- Shared infrastructure runbooks and templates were later moved out of this repository.
 
 ---
 

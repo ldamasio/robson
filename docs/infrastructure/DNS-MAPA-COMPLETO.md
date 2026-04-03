@@ -176,7 +176,7 @@ https://grafana.staging.rbx.ia.br
 | Produção | `<serviço>.rbx.ia.br` | `grafana.rbx.ia.br` |
 | Produção (alias) | `<serviço>.robson.rbx.ia.br` | `api.robson.rbx.ia.br` |
 | Staging | `<serviço>.staging.rbx.ia.br` | `api.staging.rbx.ia.br` |
-| Preview (futuro) | `<branch>.preview.rbx.ia.br` | `feature-auth.preview.rbx.ia.br` |
+| Staging auxiliar (futuro) | `<nome>.staging.rbx.ia.br` | `review-auth.staging.rbx.ia.br` |
 
 ---
 
@@ -309,9 +309,9 @@ curl -I https://api.robson.rbx.ia.br 2>&1 | grep -E "(HTTP|SSL)"
 - [x] `prometheus.rbx.ia.br`
 - [x] `argocd.rbx.ia.br`
 
-### ⏳ Fase 3: Preview Environments (Futuro)
-- [ ] Sistema para criar DNS dinâmicos por branch
-- [ ] Exemplo: `feature-auth.preview.rbx.ia.br`
+### ⏳ Fase 3: Automação de Staging (Futuro)
+- [ ] Sistema para gerenciar hosts auxiliares de staging
+- [ ] Exemplo: `review-auth.staging.rbx.ia.br`
 - [ ] Requer automação (GitHub Actions + API registro.br ou Cloudflare)
 
 ---

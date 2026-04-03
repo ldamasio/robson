@@ -60,12 +60,10 @@ kubectl get svc -n istio-system istio-ingressgateway -o jsonpath='{.status.loadB
 
 | Nome | Tipo | Valor | TTL | Descrição |
 |------|------|-------|-----|-----------|
-| `*.staging.rbx.ia.br` | A | `<K8S_LB_IP>` | 3600 | Wildcard para staging (preview envs, etc.) |
-| `*.preview.rbx.ia.br` | A | `<K8S_LB_IP>` | 3600 | Preview environments (feature branches) |
+| `*.staging.rbx.ia.br` | A | `<K8S_LB_IP>` | 3600 | Wildcard para hosts compartilhados de staging |
 
 **Nota sobre Wildcards**:
-- Facilita criação de preview environments dinâmicos
-- Exemplo: `feature-123.preview.rbx.ia.br` para branch `feature/123`
+- Facilita a criação de hosts auxiliares de staging quando necessário
 - Opcional: pode criar registros específicos conforme necessário
 
 ---
@@ -209,7 +207,6 @@ grafana.staging.rbx.ia.br.    3600  IN  A      <COLE_IP_AQUI>
 
 ; === WILDCARDS (Opcional) ===
 *.staging.rbx.ia.br.          3600  IN  A      <COLE_IP_AQUI>
-*.preview.rbx.ia.br.          3600  IN  A      <COLE_IP_AQUI>
 ```
 
 **Substitua `<COLE_IP_AQUI>` pelo IP do LoadBalancer**
@@ -315,11 +312,11 @@ kubectl get challenges -n staging
 4. ⏳ Validar acesso: https://api.rbx.ia.br
 5. ⏳ Migrar tráfego de robsonbot.com → rbx.ia.br (gradual)
 
-### Fase 3: Preview Environments (Futuro)
+### Fase 3: Automação de Staging (Futuro)
 
-1. ⏳ Criar wildcard `*.preview.rbx.ia.br`
-2. ⏳ Configurar GitHub Actions para preview per-branch
-3. ⏳ Exemplo: `feature-auth.preview.rbx.ia.br`
+1. ⏳ Revisar necessidade de hosts auxiliares em `staging`
+2. ⏳ Documentar a automação de promoção para staging
+3. ⏳ Exemplo: `review-auth.staging.rbx.ia.br`
 
 ---
 

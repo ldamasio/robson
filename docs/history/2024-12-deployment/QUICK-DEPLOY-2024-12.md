@@ -264,10 +264,11 @@ kubectl wait --for=condition=available --timeout=300s \
 kubectl apply -f infra/k8s/platform/cert-manager/cluster-issuer.yml
 ```
 
-### 4.2 Install Gateway API CRDs
+### 4.2 Install Additional Ingress Prerequisites (Historical)
 
 ```bash
-kubectl apply -f https://github.com/kubernetes-sigs/gateway-api/releases/download/v1.0.0/standard-install.yaml
+# Historical note: this 2024 plan installed additional ingress CRDs.
+# The current Robson application repository no longer carries this platform decision.
 ```
 
 ### 4.3 Create Secrets
