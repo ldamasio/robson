@@ -59,6 +59,11 @@ class DerivativesDataService:
         mode = "TESTNET" if self.binance.use_testnet else "PRODUCTION"
         logger.info(f"DerivativesDataService initialized in {mode} mode")
 
+    @property
+    def is_production(self) -> bool:
+        """Expose the resolved Binance mode for adapter consumers."""
+        return self.binance.is_production
+
     def get_mark_price(self, symbol: str) -> Dict[str, any]:
         """
         Fetch current mark price and funding rate for a symbol.

@@ -541,7 +541,7 @@ def risk_status(request):
                 'stop_loss': 'REQUIRED for every trade',
             },
             'trading_enabled': getattr(settings, 'TRADING_ENABLED', False),
-            'environment': 'production' if not getattr(settings, 'BINANCE_USE_TESTNET', True) else 'testnet',
+            'environment': settings.BINANCE_ENV,
             'timestamp': timezone.now().isoformat(),
         })
         
@@ -551,4 +551,3 @@ def risk_status(request):
             'success': False,
             'error': str(e),
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
-

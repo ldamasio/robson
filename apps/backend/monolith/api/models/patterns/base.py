@@ -1,5 +1,7 @@
 """Core pattern catalog and instance models."""
 
+from decimal import Decimal
+
 from django.db import models
 
 from ..base import BaseModel
@@ -282,6 +284,21 @@ class PatternInstance(BaseModel):
 
     def __str__(self) -> str:  # pragma: no cover - readability helper
         return f"{self.pattern.pattern_code} @ {self.symbol.name} ({self.timeframe})"
+
+    @property
+    def pattern_code(self) -> str:
+        """Compatibility accessor for legacy detector and use case code."""
+        return self.pattern.pattern_code
+
+    @property
+    def evidence(self) -> dict:
+        """Compatibility accessor for detector evidence payload."""
+        return (self.features or {}).get("evidence", {})
+
+    @property
+    def confidence(self) -> Decimal:
+        """Compatibility accessor for detector confidence."""
+        return Decimal(str((self.features or {}).get("confidence", 0)))
 
 
 class PatternPoint(BaseModel):

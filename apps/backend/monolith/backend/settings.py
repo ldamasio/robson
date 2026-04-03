@@ -23,6 +23,29 @@ from datetime import timedelta
 
 config = AutoConfig(search_path=BASE_DIR)
 
+
+def _resolve_binance_env() -> str:
+    """Resolve the canonical Binance environment from one setting."""
+    raw_env = config("RBS_BINANCE_ENV", default="").strip().lower()
+    aliases = {
+        "prod": "production",
+        "live": "production",
+        "mainnet": "production",
+        "test": "testnet",
+        "dev": "testnet",
+    }
+
+    if raw_env:
+        normalized = aliases.get(raw_env, raw_env)
+        if normalized not in {"production", "testnet"}:
+            raise ValueError(
+                "RBS_BINANCE_ENV must be either 'production' or 'testnet'"
+            )
+        return normalized
+
+    legacy_use_testnet = config("BINANCE_USE_TESTNET", default=True, cast=bool)
+    return "testnet" if legacy_use_testnet else "production"
+
 # ==========================================
 # BASIC CONFIGURATION
 # ==========================================
@@ -43,8 +66,39 @@ BINANCE_SECRET_KEY_TEST = config("RBS_BINANCE_SECRET_KEY_TEST", default="")
 BINANCE_API_KEY = config("RBS_BINANCE_API_KEY_PROD", default=config("RBS_BINANCE_API_KEY", default=""))
 BINANCE_SECRET_KEY = config("RBS_BINANCE_SECRET_KEY_PROD", default=config("RBS_BINANCE_SECRET_KEY", default=""))
 
+# Canonical environment selection
+BINANCE_ENV = _resolve_binance_env()
+BINANCE_USE_TESTNET = BINANCE_ENV == "testnet"
+BINANCE_MODE = "TESTNET" if BINANCE_USE_TESTNET else "PRODUCTION"
+
+# Derived connection settings
+BINANCE_API_URL_TEST = config(
+    "RBS_BINANCE_API_URL_TEST",
+    default="https://testnet.binance.vision/api",
+)
+BINANCE_API_URL_PROD = config(
+    "RBS_BINANCE_API_URL_PROD",
+    default="https://api.binance.com",
+)
+BINANCE_API_URL_ACTIVE = (
+    BINANCE_API_URL_TEST if BINANCE_USE_TESTNET else BINANCE_API_URL_PROD
+)
+BINANCE_API_KEY_ACTIVE = (
+    BINANCE_API_KEY_TEST if BINANCE_USE_TESTNET else BINANCE_API_KEY
+)
+BINANCE_SECRET_KEY_ACTIVE = (
+    BINANCE_SECRET_KEY_TEST if BINANCE_USE_TESTNET else BINANCE_SECRET_KEY
+)
+BINANCE_HAS_ACTIVE_CREDENTIALS = bool(
+    BINANCE_API_KEY_ACTIVE and BINANCE_SECRET_KEY_ACTIVE
+)
+
 # Trading flags
-BINANCE_USE_TESTNET = config('BINANCE_USE_TESTNET', default=True, cast=bool)
+BINANCE_ALLOW_LIVE_TRADING = config(
+    "BINANCE_ALLOW_LIVE_TRADING",
+    default=False,
+    cast=bool,
+)
 TRADING_ENABLED = config('TRADING_ENABLED', default=False, cast=bool)
 
 # Encryption key for client credentials stored in database

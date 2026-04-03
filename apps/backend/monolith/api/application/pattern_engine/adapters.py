@@ -388,12 +388,14 @@ class DjangoPatternRepository:
             instance_id: Pattern instance ID
             metrics: Candle metrics (body_pct, wick_pcts, etc.)
         """
-        CandlestickPatternDetail.objects.create(
+        CandlestickPatternDetail.objects.update_or_create(
             instance_id=instance_id,
-            body_pct_main=metrics.get("body_pct"),
-            upper_wick_pct_main=metrics.get("upper_wick_pct"),
-            lower_wick_pct_main=metrics.get("lower_wick_pct"),
-            engulf_ratio=metrics.get("engulf_ratio"),
+            defaults={
+                "body_pct_main": metrics.get("body_pct"),
+                "upper_wick_pct_main": metrics.get("upper_wick_pct"),
+                "lower_wick_pct_main": metrics.get("lower_wick_pct"),
+                "engulf_ratio": metrics.get("engulf_ratio"),
+            },
         )
 
     def store_chart_detail(self, instance_id: int, metrics: dict) -> None:
@@ -404,11 +406,13 @@ class DjangoPatternRepository:
             instance_id: Pattern instance ID
             metrics: Chart pattern metrics (neckline_slope, etc.)
         """
-        ChartPatternDetail.objects.create(
+        ChartPatternDetail.objects.update_or_create(
             instance_id=instance_id,
-            neckline_slope=metrics.get("neckline_slope"),
-            head_prominence_pct=metrics.get("head_prominence_pct"),
-            shoulder_symmetry=metrics.get("shoulder_symmetry"),
+            defaults={
+                "neckline_slope": metrics.get("neckline_slope"),
+                "head_prominence_pct": metrics.get("head_prominence_pct"),
+                "shoulder_symmetry": metrics.get("shoulder_symmetry"),
+            },
         )
 
     def store_pattern_points(self, instance_id: int, points: list[PivotPoint]) -> None:

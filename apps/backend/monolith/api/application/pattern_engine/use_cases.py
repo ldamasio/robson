@@ -300,7 +300,7 @@ class PatternScanUseCase:
         from api.models.patterns.base import PatternInstance
 
         forming_instances = PatternInstance.objects.filter(
-            symbol=command.symbol,
+            symbol__name=command.symbol,
             timeframe=command.timeframe,
             status="FORMING",
         )
@@ -383,7 +383,7 @@ class PatternScanUseCase:
         from api.models.patterns.base import PatternInstance
 
         active_instances = PatternInstance.objects.filter(
-            symbol=command.symbol,
+            symbol__name=command.symbol,
             timeframe=command.timeframe,
             status__in=["FORMING", "CONFIRMED"],
         )

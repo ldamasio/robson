@@ -30,6 +30,8 @@ from binance.client import Client
 from django.conf import settings
 from django.utils import timezone
 
+from api.services.binance_service import get_binance_runtime_config
+
 from .ports import (
     AccountBalancePort,
     ClockPort,
@@ -138,29 +140,26 @@ def _get_binance_client(use_testnet: bool = None, timeout: float = 5.0) -> Clien
     Returns:
         Configured Binance Client instance
     """
-    if use_testnet is None:
-        use_testnet = getattr(settings, "BINANCE_USE_TESTNET", True)
+    runtime = get_binance_runtime_config(use_testnet)
 
-    if use_testnet:
-        api_key = settings.BINANCE_API_KEY_TEST
-        secret_key = settings.BINANCE_SECRET_KEY_TEST
-    else:
-        api_key = settings.BINANCE_API_KEY
-        secret_key = settings.BINANCE_SECRET_KEY
+    if not runtime.has_credentials:
+        raise RuntimeError(
+            f"Binance API credentials not configured for {runtime.environment} mode"
+        )
 
-    if not api_key or not secret_key:
-        mode = "testnet" if use_testnet else "production"
-        raise RuntimeError(f"Binance API credentials not configured for {mode} mode")
-
-    mode_str = "TESTNET" if use_testnet else "PRODUCTION"
-    logger.info(f"Creating Binance client in {mode_str} mode with timeout={timeout}s")
+    logger.info(f"Creating Binance client in {runtime.mode} mode with timeout={timeout}s")
 
     # Configure timeout for all HTTP requests
     requests_params = {
         "timeout": timeout  # Single value = connect + read timeout
     }
 
-    return Client(api_key, secret_key, testnet=use_testnet, requests_params=requests_params)
+    return Client(
+        runtime.api_key,
+        runtime.secret_key,
+        testnet=runtime.use_testnet,
+        requests_params=requests_params,
+    )
 
 
 class BinanceMarketData(MarketDataPort):
@@ -267,13 +266,11 @@ class BinanceExecution(ExchangeExecutionPort):
             client: Optional pre-configured Binance client
             use_testnet: Override testnet setting. If None, uses settings.BINANCE_USE_TESTNET
         """
-        if use_testnet is None:
-            use_testnet = getattr(settings, "BINANCE_USE_TESTNET", True)
+        runtime = get_binance_runtime_config(use_testnet)
+        self.use_testnet = runtime.use_testnet
+        self.client = client or _get_binance_client(runtime.use_testnet)
 
-        self.use_testnet = use_testnet
-        self.client = client or _get_binance_client(use_testnet)
-
-        if not use_testnet:
+        if not runtime.use_testnet:
             logger.warning("⚠️ BinanceExecution initialized in PRODUCTION mode - REAL MONEY!")
 
     def place_limit(self, order: object) -> str:
@@ -487,11 +484,7 @@ class BinanceAccountBalanceAdapter(AccountBalancePort):
         """
         self.client = client or _get_binance_client(use_testnet, timeout)
         self.timeout = timeout
-        self.use_testnet = (
-            use_testnet
-            if use_testnet is not None
-            else getattr(settings, "BINANCE_USE_TESTNET", True)
-        )
+        self.use_testnet = get_binance_runtime_config(use_testnet).use_testnet
 
         logger.info(
             f"BinanceAccountBalanceAdapter initialized: "

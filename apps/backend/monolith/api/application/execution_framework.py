@@ -25,6 +25,7 @@ from api.application.execution import (
     ExecutionStatus,
 )
 from api.models import Operation, Symbol, TradingIntent
+from api.services.binance_service import has_binance_credentials
 from api.services.audit_service import AuditService
 
 logger = logging.getLogger(__name__)
@@ -184,14 +185,7 @@ class ExecutionFramework:
             logger.error(f"LIVE execution blocked for {intent.intent_id}: {error_msg}")
             raise RuntimeError(error_msg)
 
-        # Verify credentials are configured
-        api_key = getattr(settings, "BINANCE_API_KEY", None) or getattr(
-            settings, "BINANCE_API_KEY_TEST", None
-        )
-        secret_key = getattr(settings, "BINANCE_SECRET_KEY", None) or getattr(
-            settings, "BINANCE_SECRET_KEY_TEST", None
-        )
-        if not api_key or not secret_key:
+        if not has_binance_credentials():
             error_msg = "Binance API credentials not configured. Cannot execute LIVE orders."
             logger.error(f"LIVE execution blocked for {intent.intent_id}: {error_msg}")
             raise RuntimeError(error_msg)
@@ -347,13 +341,7 @@ class ExecutionFramework:
             logger.error(f"LIVE execution blocked for {intent.intent_id}: {error_msg}")
             raise RuntimeError(error_msg)
 
-        api_key = getattr(settings, "BINANCE_API_KEY", None) or getattr(
-            settings, "BINANCE_API_KEY_TEST", None
-        )
-        secret_key = getattr(settings, "BINANCE_SECRET_KEY", None) or getattr(
-            settings, "BINANCE_SECRET_KEY_TEST", None
-        )
-        if not api_key or not secret_key:
+        if not has_binance_credentials():
             error_msg = "Binance API credentials not configured. Cannot execute LIVE orders."
             logger.error(f"LIVE execution blocked for {intent.intent_id}: {error_msg}")
             raise RuntimeError(error_msg)

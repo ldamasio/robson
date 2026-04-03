@@ -503,7 +503,7 @@ def trigger_pattern_scan(request):
 
         # Initialize adapters
         # BinanceService is a singleton that uses settings for credentials
-        use_testnet = getattr(settings, "BINANCE_USE_TESTNET", False)
+        use_testnet = settings.BINANCE_USE_TESTNET
         binance_service = BinanceService(use_testnet=use_testnet)
         candle_provider = BinanceCandleProvider(binance_service)
         # For API-triggered scans, use the user's client for multi-tenancy

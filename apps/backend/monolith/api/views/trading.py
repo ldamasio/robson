@@ -25,6 +25,7 @@ from rest_framework.response import Response
 from api.models import Trade, Symbol, Order
 from api.models.audit import AuditTransaction, TransactionType, MovementCategory
 from api.application.adapters import BinanceExecution, BinanceMarketData
+from api.services.binance_service import has_binance_credentials
 
 logger = logging.getLogger(__name__)
 
@@ -64,18 +65,13 @@ def trading_status(request):
         - environment: 'production' or 'testnet'
         - can_trade: Whether the current setup allows trading
     """
-    is_testnet = getattr(settings, 'BINANCE_USE_TESTNET', True)
+    is_testnet = settings.BINANCE_USE_TESTNET
     trading_enabled = getattr(settings, 'TRADING_ENABLED', False)
-    
-    # Check if credentials are configured
-    if is_testnet:
-        has_credentials = bool(settings.BINANCE_API_KEY_TEST and settings.BINANCE_SECRET_KEY_TEST)
-    else:
-        has_credentials = bool(settings.BINANCE_API_KEY and settings.BINANCE_SECRET_KEY)
+    has_credentials = has_binance_credentials()
     
     return Response({
         'trading_enabled': trading_enabled,
-        'environment': 'testnet' if is_testnet else 'production',
+        'environment': settings.BINANCE_ENV,
         'has_credentials': has_credentials,
         'can_trade': trading_enabled and has_credentials,
         'user': request.user.username,
@@ -100,7 +96,7 @@ def account_balance(request):
         
         return Response({
             'success': True,
-            'environment': 'testnet' if execution.use_testnet else 'production',
+            'environment': settings.BINANCE_ENV,
             'data': balance_data,
             'timestamp': timezone.now().isoformat(),
         })
@@ -274,7 +270,7 @@ def buy_btc(request):
         return Response({
             'success': False,
             'error': str(e),
-            'environment': 'production' if not getattr(settings, 'BINANCE_USE_TESTNET', True) else 'testnet',
+            'environment': settings.BINANCE_ENV,
         }, status=status.HTTP_500_INTERNAL_SERVER_ERROR)
 
 

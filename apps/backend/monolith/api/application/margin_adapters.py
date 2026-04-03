@@ -12,11 +12,12 @@ from decimal import Decimal
 from typing import Optional
 import logging
 
-from django.conf import settings
 from binance.client import Client
 from binance.exceptions import BinanceAPIException
 from dataclasses import dataclass
 from typing import Protocol
+
+from api.services.binance_service import get_binance_runtime_config
 
 logger = logging.getLogger(__name__)
 
@@ -98,24 +99,20 @@ def _get_binance_client(use_testnet: bool = None) -> Client:
     Returns:
         Configured Binance Client instance
     """
-    if use_testnet is None:
-        use_testnet = getattr(settings, 'BINANCE_USE_TESTNET', True)
-    
-    if use_testnet:
-        api_key = settings.BINANCE_API_KEY_TEST
-        secret_key = settings.BINANCE_SECRET_KEY_TEST
-    else:
-        api_key = settings.BINANCE_API_KEY
-        secret_key = settings.BINANCE_SECRET_KEY
-    
-    if not api_key or not secret_key:
-        mode = "testnet" if use_testnet else "production"
-        raise RuntimeError(f'Binance API credentials not configured for {mode} mode')
-    
-    mode_str = "TESTNET" if use_testnet else "PRODUCTION"
-    logger.info(f"Creating Binance client in {mode_str} mode for margin trading")
-    
-    return Client(api_key, secret_key, testnet=use_testnet)
+    runtime = get_binance_runtime_config(use_testnet)
+
+    if not runtime.has_credentials:
+        raise RuntimeError(
+            f"Binance API credentials not configured for {runtime.environment} mode"
+        )
+
+    logger.info(f"Creating Binance client in {runtime.mode} mode for margin trading")
+
+    return Client(
+        runtime.api_key,
+        runtime.secret_key,
+        testnet=runtime.use_testnet,
+    )
 
 
 class BinanceMarginAdapter(MarginExecutionPort):
@@ -144,16 +141,14 @@ class BinanceMarginAdapter(MarginExecutionPort):
             client: Optional pre-configured Binance client
             use_testnet: Override testnet setting. If None, uses settings.BINANCE_USE_TESTNET
         """
-        if use_testnet is None:
-            use_testnet = getattr(settings, 'BINANCE_USE_TESTNET', True)
-        
-        self.use_testnet = use_testnet
-        self.client = client or _get_binance_client(use_testnet)
-        
-        mode = "TESTNET" if use_testnet else "PRODUCTION"
+        runtime = get_binance_runtime_config(use_testnet)
+        self.use_testnet = runtime.use_testnet
+        self.client = client or _get_binance_client(runtime.use_testnet)
+
+        mode = runtime.mode
         logger.info(f"BinanceMarginAdapter initialized in {mode} mode")
         
-        if not use_testnet:
+        if not runtime.use_testnet:
             logger.warning("⚠️ PRODUCTION mode - Real money margin operations!")
     
     def transfer_to_margin(
@@ -665,4 +660,3 @@ class MockMarginAdapter(MarginExecutionPort):
             for order in self.orders
             if order.symbol == symbol and order.status in ("NEW", "PARTIALLY_FILLED")
         ]
-

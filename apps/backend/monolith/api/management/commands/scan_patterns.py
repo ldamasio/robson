@@ -78,6 +78,7 @@ class Command(BaseCommand):
         parser.add_argument(
             "--testnet",
             action="store_true",
+            default=None,
             help="Use Binance testnet instead of production",
         )
         parser.add_argument(
@@ -100,6 +101,11 @@ class Command(BaseCommand):
 
         symbols = [s.strip().upper() for s in options["symbols"].split(",")]
         timeframes = [t.strip() for t in options["timeframes"].split(",")]
+        use_testnet = (
+            options["testnet"]
+            if options["testnet"] is not None
+            else settings.BINANCE_USE_TESTNET
+        )
 
         self.stdout.write(
             self.style.SUCCESS(
@@ -110,14 +116,13 @@ class Command(BaseCommand):
                 f"Timeframes: {', '.join(timeframes)}\n"
                 f"Continuous: {options['continuous']}\n"
                 f"Process Plans: {options['process_plans']}\n"
-                f"Testnet: {options['testnet']}\n"
+                f"Testnet: {use_testnet}\n"
                 f"{'='*60}\n"
             )
         )
 
         # Initialize adapters
         # BinanceService is a singleton that uses settings for credentials
-        use_testnet = options.get("testnet", getattr(settings, "BINANCE_USE_TESTNET", False))
         binance_service = BinanceService(use_testnet=use_testnet)
         candle_provider = BinanceCandleProvider(binance_service)
         # For CronJob/system-wide scans, client=None creates system-owned patterns

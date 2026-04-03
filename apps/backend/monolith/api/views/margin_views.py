@@ -65,7 +65,7 @@ def _get_adapter(use_testnet: bool = None):
     from django.conf import settings
     
     if use_testnet is None:
-        use_testnet = getattr(settings, 'BINANCE_USE_TESTNET', True)
+        use_testnet = settings.BINANCE_USE_TESTNET
     
     return BinanceMarginAdapter(use_testnet=use_testnet)
 
@@ -804,4 +804,3 @@ def monitor_margins(request):
         "total_open": len(positions),
         "at_risk": len([r for r in results if r.get("margin_health") in ("WARNING", "CRITICAL", "DANGER")]),
     })
-

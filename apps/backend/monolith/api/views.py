@@ -31,7 +31,11 @@ from .views import portfolio_btc
 
 
 
-client=Client(settings.BINANCE_API_KEY_TEST, settings.BINANCE_SECRET_KEY_TEST)
+client = Client(
+    settings.BINANCE_API_KEY_ACTIVE,
+    settings.BINANCE_SECRET_KEY_ACTIVE,
+    testnet=settings.BINANCE_USE_TESTNET,
+)
 
 # class MyTokenObtainPairSerializer(TokenObtainPairSerializer):
 #     @classmethod
@@ -320,7 +324,11 @@ def Patrimony(request):
     # return JsonResponse(result_balance)
 
 def Week(request):
-    client=Client(settings.BINANCE_API_KEY_TEST, settings.BINANCE_SECRET_KEY_TEST)
+    client = Client(
+        settings.BINANCE_API_KEY_ACTIVE,
+        settings.BINANCE_SECRET_KEY_ACTIVE,
+        testnet=settings.BINANCE_USE_TESTNET,
+    )
     asset="BTCUSDT"
     today_date = datetime.date.today()
     last_week = today_date + datetime.timedelta(days=-7)

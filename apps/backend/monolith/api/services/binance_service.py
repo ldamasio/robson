@@ -8,12 +8,84 @@ or per-client credentials (from database).
 """
 
 # api/services/binance_service.py
+from dataclasses import dataclass
 from importlib import import_module
 from django.conf import settings
-from django.core.cache import cache
 import logging
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class BinanceRuntimeConfig:
+    """Resolved Binance runtime configuration for one execution context."""
+
+    api_key: str
+    secret_key: str
+    use_testnet: bool
+    environment: str
+    mode: str
+    api_url: str
+
+    @property
+    def has_credentials(self) -> bool:
+        return bool(self.api_key and self.secret_key)
+
+
+def get_binance_runtime_config(use_testnet: bool = None) -> BinanceRuntimeConfig:
+    """
+    Resolve the effective Binance runtime configuration.
+
+    Args:
+        use_testnet: Optional override. When omitted, uses the canonical
+            settings-derived environment.
+    """
+    default_use_testnet = getattr(settings, "BINANCE_USE_TESTNET", True)
+    resolved_use_testnet = (
+        default_use_testnet if use_testnet is None else bool(use_testnet)
+    )
+
+    if resolved_use_testnet == default_use_testnet:
+        api_key = getattr(settings, "BINANCE_API_KEY_ACTIVE", "")
+        secret_key = getattr(settings, "BINANCE_SECRET_KEY_ACTIVE", "")
+        api_url = getattr(settings, "BINANCE_API_URL_ACTIVE", "")
+        environment = getattr(
+            settings,
+            "BINANCE_ENV",
+            "testnet" if resolved_use_testnet else "production",
+        )
+        mode = getattr(
+            settings,
+            "BINANCE_MODE",
+            "TESTNET" if resolved_use_testnet else "PRODUCTION",
+        )
+    else:
+        environment = "testnet" if resolved_use_testnet else "production"
+        mode = "TESTNET" if resolved_use_testnet else "PRODUCTION"
+        api_key = (
+            getattr(settings, "BINANCE_API_KEY_TEST", "")
+            if resolved_use_testnet
+            else getattr(settings, "BINANCE_API_KEY", "")
+        )
+        secret_key = (
+            getattr(settings, "BINANCE_SECRET_KEY_TEST", "")
+            if resolved_use_testnet
+            else getattr(settings, "BINANCE_SECRET_KEY", "")
+        )
+        api_url = (
+            getattr(settings, "BINANCE_API_URL_TEST", "")
+            if resolved_use_testnet
+            else getattr(settings, "BINANCE_API_URL_PROD", "")
+        )
+
+    return BinanceRuntimeConfig(
+        api_key=api_key,
+        secret_key=secret_key,
+        use_testnet=resolved_use_testnet,
+        environment=environment,
+        mode=mode,
+        api_url=api_url,
+    )
 
 
 def get_binance_credentials(use_testnet: bool = None) -> tuple[str, str, bool]:
@@ -26,17 +98,13 @@ def get_binance_credentials(use_testnet: bool = None) -> tuple[str, str, bool]:
     Returns:
         Tuple of (api_key, secret_key, is_testnet)
     """
-    if use_testnet is None:
-        use_testnet = getattr(settings, 'BINANCE_USE_TESTNET', True)
-    
-    if use_testnet:
-        api_key = settings.BINANCE_API_KEY_TEST
-        secret_key = settings.BINANCE_SECRET_KEY_TEST
-    else:
-        api_key = settings.BINANCE_API_KEY
-        secret_key = settings.BINANCE_SECRET_KEY
-    
-    return api_key, secret_key, use_testnet
+    runtime = get_binance_runtime_config(use_testnet)
+    return runtime.api_key, runtime.secret_key, runtime.use_testnet
+
+
+def has_binance_credentials(use_testnet: bool = None) -> bool:
+    """Return whether the effective runtime configuration has credentials."""
+    return get_binance_runtime_config(use_testnet).has_credentials
 
 
 class BinanceService:
@@ -67,8 +135,8 @@ class BinanceService:
             use_testnet: Override testnet setting. If None, uses settings.BINANCE_USE_TESTNET
         """
         # Determine mode from settings if not explicitly provided
-        if use_testnet is None:
-            use_testnet = getattr(settings, 'BINANCE_USE_TESTNET', True)
+        runtime = get_binance_runtime_config(use_testnet)
+        use_testnet = runtime.use_testnet
         
         # If mode changed, we need to reinitialize the client
         if BinanceService._current_testnet_mode is not None and BinanceService._current_testnet_mode != use_testnet:
@@ -82,11 +150,12 @@ class BinanceService:
     def client(self):
         """Lazy-initialize Binance client (uses class-level cache)."""
         if not BinanceService._client:
-            api_key, secret_key, is_testnet = get_binance_credentials(self.use_testnet)
+            runtime = get_binance_runtime_config(self.use_testnet)
             
-            if not api_key or not secret_key:
-                mode = "testnet" if is_testnet else "production"
-                raise RuntimeError(f'Binance API credentials not configured for {mode} mode')
+            if not runtime.has_credentials:
+                raise RuntimeError(
+                    f"Binance API credentials not configured for {runtime.environment} mode"
+                )
 
             # Resolve Client dynamically to respect test patching of `api.services.Client`
             services_pkg = import_module('api.services')
@@ -94,10 +163,12 @@ class BinanceService:
             if client_cls is None:
                 raise RuntimeError('Binance Client not available')
             
-            BinanceService._client = client_cls(api_key, secret_key, testnet=is_testnet)
-            
-            mode_str = "TESTNET" if is_testnet else "PRODUCTION"
-            logger.info(f"Binance client initialized in {mode_str} mode")
+            BinanceService._client = client_cls(
+                runtime.api_key,
+                runtime.secret_key,
+                testnet=runtime.use_testnet,
+            )
+            logger.info(f"Binance client initialized in {runtime.mode} mode")
 
         return BinanceService._client
     

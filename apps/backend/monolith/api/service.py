@@ -21,8 +21,9 @@ class BinanceService:
         """Singleton do cliente Binance"""
         if not self._client:
             self._client = Client(
-                settings.BINANCE_API_KEY_TEST, 
-                settings.BINANCE_SECRET_KEY_TEST
+                settings.BINANCE_API_KEY_ACTIVE,
+                settings.BINANCE_SECRET_KEY_ACTIVE,
+                testnet=settings.BINANCE_USE_TESTNET,
             )
         return self._client
     
