@@ -17,6 +17,10 @@ body {
   -webkit-font-smoothing: antialiased;
 }
 
+body.robson-chat-dock-active {
+  padding-bottom: 16rem;
+}
+
 /* Typography Overrides */
 h1, h2, h3, h4, h5, h6 {
   color: #fff;
@@ -101,4 +105,10 @@ a:hover {
 
 main {
   min-height: 80vh;
+}
+
+@media (max-width: 768px) {
+  body.robson-chat-dock-active {
+    padding-bottom: 14rem;
+  }
 }

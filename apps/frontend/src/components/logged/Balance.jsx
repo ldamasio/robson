@@ -1,9 +1,29 @@
 import React, { useState, useEffect, useContext } from "react";
-import { Card, Row, Col, Badge } from "react-bootstrap";
-import { Wallet2 } from "react-bootstrap-icons";
+import { Card, Badge } from "react-bootstrap";
 import axios from "axios";
 import AuthContext from "../../context/AuthContext";
 import LoadingSpinner from "../common/LoadingSpinner";
+
+function WalletGlyph() {
+  return (
+    <svg
+      aria-hidden="true"
+      viewBox="0 0 24 24"
+      width="24"
+      height="24"
+      fill="none"
+      stroke="currentColor"
+      strokeWidth="1.8"
+      strokeLinecap="round"
+      strokeLinejoin="round"
+      className="text-primary"
+    >
+      <path d="M3.5 7.5a2 2 0 0 1 2-2h11.5a2 2 0 0 1 2 2v9a2 2 0 0 1-2 2H5.5a2 2 0 0 1-2-2v-9Z" />
+      <path d="M17 10.5h3.5v3H17a1.5 1.5 0 0 1 0-3Z" />
+      <path d="M5 7.5 17.25 4.5" />
+    </svg>
+  );
+}
 
 function Balance() {
   const { authTokens } = useContext(AuthContext);
@@ -65,7 +85,7 @@ function Balance() {
         <div className="d-flex align-items-center justify-content-between mb-4">
           <div className="d-flex align-items-center">
             <div className="bg-primary bg-opacity-10 p-2 rounded-circle me-3">
-              <Wallet2 className="text-primary" size={24} />
+              <WalletGlyph />
             </div>
             <h5 className="text-light mb-0 fw-bold">Investment Wallet</h5>
           </div>
