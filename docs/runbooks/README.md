@@ -5,7 +5,7 @@
 ## Purpose
 
 Runbooks provide step-by-step instructions for:
-- **Deployment**: Production and preview environment deployments
+- **Deployment**: Production and shared staging deployments
 - **Troubleshooting**: Common issues and resolution steps
 - **Monitoring**: Observability and alerting procedures
 - **Incident Response**: Emergency procedures and escalation
@@ -87,9 +87,9 @@ If something goes wrong:
 
 | Scenario | Runbook | Time |
 |----------|---------|------|
-| Production deployment | [deployment.md](deployment.md#production) | 15 min |
-| Preview environment | [deployment.md](deployment.md#preview) | 5 min |
-| Rollback | [deployment.md](deployment.md#rollback) | 10 min |
+| Production deployment | [deployment-checklist.md](deployment-checklist.md) | 15 min |
+| Shared staging validation | [deployment-checklist.md](deployment-checklist.md) | 10 min |
+| Rollback / sync recovery | [argocd-initial-setup.md](argocd-initial-setup.md) | 10 min |
 
 ### Troubleshooting
 

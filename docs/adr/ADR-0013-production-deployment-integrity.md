@@ -257,7 +257,6 @@ Track quarterly:
 
 - **[Production Deployment Policy](../policies/PRODUCTION-DEPLOYMENT.md)** - Detailed operational policy
 - **[ADR-0011: GitOps Automatic Manifest Updates](ADR-0011-gitops-automatic-manifest-updates.md)** - Technical automation
-- **[ADR-0004: GitOps Preview Environments](ADR-0004-gitops-preview-envs.md)** - Preview environment workflow
 - **[ArgoCD Setup Runbook](../runbooks/argocd-initial-setup.md)** - Infrastructure setup
 - **[CI/CD Image Tagging](../runbooks/ci-cd-image-tagging.md)** - Image versioning workflow
 

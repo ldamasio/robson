@@ -7,6 +7,7 @@ Project Policy
 - When introducing a design pattern (e.g., Singleton, Factory, Strategy), add or update an ADR entry in this document.
 - For substantial or long‑form ADRs, create per‑ADR files under `docs/adr/` (e.g., `docs/adr/ADR-000X-<slug>.md`) and list them here.
 - Keep ADRs concise, actionable, and dated. Reference code paths and links to PRs when relevant.
+- This index tracks application decisions for Robson. Shared infrastructure decisions belong in the infrastructure repository, not here.
 
 ADR Template (inline)
 - Title: <short, imperative>
@@ -26,9 +27,6 @@ Index
 |----|-------|--------|------|
 | ADR-0001 | BinanceService Singleton | Accepted | 2024-11 |
 | ADR-0002 | Hexagonal Architecture | Accepted | 2024-11 |
-| ADR-0003 | Istio Ambient + Gateway API | Accepted | 2024-11 |
-| ADR-0004 | GitOps Preview Environments | Accepted | 2024-11 |
-| ADR-0005 | Ansible Bootstrap Hardening | Accepted | 2024-11 |
 | ADR-0006 | English-Only Codebase | Accepted | 2024-11 |
 | ADR-0007 | ParadeDB Primary Database | Accepted | 2024-12 |
 | ADR-0008 | DeepSeek Primary LLM | Accepted | 2024-12 |

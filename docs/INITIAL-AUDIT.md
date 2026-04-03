@@ -15,9 +15,8 @@ Robson Bot is a **production-ready cryptocurrency trading platform** with strong
 
 **Key Strengths**:
 - Well-documented hexagonal architecture vision with active migration
-- Comprehensive ADR-driven decision making (5 ADRs)
-- Modern tech stack (Django 5.2, React 18, K3s, Istio Ambient, ArgoCD)
-- GitOps-driven per-branch preview environments
+- Comprehensive ADR-driven decision making
+- Modern tech stack (Django 5.2, React 18, K3s, ArgoCD)
 - Strong testing foundation (1182 LOC backend tests)
 
 **Transformation Opportunities**:
@@ -45,13 +44,9 @@ robson/
 │   │   └── monolith/               # Django monolith (74+ files)
 │   └── frontend/                   # React 18 + Vite (47 files)
 ├── docs/                           # 15+ documentation files
-│   ├── adr/                        # 5 Architecture Decision Records
+│   ├── adr/                        # Architecture Decision Records
 │   ├── history/                    # Migration guides
-│   └── plan/infra/                 # Infrastructure plans
-├── infra/                          # Infrastructure as Code
-│   ├── ansible/                    # Node bootstrap (4 Contabo VPS)
-│   ├── k8s/                        # Platform components (Istio, ArgoCD)
-│   └── charts/                     # Helm charts (backend, frontend)
+│   └── plan/                       # Planning documents
 ├── .github/workflows/              # 4 CI/CD workflows
 ├── docker-compose.yml              # Local development stack
 └── Makefile                        # Development automation
@@ -68,11 +63,9 @@ robson/
 | **Async** | Gevent + aiohttp | - | 1000 concurrent connections |
 | **Container** | Docker | - | Multi-stage builds |
 | **Orchestration** | Kubernetes | k3s | 4-node Contabo cluster |
-| **Service Mesh** | Istio | Ambient | Sidecarless mTLS |
-| **Ingress** | Gateway API | v1.1.0 | Istio GatewayClass |
+| **Ingress** | Traefik | - | Cluster ingress controller |
 | **TLS** | cert-manager | - | Let's Encrypt HTTP-01 |
-| **GitOps** | ArgoCD | - | Per-branch previews |
-| **Config** | Ansible | - | Node bootstrap + hardening |
+| **GitOps** | ArgoCD | - | Declarative deployments |
 | **Exchange** | Binance | python-binance 1.0.16 | Spot trading |
 
 ### 1.3 Metrics
@@ -199,7 +192,7 @@ core/
 | `docs/STYLE_GUIDE.md` | - | ⚠️ Referenced only | Content not visible in scan |
 | `apps/backend/README.md` | - | ✅ Good | Backend layout |
 | `apps/frontend/README.md` | - | ✅ Good | Frontend setup |
-| `infra/README.md` | - | ✅ Excellent | Infrastructure overview |
+| `docs/infra/K3S-CLUSTER-GUIDE.md` | - | ✅ Good | Cluster operations guide |
 
 ### 3.2 Architecture Decision Records
 
@@ -207,9 +200,6 @@ core/
 |-----|-------|--------|---------|
 | 0001 | Binance Service Singleton | Accepted | ✅ Well-documented |
 | 0002 | Hexagonal Architecture | Accepted | ✅ Comprehensive |
-| 0003 | Istio Ambient + Gateway API | Accepted | ✅ Forward-thinking |
-| 0004 | GitOps Preview Environments | Accepted | ✅ DevOps best practice |
-| 0005 | Ansible Bootstrap Hardening | Accepted | ✅ Security-focused |
 | TEMPLATE | ADR Template | - | ✅ Clear structure |
 
 **Assessment**: Excellent ADR practice. All major decisions are documented with context, alternatives, and consequences.
@@ -269,7 +259,7 @@ core/
 - ✅ GitHub Actions workflow (`backend-tests.yml`)
 - ✅ PostgreSQL 16 test database with health checks
 - ✅ Environment isolation (testnet, trading disabled)
-- ✅ Runs on all branches (enables preview testing)
+- ✅ Runs on all branches
 
 **Strengths**:
 - Good test LOC coverage for critical business logic
@@ -401,7 +391,7 @@ core/
 - Parallel workflows for backend/frontend
 - Database service isolation
 - Caching for dependency installation
-- Runs on all branches (enables preview testing)
+- Runs on all branches
 
 **Gaps**:
 - ❌ No linting/formatting checks
@@ -415,16 +405,15 @@ core/
 
 ### 6.2 GitOps & Deployment
 
-**ArgoCD ApplicationSet**:
-- ✅ Per-branch preview environments
-- ✅ Branch name normalization (`h-<branch>`)
+**ArgoCD Workflow**:
+- ✅ Declarative application deployment
 - ✅ Auto-sync enabled
-- ✅ Deletion triggers cleanup
+- ✅ Git-based audit trail
 
 **Deployment Strategy**:
 - Docker images tagged with `<branch>-<sha>`
 - Helm charts with templated image tags
-- Gateway API for traffic routing
+- Traefik ingress for traffic routing
 - cert-manager for automated TLS
 
 **Gaps**:
@@ -441,15 +430,13 @@ core/
 
 **Platform**:
 - k3s on 4 Contabo VPS nodes (bengal, eagle, pantera, tiger)
-- Istio Ambient Mode (sidecarless service mesh with mTLS)
-- Gateway API v1.1.0 (future-proof ingress)
+- Traefik ingress controller
 - cert-manager (Let's Encrypt HTTP-01 solver)
 - ArgoCD (GitOps controller)
 - external-dns (optional, for dynamic DNS)
 
 **Strengths**:
-- ✅ Modern service mesh (Istio Ambient)
-- ✅ Future-proof ingress (Gateway API vs. legacy Ingress)
+- ✅ Standard ingress + TLS automation
 - ✅ Automated TLS (cert-manager)
 - ✅ GitOps-driven (ArgoCD)
 
@@ -462,32 +449,14 @@ core/
 - ❌ No disaster recovery plan
 - ❌ No load balancing strategy documented
 
-### 7.2 Ansible Automation
+### 7.2 Shared Infrastructure Automation
 
-**Purpose**: Node bootstrap + hardening
-
-**Implemented**:
-- ✅ SSH hardening
-- ✅ UFW firewall
-- ✅ Admin user creation
-- ✅ k3s installation + cluster join
-
-**Strengths**:
-- Clean role organization
-- Encrypted variables (Ansible Vault)
-- Host-specific configuration
-
-**Gaps**:
-- ❌ No automated backup/restore procedures
-- ❌ No monitoring agent installation
-- ❌ No log aggregation setup
+**Scope note**: bootstrap and host hardening automation are no longer part of the Robson application repository. That work now belongs in the shared infrastructure repository.
 
 ### 7.3 Security
 
 **Implemented**:
-- ✅ SSH hardening (Ansible)
 - ✅ UFW firewall rules
-- ✅ Istio mTLS (Ambient Mode)
 - ✅ Let's Encrypt TLS certificates
 - ✅ JWT authentication (backend)
 
@@ -707,7 +676,7 @@ core/
     - Backstage developer portal
     - Service catalog
     - API catalog
-    - Self-service preview environments
+    - Shared operational tooling
 
 15. **Performance Engineering**:
     - Define SLAs, SLOs, SLIs
@@ -757,7 +726,7 @@ Robson Bot is a **professional, production-ready platform** with strong engineer
 - ✅ Comprehensive documentation (ADRs, developer guides)
 - ✅ Solid DevOps practices (GitOps, IaC, CI/CD)
 - ✅ Good testing foundation (1182 backend test LOC)
-- ✅ Forward-thinking infrastructure (Istio Ambient, Gateway API)
+- ✅ Clear application and operations separation
 
 The transformation to **AI-First** is straightforward due to:
 - English-only codebase (all source files)
@@ -777,7 +746,7 @@ The transformation to **AI-First** is straightforward due to:
 
 The repository is well-positioned to become a **reference implementation** for:
 - Hexagonal architecture in Python
-- GitOps-driven per-branch previews
+- GitOps-driven application delivery
 - Multi-tenant cryptocurrency trading platforms
 - AI-assisted fintech development
 

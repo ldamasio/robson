@@ -123,8 +123,10 @@ k3s Cluster (Contabo VPS)
 │   ├── Deployment: rag-indexer (Ingestion)
 │   ├── Service: redis (Queue)
 │   └── CronJob: rag-batch-indexer (Daily)
-├── Namespace: istio-system
-│   └── Istio Ambient (mTLS, Gateway API)
+├── Namespace: kube-system
+│   └── Traefik (Ingress)
+├── Namespace: cert-manager
+│   └── cert-manager (TLS automation)
 └── Namespace: argocd
     └── ArgoCD (GitOps)
 ```

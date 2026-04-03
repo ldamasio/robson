@@ -530,15 +530,14 @@ Closes #123
 4. **Approval**: At least one maintainer approval required
 5. **Merge**: Squash and merge (default) or rebase
 
-### Preview Environment
+### Validation Flow
 
-Every PR automatically gets a preview environment:
-- **URL**: `https://h-<branch-name>.preview.robsonbot.com`
-- **Created**: On PR creation
-- **Updated**: On each push
-- **Deleted**: When PR is closed/merged
+Every PR must pass the standard validation path:
+- **Local checks**: run the relevant tests and linters before pushing
+- **CI**: automated checks run on PR creation and on each push
+- **Shared staging**: maintainers may validate changes in a shared environment when integration testing is needed
 
-Use this to test your changes in a production-like environment.
+Use this flow to confirm changes before requesting merge.
 
 ---
 

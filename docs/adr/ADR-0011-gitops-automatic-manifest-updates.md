@@ -125,11 +125,9 @@ GitHub Actions: Smoke test production
 
 - [CI/CD Image Tagging Runbook](../runbooks/ci-cd-image-tagging.md)
 - [ArgoCD Setup Runbook](../runbooks/argocd-initial-setup.md)
-- [ADR-0004: GitOps Preview Environments](ADR-0004-gitops-preview-envs.md)
 
 ## References
 
 - [GitHub Actions: Pushing to protected branches](https://docs.github.com/en/actions/using-workflows/workflow-syntax-for-github-actions#permissions)
 - [ArgoCD Auto-Sync](https://argo-cd.readthedocs.io/en/stable/user-guide/auto_sync/)
 - [GitOps Principles](https://www.gitops.tech/)
-

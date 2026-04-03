@@ -49,7 +49,7 @@ New to Robson Bot? Start here:
 ### For Infrastructure Engineers
 
 - **Setup**: [setup.md#infrastructure](setup.md#infrastructure-setup)
-- **K8s Guide**: [../../infra/README.md](../../infra/README.md)
+- **K8s Guide**: [../infra/K3S-CLUSTER-GUIDE.md](../infra/K3S-CLUSTER-GUIDE.md)
 - **ADRs**: [../adr/](../adr/)
 
 ## Development Principles
@@ -126,14 +126,13 @@ docker build -f apps/backend/monolith/Dockerfile -t robson-backend .
 docker build -f apps/frontend/Dockerfile -t robson-frontend .
 ```
 
-### Deploy to Preview Environment
+### Deploy to Shared Staging
 
 ```bash
 # Push to branch
 git push origin feature/my-feature
 
-# ArgoCD auto-creates preview at:
-# https://h-feature-my-feature.preview.robsonbot.com
+# If integration validation is needed, ask a maintainer to sync shared staging
 ```
 
 ## Development Workflow
@@ -145,7 +144,7 @@ git push origin feature/my-feature
 5. **Implement**: Write code
 6. **Validate**: Run tests + linting
 7. **Commit**: Use Conventional Commits
-8. **Push**: Triggers CI + preview deployment
+8. **Push**: Triggers CI
 9. **Create PR**: Use PR template
 10. **Review**: Address feedback
 11. **Merge**: Squash and merge
@@ -237,7 +236,7 @@ We welcome contributions! Please:
 ### Kubernetes
 
 - [Kubernetes Patterns](https://k8spatterns.io/)
-- [Gateway API](https://gateway-api.sigs.k8s.io/)
+- [Traefik Documentation](https://doc.traefik.io/traefik/)
 
 ---
 

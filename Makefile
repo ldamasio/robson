@@ -129,7 +129,7 @@ dev-reset-api:
 # K9s Helpers (Kubernetes Terminal UI)
 # ==============================
 
-.PHONY: k9s k9s-ns k9s-preview
+.PHONY: k9s k9s-ns
 
 k9s:
 	@echo "🚀 Launching K9s with current kubeconfig context..."
@@ -144,15 +144,6 @@ k9s-ns:
 	fi
 	@echo "🚀 Launching K9s for namespace: $(NAMESPACE)"
 	@./infra/scripts/k9s-ns.sh "$(NAMESPACE)"
-
-k9s-preview:
-	@if [ -z "$(BRANCH)" ]; then \
-		echo "❌ Error: BRANCH is required."; \
-		echo "   Usage: make k9s-preview BRANCH=<branch-name>"; \
-		exit 1; \
-	fi
-	@echo "🚀 Launching K9s for preview environment: $(BRANCH)"
-	@./infra/scripts/k9s-preview.sh "$(BRANCH)"
 
 # ==============================
 # AI Governance Validation

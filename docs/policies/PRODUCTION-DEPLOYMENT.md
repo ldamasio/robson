@@ -317,7 +317,6 @@ ArgoCD detects drift automatically:
 ## Related Documentation
 
 - **[ADR-0011](../adr/ADR-0011-gitops-automatic-manifest-updates.md)**: GitOps Automatic Manifest Updates
-- **[ADR-0004](../adr/ADR-0004-gitops-preview-environments.md)**: GitOps Preview Environments
 - **[DEVELOPER.md](../DEVELOPER.md)**: Development workflow
 - **[CLAUDE.md](../CLAUDE.md)**: Quick reference for AI assistants
 

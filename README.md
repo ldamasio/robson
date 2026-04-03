@@ -189,11 +189,11 @@ just info           # environment info
 
 ## Deployment
 
-Production deployments are performed via GitOps (GitHub Actions + ArgoCD + k3s) using Istio Ambient Mode with Gateway API. Each non-main branch creates a staging environment at `h-<branch>.robson.rbx.ia.br`.
+Production deployments are performed via GitOps (GitHub Actions + ArgoCD + k3s) with Traefik ingress and cert-manager-managed TLS. Shared infrastructure automation belongs outside this repository; this repository focuses on the Robson application.
 
 The `./bin/dj` script and `docker-compose.dev.yml` are for local development only.
 
-See `infra/README.md` for deployment details.
+See `docs/infra/K3S-CLUSTER-GUIDE.md` and `docs/runbooks/argocd-initial-setup.md` for deployment details.
 
 ## Contributing
 

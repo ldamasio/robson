@@ -144,7 +144,7 @@ C4Container
 | **Message Bus** | (Future: RabbitMQ/Kafka) | Event-driven communication |
 | **Container** | Docker | Containerization |
 | **Orchestration** | Kubernetes (k3s) | Deployment, scaling |
-| **Service Mesh** | Istio Ambient | mTLS, traffic management |
+| **Ingress** | Traefik | Routing, TLS termination |
 | **GitOps** | ArgoCD | Continuous deployment |
 
 ---
@@ -227,9 +227,6 @@ robson/                                 # Repository root
 │   ├── adr/                            # Architecture Decision Records
 │   │   ├── ADR-0001-binance-service-singleton.md
 │   │   ├── ADR-0002-hexagonal-architecture.md
-│   │   ├── ADR-0003-istio-ambient-gateway-api.md
-│   │   ├── ADR-0004-gitops-preview-envs.md
-│   │   ├── ADR-0005-ansible-bootstrap-hardening.md
 │   │   └── ADR-0006-english-only-codebase.md
 │   ├── specs/                          # Specifications
 │   │   ├── features/                   # Feature specs
@@ -655,7 +652,7 @@ sequenceDiagram
     CI->>GH: Update status
     Argo->>GH: Poll for changes
     Argo->>Argo: Detect new commit
-    Argo->>K8s: Deploy to preview namespace
+    Argo->>K8s: Sync target namespace
     Argo->>K8s: Create/update resources
     K8s->>K8s: Rolling update
 ```
@@ -664,23 +661,18 @@ sequenceDiagram
 
 | Environment | Trigger | Namespace | URL Pattern |
 |-------------|---------|-----------|-------------|
-| **Preview** | Any branch push | `h-<branch>` | `https://h-<branch>.preview.robsonbot.com` |
-| **Staging** | Merge to `develop` | `staging` | `https://staging.robsonbot.com` |
+| **Staging** | Maintainer-triggered sync | `staging` | Shared staging host |
 | **Production** | Tag `v*.*.*` | `production` | `https://robsonbot.com` |
 
-### Preview Environments
+### Shared Environment Validation
 
-**Every branch** gets its own environment:
+When integration validation is needed:
 
 1. Push to branch `feature/new-indicator`
 2. CI builds Docker images tagged `feature-new-indicator-abc123`
-3. ArgoCD ApplicationSet detects new branch
-4. Creates namespace `h-feature-new-indicator`
-5. Deploys backend + frontend + PostgreSQL
-6. Issues TLS certificate via cert-manager
-7. Available at `https://h-feature-new-indicator.preview.robsonbot.com`
-
-**Cleanup**: ArgoCD deletes namespace when branch is deleted.
+3. Open a PR and wait for CI to pass
+4. If needed, a maintainer syncs the shared staging environment
+5. Validate the deployed behavior in staging before merge
 
 ### Manual Deployment (Emergency)
 
@@ -766,24 +758,6 @@ All major decisions are documented in [Architecture Decision Records](adr/):
 **Decision**: Adopt hexagonal (ports & adapters) architecture
 **Rationale**: Decouple business logic from frameworks, enable testing without Django
 **Migration**: Gradual migration from monolith to hexagonal core
-
-### ADR-0003: Istio Ambient + Gateway API
-
-**Decision**: Use Istio Ambient Mode with Gateway API (vs. traditional Ingress)
-**Rationale**: Sidecarless service mesh (lower overhead), Gateway API is future-proof
-**Trade-off**: Cutting-edge tech, less mature than traditional Ingress
-
-### ADR-0004: GitOps Preview Environments
-
-**Decision**: Per-branch preview environments via ArgoCD ApplicationSet
-**Rationale**: Enable testing in production-like environment before merge
-**Benefit**: 10x faster feedback loop, reduces production bugs
-
-### ADR-0005: Ansible Bootstrap & Hardening
-
-**Decision**: Use Ansible for node provisioning and security hardening
-**Rationale**: Repeatable, auditable infrastructure setup
-**Security**: SSH hardening, UFW firewall, automated k3s installation
 
 ### ADR-0006: English-Only Codebase
 
@@ -944,13 +918,10 @@ Implement my feature with risk validation.
 
 Closes #123"
 
-# 4. Push (triggers CI + preview environment)
+# 4. Push (triggers CI)
 git push origin feature/my-feature
 
-# 5. Preview environment auto-created
-# https://h-feature-my-feature.preview.robsonbot.com
-
-# 6. Create PR on GitHub
+# 5. Create PR on GitHub
 gh pr create --title "feat: my feature" --body "Description"
 
 # 7. Address review feedback, merge
@@ -1056,18 +1027,15 @@ const WS_URL = import.meta.env.VITE_WS_URL || 'ws://localhost:8000/ws';
 
 ### Deployment Issues
 
-**Problem**: ArgoCD not syncing preview environment
+**Problem**: ArgoCD not syncing the target application
 
 **Solution**:
 ```bash
-# Check ApplicationSet
-kubectl get applicationset -n argocd
-
-# Check generated Applications
-kubectl get applications -n argocd | grep h-
+# Check ArgoCD applications
+kubectl get applications -n argocd
 
 # Force sync
-argocd app sync h-feature-my-feature
+argocd app sync <app-name>
 
 # Check logs
 kubectl logs -n argocd deployment/argocd-application-controller

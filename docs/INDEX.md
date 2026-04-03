@@ -100,16 +100,12 @@ docs/
 - [Production Deployment Policy](policies/PRODUCTION-DEPLOYMENT.md) - **CRITICAL**: GitOps-only deployments
 
 **Deployment**:
-- [Infrastructure README](../infra/README.md) - Infrastructure overview
 - [K3s Cluster Guide](infra/K3S-CLUSTER-GUIDE.md) - k3s deployment guide
 - [Deployment Checklist](runbooks/deployment-checklist.md) - Deployment procedures
 - [ArgoCD Setup](runbooks/argocd-initial-setup.md) - ArgoCD configuration
 - [CI/CD Image Tagging](runbooks/ci-cd-image-tagging.md) - Image versioning
 
 **Infrastructure**:
-- [ADR-0003: Istio Ambient](adr/ADR-0003-istio-ambient-gateway-api.md)
-- [ADR-0004: GitOps Previews](adr/ADR-0004-gitops-preview-envs.md)
-- [ADR-0005: Ansible Bootstrap](adr/ADR-0005-ansible-bootstrap-hardening.md)
 - [ADR-0011: GitOps Auto-Deploy](adr/ADR-0011-gitops-automatic-manifest-updates.md)
 
 ### For **AI Agents**
@@ -198,7 +194,7 @@ docs/
 | **ArgoCD Setup** | [runbooks/argocd-initial-setup.md](runbooks/argocd-initial-setup.md) |
 | **CI/CD & Image Tagging** | [runbooks/ci-cd-image-tagging.md](runbooks/ci-cd-image-tagging.md) |
 | **Deployment Checklist** | [runbooks/deployment-checklist.md](runbooks/deployment-checklist.md) |
-| **Infrastructure** | [../infra/README.md](../infra/README.md) |
+| **Runbooks Overview** | [runbooks/README.md](runbooks/README.md) |
 | **First Leveraged Position** | [operations/2025-12-24-first-leveraged-position.md](operations/2025-12-24-first-leveraged-position.md) |
 | **Isolated Margin SHORT (BTCUSDC)** | [operations/2026-01-05-isolated-margin-short-btcusdc.md](operations/2026-01-05-isolated-margin-short-btcusdc.md) |
 
@@ -256,11 +252,10 @@ Robson Bot is optimized for AI-assisted development:
 ### Path 3: New DevOps Engineer
 
 1. [Production Deployment Policy](policies/PRODUCTION-DEPLOYMENT.md) ⚠️ **READ FIRST**
-2. [Infrastructure Overview](../infra/README.md)
-3. [K3s Cluster Guide](infra/K3S-CLUSTER-GUIDE.md)
-4. [ADR-0011: GitOps Auto-Deploy](adr/ADR-0011-gitops-automatic-manifest-updates.md)
-5. [ADR-0004: GitOps Previews](adr/ADR-0004-gitops-preview-envs.md)
-6. [ArgoCD Setup](runbooks/argocd-initial-setup.md)
+2. [K3s Cluster Guide](infra/K3S-CLUSTER-GUIDE.md)
+3. [ADR-0011: GitOps Auto-Deploy](adr/ADR-0011-gitops-automatic-manifest-updates.md)
+4. [ArgoCD Setup](runbooks/argocd-initial-setup.md)
+5. [Deployment Checklist](runbooks/deployment-checklist.md)
 
 ### Path 4: Understanding Architecture
 
@@ -279,7 +274,7 @@ Robson Bot is optimized for AI-assisted development:
 - [Django REST Framework](https://www.django-rest-framework.org/)
 
 ### Kubernetes
-- [Gateway API](https://gateway-api.sigs.k8s.io/)
+- [Traefik Documentation](https://doc.traefik.io/traefik/)
 
 ### GitOps
 - [ArgoCD Documentation](https://argo-cd.readthedocs.io/)

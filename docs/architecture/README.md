@@ -122,9 +122,6 @@ Major decisions are documented in ADRs:
 |----------|-----|--------|
 | Hexagonal Architecture | [ADR-0002](../adr/ADR-0002-hexagonal-architecture.md) | Accepted |
 | Binance Service Singleton | [ADR-0001](../adr/ADR-0001-binance-service-singleton.md) | Accepted |
-| Istio Ambient + Gateway API | [ADR-0003](../adr/ADR-0003-istio-ambient-gateway-api.md) | Accepted |
-| GitOps Preview Environments | [ADR-0004](../adr/ADR-0004-gitops-preview-envs.md) | Accepted |
-| Ansible Bootstrap | [ADR-0005](../adr/ADR-0005-ansible-bootstrap-hardening.md) | Accepted |
 
 See [../adr/](../adr/) for all ADRs.
 
@@ -138,8 +135,7 @@ See [../adr/](../adr/) for all ADRs.
 | **Async** | Gevent + aiohttp | Non-blocking I/O for high concurrency |
 | **Container** | Docker | Standard containerization |
 | **Orchestration** | Kubernetes (k3s) | Production-grade, cloud-native |
-| **Service Mesh** | Istio Ambient | Sidecarless, automatic mTLS |
-| **Ingress** | Gateway API | Future-proof, Kubernetes standard |
+| **Ingress** | Traefik | Existing ingress controller for routing and TLS termination |
 | **GitOps** | ArgoCD | Declarative, auditable deployments |
 
 See [tech-stack.md](tech-stack.md) for complete details.
@@ -173,7 +169,7 @@ See [data-flow.md](data-flow.md) for all flows.
 
 ### Defense in Depth
 
-1. **Network**: Istio mTLS between services
+1. **Network**: Kubernetes service isolation and controlled ingress via Traefik
 2. **Transport**: TLS 1.3 for external traffic (Let's Encrypt)
 3. **Authentication**: JWT tokens with refresh
 4. **Authorization**: Role-based access control
@@ -188,9 +184,9 @@ See [security-model.md](security-model.md) for threat model and controls.
 
 ```
 ┌─────────────────────────────────────────────────────┐
-│ Istio Gateway (Gateway API)                         │
-│ ├─ TLS Termination (cert-manager)                   │
-│ └─ HTTP Routing (HTTPRoute)                         │
+│ Traefik Ingress                                     │
+│ ├─ TLS Termination                                  │
+│ └─ HTTP Routing                                     │
 └──────────────────┬──────────────────────────────────┘
                    │
        ┌───────────┴────────────┐

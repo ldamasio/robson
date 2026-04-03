@@ -569,7 +569,7 @@ Every action is logged:
 
 ### Alternative 2: Full Service Mesh (Istio/Linkerd) (DEFERRED)
 
-**Approach**: Deploy full service mesh with mTLS, traffic splitting, observability
+**Approach**: Deploy a full cluster networking stack with mTLS, traffic splitting, and deeper observability
 
 **Deferred because**:
 - Overkill for current scale (10 services, 1 cluster)
@@ -591,7 +591,6 @@ Every action is logged:
 ## References
 
 - [ADR-0015: Rust Stop Engine and RabbitMQ Architecture](ADR-0015-rust-stop-engine-rabbitmq.md)
-- [ADR-0003: Istio Ambient + Gateway API](ADR-0003-istio-ambient-gateway-api.md) (future service mesh)
 - [Traefik Middlewares Documentation](https://doc.traefik.io/traefik/middlewares/overview/)
 - [Kubernetes NetworkPolicy Documentation](https://kubernetes.io/docs/concepts/services-networking/network-policies/)
 - [RabbitMQ Access Control](https://www.rabbitmq.com/access-control.html)

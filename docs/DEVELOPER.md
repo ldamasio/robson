@@ -337,7 +337,7 @@ Coding Style
 
 Kubernetes Tooling (Optional)
 - **K9s** (terminal UI for Kubernetes):
-  - Recommended for developers who interact with deployed environments (staging, preview, production).
+  - Recommended for developers who interact with deployed environments (staging, production).
   - Used for cluster inspection, pod debugging, and log tailing.
-  - See [../infra/K9S-OPERATIONS.md](../infra/K9S-OPERATIONS.md) for installation and workflows.
+  - Use alongside the cluster and ArgoCD runbooks in `docs/infra/` and `docs/runbooks/`.
   - Note: K9s is read-mostly; permanent changes must go through GitOps (not manual edits).

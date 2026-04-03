@@ -206,19 +206,14 @@ curl http://localhost:8000/api/
 
 ---
 
-## Phase 8: Ingress/Gateway (If Configured)
+## Phase 8: Ingress (If Configured)
 
 ### Check Ingress Resources
-- [ ] Gateway resources created
-- [ ] HTTPRoute resources created
+- [ ] Ingress resources created
 - [ ] DNS pointing to correct IP
 
 ```bash
-# Check Gateway API resources
-kubectl get gateway -n robson
-kubectl get httproute -n robson
-
-# Or traditional Ingress
+# Check Ingress resources
 kubectl get ingress -n robson
 ```
 

@@ -516,9 +516,8 @@ describe('MyComponent', () => {
 - Axios 1.1 (HTTP client)
 
 **Infrastructure**:
-- k3s (Kubernetes), Istio Ambient (service mesh)
+- k3s (Kubernetes), Traefik (ingress)
 - ArgoCD (GitOps), cert-manager (TLS)
-- Ansible (node provisioning)
 - K9s (terminal UI for cluster operations, read-mostly debugging)
 
 ---
@@ -529,10 +528,7 @@ Read full context in `docs/adr/`:
 
 1. **ADR-0001**: Binance Service Singleton (rate limit handling)
 2. **ADR-0002**: Hexagonal Architecture (framework independence)
-3. **ADR-0003**: Istio Ambient + Gateway API (sidecarless mesh)
-4. **ADR-0004**: GitOps Preview Environments (per-branch testing)
-5. **ADR-0005**: Ansible Bootstrap (automated hardening)
-6. **ADR-0006**: English-Only Codebase (international positioning)
+3. **ADR-0006**: English-Only Codebase (international positioning)
 
 ---
 
@@ -570,14 +566,12 @@ Implement automatic stop-loss order execution.
 
 Closes #123"
 
-# 5. Push (triggers CI + preview environment)
+# 5. Push (triggers CI)
 git push origin feature/my-feature
 
 # 6. Create PR
 gh pr create --title "feat: stop-loss orders"
 
-# 7. Preview available at:
-# https://h-feature-my-feature.preview.robsonbot.com
 ```
 
 ---
@@ -693,7 +687,6 @@ kubectl logs -f pod/name             # View logs
 argocd app sync robson-backend       # Force sync
 make k9s                             # Launch K9s (terminal UI)
 make k9s-ns NAMESPACE=<name>         # K9s for specific namespace
-make k9s-preview BRANCH=<branch>     # K9s for preview environment
 
 # Stop Monitor CronJob
 kubectl get cronjob -n robson                              # List CronJobs

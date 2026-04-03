@@ -228,11 +228,6 @@ k9s-ns NAMESPACE:
     @echo "🚀 Launching K9s for namespace: {{NAMESPACE}}"
     ./infra/scripts/k9s-ns.sh "{{NAMESPACE}}"
 
-# Launch K9s for preview environment
-k9s-preview BRANCH:
-    @echo "🚀 Launching K9s for preview: {{BRANCH}}"
-    ./infra/scripts/k9s-preview.sh "{{BRANCH}}"
-
 # ============================================================================
 # Documentation
 # ============================================================================

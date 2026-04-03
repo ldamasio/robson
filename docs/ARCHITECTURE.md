@@ -64,11 +64,10 @@ Migration guidelines:
 2) Define ports in `core/application` for persistence, market data, messaging, etc.
 3) Implement adapters in `core/adapters/*` and wire them in `core/wiring`.
 4) Make REST/WS call use cases only (no domain logic in views).
-5) Keep migrations and infra in `infra/` or adapter-specific folders.
-Platform: Istio Ambient + Gateway API
+5) Keep migrations and deployment notes close to the application or in the dedicated infrastructure repository.
+Platform: k3s + Traefik + ArgoCD
 
-- Service mesh: Istio Ambient (sidecarless) with mTLS default; namespaces opt-in via labels.
-- Ingress: Gateway API resources (`Gateway`, `HTTPRoute`) with GatewayClass `istio`.
-- DNS and TLS: external-dns manages `*.robson.rbx.ia.br`; cert-manager issues certificates referenced by Gateways.
-- Per-branch previews: for every non-main branch, deploy to namespace `h-<branch>` and host `h-<branch>.robson.rbx.ia.br` via ArgoCD ApplicationSet.
-
+- Ingress: Traefik routes external traffic to Robson services.
+- TLS: cert-manager issues and renews certificates for application hosts.
+- GitOps: production deployment remains declarative via GitHub Actions + ArgoCD.
+- Scope: shared infrastructure bootstrap and cross-project platform automation are intentionally outside this repository.
