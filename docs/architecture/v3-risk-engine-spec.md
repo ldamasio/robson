@@ -369,6 +369,8 @@ If dynamic computation fails OR data is stale:
 
 The Safety Net is a SEPARATE monitoring process that runs independently of the Risk Engine. It is defense-in-depth.
 
+In v3, this is implemented as a long-lived Rust task or dedicated worker process, not as a Django CronJob. The v3 desired state does not include Django execution CronJobs.
+
 ### Purpose
 
 Detect and close "rogue positions" — positions on Binance that were NOT opened by Robson.
@@ -395,6 +397,7 @@ Every 60 seconds:
 - Safety Net writes to EventLog but does NOT read from it (uses exchange as source of truth)
 - If Risk Engine is down, Safety Net still operates
 - If Safety Net is down, Risk Engine still operates
+- Safety Net is restarted by Kubernetes/runtime supervision, not by periodic CronJob scheduling
 
 ---
 

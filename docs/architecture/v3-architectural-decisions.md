@@ -22,10 +22,11 @@
 - Python asyncio could achieve it but loses Rust's type safety on Decimal arithmetic and ownership guarantees on concurrent state
 - Go is viable but the v2 Rust codebase is already 85% complete — rewriting is waste
 - Rust's type system enforces the GovernedAction pattern at compile time (no runtime bypass possible)
+- v3 needs a single execution authority; leaving Django CronJobs in parallel creates ambiguity and double-execution risk
 
 **Breaks if wrong**: If the Rust codebase becomes unmaintainable for a solo operator (Rust's learning curve, borrow checker friction on rapid iteration), development velocity drops. Mitigation: freeze the Rust binary at a stable point, add new features via Python sidecar communicating over gRPC. This preserves the performance-critical execution path while allowing rapid iteration on non-critical features.
 
-**Reversibility**: Partially reversible. Can always re-enable Django CronJob as fallback. Cannot easily port Rust type system guarantees back to Python.
+**Reversibility**: Partially reversible. Rollback means restoring the legacy runtime as a mutually exclusive path, not running Django CronJobs in parallel with robsond. Cannot easily port Rust type system guarantees back to Python.
 
 ---
 

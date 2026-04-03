@@ -442,7 +442,7 @@ Layer 6: Data (encryption at rest, audit logging)
 - If criticws fails: Execution continues via RabbitMQ
 - If ws fails: UI shows error, execution continues
 - If Prometheus fails: No metrics, but execution continues
-- If RabbitMQ fails: Python CronJob backstop executes within 5 minutes
+- If RabbitMQ fails: execution must degrade to a mutually exclusive fallback or halt safely; no parallel Python CronJob backstop should exist in the v3 desired state
 
 ### 4. **Separation of Concerns**
 

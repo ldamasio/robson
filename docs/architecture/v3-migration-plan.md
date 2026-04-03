@@ -69,7 +69,9 @@ Robson operates from Baar/Zug under Swiss jurisdiction:
 
 ## 1. EXECUTIVE SUMMARY
 
-Robson currently exists as two parallel implementations: a Django monolith (v1, live in production on k3s) and a Rust system (v2, architecturally superior, 12 crates, ~21K LOC, not yet deployed). The v1 system has accumulated 31 Django migrations, event-sourced stop monitoring, a 3-level audit trail, margin trading, pattern detection, and an agentic workflow (PLAN->VALIDATE->EXECUTE). The v2 system implements the correct architecture — pure domain layer, event sourcing with ULID ordering, trailing stop engine, risk gate, idempotent executor with intent journal, Binance REST+WS connectors, and a daemon with HTTP API — but has incomplete projections (40%) and no backtesting. The migration path is: v2.5 deploys the Rust daemon alongside the Django monolith as the execution engine (stop monitoring, trailing stops, position lifecycle), while Django continues serving the API, frontend, and pattern engine; v3 promotes the Rust daemon to the primary runtime, replaces Django with a thin API gateway, and the React frontend connects directly to the daemon's event stream. The single most important architectural decision is that the Rust Runtime (robsond) becomes the sole guardian of execution — no context reaches the model, no tool executes, no order places without passing through its governance pipeline. Every other decision flows from this.
+Robson currently exists as two parallel implementations: a Django monolith (v1, live in production on k3s) and a Rust system (v2, architecturally superior, 12 crates, ~21K LOC, not yet deployed). The v1 system has accumulated 31 Django migrations, event-sourced stop monitoring, a 3-level audit trail, margin trading, pattern detection, and an agentic workflow (PLAN->VALIDATE->EXECUTE). The v2 system implements the correct architecture — pure domain layer, event sourcing with ULID ordering, trailing stop engine, risk gate, idempotent executor with intent journal, Binance REST+WS connectors, and a daemon with HTTP API — but has incomplete projections (40%) and no backtesting. The migration path is: v2.5 deploys the Rust daemon alongside the Django monolith, with Django continuing to serve the API, frontend, and pattern engine while the Rust runtime assumes execution responsibilities. Once the Rust path is validated in production, the v1 execution CronJobs are disabled and removed from desired state. v3 then promotes the Rust daemon to the primary runtime, replaces Django with a thin API gateway, and the React frontend connects directly to the daemon's event stream. The single most important architectural decision is that the Rust Runtime (robsond) becomes the sole guardian of execution — no context reaches the model, no tool executes, no order places without passing through its governance pipeline. Every other decision flows from this.
+
+In the v3 desired state there are no Django execution CronJobs. Critical monitoring moves to long-lived Rust runtime components such as the Control Loop, Safety Net, and reconciliation workers. Kubernetes CronJobs remain acceptable only for non-critical maintenance jobs such as retention, backfills, or report generation.
 
 ---
 
@@ -610,6 +612,8 @@ RiskDecision {
 
 **Resource budget**: Prometheus + Grafana + Loki together should consume <1GB RAM, <500m CPU. Deployed on jaguar alongside Postgres.
 
+**Monitoring model**: Critical runtime monitoring is continuous, not scheduled. robsond owns the Control Loop, Safety Net, exchange reconciliation, and market-data failover as long-lived processes. New Kubernetes CronJobs are allowed only for non-critical housekeeping such as retention, backfills, and offline reports.
+
 ### CI/CD
 
 **Decision**: GitHub Actions + ArgoCD. Already working. No changes needed.
@@ -793,7 +797,7 @@ Reconsider TRON integration when ALL of these are true:
 
 | # | Change | Replaces from v2.5 | Precondition | Effort | Reversible? | Rollback | Breaks If Done Wrong |
 |---|--------|-------------------|-------------|--------|-------------|----------|---------------------|
-| 1 | **Promote robsond as primary runtime** (all execution goes through daemon) | Django stop monitor CronJob | v2.5 #1-#4 complete, daemon stable for >2 weeks in prod | M | Yes — re-enable Django paths | Re-enable CronJob, redirect frontend to Django API | Execution path broken if daemon has undiscovered bugs |
+| 1 | **Promote robsond as primary runtime** (all execution goes through daemon) | Django stop monitor CronJob | v2.5 #1-#4 complete, daemon stable for >2 weeks in prod | M | Yes — rollback to legacy runtime | Suspend robsond execution path, restore legacy runtime, redirect frontend to Django API if needed | Execution path broken if daemon has undiscovered bugs |
 | 2 | **Replace Django API with thin gateway** (FastAPI or axum) that proxies to robsond | Django REST API | robsond is primary (#1), frontend SSE working (v2.5 #6) | L | Partially — can re-enable Django | Redeploy Django, update ingress routing | Frontend/CLI break if gateway has bugs; both have robsond as direct fallback |
 | 3 | **Frontend direct connection to robsond SSE** | SSE via Django proxy | Gateway deployed (#2) | S | Yes — revert to Django proxy | Update frontend VITE_API_BASE_URL to Django endpoint | Frontend loses real-time if SSE path fails; graceful degradation to REST |
 | 4 | **Dynamic risk limits** (volatility-adjusted, funding-rate-aware) | Hard limits only | Risk Engine blocking (v2.5 #4), market data pipeline working | M | Yes — disable dynamic, use hard limits | Config: `dynamic_limits_enabled: false` | False sense of security if dynamic computation is wrong; fallback to hard limits is safe |
@@ -805,19 +809,20 @@ Reconsider TRON integration when ALL of these are true:
 ### Migration Rules
 
 1. **Every migration step generates an immutable event**: `MigrationStepStarted`, `MigrationStepCompleted`, `MigrationStepRolledBack` in EventLog.
-2. **Data migration risk**: Steps #1-#6 in v2.5 do NOT migrate data. The Django database remains untouched. robsond creates its own EventLog in Postgres. The two systems run in parallel until v3.
+2. **Data migration risk**: Steps #1-#6 in v2.5 do NOT migrate data. The Django database remains untouched. robsond creates its own EventLog in Postgres. The two systems coexist during v2.5, but only one execution path may be active for live stop/trailing responsibilities at a time.
 3. **Build order** (foundation first):
    - FIRST: robsond deployment (#1) + SOPS (#7) + observability (#8)
    - THEN: projector (#2) + Risk Engine wiring (#4)
    - THEN: stop monitoring migration (#3) + circuit breaker (#5)
    - THEN: SSE (#6) + contract tests (#9) + replay tests (#10)
 4. **Parallelizable**: #1 + #7 + #8 can run in parallel. #2 + #4 can run in parallel after #1. #9 + #10 can run in parallel after #1.
-5. **Deferred to post-v3**:
+5. **No parallel execution authorities**: v3 never runs Django execution CronJobs in parallel with robsond. Rollback is mutually exclusive.
+6. **Deferred to post-v3**:
    - Backtesting (robson-sim): Trigger — operator wants to validate strategies before arming
    - Multi-user support: Trigger — second operator joins
    - ML-based signals: Trigger — operator has validated ML model with backtesting
    - TRON integration: Trigger — regulatory clarity + concrete use case
-6. **Explicitly out of scope**:
+7. **Explicitly out of scope**:
    - Auto-trading (ADR-0007 — Robson is an assistant, not a bot)
    - Public API / SaaS (single operator system)
    - Mobile app (web UI is sufficient for desk trading)
