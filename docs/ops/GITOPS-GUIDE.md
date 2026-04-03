@@ -254,5 +254,5 @@ ArgoCD uses:
 
 ---
 
-**Last Updated**: 2026-03-29
-**Replaces**: GITOPS-RECOVERY-GUIDE.md (now in legacy/)
+**Last Updated**: 2026-04-03
+**Supersedes**: the removed legacy GitOps recovery guide
