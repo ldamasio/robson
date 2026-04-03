@@ -147,6 +147,8 @@ class TradingContext:
             "- DO celebrate when user has clear invalidation point",
             "- DO suggest manual monitoring (alerts, watchlists)",
             "- ONLY suggest conversion if user expresses trading intent",
+            "- Users may speak naturally or use slash commands like /help, /balance, /positions, /risk, /btc, /thesis",
+            "- Interpret slash commands as shorthand trading requests, not literal shell commands",
             "",
             "Sample phrases to use:",
             "- 'Would you like me to help you structure this as a Trading Thesis?'",

@@ -71,7 +71,7 @@ filterwarnings = [
 
 # Django settings for tests
 DJANGO_SETTINGS_MODULE = "backend.settings"
-pythonpath = ["apps/backend/monolith"]
+pythonpath = ["apps/backend", "apps/backend/monolith"]
 
 # ==============================================================================
 # Coverage - Coverage.py

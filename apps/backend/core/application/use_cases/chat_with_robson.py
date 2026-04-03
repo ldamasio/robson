@@ -63,6 +63,7 @@ class ChatWithRobsonUseCase:
         tenant_id: str,
         user_message: str,
         conversation_id: str | None = None,
+        history: list[dict[str, str]] | None = None,
     ) -> ChatResponse:
         """
         Process a user message and generate AI response.
@@ -82,6 +83,9 @@ class ChatWithRobsonUseCase:
             tenant_id=tenant_id,
             conversation_id=conversation_id,
         )
+
+        # Seed recent history when we do not have persistence yet.
+        self._hydrate_history(conversation, history)
 
         # 2. Add user message
         user_msg = Message(
@@ -173,6 +177,38 @@ class ChatWithRobsonUseCase:
             updated_at=datetime.now(),
         )
 
+    def _hydrate_history(
+        self,
+        conversation: Conversation,
+        history: list[dict[str, str]] | None,
+    ) -> None:
+        """
+        Rebuild a short-lived conversation from request history.
+
+        This gives the chat continuity before we add server-side persistence.
+        """
+        if conversation.messages or not history:
+            return
+
+        for item in history[-20:]:
+            role = item.get("role")
+            content = (item.get("content") or "").strip()
+
+            if role not in {MessageRole.USER.value, MessageRole.ASSISTANT.value}:
+                continue
+            if not content:
+                continue
+
+            conversation.add_message(
+                Message(
+                    id=str(uuid.uuid4()),
+                    role=MessageRole(role),
+                    content=content,
+                    timestamp=datetime.now(),
+                    metadata={"source": "request_history"},
+                )
+            )
+
     def _get_trading_context(self, tenant_id: str) -> TradingContext | None:
         """Gather current trading context."""
         if not self.trading_context:
@@ -231,6 +267,8 @@ IMPORTANT RULES:
 - DO celebrate when user has clear invalidation point
 - DO suggest manual monitoring (alerts, watchlists)
 - ONLY suggest conversion if user expresses trading intent
+- Users may speak naturally or use slash commands like /help, /balance, /positions, /risk, /btc, /thesis
+- Interpret slash commands as shorthand trading requests, not literal shell commands
 
 Sample phrases:
 - 'Would you like me to help you structure this as a Trading Thesis?'
