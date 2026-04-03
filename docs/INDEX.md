@@ -155,6 +155,9 @@ docs/
 | Topic | Document |
 |-------|----------|
 | **High-Level Overview** | [ARCHITECTURE.md](ARCHITECTURE.md) |
+| **Robson v3 Migration** | [architecture/v3-migration-plan.md](architecture/v3-migration-plan.md) |
+| **Robson v3 Runtime** | [architecture/v3-runtime-spec.md](architecture/v3-runtime-spec.md) |
+| **Robson v3 Risk Engine** | [architecture/v3-risk-engine-spec.md](architecture/v3-risk-engine-spec.md) |
 | **Hexagonal Architecture** | [ADR-0002](adr/ADR-0002-hexagonal-architecture.md) |
 | **AI-First Architecture** | [ai-first/ARCHITECTURE.md](ai-first/ARCHITECTURE.md) |
 | **ParadeDB Database** | [ADR-0007](adr/ADR-0007-paradedb-primary-database.md) |

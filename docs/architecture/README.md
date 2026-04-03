@@ -47,6 +47,15 @@ Start here to understand the system:
 - **[Deployment Architecture](deployment.md)** - K8s manifests and configuration
 - **[../runbooks/](../runbooks/)** - Operational procedures
 
+### For Robson v3
+
+- **[v3 Migration Plan](v3-migration-plan.md)** - Product and migration strategy
+- **[v3 Architectural Decisions](v3-architectural-decisions.md)** - Decision register for v3
+- **[v3 Runtime Spec](v3-runtime-spec.md)** - Runtime ownership and governance model
+- **[v3 Risk Engine Spec](v3-risk-engine-spec.md)** - Blocking risk gate design
+- **[v3 Control Loop](v3-control-loop.md)** - Execution cycle specification
+- **[v3 TRON Evaluation](v3-tron-evaluation.md)** - Deferred integration analysis
+
 ## Architecture Principles
 
 Our architecture follows these principles:
