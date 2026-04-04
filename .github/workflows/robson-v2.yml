@@ -87,8 +87,8 @@ jobs:
           tags: |
             ${{ env.IMAGE }}:${{ steps.meta.outputs.sha_tag }}
             ${{ env.IMAGE }}:latest
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          cache-from: type=registry,ref=${{ env.IMAGE }}:cache
+          cache-to: type=registry,ref=${{ env.IMAGE }}:cache,mode=max
 
       - name: Update image tags in rbx-infra
         env:
