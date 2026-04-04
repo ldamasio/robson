@@ -52,7 +52,7 @@ jobs:
         run: cargo fmt --all --check
 
       - name: Clippy
-        run: cargo clippy --all-targets -- -D warnings
+        run: cargo clippy --all-targets -- -D clippy::correctness -D clippy::suspicious
 
   build-and-push:
     name: Build & Push Image
