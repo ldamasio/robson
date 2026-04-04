@@ -196,7 +196,10 @@ pub async fn find_active_from_projection(
             "long" => Side::Long,
             "short" => Side::Short,
             _ => {
-                return Err(StoreError::Deserialization(format!("Invalid side: {}", row_data.side)));
+                return Err(StoreError::Deserialization(format!(
+                    "Invalid side: {}",
+                    row_data.side
+                )));
             },
         };
 
