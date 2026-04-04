@@ -420,6 +420,7 @@ mod tests {
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
             side: Side::Long,
             timestamp: chrono::Utc::now(),
+            tech_stop_distance: None,
         };
 
         let action = EngineAction::EmitEvent(event.clone());
@@ -453,6 +454,7 @@ mod tests {
                 symbol: Symbol::from_pair("BTCUSDT").unwrap(),
                 side: Side::Long,
                 timestamp: chrono::Utc::now(),
+                tech_stop_distance: None,
             }),
             EngineAction::PlaceEntryOrder {
                 position_id,
