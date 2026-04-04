@@ -12,7 +12,8 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: write   # Required for pushing manifest updates to rbx-infra
+  contents: write
+  actions: write
 
 concurrency:
   group: robson-v2-${{ github.ref }}
@@ -44,7 +45,7 @@ jobs:
           key: rust-${{ runner.os }}-${{ hashFiles('v2/Cargo.lock') }}
           restore-keys: rust-${{ runner.os }}-
 
-      - name: Run tests (no postgres feature — uses MemoryStore)
+      - name: Run tests (no postgres feature - uses MemoryStore)
         run: cargo test --all --no-fail-fast
 
       - name: Check formatting
@@ -92,9 +93,10 @@ jobs:
       - name: Update image tags in rbx-infra
         env:
           GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          SHA_TAG: ${{ steps.meta.outputs.sha_tag }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
         run: |
-          SHA_TAG="${{ steps.meta.outputs.sha_tag }}"
-
           git clone https://x-access-token:${GITOPS_TOKEN}@github.com/rbxrobotica/rbx-infra.git /tmp/rbx-infra
           cd /tmp/rbx-infra
 
@@ -113,16 +115,14 @@ jobs:
             exit 0
           fi
 
-          git commit -m "chore(robson-v2): update image tag to ${SHA_TAG}
-
-Automated update by Robson v2 CI/CD pipeline.
-Triggered by: ${{ github.repository }}@${{ github.sha }}
-
-[skip ci]"
+          git commit -m "chore(robson-v2): update image tag to ${SHA_TAG}" \
+            -m "Automated update by Robson v2 CI/CD pipeline." \
+            -m "Triggered by: ${REPO}@${SHA}" \
+            -m "[skip ci]"
 
           for i in 1 2 3; do
             if git push origin main; then
-              echo "Manifests pushed — ArgoCD will auto-sync"
+              echo "Manifests pushed - ArgoCD will auto-sync"
               exit 0
             fi
             echo "Push attempt $i failed, rebasing..."
