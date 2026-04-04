@@ -1,7 +1,7 @@
 # ============================================================================
 # Stage 1: Build
 # ============================================================================
-FROM rust:1.83-slim AS builder
+FROM docker.io/library/rust:1-slim AS builder
 
 WORKDIR /app
 
@@ -13,20 +13,26 @@ RUN apt-get update && apt-get install -y \
 
 # Copy workspace files
 COPY Cargo.toml Cargo.lock ./
-COPY robsond/ ./robsond/
-COPY robson-engine/ ./robson-engine/
 COPY robson-domain/ ./robson-domain/
-COPY robson-store/ ./robson-store/
-COPY robson-connectors/ ./robson-connectors/
+COPY robson-engine/ ./robson-engine/
 COPY robson-exec/ ./robson-exec/
+COPY robson-connectors/ ./robson-connectors/
+COPY robson-store/ ./robson-store/
+COPY robson-eventlog/ ./robson-eventlog/
+COPY robson-projector/ ./robson-projector/
+COPY robson-db/ ./robson-db/
+COPY migrations/ ./migrations/
+COPY robson-testkit/ ./robson-testkit/
+COPY robson-sim/ ./robson-sim/
+COPY robsond/ ./robsond/
 
-# Build release binary
-RUN cargo build --release -p robsond
+# Build release binary with postgres feature for production
+RUN cargo build --release -p robsond --features postgres
 
 # ============================================================================
 # Stage 2: Runtime
 # ============================================================================
-FROM debian:bookworm-slim
+FROM docker.io/library/debian:bookworm-slim
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \

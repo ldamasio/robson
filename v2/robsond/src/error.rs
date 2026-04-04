@@ -7,6 +7,8 @@ use robson_store::StoreError;
 use thiserror::Error;
 use uuid::Uuid;
 
+use crate::position_monitor::MonitorError;
+
 /// Daemon-level errors.
 #[derive(Debug, Error)]
 pub enum DaemonError {
@@ -59,6 +61,10 @@ pub enum DaemonError {
     /// Configuration error
     #[error("Configuration error: {0}")]
     Config(String),
+
+    /// Monitor error
+    #[error("Monitor error: {0}")]
+    Monitor(#[from] MonitorError),
 
     /// Shutdown requested
     #[error("Shutdown requested")]

@@ -3,10 +3,10 @@
 //! Spawns WebSocket client tasks and bridges market data events
 //! from connectors to the daemon event bus.
 
-use robson_connectors::BinanceMarketDataClient;
-use robson_domain::{MarketDataEvent, Price, Symbol};
+use robson_connectors::{BinanceWebSocketClient, WsMessage};
+use robson_domain::{Price, Symbol};
+use std::str::FromStr;
 use std::sync::Arc;
-use tokio::sync::broadcast;
 use tokio::task::JoinHandle;
 use tracing::{error, info};
 
@@ -29,80 +29,90 @@ impl MarketDataManager {
     ///
     /// Returns a join handle that can be used to monitor the task.
     pub fn spawn_ws_client(&self, symbol: Symbol) -> DaemonResult<JoinHandle<()>> {
-        // Create internal broadcast channel for MarketDataEvent
-        let (event_sender, mut event_receiver) = broadcast::channel::<MarketDataEvent>(100);
-
-        // Clone event_bus and symbol for the bridge task
         let event_bus = self.event_bus.clone();
-        let symbol_for_bridge = symbol.clone();
+        let symbol_str = symbol.as_pair();
 
-        // Spawn the WebSocket client task
-        let client_task = tokio::spawn(async move {
-            // TODO: In production, handle reconnect logic here
-            let mut client = match BinanceMarketDataClient::new(symbol.clone(), event_sender).await
-            {
-                Ok(c) => {
-                    info!(symbol = %symbol.as_pair(), "WebSocket client connected");
-                    c
-                },
+        let handle = tokio::spawn(async move {
+            let ws_client = BinanceWebSocketClient::new(false);
+
+            let mut stream = match ws_client.subscribe_agg_trade(&symbol_str).await {
+                Ok(s) => {
+                    info!(symbol = %symbol_str, "WebSocket client connected");
+                    s
+                }
                 Err(e) => {
-                    error!(error = %e, symbol = %symbol.as_pair(), "Failed to create WebSocket client");
+                    error!(error = %e, symbol = %symbol_str, "Failed to connect WebSocket");
                     return;
-                },
+                }
             };
 
-            info!(symbol = %symbol.as_pair(), "WebSocket client task started");
+            info!(symbol = %symbol_str, "WebSocket client task started");
 
-            // Run the client message loop
-            match client.run().await {
-                Ok(_) => {
-                    info!(symbol = %symbol.as_pair(), "WebSocket client disconnected gracefully");
-                },
-                Err(e) => {
-                    error!(error = %e, symbol = %symbol.as_pair(), "WebSocket client error");
-                },
-            }
-        });
-
-        // Spawn a bridge task to forward MarketDataEvent to DaemonEvent
-        let _bridge_task = tokio::spawn(async move {
             let mut first_tick_logged = false;
 
-            while let Ok(result) = event_receiver.recv().await {
-                match result {
-                    MarketDataEvent::Tick(tick) => {
+            loop {
+                match stream.next().await {
+                    None => {
+                        info!(symbol = %symbol_str, "WebSocket stream closed");
+                        break;
+                    }
+                    Some(Err(e)) => {
+                        error!(error = %e, symbol = %symbol_str, "WebSocket stream error");
+                        break;
+                    }
+                    Some(Ok(WsMessage::AggTrade(trade))) => {
+                        let price_decimal = match rust_decimal::Decimal::from_str(&trade.price) {
+                            Ok(d) => d,
+                            Err(e) => {
+                                error!(error = %e, "Failed to parse price from agg trade");
+                                continue;
+                            }
+                        };
+
+                        let price = match Price::new(price_decimal) {
+                            Ok(p) => p,
+                            Err(e) => {
+                                error!(error = %e, price = %trade.price, "Invalid price value");
+                                continue;
+                            }
+                        };
+
                         if !first_tick_logged {
                             info!(
-                                symbol = %tick.symbol.as_pair(),
-                                price = %tick.price,
-                                quantity = %tick.quantity,
+                                symbol = %trade.symbol,
+                                price = %price_decimal,
                                 "First tick received"
                             );
                             first_tick_logged = true;
                         }
 
-                        // Convert Decimal to Price (unwrap is safe: tick prices are always positive)
-                        let price = Price::new(tick.price).unwrap();
+                        let trade_symbol = match Symbol::from_pair(&trade.symbol) {
+                            Ok(s) => s,
+                            Err(e) => {
+                                error!(error = %e, symbol = %trade.symbol, "Failed to parse symbol");
+                                continue;
+                            }
+                        };
 
-                        // Convert to DaemonEvent and publish
+                        let timestamp = chrono::Utc::now();
                         let daemon_event = DaemonEvent::MarketData(crate::event_bus::MarketData {
-                            symbol: tick.symbol.clone(),
+                            symbol: trade_symbol,
                             price,
-                            timestamp: tick.timestamp,
+                            timestamp,
                         });
 
                         event_bus.send(daemon_event);
-                    },
-                    _ => {
-                        // Other event types (Candle, OrderBookSnapshot) not implemented yet
-                    },
+                    }
+                    Some(Ok(_)) => {
+                        // Other message types not needed here
+                    }
                 }
             }
 
-            info!(symbol = %symbol_for_bridge.as_pair(), "Market data bridge task ended");
+            info!(symbol = %symbol_str, "WebSocket client task ended");
         });
 
-        Ok(client_task)
+        Ok(handle)
     }
 }
 
@@ -113,9 +123,7 @@ mod tests {
     #[test]
     fn test_market_data_manager_creation() {
         let event_bus = Arc::new(EventBus::new(100));
-        let manager = MarketDataManager::new(event_bus);
-
+        let _manager = MarketDataManager::new(event_bus);
         // Manager is created successfully
-        // Actual WebSocket connection requires async runtime
     }
 }

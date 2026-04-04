@@ -56,7 +56,7 @@ pub async fn status(pool: &PgPool) -> Result<()> {
             for mig in migs {
                 let version: i64 = mig.get("version");
                 let description: String = mig.get("description");
-                let installed_at: Option<String> = mig.get("installed_at");
+                let installed_on: Option<String> = mig.get("installed_on");
                 let success: Option<bool> = mig.get("success");
 
                 let status = if success.unwrap_or(true) {
@@ -69,7 +69,7 @@ pub async fn status(pool: &PgPool) -> Result<()> {
                     status,
                     version,
                     description,
-                    installed_at.unwrap_or_else(|| "N/A".to_string())
+                    installed_on.unwrap_or_else(|| "N/A".to_string())
                 );
             }
         },

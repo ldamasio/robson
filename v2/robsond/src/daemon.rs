@@ -324,7 +324,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         }
 
         if let Some(monitor) = position_monitor {
-            monitor.shutdown().await;
+            if let Ok(m) = Arc::try_unwrap(monitor) {
+                m.shutdown().await;
+            }
         }
         if let Some(handle) = position_monitor_handle {
             info!("Waiting for position monitor to finish...");
@@ -426,6 +428,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         let state = Arc::new(ApiState {
             position_manager: self.position_manager.clone(),
             position_monitor,
+            #[cfg(feature = "postgres")]
+            pg_pool: self.pg_pool.clone(),
         });
 
         let router = create_router(state);
@@ -601,6 +605,33 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                     %error,
                     %consecutive_failures,
                     "PANIC: Safety exit failed repeatedly, position in panic mode"
+                );
+            },
+
+            DaemonEvent::CorePositionOpened {
+                position_id,
+                symbol,
+                side,
+                ..
+            } => {
+                info!(
+                    %position_id,
+                    %symbol,
+                    ?side,
+                    "Core position opened"
+                );
+            },
+
+            DaemonEvent::CorePositionClosed {
+                position_id,
+                symbol,
+                side,
+            } => {
+                info!(
+                    %position_id,
+                    %symbol,
+                    ?side,
+                    "Core position closed"
                 );
             },
         }

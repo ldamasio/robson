@@ -39,6 +39,7 @@ dotenvy = { workspace = true }
 rust_decimal = { workspace = true }
 rust_decimal_macros = { workspace = true }
 chrono = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 rust_decimal_macros = { workspace = true }

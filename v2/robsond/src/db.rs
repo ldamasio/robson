@@ -63,6 +63,10 @@ pub async fn run_db_command(args: Vec<String>) -> Result<()> {
 
             let (tid, aid) = init_minimal_data(&pool, tenant_id, account_id).await?;
             info!("Initialized: tenant_id={}, account_id={}", tid, aid);
+            // Print to stdout so operators can capture the value for secret provisioning:
+            //   PROJECTION_TENANT_ID=$(robsond db init | grep TENANT_ID | awk '{print $2}')
+            println!("TENANT_ID={}", tid);
+            println!("ACCOUNT_ID={}", aid);
         },
         _ => {
             return Err(anyhow!("Unknown db command: {}. Use migrate, status, or init", args[2]));

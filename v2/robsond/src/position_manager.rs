@@ -733,9 +733,13 @@ mod tests {
 
         manager.disarm_position(position.id).await.unwrap();
 
-        // Should be deleted
-        let loaded = manager.get_position(position.id).await.unwrap();
-        assert!(loaded.is_none());
+        // Position must be kept for audit trail, transitioned to Closed state
+        let loaded = manager.get_position(position.id).await.unwrap().expect("position must exist after disarm");
+        assert!(
+            matches!(loaded.state, PositionState::Closed { .. }),
+            "expected Closed after disarm, got {:?}",
+            loaded.state
+        );
     }
 
     #[tokio::test]

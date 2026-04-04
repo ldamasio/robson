@@ -30,6 +30,8 @@
 #[cfg(feature = "postgres")]
 mod db;
 
+use std::sync::Arc;
+
 use robsond::{Config, Daemon};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};

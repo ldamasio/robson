@@ -28,7 +28,7 @@ CREATE TABLE detected_positions (
     stop_distance_pct DECIMAL(10, 6) NOT NULL,
 
     -- Tracking
-    detected_at TIMESTAMPTZ NOT DEFAULT NOW(),
+    detected_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
     verified_at TIMESTAMPTZ,  -- Last time position was verified on Binance
     closed_at TIMESTAMPTZ,     -- When position was closed/removed
     is_active BOOLEAN NOT NULL DEFAULT TRUE,

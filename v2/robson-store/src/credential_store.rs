@@ -430,10 +430,10 @@ impl CredentialStore for PgCredentialStore {
                 updated_at = NOW()
             "#
         )
-        .bind(&id.tenant_id)
-        .bind(&id.user_id)
+        .bind(id.tenant_id())
+        .bind(id.user_id())
         .bind(id.exchange.as_str())
-        .bind(id.profile.as_str())
+        .bind(id.profile())
         .bind(&api_key_ciphertext)
         .bind(&api_key_nonce)
         .bind(&api_secret_ciphertext)
@@ -461,18 +461,18 @@ impl CredentialStore for PgCredentialStore {
             WHERE tenant_id = $1 AND user_id = $2 AND exchange = $3 AND profile = $4
             "#
         )
-        .bind(&id.tenant_id)
-        .bind(&id.user_id)
+        .bind(id.tenant_id())
+        .bind(id.user_id())
         .bind(id.exchange.as_str())
-        .bind(id.profile.as_str())
+        .bind(id.profile())
         .fetch_optional(&*self.pool)
         .await
         .map_err(|e| CredentialError::Database(e.to_string()))?
         .ok_or_else(|| CredentialError::NotFound {
-            tenant_id: id.tenant_id.clone(),
-            user_id: id.user_id.clone(),
+            tenant_id: id.tenant_id().to_string(),
+            user_id: id.user_id().to_string(),
             exchange: id.exchange.as_str().to_string(),
-            profile: id.profile.as_str().to_string(),
+            profile: id.profile().to_string(),
         })?;
 
         let (api_key_ciphertext, api_key_nonce, api_secret_ciphertext, api_secret_nonce, key_id, status) = row;
@@ -510,10 +510,10 @@ impl CredentialStore for PgCredentialStore {
             WHERE tenant_id = $1 AND user_id = $2 AND exchange = $3 AND profile = $4
             "#
         )
-        .bind(&id.tenant_id)
-        .bind(&id.user_id)
+        .bind(id.tenant_id())
+        .bind(id.user_id())
         .bind(id.exchange.as_str())
-        .bind(id.profile.as_str())
+        .bind(id.profile())
         .execute(&*self.pool)
         .await
         .ok(); // Ignore errors on touch
@@ -528,10 +528,10 @@ impl CredentialStore for PgCredentialStore {
             WHERE tenant_id = $1 AND user_id = $2 AND exchange = $3 AND profile = $4 AND status = 'active'
             "#
         )
-        .bind(&id.tenant_id)
-        .bind(&id.user_id)
+        .bind(id.tenant_id())
+        .bind(id.user_id())
         .bind(id.exchange.as_str())
-        .bind(id.profile.as_str())
+        .bind(id.profile())
         .fetch_optional(&*self.pool)
         .await
         .map_err(|e| CredentialError::Database(e.to_string()))?;
@@ -547,10 +547,10 @@ impl CredentialStore for PgCredentialStore {
             WHERE tenant_id = $1 AND user_id = $2 AND exchange = $3 AND profile = $4
             "#
         )
-        .bind(&id.tenant_id)
-        .bind(&id.user_id)
+        .bind(id.tenant_id())
+        .bind(id.user_id())
         .bind(id.exchange.as_str())
-        .bind(id.profile.as_str())
+        .bind(id.profile())
         .bind(reason)
         .execute(&*self.pool)
         .await
@@ -573,10 +573,10 @@ impl CredentialStore for PgCredentialStore {
             WHERE tenant_id = $1 AND user_id = $2 AND exchange = $3 AND profile = $4
             "#
         )
-        .bind(&id.tenant_id)
-        .bind(&id.user_id)
+        .bind(id.tenant_id())
+        .bind(id.user_id())
         .bind(id.exchange.as_str())
-        .bind(id.profile.as_str())
+        .bind(id.profile())
         .execute(&*self.pool)
         .await
         .map_err(|e| CredentialError::Database(e.to_string()))?;

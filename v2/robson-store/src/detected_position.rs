@@ -9,6 +9,8 @@ use chrono::{DateTime, Utc};
 use robson_domain::{DetectedPosition, Price, Quantity, Side, Symbol};
 use rust_decimal::Decimal;
 use std::collections::HashMap;
+#[cfg(feature = "postgres")]
+use std::sync::Arc;
 use uuid::Uuid;
 
 // =============================================================================
@@ -17,6 +19,7 @@ use uuid::Uuid;
 
 /// DTO for serializing DetectedPosition to/from database.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "postgres", derive(sqlx::FromRow))]
 pub struct DetectedPositionDto {
     /// Composite ID: "{symbol}:{side}" e.g., "BTCUSDT:long"
     pub position_id: String,
@@ -30,6 +33,7 @@ pub struct DetectedPositionDto {
     pub stop_distance: Decimal,
     pub stop_distance_pct: Decimal,
     pub detected_at: DateTime<Utc>,
+    #[cfg_attr(feature = "postgres", sqlx(rename = "verified_at"))]
     pub last_verified_at: DateTime<Utc>,
     pub closed_at: Option<DateTime<Utc>>,
     pub is_active: bool,
@@ -121,6 +125,7 @@ impl DetectedPositionDto {
 
 /// DTO for safety net execution log entries.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "postgres", derive(sqlx::FromRow))]
 pub struct SafetyExecutionDto {
     pub execution_id: Uuid,
     pub position_id: String,
@@ -372,7 +377,7 @@ impl DetectedPositionRepository for PgDetectedPositionRepository {
         .bind(dto.stop_distance)
         .bind(dto.stop_distance_pct)
         .bind(dto.detected_at)
-        .bind(dto.verified_at)
+        .bind(dto.last_verified_at)
         .bind(dto.closed_at)
         .bind(dto.is_active)
         .bind(&dto.stop_method)

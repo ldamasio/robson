@@ -38,6 +38,9 @@ use crate::position_monitor::PositionMonitor;
 pub struct ApiState<E: ExchangePort + 'static, S: Store + 'static> {
     pub position_manager: Arc<RwLock<PositionManager<E, S>>>,
     pub position_monitor: Option<Arc<PositionMonitor>>,
+    /// PostgreSQL pool for liveness check. Present only when DATABASE_URL is configured.
+    #[cfg(feature = "postgres")]
+    pub pg_pool: Option<std::sync::Arc<sqlx::PgPool>>,
 }
 
 // =============================================================================
@@ -259,15 +262,26 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
-    let mut database_ok = false;
+    let mut database_ok;
     let mut binance_ok = false;
 
-    // Check database connection by trying to get active positions
+    // Check PostgreSQL connectivity with a real ping when pool is configured.
+    // Falls back to MemoryStore check (always OK) when Postgres is not wired.
+    #[cfg(feature = "postgres")]
     {
-        let manager = state.position_manager.read().await;
-        if let Ok(_) = manager.get_active_positions().await {
+        if let Some(pool) = &state.pg_pool {
+            database_ok = sqlx::query("SELECT 1")
+                .execute(pool.as_ref())
+                .await
+                .is_ok();
+        } else {
+            // No PG configured: readiness passes (foundation mode without DB)
             database_ok = true;
         }
+    }
+    #[cfg(not(feature = "postgres"))]
+    {
+        database_ok = true;
     }
 
     // Check Binance API reachability via position monitor
@@ -672,6 +686,8 @@ mod tests {
         let state = Arc::new(ApiState {
             position_manager: Arc::new(RwLock::new(manager)),
             position_monitor: None,
+            #[cfg(feature = "postgres")]
+            pg_pool: None,
         });
 
         create_router(state)
