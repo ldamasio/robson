@@ -9,6 +9,7 @@ on:
     branches: ["main"]
     paths:
       - "v2/**"
+  workflow_dispatch:
 
 permissions:
   contents: write   # Required for pushing manifest updates to rbx-infra
