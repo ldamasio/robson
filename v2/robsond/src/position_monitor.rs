@@ -50,11 +50,11 @@ pub struct PositionMonitorConfig {
 impl Default for PositionMonitorConfig {
     fn default() -> Self {
         Self {
-            poll_interval_secs: 20,      // 20 seconds default
+            poll_interval_secs: 20, // 20 seconds default
             symbols: vec!["BTCUSDT".to_string()],
             enabled: true,
             max_retry_attempts: 3,
-            execution_cooldown_secs: 60,  // Don't retry within 60 seconds
+            execution_cooldown_secs: 60, // Don't retry within 60 seconds
             price_validation_tolerance_pct: Decimal::new(1, 3), // 0.1%
         }
     }
@@ -239,15 +239,22 @@ impl PositionMonitor {
                 Ok(positions) => {
                     let mut tracked = self.tracked_positions.write().await;
                     for pos in positions {
-                        let position_id = format!("{}:{}", pos.symbol.as_pair(),
-                            if pos.side == Side::Long { "long" } else { "short" });
+                        let position_id = format!(
+                            "{}:{}",
+                            pos.symbol.as_pair(),
+                            if pos.side == Side::Long {
+                                "long"
+                            } else {
+                                "short"
+                            }
+                        );
                         tracked.insert(position_id, pos);
                     }
                     info!(count = tracked.len(), "Loaded persisted positions from database");
-                }
+                },
                 Err(e) => {
                     warn!(error = %e, "Failed to load persisted positions, starting fresh");
-                }
+                },
             }
         }
         Ok(())
@@ -267,7 +274,7 @@ impl PositionMonitor {
                         "Position is Core-managed, Safety Net will skip"
                     );
                     Ok(true)
-                }
+                },
                 Ok(None) => Ok(false),
                 Err(e) => {
                     // Fail-safe: On error, skip monitoring (don't risk double execution)
@@ -278,7 +285,7 @@ impl PositionMonitor {
                         "Error checking Core positions, failing safe (skipping monitoring)"
                     );
                     Ok(true) // Err on the side of caution
-                }
+                },
             }
         } else {
             // No core repo configured, Safety Net monitors everything
@@ -445,7 +452,8 @@ impl PositionMonitor {
                         stop_price.unwrap(),
                         quantity,
                         current_price,
-                    ).await?;
+                    )
+                    .await?;
                     return Ok(());
                 }
             }
@@ -457,7 +465,6 @@ impl PositionMonitor {
                 stop_price = ?existing.calculated_stop.as_ref().map(|s| s.stop_price.as_decimal()),
                 "Position verified, stop not hit"
             );
-
         } else {
             // New position detected
 
@@ -510,7 +517,8 @@ impl PositionMonitor {
                     calculated_stop.stop_price,
                     detected.quantity,
                     current_price,
-                ).await?;
+                )
+                .await?;
                 return Ok(());
             }
 
@@ -585,16 +593,17 @@ impl PositionMonitor {
         // 2. PRE-EXECUTION VALIDATION
         // =========================================
         // Re-validate price vs stop with tolerance
-        let tolerance = stop_price.as_decimal() * self.config.price_validation_tolerance_pct / Decimal::from(100u32);
+        let tolerance = stop_price.as_decimal() * self.config.price_validation_tolerance_pct
+            / Decimal::from(100u32);
         let is_still_hit = match side {
             Side::Long => {
                 // LONG: price must be at or below stop (minus tolerance)
                 current_price.as_decimal() <= (stop_price.as_decimal() + tolerance)
-            }
+            },
             Side::Short => {
                 // SHORT: price must be at or above stop (plus tolerance)
                 current_price.as_decimal() >= (stop_price.as_decimal() - tolerance)
-            }
+            },
         };
 
         if !is_still_hit {
@@ -630,7 +639,8 @@ impl PositionMonitor {
             // Mark as attempting (before the actual try)
             {
                 let mut attempts = self.execution_attempts.write().await;
-                let exec_attempt = attempts.entry(position_id.clone())
+                let exec_attempt = attempts
+                    .entry(position_id.clone())
                     .or_insert_with(|| ExecutionAttempt::new(position_id.clone()));
                 exec_attempt.attempted_at = Utc::now();
             }
@@ -643,16 +653,15 @@ impl PositionMonitor {
 
             // Determine exit side
             let exit_side = match side {
-                Side::Long => Side::Short,  // Sell to close long
-                Side::Short => Side::Long,  // Buy to close short
+                Side::Long => Side::Short, // Sell to close long
+                Side::Short => Side::Long, // Buy to close short
             };
 
             // Place market order
-            let result = self.binance_client.place_market_order(
-                &symbol.as_pair(),
-                exit_side,
-                quantity.as_decimal(),
-            ).await;
+            let result = self
+                .binance_client
+                .place_market_order(&symbol.as_pair(), exit_side, quantity.as_decimal())
+                .await;
 
             match result {
                 Ok(order) => {
@@ -692,7 +701,7 @@ impl PositionMonitor {
                     });
 
                     return Ok(());
-                }
+                },
                 Err(e) => {
                     last_error = Some(e.to_string());
 
@@ -731,7 +740,7 @@ impl PositionMonitor {
                         error = %e,
                         "Transient error, retrying"
                     );
-                }
+                },
             }
         }
 
@@ -762,10 +771,7 @@ impl PositionMonitor {
                         consecutive_failures: attempt.consecutive_failures,
                     });
 
-                    return Err(MonitorError::PanicMode {
-                        position_id,
-                        error: error_msg,
-                    });
+                    return Err(MonitorError::PanicMode { position_id, error: error_msg });
                 }
             }
         }
@@ -795,7 +801,8 @@ impl PositionMonitor {
     /// Mark an execution as failed.
     async fn mark_execution_failed(&self, position_id: &str, error: String) {
         let mut attempts = self.execution_attempts.write().await;
-        let attempt = attempts.entry(position_id.to_string())
+        let attempt = attempts
+            .entry(position_id.to_string())
             .or_insert_with(|| ExecutionAttempt::new(position_id.to_string()));
         attempt.record_failure(error.clone(), self.config.max_retry_attempts);
 
@@ -803,13 +810,10 @@ impl PositionMonitor {
         if let Some(repo) = &self.repository {
             let is_panic = attempt.is_panic_mode;
             let failures = attempt.consecutive_failures as i32;
-            if let Err(e) = repo.update_execution_attempt(
-                position_id,
-                Utc::now(),
-                failures,
-                is_panic,
-                Some(error),
-            ).await {
+            if let Err(e) = repo
+                .update_execution_attempt(position_id, Utc::now(), failures, is_panic, Some(error))
+                .await
+            {
                 warn!(error = %e, "Failed to persist execution attempt to database");
             }
         }
@@ -835,11 +839,7 @@ impl PositionMonitor {
         // Place market order
         let order_result = self
             .binance_client
-            .place_market_order(
-                &position.symbol,
-                exit_side,
-                position.quantity.as_decimal(),
-            )
+            .place_market_order(&position.symbol, exit_side, position.quantity.as_decimal())
             .await;
 
         match order_result {
@@ -864,7 +864,7 @@ impl PositionMonitor {
                 });
 
                 Ok(())
-            }
+            },
             Err(e) => {
                 error!(
                     symbol = %position.symbol,
@@ -879,30 +879,24 @@ impl PositionMonitor {
                 });
 
                 Err(MonitorError::ExecutionFailed(e.to_string()))
-            }
+            },
         }
     }
 
     /// Clean up positions that are no longer open on Binance.
     async fn cleanup_closed_positions(&self, symbol: &str) {
         // Get all positions for this symbol
-        let binance_positions = match self
-            .binance_client
-            .get_open_positions(symbol)
-            .await
-        {
+        let binance_positions = match self.binance_client.get_open_positions(symbol).await {
             Ok(p) => p,
             Err(e) => {
                 error!(symbol = %symbol, error = %e, "Failed to get positions for cleanup");
                 return;
-            }
+            },
         };
 
         // Build set of active position IDs
-        let active_ids: std::collections::HashSet<String> = binance_positions
-            .iter()
-            .map(|p| format!("{}:{}", p.symbol, p.side))
-            .collect();
+        let active_ids: std::collections::HashSet<String> =
+            binance_positions.iter().map(|p| format!("{}:{}", p.symbol, p.side)).collect();
 
         // Remove closed positions
         let mut tracked = self.tracked_positions.write().await;
@@ -987,10 +981,7 @@ pub enum MonitorError {
 
     /// Panic mode activated
     #[error("PANIC mode for position {position_id}: {error}")]
-    PanicMode {
-        position_id: String,
-        error: String,
-    },
+    PanicMode { position_id: String, error: String },
 }
 
 /// Type alias for monitor results.
@@ -1054,10 +1045,7 @@ mod tests {
         };
         let current_price = Price::new(dec!(95000)).unwrap();
 
-        monitor
-            .process_binance_position(binance_pos, current_price)
-            .await
-            .unwrap();
+        monitor.process_binance_position(binance_pos, current_price).await.unwrap();
 
         // Position should not be tracked because it was excluded as Core-managed.
         assert!(monitor.get_tracked_positions().await.is_empty());

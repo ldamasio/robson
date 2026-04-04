@@ -187,14 +187,17 @@ pub async fn find_active_from_projection(
             .map_err(|e| StoreError::Database(format!("Failed to parse row: {}", e)))?;
 
         // Parse symbol
-        let symbol = Symbol::from_pair(&row_data.symbol)
-            .map_err(|e| StoreError::Deserialization(format!("Invalid symbol {}: {}", row_data.symbol, e)))?;
+        let symbol = Symbol::from_pair(&row_data.symbol).map_err(|e| {
+            StoreError::Deserialization(format!("Invalid symbol {}: {}", row_data.symbol, e))
+        })?;
 
         // Parse side
         let side = match row_data.side.as_str() {
             "long" => Side::Long,
             "short" => Side::Short,
-            _ => return Err(StoreError::Deserialization(format!("Invalid side: {}", row_data.side))),
+            _ => {
+                return Err(StoreError::Deserialization(format!("Invalid side: {}", row_data.side)));
+            },
         };
 
         // Create base position
@@ -210,7 +213,10 @@ pub async fn find_active_from_projection(
 
         if let Some(entry_quantity) = row_data.entry_quantity {
             position.quantity = Quantity::new(entry_quantity).map_err(|e| {
-                StoreError::Deserialization(format!("Invalid entry_quantity {}: {}", entry_quantity, e))
+                StoreError::Deserialization(format!(
+                    "Invalid entry_quantity {}: {}",
+                    entry_quantity, e
+                ))
             })?;
         }
 
@@ -234,24 +240,32 @@ pub async fn find_active_from_projection(
         match row_data.state.as_str() {
             "armed" => {
                 position.state = robson_domain::PositionState::Armed;
-            }
+            },
             "active" => {
                 // For Active positions, we need to reconstruct the full Active state
                 // This requires: current_price, trailing_stop, favorable_extreme, extreme_at
-                let current_price = row_data
-                    .entry_price
-                    .ok_or_else(|| StoreError::Deserialization("Missing entry_price for active position".to_string()))?;
+                let current_price = row_data.entry_price.ok_or_else(|| {
+                    StoreError::Deserialization(
+                        "Missing entry_price for active position".to_string(),
+                    )
+                })?;
 
-                let trailing_stop = row_data
-                    .trailing_stop_price
-                    .ok_or_else(|| StoreError::Deserialization("Missing trailing_stop_price for active position".to_string()))?;
+                let trailing_stop = row_data.trailing_stop_price.ok_or_else(|| {
+                    StoreError::Deserialization(
+                        "Missing trailing_stop_price for active position".to_string(),
+                    )
+                })?;
 
                 let favorable_extreme = row_data.favorable_extreme.ok_or_else(|| {
-                    StoreError::Deserialization("Missing favorable_extreme for active position".to_string())
+                    StoreError::Deserialization(
+                        "Missing favorable_extreme for active position".to_string(),
+                    )
                 })?;
 
                 let extreme_at = row_data.extreme_at.ok_or_else(|| {
-                    StoreError::Deserialization("Missing extreme_at for active position".to_string())
+                    StoreError::Deserialization(
+                        "Missing extreme_at for active position".to_string(),
+                    )
                 })?;
 
                 position.state = robson_domain::PositionState::Active {
@@ -268,11 +282,11 @@ pub async fn find_active_from_projection(
                     insurance_stop_id: None,
                     last_emitted_stop: row_data.trailing_stop_price.map(|p| Price::new(p).unwrap()),
                 };
-            }
+            },
             _ => {
                 // Skip other states (exiting, closed, error) as they are not "active" for recovery
                 continue;
-            }
+            },
         }
 
         // Set timestamps
@@ -378,7 +392,7 @@ mod tests {
                 assert_eq!(favorable_extreme.as_decimal(), dec!(97000));
                 assert!(insurance_stop_id.is_none());
                 assert_eq!(last_emitted_stop.as_ref().map(|p| p.as_decimal()), Some(dec!(93500)));
-            }
+            },
             _ => panic!("Expected Active state, got {:?}", pos.state),
         }
 
@@ -472,7 +486,7 @@ mod tests {
         // Only armed position should be restored (closed is skipped)
         assert_eq!(restored.len(), 1);
         match &restored[0].state {
-            robson_domain::PositionState::Armed => {}
+            robson_domain::PositionState::Armed => {},
             _ => panic!("Expected Armed state"),
         }
     }

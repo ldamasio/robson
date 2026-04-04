@@ -52,7 +52,9 @@ pub mod position_monitor;
 pub mod projection_worker;
 
 // Re-exports for convenience
-pub use config::{ApiConfig, Config, EngineConfig, Environment, PositionMonitorConfig, ProjectionConfig};
+pub use config::{
+    ApiConfig, Config, EngineConfig, Environment, PositionMonitorConfig, ProjectionConfig,
+};
 pub use daemon::Daemon;
 pub use detector::{DetectorConfig, DetectorTask};
 pub use error::{DaemonError, DaemonResult};

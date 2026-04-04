@@ -18,8 +18,8 @@ pub mod value_objects;
 // Re-export commonly used types
 pub use context::IdentityScope;
 pub use credentials::{
-    ApiCredentials, CredentialError, CredentialId, CredentialProfile, CredentialStatus,
-    Exchange, StoredCredential,
+    ApiCredentials, CredentialError, CredentialId, CredentialProfile, CredentialStatus, Exchange,
+    StoredCredential,
 };
 pub use detected_position::{CalculatedStop, DetectedPosition, StopMethod};
 pub use entities::{

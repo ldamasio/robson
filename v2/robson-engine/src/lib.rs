@@ -42,7 +42,9 @@ use thiserror::Error;
 use tracing::debug;
 
 // Re-export risk types for convenience
-pub use risk::{PositionSummary, ProposedTrade, RiskCheck, RiskContext, RiskGate, RiskLimits, RiskVerdict};
+pub use risk::{
+    PositionSummary, ProposedTrade, RiskCheck, RiskContext, RiskGate, RiskLimits, RiskVerdict,
+};
 
 // =============================================================================
 // Engine Errors
@@ -479,21 +481,22 @@ impl Engine {
         market_data: &MarketData,
     ) -> Result<EngineDecision, EngineError> {
         // Validate position is active
-        let (_current_price_in_state, trailing_stop, favorable_extreme, last_emitted_stop) = match &position.state {
-            PositionState::Active {
-                current_price,
-                trailing_stop,
-                favorable_extreme,
-                last_emitted_stop,
-                ..
-            } => (*current_price, *trailing_stop, *favorable_extreme, *last_emitted_stop),
-            other => {
-                return Err(EngineError::InvalidPositionState {
-                    expected: "active".to_string(),
-                    actual: other.name().to_string(),
-                });
-            },
-        };
+        let (_current_price_in_state, trailing_stop, favorable_extreme, last_emitted_stop) =
+            match &position.state {
+                PositionState::Active {
+                    current_price,
+                    trailing_stop,
+                    favorable_extreme,
+                    last_emitted_stop,
+                    ..
+                } => (*current_price, *trailing_stop, *favorable_extreme, *last_emitted_stop),
+                other => {
+                    return Err(EngineError::InvalidPositionState {
+                        expected: "active".to_string(),
+                        actual: other.name().to_string(),
+                    });
+                },
+            };
 
         // Validate symbol matches
         if position.symbol != market_data.symbol {
@@ -1412,9 +1415,7 @@ mod tests {
         // Process same price again ($96k - same as favorable extreme)
         // This should NOT trigger a new trailing stop update (idempotency)
         let market = create_market_data(dec!(96000));
-        let decision = engine
-            .process_active_position(&position_with_emitted, &market)
-            .unwrap();
+        let decision = engine.process_active_position(&position_with_emitted, &market).unwrap();
 
         // No action should be taken because:
         // 1. Price ($96k) is not above favorable_extreme ($96k) - it's equal
@@ -1459,15 +1460,9 @@ mod tests {
 
         // Process same price multiple times (simulating duplicate ticks)
         let market = create_market_data(dec!(95500)); // Price below extreme, no update
-        let decision1 = engine
-            .process_active_position(&position_with_emitted, &market)
-            .unwrap();
-        let decision2 = engine
-            .process_active_position(&position_with_emitted, &market)
-            .unwrap();
-        let decision3 = engine
-            .process_active_position(&position_with_emitted, &market)
-            .unwrap();
+        let decision1 = engine.process_active_position(&position_with_emitted, &market).unwrap();
+        let decision2 = engine.process_active_position(&position_with_emitted, &market).unwrap();
+        let decision3 = engine.process_active_position(&position_with_emitted, &market).unwrap();
 
         // None should trigger updates
         assert!(!decision1.has_actions());

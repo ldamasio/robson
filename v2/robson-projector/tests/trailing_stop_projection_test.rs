@@ -12,7 +12,7 @@
 //! ```
 
 use chrono::Utc;
-use robson_eventlog::{append_event, ActorType, Event};
+use robson_eventlog::{ActorType, Event, append_event};
 use rust_decimal_macros::dec;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -286,13 +286,12 @@ async fn test_exit_triggered_marks_exiting(pool: PgPool) {
     append_and_project(&pool, exit_event).await;
 
     // Verify state changed to exiting
-    let state: String = sqlx::query_scalar(
-        "SELECT state FROM positions_current WHERE position_id = $1"
-    )
-    .bind(position_id)
-    .fetch_one(&pool)
-    .await
-    .unwrap();
+    let state: String =
+        sqlx::query_scalar("SELECT state FROM positions_current WHERE position_id = $1")
+            .bind(position_id)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
 
     assert_eq!(state, "exiting");
 }

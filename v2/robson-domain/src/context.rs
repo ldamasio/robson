@@ -104,12 +104,8 @@ impl IdentityScope {
             tenant_id: tenant_id
                 .map(|s| s.to_string())
                 .unwrap_or_else(|| DEFAULT_TENANT_ID.to_string()),
-            user_id: user_id
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| DEFAULT_USER_ID.to_string()),
-            profile: profile
-                .map(|s| s.to_string())
-                .unwrap_or_else(|| DEFAULT_PROFILE.to_string()),
+            user_id: user_id.map(|s| s.to_string()).unwrap_or_else(|| DEFAULT_USER_ID.to_string()),
+            profile: profile.map(|s| s.to_string()).unwrap_or_else(|| DEFAULT_PROFILE.to_string()),
         }
     }
 }
@@ -125,11 +121,7 @@ impl std::fmt::Display for IdentityScope {
         if self.is_single_user() {
             write!(f, "single-user(profile={})", self.profile)
         } else {
-            write!(
-                f,
-                "tenant={}/user={}/profile={}",
-                self.tenant_id, self.user_id, self.profile
-            )
+            write!(f, "tenant={}/user={}/profile={}", self.tenant_id, self.user_id, self.profile)
         }
     }
 }
@@ -210,10 +202,7 @@ mod tests {
     #[test]
     fn test_display_multi_tenant() {
         let scope = IdentityScope::new("org123", "user456", "prod");
-        assert_eq!(
-            format!("{}", scope),
-            "tenant=org123/user=user456/profile=prod"
-        );
+        assert_eq!(format!("{}", scope), "tenant=org123/user=user456/profile=prod");
     }
 
     #[test]

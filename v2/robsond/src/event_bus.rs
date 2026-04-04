@@ -67,10 +67,7 @@ pub enum DaemonEvent {
     },
 
     /// Safety exit execution failed
-    SafetyExitFailed {
-        symbol: String,
-        error: String,
-    },
+    SafetyExitFailed { symbol: String, error: String },
 
     /// Panic mode activated (all retries exhausted)
     SafetyPanic {

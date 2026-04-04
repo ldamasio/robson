@@ -33,12 +33,12 @@ use robson_connectors::BinanceRestClient;
 use robson_domain::{Position, PositionId, Symbol};
 use robson_engine::Engine;
 use robson_exec::{ExchangePort, Executor, IntentJournal, StubExchange};
+#[cfg(feature = "postgres")]
+use robson_store::PgDetectedPositionRepository;
 use robson_store::{
     DetectedPositionRepository, MemoryDetectedPositionRepository, MemoryStore, PositionRepository,
     Store, StoreError,
 };
-#[cfg(feature = "postgres")]
-use robson_store::PgDetectedPositionRepository;
 
 use crate::api::{ApiState, create_router};
 use crate::config::Config;
@@ -46,7 +46,9 @@ use crate::error::{DaemonError, DaemonResult};
 use crate::event_bus::{DaemonEvent, EventBus};
 use crate::market_data::MarketDataManager;
 use crate::position_manager::PositionManager;
-use crate::position_monitor::{PositionMonitor, PositionMonitorConfig as RuntimePositionMonitorConfig};
+use crate::position_monitor::{
+    PositionMonitor, PositionMonitorConfig as RuntimePositionMonitorConfig,
+};
 
 #[cfg(feature = "postgres")]
 use crate::projection_worker::ProjectionWorker;
@@ -109,10 +111,7 @@ impl<S: Store + 'static> PositionRepository for StorePositionRepositoryAdapter<S
         symbol: &robson_domain::Symbol,
         side: robson_domain::Side,
     ) -> Result<Option<Position>, StoreError> {
-        self.store
-            .positions()
-            .find_active_by_symbol_and_side(symbol, side)
-            .await
+        self.store.positions().find_active_by_symbol_and_side(symbol, side).await
     }
 
     async fn delete(&self, id: PositionId) -> Result<(), StoreError> {
@@ -236,9 +235,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
 
         // 2. Initialize safety net monitor (when configured with Binance credentials)
         let position_monitor = self.initialize_position_monitor().await?;
-        let position_monitor_handle = position_monitor
-            .as_ref()
-            .map(|monitor| Arc::clone(monitor).start());
+        let position_monitor_handle =
+            position_monitor.as_ref().map(|monitor| Arc::clone(monitor).start());
 
         // 3. Start API server
         let api_addr = self.start_api_server(position_monitor.clone()).await?;
@@ -253,14 +251,17 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
 
         // 4. Spawn projection worker (if pg_pool configured)
         #[cfg(feature = "postgres")]
-        let projection_handle = if let (Some(pool), Some(tenant_id)) = (&self.pg_pool, self.config.projection.tenant_id) {
+        let projection_handle = if let (Some(pool), Some(tenant_id)) =
+            (&self.pg_pool, self.config.projection.tenant_id)
+        {
             info!(
                 stream_key = %self.config.projection.stream_key,
                 %tenant_id,
                 "Starting projection worker with shared pool"
             );
 
-            let worker = ProjectionWorker::new((**pool).clone(), self.config.projection.clone(), tenant_id);
+            let worker =
+                ProjectionWorker::new((**pool).clone(), self.config.projection.clone(), tenant_id);
 
             let worker_shutdown = shutdown.clone();
             Some(tokio::spawn(async move {
@@ -380,7 +381,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         // Store is empty, try projection recovery if available
         #[cfg(feature = "postgres")]
         {
-            if let (Some(recovery), Some(tenant_id)) = (&self.projection_recovery, self.config.projection.tenant_id) {
+            if let (Some(recovery), Some(tenant_id)) =
+                (&self.projection_recovery, self.config.projection.tenant_id)
+            {
                 info!("Store empty, attempting projection recovery");
 
                 match recovery.find_active_from_projection(tenant_id).await {
@@ -402,10 +405,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                         } else {
                             info!("Projection recovery: no active positions found");
                         }
-                    }
+                    },
                     Err(e) => {
                         warn!(error = %e, "Projection recovery failed, continuing with empty store");
-                    }
+                    },
                 }
             } else {
                 info!("No projection recovery configured, starting with empty store");
@@ -555,12 +558,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                 return Err(DaemonError::Shutdown);
             },
 
-            DaemonEvent::RoguePositionDetected {
-                symbol,
-                side,
-                entry_price,
-                stop_price,
-            } => {
+            DaemonEvent::RoguePositionDetected { symbol, side, entry_price, stop_price } => {
                 info!(
                     %symbol,
                     ?side,
@@ -570,11 +568,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                 );
             },
 
-            DaemonEvent::SafetyExitExecuted {
-                symbol,
-                order_id,
-                executed_quantity,
-            } => {
+            DaemonEvent::SafetyExitExecuted { symbol, order_id, executed_quantity } => {
                 info!(
                     %symbol,
                     %order_id,
@@ -608,12 +602,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                 );
             },
 
-            DaemonEvent::CorePositionOpened {
-                position_id,
-                symbol,
-                side,
-                ..
-            } => {
+            DaemonEvent::CorePositionOpened { position_id, symbol, side, .. } => {
                 info!(
                     %position_id,
                     %symbol,
@@ -622,11 +611,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                 );
             },
 
-            DaemonEvent::CorePositionClosed {
-                position_id,
-                symbol,
-                side,
-            } => {
+            DaemonEvent::CorePositionClosed { position_id, symbol, side } => {
                 info!(
                     %position_id,
                     %symbol,

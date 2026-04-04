@@ -26,9 +26,9 @@
 
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use tokio_tungstenite::{connect_async, tungstenite::Message, WebSocketStream, MaybeTlsStream};
-use tokio::net::TcpStream;
 use std::time::Duration;
+use tokio::net::TcpStream;
+use tokio_tungstenite::{MaybeTlsStream, WebSocketStream, connect_async, tungstenite::Message};
 
 // =============================================================================
 // Constants
@@ -107,10 +107,7 @@ impl BinanceWebSocketClient {
     /// # Arguments
     ///
     /// * `symbol` - Trading pair (e.g., "BTCUSDT")
-    pub async fn subscribe_ticker(
-        &self,
-        symbol: &str,
-    ) -> Result<BinanceWsStream, BinanceWsError> {
+    pub async fn subscribe_ticker(&self, symbol: &str) -> Result<BinanceWsStream, BinanceWsError> {
         let symbol_lower = symbol.to_lowercase();
         let url = format!("{}/ws/{}@ticker", self.base_url, symbol_lower);
 
@@ -209,11 +206,7 @@ pub struct BinanceWsStream {
 
 impl BinanceWsStream {
     fn new(inner: WebSocketStream<MaybeTlsStream<TcpStream>>, stream_type: StreamType) -> Self {
-        Self {
-            inner,
-            stream_type,
-            last_ping: None,
-        }
+        Self { inner, stream_type, last_ping: None }
     }
 
     /// Receive next message from stream.
@@ -240,7 +233,7 @@ impl BinanceWsStream {
                     Ok(msg) => Some(Ok(msg)),
                     Err(e) => Some(Err(BinanceWsError::ParseError(e.to_string()))),
                 }
-            }
+            },
             Some(Ok(Message::Ping(_))) => {
                 // Respond to ping with pong
                 if let Err(e) = self.pong().await {
@@ -248,18 +241,18 @@ impl BinanceWsStream {
                 }
                 // Continue receiving next message
                 Box::pin(self.next()).await
-            }
+            },
             Some(Ok(Message::Pong(_))) => {
                 // Pong received, continue
                 Box::pin(self.next()).await
-            }
+            },
             Some(Ok(Message::Close(_))) => None,
             Some(Err(e)) => Some(Err(BinanceWsError::ReceiveFailed(e.to_string()))),
             None => None,
             _ => {
                 // Binary or Frame messages, skip
                 Box::pin(self.next()).await
-            }
+            },
         }
     }
 
@@ -623,7 +616,7 @@ mod tests {
             WsMessage::Ticker(ticker) => {
                 assert_eq!(ticker.symbol, "BTCUSDT");
                 assert_eq!(ticker.close_price, "51000.00");
-            }
+            },
             _ => panic!("Expected Ticker event"),
         }
     }
@@ -650,7 +643,7 @@ mod tests {
                 assert_eq!(trade.symbol, "BTCUSDT");
                 assert_eq!(trade.price, "50000.00");
                 assert!(trade.is_buyer_maker);
-            }
+            },
             _ => panic!("Expected AggTrade event"),
         }
     }
@@ -682,7 +675,7 @@ mod tests {
                 assert_eq!(report.symbol, "BTCUSDT");
                 assert_eq!(report.order_status, "FILLED");
                 assert_eq!(report.side, "BUY");
-            }
+            },
             _ => panic!("Expected ExecutionReport event"),
         }
     }

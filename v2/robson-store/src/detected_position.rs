@@ -47,8 +47,15 @@ pub struct DetectedPositionDto {
 impl DetectedPositionDto {
     /// Convert from domain DetectedPosition to DTO.
     pub fn from_domain(pos: &DetectedPosition) -> Self {
-        let position_id = format!("{}:{}", pos.symbol.as_pair(),
-            if pos.side == Side::Long { "long" } else { "short" });
+        let position_id = format!(
+            "{}:{}",
+            pos.symbol.as_pair(),
+            if pos.side == Side::Long {
+                "long"
+            } else {
+                "short"
+            }
+        );
 
         Self {
             position_id,
@@ -57,20 +64,42 @@ impl DetectedPositionDto {
             side: format!("{:?}", pos.side).to_lowercase(),
             entry_price: pos.entry_price.as_decimal(),
             quantity: pos.quantity.as_decimal(),
-            stop_price: pos.calculated_stop.as_ref().map(|s| s.stop_price.as_decimal()).unwrap_or_else(|| {
-                // Calculate if not set (shouldn't happen with proper flow)
-                match pos.side {
-                    Side::Long => pos.entry_price.as_decimal() * Decimal::from(98u32) / Decimal::from(100u32),
-                    Side::Short => pos.entry_price.as_decimal() * Decimal::from(102u32) / Decimal::from(100u32),
-                }
-            }),
+            stop_price: pos
+                .calculated_stop
+                .as_ref()
+                .map(|s| s.stop_price.as_decimal())
+                .unwrap_or_else(|| {
+                    // Calculate if not set (shouldn't happen with proper flow)
+                    match pos.side {
+                        Side::Long => {
+                            pos.entry_price.as_decimal() * Decimal::from(98u32)
+                                / Decimal::from(100u32)
+                        },
+                        Side::Short => {
+                            pos.entry_price.as_decimal() * Decimal::from(102u32)
+                                / Decimal::from(100u32)
+                        },
+                    }
+                }),
             stop_distance: pos.calculated_stop.as_ref().map(|s| s.distance).unwrap_or_else(|| {
                 match pos.side {
-                    Side::Long => pos.entry_price.as_decimal() - (pos.entry_price.as_decimal() * Decimal::from(98u32) / Decimal::from(100u32)),
-                    Side::Short => (pos.entry_price.as_decimal() * Decimal::from(102u32) / Decimal::from(100u32)) - pos.entry_price.as_decimal(),
+                    Side::Long => {
+                        pos.entry_price.as_decimal()
+                            - (pos.entry_price.as_decimal() * Decimal::from(98u32)
+                                / Decimal::from(100u32))
+                    },
+                    Side::Short => {
+                        (pos.entry_price.as_decimal() * Decimal::from(102u32)
+                            / Decimal::from(100u32))
+                            - pos.entry_price.as_decimal()
+                    },
                 }
             }),
-            stop_distance_pct: pos.calculated_stop.as_ref().map(|s| s.distance_pct).unwrap_or_else(|| Decimal::from(2)),
+            stop_distance_pct: pos
+                .calculated_stop
+                .as_ref()
+                .map(|s| s.distance_pct)
+                .unwrap_or_else(|| Decimal::from(2)),
             detected_at: pos.detected_at,
             last_verified_at: pos.last_verified_at,
             closed_at: None, // Not tracked in domain, managed by repository
@@ -85,8 +114,9 @@ impl DetectedPositionDto {
 
     /// Convert from DTO to domain DetectedPosition.
     pub fn to_domain(&self) -> Result<DetectedPosition, StoreError> {
-        let symbol = Symbol::from_pair(&self.symbol)
-            .map_err(|e| StoreError::Deserialization(format!("Invalid symbol {}: {}", self.symbol, e)))?;
+        let symbol = Symbol::from_pair(&self.symbol).map_err(|e| {
+            StoreError::Deserialization(format!("Invalid symbol {}: {}", self.symbol, e))
+        })?;
 
         let side = match self.side.as_str() {
             "long" => Side::Long,
@@ -94,11 +124,13 @@ impl DetectedPositionDto {
             _ => return Err(StoreError::Deserialization(format!("Invalid side: {}", self.side))),
         };
 
-        let entry_price = Price::new(self.entry_price)
-            .map_err(|e| StoreError::Deserialization(format!("Invalid entry_price {}: {}", self.entry_price, e)))?;
+        let entry_price = Price::new(self.entry_price).map_err(|e| {
+            StoreError::Deserialization(format!("Invalid entry_price {}: {}", self.entry_price, e))
+        })?;
 
-        let quantity = Quantity::new(self.quantity)
-            .map_err(|e| StoreError::Deserialization(format!("Invalid quantity {}: {}", self.quantity, e)))?;
+        let quantity = Quantity::new(self.quantity).map_err(|e| {
+            StoreError::Deserialization(format!("Invalid quantity {}: {}", self.quantity, e))
+        })?;
 
         let mut pos = DetectedPosition::new(
             self.binance_position_id.clone(),
@@ -183,7 +215,10 @@ pub trait DetectedPositionRepository: Send + Sync {
     async fn log_execution(&self, execution: &SafetyExecutionDto) -> Result<(), StoreError>;
 
     /// Get execution history for a position.
-    async fn get_executions(&self, position_id: &str) -> Result<Vec<SafetyExecutionDto>, StoreError>;
+    async fn get_executions(
+        &self,
+        position_id: &str,
+    ) -> Result<Vec<SafetyExecutionDto>, StoreError>;
 
     /// Find positions in panic mode.
     async fn find_panic_mode(&self) -> Result<Vec<DetectedPosition>, StoreError>;
@@ -300,7 +335,10 @@ impl DetectedPositionRepository for MemoryDetectedPositionRepository {
         Ok(())
     }
 
-    async fn get_executions(&self, position_id: &str) -> Result<Vec<SafetyExecutionDto>, StoreError> {
+    async fn get_executions(
+        &self,
+        position_id: &str,
+    ) -> Result<Vec<SafetyExecutionDto>, StoreError> {
         let executions = self.executions.read().await;
         Ok(executions.iter().filter(|e| e.position_id == position_id).cloned().collect())
     }
@@ -366,7 +404,7 @@ impl DetectedPositionRepository for PgDetectedPositionRepository {
                 verified_at = EXCLUDED.verified_at,
                 closed_at = EXCLUDED.closed_at,
                 is_active = EXCLUDED.is_active
-            "#
+            "#,
         )
         .bind(&dto.position_id)
         .bind(&dto.symbol)
@@ -389,7 +427,7 @@ impl DetectedPositionRepository for PgDetectedPositionRepository {
 
     async fn find_by_id(&self, id: &str) -> Result<Option<DetectedPosition>, StoreError> {
         let row = sqlx::query_as::<_, DetectedPositionDto>(
-            "SELECT * FROM detected_positions WHERE position_id = $1"
+            "SELECT * FROM detected_positions WHERE position_id = $1",
         )
         .bind(id)
         .fetch_optional(&*self.pool)
@@ -400,7 +438,7 @@ impl DetectedPositionRepository for PgDetectedPositionRepository {
 
     async fn find_active(&self) -> Result<Vec<DetectedPosition>, StoreError> {
         let rows = sqlx::query_as::<_, DetectedPositionDto>(
-            "SELECT * FROM detected_positions WHERE is_active = TRUE ORDER BY detected_at ASC"
+            "SELECT * FROM detected_positions WHERE is_active = TRUE ORDER BY detected_at ASC",
         )
         .fetch_all(&*self.pool)
         .await?;
@@ -416,7 +454,7 @@ impl DetectedPositionRepository for PgDetectedPositionRepository {
 
     async fn find_by_symbol(&self, symbol: &str) -> Result<Vec<DetectedPosition>, StoreError> {
         let rows = sqlx::query_as::<_, DetectedPositionDto>(
-            "SELECT * FROM detected_positions WHERE symbol = $1 ORDER BY detected_at DESC"
+            "SELECT * FROM detected_positions WHERE symbol = $1 ORDER BY detected_at DESC",
         )
         .bind(symbol)
         .fetch_all(&*self.pool)
@@ -459,7 +497,7 @@ impl DetectedPositionRepository for PgDetectedPositionRepository {
                 is_panic_mode = $3,
                 last_error = $4
             WHERE position_id = $5
-            "#
+            "#,
         )
         .bind(attempted_at)
         .bind(failures)
@@ -481,7 +519,7 @@ impl DetectedPositionRepository for PgDetectedPositionRepository {
                 is_panic_mode = FALSE,
                 last_error = NULL
             WHERE position_id = $1
-            "#
+            "#,
         )
         .bind(id)
         .execute(&*self.pool)
@@ -499,7 +537,7 @@ impl DetectedPositionRepository for PgDetectedPositionRepository {
                 exchange_order_id, status, error_message,
                 attempt_number, is_retry, attempted_at, completed_at
             ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
-            "#
+            "#,
         )
         .bind(execution.execution_id)
         .bind(&execution.position_id)
@@ -522,9 +560,12 @@ impl DetectedPositionRepository for PgDetectedPositionRepository {
         Ok(())
     }
 
-    async fn get_executions(&self, position_id: &str) -> Result<Vec<SafetyExecutionDto>, StoreError> {
+    async fn get_executions(
+        &self,
+        position_id: &str,
+    ) -> Result<Vec<SafetyExecutionDto>, StoreError> {
         let executions = sqlx::query_as::<_, SafetyExecutionDto>(
-            "SELECT * FROM safety_net_executions WHERE position_id = $1 ORDER BY attempted_at DESC"
+            "SELECT * FROM safety_net_executions WHERE position_id = $1 ORDER BY attempted_at DESC",
         )
         .bind(position_id)
         .fetch_all(&*self.pool)
@@ -535,7 +576,7 @@ impl DetectedPositionRepository for PgDetectedPositionRepository {
 
     async fn find_panic_mode(&self) -> Result<Vec<DetectedPosition>, StoreError> {
         let rows = sqlx::query_as::<_, DetectedPositionDto>(
-            "SELECT * FROM detected_positions WHERE is_panic_mode = TRUE AND is_active = TRUE"
+            "SELECT * FROM detected_positions WHERE is_panic_mode = TRUE AND is_active = TRUE",
         )
         .fetch_all(&*self.pool)
         .await?;
@@ -550,12 +591,10 @@ impl DetectedPositionRepository for PgDetectedPositionRepository {
     }
 
     async fn cleanup_old_positions(&self, older_than: DateTime<Utc>) -> Result<u64, StoreError> {
-        let result = sqlx::query(
-            "DELETE FROM detected_positions WHERE closed_at < $1"
-        )
-        .bind(older_than)
-        .execute(&*self.pool)
-        .await?;
+        let result = sqlx::query("DELETE FROM detected_positions WHERE closed_at < $1")
+            .bind(older_than)
+            .execute(&*self.pool)
+            .await?;
 
         Ok(result.rows_affected())
     }
@@ -617,7 +656,8 @@ mod tests {
 
         let now = Utc::now();
         repo.update_execution_attempt("BTCUSDT:long", now, 2, false, Some("error".to_string()))
-            .await.unwrap();
+            .await
+            .unwrap();
 
         let active = repo.find_active().await.unwrap();
         assert_eq!(active.len(), 1);

@@ -133,10 +133,7 @@ impl RiskContext {
         daily_realized_pnl: Decimal,
         daily_unrealized_pnl: Decimal,
     ) -> Self {
-        let total_notional_exposure = open_positions
-            .iter()
-            .map(|p| p.notional_value)
-            .sum();
+        let total_notional_exposure = open_positions.iter().map(|p| p.notional_value).sum();
 
         Self {
             capital,
@@ -159,9 +156,7 @@ impl RiskContext {
 
     /// Check if there's an existing position with same symbol and side
     pub fn has_duplicate_position(&self, symbol: &str, side: &str) -> bool {
-        self.open_positions
-            .iter()
-            .any(|p| p.symbol == symbol && p.side == side)
+        self.open_positions.iter().any(|p| p.symbol == symbol && p.side == side)
     }
 }
 
@@ -251,9 +246,7 @@ pub struct RiskGate {
 impl RiskGate {
     /// Create a new RiskGate with default limits
     pub fn new() -> Self {
-        Self {
-            limits: RiskLimits::default(),
-        }
+        Self { limits: RiskLimits::default() }
     }
 
     /// Create a RiskGate with custom limits
@@ -291,7 +284,8 @@ impl RiskGate {
 
         // 2. Check total exposure
         let new_total_exposure = context.total_notional_exposure + proposed.notional_value;
-        let max_exposure = context.capital * self.limits.max_total_exposure_pct / Decimal::from(100);
+        let max_exposure =
+            context.capital * self.limits.max_total_exposure_pct / Decimal::from(100);
         if new_total_exposure > max_exposure {
             debug!(
                 current = %context.total_notional_exposure,
@@ -323,9 +317,7 @@ impl RiskGate {
                 check: RiskCheck::SinglePositionConcentration,
                 reason: format!(
                     "Position size {} exceeds {}% of capital ({})",
-                    proposed.notional_value,
-                    self.limits.max_single_position_pct,
-                    max_single
+                    proposed.notional_value, self.limits.max_single_position_pct, max_single
                 ),
             };
         }
@@ -339,17 +331,14 @@ impl RiskGate {
             );
             return RiskVerdict::Rejected {
                 check: RiskCheck::DuplicatePosition,
-                reason: format!(
-                    "Already have {} position on {}",
-                    proposed.side,
-                    proposed.symbol
-                ),
+                reason: format!("Already have {} position on {}", proposed.side, proposed.symbol),
             };
         }
 
         // 5. Check daily loss circuit breaker
         let daily_pnl = context.total_daily_pnl();
-        let daily_loss_limit = context.capital * self.limits.daily_loss_limit_pct / Decimal::from(100);
+        let daily_loss_limit =
+            context.capital * self.limits.daily_loss_limit_pct / Decimal::from(100);
         if daily_pnl < -daily_loss_limit {
             debug!(
                 daily_pnl = %daily_pnl,
@@ -360,8 +349,7 @@ impl RiskGate {
                 check: RiskCheck::DailyLossLimit,
                 reason: format!(
                     "Daily P&L {} has exceeded loss limit of -{}",
-                    daily_pnl,
-                    daily_loss_limit
+                    daily_pnl, daily_loss_limit
                 ),
             };
         }
@@ -404,9 +392,9 @@ mod tests {
         ProposedTrade {
             symbol: "BTCUSDT".to_string(),
             side: "long".to_string(),
-            quantity: dec!(0.02),  // 0.02 BTC
+            quantity: dec!(0.02), // 0.02 BTC
             entry_price: dec!(50000),
-            notional_value: dec!(1000),  // $1,000 (within 15% single position limit)
+            notional_value: dec!(1000), // $1,000 (within 15% single position limit)
             margin_required: dec!(100),
         }
     }
@@ -443,7 +431,10 @@ mod tests {
         let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
-        assert!(matches!(verdict, RiskVerdict::Rejected { check: RiskCheck::MaxOpenPositions, .. }));
+        assert!(matches!(
+            verdict,
+            RiskVerdict::Rejected { check: RiskCheck::MaxOpenPositions, .. }
+        ));
     }
 
     #[test]
@@ -451,16 +442,14 @@ mod tests {
         let gate = RiskGate::new();
         let context = RiskContext::with_positions(
             dec!(10000),
-            vec![
-                PositionSummary {
-                    position_id: uuid::Uuid::nil(),
-                    symbol: "ETHUSDT".to_string(),
-                    side: "long".to_string(),
-                    notional_value: dec!(2900),
-                    margin_used: dec!(290),
-                    unrealized_pnl: dec!(0),
-                },
-            ],
+            vec![PositionSummary {
+                position_id: uuid::Uuid::nil(),
+                symbol: "ETHUSDT".to_string(),
+                side: "long".to_string(),
+                notional_value: dec!(2900),
+                margin_used: dec!(290),
+                unrealized_pnl: dec!(0),
+            }],
             dec!(0),
             dec!(0),
         );
@@ -493,7 +482,13 @@ mod tests {
         };
 
         let verdict = gate.evaluate(&proposed, &context);
-        assert!(matches!(verdict, RiskVerdict::Rejected { check: RiskCheck::SinglePositionConcentration, .. }));
+        assert!(matches!(
+            verdict,
+            RiskVerdict::Rejected {
+                check: RiskCheck::SinglePositionConcentration,
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -501,23 +496,24 @@ mod tests {
         let gate = RiskGate::new();
         let context = RiskContext::with_positions(
             dec!(10000),
-            vec![
-                PositionSummary {
-                    position_id: uuid::Uuid::nil(),
-                    symbol: "BTCUSDT".to_string(),
-                    side: "long".to_string(),
-                    notional_value: dec!(1000),
-                    margin_used: dec!(100),
-                    unrealized_pnl: dec!(0),
-                },
-            ],
+            vec![PositionSummary {
+                position_id: uuid::Uuid::nil(),
+                symbol: "BTCUSDT".to_string(),
+                side: "long".to_string(),
+                notional_value: dec!(1000),
+                margin_used: dec!(100),
+                unrealized_pnl: dec!(0),
+            }],
             dec!(0),
             dec!(0),
         );
         let proposed = sample_proposed(); // BTCUSDT long
 
         let verdict = gate.evaluate(&proposed, &context);
-        assert!(matches!(verdict, RiskVerdict::Rejected { check: RiskCheck::DuplicatePosition, .. }));
+        assert!(matches!(
+            verdict,
+            RiskVerdict::Rejected { check: RiskCheck::DuplicatePosition, .. }
+        ));
     }
 
     #[test]
@@ -534,7 +530,10 @@ mod tests {
         let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
-        assert!(matches!(verdict, RiskVerdict::Rejected { check: RiskCheck::DailyLossLimit, .. }));
+        assert!(matches!(
+            verdict,
+            RiskVerdict::Rejected { check: RiskCheck::DailyLossLimit, .. }
+        ));
     }
 
     #[test]
@@ -542,16 +541,14 @@ mod tests {
         let gate = RiskGate::new();
         let context = RiskContext::with_positions(
             dec!(10000),
-            vec![
-                PositionSummary {
-                    position_id: uuid::Uuid::nil(),
-                    symbol: "BTCUSDT".to_string(),
-                    side: "short".to_string(), // Different side
-                    notional_value: dec!(1000),
-                    margin_used: dec!(100),
-                    unrealized_pnl: dec!(0),
-                },
-            ],
+            vec![PositionSummary {
+                position_id: uuid::Uuid::nil(),
+                symbol: "BTCUSDT".to_string(),
+                side: "short".to_string(), // Different side
+                notional_value: dec!(1000),
+                margin_used: dec!(100),
+                unrealized_pnl: dec!(0),
+            }],
             dec!(0),
             dec!(0),
         );

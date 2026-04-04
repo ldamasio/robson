@@ -33,7 +33,7 @@ use robson_domain::{
     Symbol, TechnicalStopDistance,
 };
 use robson_engine::{Engine, EngineAction};
-use robson_exec::{ActionResult, ExecError, ExchangePort, Executor};
+use robson_exec::{ActionResult, ExchangePort, ExecError, Executor};
 use robson_store::Store;
 
 use crate::detector::DetectorTask;
@@ -394,8 +394,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         // Use engine to process fill (pure: State+Fill → Decision)
         // binance_position_id is passed through to EntryFilled event
-        let decision =
-            self.engine.process_entry_fill(&position, fill_price, filled_quantity, binance_position_id.clone())?;
+        let decision = self.engine.process_entry_fill(
+            &position,
+            fill_price,
+            filled_quantity,
+            binance_position_id.clone(),
+        )?;
 
         // Execute actions (EntryFilled event transitions position to Active via apply_event)
         self.executor.execute(decision.actions).await?;
@@ -598,7 +602,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let fill_price = results
             .into_iter()
             .find_map(|r| {
-                if let ActionResult::OrderPlaced(order) = r { Some(order.fill_price) } else { None }
+                if let ActionResult::OrderPlaced(order) = r {
+                    Some(order.fill_price)
+                } else {
+                    None
+                }
             })
             .ok_or(DaemonError::Exec(ExecError::InvalidState(
                 "Panic close: PlaceExitOrder did not return OrderPlaced".to_string(),
@@ -734,7 +742,11 @@ mod tests {
         manager.disarm_position(position.id).await.unwrap();
 
         // Position must be kept for audit trail, transitioned to Closed state
-        let loaded = manager.get_position(position.id).await.unwrap().expect("position must exist after disarm");
+        let loaded = manager
+            .get_position(position.id)
+            .await
+            .unwrap()
+            .expect("position must exist after disarm");
         assert!(
             matches!(loaded.state, PositionState::Closed { .. }),
             "expected Closed after disarm, got {:?}",
@@ -783,11 +795,8 @@ mod tests {
         // Core open event must be emitted when position becomes active
         let mut opened = false;
         for _ in 0..20 {
-            if let Ok(Some(event)) = tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                receiver.recv(),
-            )
-            .await
+            if let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv()).await
             {
                 if let Ok(DaemonEvent::CorePositionOpened { position_id, symbol, side, .. }) = event
                 {
@@ -883,11 +892,8 @@ mod tests {
 
         let mut closed = false;
         for _ in 0..20 {
-            if let Ok(Some(event)) = tokio::time::timeout(
-                std::time::Duration::from_millis(50),
-                receiver.recv(),
-            )
-            .await
+            if let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv()).await
             {
                 if let Ok(DaemonEvent::CorePositionClosed { position_id, symbol, side }) = event {
                     assert_eq!(position_id, position.id);

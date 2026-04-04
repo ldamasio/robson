@@ -126,7 +126,10 @@ impl BinanceRestClient {
     /// 1. All parameters in query string
     /// 2. HMAC SHA256 signature of query string
     /// 3. signature and timestamp as query parameters
-    fn build_signed_query(&self, mut params: Vec<(&str, String)>) -> Result<String, BinanceRestError> {
+    fn build_signed_query(
+        &self,
+        mut params: Vec<(&str, String)>,
+    ) -> Result<String, BinanceRestError> {
         // Add timestamp
         let timestamp = Utc::now().timestamp_millis().to_string();
         params.push(("timestamp", timestamp));
@@ -135,11 +138,8 @@ impl BinanceRestClient {
         params.sort_by(|a, b| a.0.cmp(b.0));
 
         // Build query string
-        let query_string: String = params
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect::<Vec<_>>()
-            .join("&");
+        let query_string: String =
+            params.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&");
 
         // Create signature
         use hmac::{Hmac, Mac};
@@ -158,24 +158,28 @@ impl BinanceRestClient {
     }
 
     /// Send a GET request to a public endpoint.
-    async fn get_public(&self, endpoint: &str, params: Vec<(&str, String)>) -> Result<String, BinanceRestError> {
+    async fn get_public(
+        &self,
+        endpoint: &str,
+        params: Vec<(&str, String)>,
+    ) -> Result<String, BinanceRestError> {
         let url = if params.is_empty() {
             format!("{}{}", self.base_url(), endpoint)
         } else {
-            let query = params.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&");
+            let query =
+                params.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&");
             format!("{}{}?{}", self.base_url(), endpoint, query)
         };
 
-        let response = timeout(
-            Duration::from_secs(REQUEST_TIMEOUT_SECS),
-            self.client.get(&url).send(),
-        )
-        .await
-        .map_err(|_| BinanceRestError::Timeout)?
-        .map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
+        let response =
+            timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), self.client.get(&url).send())
+                .await
+                .map_err(|_| BinanceRestError::Timeout)?
+                .map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
 
         let status = response.status();
-        let body = response.text().await.map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+        let body =
+            response.text().await.map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
 
         if !status.is_success() {
             // Try to parse Binance error response
@@ -189,23 +193,25 @@ impl BinanceRestClient {
     }
 
     /// Send a GET request to a signed endpoint.
-    async fn get_signed(&self, endpoint: &str, params: Vec<(&str, String)>) -> Result<String, BinanceRestError> {
+    async fn get_signed(
+        &self,
+        endpoint: &str,
+        params: Vec<(&str, String)>,
+    ) -> Result<String, BinanceRestError> {
         let query = self.build_signed_query(params)?;
         let url = format!("{}{}?{}", self.base_url(), endpoint, query);
 
         let response = timeout(
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
-            self.client
-                .get(&url)
-                .header("X-MBX-APIKEY", &self.api_key)
-                .send(),
+            self.client.get(&url).header("X-MBX-APIKEY", &self.api_key).send(),
         )
         .await
         .map_err(|_| BinanceRestError::Timeout)?
         .map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
 
         let status = response.status();
-        let body = response.text().await.map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+        let body =
+            response.text().await.map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
 
         if !status.is_success() {
             // Try to parse Binance error response
@@ -219,23 +225,25 @@ impl BinanceRestClient {
     }
 
     /// Send a POST request to a signed endpoint.
-    async fn post_signed(&self, endpoint: &str, params: Vec<(&str, String)>) -> Result<String, BinanceRestError> {
+    async fn post_signed(
+        &self,
+        endpoint: &str,
+        params: Vec<(&str, String)>,
+    ) -> Result<String, BinanceRestError> {
         let query = self.build_signed_query(params)?;
         let url = format!("{}{}?{}", self.base_url(), endpoint, query);
 
         let response = timeout(
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
-            self.client
-                .post(&url)
-                .header("X-MBX-APIKEY", &self.api_key)
-                .send(),
+            self.client.post(&url).header("X-MBX-APIKEY", &self.api_key).send(),
         )
         .await
         .map_err(|_| BinanceRestError::Timeout)?
         .map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
 
         let status = response.status();
-        let body = response.text().await.map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+        let body =
+            response.text().await.map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
 
         if !status.is_success() {
             // Try to parse Binance error response
@@ -283,9 +291,7 @@ impl BinanceRestClient {
     pub async fn get_all_isolated_margin_accounts(
         &self,
     ) -> Result<Vec<IsolatedMarginAccount>, BinanceRestError> {
-        let body = self
-            .get_signed("/sapi/v1/margin/isolated/account", vec![])
-            .await?;
+        let body = self.get_signed("/sapi/v1/margin/isolated/account", vec![]).await?;
 
         // Response is an array of accounts
         serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
@@ -406,8 +412,8 @@ impl BinanceRestClient {
 
         let body = self.get_public("/api/v3/ticker/price", params).await?;
 
-        let response: PriceResponse = serde_json::from_str(&body)
-            .map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+        let response: PriceResponse =
+            serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
 
         Ok(Price::new(response.price).map_err(|e| {
             BinanceRestError::ParseError(format!("Invalid price in response: {}", e))
@@ -415,9 +421,9 @@ impl BinanceRestClient {
     }
 
     /// Query order status.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `symbol` - Trading pair (e.g., "BTCUSDT")
     /// * `order_id` - Exchange order ID
     pub async fn get_order_status(
@@ -436,12 +442,12 @@ impl BinanceRestClient {
     }
 
     /// Ping Binance API to check connectivity.
-    /// 
+    ///
     /// Uses public endpoint, no authentication required.
     /// Returns Ok(()) if API is reachable, Err otherwise.
     pub async fn ping(&self) -> Result<(), BinanceRestError> {
         let body = self.get_public("/api/v3/ping", vec![]).await?;
-        
+
         // Ping returns empty JSON object {}
         if body.trim() == "{}" {
             Ok(())

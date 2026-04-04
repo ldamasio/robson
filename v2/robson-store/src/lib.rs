@@ -45,17 +45,17 @@ mod postgres;
 mod repository;
 
 // Re-exports
-pub use credential_store::{CredentialStore, MemoryCredentialStore};
 #[cfg(feature = "postgres")]
 pub use credential_store::PgCredentialStore;
+pub use credential_store::{CredentialStore, MemoryCredentialStore};
+#[cfg(feature = "postgres")]
+pub use detected_position::PgDetectedPositionRepository;
 pub use detected_position::{
     DetectedPositionDto, DetectedPositionRepository, MemoryDetectedPositionRepository,
     SafetyExecutionDto,
 };
-#[cfg(feature = "postgres")]
-pub use detected_position::PgDetectedPositionRepository;
 pub use error::StoreError;
 pub use memory::MemoryStore;
 #[cfg(feature = "postgres")]
-pub use postgres::{find_active_from_projection, PgProjectionReader, ProjectionRecovery};
+pub use postgres::{PgProjectionReader, ProjectionRecovery, find_active_from_projection};
 pub use repository::{EventRepository, OrderRepository, PositionRepository, Store};

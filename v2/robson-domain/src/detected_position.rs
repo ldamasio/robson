@@ -68,14 +68,16 @@ impl DetectedPosition {
         let stop_price = match self.side {
             Side::Long => {
                 // LONG: stop is below entry (2%)
-                let stop_value = self.entry_price.as_decimal() * Decimal::from(98u32) / Decimal::from(100u32);
+                let stop_value =
+                    self.entry_price.as_decimal() * Decimal::from(98u32) / Decimal::from(100u32);
                 Price::new(stop_value).unwrap_or(self.entry_price)
-            }
+            },
             Side::Short => {
                 // SHORT: stop is above entry (2%)
-                let stop_value = self.entry_price.as_decimal() * Decimal::from(102u32) / Decimal::from(100u32);
+                let stop_value =
+                    self.entry_price.as_decimal() * Decimal::from(102u32) / Decimal::from(100u32);
                 Price::new(stop_value).unwrap_or(self.entry_price)
-            }
+            },
         };
 
         let entry = self.entry_price.as_decimal();
@@ -186,13 +188,8 @@ mod tests {
         let entry = Price::new(dec!(95000)).unwrap();
         let quantity = Quantity::new(dec!(0.1)).unwrap();
 
-        let position = DetectedPosition::new(
-            "binance_123".to_string(),
-            symbol,
-            Side::Long,
-            entry,
-            quantity,
-        );
+        let position =
+            DetectedPosition::new("binance_123".to_string(), symbol, Side::Long, entry, quantity);
 
         assert_eq!(position.binance_position_id, "binance_123");
         assert_eq!(position.side, Side::Long);
@@ -207,13 +204,8 @@ mod tests {
         let entry = Price::new(dec!(95000)).unwrap();
         let quantity = Quantity::new(dec!(0.1)).unwrap();
 
-        let mut position = DetectedPosition::new(
-            "binance_123".to_string(),
-            symbol,
-            Side::Long,
-            entry,
-            quantity,
-        );
+        let mut position =
+            DetectedPosition::new("binance_123".to_string(), symbol, Side::Long, entry, quantity);
 
         let stop = position.calculate_safety_stop();
 
@@ -231,13 +223,8 @@ mod tests {
         let entry = Price::new(dec!(95000)).unwrap();
         let quantity = Quantity::new(dec!(0.1)).unwrap();
 
-        let mut position = DetectedPosition::new(
-            "binance_123".to_string(),
-            symbol,
-            Side::Short,
-            entry,
-            quantity,
-        );
+        let mut position =
+            DetectedPosition::new("binance_123".to_string(), symbol, Side::Short, entry, quantity);
 
         let stop = position.calculate_safety_stop();
 
@@ -254,13 +241,8 @@ mod tests {
         let entry = Price::new(dec!(95000)).unwrap();
         let quantity = Quantity::new(dec!(0.1)).unwrap();
 
-        let mut position = DetectedPosition::new(
-            "binance_123".to_string(),
-            symbol,
-            Side::Long,
-            entry,
-            quantity,
-        );
+        let mut position =
+            DetectedPosition::new("binance_123".to_string(), symbol, Side::Long, entry, quantity);
 
         position.calculate_safety_stop();
 
@@ -281,13 +263,8 @@ mod tests {
         let entry = Price::new(dec!(95000)).unwrap();
         let quantity = Quantity::new(dec!(0.1)).unwrap();
 
-        let mut position = DetectedPosition::new(
-            "binance_123".to_string(),
-            symbol,
-            Side::Short,
-            entry,
-            quantity,
-        );
+        let mut position =
+            DetectedPosition::new("binance_123".to_string(), symbol, Side::Short, entry, quantity);
 
         position.calculate_safety_stop();
 
@@ -308,13 +285,8 @@ mod tests {
         let entry = Price::new(dec!(95000)).unwrap();
         let quantity = Quantity::new(dec!(0.1)).unwrap();
 
-        let position = DetectedPosition::new(
-            "binance_123".to_string(),
-            symbol,
-            Side::Long,
-            entry,
-            quantity,
-        );
+        let position =
+            DetectedPosition::new("binance_123".to_string(), symbol, Side::Long, entry, quantity);
 
         // No stop calculated yet
         assert!(position.calculated_stop.is_none());
@@ -327,13 +299,8 @@ mod tests {
         let entry = Price::new(dec!(95000)).unwrap();
         let quantity = Quantity::new(dec!(0.1)).unwrap();
 
-        let mut position = DetectedPosition::new(
-            "binance_123".to_string(),
-            symbol,
-            Side::Long,
-            entry,
-            quantity,
-        );
+        let mut position =
+            DetectedPosition::new("binance_123".to_string(), symbol, Side::Long, entry, quantity);
 
         let original_time = position.last_verified_at;
 
@@ -371,13 +338,8 @@ mod tests {
         let entry = Price::new(dec!(95000)).unwrap();
         let quantity = Quantity::new(dec!(0.1)).unwrap();
 
-        let mut position = DetectedPosition::new(
-            "binance_123".to_string(),
-            symbol,
-            Side::Long,
-            entry,
-            quantity,
-        );
+        let mut position =
+            DetectedPosition::new("binance_123".to_string(), symbol, Side::Long, entry, quantity);
 
         position.calculate_safety_stop();
 

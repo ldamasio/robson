@@ -8,7 +8,7 @@
 #![cfg(feature = "postgres")]
 
 use chrono::Utc;
-use robson_eventlog::{append_event, Event, EventEnvelope};
+use robson_eventlog::{Event, EventEnvelope, append_event};
 use robson_projector::apply_event_to_projections;
 use robson_store::{PgProjectionReader, ProjectionRecovery};
 use rust_decimal::Decimal;
@@ -64,12 +64,10 @@ async fn setup_position_event(
     let event_id = append_event(pool, &stream_key, None, event).await?;
 
     // 3. Query the event envelope
-    let envelope: EventEnvelope = sqlx::query_as(
-        "SELECT * FROM event_log WHERE event_id = $1"
-    )
-    .bind(event_id)
-    .fetch_one(pool)
-    .await?;
+    let envelope: EventEnvelope = sqlx::query_as("SELECT * FROM event_log WHERE event_id = $1")
+        .bind(event_id)
+        .fetch_one(pool)
+        .await?;
 
     // 4. Apply event to projections
     apply_event_to_projections(pool, &envelope).await?;
@@ -97,12 +95,23 @@ async fn test_crash_recovery_restores_active_position(pool: sqlx::PgPool) {
 
     // 1. Create and persist POSITION_OPENED event
     setup_position_event(
-        &pool, tenant_id, position_id, account_id, strategy_id,
-        "BTCUSDT", dec!(95000), dec!(0.01), dec!(93500), dec!(1500)
-    ).await.expect("Failed to setup position event");
+        &pool,
+        tenant_id,
+        position_id,
+        account_id,
+        strategy_id,
+        "BTCUSDT",
+        dec!(95000),
+        dec!(0.01),
+        dec!(93500),
+        dec!(1500),
+    )
+    .await
+    .expect("Failed to setup position event");
 
     // 2. Create projection recovery reader
-    let projection_recovery = Arc::new(PgProjectionReader::new(Arc::new(pool))) as Arc<dyn ProjectionRecovery>;
+    let projection_recovery =
+        Arc::new(PgProjectionReader::new(Arc::new(pool))) as Arc<dyn ProjectionRecovery>;
 
     // 3. Restore positions from projection
     let restored = projection_recovery
@@ -123,7 +132,7 @@ async fn test_crash_recovery_restores_active_position(pool: sqlx::PgPool) {
     match &pos.state {
         PositionState::Armed => {
             // Position should be Armed after POSITION_OPENED
-        }
+        },
         _ => panic!("Expected Armed state, got {:?}", pos.state),
     }
 
@@ -154,12 +163,23 @@ async fn test_daemon_restore_positions_from_projection(pool: sqlx::PgPool) {
 
     // 1. Create and persist POSITION_OPENED event
     setup_position_event(
-        &pool, tenant_id, position_id, account_id, strategy_id,
-        "ETHUSDT", dec!(3000), dec!(0.5), dec!(2950), dec!(50)
-    ).await.expect("Failed to setup position event");
+        &pool,
+        tenant_id,
+        position_id,
+        account_id,
+        strategy_id,
+        "ETHUSDT",
+        dec!(3000),
+        dec!(0.5),
+        dec!(2950),
+        dec!(50),
+    )
+    .await
+    .expect("Failed to setup position event");
 
     // 2. Verify position is in projection
-    let projection_recovery = Arc::new(PgProjectionReader::new(Arc::new(pool))) as Arc<dyn robson_store::ProjectionRecovery>;
+    let projection_recovery = Arc::new(PgProjectionReader::new(Arc::new(pool)))
+        as Arc<dyn robson_store::ProjectionRecovery>;
     let restored = projection_recovery
         .find_active_from_projection(tenant_id)
         .await
@@ -184,21 +204,41 @@ async fn test_crash_recovery_skips_closed_positions(pool: sqlx::PgPool) {
     // 1. Create an active position (should be restored)
     let active_position_id = Uuid::now_v7();
     setup_position_event(
-        &pool, tenant_id, active_position_id, account_id, strategy_id,
-        "BTCUSDT", dec!(95000), dec!(0.01), dec!(93500), dec!(1500)
-    ).await.expect("Failed to setup active position event");
+        &pool,
+        tenant_id,
+        active_position_id,
+        account_id,
+        strategy_id,
+        "BTCUSDT",
+        dec!(95000),
+        dec!(0.01),
+        dec!(93500),
+        dec!(1500),
+    )
+    .await
+    .expect("Failed to setup active position event");
 
     // 2. Create a closed position (should NOT be restored)
     let closed_position_id = Uuid::now_v7();
     setup_position_event(
-        &pool, tenant_id, closed_position_id, account_id, strategy_id,
-        "BTCUSDT", dec!(90000), dec!(0.01), dec!(89000), dec!(1000)
-    ).await.expect("Failed to setup closed position event");
+        &pool,
+        tenant_id,
+        closed_position_id,
+        account_id,
+        strategy_id,
+        "BTCUSDT",
+        dec!(90000),
+        dec!(0.01),
+        dec!(89000),
+        dec!(1000),
+    )
+    .await
+    .expect("Failed to setup closed position event");
 
     // 3. Close the second position by updating state in projection
     let now = Utc::now();
     sqlx::query(
-        "UPDATE positions_current SET state = 'closed', closed_at = $1 WHERE position_id = $2"
+        "UPDATE positions_current SET state = 'closed', closed_at = $1 WHERE position_id = $2",
     )
     .bind(now)
     .bind(closed_position_id)
@@ -207,7 +247,8 @@ async fn test_crash_recovery_skips_closed_positions(pool: sqlx::PgPool) {
     .expect("Failed to close position");
 
     // 4. Restore positions from projection
-    let projection_recovery = Arc::new(PgProjectionReader::new(Arc::new(pool))) as Arc<dyn ProjectionRecovery>;
+    let projection_recovery =
+        Arc::new(PgProjectionReader::new(Arc::new(pool))) as Arc<dyn ProjectionRecovery>;
     let restored = projection_recovery
         .find_active_from_projection(tenant_id)
         .await
@@ -215,5 +256,8 @@ async fn test_crash_recovery_skips_closed_positions(pool: sqlx::PgPool) {
 
     // 5. Only the active position should be restored
     assert_eq!(restored.len(), 1, "Should restore only 1 active position");
-    assert_eq!(restored[0].id, active_position_id, "Should restore active position, not closed one");
+    assert_eq!(
+        restored[0].id, active_position_id,
+        "Should restore active position, not closed one"
+    );
 }

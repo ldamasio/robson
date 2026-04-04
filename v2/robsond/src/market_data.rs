@@ -39,11 +39,11 @@ impl MarketDataManager {
                 Ok(s) => {
                     info!(symbol = %symbol_str, "WebSocket client connected");
                     s
-                }
+                },
                 Err(e) => {
                     error!(error = %e, symbol = %symbol_str, "Failed to connect WebSocket");
                     return;
-                }
+                },
             };
 
             info!(symbol = %symbol_str, "WebSocket client task started");
@@ -55,18 +55,18 @@ impl MarketDataManager {
                     None => {
                         info!(symbol = %symbol_str, "WebSocket stream closed");
                         break;
-                    }
+                    },
                     Some(Err(e)) => {
                         error!(error = %e, symbol = %symbol_str, "WebSocket stream error");
                         break;
-                    }
+                    },
                     Some(Ok(WsMessage::AggTrade(trade))) => {
                         let price_decimal = match rust_decimal::Decimal::from_str(&trade.price) {
                             Ok(d) => d,
                             Err(e) => {
                                 error!(error = %e, "Failed to parse price from agg trade");
                                 continue;
-                            }
+                            },
                         };
 
                         let price = match Price::new(price_decimal) {
@@ -74,7 +74,7 @@ impl MarketDataManager {
                             Err(e) => {
                                 error!(error = %e, price = %trade.price, "Invalid price value");
                                 continue;
-                            }
+                            },
                         };
 
                         if !first_tick_logged {
@@ -91,7 +91,7 @@ impl MarketDataManager {
                             Err(e) => {
                                 error!(error = %e, symbol = %trade.symbol, "Failed to parse symbol");
                                 continue;
-                            }
+                            },
                         };
 
                         let timestamp = chrono::Utc::now();
@@ -102,10 +102,10 @@ impl MarketDataManager {
                         });
 
                         event_bus.send(daemon_event);
-                    }
+                    },
                     Some(Ok(_)) => {
                         // Other message types not needed here
-                    }
+                    },
                 }
             }
 

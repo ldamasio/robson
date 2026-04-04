@@ -238,7 +238,7 @@ where
 // =============================================================================
 
 /// Liveness probe for Kubernetes - checks if the process is alive.
-/// 
+///
 /// This endpoint always returns 200 OK if the process is running.
 /// Used by Kubernetes to determine if the pod should be restarted.
 async fn health_liveness() -> Json<HealthResponse> {
@@ -249,11 +249,11 @@ async fn health_liveness() -> Json<HealthResponse> {
 }
 
 /// Readiness probe for Kubernetes - checks if the service is ready to accept traffic.
-/// 
+///
 /// Checks:
 /// - Database connectivity (via store)
 /// - Binance API reachability
-/// 
+///
 /// Returns 200 OK if all checks pass, 503 Service Unavailable otherwise.
 async fn health_readiness<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
@@ -270,10 +270,7 @@ where
     #[cfg(feature = "postgres")]
     {
         if let Some(pool) = &state.pg_pool {
-            database_ok = sqlx::query("SELECT 1")
-                .execute(pool.as_ref())
-                .await
-                .is_ok();
+            database_ok = sqlx::query("SELECT 1").execute(pool.as_ref()).await.is_ok();
         } else {
             // No PG configured: readiness passes (foundation mode without DB)
             database_ok = true;
@@ -295,12 +292,24 @@ where
     }
 
     let checks = ReadinessChecks {
-        database: if database_ok { "ok".to_string() } else { "failed".to_string() },
-        binance_api: if binance_ok { "ok".to_string() } else { "failed".to_string() },
+        database: if database_ok {
+            "ok".to_string()
+        } else {
+            "failed".to_string()
+        },
+        binance_api: if binance_ok {
+            "ok".to_string()
+        } else {
+            "failed".to_string()
+        },
     };
 
     let response = ReadinessResponse {
-        status: if database_ok && binance_ok { "ready".to_string() } else { "not_ready".to_string() },
+        status: if database_ok && binance_ok {
+            "ready".to_string()
+        } else {
+            "not_ready".to_string()
+        },
         checks,
         timestamp: chrono::Utc::now().to_rfc3339(),
     };
@@ -562,7 +571,7 @@ where
                 tracked_positions: summaries,
                 pending_executions: attempts_count,
             }))
-        }
+        },
         None => Ok(Json(SafetyStatusResponse {
             enabled: false,
             symbols: vec![],
@@ -587,10 +596,12 @@ where
             // For now, return a simple success message
             Ok(Json(SafetyTestResponse {
                 success: true,
-                message: "Safety net is running. Use 'robson safety-status' to see tracked positions.".to_string(),
+                message:
+                    "Safety net is running. Use 'robson safety-status' to see tracked positions."
+                        .to_string(),
                 positions: None,
             }))
-        }
+        },
         None => Ok(Json(SafetyTestResponse {
             success: false,
             message: "Safety net is not enabled.".to_string(),

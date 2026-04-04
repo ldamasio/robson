@@ -180,12 +180,7 @@ impl MemoryStore {
             },
 
             // ExitOrderPlaced: Transition Active → Exiting
-            Event::ExitOrderPlaced {
-                position_id,
-                order_id,
-                exit_reason,
-                ..
-            } => {
+            Event::ExitOrderPlaced { position_id, order_id, exit_reason, .. } => {
                 let mut positions = self.positions.write().unwrap();
                 if let Some(mut position) = positions.get(position_id).cloned() {
                     position.state = PositionState::Exiting {

@@ -412,10 +412,7 @@ mod tests {
     #[test]
     fn test_exchange_base_url() {
         assert_eq!(Exchange::Binance.base_url(), "https://api.binance.com");
-        assert_eq!(
-            Exchange::BinanceTestnet.base_url(),
-            "https://testnet.binance.vision"
-        );
+        assert_eq!(Exchange::BinanceTestnet.base_url(), "https://testnet.binance.vision");
     }
 
     #[test]

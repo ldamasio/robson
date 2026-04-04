@@ -10,8 +10,8 @@ use std::sync::Arc;
 
 use chrono::Utc;
 use robson_domain::{
-    AccountId, ExitReason, Event, Position, PositionState, Price,
-    Quantity, Side, Symbol, TechnicalStopDistance,
+    AccountId, Event, ExitReason, Position, PositionState, Price, Quantity, Side, Symbol,
+    TechnicalStopDistance,
 };
 use robson_engine::{Engine, MarketData};
 use robson_exec::{Executor, StubExchange};
@@ -65,15 +65,10 @@ async fn test_trailing_stop_e2e() {
 
     // TICK A: Price rises to $96.5k (new high)
     let market_data_high = MarketData::new(symbol.clone(), Price::new(dec!(96500)).unwrap());
-    let decision_a = engine
-        .process_active_position(&position, &market_data_high)
-        .unwrap();
+    let decision_a = engine.process_active_position(&position, &market_data_high).unwrap();
 
     // Verify: Decision has updated position and actions
-    assert!(
-        decision_a.updated_position.is_some(),
-        "Tick A: Should have updated position"
-    );
+    assert!(decision_a.updated_position.is_some(), "Tick A: Should have updated position");
 
     let updated_a = decision_a.updated_position.as_ref().unwrap();
 
@@ -111,19 +106,9 @@ async fn test_trailing_stop_e2e() {
     }
 
     // Verify: State was persisted correctly
-    let loaded_a = store
-        .positions()
-        .find_by_id(position_id)
-        .await
-        .unwrap()
-        .unwrap();
+    let loaded_a = store.positions().find_by_id(position_id).await.unwrap().unwrap();
 
-    if let PositionState::Active {
-        trailing_stop,
-        favorable_extreme,
-        ..
-    } = loaded_a.state
-    {
+    if let PositionState::Active { trailing_stop, favorable_extreme, .. } = loaded_a.state {
         assert_eq!(trailing_stop.as_decimal(), dec!(95000));
         assert_eq!(favorable_extreme.as_decimal(), dec!(96500));
     } else {
@@ -132,16 +117,11 @@ async fn test_trailing_stop_e2e() {
 
     // TICK B: Price falls to $95k (hits trailing stop at $95k)
     let market_data_drop = MarketData::new(symbol.clone(), Price::new(dec!(95000)).unwrap());
-    let decision_b = engine
-        .process_active_position(&loaded_a, &market_data_drop)
-        .unwrap();
+    let decision_b = engine.process_active_position(&loaded_a, &market_data_drop).unwrap();
 
     // Verify: Exit decision
     let has_exit_event = decision_b.actions.iter().any(|action| {
-        matches!(
-            action,
-            robson_engine::EngineAction::EmitEvent(Event::ExitTriggered { .. })
-        )
+        matches!(action, robson_engine::EngineAction::EmitEvent(Event::ExitTriggered { .. }))
     });
     assert!(has_exit_event, "Tick B: Should emit ExitTriggered");
 

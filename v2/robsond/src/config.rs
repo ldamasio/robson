@@ -114,7 +114,13 @@ impl Config {
         let projection = Self::load_projection_config()?;
         let position_monitor = Self::load_position_monitor_config()?;
 
-        Ok(Self { api, engine, projection, position_monitor, environment })
+        Ok(Self {
+            api,
+            engine,
+            projection,
+            position_monitor,
+            environment,
+        })
     }
 
     /// Create test configuration.
@@ -246,8 +252,8 @@ impl Config {
             .unwrap_or(true); // Default: enabled
 
         // Poll interval
-        let poll_interval_str = env::var("ROBSON_POSITION_MONITOR_POLL_INTERVAL")
-            .unwrap_or_else(|_| "20".to_string());
+        let poll_interval_str =
+            env::var("ROBSON_POSITION_MONITOR_POLL_INTERVAL").unwrap_or_else(|_| "20".to_string());
         let poll_interval_secs = poll_interval_str.parse::<u64>().map_err(|_| {
             DaemonError::Config(format!(
                 "Invalid ROBSON_POSITION_MONITOR_POLL_INTERVAL: {}",
@@ -256,8 +262,8 @@ impl Config {
         })?;
 
         // Symbols to monitor
-        let symbols_str = env::var("ROBSON_POSITION_MONITOR_SYMBOLS")
-            .unwrap_or_else(|_| "BTCUSDT".to_string());
+        let symbols_str =
+            env::var("ROBSON_POSITION_MONITOR_SYMBOLS").unwrap_or_else(|_| "BTCUSDT".to_string());
         let symbols: Vec<String> = symbols_str
             .split(',')
             .map(|s| s.trim().to_uppercase())

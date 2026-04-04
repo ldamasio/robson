@@ -26,8 +26,7 @@
 use async_trait::async_trait;
 use chrono::Utc;
 use robson_domain::{
-    ApiCredentials, CredentialError, CredentialId, CredentialStatus,
-    StoredCredential,
+    ApiCredentials, CredentialError, CredentialId, CredentialStatus, StoredCredential,
 };
 #[cfg(feature = "postgres")]
 use std::sync::Arc;
@@ -41,8 +40,8 @@ use sqlx::PgPool;
 
 mod crypto {
     use aes_gcm::{
-        aead::{Aead, KeyInit, OsRng},
         Aes256Gcm, Nonce,
+        aead::{Aead, KeyInit, OsRng},
     };
     use rand::RngCore;
     use robson_domain::CredentialError;
@@ -62,7 +61,10 @@ mod crypto {
 
     impl EncryptionKey {
         /// Create from raw bytes.
-        pub fn from_bytes(key_bytes: &[u8], key_id: impl Into<String>) -> Result<Self, CredentialError> {
+        pub fn from_bytes(
+            key_bytes: &[u8],
+            key_id: impl Into<String>,
+        ) -> Result<Self, CredentialError> {
             if key_bytes.len() != KEY_SIZE {
                 return Err(CredentialError::Encryption(format!(
                     "Invalid key size: expected {} bytes, got {}",
@@ -74,10 +76,7 @@ mod crypto {
             let key = Aes256Gcm::new_from_slice(key_bytes)
                 .map_err(|e| CredentialError::Encryption(e.to_string()))?;
 
-            Ok(Self {
-                key,
-                key_id: key_id.into(),
-            })
+            Ok(Self { key, key_id: key_id.into() })
         }
 
         /// Generate a new random key.
@@ -85,10 +84,7 @@ mod crypto {
             let mut key_bytes = [0u8; KEY_SIZE];
             OsRng.fill_bytes(&mut key_bytes);
             let key = Aes256Gcm::new_from_slice(&key_bytes).unwrap();
-            Self {
-                key,
-                key_id: key_id.into(),
-            }
+            Self { key, key_id: key_id.into() }
         }
 
         /// Get the key ID.
@@ -97,24 +93,30 @@ mod crypto {
         }
 
         /// Encrypt plaintext with AAD.
-        pub fn encrypt(&self, plaintext: &[u8], aad: &[u8]) -> Result<(Vec<u8>, Vec<u8>), CredentialError> {
+        pub fn encrypt(
+            &self,
+            plaintext: &[u8],
+            aad: &[u8],
+        ) -> Result<(Vec<u8>, Vec<u8>), CredentialError> {
             let mut nonce_bytes = [0u8; NONCE_SIZE];
             OsRng.fill_bytes(&mut nonce_bytes);
             let nonce = Nonce::from_slice(&nonce_bytes);
 
             let ciphertext = self
                 .key
-                .encrypt(nonce, aes_gcm::aead::Payload {
-                    msg: plaintext,
-                    aad,
-                })
+                .encrypt(nonce, aes_gcm::aead::Payload { msg: plaintext, aad })
                 .map_err(|e| CredentialError::Encryption(e.to_string()))?;
 
             Ok((ciphertext, nonce_bytes.to_vec()))
         }
 
         /// Decrypt ciphertext with AAD.
-        pub fn decrypt(&self, ciphertext: &[u8], nonce: &[u8], aad: &[u8]) -> Result<Zeroizing<Vec<u8>>, CredentialError> {
+        pub fn decrypt(
+            &self,
+            ciphertext: &[u8],
+            nonce: &[u8],
+            aad: &[u8],
+        ) -> Result<Zeroizing<Vec<u8>>, CredentialError> {
             if nonce.len() != NONCE_SIZE {
                 return Err(CredentialError::Encryption(format!(
                     "Invalid nonce size: expected {} bytes, got {}",
@@ -127,10 +129,7 @@ mod crypto {
 
             let plaintext = self
                 .key
-                .decrypt(nonce, aes_gcm::aead::Payload {
-                    msg: ciphertext,
-                    aad,
-                })
+                .decrypt(nonce, aes_gcm::aead::Payload { msg: ciphertext, aad })
                 .map_err(|e| CredentialError::Encryption(format!("Decryption failed: {}", e)))?;
 
             Ok(Zeroizing::new(plaintext))
@@ -139,8 +138,7 @@ mod crypto {
 
     /// Parse hex-encoded key from environment variable.
     pub fn parse_key_from_hex(hex: &str) -> Result<Vec<u8>, CredentialError> {
-        hex::decode(hex)
-            .map_err(|e| CredentialError::Encryption(format!("Invalid hex key: {}", e)))
+        hex::decode(hex).map_err(|e| CredentialError::Encryption(format!("Invalid hex key: {}", e)))
     }
 }
 
@@ -174,7 +172,11 @@ pub trait CredentialStore: Send + Sync {
     async fn revoke(&self, id: &CredentialId, reason: &str) -> Result<(), CredentialError>;
 
     /// List all credentials for a tenant/user.
-    async fn list(&self, tenant_id: &str, user_id: &str) -> Result<Vec<StoredCredential>, CredentialError>;
+    async fn list(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<Vec<StoredCredential>, CredentialError>;
 
     /// Update last used timestamp.
     async fn touch(&self, id: &CredentialId) -> Result<(), CredentialError>;
@@ -208,13 +210,7 @@ impl MemoryCredentialStore {
     }
 
     fn id_to_key(id: &CredentialId) -> String {
-        format!(
-            "{}:{}:{}:{}",
-            id.tenant_id(),
-            id.user_id(),
-            id.exchange.as_str(),
-            id.profile()
-        )
+        format!("{}:{}:{}:{}", id.tenant_id(), id.user_id(), id.exchange.as_str(), id.profile())
     }
 }
 
@@ -237,8 +233,10 @@ impl CredentialStore for MemoryCredentialStore {
         let aad = id.aad();
 
         // Encrypt
-        let (api_key_ciphertext, api_key_nonce) = self.encryption_key.encrypt(api_key.as_bytes(), &aad)?;
-        let (api_secret_ciphertext, api_secret_nonce) = self.encryption_key.encrypt(api_secret.as_bytes(), &aad)?;
+        let (api_key_ciphertext, api_key_nonce) =
+            self.encryption_key.encrypt(api_key.as_bytes(), &aad)?;
+        let (api_secret_ciphertext, api_secret_nonce) =
+            self.encryption_key.encrypt(api_secret.as_bytes(), &aad)?;
 
         let now = Utc::now();
         let stored = StoredCredential {
@@ -294,12 +292,14 @@ impl CredentialStore for MemoryCredentialStore {
         }
 
         // Decrypt
-        let api_key_bytes = self
-            .encryption_key
-            .decrypt(&stored.api_key_ciphertext, &stored.api_key_nonce, &aad)?;
-        let api_secret_bytes = self
-            .encryption_key
-            .decrypt(&stored.api_secret_ciphertext, &stored.api_secret_nonce, &aad)?;
+        let api_key_bytes =
+            self.encryption_key
+                .decrypt(&stored.api_key_ciphertext, &stored.api_key_nonce, &aad)?;
+        let api_secret_bytes = self.encryption_key.decrypt(
+            &stored.api_secret_ciphertext,
+            &stored.api_secret_nonce,
+            &aad,
+        )?;
 
         let api_key = String::from_utf8(api_key_bytes.to_vec())
             .map_err(|e| CredentialError::Encryption(format!("Invalid UTF-8: {}", e)))?;
@@ -337,7 +337,11 @@ impl CredentialStore for MemoryCredentialStore {
         Ok(())
     }
 
-    async fn list(&self, tenant_id: &str, user_id: &str) -> Result<Vec<StoredCredential>, CredentialError> {
+    async fn list(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<Vec<StoredCredential>, CredentialError> {
         let creds = self.credentials.read().unwrap();
         let result = creds
             .values()
@@ -388,7 +392,8 @@ impl PgCredentialStore {
             .map_err(|_| CredentialError::Encryption("ROBSON_CRYPTO_KEY not set".to_string()))?;
 
         let key_bytes = crypto::parse_key_from_hex(&key_hex)?;
-        let key_id = std::env::var("ROBSON_CRYPTO_KEY_ID").unwrap_or_else(|_| "default".to_string());
+        let key_id =
+            std::env::var("ROBSON_CRYPTO_KEY_ID").unwrap_or_else(|_| "default".to_string());
 
         Self::new(pool, &key_bytes, &key_id)
     }
@@ -407,8 +412,10 @@ impl CredentialStore for PgCredentialStore {
         let aad = id.aad();
 
         // Encrypt
-        let (api_key_ciphertext, api_key_nonce) = self.encryption_key.encrypt(api_key.as_bytes(), &aad)?;
-        let (api_secret_ciphertext, api_secret_nonce) = self.encryption_key.encrypt(api_secret.as_bytes(), &aad)?;
+        let (api_key_ciphertext, api_key_nonce) =
+            self.encryption_key.encrypt(api_key.as_bytes(), &aad)?;
+        let (api_secret_ciphertext, api_secret_nonce) =
+            self.encryption_key.encrypt(api_secret.as_bytes(), &aad)?;
 
         sqlx::query(
             r#"
@@ -459,7 +466,7 @@ impl CredentialStore for PgCredentialStore {
                    key_id, status
             FROM exchange_credentials
             WHERE tenant_id = $1 AND user_id = $2 AND exchange = $3 AND profile = $4
-            "#
+            "#,
         )
         .bind(id.tenant_id())
         .bind(id.user_id())
@@ -475,7 +482,14 @@ impl CredentialStore for PgCredentialStore {
             profile: id.profile().to_string(),
         })?;
 
-        let (api_key_ciphertext, api_key_nonce, api_secret_ciphertext, api_secret_nonce, key_id, status) = row;
+        let (
+            api_key_ciphertext,
+            api_key_nonce,
+            api_secret_ciphertext,
+            api_secret_nonce,
+            key_id,
+            status,
+        ) = row;
 
         // Check status
         if status != "active" {
@@ -490,12 +504,10 @@ impl CredentialStore for PgCredentialStore {
         }
 
         // Decrypt
-        let api_key_bytes = self
-            .encryption_key
-            .decrypt(&api_key_ciphertext, &api_key_nonce, &aad)?;
-        let api_secret_bytes = self
-            .encryption_key
-            .decrypt(&api_secret_ciphertext, &api_secret_nonce, &aad)?;
+        let api_key_bytes =
+            self.encryption_key.decrypt(&api_key_ciphertext, &api_key_nonce, &aad)?;
+        let api_secret_bytes =
+            self.encryption_key.decrypt(&api_secret_ciphertext, &api_secret_nonce, &aad)?;
 
         let api_key = String::from_utf8(api_key_bytes.to_vec())
             .map_err(|e| CredentialError::Encryption(format!("Invalid UTF-8: {}", e)))?;
@@ -508,7 +520,7 @@ impl CredentialStore for PgCredentialStore {
             UPDATE exchange_credentials
             SET last_used_at = NOW()
             WHERE tenant_id = $1 AND user_id = $2 AND exchange = $3 AND profile = $4
-            "#
+            "#,
         )
         .bind(id.tenant_id())
         .bind(id.user_id())
@@ -545,7 +557,7 @@ impl CredentialStore for PgCredentialStore {
             UPDATE exchange_credentials
             SET status = 'revoked', revoke_reason = $5, revoked_at = NOW(), updated_at = NOW()
             WHERE tenant_id = $1 AND user_id = $2 AND exchange = $3 AND profile = $4
-            "#
+            "#,
         )
         .bind(id.tenant_id())
         .bind(id.user_id())
@@ -559,7 +571,11 @@ impl CredentialStore for PgCredentialStore {
         Ok(())
     }
 
-    async fn list(&self, tenant_id: &str, user_id: &str) -> Result<Vec<StoredCredential>, CredentialError> {
+    async fn list(
+        &self,
+        tenant_id: &str,
+        user_id: &str,
+    ) -> Result<Vec<StoredCredential>, CredentialError> {
         // Simplified - returns empty for now (full impl would map all fields)
         let _ = (tenant_id, user_id);
         Ok(Vec::new())
@@ -571,7 +587,7 @@ impl CredentialStore for PgCredentialStore {
             UPDATE exchange_credentials
             SET last_used_at = NOW()
             WHERE tenant_id = $1 AND user_id = $2 AND exchange = $3 AND profile = $4
-            "#
+            "#,
         )
         .bind(id.tenant_id())
         .bind(id.user_id())
