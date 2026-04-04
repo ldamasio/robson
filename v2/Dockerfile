@@ -11,20 +11,20 @@ RUN apt-get update && apt-get install -y \
     libssl-dev \
     && rm -rf /var/lib/apt/lists/*
 
-# Copy workspace files
-COPY Cargo.toml Cargo.lock ./
-COPY robson-domain/ ./robson-domain/
-COPY robson-engine/ ./robson-engine/
-COPY robson-exec/ ./robson-exec/
-COPY robson-connectors/ ./robson-connectors/
-COPY robson-store/ ./robson-store/
-COPY robson-eventlog/ ./robson-eventlog/
-COPY robson-projector/ ./robson-projector/
-COPY robson-db/ ./robson-db/
-COPY migrations/ ./migrations/
-COPY robson-testkit/ ./robson-testkit/
-COPY robson-sim/ ./robson-sim/
-COPY robsond/ ./robsond/
+# Copy workspace files (context is repo root, v2/ subdirectory)
+COPY v2/Cargo.toml v2/Cargo.lock ./
+COPY v2/robson-domain/ ./robson-domain/
+COPY v2/robson-engine/ ./robson-engine/
+COPY v2/robson-exec/ ./robson-exec/
+COPY v2/robson-connectors/ ./robson-connectors/
+COPY v2/robson-store/ ./robson-store/
+COPY v2/robson-eventlog/ ./robson-eventlog/
+COPY v2/robson-projector/ ./robson-projector/
+COPY v2/robson-db/ ./robson-db/
+COPY v2/migrations/ ./migrations/
+COPY v2/robson-testkit/ ./robson-testkit/
+COPY v2/robson-sim/ ./robson-sim/
+COPY v2/robsond/ ./robsond/
 
 # Build release binary with postgres feature for production
 RUN cargo build --release -p robsond --features postgres
