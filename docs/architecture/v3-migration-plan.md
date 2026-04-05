@@ -100,7 +100,7 @@ Status rule for this table: code-backed items may be marked done from repository
 | ID | Description | Status |
 |----|-------------|--------|
 | MIG-v2.5#1 | Deploy robsond to k3s | Pending (operational rollout) |
-| MIG-v2.5#2 | Complete projector handlers | Pending |
+| MIG-v2.5#2 | Complete projector handlers + runtime persistence | Pending (code hardened; awaiting real PostgreSQL execution) |
 | MIG-v2.5#3 | Migrate stop monitoring to WebSocket | Pending |
 | MIG-v2.5#4 | GovernedAction + Risk Engine blocking gate | ✅ Done (2026-04-04) |
 | MIG-v2.5#5 | Circuit breaker escalation ladder | Pending |
@@ -122,6 +122,52 @@ Status rule for this table: code-backed items may be marked done from repository
 | QE-P3 | Approval Gates | ✅ Done (2026-04-05) |
 | QE-P4 | Full Audit & Replay | ✅ Done (2026-04-05) |
 | QE-P5 | Context Governance (LLM) | Deferred (v3+) |
+
+### MIG-v2.5#2 Technical Notes (2026-04-05)
+
+**Status**: Pending (needs staging validation with real PostgreSQL — see remaining gaps below)
+
+**What was corrected in this session**:
+
+1. **Centralized event persistence in `execute_and_persist()`**: The wrapper now persists events from both `ActionResult::EventEmitted` AND `ActionResult::OrderPlaced { event: Some(_), .. }`. This eliminates the gap where `ExitOrderPlaced` events were lost in the panic_close path.
+
+2. **Correct event ordering**: `ExitOrderPlaced` is persisted BEFORE `PositionClosed` in the exit path. The `execute_and_persist()` function handles this centrally, removing manual persistence logic from call sites.
+
+3. **Removed duplicate manual persistence**: Call sites in `execute_signal_query()` and `process_market_data()` no longer have manual `if let Some(evt) = event { persist_event_to_log(&evt) }` blocks.
+
+4. **Projector fails on unknown events**: `apply_event_to_projections()` now returns `MissingHandler` error instead of `warn+skip`. This prevents silent checkpoint advancement over unhandled events.
+
+5. **Fail-fast write path for position events**: `persist_event_to_log()` now returns `DaemonError::EventLog` on any failure (append or projection apply). `execute_and_persist()` propagates these errors to callers. When `event_log_pool` is configured, failures in append or projection apply abort the current execution cycle. Silent failures are no longer accepted.
+
+6. **Idempotent retry now re-applies projection**: when `append_event()` returns `IdempotentDuplicate`, `persist_event_to_log()` no longer assumes the projection was already updated. It fetches the stored envelope and re-runs `apply_event_to_projections()`. This closes the retry hole where append could succeed and projection apply could fail on the first attempt.
+
+**Consistency mechanism (explicit design decision)**:
+
+The chosen mechanism for MIG-v2.5#2 is the **synchronous fail-fast write path**:
+
+- Position events are written to `stream_key = position:{position_id}` (per-position streams)
+- On every `execute_and_persist()` call with `event_log_pool` configured:
+  1. Event is appended to `event_log` — failure aborts execution cycle
+  2. Projection `positions_current` is updated synchronously — failure aborts execution cycle
+  3. If the append already happened on a prior attempt (`IdempotentDuplicate`), the stored envelope is fetched and projection apply is retried
+- The ProjectionWorker reads from `config.projection.stream_key` (e.g., `robson:daemon`) for QueryEngine audit events only
+- **Position streams are NOT watched by ProjectionWorker today** — this remains a limitation of the current design, not an invisible background repair path
+- **Recovery**: reads from `positions_current`, which is updated on the synchronous write path and is no longer allowed to fail silently
+- **Important limit**: append and projection apply are still separate steps, so this is fail-fast + retry-healing on duplicate, not a fully atomic guarantee
+- **v3 follow-up**: evaluate whether to unify stream strategy or add per-position ProjectionWorker catch-up, or move append+projection into a single transaction-aware path
+
+**Remaining gaps (explicit)**:
+
+1. Staging validation with real PostgreSQL (`DATABASE_URL`) has not been run in this repository
+2. ProjectionWorker does not perform catch-up for `position:{id}` streams
+3. Runtime e2e test (`test_runtime_arm_position_persists_to_projection`) is compiled and present but marked `#[ignore]` pending `DATABASE_URL` in CI
+4. The write path is fail-fast and retry-healing on duplicate, but append + projection apply are still not a single atomic transaction
+
+**2026-04-05 Session Update**:
+
+6. **Added `entry_signal_received` handler to projector**: The engine emits `EntrySignalReceived` as an audit event during entry signal processing. Previously, the projector had no handler for this event type, which would cause a `MissingHandler` error when `event_log_pool` is configured (fail-fast mode). Added `handle_entry_signal_received()` which acknowledges the event without modifying projection state (it's an audit event, state transition is done by `entry_order_placed`).
+
+7. **Added regression test for `entry_signal_received`**: New test `test_entry_signal_received_handled_without_error` in `crash_recovery.rs` verifies that the event is handled without `MissingHandler` error and doesn't change position state.
 
 ---
 
