@@ -32,7 +32,8 @@ use robson_domain::{
     DetectorSignal, Event, Position, PositionId, PositionState, Price, Quantity, RiskConfig, Side,
     Symbol, TechnicalStopDistance,
 };
-use robson_engine::{Engine, EngineAction};
+use robson_engine::{Engine, EngineAction, EngineDecision, PositionSummary, ProposedTrade, RiskContext, RiskGate};
+use rust_decimal::Decimal;
 use robson_exec::{ActionResult, ExchangePort, ExecError, Executor};
 use robson_store::Store;
 
@@ -42,7 +43,7 @@ use crate::event_bus::{DaemonEvent, EventBus, MarketData};
 use crate::query::{
     ActorKind, CommandSource, ContextSummary, ExecutionQuery, QueryKind, QueryOutcome, QueryState,
 };
-use crate::query_engine::{QueryEngine, TracingQueryRecorder};
+use crate::query_engine::{CheckRiskError, GovernedAction, QueryEngine, TracingQueryRecorder};
 
 // =============================================================================
 // Position Manager
@@ -77,7 +78,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         event_bus: Arc<EventBus>,
     ) -> Self {
         let shutdown_token = CancellationToken::new();
-        let query_engine = QueryEngine::new(TracingQueryRecorder);
+        let query_engine = QueryEngine::new(TracingQueryRecorder, RiskGate::new());
 
         Self {
             engine,
@@ -153,6 +154,119 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if let Ok(active_positions) = self.store.positions().find_active().await {
             Self::set_query_context_summary(query, active_positions.len());
         }
+    }
+
+    // =========================================================================
+    // Phase 2: Risk context helpers
+    // =========================================================================
+
+    /// Build a RiskContext snapshot from current store state.
+    ///
+    /// Uses `find_risk_open()` (Entering + Active) so positions with a committed
+    /// exchange order are counted even before fill confirmation. This prevents
+    /// concurrent entries from slipping under the exposure limits during the
+    /// order-fill window (signal fires → order submitted → not yet filled →
+    /// next signal arrives).
+    ///
+    /// Phase 2 limitation: daily PnL (realized + unrealized) is not yet tracked
+    /// in the store. Both fields default to zero, which means the daily loss
+    /// circuit breaker is effectively disabled. Proper PnL tracking is deferred
+    /// to a follow-up task.
+    async fn build_risk_context(&self) -> DaemonResult<RiskContext> {
+        let capital = self.engine.risk_config().capital();
+        let active_positions = self.store.positions().find_risk_open().await?;
+
+        // find_risk_open() guarantees only Entering and Active positions.
+        // For Entering: use expected_entry from state (order price is committed on exchange).
+        // For Active: use the recorded fill price (entry_price field).
+        // Defensive: skip positions with zero quantity (should not occur in practice).
+        let summaries: Vec<PositionSummary> = active_positions
+            .iter()
+            .filter_map(|p| {
+                let entry_price_decimal = match &p.state {
+                    PositionState::Active { .. } => p.entry_price?.as_decimal(),
+                    PositionState::Entering { expected_entry, .. } => expected_entry.as_decimal(),
+                    _ => return None, // find_risk_open guarantees this is unreachable
+                };
+                let qty = p.quantity.as_decimal();
+                if qty.is_zero() {
+                    return None;
+                }
+                let notional_value = qty * entry_price_decimal;
+                let margin_used =
+                    notional_value / Decimal::from(robson_domain::RiskConfig::LEVERAGE as u32);
+                Some(PositionSummary {
+                    position_id: p.id,
+                    symbol: p.symbol.as_pair(),
+                    side: format!("{}", p.side).to_lowercase(),
+                    notional_value,
+                    margin_used,
+                    unrealized_pnl: Decimal::ZERO,
+                })
+            })
+            .collect();
+
+        Ok(RiskContext::with_positions(
+            capital,
+            summaries,
+            Decimal::ZERO, // daily_realized_pnl: deferred — see Phase 2 limitation above
+            Decimal::ZERO, // daily_unrealized_pnl: deferred
+        ))
+    }
+
+    /// Re-arm the position's detector after a risk gate denial.
+    ///
+    /// When the risk gate denies an entry, the original detector has already completed
+    /// (it fired the signal). Without re-arming, the position would remain Armed but
+    /// with no active detector — unable to receive future signals.
+    ///
+    /// This spawns a new detector so the position remains responsive.
+    /// If the spawn fails (e.g. invalid position state), logs a warning — the operator
+    /// can re-arm manually via the disarm/re-arm flow.
+    async fn rearm_detector_after_denial(&self, position_id: PositionId, position: &Position) {
+        let cancel_token = self.child_cancel_token();
+        match DetectorTask::from_position(position, Arc::clone(&self.event_bus), cancel_token) {
+            Ok(detector) => {
+                let handle = detector.spawn();
+                let mut detectors = self.detectors.write().await;
+                detectors.insert(position_id, handle);
+                info!(%position_id, "Detector re-armed after risk denial");
+            }
+            Err(e) => {
+                warn!(
+                    %position_id,
+                    error = %e,
+                    "Failed to re-arm detector after risk denial — position requires manual re-arm"
+                );
+            }
+        }
+    }
+
+    /// Build a ProposedTrade for risk evaluation from a signal and its engine decision.
+    ///
+    /// Extracts the quantity decided by the Engine (from PlaceEntryOrder action)
+    /// and computes notional / margin using the fixed leverage constant.
+    /// Returns None if the decision contains no PlaceEntryOrder (caller handles this).
+    fn build_proposed_trade(signal: &DetectorSignal, decision: &EngineDecision) -> Option<ProposedTrade> {
+        let quantity = decision.actions.iter().find_map(|a| match a {
+            EngineAction::PlaceEntryOrder { quantity, .. } => Some(*quantity),
+            _ => None,
+        })?;
+
+        let qty_decimal = quantity.as_decimal();
+        let entry_price = signal.entry_price.as_decimal();
+        let notional_value = qty_decimal * entry_price;
+        let margin_required =
+            notional_value / Decimal::from(robson_domain::RiskConfig::LEVERAGE as u32);
+
+        Some(ProposedTrade {
+            symbol: signal.symbol.as_pair(),
+            side: format!("{}", signal.side).to_lowercase(),
+            quantity: qty_decimal,
+            entry_price,
+            notional_value,
+            margin_required,
+        })
     }
 
     /// Start background task to listen for detector signals.
@@ -514,7 +628,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             },
         };
 
-        // Check if we have actions to execute
+        // Check if we have actions to execute (before risk check — no point evaluating
+        // risk for a no-action decision)
         if decision.actions.is_empty() {
             if let Err(e) = query.complete(QueryOutcome::NoAction {
                 reason: "No actions from engine".to_string(),
@@ -527,17 +642,76 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             return Ok(());
         }
 
-        // Transition to Acting before executor call
+        // Phase 2: Risk governance gate.
+        //
+        // Build RiskContext (current portfolio state) and ProposedTrade (this entry),
+        // then delegate to QueryEngine.check_risk(), which:
+        //   1. Transitions query to RiskChecked (or returns InvalidState on failure)
+        //   2. Evaluates the RiskGate (pure computation)
+        //   3. Returns GovernedAction (approved) or CheckRiskError (denied or state error)
+        //
+        // Denial (CheckRiskError::Denied) is a governed outcome — return Ok(()).
+        // InvalidState (CheckRiskError::InvalidState) is an operational error — propagate.
+        let governed: GovernedAction = {
+            let risk_context = match self.build_risk_context().await {
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    let err_str = format!("{}", e);
+                    query.fail(err_str.clone(), "processing".to_string());
+                    self.query_engine.on_error(&query, &err_str);
+                    return Err(e);
+                }
+            };
+
+            let proposed = match Self::build_proposed_trade(&signal, &decision) {
+                Some(p) => p,
+                None => {
+                    let err_str = "decide_entry produced actions but no PlaceEntryOrder — cannot build ProposedTrade".to_string();
+                    query.fail(err_str.clone(), "processing".to_string());
+                    self.query_engine.on_error(&query, &err_str);
+                    return Err(DaemonError::Config(err_str));
+                }
+            };
+
+            match self.query_engine.check_risk(&mut query, &proposed, &risk_context, decision.actions) {
+                Ok(g) => g,
+                Err(CheckRiskError::Denied) => {
+                    // Governed denial: query is already in Denied state.
+                    //
+                    // Re-arm the detector so the Armed position can receive future signals.
+                    // The original detector completed when the signal fired; without re-arming,
+                    // the position would be Armed but permanently unresponsive.
+                    self.rearm_detector_after_denial(position_id, &position).await;
+                    info!(
+                        %position_id,
+                        query_id = %query.id,
+                        "Entry denied by risk gate — detector re-armed (governed outcome)"
+                    );
+                    return Ok(());
+                }
+                Err(CheckRiskError::InvalidState(e)) => {
+                    // Operational error: query lifecycle state machine is inconsistent.
+                    // This is NOT a governed denial — it indicates a bug or concurrent
+                    // mutation. Fail the query and propagate as a hard error.
+                    let err_str = format!("Risk gate lifecycle error: {}", e);
+                    query.fail(err_str.clone(), "processing".to_string());
+                    self.query_engine.on_error(&query, &err_str);
+                    return Err(DaemonError::Config(err_str));
+                }
+            }
+        };
+
+        // Transition to Acting before executor call (risk approved)
         if let Err(e) = query.transition(QueryState::Acting) {
-            query.fail(format!("{}", e), "processing".to_string());
+            query.fail(format!("{}", e), "risk_checked".to_string());
             self.query_engine.on_error(&query, &format!("{}", e));
             return Err(DaemonError::Config(format!("Query transition error: {}", e)));
         }
         self.query_engine.on_state_change(&query);
 
-        // Execute actions (events are appended and applied; exchange orders are placed)
+        // Execute governed actions (events are appended and applied; exchange orders are placed)
         // EntryOrderPlaced event transitions position to Entering via apply_event
-        let results = match self.executor.execute(decision.actions).await {
+        let results = match self.executor.execute(governed.into_actions()).await {
             Ok(r) => r,
             Err(e) => {
                 query.fail(format!("{}", e), "acting".to_string());
@@ -862,54 +1036,101 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     }
 
     /// Emergency close all positions.
+    ///
+    /// Iterates all non-terminal positions (Armed, Entering, Active, Exiting) and
+    /// applies state-appropriate shutdown:
+    ///
+    /// - **Active**: place market exit order via `panic_close_position_internal()`.
+    /// - **Armed**: disarm (cancel detector). No exchange action needed.
+    /// - **Entering**: order submitted but not yet filled — logged as skipped.
+    ///   Cancelling a pending entry order requires exchange-specific logic deferred
+    ///   to a follow-up task. The position will remain Entering until the order fills
+    ///   or the exchange session expires.
+    /// - **Exiting**: exit already in progress — skip to avoid duplicate orders.
     pub async fn panic_close_all(&self) -> DaemonResult<Vec<PositionId>> {
         warn!("PANIC: Emergency close all positions");
 
-        let active = self.store.positions().find_active().await?;
-        let active_positions_count = active.len();
+        // find_active() returns ALL non-terminal states: Armed, Entering, Active, Exiting.
+        let all_non_terminal = self.store.positions().find_active().await?;
+        let total_count = all_non_terminal.len();
         let mut closed_ids = Vec::new();
 
-        for position in active {
-            // Create one PanicClosePosition query PER POSITION
-            let mut query = ExecutionQuery::new(
-                QueryKind::PanicClosePosition { position_id: position.id },
-                Self::operator_actor(),
-            );
-            query.position_id = Some(position.id);
-            Self::set_query_context_summary(&mut query, active_positions_count);
-            self.query_engine.on_accepted(&query);
+        for position in all_non_terminal {
+            match &position.state {
+                PositionState::Active { .. } => {
+                    // Place market exit order
+                    let mut query = ExecutionQuery::new(
+                        QueryKind::PanicClosePosition { position_id: position.id },
+                        Self::operator_actor(),
+                    );
+                    query.position_id = Some(position.id);
+                    Self::set_query_context_summary(&mut query, total_count);
+                    self.query_engine.on_accepted(&query);
 
-            match self.panic_close_position_internal(position.id, &mut query).await {
-                Ok(_) => {
-                    if let Err(e) =
-                        query.complete(QueryOutcome::ActionsExecuted { actions_count: 1 })
-                    {
-                        query.fail(format!("{}", e), "acting".to_string());
-                        self.query_engine.on_error(&query, &format!("{}", e));
-                    } else {
-                        self.query_engine.on_state_change(&query);
+                    match self.panic_close_position_internal(position.id, &mut query).await {
+                        Ok(_) => {
+                            if let Err(e) =
+                                query.complete(QueryOutcome::ActionsExecuted { actions_count: 1 })
+                            {
+                                query.fail(format!("{}", e), "acting".to_string());
+                                self.query_engine.on_error(&query, &format!("{}", e));
+                            } else {
+                                self.query_engine.on_state_change(&query);
+                            }
+                            closed_ids.push(position.id);
+                        },
+                        Err(e) => {
+                            // Caller owns failure recording — internal method does NOT call fail()
+                            let phase = match &query.state {
+                                QueryState::Accepted => "accepted".to_string(),
+                                QueryState::Processing => "processing".to_string(),
+                                QueryState::RiskChecked => "risk_checked".to_string(),
+                                QueryState::Acting => "acting".to_string(),
+                                QueryState::Completed => "completed".to_string(),
+                                QueryState::Failed { phase, .. } => phase.clone(),
+                                QueryState::Denied { check, .. } => format!("denied:{}", check),
+                            };
+                            query.fail(format!("{}", e), phase);
+                            self.query_engine.on_error(&query, &format!("{}", e));
+                            error!(position_id = %position.id, error = %e, "Failed to panic close");
+                        },
                     }
-                    closed_ids.push(position.id);
-                },
-                Err(e) => {
-                    // Caller owns failure recording - internal method does NOT call fail()
-                    // Infer phase from current query state for accurate audit trail
-                    let phase = match &query.state {
-                        QueryState::Accepted => "accepted".to_string(),
-                        QueryState::Processing => "processing".to_string(),
-                        QueryState::Acting => "acting".to_string(),
-                        QueryState::Completed => "completed".to_string(),
-                        QueryState::Failed { phase, .. } => phase.clone(),
-                    };
-                    query.fail(format!("{}", e), phase);
-                    self.query_engine.on_error(&query, &format!("{}", e));
-                    error!(position_id = %position.id, error = %e, "Failed to panic close");
-                },
+                }
+                PositionState::Armed => {
+                    // No exchange order exists — disarm the position (cancel its detector).
+                    if let Err(e) = self.disarm_position(position.id).await {
+                        warn!(position_id = %position.id, error = %e, "Panic: failed to disarm Armed position");
+                    } else {
+                        info!(position_id = %position.id, "Panic: Armed position disarmed");
+                        closed_ids.push(position.id);
+                    }
+                }
+                PositionState::Entering { .. } => {
+                    // Entry order submitted but not yet filled.
+                    // Cancelling a pending margin order requires exchange-specific
+                    // cancel-order logic (deferred). Log and skip for now.
+                    warn!(
+                        position_id = %position.id,
+                        "Panic: Entering position skipped — entry order cancel not yet implemented"
+                    );
+                }
+                PositionState::Exiting { .. } => {
+                    // Exit already in progress — do not place a duplicate order.
+                    info!(position_id = %position.id, "Panic: Exiting position skipped — exit already in progress");
+                }
+                PositionState::Closed { .. } => {
+                    // find_active() guarantees this is unreachable.
+                }
+                PositionState::Error { error, .. } => {
+                    // Error state requires manual intervention — cannot be automatically closed.
+                    warn!(
+                        position_id = %position.id,
+                        error = %error,
+                        "Panic: Error position skipped — requires manual intervention"
+                    );
+                }
             }
         }
-
-        // Also disarm any armed positions
-        // (find_active already excludes armed, so we need another query - skip for now)
 
         info!(closed_count = closed_ids.len(), "Panic close complete");
 
@@ -1146,14 +1367,23 @@ mod tests {
             .await
             .unwrap();
 
-        // Create detector signal
+        // Create detector signal.
+        //
+        // Stop distance must be wide enough to pass the Phase 2 risk gate:
+        //   qty = (capital * risk_pct) / (entry * stop_pct) = $100 / (95000 * stop_pct)
+        //   notional = qty * entry = $100 / stop_pct
+        //   max_single_position_pct = 15% of $10000 = $1500
+        //   → stop_pct ≥ 100/1500 ≈ 6.67%
+        //
+        // Using 8% stop distance: stop_loss = 95000 * 0.92 = 87400
+        //   notional ≈ $1250 < $1500 ✓
         let signal = DetectorSignal {
             signal_id: Uuid::now_v7(),
             position_id: position.id,
             symbol: symbol.clone(),
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
-            stop_loss: Price::new(dec!(93100)).unwrap(), // 2% below
+            stop_loss: Price::new(dec!(87400)).unwrap(), // 8% below — passes risk gate
             timestamp: chrono::Utc::now(),
         };
 
@@ -1202,19 +1432,19 @@ mod tests {
             .await
             .unwrap();
 
-        // Move to Active
+        // Move to Active — 8% stop distance passes the risk gate (see test_handle_signal)
         let signal = DetectorSignal {
             signal_id: Uuid::now_v7(),
             position_id: position.id,
             symbol,
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
-            stop_loss: Price::new(dec!(93100)).unwrap(),
+            stop_loss: Price::new(dec!(87400)).unwrap(), // 8% below — passes risk gate
             timestamp: chrono::Utc::now(),
         };
         manager.handle_signal(signal).await.unwrap();
 
-        // Try to disarm (should fail)
+        // Try to disarm (should fail — position is now Active, not Armed)
         let result = manager.disarm_position(position.id).await;
         assert!(result.is_err());
     }
@@ -1248,16 +1478,24 @@ mod tests {
             .await
             .unwrap();
 
+        // 8% stop — passes risk gate (≥6.67% threshold on $10k capital, 1% risk, 15% max single)
         let signal = DetectorSignal {
             signal_id: Uuid::now_v7(),
             position_id: position.id,
             symbol,
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
-            stop_loss: Price::new(dec!(93100)).unwrap(),
+            stop_loss: Price::new(dec!(87400)).unwrap(), // 8% below — passes risk gate
             timestamp: chrono::Utc::now(),
         };
         manager.handle_signal(signal).await.unwrap();
+
+        // Verify position is Active before panic close (entry was not denied)
+        let pos = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(
+            matches!(pos.state, PositionState::Active { .. }),
+            "Expected Active before panic close, got {:?}", pos.state
+        );
 
         let _ = manager.panic_close_all().await.unwrap();
 
@@ -1276,6 +1514,118 @@ mod tests {
             }
         }
         assert!(closed, "Expected CorePositionClosed event");
+    }
+
+    /// Phase 2: Risk gate denial keeps position Armed and re-arms the detector.
+    ///
+    /// A 2% stop distance causes notional ≈ $5000 which exceeds the default
+    /// 15% single-position limit ($1500 on $10k capital), so the entry is denied.
+    /// The position must remain Armed and have a fresh detector after the denial.
+    #[tokio::test]
+    async fn test_risk_gate_denial_rearmed_and_position_stays_armed() {
+        let manager = create_test_manager().await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(98)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        let position = manager
+            .arm_position(symbol.clone(), Side::Long, create_test_risk_config(), tech_stop, Uuid::now_v7())
+            .await
+            .unwrap();
+
+        // 2% stop → notional ≈ $5000 > $1500 limit → risk gate denies
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol: symbol.clone(),
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(93100)).unwrap(), // 2% — deliberately over limit
+            timestamp: chrono::Utc::now(),
+        };
+
+        // handle_signal must return Ok(()) — denial is a governed outcome, not an error
+        manager.handle_signal(signal).await.unwrap();
+
+        // Position must still be Armed — no entry was executed
+        let updated = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(
+            matches!(updated.state, PositionState::Armed),
+            "Expected Armed after denial, got {:?}",
+            updated.state
+        );
+
+        // Detector must have been re-armed — detectors map must contain the position
+        let detectors = manager.detectors.read().await;
+        assert!(
+            detectors.contains_key(&position.id),
+            "Expected detector to be re-armed after risk denial"
+        );
+    }
+
+    /// Entering positions are included in risk context (find_risk_open).
+    ///
+    /// If only find_active() were used, Entering positions would be invisible to
+    /// the risk gate, allowing concurrent entries to bypass exposure checks during
+    /// the order-fill window. This test proves find_risk_open() counts them.
+    ///
+    /// Strategy: seed the store with MAX_OPEN_POSITIONS Entering positions, then
+    /// send a signal for a new Armed position. The risk gate must deny it.
+    #[tokio::test]
+    async fn test_entering_positions_count_in_risk_context() {
+        let manager = create_test_manager().await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+
+        // Seed the store with 3 positions in Entering state (MaxOpenPositions = 3).
+        // We construct them directly to bypass the fill logic (StubExchange fills immediately).
+        //
+        // Non-zero quantity is required: build_risk_context() skips zero-qty positions
+        // when building PositionSummary entries for open_position_count().
+        // qty ≈ $100 risk / ($95000 * 8% stop) ≈ 0.01315 BTC
+        let account_id = uuid::Uuid::now_v7();
+        for _ in 0..3 {
+            let mut pos = Position::new(account_id, symbol.clone(), Side::Long);
+            pos.quantity = Quantity::new(dec!(0.01315)).unwrap();
+            pos.state = PositionState::Entering {
+                entry_order_id: uuid::Uuid::now_v7(),
+                expected_entry: Price::new(dec!(95000)).unwrap(),
+                signal_id: uuid::Uuid::now_v7(),
+            };
+            manager.store.positions().save(&pos).await.unwrap();
+        }
+
+        // Arm a 4th position (the one we will try to enter).
+        // 8% stop — within valid range (≤10%) and passes single-position check (≥6.67%).
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(92)).unwrap(); // 8% stop
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        let position = manager
+            .arm_position(symbol.clone(), Side::Long, create_test_risk_config(), tech_stop, uuid::Uuid::now_v7())
+            .await
+            .unwrap();
+
+        let signal = DetectorSignal {
+            signal_id: uuid::Uuid::now_v7(),
+            position_id: position.id,
+            symbol: symbol.clone(),
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(87400)).unwrap(), // 8% below — passes single-position gate
+            timestamp: chrono::Utc::now(),
+        };
+
+        // Must return Ok(()) — denial is a governed outcome.
+        manager.handle_signal(signal).await.unwrap();
+
+        // 4th position must still be Armed — entry was blocked by MaxOpenPositions.
+        let updated = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(
+            matches!(updated.state, PositionState::Armed),
+            "Expected Armed after denial (Entering positions blocked entry), got {:?}",
+            updated.state
+        );
     }
 
     /// E2E test: full detector integration (arm → spawn detector → MA crossover → signal → entry)

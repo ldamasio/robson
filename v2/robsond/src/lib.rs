@@ -69,4 +69,6 @@ pub use query::{
     ActionClass, ActorKind, ApprovalRequirement, CommandSource, ContextSummary, ExecutionQuery,
     PermissionDecision, QueryError, QueryKind, QueryOutcome, QueryState,
 };
+// GovernedAction and CheckRiskError are pub(crate) — not re-exported publicly.
+// External consumers observe governance outcomes via QueryState::Denied.
 pub use query_engine::{QueryEngine, QueryRecorder, TracingQueryRecorder};
