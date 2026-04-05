@@ -71,6 +71,40 @@ pub(crate) fn map_daemon_event(event: &DaemonEvent) -> Option<PublicSseEvent> {
                 "source_occurred_at": timestamp,
             }),
         )),
+        DaemonEvent::QueryAwaitingApproval {
+            query_id,
+            position_id,
+            reason,
+            expires_at,
+        } => Some(PublicSseEvent::new(
+            "query.awaiting_approval",
+            json!({
+                "query_id": query_id,
+                "position_id": position_id,
+                "reason": reason,
+                "expires_at": expires_at,
+            }),
+        )),
+        DaemonEvent::QueryAuthorized { query_id, position_id, approved_at } => {
+            Some(PublicSseEvent::new(
+                "query.authorized",
+                json!({
+                    "query_id": query_id,
+                    "position_id": position_id,
+                    "approved_at": approved_at,
+                }),
+            ))
+        },
+        DaemonEvent::QueryExpired { query_id, position_id, expired_at } => {
+            Some(PublicSseEvent::new(
+                "query.expired",
+                json!({
+                    "query_id": query_id,
+                    "position_id": position_id,
+                    "expired_at": expired_at,
+                }),
+            ))
+        },
         DaemonEvent::CorePositionOpened { position_id, symbol, side, .. } => {
             Some(PublicSseEvent::new(
                 "position.opened",
@@ -220,6 +254,31 @@ mod tests {
         .unwrap();
         assert_eq!(position_opened.event_type, "position.opened");
 
+        let query_awaiting = map_daemon_event(&DaemonEvent::QueryAwaitingApproval {
+            query_id: Uuid::now_v7(),
+            position_id: Some(Uuid::now_v7()),
+            reason: "Manual confirmation required".to_string(),
+            expires_at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(query_awaiting.event_type, "query.awaiting_approval");
+
+        let query_authorized = map_daemon_event(&DaemonEvent::QueryAuthorized {
+            query_id: Uuid::now_v7(),
+            position_id: Some(Uuid::now_v7()),
+            approved_at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(query_authorized.event_type, "query.authorized");
+
+        let query_expired = map_daemon_event(&DaemonEvent::QueryExpired {
+            query_id: Uuid::now_v7(),
+            position_id: Some(Uuid::now_v7()),
+            expired_at: Utc::now(),
+        })
+        .unwrap();
+        assert_eq!(query_expired.event_type, "query.expired");
+
         let position_closed = map_daemon_event(&DaemonEvent::CorePositionClosed {
             position_id: Uuid::now_v7(),
             symbol: test_symbol(),
@@ -288,6 +347,16 @@ mod tests {
         let position_changed = map_daemon_event(&test_position_changed()).unwrap();
         assert!(position_changed.payload["position_id"].as_str().is_some());
         assert!(position_changed.payload["source_occurred_at"].as_str().is_some());
+
+        let awaiting_approval = map_daemon_event(&DaemonEvent::QueryAwaitingApproval {
+            query_id: Uuid::now_v7(),
+            position_id: Some(Uuid::now_v7()),
+            reason: "Manual confirmation required".to_string(),
+            expires_at: Utc::now(),
+        })
+        .unwrap();
+        assert!(awaiting_approval.payload["query_id"].as_str().is_some());
+        assert!(awaiting_approval.payload["expires_at"].as_str().is_some());
 
         let position_opened = map_daemon_event(&DaemonEvent::CorePositionOpened {
             position_id: Uuid::now_v7(),

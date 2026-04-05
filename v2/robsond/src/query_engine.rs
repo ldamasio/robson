@@ -8,6 +8,10 @@
 //! obtain a `GovernedAction` before dispatching to the Executor. Denial is a
 //! governed terminal outcome (`QueryState::Denied`), not an operational error.
 //!
+//! Phase 3: Approval gates.
+//! After risk approval, QueryEngine decides whether a human approval gate is
+//! required before execution can proceed.
+//!
 //! GovernedAction is `pub(crate)` — only constructible inside this module via
 //! `check_risk()`. This ensures no entry path in robsond can reach the Executor
 //! without passing through the risk gate.
@@ -21,8 +25,9 @@
 //! Ownership: lives INSIDE robsond crate. Not a separate crate.
 
 use robson_engine::{EngineAction, ProposedTrade, RiskContext, RiskGate, RiskVerdict};
+use rust_decimal::Decimal;
 
-use crate::query::{ExecutionQuery, QueryError, QueryState};
+use crate::query::{ApprovalRequirement, ExecutionQuery, QueryError, QueryState};
 
 // =============================================================================
 // QueryRecorder - Audit and Observability
@@ -114,6 +119,80 @@ impl GovernedAction {
     pub(crate) fn into_actions(self) -> Vec<EngineAction> {
         self.actions
     }
+
+    fn actions(&self) -> &[EngineAction] {
+        &self.actions
+    }
+}
+
+// =============================================================================
+// ApprovalPolicy / ApprovalCheckResult
+// =============================================================================
+
+/// Minimal Phase 3 approval policy.
+///
+/// Scope is intentionally narrow:
+/// - Only entry orders are considered for approval
+/// - Approval is required when the proposed entry notional exceeds a fixed
+///   percentage of capital
+/// - TTL is fixed and explicit
+#[derive(Debug, Clone)]
+pub(crate) struct ApprovalPolicy {
+    entry_notional_threshold_pct: Decimal,
+    ttl_seconds: u64,
+}
+
+impl ApprovalPolicy {
+    pub(crate) fn new(entry_notional_threshold_pct: Decimal, ttl_seconds: u64) -> Self {
+        Self {
+            entry_notional_threshold_pct,
+            ttl_seconds,
+        }
+    }
+
+    fn requirement_for(
+        &self,
+        actions: &[EngineAction],
+        proposed: &ProposedTrade,
+        context: &RiskContext,
+    ) -> ApprovalRequirement {
+        let has_entry_order = actions
+            .iter()
+            .any(|action| matches!(action, EngineAction::PlaceEntryOrder { .. }));
+
+        if !has_entry_order || context.capital <= Decimal::ZERO {
+            return ApprovalRequirement::NotRequired;
+        }
+
+        let threshold = context.capital * self.entry_notional_threshold_pct / Decimal::from(100u32);
+
+        if proposed.notional_value > threshold {
+            ApprovalRequirement::Required {
+                reason: format!(
+                    "Entry notional {} exceeds approval threshold {}",
+                    proposed.notional_value, threshold
+                ),
+                ttl_seconds: self.ttl_seconds,
+            }
+        } else {
+            ApprovalRequirement::NotRequired
+        }
+    }
+}
+
+impl Default for ApprovalPolicy {
+    fn default() -> Self {
+        Self::new(Decimal::from(5u32), 300)
+    }
+}
+
+/// Result of the approval gate after risk approval.
+#[derive(Debug)]
+pub(crate) enum ApprovalCheckResult {
+    /// No approval required. Execution may proceed immediately.
+    Ready(GovernedAction),
+    /// Approval required. Runtime must hold the query until operator approval.
+    AwaitingApproval(GovernedAction),
 }
 
 // =============================================================================
@@ -154,12 +233,21 @@ pub(crate) enum CheckRiskError {
 pub struct QueryEngine<R: QueryRecorder> {
     recorder: R,
     risk_gate: RiskGate,
+    approval_policy: ApprovalPolicy,
 }
 
 impl<R: QueryRecorder> QueryEngine<R> {
     /// Create a new QueryEngine with the given recorder and risk gate.
     pub fn new(recorder: R, risk_gate: RiskGate) -> Self {
-        Self { recorder, risk_gate }
+        Self::with_approval_policy(recorder, risk_gate, ApprovalPolicy::default())
+    }
+
+    pub(crate) fn with_approval_policy(
+        recorder: R,
+        risk_gate: RiskGate,
+        approval_policy: ApprovalPolicy,
+    ) -> Self {
+        Self { recorder, risk_gate, approval_policy }
     }
 
     /// Record that a query has been accepted.
@@ -226,7 +314,7 @@ impl<R: QueryRecorder> QueryEngine<R> {
                     "risk check approved"
                 );
                 Ok(GovernedAction::new(actions))
-            }
+            },
             RiskVerdict::Rejected { check, reason } => {
                 tracing::warn!(
                     query_id = %query.id,
@@ -239,8 +327,41 @@ impl<R: QueryRecorder> QueryEngine<R> {
                 query.deny(reason, check.name().to_string());
                 self.recorder.on_state_change(query);
                 Err(CheckRiskError::Denied)
-            }
+            },
         }
+    }
+
+    /// Phase 3: decide whether an already risk-approved query requires
+    /// operator approval before execution.
+    pub(crate) fn check_approval(
+        &self,
+        query: &mut ExecutionQuery,
+        proposed: &ProposedTrade,
+        context: &RiskContext,
+        governed: GovernedAction,
+    ) -> Result<ApprovalCheckResult, QueryError> {
+        match self.approval_policy.requirement_for(governed.actions(), proposed, context) {
+            ApprovalRequirement::NotRequired => Ok(ApprovalCheckResult::Ready(governed)),
+            ApprovalRequirement::Required { reason, ttl_seconds } => {
+                query.await_approval(reason, ttl_seconds)?;
+                self.recorder.on_state_change(query);
+                Ok(ApprovalCheckResult::AwaitingApproval(governed))
+            },
+        }
+    }
+
+    /// Record an operator authorization transition.
+    pub(crate) fn authorize(&self, query: &mut ExecutionQuery) -> Result<(), QueryError> {
+        query.authorize()?;
+        self.recorder.on_state_change(query);
+        Ok(())
+    }
+
+    /// Record approval expiration.
+    pub(crate) fn expire(&self, query: &mut ExecutionQuery) -> Result<(), QueryError> {
+        query.expire_approval()?;
+        self.recorder.on_state_change(query);
+        Ok(())
     }
 }
 
@@ -253,7 +374,7 @@ mod tests {
     use super::*;
     use crate::query::{ActorKind, QueryKind, QueryOutcome, QueryState};
     use robson_domain::{Price, Side, Symbol};
-    use robson_engine::{PositionSummary, RiskContext, RiskGate, RiskLimits};
+    use robson_engine::{PositionSummary, RiskContext, RiskGate};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use std::sync::Arc;
@@ -303,10 +424,6 @@ mod tests {
             },
             ActorKind::Detector,
         )
-    }
-
-    fn make_engine(recorder: impl QueryRecorder) -> QueryEngine<impl QueryRecorder> {
-        QueryEngine::new(recorder, RiskGate::new())
     }
 
     #[test]
@@ -445,18 +562,14 @@ mod tests {
     }
 
     fn dummy_actions() -> Vec<EngineAction> {
-        // Use EmitEvent as a stand-in (we just need a non-empty Vec)
-        use robson_domain::{Event, PositionId, TechnicalStopDistance, Side, Symbol};
-        use robson_domain::Price;
-        use rust_decimal_macros::dec;
-        vec![EngineAction::EmitEvent(Event::PositionArmed {
+        use robson_domain::{OrderSide, Quantity, Symbol};
+        vec![EngineAction::PlaceEntryOrder {
             position_id: uuid::Uuid::nil(),
-            account_id: uuid::Uuid::nil(),
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
-            side: Side::Long,
-            tech_stop_distance: None,
-            timestamp: chrono::Utc::now(),
-        })]
+            side: OrderSide::Buy,
+            quantity: Quantity::new(dec!(0.01)).unwrap(),
+            signal_id: uuid::Uuid::nil(),
+        }]
     }
 
     #[test]
@@ -468,13 +581,107 @@ mod tests {
         query.transition(QueryState::Processing).unwrap();
 
         let actions = dummy_actions();
-        let result =
-            engine.check_risk(&mut query, &sample_proposed(), &empty_context(), actions);
+        let result = engine.check_risk(&mut query, &sample_proposed(), &empty_context(), actions);
 
         assert!(result.is_ok(), "Expected Ok(GovernedAction) for approved trade");
         assert_eq!(query.state, QueryState::RiskChecked);
         // state_change recorded for Accepted (from create_test_query) + RiskChecked transition
         assert!(recorder.state_change_count() >= 1);
+    }
+
+    #[test]
+    fn test_check_approval_not_required_returns_ready() {
+        let recorder = Arc::new(MockRecorder::new());
+        let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
+
+        let mut query = create_test_query();
+        query.transition(QueryState::Processing).unwrap();
+
+        let no_approval_proposed = ProposedTrade {
+            symbol: "BTCUSDT".to_string(),
+            side: "long".to_string(),
+            quantity: dec!(0.004),
+            entry_price: dec!(95000),
+            notional_value: dec!(400),
+            margin_required: dec!(40),
+        };
+
+        let governed = engine
+            .check_risk(&mut query, &no_approval_proposed, &empty_context(), dummy_actions())
+            .expect("risk should approve");
+
+        let result =
+            engine.check_approval(&mut query, &no_approval_proposed, &empty_context(), governed);
+
+        assert!(matches!(result, Ok(ApprovalCheckResult::Ready(_))));
+        assert_eq!(query.state, QueryState::RiskChecked);
+        assert!(query.approval.is_none(), "No approval metadata should be attached");
+    }
+
+    #[test]
+    fn test_check_approval_required_moves_to_awaiting_approval() {
+        let recorder = Arc::new(MockRecorder::new());
+        let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
+
+        let mut query = create_test_query();
+        query.transition(QueryState::Processing).unwrap();
+
+        let approval_proposed = ProposedTrade {
+            symbol: "BTCUSDT".to_string(),
+            side: "long".to_string(),
+            quantity: dec!(0.01),
+            entry_price: dec!(95000),
+            notional_value: dec!(1000),
+            margin_required: dec!(100),
+        };
+
+        let governed = engine
+            .check_risk(&mut query, &approval_proposed, &empty_context(), dummy_actions())
+            .expect("risk should approve");
+
+        let result =
+            engine.check_approval(&mut query, &approval_proposed, &empty_context(), governed);
+
+        assert!(matches!(result, Ok(ApprovalCheckResult::AwaitingApproval(_))));
+        assert_eq!(query.state, QueryState::AwaitingApproval);
+        let approval = query.approval.as_ref().expect("approval metadata must be present");
+        assert_eq!(approval.ttl_seconds, 300);
+        assert!(approval.reason.contains("approval threshold"));
+    }
+
+    #[test]
+    fn test_authorize_transitions_query_to_authorized() {
+        let recorder = Arc::new(MockRecorder::new());
+        let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
+
+        let mut query = create_test_query();
+        query.transition(QueryState::Processing).unwrap();
+        query.transition(QueryState::RiskChecked).unwrap();
+        query.await_approval("Manual gate".to_string(), 30).unwrap();
+
+        engine.authorize(&mut query).unwrap();
+
+        assert_eq!(query.state, QueryState::Authorized);
+        assert!(
+            query.approval.as_ref().and_then(|approval| approval.approved_at).is_some(),
+            "Authorized queries must record approved_at"
+        );
+    }
+
+    #[test]
+    fn test_expire_transitions_query_to_expired() {
+        let recorder = Arc::new(MockRecorder::new());
+        let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
+
+        let mut query = create_test_query();
+        query.transition(QueryState::Processing).unwrap();
+        query.transition(QueryState::RiskChecked).unwrap();
+        query.await_approval("Manual gate".to_string(), 30).unwrap();
+
+        engine.expire(&mut query).unwrap();
+
+        assert_eq!(query.state, QueryState::Expired);
+        assert!(query.finished_at.is_some(), "Expired queries are terminal");
     }
 
     #[test]
@@ -485,8 +692,12 @@ mod tests {
         let mut query = create_test_query();
         query.transition(QueryState::Processing).unwrap();
 
-        let result =
-            engine.check_risk(&mut query, &sample_proposed(), &saturated_context(), dummy_actions());
+        let result = engine.check_risk(
+            &mut query,
+            &sample_proposed(),
+            &saturated_context(),
+            dummy_actions(),
+        );
 
         assert!(result.is_err(), "Expected Err(CheckRiskError::Denied) for saturated portfolio");
         assert!(
@@ -533,7 +744,8 @@ mod tests {
 
         assert!(
             matches!(result, Err(CheckRiskError::InvalidState(_))),
-            "Expected Err(CheckRiskError::InvalidState), got {:?}", result
+            "Expected Err(CheckRiskError::InvalidState), got {:?}",
+            result
         );
         // Query must NOT have transitioned to Denied — that would be a false governance record.
         assert!(

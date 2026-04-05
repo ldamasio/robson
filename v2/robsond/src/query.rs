@@ -103,7 +103,13 @@ pub enum QueryKind {
 ///               Failed         Denied        Failed
 /// ```
 ///
-/// Phase 3+ adds: AwaitingApproval, Authorized between RiskChecked and Acting.
+/// Phase 3:
+/// ```text
+///   Accepted -> Processing -> RiskChecked -> AwaitingApproval -> Authorized -> Acting -> Completed
+///                  |              |                |                                |
+///                  v              v                v                                v
+///               Failed         Denied          Expired                           Failed
+/// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum QueryState {
     /// Query created, validated, queued
@@ -114,6 +120,12 @@ pub enum QueryState {
 
     /// Phase 2: Risk gate evaluated. Either approved (→ Acting) or denied (→ Denied).
     RiskChecked,
+
+    /// Phase 3: waiting for explicit operator approval before execution.
+    AwaitingApproval,
+
+    /// Phase 3: operator approved execution. The query may proceed to Acting.
+    Authorized,
 
     /// Executor is executing governed actions (Act phase)
     Acting,
@@ -132,6 +144,9 @@ pub enum QueryState {
     ///
     /// `check` identifies which governance rule triggered the denial.
     Denied { reason: String, check: String },
+
+    /// Phase 3: approval TTL elapsed before the operator authorized the query.
+    Expired,
 }
 
 // =============================================================================
@@ -231,6 +246,19 @@ pub enum ApprovalRequirement {
     Required { reason: String, ttl_seconds: u64 },
 }
 
+/// Runtime approval metadata for queries gated by human confirmation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ApprovalContext {
+    /// Why explicit approval is required.
+    pub reason: String,
+    /// Approval time-to-live in seconds.
+    pub ttl_seconds: u64,
+    /// Absolute deadline for approval.
+    pub expires_at: DateTime<Utc>,
+    /// When the operator approved the query, if approval was granted.
+    pub approved_at: Option<DateTime<Utc>>,
+}
+
 /// Result of a permission check.
 /// Phase 1: always Granted.
 /// Phase 2+: determined by Risk Engine and governance rules.
@@ -297,6 +325,9 @@ pub struct ExecutionQuery {
 
     /// Final outcome (set when Completed or Failed)
     pub outcome: Option<QueryOutcome>,
+
+    /// Approval metadata for Phase 3 queries gated by human confirmation.
+    pub approval: Option<ApprovalContext>,
 }
 
 impl ExecutionQuery {
@@ -312,6 +343,7 @@ impl ExecutionQuery {
             started_at: Utc::now(),
             finished_at: None,
             outcome: None,
+            approval: None,
         }
     }
 
@@ -334,8 +366,20 @@ impl ExecutionQuery {
             // RiskChecked -> Acting (risk approved)
             (QueryState::RiskChecked, QueryState::Acting) => Ok(()),
 
+            // RiskChecked -> AwaitingApproval (Phase 3 approval gate)
+            (QueryState::RiskChecked, QueryState::AwaitingApproval) => Ok(()),
+
             // RiskChecked -> Denied (risk denied — governed terminal state)
             (QueryState::RiskChecked, QueryState::Denied { .. }) => Ok(()),
+
+            // AwaitingApproval -> Authorized (operator approved)
+            (QueryState::AwaitingApproval, QueryState::Authorized) => Ok(()),
+
+            // AwaitingApproval -> Expired (approval TTL elapsed)
+            (QueryState::AwaitingApproval, QueryState::Expired) => Ok(()),
+
+            // Authorized -> Acting
+            (QueryState::Authorized, QueryState::Acting) => Ok(()),
 
             // Acting -> Completed
             (QueryState::Acting, QueryState::Completed) => Ok(()),
@@ -344,6 +388,8 @@ impl ExecutionQuery {
             (QueryState::Accepted, QueryState::Failed { .. }) => Ok(()),
             (QueryState::Processing, QueryState::Failed { .. }) => Ok(()),
             (QueryState::RiskChecked, QueryState::Failed { .. }) => Ok(()),
+            (QueryState::AwaitingApproval, QueryState::Failed { .. }) => Ok(()),
+            (QueryState::Authorized, QueryState::Failed { .. }) => Ok(()),
             (QueryState::Acting, QueryState::Failed { .. }) => Ok(()),
 
             // All other transitions are invalid
@@ -358,7 +404,10 @@ impl ExecutionQuery {
         // Set finished_at for terminal states
         if matches!(
             self.state,
-            QueryState::Completed | QueryState::Failed { .. } | QueryState::Denied { .. }
+            QueryState::Completed
+                | QueryState::Failed { .. }
+                | QueryState::Denied { .. }
+                | QueryState::Expired
         ) {
             self.finished_at = Some(Utc::now());
         }
@@ -413,6 +462,49 @@ impl ExecutionQuery {
         let _ = self.transition(QueryState::Denied { reason, check });
     }
 
+    /// Convenience: move into AwaitingApproval and attach approval metadata.
+    pub fn await_approval(&mut self, reason: String, ttl_seconds: u64) -> Result<(), QueryError> {
+        self.transition(QueryState::AwaitingApproval)?;
+        let ttl_seconds = ttl_seconds.min(i64::MAX as u64);
+        self.approval = Some(ApprovalContext {
+            reason,
+            ttl_seconds,
+            expires_at: Utc::now() + Duration::seconds(ttl_seconds as i64),
+            approved_at: None,
+        });
+        Ok(())
+    }
+
+    /// Convenience: mark an awaiting approval query as authorized.
+    pub fn authorize(&mut self) -> Result<(), QueryError> {
+        if self.approval.is_none() {
+            return Err(QueryError::InvalidTransition {
+                from: format!("{:?}", self.state),
+                to: "Authorized".to_string(),
+            });
+        }
+
+        self.transition(QueryState::Authorized)?;
+
+        if let Some(approval) = &mut self.approval {
+            approval.approved_at = Some(Utc::now());
+        }
+
+        Ok(())
+    }
+
+    /// Convenience: expire an awaiting approval query.
+    pub fn expire_approval(&mut self) -> Result<(), QueryError> {
+        if self.approval.is_none() {
+            return Err(QueryError::InvalidTransition {
+                from: format!("{:?}", self.state),
+                to: "Expired".to_string(),
+            });
+        }
+
+        self.transition(QueryState::Expired)
+    }
+
     /// Duration of query execution (None if not yet completed).
     pub fn duration(&self) -> Option<Duration> {
         self.finished_at.map(|f| f - self.started_at)
@@ -450,6 +542,7 @@ mod tests {
         assert!(query.context_summary.is_none());
         assert!(query.finished_at.is_none());
         assert!(query.outcome.is_none());
+        assert!(query.approval.is_none());
     }
 
     #[test]
@@ -635,7 +728,65 @@ mod tests {
         );
 
         // finished_at must be set (Denied is terminal)
-        assert!(query.finished_at.is_some(), "Denied is a terminal state — finished_at must be set");
+        assert!(
+            query.finished_at.is_some(),
+            "Denied is a terminal state — finished_at must be set"
+        );
+    }
+
+    #[test]
+    fn test_risk_checked_to_awaiting_approval_sets_metadata() {
+        let mut query = create_test_query();
+
+        query.transition(QueryState::Processing).unwrap();
+        query.transition(QueryState::RiskChecked).unwrap();
+        query.await_approval("Operator confirmation required".to_string(), 30).unwrap();
+
+        assert_eq!(query.state, QueryState::AwaitingApproval);
+        let approval = query.approval.as_ref().expect("approval metadata must be set");
+        assert_eq!(approval.reason, "Operator confirmation required");
+        assert_eq!(approval.ttl_seconds, 30);
+        assert!(approval.expires_at >= query.started_at);
+        assert!(approval.approved_at.is_none());
+        assert!(query.finished_at.is_none(), "AwaitingApproval is non-terminal");
+    }
+
+    #[test]
+    fn test_awaiting_approval_to_authorized_sets_timestamp() {
+        let mut query = create_test_query();
+
+        query.transition(QueryState::Processing).unwrap();
+        query.transition(QueryState::RiskChecked).unwrap();
+        query.await_approval("Manual gate".to_string(), 60).unwrap();
+        query.authorize().unwrap();
+
+        assert_eq!(query.state, QueryState::Authorized);
+        let approval = query.approval.as_ref().expect("approval metadata must be present");
+        assert!(approval.approved_at.is_some());
+        assert!(query.finished_at.is_none(), "Authorized is non-terminal");
+    }
+
+    #[test]
+    fn test_awaiting_approval_to_expired_is_terminal() {
+        let mut query = create_test_query();
+
+        query.transition(QueryState::Processing).unwrap();
+        query.transition(QueryState::RiskChecked).unwrap();
+        query.await_approval("Manual gate".to_string(), 60).unwrap();
+        query.expire_approval().unwrap();
+
+        assert_eq!(query.state, QueryState::Expired);
+        assert!(query.finished_at.is_some(), "Expired is terminal");
+    }
+
+    #[test]
+    fn test_invalid_approval_transition_is_rejected() {
+        let mut query = create_test_query();
+
+        query.transition(QueryState::Processing).unwrap();
+
+        let result = query.authorize();
+        assert!(result.is_err(), "authorize() must fail outside AwaitingApproval");
     }
 
     #[test]

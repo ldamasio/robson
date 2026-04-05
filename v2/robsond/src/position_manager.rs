@@ -45,11 +45,21 @@ use crate::event_bus::{DaemonEvent, EventBus, MarketData};
 use crate::query::{
     ActorKind, CommandSource, ContextSummary, ExecutionQuery, QueryKind, QueryOutcome, QueryState,
 };
-use crate::query_engine::{CheckRiskError, GovernedAction, QueryEngine, TracingQueryRecorder};
+use crate::query_engine::{
+    ApprovalCheckResult, ApprovalPolicy, CheckRiskError, GovernedAction, QueryEngine,
+    TracingQueryRecorder,
+};
 
 // =============================================================================
 // Position Manager
 // =============================================================================
+
+#[derive(Debug)]
+struct PendingApprovalRecord {
+    query: ExecutionQuery,
+    position: Position,
+    governed: GovernedAction,
+}
 
 /// Manages position lifecycle and detector tasks.
 pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
@@ -64,9 +74,11 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// Master cancellation token for all detector tasks
     shutdown_token: CancellationToken,
     /// Active detector tasks (position_id → task handle)
-    detectors: RwLock<HashMap<PositionId, JoinHandle<Option<DetectorSignal>>>>,
+    detectors: Arc<RwLock<HashMap<PositionId, JoinHandle<Option<DetectorSignal>>>>>,
+    /// Pending approvals held in runtime memory for Phase 3.
+    pending_approvals: Arc<RwLock<HashMap<Uuid, PendingApprovalRecord>>>,
     /// Query engine for lifecycle tracking
-    query_engine: QueryEngine<TracingQueryRecorder>,
+    query_engine: Arc<QueryEngine<TracingQueryRecorder>>,
 }
 
 impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
@@ -79,8 +91,22 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         store: Arc<S>,
         event_bus: Arc<EventBus>,
     ) -> Self {
+        Self::with_approval_policy(engine, executor, store, event_bus, ApprovalPolicy::default())
+    }
+
+    pub(crate) fn with_approval_policy(
+        engine: Engine,
+        executor: Arc<Executor<E, S>>,
+        store: Arc<S>,
+        event_bus: Arc<EventBus>,
+        approval_policy: ApprovalPolicy,
+    ) -> Self {
         let shutdown_token = CancellationToken::new();
-        let query_engine = QueryEngine::new(TracingQueryRecorder, RiskGate::new());
+        let query_engine = Arc::new(QueryEngine::with_approval_policy(
+            TracingQueryRecorder,
+            RiskGate::new(),
+            approval_policy,
+        ));
 
         Self {
             engine,
@@ -88,7 +114,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             store,
             event_bus,
             shutdown_token,
-            detectors: RwLock::new(HashMap::new()),
+            detectors: Arc::new(RwLock::new(HashMap::new())),
+            pending_approvals: Arc::new(RwLock::new(HashMap::new())),
             query_engine,
         }
     }
@@ -216,32 +243,245 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         ))
     }
 
-    /// Re-arm the position's detector after a risk gate denial.
-    ///
-    /// When the risk gate denies an entry, the original detector has already completed
-    /// (it fired the signal). Without re-arming, the position would remain Armed but
-    /// with no active detector — unable to receive future signals.
-    ///
-    /// This spawns a new detector so the position remains responsive.
-    /// If the spawn fails (e.g. invalid position state), logs a warning — the operator
-    /// can re-arm manually via the disarm/re-arm flow.
-    async fn rearm_detector_after_denial(&self, position_id: PositionId, position: &Position) {
-        let cancel_token = self.child_cancel_token();
-        match DetectorTask::from_position(position, Arc::clone(&self.event_bus), cancel_token) {
+    async fn rearm_detector(
+        position_id: PositionId,
+        position: Position,
+        event_bus: Arc<EventBus>,
+        detectors: Arc<RwLock<HashMap<PositionId, JoinHandle<Option<DetectorSignal>>>>>,
+        shutdown_token: CancellationToken,
+        reason: &'static str,
+    ) {
+        let cancel_token = shutdown_token.child_token();
+        match DetectorTask::from_position(&position, Arc::clone(&event_bus), cancel_token) {
             Ok(detector) => {
                 let handle = detector.spawn();
-                let mut detectors = self.detectors.write().await;
+                let mut detectors = detectors.write().await;
                 detectors.insert(position_id, handle);
-                info!(%position_id, "Detector re-armed after risk denial");
+                info!(%position_id, %reason, "Detector re-armed");
             },
             Err(e) => {
                 warn!(
                     %position_id,
+                    %reason,
                     error = %e,
-                    "Failed to re-arm detector after risk denial — position requires manual re-arm"
+                    "Failed to re-arm detector — position requires manual re-arm"
                 );
             },
         }
+    }
+
+    async fn rearm_detector_after_governed_block(
+        &self,
+        position_id: PositionId,
+        position: &Position,
+        reason: &'static str,
+    ) {
+        Self::rearm_detector(
+            position_id,
+            position.clone(),
+            Arc::clone(&self.event_bus),
+            Arc::clone(&self.detectors),
+            self.shutdown_token.clone(),
+            reason,
+        )
+        .await;
+    }
+
+    fn emit_query_awaiting_approval(&self, query: &ExecutionQuery) {
+        let approval = match &query.approval {
+            Some(approval) => approval,
+            None => return,
+        };
+
+        self.event_bus.send(DaemonEvent::QueryAwaitingApproval {
+            query_id: query.id,
+            position_id: query.position_id,
+            reason: approval.reason.clone(),
+            expires_at: approval.expires_at,
+        });
+    }
+
+    fn emit_query_authorized(&self, query: &ExecutionQuery) {
+        let approved_at = query
+            .approval
+            .as_ref()
+            .and_then(|approval| approval.approved_at)
+            .unwrap_or_else(chrono::Utc::now);
+
+        self.event_bus.send(DaemonEvent::QueryAuthorized {
+            query_id: query.id,
+            position_id: query.position_id,
+            approved_at,
+        });
+    }
+
+    fn emit_query_expired(&self, query: &ExecutionQuery) {
+        self.event_bus.send(DaemonEvent::QueryExpired {
+            query_id: query.id,
+            position_id: query.position_id,
+            expired_at: chrono::Utc::now(),
+        });
+    }
+
+    fn spawn_approval_expiration_task(
+        &self,
+        query_id: Uuid,
+        expires_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        let pending_approvals = Arc::clone(&self.pending_approvals);
+        let query_engine = Arc::clone(&self.query_engine);
+        let event_bus = Arc::clone(&self.event_bus);
+        let detectors = Arc::clone(&self.detectors);
+        let shutdown_token = self.shutdown_token.clone();
+
+        let wait_duration = expires_at
+            .signed_duration_since(chrono::Utc::now())
+            .to_std()
+            .unwrap_or_default();
+
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = shutdown_token.cancelled() => {}
+                _ = tokio::time::sleep(wait_duration) => {
+                    let mut record = {
+                        let mut pending = pending_approvals.write().await;
+                        pending.remove(&query_id)
+                    };
+
+                    if let Some(mut record_inner) = record.take() {
+                        if let Err(error) = query_engine.expire(&mut record_inner.query) {
+                            let error_message = format!("Approval expiry transition error: {}", error);
+                            record_inner.query.fail(error_message.clone(), "awaiting_approval".to_string());
+                            query_engine.on_error(&record_inner.query, &error_message);
+                            return;
+                        }
+
+                        event_bus.send(DaemonEvent::QueryExpired {
+                            query_id: record_inner.query.id,
+                            position_id: record_inner.query.position_id,
+                            expired_at: chrono::Utc::now(),
+                        });
+
+                        PositionManager::<E, S>::rearm_detector(
+                            record_inner.position.id,
+                            record_inner.position,
+                            event_bus,
+                            detectors,
+                            shutdown_token,
+                            "approval expired",
+                        )
+                        .await;
+                    }
+                }
+            }
+        });
+    }
+
+    async fn store_pending_approval(
+        &self,
+        query: ExecutionQuery,
+        position: Position,
+        governed: GovernedAction,
+    ) {
+        let query_id = query.id;
+        let expires_at = query
+            .approval
+            .as_ref()
+            .map(|approval| approval.expires_at)
+            .expect("awaiting approval queries must include approval metadata");
+
+        {
+            let mut pending_approvals = self.pending_approvals.write().await;
+            pending_approvals.insert(query_id, PendingApprovalRecord { query, position, governed });
+        }
+
+        let pending_approvals = self.pending_approvals.read().await;
+        if let Some(record) = pending_approvals.get(&query_id) {
+            self.emit_query_awaiting_approval(&record.query);
+        }
+        drop(pending_approvals);
+
+        self.spawn_approval_expiration_task(query_id, expires_at);
+    }
+
+    async fn execute_signal_query(
+        &self,
+        query: &mut ExecutionQuery,
+        governed: GovernedAction,
+    ) -> DaemonResult<()> {
+        let position_id = query
+            .position_id
+            .ok_or_else(|| DaemonError::Config("Signal query missing position_id".to_string()))?;
+
+        if let Err(e) = query.transition(QueryState::Acting) {
+            let phase = match query.state {
+                QueryState::Authorized => "authorized",
+                QueryState::RiskChecked => "risk_checked",
+                _ => "processing",
+            };
+            query.fail(format!("{}", e), phase.to_string());
+            self.query_engine.on_error(query, &format!("{}", e));
+            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+        }
+        self.query_engine.on_state_change(query);
+
+        let results = match self.executor.execute(governed.into_actions()).await {
+            Ok(r) => r,
+            Err(e) => {
+                query.fail(format!("{}", e), "acting".to_string());
+                self.query_engine.on_error(query, &format!("{}", e));
+                return Err(e.into());
+            },
+        };
+
+        let actions_count = results.len();
+        for result in results {
+            match result {
+                ActionResult::OrderPlaced(order) => {
+                    info!(
+                        %position_id,
+                        exchange_order_id = %order.exchange_order_id,
+                        fill_price = %order.fill_price.as_decimal(),
+                        "Entry order placed and filled"
+                    );
+
+                    if let Err(e) = self
+                        .handle_entry_fill(
+                            position_id,
+                            order.fill_price,
+                            order.filled_quantity,
+                            Some(order.exchange_order_id),
+                        )
+                        .await
+                    {
+                        query.fail(format!("{}", e), "acting".to_string());
+                        self.query_engine.on_error(query, &format!("{}", e));
+                        return Err(e);
+                    }
+                },
+                ActionResult::AlreadyProcessed(id) => {
+                    warn!(%position_id, %id, "Signal already processed (idempotent skip)");
+                },
+                ActionResult::EventEmitted(event) => {
+                    debug!(%position_id, event_type = event.event_type(), "Event emitted");
+                },
+                ActionResult::StateUpdated => {
+                    debug!(%position_id, "State updated");
+                },
+                ActionResult::Skipped(reason) => {
+                    debug!(%position_id, %reason, "Action skipped");
+                },
+            }
+        }
+
+        if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
+            query.fail(format!("{}", e), "acting".to_string());
+            self.query_engine.on_error(query, &format!("{}", e));
+            return Err(DaemonError::Config(format!("Query completion error: {}", e)));
+        }
+        self.query_engine.on_state_change(query);
+
+        Ok(())
     }
 
     /// Build a ProposedTrade for risk evaluation from a signal and its engine decision.
@@ -657,132 +897,137 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         //
         // Denial (CheckRiskError::Denied) is a governed outcome — return Ok(()).
         // InvalidState (CheckRiskError::InvalidState) is an operational error — propagate.
-        let governed: GovernedAction = {
-            let risk_context = match self.build_risk_context().await {
-                Ok(ctx) => ctx,
-                Err(e) => {
-                    let err_str = format!("{}", e);
-                    query.fail(err_str.clone(), "processing".to_string());
-                    self.query_engine.on_error(&query, &err_str);
-                    return Err(e);
-                },
-            };
-
-            let proposed = match Self::build_proposed_trade(&signal, &decision) {
-                Some(p) => p,
-                None => {
-                    let err_str = "decide_entry produced actions but no PlaceEntryOrder — cannot build ProposedTrade".to_string();
-                    query.fail(err_str.clone(), "processing".to_string());
-                    self.query_engine.on_error(&query, &err_str);
-                    return Err(DaemonError::Config(err_str));
-                },
-            };
-
-            match self.query_engine.check_risk(
-                &mut query,
-                &proposed,
-                &risk_context,
-                decision.actions,
-            ) {
-                Ok(g) => g,
-                Err(CheckRiskError::Denied) => {
-                    // Governed denial: query is already in Denied state.
-                    //
-                    // Re-arm the detector so the Armed position can receive future signals.
-                    // The original detector completed when the signal fired; without re-arming,
-                    // the position would be Armed but permanently unresponsive.
-                    self.rearm_detector_after_denial(position_id, &position).await;
-                    info!(
-                        %position_id,
-                        query_id = %query.id,
-                        "Entry denied by risk gate — detector re-armed (governed outcome)"
-                    );
-                    return Ok(());
-                },
-                Err(CheckRiskError::InvalidState(e)) => {
-                    // Operational error: query lifecycle state machine is inconsistent.
-                    // This is NOT a governed denial — it indicates a bug or concurrent
-                    // mutation. Fail the query and propagate as a hard error.
-                    let err_str = format!("Risk gate lifecycle error: {}", e);
-                    query.fail(err_str.clone(), "processing".to_string());
-                    self.query_engine.on_error(&query, &err_str);
-                    return Err(DaemonError::Config(err_str));
-                },
-            }
-        };
-
-        // Transition to Acting before executor call (risk approved)
-        if let Err(e) = query.transition(QueryState::Acting) {
-            query.fail(format!("{}", e), "risk_checked".to_string());
-            self.query_engine.on_error(&query, &format!("{}", e));
-            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
-        }
-        self.query_engine.on_state_change(&query);
-
-        // Execute governed actions (events are appended and applied; exchange orders are placed)
-        // EntryOrderPlaced event transitions position to Entering via apply_event
-        let results = match self.executor.execute(governed.into_actions()).await {
-            Ok(r) => r,
+        let risk_context = match self.build_risk_context().await {
+            Ok(ctx) => ctx,
             Err(e) => {
-                query.fail(format!("{}", e), "acting".to_string());
-                self.query_engine.on_error(&query, &format!("{}", e));
-                return Err(e.into());
+                let err_str = format!("{}", e);
+                query.fail(err_str.clone(), "processing".to_string());
+                self.query_engine.on_error(&query, &err_str);
+                return Err(e);
             },
         };
 
-        // Log results and process fill if order was placed
-        // actions_count represents ALL ActionResult variants (including AlreadyProcessed and Skipped)
-        let actions_count = results.len();
-        for result in results {
-            match result {
-                ActionResult::OrderPlaced(order) => {
-                    info!(
-                        %position_id,
-                        exchange_order_id = %order.exchange_order_id,
-                        fill_price = %order.fill_price.as_decimal(),
-                        "Entry order placed and filled"
-                    );
+        let proposed = match Self::build_proposed_trade(&signal, &decision) {
+            Some(p) => p,
+            None => {
+                let err_str =
+                    "decide_entry produced actions but no PlaceEntryOrder — cannot build ProposedTrade"
+                        .to_string();
+                query.fail(err_str.clone(), "processing".to_string());
+                self.query_engine.on_error(&query, &err_str);
+                return Err(DaemonError::Config(err_str));
+            },
+        };
 
-                    // Process the fill (position is now in Entering state)
-                    // Note: handle_entry_fill is internal, covered by this query's lifecycle
-                    if let Err(e) = self
-                        .handle_entry_fill(
-                            position_id,
-                            order.fill_price,
-                            order.filled_quantity,
-                            Some(order.exchange_order_id),
-                        )
-                        .await
-                    {
-                        query.fail(format!("{}", e), "acting".to_string());
-                        self.query_engine.on_error(&query, &format!("{}", e));
-                        return Err(e);
-                    }
-                },
-                ActionResult::AlreadyProcessed(id) => {
-                    warn!(%position_id, %id, "Signal already processed (idempotent skip)");
-                },
-                ActionResult::EventEmitted(event) => {
-                    debug!(%position_id, event_type = event.event_type(), "Event emitted");
-                },
-                ActionResult::StateUpdated => {
-                    debug!(%position_id, "State updated");
-                },
-                ActionResult::Skipped(reason) => {
-                    debug!(%position_id, %reason, "Action skipped");
-                },
+        let governed: GovernedAction = match self.query_engine.check_risk(
+            &mut query,
+            &proposed,
+            &risk_context,
+            decision.actions,
+        ) {
+            Ok(g) => g,
+            Err(CheckRiskError::Denied) => {
+                // Governed denial: query is already in Denied state.
+                //
+                // Re-arm the detector so the Armed position can receive future signals.
+                // The original detector completed when the signal fired; without re-arming,
+                // the position would be Armed but permanently unresponsive.
+                self.rearm_detector_after_governed_block(position_id, &position, "risk denied")
+                    .await;
+                info!(
+                    %position_id,
+                    query_id = %query.id,
+                    "Entry denied by risk gate — detector re-armed (governed outcome)"
+                );
+                return Ok(());
+            },
+            Err(CheckRiskError::InvalidState(e)) => {
+                // Operational error: query lifecycle state machine is inconsistent.
+                // This is NOT a governed denial — it indicates a bug or concurrent
+                // mutation. Fail the query and propagate as a hard error.
+                let err_str = format!("Risk gate lifecycle error: {}", e);
+                query.fail(err_str.clone(), "processing".to_string());
+                self.query_engine.on_error(&query, &err_str);
+                return Err(DaemonError::Config(err_str));
+            },
+        };
+
+        match self.query_engine.check_approval(&mut query, &proposed, &risk_context, governed) {
+            Ok(ApprovalCheckResult::Ready(governed)) => {
+                self.execute_signal_query(&mut query, governed).await?;
+                Ok(())
+            },
+            Ok(ApprovalCheckResult::AwaitingApproval(governed)) => {
+                let query_id = query.id;
+                let expires_at = query
+                    .approval
+                    .as_ref()
+                    .map(|approval| approval.expires_at)
+                    .expect("awaiting approval query must contain approval metadata");
+                self.store_pending_approval(query, position.clone(), governed).await;
+
+                info!(
+                    %position_id,
+                    %query_id,
+                    expires_at = %expires_at,
+                    "Entry awaiting operator approval"
+                );
+                Ok(())
+            },
+            Err(e) => {
+                let err_str = format!("Approval gate lifecycle error: {}", e);
+                query.fail(err_str.clone(), "risk_checked".to_string());
+                self.query_engine.on_error(&query, &err_str);
+                Err(DaemonError::Config(err_str))
+            },
+        }
+    }
+
+    /// Approve a pending query and resume execution.
+    pub async fn approve_query(&self, query_id: Uuid) -> DaemonResult<ExecutionQuery> {
+        let mut record = {
+            let mut pending_approvals = self.pending_approvals.write().await;
+            pending_approvals
+                .remove(&query_id)
+                .ok_or(DaemonError::QueryNotFound(query_id))?
+        };
+
+        let expired = record
+            .query
+            .approval
+            .as_ref()
+            .map(|approval| chrono::Utc::now() >= approval.expires_at)
+            .unwrap_or(false);
+
+        if expired {
+            if let Err(e) = self.query_engine.expire(&mut record.query) {
+                let err_str = format!("Approval expiry transition error: {}", e);
+                record.query.fail(err_str.clone(), "awaiting_approval".to_string());
+                self.query_engine.on_error(&record.query, &err_str);
+                return Err(DaemonError::Config(err_str));
             }
+
+            self.emit_query_expired(&record.query);
+            self.rearm_detector_after_governed_block(
+                record.position.id,
+                &record.position,
+                "approval expired",
+            )
+            .await;
+            return Err(DaemonError::ApprovalExpired(query_id));
         }
 
-        // Complete query with success
-        if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
-            query.fail(format!("{}", e), "acting".to_string());
-            self.query_engine.on_error(&query, &format!("{}", e));
-            return Err(DaemonError::Config(format!("Query completion error: {}", e)));
+        if let Err(e) = self.query_engine.authorize(&mut record.query) {
+            let err_str = format!("Approval authorization error: {}", e);
+            record.query.fail(err_str.clone(), "awaiting_approval".to_string());
+            self.query_engine.on_error(&record.query, &err_str);
+            return Err(DaemonError::Config(err_str));
         }
-        self.query_engine.on_state_change(&query);
 
-        Ok(())
+        self.emit_query_authorized(&record.query);
+        self.execute_signal_query(&mut record.query, record.governed).await?;
+
+        Ok(record.query)
     }
 
     /// Handle entry fill (transition from Entering → Active).
@@ -1096,8 +1341,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                                 QueryState::Accepted => "accepted".to_string(),
                                 QueryState::Processing => "processing".to_string(),
                                 QueryState::RiskChecked => "risk_checked".to_string(),
+                                QueryState::AwaitingApproval => "awaiting_approval".to_string(),
+                                QueryState::Authorized => "authorized".to_string(),
                                 QueryState::Acting => "acting".to_string(),
                                 QueryState::Completed => "completed".to_string(),
+                                QueryState::Expired => "expired".to_string(),
                                 QueryState::Failed { phase, .. } => phase.clone(),
                                 QueryState::Denied { check, .. } => format!("denied:{}", check),
                             };
@@ -1291,7 +1539,9 @@ mod tests {
 
     /// Create a test manager without starting the signal listener.
     /// Use this for unit tests that call handle_signal() directly.
-    async fn create_test_manager() -> Arc<PositionManager<StubExchange, MemoryStore>> {
+    async fn create_test_manager_with_approval_policy(
+        approval_policy: ApprovalPolicy,
+    ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
@@ -1300,7 +1550,28 @@ mod tests {
         let risk_config = RiskConfig::new(dec!(10000), dec!(1)).unwrap(); // 1% risk
         let engine = Engine::new(risk_config);
 
-        Arc::new(PositionManager::new(engine, executor, store, event_bus))
+        Arc::new(PositionManager::with_approval_policy(
+            engine,
+            executor,
+            store,
+            event_bus,
+            approval_policy,
+        ))
+    }
+
+    async fn create_test_manager() -> Arc<PositionManager<StubExchange, MemoryStore>> {
+        create_test_manager_with_approval_policy(ApprovalPolicy::new(Decimal::from(100u32), 300))
+            .await
+    }
+
+    async fn create_phase3_test_manager(
+        ttl_seconds: u64,
+    ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
+        create_test_manager_with_approval_policy(ApprovalPolicy::new(
+            Decimal::from(5u32),
+            ttl_seconds,
+        ))
+        .await
     }
 
     /// Create a test manager WITH signal listener running.
@@ -1588,6 +1859,180 @@ mod tests {
         assert!(
             detectors.contains_key(&position.id),
             "Expected detector to be re-armed after risk denial"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_signal_waits_for_approval_when_required() {
+        let manager = create_phase3_test_manager(300).await;
+        let mut receiver = manager.event_bus.subscribe();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(90)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        let position = manager
+            .arm_position(
+                symbol.clone(),
+                Side::Long,
+                create_test_risk_config(),
+                tech_stop,
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol,
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(85500)).unwrap(), // 10% below -> approval required, risk approved
+            timestamp: chrono::Utc::now(),
+        };
+
+        manager.handle_signal(signal).await.unwrap();
+
+        let updated = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(
+            matches!(updated.state, PositionState::Armed),
+            "Expected Armed while approval is pending, got {:?}",
+            updated.state
+        );
+
+        let pending = manager.pending_approvals.read().await;
+        assert_eq!(pending.len(), 1, "Expected exactly one pending approval");
+        let record = pending.values().next().expect("pending approval must exist");
+        assert_eq!(record.query.state, QueryState::AwaitingApproval);
+        assert!(record.query.approval.is_some());
+        drop(pending);
+
+        let mut awaiting_seen = false;
+        for _ in 0..20 {
+            if let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv()).await
+            {
+                if let Ok(DaemonEvent::QueryAwaitingApproval { query_id, position_id, .. }) = event
+                {
+                    assert_eq!(position_id, Some(position.id));
+                    let pending = manager.pending_approvals.read().await;
+                    assert!(pending.contains_key(&query_id));
+                    awaiting_seen = true;
+                    break;
+                }
+            }
+        }
+        assert!(awaiting_seen, "Expected QueryAwaitingApproval event");
+    }
+
+    #[tokio::test]
+    async fn test_approve_query_executes_pending_signal() {
+        let manager = create_phase3_test_manager(300).await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(90)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        let position = manager
+            .arm_position(
+                symbol.clone(),
+                Side::Long,
+                create_test_risk_config(),
+                tech_stop,
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol,
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(85500)).unwrap(), // 10% below -> approval required, risk approved
+            timestamp: chrono::Utc::now(),
+        };
+
+        manager.handle_signal(signal).await.unwrap();
+
+        let query_id = {
+            let pending = manager.pending_approvals.read().await;
+            *pending.keys().next().expect("pending approval query must exist")
+        };
+
+        let approved_query = manager.approve_query(query_id).await.unwrap();
+
+        assert_eq!(approved_query.state, QueryState::Completed);
+        assert!(manager.pending_approvals.read().await.is_empty());
+
+        let updated = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(
+            matches!(updated.state, PositionState::Active { .. }),
+            "Expected Active after approval execution, got {:?}",
+            updated.state
+        );
+    }
+
+    #[tokio::test]
+    async fn test_pending_approval_expires_and_does_not_execute() {
+        let manager = create_phase3_test_manager(1).await;
+        let mut receiver = manager.event_bus.subscribe();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(90)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        let position = manager
+            .arm_position(
+                symbol.clone(),
+                Side::Long,
+                create_test_risk_config(),
+                tech_stop,
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol,
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(85500)).unwrap(), // 10% below -> approval required, risk approved
+            timestamp: chrono::Utc::now(),
+        };
+
+        manager.handle_signal(signal).await.unwrap();
+
+        let mut expired_seen = false;
+        for _ in 0..40 {
+            if let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(100), receiver.recv()).await
+            {
+                if let Ok(DaemonEvent::QueryExpired { position_id, .. }) = event {
+                    assert_eq!(position_id, Some(position.id));
+                    expired_seen = true;
+                    break;
+                }
+            }
+        }
+        assert!(expired_seen, "Expected QueryExpired event");
+
+        let updated = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(
+            matches!(updated.state, PositionState::Armed),
+            "Expected Armed after approval expiry, got {:?}",
+            updated.state
+        );
+        assert!(manager.pending_approvals.read().await.is_empty());
+
+        let detectors = manager.detectors.read().await;
+        assert!(
+            detectors.contains_key(&position.id),
+            "Detector must be re-armed after approval expiry"
         );
     }
 

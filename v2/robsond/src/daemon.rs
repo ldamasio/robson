@@ -554,6 +554,33 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                 );
             },
 
+            DaemonEvent::QueryAwaitingApproval { query_id, position_id, expires_at, .. } => {
+                info!(
+                    %query_id,
+                    ?position_id,
+                    %expires_at,
+                    "Query awaiting approval"
+                );
+            },
+
+            DaemonEvent::QueryAuthorized { query_id, position_id, approved_at } => {
+                info!(
+                    %query_id,
+                    ?position_id,
+                    %approved_at,
+                    "Query authorized"
+                );
+            },
+
+            DaemonEvent::QueryExpired { query_id, position_id, expired_at } => {
+                warn!(
+                    %query_id,
+                    ?position_id,
+                    %expired_at,
+                    "Query approval expired"
+                );
+            },
+
             DaemonEvent::Shutdown => {
                 info!("Shutdown event received");
                 return Err(DaemonError::Shutdown);

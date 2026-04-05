@@ -42,6 +42,10 @@ pub enum DaemonError {
     #[error("Position not found: {0}")]
     PositionNotFound(Uuid),
 
+    /// Query not found
+    #[error("Query not found: {0}")]
+    QueryNotFound(Uuid),
+
     /// Position already exists
     #[error("Position already exists: {0}")]
     PositionAlreadyExists(Uuid),
@@ -61,6 +65,10 @@ pub enum DaemonError {
     /// Configuration error
     #[error("Configuration error: {0}")]
     Config(String),
+
+    /// Approval expired before the operator authorized the query
+    #[error("Approval expired for query: {0}")]
+    ApprovalExpired(Uuid),
 
     /// Monitor error
     #[error("Monitor error: {0}")]

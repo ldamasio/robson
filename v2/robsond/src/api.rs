@@ -143,6 +143,13 @@ pub struct PanicResponse {
     pub count: usize,
 }
 
+/// Response after approving a query.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ApproveQueryResponse {
+    pub query_id: Uuid,
+    pub state: String,
+}
+
 /// Error response.
 #[derive(Debug, Serialize)]
 pub struct ErrorResponse {
@@ -240,6 +247,7 @@ where
         .route("/positions/:id", get(get_position_handler))
         .route("/positions/:id", delete(disarm_handler))
         .route("/positions/:id/signal", post(signal_handler))
+        .route("/queries/:id/approve", post(approve_query_handler))
         .route("/panic", post(panic_handler))
         // Safety net endpoints
         .route("/safety/status", get(safety_status_handler))
@@ -591,6 +599,24 @@ where
     }))
 }
 
+/// Approve a pending query and resume execution.
+async fn approve_query_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    Path(id): Path<Uuid>,
+) -> Result<Json<ApproveQueryResponse>, (StatusCode, Json<ErrorResponse>)>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let manager = state.position_manager.write().await;
+    let query = manager.approve_query(id).await.map_err(|e| to_error_response(e))?;
+
+    Ok(Json(ApproveQueryResponse {
+        query_id: query.id,
+        state: format!("{:?}", query.state),
+    }))
+}
+
 // =============================================================================
 // Safety Net Handlers
 // =============================================================================
@@ -678,7 +704,9 @@ where
 fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
     let status = match &error {
         DaemonError::PositionNotFound(_) => StatusCode::NOT_FOUND,
+        DaemonError::QueryNotFound(_) => StatusCode::NOT_FOUND,
         DaemonError::InvalidPositionState { .. } => StatusCode::CONFLICT,
+        DaemonError::ApprovalExpired(_) => StatusCode::GONE,
         DaemonError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::BAD_REQUEST,
     };
@@ -751,7 +779,9 @@ mod tests {
     use tokio::time::timeout;
     use tower::ServiceExt;
 
-    async fn create_test_app_with_event_bus(capacity: usize) -> (Router, Arc<EventBus>) {
+    async fn create_test_app_with_event_bus(
+        capacity: usize,
+    ) -> (Router, Arc<EventBus>, Arc<RwLock<PositionManager<StubExchange, MemoryStore>>>) {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
@@ -762,15 +792,17 @@ mod tests {
 
         let manager = PositionManager::new(engine, executor, store, Arc::clone(&event_bus));
 
+        let position_manager = Arc::new(RwLock::new(manager));
+
         let state = Arc::new(ApiState {
-            position_manager: Arc::new(RwLock::new(manager)),
+            position_manager: Arc::clone(&position_manager),
             event_bus: Arc::clone(&event_bus),
             position_monitor: None,
             #[cfg(feature = "postgres")]
             pg_pool: None,
         });
 
-        (create_router(state), event_bus)
+        (create_router(state), event_bus, position_manager)
     }
 
     // #[tokio::test]
@@ -900,7 +932,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_events_endpoint_returns_sse_headers_and_frame() {
-        let (app, event_bus) = create_test_app_with_event_bus(100).await;
+        let (app, event_bus, _) = create_test_app_with_event_bus(100).await;
 
         let response = app
             .oneshot(Request::builder().uri("/events").body(Body::empty()).unwrap())
@@ -936,7 +968,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_events_endpoint_emits_resync_required_on_broadcast_lag() {
-        let (app, event_bus) = create_test_app_with_event_bus(1).await;
+        let (app, event_bus, _) = create_test_app_with_event_bus(1).await;
 
         let response = app
             .oneshot(Request::builder().uri("/events").body(Body::empty()).unwrap())
@@ -968,5 +1000,77 @@ mod tests {
         assert!(frame_text.contains("event: system.resync_required"));
         assert!(frame_text.contains("\"event_type\":\"system.resync_required\""));
         assert!(frame_text.contains("\"reason\":\"lagged\""));
+    }
+
+    #[tokio::test]
+    async fn test_approve_query_endpoint_resumes_pending_query() {
+        let (app, event_bus, position_manager) = create_test_app_with_event_bus(100).await;
+        let mut receiver = event_bus.subscribe();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(90)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        let position = {
+            let manager = position_manager.write().await;
+            manager
+                .arm_position(
+                    symbol.clone(),
+                    Side::Long,
+                    RiskConfig::new(dec!(10000), dec!(1)).unwrap(),
+                    tech_stop,
+                    Uuid::now_v7(),
+                )
+                .await
+                .unwrap()
+        };
+
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol,
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(85500)).unwrap(), // 10% stop -> approval required, risk approved
+            timestamp: chrono::Utc::now(),
+        };
+
+        {
+            let manager = position_manager.write().await;
+            manager.handle_signal(signal).await.unwrap();
+        }
+
+        let query_id = loop {
+            if let Ok(Some(event)) =
+                tokio::time::timeout(Duration::from_secs(1), receiver.recv()).await
+            {
+                match event.unwrap() {
+                    crate::event_bus::DaemonEvent::QueryAwaitingApproval { query_id, .. } => {
+                        break query_id;
+                    },
+                    _ => continue,
+                }
+            } else {
+                panic!("Expected QueryAwaitingApproval event");
+            }
+        };
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/queries/{}/approve", query_id))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let approval: ApproveQueryResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(approval.query_id, query_id);
+        assert_eq!(approval.state, "Completed");
     }
 }

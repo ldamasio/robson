@@ -36,6 +36,28 @@ pub enum DaemonEvent {
         timestamp: DateTime<Utc>,
     },
 
+    /// Query is blocked awaiting operator approval.
+    QueryAwaitingApproval {
+        query_id: Uuid,
+        position_id: Option<PositionId>,
+        reason: String,
+        expires_at: DateTime<Utc>,
+    },
+
+    /// Query approval granted by the operator.
+    QueryAuthorized {
+        query_id: Uuid,
+        position_id: Option<PositionId>,
+        approved_at: DateTime<Utc>,
+    },
+
+    /// Query approval TTL elapsed before authorization.
+    QueryExpired {
+        query_id: Uuid,
+        position_id: Option<PositionId>,
+        expired_at: DateTime<Utc>,
+    },
+
     /// Core Trading position opened (for Safety Net coordination)
     CorePositionOpened {
         position_id: PositionId,
@@ -202,7 +224,7 @@ impl EventReceiver {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use robson_domain::{OrderSide, Quantity, Side, Symbol};
+    use robson_domain::{Quantity, Side, Symbol};
     use rust_decimal_macros::dec;
 
     fn create_test_signal() -> DetectorSignal {
