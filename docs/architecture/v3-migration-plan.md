@@ -826,7 +826,7 @@ Reconsider TRON integration when ALL of these are true:
 | 7 | **Implement SOPS for secrets management** | Current secrets are K8s secrets (base64, not encrypted at rest in git). SOPS encrypts in git. | None | S | Yes — revert to plain K8s secrets | Remove .sops.yaml, restore template secrets | Secrets remain unencrypted in git templates (security risk) |
 | 8 | **Deploy Prometheus + Grafana + Loki on k3s** | Observability is non-negotiable before v3. Cannot debug production issues without metrics/logs. | k3s cluster (exists) | M | Yes — undeploy | `kubectl delete namespace monitoring` | Flying blind in production. Debugging via `kubectl logs` only. |
 | 9 | **Contract tests for daemon API** | CLI and frontend depend on daemon API stability. Breaking changes must be caught in CI. | robsond deployed (#1) | S | Yes — remove test suite | Revert CI config | API breaks silently, CLI/frontend stop working after daemon update |
-| 10 | **EventLog replay determinism test** | Must prove replay works before relying on it for state recovery | EventLog implemented (exists in v2) | S | Yes — remove test | N/A | Cannot guarantee state recovery correctness |
+| 10 | **EventLog replay determinism test** — ✅ IMPLEMENTED 2026-04-05 | Must prove replay works before relying on it for state recovery | EventLog implemented (exists in v2) | S | Yes — remove test | N/A | Cannot guarantee state recovery correctness |
 
 ### v2.5 -> v3 (Architectural Evolution)
 
@@ -837,7 +837,7 @@ Reconsider TRON integration when ALL of these are true:
 | 3 | **Frontend direct connection to robsond SSE** | SSE via Django proxy | Gateway deployed (#2) | S | Yes — revert to Django proxy | Update frontend VITE_API_BASE_URL to Django endpoint | Frontend loses real-time if SSE path fails; graceful degradation to REST |
 | 4 | **Dynamic risk limits** (volatility-adjusted, funding-rate-aware) | Hard limits only | Risk Engine blocking (v2.5 #4), market data pipeline working | M | Yes — disable dynamic, use hard limits | Config: `dynamic_limits_enabled: false` | False sense of security if dynamic computation is wrong; fallback to hard limits is safe |
 | 5 | **Operator control surface** (pause/resume/override in UI) | CLI-only operator interaction | Frontend SSE (#3), daemon control API (v2.5 #6) | M | Yes — controls are additive | Remove UI controls, operator uses CLI | Operator must use CLI for all interventions, slower response in emergencies |
-| 6 | **Hash-chained EventLog** for tamper detection | Plain EventLog | EventLog stable, replay determinism proven (v2.5 #10) | S | Yes — stop computing hashes | Remove hash column, revert to plain append | Audit trail tampering undetectable; acceptable for single operator, problematic if audited |
+| 6 | **Hash-chained EventLog** for tamper detection | Plain EventLog | EventLog stable, replay determinism proven (v2.5 #10 ✅ DONE 2026-04-05) | S | Yes — stop computing hashes | Remove hash column, revert to plain append | Audit trail tampering undetectable; acceptable for single operator, problematic if audited |
 | 7 | **PaymentRail trait** (architecture readiness for future settlement) | None | None (pure interface definition) | S | Yes — delete trait | Remove trait definition | No impact on v3; delays TRON readiness if ever needed |
 | 8 | **Chaos testing suite** | No chaos testing | All components deployed and stable | M | Yes — disable tests | Remove chaos test suite from CI | Undiscovered failure modes in production; acceptable risk if monitoring is good |
 
@@ -846,10 +846,12 @@ Reconsider TRON integration when ALL of these are true:
 1. **Every migration step generates an immutable event**: `MigrationStepStarted`, `MigrationStepCompleted`, `MigrationStepRolledBack` in EventLog.
 2. **Data migration risk**: Steps #1-#6 in v2.5 do NOT migrate data. The Django database remains untouched. robsond creates its own EventLog in Postgres. The two systems coexist during v2.5, but only one execution path may be active for live stop/trailing responsibilities at a time.
 3. **Build order** (foundation first):
-   - FIRST: robsond deployment (#1) + SOPS (#7) + observability (#8) + **QueryEngine Phase 1** (passive wrapper, see v3-query-query-engine.md)
-   - THEN: projector (#2) + Risk Engine wiring (#4) + **QueryEngine Phase 2** (blocking governance via QueryEngine)
+   - FIRST: robsond deployment (#1) + SOPS (#7) + observability (#8) + **QueryEngine Phase 1** (passive wrapper) ✅ DONE
+   - THEN: projector (#2) + Risk Engine wiring (#4) + **QueryEngine Phase 2** (blocking governance) ✅ DONE 2026-04-04
    - THEN: stop monitoring migration (#3) + circuit breaker (#5)
-   - THEN: SSE (#6) + contract tests (#9) + replay tests (#10)
+   - THEN: SSE (#6) + **QueryEngine Phase 3** (approval gates) ✅ DONE 2026-04-05
+   - THEN: contract tests (#9) + replay tests (#10 / **QueryEngine Phase 4**: full audit & replay) ✅ DONE 2026-04-05
+   - See v3-query-query-engine.md for complete QueryEngine implementation timeline
 4. **Parallelizable**: #1 + #7 + #8 + QueryEngine Phase 1 can run in parallel. #2 + #4 + QueryEngine Phase 2 can run in parallel after #1. #9 + #10 can run in parallel after #1.
 5. **No parallel execution authorities**: v3 never runs Django execution CronJobs in parallel with robsond. Rollback is mutually exclusive.
 6. **Deferred to post-v3**:

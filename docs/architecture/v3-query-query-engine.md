@@ -1,8 +1,8 @@
 # ROBSON v3 — QUERY & QUERYENGINE SPECIFICATION
 
 **Date**: 2026-04-04  
-**Revised**: 2026-04-05 (Phase 3 approval gate implementation notes)  
-**Status**: APPROVED — Ready for Implementation  
+**Revised**: 2026-04-05 (Phase 3 approval gates, Phase 4 full audit & replay)  
+**Status**: APPROVED — Phases 1-4 Implemented  
 **Owner**: Runtime (robsond)  
 **Companion to**: v3-migration-plan.md, v3-control-loop.md, v3-runtime-spec.md
 
@@ -712,17 +712,91 @@ Proper PnL tracking in the store is deferred to a follow-up task.
 
 **Depends on**: Phase 2 complete, SSE working (v2.5 #6)
 
-### Phase 4: Full Audit & Replay
+### Phase 4: Full Audit & Replay — IMPLEMENTED 2026-04-05
 
 **Goal**: Complete audit trail. Query lifecycle fully persisted. Replay determinism proven.
 
-**Changes**:
-- Query lifecycle events in EventLog (QueryAccepted, QueryProcessing, QueryCompleted, etc.)
-- Projection handler for query lifecycle (robson-projector)
-- Projection worker checkpoint moves from /tmp to DB
-- Replay test: insert N queries, replay from EventLog, compare state byte-for-byte
+**Implemented**:
 
-**Depends on**: Phase 3 complete, v2.5 #10 (replay determinism)
+1. **Canonical event type**: `QUERY_STATE_CHANGED` — single event type for all lifecycle transitions
+   - Ref: `robson-eventlog/src/lib.rs:38` (constant definition)
+   - Ref: `robson-projector/src/apply.rs:56` (handler registration)
+   - Eliminates payload fragmentation (no separate QueryAccepted, QueryProcessing, etc.)
+
+2. **Snapshot-based payload**: Every `QUERY_STATE_CHANGED` event carries complete query snapshot
+   - Fields: `query_id`, `position_id`, `state`, `started_at`, `finished_at`, `transition_cause`, `snapshot` (JSONB)
+   - Ref: `robsond/src/query_engine.rs:48` (snapshot construction)
+   - Enables byte-for-byte deterministic replay without ignoring timestamps
+
+3. **Projection table**: `queries_current` materializes latest state per `query_id`
+   - Schema: `query_id` (PK), `tenant_id`, `stream_key`, `position_id`, `state`, `started_at`, `finished_at`, `snapshot` (JSONB), `last_event_id`, `last_seq`, `updated_at`
+   - Indexes: state, position_id (partial), updated_at DESC
+   - Ref: `migrations/20240101000007_query_audit_phase4.sql:5`
+   - Ref: `robson-projector/src/handlers/queries.rs:8` (projection handler)
+
+4. **Persistent checkpoint**: Projection worker cursor moved from `/tmp` to PostgreSQL
+   - Table: `projection_checkpoints` (projection_name, tenant_id, stream_key, last_seq, updated_at)
+   - Belongs to **worker** (`robsond/src/projection_worker.rs:14`), not projector crate
+   - Ref: `migrations/20240101000007_query_audit_phase4.sql:26`
+   - Survives restart; worker resumes from last processed `seq`
+
+5. **Async QueryRecorder**: Trait evolved from sync observability to async audit
+   - **Durable implementation**: `EventLogQueryRecorder` (feature: postgres)
+   - **Fallback**: `TracingQueryRecorder` (tracing only, no persistence)
+   - Ref: `robsond/src/query_engine.rs:159` (trait definition)
+   - Ref: `robsond/src/query_engine.rs:199` (EventLogQueryRecorder impl)
+   - Ref: `robsond/src/daemon.rs:130` (wiring with postgres pool)
+
+6. **Restart semantics**: Queries in `AwaitingApproval` invalidated on boot
+   - Rationale: Pending approvals are in-memory (Phase 3). Restart drops approval runtime state.
+   - Behavior: On daemon boot, persisted `AwaitingApproval` queries transition to `Expired` with `transition_cause = "restart_invalidated"`
+   - Ref: `robsond/src/daemon.rs:395` (invalidation logic)
+   - Prevents "zombie queries" (persisted approvals without runtime approval state)
+
+7. **REST bootstrap**: Continues via `/status` (Phase 3)
+   - `/status` returns `pending_approvals` for in-memory runtime state
+   - `GET /queries` remains out-of-scope (no control surface in Phase 4)
+   - Operator bootstrap: SSE `/events` + REST `/status`
+
+8. **Replay determinism**: Proven via snapshot-based projection
+   - Test: Insert N queries, replay EventLog from `seq=0`, compare `queries_current` table byte-for-byte
+   - No special timestamp-ignoring rules — snapshot carries original lifecycle timestamps
+   - Ref: `robsond/tests/replay_test.rs:133` (deterministic replay test)
+
+**Testing & validation**:
+- `cargo check --all` — build validation
+- `cargo test --all` — core test suite (memory-only)
+- `cargo test -p robsond --features postgres --no-run` — postgres-specific tests compile check
+- Postgres tests (when `DATABASE_URL` set): projection handler, checkpoint persistence, restart invalidation, replay determinism
+
+**Commits**:
+- `25ee7e78` — feat(projector): materialize query audit state
+- `86f2389c` — feat(robsond): persist query lifecycle snapshots  
+- `bcf2de34` — test(robsond): add deterministic query replay coverage
+
+**Depends on**: Phase 3 complete
+
+---
+
+**Architectural notes (Phase 4 implementation)**:
+
+The initial Phase 4 plan was revised based on architectural review to address operational risks:
+
+1. **QueryRecorder contract evolved**: From sync observability (`on_state_change`, `on_error`) to async audit trail (`record_transition`). The trait now explicitly supports durable persistence, not just tracing. Fallback remains `TracingQueryRecorder` for non-postgres builds.
+
+2. **Checkpoint ownership clarified**: Belongs to projection **worker** (`robsond/src/projection_worker.rs`), not projector crate. Table schema simplified: `(projection_name, tenant_id, stream_key, last_seq)` — no `last_event_id` (optional, not essential).
+
+3. **Producer/consumer ordering**: Initial plan had "EventLog events → Recorder → Handler" which risked worker failure on unknown event types. Revised: Handler registered **before** events emitted, or gated by feature flag. Implemented as: migration + handler deployed, then recorder enabled.
+
+4. **Scope discipline**: `GET /queries` removed from Phase 4 core. Bootstrap continues via `/status` (already includes `pending_approvals`). Control surface remains out-of-scope. Phase 4 stayed enxuta: audit trail, snapshot projection, replay proven.
+
+5. **Restart semantics formalized**: `AwaitingApproval` queries cannot be resurrected (approvals are in-memory, Phase 3). On boot, persisted queries in this state transition to `Expired` with `transition_cause = "restart_invalidated"`. Prevents projection table from carrying non-actionable zombie queries.
+
+6. **Snapshot-based determinism**: Replay test compares final `queries_current` table byte-for-byte. Works without timestamp-ignoring rules because `QUERY_STATE_CHANGED` payload includes complete snapshot (`started_at`, `finished_at`, `approval` metadata). EventLog becomes the durable ground truth; projection is derived.
+
+7. **Single canonical event type**: `QUERY_STATE_CHANGED` replaces nine separate event types (QueryAccepted, QueryProcessing, etc.). Eliminates payload struct fragmentation. All lifecycle transitions use same schema with `transition_cause` field for context.
+
+---
 
 ### Phase 5: Context Governance (v3+ with LLM)
 
@@ -888,7 +962,7 @@ These require human architectural decision before Phase 2:
 
 2. **GovernedAction location**: ~~Should it stay in robsond or move to robson-exec?~~ **DECIDED 2026-04-04**: Stays in robsond as `pub(crate)`. Executor unchanged. See Phase 2 architectural decision above.
 
-3. **Approval persistence**: **DECIDED 2026-04-05 (Phase 3 minimum)**: keep pending approvals in memory only. Restart drops pending approvals and the operator must re-approve after REST bootstrap. Durable approval lifecycle persistence is deferred to Phase 4.
+3. **Approval persistence**: **DECIDED 2026-04-05 (Phase 3 minimum)**: keep pending approvals in memory only. Restart drops pending approvals and the operator must re-approve after REST bootstrap. **Phase 4 IMPLEMENTED 2026-04-05**: Durable query lifecycle audit trail now persisted in EventLog via `QUERY_STATE_CHANGED` events. Restart invalidates persisted `AwaitingApproval` queries (transition to `Expired` with cause `"restart_invalidated"`).
 
 4. **Query timeout**: **DECIDED 2026-04-05 (Phase 3 minimum)**: fixed TTL of 300 seconds for `AwaitingApproval` queries. On expiry, the query transitions to `Expired`, emits a public SSE event, and the detector is re-armed.
 
@@ -896,4 +970,4 @@ These require human architectural decision before Phase 2:
 
 ---
 
-**This document is the authoritative specification for Query/QueryEngine in Robson v3. Phases 1-3 are now implemented in `robsond`; Phase 4+ remains deferred.**
+**This document is the authoritative specification for Query/QueryEngine in Robson v3. Phases 1-4 are now implemented in `robsond`; Phase 5 (Context Governance) remains deferred pending concrete LLM value proposition.**
