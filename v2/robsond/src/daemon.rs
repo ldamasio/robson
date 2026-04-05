@@ -430,6 +430,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
     ) -> DaemonResult<SocketAddr> {
         let state = Arc::new(ApiState {
             position_manager: self.position_manager.clone(),
+            event_bus: self.event_bus.clone(),
             position_monitor,
             #[cfg(feature = "postgres")]
             pg_pool: self.pg_pool.clone(),

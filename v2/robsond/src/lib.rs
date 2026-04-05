@@ -49,6 +49,7 @@ pub mod position_manager;
 pub mod position_monitor;
 pub mod query;
 pub mod query_engine;
+mod sse;
 
 #[cfg(feature = "postgres")]
 pub mod projection_worker;

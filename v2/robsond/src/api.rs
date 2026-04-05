@@ -7,17 +7,24 @@
 //! - Disarm position
 //! - Panic (emergency close all)
 //! - Safety net (rogue position monitoring)
+//! - SSE events for operator-facing runtime updates
 
+use async_stream::stream;
 use axum::{
     Json, Router,
     extract::{Path, State},
-    http::StatusCode,
+    http::{StatusCode, header},
+    response::{
+        IntoResponse,
+        sse::{KeepAlive, Sse},
+    },
     routing::{delete, get, post},
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::sync::Arc;
+use std::{convert::Infallible, sync::Arc, time::Duration};
 use tokio::sync::RwLock;
+use tracing::warn;
 use uuid::Uuid;
 
 use robson_domain::{
@@ -27,8 +34,10 @@ use robson_exec::ExchangePort;
 use robson_store::Store;
 
 use crate::error::DaemonError;
+use crate::event_bus::EventBus;
 use crate::position_manager::PositionManager;
 use crate::position_monitor::PositionMonitor;
+use crate::sse::{map_daemon_event, resync_required_event};
 
 // =============================================================================
 // API State
@@ -37,6 +46,7 @@ use crate::position_monitor::PositionMonitor;
 /// Shared state for API handlers.
 pub struct ApiState<E: ExchangePort + 'static, S: Store + 'static> {
     pub position_manager: Arc<RwLock<PositionManager<E, S>>>,
+    pub event_bus: Arc<EventBus>,
     pub position_monitor: Option<Arc<PositionMonitor>>,
     /// PostgreSQL pool for liveness check. Present only when DATABASE_URL is configured.
     #[cfg(feature = "postgres")]
@@ -224,6 +234,7 @@ where
         .route("/readyz", get(health_readiness))
         // Standard endpoints
         .route("/health", get(health_handler))
+        .route("/events", get(events_handler))
         .route("/status", get(status_handler))
         .route("/positions", post(arm_handler))
         .route("/positions/:id", get(get_position_handler))
@@ -330,6 +341,53 @@ async fn health_handler() -> Json<HealthResponse> {
         status: "healthy".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
+}
+
+/// Stream public operator events over Server-Sent Events.
+///
+/// Clients should bootstrap state via REST and use this stream only for
+/// incremental updates. `event_id` is emitted for uniqueness and client-side
+/// deduplication, but v2.5 does not implement replay or `Last-Event-ID` resume.
+async fn events_handler<E, S>(State(state): State<Arc<ApiState<E, S>>>) -> impl IntoResponse
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let mut receiver = state.event_bus.subscribe();
+
+    let event_stream = stream! {
+        loop {
+            match receiver.recv().await {
+                Some(Ok(event)) => {
+                    if let Some(public_event) = map_daemon_event(&event) {
+                        yield Ok::<_, Infallible>(public_event.into_sse_event());
+                    }
+                }
+                Some(Err(lag_message)) => {
+                    warn!(message = %lag_message, "SSE receiver lagged; operator client must re-sync");
+                    yield Ok::<_, Infallible>(
+                        resync_required_event("lagged", lag_message).into_sse_event()
+                    );
+                    break;
+                }
+                None => break,
+            }
+        }
+    };
+
+    let sse = Sse::new(event_stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)).text("heartbeat"));
+
+    (
+        [
+            (header::CACHE_CONTROL, header::HeaderValue::from_static("no-cache")),
+            (
+                header::HeaderName::from_static("x-accel-buffering"),
+                header::HeaderValue::from_static("no"),
+            ),
+        ],
+        sse,
+    )
 }
 
 /// Get status (all open core positions).
@@ -680,46 +738,41 @@ fn position_to_summary(position: &Position) -> PositionSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        body::Body,
+        http::{Request, header::CONTENT_TYPE},
+    };
+    use http_body_util::BodyExt;
     use robson_domain::RiskConfig;
     use robson_engine::Engine;
     use robson_exec::{Executor, IntentJournal, StubExchange};
     use robson_store::MemoryStore;
     use rust_decimal_macros::dec;
+    use tokio::time::timeout;
+    use tower::ServiceExt;
 
-    async fn create_test_app() -> Router {
+    async fn create_test_app_with_event_bus(capacity: usize) -> (Router, Arc<EventBus>) {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
-        let event_bus = Arc::new(crate::event_bus::EventBus::new(100));
+        let event_bus = Arc::new(crate::event_bus::EventBus::new(capacity));
         let risk_config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
         let engine = Engine::new(risk_config);
 
-        let manager = PositionManager::new(engine, executor, store, event_bus);
+        let manager = PositionManager::new(engine, executor, store, Arc::clone(&event_bus));
 
         let state = Arc::new(ApiState {
             position_manager: Arc::new(RwLock::new(manager)),
+            event_bus: Arc::clone(&event_bus),
             position_monitor: None,
             #[cfg(feature = "postgres")]
             pg_pool: None,
         });
 
-        create_router(state)
+        (create_router(state), event_bus)
     }
 
-    // ============================================================================
-    // TODO: Re-enable API tests - requires tower/util feature
-    // ============================================================================
-    // The API integration tests below use `tower::ServiceExt::oneshot()` which
-    // requires the "util" feature of the tower crate. To re-enable these tests:
-    //
-    // 1. Add tower = { version = "0.4", features = ["util"] } to workspace dependencies
-    // 2. Uncomment the test functions below
-    // 3. Uncomment the import: use tower::util::ServiceExt;
-    //
-    // Reference: https://github.com/tower-rs/tower/blob/master/tower/src/util/mod.rs
-    // ============================================================================
-    //
     // #[tokio::test]
     // async fn test_health_endpoint() {
     //     let app = create_test_app().await;
@@ -844,4 +897,76 @@ mod tests {
     //
     //     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     // }
+
+    #[tokio::test]
+    async fn test_events_endpoint_returns_sse_headers_and_frame() {
+        let (app, event_bus) = create_test_app_with_event_bus(100).await;
+
+        let response = app
+            .oneshot(Request::builder().uri("/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "text/event-stream");
+        assert_eq!(response.headers().get(header::CACHE_CONTROL).unwrap(), "no-cache");
+        assert_eq!(response.headers().get("x-accel-buffering").unwrap(), "no");
+
+        event_bus.send(crate::event_bus::DaemonEvent::PositionStateChanged {
+            position_id: Uuid::now_v7(),
+            previous_state: "armed".to_string(),
+            new_state: "active".to_string(),
+            timestamp: chrono::Utc::now(),
+        });
+
+        let mut body = response.into_body();
+        let frame = timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("Timed out waiting for SSE frame")
+            .expect("Expected SSE body frame")
+            .expect("SSE body frame should be valid");
+        let bytes = frame.into_data().expect("Expected SSE data frame");
+        let frame_text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        assert!(frame_text.contains("id: "));
+        assert!(frame_text.contains("event: position.changed"));
+        assert!(frame_text.contains("data: "));
+        assert!(frame_text.contains("\"event_type\":\"position.changed\""));
+    }
+
+    #[tokio::test]
+    async fn test_events_endpoint_emits_resync_required_on_broadcast_lag() {
+        let (app, event_bus) = create_test_app_with_event_bus(1).await;
+
+        let response = app
+            .oneshot(Request::builder().uri("/events").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        event_bus.send(crate::event_bus::DaemonEvent::PositionStateChanged {
+            position_id: Uuid::now_v7(),
+            previous_state: "armed".to_string(),
+            new_state: "entering".to_string(),
+            timestamp: chrono::Utc::now(),
+        });
+        event_bus.send(crate::event_bus::DaemonEvent::PositionStateChanged {
+            position_id: Uuid::now_v7(),
+            previous_state: "entering".to_string(),
+            new_state: "active".to_string(),
+            timestamp: chrono::Utc::now(),
+        });
+
+        let mut body = response.into_body();
+        let frame = timeout(Duration::from_secs(1), body.frame())
+            .await
+            .expect("Timed out waiting for lag SSE frame")
+            .expect("Expected lag SSE body frame")
+            .expect("Lag SSE body frame should be valid");
+        let bytes = frame.into_data().expect("Expected lag SSE data frame");
+        let frame_text = String::from_utf8(bytes.to_vec()).unwrap();
+
+        assert!(frame_text.contains("event: system.resync_required"));
+        assert!(frame_text.contains("\"event_type\":\"system.resync_required\""));
+        assert!(frame_text.contains("\"reason\":\"lagged\""));
+    }
 }
