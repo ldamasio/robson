@@ -27,9 +27,9 @@
 //!     );
 //!     store.save(&position).await.unwrap();
 //!
-//!     // Find active positions
-//!     let active = store.find_active().await.unwrap();
-//!     println!("Active positions: {}", active.len());
+//!     // Find open core positions (historically named "active")
+//!     let open = store.find_active().await.unwrap();
+//!     println!("Open positions: {}", open.len());
 //! }
 //! ```
 

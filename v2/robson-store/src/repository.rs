@@ -22,8 +22,11 @@ pub trait PositionRepository: Send + Sync {
 
     /// Find positions eligible for lifecycle management.
     ///
-    /// Returns positions that are not yet closed: Armed, Entering, Active, Exiting.
-    /// Used by position managers that need to act on all non-terminal positions
+    /// Returns positions still participating in the core trading lifecycle:
+    /// Armed, Entering, Active, Exiting.
+    ///
+    /// Excludes terminal states such as Closed and Error.
+    /// Used by position managers that need to act on every open core position
     /// (e.g. process market ticks, panic close, shutdown cleanup).
     ///
     /// Note: does NOT filter to "Active only" despite historic naming. Use

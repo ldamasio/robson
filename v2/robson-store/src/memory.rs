@@ -273,11 +273,22 @@ impl PositionRepository for MemoryStore {
 
     async fn find_active(&self) -> Result<Vec<Position>, StoreError> {
         let positions = self.positions.read().unwrap();
-        // All non-terminal states: Armed, Entering, Active, Exiting.
-        // Excludes only Closed. This matches the trait contract:
-        // lifecycle management (panic close, crash recovery) must see every
-        // position that has not yet reached a terminal state.
-        Ok(positions.values().filter(|p| !p.is_closed()).cloned().collect())
+        // Open core-lifecycle states only: Armed, Entering, Active, Exiting.
+        // Excludes Closed and Error. Error requires manual intervention and is
+        // intentionally not treated as an "active" position for lifecycle flows.
+        Ok(positions
+            .values()
+            .filter(|p| {
+                matches!(
+                    p.state,
+                    robson_domain::PositionState::Armed
+                        | robson_domain::PositionState::Entering { .. }
+                        | robson_domain::PositionState::Active { .. }
+                        | robson_domain::PositionState::Exiting { .. }
+                )
+            })
+            .cloned()
+            .collect())
     }
 
     async fn find_risk_open(&self) -> Result<Vec<Position>, StoreError> {
@@ -507,8 +518,9 @@ mod tests {
 
     #[tokio::test]
     async fn test_position_find_active_returns_all_non_terminal() {
-        // find_active() must return ALL non-terminal states: Armed, Entering, Active, Exiting.
-        // It must exclude only Closed positions.
+        // find_active() must return open core-lifecycle states only:
+        // Armed, Entering, Active, Exiting.
+        // It must exclude Closed and Error.
         use robson_domain::{PositionState, Price, Quantity};
 
         let store = MemoryStore::new();
@@ -557,29 +569,48 @@ mod tests {
             realized_pnl: dec!(0),
         };
 
-        for pos in [&armed, &entering, &active_pos, &exiting_pos, &closed_pos] {
+        // Error (must NOT appear in find_active)
+        let mut error_pos = Position::new(account_id, symbol.clone(), Side::Long);
+        error_pos.state = PositionState::Error {
+            error: "exchange rejected order".to_string(),
+            recoverable: true,
+        };
+
+        for pos in [
+            &armed,
+            &entering,
+            &active_pos,
+            &exiting_pos,
+            &closed_pos,
+            &error_pos,
+        ] {
             PositionRepository::save(&store, pos).await.unwrap();
         }
 
         let result = PositionRepository::find_active(&store).await.unwrap();
 
-        assert_eq!(result.len(), 4, "Expected 4 non-terminal positions, got {}", result.len());
+        assert_eq!(result.len(), 4, "Expected 4 open positions, got {}", result.len());
 
-        let closed_in_result = result.iter().any(|p| matches!(p.state, PositionState::Closed { .. }));
+        let closed_in_result =
+            result.iter().any(|p| matches!(p.state, PositionState::Closed { .. }));
         assert!(!closed_in_result, "find_active must not return Closed positions");
+        let error_in_result = result.iter().any(|p| matches!(p.state, PositionState::Error { .. }));
+        assert!(!error_in_result, "find_active must not return Error positions");
 
         let states: Vec<&str> = result.iter().map(|p| p.state.name()).collect();
         for expected in ["armed", "entering", "active", "exiting"] {
             assert!(
                 states.contains(&expected),
-                "Expected state '{}' in find_active result, got: {:?}", expected, states
+                "Expected state '{}' in find_active result, got: {:?}",
+                expected,
+                states
             );
         }
     }
 
     #[tokio::test]
     async fn test_position_find_active_excludes_closed() {
-        // Regression: find_active must NOT include Closed even after state transitions
+        // Regression: find_active must NOT include terminal/manual states.
         let store = MemoryStore::new();
         let mut pos = create_test_position();
 
@@ -595,6 +626,23 @@ mod tests {
 
         let result = PositionRepository::find_active(&store).await.unwrap();
         assert!(result.is_empty(), "Closed position must not appear in find_active");
+    }
+
+    #[tokio::test]
+    async fn test_position_find_active_excludes_error() {
+        let store = MemoryStore::new();
+        let mut pos = create_test_position();
+
+        PositionRepository::save(&store, &pos).await.unwrap();
+
+        pos.state = robson_domain::PositionState::Error {
+            error: "manual intervention required".to_string(),
+            recoverable: false,
+        };
+        PositionRepository::save(&store, &pos).await.unwrap();
+
+        let result = PositionRepository::find_active(&store).await.unwrap();
+        assert!(result.is_empty(), "Error position must not appear in find_active");
     }
 
     #[tokio::test]
