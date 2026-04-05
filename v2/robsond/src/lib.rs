@@ -47,6 +47,8 @@ pub mod event_bus;
 pub mod market_data;
 pub mod position_manager;
 pub mod position_monitor;
+pub mod query;
+pub mod query_engine;
 
 #[cfg(feature = "postgres")]
 pub mod projection_worker;
@@ -61,3 +63,10 @@ pub use error::{DaemonError, DaemonResult};
 pub use event_bus::{DaemonEvent, EventBus, EventReceiver, MarketData, OrderFill};
 pub use position_manager::PositionManager;
 pub use position_monitor::{MonitorError, PositionMonitor, PositionMonitorConfig as MonitorConfig};
+
+// Query engine re-exports
+pub use query::{
+    ActionClass, ActorKind, ApprovalRequirement, CommandSource, ContextSummary, ExecutionQuery,
+    PermissionDecision, QueryError, QueryKind, QueryOutcome, QueryState,
+};
+pub use query_engine::{QueryEngine, QueryRecorder, TracingQueryRecorder};

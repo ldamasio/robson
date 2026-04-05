@@ -39,6 +39,10 @@ use robson_store::Store;
 use crate::detector::DetectorTask;
 use crate::error::{DaemonError, DaemonResult};
 use crate::event_bus::{DaemonEvent, EventBus, MarketData};
+use crate::query::{
+    ActorKind, CommandSource, ContextSummary, ExecutionQuery, QueryKind, QueryOutcome, QueryState,
+};
+use crate::query_engine::{QueryEngine, TracingQueryRecorder};
 
 // =============================================================================
 // Position Manager
@@ -58,6 +62,8 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     shutdown_token: CancellationToken,
     /// Active detector tasks (position_id → task handle)
     detectors: RwLock<HashMap<PositionId, JoinHandle<Option<DetectorSignal>>>>,
+    /// Query engine for lifecycle tracking
+    query_engine: QueryEngine<TracingQueryRecorder>,
 }
 
 impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
@@ -71,6 +77,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         event_bus: Arc<EventBus>,
     ) -> Self {
         let shutdown_token = CancellationToken::new();
+        let query_engine = QueryEngine::new(TracingQueryRecorder);
 
         Self {
             engine,
@@ -79,6 +86,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             event_bus,
             shutdown_token,
             detectors: RwLock::new(HashMap::new()),
+            query_engine,
         }
     }
 
@@ -131,6 +139,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// Child tokens are cancelled when the parent is cancelled.
     fn child_cancel_token(&self) -> CancellationToken {
         self.shutdown_token.child_token()
+    }
+
+    fn operator_actor() -> ActorKind {
+        ActorKind::Operator { source: CommandSource::Api }
+    }
+
+    fn set_query_context_summary(query: &mut ExecutionQuery, active_positions_count: usize) {
+        query.context_summary = Some(ContextSummary { active_positions_count });
+    }
+
+    async fn populate_query_context_summary(&self, query: &mut ExecutionQuery) {
+        if let Ok(active_positions) = self.store.positions().find_active().await {
+            Self::set_query_context_summary(query, active_positions.len());
+        }
     }
 
     /// Start background task to listen for detector signals.
@@ -216,12 +238,35 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Generate position ID upfront (used in event and returned to caller)
         let position_id = Uuid::now_v7();
 
+        // Create query for lifecycle tracking
+        let mut query = ExecutionQuery::new(
+            QueryKind::ArmPosition {
+                symbol: symbol.clone(),
+                side,
+                tech_stop_distance,
+                account_id,
+            },
+            Self::operator_actor(),
+        );
+        query.position_id = Some(position_id);
+        self.populate_query_context_summary(&mut query).await;
+        self.query_engine.on_accepted(&query);
+
         info!(
             %position_id,
+            query_id = %query.id,
             symbol = %symbol.as_pair(),
             ?side,
             "Arming position"
         );
+
+        // Transition to Processing
+        if let Err(e) = query.transition(QueryState::Processing) {
+            query.fail(format!("{}", e), "accepted".to_string());
+            self.query_engine.on_error(&query, &format!("{}", e));
+            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+        }
+        self.query_engine.on_state_change(&query);
 
         // Emit PositionArmed event → apply_event creates position in Armed state
         let now = chrono::Utc::now();
@@ -233,7 +278,26 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             tech_stop_distance: Some(tech_stop_distance),
             timestamp: now,
         };
-        self.executor.execute(vec![EngineAction::EmitEvent(event)]).await?;
+
+        // Transition to Acting before executor call
+        if let Err(e) = query.transition(QueryState::Acting) {
+            query.fail(format!("{}", e), "processing".to_string());
+            self.query_engine.on_error(&query, &format!("{}", e));
+            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+        }
+        self.query_engine.on_state_change(&query);
+
+        // Execute event emission
+        let results = match self.executor.execute(vec![EngineAction::EmitEvent(event)]).await {
+            Ok(r) => r,
+            Err(e) => {
+                let err_str = format!("{}", e);
+                query.fail(err_str.clone(), "acting".to_string());
+                self.query_engine.on_error(&query, &err_str);
+                return Err(e.into());
+            },
+        };
+        let actions_count = results.len();
 
         self.event_bus.send(DaemonEvent::PositionStateChanged {
             position_id,
@@ -243,17 +307,35 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         });
 
         // Load position from projection for detector and return
-        let position = self
-            .store
-            .positions()
-            .find_by_id(position_id)
-            .await?
-            .ok_or(DaemonError::PositionNotFound(position_id))?;
+        let position = match self.store.positions().find_by_id(position_id).await {
+            Ok(Some(pos)) => pos,
+            Ok(None) => {
+                let e = DaemonError::PositionNotFound(position_id);
+                query.fail(format!("{}", e), "acting".to_string());
+                self.query_engine.on_error(&query, &format!("{}", e));
+                return Err(e);
+            },
+            Err(e) => {
+                let err_str = format!("{}", e);
+                query.fail(err_str.clone(), "acting".to_string());
+                self.query_engine.on_error(&query, &err_str);
+                return Err(e.into());
+            },
+        };
 
         // Spawn detector task
         let cancel_token = self.child_cancel_token();
         let detector =
-            DetectorTask::from_position(&position, Arc::clone(&self.event_bus), cancel_token)?;
+            match DetectorTask::from_position(&position, Arc::clone(&self.event_bus), cancel_token)
+            {
+                Ok(d) => d,
+                Err(e) => {
+                    let err_str = format!("{}", e);
+                    query.fail(err_str.clone(), "acting".to_string());
+                    self.query_engine.on_error(&query, &err_str);
+                    return Err(e);
+                },
+            };
         let handle = detector.spawn();
 
         // Store detector handle for cancellation
@@ -262,6 +344,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         debug!(%position_id, "Position armed, detector spawned");
 
+        // Complete query ONLY after all operations succeed
+        if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
+            query.fail(format!("{}", e), "acting".to_string());
+            self.query_engine.on_error(&query, &format!("{}", e));
+            return Err(DaemonError::Config(format!("Query completion error: {}", e)));
+        }
+        self.query_engine.on_state_change(&query);
+
         Ok(position)
     }
 
@@ -269,24 +359,58 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     ///
     /// Only positions in Armed state can be disarmed.
     pub async fn disarm_position(&self, position_id: PositionId) -> DaemonResult<()> {
-        let position = self
-            .store
-            .positions()
-            .find_by_id(position_id)
-            .await?
-            .ok_or(DaemonError::PositionNotFound(position_id))?;
+        // Create query for lifecycle tracking
+        let mut query =
+            ExecutionQuery::new(QueryKind::DisarmPosition { position_id }, Self::operator_actor());
+        query.position_id = Some(position_id);
+        self.populate_query_context_summary(&mut query).await;
+        self.query_engine.on_accepted(&query);
+
+        // Transition to Processing
+        if let Err(e) = query.transition(QueryState::Processing) {
+            query.fail(format!("{}", e), "accepted".to_string());
+            self.query_engine.on_error(&query, &format!("{}", e));
+            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+        }
+        self.query_engine.on_state_change(&query);
+
+        let position = match self.store.positions().find_by_id(position_id).await {
+            Ok(Some(pos)) => pos,
+            Ok(None) => {
+                let e = DaemonError::PositionNotFound(position_id);
+                query.fail(format!("{}", e), "processing".to_string());
+                self.query_engine.on_error(&query, &format!("{}", e));
+                return Err(e);
+            },
+            Err(e) => {
+                query.fail(format!("{}", e), "processing".to_string());
+                self.query_engine.on_error(&query, &format!("{}", e));
+                return Err(e.into());
+            },
+        };
 
         if !matches!(position.state, PositionState::Armed) {
-            return Err(DaemonError::InvalidPositionState {
+            let e = DaemonError::InvalidPositionState {
                 expected: "Armed".to_string(),
                 actual: format!("{:?}", position.state),
-            });
+            };
+            query.fail(format!("{}", e), "processing".to_string());
+            self.query_engine.on_error(&query, &format!("{}", e));
+            return Err(e);
         }
 
-        info!(%position_id, "Disarming position");
+        info!(%position_id, query_id = %query.id, "Disarming position");
 
         // Kill detector task if exists
         self.kill_detector(position_id).await;
+
+        // Transition to Acting before executor call
+        if let Err(e) = query.transition(QueryState::Acting) {
+            query.fail(format!("{}", e), "processing".to_string());
+            self.query_engine.on_error(&query, &format!("{}", e));
+            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+        }
+        self.query_engine.on_state_change(&query);
 
         // Emit PositionDisarmed event → apply_event transitions position to Closed
         let event = Event::PositionDisarmed {
@@ -294,7 +418,25 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             reason: "user_disarmed".to_string(),
             timestamp: chrono::Utc::now(),
         };
-        self.executor.execute(vec![EngineAction::EmitEvent(event)]).await?;
+
+        let exec_result = self.executor.execute(vec![EngineAction::EmitEvent(event)]).await;
+        match exec_result {
+            Ok(results) => {
+                if let Err(e) =
+                    query.complete(QueryOutcome::ActionsExecuted { actions_count: results.len() })
+                {
+                    query.fail(format!("{}", e), "acting".to_string());
+                    self.query_engine.on_error(&query, &format!("{}", e));
+                    return Err(DaemonError::Config(format!("Query completion error: {}", e)));
+                }
+                self.query_engine.on_state_change(&query);
+            },
+            Err(e) => {
+                query.fail(format!("{}", e), "acting".to_string());
+                self.query_engine.on_error(&query, &format!("{}", e));
+                return Err(e.into());
+            },
+        }
 
         self.event_bus.send(DaemonEvent::PositionStateChanged {
             position_id,
@@ -311,32 +453,102 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// Flow: Engine → Execute actions (emit events) → Save state → Process fill
     pub async fn handle_signal(&self, signal: DetectorSignal) -> DaemonResult<()> {
         let position_id = signal.position_id;
+
+        // Create query for lifecycle tracking
+        let mut query = ExecutionQuery::new(
+            QueryKind::ProcessSignal {
+                signal_id: signal.signal_id,
+                symbol: signal.symbol.clone(),
+                side: signal.side,
+                entry_price: signal.entry_price,
+                stop_loss: signal.stop_loss,
+            },
+            ActorKind::Detector,
+        );
+        query.position_id = Some(position_id);
+        self.populate_query_context_summary(&mut query).await;
+        self.query_engine.on_accepted(&query);
+
         info!(
             %position_id,
+            query_id = %query.id,
             signal_id = %signal.signal_id,
             entry_price = %signal.entry_price.as_decimal(),
             "Processing detector signal"
         );
 
+        // Transition to Processing
+        if let Err(e) = query.transition(QueryState::Processing) {
+            query.fail(format!("{}", e), "accepted".to_string());
+            self.query_engine.on_error(&query, &format!("{}", e));
+            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+        }
+        self.query_engine.on_state_change(&query);
+
         // Load position
-        let position = self
-            .store
-            .positions()
-            .find_by_id(position_id)
-            .await?
-            .ok_or(DaemonError::PositionNotFound(position_id))?;
+        let position = match self.store.positions().find_by_id(position_id).await {
+            Ok(Some(pos)) => pos,
+            Ok(None) => {
+                let e = DaemonError::PositionNotFound(position_id);
+                query.fail(format!("{}", e), "processing".to_string());
+                self.query_engine.on_error(&query, &format!("{}", e));
+                return Err(e);
+            },
+            Err(e) => {
+                query.fail(format!("{}", e), "processing".to_string());
+                self.query_engine.on_error(&query, &format!("{}", e));
+                return Err(e.into());
+            },
+        };
 
         // Kill detector (it's single-shot)
         self.kill_detector(position_id).await;
 
         // Use engine to decide entry (pure: State+Signal → Decision)
-        let decision = self.engine.decide_entry(&position, &signal)?;
+        let decision = match self.engine.decide_entry(&position, &signal) {
+            Ok(d) => d,
+            Err(e) => {
+                query.fail(format!("{}", e), "processing".to_string());
+                self.query_engine.on_error(&query, &format!("{}", e));
+                return Err(e.into());
+            },
+        };
+
+        // Check if we have actions to execute
+        if decision.actions.is_empty() {
+            if let Err(e) = query.complete(QueryOutcome::NoAction {
+                reason: "No actions from engine".to_string(),
+            }) {
+                query.fail(format!("{}", e), "processing".to_string());
+                self.query_engine.on_error(&query, &format!("{}", e));
+                return Err(DaemonError::Config(format!("Query completion error: {}", e)));
+            }
+            self.query_engine.on_state_change(&query);
+            return Ok(());
+        }
+
+        // Transition to Acting before executor call
+        if let Err(e) = query.transition(QueryState::Acting) {
+            query.fail(format!("{}", e), "processing".to_string());
+            self.query_engine.on_error(&query, &format!("{}", e));
+            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+        }
+        self.query_engine.on_state_change(&query);
 
         // Execute actions (events are appended and applied; exchange orders are placed)
         // EntryOrderPlaced event transitions position to Entering via apply_event
-        let results = self.executor.execute(decision.actions).await?;
+        let results = match self.executor.execute(decision.actions).await {
+            Ok(r) => r,
+            Err(e) => {
+                query.fail(format!("{}", e), "acting".to_string());
+                self.query_engine.on_error(&query, &format!("{}", e));
+                return Err(e.into());
+            },
+        };
 
         // Log results and process fill if order was placed
+        // actions_count represents ALL ActionResult variants (including AlreadyProcessed and Skipped)
+        let actions_count = results.len();
         for result in results {
             match result {
                 ActionResult::OrderPlaced(order) => {
@@ -348,13 +560,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     );
 
                     // Process the fill (position is now in Entering state)
-                    self.handle_entry_fill(
-                        position_id,
-                        order.fill_price,
-                        order.filled_quantity,
-                        Some(order.exchange_order_id),
-                    )
-                    .await?;
+                    // Note: handle_entry_fill is internal, covered by this query's lifecycle
+                    if let Err(e) = self
+                        .handle_entry_fill(
+                            position_id,
+                            order.fill_price,
+                            order.filled_quantity,
+                            Some(order.exchange_order_id),
+                        )
+                        .await
+                    {
+                        query.fail(format!("{}", e), "acting".to_string());
+                        self.query_engine.on_error(&query, &format!("{}", e));
+                        return Err(e);
+                    }
                 },
                 ActionResult::AlreadyProcessed(id) => {
                     warn!(%position_id, %id, "Signal already processed (idempotent skip)");
@@ -370,6 +589,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 },
             }
         }
+
+        // Complete query with success
+        if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
+            query.fail(format!("{}", e), "acting".to_string());
+            self.query_engine.on_error(&query, &format!("{}", e));
+            return Err(DaemonError::Config(format!("Query completion error: {}", e)));
+        }
+        self.query_engine.on_state_change(&query);
 
         Ok(())
     }
@@ -449,6 +676,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     pub async fn process_market_data(&self, data: MarketData) -> DaemonResult<()> {
         // Find all active positions for this symbol (from projection)
         let active_positions = self.store.positions().find_active().await?;
+        let active_positions_count = active_positions.len();
 
         for position in active_positions {
             if position.symbol != data.symbol {
@@ -459,24 +687,106 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 continue;
             }
 
+            // Create one ExecutionQuery PER POSITION processed
+            let mut query = ExecutionQuery::new(
+                QueryKind::ProcessMarketTick {
+                    symbol: data.symbol.clone(),
+                    price: data.price,
+                },
+                ActorKind::MarketData,
+            );
+            query.position_id = Some(position.id);
+            Self::set_query_context_summary(&mut query, active_positions_count);
+            self.query_engine.on_accepted(&query);
+
+            debug!(
+                position_id = %position.id,
+                query_id = %query.id,
+                price = %data.price.as_decimal(),
+                "Processing market tick for position"
+            );
+
+            // Transition to Processing
+            if let Err(e) = query.transition(QueryState::Processing) {
+                query.fail(format!("{}", e), "accepted".to_string());
+                self.query_engine.on_error(&query, &format!("{}", e));
+                return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+            }
+            self.query_engine.on_state_change(&query);
+
             // Use engine to process (pure: State+Tick → Decision)
             let symbol_clone = data.symbol.clone();
             let market_data = robson_engine::MarketData::new(symbol_clone, data.price);
-            let decision = self.engine.process_active_position(&position, &market_data)?;
+            let decision = match self.engine.process_active_position(&position, &market_data) {
+                Ok(d) => d,
+                Err(e) => {
+                    let err_str = format!("{}", e);
+                    query.fail(err_str.clone(), "processing".to_string());
+                    self.query_engine.on_error(&query, &err_str);
+                    return Err(e.into());
+                },
+            };
+
+            // Check if we have actions to execute
+            if decision.actions.is_empty() {
+                if let Err(e) =
+                    query.complete(QueryOutcome::NoAction { reason: "No stop trigger".to_string() })
+                {
+                    let err_str = format!("{}", e);
+                    query.fail(err_str.clone(), "processing".to_string());
+                    self.query_engine.on_error(&query, &err_str);
+                    return Err(DaemonError::Config(format!("Query completion error: {}", e)));
+                }
+                self.query_engine.on_state_change(&query);
+                continue;
+            }
+
+            // Transition to Acting before executor call
+            if let Err(e) = query.transition(QueryState::Acting) {
+                query.fail(format!("{}", e), "processing".to_string());
+                self.query_engine.on_error(&query, &format!("{}", e));
+                return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+            }
+            self.query_engine.on_state_change(&query);
 
             // Execute actions via Executor (side-effects: EventLog.append, Exchange orders)
             // MemoryStore is updated via apply_event() called by executor after event append
-            if !decision.actions.is_empty() {
-                let results = self.executor.execute(decision.actions).await?;
+            let results = match self.executor.execute(decision.actions).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let err_str = format!("{}", e);
+                    query.fail(err_str.clone(), "acting".to_string());
+                    self.query_engine.on_error(&query, &err_str);
+                    return Err(e.into());
+                },
+            };
 
-                for result in results {
-                    if let ActionResult::OrderPlaced(order) = result {
-                        // Exit order filled, handle close
-                        self.handle_exit_fill(position.id, order.fill_price, order.filled_quantity)
-                            .await?;
+            // Process results
+            // actions_count represents ALL ActionResult variants
+            let actions_count = results.len();
+            for result in results {
+                if let ActionResult::OrderPlaced(order) = result {
+                    // Exit order filled, handle close
+                    // Note: handle_exit_fill is internal, covered by this query's lifecycle
+                    if let Err(e) = self
+                        .handle_exit_fill(position.id, order.fill_price, order.filled_quantity)
+                        .await
+                    {
+                        let err_str = format!("{}", e);
+                        query.fail(err_str.clone(), "acting".to_string());
+                        self.query_engine.on_error(&query, &err_str);
+                        return Err(e);
                     }
                 }
             }
+
+            // Complete query with success
+            if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
+                query.fail(format!("{}", e), "acting".to_string());
+                self.query_engine.on_error(&query, &format!("{}", e));
+                return Err(DaemonError::Config(format!("Query completion error: {}", e)));
+            }
+            self.query_engine.on_state_change(&query);
         }
 
         Ok(())
@@ -556,12 +866,45 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         warn!("PANIC: Emergency close all positions");
 
         let active = self.store.positions().find_active().await?;
+        let active_positions_count = active.len();
         let mut closed_ids = Vec::new();
 
         for position in active {
-            match self.panic_close_position(position.id).await {
-                Ok(_) => closed_ids.push(position.id),
-                Err(e) => error!(position_id = %position.id, error = %e, "Failed to panic close"),
+            // Create one PanicClosePosition query PER POSITION
+            let mut query = ExecutionQuery::new(
+                QueryKind::PanicClosePosition { position_id: position.id },
+                Self::operator_actor(),
+            );
+            query.position_id = Some(position.id);
+            Self::set_query_context_summary(&mut query, active_positions_count);
+            self.query_engine.on_accepted(&query);
+
+            match self.panic_close_position_internal(position.id, &mut query).await {
+                Ok(_) => {
+                    if let Err(e) =
+                        query.complete(QueryOutcome::ActionsExecuted { actions_count: 1 })
+                    {
+                        query.fail(format!("{}", e), "acting".to_string());
+                        self.query_engine.on_error(&query, &format!("{}", e));
+                    } else {
+                        self.query_engine.on_state_change(&query);
+                    }
+                    closed_ids.push(position.id);
+                },
+                Err(e) => {
+                    // Caller owns failure recording - internal method does NOT call fail()
+                    // Infer phase from current query state for accurate audit trail
+                    let phase = match &query.state {
+                        QueryState::Accepted => "accepted".to_string(),
+                        QueryState::Processing => "processing".to_string(),
+                        QueryState::Acting => "acting".to_string(),
+                        QueryState::Completed => "completed".to_string(),
+                        QueryState::Failed { phase, .. } => phase.clone(),
+                    };
+                    query.fail(format!("{}", e), phase);
+                    self.query_engine.on_error(&query, &format!("{}", e));
+                    error!(position_id = %position.id, error = %e, "Failed to panic close");
+                },
             }
         }
 
@@ -573,18 +916,42 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         Ok(closed_ids)
     }
 
-    /// Emergency close a single position.
+    /// Emergency close a single position (internal, takes query for lifecycle tracking).
+    ///
+    /// # Failure Recording Ownership
+    ///
+    /// This method does NOT call `query.fail()` or `on_error()` on errors.
+    /// The caller is responsible for failure recording. This prevents double-fail.
     ///
     /// Emits PositionClosed event which will be applied by projection.
-    async fn panic_close_position(&self, position_id: PositionId) -> DaemonResult<()> {
-        let position = self
-            .store
-            .positions()
-            .find_by_id(position_id)
-            .await?
-            .ok_or(DaemonError::PositionNotFound(position_id))?;
+    async fn panic_close_position_internal(
+        &self,
+        position_id: PositionId,
+        query: &mut ExecutionQuery,
+    ) -> DaemonResult<()> {
+        // Transition to Processing
+        if let Err(e) = query.transition(QueryState::Processing) {
+            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+        }
+        self.query_engine.on_state_change(query);
+
+        let position = match self.store.positions().find_by_id(position_id).await {
+            Ok(Some(pos)) => pos,
+            Ok(None) => {
+                return Err(DaemonError::PositionNotFound(position_id));
+            },
+            Err(e) => {
+                return Err(e.into());
+            },
+        };
 
         let exit_side = position.side.exit_action();
+
+        // Transition to Acting before executor call
+        if let Err(e) = query.transition(QueryState::Acting) {
+            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+        }
+        self.query_engine.on_state_change(query);
 
         // Place market exit order on exchange (executor also emits ExitOrderPlaced → Active → Exiting)
         let results = self
@@ -599,18 +966,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .await?;
 
         // Extract actual fill price from exchange result
-        let fill_price = results
-            .into_iter()
-            .find_map(|r| {
-                if let ActionResult::OrderPlaced(order) = r {
-                    Some(order.fill_price)
-                } else {
-                    None
-                }
-            })
-            .ok_or(DaemonError::Exec(ExecError::InvalidState(
-                "Panic close: PlaceExitOrder did not return OrderPlaced".to_string(),
-            )))?;
+        let fill_price = match results.into_iter().find_map(|r| {
+            if let ActionResult::OrderPlaced(order) = r {
+                Some(order.fill_price)
+            } else {
+                None
+            }
+        }) {
+            Some(price) => price,
+            None => {
+                return Err(DaemonError::Exec(ExecError::InvalidState(
+                    "Panic close: PlaceExitOrder did not return OrderPlaced".to_string(),
+                )));
+            },
+        };
 
         // Calculate PnL with actual fill price
         let entry_price = position.entry_price.unwrap_or(fill_price);
@@ -626,8 +995,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             total_fees: position.fees_paid,
             timestamp: chrono::Utc::now(),
         };
+
         self.executor.execute(vec![EngineAction::EmitEvent(event)]).await?;
 
+        // Send to event bus for real-time notification
         self.event_bus.send(DaemonEvent::CorePositionClosed {
             position_id,
             symbol: position.symbol.clone(),
