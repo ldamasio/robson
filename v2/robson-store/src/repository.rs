@@ -20,8 +20,35 @@ pub trait PositionRepository: Send + Sync {
     /// Find all positions for an account
     async fn find_by_account(&self, account_id: Uuid) -> Result<Vec<Position>, StoreError>;
 
-    /// Find all active positions (state = Armed or Active)
+    /// Find positions eligible for lifecycle management.
+    ///
+    /// Returns positions that are not yet closed: Armed, Entering, Active, Exiting.
+    /// Used by position managers that need to act on all non-terminal positions
+    /// (e.g. process market ticks, panic close, shutdown cleanup).
+    ///
+    /// Note: does NOT filter to "Active only" despite historic naming. Use
+    /// `find_risk_open()` when computing portfolio exposure for risk gates.
     async fn find_active(&self) -> Result<Vec<Position>, StoreError>;
+
+    /// Find positions with committed exchange exposure for risk context computation.
+    ///
+    /// Returns only `Entering` and `Active` positions:
+    /// - `Entering`: entry order submitted to exchange, waiting for fill.
+    ///   Notional is committed on the exchange even before fill confirmation.
+    /// - `Active`: position open on exchange with trailing stop monitoring.
+    ///
+    /// Excludes Armed (no order yet) and Exiting (reducing, not expanding exposure).
+    ///
+    /// Used exclusively by `build_risk_context()` to ensure concurrent entries
+    /// cannot bypass exposure limits during the order-fill window.
+    ///
+    /// Default implementation uses two `find_by_state` calls. Override for
+    /// a single-pass implementation.
+    async fn find_risk_open(&self) -> Result<Vec<Position>, StoreError> {
+        let mut result = self.find_by_state("entering").await?;
+        result.extend(self.find_by_state("active").await?);
+        Ok(result)
+    }
 
     /// Find positions by state
     async fn find_by_state(&self, state: &str) -> Result<Vec<Position>, StoreError>;
