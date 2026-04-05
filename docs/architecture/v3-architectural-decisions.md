@@ -258,6 +258,29 @@ See v3-tron-evaluation.md for full analysis.
 
 ---
 
+### ADR-v3-015: Execution Core — QueryEngine with state-first Architecture
+
+**Context**: The Control Loop (Observe -> Interpret -> Decide -> Act -> Evaluate -> Persist) is currently stitched together by PositionManager, which directly calls Engine + Executor. Execution lifecycle state is fragmented: PositionState tracks business state, IntentStatus tracks idempotency state, and runtime-cycle state is implicit in call stacks. There is no single typed execution unit. Additionally, the relationship between RuntimeState (operational truth), EventLog (durable truth), and Projections (derived views) is implicit.
+
+**Decision**: Introduce QueryEngine as the governed execution core inside the Runtime, with ExecutionQuery as the typed lifecycle unit. Formalize the architectural premise: `state = source of truth, stream = projection`.
+
+**Chose**: QueryEngine inside robsond with phased rollout (passive wrapper -> blocking governance -> approval gates -> full audit)
+**Rejected**: (a) Rewrite PositionManager from scratch (too risky, breaks everything), (b) Separate QueryEngine crate (violates Runtime exclusivity — Control Loop must be owned by robsond), (c) Keep implicit stitching (fragmentation grows with each new feature)
+
+**Rationale**:
+- Every trigger becomes a typed ExecutionQuery with explicit state machine (Accepted -> Processing -> Acting -> Completed / Failed)
+- Single entry point: `QueryEngine.process()` is the ONLY path to mutate RuntimeState
+- Formalizes what PositionManager does informally, without rewriting it
+- The `state = source of truth, stream = projection` premise clarifies: RuntimeState is the operational authority, EventLog is the durable authority, Projections are always derived
+- Phase 1 is non-breaking (wrapper + tracing), Phase 2 wires GovernedAction and Risk Engine as blocking gate
+- Aligns with GovernedAction pattern (v3-runtime-spec.md) — GovernedAction is constructed inside QueryEngine after risk clearance
+
+**Breaks if wrong**: QueryEngine adds indirection that slows development. Mitigation: Phase 1 is a thin wrapper with zero behavior change. If indirection proves harmful, remove it — the underlying Engine + Executor remain unchanged.
+
+See [v3-query-query-engine.md](v3-query-query-engine.md) for the full specification.
+
+---
+
 ### ADR-v3-014: Concurrency — Sequential Control Loop
 
 **Context**: The control loop can run cycles concurrently (with isolation guarantees) or sequentially (one at a time, queued).

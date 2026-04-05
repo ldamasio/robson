@@ -811,11 +811,11 @@ Reconsider TRON integration when ALL of these are true:
 1. **Every migration step generates an immutable event**: `MigrationStepStarted`, `MigrationStepCompleted`, `MigrationStepRolledBack` in EventLog.
 2. **Data migration risk**: Steps #1-#6 in v2.5 do NOT migrate data. The Django database remains untouched. robsond creates its own EventLog in Postgres. The two systems coexist during v2.5, but only one execution path may be active for live stop/trailing responsibilities at a time.
 3. **Build order** (foundation first):
-   - FIRST: robsond deployment (#1) + SOPS (#7) + observability (#8)
-   - THEN: projector (#2) + Risk Engine wiring (#4)
+   - FIRST: robsond deployment (#1) + SOPS (#7) + observability (#8) + **QueryEngine Phase 1** (passive wrapper, see v3-query-query-engine.md)
+   - THEN: projector (#2) + Risk Engine wiring (#4) + **QueryEngine Phase 2** (blocking governance via QueryEngine)
    - THEN: stop monitoring migration (#3) + circuit breaker (#5)
    - THEN: SSE (#6) + contract tests (#9) + replay tests (#10)
-4. **Parallelizable**: #1 + #7 + #8 can run in parallel. #2 + #4 can run in parallel after #1. #9 + #10 can run in parallel after #1.
+4. **Parallelizable**: #1 + #7 + #8 + QueryEngine Phase 1 can run in parallel. #2 + #4 + QueryEngine Phase 2 can run in parallel after #1. #9 + #10 can run in parallel after #1.
 5. **No parallel execution authorities**: v3 never runs Django execution CronJobs in parallel with robsond. Rollback is mutually exclusive.
 6. **Deferred to post-v3**:
    - Backtesting (robson-sim): Trigger — operator wants to validate strategies before arming

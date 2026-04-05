@@ -54,6 +54,7 @@ Start here to understand the system:
 - **[v3 Runtime Spec](v3-runtime-spec.md)** - Runtime ownership and governance model
 - **[v3 Risk Engine Spec](v3-risk-engine-spec.md)** - Blocking risk gate design
 - **[v3 Control Loop](v3-control-loop.md)** - Execution cycle specification
+- **[v3 Query & QueryEngine](v3-query-query-engine.md)** - Governed execution core (ExecutionQuery lifecycle, state-first architecture)
 - **[v3 TRON Evaluation](v3-tron-evaluation.md)** - Deferred integration analysis
 
 ## Architecture Principles

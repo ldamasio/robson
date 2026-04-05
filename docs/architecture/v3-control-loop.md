@@ -14,6 +14,12 @@ The Control Loop is the heartbeat of Robson. It is the single execution path thr
 Observe -> Interpret -> Decide -> Act -> Evaluate -> Persist
 ```
 
+### Implementation: QueryEngine
+
+The Control Loop is implemented by the **QueryEngine** (`robsond/src/query_engine.rs`). Every trigger that enters the Runtime becomes a typed **ExecutionQuery** (`robsond/src/query.rs`) that progresses through the pipeline above. The QueryEngine is the ONLY path to mutate RuntimeState.
+
+See **[v3-query-query-engine.md](v3-query-query-engine.md)** for the full specification, including state machine, phased implementation, and the `state = source of truth, stream = projection` architectural premise.
+
 ---
 
 ## Phase Specification

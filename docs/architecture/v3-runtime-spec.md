@@ -12,6 +12,14 @@ The Runtime is the single most important software component in Robson. It is NOT
 
 **The Runtime IS the agent.** The LLM (if integrated in v3+) is a reasoning tool that the Runtime governs. The exchange is an execution tool that the Runtime governs. The EventLog is a persistence tool that the Runtime governs. Nothing operates outside the Runtime's control.
 
+### Execution Core: QueryEngine
+
+The Runtime's execution pipeline is implemented by the **QueryEngine** (`robsond/src/query_engine.rs`). Every trigger becomes a typed **ExecutionQuery** that flows through the Control Loop. The QueryEngine is internal to the Runtime — it is NOT a separate service or crate.
+
+**Architectural premise**: `state = source of truth, stream = projection`. RuntimeState is the operational authority for real-time decisions. EventLog is the durable authority for replay and audit. Projections are always derived from EventLog, never consulted for decisions.
+
+See **[v3-query-query-engine.md](v3-query-query-engine.md)** for the full specification.
+
 ---
 
 ## Architecture
