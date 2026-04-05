@@ -457,9 +457,9 @@ async fn handle_signal(&self, signal: DetectorSignal) {
 ```rust
 // One ExecutionQuery PER POSITION processed, not one per tick
 pub async fn process_market_data(&self, data: MarketData) -> DaemonResult<()> {
-    let active_positions = self.store.positions().find_active().await?;
+    let open_positions = self.store.positions().find_active().await?;
 
-    for position in active_positions {
+    for position in open_positions {
         if position.symbol != data.symbol { continue; }
         if !matches!(position.state, PositionState::Active { .. }) { continue; }
 
@@ -484,13 +484,14 @@ pub async fn process_market_data(&self, data: MarketData) -> DaemonResult<()> {
 
 **Fan-out pattern** (panic_close_all):
 ```rust
-// find_active() returns all non-terminal: Armed, Entering, Active, Exiting.
+// find_active() returns open core-lifecycle positions:
+// Armed, Entering, Active, Exiting.
 // Each state receives appropriate handling — not blindly "close everything".
 pub async fn panic_close_all(&self) -> DaemonResult<Vec<PositionId>> {
-    let all_non_terminal = self.store.positions().find_active().await?;
+    let open_positions = self.store.positions().find_active().await?;
     let mut closed_ids = Vec::new();
 
-    for position in all_non_terminal {
+    for position in open_positions {
         match &position.state {
             PositionState::Active { .. } => {
                 // One PanicClosePosition query per Active position
@@ -659,12 +660,15 @@ The Control Loop phases map directly to QueryEngine processing:
 - `PositionRepository::find_risk_open()` added with explicit Entering+Active semantics.
   `build_risk_context()` calls this — not `find_active()` — so concurrent Entering positions
   (order submitted, fill pending) block new entries as expected.
-- `PositionRepository::find_active()` contract fixed to return **all non-terminal states**
-  (Armed, Entering, Active, Exiting). `MemoryStore` implementation updated from
-  `can_enter() || can_exit()` (= Armed+Active only) to `!is_closed()`. This matters for
-  `panic_close_all()` and crash-recovery `restore_positions()`, which must see every live position.
+- `PositionRepository::find_active()` contract fixed to return open core-lifecycle states only:
+  `Armed`, `Entering`, `Active`, `Exiting`. It explicitly excludes `Closed` and `Error`.
+  `MemoryStore` implementation now matches these states explicitly instead of relying on
+  `!is_closed()`, which accidentally included `Error`.
+- PostgreSQL projection recovery was aligned to the same contract. `positions_current` now stores
+  recovery metadata (`entry_signal_id`, `exit_reason`) so `find_active_from_projection()` can
+  reconstruct `Entering` and `Exiting` rows instead of silently dropping them during fallback recovery.
 - `panic_close_all()` refactored with per-state dispatch: Active→exit order, Armed→disarm,
-  Entering→warning (cancel not yet implemented), Exiting→skip, Error→warning.
+  Entering→warning (cancel not yet implemented), Exiting→skip.
 
 **Architectural decision (Option A — recorded)**:
 - `GovernedAction` lives in `robsond` (`pub(crate)`), NOT in `robson-exec`
