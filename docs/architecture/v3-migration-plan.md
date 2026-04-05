@@ -273,8 +273,12 @@ implementation wires the minimal production path only:
 - `PlaceEntryOrder` above 5% of capital is gated
 - approval state is kept in memory only for the current daemon lifetime
 - operator approval happens via `POST /queries/{id}/approve`
+- approval is not a risk override: pending approvals reserve risk, and `approve`
+  revalidates the current context before execution
+- `disarm` invalidates pending approvals for the same position
 - TTL is fixed at 300 seconds
 - public SSE exposes `query.awaiting_approval`, `query.authorized`, and `query.expired`
+- REST bootstrap exposes pending approvals on `/status`
 
 The broader configurable permission matrix remains the v3 target architecture,
 but it is not fully implemented in this phase.

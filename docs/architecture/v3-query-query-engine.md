@@ -700,6 +700,11 @@ Proper PnL tracking in the store is deferred to a follow-up task.
 - TTL is explicit and fixed at **300 seconds**
 - Current policy is intentionally narrow: `PlaceEntryOrder` requires approval when
   entry notional exceeds **5% of capital**
+- Approval is **not** a risk override: pending queries reserve risk while waiting,
+  and `approve` revalidates risk against the current runtime context before acting
+- `disarm` invalidates pending approvals for the same position before closing it
+- REST bootstrap now includes pending approvals on `/status` so clients can recover
+  after SSE reconnect without replay
 - Public SSE exposes `query.awaiting_approval`, `query.authorized`, `query.expired`
 - No replay support, no EventLog lifecycle persistence, no approval broker/queue
 - Precondition status: SSE working (v2.5 #6) is satisfied by the `robsond` `/events`
