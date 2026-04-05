@@ -18,6 +18,8 @@ The Runtime's execution pipeline is implemented by the **QueryEngine** (`robsond
 
 **Architectural premise**: `state = source of truth, stream = projection`. RuntimeState is the operational authority for real-time decisions. EventLog is the durable authority for replay and audit. Projections are always derived from EventLog, never consulted for decisions.
 
+**v2.5 transitional note (implemented 2026-04-05)**: `robsond` now exposes a minimal SSE endpoint at `/events` for operator-facing runtime updates. This stream is ephemeral and derived for UI/monitoring only. It does not provide replay or `Last-Event-ID` resume; clients bootstrap current state via REST and then subscribe for incremental updates.
+
 See **[v3-query-query-engine.md](v3-query-query-engine.md)** for the full specification.
 
 ---

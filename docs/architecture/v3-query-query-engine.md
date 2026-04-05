@@ -697,6 +697,8 @@ Proper PnL tracking in the store is deferred to a follow-up task.
 - Approval token with TTL, bound to query_id + action hash
 - Permission system wired into QueryEngine
 - Circuit breaker reset requires approval
+- Precondition status: SSE working (v2.5 #6) is satisfied by the `robsond` `/events`
+  endpoint implemented on 2026-04-05
 
 **Depends on**: Phase 2 complete, SSE working (v2.5 #6)
 
@@ -773,14 +775,14 @@ pub enum PermissionDecision {
 
 With QueryEngine as the execution core, the stream derivation contract becomes explicit:
 
-**Phase 1 (v2 current persistence model)**:
+**Phase 1 / v2.5 current model**:
 ```
 ExecutionQuery (trigger)
   -> PositionManager (Engine + Executor calls, wrapped with lifecycle)
     -> Executor.execute() (persists events + applies to Store internally)
       -> Store (MemoryStore/PgStore) = operational truth
       -> EventLog.append() = durable truth (when robson-eventlog is wired)
-        -> ProjectionWorker.apply() (derived)
+        -> Runtime EventBus / public mapper (derived, ephemeral)
           -> SSE stream (push to consumers)
 ```
 
@@ -795,10 +797,11 @@ ExecutionQuery (trigger)
 ```
 
 **Rules** (apply to both phases):
-1. **Projections NEVER feed back into decisions.** Decisions use Store (Phase 1) or RuntimeState (Phase 2+).
-2. **SSE streams are derived from projections**, not from Store/RuntimeState directly.
-3. **If projections drift from EventLog** (watermark lag >100), they are rebuilt from EventLog. This is safe because projections are always derived.
-4. **If Store/RuntimeState drifts from exchange** (reconciliation mismatch), exchange state wins. A ReconciliationEvent is appended to EventLog.
+1. **Derived streams NEVER feed back into decisions.** Decisions use Store (Phase 1/v2.5) or RuntimeState (Phase 2+/v3 target).
+2. **v2.5 SSE is an ephemeral derived stream**, mapped from runtime events for operator/UI use. It is not a source of truth, does not provide replay, and requires REST bootstrap on connect.
+3. **v3 target SSE is derived from durable projections**, not from Store/RuntimeState directly.
+4. **If projections drift from EventLog** (watermark lag >100), they are rebuilt from EventLog. This is safe because projections are always derived.
+5. **If Store/RuntimeState drifts from exchange** (reconciliation mismatch), exchange state wins. A ReconciliationEvent is appended to EventLog.
 
 This formalizes what v3-control-loop.md and v3-runtime-spec.md already describe, but makes the derivation chain explicit and enforceable.
 

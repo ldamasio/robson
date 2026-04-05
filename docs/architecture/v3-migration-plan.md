@@ -434,23 +434,41 @@ pub async fn replay_from_log(pool: &PgPool) -> Result<RuntimeState> {
 **Stack**: React 18 + Vite (existing). No framework change.
 
 **Evolution from v1 to v3**:
-- v2.5: Add SSE endpoint from Django for real-time event streaming; add operator controls (pause/resume/panic) that call robsond API
-- v3: Frontend connects directly to robsond's SSE/WebSocket endpoint; Django removed from the path
+- v2.5: Add SSE endpoint in `robsond` for real-time operator event streaming; frontend still bootstraps via REST
+- v3: Frontend connects directly to robsond's SSE/WebSocket endpoint through the gateway; Django is removed from the execution path
 
 **Real-time model**: Server-Sent Events (SSE) for event stream (unidirectional, simpler than WebSocket for event push). WebSocket retained only for Binance market data relay to frontend.
 
-**Streaming contract**:
+**v2.5 SSE MVP contract (implemented 2026-04-05)**:
 ```typescript
 interface EventStreamMessage {
-    event_type: string;           // "position_state_changed", "risk_alert", "cycle_completed", etc.
+    schema_version: 1;
+    event_id: string;             // UUID v7, uniqueness/dedup only (NOT replay cursor)
+    event_type: string;           // "position.changed", "position.opened", etc.
+    occurred_at: string;          // Projection timestamp (ISO 8601)
     payload: Record<string, any>; // Event-specific data
-    timestamp: string;            // ISO 8601
-    cycle_id?: string;            // ULID if part of a control loop cycle
-    priority: "critical" | "high" | "normal" | "low";
 }
 ```
 
-Critical events (circuit breaker, panic) are sent immediately. Normal events are batched at 100ms intervals to prevent UI thrashing.
+**Current endpoint**: `GET /events`
+
+**Current behavior**:
+- REST remains the bootstrap path for snapshots (`/status`, `/positions`, etc.)
+- SSE carries incremental operator-facing updates only
+- Public stream is mapped from internal daemon events; it does NOT expose `DaemonEvent` directly
+- Keepalive heartbeat is enabled
+- On broadcast lag, the daemon emits `system.resync_required` and closes the stream
+- `Last-Event-ID` replay/resume is NOT implemented in v2.5
+
+**Current public event types**:
+- `position.changed`
+- `position.opened`
+- `position.closed`
+- `safety.rogue_position_detected`
+- `safety.exit_executed`
+- `safety.exit_failed`
+- `safety.panic`
+- `system.resync_required`
 
 ### Operator Capabilities
 
@@ -787,7 +805,7 @@ Reconsider TRON integration when ALL of these are true:
 | 3 | **Migrate stop monitoring from Django CronJob to robsond WebSocket** | CronJob has 60s granularity. WebSocket achieves <500ms. This is the core latency improvement. | robsond deployed (#1), projector complete (#2) | M | Yes — re-enable CronJob | Re-enable `rbs-stop-monitor-cronjob`, disable robsond stop monitor | Stop-loss latency stays at 60s, unacceptable for leveraged trading |
 | 4 | **Implement GovernedAction + Risk Engine as blocking gate** | Risk Engine is currently in robson-engine but not wired as mandatory gate. Must block before any v3 feature relies on it. | robsond deployed (#1) | M | Yes — revert to advisory mode | Config flag: `risk_engine_mode: advisory` | Risk Engine bypass possible, defeating the entire safety architecture |
 | 5 | **Implement circuit breaker escalation ladder (L1-L4)** | Without escalation, a single circuit breaker trip halts the system with no graceful degradation | Risk Engine blocking (#4) | M | Yes — revert to simple halt | Remove escalation, revert to single-level circuit breaker | Operator must manually intervene for every risk event, no automated protection |
-| 6 | **Add SSE endpoint to robsond for frontend event streaming** | Frontend needs real-time data from daemon, not Django polling | robsond deployed (#1) | S | Yes — frontend falls back to REST polling | Remove SSE route, frontend uses REST | Frontend has no real-time capability, operator flies blind |
+| 6 | **Add SSE endpoint to robsond for frontend event streaming** — IMPLEMENTED 2026-04-05 | Frontend needs real-time data from daemon, not Django polling | robsond deployed (#1) | S | Yes — frontend falls back to REST polling | Remove SSE route, frontend uses REST | Frontend has no real-time capability, operator flies blind |
 | 7 | **Implement SOPS for secrets management** | Current secrets are K8s secrets (base64, not encrypted at rest in git). SOPS encrypts in git. | None | S | Yes — revert to plain K8s secrets | Remove .sops.yaml, restore template secrets | Secrets remain unencrypted in git templates (security risk) |
 | 8 | **Deploy Prometheus + Grafana + Loki on k3s** | Observability is non-negotiable before v3. Cannot debug production issues without metrics/logs. | k3s cluster (exists) | M | Yes — undeploy | `kubectl delete namespace monitoring` | Flying blind in production. Debugging via `kubectl logs` only. |
 | 9 | **Contract tests for daemon API** | CLI and frontend depend on daemon API stability. Breaking changes must be caught in CI. | robsond deployed (#1) | S | Yes — remove test suite | Revert CI config | API breaks silently, CLI/frontend stop working after daemon update |
