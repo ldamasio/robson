@@ -87,6 +87,7 @@ pub enum QueryKind {
 
 /// Lifecycle state machine for an ExecutionQuery.
 ///
+/// Phase 1:
 /// ```text
 ///   Accepted -> Processing -> Acting -> Completed
 ///                  |            |
@@ -94,8 +95,15 @@ pub enum QueryKind {
 ///               Failed       Failed
 /// ```
 ///
-/// Phase 2+ adds: RiskChecked, AwaitingApproval, Authorized
-/// between Processing and Acting.
+/// Phase 2 (current):
+/// ```text
+///   Accepted -> Processing -> RiskChecked -> Acting -> Completed
+///                  |              |             |
+///                  v              v             v
+///               Failed         Denied        Failed
+/// ```
+///
+/// Phase 3+ adds: AwaitingApproval, Authorized between RiskChecked and Acting.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum QueryState {
     /// Query created, validated, queued
@@ -104,14 +112,26 @@ pub enum QueryState {
     /// Engine + Risk are evaluating (Interpret + Decide phases)
     Processing,
 
+    /// Phase 2: Risk gate evaluated. Either approved (→ Acting) or denied (→ Denied).
+    RiskChecked,
+
     /// Executor is executing governed actions (Act phase)
     Acting,
 
     /// Successfully completed.
     Completed,
 
-    /// Terminal failure
+    /// Terminal failure (operational error — not a governance decision)
     Failed { reason: String, phase: String },
+
+    /// Phase 2: Terminal governance denial.
+    ///
+    /// Distinct from `Failed`: denial is an intentional governed outcome,
+    /// not a system failure. The risk gate or a future approval gate rejected
+    /// the action before any side effects occurred.
+    ///
+    /// `check` identifies which governance rule triggered the denial.
+    Denied { reason: String, check: String },
 }
 
 // =============================================================================
@@ -302,18 +322,28 @@ impl ExecutionQuery {
             // Accepted -> Processing
             (QueryState::Accepted, QueryState::Processing) => Ok(()),
 
-            // Processing -> Acting (has actions)
+            // Processing -> RiskChecked (Phase 2: entry through risk gate)
+            (QueryState::Processing, QueryState::RiskChecked) => Ok(()),
+
+            // Processing -> Acting (exit/safe operations that bypass risk gate)
             (QueryState::Processing, QueryState::Acting) => Ok(()),
 
-            // Processing -> Completed (no action / denied)
+            // Processing -> Completed (no action before risk check)
             (QueryState::Processing, QueryState::Completed) => Ok(()),
+
+            // RiskChecked -> Acting (risk approved)
+            (QueryState::RiskChecked, QueryState::Acting) => Ok(()),
+
+            // RiskChecked -> Denied (risk denied — governed terminal state)
+            (QueryState::RiskChecked, QueryState::Denied { .. }) => Ok(()),
 
             // Acting -> Completed
             (QueryState::Acting, QueryState::Completed) => Ok(()),
 
-            // Any non-terminal state can fail
+            // Any non-terminal state can fail (operational error)
             (QueryState::Accepted, QueryState::Failed { .. }) => Ok(()),
             (QueryState::Processing, QueryState::Failed { .. }) => Ok(()),
+            (QueryState::RiskChecked, QueryState::Failed { .. }) => Ok(()),
             (QueryState::Acting, QueryState::Failed { .. }) => Ok(()),
 
             // All other transitions are invalid
@@ -326,7 +356,10 @@ impl ExecutionQuery {
         self.state = new_state;
 
         // Set finished_at for terminal states
-        if matches!(self.state, QueryState::Completed | QueryState::Failed { .. }) {
+        if matches!(
+            self.state,
+            QueryState::Completed | QueryState::Failed { .. } | QueryState::Denied { .. }
+        ) {
             self.finished_at = Some(Utc::now());
         }
 
@@ -354,16 +387,30 @@ impl ExecutionQuery {
         Ok(())
     }
 
-    /// Convenience: mark as failed.
+    /// Convenience: mark as failed (operational error).
     ///
-    /// Phase 1: Does NOT set `outcome` - the `Failed` state with its
-    /// `reason` and `phase` fields is the authoritative record of failure.
-    /// `QueryOutcome::Denied` is reserved for governance/risk denial (Phase 2+),
-    /// not operational failures.
+    /// The `Failed` state with its `reason` and `phase` fields is the
+    /// authoritative record of failure. Does NOT set `outcome`.
+    ///
+    /// For governance denials (risk gate, approval gate), use `deny()` instead.
     pub fn fail(&mut self, reason: String, phase: String) {
         // Transition is best-effort for failure
         // The Failed state captures reason/phase - no need to pollute outcome
         let _ = self.transition(QueryState::Failed { reason, phase });
+    }
+
+    /// Convenience: mark as governance-denied (Phase 2+).
+    ///
+    /// Called when the risk gate or a future approval gate rejects the action.
+    /// This is NOT an operational failure — it is an intentional governed outcome.
+    ///
+    /// Sets `outcome = Some(QueryOutcome::Denied)` for audit and projections.
+    /// `check` identifies which governance rule triggered the denial (e.g. "max_open_positions").
+    /// Query must be in `RiskChecked` state before calling this.
+    pub fn deny(&mut self, reason: String, check: String) {
+        // Set outcome BEFORE transition so it is recorded even if transition is already terminal
+        self.outcome = Some(QueryOutcome::Denied { reason: reason.clone() });
+        let _ = self.transition(QueryState::Denied { reason, check });
     }
 
     /// Duration of query execution (None if not yet completed).
@@ -564,6 +611,31 @@ mod tests {
 
         // But state should be Failed
         assert!(matches!(query.state, QueryState::Failed { .. }));
+    }
+
+    #[test]
+    fn test_deny_sets_outcome_and_terminal_state() {
+        // Phase 2: deny() must set outcome for audit/projections
+        let mut query = create_test_query();
+
+        query.transition(QueryState::Processing).unwrap();
+        query.transition(QueryState::RiskChecked).unwrap();
+        query.deny("Too many positions".to_string(), "max_open_positions".to_string());
+
+        // State must be Denied (terminal)
+        assert!(
+            matches!(query.state, QueryState::Denied { .. }),
+            "deny() must transition to Denied state"
+        );
+
+        // outcome must be Some(Denied) for audit and projections
+        assert!(
+            matches!(query.outcome, Some(QueryOutcome::Denied { .. })),
+            "deny() must set outcome = Some(QueryOutcome::Denied)"
+        );
+
+        // finished_at must be set (Denied is terminal)
+        assert!(query.finished_at.is_some(), "Denied is a terminal state — finished_at must be set");
     }
 
     #[test]
