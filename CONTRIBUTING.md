@@ -82,6 +82,15 @@ We welcome contributors from all language backgrounds! Tips:
 
 ---
 
+## AI-First Instructions
+
+Canonical AI-first repository rules live in [AGENTS.md](AGENTS.md).
+
+Use `AGENTS.md` as the primary place for project-wide agent instructions and conventions.
+Vendor-specific files such as `CLAUDE.md` should stay as thin compatibility adapters and must not become separate sources of truth.
+
+---
+
 ## Getting Started
 
 ### Prerequisites

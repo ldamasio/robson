@@ -8,6 +8,12 @@ Robson is concerned with what happens **after** a trading decision is made: how 
 
 The system provides a multi-tenant runtime with deterministic execution semantics, explicit risk controls, full auditability, and a clear separation between signal interpretation and order execution.
 
+## AI-First Repository Rules
+
+Canonical AI-first repository instructions live in [AGENTS.md](AGENTS.md).
+
+Vendor-specific files such as [CLAUDE.md](CLAUDE.md) are compatibility adapters and should remain thin.
+
 ## Why Robson Exists
 
 Most open-source trading systems conflate signal generation with execution. The result is software where risk management is an afterthought bolted onto an indicator library.
