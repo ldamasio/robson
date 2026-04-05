@@ -70,6 +70,10 @@ pub enum DaemonError {
     #[error("Approval expired for query: {0}")]
     ApprovalExpired(Uuid),
 
+    /// Approval was requested, but current risk no longer allows execution
+    #[error("Approval denied for query {query_id}: {reason}")]
+    ApprovalDenied { query_id: Uuid, reason: String },
+
     /// Monitor error
     #[error("Monitor error: {0}")]
     Monitor(#[from] MonitorError),

@@ -350,6 +350,34 @@ impl<R: QueryRecorder> QueryEngine<R> {
         }
     }
 
+    /// Revalidate a pending approval against the current risk context.
+    ///
+    /// Approval is not a risk override. If the portfolio changed while the query
+    /// was waiting for operator confirmation, execution must be denied.
+    pub(crate) fn revalidate_risk(
+        &self,
+        query: &mut ExecutionQuery,
+        proposed: &ProposedTrade,
+        context: &RiskContext,
+    ) -> Result<(), CheckRiskError> {
+        match self.risk_gate.evaluate(proposed, context) {
+            RiskVerdict::Approved => Ok(()),
+            RiskVerdict::Rejected { check, reason } => {
+                tracing::warn!(
+                    query_id = %query.id,
+                    symbol = %proposed.symbol,
+                    side = %proposed.side,
+                    risk_check = %check.name(),
+                    reason = %reason,
+                    "approval revalidation denied — governed rejection, no side effects"
+                );
+                query.deny(reason, check.name().to_string());
+                self.recorder.on_state_change(query);
+                Err(CheckRiskError::Denied)
+            },
+        }
+    }
+
     /// Record an operator authorization transition.
     pub(crate) fn authorize(&self, query: &mut ExecutionQuery) -> Result<(), QueryError> {
         query.authorize()?;
@@ -682,6 +710,23 @@ mod tests {
 
         assert_eq!(query.state, QueryState::Expired);
         assert!(query.finished_at.is_some(), "Expired queries are terminal");
+    }
+
+    #[test]
+    fn test_revalidate_risk_denied_from_awaiting_approval() {
+        let recorder = Arc::new(MockRecorder::new());
+        let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
+
+        let mut query = create_test_query();
+        query.transition(QueryState::Processing).unwrap();
+        query.transition(QueryState::RiskChecked).unwrap();
+        query.await_approval("Manual gate".to_string(), 30).unwrap();
+
+        let result = engine.revalidate_risk(&mut query, &sample_proposed(), &saturated_context());
+
+        assert!(matches!(result, Err(CheckRiskError::Denied)));
+        assert!(matches!(query.state, QueryState::Denied { .. }));
+        assert!(query.finished_at.is_some(), "Denied queries are terminal");
     }
 
     #[test]

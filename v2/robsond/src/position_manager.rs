@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, error, info, warn};
@@ -58,6 +58,7 @@ use crate::query_engine::{
 struct PendingApprovalRecord {
     query: ExecutionQuery,
     position: Position,
+    proposed: ProposedTrade,
     governed: GovernedAction,
 }
 
@@ -77,6 +78,8 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     detectors: Arc<RwLock<HashMap<PositionId, JoinHandle<Option<DetectorSignal>>>>>,
     /// Pending approvals held in runtime memory for Phase 3.
     pending_approvals: Arc<RwLock<HashMap<Uuid, PendingApprovalRecord>>>,
+    /// Serializes entry-governance flows so pending reservations remain coherent.
+    entry_flow_lock: Mutex<()>,
     /// Query engine for lifecycle tracking
     query_engine: Arc<QueryEngine<TracingQueryRecorder>>,
 }
@@ -116,6 +119,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             shutdown_token,
             detectors: Arc::new(RwLock::new(HashMap::new())),
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
+            entry_flow_lock: Mutex::new(()),
             query_engine,
         }
     }
@@ -185,6 +189,55 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
     }
 
+    fn pending_approval_to_summary(record: &PendingApprovalRecord) -> PositionSummary {
+        PositionSummary {
+            position_id: record.position.id,
+            symbol: record.proposed.symbol.clone(),
+            side: record.proposed.side.clone(),
+            notional_value: record.proposed.notional_value,
+            margin_used: record.proposed.margin_required,
+            unrealized_pnl: Decimal::ZERO,
+        }
+    }
+
+    async fn has_pending_approval_for_position(&self, position_id: PositionId) -> bool {
+        let pending = self.pending_approvals.read().await;
+        pending.values().any(|record| record.position.id == position_id)
+    }
+
+    async fn invalidate_pending_approvals_for_position(
+        &self,
+        position_id: PositionId,
+        reason: &str,
+    ) {
+        let invalidated_records = {
+            let mut pending = self.pending_approvals.write().await;
+            let invalidated_ids: Vec<Uuid> = pending
+                .iter()
+                .filter_map(|(query_id, record)| {
+                    (record.position.id == position_id).then_some(*query_id)
+                })
+                .collect();
+
+            invalidated_ids
+                .into_iter()
+                .filter_map(|query_id| pending.remove(&query_id))
+                .collect::<Vec<_>>()
+        };
+
+        for mut record in invalidated_records {
+            let failure_reason = format!("Pending approval invalidated: {}", reason);
+            record.query.fail(failure_reason, "awaiting_approval".to_string());
+            self.query_engine.on_state_change(&record.query);
+            info!(
+                %position_id,
+                query_id = %record.query.id,
+                reason,
+                "Pending approval invalidated"
+            );
+        }
+    }
+
     // =========================================================================
     // Phase 2: Risk context helpers
     // =========================================================================
@@ -209,7 +262,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // For Entering: use expected_entry from state (order price is committed on exchange).
         // For Active: use the recorded fill price (entry_price field).
         // Defensive: skip positions with zero quantity (should not occur in practice).
-        let summaries: Vec<PositionSummary> = active_positions
+        let mut summaries: Vec<PositionSummary> = active_positions
             .iter()
             .filter_map(|p| {
                 let entry_price_decimal = match &p.state {
@@ -234,6 +287,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 })
             })
             .collect();
+
+        let pending_summaries: Vec<PositionSummary> = self
+            .pending_approvals
+            .read()
+            .await
+            .values()
+            .map(Self::pending_approval_to_summary)
+            .collect();
+        summaries.extend(pending_summaries);
 
         Ok(RiskContext::with_positions(
             capital,
@@ -381,6 +443,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         &self,
         query: ExecutionQuery,
         position: Position,
+        proposed: ProposedTrade,
         governed: GovernedAction,
     ) {
         let query_id = query.id;
@@ -392,7 +455,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         {
             let mut pending_approvals = self.pending_approvals.write().await;
-            pending_approvals.insert(query_id, PendingApprovalRecord { query, position, governed });
+            pending_approvals
+                .insert(query_id, PendingApprovalRecord { query, position, proposed, governed });
         }
 
         let pending_approvals = self.pending_approvals.read().await;
@@ -402,6 +466,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         drop(pending_approvals);
 
         self.spawn_approval_expiration_task(query_id, expires_at);
+    }
+
+    pub async fn get_pending_approvals(&self) -> Vec<ExecutionQuery> {
+        let pending = self.pending_approvals.read().await;
+        let mut queries: Vec<ExecutionQuery> =
+            pending.values().map(|record| record.query.clone()).collect();
+        queries.sort_by_key(|query| query.started_at);
+        queries
     }
 
     async fn execute_signal_query(
@@ -718,6 +790,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     ///
     /// Only positions in Armed state can be disarmed.
     pub async fn disarm_position(&self, position_id: PositionId) -> DaemonResult<()> {
+        let _entry_flow_guard = self.entry_flow_lock.lock().await;
+
         // Create query for lifecycle tracking
         let mut query =
             ExecutionQuery::new(QueryKind::DisarmPosition { position_id }, Self::operator_actor());
@@ -759,6 +833,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
 
         info!(%position_id, query_id = %query.id, "Disarming position");
+
+        self.invalidate_pending_approvals_for_position(position_id, "position disarmed")
+            .await;
 
         // Kill detector task if exists
         self.kill_detector(position_id).await;
@@ -811,6 +888,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     ///
     /// Flow: Engine → Execute actions (emit events) → Save state → Process fill
     pub async fn handle_signal(&self, signal: DetectorSignal) -> DaemonResult<()> {
+        let _entry_flow_guard = self.entry_flow_lock.lock().await;
         let position_id = signal.position_id;
 
         // Create query for lifecycle tracking
@@ -859,6 +937,23 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 return Err(e.into());
             },
         };
+
+        if self.has_pending_approval_for_position(position_id).await {
+            if let Err(e) = query.complete(QueryOutcome::NoAction {
+                reason: "Approval already pending for position".to_string(),
+            }) {
+                query.fail(format!("{}", e), "processing".to_string());
+                self.query_engine.on_error(&query, &format!("{}", e));
+                return Err(DaemonError::Config(format!("Query completion error: {}", e)));
+            }
+            self.query_engine.on_state_change(&query);
+            info!(
+                %position_id,
+                query_id = %query.id,
+                "Skipping signal because approval is already pending for position"
+            );
+            return Ok(());
+        }
 
         // Kill detector (it's single-shot)
         self.kill_detector(position_id).await;
@@ -964,7 +1059,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     .as_ref()
                     .map(|approval| approval.expires_at)
                     .expect("awaiting approval query must contain approval metadata");
-                self.store_pending_approval(query, position.clone(), governed).await;
+                self.store_pending_approval(query, position.clone(), proposed, governed).await;
 
                 info!(
                     %position_id,
@@ -985,6 +1080,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
     /// Approve a pending query and resume execution.
     pub async fn approve_query(&self, query_id: Uuid) -> DaemonResult<ExecutionQuery> {
+        let _entry_flow_guard = self.entry_flow_lock.lock().await;
+
         let mut record = {
             let mut pending_approvals = self.pending_approvals.write().await;
             pending_approvals
@@ -1015,6 +1112,67 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             )
             .await;
             return Err(DaemonError::ApprovalExpired(query_id));
+        }
+
+        let current_position = match self.store.positions().find_by_id(record.position.id).await {
+            Ok(Some(position)) => position,
+            Ok(None) => {
+                let err = DaemonError::PositionNotFound(record.position.id);
+                record.query.fail(
+                    format!("Pending approval invalidated: {}", err),
+                    "awaiting_approval".to_string(),
+                );
+                self.query_engine.on_state_change(&record.query);
+                return Err(err);
+            },
+            Err(e) => {
+                let err_str = format!("{}", e);
+                record.query.fail(err_str.clone(), "awaiting_approval".to_string());
+                self.query_engine.on_error(&record.query, &err_str);
+                return Err(e.into());
+            },
+        };
+
+        if !matches!(current_position.state, PositionState::Armed) {
+            let err = DaemonError::InvalidPositionState {
+                expected: "Armed".to_string(),
+                actual: format!("{:?}", current_position.state),
+            };
+            record.query.fail(
+                format!("Pending approval invalidated: {}", err),
+                "awaiting_approval".to_string(),
+            );
+            self.query_engine.on_state_change(&record.query);
+            return Err(err);
+        }
+
+        let risk_context = self.build_risk_context().await?;
+        match self
+            .query_engine
+            .revalidate_risk(&mut record.query, &record.proposed, &risk_context)
+        {
+            Ok(()) => {},
+            Err(CheckRiskError::Denied) => {
+                self.rearm_detector_after_governed_block(
+                    current_position.id,
+                    &current_position,
+                    "approval revalidation denied",
+                )
+                .await;
+
+                let reason = match &record.query.state {
+                    QueryState::Denied { reason, .. } => reason.clone(),
+                    _ => "Approval denied after risk revalidation".to_string(),
+                };
+
+                return Err(DaemonError::ApprovalDenied { query_id, reason });
+            },
+            Err(CheckRiskError::InvalidState(e)) => {
+                let err_str = format!("Approval revalidation lifecycle error: {}", e);
+                record.query.fail(err_str.clone(), "awaiting_approval".to_string());
+                self.query_engine.on_error(&record.query, &err_str);
+                return Err(DaemonError::Config(err_str));
+            },
         }
 
         if let Err(e) = self.query_engine.authorize(&mut record.query) {
@@ -1587,6 +1745,41 @@ mod tests {
         RiskConfig::new(dec!(10000), dec!(1)).unwrap() // 1% risk
     }
 
+    async fn save_active_position(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        symbol: &str,
+        side: Side,
+        entry_price: Decimal,
+        quantity: Decimal,
+    ) -> Position {
+        let account_id = Uuid::now_v7();
+        let symbol = Symbol::from_pair(symbol).unwrap();
+        let entry_price = Price::new(entry_price).unwrap();
+        let trailing_stop = match side {
+            Side::Long => Price::new(entry_price.as_decimal() - dec!(10)).unwrap(),
+            Side::Short => Price::new(entry_price.as_decimal() + dec!(10)).unwrap(),
+        };
+        let quantity = Quantity::new(quantity).unwrap();
+        let now = chrono::Utc::now();
+
+        let mut position = Position::new(account_id, symbol, side);
+        position.entry_price = Some(entry_price);
+        position.entry_filled_at = Some(now);
+        position.quantity = quantity;
+        position.state = PositionState::Active {
+            current_price: entry_price,
+            trailing_stop,
+            favorable_extreme: entry_price,
+            extreme_at: now,
+            insurance_stop_id: None,
+            last_emitted_stop: None,
+        };
+        position.updated_at = now;
+
+        manager.store.positions().save(&position).await.unwrap();
+        position
+    }
+
     #[tokio::test]
     async fn test_arm_position() {
         let manager = create_test_manager().await;
@@ -1972,6 +2165,119 @@ mod tests {
             matches!(updated.state, PositionState::Active { .. }),
             "Expected Active after approval execution, got {:?}",
             updated.state
+        );
+    }
+
+    #[tokio::test]
+    async fn test_disarm_invalidates_pending_approval() {
+        let manager = create_phase3_test_manager(300).await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(90)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        let position = manager
+            .arm_position(
+                symbol.clone(),
+                Side::Long,
+                create_test_risk_config(),
+                tech_stop,
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol,
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(85500)).unwrap(),
+            timestamp: chrono::Utc::now(),
+        };
+
+        manager.handle_signal(signal).await.unwrap();
+
+        let query_id = {
+            let pending = manager.pending_approvals.read().await;
+            *pending.keys().next().expect("pending approval query must exist")
+        };
+
+        manager.disarm_position(position.id).await.unwrap();
+
+        assert!(manager.pending_approvals.read().await.is_empty());
+        let updated = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(
+            matches!(updated.state, PositionState::Closed { .. }),
+            "Expected Closed after disarm, got {:?}",
+            updated.state
+        );
+
+        let approval_result = manager.approve_query(query_id).await;
+        assert!(matches!(approval_result, Err(DaemonError::QueryNotFound(id)) if id == query_id));
+    }
+
+    #[tokio::test]
+    async fn test_approve_query_denied_when_risk_context_changes() {
+        let manager = create_phase3_test_manager(300).await;
+        save_active_position(&manager, "ETHUSDT", Side::Long, dec!(100), dec!(5)).await;
+        save_active_position(&manager, "SOLUSDT", Side::Long, dec!(100), dec!(5)).await;
+
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(90)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        let position = manager
+            .arm_position(
+                symbol.clone(),
+                Side::Long,
+                create_test_risk_config(),
+                tech_stop,
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol,
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(85500)).unwrap(),
+            timestamp: chrono::Utc::now(),
+        };
+
+        manager.handle_signal(signal).await.unwrap();
+
+        let query_id = {
+            let pending = manager.pending_approvals.read().await;
+            *pending.keys().next().expect("pending approval query must exist")
+        };
+
+        save_active_position(&manager, "BNBUSDT", Side::Long, dec!(100), dec!(5)).await;
+
+        let approval_result = manager.approve_query(query_id).await;
+        assert!(matches!(
+            approval_result,
+            Err(DaemonError::ApprovalDenied { query_id: denied_query_id, .. })
+            if denied_query_id == query_id
+        ));
+        assert!(manager.pending_approvals.read().await.is_empty());
+
+        let updated = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(
+            matches!(updated.state, PositionState::Armed),
+            "Expected Armed after approval denial, got {:?}",
+            updated.state
+        );
+
+        let detectors = manager.detectors.read().await;
+        assert!(
+            detectors.contains_key(&position.id),
+            "Detector must be re-armed after approval denial"
         );
     }
 

@@ -83,14 +83,15 @@ pub struct ReadinessChecks {
 ///
 /// `active_positions` is a historical field name. It currently counts open core
 /// positions returned by `/status` (Armed, Entering, Active, Exiting).
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct StatusResponse {
     pub active_positions: usize,
     pub positions: Vec<PositionSummary>,
+    pub pending_approvals: Vec<PendingApprovalSummary>,
 }
 
 /// Summary of a position.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PositionSummary {
     pub id: Uuid,
     pub symbol: String,
@@ -102,6 +103,16 @@ pub struct PositionSummary {
     pub trailing_stop: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pnl: Option<Decimal>,
+}
+
+/// Summary of a pending approval query for REST bootstrap.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct PendingApprovalSummary {
+    pub query_id: Uuid,
+    pub position_id: Option<Uuid>,
+    pub state: String,
+    pub reason: String,
+    pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Request to arm a new position.
@@ -408,12 +419,27 @@ where
 {
     let manager = state.position_manager.read().await;
     let positions = manager.get_open_positions().await.map_err(|e| to_error_response(e))?;
+    let pending_approvals = manager.get_pending_approvals().await;
 
     let summaries: Vec<PositionSummary> = positions.iter().map(position_to_summary).collect();
+    let pending_summaries: Vec<PendingApprovalSummary> = pending_approvals
+        .into_iter()
+        .filter_map(|query| {
+            let approval = query.approval?;
+            Some(PendingApprovalSummary {
+                query_id: query.id,
+                position_id: query.position_id,
+                state: format!("{:?}", query.state),
+                reason: approval.reason,
+                expires_at: approval.expires_at,
+            })
+        })
+        .collect();
 
     Ok(Json(StatusResponse {
         active_positions: summaries.len(),
         positions: summaries,
+        pending_approvals: pending_summaries,
     }))
 }
 
@@ -707,6 +733,7 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
         DaemonError::QueryNotFound(_) => StatusCode::NOT_FOUND,
         DaemonError::InvalidPositionState { .. } => StatusCode::CONFLICT,
         DaemonError::ApprovalExpired(_) => StatusCode::GONE,
+        DaemonError::ApprovalDenied { .. } => StatusCode::CONFLICT,
         DaemonError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::BAD_REQUEST,
     };
@@ -1000,6 +1027,66 @@ mod tests {
         assert!(frame_text.contains("event: system.resync_required"));
         assert!(frame_text.contains("\"event_type\":\"system.resync_required\""));
         assert!(frame_text.contains("\"reason\":\"lagged\""));
+    }
+
+    #[tokio::test]
+    async fn test_status_endpoint_includes_pending_approvals_for_bootstrap() {
+        let (app, _event_bus, position_manager) = create_test_app_with_event_bus(100).await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(90)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        let position = {
+            let manager = position_manager.write().await;
+            manager
+                .arm_position(
+                    symbol.clone(),
+                    Side::Long,
+                    RiskConfig::new(dec!(10000), dec!(1)).unwrap(),
+                    tech_stop,
+                    Uuid::now_v7(),
+                )
+                .await
+                .unwrap()
+        };
+
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol,
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(85500)).unwrap(),
+            timestamp: chrono::Utc::now(),
+        };
+
+        let query_id = {
+            let manager = position_manager.write().await;
+            manager.handle_signal(signal).await.unwrap();
+            manager
+                .get_pending_approvals()
+                .await
+                .into_iter()
+                .next()
+                .expect("pending approval must exist")
+                .id
+        };
+
+        let response = app
+            .oneshot(Request::builder().uri("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let status: StatusResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status.active_positions, 1);
+        assert_eq!(status.pending_approvals.len(), 1);
+        assert_eq!(status.pending_approvals[0].query_id, query_id);
+        assert_eq!(status.pending_approvals[0].position_id, Some(position.id));
+        assert_eq!(status.pending_approvals[0].state, "AwaitingApproval");
     }
 
     #[tokio::test]

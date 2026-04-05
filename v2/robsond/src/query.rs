@@ -106,9 +106,9 @@ pub enum QueryKind {
 /// Phase 3:
 /// ```text
 ///   Accepted -> Processing -> RiskChecked -> AwaitingApproval -> Authorized -> Acting -> Completed
-///                  |              |                |                                |
-///                  v              v                v                                v
-///               Failed         Denied          Expired                           Failed
+///                  |              |                |               |                |
+///                  v              v                v               v                v
+///               Failed         Denied       Expired|Denied      Denied            Failed
 /// ```
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum QueryState {
@@ -378,6 +378,9 @@ impl ExecutionQuery {
             // AwaitingApproval -> Expired (approval TTL elapsed)
             (QueryState::AwaitingApproval, QueryState::Expired) => Ok(()),
 
+            // AwaitingApproval -> Denied (risk no longer allows execution)
+            (QueryState::AwaitingApproval, QueryState::Denied { .. }) => Ok(()),
+
             // Authorized -> Acting
             (QueryState::Authorized, QueryState::Acting) => Ok(()),
 
@@ -455,7 +458,7 @@ impl ExecutionQuery {
     ///
     /// Sets `outcome = Some(QueryOutcome::Denied)` for audit and projections.
     /// `check` identifies which governance rule triggered the denial (e.g. "max_open_positions").
-    /// Query must be in `RiskChecked` state before calling this.
+    /// Query must be in `RiskChecked` or `AwaitingApproval` state before calling this.
     pub fn deny(&mut self, reason: String, check: String) {
         // Set outcome BEFORE transition so it is recorded even if transition is already terminal
         self.outcome = Some(QueryOutcome::Denied { reason: reason.clone() });
@@ -777,6 +780,20 @@ mod tests {
 
         assert_eq!(query.state, QueryState::Expired);
         assert!(query.finished_at.is_some(), "Expired is terminal");
+    }
+
+    #[test]
+    fn test_awaiting_approval_to_denied_is_terminal() {
+        let mut query = create_test_query();
+
+        query.transition(QueryState::Processing).unwrap();
+        query.transition(QueryState::RiskChecked).unwrap();
+        query.await_approval("Manual gate".to_string(), 60).unwrap();
+        query.deny("Risk context changed".to_string(), "max_open_positions".to_string());
+
+        assert!(matches!(query.state, QueryState::Denied { .. }));
+        assert!(matches!(query.outcome, Some(QueryOutcome::Denied { .. })));
+        assert!(query.finished_at.is_some(), "Denied is terminal");
     }
 
     #[test]
