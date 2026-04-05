@@ -24,8 +24,18 @@
 //!
 //! Ownership: lives INSIDE robsond crate. Not a separate crate.
 
+use async_trait::async_trait;
+use serde::{Deserialize, Serialize};
+
 use robson_engine::{EngineAction, ProposedTrade, RiskContext, RiskGate, RiskVerdict};
+#[cfg(feature = "postgres")]
+use robson_eventlog::{
+    ActorType, Event, EventLogError, QUERY_STATE_CHANGED_EVENT_TYPE, append_event,
+};
 use rust_decimal::Decimal;
+#[cfg(feature = "postgres")]
+use sqlx::PgPool;
+use uuid::Uuid;
 
 use crate::query::{ApprovalRequirement, ExecutionQuery, QueryError, QueryState};
 
@@ -33,25 +43,135 @@ use crate::query::{ApprovalRequirement, ExecutionQuery, QueryError, QueryState};
 // QueryRecorder - Audit and Observability
 // =============================================================================
 
-/// Records query lifecycle events for observability and audit.
-/// Phase 1: TracingQueryRecorder (structured logs via tracing crate).
-/// Phase 2+: EventLogQueryRecorder (persists to robson-eventlog).
-pub trait QueryRecorder: Send + Sync {
-    /// Called when a query state changes.
-    fn on_state_change(&self, query: &ExecutionQuery);
+/// Canonical durable payload for query lifecycle persistence.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryStateChangedEvent {
+    pub query_id: Uuid,
+    pub position_id: Option<Uuid>,
+    pub state: String,
+    pub started_at: chrono::DateTime<chrono::Utc>,
+    pub finished_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub transition_cause: String,
+    pub snapshot: ExecutionQuery,
+}
 
-    /// Called when a query encounters an error.
-    fn on_error(&self, query: &ExecutionQuery, error: &str);
+impl QueryStateChangedEvent {
+    pub fn from_query(query: &ExecutionQuery, transition_cause: &str) -> Self {
+        Self {
+            query_id: query.id,
+            position_id: query.position_id,
+            state: query.state.label().to_string(),
+            started_at: query.started_at,
+            finished_at: query.finished_at,
+            transition_cause: transition_cause.to_string(),
+            snapshot: query.clone(),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum QueryRecorderError {
+    #[error("Serialization error: {0}")]
+    Serialization(#[from] serde_json::Error),
+
+    #[cfg(feature = "postgres")]
+    #[error("Event log error: {0}")]
+    EventLog(#[from] EventLogError),
+}
+
+fn trace_query_transition(query: &ExecutionQuery, transition_cause: &str) {
+    let duration_ms = query.duration().map(|d| d.num_milliseconds());
+
+    match &query.state {
+        QueryState::Failed { reason, phase } => {
+            tracing::error!(
+                query_id = %query.id,
+                kind = ?query.kind,
+                state = %query.state.label(),
+                actor = ?query.actor,
+                position_id = ?query.position_id,
+                active_positions_count = ?query.context_summary.as_ref().map(|c| c.active_positions_count),
+                duration_ms = ?duration_ms,
+                transition_cause = %transition_cause,
+                reason = %reason,
+                phase = %phase,
+                "query state transition"
+            );
+        },
+        QueryState::Denied { reason, check } => {
+            tracing::warn!(
+                query_id = %query.id,
+                kind = ?query.kind,
+                state = %query.state.label(),
+                actor = ?query.actor,
+                position_id = ?query.position_id,
+                active_positions_count = ?query.context_summary.as_ref().map(|c| c.active_positions_count),
+                duration_ms = ?duration_ms,
+                transition_cause = %transition_cause,
+                reason = %reason,
+                check = %check,
+                "query state transition"
+            );
+        },
+        _ => {
+            tracing::info!(
+                query_id = %query.id,
+                kind = ?query.kind,
+                state = %query.state.label(),
+                actor = ?query.actor,
+                position_id = ?query.position_id,
+                active_positions_count = ?query.context_summary.as_ref().map(|c| c.active_positions_count),
+                duration_ms = ?duration_ms,
+                transition_cause = %transition_cause,
+                "query state transition"
+            );
+        },
+    }
+}
+
+#[cfg(feature = "postgres")]
+pub(crate) async fn append_query_state_changed_event(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    stream_key: &str,
+    query: &ExecutionQuery,
+    transition_cause: &str,
+) -> Result<(), QueryRecorderError> {
+    let payload = QueryStateChangedEvent::from_query(query, transition_cause);
+    let event = Event::new(
+        tenant_id,
+        stream_key,
+        QUERY_STATE_CHANGED_EVENT_TYPE,
+        serde_json::to_value(payload)?,
+    )
+    .with_actor(ActorType::Daemon, Some("robsond".to_string()));
+
+    match append_event(pool, stream_key, None, event).await {
+        Ok(_) | Err(EventLogError::IdempotentDuplicate(_)) => Ok(()),
+        Err(err) => Err(QueryRecorderError::EventLog(err)),
+    }
+}
+
+/// Records query lifecycle snapshots for observability and audit.
+#[async_trait]
+pub trait QueryRecorder: Send + Sync {
+    /// Persist or emit the latest query snapshot after a lifecycle transition.
+    async fn record_transition(
+        &self,
+        query: &ExecutionQuery,
+        transition_cause: &str,
+    ) -> Result<(), QueryRecorderError>;
 }
 
 // Blanket implementation for Arc<T>
+#[async_trait]
 impl<T: QueryRecorder + ?Sized> QueryRecorder for std::sync::Arc<T> {
-    fn on_state_change(&self, query: &ExecutionQuery) {
-        (**self).on_state_change(query);
-    }
-
-    fn on_error(&self, query: &ExecutionQuery, error: &str) {
-        (**self).on_error(query, error);
+    async fn record_transition(
+        &self,
+        query: &ExecutionQuery,
+        transition_cause: &str,
+    ) -> Result<(), QueryRecorderError> {
+        (**self).record_transition(query, transition_cause).await
     }
 }
 
@@ -63,29 +183,53 @@ impl<T: QueryRecorder + ?Sized> QueryRecorder for std::sync::Arc<T> {
 /// Zero persistence overhead. Full observability via tracing subscribers.
 pub struct TracingQueryRecorder;
 
+#[async_trait]
 impl QueryRecorder for TracingQueryRecorder {
-    fn on_state_change(&self, query: &ExecutionQuery) {
-        tracing::info!(
-            query_id = %query.id,
-            kind = ?query.kind,
-            state = ?query.state,
-            actor = ?query.actor,
-            position_id = ?query.position_id,
-            active_positions_count = ?query.context_summary.as_ref().map(|c| c.active_positions_count),
-            duration_ms = ?query.duration().map(|d| d.num_milliseconds()),
-            "query state transition"
-        );
+    async fn record_transition(
+        &self,
+        query: &ExecutionQuery,
+        transition_cause: &str,
+    ) -> Result<(), QueryRecorderError> {
+        trace_query_transition(query, transition_cause);
+        Ok(())
     }
+}
 
-    fn on_error(&self, query: &ExecutionQuery, error: &str) {
-        tracing::error!(
-            query_id = %query.id,
-            kind = ?query.kind,
-            state = ?query.state,
-            active_positions_count = ?query.context_summary.as_ref().map(|c| c.active_positions_count),
-            error = %error,
-            "query engine error"
-        );
+#[cfg(feature = "postgres")]
+pub struct EventLogQueryRecorder {
+    pool: PgPool,
+    tenant_id: Uuid,
+    stream_key: String,
+}
+
+#[cfg(feature = "postgres")]
+impl EventLogQueryRecorder {
+    pub fn new(pool: PgPool, tenant_id: Uuid, stream_key: impl Into<String>) -> Self {
+        Self {
+            pool,
+            tenant_id,
+            stream_key: stream_key.into(),
+        }
+    }
+}
+
+#[cfg(feature = "postgres")]
+#[async_trait]
+impl QueryRecorder for EventLogQueryRecorder {
+    async fn record_transition(
+        &self,
+        query: &ExecutionQuery,
+        transition_cause: &str,
+    ) -> Result<(), QueryRecorderError> {
+        trace_query_transition(query, transition_cause);
+        append_query_state_changed_event(
+            &self.pool,
+            self.tenant_id,
+            &self.stream_key,
+            query,
+            transition_cause,
+        )
+        .await
     }
 }
 
@@ -218,6 +362,17 @@ pub(crate) enum CheckRiskError {
     /// Query state machine is inconsistent — cannot transition to RiskChecked.
     /// This is an operational error, not a governance decision.
     InvalidState(QueryError),
+    /// Query snapshot could not be persisted after a lifecycle transition.
+    Audit(QueryRecorderError),
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum QueryTransitionError {
+    #[error("Invalid query transition: {0}")]
+    InvalidState(#[from] QueryError),
+
+    #[error("Query audit error: {0}")]
+    Audit(#[from] QueryRecorderError),
 }
 
 // =============================================================================
@@ -251,18 +406,17 @@ impl<R: QueryRecorder> QueryEngine<R> {
     }
 
     /// Record that a query has been accepted.
-    pub fn on_accepted(&self, query: &ExecutionQuery) {
-        self.recorder.on_state_change(query);
+    pub async fn on_accepted(&self, query: &ExecutionQuery) -> Result<(), QueryRecorderError> {
+        self.recorder.record_transition(query, "accepted").await
     }
 
     /// Record a state transition.
-    pub fn on_state_change(&self, query: &ExecutionQuery) {
-        self.recorder.on_state_change(query);
-    }
-
-    /// Record an error. Caller is responsible for calling query.fail() first.
-    pub fn on_error(&self, query: &ExecutionQuery, error: &str) {
-        self.recorder.on_error(query, error);
+    pub async fn on_state_change(
+        &self,
+        query: &ExecutionQuery,
+        transition_cause: &str,
+    ) -> Result<(), QueryRecorderError> {
+        self.recorder.record_transition(query, transition_cause).await
     }
 
     /// Phase 2: Evaluate risk and return a governed proof token.
@@ -280,7 +434,7 @@ impl<R: QueryRecorder> QueryEngine<R> {
     ///
     /// `actions` are consumed here — there is no path to the Executor without
     /// passing through this check.
-    pub(crate) fn check_risk(
+    pub(crate) async fn check_risk(
         &self,
         query: &mut ExecutionQuery,
         proposed: &ProposedTrade,
@@ -300,7 +454,9 @@ impl<R: QueryRecorder> QueryEngine<R> {
             );
             return Err(CheckRiskError::InvalidState(e));
         }
-        self.recorder.on_state_change(query);
+        if let Err(err) = self.recorder.record_transition(query, "risk_checked").await {
+            return Err(CheckRiskError::Audit(err));
+        }
 
         let verdict = self.risk_gate.evaluate(proposed, context);
 
@@ -325,7 +481,9 @@ impl<R: QueryRecorder> QueryEngine<R> {
                     "risk check denied — governed rejection, no side effects"
                 );
                 query.deny(reason, check.name().to_string());
-                self.recorder.on_state_change(query);
+                if let Err(err) = self.recorder.record_transition(query, "risk_denied").await {
+                    return Err(CheckRiskError::Audit(err));
+                }
                 Err(CheckRiskError::Denied)
             },
         }
@@ -333,18 +491,18 @@ impl<R: QueryRecorder> QueryEngine<R> {
 
     /// Phase 3: decide whether an already risk-approved query requires
     /// operator approval before execution.
-    pub(crate) fn check_approval(
+    pub(crate) async fn check_approval(
         &self,
         query: &mut ExecutionQuery,
         proposed: &ProposedTrade,
         context: &RiskContext,
         governed: GovernedAction,
-    ) -> Result<ApprovalCheckResult, QueryError> {
+    ) -> Result<ApprovalCheckResult, QueryTransitionError> {
         match self.approval_policy.requirement_for(governed.actions(), proposed, context) {
             ApprovalRequirement::NotRequired => Ok(ApprovalCheckResult::Ready(governed)),
             ApprovalRequirement::Required { reason, ttl_seconds } => {
                 query.await_approval(reason, ttl_seconds)?;
-                self.recorder.on_state_change(query);
+                self.recorder.record_transition(query, "awaiting_approval").await?;
                 Ok(ApprovalCheckResult::AwaitingApproval(governed))
             },
         }
@@ -354,7 +512,7 @@ impl<R: QueryRecorder> QueryEngine<R> {
     ///
     /// Approval is not a risk override. If the portfolio changed while the query
     /// was waiting for operator confirmation, execution must be denied.
-    pub(crate) fn revalidate_risk(
+    pub(crate) async fn revalidate_risk(
         &self,
         query: &mut ExecutionQuery,
         proposed: &ProposedTrade,
@@ -372,23 +530,32 @@ impl<R: QueryRecorder> QueryEngine<R> {
                     "approval revalidation denied — governed rejection, no side effects"
                 );
                 query.deny(reason, check.name().to_string());
-                self.recorder.on_state_change(query);
+                if let Err(err) = self.recorder.record_transition(query, "risk_denied").await {
+                    return Err(CheckRiskError::Audit(err));
+                }
                 Err(CheckRiskError::Denied)
             },
         }
     }
 
     /// Record an operator authorization transition.
-    pub(crate) fn authorize(&self, query: &mut ExecutionQuery) -> Result<(), QueryError> {
+    pub(crate) async fn authorize(
+        &self,
+        query: &mut ExecutionQuery,
+    ) -> Result<(), QueryTransitionError> {
         query.authorize()?;
-        self.recorder.on_state_change(query);
+        self.recorder.record_transition(query, "authorized").await?;
         Ok(())
     }
 
     /// Record approval expiration.
-    pub(crate) fn expire(&self, query: &mut ExecutionQuery) -> Result<(), QueryError> {
+    pub(crate) async fn expire(
+        &self,
+        query: &mut ExecutionQuery,
+        transition_cause: &str,
+    ) -> Result<(), QueryTransitionError> {
         query.expire_approval()?;
-        self.recorder.on_state_change(query);
+        self.recorder.record_transition(query, transition_cause).await?;
         Ok(())
     }
 }
@@ -410,34 +577,28 @@ mod tests {
 
     /// Mock recorder that counts calls
     struct MockRecorder {
-        state_change_count: AtomicUsize,
-        error_count: AtomicUsize,
+        transition_count: AtomicUsize,
     }
 
     impl MockRecorder {
         fn new() -> Self {
-            Self {
-                state_change_count: AtomicUsize::new(0),
-                error_count: AtomicUsize::new(0),
-            }
+            Self { transition_count: AtomicUsize::new(0) }
         }
 
-        fn state_change_count(&self) -> usize {
-            self.state_change_count.load(Ordering::SeqCst)
-        }
-
-        fn error_count(&self) -> usize {
-            self.error_count.load(Ordering::SeqCst)
+        fn transition_count(&self) -> usize {
+            self.transition_count.load(Ordering::SeqCst)
         }
     }
 
+    #[async_trait]
     impl QueryRecorder for MockRecorder {
-        fn on_state_change(&self, _query: &ExecutionQuery) {
-            self.state_change_count.fetch_add(1, Ordering::SeqCst);
-        }
-
-        fn on_error(&self, _query: &ExecutionQuery, _error: &str) {
-            self.error_count.fetch_add(1, Ordering::SeqCst);
+        async fn record_transition(
+            &self,
+            _query: &ExecutionQuery,
+            _transition_cause: &str,
+        ) -> Result<(), QueryRecorderError> {
+            self.transition_count.fetch_add(1, Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -454,28 +615,27 @@ mod tests {
         )
     }
 
-    #[test]
-    fn test_query_engine_delegates_to_recorder() {
+    #[tokio::test]
+    async fn test_query_engine_delegates_to_recorder() {
         let recorder = Arc::new(MockRecorder::new());
         let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
 
-        let query = create_test_query();
+        let mut query = create_test_query();
 
-        // on_accepted should call on_state_change
-        engine.on_accepted(&query);
-        assert_eq!(recorder.state_change_count(), 1);
+        engine.on_accepted(&query).await.unwrap();
+        assert_eq!(recorder.transition_count(), 1);
 
-        // on_state_change should call on_state_change
-        engine.on_state_change(&query);
-        assert_eq!(recorder.state_change_count(), 2);
+        query.transition(QueryState::Processing).unwrap();
+        engine.on_state_change(&query, "processing").await.unwrap();
+        assert_eq!(recorder.transition_count(), 2);
 
-        // on_error should call on_error
-        engine.on_error(&query, "test error");
-        assert_eq!(recorder.error_count(), 1);
+        query.fail("test error".to_string(), "processing".to_string());
+        engine.on_state_change(&query, "failed").await.unwrap();
+        assert_eq!(recorder.transition_count(), 3);
     }
 
-    #[test]
-    fn test_tracing_recorder() {
+    #[tokio::test]
+    async fn test_tracing_recorder() {
         // This test just ensures TracingQueryRecorder compiles and can be created
         let recorder = TracingQueryRecorder;
         let engine = QueryEngine::new(recorder, RiskGate::new());
@@ -483,65 +643,62 @@ mod tests {
         let mut query = create_test_query();
 
         // These should not panic
-        engine.on_accepted(&query);
+        engine.on_accepted(&query).await.unwrap();
 
         query.transition(QueryState::Processing).unwrap();
-        engine.on_state_change(&query);
+        engine.on_state_change(&query, "processing").await.unwrap();
 
         query.fail("Test error".to_string(), "processing".to_string());
-        engine.on_error(&query, "Test error");
+        engine.on_state_change(&query, "failed").await.unwrap();
     }
 
-    #[test]
-    fn test_full_lifecycle_with_mock_recorder() {
+    #[tokio::test]
+    async fn test_full_lifecycle_with_mock_recorder() {
         let recorder = Arc::new(MockRecorder::new());
         let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
 
         let mut query = create_test_query();
 
         // Accepted
-        engine.on_accepted(&query);
-        assert_eq!(recorder.state_change_count(), 1);
+        engine.on_accepted(&query).await.unwrap();
+        assert_eq!(recorder.transition_count(), 1);
 
         // Processing
         query.transition(QueryState::Processing).unwrap();
-        engine.on_state_change(&query);
-        assert_eq!(recorder.state_change_count(), 2);
+        engine.on_state_change(&query, "processing").await.unwrap();
+        assert_eq!(recorder.transition_count(), 2);
 
         // Acting
         query.transition(QueryState::Acting).unwrap();
-        engine.on_state_change(&query);
-        assert_eq!(recorder.state_change_count(), 3);
+        engine.on_state_change(&query, "acting").await.unwrap();
+        assert_eq!(recorder.transition_count(), 3);
 
         // Completed
         query.complete(QueryOutcome::ActionsExecuted { actions_count: 2 }).unwrap();
-        engine.on_state_change(&query);
-        assert_eq!(recorder.state_change_count(), 4);
-
-        // No errors
-        assert_eq!(recorder.error_count(), 0);
+        engine.on_state_change(&query, "completed").await.unwrap();
+        assert_eq!(recorder.transition_count(), 4);
     }
 
-    #[test]
-    fn test_error_lifecycle_with_mock_recorder() {
+    #[tokio::test]
+    async fn test_error_lifecycle_with_mock_recorder() {
         let recorder = Arc::new(MockRecorder::new());
         let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
 
         let mut query = create_test_query();
 
         // Accepted
-        engine.on_accepted(&query);
-        assert_eq!(recorder.state_change_count(), 1);
+        engine.on_accepted(&query).await.unwrap();
+        assert_eq!(recorder.transition_count(), 1);
 
         // Processing
         query.transition(QueryState::Processing).unwrap();
-        engine.on_state_change(&query);
-        assert_eq!(recorder.state_change_count(), 2);
+        engine.on_state_change(&query, "processing").await.unwrap();
+        assert_eq!(recorder.transition_count(), 2);
 
         // Failed
         query.fail("Engine error".to_string(), "processing".to_string());
-        engine.on_error(&query, "Engine error");
-        assert_eq!(recorder.error_count(), 1);
+        engine.on_state_change(&query, "failed").await.unwrap();
+        assert_eq!(recorder.transition_count(), 3);
     }
 
     #[test]
@@ -600,8 +757,8 @@ mod tests {
         }]
     }
 
-    #[test]
-    fn test_check_risk_approved_returns_governed_action() {
+    #[tokio::test]
+    async fn test_check_risk_approved_returns_governed_action() {
         let recorder = Arc::new(MockRecorder::new());
         let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
 
@@ -609,16 +766,17 @@ mod tests {
         query.transition(QueryState::Processing).unwrap();
 
         let actions = dummy_actions();
-        let result = engine.check_risk(&mut query, &sample_proposed(), &empty_context(), actions);
+        let result = engine
+            .check_risk(&mut query, &sample_proposed(), &empty_context(), actions)
+            .await;
 
         assert!(result.is_ok(), "Expected Ok(GovernedAction) for approved trade");
         assert_eq!(query.state, QueryState::RiskChecked);
-        // state_change recorded for Accepted (from create_test_query) + RiskChecked transition
-        assert!(recorder.state_change_count() >= 1);
+        assert_eq!(recorder.transition_count(), 1);
     }
 
-    #[test]
-    fn test_check_approval_not_required_returns_ready() {
+    #[tokio::test]
+    async fn test_check_approval_not_required_returns_ready() {
         let recorder = Arc::new(MockRecorder::new());
         let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
 
@@ -636,18 +794,20 @@ mod tests {
 
         let governed = engine
             .check_risk(&mut query, &no_approval_proposed, &empty_context(), dummy_actions())
+            .await
             .expect("risk should approve");
 
-        let result =
-            engine.check_approval(&mut query, &no_approval_proposed, &empty_context(), governed);
+        let result = engine
+            .check_approval(&mut query, &no_approval_proposed, &empty_context(), governed)
+            .await;
 
         assert!(matches!(result, Ok(ApprovalCheckResult::Ready(_))));
         assert_eq!(query.state, QueryState::RiskChecked);
         assert!(query.approval.is_none(), "No approval metadata should be attached");
     }
 
-    #[test]
-    fn test_check_approval_required_moves_to_awaiting_approval() {
+    #[tokio::test]
+    async fn test_check_approval_required_moves_to_awaiting_approval() {
         let recorder = Arc::new(MockRecorder::new());
         let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
 
@@ -665,20 +825,23 @@ mod tests {
 
         let governed = engine
             .check_risk(&mut query, &approval_proposed, &empty_context(), dummy_actions())
+            .await
             .expect("risk should approve");
 
-        let result =
-            engine.check_approval(&mut query, &approval_proposed, &empty_context(), governed);
+        let result = engine
+            .check_approval(&mut query, &approval_proposed, &empty_context(), governed)
+            .await;
 
         assert!(matches!(result, Ok(ApprovalCheckResult::AwaitingApproval(_))));
         assert_eq!(query.state, QueryState::AwaitingApproval);
         let approval = query.approval.as_ref().expect("approval metadata must be present");
         assert_eq!(approval.ttl_seconds, 300);
         assert!(approval.reason.contains("approval threshold"));
+        assert_eq!(recorder.transition_count(), 2);
     }
 
-    #[test]
-    fn test_authorize_transitions_query_to_authorized() {
+    #[tokio::test]
+    async fn test_authorize_transitions_query_to_authorized() {
         let recorder = Arc::new(MockRecorder::new());
         let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
 
@@ -687,7 +850,7 @@ mod tests {
         query.transition(QueryState::RiskChecked).unwrap();
         query.await_approval("Manual gate".to_string(), 30).unwrap();
 
-        engine.authorize(&mut query).unwrap();
+        engine.authorize(&mut query).await.unwrap();
 
         assert_eq!(query.state, QueryState::Authorized);
         assert!(
@@ -696,8 +859,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_expire_transitions_query_to_expired() {
+    #[tokio::test]
+    async fn test_expire_transitions_query_to_expired() {
         let recorder = Arc::new(MockRecorder::new());
         let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
 
@@ -706,14 +869,14 @@ mod tests {
         query.transition(QueryState::RiskChecked).unwrap();
         query.await_approval("Manual gate".to_string(), 30).unwrap();
 
-        engine.expire(&mut query).unwrap();
+        engine.expire(&mut query, "expired").await.unwrap();
 
         assert_eq!(query.state, QueryState::Expired);
         assert!(query.finished_at.is_some(), "Expired queries are terminal");
     }
 
-    #[test]
-    fn test_revalidate_risk_denied_from_awaiting_approval() {
+    #[tokio::test]
+    async fn test_revalidate_risk_denied_from_awaiting_approval() {
         let recorder = Arc::new(MockRecorder::new());
         let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
 
@@ -722,27 +885,26 @@ mod tests {
         query.transition(QueryState::RiskChecked).unwrap();
         query.await_approval("Manual gate".to_string(), 30).unwrap();
 
-        let result = engine.revalidate_risk(&mut query, &sample_proposed(), &saturated_context());
+        let result = engine
+            .revalidate_risk(&mut query, &sample_proposed(), &saturated_context())
+            .await;
 
         assert!(matches!(result, Err(CheckRiskError::Denied)));
         assert!(matches!(query.state, QueryState::Denied { .. }));
         assert!(query.finished_at.is_some(), "Denied queries are terminal");
     }
 
-    #[test]
-    fn test_check_risk_denied_transitions_to_denied_state() {
+    #[tokio::test]
+    async fn test_check_risk_denied_transitions_to_denied_state() {
         let recorder = Arc::new(MockRecorder::new());
         let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
 
         let mut query = create_test_query();
         query.transition(QueryState::Processing).unwrap();
 
-        let result = engine.check_risk(
-            &mut query,
-            &sample_proposed(),
-            &saturated_context(),
-            dummy_actions(),
-        );
+        let result = engine
+            .check_risk(&mut query, &sample_proposed(), &saturated_context(), dummy_actions())
+            .await;
 
         assert!(result.is_err(), "Expected Err(CheckRiskError::Denied) for saturated portfolio");
         assert!(
@@ -752,28 +914,29 @@ mod tests {
         assert!(query.finished_at.is_some(), "Denied is a terminal state");
     }
 
-    #[test]
-    fn test_check_risk_denied_records_via_recorder() {
+    #[tokio::test]
+    async fn test_check_risk_denied_records_via_recorder() {
         let recorder = Arc::new(MockRecorder::new());
         let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
 
         let mut query = create_test_query();
         query.transition(QueryState::Processing).unwrap();
 
-        let before = recorder.state_change_count();
+        let before = recorder.transition_count();
         engine
             .check_risk(&mut query, &sample_proposed(), &saturated_context(), dummy_actions())
+            .await
             .ok();
 
         // check_risk records: RiskChecked + Denied = 2 additional transitions
         assert!(
-            recorder.state_change_count() >= before + 2,
+            recorder.transition_count() >= before + 2,
             "Expected at least 2 recorded transitions for risk denial"
         );
     }
 
-    #[test]
-    fn test_check_risk_invalid_state_returns_invalid_state_error() {
+    #[tokio::test]
+    async fn test_check_risk_invalid_state_returns_invalid_state_error() {
         // Calling check_risk() from Accepted (not Processing) must fail the
         // Processing → RiskChecked transition and return InvalidState, NOT Denied.
         // This proves that a state machine bug is not silently treated as a
@@ -784,8 +947,9 @@ mod tests {
         // Do NOT transition to Processing — query is still in Accepted state.
         let mut query = create_test_query();
 
-        let result =
-            engine.check_risk(&mut query, &sample_proposed(), &empty_context(), dummy_actions());
+        let result = engine
+            .check_risk(&mut query, &sample_proposed(), &empty_context(), dummy_actions())
+            .await;
 
         assert!(
             matches!(result, Err(CheckRiskError::InvalidState(_))),
@@ -799,8 +963,8 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_governed_action_into_actions_returns_original() {
+    #[tokio::test]
+    async fn test_governed_action_into_actions_returns_original() {
         let recorder = Arc::new(MockRecorder::new());
         let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
 
@@ -812,6 +976,7 @@ mod tests {
 
         let governed = engine
             .check_risk(&mut query, &sample_proposed(), &empty_context(), actions)
+            .await
             .expect("Should approve");
 
         let returned = governed.into_actions();

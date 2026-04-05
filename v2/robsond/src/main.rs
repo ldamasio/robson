@@ -30,6 +30,7 @@
 #[cfg(feature = "postgres")]
 mod db;
 
+#[cfg(feature = "postgres")]
 use std::sync::Arc;
 
 use robsond::{Config, Daemon};

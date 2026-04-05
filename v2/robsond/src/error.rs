@@ -8,6 +8,7 @@ use thiserror::Error;
 use uuid::Uuid;
 
 use crate::position_monitor::MonitorError;
+use crate::query_engine::QueryRecorderError;
 
 /// Daemon-level errors.
 #[derive(Debug, Error)]
@@ -45,6 +46,10 @@ pub enum DaemonError {
     /// Query not found
     #[error("Query not found: {0}")]
     QueryNotFound(Uuid),
+
+    /// Query audit persistence failed
+    #[error("Query audit error: {0}")]
+    QueryAudit(#[from] QueryRecorderError),
 
     /// Position already exists
     #[error("Position already exists: {0}")]

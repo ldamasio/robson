@@ -49,6 +49,11 @@ use crate::position_manager::PositionManager;
 use crate::position_monitor::{
     PositionMonitor, PositionMonitorConfig as RuntimePositionMonitorConfig,
 };
+#[cfg(feature = "postgres")]
+use crate::query::ExecutionQuery;
+#[cfg(feature = "postgres")]
+use crate::query_engine::{EventLogQueryRecorder, append_query_state_changed_event};
+use crate::query_engine::{QueryRecorder, TracingQueryRecorder};
 
 #[cfg(feature = "postgres")]
 use crate::projection_worker::ProjectionWorker;
@@ -56,6 +61,8 @@ use crate::projection_worker::ProjectionWorker;
 // Optional projection recovery for crash recovery
 #[cfg(feature = "postgres")]
 use robson_store::ProjectionRecovery;
+#[cfg(feature = "postgres")]
+use sqlx::Row;
 
 // =============================================================================
 // Daemon
@@ -120,6 +127,10 @@ impl<S: Store + 'static> PositionRepository for StorePositionRepositoryAdapter<S
 }
 
 impl Daemon<StubExchange, MemoryStore> {
+    fn default_query_recorder() -> Arc<dyn QueryRecorder> {
+        Arc::new(TracingQueryRecorder)
+    }
+
     /// Create a new daemon with stub components (for testing/development).
     pub fn new_stub(config: Config) -> Self {
         use robson_domain::RiskConfig;
@@ -129,6 +140,7 @@ impl Daemon<StubExchange, MemoryStore> {
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
         let event_bus = Arc::new(EventBus::new(1000));
+        let query_recorder = Self::default_query_recorder();
         let risk_config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
         let engine = Engine::new(risk_config);
 
@@ -137,6 +149,7 @@ impl Daemon<StubExchange, MemoryStore> {
             executor,
             store.clone(),
             event_bus.clone(),
+            query_recorder,
         )));
 
         Self {
@@ -165,6 +178,16 @@ impl Daemon<StubExchange, MemoryStore> {
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
         let event_bus = Arc::new(EventBus::new(1000));
+        let query_recorder: Arc<dyn QueryRecorder> =
+            if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
+                Arc::new(EventLogQueryRecorder::new(
+                    (**pool).clone(),
+                    tenant_id,
+                    config.projection.stream_key.clone(),
+                ))
+            } else {
+                Self::default_query_recorder()
+            };
         let risk_config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
         let engine = Engine::new(risk_config);
 
@@ -173,6 +196,7 @@ impl Daemon<StubExchange, MemoryStore> {
             executor,
             store.clone(),
             event_bus.clone(),
+            query_recorder,
         )));
 
         Self {
@@ -230,26 +254,30 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         // 0. Rebuild store from event log (crash recovery)
         self.rebuild_store().await?;
 
-        // 1. Restore active positions
+        // 1. Invalidate durable query approvals that cannot be rehydrated safely.
+        #[cfg(feature = "postgres")]
+        self.invalidate_restart_pending_queries().await?;
+
+        // 2. Restore active positions
         self.restore_positions().await?;
 
-        // 2. Initialize safety net monitor (when configured with Binance credentials)
+        // 3. Initialize safety net monitor (when configured with Binance credentials)
         let position_monitor = self.initialize_position_monitor().await?;
         let position_monitor_handle =
             position_monitor.as_ref().map(|monitor| Arc::clone(monitor).start());
 
-        // 3. Start API server
+        // 4. Start API server
         let api_addr = self.start_api_server(position_monitor.clone()).await?;
         info!(%api_addr, "API server started");
 
-        // 3. Spawn WebSocket client (Phase 6: Market Data)
+        // 5. Spawn WebSocket client (Phase 6: Market Data)
         // TODO: Make this configurable (symbols list from config)
         let market_data_manager = MarketDataManager::new(self.event_bus.clone());
         let btcusdt = Symbol::from_pair("BTCUSDT").unwrap();
         let _ws_handle = market_data_manager.spawn_ws_client(btcusdt)?;
         info!("WebSocket client spawned for BTCUSDT");
 
-        // 4. Spawn projection worker (if pg_pool configured)
+        // 6. Spawn projection worker (if pg_pool configured)
         #[cfg(feature = "postgres")]
         let projection_handle = if let (Some(pool), Some(tenant_id)) =
             (&self.pg_pool, self.config.projection.tenant_id)
@@ -277,10 +305,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         #[cfg(not(feature = "postgres"))]
         let projection_handle: Option<tokio::task::JoinHandle<()>> = None;
 
-        // 5. Subscribe to event bus
+        // 7. Subscribe to event bus
         let mut event_receiver = self.event_bus.subscribe();
 
-        // 6. Spawn ctrl+c handler
+        // 8. Spawn ctrl+c handler
         let ctrl_c_shutdown = shutdown.clone();
         tokio::spawn(async move {
             if let Err(_) = tokio::signal::ctrl_c().await {
@@ -290,7 +318,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             ctrl_c_shutdown.cancel();
         });
 
-        // 7. Main event loop
+        // 9. Main event loop
         info!("Entering main event loop");
         loop {
             tokio::select! {
@@ -360,6 +388,71 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         }
 
         info!(count, "Successfully rebuilt store from event log");
+        Ok(())
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn invalidate_restart_pending_queries(&self) -> DaemonResult<()> {
+        let (Some(pool), Some(tenant_id)) = (&self.pg_pool, self.config.projection.tenant_id)
+        else {
+            return Ok(());
+        };
+
+        let rows = sqlx::query(
+            r#"
+            SELECT snapshot
+            FROM queries_current
+            WHERE tenant_id = $1
+              AND stream_key = $2
+              AND state = 'AwaitingApproval'
+            ORDER BY last_seq ASC
+            "#,
+        )
+        .bind(tenant_id)
+        .bind(&self.config.projection.stream_key)
+        .fetch_all(&**pool)
+        .await?;
+
+        if rows.is_empty() {
+            return Ok(());
+        }
+
+        let mut invalidated = 0usize;
+        for row in rows {
+            let snapshot: serde_json::Value = row.try_get("snapshot")?;
+            let mut query: ExecutionQuery = serde_json::from_value(snapshot).map_err(|error| {
+                DaemonError::Config(format!(
+                    "Failed to deserialize AwaitingApproval query snapshot during restart: {}",
+                    error
+                ))
+            })?;
+
+            if query.state != crate::query::QueryState::AwaitingApproval {
+                continue;
+            }
+
+            query.expire_approval().map_err(|error| {
+                DaemonError::Config(format!(
+                    "Failed to invalidate AwaitingApproval query {} on restart: {}",
+                    query.id, error
+                ))
+            })?;
+
+            append_query_state_changed_event(
+                &**pool,
+                tenant_id,
+                &self.config.projection.stream_key,
+                &query,
+                "restart_invalidated",
+            )
+            .await?;
+            invalidated += 1;
+        }
+
+        if invalidated > 0 {
+            info!(invalidated, "Invalidated persisted AwaitingApproval queries on restart");
+        }
+
         Ok(())
     }
 
@@ -673,6 +766,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(feature = "postgres")]
+    use crate::query::{ActorKind, ExecutionQuery, QueryKind};
+    #[cfg(feature = "postgres")]
+    use crate::query_engine::QueryStateChangedEvent;
+    #[cfg(feature = "postgres")]
+    use chrono::{TimeZone, Utc};
+    #[cfg(feature = "postgres")]
+    use robson_eventlog::{
+        ActorType, Event, QUERY_STATE_CHANGED_EVENT_TYPE, QueryOptions, append_event, query_events,
+    };
+    #[cfg(feature = "postgres")]
+    use robson_projector::apply_event_to_projections;
+    #[cfg(feature = "postgres")]
+    use rust_decimal_macros::dec;
 
     #[tokio::test]
     async fn test_daemon_stub_creation() {
@@ -719,5 +826,128 @@ mod tests {
 
         // Shutdown should complete without errors
         daemon.shutdown().await.unwrap();
+    }
+
+    #[cfg(feature = "postgres")]
+    fn ts(hour: u32, minute: u32, second: u32) -> chrono::DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 4, 5, hour, minute, second).single().unwrap()
+    }
+
+    #[cfg(feature = "postgres")]
+    fn awaiting_approval_query(
+        query_id: uuid::Uuid,
+        position_id: uuid::Uuid,
+        started_at: chrono::DateTime<Utc>,
+    ) -> ExecutionQuery {
+        use robson_domain::{Price, Side, Symbol};
+
+        let mut query = ExecutionQuery::new(
+            QueryKind::ProcessSignal {
+                signal_id: uuid::Uuid::from_u128(0xB1),
+                symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+                side: Side::Long,
+                entry_price: Price::new(dec!(95000)).unwrap(),
+                stop_loss: Price::new(dec!(85500)).unwrap(),
+            },
+            ActorKind::Detector,
+        );
+        query.id = query_id;
+        query.position_id = Some(position_id);
+        query.started_at = started_at;
+        query.transition(crate::query::QueryState::Processing).unwrap();
+        query.transition(crate::query::QueryState::RiskChecked).unwrap();
+        query.await_approval("manual approval".to_string(), 300).unwrap();
+        query.approval.as_mut().unwrap().expires_at = ts(10, 5, 0);
+        query
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn append_query_snapshot(
+        pool: &sqlx::PgPool,
+        tenant_id: uuid::Uuid,
+        stream_key: &str,
+        query: &ExecutionQuery,
+        transition_cause: &str,
+        occurred_at: chrono::DateTime<Utc>,
+    ) {
+        let payload = QueryStateChangedEvent::from_query(query, transition_cause);
+        let mut event = Event::new(
+            tenant_id,
+            stream_key,
+            QUERY_STATE_CHANGED_EVENT_TYPE,
+            serde_json::to_value(payload).unwrap(),
+        )
+        .with_actor(ActorType::Daemon, Some("daemon-restart-test".to_string()));
+        event.occurred_at = occurred_at;
+
+        let event_id = append_event(pool, stream_key, None, event).await.unwrap();
+        let envelope: robson_eventlog::EventEnvelope =
+            sqlx::query_as("SELECT * FROM event_log WHERE event_id = $1")
+                .bind(event_id)
+                .fetch_one(pool)
+                .await
+                .unwrap();
+        apply_event_to_projections(pool, &envelope).await.unwrap();
+    }
+
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn test_restart_invalidates_awaiting_approval_queries(pool: sqlx::PgPool) {
+        let tenant_id = uuid::Uuid::from_u128(0x200);
+        let stream_key = "robson:daemon:phase4:restart";
+        let query_id = uuid::Uuid::from_u128(0x201);
+        let position_id = uuid::Uuid::from_u128(0x202);
+
+        let awaiting_query = awaiting_approval_query(query_id, position_id, ts(10, 0, 0));
+        append_query_snapshot(
+            &pool,
+            tenant_id,
+            stream_key,
+            &awaiting_query,
+            "awaiting_approval",
+            ts(10, 0, 1),
+        )
+        .await;
+
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(tenant_id);
+        config.projection.stream_key = stream_key.to_string();
+
+        let daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())));
+        daemon.invalidate_restart_pending_queries().await.unwrap();
+        daemon.invalidate_restart_pending_queries().await.unwrap();
+
+        let events = query_events(
+            &pool,
+            QueryOptions::new(tenant_id)
+                .stream(stream_key)
+                .event_type(QUERY_STATE_CHANGED_EVENT_TYPE),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(events.len(), 2, "restart invalidation must be idempotent");
+
+        let last_payload: QueryStateChangedEvent =
+            serde_json::from_value(events.last().unwrap().payload.clone()).unwrap();
+        assert_eq!(last_payload.query_id, query_id);
+        assert_eq!(last_payload.state, "Expired");
+        assert_eq!(last_payload.transition_cause, "restart_invalidated");
+
+        apply_event_to_projections(&pool, events.last().unwrap()).await.unwrap();
+
+        let projected_state: String = sqlx::query_scalar(
+            r#"
+            SELECT state
+            FROM queries_current
+            WHERE query_id = $1
+            "#,
+        )
+        .bind(query_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(projected_state, "Expired");
     }
 }

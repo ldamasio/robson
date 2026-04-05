@@ -46,8 +46,7 @@ use crate::query::{
     ActorKind, CommandSource, ContextSummary, ExecutionQuery, QueryKind, QueryOutcome, QueryState,
 };
 use crate::query_engine::{
-    ApprovalCheckResult, ApprovalPolicy, CheckRiskError, GovernedAction, QueryEngine,
-    TracingQueryRecorder,
+    ApprovalCheckResult, ApprovalPolicy, CheckRiskError, GovernedAction, QueryEngine, QueryRecorder,
 };
 
 // =============================================================================
@@ -80,8 +79,8 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     pending_approvals: Arc<RwLock<HashMap<Uuid, PendingApprovalRecord>>>,
     /// Serializes entry-governance flows so pending reservations remain coherent.
     entry_flow_lock: Mutex<()>,
-    /// Query engine for lifecycle tracking
-    query_engine: Arc<QueryEngine<TracingQueryRecorder>>,
+    /// Query engine for lifecycle tracking and audit persistence
+    query_engine: Arc<QueryEngine<Arc<dyn QueryRecorder>>>,
 }
 
 impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
@@ -93,8 +92,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         executor: Arc<Executor<E, S>>,
         store: Arc<S>,
         event_bus: Arc<EventBus>,
+        query_recorder: Arc<dyn QueryRecorder>,
     ) -> Self {
-        Self::with_approval_policy(engine, executor, store, event_bus, ApprovalPolicy::default())
+        Self::with_approval_policy(
+            engine,
+            executor,
+            store,
+            event_bus,
+            query_recorder,
+            ApprovalPolicy::default(),
+        )
     }
 
     pub(crate) fn with_approval_policy(
@@ -102,11 +109,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         executor: Arc<Executor<E, S>>,
         store: Arc<S>,
         event_bus: Arc<EventBus>,
+        query_recorder: Arc<dyn QueryRecorder>,
         approval_policy: ApprovalPolicy,
     ) -> Self {
         let shutdown_token = CancellationToken::new();
         let query_engine = Arc::new(QueryEngine::with_approval_policy(
-            TracingQueryRecorder,
+            query_recorder,
             RiskGate::new(),
             approval_policy,
         ));
@@ -179,6 +187,24 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         ActorKind::Operator { source: CommandSource::Api }
     }
 
+    async fn record_query_accepted(&self, query: &ExecutionQuery) -> DaemonResult<()> {
+        self.query_engine.on_accepted(query).await?;
+        Ok(())
+    }
+
+    async fn record_query_transition(
+        &self,
+        query: &ExecutionQuery,
+        transition_cause: &str,
+    ) -> DaemonResult<()> {
+        self.query_engine.on_state_change(query, transition_cause).await?;
+        Ok(())
+    }
+
+    async fn record_query_failure(&self, query: &ExecutionQuery) -> DaemonResult<()> {
+        self.record_query_transition(query, "failed").await
+    }
+
     fn set_query_context_summary(query: &mut ExecutionQuery, active_positions_count: usize) {
         query.context_summary = Some(ContextSummary { active_positions_count });
     }
@@ -228,7 +254,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         for mut record in invalidated_records {
             let failure_reason = format!("Pending approval invalidated: {}", reason);
             record.query.fail(failure_reason, "awaiting_approval".to_string());
-            self.query_engine.on_state_change(&record.query);
+            if let Err(error) = self.record_query_failure(&record.query).await {
+                warn!(
+                    %position_id,
+                    query_id = %record.query.id,
+                    error = %error,
+                    "Failed to persist invalidated pending approval snapshot"
+                );
+            }
             info!(
                 %position_id,
                 query_id = %record.query.id,
@@ -411,10 +444,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     };
 
                     if let Some(mut record_inner) = record.take() {
-                        if let Err(error) = query_engine.expire(&mut record_inner.query) {
+                        if let Err(error) = query_engine.expire(&mut record_inner.query, "expired").await {
                             let error_message = format!("Approval expiry transition error: {}", error);
                             record_inner.query.fail(error_message.clone(), "awaiting_approval".to_string());
-                            query_engine.on_error(&record_inner.query, &error_message);
+                            if let Err(audit_error) = query_engine
+                                .on_state_change(&record_inner.query, "failed")
+                                .await
+                            {
+                                warn!(
+                                    query_id = %record_inner.query.id,
+                                    error = %audit_error,
+                                    "Failed to persist failed approval expiry snapshot"
+                                );
+                            }
                             return;
                         }
 
@@ -492,16 +534,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 _ => "processing",
             };
             query.fail(format!("{}", e), phase.to_string());
-            self.query_engine.on_error(query, &format!("{}", e));
+            self.record_query_failure(query).await?;
             return Err(DaemonError::Config(format!("Query transition error: {}", e)));
         }
-        self.query_engine.on_state_change(query);
+        self.record_query_transition(query, "acting").await?;
 
         let results = match self.executor.execute(governed.into_actions()).await {
             Ok(r) => r,
             Err(e) => {
                 query.fail(format!("{}", e), "acting".to_string());
-                self.query_engine.on_error(query, &format!("{}", e));
+                self.record_query_failure(query).await?;
                 return Err(e.into());
             },
         };
@@ -527,7 +569,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         .await
                     {
                         query.fail(format!("{}", e), "acting".to_string());
-                        self.query_engine.on_error(query, &format!("{}", e));
+                        self.record_query_failure(query).await?;
                         return Err(e);
                     }
                 },
@@ -548,10 +590,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
             query.fail(format!("{}", e), "acting".to_string());
-            self.query_engine.on_error(query, &format!("{}", e));
+            self.record_query_failure(query).await?;
             return Err(DaemonError::Config(format!("Query completion error: {}", e)));
         }
-        self.query_engine.on_state_change(query);
+        self.record_query_transition(query, "completed").await?;
 
         Ok(())
     }
@@ -681,7 +723,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         );
         query.position_id = Some(position_id);
         self.populate_query_context_summary(&mut query).await;
-        self.query_engine.on_accepted(&query);
+        self.record_query_accepted(&query).await?;
 
         info!(
             %position_id,
@@ -694,10 +736,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Transition to Processing
         if let Err(e) = query.transition(QueryState::Processing) {
             query.fail(format!("{}", e), "accepted".to_string());
-            self.query_engine.on_error(&query, &format!("{}", e));
+            self.record_query_failure(&query).await?;
             return Err(DaemonError::Config(format!("Query transition error: {}", e)));
         }
-        self.query_engine.on_state_change(&query);
+        self.record_query_transition(&query, "processing").await?;
 
         // Emit PositionArmed event → apply_event creates position in Armed state
         let now = chrono::Utc::now();
@@ -713,10 +755,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Transition to Acting before executor call
         if let Err(e) = query.transition(QueryState::Acting) {
             query.fail(format!("{}", e), "processing".to_string());
-            self.query_engine.on_error(&query, &format!("{}", e));
+            self.record_query_failure(&query).await?;
             return Err(DaemonError::Config(format!("Query transition error: {}", e)));
         }
-        self.query_engine.on_state_change(&query);
+        self.record_query_transition(&query, "acting").await?;
 
         // Execute event emission
         let results = match self.executor.execute(vec![EngineAction::EmitEvent(event)]).await {
@@ -724,7 +766,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             Err(e) => {
                 let err_str = format!("{}", e);
                 query.fail(err_str.clone(), "acting".to_string());
-                self.query_engine.on_error(&query, &err_str);
+                self.record_query_failure(&query).await?;
                 return Err(e.into());
             },
         };
@@ -743,13 +785,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             Ok(None) => {
                 let e = DaemonError::PositionNotFound(position_id);
                 query.fail(format!("{}", e), "acting".to_string());
-                self.query_engine.on_error(&query, &format!("{}", e));
+                self.record_query_failure(&query).await?;
                 return Err(e);
             },
             Err(e) => {
                 let err_str = format!("{}", e);
                 query.fail(err_str.clone(), "acting".to_string());
-                self.query_engine.on_error(&query, &err_str);
+                self.record_query_failure(&query).await?;
                 return Err(e.into());
             },
         };
@@ -763,7 +805,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 Err(e) => {
                     let err_str = format!("{}", e);
                     query.fail(err_str.clone(), "acting".to_string());
-                    self.query_engine.on_error(&query, &err_str);
+                    self.record_query_failure(&query).await?;
                     return Err(e);
                 },
             };
@@ -778,10 +820,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Complete query ONLY after all operations succeed
         if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
             query.fail(format!("{}", e), "acting".to_string());
-            self.query_engine.on_error(&query, &format!("{}", e));
+            self.record_query_failure(&query).await?;
             return Err(DaemonError::Config(format!("Query completion error: {}", e)));
         }
-        self.query_engine.on_state_change(&query);
+        self.record_query_transition(&query, "completed").await?;
 
         Ok(position)
     }
@@ -797,27 +839,27 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             ExecutionQuery::new(QueryKind::DisarmPosition { position_id }, Self::operator_actor());
         query.position_id = Some(position_id);
         self.populate_query_context_summary(&mut query).await;
-        self.query_engine.on_accepted(&query);
+        self.record_query_accepted(&query).await?;
 
         // Transition to Processing
         if let Err(e) = query.transition(QueryState::Processing) {
             query.fail(format!("{}", e), "accepted".to_string());
-            self.query_engine.on_error(&query, &format!("{}", e));
+            self.record_query_failure(&query).await?;
             return Err(DaemonError::Config(format!("Query transition error: {}", e)));
         }
-        self.query_engine.on_state_change(&query);
+        self.record_query_transition(&query, "processing").await?;
 
         let position = match self.store.positions().find_by_id(position_id).await {
             Ok(Some(pos)) => pos,
             Ok(None) => {
                 let e = DaemonError::PositionNotFound(position_id);
                 query.fail(format!("{}", e), "processing".to_string());
-                self.query_engine.on_error(&query, &format!("{}", e));
+                self.record_query_failure(&query).await?;
                 return Err(e);
             },
             Err(e) => {
                 query.fail(format!("{}", e), "processing".to_string());
-                self.query_engine.on_error(&query, &format!("{}", e));
+                self.record_query_failure(&query).await?;
                 return Err(e.into());
             },
         };
@@ -828,7 +870,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 actual: format!("{:?}", position.state),
             };
             query.fail(format!("{}", e), "processing".to_string());
-            self.query_engine.on_error(&query, &format!("{}", e));
+            self.record_query_failure(&query).await?;
             return Err(e);
         }
 
@@ -843,10 +885,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Transition to Acting before executor call
         if let Err(e) = query.transition(QueryState::Acting) {
             query.fail(format!("{}", e), "processing".to_string());
-            self.query_engine.on_error(&query, &format!("{}", e));
+            self.record_query_failure(&query).await?;
             return Err(DaemonError::Config(format!("Query transition error: {}", e)));
         }
-        self.query_engine.on_state_change(&query);
+        self.record_query_transition(&query, "acting").await?;
 
         // Emit PositionDisarmed event → apply_event transitions position to Closed
         let event = Event::PositionDisarmed {
@@ -862,14 +904,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     query.complete(QueryOutcome::ActionsExecuted { actions_count: results.len() })
                 {
                     query.fail(format!("{}", e), "acting".to_string());
-                    self.query_engine.on_error(&query, &format!("{}", e));
+                    self.record_query_failure(&query).await?;
                     return Err(DaemonError::Config(format!("Query completion error: {}", e)));
                 }
-                self.query_engine.on_state_change(&query);
+                self.record_query_transition(&query, "completed").await?;
             },
             Err(e) => {
                 query.fail(format!("{}", e), "acting".to_string());
-                self.query_engine.on_error(&query, &format!("{}", e));
+                self.record_query_failure(&query).await?;
                 return Err(e.into());
             },
         }
@@ -904,7 +946,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         );
         query.position_id = Some(position_id);
         self.populate_query_context_summary(&mut query).await;
-        self.query_engine.on_accepted(&query);
+        self.record_query_accepted(&query).await?;
 
         info!(
             %position_id,
@@ -917,10 +959,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Transition to Processing
         if let Err(e) = query.transition(QueryState::Processing) {
             query.fail(format!("{}", e), "accepted".to_string());
-            self.query_engine.on_error(&query, &format!("{}", e));
+            self.record_query_failure(&query).await?;
             return Err(DaemonError::Config(format!("Query transition error: {}", e)));
         }
-        self.query_engine.on_state_change(&query);
+        self.record_query_transition(&query, "processing").await?;
 
         // Load position
         let position = match self.store.positions().find_by_id(position_id).await {
@@ -928,12 +970,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             Ok(None) => {
                 let e = DaemonError::PositionNotFound(position_id);
                 query.fail(format!("{}", e), "processing".to_string());
-                self.query_engine.on_error(&query, &format!("{}", e));
+                self.record_query_failure(&query).await?;
                 return Err(e);
             },
             Err(e) => {
                 query.fail(format!("{}", e), "processing".to_string());
-                self.query_engine.on_error(&query, &format!("{}", e));
+                self.record_query_failure(&query).await?;
                 return Err(e.into());
             },
         };
@@ -943,10 +985,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 reason: "Approval already pending for position".to_string(),
             }) {
                 query.fail(format!("{}", e), "processing".to_string());
-                self.query_engine.on_error(&query, &format!("{}", e));
+                self.record_query_failure(&query).await?;
                 return Err(DaemonError::Config(format!("Query completion error: {}", e)));
             }
-            self.query_engine.on_state_change(&query);
+            self.record_query_transition(&query, "completed").await?;
             info!(
                 %position_id,
                 query_id = %query.id,
@@ -963,7 +1005,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             Ok(d) => d,
             Err(e) => {
                 query.fail(format!("{}", e), "processing".to_string());
-                self.query_engine.on_error(&query, &format!("{}", e));
+                self.record_query_failure(&query).await?;
                 return Err(e.into());
             },
         };
@@ -975,10 +1017,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 reason: "No actions from engine".to_string(),
             }) {
                 query.fail(format!("{}", e), "processing".to_string());
-                self.query_engine.on_error(&query, &format!("{}", e));
+                self.record_query_failure(&query).await?;
                 return Err(DaemonError::Config(format!("Query completion error: {}", e)));
             }
-            self.query_engine.on_state_change(&query);
+            self.record_query_transition(&query, "completed").await?;
             return Ok(());
         }
 
@@ -997,7 +1039,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             Err(e) => {
                 let err_str = format!("{}", e);
                 query.fail(err_str.clone(), "processing".to_string());
-                self.query_engine.on_error(&query, &err_str);
+                self.record_query_failure(&query).await?;
                 return Err(e);
             },
         };
@@ -1009,17 +1051,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     "decide_entry produced actions but no PlaceEntryOrder — cannot build ProposedTrade"
                         .to_string();
                 query.fail(err_str.clone(), "processing".to_string());
-                self.query_engine.on_error(&query, &err_str);
+                self.record_query_failure(&query).await?;
                 return Err(DaemonError::Config(err_str));
             },
         };
 
-        let governed: GovernedAction = match self.query_engine.check_risk(
-            &mut query,
-            &proposed,
-            &risk_context,
-            decision.actions,
-        ) {
+        let governed: GovernedAction = match self
+            .query_engine
+            .check_risk(&mut query, &proposed, &risk_context, decision.actions)
+            .await
+        {
             Ok(g) => g,
             Err(CheckRiskError::Denied) => {
                 // Governed denial: query is already in Denied state.
@@ -1042,12 +1083,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 // mutation. Fail the query and propagate as a hard error.
                 let err_str = format!("Risk gate lifecycle error: {}", e);
                 query.fail(err_str.clone(), "processing".to_string());
-                self.query_engine.on_error(&query, &err_str);
+                self.record_query_failure(&query).await?;
                 return Err(DaemonError::Config(err_str));
+            },
+            Err(CheckRiskError::Audit(e)) => {
+                return Err(e.into());
             },
         };
 
-        match self.query_engine.check_approval(&mut query, &proposed, &risk_context, governed) {
+        match self
+            .query_engine
+            .check_approval(&mut query, &proposed, &risk_context, governed)
+            .await
+        {
             Ok(ApprovalCheckResult::Ready(governed)) => {
                 self.execute_signal_query(&mut query, governed).await?;
                 Ok(())
@@ -1072,7 +1120,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             Err(e) => {
                 let err_str = format!("Approval gate lifecycle error: {}", e);
                 query.fail(err_str.clone(), "risk_checked".to_string());
-                self.query_engine.on_error(&query, &err_str);
+                self.record_query_failure(&query).await?;
                 Err(DaemonError::Config(err_str))
             },
         }
@@ -1097,10 +1145,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .unwrap_or(false);
 
         if expired {
-            if let Err(e) = self.query_engine.expire(&mut record.query) {
+            if let Err(e) = self.query_engine.expire(&mut record.query, "expired").await {
                 let err_str = format!("Approval expiry transition error: {}", e);
                 record.query.fail(err_str.clone(), "awaiting_approval".to_string());
-                self.query_engine.on_error(&record.query, &err_str);
+                self.record_query_failure(&record.query).await?;
                 return Err(DaemonError::Config(err_str));
             }
 
@@ -1122,13 +1170,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     format!("Pending approval invalidated: {}", err),
                     "awaiting_approval".to_string(),
                 );
-                self.query_engine.on_state_change(&record.query);
+                self.record_query_failure(&record.query).await?;
                 return Err(err);
             },
             Err(e) => {
                 let err_str = format!("{}", e);
                 record.query.fail(err_str.clone(), "awaiting_approval".to_string());
-                self.query_engine.on_error(&record.query, &err_str);
+                self.record_query_failure(&record.query).await?;
                 return Err(e.into());
             },
         };
@@ -1142,7 +1190,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 format!("Pending approval invalidated: {}", err),
                 "awaiting_approval".to_string(),
             );
-            self.query_engine.on_state_change(&record.query);
+            self.record_query_failure(&record.query).await?;
             return Err(err);
         }
 
@@ -1150,6 +1198,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         match self
             .query_engine
             .revalidate_risk(&mut record.query, &record.proposed, &risk_context)
+            .await
         {
             Ok(()) => {},
             Err(CheckRiskError::Denied) => {
@@ -1170,15 +1219,18 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             Err(CheckRiskError::InvalidState(e)) => {
                 let err_str = format!("Approval revalidation lifecycle error: {}", e);
                 record.query.fail(err_str.clone(), "awaiting_approval".to_string());
-                self.query_engine.on_error(&record.query, &err_str);
+                self.record_query_failure(&record.query).await?;
                 return Err(DaemonError::Config(err_str));
+            },
+            Err(CheckRiskError::Audit(e)) => {
+                return Err(e.into());
             },
         }
 
-        if let Err(e) = self.query_engine.authorize(&mut record.query) {
+        if let Err(e) = self.query_engine.authorize(&mut record.query).await {
             let err_str = format!("Approval authorization error: {}", e);
             record.query.fail(err_str.clone(), "awaiting_approval".to_string());
-            self.query_engine.on_error(&record.query, &err_str);
+            self.record_query_failure(&record.query).await?;
             return Err(DaemonError::Config(err_str));
         }
 
@@ -1284,7 +1336,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             );
             query.position_id = Some(position.id);
             Self::set_query_context_summary(&mut query, active_positions_count);
-            self.query_engine.on_accepted(&query);
+            self.record_query_accepted(&query).await?;
 
             debug!(
                 position_id = %position.id,
@@ -1296,10 +1348,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             // Transition to Processing
             if let Err(e) = query.transition(QueryState::Processing) {
                 query.fail(format!("{}", e), "accepted".to_string());
-                self.query_engine.on_error(&query, &format!("{}", e));
+                self.record_query_failure(&query).await?;
                 return Err(DaemonError::Config(format!("Query transition error: {}", e)));
             }
-            self.query_engine.on_state_change(&query);
+            self.record_query_transition(&query, "processing").await?;
 
             // Use engine to process (pure: State+Tick → Decision)
             let symbol_clone = data.symbol.clone();
@@ -1309,7 +1361,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 Err(e) => {
                     let err_str = format!("{}", e);
                     query.fail(err_str.clone(), "processing".to_string());
-                    self.query_engine.on_error(&query, &err_str);
+                    self.record_query_failure(&query).await?;
                     return Err(e.into());
                 },
             };
@@ -1321,20 +1373,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 {
                     let err_str = format!("{}", e);
                     query.fail(err_str.clone(), "processing".to_string());
-                    self.query_engine.on_error(&query, &err_str);
+                    self.record_query_failure(&query).await?;
                     return Err(DaemonError::Config(format!("Query completion error: {}", e)));
                 }
-                self.query_engine.on_state_change(&query);
+                self.record_query_transition(&query, "completed").await?;
                 continue;
             }
 
             // Transition to Acting before executor call
             if let Err(e) = query.transition(QueryState::Acting) {
                 query.fail(format!("{}", e), "processing".to_string());
-                self.query_engine.on_error(&query, &format!("{}", e));
+                self.record_query_failure(&query).await?;
                 return Err(DaemonError::Config(format!("Query transition error: {}", e)));
             }
-            self.query_engine.on_state_change(&query);
+            self.record_query_transition(&query, "acting").await?;
 
             // Execute actions via Executor (side-effects: EventLog.append, Exchange orders)
             // MemoryStore is updated via apply_event() called by executor after event append
@@ -1343,7 +1395,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 Err(e) => {
                     let err_str = format!("{}", e);
                     query.fail(err_str.clone(), "acting".to_string());
-                    self.query_engine.on_error(&query, &err_str);
+                    self.record_query_failure(&query).await?;
                     return Err(e.into());
                 },
             };
@@ -1361,7 +1413,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     {
                         let err_str = format!("{}", e);
                         query.fail(err_str.clone(), "acting".to_string());
-                        self.query_engine.on_error(&query, &err_str);
+                        self.record_query_failure(&query).await?;
                         return Err(e);
                     }
                 }
@@ -1370,10 +1422,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             // Complete query with success
             if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
                 query.fail(format!("{}", e), "acting".to_string());
-                self.query_engine.on_error(&query, &format!("{}", e));
+                self.record_query_failure(&query).await?;
                 return Err(DaemonError::Config(format!("Query completion error: {}", e)));
             }
-            self.query_engine.on_state_change(&query);
+            self.record_query_transition(&query, "completed").await?;
         }
 
         Ok(())
@@ -1479,7 +1531,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     );
                     query.position_id = Some(position.id);
                     Self::set_query_context_summary(&mut query, total_count);
-                    self.query_engine.on_accepted(&query);
+                    self.record_query_accepted(&query).await?;
 
                     match self.panic_close_position_internal(position.id, &mut query).await {
                         Ok(_) => {
@@ -1487,9 +1539,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                                 query.complete(QueryOutcome::ActionsExecuted { actions_count: 1 })
                             {
                                 query.fail(format!("{}", e), "acting".to_string());
-                                self.query_engine.on_error(&query, &format!("{}", e));
+                                self.record_query_failure(&query).await?;
                             } else {
-                                self.query_engine.on_state_change(&query);
+                                self.record_query_transition(&query, "completed").await?;
                             }
                             closed_ids.push(position.id);
                         },
@@ -1508,7 +1560,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                                 QueryState::Denied { check, .. } => format!("denied:{}", check),
                             };
                             query.fail(format!("{}", e), phase);
-                            self.query_engine.on_error(&query, &format!("{}", e));
+                            self.record_query_failure(&query).await?;
                             error!(position_id = %position.id, error = %e, "Failed to panic close");
                         },
                     }
@@ -1559,7 +1611,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     ///
     /// # Failure Recording Ownership
     ///
-    /// This method does NOT call `query.fail()` or `on_error()` on errors.
+    /// This method does NOT call `query.fail()` or persist failure snapshots on errors.
     /// The caller is responsible for failure recording. This prevents double-fail.
     ///
     /// Emits PositionClosed event which will be applied by projection.
@@ -1572,7 +1624,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if let Err(e) = query.transition(QueryState::Processing) {
             return Err(DaemonError::Config(format!("Query transition error: {}", e)));
         }
-        self.query_engine.on_state_change(query);
+        self.record_query_transition(query, "processing").await?;
 
         let position = match self.store.positions().find_by_id(position_id).await {
             Ok(Some(pos)) => pos,
@@ -1590,7 +1642,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if let Err(e) = query.transition(QueryState::Acting) {
             return Err(DaemonError::Config(format!("Query transition error: {}", e)));
         }
-        self.query_engine.on_state_change(query);
+        self.record_query_transition(query, "acting").await?;
 
         // Place market exit order on exchange (executor also emits ExitOrderPlaced → Active → Exiting)
         let results = self
@@ -1690,6 +1742,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query_engine::TracingQueryRecorder;
     use robson_exec::{IntentJournal, StubExchange};
     use robson_store::MemoryStore;
     use rust_decimal::Decimal;
@@ -1713,6 +1766,7 @@ mod tests {
             executor,
             store,
             event_bus,
+            Arc::new(TracingQueryRecorder),
             approval_policy,
         ))
     }

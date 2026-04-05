@@ -149,6 +149,23 @@ pub enum QueryState {
     Expired,
 }
 
+impl QueryState {
+    pub fn label(&self) -> &'static str {
+        match self {
+            QueryState::Accepted => "Accepted",
+            QueryState::Processing => "Processing",
+            QueryState::RiskChecked => "RiskChecked",
+            QueryState::AwaitingApproval => "AwaitingApproval",
+            QueryState::Authorized => "Authorized",
+            QueryState::Acting => "Acting",
+            QueryState::Completed => "Completed",
+            QueryState::Failed { .. } => "Failed",
+            QueryState::Denied { .. } => "Denied",
+            QueryState::Expired => "Expired",
+        }
+    }
+}
+
 // =============================================================================
 // QueryOutcome - The result of a completed query
 // =============================================================================

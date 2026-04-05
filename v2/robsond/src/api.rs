@@ -793,6 +793,7 @@ fn position_to_summary(position: &Position) -> PositionSummary {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::query_engine::TracingQueryRecorder;
     use axum::{
         body::Body,
         http::{Request, header::CONTENT_TYPE},
@@ -817,7 +818,13 @@ mod tests {
         let risk_config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
         let engine = Engine::new(risk_config);
 
-        let manager = PositionManager::new(engine, executor, store, Arc::clone(&event_bus));
+        let manager = PositionManager::new(
+            engine,
+            executor,
+            store,
+            Arc::clone(&event_bus),
+            Arc::new(TracingQueryRecorder),
+        );
 
         let position_manager = Arc::new(RwLock::new(manager));
 

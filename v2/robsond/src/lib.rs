@@ -72,4 +72,9 @@ pub use query::{
 };
 // GovernedAction and CheckRiskError are pub(crate) — not re-exported publicly.
 // External consumers observe governance outcomes via QueryState::Denied.
-pub use query_engine::{QueryEngine, QueryRecorder, TracingQueryRecorder};
+#[cfg(feature = "postgres")]
+pub use query_engine::EventLogQueryRecorder;
+pub use query_engine::{
+    QueryEngine, QueryRecorder, QueryRecorderError, QueryStateChangedEvent, QueryTransitionError,
+    TracingQueryRecorder,
+};
