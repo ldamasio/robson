@@ -1,10 +1,22 @@
 # ROBSON v3 — QUERY & QUERYENGINE SPECIFICATION
 
 **Date**: 2026-04-04  
-**Revised**: 2026-04-05 (Phase 3 approval gates, Phase 4 full audit & replay)  
-**Status**: APPROVED — Phases 1-4 Implemented  
+**Revised**: 2026-04-05 (QE-P3 approval gates, QE-P4 full audit & replay)
+**Status**: APPROVED — QE-P1 through QE-P4 Implemented
 **Owner**: Runtime (robsond)  
 **Companion to**: v3-migration-plan.md, v3-control-loop.md, v3-runtime-spec.md
+
+### Nomenclature
+
+This document uses canonical identifiers from v3-migration-plan.md §1.1:
+
+| Prefix | Meaning | Example |
+|--------|---------|---------|
+| `QE-P` | QueryEngine phase (this document) | QE-P1 = Passive Wrapper |
+| `MIG-v2.5#` | Migration step v2 → v2.5 | MIG-v2.5#4 = GovernedAction + Risk Engine |
+| `MIG-v3#` | Migration step v2.5 → v3 | MIG-v3#1 = Promote robsond |
+
+Never use bare "Phase N" without prefix. See v3-migration-plan.md §1.1 for full legend.
 
 ---
 
@@ -38,7 +50,7 @@ Store / RuntimeState (operational truth)
 
 On restart, state is reconstructed from EventLog replay (v3-runtime-spec.md, Recovery Scenario 1). During runtime, state is the authority. EventLog is the durability mechanism. Projections are always derived.
 
-**v2 reality vs v3 target**: The v2 codebase does NOT yet have a `RuntimeState` struct. Operational state lives in `Store` (MemoryStore/PgStore) queried via repository traits. The Executor persists events AND applies them to Store internally via `store.events().append()` + `store.positions().apply_event()`. Phase 1 of QueryEngine works with this existing model. `RuntimeState` as an explicit in-memory struct is a Phase 2+ concern.
+**v2 reality vs v3 target**: The v2 codebase does NOT yet have a `RuntimeState` struct. Operational state lives in `Store` (MemoryStore/PgStore) queried via repository traits. The Executor persists events AND applies them to Store internally via `store.events().append()` + `store.positions().apply_event()`. QE-P1 works with this existing model. `RuntimeState` as an explicit in-memory struct is a QE-P2+ concern.
 
 This is NOT a departure from event sourcing. It is a clarification: events are the durable persistence format, but the runtime does not query the EventLog to make decisions. It acts on state.
 
@@ -70,7 +82,7 @@ The QueryEngine is the **implementation of the Control Loop** (v3-control-loop.m
 - A single entry point for ALL runtime triggers
 - A typed lifecycle unit (`ExecutionQuery`) for each trigger
 - Explicit state machine progression
-- Mandatory risk gate (when wired in Phase 2)
+- Mandatory risk gate (when wired in QE-P2)
 - Structured audit trail per query
 - Clear ownership: QueryEngine sits INSIDE the Runtime, not alongside it
 
@@ -178,18 +190,18 @@ pub enum QueryKind {
 ///                  v            v
 ///               Failed       Failed
 ///
-/// Phase 2+ adds: RiskChecked, AwaitingApproval, Authorized
+/// QE-P2+ adds: RiskChecked, AwaitingApproval, Authorized
 /// between Processing and Acting.
 pub enum QueryState {
     /// Query created, validated, queued
     Accepted,
     /// Engine + Risk are evaluating (Interpret + Decide phases)
     Processing,
-    /// Executor is executing governed actions (Act phase)
+    /// Executor is executing governed actions (Act stage)
     Acting,
     /// Successfully completed.
-    /// In Phase 1: set after Executor returns (Executor persists internally).
-    /// In Phase 2+: set after EventLog append confirmed.
+    /// In QE-P1: set after Executor returns (Executor persists internally).
+    /// In QE-P2+: set after EventLog append confirmed.
     Completed,
     /// Terminal failure
     Failed {
@@ -212,7 +224,7 @@ pub enum QueryOutcome {
     NoAction {
         reason: String,
     },
-    /// Risk Engine or governance denied the action (Phase 2+)
+    /// Risk Engine or governance denied the action (QE-P2+)
     Denied {
         reason: String,
     },
@@ -238,8 +250,8 @@ pub enum ActorKind {
 
 /// Lightweight summary of context at query time.
 /// Logged via tracing for observability, NOT used for decisions.
-/// Phase 1: populated from Store queries.
-/// Phase 2+: may include risk snapshot when RuntimeState exists.
+/// QE-P1: populated from Store queries.
+/// QE-P2+: may include risk snapshot when RuntimeState exists.
 pub struct ContextSummary {
     pub active_positions_count: usize,
 }
@@ -321,20 +333,20 @@ impl ExecutionQuery {
 
 The QueryEngine tracks the lifecycle of ExecutionQueries. It sits inside `robsond` (the Runtime crate).
 
-**CRITICAL DESIGN DECISION FOR PHASE 1**: QueryEngine is a **lifecycle tracker**, not a dispatcher. It does NOT own Engine or Executor. It does NOT call them. PositionManager retains its existing Engine+Executor logic unchanged. QueryEngine records state transitions AROUND that logic.
+**CRITICAL DESIGN DECISION FOR QE-P1**: QueryEngine is a **lifecycle tracker**, not a dispatcher. It does NOT own Engine or Executor. It does NOT call them. PositionManager retains its existing Engine+Executor logic unchanged. QueryEngine records state transitions AROUND that logic.
 
-**Why**: The v2 codebase has no `RuntimeState` struct. The Executor persists events internally via `store.events().append()` + `store.positions().apply_event()`. Persistence ownership lives in Executor, not in a caller-managed state object. Trying to move dispatch into QueryEngine in Phase 1 would require changing Executor's persistence model — that is a Phase 2 concern.
+**Why**: The v2 codebase has no `RuntimeState` struct. The Executor persists events internally via `store.events().append()` + `store.positions().apply_event()`. Persistence ownership lives in Executor, not in a caller-managed state object. Trying to move dispatch into QueryEngine in QE-P1 would require changing Executor's persistence model — that is a QE-P2 concern.
 
-**Phase 2 evolution**: QueryEngine becomes the dispatcher. Engine+Executor calls move from PositionManager into QueryEngine.process(). GovernedAction wraps Executor calls. RuntimeState is introduced as an explicit struct.
+**QE-P2 evolution**: QueryEngine becomes the dispatcher. Engine+Executor calls move from PositionManager into QueryEngine.process(). GovernedAction wraps Executor calls. RuntimeState is introduced as an explicit struct.
 
 ```rust
 use crate::query::{ExecutionQuery, QueryState, QueryOutcome};
 
-/// Phase 1: Lifecycle tracker.
+/// QE-P1: Lifecycle tracker.
 /// Records query state transitions via QueryRecorder.
 /// Does NOT dispatch to Engine/Executor (PositionManager still does that).
 ///
-/// Phase 2+: Becomes the governed dispatcher.
+/// QE-P2+: Becomes the governed dispatcher.
 ///
 /// Ownership: lives INSIDE robsond crate. Not a separate crate.
 pub struct QueryEngine<R: QueryRecorder> {
@@ -369,8 +381,8 @@ impl<R: QueryRecorder> QueryEngine<R> {
 
 ```rust
 /// Records query lifecycle events for observability and audit.
-/// Phase 1: TracingQueryRecorder (structured logs via tracing crate).
-/// Phase 2+: EventLogQueryRecorder (persists to robson-eventlog).
+/// QE-P1: TracingQueryRecorder (structured logs via tracing crate).
+/// QE-P2+: EventLogQueryRecorder (persists to robson-eventlog).
 pub trait QueryRecorder: Send + Sync {
     fn on_state_change(&self, query: &ExecutionQuery);
     fn on_error(&self, query: &ExecutionQuery, error: &str);
@@ -407,11 +419,11 @@ impl QueryRecorder for TracingQueryRecorder {
 
 ### 2.4 Integration: PositionManager Wraps Existing Logic
 
-**Phase 1**: PositionManager retains ALL existing Engine+Executor logic. It wraps each method with query lifecycle tracking. The internal calls remain identical.
+**QE-P1**: PositionManager retains ALL existing Engine+Executor logic. It wraps each method with query lifecycle tracking. The internal calls remain identical.
 
-**Phase 2**: Engine+Executor dispatch moves into QueryEngine.process(). PositionManager becomes a thin translator (EventBus events -> ExecutionQuery).
+**QE-P2**: Engine+Executor dispatch moves into QueryEngine.process(). PositionManager becomes a thin translator (EventBus events -> ExecutionQuery).
 
-**Phase 1 pattern** (handle_signal as example):
+**QE-P1 pattern** (handle_signal as example):
 ```rust
 // PositionManager wraps existing logic with query lifecycle
 async fn handle_signal(&self, signal: DetectorSignal) {
@@ -524,7 +536,7 @@ This pattern applies to ALL PositionManager entry points: `arm_position`, `disar
 
 ## 3. STATE MACHINE EVOLUTION
 
-### Phase 1 (Now) — Minimal, Non-Breaking
+### QE-P1 (Now) — Minimal, Non-Breaking
 
 ```
 Accepted -> Processing -> Acting -> Completed
@@ -538,7 +550,7 @@ Accepted -> Processing -> Acting -> Completed
 
 5 states. Enough for typed lifecycle tracking and structured audit.
 
-### Phase 2 (v2.5 #4 — GovernedAction) — Add Risk Gate
+### QE-P2 (aligns with MIG-v2.5#4 — GovernedAction) — Add Risk Gate
 
 ```
 Accepted -> Processing -> RiskChecked -> Acting -> Completed
@@ -549,7 +561,7 @@ Accepted -> Processing -> RiskChecked -> Acting -> Completed
 
 `RiskChecked` is the proof that Risk Engine approved. `Denied` is a terminal state (not Failed — denial is intentional, not an error).
 
-### Phase 3 (v3 — Approval Gates) — Add Human Confirmation
+### QE-P3 (v3 — Approval Gates) — Add Human Confirmation
 
 ```
 Accepted -> Processing -> RiskChecked -> AwaitingApproval -> Authorized -> Acting -> Completed
@@ -566,44 +578,44 @@ Accepted -> Processing -> RiskChecked -> AwaitingApproval -> Authorized -> Actin
 
 ### v3-control-loop.md Mapping
 
-The Control Loop phases map directly to QueryEngine processing:
+The Control Loop stages map directly to QueryEngine processing:
 
-| Control Loop Phase | Phase 1 Responsibility | Phase 2+ Responsibility | QueryState |
+| Control Loop Stage | QE-P1 Responsibility | QE-P2+ Responsibility | QueryState |
 |---|---|---|---|
 | **Observe** | PositionManager creates `ExecutionQuery` | Same | `Accepted` |
 | **Interpret** | PositionManager calls Engine (unchanged) | QueryEngine dispatches to Engine | `Processing` |
 | **Decide** | Engine returns `EngineDecision` (pure) | Same | `Processing` |
-| **Risk Gate** | N/A (pass-through) | QueryEngine evaluates via RiskGate | `RiskChecked` (Phase 2) |
-| **Act** | PositionManager calls Executor (unchanged) | QueryEngine calls Executor with GovernedAction | `Acting` |
-| **Evaluate + Persist** | Executor persists internally (unchanged) | QueryEngine manages persist sequence | `Completed` |
+| **Risk Gate** | N/A (pass-through) | QueryEngine evaluates via RiskGate | `RiskChecked` (QE-P2) |
+| **Act** | PositionManager calls Executor (unchanged) | QueryEngine clears actions via `GovernedAction` and dispatches approved `Vec<EngineAction>` to Executor | `Acting` |
+| **Evaluate + Persist** | Executor persists internally (unchanged) | QueryEngine records lifecycle audit; Executor still persists domain events internally | `Completed` |
 
 ### v3-runtime-spec.md Mapping
 
-| Runtime Concept | Phase 1 Equivalent | Phase 2+ Equivalent |
+| Runtime Concept | QE-P1 Equivalent | QE-P2+ Equivalent |
 |---|---|---|
 | `RuntimeInput` | `QueryKind` | Same |
 | `RuntimeOutput` | `QueryOutcome` | Same + emitted events |
 | `GovernedAction` | N/A | Constructed inside QueryEngine after RiskChecked |
 | `RuntimeState` | `Store` (MemoryStore/PgStore) | Explicit in-memory RuntimeState |
-| Zero-Bypass Guarantee | Partial (all entry points wrapped) | Full (Executor accepts only GovernedAction) |
+| Zero-Bypass Guarantee | Partial (all entry points wrapped) | Runtime-level inside `robsond`; executor signature still unchanged |
 
 ### v3-migration-plan.md Alignment
 
 | Migration Step | QueryEngine Impact |
 |---|---|
-| v2.5 #1: Deploy robsond | QueryEngine ships as part of robsond |
-| v2.5 #3: Migrate stop monitoring | Stop monitoring goes through QueryEngine via `ProcessMarketTick` |
-| v2.5 #4: Wire Risk Engine as blocking gate | Risk gate added to QueryEngine Phase 2 |
-| v2.5 #5: Circuit breaker ladder | Circuit breaker check in QueryEngine before Processing |
-| v3 #1: Promote robsond as primary | QueryEngine IS the primary execution path |
+| MIG-v2.5#1: Deploy robsond | QueryEngine ships as part of robsond |
+| MIG-v2.5#3: Migrate stop monitoring | Stop monitoring goes through QueryEngine via `ProcessMarketTick` |
+| MIG-v2.5#4: Wire Risk Engine as blocking gate | Risk gate added to QueryEngine (QE-P2) |
+| MIG-v2.5#5: Circuit breaker ladder | Circuit breaker check in QueryEngine before Processing |
+| MIG-v3#1: Promote robsond as primary | QueryEngine IS the primary execution path |
 
-**No conflicts with existing migration steps.** QueryEngine is additive in Phase 1 (wrapper) and becomes the enforcement mechanism in Phase 2+.
+**No conflicts with existing migration steps.** QueryEngine is additive in QE-P1 (wrapper) and becomes the enforcement mechanism in QE-P2+.
 
 ---
 
 ## 5. PHASED IMPLEMENTATION PLAN
 
-### Phase 1: Passive Wrapper (Non-Breaking)
+### QE-P1: Passive Wrapper (Non-Breaking)
 
 **Goal**: Introduce ExecutionQuery and QueryEngine without changing any external behavior. Tracing-only audit. All existing tests pass.
 
@@ -643,7 +655,7 @@ The Control Loop phases map directly to QueryEngine processing:
 - No RuntimeState struct (v2 uses Store)
 - `handle_entry_fill` and `handle_exit_fill` not separately wrapped (covered by parent query)
 
-### Phase 2: Blocking Governance (Aligns with v2.5 #4) — IMPLEMENTED 2026-04-04
+### QE-P2: Blocking Governance (Aligns with MIG-v2.5#4) — IMPLEMENTED 2026-04-04
 
 **Goal**: Wire Risk Engine as mandatory blocking gate inside QueryEngine. Introduce GovernedAction.
 
@@ -675,19 +687,19 @@ The Control Loop phases map directly to QueryEngine processing:
 - `Executor` continues accepting `Vec<EngineAction>` — signature unchanged
 - Governance enforcement is **runtime-level inside the crate**, not type-level across crate boundary
 - Rationale: the crate graph `robsond → robson-exec` makes `GovernedAction` in `robson-exec` require
-  either a circular dependency or a new shared contracts crate. Both are out of scope for this phase.
+  either a circular dependency or a new shared contracts crate. Both are out of scope for QE-P2.
   Governance and Risk Gate belong to the Runtime/QueryEngine layer, not to I/O execution.
 - `GovernedAction` can only be constructed by `QueryEngine::check_risk()` (private constructor),
   enforcing the governance rule within the crate. Type-level enforcement across the crate boundary
   is explicitly deferred as a follow-up architectural concern.
 
-**Phase 2 limitation**: Daily PnL (daily_realized_pnl, daily_unrealized_pnl) in `RiskContext` defaults
+**QE-P2 limitation**: Daily PnL (daily_realized_pnl, daily_unrealized_pnl) in `RiskContext` defaults
 to zero. The daily loss circuit breaker (`DailyLossLimit` check in RiskGate) is therefore not active.
 Proper PnL tracking in the store is deferred to a follow-up task.
 
-**Depends on**: Phase 1 complete
+**Depends on**: QE-P1 complete
 
-### Phase 3: Approval Gates (v3) — IMPLEMENTED 2026-04-05
+### QE-P3: Approval Gates (v3) — IMPLEMENTED 2026-04-05
 
 **Goal**: Add human confirmation for high-risk actions.
 
@@ -695,7 +707,7 @@ Proper PnL tracking in the store is deferred to a follow-up task.
 - New states: `AwaitingApproval`, `Authorized`, `Expired`
 - API endpoint: `POST /queries/{id}/approve`
 - Approval decision lives in `QueryEngine`; pending approvals live in `PositionManager`
-- Pending approvals are kept **in memory only** for this phase
+- Pending approvals are kept **in memory only** for QE-P3
 - Restart drops pending approvals; operator must re-approve after re-bootstrap
 - TTL is explicit and fixed at **300 seconds**
 - Current policy is intentionally narrow: `PlaceEntryOrder` requires approval when
@@ -707,12 +719,12 @@ Proper PnL tracking in the store is deferred to a follow-up task.
   after SSE reconnect without replay
 - Public SSE exposes `query.awaiting_approval`, `query.authorized`, `query.expired`
 - No replay support, no EventLog lifecycle persistence, no approval broker/queue
-- Precondition status: SSE working (v2.5 #6) is satisfied by the `robsond` `/events`
+- Precondition status: SSE working (MIG-v2.5#6) is satisfied by the `robsond` `/events`
   endpoint implemented on 2026-04-05
 
-**Depends on**: Phase 2 complete, SSE working (v2.5 #6)
+**Depends on**: QE-P2 complete, SSE working (MIG-v2.5#6)
 
-### Phase 4: Full Audit & Replay — IMPLEMENTED 2026-04-05
+### QE-P4: Full Audit & Replay — IMPLEMENTED 2026-04-05
 
 **Goal**: Complete audit trail. Query lifecycle fully persisted. Replay determinism proven.
 
@@ -748,14 +760,14 @@ Proper PnL tracking in the store is deferred to a follow-up task.
    - Ref: `robsond/src/daemon.rs:130` (wiring with postgres pool)
 
 6. **Restart semantics**: Queries in `AwaitingApproval` invalidated on boot
-   - Rationale: Pending approvals are in-memory (Phase 3). Restart drops approval runtime state.
+   - Rationale: Pending approvals are in-memory (QE-P3). Restart drops approval runtime state.
    - Behavior: On daemon boot, persisted `AwaitingApproval` queries transition to `Expired` with `transition_cause = "restart_invalidated"`
    - Ref: `robsond/src/daemon.rs:395` (invalidation logic)
    - Prevents "zombie queries" (persisted approvals without runtime approval state)
 
-7. **REST bootstrap**: Continues via `/status` (Phase 3)
+7. **REST bootstrap**: Continues via `/status` (QE-P3)
    - `/status` returns `pending_approvals` for in-memory runtime state
-   - `GET /queries` remains out-of-scope (no control surface in Phase 4)
+   - `GET /queries` remains out-of-scope (no control surface in QE-P4)
    - Operator bootstrap: SSE `/events` + REST `/status`
 
 8. **Replay determinism**: Proven via snapshot-based projection
@@ -774,13 +786,13 @@ Proper PnL tracking in the store is deferred to a follow-up task.
 - `86f2389c` — feat(robsond): persist query lifecycle snapshots  
 - `bcf2de34` — test(robsond): add deterministic query replay coverage
 
-**Depends on**: Phase 3 complete
+**Depends on**: QE-P3 complete
 
 ---
 
-**Architectural notes (Phase 4 implementation)**:
+**Architectural notes (QE-P4 implementation)**:
 
-The initial Phase 4 plan was revised based on architectural review to address operational risks:
+The initial QE-P4 plan was revised based on architectural review to address operational risks:
 
 1. **QueryRecorder contract evolved**: From sync observability (`on_state_change`, `on_error`) to async audit trail (`record_transition`). The trait now explicitly supports durable persistence, not just tracing. Fallback remains `TracingQueryRecorder` for non-postgres builds.
 
@@ -788,9 +800,9 @@ The initial Phase 4 plan was revised based on architectural review to address op
 
 3. **Producer/consumer ordering**: Initial plan had "EventLog events → Recorder → Handler" which risked worker failure on unknown event types. Revised: Handler registered **before** events emitted, or gated by feature flag. Implemented as: migration + handler deployed, then recorder enabled.
 
-4. **Scope discipline**: `GET /queries` removed from Phase 4 core. Bootstrap continues via `/status` (already includes `pending_approvals`). Control surface remains out-of-scope. Phase 4 stayed enxuta: audit trail, snapshot projection, replay proven.
+4. **Scope discipline**: `GET /queries` removed from QE-P4 core. Bootstrap continues via `/status` (already includes `pending_approvals`). Control surface remains out-of-scope. QE-P4 stayed lean: audit trail, snapshot projection, replay proven.
 
-5. **Restart semantics formalized**: `AwaitingApproval` queries cannot be resurrected (approvals are in-memory, Phase 3). On boot, persisted queries in this state transition to `Expired` with `transition_cause = "restart_invalidated"`. Prevents projection table from carrying non-actionable zombie queries.
+5. **Restart semantics formalized**: `AwaitingApproval` queries cannot be resurrected (approvals are in-memory, QE-P3). On boot, persisted queries in this state transition to `Expired` with `transition_cause = "restart_invalidated"`. Prevents projection table from carrying non-actionable zombie queries.
 
 6. **Snapshot-based determinism**: Replay test compares final `queries_current` table byte-for-byte. Works without timestamp-ignoring rules because `QUERY_STATE_CHANGED` payload includes complete snapshot (`started_at`, `finished_at`, `approval` metadata). EventLog becomes the durable ground truth; projection is derived.
 
@@ -798,7 +810,7 @@ The initial Phase 4 plan was revised based on architectural review to address op
 
 ---
 
-### Phase 5: Context Governance (v3+ with LLM)
+### QE-P5: Context Governance (v3+ with LLM) — DEFERRED
 
 **Goal**: Bounded context for LLM reasoning, if ever added.
 
@@ -811,14 +823,14 @@ The initial Phase 4 plan was revised based on architectural review to address op
 
 ---
 
-## 6. SCAFFOLDING ENUMS (Phase 1 — Permissive, Future-Ready)
+## 6. SCAFFOLDING ENUMS (QE-P1 — Permissive, Future-Ready)
 
-Include these in Phase 1 for type stability, but keep them permissive (always allow/approve):
+Include these in QE-P1 for type stability, but keep them permissive (always allow/approve):
 
 ```rust
 /// Classification of side effects. Used by governance layers.
-/// Phase 1: informational only (logged via tracing).
-/// Phase 2+: determines approval requirements.
+/// QE-P1: informational only (logged via tracing).
+/// QE-P2+: determines approval requirements.
 pub enum ActionClass {
     /// Reads state, no side effects
     ReadOnly,
@@ -833,8 +845,8 @@ pub enum ActionClass {
 }
 
 /// Whether an action requires human approval.
-/// Phase 1: always NotRequired.
-/// Phase 3+: determined by action class, risk level, and configuration.
+/// QE-P1: always NotRequired.
+/// QE-P3+: determined by action class, risk level, and configuration.
 pub enum ApprovalRequirement {
     NotRequired,
     Required {
@@ -844,8 +856,8 @@ pub enum ApprovalRequirement {
 }
 
 /// Result of a permission check.
-/// Phase 1: always Granted.
-/// Phase 2+: determined by Risk Engine and governance rules.
+/// QE-P1: always Granted.
+/// QE-P2+: determined by Risk Engine and governance rules.
 pub enum PermissionDecision {
     Granted,
     Denied { reason: String },
@@ -859,7 +871,7 @@ pub enum PermissionDecision {
 
 With QueryEngine as the execution core, the stream derivation contract becomes explicit:
 
-**Phase 1 / v2.5 current model**:
+**QE-P1 / v2.5 current model**:
 ```
 ExecutionQuery (trigger)
   -> PositionManager (Engine + Executor calls, wrapped with lifecycle)
@@ -870,7 +882,7 @@ ExecutionQuery (trigger)
           -> SSE stream (push to consumers)
 ```
 
-**Phase 2+ (v3 target)**:
+**QE-P2+ (v3 target)**:
 ```
 ExecutionQuery (trigger)
   -> QueryEngine.process() (owns the pipeline)
@@ -880,8 +892,8 @@ ExecutionQuery (trigger)
           -> SSE stream (push to consumers)
 ```
 
-**Rules** (apply to both phases):
-1. **Derived streams NEVER feed back into decisions.** Decisions use Store (Phase 1/v2.5) or RuntimeState (Phase 2+/v3 target).
+**Rules** (apply to both models):
+1. **Derived streams NEVER feed back into decisions.** Decisions use Store (QE-P1/v2.5) or RuntimeState (QE-P2+/v3 target).
 2. **v2.5 SSE is an ephemeral derived stream**, mapped from runtime events for operator/UI use. It is not a source of truth, does not provide replay, and requires REST bootstrap on connect.
 3. **v3 target SSE is derived from durable projections**, not from Store/RuntimeState directly.
 4. **If projections drift from EventLog** (watermark lag >100), they are rebuilt from EventLog. This is safe because projections are always derived.
@@ -941,7 +953,7 @@ Every query state transition produces a structured log entry:
 
 ---
 
-## 10. CLAUDE CODE IMPLEMENTATION PROMPT — PHASE 1
+## 10. CLAUDE CODE IMPLEMENTATION PROMPT — QE-P1
 
 **IMPORTANT**: The prompt below has been superseded by a more detailed, code-anchored prompt provided separately. Use the external prompt document, not this abbreviated version. This section is kept for reference only.
 
@@ -949,25 +961,69 @@ The external prompt includes:
 - Exact v2 type signatures (PositionManager<E: ExchangePort, S: Store>, Executor.execute(Vec<EngineAction>))
 - Correct fan-out pattern for process_market_data and panic_close_all
 - Error path requirements (query.fail() on every error branch)
-- Phase 1 lifecycle tracker design (QueryEngine does NOT dispatch, only records)
+- QE-P1 lifecycle tracker design (QueryEngine does NOT dispatch, only records)
 - Complete test requirements
 
 ---
 
-## 11. OPEN QUESTIONS
+## 11. DECISIONS AND FOLLOW-UPS
 
-These require human architectural decision before Phase 2:
+### DECIDED
 
-1. **Query persistence granularity**: Should every query (including high-frequency market ticks) be persisted to EventLog, or only queries that produce actions? Market ticks at 100/s would generate significant EventLog volume.
+1. **GovernedAction location** — DECIDED 2026-04-04
+   Stays in robsond as `pub(crate)`. Executor signature unchanged (`Vec<EngineAction>`).
+   Governance enforcement is runtime-level inside the crate, not type-level across crate boundary.
+   See QE-P2 architectural decision above.
 
-2. **GovernedAction location**: ~~Should it stay in robsond or move to robson-exec?~~ **DECIDED 2026-04-04**: Stays in robsond as `pub(crate)`. Executor unchanged. See Phase 2 architectural decision above.
+2. **Approval persistence** — DECIDED 2026-04-05 (QE-P3)
+   Pending approvals are kept in memory only. Restart drops pending approvals; operator must
+   re-approve after REST bootstrap. QE-P4 added durable query lifecycle audit trail via
+   `QUERY_STATE_CHANGED` events in EventLog. Restart invalidates persisted `AwaitingApproval`
+   queries (transition to `Expired` with cause `"restart_invalidated"`).
+   Status: **IMPLEMENTED** (QE-P3 + QE-P4).
 
-3. **Approval persistence**: **DECIDED 2026-04-05 (Phase 3 minimum)**: keep pending approvals in memory only. Restart drops pending approvals and the operator must re-approve after REST bootstrap. **Phase 4 IMPLEMENTED 2026-04-05**: Durable query lifecycle audit trail now persisted in EventLog via `QUERY_STATE_CHANGED` events. Restart invalidates persisted `AwaitingApproval` queries (transition to `Expired` with cause `"restart_invalidated"`).
+3. **Query timeout** — DECIDED 2026-04-05 (QE-P3)
+   Fixed TTL of 300 seconds for `AwaitingApproval` queries. On expiry, the query transitions to
+   `Expired`, emits a public SSE event, and the detector is re-armed.
+   Status: **IMPLEMENTED** (QE-P3).
 
-4. **Query timeout**: **DECIDED 2026-04-05 (Phase 3 minimum)**: fixed TTL of 300 seconds for `AwaitingApproval` queries. On expiry, the query transitions to `Expired`, emits a public SSE event, and the detector is re-armed.
+4. **Query persistence granularity** — DECIDED 2026-04-05
+   Durable persistence covers governance-relevant and operationally-relevant queries only.
+   Criteria for durable persistence (EventLog):
+   - Queries that produce actions (`ActionsExecuted`)
+   - Queries that enter approval/authorization/expiration flow (`AwaitingApproval`, `Authorized`, `Expired`)
+   - Queries that result in `Denied`, `Failed`, or another auditable terminal state
+   - Queries that cross governance boundaries (risk gate evaluation)
 
-5. **Event model unification**: The repository has two event models (robson_domain::Event and EventEnvelope). Should QueryEngine produce one, the other, or both? Unification is desirable but risky if done in Phase 1.
+   High-frequency queries that terminate in `NoAction` — especially market ticks without effect —
+   are treated as tracing/metrics, not as EventLog entries.
+
+   Rationale: Market ticks at 100/s would generate ~8.6M EventLog rows/day with zero audit value.
+   Tracing provides full observability for debugging without polluting the durable event stream.
+
+   Status: **DECIDED**. The filtering logic in `EventLogQueryRecorder` may not yet fully align
+   with this policy. **FOLLOW-UP REQUIRED**: verify that the current recorder implementation
+   applies this filter, and adjust if it persists NoAction market tick queries.
+
+5. **Event model unification** — DECIDED 2026-04-05
+   The canonical durable event model is `robson_eventlog` / `EventEnvelope` / `event_log` table.
+   `robson_domain::Event` remains as the internal domain representation used within crate
+   boundaries for business logic.
+
+   The system must NOT maintain two durable models of first class in the long term.
+   QueryEngine produces `QUERY_STATE_CHANGED` events as `EventEnvelope` entries in the canonical
+   EventLog. Domain events flow through the existing `Executor → Store → EventLog` path.
+
+   Convergence plan: all durable persistence converges to `EventEnvelope` as the single canonical
+   format. Adaptation between `robson_domain::Event` and `EventEnvelope` happens at persistence
+   boundaries, not as parallel durable outputs.
+
+   Status: **DECIDED**. The architectural direction is set. Full convergence is not yet implemented —
+   `Executor` still persists via `store.events().append()` internally, and the two models coexist.
+   **FOLLOW-UP REQUIRED**: migrate Executor persistence to emit `EventEnvelope` directly, or
+   introduce an adapter at the Store boundary that maps `robson_domain::Event` to `EventEnvelope`
+   before append. This is a code change, not an architectural decision.
 
 ---
 
-**This document is the authoritative specification for Query/QueryEngine in Robson v3. Phases 1-4 are now implemented in `robsond`; Phase 5 (Context Governance) remains deferred pending concrete LLM value proposition.**
+**This document is the authoritative specification for Query/QueryEngine in Robson v3. QE-P1 through QE-P4 are implemented in `robsond`; QE-P5 (Context Governance) remains deferred pending concrete LLM value proposition.**

@@ -20,7 +20,9 @@ The Runtime's execution pipeline is implemented by the **QueryEngine** (`robsond
 
 **v2.5 transitional note (implemented 2026-04-05)**: `robsond` now exposes a minimal SSE endpoint at `/events` for operator-facing runtime updates. This stream is ephemeral and derived for UI/monitoring only. It does not provide replay or `Last-Event-ID` resume; clients bootstrap current state via REST and then subscribe for incremental updates.
 
-**Phase 3 transitional note (implemented 2026-04-05)**: high-notional entry queries now pause in `AwaitingApproval` after `RiskChecked`. The approval decision is made inside `QueryEngine`; pending approvals are held in runtime memory by `PositionManager`; the operator authorizes via `POST /queries/{id}/approve`; and pending approvals expire after 300 seconds if not approved. Approval is not a risk override: pending queries reserve risk while waiting, and `approve` revalidates the current risk context before acting. `disarm` invalidates pending approvals for the same position. REST bootstrap now exposes pending approvals via `/status`, because `/events` remains ephemeral and non-replayable. This is intentionally non-durable in v2.5/v3 minimum scope: restart drops pending approvals and clients must re-bootstrap from REST + SSE.
+**QE-P3 transitional note (implemented 2026-04-05)**: high-notional entry queries now pause in `AwaitingApproval` after `RiskChecked`. The approval decision is made inside `QueryEngine`; pending approvals are held in runtime memory by `PositionManager`; the operator authorizes via `POST /queries/{id}/approve`; and pending approvals expire after 300 seconds if not approved. Approval is not a risk override: pending queries reserve risk while waiting, and `approve` revalidates the current risk context before acting. `disarm` invalidates pending approvals for the same position. REST bootstrap now exposes pending approvals via `/status`, because `/events` remains ephemeral and non-replayable. This is intentionally non-durable in v2.5/v3 minimum scope: restart drops pending approvals and clients must re-bootstrap from REST + SSE.
+
+**Current v2.5 implementation note**: governance is already enforced inside `robsond`, but the executor boundary is still transitional. `QueryEngine` uses an internal `GovernedAction` token after risk approval; `Executor` still accepts `Vec<EngineAction>`; query lifecycle audit events append directly to `robson-eventlog`; and executor domain events still persist through `Store`.
 
 See **[v3-query-query-engine.md](v3-query-query-engine.md)** for the full specification.
 
@@ -127,9 +129,9 @@ pub enum RuntimeOutput {
         events: Vec<EventEnvelope>,
         cycle_id: Ulid,
     },
-    /// Action requested to Executor
+    /// Actions requested to Executor after runtime governance clearance
     ActionRequested {
-        action: GovernedAction,
+        actions: Vec<EngineAction>,
         cycle_id: Ulid,
     },
     /// State change notification (for SSE consumers)
@@ -204,9 +206,13 @@ pub enum CircuitBreakerState {
 
 ---
 
-## Internal Phases
+## Internal Stages
 
-### Phase 1: Input Validation
+Each runtime cycle processes a trigger through 9 sequential stages.
+These are **pipeline stages within a single execution tick**, not project phases.
+For project-level identifiers see v3-migration-plan.md §1.1 (`MIG-*`, `QE-P*`).
+
+### Stage 1: Input Validation
 
 Every `RuntimeInput` passes through validation before entering the observation queue:
 
@@ -232,27 +238,27 @@ impl RuntimeInput {
 }
 ```
 
-### Phase 2: Inspection (v3 — when LLM is integrated)
+### Stage 2: Inspection (v3 — when LLM is integrated)
 
-For v2.5/v3 launch: NO LLM, this phase is a no-op pass-through.
+For v2.5/v3 launch: NO LLM, this stage is a no-op pass-through.
 
 Future (v3+): When LLM reasoning is added for thesis evaluation:
 - Strip sensitive data (API keys, credentials) from context
 - Validate schema of any data entering LLM prompt
 - Log what context was provided to the model for audit
 
-### Phase 3: Risk Pre-Check
+### Stage 3: Risk Pre-Check
 
 Before the Engine makes any decision, the Risk Engine performs a pre-check:
 - Is the circuit breaker CLOSED? If OPEN, only `PanicClose` and `AdjustConfig` actions are allowed.
 - Is the system paused? If paused, only operator commands are processed.
 - Is the daily order count below the rate limit?
 
-### Phase 4: Engine Decision
+### Stage 4: Engine Decision
 
 The Engine receives the interpretation and produces an `EngineAction`. This is a pure function — no I/O, no side effects, deterministic.
 
-### Phase 5: Risk Post-Check
+### Stage 5: Risk Post-Check
 
 The specific `EngineAction` is evaluated:
 - `PlaceEntryOrder`: Does the new position violate max exposure? Max position count? Max single position size?
@@ -260,24 +266,25 @@ The specific `EngineAction` is evaluated:
 - `UpdateTrailingStop`: Always allowed (tightening stop is always safe).
 - `PanicClose`: Always allowed (emergency).
 
-### Phase 6: Governance (GovernedAction Construction)
+### Stage 6: Governance (GovernedAction Construction)
 
 If Risk Engine approves:
 ```rust
-let governed = GovernedAction::new(action, risk_clearance, cycle_id);
+let governed = GovernedAction::new(actions);
+let cleared_actions = governed.into_actions();
 ```
 
-`GovernedAction` can ONLY be constructed inside the Runtime module (Rust module visibility). The Executor's `execute()` method accepts ONLY `GovernedAction`, not raw `EngineAction`. This is enforced at compile time.
+Current v2.5/QE-P2 reality: `GovernedAction` is an internal `robsond` token proving that `QueryEngine` cleared the action set. It is `pub(crate)` and not part of the executor API. The executor boundary still accepts `Vec<EngineAction>` today; moving the proof all the way to the executor signature remains target architecture / follow-up work.
 
-### Phase 7: Execution
+### Stage 7: Execution
 
-Governed action sent to Executor. Result returned.
+Risk-cleared actions are sent to Executor as `Vec<EngineAction>`. Result returned.
 
-### Phase 8: Evaluation
+### Stage 8: Evaluation
 
 Action result applied to RuntimeState. Domain events produced.
 
-### Phase 9: Persistence
+### Stage 9: Persistence
 
 Events appended to EventLog. Cycle complete.
 
@@ -287,35 +294,39 @@ Events appended to EventLog. Cycle complete.
 
 ### How the Runtime prevents bypass
 
-1. **Type-level enforcement**: `GovernedAction` is the only type accepted by the Executor. It can only be constructed by the Runtime after Risk Engine clearance. There is no public constructor.
+1. **Current runtime-level enforcement**: `GovernedAction` can only be constructed inside `robsond` after Risk Engine clearance. It acts as an internal proof token before executor dispatch, even though the executor signature still accepts `Vec<EngineAction>` today.
 
 ```rust
-// In robson-exec crate:
-pub async fn execute(&self, action: GovernedAction) -> Result<ActionResult> {
-    // GovernedAction proves Risk Engine approved this action
-    // No way to call this with a raw EngineAction
-    let inner = action.into_inner(); // consumes governance proof
-    match inner {
-        EngineAction::PlaceEntryOrder { .. } => self.place_order(inner).await,
-        // ...
-    }
-}
+// In robsond:
+let governed = query_engine.check_risk(query, actions, proposed, context).await?;
+
+// Current executor boundary:
+executor.execute(governed.into_actions()).await?;
+
+// In robson-exec:
+pub async fn execute(&self, actions: Vec<EngineAction>) -> ExecResult<Vec<ActionResult>> { ... }
 ```
+
+Cross-crate type-level enforcement remains a v3 target, not a property of the current executor API.
 
 2. **Module visibility**: `GovernedAction::new()` is `pub(crate)` within the runtime crate. External crates cannot construct it.
 
-3. **No direct exchange access**: The `ExchangePort` trait implementation (`BinanceExchange`) is only accessible through the Executor, which only accepts `GovernedAction`.
+3. **No direct exchange access from the decision path**: `ExchangePort` is held behind `Executor`. Runtime entry points are wrapped by `QueryEngine` before dispatch, so the governance gate remains on the hot path.
 
-4. **No direct EventLog writes from components**: Components produce `Vec<DomainEvent>`. Only the Runtime's persist phase calls `append_event()`. The EventLog writer handle is private to the Runtime.
+4. **Current persistence reality**: query lifecycle audit events are appended via `EventLogQueryRecorder`; executor domain events are still appended via `Store::events().append()`. Convergence to a single persistence boundary is architectural direction, not current-state behavior.
 
-### What this prevents
+### What this prevents today
 
 | Attack/Bug | Prevention |
 |-----------|------------|
-| Engine produces action, bypasses Risk Engine | GovernedAction requires RiskClearance proof |
-| Component writes directly to EventLog | EventLog writer handle is private to Runtime |
-| Component calls exchange directly | ExchangePort instance is private to Executor, which requires GovernedAction |
+| Engine produces action, bypasses Risk Engine | `QueryEngine` must create the internal `GovernedAction` token before executor dispatch |
+| Component writes query lifecycle events outside the audit trail | Query lifecycle audit is centralized in `EventLogQueryRecorder` |
+| Component calls exchange directly from the decision path | ExchangePort instance is private to Executor; runtime owns executor dispatch |
 | LLM output triggers direct execution | LLM output is typed as `Suggestion` — only `Observation` and `ThesisUpdate` variants exist. No `PlaceOrder` variant. |
+
+### Target-state strengthening
+
+The intended v3 strengthening is to push this proof to the executor boundary as well, so the executor accepts a governed type rather than raw `Vec<EngineAction>`. That is not yet implemented.
 
 ---
 

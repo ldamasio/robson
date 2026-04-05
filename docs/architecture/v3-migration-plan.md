@@ -69,9 +69,59 @@ Robson operates from Baar/Zug under Swiss jurisdiction:
 
 ## 1. EXECUTIVE SUMMARY
 
-Robson currently exists as two parallel implementations: a Django monolith (v1, live in production on k3s) and a Rust system (v2, architecturally superior, 12 crates, ~21K LOC, not yet deployed). The v1 system has accumulated 31 Django migrations, event-sourced stop monitoring, a 3-level audit trail, margin trading, pattern detection, and an agentic workflow (PLAN->VALIDATE->EXECUTE). The v2 system implements the correct architecture — pure domain layer, event sourcing with ULID ordering, trailing stop engine, risk gate, idempotent executor with intent journal, Binance REST+WS connectors, and a daemon with HTTP API — but has incomplete projections (40%) and no backtesting. The migration path is: v2.5 deploys the Rust daemon alongside the Django monolith, with Django continuing to serve the API, frontend, and pattern engine while the Rust runtime assumes execution responsibilities. Once the Rust path is validated in production, the v1 execution CronJobs are disabled and removed from desired state. v3 then promotes the Rust daemon to the primary runtime, replaces Django with a thin API gateway, and the React frontend connects directly to the daemon's event stream. The single most important architectural decision is that the Rust Runtime (robsond) becomes the sole guardian of execution — no context reaches the model, no tool executes, no order places without passing through its governance pipeline. Every other decision flows from this.
+Robson currently exists as two parallel implementations: a Django monolith (v1, live in production on k3s) and a Rust system (v2, architecturally superior, 12 crates, ~21K LOC). The v1 system has accumulated 31 Django migrations, event-sourced stop monitoring, a 3-level audit trail, margin trading, pattern detection, and an agentic workflow (PLAN->VALIDATE->EXECUTE). The v2 system implements the correct architecture — pure domain layer, event sourcing with ULID ordering, trailing stop engine, risk gate, idempotent executor with intent journal, Binance REST+WS connectors, and a daemon with HTTP API — but still has incomplete projections (40%), no backtesting, and the robsond k3s rollout is not treated as complete in this repository. The migration path is: v2.5 deploys the Rust daemon alongside the Django monolith, with Django continuing to serve the API, frontend, and pattern engine while the Rust runtime assumes execution responsibilities. Once the Rust path is validated in production, the v1 execution CronJobs are disabled and removed from desired state. v3 then promotes the Rust daemon to the primary runtime, replaces Django with a thin API gateway, and the React frontend connects directly to the daemon's event stream. The single most important architectural decision is that the Rust Runtime (robsond) becomes the sole guardian of execution — no context reaches the model, no tool executes, no order places without passing through its governance pipeline. Every other decision flows from this.
 
 In the v3 desired state there are no Django execution CronJobs. Critical monitoring moves to long-lived Rust runtime components such as the Control Loop, Safety Net, and reconciliation workers. Kubernetes CronJobs remain acceptable only for non-critical maintenance jobs such as retention, backfills, or report generation.
+
+---
+
+## 1.1. NOMENCLATURE — AXES AND IDENTIFIERS
+
+This document covers multiple parallel axes of work. To avoid ambiguity,
+every reference uses a canonical identifier with a prefix:
+
+| Axis | Prefix | Identifiers | What it is |
+|------|--------|-------------|------------|
+| **Migration v2 → v2.5** | `MIG-v2.5#` | MIG-v2.5#1 … MIG-v2.5#10 | Migration steps to deploy Rust daemon alongside Django |
+| **Migration v2.5 → v3** | `MIG-v3#` | MIG-v3#1 … MIG-v3#8 | Migration steps to promote Rust daemon as primary runtime |
+| **QueryEngine phases** | `QE-P` | QE-P1 … QE-P5 | Internal implementation phases of the QueryEngine subsystem (see v3-query-query-engine.md) |
+| **Pipeline stages** | `Stage` | Stage 1 … Stage N | Sequential stages within a single control loop cycle (see v3-control-loop.md, v3-runtime-spec.md) |
+
+**Rules**:
+- Never use bare "Phase 5" or "step 3" without prefix. Always use the canonical identifier.
+- `MIG-v2.5` and `MIG-v3` are sequential migration blocks. `QE-P1`…`QE-P5` are subsystem workstreams.
+- `QE-P5` is NOT a migration step; it is a deferred QueryEngine phase (Context Governance, v3+ with LLM).
+- `Stage N` is a pipeline stage within a single execution tick (e.g., Stage 1: Observe). Not a project milestone.
+
+**Quick status reference** (as of 2026-04-05, repository-verified):
+
+Status rule for this table: code-backed items may be marked done from repository evidence; operational rollout items stay pending unless the repository contains explicit rollout confirmation.
+
+| ID | Description | Status |
+|----|-------------|--------|
+| MIG-v2.5#1 | Deploy robsond to k3s | Pending (operational rollout) |
+| MIG-v2.5#2 | Complete projector handlers | Pending |
+| MIG-v2.5#3 | Migrate stop monitoring to WebSocket | Pending |
+| MIG-v2.5#4 | GovernedAction + Risk Engine blocking gate | ✅ Done (2026-04-04) |
+| MIG-v2.5#5 | Circuit breaker escalation ladder | Pending |
+| MIG-v2.5#6 | SSE endpoint for frontend | ✅ Done (2026-04-05) |
+| MIG-v2.5#7 | SOPS secrets management | Pending |
+| MIG-v2.5#8 | Deploy Prometheus + Grafana + Loki | Pending |
+| MIG-v2.5#9 | Contract tests for daemon API | Pending |
+| MIG-v2.5#10 | EventLog replay determinism test | ✅ Done (2026-04-05) |
+| MIG-v3#1 | Promote robsond as primary runtime | Pending |
+| MIG-v3#2 | Replace Django API with thin gateway | Pending |
+| MIG-v3#3 | Frontend direct connection to SSE | Pending |
+| MIG-v3#4 | Dynamic risk limits | Pending |
+| MIG-v3#5 | Operator control surface in UI | Pending |
+| MIG-v3#6 | Hash-chained EventLog | Pending |
+| MIG-v3#7 | PaymentRail trait | Pending |
+| MIG-v3#8 | Chaos testing suite | Pending |
+| QE-P1 | Passive Wrapper (Non-Breaking) | ✅ Done |
+| QE-P2 | Blocking Governance | ✅ Done (2026-04-04) |
+| QE-P3 | Approval Gates | ✅ Done (2026-04-05) |
+| QE-P4 | Full Audit & Replay | ✅ Done (2026-04-05) |
+| QE-P5 | Context Governance (LLM) | Deferred (v3+) |
 
 ---
 
@@ -175,32 +225,34 @@ CycleCompleted {
 | Aspect | Specification |
 |--------|--------------|
 | **Input contract** | `RuntimeInput` enum: `MarketTick { symbol, bid, ask, ts }`, `DetectorSignal { signal_id, symbol, side, entry_price, tech_stop }`, `OperatorCommand { cmd, params }`, `OrderFill { order_id, fill_price, fill_qty, ts }`, `Timer { interval_id }` |
-| **Output contract** | `RuntimeOutput` enum: `EventsProduced(Vec<DomainEvent>)`, `ActionRequested(EngineAction)`, `StateChanged(PositionId, PositionState)`, `Alert(AlertKind, String)` |
-| **Internal phases** | Observation -> Inspection -> Risk Gate -> Engine Decision -> Action Governance -> Execution -> Evaluation -> Persistence |
+| **Output contract** | `RuntimeOutput` enum: `EventsProduced(Vec<DomainEvent>)`, `ActionRequested(Vec<EngineAction>)` after runtime governance clearance, `StateChanged(PositionId, PositionState)`, `Alert(AlertKind, String)` |
+| **Internal stages** | Observation -> Inspection -> Risk Gate -> Engine Decision -> Action Governance -> Execution -> Evaluation -> Persistence |
 | **State representation** | `RuntimeState { positions: HashMap<PositionId, Position>, risk_snapshot: RiskSnapshot, active_orders: HashMap<OrderId, OrderState>, config: RuntimeConfig, circuit_breaker: CircuitBreakerState }` |
 | **Model-agnostic** | Runtime has ZERO coupling to any LLM. The Engine is pure Rust functions. If/when LLM integration is added (v3+), it enters through a `ReasoningPort` trait that the Runtime governs. |
 
 ### Zero-Bypass Enforcement
 
-The Runtime enforces governance through Rust's type system:
+The Runtime enforces governance at the `robsond` boundary today. Stronger cross-crate type-level enforcement remains a target architecture item, not current executor reality:
 
-1. **No raw exchange access**: `ExchangePort` is a trait. The only implementation is wrapped by `GovernedExchange` which checks permissions before every call.
-2. **No direct EventLog writes**: Only the Runtime's `persist()` method calls `append_event()`. Components produce events; the Runtime decides what gets persisted.
-3. **No ungoverned actions**: `EngineAction` is produced by the pure Engine. The Executor only accepts actions from the Runtime's `act()` method, which has already passed Risk Gate.
+1. **No raw exchange access from the decision path**: `ExchangePort` remains behind `Executor`. Runtime entry points are wrapped by `QueryEngine` before dispatch.
+2. **No ungoverned actions inside `robsond`**: `EngineAction` must pass through `QueryEngine` risk evaluation before executor dispatch. `QueryEngine` uses an internal `GovernedAction` token (`pub(crate)`) to represent "risk-cleared" actions inside the crate.
+3. **Current persistence reality**: query lifecycle audit events are appended via `EventLogQueryRecorder`; executor domain events are still persisted via `Store::events().append()`. Convergence to a single durable persistence boundary is follow-up work.
 
 ```rust
-// The Executor CANNOT be called directly with an EngineAction.
-// It receives GovernedAction, which can only be constructed by the Runtime.
-pub struct GovernedAction {
-    inner: EngineAction,
-    risk_clearance: RiskClearance,  // proof that Risk Engine approved
-    cycle_id: Ulid,                 // audit linkage
+// Current QE-P2 implementation inside robsond.
+pub(crate) struct GovernedAction {
+    actions: Vec<EngineAction>,
+    _proof: (),  // private token proving QueryEngine approval
 }
 
 impl GovernedAction {
-    // Private constructor — only Runtime can create
-    fn new(action: EngineAction, clearance: RiskClearance, cycle_id: Ulid) -> Self { ... }
+    // Private constructor — only QueryEngine can create
+    fn new(actions: Vec<EngineAction>) -> Self { ... }
+    pub(crate) fn into_actions(self) -> Vec<EngineAction> { ... }
 }
+
+// Executor API remains unchanged today.
+pub async fn execute(&self, actions: Vec<EngineAction>) -> ExecResult<Vec<ActionResult>> { ... }
 ```
 
 ### Context Management (v3 — when LLM integration is added)
@@ -241,7 +293,7 @@ If the Runtime crashes mid-cycle:
 | **Orchestrator** (robsond main loop) | Bootstrap components, manage lifecycle, route inputs to Runtime | Must NOT execute tools, hold mutable state outside Runtime, or bypass Risk Engine |
 | **Runtime** (PositionManager + Control Loop) | Own the Control Loop, manage context, enforce governance, coordinate state | Must NOT make trading decisions (that's Engine), access exchange directly (that's Executor via ExchangePort) |
 | **Engine** (robson-engine) | Pure decision logic: position sizing, trailing stop, risk gate | Must NOT perform I/O, access database, call exchange. ZERO side effects. |
-| **Executor** (robson-exec) | Execute governed actions on exchange, manage intent journal | Must NOT reason, decide, or self-authorize. Only accepts GovernedAction from Runtime |
+| **Executor** (robson-exec) | Execute actions cleared by Runtime/QueryEngine on exchange, manage intent journal | Must NOT reason, decide, or self-authorize. The signature still accepts `Vec<EngineAction>` today; governance is enforced before dispatch |
 | **Risk Engine** (robson-engine::risk) | Evaluate limits, enforce constraints, trigger circuit breakers | Must NOT be bypassed, overridden by any component, or made advisory-only |
 | **EventLog** (robson-eventlog) | Persist immutable events, provide replay | Must NOT mutate events, allow deletion, or serve as query engine (that's projections) |
 | **Store** (robson-store) | Persist/recall volatile projections from EventLog | Must NOT be treated as source of truth. Always rebuildable from EventLog |
@@ -268,7 +320,7 @@ Every action requires explicit permission. Permissions are scoped:
 
 This list is configurable via `robsond.toml`.
 
-**Implementation note (Phase 3 minimum, 2026-04-05)**: the current `robsond`
+**Implementation note (QE-P3 minimum, 2026-04-05)**: the current `robsond`
 implementation wires the minimal production path only:
 - `PlaceEntryOrder` above 5% of capital is gated
 - approval state is kept in memory only for the current daemon lifetime
@@ -281,7 +333,7 @@ implementation wires the minimal production path only:
 - REST bootstrap exposes pending approvals on `/status`
 
 The broader configurable permission matrix remains the v3 target architecture,
-but it is not fully implemented in this phase.
+but it is not fully implemented in QE-P3.
 
 **Escalation path**: When permission is denied:
 1. Action is BLOCKED (not silently dropped)
@@ -471,7 +523,7 @@ interface EventStreamMessage {
 - REST remains the bootstrap path for snapshots (`/status`, `/positions`, etc.)
 - SSE carries incremental operator-facing updates only
 - Public stream is mapped from internal daemon events; it does NOT expose `DaemonEvent` directly
-- Phase 3 adds approval observability on the same stream via
+- QE-P3 adds approval observability on the same stream via
   `query.awaiting_approval`, `query.authorized`, and `query.expired`
 - Keepalive heartbeat is enabled
 - On broadcast lag, the daemon emits `system.resync_required` and closes the stream
@@ -492,7 +544,7 @@ interface EventStreamMessage {
 | Capability | Description | Latency | Implementation |
 |-----------|-------------|---------|----------------|
 | **Pause/Resume** | Pause control loop (drain current cycle, block new ones) | < 100ms ack | `POST /api/v1/control/pause` -> sets flag in Runtime |
-| **Override** | Override pending decision before execution | Before Act phase | `POST /api/v1/control/override/{cycle_id}` with operator decision |
+| **Override** | Override pending decision before execution | Before Act stage | `POST /api/v1/control/override/{cycle_id}` with operator decision |
 | **Risk adjustment** | Adjust risk parameters in real-time | Immediate on next cycle | `PUT /api/v1/config/risk-limits` -> updates RuntimeConfig |
 | **Event injection** | Inject events (manual observations, corrections) | Persisted in current cycle | `POST /api/v1/events/inject` with event type + payload |
 | **Replay** | Replay past events/cycles for audit | On-demand, <30s for 100K events | `GET /api/v1/replay?from={seq}&to={seq}` |
@@ -813,46 +865,46 @@ Reconsider TRON integration when ALL of these are true:
 
 ## 12. MIGRATION PLAN
 
-### v2 -> v2.5 (Incremental, Non-Breaking, De-Risks v3)
+### MIG-v2.5: v2 → v2.5 (Incremental, Non-Breaking, De-Risks v3)
 
-| # | Change | Why It Cannot Wait | Depends On | Effort | Reversible? | Rollback | Breaks If Skipped |
-|---|--------|--------------------|-----------|--------|-------------|----------|-------------------|
-| 1 | **Deploy robsond to k3s alongside Django** | Rust daemon must be running before it can take over stop monitoring. Deploy first, verify stability. | K8s manifests (exist in v2/k8s/) | S | Yes — undeploy pod | `kubectl delete deployment robsond` | v3 has no production-proven daemon |
-| 2 | **Complete projector handlers** (robson-projector, currently 40%) | Without projections, Runtime cannot reconstruct state on restart | robsond deployed (#1) | M | Yes — code change only | Revert commit | Runtime loses state on restart, requires full EventLog replay every time |
-| 3 | **Migrate stop monitoring from Django CronJob to robsond WebSocket** | CronJob has 60s granularity. WebSocket achieves <500ms. This is the core latency improvement. | robsond deployed (#1), projector complete (#2) | M | Yes — re-enable CronJob | Re-enable `rbs-stop-monitor-cronjob`, disable robsond stop monitor | Stop-loss latency stays at 60s, unacceptable for leveraged trading |
-| 4 | **Implement GovernedAction + Risk Engine as blocking gate** | Risk Engine is currently in robson-engine but not wired as mandatory gate. Must block before any v3 feature relies on it. | robsond deployed (#1) | M | Yes — revert to advisory mode | Config flag: `risk_engine_mode: advisory` | Risk Engine bypass possible, defeating the entire safety architecture |
-| 5 | **Implement circuit breaker escalation ladder (L1-L4)** | Without escalation, a single circuit breaker trip halts the system with no graceful degradation | Risk Engine blocking (#4) | M | Yes — revert to simple halt | Remove escalation, revert to single-level circuit breaker | Operator must manually intervene for every risk event, no automated protection |
-| 6 | **Add SSE endpoint to robsond for frontend event streaming** — IMPLEMENTED 2026-04-05 | Frontend needs real-time data from daemon, not Django polling | robsond deployed (#1) | S | Yes — frontend falls back to REST polling | Remove SSE route, frontend uses REST | Frontend has no real-time capability, operator flies blind |
-| 7 | **Implement SOPS for secrets management** | Current secrets are K8s secrets (base64, not encrypted at rest in git). SOPS encrypts in git. | None | S | Yes — revert to plain K8s secrets | Remove .sops.yaml, restore template secrets | Secrets remain unencrypted in git templates (security risk) |
-| 8 | **Deploy Prometheus + Grafana + Loki on k3s** | Observability is non-negotiable before v3. Cannot debug production issues without metrics/logs. | k3s cluster (exists) | M | Yes — undeploy | `kubectl delete namespace monitoring` | Flying blind in production. Debugging via `kubectl logs` only. |
-| 9 | **Contract tests for daemon API** | CLI and frontend depend on daemon API stability. Breaking changes must be caught in CI. | robsond deployed (#1) | S | Yes — remove test suite | Revert CI config | API breaks silently, CLI/frontend stop working after daemon update |
-| 10 | **EventLog replay determinism test** — ✅ IMPLEMENTED 2026-04-05 | Must prove replay works before relying on it for state recovery | EventLog implemented (exists in v2) | S | Yes — remove test | N/A | Cannot guarantee state recovery correctness |
+| ID | Change | Why It Cannot Wait | Depends On | Effort | Reversible? | Rollback | Breaks If Skipped |
+|----|--------|--------------------|-----------|--------|-------------|----------|-------------------|
+| MIG-v2.5#1 | **Deploy robsond to k3s alongside Django** | Rust daemon must be running before it can take over stop monitoring. Deploy first, verify stability. | K8s manifests (exist in v2/k8s/) | S | Yes — undeploy pod | `kubectl delete deployment robsond` | v3 has no production-proven daemon |
+| MIG-v2.5#2 | **Complete projector handlers** (robson-projector, currently 40%) | Without projections, Runtime cannot reconstruct state on restart | MIG-v2.5#1 | M | Yes — code change only | Revert commit | Runtime loses state on restart, requires full EventLog replay every time |
+| MIG-v2.5#3 | **Migrate stop monitoring from Django CronJob to robsond WebSocket** | CronJob has 60s granularity. WebSocket achieves <500ms. This is the core latency improvement. | MIG-v2.5#1, MIG-v2.5#2 | M | Yes — re-enable CronJob | Re-enable `rbs-stop-monitor-cronjob`, disable robsond stop monitor | Stop-loss latency stays at 60s, unacceptable for leveraged trading |
+| MIG-v2.5#4 | **Implement GovernedAction + Risk Engine as blocking gate** | Risk Engine is currently in robson-engine but not wired as mandatory gate. Must block before any v3 feature relies on it. | MIG-v2.5#1 | M | Yes — revert to advisory mode | Config flag: `risk_engine_mode: advisory` | Risk Engine bypass possible, defeating the entire safety architecture |
+| MIG-v2.5#5 | **Implement circuit breaker escalation ladder (L1-L4)** | Without escalation, a single circuit breaker trip halts the system with no graceful degradation | MIG-v2.5#4 | M | Yes — revert to simple halt | Remove escalation, revert to single-level circuit breaker | Operator must manually intervene for every risk event, no automated protection |
+| MIG-v2.5#6 | **Add SSE endpoint to robsond for frontend event streaming** — ✅ DONE 2026-04-05 | Frontend needs real-time data from daemon, not Django polling | MIG-v2.5#1 | S | Yes — frontend falls back to REST polling | Remove SSE route, frontend uses REST | Frontend has no real-time capability, operator flies blind |
+| MIG-v2.5#7 | **Implement SOPS for secrets management** | Current secrets are K8s secrets (base64, not encrypted at rest in git). SOPS encrypts in git. | None | S | Yes — revert to plain K8s secrets | Remove .sops.yaml, restore template secrets | Secrets remain unencrypted in git templates (security risk) |
+| MIG-v2.5#8 | **Deploy Prometheus + Grafana + Loki on k3s** | Observability is non-negotiable before v3. Cannot debug production issues without metrics/logs. | k3s cluster (exists) | M | Yes — undeploy | `kubectl delete namespace monitoring` | Flying blind in production. Debugging via `kubectl logs` only. |
+| MIG-v2.5#9 | **Contract tests for daemon API** | CLI and frontend depend on daemon API stability. Breaking changes must be caught in CI. | MIG-v2.5#1 | S | Yes — remove test suite | Revert CI config | API breaks silently, CLI/frontend stop working after daemon update |
+| MIG-v2.5#10 | **EventLog replay determinism test** — ✅ DONE 2026-04-05 | Must prove replay works before relying on it for state recovery | EventLog implemented (exists in v2) | S | Yes — remove test | N/A | Cannot guarantee state recovery correctness |
 
-### v2.5 -> v3 (Architectural Evolution)
+### MIG-v3: v2.5 → v3 (Architectural Evolution)
 
-| # | Change | Replaces from v2.5 | Precondition | Effort | Reversible? | Rollback | Breaks If Done Wrong |
-|---|--------|-------------------|-------------|--------|-------------|----------|---------------------|
-| 1 | **Promote robsond as primary runtime** (all execution goes through daemon) | Django stop monitor CronJob | v2.5 #1-#4 complete, daemon stable for >2 weeks in prod | M | Yes — rollback to legacy runtime | Suspend robsond execution path, restore legacy runtime, redirect frontend to Django API if needed | Execution path broken if daemon has undiscovered bugs |
-| 2 | **Replace Django API with thin gateway** (FastAPI or axum) that proxies to robsond | Django REST API | robsond is primary (#1), frontend SSE working (v2.5 #6) | L | Partially — can re-enable Django | Redeploy Django, update ingress routing | Frontend/CLI break if gateway has bugs; both have robsond as direct fallback |
-| 3 | **Frontend direct connection to robsond SSE** | SSE via Django proxy | Gateway deployed (#2) | S | Yes — revert to Django proxy | Update frontend VITE_API_BASE_URL to Django endpoint | Frontend loses real-time if SSE path fails; graceful degradation to REST |
-| 4 | **Dynamic risk limits** (volatility-adjusted, funding-rate-aware) | Hard limits only | Risk Engine blocking (v2.5 #4), market data pipeline working | M | Yes — disable dynamic, use hard limits | Config: `dynamic_limits_enabled: false` | False sense of security if dynamic computation is wrong; fallback to hard limits is safe |
-| 5 | **Operator control surface** (pause/resume/override in UI) | CLI-only operator interaction | Frontend SSE (#3), daemon control API (v2.5 #6) | M | Yes — controls are additive | Remove UI controls, operator uses CLI | Operator must use CLI for all interventions, slower response in emergencies |
-| 6 | **Hash-chained EventLog** for tamper detection | Plain EventLog | EventLog stable, replay determinism proven (v2.5 #10 ✅ DONE 2026-04-05) | S | Yes — stop computing hashes | Remove hash column, revert to plain append | Audit trail tampering undetectable; acceptable for single operator, problematic if audited |
-| 7 | **PaymentRail trait** (architecture readiness for future settlement) | None | None (pure interface definition) | S | Yes — delete trait | Remove trait definition | No impact on v3; delays TRON readiness if ever needed |
-| 8 | **Chaos testing suite** | No chaos testing | All components deployed and stable | M | Yes — disable tests | Remove chaos test suite from CI | Undiscovered failure modes in production; acceptable risk if monitoring is good |
+| ID | Change | Replaces from v2.5 | Precondition | Effort | Reversible? | Rollback | Breaks If Done Wrong |
+|----|--------|-------------------|-------------|--------|-------------|----------|---------------------|
+| MIG-v3#1 | **Promote robsond as primary runtime** (all execution goes through daemon) | Django stop monitor CronJob | MIG-v2.5#1–#4 complete, daemon stable for >2 weeks in prod | M | Yes — rollback to legacy runtime | Suspend robsond execution path, restore legacy runtime, redirect frontend to Django API if needed | Execution path broken if daemon has undiscovered bugs |
+| MIG-v3#2 | **Replace Django API with thin gateway** (FastAPI or axum) that proxies to robsond | Django REST API | MIG-v3#1, MIG-v2.5#6 | L | Partially — can re-enable Django | Redeploy Django, update ingress routing | Frontend/CLI break if gateway has bugs; both have robsond as direct fallback |
+| MIG-v3#3 | **Frontend direct connection to robsond SSE** | SSE via Django proxy | MIG-v3#2 | S | Yes — revert to Django proxy | Update frontend VITE_API_BASE_URL to Django endpoint | Frontend loses real-time if SSE path fails; graceful degradation to REST |
+| MIG-v3#4 | **Dynamic risk limits** (volatility-adjusted, funding-rate-aware) | Hard limits only | MIG-v2.5#4, market data pipeline working | M | Yes — disable dynamic, use hard limits | Config: `dynamic_limits_enabled: false` | False sense of security if dynamic computation is wrong; fallback to hard limits is safe |
+| MIG-v3#5 | **Operator control surface** (pause/resume/override in UI) | CLI-only operator interaction | MIG-v3#3, MIG-v2.5#6 | M | Yes — controls are additive | Remove UI controls, operator uses CLI | Operator must use CLI for all interventions, slower response in emergencies |
+| MIG-v3#6 | **Hash-chained EventLog** for tamper detection | Plain EventLog | EventLog stable, MIG-v2.5#10 ✅ DONE 2026-04-05 | S | Yes — stop computing hashes | Remove hash column, revert to plain append | Audit trail tampering undetectable; acceptable for single operator, problematic if audited |
+| MIG-v3#7 | **PaymentRail trait** (architecture readiness for future settlement) | None | None (pure interface definition) | S | Yes — delete trait | Remove trait definition | No impact on v3; delays TRON readiness if ever needed |
+| MIG-v3#8 | **Chaos testing suite** | No chaos testing | All components deployed and stable | M | Yes — disable tests | Remove chaos test suite from CI | Undiscovered failure modes in production; acceptable risk if monitoring is good |
 
 ### Migration Rules
 
 1. **Every migration step generates an immutable event**: `MigrationStepStarted`, `MigrationStepCompleted`, `MigrationStepRolledBack` in EventLog.
 2. **Data migration risk**: Steps #1-#6 in v2.5 do NOT migrate data. The Django database remains untouched. robsond creates its own EventLog in Postgres. The two systems coexist during v2.5, but only one execution path may be active for live stop/trailing responsibilities at a time.
 3. **Build order** (foundation first):
-   - FIRST: robsond deployment (#1) + SOPS (#7) + observability (#8) + **QueryEngine Phase 1** (passive wrapper) ✅ DONE
-   - THEN: projector (#2) + Risk Engine wiring (#4) + **QueryEngine Phase 2** (blocking governance) ✅ DONE 2026-04-04
-   - THEN: stop monitoring migration (#3) + circuit breaker (#5)
-   - THEN: SSE (#6) + **QueryEngine Phase 3** (approval gates) ✅ DONE 2026-04-05
-   - THEN: contract tests (#9) + replay tests (#10 / **QueryEngine Phase 4**: full audit & replay) ✅ DONE 2026-04-05
-   - See v3-query-query-engine.md for complete QueryEngine implementation timeline
-4. **Parallelizable**: #1 + #7 + #8 + QueryEngine Phase 1 can run in parallel. #2 + #4 + QueryEngine Phase 2 can run in parallel after #1. #9 + #10 can run in parallel after #1.
+   - FOUNDATION: MIG-v2.5#1 + MIG-v2.5#7 + MIG-v2.5#8 + **QE-P1** (passive wrapper)
+   - GOVERNANCE: MIG-v2.5#2 + MIG-v2.5#4 + **QE-P2** (blocking governance)
+   - EXECUTION CUTOVER: MIG-v2.5#3 + MIG-v2.5#5
+   - OPERATOR FEEDBACK: MIG-v2.5#6 + **QE-P3** (approval gates)
+   - VERIFICATION: MIG-v2.5#9 + MIG-v2.5#10 / **QE-P4** (full audit & replay)
+   - See v3-query-query-engine.md for complete QueryEngine implementation timeline (QE-P1…QE-P5)
+4. **Parallelizable**: MIG-v2.5#1 + MIG-v2.5#7 + MIG-v2.5#8 + QE-P1 can run in parallel. MIG-v2.5#2 + MIG-v2.5#4 + QE-P2 can run in parallel after MIG-v2.5#1. MIG-v2.5#9 + MIG-v2.5#10 can run in parallel after MIG-v2.5#1.
 5. **No parallel execution authorities**: v3 never runs Django execution CronJobs in parallel with robsond. Rollback is mutually exclusive.
 6. **Deferred to post-v3**:
    - Backtesting (robson-sim): Trigger — operator wants to validate strategies before arming
@@ -880,13 +932,15 @@ Reconsider TRON integration when ALL of these are true:
 
 ## 14. FINAL RECOMMENDATIONS
 
-### Build THIS WEEK (in order)
+### Current Recommended Next Steps
 
-1. **Deploy robsond to k3s** — create kustomization overlay for prod namespace, push image, verify healthz/readyz
-2. **Wire Risk Engine as blocking gate** — implement GovernedAction wrapper, deny by default
-3. **Complete projector handlers** — position and order projection handlers (the 60% gap)
-4. **Set up SOPS** — generate age key, encrypt existing secrets, update ArgoCD
-5. **Deploy Prometheus + Grafana** — helm chart install, basic dashboards (system metrics + robsond custom metrics)
+The repository already shows `MIG-v2.5#4`, `MIG-v2.5#6`, `MIG-v2.5#10`, and `QE-P1` through `QE-P4` implemented. The next actions should stay inside the pending `MIG-v2.5` items:
+
+1. **MIG-v2.5#1 — Operational rollout of robsond to k3s**: create the production overlay, deploy the daemon, and verify `healthz`/`readyz` under the real namespace.
+2. **MIG-v2.5#2 — Complete projector handlers**: close the projection/recovery gaps so restart semantics match the real runtime event flow.
+3. **MIG-v2.5#3 — Migrate stop monitoring to robsond WebSocket**: only after `MIG-v2.5#1` and `MIG-v2.5#2` are accepted.
+4. **MIG-v2.5#5 — Implement the circuit breaker escalation ladder**: build on top of the already-implemented blocking gate.
+5. **MIG-v2.5#7, MIG-v2.5#8, MIG-v2.5#9 — Finish the ops baseline**: SOPS, observability, and daemon API contract tests.
 
 ### Explicitly NOT Building Yet
 
@@ -900,6 +954,6 @@ Reconsider TRON integration when ALL of these are true:
 
 **The Rust Runtime (robsond) must become the sole guardian of execution.**
 
-If robsond is deployed, stable, and enforcing the Risk Engine as a blocking gate, everything else follows: the EventLog captures truth, the projections derive from truth, the frontend displays truth, the operator intervenes on truth. If robsond fails to become the authority — if Django remains in the execution path, if the Risk Engine remains advisory, if events bypass the log — then v3 is a collection of components, not a system. The entire migration hinges on this one transition: from Django CronJob executing stops every 60 seconds, to robsond governing every action in real-time with full audit.
+Once robsond is deployed, stable, and enforcing the Risk Engine as a blocking gate, everything else follows: the EventLog captures truth, the projections derive from truth, the frontend displays truth, the operator intervenes on truth. If robsond fails to become the authority — if Django remains in the execution path, if the Risk Engine remains advisory, if events bypass the log — then v3 is a collection of components, not a system. The entire migration hinges on this one transition: from Django CronJob executing stops every 60 seconds, to robsond governing every action in real-time with full audit.
 
 Ship this. Everything else is sequencing.
