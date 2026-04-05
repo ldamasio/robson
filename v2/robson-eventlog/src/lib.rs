@@ -35,6 +35,8 @@ pub mod idempotency;
 pub mod query;
 pub mod types;
 
+pub const QUERY_STATE_CHANGED_EVENT_TYPE: &str = "QUERY_STATE_CHANGED";
+
 pub use append::append_event;
 pub use idempotency::compute_idempotency_key;
 pub use query::{QueryOptions, query_events};

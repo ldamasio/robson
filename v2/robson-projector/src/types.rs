@@ -8,6 +8,22 @@ use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 // =============================================================================
+// QUERY AUDIT EVENTS
+// =============================================================================
+
+/// QUERY_STATE_CHANGED payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct QueryStateChanged {
+    pub query_id: Uuid,
+    pub position_id: Option<Uuid>,
+    pub state: String,
+    pub started_at: DateTime<Utc>,
+    pub finished_at: Option<DateTime<Utc>>,
+    pub transition_cause: String,
+    pub snapshot: serde_json::Value,
+}
+
+// =============================================================================
 // ORDER EVENTS
 // =============================================================================
 

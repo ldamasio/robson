@@ -5,6 +5,7 @@
 use crate::error::{ProjectionError, Result};
 use crate::handlers;
 use robson_eventlog::EventEnvelope;
+use robson_eventlog::QUERY_STATE_CHANGED_EVENT_TYPE;
 use sqlx::PgPool;
 
 /// Apply a single event to all relevant projection tables.
@@ -50,6 +51,11 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
         // Strategy events
         "STRATEGY_ENABLED" => handlers::strategy::handle_strategy_enabled(pool, envelope).await?,
         "STRATEGY_DISABLED" => handlers::strategy::handle_strategy_disabled(pool, envelope).await?,
+
+        // Query audit events
+        QUERY_STATE_CHANGED_EVENT_TYPE => {
+            handlers::queries::handle_query_state_changed(pool, envelope).await?
+        },
 
         _ => {
             tracing::warn!("Unknown event type: {}", envelope.event_type);
