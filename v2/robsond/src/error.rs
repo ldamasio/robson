@@ -83,6 +83,14 @@ pub enum DaemonError {
     #[error("Monitor error: {0}")]
     Monitor(#[from] MonitorError),
 
+    /// EventLog persistence failure (append or projection apply).
+    ///
+    /// Raised when `event_log_pool` is configured and a domain event fails
+    /// to be appended or applied. This is a hard error — callers must not
+    /// silently continue, as doing so would leave `positions_current` stale.
+    #[error("EventLog error: {0}")]
+    EventLog(String),
+
     /// Shutdown requested
     #[error("Shutdown requested")]
     Shutdown,

@@ -48,3 +48,8 @@ reqwest = { version = "0.12", features = ["json"] }
 http-body-util = "0.1"
 robson-eventlog = { path = "../robson-eventlog" }
 robson-projector = { path = "../robson-projector" }
+robson-domain = { path = "../robson-domain" }
+robson-engine = { path = "../robson-engine" }
+robson-exec = { path = "../robson-exec" }
+robson-store = { path = "../robson-store" }
+anyhow = { workspace = true }

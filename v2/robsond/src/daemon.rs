@@ -191,13 +191,17 @@ impl Daemon<StubExchange, MemoryStore> {
         let risk_config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
         let engine = Engine::new(risk_config);
 
-        let position_manager = Arc::new(RwLock::new(PositionManager::new(
+        let mut pm = PositionManager::new(
             engine,
             executor,
             store.clone(),
             event_bus.clone(),
             query_recorder,
-        )));
+        );
+        if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
+            pm = pm.with_event_log((**pool).clone(), tenant_id);
+        }
+        let position_manager = Arc::new(RwLock::new(pm));
 
         Self {
             config,

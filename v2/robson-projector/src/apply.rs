@@ -32,6 +32,9 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
         "entry_filled" | "ENTRY_FILLED" => {
             handlers::positions::handle_entry_filled(pool, envelope).await?
         },
+        "entry_signal_received" | "ENTRY_SIGNAL_RECEIVED" => {
+            handlers::positions::handle_entry_signal_received(pool, envelope).await?
+        },
         "trailing_stop_updated" | "TRAILING_STOP_UPDATED" => {
             handlers::positions::handle_trailing_stop_updated(pool, envelope).await?
         },
@@ -57,9 +60,31 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
             handlers::queries::handle_query_state_changed(pool, envelope).await?
         },
 
+        // Domain position lifecycle events (snake_case, emitted by robsond via executor)
+        "position_armed" => {
+            handlers::positions::handle_position_armed(pool, envelope).await?
+        },
+        "position_disarmed" => {
+            handlers::positions::handle_position_disarmed(pool, envelope).await?
+        },
+        "exit_filled" | "EXIT_FILLED" => {
+            handlers::positions::handle_exit_filled(pool, envelope).await?
+        },
+        // Lowercase position_closed: domain event with P&L fields
+        "position_closed" => {
+            handlers::positions::handle_position_closed_domain(pool, envelope).await?
+        },
+
         _ => {
-            tracing::warn!("Unknown event type: {}", envelope.event_type);
-            return Err(ProjectionError::UnknownEventType(envelope.event_type.clone()));
+            // Unknown event types are a configuration error - they indicate the projector
+            // is missing a handler for an event type that was persisted to the eventlog.
+            // Return an error so the caller can decide how to handle (retry, alert, etc).
+            // The checkpoint should NOT advance for unhandled events.
+            return Err(ProjectionError::MissingHandler {
+                event_type: envelope.event_type.clone(),
+                seq: envelope.seq,
+                stream_key: envelope.stream_key.clone(),
+            });
         },
     }
 

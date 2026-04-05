@@ -144,6 +144,21 @@ pub struct EntryFilled {
     pub timestamp: DateTime<Utc>,
 }
 
+/// ENTRY_SIGNAL_RECEIVED payload (entry_signal_received event from domain)
+///
+/// Emitted by the engine when a detector signal is received for an armed position.
+/// This is an audit event - it does not change position state (that's done by entry_order_placed).
+/// We persist it for audit trail purposes but it doesn't affect positions_current projection.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntrySignalReceived {
+    pub position_id: Uuid,
+    pub signal_id: Uuid,
+    pub entry_price: Decimal,
+    pub stop_loss: Decimal,
+    pub quantity: Decimal,
+    pub timestamp: DateTime<Utc>,
+}
+
 /// TRAILING_STOP_UPDATED payload (trailing_stop_updated event from domain)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TrailingStopUpdated {
@@ -225,4 +240,89 @@ pub struct StrategyEnabled {
 pub struct StrategyDisabled {
     pub strategy_id: Uuid,
     pub reason: Option<String>,
+}
+
+// =============================================================================
+// DOMAIN POSITION LIFECYCLE EVENTS (emitted by robsond executor, snake_case)
+// =============================================================================
+
+/// Minimal Symbol representation matching robson-domain::Symbol serialization.
+/// Symbol serializes as {"base": "BTC", "quote": "USDT"}.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SymbolPayload {
+    pub base: String,
+    pub quote: String,
+}
+
+impl SymbolPayload {
+    /// Produce the canonical trading pair string (e.g. "BTCUSDT").
+    pub fn as_pair(&self) -> String {
+        format!("{}{}", self.base, self.quote)
+    }
+}
+
+/// TechnicalStopDistance representation matching robson-domain::TechnicalStopDistance.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TechnicalStopDistancePayload {
+    pub distance: Decimal,
+    pub distance_pct: Decimal,
+    /// initial_stop is a Price value object: serialized as Decimal by serde.
+    pub initial_stop: Decimal,
+}
+
+/// position_armed payload (robson-domain::Event::PositionArmed)
+///
+/// Emitted by PositionManager::arm_position() via Executor::EmitEvent.
+/// Creates an 'armed' row in positions_current.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionArmed {
+    pub position_id: Uuid,
+    pub account_id: Uuid,
+    pub symbol: SymbolPayload,
+    /// "Long" or "Short" (PascalCase, matches Side enum default serde)
+    pub side: String,
+    pub tech_stop_distance: Option<TechnicalStopDistancePayload>,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// position_disarmed payload (robson-domain::Event::PositionDisarmed)
+///
+/// Emitted when an armed position is disarmed before any entry order.
+/// Transitions the row from 'armed' to 'closed'.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionDisarmed {
+    pub position_id: Uuid,
+    pub reason: String,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// exit_filled payload (robson-domain::Event::ExitFilled)
+///
+/// Emitted when the exit order is confirmed filled.
+/// Records actual exit fill price and fees; does NOT close the position row —
+/// that is done by the subsequent position_closed event.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExitFilled {
+    pub position_id: Uuid,
+    pub order_id: Uuid,
+    pub fill_price: Decimal,
+    pub filled_quantity: Decimal,
+    pub fee: Decimal,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+/// position_closed payload (robson-domain::Event::PositionClosed, lowercase)
+///
+/// Emitted after the exit fill is confirmed, with final P&L summary.
+/// Transitions the row to 'closed' and records realized_pnl + total_fees.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PositionClosedDomain {
+    pub position_id: Uuid,
+    /// Serialized as string (ExitReason enum variants: "TrailingStop", "UserPanic", etc.)
+    pub exit_reason: String,
+    pub entry_price: Decimal,
+    pub exit_price: Decimal,
+    pub realized_pnl: Decimal,
+    pub total_fees: Decimal,
+    pub timestamp: chrono::DateTime<chrono::Utc>,
 }

@@ -29,8 +29,9 @@ use crate::ports::{ExchangePort, OrderResult};
 /// Result of executing an engine action.
 #[derive(Debug)]
 pub enum ActionResult {
-    /// Order placed successfully
-    OrderPlaced(OrderResult),
+    /// Order placed successfully, optionally with a domain event emitted.
+    /// For exit orders, the event is ExitOrderPlaced which transitions position to Exiting.
+    OrderPlaced { order: OrderResult, event: Option<Event> },
     /// Action was already processed (idempotent skip)
     AlreadyProcessed(Uuid),
     /// Event emitted (no exchange interaction)
@@ -233,7 +234,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             },
         }
 
-        result.map(ActionResult::OrderPlaced)
+        result.map(|order| ActionResult::OrderPlaced { order, event: None })
     }
 
     /// Execute exit order with idempotency.
@@ -289,6 +290,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             .await;
 
         // 4. Record result and emit ExitOrderPlaced event on success
+        let mut exit_event_opt = None;
         match &result {
             Ok(order_result) => {
                 info!(
@@ -300,7 +302,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                 );
                 self.journal.complete(intent_id, IntentResult::Success(order_result.clone()))?;
 
-                // Emit ExitOrderPlaced → apply_event transitions position to Exiting
+                // Create ExitOrderPlaced event (will be returned and persisted by caller)
                 let exit_event = Event::ExitOrderPlaced {
                     position_id,
                     order_id: intent_id,
@@ -309,8 +311,10 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                     exit_reason: reason,
                     timestamp: chrono::Utc::now(),
                 };
+                // Apply to in-memory store (caller persists to eventlog)
                 self.store.events().append(&exit_event).await?;
                 self.store.apply_event(&exit_event)?;
+                exit_event_opt = Some(exit_event);
             },
             Err(e) => {
                 error!(%position_id, error = %e, "Exit order failed");
@@ -318,7 +322,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             },
         }
 
-        result.map(ActionResult::OrderPlaced)
+        result.map(|order| ActionResult::OrderPlaced { order, event: exit_event_opt })
     }
 
     /// Get the intent journal (for inspection/recovery).
@@ -371,7 +375,7 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         match &results[0] {
-            ActionResult::OrderPlaced(order) => {
+            ActionResult::OrderPlaced { order, .. } => {
                 assert_eq!(order.fill_price.as_decimal(), dec!(95000));
                 assert_eq!(order.filled_quantity.as_decimal(), dec!(0.1));
             },
@@ -400,7 +404,7 @@ mod tests {
 
         // First execution
         let results1 = executor.execute(vec![action.clone()]).await.unwrap();
-        assert!(matches!(results1[0], ActionResult::OrderPlaced(_)));
+        assert!(matches!(results1[0], ActionResult::OrderPlaced { .. }));
 
         // Second execution should be idempotent
         let results2 = executor.execute(vec![action]).await.unwrap();
@@ -469,6 +473,6 @@ mod tests {
 
         assert_eq!(results.len(), 2);
         assert!(matches!(results[0], ActionResult::EventEmitted(_)));
-        assert!(matches!(results[1], ActionResult::OrderPlaced(_)));
+        assert!(matches!(results[1], ActionResult::OrderPlaced { .. }));
     }
 }

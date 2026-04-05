@@ -35,9 +35,15 @@ use robson_domain::{
 use robson_engine::{
     Engine, EngineAction, EngineDecision, PositionSummary, ProposedTrade, RiskContext, RiskGate,
 };
+#[cfg(feature = "postgres")]
+use robson_eventlog::{ActorType as EventlogActorType, Event as EventlogEvent, append_event};
 use robson_exec::{ActionResult, ExchangePort, ExecError, Executor};
+#[cfg(feature = "postgres")]
+use robson_projector::apply_event_to_projections;
 use robson_store::Store;
 use rust_decimal::Decimal;
+#[cfg(feature = "postgres")]
+use sqlx::PgPool;
 
 use crate::detector::DetectorTask;
 use crate::error::{DaemonError, DaemonResult};
@@ -81,6 +87,12 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     entry_flow_lock: Mutex<()>,
     /// Query engine for lifecycle tracking and audit persistence
     query_engine: Arc<QueryEngine<Arc<dyn QueryRecorder>>>,
+    /// Optional postgres pool for persisting domain events to robson-eventlog.
+    #[cfg(feature = "postgres")]
+    event_log_pool: Option<PgPool>,
+    /// Tenant ID used for eventlog entries. Required when event_log_pool is Some.
+    #[cfg(feature = "postgres")]
+    event_log_tenant_id: Option<Uuid>,
 }
 
 impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
@@ -129,7 +141,161 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
             entry_flow_lock: Mutex::new(()),
             query_engine,
+            #[cfg(feature = "postgres")]
+            event_log_pool: None,
+            #[cfg(feature = "postgres")]
+            event_log_tenant_id: None,
         }
+    }
+
+    /// Configure eventlog persistence for domain events (MIG-v2.5#2).
+    ///
+    /// When set, every domain event emitted through the executor is also
+    /// persisted to `robson-eventlog` and applied to projections synchronously.
+    /// This is required for crash recovery from `positions_current` to be
+    /// defensible in live execution.
+    #[cfg(feature = "postgres")]
+    pub fn with_event_log(mut self, pool: PgPool, tenant_id: Uuid) -> Self {
+        self.event_log_pool = Some(pool);
+        self.event_log_tenant_id = Some(tenant_id);
+        self
+    }
+
+    // =========================================================================
+    // Eventlog persistence bridge (MIG-v2.5#2)
+    // =========================================================================
+
+    /// Persist a single domain event to robson-eventlog and apply it to projections.
+    ///
+    /// When `event_log_pool` is configured this is a **fail-fast** operation.
+    /// Any failure in append OR projection apply is returned as `DaemonError::EventLog`
+    /// so that callers propagate the error and abort the current execution cycle.
+    ///
+    /// Rationale: the synchronous apply on the write path is the only active
+    /// projection update mechanism for `positions_current`. Silencing failures here
+    /// would leave the projection stale without the caller's knowledge, making
+    /// crash recovery unreliable. (MIG-v2.5#2 design decision.)
+    ///
+    /// When no pool is configured (in-memory only mode) returns `Ok(())` immediately.
+    ///
+    /// Stream key pattern: `position:{position_id}`.
+    #[cfg(feature = "postgres")]
+    async fn persist_event_to_log(&self, event: &Event) -> DaemonResult<()> {
+        let (pool, tenant_id) = match (&self.event_log_pool, &self.event_log_tenant_id) {
+            (Some(pool), Some(tid)) => (pool, *tid),
+            _ => return Ok(()), // No eventlog configured — in-memory only mode
+        };
+
+        let position_id = event.position_id();
+        let stream_key = format!("position:{}", position_id);
+        let event_type = event.event_type().to_string();
+
+        // Serialize full domain event as payload
+        let payload = serde_json::to_value(event).map_err(|e| {
+            DaemonError::EventLog(format!(
+                "Failed to serialize {} for eventlog (position {}): {}",
+                event_type, position_id, e
+            ))
+        })?;
+
+        let eventlog_event = EventlogEvent::new(tenant_id, &stream_key, &event_type, payload)
+            .with_actor(EventlogActorType::Daemon, Some("robsond".to_string()));
+
+        let event_id = match append_event(pool, &stream_key, None, eventlog_event).await {
+            Ok(id) => id,
+            Err(robson_eventlog::EventLogError::IdempotentDuplicate(id)) => {
+                // Duplicate means the append already happened, but projection apply may
+                // have failed on a previous attempt. Re-fetch the stored envelope and
+                // re-run projection apply so retries can heal partial failures.
+                tracing::debug!(
+                    event_type = %event_type,
+                    %position_id,
+                    event_id = %id,
+                    "Domain event already in eventlog (idempotent) — reapplying projection"
+                );
+                id
+            },
+            Err(e) => {
+                return Err(DaemonError::EventLog(format!(
+                    "Failed to append {} to eventlog (position {}): {}",
+                    event_type, position_id, e
+                )));
+            },
+        };
+
+        // Fetch the stored envelope and apply to projection synchronously.
+        // This is the write path for `positions_current` — failure is not acceptable.
+        let envelope = sqlx::query_as::<_, robson_eventlog::EventEnvelope>(
+            "SELECT event_id, tenant_id, stream_key, seq, event_type, payload, \
+             payload_schema_version, occurred_at, ingested_at, idempotency_key, \
+             trace_id, causation_id, command_id, workflow_id, \
+             actor_type, actor_id, prev_hash, hash \
+             FROM event_log WHERE event_id = $1",
+        )
+        .bind(event_id)
+        .fetch_one(pool)
+        .await
+        .map_err(|e| {
+            DaemonError::EventLog(format!(
+                "Failed to fetch envelope for {} (position {}, event_id {}): {}",
+                event_type, position_id, event_id, e
+            ))
+        })?;
+
+        apply_event_to_projections(pool, &envelope).await.map_err(|e| {
+            DaemonError::EventLog(format!(
+                "Failed to apply {} to projection (position {}, seq {}): {}",
+                event_type, position_id, envelope.seq, e
+            ))
+        })?;
+
+        tracing::debug!(
+            event_type = %event_type,
+            %position_id,
+            seq = envelope.seq,
+            "Domain event persisted to eventlog and projection applied"
+        );
+        Ok(())
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    async fn persist_event_to_log(&self, _event: &Event) -> DaemonResult<()> {
+        Ok(())
+    }
+
+    /// Execute engine actions and persist any emitted domain events to the eventlog.
+    ///
+    /// This is a wrapper around `executor.execute()` that adds eventlog persistence
+    /// for events in action results:
+    /// - `ActionResult::EventEmitted(event)` - events from EmitEvent action
+    /// - `ActionResult::OrderPlaced { event: Some(event), .. }` - events from exit orders
+    ///
+    /// When `event_log_pool` is configured, persistence is **fail-fast**: any failure
+    /// in `persist_event_to_log()` (append OR projection apply) is propagated as a
+    /// `DaemonError::EventLog` and the caller must abort the current execution cycle.
+    ///
+    /// This prevents silent projection drift during execution when PostgreSQL is in
+    /// use. Append and projection apply still happen in separate steps, so this is
+    /// fail-fast visibility, not an atomic multi-step guarantee.
+    async fn execute_and_persist(&self, actions: Vec<EngineAction>) -> DaemonResult<Vec<ActionResult>> {
+        let results = self.executor.execute(actions).await?;
+
+        // Persist events from results to eventlog (centralized for MIG-v2.5#2).
+        // Failures propagate — caller must not continue on EventLog error.
+        for result in &results {
+            match result {
+                ActionResult::EventEmitted(event) => {
+                    self.persist_event_to_log(event).await?;
+                },
+                ActionResult::OrderPlaced { event: Some(event), .. } => {
+                    // Exit orders carry ExitOrderPlaced event - persist it before PositionClosed
+                    self.persist_event_to_log(event).await?;
+                },
+                _ => {},
+            }
+        }
+
+        Ok(results)
     }
 
     /// Start the position manager's background tasks.
@@ -539,19 +705,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
         self.record_query_transition(query, "acting").await?;
 
-        let results = match self.executor.execute(governed.into_actions()).await {
+        let results = match self.execute_and_persist(governed.into_actions()).await {
             Ok(r) => r,
             Err(e) => {
                 query.fail(format!("{}", e), "acting".to_string());
                 self.record_query_failure(query).await?;
-                return Err(e.into());
+                return Err(e);
             },
         };
 
         let actions_count = results.len();
         for result in results {
             match result {
-                ActionResult::OrderPlaced(order) => {
+                ActionResult::OrderPlaced { order, .. } => {
                     info!(
                         %position_id,
                         exchange_order_id = %order.exchange_order_id,
@@ -572,6 +738,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         self.record_query_failure(query).await?;
                         return Err(e);
                     }
+                    // Note: event persistence handled by execute_and_persist()
                 },
                 ActionResult::AlreadyProcessed(id) => {
                     warn!(%position_id, %id, "Signal already processed (idempotent skip)");
@@ -760,16 +927,17 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
         self.record_query_transition(&query, "acting").await?;
 
-        // Execute event emission
-        let results = match self.executor.execute(vec![EngineAction::EmitEvent(event)]).await {
-            Ok(r) => r,
-            Err(e) => {
-                let err_str = format!("{}", e);
-                query.fail(err_str.clone(), "acting".to_string());
-                self.record_query_failure(&query).await?;
-                return Err(e.into());
-            },
-        };
+        // Execute event emission + persist to eventlog for crash recovery
+        let results =
+            match self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await {
+                Ok(r) => r,
+                Err(e) => {
+                    let err_str = format!("{}", e);
+                    query.fail(err_str.clone(), "acting".to_string());
+                    self.record_query_failure(&query).await?;
+                    return Err(e);
+                },
+            };
         let actions_count = results.len();
 
         self.event_bus.send(DaemonEvent::PositionStateChanged {
@@ -897,7 +1065,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             timestamp: chrono::Utc::now(),
         };
 
-        let exec_result = self.executor.execute(vec![EngineAction::EmitEvent(event)]).await;
+        let exec_result = self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await;
         match exec_result {
             Ok(results) => {
                 if let Err(e) =
@@ -912,7 +1080,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             Err(e) => {
                 query.fail(format!("{}", e), "acting".to_string());
                 self.record_query_failure(&query).await?;
-                return Err(e.into());
+                return Err(e);
             },
         }
 
@@ -1268,7 +1436,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         )?;
 
         // Execute actions (EntryFilled event transitions position to Active via apply_event)
-        self.executor.execute(decision.actions).await?;
+        // Also persists to eventlog for crash recovery (MIG-v2.5#2).
+        self.execute_and_persist(decision.actions).await?;
 
         info!(
             %position_id,
@@ -1390,13 +1559,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
             // Execute actions via Executor (side-effects: EventLog.append, Exchange orders)
             // MemoryStore is updated via apply_event() called by executor after event append
-            let results = match self.executor.execute(decision.actions).await {
+            let results = match self.execute_and_persist(decision.actions).await {
                 Ok(r) => r,
                 Err(e) => {
                     let err_str = format!("{}", e);
                     query.fail(err_str.clone(), "acting".to_string());
                     self.record_query_failure(&query).await?;
-                    return Err(e.into());
+                    return Err(e);
                 },
             };
 
@@ -1404,9 +1573,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             // actions_count represents ALL ActionResult variants
             let actions_count = results.len();
             for result in results {
-                if let ActionResult::OrderPlaced(order) = result {
+                if let ActionResult::OrderPlaced { order, .. } = result {
                     // Exit order filled, handle close
                     // Note: handle_exit_fill is internal, covered by this query's lifecycle
+                    // Note: ExitOrderPlaced event already persisted by execute_and_persist()
                     if let Err(e) = self
                         .handle_exit_fill(position.id, order.fill_price, order.filled_quantity)
                         .await
@@ -1473,6 +1643,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let pnl = position.calculate_pnl();
 
         // Emit PositionClosed event via executor (ensures append->apply order)
+        // Also persists to eventlog for crash recovery (MIG-v2.5#2).
         let event = Event::PositionClosed {
             position_id,
             exit_reason,
@@ -1482,7 +1653,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             total_fees: position.fees_paid,
             timestamp: chrono::Utc::now(),
         };
-        self.executor.execute(vec![EngineAction::EmitEvent(event)]).await?;
+        self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await?;
 
         // Send to event bus for real-time notification
         self.event_bus.send(DaemonEvent::PositionStateChanged {
@@ -1645,9 +1816,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self.record_query_transition(query, "acting").await?;
 
         // Place market exit order on exchange (executor also emits ExitOrderPlaced → Active → Exiting)
+        // Use execute_and_persist to ensure events are persisted to eventlog (MIG-v2.5#2)
         let results = self
-            .executor
-            .execute(vec![EngineAction::PlaceExitOrder {
+            .execute_and_persist(vec![EngineAction::PlaceExitOrder {
                 position_id,
                 symbol: position.symbol.clone(),
                 side: exit_side,
@@ -1658,7 +1829,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         // Extract actual fill price from exchange result
         let fill_price = match results.into_iter().find_map(|r| {
-            if let ActionResult::OrderPlaced(order) = r {
+            if let ActionResult::OrderPlaced { order, .. } = r {
                 Some(order.fill_price)
             } else {
                 None
@@ -1687,7 +1858,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             timestamp: chrono::Utc::now(),
         };
 
-        self.executor.execute(vec![EngineAction::EmitEvent(event)]).await?;
+        self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await?;
 
         // Send to event bus for real-time notification
         self.event_bus.send(DaemonEvent::CorePositionClosed {
