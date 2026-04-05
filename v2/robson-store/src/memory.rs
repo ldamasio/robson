@@ -273,7 +273,26 @@ impl PositionRepository for MemoryStore {
 
     async fn find_active(&self) -> Result<Vec<Position>, StoreError> {
         let positions = self.positions.read().unwrap();
-        Ok(positions.values().filter(|p| p.can_enter() || p.can_exit()).cloned().collect())
+        // All non-terminal states: Armed, Entering, Active, Exiting.
+        // Excludes only Closed. This matches the trait contract:
+        // lifecycle management (panic close, crash recovery) must see every
+        // position that has not yet reached a terminal state.
+        Ok(positions.values().filter(|p| !p.is_closed()).cloned().collect())
+    }
+
+    async fn find_risk_open(&self) -> Result<Vec<Position>, StoreError> {
+        let positions = self.positions.read().unwrap();
+        Ok(positions
+            .values()
+            .filter(|p| {
+                matches!(
+                    p.state,
+                    robson_domain::PositionState::Entering { .. }
+                        | robson_domain::PositionState::Active { .. }
+                )
+            })
+            .cloned()
+            .collect())
     }
 
     async fn find_by_state(&self, state: &str) -> Result<Vec<Position>, StoreError> {
@@ -487,15 +506,95 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_position_find_active() {
+    async fn test_position_find_active_returns_all_non_terminal() {
+        // find_active() must return ALL non-terminal states: Armed, Entering, Active, Exiting.
+        // It must exclude only Closed positions.
+        use robson_domain::{PositionState, Price, Quantity};
+
         let store = MemoryStore::new();
+        let symbol = robson_domain::Symbol::from_pair("BTCUSDT").unwrap();
+        let account_id = Uuid::now_v7();
 
-        // Create armed position (active)
-        let armed = create_test_position();
-        PositionRepository::save(&store, &armed).await.unwrap();
+        // Armed
+        let armed = Position::new(account_id, symbol.clone(), Side::Long);
 
-        let active = PositionRepository::find_active(&store).await.unwrap();
-        assert_eq!(active.len(), 1);
+        // Entering
+        let mut entering = Position::new(account_id, symbol.clone(), Side::Long);
+        entering.quantity = Quantity::new(dec!(0.01)).unwrap();
+        entering.state = PositionState::Entering {
+            entry_order_id: Uuid::now_v7(),
+            expected_entry: Price::new(dec!(95000)).unwrap(),
+            signal_id: Uuid::now_v7(),
+        };
+
+        // Active
+        let mut active_pos = Position::new(account_id, symbol.clone(), Side::Long);
+        active_pos.quantity = Quantity::new(dec!(0.01)).unwrap();
+        active_pos.entry_price = Some(Price::new(dec!(95000)).unwrap());
+        active_pos.state = PositionState::Active {
+            current_price: Price::new(dec!(95000)).unwrap(),
+            trailing_stop: Price::new(dec!(93500)).unwrap(),
+            favorable_extreme: Price::new(dec!(95000)).unwrap(),
+            extreme_at: Utc::now(),
+            insurance_stop_id: None,
+            last_emitted_stop: None,
+        };
+
+        // Exiting
+        let mut exiting_pos = Position::new(account_id, symbol.clone(), Side::Long);
+        exiting_pos.quantity = Quantity::new(dec!(0.01)).unwrap();
+        exiting_pos.entry_price = Some(Price::new(dec!(95000)).unwrap());
+        exiting_pos.state = PositionState::Exiting {
+            exit_order_id: Uuid::now_v7(),
+            exit_reason: robson_domain::ExitReason::TrailingStop,
+        };
+
+        // Closed (must NOT appear in find_active)
+        let mut closed_pos = Position::new(account_id, symbol.clone(), Side::Long);
+        closed_pos.state = PositionState::Closed {
+            exit_price: Price::new(dec!(95000)).unwrap(),
+            exit_reason: robson_domain::ExitReason::TrailingStop,
+            realized_pnl: dec!(0),
+        };
+
+        for pos in [&armed, &entering, &active_pos, &exiting_pos, &closed_pos] {
+            PositionRepository::save(&store, pos).await.unwrap();
+        }
+
+        let result = PositionRepository::find_active(&store).await.unwrap();
+
+        assert_eq!(result.len(), 4, "Expected 4 non-terminal positions, got {}", result.len());
+
+        let closed_in_result = result.iter().any(|p| matches!(p.state, PositionState::Closed { .. }));
+        assert!(!closed_in_result, "find_active must not return Closed positions");
+
+        let states: Vec<&str> = result.iter().map(|p| p.state.name()).collect();
+        for expected in ["armed", "entering", "active", "exiting"] {
+            assert!(
+                states.contains(&expected),
+                "Expected state '{}' in find_active result, got: {:?}", expected, states
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_position_find_active_excludes_closed() {
+        // Regression: find_active must NOT include Closed even after state transitions
+        let store = MemoryStore::new();
+        let mut pos = create_test_position();
+
+        // Save as Armed, then transition to Closed
+        PositionRepository::save(&store, &pos).await.unwrap();
+
+        pos.state = robson_domain::PositionState::Closed {
+            exit_price: robson_domain::Price::new(dec!(95000)).unwrap(),
+            exit_reason: robson_domain::ExitReason::TrailingStop,
+            realized_pnl: dec!(0),
+        };
+        PositionRepository::save(&store, &pos).await.unwrap();
+
+        let result = PositionRepository::find_active(&store).await.unwrap();
+        assert!(result.is_empty(), "Closed position must not appear in find_active");
     }
 
     #[tokio::test]
