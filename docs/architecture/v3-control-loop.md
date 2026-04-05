@@ -22,9 +22,13 @@ See **[v3-query-query-engine.md](v3-query-query-engine.md)** for the full specif
 
 ---
 
-## Phase Specification
+## Stage Specification
 
-### Phase 1: Observe
+Each control loop cycle progresses through 6 sequential stages.
+These are **pipeline stages within a single execution tick**, not project phases.
+For project-level identifiers see v3-migration-plan.md §1.1 (`MIG-*`, `QE-P*`).
+
+### Stage 1: Observe
 
 **Owner**: Runtime (MarketDataManager, API Server, Timer)
 
@@ -77,7 +81,7 @@ pub enum Observation {
 
 ---
 
-### Phase 2: Interpret
+### Stage 2: Interpret
 
 **Owner**: Runtime (PositionManager)
 
@@ -134,7 +138,7 @@ pub enum Interpretation {
 
 ---
 
-### Phase 3: Decide
+### Stage 3: Decide
 
 **Owner**: Engine (robson-engine) — PURE, NO I/O
 
@@ -177,7 +181,7 @@ pub enum EngineAction {
 
 **Deterministic**: Yes. The Engine is a pure function with zero side effects.
 
-**Risk Gate (sub-phase)**:
+**Risk Gate (sub-stage)**:
 Before the Engine decision is accepted, the Risk Engine evaluates:
 1. Is the system in a state where this action is allowed? (circuit breaker check)
 2. Does this specific action violate any limit? (exposure check, position count, daily loss)
@@ -186,7 +190,7 @@ If denied, `EngineAction` is replaced with `RejectTrade { reason: RiskVerdict }`
 
 ---
 
-### Phase 4: Act
+### Stage 4: Act
 
 **Owner**: Executor (robson-exec) via GovernedAction
 
@@ -215,7 +219,7 @@ pub enum ActionResult {
 }
 ```
 
-**Deterministic**: NO. This phase interacts with external systems (Binance API). Network latency, exchange state, and market conditions introduce non-determinism.
+**Deterministic**: NO. This stage interacts with external systems (Binance API). Network latency, exchange state, and market conditions introduce non-determinism.
 
 **Audit**: Full request/response logged. Exchange order ID captured for reconciliation.
 
@@ -223,7 +227,7 @@ pub enum ActionResult {
 
 ---
 
-### Phase 5: Evaluate
+### Stage 5: Evaluate
 
 **Owner**: Runtime (PositionManager)
 
@@ -246,11 +250,11 @@ Blocked             -> PositionState unchanged (action was prevented)
 
 ---
 
-### Phase 6: Persist
+### Stage 6: Persist
 
 **Owner**: EventLog (robson-eventlog)
 
-**Input**: `Vec<DomainEvent>` from Evaluate phase
+**Input**: `Vec<DomainEvent>` from Evaluate stage
 
 **Output**: `Vec<EventEnvelope>` (persisted events with assigned event_id, sequence, timestamp)
 
@@ -294,8 +298,8 @@ Blocked             -> PositionState unchanged (action was prevented)
 ```
 Operator issues PAUSE command
 -> Current cycle completes normally
--> After Persist phase: set RuntimeState.paused = true
--> Observe phase checks paused flag: skip all non-critical observations
+-> After Persist stage: set RuntimeState.paused = true
+-> Observe stage checks paused flag: skip all non-critical observations
 -> Only Critical and High priority triggers processed
 -> PauseActivated event persisted
 ```
@@ -355,7 +359,7 @@ Runtime restarts (Kubernetes pod restart)
 
 ```
 robson_cycles_total{trigger_type}           # Counter: total cycles by trigger
-robson_cycle_duration_ms{phase}             # Histogram: duration per phase
+robson_cycle_duration_ms{stage}             # Histogram: duration per stage
 robson_queue_depth                          # Gauge: current observation queue depth
 robson_risk_decisions_total{verdict}        # Counter: approved/denied
 robson_circuit_breaker_state                # Gauge: 0=closed, 1=open, 2=half_open
@@ -387,4 +391,4 @@ Every cycle produces a structured log entry:
 
 ### Traces (OpenTelemetry)
 
-Each cycle is a trace span with child spans per phase. Trace ID = cycle_id for correlation.
+Each cycle is a trace span with child spans per stage. Trace ID = cycle_id for correlation.

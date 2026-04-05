@@ -272,10 +272,10 @@ See v3-tron-evaluation.md for full analysis.
 - Single entry point: `QueryEngine.process()` is the ONLY path to mutate RuntimeState
 - Formalizes what PositionManager does informally, without rewriting it
 - The `state = source of truth, stream = projection` premise clarifies: RuntimeState is the operational authority, EventLog is the durable authority, Projections are always derived
-- Phase 1 is non-breaking (wrapper + tracing), Phase 2 wires GovernedAction and Risk Engine as blocking gate
+- QE-P1 is non-breaking (wrapper + tracing), QE-P2 wires GovernedAction and Risk Engine as blocking gate
 - Aligns with GovernedAction pattern (v3-runtime-spec.md) — GovernedAction is constructed inside QueryEngine after risk clearance
 
-**Breaks if wrong**: QueryEngine adds indirection that slows development. Mitigation: Phase 1 is a thin wrapper with zero behavior change. If indirection proves harmful, remove it — the underlying Engine + Executor remain unchanged.
+**Breaks if wrong**: QueryEngine adds indirection that slows development. Mitigation: QE-P1 is a thin wrapper with zero behavior change. If indirection proves harmful, remove it — the underlying Engine + Executor remain unchanged.
 
 See [v3-query-query-engine.md](v3-query-query-engine.md) for the full specification.
 
@@ -296,3 +296,60 @@ See [v3-query-query-engine.md](v3-query-query-engine.md) for the full specificat
 - Queue handles burst observations. Critical events (operator commands, risk alerts) have priority and are never dropped.
 
 **Breaks if wrong**: Market moves require simultaneous management of multiple positions and the queue introduces unacceptable latency. Trigger: operator regularly has >3 positions requiring simultaneous attention AND measured queue latency exceeds 1 second.
+
+---
+
+### ADR-v3-015: Query Persistence Granularity — Governance-Relevant Only
+
+**Date**: 2026-04-05
+**Status**: DECIDED — implementation alignment is follow-up
+
+**Context**: QE-P4 introduced durable query lifecycle persistence via `QUERY_STATE_CHANGED` events in EventLog. The question was whether ALL queries (including high-frequency market ticks that terminate in `NoAction`) should be durably persisted.
+
+**Decision**: Persist only governance-relevant and operationally-relevant queries.
+
+**Chose**: Selective persistence based on query outcome and governance significance
+**Rejected**: Persist all queries (including NoAction market ticks)
+
+**Criteria for durable persistence**:
+- Queries that produce actions (`ActionsExecuted`)
+- Queries entering approval/authorization/expiration flow
+- Queries resulting in `Denied`, `Failed`, or auditable terminal states
+- Queries crossing governance boundaries (risk gate evaluation)
+
+**Excluded from durable persistence**:
+- High-frequency `NoAction` queries (market ticks without effect) — tracing/metrics only
+
+**Rationale**: Market ticks at 100/s would generate ~8.6M EventLog rows/day with zero audit value. Tracing via `TracingQueryRecorder` provides full observability for debugging. The EventLog must remain a meaningful audit trail, not a firehose.
+
+**Breaks if wrong**: If a NoAction query later turns out to have been governance-relevant (e.g., a tick that *should* have triggered a stop but didn't due to a bug), the EventLog won't have it. Mitigation: tracing logs retain full query lifecycle for debugging; only durable audit is selective.
+
+**Follow-up**: Verify that `EventLogQueryRecorder` applies this filter. If it currently persists all queries regardless of outcome, adjust the implementation.
+
+See [v3-query-query-engine.md §11](v3-query-query-engine.md) for details.
+
+---
+
+### ADR-v3-016: Event Model Convergence — EventEnvelope as Canonical Durable Format
+
+**Date**: 2026-04-05
+**Status**: DECIDED — full convergence is follow-up
+
+**Context**: The repository has two event models: `robson_domain::Event` (internal domain events used by Engine/Executor within crate boundaries) and `EventEnvelope` (the `robson-eventlog` durable format with ULID, stream_key, sequence, JSONB payload). Both currently participate in persistence — Executor writes via `store.events().append()` using domain events, while QueryEngine writes `QUERY_STATE_CHANGED` as `EventEnvelope` directly. This dual-model state is transitional, not architectural target.
+
+**Decision**: `robson_eventlog` / `EventEnvelope` / `event_log` table is the single canonical durable event format.
+
+**Chose**: One canonical durable format (`EventEnvelope`), with `robson_domain::Event` as internal-only domain representation
+**Rejected**: Two parallel durable models; QueryEngine producing both formats as independent durable outputs
+
+**Convergence plan**:
+1. `robson_domain::Event` remains as the internal business-logic representation within crate boundaries
+2. All durable persistence converges to `EventEnvelope` as the single canonical format
+3. Adaptation between `robson_domain::Event` and `EventEnvelope` happens at persistence boundaries
+4. No component should maintain a separate durable event store outside the canonical `event_log` table
+
+**Breaks if wrong**: If `EventEnvelope` schema is too rigid for future domain event types, adaptation at the boundary becomes complex. Mitigation: `EventEnvelope.payload` is JSONB — schema flexibility is inherent.
+
+**Follow-up**: Migrate Executor persistence to emit `EventEnvelope` directly, or introduce an adapter at the Store boundary. This is a code change, not an architectural decision.
+
+See [v3-query-query-engine.md §11](v3-query-query-engine.md) for details.
