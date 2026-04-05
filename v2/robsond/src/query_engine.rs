@@ -2,13 +2,27 @@
 //!
 //! Phase 1: Lifecycle tracker.
 //! Records query state transitions via QueryRecorder.
-//! Does NOT dispatch to Engine/Executor (PositionManager still does that).
 //!
-//! Phase 2+: Becomes the governed dispatcher.
+//! Phase 2 (current): Blocking governance.
+//! Holds the RiskGate. All entry execution paths must call `check_risk()` to
+//! obtain a `GovernedAction` before dispatching to the Executor. Denial is a
+//! governed terminal outcome (`QueryState::Denied`), not an operational error.
+//!
+//! GovernedAction is `pub(crate)` — only constructible inside this module via
+//! `check_risk()`. This ensures no entry path in robsond can reach the Executor
+//! without passing through the risk gate.
+//!
+//! Architectural note (Phase 2 decision):
+//! `GovernedAction` lives in robsond (not robson-exec). The Executor continues
+//! accepting `Vec<EngineAction>` unchanged. Type-level enforcement across the
+//! crate boundary is deferred as a follow-up architectural concern. The governance
+//! guarantee in Phase 2 is: "risk evaluated inside runtime before any Executor call".
 //!
 //! Ownership: lives INSIDE robsond crate. Not a separate crate.
 
-use crate::query::ExecutionQuery;
+use robson_engine::{EngineAction, ProposedTrade, RiskContext, RiskGate, RiskVerdict};
+
+use crate::query::{ExecutionQuery, QueryError, QueryState};
 
 // =============================================================================
 // QueryRecorder - Audit and Observability
@@ -71,24 +85,81 @@ impl QueryRecorder for TracingQueryRecorder {
 }
 
 // =============================================================================
+// GovernedAction — Phase 2 proof token
+// =============================================================================
+
+/// Proof that a set of engine actions has passed the risk gate.
+///
+/// Only constructible via `QueryEngine::check_risk()`. This ensures no entry
+/// execution path in robsond can reach the Executor without risk evaluation.
+///
+/// `pub(crate)`: visible within robsond only. The Executor still accepts
+/// `Vec<EngineAction>` (unchanged); the governance enforcement is runtime-level
+/// within the crate, not type-level across the crate boundary.
+#[derive(Debug)]
+pub(crate) struct GovernedAction {
+    actions: Vec<EngineAction>,
+    // Private field prevents external construction even within the crate if
+    // someone tries to use struct literal syntax.
+    _proof: (),
+}
+
+impl GovernedAction {
+    /// Private: only QueryEngine::check_risk() may construct this.
+    fn new(actions: Vec<EngineAction>) -> Self {
+        Self { actions, _proof: () }
+    }
+
+    /// Consume the token and return the approved actions for Executor dispatch.
+    pub(crate) fn into_actions(self) -> Vec<EngineAction> {
+        self.actions
+    }
+}
+
+// =============================================================================
+// CheckRiskError — typed error for check_risk() callers
+// =============================================================================
+
+/// Error returned by `check_risk()`.
+///
+/// Two distinct cases that callers MUST handle differently:
+///
+/// - `Denied`: Risk gate rejected the trade. The query is in `QueryState::Denied`.
+///   No exchange side effects occurred. Caller should treat this as a governed
+///   outcome and return `Ok(())`.
+///
+/// - `InvalidState`: The query lifecycle state machine is in an unexpected state
+///   and cannot enter `RiskChecked`. This is an operational error (e.g. a bug
+///   in the caller or concurrent mutation). Caller should propagate as an error
+///   — NOT treat it as a governance denial.
+#[derive(Debug)]
+pub(crate) enum CheckRiskError {
+    /// Risk gate rejected the trade (governed outcome — no side effects occurred).
+    Denied,
+    /// Query state machine is inconsistent — cannot transition to RiskChecked.
+    /// This is an operational error, not a governance decision.
+    InvalidState(QueryError),
+}
+
+// =============================================================================
 // QueryEngine
 // =============================================================================
 
-/// Phase 1: Lifecycle tracker.
-/// Records query state transitions via QueryRecorder.
-/// Does NOT dispatch to Engine/Executor (PositionManager still does that).
+/// Phase 2: Lifecycle tracker + Risk governance gate.
 ///
-/// Phase 2+: Becomes the governed dispatcher.
+/// Holds the RiskGate. Entry execution paths call `check_risk()` to obtain
+/// a `GovernedAction`. All other lifecycle recording methods remain unchanged.
 ///
 /// Ownership: lives INSIDE robsond crate. Not a separate crate.
 pub struct QueryEngine<R: QueryRecorder> {
     recorder: R,
+    risk_gate: RiskGate,
 }
 
 impl<R: QueryRecorder> QueryEngine<R> {
-    /// Create a new QueryEngine with the given recorder.
-    pub fn new(recorder: R) -> Self {
-        Self { recorder }
+    /// Create a new QueryEngine with the given recorder and risk gate.
+    pub fn new(recorder: R, risk_gate: RiskGate) -> Self {
+        Self { recorder, risk_gate }
     }
 
     /// Record that a query has been accepted.
@@ -105,6 +176,72 @@ impl<R: QueryRecorder> QueryEngine<R> {
     pub fn on_error(&self, query: &ExecutionQuery, error: &str) {
         self.recorder.on_error(query, error);
     }
+
+    /// Phase 2: Evaluate risk and return a governed proof token.
+    ///
+    /// This is the mandatory governance gate for all entry execution paths.
+    ///
+    /// Returns:
+    /// - `Ok(GovernedAction)`: risk approved — pass actions to Executor via
+    ///   `governed.into_actions()`.
+    /// - `Err(CheckRiskError::Denied)`: risk gate rejected the trade. Query is in
+    ///   `QueryState::Denied`. Caller should treat as governed outcome (`Ok(())`).
+    /// - `Err(CheckRiskError::InvalidState)`: query lifecycle state machine is
+    ///   inconsistent (cannot enter RiskChecked). This is an operational error.
+    ///   Caller MUST propagate as `Err`, not treat as a denial.
+    ///
+    /// `actions` are consumed here — there is no path to the Executor without
+    /// passing through this check.
+    pub(crate) fn check_risk(
+        &self,
+        query: &mut ExecutionQuery,
+        proposed: &ProposedTrade,
+        context: &RiskContext,
+        actions: Vec<EngineAction>,
+    ) -> Result<GovernedAction, CheckRiskError> {
+        // Transition to RiskChecked FIRST — before evaluating the verdict.
+        // If this fails, the query is in an unexpected state (operational bug).
+        // Return InvalidState so the caller can propagate it as an error,
+        // not silently absorb it as a governance denial.
+        if let Err(e) = query.transition(QueryState::RiskChecked) {
+            tracing::error!(
+                query_id = %query.id,
+                current_state = ?query.state,
+                error = %e,
+                "Cannot transition to RiskChecked — query lifecycle inconsistency"
+            );
+            return Err(CheckRiskError::InvalidState(e));
+        }
+        self.recorder.on_state_change(query);
+
+        let verdict = self.risk_gate.evaluate(proposed, context);
+
+        match verdict {
+            RiskVerdict::Approved => {
+                tracing::info!(
+                    query_id = %query.id,
+                    symbol = %proposed.symbol,
+                    side = %proposed.side,
+                    notional = %proposed.notional_value,
+                    "risk check approved"
+                );
+                Ok(GovernedAction::new(actions))
+            }
+            RiskVerdict::Rejected { check, reason } => {
+                tracing::warn!(
+                    query_id = %query.id,
+                    symbol = %proposed.symbol,
+                    side = %proposed.side,
+                    risk_check = %check.name(),
+                    reason = %reason,
+                    "risk check denied — governed rejection, no side effects"
+                );
+                query.deny(reason, check.name().to_string());
+                self.recorder.on_state_change(query);
+                Err(CheckRiskError::Denied)
+            }
+        }
+    }
 }
 
 // =============================================================================
@@ -116,6 +253,8 @@ mod tests {
     use super::*;
     use crate::query::{ActorKind, QueryKind, QueryOutcome, QueryState};
     use robson_domain::{Price, Side, Symbol};
+    use robson_engine::{PositionSummary, RiskContext, RiskGate, RiskLimits};
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
@@ -166,10 +305,14 @@ mod tests {
         )
     }
 
+    fn make_engine(recorder: impl QueryRecorder) -> QueryEngine<impl QueryRecorder> {
+        QueryEngine::new(recorder, RiskGate::new())
+    }
+
     #[test]
     fn test_query_engine_delegates_to_recorder() {
         let recorder = Arc::new(MockRecorder::new());
-        let engine = QueryEngine::new(Arc::clone(&recorder));
+        let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
 
         let query = create_test_query();
 
@@ -190,7 +333,7 @@ mod tests {
     fn test_tracing_recorder() {
         // This test just ensures TracingQueryRecorder compiles and can be created
         let recorder = TracingQueryRecorder;
-        let engine = QueryEngine::new(recorder);
+        let engine = QueryEngine::new(recorder, RiskGate::new());
 
         let mut query = create_test_query();
 
@@ -207,7 +350,7 @@ mod tests {
     #[test]
     fn test_full_lifecycle_with_mock_recorder() {
         let recorder = Arc::new(MockRecorder::new());
-        let engine = QueryEngine::new(Arc::clone(&recorder));
+        let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
 
         let mut query = create_test_query();
 
@@ -237,7 +380,7 @@ mod tests {
     #[test]
     fn test_error_lifecycle_with_mock_recorder() {
         let recorder = Arc::new(MockRecorder::new());
-        let engine = QueryEngine::new(Arc::clone(&recorder));
+        let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
 
         let mut query = create_test_query();
 
@@ -259,6 +402,162 @@ mod tests {
     #[test]
     fn test_query_engine_new() {
         let recorder = TracingQueryRecorder;
-        let _engine = QueryEngine::new(recorder);
+        let _engine = QueryEngine::new(recorder, RiskGate::new());
+    }
+
+    // =========================================================================
+    // Phase 2: check_risk tests
+    // =========================================================================
+
+    fn sample_proposed() -> ProposedTrade {
+        ProposedTrade {
+            symbol: "BTCUSDT".to_string(),
+            side: "long".to_string(),
+            quantity: dec!(0.02),
+            entry_price: dec!(50000),
+            notional_value: dec!(1000),
+            margin_required: dec!(100),
+        }
+    }
+
+    fn empty_context() -> RiskContext {
+        RiskContext::new(dec!(10000))
+    }
+
+    fn saturated_context() -> RiskContext {
+        // 3 open positions — triggers MaxOpenPositions
+        RiskContext::with_positions(
+            dec!(10000),
+            vec![
+                PositionSummary {
+                    position_id: uuid::Uuid::nil(),
+                    symbol: "ETHUSDT".to_string(),
+                    side: "long".to_string(),
+                    notional_value: dec!(1000),
+                    margin_used: dec!(100),
+                    unrealized_pnl: Decimal::ZERO,
+                };
+                3
+            ],
+            Decimal::ZERO,
+            Decimal::ZERO,
+        )
+    }
+
+    fn dummy_actions() -> Vec<EngineAction> {
+        // Use EmitEvent as a stand-in (we just need a non-empty Vec)
+        use robson_domain::{Event, PositionId, TechnicalStopDistance, Side, Symbol};
+        use robson_domain::Price;
+        use rust_decimal_macros::dec;
+        vec![EngineAction::EmitEvent(Event::PositionArmed {
+            position_id: uuid::Uuid::nil(),
+            account_id: uuid::Uuid::nil(),
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            side: Side::Long,
+            tech_stop_distance: None,
+            timestamp: chrono::Utc::now(),
+        })]
+    }
+
+    #[test]
+    fn test_check_risk_approved_returns_governed_action() {
+        let recorder = Arc::new(MockRecorder::new());
+        let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
+
+        let mut query = create_test_query();
+        query.transition(QueryState::Processing).unwrap();
+
+        let actions = dummy_actions();
+        let result =
+            engine.check_risk(&mut query, &sample_proposed(), &empty_context(), actions);
+
+        assert!(result.is_ok(), "Expected Ok(GovernedAction) for approved trade");
+        assert_eq!(query.state, QueryState::RiskChecked);
+        // state_change recorded for Accepted (from create_test_query) + RiskChecked transition
+        assert!(recorder.state_change_count() >= 1);
+    }
+
+    #[test]
+    fn test_check_risk_denied_transitions_to_denied_state() {
+        let recorder = Arc::new(MockRecorder::new());
+        let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
+
+        let mut query = create_test_query();
+        query.transition(QueryState::Processing).unwrap();
+
+        let result =
+            engine.check_risk(&mut query, &sample_proposed(), &saturated_context(), dummy_actions());
+
+        assert!(result.is_err(), "Expected Err(CheckRiskError::Denied) for saturated portfolio");
+        assert!(
+            matches!(query.state, QueryState::Denied { .. }),
+            "Query should be in Denied state after risk denial"
+        );
+        assert!(query.finished_at.is_some(), "Denied is a terminal state");
+    }
+
+    #[test]
+    fn test_check_risk_denied_records_via_recorder() {
+        let recorder = Arc::new(MockRecorder::new());
+        let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
+
+        let mut query = create_test_query();
+        query.transition(QueryState::Processing).unwrap();
+
+        let before = recorder.state_change_count();
+        engine
+            .check_risk(&mut query, &sample_proposed(), &saturated_context(), dummy_actions())
+            .ok();
+
+        // check_risk records: RiskChecked + Denied = 2 additional transitions
+        assert!(
+            recorder.state_change_count() >= before + 2,
+            "Expected at least 2 recorded transitions for risk denial"
+        );
+    }
+
+    #[test]
+    fn test_check_risk_invalid_state_returns_invalid_state_error() {
+        // Calling check_risk() from Accepted (not Processing) must fail the
+        // Processing → RiskChecked transition and return InvalidState, NOT Denied.
+        // This proves that a state machine bug is not silently treated as a
+        // governed denial.
+        let recorder = Arc::new(MockRecorder::new());
+        let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
+
+        // Do NOT transition to Processing — query is still in Accepted state.
+        let mut query = create_test_query();
+
+        let result =
+            engine.check_risk(&mut query, &sample_proposed(), &empty_context(), dummy_actions());
+
+        assert!(
+            matches!(result, Err(CheckRiskError::InvalidState(_))),
+            "Expected Err(CheckRiskError::InvalidState), got {:?}", result
+        );
+        // Query must NOT have transitioned to Denied — that would be a false governance record.
+        assert!(
+            !matches!(query.state, QueryState::Denied { .. }),
+            "InvalidState must not produce a Denied query state"
+        );
+    }
+
+    #[test]
+    fn test_governed_action_into_actions_returns_original() {
+        let recorder = Arc::new(MockRecorder::new());
+        let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
+
+        let mut query = create_test_query();
+        query.transition(QueryState::Processing).unwrap();
+
+        let actions = dummy_actions();
+        let actions_count = actions.len();
+
+        let governed = engine
+            .check_risk(&mut query, &sample_proposed(), &empty_context(), actions)
+            .expect("Should approve");
+
+        let returned = governed.into_actions();
+        assert_eq!(returned.len(), actions_count);
     }
 }
