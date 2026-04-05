@@ -484,29 +484,31 @@ pub async fn process_market_data(&self, data: MarketData) -> DaemonResult<()> {
 
 **Fan-out pattern** (panic_close_all):
 ```rust
-// One PanicClosePosition query per position, not one PanicClose for all
+// find_active() returns all non-terminal: Armed, Entering, Active, Exiting.
+// Each state receives appropriate handling — not blindly "close everything".
 pub async fn panic_close_all(&self) -> DaemonResult<Vec<PositionId>> {
-    let active = self.store.positions().find_active().await?;
+    let all_non_terminal = self.store.positions().find_active().await?;
     let mut closed_ids = Vec::new();
 
-    for position in active {
-        let mut query = ExecutionQuery::new(
-            QueryKind::PanicClosePosition { position_id: position.id },
-            ActorKind::Operator { source: CommandSource::Cli },
-        );
-        query.position_id = Some(position.id);
-        self.query_engine.on_accepted(&query);
-
-        match self.panic_close_position(position.id).await {
-            Ok(_) => {
-                query.complete(QueryOutcome::ActionsExecuted { actions_count: 1 })?;
-                self.query_engine.on_state_change(&query);
-                closed_ids.push(position.id);
+    for position in all_non_terminal {
+        match &position.state {
+            PositionState::Active { .. } => {
+                // One PanicClosePosition query per Active position
+                let mut query = ExecutionQuery::new(
+                    QueryKind::PanicClosePosition { position_id: position.id },
+                    ActorKind::Operator { source: CommandSource::Cli },
+                );
+                query.position_id = Some(position.id);
+                self.query_engine.on_accepted(&query);
+                match self.panic_close_position_internal(position.id, &mut query).await {
+                    Ok(_) => { closed_ids.push(position.id); }
+                    Err(e) => { query.fail(format!("{}", e), "acting".to_string()); }
+                }
             }
-            Err(e) => {
-                query.fail(format!("{}", e), "acting".to_string());
-                self.query_engine.on_error(&query, &format!("{}", e));
-            }
+            PositionState::Armed => { self.disarm_position(position.id).await.ok(); }
+            PositionState::Entering { .. } => { /* cancel not yet implemented — log */ }
+            PositionState::Exiting { .. } => { /* skip: exit already in progress */ }
+            _ => {}
         }
     }
     Ok(closed_ids)
@@ -640,19 +642,46 @@ The Control Loop phases map directly to QueryEngine processing:
 - No RuntimeState struct (v2 uses Store)
 - `handle_entry_fill` and `handle_exit_fill` not separately wrapped (covered by parent query)
 
-### Phase 2: Blocking Governance (Aligns with v2.5 #4)
+### Phase 2: Blocking Governance (Aligns with v2.5 #4) — IMPLEMENTED 2026-04-04
 
 **Goal**: Wire Risk Engine as mandatory blocking gate inside QueryEngine. Introduce GovernedAction.
 
-**Changes**:
-- QueryEngine gains `risk_gate: RiskGate` field
+**Implemented**:
+- `QueryEngine` gains `risk_gate: RiskGate` field
 - New state: `RiskChecked` between Processing and Acting
-- New state: `Denied` as terminal (risk denial)
-- Executor signature changes: accepts `GovernedAction` only
-- `GovernedAction` constructed inside QueryEngine with `pub(crate)` visibility
-- QueryRecorder starts persisting to EventLog (risk decisions as events)
+- New terminal state: `Denied { reason, check }` (governance denial — distinct from `Failed`)
+- `GovernedAction` constructed inside `QueryEngine::check_risk()` with `pub(crate)` visibility
+- `QueryRecorder` records both `RiskChecked` and `Denied` transitions via tracing
+- `CheckRiskError` enum separates governed denial (`Denied`) from operational state-machine
+  error (`InvalidState(QueryError)`). Callers re-arm the detector on `Denied` and propagate
+  as hard error on `InvalidState`. Prevents a state machine bug from being silently treated
+  as a governed denial.
+- `PositionRepository::find_risk_open()` added with explicit Entering+Active semantics.
+  `build_risk_context()` calls this — not `find_active()` — so concurrent Entering positions
+  (order submitted, fill pending) block new entries as expected.
+- `PositionRepository::find_active()` contract fixed to return **all non-terminal states**
+  (Armed, Entering, Active, Exiting). `MemoryStore` implementation updated from
+  `can_enter() || can_exit()` (= Armed+Active only) to `!is_closed()`. This matters for
+  `panic_close_all()` and crash-recovery `restore_positions()`, which must see every live position.
+- `panic_close_all()` refactored with per-state dispatch: Active→exit order, Armed→disarm,
+  Entering→warning (cancel not yet implemented), Exiting→skip, Error→warning.
 
-**Depends on**: Phase 1 complete, v2.5 #1 (robsond deployed)
+**Architectural decision (Option A — recorded)**:
+- `GovernedAction` lives in `robsond` (`pub(crate)`), NOT in `robson-exec`
+- `Executor` continues accepting `Vec<EngineAction>` — signature unchanged
+- Governance enforcement is **runtime-level inside the crate**, not type-level across crate boundary
+- Rationale: the crate graph `robsond → robson-exec` makes `GovernedAction` in `robson-exec` require
+  either a circular dependency or a new shared contracts crate. Both are out of scope for this phase.
+  Governance and Risk Gate belong to the Runtime/QueryEngine layer, not to I/O execution.
+- `GovernedAction` can only be constructed by `QueryEngine::check_risk()` (private constructor),
+  enforcing the governance rule within the crate. Type-level enforcement across the crate boundary
+  is explicitly deferred as a follow-up architectural concern.
+
+**Phase 2 limitation**: Daily PnL (daily_realized_pnl, daily_unrealized_pnl) in `RiskContext` defaults
+to zero. The daily loss circuit breaker (`DailyLossLimit` check in RiskGate) is therefore not active.
+Proper PnL tracking in the store is deferred to a follow-up task.
+
+**Depends on**: Phase 1 complete
 
 ### Phase 3: Approval Gates (v3)
 
@@ -840,7 +869,7 @@ These require human architectural decision before Phase 2:
 
 1. **Query persistence granularity**: Should every query (including high-frequency market ticks) be persisted to EventLog, or only queries that produce actions? Market ticks at 100/s would generate significant EventLog volume.
 
-2. **GovernedAction location**: The v3-runtime-spec.md says GovernedAction is `pub(crate)` in robsond. Should it stay there or move to robson-exec as a type that Executor accepts? Moving it creates a cross-crate dependency on governance proof.
+2. **GovernedAction location**: ~~Should it stay in robsond or move to robson-exec?~~ **DECIDED 2026-04-04**: Stays in robsond as `pub(crate)`. Executor unchanged. See Phase 2 architectural decision above.
 
 3. **Approval persistence**: Should pending approvals be persisted to PostgreSQL (survives restart) or kept in-memory (lost on restart, operator must re-approve)? Persistent approvals add complexity but prevent lost approval state during rolling deploys.
 
