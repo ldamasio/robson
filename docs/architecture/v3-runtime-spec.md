@@ -20,6 +20,8 @@ The Runtime's execution pipeline is implemented by the **QueryEngine** (`robsond
 
 **v2.5 transitional note (implemented 2026-04-05)**: `robsond` now exposes a minimal SSE endpoint at `/events` for operator-facing runtime updates. This stream is ephemeral and derived for UI/monitoring only. It does not provide replay or `Last-Event-ID` resume; clients bootstrap current state via REST and then subscribe for incremental updates.
 
+**Phase 3 transitional note (implemented 2026-04-05)**: high-notional entry queries now pause in `AwaitingApproval` after `RiskChecked`. The approval decision is made inside `QueryEngine`; pending approvals are held in runtime memory by `PositionManager`; the operator authorizes via `POST /queries/{id}/approve`; and pending approvals expire after 300 seconds if not approved. This is intentionally non-durable in v2.5/v3 minimum scope: restart drops pending approvals and clients must re-bootstrap from REST + SSE.
+
 See **[v3-query-query-engine.md](v3-query-query-engine.md)** for the full specification.
 
 ---

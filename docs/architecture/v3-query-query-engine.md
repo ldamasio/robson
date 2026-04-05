@@ -1,7 +1,7 @@
 # ROBSON v3 — QUERY & QUERYENGINE SPECIFICATION
 
 **Date**: 2026-04-04  
-**Revised**: 2026-04-04 (post-review: fan-out model, persistence ownership, type corrections)  
+**Revised**: 2026-04-05 (Phase 3 approval gate implementation notes)  
 **Status**: APPROVED — Ready for Implementation  
 **Owner**: Runtime (robsond)  
 **Companion to**: v3-migration-plan.md, v3-control-loop.md, v3-runtime-spec.md
@@ -687,16 +687,21 @@ Proper PnL tracking in the store is deferred to a follow-up task.
 
 **Depends on**: Phase 1 complete
 
-### Phase 3: Approval Gates (v3)
+### Phase 3: Approval Gates (v3) — IMPLEMENTED 2026-04-05
 
 **Goal**: Add human confirmation for high-risk actions.
 
-**Changes**:
+**Implemented scope (minimum correct)**:
 - New states: `AwaitingApproval`, `Authorized`, `Expired`
-- API endpoint: `POST /api/v1/queries/{id}/approve`
-- Approval token with TTL, bound to query_id + action hash
-- Permission system wired into QueryEngine
-- Circuit breaker reset requires approval
+- API endpoint: `POST /queries/{id}/approve`
+- Approval decision lives in `QueryEngine`; pending approvals live in `PositionManager`
+- Pending approvals are kept **in memory only** for this phase
+- Restart drops pending approvals; operator must re-approve after re-bootstrap
+- TTL is explicit and fixed at **300 seconds**
+- Current policy is intentionally narrow: `PlaceEntryOrder` requires approval when
+  entry notional exceeds **5% of capital**
+- Public SSE exposes `query.awaiting_approval`, `query.authorized`, `query.expired`
+- No replay support, no EventLog lifecycle persistence, no approval broker/queue
 - Precondition status: SSE working (v2.5 #6) is satisfied by the `robsond` `/events`
   endpoint implemented on 2026-04-05
 
@@ -878,12 +883,12 @@ These require human architectural decision before Phase 2:
 
 2. **GovernedAction location**: ~~Should it stay in robsond or move to robson-exec?~~ **DECIDED 2026-04-04**: Stays in robsond as `pub(crate)`. Executor unchanged. See Phase 2 architectural decision above.
 
-3. **Approval persistence**: Should pending approvals be persisted to PostgreSQL (survives restart) or kept in-memory (lost on restart, operator must re-approve)? Persistent approvals add complexity but prevent lost approval state during rolling deploys.
+3. **Approval persistence**: **DECIDED 2026-04-05 (Phase 3 minimum)**: keep pending approvals in memory only. Restart drops pending approvals and the operator must re-approve after REST bootstrap. Durable approval lifecycle persistence is deferred to Phase 4.
 
-4. **Query timeout**: Should there be a hard timeout on queries in AwaitingApproval state? The v3-risk-engine-spec.md defines circuit breaker escalation timers (30min L1->L2), but individual query approval TTL is not specified.
+4. **Query timeout**: **DECIDED 2026-04-05 (Phase 3 minimum)**: fixed TTL of 300 seconds for `AwaitingApproval` queries. On expiry, the query transitions to `Expired`, emits a public SSE event, and the detector is re-armed.
 
 5. **Event model unification**: The repository has two event models (robson_domain::Event and EventEnvelope). Should QueryEngine produce one, the other, or both? Unification is desirable but risky if done in Phase 1.
 
 ---
 
-**This document is the authoritative specification for Query/QueryEngine in Robson v3. Implementation follows the phased plan above. Phase 1 is safe, non-breaking, and ready to build.**
+**This document is the authoritative specification for Query/QueryEngine in Robson v3. Phases 1-3 are now implemented in `robsond`; Phase 4+ remains deferred.**

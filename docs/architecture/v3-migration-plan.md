@@ -268,6 +268,17 @@ Every action requires explicit permission. Permissions are scoped:
 
 This list is configurable via `robsond.toml`.
 
+**Implementation note (Phase 3 minimum, 2026-04-05)**: the current `robsond`
+implementation wires the minimal production path only:
+- `PlaceEntryOrder` above 5% of capital is gated
+- approval state is kept in memory only for the current daemon lifetime
+- operator approval happens via `POST /queries/{id}/approve`
+- TTL is fixed at 300 seconds
+- public SSE exposes `query.awaiting_approval`, `query.authorized`, and `query.expired`
+
+The broader configurable permission matrix remains the v3 target architecture,
+but it is not fully implemented in this phase.
+
 **Escalation path**: When permission is denied:
 1. Action is BLOCKED (not silently dropped)
 2. `PermissionDenied` event logged with full context
@@ -456,6 +467,8 @@ interface EventStreamMessage {
 - REST remains the bootstrap path for snapshots (`/status`, `/positions`, etc.)
 - SSE carries incremental operator-facing updates only
 - Public stream is mapped from internal daemon events; it does NOT expose `DaemonEvent` directly
+- Phase 3 adds approval observability on the same stream via
+  `query.awaiting_approval`, `query.authorized`, and `query.expired`
 - Keepalive heartbeat is enabled
 - On broadcast lag, the daemon emits `system.resync_required` and closes the stream
 - `Last-Event-ID` replay/resume is NOT implemented in v2.5
