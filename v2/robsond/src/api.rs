@@ -70,6 +70,9 @@ pub struct ReadinessChecks {
 }
 
 /// Status response.
+///
+/// `active_positions` is a historical field name. It currently counts open core
+/// positions returned by `/status` (Armed, Entering, Active, Exiting).
 #[derive(Debug, Serialize)]
 pub struct StatusResponse {
     pub active_positions: usize,
@@ -329,7 +332,7 @@ async fn health_handler() -> Json<HealthResponse> {
     })
 }
 
-/// Get status (all positions).
+/// Get status (all open core positions).
 async fn status_handler<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
 ) -> Result<Json<StatusResponse>, (StatusCode, Json<ErrorResponse>)>
@@ -338,7 +341,7 @@ where
     S: Store + 'static,
 {
     let manager = state.position_manager.read().await;
-    let positions = manager.get_active_positions().await.map_err(|e| to_error_response(e))?;
+    let positions = manager.get_open_positions().await.map_err(|e| to_error_response(e))?;
 
     let summaries: Vec<PositionSummary> = positions.iter().map(position_to_summary).collect();
 

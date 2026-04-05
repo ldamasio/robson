@@ -32,10 +32,12 @@ use robson_domain::{
     DetectorSignal, Event, Position, PositionId, PositionState, Price, Quantity, RiskConfig, Side,
     Symbol, TechnicalStopDistance,
 };
-use robson_engine::{Engine, EngineAction, EngineDecision, PositionSummary, ProposedTrade, RiskContext, RiskGate};
-use rust_decimal::Decimal;
+use robson_engine::{
+    Engine, EngineAction, EngineDecision, PositionSummary, ProposedTrade, RiskContext, RiskGate,
+};
 use robson_exec::{ActionResult, ExchangePort, ExecError, Executor};
 use robson_store::Store;
+use rust_decimal::Decimal;
 
 use crate::detector::DetectorTask;
 use crate::error::{DaemonError, DaemonResult};
@@ -231,14 +233,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 let mut detectors = self.detectors.write().await;
                 detectors.insert(position_id, handle);
                 info!(%position_id, "Detector re-armed after risk denial");
-            }
+            },
             Err(e) => {
                 warn!(
                     %position_id,
                     error = %e,
                     "Failed to re-arm detector after risk denial — position requires manual re-arm"
                 );
-            }
+            },
         }
     }
 
@@ -247,7 +249,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// Extracts the quantity decided by the Engine (from PlaceEntryOrder action)
     /// and computes notional / margin using the fixed leverage constant.
     /// Returns None if the decision contains no PlaceEntryOrder (caller handles this).
-    fn build_proposed_trade(signal: &DetectorSignal, decision: &EngineDecision) -> Option<ProposedTrade> {
+    fn build_proposed_trade(
+        signal: &DetectorSignal,
+        decision: &EngineDecision,
+    ) -> Option<ProposedTrade> {
         let quantity = decision.actions.iter().find_map(|a| match a {
             EngineAction::PlaceEntryOrder { quantity, .. } => Some(*quantity),
             _ => None,
@@ -660,7 +665,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     query.fail(err_str.clone(), "processing".to_string());
                     self.query_engine.on_error(&query, &err_str);
                     return Err(e);
-                }
+                },
             };
 
             let proposed = match Self::build_proposed_trade(&signal, &decision) {
@@ -670,10 +675,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     query.fail(err_str.clone(), "processing".to_string());
                     self.query_engine.on_error(&query, &err_str);
                     return Err(DaemonError::Config(err_str));
-                }
+                },
             };
 
-            match self.query_engine.check_risk(&mut query, &proposed, &risk_context, decision.actions) {
+            match self.query_engine.check_risk(
+                &mut query,
+                &proposed,
+                &risk_context,
+                decision.actions,
+            ) {
                 Ok(g) => g,
                 Err(CheckRiskError::Denied) => {
                     // Governed denial: query is already in Denied state.
@@ -688,7 +698,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         "Entry denied by risk gate — detector re-armed (governed outcome)"
                     );
                     return Ok(());
-                }
+                },
                 Err(CheckRiskError::InvalidState(e)) => {
                     // Operational error: query lifecycle state machine is inconsistent.
                     // This is NOT a governed denial — it indicates a bug or concurrent
@@ -697,7 +707,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     query.fail(err_str.clone(), "processing".to_string());
                     self.query_engine.on_error(&query, &err_str);
                     return Err(DaemonError::Config(err_str));
-                }
+                },
             }
         };
 
@@ -1037,7 +1047,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
     /// Emergency close all positions.
     ///
-    /// Iterates all non-terminal positions (Armed, Entering, Active, Exiting) and
+    /// Iterates all open core positions (Armed, Entering, Active, Exiting) and
     /// applies state-appropriate shutdown:
     ///
     /// - **Active**: place market exit order via `panic_close_position_internal()`.
@@ -1050,7 +1060,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     pub async fn panic_close_all(&self) -> DaemonResult<Vec<PositionId>> {
         warn!("PANIC: Emergency close all positions");
 
-        // find_active() returns ALL non-terminal states: Armed, Entering, Active, Exiting.
+        // find_active() returns open core-lifecycle states only:
+        // Armed, Entering, Active, Exiting.
         let all_non_terminal = self.store.positions().find_active().await?;
         let total_count = all_non_terminal.len();
         let mut closed_ids = Vec::new();
@@ -1095,7 +1106,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                             error!(position_id = %position.id, error = %e, "Failed to panic close");
                         },
                     }
-                }
+                },
                 PositionState::Armed => {
                     // No exchange order exists — disarm the position (cancel its detector).
                     if let Err(e) = self.disarm_position(position.id).await {
@@ -1104,7 +1115,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         info!(position_id = %position.id, "Panic: Armed position disarmed");
                         closed_ids.push(position.id);
                     }
-                }
+                },
                 PositionState::Entering { .. } => {
                     // Entry order submitted but not yet filled.
                     // Cancelling a pending margin order requires exchange-specific
@@ -1113,22 +1124,23 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         position_id = %position.id,
                         "Panic: Entering position skipped — entry order cancel not yet implemented"
                     );
-                }
+                },
                 PositionState::Exiting { .. } => {
                     // Exit already in progress — do not place a duplicate order.
                     info!(position_id = %position.id, "Panic: Exiting position skipped — exit already in progress");
-                }
+                },
                 PositionState::Closed { .. } => {
                     // find_active() guarantees this is unreachable.
-                }
+                },
                 PositionState::Error { error, .. } => {
-                    // Error state requires manual intervention — cannot be automatically closed.
+                    // Defensive fallback: find_active() excludes Error, but skip safely if the
+                    // repository contract is violated.
                     warn!(
                         position_id = %position.id,
                         error = %error,
-                        "Panic: Error position skipped — requires manual intervention"
+                        "Panic: Error position encountered outside find_active() contract"
                     );
-                }
+                },
             }
         }
 
@@ -1243,17 +1255,25 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         Ok(self.store.positions().find_by_id(position_id).await?)
     }
 
-    /// Get all active positions.
-    pub async fn get_active_positions(&self) -> DaemonResult<Vec<Position>> {
+    /// Get all open core positions.
+    ///
+    /// Includes Armed, Entering, Active, and Exiting positions.
+    /// Excludes Closed and Error.
+    pub async fn get_open_positions(&self) -> DaemonResult<Vec<Position>> {
         Ok(self.store.positions().find_active().await?)
     }
 
-    /// Get position count.
+    /// Historical alias used by older API/CLI code.
+    pub async fn get_active_positions(&self) -> DaemonResult<Vec<Position>> {
+        self.get_open_positions().await
+    }
+
+    /// Get open position count.
     pub async fn position_count(&self) -> DaemonResult<usize> {
         // This is a hack since Store doesn't have count method
         // In memory store we can count, in production we'd have proper query
-        let active = self.store.positions().find_active().await?;
-        Ok(active.len())
+        let open = self.store.positions().find_active().await?;
+        Ok(open.len())
     }
 }
 
@@ -1494,7 +1514,8 @@ mod tests {
         let pos = manager.get_position(position.id).await.unwrap().unwrap();
         assert!(
             matches!(pos.state, PositionState::Active { .. }),
-            "Expected Active before panic close, got {:?}", pos.state
+            "Expected Active before panic close, got {:?}",
+            pos.state
         );
 
         let _ = manager.panic_close_all().await.unwrap();
@@ -1530,7 +1551,13 @@ mod tests {
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let position = manager
-            .arm_position(symbol.clone(), Side::Long, create_test_risk_config(), tech_stop, Uuid::now_v7())
+            .arm_position(
+                symbol.clone(),
+                Side::Long,
+                create_test_risk_config(),
+                tech_stop,
+                Uuid::now_v7(),
+            )
             .await
             .unwrap();
 
@@ -1602,7 +1629,13 @@ mod tests {
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let position = manager
-            .arm_position(symbol.clone(), Side::Long, create_test_risk_config(), tech_stop, uuid::Uuid::now_v7())
+            .arm_position(
+                symbol.clone(),
+                Side::Long,
+                create_test_risk_config(),
+                tech_stop,
+                uuid::Uuid::now_v7(),
+            )
             .await
             .unwrap();
 
