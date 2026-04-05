@@ -25,6 +25,9 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
         // Position events
         "POSITION_OPENED" => handlers::positions::handle_position_opened(pool, envelope).await?,
         "POSITION_CLOSED" => handlers::positions::handle_position_closed(pool, envelope).await?,
+        "entry_order_placed" | "ENTRY_ORDER_PLACED" => {
+            handlers::positions::handle_entry_order_placed(pool, envelope).await?
+        },
         "entry_filled" | "ENTRY_FILLED" => {
             handlers::positions::handle_entry_filled(pool, envelope).await?
         },
@@ -33,6 +36,9 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
         },
         "exit_triggered" | "EXIT_TRIGGERED" => {
             handlers::positions::handle_exit_triggered(pool, envelope).await?
+        },
+        "exit_order_placed" | "EXIT_ORDER_PLACED" => {
+            handlers::positions::handle_exit_order_placed(pool, envelope).await?
         },
 
         // Balance events

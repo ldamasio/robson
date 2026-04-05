@@ -4,7 +4,7 @@
 //! INVARIANT: trailing_stop_price is initially derived from technical_stop_distance.
 
 use crate::error::{ProjectionError, Result};
-use crate::types::{PositionClosed, PositionOpened};
+use crate::types::{EntryOrderPlaced, ExitOrderPlaced, PositionClosed, PositionOpened};
 use robson_eventlog::EventEnvelope;
 use sqlx::PgPool;
 
@@ -137,6 +137,48 @@ pub(crate) async fn handle_position_closed(pool: &PgPool, envelope: &EventEnvelo
     Ok(())
 }
 
+pub(crate) async fn handle_entry_order_placed(
+    pool: &PgPool,
+    envelope: &EventEnvelope,
+) -> Result<()> {
+    let payload: EntryOrderPlaced =
+        serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+            ProjectionError::InvalidPayload {
+                event_type: envelope.event_type.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+
+    sqlx::query(
+        r#"
+        UPDATE positions_current
+        SET
+            state = 'entering',
+            entry_price = $2,
+            entry_quantity = $3,
+            current_quantity = $3,
+            entry_order_id = $4,
+            entry_signal_id = $5,
+            last_event_id = $6,
+            last_seq = $7,
+            updated_at = $8
+        WHERE position_id = $1 AND last_seq < $7
+        "#,
+    )
+    .bind(payload.position_id)
+    .bind(payload.expected_price)
+    .bind(payload.quantity)
+    .bind(payload.order_id)
+    .bind(payload.signal_id)
+    .bind(envelope.event_id)
+    .bind(envelope.seq)
+    .bind(envelope.occurred_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 pub(crate) async fn handle_entry_filled(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
     use crate::types::EntryFilled;
 
@@ -234,13 +276,52 @@ pub(crate) async fn handle_exit_triggered(pool: &PgPool, envelope: &EventEnvelop
         UPDATE positions_current
         SET
             state = 'exiting',
-            last_event_id = $2,
-            last_seq = $3,
-            updated_at = $4
-        WHERE position_id = $1 AND last_seq < $3
+            exit_reason = $2,
+            last_event_id = $3,
+            last_seq = $4,
+            updated_at = $5
+        WHERE position_id = $1 AND last_seq < $4
         "#,
     )
     .bind(payload.position_id)
+    .bind(&payload.reason)
+    .bind(envelope.event_id)
+    .bind(envelope.seq)
+    .bind(envelope.occurred_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub(crate) async fn handle_exit_order_placed(
+    pool: &PgPool,
+    envelope: &EventEnvelope,
+) -> Result<()> {
+    let payload: ExitOrderPlaced =
+        serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+            ProjectionError::InvalidPayload {
+                event_type: envelope.event_type.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+
+    sqlx::query(
+        r#"
+        UPDATE positions_current
+        SET
+            state = 'exiting',
+            exit_order_id = $2,
+            exit_reason = $3,
+            last_event_id = $4,
+            last_seq = $4,
+            updated_at = $5
+        WHERE position_id = $1 AND last_seq < $4
+        "#,
+    )
+    .bind(payload.position_id)
+    .bind(payload.order_id)
+    .bind(&payload.exit_reason)
     .bind(envelope.event_id)
     .bind(envelope.seq)
     .bind(envelope.occurred_at)

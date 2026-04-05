@@ -97,6 +97,17 @@ pub struct PositionOpened {
     pub stop_loss_order_id: Option<Uuid>,
 }
 
+/// ENTRY_ORDER_PLACED payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntryOrderPlaced {
+    pub position_id: Uuid,
+    pub order_id: Uuid,
+    pub expected_price: Decimal,
+    pub quantity: Decimal,
+    pub signal_id: Uuid,
+    pub timestamp: DateTime<Utc>,
+}
+
 /// POSITION_CLOSED payload
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PositionClosed {
@@ -134,6 +145,17 @@ pub struct ExitTriggered {
     pub reason: String,
     pub trigger_price: Decimal,
     pub stop_price: Decimal,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// EXIT_ORDER_PLACED payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ExitOrderPlaced {
+    pub position_id: Uuid,
+    pub order_id: Uuid,
+    pub expected_price: Decimal,
+    pub quantity: Decimal,
+    pub exit_reason: String,
     pub timestamp: DateTime<Utc>,
 }
 

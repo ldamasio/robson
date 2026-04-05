@@ -231,6 +231,157 @@ async fn test_position_opened_rejects_zero_stop_distance(pool: sqlx::PgPool) -> 
 
 #[sqlx::test]
 #[ignore = "requires DATABASE_URL (see file header for setup)"]
+async fn test_entry_order_placed_updates_position_to_entering(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let position_id = Uuid::new_v4();
+    let tenant_id = Uuid::new_v4();
+    let account_id = Uuid::new_v4();
+    let signal_id = Uuid::new_v4();
+    let order_id = Uuid::new_v4();
+
+    let opened = make_envelope(
+        "position:test",
+        "POSITION_OPENED",
+        serde_json::json!({
+            "position_id": position_id,
+            "tenant_id": tenant_id,
+            "account_id": account_id,
+            "strategy_id": null,
+            "symbol": "BTCUSDT",
+            "side": "long",
+            "entry_price": null,
+            "entry_quantity": null,
+            "entry_filled_at": null,
+            "technical_stop_price": "49000",
+            "technical_stop_distance": "1000",
+            "entry_order_id": null,
+            "stop_loss_order_id": null
+        }),
+        1,
+    );
+    apply_event_to_projections(&pool, &opened).await.unwrap();
+
+    let entering = make_envelope(
+        "position:test",
+        "entry_order_placed",
+        serde_json::json!({
+            "position_id": position_id,
+            "order_id": order_id,
+            "expected_price": "50000",
+            "quantity": "0.1",
+            "signal_id": signal_id,
+            "timestamp": Utc::now(),
+        }),
+        2,
+    );
+    apply_event_to_projections(&pool, &entering).await.unwrap();
+
+    let (state, entry_price, entry_quantity, current_quantity, stored_order_id, stored_signal_id): (
+        String,
+        Option<Decimal>,
+        Option<Decimal>,
+        Decimal,
+        Option<Uuid>,
+        Option<Uuid>,
+    ) = sqlx::query_as(
+        "SELECT state, entry_price, entry_quantity, current_quantity, entry_order_id, entry_signal_id FROM positions_current WHERE position_id = $1",
+    )
+    .bind(position_id)
+    .fetch_one(&pool)
+    .await?;
+
+    assert_eq!(state, "entering");
+    assert_eq!(entry_price, Some(Decimal::from(50000)));
+    assert_eq!(entry_quantity, Some(Decimal::from(1) / Decimal::from(10)));
+    assert_eq!(current_quantity, Decimal::from(1) / Decimal::from(10));
+    assert_eq!(stored_order_id, Some(order_id));
+    assert_eq!(stored_signal_id, Some(signal_id));
+
+    Ok(())
+}
+
+#[sqlx::test]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
+async fn test_exit_order_placed_updates_projection_with_exit_reason(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let position_id = Uuid::new_v4();
+    let tenant_id = Uuid::new_v4();
+    let account_id = Uuid::new_v4();
+    let entry_order_id = Uuid::new_v4();
+    let exit_order_id = Uuid::new_v4();
+
+    let opened = make_envelope(
+        "position:test",
+        "POSITION_OPENED",
+        serde_json::json!({
+            "position_id": position_id,
+            "tenant_id": tenant_id,
+            "account_id": account_id,
+            "strategy_id": null,
+            "symbol": "BTCUSDT",
+            "side": "long",
+            "entry_price": null,
+            "entry_quantity": null,
+            "entry_filled_at": null,
+            "technical_stop_price": "49000",
+            "technical_stop_distance": "1000",
+            "entry_order_id": null,
+            "stop_loss_order_id": null
+        }),
+        1,
+    );
+    apply_event_to_projections(&pool, &opened).await.unwrap();
+
+    let entry_filled = make_envelope(
+        "position:test",
+        "entry_filled",
+        serde_json::json!({
+            "position_id": position_id,
+            "order_id": entry_order_id,
+            "fill_price": "50000",
+            "filled_quantity": "0.1",
+            "fee": "0.001",
+            "initial_stop": "49000",
+            "timestamp": Utc::now(),
+        }),
+        2,
+    );
+    apply_event_to_projections(&pool, &entry_filled).await.unwrap();
+
+    let exit_order = make_envelope(
+        "position:test",
+        "exit_order_placed",
+        serde_json::json!({
+            "position_id": position_id,
+            "order_id": exit_order_id,
+            "expected_price": "48900",
+            "quantity": "0.1",
+            "exit_reason": "TrailingStop",
+            "timestamp": Utc::now(),
+        }),
+        3,
+    );
+    apply_event_to_projections(&pool, &exit_order).await.unwrap();
+
+    let (state, stored_order_id, exit_reason): (String, Option<Uuid>, Option<String>) =
+        sqlx::query_as(
+            "SELECT state, exit_order_id, exit_reason FROM positions_current WHERE position_id = $1",
+        )
+        .bind(position_id)
+        .fetch_one(&pool)
+        .await?;
+
+    assert_eq!(state, "exiting");
+    assert_eq!(stored_order_id, Some(exit_order_id));
+    assert_eq!(exit_reason, Some("TrailingStop".to_string()));
+
+    Ok(())
+}
+
+#[sqlx::test]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_fill_received_idempotent(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Arrange
     let order_id = Uuid::new_v4();
