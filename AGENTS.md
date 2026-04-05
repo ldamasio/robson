@@ -102,8 +102,12 @@ Tool-specific files may exist for compatibility, but they are adapters, not prim
 Examples:
 
 - `CLAUDE.md`
-- Cursor project rules
+- `.cursor/rules/*`
 - other editor or agent config files
+
+Legacy compatibility note:
+
+- `.cursorrules` is deprecated and should not be used as a primary rule store in this repository.
 
 When updating project-wide AI behavior:
 

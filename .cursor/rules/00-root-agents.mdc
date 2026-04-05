@@ -1,0 +1,11 @@
+---
+description: Canonical project instructions live in root AGENTS.md
+globs:
+alwaysApply: true
+---
+
+Follow the repository root `AGENTS.md` as the canonical project-wide instruction file.
+
+This Cursor rule is only a compatibility adapter.
+Do not duplicate policy here.
+Do not let this file diverge from `AGENTS.md`.
