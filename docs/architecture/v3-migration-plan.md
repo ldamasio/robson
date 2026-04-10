@@ -99,9 +99,9 @@ Status rule for this table: code-backed items may be marked done from repository
 
 | ID | Description | Status |
 |----|-------------|--------|
-| MIG-v2.5#1 | Deploy robsond to k3s | Pending (operational rollout) |
-| MIG-v2.5#2 | Complete projector handlers + runtime persistence | Pending (code hardened; awaiting real PostgreSQL execution) |
-| MIG-v2.5#3 | Migrate stop monitoring to WebSocket | Pending |
+| MIG-v2.5#1 | Deploy robsond to k3s | ✅ Done (2026-04-10) — sha-e128478e, 0 restarts, Synced/Healthy |
+| MIG-v2.5#2 | Complete projector handlers + runtime persistence | ✅ Done (2026-04-10) — migrations 000–007 applied, pool connected, projection recovery working |
+| MIG-v2.5#3 | Migrate stop monitoring to WebSocket | ✅ Done (2026-04-10) — reconnect loop + DB startup retry |
 | MIG-v2.5#4 | GovernedAction + Risk Engine blocking gate | ✅ Done (2026-04-04) |
 | MIG-v2.5#5 | Circuit breaker escalation ladder | ✅ Done (2026-04-10) |
 | MIG-v2.5#6 | SSE endpoint for frontend | ✅ Done (2026-04-05) |
@@ -123,9 +123,9 @@ Status rule for this table: code-backed items may be marked done from repository
 | QE-P4 | Full Audit & Replay | ✅ Done (2026-04-05) |
 | QE-P5 | Context Governance (LLM) | Deferred (v3+) |
 
-### MIG-v2.5#2 Technical Notes (2026-04-05)
+### MIG-v2.5#2 Technical Notes (2026-04-05, validated 2026-04-10)
 
-**Status**: Pending (needs staging validation with real PostgreSQL — see remaining gaps below)
+**Status**: ✅ Done — staging validation complete against real PostgreSQL on jaguar/ParadeDB. Migrations 20240101000000–20240101000007 confirmed applied; `positions_current`, `event_log`, `query_audit` tables present and accessible; projection recovery returns 0 active positions on startup (correct for fresh deployment).
 
 **What was corrected in this session**:
 
@@ -158,16 +158,46 @@ The chosen mechanism for MIG-v2.5#2 is the **synchronous fail-fast write path**:
 
 **Remaining gaps (explicit)**:
 
-1. Staging validation with real PostgreSQL (`DATABASE_URL`) has not been run in this repository
-2. ProjectionWorker does not perform catch-up for `position:{id}` streams
-3. Runtime e2e test (`test_runtime_arm_position_persists_to_projection`) is compiled and present but marked `#[ignore]` pending `DATABASE_URL` in CI
-4. The write path is fail-fast and retry-healing on duplicate, but append + projection apply are still not a single atomic transaction
+1. ~~Staging validation with real PostgreSQL (`DATABASE_URL`) has not been run~~ — ✅ Closed 2026-04-10.
+2. ProjectionWorker does not perform catch-up for `position:{id}` streams — v3 follow-up.
+3. Runtime e2e test (`test_runtime_arm_position_persists_to_projection`) is compiled and present but marked `#[ignore]` pending `DATABASE_URL` in CI — acceptable; validated manually against live cluster.
+4. The write path is fail-fast and retry-healing on duplicate, but append + projection apply are still not a single atomic transaction — v3 follow-up.
 
 **2026-04-05 Session Update**:
 
 6. **Added `entry_signal_received` handler to projector**: The engine emits `EntrySignalReceived` as an audit event during entry signal processing. Previously, the projector had no handler for this event type, which would cause a `MissingHandler` error when `event_log_pool` is configured (fail-fast mode). Added `handle_entry_signal_received()` which acknowledges the event without modifying projection state (it's an audit event, state transition is done by `entry_order_placed`).
 
 7. **Added regression test for `entry_signal_received`**: New test `test_entry_signal_received_handled_without_error` in `crash_recovery.rs` verifies that the event is handled without `MissingHandler` error and doesn't change position state.
+
+### MIG-v2.5#3 Technical Notes (2026-04-10)
+
+**Status**: ✅ Done — WebSocket reconnection loop + DB startup retry deployed as `sha-e128478e`. Verified in cluster: WebSocket now reconnects after stream close without daemon exit; 0 restarts after rollout.
+
+**Root cause of 626 restarts (identified from `--previous` logs)**:
+
+Primary cause was NOT the WebSocket disconnect. The real crash was:
+```
+Error: error communicating with database: failed to lookup address information: Temporary failure in name resolution
+```
+`PgPool::connect(database_url).await?` in `main.rs` exited immediately on transient DNS failure (normal during pod startup — CoreDNS/flannel may not be ready when the container starts). Every failure → `exitCode=1` → k8s restart. This is why 626 restarts accumulated over 3 days.
+
+**Fixes applied**:
+
+1. **DB startup retry** (`main.rs`): `PgPool::connect` now retries with exponential backoff (1 s → 2 s → 4 s → 8 s → 16 s → 32 s → 60 s, max 7 attempts, ~2 min total) before propagating error. Kubernetes restart remains the last resort, not the normal retry path.
+
+2. **WebSocket reconnection** (`market_data.rs`): The `spawn_ws_client` task now runs indefinitely. On stream close or error, it waits with exponential backoff (1 s → 60 s cap) and reconnects. Backoff resets only after receiving the **first tick** (not just on connect), so Binance accept-then-immediately-close loops still back off. The task exits cleanly when the `CancellationToken` is cancelled (daemon shutdown).
+
+3. **WS handle awaited on shutdown** (`daemon.rs`): `ws_handle` is now retained and awaited with a 5-second timeout during graceful shutdown, consistent with projection worker and position monitor.
+
+**Migration metadata repair (one-time operational fix)**:
+
+The `_sqlx_migrations` table had old numeric versions (2–6) from a prior migrator schema. When the new migrator (timestamp-versioned 20240101000000–20240101000007) ran, it rejected the old entries as "missing in the resolved migrations". Fixed by:
+1. Mapping numeric versions 2→`20240101000001`, 3→`20240101000002`, 5→`20240101000004` via `UPDATE` in a transaction.
+2. Removing entries 4 and 6 (the old versions — the schema objects they created already existed; those were actually covered by different current migrations).
+3. Registering migrations `20240101000000`, `20240101000003`, `20240101000005` (applied by the failed hook attempt but unregistered) with correct SHA-384 checksums.
+4. Re-running the ArgoCD sync hook which then applied `20240101000006` and `20240101000007` cleanly.
+
+This was a one-time repair; the migration table is now consistent and idempotent.
 
 ---
 
