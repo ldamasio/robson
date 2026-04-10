@@ -30,7 +30,7 @@ pub async fn migrate(pool: &PgPool) -> Result<()> {
 /// Prints current migration version and any pending migrations.
 pub async fn status(pool: &PgPool) -> Result<()> {
     // Check connectivity
-    let result: i64 = sqlx::query_scalar("SELECT 1").fetch_one(pool).await?;
+    let result: i64 = sqlx::query_scalar("SELECT 1::BIGINT").fetch_one(pool).await?;
 
     if result != 1 {
         return Err(anyhow::anyhow!("Database connectivity check failed"));
@@ -41,7 +41,7 @@ pub async fn status(pool: &PgPool) -> Result<()> {
     // Check migration status using runtime query (sqlx::query! requires DB at compile time)
     let rows = sqlx::query(
         r#"
-        SELECT version, description, installed_on, success
+        SELECT version, description, installed_on::TEXT AS installed_on, success
         FROM _sqlx_migrations
         ORDER BY version DESC
         LIMIT 10
