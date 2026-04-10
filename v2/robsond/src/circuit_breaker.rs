@@ -19,12 +19,12 @@
 //! Any level → Inactive  (via /circuit-breaker/reset, operator only)
 //! ```
 //!
-//! | Level    | Trigger                      | Blocks new entries | Blocks all trading |
-//! |----------|------------------------------|-------------------|-------------------|
-//! | Inactive | —                            | No                | No                |
-//! | Warning  | reserved — not yet triggered | No                | No                |
-//! | SoftHalt | Daily loss limit exceeded    | Yes               | No                |
-//! | HardHalt | Operator escalation only     | Yes               | Yes               |
+//! | Level    | Trigger                      | Blocks new entries | Blocks signals | Trailing stops still run |
+//! |----------|------------------------------|-------------------|----------------|--------------------------|
+//! | Inactive | —                            | No                | No             | Yes                      |
+//! | Warning  | reserved — not yet triggered | No                | No             | Yes                      |
+//! | SoftHalt | Daily loss limit exceeded    | Yes               | Yes            | Yes                      |
+//! | HardHalt | Operator escalation only     | Yes               | Yes            | Yes                      |
 //!
 //! # Design Decisions
 //!
@@ -35,9 +35,11 @@
 //! - **Downward transitions require explicit operator reset** (`POST /circuit-breaker/reset`).
 //! - **SoftHalt does not close positions.** Existing positions continue to trail stops
 //!   and can exit normally. New arm, signal, and approval-resume are all blocked.
-//! - **HardHalt blocks all trading activity** including signal processing and market-data
-//!   driven exits. The operator must call `/panic` separately to close positions;
-//!   circuit breaker reset alone does not close positions.
+//! - **HardHalt blocks new entries and signal processing**, but does NOT block
+//!   market-data driven trailing-stop updates and exits on existing positions.
+//!   This is intentional: stopping trailing stops under HardHalt would leave open
+//!   positions unprotected. To close existing positions, the operator must call
+//!   `/panic` explicitly; circuit breaker reset alone does not close positions.
 //! - **Thread-safe.** Inner `RwLock` allows reads from `&self` contexts, writes only
 //!   during escalation and reset.
 //! - **Idempotent operator actions.** `escalate_to_hard_halt` and `reset` are no-ops
@@ -79,7 +81,11 @@ impl CircuitBreakerLevel {
         matches!(self, CircuitBreakerLevel::SoftHalt | CircuitBreakerLevel::HardHalt)
     }
 
-    /// Returns true if the level prevents ALL trading activity (including signal processing).
+    /// Returns true if the level prevents signal processing and new entries.
+    ///
+    /// Note: market-data driven trailing-stop updates and exits on existing positions
+    /// are NOT blocked even at `HardHalt` — stopping them would leave open positions
+    /// unprotected. Use `/panic` to close existing positions explicitly.
     pub fn blocks_all_trading(self) -> bool {
         matches!(self, CircuitBreakerLevel::HardHalt)
     }

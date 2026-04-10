@@ -175,8 +175,9 @@ pub(crate) fn map_daemon_event(event: &DaemonEvent) -> Option<PublicSseEvent> {
         } => Some(PublicSseEvent::new(
             "circuit_breaker.triggered",
             json!({
-                "level": level.to_string(),
-                "previous_level": previous_level.to_string(),
+                // Serialize via serde (snake_case) to match the REST API contract.
+                "level": level,
+                "previous_level": previous_level,
                 "reason": reason,
                 "triggered_at": triggered_at,
             }),
@@ -184,7 +185,7 @@ pub(crate) fn map_daemon_event(event: &DaemonEvent) -> Option<PublicSseEvent> {
         DaemonEvent::CircuitBreakerReset { previous_level } => Some(PublicSseEvent::new(
             "circuit_breaker.reset",
             json!({
-                "previous_level": previous_level.to_string(),
+                "previous_level": previous_level,
             }),
         )),
         DaemonEvent::DetectorSignal(_)
