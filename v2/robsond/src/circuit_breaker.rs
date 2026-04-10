@@ -19,12 +19,12 @@
 //! Any level → Inactive  (via /circuit-breaker/reset, operator only)
 //! ```
 //!
-//! | Level    | Trigger                      | Blocks new entries | Blocks signals | Trailing stops still run |
-//! |----------|------------------------------|-------------------|----------------|--------------------------|
-//! | Inactive | —                            | No                | No             | Yes                      |
-//! | Warning  | reserved — not yet triggered | No                | No             | Yes                      |
-//! | SoftHalt | Daily loss limit exceeded    | Yes               | Yes            | Yes                      |
-//! | HardHalt | Operator escalation only     | Yes               | Yes            | Yes                      |
+//! | Level    | Trigger                      | blocks_new_entries | blocks_signals | Trailing stops |
+//! |----------|------------------------------|-------------------|----------------|----------------|
+//! | Inactive | —                            | No                | No             | Yes            |
+//! | Warning  | reserved — not yet triggered | No                | No             | Yes            |
+//! | SoftHalt | Daily loss limit exceeded    | Yes               | Yes            | Yes            |
+//! | HardHalt | Operator escalation only     | Yes               | Yes            | Yes            |
 //!
 //! # Design Decisions
 //!
@@ -83,11 +83,13 @@ impl CircuitBreakerLevel {
 
     /// Returns true if the level prevents detector signal processing.
     ///
-    /// At `HardHalt` this is true, but market-data driven trailing-stop updates and
-    /// exits on existing positions are NOT blocked — stopping them would leave open
-    /// positions unprotected. Use `/panic` to close existing positions explicitly.
+    /// True for `SoftHalt` and `HardHalt`: a detector signal that would transition
+    /// an Armed position to Entering is a new entry, and is blocked at the same
+    /// levels as `blocks_new_entries`. Market-data driven trailing-stop updates and
+    /// exits on existing positions are NOT blocked at any level — use `/panic` to
+    /// close existing positions explicitly.
     pub fn blocks_signals(self) -> bool {
-        matches!(self, CircuitBreakerLevel::HardHalt)
+        matches!(self, CircuitBreakerLevel::SoftHalt | CircuitBreakerLevel::HardHalt)
     }
 
     /// Human-readable description.
@@ -261,12 +263,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_escalate_to_soft_halt_blocks_entries() {
+    async fn test_escalate_to_soft_halt_blocks_entries_and_signals() {
         let cb = CircuitBreaker::default();
         let prev = cb.try_escalate(CircuitBreakerLevel::SoftHalt, "daily limit".into()).await;
         assert_eq!(prev, Some(CircuitBreakerLevel::Inactive));
         assert!(cb.blocks_new_entries().await);
-        assert!(!cb.blocks_signals().await);
+        assert!(cb.blocks_signals().await, "SoftHalt must also block signals");
     }
 
     #[tokio::test]

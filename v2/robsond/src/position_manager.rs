@@ -1121,7 +1121,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         // SoftHalt and HardHalt both block new entries — a detector signal that
         // would transition Armed→Entering counts as a new entry.
-        // (HardHalt also blocks market-data processing, but that path is separate.)
         if self.circuit_breaker.blocks_new_entries().await {
             let snap = self.circuit_breaker.snapshot().await;
             warn!(
