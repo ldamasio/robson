@@ -81,12 +81,12 @@ impl CircuitBreakerLevel {
         matches!(self, CircuitBreakerLevel::SoftHalt | CircuitBreakerLevel::HardHalt)
     }
 
-    /// Returns true if the level prevents signal processing and new entries.
+    /// Returns true if the level prevents detector signal processing.
     ///
-    /// Note: market-data driven trailing-stop updates and exits on existing positions
-    /// are NOT blocked even at `HardHalt` — stopping them would leave open positions
-    /// unprotected. Use `/panic` to close existing positions explicitly.
-    pub fn blocks_all_trading(self) -> bool {
+    /// At `HardHalt` this is true, but market-data driven trailing-stop updates and
+    /// exits on existing positions are NOT blocked — stopping them would leave open
+    /// positions unprotected. Use `/panic` to close existing positions explicitly.
+    pub fn blocks_signals(self) -> bool {
         matches!(self, CircuitBreakerLevel::HardHalt)
     }
 
@@ -96,7 +96,7 @@ impl CircuitBreakerLevel {
             CircuitBreakerLevel::Inactive => "Normal operation",
             CircuitBreakerLevel::Warning => "Approaching daily loss limit — new entries still allowed",
             CircuitBreakerLevel::SoftHalt => "Daily loss limit exceeded — new entries blocked",
-            CircuitBreakerLevel::HardHalt => "Hard halt — all trading blocked, operator reset required",
+            CircuitBreakerLevel::HardHalt => "Hard halt — new entries and signals blocked; trailing stops continue; operator reset required",
         }
     }
 }
@@ -122,7 +122,7 @@ pub struct CircuitBreakerSnapshot {
     /// Whether new position arm/entry is currently blocked.
     pub blocks_new_entries: bool,
     /// Whether all trading activity is currently blocked.
-    pub blocks_all_trading: bool,
+    pub blocks_signals: bool,
 }
 
 // =============================================================================
@@ -148,7 +148,7 @@ impl State {
             reason: self.reason.clone(),
             triggered_at: self.triggered_at,
             blocks_new_entries: self.level.blocks_new_entries(),
-            blocks_all_trading: self.level.blocks_all_trading(),
+            blocks_signals: self.level.blocks_signals(),
         }
     }
 }
@@ -189,8 +189,8 @@ impl CircuitBreaker {
     }
 
     /// Whether all trading is currently blocked.
-    pub async fn blocks_all_trading(&self) -> bool {
-        self.state.read().await.level.blocks_all_trading()
+    pub async fn blocks_signals(&self) -> bool {
+        self.state.read().await.level.blocks_signals()
     }
 
     /// Try to escalate to `target_level` if it is higher than the current level.
@@ -257,7 +257,7 @@ mod tests {
         let cb = CircuitBreaker::default();
         assert_eq!(cb.level().await, CircuitBreakerLevel::Inactive);
         assert!(!cb.blocks_new_entries().await);
-        assert!(!cb.blocks_all_trading().await);
+        assert!(!cb.blocks_signals().await);
     }
 
     #[tokio::test]
@@ -266,7 +266,7 @@ mod tests {
         let prev = cb.try_escalate(CircuitBreakerLevel::SoftHalt, "daily limit".into()).await;
         assert_eq!(prev, Some(CircuitBreakerLevel::Inactive));
         assert!(cb.blocks_new_entries().await);
-        assert!(!cb.blocks_all_trading().await);
+        assert!(!cb.blocks_signals().await);
     }
 
     #[tokio::test]
@@ -275,7 +275,7 @@ mod tests {
         let prev = cb.escalate_to_hard_halt("operator".into()).await;
         assert_eq!(prev, Some(CircuitBreakerLevel::Inactive));
         assert!(cb.blocks_new_entries().await);
-        assert!(cb.blocks_all_trading().await);
+        assert!(cb.blocks_signals().await);
     }
 
     #[tokio::test]
@@ -334,7 +334,7 @@ mod tests {
         assert_eq!(snap.reason.as_deref(), Some("approaching limit"));
         assert!(snap.triggered_at.is_some());
         assert!(!snap.blocks_new_entries);
-        assert!(!snap.blocks_all_trading);
+        assert!(!snap.blocks_signals);
     }
 
     #[tokio::test]

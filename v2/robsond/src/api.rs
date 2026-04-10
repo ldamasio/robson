@@ -175,7 +175,7 @@ pub struct CircuitBreakerStatusResponse {
     pub reason: Option<String>,
     pub triggered_at: Option<chrono::DateTime<chrono::Utc>>,
     pub blocks_new_entries: bool,
-    pub blocks_all_trading: bool,
+    pub blocks_signals: bool,
 }
 
 impl From<CircuitBreakerSnapshot> for CircuitBreakerStatusResponse {
@@ -186,7 +186,7 @@ impl From<CircuitBreakerSnapshot> for CircuitBreakerStatusResponse {
             reason: s.reason,
             triggered_at: s.triggered_at,
             blocks_new_entries: s.blocks_new_entries,
-            blocks_all_trading: s.blocks_all_trading,
+            blocks_signals: s.blocks_signals,
         }
     }
 }
