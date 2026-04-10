@@ -93,7 +93,7 @@ every reference uses a canonical identifier with a prefix:
 - `QE-P5` is NOT a migration step; it is a deferred QueryEngine phase (Context Governance, v3+ with LLM).
 - `Stage N` is a pipeline stage within a single execution tick (e.g., Stage 1: Observe). Not a project milestone.
 
-**Quick status reference** (as of 2026-04-05, repository-verified):
+**Quick status reference** (as of 2026-04-10, repository-verified):
 
 Status rule for this table: code-backed items may be marked done from repository evidence; operational rollout items stay pending unless the repository contains explicit rollout confirmation.
 
@@ -103,11 +103,11 @@ Status rule for this table: code-backed items may be marked done from repository
 | MIG-v2.5#2 | Complete projector handlers + runtime persistence | Pending (code hardened; awaiting real PostgreSQL execution) |
 | MIG-v2.5#3 | Migrate stop monitoring to WebSocket | Pending |
 | MIG-v2.5#4 | GovernedAction + Risk Engine blocking gate | ✅ Done (2026-04-04) |
-| MIG-v2.5#5 | Circuit breaker escalation ladder | Pending |
+| MIG-v2.5#5 | Circuit breaker escalation ladder | ✅ Done (2026-04-10) |
 | MIG-v2.5#6 | SSE endpoint for frontend | ✅ Done (2026-04-05) |
-| MIG-v2.5#7 | SOPS secrets management | Pending |
-| MIG-v2.5#8 | Deploy Prometheus + Grafana + Loki | Pending |
-| MIG-v2.5#9 | Contract tests for daemon API | Pending |
+| MIG-v2.5#7 | SOPS secrets management | ✅ Done (2026-04-10) |
+| MIG-v2.5#8 | Deploy Prometheus + Grafana + Loki | ✅ Done (2026-04-10) — manifests+ArgoCD; pending cluster sync |
+| MIG-v2.5#9 | Contract tests for daemon API | ✅ Done (2026-04-10) — 29 tests |
 | MIG-v2.5#10 | EventLog replay determinism test | ✅ Done (2026-04-05) |
 | MIG-v3#1 | Promote robsond as primary runtime | Pending |
 | MIG-v3#2 | Replace Django API with thin gateway | Pending |

@@ -75,8 +75,38 @@ async fn main() -> anyhow::Result<()> {
         {
             info!(%tenant_id, "PostgreSQL configured, creating shared connection pool");
 
-            // Create shared PostgreSQL connection pool
-            let pool = Arc::new(sqlx::PgPool::connect(database_url).await?);
+            // Retry initial DB connect with exponential backoff so that transient DNS
+            // failures during pod startup do not cause an immediate exitCode=1.
+            // Kubernetes restarts are a last resort, not the normal retry mechanism.
+            // Cap: ~2 minutes total (1+2+4+8+16+32+60 = 123 s across 7 attempts).
+            let pool = {
+                const MAX_BACKOFF_SECS: u64 = 60;
+                let mut backoff_secs: u64 = 1;
+                let mut attempt: u32 = 0;
+                loop {
+                    attempt += 1;
+                    match sqlx::PgPool::connect(database_url).await {
+                        Ok(p) => {
+                            if attempt > 1 {
+                                info!(attempt, "PostgreSQL connection established after retry");
+                            }
+                            break p;
+                        }
+                        Err(e) => {
+                            tracing::warn!(
+                                attempt,
+                                retry_in_secs = backoff_secs,
+                                error = %e,
+                                "PostgreSQL connection failed, retrying"
+                            );
+                            tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs))
+                                .await;
+                            backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                        }
+                    }
+                }
+            };
+            let pool = Arc::new(pool);
 
             // Create projection recovery adapter (uses same pool)
             let recovery = Some(Arc::new(robson_store::PgProjectionReader::new(pool.clone()))

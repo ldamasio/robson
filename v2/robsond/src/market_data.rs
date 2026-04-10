@@ -2,111 +2,181 @@
 //!
 //! Spawns WebSocket client tasks and bridges market data events
 //! from connectors to the daemon event bus.
+//!
+//! # Reconnection
+//!
+//! The spawned task runs indefinitely. When the WebSocket stream closes or
+//! errors (Binance disconnects periodically — this is normal), the task waits
+//! with exponential backoff (1 s → 2 s → 4 s … capped at 60 s) and reconnects.
+//! The task only terminates on daemon shutdown (via `CancellationToken`).
 
 use robson_connectors::{BinanceWebSocketClient, WsMessage};
 use robson_domain::{Price, Symbol};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
-use tracing::{error, info};
+use tokio::time::{Duration, sleep};
+use tokio_util::sync::CancellationToken;
+use tracing::{error, info, warn};
 
 use crate::error::DaemonResult;
 use crate::event_bus::{DaemonEvent, EventBus};
+
+/// Maximum reconnect backoff in seconds.
+const MAX_BACKOFF_SECS: u64 = 60;
 
 /// Market data manager - spawns and manages WebSocket tasks.
 pub struct MarketDataManager {
     /// Event bus for publishing market data
     event_bus: Arc<EventBus>,
+    /// Cancellation token for graceful shutdown
+    cancel: CancellationToken,
 }
 
 impl MarketDataManager {
     /// Create a new market data manager.
-    pub fn new(event_bus: Arc<EventBus>) -> Self {
-        Self { event_bus }
+    pub fn new(event_bus: Arc<EventBus>, cancel: CancellationToken) -> Self {
+        Self { event_bus, cancel }
     }
 
     /// Spawn a WebSocket client task for a single symbol.
     ///
-    /// Returns a join handle that can be used to monitor the task.
+    /// The task runs indefinitely, reconnecting with exponential backoff when
+    /// the stream closes or errors. It exits cleanly when the cancellation
+    /// token is cancelled.
+    ///
+    /// Returns a join handle that completes only on shutdown.
     pub fn spawn_ws_client(&self, symbol: Symbol) -> DaemonResult<JoinHandle<()>> {
         let event_bus = self.event_bus.clone();
+        let cancel = self.cancel.clone();
         let symbol_str = symbol.as_pair();
 
         let handle = tokio::spawn(async move {
             let ws_client = BinanceWebSocketClient::new(false);
+            let mut backoff_secs: u64 = 1;
 
-            let mut stream = match ws_client.subscribe_agg_trade(&symbol_str).await {
-                Ok(s) => {
-                    info!(symbol = %symbol_str, "WebSocket client connected");
-                    s
-                },
-                Err(e) => {
-                    error!(error = %e, symbol = %symbol_str, "Failed to connect WebSocket");
-                    return;
-                },
-            };
-
-            info!(symbol = %symbol_str, "WebSocket client task started");
-
-            let mut first_tick_logged = false;
-
-            loop {
-                match stream.next().await {
-                    None => {
-                        info!(symbol = %symbol_str, "WebSocket stream closed");
-                        break;
-                    },
-                    Some(Err(e)) => {
-                        error!(error = %e, symbol = %symbol_str, "WebSocket stream error");
-                        break;
-                    },
-                    Some(Ok(WsMessage::AggTrade(trade))) => {
-                        let price_decimal = match rust_decimal::Decimal::from_str(&trade.price) {
-                            Ok(d) => d,
-                            Err(e) => {
-                                error!(error = %e, "Failed to parse price from agg trade");
-                                continue;
-                            },
-                        };
-
-                        let price = match Price::new(price_decimal) {
-                            Ok(p) => p,
-                            Err(e) => {
-                                error!(error = %e, price = %trade.price, "Invalid price value");
-                                continue;
-                            },
-                        };
-
-                        if !first_tick_logged {
-                            info!(
-                                symbol = %trade.symbol,
-                                price = %price_decimal,
-                                "First tick received"
-                            );
-                            first_tick_logged = true;
-                        }
-
-                        let trade_symbol = match Symbol::from_pair(&trade.symbol) {
-                            Ok(s) => s,
-                            Err(e) => {
-                                error!(error = %e, symbol = %trade.symbol, "Failed to parse symbol");
-                                continue;
-                            },
-                        };
-
-                        let timestamp = chrono::Utc::now();
-                        let daemon_event = DaemonEvent::MarketData(crate::event_bus::MarketData {
-                            symbol: trade_symbol,
-                            price,
-                            timestamp,
-                        });
-
-                        event_bus.send(daemon_event);
-                    },
-                    Some(Ok(_)) => {
-                        // Other message types not needed here
-                    },
+            'reconnect: loop {
+                if cancel.is_cancelled() {
+                    break;
                 }
+
+                let mut stream = match ws_client.subscribe_agg_trade(&symbol_str).await {
+                    Ok(s) => {
+                        info!(symbol = %symbol_str, "WebSocket client connected");
+                        // Backoff resets only after first tick, not on connect, so that
+                        // Binance accept-then-immediately-close loops still back off.
+                        s
+                    },
+                    Err(e) => {
+                        error!(
+                            error = %e,
+                            symbol = %symbol_str,
+                            retry_in_secs = backoff_secs,
+                            "WebSocket connect failed, retrying"
+                        );
+                        tokio::select! {
+                            _ = sleep(Duration::from_secs(backoff_secs)) => {},
+                            _ = cancel.cancelled() => break 'reconnect,
+                        }
+                        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                        continue 'reconnect;
+                    },
+                };
+
+                let mut first_tick_logged = false;
+
+                loop {
+                    tokio::select! {
+                        _ = cancel.cancelled() => {
+                            info!(symbol = %symbol_str, "WebSocket client shutting down");
+                            break 'reconnect;
+                        }
+                        msg = stream.next() => {
+                            match msg {
+                                None => {
+                                    warn!(
+                                        symbol = %symbol_str,
+                                        retry_in_secs = backoff_secs,
+                                        "WebSocket stream closed, reconnecting"
+                                    );
+                                    break; // break inner loop → reconnect
+                                },
+                                Some(Err(e)) => {
+                                    error!(
+                                        error = %e,
+                                        symbol = %symbol_str,
+                                        retry_in_secs = backoff_secs,
+                                        "WebSocket stream error, reconnecting"
+                                    );
+                                    break; // break inner loop → reconnect
+                                },
+                                Some(Ok(WsMessage::AggTrade(trade))) => {
+                                    let price_decimal =
+                                        match rust_decimal::Decimal::from_str(&trade.price) {
+                                            Ok(d) => d,
+                                            Err(e) => {
+                                                error!(error = %e, "Failed to parse price");
+                                                continue;
+                                            },
+                                        };
+
+                                    let price = match Price::new(price_decimal) {
+                                        Ok(p) => p,
+                                        Err(e) => {
+                                            error!(
+                                                error = %e,
+                                                price = %trade.price,
+                                                "Invalid price value"
+                                            );
+                                            continue;
+                                        },
+                                    };
+
+                                    if !first_tick_logged {
+                                        info!(
+                                            symbol = %trade.symbol,
+                                            price = %price_decimal,
+                                            "First tick received"
+                                        );
+                                        first_tick_logged = true;
+                                        backoff_secs = 1; // stable connection confirmed
+                                    }
+
+                                    let trade_symbol = match Symbol::from_pair(&trade.symbol) {
+                                        Ok(s) => s,
+                                        Err(e) => {
+                                            error!(
+                                                error = %e,
+                                                symbol = %trade.symbol,
+                                                "Failed to parse symbol"
+                                            );
+                                            continue;
+                                        },
+                                    };
+
+                                    let daemon_event =
+                                        DaemonEvent::MarketData(crate::event_bus::MarketData {
+                                            symbol: trade_symbol,
+                                            price,
+                                            timestamp: chrono::Utc::now(),
+                                        });
+
+                                    event_bus.send(daemon_event);
+                                },
+                                Some(Ok(_)) => {
+                                    // Other message types not needed here
+                                },
+                            }
+                        }
+                    }
+                }
+
+                // Backoff before reconnect attempt
+                tokio::select! {
+                    _ = sleep(Duration::from_secs(backoff_secs)) => {},
+                    _ = cancel.cancelled() => break 'reconnect,
+                }
+                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
             }
 
             info!(symbol = %symbol_str, "WebSocket client task ended");
@@ -123,7 +193,8 @@ mod tests {
     #[test]
     fn test_market_data_manager_creation() {
         let event_bus = Arc::new(EventBus::new(100));
-        let _manager = MarketDataManager::new(event_bus);
+        let cancel = CancellationToken::new();
+        let _manager = MarketDataManager::new(event_bus, cancel);
         // Manager is created successfully
     }
 }
