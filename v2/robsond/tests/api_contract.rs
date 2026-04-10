@@ -518,7 +518,7 @@ async fn test_circuit_breaker_status_is_inactive_on_fresh_daemon() {
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
 
-    assert_eq!(body["level"].as_str().unwrap(), "Inactive");
+    assert_eq!(body["level"].as_str().unwrap(), "inactive");
     assert_eq!(body["blocks_new_entries"].as_bool().unwrap(), false);
     assert_eq!(body["blocks_all_trading"].as_bool().unwrap(), false);
     assert!(body["description"].is_string(), "description missing");
@@ -552,7 +552,7 @@ async fn test_circuit_breaker_escalate_to_hard_halt() {
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
 
-    assert_eq!(body["level"].as_str().unwrap(), "HardHalt");
+    assert_eq!(body["level"].as_str().unwrap(), "hard_halt");
     assert_eq!(body["blocks_new_entries"].as_bool().unwrap(), true);
     assert_eq!(body["blocks_all_trading"].as_bool().unwrap(), true);
     assert_eq!(body["reason"].as_str().unwrap(), "operator test escalation");
@@ -580,7 +580,7 @@ async fn test_circuit_breaker_reset_returns_to_inactive() {
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
 
-    assert_eq!(body["level"].as_str().unwrap(), "Inactive");
+    assert_eq!(body["level"].as_str().unwrap(), "inactive");
     assert_eq!(body["blocks_new_entries"].as_bool().unwrap(), false);
     assert_eq!(body["blocks_all_trading"].as_bool().unwrap(), false);
 }

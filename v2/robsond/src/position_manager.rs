@@ -45,7 +45,7 @@ use rust_decimal::Decimal;
 #[cfg(feature = "postgres")]
 use sqlx::PgPool;
 
-use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerLevel};
+use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerLevel, DAILY_LOSS_LIMIT_CHECK_NAME};
 use crate::detector::DetectorTask;
 use crate::error::{DaemonError, DaemonResult};
 use crate::event_bus::{DaemonEvent, EventBus, MarketData};
@@ -1119,13 +1119,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let _entry_flow_guard = self.entry_flow_lock.lock().await;
         let position_id = signal.position_id;
 
-        // HardHalt blocks all signal processing.
-        if self.circuit_breaker.blocks_all_trading().await {
+        // SoftHalt and HardHalt both block new entries — a detector signal that
+        // would transition Armed→Entering counts as a new entry.
+        // (HardHalt also blocks market-data processing, but that path is separate.)
+        if self.circuit_breaker.blocks_new_entries().await {
             let snap = self.circuit_breaker.snapshot().await;
             warn!(
                 %position_id,
                 level = %snap.level,
-                "Signal dropped — circuit breaker at HardHalt"
+                "Signal dropped — circuit breaker blocks new entries"
             );
             return Err(DaemonError::CircuitBreakerTripped {
                 level: format!("{}", snap.level),
@@ -1270,7 +1272,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 // governed denial into a latching circuit-level block for all future
                 // new entries — operator must explicitly reset.
                 if let QueryState::Denied { ref check, ref reason } = query.state {
-                    if check == "daily_loss_limit" {
+                    if check == DAILY_LOSS_LIMIT_CHECK_NAME {
                         let reason_str = reason.clone();
                         if let Some(prev) = self
                             .circuit_breaker
@@ -1357,6 +1359,17 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     pub async fn approve_query(&self, query_id: Uuid) -> DaemonResult<ExecutionQuery> {
         let _entry_flow_guard = self.entry_flow_lock.lock().await;
 
+        // Approval resume is a new entry — respect SoftHalt and HardHalt.
+        // The query was approved by the operator, but the circuit breaker may have
+        // been triggered between when the query was queued and now.
+        if self.circuit_breaker.blocks_new_entries().await {
+            let snap = self.circuit_breaker.snapshot().await;
+            return Err(DaemonError::CircuitBreakerTripped {
+                level: format!("{}", snap.level),
+                reason: snap.reason.unwrap_or_default(),
+            });
+        }
+
         let mut record = {
             let mut pending_approvals = self.pending_approvals.write().await;
             pending_approvals
@@ -1429,6 +1442,31 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         {
             Ok(()) => {},
             Err(CheckRiskError::Denied) => {
+                // Mirror the SoftHalt auto-trigger from handle_signal: if revalidation
+                // fails due to the daily loss limit, escalate the circuit breaker.
+                if let QueryState::Denied { ref check, ref reason } = record.query.state {
+                    if check == DAILY_LOSS_LIMIT_CHECK_NAME {
+                        let reason_str = reason.clone();
+                        if let Some(prev) = self
+                            .circuit_breaker
+                            .try_escalate(CircuitBreakerLevel::SoftHalt, reason_str.clone())
+                            .await
+                        {
+                            warn!(
+                                query_id = %query_id,
+                                previous_level = %prev,
+                                "Daily loss limit exceeded during approval revalidation — circuit breaker escalated to SoftHalt"
+                            );
+                            self.event_bus.send(DaemonEvent::CircuitBreakerTriggered {
+                                level: CircuitBreakerLevel::SoftHalt,
+                                previous_level: prev,
+                                reason: reason_str,
+                                triggered_at: chrono::Utc::now(),
+                            });
+                        }
+                    }
+                }
+
                 self.rearm_detector_after_governed_block(
                     current_position.id,
                     &current_position,

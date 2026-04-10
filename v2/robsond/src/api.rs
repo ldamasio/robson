@@ -163,13 +163,14 @@ pub struct ApproveQueryResponse {
     pub state: String,
 }
 
-/// Circuit breaker status response.
+/// Circuit breaker status response — returned by GET, escalate, and reset endpoints.
 ///
-/// Wraps `CircuitBreakerSnapshot` with an extra `previous_level` field for
-/// escalate/reset responses so callers can log state transitions.
+/// `level` serializes as snake_case via `#[serde(rename_all = "snake_case")]` on
+/// `CircuitBreakerLevel`: `"inactive"`, `"warning"`, `"soft_halt"`, `"hard_halt"`.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct CircuitBreakerStatusResponse {
-    pub level: String,
+    /// Current level (snake_case: "inactive" | "warning" | "soft_halt" | "hard_halt").
+    pub level: CircuitBreakerLevel,
     pub description: &'static str,
     pub reason: Option<String>,
     pub triggered_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -180,7 +181,7 @@ pub struct CircuitBreakerStatusResponse {
 impl From<CircuitBreakerSnapshot> for CircuitBreakerStatusResponse {
     fn from(s: CircuitBreakerSnapshot) -> Self {
         Self {
-            level: s.level.to_string(),
+            level: s.level,
             description: s.description,
             reason: s.reason,
             triggered_at: s.triggered_at,
@@ -782,6 +783,9 @@ where
 }
 
 /// POST /circuit-breaker/escalate — operator-initiated escalation to HardHalt.
+///
+/// Idempotent: if already at HardHalt, returns current status without mutating state
+/// or emitting an event.
 async fn circuit_breaker_escalate_handler<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
     Json(req): Json<EscalateRequest>,
@@ -790,18 +794,23 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
-    let previous = state.circuit_breaker.escalate_to_hard_halt(req.reason.clone()).await;
+    if let Some(previous) = state.circuit_breaker.escalate_to_hard_halt(req.reason.clone()).await {
+        let snap = state.circuit_breaker.snapshot().await;
+        state.event_bus.send(DaemonEvent::CircuitBreakerTriggered {
+            level: CircuitBreakerLevel::HardHalt,
+            previous_level: previous,
+            reason: req.reason,
+            triggered_at: snap.triggered_at.unwrap_or_else(chrono::Utc::now),
+        });
+    }
     let snap = state.circuit_breaker.snapshot().await;
-    state.event_bus.send(DaemonEvent::CircuitBreakerTriggered {
-        level: CircuitBreakerLevel::HardHalt,
-        previous_level: previous,
-        reason: req.reason,
-        triggered_at: snap.triggered_at.unwrap_or_else(chrono::Utc::now),
-    });
     Json(snap.into())
 }
 
 /// POST /circuit-breaker/reset — operator reset to Inactive.
+///
+/// Idempotent: if already Inactive, returns current status without mutating state
+/// or emitting an event.
 async fn circuit_breaker_reset_handler<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
 ) -> Json<CircuitBreakerStatusResponse>
@@ -809,8 +818,9 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
-    let previous = state.circuit_breaker.reset().await;
-    state.event_bus.send(DaemonEvent::CircuitBreakerReset { previous_level: previous });
+    if let Some(previous) = state.circuit_breaker.reset().await {
+        state.event_bus.send(DaemonEvent::CircuitBreakerReset { previous_level: previous });
+    }
     let snap = state.circuit_breaker.snapshot().await;
     Json(snap.into())
 }

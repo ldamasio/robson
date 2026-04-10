@@ -8,36 +8,52 @@
 //! # Escalation Levels
 //!
 //! ```text
+//!                              (operator only)
+//!                                    ↓
 //! Inactive → Warning → SoftHalt → HardHalt
-//!               ↑                      ↑
-//!           (auto, 70%             (manual via
-//!            of daily limit)        /circuit-breaker/escalate)
+//!                ↑          ↑
+//!           (reserved,  (auto: daily
+//!            not active  loss limit hit)
+//!            yet)
 //!
 //! Any level → Inactive  (via /circuit-breaker/reset, operator only)
 //! ```
 //!
-//! | Level    | Trigger              | Blocks new entries | Blocks all trading |
-//! |----------|----------------------|-------------------|-------------------|
-//! | Inactive | —                    | No                | No                |
-//! | Warning  | 70% of daily limit   | No                | No                |
-//! | SoftHalt | 100% of daily limit  | Yes               | No                |
-//! | HardHalt | Operator escalation  | Yes               | Yes               |
+//! | Level    | Trigger                      | Blocks new entries | Blocks all trading |
+//! |----------|------------------------------|-------------------|-------------------|
+//! | Inactive | —                            | No                | No                |
+//! | Warning  | reserved — not yet triggered | No                | No                |
+//! | SoftHalt | Daily loss limit exceeded    | Yes               | No                |
+//! | HardHalt | Operator escalation only     | Yes               | Yes               |
 //!
 //! # Design Decisions
 //!
-//! - **Only upward escalation is automatic.** The system moves Inactive→Warning→SoftHalt
-//!   on PnL thresholds. HardHalt is operator-only. Downward transitions require
-//!   explicit operator reset.
+//! - **Automatic escalation: Inactive→SoftHalt only.** The system auto-escalates to
+//!   SoftHalt when the `DailyLossLimit` risk check fires. The Warning level is reserved
+//!   for a future 70%-threshold trigger and is not auto-triggered in the current tree.
+//!   HardHalt is operator-only via `POST /circuit-breaker/escalate`.
+//! - **Downward transitions require explicit operator reset** (`POST /circuit-breaker/reset`).
 //! - **SoftHalt does not close positions.** Existing positions continue to trail stops
-//!   and can exit normally. Only new arm/entry is blocked.
-//! - **HardHalt blocks signal processing.** The operator must call `/panic` separately
-//!   to close existing positions; circuit breaker reset alone does not close positions.
-//! - **Thread-safe.** Inner `RwLock` allows read from any `&self` context, write
-//!   during threshold checks.
+//!   and can exit normally. New arm, signal, and approval-resume are all blocked.
+//! - **HardHalt blocks all trading activity** including signal processing and market-data
+//!   driven exits. The operator must call `/panic` separately to close positions;
+//!   circuit breaker reset alone does not close positions.
+//! - **Thread-safe.** Inner `RwLock` allows reads from `&self` contexts, writes only
+//!   during escalation and reset.
+//! - **Idempotent operator actions.** `escalate_to_hard_halt` and `reset` are no-ops
+//!   (and do not emit events) when already at the target level.
 
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+
+/// The `RiskCheck::name()` string for the daily loss limit check.
+///
+/// Used in `PositionManager` to identify `DailyLossLimit` denials without a
+/// direct dependency on the `robson-engine` crate from within `circuit_breaker.rs`.
+/// If `RiskCheck::name()` is ever renamed in `robson-engine`, this constant must
+/// be updated to match.
+pub const DAILY_LOSS_LIMIT_CHECK_NAME: &str = "daily_loss_limit";
 
 // =============================================================================
 // Public types
@@ -191,26 +207,34 @@ impl CircuitBreaker {
         }
     }
 
-    /// Force-escalate to `HardHalt` regardless of current level (operator action).
+    /// Force-escalate to `HardHalt` (operator action).
     ///
-    /// Returns the previous level.
-    pub async fn escalate_to_hard_halt(&self, reason: String) -> CircuitBreakerLevel {
+    /// Returns `Some(previous_level)` if the level changed, `None` if already at `HardHalt`
+    /// (idempotent — no state mutation, no event emitted on repeated calls).
+    pub async fn escalate_to_hard_halt(&self, reason: String) -> Option<CircuitBreakerLevel> {
         let mut state = self.state.write().await;
+        if state.level == CircuitBreakerLevel::HardHalt {
+            return None;
+        }
         let previous = state.level;
         state.level = CircuitBreakerLevel::HardHalt;
         state.reason = Some(reason);
         state.triggered_at = Some(Utc::now());
-        previous
+        Some(previous)
     }
 
     /// Reset to `Inactive` (operator action).
     ///
-    /// Returns the level that was active before reset.
-    pub async fn reset(&self) -> CircuitBreakerLevel {
+    /// Returns `Some(previous_level)` if the level changed, `None` if already `Inactive`
+    /// (idempotent — no state mutation, no event emitted on repeated calls).
+    pub async fn reset(&self) -> Option<CircuitBreakerLevel> {
         let mut state = self.state.write().await;
+        if state.level == CircuitBreakerLevel::Inactive {
+            return None;
+        }
         let previous = state.level;
         *state = State::inactive();
-        previous
+        Some(previous)
     }
 }
 
@@ -242,9 +266,31 @@ mod tests {
     #[tokio::test]
     async fn test_escalate_to_hard_halt_blocks_all() {
         let cb = CircuitBreaker::default();
-        cb.escalate_to_hard_halt("operator".into()).await;
+        let prev = cb.escalate_to_hard_halt("operator".into()).await;
+        assert_eq!(prev, Some(CircuitBreakerLevel::Inactive));
         assert!(cb.blocks_new_entries().await);
         assert!(cb.blocks_all_trading().await);
+    }
+
+    #[tokio::test]
+    async fn test_escalate_to_hard_halt_is_idempotent() {
+        let cb = CircuitBreaker::default();
+        cb.escalate_to_hard_halt("first".into()).await;
+        // Second call when already HardHalt — must return None (no mutation)
+        let result = cb.escalate_to_hard_halt("second".into()).await;
+        assert_eq!(result, None);
+        // Reason should still be from the first call
+        let snap = cb.snapshot().await;
+        assert_eq!(snap.reason.as_deref(), Some("first"));
+    }
+
+    #[tokio::test]
+    async fn test_reset_is_idempotent() {
+        let cb = CircuitBreaker::default();
+        // Already Inactive — reset should be a no-op
+        let result = cb.reset().await;
+        assert_eq!(result, None);
+        assert_eq!(cb.level().await, CircuitBreakerLevel::Inactive);
     }
 
     #[tokio::test]
@@ -263,7 +309,7 @@ mod tests {
         let cb = CircuitBreaker::default();
         cb.try_escalate(CircuitBreakerLevel::SoftHalt, "limit".into()).await;
         let prev = cb.reset().await;
-        assert_eq!(prev, CircuitBreakerLevel::SoftHalt);
+        assert_eq!(prev, Some(CircuitBreakerLevel::SoftHalt));
         assert_eq!(cb.level().await, CircuitBreakerLevel::Inactive);
         assert!(!cb.blocks_new_entries().await);
     }
