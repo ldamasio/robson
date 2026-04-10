@@ -91,6 +91,14 @@ pub enum DaemonError {
     #[error("EventLog error: {0}")]
     EventLog(String),
 
+    /// Circuit breaker blocked the operation (MIG-v2.5#5).
+    ///
+    /// Returned when `arm_position` or `handle_signal` is called while the
+    /// circuit breaker is at SoftHalt (new entries blocked) or HardHalt (all
+    /// trading blocked). Operator must reset the circuit breaker to resume.
+    #[error("Circuit breaker at {level}: {reason}")]
+    CircuitBreakerTripped { level: String, reason: String },
+
     /// Shutdown requested
     #[error("Shutdown requested")]
     Shutdown,

@@ -45,6 +45,7 @@ use rust_decimal::Decimal;
 #[cfg(feature = "postgres")]
 use sqlx::PgPool;
 
+use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerLevel};
 use crate::detector::DetectorTask;
 use crate::error::{DaemonError, DaemonResult};
 use crate::event_bus::{DaemonEvent, EventBus, MarketData};
@@ -87,6 +88,8 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     entry_flow_lock: Mutex<()>,
     /// Query engine for lifecycle tracking and audit persistence
     query_engine: Arc<QueryEngine<Arc<dyn QueryRecorder>>>,
+    /// Circuit breaker escalation ladder (MIG-v2.5#5).
+    pub(crate) circuit_breaker: Arc<CircuitBreaker>,
     /// Optional postgres pool for persisting domain events to robson-eventlog.
     #[cfg(feature = "postgres")]
     event_log_pool: Option<PgPool>,
@@ -141,6 +144,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
             entry_flow_lock: Mutex::new(()),
             query_engine,
+            circuit_breaker: Arc::new(CircuitBreaker::default()),
             #[cfg(feature = "postgres")]
             event_log_pool: None,
             #[cfg(feature = "postgres")]
@@ -875,6 +879,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         tech_stop_distance: TechnicalStopDistance,
         account_id: Uuid,
     ) -> DaemonResult<Position> {
+        // Circuit breaker check — blocks new entries at SoftHalt and HardHalt.
+        if self.circuit_breaker.blocks_new_entries().await {
+            let snap = self.circuit_breaker.snapshot().await;
+            return Err(DaemonError::CircuitBreakerTripped {
+                level: format!("{}", snap.level),
+                reason: snap.reason.unwrap_or_default(),
+            });
+        }
+
         // Generate position ID upfront (used in event and returned to caller)
         let position_id = Uuid::now_v7();
 
@@ -996,6 +1009,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         Ok(position)
     }
 
+    /// Returns an `Arc` to the circuit breaker so API handlers can read/write it.
+    pub fn circuit_breaker(&self) -> Arc<CircuitBreaker> {
+        Arc::clone(&self.circuit_breaker)
+    }
+
     /// Disarm (cancel) an armed position.
     ///
     /// Only positions in Armed state can be disarmed.
@@ -1100,6 +1118,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     pub async fn handle_signal(&self, signal: DetectorSignal) -> DaemonResult<()> {
         let _entry_flow_guard = self.entry_flow_lock.lock().await;
         let position_id = signal.position_id;
+
+        // HardHalt blocks all signal processing.
+        if self.circuit_breaker.blocks_all_trading().await {
+            let snap = self.circuit_breaker.snapshot().await;
+            warn!(
+                %position_id,
+                level = %snap.level,
+                "Signal dropped — circuit breaker at HardHalt"
+            );
+            return Err(DaemonError::CircuitBreakerTripped {
+                level: format!("{}", snap.level),
+                reason: snap.reason.unwrap_or_default(),
+            });
+        }
 
         // Create query for lifecycle tracking
         let mut query = ExecutionQuery::new(
@@ -1233,6 +1265,33 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             Err(CheckRiskError::Denied) => {
                 // Governed denial: query is already in Denied state.
                 //
+                // If the denial was caused by the daily loss limit, auto-escalate the
+                // circuit breaker to SoftHalt (MIG-v2.5#5). This turns a per-trade
+                // governed denial into a latching circuit-level block for all future
+                // new entries — operator must explicitly reset.
+                if let QueryState::Denied { ref check, ref reason } = query.state {
+                    if check == "daily_loss_limit" {
+                        let reason_str = reason.clone();
+                        if let Some(prev) = self
+                            .circuit_breaker
+                            .try_escalate(CircuitBreakerLevel::SoftHalt, reason_str.clone())
+                            .await
+                        {
+                            warn!(
+                                %position_id,
+                                previous_level = %prev,
+                                "Daily loss limit exceeded — circuit breaker escalated to SoftHalt"
+                            );
+                            self.event_bus.send(DaemonEvent::CircuitBreakerTriggered {
+                                level: CircuitBreakerLevel::SoftHalt,
+                                previous_level: prev,
+                                reason: reason_str,
+                                triggered_at: chrono::Utc::now(),
+                            });
+                        }
+                    }
+                }
+
                 // Re-arm the detector so the Armed position can receive future signals.
                 // The original detector completed when the signal fired; without re-arming,
                 // the position would be Armed but permanently unresponsive.

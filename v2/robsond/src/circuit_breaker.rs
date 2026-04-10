@@ -1,0 +1,294 @@
+//! Circuit breaker escalation ladder (MIG-v2.5#5).
+//!
+//! A latching state machine that blocks new position entries when risk thresholds
+//! are breached. Unlike the per-trade `RiskGate` check (which evaluates each trade
+//! independently), the circuit breaker **persists across control loop cycles** and
+//! remains active until an operator explicitly resets it.
+//!
+//! # Escalation Levels
+//!
+//! ```text
+//! Inactive → Warning → SoftHalt → HardHalt
+//!               ↑                      ↑
+//!           (auto, 70%             (manual via
+//!            of daily limit)        /circuit-breaker/escalate)
+//!
+//! Any level → Inactive  (via /circuit-breaker/reset, operator only)
+//! ```
+//!
+//! | Level    | Trigger              | Blocks new entries | Blocks all trading |
+//! |----------|----------------------|-------------------|-------------------|
+//! | Inactive | —                    | No                | No                |
+//! | Warning  | 70% of daily limit   | No                | No                |
+//! | SoftHalt | 100% of daily limit  | Yes               | No                |
+//! | HardHalt | Operator escalation  | Yes               | Yes               |
+//!
+//! # Design Decisions
+//!
+//! - **Only upward escalation is automatic.** The system moves Inactive→Warning→SoftHalt
+//!   on PnL thresholds. HardHalt is operator-only. Downward transitions require
+//!   explicit operator reset.
+//! - **SoftHalt does not close positions.** Existing positions continue to trail stops
+//!   and can exit normally. Only new arm/entry is blocked.
+//! - **HardHalt blocks signal processing.** The operator must call `/panic` separately
+//!   to close existing positions; circuit breaker reset alone does not close positions.
+//! - **Thread-safe.** Inner `RwLock` allows read from any `&self` context, write
+//!   during threshold checks.
+
+use chrono::{DateTime, Utc};
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+
+// =============================================================================
+// Public types
+// =============================================================================
+
+/// The four escalation levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CircuitBreakerLevel {
+    /// Normal operation.
+    Inactive,
+    /// Approaching daily loss limit (≥70%). Alerting only — trading continues.
+    Warning,
+    /// Daily loss limit exceeded. New entries blocked; existing positions managed.
+    SoftHalt,
+    /// Operator-escalated. All trading blocked. Requires explicit reset.
+    HardHalt,
+}
+
+impl CircuitBreakerLevel {
+    /// Returns true if the level prevents new position entries.
+    pub fn blocks_new_entries(self) -> bool {
+        matches!(self, CircuitBreakerLevel::SoftHalt | CircuitBreakerLevel::HardHalt)
+    }
+
+    /// Returns true if the level prevents ALL trading activity (including signal processing).
+    pub fn blocks_all_trading(self) -> bool {
+        matches!(self, CircuitBreakerLevel::HardHalt)
+    }
+
+    /// Human-readable description.
+    pub fn description(self) -> &'static str {
+        match self {
+            CircuitBreakerLevel::Inactive => "Normal operation",
+            CircuitBreakerLevel::Warning => "Approaching daily loss limit — new entries still allowed",
+            CircuitBreakerLevel::SoftHalt => "Daily loss limit exceeded — new entries blocked",
+            CircuitBreakerLevel::HardHalt => "Hard halt — all trading blocked, operator reset required",
+        }
+    }
+}
+
+impl std::fmt::Display for CircuitBreakerLevel {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CircuitBreakerLevel::Inactive => write!(f, "Inactive"),
+            CircuitBreakerLevel::Warning => write!(f, "Warning"),
+            CircuitBreakerLevel::SoftHalt => write!(f, "SoftHalt"),
+            CircuitBreakerLevel::HardHalt => write!(f, "HardHalt"),
+        }
+    }
+}
+
+/// Serializable snapshot returned by the API.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CircuitBreakerSnapshot {
+    pub level: CircuitBreakerLevel,
+    pub description: &'static str,
+    pub reason: Option<String>,
+    pub triggered_at: Option<DateTime<Utc>>,
+    /// Whether new position arm/entry is currently blocked.
+    pub blocks_new_entries: bool,
+    /// Whether all trading activity is currently blocked.
+    pub blocks_all_trading: bool,
+}
+
+// =============================================================================
+// Inner state
+// =============================================================================
+
+#[derive(Debug, Clone)]
+struct State {
+    level: CircuitBreakerLevel,
+    reason: Option<String>,
+    triggered_at: Option<DateTime<Utc>>,
+}
+
+impl State {
+    fn inactive() -> Self {
+        Self { level: CircuitBreakerLevel::Inactive, reason: None, triggered_at: None }
+    }
+
+    fn snapshot(&self) -> CircuitBreakerSnapshot {
+        CircuitBreakerSnapshot {
+            level: self.level,
+            description: self.level.description(),
+            reason: self.reason.clone(),
+            triggered_at: self.triggered_at,
+            blocks_new_entries: self.level.blocks_new_entries(),
+            blocks_all_trading: self.level.blocks_all_trading(),
+        }
+    }
+}
+
+// =============================================================================
+// CircuitBreaker
+// =============================================================================
+
+/// Runtime circuit breaker.
+///
+/// Wraps an inner `RwLock<State>` so it can be read/written from `&self` contexts.
+/// Intended to be stored as `Arc<CircuitBreaker>` inside `PositionManager`.
+#[derive(Debug)]
+pub struct CircuitBreaker {
+    state: RwLock<State>,
+}
+
+impl Default for CircuitBreaker {
+    fn default() -> Self {
+        Self { state: RwLock::new(State::inactive()) }
+    }
+}
+
+impl CircuitBreaker {
+    /// Current snapshot (non-blocking read).
+    pub async fn snapshot(&self) -> CircuitBreakerSnapshot {
+        self.state.read().await.snapshot()
+    }
+
+    /// Current level (non-blocking read).
+    pub async fn level(&self) -> CircuitBreakerLevel {
+        self.state.read().await.level
+    }
+
+    /// Whether new entries are currently blocked.
+    pub async fn blocks_new_entries(&self) -> bool {
+        self.state.read().await.level.blocks_new_entries()
+    }
+
+    /// Whether all trading is currently blocked.
+    pub async fn blocks_all_trading(&self) -> bool {
+        self.state.read().await.level.blocks_all_trading()
+    }
+
+    /// Try to escalate to `target_level` if it is higher than the current level.
+    ///
+    /// Returns `Some(previous_level)` if escalation happened, `None` if already at or above.
+    pub async fn try_escalate(
+        &self,
+        target: CircuitBreakerLevel,
+        reason: String,
+    ) -> Option<CircuitBreakerLevel> {
+        let mut state = self.state.write().await;
+        if target > state.level {
+            let previous = state.level;
+            state.level = target;
+            state.reason = Some(reason);
+            state.triggered_at = Some(Utc::now());
+            Some(previous)
+        } else {
+            None
+        }
+    }
+
+    /// Force-escalate to `HardHalt` regardless of current level (operator action).
+    ///
+    /// Returns the previous level.
+    pub async fn escalate_to_hard_halt(&self, reason: String) -> CircuitBreakerLevel {
+        let mut state = self.state.write().await;
+        let previous = state.level;
+        state.level = CircuitBreakerLevel::HardHalt;
+        state.reason = Some(reason);
+        state.triggered_at = Some(Utc::now());
+        previous
+    }
+
+    /// Reset to `Inactive` (operator action).
+    ///
+    /// Returns the level that was active before reset.
+    pub async fn reset(&self) -> CircuitBreakerLevel {
+        let mut state = self.state.write().await;
+        let previous = state.level;
+        *state = State::inactive();
+        previous
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn test_initial_state_is_inactive() {
+        let cb = CircuitBreaker::default();
+        assert_eq!(cb.level().await, CircuitBreakerLevel::Inactive);
+        assert!(!cb.blocks_new_entries().await);
+        assert!(!cb.blocks_all_trading().await);
+    }
+
+    #[tokio::test]
+    async fn test_escalate_to_soft_halt_blocks_entries() {
+        let cb = CircuitBreaker::default();
+        let prev = cb.try_escalate(CircuitBreakerLevel::SoftHalt, "daily limit".into()).await;
+        assert_eq!(prev, Some(CircuitBreakerLevel::Inactive));
+        assert!(cb.blocks_new_entries().await);
+        assert!(!cb.blocks_all_trading().await);
+    }
+
+    #[tokio::test]
+    async fn test_escalate_to_hard_halt_blocks_all() {
+        let cb = CircuitBreaker::default();
+        cb.escalate_to_hard_halt("operator".into()).await;
+        assert!(cb.blocks_new_entries().await);
+        assert!(cb.blocks_all_trading().await);
+    }
+
+    #[tokio::test]
+    async fn test_no_downgrade_via_try_escalate() {
+        let cb = CircuitBreaker::default();
+        cb.try_escalate(CircuitBreakerLevel::HardHalt, "hard".into()).await;
+        // Warning is below HardHalt — should not downgrade
+        let result =
+            cb.try_escalate(CircuitBreakerLevel::Warning, "warning".into()).await;
+        assert_eq!(result, None);
+        assert_eq!(cb.level().await, CircuitBreakerLevel::HardHalt);
+    }
+
+    #[tokio::test]
+    async fn test_reset_returns_to_inactive() {
+        let cb = CircuitBreaker::default();
+        cb.try_escalate(CircuitBreakerLevel::SoftHalt, "limit".into()).await;
+        let prev = cb.reset().await;
+        assert_eq!(prev, CircuitBreakerLevel::SoftHalt);
+        assert_eq!(cb.level().await, CircuitBreakerLevel::Inactive);
+        assert!(!cb.blocks_new_entries().await);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_contains_correct_fields() {
+        let cb = CircuitBreaker::default();
+        cb.try_escalate(
+            CircuitBreakerLevel::Warning,
+            "approaching limit".into(),
+        )
+        .await;
+
+        let snap = cb.snapshot().await;
+        assert_eq!(snap.level, CircuitBreakerLevel::Warning);
+        assert_eq!(snap.reason.as_deref(), Some("approaching limit"));
+        assert!(snap.triggered_at.is_some());
+        assert!(!snap.blocks_new_entries);
+        assert!(!snap.blocks_all_trading);
+    }
+
+    #[tokio::test]
+    async fn test_level_ordering() {
+        assert!(CircuitBreakerLevel::Inactive < CircuitBreakerLevel::Warning);
+        assert!(CircuitBreakerLevel::Warning < CircuitBreakerLevel::SoftHalt);
+        assert!(CircuitBreakerLevel::SoftHalt < CircuitBreakerLevel::HardHalt);
+    }
+}

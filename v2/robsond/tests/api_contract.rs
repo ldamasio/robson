@@ -504,3 +504,153 @@ async fn test_panic_response_has_required_fields() {
     assert!(body["count"].is_number(), "count missing");
     assert!(body["closed_positions"].is_array(), "closed_positions missing");
 }
+
+// =============================================================================
+// Circuit breaker (MIG-v2.5#5)
+// =============================================================================
+
+#[tokio::test]
+async fn test_circuit_breaker_status_is_inactive_on_fresh_daemon() {
+    let (base, _) = start_test_server().await;
+
+    let resp = client().get(format!("{}/circuit-breaker", base)).send().await.unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+
+    assert_eq!(body["level"].as_str().unwrap(), "Inactive");
+    assert_eq!(body["blocks_new_entries"].as_bool().unwrap(), false);
+    assert_eq!(body["blocks_all_trading"].as_bool().unwrap(), false);
+    assert!(body["description"].is_string(), "description missing");
+}
+
+#[tokio::test]
+async fn test_circuit_breaker_status_has_required_fields() {
+    let (base, _) = start_test_server().await;
+
+    let resp = client().get(format!("{}/circuit-breaker", base)).send().await.unwrap();
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+
+    assert!(body["level"].is_string(), "level missing");
+    assert!(body["description"].is_string(), "description missing");
+    assert!(body["blocks_new_entries"].is_boolean(), "blocks_new_entries missing");
+    assert!(body["blocks_all_trading"].is_boolean(), "blocks_all_trading missing");
+}
+
+#[tokio::test]
+async fn test_circuit_breaker_escalate_to_hard_halt() {
+    let (base, _) = start_test_server().await;
+
+    let resp = client()
+        .post(format!("{}/circuit-breaker/escalate", base))
+        .json(&json!({ "reason": "operator test escalation" }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+
+    assert_eq!(body["level"].as_str().unwrap(), "HardHalt");
+    assert_eq!(body["blocks_new_entries"].as_bool().unwrap(), true);
+    assert_eq!(body["blocks_all_trading"].as_bool().unwrap(), true);
+    assert_eq!(body["reason"].as_str().unwrap(), "operator test escalation");
+}
+
+#[tokio::test]
+async fn test_circuit_breaker_reset_returns_to_inactive() {
+    let (base, _) = start_test_server().await;
+
+    // Escalate first
+    client()
+        .post(format!("{}/circuit-breaker/escalate", base))
+        .json(&json!({ "reason": "test" }))
+        .send()
+        .await
+        .unwrap();
+
+    // Reset
+    let resp = client()
+        .post(format!("{}/circuit-breaker/reset", base))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+
+    assert_eq!(body["level"].as_str().unwrap(), "Inactive");
+    assert_eq!(body["blocks_new_entries"].as_bool().unwrap(), false);
+    assert_eq!(body["blocks_all_trading"].as_bool().unwrap(), false);
+}
+
+#[tokio::test]
+async fn test_arm_blocked_when_circuit_breaker_at_hard_halt() {
+    let (base, _) = start_test_server().await;
+
+    // Escalate to HardHalt
+    client()
+        .post(format!("{}/circuit-breaker/escalate", base))
+        .json(&json!({ "reason": "daily limit hit" }))
+        .send()
+        .await
+        .unwrap();
+
+    // Arming should now be blocked
+    let resp = client()
+        .post(format!("{}/positions", base))
+        .json(&json!({
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "capital": "10000",
+            "risk_percent": "1"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    // 503 Service Unavailable — circuit breaker tripped
+    assert_eq!(
+        resp.status(),
+        503,
+        "arm should be blocked at HardHalt, got: {}",
+        resp.status()
+    );
+    let body: Value = resp.json().await.unwrap();
+    assert!(body["error"].is_string(), "error field missing");
+}
+
+#[tokio::test]
+async fn test_arm_unblocked_after_circuit_breaker_reset() {
+    let (base, _) = start_test_server().await;
+
+    // Escalate and then reset
+    client()
+        .post(format!("{}/circuit-breaker/escalate", base))
+        .json(&json!({ "reason": "test" }))
+        .send()
+        .await
+        .unwrap();
+
+    client()
+        .post(format!("{}/circuit-breaker/reset", base))
+        .send()
+        .await
+        .unwrap();
+
+    // Now arm should work again
+    let resp = client()
+        .post(format!("{}/positions", base))
+        .json(&json!({
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "capital": "10000",
+            "risk_percent": "1"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 201, "arm should succeed after reset, got: {}", resp.status());
+}

@@ -33,8 +33,9 @@ use robson_domain::{
 use robson_exec::ExchangePort;
 use robson_store::Store;
 
+use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerLevel, CircuitBreakerSnapshot};
 use crate::error::DaemonError;
-use crate::event_bus::EventBus;
+use crate::event_bus::{DaemonEvent, EventBus};
 use crate::position_manager::PositionManager;
 use crate::position_monitor::PositionMonitor;
 use crate::sse::{map_daemon_event, resync_required_event};
@@ -47,6 +48,7 @@ use crate::sse::{map_daemon_event, resync_required_event};
 pub struct ApiState<E: ExchangePort + 'static, S: Store + 'static> {
     pub position_manager: Arc<RwLock<PositionManager<E, S>>>,
     pub event_bus: Arc<EventBus>,
+    pub circuit_breaker: Arc<CircuitBreaker>,
     pub position_monitor: Option<Arc<PositionMonitor>>,
     /// PostgreSQL pool for liveness check. Present only when DATABASE_URL is configured.
     #[cfg(feature = "postgres")]
@@ -161,6 +163,40 @@ pub struct ApproveQueryResponse {
     pub state: String,
 }
 
+/// Circuit breaker status response.
+///
+/// Wraps `CircuitBreakerSnapshot` with an extra `previous_level` field for
+/// escalate/reset responses so callers can log state transitions.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct CircuitBreakerStatusResponse {
+    pub level: String,
+    pub description: &'static str,
+    pub reason: Option<String>,
+    pub triggered_at: Option<chrono::DateTime<chrono::Utc>>,
+    pub blocks_new_entries: bool,
+    pub blocks_all_trading: bool,
+}
+
+impl From<CircuitBreakerSnapshot> for CircuitBreakerStatusResponse {
+    fn from(s: CircuitBreakerSnapshot) -> Self {
+        Self {
+            level: s.level.to_string(),
+            description: s.description,
+            reason: s.reason,
+            triggered_at: s.triggered_at,
+            blocks_new_entries: s.blocks_new_entries,
+            blocks_all_trading: s.blocks_all_trading,
+        }
+    }
+}
+
+/// Request body for `POST /circuit-breaker/escalate`.
+#[derive(Debug, Deserialize)]
+pub struct EscalateRequest {
+    /// Human-readable reason for the escalation.
+    pub reason: String,
+}
+
 /// Error response.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorResponse {
@@ -263,6 +299,10 @@ where
         // Safety net endpoints
         .route("/safety/status", get(safety_status_handler))
         .route("/safety/test", get(safety_test_handler))
+        // Circuit breaker endpoints (MIG-v2.5#5)
+        .route("/circuit-breaker", get(circuit_breaker_status_handler))
+        .route("/circuit-breaker/escalate", post(circuit_breaker_escalate_handler))
+        .route("/circuit-breaker/reset", post(circuit_breaker_reset_handler))
         .with_state(state)
 }
 
@@ -726,6 +766,56 @@ where
 // =============================================================================
 // Helpers
 // =============================================================================
+// Circuit Breaker handlers (MIG-v2.5#5)
+// =============================================================================
+
+/// GET /circuit-breaker — current circuit breaker status.
+async fn circuit_breaker_status_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+) -> Json<CircuitBreakerStatusResponse>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let snap = state.circuit_breaker.snapshot().await;
+    Json(snap.into())
+}
+
+/// POST /circuit-breaker/escalate — operator-initiated escalation to HardHalt.
+async fn circuit_breaker_escalate_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    Json(req): Json<EscalateRequest>,
+) -> Json<CircuitBreakerStatusResponse>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let previous = state.circuit_breaker.escalate_to_hard_halt(req.reason.clone()).await;
+    let snap = state.circuit_breaker.snapshot().await;
+    state.event_bus.send(DaemonEvent::CircuitBreakerTriggered {
+        level: CircuitBreakerLevel::HardHalt,
+        previous_level: previous,
+        reason: req.reason,
+        triggered_at: snap.triggered_at.unwrap_or_else(chrono::Utc::now),
+    });
+    Json(snap.into())
+}
+
+/// POST /circuit-breaker/reset — operator reset to Inactive.
+async fn circuit_breaker_reset_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+) -> Json<CircuitBreakerStatusResponse>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let previous = state.circuit_breaker.reset().await;
+    state.event_bus.send(DaemonEvent::CircuitBreakerReset { previous_level: previous });
+    let snap = state.circuit_breaker.snapshot().await;
+    Json(snap.into())
+}
+
+// =============================================================================
 
 fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
     let status = match &error {
@@ -734,6 +824,7 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
         DaemonError::InvalidPositionState { .. } => StatusCode::CONFLICT,
         DaemonError::ApprovalExpired(_) => StatusCode::GONE,
         DaemonError::ApprovalDenied { .. } => StatusCode::CONFLICT,
+        DaemonError::CircuitBreakerTripped { .. } => StatusCode::SERVICE_UNAVAILABLE,
         DaemonError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::BAD_REQUEST,
     };
@@ -827,10 +918,12 @@ mod tests {
         );
 
         let position_manager = Arc::new(RwLock::new(manager));
+        let circuit_breaker = position_manager.read().await.circuit_breaker();
 
         let state = Arc::new(ApiState {
             position_manager: Arc::clone(&position_manager),
             event_bus: Arc::clone(&event_bus),
+            circuit_breaker,
             position_monitor: None,
             #[cfg(feature = "postgres")]
             pg_pool: None,
