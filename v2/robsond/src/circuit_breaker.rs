@@ -123,7 +123,7 @@ pub struct CircuitBreakerSnapshot {
     pub triggered_at: Option<DateTime<Utc>>,
     /// Whether new position arm/entry is currently blocked.
     pub blocks_new_entries: bool,
-    /// Whether all trading activity is currently blocked.
+    /// Whether detector signal processing is currently blocked (SoftHalt or HardHalt).
     pub blocks_signals: bool,
 }
 
@@ -190,7 +190,7 @@ impl CircuitBreaker {
         self.state.read().await.level.blocks_new_entries()
     }
 
-    /// Whether all trading is currently blocked.
+    /// Whether detector signal processing is currently blocked.
     pub async fn blocks_signals(&self) -> bool {
         self.state.read().await.level.blocks_signals()
     }
