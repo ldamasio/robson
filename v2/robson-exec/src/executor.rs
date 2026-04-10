@@ -31,7 +31,10 @@ use crate::ports::{ExchangePort, OrderResult};
 pub enum ActionResult {
     /// Order placed successfully, optionally with a domain event emitted.
     /// For exit orders, the event is ExitOrderPlaced which transitions position to Exiting.
-    OrderPlaced { order: OrderResult, event: Option<Event> },
+    OrderPlaced {
+        order: OrderResult,
+        event: Option<Event>,
+    },
     /// Action was already processed (idempotent skip)
     AlreadyProcessed(Uuid),
     /// Event emitted (no exchange interaction)

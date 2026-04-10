@@ -96,9 +96,13 @@ impl CircuitBreakerLevel {
     pub fn description(self) -> &'static str {
         match self {
             CircuitBreakerLevel::Inactive => "Normal operation",
-            CircuitBreakerLevel::Warning => "Approaching daily loss limit — new entries still allowed",
+            CircuitBreakerLevel::Warning => {
+                "Approaching daily loss limit — new entries still allowed"
+            },
             CircuitBreakerLevel::SoftHalt => "Daily loss limit exceeded — new entries blocked",
-            CircuitBreakerLevel::HardHalt => "Hard halt — new entries and signals blocked; trailing stops continue; operator reset required",
+            CircuitBreakerLevel::HardHalt => {
+                "Hard halt — new entries and signals blocked; trailing stops continue; operator reset required"
+            },
         }
     }
 }
@@ -140,7 +144,11 @@ struct State {
 
 impl State {
     fn inactive() -> Self {
-        Self { level: CircuitBreakerLevel::Inactive, reason: None, triggered_at: None }
+        Self {
+            level: CircuitBreakerLevel::Inactive,
+            reason: None,
+            triggered_at: None,
+        }
     }
 
     fn snapshot(&self) -> CircuitBreakerSnapshot {
@@ -306,8 +314,7 @@ mod tests {
         let cb = CircuitBreaker::default();
         cb.try_escalate(CircuitBreakerLevel::HardHalt, "hard".into()).await;
         // Warning is below HardHalt — should not downgrade
-        let result =
-            cb.try_escalate(CircuitBreakerLevel::Warning, "warning".into()).await;
+        let result = cb.try_escalate(CircuitBreakerLevel::Warning, "warning".into()).await;
         assert_eq!(result, None);
         assert_eq!(cb.level().await, CircuitBreakerLevel::HardHalt);
     }
@@ -325,11 +332,7 @@ mod tests {
     #[tokio::test]
     async fn test_snapshot_contains_correct_fields() {
         let cb = CircuitBreaker::default();
-        cb.try_escalate(
-            CircuitBreakerLevel::Warning,
-            "approaching limit".into(),
-        )
-        .await;
+        cb.try_escalate(CircuitBreakerLevel::Warning, "approaching limit".into()).await;
 
         let snap = cb.snapshot().await;
         assert_eq!(snap.level, CircuitBreakerLevel::Warning);

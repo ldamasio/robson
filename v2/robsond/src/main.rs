@@ -80,6 +80,7 @@ async fn main() -> anyhow::Result<()> {
             // Kubernetes restarts are a last resort, not the normal retry mechanism.
             // Cap: ~2 minutes total (1+2+4+8+16+32+60 = 123 s across 7 attempts).
             let pool = {
+                const MAX_ATTEMPTS: u32 = 7;
                 const MAX_BACKOFF_SECS: u64 = 60;
                 let mut backoff_secs: u64 = 1;
                 let mut attempt: u32 = 0;
@@ -91,7 +92,15 @@ async fn main() -> anyhow::Result<()> {
                                 info!(attempt, "PostgreSQL connection established after retry");
                             }
                             break p;
-                        }
+                        },
+                        Err(e) if attempt >= MAX_ATTEMPTS => {
+                            tracing::error!(
+                                attempt,
+                                error = %e,
+                                "PostgreSQL connection failed after retries"
+                            );
+                            return Err(e.into());
+                        },
                         Err(e) => {
                             tracing::warn!(
                                 attempt,
@@ -102,7 +111,7 @@ async fn main() -> anyhow::Result<()> {
                             tokio::time::sleep(tokio::time::Duration::from_secs(backoff_secs))
                                 .await;
                             backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
-                        }
+                        },
                     }
                 }
             };

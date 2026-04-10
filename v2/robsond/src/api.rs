@@ -819,7 +819,9 @@ where
     S: Store + 'static,
 {
     if let Some(previous) = state.circuit_breaker.reset().await {
-        state.event_bus.send(DaemonEvent::CircuitBreakerReset { previous_level: previous });
+        state
+            .event_bus
+            .send(DaemonEvent::CircuitBreakerReset { previous_level: previous });
     }
     let snap = state.circuit_breaker.snapshot().await;
     Json(snap.into())

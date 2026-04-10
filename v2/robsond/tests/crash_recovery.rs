@@ -327,10 +327,7 @@ async fn test_recovery_from_domain_position_armed(pool: sqlx::PgPool) {
     // Recovery must find the Armed position
     let reader = Arc::new(robson_store::PgProjectionReader::new(Arc::new(pool)))
         as Arc<dyn robson_store::ProjectionRecovery>;
-    let restored = reader
-        .find_active_from_projection(tenant_id)
-        .await
-        .expect("Recovery failed");
+    let restored = reader.find_active_from_projection(tenant_id).await.expect("Recovery failed");
 
     assert_eq!(restored.len(), 1, "Should restore 1 armed position");
     let pos = &restored[0];
@@ -338,11 +335,7 @@ async fn test_recovery_from_domain_position_armed(pool: sqlx::PgPool) {
     assert_eq!(pos.symbol.as_pair(), "BTCUSDT");
 
     use robson_domain::PositionState;
-    assert!(
-        matches!(pos.state, PositionState::Armed),
-        "Expected Armed, got {:?}",
-        pos.state
-    );
+    assert!(matches!(pos.state, PositionState::Armed), "Expected Armed, got {:?}", pos.state);
 }
 
 /// Test: full domain lifecycle — armed → entry_filled → trailing_stop_updated →
@@ -456,10 +449,7 @@ async fn test_recovery_domain_closed_position_excluded(pool: sqlx::PgPool) {
     // Recovery must NOT return the closed position
     let reader = Arc::new(robson_store::PgProjectionReader::new(Arc::new(pool)))
         as Arc<dyn robson_store::ProjectionRecovery>;
-    let restored = reader
-        .find_active_from_projection(tenant_id)
-        .await
-        .expect("Recovery failed");
+    let restored = reader.find_active_from_projection(tenant_id).await.expect("Recovery failed");
 
     assert_eq!(
         restored.len(),
@@ -507,10 +497,7 @@ async fn test_projector_rejects_unknown_event_type(pool: sqlx::PgPool) {
 
     // Apply to projections - should return MissingHandler error
     let result = apply_event_to_projections(&pool, &envelope).await;
-    assert!(
-        result.is_err(),
-        "Projector should return error for unknown event type"
-    );
+    assert!(result.is_err(), "Projector should return error for unknown event type");
 
     let err = result.unwrap_err();
     assert!(
@@ -573,23 +560,23 @@ async fn test_projection_and_recovery_from_appended_position_armed(pool: sqlx::P
         .expect("Failed to apply event to projections");
 
     // 3. Verify projection is updated
-    let state: Option<String> = sqlx::query_scalar(
-        "SELECT state FROM positions_current WHERE position_id = $1",
-    )
-    .bind(position_id)
-    .fetch_optional(&pool)
-    .await
-    .expect("Failed to query projection");
+    let state: Option<String> =
+        sqlx::query_scalar("SELECT state FROM positions_current WHERE position_id = $1")
+            .bind(position_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("Failed to query projection");
 
-    assert_eq!(state.as_deref(), Some("armed"), "Projection should show armed state after apply");
+    assert_eq!(
+        state.as_deref(),
+        Some("armed"),
+        "Projection should show armed state after apply"
+    );
 
     // 4. Verify recovery from projection works
     let reader = Arc::new(robson_store::PgProjectionReader::new(Arc::new(pool.clone())))
         as Arc<dyn robson_store::ProjectionRecovery>;
-    let restored = reader
-        .find_active_from_projection(tenant_id)
-        .await
-        .expect("Recovery failed");
+    let restored = reader.find_active_from_projection(tenant_id).await.expect("Recovery failed");
 
     assert_eq!(restored.len(), 1, "Should restore 1 position from projection");
     assert_eq!(restored[0].id, position_id, "Recovered position ID should match");
@@ -633,7 +620,9 @@ async fn test_replay_exit_event_ordering_preserved_in_eventlog(pool: sqlx::PgPoo
             "timestamp": chrono::Utc::now().to_rfc3339()
         }),
     );
-    let _ = append_event(&pool, &stream_key, None, event1).await.expect("Failed to append position_armed");
+    let _ = append_event(&pool, &stream_key, None, event1)
+        .await
+        .expect("Failed to append position_armed");
 
     // 2. Second: exit_order_placed (must come before position_closed)
     let event2 = Event::new(
@@ -649,7 +638,9 @@ async fn test_replay_exit_event_ordering_preserved_in_eventlog(pool: sqlx::PgPoo
             "timestamp": chrono::Utc::now().to_rfc3339()
         }),
     );
-    let _ = append_event(&pool, &stream_key, None, event2).await.expect("Failed to append exit_order_placed");
+    let _ = append_event(&pool, &stream_key, None, event2)
+        .await
+        .expect("Failed to append exit_order_placed");
 
     // 3. Third: position_closed (must come after exit_order_placed)
     let event3 = Event::new(
@@ -666,7 +657,9 @@ async fn test_replay_exit_event_ordering_preserved_in_eventlog(pool: sqlx::PgPoo
             "timestamp": chrono::Utc::now().to_rfc3339()
         }),
     );
-    let _ = append_event(&pool, &stream_key, None, event3).await.expect("Failed to append position_closed");
+    let _ = append_event(&pool, &stream_key, None, event3)
+        .await
+        .expect("Failed to append position_closed");
 
     // 4. Fetch all events in order
     let events: Vec<(String, i64)> = sqlx::query_as(
@@ -702,23 +695,23 @@ async fn test_replay_exit_event_ordering_preserved_in_eventlog(pool: sqlx::PgPoo
     }
 
     // 6. Verify final state is closed
-    let state: Option<String> = sqlx::query_scalar(
-        "SELECT state FROM positions_current WHERE position_id = $1",
-    )
-    .bind(position_id)
-    .fetch_optional(&pool)
-    .await
-    .expect("Failed to query projection");
+    let state: Option<String> =
+        sqlx::query_scalar("SELECT state FROM positions_current WHERE position_id = $1")
+            .bind(position_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("Failed to query projection");
 
-    assert_eq!(state.as_deref(), Some("closed"), "Final state should be closed after all events applied");
+    assert_eq!(
+        state.as_deref(),
+        Some("closed"),
+        "Final state should be closed after all events applied"
+    );
 
     // 7. Verify closed position is NOT restored during recovery
     let reader = Arc::new(robson_store::PgProjectionReader::new(Arc::new(pool.clone())))
         as Arc<dyn robson_store::ProjectionRecovery>;
-    let restored = reader
-        .find_active_from_projection(tenant_id)
-        .await
-        .expect("Recovery failed");
+    let restored = reader.find_active_from_projection(tenant_id).await.expect("Recovery failed");
 
     assert_eq!(restored.len(), 0, "Closed position should NOT be restored from projection");
 }
@@ -767,14 +760,8 @@ async fn test_runtime_arm_position_persists_to_projection(pool: sqlx::PgPool) {
     let engine = Engine::new(risk_config.clone());
 
     let manager = Arc::new(
-        PositionManager::new(
-            engine,
-            executor,
-            store,
-            event_bus,
-            Arc::new(TracingQueryRecorder),
-        )
-        .with_event_log(pool.clone(), tenant_id),
+        PositionManager::new(engine, executor, store, event_bus, Arc::new(TracingQueryRecorder))
+            .with_event_log(pool.clone(), tenant_id),
     );
 
     // arm_position() exercises the full runtime write path
@@ -789,13 +776,12 @@ async fn test_runtime_arm_position_persists_to_projection(pool: sqlx::PgPool) {
         .expect("arm_position failed — eventlog or projection apply error");
 
     // Verify the event was persisted to event_log (append succeeded)
-    let event_count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM event_log WHERE stream_key = $1",
-    )
-    .bind(format!("position:{}", position.id))
-    .fetch_one(&pool)
-    .await
-    .expect("Failed to query event_log");
+    let event_count: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM event_log WHERE stream_key = $1")
+            .bind(format!("position:{}", position.id))
+            .fetch_one(&pool)
+            .await
+            .expect("Failed to query event_log");
 
     assert!(
         event_count >= 1,
@@ -816,13 +802,12 @@ async fn test_runtime_arm_position_persists_to_projection(pool: sqlx::PgPool) {
     assert_eq!(event_type, "position_armed", "First event must be position_armed");
 
     // Verify positions_current was updated synchronously (projection apply succeeded)
-    let state: Option<String> = sqlx::query_scalar(
-        "SELECT state FROM positions_current WHERE position_id = $1",
-    )
-    .bind(position.id)
-    .fetch_optional(&pool)
-    .await
-    .expect("Failed to query positions_current");
+    let state: Option<String> =
+        sqlx::query_scalar("SELECT state FROM positions_current WHERE position_id = $1")
+            .bind(position.id)
+            .fetch_optional(&pool)
+            .await
+            .expect("Failed to query positions_current");
 
     assert_eq!(
         state.as_deref(),
@@ -833,10 +818,7 @@ async fn test_runtime_arm_position_persists_to_projection(pool: sqlx::PgPool) {
     // Verify crash recovery finds the armed position
     let reader = Arc::new(robson_store::PgProjectionReader::new(Arc::new(pool.clone())))
         as Arc<dyn robson_store::ProjectionRecovery>;
-    let restored = reader
-        .find_active_from_projection(tenant_id)
-        .await
-        .expect("Recovery failed");
+    let restored = reader.find_active_from_projection(tenant_id).await.expect("Recovery failed");
 
     assert_eq!(restored.len(), 1, "Crash recovery should find exactly 1 armed position");
     assert_eq!(restored[0].id, position.id, "Recovered position ID must match");
@@ -935,13 +917,12 @@ async fn test_entry_signal_received_handled_without_error(pool: sqlx::PgPool) {
     );
 
     // Position should still be in armed state (signal doesn't change state)
-    let state: Option<String> = sqlx::query_scalar(
-        "SELECT state FROM positions_current WHERE position_id = $1",
-    )
-    .bind(position_id)
-    .fetch_optional(&pool)
-    .await
-    .expect("Failed to query projection");
+    let state: Option<String> =
+        sqlx::query_scalar("SELECT state FROM positions_current WHERE position_id = $1")
+            .bind(position_id)
+            .fetch_optional(&pool)
+            .await
+            .expect("Failed to query projection");
 
     assert_eq!(
         state.as_deref(),

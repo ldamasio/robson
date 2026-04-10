@@ -50,8 +50,12 @@ fn projection_route(event_type: &str) -> Option<ProjectionRoute> {
         "POSITION_CLOSED" => Some(ProjectionRoute::PositionClosedLegacy),
         "entry_order_placed" | "ENTRY_ORDER_PLACED" => Some(ProjectionRoute::EntryOrderPlaced),
         "entry_filled" | "ENTRY_FILLED" => Some(ProjectionRoute::EntryFilled),
-        "entry_signal_received" | "ENTRY_SIGNAL_RECEIVED" => Some(ProjectionRoute::EntrySignalReceived),
-        "trailing_stop_updated" | "TRAILING_STOP_UPDATED" => Some(ProjectionRoute::TrailingStopUpdated),
+        "entry_signal_received" | "ENTRY_SIGNAL_RECEIVED" => {
+            Some(ProjectionRoute::EntrySignalReceived)
+        },
+        "trailing_stop_updated" | "TRAILING_STOP_UPDATED" => {
+            Some(ProjectionRoute::TrailingStopUpdated)
+        },
         "exit_triggered" | "EXIT_TRIGGERED" => Some(ProjectionRoute::ExitTriggered),
         "exit_order_placed" | "EXIT_ORDER_PLACED" => Some(ProjectionRoute::ExitOrderPlaced),
 

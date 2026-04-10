@@ -14,7 +14,11 @@ pub enum ProjectionError {
     InvariantViolated { event_type: String, reason: String },
 
     #[error("Missing handler for event type {event_type} (seq={seq}, stream={stream_key})")]
-    MissingHandler { event_type: String, seq: i64, stream_key: String },
+    MissingHandler {
+        event_type: String,
+        seq: i64,
+        stream_key: String,
+    },
 
     #[error("Database error: {0}")]
     Database(#[from] sqlx::Error),

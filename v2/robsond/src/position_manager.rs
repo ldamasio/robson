@@ -281,7 +281,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// This prevents silent projection drift during execution when PostgreSQL is in
     /// use. Append and projection apply still happen in separate steps, so this is
     /// fail-fast visibility, not an atomic multi-step guarantee.
-    async fn execute_and_persist(&self, actions: Vec<EngineAction>) -> DaemonResult<Vec<ActionResult>> {
+    async fn execute_and_persist(
+        &self,
+        actions: Vec<EngineAction>,
+    ) -> DaemonResult<Vec<ActionResult>> {
         let results = self.executor.execute(actions).await?;
 
         // Persist events from results to eventlog (centralized for MIG-v2.5#2).
@@ -941,16 +944,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self.record_query_transition(&query, "acting").await?;
 
         // Execute event emission + persist to eventlog for crash recovery
-        let results =
-            match self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await {
-                Ok(r) => r,
-                Err(e) => {
-                    let err_str = format!("{}", e);
-                    query.fail(err_str.clone(), "acting".to_string());
-                    self.record_query_failure(&query).await?;
-                    return Err(e);
-                },
-            };
+        let results = match self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await {
+            Ok(r) => r,
+            Err(e) => {
+                let err_str = format!("{}", e);
+                query.fail(err_str.clone(), "acting".to_string());
+                self.record_query_failure(&query).await?;
+                return Err(e);
+            },
+        };
         let actions_count = results.len();
 
         self.event_bus.send(DaemonEvent::PositionStateChanged {

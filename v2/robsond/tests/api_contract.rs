@@ -39,10 +39,7 @@ async fn start_test_server() -> (String, SocketAddr) {
 }
 
 fn client() -> Client {
-    Client::builder()
-        .timeout(std::time::Duration::from_secs(5))
-        .build()
-        .unwrap()
+    Client::builder().timeout(std::time::Duration::from_secs(5)).build().unwrap()
 }
 
 // =============================================================================
@@ -169,11 +166,7 @@ async fn test_get_position_not_found() {
     let (base, _) = start_test_server().await;
     let unknown_id = Uuid::now_v7();
 
-    let resp = client()
-        .get(format!("{}/positions/{}", base, unknown_id))
-        .send()
-        .await
-        .unwrap();
+    let resp = client().get(format!("{}/positions/{}", base, unknown_id)).send().await.unwrap();
 
     assert_eq!(resp.status(), 404);
     let body: api::ErrorResponse = resp.json().await.unwrap();
@@ -283,7 +276,11 @@ async fn test_arm_missing_required_field_returns_422() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), 422, "missing required fields should return 422 Unprocessable Entity");
+    assert_eq!(
+        resp.status(),
+        422,
+        "missing required fields should return 422 Unprocessable Entity"
+    );
 }
 
 // =============================================================================
@@ -571,11 +568,7 @@ async fn test_circuit_breaker_reset_returns_to_inactive() {
         .unwrap();
 
     // Reset
-    let resp = client()
-        .post(format!("{}/circuit-breaker/reset", base))
-        .send()
-        .await
-        .unwrap();
+    let resp = client().post(format!("{}/circuit-breaker/reset", base)).send().await.unwrap();
 
     assert_eq!(resp.status(), 200);
     let body: Value = resp.json().await.unwrap();
@@ -611,12 +604,7 @@ async fn test_arm_blocked_when_circuit_breaker_at_hard_halt() {
         .unwrap();
 
     // 503 Service Unavailable — circuit breaker tripped
-    assert_eq!(
-        resp.status(),
-        503,
-        "arm should be blocked at HardHalt, got: {}",
-        resp.status()
-    );
+    assert_eq!(resp.status(), 503, "arm should be blocked at HardHalt, got: {}", resp.status());
     let body: Value = resp.json().await.unwrap();
     assert!(body["error"].is_string(), "error field missing");
 }
@@ -633,11 +621,7 @@ async fn test_arm_unblocked_after_circuit_breaker_reset() {
         .await
         .unwrap();
 
-    client()
-        .post(format!("{}/circuit-breaker/reset", base))
-        .send()
-        .await
-        .unwrap();
+    client().post(format!("{}/circuit-breaker/reset", base)).send().await.unwrap();
 
     // Now arm should work again
     let resp = client()

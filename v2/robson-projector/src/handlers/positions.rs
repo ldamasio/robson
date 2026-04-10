@@ -235,9 +235,11 @@ pub(crate) async fn handle_entry_signal_received(
     envelope: &EventEnvelope,
 ) -> Result<()> {
     let _payload: EntrySignalReceived =
-        serde_json::from_value(envelope.payload.clone()).map_err(|e| ProjectionError::InvalidPayload {
-            event_type: envelope.event_type.clone(),
-            reason: e.to_string(),
+        serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+            ProjectionError::InvalidPayload {
+                event_type: envelope.event_type.clone(),
+                reason: e.to_string(),
+            }
         })?;
 
     // Audit event only - no projection update needed.
@@ -372,17 +374,13 @@ pub(crate) async fn handle_exit_order_placed(
 /// Creates the initial 'armed' row in positions_current.
 /// technical_stop_price is derived from tech_stop_distance.initial_stop.
 /// Enforces the same technical stop invariants as POSITION_OPENED.
-pub(crate) async fn handle_position_armed(
-    pool: &PgPool,
-    envelope: &EventEnvelope,
-) -> Result<()> {
-    let payload: PositionArmed =
-        serde_json::from_value(envelope.payload.clone()).map_err(|e| {
-            ProjectionError::InvalidPayload {
-                event_type: envelope.event_type.clone(),
-                reason: e.to_string(),
-            }
-        })?;
+pub(crate) async fn handle_position_armed(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
+    let payload: PositionArmed = serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+        ProjectionError::InvalidPayload {
+            event_type: envelope.event_type.clone(),
+            reason: e.to_string(),
+        }
+    })?;
 
     // INVARIANT: tech_stop_distance must be present and non-zero (Golden Rule)
     let tech = payload.tech_stop_distance.ok_or_else(|| ProjectionError::InvariantViolated {
@@ -507,17 +505,13 @@ pub(crate) async fn handle_position_disarmed(
 /// Records the confirmed exit fill. Does not close the position — that is done
 /// by the subsequent position_closed event which carries final P&L.
 /// Updates current_quantity to 0 and records the fill timestamp.
-pub(crate) async fn handle_exit_filled(
-    pool: &PgPool,
-    envelope: &EventEnvelope,
-) -> Result<()> {
-    let payload: ExitFilled =
-        serde_json::from_value(envelope.payload.clone()).map_err(|e| {
-            ProjectionError::InvalidPayload {
-                event_type: envelope.event_type.clone(),
-                reason: e.to_string(),
-            }
-        })?;
+pub(crate) async fn handle_exit_filled(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
+    let payload: ExitFilled = serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+        ProjectionError::InvalidPayload {
+            event_type: envelope.event_type.clone(),
+            reason: e.to_string(),
+        }
+    })?;
 
     sqlx::query(
         r#"
