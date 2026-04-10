@@ -521,7 +521,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
     }
 
     /// Start the API server.
-    async fn start_api_server(
+    ///
+    /// Public to allow integration tests to start the server and get the address.
+    pub async fn start_api_server(
         &self,
         position_monitor: Option<Arc<PositionMonitor>>,
     ) -> DaemonResult<SocketAddr> {

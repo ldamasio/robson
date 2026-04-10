@@ -58,14 +58,14 @@ pub struct ApiState<E: ExchangePort + 'static, S: Store + 'static> {
 // =============================================================================
 
 /// Health check response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct HealthResponse {
     pub status: String,
     pub version: String,
 }
 
 /// Readiness check response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ReadinessResponse {
     pub status: String,
     pub checks: ReadinessChecks,
@@ -73,7 +73,7 @@ pub struct ReadinessResponse {
 }
 
 /// Individual readiness checks.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ReadinessChecks {
     pub database: String,
     pub binance_api: String,
@@ -131,7 +131,7 @@ fn default_account_id() -> Uuid {
 }
 
 /// Response after arming a position.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ArmResponse {
     pub position_id: Uuid,
     pub symbol: String,
@@ -148,7 +148,7 @@ pub struct SignalRequest {
 }
 
 /// Panic response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct PanicResponse {
     pub closed_positions: Vec<Uuid>,
     pub count: usize,
@@ -162,7 +162,7 @@ pub struct ApproveQueryResponse {
 }
 
 /// Error response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ErrorResponse {
     pub error: String,
 }
@@ -172,7 +172,7 @@ pub struct ErrorResponse {
 // =============================================================================
 
 /// Safety net status response.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct SafetyStatusResponse {
     /// Whether the safety net is enabled
     pub enabled: bool,
@@ -187,7 +187,7 @@ pub struct SafetyStatusResponse {
 }
 
 /// Summary of a detected rogue position.
-#[derive(Debug, Serialize)]
+#[derive(Debug, Serialize, Deserialize)]
 pub struct DetectedPositionSummary {
     /// Position ID (symbol:side)
     pub id: String,
