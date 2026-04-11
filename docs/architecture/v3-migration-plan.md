@@ -110,7 +110,7 @@ Status rule for this table: code-backed items may be marked done from repository
 | MIG-v2.5#9 | Contract tests for daemon API | ✅ Done (2026-04-10) — 29 tests |
 | MIG-v2.5#10 | EventLog replay determinism test | ✅ Done (2026-04-05) |
 | MIG-v3#1 | Promote robsond as primary runtime | ✅ Done (2026-04-10) — Django execution CronJobs suspended, robsond sole execution path |
-| MIG-v3#2 | Replace Django API with thin gateway | ✅ Done (2026-04-11) — robsond in ns robson, Django removed, Gateway API only |
+| MIG-v3#2 | Replace Django API with thin gateway | 🔄 In Progress — manifests complete, pending: push, secret migration, ArgoCD sync |
 | MIG-v3#3 | Frontend direct connection to SSE | Pending |
 | MIG-v3#4 | Dynamic risk limits | Pending |
 | MIG-v3#5 | Operator control surface in UI | Pending |
