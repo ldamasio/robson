@@ -30,7 +30,7 @@ async fn test_trailing_stop_e2e() {
     let journal = Arc::new(robson_exec::IntentJournal::new());
     let store = Arc::new(MemoryStore::new());
     let executor = Executor::new(exchange, journal, store.clone());
-    let risk_config = robson_domain::RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+    let risk_config = robson_domain::RiskConfig::new(dec!(10000)).unwrap();
     let engine = Engine::new(risk_config);
 
     let position_id = Uuid::now_v7();

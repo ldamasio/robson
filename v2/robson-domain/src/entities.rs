@@ -162,7 +162,7 @@ impl Position {
 /// # use robson_domain::value_objects::{RiskConfig, Price, TechnicalStopDistance};
 /// # use robson_domain::entities::calculate_position_size;
 /// # use rust_decimal_macros::dec;
-/// let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap(); // $10k, 1% risk
+/// let config = RiskConfig::new(dec!(10000)).unwrap(); // $10k, 1% risk
 /// let entry = Price::new(dec!(95000)).unwrap();
 /// let stop = Price::new(dec!(93500)).unwrap();
 /// let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
@@ -625,7 +625,7 @@ mod tests {
     #[test]
     fn test_calculate_position_size_basic() {
         // Setup: $10,000 capital, 1% risk
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
 
         // Entry: $95,000, Stop: $93,500 (distance = $1,500)
         let entry = Price::new(dec!(95000)).unwrap();
@@ -643,7 +643,7 @@ mod tests {
     #[test]
     fn test_calculate_position_size_wider_stop() {
         // Wider stop = smaller position
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
 
         // Wide stop: $3,000 distance
         let entry = Price::new(dec!(95000)).unwrap();
@@ -660,7 +660,7 @@ mod tests {
     #[test]
     fn test_calculate_position_size_tighter_stop() {
         // Tighter stop = larger position
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
 
         // Tight stop: $500 distance (still valid, ~0.5%)
         let entry = Price::new(dec!(95000)).unwrap();
@@ -674,9 +674,9 @@ mod tests {
     }
 
     #[test]
-    fn test_calculate_position_size_higher_risk() {
-        // 2% risk = double position size
-        let config = RiskConfig::new(dec!(10000), dec!(2)).unwrap();
+    fn test_calculate_position_size_higher_capital() {
+        // v3: risk is always 1%, but with higher capital ($50k)
+        let config = RiskConfig::new(dec!(50000)).unwrap();
 
         let entry = Price::new(dec!(95000)).unwrap();
         let stop = Price::new(dec!(93500)).unwrap();
@@ -684,8 +684,8 @@ mod tests {
 
         let size = calculate_position_size(&config, &tech_stop).unwrap();
 
-        // Expected: $200 / $1,500 = 0.1333... BTC
-        let expected = dec!(200) / dec!(1500);
+        // Expected: $500 (1% of 50k) / $1,500 = 0.3333... BTC
+        let expected = dec!(500) / dec!(1500);
         assert_eq!(size.as_decimal(), expected);
     }
 
@@ -712,7 +712,7 @@ mod tests {
     fn test_position_sizing_risk_stays_constant() {
         // This test validates the golden rule:
         // Regardless of stop distance, the risk amount is always 1% of capital
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap(); // $100 risk
+        let config = RiskConfig::new(dec!(10000)).unwrap(); // $100 risk
 
         // Test 1: Wide stop ($3,000)
         let entry1 = Price::new(dec!(95000)).unwrap();

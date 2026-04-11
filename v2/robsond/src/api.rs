@@ -118,12 +118,13 @@ pub struct PendingApprovalSummary {
 }
 
 /// Request to arm a new position.
+///
+/// Note: risk per trade is fixed at 1% by v3 policy. Not configurable via API.
 #[derive(Debug, Deserialize)]
 pub struct ArmRequest {
     pub symbol: String,
     pub side: String,
     pub capital: Decimal,
-    pub risk_percent: Decimal,
     #[serde(default = "default_account_id")]
     pub account_id: Uuid,
 }
@@ -542,8 +543,8 @@ where
         },
     };
 
-    // Create risk config
-    let risk_config = RiskConfig::new(req.capital, req.risk_percent).map_err(|e| {
+    // Create risk config (v3 policy: risk is fixed at 1%, not from request)
+    let risk_config = RiskConfig::new(req.capital).map_err(|e| {
         (
             StatusCode::BAD_REQUEST,
             Json(ErrorResponse {
@@ -918,7 +919,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
         let event_bus = Arc::new(crate::event_bus::EventBus::new(capacity));
-        let risk_config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let risk_config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(risk_config);
 
         let manager = PositionManager::new(
@@ -1155,7 +1156,7 @@ mod tests {
                 .arm_position(
                     symbol.clone(),
                     Side::Long,
-                    RiskConfig::new(dec!(10000), dec!(1)).unwrap(),
+                    RiskConfig::new(dec!(10000)).unwrap(),
                     tech_stop,
                     Uuid::now_v7(),
                 )
@@ -1216,7 +1217,7 @@ mod tests {
                 .arm_position(
                     symbol.clone(),
                     Side::Long,
-                    RiskConfig::new(dec!(10000), dec!(1)).unwrap(),
+                    RiskConfig::new(dec!(10000)).unwrap(),
                     tech_stop,
                     Uuid::now_v7(),
                 )

@@ -54,10 +54,11 @@ pub struct ProjectionConfig {
 }
 
 /// Engine configuration.
+///
+/// Note: risk per trade is NOT configurable — it is fixed at 1% by v3 policy.
+/// See `RiskConfig::RISK_PER_TRADE_PCT` in robson-domain.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    /// Default risk percent for position sizing (0.01 = 1%)
-    pub default_risk_percent: Decimal,
     /// Minimum tech stop distance (0.001 = 0.1%)
     pub min_tech_stop_percent: Decimal,
     /// Maximum tech stop distance (0.10 = 10%)
@@ -131,7 +132,6 @@ impl Config {
                 port: 0, // Let OS assign port
             },
             engine: EngineConfig {
-                default_risk_percent: Decimal::new(1, 2),   // 1%
                 min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
                 max_tech_stop_percent: Decimal::new(10, 2), // 10%
             },
@@ -178,11 +178,7 @@ impl Config {
     }
 
     fn load_engine_config() -> DaemonResult<EngineConfig> {
-        let default_risk = Self::load_decimal_env(
-            "ROBSON_DEFAULT_RISK_PERCENT",
-            Decimal::new(1, 2), // 1%
-        )?;
-
+        // Note: risk per trade is NOT loaded from env — fixed at 1% by v3 policy.
         let min_tech_stop = Self::load_decimal_env(
             "ROBSON_MIN_TECH_STOP_PERCENT",
             Decimal::new(1, 3), // 0.1%
@@ -194,7 +190,6 @@ impl Config {
         )?;
 
         Ok(EngineConfig {
-            default_risk_percent: default_risk,
             min_tech_stop_percent: min_tech_stop,
             max_tech_stop_percent: max_tech_stop,
         })
@@ -300,7 +295,6 @@ impl Default for Config {
         Self {
             api: ApiConfig { host: "0.0.0.0".to_string(), port: 8080 },
             engine: EngineConfig {
-                default_risk_percent: Decimal::new(1, 2),   // 1%
                 min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
                 max_tech_stop_percent: Decimal::new(10, 2), // 10%
             },
@@ -354,7 +348,7 @@ mod tests {
     fn test_engine_config_defaults() {
         let config = Config::default();
 
-        assert_eq!(config.engine.default_risk_percent, Decimal::new(1, 2));
+        // Risk per trade is NOT in engine config — fixed at 1% in domain
         assert_eq!(config.engine.min_tech_stop_percent, Decimal::new(1, 3));
         assert_eq!(config.engine.max_tech_stop_percent, Decimal::new(10, 2));
     }

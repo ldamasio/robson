@@ -265,13 +265,15 @@ impl fmt::Display for OrderSide {
 // RiskConfig
 // =============================================================================
 
-/// Risk configuration for position sizing
+/// Risk configuration for position sizing (v3 policy)
 ///
-/// Defines the capital and risk parameters used to calculate position sizes.
-/// With fixed 10x leverage, position size is derived from:
+/// Risk per trade is FIXED at 1% of capital. This is a v3 policy decision:
+/// no configuration, no alternative modes, no overrides.
+///
+/// Position size is derived from the Golden Rule:
 ///
 /// ```text
-/// Position Size = (Capital × Risk%) / Stop Distance
+/// Position Size = (Capital × 1%) / Stop Distance
 /// ```
 ///
 /// # Example
@@ -279,7 +281,7 @@ impl fmt::Display for OrderSide {
 /// ```
 /// # use robson_domain::value_objects::RiskConfig;
 /// # use rust_decimal_macros::dec;
-/// let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+/// let config = RiskConfig::new(dec!(10000)).unwrap();
 /// assert_eq!(config.capital(), dec!(10000));
 /// assert_eq!(config.risk_per_trade_pct(), dec!(1));
 /// assert_eq!(config.max_risk_amount(), dec!(100)); // 1% of 10000
@@ -288,38 +290,27 @@ impl fmt::Display for OrderSide {
 pub struct RiskConfig {
     /// Available capital in quote currency (e.g., USDT)
     capital: Decimal,
-    /// Risk per trade as percentage (e.g., 1 = 1%)
-    risk_per_trade_pct: Decimal,
 }
 
 impl RiskConfig {
     /// Fixed leverage for all positions (10x isolated margin)
     pub const LEVERAGE: u8 = 10;
 
+    /// Fixed risk per trade: 1% of capital (v3 policy — non-negotiable)
+    pub const RISK_PER_TRADE_PCT: Decimal = Decimal::ONE;
+
     /// Create a new RiskConfig with validation
     ///
+    /// Risk is always 1% — not configurable. Only capital is provided.
+    ///
     /// # Errors
-    /// Returns `DomainError::InvalidRiskConfig` if:
-    /// - Capital <= 0
-    /// - Risk percentage <= 0 or > 5%
-    pub fn new(capital: Decimal, risk_per_trade_pct: Decimal) -> Result<Self, DomainError> {
+    /// Returns `DomainError::InvalidRiskConfig` if capital <= 0
+    pub fn new(capital: Decimal) -> Result<Self, DomainError> {
         if capital <= Decimal::ZERO {
             return Err(DomainError::InvalidRiskConfig("Capital must be positive".to_string()));
         }
 
-        if risk_per_trade_pct <= Decimal::ZERO {
-            return Err(DomainError::InvalidRiskConfig(
-                "Risk percentage must be positive".to_string(),
-            ));
-        }
-
-        if risk_per_trade_pct > Decimal::from(5) {
-            return Err(DomainError::InvalidRiskConfig(
-                "Risk percentage cannot exceed 5%".to_string(),
-            ));
-        }
-
-        Ok(Self { capital, risk_per_trade_pct })
+        Ok(Self { capital })
     }
 
     /// Get capital
@@ -327,16 +318,16 @@ impl RiskConfig {
         self.capital
     }
 
-    /// Get risk percentage
+    /// Get risk percentage (always 1%)
     pub fn risk_per_trade_pct(&self) -> Decimal {
-        self.risk_per_trade_pct
+        Self::RISK_PER_TRADE_PCT
     }
 
     /// Calculate max risk amount in quote currency
     ///
-    /// Returns: Capital × Risk% / 100
+    /// Returns: Capital × 1% (fixed)
     pub fn max_risk_amount(&self) -> Decimal {
-        self.capital * self.risk_per_trade_pct / Decimal::from(100)
+        self.capital * Self::RISK_PER_TRADE_PCT / Decimal::from(100)
     }
 
     /// Get fixed leverage
@@ -349,7 +340,6 @@ impl Default for RiskConfig {
     fn default() -> Self {
         Self {
             capital: Decimal::from(10000),
-            risk_per_trade_pct: Decimal::ONE, // 1%
         }
     }
 }
@@ -358,9 +348,8 @@ impl fmt::Display for RiskConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "RiskConfig {{ capital: {}, risk: {}%, leverage: {}x }}",
+            "RiskConfig {{ capital: {}, risk: 1% (fixed), leverage: {}x }}",
             self.capital,
-            self.risk_per_trade_pct,
             Self::LEVERAGE
         )
     }
@@ -373,26 +362,36 @@ impl fmt::Display for RiskConfig {
 /// TechnicalStopDistance represents the distance from entry to technical stop
 ///
 /// This is the structural foundation of position sizing AND trailing stop logic.
-/// The technical stop is calculated from chart analysis (e.g., 2nd support/resistance).
-/// The SAME distance is used to trail the stop as price moves favorably.
+/// The distance is called the "span" (palmo) — the central unit of the position.
 ///
 /// # Technical Stop Calculation
 ///
-/// The technical stop is determined by:
-/// - **LONG**: Second technical support to the left on 15-minute chart
-/// - **SHORT**: Second technical resistance to the left on 15-minute chart
+/// The technical stop is determined at position entry by:
+/// - **LONG**: Second technical support on the 15-minute chart
+/// - **SHORT**: Second technical resistance on the 15-minute chart
 ///
-/// # Trailing Stop Logic (1x Span)
+/// # The Span (Palmo)
 ///
-/// For LONG positions:
-/// - Trailing stop moves up when price makes new highs
-/// - Stop is always: current_peak - distance
-/// - Exit when price drops to trailing stop
+/// `span = abs(entry - technical_stop)`
 ///
-/// For SHORT positions:
-/// - Trailing stop moves down when price makes new lows
-/// - Stop is always: current_low + distance
-/// - Exit when price rises to trailing stop
+/// The span is:
+/// - Unit of risk (position size = 1% of capital / span)
+/// - Unit of movement (trailing stop moves in integer multiples of span)
+/// - Unit of decision (only complete span events trigger action)
+///
+/// # Trailing Stop Logic (v3 — Discrete Step)
+///
+/// The trailing stop moves in INTEGER MULTIPLES of the span:
+///
+/// For LONG:
+///   - entry=95000, stop=93500, span=1500
+///   - price reaches 96500 (entry + 1×span) → stop moves to 95000
+///   - price reaches 98000 (entry + 2×span) → stop moves to 96500
+///   - Partial movements are IGNORED
+///
+/// For SHORT: symmetric (stop moves down in span steps)
+///
+/// Key: the stop NEVER reacts to partial price movement.
 ///
 /// # Invariants
 /// - Distance must be positive
@@ -537,54 +536,11 @@ impl TechnicalStopDistance {
         Ok(())
     }
 
-    /// Calculate the trailing stop price for a LONG position
+    /// Get the span (palmo) — alias for `distance`
     ///
-    /// For longs, trailing stop = peak_price - distance
-    /// Stop only moves UP, never down (use max with current stop)
-    ///
-    /// # Examples
-    /// ```
-    /// # use robson_domain::value_objects::{TechnicalStopDistance, Price};
-    /// # use rust_decimal_macros::dec;
-    /// let entry = Price::new(dec!(95000.0)).unwrap();
-    /// let stop = Price::new(dec!(93500.0)).unwrap();
-    /// let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
-    ///
-    /// // Price moved up to $97,000
-    /// let new_stop = tech_stop.calculate_trailing_stop_long(dec!(97000.0));
-    /// assert_eq!(new_stop.as_decimal(), dec!(95500.0)); // 97000 - 1500
-    /// ```
-    pub fn calculate_trailing_stop_long(&self, peak_price: Decimal) -> Price {
-        let stop_value = peak_price - self.distance;
-        // Safety: if peak is below entry, don't trail below initial stop
-        let min_stop = self.initial_stop.as_decimal();
-        let final_stop = stop_value.max(min_stop);
-        Price(final_stop)
-    }
-
-    /// Calculate the trailing stop price for a SHORT position
-    ///
-    /// For shorts, trailing stop = low_price + distance
-    /// Stop only moves DOWN, never up (use min with current stop)
-    ///
-    /// # Examples
-    /// ```
-    /// # use robson_domain::value_objects::{TechnicalStopDistance, Price};
-    /// # use rust_decimal_macros::dec;
-    /// let entry = Price::new(dec!(95000.0)).unwrap();
-    /// let stop = Price::new(dec!(96500.0)).unwrap();  // Short stop above entry
-    /// let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
-    ///
-    /// // Price moved down to $93,000
-    /// let new_stop = tech_stop.calculate_trailing_stop_short(dec!(93000.0));
-    /// assert_eq!(new_stop.as_decimal(), dec!(94500.0)); // 93000 + 1500
-    /// ```
-    pub fn calculate_trailing_stop_short(&self, low_price: Decimal) -> Price {
-        let stop_value = low_price + self.distance;
-        // Safety: if low is above entry, don't trail above initial stop
-        let max_stop = self.initial_stop.as_decimal();
-        let final_stop = stop_value.min(max_stop);
-        Price(final_stop)
+    /// The span is the unit of risk, movement, and decision for this position.
+    pub fn span(&self) -> Decimal {
+        self.distance
     }
 
     /// Check if current price triggers the trailing stop (LONG position)
@@ -673,37 +629,31 @@ mod tests {
         assert_eq!(Side::Short.exit_action(), OrderSide::Buy);
     }
 
-    // RiskConfig tests
+    // RiskConfig tests (v3: fixed 1% risk)
     #[test]
     fn test_risk_config_validation() {
-        // Valid config
-        assert!(RiskConfig::new(dec!(10000), dec!(1)).is_ok());
-        assert!(RiskConfig::new(dec!(1000), dec!(0.5)).is_ok());
-        assert!(RiskConfig::new(dec!(100000), dec!(5)).is_ok());
+        // Valid: positive capital
+        assert!(RiskConfig::new(dec!(10000)).is_ok());
+        assert!(RiskConfig::new(dec!(1000)).is_ok());
+        assert!(RiskConfig::new(dec!(100000)).is_ok());
 
         // Invalid: zero capital
-        assert!(RiskConfig::new(dec!(0), dec!(1)).is_err());
+        assert!(RiskConfig::new(dec!(0)).is_err());
 
         // Invalid: negative capital
-        assert!(RiskConfig::new(dec!(-1000), dec!(1)).is_err());
-
-        // Invalid: zero risk
-        assert!(RiskConfig::new(dec!(10000), dec!(0)).is_err());
-
-        // Invalid: negative risk
-        assert!(RiskConfig::new(dec!(10000), dec!(-1)).is_err());
-
-        // Invalid: risk > 5%
-        assert!(RiskConfig::new(dec!(10000), dec!(6)).is_err());
+        assert!(RiskConfig::new(dec!(-1000)).is_err());
     }
 
     #[test]
-    fn test_risk_config_max_risk_amount() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+    fn test_risk_config_fixed_one_percent() {
+        // Risk is always 1%, regardless of capital
+        let config = RiskConfig::new(dec!(10000)).unwrap();
+        assert_eq!(config.risk_per_trade_pct(), dec!(1));
         assert_eq!(config.max_risk_amount(), dec!(100)); // 1% of 10000
 
-        let config2 = RiskConfig::new(dec!(50000), dec!(2)).unwrap();
-        assert_eq!(config2.max_risk_amount(), dec!(1000)); // 2% of 50000
+        let config2 = RiskConfig::new(dec!(50000)).unwrap();
+        assert_eq!(config2.risk_per_trade_pct(), dec!(1)); // still 1%
+        assert_eq!(config2.max_risk_amount(), dec!(500)); // 1% of 50000
     }
 
     #[test]
@@ -760,79 +710,17 @@ mod tests {
         assert!(tech_stop.validate().is_err());
     }
 
-    // Trailing stop tests
+    // Span alias test
     #[test]
-    fn test_trailing_stop_long_moves_up() {
+    fn test_span_alias() {
         let entry = Price::new(dec!(95000.0)).unwrap();
         let stop = Price::new(dec!(93500.0)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
-
-        // Initial trailing stop equals initial stop
-        let initial_stop = tech_stop.calculate_trailing_stop_long(dec!(95000.0));
-        assert_eq!(initial_stop.as_decimal(), dec!(93500.0));
-
-        // Price moves up, trailing stop follows
-        let stop_1 = tech_stop.calculate_trailing_stop_long(dec!(96000.0));
-        assert_eq!(stop_1.as_decimal(), dec!(94500.0)); // 96000 - 1500
-
-        let stop_2 = tech_stop.calculate_trailing_stop_long(dec!(97000.0));
-        assert_eq!(stop_2.as_decimal(), dec!(95500.0)); // 97000 - 1500
-
-        let stop_3 = tech_stop.calculate_trailing_stop_long(dec!(98000.0));
-        assert_eq!(stop_3.as_decimal(), dec!(96500.0)); // 98000 - 1500
+        assert_eq!(tech_stop.span(), dec!(1500.0));
+        assert_eq!(tech_stop.span(), tech_stop.distance);
     }
 
-    #[test]
-    fn test_trailing_stop_long_never_below_initial() {
-        let entry = Price::new(dec!(95000.0)).unwrap();
-        let stop = Price::new(dec!(93500.0)).unwrap();
-        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
-
-        // Price drops below entry - stop should NOT go below initial
-        let stop_dropped = tech_stop.calculate_trailing_stop_long(dec!(94000.0));
-        assert_eq!(stop_dropped.as_decimal(), dec!(93500.0)); // Stays at initial stop
-
-        // Price way below entry - stop should NOT go below initial
-        let stop_crashed = tech_stop.calculate_trailing_stop_long(dec!(92000.0));
-        assert_eq!(stop_crashed.as_decimal(), dec!(93500.0)); // Stays at initial stop
-    }
-
-    #[test]
-    fn test_trailing_stop_short_moves_down() {
-        let entry = Price::new(dec!(95000.0)).unwrap();
-        let stop = Price::new(dec!(96500.0)).unwrap(); // Short stop above entry
-        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
-
-        // Initial trailing stop equals initial stop
-        let initial_stop = tech_stop.calculate_trailing_stop_short(dec!(95000.0));
-        assert_eq!(initial_stop.as_decimal(), dec!(96500.0));
-
-        // Price moves down, trailing stop follows
-        let stop_1 = tech_stop.calculate_trailing_stop_short(dec!(94000.0));
-        assert_eq!(stop_1.as_decimal(), dec!(95500.0)); // 94000 + 1500
-
-        let stop_2 = tech_stop.calculate_trailing_stop_short(dec!(93000.0));
-        assert_eq!(stop_2.as_decimal(), dec!(94500.0)); // 93000 + 1500
-
-        let stop_3 = tech_stop.calculate_trailing_stop_short(dec!(92000.0));
-        assert_eq!(stop_3.as_decimal(), dec!(93500.0)); // 92000 + 1500
-    }
-
-    #[test]
-    fn test_trailing_stop_short_never_above_initial() {
-        let entry = Price::new(dec!(95000.0)).unwrap();
-        let stop = Price::new(dec!(96500.0)).unwrap();
-        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
-
-        // Price rises above entry - stop should NOT go above initial
-        let stop_risen = tech_stop.calculate_trailing_stop_short(dec!(96000.0));
-        assert_eq!(stop_risen.as_decimal(), dec!(96500.0)); // Stays at initial stop
-
-        // Price way above entry - stop should NOT go above initial
-        let stop_pumped = tech_stop.calculate_trailing_stop_short(dec!(98000.0));
-        assert_eq!(stop_pumped.as_decimal(), dec!(96500.0)); // Stays at initial stop
-    }
-
+    // Exit condition tests
     #[test]
     fn test_should_exit_long() {
         let entry = Price::new(dec!(95000.0)).unwrap();

@@ -7,7 +7,8 @@
 //!
 //! - **No I/O**: Engine never touches network, database, or filesystem
 //! - **Pure Functions**: `process(input) -> decisions`
-//! - **Trailing Stop**: Exit when price hits trailing stop (1x tech distance)
+//! - **Trailing Stop**: Discrete step trailing (v3 policy). Stop moves in integer
+//!   multiples of the span (tech stop distance). Never reacts to partial movement.
 //!
 //! # Example
 //!
@@ -19,7 +20,7 @@
 //! use uuid::Uuid;
 //!
 //! // Create engine with risk config
-//! let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+//! let config = RiskConfig::new(dec!(10000)).unwrap();
 //! let engine = Engine::new(config);
 //!
 //! // Engine processes active positions and returns actions
@@ -413,11 +414,10 @@ impl Engine {
             EngineError::MissingData("Position missing tech_stop_distance".to_string())
         })?;
 
-        // 3. Calculate initial trailing stop
-        let initial_trailing_stop = match position.side {
-            Side::Long => tech_stop.calculate_trailing_stop_long(fill_price.as_decimal()),
-            Side::Short => tech_stop.calculate_trailing_stop_short(fill_price.as_decimal()),
-        };
+        // 3. Initial trailing stop = the technical stop itself (no movement yet)
+        //    In v3 discrete trailing, the stop only moves after a full span of profit.
+        //    At entry, zero spans have been completed, so the stop is the initial tech stop.
+        let initial_trailing_stop = tech_stop.initial_stop;
 
         debug!(
             position_id = %position.id,
@@ -524,14 +524,15 @@ impl Engine {
             return Ok(self.create_exit_decision(position, current_price, trailing_stop));
         }
 
-        // Check if trailing stop should be updated
+        // Check if trailing stop should be updated (discrete step logic)
         if let Some(new_stop) = self.calculate_new_trailing_stop(
             position.side,
             current_price,
             favorable_extreme,
+            trailing_stop,
             tech_stop,
         ) {
-            // Only update if new stop is more favorable than current stop
+            // Discrete logic already ensures monotonicity, but double-check
             if self.is_more_favorable_stop(position.side, new_stop, trailing_stop) {
                 // Idempotency check: only emit if different from last emitted
                 if last_emitted_stop != Some(new_stop) {
@@ -566,35 +567,28 @@ impl Engine {
         }
     }
 
-    /// Calculate new trailing stop based on favorable price movement
+    /// Calculate new trailing stop using v3 discrete step (span/palmo) logic
     ///
-    /// Returns `Some(new_stop)` if price has moved favorably beyond current extreme.
-    /// Returns `None` if no update is needed.
+    /// The stop moves in integer multiples of the span, anchored to entry price.
+    /// Returns `Some(new_stop)` only when a FULL span step has been completed.
+    /// Returns `None` for partial movements.
     fn calculate_new_trailing_stop(
         &self,
         side: Side,
         current_price: Price,
         favorable_extreme: Price,
+        trailing_stop: Price,
         tech_stop: &TechnicalStopDistance,
     ) -> Option<Price> {
-        match side {
-            Side::Long => {
-                // LONG: check if we have a new high
-                if current_price.as_decimal() > favorable_extreme.as_decimal() {
-                    Some(tech_stop.calculate_trailing_stop_long(current_price.as_decimal()))
-                } else {
-                    None
-                }
-            },
-            Side::Short => {
-                // SHORT: check if we have a new low
-                if current_price.as_decimal() < favorable_extreme.as_decimal() {
-                    Some(tech_stop.calculate_trailing_stop_short(current_price.as_decimal()))
-                } else {
-                    None
-                }
-            },
-        }
+        let update = trailing_stop::update_trailing_stop_discrete(
+            side,
+            current_price,
+            favorable_extreme,
+            trailing_stop,
+            tech_stop.entry_price,
+            tech_stop.distance,
+        );
+        update.map(|u| u.new_stop)
     }
 
     /// Check if new stop is more favorable than current stop
@@ -762,7 +756,7 @@ mod tests {
 
     #[test]
     fn test_long_no_action_price_stable() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
         // Position: entry $95k, stop $93.5k, distance $1.5k
@@ -782,8 +776,8 @@ mod tests {
     }
 
     #[test]
-    fn test_long_trailing_stop_update_new_high() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+    fn test_long_trailing_stop_no_update_partial_span() {
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
         // Position: entry $95k, stop $93.5k, distance $1.5k
@@ -795,18 +789,36 @@ mod tests {
             dec!(1500),  // tech distance
         );
 
-        // Price moved up to $96k (new high!)
+        // Price moved up to $96k — NOT a full span ($96.5k needed). No update.
         let market = create_market_data(dec!(96000));
+        let decision = engine.process_active_position(&position, &market).unwrap();
+        assert!(!decision.has_actions());
+    }
+
+    #[test]
+    fn test_long_trailing_stop_update_full_span() {
+        let config = RiskConfig::new(dec!(10000)).unwrap();
+        let engine = Engine::new(config);
+
+        // Position: entry $95k, stop $93.5k, distance $1.5k
+        let position = create_active_position(
+            Side::Long,
+            dec!(95000),
+            dec!(93500), // trailing stop
+            dec!(95000), // favorable extreme
+            dec!(1500),  // tech distance
+        );
+
+        // Price moved up to $96.5k — exactly 1 full span above entry. Update!
+        let market = create_market_data(dec!(96500));
         let decision = engine.process_active_position(&position, &market).unwrap();
 
         assert!(decision.has_actions());
         assert_eq!(decision.actions.len(), 2);
 
-        // Check first action is UpdateTrailingStop
         match &decision.actions[0] {
             EngineAction::UpdateTrailingStop { new_stop, previous_stop, .. } => {
-                // New stop should be $96k - $1.5k = $94.5k
-                assert_eq!(new_stop.as_decimal(), dec!(94500));
+                assert_eq!(new_stop.as_decimal(), dec!(95000)); // breakeven
                 assert_eq!(previous_stop.as_decimal(), dec!(93500));
             },
             _ => panic!("Expected UpdateTrailingStop action"),
@@ -815,15 +827,15 @@ mod tests {
 
     #[test]
     fn test_long_trailing_stop_no_update_price_below_extreme() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
-        // Position already made a high at $96k
+        // Position already made a high at $96.5k (1 full span), stop moved to $95k
         let position = create_active_position(
             Side::Long,
             dec!(95000),
-            dec!(94500), // trailing stop (from $96k high)
-            dec!(96000), // favorable extreme
+            dec!(95000), // trailing stop (1 span completed: breakeven)
+            dec!(96500), // favorable extreme (1 span above entry)
             dec!(1500),  // tech distance
         );
 
@@ -837,7 +849,7 @@ mod tests {
 
     #[test]
     fn test_long_exit_triggered_stop_hit() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
         let position = create_active_position(
@@ -869,7 +881,7 @@ mod tests {
 
     #[test]
     fn test_long_exit_triggered_price_below_stop() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
         let position = create_active_position(
@@ -896,7 +908,7 @@ mod tests {
 
     #[test]
     fn test_short_no_action_price_stable() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
         // Short position: entry $95k, stop $96.5k, distance $1.5k
@@ -915,8 +927,8 @@ mod tests {
     }
 
     #[test]
-    fn test_short_trailing_stop_update_new_low() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+    fn test_short_trailing_stop_no_update_partial_span() {
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
         let position = create_active_position(
@@ -927,16 +939,34 @@ mod tests {
             dec!(1500),  // tech distance
         );
 
-        // Price moved down to $94k (new low!)
+        // Price moved down to $94,000 — NOT a full span ($93,500 needed). No update.
         let market = create_market_data(dec!(94000));
+        let decision = engine.process_active_position(&position, &market).unwrap();
+        assert!(!decision.has_actions());
+    }
+
+    #[test]
+    fn test_short_trailing_stop_update_full_span() {
+        let config = RiskConfig::new(dec!(10000)).unwrap();
+        let engine = Engine::new(config);
+
+        let position = create_active_position(
+            Side::Short,
+            dec!(95000),
+            dec!(96500), // trailing stop
+            dec!(95000), // favorable extreme
+            dec!(1500),  // tech distance
+        );
+
+        // Price moved down to $93,500 — exactly 1 full span below entry. Update!
+        let market = create_market_data(dec!(93500));
         let decision = engine.process_active_position(&position, &market).unwrap();
 
         assert!(decision.has_actions());
 
         match &decision.actions[0] {
             EngineAction::UpdateTrailingStop { new_stop, previous_stop, .. } => {
-                // New stop should be $94k + $1.5k = $95.5k
-                assert_eq!(new_stop.as_decimal(), dec!(95500));
+                assert_eq!(new_stop.as_decimal(), dec!(95000)); // breakeven
                 assert_eq!(previous_stop.as_decimal(), dec!(96500));
             },
             _ => panic!("Expected UpdateTrailingStop action"),
@@ -945,7 +975,7 @@ mod tests {
 
     #[test]
     fn test_short_exit_triggered_stop_hit() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
         let position = create_active_position(
@@ -975,7 +1005,7 @@ mod tests {
 
     #[test]
     fn test_error_position_not_active() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
         // Create armed position (not active)
@@ -997,7 +1027,7 @@ mod tests {
 
     #[test]
     fn test_error_symbol_mismatch() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
         let position =
@@ -1018,7 +1048,7 @@ mod tests {
 
     #[test]
     fn test_long_multiple_updates_sequence() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
         // Simulate price moving up in steps
@@ -1053,7 +1083,7 @@ mod tests {
 
     #[test]
     fn test_exit_takes_priority_over_update() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
         // Edge case: price gaps through both update and exit levels
@@ -1103,7 +1133,7 @@ mod tests {
 
     #[test]
     fn test_decide_entry_long_success() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
         let position = create_armed_position(Side::Long);
@@ -1137,7 +1167,7 @@ mod tests {
 
     #[test]
     fn test_decide_entry_short_success() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
         let position = create_armed_position(Side::Short);
@@ -1155,7 +1185,7 @@ mod tests {
 
     #[test]
     fn test_decide_entry_rejects_non_armed() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
         // Create an Active position (not Armed)
@@ -1184,7 +1214,7 @@ mod tests {
 
     #[test]
     fn test_decide_entry_rejects_signal_mismatch() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
         let position = create_armed_position(Side::Long);
@@ -1206,7 +1236,7 @@ mod tests {
 
     #[test]
     fn test_decide_entry_validates_tech_stop() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
         let position = create_armed_position(Side::Long);
@@ -1222,7 +1252,7 @@ mod tests {
 
     #[test]
     fn test_process_entry_fill_long() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
         // First, create a position in Entering state
@@ -1250,8 +1280,8 @@ mod tests {
             } => {
                 assert_eq!(current_price.as_decimal(), dec!(95100));
                 assert_eq!(favorable_extreme.as_decimal(), dec!(95100));
-                // Initial trailing stop = 95100 - 1500 = 93600
-                assert_eq!(trailing_stop.as_decimal(), dec!(93600));
+                // v3: initial trailing stop = the technical stop itself (no spans completed)
+                assert_eq!(trailing_stop.as_decimal(), dec!(93500));
             },
             other => panic!("Expected Active state, got {:?}", other.name()),
         }
@@ -1259,7 +1289,7 @@ mod tests {
 
     #[test]
     fn test_process_entry_fill_short() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
         // Create a short position in Entering state
@@ -1281,8 +1311,8 @@ mod tests {
         match &active_position.state {
             PositionState::Active { trailing_stop, favorable_extreme, .. } => {
                 assert_eq!(favorable_extreme.as_decimal(), dec!(94900));
-                // Initial trailing stop = 94900 + 1500 = 96400
-                assert_eq!(trailing_stop.as_decimal(), dec!(96400));
+                // v3: initial trailing stop = the technical stop itself (no spans completed)
+                assert_eq!(trailing_stop.as_decimal(), dec!(96500));
             },
             other => panic!("Expected Active state, got {:?}", other.name()),
         }
@@ -1290,7 +1320,7 @@ mod tests {
 
     #[test]
     fn test_process_entry_fill_rejects_non_entering() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
         // Use an Armed position (not Entering)
@@ -1313,7 +1343,7 @@ mod tests {
 
     #[test]
     fn test_full_entry_to_exit_flow() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
         // 1. Armed position
@@ -1341,26 +1371,25 @@ mod tests {
         assert!(active_position.can_exit());
         assert!(!active_position.can_enter());
 
-        // 4. Price moves up, trailing stop updates
-        let market_up = create_market_data(dec!(97000));
+        // 4. Price moves up to $96,500 (1 full span), trailing stop updates to $95,000
+        let market_up = create_market_data(dec!(96500));
         let update_decision = engine.process_active_position(&active_position, &market_up).unwrap();
         assert!(update_decision.has_actions());
 
         // 5. Simulate price hitting trailing stop (exit)
-        // After price went to 97k, trailing stop should be 97k - 1.5k = 95.5k
-        // Create position with updated trailing stop for this test
+        // After 1 full span completed, trailing stop is at $95,000 (breakeven)
         let mut position_after_update = active_position.clone();
         position_after_update.state = PositionState::Active {
-            current_price: Price::new(dec!(97000)).unwrap(),
-            trailing_stop: Price::new(dec!(95500)).unwrap(),
-            favorable_extreme: Price::new(dec!(97000)).unwrap(),
+            current_price: Price::new(dec!(96500)).unwrap(),
+            trailing_stop: Price::new(dec!(95000)).unwrap(),
+            favorable_extreme: Price::new(dec!(96500)).unwrap(),
             extreme_at: Utc::now(),
             insurance_stop_id: None,
-            last_emitted_stop: Some(Price::new(dec!(95500)).unwrap()),
+            last_emitted_stop: Some(Price::new(dec!(95000)).unwrap()),
         };
 
-        // Price drops to trailing stop
-        let market_exit = create_market_data(dec!(95500));
+        // Price drops to trailing stop ($95,000)
+        let market_exit = create_market_data(dec!(95000));
         let exit_decision =
             engine.process_active_position(&position_after_update, &market_exit).unwrap();
 
@@ -1378,16 +1407,15 @@ mod tests {
 
     #[test]
     fn test_idempotent_trailing_stop_update_same_tick() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
-        // Position: entry $95k, stop $93.5k, distance $1.5k
-        // Price already moved to $97k, trailing stop moved to $95.5k
+        // Position: entry $95k, stop moved to $95k (1 span completed at $96.5k)
         let position = create_active_position(
             Side::Long,
             dec!(95000),
-            dec!(94500), // trailing stop (previous update from $96k high)
-            dec!(96000), // favorable extreme
+            dec!(95000), // trailing stop (1 span completed: breakeven)
+            dec!(96500), // favorable extreme (1 full span above entry)
             dec!(1500),  // tech distance
         );
 
@@ -1408,32 +1436,30 @@ mod tests {
                 favorable_extreme,
                 extreme_at,
                 insurance_stop_id,
-                last_emitted_stop: Some(Price::new(dec!(94500)).unwrap()), // Already emitted $94.5k
+                last_emitted_stop: Some(Price::new(dec!(95000)).unwrap()), // Already emitted
             };
         }
 
-        // Process same price again ($96k - same as favorable extreme)
+        // Process same price again ($96.5k - same as favorable extreme)
         // This should NOT trigger a new trailing stop update (idempotency)
-        let market = create_market_data(dec!(96000));
+        let market = create_market_data(dec!(96500));
         let decision = engine.process_active_position(&position_with_emitted, &market).unwrap();
 
-        // No action should be taken because:
-        // 1. Price ($96k) is not above favorable_extreme ($96k) - it's equal
-        // 2. Even if calculated, the new stop would be same as last_emitted_stop
+        // No action: stop would still be $95k (same as last_emitted_stop)
         assert!(!decision.has_actions(), "Should not emit duplicate trailing stop update");
     }
 
     #[test]
     fn test_idempotent_trailing_stop_update_repeated_same_price() {
-        let config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
-        // Position: entry $95k, stop $93.5k, distance $1.5k
+        // Position: entry $95k, stop at $95k (1 span completed at $96.5k)
         let position = create_active_position(
             Side::Long,
             dec!(95000),
-            dec!(94500), // trailing stop
-            dec!(96000), // favorable extreme (price went to $96k)
+            dec!(95000), // trailing stop (1 span completed)
+            dec!(96500), // favorable extreme (1 full span above entry)
             dec!(1500),  // tech distance
         );
 
@@ -1454,7 +1480,7 @@ mod tests {
                 favorable_extreme,
                 extreme_at,
                 insurance_stop_id,
-                last_emitted_stop: Some(Price::new(dec!(94500)).unwrap()), // Already emitted
+                last_emitted_stop: Some(Price::new(dec!(95000)).unwrap()), // Already emitted
             };
         }
 

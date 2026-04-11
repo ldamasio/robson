@@ -45,6 +45,11 @@ pub struct RiskLimits {
     /// Daily loss limit as percentage of capital (circuit breaker)
     /// Default: 3% (at 1% risk per trade, 3 consecutive losses hit this)
     pub daily_loss_limit_pct: Decimal,
+
+    /// Monthly drawdown limit as percentage of capital (v3 policy)
+    /// Default: 4% — when reached, system enters MonthlyHalt:
+    /// close all positions, block new entries, halt until next month.
+    pub max_monthly_drawdown_pct: Decimal,
 }
 
 impl Default for RiskLimits {
@@ -54,6 +59,7 @@ impl Default for RiskLimits {
             max_total_exposure_pct: Decimal::from(30),
             max_single_position_pct: Decimal::from(15),
             daily_loss_limit_pct: Decimal::from(3),
+            max_monthly_drawdown_pct: Decimal::from(4),
         }
     }
 }
@@ -71,6 +77,7 @@ impl RiskLimits {
             max_total_exposure_pct,
             max_single_position_pct,
             daily_loss_limit_pct,
+            max_monthly_drawdown_pct: Decimal::from(4), // v3 policy: 4% fixed
         }
     }
 }
@@ -112,6 +119,10 @@ pub struct RiskContext {
     pub daily_realized_pnl: Decimal,
     /// Daily unrealized PnL
     pub daily_unrealized_pnl: Decimal,
+    /// Monthly realized PnL (v3 policy: halt at -4%)
+    pub monthly_realized_pnl: Decimal,
+    /// Monthly unrealized PnL
+    pub monthly_unrealized_pnl: Decimal,
 }
 
 impl RiskContext {
@@ -123,6 +134,8 @@ impl RiskContext {
             total_notional_exposure: Decimal::ZERO,
             daily_realized_pnl: Decimal::ZERO,
             daily_unrealized_pnl: Decimal::ZERO,
+            monthly_realized_pnl: Decimal::ZERO,
+            monthly_unrealized_pnl: Decimal::ZERO,
         }
     }
 
@@ -141,6 +154,30 @@ impl RiskContext {
             total_notional_exposure,
             daily_realized_pnl,
             daily_unrealized_pnl,
+            monthly_realized_pnl: Decimal::ZERO,
+            monthly_unrealized_pnl: Decimal::ZERO,
+        }
+    }
+
+    /// Create context with positions and monthly PnL
+    pub fn with_monthly_pnl(
+        capital: Decimal,
+        open_positions: Vec<PositionSummary>,
+        daily_realized_pnl: Decimal,
+        daily_unrealized_pnl: Decimal,
+        monthly_realized_pnl: Decimal,
+        monthly_unrealized_pnl: Decimal,
+    ) -> Self {
+        let total_notional_exposure = open_positions.iter().map(|p| p.notional_value).sum();
+
+        Self {
+            capital,
+            open_positions,
+            total_notional_exposure,
+            daily_realized_pnl,
+            daily_unrealized_pnl,
+            monthly_realized_pnl,
+            monthly_unrealized_pnl,
         }
     }
 
@@ -152,6 +189,11 @@ impl RiskContext {
     /// Calculate total daily PnL (realized + unrealized)
     pub fn total_daily_pnl(&self) -> Decimal {
         self.daily_realized_pnl + self.daily_unrealized_pnl
+    }
+
+    /// Calculate total monthly PnL (realized + unrealized)
+    pub fn total_monthly_pnl(&self) -> Decimal {
+        self.monthly_realized_pnl + self.monthly_unrealized_pnl
     }
 
     /// Check if there's an existing position with same symbol and side
@@ -198,6 +240,8 @@ pub enum RiskCheck {
     InsufficientMargin,
     /// Daily loss limit exceeded
     DailyLossLimit,
+    /// Monthly drawdown limit exceeded (v3: 4% → MonthlyHalt)
+    MonthlyDrawdown,
     /// Already have position on same symbol+side
     DuplicatePosition,
 }
@@ -211,6 +255,7 @@ impl RiskCheck {
             RiskCheck::SinglePositionConcentration => "single_position_concentration",
             RiskCheck::InsufficientMargin => "insufficient_margin",
             RiskCheck::DailyLossLimit => "daily_loss_limit",
+            RiskCheck::MonthlyDrawdown => "monthly_drawdown",
             RiskCheck::DuplicatePosition => "duplicate_position",
         }
     }
@@ -335,7 +380,26 @@ impl RiskGate {
             };
         }
 
-        // 5. Check daily loss circuit breaker
+        // 5. Check monthly drawdown (v3 policy: 4% → MonthlyHalt)
+        let monthly_pnl = context.total_monthly_pnl();
+        let monthly_loss_limit =
+            context.capital * self.limits.max_monthly_drawdown_pct / Decimal::from(100);
+        if monthly_pnl < -monthly_loss_limit {
+            debug!(
+                monthly_pnl = %monthly_pnl,
+                limit = %monthly_loss_limit,
+                "Risk check failed: monthly drawdown limit (MonthlyHalt)"
+            );
+            return RiskVerdict::Rejected {
+                check: RiskCheck::MonthlyDrawdown,
+                reason: format!(
+                    "Monthly P&L {} has exceeded drawdown limit of -{}% (MonthlyHalt triggered)",
+                    monthly_pnl, self.limits.max_monthly_drawdown_pct
+                ),
+            };
+        }
+
+        // 6. Check daily loss circuit breaker
         let daily_pnl = context.total_daily_pnl();
         let daily_loss_limit =
             context.capital * self.limits.daily_loss_limit_pct / Decimal::from(100);
@@ -354,7 +418,7 @@ impl RiskGate {
             };
         }
 
-        // 6. Check margin availability (optional - exchange will also validate)
+        // 7. Check margin availability (optional - exchange will also validate)
         // Note: This is a pre-check; exchange will do final validation
         // For now, we rely on exchange validation for margin
 
@@ -525,6 +589,8 @@ mod tests {
             total_notional_exposure: Decimal::ZERO,
             daily_realized_pnl: dec!(-250),
             daily_unrealized_pnl: dec!(-100),
+            monthly_realized_pnl: dec!(0),
+            monthly_unrealized_pnl: dec!(0),
         };
         // -350 < -300 (3% of 10000)
         let proposed = sample_proposed();
@@ -534,6 +600,47 @@ mod tests {
             verdict,
             RiskVerdict::Rejected { check: RiskCheck::DailyLossLimit, .. }
         ));
+    }
+
+    #[test]
+    fn test_risk_gate_rejects_monthly_drawdown() {
+        let gate = RiskGate::new();
+        let context = RiskContext {
+            capital: dec!(10000),
+            open_positions: vec![],
+            total_notional_exposure: Decimal::ZERO,
+            daily_realized_pnl: dec!(-100),
+            daily_unrealized_pnl: dec!(0),
+            monthly_realized_pnl: dec!(-350),
+            monthly_unrealized_pnl: dec!(-100),
+        };
+        // Monthly PnL = -450 < -400 (4% of 10000)
+        let proposed = sample_proposed();
+
+        let verdict = gate.evaluate(&proposed, &context);
+        assert!(matches!(
+            verdict,
+            RiskVerdict::Rejected { check: RiskCheck::MonthlyDrawdown, .. }
+        ));
+    }
+
+    #[test]
+    fn test_risk_gate_allows_within_monthly_drawdown() {
+        let gate = RiskGate::new();
+        let context = RiskContext {
+            capital: dec!(10000),
+            open_positions: vec![],
+            total_notional_exposure: Decimal::ZERO,
+            daily_realized_pnl: dec!(0),
+            daily_unrealized_pnl: dec!(0),
+            monthly_realized_pnl: dec!(-300),
+            monthly_unrealized_pnl: dec!(0),
+        };
+        // Monthly PnL = -300, limit is -400. Still within limit.
+        let proposed = sample_proposed();
+
+        let verdict = gate.evaluate(&proposed, &context);
+        assert_eq!(verdict, RiskVerdict::Approved);
     }
 
     #[test]

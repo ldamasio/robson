@@ -756,7 +756,7 @@ async fn test_runtime_arm_position_persists_to_projection(pool: sqlx::PgPool) {
     let store = Arc::new(MemoryStore::new());
     let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
     let event_bus = Arc::new(EventBus::new(100));
-    let risk_config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+    let risk_config = RiskConfig::new(dec!(10000)).unwrap();
     let engine = Engine::new(risk_config.clone());
 
     let manager = Arc::new(

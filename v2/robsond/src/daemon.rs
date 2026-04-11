@@ -141,7 +141,7 @@ impl Daemon<StubExchange, MemoryStore> {
         let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder = Self::default_query_recorder();
-        let risk_config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let risk_config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(risk_config);
 
         let position_manager = Arc::new(RwLock::new(PositionManager::new(
@@ -188,7 +188,7 @@ impl Daemon<StubExchange, MemoryStore> {
             } else {
                 Self::default_query_recorder()
             };
-        let risk_config = RiskConfig::new(dec!(10000), dec!(1)).unwrap();
+        let risk_config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(risk_config);
 
         let mut pm = PositionManager::new(

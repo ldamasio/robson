@@ -2027,7 +2027,7 @@ mod tests {
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
         let event_bus = Arc::new(EventBus::new(100));
-        let risk_config = RiskConfig::new(dec!(10000), dec!(1)).unwrap(); // 1% risk
+        let risk_config = RiskConfig::new(dec!(10000)).unwrap(); // 1% risk
         let engine = Engine::new(risk_config);
 
         Arc::new(PositionManager::with_approval_policy(
@@ -2065,7 +2065,7 @@ mod tests {
     }
 
     fn create_test_risk_config() -> RiskConfig {
-        RiskConfig::new(dec!(10000), dec!(1)).unwrap() // 1% risk
+        RiskConfig::new(dec!(10000)).unwrap() // 1% risk
     }
 
     async fn save_active_position(
