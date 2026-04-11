@@ -109,7 +109,7 @@ Status rule for this table: code-backed items may be marked done from repository
 | MIG-v2.5#8 | Deploy Prometheus + Grafana + Loki | ✅ Done (2026-04-10) — manifests+ArgoCD; pending cluster sync |
 | MIG-v2.5#9 | Contract tests for daemon API | ✅ Done (2026-04-10) — 29 tests |
 | MIG-v2.5#10 | EventLog replay determinism test | ✅ Done (2026-04-05) |
-| MIG-v3#1 | Promote robsond as primary runtime | Pending |
+| MIG-v3#1 | Promote robsond as primary runtime | ✅ Done (2026-04-10) — Django execution CronJobs suspended, robsond sole execution path |
 | MIG-v3#2 | Replace Django API with thin gateway | Pending |
 | MIG-v3#3 | Frontend direct connection to SSE | Pending |
 | MIG-v3#4 | Dynamic risk limits | Pending |
@@ -960,7 +960,7 @@ Reconsider TRON integration when ALL of these are true:
 
 | ID | Change | Replaces from v2.5 | Precondition | Effort | Reversible? | Rollback | Breaks If Done Wrong |
 |----|--------|-------------------|-------------|--------|-------------|----------|---------------------|
-| MIG-v3#1 | **Promote robsond as primary runtime** (all execution goes through daemon) | Django stop monitor CronJob | MIG-v2.5#1–#4 complete, daemon stable for >2 weeks in prod | M | Yes — rollback to legacy runtime | Suspend robsond execution path, restore legacy runtime, redirect frontend to Django API if needed | Execution path broken if daemon has undiscovered bugs |
+| MIG-v3#1 | **Promote robsond as primary runtime** (all execution goes through daemon) ✅ Done 2026-04-10 | Django stop monitor CronJob | MIG-v2.5#1–#4 complete, daemon stable for >2 weeks in prod | M | Yes — rollback to legacy runtime | Re-enable CronJobs (`suspend: false`), robsond continues running passively | Execution path broken if daemon has undiscovered bugs |
 | MIG-v3#2 | **Replace Django API with thin gateway** (FastAPI or axum) that proxies to robsond | Django REST API | MIG-v3#1, MIG-v2.5#6 | L | Partially — can re-enable Django | Redeploy Django, update ingress routing | Frontend/CLI break if gateway has bugs; both have robsond as direct fallback |
 | MIG-v3#3 | **Frontend direct connection to robsond SSE** | SSE via Django proxy | MIG-v3#2 | S | Yes — revert to Django proxy | Update frontend VITE_API_BASE_URL to Django endpoint | Frontend loses real-time if SSE path fails; graceful degradation to REST |
 | MIG-v3#4 | **Dynamic risk limits** (volatility-adjusted, funding-rate-aware) | Hard limits only | MIG-v2.5#4, market data pipeline working | M | Yes — disable dynamic, use hard limits | Config: `dynamic_limits_enabled: false` | False sense of security if dynamic computation is wrong; fallback to hard limits is safe |
