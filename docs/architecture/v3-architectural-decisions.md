@@ -353,3 +353,119 @@ See [v3-query-query-engine.md §11](v3-query-query-engine.md) for details.
 **Follow-up**: Migrate Executor persistence to emit `EventEnvelope` directly, or introduce an adapter at the Store boundary. This is a code change, not an architectural decision.
 
 See [v3-query-query-engine.md §11](v3-query-query-engine.md) for details.
+
+---
+
+### ADR-v3-017: Namespace Consolidation — robsond moves to namespace `robson`
+
+**Date**: 2026-04-11
+**Status**: DECIDED — implementation in MIG-v3#2
+
+**Context**: robsond runs in namespace `robson-v2` while the Django stack (backend, frontend, Redis, CronJobs) runs in namespace `robson`. With MIG-v3#1 complete, robsond is the sole execution authority. The Django backend is being removed (MIG-v3#2). Two namespaces for a single application increase routing complexity (cross-namespace service references in Ingress/HTTPRoute) without any remaining benefit.
+
+**Decision**: robsond deployment moves to namespace `robson`. Namespace `robson-v2` is archived and its ArgoCD Application removed.
+
+**Chose**: Single namespace (`robson`) for all Robson resources
+**Rejected**: Keep two namespaces (adds cross-namespace routing, no isolation benefit for single-operator system); Create new namespace `robson-v3` (unnecessary churn)
+
+**Rationale**:
+- Single operator, single application. Namespace isolation was a transitional safeguard during v2.5 coexistence.
+- Cross-namespace HTTPRoute/Ingress references require ExternalName Services or gateway-level workarounds.
+- ArgoCD manages one Application instead of two, reducing sync complexity.
+
+**Breaks if wrong**: If robsond needs to be isolated from frontend/Redis for security or resource reasons, re-introducing a namespace is straightforward (move manifests, update kustomization). At current scale (single replica, single operator), this is unnecessary.
+
+**Rollback**: git revert + ArgoCD sync.
+
+---
+
+### ADR-v3-018: Gateway API as sole routing layer (Traefik)
+
+**Date**: 2026-04-11
+**Status**: DECIDED — implementation in MIG-v3#2
+
+**Context**: The cluster runs both Kubernetes Ingress (`networking.k8s.io/v1`) and Gateway API HTTPRoute (`gateway.networking.k8s.io/v1`) for the same hosts. Both point to the same backends via Traefik. This duplication creates confusion about which layer is authoritative and can cause conflicting routing decisions.
+
+**Decision**: Remove all `Ingress` resources. Only `HTTPRoute` (Gateway API) remains for external routing.
+
+**Chose**: Gateway API (HTTPRoute) exclusively
+**Rejected**: Keep both layers (duplication, confusion); Ingress only (backwards-looking, no benefit)
+
+**Rationale**:
+- Gateway API is the forward-looking standard. Traefik supports it natively.
+- One routing mechanism per host eliminates ambiguity.
+- The `robson-gateway` Gateway resource already exists in the cluster.
+
+**Breaks if wrong**: If Gateway API support in Traefik has regressions, re-adding Ingress resources is a git revert. Low risk — Gateway API is stable (v1 since Kubernetes 1.28).
+
+**Rollback**: git revert + ArgoCD sync.
+
+---
+
+### ADR-v3-019: Django backend removed (not scaled to zero)
+
+**Date**: 2026-04-11
+**Status**: DECIDED — implementation in MIG-v3#2
+
+**Context**: The Django backend Deployment (`robson-backend`) has been superseded by robsond as the sole runtime (MIG-v3#1). The question is whether to scale it to zero (`replicas: 0`) or remove the manifests entirely.
+
+**Decision**: Remove the Deployment and Service manifests from git. Do not scale to zero.
+
+**Chose**: Full removal from manifests
+**Rejected**: `replicas: 0` (ambiguous state — "suspended but present" sends mixed signal about what is active)
+
+**Rationale**:
+- `replicas: 0` keeps the Deployment in desired state, suggesting it might come back. This is ambiguous after MIG-v3#1 committed to robsond as sole runtime.
+- Removal records the decision clearly in git history.
+- Rollback is a git revert — no data loss, no irreversible state change.
+- Django database tables remain untouched; only the runtime is removed.
+
+**Breaks if wrong**: If Django needs to be reactivated urgently, git revert restores manifests and ArgoCD re-deploys. The Django image and configuration remain in git history permanently.
+
+**Rollback**: git revert + ArgoCD sync.
+
+---
+
+### ADR-v3-020: Django CronJobs removed
+
+**Date**: 2026-04-11
+**Status**: DECIDED — implementation in MIG-v3#2
+
+**Context**: Three CronJobs exist in namespace `robson`:
+- `rbs-stop-monitor-cronjob` — suspended since MIG-v3#1 (2026-04-10)
+- `rbs-trailing-stop-cronjob` — suspended since MIG-v3#1 (2026-04-10)
+- `rbs-pattern-scan-cronjob` — still active, runs every 15 minutes with `BINANCE_USE_TESTNET=True`
+
+**Decision**: Remove all three CronJob manifests from git.
+
+**Chose**: Full removal
+**Rejected**: Keep suspended (ambiguous); Keep pattern-scan (testnet-only, Django ecosystem, no v3 role)
+
+**Rationale**:
+- Stop monitor and trailing stop are already replaced by robsond's WebSocket runtime.
+- Pattern scan runs against testnet and belongs to the Django pattern engine — not part of v3 scope.
+- Keeping suspended CronJobs in manifests creates noise and confusion about what is active.
+
+**Rollback**: git revert + ArgoCD sync.
+
+---
+
+### ADR-v3-021: Frontend adaptation deferred
+
+**Date**: 2026-04-11
+**Status**: DECIDED — separate work item post MIG-v3#2
+
+**Context**: The React frontend (`app.robson.rbx.ia.br`) currently calls `api.robson.rbx.ia.br` expecting the Django API contract. After MIG-v3#2, `api.robson.rbx.ia.br` will point to robsond's Axum API, which has a different (simpler) contract. The frontend will break for any endpoint not present in robsond.
+
+**Decision**: Do not modify the frontend in MIG-v3#2. Accept temporary breakage. Frontend reconnection is MIG-v3#3.
+
+**Chose**: Defer frontend changes to MIG-v3#3
+**Rejected**: Adapt frontend now (scope creep, MIG-v3#2 is infrastructure-only)
+
+**Rationale**:
+- MIG-v3#2 scope is infrastructure routing (ingress) and Django sunset.
+- Frontend changes require understanding the exact API contract differences and are a separate work item.
+- robsond's API already covers all trading endpoints. Non-trading endpoints (patterns, indicators) are deferred by design.
+- Operator has CLI as fallback for all critical operations.
+
+**Breaks if wrong**: Frontend is temporarily non-functional for trading operations. Operator uses CLI. Risk is acceptable — operator confirmed "frontend breaking is acceptable."
