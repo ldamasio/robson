@@ -469,3 +469,74 @@ See [v3-query-query-engine.md §11](v3-query-query-engine.md) for details.
 - Operator has CLI as fallback for all critical operations.
 
 **Breaks if wrong**: Frontend is temporarily non-functional for trading operations. Operator uses CLI. Risk is acceptable — operator confirmed "frontend breaking is acceptable."
+
+---
+
+### ADR-v3-022: Fixed 1% Risk Per Trade — Non-Configurable
+
+**Date**: 2026-04-11
+**Status**: DECIDED — implemented
+
+**Context**: In v2, `risk_per_trade_pct` was a configurable field in `RiskConfig`, settable via the `ArmRequest` API parameter and the `ROBSON_DEFAULT_RISK_PERCENT` environment variable. This created multiple paths to override a critical safety parameter. The operator's trading methodology prescribes exactly 1% risk per trade — no exceptions, no market-condition adjustments, no operator override.
+
+**Decision**: Risk per trade is a compile-time constant (`RiskConfig::RISK_PER_TRADE_PCT = 1`). All configuration paths are removed.
+
+**Chose**: Hard-coded constant, zero configuration surface
+**Rejected**: Configurable with default (leaves override path open); Environment variable with validation (still overridable); Per-trade parameter (highest risk — ad-hoc decisions under pressure)
+
+**Rationale**:
+- The 1% rule is the foundation of the position sizing Golden Rule: `position_size = (capital × 0.01) / stop_distance`. Making it configurable means every trade is an opportunity to deviate under emotional pressure.
+- Removing the configuration surface eliminates an entire class of operator error. The system cannot be told to risk more.
+- If the operator's methodology changes (e.g., 0.5% per trade), the constant is updated in code, reviewed, tested, and deployed — a deliberate process, not a runtime decision.
+
+**Changes made**:
+- `RiskConfig` constructor: `new(capital, risk_pct)` → `new(capital)` (field removed, constant added)
+- `ArmRequest.risk_percent` field removed from API contract
+- `ROBSON_DEFAULT_RISK_PERCENT` env var removed from `EngineConfig`
+- All callers across crates updated (domain, engine, daemon, tests)
+
+**Breaks if wrong**: If the operator needs different risk levels for different market conditions or instruments, a code change and deploy is required for each adjustment. This is intentional — the friction prevents impulsive changes.
+
+---
+
+### ADR-v3-023: Discrete Step Trailing Stop (Span / Palmo)
+
+**Date**: 2026-04-11
+**Status**: DECIDED — implemented
+
+**Context**: The v2 trailing stop was continuous: at every tick, `new_stop = favorable_extreme - tech_stop_distance`. This reacted to every micro-movement, producing frequent small stop adjustments that don't correspond to meaningful price action. The operator's methodology requires a discrete trailing stop that only moves at significant price levels — specifically, in integer multiples of the span (palmo da mão).
+
+**Decision**: The trailing stop moves only in complete span steps, anchored to entry price. The span (`abs(entry_price - technical_stop)`) is the central unit of risk, movement, and decision.
+
+**Chose**: Discrete step trailing stop with span as unit
+**Rejected**: Continuous trailing (v2 behavior — reacts to noise); Percentage-based trailing (not anchored to technical structure); ATR-based trailing (requires indicator dependency, not structural)
+
+**Algorithm** (LONG):
+```
+completed_spans = floor((peak_price - entry_price) / span)
+trailing_stop = initial_stop + completed_spans × span
+```
+
+**Algorithm** (SHORT):
+```
+completed_spans = floor((entry_price - low_price) / span)
+trailing_stop = initial_stop - completed_spans × span
+```
+
+**Key properties**:
+1. **Monotonic**: stop only moves in the favorable direction
+2. **Discrete**: stop moves only at complete span boundaries
+3. **Deterministic**: no reaction to partial movements
+4. **Anchored to entry**: steps computed from entry price, not from peak
+
+**Behavioral rule**: If price nearly hits the stop but doesn't, then recovers to entry, the system does nothing. It reacts only to complete events, never to "almost".
+
+**Changes made**:
+- `update_trailing_stop_anchored()` replaced by `update_trailing_stop_discrete()` in `trailing_stop.rs`
+- New function signature adds `entry_price` and `span` parameters
+- `TechnicalStopDistance` gains `span()` method (alias for `distance`)
+- Continuous trailing methods removed from `TechnicalStopDistance`
+- Engine integration updated to delegate to discrete function
+- All tests rewritten for discrete behavior
+
+**Breaks if wrong**: Discrete steps leave more profit on the table during sharp reversals compared to continuous trailing (the stop is always ≤1 span behind the continuous equivalent). This is accepted — the reduction in noise-induced exits outweighs the occasional missed partial-span profit.
