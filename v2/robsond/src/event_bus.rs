@@ -12,8 +12,6 @@ use robson_domain::{DetectorSignal, PositionId, Price, Symbol};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
-use crate::circuit_breaker::CircuitBreakerLevel;
-
 // =============================================================================
 // Event Types
 // =============================================================================
@@ -102,16 +100,14 @@ pub enum DaemonEvent {
         consecutive_failures: u32,
     },
 
-    /// Circuit breaker escalated to a new level.
-    CircuitBreakerTriggered {
-        level: CircuitBreakerLevel,
-        previous_level: CircuitBreakerLevel,
+    /// MonthlyHalt triggered (4% drawdown reached or operator action).
+    MonthlyHaltTriggered {
         reason: String,
         triggered_at: DateTime<Utc>,
     },
 
-    /// Circuit breaker reset to Inactive by operator.
-    CircuitBreakerReset { previous_level: CircuitBreakerLevel },
+    /// MonthlyHalt reset to Active by operator.
+    MonthlyHaltReset {},
 
     /// Shutdown signal
     Shutdown,

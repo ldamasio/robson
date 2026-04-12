@@ -56,7 +56,7 @@ mod sse;
 pub mod projection_worker;
 
 // Re-exports for convenience
-pub use circuit_breaker::{CircuitBreaker, CircuitBreakerLevel, CircuitBreakerSnapshot};
+pub use circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot};
 pub use config::{
     ApiConfig, Config, EngineConfig, Environment, PositionMonitorConfig, ProjectionConfig,
 };

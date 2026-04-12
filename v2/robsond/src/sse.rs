@@ -167,26 +167,19 @@ pub(crate) fn map_daemon_event(event: &DaemonEvent) -> Option<PublicSseEvent> {
                 "consecutive_failures": consecutive_failures,
             }),
         )),
-        DaemonEvent::CircuitBreakerTriggered {
-            level,
-            previous_level,
+        DaemonEvent::MonthlyHaltTriggered {
             reason,
             triggered_at,
         } => Some(PublicSseEvent::new(
-            "circuit_breaker.triggered",
+            "monthly_halt.triggered",
             json!({
-                // Serialize via serde (snake_case) to match the REST API contract.
-                "level": level,
-                "previous_level": previous_level,
                 "reason": reason,
                 "triggered_at": triggered_at,
             }),
         )),
-        DaemonEvent::CircuitBreakerReset { previous_level } => Some(PublicSseEvent::new(
-            "circuit_breaker.reset",
-            json!({
-                "previous_level": previous_level,
-            }),
+        DaemonEvent::MonthlyHaltReset {} => Some(PublicSseEvent::new(
+            "monthly_halt.reset",
+            json!({}),
         )),
         DaemonEvent::DetectorSignal(_)
         | DaemonEvent::MarketData(_)

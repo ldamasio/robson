@@ -91,13 +91,13 @@ pub enum DaemonError {
     #[error("EventLog error: {0}")]
     EventLog(String),
 
-    /// Circuit breaker blocked the operation (MIG-v2.5#5).
+    /// MonthlyHalt is active — all new entries blocked (v3 policy).
     ///
-    /// Returned when `arm_position` or `handle_signal` is called while the
-    /// circuit breaker is at SoftHalt (new entries blocked) or HardHalt (all
-    /// trading blocked). Operator must reset the circuit breaker to resume.
-    #[error("Circuit breaker at {level}: {reason}")]
-    CircuitBreakerTripped { level: String, reason: String },
+    /// Returned when `arm_position`, `handle_signal`, or `approve_query` is
+    /// called while the system is in MonthlyHalt (4% monthly drawdown reached).
+    /// MonthlyHalt persists until next calendar month or operator acknowledgment.
+    #[error("MonthlyHalt active: {reason}")]
+    MonthlyHaltActive { reason: String },
 
     /// Shutdown requested
     #[error("Shutdown requested")]

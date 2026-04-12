@@ -33,7 +33,7 @@ use robson_domain::{
 use robson_exec::ExchangePort;
 use robson_store::Store;
 
-use crate::circuit_breaker::{CircuitBreaker, CircuitBreakerLevel, CircuitBreakerSnapshot};
+use crate::circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot};
 use crate::error::DaemonError;
 use crate::event_bus::{DaemonEvent, EventBus};
 use crate::position_manager::PositionManager;
@@ -164,14 +164,13 @@ pub struct ApproveQueryResponse {
     pub state: String,
 }
 
-/// Circuit breaker status response — returned by GET, escalate, and reset endpoints.
+/// MonthlyHalt status response — returned by GET and trigger endpoints.
 ///
-/// `level` serializes as snake_case via `#[serde(rename_all = "snake_case")]` on
-/// `CircuitBreakerLevel`: `"inactive"`, `"warning"`, `"soft_halt"`, `"hard_halt"`.
+/// `state` serializes as snake_case: `"active"` | `"monthly_halt"`.
 #[derive(Debug, Serialize, Deserialize)]
-pub struct CircuitBreakerStatusResponse {
-    /// Current level (snake_case: "inactive" | "warning" | "soft_halt" | "hard_halt").
-    pub level: CircuitBreakerLevel,
+pub struct MonthlyHaltStatusResponse {
+    /// Current state (snake_case: "active" | "monthly_halt").
+    pub state: HaltState,
     pub description: &'static str,
     pub reason: Option<String>,
     pub triggered_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -179,10 +178,10 @@ pub struct CircuitBreakerStatusResponse {
     pub blocks_signals: bool,
 }
 
-impl From<CircuitBreakerSnapshot> for CircuitBreakerStatusResponse {
-    fn from(s: CircuitBreakerSnapshot) -> Self {
+impl From<MonthlyHaltSnapshot> for MonthlyHaltStatusResponse {
+    fn from(s: MonthlyHaltSnapshot) -> Self {
         Self {
-            level: s.level,
+            state: s.state,
             description: s.description,
             reason: s.reason,
             triggered_at: s.triggered_at,
@@ -192,10 +191,10 @@ impl From<CircuitBreakerSnapshot> for CircuitBreakerStatusResponse {
     }
 }
 
-/// Request body for `POST /circuit-breaker/escalate`.
+/// Request body for `POST /monthly-halt` (conservative operator trigger).
 #[derive(Debug, Deserialize)]
-pub struct EscalateRequest {
-    /// Human-readable reason for the escalation.
+pub struct MonthlyHaltTriggerRequest {
+    /// Human-readable reason for triggering MonthlyHalt.
     pub reason: String,
 }
 
@@ -301,10 +300,9 @@ where
         // Safety net endpoints
         .route("/safety/status", get(safety_status_handler))
         .route("/safety/test", get(safety_test_handler))
-        // Circuit breaker endpoints (MIG-v2.5#5)
-        .route("/circuit-breaker", get(circuit_breaker_status_handler))
-        .route("/circuit-breaker/escalate", post(circuit_breaker_escalate_handler))
-        .route("/circuit-breaker/reset", post(circuit_breaker_reset_handler))
+        // MonthlyHalt endpoints (v3 policy: binary halt at 4% monthly drawdown)
+        .route("/monthly-halt", get(monthly_halt_status_handler))
+        .route("/monthly-halt", post(monthly_halt_trigger_handler))
         .with_state(state)
 }
 
@@ -768,13 +766,13 @@ where
 // =============================================================================
 // Helpers
 // =============================================================================
-// Circuit Breaker handlers (MIG-v2.5#5)
+// MonthlyHalt handlers (v3 policy)
 // =============================================================================
 
-/// GET /circuit-breaker — current circuit breaker status.
-async fn circuit_breaker_status_handler<E, S>(
+/// GET /monthly-halt — current MonthlyHalt status.
+async fn monthly_halt_status_handler<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
-) -> Json<CircuitBreakerStatusResponse>
+) -> Json<MonthlyHaltStatusResponse>
 where
     E: ExchangePort + 'static,
     S: Store + 'static,
@@ -783,49 +781,29 @@ where
     Json(snap.into())
 }
 
-/// POST /circuit-breaker/escalate — operator-initiated escalation to HardHalt.
+/// POST /monthly-halt — operator-initiated conservative MonthlyHalt trigger.
 ///
-/// Idempotent: if already at HardHalt, returns current status without mutating state
-/// or emitting an event.
-async fn circuit_breaker_escalate_handler<E, S>(
+/// Idempotent: if already in MonthlyHalt, returns current status without mutating
+/// state or emitting an event. Closes all open positions on transition.
+///
+/// Note: there is no reset endpoint. MonthlyHalt persists until next calendar
+/// month. Allowing a reset without explicit policy evidence is not permitted.
+async fn monthly_halt_trigger_handler<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
-    Json(req): Json<EscalateRequest>,
-) -> Json<CircuitBreakerStatusResponse>
+    Json(req): Json<MonthlyHaltTriggerRequest>,
+) -> Result<Json<MonthlyHaltStatusResponse>, (StatusCode, Json<ErrorResponse>)>
 where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
-    if let Some(previous) = state.circuit_breaker.escalate_to_hard_halt(req.reason.clone()).await {
-        let snap = state.circuit_breaker.snapshot().await;
-        state.event_bus.send(DaemonEvent::CircuitBreakerTriggered {
-            level: CircuitBreakerLevel::HardHalt,
-            previous_level: previous,
-            reason: req.reason,
-            triggered_at: snap.triggered_at.unwrap_or_else(chrono::Utc::now),
-        });
-    }
-    let snap = state.circuit_breaker.snapshot().await;
-    Json(snap.into())
-}
+    let manager = state.position_manager.write().await;
+    manager
+        .trigger_monthly_halt(req.reason)
+        .await
+        .map_err(|e| to_error_response(e))?;
 
-/// POST /circuit-breaker/reset — operator reset to Inactive.
-///
-/// Idempotent: if already Inactive, returns current status without mutating state
-/// or emitting an event.
-async fn circuit_breaker_reset_handler<E, S>(
-    State(state): State<Arc<ApiState<E, S>>>,
-) -> Json<CircuitBreakerStatusResponse>
-where
-    E: ExchangePort + 'static,
-    S: Store + 'static,
-{
-    if let Some(previous) = state.circuit_breaker.reset().await {
-        state
-            .event_bus
-            .send(DaemonEvent::CircuitBreakerReset { previous_level: previous });
-    }
     let snap = state.circuit_breaker.snapshot().await;
-    Json(snap.into())
+    Ok(Json(snap.into()))
 }
 
 // =============================================================================
@@ -837,7 +815,7 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
         DaemonError::InvalidPositionState { .. } => StatusCode::CONFLICT,
         DaemonError::ApprovalExpired(_) => StatusCode::GONE,
         DaemonError::ApprovalDenied { .. } => StatusCode::CONFLICT,
-        DaemonError::CircuitBreakerTripped { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        DaemonError::MonthlyHaltActive { .. } => StatusCode::SERVICE_UNAVAILABLE,
         DaemonError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::BAD_REQUEST,
     };

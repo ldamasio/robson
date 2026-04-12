@@ -124,6 +124,14 @@ impl<S: Store + 'static> PositionRepository for StorePositionRepositoryAdapter<S
     async fn delete(&self, id: PositionId) -> Result<(), StoreError> {
         self.store.positions().delete(id).await
     }
+
+    async fn find_closed_in_month(
+        &self,
+        year: i32,
+        month: u32,
+    ) -> Result<Vec<Position>, StoreError> {
+        self.store.positions().find_closed_in_month(year, month).await
+    }
 }
 
 impl Daemon<StubExchange, MemoryStore> {
@@ -755,20 +763,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                 );
             },
 
-            DaemonEvent::CircuitBreakerTriggered { level, previous_level, reason, .. } => {
+            DaemonEvent::MonthlyHaltTriggered { reason, .. } => {
                 warn!(
-                    level = %level,
-                    previous_level = %previous_level,
                     %reason,
-                    "Circuit breaker escalated"
+                    "MonthlyHalt triggered"
                 );
             },
 
-            DaemonEvent::CircuitBreakerReset { previous_level } => {
-                info!(
-                    previous_level = %previous_level,
-                    "Circuit breaker reset to Inactive"
-                );
+            DaemonEvent::MonthlyHaltReset {} => {
+                info!("MonthlyHalt reset to Active");
             },
         }
 
