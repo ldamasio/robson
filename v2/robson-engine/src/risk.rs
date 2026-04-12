@@ -384,7 +384,7 @@ impl RiskGate {
         let monthly_pnl = context.total_monthly_pnl();
         let monthly_loss_limit =
             context.capital * self.limits.max_monthly_drawdown_pct / Decimal::from(100);
-        if monthly_pnl < -monthly_loss_limit {
+        if monthly_pnl <= -monthly_loss_limit {
             debug!(
                 monthly_pnl = %monthly_pnl,
                 limit = %monthly_loss_limit,
@@ -641,6 +641,47 @@ mod tests {
 
         let verdict = gate.evaluate(&proposed, &context);
         assert_eq!(verdict, RiskVerdict::Approved);
+    }
+
+    #[test]
+    fn test_risk_gate_allows_at_399_pct_monthly_drawdown() {
+        let gate = RiskGate::new();
+        let context = RiskContext {
+            capital: dec!(10000),
+            open_positions: vec![],
+            total_notional_exposure: Decimal::ZERO,
+            daily_realized_pnl: dec!(0),
+            daily_unrealized_pnl: dec!(0),
+            // -399 is 3.99% of 10000 — just below the 4% threshold
+            monthly_realized_pnl: dec!(-399),
+            monthly_unrealized_pnl: dec!(0),
+        };
+        let proposed = sample_proposed();
+
+        let verdict = gate.evaluate(&proposed, &context);
+        assert_eq!(verdict, RiskVerdict::Approved, "3.99% monthly loss must be allowed");
+    }
+
+    #[test]
+    fn test_risk_gate_blocks_at_exactly_4_pct_monthly_drawdown() {
+        let gate = RiskGate::new();
+        let context = RiskContext {
+            capital: dec!(10000),
+            open_positions: vec![],
+            total_notional_exposure: Decimal::ZERO,
+            daily_realized_pnl: dec!(0),
+            daily_unrealized_pnl: dec!(0),
+            // -400 is exactly 4.00% of 10000 — must be blocked
+            monthly_realized_pnl: dec!(-400),
+            monthly_unrealized_pnl: dec!(0),
+        };
+        let proposed = sample_proposed();
+
+        let verdict = gate.evaluate(&proposed, &context);
+        assert!(
+            matches!(verdict, RiskVerdict::Rejected { check: RiskCheck::MonthlyDrawdown, .. }),
+            "exactly 4.00% monthly loss must be blocked"
+        );
     }
 
     #[test]
