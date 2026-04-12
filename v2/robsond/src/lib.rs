@@ -39,6 +39,7 @@
 #![warn(clippy::all)]
 
 pub mod api;
+pub mod binance_exchange;
 pub mod circuit_breaker;
 pub mod config;
 pub mod daemon;
@@ -56,6 +57,7 @@ mod sse;
 pub mod projection_worker;
 
 // Re-exports for convenience
+pub use binance_exchange::BinanceExchangeAdapter;
 pub use circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot};
 pub use config::{
     ApiConfig, Config, EngineConfig, Environment, PositionMonitorConfig, ProjectionConfig,

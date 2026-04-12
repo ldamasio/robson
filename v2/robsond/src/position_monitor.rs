@@ -660,7 +660,7 @@ impl PositionMonitor {
             // Place market order
             let result = self
                 .binance_client
-                .place_market_order(&symbol.as_pair(), exit_side, quantity.as_decimal())
+                .place_market_order(&symbol.as_pair(), exit_side, quantity.as_decimal(), None)
                 .await;
 
             match result {
@@ -839,7 +839,7 @@ impl PositionMonitor {
         // Place market order
         let order_result = self
             .binance_client
-            .place_market_order(&position.symbol, exit_side, position.quantity.as_decimal())
+            .place_market_order(&position.symbol, exit_side, position.quantity.as_decimal(), None)
             .await;
 
         match order_result {

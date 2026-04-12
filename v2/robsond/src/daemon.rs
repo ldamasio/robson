@@ -33,6 +33,8 @@ use robson_connectors::BinanceRestClient;
 use robson_domain::{Position, PositionId, Symbol};
 use robson_engine::Engine;
 use robson_exec::{ExchangePort, Executor, IntentJournal, StubExchange};
+
+use crate::binance_exchange::BinanceExchangeAdapter;
 #[cfg(feature = "postgres")]
 use robson_store::PgDetectedPositionRepository;
 use robson_store::{
@@ -86,6 +88,11 @@ pub struct Daemon<E: ExchangePort + 'static, S: Store + 'static> {
     pg_pool: Option<Arc<sqlx::PgPool>>,
 }
 
+/// Default query recorder (tracing only, no persistence).
+fn default_query_recorder() -> Arc<dyn QueryRecorder> {
+    Arc::new(TracingQueryRecorder)
+}
+
 /// Adapts a generic `Store` into a concrete `PositionRepository` trait object.
 struct StorePositionRepositoryAdapter<S: Store + 'static> {
     store: Arc<S>,
@@ -135,10 +142,6 @@ impl<S: Store + 'static> PositionRepository for StorePositionRepositoryAdapter<S
 }
 
 impl Daemon<StubExchange, MemoryStore> {
-    fn default_query_recorder() -> Arc<dyn QueryRecorder> {
-        Arc::new(TracingQueryRecorder)
-    }
-
     /// Create a new daemon with stub components (for testing/development).
     pub fn new_stub(config: Config) -> Self {
         use robson_domain::RiskConfig;
@@ -148,7 +151,7 @@ impl Daemon<StubExchange, MemoryStore> {
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
         let event_bus = Arc::new(EventBus::new(1000));
-        let query_recorder = Self::default_query_recorder();
+        let query_recorder = default_query_recorder();
         let risk_config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(risk_config);
 
@@ -194,7 +197,7 @@ impl Daemon<StubExchange, MemoryStore> {
                     config.projection.stream_key.clone(),
                 ))
             } else {
-                Self::default_query_recorder()
+                default_query_recorder()
             };
         let risk_config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(risk_config);
@@ -218,6 +221,41 @@ impl Daemon<StubExchange, MemoryStore> {
             store,
             projection_recovery,
             pg_pool,
+        }
+    }
+}
+
+impl Daemon<BinanceExchangeAdapter, MemoryStore> {
+    /// Create a daemon with Binance exchange adapter (for production).
+    pub fn new_binance(config: Config, client: Arc<BinanceRestClient>) -> Self {
+        use robson_domain::RiskConfig;
+
+        let exchange = Arc::new(BinanceExchangeAdapter::new(client));
+        let journal = Arc::new(IntentJournal::new());
+        let store = Arc::new(MemoryStore::new());
+        let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+        let event_bus = Arc::new(EventBus::new(1000));
+        let query_recorder = default_query_recorder();
+        let risk_config = RiskConfig::new(dec!(10000)).unwrap();
+        let engine = Engine::new(risk_config);
+
+        let position_manager = Arc::new(RwLock::new(PositionManager::new(
+            engine,
+            executor,
+            store.clone(),
+            event_bus.clone(),
+            query_recorder,
+        )));
+
+        Self {
+            config,
+            position_manager,
+            event_bus,
+            store,
+            #[cfg(feature = "postgres")]
+            projection_recovery: None,
+            #[cfg(feature = "postgres")]
+            pg_pool: None,
         }
     }
 }

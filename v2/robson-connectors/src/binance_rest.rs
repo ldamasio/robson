@@ -256,9 +256,36 @@ impl BinanceRestClient {
         Ok(body)
     }
 
-    // =========================================================================
-    // Isolated Margin Account API
-    // =========================================================================
+    /// Send a DELETE request to a signed endpoint.
+    async fn delete_signed(
+        &self,
+        endpoint: &str,
+        params: Vec<(&str, String)>,
+    ) -> Result<String, BinanceRestError> {
+        let query = self.build_signed_query(params)?;
+        let url = format!("{}{}?{}", self.base_url(), endpoint, query);
+
+        let response = timeout(
+            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            self.client.delete(&url).header("X-MBX-APIKEY", &self.api_key).send(),
+        )
+        .await
+        .map_err(|_| BinanceRestError::Timeout)?
+        .map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
+
+        let status = response.status();
+        let body =
+            response.text().await.map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+
+        if !status.is_success() {
+            if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
+                return Err(BinanceRestError::ApiError { code: err.code, msg: err.msg });
+            }
+            return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
+        }
+
+        Ok(body)
+    }
 
     /// Get isolated margin account information for a symbol.
     ///
@@ -354,6 +381,7 @@ impl BinanceRestClient {
     /// * `symbol` - Trading pair symbol (e.g., "BTCUSDT")
     /// * `side` - Order side (BUY or SELL)
     /// * `quantity` - Order quantity
+    /// * `client_order_id` - Optional client order ID for idempotency
     ///
     /// # Endpoint
     ///
@@ -362,7 +390,7 @@ impl BinanceRestClient {
     /// # Example
     ///
     /// ```ignore
-    /// let order = client.place_market_order("BTCUSDT", Side::Sell, dec!(0.1)).await?;
+    /// let order = client.place_market_order("BTCUSDT", Side::Sell, dec!(0.1), None).await?;
     /// println!("Order ID: {}", order.order_id);
     /// ```
     pub async fn place_market_order(
@@ -370,18 +398,24 @@ impl BinanceRestClient {
         symbol: &str,
         side: Side,
         quantity: Decimal,
+        client_order_id: Option<&str>,
     ) -> Result<BinanceOrderResponse, BinanceRestError> {
         let side_str = match side {
             Side::Long => "BUY",
             Side::Short => "SELL",
         };
 
-        let params = vec![
+        let mut params = vec![
             ("symbol", symbol.to_string()),
             ("side", side_str.to_string()),
             ("type", "MARKET".to_string()),
             ("quantity", quantity.to_string()),
+            ("isIsolated", "true".to_string()),
         ];
+
+        if let Some(coid) = client_order_id {
+            params.push(("newClientOrderId", coid.to_string()));
+        }
 
         let body = self.post_signed("/sapi/v1/margin/order", params).await?;
 
@@ -397,9 +431,10 @@ impl BinanceRestClient {
         let params = vec![
             ("symbol", symbol.to_string()),
             ("orderId", order_id.to_string()),
+            ("isIsolated", "true".to_string()),
         ];
 
-        let body = self.post_signed("/sapi/v1/margin/order", params).await?;
+        let body = self.delete_signed("/sapi/v1/margin/order", params).await?;
 
         serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
     }
@@ -530,7 +565,7 @@ pub struct BinanceOrderResponse {
     /// Order ID
     pub order_id: u64,
     /// Client order ID
-    pub client_order_id: u64,
+    pub client_order_id: String,
     /// Transaction time
     pub transact_time: i64,
     /// Price
@@ -548,6 +583,23 @@ pub struct BinanceOrderResponse {
     /// Type
     #[serde(rename = "type")]
     pub order_type: String,
+    /// Individual fills (present in margin market order responses)
+    #[serde(default)]
+    pub fills: Vec<BinanceFill>,
+}
+
+/// Individual fill from a Binance order response.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceFill {
+    /// Fill price
+    pub price: Decimal,
+    /// Fill quantity
+    pub qty: Decimal,
+    /// Commission amount
+    pub commission: Decimal,
+    /// Commission asset
+    pub commission_asset: String,
 }
 
 /// Price ticker response.
