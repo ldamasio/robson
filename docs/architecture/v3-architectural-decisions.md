@@ -540,3 +540,41 @@ trailing_stop = initial_stop - completed_spans × span
 - All tests rewritten for discrete behavior
 
 **Breaks if wrong**: Discrete steps leave more profit on the table during sharp reversals compared to continuous trailing (the stop is always ≤1 span behind the continuous equivalent). This is accepted — the reduction in noise-induced exits outweighs the occasional missed partial-span profit.
+
+---
+
+### ADR-v3-024: PnL Model — Canonical Definition
+
+**Date**: 2026-04-12
+**Status**: DECIDED — documentation alignment (no code change)
+
+**Context**: The system accumulated implicit assumptions about PnL. `realized_pnl` was used in the monthly drawdown trigger without documenting whether fees were included. `unrealized_pnl` pricing source (tick vs. exchange mark price) was unspecified. The daily loss circuit breaker existed in `RiskGate` but was silently disabled due to missing data, without explicit documentation. These gaps created a mismatch between what the spec claimed and what the code did.
+
+**Decision**: Formalize the canonical PnL model with explicit component definitions, formula, source of truth, and current implementation state.
+
+**Canonical formula**:
+```
+MonthlyPnL = Σ(realized_pnl_gross) - Σ(fees_paid) + unrealized_pnl
+```
+
+**Component definitions**:
+
+| Component | Definition | Source | Current state |
+|---|---|---|---|
+| `realized_pnl_gross` | Gross P&L of a closed position: `(exit_price − entry_price) × quantity`, signed by side. Does NOT include fees. | `Event::PositionClosed { realized_pnl }` → `Position.realized_pnl` | Implemented |
+| `fees_paid` | Commissions paid (entry + exit). Does NOT include funding rates. | `Event::PositionClosed { total_fees }` → `Position.fees_paid` | Tracked but not subtracted in monthly PnL |
+| `unrealized_pnl` | Mark-to-market of open Active positions using last received tick price. NOT exchange mark price. | `Position::calculate_pnl()` with `current_price` | Implemented (approximation) |
+| Daily PnL | Realized + unrealized PnL within the current calendar day. | Not aggregated | **Not implemented** — always zero |
+| Funding rates | Costs from perpetual contract funding. | Not captured | Not tracked |
+
+**Source of truth**: Exchange (Binance) is the primary financial authority. Robson maintains a local projection derived from events. This projection is not continuously reconciled against the exchange. Divergence sources: slippage not captured, fees partially modeled (no funding), fill prices approximated from ticks rather than confirmed fills.
+
+Robson's PnL model is authoritative for **risk gate decisions only**. It is not authoritative for accounting or tax reporting.
+
+**Chose**: Explicit canonical formula with gross/net/unrealized separation. Exchange as source of truth. Documented gaps rather than implicit behavior.
+
+**Rejected**: Continuing with implicit behavior (current state before this ADR) — implicit assumptions about fees and pricing source make correctness analysis impossible.
+
+**Known gap — fees deduction not implemented**: `build_risk_context()` uses `realized_pnl_gross` only. `fees_paid` is NOT subtracted in the monthly PnL calculation. This means MonthlyHalt triggers on gross drawdown, not net drawdown. At 1% risk per trade with typical 0.04% commission (entry + exit × 10x leverage ≈ 0.8% per cycle in fees), fees are material and can cause real drawdown to exceed 4% before MonthlyHalt fires. This must be corrected before live capital management.
+
+**Breaks if wrong**: If fees are material and not deducted, the system may allow more capital loss than the 4% policy intends. Conversely, if fees are double-counted in a future correction, MonthlyHalt could trigger prematurely. Fix must be validated with real exchange data.

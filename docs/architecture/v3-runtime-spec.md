@@ -181,6 +181,10 @@ pub struct RuntimeState {
     pub cycle_count: u64,
 }
 
+// PnL fields follow the canonical model defined in v3-risk-engine-spec.md § PnL Model.
+// monthly_drawdown_pct = (realized_pnl_gross - fees_paid + unrealized_pnl) / capital
+// daily_pnl_pct = (daily_realized_pnl_gross - daily_fees + daily_unrealized_pnl) / capital
+// NOTE: daily_pnl_pct is NOT YET IMPLEMENTED — always zero in current code.
 pub struct RiskSnapshot {
     pub total_exposure_pct: Decimal,
     pub daily_pnl_pct: Decimal,
@@ -191,15 +195,10 @@ pub struct RiskSnapshot {
 }
 
 pub enum CircuitBreakerState {
-    Closed,
-    Open {
-        level: CircuitBreakerLevel,  // L1, L2, L3, L4
+    Active,
+    MonthlyHalt {
         triggered_at: DateTime<Utc>,
         trigger_reason: String,
-        escalation_deadline: Option<DateTime<Utc>>,
-    },
-    HalfOpen {
-        since: DateTime<Utc>,
     },
 }
 ```
@@ -373,12 +372,9 @@ max_slippage_pct = 5
 risk_engine_timeout_ms = 200
 
 [circuit_breaker]
-l1_trigger_daily_loss_pct = 2
-l2_trigger_daily_loss_pct = 3
-l3_trigger_daily_loss_pct = 4
-l1_to_l2_escalation_minutes = 30
-l2_to_l3_escalation_minutes = 15
-operator_unreachable_escalation_minutes = 45
+# v3: binary MonthlyHalt — no escalation ladder
+# 4% monthly drawdown → MonthlyHalt (close all, block new entries)
+# No automatic reset. No Warning/SoftHalt/HardHalt levels.
 
 [execution]
 retry_attempts = 3

@@ -33,13 +33,28 @@ These decisions are final for v3. No alternatives, no overrides, no flexibility.
   - System enters `MonthlyHalt` state.
 - No gradual escalation (no L1/L2/L3/L4).
 - No dynamic adjustment based on market conditions.
-- Resume: next calendar month or manual operator reset.
+- Resume: not implemented. MonthlyHalt persists until process restart. Calendar-month boundary auto-reset is follow-up work, not a current feature.
+
+**Trigger condition**: `MonthlyPnL ≤ −(capital × 0.04)`
+
+Where `MonthlyPnL` is defined in the **PnL Model** section of this document.
+
+**Current approximation**: The trigger uses `realized_pnl_gross` without
+subtracting fees. This understates losses — real drawdown may reach 4% before
+the trigger fires when fees are material. See "PnL Model — Current Implementation
+State".
 
 ### 3. Daily Loss Limit: 3%
 
 - Maximum daily loss: **3% of capital**.
 - When reached: block new entries for the remainder of the day.
 - Existing positions continue to be managed (trailing stop still active).
+
+> **NOT IMPLEMENTED**: Daily PnL aggregation is deferred.
+> `build_risk_context()` passes `Decimal::ZERO` for both `daily_realized_pnl`
+> and `daily_unrealized_pnl`. The `RiskGate` check exists in code but is
+> effectively disabled — it never triggers because the input is always zero.
+> See "Follow-up Required" table.
 
 ---
 
@@ -144,6 +159,62 @@ GovernedAction          RiskDenied Event
 
 ---
 
+## PnL Model
+
+Defines how financial performance is measured and fed into risk decisions.
+
+### Canonical Formula
+
+```
+MonthlyPnL = Σ(realized_pnl_gross) - Σ(fees_paid) + unrealized_pnl
+```
+
+### Component Definitions
+
+**`realized_pnl_gross`** — Gross P&L of a closed position.
+- Formula: `(exit_price − entry_price) × quantity`, signed by side (positive for profit).
+- Source: `Event::PositionClosed { realized_pnl }` → stored in `Position.realized_pnl`.
+- **Does not include fees.** Fees are in the separate `total_fees` / `fees_paid` fields.
+
+**`fees_paid`** — Commissions incurred by a position.
+- Source: `Event::PositionClosed { total_fees }` → stored in `Position.fees_paid`.
+- Includes: entry commission, exit commission.
+- Does not include: funding rates (not tracked in v3).
+- Tracked separately from `realized_pnl_gross`.
+
+**`unrealized_pnl`** — Mark-to-market P&L of currently open Active positions.
+- Computed by `Position::calculate_pnl()` using `current_price` (last received tick).
+- `current_price` is the last WebSocket tick recorded by the position.
+- **Not exchange mark price.** Exchange mark price is not fetched. In high-volatility
+  conditions, last tick price may deviate from exchange mark price. This is a known
+  approximation.
+- Entering positions contribute `Decimal::ZERO` unrealized PnL (order not filled yet).
+
+### Source of Truth
+
+The **exchange (Binance)** is the primary source of financial truth.
+
+Robson maintains a **local projection** derived from events. This projection:
+- Is not continuously reconciled against the exchange.
+- May diverge from exchange-reported P&L due to: slippage not captured, fees
+  partially modeled (no funding rates), fill prices approximated from ticks.
+
+Robson's PnL model is authoritative for **risk gate decisions**. It is not
+authoritative for accounting or tax reporting.
+
+### Current Implementation State
+
+| Component | Status | Notes |
+|---|---|---|
+| `realized_pnl_gross` | Implemented | Gross only. Fees excluded. Source: `find_closed_in_month()`. |
+| `fees_paid` (commissions) | Tracked | Stored in `Position.fees_paid`. Not yet subtracted in monthly PnL calculation. |
+| Monthly net PnL (`gross − fees`) | **Not implemented** | `build_risk_context()` uses `realized_pnl_gross` only. `fees_paid` is not subtracted. MonthlyHalt trigger underestimates real losses. |
+| `unrealized_pnl` (Active positions) | Implemented | Uses last tick price via `calculate_pnl()`. Not exchange mark price. |
+| Daily PnL (realized + unrealized) | **Not implemented** | Always `Decimal::ZERO`. Daily loss limit check exists in `RiskGate` but never triggers. |
+| Funding rates | Not tracked | Not captured anywhere in the current system. |
+
+---
+
 ## Risk Limits
 
 ### Hard Limits (non-overridable)
@@ -201,5 +272,18 @@ Priorities:
 | Risk per trade | `v2/robson-domain/src/value_objects.rs` | `RiskConfig::RISK_PER_TRADE_PCT = 1` |
 | Position sizing | `v2/robson-domain/src/entities.rs` | `calculate_position_size()` |
 | Trailing stop | `v2/robson-engine/src/trailing_stop.rs` | `update_trailing_stop_discrete()` |
-| Risk gate | `v2/robson-engine/src/risk.rs` | `RiskGate::evaluate()` with monthly check |
+| Risk gate | `v2/robson-engine/src/risk.rs` | `RiskGate::evaluate()` — monthly check uses `<=` (blocks at exactly 4.00%) |
+| MonthlyHalt gate | `v2/robsond/src/circuit_breaker.rs` | Binary `Active | MonthlyHalt` state machine |
+| MonthlyHalt trigger | `v2/robsond/src/position_manager.rs` | `trigger_monthly_halt()` — closes all positions, blocks new entries |
 | Span definition | `v2/robson-domain/src/value_objects.rs` | `TechnicalStopDistance::span()` |
+
+## Follow-up Required
+
+| Gap | Status | Impact |
+|-----|--------|--------|
+| Monthly PnL — gross aggregation | Implemented | `build_risk_context()` sums `realized_pnl_gross` from `find_closed_in_month()` and `calculate_pnl()` from Active positions. `evaluate_monthly_halt()` auto-triggers MonthlyHalt when threshold crossed. |
+| Monthly PnL — fees deduction | **Not implemented** | `fees_paid` is tracked per position but not subtracted. MonthlyHalt trigger uses gross PnL, understating real losses by the fee amount. |
+| Daily PnL aggregation | **Not implemented** | `build_risk_context()` always passes `Decimal::ZERO` for `daily_realized_pnl` and `daily_unrealized_pnl`. The 3% daily loss limit check in `RiskGate` exists but never triggers. |
+| Unrealized PnL — exchange mark price | Not implemented | `unrealized_pnl` uses last tick price, not exchange mark price. Known approximation. |
+| Entering position cancel on halt | Not implemented | `trigger_monthly_halt()` cannot cancel pending entry orders on exchange. Entering positions remain until fill or exchange session expiry. |
+| MonthlyHalt auto-reset | Not implemented | No calendar-month boundary detection. MonthlyHalt persists until process restart. |
