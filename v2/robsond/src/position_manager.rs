@@ -740,6 +740,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         %position_id,
                         exchange_order_id = %order.exchange_order_id,
                         fill_price = %order.fill_price.as_decimal(),
+                        fee = %order.fee,
                         "Entry order placed and filled"
                     );
 
@@ -748,6 +749,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                             position_id,
                             order.fill_price,
                             order.filled_quantity,
+                            order.fee,
+                            order.filled_at,
                             Some(order.exchange_order_id),
                         )
                         .await
@@ -1632,6 +1635,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         position_id: PositionId,
         fill_price: Price,
         filled_quantity: Quantity,
+        fee: Decimal,
+        filled_at: chrono::DateTime<chrono::Utc>,
         binance_position_id: Option<String>,
     ) -> DaemonResult<()> {
         // Load position
@@ -1648,6 +1653,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             &position,
             fill_price,
             filled_quantity,
+            fee,
+            filled_at,
             binance_position_id.clone(),
         )?;
 
@@ -1794,7 +1801,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     // Note: handle_exit_fill is internal, covered by this query's lifecycle
                     // Note: ExitOrderPlaced event already persisted by execute_and_persist()
                     if let Err(e) = self
-                        .handle_exit_fill(position.id, order.fill_price, order.filled_quantity)
+                        .handle_exit_fill(
+                            position.id,
+                            order.fill_price,
+                            order.filled_quantity,
+                            order.fee,
+                            order.filled_at,
+                        )
                         .await
                     {
                         let err_str = format!("{}", e);
@@ -1826,6 +1839,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         position_id: PositionId,
         fill_price: Price,
         _filled_quantity: Quantity,
+        exit_fee: Decimal,
+        filled_at: chrono::DateTime<chrono::Utc>,
     ) -> DaemonResult<()> {
         let position = self
             .store
@@ -1870,14 +1885,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         // Emit PositionClosed event via executor (ensures append->apply order)
         // Also persists to eventlog for crash recovery (MIG-v2.5#2).
+        let total_fees = position.fees_paid + exit_fee;
         let event = Event::PositionClosed {
             position_id,
             exit_reason,
             entry_price,
             exit_price: fill_price,
             realized_pnl: pnl,
-            total_fees: position.fees_paid,
-            timestamp: chrono::Utc::now(),
+            total_fees,
+            timestamp: filled_at,
         };
         self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await?;
 
@@ -1886,7 +1902,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             position_id,
             previous_state: "Exiting".to_string(),
             new_state: "Closed".to_string(),
-            timestamp: chrono::Utc::now(),
+            timestamp: filled_at,
         });
         self.event_bus.send(DaemonEvent::CorePositionClosed {
             position_id,
@@ -2059,15 +2075,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             }])
             .await?;
 
-        // Extract actual fill price from exchange result
-        let fill_price = match results.into_iter().find_map(|r| {
+        // Extract actual fill details from exchange result
+        let (fill_price, exit_fee, filled_at) = match results.into_iter().find_map(|r| {
             if let ActionResult::OrderPlaced { order, .. } = r {
-                Some(order.fill_price)
+                Some((order.fill_price, order.fee, order.filled_at))
             } else {
                 None
             }
         }) {
-            Some(price) => price,
+            Some(details) => details,
             None => {
                 return Err(DaemonError::Exec(ExecError::InvalidState(
                     "Panic close: PlaceExitOrder did not return OrderPlaced".to_string(),

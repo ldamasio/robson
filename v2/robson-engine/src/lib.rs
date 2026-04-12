@@ -375,6 +375,8 @@ impl Engine {
     /// * `position` - The entering position (must be in Entering state)
     /// * `fill_price` - Actual fill price from exchange
     /// * `filled_quantity` - Actual filled quantity
+    /// * `fee` - Trading fee paid (from OrderResult)
+    /// * `filled_at` - When the fill occurred (from exchange, not local clock)
     /// * `binance_position_id` - Optional Binance isolated margin position ID
     ///
     /// # Returns
@@ -392,6 +394,8 @@ impl Engine {
         position: &Position,
         fill_price: Price,
         filled_quantity: Quantity,
+        fee: rust_decimal::Decimal,
+        filled_at: DateTime<Utc>,
         binance_position_id: Option<String>,
     ) -> Result<EngineDecision, EngineError> {
         // 1. Validate position is Entering
@@ -433,14 +437,15 @@ impl Engine {
             current_price: fill_price,
             trailing_stop: initial_trailing_stop,
             favorable_extreme: fill_price,
-            extreme_at: Utc::now(),
+            extreme_at: filled_at,
             insurance_stop_id: None, // No insurance stop (Robson manages exits)
             last_emitted_stop: None, // No stop emitted yet
         };
         updated_position.entry_price = Some(fill_price);
         updated_position.quantity = filled_quantity;
-        updated_position.entry_filled_at = Some(Utc::now());
-        updated_position.updated_at = Utc::now();
+        updated_position.fees_paid = fee;
+        updated_position.entry_filled_at = Some(filled_at);
+        updated_position.updated_at = filled_at;
 
         // 5. Build actions (emit event)
         let actions = vec![EngineAction::EmitEvent(Event::EntryFilled {
@@ -448,10 +453,10 @@ impl Engine {
             order_id: entry_order_id,
             fill_price,
             filled_quantity,
-            fee: rust_decimal::Decimal::ZERO, // Will be updated by executor
+            fee,
             initial_stop: initial_trailing_stop,
             binance_position_id,
-            timestamp: Utc::now(),
+            timestamp: filled_at,
         })];
 
         Ok(EngineDecision::with_position(actions, updated_position))

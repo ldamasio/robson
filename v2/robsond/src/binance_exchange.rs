@@ -106,10 +106,42 @@ impl ExchangePort for BinanceExchangeAdapter {
             .await
             .map_err(Self::map_error)?;
 
+        // Reject ambiguous order statuses that do not represent a clean fill.
+        // Market orders are expected to fill immediately; anything else is an
+        // anomaly that the caller must handle explicitly.
+        match response.status.as_str() {
+            "FILLED" => {},
+            "PARTIALLY_FILLED" | "EXPIRED" | "CANCELED" | "REJECTED" => {
+                return Err(ExecError::Exchange(format!(
+                    "Order {} returned status '{}' — not a clean fill (order_id={})",
+                    client_order_id, response.status, response.order_id
+                )));
+            },
+            _ => {
+                return Err(ExecError::Exchange(format!(
+                    "Order {} returned unexpected status '{}' (order_id={})",
+                    client_order_id, response.status, response.order_id
+                )));
+            },
+        }
+
+        // A real execution happened on Binance. From this point on we must
+        // construct OrderResult robustly — an internal validation failure
+        // after real execution would create an unrecoverable Binance/system
+        // state divergence.
+
+        let executed_qty = response.executed_qty;
+        if executed_qty <= Decimal::ZERO {
+            return Err(ExecError::Exchange(format!(
+                "Order {} reports FILLED but executed_qty={} — inconsistent response (order_id={})",
+                client_order_id, executed_qty, response.order_id
+            )));
+        }
+
         // Extract fill information.
         // Priority 1: fills[] (most accurate — VWAP price, actual commission)
         // Priority 2: fallback to executedQty + cummulativeQuoteQty
-        let (fill_price, filled_quantity, fee, fee_asset) = if !response.fills.is_empty() {
+        let (fill_price, fee, fee_asset) = if !response.fills.is_empty() {
             let total_quote: Decimal = response.fills.iter().map(|f| f.price * f.qty).sum();
             let total_qty: Decimal = response.fills.iter().map(|f| f.qty).sum();
             let total_fee: Decimal = response.fills.iter().map(|f| f.commission).sum();
@@ -119,36 +151,66 @@ impl ExchangePort for BinanceExchangeAdapter {
                 .map(|f| f.commission_asset.clone())
                 .unwrap_or_else(|| "USDT".to_string());
 
+            // fills[] is present but total_qty could be zero in degenerate
+            // edge cases. Fallback to executed_qty to avoid division by zero.
             let vwap_price = if total_qty > Decimal::ZERO {
                 total_quote / total_qty
             } else {
-                response.price
+                // executed_qty > 0 is verified above; derive from cumulative.
+                if response.cummulative_quote_qty > Decimal::ZERO {
+                    response.cummulative_quote_qty / executed_qty
+                } else {
+                    // Should not happen for FILLED with executed_qty > 0.
+                    // Log warning but proceed — the execution is real.
+                    tracing::warn!(
+                        order_id = %response.order_id,
+                        executed_qty = %executed_qty,
+                        "FILLS present but no usable price source — using executed_qty to indicate issue"
+                    );
+                    return Err(ExecError::Exchange(format!(
+                        "Cannot determine fill price for order {} (fills empty, cummulativeQuoteQty=0)",
+                        response.order_id
+                    )));
+                }
             };
 
-            (vwap_price, total_qty, total_fee, fee_asset)
+            (vwap_price, total_fee, fee_asset)
         } else {
-            // Fallback: derive price from executed quantities
-            let fill_price = if response.executed_qty > Decimal::ZERO {
-                response.cummulative_quote_qty / response.executed_qty
+            // No fills array — derive price from cumulative quantities.
+            let fill_price = if response.cummulative_quote_qty > Decimal::ZERO {
+                response.cummulative_quote_qty / executed_qty
             } else {
-                response.price
+                // executed_qty > 0 but no quote qty — cannot derive price.
+                return Err(ExecError::Exchange(format!(
+                    "Cannot determine fill price for order {} (no fills, cummulativeQuoteQty=0)",
+                    response.order_id
+                )));
             };
 
             // No commission data available — estimate 0.1% (conservative upper bound)
             let estimated_fee = response.cummulative_quote_qty * Decimal::new(1, 3);
 
-            (fill_price, response.executed_qty, estimated_fee, "USDT".to_string())
+            (fill_price, estimated_fee, "USDT".to_string())
         };
 
+        // Parse Binance transact time. Log a clear warning on parse failure
+        // and use Utc::now as fallback — the fill is real regardless.
         let filled_at = chrono::DateTime::from_timestamp_millis(response.transact_time)
-            .unwrap_or_else(Utc::now);
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    order_id = %response.order_id,
+                    transact_time = response.transact_time,
+                    "Invalid transact_time from Binance — using local clock as fallback"
+                );
+                Utc::now()
+            });
 
         Ok(OrderResult {
             exchange_order_id: response.order_id.to_string(),
             client_order_id: response.client_order_id,
             fill_price: Price::new(fill_price)
                 .map_err(|e| ExecError::Exchange(format!("Invalid fill price: {}", e)))?,
-            filled_quantity: Quantity::new(filled_quantity)
+            filled_quantity: Quantity::new(executed_qty)
                 .map_err(|e| ExecError::Exchange(format!("Invalid filled quantity: {}", e)))?,
             fee,
             fee_asset,

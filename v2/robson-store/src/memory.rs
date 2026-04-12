@@ -123,6 +123,7 @@ impl MemoryStore {
                 order_id,
                 fill_price,
                 filled_quantity,
+                fee,
                 initial_stop,
                 binance_position_id,
                 timestamp,
@@ -133,6 +134,7 @@ impl MemoryStore {
                     position.entry_price = Some(*fill_price);
                     position.entry_filled_at = Some(*timestamp);
                     position.quantity = *filled_quantity;
+                    position.fees_paid = *fee;
                     position.entry_order_id = Some(*order_id);
                     if binance_position_id.is_some() {
                         position.binance_position_id = binance_position_id.clone();
@@ -200,6 +202,7 @@ impl MemoryStore {
                 exit_price,
                 exit_reason,
                 realized_pnl,
+                total_fees,
                 timestamp,
                 ..
             } => {
@@ -211,6 +214,7 @@ impl MemoryStore {
                         exit_reason: *exit_reason,
                     };
                     position.realized_pnl = *realized_pnl;
+                    position.fees_paid = *total_fees;
                     position.closed_at = Some(*timestamp);
                     position.updated_at = chrono::Utc::now();
                     positions.insert(*position_id, position);
