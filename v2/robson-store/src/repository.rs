@@ -68,6 +68,16 @@ pub trait PositionRepository: Send + Sync {
 
     /// Delete a position (soft delete - marks as closed)
     async fn delete(&self, id: PositionId) -> Result<(), StoreError>;
+
+    /// Find positions closed in a given month.
+    ///
+    /// Returns positions with `closed_at` in the specified year/month that
+    /// are in `Closed` state. Used to compute monthly realized PnL.
+    async fn find_closed_in_month(
+        &self,
+        year: i32,
+        month: u32,
+    ) -> Result<Vec<Position>, StoreError>;
 }
 
 /// Repository for Order entities

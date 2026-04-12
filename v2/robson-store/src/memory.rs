@@ -6,6 +6,7 @@
 use crate::error::StoreError;
 use crate::repository::{EventRepository, OrderRepository, PositionRepository, Store};
 use async_trait::async_trait;
+use chrono::Datelike;
 use robson_domain::{Event, Order, OrderId, OrderStatus, Position, PositionId};
 use std::collections::HashMap;
 use std::sync::RwLock;
@@ -340,6 +341,24 @@ impl PositionRepository for MemoryStore {
         } else {
             Err(StoreError::not_found("position", id.to_string()))
         }
+    }
+
+    async fn find_closed_in_month(
+        &self,
+        year: i32,
+        month: u32,
+    ) -> Result<Vec<Position>, StoreError> {
+        let positions = self.positions.read().unwrap();
+        Ok(positions
+            .values()
+            .filter(|p| {
+                matches!(p.state, robson_domain::PositionState::Closed { .. })
+                    && p.closed_at
+                        .map(|t| t.year() == year && t.month() == month)
+                        .unwrap_or(false)
+            })
+            .cloned()
+            .collect())
     }
 }
 
