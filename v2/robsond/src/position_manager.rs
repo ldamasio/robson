@@ -508,7 +508,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Monthly realized PnL: sum realized_pnl from all positions closed in the current month.
         let now = chrono::Utc::now();
         let monthly_closed = self.store.positions().find_closed_in_month(now.year(), now.month()).await?;
-        let monthly_realized_pnl: Decimal = monthly_closed.iter().map(|p| p.realized_pnl).sum();
+        let monthly_realized_pnl: Decimal = monthly_closed.iter().map(|p| p.realized_pnl - p.fees_paid).sum();
 
         // Monthly unrealized PnL: sum unrealized PnL from currently open Active positions.
         let monthly_unrealized_pnl: Decimal = active_positions
@@ -1087,7 +1087,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 return false;
             },
         };
-        let monthly_realized_pnl: Decimal = monthly_closed.iter().map(|p| p.realized_pnl).sum();
+        let monthly_realized_pnl: Decimal = monthly_closed.iter().map(|p| p.realized_pnl - p.fees_paid).sum();
 
         // Monthly unrealized PnL from open Active positions
         let active_positions = match self.store.positions().find_risk_open().await {
@@ -3540,5 +3540,63 @@ mod tests {
             },
             other => panic!("expected Closed state, got {:?}", other),
         }
+    }
+
+    // =========================================================================
+    // Fees deduction in monthly PnL
+    // =========================================================================
+
+    /// Helper: save a closed position with realized PnL and fees in the current month.
+    async fn save_closed_position_with_pnl_and_fees(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        realized_pnl: Decimal,
+        fees_paid: Decimal,
+    ) -> Position {
+        let account_id = Uuid::now_v7();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(95000)).unwrap();
+        let exit = Price::new(dec!(95000) + realized_pnl).unwrap();
+        let now = chrono::Utc::now();
+
+        let mut position = Position::new(account_id, symbol, Side::Long);
+        position.entry_price = Some(entry);
+        position.quantity = Quantity::new(dec!(0.1)).unwrap();
+        position.realized_pnl = realized_pnl;
+        position.fees_paid = fees_paid;
+        position.closed_at = Some(now);
+        position.updated_at = now;
+        position.state = PositionState::Closed {
+            exit_price: exit,
+            realized_pnl,
+            exit_reason: robson_domain::ExitReason::TrailingStop,
+        };
+
+        manager.store.positions().save(&position).await.unwrap();
+        position
+    }
+
+    #[tokio::test]
+    async fn test_build_risk_context_deducts_fees_from_monthly_realized_pnl() {
+        let manager = create_test_manager().await;
+        // Position closed with realized_pnl = -300, fees_paid = 50
+        // Net = -300 - 50 = -350
+        save_closed_position_with_pnl_and_fees(&manager, dec!(-300), dec!(50)).await;
+
+        let ctx = manager.build_risk_context().await.unwrap();
+
+        assert_eq!(ctx.monthly_realized_pnl, dec!(-350), "monthly_realized_pnl must deduct fees");
+        assert_eq!(ctx.monthly_unrealized_pnl, dec!(0), "no open positions, unrealized must be zero");
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_monthly_halt_accounts_for_fees() {
+        let manager = create_test_manager().await;
+        // Capital = 10_000, 4% limit = -400
+        // realized_pnl = -350, fees_paid = 50 → net = -400 → triggers MonthlyHalt
+        save_closed_position_with_pnl_and_fees(&manager, dec!(-350), dec!(50)).await;
+
+        let triggered = manager.evaluate_monthly_halt().await;
+        assert!(triggered, "net -400 (PnL -350, fees -50) must trigger MonthlyHalt");
+        assert!(manager.circuit_breaker.blocks_new_entries().await);
     }
 }
