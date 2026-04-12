@@ -693,10 +693,6 @@ The Control Loop stages map directly to QueryEngine processing:
   enforcing the governance rule within the crate. Type-level enforcement across the crate boundary
   is explicitly deferred as a follow-up architectural concern.
 
-**QE-P2 limitation**: Daily PnL (daily_realized_pnl, daily_unrealized_pnl) in `RiskContext` defaults
-to zero. The daily loss circuit breaker (`DailyLossLimit` check in RiskGate) is therefore not active.
-Proper PnL tracking in the store is deferred to a follow-up task.
-
 **Depends on**: QE-P1 complete
 
 ### QE-P3: Approval Gates (v3) — IMPLEMENTED 2026-04-05

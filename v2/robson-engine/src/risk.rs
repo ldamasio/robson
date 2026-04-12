@@ -9,7 +9,7 @@
 //! 2. Total exposure (aggregate notional) within limit
 //! 3. Single position concentration within limit
 //! 4. No duplicate position on same symbol+side
-//! 5. Daily loss circuit breaker not triggered
+//! 5. Monthly drawdown not exceeded (v3: 4% → MonthlyHalt)
 //!
 //! # Design
 //!
@@ -42,10 +42,6 @@ pub struct RiskLimits {
     /// Default: 15% (prevents concentration risk)
     pub max_single_position_pct: Decimal,
 
-    /// Daily loss limit as percentage of capital (circuit breaker)
-    /// Default: 3% (at 1% risk per trade, 3 consecutive losses hit this)
-    pub daily_loss_limit_pct: Decimal,
-
     /// Monthly drawdown limit as percentage of capital (v3 policy)
     /// Default: 4% — when reached, system enters MonthlyHalt:
     /// close all positions, block new entries, halt until next month.
@@ -58,7 +54,6 @@ impl Default for RiskLimits {
             max_open_positions: 3,
             max_total_exposure_pct: Decimal::from(30),
             max_single_position_pct: Decimal::from(15),
-            daily_loss_limit_pct: Decimal::from(3),
             max_monthly_drawdown_pct: Decimal::from(4),
         }
     }
@@ -70,13 +65,11 @@ impl RiskLimits {
         max_open_positions: usize,
         max_total_exposure_pct: Decimal,
         max_single_position_pct: Decimal,
-        daily_loss_limit_pct: Decimal,
     ) -> Self {
         Self {
             max_open_positions,
             max_total_exposure_pct,
             max_single_position_pct,
-            daily_loss_limit_pct,
             max_monthly_drawdown_pct: Decimal::from(4), // v3 policy: 4% fixed
         }
     }
@@ -115,10 +108,6 @@ pub struct RiskContext {
     pub open_positions: Vec<PositionSummary>,
     /// Total notional exposure across all positions
     pub total_notional_exposure: Decimal,
-    /// Daily realized PnL
-    pub daily_realized_pnl: Decimal,
-    /// Daily unrealized PnL
-    pub daily_unrealized_pnl: Decimal,
     /// Monthly realized PnL (v3 policy: halt at -4%)
     pub monthly_realized_pnl: Decimal,
     /// Monthly unrealized PnL
@@ -132,8 +121,6 @@ impl RiskContext {
             capital,
             open_positions: vec![],
             total_notional_exposure: Decimal::ZERO,
-            daily_realized_pnl: Decimal::ZERO,
-            daily_unrealized_pnl: Decimal::ZERO,
             monthly_realized_pnl: Decimal::ZERO,
             monthly_unrealized_pnl: Decimal::ZERO,
         }
@@ -143,8 +130,6 @@ impl RiskContext {
     pub fn with_positions(
         capital: Decimal,
         open_positions: Vec<PositionSummary>,
-        daily_realized_pnl: Decimal,
-        daily_unrealized_pnl: Decimal,
     ) -> Self {
         let total_notional_exposure = open_positions.iter().map(|p| p.notional_value).sum();
 
@@ -152,8 +137,6 @@ impl RiskContext {
             capital,
             open_positions,
             total_notional_exposure,
-            daily_realized_pnl,
-            daily_unrealized_pnl,
             monthly_realized_pnl: Decimal::ZERO,
             monthly_unrealized_pnl: Decimal::ZERO,
         }
@@ -163,8 +146,6 @@ impl RiskContext {
     pub fn with_monthly_pnl(
         capital: Decimal,
         open_positions: Vec<PositionSummary>,
-        daily_realized_pnl: Decimal,
-        daily_unrealized_pnl: Decimal,
         monthly_realized_pnl: Decimal,
         monthly_unrealized_pnl: Decimal,
     ) -> Self {
@@ -174,8 +155,6 @@ impl RiskContext {
             capital,
             open_positions,
             total_notional_exposure,
-            daily_realized_pnl,
-            daily_unrealized_pnl,
             monthly_realized_pnl,
             monthly_unrealized_pnl,
         }
@@ -184,11 +163,6 @@ impl RiskContext {
     /// Count open positions
     pub fn open_position_count(&self) -> usize {
         self.open_positions.len()
-    }
-
-    /// Calculate total daily PnL (realized + unrealized)
-    pub fn total_daily_pnl(&self) -> Decimal {
-        self.daily_realized_pnl + self.daily_unrealized_pnl
     }
 
     /// Calculate total monthly PnL (realized + unrealized)
@@ -238,8 +212,6 @@ pub enum RiskCheck {
     SinglePositionConcentration,
     /// Not enough margin available
     InsufficientMargin,
-    /// Daily loss limit exceeded
-    DailyLossLimit,
     /// Monthly drawdown limit exceeded (v3: 4% → MonthlyHalt)
     MonthlyDrawdown,
     /// Already have position on same symbol+side
@@ -254,7 +226,6 @@ impl RiskCheck {
             RiskCheck::TotalExposure => "total_exposure",
             RiskCheck::SinglePositionConcentration => "single_position_concentration",
             RiskCheck::InsufficientMargin => "insufficient_margin",
-            RiskCheck::DailyLossLimit => "daily_loss_limit",
             RiskCheck::MonthlyDrawdown => "monthly_drawdown",
             RiskCheck::DuplicatePosition => "duplicate_position",
         }
@@ -399,26 +370,7 @@ impl RiskGate {
             };
         }
 
-        // 6. Check daily loss circuit breaker
-        let daily_pnl = context.total_daily_pnl();
-        let daily_loss_limit =
-            context.capital * self.limits.daily_loss_limit_pct / Decimal::from(100);
-        if daily_pnl < -daily_loss_limit {
-            debug!(
-                daily_pnl = %daily_pnl,
-                limit = %daily_loss_limit,
-                "Risk check failed: daily loss limit"
-            );
-            return RiskVerdict::Rejected {
-                check: RiskCheck::DailyLossLimit,
-                reason: format!(
-                    "Daily P&L {} has exceeded loss limit of -{}",
-                    daily_pnl, daily_loss_limit
-                ),
-            };
-        }
-
-        // 7. Check margin availability (optional - exchange will also validate)
+        // 6. Check margin availability (optional - exchange will also validate)
         // Note: This is a pre-check; exchange will do final validation
         // For now, we rely on exchange validation for margin
 
@@ -489,8 +441,6 @@ mod tests {
                 };
                 3
             ],
-            dec!(0),
-            dec!(0),
         );
         let proposed = sample_proposed();
 
@@ -514,8 +464,6 @@ mod tests {
                 margin_used: dec!(290),
                 unrealized_pnl: dec!(0),
             }],
-            dec!(0),
-            dec!(0),
         );
         // 2900 + 5000 = 7900 > 3000 (30% of 10000)
         let proposed = ProposedTrade {
@@ -568,8 +516,6 @@ mod tests {
                 margin_used: dec!(100),
                 unrealized_pnl: dec!(0),
             }],
-            dec!(0),
-            dec!(0),
         );
         let proposed = sample_proposed(); // BTCUSDT long
 
@@ -581,36 +527,12 @@ mod tests {
     }
 
     #[test]
-    fn test_risk_gate_rejects_daily_loss_limit() {
-        let gate = RiskGate::new();
-        let context = RiskContext {
-            capital: dec!(10000),
-            open_positions: vec![],
-            total_notional_exposure: Decimal::ZERO,
-            daily_realized_pnl: dec!(-250),
-            daily_unrealized_pnl: dec!(-100),
-            monthly_realized_pnl: dec!(0),
-            monthly_unrealized_pnl: dec!(0),
-        };
-        // -350 < -300 (3% of 10000)
-        let proposed = sample_proposed();
-
-        let verdict = gate.evaluate(&proposed, &context);
-        assert!(matches!(
-            verdict,
-            RiskVerdict::Rejected { check: RiskCheck::DailyLossLimit, .. }
-        ));
-    }
-
-    #[test]
     fn test_risk_gate_rejects_monthly_drawdown() {
         let gate = RiskGate::new();
         let context = RiskContext {
             capital: dec!(10000),
             open_positions: vec![],
             total_notional_exposure: Decimal::ZERO,
-            daily_realized_pnl: dec!(-100),
-            daily_unrealized_pnl: dec!(0),
             monthly_realized_pnl: dec!(-350),
             monthly_unrealized_pnl: dec!(-100),
         };
@@ -631,8 +553,6 @@ mod tests {
             capital: dec!(10000),
             open_positions: vec![],
             total_notional_exposure: Decimal::ZERO,
-            daily_realized_pnl: dec!(0),
-            daily_unrealized_pnl: dec!(0),
             monthly_realized_pnl: dec!(-300),
             monthly_unrealized_pnl: dec!(0),
         };
@@ -650,8 +570,6 @@ mod tests {
             capital: dec!(10000),
             open_positions: vec![],
             total_notional_exposure: Decimal::ZERO,
-            daily_realized_pnl: dec!(0),
-            daily_unrealized_pnl: dec!(0),
             // -399 is 3.99% of 10000 — just below the 4% threshold
             monthly_realized_pnl: dec!(-399),
             monthly_unrealized_pnl: dec!(0),
@@ -669,8 +587,6 @@ mod tests {
             capital: dec!(10000),
             open_positions: vec![],
             total_notional_exposure: Decimal::ZERO,
-            daily_realized_pnl: dec!(0),
-            daily_unrealized_pnl: dec!(0),
             // -400 is exactly 4.00% of 10000 — must be blocked
             monthly_realized_pnl: dec!(-400),
             monthly_unrealized_pnl: dec!(0),
@@ -697,8 +613,6 @@ mod tests {
                 margin_used: dec!(100),
                 unrealized_pnl: dec!(0),
             }],
-            dec!(0),
-            dec!(0),
         );
         let proposed = sample_proposed(); // BTCUSDT long
 

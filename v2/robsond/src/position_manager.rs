@@ -457,11 +457,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// concurrent entries from slipping under the exposure limits during the
     /// order-fill window (signal fires → order submitted → not yet filled →
     /// next signal arrives).
-    ///
-    /// Phase 2 limitation: daily PnL (realized + unrealized) is not yet tracked
-    /// in the store. Both fields default to zero, which means the daily loss
-    /// circuit breaker is effectively disabled. Proper PnL tracking is deferred
-    /// to a follow-up task.
     async fn build_risk_context(&self) -> DaemonResult<RiskContext> {
         let capital = self.engine.risk_config().capital();
         let active_positions = self.store.positions().find_risk_open().await?;
@@ -522,8 +517,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         Ok(RiskContext::with_monthly_pnl(
             capital,
             summaries,
-            Decimal::ZERO, // daily_realized_pnl: deferred — daily aggregation not yet implemented
-            Decimal::ZERO, // daily_unrealized_pnl: deferred
             monthly_realized_pnl,
             monthly_unrealized_pnl,
         ))

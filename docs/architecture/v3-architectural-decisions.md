@@ -562,9 +562,8 @@ MonthlyPnL = Σ(realized_pnl_gross) - Σ(fees_paid) + unrealized_pnl
 | Component | Definition | Source | Current state |
 |---|---|---|---|
 | `realized_pnl_gross` | Gross P&L of a closed position: `(exit_price − entry_price) × quantity`, signed by side. Does NOT include fees. | `Event::PositionClosed { realized_pnl }` → `Position.realized_pnl` | Implemented |
-| `fees_paid` | Commissions paid (entry + exit). Does NOT include funding rates. | `Event::PositionClosed { total_fees }` → `Position.fees_paid` | Tracked but not subtracted in monthly PnL |
+| `fees_paid` | Commissions paid (entry + exit). Does NOT include funding rates. | `Event::PositionClosed { total_fees }` → `Position.fees_paid` | Implemented — subtracted in `build_risk_context()` |
 | `unrealized_pnl` | Mark-to-market of open Active positions using last received tick price. NOT exchange mark price. | `Position::calculate_pnl()` with `current_price` | Implemented (approximation) |
-| Daily PnL | Realized + unrealized PnL within the current calendar day. | Not aggregated | **Not implemented** — always zero |
 | Funding rates | Costs from perpetual contract funding. | Not captured | Not tracked |
 
 **Source of truth**: Exchange (Binance) is the primary financial authority. Robson maintains a local projection derived from events. This projection is not continuously reconciled against the exchange. Divergence sources: slippage not captured, fees partially modeled (no funding), fill prices approximated from ticks rather than confirmed fills.
@@ -575,6 +574,6 @@ Robson's PnL model is authoritative for **risk gate decisions only**. It is not 
 
 **Rejected**: Continuing with implicit behavior (current state before this ADR) — implicit assumptions about fees and pricing source make correctness analysis impossible.
 
-**Known gap — fees deduction not implemented**: `build_risk_context()` uses `realized_pnl_gross` only. `fees_paid` is NOT subtracted in the monthly PnL calculation. This means MonthlyHalt triggers on gross drawdown, not net drawdown. At 1% risk per trade with typical 0.04% commission (entry + exit × 10x leverage ≈ 0.8% per cycle in fees), fees are material and can cause real drawdown to exceed 4% before MonthlyHalt fires. This must be corrected before live capital management.
+**Fees deduction**: `build_risk_context()` sums `realized_pnl - fees_paid` from closed positions. MonthlyHalt triggers on net PnL (gross minus fees). At 1% risk per trade with typical 0.04% commission (entry + exit × 10x leverage ≈ 0.8% per cycle in fees), fees are material and correctly accounted for in the drawdown calculation.
 
 **Breaks if wrong**: If fees are material and not deducted, the system may allow more capital loss than the 4% policy intends. Conversely, if fees are double-counted in a future correction, MonthlyHalt could trigger prematurely. Fix must be validated with real exchange data.

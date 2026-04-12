@@ -39,22 +39,8 @@ These decisions are final for v3. No alternatives, no overrides, no flexibility.
 
 Where `MonthlyPnL` is defined in the **PnL Model** section of this document.
 
-**Current approximation**: The trigger uses `realized_pnl_gross` without
-subtracting fees. This understates losses — real drawdown may reach 4% before
-the trigger fires when fees are material. See "PnL Model — Current Implementation
-State".
-
-### 3. Daily Loss Limit: 3%
-
-- Maximum daily loss: **3% of capital**.
-- When reached: block new entries for the remainder of the day.
-- Existing positions continue to be managed (trailing stop still active).
-
-> **NOT IMPLEMENTED**: Daily PnL aggregation is deferred.
-> `build_risk_context()` passes `Decimal::ZERO` for both `daily_realized_pnl`
-> and `daily_unrealized_pnl`. The `RiskGate` check exists in code but is
-> effectively disabled — it never triggers because the input is always zero.
-> See "Follow-up Required" table.
+**Current approximation**: The trigger uses `realized_pnl_gross − fees_paid`.
+See "PnL Model — Current Implementation State".
 
 ---
 
@@ -142,7 +128,6 @@ The system reacts only to complete events. It does not react to "almost".
           │  RISK ENGINE   │
           │                │
           │  Monthly Check │──── 4% drawdown → MonthlyHalt
-          │  Daily Check   │──── 3% daily loss → Block new entries
           │  Position Check│──── Max positions, exposure, concentration
           │  Verdict        │
           └───────┬────────┘
@@ -207,10 +192,9 @@ authoritative for accounting or tax reporting.
 | Component | Status | Notes |
 |---|---|---|
 | `realized_pnl_gross` | Implemented | Gross only. Fees excluded. Source: `find_closed_in_month()`. |
-| `fees_paid` (commissions) | Tracked | Stored in `Position.fees_paid`. Not yet subtracted in monthly PnL calculation. |
-| Monthly net PnL (`gross − fees`) | **Not implemented** | `build_risk_context()` uses `realized_pnl_gross` only. `fees_paid` is not subtracted. MonthlyHalt trigger underestimates real losses. |
+| `fees_paid` (commissions) | Implemented — `p.realized_pnl - p.fees_paid` | Stored in `Position.fees_paid`. Subtracted in `build_risk_context()` monthly PnL calculation. |
+| Monthly net PnL (`gross − fees`) | Implemented | `build_risk_context()` sums `realized_pnl - fees_paid` from closed positions. |
 | `unrealized_pnl` (Active positions) | Implemented | Uses last tick price via `calculate_pnl()`. Not exchange mark price. |
-| Daily PnL (realized + unrealized) | **Not implemented** | Always `Decimal::ZERO`. Daily loss limit check exists in `RiskGate` but never triggers. |
 | Funding rates | Not tracked | Not captured anywhere in the current system. |
 
 ---
@@ -223,7 +207,6 @@ authoritative for accounting or tax reporting.
 |-------|-------|----------|
 | Risk per trade | 1% of capital | NO |
 | Max monthly drawdown | 4% of capital | NO |
-| Max daily loss | 3% of capital | NO |
 
 ### Soft Limits (existing from v2, not expanded in v3)
 
@@ -281,9 +264,8 @@ Priorities:
 
 | Gap | Status | Impact |
 |-----|--------|--------|
-| Monthly PnL — gross aggregation | Implemented | `build_risk_context()` sums `realized_pnl_gross` from `find_closed_in_month()` and `calculate_pnl()` from Active positions. `evaluate_monthly_halt()` auto-triggers MonthlyHalt when threshold crossed. |
-| Monthly PnL — fees deduction | **Not implemented** | `fees_paid` is tracked per position but not subtracted. MonthlyHalt trigger uses gross PnL, understating real losses by the fee amount. |
-| Daily PnL aggregation | **Not implemented** | `build_risk_context()` always passes `Decimal::ZERO` for `daily_realized_pnl` and `daily_unrealized_pnl`. The 3% daily loss limit check in `RiskGate` exists but never triggers. |
+| Monthly PnL — gross aggregation | Implemented | `build_risk_context()` sums `realized_pnl_gross - fees_paid` from `find_closed_in_month()` and `calculate_pnl()` from Active positions. `evaluate_monthly_halt()` auto-triggers MonthlyHalt when threshold crossed. |
+| Monthly PnL — fees deduction | Implemented | `fees_paid` is tracked per position and subtracted: `p.realized_pnl - p.fees_paid`. MonthlyHalt triggers on net PnL. |
 | Unrealized PnL — exchange mark price | Not implemented | `unrealized_pnl` uses last tick price, not exchange mark price. Known approximation. |
 | Entering position cancel on halt | Not implemented | `trigger_monthly_halt()` cannot cancel pending entry orders on exchange. Entering positions remain until fill or exchange session expiry. |
 | MonthlyHalt auto-reset | Not implemented | No calendar-month boundary detection. MonthlyHalt persists until process restart. |

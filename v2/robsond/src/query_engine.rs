@@ -741,8 +741,6 @@ mod tests {
                 };
                 3
             ],
-            Decimal::ZERO,
-            Decimal::ZERO,
         )
     }
 

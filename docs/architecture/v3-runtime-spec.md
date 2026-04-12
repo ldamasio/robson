@@ -183,8 +183,6 @@ pub struct RuntimeState {
 
 // PnL fields follow the canonical model defined in v3-risk-engine-spec.md § PnL Model.
 // monthly_drawdown_pct = (realized_pnl_gross - fees_paid + unrealized_pnl) / capital
-// daily_pnl_pct = (daily_realized_pnl_gross - daily_fees + daily_unrealized_pnl) / capital
-// NOTE: daily_pnl_pct is NOT YET IMPLEMENTED — always zero in current code.
 pub struct RiskSnapshot {
     pub total_exposure_pct: Decimal,
     pub daily_pnl_pct: Decimal,
