@@ -1861,9 +1861,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             "Exit filled, emitting PositionClosed event"
         );
 
-        // Calculate PnL for event
-        let entry_price = position.entry_price.unwrap_or(fill_price);
-        let pnl = position.calculate_pnl();
+        // Calculate PnL for event using actual fill price.
+        // calculate_pnl() returns ZERO for Exiting state — direct calc instead.
+        let entry_price = position.entry_price.ok_or_else(|| {
+            DaemonError::InvalidPositionState {
+                expected: "Exiting with entry_price set".to_string(),
+                actual: format!("Exiting with entry_price=None for position {}", position_id),
+            }
+        })?;
+        let qty = position.quantity.as_decimal();
+        let pnl = match position.side {
+            Side::Long => (fill_price.as_decimal() - entry_price.as_decimal()) * qty,
+            Side::Short => (entry_price.as_decimal() - fill_price.as_decimal()) * qty,
+        };
 
         // Emit PositionClosed event via executor (ensures append->apply order)
         // Also persists to eventlog for crash recovery (MIG-v2.5#2).
@@ -2072,9 +2082,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             },
         };
 
-        // Calculate PnL with actual fill price
-        let entry_price = position.entry_price.unwrap_or(fill_price);
-        let pnl = position.calculate_pnl();
+        // Calculate PnL from actual fill price (not current_price via calculate_pnl).
+        // Direct calc avoids implicit current_price and guarantees fill_price is used.
+        let entry_price = position.entry_price.ok_or_else(|| {
+            DaemonError::InvalidPositionState {
+                expected: "Active/Exiting with entry_price set".to_string(),
+                actual: format!("entry_price=None for position {}", position_id),
+            }
+        })?;
+        let qty = position.quantity.as_decimal();
+        let pnl = match position.side {
+            Side::Long => (fill_price.as_decimal() - entry_price.as_decimal()) * qty,
+            Side::Short => (entry_price.as_decimal() - fill_price.as_decimal()) * qty,
+        };
 
         // Emit PositionClosed with actual fill price (Exiting → Closed)
         let event = Event::PositionClosed {
@@ -3327,5 +3347,198 @@ mod tests {
             active_count, 0,
             "approve_query monthly drawdown path must close Active positions"
         );
+    }
+
+    // =========================================================================
+    // handle_exit_fill realized PnL tests
+    // =========================================================================
+
+    /// Verify that handle_exit_fill computes realized PnL directly from
+    /// (fill_price − entry_price) × qty, NOT via calculate_pnl() which returns
+    /// ZERO for the Exiting state.
+    ///
+    /// Setup: manually place a Long position in Exiting state with known
+    /// entry_price and quantity, then call handle_exit_fill with a fill_price
+    /// below entry → expected negative realized PnL.
+    #[tokio::test]
+    async fn test_handle_exit_fill_records_negative_realized_pnl() {
+        let manager = create_test_manager().await;
+
+        let account_id = Uuid::now_v7();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry_price = Price::new(dec!(95000)).unwrap();
+        let fill_price = Price::new(dec!(90000)).unwrap(); // $5_000 below entry
+        let quantity = Quantity::new(dec!(0.1)).unwrap();
+
+        // Build position in Exiting state (as if exit order was placed)
+        let mut position = Position::new(account_id, symbol.clone(), Side::Long);
+        position.entry_price = Some(entry_price);
+        position.quantity = quantity;
+        position.state = PositionState::Exiting {
+            exit_order_id: Uuid::now_v7(),
+            exit_reason: robson_domain::ExitReason::TrailingStop,
+        };
+        position.updated_at = chrono::Utc::now();
+        manager.store.positions().save(&position).await.unwrap();
+
+        // Call handle_exit_fill — must compute realized PnL directly
+        let result = manager
+            .handle_exit_fill(position.id, fill_price, quantity)
+            .await;
+        assert!(result.is_ok(), "handle_exit_fill failed: {:?}", result.err());
+
+        // Reload and verify the closed position has correct negative realized PnL
+        let closed = manager
+            .store
+            .positions()
+            .find_by_id(position.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Expected: (90000 - 95000) * 0.1 = -500
+        let expected_pnl = (fill_price.as_decimal() - entry_price.as_decimal()) * quantity.as_decimal();
+        assert_eq!(
+            closed.realized_pnl, expected_pnl,
+            "realized_pnl must be {} (got {}) — direct calc, not calculate_pnl()",
+            expected_pnl, closed.realized_pnl
+        );
+        assert!(
+            closed.realized_pnl < Decimal::ZERO,
+            "realized_pnl must be negative for Long position closing below entry"
+        );
+
+        // Verify Closed state carries the same PnL
+        match closed.state {
+            PositionState::Closed { realized_pnl, exit_price, .. } => {
+                assert_eq!(realized_pnl, expected_pnl, "Closed.realized_pnl must match");
+                assert_eq!(exit_price, fill_price, "Closed.exit_price must be fill_price");
+            },
+            other => panic!("expected Closed state, got {:?}", other),
+        }
+    }
+
+    /// handle_exit_fill must return an error when entry_price is None
+    /// instead of silently falling back to fill_price.
+    #[tokio::test]
+    async fn test_handle_exit_fill_rejects_missing_entry_price() {
+        let manager = create_test_manager().await;
+
+        let account_id = Uuid::now_v7();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let fill_price = Price::new(dec!(90000)).unwrap();
+        let quantity = Quantity::new(dec!(0.1)).unwrap();
+
+        // Build position with entry_price = None (corrupted/incomplete state)
+        let mut position = Position::new(account_id, symbol, Side::Long);
+        position.entry_price = None; // explicitly missing
+        position.quantity = quantity;
+        position.state = PositionState::Exiting {
+            exit_order_id: Uuid::now_v7(),
+            exit_reason: robson_domain::ExitReason::TrailingStop,
+        };
+        position.updated_at = chrono::Utc::now();
+        manager.store.positions().save(&position).await.unwrap();
+
+        let result = manager
+            .handle_exit_fill(position.id, fill_price, quantity)
+            .await;
+
+        assert!(
+            result.is_err(),
+            "handle_exit_fill must reject position with entry_price=None"
+        );
+        let err = result.unwrap_err();
+        assert!(
+            matches!(err, DaemonError::InvalidPositionState { .. }),
+            "expected InvalidPositionState, got: {:?}",
+            err
+        );
+    }
+
+    /// Verify panic_close_position_internal computes realized PnL from
+    /// (fill_price − entry_price) × qty, NOT from current_price.
+    ///
+    /// Setup: Active Long position with entry_price = 100_000, current_price = 99_000.
+    /// StubExchange fills at default 95_000. The PnL must be based on fill_price
+    /// (95_000), NOT current_price (99_000), proving the direct calc is used.
+    #[tokio::test]
+    async fn test_panic_close_records_negative_realized_pnl() {
+        let manager = create_test_manager().await;
+
+        let account_id = Uuid::now_v7();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry_price = Price::new(dec!(100000)).unwrap();
+        // current_price intentionally different from fill to prove fill_price is used
+        let current_price = Price::new(dec!(99000)).unwrap();
+        let quantity = Quantity::new(dec!(0.1)).unwrap();
+        let now = chrono::Utc::now();
+
+        // Build Active position
+        let mut position = Position::new(account_id, symbol.clone(), Side::Long);
+        position.entry_price = Some(entry_price);
+        position.entry_filled_at = Some(now);
+        position.quantity = quantity;
+        position.state = PositionState::Active {
+            current_price,
+            trailing_stop: Price::new(dec!(90000)).unwrap(),
+            favorable_extreme: entry_price,
+            extreme_at: now,
+            insurance_stop_id: None,
+            last_emitted_stop: None,
+        };
+        position.updated_at = now;
+        manager.store.positions().save(&position).await.unwrap();
+
+        // Build an ExecutionQuery in Accepted state (panic_close transitions it internally)
+        let mut query = ExecutionQuery::new(
+            QueryKind::PanicClosePosition { position_id: position.id },
+            ActorKind::Operator { source: CommandSource::Api },
+        );
+        query.position_id = Some(position.id);
+
+        // Call panic_close — StubExchange fills at default price 95_000
+        let result = manager
+            .panic_close_position_internal(position.id, &mut query)
+            .await;
+        assert!(result.is_ok(), "panic_close failed: {:?}", result.err());
+
+        // Reload and verify
+        let closed = manager
+            .store
+            .positions()
+            .find_by_id(position.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // fill_price from StubExchange = 95_000
+        // Expected: (95000 - 100000) * 0.1 = -500
+        let expected_pnl = (dec!(95000) - entry_price.as_decimal()) * quantity.as_decimal();
+        assert_eq!(
+            closed.realized_pnl, expected_pnl,
+            "realized_pnl must be {} (got {}) — based on fill_price 95000, not current_price 99000",
+            expected_pnl, closed.realized_pnl
+        );
+        assert!(
+            closed.realized_pnl < Decimal::ZERO,
+            "realized_pnl must be negative for Long closing below entry"
+        );
+
+        // Double-check it's NOT the current_price-based value
+        let current_price_pnl = (current_price.as_decimal() - entry_price.as_decimal()) * quantity.as_decimal();
+        assert_ne!(
+            closed.realized_pnl, current_price_pnl,
+            "realized_pnl must NOT equal current_price-based PnL ({})",
+            current_price_pnl
+        );
+
+        match closed.state {
+            PositionState::Closed { realized_pnl, exit_price, .. } => {
+                assert_eq!(realized_pnl, expected_pnl, "Closed.realized_pnl must match");
+                assert_eq!(exit_price, Price::new(dec!(95000)).unwrap(), "exit_price must be fill_price");
+            },
+            other => panic!("expected Closed state, got {:?}", other),
+        }
     }
 }
