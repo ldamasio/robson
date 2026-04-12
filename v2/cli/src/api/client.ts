@@ -66,7 +66,6 @@ export class RobsonClient {
       symbol: request.symbol,
       side: request.side,
       capital: request.capital,
-      risk_percent: request.risk_percent,
     });
     return response.data;
   }

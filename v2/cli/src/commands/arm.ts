@@ -6,22 +6,15 @@ export function registerArmCommand(program: Command) {
     .command('arm <symbol>')
     .description('Arm position for a symbol (creates detector, waits for entry signal)')
     .requiredOption('--capital <amount>', 'Capital to allocate (e.g., 1000)')
-    .option('--risk <percent>', 'Risk per trade in percent (default: 1)', '1')
     .option('--side <side>', 'Position side: long or short (default: long)', 'long')
     .action(async (symbol: string, options) => {
       const client = new RobsonClient(process.env.ROBSON_DAEMON_URL || 'http://localhost:8080');
 
       const capital = parseFloat(options.capital);
-      const riskPercent = parseFloat(options.risk);
       const side = options.side.toLowerCase() as 'long' | 'short';
 
       if (isNaN(capital) || capital <= 0) {
         console.error('Error: --capital must be a positive number');
-        process.exit(1);
-      }
-
-      if (isNaN(riskPercent) || riskPercent <= 0 || riskPercent > 10) {
-        console.error('Error: --risk must be between 0 and 10');
         process.exit(1);
       }
 
@@ -32,7 +25,7 @@ export function registerArmCommand(program: Command) {
 
       console.log(`Arming ${symbol.toUpperCase()} ${side.toUpperCase()}`);
       console.log(`  Capital: ${capital} USDT`);
-      console.log(`  Risk: ${riskPercent}%`);
+      console.log(`  Risk: 1% (fixed)`);
       console.log(`  Leverage: 10x (fixed)`);
       console.log();
 
@@ -41,10 +34,9 @@ export function registerArmCommand(program: Command) {
           symbol: symbol.toUpperCase(),
           side,
           capital,
-          risk_percent: riskPercent,
         });
 
-        console.log('✓ Position armed successfully');
+        console.log('Position armed successfully');
         console.log(`  ID: ${result.position_id}`);
         console.log(`  Symbol: ${result.symbol}`);
         console.log(`  Side: ${result.side}`);
