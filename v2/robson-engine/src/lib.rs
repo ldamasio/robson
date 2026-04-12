@@ -1271,7 +1271,14 @@ mod tests {
         let filled_quantity = Quantity::new(dec!(0.0666666666666666666666666667)).unwrap();
 
         let fill_decision = engine
-            .process_entry_fill(&entering_position, fill_price, filled_quantity, None)
+            .process_entry_fill(
+                &entering_position,
+                fill_price,
+                filled_quantity,
+                rust_decimal::Decimal::ZERO,
+                Utc::now(),
+                None,
+            )
             .unwrap();
 
         // Check updated position is Active
@@ -1308,7 +1315,14 @@ mod tests {
         let filled_quantity = Quantity::new(dec!(0.0666666666666666666666666667)).unwrap();
 
         let fill_decision = engine
-            .process_entry_fill(&entering_position, fill_price, filled_quantity, None)
+            .process_entry_fill(
+                &entering_position,
+                fill_price,
+                filled_quantity,
+                rust_decimal::Decimal::ZERO,
+                Utc::now(),
+                None,
+            )
             .unwrap();
 
         // Check trailing stop for short
@@ -1334,7 +1348,14 @@ mod tests {
         let fill_price = Price::new(dec!(95000)).unwrap();
         let filled_quantity = Quantity::new(dec!(0.1)).unwrap();
 
-        let result = engine.process_entry_fill(&position, fill_price, filled_quantity, None);
+        let result = engine.process_entry_fill(
+            &position,
+            fill_price,
+            filled_quantity,
+            rust_decimal::Decimal::ZERO,
+            Utc::now(),
+            None,
+        );
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -1368,7 +1389,14 @@ mod tests {
         let fill_price = Price::new(dec!(95000)).unwrap();
         let filled_quantity = entering_position.quantity;
         let fill_decision = engine
-            .process_entry_fill(&entering_position, fill_price, filled_quantity, None)
+            .process_entry_fill(
+                &entering_position,
+                fill_price,
+                filled_quantity,
+                rust_decimal::Decimal::ZERO,
+                Utc::now(),
+                None,
+            )
             .unwrap();
         let active_position = fill_decision.updated_position.unwrap();
 

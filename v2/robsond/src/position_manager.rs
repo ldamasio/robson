@@ -2106,14 +2106,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         };
 
         // Emit PositionClosed with actual fill price (Exiting → Closed)
+        let total_fees = position.fees_paid + exit_fee;
         let event = Event::PositionClosed {
             position_id,
             exit_reason: robson_domain::ExitReason::UserPanic,
             entry_price,
             exit_price: fill_price,
             realized_pnl: pnl,
-            total_fees: position.fees_paid,
-            timestamp: chrono::Utc::now(),
+            total_fees,
+            timestamp: filled_at,
         };
 
         self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await?;
@@ -3392,7 +3393,13 @@ mod tests {
 
         // Call handle_exit_fill — must compute realized PnL directly
         let result = manager
-            .handle_exit_fill(position.id, fill_price, quantity)
+            .handle_exit_fill(
+                position.id,
+                fill_price,
+                quantity,
+                Decimal::ZERO,
+                chrono::Utc::now(),
+            )
             .await;
         assert!(result.is_ok(), "handle_exit_fill failed: {:?}", result.err());
 
@@ -3450,7 +3457,13 @@ mod tests {
         manager.store.positions().save(&position).await.unwrap();
 
         let result = manager
-            .handle_exit_fill(position.id, fill_price, quantity)
+            .handle_exit_fill(
+                position.id,
+                fill_price,
+                quantity,
+                Decimal::ZERO,
+                chrono::Utc::now(),
+            )
             .await;
 
         assert!(
