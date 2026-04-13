@@ -30,9 +30,9 @@
 #[cfg(feature = "postgres")]
 mod db;
 
-#[cfg(feature = "postgres")]
 use std::sync::Arc;
 
+use robson_connectors::BinanceRestClient;
 use robsond::{Config, Daemon};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -65,6 +65,16 @@ async fn main() -> anyhow::Result<()> {
         api_port = config.api.port,
         "Robson v2 Daemon"
     );
+
+    // Select exchange adapter based on Binance credentials and environment marker.
+    // Reuses position_monitor.binance_api_key/secret from config (same env vars).
+    // ROBSON_BINANCE_USE_TESTNET is a birth-time environment marker set in the
+    // ConfigMap — never a runtime toggle. See ADR-0003.
+    let has_binance_creds = config.position_monitor.binance_api_key.is_some()
+        && config.position_monitor.binance_api_secret.is_some();
+    let use_testnet = std::env::var("ROBSON_BINANCE_USE_TESTNET")
+        .unwrap_or_default()
+        == "true";
 
     // Create daemon with optional projection recovery (wiring layer)
     #[cfg(feature = "postgres")]
@@ -126,14 +136,55 @@ async fn main() -> anyhow::Result<()> {
             (None, None)
         };
 
-        let daemon = Daemon::new_stub_with_recovery(config, projection_recovery, pg_pool);
-        daemon.run().await?;
+        if has_binance_creds && use_testnet {
+            info!("Exchange: Binance (testnet)");
+            let (api_key, api_secret) = (
+                config.position_monitor.binance_api_key.clone().unwrap(),
+                config.position_monitor.binance_api_secret.clone().unwrap(),
+            );
+            let client = Arc::new(BinanceRestClient::testnet(api_key, api_secret));
+            let daemon =
+                Daemon::new_binance_with_recovery(config, client, projection_recovery, pg_pool);
+            daemon.run().await?;
+        } else {
+            if has_binance_creds && !use_testnet {
+                tracing::error!(
+                    "Binance credentials present but ROBSON_BINANCE_USE_TESTNET is not set. \
+                     Refusing to connect to Binance production. Falling back to StubExchange. \
+                     Set ROBSON_BINANCE_USE_TESTNET=true to enable testnet, or remove credentials."
+                );
+            } else {
+                info!("Exchange: Stub (no Binance credentials)");
+            }
+            let daemon = Daemon::new_stub_with_recovery(config, projection_recovery, pg_pool);
+            daemon.run().await?;
+        }
     }
 
     #[cfg(not(feature = "postgres"))]
     {
-        let daemon = Daemon::new_stub(config);
-        daemon.run().await?;
+        if has_binance_creds && use_testnet {
+            info!("Exchange: Binance (testnet)");
+            let (api_key, api_secret) = (
+                config.position_monitor.binance_api_key.clone().unwrap(),
+                config.position_monitor.binance_api_secret.clone().unwrap(),
+            );
+            let client = Arc::new(BinanceRestClient::testnet(api_key, api_secret));
+            let daemon = Daemon::new_binance(config, client);
+            daemon.run().await?;
+        } else {
+            if has_binance_creds && !use_testnet {
+                tracing::error!(
+                    "Binance credentials present but ROBSON_BINANCE_USE_TESTNET is not set. \
+                     Refusing to connect to Binance production. Falling back to StubExchange. \
+                     Set ROBSON_BINANCE_USE_TESTNET=true to enable testnet, or remove credentials."
+                );
+            } else {
+                info!("Exchange: Stub (no Binance credentials)");
+            }
+            let daemon = Daemon::new_stub(config);
+            daemon.run().await?;
+        }
     }
 
     Ok(())

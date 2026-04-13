@@ -258,6 +258,57 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
             pg_pool: None,
         }
     }
+
+    /// Create a Binance daemon with optional projection recovery and shared pool.
+    #[cfg(feature = "postgres")]
+    pub fn new_binance_with_recovery(
+        config: Config,
+        client: Arc<BinanceRestClient>,
+        projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
+        pg_pool: Option<Arc<sqlx::PgPool>>,
+    ) -> Self {
+        use robson_domain::RiskConfig;
+
+        let exchange = Arc::new(BinanceExchangeAdapter::new(client));
+        let journal = Arc::new(IntentJournal::new());
+        let store = Arc::new(MemoryStore::new());
+        let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+        let event_bus = Arc::new(EventBus::new(1000));
+
+        let query_recorder: Arc<dyn QueryRecorder> =
+            if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
+                Arc::new(EventLogQueryRecorder::new(
+                    (**pool).clone(),
+                    tenant_id,
+                    config.projection.stream_key.clone(),
+                ))
+            } else {
+                default_query_recorder()
+            };
+        let risk_config = RiskConfig::new(dec!(10000)).unwrap();
+        let engine = Engine::new(risk_config);
+
+        let mut pm = PositionManager::new(
+            engine,
+            executor,
+            store.clone(),
+            event_bus.clone(),
+            query_recorder,
+        );
+        if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
+            pm = pm.with_event_log((**pool).clone(), tenant_id);
+        }
+        let position_manager = Arc::new(RwLock::new(pm));
+
+        Self {
+            config,
+            position_manager,
+            event_bus,
+            store,
+            projection_recovery,
+            pg_pool,
+        }
+    }
 }
 
 impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
