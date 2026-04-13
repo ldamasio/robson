@@ -30,9 +30,9 @@
 #[cfg(feature = "postgres")]
 mod db;
 
-#[cfg(feature = "postgres")]
 use std::sync::Arc;
 
+use robson_connectors::BinanceRestClient;
 use robsond::{Config, Daemon};
 use tracing::info;
 use tracing_subscriber::{EnvFilter, fmt, prelude::*};
@@ -65,6 +65,11 @@ async fn main() -> anyhow::Result<()> {
         api_port = config.api.port,
         "Robson v2 Daemon"
     );
+
+    // Select exchange adapter based on Binance credentials.
+    // Reuses position_monitor.binance_api_key/secret from config (same env vars).
+    let has_binance_creds = config.position_monitor.binance_api_key.is_some()
+        && config.position_monitor.binance_api_secret.is_some();
 
     // Create daemon with optional projection recovery (wiring layer)
     #[cfg(feature = "postgres")]
@@ -126,14 +131,39 @@ async fn main() -> anyhow::Result<()> {
             (None, None)
         };
 
-        let daemon = Daemon::new_stub_with_recovery(config, projection_recovery, pg_pool);
-        daemon.run().await?;
+        if has_binance_creds {
+            info!("Exchange: Binance (testnet)");
+            let (api_key, api_secret) = (
+                config.position_monitor.binance_api_key.clone().unwrap(),
+                config.position_monitor.binance_api_secret.clone().unwrap(),
+            );
+            let client = Arc::new(BinanceRestClient::testnet(api_key, api_secret));
+            let daemon =
+                Daemon::new_binance_with_recovery(config, client, projection_recovery, pg_pool);
+            daemon.run().await?;
+        } else {
+            info!("Exchange: Stub (no Binance credentials)");
+            let daemon = Daemon::new_stub_with_recovery(config, projection_recovery, pg_pool);
+            daemon.run().await?;
+        }
     }
 
     #[cfg(not(feature = "postgres"))]
     {
-        let daemon = Daemon::new_stub(config);
-        daemon.run().await?;
+        if has_binance_creds {
+            info!("Exchange: Binance (testnet)");
+            let (api_key, api_secret) = (
+                config.position_monitor.binance_api_key.clone().unwrap(),
+                config.position_monitor.binance_api_secret.clone().unwrap(),
+            );
+            let client = Arc::new(BinanceRestClient::testnet(api_key, api_secret));
+            let daemon = Daemon::new_binance(config, client);
+            daemon.run().await?;
+        } else {
+            info!("Exchange: Stub (no Binance credentials)");
+            let daemon = Daemon::new_stub(config);
+            daemon.run().await?;
+        }
     }
 
     Ok(())
