@@ -634,6 +634,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             position_monitor,
             #[cfg(feature = "postgres")]
             pg_pool: self.pg_pool.clone(),
+            api_token: self.config.api.api_token.clone(),
         });
 
         let router = create_router(state);

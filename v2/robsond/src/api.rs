@@ -13,8 +13,9 @@ use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use async_stream::stream;
 use axum::{
-    extract::{Path, State},
+    extract::{Path, Request, State},
     http::{header, StatusCode},
+    middleware::{self, Next},
     response::{
         sse::{KeepAlive, Sse},
         IntoResponse,
@@ -56,6 +57,9 @@ pub struct ApiState<E: ExchangePort + 'static, S: Store + 'static> {
     /// configured.
     #[cfg(feature = "postgres")]
     pub pg_pool: Option<std::sync::Arc<sqlx::PgPool>>,
+    /// Bearer token for authenticating mutating routes. `None` means auth is
+    /// disabled (non-production environments only).
+    pub api_token: Option<String>,
 }
 
 // =============================================================================
@@ -281,32 +285,46 @@ pub struct BinancePositionInfo {
 // =============================================================================
 
 /// Create the API router.
+///
+/// Read-only routes are mounted without authentication.
+/// Mutating routes are wrapped in a bearer-token auth middleware.
 pub fn create_router<E, S>(state: Arc<ApiState<E, S>>) -> Router
 where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
-    Router::new()
+    let token = state.api_token.clone();
+
+    // Read-only routes — no auth required
+    let read_only = Router::new()
         // Kubernetes health probes
         .route("/healthz", get(health_liveness))
         .route("/readyz", get(health_readiness))
-        // Standard endpoints
+        // Standard read-only endpoints
         .route("/health", get(health_handler))
         .route("/events", get(events_handler))
         .route("/status", get(status_handler))
-        .route("/positions", post(arm_handler))
         .route("/positions/:id", get(get_position_handler))
+        // Safety net read-only endpoints
+        .route("/safety/status", get(safety_status_handler))
+        .route("/safety/test", get(safety_test_handler))
+        // MonthlyHalt status (read-only)
+        .route("/monthly-halt", get(monthly_halt_status_handler))
+        .with_state(state.clone());
+
+    // Mutating routes — bearer token required
+    let mutating = Router::new()
+        .route("/positions", post(arm_handler))
         .route("/positions/:id", delete(disarm_handler))
         .route("/positions/:id/signal", post(signal_handler))
         .route("/queries/:id/approve", post(approve_query_handler))
         .route("/panic", post(panic_handler))
-        // Safety net endpoints
-        .route("/safety/status", get(safety_status_handler))
-        .route("/safety/test", get(safety_test_handler))
-        // MonthlyHalt endpoints (v3 policy: binary halt at 4% monthly drawdown)
-        .route("/monthly-halt", get(monthly_halt_status_handler))
+        // MonthlyHalt trigger (mutating)
         .route("/monthly-halt", post(monthly_halt_trigger_handler))
-        .with_state(state)
+        .layer(middleware::from_fn_with_state(token, auth_middleware))
+        .with_state(state);
+
+    read_only.merge(mutating)
 }
 
 // =============================================================================
@@ -769,6 +787,56 @@ where
 }
 
 // =============================================================================
+// Auth Middleware
+// =============================================================================
+
+/// Bearer token authentication middleware for mutating routes.
+///
+/// - If `expected_token` is `None`, auth is disabled (non-production).
+/// - If `expected_token` is `Some`, validates `Authorization: Bearer <token>`.
+/// - Returns 401 on missing or incorrect token.
+async fn auth_middleware(
+    State(expected_token): State<Option<String>>,
+    request: Request,
+    next: Next,
+) -> impl IntoResponse {
+    // No token configured — auth disabled
+    let Some(expected) = expected_token else {
+        return next.run(request).await;
+    };
+
+    // Extract Authorization header
+    let auth_header = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|v| v.to_str().ok());
+
+    match auth_header {
+        Some(value) if value.starts_with("Bearer ") => {
+            let token = &value[7..];
+            if token == expected {
+                next.run(request).await
+            } else {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse {
+                        error: "Invalid bearer token".to_string(),
+                    }),
+                )
+                    .into_response()
+            }
+        },
+        _ => (
+            StatusCode::UNAUTHORIZED,
+            Json(ErrorResponse {
+                error: "Missing or invalid Authorization header".to_string(),
+            }),
+        )
+            .into_response(),
+    }
+}
+
+// =============================================================================
 // Helpers
 // =============================================================================
 // MonthlyHalt handlers (v3 policy)
@@ -925,6 +993,7 @@ mod tests {
             position_monitor: None,
             #[cfg(feature = "postgres")]
             pg_pool: None,
+            api_token: None,
         });
 
         (create_router(state), event_bus, position_manager)

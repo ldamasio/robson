@@ -39,6 +39,9 @@ pub struct ApiConfig {
     pub host: String,
     /// Port to bind to
     pub port: u16,
+    /// Bearer token for authenticating mutating API routes.
+    /// Required when ROBSON_ENV=production; optional otherwise.
+    pub api_token: Option<String>,
 }
 
 /// Projection configuration.
@@ -116,6 +119,13 @@ impl Config {
         let projection = Self::load_projection_config()?;
         let position_monitor = Self::load_position_monitor_config()?;
 
+        // Fail-fast: API token is mandatory in production
+        if environment == Environment::Production && api.api_token.is_none() {
+            return Err(DaemonError::Config(
+                "ROBSON_API_TOKEN is required when ROBSON_ENV=production".to_string(),
+            ));
+        }
+
         Ok(Self {
             api,
             engine,
@@ -131,6 +141,7 @@ impl Config {
             api: ApiConfig {
                 host: "127.0.0.1".to_string(),
                 port: 0, // Let OS assign port
+                api_token: None,
             },
             engine: EngineConfig {
                 min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
@@ -175,7 +186,9 @@ impl Config {
             .parse::<u16>()
             .map_err(|_| DaemonError::Config(format!("Invalid ROBSON_API_PORT: {}", port_str)))?;
 
-        Ok(ApiConfig { host, port })
+        let api_token = env::var("ROBSON_API_TOKEN").ok().filter(|v| !v.trim().is_empty());
+
+        Ok(ApiConfig { host, port, api_token })
     }
 
     fn load_engine_config() -> DaemonResult<EngineConfig> {
@@ -294,7 +307,7 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            api: ApiConfig { host: "0.0.0.0".to_string(), port: 8080 },
+            api: ApiConfig { host: "0.0.0.0".to_string(), port: 8080, api_token: None },
             engine: EngineConfig {
                 min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
                 max_tech_stop_percent: Decimal::new(10, 2), // 10%
