@@ -323,10 +323,8 @@ where
             };
 
             // Extract Authorization header
-            let auth_header = req
-                .headers()
-                .get(header::AUTHORIZATION)
-                .and_then(|v| v.to_str().ok());
+            let auth_header =
+                req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
 
             match auth_header {
                 Some(value) if value.starts_with("Bearer ") => {

@@ -47,21 +47,16 @@ pub static RISK_DENIALS: LazyLock<CounterVec> = LazyLock::new(|| {
 
 /// Realized PnL per closed position (gauge — set once per close event).
 pub static POSITION_PNL: LazyLock<GaugeVec> = LazyLock::new(|| {
-    register_gauge_vec!(
-        "robsond_position_pnl",
-        "Realized PnL for closed positions",
-        &["position_id"]
-    )
+    register_gauge_vec!("robsond_position_pnl", "Realized PnL for closed positions", &[
+        "position_id"
+    ])
     .expect("failed to register robsond_position_pnl")
 });
 
 /// Currently open position count.
 pub static ACTIVE_POSITIONS: LazyLock<Gauge> = LazyLock::new(|| {
-    register_gauge!(
-        "robsond_active_positions",
-        "Number of currently open positions"
-    )
-    .expect("failed to register robsond_active_positions")
+    register_gauge!("robsond_active_positions", "Number of currently open positions")
+        .expect("failed to register robsond_active_positions")
 });
 
 /// MonthlyHalt circuit breaker state (0 = normal, 1 = halted).

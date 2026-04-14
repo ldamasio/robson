@@ -307,7 +307,11 @@ impl Config {
 impl Default for Config {
     fn default() -> Self {
         Self {
-            api: ApiConfig { host: "0.0.0.0".to_string(), port: 8080, api_token: None },
+            api: ApiConfig {
+                host: "0.0.0.0".to_string(),
+                port: 8080,
+                api_token: None,
+            },
             engine: EngineConfig {
                 min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
                 max_tech_stop_percent: Decimal::new(10, 2), // 10%

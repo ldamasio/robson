@@ -3700,8 +3700,8 @@ mod tests {
 
     /// Verify that different capital values produce different position sizes.
     ///
-    /// The engine calculates qty = (capital * risk_pct) / (entry_price * stop_pct).
-    /// With capital=10000, risk=1%: qty = $100 / stop_distance.
+    /// The engine calculates qty = (capital * risk_pct) / (entry_price *
+    /// stop_pct). With capital=10000, risk=1%: qty = $100 / stop_distance.
     /// With capital=20000, risk=1%: qty = $200 / stop_distance.
     /// The larger capital must produce a larger quantity.
     #[tokio::test]
@@ -3740,9 +3740,9 @@ mod tests {
             .await
             .unwrap();
 
-        // Now fire signals for both positions (pos_small was disarmed, so only pos_large)
-        // Instead, verify that the engine capital was actually updated by checking
-        // position size after signal.
+        // Now fire signals for both positions (pos_small was disarmed, so only
+        // pos_large) Instead, verify that the engine capital was actually
+        // updated by checking position size after signal.
         //
         // With capital=20_000, risk=1%=$200, entry=95000, stop=87400 (8%):
         //   qty = $200 / ($95000 * 0.08) = $200 / $7600 ≈ 0.026315789...

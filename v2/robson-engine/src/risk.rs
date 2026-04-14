@@ -77,7 +77,7 @@ impl RiskLimits {
             max_total_exposure_pct,
             max_single_position_pct,
             max_monthly_drawdown_pct: Decimal::from(4), // v3 policy: 4% fixed
-            daily_loss_limit_pct: Decimal::ONE,          // 1% daily loss limit
+            daily_loss_limit_pct: Decimal::ONE,         // 1% daily loss limit
         }
     }
 }
