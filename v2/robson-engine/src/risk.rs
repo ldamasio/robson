@@ -433,7 +433,7 @@ impl RiskGate {
             };
         }
 
-        // 6. Check margin availability (optional - exchange will also validate)
+        // 7. Check margin availability (optional - exchange will also validate)
         // Note: This is a pre-check; exchange will do final validation
         // For now, we rely on exchange validation for margin
 
