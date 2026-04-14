@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed - v2 CI/CD Pipeline (2026-04-14)
+
+- **rustfmt.toml restored**: Rich nightly-only configuration (`imports_granularity`,
+  `group_imports`, `wrap_comments`, `brace_style`, `where_single_line`,
+  `normalize_comments`, `format_code_in_doc_comments`) reinstated after being
+  stripped down to stable-only options. Obsolete options `version` and
+  `edition_idioms` removed (renamed/removed in current nightly).
+- **CI uses nightly rustfmt**: Added `rustup toolchain install nightly --component rustfmt`
+  step; formatting check now runs `cargo +nightly fmt --all --check` instead of stable.
+- **GitOps paths corrected**: `Build & Push Image` job was targeting non-existent paths
+  `apps/prod/robson-v2/robsond-deployment.yml` in rbx-infra. Fixed to correct paths:
+  `apps/prod/robson/robsond-deploy.yml` and `apps/prod/robson/robsond-db-migrate-job.yml`.
+- Codebase reformatted with nightly rustfmt (62 files, net −534 lines).
+
 ### Added - Pattern Detection Engine (2025-12-28)
 
 #### Core Engine (CORE 1.0)

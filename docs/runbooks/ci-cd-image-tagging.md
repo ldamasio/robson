@@ -1,8 +1,9 @@
-# CI/CD Image Tagging Strategy
+# CI/CD Image Tagging — Robson v2
 
 ## Overview
 
-This document describes how Docker images are tagged in the Robson CI/CD pipeline and how to promote releases to production using GitOps (ArgoCD).
+Documents the Docker image tagging strategy, CI/CD pipeline behavior, and GitOps flow
+for Robson v2 (Rust). The pipeline lives in `.github/workflows/robson-v2.yml`.
 
 ---
 
@@ -10,232 +11,164 @@ This document describes how Docker images are tagged in the Robson CI/CD pipelin
 
 | Tag Pattern | When Created | Use Case | Example |
 |-------------|--------------|----------|---------|
-| `sha-<7chars>` | Every push to `main` | **Production (recommended)** | `sha-a1b2c3d` |
-| `v<semver>` | Git tag push (`v*`) | Releases, changelogs | `v0.3.0` |
-| `latest` | Every push to `main` | **Dev/local only** | `latest` |
+| `sha-<8chars>` | Every push to `main` (via `v2/**` path filter) | **Production** | `sha-776a72f9` |
+| `latest` | Every push to `main` | Dev/local only | `latest` |
 
 ### SHA Tags (Golden Standard)
 
-- **Format**: `sha-<first-7-chars-of-commit>`
-- **Example**: `sha-a1b2c3d`
+- **Format**: `sha-<first-8-chars-of-commit>`
+- **Registry**: `ghcr.io/rbxrobotica/robson-v2`
 - **Purpose**: Immutable, traceable, rollback-friendly
-- **When**: Every commit to `main`
-
-**Why SHA is the golden standard:**
-- ✅ Immutable (same SHA = same content)
-- ✅ Traceable (`git log`, `git show`, `git blame`)
-- ✅ Rollback-friendly (revert to any previous SHA)
-- ✅ No ambiguity (unlike `:latest`)
-
-### SemVer Tags (Releases)
-
-- **Format**: `v<major>.<minor>.<patch>`
-- **Example**: `v0.3.0`, `v1.0.0`
-- **Purpose**: Human-readable milestones, changelogs
-- **When**: Creating a GitHub Release with a `v*` tag
-
-### Latest Tag (Dev Only)
-
-- **⚠️ WARNING**: Never use `:latest` in production
-- **Purpose**: Developer convenience for local testing
-- **Problem**: Mutable, unpredictable, breaks rollbacks
 
 ---
 
-## Workflow
+## Workflow Triggers
 
-### 1. Regular Development (Push to main)
-
-```
-Developer pushes to main
-         │
-         ▼
-GitHub Actions builds images
-         │
-         ▼
-Tags published:
-  - sha-a1b2c3d  ← Use this in prod
-  - latest      ← Dev only
-```
-
-### 2. Creating a Release
-
-```bash
-# 1. Create annotated tag
-git tag -a v0.3.0 -m "Release v0.3.0: Add feature X"
-
-# 2. Push tag
-git push origin v0.3.0
-
-# 3. (Optional) Create GitHub Release via UI or CLI
-gh release create v0.3.0 --title "v0.3.0" --notes "Release notes here"
-```
-
-This triggers the workflow with additional tags:
-
-```
-Tags published:
-  - sha-a1b2c3d  ← Immutable reference
-  - v0.3.0      ← Human-readable release
-```
-
----
-
-## Production Deployment (GitOps)
-
-### Golden Rule
-
-**Production manifests in `infra/k8s/prod/` MUST use SHA tags.**
-
-### Automatic Deployment (NEW - December 2024)
-
-**Deployments are now fully automatic!** When you push to `main`:
-
-```
-Developer pushes to main
-         │
-         ▼
-GitHub Actions builds images (sha-XXXXXX)
-         │
-         ▼
-GitHub Actions updates manifests in infra/k8s/prod/*.yml
-         │
-         ▼
-GitHub Actions commits + pushes with [skip ci]
-         │
-         ▼
-ArgoCD detects manifest change
-         │
-         ▼
-ArgoCD syncs automatically (rolling update)
-         │
-         ▼
-Smoke test verifies production is healthy
-         │
-         ▼
-✅ Deploy complete (~6-10 minutes)
-```
-
-**No manual intervention required!**
-
-### What the CI/CD Pipeline Does
-
-1. **Updates 4 manifests** automatically:
-   - `rbs-frontend-prod-deploy.yml`
-   - `rbs-backend-monolith-prod-deploy.yml`
-   - `rbs-backend-nginx-prod-deploy.yml`
-   - `rbs-stop-monitor-cronjob.yml`
-
-2. **Commits with `[skip ci]`** to avoid infinite loop
-
-3. **Waits for ArgoCD sync** (optional, requires `ARGOCD_AUTH_TOKEN` secret)
-
-4. **Runs smoke test** on `https://app.robson.rbx.ia.br`
-
-### Manual Promotion (Fallback)
-
-If automation fails, you can still promote manually:
-
-1. **Get the SHA tag** from GitHub Actions summary or commit hash:
-   ```bash
-   # From git log
-   git log --oneline -1
-   # Output: a1b2c3d feat: add new feature
-   # Tag: sha-a1b2c3d
-   ```
-
-2. **Update the manifest** in `infra/k8s/prod/`:
-   ```yaml
-   # Before
-   image: ldamasio/rbs-backend-monolith-prod:sha-OLD_SHA
-   
-   # After
-   image: ldamasio/rbs-backend-monolith-prod:sha-a1b2c3d
-   ```
-
-3. **Commit and push**:
-   ```bash
-   git add infra/k8s/prod/rbs-backend-monolith-prod-deploy.yml
-   git commit -m "deploy: promote backend to sha-a1b2c3d"
-   git push
-   ```
-
-4. **ArgoCD syncs automatically** (or manually via UI/CLI):
-   ```bash
-   argocd app sync robson-prod
-   ```
-
-### Example Diff
-
-```diff
-# infra/k8s/prod/rbs-backend-monolith-prod-deploy.yml
- spec:
-   containers:
-   - name: rbs-backend-monolith-prod-deploy
--    image: ldamasio/rbs-backend-monolith-prod:sha-b2c3d4e
-+    image: ldamasio/rbs-backend-monolith-prod:sha-a1b2c3d
-```
-
-### Rollback
-
-To rollback, update the tag to a previous SHA:
-
-```bash
-# Find previous working SHA
-git log --oneline infra/k8s/prod/rbs-backend-monolith-prod-deploy.yml
-
-# Update manifest to previous SHA, commit, push
-# ArgoCD syncs automatically
-```
-
----
-
-## Images Reference
-
-| Service | Image Repository | Dockerfile |
-|---------|------------------|------------|
-| Frontend | `ldamasio/rbs-frontend-prod` | `apps/frontend/docker/Dockerfile` |
-| Backend Monolith | `ldamasio/rbs-backend-monolith-prod` | `apps/backend/monolith/docker/Dockerfile_django` |
-| Backend Nginx | `ldamasio/rbs-backend-nginx-prod` | `apps/backend/monolith/docker/Dockerfile_nginx` |
-
----
-
-## Cache Strategy
-
-The workflow uses GitHub Actions cache (`type=gha`) for Docker layer caching:
+The workflow (`robson-v2.yml`) triggers on:
 
 ```yaml
-cache-from: type=gha
-cache-to: type=gha,mode=max
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "v2/**"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "v2/**"
+  workflow_dispatch:
 ```
 
-**Requirements**: `permissions: actions: write` in the workflow.
+> **Important**: Changes exclusively in `.github/workflows/` do **not** trigger the
+> workflow automatically due to the `v2/**` path filter. Use `workflow_dispatch` manually:
+> ```bash
+> gh workflow run robson-v2.yml --repo ldamasio/robson --ref main
+> ```
+
+---
+
+## Pipeline Steps
+
+### Job 1: Rust Tests
+
+1. Cache Rust toolchain and deps (`~/.rustup`, `~/.cargo`, `v2/target`)
+2. `cargo test --all --no-fail-fast`
+3. `rustup toolchain install nightly --component rustfmt`
+4. `cargo +nightly fmt --all --check` (nightly required for options in `v2/rustfmt.toml`)
+5. `cargo clippy --all-targets -- -D clippy::correctness -D clippy::suspicious`
+
+### Job 2: Build & Push Image (main only, after Job 1)
+
+1. Docker Buildx setup
+2. Login to GHCR (`ghcr.io`) with `GITOPS_TOKEN`
+3. Build from `v2/Dockerfile`, push tags `sha-<8chars>` and `latest`
+4. Clone `rbxrobotica/rbx-infra`, update manifest image tags via `sed`, commit and push
+5. ArgoCD detects manifest change and syncs automatically
+
+---
+
+## GitOps Flow
+
+```
+Push to main (v2/** change)
+    │
+    ▼
+Rust Tests: cargo test + nightly fmt check + clippy
+    │
+    ▼
+Build & Push: ghcr.io/rbxrobotica/robson-v2:sha-XXXXXXXX
+    │
+    ▼
+Update rbx-infra:
+  apps/prod/robson/robsond-deploy.yml
+  apps/prod/robson/robsond-db-migrate-job.yml
+    │
+    ▼
+ArgoCD syncs (namespace: robson)
+    │
+    ▼
+✅ Deploy complete
+```
+
+---
+
+## rustfmt Configuration
+
+`v2/rustfmt.toml` uses **nightly-only options** (e.g., `imports_granularity`,
+`group_imports`, `wrap_comments`, `format_code_in_doc_comments`). The CI explicitly
+installs the nightly toolchain to run formatting checks. Do not simplify `rustfmt.toml`
+to stable-only options.
+
+---
+
+## Rollback
+
+```bash
+# 1. Find the previous working SHA from rbx-infra history
+gh api repos/rbxrobotica/rbx-infra/commits \
+  --jq '.[0:10] | .[] | {sha: .sha[0:8], message: .commit.message[0:60]}'
+
+# 2. Manually update the manifest in rbx-infra
+# Edit apps/prod/robson/robsond-deploy.yml:
+#   image: ghcr.io/rbxrobotica/robson-v2:sha-<previous>
+
+# 3. Commit and push to rbx-infra — ArgoCD syncs automatically
+```
+
+---
+
+## Manual Deployment (Fallback)
+
+If the GitOps update fails:
+
+```bash
+# Get the SHA tag you want to deploy
+SHA_TAG="sha-776a72f9"
+
+# Clone rbx-infra and update manifests manually
+git clone https://github.com/rbxrobotica/rbx-infra.git /tmp/rbx-infra
+cd /tmp/rbx-infra
+sed -i "s|image: ghcr.io/rbxrobotica/robson-v2:sha-[a-f0-9]*|image: ghcr.io/rbxrobotica/robson-v2:${SHA_TAG}|g" \
+  apps/prod/robson/robsond-deploy.yml \
+  apps/prod/robson/robsond-db-migrate-job.yml
+git add apps/prod/robson/
+git commit -m "chore(robson-v2): manual rollout to ${SHA_TAG}"
+git push origin main
+```
 
 ---
 
 ## Troubleshooting
 
-### Image not found in Docker Hub
+### Build & Push fails: `sed: can't read ...`
 
-1. Check GitHub Actions run completed successfully
-2. Verify the SHA: `git rev-parse --short HEAD`
-3. Check Docker Hub: `docker pull ldamasio/rbs-backend-monolith-prod:sha-<sha>`
+The GitOps step references incorrect manifest paths. Verify the paths in the
+`Update image tags in rbx-infra` step match:
+- `apps/prod/robson/robsond-deploy.yml`
+- `apps/prod/robson/robsond-db-migrate-job.yml`
 
-### Cache not working
+### Formatting check fails locally
 
-1. Verify `permissions: actions: write` is set
-2. Check Actions tab for cache hits/misses
+Ensure you are using the nightly toolchain:
+```bash
+cd v2
+rustup toolchain install nightly --component rustfmt
+cargo +nightly fmt --all --check
+```
 
-### ArgoCD not syncing
+### CI not triggered after workflow file change
 
-1. Verify manifest is valid YAML
-2. Check ArgoCD UI for sync errors
-3. Force sync: `argocd app sync robson-prod --force`
+The workflow only triggers on `v2/**` path changes. For workflow-only changes,
+dispatch manually:
+```bash
+gh workflow run robson-v2.yml --repo ldamasio/robson --ref main
+```
 
 ---
 
 ## References
 
-- [GitHub Actions Workflow](.github/workflows/main.yml)
-- [Production Manifests](infra/k8s/prod/)
-- [ArgoCD Documentation](https://argo-cd.readthedocs.io/)
+- [Workflow](.github/workflows/robson-v2.yml)
+- [rustfmt config](v2/rustfmt.toml)
+- [rbx-infra manifests](https://github.com/rbxrobotica/rbx-infra/tree/main/apps/prod/robson)
+- [ADR-0011: GitOps Automatic Manifest Updates](../adr/ADR-0011-gitops-automatic-manifest-updates.md)
