@@ -6,8 +6,8 @@ use anyhow::Result;
 use chrono::{DateTime, TimeZone, Utc};
 use robson_domain::{Price, Side, Symbol};
 use robson_eventlog::{
-    ActorType, Event, EventEnvelope, QUERY_STATE_CHANGED_EVENT_TYPE, QueryOptions, append_event,
-    query_events,
+    append_event, query_events, ActorType, Event, EventEnvelope, QueryOptions,
+    QUERY_STATE_CHANGED_EVENT_TYPE,
 };
 use robson_projector::apply_event_to_projections;
 use robsond::{
@@ -142,68 +142,169 @@ async fn test_query_replay_rebuilds_queries_current_byte_for_byte(pool: sqlx::Pg
     let position_c = Uuid::from_u128(0x313);
 
     let mut query_a = signal_query(query_a_id, position_a, ts(10, 0, 0));
-    append_and_project(&pool, tenant_id, stream_key, &query_a, "accepted", ts(10, 0, 1))
-        .await
-        .unwrap();
+    append_and_project(
+        &pool,
+        tenant_id,
+        stream_key,
+        &query_a,
+        "accepted",
+        ts(10, 0, 1),
+    )
+    .await
+    .unwrap();
     query_a.transition(QueryState::Processing).unwrap();
-    append_and_project(&pool, tenant_id, stream_key, &query_a, "processing", ts(10, 0, 2))
-        .await
-        .unwrap();
+    append_and_project(
+        &pool,
+        tenant_id,
+        stream_key,
+        &query_a,
+        "processing",
+        ts(10, 0, 2),
+    )
+    .await
+    .unwrap();
     query_a.transition(QueryState::RiskChecked).unwrap();
-    append_and_project(&pool, tenant_id, stream_key, &query_a, "risk_checked", ts(10, 0, 3))
-        .await
-        .unwrap();
+    append_and_project(
+        &pool,
+        tenant_id,
+        stream_key,
+        &query_a,
+        "risk_checked",
+        ts(10, 0, 3),
+    )
+    .await
+    .unwrap();
     query_a.await_approval("manual approval".to_string(), 300).unwrap();
     query_a.approval.as_mut().unwrap().expires_at = ts(10, 5, 0);
-    append_and_project(&pool, tenant_id, stream_key, &query_a, "awaiting_approval", ts(10, 0, 4))
-        .await
-        .unwrap();
+    append_and_project(
+        &pool,
+        tenant_id,
+        stream_key,
+        &query_a,
+        "awaiting_approval",
+        ts(10, 0, 4),
+    )
+    .await
+    .unwrap();
     query_a.authorize().unwrap();
     query_a.approval.as_mut().unwrap().approved_at = Some(ts(10, 0, 5));
-    append_and_project(&pool, tenant_id, stream_key, &query_a, "authorized", ts(10, 0, 5))
-        .await
-        .unwrap();
+    append_and_project(
+        &pool,
+        tenant_id,
+        stream_key,
+        &query_a,
+        "authorized",
+        ts(10, 0, 5),
+    )
+    .await
+    .unwrap();
     query_a.transition(QueryState::Acting).unwrap();
-    append_and_project(&pool, tenant_id, stream_key, &query_a, "acting", ts(10, 0, 6))
-        .await
-        .unwrap();
+    append_and_project(
+        &pool,
+        tenant_id,
+        stream_key,
+        &query_a,
+        "acting",
+        ts(10, 0, 6),
+    )
+    .await
+    .unwrap();
     query_a.complete(QueryOutcome::ActionsExecuted { actions_count: 1 }).unwrap();
     query_a.finished_at = Some(ts(10, 0, 7));
-    append_and_project(&pool, tenant_id, stream_key, &query_a, "completed", ts(10, 0, 7))
-        .await
-        .unwrap();
+    append_and_project(
+        &pool,
+        tenant_id,
+        stream_key,
+        &query_a,
+        "completed",
+        ts(10, 0, 7),
+    )
+    .await
+    .unwrap();
 
     let mut query_b = signal_query(query_b_id, position_b, ts(11, 0, 0));
-    append_and_project(&pool, tenant_id, stream_key, &query_b, "accepted", ts(11, 0, 1))
-        .await
-        .unwrap();
+    append_and_project(
+        &pool,
+        tenant_id,
+        stream_key,
+        &query_b,
+        "accepted",
+        ts(11, 0, 1),
+    )
+    .await
+    .unwrap();
     query_b.transition(QueryState::Processing).unwrap();
-    append_and_project(&pool, tenant_id, stream_key, &query_b, "processing", ts(11, 0, 2))
-        .await
-        .unwrap();
+    append_and_project(
+        &pool,
+        tenant_id,
+        stream_key,
+        &query_b,
+        "processing",
+        ts(11, 0, 2),
+    )
+    .await
+    .unwrap();
     query_b.transition(QueryState::RiskChecked).unwrap();
-    append_and_project(&pool, tenant_id, stream_key, &query_b, "risk_checked", ts(11, 0, 3))
-        .await
-        .unwrap();
-    query_b.deny("max open positions".to_string(), "max_open_positions".to_string());
+    append_and_project(
+        &pool,
+        tenant_id,
+        stream_key,
+        &query_b,
+        "risk_checked",
+        ts(11, 0, 3),
+    )
+    .await
+    .unwrap();
+    query_b.deny(
+        "max open positions".to_string(),
+        "max_open_positions".to_string(),
+    );
     query_b.finished_at = Some(ts(11, 0, 4));
-    append_and_project(&pool, tenant_id, stream_key, &query_b, "risk_denied", ts(11, 0, 4))
-        .await
-        .unwrap();
+    append_and_project(
+        &pool,
+        tenant_id,
+        stream_key,
+        &query_b,
+        "risk_denied",
+        ts(11, 0, 4),
+    )
+    .await
+    .unwrap();
 
     let mut query_c = market_tick_query(query_c_id, position_c, ts(12, 0, 0));
-    append_and_project(&pool, tenant_id, stream_key, &query_c, "accepted", ts(12, 0, 1))
-        .await
-        .unwrap();
+    append_and_project(
+        &pool,
+        tenant_id,
+        stream_key,
+        &query_c,
+        "accepted",
+        ts(12, 0, 1),
+    )
+    .await
+    .unwrap();
     query_c.transition(QueryState::Processing).unwrap();
-    append_and_project(&pool, tenant_id, stream_key, &query_c, "processing", ts(12, 0, 2))
-        .await
-        .unwrap();
+    append_and_project(
+        &pool,
+        tenant_id,
+        stream_key,
+        &query_c,
+        "processing",
+        ts(12, 0, 2),
+    )
+    .await
+    .unwrap();
     query_c.fail("exchange unavailable".to_string(), "acting".to_string());
     query_c.finished_at = Some(ts(12, 0, 3));
-    append_and_project(&pool, tenant_id, stream_key, &query_c, "failed", ts(12, 0, 3))
-        .await
-        .unwrap();
+    append_and_project(
+        &pool,
+        tenant_id,
+        stream_key,
+        &query_c,
+        "failed",
+        ts(12, 0, 3),
+    )
+    .await
+    .unwrap();
 
     let baseline = load_queries_current(&pool).await.unwrap();
     assert_eq!(baseline.len(), 3);

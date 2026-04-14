@@ -8,7 +8,7 @@
 use axum::response::sse::Event;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{json, Value};
 use uuid::Uuid;
 
 use crate::event_bus::DaemonEvent;
@@ -167,20 +167,16 @@ pub(crate) fn map_daemon_event(event: &DaemonEvent) -> Option<PublicSseEvent> {
                 "consecutive_failures": consecutive_failures,
             }),
         )),
-        DaemonEvent::MonthlyHaltTriggered {
-            reason,
-            triggered_at,
-        } => Some(PublicSseEvent::new(
+        DaemonEvent::MonthlyHaltTriggered { reason, triggered_at } => Some(PublicSseEvent::new(
             "monthly_halt.triggered",
             json!({
                 "reason": reason,
                 "triggered_at": triggered_at,
             }),
         )),
-        DaemonEvent::MonthlyHaltReset {} => Some(PublicSseEvent::new(
-            "monthly_halt.reset",
-            json!({}),
-        )),
+        DaemonEvent::MonthlyHaltReset {} => {
+            Some(PublicSseEvent::new("monthly_halt.reset", json!({})))
+        },
         DaemonEvent::DetectorSignal(_)
         | DaemonEvent::MarketData(_)
         | DaemonEvent::OrderFill(_)

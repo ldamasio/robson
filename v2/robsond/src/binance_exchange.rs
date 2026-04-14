@@ -18,8 +18,8 @@ use tracing::info;
 
 use robson_connectors::{BinanceRestClient, BinanceRestError};
 use robson_domain::{OrderSide, Price, Quantity, Side, Symbol};
-use robson_exec::{ExecError, ExchangePort, OrderResult};
 use robson_exec::ports::MarginSettings;
+use robson_exec::{ExchangePort, ExecError, OrderResult};
 
 // =============================================================================
 // Adapter
@@ -50,7 +50,9 @@ impl BinanceExchangeAdapter {
                 -2010 | -2011 | -2013 => ExecError::OrderRejected(msg.clone()),
                 _ => ExecError::Exchange(error.to_string()),
             },
-            BinanceRestError::Timeout => ExecError::Timeout("Binance request timed out".to_string()),
+            BinanceRestError::Timeout => {
+                ExecError::Timeout("Binance request timed out".to_string())
+            },
             BinanceRestError::InvalidParameter(msg) => ExecError::OrderRejected(msg.clone()),
             _ => ExecError::Exchange(error.to_string()),
         }
@@ -219,9 +221,9 @@ impl ExchangePort for BinanceExchangeAdapter {
     }
 
     async fn cancel_order(&self, symbol: &Symbol, order_id: &str) -> Result<(), ExecError> {
-        let order_id_num: u64 = order_id
-            .parse()
-            .map_err(|_| ExecError::Exchange(format!("Invalid order_id for cancel: {}", order_id)))?;
+        let order_id_num: u64 = order_id.parse().map_err(|_| {
+            ExecError::Exchange(format!("Invalid order_id for cancel: {}", order_id))
+        })?;
 
         self.client
             .cancel_order(&symbol.as_pair(), order_id_num)

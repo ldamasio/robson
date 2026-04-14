@@ -35,8 +35,8 @@ pub mod trailing_stop;
 
 use chrono::{DateTime, Utc};
 use robson_domain::{
-    DetectorSignal, Event, ExitReason, Position, PositionId, PositionState, Price, Quantity,
-    RiskConfig, Side, Symbol, TechnicalStopDistance, calculate_position_size,
+    calculate_position_size, DetectorSignal, Event, ExitReason, Position, PositionId,
+    PositionState, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance,
 };
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
@@ -494,7 +494,12 @@ impl Engine {
                     favorable_extreme,
                     last_emitted_stop,
                     ..
-                } => (*current_price, *trailing_stop, *favorable_extreme, *last_emitted_stop),
+                } => (
+                    *current_price,
+                    *trailing_stop,
+                    *favorable_extreme,
+                    *last_emitted_stop,
+                ),
                 other => {
                     return Err(EngineError::InvalidPositionState {
                         expected: "active".to_string(),
@@ -752,7 +757,10 @@ mod tests {
     }
 
     fn create_market_data(price: Decimal) -> MarketData {
-        MarketData::new(Symbol::from_pair("BTCUSDT").unwrap(), Price::new(price).unwrap())
+        MarketData::new(
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            Price::new(price).unwrap(),
+        )
     }
 
     // =========================================================================
@@ -1001,7 +1009,10 @@ mod tests {
         let has_order = decision.actions.iter().any(|a| {
             matches!(a, EngineAction::PlaceExitOrder { side, .. } if *side == robson_domain::OrderSide::Buy)
         });
-        assert!(has_order, "Should have PlaceExitOrder with Buy side for short exit");
+        assert!(
+            has_order,
+            "Should have PlaceExitOrder with Buy side for short exit"
+        );
     }
 
     // =========================================================================
@@ -1014,8 +1025,11 @@ mod tests {
         let engine = Engine::new(config);
 
         // Create armed position (not active)
-        let position =
-            Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        let position = Position::new(
+            Uuid::now_v7(),
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            Side::Long,
+        );
 
         let market = create_market_data(dec!(95000));
         let result = engine.process_active_position(&position, &market);
@@ -1035,16 +1049,26 @@ mod tests {
         let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
-        let position =
-            create_active_position(Side::Long, dec!(95000), dec!(93500), dec!(95000), dec!(1500));
+        let position = create_active_position(
+            Side::Long,
+            dec!(95000),
+            dec!(93500),
+            dec!(95000),
+            dec!(1500),
+        );
 
         // Market data for different symbol
-        let market =
-            MarketData::new(Symbol::from_pair("ETHUSDT").unwrap(), Price::new(dec!(3000)).unwrap());
+        let market = MarketData::new(
+            Symbol::from_pair("ETHUSDT").unwrap(),
+            Price::new(dec!(3000)).unwrap(),
+        );
 
         let result = engine.process_active_position(&position, &market);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), EngineError::InvalidMarketData(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            EngineError::InvalidMarketData(_)
+        ));
     }
 
     // =========================================================================
@@ -1151,7 +1175,10 @@ mod tests {
 
         // Check PlaceEntryOrder action
         let has_entry_order = decision.actions.iter().any(|a| {
-            matches!(a, EngineAction::PlaceEntryOrder { side: robson_domain::OrderSide::Buy, .. })
+            matches!(
+                a,
+                EngineAction::PlaceEntryOrder { side: robson_domain::OrderSide::Buy, .. }
+            )
         });
         assert!(has_entry_order, "Should have PlaceEntryOrder with Buy side");
 
@@ -1183,9 +1210,15 @@ mod tests {
 
         // Check PlaceEntryOrder has Sell side (short entry)
         let has_entry_order = decision.actions.iter().any(|a| {
-            matches!(a, EngineAction::PlaceEntryOrder { side: robson_domain::OrderSide::Sell, .. })
+            matches!(
+                a,
+                EngineAction::PlaceEntryOrder { side: robson_domain::OrderSide::Sell, .. }
+            )
         });
-        assert!(has_entry_order, "Should have PlaceEntryOrder with Sell side for short");
+        assert!(
+            has_entry_order,
+            "Should have PlaceEntryOrder with Sell side for short"
+        );
     }
 
     #[test]
@@ -1194,8 +1227,13 @@ mod tests {
         let engine = Engine::new(config);
 
         // Create an Active position (not Armed)
-        let position =
-            create_active_position(Side::Long, dec!(95000), dec!(93500), dec!(95000), dec!(1500));
+        let position = create_active_position(
+            Side::Long,
+            dec!(95000),
+            dec!(93500),
+            dec!(95000),
+            dec!(1500),
+        );
 
         let signal = DetectorSignal::new(
             position.id,
@@ -1383,7 +1421,10 @@ mod tests {
         let entering_position = entry_decision.updated_position.unwrap();
 
         // Position is now Entering
-        assert!(matches!(entering_position.state, PositionState::Entering { .. }));
+        assert!(matches!(
+            entering_position.state,
+            PositionState::Entering { .. }
+        ));
 
         // 3. Entry fill received
         let fill_price = Price::new(dec!(95000)).unwrap();
@@ -1479,7 +1520,10 @@ mod tests {
         let decision = engine.process_active_position(&position_with_emitted, &market).unwrap();
 
         // No action: stop would still be $95k (same as last_emitted_stop)
-        assert!(!decision.has_actions(), "Should not emit duplicate trailing stop update");
+        assert!(
+            !decision.has_actions(),
+            "Should not emit duplicate trailing stop update"
+        );
     }
 
     #[test]

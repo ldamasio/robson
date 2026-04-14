@@ -61,7 +61,9 @@ impl Price {
     /// Returns `DomainError::InvalidPrice` if value <= 0
     pub fn new(value: Decimal) -> Result<Self, DomainError> {
         if value <= Decimal::ZERO {
-            return Err(DomainError::InvalidPrice("Price must be positive".to_string()));
+            return Err(DomainError::InvalidPrice(
+                "Price must be positive".to_string(),
+            ));
         }
         Ok(Self(value))
     }
@@ -101,7 +103,9 @@ impl Quantity {
     /// Returns `DomainError::InvalidQuantity` if value <= 0
     pub fn new(value: Decimal) -> Result<Self, DomainError> {
         if value <= Decimal::ZERO {
-            return Err(DomainError::InvalidQuantity("Quantity must be positive".to_string()));
+            return Err(DomainError::InvalidQuantity(
+                "Quantity must be positive".to_string(),
+            ));
         }
         Ok(Self(value))
     }
@@ -166,13 +170,18 @@ impl Symbol {
             }
         }
 
-        Err(DomainError::InvalidSymbol(format!("Cannot parse trading pair: {}", pair)))
+        Err(DomainError::InvalidSymbol(format!(
+            "Cannot parse trading pair: {}",
+            pair
+        )))
     }
 
     /// Create a Symbol from explicit base and quote
     pub fn new(base: String, quote: String) -> Result<Self, DomainError> {
         if base.is_empty() || quote.is_empty() {
-            return Err(DomainError::InvalidSymbol("Base and quote must be non-empty".to_string()));
+            return Err(DomainError::InvalidSymbol(
+                "Base and quote must be non-empty".to_string(),
+            ));
         }
         Ok(Self { base, quote })
     }
@@ -307,7 +316,9 @@ impl RiskConfig {
     /// Returns `DomainError::InvalidRiskConfig` if capital <= 0
     pub fn new(capital: Decimal) -> Result<Self, DomainError> {
         if capital <= Decimal::ZERO {
-            return Err(DomainError::InvalidRiskConfig("Capital must be positive".to_string()));
+            return Err(DomainError::InvalidRiskConfig(
+                "Capital must be positive".to_string(),
+            ));
         }
 
         Ok(Self { capital })
@@ -338,9 +349,7 @@ impl RiskConfig {
 
 impl Default for RiskConfig {
     fn default() -> Self {
-        Self {
-            capital: Decimal::from(10000),
-        }
+        Self { capital: Decimal::from(10000) }
     }
 }
 
@@ -767,7 +776,10 @@ mod tests {
 
         let result = TechnicalStopDistance::new_validated(entry, stop, Side::Long);
         assert!(result.is_err());
-        assert!(matches!(result.unwrap_err(), DomainError::InvalidTechnicalStopDistance(_)));
+        assert!(matches!(
+            result.unwrap_err(),
+            DomainError::InvalidTechnicalStopDistance(_)
+        ));
     }
 
     #[test]

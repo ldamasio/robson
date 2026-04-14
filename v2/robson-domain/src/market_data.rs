@@ -144,7 +144,11 @@ impl Candle {
     /// Get the candle's midpoint price.
     pub fn midpoint(&self) -> Option<Decimal> {
         let mid = (self.high + self.low) / Decimal::from(2);
-        if mid > Decimal::ZERO { Some(mid) } else { None }
+        if mid > Decimal::ZERO {
+            Some(mid)
+        } else {
+            None
+        }
     }
 }
 
@@ -263,7 +267,13 @@ mod tests {
     #[test]
     fn test_tick_creation() {
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
-        let tick = Tick::new(symbol, dec!(95000), dec!(0.1), Utc::now(), "12345".to_string());
+        let tick = Tick::new(
+            symbol,
+            dec!(95000),
+            dec!(0.1),
+            Utc::now(),
+            "12345".to_string(),
+        );
 
         assert_eq!(tick.price, dec!(95000));
         assert_eq!(tick.quantity, dec!(0.1));

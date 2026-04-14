@@ -196,7 +196,9 @@ pub fn calculate_position_size(
     let stop_distance = tech_stop.distance;
 
     if stop_distance <= rust_decimal::Decimal::ZERO {
-        return Err(DomainError::PositionSizingError("Stop distance must be positive".to_string()));
+        return Err(DomainError::PositionSizingError(
+            "Stop distance must be positive".to_string(),
+        ));
     }
 
     // Golden Rule: Position Size = Max Risk / Stop Distance

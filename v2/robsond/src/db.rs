@@ -2,7 +2,7 @@
 //!
 //! Provides `db migrate`, `db status`, and `db init` commands.
 
-use anyhow::{Result, anyhow};
+use anyhow::{anyhow, Result};
 use std::env;
 use tracing::info;
 
@@ -69,7 +69,10 @@ pub async fn run_db_command(args: Vec<String>) -> Result<()> {
             println!("ACCOUNT_ID={}", aid);
         },
         _ => {
-            return Err(anyhow!("Unknown db command: {}. Use migrate, status, or init", args[2]));
+            return Err(anyhow!(
+                "Unknown db command: {}. Use migrate, status, or init",
+                args[2]
+            ));
         },
     }
 

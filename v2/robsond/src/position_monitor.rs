@@ -214,7 +214,10 @@ impl PositionMonitor {
     }
 
     fn exclusion_key(symbol: &str, side: Side) -> String {
-        format!("{symbol}:{}", if side == Side::Long { "long" } else { "short" })
+        format!(
+            "{symbol}:{}",
+            if side == Side::Long { "long" } else { "short" }
+        )
     }
 
     async fn is_core_excluded_in_memory(&self, symbol: &Symbol, side: Side) -> bool {
@@ -250,7 +253,10 @@ impl PositionMonitor {
                         );
                         tracked.insert(position_id, pos);
                     }
-                    info!(count = tracked.len(), "Loaded persisted positions from database");
+                    info!(
+                        count = tracked.len(),
+                        "Loaded persisted positions from database"
+                    );
                 },
                 Err(e) => {
                     warn!(error = %e, "Failed to load persisted positions, starting fresh");
@@ -839,7 +845,12 @@ impl PositionMonitor {
         // Place market order
         let order_result = self
             .binance_client
-            .place_market_order(&position.symbol, exit_side, position.quantity.as_decimal(), None)
+            .place_market_order(
+                &position.symbol,
+                exit_side,
+                position.quantity.as_decimal(),
+                None,
+            )
             .await;
 
         match order_result {
@@ -1010,7 +1021,10 @@ mod tests {
     #[tokio::test]
     async fn test_core_exclusion_set_add_remove() {
         let monitor = PositionMonitor::new(
-            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
+            Arc::new(BinanceRestClient::new(
+                "key".to_string(),
+                "secret".to_string(),
+            )),
             Arc::new(EventBus::new(100)),
             create_test_config(),
         );
@@ -1028,7 +1042,10 @@ mod tests {
     #[tokio::test]
     async fn test_process_binance_position_skips_core_exclusion_cache() {
         let monitor = PositionMonitor::new(
-            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
+            Arc::new(BinanceRestClient::new(
+                "key".to_string(),
+                "secret".to_string(),
+            )),
             Arc::new(EventBus::new(100)),
             create_test_config(),
         );
@@ -1109,7 +1126,10 @@ mod tests {
     #[test]
     fn test_calculate_expected_pnl_long() {
         let monitor = PositionMonitor::new(
-            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
+            Arc::new(BinanceRestClient::new(
+                "key".to_string(),
+                "secret".to_string(),
+            )),
             Arc::new(EventBus::new(100)),
             create_test_config(),
         );
@@ -1127,7 +1147,10 @@ mod tests {
     #[test]
     fn test_calculate_expected_pnl_short() {
         let monitor = PositionMonitor::new(
-            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
+            Arc::new(BinanceRestClient::new(
+                "key".to_string(),
+                "secret".to_string(),
+            )),
             Arc::new(EventBus::new(100)),
             create_test_config(),
         );
@@ -1145,7 +1168,10 @@ mod tests {
     #[test]
     fn test_calculate_expected_pnl_loss() {
         let monitor = PositionMonitor::new(
-            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
+            Arc::new(BinanceRestClient::new(
+                "key".to_string(),
+                "secret".to_string(),
+            )),
             Arc::new(EventBus::new(100)),
             create_test_config(),
         );

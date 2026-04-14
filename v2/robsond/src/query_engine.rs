@@ -30,7 +30,7 @@ use serde::{Deserialize, Serialize};
 use robson_engine::{EngineAction, ProposedTrade, RiskContext, RiskGate, RiskVerdict};
 #[cfg(feature = "postgres")]
 use robson_eventlog::{
-    ActorType, Event, EventLogError, QUERY_STATE_CHANGED_EVENT_TYPE, append_event,
+    append_event, ActorType, Event, EventLogError, QUERY_STATE_CHANGED_EVENT_TYPE,
 };
 use rust_decimal::Decimal;
 #[cfg(feature = "postgres")]
@@ -572,8 +572,8 @@ mod tests {
     use robson_engine::{PositionSummary, RiskContext, RiskGate};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     /// Mock recorder that counts calls
     struct MockRecorder {
@@ -768,7 +768,10 @@ mod tests {
             .check_risk(&mut query, &sample_proposed(), &empty_context(), actions)
             .await;
 
-        assert!(result.is_ok(), "Expected Ok(GovernedAction) for approved trade");
+        assert!(
+            result.is_ok(),
+            "Expected Ok(GovernedAction) for approved trade"
+        );
         assert_eq!(query.state, QueryState::RiskChecked);
         assert_eq!(recorder.transition_count(), 1);
     }
@@ -791,17 +794,30 @@ mod tests {
         };
 
         let governed = engine
-            .check_risk(&mut query, &no_approval_proposed, &empty_context(), dummy_actions())
+            .check_risk(
+                &mut query,
+                &no_approval_proposed,
+                &empty_context(),
+                dummy_actions(),
+            )
             .await
             .expect("risk should approve");
 
         let result = engine
-            .check_approval(&mut query, &no_approval_proposed, &empty_context(), governed)
+            .check_approval(
+                &mut query,
+                &no_approval_proposed,
+                &empty_context(),
+                governed,
+            )
             .await;
 
         assert!(matches!(result, Ok(ApprovalCheckResult::Ready(_))));
         assert_eq!(query.state, QueryState::RiskChecked);
-        assert!(query.approval.is_none(), "No approval metadata should be attached");
+        assert!(
+            query.approval.is_none(),
+            "No approval metadata should be attached"
+        );
     }
 
     #[tokio::test]
@@ -822,7 +838,12 @@ mod tests {
         };
 
         let governed = engine
-            .check_risk(&mut query, &approval_proposed, &empty_context(), dummy_actions())
+            .check_risk(
+                &mut query,
+                &approval_proposed,
+                &empty_context(),
+                dummy_actions(),
+            )
             .await
             .expect("risk should approve");
 
@@ -830,7 +851,10 @@ mod tests {
             .check_approval(&mut query, &approval_proposed, &empty_context(), governed)
             .await;
 
-        assert!(matches!(result, Ok(ApprovalCheckResult::AwaitingApproval(_))));
+        assert!(matches!(
+            result,
+            Ok(ApprovalCheckResult::AwaitingApproval(_))
+        ));
         assert_eq!(query.state, QueryState::AwaitingApproval);
         let approval = query.approval.as_ref().expect("approval metadata must be present");
         assert_eq!(approval.ttl_seconds, 300);
@@ -901,10 +925,18 @@ mod tests {
         query.transition(QueryState::Processing).unwrap();
 
         let result = engine
-            .check_risk(&mut query, &sample_proposed(), &saturated_context(), dummy_actions())
+            .check_risk(
+                &mut query,
+                &sample_proposed(),
+                &saturated_context(),
+                dummy_actions(),
+            )
             .await;
 
-        assert!(result.is_err(), "Expected Err(CheckRiskError::Denied) for saturated portfolio");
+        assert!(
+            result.is_err(),
+            "Expected Err(CheckRiskError::Denied) for saturated portfolio"
+        );
         assert!(
             matches!(query.state, QueryState::Denied { .. }),
             "Query should be in Denied state after risk denial"
@@ -922,7 +954,12 @@ mod tests {
 
         let before = recorder.transition_count();
         engine
-            .check_risk(&mut query, &sample_proposed(), &saturated_context(), dummy_actions())
+            .check_risk(
+                &mut query,
+                &sample_proposed(),
+                &saturated_context(),
+                dummy_actions(),
+            )
             .await
             .ok();
 
@@ -946,7 +983,12 @@ mod tests {
         let mut query = create_test_query();
 
         let result = engine
-            .check_risk(&mut query, &sample_proposed(), &empty_context(), dummy_actions())
+            .check_risk(
+                &mut query,
+                &sample_proposed(),
+                &empty_context(),
+                dummy_actions(),
+            )
             .await;
 
         assert!(

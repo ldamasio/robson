@@ -38,7 +38,7 @@ use robson_engine::{
     Engine, EngineAction, EngineDecision, PositionSummary, ProposedTrade, RiskContext, RiskGate,
 };
 #[cfg(feature = "postgres")]
-use robson_eventlog::{ActorType as EventlogActorType, Event as EventlogEvent, append_event};
+use robson_eventlog::{append_event, ActorType as EventlogActorType, Event as EventlogEvent};
 use robson_exec::{ActionResult, ExchangePort, ExecError, Executor};
 #[cfg(feature = "postgres")]
 use robson_projector::apply_event_to_projections;
@@ -502,8 +502,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         // Monthly realized PnL: sum realized_pnl from all positions closed in the current month.
         let now = chrono::Utc::now();
-        let monthly_closed = self.store.positions().find_closed_in_month(now.year(), now.month()).await?;
-        let monthly_realized_pnl: Decimal = monthly_closed.iter().map(|p| p.realized_pnl - p.fees_paid).sum();
+        let monthly_closed =
+            self.store.positions().find_closed_in_month(now.year(), now.month()).await?;
+        let monthly_realized_pnl: Decimal =
+            monthly_closed.iter().map(|p| p.realized_pnl - p.fees_paid).sum();
 
         // Monthly unrealized PnL: sum unrealized PnL from currently open Active positions.
         let monthly_unrealized_pnl: Decimal = active_positions
@@ -681,8 +683,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         {
             let mut pending_approvals = self.pending_approvals.write().await;
-            pending_approvals
-                .insert(query_id, PendingApprovalRecord { query, position, proposed, governed });
+            pending_approvals.insert(
+                query_id,
+                PendingApprovalRecord { query, position, proposed, governed },
+            );
         }
 
         let pending_approvals = self.pending_approvals.read().await;
@@ -719,7 +723,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             };
             query.fail(format!("{}", e), phase.to_string());
             self.record_query_failure(query).await?;
-            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+            return Err(DaemonError::Config(format!(
+                "Query transition error: {}",
+                e
+            )));
         }
         self.record_query_transition(query, "acting").await?;
 
@@ -779,7 +786,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
             query.fail(format!("{}", e), "acting".to_string());
             self.record_query_failure(query).await?;
-            return Err(DaemonError::Config(format!("Query completion error: {}", e)));
+            return Err(DaemonError::Config(format!(
+                "Query completion error: {}",
+                e
+            )));
         }
         self.record_query_transition(query, "completed").await?;
 
@@ -899,9 +909,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // MonthlyHalt check — blocks new entries when 4% monthly drawdown reached.
         if self.circuit_breaker.blocks_new_entries().await {
             let snap = self.circuit_breaker.snapshot().await;
-            return Err(DaemonError::MonthlyHaltActive {
-                reason: snap.reason.unwrap_or_default(),
-            });
+            return Err(DaemonError::MonthlyHaltActive { reason: snap.reason.unwrap_or_default() });
         }
 
         // Generate position ID upfront (used in event and returned to caller)
@@ -933,7 +941,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if let Err(e) = query.transition(QueryState::Processing) {
             query.fail(format!("{}", e), "accepted".to_string());
             self.record_query_failure(&query).await?;
-            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+            return Err(DaemonError::Config(format!(
+                "Query transition error: {}",
+                e
+            )));
         }
         self.record_query_transition(&query, "processing").await?;
 
@@ -952,7 +963,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if let Err(e) = query.transition(QueryState::Acting) {
             query.fail(format!("{}", e), "processing".to_string());
             self.record_query_failure(&query).await?;
-            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+            return Err(DaemonError::Config(format!(
+                "Query transition error: {}",
+                e
+            )));
         }
         self.record_query_transition(&query, "acting").await?;
 
@@ -1017,7 +1031,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
             query.fail(format!("{}", e), "acting".to_string());
             self.record_query_failure(&query).await?;
-            return Err(DaemonError::Config(format!("Query completion error: {}", e)));
+            return Err(DaemonError::Config(format!(
+                "Query completion error: {}",
+                e
+            )));
         }
         self.record_query_transition(&query, "completed").await?;
 
@@ -1076,14 +1093,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let now = chrono::Utc::now();
 
         // Monthly realized PnL from closed positions
-        let monthly_closed = match self.store.positions().find_closed_in_month(now.year(), now.month()).await {
+        let monthly_closed = match self
+            .store
+            .positions()
+            .find_closed_in_month(now.year(), now.month())
+            .await
+        {
             Ok(positions) => positions,
             Err(e) => {
                 warn!(error = %e, "Failed to query monthly closed positions for MonthlyHalt evaluation");
                 return false;
             },
         };
-        let monthly_realized_pnl: Decimal = monthly_closed.iter().map(|p| p.realized_pnl - p.fees_paid).sum();
+        let monthly_realized_pnl: Decimal =
+            monthly_closed.iter().map(|p| p.realized_pnl - p.fees_paid).sum();
 
         // Monthly unrealized PnL from open Active positions
         let active_positions = match self.store.positions().find_risk_open().await {
@@ -1136,8 +1159,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let _entry_flow_guard = self.entry_flow_lock.lock().await;
 
         // Create query for lifecycle tracking
-        let mut query =
-            ExecutionQuery::new(QueryKind::DisarmPosition { position_id }, Self::operator_actor());
+        let mut query = ExecutionQuery::new(
+            QueryKind::DisarmPosition { position_id },
+            Self::operator_actor(),
+        );
         query.position_id = Some(position_id);
         self.populate_query_context_summary(&mut query).await;
         self.record_query_accepted(&query).await?;
@@ -1146,7 +1171,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if let Err(e) = query.transition(QueryState::Processing) {
             query.fail(format!("{}", e), "accepted".to_string());
             self.record_query_failure(&query).await?;
-            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+            return Err(DaemonError::Config(format!(
+                "Query transition error: {}",
+                e
+            )));
         }
         self.record_query_transition(&query, "processing").await?;
 
@@ -1187,7 +1215,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if let Err(e) = query.transition(QueryState::Acting) {
             query.fail(format!("{}", e), "processing".to_string());
             self.record_query_failure(&query).await?;
-            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+            return Err(DaemonError::Config(format!(
+                "Query transition error: {}",
+                e
+            )));
         }
         self.record_query_transition(&query, "acting").await?;
 
@@ -1206,7 +1237,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 {
                     query.fail(format!("{}", e), "acting".to_string());
                     self.record_query_failure(&query).await?;
-                    return Err(DaemonError::Config(format!("Query completion error: {}", e)));
+                    return Err(DaemonError::Config(format!(
+                        "Query completion error: {}",
+                        e
+                    )));
                 }
                 self.record_query_transition(&query, "completed").await?;
             },
@@ -1243,9 +1277,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 state = %snap.state,
                 "Signal dropped — MonthlyHalt blocks new entries"
             );
-            return Err(DaemonError::MonthlyHaltActive {
-                reason: snap.reason.unwrap_or_default(),
-            });
+            return Err(DaemonError::MonthlyHaltActive { reason: snap.reason.unwrap_or_default() });
         }
 
         // Create query for lifecycle tracking
@@ -1275,7 +1307,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if let Err(e) = query.transition(QueryState::Processing) {
             query.fail(format!("{}", e), "accepted".to_string());
             self.record_query_failure(&query).await?;
-            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+            return Err(DaemonError::Config(format!(
+                "Query transition error: {}",
+                e
+            )));
         }
         self.record_query_transition(&query, "processing").await?;
 
@@ -1301,7 +1336,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             }) {
                 query.fail(format!("{}", e), "processing".to_string());
                 self.record_query_failure(&query).await?;
-                return Err(DaemonError::Config(format!("Query completion error: {}", e)));
+                return Err(DaemonError::Config(format!(
+                    "Query completion error: {}",
+                    e
+                )));
             }
             self.record_query_transition(&query, "completed").await?;
             info!(
@@ -1333,7 +1371,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             }) {
                 query.fail(format!("{}", e), "processing".to_string());
                 self.record_query_failure(&query).await?;
-                return Err(DaemonError::Config(format!("Query completion error: {}", e)));
+                return Err(DaemonError::Config(format!(
+                    "Query completion error: {}",
+                    e
+                )));
             }
             self.record_query_transition(&query, "completed").await?;
             return Ok(());
@@ -1390,7 +1431,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 if let QueryState::Denied { ref check, ref reason } = query.state {
                     if check == "monthly_drawdown" {
                         let reason_str = reason.clone();
-                        if let Some(()) = self.circuit_breaker.trigger_halt(reason_str.clone()).await {
+                        if let Some(()) =
+                            self.circuit_breaker.trigger_halt(reason_str.clone()).await
+                        {
                             warn!(
                                 %position_id,
                                 "Monthly drawdown exceeded — MonthlyHalt triggered, closing positions"
@@ -1481,9 +1524,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // entered MonthlyHalt between when the query was queued and now.
         if self.circuit_breaker.blocks_new_entries().await {
             let snap = self.circuit_breaker.snapshot().await;
-            return Err(DaemonError::MonthlyHaltActive {
-                reason: snap.reason.unwrap_or_default(),
-            });
+            return Err(DaemonError::MonthlyHaltActive { reason: snap.reason.unwrap_or_default() });
         }
 
         let mut record = {
@@ -1568,7 +1609,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 if let QueryState::Denied { ref check, ref reason } = record.query.state {
                     if check == "monthly_drawdown" {
                         let reason_str = reason.clone();
-                        if let Some(()) = self.circuit_breaker.trigger_halt(reason_str.clone()).await {
+                        if let Some(()) =
+                            self.circuit_breaker.trigger_halt(reason_str.clone()).await
+                        {
                             warn!(
                                 query_id = %query_id,
                                 "Monthly drawdown exceeded during approval revalidation — MonthlyHalt triggered, closing positions"
@@ -1741,7 +1784,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             if let Err(e) = query.transition(QueryState::Processing) {
                 query.fail(format!("{}", e), "accepted".to_string());
                 self.record_query_failure(&query).await?;
-                return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+                return Err(DaemonError::Config(format!(
+                    "Query transition error: {}",
+                    e
+                )));
             }
             self.record_query_transition(&query, "processing").await?;
 
@@ -1766,7 +1812,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     let err_str = format!("{}", e);
                     query.fail(err_str.clone(), "processing".to_string());
                     self.record_query_failure(&query).await?;
-                    return Err(DaemonError::Config(format!("Query completion error: {}", e)));
+                    return Err(DaemonError::Config(format!(
+                        "Query completion error: {}",
+                        e
+                    )));
                 }
                 self.record_query_transition(&query, "completed").await?;
                 continue;
@@ -1776,7 +1825,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             if let Err(e) = query.transition(QueryState::Acting) {
                 query.fail(format!("{}", e), "processing".to_string());
                 self.record_query_failure(&query).await?;
-                return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+                return Err(DaemonError::Config(format!(
+                    "Query transition error: {}",
+                    e
+                )));
             }
             self.record_query_transition(&query, "acting").await?;
 
@@ -1822,7 +1874,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
                 query.fail(format!("{}", e), "acting".to_string());
                 self.record_query_failure(&query).await?;
-                return Err(DaemonError::Config(format!("Query completion error: {}", e)));
+                return Err(DaemonError::Config(format!(
+                    "Query completion error: {}",
+                    e
+                )));
             }
             self.record_query_transition(&query, "completed").await?;
         }
@@ -1871,12 +1926,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         // Calculate PnL for event using actual fill price.
         // calculate_pnl() returns ZERO for Exiting state — direct calc instead.
-        let entry_price = position.entry_price.ok_or_else(|| {
-            DaemonError::InvalidPositionState {
+        let entry_price =
+            position.entry_price.ok_or_else(|| DaemonError::InvalidPositionState {
                 expected: "Exiting with entry_price set".to_string(),
                 actual: format!("Exiting with entry_price=None for position {}", position_id),
-            }
-        })?;
+            })?;
         let qty = position.quantity.as_decimal();
         let pnl = match position.side {
             Side::Long => (fill_price.as_decimal() - entry_price.as_decimal()) * qty,
@@ -2041,7 +2095,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     ) -> DaemonResult<()> {
         // Transition to Processing
         if let Err(e) = query.transition(QueryState::Processing) {
-            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+            return Err(DaemonError::Config(format!(
+                "Query transition error: {}",
+                e
+            )));
         }
         self.record_query_transition(query, "processing").await?;
 
@@ -2059,7 +2116,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         // Transition to Acting before executor call
         if let Err(e) = query.transition(QueryState::Acting) {
-            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
+            return Err(DaemonError::Config(format!(
+                "Query transition error: {}",
+                e
+            )));
         }
         self.record_query_transition(query, "acting").await?;
 
@@ -2093,12 +2153,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         // Calculate PnL from actual fill price (not current_price via calculate_pnl).
         // Direct calc avoids implicit current_price and guarantees fill_price is used.
-        let entry_price = position.entry_price.ok_or_else(|| {
-            DaemonError::InvalidPositionState {
+        let entry_price =
+            position.entry_price.ok_or_else(|| DaemonError::InvalidPositionState {
                 expected: "Active/Exiting with entry_price set".to_string(),
                 actual: format!("entry_price=None for position {}", position_id),
-            }
-        })?;
+            })?;
         let qty = position.quantity.as_decimal();
         let pnl = match position.side {
             Side::Long => (fill_price.as_decimal() - entry_price.as_decimal()) * qty,
@@ -2274,7 +2333,13 @@ mod tests {
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let position = manager
-            .arm_position(symbol, Side::Long, create_test_risk_config(), tech_stop, Uuid::now_v7())
+            .arm_position(
+                symbol,
+                Side::Long,
+                create_test_risk_config(),
+                tech_stop,
+                Uuid::now_v7(),
+            )
             .await
             .unwrap();
 
@@ -2295,7 +2360,13 @@ mod tests {
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let position = manager
-            .arm_position(symbol, Side::Long, create_test_risk_config(), tech_stop, Uuid::now_v7())
+            .arm_position(
+                symbol,
+                Side::Long,
+                create_test_risk_config(),
+                tech_stop,
+                Uuid::now_v7(),
+            )
             .await
             .unwrap();
 
@@ -3041,7 +3112,10 @@ mod tests {
         save_closed_position_with_pnl(&manager, dec!(-399)).await;
 
         let triggered = manager.evaluate_monthly_halt().await;
-        assert!(!triggered, "3.99% monthly loss must not trigger MonthlyHalt");
+        assert!(
+            !triggered,
+            "3.99% monthly loss must not trigger MonthlyHalt"
+        );
         assert!(!manager.circuit_breaker.blocks_new_entries().await);
     }
 
@@ -3052,7 +3126,10 @@ mod tests {
         save_closed_position_with_pnl(&manager, dec!(-400)).await;
 
         let triggered = manager.evaluate_monthly_halt().await;
-        assert!(triggered, "exactly 4% monthly loss must trigger MonthlyHalt");
+        assert!(
+            triggered,
+            "exactly 4% monthly loss must trigger MonthlyHalt"
+        );
         assert!(manager.circuit_breaker.blocks_new_entries().await);
     }
 
@@ -3071,7 +3148,13 @@ mod tests {
 
         // Attempt to arm a new position — must fail
         let result = manager
-            .arm_position(symbol, Side::Long, create_test_risk_config(), tech_stop, Uuid::now_v7())
+            .arm_position(
+                symbol,
+                Side::Long,
+                create_test_risk_config(),
+                tech_stop,
+                Uuid::now_v7(),
+            )
             .await;
 
         assert!(
@@ -3123,10 +3206,8 @@ mod tests {
 
         // Active position should have been closed by panic_close_all
         let open = manager.store.positions().find_active().await.unwrap();
-        let active_count = open
-            .iter()
-            .filter(|p| matches!(p.state, PositionState::Active { .. }))
-            .count();
+        let active_count =
+            open.iter().filter(|p| matches!(p.state, PositionState::Active { .. })).count();
         assert_eq!(active_count, 0, "MonthlyHalt must close Active positions");
     }
 
@@ -3150,20 +3231,26 @@ mod tests {
         save_closed_position_with_pnl(&manager, dec!(-150)).await;
 
         // Save an Active position with -50 unrealized PnL
-        let active = save_active_position(&manager, "ETHUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
+        let active =
+            save_active_position(&manager, "ETHUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
 
         let ctx = manager.build_risk_context().await.unwrap();
 
         // monthly_realized_pnl should be -150 (from the closed position)
-        assert_eq!(ctx.monthly_realized_pnl, dec!(-150),
-            "monthly_realized_pnl must reflect closed positions in current month");
+        assert_eq!(
+            ctx.monthly_realized_pnl,
+            dec!(-150),
+            "monthly_realized_pnl must reflect closed positions in current month"
+        );
 
         // The unrealized PnL depends on calculate_pnl() which needs entry_price
         // and current_price. Since we set entry_price = 3000 and current_price = 3000
         // in save_active_position, unrealized PnL should be 0.
         // Let's just verify it's not hardcoded zero anymore by checking it ran.
-        assert!(ctx.monthly_unrealized_pnl == dec!(0),
-            "monthly_unrealized_pnl should be computed (not hardcoded)");
+        assert!(
+            ctx.monthly_unrealized_pnl == dec!(0),
+            "monthly_unrealized_pnl should be computed (not hardcoded)"
+        );
     }
 
     #[tokio::test]
@@ -3189,13 +3276,7 @@ mod tests {
         manager.evaluate_monthly_halt().await;
 
         // Entering position should still exist (not cancelled)
-        let entering = manager
-            .store
-            .positions()
-            .find_by_id(position.id)
-            .await
-            .unwrap()
-            .unwrap();
+        let entering = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
         assert!(
             matches!(entering.state, PositionState::Entering { .. }),
             "Entering positions are not cancellable yet — this is a documented limitation"
@@ -3210,7 +3291,8 @@ mod tests {
         save_closed_position_with_pnl(&manager, dec!(-400)).await;
 
         // 2. Active position — must be closed by MonthlyHalt
-        let _active = save_active_position(&manager, "ETHUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
+        let _active =
+            save_active_position(&manager, "ETHUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
 
         // 3. Arm a second position and fire a signal
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(
@@ -3249,10 +3331,8 @@ mod tests {
 
         // 5. Active positions must be closed
         let open = manager.store.positions().find_active().await.unwrap();
-        let active_count = open
-            .iter()
-            .filter(|p| matches!(p.state, PositionState::Active { .. }))
-            .count();
+        let active_count =
+            open.iter().filter(|p| matches!(p.state, PositionState::Active { .. })).count();
         assert_eq!(
             active_count, 0,
             "handle_signal monthly drawdown path must close Active positions"
@@ -3268,10 +3348,7 @@ mod tests {
 
         save_active_position(&manager, "BTCUSDT", Side::Long, dec!(95000), dec!(0.1)).await;
 
-        let closed = manager
-            .trigger_monthly_halt("operator test".to_string())
-            .await
-            .unwrap();
+        let closed = manager.trigger_monthly_halt("operator test".to_string()).await.unwrap();
 
         assert!(
             !closed.is_empty(),
@@ -3279,10 +3356,8 @@ mod tests {
         );
 
         let open = manager.store.positions().find_active().await.unwrap();
-        let active_count = open
-            .iter()
-            .filter(|p| matches!(p.state, PositionState::Active { .. }))
-            .count();
+        let active_count =
+            open.iter().filter(|p| matches!(p.state, PositionState::Active { .. })).count();
         assert_eq!(
             active_count, 0,
             "trigger_monthly_halt must close all Active positions"
@@ -3349,10 +3424,8 @@ mod tests {
 
         // 6. Active positions must be closed
         let open = manager.store.positions().find_active().await.unwrap();
-        let active_count = open
-            .iter()
-            .filter(|p| matches!(p.state, PositionState::Active { .. }))
-            .count();
+        let active_count =
+            open.iter().filter(|p| matches!(p.state, PositionState::Active { .. })).count();
         assert_eq!(
             active_count, 0,
             "approve_query monthly drawdown path must close Active positions"
@@ -3401,19 +3474,18 @@ mod tests {
                 chrono::Utc::now(),
             )
             .await;
-        assert!(result.is_ok(), "handle_exit_fill failed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "handle_exit_fill failed: {:?}",
+            result.err()
+        );
 
         // Reload and verify the closed position has correct negative realized PnL
-        let closed = manager
-            .store
-            .positions()
-            .find_by_id(position.id)
-            .await
-            .unwrap()
-            .unwrap();
+        let closed = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
 
         // Expected: (90000 - 95000) * 0.1 = -500
-        let expected_pnl = (fill_price.as_decimal() - entry_price.as_decimal()) * quantity.as_decimal();
+        let expected_pnl =
+            (fill_price.as_decimal() - entry_price.as_decimal()) * quantity.as_decimal();
         assert_eq!(
             closed.realized_pnl, expected_pnl,
             "realized_pnl must be {} (got {}) — direct calc, not calculate_pnl()",
@@ -3428,7 +3500,10 @@ mod tests {
         match closed.state {
             PositionState::Closed { realized_pnl, exit_price, .. } => {
                 assert_eq!(realized_pnl, expected_pnl, "Closed.realized_pnl must match");
-                assert_eq!(exit_price, fill_price, "Closed.exit_price must be fill_price");
+                assert_eq!(
+                    exit_price, fill_price,
+                    "Closed.exit_price must be fill_price"
+                );
             },
             other => panic!("expected Closed state, got {:?}", other),
         }
@@ -3520,19 +3595,11 @@ mod tests {
         query.position_id = Some(position.id);
 
         // Call panic_close — StubExchange fills at default price 95_000
-        let result = manager
-            .panic_close_position_internal(position.id, &mut query)
-            .await;
+        let result = manager.panic_close_position_internal(position.id, &mut query).await;
         assert!(result.is_ok(), "panic_close failed: {:?}", result.err());
 
         // Reload and verify
-        let closed = manager
-            .store
-            .positions()
-            .find_by_id(position.id)
-            .await
-            .unwrap()
-            .unwrap();
+        let closed = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
 
         // fill_price from StubExchange = 95_000
         // Expected: (95000 - 100000) * 0.1 = -500
@@ -3548,7 +3615,8 @@ mod tests {
         );
 
         // Double-check it's NOT the current_price-based value
-        let current_price_pnl = (current_price.as_decimal() - entry_price.as_decimal()) * quantity.as_decimal();
+        let current_price_pnl =
+            (current_price.as_decimal() - entry_price.as_decimal()) * quantity.as_decimal();
         assert_ne!(
             closed.realized_pnl, current_price_pnl,
             "realized_pnl must NOT equal current_price-based PnL ({})",
@@ -3558,7 +3626,11 @@ mod tests {
         match closed.state {
             PositionState::Closed { realized_pnl, exit_price, .. } => {
                 assert_eq!(realized_pnl, expected_pnl, "Closed.realized_pnl must match");
-                assert_eq!(exit_price, Price::new(dec!(95000)).unwrap(), "exit_price must be fill_price");
+                assert_eq!(
+                    exit_price,
+                    Price::new(dec!(95000)).unwrap(),
+                    "exit_price must be fill_price"
+                );
             },
             other => panic!("expected Closed state, got {:?}", other),
         }
@@ -3606,8 +3678,16 @@ mod tests {
 
         let ctx = manager.build_risk_context().await.unwrap();
 
-        assert_eq!(ctx.monthly_realized_pnl, dec!(-350), "monthly_realized_pnl must deduct fees");
-        assert_eq!(ctx.monthly_unrealized_pnl, dec!(0), "no open positions, unrealized must be zero");
+        assert_eq!(
+            ctx.monthly_realized_pnl,
+            dec!(-350),
+            "monthly_realized_pnl must deduct fees"
+        );
+        assert_eq!(
+            ctx.monthly_unrealized_pnl,
+            dec!(0),
+            "no open positions, unrealized must be zero"
+        );
     }
 
     #[tokio::test]
@@ -3618,7 +3698,10 @@ mod tests {
         save_closed_position_with_pnl_and_fees(&manager, dec!(-350), dec!(50)).await;
 
         let triggered = manager.evaluate_monthly_halt().await;
-        assert!(triggered, "net -400 (PnL -350, fees -50) must trigger MonthlyHalt");
+        assert!(
+            triggered,
+            "net -400 (PnL -350, fees -50) must trigger MonthlyHalt"
+        );
         assert!(manager.circuit_breaker.blocks_new_entries().await);
     }
 }

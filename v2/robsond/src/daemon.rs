@@ -42,7 +42,7 @@ use robson_store::{
     Store, StoreError,
 };
 
-use crate::api::{ApiState, create_router};
+use crate::api::{create_router, ApiState};
 use crate::config::Config;
 use crate::error::{DaemonError, DaemonResult};
 use crate::event_bus::{DaemonEvent, EventBus};
@@ -54,7 +54,7 @@ use crate::position_monitor::{
 #[cfg(feature = "postgres")]
 use crate::query::ExecutionQuery;
 #[cfg(feature = "postgres")]
-use crate::query_engine::{EventLogQueryRecorder, append_query_state_changed_event};
+use crate::query_engine::{append_query_state_changed_event, EventLogQueryRecorder};
 use crate::query_engine::{QueryRecorder, TracingQueryRecorder};
 
 #[cfg(feature = "postgres")]
@@ -554,7 +554,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         }
 
         if invalidated > 0 {
-            info!(invalidated, "Invalidated persisted AwaitingApproval queries on restart");
+            info!(
+                invalidated,
+                "Invalidated persisted AwaitingApproval queries on restart"
+            );
         }
 
         Ok(())
@@ -896,7 +899,7 @@ mod tests {
     use chrono::{TimeZone, Utc};
     #[cfg(feature = "postgres")]
     use robson_eventlog::{
-        ActorType, Event, QUERY_STATE_CHANGED_EVENT_TYPE, QueryOptions, append_event, query_events,
+        append_event, query_events, ActorType, Event, QueryOptions, QUERY_STATE_CHANGED_EVENT_TYPE,
     };
     #[cfg(feature = "postgres")]
     use robson_projector::apply_event_to_projections;

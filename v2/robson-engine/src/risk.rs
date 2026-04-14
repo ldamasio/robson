@@ -127,10 +127,7 @@ impl RiskContext {
     }
 
     /// Create context with positions
-    pub fn with_positions(
-        capital: Decimal,
-        open_positions: Vec<PositionSummary>,
-    ) -> Self {
+    pub fn with_positions(capital: Decimal, open_positions: Vec<PositionSummary>) -> Self {
         let total_notional_exposure = open_positions.iter().map(|p| p.notional_value).sum();
 
         Self {
@@ -347,7 +344,10 @@ impl RiskGate {
             );
             return RiskVerdict::Rejected {
                 check: RiskCheck::DuplicatePosition,
-                reason: format!("Already have {} position on {}", proposed.side, proposed.symbol),
+                reason: format!(
+                    "Already have {} position on {}",
+                    proposed.side, proposed.symbol
+                ),
             };
         }
 
@@ -476,7 +476,10 @@ mod tests {
         };
 
         let verdict = gate.evaluate(&proposed, &context);
-        assert!(matches!(verdict, RiskVerdict::Rejected { check: RiskCheck::TotalExposure, .. }));
+        assert!(matches!(
+            verdict,
+            RiskVerdict::Rejected { check: RiskCheck::TotalExposure, .. }
+        ));
     }
 
     #[test]
@@ -577,7 +580,11 @@ mod tests {
         let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
-        assert_eq!(verdict, RiskVerdict::Approved, "3.99% monthly loss must be allowed");
+        assert_eq!(
+            verdict,
+            RiskVerdict::Approved,
+            "3.99% monthly loss must be allowed"
+        );
     }
 
     #[test]
@@ -595,7 +602,10 @@ mod tests {
 
         let verdict = gate.evaluate(&proposed, &context);
         assert!(
-            matches!(verdict, RiskVerdict::Rejected { check: RiskCheck::MonthlyDrawdown, .. }),
+            matches!(
+                verdict,
+                RiskVerdict::Rejected { check: RiskCheck::MonthlyDrawdown, .. }
+            ),
             "exactly 4.00% monthly loss must be blocked"
         );
     }

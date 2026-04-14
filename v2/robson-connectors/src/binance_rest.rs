@@ -171,11 +171,13 @@ impl BinanceRestClient {
             format!("{}{}?{}", self.base_url(), endpoint, query)
         };
 
-        let response =
-            timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), self.client.get(&url).send())
-                .await
-                .map_err(|_| BinanceRestError::Timeout)?
-                .map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
+        let response = timeout(
+            Duration::from_secs(REQUEST_TIMEOUT_SECS),
+            self.client.get(&url).send(),
+        )
+        .await
+        .map_err(|_| BinanceRestError::Timeout)?
+        .map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
 
         let status = response.status();
         let body =
@@ -186,7 +188,10 @@ impl BinanceRestClient {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
                 return Err(BinanceRestError::ApiError { code: err.code, msg: err.msg });
             }
-            return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
+            return Err(BinanceRestError::RequestFailed(format!(
+                "HTTP {}: {}",
+                status, body
+            )));
         }
 
         Ok(body)
@@ -218,7 +223,10 @@ impl BinanceRestClient {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
                 return Err(BinanceRestError::ApiError { code: err.code, msg: err.msg });
             }
-            return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
+            return Err(BinanceRestError::RequestFailed(format!(
+                "HTTP {}: {}",
+                status, body
+            )));
         }
 
         Ok(body)
@@ -250,7 +258,10 @@ impl BinanceRestClient {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
                 return Err(BinanceRestError::ApiError { code: err.code, msg: err.msg });
             }
-            return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
+            return Err(BinanceRestError::RequestFailed(format!(
+                "HTTP {}: {}",
+                status, body
+            )));
         }
 
         Ok(body)
@@ -281,7 +292,10 @@ impl BinanceRestClient {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
                 return Err(BinanceRestError::ApiError { code: err.code, msg: err.msg });
             }
-            return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
+            return Err(BinanceRestError::RequestFailed(format!(
+                "HTTP {}: {}",
+                status, body
+            )));
         }
 
         Ok(body)
@@ -487,7 +501,10 @@ impl BinanceRestClient {
         if body.trim() == "{}" {
             Ok(())
         } else {
-            Err(BinanceRestError::ParseError(format!("Unexpected ping response: {}", body)))
+            Err(BinanceRestError::ParseError(format!(
+                "Unexpected ping response: {}",
+                body
+            )))
         }
     }
 }

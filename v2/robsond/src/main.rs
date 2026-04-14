@@ -35,7 +35,7 @@ use std::sync::Arc;
 use robson_connectors::BinanceRestClient;
 use robsond::{Config, Daemon};
 use tracing::info;
-use tracing_subscriber::{EnvFilter, fmt, prelude::*};
+use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -72,9 +72,7 @@ async fn main() -> anyhow::Result<()> {
     // ConfigMap — never a runtime toggle. See ADR-0003.
     let has_binance_creds = config.position_monitor.binance_api_key.is_some()
         && config.position_monitor.binance_api_secret.is_some();
-    let use_testnet = std::env::var("ROBSON_BINANCE_USE_TESTNET")
-        .unwrap_or_default()
-        == "true";
+    let use_testnet = std::env::var("ROBSON_BINANCE_USE_TESTNET").unwrap_or_default() == "true";
 
     // Create daemon with optional projection recovery (wiring layer)
     #[cfg(feature = "postgres")]
@@ -128,8 +126,10 @@ async fn main() -> anyhow::Result<()> {
             let pool = Arc::new(pool);
 
             // Create projection recovery adapter (uses same pool)
-            let recovery = Some(Arc::new(robson_store::PgProjectionReader::new(pool.clone()))
-                as Arc<dyn robson_store::ProjectionRecovery>);
+            let recovery = Some(
+                Arc::new(robson_store::PgProjectionReader::new(pool.clone()))
+                    as Arc<dyn robson_store::ProjectionRecovery>,
+            );
 
             (recovery, Some(pool))
         } else {

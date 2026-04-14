@@ -360,35 +360,62 @@ mod tests {
 
         // Price 96,500 → stop 95,000
         let r = update_trailing_stop_discrete(
-            side, Price::new(dec!(96500)).unwrap(), extreme, stop, entry, span,
-        ).unwrap();
+            side,
+            Price::new(dec!(96500)).unwrap(),
+            extreme,
+            stop,
+            entry,
+            span,
+        )
+        .unwrap();
         assert_eq!(r.new_stop.as_decimal(), dec!(95000));
         stop = r.new_stop;
         extreme = r.new_favorable_extreme;
 
         // Price 98,000 → stop 96,500
         let r = update_trailing_stop_discrete(
-            side, Price::new(dec!(98000)).unwrap(), extreme, stop, entry, span,
-        ).unwrap();
+            side,
+            Price::new(dec!(98000)).unwrap(),
+            extreme,
+            stop,
+            entry,
+            span,
+        )
+        .unwrap();
         assert_eq!(r.new_stop.as_decimal(), dec!(96500));
         stop = r.new_stop;
         extreme = r.new_favorable_extreme;
 
         // Price 99,500 → stop 98,000
         let r = update_trailing_stop_discrete(
-            side, Price::new(dec!(99500)).unwrap(), extreme, stop, entry, span,
-        ).unwrap();
+            side,
+            Price::new(dec!(99500)).unwrap(),
+            extreme,
+            stop,
+            entry,
+            span,
+        )
+        .unwrap();
         assert_eq!(r.new_stop.as_decimal(), dec!(98000));
         stop = r.new_stop;
         extreme = r.new_favorable_extreme;
 
         // Price drops to 97,200 → no update (stop stays at 98,000)
         let r = update_trailing_stop_discrete(
-            side, Price::new(dec!(97200)).unwrap(), extreme, stop, entry, span,
+            side,
+            Price::new(dec!(97200)).unwrap(),
+            extreme,
+            stop,
+            entry,
+            span,
         );
         assert!(r.is_none());
         // Position should be closed by is_trailing_stop_hit (97,200 < 98,000)
-        assert!(is_trailing_stop_hit(Side::Long, Price::new(dec!(97200)).unwrap(), stop));
+        assert!(is_trailing_stop_hit(
+            Side::Long,
+            Price::new(dec!(97200)).unwrap(),
+            stop
+        ));
     }
 
     #[test]
@@ -407,7 +434,11 @@ mod tests {
             span,
         );
         assert!(r.is_none());
-        assert!(!is_trailing_stop_hit(Side::Long, Price::new(dec!(93600)).unwrap(), stop));
+        assert!(!is_trailing_stop_hit(
+            Side::Long,
+            Price::new(dec!(93600)).unwrap(),
+            stop
+        ));
 
         // Price recovers to entry ($95,000)
         let r = update_trailing_stop_discrete(
@@ -429,15 +460,26 @@ mod tests {
 
         // Price to 96,500 → stop to 95,000
         let r = update_trailing_stop_discrete(
-            side, Price::new(dec!(96500)).unwrap(), extreme, stop, entry, span,
-        ).unwrap();
+            side,
+            Price::new(dec!(96500)).unwrap(),
+            extreme,
+            stop,
+            entry,
+            span,
+        )
+        .unwrap();
         stop = r.new_stop;
         extreme = r.new_favorable_extreme;
         assert_eq!(stop.as_decimal(), dec!(95000));
 
         // Price drops back — stop must NOT go down
         let r = update_trailing_stop_discrete(
-            side, Price::new(dec!(95500)).unwrap(), extreme, stop, entry, span,
+            side,
+            Price::new(dec!(95500)).unwrap(),
+            extreme,
+            stop,
+            entry,
+            span,
         );
         assert!(r.is_none()); // Stop stays at 95,000
     }
@@ -454,7 +496,8 @@ mod tests {
             stop,
             entry,
             span,
-        ).unwrap();
+        )
+        .unwrap();
         // 3 completed spans → stop = 93500 + 3×1500 = 98000
         assert_eq!(r.new_stop.as_decimal(), dec!(98000));
     }
@@ -526,34 +569,61 @@ mod tests {
 
         // Price 93,500 → stop 95,000
         let r = update_trailing_stop_discrete(
-            side, Price::new(dec!(93500)).unwrap(), extreme, stop, entry, span,
-        ).unwrap();
+            side,
+            Price::new(dec!(93500)).unwrap(),
+            extreme,
+            stop,
+            entry,
+            span,
+        )
+        .unwrap();
         assert_eq!(r.new_stop.as_decimal(), dec!(95000));
         stop = r.new_stop;
         extreme = r.new_favorable_extreme;
 
         // Price 92,000 → stop 93,500
         let r = update_trailing_stop_discrete(
-            side, Price::new(dec!(92000)).unwrap(), extreme, stop, entry, span,
-        ).unwrap();
+            side,
+            Price::new(dec!(92000)).unwrap(),
+            extreme,
+            stop,
+            entry,
+            span,
+        )
+        .unwrap();
         assert_eq!(r.new_stop.as_decimal(), dec!(93500));
         stop = r.new_stop;
         extreme = r.new_favorable_extreme;
 
         // Price 90,500 → stop 92,000
         let r = update_trailing_stop_discrete(
-            side, Price::new(dec!(90500)).unwrap(), extreme, stop, entry, span,
-        ).unwrap();
+            side,
+            Price::new(dec!(90500)).unwrap(),
+            extreme,
+            stop,
+            entry,
+            span,
+        )
+        .unwrap();
         assert_eq!(r.new_stop.as_decimal(), dec!(92000));
         stop = r.new_stop;
         extreme = r.new_favorable_extreme;
 
         // Price rises to 92,800 → no update, but stop hit
         let r = update_trailing_stop_discrete(
-            side, Price::new(dec!(92800)).unwrap(), extreme, stop, entry, span,
+            side,
+            Price::new(dec!(92800)).unwrap(),
+            extreme,
+            stop,
+            entry,
+            span,
         );
         assert!(r.is_none());
-        assert!(is_trailing_stop_hit(Side::Short, Price::new(dec!(92800)).unwrap(), stop));
+        assert!(is_trailing_stop_hit(
+            Side::Short,
+            Price::new(dec!(92800)).unwrap(),
+            stop
+        ));
     }
 
     #[test]
@@ -564,15 +634,26 @@ mod tests {
 
         // Price to 93,500 → stop to 95,000
         let r = update_trailing_stop_discrete(
-            side, Price::new(dec!(93500)).unwrap(), extreme, stop, entry, span,
-        ).unwrap();
+            side,
+            Price::new(dec!(93500)).unwrap(),
+            extreme,
+            stop,
+            entry,
+            span,
+        )
+        .unwrap();
         stop = r.new_stop;
         extreme = r.new_favorable_extreme;
         assert_eq!(stop.as_decimal(), dec!(95000));
 
         // Price rises back — stop must NOT go up
         let r = update_trailing_stop_discrete(
-            side, Price::new(dec!(94500)).unwrap(), extreme, stop, entry, span,
+            side,
+            Price::new(dec!(94500)).unwrap(),
+            extreme,
+            stop,
+            entry,
+            span,
         );
         assert!(r.is_none());
     }
@@ -584,17 +665,41 @@ mod tests {
     #[test]
     fn test_long_stop_hit_at_or_below() {
         let stop = Price::new(dec!(95000)).unwrap();
-        assert!(is_trailing_stop_hit(Side::Long, Price::new(dec!(95000)).unwrap(), stop));
-        assert!(is_trailing_stop_hit(Side::Long, Price::new(dec!(94900)).unwrap(), stop));
-        assert!(!is_trailing_stop_hit(Side::Long, Price::new(dec!(95100)).unwrap(), stop));
+        assert!(is_trailing_stop_hit(
+            Side::Long,
+            Price::new(dec!(95000)).unwrap(),
+            stop
+        ));
+        assert!(is_trailing_stop_hit(
+            Side::Long,
+            Price::new(dec!(94900)).unwrap(),
+            stop
+        ));
+        assert!(!is_trailing_stop_hit(
+            Side::Long,
+            Price::new(dec!(95100)).unwrap(),
+            stop
+        ));
     }
 
     #[test]
     fn test_short_stop_hit_at_or_above() {
         let stop = Price::new(dec!(95000)).unwrap();
-        assert!(is_trailing_stop_hit(Side::Short, Price::new(dec!(95000)).unwrap(), stop));
-        assert!(is_trailing_stop_hit(Side::Short, Price::new(dec!(95100)).unwrap(), stop));
-        assert!(!is_trailing_stop_hit(Side::Short, Price::new(dec!(94900)).unwrap(), stop));
+        assert!(is_trailing_stop_hit(
+            Side::Short,
+            Price::new(dec!(95000)).unwrap(),
+            stop
+        ));
+        assert!(is_trailing_stop_hit(
+            Side::Short,
+            Price::new(dec!(95100)).unwrap(),
+            stop
+        ));
+        assert!(!is_trailing_stop_hit(
+            Side::Short,
+            Price::new(dec!(94900)).unwrap(),
+            stop
+        ));
     }
 
     // =========================================================================
@@ -633,12 +738,8 @@ mod tests {
     fn test_price_at_entry_no_update() {
         let (side, entry, stop, extreme, span) = long_setup();
         let result = update_trailing_stop_discrete(
-            side,
-            entry, // price exactly at entry
-            extreme,
-            stop,
-            entry,
-            span,
+            side, entry, // price exactly at entry
+            extreme, stop, entry, span,
         );
         assert!(result.is_none()); // zero profit distance
     }
@@ -663,13 +764,24 @@ mod tests {
 
         // Price hits 96,500 — first span
         let r = update_trailing_stop_discrete(
-            side, Price::new(dec!(96500)).unwrap(), extreme, stop, entry, span,
-        ).unwrap();
+            side,
+            Price::new(dec!(96500)).unwrap(),
+            extreme,
+            stop,
+            entry,
+            span,
+        )
+        .unwrap();
         assert_eq!(r.new_favorable_extreme.as_decimal(), dec!(96500));
 
         // Price drops to 95,500 — extreme should remain at 96,500
         let r2 = update_trailing_stop_discrete(
-            side, Price::new(dec!(95500)).unwrap(), r.new_favorable_extreme, r.new_stop, entry, span,
+            side,
+            Price::new(dec!(95500)).unwrap(),
+            r.new_favorable_extreme,
+            r.new_stop,
+            entry,
+            span,
         );
         assert!(r2.is_none()); // Peak was already 96,500, price didn't exceed it
     }

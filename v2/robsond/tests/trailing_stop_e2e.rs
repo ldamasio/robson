@@ -68,7 +68,10 @@ async fn test_trailing_stop_e2e() {
     let decision_a = engine.process_active_position(&position, &market_data_high).unwrap();
 
     // Verify: Decision has updated position and actions
-    assert!(decision_a.updated_position.is_some(), "Tick A: Should have updated position");
+    assert!(
+        decision_a.updated_position.is_some(),
+        "Tick A: Should have updated position"
+    );
 
     let updated_a = decision_a.updated_position.as_ref().unwrap();
 
@@ -121,7 +124,10 @@ async fn test_trailing_stop_e2e() {
 
     // Verify: Exit decision
     let has_exit_event = decision_b.actions.iter().any(|action| {
-        matches!(action, robson_engine::EngineAction::EmitEvent(Event::ExitTriggered { .. }))
+        matches!(
+            action,
+            robson_engine::EngineAction::EmitEvent(Event::ExitTriggered { .. })
+        )
     });
     assert!(has_exit_event, "Tick B: Should emit ExitTriggered");
 

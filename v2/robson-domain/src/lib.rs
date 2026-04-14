@@ -23,9 +23,9 @@ pub use credentials::{
 };
 pub use detected_position::{CalculatedStop, DetectedPosition, StopMethod};
 pub use entities::{
-    AccountId, DetectorSignal, ExitReason, Order, OrderId, OrderStatus, OrderType, Position,
-    PositionId, PositionState, calculate_margin_required, calculate_notional_value,
-    calculate_position_size,
+    calculate_margin_required, calculate_notional_value, calculate_position_size, AccountId,
+    DetectorSignal, ExitReason, Order, OrderId, OrderStatus, OrderType, Position, PositionId,
+    PositionState,
 };
 pub use events::Event;
 pub use market_data::{Candle, MarketDataEvent, OrderBookSnapshot, Tick};

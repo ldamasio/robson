@@ -5,8 +5,8 @@
 mod helpers;
 
 pub use helpers::{
-    AppendEventOptions, append_event, seed_balance_sampled_event, seed_position_opened_event,
-    seed_tenant_account,
+    append_event, seed_balance_sampled_event, seed_position_opened_event, seed_tenant_account,
+    AppendEventOptions,
 };
 
 use anyhow::Result;

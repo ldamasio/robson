@@ -276,9 +276,10 @@ pub async fn find_active_from_projection(
         }
 
         // Set tech stop distance
-        if let (Some(_distance), Some(stop_price)) =
-            (row_data.technical_stop_distance, row_data.technical_stop_price)
-        {
+        if let (Some(_distance), Some(stop_price)) = (
+            row_data.technical_stop_distance,
+            row_data.technical_stop_price,
+        ) {
             let entry = position.entry_price.ok_or_else(|| {
                 StoreError::Deserialization("Missing entry_price for technical stop".to_string())
             })?;
@@ -510,7 +511,10 @@ mod tests {
                 assert_eq!(trailing_stop.as_decimal(), dec!(93500));
                 assert_eq!(favorable_extreme.as_decimal(), dec!(97000));
                 assert!(insurance_stop_id.is_none());
-                assert_eq!(last_emitted_stop.as_ref().map(|p| p.as_decimal()), Some(dec!(93500)));
+                assert_eq!(
+                    last_emitted_stop.as_ref().map(|p| p.as_decimal()),
+                    Some(dec!(93500))
+                );
             },
             _ => panic!("Expected Active state, got {:?}", pos.state),
         }
@@ -601,7 +605,11 @@ mod tests {
             .await
             .expect("Failed to restore positions");
 
-        assert_eq!(restored.len(), 2, "Should restore entering + exiting positions");
+        assert_eq!(
+            restored.len(),
+            2,
+            "Should restore entering + exiting positions"
+        );
 
         let entering = restored.iter().find(|p| p.id == entering_id).expect("Missing entering");
         match &entering.state {

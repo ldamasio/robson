@@ -105,7 +105,9 @@ impl ExchangePort for StubExchange {
         expected_leverage: u8,
     ) -> Result<MarginSettings, ExecError> {
         if self.should_fail() {
-            return Err(ExecError::Exchange("Simulated margin check failure".to_string()));
+            return Err(ExecError::Exchange(
+                "Simulated margin check failure".to_string(),
+            ));
         }
 
         let (is_isolated, leverage) = {
@@ -147,7 +149,9 @@ impl ExchangePort for StubExchange {
     ) -> Result<OrderResult, ExecError> {
         // Check if we should simulate a failure
         if self.should_fail() {
-            return Err(ExecError::Exchange("Simulated exchange failure".to_string()));
+            return Err(ExecError::Exchange(
+                "Simulated exchange failure".to_string(),
+            ));
         }
 
         // Get current price
@@ -183,7 +187,9 @@ impl ExchangePort for StubExchange {
 
     async fn get_price(&self, symbol: &Symbol) -> Result<Price, ExecError> {
         if self.should_fail() {
-            return Err(ExecError::Exchange("Simulated price fetch failure".to_string()));
+            return Err(ExecError::Exchange(
+                "Simulated price fetch failure".to_string(),
+            ));
         }
 
         let price = self.get_price_decimal(&symbol.as_pair());
@@ -192,7 +198,9 @@ impl ExchangePort for StubExchange {
 
     async fn health_check(&self) -> Result<(), ExecError> {
         if self.should_fail() {
-            return Err(ExecError::Exchange("Simulated health check failure".to_string()));
+            return Err(ExecError::Exchange(
+                "Simulated health check failure".to_string(),
+            ));
         }
         Ok(())
     }
@@ -345,12 +353,22 @@ mod tests {
         let btc = Symbol::from_pair("BTCUSDT").unwrap();
 
         let eth_result = exchange
-            .place_market_order(&eth, OrderSide::Buy, Quantity::new(dec!(1.0)).unwrap(), "eth-1")
+            .place_market_order(
+                &eth,
+                OrderSide::Buy,
+                Quantity::new(dec!(1.0)).unwrap(),
+                "eth-1",
+            )
             .await
             .unwrap();
 
         let btc_result = exchange
-            .place_market_order(&btc, OrderSide::Buy, Quantity::new(dec!(0.1)).unwrap(), "btc-1")
+            .place_market_order(
+                &btc,
+                OrderSide::Buy,
+                Quantity::new(dec!(0.1)).unwrap(),
+                "btc-1",
+            )
             .await
             .unwrap();
 
@@ -379,7 +397,12 @@ mod tests {
 
         // Next call should succeed
         let result = exchange
-            .place_market_order(&symbol, OrderSide::Buy, Quantity::new(dec!(0.1)).unwrap(), "ok-1")
+            .place_market_order(
+                &symbol,
+                OrderSide::Buy,
+                Quantity::new(dec!(0.1)).unwrap(),
+                "ok-1",
+            )
             .await;
 
         assert!(result.is_ok());

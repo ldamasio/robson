@@ -121,7 +121,12 @@ impl DetectedPositionDto {
         let side = match self.side.as_str() {
             "long" => Side::Long,
             "short" => Side::Short,
-            _ => return Err(StoreError::Deserialization(format!("Invalid side: {}", self.side))),
+            _ => {
+                return Err(StoreError::Deserialization(format!(
+                    "Invalid side: {}",
+                    self.side
+                )))
+            },
         };
 
         let entry_price = Price::new(self.entry_price).map_err(|e| {
@@ -613,7 +618,13 @@ mod tests {
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
         let entry_price = Price::new(rust_decimal_macros::dec!(95000)).unwrap();
         let quantity = Quantity::new(rust_decimal_macros::dec!(0.1)).unwrap();
-        DetectedPosition::new("binance_123".to_string(), symbol, Side::Long, entry_price, quantity)
+        DetectedPosition::new(
+            "binance_123".to_string(),
+            symbol,
+            Side::Long,
+            entry_price,
+            quantity,
+        )
     }
 
     #[tokio::test]

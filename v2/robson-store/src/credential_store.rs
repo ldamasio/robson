@@ -40,8 +40,8 @@ use sqlx::PgPool;
 
 mod crypto {
     use aes_gcm::{
-        Aes256Gcm, Nonce,
         aead::{Aead, KeyInit, OsRng},
+        Aes256Gcm, Nonce,
     };
     use rand::RngCore;
     use robson_domain::CredentialError;
@@ -210,7 +210,13 @@ impl MemoryCredentialStore {
     }
 
     fn id_to_key(id: &CredentialId) -> String {
-        format!("{}:{}:{}:{}", id.tenant_id(), id.user_id(), id.exchange.as_str(), id.profile())
+        format!(
+            "{}:{}:{}:{}",
+            id.tenant_id(),
+            id.user_id(),
+            id.exchange.as_str(),
+            id.profile()
+        )
     }
 }
 

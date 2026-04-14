@@ -888,7 +888,10 @@ mod tests {
             .expect("Detector task panicked");
 
         // Should return None (no signal) due to cancellation
-        assert!(result.is_none(), "Detector should not emit signal on cancellation");
+        assert!(
+            result.is_none(),
+            "Detector should not emit signal on cancellation"
+        );
     }
 
     #[tokio::test]
@@ -920,7 +923,10 @@ mod tests {
             .expect("Detector task panicked");
 
         // Should return None (cancelled before signal)
-        assert!(result.is_none(), "Detector should be cancelled before emitting signal");
+        assert!(
+            result.is_none(),
+            "Detector should be cancelled before emitting signal"
+        );
     }
 
     #[tokio::test]
@@ -952,7 +958,10 @@ mod tests {
                 .expect("Detector task panicked");
 
             // All should return None (cancelled)
-            assert!(result.is_none(), "Detector should not emit signal on cancellation");
+            assert!(
+                result.is_none(),
+                "Detector should not emit signal on cancellation"
+            );
         }
     }
 }

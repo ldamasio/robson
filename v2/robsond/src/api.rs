@@ -11,14 +11,14 @@
 
 use async_stream::stream;
 use axum::{
-    Json, Router,
     extract::{Path, State},
-    http::{StatusCode, header},
+    http::{header, StatusCode},
     response::{
-        IntoResponse,
         sse::{KeepAlive, Sse},
+        IntoResponse,
     },
     routing::{delete, get, post},
+    Json, Router,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -439,7 +439,10 @@ where
 
     (
         [
-            (header::CACHE_CONTROL, header::HeaderValue::from_static("no-cache")),
+            (
+                header::CACHE_CONTROL,
+                header::HeaderValue::from_static("no-cache"),
+            ),
             (
                 header::HeaderName::from_static("x-accel-buffering"),
                 header::HeaderValue::from_static("no"),
@@ -826,9 +829,12 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
 fn position_to_summary(position: &Position) -> PositionSummary {
     let (state_str, entry_price, trailing_stop, pnl) = match &position.state {
         PositionState::Armed => ("Armed".to_string(), None, None, None),
-        PositionState::Entering { expected_entry, .. } => {
-            ("Entering".to_string(), Some(expected_entry.as_decimal()), None, None)
-        },
+        PositionState::Entering { expected_entry, .. } => (
+            "Entering".to_string(),
+            Some(expected_entry.as_decimal()),
+            None,
+            None,
+        ),
         PositionState::Active { trailing_stop, .. } => (
             "Active".to_string(),
             position.entry_price.map(|p| p.as_decimal()),
@@ -878,7 +884,7 @@ mod tests {
     use crate::query_engine::TracingQueryRecorder;
     use axum::{
         body::Body,
-        http::{Request, header::CONTENT_TYPE},
+        http::{header::CONTENT_TYPE, Request},
     };
     use http_body_util::BodyExt;
     use robson_domain::RiskConfig;
@@ -891,7 +897,11 @@ mod tests {
 
     async fn create_test_app_with_event_bus(
         capacity: usize,
-    ) -> (Router, Arc<EventBus>, Arc<RwLock<PositionManager<StubExchange, MemoryStore>>>) {
+    ) -> (
+        Router,
+        Arc<EventBus>,
+        Arc<RwLock<PositionManager<StubExchange, MemoryStore>>>,
+    ) {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
@@ -1058,8 +1068,14 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "text/event-stream");
-        assert_eq!(response.headers().get(header::CACHE_CONTROL).unwrap(), "no-cache");
+        assert_eq!(
+            response.headers().get(CONTENT_TYPE).unwrap(),
+            "text/event-stream"
+        );
+        assert_eq!(
+            response.headers().get(header::CACHE_CONTROL).unwrap(),
+            "no-cache"
+        );
         assert_eq!(response.headers().get("x-accel-buffering").unwrap(), "no");
 
         event_bus.send(crate::event_bus::DaemonEvent::PositionStateChanged {

@@ -12,7 +12,7 @@
 //! ```
 
 use chrono::Utc;
-use robson_eventlog::{ActorType, Event, append_event};
+use robson_eventlog::{append_event, ActorType, Event};
 use rust_decimal_macros::dec;
 use sqlx::PgPool;
 use uuid::Uuid;

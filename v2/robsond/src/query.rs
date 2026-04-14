@@ -733,7 +733,10 @@ mod tests {
 
         query.transition(QueryState::Processing).unwrap();
         query.transition(QueryState::RiskChecked).unwrap();
-        query.deny("Too many positions".to_string(), "max_open_positions".to_string());
+        query.deny(
+            "Too many positions".to_string(),
+            "max_open_positions".to_string(),
+        );
 
         // State must be Denied (terminal)
         assert!(
@@ -768,7 +771,10 @@ mod tests {
         assert_eq!(approval.ttl_seconds, 30);
         assert!(approval.expires_at >= query.started_at);
         assert!(approval.approved_at.is_none());
-        assert!(query.finished_at.is_none(), "AwaitingApproval is non-terminal");
+        assert!(
+            query.finished_at.is_none(),
+            "AwaitingApproval is non-terminal"
+        );
     }
 
     #[test]
@@ -806,7 +812,10 @@ mod tests {
         query.transition(QueryState::Processing).unwrap();
         query.transition(QueryState::RiskChecked).unwrap();
         query.await_approval("Manual gate".to_string(), 60).unwrap();
-        query.deny("Risk context changed".to_string(), "max_open_positions".to_string());
+        query.deny(
+            "Risk context changed".to_string(),
+            "max_open_positions".to_string(),
+        );
 
         assert!(matches!(query.state, QueryState::Denied { .. }));
         assert!(matches!(query.outcome, Some(QueryOutcome::Denied { .. })));
@@ -820,7 +829,10 @@ mod tests {
         query.transition(QueryState::Processing).unwrap();
 
         let result = query.authorize();
-        assert!(result.is_err(), "authorize() must fail outside AwaitingApproval");
+        assert!(
+            result.is_err(),
+            "authorize() must fail outside AwaitingApproval"
+        );
     }
 
     #[test]
@@ -858,7 +870,10 @@ mod tests {
         );
 
         assert!(matches!(query.kind, QueryKind::ArmPosition { .. }));
-        assert!(matches!(query.actor, ActorKind::Operator { source: CommandSource::Api }));
+        assert!(matches!(
+            query.actor,
+            ActorKind::Operator { source: CommandSource::Api }
+        ));
     }
 
     #[test]

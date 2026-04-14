@@ -36,7 +36,10 @@ pub async fn init_minimal_data(
     .await?;
 
     if existing.is_some() {
-        info!("Strategy already exists for tenant={}, account={}", tenant_id, account_id);
+        info!(
+            "Strategy already exists for tenant={}, account={}",
+            tenant_id, account_id
+        );
         tx.commit().await?;
         return Ok((tenant_id, account_id));
     }

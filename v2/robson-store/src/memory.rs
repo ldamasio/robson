@@ -9,8 +9,8 @@ use async_trait::async_trait;
 use chrono::Datelike;
 use robson_domain::{Event, Order, OrderId, OrderStatus, Position, PositionId};
 use std::collections::HashMap;
-use std::sync::RwLock;
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::RwLock;
 use uuid::Uuid;
 
 /// In-memory store for testing
@@ -357,9 +357,7 @@ impl PositionRepository for MemoryStore {
             .values()
             .filter(|p| {
                 matches!(p.state, robson_domain::PositionState::Closed { .. })
-                    && p.closed_at
-                        .map(|t| t.year() == year && t.month() == month)
-                        .unwrap_or(false)
+                    && p.closed_at.map(|t| t.year() == year && t.month() == month).unwrap_or(false)
             })
             .cloned()
             .collect())
@@ -502,7 +500,11 @@ mod tests {
     use rust_decimal_macros::dec;
 
     fn create_test_position() -> Position {
-        Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long)
+        Position::new(
+            Uuid::now_v7(),
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            Side::Long,
+        )
     }
 
     fn create_test_order(position_id: PositionId) -> Order {
@@ -612,13 +614,24 @@ mod tests {
 
         let result = PositionRepository::find_active(&store).await.unwrap();
 
-        assert_eq!(result.len(), 4, "Expected 4 open positions, got {}", result.len());
+        assert_eq!(
+            result.len(),
+            4,
+            "Expected 4 open positions, got {}",
+            result.len()
+        );
 
         let closed_in_result =
             result.iter().any(|p| matches!(p.state, PositionState::Closed { .. }));
-        assert!(!closed_in_result, "find_active must not return Closed positions");
+        assert!(
+            !closed_in_result,
+            "find_active must not return Closed positions"
+        );
         let error_in_result = result.iter().any(|p| matches!(p.state, PositionState::Error { .. }));
-        assert!(!error_in_result, "find_active must not return Error positions");
+        assert!(
+            !error_in_result,
+            "find_active must not return Error positions"
+        );
 
         let states: Vec<&str> = result.iter().map(|p| p.state.name()).collect();
         for expected in ["armed", "entering", "active", "exiting"] {
@@ -648,7 +661,10 @@ mod tests {
         PositionRepository::save(&store, &pos).await.unwrap();
 
         let result = PositionRepository::find_active(&store).await.unwrap();
-        assert!(result.is_empty(), "Closed position must not appear in find_active");
+        assert!(
+            result.is_empty(),
+            "Closed position must not appear in find_active"
+        );
     }
 
     #[tokio::test]
@@ -665,7 +681,10 @@ mod tests {
         PositionRepository::save(&store, &pos).await.unwrap();
 
         let result = PositionRepository::find_active(&store).await.unwrap();
-        assert!(result.is_empty(), "Error position must not appear in find_active");
+        assert!(
+            result.is_empty(),
+            "Error position must not appear in find_active"
+        );
     }
 
     #[tokio::test]

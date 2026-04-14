@@ -660,10 +660,16 @@ async fn test_global_idempotency(pool: sqlx::PgPool) -> sqlx::Result<()> {
     .bind(idempotency_key)
     .fetch_one(&pool)
     .await?;
-    assert_eq!(count_2, 1, "Second insert should NOT create duplicate; should still be 1 row");
+    assert_eq!(
+        count_2, 1,
+        "Second insert should NOT create duplicate; should still be 1 row"
+    );
 
     // Verify the event_id returned is the same (first insert)
-    assert_eq!(event_id_1, event_id_2, "Both inserts should return same event_id");
+    assert_eq!(
+        event_id_1, event_id_2,
+        "Both inserts should return same event_id"
+    );
 
     Ok(())
 }

@@ -49,8 +49,12 @@ pub async fn append_event_tx(
     let event_id = Uuid::new_v4();
 
     // 3. Compute idempotency key
-    let idempotency_key =
-        compute_idempotency_key(event.tenant_id, stream_key, event.command_id, &event.payload);
+    let idempotency_key = compute_idempotency_key(
+        event.tenant_id,
+        stream_key,
+        event.command_id,
+        &event.payload,
+    );
 
     // 4. Check global idempotency via event_idempotency table
     let idempotency_check = sqlx::query(

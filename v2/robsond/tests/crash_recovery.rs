@@ -8,7 +8,7 @@
 #![cfg(feature = "postgres")]
 
 use chrono::Utc;
-use robson_eventlog::{Event, EventEnvelope, append_event};
+use robson_eventlog::{append_event, Event, EventEnvelope};
 use robson_projector::apply_event_to_projections;
 use robson_store::{PgProjectionReader, ProjectionRecovery};
 use rust_decimal::Decimal;
@@ -137,7 +137,10 @@ async fn test_crash_recovery_restores_active_position(pool: sqlx::PgPool) {
     }
 
     // Verify entry price and quantity
-    assert_eq!(pos.entry_price.as_ref().map(|p| p.as_decimal()), Some(dec!(95000)));
+    assert_eq!(
+        pos.entry_price.as_ref().map(|p| p.as_decimal()),
+        Some(dec!(95000))
+    );
     assert_eq!(pos.quantity.as_decimal(), dec!(0.01));
 
     // Verify technical stop distance
@@ -186,7 +189,11 @@ async fn test_daemon_restore_positions_from_projection(pool: sqlx::PgPool) {
         .expect("Failed to restore positions from projection");
 
     // Should restore 1 position
-    assert_eq!(restored.len(), 1, "Should restore 1 position from projection");
+    assert_eq!(
+        restored.len(),
+        1,
+        "Should restore 1 position from projection"
+    );
 
     // Note: Testing Daemon::restore_positions() requires calling daemon.run(),
     // which is not feasible in this test setup. The projection_recovery test
@@ -277,7 +284,7 @@ async fn append_and_apply(
     event_type: &str,
     payload: serde_json::Value,
 ) -> Result<(), anyhow::Error> {
-    use robson_eventlog::{Event, append_event};
+    use robson_eventlog::{append_event, Event};
 
     let event = Event::new(tenant_id, stream_key.to_string(), event_type, payload);
     let event_id = append_event(pool, stream_key, None, event).await?;
@@ -335,7 +342,11 @@ async fn test_recovery_from_domain_position_armed(pool: sqlx::PgPool) {
     assert_eq!(pos.symbol.as_pair(), "BTCUSDT");
 
     use robson_domain::PositionState;
-    assert!(matches!(pos.state, PositionState::Armed), "Expected Armed, got {:?}", pos.state);
+    assert!(
+        matches!(pos.state, PositionState::Armed),
+        "Expected Armed, got {:?}",
+        pos.state
+    );
 }
 
 /// Test: full domain lifecycle — armed → entry_filled → trailing_stop_updated →
@@ -472,7 +483,7 @@ async fn test_recovery_domain_closed_position_excluded(pool: sqlx::PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "Requires DATABASE_URL to be set"]
 async fn test_projector_rejects_unknown_event_type(pool: sqlx::PgPool) {
-    use robson_eventlog::{Event, append_event};
+    use robson_eventlog::{append_event, Event};
 
     let tenant_id = Uuid::now_v7();
     let stream_key = "test:unknown:event";
@@ -497,7 +508,10 @@ async fn test_projector_rejects_unknown_event_type(pool: sqlx::PgPool) {
 
     // Apply to projections - should return MissingHandler error
     let result = apply_event_to_projections(&pool, &envelope).await;
-    assert!(result.is_err(), "Projector should return error for unknown event type");
+    assert!(
+        result.is_err(),
+        "Projector should return error for unknown event type"
+    );
 
     let err = result.unwrap_err();
     assert!(
@@ -518,7 +532,7 @@ async fn test_projector_rejects_unknown_event_type(pool: sqlx::PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "Requires DATABASE_URL to be set"]
 async fn test_projection_and_recovery_from_appended_position_armed(pool: sqlx::PgPool) {
-    use robson_eventlog::{Event, append_event};
+    use robson_eventlog::{append_event, Event};
 
     let tenant_id = Uuid::now_v7();
     let position_id = Uuid::now_v7();
@@ -574,13 +588,25 @@ async fn test_projection_and_recovery_from_appended_position_armed(pool: sqlx::P
     );
 
     // 4. Verify recovery from projection works
-    let reader = Arc::new(robson_store::PgProjectionReader::new(Arc::new(pool.clone())))
-        as Arc<dyn robson_store::ProjectionRecovery>;
+    let reader = Arc::new(robson_store::PgProjectionReader::new(Arc::new(
+        pool.clone(),
+    ))) as Arc<dyn robson_store::ProjectionRecovery>;
     let restored = reader.find_active_from_projection(tenant_id).await.expect("Recovery failed");
 
-    assert_eq!(restored.len(), 1, "Should restore 1 position from projection");
-    assert_eq!(restored[0].id, position_id, "Recovered position ID should match");
-    assert_eq!(restored[0].symbol.as_pair(), "BTCUSDT", "Recovered symbol should match");
+    assert_eq!(
+        restored.len(),
+        1,
+        "Should restore 1 position from projection"
+    );
+    assert_eq!(
+        restored[0].id, position_id,
+        "Recovered position ID should match"
+    );
+    assert_eq!(
+        restored[0].symbol.as_pair(),
+        "BTCUSDT",
+        "Recovered symbol should match"
+    );
 }
 
 /// Projection/replay test: exit event ordering is preserved in the eventlog.
@@ -595,7 +621,7 @@ async fn test_projection_and_recovery_from_appended_position_armed(pool: sqlx::P
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "Requires DATABASE_URL to be set"]
 async fn test_replay_exit_event_ordering_preserved_in_eventlog(pool: sqlx::PgPool) {
-    use robson_eventlog::{Event, append_event};
+    use robson_eventlog::{append_event, Event};
 
     let tenant_id = Uuid::now_v7();
     let position_id = Uuid::now_v7();
@@ -672,11 +698,26 @@ async fn test_replay_exit_event_ordering_preserved_in_eventlog(pool: sqlx::PgPoo
     .expect("Failed to fetch events");
 
     assert_eq!(events.len(), 3, "Should have 3 events");
-    assert_eq!(events[0].0, "position_armed", "First event should be position_armed");
-    assert_eq!(events[1].0, "exit_order_placed", "Second event should be exit_order_placed");
-    assert_eq!(events[2].0, "position_closed", "Third event should be position_closed");
-    assert!(events[0].1 < events[1].1, "position_armed seq < exit_order_placed seq");
-    assert!(events[1].1 < events[2].1, "exit_order_placed seq < position_closed seq");
+    assert_eq!(
+        events[0].0, "position_armed",
+        "First event should be position_armed"
+    );
+    assert_eq!(
+        events[1].0, "exit_order_placed",
+        "Second event should be exit_order_placed"
+    );
+    assert_eq!(
+        events[2].0, "position_closed",
+        "Third event should be position_closed"
+    );
+    assert!(
+        events[0].1 < events[1].1,
+        "position_armed seq < exit_order_placed seq"
+    );
+    assert!(
+        events[1].1 < events[2].1,
+        "exit_order_placed seq < position_closed seq"
+    );
 
     // 5. Apply events to projections in order (simulating replay)
     let envelopes: Vec<EventEnvelope> = sqlx::query_as(
@@ -709,11 +750,16 @@ async fn test_replay_exit_event_ordering_preserved_in_eventlog(pool: sqlx::PgPoo
     );
 
     // 7. Verify closed position is NOT restored during recovery
-    let reader = Arc::new(robson_store::PgProjectionReader::new(Arc::new(pool.clone())))
-        as Arc<dyn robson_store::ProjectionRecovery>;
+    let reader = Arc::new(robson_store::PgProjectionReader::new(Arc::new(
+        pool.clone(),
+    ))) as Arc<dyn robson_store::ProjectionRecovery>;
     let restored = reader.find_active_from_projection(tenant_id).await.expect("Recovery failed");
 
-    assert_eq!(restored.len(), 0, "Closed position should NOT be restored from projection");
+    assert_eq!(
+        restored.len(),
+        0,
+        "Closed position should NOT be restored from projection"
+    );
 }
 
 // =============================================================================
@@ -760,8 +806,14 @@ async fn test_runtime_arm_position_persists_to_projection(pool: sqlx::PgPool) {
     let engine = Engine::new(risk_config.clone());
 
     let manager = Arc::new(
-        PositionManager::new(engine, executor, store, event_bus, Arc::new(TracingQueryRecorder))
-            .with_event_log(pool.clone(), tenant_id),
+        PositionManager::new(
+            engine,
+            executor,
+            store,
+            event_bus,
+            Arc::new(TracingQueryRecorder),
+        )
+        .with_event_log(pool.clone(), tenant_id),
     );
 
     // arm_position() exercises the full runtime write path
@@ -799,7 +851,10 @@ async fn test_runtime_arm_position_persists_to_projection(pool: sqlx::PgPool) {
     .await
     .expect("Failed to query event_log event_type");
 
-    assert_eq!(event_type, "position_armed", "First event must be position_armed");
+    assert_eq!(
+        event_type, "position_armed",
+        "First event must be position_armed"
+    );
 
     // Verify positions_current was updated synchronously (projection apply succeeded)
     let state: Option<String> =
@@ -816,13 +871,25 @@ async fn test_runtime_arm_position_persists_to_projection(pool: sqlx::PgPool) {
     );
 
     // Verify crash recovery finds the armed position
-    let reader = Arc::new(robson_store::PgProjectionReader::new(Arc::new(pool.clone())))
-        as Arc<dyn robson_store::ProjectionRecovery>;
+    let reader = Arc::new(robson_store::PgProjectionReader::new(Arc::new(
+        pool.clone(),
+    ))) as Arc<dyn robson_store::ProjectionRecovery>;
     let restored = reader.find_active_from_projection(tenant_id).await.expect("Recovery failed");
 
-    assert_eq!(restored.len(), 1, "Crash recovery should find exactly 1 armed position");
-    assert_eq!(restored[0].id, position.id, "Recovered position ID must match");
-    assert_eq!(restored[0].symbol.as_pair(), "BTCUSDT", "Recovered symbol must match");
+    assert_eq!(
+        restored.len(),
+        1,
+        "Crash recovery should find exactly 1 armed position"
+    );
+    assert_eq!(
+        restored[0].id, position.id,
+        "Recovered position ID must match"
+    );
+    assert_eq!(
+        restored[0].symbol.as_pair(),
+        "BTCUSDT",
+        "Recovered symbol must match"
+    );
 
     use robson_domain::PositionState;
     assert!(
@@ -845,7 +912,7 @@ async fn test_runtime_arm_position_persists_to_projection(pool: sqlx::PgPool) {
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "Requires DATABASE_URL to be set"]
 async fn test_entry_signal_received_handled_without_error(pool: sqlx::PgPool) {
-    use robson_eventlog::{Event, append_event};
+    use robson_eventlog::{append_event, Event};
 
     let tenant_id = Uuid::now_v7();
     let position_id = Uuid::now_v7();

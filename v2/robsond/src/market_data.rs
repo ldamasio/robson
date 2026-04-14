@@ -15,7 +15,7 @@ use robson_domain::{Price, Symbol};
 use std::str::FromStr;
 use std::sync::Arc;
 use tokio::task::JoinHandle;
-use tokio::time::{Duration, sleep};
+use tokio::time::{sleep, Duration};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
