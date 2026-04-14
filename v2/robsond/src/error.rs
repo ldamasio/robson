@@ -7,8 +7,7 @@ use robson_store::StoreError;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::position_monitor::MonitorError;
-use crate::query_engine::QueryRecorderError;
+use crate::{position_monitor::MonitorError, query_engine::QueryRecorderError};
 
 /// Daemon-level errors.
 #[derive(Debug, Error)]
@@ -95,7 +94,8 @@ pub enum DaemonError {
     ///
     /// Returned when `arm_position`, `handle_signal`, or `approve_query` is
     /// called while the system is in MonthlyHalt (4% monthly drawdown reached).
-    /// MonthlyHalt persists until next calendar month or operator acknowledgment.
+    /// MonthlyHalt persists until next calendar month or operator
+    /// acknowledgment.
     #[error("MonthlyHalt active: {reason}")]
     MonthlyHaltActive { reason: String },
 

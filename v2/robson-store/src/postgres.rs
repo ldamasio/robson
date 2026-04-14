@@ -8,20 +8,23 @@
 //! This module uses dynamic queries (sqlx::query) instead of compile-time
 //! checked macros (sqlx::query!) to allow compilation without DATABASE_URL.
 
-use crate::error::StoreError;
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use robson_domain::{
     ExitReason, Position, PositionState, Price, Quantity, Side, Symbol, TechnicalStopDistance,
 };
 use rust_decimal::Decimal;
 use sqlx::{PgPool, Row};
-use std::sync::Arc;
 use uuid::Uuid;
+
+use crate::error::StoreError;
 
 /// Trait for reading open core positions from a projection table.
 ///
 /// This trait allows the Daemon to restore positions from the database
-/// projection after a crash, without coupling the Daemon directly to PostgreSQL.
+/// projection after a crash, without coupling the Daemon directly to
+/// PostgreSQL.
 #[async_trait]
 pub trait ProjectionRecovery: Send + Sync {
     /// Find open core positions from the projection for a given tenant.
@@ -98,7 +101,8 @@ struct PositionCurrentRow {
 /// Helper function to parse a row from positions_current query.
 ///
 /// Uses sqlx::Row trait with rust_decimal feature enabled.
-/// For nullable columns, we use try_get::<Option<Decimal>, _>() to handle NULL values correctly.
+/// For nullable columns, we use try_get::<Option<Decimal>, _>() to handle NULL
+/// values correctly.
 fn parse_position_row(row: &sqlx::postgres::PgRow) -> Result<PositionCurrentRow, sqlx::Error> {
     // Helper to get optional decimal values (handles NULL correctly)
     let try_get_decimal = |column: &str| -> Option<Decimal> {
@@ -169,7 +173,8 @@ fn parse_exit_reason(reason: &str) -> Option<ExitReason> {
 /// - strategy_id: Uuid
 /// - symbol: String (e.g., "BTCUSDT")
 /// - side: String ("long" or "short")
-/// - state: String ("armed", "entering", "active", "exiting", "closed", "error")
+/// - state: String ("armed", "entering", "active", "exiting", "closed",
+///   "error")
 /// - entry_price: Decimal?
 /// - entry_quantity: Decimal?
 /// - current_quantity: Decimal
@@ -276,10 +281,9 @@ pub async fn find_active_from_projection(
         }
 
         // Set tech stop distance
-        if let (Some(_distance), Some(stop_price)) = (
-            row_data.technical_stop_distance,
-            row_data.technical_stop_price,
-        ) {
+        if let (Some(_distance), Some(stop_price)) =
+            (row_data.technical_stop_distance, row_data.technical_stop_price)
+        {
             let entry = position.entry_price.ok_or_else(|| {
                 StoreError::Deserialization("Missing entry_price for technical stop".to_string())
             })?;
@@ -420,9 +424,10 @@ pub async fn find_active_from_projection(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use chrono::Utc;
     use rust_decimal_macros::dec;
+
+    use super::*;
 
     /// Integration test for projection recovery.
     ///
@@ -432,7 +437,8 @@ mod tests {
     /// - Provides a PgPool for the test
     /// - Rolls back the transaction at the end
     ///
-    /// Run with: `DATABASE_URL=postgresql://localhost/test cargo test -p robson-store --features postgres -- --ignored`
+    /// Run with: `DATABASE_URL=postgresql://localhost/test cargo test -p
+    /// robson-store --features postgres -- --ignored`
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "Requires DATABASE_URL to be set"]
     async fn test_projection_recovery_restores_active_position(pool: PgPool) {
@@ -511,10 +517,7 @@ mod tests {
                 assert_eq!(trailing_stop.as_decimal(), dec!(93500));
                 assert_eq!(favorable_extreme.as_decimal(), dec!(97000));
                 assert!(insurance_stop_id.is_none());
-                assert_eq!(
-                    last_emitted_stop.as_ref().map(|p| p.as_decimal()),
-                    Some(dec!(93500))
-                );
+                assert_eq!(last_emitted_stop.as_ref().map(|p| p.as_decimal()), Some(dec!(93500)));
             },
             _ => panic!("Expected Active state, got {:?}", pos.state),
         }
@@ -605,11 +608,7 @@ mod tests {
             .await
             .expect("Failed to restore positions");
 
-        assert_eq!(
-            restored.len(),
-            2,
-            "Should restore entering + exiting positions"
-        );
+        assert_eq!(restored.len(), 2, "Should restore entering + exiting positions");
 
         let entering = restored.iter().find(|p| p.id == entering_id).expect("Missing entering");
         match &entering.state {

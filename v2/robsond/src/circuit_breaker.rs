@@ -24,10 +24,10 @@
 //! - **Binary, not a ladder.** No escalation levels. The system is either
 //!   active or halted. There is no Warning, SoftHalt, or HardHalt.
 //! - **MonthlyHalt closes positions.** When the 4% monthly drawdown limit is
-//!   reached, all open positions are closed immediately using the existing
-//!   exit logic (without re-entering `entry_flow_lock`).
-//! - **No automatic reset.** MonthlyHalt persists until next calendar month
-//!   or explicit operator acknowledgment. There is no `/monthly-halt/reset`
+//!   reached, all open positions are closed immediately using the existing exit
+//!   logic (without re-entering `entry_flow_lock`).
+//! - **No automatic reset.** MonthlyHalt persists until next calendar month or
+//!   explicit operator acknowledgment. There is no `/monthly-halt/reset`
 //!   endpoint — unblocking the month without policy evidence is not permitted.
 //! - **Manual trigger allowed.** An operator may trigger MonthlyHalt
 //!   conservatively via `POST /monthly-halt` if they judge conditions unsafe.
@@ -47,7 +47,8 @@ use tokio::sync::RwLock;
 pub enum HaltState {
     /// Normal operation.
     Active,
-    /// Monthly drawdown limit reached (4%). All new entries blocked; positions closed.
+    /// Monthly drawdown limit reached (4%). All new entries blocked; positions
+    /// closed.
     MonthlyHalt,
 }
 
@@ -133,8 +134,9 @@ impl State {
 
 /// Runtime MonthlyHalt gate.
 ///
-/// Wraps an inner `RwLock<State>` so it can be read/written from `&self` contexts.
-/// Intended to be stored as `Arc<CircuitBreaker>` inside `PositionManager`.
+/// Wraps an inner `RwLock<State>` so it can be read/written from `&self`
+/// contexts. Intended to be stored as `Arc<CircuitBreaker>` inside
+/// `PositionManager`.
 #[derive(Debug)]
 pub struct CircuitBreaker {
     state: RwLock<State>,

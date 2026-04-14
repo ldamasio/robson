@@ -1,9 +1,10 @@
 //! Event Querying
 
-use crate::types::{EventEnvelope, EventLogError, Result};
 use chrono::{DateTime, Utc};
 use sqlx::PgPool;
 use uuid::Uuid;
+
+use crate::types::{EventEnvelope, EventLogError, Result};
 
 /// Query options for reading events
 #[derive(Debug, Clone)]

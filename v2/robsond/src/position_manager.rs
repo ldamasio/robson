@@ -19,17 +19,9 @@
 //! Shutdown → CancellationToken.cancel() → all detectors exit
 //! ```
 
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::{collections::HashMap, sync::Arc};
 
 use chrono::Datelike;
-
-use tokio::sync::{Mutex, RwLock};
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
-use uuid::Uuid;
-
 use robson_domain::{
     DetectorSignal, Event, Position, PositionId, PositionState, Price, Quantity, RiskConfig, Side,
     Symbol, TechnicalStopDistance,
@@ -46,16 +38,27 @@ use robson_store::Store;
 use rust_decimal::Decimal;
 #[cfg(feature = "postgres")]
 use sqlx::PgPool;
-
-use crate::circuit_breaker::CircuitBreaker;
-use crate::detector::DetectorTask;
-use crate::error::{DaemonError, DaemonResult};
-use crate::event_bus::{DaemonEvent, EventBus, MarketData};
-use crate::query::{
-    ActorKind, CommandSource, ContextSummary, ExecutionQuery, QueryKind, QueryOutcome, QueryState,
+use tokio::{
+    sync::{Mutex, RwLock},
+    task::JoinHandle,
 };
-use crate::query_engine::{
-    ApprovalCheckResult, ApprovalPolicy, CheckRiskError, GovernedAction, QueryEngine, QueryRecorder,
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
+use uuid::Uuid;
+
+use crate::{
+    circuit_breaker::CircuitBreaker,
+    detector::DetectorTask,
+    error::{DaemonError, DaemonResult},
+    event_bus::{DaemonEvent, EventBus, MarketData},
+    query::{
+        ActorKind, CommandSource, ContextSummary, ExecutionQuery, QueryKind, QueryOutcome,
+        QueryState,
+    },
+    query_engine::{
+        ApprovalCheckResult, ApprovalPolicy, CheckRiskError, GovernedAction, QueryEngine,
+        QueryRecorder,
+    },
 };
 
 // =============================================================================
@@ -86,7 +89,8 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     detectors: Arc<RwLock<HashMap<PositionId, JoinHandle<Option<DetectorSignal>>>>>,
     /// Pending approvals held in runtime memory for Phase 3.
     pending_approvals: Arc<RwLock<HashMap<Uuid, PendingApprovalRecord>>>,
-    /// Serializes entry-governance flows so pending reservations remain coherent.
+    /// Serializes entry-governance flows so pending reservations remain
+    /// coherent.
     entry_flow_lock: Mutex<()>,
     /// Query engine for lifecycle tracking and audit persistence
     query_engine: Arc<QueryEngine<Arc<dyn QueryRecorder>>>,
@@ -95,7 +99,8 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// Optional postgres pool for persisting domain events to robson-eventlog.
     #[cfg(feature = "postgres")]
     event_log_pool: Option<PgPool>,
-    /// Tenant ID used for eventlog entries. Required when event_log_pool is Some.
+    /// Tenant ID used for eventlog entries. Required when event_log_pool is
+    /// Some.
     #[cfg(feature = "postgres")]
     event_log_tenant_id: Option<Uuid>,
 }
@@ -103,7 +108,8 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
 impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// Create a new position manager.
     ///
-    /// After creation, call `start(Arc::clone(&manager))` to start the signal listener.
+    /// After creation, call `start(Arc::clone(&manager))` to start the signal
+    /// listener.
     pub fn new(
         engine: Engine,
         executor: Arc<Executor<E, S>>,
@@ -171,18 +177,22 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     // Eventlog persistence bridge (MIG-v2.5#2)
     // =========================================================================
 
-    /// Persist a single domain event to robson-eventlog and apply it to projections.
+    /// Persist a single domain event to robson-eventlog and apply it to
+    /// projections.
     ///
     /// When `event_log_pool` is configured this is a **fail-fast** operation.
-    /// Any failure in append OR projection apply is returned as `DaemonError::EventLog`
-    /// so that callers propagate the error and abort the current execution cycle.
+    /// Any failure in append OR projection apply is returned as
+    /// `DaemonError::EventLog` so that callers propagate the error and
+    /// abort the current execution cycle.
     ///
     /// Rationale: the synchronous apply on the write path is the only active
-    /// projection update mechanism for `positions_current`. Silencing failures here
-    /// would leave the projection stale without the caller's knowledge, making
-    /// crash recovery unreliable. (MIG-v2.5#2 design decision.)
+    /// projection update mechanism for `positions_current`. Silencing failures
+    /// here would leave the projection stale without the caller's
+    /// knowledge, making crash recovery unreliable. (MIG-v2.5#2 design
+    /// decision.)
     ///
-    /// When no pool is configured (in-memory only mode) returns `Ok(())` immediately.
+    /// When no pool is configured (in-memory only mode) returns `Ok(())`
+    /// immediately.
     ///
     /// Stream key pattern: `position:{position_id}`.
     #[cfg(feature = "postgres")]
@@ -269,20 +279,24 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         Ok(())
     }
 
-    /// Execute engine actions and persist any emitted domain events to the eventlog.
+    /// Execute engine actions and persist any emitted domain events to the
+    /// eventlog.
     ///
-    /// This is a wrapper around `executor.execute()` that adds eventlog persistence
-    /// for events in action results:
+    /// This is a wrapper around `executor.execute()` that adds eventlog
+    /// persistence for events in action results:
     /// - `ActionResult::EventEmitted(event)` - events from EmitEvent action
-    /// - `ActionResult::OrderPlaced { event: Some(event), .. }` - events from exit orders
+    /// - `ActionResult::OrderPlaced { event: Some(event), .. }` - events from
+    ///   exit orders
     ///
-    /// When `event_log_pool` is configured, persistence is **fail-fast**: any failure
-    /// in `persist_event_to_log()` (append OR projection apply) is propagated as a
-    /// `DaemonError::EventLog` and the caller must abort the current execution cycle.
+    /// When `event_log_pool` is configured, persistence is **fail-fast**: any
+    /// failure in `persist_event_to_log()` (append OR projection apply) is
+    /// propagated as a `DaemonError::EventLog` and the caller must abort
+    /// the current execution cycle.
     ///
-    /// This prevents silent projection drift during execution when PostgreSQL is in
-    /// use. Append and projection apply still happen in separate steps, so this is
-    /// fail-fast visibility, not an atomic multi-step guarantee.
+    /// This prevents silent projection drift during execution when PostgreSQL
+    /// is in use. Append and projection apply still happen in separate
+    /// steps, so this is fail-fast visibility, not an atomic multi-step
+    /// guarantee.
     async fn execute_and_persist(
         &self,
         actions: Vec<EngineAction>,
@@ -452,19 +466,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
     /// Build a RiskContext snapshot from current store state.
     ///
-    /// Uses `find_risk_open()` (Entering + Active) so positions with a committed
-    /// exchange order are counted even before fill confirmation. This prevents
-    /// concurrent entries from slipping under the exposure limits during the
-    /// order-fill window (signal fires → order submitted → not yet filled →
-    /// next signal arrives).
+    /// Uses `find_risk_open()` (Entering + Active) so positions with a
+    /// committed exchange order are counted even before fill confirmation.
+    /// This prevents concurrent entries from slipping under the exposure
+    /// limits during the order-fill window (signal fires → order submitted
+    /// → not yet filled → next signal arrives).
     async fn build_risk_context(&self) -> DaemonResult<RiskContext> {
         let capital = self.engine.risk_config().capital();
         let active_positions = self.store.positions().find_risk_open().await?;
 
         // find_risk_open() guarantees only Entering and Active positions.
-        // For Entering: use expected_entry from state (order price is committed on exchange).
-        // For Active: use the recorded fill price (entry_price field).
-        // Defensive: skip positions with zero quantity (should not occur in practice).
+        // For Entering: use expected_entry from state (order price is committed on
+        // exchange). For Active: use the recorded fill price (entry_price
+        // field). Defensive: skip positions with zero quantity (should not
+        // occur in practice).
         let mut summaries: Vec<PositionSummary> = active_positions
             .iter()
             .filter_map(|p| {
@@ -500,14 +515,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .collect();
         summaries.extend(pending_summaries);
 
-        // Monthly realized PnL: sum realized_pnl from all positions closed in the current month.
+        // Monthly realized PnL: sum realized_pnl from all positions closed in the
+        // current month.
         let now = chrono::Utc::now();
         let monthly_closed =
             self.store.positions().find_closed_in_month(now.year(), now.month()).await?;
         let monthly_realized_pnl: Decimal =
             monthly_closed.iter().map(|p| p.realized_pnl - p.fees_paid).sum();
 
-        // Monthly unrealized PnL: sum unrealized PnL from currently open Active positions.
+        // Monthly unrealized PnL: sum unrealized PnL from currently open Active
+        // positions.
         let monthly_unrealized_pnl: Decimal = active_positions
             .iter()
             .filter_map(|p| match &p.state {
@@ -683,10 +700,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         {
             let mut pending_approvals = self.pending_approvals.write().await;
-            pending_approvals.insert(
-                query_id,
-                PendingApprovalRecord { query, position, proposed, governed },
-            );
+            pending_approvals.insert(query_id, PendingApprovalRecord {
+                query,
+                position,
+                proposed,
+                governed,
+            });
         }
 
         let pending_approvals = self.pending_approvals.read().await;
@@ -723,10 +742,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             };
             query.fail(format!("{}", e), phase.to_string());
             self.record_query_failure(query).await?;
-            return Err(DaemonError::Config(format!(
-                "Query transition error: {}",
-                e
-            )));
+            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
         }
         self.record_query_transition(query, "acting").await?;
 
@@ -786,21 +802,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
             query.fail(format!("{}", e), "acting".to_string());
             self.record_query_failure(query).await?;
-            return Err(DaemonError::Config(format!(
-                "Query completion error: {}",
-                e
-            )));
+            return Err(DaemonError::Config(format!("Query completion error: {}", e)));
         }
         self.record_query_transition(query, "completed").await?;
 
         Ok(())
     }
 
-    /// Build a ProposedTrade for risk evaluation from a signal and its engine decision.
+    /// Build a ProposedTrade for risk evaluation from a signal and its engine
+    /// decision.
     ///
-    /// Extracts the quantity decided by the Engine (from PlaceEntryOrder action)
-    /// and computes notional / margin using the fixed leverage constant.
-    /// Returns None if the decision contains no PlaceEntryOrder (caller handles this).
+    /// Extracts the quantity decided by the Engine (from PlaceEntryOrder
+    /// action) and computes notional / margin using the fixed leverage
+    /// constant. Returns None if the decision contains no PlaceEntryOrder
+    /// (caller handles this).
     fn build_proposed_trade(
         signal: &DetectorSignal,
         decision: &EngineDecision,
@@ -941,10 +956,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if let Err(e) = query.transition(QueryState::Processing) {
             query.fail(format!("{}", e), "accepted".to_string());
             self.record_query_failure(&query).await?;
-            return Err(DaemonError::Config(format!(
-                "Query transition error: {}",
-                e
-            )));
+            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
         }
         self.record_query_transition(&query, "processing").await?;
 
@@ -963,10 +975,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if let Err(e) = query.transition(QueryState::Acting) {
             query.fail(format!("{}", e), "processing".to_string());
             self.record_query_failure(&query).await?;
-            return Err(DaemonError::Config(format!(
-                "Query transition error: {}",
-                e
-            )));
+            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
         }
         self.record_query_transition(&query, "acting").await?;
 
@@ -1031,17 +1040,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
             query.fail(format!("{}", e), "acting".to_string());
             self.record_query_failure(&query).await?;
-            return Err(DaemonError::Config(format!(
-                "Query completion error: {}",
-                e
-            )));
+            return Err(DaemonError::Config(format!("Query completion error: {}", e)));
         }
         self.record_query_transition(&query, "completed").await?;
 
         Ok(position)
     }
 
-    /// Returns an `Arc` to the circuit breaker so API handlers can read/write it.
+    /// Returns an `Arc` to the circuit breaker so API handlers can read/write
+    /// it.
     pub fn circuit_breaker(&self) -> Arc<CircuitBreaker> {
         Arc::clone(&self.circuit_breaker)
     }
@@ -1050,7 +1057,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     ///
     /// This method MUST NOT be called while holding `entry_flow_lock` to avoid
     /// deadlock (panic_close_all → disarm_position → entry_flow_lock.lock()).
-    /// It is called from the API handler directly, which does not hold the lock.
+    /// It is called from the API handler directly, which does not hold the
+    /// lock.
     ///
     /// Follow-up required: Entering positions cannot be cancelled yet (exchange
     /// cancel-order logic not implemented). They will remain in Entering state
@@ -1077,10 +1085,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// Evaluate monthly PnL and trigger MonthlyHalt if the 4% limit is crossed.
     ///
     /// This is the automatic runtime trigger. It must be called:
-    /// - After any position close that changes realized PnL (`handle_exit_fill`)
-    /// - It MUST NOT be called while holding `entry_flow_lock`, because
-    ///   it calls `panic_close_all()` which calls `disarm_position()` (which
-    ///   takes `entry_flow_lock` internally).
+    /// - After any position close that changes realized PnL
+    ///   (`handle_exit_fill`)
+    /// - It MUST NOT be called while holding `entry_flow_lock`, because it
+    ///   calls `panic_close_all()` which calls `disarm_position()` (which takes
+    ///   `entry_flow_lock` internally).
     ///
     /// Returns true if MonthlyHalt was triggered this call.
     pub async fn evaluate_monthly_halt(&self) -> bool {
@@ -1159,10 +1168,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let _entry_flow_guard = self.entry_flow_lock.lock().await;
 
         // Create query for lifecycle tracking
-        let mut query = ExecutionQuery::new(
-            QueryKind::DisarmPosition { position_id },
-            Self::operator_actor(),
-        );
+        let mut query =
+            ExecutionQuery::new(QueryKind::DisarmPosition { position_id }, Self::operator_actor());
         query.position_id = Some(position_id);
         self.populate_query_context_summary(&mut query).await;
         self.record_query_accepted(&query).await?;
@@ -1171,10 +1178,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if let Err(e) = query.transition(QueryState::Processing) {
             query.fail(format!("{}", e), "accepted".to_string());
             self.record_query_failure(&query).await?;
-            return Err(DaemonError::Config(format!(
-                "Query transition error: {}",
-                e
-            )));
+            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
         }
         self.record_query_transition(&query, "processing").await?;
 
@@ -1215,10 +1219,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if let Err(e) = query.transition(QueryState::Acting) {
             query.fail(format!("{}", e), "processing".to_string());
             self.record_query_failure(&query).await?;
-            return Err(DaemonError::Config(format!(
-                "Query transition error: {}",
-                e
-            )));
+            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
         }
         self.record_query_transition(&query, "acting").await?;
 
@@ -1237,10 +1238,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 {
                     query.fail(format!("{}", e), "acting".to_string());
                     self.record_query_failure(&query).await?;
-                    return Err(DaemonError::Config(format!(
-                        "Query completion error: {}",
-                        e
-                    )));
+                    return Err(DaemonError::Config(format!("Query completion error: {}", e)));
                 }
                 self.record_query_transition(&query, "completed").await?;
             },
@@ -1307,10 +1305,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if let Err(e) = query.transition(QueryState::Processing) {
             query.fail(format!("{}", e), "accepted".to_string());
             self.record_query_failure(&query).await?;
-            return Err(DaemonError::Config(format!(
-                "Query transition error: {}",
-                e
-            )));
+            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
         }
         self.record_query_transition(&query, "processing").await?;
 
@@ -1336,10 +1331,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             }) {
                 query.fail(format!("{}", e), "processing".to_string());
                 self.record_query_failure(&query).await?;
-                return Err(DaemonError::Config(format!(
-                    "Query completion error: {}",
-                    e
-                )));
+                return Err(DaemonError::Config(format!("Query completion error: {}", e)));
             }
             self.record_query_transition(&query, "completed").await?;
             info!(
@@ -1371,10 +1363,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             }) {
                 query.fail(format!("{}", e), "processing".to_string());
                 self.record_query_failure(&query).await?;
-                return Err(DaemonError::Config(format!(
-                    "Query completion error: {}",
-                    e
-                )));
+                return Err(DaemonError::Config(format!("Query completion error: {}", e)));
             }
             self.record_query_transition(&query, "completed").await?;
             return Ok(());
@@ -1386,10 +1375,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // then delegate to QueryEngine.check_risk(), which:
         //   1. Transitions query to RiskChecked (or returns InvalidState on failure)
         //   2. Evaluates the RiskGate (pure computation)
-        //   3. Returns GovernedAction (approved) or CheckRiskError (denied or state error)
+        //   3. Returns GovernedAction (approved) or CheckRiskError (denied or state
+        //      error)
         //
         // Denial (CheckRiskError::Denied) is a governed outcome — return Ok(()).
-        // InvalidState (CheckRiskError::InvalidState) is an operational error — propagate.
+        // InvalidState (CheckRiskError::InvalidState) is an operational error —
+        // propagate.
         let risk_context = match self.build_risk_context().await {
             Ok(ctx) => ctx,
             Err(e) => {
@@ -1423,10 +1414,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 //
                 // v3: If the denial was caused by monthly drawdown (>=4%):
                 // 1. Activate MonthlyHalt (circuit_breaker blocks new entries).
-                // 2. Release entry_flow_lock — panic_close_all() → disarm_position()
-                //    also acquires this lock; holding it here would deadlock.
-                //    Dropping is safe: MonthlyHalt is already set, no new entries
-                //    can proceed (circuit_breaker.blocks_new_entries() == true).
+                // 2. Release entry_flow_lock — panic_close_all() → disarm_position() also
+                //    acquires this lock; holding it here would deadlock. Dropping is safe:
+                //    MonthlyHalt is already set, no new entries can proceed
+                //    (circuit_breaker.blocks_new_entries() == true).
                 // 3. Close all open positions via panic_close_all().
                 if let QueryState::Denied { ref check, ref reason } = query.state {
                     if check == "monthly_drawdown" {
@@ -1601,10 +1592,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             Err(CheckRiskError::Denied) => {
                 // v3: If denial caused by monthly drawdown during approval revalidation:
                 // 1. Activate MonthlyHalt (circuit_breaker blocks new entries).
-                // 2. Release entry_flow_lock — panic_close_all() → disarm_position()
-                //    also acquires this lock; holding it here would deadlock.
-                //    Dropping is safe: MonthlyHalt is already set, no new entries
-                //    can proceed (circuit_breaker.blocks_new_entries() == true).
+                // 2. Release entry_flow_lock — panic_close_all() → disarm_position() also
+                //    acquires this lock; holding it here would deadlock. Dropping is safe:
+                //    MonthlyHalt is already set, no new entries can proceed
+                //    (circuit_breaker.blocks_new_entries() == true).
                 // 3. Close all open positions via panic_close_all().
                 if let QueryState::Denied { ref check, ref reason } = record.query.state {
                     if check == "monthly_drawdown" {
@@ -1701,8 +1692,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             binance_position_id.clone(),
         )?;
 
-        // Execute actions (EntryFilled event transitions position to Active via apply_event)
-        // Also persists to eventlog for crash recovery (MIG-v2.5#2).
+        // Execute actions (EntryFilled event transitions position to Active via
+        // apply_event) Also persists to eventlog for crash recovery
+        // (MIG-v2.5#2).
         self.execute_and_persist(decision.actions).await?;
 
         info!(
@@ -1784,10 +1776,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             if let Err(e) = query.transition(QueryState::Processing) {
                 query.fail(format!("{}", e), "accepted".to_string());
                 self.record_query_failure(&query).await?;
-                return Err(DaemonError::Config(format!(
-                    "Query transition error: {}",
-                    e
-                )));
+                return Err(DaemonError::Config(format!("Query transition error: {}", e)));
             }
             self.record_query_transition(&query, "processing").await?;
 
@@ -1812,10 +1801,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     let err_str = format!("{}", e);
                     query.fail(err_str.clone(), "processing".to_string());
                     self.record_query_failure(&query).await?;
-                    return Err(DaemonError::Config(format!(
-                        "Query completion error: {}",
-                        e
-                    )));
+                    return Err(DaemonError::Config(format!("Query completion error: {}", e)));
                 }
                 self.record_query_transition(&query, "completed").await?;
                 continue;
@@ -1825,15 +1811,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             if let Err(e) = query.transition(QueryState::Acting) {
                 query.fail(format!("{}", e), "processing".to_string());
                 self.record_query_failure(&query).await?;
-                return Err(DaemonError::Config(format!(
-                    "Query transition error: {}",
-                    e
-                )));
+                return Err(DaemonError::Config(format!("Query transition error: {}", e)));
             }
             self.record_query_transition(&query, "acting").await?;
 
             // Execute actions via Executor (side-effects: EventLog.append, Exchange orders)
-            // MemoryStore is updated via apply_event() called by executor after event append
+            // MemoryStore is updated via apply_event() called by executor after event
+            // append
             let results = match self.execute_and_persist(decision.actions).await {
                 Ok(r) => r,
                 Err(e) => {
@@ -1874,10 +1858,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
                 query.fail(format!("{}", e), "acting".to_string());
                 self.record_query_failure(&query).await?;
-                return Err(DaemonError::Config(format!(
-                    "Query completion error: {}",
-                    e
-                )));
+                return Err(DaemonError::Config(format!("Query completion error: {}", e)));
             }
             self.record_query_transition(&query, "completed").await?;
         }
@@ -1978,13 +1959,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// Iterates all open core positions (Armed, Entering, Active, Exiting) and
     /// applies state-appropriate shutdown:
     ///
-    /// - **Active**: place market exit order via `panic_close_position_internal()`.
+    /// - **Active**: place market exit order via
+    ///   `panic_close_position_internal()`.
     /// - **Armed**: disarm (cancel detector). No exchange action needed.
     /// - **Entering**: order submitted but not yet filled — logged as skipped.
-    ///   Cancelling a pending entry order requires exchange-specific logic deferred
-    ///   to a follow-up task. The position will remain Entering until the order fills
-    ///   or the exchange session expires.
-    /// - **Exiting**: exit already in progress — skip to avoid duplicate orders.
+    ///   Cancelling a pending entry order requires exchange-specific logic
+    ///   deferred to a follow-up task. The position will remain Entering until
+    ///   the order fills or the exchange session expires.
+    /// - **Exiting**: exit already in progress — skip to avoid duplicate
+    ///   orders.
     pub async fn panic_close_all(&self) -> DaemonResult<Vec<PositionId>> {
         warn!("PANIC: Emergency close all positions");
 
@@ -2080,12 +2063,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         Ok(closed_ids)
     }
 
-    /// Emergency close a single position (internal, takes query for lifecycle tracking).
+    /// Emergency close a single position (internal, takes query for lifecycle
+    /// tracking).
     ///
     /// # Failure Recording Ownership
     ///
-    /// This method does NOT call `query.fail()` or persist failure snapshots on errors.
-    /// The caller is responsible for failure recording. This prevents double-fail.
+    /// This method does NOT call `query.fail()` or persist failure snapshots on
+    /// errors. The caller is responsible for failure recording. This
+    /// prevents double-fail.
     ///
     /// Emits PositionClosed event which will be applied by projection.
     async fn panic_close_position_internal(
@@ -2095,10 +2080,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     ) -> DaemonResult<()> {
         // Transition to Processing
         if let Err(e) = query.transition(QueryState::Processing) {
-            return Err(DaemonError::Config(format!(
-                "Query transition error: {}",
-                e
-            )));
+            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
         }
         self.record_query_transition(query, "processing").await?;
 
@@ -2116,15 +2098,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         // Transition to Acting before executor call
         if let Err(e) = query.transition(QueryState::Acting) {
-            return Err(DaemonError::Config(format!(
-                "Query transition error: {}",
-                e
-            )));
+            return Err(DaemonError::Config(format!("Query transition error: {}", e)));
         }
         self.record_query_transition(query, "acting").await?;
 
-        // Place market exit order on exchange (executor also emits ExitOrderPlaced → Active → Exiting)
-        // Use execute_and_persist to ensure events are persisted to eventlog (MIG-v2.5#2)
+        // Place market exit order on exchange (executor also emits ExitOrderPlaced →
+        // Active → Exiting) Use execute_and_persist to ensure events are
+        // persisted to eventlog (MIG-v2.5#2)
         let results = self
             .execute_and_persist(vec![EngineAction::PlaceExitOrder {
                 position_id,
@@ -2230,12 +2210,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::query_engine::TracingQueryRecorder;
     use robson_exec::{IntentJournal, StubExchange};
     use robson_store::MemoryStore;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
+
+    use super::*;
+    use crate::query_engine::TracingQueryRecorder;
 
     /// Create a test manager without starting the signal listener.
     /// Use this for unit tests that call handle_signal() directly.
@@ -2333,13 +2314,7 @@ mod tests {
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let position = manager
-            .arm_position(
-                symbol,
-                Side::Long,
-                create_test_risk_config(),
-                tech_stop,
-                Uuid::now_v7(),
-            )
+            .arm_position(symbol, Side::Long, create_test_risk_config(), tech_stop, Uuid::now_v7())
             .await
             .unwrap();
 
@@ -2360,13 +2335,7 @@ mod tests {
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let position = manager
-            .arm_position(
-                symbol,
-                Side::Long,
-                create_test_risk_config(),
-                tech_stop,
-                Uuid::now_v7(),
-            )
+            .arm_position(symbol, Side::Long, create_test_risk_config(), tech_stop, Uuid::now_v7())
             .await
             .unwrap();
 
@@ -2471,7 +2440,8 @@ mod tests {
             .await
             .unwrap();
 
-        // Move to Active — 8% stop distance passes the risk gate (see test_handle_signal)
+        // Move to Active — 8% stop distance passes the risk gate (see
+        // test_handle_signal)
         let signal = DetectorSignal {
             signal_id: Uuid::now_v7(),
             position_id: position.id,
@@ -2517,7 +2487,8 @@ mod tests {
             .await
             .unwrap();
 
-        // 8% stop — passes risk gate (≥6.67% threshold on $10k capital, 1% risk, 15% max single)
+        // 8% stop — passes risk gate (≥6.67% threshold on $10k capital, 1% risk, 15%
+        // max single)
         let signal = DetectorSignal {
             signal_id: Uuid::now_v7(),
             position_id: position.id,
@@ -2559,8 +2530,9 @@ mod tests {
     /// Phase 2: Risk gate denial keeps position Armed and re-arms the detector.
     ///
     /// A 2% stop distance causes notional ≈ $5000 which exceeds the default
-    /// 15% single-position limit ($1500 on $10k capital), so the entry is denied.
-    /// The position must remain Armed and have a fresh detector after the denial.
+    /// 15% single-position limit ($1500 on $10k capital), so the entry is
+    /// denied. The position must remain Armed and have a fresh detector
+    /// after the denial.
     #[tokio::test]
     async fn test_risk_gate_denial_rearmed_and_position_stays_armed() {
         let manager = create_test_manager().await;
@@ -2636,7 +2608,8 @@ mod tests {
             symbol,
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
-            stop_loss: Price::new(dec!(85500)).unwrap(), // 10% below -> approval required, risk approved
+            stop_loss: Price::new(dec!(85500)).unwrap(), /* 10% below -> approval required, risk
+                                                          * approved */
             timestamp: chrono::Utc::now(),
         };
 
@@ -2699,7 +2672,8 @@ mod tests {
             symbol,
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
-            stop_loss: Price::new(dec!(85500)).unwrap(), // 10% below -> approval required, risk approved
+            stop_loss: Price::new(dec!(85500)).unwrap(), /* 10% below -> approval required, risk
+                                                          * approved */
             timestamp: chrono::Utc::now(),
         };
 
@@ -2862,7 +2836,8 @@ mod tests {
             symbol,
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
-            stop_loss: Price::new(dec!(85500)).unwrap(), // 10% below -> approval required, risk approved
+            stop_loss: Price::new(dec!(85500)).unwrap(), /* 10% below -> approval required, risk
+                                                          * approved */
             timestamp: chrono::Utc::now(),
         };
 
@@ -2899,19 +2874,22 @@ mod tests {
 
     /// Entering positions are included in risk context (find_risk_open).
     ///
-    /// If only find_active() were used, Entering positions would be invisible to
-    /// the risk gate, allowing concurrent entries to bypass exposure checks during
-    /// the order-fill window. This test proves find_risk_open() counts them.
+    /// If only find_active() were used, Entering positions would be invisible
+    /// to the risk gate, allowing concurrent entries to bypass exposure
+    /// checks during the order-fill window. This test proves
+    /// find_risk_open() counts them.
     ///
-    /// Strategy: seed the store with MAX_OPEN_POSITIONS Entering positions, then
-    /// send a signal for a new Armed position. The risk gate must deny it.
+    /// Strategy: seed the store with MAX_OPEN_POSITIONS Entering positions,
+    /// then send a signal for a new Armed position. The risk gate must deny
+    /// it.
     #[tokio::test]
     async fn test_entering_positions_count_in_risk_context() {
         let manager = create_test_manager().await;
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
 
         // Seed the store with 3 positions in Entering state (MaxOpenPositions = 3).
-        // We construct them directly to bypass the fill logic (StubExchange fills immediately).
+        // We construct them directly to bypass the fill logic (StubExchange fills
+        // immediately).
         //
         // Non-zero quantity is required: build_risk_context() skips zero-qty positions
         // when building PositionSummary entries for open_position_count().
@@ -2929,7 +2907,8 @@ mod tests {
         }
 
         // Arm a 4th position (the one we will try to enter).
-        // 8% stop — within valid range (≤10%) and passes single-position check (≥6.67%).
+        // 8% stop — within valid range (≤10%) and passes single-position check
+        // (≥6.67%).
         let entry = Price::new(dec!(100)).unwrap();
         let stop = Price::new(dec!(92)).unwrap(); // 8% stop
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
@@ -2967,13 +2946,15 @@ mod tests {
         );
     }
 
-    /// E2E test: full detector integration (arm → spawn detector → MA crossover → signal → entry)
+    /// E2E test: full detector integration (arm → spawn detector → MA crossover
+    /// → signal → entry)
     ///
     /// Flow:
     /// 1. arm_position() → spawns detector
     /// 2. Inject synthetic market data via EventBus
     /// 3. Wait for MA crossover → DetectorSignal
-    /// 4. Signal listener processes signal → Entry order → Position becomes Active
+    /// 4. Signal listener processes signal → Entry order → Position becomes
+    ///    Active
     ///
     /// Scope: Uses stub exchange, NO real orders, NO WebSocket
     #[tokio::test]
@@ -3112,10 +3093,7 @@ mod tests {
         save_closed_position_with_pnl(&manager, dec!(-399)).await;
 
         let triggered = manager.evaluate_monthly_halt().await;
-        assert!(
-            !triggered,
-            "3.99% monthly loss must not trigger MonthlyHalt"
-        );
+        assert!(!triggered, "3.99% monthly loss must not trigger MonthlyHalt");
         assert!(!manager.circuit_breaker.blocks_new_entries().await);
     }
 
@@ -3126,10 +3104,7 @@ mod tests {
         save_closed_position_with_pnl(&manager, dec!(-400)).await;
 
         let triggered = manager.evaluate_monthly_halt().await;
-        assert!(
-            triggered,
-            "exactly 4% monthly loss must trigger MonthlyHalt"
-        );
+        assert!(triggered, "exactly 4% monthly loss must trigger MonthlyHalt");
         assert!(manager.circuit_breaker.blocks_new_entries().await);
     }
 
@@ -3148,19 +3123,10 @@ mod tests {
 
         // Attempt to arm a new position — must fail
         let result = manager
-            .arm_position(
-                symbol,
-                Side::Long,
-                create_test_risk_config(),
-                tech_stop,
-                Uuid::now_v7(),
-            )
+            .arm_position(symbol, Side::Long, create_test_risk_config(), tech_stop, Uuid::now_v7())
             .await;
 
-        assert!(
-            result.is_err(),
-            "arm_position must fail after MonthlyHalt auto-trigger"
-        );
+        assert!(result.is_err(), "arm_position must fail after MonthlyHalt auto-trigger");
         let err = result.unwrap_err();
         assert!(
             matches!(err, DaemonError::MonthlyHaltActive { .. }),
@@ -3339,9 +3305,10 @@ mod tests {
         );
     }
 
-    /// Regression guard: every path that sets MonthlyHalt must also close positions.
-    /// This test exercises trigger_monthly_halt() directly (the canonical path).
-    /// handle_signal() and approve_query() paths are covered by their respective tests.
+    /// Regression guard: every path that sets MonthlyHalt must also close
+    /// positions. This test exercises trigger_monthly_halt() directly (the
+    /// canonical path). handle_signal() and approve_query() paths are
+    /// covered by their respective tests.
     #[tokio::test]
     async fn test_trigger_monthly_halt_closes_active_positions() {
         let manager = create_test_manager().await;
@@ -3350,18 +3317,12 @@ mod tests {
 
         let closed = manager.trigger_monthly_halt("operator test".to_string()).await.unwrap();
 
-        assert!(
-            !closed.is_empty(),
-            "trigger_monthly_halt must return closed position IDs"
-        );
+        assert!(!closed.is_empty(), "trigger_monthly_halt must return closed position IDs");
 
         let open = manager.store.positions().find_active().await.unwrap();
         let active_count =
             open.iter().filter(|p| matches!(p.state, PositionState::Active { .. })).count();
-        assert_eq!(
-            active_count, 0,
-            "trigger_monthly_halt must close all Active positions"
-        );
+        assert_eq!(active_count, 0, "trigger_monthly_halt must close all Active positions");
     }
 
     #[tokio::test]
@@ -3466,19 +3427,9 @@ mod tests {
 
         // Call handle_exit_fill — must compute realized PnL directly
         let result = manager
-            .handle_exit_fill(
-                position.id,
-                fill_price,
-                quantity,
-                Decimal::ZERO,
-                chrono::Utc::now(),
-            )
+            .handle_exit_fill(position.id, fill_price, quantity, Decimal::ZERO, chrono::Utc::now())
             .await;
-        assert!(
-            result.is_ok(),
-            "handle_exit_fill failed: {:?}",
-            result.err()
-        );
+        assert!(result.is_ok(), "handle_exit_fill failed: {:?}", result.err());
 
         // Reload and verify the closed position has correct negative realized PnL
         let closed = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
@@ -3500,10 +3451,7 @@ mod tests {
         match closed.state {
             PositionState::Closed { realized_pnl, exit_price, .. } => {
                 assert_eq!(realized_pnl, expected_pnl, "Closed.realized_pnl must match");
-                assert_eq!(
-                    exit_price, fill_price,
-                    "Closed.exit_price must be fill_price"
-                );
+                assert_eq!(exit_price, fill_price, "Closed.exit_price must be fill_price");
             },
             other => panic!("expected Closed state, got {:?}", other),
         }
@@ -3532,19 +3480,10 @@ mod tests {
         manager.store.positions().save(&position).await.unwrap();
 
         let result = manager
-            .handle_exit_fill(
-                position.id,
-                fill_price,
-                quantity,
-                Decimal::ZERO,
-                chrono::Utc::now(),
-            )
+            .handle_exit_fill(position.id, fill_price, quantity, Decimal::ZERO, chrono::Utc::now())
             .await;
 
-        assert!(
-            result.is_err(),
-            "handle_exit_fill must reject position with entry_price=None"
-        );
+        assert!(result.is_err(), "handle_exit_fill must reject position with entry_price=None");
         let err = result.unwrap_err();
         assert!(
             matches!(err, DaemonError::InvalidPositionState { .. }),
@@ -3556,9 +3495,10 @@ mod tests {
     /// Verify panic_close_position_internal computes realized PnL from
     /// (fill_price − entry_price) × qty, NOT from current_price.
     ///
-    /// Setup: Active Long position with entry_price = 100_000, current_price = 99_000.
-    /// StubExchange fills at default 95_000. The PnL must be based on fill_price
-    /// (95_000), NOT current_price (99_000), proving the direct calc is used.
+    /// Setup: Active Long position with entry_price = 100_000, current_price =
+    /// 99_000. StubExchange fills at default 95_000. The PnL must be based
+    /// on fill_price (95_000), NOT current_price (99_000), proving the
+    /// direct calc is used.
     #[tokio::test]
     async fn test_panic_close_records_negative_realized_pnl() {
         let manager = create_test_manager().await;
@@ -3587,7 +3527,8 @@ mod tests {
         position.updated_at = now;
         manager.store.positions().save(&position).await.unwrap();
 
-        // Build an ExecutionQuery in Accepted state (panic_close transitions it internally)
+        // Build an ExecutionQuery in Accepted state (panic_close transitions it
+        // internally)
         let mut query = ExecutionQuery::new(
             QueryKind::PanicClosePosition { position_id: position.id },
             ActorKind::Operator { source: CommandSource::Api },
@@ -3640,7 +3581,8 @@ mod tests {
     // Fees deduction in monthly PnL
     // =========================================================================
 
-    /// Helper: save a closed position with realized PnL and fees in the current month.
+    /// Helper: save a closed position with realized PnL and fees in the current
+    /// month.
     async fn save_closed_position_with_pnl_and_fees(
         manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
         realized_pnl: Decimal,
@@ -3678,11 +3620,7 @@ mod tests {
 
         let ctx = manager.build_risk_context().await.unwrap();
 
-        assert_eq!(
-            ctx.monthly_realized_pnl,
-            dec!(-350),
-            "monthly_realized_pnl must deduct fees"
-        );
+        assert_eq!(ctx.monthly_realized_pnl, dec!(-350), "monthly_realized_pnl must deduct fees");
         assert_eq!(
             ctx.monthly_unrealized_pnl,
             dec!(0),
@@ -3698,10 +3636,7 @@ mod tests {
         save_closed_position_with_pnl_and_fees(&manager, dec!(-350), dec!(50)).await;
 
         let triggered = manager.evaluate_monthly_halt().await;
-        assert!(
-            triggered,
-            "net -400 (PnL -350, fees -50) must trigger MonthlyHalt"
-        );
+        assert!(triggered, "net -400 (PnL -350, fees -50) must trigger MonthlyHalt");
         assert!(manager.circuit_breaker.blocks_new_entries().await);
     }
 }

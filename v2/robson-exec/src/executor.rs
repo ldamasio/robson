@@ -11,16 +11,18 @@
 //! ```
 
 use std::sync::Arc;
-use tracing::{debug, error, info};
-use uuid::Uuid;
 
 use robson_domain::{Event, ExitReason, Position, PositionId, RiskConfig};
 use robson_engine::EngineAction;
 use robson_store::Store;
+use tracing::{debug, error, info};
+use uuid::Uuid;
 
-use crate::error::{ExecError, ExecResult};
-use crate::intent::{Intent, IntentAction, IntentJournal, IntentResult};
-use crate::ports::{ExchangePort, OrderResult};
+use crate::{
+    error::{ExecError, ExecResult},
+    intent::{Intent, IntentAction, IntentJournal, IntentResult},
+    ports::{ExchangePort, OrderResult},
+};
 
 // =============================================================================
 // Execution Result
@@ -30,7 +32,8 @@ use crate::ports::{ExchangePort, OrderResult};
 #[derive(Debug)]
 pub enum ActionResult {
     /// Order placed successfully, optionally with a domain event emitted.
-    /// For exit orders, the event is ExitOrderPlaced which transitions position to Exiting.
+    /// For exit orders, the event is ExitOrderPlaced which transitions position
+    /// to Exiting.
     OrderPlaced {
         order: OrderResult,
         event: Option<Event>,
@@ -189,11 +192,11 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         self.exchange.validate_margin_settings(&symbol, RiskConfig::LEVERAGE).await?;
 
         // 3. Record intent
-        let intent = Intent::new(
-            signal_id,
-            position_id,
-            IntentAction::PlaceEntryOrder { symbol: symbol.clone(), side, quantity },
-        );
+        let intent = Intent::new(signal_id, position_id, IntentAction::PlaceEntryOrder {
+            symbol: symbol.clone(),
+            side,
+            quantity,
+        });
 
         if let Err(ExecError::AlreadyProcessed(id)) = self.journal.record(intent) {
             info!(%id, "Intent already recorded, checking status");
@@ -262,16 +265,12 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         self.exchange.validate_margin_settings(&symbol, RiskConfig::LEVERAGE).await?;
 
         // 2. Record intent
-        let intent = Intent::new(
-            intent_id,
-            position_id,
-            IntentAction::PlaceExitOrder {
-                symbol: symbol.clone(),
-                side,
-                quantity,
-                reason: reason.clone(),
-            },
-        );
+        let intent = Intent::new(intent_id, position_id, IntentAction::PlaceExitOrder {
+            symbol: symbol.clone(),
+            side,
+            quantity,
+            reason: reason.clone(),
+        });
 
         self.journal.record(intent)?;
         self.journal.mark_executing(intent_id)?;
@@ -345,11 +344,12 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::stub::StubExchange;
     use robson_domain::{Quantity, Side, Symbol};
     use robson_store::MemoryStore;
     use rust_decimal_macros::dec;
+
+    use super::*;
+    use crate::stub::StubExchange;
 
     async fn create_test_executor() -> Executor<StubExchange, MemoryStore> {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));

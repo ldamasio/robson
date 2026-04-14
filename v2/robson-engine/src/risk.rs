@@ -1,7 +1,8 @@
 //! Risk Gate: Pre-trade approval checks
 //!
 //! The RiskGate evaluates proposed trades against portfolio-level risk limits.
-//! It answers: "given the current portfolio state, should this trade be allowed?"
+//! It answers: "given the current portfolio state, should this trade be
+//! allowed?"
 //!
 //! # Checks Performed
 //!
@@ -344,10 +345,7 @@ impl RiskGate {
             );
             return RiskVerdict::Rejected {
                 check: RiskCheck::DuplicatePosition,
-                reason: format!(
-                    "Already have {} position on {}",
-                    proposed.side, proposed.symbol
-                ),
+                reason: format!("Already have {} position on {}", proposed.side, proposed.symbol),
             };
         }
 
@@ -397,8 +395,9 @@ impl Default for RiskGate {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rust_decimal_macros::dec;
+
+    use super::*;
 
     fn sample_context() -> RiskContext {
         RiskContext::new(dec!(10000))
@@ -428,43 +427,37 @@ mod tests {
     #[test]
     fn test_risk_gate_rejects_max_positions() {
         let gate = RiskGate::new();
-        let context = RiskContext::with_positions(
-            dec!(10000),
-            vec![
-                PositionSummary {
-                    position_id: uuid::Uuid::nil(),
-                    symbol: "ETHUSDT".to_string(),
-                    side: "long".to_string(),
-                    notional_value: dec!(3000),
-                    margin_used: dec!(300),
-                    unrealized_pnl: dec!(0),
-                };
-                3
-            ],
-        );
+        let context = RiskContext::with_positions(dec!(10000), vec![
+            PositionSummary {
+                position_id: uuid::Uuid::nil(),
+                symbol: "ETHUSDT".to_string(),
+                side: "long".to_string(),
+                notional_value: dec!(3000),
+                margin_used: dec!(300),
+                unrealized_pnl: dec!(0),
+            };
+            3
+        ]);
         let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
-        assert!(matches!(
-            verdict,
-            RiskVerdict::Rejected { check: RiskCheck::MaxOpenPositions, .. }
-        ));
+        assert!(matches!(verdict, RiskVerdict::Rejected {
+            check: RiskCheck::MaxOpenPositions,
+            ..
+        }));
     }
 
     #[test]
     fn test_risk_gate_rejects_total_exposure() {
         let gate = RiskGate::new();
-        let context = RiskContext::with_positions(
-            dec!(10000),
-            vec![PositionSummary {
-                position_id: uuid::Uuid::nil(),
-                symbol: "ETHUSDT".to_string(),
-                side: "long".to_string(),
-                notional_value: dec!(2900),
-                margin_used: dec!(290),
-                unrealized_pnl: dec!(0),
-            }],
-        );
+        let context = RiskContext::with_positions(dec!(10000), vec![PositionSummary {
+            position_id: uuid::Uuid::nil(),
+            symbol: "ETHUSDT".to_string(),
+            side: "long".to_string(),
+            notional_value: dec!(2900),
+            margin_used: dec!(290),
+            unrealized_pnl: dec!(0),
+        }]);
         // 2900 + 5000 = 7900 > 3000 (30% of 10000)
         let proposed = ProposedTrade {
             symbol: "BTCUSDT".to_string(),
@@ -476,10 +469,7 @@ mod tests {
         };
 
         let verdict = gate.evaluate(&proposed, &context);
-        assert!(matches!(
-            verdict,
-            RiskVerdict::Rejected { check: RiskCheck::TotalExposure, .. }
-        ));
+        assert!(matches!(verdict, RiskVerdict::Rejected { check: RiskCheck::TotalExposure, .. }));
     }
 
     #[test]
@@ -497,36 +487,30 @@ mod tests {
         };
 
         let verdict = gate.evaluate(&proposed, &context);
-        assert!(matches!(
-            verdict,
-            RiskVerdict::Rejected {
-                check: RiskCheck::SinglePositionConcentration,
-                ..
-            }
-        ));
+        assert!(matches!(verdict, RiskVerdict::Rejected {
+            check: RiskCheck::SinglePositionConcentration,
+            ..
+        }));
     }
 
     #[test]
     fn test_risk_gate_rejects_duplicate_position() {
         let gate = RiskGate::new();
-        let context = RiskContext::with_positions(
-            dec!(10000),
-            vec![PositionSummary {
-                position_id: uuid::Uuid::nil(),
-                symbol: "BTCUSDT".to_string(),
-                side: "long".to_string(),
-                notional_value: dec!(1000),
-                margin_used: dec!(100),
-                unrealized_pnl: dec!(0),
-            }],
-        );
+        let context = RiskContext::with_positions(dec!(10000), vec![PositionSummary {
+            position_id: uuid::Uuid::nil(),
+            symbol: "BTCUSDT".to_string(),
+            side: "long".to_string(),
+            notional_value: dec!(1000),
+            margin_used: dec!(100),
+            unrealized_pnl: dec!(0),
+        }]);
         let proposed = sample_proposed(); // BTCUSDT long
 
         let verdict = gate.evaluate(&proposed, &context);
-        assert!(matches!(
-            verdict,
-            RiskVerdict::Rejected { check: RiskCheck::DuplicatePosition, .. }
-        ));
+        assert!(matches!(verdict, RiskVerdict::Rejected {
+            check: RiskCheck::DuplicatePosition,
+            ..
+        }));
     }
 
     #[test]
@@ -543,10 +527,10 @@ mod tests {
         let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
-        assert!(matches!(
-            verdict,
-            RiskVerdict::Rejected { check: RiskCheck::MonthlyDrawdown, .. }
-        ));
+        assert!(matches!(verdict, RiskVerdict::Rejected {
+            check: RiskCheck::MonthlyDrawdown,
+            ..
+        }));
     }
 
     #[test]
@@ -580,11 +564,7 @@ mod tests {
         let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
-        assert_eq!(
-            verdict,
-            RiskVerdict::Approved,
-            "3.99% monthly loss must be allowed"
-        );
+        assert_eq!(verdict, RiskVerdict::Approved, "3.99% monthly loss must be allowed");
     }
 
     #[test]
@@ -602,10 +582,7 @@ mod tests {
 
         let verdict = gate.evaluate(&proposed, &context);
         assert!(
-            matches!(
-                verdict,
-                RiskVerdict::Rejected { check: RiskCheck::MonthlyDrawdown, .. }
-            ),
+            matches!(verdict, RiskVerdict::Rejected { check: RiskCheck::MonthlyDrawdown, .. }),
             "exactly 4.00% monthly loss must be blocked"
         );
     }
@@ -613,17 +590,14 @@ mod tests {
     #[test]
     fn test_risk_gate_allows_same_symbol_opposite_side() {
         let gate = RiskGate::new();
-        let context = RiskContext::with_positions(
-            dec!(10000),
-            vec![PositionSummary {
-                position_id: uuid::Uuid::nil(),
-                symbol: "BTCUSDT".to_string(),
-                side: "short".to_string(), // Different side
-                notional_value: dec!(1000),
-                margin_used: dec!(100),
-                unrealized_pnl: dec!(0),
-            }],
-        );
+        let context = RiskContext::with_positions(dec!(10000), vec![PositionSummary {
+            position_id: uuid::Uuid::nil(),
+            symbol: "BTCUSDT".to_string(),
+            side: "short".to_string(), // Different side
+            notional_value: dec!(1000),
+            margin_used: dec!(100),
+            unrealized_pnl: dec!(0),
+        }]);
         let proposed = sample_proposed(); // BTCUSDT long
 
         let verdict = gate.evaluate(&proposed, &context);

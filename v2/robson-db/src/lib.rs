@@ -5,7 +5,6 @@
 mod init;
 
 pub use init::init_minimal_data;
-
 use sqlx::{PgPool, Row};
 use tracing::{info, warn};
 
@@ -38,7 +37,8 @@ pub async fn status(pool: &PgPool) -> Result<()> {
 
     info!("Database connectivity: OK");
 
-    // Check migration status using runtime query (sqlx::query! requires DB at compile time)
+    // Check migration status using runtime query (sqlx::query! requires DB at
+    // compile time)
     let rows = sqlx::query(
         r#"
         SELECT version, description, installed_on::TEXT AS installed_on, success

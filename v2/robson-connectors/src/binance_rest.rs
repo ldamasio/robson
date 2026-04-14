@@ -13,15 +13,15 @@
 //! - `signature` query parameter (HMAC SHA256 of query string)
 //! - `timestamp` query parameter
 
+use std::time::Duration;
+
 use chrono::Utc;
 use reqwest::Client;
+use robson_domain::{Price, Quantity, Side};
 use rust_decimal::Decimal;
 use serde::Deserialize;
-use std::time::Duration;
 use thiserror::Error;
 use tokio::time::timeout;
-
-use robson_domain::{Price, Quantity, Side};
 
 // =============================================================================
 // Constants
@@ -171,13 +171,11 @@ impl BinanceRestClient {
             format!("{}{}?{}", self.base_url(), endpoint, query)
         };
 
-        let response = timeout(
-            Duration::from_secs(REQUEST_TIMEOUT_SECS),
-            self.client.get(&url).send(),
-        )
-        .await
-        .map_err(|_| BinanceRestError::Timeout)?
-        .map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
+        let response =
+            timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), self.client.get(&url).send())
+                .await
+                .map_err(|_| BinanceRestError::Timeout)?
+                .map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
 
         let status = response.status();
         let body =
@@ -188,10 +186,7 @@ impl BinanceRestClient {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
                 return Err(BinanceRestError::ApiError { code: err.code, msg: err.msg });
             }
-            return Err(BinanceRestError::RequestFailed(format!(
-                "HTTP {}: {}",
-                status, body
-            )));
+            return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
         }
 
         Ok(body)
@@ -223,10 +218,7 @@ impl BinanceRestClient {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
                 return Err(BinanceRestError::ApiError { code: err.code, msg: err.msg });
             }
-            return Err(BinanceRestError::RequestFailed(format!(
-                "HTTP {}: {}",
-                status, body
-            )));
+            return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
         }
 
         Ok(body)
@@ -258,10 +250,7 @@ impl BinanceRestClient {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
                 return Err(BinanceRestError::ApiError { code: err.code, msg: err.msg });
             }
-            return Err(BinanceRestError::RequestFailed(format!(
-                "HTTP {}: {}",
-                status, body
-            )));
+            return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
         }
 
         Ok(body)
@@ -292,10 +281,7 @@ impl BinanceRestClient {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
                 return Err(BinanceRestError::ApiError { code: err.code, msg: err.msg });
             }
-            return Err(BinanceRestError::RequestFailed(format!(
-                "HTTP {}: {}",
-                status, body
-            )));
+            return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
         }
 
         Ok(body)
@@ -501,10 +487,7 @@ impl BinanceRestClient {
         if body.trim() == "{}" {
             Ok(())
         } else {
-            Err(BinanceRestError::ParseError(format!(
-                "Unexpected ping response: {}",
-                body
-            )))
+            Err(BinanceRestError::ParseError(format!("Unexpected ping response: {}", body)))
         }
     }
 }
@@ -632,8 +615,9 @@ struct PriceResponse {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rust_decimal_macros::dec;
+
+    use super::*;
 
     #[test]
     fn test_build_signed_query() {

@@ -3,9 +3,10 @@
 //! Immutable, validated domain primitives.
 //! All value objects enforce invariants at construction time.
 
+use std::fmt;
+
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use std::fmt;
 
 /// Domain errors for value object validation
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -61,9 +62,7 @@ impl Price {
     /// Returns `DomainError::InvalidPrice` if value <= 0
     pub fn new(value: Decimal) -> Result<Self, DomainError> {
         if value <= Decimal::ZERO {
-            return Err(DomainError::InvalidPrice(
-                "Price must be positive".to_string(),
-            ));
+            return Err(DomainError::InvalidPrice("Price must be positive".to_string()));
         }
         Ok(Self(value))
     }
@@ -103,9 +102,7 @@ impl Quantity {
     /// Returns `DomainError::InvalidQuantity` if value <= 0
     pub fn new(value: Decimal) -> Result<Self, DomainError> {
         if value <= Decimal::ZERO {
-            return Err(DomainError::InvalidQuantity(
-                "Quantity must be positive".to_string(),
-            ));
+            return Err(DomainError::InvalidQuantity("Quantity must be positive".to_string()));
         }
         Ok(Self(value))
     }
@@ -170,18 +167,13 @@ impl Symbol {
             }
         }
 
-        Err(DomainError::InvalidSymbol(format!(
-            "Cannot parse trading pair: {}",
-            pair
-        )))
+        Err(DomainError::InvalidSymbol(format!("Cannot parse trading pair: {}", pair)))
     }
 
     /// Create a Symbol from explicit base and quote
     pub fn new(base: String, quote: String) -> Result<Self, DomainError> {
         if base.is_empty() || quote.is_empty() {
-            return Err(DomainError::InvalidSymbol(
-                "Base and quote must be non-empty".to_string(),
-            ));
+            return Err(DomainError::InvalidSymbol("Base and quote must be non-empty".to_string()));
         }
         Ok(Self { base, quote })
     }
@@ -316,9 +308,7 @@ impl RiskConfig {
     /// Returns `DomainError::InvalidRiskConfig` if capital <= 0
     pub fn new(capital: Decimal) -> Result<Self, DomainError> {
         if capital <= Decimal::ZERO {
-            return Err(DomainError::InvalidRiskConfig(
-                "Capital must be positive".to_string(),
-            ));
+            return Err(DomainError::InvalidRiskConfig("Capital must be positive".to_string()));
         }
 
         Ok(Self { capital })
@@ -370,8 +360,9 @@ impl fmt::Display for RiskConfig {
 
 /// TechnicalStopDistance represents the distance from entry to technical stop
 ///
-/// This is the structural foundation of position sizing AND trailing stop logic.
-/// The distance is called the "span" (palmo) — the central unit of the position.
+/// This is the structural foundation of position sizing AND trailing stop
+/// logic. The distance is called the "span" (palmo) — the central unit of the
+/// position.
 ///
 /// # Technical Stop Calculation
 ///
@@ -447,19 +438,22 @@ impl TechnicalStopDistance {
         }
     }
 
-    /// Create TechnicalStopDistance with side-aware validation (hard-stop invariants)
+    /// Create TechnicalStopDistance with side-aware validation (hard-stop
+    /// invariants)
     ///
     /// This constructor enforces critical domain invariants ONLY:
     /// - Distance must be > 0 (stop cannot equal entry price)
     /// - For LONG: stop must be below entry
     /// - For SHORT: stop must be above entry
     ///
-    /// Note: Percentage bounds (0.1% to 10%) are enforced at the engine/policy level,
-    /// not in the domain. Use this constructor when you only need domain invariant validation.
+    /// Note: Percentage bounds (0.1% to 10%) are enforced at the engine/policy
+    /// level, not in the domain. Use this constructor when you only need
+    /// domain invariant validation.
     ///
     /// # Errors
     ///
-    /// Returns `DomainError::InvalidTechnicalStopDistance` if invariants are violated.
+    /// Returns `DomainError::InvalidTechnicalStopDistance` if invariants are
+    /// violated.
     ///
     /// # Examples
     ///
@@ -511,7 +505,8 @@ impl TechnicalStopDistance {
             },
         }
 
-        // Note: We do NOT call validate() here - percentage bounds are policy, not domain invariants
+        // Note: We do NOT call validate() here - percentage bounds are policy, not
+        // domain invariants
         Ok(Self::from_entry_and_stop(entry, initial_stop))
     }
 
@@ -580,8 +575,9 @@ impl From<Decimal> for Price {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rust_decimal_macros::dec;
+
+    use super::*;
 
     // Price tests
     #[test]
@@ -776,10 +772,7 @@ mod tests {
 
         let result = TechnicalStopDistance::new_validated(entry, stop, Side::Long);
         assert!(result.is_err());
-        assert!(matches!(
-            result.unwrap_err(),
-            DomainError::InvalidTechnicalStopDistance(_)
-        ));
+        assert!(matches!(result.unwrap_err(), DomainError::InvalidTechnicalStopDistance(_)));
     }
 
     #[test]

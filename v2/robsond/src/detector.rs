@@ -29,7 +29,8 @@
 //!
 //! # MA Crossover Detection
 //!
-//! The detector uses Simple Moving Average (SMA) crossover to detect entry signals:
+//! The detector uses Simple Moving Average (SMA) crossover to detect entry
+//! signals:
 //!
 //! - **Long**: Fast MA crosses **above** Slow MA
 //! - **Short**: Fast MA crosses **below** Slow MA
@@ -44,8 +45,7 @@
 //! - Cooperative: checks token between events
 //! - No orphaned tasks after shutdown
 
-use std::collections::VecDeque;
-use std::sync::Arc;
+use std::{collections::VecDeque, sync::Arc};
 
 use chrono::Utc;
 use robson_domain::{DetectorSignal, Position, PositionId, Price, Side, Symbol};
@@ -56,8 +56,10 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 use uuid::Uuid;
 
-use crate::event_bus::{DaemonEvent, EventBus, MarketData};
-use crate::{DaemonError, DaemonResult};
+use crate::{
+    event_bus::{DaemonEvent, EventBus, MarketData},
+    DaemonError, DaemonResult,
+};
 
 // =============================================================================
 // Detector Configuration
@@ -166,7 +168,8 @@ impl DetectorTask {
     /// # Arguments
     ///
     /// * `config` - Detector configuration (from armed position)
-    /// * `event_bus` - Shared event bus for receiving market data and emitting signals
+    /// * `event_bus` - Shared event bus for receiving market data and emitting
+    ///   signals
     /// * `cancel_token` - Cancellation token for graceful shutdown
     pub fn new(
         config: DetectorConfig,
@@ -470,9 +473,10 @@ impl DetectorTask {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use robson_domain::Side;
     use rust_decimal_macros::dec;
+
+    use super::*;
 
     fn create_test_config() -> DetectorConfig {
         DetectorConfig {
@@ -888,10 +892,7 @@ mod tests {
             .expect("Detector task panicked");
 
         // Should return None (no signal) due to cancellation
-        assert!(
-            result.is_none(),
-            "Detector should not emit signal on cancellation"
-        );
+        assert!(result.is_none(), "Detector should not emit signal on cancellation");
     }
 
     #[tokio::test]
@@ -923,10 +924,7 @@ mod tests {
             .expect("Detector task panicked");
 
         // Should return None (cancelled before signal)
-        assert!(
-            result.is_none(),
-            "Detector should be cancelled before emitting signal"
-        );
+        assert!(result.is_none(), "Detector should be cancelled before emitting signal");
     }
 
     #[tokio::test]
@@ -958,10 +956,7 @@ mod tests {
                 .expect("Detector task panicked");
 
             // All should return None (cancelled)
-            assert!(
-                result.is_none(),
-                "Detector should not emit signal on cancellation"
-            );
+            assert!(result.is_none(), "Detector should not emit signal on cancellation");
         }
     }
 }

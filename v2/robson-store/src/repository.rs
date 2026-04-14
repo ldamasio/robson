@@ -3,10 +3,11 @@
 //! These traits define the storage interface for the domain.
 //! Implementations can be PostgreSQL, in-memory, or mock for testing.
 
-use crate::error::StoreError;
 use async_trait::async_trait;
 use robson_domain::{Event, Order, OrderId, Position, PositionId};
 use uuid::Uuid;
+
+use crate::error::StoreError;
 
 /// Repository for Position entities
 #[async_trait]
@@ -33,14 +34,16 @@ pub trait PositionRepository: Send + Sync {
     /// `find_risk_open()` when computing portfolio exposure for risk gates.
     async fn find_active(&self) -> Result<Vec<Position>, StoreError>;
 
-    /// Find positions with committed exchange exposure for risk context computation.
+    /// Find positions with committed exchange exposure for risk context
+    /// computation.
     ///
     /// Returns only `Entering` and `Active` positions:
     /// - `Entering`: entry order submitted to exchange, waiting for fill.
     ///   Notional is committed on the exchange even before fill confirmation.
     /// - `Active`: position open on exchange with trailing stop monitoring.
     ///
-    /// Excludes Armed (no order yet) and Exiting (reducing, not expanding exposure).
+    /// Excludes Armed (no order yet) and Exiting (reducing, not expanding
+    /// exposure).
     ///
     /// Used exclusively by `build_risk_context()` to ensure concurrent entries
     /// cannot bypass exposure limits during the order-fill window.

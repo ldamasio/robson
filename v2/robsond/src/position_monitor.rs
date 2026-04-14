@@ -9,20 +9,20 @@
 //! This runs independently of the normal position flow to provide
 //! risk management even when the user bypasses Robson v2.
 
-use std::collections::{HashMap, HashSet};
-use std::sync::Arc;
-use std::time::Duration;
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use chrono::{DateTime, Utc};
-use rust_decimal::Decimal;
-use tokio::sync::RwLock;
-use tokio::task::JoinHandle;
-use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
-
 use robson_connectors::{BinanceRestClient, BinanceRestError, IsolatedMarginPosition};
 use robson_domain::{DetectedPosition, Price, Quantity, Side, Symbol};
 use robson_store::{DetectedPositionRepository, PositionRepository};
+use rust_decimal::Decimal;
+use tokio::{sync::RwLock, task::JoinHandle};
+use tokio_util::sync::CancellationToken;
+use tracing::{debug, error, info, warn};
 
 use crate::event_bus::{DaemonEvent, EventBus};
 
@@ -121,7 +121,8 @@ impl ExecutionAttempt {
 // Position Monitor
 // =============================================================================
 
-/// Monitors Binance isolated margin for rogue positions and manages safety stops.
+/// Monitors Binance isolated margin for rogue positions and manages safety
+/// stops.
 pub struct PositionMonitor {
     /// Binance REST client
     binance_client: Arc<BinanceRestClient>,
@@ -189,8 +190,8 @@ impl PositionMonitor {
 
     /// Create a new position monitor with Core Trading exclusion filter.
     ///
-    /// This variant accepts a Core position repository to exclude Core-managed positions
-    /// from Safety Net monitoring, preventing double execution.
+    /// This variant accepts a Core position repository to exclude Core-managed
+    /// positions from Safety Net monitoring, preventing double execution.
     pub fn with_core_exclusion(
         binance_client: Arc<BinanceRestClient>,
         event_bus: Arc<EventBus>,
@@ -214,10 +215,7 @@ impl PositionMonitor {
     }
 
     fn exclusion_key(symbol: &str, side: Side) -> String {
-        format!(
-            "{symbol}:{}",
-            if side == Side::Long { "long" } else { "short" }
-        )
+        format!("{symbol}:{}", if side == Side::Long { "long" } else { "short" })
     }
 
     async fn is_core_excluded_in_memory(&self, symbol: &Symbol, side: Side) -> bool {
@@ -253,10 +251,7 @@ impl PositionMonitor {
                         );
                         tracked.insert(position_id, pos);
                     }
-                    info!(
-                        count = tracked.len(),
-                        "Loaded persisted positions from database"
-                    );
+                    info!(count = tracked.len(), "Loaded persisted positions from database");
                 },
                 Err(e) => {
                     warn!(error = %e, "Failed to load persisted positions, starting fresh");
@@ -715,8 +710,8 @@ impl PositionMonitor {
                     let is_transient = match &e {
                         BinanceRestError::Timeout => true,
                         BinanceRestError::RequestFailed(_) => true,
-                        BinanceRestError::ApiError { code, .. } if *code == -1001 => true, // Disconnect
-                        BinanceRestError::ApiError { code, .. } if *code == -1021 => true, // Timestamp out of sync
+                        BinanceRestError::ApiError { code, .. } if *code == -1001 => true, /* Disconnect */
+                        BinanceRestError::ApiError { code, .. } if *code == -1021 => true, /* Timestamp out of sync */
                         _ => false,
                     };
 
@@ -825,7 +820,8 @@ impl PositionMonitor {
         }
     }
 
-    /// Execute a market order to exit a position (DEPRECATED - use execute_stop_with_retry).
+    /// Execute a market order to exit a position (DEPRECATED - use
+    /// execute_stop_with_retry).
     ///
     /// This method is kept for compatibility but should not be used directly.
     async fn execute_exit(&self, position: &IsolatedMarginPosition) -> Result<(), MonitorError> {
@@ -845,12 +841,7 @@ impl PositionMonitor {
         // Place market order
         let order_result = self
             .binance_client
-            .place_market_order(
-                &position.symbol,
-                exit_side,
-                position.quantity.as_decimal(),
-                None,
-            )
+            .place_market_order(&position.symbol, exit_side, position.quantity.as_decimal(), None)
             .await;
 
         match order_result {
@@ -1004,8 +995,9 @@ pub type DaemonResult<T> = Result<T, MonitorError>;
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rust_decimal_macros::dec;
+
+    use super::*;
 
     fn create_test_config() -> PositionMonitorConfig {
         PositionMonitorConfig {
@@ -1021,10 +1013,7 @@ mod tests {
     #[tokio::test]
     async fn test_core_exclusion_set_add_remove() {
         let monitor = PositionMonitor::new(
-            Arc::new(BinanceRestClient::new(
-                "key".to_string(),
-                "secret".to_string(),
-            )),
+            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
             Arc::new(EventBus::new(100)),
             create_test_config(),
         );
@@ -1042,10 +1031,7 @@ mod tests {
     #[tokio::test]
     async fn test_process_binance_position_skips_core_exclusion_cache() {
         let monitor = PositionMonitor::new(
-            Arc::new(BinanceRestClient::new(
-                "key".to_string(),
-                "secret".to_string(),
-            )),
+            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
             Arc::new(EventBus::new(100)),
             create_test_config(),
         );
@@ -1126,10 +1112,7 @@ mod tests {
     #[test]
     fn test_calculate_expected_pnl_long() {
         let monitor = PositionMonitor::new(
-            Arc::new(BinanceRestClient::new(
-                "key".to_string(),
-                "secret".to_string(),
-            )),
+            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
             Arc::new(EventBus::new(100)),
             create_test_config(),
         );
@@ -1147,10 +1130,7 @@ mod tests {
     #[test]
     fn test_calculate_expected_pnl_short() {
         let monitor = PositionMonitor::new(
-            Arc::new(BinanceRestClient::new(
-                "key".to_string(),
-                "secret".to_string(),
-            )),
+            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
             Arc::new(EventBus::new(100)),
             create_test_config(),
         );
@@ -1168,10 +1148,7 @@ mod tests {
     #[test]
     fn test_calculate_expected_pnl_loss() {
         let monitor = PositionMonitor::new(
-            Arc::new(BinanceRestClient::new(
-                "key".to_string(),
-                "secret".to_string(),
-            )),
+            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
             Arc::new(EventBus::new(100)),
             create_test_config(),
         );

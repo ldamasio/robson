@@ -10,17 +10,21 @@
 //! with exponential backoff (1 s → 2 s → 4 s … capped at 60 s) and reconnects.
 //! The task only terminates on daemon shutdown (via `CancellationToken`).
 
+use std::{str::FromStr, sync::Arc};
+
 use robson_connectors::{BinanceWebSocketClient, WsMessage};
 use robson_domain::{Price, Symbol};
-use std::str::FromStr;
-use std::sync::Arc;
-use tokio::task::JoinHandle;
-use tokio::time::{sleep, Duration};
+use tokio::{
+    task::JoinHandle,
+    time::{sleep, Duration},
+};
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
-use crate::error::DaemonResult;
-use crate::event_bus::{DaemonEvent, EventBus};
+use crate::{
+    error::DaemonResult,
+    event_bus::{DaemonEvent, EventBus},
+};
 
 /// Maximum reconnect backoff in seconds.
 const MAX_BACKOFF_SECS: u64 = 60;

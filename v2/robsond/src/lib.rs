@@ -18,7 +18,8 @@
 //!
 //! - **Daemon**: Main runtime orchestrator
 //! - **Position Manager**: Manages position lifecycle and detector tasks
-//! - **Position Monitor**: Safety net for rogue positions (opened outside Robson v2)
+//! - **Position Monitor**: Safety net for rogue positions (opened outside
+//!   Robson v2)
 //! - **Event Bus**: Internal communication (detector → engine, market data)
 //! - **API**: HTTP endpoints for CLI interaction
 //! - **Config**: Environment-based configuration
@@ -68,7 +69,6 @@ pub use error::{DaemonError, DaemonResult};
 pub use event_bus::{DaemonEvent, EventBus, EventReceiver, MarketData, OrderFill};
 pub use position_manager::PositionManager;
 pub use position_monitor::{MonitorError, PositionMonitor, PositionMonitorConfig as MonitorConfig};
-
 // Query engine re-exports
 pub use query::{
     ActionClass, ActorKind, ApprovalRequirement, CommandSource, ContextSummary, ExecutionQuery,

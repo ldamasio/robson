@@ -17,10 +17,11 @@
 //! - Behavior that requires PostgreSQL (projection, event log queries).
 //! - SSE stream content (only the connection is checked).
 
+use std::net::SocketAddr;
+
 use reqwest::Client;
 use robsond::{api, Config, Daemon};
 use serde_json::{json, Value};
-use std::net::SocketAddr;
 use uuid::Uuid;
 
 // =============================================================================
@@ -236,11 +237,7 @@ async fn test_arm_invalid_side_returns_400() {
 
     assert_eq!(resp.status(), 400);
     let body: api::ErrorResponse = resp.json().await.unwrap();
-    assert!(
-        body.error.to_lowercase().contains("side"),
-        "error: {}",
-        body.error
-    );
+    assert!(body.error.to_lowercase().contains("side"), "error: {}", body.error);
 }
 
 #[tokio::test]
@@ -305,12 +302,7 @@ async fn test_signal_on_armed_position_is_accepted() {
         .unwrap();
 
     // Signal may result in 200 (accepted) or 200 with state change
-    assert_eq!(
-        resp.status(),
-        200,
-        "signal injection should return 200, got: {}",
-        resp.status()
-    );
+    assert_eq!(resp.status(), 200, "signal injection should return 200, got: {}", resp.status());
 }
 
 #[tokio::test]
@@ -489,15 +481,9 @@ async fn test_status_response_has_required_fields() {
     let body: Value = resp.json().await.unwrap();
 
     // Contract: these fields must always be present
-    assert!(
-        body["active_positions"].is_number(),
-        "active_positions missing"
-    );
+    assert!(body["active_positions"].is_number(), "active_positions missing");
     assert!(body["positions"].is_array(), "positions missing");
-    assert!(
-        body["pending_approvals"].is_array(),
-        "pending_approvals missing"
-    );
+    assert!(body["pending_approvals"].is_array(), "pending_approvals missing");
 }
 
 #[tokio::test]
@@ -509,10 +495,7 @@ async fn test_panic_response_has_required_fields() {
     let body: Value = resp.json().await.unwrap();
 
     assert!(body["count"].is_number(), "count missing");
-    assert!(
-        body["closed_positions"].is_array(),
-        "closed_positions missing"
-    );
+    assert!(body["closed_positions"].is_array(), "closed_positions missing");
 }
 
 // =============================================================================
@@ -544,14 +527,8 @@ async fn test_monthly_halt_status_has_required_fields() {
 
     assert!(body["state"].is_string(), "state missing");
     assert!(body["description"].is_string(), "description missing");
-    assert!(
-        body["blocks_new_entries"].is_boolean(),
-        "blocks_new_entries missing"
-    );
-    assert!(
-        body["blocks_signals"].is_boolean(),
-        "blocks_signals missing"
-    );
+    assert!(body["blocks_new_entries"].is_boolean(), "blocks_new_entries missing");
+    assert!(body["blocks_signals"].is_boolean(), "blocks_signals missing");
 }
 
 #[tokio::test]

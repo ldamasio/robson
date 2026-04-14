@@ -13,10 +13,10 @@
 //! #[tokio::main]
 //! async fn main() {
 //!     let ws_client = BinanceWebSocketClient::new(false);
-//!     
+//!
 //!     // Subscribe to ticker for BTCUSDT
 //!     let mut stream = ws_client.subscribe_ticker("BTCUSDT").await.unwrap();
-//!     
+//!
 //!     // Receive updates
 //!     while let Some(msg) = stream.next().await {
 //!         println!("Ticker: {:?}", msg);
@@ -24,9 +24,10 @@
 //! }
 //! ```
 
+use std::time::Duration;
+
 use futures_util::{SinkExt, StreamExt};
 use serde::{Deserialize, Serialize};
-use std::time::Duration;
 use tokio::net::TcpStream;
 use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, WebSocketStream};
 

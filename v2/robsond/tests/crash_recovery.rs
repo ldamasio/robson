@@ -7,13 +7,14 @@
 
 #![cfg(feature = "postgres")]
 
+use std::sync::Arc;
+
 use chrono::Utc;
 use robson_eventlog::{append_event, Event, EventEnvelope};
 use robson_projector::apply_event_to_projections;
 use robson_store::{PgProjectionReader, ProjectionRecovery};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
-use std::sync::Arc;
 use uuid::Uuid;
 
 // =============================================================================
@@ -83,7 +84,8 @@ async fn setup_position_event(
 /// 3. Creates Daemon with projection recovery
 /// 4. Calls restore_positions() to verify positions are restored
 ///
-/// Run with: `DATABASE_URL=postgresql://localhost/test cargo test -p robsond --features postgres -- --ignored`
+/// Run with: `DATABASE_URL=postgresql://localhost/test cargo test -p robsond
+/// --features postgres -- --ignored`
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "Requires DATABASE_URL to be set"]
 async fn test_crash_recovery_restores_active_position(pool: sqlx::PgPool) {
@@ -137,10 +139,7 @@ async fn test_crash_recovery_restores_active_position(pool: sqlx::PgPool) {
     }
 
     // Verify entry price and quantity
-    assert_eq!(
-        pos.entry_price.as_ref().map(|p| p.as_decimal()),
-        Some(dec!(95000))
-    );
+    assert_eq!(pos.entry_price.as_ref().map(|p| p.as_decimal()), Some(dec!(95000)));
     assert_eq!(pos.quantity.as_decimal(), dec!(0.01));
 
     // Verify technical stop distance
@@ -189,11 +188,7 @@ async fn test_daemon_restore_positions_from_projection(pool: sqlx::PgPool) {
         .expect("Failed to restore positions from projection");
 
     // Should restore 1 position
-    assert_eq!(
-        restored.len(),
-        1,
-        "Should restore 1 position from projection"
-    );
+    assert_eq!(restored.len(), 1, "Should restore 1 position from projection");
 
     // Note: Testing Daemon::restore_positions() requires calling daemon.run(),
     // which is not feasible in this test setup. The projection_recovery test
@@ -271,7 +266,8 @@ async fn test_crash_recovery_skips_closed_positions(pool: sqlx::PgPool) {
 
 // =============================================================================
 // Domain event path tests (position_armed → ... → position_closed)
-// These test the real execution path via robsond domain events, not POSITION_OPENED.
+// These test the real execution path via robsond domain events, not
+// POSITION_OPENED.
 // =============================================================================
 
 /// Append an event to the event log and immediately apply it to projections.
@@ -309,7 +305,8 @@ async fn test_recovery_from_domain_position_armed(pool: sqlx::PgPool) {
     let account_id = Uuid::now_v7();
     let stream_key = format!("position:{}", position_id);
 
-    // Emit position_armed (matches robson-domain::Event::PositionArmed serialization)
+    // Emit position_armed (matches robson-domain::Event::PositionArmed
+    // serialization)
     append_and_apply(
         &pool,
         tenant_id,
@@ -342,11 +339,7 @@ async fn test_recovery_from_domain_position_armed(pool: sqlx::PgPool) {
     assert_eq!(pos.symbol.as_pair(), "BTCUSDT");
 
     use robson_domain::PositionState;
-    assert!(
-        matches!(pos.state, PositionState::Armed),
-        "Expected Armed, got {:?}",
-        pos.state
-    );
+    assert!(matches!(pos.state, PositionState::Armed), "Expected Armed, got {:?}", pos.state);
 }
 
 /// Test: full domain lifecycle — armed → entry_filled → trailing_stop_updated →
@@ -474,7 +467,8 @@ async fn test_recovery_domain_closed_position_excluded(pool: sqlx::PgPool) {
 // Projection and replay tests (MIG-v2.5#2)
 // These validate append → apply → recovery using manual event construction.
 // They do NOT exercise the PositionManager runtime path.
-// The real runtime e2e test is test_runtime_arm_position_persists_to_projection below.
+// The real runtime e2e test is test_runtime_arm_position_persists_to_projection
+// below.
 // =============================================================================
 
 /// Test that projector returns error for unknown event types.
@@ -508,10 +502,7 @@ async fn test_projector_rejects_unknown_event_type(pool: sqlx::PgPool) {
 
     // Apply to projections - should return MissingHandler error
     let result = apply_event_to_projections(&pool, &envelope).await;
-    assert!(
-        result.is_err(),
-        "Projector should return error for unknown event type"
-    );
+    assert!(result.is_err(), "Projector should return error for unknown event type");
 
     let err = result.unwrap_err();
     assert!(
@@ -527,8 +518,8 @@ async fn test_projector_rejects_unknown_event_type(pool: sqlx::PgPool) {
 /// 1. append_event → apply_event_to_projections works for position_armed
 /// 2. Recovery reads the armed position from positions_current
 ///
-/// For the real runtime path (PositionManager → Executor → eventlog → projection),
-/// see test_runtime_arm_position_persists_to_projection.
+/// For the real runtime path (PositionManager → Executor → eventlog →
+/// projection), see test_runtime_arm_position_persists_to_projection.
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "Requires DATABASE_URL to be set"]
 async fn test_projection_and_recovery_from_appended_position_armed(pool: sqlx::PgPool) {
@@ -562,7 +553,8 @@ async fn test_projection_and_recovery_from_appended_position_armed(pool: sqlx::P
         .await
         .expect("Failed to append position_armed event");
 
-    // 2. Fetch envelope and apply to projections (simulating execute_and_persist apply path)
+    // 2. Fetch envelope and apply to projections (simulating execute_and_persist
+    //    apply path)
     let envelope: EventEnvelope = sqlx::query_as("SELECT * FROM event_log WHERE event_id = $1")
         .bind(event_id)
         .fetch_one(&pool)
@@ -588,25 +580,13 @@ async fn test_projection_and_recovery_from_appended_position_armed(pool: sqlx::P
     );
 
     // 4. Verify recovery from projection works
-    let reader = Arc::new(robson_store::PgProjectionReader::new(Arc::new(
-        pool.clone(),
-    ))) as Arc<dyn robson_store::ProjectionRecovery>;
+    let reader = Arc::new(robson_store::PgProjectionReader::new(Arc::new(pool.clone())))
+        as Arc<dyn robson_store::ProjectionRecovery>;
     let restored = reader.find_active_from_projection(tenant_id).await.expect("Recovery failed");
 
-    assert_eq!(
-        restored.len(),
-        1,
-        "Should restore 1 position from projection"
-    );
-    assert_eq!(
-        restored[0].id, position_id,
-        "Recovered position ID should match"
-    );
-    assert_eq!(
-        restored[0].symbol.as_pair(),
-        "BTCUSDT",
-        "Recovered symbol should match"
-    );
+    assert_eq!(restored.len(), 1, "Should restore 1 position from projection");
+    assert_eq!(restored[0].id, position_id, "Recovered position ID should match");
+    assert_eq!(restored[0].symbol.as_pair(), "BTCUSDT", "Recovered symbol should match");
 }
 
 /// Projection/replay test: exit event ordering is preserved in the eventlog.
@@ -698,26 +678,11 @@ async fn test_replay_exit_event_ordering_preserved_in_eventlog(pool: sqlx::PgPoo
     .expect("Failed to fetch events");
 
     assert_eq!(events.len(), 3, "Should have 3 events");
-    assert_eq!(
-        events[0].0, "position_armed",
-        "First event should be position_armed"
-    );
-    assert_eq!(
-        events[1].0, "exit_order_placed",
-        "Second event should be exit_order_placed"
-    );
-    assert_eq!(
-        events[2].0, "position_closed",
-        "Third event should be position_closed"
-    );
-    assert!(
-        events[0].1 < events[1].1,
-        "position_armed seq < exit_order_placed seq"
-    );
-    assert!(
-        events[1].1 < events[2].1,
-        "exit_order_placed seq < position_closed seq"
-    );
+    assert_eq!(events[0].0, "position_armed", "First event should be position_armed");
+    assert_eq!(events[1].0, "exit_order_placed", "Second event should be exit_order_placed");
+    assert_eq!(events[2].0, "position_closed", "Third event should be position_closed");
+    assert!(events[0].1 < events[1].1, "position_armed seq < exit_order_placed seq");
+    assert!(events[1].1 < events[2].1, "exit_order_placed seq < position_closed seq");
 
     // 5. Apply events to projections in order (simulating replay)
     let envelopes: Vec<EventEnvelope> = sqlx::query_as(
@@ -750,39 +715,37 @@ async fn test_replay_exit_event_ordering_preserved_in_eventlog(pool: sqlx::PgPoo
     );
 
     // 7. Verify closed position is NOT restored during recovery
-    let reader = Arc::new(robson_store::PgProjectionReader::new(Arc::new(
-        pool.clone(),
-    ))) as Arc<dyn robson_store::ProjectionRecovery>;
+    let reader = Arc::new(robson_store::PgProjectionReader::new(Arc::new(pool.clone())))
+        as Arc<dyn robson_store::ProjectionRecovery>;
     let restored = reader.find_active_from_projection(tenant_id).await.expect("Recovery failed");
 
-    assert_eq!(
-        restored.len(),
-        0,
-        "Closed position should NOT be restored from projection"
-    );
+    assert_eq!(restored.len(), 0, "Closed position should NOT be restored from projection");
 }
 
 // =============================================================================
 // Real runtime e2e tests (MIG-v2.5#2)
-// These exercise the ACTUAL PositionManager → Executor → eventlog → projection path.
-// No manual append_event calls. Failures in persist/apply propagate as errors.
+// These exercise the ACTUAL PositionManager → Executor → eventlog → projection
+// path. No manual append_event calls. Failures in persist/apply propagate as
+// errors.
 // =============================================================================
 
-/// Runtime e2e test: arm_position() persists to eventlog and updates projection.
+/// Runtime e2e test: arm_position() persists to eventlog and updates
+/// projection.
 ///
 /// This is the REAL runtime path test for MIG-v2.5#2. It exercises:
 ///   PositionManager::arm_position()
 ///     → execute_and_persist(EmitEvent(PositionArmed))
-///       → Executor::execute() → store.apply_event()       (in-memory projection)
-///       → persist_event_to_log()                          (fail-fast)
-///         → append_event() to event_log
+///       → Executor::execute() → store.apply_event()       (in-memory
+/// projection)       → persist_event_to_log()
+/// (fail-fast)         → append_event() to event_log
 ///         → apply_event_to_projections() → positions_current
 ///   → PgProjectionReader::find_active_from_projection()   (crash recovery)
 ///
 /// If persist_event_to_log() fails (append or projection apply), arm_position()
 /// returns an error — there is no silent best-effort fallback.
 ///
-/// Run with: `DATABASE_URL=postgresql://... cargo test -p robsond --features postgres -- --ignored`
+/// Run with: `DATABASE_URL=postgresql://... cargo test -p robsond --features
+/// postgres -- --ignored`
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "Requires DATABASE_URL to be set"]
 async fn test_runtime_arm_position_persists_to_projection(pool: sqlx::PgPool) {
@@ -796,7 +759,8 @@ async fn test_runtime_arm_position_persists_to_projection(pool: sqlx::PgPool) {
     let tenant_id = Uuid::now_v7();
     let account_id = Uuid::now_v7();
 
-    // Build PositionManager with real event_log pool (fail-fast persistence enabled)
+    // Build PositionManager with real event_log pool (fail-fast persistence
+    // enabled)
     let exchange = Arc::new(StubExchange::new(dec!(95000)));
     let journal = Arc::new(IntentJournal::new());
     let store = Arc::new(MemoryStore::new());
@@ -806,14 +770,8 @@ async fn test_runtime_arm_position_persists_to_projection(pool: sqlx::PgPool) {
     let engine = Engine::new(risk_config.clone());
 
     let manager = Arc::new(
-        PositionManager::new(
-            engine,
-            executor,
-            store,
-            event_bus,
-            Arc::new(TracingQueryRecorder),
-        )
-        .with_event_log(pool.clone(), tenant_id),
+        PositionManager::new(engine, executor, store, event_bus, Arc::new(TracingQueryRecorder))
+            .with_event_log(pool.clone(), tenant_id),
     );
 
     // arm_position() exercises the full runtime write path
@@ -851,12 +809,10 @@ async fn test_runtime_arm_position_persists_to_projection(pool: sqlx::PgPool) {
     .await
     .expect("Failed to query event_log event_type");
 
-    assert_eq!(
-        event_type, "position_armed",
-        "First event must be position_armed"
-    );
+    assert_eq!(event_type, "position_armed", "First event must be position_armed");
 
-    // Verify positions_current was updated synchronously (projection apply succeeded)
+    // Verify positions_current was updated synchronously (projection apply
+    // succeeded)
     let state: Option<String> =
         sqlx::query_scalar("SELECT state FROM positions_current WHERE position_id = $1")
             .bind(position.id)
@@ -871,25 +827,13 @@ async fn test_runtime_arm_position_persists_to_projection(pool: sqlx::PgPool) {
     );
 
     // Verify crash recovery finds the armed position
-    let reader = Arc::new(robson_store::PgProjectionReader::new(Arc::new(
-        pool.clone(),
-    ))) as Arc<dyn robson_store::ProjectionRecovery>;
+    let reader = Arc::new(robson_store::PgProjectionReader::new(Arc::new(pool.clone())))
+        as Arc<dyn robson_store::ProjectionRecovery>;
     let restored = reader.find_active_from_projection(tenant_id).await.expect("Recovery failed");
 
-    assert_eq!(
-        restored.len(),
-        1,
-        "Crash recovery should find exactly 1 armed position"
-    );
-    assert_eq!(
-        restored[0].id, position.id,
-        "Recovered position ID must match"
-    );
-    assert_eq!(
-        restored[0].symbol.as_pair(),
-        "BTCUSDT",
-        "Recovered symbol must match"
-    );
+    assert_eq!(restored.len(), 1, "Crash recovery should find exactly 1 armed position");
+    assert_eq!(restored[0].id, position.id, "Recovered position ID must match");
+    assert_eq!(restored[0].symbol.as_pair(), "BTCUSDT", "Recovered symbol must match");
 
     use robson_domain::PositionState;
     assert!(

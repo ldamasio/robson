@@ -88,9 +88,10 @@ pub struct FillReceived {
 
 /// POSITION_OPENED payload
 ///
-/// INVARIANT: technical_stop_price and technical_stop_distance MUST be non-null.
-/// This is the Golden Rule of position sizing - stop distance is derived from
-/// technical analysis (2nd support level on chart), not arbitrary percentage.
+/// INVARIANT: technical_stop_price and technical_stop_distance MUST be
+/// non-null. This is the Golden Rule of position sizing - stop distance is
+/// derived from technical analysis (2nd support level on chart), not arbitrary
+/// percentage.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PositionOpened {
     pub position_id: Uuid,
@@ -103,7 +104,8 @@ pub struct PositionOpened {
     pub entry_quantity: Option<Decimal>,
     pub entry_filled_at: Option<DateTime<Utc>>,
 
-    /// INVARIANT: MUST be non-null - derived from technical analysis (2nd support)
+    /// INVARIANT: MUST be non-null - derived from technical analysis (2nd
+    /// support)
     pub technical_stop_price: Decimal,
 
     /// INVARIANT: MUST be non-null - |Entry - Technical Stop|
@@ -146,9 +148,10 @@ pub struct EntryFilled {
 
 /// ENTRY_SIGNAL_RECEIVED payload (entry_signal_received event from domain)
 ///
-/// Emitted by the engine when a detector signal is received for an armed position.
-/// This is an audit event - it does not change position state (that's done by entry_order_placed).
-/// We persist it for audit trail purposes but it doesn't affect positions_current projection.
+/// Emitted by the engine when a detector signal is received for an armed
+/// position. This is an audit event - it does not change position state (that's
+/// done by entry_order_placed). We persist it for audit trail purposes but it
+/// doesn't affect positions_current projection.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntrySignalReceived {
     pub position_id: Uuid,
@@ -261,7 +264,8 @@ impl SymbolPayload {
     }
 }
 
-/// TechnicalStopDistance representation matching robson-domain::TechnicalStopDistance.
+/// TechnicalStopDistance representation matching
+/// robson-domain::TechnicalStopDistance.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TechnicalStopDistancePayload {
     pub distance: Decimal,
@@ -318,7 +322,8 @@ pub struct ExitFilled {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PositionClosedDomain {
     pub position_id: Uuid,
-    /// Serialized as string (ExitReason enum variants: "TrailingStop", "UserPanic", etc.)
+    /// Serialized as string (ExitReason enum variants: "TrailingStop",
+    /// "UserPanic", etc.)
     pub exit_reason: String,
     pub entry_price: Decimal,
     pub exit_price: Decimal,

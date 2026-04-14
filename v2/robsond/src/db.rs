@@ -2,18 +2,19 @@
 //!
 //! Provides `db migrate`, `db status`, and `db init` commands.
 
-use anyhow::{anyhow, Result};
 use std::env;
-use tracing::info;
 
+use anyhow::{anyhow, Result};
 use robson_db::{init_minimal_data, migrate, status};
+use tracing::info;
 
 /// Run database CLI subcommands.
 ///
 /// Supported commands:
 /// - `robsond db migrate` - Run pending migrations
 /// - `robsond db status` - Check migration status
-/// - `robsond db init [--tenant-id UUID] [--account-id UUID]` - Seed minimal data
+/// - `robsond db init [--tenant-id UUID] [--account-id UUID]` - Seed minimal
+///   data
 pub async fn run_db_command(args: Vec<String>) -> Result<()> {
     if args.len() < 3 {
         return Err(anyhow!("Usage: robsond db <migrate|status|init> [options]"));
@@ -69,10 +70,7 @@ pub async fn run_db_command(args: Vec<String>) -> Result<()> {
             println!("ACCOUNT_ID={}", aid);
         },
         _ => {
-            return Err(anyhow!(
-                "Unknown db command: {}. Use migrate, status, or init",
-                args[2]
-            ));
+            return Err(anyhow!("Unknown db command: {}. Use migrate, status, or init", args[2]));
         },
     }
 

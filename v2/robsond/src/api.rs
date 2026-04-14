@@ -9,6 +9,8 @@
 //! - Safety net (rogue position monitoring)
 //! - SSE events for operator-facing runtime updates
 
+use std::{convert::Infallible, sync::Arc, time::Duration};
+
 use async_stream::stream;
 use axum::{
     extract::{Path, State},
@@ -20,25 +22,25 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use rust_decimal::Decimal;
-use serde::{Deserialize, Serialize};
-use std::{convert::Infallible, sync::Arc, time::Duration};
-use tokio::sync::RwLock;
-use tracing::warn;
-use uuid::Uuid;
-
 use robson_domain::{
     DetectorSignal, Position, PositionState, Price, RiskConfig, Side, Symbol, TechnicalStopDistance,
 };
 use robson_exec::ExchangePort;
 use robson_store::Store;
+use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+use tokio::sync::RwLock;
+use tracing::warn;
+use uuid::Uuid;
 
-use crate::circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot};
-use crate::error::DaemonError;
-use crate::event_bus::{DaemonEvent, EventBus};
-use crate::position_manager::PositionManager;
-use crate::position_monitor::PositionMonitor;
-use crate::sse::{map_daemon_event, resync_required_event};
+use crate::{
+    circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot},
+    error::DaemonError,
+    event_bus::{DaemonEvent, EventBus},
+    position_manager::PositionManager,
+    position_monitor::PositionMonitor,
+    sse::{map_daemon_event, resync_required_event},
+};
 
 // =============================================================================
 // API State
@@ -50,7 +52,8 @@ pub struct ApiState<E: ExchangePort + 'static, S: Store + 'static> {
     pub event_bus: Arc<EventBus>,
     pub circuit_breaker: Arc<CircuitBreaker>,
     pub position_monitor: Option<Arc<PositionMonitor>>,
-    /// PostgreSQL pool for liveness check. Present only when DATABASE_URL is configured.
+    /// PostgreSQL pool for liveness check. Present only when DATABASE_URL is
+    /// configured.
     #[cfg(feature = "postgres")]
     pub pg_pool: Option<std::sync::Arc<sqlx::PgPool>>,
 }
@@ -321,7 +324,8 @@ async fn health_liveness() -> Json<HealthResponse> {
     })
 }
 
-/// Readiness probe for Kubernetes - checks if the service is ready to accept traffic.
+/// Readiness probe for Kubernetes - checks if the service is ready to accept
+/// traffic.
 ///
 /// Checks:
 /// - Database connectivity (via store)
@@ -439,10 +443,7 @@ where
 
     (
         [
-            (
-                header::CACHE_CONTROL,
-                header::HeaderValue::from_static("no-cache"),
-            ),
+            (header::CACHE_CONTROL, header::HeaderValue::from_static("no-cache")),
             (
                 header::HeaderName::from_static("x-accel-buffering"),
                 header::HeaderValue::from_static("no"),
@@ -555,8 +556,9 @@ where
     })?;
 
     // Create a dummy tech stop distance (will be replaced by detector signal)
-    // Note: In production, the detector signal provides the actual tech stop distance
-    // Use Price::zero() to bypass validation (allowed for initialization only)
+    // Note: In production, the detector signal provides the actual tech stop
+    // distance Use Price::zero() to bypass validation (allowed for
+    // initialization only)
     let entry_price = Price::new(rust_decimal::Decimal::ONE).unwrap();
     let stop_loss = Price::zero();
     let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry_price, stop_loss);
@@ -786,8 +788,9 @@ where
 
 /// POST /monthly-halt — operator-initiated conservative MonthlyHalt trigger.
 ///
-/// Idempotent: if already in MonthlyHalt, returns current status without mutating
-/// state or emitting an event. Closes all open positions on transition.
+/// Idempotent: if already in MonthlyHalt, returns current status without
+/// mutating state or emitting an event. Closes all open positions on
+/// transition.
 ///
 /// Note: there is no reset endpoint. MonthlyHalt persists until next calendar
 /// month. Allowing a reset without explicit policy evidence is not permitted.
@@ -829,12 +832,9 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
 fn position_to_summary(position: &Position) -> PositionSummary {
     let (state_str, entry_price, trailing_stop, pnl) = match &position.state {
         PositionState::Armed => ("Armed".to_string(), None, None, None),
-        PositionState::Entering { expected_entry, .. } => (
-            "Entering".to_string(),
-            Some(expected_entry.as_decimal()),
-            None,
-            None,
-        ),
+        PositionState::Entering { expected_entry, .. } => {
+            ("Entering".to_string(), Some(expected_entry.as_decimal()), None, None)
+        },
         PositionState::Active { trailing_stop, .. } => (
             "Active".to_string(),
             position.entry_price.map(|p| p.as_decimal()),
@@ -880,8 +880,6 @@ fn position_to_summary(position: &Position) -> PositionSummary {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::query_engine::TracingQueryRecorder;
     use axum::{
         body::Body,
         http::{header::CONTENT_TYPE, Request},
@@ -895,13 +893,12 @@ mod tests {
     use tokio::time::timeout;
     use tower::ServiceExt;
 
+    use super::*;
+    use crate::query_engine::TracingQueryRecorder;
+
     async fn create_test_app_with_event_bus(
         capacity: usize,
-    ) -> (
-        Router,
-        Arc<EventBus>,
-        Arc<RwLock<PositionManager<StubExchange, MemoryStore>>>,
-    ) {
+    ) -> (Router, Arc<EventBus>, Arc<RwLock<PositionManager<StubExchange, MemoryStore>>>) {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
@@ -938,8 +935,8 @@ mod tests {
     //     let app = create_test_app().await;
     //
     //     let response = app
-    //         .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
-    //         .await
+    //         .oneshot(Request::builder().uri("/health").body(Body::empty()).
+    // unwrap())         .await
     //         .unwrap();
     //
     //     assert_eq!(response.status(), StatusCode::OK);
@@ -1068,14 +1065,8 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            response.headers().get(CONTENT_TYPE).unwrap(),
-            "text/event-stream"
-        );
-        assert_eq!(
-            response.headers().get(header::CACHE_CONTROL).unwrap(),
-            "no-cache"
-        );
+        assert_eq!(response.headers().get(CONTENT_TYPE).unwrap(), "text/event-stream");
+        assert_eq!(response.headers().get(header::CACHE_CONTROL).unwrap(), "no-cache");
         assert_eq!(response.headers().get("x-accel-buffering").unwrap(), "no");
 
         event_bus.send(crate::event_bus::DaemonEvent::PositionStateChanged {
@@ -1225,7 +1216,8 @@ mod tests {
             symbol,
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
-            stop_loss: Price::new(dec!(85500)).unwrap(), // 10% stop -> approval required, risk approved
+            stop_loss: Price::new(dec!(85500)).unwrap(), /* 10% stop -> approval required, risk
+                                                          * approved */
             timestamp: chrono::Utc::now(),
         };
 

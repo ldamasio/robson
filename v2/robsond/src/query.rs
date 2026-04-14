@@ -46,7 +46,8 @@ pub enum QueryKind {
     },
 
     /// Market price update for ONE active position
-    /// (PositionManager creates one query per active position matching the symbol)
+    /// (PositionManager creates one query per active position matching the
+    /// symbol)
     ProcessMarketTick { symbol: Symbol, price: Price },
 
     /// Operator requests position arming
@@ -118,7 +119,8 @@ pub enum QueryState {
     /// Engine + Risk are evaluating (Interpret + Decide phases)
     Processing,
 
-    /// Phase 2: Risk gate evaluated. Either approved (→ Acting) or denied (→ Denied).
+    /// Phase 2: Risk gate evaluated. Either approved (→ Acting) or denied (→
+    /// Denied).
     RiskChecked,
 
     /// Phase 3: waiting for explicit operator approval before execution.
@@ -176,7 +178,8 @@ pub enum QueryOutcome {
     /// Actions were executed via Executor.
     ActionsExecuted { actions_count: usize },
 
-    /// Query evaluated but no action was needed (e.g., price tick didn't trigger stop)
+    /// Query evaluated but no action was needed (e.g., price tick didn't
+    /// trigger stop)
     NoAction { reason: String },
 
     /// Risk Engine or governance denied the action (Phase 2+)
@@ -471,13 +474,16 @@ impl ExecutionQuery {
     /// Convenience: mark as governance-denied (Phase 2+).
     ///
     /// Called when the risk gate or a future approval gate rejects the action.
-    /// This is NOT an operational failure — it is an intentional governed outcome.
+    /// This is NOT an operational failure — it is an intentional governed
+    /// outcome.
     ///
     /// Sets `outcome = Some(QueryOutcome::Denied)` for audit and projections.
-    /// `check` identifies which governance rule triggered the denial (e.g. "max_open_positions").
-    /// Query must be in `RiskChecked` or `AwaitingApproval` state before calling this.
+    /// `check` identifies which governance rule triggered the denial (e.g.
+    /// "max_open_positions"). Query must be in `RiskChecked` or
+    /// `AwaitingApproval` state before calling this.
     pub fn deny(&mut self, reason: String, check: String) {
-        // Set outcome BEFORE transition so it is recorded even if transition is already terminal
+        // Set outcome BEFORE transition so it is recorded even if transition is already
+        // terminal
         self.outcome = Some(QueryOutcome::Denied { reason: reason.clone() });
         let _ = self.transition(QueryState::Denied { reason, check });
     }
@@ -537,9 +543,10 @@ impl ExecutionQuery {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use robson_domain::Symbol;
     use rust_decimal_macros::dec;
+
+    use super::*;
 
     fn create_test_query() -> ExecutionQuery {
         ExecutionQuery::new(
@@ -733,10 +740,7 @@ mod tests {
 
         query.transition(QueryState::Processing).unwrap();
         query.transition(QueryState::RiskChecked).unwrap();
-        query.deny(
-            "Too many positions".to_string(),
-            "max_open_positions".to_string(),
-        );
+        query.deny("Too many positions".to_string(), "max_open_positions".to_string());
 
         // State must be Denied (terminal)
         assert!(
@@ -771,10 +775,7 @@ mod tests {
         assert_eq!(approval.ttl_seconds, 30);
         assert!(approval.expires_at >= query.started_at);
         assert!(approval.approved_at.is_none());
-        assert!(
-            query.finished_at.is_none(),
-            "AwaitingApproval is non-terminal"
-        );
+        assert!(query.finished_at.is_none(), "AwaitingApproval is non-terminal");
     }
 
     #[test]
@@ -812,10 +813,7 @@ mod tests {
         query.transition(QueryState::Processing).unwrap();
         query.transition(QueryState::RiskChecked).unwrap();
         query.await_approval("Manual gate".to_string(), 60).unwrap();
-        query.deny(
-            "Risk context changed".to_string(),
-            "max_open_positions".to_string(),
-        );
+        query.deny("Risk context changed".to_string(), "max_open_positions".to_string());
 
         assert!(matches!(query.state, QueryState::Denied { .. }));
         assert!(matches!(query.outcome, Some(QueryOutcome::Denied { .. })));
@@ -829,10 +827,7 @@ mod tests {
         query.transition(QueryState::Processing).unwrap();
 
         let result = query.authorize();
-        assert!(
-            result.is_err(),
-            "authorize() must fail outside AwaitingApproval"
-        );
+        assert!(result.is_err(), "authorize() must fail outside AwaitingApproval");
     }
 
     #[test]
@@ -870,20 +865,17 @@ mod tests {
         );
 
         assert!(matches!(query.kind, QueryKind::ArmPosition { .. }));
-        assert!(matches!(
-            query.actor,
-            ActorKind::Operator { source: CommandSource::Api }
-        ));
+        assert!(matches!(query.actor, ActorKind::Operator { source: CommandSource::Api }));
     }
 
     #[test]
     fn test_disarm_position_kind() {
         let position_id = Uuid::now_v7();
 
-        let query = ExecutionQuery::new(
-            QueryKind::DisarmPosition { position_id },
-            ActorKind::Operator { source: CommandSource::Api },
-        );
+        let query =
+            ExecutionQuery::new(QueryKind::DisarmPosition { position_id }, ActorKind::Operator {
+                source: CommandSource::Api,
+            });
 
         assert!(matches!(query.kind, QueryKind::DisarmPosition { .. }));
     }
@@ -918,10 +910,9 @@ mod tests {
 
     #[test]
     fn test_health_check_kind() {
-        let query = ExecutionQuery::new(
-            QueryKind::HealthCheck,
-            ActorKind::System { subsystem: "scheduler".to_string() },
-        );
+        let query = ExecutionQuery::new(QueryKind::HealthCheck, ActorKind::System {
+            subsystem: "scheduler".to_string(),
+        });
 
         assert!(matches!(query.kind, QueryKind::HealthCheck));
     }

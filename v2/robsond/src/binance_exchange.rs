@@ -7,19 +7,18 @@
 //!
 //! When processing order responses, fills are extracted with priority:
 //! 1. `fills[]` array (most accurate) — VWAP price, actual commission
-//! 2. Fallback to `executedQty + cummulativeQuoteQty` — average price, estimated fee
+//! 2. Fallback to `executedQty + cummulativeQuoteQty` — average price,
+//!    estimated fee
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::Utc;
-use rust_decimal::Decimal;
-use tracing::info;
-
 use robson_connectors::{BinanceRestClient, BinanceRestError};
 use robson_domain::{OrderSide, Price, Quantity, Side, Symbol};
-use robson_exec::ports::MarginSettings;
-use robson_exec::{ExchangePort, ExecError, OrderResult};
+use robson_exec::{ports::MarginSettings, ExchangePort, ExecError, OrderResult};
+use rust_decimal::Decimal;
+use tracing::info;
 
 // =============================================================================
 // Adapter

@@ -9,10 +9,11 @@
 //! - Each credential is isolated by (tenant_id, user_id, exchange, profile)
 //! - Single-user mode uses tenant_id="default", user_id="local"
 
-use crate::context::IdentityScope;
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use zeroize::Zeroize;
+
+use crate::context::IdentityScope;
 
 // =============================================================================
 // Credential Identity
@@ -412,10 +413,7 @@ mod tests {
     #[test]
     fn test_exchange_base_url() {
         assert_eq!(Exchange::Binance.base_url(), "https://api.binance.com");
-        assert_eq!(
-            Exchange::BinanceTestnet.base_url(),
-            "https://testnet.binance.vision"
-        );
+        assert_eq!(Exchange::BinanceTestnet.base_url(), "https://testnet.binance.vision");
     }
 
     #[test]

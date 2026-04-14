@@ -2,14 +2,14 @@
 //!
 //! Uses a PostgreSQL checkpoint row to track last processed sequence number.
 
-use crate::config::ProjectionConfig;
-use crate::error::DaemonResult;
 use robson_eventlog::EventEnvelope;
 use robson_projector::apply_event_to_projections;
 use sqlx::PgPool;
 use tokio::time::{interval, Duration};
 use tracing::{debug, error, info, warn};
 use uuid::Uuid;
+
+use crate::{config::ProjectionConfig, error::DaemonResult};
 
 const PROJECTION_NAME: &str = "robson-projector";
 
@@ -185,11 +185,6 @@ impl ProjectionWorker {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    #[cfg(feature = "postgres")]
-    use crate::query::{ActorKind, ExecutionQuery, QueryKind, QueryOutcome, QueryState};
-    #[cfg(feature = "postgres")]
-    use crate::query_engine::QueryStateChangedEvent;
     #[cfg(feature = "postgres")]
     use chrono::{TimeZone, Utc};
     #[cfg(feature = "postgres")]
@@ -200,6 +195,12 @@ mod tests {
     use rust_decimal_macros::dec;
     #[cfg(feature = "postgres")]
     use uuid::Uuid;
+
+    use super::*;
+    #[cfg(feature = "postgres")]
+    use crate::query::{ActorKind, ExecutionQuery, QueryKind, QueryOutcome, QueryState};
+    #[cfg(feature = "postgres")]
+    use crate::query_engine::QueryStateChangedEvent;
 
     #[test]
     fn test_projection_name_constant() {
@@ -252,10 +253,7 @@ mod tests {
             QUERY_STATE_CHANGED_EVENT_TYPE,
             serde_json::to_value(payload)?,
         )
-        .with_actor(
-            ActorType::Daemon,
-            Some("projection-worker-test".to_string()),
-        );
+        .with_actor(ActorType::Daemon, Some("projection-worker-test".to_string()));
         event.occurred_at = occurred_at;
         append_event(pool, stream_key, None, event).await?;
         Ok(())

@@ -77,7 +77,8 @@ async fn main() -> anyhow::Result<()> {
     // Create daemon with optional projection recovery (wiring layer)
     #[cfg(feature = "postgres")]
     {
-        // If DATABASE_URL is set, create shared PgPool (used by both recovery and worker)
+        // If DATABASE_URL is set, create shared PgPool (used by both recovery and
+        // worker)
         let (projection_recovery, pg_pool) = if let (Some(database_url), Some(tenant_id)) =
             (&config.projection.database_url, config.projection.tenant_id)
         {
@@ -126,10 +127,8 @@ async fn main() -> anyhow::Result<()> {
             let pool = Arc::new(pool);
 
             // Create projection recovery adapter (uses same pool)
-            let recovery = Some(
-                Arc::new(robson_store::PgProjectionReader::new(pool.clone()))
-                    as Arc<dyn robson_store::ProjectionRecovery>,
-            );
+            let recovery = Some(Arc::new(robson_store::PgProjectionReader::new(pool.clone()))
+                as Arc<dyn robson_store::ProjectionRecovery>);
 
             (recovery, Some(pool))
         } else {

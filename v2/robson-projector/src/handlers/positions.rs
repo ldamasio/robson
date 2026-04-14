@@ -1,16 +1,20 @@
 //! Position projection handlers
 //!
-//! INVARIANT: POSITION_OPENED requires technical_stop_price and technical_stop_distance.
-//! INVARIANT: trailing_stop_price is initially derived from technical_stop_distance.
-//! INVARIANT: position_armed requires tech_stop_distance.initial_stop (same semantic).
+//! INVARIANT: POSITION_OPENED requires technical_stop_price and
+//! technical_stop_distance. INVARIANT: trailing_stop_price is initially derived
+//! from technical_stop_distance. INVARIANT: position_armed requires
+//! tech_stop_distance.initial_stop (same semantic).
 
-use crate::error::{ProjectionError, Result};
-use crate::types::{
-    EntryOrderPlaced, EntrySignalReceived, ExitFilled, ExitOrderPlaced, PositionArmed,
-    PositionClosed, PositionClosedDomain, PositionDisarmed, PositionOpened,
-};
 use robson_eventlog::EventEnvelope;
 use sqlx::PgPool;
+
+use crate::{
+    error::{ProjectionError, Result},
+    types::{
+        EntryOrderPlaced, EntrySignalReceived, ExitFilled, ExitOrderPlaced, PositionArmed,
+        PositionClosed, PositionClosedDomain, PositionDisarmed, PositionOpened,
+    },
+};
 
 pub(crate) async fn handle_position_opened(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
     let payload: PositionOpened =
@@ -22,7 +26,8 @@ pub(crate) async fn handle_position_opened(pool: &PgPool, envelope: &EventEnvelo
         })?;
 
     // INVARIANT CHECK: technical_stop_price and distance must be present
-    // This is the Golden Rule - stop comes from technical analysis, not arbitrary %.
+    // This is the Golden Rule - stop comes from technical analysis, not arbitrary
+    // %.
     if payload.technical_stop_price.is_zero() {
         return Err(ProjectionError::InvariantViolated {
             event_type: "POSITION_OPENED".to_string(),
@@ -267,7 +272,8 @@ pub(crate) async fn handle_trailing_stop_updated(
             }
         })?;
 
-    // Update trailing_stop_price + favorable_extreme (trigger_price is the new extreme)
+    // Update trailing_stop_price + favorable_extreme (trigger_price is the new
+    // extreme)
     sqlx::query(
         r#"
         UPDATE positions_current
@@ -541,7 +547,8 @@ pub(crate) async fn handle_exit_filled(pool: &PgPool, envelope: &EventEnvelope) 
 /// Handle position_closed (robson-domain::Event::PositionClosed, lowercase)
 ///
 /// Final closure event with realized P&L.
-/// Transitions the position to 'closed' and records exit_price, realized_pnl, total_fees.
+/// Transitions the position to 'closed' and records exit_price, realized_pnl,
+/// total_fees.
 pub(crate) async fn handle_position_closed_domain(
     pool: &PgPool,
     envelope: &EventEnvelope,

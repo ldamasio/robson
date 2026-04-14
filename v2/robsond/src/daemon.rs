@@ -18,53 +18,46 @@
 //! 7. Main event loop (process events, market data)
 //! 8. Graceful shutdown on SIGINT/SIGTERM
 
-use std::net::SocketAddr;
-use std::sync::Arc;
+use std::{net::SocketAddr, sync::Arc};
 
 // Macro for creating Decimal literals
 use async_trait::async_trait;
-use rust_decimal_macros::dec;
-
-use tokio::net::TcpListener;
-use tokio::sync::RwLock;
-use tracing::{error, info, warn};
-
 use robson_connectors::BinanceRestClient;
 use robson_domain::{Position, PositionId, Symbol};
 use robson_engine::Engine;
 use robson_exec::{ExchangePort, Executor, IntentJournal, StubExchange};
-
-use crate::binance_exchange::BinanceExchangeAdapter;
 #[cfg(feature = "postgres")]
 use robson_store::PgDetectedPositionRepository;
+// Optional projection recovery for crash recovery
+#[cfg(feature = "postgres")]
+use robson_store::ProjectionRecovery;
 use robson_store::{
     DetectedPositionRepository, MemoryDetectedPositionRepository, MemoryStore, PositionRepository,
     Store, StoreError,
 };
+use rust_decimal_macros::dec;
+#[cfg(feature = "postgres")]
+use sqlx::Row;
+use tokio::{net::TcpListener, sync::RwLock};
+use tracing::{error, info, warn};
 
-use crate::api::{create_router, ApiState};
-use crate::config::Config;
-use crate::error::{DaemonError, DaemonResult};
-use crate::event_bus::{DaemonEvent, EventBus};
-use crate::market_data::MarketDataManager;
-use crate::position_manager::PositionManager;
-use crate::position_monitor::{
-    PositionMonitor, PositionMonitorConfig as RuntimePositionMonitorConfig,
-};
+#[cfg(feature = "postgres")]
+use crate::projection_worker::ProjectionWorker;
 #[cfg(feature = "postgres")]
 use crate::query::ExecutionQuery;
 #[cfg(feature = "postgres")]
 use crate::query_engine::{append_query_state_changed_event, EventLogQueryRecorder};
-use crate::query_engine::{QueryRecorder, TracingQueryRecorder};
-
-#[cfg(feature = "postgres")]
-use crate::projection_worker::ProjectionWorker;
-
-// Optional projection recovery for crash recovery
-#[cfg(feature = "postgres")]
-use robson_store::ProjectionRecovery;
-#[cfg(feature = "postgres")]
-use sqlx::Row;
+use crate::{
+    api::{create_router, ApiState},
+    binance_exchange::BinanceExchangeAdapter,
+    config::Config,
+    error::{DaemonError, DaemonResult},
+    event_bus::{DaemonEvent, EventBus},
+    market_data::MarketDataManager,
+    position_manager::PositionManager,
+    position_monitor::{PositionMonitor, PositionMonitorConfig as RuntimePositionMonitorConfig},
+    query_engine::{QueryRecorder, TracingQueryRecorder},
+};
 
 // =============================================================================
 // Daemon
@@ -175,7 +168,8 @@ impl Daemon<StubExchange, MemoryStore> {
         }
     }
 
-    /// Create a new stub daemon with optional projection recovery and shared pool.
+    /// Create a new stub daemon with optional projection recovery and shared
+    /// pool.
     #[cfg(feature = "postgres")]
     pub fn new_stub_with_recovery(
         config: Config,
@@ -259,7 +253,8 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
         }
     }
 
-    /// Create a Binance daemon with optional projection recovery and shared pool.
+    /// Create a Binance daemon with optional projection recovery and shared
+    /// pool.
     #[cfg(feature = "postgres")]
     pub fn new_binance_with_recovery(
         config: Config,
@@ -473,8 +468,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
 
     /// Rebuild store from EventLog on startup (crash recovery).
     ///
-    /// Reads all stored events and re-applies them to rebuild the in-memory projection.
-    /// This is idempotent and safe to run on every boot.
+    /// Reads all stored events and re-applies them to rebuild the in-memory
+    /// projection. This is idempotent and safe to run on every boot.
     async fn rebuild_store(&self) -> DaemonResult<()> {
         let events = self.store.events().get_all_events().await?;
         let count = events.len();
@@ -554,10 +549,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         }
 
         if invalidated > 0 {
-            info!(
-                invalidated,
-                "Invalidated persisted AwaitingApproval queries on restart"
-            );
+            info!(invalidated, "Invalidated persisted AwaitingApproval queries on restart");
         }
 
         Ok(())
@@ -625,7 +617,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
 
     /// Start the API server.
     ///
-    /// Public to allow integration tests to start the server and get the address.
+    /// Public to allow integration tests to start the server and get the
+    /// address.
     pub async fn start_api_server(
         &self,
         position_monitor: Option<Arc<PositionMonitor>>,
@@ -890,11 +883,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    #[cfg(feature = "postgres")]
-    use crate::query::{ActorKind, ExecutionQuery, QueryKind};
-    #[cfg(feature = "postgres")]
-    use crate::query_engine::QueryStateChangedEvent;
     #[cfg(feature = "postgres")]
     use chrono::{TimeZone, Utc};
     #[cfg(feature = "postgres")]
@@ -905,6 +893,12 @@ mod tests {
     use robson_projector::apply_event_to_projections;
     #[cfg(feature = "postgres")]
     use rust_decimal_macros::dec;
+
+    use super::*;
+    #[cfg(feature = "postgres")]
+    use crate::query::{ActorKind, ExecutionQuery, QueryKind};
+    #[cfg(feature = "postgres")]
+    use crate::query_engine::QueryStateChangedEvent;
 
     #[tokio::test]
     async fn test_daemon_stub_creation() {

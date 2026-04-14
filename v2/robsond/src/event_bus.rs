@@ -232,9 +232,10 @@ impl EventReceiver {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use robson_domain::{Quantity, Side, Symbol};
     use rust_decimal_macros::dec;
+
+    use super::*;
 
     fn create_test_signal() -> DetectorSignal {
         DetectorSignal {

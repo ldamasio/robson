@@ -3,15 +3,17 @@
 //! Provides persistence for rogue positions detected by the safety net,
 //! allowing the position monitor to recover its state after restarts.
 
-use crate::error::StoreError;
+use std::collections::HashMap;
+#[cfg(feature = "postgres")]
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use robson_domain::{DetectedPosition, Price, Quantity, Side, Symbol};
 use rust_decimal::Decimal;
-use std::collections::HashMap;
-#[cfg(feature = "postgres")]
-use std::sync::Arc;
 use uuid::Uuid;
+
+use crate::error::StoreError;
 
 // =============================================================================
 // DTO (Data Transfer Object) for serialization
@@ -121,12 +123,7 @@ impl DetectedPositionDto {
         let side = match self.side.as_str() {
             "long" => Side::Long,
             "short" => Side::Short,
-            _ => {
-                return Err(StoreError::Deserialization(format!(
-                    "Invalid side: {}",
-                    self.side
-                )))
-            },
+            _ => return Err(StoreError::Deserialization(format!("Invalid side: {}", self.side))),
         };
 
         let entry_price = Price::new(self.entry_price).map_err(|e| {
@@ -611,20 +608,15 @@ impl DetectedPositionRepository for PgDetectedPositionRepository {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use chrono::Utc;
+
+    use super::*;
 
     fn create_test_position() -> DetectedPosition {
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
         let entry_price = Price::new(rust_decimal_macros::dec!(95000)).unwrap();
         let quantity = Quantity::new(rust_decimal_macros::dec!(0.1)).unwrap();
-        DetectedPosition::new(
-            "binance_123".to_string(),
-            symbol,
-            Side::Long,
-            entry_price,
-            quantity,
-        )
+        DetectedPosition::new("binance_123".to_string(), symbol, Side::Long, entry_price, quantity)
     }
 
     #[tokio::test]

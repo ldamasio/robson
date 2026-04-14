@@ -94,8 +94,9 @@ fn normalize_payload(payload: &serde_json::Value) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     #[test]
     fn test_compute_idempotency_key_deterministic() {
@@ -184,9 +185,6 @@ mod tests {
         let key1 = compute_idempotency_key(tenant_id, stream_key, command_id, &payload1);
         let key2 = compute_idempotency_key(tenant_id, stream_key, command_id, &payload2);
 
-        assert_eq!(
-            key1, key2,
-            "Timestamp changes should not affect idempotency key"
-        );
+        assert_eq!(key1, key2, "Timestamp changes should not affect idempotency key");
     }
 }

@@ -1,7 +1,8 @@
 //! Market Data Types
 //!
 //! Canonical market data types used across Robson v2.
-//! These are exchange-agnostic and can be used for both live and simulated data.
+//! These are exchange-agnostic and can be used for both live and simulated
+//! data.
 
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
@@ -261,19 +262,14 @@ impl MarketDataEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rust_decimal_macros::dec;
+
+    use super::*;
 
     #[test]
     fn test_tick_creation() {
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
-        let tick = Tick::new(
-            symbol,
-            dec!(95000),
-            dec!(0.1),
-            Utc::now(),
-            "12345".to_string(),
-        );
+        let tick = Tick::new(symbol, dec!(95000), dec!(0.1), Utc::now(), "12345".to_string());
 
         assert_eq!(tick.price, dec!(95000));
         assert_eq!(tick.quantity, dec!(0.1));

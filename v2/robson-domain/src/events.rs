@@ -3,11 +3,14 @@
 //! Events represent state changes in the domain.
 //! Used for event sourcing and audit trails.
 
-use crate::entities::{AccountId, ExitReason, OrderId, PositionId};
-use crate::value_objects::{Price, Quantity, Side, Symbol, TechnicalStopDistance};
 use chrono::{DateTime, Utc};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+
+use crate::{
+    entities::{AccountId, ExitReason, OrderId, PositionId},
+    value_objects::{Price, Quantity, Side, Symbol, TechnicalStopDistance},
+};
 
 /// Domain events for position lifecycle
 ///
@@ -26,7 +29,8 @@ pub enum Event {
         symbol: Symbol,
         /// Position direction
         side: Side,
-        /// Technical stop distance from chart analysis (needed for position sizing on signal)
+        /// Technical stop distance from chart analysis (needed for position
+        /// sizing on signal)
         tech_stop_distance: Option<TechnicalStopDistance>,
         /// When the position was armed
         timestamp: DateTime<Utc>,
@@ -58,7 +62,8 @@ pub enum Event {
         expected_price: Price,
         /// Order quantity
         quantity: Quantity,
-        /// Signal ID for idempotency (matches signal_id in PositionState::Entering)
+        /// Signal ID for idempotency (matches signal_id in
+        /// PositionState::Entering)
         signal_id: uuid::Uuid,
         /// When the order was placed
         timestamp: DateTime<Utc>,
@@ -281,9 +286,10 @@ impl Event {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rust_decimal_macros::dec;
     use uuid::Uuid;
+
+    use super::*;
 
     fn sample_position_armed() -> Event {
         Event::PositionArmed {

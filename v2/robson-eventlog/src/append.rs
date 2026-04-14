@@ -1,11 +1,14 @@
 //! Event Appending with Optimistic Concurrency
 
-use crate::idempotency::compute_idempotency_key;
-use crate::types::{ActorType, Event, EventEnvelope, EventLogError, Result};
 use chrono::Utc;
 use sqlx::{PgPool, Postgres, Row, Transaction};
 use tracing::{debug, warn};
 use uuid::Uuid;
+
+use crate::{
+    idempotency::compute_idempotency_key,
+    types::{ActorType, Event, EventEnvelope, EventLogError, Result},
+};
 
 /// Append event to log with optimistic concurrency
 ///
@@ -49,12 +52,8 @@ pub async fn append_event_tx(
     let event_id = Uuid::new_v4();
 
     // 3. Compute idempotency key
-    let idempotency_key = compute_idempotency_key(
-        event.tenant_id,
-        stream_key,
-        event.command_id,
-        &event.payload,
-    );
+    let idempotency_key =
+        compute_idempotency_key(event.tenant_id, stream_key, event.command_id, &event.payload);
 
     // 4. Check global idempotency via event_idempotency table
     let idempotency_check = sqlx::query(
@@ -149,7 +148,8 @@ pub async fn append_event_tx(
     }
 }
 
-/// Get next sequence number for stream with optional optimistic concurrency check
+/// Get next sequence number for stream with optional optimistic concurrency
+/// check
 async fn get_next_seq(
     tx: &mut Transaction<'_, Postgres>,
     stream_key: &str,
@@ -206,8 +206,9 @@ async fn update_stream_state(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use serde_json::json;
+
+    use super::*;
 
     // TODO: Add integration tests with test database
     // - Test successful append

@@ -19,20 +19,20 @@
 //! Architectural note (Phase 2 decision):
 //! `GovernedAction` lives in robsond (not robson-exec). The Executor continues
 //! accepting `Vec<EngineAction>` unchanged. Type-level enforcement across the
-//! crate boundary is deferred as a follow-up architectural concern. The governance
-//! guarantee in Phase 2 is: "risk evaluated inside runtime before any Executor call".
+//! crate boundary is deferred as a follow-up architectural concern. The
+//! governance guarantee in Phase 2 is: "risk evaluated inside runtime before
+//! any Executor call".
 //!
 //! Ownership: lives INSIDE robsond crate. Not a separate crate.
 
 use async_trait::async_trait;
-use serde::{Deserialize, Serialize};
-
 use robson_engine::{EngineAction, ProposedTrade, RiskContext, RiskGate, RiskVerdict};
 #[cfg(feature = "postgres")]
 use robson_eventlog::{
     append_event, ActorType, Event, EventLogError, QUERY_STATE_CHANGED_EVENT_TYPE,
 };
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
 #[cfg(feature = "postgres")]
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -347,17 +347,18 @@ pub(crate) enum ApprovalCheckResult {
 ///
 /// Two distinct cases that callers MUST handle differently:
 ///
-/// - `Denied`: Risk gate rejected the trade. The query is in `QueryState::Denied`.
-///   No exchange side effects occurred. Caller should treat this as a governed
-///   outcome and return `Ok(())`.
+/// - `Denied`: Risk gate rejected the trade. The query is in
+///   `QueryState::Denied`. No exchange side effects occurred. Caller should
+///   treat this as a governed outcome and return `Ok(())`.
 ///
-/// - `InvalidState`: The query lifecycle state machine is in an unexpected state
-///   and cannot enter `RiskChecked`. This is an operational error (e.g. a bug
-///   in the caller or concurrent mutation). Caller should propagate as an error
-///   — NOT treat it as a governance denial.
+/// - `InvalidState`: The query lifecycle state machine is in an unexpected
+///   state and cannot enter `RiskChecked`. This is an operational error (e.g. a
+///   bug in the caller or concurrent mutation). Caller should propagate as an
+///   error — NOT treat it as a governance denial.
 #[derive(Debug)]
 pub(crate) enum CheckRiskError {
-    /// Risk gate rejected the trade (governed outcome — no side effects occurred).
+    /// Risk gate rejected the trade (governed outcome — no side effects
+    /// occurred).
     Denied,
     /// Query state machine is inconsistent — cannot transition to RiskChecked.
     /// This is an operational error, not a governance decision.
@@ -426,8 +427,9 @@ impl<R: QueryRecorder> QueryEngine<R> {
     /// Returns:
     /// - `Ok(GovernedAction)`: risk approved — pass actions to Executor via
     ///   `governed.into_actions()`.
-    /// - `Err(CheckRiskError::Denied)`: risk gate rejected the trade. Query is in
-    ///   `QueryState::Denied`. Caller should treat as governed outcome (`Ok(())`).
+    /// - `Err(CheckRiskError::Denied)`: risk gate rejected the trade. Query is
+    ///   in `QueryState::Denied`. Caller should treat as governed outcome
+    ///   (`Ok(())`).
     /// - `Err(CheckRiskError::InvalidState)`: query lifecycle state machine is
     ///   inconsistent (cannot enter RiskChecked). This is an operational error.
     ///   Caller MUST propagate as `Err`, not treat as a denial.
@@ -510,8 +512,9 @@ impl<R: QueryRecorder> QueryEngine<R> {
 
     /// Revalidate a pending approval against the current risk context.
     ///
-    /// Approval is not a risk override. If the portfolio changed while the query
-    /// was waiting for operator confirmation, execution must be denied.
+    /// Approval is not a risk override. If the portfolio changed while the
+    /// query was waiting for operator confirmation, execution must be
+    /// denied.
     pub(crate) async fn revalidate_risk(
         &self,
         query: &mut ExecutionQuery,
@@ -566,14 +569,18 @@ impl<R: QueryRecorder> QueryEngine<R> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::query::{ActorKind, QueryKind, QueryOutcome, QueryState};
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
     use robson_domain::{Price, Side, Symbol};
     use robson_engine::{PositionSummary, RiskContext, RiskGate};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
-    use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
+
+    use super::*;
+    use crate::query::{ActorKind, QueryKind, QueryOutcome, QueryState};
 
     /// Mock recorder that counts calls
     struct MockRecorder {
@@ -728,20 +735,17 @@ mod tests {
 
     fn saturated_context() -> RiskContext {
         // 3 open positions — triggers MaxOpenPositions
-        RiskContext::with_positions(
-            dec!(10000),
-            vec![
-                PositionSummary {
-                    position_id: uuid::Uuid::nil(),
-                    symbol: "ETHUSDT".to_string(),
-                    side: "long".to_string(),
-                    notional_value: dec!(1000),
-                    margin_used: dec!(100),
-                    unrealized_pnl: Decimal::ZERO,
-                };
-                3
-            ],
-        )
+        RiskContext::with_positions(dec!(10000), vec![
+            PositionSummary {
+                position_id: uuid::Uuid::nil(),
+                symbol: "ETHUSDT".to_string(),
+                side: "long".to_string(),
+                notional_value: dec!(1000),
+                margin_used: dec!(100),
+                unrealized_pnl: Decimal::ZERO,
+            };
+            3
+        ])
     }
 
     fn dummy_actions() -> Vec<EngineAction> {
@@ -768,10 +772,7 @@ mod tests {
             .check_risk(&mut query, &sample_proposed(), &empty_context(), actions)
             .await;
 
-        assert!(
-            result.is_ok(),
-            "Expected Ok(GovernedAction) for approved trade"
-        );
+        assert!(result.is_ok(), "Expected Ok(GovernedAction) for approved trade");
         assert_eq!(query.state, QueryState::RiskChecked);
         assert_eq!(recorder.transition_count(), 1);
     }
@@ -794,30 +795,17 @@ mod tests {
         };
 
         let governed = engine
-            .check_risk(
-                &mut query,
-                &no_approval_proposed,
-                &empty_context(),
-                dummy_actions(),
-            )
+            .check_risk(&mut query, &no_approval_proposed, &empty_context(), dummy_actions())
             .await
             .expect("risk should approve");
 
         let result = engine
-            .check_approval(
-                &mut query,
-                &no_approval_proposed,
-                &empty_context(),
-                governed,
-            )
+            .check_approval(&mut query, &no_approval_proposed, &empty_context(), governed)
             .await;
 
         assert!(matches!(result, Ok(ApprovalCheckResult::Ready(_))));
         assert_eq!(query.state, QueryState::RiskChecked);
-        assert!(
-            query.approval.is_none(),
-            "No approval metadata should be attached"
-        );
+        assert!(query.approval.is_none(), "No approval metadata should be attached");
     }
 
     #[tokio::test]
@@ -838,12 +826,7 @@ mod tests {
         };
 
         let governed = engine
-            .check_risk(
-                &mut query,
-                &approval_proposed,
-                &empty_context(),
-                dummy_actions(),
-            )
+            .check_risk(&mut query, &approval_proposed, &empty_context(), dummy_actions())
             .await
             .expect("risk should approve");
 
@@ -851,10 +834,7 @@ mod tests {
             .check_approval(&mut query, &approval_proposed, &empty_context(), governed)
             .await;
 
-        assert!(matches!(
-            result,
-            Ok(ApprovalCheckResult::AwaitingApproval(_))
-        ));
+        assert!(matches!(result, Ok(ApprovalCheckResult::AwaitingApproval(_))));
         assert_eq!(query.state, QueryState::AwaitingApproval);
         let approval = query.approval.as_ref().expect("approval metadata must be present");
         assert_eq!(approval.ttl_seconds, 300);
@@ -925,18 +905,10 @@ mod tests {
         query.transition(QueryState::Processing).unwrap();
 
         let result = engine
-            .check_risk(
-                &mut query,
-                &sample_proposed(),
-                &saturated_context(),
-                dummy_actions(),
-            )
+            .check_risk(&mut query, &sample_proposed(), &saturated_context(), dummy_actions())
             .await;
 
-        assert!(
-            result.is_err(),
-            "Expected Err(CheckRiskError::Denied) for saturated portfolio"
-        );
+        assert!(result.is_err(), "Expected Err(CheckRiskError::Denied) for saturated portfolio");
         assert!(
             matches!(query.state, QueryState::Denied { .. }),
             "Query should be in Denied state after risk denial"
@@ -954,12 +926,7 @@ mod tests {
 
         let before = recorder.transition_count();
         engine
-            .check_risk(
-                &mut query,
-                &sample_proposed(),
-                &saturated_context(),
-                dummy_actions(),
-            )
+            .check_risk(&mut query, &sample_proposed(), &saturated_context(), dummy_actions())
             .await
             .ok();
 
@@ -983,12 +950,7 @@ mod tests {
         let mut query = create_test_query();
 
         let result = engine
-            .check_risk(
-                &mut query,
-                &sample_proposed(),
-                &empty_context(),
-                dummy_actions(),
-            )
+            .check_risk(&mut query, &sample_proposed(), &empty_context(), dummy_actions())
             .await;
 
         assert!(
@@ -996,7 +958,8 @@ mod tests {
             "Expected Err(CheckRiskError::InvalidState), got {:?}",
             result
         );
-        // Query must NOT have transitioned to Denied — that would be a false governance record.
+        // Query must NOT have transitioned to Denied — that would be a false governance
+        // record.
         assert!(
             !matches!(query.state, QueryState::Denied { .. }),
             "InvalidState must not produce a Denied query state"

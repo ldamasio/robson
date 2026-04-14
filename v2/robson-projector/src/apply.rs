@@ -2,11 +2,13 @@
 //!
 //! Routes events to their appropriate projection handlers.
 
-use crate::error::{ProjectionError, Result};
-use crate::handlers;
-use robson_eventlog::EventEnvelope;
-use robson_eventlog::QUERY_STATE_CHANGED_EVENT_TYPE;
+use robson_eventlog::{EventEnvelope, QUERY_STATE_CHANGED_EVENT_TYPE};
 use sqlx::PgPool;
+
+use crate::{
+    error::{ProjectionError, Result},
+    handlers,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ProjectionRoute {

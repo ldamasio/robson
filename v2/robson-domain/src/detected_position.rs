@@ -179,8 +179,9 @@ pub enum StopMethod {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rust_decimal_macros::dec;
+
+    use super::*;
 
     #[test]
     fn test_detected_position_creation() {
@@ -188,13 +189,8 @@ mod tests {
         let entry = Price::new(dec!(95000)).unwrap();
         let quantity = Quantity::new(dec!(0.1)).unwrap();
 
-        let position = DetectedPosition::new(
-            "binance_123".to_string(),
-            symbol,
-            Side::Long,
-            entry,
-            quantity,
-        );
+        let position =
+            DetectedPosition::new("binance_123".to_string(), symbol, Side::Long, entry, quantity);
 
         assert_eq!(position.binance_position_id, "binance_123");
         assert_eq!(position.side, Side::Long);
@@ -209,13 +205,8 @@ mod tests {
         let entry = Price::new(dec!(95000)).unwrap();
         let quantity = Quantity::new(dec!(0.1)).unwrap();
 
-        let mut position = DetectedPosition::new(
-            "binance_123".to_string(),
-            symbol,
-            Side::Long,
-            entry,
-            quantity,
-        );
+        let mut position =
+            DetectedPosition::new("binance_123".to_string(), symbol, Side::Long, entry, quantity);
 
         let stop = position.calculate_safety_stop();
 
@@ -233,13 +224,8 @@ mod tests {
         let entry = Price::new(dec!(95000)).unwrap();
         let quantity = Quantity::new(dec!(0.1)).unwrap();
 
-        let mut position = DetectedPosition::new(
-            "binance_123".to_string(),
-            symbol,
-            Side::Short,
-            entry,
-            quantity,
-        );
+        let mut position =
+            DetectedPosition::new("binance_123".to_string(), symbol, Side::Short, entry, quantity);
 
         let stop = position.calculate_safety_stop();
 
@@ -256,37 +242,20 @@ mod tests {
         let entry = Price::new(dec!(95000)).unwrap();
         let quantity = Quantity::new(dec!(0.1)).unwrap();
 
-        let mut position = DetectedPosition::new(
-            "binance_123".to_string(),
-            symbol,
-            Side::Long,
-            entry,
-            quantity,
-        );
+        let mut position =
+            DetectedPosition::new("binance_123".to_string(), symbol, Side::Long, entry, quantity);
 
         position.calculate_safety_stop();
 
         // Price above stop - not hit
-        assert_eq!(
-            position.is_stop_hit(Price::new(dec!(93200)).unwrap()),
-            Some(false)
-        );
-        assert_eq!(
-            position.is_stop_hit(Price::new(dec!(95000)).unwrap()),
-            Some(false)
-        );
+        assert_eq!(position.is_stop_hit(Price::new(dec!(93200)).unwrap()), Some(false));
+        assert_eq!(position.is_stop_hit(Price::new(dec!(95000)).unwrap()), Some(false));
 
         // Price at stop - hit
-        assert_eq!(
-            position.is_stop_hit(Price::new(dec!(93100)).unwrap()),
-            Some(true)
-        );
+        assert_eq!(position.is_stop_hit(Price::new(dec!(93100)).unwrap()), Some(true));
 
         // Price below stop - hit
-        assert_eq!(
-            position.is_stop_hit(Price::new(dec!(93000)).unwrap()),
-            Some(true)
-        );
+        assert_eq!(position.is_stop_hit(Price::new(dec!(93000)).unwrap()), Some(true));
     }
 
     #[test]
@@ -295,37 +264,20 @@ mod tests {
         let entry = Price::new(dec!(95000)).unwrap();
         let quantity = Quantity::new(dec!(0.1)).unwrap();
 
-        let mut position = DetectedPosition::new(
-            "binance_123".to_string(),
-            symbol,
-            Side::Short,
-            entry,
-            quantity,
-        );
+        let mut position =
+            DetectedPosition::new("binance_123".to_string(), symbol, Side::Short, entry, quantity);
 
         position.calculate_safety_stop();
 
         // Price below stop - not hit
-        assert_eq!(
-            position.is_stop_hit(Price::new(dec!(96800)).unwrap()),
-            Some(false)
-        );
-        assert_eq!(
-            position.is_stop_hit(Price::new(dec!(95000)).unwrap()),
-            Some(false)
-        );
+        assert_eq!(position.is_stop_hit(Price::new(dec!(96800)).unwrap()), Some(false));
+        assert_eq!(position.is_stop_hit(Price::new(dec!(95000)).unwrap()), Some(false));
 
         // Price at stop - hit
-        assert_eq!(
-            position.is_stop_hit(Price::new(dec!(96900)).unwrap()),
-            Some(true)
-        );
+        assert_eq!(position.is_stop_hit(Price::new(dec!(96900)).unwrap()), Some(true));
 
         // Price above stop - hit
-        assert_eq!(
-            position.is_stop_hit(Price::new(dec!(97000)).unwrap()),
-            Some(true)
-        );
+        assert_eq!(position.is_stop_hit(Price::new(dec!(97000)).unwrap()), Some(true));
     }
 
     #[test]
@@ -334,13 +286,8 @@ mod tests {
         let entry = Price::new(dec!(95000)).unwrap();
         let quantity = Quantity::new(dec!(0.1)).unwrap();
 
-        let position = DetectedPosition::new(
-            "binance_123".to_string(),
-            symbol,
-            Side::Long,
-            entry,
-            quantity,
-        );
+        let position =
+            DetectedPosition::new("binance_123".to_string(), symbol, Side::Long, entry, quantity);
 
         // No stop calculated yet
         assert!(position.calculated_stop.is_none());
@@ -353,13 +300,8 @@ mod tests {
         let entry = Price::new(dec!(95000)).unwrap();
         let quantity = Quantity::new(dec!(0.1)).unwrap();
 
-        let mut position = DetectedPosition::new(
-            "binance_123".to_string(),
-            symbol,
-            Side::Long,
-            entry,
-            quantity,
-        );
+        let mut position =
+            DetectedPosition::new("binance_123".to_string(), symbol, Side::Long, entry, quantity);
 
         let original_time = position.last_verified_at;
 
@@ -397,13 +339,8 @@ mod tests {
         let entry = Price::new(dec!(95000)).unwrap();
         let quantity = Quantity::new(dec!(0.1)).unwrap();
 
-        let mut position = DetectedPosition::new(
-            "binance_123".to_string(),
-            symbol,
-            Side::Long,
-            entry,
-            quantity,
-        );
+        let mut position =
+            DetectedPosition::new("binance_123".to_string(), symbol, Side::Long, entry, quantity);
 
         position.calculate_safety_stop();
 
@@ -413,10 +350,7 @@ mod tests {
         // Deserialize
         let deserialized: DetectedPosition = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(
-            deserialized.binance_position_id,
-            position.binance_position_id
-        );
+        assert_eq!(deserialized.binance_position_id, position.binance_position_id);
         assert_eq!(deserialized.side, position.side);
         assert_eq!(deserialized.entry_price, position.entry_price);
         assert!(deserialized.calculated_stop.is_some());

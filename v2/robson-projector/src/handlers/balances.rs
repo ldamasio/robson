@@ -1,9 +1,12 @@
 //! Balance projection handlers
 
-use crate::error::{ProjectionError, Result};
-use crate::types::BalanceSampled;
 use robson_eventlog::EventEnvelope;
 use sqlx::PgPool;
+
+use crate::{
+    error::{ProjectionError, Result},
+    types::BalanceSampled,
+};
 
 pub(crate) async fn handle_balance_sampled(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
     let payload: BalanceSampled =

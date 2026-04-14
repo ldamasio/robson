@@ -1,9 +1,12 @@
 //! Strategy projection handlers
 
-use crate::error::{ProjectionError, Result};
-use crate::types::{StrategyDisabled, StrategyEnabled};
 use robson_eventlog::EventEnvelope;
 use sqlx::PgPool;
+
+use crate::{
+    error::{ProjectionError, Result},
+    types::{StrategyDisabled, StrategyEnabled},
+};
 
 pub(crate) async fn handle_strategy_enabled(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
     let payload: StrategyEnabled =

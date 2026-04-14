@@ -2,11 +2,12 @@
 //!
 //! Loads configuration from environment variables with sensible defaults.
 
-use crate::error::{DaemonError, DaemonResult};
+use std::{env, str::FromStr};
+
 use rust_decimal::Decimal;
-use std::env;
-use std::str::FromStr;
 use uuid::Uuid;
+
+use crate::error::{DaemonError, DaemonResult};
 
 // =============================================================================
 // Configuration

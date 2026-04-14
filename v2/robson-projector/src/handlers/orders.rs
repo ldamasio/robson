@@ -3,12 +3,15 @@
 //! INVARIANT: All handlers are idempotent - safe for replay.
 //! UPSERT is used and sequence numbers are checked.
 
-use crate::error::{ProjectionError, Result};
-use crate::types::{FillReceived, OrderAcked, OrderCanceled, OrderRejected, OrderSubmitted};
 use chrono::Utc;
 use robson_eventlog::EventEnvelope;
 use sqlx::PgPool;
 use uuid::Uuid;
+
+use crate::{
+    error::{ProjectionError, Result},
+    types::{FillReceived, OrderAcked, OrderCanceled, OrderRejected, OrderSubmitted},
+};
 
 pub(crate) async fn handle_order_submitted(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
     let payload: OrderSubmitted =

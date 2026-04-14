@@ -23,14 +23,14 @@
 //! println!("API Key: {}", creds.api_key);
 //! ```
 
+#[cfg(feature = "postgres")]
+use std::sync::Arc;
+
 use async_trait::async_trait;
 use chrono::Utc;
 use robson_domain::{
     ApiCredentials, CredentialError, CredentialId, CredentialStatus, StoredCredential,
 };
-#[cfg(feature = "postgres")]
-use std::sync::Arc;
-
 #[cfg(feature = "postgres")]
 use sqlx::PgPool;
 
@@ -210,13 +210,7 @@ impl MemoryCredentialStore {
     }
 
     fn id_to_key(id: &CredentialId) -> String {
-        format!(
-            "{}:{}:{}:{}",
-            id.tenant_id(),
-            id.user_id(),
-            id.exchange.as_str(),
-            id.profile()
-        )
+        format!("{}:{}:{}:{}", id.tenant_id(), id.user_id(), id.exchange.as_str(), id.profile())
     }
 }
 
@@ -613,8 +607,9 @@ impl CredentialStore for PgCredentialStore {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use robson_domain::{Exchange, IdentityScope};
+
+    use super::*;
 
     #[tokio::test]
     async fn test_memory_store_roundtrip_single_user() {

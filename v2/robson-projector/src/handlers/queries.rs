@@ -1,9 +1,12 @@
 //! Query audit projection handlers
 
-use crate::error::{ProjectionError, Result};
-use crate::types::QueryStateChanged;
 use robson_eventlog::EventEnvelope;
 use sqlx::PgPool;
+
+use crate::{
+    error::{ProjectionError, Result},
+    types::QueryStateChanged,
+};
 
 pub(crate) async fn handle_query_state_changed(
     pool: &PgPool,

@@ -1,10 +1,13 @@
 //! Risk projection handlers
 
-use crate::error::{ProjectionError, Result};
-use crate::types::RiskCheckFailed;
 use robson_eventlog::EventEnvelope;
 use sqlx::PgPool;
 use uuid::Uuid;
+
+use crate::{
+    error::{ProjectionError, Result},
+    types::RiskCheckFailed,
+};
 
 pub(crate) async fn handle_risk_check_failed(
     pool: &PgPool,

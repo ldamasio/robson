@@ -1,6 +1,7 @@
 //! DB-backed integration test for trailing stop projections
 //!
-//! Tests that trailing stop events are correctly projected to positions_current table.
+//! Tests that trailing stop events are correctly projected to positions_current
+//! table.
 //!
 //! # Running these tests
 //!

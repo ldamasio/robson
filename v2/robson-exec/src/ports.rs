@@ -5,10 +5,9 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use robson_domain::{OrderSide, Price, Quantity, Symbol};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-
-use robson_domain::{OrderSide, Price, Quantity, Symbol};
 
 use crate::error::ExecError;
 
@@ -162,8 +161,9 @@ pub struct PriceUpdate {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rust_decimal_macros::dec;
+
+    use super::*;
 
     #[test]
     fn test_order_result_serialization() {

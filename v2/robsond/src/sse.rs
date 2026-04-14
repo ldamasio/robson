@@ -53,8 +53,8 @@ impl PublicSseEvent {
 
 /// Map an internal daemon event into the public SSE contract.
 ///
-/// Returns `None` for internal-only events that are intentionally not exposed to
-/// operator clients in the v2.5 SSE stream.
+/// Returns `None` for internal-only events that are intentionally not exposed
+/// to operator clients in the v2.5 SSE stream.
 pub(crate) fn map_daemon_event(event: &DaemonEvent) -> Option<PublicSseEvent> {
     match event {
         DaemonEvent::PositionStateChanged {
@@ -201,10 +201,11 @@ pub(crate) fn resync_required_event(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use crate::event_bus::{MarketData, OrderFill};
     use robson_domain::{DetectorSignal, Price, Quantity, Side, Symbol};
     use rust_decimal_macros::dec;
+
+    use super::*;
+    use crate::event_bus::{MarketData, OrderFill};
 
     fn test_symbol() -> Symbol {
         Symbol::from_pair("BTCUSDT").unwrap()

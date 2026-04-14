@@ -1,15 +1,15 @@
 //! Test helpers for Robson v2 database-backed tests.
 //!
-//! Provides seeding helpers for tenant/account, event appending, and projection state.
+//! Provides seeding helpers for tenant/account, event appending, and projection
+//! state.
 
 mod helpers;
 
+use anyhow::Result;
 pub use helpers::{
     append_event, seed_balance_sampled_event, seed_position_opened_event, seed_tenant_account,
     AppendEventOptions,
 };
-
-use anyhow::Result;
 use sqlx::PgPool;
 
 /// Setup a clean test database by running migrations.

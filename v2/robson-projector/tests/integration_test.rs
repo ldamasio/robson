@@ -557,7 +557,8 @@ async fn test_risk_check_failed(pool: sqlx::PgPool) -> sqlx::Result<()> {
 #[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_global_idempotency(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Regression test: inserting same event twice should not duplicate
-    // Uses event_idempotency table for global idempotency by (tenant_id, idempotency_key)
+    // Uses event_idempotency table for global idempotency by (tenant_id,
+    // idempotency_key)
 
     let tenant_id = Uuid::new_v4();
     let account_id = Uuid::new_v4();
@@ -646,7 +647,8 @@ async fn test_global_idempotency(pool: sqlx::PgPool) -> sqlx::Result<()> {
     .await?;
     assert_eq!(count_1, 1, "First insert should create 1 row");
 
-    // Second insert - should be blocked by event_idempotency (ON CONFLICT DO NOTHING)
+    // Second insert - should be blocked by event_idempotency (ON CONFLICT DO
+    // NOTHING)
     let event_id_2 =
         insert_via_idempotency(stream_key, 2, &pool, tenant_id, idempotency_key, account_id)
             .await?;
@@ -660,16 +662,10 @@ async fn test_global_idempotency(pool: sqlx::PgPool) -> sqlx::Result<()> {
     .bind(idempotency_key)
     .fetch_one(&pool)
     .await?;
-    assert_eq!(
-        count_2, 1,
-        "Second insert should NOT create duplicate; should still be 1 row"
-    );
+    assert_eq!(count_2, 1, "Second insert should NOT create duplicate; should still be 1 row");
 
     // Verify the event_id returned is the same (first insert)
-    assert_eq!(
-        event_id_1, event_id_2,
-        "Both inserts should return same event_id"
-    );
+    assert_eq!(event_id_1, event_id_2, "Both inserts should return same event_id");
 
     Ok(())
 }

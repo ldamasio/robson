@@ -3,12 +3,13 @@
 //! Core business entities with lifecycle management.
 //! All entities have identity and state transitions.
 
-use crate::value_objects::{
-    DomainError, OrderSide, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance,
-};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
+
+use crate::value_objects::{
+    DomainError, OrderSide, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance,
+};
 
 // =============================================================================
 // Position ID
@@ -60,7 +61,8 @@ pub struct Position {
     pub entry_order_id: Option<OrderId>,
     pub exit_order_id: Option<OrderId>,
     pub insurance_stop_id: Option<OrderId>, // Exchange insurance stop (if enabled)
-    /// Binance exchange identifier captured on entry fill for Core/SafetyNet coordination.
+    /// Binance exchange identifier captured on entry fill for Core/SafetyNet
+    /// coordination.
     pub binance_position_id: Option<String>,
 
     // Audit
@@ -196,9 +198,7 @@ pub fn calculate_position_size(
     let stop_distance = tech_stop.distance;
 
     if stop_distance <= rust_decimal::Decimal::ZERO {
-        return Err(DomainError::PositionSizingError(
-            "Stop distance must be positive".to_string(),
-        ));
+        return Err(DomainError::PositionSizingError("Stop distance must be positive".to_string()));
     }
 
     // Golden Rule: Position Size = Max Risk / Stop Distance
@@ -555,8 +555,9 @@ impl DetectorSignal {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rust_decimal_macros::dec;
+
+    use super::*;
 
     #[test]
     fn test_position_creation() {

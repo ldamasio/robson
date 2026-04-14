@@ -11,8 +11,8 @@
 //! # Usage
 //!
 //! ```rust
-//! use robson_store::{MemoryStore, Store, PositionRepository};
-//! use robson_domain::{Position, Symbol, Side};
+//! use robson_domain::{Position, Side, Symbol};
+//! use robson_store::{MemoryStore, PositionRepository, Store};
 //! use uuid::Uuid;
 //!
 //! #[tokio::main]
@@ -20,11 +20,8 @@
 //!     let store = MemoryStore::new();
 //!
 //!     // Create and save a position
-//!     let position = Position::new(
-//!         Uuid::now_v7(),
-//!         Symbol::from_pair("BTCUSDT").unwrap(),
-//!         Side::Long,
-//!     );
+//!     let position =
+//!         Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
 //!     store.save(&position).await.unwrap();
 //!
 //!     // Find open core positions (historically named "active")

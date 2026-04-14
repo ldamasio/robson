@@ -1,7 +1,8 @@
 //! Discrete Step Trailing Stop (v3 Policy)
 //!
-//! This module implements the v3 trailing stop using the "span" (palmo) technique.
-//! The span is the technical stop distance calculated at position entry.
+//! This module implements the v3 trailing stop using the "span" (palmo)
+//! technique. The span is the technical stop distance calculated at position
+//! entry.
 //!
 //! # Algorithm (Discrete Step / Palmo)
 //!
@@ -9,10 +10,12 @@
 //!
 //! For LONG:
 //!   - entry = 95,000, stop_tecnico = 93,500, span = 1,500
-//!   - price reaches 96,500 (entry + 1×span) → stop moves to 95,000 (entry - 0×span = breakeven)
+//!   - price reaches 96,500 (entry + 1×span) → stop moves to 95,000 (entry -
+//!     0×span = breakeven)
 //!   - price reaches 98,000 (entry + 2×span) → stop moves to 96,500
 //!   - price reaches 99,500 (entry + 3×span) → stop moves to 98,000
-//!   - price at 97,200 (between steps) → stop stays at 98,000 (no partial moves)
+//!   - price at 97,200 (between steps) → stop stays at 98,000 (no partial
+//!     moves)
 //!
 //! # Key Invariants
 //!
@@ -27,7 +30,8 @@ use rust_decimal::Decimal;
 /// Result of a trailing stop update
 ///
 /// Contains the new stop price if an update occurred.
-/// Returns `None` when no update is needed (price hasn't completed a new span step).
+/// Returns `None` when no update is needed (price hasn't completed a new span
+/// step).
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TrailingStopUpdate {
     /// New trailing stop price
@@ -46,7 +50,8 @@ pub struct TrailingStopUpdate {
 ///
 /// * `side` - Position side (Long or Short)
 /// * `current_price` - Current market price
-/// * `favorable_extreme` - Current best price seen (peak for Long, low for Short)
+/// * `favorable_extreme` - Current best price seen (peak for Long, low for
+///   Short)
 /// * `current_trailing_stop` - Current trailing stop price
 /// * `entry_price` - Entry price of the position (anchor for span steps)
 /// * `span` - Technical stop distance (the "palmo" — unit of movement)
@@ -268,8 +273,9 @@ pub fn is_trailing_stop_hit(side: Side, current_price: Price, trailing_stop: Pri
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use rust_decimal_macros::dec;
+
+    use super::*;
 
     // Helper: standard LONG position setup
     // entry = $95,000, stop = $93,500, span = $1,500
@@ -411,11 +417,7 @@ mod tests {
         );
         assert!(r.is_none());
         // Position should be closed by is_trailing_stop_hit (97,200 < 98,000)
-        assert!(is_trailing_stop_hit(
-            Side::Long,
-            Price::new(dec!(97200)).unwrap(),
-            stop
-        ));
+        assert!(is_trailing_stop_hit(Side::Long, Price::new(dec!(97200)).unwrap(), stop));
     }
 
     #[test]
@@ -434,11 +436,7 @@ mod tests {
             span,
         );
         assert!(r.is_none());
-        assert!(!is_trailing_stop_hit(
-            Side::Long,
-            Price::new(dec!(93600)).unwrap(),
-            stop
-        ));
+        assert!(!is_trailing_stop_hit(Side::Long, Price::new(dec!(93600)).unwrap(), stop));
 
         // Price recovers to entry ($95,000)
         let r = update_trailing_stop_discrete(
@@ -510,7 +508,8 @@ mod tests {
         let stop = Price::new(dec!(95000)).unwrap();
         let extreme = Price::new(dec!(96500)).unwrap();
 
-        // Price at $97,500 — between span 1 boundary (96,500) and span 2 boundary (98,000)
+        // Price at $97,500 — between span 1 boundary (96,500) and span 2 boundary
+        // (98,000)
         let r = update_trailing_stop_discrete(
             side,
             Price::new(dec!(97500)).unwrap(),
@@ -619,11 +618,7 @@ mod tests {
             span,
         );
         assert!(r.is_none());
-        assert!(is_trailing_stop_hit(
-            Side::Short,
-            Price::new(dec!(92800)).unwrap(),
-            stop
-        ));
+        assert!(is_trailing_stop_hit(Side::Short, Price::new(dec!(92800)).unwrap(), stop));
     }
 
     #[test]
@@ -665,41 +660,17 @@ mod tests {
     #[test]
     fn test_long_stop_hit_at_or_below() {
         let stop = Price::new(dec!(95000)).unwrap();
-        assert!(is_trailing_stop_hit(
-            Side::Long,
-            Price::new(dec!(95000)).unwrap(),
-            stop
-        ));
-        assert!(is_trailing_stop_hit(
-            Side::Long,
-            Price::new(dec!(94900)).unwrap(),
-            stop
-        ));
-        assert!(!is_trailing_stop_hit(
-            Side::Long,
-            Price::new(dec!(95100)).unwrap(),
-            stop
-        ));
+        assert!(is_trailing_stop_hit(Side::Long, Price::new(dec!(95000)).unwrap(), stop));
+        assert!(is_trailing_stop_hit(Side::Long, Price::new(dec!(94900)).unwrap(), stop));
+        assert!(!is_trailing_stop_hit(Side::Long, Price::new(dec!(95100)).unwrap(), stop));
     }
 
     #[test]
     fn test_short_stop_hit_at_or_above() {
         let stop = Price::new(dec!(95000)).unwrap();
-        assert!(is_trailing_stop_hit(
-            Side::Short,
-            Price::new(dec!(95000)).unwrap(),
-            stop
-        ));
-        assert!(is_trailing_stop_hit(
-            Side::Short,
-            Price::new(dec!(95100)).unwrap(),
-            stop
-        ));
-        assert!(!is_trailing_stop_hit(
-            Side::Short,
-            Price::new(dec!(94900)).unwrap(),
-            stop
-        ));
+        assert!(is_trailing_stop_hit(Side::Short, Price::new(dec!(95000)).unwrap(), stop));
+        assert!(is_trailing_stop_hit(Side::Short, Price::new(dec!(95100)).unwrap(), stop));
+        assert!(!is_trailing_stop_hit(Side::Short, Price::new(dec!(94900)).unwrap(), stop));
     }
 
     // =========================================================================
@@ -783,6 +754,7 @@ mod tests {
             entry,
             span,
         );
-        assert!(r2.is_none()); // Peak was already 96,500, price didn't exceed it
+        assert!(r2.is_none()); // Peak was already 96,500, price didn't exceed
+                               // it
     }
 }
