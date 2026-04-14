@@ -33,7 +33,7 @@ mod db;
 use std::sync::Arc;
 
 use robson_connectors::BinanceRestClient;
-use robsond::{Config, Daemon};
+use robsond::{Config, Daemon, Environment};
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 
@@ -145,12 +145,22 @@ async fn main() -> anyhow::Result<()> {
             let daemon =
                 Daemon::new_binance_with_recovery(config, client, projection_recovery, pg_pool);
             daemon.run().await?;
+        } else if has_binance_creds && config.environment == Environment::Production {
+            info!("Exchange: Binance (production)");
+            let (api_key, api_secret) = (
+                config.position_monitor.binance_api_key.clone().unwrap(),
+                config.position_monitor.binance_api_secret.clone().unwrap(),
+            );
+            let client = Arc::new(BinanceRestClient::new(api_key, api_secret));
+            let daemon =
+                Daemon::new_binance_with_recovery(config, client, projection_recovery, pg_pool);
+            daemon.run().await?;
         } else {
             if has_binance_creds && !use_testnet {
                 tracing::error!(
-                    "Binance credentials present but ROBSON_BINANCE_USE_TESTNET is not set. \
-                     Refusing to connect to Binance production. Falling back to StubExchange. \
-                     Set ROBSON_BINANCE_USE_TESTNET=true to enable testnet, or remove credentials."
+                    "Binance credentials present but neither ROBSON_BINANCE_USE_TESTNET=true \
+                     nor ROBSON_ENV=production is set. Refusing to connect. \
+                     Falling back to StubExchange."
                 );
             } else {
                 info!("Exchange: Stub (no Binance credentials)");
@@ -171,12 +181,21 @@ async fn main() -> anyhow::Result<()> {
             let client = Arc::new(BinanceRestClient::testnet(api_key, api_secret));
             let daemon = Daemon::new_binance(config, client);
             daemon.run().await?;
+        } else if has_binance_creds && config.environment == Environment::Production {
+            info!("Exchange: Binance (production)");
+            let (api_key, api_secret) = (
+                config.position_monitor.binance_api_key.clone().unwrap(),
+                config.position_monitor.binance_api_secret.clone().unwrap(),
+            );
+            let client = Arc::new(BinanceRestClient::new(api_key, api_secret));
+            let daemon = Daemon::new_binance(config, client);
+            daemon.run().await?;
         } else {
             if has_binance_creds && !use_testnet {
                 tracing::error!(
-                    "Binance credentials present but ROBSON_BINANCE_USE_TESTNET is not set. \
-                     Refusing to connect to Binance production. Falling back to StubExchange. \
-                     Set ROBSON_BINANCE_USE_TESTNET=true to enable testnet, or remove credentials."
+                    "Binance credentials present but neither ROBSON_BINANCE_USE_TESTNET=true \
+                     nor ROBSON_ENV=production is set. Refusing to connect. \
+                     Falling back to StubExchange."
                 );
             } else {
                 info!("Exchange: Stub (no Binance credentials)");
