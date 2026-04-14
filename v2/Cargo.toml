@@ -66,6 +66,9 @@ async-trait = "0.1"
 # Config
 dotenvy = "0.15"
 
+# Metrics
+prometheus = "0.13"
+
 [profile.release]
 opt-level = 3
 lto = true

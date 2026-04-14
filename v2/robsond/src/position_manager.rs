@@ -782,6 +782,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         fee = %order.fee,
                         "Entry order placed and filled"
                     );
+                    crate::metrics::ORDERS.with_label_values(&["entry"]).inc();
 
                     if let Err(e) = self
                         .handle_entry_fill(
@@ -1482,6 +1483,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     }
                 }
 
+                // Record risk denial in Prometheus metrics
+                if let QueryState::Denied { ref check, .. } = query.state {
+                    crate::metrics::RISK_DENIALS.with_label_values(&[check]).inc();
+                }
+
                 // Re-arm the detector so the Armed position can receive future signals.
                 // The original detector completed when the signal fired; without re-arming,
                 // the position would be Armed but permanently unresponsive.
@@ -1877,6 +1883,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     // Exit order filled, handle close
                     // Note: handle_exit_fill is internal, covered by this query's lifecycle
                     // Note: ExitOrderPlaced event already persisted by execute_and_persist()
+                    crate::metrics::ORDERS.with_label_values(&["exit"]).inc();
                     if let Err(e) = self
                         .handle_exit_fill(
                             position.id,
@@ -1904,6 +1911,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             self.record_query_transition(&query, "completed").await?;
         }
 
+        crate::metrics::CYCLES.with_label_values(&["success"]).inc();
         Ok(())
     }
 
@@ -1972,6 +1980,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             timestamp: filled_at,
         };
         self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await?;
+
+        // Record realized PnL in Prometheus metrics
+        crate::metrics::POSITION_PNL
+            .with_label_values(&[&position_id.to_string()])
+            .set(pnl.to_string().parse::<f64>().unwrap_or(0.0));
 
         // Send to event bus for real-time notification
         self.event_bus.send(DaemonEvent::PositionStateChanged {

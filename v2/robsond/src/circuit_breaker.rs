@@ -181,6 +181,7 @@ impl CircuitBreaker {
         state.state = HaltState::MonthlyHalt;
         state.reason = Some(reason);
         state.triggered_at = Some(Utc::now());
+        crate::metrics::MONTHLY_HALT_ACTIVE.set(1.0);
         Some(())
     }
 
@@ -194,6 +195,7 @@ impl CircuitBreaker {
             return None;
         }
         *state = State::active();
+        crate::metrics::MONTHLY_HALT_ACTIVE.set(0.0);
         Some(())
     }
 }

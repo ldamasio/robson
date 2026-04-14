@@ -41,6 +41,7 @@ rust_decimal_macros = { workspace = true }
 chrono = { workspace = true }
 async-trait = { workspace = true }
 async-stream = "0.3"
+prometheus = { workspace = true }
 
 [dev-dependencies]
 rust_decimal_macros = { workspace = true }

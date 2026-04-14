@@ -48,6 +48,7 @@ pub mod detector;
 pub mod error;
 pub mod event_bus;
 pub mod market_data;
+pub mod metrics;
 pub mod position_manager;
 pub mod position_monitor;
 pub mod query;

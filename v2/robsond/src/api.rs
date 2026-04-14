@@ -303,6 +303,8 @@ where
         .route("/events", get(events_handler))
         .route("/status", get(status_handler))
         .route("/positions/:id", get(get_position_handler))
+        // Prometheus metrics
+        .route("/metrics", get(metrics_handler))
         // Safety net read-only endpoints
         .route("/safety/status", get(safety_status_handler))
         .route("/safety/test", get(safety_test_handler))
@@ -368,6 +370,19 @@ where
 // =============================================================================
 // Handlers
 // =============================================================================
+
+/// Prometheus metrics endpoint.
+///
+/// Returns all registered metrics in the Prometheus exposition format.
+/// Unauthenticated (read-only).
+async fn metrics_handler() -> impl IntoResponse {
+    let body = crate::metrics::render();
+    (
+        StatusCode::OK,
+        [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
+        body,
+    )
+}
 
 /// Liveness probe for Kubernetes - checks if the process is alive.
 ///
@@ -522,6 +537,9 @@ where
     let pending_approvals = manager.get_pending_approvals().await;
 
     let summaries: Vec<PositionSummary> = positions.iter().map(position_to_summary).collect();
+
+    // Update active positions gauge
+    crate::metrics::ACTIVE_POSITIONS.set(summaries.len() as f64);
     let pending_summaries: Vec<PendingApprovalSummary> = pending_approvals
         .into_iter()
         .filter_map(|query| {
