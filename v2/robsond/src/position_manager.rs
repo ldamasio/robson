@@ -75,8 +75,8 @@ struct PendingApprovalRecord {
 
 /// Manages position lifecycle and detector tasks.
 pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
-    /// Trading engine
-    engine: Engine,
+    /// Trading engine (Mutex for interior mutability: arm updates RiskConfig)
+    engine: std::sync::Mutex<Engine>,
     /// Order executor
     executor: Arc<Executor<E, S>>,
     /// Store for persistence
@@ -143,7 +143,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         ));
 
         Self {
-            engine,
+            engine: std::sync::Mutex::new(engine),
             executor,
             store,
             event_bus,
@@ -472,7 +472,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// limits during the order-fill window (signal fires → order submitted
     /// → not yet filled → next signal arrives).
     async fn build_risk_context(&self) -> DaemonResult<RiskContext> {
-        let capital = self.engine.risk_config().capital();
+        let capital = self.engine.lock().unwrap().risk_config().capital();
         let active_positions = self.store.positions().find_risk_open().await?;
 
         // find_risk_open() guarantees only Entering and Active positions.
@@ -913,14 +913,31 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     ///
     /// Creates the position in Armed state and spawns a detector task.
     /// The detector will fire a signal when entry conditions are met.
+    ///
+    /// The `risk_config` parameter updates the engine's capital before any
+    /// position sizing calculation. This ensures the operator-supplied capital
+    /// is used rather than the hardcoded default.
     pub async fn arm_position(
         &self,
         symbol: Symbol,
         side: Side,
-        _risk_config: RiskConfig, // Used by Engine for position sizing
+        risk_config: RiskConfig,
         tech_stop_distance: TechnicalStopDistance,
         account_id: Uuid,
     ) -> DaemonResult<Position> {
+        // Update engine with operator-supplied capital before any sizing.
+        {
+            let mut engine = self.engine.lock().unwrap();
+            let capital = risk_config.capital();
+            let risk_pct = risk_config.risk_per_trade_pct();
+            info!(
+                capital = %capital,
+                risk_percent = %risk_pct,
+                "Engine configured with operator capital"
+            );
+            engine.update_risk_config(risk_config);
+        }
+
         // MonthlyHalt check — blocks new entries when 4% monthly drawdown reached.
         if self.circuit_breaker.blocks_new_entries().await {
             let snap = self.circuit_breaker.snapshot().await;
@@ -1098,7 +1115,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             return false;
         }
 
-        let capital = self.engine.risk_config().capital();
+        let capital = self.engine.lock().unwrap().risk_config().capital();
         let now = chrono::Utc::now();
 
         // Monthly realized PnL from closed positions
@@ -1346,7 +1363,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self.kill_detector(position_id).await;
 
         // Use engine to decide entry (pure: State+Signal → Decision)
-        let decision = match self.engine.decide_entry(&position, &signal) {
+        let decision = {
+            let engine = self.engine.lock().unwrap();
+            engine.decide_entry(&position, &signal)
+        };
+        let decision = match decision {
             Ok(d) => d,
             Err(e) => {
                 query.fail(format!("{}", e), "processing".to_string());
@@ -1683,7 +1704,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         // Use engine to process fill (pure: State+Fill → Decision)
         // binance_position_id is passed through to EntryFilled event
-        let decision = self.engine.process_entry_fill(
+        let decision = self.engine.lock().unwrap().process_entry_fill(
             &position,
             fill_price,
             filled_quantity,
@@ -1783,7 +1804,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             // Use engine to process (pure: State+Tick → Decision)
             let symbol_clone = data.symbol.clone();
             let market_data = robson_engine::MarketData::new(symbol_clone, data.price);
-            let decision = match self.engine.process_active_position(&position, &market_data) {
+            let decision = {
+                let engine = self.engine.lock().unwrap();
+                engine.process_active_position(&position, &market_data)
+            };
+            let decision = match decision {
                 Ok(d) => d,
                 Err(e) => {
                     let err_str = format!("{}", e);
@@ -3638,5 +3663,95 @@ mod tests {
         let triggered = manager.evaluate_monthly_halt().await;
         assert!(triggered, "net -400 (PnL -350, fees -50) must trigger MonthlyHalt");
         assert!(manager.circuit_breaker.blocks_new_entries().await);
+    }
+
+    // =========================================================================
+    // RiskConfig wiring tests
+    // =========================================================================
+
+    /// Verify that different capital values produce different position sizes.
+    ///
+    /// The engine calculates qty = (capital * risk_pct) / (entry_price * stop_pct).
+    /// With capital=10000, risk=1%: qty = $100 / stop_distance.
+    /// With capital=20000, risk=1%: qty = $200 / stop_distance.
+    /// The larger capital must produce a larger quantity.
+    #[tokio::test]
+    async fn test_different_capital_produces_different_position_size() {
+        let manager = create_test_manager().await;
+
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(98)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        // Arm with default capital (10_000)
+        let pos_small = manager
+            .arm_position(
+                symbol.clone(),
+                Side::Long,
+                RiskConfig::new(dec!(10000)).unwrap(),
+                tech_stop.clone(),
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+
+        // Disarm to free slot
+        manager.disarm_position(pos_small.id).await.unwrap();
+
+        // Re-arm with double capital (20_000)
+        let pos_large = manager
+            .arm_position(
+                symbol,
+                Side::Long,
+                RiskConfig::new(dec!(20000)).unwrap(),
+                tech_stop,
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+
+        // Now fire signals for both positions (pos_small was disarmed, so only pos_large)
+        // Instead, verify that the engine capital was actually updated by checking
+        // position size after signal.
+        //
+        // With capital=20_000, risk=1%=$200, entry=95000, stop=87400 (8%):
+        //   qty = $200 / ($95000 * 0.08) = $200 / $7600 ≈ 0.026315789...
+        //
+        // Compare with capital=10_000: qty = $100 / $7600 ≈ 0.013157894...
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: pos_large.id,
+            symbol: pos_large.symbol.clone(),
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(87400)).unwrap(), // 8% stop
+            timestamp: chrono::Utc::now(),
+        };
+
+        manager.handle_signal(signal).await.unwrap();
+
+        let updated = manager.get_position(pos_large.id).await.unwrap().unwrap();
+        assert!(
+            matches!(updated.state, PositionState::Active { .. }),
+            "Expected Active, got {:?}",
+            updated.state
+        );
+
+        // With capital=20000: qty = 200 / (95000 * 0.08) = 200/7600
+        let expected_qty = dec!(200) / dec!(7600);
+        assert_eq!(
+            updated.quantity.as_decimal(),
+            expected_qty,
+            "Position size must reflect doubled capital"
+        );
+
+        // Verify it's actually different from the default (capital=10000)
+        let default_qty = dec!(100) / dec!(7600);
+        assert_ne!(
+            updated.quantity.as_decimal(),
+            default_qty,
+            "Position size with capital=20000 must differ from capital=10000"
+        );
     }
 }

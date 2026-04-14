@@ -293,8 +293,6 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
-    let token = state.api_token.clone();
-
     // Read-only routes — no auth required
     let read_only = Router::new()
         // Kubernetes health probes
@@ -313,6 +311,46 @@ where
         .with_state(state.clone());
 
     // Mutating routes — bearer token required
+    let token = state.api_token.clone();
+    let auth_layer = axum::middleware::from_fn(move |req: Request, next: Next| {
+        let expected = token.clone();
+        async move {
+            // No token configured — auth disabled
+            let Some(expected) = expected else {
+                return next.run(req).await;
+            };
+
+            // Extract Authorization header
+            let auth_header = req
+                .headers()
+                .get(header::AUTHORIZATION)
+                .and_then(|v| v.to_str().ok());
+
+            match auth_header {
+                Some(value) if value.starts_with("Bearer ") => {
+                    let provided = &value[7..];
+                    if provided == expected {
+                        next.run(req).await
+                    } else {
+                        (
+                            StatusCode::UNAUTHORIZED,
+                            Json(ErrorResponse {
+                                error: "Invalid bearer token".to_string(),
+                            }),
+                        )
+                            .into_response()
+                    }
+                },
+                _ => (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse {
+                        error: "Missing or invalid Authorization header".to_string(),
+                    }),
+                )
+                    .into_response(),
+            }
+        }
+    });
     let mutating = Router::new()
         .route("/positions", post(arm_handler))
         .route("/positions/:id", delete(disarm_handler))
@@ -321,7 +359,7 @@ where
         .route("/panic", post(panic_handler))
         // MonthlyHalt trigger (mutating)
         .route("/monthly-halt", post(monthly_halt_trigger_handler))
-        .layer(middleware::from_fn_with_state(token, auth_middleware))
+        .layer(auth_layer)
         .with_state(state);
 
     read_only.merge(mutating)
@@ -783,56 +821,6 @@ where
             message: "Safety net is not enabled.".to_string(),
             positions: None,
         })),
-    }
-}
-
-// =============================================================================
-// Auth Middleware
-// =============================================================================
-
-/// Bearer token authentication middleware for mutating routes.
-///
-/// - If `expected_token` is `None`, auth is disabled (non-production).
-/// - If `expected_token` is `Some`, validates `Authorization: Bearer <token>`.
-/// - Returns 401 on missing or incorrect token.
-async fn auth_middleware(
-    State(expected_token): State<Option<String>>,
-    request: Request,
-    next: Next,
-) -> impl IntoResponse {
-    // No token configured — auth disabled
-    let Some(expected) = expected_token else {
-        return next.run(request).await;
-    };
-
-    // Extract Authorization header
-    let auth_header = request
-        .headers()
-        .get(header::AUTHORIZATION)
-        .and_then(|v| v.to_str().ok());
-
-    match auth_header {
-        Some(value) if value.starts_with("Bearer ") => {
-            let token = &value[7..];
-            if token == expected {
-                next.run(request).await
-            } else {
-                (
-                    StatusCode::UNAUTHORIZED,
-                    Json(ErrorResponse {
-                        error: "Invalid bearer token".to_string(),
-                    }),
-                )
-                    .into_response()
-            }
-        },
-        _ => (
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorResponse {
-                error: "Missing or invalid Authorization header".to_string(),
-            }),
-        )
-            .into_response(),
     }
 }
 

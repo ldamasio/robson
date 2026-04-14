@@ -258,6 +258,11 @@ impl Engine {
         &self.risk_config
     }
 
+    /// Update the risk configuration (e.g., when operator provides new capital).
+    pub fn update_risk_config(&mut self, risk_config: RiskConfig) {
+        self.risk_config = risk_config;
+    }
+
     // =========================================================================
     // Entry Logic
     // =========================================================================
