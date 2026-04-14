@@ -533,11 +533,27 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             })
             .sum();
 
-        Ok(RiskContext::with_monthly_pnl(
+        // Daily realized PnL: filter monthly closed positions to today (UTC date).
+        let today = now.date_naive();
+        let daily_realized_pnl: Decimal = monthly_closed
+            .iter()
+            .filter(|p| p.closed_at.map(|t| t.date_naive() == today).unwrap_or(false))
+            .map(|p| p.realized_pnl - p.fees_paid)
+            .sum();
+
+        // Daily unrealized PnL mirrors monthly unrealized (all open positions are
+        // "today"). This is a simplification: if positions were opened on a
+        // previous day, their unrealized PnL still counts toward the daily
+        // figure. This is conservative (stricter) and matches the v3 spec.
+        let daily_unrealized_pnl = monthly_unrealized_pnl;
+
+        Ok(RiskContext::with_monthly_and_daily_pnl(
             capital,
             summaries,
             monthly_realized_pnl,
             monthly_unrealized_pnl,
+            daily_realized_pnl,
+            daily_unrealized_pnl,
         ))
     }
 
