@@ -42,7 +42,13 @@ cargo build --all
 ### Run Tests
 
 ```bash
+# Unit + in-memory tests (no database required)
 cargo test --all
+
+# PostgreSQL integration tests (crash recovery, replay, projections)
+# Requires: just v2-db-up  (starts local Podman container)
+just v2-db-up
+just v2-test-pg
 ```
 
 ### Run Daemon
@@ -69,6 +75,72 @@ bun run src/index.ts status
 - [Execution Plan](./docs/EXECUTION-PLAN.md)
 - [Phase 6: Detector Runtime](./docs/PHASE_6.md) ← NEW
 - [Prompt Pack](./docs/PROMPT-PACK.md) (for agentic coding)
+
+## PostgreSQL Integration Tests
+
+Some tests require a live PostgreSQL connection. These tests are gated with `#[ignore]` and the `postgres` feature flag so they never block a plain `cargo test`.
+
+### Layer separation
+
+Database concerns are split across three layers with explicit ownership:
+
+| Layer | Owner | Responsibility |
+|---|---|---|
+| **Infrastructure** | `rbx-infra` Ansible bootstrap | Provisions server, creates user and database, outputs `DATABASE_URL` to vault |
+| **Migrations** | Application (`v2/migrations/`) | Schema evolution via `sqlx migrate run` at deploy time |
+| **Test framework** | `sqlx::test` macro | Ephemeral per-test databases — creates, runs migrations, drops automatically |
+
+`DATABASE_URL` always flows **into** the application from the infrastructure layer. No script resolves or constructs it. The only exception is the `just v2-test-pg` target, which supplies the local dev container URL as an explicit fallback when `DATABASE_URL` is absent.
+
+### What they validate
+
+| Crate | Tests | Why it matters for go-live |
+|---|---|---|
+| `robsond` (crash_recovery) | Daemon restores positions from `positions_current` after crash | Capital-safe restart path |
+| `robsond` (replay_test) | `queries_current` projection rebuilds byte-for-byte from event log | Deterministic audit trail |
+| `robsond` (daemon) | Restart invalidates `AwaitingApproval` queries | No stale approvals after restart |
+| `robsond` (projection_worker) | Checkpoint persists across worker restart | No event reprocessing on restart |
+| `robson-store` | `PgProjectionReader` restores active/entering/exiting positions | Recovery correctness |
+| `robson-projector` | Event handlers materialize projections correctly | Projection consistency |
+
+### How sqlx::test works
+
+Each test receives an isolated `PgPool`. `sqlx::test`:
+1. Connects to the server at `DATABASE_URL`
+2. Creates a temporary database per test (requires `CREATEDB` privilege on the user)
+3. Applies all migrations from `v2/migrations/` automatically
+4. Runs the test
+5. Drops the temporary database
+
+No manual migration step needed. No persistent state left behind.
+
+### Running the tests
+
+**Local dev** — local Podman container (provisioned by justfile as local IaC equivalent):
+
+```bash
+just v2-db-up   # provisions robson-v2-db container
+just v2-test-pg # exports local DATABASE_URL and runs tests
+```
+
+Filter by test name:
+
+```bash
+DATABASE_URL=postgresql://robson:robson@localhost:5432/robson_v2 \
+  bash v2/scripts/test-pg.sh --test crash_recovery
+```
+
+**CI** — `DATABASE_URL` must be set as a CI environment variable or secret before the test step. The database server is provisioned by the CI infrastructure, not by this script.
+
+**Staging** — `DATABASE_URL` comes from rbx-infra Ansible vault output. Never run integration tests against the live production database.
+
+### Without a database
+
+`cargo test --all` and `cargo test --features postgres` both pass without `DATABASE_URL`. Only `--ignored` tests are skipped. This keeps CI fast and portable.
+
+### WARNING: never use a production DATABASE_URL
+
+`sqlx::test` creates and **drops** temporary databases on the target server. Running this against production risks data loss. `scripts/test-pg.sh` refuses URLs containing `prod`, `production`, or `live`.
 
 ## Development
 

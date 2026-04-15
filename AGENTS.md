@@ -73,6 +73,39 @@ When editing architecture, migration, or runtime docs:
 3. If an architectural decision is made but not fully implemented, record it as `DECIDED` plus `FOLLOW-UP REQUIRED`, not as `IMPLEMENTED`.
 4. Use ADRs for stable architectural decisions that should outlive a single migration task.
 
+## Database and Infrastructure Layer Rules
+
+Database provisioning is the responsibility of `rbx-infra` (Ansible bootstrap).
+Application and agent code must never provision databases directly.
+
+### Layer ownership
+
+| Layer | Owner | Responsibility |
+|---|---|---|
+| Server, user, base database | `rbx-infra` Ansible | Provisions the Postgres server and emits `DATABASE_URL` to vault |
+| Schema migrations | Application (`v2/migrations/`) | Applied at deploy time via `sqlx migrate run`; applied automatically by `sqlx::test` during testing |
+| Per-test database lifecycle | `sqlx::test` macro | Creates isolated ephemeral databases, runs all migrations, drops after test |
+
+### Rules for agents
+
+1. **Never provision a database** as a side effect of a code or test task. Starting containers, creating users, or running `CREATE DATABASE` is IaC work — delegate it or refuse it.
+2. **Never hardcode `DATABASE_URL`** in source files, test helpers, or scripts. The value always flows in from the infrastructure layer via the environment.
+3. **When writing a test that requires a live database**, gate it with `#[ignore = "requires DATABASE_URL"]` and `#[sqlx::test(migrations = "../migrations")]`. Do not write setup logic that provisions the database.
+4. **`v2/scripts/test-pg.sh`** is the canonical entry point for Postgres-backed tests. It requires `DATABASE_URL` from the environment. It does not resolve or infer it.
+5. **`just v2-test-pg`** is the local-dev wrapper. It supplies the known local container URL as an explicit fallback only when `DATABASE_URL` is absent. In CI and staging, `DATABASE_URL` must be injected externally.
+6. **Never run Postgres integration tests against a production `DATABASE_URL`**. `sqlx::test` creates and drops databases on the target server. `scripts/test-pg.sh` enforces this with a naming guard; do not bypass it.
+7. **Migration ownership**: migrations live in `v2/migrations/`. If you add a migration, verify that existing `sqlx::test`-based tests still pass with the updated schema. Do not apply migrations manually to shared environments.
+
+### Test tiers (v2 Rust)
+
+| Tier | Command | Requires database |
+|---|---|---|
+| Unit + in-memory | `cargo test --all` | No |
+| Feature-gated (compile check) | `cargo test --features postgres` | No (`--ignored` tests skipped) |
+| Postgres integration | `just v2-test-pg` or `bash v2/scripts/test-pg.sh` | Yes — `DATABASE_URL` must be set |
+
+CI must pass the first two tiers unconditionally. The third tier requires a provisioned database and should run in environments where `DATABASE_URL` is available.
+
 ## Code and Review Expectations
 
 - Follow conventional commits.

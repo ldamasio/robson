@@ -333,10 +333,12 @@ gh pr create --title "feat: add Order entity"
 |---------|---------|-------------|
 | `cargo fmt --all --check` | Check Rust formatting | Pre-commit, CI |
 | `cargo clippy --all-targets -- -D warnings` | Lint Rust code | Pre-commit, CI |
-| `cargo test --all` | Run all Rust tests | Pre-commit, CI |
+| `cargo test --all` | Unit + in-memory tests (no DB) | Pre-commit, CI |
+| `cargo test --features postgres` | Feature-gated paths (no DB) | Pre-commit, CI |
+| `just v2-db-up && just v2-test-pg` | Postgres integration tests | Before go-live, when touching DB code |
 | `cargo build --release` | Build optimized binaries | Before deploy |
 | `cd cli && bun test` | Run CLI tests | Pre-commit |
-| `./scripts/verify.sh` | Full verification | Before push |
+| `./scripts/verify.sh` | Full verification (no DB) | Before push |
 
 ---
 
@@ -347,10 +349,12 @@ Before marking a task as complete, ensure:
 - [ ] **Code compiles** without warnings (`cargo build`)
 - [ ] **Formatted** with `cargo fmt --all`
 - [ ] **Linted** with `cargo clippy -- -D warnings`
-- [ ] **Tests pass** (`cargo test --all`)
+- [ ] **Tests pass** (`cargo test --all` and `cargo test --features postgres`)
 - [ ] **Tests written** for new business logic (aim for >80% coverage on domain/engine)
+- [ ] **Postgres tests pass** if DB code was touched (`just v2-db-up && just v2-test-pg`)
 - [ ] **Docs updated** (inline `///` doc comments + README if needed)
 - [ ] **No `unwrap()` or `expect()` in production code** (only in tests)
+- [ ] **No hardcoded `DATABASE_URL`** in source files or scripts
 - [ ] **Commit message follows Conventional Commits**
 - [ ] **English only** (no Portuguese in code/comments/docs)
 
@@ -390,12 +394,17 @@ Before marking a task as complete, ensure:
    - Integration tests in `tests/` directory
    - Use `#[tokio::test]` for async tests
    - Use `rust_decimal_macros::dec!` for test fixtures
+   - Tests that require a live database: use `#[sqlx::test(migrations = "../migrations")]` + `#[ignore = "requires DATABASE_URL"]`
+   - Never write test setup that provisions a database; let `sqlx::test` handle that
+   - See **Database and infrastructure rules** section below
 
 5. **Database interactions**:
-   - Use SQLx compile-time checked queries (`query_as!`)
-   - Store migrations in `robson-store/migrations/`
+   - Use SQLx dynamic queries (`sqlx::query(...)`) in tests to avoid compile-time `DATABASE_URL` requirement
+   - Use SQLx compile-time checked queries (`query_as!`) in production code where feasible
+   - Migrations live in `v2/migrations/` — applied automatically by `sqlx::test` and at deploy time by `sqlx migrate run`
    - Use UUID v7 for entity IDs (time-ordered)
    - Always use transactions for multi-step operations
+   - Never hardcode `DATABASE_URL`; it is always injected from the environment
 
 6. **When to use each crate**:
    - `robson-domain`: Entities, value objects, domain errors
@@ -405,6 +414,49 @@ Before marking a task as complete, ensure:
    - `robson-store`: PostgreSQL repositories, migrations
    - `robsond`: HTTP API, configuration, runtime
    - `robson-sim`: Backtesting, simulation, performance metrics
+
+---
+
+## Database and Infrastructure Rules
+
+> See also: root `AGENTS.md` — "Database and Infrastructure Layer Rules" (canonical source).
+
+### Layer separation
+
+Database provisioning is owned by `rbx-infra` (Ansible). This codebase is a consumer, not a provisioner.
+
+```
+rbx-infra Ansible          provisions server, user, database
+                           emits DATABASE_URL → vault / CI secret
+      ↓
+Environment (CI / local)   injects DATABASE_URL
+      ↓
+Application / sqlx          reads DATABASE_URL; runs migrations at deploy time
+      ↓
+sqlx::test (tests only)    creates ephemeral per-test databases, auto-migrates, drops after test
+```
+
+### Rules for this agent
+
+- **Do not** provision a database, start a container, or create users as part of a code task.
+- **Do not** hardcode `DATABASE_URL` in source files, test helpers, or scripts.
+- **Do** gate database-dependent tests with `#[ignore = "requires DATABASE_URL"]` and `#[sqlx::test(migrations = "../migrations")]`.
+- **Do** use `scripts/test-pg.sh` to run Postgres integration tests. It requires `DATABASE_URL` from the environment.
+- **Do** use `just v2-db-up` to provision the local dev container (local IaC equivalent) before running Postgres tests locally.
+- **Do not** run `scripts/test-pg.sh` with a production `DATABASE_URL` — it creates and drops databases on the target server.
+
+### Test tiers
+
+| Tier | Command | DATABASE_URL required |
+|---|---|---|
+| Unit + in-memory | `cargo test --all` | No |
+| Feature-gated (no DB) | `cargo test --features postgres` | No |
+| Postgres integration | `just v2-test-pg` | Yes — local container or injected externally |
+
+When adding a new Postgres-backed test:
+1. Use `#[sqlx::test(migrations = "../migrations")]` — never write manual migration setup.
+2. Use `#[ignore = "requires DATABASE_URL"]`.
+3. Use `sqlx::query(...)` (dynamic) in tests, not `sqlx::query!(...)` (compile-time macro), to avoid requiring `DATABASE_URL` at build time.
 
 ---
 
@@ -422,11 +474,18 @@ cargo fmt --all --check
 # Lint with Clippy (strict)
 cargo clippy --all-targets -- -D warnings
 
-# Run tests
+# Run unit + in-memory tests (no database needed)
 cargo test --all
+
+# Run with postgres feature flag (no DB needed; ignored tests skipped)
+cargo test --features postgres
 
 # Run specific test
 cargo test test_position_size_calculation
+
+# Run Postgres integration tests (requires DATABASE_URL)
+just v2-db-up       # start local container (first time or after v2-db-down)
+just v2-test-pg     # run all #[ignore] Postgres tests
 
 # Build in release mode
 cargo build --release

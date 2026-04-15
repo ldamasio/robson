@@ -42,10 +42,13 @@ Thank you for contributing to Robson v2! This document provides guidelines for c
 - Rust 1.83+ (`rustup`)
 - Bun latest (`curl -fsSL https://bun.sh/install | bash`)
 - Git 2.30+
-- PostgreSQL 14+ (for database-dependent features)
 
-**Optional**:
-- SQLx CLI (`cargo install sqlx-cli`)
+**For Postgres integration tests** (optional — unit tests run without it):
+- Podman or Docker (to run the local test container via `just v2-db-up`)
+- `DATABASE_URL` is provisioned by `rbx-infra` (Ansible) in staging/production. For local dev, `just v2-db-up` provides it.
+
+**Optional tooling**:
+- SQLx CLI (`cargo install sqlx-cli`) — for inspecting/running migrations manually
 - Cargo-audit (`cargo install cargo-audit`)
 - Cargo-watch (`cargo install cargo-watch`)
 
@@ -500,17 +503,86 @@ Fixed  ❌ (not specific)
 
 ## Testing
 
-### Test Requirements
+### Test tiers
+
+There are three test tiers with different infrastructure requirements:
+
+| Tier | What it covers | Command | Needs database |
+|---|---|---|---|
+| **Unit / in-memory** | Domain logic, engine, pure functions | `cargo test --all` | No |
+| **Feature-gated** | Postgres-specific code paths (compile check only) | `cargo test --features postgres` | No — `#[ignore]` tests are skipped |
+| **Postgres integration** | Crash recovery, replay, projections, store layer | `just v2-test-pg` | Yes |
+
+CI must pass tiers 1 and 2 unconditionally. Tier 3 requires a provisioned database (`DATABASE_URL`).
+
+### Test requirements
 
 **All business logic must have tests**. Aim for >80% coverage on:
-- Domain entities (robson-domain)
-- Engine logic (robson-engine)
-- Execution layer (robson-exec)
+- Domain entities (`robson-domain`)
+- Engine logic (`robson-engine`)
+- Execution layer (`robson-exec`)
 
-### Test Organization
+### Writing a Postgres integration test
+
+Use `sqlx::test` — it handles the full database lifecycle automatically:
 
 ```rust
-// Unit tests in same file
+// ✅ Correct pattern for a Postgres-backed test
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn test_projection_restores_state(pool: sqlx::PgPool) {
+    // sqlx::test creates a clean, isolated database for this test.
+    // All migrations in v2/migrations/ are applied automatically.
+    // The database is dropped when the test ends.
+    // Never write manual setup here — let sqlx::test handle it.
+
+    // Use sqlx::query(...) (dynamic), not sqlx::query!(...) (compile-time macro),
+    // to avoid requiring DATABASE_URL at build time.
+    sqlx::query("INSERT INTO ...")
+        .bind(value)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+```
+
+Rules:
+- Always use `#[ignore = "requires DATABASE_URL"]` on Postgres tests.
+- Always use `#[sqlx::test(migrations = "../migrations")]`, not manual pool creation.
+- Never provision a database or start a container inside a test.
+- Use `sqlx::query(...)`, not `sqlx::query!(...)`, in test files.
+
+### DATABASE_URL — where it comes from
+
+`DATABASE_URL` is never hardcoded. It is injected from the appropriate layer:
+
+| Environment | Source |
+|---|---|
+| Local dev | `just v2-db-up` provisions the container; `just v2-test-pg` exports the URL |
+| CI | CI environment variable / secret — database provisioned by CI infrastructure |
+| Staging | `rbx-infra` Ansible vault output |
+| Production | `rbx-infra` Ansible vault — **never used for tests** |
+
+### Running Postgres integration tests
+
+```bash
+# Step 1: start the local test database (first time, or after just v2-db-down)
+just v2-db-up
+
+# Step 2: run all Postgres-backed tests
+just v2-test-pg
+
+# Filter to a specific test
+DATABASE_URL=postgresql://robson:robson@localhost:5432/robson_v2 \
+  bash v2/scripts/test-pg.sh --test crash_recovery
+```
+
+The `scripts/test-pg.sh` script refuses URLs containing `prod`, `production`, or `live` as a safety guard.
+
+### Test organization
+
+```rust
+// Unit tests inline in the source file
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -518,54 +590,46 @@ mod tests {
 
     #[test]
     fn test_order_creation() {
-        // Arrange
         let symbol = Symbol::from("BTCUSDT");
-
-        // Act
         let order = Order::new(symbol, OrderSide::Buy, dec!(0.1), dec!(50000));
-
-        // Assert
         assert_eq!(order.status, OrderStatus::Pending);
     }
 }
 ```
 
-### Test Naming
+### Test naming
 
 Use descriptive test names:
 
 ```rust
 // ✅ GOOD
-#[test]
 fn test_order_execution_transitions_status_from_pending_to_executed() { }
-
-#[test]
 fn test_zero_stop_distance_returns_invalid_stop_distance_error() { }
 
 // ❌ BAD
-#[test]
 fn test1() { }
-
-#[test]
 fn test_order() { }
 ```
 
-### Running Tests
+### Running tests
 
 ```bash
-# Run all tests
+# All unit + in-memory tests (no database needed)
 cargo test --all
 
-# Run tests for specific crate
+# Specific crate
 cargo test -p robson-domain
 
-# Run specific test
+# Specific test
 cargo test test_order_creation
 
-# Run with output
+# With output
 cargo test -- --nocapture
 
-# Run with coverage (requires cargo-tarpaulin)
+# Postgres integration tests
+just v2-db-up && just v2-test-pg
+
+# Coverage (requires cargo-tarpaulin)
 cargo tarpaulin --all
 ```
 

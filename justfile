@@ -385,6 +385,21 @@ v2-db-migrate:
 v2-db-psql:
     podman exec -it robson-v2-db psql -U robson -d robson_v2
 
+# v2: Run Postgres-backed integration tests (crash-recovery, replay, projections)
+#
+# DATABASE_URL resolution by environment:
+#   Local dev  : just v2-db-up  →  this target uses the local container URL
+#   CI         : set DATABASE_URL as CI env var before calling this target
+#   Staging    : set DATABASE_URL from Ansible vault output before calling this target
+#
+# WARNING: Never use a production DATABASE_URL — sqlx::test creates/drops databases on the server.
+v2-test-pg:
+    #!/usr/bin/env bash
+    # Local dev: use the known container URL if DATABASE_URL is not already set.
+    # In CI/staging, DATABASE_URL must be injected externally (this fallback does not apply).
+    export DATABASE_URL="${DATABASE_URL:-postgresql://robson:robson@localhost:5432/robson_v2}"
+    cd v2 && bash scripts/test-pg.sh
+
 # v2: Test projection worker (end-to-end)
 v2-test-projection-worker:
     #!/usr/bin/env bash
