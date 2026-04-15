@@ -225,8 +225,8 @@ CREATE TABLE positions_current (
 
 CREATE INDEX idx_positions_tenant_account ON positions_current(tenant_id, account_id);
 CREATE INDEX idx_positions_strategy ON positions_current(strategy_id) WHERE strategy_id IS NOT NULL;
-CREATE INDEX idx_positions_state ON positions_current(state);
-CREATE INDEX idx_positions_symbol ON positions_current(symbol);
+CREATE INDEX idx_positions_current_state ON positions_current(state);
+CREATE INDEX idx_positions_current_symbol ON positions_current(symbol);
 CREATE INDEX idx_positions_updated ON positions_current(updated_at DESC);
 CREATE INDEX idx_positions_active ON positions_current(tenant_id, state, symbol)
     WHERE state IN ('armed', 'entering', 'active', 'exiting');
