@@ -165,7 +165,7 @@ CREATE UNIQUE INDEX uk_orders_exchange_order_id ON orders_current(exchange_order
 
 CREATE INDEX idx_orders_tenant_account ON orders_current(tenant_id, account_id);
 CREATE INDEX idx_orders_position ON orders_current(position_id) WHERE position_id IS NOT NULL;
-CREATE INDEX idx_orders_status ON orders_current(status);
+CREATE INDEX idx_orders_current_status ON orders_current(status);
 CREATE INDEX idx_orders_symbol ON orders_current(symbol);
 CREATE INDEX idx_orders_updated ON orders_current(updated_at DESC);
 
