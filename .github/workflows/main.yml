@@ -1,10 +1,7 @@
 name: Robson Production CI/CD Pipeline
 
-on:
-  push:
-    branches: ["main"]
-    tags:
-      - 'v*'  # Trigger on version tags (v0.1.0, v1.0.0, etc.)
+# Disabled: legacy Django-era workflow superseded by robson-v2.yml.
+on: {}
 
 permissions:
   contents: write  # Required for pushing manifest updates
