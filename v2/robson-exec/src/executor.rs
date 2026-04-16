@@ -103,11 +103,15 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
 
             EngineAction::PlaceExitOrder {
                 position_id,
+                cycle_id,
                 symbol,
                 side,
                 quantity,
                 reason,
-            } => self.execute_exit_order(position_id, symbol, side, quantity, reason).await,
+            } => {
+                self.execute_exit_order(position_id, cycle_id, symbol, side, quantity, reason)
+                    .await
+            },
 
             EngineAction::UpdateTrailingStop {
                 position_id,
@@ -247,6 +251,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
     async fn execute_exit_order(
         &self,
         position_id: PositionId,
+        cycle_id: Option<Uuid>,
         symbol: robson_domain::Symbol,
         side: robson_domain::OrderSide,
         quantity: robson_domain::Quantity,
@@ -307,6 +312,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                 // Create ExitOrderPlaced event (will be returned and persisted by caller)
                 let exit_event = Event::ExitOrderPlaced {
                     position_id,
+                    cycle_id,
                     order_id: intent_id,
                     expected_price: order_result.fill_price,
                     quantity,
@@ -388,6 +394,36 @@ mod tests {
         // Intent should be recorded and completed
         let intent = executor.journal.get(signal_id).unwrap().unwrap();
         assert!(intent.is_success());
+    }
+
+    #[tokio::test]
+    async fn test_execute_exit_order_emits_cycle_id() {
+        let executor = create_test_executor().await;
+
+        let position_id = Uuid::now_v7();
+        let cycle_id = Uuid::now_v7();
+
+        let action = EngineAction::PlaceExitOrder {
+            position_id,
+            cycle_id: Some(cycle_id),
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            side: robson_domain::OrderSide::Sell,
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            reason: ExitReason::TrailingStop,
+        };
+
+        let results = executor.execute(vec![action]).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            ActionResult::OrderPlaced {
+                event: Some(Event::ExitOrderPlaced { cycle_id: actual, .. }),
+                ..
+            } => {
+                assert_eq!(*actual, Some(cycle_id));
+            },
+            other => panic!("Expected exit OrderPlaced event, got {:?}", other),
+        }
     }
 
     #[tokio::test]

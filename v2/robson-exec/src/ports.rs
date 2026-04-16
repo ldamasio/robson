@@ -168,7 +168,8 @@ pub enum CandleInterval {
     OneMinute,
     /// 5-minute candles
     FiveMinutes,
-    /// 15-minute candles — primary interval for `TechnicalStopAnalyzer` (REQ-CORE-TECHSTOP-004)
+    /// 15-minute candles — primary interval for `TechnicalStopAnalyzer`
+    /// (REQ-CORE-TECHSTOP-004)
     FifteenMinutes,
     /// 1-hour candles
     OneHour,
@@ -214,7 +215,8 @@ pub trait OhlcvPort: Send + Sync {
     /// # Arguments
     ///
     /// * `symbol` - Trading pair (e.g., `BTCUSDT`)
-    /// * `interval` - Candle interval (`FifteenMinutes` per REQ-CORE-TECHSTOP-004)
+    /// * `interval` - Candle interval (`FifteenMinutes` per
+    ///   REQ-CORE-TECHSTOP-004)
     /// * `limit` - Number of candles to fetch (use ≥ 100; max 1000)
     ///
     /// # Returns

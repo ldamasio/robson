@@ -164,6 +164,9 @@ pub enum EngineAction {
     PlaceExitOrder {
         /// Position being exited
         position_id: PositionId,
+        /// Query/risk cycle identifier proving governed execution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cycle_id: Option<uuid::Uuid>,
         /// Symbol to trade
         symbol: Symbol,
         /// Order side (opposite of position side)
@@ -176,6 +179,65 @@ pub enum EngineAction {
 
     /// Emit domain event for audit/persistence
     EmitEvent(Event),
+}
+
+impl EngineAction {
+    /// Return this action with order-placement audit events stamped with the
+    /// execution cycle id.
+    pub fn with_cycle_id(self, cycle_id: uuid::Uuid) -> Self {
+        match self {
+            EngineAction::EmitEvent(Event::EntryOrderPlaced {
+                position_id,
+                cycle_id: existing_cycle_id,
+                order_id,
+                expected_price,
+                quantity,
+                signal_id,
+                timestamp,
+            }) => EngineAction::EmitEvent(Event::EntryOrderPlaced {
+                position_id,
+                cycle_id: existing_cycle_id.or(Some(cycle_id)),
+                order_id,
+                expected_price,
+                quantity,
+                signal_id,
+                timestamp,
+            }),
+            EngineAction::EmitEvent(Event::ExitOrderPlaced {
+                position_id,
+                cycle_id: existing_cycle_id,
+                order_id,
+                expected_price,
+                quantity,
+                exit_reason,
+                timestamp,
+            }) => EngineAction::EmitEvent(Event::ExitOrderPlaced {
+                position_id,
+                cycle_id: existing_cycle_id.or(Some(cycle_id)),
+                order_id,
+                expected_price,
+                quantity,
+                exit_reason,
+                timestamp,
+            }),
+            EngineAction::PlaceExitOrder {
+                position_id,
+                cycle_id: existing_cycle_id,
+                symbol,
+                side,
+                quantity,
+                reason,
+            } => EngineAction::PlaceExitOrder {
+                position_id,
+                cycle_id: existing_cycle_id.or(Some(cycle_id)),
+                symbol,
+                side,
+                quantity,
+                reason,
+            },
+            other => other,
+        }
+    }
 }
 
 // =============================================================================
@@ -354,6 +416,7 @@ impl Engine {
             // Emit entry order placed event — apply_event transitions position to Entering
             EngineAction::EmitEvent(Event::EntryOrderPlaced {
                 position_id: position.id,
+                cycle_id: None,
                 order_id: entry_order_id,
                 expected_price: signal.entry_price,
                 quantity,
@@ -637,6 +700,7 @@ impl Engine {
             // 2. Place exit order
             EngineAction::PlaceExitOrder {
                 position_id: position.id,
+                cycle_id: None,
                 symbol: position.symbol.clone(),
                 side: exit_side,
                 quantity: position.quantity,

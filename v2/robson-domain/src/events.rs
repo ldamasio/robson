@@ -56,6 +56,9 @@ pub enum Event {
     EntryOrderPlaced {
         /// Position identifier
         position_id: PositionId,
+        /// Query/risk cycle identifier proving governed execution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cycle_id: Option<uuid::Uuid>,
         /// Order identifier (matches entry_order_id in PositionState::Entering)
         order_id: OrderId,
         /// Expected entry price
@@ -121,6 +124,9 @@ pub enum Event {
     ExitOrderPlaced {
         /// Position identifier
         position_id: PositionId,
+        /// Query/risk cycle identifier proving governed execution.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cycle_id: Option<uuid::Uuid>,
         /// Order identifier (matches exit_order_id in PositionState::Exiting)
         order_id: OrderId,
         /// Expected exit price
@@ -315,6 +321,30 @@ mod tests {
         }
     }
 
+    fn sample_entry_order_placed(cycle_id: Uuid) -> Event {
+        Event::EntryOrderPlaced {
+            position_id: Uuid::now_v7(),
+            cycle_id: Some(cycle_id),
+            order_id: Uuid::now_v7(),
+            expected_price: Price::new(dec!(95000)).unwrap(),
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            signal_id: Uuid::now_v7(),
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn sample_exit_order_placed(cycle_id: Uuid) -> Event {
+        Event::ExitOrderPlaced {
+            position_id: Uuid::now_v7(),
+            cycle_id: Some(cycle_id),
+            order_id: Uuid::now_v7(),
+            expected_price: Price::new(dec!(96000)).unwrap(),
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            exit_reason: ExitReason::TrailingStop,
+            timestamp: Utc::now(),
+        }
+    }
+
     fn sample_position_closed() -> Event {
         Event::PositionClosed {
             position_id: Uuid::now_v7(),
@@ -355,6 +385,28 @@ mod tests {
 
         assert_eq!(event.position_id(), deserialized.position_id());
         assert_eq!(event.event_type(), "position_closed");
+    }
+
+    #[test]
+    fn test_entry_order_placed_serializes_cycle_id_in_payload() {
+        let cycle_id = Uuid::now_v7();
+        let event = sample_entry_order_placed(cycle_id);
+
+        let payload = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(payload["type"], "entry_order_placed");
+        assert_eq!(payload["cycle_id"], cycle_id.to_string());
+    }
+
+    #[test]
+    fn test_exit_order_placed_serializes_cycle_id_in_payload() {
+        let cycle_id = Uuid::now_v7();
+        let event = sample_exit_order_placed(cycle_id);
+
+        let payload = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(payload["type"], "exit_order_placed");
+        assert_eq!(payload["cycle_id"], cycle_id.to_string());
     }
 
     #[test]

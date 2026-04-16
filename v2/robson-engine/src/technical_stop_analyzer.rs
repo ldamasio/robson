@@ -35,12 +35,11 @@
 //! DetectorSignal { entry_price, stop_loss }
 //! ```
 
+use robson_domain::{Candle, Price, Side};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
-
-use robson_domain::{Candle, Price, Side};
 
 // =============================================================================
 // Configuration
@@ -59,12 +58,14 @@ pub struct TechnicalStopConfig {
     /// within a window of 2 candles on each side)
     pub swing_lookback: usize,
 
-    /// Which support/resistance level to use as the stop (1-indexed, default: 2)
+    /// Which support/resistance level to use as the stop (1-indexed, default:
+    /// 2)
     ///
     /// `support_level_n = 2` means "second support below entry for LONG".
     pub support_level_n: usize,
 
-    /// Price tolerance for clustering nearby levels (as a fraction, default: 0.005 = 0.5%)
+    /// Price tolerance for clustering nearby levels (as a fraction, default:
+    /// 0.005 = 0.5%)
     ///
     /// Swing lows within this fraction of each other are merged into a single
     /// support cluster before counting N levels.
@@ -76,7 +77,8 @@ pub struct TechnicalStopConfig {
     /// ATR multiplier for the fallback stop (default: 1.5)
     pub atr_multiplier: Decimal,
 
-    /// Minimum allowed stop distance as fraction of entry (default: 0.001 = 0.1%)
+    /// Minimum allowed stop distance as fraction of entry (default: 0.001 =
+    /// 0.1%)
     pub min_stop_distance_pct: Decimal,
 
     /// Maximum allowed stop distance as fraction of entry (default: 0.10 = 10%)
@@ -106,7 +108,8 @@ impl Default for TechnicalStopConfig {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum TechnicalStopMethod {
     /// Stop placed at the Nth swing low (LONG) or swing high (SHORT).
-    /// Value is the 1-indexed level number that was used (e.g., 2 = second support).
+    /// Value is the 1-indexed level number that was used (e.g., 2 = second
+    /// support).
     SwingPoint { level_n: usize },
     /// Fallback: stop at `entry ± atr_multiplier × ATR(atr_period)`.
     /// Used when fewer than `support_level_n` swing levels are found.
@@ -126,8 +129,9 @@ pub enum StopConfidence {
 
 /// Result of technical stop analysis.
 ///
-/// Pass `stop_price` to `TechnicalStopDistance::new_validated(entry, stop_price, side)`
-/// to obtain the validated distance used for position sizing.
+/// Pass `stop_price` to `TechnicalStopDistance::new_validated(entry,
+/// stop_price, side)` to obtain the validated distance used for position
+/// sizing.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TechnicalStopAnalysis {
     /// Chart-derived stop price (absolute price level, NOT a percentage).
@@ -176,7 +180,8 @@ pub enum TechnicalStopError {
 /// Pure technical stop analyzer.
 ///
 /// Call [`TechnicalStopAnalyzer::analyze`] with pre-fetched candle data.
-/// No I/O is performed here — all OHLCV fetching is the caller's responsibility.
+/// No I/O is performed here — all OHLCV fetching is the caller's
+/// responsibility.
 pub struct TechnicalStopAnalyzer;
 
 impl TechnicalStopAnalyzer {
@@ -195,7 +200,8 @@ impl TechnicalStopAnalyzer {
     ///
     /// [`TechnicalStopAnalysis`] with an absolute stop price. Callers must then
     /// construct [`TechnicalStopDistance`] via
-    /// `TechnicalStopDistance::new_validated(entry_price, result.stop_price, side)`.
+    /// `TechnicalStopDistance::new_validated(entry_price, result.stop_price,
+    /// side)`.
     ///
     /// # Errors
     ///
@@ -389,8 +395,8 @@ fn cluster_levels(levels: &mut Vec<Decimal>, entry: Decimal, tolerance: Decimal)
         return vec![];
     }
 
-    // Sort so we process closest levels first (for LONG: descending; we just sort any way
-    // and let the caller re-sort after clustering)
+    // Sort so we process closest levels first (for LONG: descending; we just sort
+    // any way and let the caller re-sort after clustering)
     levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
 
     let tolerance_abs = if entry > Decimal::ZERO {
@@ -462,9 +468,8 @@ fn compute_atr(candles: &[Candle], period: usize) -> Decimal {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use rust_decimal_macros::dec;
-
     use robson_domain::Symbol;
+    use rust_decimal_macros::dec;
 
     use super::*;
 

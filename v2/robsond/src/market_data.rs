@@ -35,7 +35,8 @@ pub struct MarketDataManager {
     event_bus: Arc<EventBus>,
     /// Cancellation token for graceful shutdown
     cancel: CancellationToken,
-    /// Whether to connect to Binance testnet streams (mirrors ROBSON_BINANCE_USE_TESTNET)
+    /// Whether to connect to Binance testnet streams (mirrors
+    /// ROBSON_BINANCE_USE_TESTNET)
     use_testnet: bool,
 }
 

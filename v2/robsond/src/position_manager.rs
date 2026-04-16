@@ -330,6 +330,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         Ok(results)
     }
 
+    fn stamp_cycle_id(actions: Vec<EngineAction>, cycle_id: Uuid) -> Vec<EngineAction> {
+        actions.into_iter().map(|action| action.with_cycle_id(cycle_id)).collect()
+    }
+
     /// Start the position manager's background tasks.
     ///
     /// This spawns the signal listener that processes DetectorSignal events
@@ -734,8 +738,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         {
             let mut pending_approvals = self.pending_approvals.write().await;
-            pending_approvals
-                .insert(query_id, PendingApprovalRecord { query, position, proposed, governed });
+            pending_approvals.insert(query_id, PendingApprovalRecord {
+                query,
+                position,
+                proposed,
+                governed,
+            });
         }
 
         let pending_approvals = self.pending_approvals.read().await;
@@ -1882,7 +1890,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             // Execute actions via Executor (side-effects: EventLog.append, Exchange orders)
             // MemoryStore is updated via apply_event() called by executor after event
             // append
-            let results = match self.execute_and_persist(decision.actions).await {
+            let actions = Self::stamp_cycle_id(decision.actions, query.id);
+            let results = match self.execute_and_persist(actions).await {
                 Ok(r) => r,
                 Err(e) => {
                     let err_str = format!("{}", e);
@@ -2179,6 +2188,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let results = self
             .execute_and_persist(vec![EngineAction::PlaceExitOrder {
                 position_id,
+                cycle_id: Some(query.id),
                 symbol: position.symbol.clone(),
                 side: exit_side,
                 quantity: position.quantity,

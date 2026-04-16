@@ -247,6 +247,7 @@ impl QueryRecorder for EventLogQueryRecorder {
 /// within the crate, not type-level across the crate boundary.
 #[derive(Debug)]
 pub(crate) struct GovernedAction {
+    cycle_id: Uuid,
     actions: Vec<EngineAction>,
     // Private field prevents external construction even within the crate if
     // someone tries to use struct literal syntax.
@@ -255,17 +256,25 @@ pub(crate) struct GovernedAction {
 
 impl GovernedAction {
     /// Private: only QueryEngine::check_risk() may construct this.
-    fn new(actions: Vec<EngineAction>) -> Self {
-        Self { actions, _proof: () }
+    fn new(cycle_id: Uuid, actions: Vec<EngineAction>) -> Self {
+        Self { cycle_id, actions, _proof: () }
     }
 
     /// Consume the token and return the approved actions for Executor dispatch.
     pub(crate) fn into_actions(self) -> Vec<EngineAction> {
         self.actions
+            .into_iter()
+            .map(|action| action.with_cycle_id(self.cycle_id))
+            .collect()
     }
 
     fn actions(&self) -> &[EngineAction] {
         &self.actions
+    }
+
+    #[cfg(test)]
+    fn cycle_id(&self) -> Uuid {
+        self.cycle_id
     }
 }
 
@@ -471,7 +480,7 @@ impl<R: QueryRecorder> QueryEngine<R> {
                     notional = %proposed.notional_value,
                     "risk check approved"
                 );
-                Ok(GovernedAction::new(actions))
+                Ok(GovernedAction::new(query.id, actions))
             },
             RiskVerdict::Rejected { check, reason } => {
                 tracing::warn!(
@@ -775,6 +784,53 @@ mod tests {
         assert!(result.is_ok(), "Expected Ok(GovernedAction) for approved trade");
         assert_eq!(query.state, QueryState::RiskChecked);
         assert_eq!(recorder.transition_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn test_governed_action_stamps_cycle_id_on_entry_order_placed() {
+        use robson_domain::{Event, OrderSide, Quantity, Symbol};
+
+        let recorder = Arc::new(MockRecorder::new());
+        let engine = QueryEngine::new(Arc::clone(&recorder), RiskGate::new());
+
+        let mut query = create_test_query();
+        query.transition(QueryState::Processing).unwrap();
+
+        let position_id = Uuid::now_v7();
+        let signal_id = Uuid::now_v7();
+        let actions = vec![
+            EngineAction::EmitEvent(Event::EntryOrderPlaced {
+                position_id,
+                cycle_id: None,
+                order_id: Uuid::now_v7(),
+                expected_price: Price::new(dec!(95000)).unwrap(),
+                quantity: Quantity::new(dec!(0.01)).unwrap(),
+                signal_id,
+                timestamp: chrono::Utc::now(),
+            }),
+            EngineAction::PlaceEntryOrder {
+                position_id,
+                symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+                side: OrderSide::Buy,
+                quantity: Quantity::new(dec!(0.01)).unwrap(),
+                signal_id,
+            },
+        ];
+
+        let governed = engine
+            .check_risk(&mut query, &sample_proposed(), &empty_context(), actions)
+            .await
+            .expect("risk should approve");
+
+        assert_eq!(governed.cycle_id(), query.id);
+
+        let returned = governed.into_actions();
+        let cycle_id = returned.iter().find_map(|action| match action {
+            EngineAction::EmitEvent(Event::EntryOrderPlaced { cycle_id, .. }) => *cycle_id,
+            _ => None,
+        });
+
+        assert_eq!(cycle_id, Some(query.id));
     }
 
     #[tokio::test]

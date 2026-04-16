@@ -592,10 +592,13 @@ pub struct BalanceUpdateEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-    use tokio::net::TcpListener;
-    use tokio::time::{timeout, Duration};
+    use tokio::{
+        net::TcpListener,
+        time::{timeout, Duration},
+    };
     use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    use super::*;
 
     #[test]
     fn test_websocket_client_uses_production_stream_endpoint() {
