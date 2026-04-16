@@ -391,22 +391,24 @@ mod tests {
     fn test_entry_order_placed_serializes_cycle_id_in_payload() {
         let cycle_id = Uuid::now_v7();
         let event = sample_entry_order_placed(cycle_id);
+        let expected_cycle_id = cycle_id.to_string();
 
         let payload = serde_json::to_value(&event).unwrap();
 
-        assert_eq!(payload["type"], "entry_order_placed");
-        assert_eq!(payload["cycle_id"], cycle_id.to_string());
+        assert_eq!(payload["type"].as_str(), Some("entry_order_placed"));
+        assert_eq!(payload["cycle_id"].as_str(), Some(expected_cycle_id.as_str()));
     }
 
     #[test]
     fn test_exit_order_placed_serializes_cycle_id_in_payload() {
         let cycle_id = Uuid::now_v7();
         let event = sample_exit_order_placed(cycle_id);
+        let expected_cycle_id = cycle_id.to_string();
 
         let payload = serde_json::to_value(&event).unwrap();
 
-        assert_eq!(payload["type"], "exit_order_placed");
-        assert_eq!(payload["cycle_id"], cycle_id.to_string());
+        assert_eq!(payload["type"].as_str(), Some("exit_order_placed"));
+        assert_eq!(payload["cycle_id"].as_str(), Some(expected_cycle_id.as_str()));
     }
 
     #[test]

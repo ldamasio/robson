@@ -327,8 +327,7 @@ must be tracked as follow-up work:
 
 | # | Gap | Impact | Follow-up |
 |---|-----|--------|-----------|
-| 1 | `cycle_id` not serialized to EventLog event payloads | Audit cannot verify GovernedAction proof from EventLog alone | Add `cycle_id` field to `entry_order_placed` and `exit_order_placed` serialization |
-| 2 | `trailing_stop_updated` events only emit after full favorable span | Phase 4 cannot use EventLog as primary evidence on short runs | Document span threshold; consider emitting a `position_monitor_tick` audit event |
+| 1 | `trailing_stop_updated` events only emit after full favorable span | Phase 4 cannot use EventLog as primary evidence on short runs | Document span threshold; consider emitting a `position_monitor_tick` audit event |
 
 ---
 
