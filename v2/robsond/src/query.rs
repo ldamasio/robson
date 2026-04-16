@@ -54,7 +54,7 @@ pub enum QueryKind {
     ArmPosition {
         symbol: Symbol,
         side: Side,
-        tech_stop_distance: TechnicalStopDistance,
+        tech_stop_distance: Option<TechnicalStopDistance>,
         account_id: Uuid,
     },
 
@@ -858,7 +858,7 @@ mod tests {
             QueryKind::ArmPosition {
                 symbol: symbol.clone(),
                 side: Side::Long,
-                tech_stop_distance: tech_stop,
+                tech_stop_distance: Some(tech_stop),
                 account_id: Uuid::now_v7(),
             },
             ActorKind::Operator { source: CommandSource::Api },
@@ -872,10 +872,10 @@ mod tests {
     fn test_disarm_position_kind() {
         let position_id = Uuid::now_v7();
 
-        let query =
-            ExecutionQuery::new(QueryKind::DisarmPosition { position_id }, ActorKind::Operator {
-                source: CommandSource::Api,
-            });
+        let query = ExecutionQuery::new(
+            QueryKind::DisarmPosition { position_id },
+            ActorKind::Operator { source: CommandSource::Api },
+        );
 
         assert!(matches!(query.kind, QueryKind::DisarmPosition { .. }));
     }
@@ -910,9 +910,10 @@ mod tests {
 
     #[test]
     fn test_health_check_kind() {
-        let query = ExecutionQuery::new(QueryKind::HealthCheck, ActorKind::System {
-            subsystem: "scheduler".to_string(),
-        });
+        let query = ExecutionQuery::new(
+            QueryKind::HealthCheck,
+            ActorKind::System { subsystem: "scheduler".to_string() },
+        );
 
         assert!(matches!(query.kind, QueryKind::HealthCheck));
     }

@@ -738,12 +738,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         {
             let mut pending_approvals = self.pending_approvals.write().await;
-            pending_approvals.insert(query_id, PendingApprovalRecord {
-                query,
-                position,
-                proposed,
-                governed,
-            });
+            pending_approvals
+                .insert(query_id, PendingApprovalRecord { query, position, proposed, governed });
         }
 
         let pending_approvals = self.pending_approvals.read().await;
@@ -952,6 +948,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     ///
     /// Creates the position in Armed state and spawns a detector task.
     /// The detector will fire a signal when entry conditions are met.
+    /// At ARM time the entry price and chart-derived technical stop may still
+    /// be unknown, so `tech_stop_distance` is optional and normally `None` for
+    /// API-armed positions.
     ///
     /// The `risk_config` parameter updates the engine's capital before any
     /// position sizing calculation. This ensures the operator-supplied capital
@@ -961,7 +960,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         symbol: Symbol,
         side: Side,
         risk_config: RiskConfig,
-        tech_stop_distance: TechnicalStopDistance,
+        tech_stop_distance: Option<TechnicalStopDistance>,
         account_id: Uuid,
     ) -> DaemonResult<Position> {
         // Update engine with operator-supplied capital before any sizing.
@@ -991,7 +990,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             QueryKind::ArmPosition {
                 symbol: symbol.clone(),
                 side,
-                tech_stop_distance,
+                tech_stop_distance: tech_stop_distance.clone(),
                 account_id,
             },
             Self::operator_actor(),
@@ -1023,7 +1022,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             account_id,
             symbol: symbol.clone(),
             side,
-            tech_stop_distance: Some(tech_stop_distance),
+            tech_stop_distance,
             timestamp: now,
         };
 
@@ -2441,21 +2440,22 @@ mod tests {
     async fn test_arm_position() {
         let manager = create_test_manager().await;
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
-        // Create tech stop distance: entry $100, stop $98 (2% distance)
-        let entry = Price::new(dec!(100)).unwrap();
-        let stop = Price::new(dec!(98)).unwrap();
-        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let position = manager
-            .arm_position(symbol, Side::Long, create_test_risk_config(), tech_stop, Uuid::now_v7())
+            .arm_position(symbol, Side::Long, create_test_risk_config(), None, Uuid::now_v7())
             .await
             .unwrap();
 
         assert!(matches!(position.state, PositionState::Armed));
+        assert!(
+            position.tech_stop_distance.is_none(),
+            "ARM must not invent a technical stop before detector signal"
+        );
 
         // Should be persisted
         let loaded = manager.get_position(position.id).await.unwrap().unwrap();
         assert_eq!(loaded.id, position.id);
+        assert!(loaded.tech_stop_distance.is_none());
     }
 
     #[tokio::test]
@@ -2468,7 +2468,13 @@ mod tests {
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let position = manager
-            .arm_position(symbol, Side::Long, create_test_risk_config(), tech_stop, Uuid::now_v7())
+            .arm_position(
+                symbol,
+                Side::Long,
+                create_test_risk_config(),
+                Some(tech_stop),
+                Uuid::now_v7(),
+            )
             .await
             .unwrap();
 
@@ -2502,7 +2508,7 @@ mod tests {
                 symbol.clone(),
                 Side::Long,
                 create_test_risk_config(),
-                tech_stop,
+                Some(tech_stop),
                 Uuid::now_v7(),
             )
             .await
@@ -2567,7 +2573,7 @@ mod tests {
                 symbol.clone(),
                 Side::Long,
                 create_test_risk_config(),
-                tech_stop,
+                Some(tech_stop),
                 Uuid::now_v7(),
             )
             .await
@@ -2614,7 +2620,7 @@ mod tests {
                 symbol.clone(),
                 Side::Long,
                 create_test_risk_config(),
-                tech_stop,
+                Some(tech_stop),
                 Uuid::now_v7(),
             )
             .await
@@ -2679,7 +2685,7 @@ mod tests {
                 symbol.clone(),
                 Side::Long,
                 create_test_risk_config(),
-                tech_stop,
+                Some(tech_stop),
                 Uuid::now_v7(),
             )
             .await
@@ -2729,7 +2735,7 @@ mod tests {
                 symbol.clone(),
                 Side::Long,
                 create_test_risk_config(),
-                tech_stop,
+                Some(tech_stop),
                 Uuid::now_v7(),
             )
             .await
@@ -2793,7 +2799,7 @@ mod tests {
                 symbol.clone(),
                 Side::Long,
                 create_test_risk_config(),
-                tech_stop,
+                Some(tech_stop),
                 Uuid::now_v7(),
             )
             .await
@@ -2843,7 +2849,7 @@ mod tests {
                 symbol.clone(),
                 Side::Long,
                 create_test_risk_config(),
-                tech_stop,
+                Some(tech_stop),
                 Uuid::now_v7(),
             )
             .await
@@ -2896,7 +2902,7 @@ mod tests {
                 symbol.clone(),
                 Side::Long,
                 create_test_risk_config(),
-                tech_stop,
+                Some(tech_stop),
                 Uuid::now_v7(),
             )
             .await
@@ -2957,7 +2963,7 @@ mod tests {
                 symbol.clone(),
                 Side::Long,
                 create_test_risk_config(),
-                tech_stop,
+                Some(tech_stop),
                 Uuid::now_v7(),
             )
             .await
@@ -3051,7 +3057,7 @@ mod tests {
                 symbol.clone(),
                 Side::Long,
                 create_test_risk_config(),
-                tech_stop,
+                Some(tech_stop),
                 uuid::Uuid::now_v7(),
             )
             .await
@@ -3110,7 +3116,7 @@ mod tests {
                 symbol.clone(),
                 Side::Long,
                 create_test_risk_config(),
-                tech_stop,
+                Some(tech_stop),
                 Uuid::now_v7(),
             )
             .await
@@ -3256,7 +3262,13 @@ mod tests {
 
         // Attempt to arm a new position — must fail
         let result = manager
-            .arm_position(symbol, Side::Long, create_test_risk_config(), tech_stop, Uuid::now_v7())
+            .arm_position(
+                symbol,
+                Side::Long,
+                create_test_risk_config(),
+                Some(tech_stop),
+                Uuid::now_v7(),
+            )
             .await;
 
         assert!(result.is_err(), "arm_position must fail after MonthlyHalt auto-trigger");
@@ -3282,7 +3294,7 @@ mod tests {
                 Symbol::from_pair("BTCUSDT").unwrap(),
                 Side::Long,
                 create_test_risk_config(),
-                tech_stop,
+                Some(tech_stop),
                 Uuid::now_v7(),
             )
             .await
@@ -3403,7 +3415,7 @@ mod tests {
                 Symbol::from_pair("BTCUSDT").unwrap(),
                 Side::Long,
                 create_test_risk_config(),
-                tech_stop,
+                Some(tech_stop),
                 Uuid::now_v7(),
             )
             .await
@@ -3476,7 +3488,7 @@ mod tests {
                 symbol.clone(),
                 Side::Long,
                 create_test_risk_config(),
-                tech_stop,
+                Some(tech_stop),
                 Uuid::now_v7(),
             )
             .await
@@ -3798,7 +3810,7 @@ mod tests {
                 symbol.clone(),
                 Side::Long,
                 RiskConfig::new(dec!(10000)).unwrap(),
-                tech_stop.clone(),
+                Some(tech_stop.clone()),
                 Uuid::now_v7(),
             )
             .await
@@ -3813,7 +3825,7 @@ mod tests {
                 symbol,
                 Side::Long,
                 RiskConfig::new(dec!(20000)).unwrap(),
-                tech_stop,
+                Some(tech_stop),
                 Uuid::now_v7(),
             )
             .await

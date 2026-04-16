@@ -2,10 +2,12 @@
 //!
 //! INVARIANT: POSITION_OPENED requires technical_stop_price and
 //! technical_stop_distance. INVARIANT: trailing_stop_price is initially derived
-//! from technical_stop_distance. INVARIANT: position_armed requires
-//! tech_stop_distance.initial_stop (same semantic).
+//! from technical_stop_distance. Domain position_armed may not have technical
+//! stop data yet; the real detector stop is captured from entry_signal_received
+//! and enforced before entry_order_placed transitions the position.
 
 use robson_eventlog::EventEnvelope;
+use rust_decimal::Decimal;
 use sqlx::PgPool;
 
 use crate::{
@@ -13,6 +15,7 @@ use crate::{
     types::{
         EntryOrderPlaced, EntrySignalReceived, ExitFilled, ExitOrderPlaced, PositionArmed,
         PositionClosed, PositionClosedDomain, PositionDisarmed, PositionOpened,
+        TechnicalStopDistancePayload,
     },
 };
 
@@ -146,6 +149,56 @@ pub(crate) async fn handle_position_closed(pool: &PgPool, envelope: &EventEnvelo
     Ok(())
 }
 
+fn technical_stop_fields(
+    tech_stop_distance: Option<TechnicalStopDistancePayload>,
+) -> (Option<Decimal>, Option<Decimal>) {
+    match tech_stop_distance {
+        Some(tech) if !tech.initial_stop.is_zero() && !tech.distance.is_zero() => {
+            (Some(tech.initial_stop), Some(tech.distance))
+        },
+        _ => (None, None),
+    }
+}
+
+fn signal_stop_distance(entry_price: Decimal, stop_loss: Decimal) -> Decimal {
+    if entry_price >= stop_loss {
+        entry_price - stop_loss
+    } else {
+        stop_loss - entry_price
+    }
+}
+
+fn validate_entry_order_technical_stop(
+    technical_stop_price: Option<Decimal>,
+    technical_stop_distance: Option<Decimal>,
+) -> Result<()> {
+    let stop = technical_stop_price.ok_or_else(|| ProjectionError::InvariantViolated {
+        event_type: "entry_order_placed".to_string(),
+        reason: "technical_stop_price is required before entry_order_placed".to_string(),
+    })?;
+
+    if stop.is_zero() {
+        return Err(ProjectionError::InvariantViolated {
+            event_type: "entry_order_placed".to_string(),
+            reason: "technical_stop_price must be non-zero".to_string(),
+        });
+    }
+
+    let distance = technical_stop_distance.ok_or_else(|| ProjectionError::InvariantViolated {
+        event_type: "entry_order_placed".to_string(),
+        reason: "technical_stop_distance is required before entry_order_placed".to_string(),
+    })?;
+
+    if distance.is_zero() {
+        return Err(ProjectionError::InvariantViolated {
+            event_type: "entry_order_placed".to_string(),
+            reason: "technical_stop_distance must be non-zero".to_string(),
+        });
+    }
+
+    Ok(())
+}
+
 pub(crate) async fn handle_entry_order_placed(
     pool: &PgPool,
     envelope: &EventEnvelope,
@@ -157,6 +210,31 @@ pub(crate) async fn handle_entry_order_placed(
                 reason: e.to_string(),
             }
         })?;
+
+    let Some((last_seq, technical_stop_price, technical_stop_distance)) =
+        sqlx::query_as::<_, (i64, Option<Decimal>, Option<Decimal>)>(
+            r#"
+            SELECT last_seq, technical_stop_price, technical_stop_distance
+            FROM positions_current
+            WHERE position_id = $1
+            "#,
+        )
+        .bind(payload.position_id)
+        .fetch_optional(pool)
+        .await?
+    else {
+        return Err(ProjectionError::InvariantViolated {
+            event_type: "entry_order_placed".to_string(),
+            reason: "position_armed must exist before entry_order_placed".to_string(),
+        });
+    };
+
+    if last_seq >= envelope.seq {
+        tracing::debug!("entry_order_placed already applied: seq={}", last_seq);
+        return Ok(());
+    }
+
+    validate_entry_order_technical_stop(technical_stop_price, technical_stop_distance)?;
 
     sqlx::query(
         r#"
@@ -230,16 +308,14 @@ pub(crate) async fn handle_entry_filled(pool: &PgPool, envelope: &EventEnvelope)
 
 /// Handle entry_signal_received (robson-domain::Event::EntrySignalReceived)
 ///
-/// This is an audit event emitted when a detector signal is received.
-/// It does NOT change position state - the state transition to Entering
-/// is done by entry_order_placed. We simply acknowledge the event was
-/// processed successfully (it's already persisted in event_log by the
-/// write path).
+/// This event carries the detector-derived technical stop. It does not change
+/// position state; entry_order_placed performs the Entering transition after
+/// verifying these fields are present and non-zero.
 pub(crate) async fn handle_entry_signal_received(
-    _pool: &PgPool,
+    pool: &PgPool,
     envelope: &EventEnvelope,
 ) -> Result<()> {
-    let _payload: EntrySignalReceived =
+    let payload: EntrySignalReceived =
         serde_json::from_value(envelope.payload.clone()).map_err(|e| {
             ProjectionError::InvalidPayload {
                 event_type: envelope.event_type.clone(),
@@ -247,12 +323,35 @@ pub(crate) async fn handle_entry_signal_received(
             }
         })?;
 
-    // Audit event only - no projection update needed.
-    // The event is already in event_log for replay/audit purposes.
+    let distance = signal_stop_distance(payload.entry_price, payload.stop_loss);
+
+    sqlx::query(
+        r#"
+        UPDATE positions_current
+        SET
+            technical_stop_price = $2,
+            technical_stop_distance = $3,
+            last_event_id = $4,
+            last_seq = $5,
+            updated_at = $6
+        WHERE position_id = $1 AND last_seq < $5
+        "#,
+    )
+    .bind(payload.position_id)
+    .bind(payload.stop_loss)
+    .bind(distance)
+    .bind(envelope.event_id)
+    .bind(envelope.seq)
+    .bind(envelope.occurred_at)
+    .execute(pool)
+    .await?;
+
     tracing::debug!(
-        position_id = %_payload.position_id,
-        signal_id = %_payload.signal_id,
-        "entry_signal_received processed (audit only)"
+        position_id = %payload.position_id,
+        signal_id = %payload.signal_id,
+        stop_loss = %payload.stop_loss,
+        distance = %distance,
+        "entry_signal_received stored detector technical stop"
     );
 
     Ok(())
@@ -377,9 +476,9 @@ pub(crate) async fn handle_exit_order_placed(
 
 /// Handle position_armed (robson-domain::Event::PositionArmed)
 ///
-/// Creates the initial 'armed' row in positions_current.
-/// technical_stop_price is derived from tech_stop_distance.initial_stop.
-/// Enforces the same technical stop invariants as POSITION_OPENED.
+/// Creates the initial 'armed' row in positions_current. The detector has not
+/// produced an entry price or technical stop yet, so technical stop columns may
+/// be NULL at this phase.
 pub(crate) async fn handle_position_armed(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
     let payload: PositionArmed = serde_json::from_value(envelope.payload.clone()).map_err(|e| {
         ProjectionError::InvalidPayload {
@@ -388,25 +487,8 @@ pub(crate) async fn handle_position_armed(pool: &PgPool, envelope: &EventEnvelop
         }
     })?;
 
-    // INVARIANT: tech_stop_distance must be present and non-zero (Golden Rule)
-    let tech = payload.tech_stop_distance.ok_or_else(|| ProjectionError::InvariantViolated {
-        event_type: "position_armed".to_string(),
-        reason: "tech_stop_distance is required for position_armed".to_string(),
-    })?;
-
-    if tech.distance.is_zero() {
-        return Err(ProjectionError::InvariantViolated {
-            event_type: "position_armed".to_string(),
-            reason: "tech_stop_distance.distance must be non-zero".to_string(),
-        });
-    }
-    if tech.initial_stop.is_zero() {
-        return Err(ProjectionError::InvariantViolated {
-            event_type: "position_armed".to_string(),
-            reason: "tech_stop_distance.initial_stop must be non-zero".to_string(),
-        });
-    }
-
+    let (technical_stop_price, technical_stop_distance) =
+        technical_stop_fields(payload.tech_stop_distance);
     let symbol = payload.symbol.as_pair();
     let side = payload.side.to_lowercase();
 
@@ -454,8 +536,8 @@ pub(crate) async fn handle_position_armed(pool: &PgPool, envelope: &EventEnvelop
     .bind(payload.account_id)
     .bind(&symbol)
     .bind(&side)
-    .bind(tech.initial_stop)
-    .bind(tech.distance)
+    .bind(technical_stop_price)
+    .bind(technical_stop_distance)
     .bind(envelope.event_id)
     .bind(envelope.seq)
     .bind(payload.timestamp)
@@ -463,6 +545,36 @@ pub(crate) async fn handle_position_armed(pool: &PgPool, envelope: &EventEnvelop
     .await?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use rust_decimal_macros::dec;
+
+    use super::*;
+
+    #[test]
+    fn position_armed_treats_missing_or_zero_technical_stop_as_unknown() {
+        assert_eq!(technical_stop_fields(None), (None, None));
+
+        let zero_stop = TechnicalStopDistancePayload {
+            distance: dec!(1),
+            distance_pct: dec!(100),
+            initial_stop: Decimal::ZERO,
+        };
+        assert_eq!(technical_stop_fields(Some(zero_stop)), (None, None));
+    }
+
+    #[test]
+    fn entry_order_placed_requires_non_zero_detector_technical_stop() {
+        assert!(validate_entry_order_technical_stop(None, Some(dec!(1500))).is_err());
+        assert!(validate_entry_order_technical_stop(Some(Decimal::ZERO), Some(dec!(1500))).is_err());
+        assert!(validate_entry_order_technical_stop(Some(dec!(93500)), None).is_err());
+        assert!(
+            validate_entry_order_technical_stop(Some(dec!(93500)), Some(Decimal::ZERO)).is_err()
+        );
+        assert!(validate_entry_order_technical_stop(Some(dec!(93500)), Some(dec!(1500))).is_ok());
+    }
 }
 
 /// Handle position_disarmed (robson-domain::Event::PositionDisarmed)

@@ -781,7 +781,7 @@ async fn test_runtime_arm_position_persists_to_projection(pool: sqlx::PgPool) {
     let symbol = Symbol::from_pair("BTCUSDT").unwrap();
 
     let position = manager
-        .arm_position(symbol, Side::Long, risk_config, tech_stop, account_id)
+        .arm_position(symbol, Side::Long, risk_config, Some(tech_stop), account_id)
         .await
         .expect("arm_position failed — eventlog or projection apply error");
 

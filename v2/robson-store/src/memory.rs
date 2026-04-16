@@ -78,7 +78,7 @@ impl MemoryStore {
     /// If apply fails, we fail-fast (error is ok).
     /// The EventLog remains the source of truth for recovery.
     fn apply_event_internal(&self, event: &Event) -> Result<(), StoreError> {
-        use robson_domain::{ExitReason, Position, PositionState};
+        use robson_domain::{ExitReason, Position, PositionState, TechnicalStopDistance};
 
         match event {
             // PositionArmed: Create position in Armed state (initial projection entry)
@@ -103,6 +103,23 @@ impl MemoryStore {
                 positions.insert(*position_id, position);
             },
 
+            // EntrySignalReceived: detector supplied the real chart-derived stop
+            Event::EntrySignalReceived {
+                position_id,
+                entry_price,
+                stop_loss,
+                timestamp,
+                ..
+            } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    position.tech_stop_distance =
+                        Some(TechnicalStopDistance::from_entry_and_stop(*entry_price, *stop_loss));
+                    position.updated_at = *timestamp;
+                    positions.insert(*position_id, position);
+                }
+            },
+
             // EntryOrderPlaced: Transition Armed → Entering
             Event::EntryOrderPlaced {
                 position_id,
@@ -113,6 +130,26 @@ impl MemoryStore {
             } => {
                 let mut positions = self.positions.write().unwrap();
                 if let Some(mut position) = positions.get(position_id).cloned() {
+                    let tech_stop = position.tech_stop_distance.as_ref().ok_or_else(|| {
+                        StoreError::InvalidState {
+                            message: "technical stop must be present before entry_order_placed"
+                                .to_string(),
+                        }
+                    })?;
+                    if tech_stop.initial_stop.as_decimal().is_zero() {
+                        return Err(StoreError::InvalidState {
+                            message:
+                                "technical stop initial_stop must be non-zero before entry_order_placed"
+                                    .to_string(),
+                        });
+                    }
+                    if tech_stop.distance.is_zero() {
+                        return Err(StoreError::InvalidState {
+                            message:
+                                "technical stop distance must be non-zero before entry_order_placed"
+                                    .to_string(),
+                        });
+                    }
                     position.state = PositionState::Entering {
                         entry_order_id: *order_id,
                         expected_entry: *expected_price,

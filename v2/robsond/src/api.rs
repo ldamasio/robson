@@ -23,9 +23,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use robson_domain::{
-    DetectorSignal, Position, PositionState, Price, RiskConfig, Side, Symbol, TechnicalStopDistance,
-};
+use robson_domain::{DetectorSignal, Position, PositionState, Price, RiskConfig, Side, Symbol};
 use robson_exec::ExchangePort;
 use robson_store::Store;
 use rust_decimal::Decimal;
@@ -627,18 +625,10 @@ where
         )
     })?;
 
-    // Create a dummy tech stop distance (will be replaced by detector signal)
-    // Note: In production, the detector signal provides the actual tech stop
-    // distance Use Price::zero() to bypass validation (allowed for
-    // initialization only)
-    let entry_price = Price::new(rust_decimal::Decimal::ONE).unwrap();
-    let stop_loss = Price::zero();
-    let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry_price, stop_loss);
-
     // Arm position
     let manager = state.position_manager.write().await;
     let position = manager
-        .arm_position(symbol.clone(), side, risk_config, tech_stop, req.account_id)
+        .arm_position(symbol.clone(), side, risk_config, None, req.account_id)
         .await
         .map_err(|e| to_error_response(e))?;
 
@@ -957,7 +947,7 @@ mod tests {
         http::{header::CONTENT_TYPE, Request},
     };
     use http_body_util::BodyExt;
-    use robson_domain::RiskConfig;
+    use robson_domain::{RiskConfig, TechnicalStopDistance};
     use robson_engine::Engine;
     use robson_exec::{Executor, IntentJournal, StubExchange};
     use robson_store::MemoryStore;
@@ -1215,7 +1205,7 @@ mod tests {
                     symbol.clone(),
                     Side::Long,
                     RiskConfig::new(dec!(10000)).unwrap(),
-                    tech_stop,
+                    Some(tech_stop),
                     Uuid::now_v7(),
                 )
                 .await
@@ -1276,7 +1266,7 @@ mod tests {
                     symbol.clone(),
                     Side::Long,
                     RiskConfig::new(dec!(10000)).unwrap(),
-                    tech_stop,
+                    Some(tech_stop),
                     Uuid::now_v7(),
                 )
                 .await

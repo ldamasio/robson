@@ -149,9 +149,9 @@ pub struct EntryFilled {
 /// ENTRY_SIGNAL_RECEIVED payload (entry_signal_received event from domain)
 ///
 /// Emitted by the engine when a detector signal is received for an armed
-/// position. This is an audit event - it does not change position state (that's
-/// done by entry_order_placed). We persist it for audit trail purposes but it
-/// doesn't affect positions_current projection.
+/// position. This carries the detector-derived technical stop. It does not
+/// change position state; entry_order_placed performs the Entering transition
+/// after the projector verifies this stop exists.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntrySignalReceived {
     pub position_id: Uuid,
@@ -277,7 +277,8 @@ pub struct TechnicalStopDistancePayload {
 /// position_armed payload (robson-domain::Event::PositionArmed)
 ///
 /// Emitted by PositionManager::arm_position() via Executor::EmitEvent.
-/// Creates an 'armed' row in positions_current.
+/// Creates an 'armed' row in positions_current. Technical stop data is optional
+/// because no detector entry price exists at ARM time.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PositionArmed {
     pub position_id: Uuid,
