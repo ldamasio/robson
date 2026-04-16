@@ -83,6 +83,13 @@ If something goes wrong:
 
 ## Quick Reference
 
+### Validation Gates (VAL-N)
+
+| ID | Scenario | Runbook | Blocks |
+|----|----------|---------|--------|
+| VAL-001 | Testnet E2E validation | [val-001-testnet-e2e-validation.md](val-001-testnet-e2e-validation.md) | VAL-002 (real capital) |
+| VAL-002 | Real capital activation | val-002-real-capital-activation.md *(pending VAL-001 PASS)* | Production real trades |
+
 ### Deployment
 
 | Scenario | Runbook | Time |

@@ -32,6 +32,7 @@
 
 // Trading strategy modules
 pub mod risk;
+pub mod technical_stop_analyzer;
 pub mod trailing_stop;
 
 use chrono::{DateTime, Utc};

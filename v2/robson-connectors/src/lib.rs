@@ -11,8 +11,8 @@ pub mod binance_ws;
 
 // Re-exports
 pub use binance_rest::{
-    BinanceFill, BinanceOrderResponse, BinanceRestClient, BinanceRestError, IsolatedMarginAccount,
-    IsolatedMarginAsset, IsolatedMarginPosition,
+    BinanceFill, BinanceKline, BinanceOrderResponse, BinanceRestClient, BinanceRestError,
+    IsolatedMarginAccount, IsolatedMarginAsset, IsolatedMarginPosition,
 };
 pub use binance_ws::{
     AggTradeEvent, BalanceUpdateEvent, BinanceWebSocketClient, BinanceWsError, BinanceWsStream,

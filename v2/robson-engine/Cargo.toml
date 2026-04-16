@@ -10,6 +10,7 @@ robson-domain = { path = "../robson-domain" }
 serde = { workspace = true }
 serde_json = { workspace = true }
 rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
 chrono = { workspace = true }
 thiserror = { workspace = true }
 tracing = { workspace = true }

@@ -41,6 +41,7 @@
 
 pub mod api;
 pub mod binance_exchange;
+pub mod binance_ohlcv;
 pub mod circuit_breaker;
 pub mod config;
 pub mod daemon;
@@ -60,6 +61,7 @@ pub mod projection_worker;
 
 // Re-exports for convenience
 pub use binance_exchange::BinanceExchangeAdapter;
+pub use binance_ohlcv::BinanceOhlcvAdapter;
 pub use circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot};
 pub use config::{
     ApiConfig, Config, EngineConfig, Environment, PositionMonitorConfig, ProjectionConfig,

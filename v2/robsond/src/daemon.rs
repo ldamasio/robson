@@ -50,6 +50,7 @@ use crate::query_engine::{append_query_state_changed_event, EventLogQueryRecorde
 use crate::{
     api::{create_router, ApiState},
     binance_exchange::BinanceExchangeAdapter,
+    binance_ohlcv::BinanceOhlcvAdapter,
     config::Config,
     error::{DaemonError, DaemonResult},
     event_bus::{DaemonEvent, EventBus},
@@ -224,7 +225,9 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
     pub fn new_binance(config: Config, client: Arc<BinanceRestClient>) -> Self {
         use robson_domain::RiskConfig;
 
-        let exchange = Arc::new(BinanceExchangeAdapter::new(client));
+        let exchange = Arc::new(BinanceExchangeAdapter::new(Arc::clone(&client)));
+        let ohlcv_port: Arc<dyn robson_exec::OhlcvPort> =
+            Arc::new(BinanceOhlcvAdapter::new(client));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
@@ -233,13 +236,16 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
         let risk_config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(risk_config);
 
-        let position_manager = Arc::new(RwLock::new(PositionManager::new(
-            engine,
-            executor,
-            store.clone(),
-            event_bus.clone(),
-            query_recorder,
-        )));
+        let position_manager = Arc::new(RwLock::new(
+            PositionManager::new(
+                engine,
+                executor,
+                store.clone(),
+                event_bus.clone(),
+                query_recorder,
+            )
+            .with_ohlcv_port(ohlcv_port),
+        ));
 
         Self {
             config,
@@ -264,7 +270,9 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
     ) -> Self {
         use robson_domain::RiskConfig;
 
-        let exchange = Arc::new(BinanceExchangeAdapter::new(client));
+        let exchange = Arc::new(BinanceExchangeAdapter::new(Arc::clone(&client)));
+        let ohlcv_port: Arc<dyn robson_exec::OhlcvPort> =
+            Arc::new(BinanceOhlcvAdapter::new(client));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
@@ -289,7 +297,8 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
             store.clone(),
             event_bus.clone(),
             query_recorder,
-        );
+        )
+        .with_ohlcv_port(ohlcv_port);
         if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
             pm = pm.with_event_log((**pool).clone(), tenant_id);
         }

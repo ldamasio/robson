@@ -20,6 +20,7 @@ use reqwest::Client;
 use robson_domain::{Price, Quantity, Side};
 use rust_decimal::Decimal;
 use serde::Deserialize;
+use serde_json::Value;
 use thiserror::Error;
 use tokio::time::timeout;
 
@@ -29,6 +30,12 @@ use tokio::time::timeout;
 
 /// Binance REST API base URL (Spot/Margin)
 const BINANCE_API_URL: &str = "https://api.binance.com";
+
+/// Binance USD-M futures REST API base URL.
+const BINANCE_FUTURES_API_URL: &str = "https://fapi.binance.com";
+
+/// Binance USD-M futures testnet REST API base URL.
+const BINANCE_FUTURES_TESTNET_API_URL: &str = "https://testnet.binancefuture.com";
 
 /// Request timeout in seconds
 const REQUEST_TIMEOUT_SECS: u64 = 10;
@@ -120,6 +127,15 @@ impl BinanceRestClient {
         }
     }
 
+    /// Get the base URL for USD-M futures public API requests.
+    fn futures_base_url(&self) -> &str {
+        if self.testnet {
+            BINANCE_FUTURES_TESTNET_API_URL
+        } else {
+            BINANCE_FUTURES_API_URL
+        }
+    }
+
     /// Build query string with signature for signed requests.
     ///
     /// Binance requires:
@@ -163,12 +179,22 @@ impl BinanceRestClient {
         endpoint: &str,
         params: Vec<(&str, String)>,
     ) -> Result<String, BinanceRestError> {
+        self.get_public_from_base(self.base_url(), endpoint, params).await
+    }
+
+    /// Send a GET request to a public endpoint on an explicit base URL.
+    async fn get_public_from_base(
+        &self,
+        base_url: &str,
+        endpoint: &str,
+        params: Vec<(&str, String)>,
+    ) -> Result<String, BinanceRestError> {
         let url = if params.is_empty() {
-            format!("{}{}", self.base_url(), endpoint)
+            format!("{}{}", base_url, endpoint)
         } else {
             let query =
                 params.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&");
-            format!("{}{}?{}", self.base_url(), endpoint, query)
+            format!("{}{}?{}", base_url, endpoint, query)
         };
 
         let response =
@@ -455,6 +481,39 @@ impl BinanceRestClient {
         })?)
     }
 
+    /// Get USD-M futures klines for a symbol.
+    ///
+    /// Uses the public futures endpoint:
+    ///
+    /// `GET /fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}`
+    ///
+    /// Returned klines preserve Binance's oldest-first ordering.
+    pub async fn get_futures_klines(
+        &self,
+        symbol: &str,
+        interval: &str,
+        limit: u16,
+    ) -> Result<Vec<BinanceKline>, BinanceRestError> {
+        if limit == 0 || limit > 1000 {
+            return Err(BinanceRestError::InvalidParameter(format!(
+                "kline limit must be between 1 and 1000, got {}",
+                limit
+            )));
+        }
+
+        let params = vec![
+            ("symbol", symbol.to_string()),
+            ("interval", interval.to_string()),
+            ("limit", limit.to_string()),
+        ];
+
+        let body = self
+            .get_public_from_base(self.futures_base_url(), "/fapi/v1/klines", params)
+            .await?;
+
+        parse_futures_klines(&body)
+    }
+
     /// Query order status.
     ///
     /// # Arguments
@@ -556,6 +615,27 @@ pub struct IsolatedMarginPosition {
     pub asset: String,
 }
 
+/// Parsed Binance futures kline.
+#[derive(Debug, Clone, PartialEq)]
+pub struct BinanceKline {
+    /// Candle open time in milliseconds since epoch
+    pub open_time_ms: i64,
+    /// Open price
+    pub open: Decimal,
+    /// High price
+    pub high: Decimal,
+    /// Low price
+    pub low: Decimal,
+    /// Close price
+    pub close: Decimal,
+    /// Base asset volume
+    pub volume: Decimal,
+    /// Candle close time in milliseconds since epoch
+    pub close_time_ms: i64,
+    /// Number of trades
+    pub trades: u64,
+}
+
 /// Binance order response.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -607,6 +687,90 @@ pub struct BinanceFill {
 struct PriceResponse {
     symbol: String,
     price: Decimal,
+}
+
+fn parse_futures_klines(body: &str) -> Result<Vec<BinanceKline>, BinanceRestError> {
+    let rows: Vec<Vec<Value>> =
+        serde_json::from_str(body).map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+
+    rows.into_iter()
+        .enumerate()
+        .map(|(idx, row)| parse_futures_kline(idx, row))
+        .collect()
+}
+
+fn parse_futures_kline(idx: usize, row: Vec<Value>) -> Result<BinanceKline, BinanceRestError> {
+    if row.len() < 9 {
+        return Err(BinanceRestError::ParseError(format!(
+            "kline row {} has {} fields, expected at least 9",
+            idx,
+            row.len()
+        )));
+    }
+
+    Ok(BinanceKline {
+        open_time_ms: parse_i64_field(&row, idx, 0, "open_time")?,
+        open: parse_decimal_field(&row, idx, 1, "open")?,
+        high: parse_decimal_field(&row, idx, 2, "high")?,
+        low: parse_decimal_field(&row, idx, 3, "low")?,
+        close: parse_decimal_field(&row, idx, 4, "close")?,
+        volume: parse_decimal_field(&row, idx, 5, "volume")?,
+        close_time_ms: parse_i64_field(&row, idx, 6, "close_time")?,
+        trades: parse_u64_field(&row, idx, 8, "trades")?,
+    })
+}
+
+fn parse_decimal_field(
+    row: &[Value],
+    row_idx: usize,
+    field_idx: usize,
+    field_name: &str,
+) -> Result<Decimal, BinanceRestError> {
+    let raw = row
+        .get(field_idx)
+        .and_then(Value::as_str)
+        .ok_or_else(|| parse_field_error(row_idx, field_idx, field_name, "decimal string"))?;
+
+    raw.parse::<Decimal>().map_err(|e| {
+        BinanceRestError::ParseError(format!(
+            "failed to parse kline row {} field {} ({}) as decimal: {}",
+            row_idx, field_idx, field_name, e
+        ))
+    })
+}
+
+fn parse_i64_field(
+    row: &[Value],
+    row_idx: usize,
+    field_idx: usize,
+    field_name: &str,
+) -> Result<i64, BinanceRestError> {
+    row.get(field_idx)
+        .and_then(Value::as_i64)
+        .ok_or_else(|| parse_field_error(row_idx, field_idx, field_name, "integer"))
+}
+
+fn parse_u64_field(
+    row: &[Value],
+    row_idx: usize,
+    field_idx: usize,
+    field_name: &str,
+) -> Result<u64, BinanceRestError> {
+    row.get(field_idx)
+        .and_then(Value::as_u64)
+        .ok_or_else(|| parse_field_error(row_idx, field_idx, field_name, "unsigned integer"))
+}
+
+fn parse_field_error(
+    row_idx: usize,
+    field_idx: usize,
+    field_name: &str,
+    expected: &str,
+) -> BinanceRestError {
+    BinanceRestError::ParseError(format!(
+        "kline row {} field {} ({}) is not a {}",
+        row_idx, field_idx, field_name, expected
+    ))
 }
 
 // =============================================================================
@@ -662,6 +826,38 @@ mod tests {
         assert_eq!(position.symbol, "BTCUSDT");
         assert_eq!(position.side, Side::Long);
         assert_eq!(position.quantity.as_decimal(), dec!(0.1));
+    }
+
+    #[test]
+    fn test_parse_futures_klines() {
+        let body = r#"[
+            [
+                1499040000000,
+                "0.01634790",
+                "0.80000000",
+                "0.01575800",
+                "0.01577100",
+                "148976.11427815",
+                1499644799999,
+                "2434.19055334",
+                308,
+                "1756.87402397",
+                "28.46694368",
+                "17928899.62484339"
+            ]
+        ]"#;
+
+        let klines = parse_futures_klines(body).unwrap();
+
+        assert_eq!(klines.len(), 1);
+        assert_eq!(klines[0].open_time_ms, 1_499_040_000_000);
+        assert_eq!(klines[0].open, dec!(0.01634790));
+        assert_eq!(klines[0].high, dec!(0.80000000));
+        assert_eq!(klines[0].low, dec!(0.01575800));
+        assert_eq!(klines[0].close, dec!(0.01577100));
+        assert_eq!(klines[0].volume, dec!(148976.11427815));
+        assert_eq!(klines[0].close_time_ms, 1_499_644_799_999);
+        assert_eq!(klines[0].trades, 308);
     }
 
     #[tokio::test]

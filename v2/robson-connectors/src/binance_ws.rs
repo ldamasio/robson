@@ -39,7 +39,7 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, Web
 const BINANCE_WS_URL: &str = "wss://stream.binance.com:9443";
 
 /// Binance WebSocket base URL (testnet)
-const BINANCE_WS_TESTNET_URL: &str = "wss://testnet.binance.vision";
+const BINANCE_WS_TESTNET_URL: &str = "wss://stream.testnet.binance.vision";
 
 // =============================================================================
 // Errors
@@ -235,9 +235,9 @@ impl BinanceWsStream {
                     Err(e) => Some(Err(BinanceWsError::ParseError(e.to_string()))),
                 }
             },
-            Some(Ok(Message::Ping(_))) => {
-                // Respond to ping with pong
-                if let Err(e) = self.pong().await {
+            Some(Ok(Message::Ping(payload))) => {
+                // Binance requires pong responses to echo the ping payload.
+                if let Err(e) = self.pong(payload).await {
                     return Some(Err(e));
                 }
                 // Continue receiving next message
@@ -269,9 +269,9 @@ impl BinanceWsStream {
     }
 
     /// Send pong in response to ping.
-    async fn pong(&mut self) -> Result<(), BinanceWsError> {
+    async fn pong(&mut self, payload: Vec<u8>) -> Result<(), BinanceWsError> {
         self.inner
-            .send(Message::Pong(vec![]))
+            .send(Message::Pong(payload))
             .await
             .map_err(|e| BinanceWsError::SendFailed(e.to_string()))
     }
@@ -593,6 +593,25 @@ pub struct BalanceUpdateEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tokio::net::TcpListener;
+    use tokio::time::{timeout, Duration};
+    use tokio_tungstenite::{accept_async, tungstenite::Message};
+
+    #[test]
+    fn test_websocket_client_uses_production_stream_endpoint() {
+        let client = BinanceWebSocketClient::new(false);
+
+        assert_eq!(client.base_url, BINANCE_WS_URL);
+        assert!(!client.testnet);
+    }
+
+    #[test]
+    fn test_websocket_client_uses_testnet_stream_endpoint() {
+        let client = BinanceWebSocketClient::new(true);
+
+        assert_eq!(client.base_url, BINANCE_WS_TESTNET_URL);
+        assert!(client.testnet);
+    }
 
     #[test]
     fn test_ticker_event_deserialization() {
@@ -679,5 +698,43 @@ mod tests {
             },
             _ => panic!("Expected ExecutionReport event"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_ping_response_echoes_payload() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let payload = b"binance-ping".to_vec();
+
+        let server = tokio::spawn({
+            let expected = payload.clone();
+            async move {
+                let (tcp, _) = listener.accept().await.unwrap();
+                let mut server_ws = accept_async(tcp).await.unwrap();
+
+                server_ws.send(Message::Ping(expected.clone())).await.unwrap();
+
+                let response = timeout(Duration::from_secs(1), server_ws.next())
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .unwrap();
+
+                match response {
+                    Message::Pong(actual) => assert_eq!(actual, expected),
+                    other => panic!("Expected pong, got {:?}", other),
+                }
+
+                server_ws.close(None).await.unwrap();
+            }
+        });
+
+        let (client_ws, _) = connect_async(format!("ws://{}", addr)).await.unwrap();
+        let mut stream = BinanceWsStream::new(client_ws, StreamType::AggTrade);
+
+        let result = timeout(Duration::from_secs(1), stream.next()).await.unwrap();
+        assert!(result.is_none());
+
+        server.await.unwrap();
     }
 }

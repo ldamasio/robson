@@ -7,12 +7,15 @@ use std::{collections::HashMap, sync::RwLock};
 
 use async_trait::async_trait;
 use chrono::Utc;
-use robson_domain::{OrderSide, Price, Quantity, Symbol};
+use robson_domain::{Candle, OrderSide, Price, Quantity, Symbol};
 use rust_decimal::Decimal;
 
 use crate::{
     error::ExecError,
-    ports::{ExchangePort, MarginSettings, MarketDataPort, OrderResult, PriceUpdate},
+    ports::{
+        CandleInterval, ExchangePort, MarginSettings, MarketDataPort, OhlcvPort, OrderResult,
+        PriceUpdate,
+    },
 };
 
 // =============================================================================
@@ -305,6 +308,82 @@ impl MarketDataPort for StubMarketData {
 
         Ok(Price::new(price).unwrap())
     }
+}
+
+// =============================================================================
+// Stub OHLCV
+// =============================================================================
+
+/// Stub OHLCV provider for tests and in-memory daemon mode.
+#[derive(Clone)]
+pub struct StubOhlcv {
+    candles: Vec<Candle>,
+}
+
+impl StubOhlcv {
+    /// Create a stub from a fixed candle sequence.
+    pub fn new(candles: Vec<Candle>) -> Self {
+        Self { candles }
+    }
+
+    /// Create a 100-candle fixture with two supports and two resistances.
+    pub fn with_default_technical_levels() -> Self {
+        let symbol = Symbol::from_pair("BTCUSDT").expect("static test symbol must be valid");
+        Self::new(default_technical_stop_candles(symbol))
+    }
+}
+
+impl Default for StubOhlcv {
+    fn default() -> Self {
+        Self::with_default_technical_levels()
+    }
+}
+
+#[async_trait]
+impl OhlcvPort for StubOhlcv {
+    async fn fetch_candles(
+        &self,
+        _symbol: &Symbol,
+        _interval: CandleInterval,
+        _limit: u16,
+    ) -> Result<Vec<Candle>, ExecError> {
+        Ok(self.candles.clone())
+    }
+}
+
+fn default_technical_stop_candles(symbol: Symbol) -> Vec<Candle> {
+    let base = Decimal::from(95_000u32);
+    let now = Utc::now();
+    let mut candles: Vec<Candle> = (0..100)
+        .map(|_| {
+            Candle::new(symbol.clone(), base, base, base, base, Decimal::from(100u32), 10, now, now)
+        })
+        .collect();
+
+    candles[50] = Candle::new(
+        symbol.clone(),
+        base,
+        Decimal::from(97_000u32),
+        Decimal::from(93_000u32),
+        base,
+        Decimal::from(100u32),
+        10,
+        now,
+        now,
+    );
+    candles[70] = Candle::new(
+        symbol,
+        base,
+        Decimal::from(100_000u32),
+        Decimal::from(90_000u32),
+        base,
+        Decimal::from(100u32),
+        10,
+        now,
+        now,
+    );
+
+    candles
 }
 
 // =============================================================================

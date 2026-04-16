@@ -1154,7 +1154,7 @@ mod tests {
         );
 
         let entry = Price::new(dec!(95000)).unwrap();
-        let exit = Price::new(dec!(93100)).unwrap(); // Loss (2% stop)
+        let exit = Price::new(dec!(93100)).unwrap(); // Loss exit
         let qty = Quantity::new(dec!(0.1)).unwrap();
 
         let pnl = monitor.calculate_expected_pnl(Side::Long, entry, exit, qty);

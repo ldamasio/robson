@@ -31,7 +31,7 @@ use robson_engine::{
 };
 #[cfg(feature = "postgres")]
 use robson_eventlog::{append_event, ActorType as EventlogActorType, Event as EventlogEvent};
-use robson_exec::{ActionResult, ExchangePort, ExecError, Executor};
+use robson_exec::{ActionResult, ExchangePort, ExecError, Executor, OhlcvPort, StubOhlcv};
 #[cfg(feature = "postgres")]
 use robson_projector::apply_event_to_projections;
 use robson_store::Store;
@@ -83,6 +83,8 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     store: Arc<S>,
     /// Event bus for publishing events
     event_bus: Arc<EventBus>,
+    /// OHLCV source for detector technical stop analysis
+    ohlcv_port: Arc<dyn OhlcvPort>,
     /// Master cancellation token for all detector tasks
     shutdown_token: CancellationToken,
     /// Active detector tasks (position_id → task handle)
@@ -147,6 +149,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             executor,
             store,
             event_bus,
+            ohlcv_port: Arc::new(StubOhlcv::default()),
             shutdown_token,
             detectors: Arc::new(RwLock::new(HashMap::new())),
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
@@ -158,6 +161,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             #[cfg(feature = "postgres")]
             event_log_tenant_id: None,
         }
+    }
+
+    /// Configure the OHLCV source used by newly spawned detector tasks.
+    pub fn with_ohlcv_port(mut self, ohlcv_port: Arc<dyn OhlcvPort>) -> Self {
+        self.ohlcv_port = ohlcv_port;
+        self
     }
 
     /// Configure eventlog persistence for domain events (MIG-v2.5#2).
@@ -561,12 +570,18 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         position_id: PositionId,
         position: Position,
         event_bus: Arc<EventBus>,
+        ohlcv_port: Arc<dyn OhlcvPort>,
         detectors: Arc<RwLock<HashMap<PositionId, JoinHandle<Option<DetectorSignal>>>>>,
         shutdown_token: CancellationToken,
         reason: &'static str,
     ) {
         let cancel_token = shutdown_token.child_token();
-        match DetectorTask::from_position(&position, Arc::clone(&event_bus), cancel_token) {
+        match DetectorTask::from_position(
+            &position,
+            Arc::clone(&event_bus),
+            ohlcv_port,
+            cancel_token,
+        ) {
             Ok(detector) => {
                 let handle = detector.spawn();
                 let mut detectors = detectors.write().await;
@@ -594,6 +609,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             position_id,
             position.clone(),
             Arc::clone(&self.event_bus),
+            Arc::clone(&self.ohlcv_port),
             Arc::clone(&self.detectors),
             self.shutdown_token.clone(),
             reason,
@@ -645,6 +661,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let pending_approvals = Arc::clone(&self.pending_approvals);
         let query_engine = Arc::clone(&self.query_engine);
         let event_bus = Arc::clone(&self.event_bus);
+        let ohlcv_port = Arc::clone(&self.ohlcv_port);
         let detectors = Arc::clone(&self.detectors);
         let shutdown_token = self.shutdown_token.clone();
 
@@ -689,6 +706,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                             record_inner.position.id,
                             record_inner.position,
                             event_bus,
+                            ohlcv_port,
                             detectors,
                             shutdown_token,
                             "approval expired",
@@ -716,12 +734,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         {
             let mut pending_approvals = self.pending_approvals.write().await;
-            pending_approvals.insert(query_id, PendingApprovalRecord {
-                query,
-                position,
-                proposed,
-                governed,
-            });
+            pending_approvals
+                .insert(query_id, PendingApprovalRecord { query, position, proposed, governed });
         }
 
         let pending_approvals = self.pending_approvals.read().await;
@@ -1051,17 +1065,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         // Spawn detector task
         let cancel_token = self.child_cancel_token();
-        let detector =
-            match DetectorTask::from_position(&position, Arc::clone(&self.event_bus), cancel_token)
-            {
-                Ok(d) => d,
-                Err(e) => {
-                    let err_str = format!("{}", e);
-                    query.fail(err_str.clone(), "acting".to_string());
-                    self.record_query_failure(&query).await?;
-                    return Err(e);
-                },
-            };
+        let detector = match DetectorTask::from_position(
+            &position,
+            Arc::clone(&self.event_bus),
+            Arc::clone(&self.ohlcv_port),
+            cancel_token,
+        ) {
+            Ok(d) => d,
+            Err(e) => {
+                let err_str = format!("{}", e);
+                query.fail(err_str.clone(), "acting".to_string());
+                self.record_query_failure(&query).await?;
+                return Err(e);
+            },
+        };
         let handle = detector.spawn();
 
         // Store detector handle for cancellation
@@ -2264,7 +2281,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
 #[cfg(test)]
 mod tests {
-    use robson_exec::{IntentJournal, StubExchange};
+    use chrono::Duration;
+    use robson_domain::Candle;
+    use robson_exec::{IntentJournal, StubExchange, StubOhlcv};
     use robson_store::MemoryStore;
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -2285,14 +2304,17 @@ mod tests {
         let risk_config = RiskConfig::new(dec!(10000)).unwrap(); // 1% risk
         let engine = Engine::new(risk_config);
 
-        Arc::new(PositionManager::with_approval_policy(
-            engine,
-            executor,
-            store,
-            event_bus,
-            Arc::new(TracingQueryRecorder),
-            approval_policy,
-        ))
+        Arc::new(
+            PositionManager::with_approval_policy(
+                engine,
+                executor,
+                store,
+                event_bus,
+                Arc::new(TracingQueryRecorder),
+                approval_policy,
+            )
+            .with_ohlcv_port(Arc::new(StubOhlcv::new(create_test_candles()))),
+        )
     }
 
     async fn create_test_manager() -> Arc<PositionManager<StubExchange, MemoryStore>> {
@@ -2321,6 +2343,53 @@ mod tests {
 
     fn create_test_risk_config() -> RiskConfig {
         RiskConfig::new(dec!(10000)).unwrap() // 1% risk
+    }
+
+    fn create_test_candles() -> Vec<Candle> {
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let now = chrono::Utc::now();
+        let base = dec!(100);
+        let mut candles: Vec<Candle> = (0..100)
+            .map(|i| {
+                let open_time = now + Duration::minutes(i);
+                Candle::new(
+                    symbol.clone(),
+                    base,
+                    base,
+                    base,
+                    base,
+                    dec!(100),
+                    10,
+                    open_time,
+                    open_time + Duration::minutes(15),
+                )
+            })
+            .collect();
+
+        candles[50] = Candle::new(
+            symbol.clone(),
+            base,
+            dec!(105),
+            dec!(95),
+            base,
+            dec!(100),
+            10,
+            now + Duration::minutes(50),
+            now + Duration::minutes(65),
+        );
+        candles[70] = Candle::new(
+            symbol,
+            base,
+            dec!(110),
+            dec!(90),
+            base,
+            dec!(100),
+            10,
+            now + Duration::minutes(70),
+            now + Duration::minutes(85),
+        );
+
+        candles
     }
 
     async fn save_active_position(
@@ -2583,10 +2652,10 @@ mod tests {
 
     /// Phase 2: Risk gate denial keeps position Armed and re-arms the detector.
     ///
-    /// A 2% stop distance causes notional ≈ $5000 which exceeds the default
-    /// 15% single-position limit ($1500 on $10k capital), so the entry is
-    /// denied. The position must remain Armed and have a fresh detector
-    /// after the denial.
+    /// A wide technical stop distance causes notional above the default 15%
+    /// single-position limit ($1500 on $10k capital), so the entry is denied.
+    /// The position must remain Armed and have a fresh detector after the
+    /// denial.
     #[tokio::test]
     async fn test_risk_gate_denial_rearmed_and_position_stays_armed() {
         let manager = create_test_manager().await;
@@ -2606,14 +2675,14 @@ mod tests {
             .await
             .unwrap();
 
-        // 2% stop → notional ≈ $5000 > $1500 limit → risk gate denies
+        // Technical stop span makes notional > $1500 limit, so risk gate denies.
         let signal = DetectorSignal {
             signal_id: Uuid::now_v7(),
             position_id: position.id,
             symbol: symbol.clone(),
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
-            stop_loss: Price::new(dec!(93100)).unwrap(), // 2% — deliberately over limit
+            stop_loss: Price::new(dec!(93100)).unwrap(),
             timestamp: chrono::Utc::now(),
         };
 

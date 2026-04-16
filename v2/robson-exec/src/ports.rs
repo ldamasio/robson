@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use robson_domain::{OrderSide, Price, Quantity, Symbol};
+use robson_domain::{Candle, OrderSide, Price, Quantity, Symbol};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -153,6 +153,80 @@ pub struct PriceUpdate {
     pub price: Price,
     /// Update timestamp
     pub timestamp: DateTime<Utc>,
+}
+
+// =============================================================================
+// OHLCV Port
+// =============================================================================
+
+/// Candlestick interval for OHLCV requests.
+///
+/// Values map directly to Binance kline interval strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum CandleInterval {
+    /// 1-minute candles
+    OneMinute,
+    /// 5-minute candles
+    FiveMinutes,
+    /// 15-minute candles — primary interval for `TechnicalStopAnalyzer` (REQ-CORE-TECHSTOP-004)
+    FifteenMinutes,
+    /// 1-hour candles
+    OneHour,
+    /// 4-hour candles
+    FourHours,
+    /// 1-day candles
+    OneDay,
+}
+
+impl CandleInterval {
+    /// Binance REST API interval string for this interval.
+    pub fn as_binance_str(&self) -> &'static str {
+        match self {
+            CandleInterval::OneMinute => "1m",
+            CandleInterval::FiveMinutes => "5m",
+            CandleInterval::FifteenMinutes => "15m",
+            CandleInterval::OneHour => "1h",
+            CandleInterval::FourHours => "4h",
+            CandleInterval::OneDay => "1d",
+        }
+    }
+}
+
+/// Port for fetching historical OHLCV (candlestick) data.
+///
+/// Used by callers of `TechnicalStopAnalyzer` in `robson-engine` to supply
+/// historical chart data before computing chart-derived stop levels.
+///
+/// Implementations:
+/// - `BinanceOhlcvAdapter` in `robsond` — fetches from Binance REST klines
+/// - Stub for testing — configurable candle sequences
+///
+/// # Hexagonal placement
+///
+/// This port is defined in `robson-exec` (the ports layer). The concrete
+/// adapter belongs in `robsond` (composition root). `robson-engine` never
+/// depends on this port directly — callers fetch candles first, then pass
+/// `Vec<Candle>` into the pure analyzer.
+#[async_trait]
+pub trait OhlcvPort: Send + Sync {
+    /// Fetch historical candles for a symbol, ordered oldest-first.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - Trading pair (e.g., `BTCUSDT`)
+    /// * `interval` - Candle interval (`FifteenMinutes` per REQ-CORE-TECHSTOP-004)
+    /// * `limit` - Number of candles to fetch (use ≥ 100; max 1000)
+    ///
+    /// # Returns
+    ///
+    /// Candles ordered oldest-first. The caller must ensure enough history
+    /// exists before passing to `TechnicalStopAnalyzer`.
+    async fn fetch_candles(
+        &self,
+        symbol: &Symbol,
+        interval: CandleInterval,
+        limit: u16,
+    ) -> Result<Vec<Candle>, ExecError>;
 }
 
 // =============================================================================

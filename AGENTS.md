@@ -27,6 +27,15 @@ The repository currently contains two major realities:
 5. When code and docs disagree, either:
    - update docs to match current code, or
    - label the doc text clearly as target architecture / follow-up.
+6. **`TechnicalStopDistance` MUST always be computed from chart analysis — never from
+   a fixed percentage of entry price.** `stop_loss = entry × (1 − pct)` is a policy
+   violation regardless of context. The stop is the second support/resistance level on
+   the 15-minute chart (see `docs/requirements/technical-stop-requirements.md` and
+   ADR-0021). This invariant applies to all code, tests, runbooks, prompts, and agent
+   briefings without exception.
+7. **Opportunity detection (WHEN to enter) and Technical Stop Analysis (WHERE the stop
+   is) are architecturally separate responsibilities** and must never be conflated in a
+   single component. See ADR-0021.
 
 ## Canonical Planning Vocabulary
 
@@ -36,6 +45,7 @@ Use these identifiers consistently:
 - `MIG-v3#N`: migration steps from v2.5 to v3
 - `QE-PN`: QueryEngine implementation phases
 - `Stage N`: runtime or control-loop pipeline stages inside a single execution tick
+- `VAL-N`: operational validation gates — runbook-format procedures required before go-live events (see `docs/runbooks/val-*.md`)
 
 Rules:
 

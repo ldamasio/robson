@@ -86,6 +86,7 @@ every reference uses a canonical identifier with a prefix:
 | **Migration v2.5 → v3** | `MIG-v3#` | MIG-v3#1 … MIG-v3#8 | Migration steps to promote Rust daemon as primary runtime |
 | **QueryEngine phases** | `QE-P` | QE-P1 … QE-P5 | Internal implementation phases of the QueryEngine subsystem (see v3-query-query-engine.md) |
 | **Pipeline stages** | `Stage` | Stage 1 … Stage N | Sequential stages within a single control loop cycle (see v3-control-loop.md, v3-runtime-spec.md) |
+| **Operational validation gates** | `VAL-` | VAL-001 … VAL-N | Runbook-format validation procedures required before go-live events (see docs/runbooks/val-*.md) |
 
 **Rules**:
 - Never use bare "Phase 5" or "step 3" without prefix. Always use the canonical identifier.
@@ -122,6 +123,8 @@ Status rule for this table: code-backed items may be marked done from repository
 | QE-P3 | Approval Gates | ✅ Done (2026-04-05) |
 | QE-P4 | Full Audit & Replay | ✅ Done (2026-04-05) |
 | QE-P5 | Context Governance (LLM) | Deferred (v3+) |
+| VAL-001 | Testnet E2E validation (arm → signal → fill → trailing stop → exit) | **Blocked on TechnicalStopAnalyzer implementation** — see ADR-0021 and [docs/runbooks/val-001-testnet-e2e-validation.md](../runbooks/val-001-testnet-e2e-validation.md) |
+| VAL-002 | Real capital activation (Binance real keys + monitor enabled in prod) | Pending — blocked on VAL-001 PASS |
 
 ### MIG-v2.5#2 Technical Notes (2026-04-05, validated 2026-04-10)
 
