@@ -23,6 +23,7 @@ enum ProjectionRoute {
     EntryFilled,
     EntrySignalReceived,
     TrailingStopUpdated,
+    PositionMonitorTick,
     ExitTriggered,
     ExitOrderPlaced,
     BalanceSampled,
@@ -57,6 +58,9 @@ fn projection_route(event_type: &str) -> Option<ProjectionRoute> {
         },
         "trailing_stop_updated" | "TRAILING_STOP_UPDATED" => {
             Some(ProjectionRoute::TrailingStopUpdated)
+        },
+        "position_monitor_tick" | "POSITION_MONITOR_TICK" => {
+            Some(ProjectionRoute::PositionMonitorTick)
         },
         "exit_triggered" | "EXIT_TRIGGERED" => Some(ProjectionRoute::ExitTriggered),
         "exit_order_placed" | "EXIT_ORDER_PLACED" => Some(ProjectionRoute::ExitOrderPlaced),
@@ -123,6 +127,10 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
         Some(ProjectionRoute::TrailingStopUpdated) => {
             handlers::positions::handle_trailing_stop_updated(pool, envelope).await?
         },
+        Some(ProjectionRoute::PositionMonitorTick) => {
+            // Audit-only tick evidence. The canonical position projection is
+            // updated by lifecycle events such as trailing_stop_updated.
+        },
         Some(ProjectionRoute::ExitTriggered) => {
             handlers::positions::handle_exit_triggered(pool, envelope).await?
         },
@@ -188,6 +196,7 @@ mod tests {
             "entry_order_placed",
             "entry_filled",
             "trailing_stop_updated",
+            "position_monitor_tick",
             "exit_triggered",
             "exit_order_placed",
             "position_closed",

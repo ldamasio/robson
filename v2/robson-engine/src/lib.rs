@@ -44,6 +44,7 @@ use robson_domain::{
     calculate_position_size, DetectorSignal, Event, ExitReason, Position, PositionId,
     PositionState, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance,
 };
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use tracing::debug;
@@ -590,6 +591,8 @@ impl Engine {
         })?;
 
         let current_price = market_data.current_price;
+        let observed_watermark =
+            Self::observed_watermark(position.side, current_price, favorable_extreme);
 
         // Check exit first (higher priority)
         if self.should_exit(position.side, current_price, trailing_stop) {
@@ -599,7 +602,16 @@ impl Engine {
                 trailing_stop = %trailing_stop,
                 "Exit triggered"
             );
-            return Ok(self.create_exit_decision(position, current_price, trailing_stop));
+            let monitor_tick = self.create_position_monitor_tick_event(
+                position,
+                current_price,
+                trailing_stop,
+                observed_watermark,
+                market_data.timestamp,
+            );
+            let mut decision = self.create_exit_decision(position, current_price, trailing_stop);
+            decision.actions.insert(0, EngineAction::EmitEvent(monitor_tick));
+            return Ok(decision);
         }
 
         // Check if trailing stop should be updated (discrete step logic)
@@ -626,13 +638,22 @@ impl Engine {
                         trailing_stop,
                         new_stop,
                         current_price,
+                        observed_watermark,
+                        market_data.timestamp,
                     ));
                 }
             }
         }
 
-        // No action needed
-        Ok(EngineDecision::no_action())
+        let monitor_tick = self.create_position_monitor_tick_event(
+            position,
+            current_price,
+            trailing_stop,
+            observed_watermark,
+            market_data.timestamp,
+        );
+
+        Ok(EngineDecision::with_actions(vec![EngineAction::EmitEvent(monitor_tick)]))
     }
 
     /// Check if position should exit (trailing stop hit)
@@ -676,6 +697,48 @@ impl Engine {
             Side::Long => new_stop.as_decimal() > current_stop.as_decimal(),
             // SHORT: lower stop is more favorable
             Side::Short => new_stop.as_decimal() < current_stop.as_decimal(),
+        }
+    }
+
+    /// Compute the best favorable price visible at this tick.
+    fn observed_watermark(side: Side, current_price: Price, favorable_extreme: Price) -> Price {
+        match side {
+            Side::Long if current_price.as_decimal() > favorable_extreme.as_decimal() => {
+                current_price
+            },
+            Side::Short if current_price.as_decimal() < favorable_extreme.as_decimal() => {
+                current_price
+            },
+            _ => favorable_extreme,
+        }
+    }
+
+    /// Distance from the favorable watermark back to the current stop trigger.
+    fn span_remaining(side: Side, watermark: Price, current_stop: Price) -> Decimal {
+        let distance = match side {
+            Side::Long => watermark.as_decimal() - current_stop.as_decimal(),
+            Side::Short => current_stop.as_decimal() - watermark.as_decimal(),
+        };
+
+        distance.max(Decimal::ZERO)
+    }
+
+    fn create_position_monitor_tick_event(
+        &self,
+        position: &Position,
+        price: Price,
+        current_stop: Price,
+        high_watermark: Price,
+        timestamp: DateTime<Utc>,
+    ) -> Event {
+        Event::PositionMonitorTick {
+            position_id: position.id,
+            symbol: position.symbol.as_pair(),
+            price,
+            current_stop,
+            high_watermark,
+            span_remaining: Self::span_remaining(position.side, high_watermark, current_stop),
+            timestamp,
         }
     }
 
@@ -726,6 +789,8 @@ impl Engine {
         previous_stop: Price,
         new_stop: Price,
         trigger_price: Price,
+        observed_watermark: Price,
+        tick_timestamp: DateTime<Utc>,
     ) -> EngineDecision {
         // Update position state with new trailing stop and favorable extreme
         let mut updated_position = position.clone();
@@ -767,6 +832,14 @@ impl Engine {
                 trigger_price,
                 timestamp: Utc::now(),
             }),
+            // 3. Emit per-tick audit evidence with the post-update stop.
+            EngineAction::EmitEvent(self.create_position_monitor_tick_event(
+                position,
+                trigger_price,
+                new_stop,
+                observed_watermark,
+                tick_timestamp,
+            )),
         ];
 
         EngineDecision::with_position(actions, updated_position)
@@ -830,6 +903,92 @@ mod tests {
         MarketData::new(Symbol::from_pair("BTCUSDT").unwrap(), Price::new(price).unwrap())
     }
 
+    fn assert_position_monitor_tick(
+        decision: &EngineDecision,
+        expected_price: Decimal,
+        expected_current_stop: Decimal,
+        expected_high_watermark: Decimal,
+        expected_span_remaining: Decimal,
+    ) {
+        let tick = decision
+            .actions
+            .iter()
+            .find_map(|action| {
+                if let EngineAction::EmitEvent(Event::PositionMonitorTick {
+                    symbol,
+                    price,
+                    current_stop,
+                    high_watermark,
+                    span_remaining,
+                    ..
+                }) = action
+                {
+                    Some((symbol, price, current_stop, high_watermark, span_remaining))
+                } else {
+                    None
+                }
+            })
+            .expect("Expected PositionMonitorTick event");
+
+        assert_eq!(tick.0.as_str(), "BTCUSDT");
+        assert_eq!(tick.1.as_decimal(), expected_price);
+        assert_eq!(tick.2.as_decimal(), expected_current_stop);
+        assert_eq!(tick.3.as_decimal(), expected_high_watermark);
+        assert_eq!(*tick.4, expected_span_remaining);
+    }
+
+    fn has_trailing_stop_update_event(decision: &EngineDecision) -> bool {
+        decision.actions.iter().any(|action| {
+            matches!(action, EngineAction::EmitEvent(Event::TrailingStopUpdated { .. }))
+        })
+    }
+
+    fn find_trailing_stop_update(decision: &EngineDecision) -> Option<(Price, Price)> {
+        decision.actions.iter().find_map(|action| {
+            if let EngineAction::UpdateTrailingStop { new_stop, previous_stop, .. } = action {
+                Some((*new_stop, *previous_stop))
+            } else {
+                None
+            }
+        })
+    }
+
+    // =========================================================================
+    // Position Monitor Audit Tests
+    // =========================================================================
+
+    #[test]
+    fn test_position_monitor_tick_emitted_without_stop_move() {
+        let config = RiskConfig::new(dec!(10000)).unwrap();
+        let engine = Engine::new(config);
+
+        let position =
+            create_active_position(Side::Long, dec!(95000), dec!(93500), dec!(95000), dec!(1500));
+
+        let market = create_market_data(dec!(96000));
+        let decision = engine.process_active_position(&position, &market).unwrap();
+
+        assert_eq!(decision.actions.len(), 1);
+        assert_position_monitor_tick(&decision, dec!(96000), dec!(93500), dec!(96000), dec!(2500));
+        assert!(!has_trailing_stop_update_event(&decision));
+    }
+
+    #[test]
+    fn test_position_monitor_tick_emitted_with_stop_move() {
+        let config = RiskConfig::new(dec!(10000)).unwrap();
+        let engine = Engine::new(config);
+
+        let position =
+            create_active_position(Side::Long, dec!(95000), dec!(93500), dec!(95000), dec!(1500));
+
+        let market = create_market_data(dec!(96500));
+        let decision = engine.process_active_position(&position, &market).unwrap();
+
+        assert!(find_trailing_stop_update(&decision).is_some());
+        assert!(has_trailing_stop_update_event(&decision));
+        assert_position_monitor_tick(&decision, dec!(96500), dec!(95000), dec!(96500), dec!(1500));
+    }
+
     // =========================================================================
     // Long Position Tests
     // =========================================================================
@@ -852,11 +1011,14 @@ mod tests {
         let market = create_market_data(dec!(95000));
         let decision = engine.process_active_position(&position, &market).unwrap();
 
-        assert!(!decision.has_actions());
+        assert!(decision.has_actions());
+        assert_eq!(decision.actions.len(), 1);
+        assert_position_monitor_tick(&decision, dec!(95000), dec!(93500), dec!(95000), dec!(1500));
+        assert!(!has_trailing_stop_update_event(&decision));
     }
 
     #[test]
-    fn test_long_trailing_stop_no_update_partial_span() {
+    fn test_long_trailing_stop_no_update_partial_span_emits_monitor_tick() {
         let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
@@ -872,11 +1034,14 @@ mod tests {
         // Price moved up to $96k — NOT a full span ($96.5k needed). No update.
         let market = create_market_data(dec!(96000));
         let decision = engine.process_active_position(&position, &market).unwrap();
-        assert!(!decision.has_actions());
+
+        assert_eq!(decision.actions.len(), 1);
+        assert_position_monitor_tick(&decision, dec!(96000), dec!(93500), dec!(96000), dec!(2500));
+        assert!(!has_trailing_stop_update_event(&decision));
     }
 
     #[test]
-    fn test_long_trailing_stop_update_full_span() {
+    fn test_long_trailing_stop_update_full_span_emits_monitor_tick_and_update() {
         let config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(config);
 
@@ -894,15 +1059,14 @@ mod tests {
         let decision = engine.process_active_position(&position, &market).unwrap();
 
         assert!(decision.has_actions());
-        assert_eq!(decision.actions.len(), 2);
+        assert_eq!(decision.actions.len(), 3);
 
-        match &decision.actions[0] {
-            EngineAction::UpdateTrailingStop { new_stop, previous_stop, .. } => {
-                assert_eq!(new_stop.as_decimal(), dec!(95000)); // breakeven
-                assert_eq!(previous_stop.as_decimal(), dec!(93500));
-            },
-            _ => panic!("Expected UpdateTrailingStop action"),
-        }
+        let (new_stop, previous_stop) =
+            find_trailing_stop_update(&decision).expect("Expected UpdateTrailingStop action");
+        assert_eq!(new_stop.as_decimal(), dec!(95000)); // breakeven
+        assert_eq!(previous_stop.as_decimal(), dec!(93500));
+        assert!(has_trailing_stop_update_event(&decision));
+        assert_position_monitor_tick(&decision, dec!(96500), dec!(95000), dec!(96500), dec!(1500));
     }
 
     #[test]
@@ -924,7 +1088,9 @@ mod tests {
         let decision = engine.process_active_position(&position, &market).unwrap();
 
         // No update - price is below favorable extreme
-        assert!(!decision.has_actions());
+        assert_eq!(decision.actions.len(), 1);
+        assert_position_monitor_tick(&decision, dec!(95500), dec!(95000), dec!(96500), dec!(1500));
+        assert!(!has_trailing_stop_update_event(&decision));
     }
 
     #[test]
@@ -1003,7 +1169,10 @@ mod tests {
         let market = create_market_data(dec!(95000));
         let decision = engine.process_active_position(&position, &market).unwrap();
 
-        assert!(!decision.has_actions());
+        assert!(decision.has_actions());
+        assert_eq!(decision.actions.len(), 1);
+        assert_position_monitor_tick(&decision, dec!(95000), dec!(96500), dec!(95000), dec!(1500));
+        assert!(!has_trailing_stop_update_event(&decision));
     }
 
     #[test]
@@ -1022,7 +1191,9 @@ mod tests {
         // Price moved down to $94,000 — NOT a full span ($93,500 needed). No update.
         let market = create_market_data(dec!(94000));
         let decision = engine.process_active_position(&position, &market).unwrap();
-        assert!(!decision.has_actions());
+        assert_eq!(decision.actions.len(), 1);
+        assert_position_monitor_tick(&decision, dec!(94000), dec!(96500), dec!(94000), dec!(2500));
+        assert!(!has_trailing_stop_update_event(&decision));
     }
 
     #[test]
@@ -1044,13 +1215,11 @@ mod tests {
 
         assert!(decision.has_actions());
 
-        match &decision.actions[0] {
-            EngineAction::UpdateTrailingStop { new_stop, previous_stop, .. } => {
-                assert_eq!(new_stop.as_decimal(), dec!(95000)); // breakeven
-                assert_eq!(previous_stop.as_decimal(), dec!(96500));
-            },
-            _ => panic!("Expected UpdateTrailingStop action"),
-        }
+        let (new_stop, previous_stop) =
+            find_trailing_stop_update(&decision).expect("Expected UpdateTrailingStop action");
+        assert_eq!(new_stop.as_decimal(), dec!(95000)); // breakeven
+        assert_eq!(previous_stop.as_decimal(), dec!(96500));
+        assert_position_monitor_tick(&decision, dec!(93500), dec!(95000), dec!(93500), dec!(1500));
     }
 
     #[test]
@@ -1147,12 +1316,10 @@ mod tests {
             let market = create_market_data(new_price);
             let decision = engine.process_active_position(&position, &market).unwrap();
 
-            if decision.has_actions() {
-                if let EngineAction::UpdateTrailingStop { new_stop, .. } = &decision.actions[0] {
-                    // Update for next iteration
-                    current_stop = new_stop.as_decimal();
-                    favorable_extreme = new_price;
-                }
+            if let Some((new_stop, _previous_stop)) = find_trailing_stop_update(&decision) {
+                // Update for next iteration
+                current_stop = new_stop.as_decimal();
+                favorable_extreme = new_price;
             }
         }
 
@@ -1554,8 +1721,12 @@ mod tests {
         let market = create_market_data(dec!(96500));
         let decision = engine.process_active_position(&position_with_emitted, &market).unwrap();
 
-        // No action: stop would still be $95k (same as last_emitted_stop)
-        assert!(!decision.has_actions(), "Should not emit duplicate trailing stop update");
+        assert_eq!(decision.actions.len(), 1);
+        assert_position_monitor_tick(&decision, dec!(96500), dec!(95000), dec!(96500), dec!(1500));
+        assert!(
+            !has_trailing_stop_update_event(&decision),
+            "Should not emit duplicate trailing stop update"
+        );
     }
 
     #[test]
@@ -1599,9 +1770,17 @@ mod tests {
         let decision2 = engine.process_active_position(&position_with_emitted, &market).unwrap();
         let decision3 = engine.process_active_position(&position_with_emitted, &market).unwrap();
 
-        // None should trigger updates
-        assert!(!decision1.has_actions());
-        assert!(!decision2.has_actions());
-        assert!(!decision3.has_actions());
+        // None should trigger stop updates, but every active tick is audited.
+        for decision in [&decision1, &decision2, &decision3] {
+            assert_eq!(decision.actions.len(), 1);
+            assert_position_monitor_tick(
+                decision,
+                dec!(95500),
+                dec!(95000),
+                dec!(96500),
+                dec!(1500),
+            );
+            assert!(!has_trailing_stop_update_event(decision));
+        }
     }
 }

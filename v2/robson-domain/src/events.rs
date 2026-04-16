@@ -106,6 +106,24 @@ pub enum Event {
         timestamp: DateTime<Utc>,
     },
 
+    /// Position monitor observed an active-position market tick
+    PositionMonitorTick {
+        /// Position identifier
+        position_id: PositionId,
+        /// Trading pair symbol as exchange pair string (e.g. BTCUSDT)
+        symbol: String,
+        /// Current tick price
+        price: Price,
+        /// Current trailing stop after processing the tick
+        current_stop: Price,
+        /// Best favorable price seen for the position at this tick
+        high_watermark: Price,
+        /// Distance from the watermark to the stop trigger
+        span_remaining: Decimal,
+        /// When the tick was observed
+        timestamp: DateTime<Utc>,
+    },
+
     /// Exit triggered (trailing stop hit or user panic)
     ExitTriggered {
         /// Position identifier
@@ -236,6 +254,7 @@ impl Event {
             | Event::EntryOrderPlaced { position_id, .. }
             | Event::EntryFilled { position_id, .. }
             | Event::TrailingStopUpdated { position_id, .. }
+            | Event::PositionMonitorTick { position_id, .. }
             | Event::ExitTriggered { position_id, .. }
             | Event::ExitOrderPlaced { position_id, .. }
             | Event::ExitFilled { position_id, .. }
@@ -255,6 +274,7 @@ impl Event {
             | Event::EntryOrderPlaced { timestamp, .. }
             | Event::EntryFilled { timestamp, .. }
             | Event::TrailingStopUpdated { timestamp, .. }
+            | Event::PositionMonitorTick { timestamp, .. }
             | Event::ExitTriggered { timestamp, .. }
             | Event::ExitOrderPlaced { timestamp, .. }
             | Event::ExitFilled { timestamp, .. }
@@ -274,6 +294,7 @@ impl Event {
             Event::EntryOrderPlaced { .. } => "entry_order_placed",
             Event::EntryFilled { .. } => "entry_filled",
             Event::TrailingStopUpdated { .. } => "trailing_stop_updated",
+            Event::PositionMonitorTick { .. } => "position_monitor_tick",
             Event::ExitTriggered { .. } => "exit_triggered",
             Event::ExitOrderPlaced { .. } => "exit_order_placed",
             Event::ExitFilled { .. } => "exit_filled",
@@ -345,6 +366,18 @@ mod tests {
         }
     }
 
+    fn sample_position_monitor_tick() -> Event {
+        Event::PositionMonitorTick {
+            position_id: Uuid::now_v7(),
+            symbol: "BTCUSDT".to_string(),
+            price: Price::new(dec!(96000)).unwrap(),
+            current_stop: Price::new(dec!(93500)).unwrap(),
+            high_watermark: Price::new(dec!(96000)).unwrap(),
+            span_remaining: dec!(2500),
+            timestamp: Utc::now(),
+        }
+    }
+
     fn sample_position_closed() -> Event {
         Event::PositionClosed {
             position_id: Uuid::now_v7(),
@@ -409,6 +442,19 @@ mod tests {
 
         assert_eq!(payload["type"].as_str(), Some("exit_order_placed"));
         assert_eq!(payload["cycle_id"].as_str(), Some(expected_cycle_id.as_str()));
+    }
+
+    #[test]
+    fn test_position_monitor_tick_serializes_requested_payload() {
+        let event = sample_position_monitor_tick();
+        let payload = serde_json::to_value(&event).unwrap();
+
+        assert_eq!(payload["type"].as_str(), Some("position_monitor_tick"));
+        assert_eq!(payload["symbol"].as_str(), Some("BTCUSDT"));
+        assert_eq!(payload["price"].as_str(), Some("96000"));
+        assert_eq!(payload["current_stop"].as_str(), Some("93500"));
+        assert_eq!(payload["high_watermark"].as_str(), Some("96000"));
+        assert_eq!(payload["span_remaining"].as_str(), Some("2500"));
     }
 
     #[test]
