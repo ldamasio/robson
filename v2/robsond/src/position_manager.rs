@@ -738,8 +738,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         {
             let mut pending_approvals = self.pending_approvals.write().await;
-            pending_approvals
-                .insert(query_id, PendingApprovalRecord { query, position, proposed, governed });
+            pending_approvals.insert(query_id, PendingApprovalRecord {
+                query,
+                position,
+                proposed,
+                governed,
+            });
         }
 
         let pending_approvals = self.pending_approvals.read().await;

@@ -872,10 +872,10 @@ mod tests {
     fn test_disarm_position_kind() {
         let position_id = Uuid::now_v7();
 
-        let query = ExecutionQuery::new(
-            QueryKind::DisarmPosition { position_id },
-            ActorKind::Operator { source: CommandSource::Api },
-        );
+        let query =
+            ExecutionQuery::new(QueryKind::DisarmPosition { position_id }, ActorKind::Operator {
+                source: CommandSource::Api,
+            });
 
         assert!(matches!(query.kind, QueryKind::DisarmPosition { .. }));
     }
@@ -910,10 +910,9 @@ mod tests {
 
     #[test]
     fn test_health_check_kind() {
-        let query = ExecutionQuery::new(
-            QueryKind::HealthCheck,
-            ActorKind::System { subsystem: "scheduler".to_string() },
-        );
+        let query = ExecutionQuery::new(QueryKind::HealthCheck, ActorKind::System {
+            subsystem: "scheduler".to_string(),
+        });
 
         assert!(matches!(query.kind, QueryKind::HealthCheck));
     }
