@@ -35,12 +35,14 @@ pub struct MarketDataManager {
     event_bus: Arc<EventBus>,
     /// Cancellation token for graceful shutdown
     cancel: CancellationToken,
+    /// Whether to connect to Binance testnet streams (mirrors ROBSON_BINANCE_USE_TESTNET)
+    use_testnet: bool,
 }
 
 impl MarketDataManager {
     /// Create a new market data manager.
-    pub fn new(event_bus: Arc<EventBus>, cancel: CancellationToken) -> Self {
-        Self { event_bus, cancel }
+    pub fn new(event_bus: Arc<EventBus>, cancel: CancellationToken, use_testnet: bool) -> Self {
+        Self { event_bus, cancel, use_testnet }
     }
 
     /// Spawn a WebSocket client task for a single symbol.
@@ -55,8 +57,9 @@ impl MarketDataManager {
         let cancel = self.cancel.clone();
         let symbol_str = symbol.as_pair();
 
+        let use_testnet = self.use_testnet;
         let handle = tokio::spawn(async move {
-            let ws_client = BinanceWebSocketClient::new(false);
+            let ws_client = BinanceWebSocketClient::new(use_testnet);
             let mut backoff_secs: u64 = 1;
 
             'reconnect: loop {
@@ -198,7 +201,7 @@ mod tests {
     fn test_market_data_manager_creation() {
         let event_bus = Arc::new(EventBus::new(100));
         let cancel = CancellationToken::new();
-        let _manager = MarketDataManager::new(event_bus, cancel);
+        let _manager = MarketDataManager::new(event_bus, cancel, false);
         // Manager is created successfully
     }
 }

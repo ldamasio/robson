@@ -377,7 +377,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
 
         // 5. Spawn WebSocket client (Phase 6: Market Data)
         // TODO: Make this configurable (symbols list from config)
-        let market_data_manager = MarketDataManager::new(self.event_bus.clone(), shutdown.clone());
+        let ws_use_testnet =
+            std::env::var("ROBSON_BINANCE_USE_TESTNET").unwrap_or_default() == "true";
+        let market_data_manager =
+            MarketDataManager::new(self.event_bus.clone(), shutdown.clone(), ws_use_testnet);
         let btcusdt = Symbol::from_pair("BTCUSDT").unwrap();
         let ws_handle = market_data_manager.spawn_ws_client(btcusdt)?;
         info!("WebSocket client spawned for BTCUSDT");
