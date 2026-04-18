@@ -180,6 +180,8 @@ DJANGO_SETTINGS_MODULE=backend.settings .venv/bin/python -m pytest \
 2. **Status Value Validation**: Only valid status values from `STATUS_CHOICES` are accepted
 3. **Transactional Safety**: Status updates should be wrapped in `transaction.atomic()` when combined with related mutations
 4. **Synchronous Only**: Gate 5 only supports synchronous status updates within request/response cycles
+5. **Robson-authored position invariant** (ADR-0022): every `Operation` that reaches `ACTIVE` MUST correspond to a Robson-authored exchange entry — the originating exchange order id matches an `entry_order_placed` event in the runtime `event_log`. An exchange position without a matching Operation (or event) is UNTRACKED and is handled by the runtime's reconciliation worker (close at market). Adopting an UNTRACKED exchange position by back-dating an Operation in `ACTIVE` is a policy violation.
+6. **Symbol-agnostic lifecycle** (ADR-0023): this state machine applies to every `symbol` the system operates on. `Operation.symbol` is a field, not a fixed value. Examples below that mention `BTCUSDC` are illustrative; substitute any configured pair.
 
 **Note on Tenant Isolation**: Tenant boundaries are enforced at the query and view layers, not by `Operation.set_status()`. The model method only validates status transitions; it does not check tenant ownership.
 
@@ -272,6 +274,10 @@ See `api/tests/test_gate_7_cancel_operation_api.py` for integration tests.
 - [Gate 4 Implementation](../specs/gate-4-operation-creation.md) - Operation creation semantics
 - [Gate 6 Implementation](../adr/ADR-0020-gate-6-operation-cancellation.md) - Use case design
 - [ADR-0007](../adr/ADR-0007-trading-intent.md) - Agentic workflow
+- [ADR-0022 — Robson-Authored Position Invariant](../adr/ADR-0022-robson-authored-position-invariant.md)
+- [ADR-0023 — Symbol-Agnostic Policy Invariant](../adr/ADR-0023-symbol-agnostic-policy-invariant.md)
+- [UNTRACKED-POSITION-RECONCILIATION.md](../policies/UNTRACKED-POSITION-RECONCILIATION.md)
+- [SYMBOL-AGNOSTIC-POLICIES.md](../policies/SYMBOL-AGNOSTIC-POLICIES.md)
 
 ---
 
