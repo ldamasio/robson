@@ -40,7 +40,7 @@ docs/
 ├── ADRs.md                          # Architecture Decision Records index
 ├── adr/                             # Architecture Decision Records
 │   ├── ADR-TEMPLATE.md
-│   ├── ADR-0001 to ADR-0010
+│   ├── ADR-0001 to ADR-0023
 ├── policies/                        # Organizational policies
 │   ├── PRODUCTION-DEPLOYMENT.md     # Production deployment integrity policy
 │   ├── UNTRACKED-POSITION-RECONCILIATION.md  # Robson-authored position invariant (ADR-0022)
@@ -168,6 +168,9 @@ docs/
 | **Transaction Hierarchy** | [architecture/TRANSACTION-HIERARCHY.md](architecture/TRANSACTION-HIERARCHY.md) |
 | **GitOps Auto-Deploy** | [ADR-0011](adr/ADR-0011-gitops-automatic-manifest-updates.md) |
 | **Production Integrity** | [ADR-0012](adr/ADR-0012-production-deployment-integrity.md) |
+| **Opportunity Detection vs Technical Stop** | [ADR-0021](adr/ADR-0021-opportunity-detection-vs-technical-stop-analysis.md) |
+| **Robson-Authored Position Invariant** | [ADR-0022](adr/ADR-0022-robson-authored-position-invariant.md) |
+| **Symbol-Agnostic Policy Invariant** | [ADR-0023](adr/ADR-0023-symbol-agnostic-policy-invariant.md) |
 
 ### Development
 
@@ -308,6 +311,6 @@ Robson Bot is optimized for AI-assisted development:
 
 ---
 
-**Last Updated**: 2025-01-17
+**Last Updated**: 2026-04-18
 **Maintained by**: Robson Bot Core Team
 **License**: Same as project

@@ -16,9 +16,16 @@ Observe -> Interpret -> Decide -> Act -> Evaluate -> Persist
 
 ### Governing Invariants
 
-This Control Loop operates under two additional non-negotiable invariants that apply
+This Control Loop operates under three non-negotiable invariants that apply
 independently of which stage is executing:
 
+- **Opportunity detection vs Technical Stop Analysis** — detecting WHEN to enter
+  (opportunity detection) and determining WHERE the stop is (technical stop
+  analysis) are architecturally separate responsibilities that must never be
+  conflated in a single component. Both sub-steps complete before a `DetectorSignal`
+  is emitted. The stop is always a chart-derived price level — never
+  `entry × (1 − pct)` (see
+  [ADR-0021](../adr/ADR-0021-opportunity-detection-vs-technical-stop-analysis.md)).
 - **Robson-authored position invariant** — every open position on the operated
   Binance account MUST trace to a `robsond`-authored entry; UNTRACKED positions are
   closed by the reconciliation worker (see
@@ -145,7 +152,7 @@ pub enum Interpretation {
 
 **Logic**:
 - `MarketTick` -> check all active positions for trailing stop breach -> `StopBreached` or `TrailingStopUpdate` or `NoAction`
-- `DetectorSignal` -> validate signal matches armed position -> calculate position size via Golden Rule -> `SignalValid` or `SignalRejected`
+- `DetectorSignal` -> (a) opportunity detection: validate signal matches armed position and entry condition is met; (b) technical stop analysis: confirm `tech_stop` field is chart-derived (ADR-0021, never `entry × (1 − pct)`) -> `SignalValid` (with `calculated_size` via Golden Rule) or `SignalRejected`
 - `OperatorCommand` -> validate command is valid for current state -> `CommandAccepted`
 - `OrderFill` -> update position state machine -> `OrderFillProcessed`
 - `TimerFire` -> health check, reconciliation -> `NoAction` (or `RiskAlert` if anomaly detected)

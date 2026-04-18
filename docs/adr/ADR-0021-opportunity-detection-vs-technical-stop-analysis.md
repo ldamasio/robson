@@ -1,7 +1,7 @@
 # ADR-0021 — Separation of Opportunity Detection and Technical Stop Analysis
 
 **Date**: 2026-04-15
-**Status**: DECIDED — FOLLOW-UP REQUIRED (implementation gap in `detector.rs`)
+**Status**: DECIDED — IMPLEMENTATION GAP RESOLVED (2026-04-15): `TechnicalStopAnalyzer` implemented; detector now emits chart-derived stops. VAL-001 Phase 1 PASS. VAL-001 Phase 2 blocked on exposure limits, not on this ADR.
 **Deciders**: RBX Systems (operator + architecture)
 
 ---
@@ -93,16 +93,15 @@ These invariants apply to every `DetectorSignal` produced by the system, without
 
 ## Consequences
 
-### Immediate (implementation gap)
+### Immediate (implementation gap — RESOLVED 2026-04-15)
 
-`v2/robsond/src/detector.rs` violates this ADR:
-- `DetectorConfig.stop_loss_percent` must be removed
-- `calculate_stop_loss()` using `entry × (1 − pct)` must be replaced
-- The replacement must call a `TechnicalStopAnalyzer` that fetches OHLCV data and
-  performs chart analysis
+`v2/robsond/src/detector.rs` previously violated this ADR. Resolved:
+- `DetectorConfig.stop_loss_percent` removed
+- `calculate_stop_loss()` (percentage-based) replaced
+- `TechnicalStopAnalyzer` implemented: fetches OHLCV data and performs chart analysis
+- VAL-001 Run Log (2026-04-15) confirms detector emits chart-derived stops
 
-This gap is a **hard prerequisite for VAL-001** — the testnet E2E cannot validate
-the system correctly while the stop is computed from a percentage.
+VAL-001 Phase 1 now PASS. Phase 2 is blocked on exposure limits, not this ADR.
 
 ### Architecture going forward
 
@@ -144,4 +143,4 @@ derived from price action are the primary method per REQ-CORE-TECHSTOP-001.
 - `v2/robson-domain/src/value_objects.rs` — `TechnicalStopDistance` implementation
 - `v2/robson-domain/src/entities.rs` — `DetectorSignal` domain type
 - `v2/robsond/src/detector.rs` — current implementation (violates this ADR)
-- `docs/runbooks/val-001-testnet-e2e-validation.md` — blocked on this fix
+- `docs/runbooks/val-001-testnet-e2e-validation.md` — Phase 1 PASS; see Run Log for current Phase 2 status

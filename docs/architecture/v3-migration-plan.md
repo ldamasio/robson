@@ -94,7 +94,7 @@ every reference uses a canonical identifier with a prefix:
 - `QE-P5` is NOT a migration step; it is a deferred QueryEngine phase (Context Governance, v3+ with LLM).
 - `Stage N` is a pipeline stage within a single execution tick (e.g., Stage 1: Observe). Not a project milestone.
 
-**Quick status reference** (as of 2026-04-11, repository-verified):
+**Quick status reference** (as of 2026-04-18, repository-verified):
 
 Status rule for this table: code-backed items may be marked done from repository evidence; operational rollout items stay pending unless the repository contains explicit rollout confirmation.
 
@@ -125,7 +125,7 @@ Status rule for this table: code-backed items may be marked done from repository
 | QE-P3 | Approval Gates | ✅ Done (2026-04-05) |
 | QE-P4 | Full Audit & Replay | ✅ Done (2026-04-05) |
 | QE-P5 | Context Governance (LLM) | Deferred (v3+) |
-| VAL-001 | Testnet E2E validation (arm → signal → fill → trailing stop → exit) | **Blocked on TechnicalStopAnalyzer implementation** — see ADR-0021 and [docs/runbooks/val-001-testnet-e2e-validation.md](../runbooks/val-001-testnet-e2e-validation.md) |
+| VAL-001 | Testnet E2E validation (arm → signal → fill → trailing stop → exit) | Phase 1 PASS (2026-04-16) / Phase 2 blocked on exposure limits — `TechnicalStopAnalyzer` implemented (ADR-0021 ✅); RiskGate correctly denying entry because testnet capital produces notional above 30% exposure limit. See [runbooks/val-001-testnet-e2e-validation.md](../runbooks/val-001-testnet-e2e-validation.md) Run Log |
 | VAL-002 | Real capital activation (Binance real keys + monitor enabled in prod) | Pending — blocked on VAL-001 PASS |
 
 ### MIG-v2.5#2 Technical Notes (2026-04-05, validated 2026-04-10)
