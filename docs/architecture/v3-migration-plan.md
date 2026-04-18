@@ -118,6 +118,8 @@ Status rule for this table: code-backed items may be marked done from repository
 | MIG-v3#6 | Hash-chained EventLog | Pending |
 | MIG-v3#7 | PaymentRail trait | Pending |
 | MIG-v3#8 | Chaos testing suite | Pending |
+| MIG-v3#9 | Position Reconciliation Worker (ADR-0022 — Robson-authored position invariant) | Pending — follow-up from ADR-0022; scans every account type and every symbol; closes UNTRACKED positions |
+| MIG-v3#10 | Symbol-agnostic documentation + test sweep (ADR-0023) | Pending — follow-up from ADR-0023; rewrite symbol-coupled docs, parameterize risk tests across ≥2 symbols |
 | QE-P1 | Passive Wrapper (Non-Breaking) | ✅ Done |
 | QE-P2 | Blocking Governance | ✅ Done (2026-04-04) |
 | QE-P3 | Approval Gates | ✅ Done (2026-04-05) |

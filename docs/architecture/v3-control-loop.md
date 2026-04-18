@@ -14,6 +14,20 @@ The Control Loop is the heartbeat of Robson. It is the single execution path thr
 Observe -> Interpret -> Decide -> Act -> Evaluate -> Persist
 ```
 
+### Governing Invariants
+
+This Control Loop operates under two additional non-negotiable invariants that apply
+independently of which stage is executing:
+
+- **Robson-authored position invariant** — every open position on the operated
+  Binance account MUST trace to a `robsond`-authored entry; UNTRACKED positions are
+  closed by the reconciliation worker (see
+  [ADR-0022](../adr/ADR-0022-robson-authored-position-invariant.md)).
+- **Symbol-agnostic policy invariant** — every stage below treats `symbol` as a
+  variable. Rules apply uniformly to every configured pair. Examples naming
+  `BTCUSDT` below are illustrative only (see
+  [ADR-0023](../adr/ADR-0023-symbol-agnostic-policy-invariant.md)).
+
 ### Implementation: QueryEngine
 
 The Control Loop is implemented by the **QueryEngine** (`robsond/src/query_engine.rs`). Every trigger that enters the Runtime becomes a typed **ExecutionQuery** (`robsond/src/query.rs`) that progresses through the pipeline above. The QueryEngine is the ONLY path to mutate RuntimeState.
@@ -329,15 +343,25 @@ Risk Engine detects threshold breach
 ```
 Runtime restarts (Kubernetes pod restart)
 -> Load RuntimeState from EventLog replay
--> Query Binance for actual position state
--> Compare: EventLog state vs Exchange state
--> If match: resume normal operation
--> If mismatch: 
-   - Adopt exchange state as truth
-   - Persist ReconciliationEvent with discrepancy details
-   - Alert operator
-   - Resume with reconciled state
+-> Enter StartupReconciling state (blocks non-critical observations)
+-> Query Binance for all open positions across every account type and every symbol
+-> For each open position, look up matching `entry_order_placed` event by exchange order id:
+   - Match found → the position is tracked:
+     - If exchange state matches EventLog state: resume
+     - If mismatch: persist ReconciliationEvent, adopt exchange state, alert operator
+   - No match → the position is UNTRACKED (ADR-0022):
+     - Persist `position_untracked_detected`
+     - Alert operator at CRITICAL
+     - Close the position at market via Safety Net (`UNTRACKED_ON_EXCHANGE`)
+     - Persist `untracked_position_closed`
+     - Do NOT reconstruct an `entry_order_placed` event
+-> Exit StartupReconciling only when the UNTRACKED set is empty
+-> Resume normal observation processing
 ```
+
+The startup reconciliation is unconditional and applies to every symbol on the
+account (not just `allowed_symbols`). See
+[UNTRACKED-POSITION-RECONCILIATION policy](../policies/UNTRACKED-POSITION-RECONCILIATION.md).
 
 ---
 

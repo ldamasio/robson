@@ -327,6 +327,57 @@ The intended v3 strengthening is to push this proof to the executor boundary as 
 
 ---
 
+## Robson-Authored Position Invariant
+
+Reference: [ADR-0022](../adr/ADR-0022-robson-authored-position-invariant.md),
+[docs/policies/UNTRACKED-POSITION-RECONCILIATION.md](../policies/UNTRACKED-POSITION-RECONCILIATION.md).
+
+Every open position on the operated Binance account MUST be the direct result of an
+entry authored by `robsond` under a `GovernedAction`. The Zero-Bypass Guarantee above
+covers the **write side** (nothing leaves the Runtime without governance). This
+invariant adds the **read side**: nothing sits on the exchange that did not leave the
+Runtime.
+
+Operationally, the Runtime owns a long-lived **Position Reconciliation Worker** that:
+
+- Scans Binance for open positions across **all account types** (spot, isolated margin,
+  cross margin, futures) and **all symbols** — not gated by `allowed_symbols` and not
+  gated by `ROBSON_POSITION_MONITOR_ENABLED`.
+- Looks up each open position by exchange order id in `event_log`.
+- Classifies positions without a matching `entry_order_placed` event as **UNTRACKED**.
+- Closes UNTRACKED positions at market via the Safety Net close path (exit reason
+  `UNTRACKED_ON_EXCHANGE`) and alerts the operator at severity `CRITICAL`.
+
+Follow-up required (target architecture):
+
+- Exchange-order-id index on `event_log` for O(1) lookup by the reconciliation worker.
+- Dedicated `safety_net` close path for UNTRACKED positions.
+- Startup reconciliation gate: the daemon must enter `StartupReconciling` before
+  accepting observations; new entries blocked until the UNTRACKED set is empty.
+- Operator panic override endpoint (`POST /reconciliation/suspend`, max TTL 300 s).
+
+---
+
+## Symbol-Agnostic Policy Invariant
+
+Reference: [ADR-0023](../adr/ADR-0023-symbol-agnostic-policy-invariant.md),
+[docs/policies/SYMBOL-AGNOSTIC-POLICIES.md](../policies/SYMBOL-AGNOSTIC-POLICIES.md).
+
+The Runtime treats **symbol as a variable**, not as a fixed parameter. Every rule in
+this specification applies to every trading pair the operator configures.
+`allowed_symbols` in `RuntimeConfig` is a **scope selector** (which symbols are
+currently active) — it is not a policy exception.
+
+Symbol-specific constants (tick size, lot step, minimum notional, max leverage, fee
+rate) are loaded from `ExchangePort::exchange_info()` at runtime and cached per
+symbol. They MUST NOT appear as numeric literals in this specification or any
+component spec.
+
+Examples in this document that use `BTCUSDT` are illustrative. Replace with
+`{symbol}` when reading the specification abstractly.
+
+---
+
 ## Model Agnosticism
 
 The Runtime has ZERO coupling to any specific LLM:
@@ -429,9 +480,41 @@ projection_reconciliation_interval_s = 300
 
 ### Scenario 4: State Corruption (Detected via Reconciliation)
 
-1. Periodic reconciliation detects mismatch between RuntimeState and exchange
-2. Persist `StateCorruptionDetected` event with full diff
-3. Adopt exchange state as truth (exchange is the real world)
-4. Rebuild RuntimeState from EventLog + exchange reconciliation
-5. Alert operator with details
-6. If corruption source is identifiable (e.g., missed fill event): log as `MissedEvent` for investigation
+1. Periodic reconciliation detects mismatch between RuntimeState and exchange for a
+   position that IS tracked in `event_log` (e.g., a missed fill, a slippage outside
+   tolerance).
+2. Persist `StateCorruptionDetected` event with full diff.
+3. For **tracked** positions: adopt exchange state as truth (exchange is the real
+   world), rebuild RuntimeState from EventLog + exchange reconciliation.
+4. Alert operator with details.
+5. If corruption source is identifiable (e.g., missed fill event): log as
+   `MissedEvent` for investigation.
+
+**Important**: adoption applies ONLY to positions whose entry is already recorded in
+`event_log` with a matching exchange order id. A position without a matching
+`entry_order_placed` event is UNTRACKED and handled by Scenario 5 — not by adoption.
+Back-filling an `entry_order_placed` event for an UNTRACKED position is a policy
+violation (ADR-0022).
+
+### Scenario 5: UNTRACKED Position Detected
+
+Triggered when the Position Reconciliation Worker finds an open exchange position
+for which no matching `entry_order_placed` event exists in `event_log`. See
+[ADR-0022](../adr/ADR-0022-robson-authored-position-invariant.md) and
+[docs/policies/UNTRACKED-POSITION-RECONCILIATION.md](../policies/UNTRACKED-POSITION-RECONCILIATION.md).
+
+1. Persist `position_untracked_detected` with evidence: exchange order id, symbol,
+   side, quantity, open timestamp.
+2. Emit a CRITICAL operator alert.
+3. Close the position at market via the Safety Net close path, tagged exit reason
+   `UNTRACKED_ON_EXCHANGE`.
+4. Persist `untracked_position_closed` with the resulting fill.
+5. Do NOT reconstruct an `entry_order_placed` event. Do NOT adopt the position into
+   RuntimeState before closing it.
+
+This path is unconditional — not gated by `ROBSON_POSITION_MONITOR_ENABLED` or
+`allowed_symbols`. The only permitted override is an operator-issued
+`POST /reconciliation/suspend` (max TTL 300 s, fully audited — v3 target).
+
+At daemon startup, the Runtime MUST enter `StartupReconciling` and resolve all
+UNTRACKED positions before accepting non-critical observations.

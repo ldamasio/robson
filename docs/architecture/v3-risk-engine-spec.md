@@ -13,6 +13,25 @@ It is a mandatory blocking gate. No action proceeds without Risk Engine clearanc
 
 ---
 
+## Governing Invariants
+
+The rules below are stated symbol-agnostically by design. A Risk Engine rule that
+hard-codes a specific symbol is a violation of
+[ADR-0023](../adr/ADR-0023-symbol-agnostic-policy-invariant.md). `symbol` is always a
+variable; tick size, lot step, min notional, max leverage, and fee rate come from
+`ExchangePort::exchange_info()` at runtime.
+
+The Risk Engine is also the downstream half of the **Robson-authored position
+invariant** ([ADR-0022](../adr/ADR-0022-robson-authored-position-invariant.md)). The
+write side (every entry must pass this engine) is unchanged. The read side (every
+open exchange position must correspond to an entry that passed this engine) is
+enforced by the Position Reconciliation Worker documented in the Runtime spec.
+An UNTRACKED position does not pass through the Risk Engine on its way to being
+closed — closing an UNTRACKED position is always permitted (reducing exposure is
+always safe) and is tagged `UNTRACKED_ON_EXCHANGE` in the audit trail.
+
+---
+
 ## v3 Policy Decisions (Closed)
 
 These decisions are final for v3. No alternatives, no overrides, no flexibility.

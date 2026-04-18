@@ -577,3 +577,62 @@ Robson's PnL model is authoritative for **risk gate decisions only**. It is not 
 **Fees deduction**: `build_risk_context()` sums `realized_pnl - fees_paid` from closed positions. MonthlyHalt triggers on net PnL (gross minus fees). At 1% risk per trade with typical 0.04% commission (entry + exit × 10x leverage ≈ 0.8% per cycle in fees), fees are material and correctly accounted for in the drawdown calculation.
 
 **Breaks if wrong**: If fees are material and not deducted, the system may allow more capital loss than the 4% policy intends. Conversely, if fees are double-counted in a future correction, MonthlyHalt could trigger prematurely. Fix must be validated with real exchange data.
+
+---
+
+### ADR-v3-025: Robson-Authored Position Invariant
+
+**Date**: 2026-04-18
+**Status**: DECIDED — FOLLOW-UP REQUIRED (reconciliation worker + close path are target architecture)
+
+**Context**: Nothing in the prior architecture prevented an open position from existing on the Robson-operated Binance account without a matching `entry_order_placed` event in `event_log`. Such a position could arise from manual operator orders via the Binance UI, a leaked API key, a legacy service writing orders without event-log persistence, or a partial deploy. Each such position silently consumes the account's risk budget without passing the Risk Engine, has no technical stop, has no span, and is invisible to the monthly drawdown calculation.
+
+**Decision**: Every open position on the operated Binance account MUST be the direct result of an entry authored by `robsond` through a `GovernedAction`. A position without a matching `entry_order_placed` event (by exchange order id) is **UNTRACKED** and MUST be closed.
+
+**Enforcement**:
+- **Write side** (already in place): `QueryEngine` produces a `GovernedAction` before every entry; the entry is recorded with `cycle_id` in `event_log`.
+- **Read side** (follow-up): a long-lived **Position Reconciliation Worker** inside `robsond` scans every open position across every account type (spot, isolated margin, cross margin, futures) and every symbol, looks up each by exchange order id, and closes any whose entry is not in `event_log` via a dedicated Safety Net close path (`UNTRACKED_ON_EXCHANGE`).
+- **Startup gate**: daemon enters `StartupReconciling` before accepting observations; exits only when UNTRACKED set is empty.
+- **Unconditional**: not gated by `ROBSON_POSITION_MONITOR_ENABLED` or `allowed_symbols`. Only permitted override: operator-issued `POST /reconciliation/suspend` with max TTL 300 s, fully audited (v3 target).
+
+**Rejected**:
+- Adopting UNTRACKED positions into the Runtime (whitewashes policy breaches, creates retroactive "governance" for trades that never passed risk evaluation).
+- Advisory-only detection (under leverage, seconds matter).
+- Gating the worker behind `ROBSON_POSITION_MONITOR_ENABLED` (that flag gates trailing-stop management for tracked positions; UNTRACKED closure is a different concern).
+
+**Rationale**: The Risk Engine's guarantees hold end-to-end only if no shadow positions exist outside its scope. The reconciliation worker is the read-side complement to the QueryEngine's write-side `GovernedAction` gate. Operator self-discipline ("I won't place manual orders") is not a sufficient safeguard for a leveraged system; the architecture must enforce this against its own operator.
+
+**Breaks if wrong**: A false positive — a legitimate position whose `entry_order_placed` event is missing due to a bug — results in an auto-close of a valid trade. Mitigation: the exchange-order-id ↔ event-log link must be written atomically with order placement. An exchange-order-id index on `event_log` is part of the follow-up work.
+
+**Reversibility**: Fully reversible. Disabling the reconciliation worker restores the prior permissive state. The policy document and invariant can be unwound if a different governance model is chosen.
+
+**See**: [ADR-0022](../adr/ADR-0022-robson-authored-position-invariant.md) and [docs/policies/UNTRACKED-POSITION-RECONCILIATION.md](../policies/UNTRACKED-POSITION-RECONCILIATION.md).
+
+---
+
+### ADR-v3-026: Symbol-Agnostic Policy Invariant
+
+**Date**: 2026-04-18
+**Status**: DECIDED — FOLLOW-UP REQUIRED (documentation sweep + test parameterization)
+
+**Context**: Robson's history has focused on `BTCUSDT` / `BTCUSDC`, and that focus has leaked into documents, runbooks, prompts, and tests in ways that read as policy. The Risk Engine's core rules (1% per trade, 4% monthly drawdown, Golden Rule, Hand-Span Trailing Stop, Technical Stop Distance) are symbol-neutral by construction, but reader ambiguity arises because every example uses BTC. As the operator plans to trade `ETHUSDT`, `SOLUSDC`, and others, every BTC-anchored assumption becomes a silent source of risk.
+
+**Decision**: Every Robson policy applies to every trading pair the system operates on. A policy statement that narrows to a specific symbol (e.g., "Robson trades BTC/USDT") is non-compliant. Symbol-specific constants (tick size, lot step, min notional, max leverage, fee rate) come from `ExchangePort::exchange_info()` at runtime, never from policy text.
+
+**Three components**:
+1. Rules are stated symbol-agnostically — a rule must read correctly when the symbol is replaced by `{symbol}`.
+2. Symbol constants come from the exchange, not the policy.
+3. Configuration (`allowed_symbols`) selects scope; policy defines rule.
+
+**Rejected**:
+- Per-symbol policy forks (forces code and governance to branch on symbol — both an anti-pattern and a governance hole).
+- Treating BTC-specific docs as "just examples" (ambiguity between example and rule has already caused migration confusion).
+- Scoping the invariant to the Risk Engine only (detector, trailing-stop monitor, reconciliation worker, prompts, and runbooks all participate in governance; a symbol-agnostic engine with a BTC-locked runbook is not symbol-agnostic in practice).
+
+**Rationale**: Correctness of the Risk Engine is a property of the risk model, not of Bitcoin. Making the invariant explicit removes reader ambiguity, unlocks cheap addition of new symbols (configuration change, not documentation refactor), and forces test parameterization that catches accidental symbol-coupling early.
+
+**Breaks if wrong**: If a genuinely symbol-specific policy exception exists (e.g., an exchange-imposed minimum notional that effectively scopes a rule), this invariant forces it to be rewritten symbol-agnostically ("rounded up to the exchange's min notional") rather than encoded as a hard symbol-specific exception. That is the intended behavior — exchange-imposed constants belong to the exchange metadata, not to policy.
+
+**Reversibility**: Fully reversible. A future decision to fork policy per symbol could be added as a new ADR superseding this one.
+
+**See**: [ADR-0023](../adr/ADR-0023-symbol-agnostic-policy-invariant.md) and [docs/policies/SYMBOL-AGNOSTIC-POLICIES.md](../policies/SYMBOL-AGNOSTIC-POLICIES.md).
