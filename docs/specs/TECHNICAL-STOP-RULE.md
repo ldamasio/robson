@@ -110,8 +110,9 @@ def find_second_support(candles_15min, current_price, side="LONG"):
         if len(valid_supports) >= 2:
             return valid_supports[1]
         else:
-            # Fallback: use default 2% stop if insufficient data
-            return current_price * 0.98
+            # Fallback: use ATR-derived chart structure if insufficient
+            # swing levels are available. Never use a fixed percentage stop.
+            return current_price - (atr(candles_15min, period=14) * 1.5)
 
     else:  # SHORT
         # Find resistances (local maxima where price bounced down)
@@ -127,8 +128,9 @@ def find_second_support(candles_15min, current_price, side="LONG"):
         if len(valid_resistances) >= 2:
             return valid_resistances[1]
         else:
-            # Fallback: use default 2% stop if insufficient data
-            return current_price * 1.02
+            # Fallback: use ATR-derived chart structure if insufficient
+            # swing levels are available. Never use a fixed percentage stop.
+            return current_price + (atr(candles_15min, period=14) * 1.5)
 ```
 
 ## Implementation Strategy
@@ -145,7 +147,7 @@ def find_second_support(candles_15min, current_price, side="LONG"):
 
 ### Phase 3: Updated Position Size Calculator
 - [ ] Modify `PositionSizeCalculator` to accept technical stop as input
-- [ ] Remove default 2% stop (must use technical stop)
+- [ ] Remove fixed percentage stops (must use chart-derived technical stop)
 
 ### Phase 4: API Endpoints
 - [ ] `POST /api/trade/calculate-entry/` - Calculate stop + position size
@@ -186,7 +188,7 @@ def find_second_support(candles_15min, current_price, side="LONG"):
 
 ---
 
-**Status**: Pending implementation
+**Status**: Implemented in the Rust v2 runtime via `TechnicalStopAnalyzer`; legacy application surfaces may still require alignment.
 **Priority**: HIGH - Blocks new trading operations
 **Owner**: Development team
 **Related**: ADR-0007 (to be created)

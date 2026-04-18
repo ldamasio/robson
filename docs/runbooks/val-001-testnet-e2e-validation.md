@@ -11,9 +11,10 @@
 | Date | Executor | Result | Notes |
 |------|----------|--------|-------|
 | 2026-04-15 | Codex | **READY** | Detector now computes chart-derived stops via `TechnicalStopAnalyzer`; verified with `cargo test --all` and `cargo check --all-targets` |
-| 2026-04-16 | GLM+Codex | **Phase 1 PASS / Phase 2 inconclusive** | ARM fix deployed (sha-5db3daad, 377 tests). Phase 1: `position_armed` confirmed, `tech_stop_distance: null`. Phase 2: detector fired (MA crossover, chart stop $73,825.27), but Risk Engine correctly blocked entry — exposure $87 > 30% of capital $100 ($30 limit). Fix: ARM with `capital: "300"` next run. Position disarmed cleanly. |
+| 2026-04-16 | GLM+Codex | **Phase 1 PASS / Phase 2 inconclusive** | ARM fix deployed (sha-5db3daad, 377 tests). Phase 1: `position_armed` confirmed, `tech_stop_distance: null`. Phase 2: detector fired (MA crossover, chart stop $73,825.27), but Risk Engine correctly blocked entry — exposure $87 > 30% of capital $100 ($30 limit). Position disarmed cleanly. |
+| 2026-04-18 | GLM+Codex | **Phase 2 blocked by RiskGate** | Testnet Binance secret was sanitized and invalid testnet key was rotated. Detector emitted chart-derived BTCUSDT signals, but RiskGate correctly denied entries: current stop distance produced proposed notional around 50-55% of capital, above the 30% total exposure limit (and above the 15% single-position limit). Capital-only retries are not valid because sizing and exposure limits both scale from the same `RiskConfig.capital`. All armed positions were disarmed; final `/status` was clean. |
 
-*VAL-001 Phase 1 PASS. Resume at Phase 2 (detector signal) in next session.*
+*VAL-001 Phase 1 PASS. Phase 2 remains blocked until a detector-provided technical stop produces policy-compliant sizing, or an explicit testnet-only policy change is approved and documented. VAL-002 remains blocked.*
 
 ---
 
@@ -37,6 +38,44 @@ arm → detector signal → fill → trailing stop monitor → exit
 | Position monitor | enabled (`ROBSON_POSITION_MONITOR_ENABLED: "true"`, symbol: `BTCUSDT`) |
 | API access | ClusterIP — `kubectl port-forward` only |
 | Mutating routes | Bearer token required |
+
+---
+
+## Risk And Sizing Notes
+
+VAL-001 must not bypass the Technical Stop Distance policy. The detector must
+derive `stop_loss` from chart analysis; do not inject a percentage stop or
+manually override `tech_stop_distance` to force the test through RiskGate.
+
+Current sizing uses the same operator-supplied capital for both the 1% per-trade
+risk amount and the portfolio exposure limits:
+
+```text
+risk_amount = capital * 1%
+technical_stop_distance = abs(entry_price - detector_stop_loss)
+position_size = risk_amount / technical_stop_distance
+notional_exposure = position_size * entry_price
+max_total_exposure = capital * 30%
+max_single_position = capital * 15%
+```
+
+Because both `notional_exposure` and exposure limits scale with capital,
+increasing `capital` alone does not change the exposure ratio:
+
+```text
+notional_exposure / capital = 1% / technical_stop_distance_pct
+```
+
+With the default limits, a candidate entry requires approximately:
+
+```text
+technical_stop_distance_pct >= 3.33%  # total exposure <= 30%
+technical_stop_distance_pct >= 6.67%  # single position <= 15%
+```
+
+If the detector emits a valid chart-derived stop closer than this, RiskGate must
+deny entry and VAL-001 Phase 2 remains inconclusive/blocked. Do not treat that as
+a daemon failure.
 
 ---
 
