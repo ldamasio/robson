@@ -4,6 +4,25 @@
 
 Robson comes with pre-defined strategies designed for different market conditions. Each strategy has a **playful, memorable name** to make trading more intuitive and less intimidating.
 
+## Symbol Scope (ADR-0023)
+
+Every strategy below is **symbol-agnostic**. Each strategy defines its entry logic,
+trailing-stop behavior, and risk configuration — **not** its symbol scope. The
+operator chooses which symbols a strategy runs on via the strategy's `symbols: [...]`
+configuration field. Strategy documentation may use concrete examples
+(typically `BTCUSDT`) for clarity, but the rules apply unchanged to any pair the
+exchange supports. See
+[SYMBOL-AGNOSTIC-POLICIES.md](policies/SYMBOL-AGNOSTIC-POLICIES.md).
+
+## Position-Authorship Invariant (ADR-0022)
+
+Every entry emitted by these strategies passes through the Risk Engine and is
+recorded with a `GovernedAction` token. Any exchange position on the operated
+account that is not produced by such an entry is UNTRACKED and will be closed by
+the reconciliation worker. Strategies do not create a workaround for this
+invariant — see
+[UNTRACKED-POSITION-RECONCILIATION.md](policies/UNTRACKED-POSITION-RECONCILIATION.md).
+
 ---
 
 ## 🎯 Available Strategies
@@ -287,6 +306,10 @@ Playful names like "Rescue Forces" and "All In":
 - [Technical Stop Documentation](requirements/TECHNICAL-STOP.md)
 - [Risk Management](RISK-MANAGEMENT.md)
 - [Pattern Detection](PATTERN-DETECTION.md)
+- [UNTRACKED-POSITION-RECONCILIATION.md](policies/UNTRACKED-POSITION-RECONCILIATION.md)
+- [SYMBOL-AGNOSTIC-POLICIES.md](policies/SYMBOL-AGNOSTIC-POLICIES.md)
+- [ADR-0022 — Robson-Authored Position Invariant](adr/ADR-0022-robson-authored-position-invariant.md)
+- [ADR-0023 — Symbol-Agnostic Policy Invariant](adr/ADR-0023-symbol-agnostic-policy-invariant.md)
 
 ---
 

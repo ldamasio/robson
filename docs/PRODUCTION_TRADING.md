@@ -11,6 +11,26 @@ After 6+ years of development, Robson is finally ready for production trading! T
 3. P&L tracking and performance monitoring
 4. Multi-tenant credential management
 
+## Non-Negotiable Invariants
+
+Two policy invariants apply to everything in this guide and take precedence over any
+command, endpoint, or example below:
+
+1. **Robson-authored position invariant** (ADR-0022 /
+   [UNTRACKED-POSITION-RECONCILIATION.md](policies/UNTRACKED-POSITION-RECONCILIATION.md)):
+   every open position on the Robson-operated Binance account MUST be the direct
+   result of an entry authored by `robsond` through a `GovernedAction`. Any position
+   without a matching `entry_order_placed` event is UNTRACKED and is closed by the
+   reconciliation worker. Applies to every account type (spot, margin isolated,
+   margin cross, futures) and every symbol. Operators MUST NOT place manual orders
+   on an account whose keys are loaded into `robsond` — use a separate account.
+2. **Symbol-agnostic policy invariant** (ADR-0023 /
+   [SYMBOL-AGNOSTIC-POLICIES.md](policies/SYMBOL-AGNOSTIC-POLICIES.md)): every rule
+   below applies to every trading pair, not just `BTC/USDT` or `BTC/USDC`. Examples
+   that mention BTC are illustrative; substitute the symbol you are operating on.
+   Symbol-specific constants (tick size, lot step, min notional, max leverage) come
+   from exchange metadata at runtime, not from policy text.
+
 ## Configuration
 
 ### Environment Variables
@@ -128,6 +148,14 @@ Response:
 ```
 
 ### Buy BTC (First Production Trade!)
+
+> **Symbol note (ADR-0023)**: the legacy `/api/trade/buy-btc/` and
+> `/api/trade/sell-btc/` endpoints are kept for compatibility with the very first
+> production trade and are symbol-locked to BTC by name. New callers SHOULD use the
+> symbol-agnostic equivalents (`/api/trade/buy/` and `/api/trade/sell/` with an
+> explicit `symbol` parameter). The buy-btc/sell-btc endpoints are legacy adapters,
+> not a policy exception: the underlying risk gates and reconciliation rules are
+> the same for every pair.
 
 Execute a market buy order for BTC:
 
@@ -353,6 +381,14 @@ The system BLOCKS orders that:
 - ❌ Risk more than 1% of capital
 - ❌ Exceed monthly drawdown limit
 - ❌ Skip the PLAN → VALIDATE → EXECUTE workflow
+
+The system also AUTO-CLOSES exchange positions that are UNTRACKED (ADR-0022):
+
+- ❌ Any open position on the operated Binance account without a matching
+  `entry_order_placed` event in `event_log` — closed at market by the
+  reconciliation worker with exit reason `UNTRACKED_ON_EXCHANGE`, and reported as a
+  CRITICAL operator alert. This applies across every account type and every symbol
+  — manual orders placed on the Robson-operated account will be closed.
 
 Use these endpoints for risk-managed trading:
 
