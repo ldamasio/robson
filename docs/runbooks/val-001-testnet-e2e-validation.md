@@ -29,6 +29,22 @@ Validate the complete position lifecycle on `robson-testnet` before enabling rea
 arm → detector signal → fill → trailing stop monitor → exit
 ```
 
+### Symbol selection (ADR-0023 — Symbol-Agnostic Policy)
+
+This runbook is **symbol-agnostic**. The default validation target is `BTCUSDT`
+because tick flow is most reliable there on testnet, but the procedure below applies
+verbatim to any symbol the operator configures in `robsond`. Wherever a command
+contains `BTCUSDT`, treat the value as a placeholder: export `SYMBOL=BTCUSDT` (or
+your target) and substitute as needed. Before promoting a new pair to production,
+VAL-001 MUST be re-executed with that pair (follow-up required per ADR-0023).
+
+### Position-authorship invariant (ADR-0022)
+
+Throughout this runbook, the **Robson-authored position invariant** applies: every
+open exchange position on the testnet account must trace to a `robsond`-authored
+entry. Any UNTRACKED position detected at any phase is a P0 abort condition. See
+prerequisite **P7** and [UNTRACKED-POSITION-RECONCILIATION.md](../policies/UNTRACKED-POSITION-RECONCILIATION.md).
+
 **Environment facts** (repository-verified, 2026-04-15):
 
 | Key | Value |
@@ -88,9 +104,10 @@ a daemon failure.
 | P1 | Pod running | `kubectl get pods -n robson-testnet` | `1/1 Running`, 0 restarts |
 | P2 | ArgoCD Synced/Healthy | `kubectl get app robson-testnet -n argocd -o jsonpath='{.status.sync.status} {.status.health.status}'` | `Synced Healthy` |
 | P3 | DB migrations applied | `kubectl logs -n robson-testnet deploy/robsond --since=10m \| grep -i migrat` | No migration errors |
-| P4 | BTCUSDT ticks flowing | `kubectl logs -n robson-testnet deploy/robsond --since=2m \| grep -iE "tick\|btcusdt\|market_data"` | Tick events visible |
+| P4 | Symbol-under-test ticks flowing | `kubectl logs -n robson-testnet deploy/robsond --since=2m \| grep -iE "tick\|market_data\|$SYMBOL"` | Tick events visible for the symbol under validation (default example: `BTCUSDT`; any configured pair is acceptable per ADR-0023) |
 | P5 | Clean state (no open positions) | `curl http://localhost:8080/status` (after port-forward) | `"active_positions": 0` |
 | P6 | API token available | `kubectl get secret -n robson-testnet robsond-testnet-secret -o jsonpath='{.data.api-token}' \| base64 -d` | Non-empty string |
+| P7 | No UNTRACKED exchange positions (ADR-0022) | Query Binance testnet account for ALL open positions/balances across ALL account types and symbols; cross-check against `event_log` `entry_order_placed` by exchange order id | Zero UNTRACKED positions. Any position without a matching event is a P0 block — close it before proceeding (see [UNTRACKED-POSITION-RECONCILIATION.md](../policies/UNTRACKED-POSITION-RECONCILIATION.md)) |
 
 **Setup**:
 ```bash
@@ -308,13 +325,14 @@ ORDER BY sequence;
 
 ## Validation Checklist
 
-Complete after Phase 5. All 5 items required for PASS.
+Complete after Phase 5. All 6 items required for PASS.
 
 - [ ] **Full event sequence**: all 7+ events (`position_armed` → `position_closed`) present in correct order
 - [ ] **Governance proof**: every `entry_order_placed` and `exit_order_placed` has a `cycle_id` in payload (GovernedAction token — Risk Engine not bypassed)
 - [ ] **PnL calculated**: `position_closed` event has `pnl` field with a numeric value
 - [ ] **Zero critical errors**: no `ERROR` or `PANIC` in daemon logs during the cycle
 - [ ] **Clean state**: `GET /status` returns `"active_positions": 0` after exit
+- [ ] **Zero UNTRACKED positions** (ADR-0022): a post-exit scan of all testnet account types and symbols shows no open exchange position without a matching `entry_order_placed` event
 
 **Result**: record PASS or FAIL with notes in the Run Log at the top of this document.
 
@@ -328,6 +346,9 @@ Stop immediately and do not proceed to VAL-002 if:
 - Risk Engine is bypassed (order placed without `cycle_id` in EventLog)
 - Daemon crashes (pod restarts) during the cycle
 - Exit order fails and position remains open on exchange after cleanup
+- An UNTRACKED position is detected at any point (ADR-0022): an open exchange
+  position on any symbol or account type with no matching `entry_order_placed`
+  event. Close it immediately and investigate the root cause before retrying.
 
 **Abort procedure**:
 ```bash

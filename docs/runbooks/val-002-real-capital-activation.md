@@ -98,7 +98,7 @@ No production configuration routes robsond to testnet.binance.vision.
 
 ### Safety Checks Before Flip
 
-Before enabling the production position monitor, verify the production namespace has no open Robson lifecycle positions.
+Before enabling the production position monitor, verify the production namespace has no open Robson lifecycle positions AND that the real Binance production account holds no UNTRACKED positions (ADR-0022 — Robson-authored position invariant).
 
 **Command**:
 ```bash
@@ -119,13 +119,31 @@ kubectl exec -n robson "$PARADEDB_POD" -- psql -U robson -d robson -c \
   "SELECT position_id, symbol, side, state FROM positions_current WHERE state IN ('armed', 'entering', 'active', 'exiting') ORDER BY updated_at DESC;"
 ```
 
+Then enumerate every open position on the real Binance production account across
+every account type (spot, isolated margin, cross margin, futures) and every symbol.
+Cross-check each exchange order id against `event_log` `entry_order_placed`:
+
+```bash
+# All non-zero balances (spot + margin) on the operator's Binance account
+# All non-zero positions on futures
+# ... (use the binance-cli / private tooling available to the operator)
+# For each open position, verify an entry_order_placed event exists with a
+# matching exchange order id in event_log.
+```
+
 **Expected Output**:
 ```text
 /status reports active_positions = 0.
 The positions_current query returns 0 rows.
+Zero UNTRACKED positions on the Binance production account.
 ```
 
-**If this fails**: do not enable the monitor. Close or reconcile open positions first and repeat the safety checks.
+**If this fails**: do not enable the monitor. Any UNTRACKED position on the
+production Binance account is a P0 block — close it and investigate how it was
+opened (was a credential leaked? was a manual order placed on a Robson-operated
+account? is a legacy service still active?). See
+[UNTRACKED-POSITION-RECONCILIATION.md](../policies/UNTRACKED-POSITION-RECONCILIATION.md).
+Repeat the safety checks after the account is clean.
 
 ### Step 4: Enable Production Position Monitor Via GitOps
 
@@ -162,10 +180,12 @@ Verify the activation succeeded:
 - [ ] Ansible secret refresh completed successfully from `rbx-infra/bootstrap/ansible/`.
 - [ ] Production daemon logs indicate `api.binance.com`, not `testnet.binance.vision`.
 - [ ] Safety checks before flip showed `active_positions = 0` and no open rows in `positions_current`.
+- [ ] **Zero UNTRACKED positions on the production Binance account** (ADR-0022): every open exchange position across all account types and all symbols has a matching `entry_order_placed` event, OR the account is empty.
 - [ ] ArgoCD `robson-prod` is `Synced Healthy`.
 - [ ] Production ConfigMap has `ROBSON_POSITION_MONITOR_ENABLED: "true"`.
 - [ ] Production daemon pod is Running after the GitOps sync.
 - [ ] No unexpected Safety Net exit or panic events appear after monitor activation.
+- [ ] No `position_untracked_detected` events are emitted in the first 10 minutes of operation.
 
 **Command**:
 ```bash
@@ -185,6 +205,7 @@ Stop immediately and rollback if any of these occur:
 - Real Binance credentials cannot be verified in `pass`.
 - Ansible secret refresh fails or writes the wrong credential source.
 - Safety checks show any `armed`, `entering`, `active`, or `exiting` production positions before the monitor flip.
+- **Any UNTRACKED position is found on the production Binance account** (ADR-0022): an open exchange position on any symbol or account type with no matching `entry_order_placed` event. Do not proceed until the account is clean and the root cause is identified.
 - ArgoCD sync is degraded after the monitor change.
 - The monitor emits unexpected Safety Net exit or panic events immediately after activation.
 
