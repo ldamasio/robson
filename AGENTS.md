@@ -36,6 +36,18 @@ The repository currently contains two major realities:
 7. **Opportunity detection (WHEN to enter) and Technical Stop Analysis (WHERE the stop
    is) are architecturally separate responsibilities** and must never be conflated in a
    single component. See ADR-0021.
+8. **Robson-authored position invariant.** Every open position on the operated Binance
+   account MUST be the direct result of an entry authored by `robsond` through a
+   `GovernedAction`. Any open position that is not traceable to a `robsond`-authored
+   entry is UNTRACKED and MUST be closed by the reconciliation worker. Applies to every
+   account type (spot, margin, futures) and every symbol. See ADR-0022 and
+   `docs/policies/UNTRACKED-POSITION-RECONCILIATION.md`.
+9. **Symbol-agnostic policy invariant.** Every Robson policy applies to every trading
+   pair. A rule that hard-codes a symbol (e.g., "Robson trades BTC/USDT") is
+   non-compliant; symbols appear only as labeled examples or as operator-configured
+   values. Symbol-specific constants (tick size, lot step, min notional, max leverage,
+   fee rate) come from exchange metadata at runtime, never from policy text. See
+   ADR-0023 and `docs/policies/SYMBOL-AGNOSTIC-POLICIES.md`.
 
 ## Canonical Planning Vocabulary
 
