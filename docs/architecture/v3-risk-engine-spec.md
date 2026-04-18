@@ -1,7 +1,7 @@
 # ROBSON v3 — RISK ENGINE SPECIFICATION
 
 **Date**: 2026-04-11
-**Status**: APPROVED (revised — replaces previous spec with L1–L4 escalation)
+**Status**: APPROVED (revised — replaces the previous L1–L4 escalation design with binary MonthlyHalt)
 **Classification**: CRITICAL PATH — Financial Safety Component
 
 ---

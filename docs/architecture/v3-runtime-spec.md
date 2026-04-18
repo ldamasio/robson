@@ -338,6 +338,14 @@ covers the **write side** (nothing leaves the Runtime without governance). This
 invariant adds the **read side**: nothing sits on the exchange that did not leave the
 Runtime.
 
+> **TARGET ARCHITECTURE — FOLLOW-UP REQUIRED (MIG-v3#9)**: The Position Reconciliation
+> Worker described below is not yet implemented. Current startup recovery restores
+> positions from EventLog replay + projection but does NOT scan for UNTRACKED positions.
+> The Safety Net monitors for rogue positions but does not implement the ADR-0022
+> classification flow. Until MIG-v3#9 is complete, the operator must manually verify
+> that the Binance account holds no externally-opened positions before and after daemon
+> restarts.
+
 Operationally, the Runtime owns a long-lived **Position Reconciliation Worker** that:
 
 - Scans Binance for open positions across **all account types** (spot, isolated margin,
@@ -497,6 +505,10 @@ Back-filling an `entry_order_placed` event for an UNTRACKED position is a policy
 violation (ADR-0022).
 
 ### Scenario 5: UNTRACKED Position Detected
+
+> **TARGET ARCHITECTURE — FOLLOW-UP REQUIRED (MIG-v3#9)**: This scenario is not yet
+> implemented. The reconciliation worker, `StartupReconciling` state, and
+> `position_untracked_detected` event type do not exist in the current codebase.
 
 Triggered when the Position Reconciliation Worker finds an open exchange position
 for which no matching `entry_order_placed` event exists in `event_log`. See

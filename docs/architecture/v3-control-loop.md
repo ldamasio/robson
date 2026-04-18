@@ -347,6 +347,13 @@ Risk Engine detects threshold breach
 
 ### Crash Recovery
 
+> **TARGET ARCHITECTURE — FOLLOW-UP REQUIRED (MIG-v3#9)**: The UNTRACKED position
+> scanning and `StartupReconciling` state described below are not yet implemented.
+> Current crash recovery restores from EventLog replay + projection, which correctly
+> recovers tracked positions but does NOT detect positions opened outside `robsond`.
+> Until MIG-v3#9 is complete, the operator must manually verify the Binance account
+> is clean before and after daemon restarts.
+
 ```
 Runtime restarts (Kubernetes pod restart)
 -> Load RuntimeState from EventLog replay
@@ -393,7 +400,7 @@ robson_cycles_total{trigger_type}           # Counter: total cycles by trigger
 robson_cycle_duration_ms{stage}             # Histogram: duration per stage
 robson_queue_depth                          # Gauge: current observation queue depth
 robson_risk_decisions_total{verdict}        # Counter: approved/denied
-robson_circuit_breaker_state                # Gauge: 0=closed, 1=open, 2=half_open
+robson_circuit_breaker_state                # Gauge: 0=active, 1=monthly_halt
 robson_positions_active                     # Gauge: active positions count
 robson_eventlog_sequence                    # Gauge: latest event sequence number
 ```

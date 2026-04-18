@@ -104,7 +104,7 @@ Status rule for this table: code-backed items may be marked done from repository
 | MIG-v2.5#2 | Complete projector handlers + runtime persistence | ✅ Done (2026-04-10) — migrations 000–007 applied, pool connected, projection recovery working |
 | MIG-v2.5#3 | Migrate stop monitoring to WebSocket | ✅ Done (2026-04-10) — reconnect loop + DB startup retry |
 | MIG-v2.5#4 | GovernedAction + Risk Engine blocking gate | ✅ Done (2026-04-04) |
-| MIG-v2.5#5 | Circuit breaker escalation ladder | ✅ Done (2026-04-10) |
+| MIG-v2.5#5 | Binary MonthlyHalt circuit breaker | ✅ Done (2026-04-10) |
 | MIG-v2.5#6 | SSE endpoint for frontend | ✅ Done (2026-04-05) |
 | MIG-v2.5#7 | SOPS secrets management | ✅ Done (2026-04-10) |
 | MIG-v2.5#8 | Deploy Prometheus + Grafana + Loki | ✅ Done (2026-04-10) — manifests+ArgoCD; pending cluster sync |
@@ -638,7 +638,7 @@ interface EventStreamMessage {
 - Active positions with current P&L, trailing stop level, distance to stop
 - Risk snapshot: current exposure, daily P&L, drawdown, limits headroom
 - System health: daemon uptime, WebSocket connection status, last cycle timestamp
-- Circuit breaker status: CLOSED (green), OPEN (red), HALF_OPEN (yellow)
+- Circuit breaker status: Active (green), MonthlyHalt (red)
 
 **On-demand** (expandable panels):
 - Event stream (filterable by type, position, time range)
@@ -651,11 +651,11 @@ interface EventStreamMessage {
 | Scenario | UI Behavior | Automated Failsafe |
 |----------|------------|-------------------|
 | SSE stream drops | Yellow banner: "Connection lost, reconnecting..." Auto-retry with exponential backoff (1s, 2s, 4s, max 30s) | None needed — Runtime continues independently |
-| SSE drops during risk event | Red banner: "CONNECTION LOST DURING RISK EVENT — MANUAL CHECK REQUIRED" | If operator unreachable for >5 min during active circuit breaker: Runtime automatically escalates to Level 2 (reduce exposure) |
+| SSE drops during risk event | Red banner: "CONNECTION LOST DURING RISK EVENT — MANUAL CHECK REQUIRED" | MonthlyHalt activates on 4% drawdown regardless of operator reachability. No escalation levels — system halts until next calendar month or process restart. |
 | WebSocket disconnect (market data) | "Market data delayed" indicator. Prices shown from last known value with stale timestamp | Runtime falls back to REST polling (1s interval) for price data |
 | Full backend unreachable | "System Offline" screen with last known state cached in browser localStorage | Runtime continues operating on k8s. Operator can use CLI as fallback |
 
-**Automated failsafe when operator unreachable**: If a risk event (circuit breaker Level 1+) fires and no operator acknowledgment within 5 minutes (no SSE heartbeat from frontend, no CLI command), Runtime escalates one level automatically: L1->L2 (reduce exposure), L2->L3 (close all), L3->L4 (halt + alert via external webhook to operator's phone).
+**Automated failsafe when operator unreachable**: If monthly drawdown reaches 4%, MonthlyHalt activates automatically — closes all positions and blocks new entries. No escalation levels. System remains halted until next calendar month or process restart. Operator should monitor via CLI or phone webhook alerts. Kubernetes restarts the pod on liveness failure.
 
 ---
 
@@ -693,14 +693,18 @@ The Risk Engine is a mandatory gate in the control loop. Every `EngineAction` pa
 2. **Before Act**: Specific action validation — does THIS action violate any limit?
 3. **After Evaluate**: Post-check — did the completed action push any metric close to a limit? (early warning)
 
-### Circuit Breaker Escalation Ladder
+### Circuit Breaker — Binary MonthlyHalt
 
-| Level | Trigger | Action | Auto-Escalation |
-|-------|---------|--------|-----------------|
-| **L1: Block New** | Daily loss > 2% OR single position loss approaching 1% | Block new entry orders. Existing positions continue with trailing stops. | Escalate to L2 after 30 min without operator ack |
-| **L2: Reduce** | Daily loss > 3% OR max drawdown > 3% | Close 50% of exposure (largest positions first). Block all new orders. | Escalate to L3 after 15 min without operator ack |
-| **L3: Close All** | Daily loss > 4% OR any single position loss > 1.5% OR operator unreachable for 45 min during L1/L2 | Emergency close ALL positions at market. System enters L4. | Immediate |
-| **L4: Halt** | After L3 execution OR operator `panic` command | System halted. No cycles run. Full audit dump generated. | Requires manual operator reset with typed confirmation |
+> **Note (2026-04-18)**: The L1–L4 escalation ladder described in earlier revisions
+> has been **replaced by a binary MonthlyHalt** per `docs/architecture/v3-risk-engine-spec.md`
+> §"What v3 Does NOT Include". The implementation in `v2/robsond/src/circuit_breaker.rs`
+> is binary: `Active ⟷ MonthlyHalt`. There are no escalation levels, no auto-escalation
+> timers, and no Half-Open recovery state. See the risk engine spec for the authoritative
+> policy. The table below is retained for historical reference only.
+
+| Level | Trigger | Action | Status |
+|-------|---------|--------|--------|
+| **MonthlyHalt** | Monthly drawdown ≥ 4% OR operator `POST /monthly-halt` | Close all positions immediately. Block all new entries. System halts until next calendar month or process restart. | **Implemented** (binary — replaces L1–L4) |
 
 ### Hard Limits (v2.5)
 
@@ -714,7 +718,7 @@ The Risk Engine is a mandatory gate in the control loop. Every `EngineAction` pa
 | Max execution frequency | 10 orders/minute | Yes | NO — rate limit |
 | Max slippage | 5% per order | Yes | NO — order rejected |
 
-### Dynamic Limits (v3)
+### Dynamic Limits (v3 — DEFERRED)
 
 | Dynamic Input | Effect on Limits | Fallback |
 |--------------|-----------------|----------|
@@ -823,7 +827,7 @@ ArgoCD is justified because it is ALREADY DEPLOYED and configured. If starting f
 | jaguar (Postgres) | All data lost if disk fails | Daily pg_dump to S3. WAL archiving for point-in-time recovery. RTO: 1h (restore from backup). RPO: 24h (daily backup) or 5min (with WAL). |
 | tiger (k3s control plane) | Cluster management lost, workloads continue running but no rescheduling | etcd backup daily. Recovery: reinstall k3s, restore etcd, rejoin workers. RTO: 2h. |
 | Binance API | No trading, no market data | Fallback: read-only mode. Positions remain on exchange with their stop orders. No Robson action needed. |
-| Single operator | System needs human for circuit breaker reset, risk overrides | Automated escalation ladder (see Risk Engine). System can self-protect for hours without operator. |
+| Single operator | System needs human for circuit breaker reset, risk overrides | Binary MonthlyHalt (see Risk Engine). System self-protects on 4% drawdown. Operator resets on next calendar month or process restart. |
 
 ### Monitoring Blind Spots
 
@@ -910,7 +914,7 @@ Reconsider TRON integration when ALL of these are true:
 | **Unit** | Domain entities, Engine logic, Risk calculations | `cargo test` (Rust), `pytest` (Django during v2.5) | Every commit | v2 domain+engine: good coverage. v1: decent coverage. |
 | **Integration** | Component interactions, EventLog append/replay, Executor+Exchange | `cargo test --features integration` + testcontainers (Postgres) | Every PR | v2: partial (projector stubs). Needs completion. |
 | **Contract** | API contracts (CLI<->daemon, frontend<->backend), event schemas | JSON Schema validation + OpenAPI spec tests | Every PR | Not yet implemented. **v2.5 priority.** |
-| **Risk Engine** | Threshold behavior, circuit breakers, escalation ladder, edge cases | Dedicated `risk_engine_tests` module with property-based testing | Every PR + nightly | v2: RiskLimits tested. Circuit breaker ladder: NOT YET. **v2.5 priority.** |
+| **Risk Engine** | Threshold behavior, circuit breakers (binary MonthlyHalt), edge cases | Dedicated `risk_engine_tests` module with property-based testing | Every PR + nightly | v2: RiskLimits tested. Binary MonthlyHalt: implemented in `circuit_breaker.rs`. **v2.5 priority.** |
 | **Replay** | EventLog replay produces identical state | Custom harness: insert events, replay, compare state hash | Nightly | v2: basic replay exists. Determinism assertion: NOT YET. **v2.5 priority.** |
 | **Chaos** | Component failures, slow Risk Engine, exchange timeouts | tokio::test with injected delays + mock failures | Weekly / pre-release | NOT YET. **v3 priority.** |
 | **Regulatory** | Audit trail completeness, permission logging, data retention | Custom validators: for each event type, verify all required fields present | Pre-release | NOT YET. **v3 priority.** |
@@ -935,7 +939,7 @@ Reconsider TRON integration when ALL of these are true:
 **Detection**: Property-based testing explores edge cases (zero price, negative funding, max leverage). Nightly replay tests with historical market data detect divergence. Circuit breaker monitoring in production detects unexpected behavior.
 
 **Recovery**: If a bug is found in production:
-1. Activate L4 circuit breaker (halt all activity)
+1. Trigger MonthlyHalt or panic halt (halt all activity)
 2. Export EventLog for the affected period
 3. Identify the bug via replay with instrumentation
 4. Fix, test, deploy via normal CI/CD
@@ -954,7 +958,7 @@ Reconsider TRON integration when ALL of these are true:
 | MIG-v2.5#2 | **Complete projector handlers** (robson-projector, currently 40%) | Without projections, Runtime cannot reconstruct state on restart | MIG-v2.5#1 | M | Yes — code change only | Revert commit | Runtime loses state on restart, requires full EventLog replay every time |
 | MIG-v2.5#3 | **Migrate stop monitoring from Django CronJob to robsond WebSocket** | CronJob has 60s granularity. WebSocket achieves <500ms. This is the core latency improvement. | MIG-v2.5#1, MIG-v2.5#2 | M | Yes — re-enable CronJob | Re-enable `rbs-stop-monitor-cronjob`, disable robsond stop monitor | Stop-loss latency stays at 60s, unacceptable for leveraged trading |
 | MIG-v2.5#4 | **Implement GovernedAction + Risk Engine as blocking gate** | Risk Engine is currently in robson-engine but not wired as mandatory gate. Must block before any v3 feature relies on it. | MIG-v2.5#1 | M | Yes — revert to advisory mode | Config flag: `risk_engine_mode: advisory` | Risk Engine bypass possible, defeating the entire safety architecture |
-| MIG-v2.5#5 | **Implement circuit breaker escalation ladder (L1-L4)** | Without escalation, a single circuit breaker trip halts the system with no graceful degradation | MIG-v2.5#4 | M | Yes — revert to simple halt | Remove escalation, revert to single-level circuit breaker | Operator must manually intervene for every risk event, no automated protection |
+| MIG-v2.5#5 | **Implement binary MonthlyHalt circuit breaker** (replaces L1-L4 escalation) | Without MonthlyHalt, the system has no automated protection against drawdown breaches. L1–L4 escalation was evaluated and rejected in favor of binary MonthlyHalt per v3-risk-engine-spec.md. | MIG-v2.5#4 | M | Yes — revert to simple halt | Remove MonthlyHalt, revert to no automated protection | Operator must manually intervene for every drawdown breach, no automated protection |
 | MIG-v2.5#6 | **Add SSE endpoint to robsond for frontend event streaming** — ✅ DONE 2026-04-05 | Frontend needs real-time data from daemon, not Django polling | MIG-v2.5#1 | S | Yes — frontend falls back to REST polling | Remove SSE route, frontend uses REST | Frontend has no real-time capability, operator flies blind |
 | MIG-v2.5#7 | **Implement SOPS for secrets management** | Current secrets are K8s secrets (base64, not encrypted at rest in git). SOPS encrypts in git. | None | S | Yes — revert to plain K8s secrets | Remove .sops.yaml, restore template secrets | Secrets remain unencrypted in git templates (security risk) |
 | MIG-v2.5#8 | **Deploy Prometheus + Grafana + Loki on k3s** | Observability is non-negotiable before v3. Cannot debug production issues without metrics/logs. | k3s cluster (exists) | M | Yes — undeploy | `kubectl delete namespace monitoring` | Flying blind in production. Debugging via `kubectl logs` only. |
@@ -1005,7 +1009,7 @@ Reconsider TRON integration when ALL of these are true:
 |---|------|-----------|--------|------------|-------|
 | 1 | **Risk Engine bug allows trade exceeding limits** | Low | Critical (financial loss) | 100% branch coverage, property-based testing, circuit breaker as independent safety net, Safety Net monitors exchange directly | Leandro (architect + operator) |
 | 2 | **Rust daemon instability in production** (memory leak, panic, deadlock) | Medium | High (system downtime) | Deploy alongside Django first (v2.5), monitor for 2+ weeks before promoting. Kubernetes auto-restart on liveness failure. | Leandro |
-| 3 | **Single-operator bus factor** | High | Critical (system unmaintained if operator unavailable) | Automated escalation ladder (L1->L4). System self-protects for hours. Documentation sufficient for another engineer to operate. | Leandro |
+| 3 | **Single-operator bus factor** | High | Critical (system unmaintained if operator unavailable) | Binary MonthlyHalt self-protects on 4% drawdown. K8s restarts pod on liveness failure. Documentation sufficient for another engineer to operate. Manual runbooks for circuit breaker reset and position verification. | Leandro |
 | 4 | **Binance API changes break connectors** | Medium | High (trading halted) | Pin Binance API version, monitor deprecation notices. REST+WS fallback pattern. Connector is isolated behind trait — swap implementation without changing Runtime. | Leandro |
 | 5 | **FINMA regulatory surprise** (own-account trading with AI requires licensing) | Low | High (must halt operations or obtain license) | Legal opinion deferred to backlog (operator decision 2026-04-15). Own-account, no third parties — low risk in current configuration. Obtain legal opinion when operationally convenient. If licensing ever required, evaluate FinTech license (CHF 30K+ setup). | Leandro + legal counsel |
 
@@ -1017,11 +1021,10 @@ Reconsider TRON integration when ALL of these are true:
 
 The repository already shows `MIG-v2.5#4`, `MIG-v2.5#6`, `MIG-v2.5#10`, and `QE-P1` through `QE-P4` implemented. The next actions should stay inside the pending `MIG-v2.5` items:
 
-1. **MIG-v2.5#1 — Operational rollout of robsond to k3s**: create the production overlay, deploy the daemon, and verify `healthz`/`readyz` under the real namespace.
-2. **MIG-v2.5#2 — Complete projector handlers**: close the projection/recovery gaps so restart semantics match the real runtime event flow.
-3. **MIG-v2.5#3 — Migrate stop monitoring to robsond WebSocket**: only after `MIG-v2.5#1` and `MIG-v2.5#2` are accepted.
-4. **MIG-v2.5#5 — Implement the circuit breaker escalation ladder**: build on top of the already-implemented blocking gate.
-5. **MIG-v2.5#7, MIG-v2.5#8, MIG-v2.5#9 — Finish the ops baseline**: SOPS, observability, and daemon API contract tests.
+1. **VAL-001 Phase 2 — Unblock and complete testnet E2E validation**: resolve exposure-limit blocker (testnet-only policy exception or wait for wider stops), then validate full lifecycle from entry to exit.
+2. **Entry order identity design (§7 of audit)**: resolve open questions on `exchange_order_id` in domain events — prerequisite for MIG-v3#9.
+3. **MIG-v3#9 — Position Reconciliation Worker**: implement UNTRACKED detection, `StartupReconciling` state, and auto-close via Safety Net. Critical for VAL-002.
+4. **MIG-v3#10 — Symbol-agnostic documentation + test sweep**: parameterize risk tests across ≥2 symbols, remove BTC-coupled assumptions.
 
 ### Explicitly NOT Building Yet
 
