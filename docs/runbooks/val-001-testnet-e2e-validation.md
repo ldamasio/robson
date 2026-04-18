@@ -11,9 +11,9 @@
 | Date | Executor | Result | Notes |
 |------|----------|--------|-------|
 | 2026-04-15 | Codex | **READY** | Detector now computes chart-derived stops via `TechnicalStopAnalyzer`; verified with `cargo test --all` and `cargo check --all-targets` |
+| 2026-04-16 | GLM+Codex | **Phase 1 PASS / Phase 2 inconclusive** | ARM fix deployed (sha-5db3daad, 377 tests). Phase 1: `position_armed` confirmed, `tech_stop_distance: null`. Phase 2: detector fired (MA crossover, chart stop $73,825.27), but Risk Engine correctly blocked entry — exposure $87 > 30% of capital $100 ($30 limit). Fix: ARM with `capital: "300"` next run. Position disarmed cleanly. |
 
-*VAL-001 is ready for testnet execution. VAL-001 PASS is still required before
-VAL-002 (real capital).*
+*VAL-001 Phase 1 PASS. Resume at Phase 2 (detector signal) in next session.*
 
 ---
 
@@ -184,7 +184,7 @@ ORDER BY sequence;
 > **Executor: GLM**
 
 ```bash
-# Monitor trailing stop updates for at least 3 ticks
+# Monitor position monitor ticks for at least 3 ticks
 kubectl logs -n robson-testnet deploy/robsond -f \
   | grep -E "trailing|stop|monitor|tick|BTCUSDT" \
   | head -20
@@ -197,16 +197,31 @@ DEBUG robsond::position_monitor: tick BTCUSDT price=X trailing_stop=Y
 
 **EventLog audit** — Codex verifies:
 ```sql
+-- Primary evidence: position_monitor_tick fires on every tick
+SELECT event_type,
+       payload->>'price'          AS price,
+       payload->>'current_stop'   AS current_stop,
+       payload->>'high_watermark' AS high_watermark,
+       payload->>'span_remaining' AS span_remaining,
+       timestamp
+FROM event_log
+WHERE stream_key = 'position:<uuid>'
+  AND event_type = 'position_monitor_tick'
+ORDER BY sequence;
+-- Required: at least 3 rows
+-- Verify: for a long, high_watermark is non-decreasing across rows
+
+-- Secondary evidence: trailing_stop_updated (only fires when stop moves)
 SELECT event_type, payload, timestamp
 FROM event_log
 WHERE stream_key = 'position:<uuid>'
-  AND event_type ILIKE '%stop%'
+  AND event_type = 'trailing_stop_updated'
 ORDER BY sequence;
--- Required: at least 1 trailing_stop_updated event
--- Verify: stop value moves in correct direction (increases for long)
+-- Optional on short runs — stop may not move if price stays flat
+-- If present: verify current_stop increases for long positions
 ```
 
-**Phase 4 acceptance**: at least 3 ticks logged by position monitor AND trailing stop moves in correct direction.
+**Phase 4 acceptance**: at least 3 `position_monitor_tick` events in EventLog, `high_watermark` non-decreasing for long positions.
 
 ---
 

@@ -45,65 +45,36 @@ If any prerequisite fails, stop here. Do not enable the production monitor.
 
 ## Procedure
 
-### Step 1: Store Real Binance Keys In `pass`
+### Step 1: Store Real Binance Keys In `pass` ✅ DONE (2026-04-17)
 
-Store the production Binance credentials under the real-capital paths.
+Production Binance credentials are stored at:
 
-**Command**:
 ```bash
-pass insert -m rbx/robson-v2/binance-api-key
-pass insert -m rbx/robson-v2/binance-api-secret
-pass show rbx/robson-v2/binance-api-key >/dev/null
-pass show rbx/robson-v2/binance-api-secret >/dev/null
+rbx/robson/binance-api-key
+rbx/robson/binance-api-secret
 ```
 
-**Expected Output**:
-```text
-Both pass show commands exit 0.
-No secret value is printed to terminal history.
+Verify presence with:
+```bash
+pass show rbx/robson/binance-api-key >/dev/null
+pass show rbx/robson/binance-api-secret >/dev/null
 ```
 
-**If this fails**: fix the local `pass` store before continuing. Do not place real keys in shell history, plaintext files, or Git.
+**Expected Output**: Both commands exit 0. No secret value printed.
 
-### Step 2: Update Ansible Secret Source And Re-run Ansible
+### Step 2: Ansible Secret Source And Kubernetes Secret ✅ DONE (2026-04-17)
 
-Update the `rbx-infra` Ansible defaults so the production secret refresh reads from `rbx/robson-v2/` instead of `rbx/robson-v2-testnet/`.
+`rbx-infra` Ansible is already configured to read from `rbx/robson/` (`pass_robson_binance_api_key`, `pass_robson_binance_api_secret` in `bootstrap/ansible/roles/k8s-secrets/defaults/main.yml`). The production `robsond-secret` in namespace `robson` already contains the keys from `rbx/robson/`.
 
-The exact variable names must be verified against the current role before editing. The activation brief expects the Binance pass-path variables to be in `rbx-infra/bootstrap/ansible/`, with current candidate names:
-
-- `pass_robson_v2_testnet_binance_api_key`
-- `pass_robson_v2_testnet_binance_api_secret`
-
-**Command**:
+To reconcile after any key rotation:
 ```bash
 cd ~/apps/rbx-infra
-rg -n "pass_robson_v2_testnet_binance_api|robson-v2-testnet|robson-v2/binance" bootstrap/ansible/
-```
-
-Edit the verified defaults so the values are:
-
-```yaml
-pass_robson_v2_testnet_binance_api_key: "rbx/robson-v2/binance-api-key"
-pass_robson_v2_testnet_binance_api_secret: "rbx/robson-v2/binance-api-secret"
-```
-
-Then re-run the current Ansible secret workflow from `rbx-infra/bootstrap/ansible/`.
-
-**Command**:
-```bash
-cd ~/apps/rbx-infra
+bash bootstrap/scripts/init-vault-from-pass.sh
 ansible-playbook bootstrap/ansible/site.yml \
   -i bootstrap/ansible/inventory/hosts.yml \
   --tags k8s-secrets
+kubectl rollout restart deployment/robsond -n robson
 ```
-
-**Expected Output**:
-```text
-Ansible completes successfully.
-The production robsond Kubernetes secret is refreshed without printing secret values.
-```
-
-**If this fails**: restore the previous Ansible defaults, re-run the secret workflow, and verify production still uses the previous known-safe credentials.
 
 ### Step 3: Verify Production Connects To Real Binance
 
@@ -187,7 +158,7 @@ Push succeeds and ArgoCD auto-sync begins.
 Verify the activation succeeded:
 
 - [ ] VAL-001 Run Log has a `PASS` entry.
-- [ ] `pass show rbx/robson-v2/binance-api-key` and `pass show rbx/robson-v2/binance-api-secret` both exit 0.
+- [ ] `pass show rbx/robson/binance-api-key` and `pass show rbx/robson/binance-api-secret` both exit 0.
 - [ ] Ansible secret refresh completed successfully from `rbx-infra/bootstrap/ansible/`.
 - [ ] Production daemon logs indicate `api.binance.com`, not `testnet.binance.vision`.
 - [ ] Safety checks before flip showed `active_positions = 0` and no open rows in `positions_current`.
