@@ -42,7 +42,9 @@ docs/
 │   ├── ADR-TEMPLATE.md
 │   ├── ADR-0001 to ADR-0010
 ├── policies/                        # Organizational policies
-│   └── PRODUCTION-DEPLOYMENT.md     # Production deployment integrity policy
+│   ├── PRODUCTION-DEPLOYMENT.md     # Production deployment integrity policy
+│   ├── UNTRACKED-POSITION-RECONCILIATION.md  # Robson-authored position invariant (ADR-0022)
+│   └── SYMBOL-AGNOSTIC-POLICIES.md  # Policies apply to every trading pair (ADR-0023)
 ├── ai-first/                        # AI-First transformation docs
 │   ├── ARCHITECTURE.md
 │   ├── DEEPSEEK_GATEWAY.md
@@ -98,6 +100,8 @@ docs/
 
 **Policies** (READ FIRST):
 - [Production Deployment Policy](policies/PRODUCTION-DEPLOYMENT.md) - **CRITICAL**: GitOps-only deployments
+- [Untracked Position Reconciliation](policies/UNTRACKED-POSITION-RECONCILIATION.md) - **CRITICAL**: every open position must be Robson-authored (ADR-0022)
+- [Symbol-Agnostic Policies](policies/SYMBOL-AGNOSTIC-POLICIES.md) - rules apply to every trading pair (ADR-0023)
 
 **Deployment**:
 - [K3s Cluster Guide](infra/K3S-CLUSTER-GUIDE.md) - k3s deployment guide
@@ -214,6 +218,8 @@ docs/
 | Topic | Document |
 |-------|----------|
 | **Production Deployment Policy** | [policies/PRODUCTION-DEPLOYMENT.md](policies/PRODUCTION-DEPLOYMENT.md) |
+| **Untracked Position Reconciliation** (ADR-0022) | [policies/UNTRACKED-POSITION-RECONCILIATION.md](policies/UNTRACKED-POSITION-RECONCILIATION.md) |
+| **Symbol-Agnostic Policies** (ADR-0023) | [policies/SYMBOL-AGNOSTIC-POLICIES.md](policies/SYMBOL-AGNOSTIC-POLICIES.md) |
 | **Language Policy** | [LANGUAGE-POLICY.md](LANGUAGE-POLICY.md) |
 
 ---

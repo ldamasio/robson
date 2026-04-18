@@ -34,5 +34,8 @@ Index
 | ADR-0010 | GitHub Data Ingestion | Accepted | 2024-12 |
 | ADR-0011 | GitOps Automatic Manifest Updates | Accepted | 2024-12 |
 | ADR-0012 | Production Deployment Integrity | Accepted | 2024-12 |
+| ADR-0021 | Opportunity Detection vs Technical Stop Analysis | Decided (Follow-up required) | 2026-04-15 |
+| ADR-0022 | Robson-Authored Position Invariant | Decided (Follow-up required) | 2026-04-18 |
+| ADR-0023 | Symbol-Agnostic Policy Invariant | Decided (Follow-up required) | 2026-04-18 |
 
 Files located in `docs/adr/`.
