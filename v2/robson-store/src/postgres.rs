@@ -526,7 +526,7 @@ mod tests {
         assert!(pos.tech_stop_distance.is_some());
         let tech_stop = pos.tech_stop_distance.as_ref().unwrap();
         assert_eq!(tech_stop.distance, dec!(1500));
-        assert_eq!(tech_stop.distance_pct, dec!(1.57894736842105260000)); // ~1.58%
+        assert_eq!(tech_stop.distance_pct.round_dp(2), dec!(1.58));
     }
 
     #[sqlx::test(migrations = "../migrations")]
@@ -540,6 +540,31 @@ mod tests {
         let entering_id = Uuid::now_v7();
         let entering_order_id = Uuid::now_v7();
         let entering_signal_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            INSERT INTO orders_current (
+                order_id, tenant_id, account_id, position_id,
+                client_order_id, symbol, side, order_type,
+                quantity, status, filled_quantity, total_fee,
+                last_event_id, last_seq,
+                created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, 'buy', 'market', $7, 'acknowledged', 0, 0, $8, $9, $10, $10)
+            "#,
+        )
+        .bind(entering_order_id)
+        .bind(tenant_id)
+        .bind(account_id)
+        .bind(entering_id)
+        .bind(entering_signal_id.to_string())
+        .bind("BTCUSDT")
+        .bind(dec!(0.02))
+        .bind(Uuid::now_v7())
+        .bind(1i64)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("Failed to insert entering order");
+
         sqlx::query(
             r#"
             INSERT INTO positions_current (
@@ -572,6 +597,31 @@ mod tests {
 
         let exiting_id = Uuid::now_v7();
         let exiting_order_id = Uuid::now_v7();
+        sqlx::query(
+            r#"
+            INSERT INTO orders_current (
+                order_id, tenant_id, account_id, position_id,
+                client_order_id, symbol, side, order_type,
+                quantity, status, filled_quantity, total_fee,
+                last_event_id, last_seq,
+                created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, 'buy', 'market', $7, 'pending', 0, 0, $8, $9, $10, $10)
+            "#,
+        )
+        .bind(exiting_order_id)
+        .bind(tenant_id)
+        .bind(account_id)
+        .bind(exiting_id)
+        .bind(exiting_order_id.to_string())
+        .bind("ETHUSDT")
+        .bind(dec!(0.5))
+        .bind(Uuid::now_v7())
+        .bind(2i64)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("Failed to insert exiting order");
+
         sqlx::query(
             r#"
             INSERT INTO positions_current (

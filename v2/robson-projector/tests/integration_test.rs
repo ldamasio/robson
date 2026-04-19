@@ -57,7 +57,7 @@ fn make_envelope(
 // SQLX-TEST: Integration tests require DATABASE_URL
 // =============================================================================
 
-#[sqlx::test]
+#[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_order_submitted_creates_projection(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Arrange
@@ -98,7 +98,7 @@ async fn test_order_submitted_creates_projection(pool: sqlx::PgPool) -> sqlx::Re
     Ok(())
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_order_acked_updates_projection(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Arrange
@@ -146,7 +146,7 @@ async fn test_order_acked_updates_projection(pool: sqlx::PgPool) -> sqlx::Result
     Ok(())
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_position_opened_enforces_invariants(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Arrange
@@ -192,7 +192,7 @@ async fn test_position_opened_enforces_invariants(pool: sqlx::PgPool) -> sqlx::R
     Ok(())
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_position_opened_rejects_zero_stop_distance(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Arrange - invalid payload with zero stop distance
@@ -224,14 +224,17 @@ async fn test_position_opened_rejects_zero_stop_distance(pool: sqlx::PgPool) -> 
     // Assert - should fail invariant check
     assert!(result.is_err());
     let err = result.unwrap_err();
-    assert!(err.to_string().contains("InvariantViolated"));
+    assert!(
+        err.to_string().contains("Invariant violated"),
+        "Expected 'Invariant violated', got: {err}"
+    );
 
     Ok(())
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL (see file header for setup)"]
-async fn test_entry_order_placed_updates_position_to_entering(
+async fn test_legacy_entry_order_placed_does_not_transition_to_entering(
     pool: sqlx::PgPool,
 ) -> sqlx::Result<()> {
     let position_id = Uuid::new_v4();
@@ -262,7 +265,7 @@ async fn test_entry_order_placed_updates_position_to_entering(
     );
     apply_event_to_projections(&pool, &opened).await.unwrap();
 
-    let entering = make_envelope(
+    let legacy = make_envelope(
         "position:test",
         "entry_order_placed",
         serde_json::json!({
@@ -275,7 +278,7 @@ async fn test_entry_order_placed_updates_position_to_entering(
         }),
         2,
     );
-    apply_event_to_projections(&pool, &entering).await.unwrap();
+    apply_event_to_projections(&pool, &legacy).await.unwrap();
 
     let (state, entry_price, entry_quantity, current_quantity, stored_order_id, stored_signal_id): (
         String,
@@ -291,17 +294,131 @@ async fn test_entry_order_placed_updates_position_to_entering(
     .fetch_one(&pool)
     .await?;
 
-    assert_eq!(state, "entering");
+    assert_eq!(state, "armed");
     assert_eq!(entry_price, Some(Decimal::from(50000)));
     assert_eq!(entry_quantity, Some(Decimal::from(1) / Decimal::from(10)));
     assert_eq!(current_quantity, Decimal::from(1) / Decimal::from(10));
-    assert_eq!(stored_order_id, Some(order_id));
+    assert_eq!(stored_order_id, None);
     assert_eq!(stored_signal_id, Some(signal_id));
 
     Ok(())
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
+async fn test_entry_requested_accepted_creates_valid_order_and_entering_projection(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let position_id = Uuid::new_v4();
+    let tenant_id = Uuid::new_v4();
+    let account_id = Uuid::new_v4();
+    let signal_id = Uuid::new_v4();
+    let cycle_id = Uuid::new_v4();
+    let order_id = Uuid::new_v4();
+    let client_order_id = signal_id.to_string();
+
+    let opened = make_envelope(
+        "position:test",
+        "POSITION_OPENED",
+        serde_json::json!({
+            "position_id": position_id,
+            "tenant_id": tenant_id,
+            "account_id": account_id,
+            "strategy_id": null,
+            "symbol": "BTCUSDT",
+            "side": "long",
+            "entry_price": null,
+            "entry_quantity": null,
+            "entry_filled_at": null,
+            "technical_stop_price": "49000",
+            "technical_stop_distance": "1000",
+            "entry_order_id": null,
+            "stop_loss_order_id": null
+        }),
+        1,
+    );
+    apply_event_to_projections(&pool, &opened).await.unwrap();
+
+    let requested = make_envelope(
+        "position:test",
+        "entry_order_requested",
+        serde_json::json!({
+            "position_id": position_id,
+            "cycle_id": cycle_id,
+            "order_id": order_id,
+            "client_order_id": client_order_id.clone(),
+            "expected_price": "50000",
+            "quantity": "0.1",
+            "signal_id": signal_id,
+            "timestamp": Utc::now(),
+        }),
+        2,
+    );
+    apply_event_to_projections(&pool, &requested).await.unwrap();
+
+    let (requested_state, requested_order_id, order_status): (String, Option<Uuid>, String) =
+        sqlx::query_as(
+            r#"
+            SELECT p.state, p.entry_order_id, o.status
+            FROM positions_current p
+            JOIN orders_current o ON o.order_id = p.entry_order_id
+            WHERE p.position_id = $1
+            "#,
+        )
+        .bind(position_id)
+        .fetch_one(&pool)
+        .await?;
+
+    assert_eq!(requested_state, "armed");
+    assert_eq!(requested_order_id, Some(order_id));
+    assert_eq!(order_status, "pending");
+
+    let accepted = make_envelope(
+        "position:test",
+        "entry_order_accepted",
+        serde_json::json!({
+            "position_id": position_id,
+            "cycle_id": cycle_id,
+            "order_id": order_id,
+            "client_order_id": client_order_id.clone(),
+            "exchange_order_id": "exchange-456",
+            "expected_price": "50000",
+            "quantity": "0.1",
+            "signal_id": signal_id,
+            "timestamp": Utc::now(),
+        }),
+        3,
+    );
+    apply_event_to_projections(&pool, &accepted).await.unwrap();
+
+    let (state, stored_order_id, stored_signal_id, status, exchange_order_id): (
+        String,
+        Option<Uuid>,
+        Option<Uuid>,
+        String,
+        Option<String>,
+    ) = sqlx::query_as(
+        r#"
+        SELECT p.state, p.entry_order_id, p.entry_signal_id, o.status, o.exchange_order_id
+        FROM positions_current p
+        JOIN orders_current o ON o.order_id = p.entry_order_id
+        WHERE p.position_id = $1
+        "#,
+    )
+    .bind(position_id)
+    .fetch_one(&pool)
+    .await?;
+
+    assert_eq!(state, "entering");
+    assert_eq!(stored_order_id, Some(order_id));
+    assert_eq!(stored_signal_id, Some(signal_id));
+    assert_eq!(status, "acknowledged");
+    assert_eq!(exchange_order_id.as_deref(), Some("exchange-456"));
+
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_exit_order_placed_updates_projection_with_exit_reason(
     pool: sqlx::PgPool,
@@ -380,7 +497,7 @@ async fn test_exit_order_placed_updates_projection_with_exit_reason(
     Ok(())
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_fill_received_idempotent(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Arrange
@@ -435,12 +552,12 @@ async fn test_fill_received_idempotent(pool: sqlx::PgPool) -> sqlx::Result<()> {
             .fetch_one(&pool)
             .await?;
 
-    assert_eq!(filled_quantity, Decimal::from(1)); // Not 2!
+    assert_eq!(filled_quantity, Decimal::from(1) / Decimal::from(10)); // 0.1, not applied twice (not 0.2)
 
     Ok(())
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_strategy_enabled(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Arrange
@@ -479,7 +596,7 @@ async fn test_strategy_enabled(pool: sqlx::PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_balance_sampled(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Arrange
@@ -518,7 +635,7 @@ async fn test_balance_sampled(pool: sqlx::PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_risk_check_failed(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Arrange
@@ -553,7 +670,7 @@ async fn test_risk_check_failed(pool: sqlx::PgPool) -> sqlx::Result<()> {
     Ok(())
 }
 
-#[sqlx::test]
+#[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_global_idempotency(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Regression test: inserting same event twice should not duplicate
@@ -590,7 +707,7 @@ async fn test_global_idempotency(pool: sqlx::PgPool) -> sqlx::Result<()> {
         .execute(pool)
         .await?;
 
-        // Check if this was a new insert
+        // Fetch which event_id was registered (first writer wins)
         let existing = sqlx::query_scalar::<_, Uuid>(
             "SELECT event_id FROM event_idempotency WHERE tenant_id = $1 AND idempotency_key = $2",
         )
@@ -599,7 +716,12 @@ async fn test_global_idempotency(pool: sqlx::PgPool) -> sqlx::Result<()> {
         .fetch_one(pool)
         .await?;
 
-        // Now insert into event_log
+        // Only insert into event_log when this call registered a NEW idempotency key.
+        // If existing != event_id, another writer got there first — skip the insert.
+        if existing != event_id {
+            return Ok(Some(existing));
+        }
+
         let payload = serde_json::json!({
             "balance_id": Uuid::new_v4(),
             "tenant_id": tenant_id,
