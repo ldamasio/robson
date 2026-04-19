@@ -120,7 +120,7 @@ Status rule for this table: code-backed items may be marked done from repository
 | MIG-v3#8 | Chaos testing suite | Pending |
 | MIG-v3#9 | Position Reconciliation Worker (ADR-0022 — Robson-authored position invariant) | Pending — follow-up from ADR-0022; scans every account type and every symbol; closes UNTRACKED positions |
 | MIG-v3#10 | Symbol-agnostic documentation + test sweep (ADR-0023) | Pending — follow-up from ADR-0023; rewrite symbol-coupled docs, parameterize risk tests across ≥2 symbols |
-| MIG-v3#11 | Policy Layer + Dynamic Slot Calculation (ADR-0024) | Done — repository-verified (2db23ad2); `robson-domain::policy` with `TradingPolicy` and `TechStopConfig`; `RiskGate` consumes policy; static `max_open_positions`, `max_total_exposure_pct`, `max_single_position_pct` eliminated; dynamic slot calculation uses best-effort in-memory `capital_base` (persisted base lands in MIG-v3#12) |
+| MIG-v3#11 | Policy Layer + Dynamic Slot Calculation (ADR-0024) | Done — repository-verified (2db23ad2, corrected by 0b3653a7); `robson-domain::policy` with `TradingPolicy` and `TechStopConfig`; `RiskGate` consumes policy; static `max_open_positions`, `max_total_exposure_pct`, `max_single_position_pct` eliminated; dynamic slot calculation uses best-effort in-memory `capital_base` (persisted base lands in MIG-v3#12) |
 | MIG-v3#12 | Monthly State Persistence — `MonthBoundaryReset` + `monthly_state` projection | Pending — depends on MIG-v3#11; event-sourced capital base and realized loss across restarts; required before real capital (VAL-002) |
 | QE-P1 | Passive Wrapper (Non-Breaking) | ✅ Done |
 | QE-P2 | Blocking Governance | ✅ Done (2026-04-04) |
