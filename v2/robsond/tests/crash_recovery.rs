@@ -749,7 +749,7 @@ async fn test_replay_exit_event_ordering_preserved_in_eventlog(pool: sqlx::PgPoo
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "Requires DATABASE_URL to be set"]
 async fn test_runtime_arm_position_persists_to_projection(pool: sqlx::PgPool) {
-    use robson_domain::{Price, RiskConfig, Side, Symbol, TechnicalStopDistance};
+    use robson_domain::{Price, RiskConfig, Side, Symbol, TechnicalStopDistance, TradingPolicy};
     use robson_engine::Engine;
     use robson_exec::{Executor, IntentJournal, StubExchange};
     use robson_store::MemoryStore;
@@ -770,8 +770,15 @@ async fn test_runtime_arm_position_persists_to_projection(pool: sqlx::PgPool) {
     let engine = Engine::new(risk_config.clone());
 
     let manager = Arc::new(
-        PositionManager::new(engine, executor, store, event_bus, Arc::new(TracingQueryRecorder))
-            .with_event_log(pool.clone(), tenant_id),
+        PositionManager::new(
+            engine,
+            executor,
+            store,
+            event_bus,
+            Arc::new(TracingQueryRecorder),
+            TradingPolicy::default(),
+        )
+        .with_event_log(pool.clone(), tenant_id),
     );
 
     // arm_position() exercises the full runtime write path

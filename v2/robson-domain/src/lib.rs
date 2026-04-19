@@ -13,6 +13,7 @@ pub mod detected_position;
 pub mod entities;
 pub mod events;
 pub mod market_data;
+pub mod policy;
 pub mod value_objects;
 
 // Re-export commonly used types
@@ -29,6 +30,7 @@ pub use entities::{
 };
 pub use events::Event;
 pub use market_data::{Candle, MarketDataEvent, OrderBookSnapshot, Tick};
+pub use policy::{TechStopConfig, TradingPolicy};
 pub use value_objects::{
     DomainError, OrderSide, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance,
 };

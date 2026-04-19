@@ -947,7 +947,7 @@ mod tests {
         http::{header::CONTENT_TYPE, Request},
     };
     use http_body_util::BodyExt;
-    use robson_domain::{RiskConfig, TechnicalStopDistance};
+    use robson_domain::{RiskConfig, TechnicalStopDistance, TradingPolicy};
     use robson_engine::Engine;
     use robson_exec::{Executor, IntentJournal, StubExchange};
     use robson_store::MemoryStore;
@@ -975,6 +975,7 @@ mod tests {
             store,
             Arc::clone(&event_bus),
             Arc::new(TracingQueryRecorder),
+            TradingPolicy::default(),
         );
 
         let position_manager = Arc::new(RwLock::new(manager));

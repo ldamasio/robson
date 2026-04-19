@@ -24,7 +24,7 @@ use std::{collections::HashMap, sync::Arc};
 use chrono::Datelike;
 use robson_domain::{
     DetectorSignal, Event, Position, PositionId, PositionState, Price, Quantity, RiskConfig, Side,
-    Symbol, TechnicalStopDistance,
+    Symbol, TechnicalStopDistance, TradingPolicy,
 };
 use robson_engine::{
     Engine, EngineAction, EngineDecision, PositionSummary, ProposedTrade, RiskContext, RiskGate,
@@ -118,6 +118,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         store: Arc<S>,
         event_bus: Arc<EventBus>,
         query_recorder: Arc<dyn QueryRecorder>,
+        trading_policy: TradingPolicy,
     ) -> Self {
         Self::with_approval_policy(
             engine,
@@ -126,6 +127,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             event_bus,
             query_recorder,
             ApprovalPolicy::default(),
+            trading_policy,
         )
     }
 
@@ -136,11 +138,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         event_bus: Arc<EventBus>,
         query_recorder: Arc<dyn QueryRecorder>,
         approval_policy: ApprovalPolicy,
+        trading_policy: TradingPolicy,
     ) -> Self {
         let shutdown_token = CancellationToken::new();
         let query_engine = Arc::new(QueryEngine::with_approval_policy(
             query_recorder,
-            RiskGate::new(),
+            RiskGate::with_policy(trading_policy),
             approval_policy,
         ));
 
@@ -426,6 +429,22 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     }
 
     fn pending_approval_to_summary(record: &PendingApprovalRecord) -> PositionSummary {
+        // Pending approvals reserve latent risk using proposed entry/quantity and
+        // armed position's initial technical stop. If missing, log warning and use
+        // zero-risk values.
+        let initial_stop = record
+            .position
+            .tech_stop_distance
+            .as_ref()
+            .map(|ts| ts.initial_stop.as_decimal())
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    position_id = %record.position.id,
+                    "Pending approval has no tech_stop_distance; latent risk defaults to zero"
+                );
+                record.proposed.entry_price // fallback: stop at entry → zero risk
+            });
+
         PositionSummary {
             position_id: record.position.id,
             symbol: record.proposed.symbol.clone(),
@@ -433,6 +452,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             notional_value: record.proposed.notional_value,
             margin_used: record.proposed.margin_required,
             unrealized_pnl: Decimal::ZERO,
+            entry_price: record.proposed.entry_price,
+            quantity: record.proposed.quantity,
+            current_stop: initial_stop,
         }
     }
 
@@ -504,9 +526,27 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let mut summaries: Vec<PositionSummary> = active_positions
             .iter()
             .filter_map(|p| {
-                let entry_price_decimal = match &p.state {
-                    PositionState::Active { .. } => p.entry_price?.as_decimal(),
-                    PositionState::Entering { expected_entry, .. } => expected_entry.as_decimal(),
+                let (entry_price_decimal, current_stop) = match &p.state {
+                    PositionState::Active { trailing_stop, .. } => {
+                        let entry = p.entry_price?.as_decimal();
+                        (entry, trailing_stop.as_decimal())
+                    },
+                    PositionState::Entering { expected_entry, .. } => {
+                        let entry = expected_entry.as_decimal();
+                        // Entering: latent risk uses initial technical stop
+                        let stop = p
+                            .tech_stop_distance
+                            .as_ref()
+                            .map(|ts| ts.initial_stop.as_decimal())
+                            .unwrap_or_else(|| {
+                                tracing::warn!(
+                                    position_id = %p.id,
+                                    "Entering position missing tech_stop_distance; latent risk defaults to zero"
+                                );
+                                entry // stop at entry → zero risk
+                            });
+                        (entry, stop)
+                    },
                     _ => return None, // find_risk_open guarantees this is unreachable
                 };
                 let qty = p.quantity.as_decimal();
@@ -523,6 +563,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     notional_value,
                     margin_used,
                     unrealized_pnl: Decimal::ZERO,
+                    entry_price: entry_price_decimal,
+                    quantity: qty,
+                    current_stop,
                 })
             })
             .collect();
@@ -2362,6 +2405,7 @@ mod tests {
                 event_bus,
                 Arc::new(TracingQueryRecorder),
                 approval_policy,
+                TradingPolicy::default(),
             )
             .with_ohlcv_port(Arc::new(StubOhlcv::new(create_test_candles()))),
         )
@@ -2708,15 +2752,30 @@ mod tests {
     }
 
     /// Phase 2: Risk gate denial keeps position Armed and re-arms the detector.
+    /// Risk gate denial re-arms detector and keeps position Armed.
     ///
-    /// A wide technical stop distance causes notional above the default 15%
-    /// single-position limit ($1500 on $10k capital), so the entry is denied.
-    /// The position must remain Armed and have a fresh detector after the
-    /// denial.
+    /// Under ADR-0024, the duplicate-position guard (same symbol+side) still
+    /// triggers a governed denial. The position must remain Armed and get a
+    /// fresh detector.
     #[tokio::test]
     async fn test_risk_gate_denial_rearmed_and_position_stays_armed() {
         let manager = create_test_manager().await;
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+
+        // Seed an active BTCUSDT Long position to trigger duplicate denial
+        let mut pos = Position::new(uuid::Uuid::now_v7(), symbol.clone(), Side::Long);
+        pos.quantity = Quantity::new(dec!(0.01)).unwrap();
+        pos.entry_price = Some(Price::new(dec!(95000)).unwrap());
+        pos.state = PositionState::Active {
+            current_price: Price::new(dec!(95000)).unwrap(),
+            trailing_stop: Price::new(dec!(93500)).unwrap(),
+            favorable_extreme: Price::new(dec!(95000)).unwrap(),
+            extreme_at: chrono::Utc::now(),
+            insurance_stop_id: None,
+            last_emitted_stop: None,
+        };
+        manager.store.positions().save(&pos).await.unwrap();
+
         let entry = Price::new(dec!(100)).unwrap();
         let stop = Price::new(dec!(98)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
@@ -2732,7 +2791,6 @@ mod tests {
             .await
             .unwrap();
 
-        // Technical stop span makes notional > $1500 limit, so risk gate denies.
         let signal = DetectorSignal {
             signal_id: Uuid::now_v7(),
             position_id: position.id,
@@ -2743,10 +2801,10 @@ mod tests {
             timestamp: chrono::Utc::now(),
         };
 
-        // handle_signal must return Ok(()) — denial is a governed outcome, not an error
+        // handle_signal must return Ok(()) — denial is a governed outcome
         manager.handle_signal(signal).await.unwrap();
 
-        // Position must still be Armed — no entry was executed
+        // Position must still be Armed — entry was denied by duplicate guard
         let updated = manager.get_position(position.id).await.unwrap().unwrap();
         assert!(
             matches!(updated.state, PositionState::Armed),
@@ -2754,7 +2812,7 @@ mod tests {
             updated.state
         );
 
-        // Detector must have been re-armed — detectors map must contain the position
+        // Detector must have been re-armed
         let detectors = manager.detectors.read().await;
         assert!(
             detectors.contains_key(&position.id),
@@ -2780,6 +2838,7 @@ mod tests {
                 event_bus,
                 Arc::new(TracingQueryRecorder),
                 ApprovalPolicy::new(Decimal::from(100u32), 300),
+                TradingPolicy::default(),
             )
             .with_ohlcv_port(Arc::new(StubOhlcv::new(create_test_candles()))),
         );
@@ -2994,11 +3053,13 @@ mod tests {
         assert!(matches!(approval_result, Err(DaemonError::QueryNotFound(id)) if id == query_id));
     }
 
+    /// Approval is denied when risk context changes (ADR-0024: duplicate guard).
+    ///
+    /// Get a pending approval, then seed a duplicate position. Revalidation
+    /// denies the approval.
     #[tokio::test]
     async fn test_approve_query_denied_when_risk_context_changes() {
         let manager = create_phase3_test_manager(300).await;
-        save_active_position(&manager, "ETHUSDT", Side::Long, dec!(100), dec!(5)).await;
-        save_active_position(&manager, "SOLUSDT", Side::Long, dec!(100), dec!(5)).await;
 
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
         let entry = Price::new(dec!(100)).unwrap();
@@ -3019,7 +3080,7 @@ mod tests {
         let signal = DetectorSignal {
             signal_id: Uuid::now_v7(),
             position_id: position.id,
-            symbol,
+            symbol: symbol.clone(),
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(85500)).unwrap(),
@@ -3033,7 +3094,8 @@ mod tests {
             *pending.keys().next().expect("pending approval query must exist")
         };
 
-        save_active_position(&manager, "BNBUSDT", Side::Long, dec!(100), dec!(5)).await;
+        // Seed a duplicate BTCUSDT Long position
+        save_active_position(&manager, "BTCUSDT", Side::Long, dec!(95000), dec!(0.01)).await;
 
         let approval_result = manager.approve_query(query_id).await;
         assert!(matches!(
@@ -3121,43 +3183,31 @@ mod tests {
 
     /// Entering positions are included in risk context (find_risk_open).
     ///
-    /// If only find_active() were used, Entering positions would be invisible
-    /// to the risk gate, allowing concurrent entries to bypass exposure
-    /// checks during the order-fill window. This test proves
-    /// find_risk_open() counts them.
-    ///
-    /// Strategy: seed the store with MAX_OPEN_POSITIONS Entering positions,
-    /// then send a signal for a new Armed position. The risk gate must deny
-    /// it.
+    /// Under ADR-0024, the duplicate-position guard prevents same symbol+side.
+    /// Seed an Entering BTCUSDT Long, then arm another and send a signal.
+    /// The duplicate check denies entry.
     #[tokio::test]
     async fn test_entering_positions_count_in_risk_context() {
         let manager = create_test_manager().await;
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
 
-        // Seed the store with 3 positions in Entering state (MaxOpenPositions = 3).
-        // We construct them directly to bypass the fill logic (StubExchange fills
-        // immediately).
-        //
-        // Non-zero quantity is required: build_risk_context() skips zero-qty positions
-        // when building PositionSummary entries for open_position_count().
-        // qty ≈ $100 risk / ($95000 * 8% stop) ≈ 0.01315 BTC
-        let account_id = uuid::Uuid::now_v7();
-        for _ in 0..3 {
-            let mut pos = Position::new(account_id, symbol.clone(), Side::Long);
-            pos.quantity = Quantity::new(dec!(0.01315)).unwrap();
-            pos.state = PositionState::Entering {
-                entry_order_id: uuid::Uuid::now_v7(),
-                expected_entry: Price::new(dec!(95000)).unwrap(),
-                signal_id: uuid::Uuid::now_v7(),
-            };
-            manager.store.positions().save(&pos).await.unwrap();
-        }
+        // Seed an Entering BTCUSDT Long to trigger duplicate guard
+        let mut pos = Position::new(uuid::Uuid::now_v7(), symbol.clone(), Side::Long);
+        pos.quantity = Quantity::new(dec!(0.01)).unwrap();
+        pos.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(
+            Price::new(dec!(95000)).unwrap(),
+            Price::new(dec!(93500)).unwrap(),
+        ));
+        pos.state = PositionState::Entering {
+            entry_order_id: uuid::Uuid::now_v7(),
+            expected_entry: Price::new(dec!(95000)).unwrap(),
+            signal_id: uuid::Uuid::now_v7(),
+        };
+        manager.store.positions().save(&pos).await.unwrap();
 
-        // Arm a 4th position (the one we will try to enter).
-        // 8% stop — within valid range (≤10%) and passes single-position check
-        // (≥6.67%).
+        // Arm a 2nd BTCUSDT Long (the one we will try to enter).
         let entry = Price::new(dec!(100)).unwrap();
-        let stop = Price::new(dec!(92)).unwrap(); // 8% stop
+        let stop = Price::new(dec!(92)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let position = manager
@@ -3177,18 +3227,17 @@ mod tests {
             symbol: symbol.clone(),
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
-            stop_loss: Price::new(dec!(87400)).unwrap(), // 8% below — passes single-position gate
+            stop_loss: Price::new(dec!(87400)).unwrap(),
             timestamp: chrono::Utc::now(),
         };
 
-        // Must return Ok(()) — denial is a governed outcome.
         manager.handle_signal(signal).await.unwrap();
 
-        // 4th position must still be Armed — entry was blocked by MaxOpenPositions.
+        // Position must still be Armed — entry was denied by duplicate guard
         let updated = manager.get_position(position.id).await.unwrap().unwrap();
         assert!(
             matches!(updated.state, PositionState::Armed),
-            "Expected Armed after denial (Entering positions blocked entry), got {:?}",
+            "Expected Armed after denial (Entering position triggered duplicate guard), got {:?}",
             updated.state
         );
     }

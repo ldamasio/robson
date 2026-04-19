@@ -23,7 +23,7 @@ use std::{net::SocketAddr, sync::Arc};
 // Macro for creating Decimal literals
 use async_trait::async_trait;
 use robson_connectors::BinanceRestClient;
-use robson_domain::{Position, PositionId, Symbol};
+use robson_domain::{Position, PositionId, Symbol, TradingPolicy};
 use robson_engine::Engine;
 use robson_exec::{ExchangePort, Executor, IntentJournal, StubExchange};
 #[cfg(feature = "postgres")]
@@ -148,6 +148,7 @@ impl Daemon<StubExchange, MemoryStore> {
         let query_recorder = default_query_recorder();
         let risk_config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(risk_config);
+        let trading_policy = TradingPolicy::default();
 
         let position_manager = Arc::new(RwLock::new(PositionManager::new(
             engine,
@@ -155,6 +156,7 @@ impl Daemon<StubExchange, MemoryStore> {
             store.clone(),
             event_bus.clone(),
             query_recorder,
+            trading_policy,
         )));
 
         Self {
@@ -196,6 +198,7 @@ impl Daemon<StubExchange, MemoryStore> {
             };
         let risk_config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(risk_config);
+        let trading_policy = TradingPolicy::default();
 
         let mut pm = PositionManager::new(
             engine,
@@ -203,6 +206,7 @@ impl Daemon<StubExchange, MemoryStore> {
             store.clone(),
             event_bus.clone(),
             query_recorder,
+            trading_policy,
         );
         if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
             pm = pm.with_event_log((**pool).clone(), tenant_id);
@@ -235,6 +239,7 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
         let query_recorder = default_query_recorder();
         let risk_config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(risk_config);
+        let trading_policy = TradingPolicy::default();
 
         let position_manager = Arc::new(RwLock::new(
             PositionManager::new(
@@ -243,6 +248,7 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
                 store.clone(),
                 event_bus.clone(),
                 query_recorder,
+                trading_policy,
             )
             .with_ohlcv_port(ohlcv_port),
         ));
@@ -290,6 +296,7 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
             };
         let risk_config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(risk_config);
+        let trading_policy = TradingPolicy::default();
 
         let mut pm = PositionManager::new(
             engine,
@@ -297,6 +304,7 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
             store.clone(),
             event_bus.clone(),
             query_recorder,
+            trading_policy,
         )
         .with_ohlcv_port(ohlcv_port);
         if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {

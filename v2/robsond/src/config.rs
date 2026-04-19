@@ -22,6 +22,9 @@ pub struct Config {
     /// Engine configuration
     pub engine: EngineConfig,
 
+    /// Technical stop policy configuration (ADR-0024)
+    pub tech_stop: TechStopConfigEnv,
+
     /// Projection configuration
     pub projection: ProjectionConfig,
 
@@ -67,6 +70,23 @@ pub struct EngineConfig {
     pub min_tech_stop_percent: Decimal,
     /// Maximum tech stop distance (0.10 = 10%)
     pub max_tech_stop_percent: Decimal,
+}
+
+/// Technical stop policy configuration loaded from environment (ADR-0024).
+///
+/// Canonical env vars use percentage semantics (e.g., 1.0 = 1%).
+/// Legacy vars (ROBSON_MIN_TECH_STOP_PERCENT, ROBSON_MAX_TECH_STOP_PERCENT)
+/// use fraction semantics and are mapped by multiplying by 100.
+#[derive(Debug, Clone)]
+pub struct TechStopConfigEnv {
+    /// Minimum tech stop as percentage (env: ROBSON_MIN_TECH_STOP_PCT, default 1.0%)
+    pub min_stop_pct: Decimal,
+    /// Maximum tech stop as percentage (env: ROBSON_MAX_TECH_STOP_PCT, default 10.0%)
+    pub max_stop_pct: Decimal,
+    /// Support/resistance level to use (env: ROBSON_TECH_STOP_SUPPORT_N, default 2)
+    pub support_level_n: usize,
+    /// Lookback candles for analysis (env: ROBSON_TECH_STOP_LOOKBACK, default 100)
+    pub lookback_candles: usize,
 }
 
 /// Position monitor configuration (safety net for rogue positions).
@@ -116,6 +136,7 @@ impl Config {
         let environment = Self::load_environment()?;
         let api = Self::load_api_config()?;
         let engine = Self::load_engine_config()?;
+        let tech_stop = Self::load_tech_stop_config()?;
         let projection = Self::load_projection_config()?;
         let position_monitor = Self::load_position_monitor_config()?;
 
@@ -129,6 +150,7 @@ impl Config {
         Ok(Self {
             api,
             engine,
+            tech_stop,
             projection,
             position_monitor,
             environment,
@@ -146,6 +168,12 @@ impl Config {
             engine: EngineConfig {
                 min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
                 max_tech_stop_percent: Decimal::new(10, 2), // 10%
+            },
+            tech_stop: TechStopConfigEnv {
+                min_stop_pct: Decimal::new(1, 1), // 0.1%
+                max_stop_pct: Decimal::from(20),
+                support_level_n: 2,
+                lookback_candles: 100,
             },
             projection: ProjectionConfig {
                 database_url: None,
@@ -206,6 +234,49 @@ impl Config {
         Ok(EngineConfig {
             min_tech_stop_percent: min_tech_stop,
             max_tech_stop_percent: max_tech_stop,
+        })
+    }
+
+    fn load_tech_stop_config() -> DaemonResult<TechStopConfigEnv> {
+        // Primary: ROBSON_MIN_TECH_STOP_PCT / ROBSON_MAX_TECH_STOP_PCT (percentage semantics)
+        // Legacy fallback: ROBSON_MIN_TECH_STOP_PERCENT / ROBSON_MAX_TECH_STOP_PERCENT (fraction semantics → × 100)
+        let min_stop_pct = match env::var("ROBSON_MIN_TECH_STOP_PCT") {
+            Ok(val) => Decimal::from_str(&val).map_err(|_| {
+                DaemonError::Config(format!("Invalid ROBSON_MIN_TECH_STOP_PCT value: {}", val))
+            })?,
+            Err(_) => {
+                let legacy =
+                    Self::load_decimal_env("ROBSON_MIN_TECH_STOP_PERCENT", Decimal::new(1, 3))?;
+                legacy * Decimal::from(100)
+            },
+        };
+
+        let max_stop_pct = match env::var("ROBSON_MAX_TECH_STOP_PCT") {
+            Ok(val) => Decimal::from_str(&val).map_err(|_| {
+                DaemonError::Config(format!("Invalid ROBSON_MAX_TECH_STOP_PCT value: {}", val))
+            })?,
+            Err(_) => {
+                let legacy =
+                    Self::load_decimal_env("ROBSON_MAX_TECH_STOP_PERCENT", Decimal::new(10, 2))?;
+                legacy * Decimal::from(100)
+            },
+        };
+
+        let support_level_n = env::var("ROBSON_TECH_STOP_SUPPORT_N")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(2);
+
+        let lookback_candles = env::var("ROBSON_TECH_STOP_LOOKBACK")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .unwrap_or(100);
+
+        Ok(TechStopConfigEnv {
+            min_stop_pct,
+            max_stop_pct,
+            support_level_n,
+            lookback_candles,
         })
     }
 
@@ -316,6 +387,12 @@ impl Default for Config {
                 min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
                 max_tech_stop_percent: Decimal::new(10, 2), // 10%
             },
+            tech_stop: TechStopConfigEnv {
+                min_stop_pct: Decimal::ONE,      // 1%
+                max_stop_pct: Decimal::from(10), // 10%
+                support_level_n: 2,
+                lookback_candles: 100,
+            },
             projection: ProjectionConfig {
                 database_url: None,
                 tenant_id: None,
@@ -352,6 +429,10 @@ mod tests {
 
         assert_eq!(config.api.port, 8080);
         assert_eq!(config.environment, Environment::Development);
+        assert_eq!(config.tech_stop.min_stop_pct, Decimal::ONE);
+        assert_eq!(config.tech_stop.max_stop_pct, Decimal::from(10));
+        assert_eq!(config.tech_stop.support_level_n, 2);
+        assert_eq!(config.tech_stop.lookback_candles, 100);
     }
 
     #[test]
@@ -360,6 +441,8 @@ mod tests {
 
         assert_eq!(config.api.port, 0);
         assert_eq!(config.environment, Environment::Test);
+        assert_eq!(config.tech_stop.min_stop_pct, Decimal::new(1, 1)); // 0.1%
+        assert_eq!(config.tech_stop.max_stop_pct, Decimal::from(20));
     }
 
     #[test]

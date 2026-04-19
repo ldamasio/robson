@@ -1,16 +1,21 @@
-//! Risk Gate: Pre-trade approval checks
+//! Risk Gate: Pre-trade approval checks (ADR-0024).
 //!
 //! The RiskGate evaluates proposed trades against portfolio-level risk limits.
 //! It answers: "given the current portfolio state, should this trade be
 //! allowed?"
 //!
-//! # Checks Performed
+//! # Checks Performed (ADR-0024)
 //!
-//! 1. Max open positions not exceeded
-//! 2. Total exposure (aggregate notional) within limit
-//! 3. Single position concentration within limit
-//! 4. No duplicate position on same symbol+side
-//! 5. Monthly drawdown not exceeded (v3: 4% → MonthlyHalt)
+//! 1. Duplicate position (same symbol+side) — operational constraint
+//! 2. Dynamic slot exhaustion (replaces static max_open_positions)
+//! 3. Monthly drawdown hard limit (from TradingPolicy)
+//! 4. Daily loss limit (existing behavior, outside ADR-0024 scope)
+//!
+//! # Eliminated by ADR-0024
+//!
+//! - max_open_positions → dynamic slot calculation
+//! - max_total_exposure_pct → physical capital bound (enforced by exchange)
+//! - max_single_position_pct → physical capital bound (enforced by exchange)
 //!
 //! # Design
 //!
@@ -18,34 +23,33 @@
 //! - Called by Engine before producing entry actions
 //! - Rejection emits RiskCheckFailed event for audit
 
+use robson_domain::TradingPolicy;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
 
 // =============================================================================
-// Risk Limits (static configuration)
+// Risk Limits (legacy compatibility — fields no longer enforced by ADR-0024)
 // =============================================================================
 
-/// Portfolio-level risk limits (configured at startup, static)
+/// Portfolio-level risk limits.
 ///
-/// These are the guardrails that prevent excessive risk exposure.
+/// Legacy compatibility fields (max_open_positions, max_total_exposure_pct,
+/// max_single_position_pct) are preserved for struct compatibility but are no
+/// longer enforced by the risk gate per ADR-0024. Active risk enforcement uses
+/// `TradingPolicy` for dynamic slot calculation and drawdown limits.
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct RiskLimits {
-    /// Maximum number of simultaneous open positions
-    /// Default: 3 (with 1% risk per trade and 10x leverage = ~30% margin)
+    /// Legacy: no longer enforced (ADR-0024 uses dynamic slot calculation).
     pub max_open_positions: usize,
 
-    /// Maximum total notional exposure as percentage of capital
-    /// Default: 30% (e.g., $3000 exposure on $10000 capital)
+    /// Legacy: no longer enforced (ADR-0024 relies on exchange physical bounds).
     pub max_total_exposure_pct: Decimal,
 
-    /// Maximum single position size as percentage of capital
-    /// Default: 15% (prevents concentration risk)
+    /// Legacy: no longer enforced (ADR-0024 relies on exchange physical bounds).
     pub max_single_position_pct: Decimal,
 
-    /// Monthly drawdown limit as percentage of capital (v3 policy)
-    /// Default: 4% — when reached, system enters MonthlyHalt:
-    /// close all positions, block new entries, halt until next month.
+    /// Monthly drawdown limit as percentage of capital (sourced from TradingPolicy).
     pub max_monthly_drawdown_pct: Decimal,
 
     /// Daily loss limit as percentage of capital
@@ -66,7 +70,7 @@ impl Default for RiskLimits {
 }
 
 impl RiskLimits {
-    /// Create risk limits with custom values
+    /// Create risk limits with custom values (legacy compatibility).
     pub fn new(
         max_open_positions: usize,
         max_total_exposure_pct: Decimal,
@@ -76,8 +80,8 @@ impl RiskLimits {
             max_open_positions,
             max_total_exposure_pct,
             max_single_position_pct,
-            max_monthly_drawdown_pct: Decimal::from(4), // v3 policy: 4% fixed
-            daily_loss_limit_pct: Decimal::ONE,         // 1% daily loss limit
+            max_monthly_drawdown_pct: Decimal::from(4),
+            daily_loss_limit_pct: Decimal::ONE,
         }
     }
 }
@@ -93,7 +97,7 @@ pub struct PositionSummary {
     pub position_id: uuid::Uuid,
     /// Trading pair symbol
     pub symbol: String,
-    /// Position direction
+    /// Position direction (lowercase: "long" or "short")
     pub side: String,
     /// Notional value (quantity × price)
     pub notional_value: Decimal,
@@ -101,6 +105,12 @@ pub struct PositionSummary {
     pub margin_used: Decimal,
     /// Unrealized PnL
     pub unrealized_pnl: Decimal,
+    /// Entry price (for latent risk calculation)
+    pub entry_price: Decimal,
+    /// Quantity (for latent risk calculation)
+    pub quantity: Decimal,
+    /// Current stop price (for latent risk calculation)
+    pub current_stop: Decimal,
 }
 
 /// Snapshot of current portfolio risk state
@@ -215,6 +225,42 @@ impl RiskContext {
     pub fn has_duplicate_position(&self, symbol: &str, side: &str) -> bool {
         self.open_positions.iter().any(|p| p.symbol == symbol && p.side == side)
     }
+
+    /// Sum latent risk across all open positions (ADR-0024 Decision 5).
+    ///
+    /// For LONG:  max(0, (entry - stop) × qty)
+    /// For SHORT: max(0, (stop - entry) × qty)
+    /// Unknown side contributes zero.
+    pub fn latent_risk_sum(&self) -> Decimal {
+        self.open_positions
+            .iter()
+            .map(|p| {
+                let risk = match p.side.to_lowercase().as_str() {
+                    "long" => (p.entry_price - p.current_stop) * p.quantity,
+                    "short" => (p.current_stop - p.entry_price) * p.quantity,
+                    _ => Decimal::ZERO,
+                };
+                risk.max(Decimal::ZERO)
+            })
+            .sum()
+    }
+
+    /// Absolute realized loss for the current month (ADR-0024).
+    ///
+    /// Returns `|monthly_realized_pnl|` only when negative (loss);
+    /// returns zero when PnL is positive or zero.
+    pub fn realized_loss_abs(&self) -> Decimal {
+        if self.monthly_realized_pnl < Decimal::ZERO {
+            self.monthly_realized_pnl.abs()
+        } else {
+            Decimal::ZERO
+        }
+    }
+
+    /// Dynamic slot count via TradingPolicy (ADR-0024 Decision 5).
+    pub fn slots_available(&self, policy: &TradingPolicy, capital_base: Decimal) -> u32 {
+        policy.slots_available(capital_base, self.realized_loss_abs(), self.latent_risk_sum())
+    }
 }
 
 // =============================================================================
@@ -245,11 +291,11 @@ pub struct ProposedTrade {
 /// Which risk check failed
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RiskCheck {
-    /// Too many open positions
+    /// Too many open positions (legacy — no longer emitted by ADR-0024 gate)
     MaxOpenPositions,
-    /// Total exposure exceeds limit
+    /// Total exposure exceeds limit (legacy — no longer emitted by ADR-0024 gate)
     TotalExposure,
-    /// Single position too large
+    /// Single position too large (legacy — no longer emitted by ADR-0024 gate)
     SinglePositionConcentration,
     /// Not enough margin available
     InsufficientMargin,
@@ -294,95 +340,47 @@ pub enum RiskVerdict {
 // Risk Gate
 // =============================================================================
 
-/// The pre-trade approval gate
+/// The pre-trade approval gate (ADR-0024).
 ///
-/// Evaluates proposed trades against risk limits.
-/// Pure computation, no I/O.
+/// Evaluates proposed trades against TradingPolicy. Pure computation, no I/O.
 #[derive(Debug, Clone)]
 pub struct RiskGate {
     limits: RiskLimits,
+    policy: TradingPolicy,
 }
 
 impl RiskGate {
-    /// Create a new RiskGate with default limits
+    /// Create a new RiskGate with default limits and policy
     pub fn new() -> Self {
-        Self { limits: RiskLimits::default() }
+        Self {
+            limits: RiskLimits::default(),
+            policy: TradingPolicy::default(),
+        }
     }
 
-    /// Create a RiskGate with custom limits
+    /// Create a RiskGate with custom limits (legacy compatibility)
     pub fn with_limits(limits: RiskLimits) -> Self {
-        Self { limits }
+        Self { limits, policy: TradingPolicy::default() }
     }
 
-    /// Get the current limits
+    /// Create a RiskGate with a specific TradingPolicy (ADR-0024)
+    pub fn with_policy(policy: TradingPolicy) -> Self {
+        Self { limits: RiskLimits::default(), policy }
+    }
+
+    /// Get the current limits (legacy compatibility)
     pub fn limits(&self) -> &RiskLimits {
         &self.limits
     }
 
-    /// Evaluate a proposed trade against current risk context
-    ///
-    /// Returns:
-    /// - `RiskVerdict::Approved` if all checks pass
-    /// - `RiskVerdict::Rejected` if any check fails
+    /// Get the current policy
+    pub fn policy(&self) -> &TradingPolicy {
+        &self.policy
+    }
+
+    /// Evaluate a proposed trade against current risk context (ADR-0024).
     pub fn evaluate(&self, proposed: &ProposedTrade, context: &RiskContext) -> RiskVerdict {
-        // 1. Check max open positions
-        if context.open_position_count() >= self.limits.max_open_positions {
-            debug!(
-                current = context.open_position_count(),
-                max = self.limits.max_open_positions,
-                "Risk check failed: max open positions"
-            );
-            return RiskVerdict::Rejected {
-                check: RiskCheck::MaxOpenPositions,
-                reason: format!(
-                    "Already have {} open positions (max: {})",
-                    context.open_position_count(),
-                    self.limits.max_open_positions
-                ),
-            };
-        }
-
-        // 2. Check total exposure
-        let new_total_exposure = context.total_notional_exposure + proposed.notional_value;
-        let max_exposure =
-            context.capital * self.limits.max_total_exposure_pct / Decimal::from(100);
-        if new_total_exposure > max_exposure {
-            debug!(
-                current = %context.total_notional_exposure,
-                proposed = %proposed.notional_value,
-                max = %max_exposure,
-                "Risk check failed: total exposure"
-            );
-            return RiskVerdict::Rejected {
-                check: RiskCheck::TotalExposure,
-                reason: format!(
-                    "Total exposure {} + {} would exceed {}% of capital ({})",
-                    context.total_notional_exposure,
-                    proposed.notional_value,
-                    self.limits.max_total_exposure_pct,
-                    max_exposure
-                ),
-            };
-        }
-
-        // 3. Check single position concentration
-        let max_single = context.capital * self.limits.max_single_position_pct / Decimal::from(100);
-        if proposed.notional_value > max_single {
-            debug!(
-                proposed = %proposed.notional_value,
-                max = %max_single,
-                "Risk check failed: single position concentration"
-            );
-            return RiskVerdict::Rejected {
-                check: RiskCheck::SinglePositionConcentration,
-                reason: format!(
-                    "Position size {} exceeds {}% of capital ({})",
-                    proposed.notional_value, self.limits.max_single_position_pct, max_single
-                ),
-            };
-        }
-
-        // 4. Check duplicate position (same symbol + side)
+        // 1. Check duplicate position (same symbol + side)
         if context.has_duplicate_position(&proposed.symbol, &proposed.side) {
             debug!(
                 symbol = %proposed.symbol,
@@ -395,10 +393,10 @@ impl RiskGate {
             };
         }
 
-        // 5. Check monthly drawdown (v3 policy: 4% → MonthlyHalt)
+        // 2. Check monthly drawdown hard limit (ADR-0024: sourced from policy)
         let monthly_pnl = context.total_monthly_pnl();
         let monthly_loss_limit =
-            context.capital * self.limits.max_monthly_drawdown_pct / Decimal::from(100);
+            context.capital * self.policy.max_monthly_drawdown_pct / Decimal::from(100);
         if monthly_pnl <= -monthly_loss_limit {
             debug!(
                 monthly_pnl = %monthly_pnl,
@@ -409,12 +407,33 @@ impl RiskGate {
                 check: RiskCheck::MonthlyDrawdown,
                 reason: format!(
                     "Monthly P&L {} has exceeded drawdown limit of -{}% (MonthlyHalt triggered)",
-                    monthly_pnl, self.limits.max_monthly_drawdown_pct
+                    monthly_pnl, self.policy.max_monthly_drawdown_pct
                 ),
             };
         }
 
-        // 6. Check daily loss limit
+        // 3. Dynamic slot check (ADR-0024: replaces static max_open_positions)
+        let capital_base = context.capital; // MIG-v3#11 approximation; MIG-v3#12 persists real capital base.
+        let slots = context.slots_available(&self.policy, capital_base);
+        if slots == 0 {
+            debug!(
+                capital_base = %capital_base,
+                realized_loss = %context.realized_loss_abs(),
+                latent_risk = %context.latent_risk_sum(),
+                "Risk check failed: no monthly risk slots available"
+            );
+            return RiskVerdict::Rejected {
+                check: RiskCheck::MonthlyDrawdown,
+                reason: format!(
+                    "No monthly risk slots available (capital={}, realized_loss={}, latent_risk={})",
+                    capital_base,
+                    context.realized_loss_abs(),
+                    context.latent_risk_sum()
+                ),
+            };
+        }
+
+        // 4. Check daily loss limit (existing behavior, outside ADR-0024 scope)
         let daily_pnl = context.total_daily_pnl();
         let daily_loss_limit =
             context.capital * self.limits.daily_loss_limit_pct / Decimal::from(100);
@@ -433,14 +452,11 @@ impl RiskGate {
             };
         }
 
-        // 7. Check margin availability (optional - exchange will also validate)
-        // Note: This is a pre-check; exchange will do final validation
-        // For now, we rely on exchange validation for margin
-
         debug!(
             symbol = %proposed.symbol,
             side = %proposed.side,
             notional = %proposed.notional_value,
+            slots_available = slots,
             "Risk check passed"
         );
 
@@ -472,10 +488,30 @@ mod tests {
         ProposedTrade {
             symbol: "BTCUSDT".to_string(),
             side: "long".to_string(),
-            quantity: dec!(0.02), // 0.02 BTC
+            quantity: dec!(0.02),
             entry_price: dec!(50000),
-            notional_value: dec!(1000), // $1,000 (within 15% single position limit)
+            notional_value: dec!(1000),
             margin_required: dec!(100),
+        }
+    }
+
+    fn summary_with_stop(
+        symbol: &str,
+        side: &str,
+        entry: Decimal,
+        stop: Decimal,
+        qty: Decimal,
+    ) -> PositionSummary {
+        PositionSummary {
+            position_id: uuid::Uuid::nil(),
+            symbol: symbol.to_string(),
+            side: side.to_string(),
+            notional_value: qty * entry,
+            margin_used: qty * entry / dec!(10),
+            unrealized_pnl: Decimal::ZERO,
+            entry_price: entry,
+            quantity: qty,
+            current_stop: stop,
         }
     }
 
@@ -490,92 +526,29 @@ mod tests {
     }
 
     #[test]
-    fn test_risk_gate_rejects_max_positions() {
+    fn test_risk_gate_rejects_duplicate_position() {
         let gate = RiskGate::new();
-        let context = RiskContext::with_positions(dec!(10000), vec![
-            PositionSummary {
+        let context = RiskContext::with_positions(
+            dec!(10000),
+            vec![PositionSummary {
                 position_id: uuid::Uuid::nil(),
-                symbol: "ETHUSDT".to_string(),
+                symbol: "BTCUSDT".to_string(),
                 side: "long".to_string(),
-                notional_value: dec!(3000),
-                margin_used: dec!(300),
+                notional_value: dec!(1000),
+                margin_used: dec!(100),
                 unrealized_pnl: dec!(0),
-            };
-            3
-        ]);
+                entry_price: dec!(50000),
+                quantity: dec!(0.02),
+                current_stop: dec!(48000),
+            }],
+        );
         let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
-        assert!(matches!(verdict, RiskVerdict::Rejected {
-            check: RiskCheck::MaxOpenPositions,
-            ..
-        }));
-    }
-
-    #[test]
-    fn test_risk_gate_rejects_total_exposure() {
-        let gate = RiskGate::new();
-        let context = RiskContext::with_positions(dec!(10000), vec![PositionSummary {
-            position_id: uuid::Uuid::nil(),
-            symbol: "ETHUSDT".to_string(),
-            side: "long".to_string(),
-            notional_value: dec!(2900),
-            margin_used: dec!(290),
-            unrealized_pnl: dec!(0),
-        }]);
-        // 2900 + 5000 = 7900 > 3000 (30% of 10000)
-        let proposed = ProposedTrade {
-            symbol: "BTCUSDT".to_string(),
-            side: "long".to_string(),
-            quantity: dec!(0.1),
-            entry_price: dec!(50000),
-            notional_value: dec!(5000),
-            margin_required: dec!(500),
-        };
-
-        let verdict = gate.evaluate(&proposed, &context);
-        assert!(matches!(verdict, RiskVerdict::Rejected { check: RiskCheck::TotalExposure, .. }));
-    }
-
-    #[test]
-    fn test_risk_gate_rejects_single_concentration() {
-        let gate = RiskGate::new();
-        let context = sample_context();
-        // 2000 > 1500 (15% of 10000)
-        let proposed = ProposedTrade {
-            symbol: "BTCUSDT".to_string(),
-            side: "long".to_string(),
-            quantity: dec!(0.04),
-            entry_price: dec!(50000),
-            notional_value: dec!(2000),
-            margin_required: dec!(200),
-        };
-
-        let verdict = gate.evaluate(&proposed, &context);
-        assert!(matches!(verdict, RiskVerdict::Rejected {
-            check: RiskCheck::SinglePositionConcentration,
-            ..
-        }));
-    }
-
-    #[test]
-    fn test_risk_gate_rejects_duplicate_position() {
-        let gate = RiskGate::new();
-        let context = RiskContext::with_positions(dec!(10000), vec![PositionSummary {
-            position_id: uuid::Uuid::nil(),
-            symbol: "BTCUSDT".to_string(),
-            side: "long".to_string(),
-            notional_value: dec!(1000),
-            margin_used: dec!(100),
-            unrealized_pnl: dec!(0),
-        }]);
-        let proposed = sample_proposed(); // BTCUSDT long
-
-        let verdict = gate.evaluate(&proposed, &context);
-        assert!(matches!(verdict, RiskVerdict::Rejected {
-            check: RiskCheck::DuplicatePosition,
-            ..
-        }));
+        assert!(matches!(
+            verdict,
+            RiskVerdict::Rejected { check: RiskCheck::DuplicatePosition, .. }
+        ));
     }
 
     #[test]
@@ -590,14 +563,13 @@ mod tests {
             daily_realized_pnl: Decimal::ZERO,
             daily_unrealized_pnl: Decimal::ZERO,
         };
-        // Monthly PnL = -450 < -400 (4% of 10000)
         let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
-        assert!(matches!(verdict, RiskVerdict::Rejected {
-            check: RiskCheck::MonthlyDrawdown,
-            ..
-        }));
+        assert!(matches!(
+            verdict,
+            RiskVerdict::Rejected { check: RiskCheck::MonthlyDrawdown, .. }
+        ));
     }
 
     #[test]
@@ -612,7 +584,6 @@ mod tests {
             daily_realized_pnl: Decimal::ZERO,
             daily_unrealized_pnl: Decimal::ZERO,
         };
-        // Monthly PnL = -300, limit is -400. Still within limit.
         let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
@@ -620,13 +591,36 @@ mod tests {
     }
 
     #[test]
-    fn test_risk_gate_allows_at_399_pct_monthly_drawdown() {
+    fn test_risk_gate_allows_at_3_pct_monthly_drawdown() {
         let gate = RiskGate::new();
         let context = RiskContext {
             capital: dec!(10000),
             open_positions: vec![],
             total_notional_exposure: Decimal::ZERO,
-            // -399 is 3.99% of 10000 — just below the 4% threshold
+            monthly_realized_pnl: dec!(-300),
+            monthly_unrealized_pnl: dec!(0),
+            daily_realized_pnl: Decimal::ZERO,
+            daily_unrealized_pnl: Decimal::ZERO,
+        };
+        let proposed = sample_proposed();
+
+        let verdict = gate.evaluate(&proposed, &context);
+        assert_eq!(
+            verdict,
+            RiskVerdict::Approved,
+            "3.00% monthly loss with 1 slot remaining must be allowed"
+        );
+    }
+
+    #[test]
+    fn test_risk_gate_slot_exhaustion_at_399_pct_loss() {
+        // 3.99% realized loss (399 out of 400 budget) leaves $1 < $100 risk → slots = 0
+        // This blocks via MonthlyDrawdown even though hard limit hasn't been hit.
+        let gate = RiskGate::new();
+        let context = RiskContext {
+            capital: dec!(10000),
+            open_positions: vec![],
+            total_notional_exposure: Decimal::ZERO,
             monthly_realized_pnl: dec!(-399),
             monthly_unrealized_pnl: dec!(0),
             daily_realized_pnl: Decimal::ZERO,
@@ -635,7 +629,10 @@ mod tests {
         let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
-        assert_eq!(verdict, RiskVerdict::Approved, "3.99% monthly loss must be allowed");
+        assert!(
+            matches!(verdict, RiskVerdict::Rejected { check: RiskCheck::MonthlyDrawdown, .. }),
+            "3.99% loss exhausts budget for risk unit → must block via MonthlyDrawdown"
+        );
     }
 
     #[test]
@@ -645,7 +642,6 @@ mod tests {
             capital: dec!(10000),
             open_positions: vec![],
             total_notional_exposure: Decimal::ZERO,
-            // -400 is exactly 4.00% of 10000 — must be blocked
             monthly_realized_pnl: dec!(-400),
             monthly_unrealized_pnl: dec!(0),
             daily_realized_pnl: Decimal::ZERO,
@@ -663,15 +659,21 @@ mod tests {
     #[test]
     fn test_risk_gate_allows_same_symbol_opposite_side() {
         let gate = RiskGate::new();
-        let context = RiskContext::with_positions(dec!(10000), vec![PositionSummary {
-            position_id: uuid::Uuid::nil(),
-            symbol: "BTCUSDT".to_string(),
-            side: "short".to_string(), // Different side
-            notional_value: dec!(1000),
-            margin_used: dec!(100),
-            unrealized_pnl: dec!(0),
-        }]);
-        let proposed = sample_proposed(); // BTCUSDT long
+        let context = RiskContext::with_positions(
+            dec!(10000),
+            vec![PositionSummary {
+                position_id: uuid::Uuid::nil(),
+                symbol: "BTCUSDT".to_string(),
+                side: "short".to_string(),
+                notional_value: dec!(1000),
+                margin_used: dec!(100),
+                unrealized_pnl: dec!(0),
+                entry_price: dec!(50000),
+                quantity: dec!(0.02),
+                current_stop: dec!(52000),
+            }],
+        );
+        let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
         assert_eq!(verdict, RiskVerdict::Approved);
@@ -684,8 +686,6 @@ mod tests {
     #[test]
     fn test_risk_gate_rejects_daily_loss_limit() {
         let gate = RiskGate::new();
-        // Capital = 10_000, daily_loss_limit = 1% → $100
-        // Two losses of $60 each = $120 > $100 → must deny
         let context = RiskContext {
             capital: dec!(10000),
             open_positions: vec![],
@@ -707,8 +707,6 @@ mod tests {
     #[test]
     fn test_risk_gate_allows_within_daily_loss_limit() {
         let gate = RiskGate::new();
-        // Capital = 10_000, daily_loss_limit = 1% → $100
-        // Two losses of $60 each = $120 > $100 → must deny
         let context = RiskContext {
             capital: dec!(10000),
             open_positions: vec![],
@@ -733,7 +731,6 @@ mod tests {
             total_notional_exposure: Decimal::ZERO,
             monthly_realized_pnl: Decimal::ZERO,
             monthly_unrealized_pnl: Decimal::ZERO,
-            // -100 is exactly 1.00% of 10000 — must be blocked
             daily_realized_pnl: dec!(-100),
             daily_unrealized_pnl: Decimal::ZERO,
         };
@@ -749,8 +746,6 @@ mod tests {
     #[test]
     fn test_risk_gate_daily_loss_includes_unrealized() {
         let gate = RiskGate::new();
-        // Capital = 10_000, daily_loss_limit = 1% → $100
-        // realized = -60, unrealized = -41 → total -101 > -100 → blocked
         let context = RiskContext {
             capital: dec!(10000),
             open_positions: vec![],
@@ -766,6 +761,181 @@ mod tests {
         assert!(
             matches!(verdict, RiskVerdict::Rejected { check: RiskCheck::DailyLossLimit, .. }),
             "daily PnL -101 (realized -60 + unrealized -41) must be blocked"
+        );
+    }
+
+    // =========================================================================
+    // Latent risk and slot calculation tests (ADR-0024)
+    // =========================================================================
+
+    #[test]
+    fn test_latent_risk_sum_long() {
+        let ctx = RiskContext::with_positions(
+            dec!(10000),
+            vec![summary_with_stop(
+                "BTCUSDT",
+                "long",
+                dec!(80000),
+                dec!(78400),
+                dec!(0.001),
+            )],
+        );
+        // LONG: (80000 - 78400) * 0.001 = 1.6
+        assert_eq!(ctx.latent_risk_sum(), dec!(1.6));
+    }
+
+    #[test]
+    fn test_latent_risk_sum_short() {
+        let ctx = RiskContext::with_positions(
+            dec!(10000),
+            vec![summary_with_stop(
+                "BTCUSDT",
+                "short",
+                dec!(80000),
+                dec!(81600),
+                dec!(0.001),
+            )],
+        );
+        // SHORT: (81600 - 80000) * 0.001 = 1.6
+        assert_eq!(ctx.latent_risk_sum(), dec!(1.6));
+    }
+
+    #[test]
+    fn test_latent_risk_breakeven_stop() {
+        // Stop at entry → risk = 0 (breakeven)
+        let ctx = RiskContext::with_positions(
+            dec!(10000),
+            vec![summary_with_stop(
+                "BTCUSDT",
+                "long",
+                dec!(80000),
+                dec!(80000),
+                dec!(0.001),
+            )],
+        );
+        assert_eq!(ctx.latent_risk_sum(), dec!(0));
+    }
+
+    #[test]
+    fn test_latent_risk_stop_beyond_entry() {
+        // LONG with stop above entry → max(0, negative) = 0
+        let ctx = RiskContext::with_positions(
+            dec!(10000),
+            vec![summary_with_stop(
+                "BTCUSDT",
+                "long",
+                dec!(80000),
+                dec!(81000),
+                dec!(0.001),
+            )],
+        );
+        assert_eq!(ctx.latent_risk_sum(), dec!(0));
+    }
+
+    #[test]
+    fn test_realized_loss_abs_negative() {
+        let ctx = RiskContext {
+            capital: dec!(10000),
+            open_positions: vec![],
+            total_notional_exposure: Decimal::ZERO,
+            monthly_realized_pnl: dec!(-150),
+            monthly_unrealized_pnl: Decimal::ZERO,
+            daily_realized_pnl: Decimal::ZERO,
+            daily_unrealized_pnl: Decimal::ZERO,
+        };
+        assert_eq!(ctx.realized_loss_abs(), dec!(150));
+    }
+
+    #[test]
+    fn test_realized_loss_abs_positive() {
+        let ctx = RiskContext {
+            capital: dec!(10000),
+            open_positions: vec![],
+            total_notional_exposure: Decimal::ZERO,
+            monthly_realized_pnl: dec!(200),
+            monthly_unrealized_pnl: Decimal::ZERO,
+            daily_realized_pnl: Decimal::ZERO,
+            daily_unrealized_pnl: Decimal::ZERO,
+        };
+        assert_eq!(ctx.realized_loss_abs(), dec!(0));
+    }
+
+    #[test]
+    fn test_slots_available_via_context() {
+        let policy = TradingPolicy::default();
+        // capital=100, budget=4, risk=1, no loss, no latent → 4 slots
+        let ctx = RiskContext::new(dec!(100));
+        assert_eq!(ctx.slots_available(&policy, dec!(100)), 4);
+    }
+
+    // =========================================================================
+    // ADR-0024 manual concept: policy-compliant large notional
+    // =========================================================================
+
+    #[test]
+    fn test_approves_large_notional_with_available_slots() {
+        // capital = 100, existing BTC long entry = 80000, stop = 78400, qty = 0.000625
+        // latent risk = (80000 - 78400) * 0.000625 = 1
+        // slots_available = floor((4 - 0 - 1) / 1) = 3
+        // proposed notional = 50 → 50% of capital, but policy allows it
+        let gate = RiskGate::new();
+        let existing = summary_with_stop(
+            "ETHUSDT", // different symbol to avoid duplicate check
+            "long",
+            dec!(80000),
+            dec!(78400),
+            dec!(0.000625),
+        );
+        let context = RiskContext::with_positions(dec!(100), vec![existing]);
+
+        let proposed = ProposedTrade {
+            symbol: "BTCUSDT".to_string(),
+            side: "long".to_string(),
+            quantity: dec!(0.000625),
+            entry_price: dec!(80000),
+            notional_value: dec!(50), // 50% of capital — would have been rejected by old SinglePositionConcentration
+            margin_required: dec!(5),
+        };
+
+        let verdict = gate.evaluate(&proposed, &context);
+        assert_eq!(
+            verdict,
+            RiskVerdict::Approved,
+            "50% notional must be approved with available slots"
+        );
+    }
+
+    #[test]
+    fn test_slots_exhausted_uses_monthly_drawdown_check() {
+        let gate = RiskGate::new();
+        // capital=100, budget=4, risk=1 per slot
+        // 4 positions each with latent risk 1 → remaining = 4 - 0 - 4 = 0 → no slots
+        let positions: Vec<PositionSummary> = (0..4)
+            .map(|i| {
+                summary_with_stop(
+                    &format!("SYM{}USDT", i),
+                    "long",
+                    dec!(80000),
+                    dec!(78400), // 2% stop → (80000-78400)*0.000625 = 1
+                    dec!(0.000625),
+                )
+            })
+            .collect();
+
+        let context = RiskContext::with_positions(dec!(100), positions);
+        let proposed = ProposedTrade {
+            symbol: "NEWUSDT".to_string(),
+            side: "long".to_string(),
+            quantity: dec!(0.001),
+            entry_price: dec!(50000),
+            notional_value: dec!(50),
+            margin_required: dec!(5),
+        };
+
+        let verdict = gate.evaluate(&proposed, &context);
+        assert!(
+            matches!(verdict, RiskVerdict::Rejected { check: RiskCheck::MonthlyDrawdown, .. }),
+            "slots exhausted must reject with MonthlyDrawdown check"
         );
     }
 }

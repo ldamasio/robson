@@ -743,7 +743,9 @@ mod tests {
     }
 
     fn saturated_context() -> RiskContext {
-        // 3 open positions — triggers MaxOpenPositions
+        // Exhaust monthly budget: 4 positions each with 100 latent risk.
+        // budget = 10000 * 4% = 400, risk_per_trade = 100
+        // latent_risk = 4 * 100 = 400 → remaining = 0 → no slots
         RiskContext::with_positions(
             dec!(10000),
             vec![
@@ -754,8 +756,43 @@ mod tests {
                     notional_value: dec!(1000),
                     margin_used: dec!(100),
                     unrealized_pnl: Decimal::ZERO,
-                };
-                3
+                    entry_price: dec!(10000),
+                    quantity: dec!(0.01),
+                    current_stop: dec!(0), // stop at 0 → latent = entry * qty = 100
+                },
+                PositionSummary {
+                    position_id: uuid::Uuid::nil(),
+                    symbol: "SOLUSDT".to_string(),
+                    side: "long".to_string(),
+                    notional_value: dec!(1000),
+                    margin_used: dec!(100),
+                    unrealized_pnl: Decimal::ZERO,
+                    entry_price: dec!(10000),
+                    quantity: dec!(0.01),
+                    current_stop: dec!(0),
+                },
+                PositionSummary {
+                    position_id: uuid::Uuid::nil(),
+                    symbol: "XRPUSDT".to_string(),
+                    side: "long".to_string(),
+                    notional_value: dec!(1000),
+                    margin_used: dec!(100),
+                    unrealized_pnl: Decimal::ZERO,
+                    entry_price: dec!(10000),
+                    quantity: dec!(0.01),
+                    current_stop: dec!(0),
+                },
+                PositionSummary {
+                    position_id: uuid::Uuid::nil(),
+                    symbol: "DOGEUSDT".to_string(),
+                    side: "long".to_string(),
+                    notional_value: dec!(1000),
+                    margin_used: dec!(100),
+                    unrealized_pnl: Decimal::ZERO,
+                    entry_price: dec!(10000),
+                    quantity: dec!(0.01),
+                    current_stop: dec!(0),
+                },
             ],
         )
     }
