@@ -1,8 +1,9 @@
-//! Binance REST API Client for Isolated Margin Trading
+//! Binance REST API Client for USD-M Futures Trading
 //!
 //! Provides REST API integration for:
-//! - Querying isolated margin account positions
-//! - Placing market orders for exit
+//! - Querying futures account positions via `/fapi/v2/positionRisk`
+//! - Placing market orders via `/fapi/v1/order`
+//! - Setting leverage via `/fapi/v1/leverage`
 //! - Authentication via HMAC SHA256 signatures
 //!
 //! # Authentication
@@ -27,9 +28,6 @@ use tokio::time::timeout;
 // =============================================================================
 // Constants
 // =============================================================================
-
-/// Binance REST API base URL (Spot/Margin)
-const BINANCE_API_URL: &str = "https://api.binance.com";
 
 /// Binance USD-M futures REST API base URL.
 const BINANCE_FUTURES_API_URL: &str = "https://fapi.binance.com";
@@ -80,7 +78,7 @@ pub enum BinanceRestError {
 // Binance REST Client
 // =============================================================================
 
-/// Binance REST API client for isolated margin trading.
+/// Binance REST API client for USD-M futures trading.
 pub struct BinanceRestClient {
     /// HTTP client
     client: Client,
@@ -88,17 +86,12 @@ pub struct BinanceRestClient {
     api_key: String,
     /// API secret
     api_secret: String,
-    /// Use testnet (for testing)
+    /// Use testnet
     testnet: bool,
 }
 
 impl BinanceRestClient {
-    /// Create a new Binance REST client.
-    ///
-    /// # Arguments
-    ///
-    /// * `api_key` - Binance API key
-    /// * `api_secret` - Binance API secret
+    /// Create a new Binance REST client for production.
     pub fn new(api_key: String, api_secret: String) -> Self {
         Self {
             client: Client::new(),
@@ -108,7 +101,7 @@ impl BinanceRestClient {
         }
     }
 
-    /// Create a client for testnet (for testing).
+    /// Create a client for the futures testnet.
     pub fn testnet(api_key: String, api_secret: String) -> Self {
         Self {
             client: Client::new(),
@@ -118,17 +111,8 @@ impl BinanceRestClient {
         }
     }
 
-    /// Get the base URL for API requests.
+    /// Get the base URL for USD-M futures API requests.
     fn base_url(&self) -> &str {
-        if self.testnet {
-            "https://testnet.binance.vision"
-        } else {
-            BINANCE_API_URL
-        }
-    }
-
-    /// Get the base URL for USD-M futures public API requests.
-    fn futures_base_url(&self) -> &str {
         if self.testnet {
             BINANCE_FUTURES_TESTNET_API_URL
         } else {
@@ -137,27 +121,18 @@ impl BinanceRestClient {
     }
 
     /// Build query string with signature for signed requests.
-    ///
-    /// Binance requires:
-    /// 1. All parameters in query string
-    /// 2. HMAC SHA256 signature of query string
-    /// 3. signature and timestamp as query parameters
     fn build_signed_query(
         &self,
         mut params: Vec<(&str, String)>,
     ) -> Result<String, BinanceRestError> {
-        // Add timestamp
         let timestamp = Utc::now().timestamp_millis().to_string();
         params.push(("timestamp", timestamp));
 
-        // Sort parameters (required by Binance)
         params.sort_by(|a, b| a.0.cmp(b.0));
 
-        // Build query string
         let query_string: String =
             params.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&");
 
-        // Create signature
         use hmac::{Hmac, Mac};
         use sha2::Sha256;
 
@@ -169,7 +144,6 @@ impl BinanceRestClient {
         mac.update(query_string.as_bytes());
         let signature = hex::encode(mac.finalize().into_bytes());
 
-        // Add signature to query string
         Ok(format!("{}&signature={}", query_string, signature))
     }
 
@@ -179,22 +153,12 @@ impl BinanceRestClient {
         endpoint: &str,
         params: Vec<(&str, String)>,
     ) -> Result<String, BinanceRestError> {
-        self.get_public_from_base(self.base_url(), endpoint, params).await
-    }
-
-    /// Send a GET request to a public endpoint on an explicit base URL.
-    async fn get_public_from_base(
-        &self,
-        base_url: &str,
-        endpoint: &str,
-        params: Vec<(&str, String)>,
-    ) -> Result<String, BinanceRestError> {
         let url = if params.is_empty() {
-            format!("{}{}", base_url, endpoint)
+            format!("{}{}", self.base_url(), endpoint)
         } else {
             let query =
                 params.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&");
-            format!("{}{}?{}", base_url, endpoint, query)
+            format!("{}{}?{}", self.base_url(), endpoint, query)
         };
 
         let response =
@@ -208,7 +172,6 @@ impl BinanceRestClient {
             response.text().await.map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
 
         if !status.is_success() {
-            // Try to parse Binance error response
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
                 return Err(BinanceRestError::ApiError { code: err.code, msg: err.msg });
             }
@@ -240,7 +203,6 @@ impl BinanceRestClient {
             response.text().await.map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
 
         if !status.is_success() {
-            // Try to parse Binance error response
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
                 return Err(BinanceRestError::ApiError { code: err.code, msg: err.msg });
             }
@@ -272,7 +234,6 @@ impl BinanceRestClient {
             response.text().await.map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
 
         if !status.is_success() {
-            // Try to parse Binance error response
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
                 return Err(BinanceRestError::ApiError { code: err.code, msg: err.msg });
             }
@@ -313,118 +274,92 @@ impl BinanceRestClient {
         Ok(body)
     }
 
-    /// Get isolated margin account information for a symbol.
-    ///
-    /// Returns details about open positions, assets, and liabilities.
-    ///
-    /// # Endpoint
-    ///
-    /// `GET /sapi/v1/margin/isolated/account`
-    ///
-    /// # Example
-    ///
-    /// ```ignore
-    /// let account = client.get_isolated_margin_account("BTCUSDT").await?;
-    /// for asset in account.assets {
-    ///     println!("{}: {}", asset.asset, asset.net_asset);
-    /// }
-    /// ```
-    pub async fn get_isolated_margin_account(
-        &self,
-        symbol: &str,
-    ) -> Result<IsolatedMarginAccount, BinanceRestError> {
-        let params = vec![("symbols", symbol.to_string())];
+    // =========================================================================
+    // Futures Position API
+    // =========================================================================
 
-        let body = self.get_signed("/sapi/v1/margin/isolated/account", params).await?;
-
-        serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
-    }
-
-    /// Get isolated margin account information for all symbols.
-    pub async fn get_all_isolated_margin_accounts(
-        &self,
-    ) -> Result<Vec<IsolatedMarginAccount>, BinanceRestError> {
-        let body = self.get_signed("/sapi/v1/margin/isolated/account", vec![]).await?;
-
-        // Response is an array of accounts
-        serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
-    }
-
-    /// Get current open positions for a symbol.
+    /// Get current open futures positions for a symbol.
     ///
-    /// Returns positions that have non-zero quantity.
+    /// Queries `GET /fapi/v2/positionRisk` (signed) and returns positions
+    /// with non-zero `positionAmt`.
     pub async fn get_open_positions(
         &self,
         symbol: &str,
-    ) -> Result<Vec<IsolatedMarginPosition>, BinanceRestError> {
-        let account = self.get_isolated_margin_account(symbol).await?;
+    ) -> Result<Vec<FuturesPosition>, BinanceRestError> {
+        let params = vec![("symbol", symbol.to_string())];
 
-        let mut positions = Vec::new();
+        let body = self.get_signed("/fapi/v2/positionRisk", params).await?;
 
-        for asset in account.assets {
-            // Check if we have a long position (base asset)
-            if asset.net_asset_value_btc != Decimal::ZERO {
-                // Determine side based on borrowed amount
-                let borrowed = asset.borrowed.clone().unwrap_or_default();
-                let side = if borrowed > Decimal::ZERO {
-                    Side::Short
-                } else {
+        let positions: Vec<PositionRiskResponse> =
+            serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+
+        positions
+            .into_iter()
+            .filter(|p| p.position_amt != Decimal::ZERO)
+            .map(|p| {
+                let side = if p.position_amt > Decimal::ZERO {
                     Side::Long
+                } else {
+                    Side::Short
                 };
 
-                // Get current price from account
-                let price = account
-                    .total_asset_of_btc
-                    .checked_div(account.total_liability_of_btc)
-                    .unwrap_or_else(|| Decimal::ONE);
+                let quantity = p.position_amt.abs();
+                let leverage: u8 = p.leverage.parse().map_err(|e: std::num::ParseIntError| {
+                    BinanceRestError::ParseError(format!(
+                        "Invalid leverage '{}': {}",
+                        p.leverage, e
+                    ))
+                })?;
 
-                positions.push(IsolatedMarginPosition {
-                    symbol: symbol.to_string(),
+                Ok(FuturesPosition {
+                    symbol: p.symbol,
                     side,
-                    quantity: Quantity::new(asset.net_asset.abs()).map_err(|e| {
+                    quantity: Quantity::new(quantity).map_err(|e| {
                         BinanceRestError::ParseError(format!("Invalid quantity: {}", e))
                     })?,
-                    entry_price: Price::new(price).map_err(|e| {
-                        BinanceRestError::ParseError(format!("Invalid price: {}", e))
+                    entry_price: Price::new(p.entry_price).map_err(|e| {
+                        BinanceRestError::ParseError(format!("Invalid entry price: {}", e))
                     })?,
-                    // Use asset quote as asset name
-                    asset: asset.asset.clone(),
-                });
-            }
-        }
-
-        Ok(positions)
+                    unrealized_pnl: p.unrealized_profit,
+                    leverage,
+                })
+            })
+            .collect()
     }
 
     // =========================================================================
     // Order API
     // =========================================================================
 
-    /// Place a market order on isolated margin.
+    /// Place a market order on USD-M futures.
     ///
     /// # Arguments
     ///
     /// * `symbol` - Trading pair symbol (e.g., "BTCUSDT")
-    /// * `side` - Order side (BUY or SELL)
+    /// * `side` - Order side (`BUY` or `SELL`)
     /// * `quantity` - Order quantity
     /// * `client_order_id` - Optional client order ID for idempotency
+    /// * `reduce_only` - If true, only reduces existing position (for exits)
     ///
     /// # Endpoint
     ///
-    /// `POST /sapi/v1/margin/order`
+    /// `POST /fapi/v1/order`
     ///
-    /// # Example
+    /// # Side mapping (One-way mode)
     ///
-    /// ```ignore
-    /// let order = client.place_market_order("BTCUSDT", Side::Sell, dec!(0.1), None).await?;
-    /// println!("Order ID: {}", order.order_id);
-    /// ```
+    /// | Position | Action | Side | reduceOnly |
+    /// |----------|--------|------|------------|
+    /// | Long     | Open   | BUY  | false      |
+    /// | Long     | Close  | SELL | true       |
+    /// | Short    | Open   | SELL | false      |
+    /// | Short    | Close  | BUY  | true       |
     pub async fn place_market_order(
         &self,
         symbol: &str,
         side: Side,
         quantity: Decimal,
         client_order_id: Option<&str>,
+        reduce_only: bool,
     ) -> Result<BinanceOrderResponse, BinanceRestError> {
         let side_str = match side {
             Side::Long => "BUY",
@@ -436,19 +371,24 @@ impl BinanceRestClient {
             ("side", side_str.to_string()),
             ("type", "MARKET".to_string()),
             ("quantity", quantity.to_string()),
-            ("isIsolated", "true".to_string()),
         ];
+
+        if reduce_only {
+            params.push(("reduceOnly", "true".to_string()));
+        }
 
         if let Some(coid) = client_order_id {
             params.push(("newClientOrderId", coid.to_string()));
         }
 
-        let body = self.post_signed("/sapi/v1/margin/order", params).await?;
+        let body = self.post_signed("/fapi/v1/order", params).await?;
 
         serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
     }
 
     /// Cancel an open order.
+    ///
+    /// `DELETE /fapi/v1/order`
     pub async fn cancel_order(
         &self,
         symbol: &str,
@@ -457,21 +397,20 @@ impl BinanceRestClient {
         let params = vec![
             ("symbol", symbol.to_string()),
             ("orderId", order_id.to_string()),
-            ("isIsolated", "true".to_string()),
         ];
 
-        let body = self.delete_signed("/sapi/v1/margin/order", params).await?;
+        let body = self.delete_signed("/fapi/v1/order", params).await?;
 
         serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
     }
 
     /// Get current price for a symbol.
     ///
-    /// Uses public endpoint, no signature required.
+    /// `GET /fapi/v1/ticker/price` (public, no signature required).
     pub async fn get_price(&self, symbol: &str) -> Result<Price, BinanceRestError> {
         let params = vec![("symbol", symbol.to_string())];
 
-        let body = self.get_public("/api/v3/ticker/price", params).await?;
+        let body = self.get_public("/fapi/v1/ticker/price", params).await?;
 
         let response: PriceResponse =
             serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
@@ -482,8 +421,6 @@ impl BinanceRestClient {
     }
 
     /// Get USD-M futures klines for a symbol.
-    ///
-    /// Uses the public futures endpoint:
     ///
     /// `GET /fapi/v1/klines?symbol={symbol}&interval={interval}&limit={limit}`
     ///
@@ -507,19 +444,14 @@ impl BinanceRestClient {
             ("limit", limit.to_string()),
         ];
 
-        let body = self
-            .get_public_from_base(self.futures_base_url(), "/fapi/v1/klines", params)
-            .await?;
+        let body = self.get_public("/fapi/v1/klines", params).await?;
 
         parse_futures_klines(&body)
     }
 
     /// Query order status.
     ///
-    /// # Arguments
-    ///
-    /// * `symbol` - Trading pair (e.g., "BTCUSDT")
-    /// * `order_id` - Exchange order ID
+    /// `GET /fapi/v1/order` (signed).
     pub async fn get_order_status(
         &self,
         symbol: &str,
@@ -530,19 +462,33 @@ impl BinanceRestClient {
             ("orderId", order_id.to_string()),
         ];
 
-        let body = self.get_signed("/sapi/v1/margin/order", params).await?;
+        let body = self.get_signed("/fapi/v1/order", params).await?;
 
         serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
     }
 
-    /// Ping Binance API to check connectivity.
+    /// Set leverage for a symbol.
     ///
-    /// Uses public endpoint, no authentication required.
-    /// Returns Ok(()) if API is reachable, Err otherwise.
-    pub async fn ping(&self) -> Result<(), BinanceRestError> {
-        let body = self.get_public("/api/v3/ping", vec![]).await?;
+    /// `POST /fapi/v1/leverage` (signed).
+    ///
+    /// Should be called at startup for each symbol before any trading.
+    pub async fn set_leverage(&self, symbol: &str, leverage: u8) -> Result<(), BinanceRestError> {
+        let params = vec![
+            ("symbol", symbol.to_string()),
+            ("leverage", leverage.to_string()),
+        ];
 
-        // Ping returns empty JSON object {}
+        self.post_signed("/fapi/v1/leverage", params).await?;
+
+        Ok(())
+    }
+
+    /// Ping Binance futures API to check connectivity.
+    ///
+    /// `GET /fapi/v1/ping` (public, no authentication required).
+    pub async fn ping(&self) -> Result<(), BinanceRestError> {
+        let body = self.get_public("/fapi/v1/ping", vec![]).await?;
+
         if body.trim() == "{}" {
             Ok(())
         } else {
@@ -562,57 +508,32 @@ struct BinanceErrorResponse {
     msg: String,
 }
 
-/// Isolated margin account information.
+/// Response from `GET /fapi/v2/positionRisk`.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct IsolatedMarginAccount {
-    /// Symbol for this account
-    pub symbol: String,
-    /// Assets in this isolated margin account
-    pub assets: Vec<IsolatedMarginAsset>,
-    /// Total asset of BTC (for calculating total value)
-    pub total_asset_of_btc: Decimal,
-    /// Total liability of BTC
-    pub total_liability_of_btc: Decimal,
-    /// Total asset of USDT
-    pub total_asset_of_usdt: Decimal,
-    /// Total liability of USDT
-    pub total_liability_of_usdt: Decimal,
+struct PositionRiskResponse {
+    symbol: String,
+    position_amt: Decimal,
+    entry_price: Decimal,
+    unrealized_profit: Decimal,
+    leverage: String,
 }
 
-/// Asset in isolated margin account.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub struct IsolatedMarginAsset {
-    /// Asset symbol (e.g., "BTC", "USDT")
-    pub asset: String,
-    /// Borrowed amount
-    pub borrowed: Option<Decimal>,
-    /// Free amount
-    pub free: Decimal,
-    /// Locked amount
-    pub locked: Decimal,
-    /// Interest
-    pub interest: Decimal,
-    /// Net asset (free - borrowed - interest)
-    pub net_asset: Decimal,
-    /// Net asset value in BTC
-    pub net_asset_value_btc: Decimal,
-}
-
-/// Position detected in isolated margin.
+/// Position detected in USD-M futures.
 #[derive(Debug, Clone)]
-pub struct IsolatedMarginPosition {
+pub struct FuturesPosition {
     /// Trading symbol (e.g., "BTCUSDT")
     pub symbol: String,
-    /// Position side (Long or Short)
+    /// Position side (Long if positionAmt > 0, Short if < 0)
     pub side: Side,
-    /// Position quantity
+    /// Position quantity (absolute value of positionAmt)
     pub quantity: Quantity,
-    /// Approximate entry price
+    /// Entry price
     pub entry_price: Price,
-    /// Asset being held (e.g., "BTC" for long, "USDT" for short)
-    pub asset: String,
+    /// Unrealized PnL
+    pub unrealized_pnl: Decimal,
+    /// Current leverage
+    pub leverage: u8,
 }
 
 /// Parsed Binance futures kline.
@@ -663,7 +584,7 @@ pub struct BinanceOrderResponse {
     /// Type
     #[serde(rename = "type")]
     pub order_type: String,
-    /// Individual fills (present in margin market order responses)
+    /// Individual fills
     #[serde(default)]
     pub fills: Vec<BinanceFill>,
 }
@@ -790,7 +711,6 @@ mod tests {
         let params = vec![("symbol", "BTCUSDT".to_string())];
         let query = client.build_signed_query(params).unwrap();
 
-        // Query should contain timestamp and signature
         assert!(query.contains("timestamp="));
         assert!(query.contains("signature="));
         assert!(query.contains("symbol=BTCUSDT"));
@@ -800,32 +720,32 @@ mod tests {
     fn test_build_signed_query_sorts_params() {
         let client = BinanceRestClient::new("test_key".to_string(), "test_secret".to_string());
 
-        // Add params in reverse alphabetical order
         let params = vec![
             ("symbol", "BTCUSDT".to_string()),
             ("side", "SELL".to_string()),
         ];
         let query = client.build_signed_query(params).unwrap();
 
-        // Params should be sorted (side comes before symbol)
         let side_idx = query.find("side=").unwrap();
         let symbol_idx = query.find("symbol=").unwrap();
         assert!(side_idx < symbol_idx);
     }
 
     #[test]
-    fn test_isolated_margin_position_creation() {
-        let position = IsolatedMarginPosition {
+    fn test_futures_position_creation() {
+        let position = FuturesPosition {
             symbol: "BTCUSDT".to_string(),
             side: Side::Long,
             quantity: Quantity::new(dec!(0.1)).unwrap(),
             entry_price: Price::new(dec!(95000)).unwrap(),
-            asset: "BTC".to_string(),
+            unrealized_pnl: dec!(5.0),
+            leverage: 10,
         };
 
         assert_eq!(position.symbol, "BTCUSDT");
         assert_eq!(position.side, Side::Long);
         assert_eq!(position.quantity.as_decimal(), dec!(0.1));
+        assert_eq!(position.leverage, 10);
     }
 
     #[test]
@@ -862,11 +782,52 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_price_requires_no_signature() {
-        // This test just verifies the method compiles and has correct signature
-        // Actual API call would require credentials
         let client = BinanceRestClient::new("key".to_string(), "secret".to_string());
-
-        // Method should exist and return correct type
         let _ = client.get_price("BTCUSDT");
+    }
+
+    #[test]
+    fn test_position_risk_response_parsing() {
+        let body = r#"[
+            {
+                "symbol": "BTCUSDT",
+                "initialMargin": "5.00000000",
+                "maintMargin": "0.25000000",
+                "unrealizedProfit": "0.10000000",
+                "positionInitialMargin": "5.00000000",
+                "openOrderInitialMargin": "0.00000000",
+                "leverage": "10",
+                "isolated": false,
+                "entryPrice": "75000.00000000",
+                "maxNotional": "1000000.00000000",
+                "positionSide": "BOTH",
+                "positionAmt": "0.00100000",
+                "updatedTime": 1234567890000
+            },
+            {
+                "symbol": "ETHUSDT",
+                "initialMargin": "0",
+                "maintMargin": "0",
+                "unrealizedProfit": "0",
+                "positionInitialMargin": "0",
+                "openOrderInitialMargin": "0",
+                "leverage": "10",
+                "isolated": false,
+                "entryPrice": "0.00000000",
+                "maxNotional": "1000000.00000000",
+                "positionSide": "BOTH",
+                "positionAmt": "0",
+                "updatedTime": 1234567890000
+            }
+        ]"#;
+
+        let positions: Vec<PositionRiskResponse> = serde_json::from_str(body).unwrap();
+        // ETHUSDT has zero positionAmt — should be filtered
+        let active: Vec<_> =
+            positions.into_iter().filter(|p| p.position_amt != Decimal::ZERO).collect();
+        assert_eq!(active.len(), 1);
+        assert_eq!(active[0].symbol, "BTCUSDT");
+        assert_eq!(active[0].position_amt, dec!(0.001));
+        assert_eq!(active[0].leverage, "10");
     }
 }

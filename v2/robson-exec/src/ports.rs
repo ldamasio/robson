@@ -19,13 +19,13 @@ use crate::error::ExecError;
 ///
 /// Implementations:
 /// - `StubExchange` - For testing (immediate fills at configured price)
-/// - `BinanceAdapter` - Real Binance isolated margin (Phase 9)
+/// - `BinanceAdapter` - Real Binance USD-M Futures
 #[async_trait]
 pub trait ExchangePort: Send + Sync {
-    /// Validate account is in isolated margin mode with expected leverage.
+    /// Validate account is in One-way position mode with expected leverage.
     ///
     /// **SAFETY CHECK**: Must be called before placing any order.
-    /// Fails if account is not in isolated margin mode or leverage != expected.
+    /// Fails if account is not in One-way mode or leverage != expected.
     ///
     /// # Arguments
     ///
@@ -34,12 +34,12 @@ pub trait ExchangePort: Send + Sync {
     ///
     /// # Returns
     ///
-    /// `Ok(MarginSettings)` if valid, `Err` with explanation if not.
-    async fn validate_margin_settings(
+    /// `Ok(FuturesSettings)` if valid, `Err` with explanation if not.
+    async fn validate_futures_settings(
         &self,
         symbol: &Symbol,
         expected_leverage: u8,
-    ) -> Result<MarginSettings, ExecError>;
+    ) -> Result<FuturesSettings, ExecError>;
 
     /// Place a market order.
     ///
@@ -49,6 +49,7 @@ pub trait ExchangePort: Send + Sync {
     /// * `side` - Buy or Sell
     /// * `quantity` - Amount to trade
     /// * `client_order_id` - Unique ID for idempotency
+    /// * `reduce_only` - If true, order only reduces existing position (exit)
     ///
     /// # Returns
     ///
@@ -59,6 +60,7 @@ pub trait ExchangePort: Send + Sync {
         side: OrderSide,
         quantity: Quantity,
         client_order_id: &str,
+        reduce_only: bool,
     ) -> Result<OrderResult, ExecError>;
 
     /// Cancel an existing order.
@@ -88,11 +90,11 @@ pub trait ExchangePort: Send + Sync {
     async fn health_check(&self) -> Result<(), ExecError>;
 }
 
-/// Margin account settings for a symbol.
+/// USD-M Futures account settings for a symbol.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MarginSettings {
-    /// Is this an isolated margin account (not cross)
-    pub is_isolated: bool,
+pub struct FuturesSettings {
+    /// Position mode (e.g., "One-way")
+    pub position_mode: String,
     /// Current leverage multiplier
     pub leverage: u8,
     /// Symbol this applies to
@@ -240,6 +242,21 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
+
+    #[test]
+    fn test_futures_settings_serialization() {
+        let settings = FuturesSettings {
+            position_mode: "One-way".to_string(),
+            leverage: 10,
+            symbol: "BTCUSDT".to_string(),
+        };
+
+        let json = serde_json::to_string(&settings).unwrap();
+        let parsed: FuturesSettings = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed.position_mode, "One-way");
+        assert_eq!(parsed.leverage, 10);
+    }
 
     #[test]
     fn test_order_result_serialization() {

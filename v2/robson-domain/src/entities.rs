@@ -323,7 +323,7 @@ pub enum ExitReason {
 /// Order represents an instruction to buy/sell on the exchange
 ///
 /// NOTE: Trade entity was removed - fill info is consolidated here
-/// since isolated margin market orders execute in single fill.
+/// since futures market orders execute in single fill.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Order {
     pub id: OrderId,
@@ -453,7 +453,7 @@ pub enum OrderStatus {
     Pending,
     /// Submitted to exchange
     Submitted,
-    /// Partially filled (rare in isolated margin)
+    /// Partially filled (rare in futures)
     PartialFill,
     /// Completely filled
     Filled,

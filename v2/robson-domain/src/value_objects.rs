@@ -294,7 +294,7 @@ pub struct RiskConfig {
 }
 
 impl RiskConfig {
-    /// Fixed leverage for all positions (10x isolated margin)
+    /// Fixed leverage
     pub const LEVERAGE: u8 = 10;
 
     /// Fixed risk per trade: 1% of capital (v3 policy — non-negotiable)

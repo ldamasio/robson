@@ -67,7 +67,7 @@ pub enum ActionResult {
 /// The Executor:
 /// 1. Receives actions from the Engine
 /// 2. Records intents before execution
-/// 3. **Validates margin settings before orders** (isolated + 10x)
+/// 3. **Validates futures settings before orders** (One-way mode + leverage)
 /// 4. Executes via Exchange port
 /// 5. Records results for audit trail
 pub struct Executor<E: ExchangePort, S: Store> {
@@ -231,13 +231,13 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             }
         }
 
-        // 2. SAFETY CHECK: Validate margin settings (isolated + 10x)
+        // 2. SAFETY CHECK: Validate futures settings (One-way + leverage)
         info!(
             %position_id,
             symbol = %symbol.as_pair(),
-            "Validating margin settings (isolated + {}x)", RiskConfig::LEVERAGE
+            "Validating futures settings (One-way + {}x)", RiskConfig::LEVERAGE
         );
-        if let Err(e) = self.exchange.validate_margin_settings(&symbol, RiskConfig::LEVERAGE).await
+        if let Err(e) = self.exchange.validate_futures_settings(&symbol, RiskConfig::LEVERAGE).await
         {
             let event = Event::EntryExecutionRejected {
                 position_id,
@@ -284,7 +284,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         // 5. Execute on exchange
         let result = self
             .exchange
-            .place_market_order(&symbol, side, quantity, &client_order_id)
+            .place_market_order(&symbol, side, quantity, &client_order_id, false)
             .await;
 
         // 6. Record result and emit appropriate domain event
@@ -356,14 +356,14 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         // Generate unique intent ID for exit
         let intent_id = Uuid::now_v7();
 
-        // 1. SAFETY CHECK: Validate margin settings (isolated + 10x)
+        // 1. SAFETY CHECK: Validate futures settings (One-way + leverage)
         // Even for exits, we verify account state hasn't changed
         info!(
             %position_id,
             symbol = %symbol.as_pair(),
-            "Validating margin settings for exit (isolated + {}x)", RiskConfig::LEVERAGE
+            "Validating futures settings for exit (One-way + {}x)", RiskConfig::LEVERAGE
         );
-        self.exchange.validate_margin_settings(&symbol, RiskConfig::LEVERAGE).await?;
+        self.exchange.validate_futures_settings(&symbol, RiskConfig::LEVERAGE).await?;
 
         // 2. Record intent
         let intent = Intent::new(intent_id, position_id, IntentAction::PlaceExitOrder {
@@ -389,7 +389,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         // 3. Execute on exchange
         let result = self
             .exchange
-            .place_market_order(&symbol, side, quantity, &intent_id.to_string())
+            .place_market_order(&symbol, side, quantity, &intent_id.to_string(), true)
             .await;
 
         // 4. Record result and emit ExitOrderPlaced event on success
@@ -676,7 +676,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_entry_margin_rejection_returns_entry_execution_rejected() {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
-        exchange.set_margin_settings(false, RiskConfig::LEVERAGE);
+        exchange.set_futures_settings("Hedge", RiskConfig::LEVERAGE);
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Executor::new(exchange, journal, store);
@@ -709,7 +709,7 @@ mod tests {
             } => {
                 assert_eq!(*actual_cycle_id, cycle_id);
                 assert!(*recoverable);
-                assert!(error.contains("MARGIN SAFETY VIOLATION"));
+                assert!(error.contains("FUTURES SAFETY VIOLATION"));
             },
             other => panic!("Expected EntryExecutionRejected, got {:?}", other),
         }

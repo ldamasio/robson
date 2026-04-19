@@ -45,16 +45,16 @@ pub enum ExecError {
     #[error("Timeout: {0}")]
     Timeout(String),
 
-    /// Margin safety check failed (critical safety violation)
+    /// Futures safety check failed (critical safety violation)
     ///
     /// This error is returned when the account is not in the expected
-    /// margin mode (isolated) or leverage setting (10x).
+    /// position mode (One-way) or leverage setting.
     /// **DO NOT proceed with orders when this error occurs.**
-    #[error("MARGIN SAFETY VIOLATION: expected {expected}, got {actual}. {advice}")]
-    MarginSafetyViolation {
-        /// What was expected (e.g., "isolated margin", "10x leverage")
+    #[error("FUTURES SAFETY VIOLATION: expected {expected}, got {actual}. {advice}")]
+    FuturesSafetyViolation {
+        /// What was expected (e.g., "One-way mode", "10x leverage")
         expected: String,
-        /// What was found (e.g., "cross margin", "5x leverage")
+        /// What was found (e.g., "Hedge mode", "5x leverage")
         actual: String,
         /// Advice on how to fix
         advice: String,

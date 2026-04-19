@@ -454,7 +454,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             symbol: record.proposed.symbol.clone(),
             side: record.proposed.side.clone(),
             notional_value: record.proposed.notional_value,
-            margin_used: record.proposed.margin_required,
+            initial_margin: record.proposed.initial_margin,
             unrealized_pnl: Decimal::ZERO,
             entry_price: record.proposed.entry_price,
             quantity: record.proposed.quantity,
@@ -558,14 +558,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     return None;
                 }
                 let notional_value = qty * entry_price_decimal;
-                let margin_used =
+                let initial_margin =
                     notional_value / Decimal::from(robson_domain::RiskConfig::LEVERAGE as u32);
                 Some(PositionSummary {
                     position_id: p.id,
                     symbol: p.symbol.as_pair(),
                     side: format!("{}", p.side).to_lowercase(),
                     notional_value,
-                    margin_used,
+                    initial_margin,
                     unrealized_pnl: Decimal::ZERO,
                     entry_price: entry_price_decimal,
                     quantity: qty,
@@ -965,7 +965,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let qty_decimal = quantity.as_decimal();
         let entry_price = signal.entry_price.as_decimal();
         let notional_value = qty_decimal * entry_price;
-        let margin_required =
+        let initial_margin =
             notional_value / Decimal::from(robson_domain::RiskConfig::LEVERAGE as u32);
 
         Some(ProposedTrade {
@@ -974,7 +974,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             quantity: qty_decimal,
             entry_price,
             notional_value,
-            margin_required,
+            initial_margin,
         })
     }
 
@@ -2876,7 +2876,7 @@ mod tests {
     #[tokio::test]
     async fn test_margin_rejection_moves_to_error_without_rearming_detector() {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
-        exchange.set_margin_settings(false, RiskConfig::LEVERAGE);
+        exchange.set_futures_settings("Hedge", RiskConfig::LEVERAGE);
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(exchange, journal, store.clone()));

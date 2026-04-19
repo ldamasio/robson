@@ -36,10 +36,10 @@ use tokio_tungstenite::{connect_async, tungstenite::Message, MaybeTlsStream, Web
 // =============================================================================
 
 /// Binance WebSocket base URL (production)
-const BINANCE_WS_URL: &str = "wss://stream.binance.com:9443";
+const BINANCE_WS_URL: &str = "wss://fstream.binance.com";
 
-/// Binance WebSocket base URL (testnet)
-const BINANCE_WS_TESTNET_URL: &str = "wss://stream.testnet.binance.vision";
+/// Binance USD-M futures WebSocket base URL (testnet)
+const BINANCE_WS_TESTNET_URL: &str = "wss://stream.binancefuture.com";
 
 // =============================================================================
 // Errors

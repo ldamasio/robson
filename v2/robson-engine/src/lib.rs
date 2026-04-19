@@ -494,7 +494,7 @@ impl Engine {
     /// * `filled_quantity` - Actual filled quantity
     /// * `fee` - Trading fee paid (from OrderResult)
     /// * `filled_at` - When the fill occurred (from exchange, not local clock)
-    /// * `binance_position_id` - Optional Binance isolated margin position ID
+    /// * `binance_position_id` - Optional Binance USD-M Futures position ID
     ///
     /// # Returns
     ///

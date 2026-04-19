@@ -149,7 +149,7 @@ impl Exchange {
     pub fn base_url(&self) -> &'static str {
         match self {
             Exchange::Binance => "https://api.binance.com",
-            Exchange::BinanceTestnet => "https://testnet.binance.vision",
+            Exchange::BinanceTestnet => "https://testnet.binancefuture.com",
         }
     }
 }
@@ -413,7 +413,7 @@ mod tests {
     #[test]
     fn test_exchange_base_url() {
         assert_eq!(Exchange::Binance.base_url(), "https://api.binance.com");
-        assert_eq!(Exchange::BinanceTestnet.base_url(), "https://testnet.binance.vision");
+        assert_eq!(Exchange::BinanceTestnet.base_url(), "https://testnet.binancefuture.com");
     }
 
     #[test]

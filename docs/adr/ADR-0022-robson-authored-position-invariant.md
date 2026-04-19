@@ -58,8 +58,8 @@ O(1) for the reconciliation worker (new index / projection).
 
 A **Position Reconciliation Worker** runs periodically in the runtime. On each scan:
 
-1. Query Binance for all open positions across all account types (spot, isolated
-   margin, cross margin, futures) and all symbols.
+1. Query Binance for all open positions across all account types (spot, margin,
+   USD-M Futures) and all symbols.
 2. For each open position, look up the matching `entry_order_placed` event in
    `event_log` by exchange order id.
 3. If no matching event exists → classify the position as **UNTRACKED**.

@@ -104,8 +104,8 @@ pub struct PositionSummary {
     pub side: String,
     /// Notional value (quantity × price)
     pub notional_value: Decimal,
-    /// Margin used
-    pub margin_used: Decimal,
+    /// Initial margin (notional / leverage)
+    pub initial_margin: Decimal,
     /// Unrealized PnL
     pub unrealized_pnl: Decimal,
     /// Entry price (for latent risk calculation)
@@ -294,8 +294,8 @@ pub struct ProposedTrade {
     pub entry_price: Decimal,
     /// Notional value (quantity × entry_price)
     pub notional_value: Decimal,
-    /// Margin required (notional / leverage)
-    pub margin_required: Decimal,
+    /// Initial margin (notional / leverage)
+    pub initial_margin: Decimal,
 }
 
 // =============================================================================
@@ -506,7 +506,7 @@ mod tests {
             quantity: dec!(0.02),
             entry_price: dec!(50000),
             notional_value: dec!(1000),
-            margin_required: dec!(100),
+            initial_margin: dec!(100),
         }
     }
 
@@ -522,7 +522,7 @@ mod tests {
             symbol: symbol.to_string(),
             side: side.to_string(),
             notional_value: qty * entry,
-            margin_used: qty * entry / dec!(10),
+            initial_margin: qty * entry / dec!(10),
             unrealized_pnl: Decimal::ZERO,
             entry_price: entry,
             quantity: qty,
@@ -548,7 +548,7 @@ mod tests {
             symbol: "BTCUSDT".to_string(),
             side: "long".to_string(),
             notional_value: dec!(1000),
-            margin_used: dec!(100),
+            initial_margin: dec!(100),
             unrealized_pnl: dec!(0),
             entry_price: dec!(50000),
             quantity: dec!(0.02),
@@ -681,7 +681,7 @@ mod tests {
             symbol: "BTCUSDT".to_string(),
             side: "short".to_string(),
             notional_value: dec!(1000),
-            margin_used: dec!(100),
+            initial_margin: dec!(100),
             unrealized_pnl: dec!(0),
             entry_price: dec!(50000),
             quantity: dec!(0.02),
@@ -923,7 +923,7 @@ mod tests {
             entry_price: dec!(80000),
             notional_value: dec!(50), /* 50% of capital — would have been rejected by old
                                        * SinglePositionConcentration */
-            margin_required: dec!(5),
+            initial_margin: dec!(5),
         };
 
         let verdict = gate.evaluate(&proposed, &context);
@@ -958,7 +958,7 @@ mod tests {
             quantity: dec!(0.001),
             entry_price: dec!(50000),
             notional_value: dec!(50),
-            margin_required: dec!(5),
+            initial_margin: dec!(5),
         };
 
         let verdict = gate.evaluate(&proposed, &context);

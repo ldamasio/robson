@@ -145,7 +145,7 @@ pub enum Event {
         fee: Decimal,
         /// Initial trailing stop price
         initial_stop: Price,
-        /// Binance isolated margin position ID (for SafetyNet coordination)
+        /// Binance USD-M Futures position ID (for SafetyNet coordination)
         binance_position_id: Option<String>,
         /// When the fill occurred
         timestamp: DateTime<Utc>,

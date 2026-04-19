@@ -734,7 +734,7 @@ mod tests {
             quantity: dec!(0.02),
             entry_price: dec!(50000),
             notional_value: dec!(1000),
-            margin_required: dec!(100),
+            initial_margin: dec!(100),
         }
     }
 
@@ -752,7 +752,7 @@ mod tests {
                 symbol: "ETHUSDT".to_string(),
                 side: "long".to_string(),
                 notional_value: dec!(1000),
-                margin_used: dec!(100),
+                initial_margin: dec!(100),
                 unrealized_pnl: Decimal::ZERO,
                 entry_price: dec!(10000),
                 quantity: dec!(0.01),
@@ -763,7 +763,7 @@ mod tests {
                 symbol: "SOLUSDT".to_string(),
                 side: "long".to_string(),
                 notional_value: dec!(1000),
-                margin_used: dec!(100),
+                initial_margin: dec!(100),
                 unrealized_pnl: Decimal::ZERO,
                 entry_price: dec!(10000),
                 quantity: dec!(0.01),
@@ -774,7 +774,7 @@ mod tests {
                 symbol: "XRPUSDT".to_string(),
                 side: "long".to_string(),
                 notional_value: dec!(1000),
-                margin_used: dec!(100),
+                initial_margin: dec!(100),
                 unrealized_pnl: Decimal::ZERO,
                 entry_price: dec!(10000),
                 quantity: dec!(0.01),
@@ -785,7 +785,7 @@ mod tests {
                 symbol: "DOGEUSDT".to_string(),
                 side: "long".to_string(),
                 notional_value: dec!(1000),
-                margin_used: dec!(100),
+                initial_margin: dec!(100),
                 unrealized_pnl: Decimal::ZERO,
                 entry_price: dec!(10000),
                 quantity: dec!(0.01),
@@ -893,7 +893,7 @@ mod tests {
             quantity: dec!(0.004),
             entry_price: dec!(95000),
             notional_value: dec!(400),
-            margin_required: dec!(40),
+            initial_margin: dec!(40),
         };
 
         let governed = engine
@@ -924,7 +924,7 @@ mod tests {
             quantity: dec!(0.01),
             entry_price: dec!(95000),
             notional_value: dec!(1000),
-            margin_required: dec!(100),
+            initial_margin: dec!(100),
         };
 
         let governed = engine

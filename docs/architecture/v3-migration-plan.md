@@ -21,7 +21,7 @@ Robson v3 is an institutional-grade AI risk management assistant for leveraged c
 4. **Event-sourced audit trail**: Every state transition, risk decision, and execution produces an immutable event in PostgreSQL
 5. **Operator control surface**: Web UI for monitoring, intervention (pause/resume/override/panic), risk adjustment, and replay
 6. **CLI**: Terminal commands for all operational actions (arm, disarm, status, panic, credentials)
-7. **Isolated margin trading**: Binance isolated margin with automatic transfer management
+7. **USD-M Futures trading**: Binance USD-M Futures with automatic position management
 
 ### What Robson v3 is NOT
 
@@ -83,7 +83,7 @@ every reference uses a canonical identifier with a prefix:
 | Axis | Prefix | Identifiers | What it is |
 |------|--------|-------------|------------|
 | **Migration v2 → v2.5** | `MIG-v2.5#` | MIG-v2.5#1 … MIG-v2.5#10 | Migration steps to deploy Rust daemon alongside Django |
-| **Migration v2.5 → v3** | `MIG-v3#` | MIG-v3#1 … MIG-v3#8 | Migration steps to promote Rust daemon as primary runtime |
+| **Migration v2.5 → v3** | `MIG-v3#` | MIG-v3#1 … MIG-v3#13 | Migration steps to promote Rust daemon as primary runtime |
 | **QueryEngine phases** | `QE-P` | QE-P1 … QE-P5 | Internal implementation phases of the QueryEngine subsystem (see v3-query-query-engine.md) |
 | **Pipeline stages** | `Stage` | Stage 1 … Stage N | Sequential stages within a single control loop cycle (see v3-control-loop.md, v3-runtime-spec.md) |
 | **Operational validation gates** | `VAL-` | VAL-001 … VAL-N | Runbook-format validation procedures required before go-live events (see docs/runbooks/val-*.md) |
@@ -122,6 +122,7 @@ Status rule for this table: code-backed items may be marked done from repository
 | MIG-v3#10 | Symbol-agnostic documentation + test sweep (ADR-0023) | Pending — follow-up from ADR-0023; rewrite symbol-coupled docs, parameterize risk tests across ≥2 symbols |
 | MIG-v3#11 | Policy Layer + Dynamic Slot Calculation (ADR-0024) | Done — repository-verified (2db23ad2, corrected by 0b3653a7); `robson-domain::policy` with `TradingPolicy` and `TechStopConfig`; `RiskGate` consumes policy; static `max_open_positions`, `max_total_exposure_pct`, `max_single_position_pct` eliminated; dynamic slot calculation uses best-effort in-memory `capital_base` (persisted base lands in MIG-v3#12) |
 | MIG-v3#12 | Monthly State Persistence — `MonthBoundaryReset` + `monthly_state` projection | Pending — depends on MIG-v3#11; event-sourced capital base and realized loss across restarts; required before real capital (VAL-002) |
+| MIG-v3#13 | Migrate exchange layer from Isolated Margin to USD-M Futures | Done — exchange connector switched from SAPI isolated-margin endpoints to FAPI USD-M Futures endpoints; position management now operates on Binance USD-M Futures testnet (`testnet.binancefuture.com`) and production |
 | QE-P1 | Passive Wrapper (Non-Breaking) | ✅ Done |
 | QE-P2 | Blocking Governance | ✅ Done (2026-04-04) |
 | QE-P3 | Approval Gates | ✅ Done (2026-04-05) |
@@ -979,6 +980,11 @@ Reconsider TRON integration when ALL of these are true:
 | MIG-v3#6 | **Hash-chained EventLog** for tamper detection | Plain EventLog | EventLog stable, MIG-v2.5#10 ✅ DONE 2026-04-05 | S | Yes — stop computing hashes | Remove hash column, revert to plain append | Audit trail tampering undetectable; acceptable for single operator, problematic if audited |
 | MIG-v3#7 | **PaymentRail trait** (architecture readiness for future settlement) | None | None (pure interface definition) | S | Yes — delete trait | Remove trait definition | No impact on v3; delays TRON readiness if ever needed |
 | MIG-v3#8 | **Chaos testing suite** | No chaos testing | All components deployed and stable | M | Yes — disable tests | Remove chaos test suite from CI | Undiscovered failure modes in production; acceptable risk if monitoring is good |
+| MIG-v3#9 | **Position Reconciliation Worker** (ADR-0022) | No UNTRACKED detection | MIG-v3#1 | M | Yes — disable worker | Config: disable reconciliation worker | UNTRACKED positions remain undetected; safety net gap |
+| MIG-v3#10 | **Symbol-agnostic documentation + test sweep** (ADR-0023) | BTC-coupled docs/tests | None | S | Yes — revert docs | Revert documentation changes | Symbol-specific assumptions persist in policy and tests |
+| MIG-v3#11 | **Policy Layer + Dynamic Slot Calculation** (ADR-0024) | Static exposure caps | None | M | Yes — revert to static caps | Config: restore legacy limits | Dynamic slot calculation unavailable; static limits may block valid entries |
+| MIG-v3#12 | **Monthly State Persistence** — `MonthBoundaryReset` + `monthly_state` projection | In-memory monthly state only | MIG-v3#11 | S | Yes — revert to in-memory | Remove monthly_state projection | Monthly realized loss resets on daemon restart; inaccurate budget before real capital |
+| MIG-v3#13 | **Migrate exchange layer from Isolated Margin to USD-M Futures** | SAPI isolated-margin endpoints | MIG-v3#1 | M | Yes — revert to SAPI endpoints | Config: switch back to isolated-margin mode | Orders routed to wrong account type; position mismatches |
 
 ### Migration Rules
 

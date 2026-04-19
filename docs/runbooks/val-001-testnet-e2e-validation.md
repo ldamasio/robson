@@ -51,7 +51,7 @@ prerequisite **P7** and [UNTRACKED-POSITION-RECONCILIATION.md](../policies/UNTRA
 | Key | Value |
 |-----|-------|
 | Namespace | `robson-testnet` |
-| Exchange | `testnet.binance.vision` (`ROBSON_BINANCE_USE_TESTNET: "true"`) |
+| Exchange | `testnet.binancefuture.com` (`ROBSON_BINANCE_USE_TESTNET: "true"`) |
 | Position monitor | enabled (`ROBSON_POSITION_MONITOR_ENABLED: "true"`, symbol: `BTCUSDT`) |
 | API access | ClusterIP — `kubectl port-forward` only |
 | Mutating routes | Bearer token required |

@@ -1,7 +1,7 @@
 //! Position Monitor: Safety Net for Rogue Positions
 //!
 //! The Position Monitor is a background service that:
-//! - Polls Binance API for isolated margin positions
+//! - Polls Binance USD-M Futures API for open positions
 //! - Detects positions not created through Robson v2 (rogue positions)
 //! - Calculates safety stops (2% from entry)
 //! - Executes market orders when stops are hit
@@ -16,7 +16,7 @@ use std::{
 };
 
 use chrono::{DateTime, Utc};
-use robson_connectors::{BinanceRestClient, BinanceRestError, IsolatedMarginPosition};
+use robson_connectors::{BinanceRestClient, BinanceRestError, FuturesPosition};
 use robson_domain::{DetectedPosition, Price, Quantity, Side, Symbol};
 use robson_store::{DetectedPositionRepository, PositionRepository};
 use rust_decimal::Decimal;
@@ -121,7 +121,7 @@ impl ExecutionAttempt {
 // Position Monitor
 // =============================================================================
 
-/// Monitors Binance isolated margin for rogue positions and manages safety
+/// Monitors Binance USD-M Futures for rogue positions and manages safety
 /// stops.
 pub struct PositionMonitor {
     /// Binance REST client
@@ -363,7 +363,7 @@ impl PositionMonitor {
 
     /// Check a single symbol for positions.
     async fn check_symbol(&self, symbol: &str) -> Result<(), MonitorError> {
-        debug!(symbol, "Checking for isolated margin positions");
+        debug!(symbol, "Checking for futures positions");
 
         // Get current positions from Binance
         let binance_positions = self
@@ -393,7 +393,7 @@ impl PositionMonitor {
     /// Process a position detected from Binance.
     async fn process_binance_position(
         &self,
-        binance_pos: IsolatedMarginPosition,
+        binance_pos: FuturesPosition,
         current_price: Price,
     ) -> Result<(), MonitorError> {
         let position_id = format!("{}:{}", binance_pos.symbol, binance_pos.side);
@@ -661,7 +661,7 @@ impl PositionMonitor {
             // Place market order
             let result = self
                 .binance_client
-                .place_market_order(&symbol.as_pair(), exit_side, quantity.as_decimal(), None)
+                .place_market_order(&symbol.as_pair(), exit_side, quantity.as_decimal(), None, true)
                 .await;
 
             match result {
@@ -824,7 +824,7 @@ impl PositionMonitor {
     /// execute_stop_with_retry).
     ///
     /// This method is kept for compatibility but should not be used directly.
-    async fn execute_exit(&self, position: &IsolatedMarginPosition) -> Result<(), MonitorError> {
+    async fn execute_exit(&self, position: &FuturesPosition) -> Result<(), MonitorError> {
         info!(
             symbol = %position.symbol,
             side = ?position.side,
@@ -841,7 +841,13 @@ impl PositionMonitor {
         // Place market order
         let order_result = self
             .binance_client
-            .place_market_order(&position.symbol, exit_side, position.quantity.as_decimal(), None)
+            .place_market_order(
+                &position.symbol,
+                exit_side,
+                position.quantity.as_decimal(),
+                None,
+                true,
+            )
             .await;
 
         match order_result {
@@ -1039,12 +1045,13 @@ mod tests {
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
         monitor.add_core_exclusion(&symbol, Side::Long).await;
 
-        let binance_pos = IsolatedMarginPosition {
+        let binance_pos = FuturesPosition {
             symbol: "BTCUSDT".to_string(),
             side: Side::Long,
             quantity: Quantity::new(dec!(0.1)).unwrap(),
             entry_price: Price::new(dec!(95000)).unwrap(),
-            asset: "BTC".to_string(),
+            unrealized_pnl: dec!(0),
+            leverage: 10,
         };
         let current_price = Price::new(dec!(95000)).unwrap();
 

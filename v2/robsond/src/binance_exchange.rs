@@ -1,4 +1,4 @@
-//! Binance isolated margin adapter implementing ExchangePort.
+//! Binance USD-M Futures adapter implementing ExchangePort.
 //!
 //! Wraps `BinanceRestClient` and translates between domain types
 //! and Binance-specific API types.
@@ -16,7 +16,7 @@ use async_trait::async_trait;
 use chrono::Utc;
 use robson_connectors::{BinanceRestClient, BinanceRestError};
 use robson_domain::{OrderSide, Price, Quantity, Side, Symbol};
-use robson_exec::{ports::MarginSettings, ExchangePort, ExecError, OrderResult};
+use robson_exec::{ports::FuturesSettings, ExchangePort, ExecError, OrderResult};
 use rust_decimal::Decimal;
 use tracing::info;
 
@@ -24,7 +24,7 @@ use tracing::info;
 // Adapter
 // =============================================================================
 
-/// Binance isolated margin adapter implementing ExchangePort.
+/// Binance USD-M Futures adapter implementing ExchangePort.
 ///
 /// Wraps `BinanceRestClient` and translates between domain types
 /// and Binance-specific API types.
@@ -39,10 +39,6 @@ impl BinanceExchangeAdapter {
     }
 
     /// Map BinanceRestError to ExecError.
-    ///
-    /// Known Binance error codes are mapped to specific variants.
-    /// All other errors become generic Exchange errors.
-    /// No auto-retry is performed — the caller decides.
     fn map_error(error: BinanceRestError) -> ExecError {
         match &error {
             BinanceRestError::ApiError { code, msg } => match code {
@@ -60,24 +56,28 @@ impl BinanceExchangeAdapter {
 
 #[async_trait]
 impl ExchangePort for BinanceExchangeAdapter {
-    async fn validate_margin_settings(
+    async fn validate_futures_settings(
         &self,
         symbol: &Symbol,
         expected_leverage: u8,
-    ) -> Result<MarginSettings, ExecError> {
-        // Verify the isolated margin account exists and is accessible.
-        // Binance isolated margin leverage is implicit (collateral/borrow ratio),
-        // not a per-symbol configurable setting like futures.
-        let _account = self
-            .client
-            .get_isolated_margin_account(&symbol.as_pair())
+    ) -> Result<FuturesSettings, ExecError> {
+        // Set leverage on the symbol — idempotent, safe to call on every check.
+        self.client
+            .set_leverage(&symbol.as_pair(), expected_leverage)
             .await
             .map_err(Self::map_error)?;
 
-        info!(symbol = %symbol.as_pair(), "Isolated margin account verified");
+        info!(
+            symbol = %symbol.as_pair(),
+            leverage = expected_leverage,
+            "Futures leverage set, account verified"
+        );
 
-        Ok(MarginSettings {
-            is_isolated: true,
+        // One-way mode is assumed (set via Binance UI or API out-of-band).
+        // In One-way mode, positionSide is BOTH and direction is determined
+        // by order side (BUY = long, SELL = short).
+        Ok(FuturesSettings {
+            position_mode: "One-way".to_string(),
             leverage: expected_leverage,
             symbol: symbol.as_pair(),
         })
@@ -89,8 +89,8 @@ impl ExchangePort for BinanceExchangeAdapter {
         side: OrderSide,
         quantity: Quantity,
         client_order_id: &str,
+        reduce_only: bool,
     ) -> Result<OrderResult, ExecError> {
-        // Convert OrderSide (Buy/Sell) to Side (Long/Short) for BinanceRestClient.
         let binance_side = match side {
             OrderSide::Buy => Side::Long,
             OrderSide::Sell => Side::Short,
@@ -103,13 +103,11 @@ impl ExchangePort for BinanceExchangeAdapter {
                 binance_side,
                 quantity.as_decimal(),
                 Some(client_order_id),
+                reduce_only,
             )
             .await
             .map_err(Self::map_error)?;
 
-        // Reject ambiguous order statuses that do not represent a clean fill.
-        // Market orders are expected to fill immediately; anything else is an
-        // anomaly that the caller must handle explicitly.
         match response.status.as_str() {
             "FILLED" => {},
             "PARTIALLY_FILLED" | "EXPIRED" | "CANCELED" | "REJECTED" => {
@@ -126,11 +124,6 @@ impl ExchangePort for BinanceExchangeAdapter {
             },
         }
 
-        // A real execution happened on Binance. From this point on we must
-        // construct OrderResult robustly — an internal validation failure
-        // after real execution would create an unrecoverable Binance/system
-        // state divergence.
-
         let executed_qty = response.executed_qty;
         if executed_qty <= Decimal::ZERO {
             return Err(ExecError::Exchange(format!(
@@ -139,9 +132,6 @@ impl ExchangePort for BinanceExchangeAdapter {
             )));
         }
 
-        // Extract fill information.
-        // Priority 1: fills[] (most accurate — VWAP price, actual commission)
-        // Priority 2: fallback to executedQty + cummulativeQuoteQty
         let (fill_price, fee, fee_asset) = if !response.fills.is_empty() {
             let total_quote: Decimal = response.fills.iter().map(|f| f.price * f.qty).sum();
             let total_qty: Decimal = response.fills.iter().map(|f| f.qty).sum();
@@ -152,21 +142,16 @@ impl ExchangePort for BinanceExchangeAdapter {
                 .map(|f| f.commission_asset.clone())
                 .unwrap_or_else(|| "USDT".to_string());
 
-            // fills[] is present but total_qty could be zero in degenerate
-            // edge cases. Fallback to executed_qty to avoid division by zero.
             let vwap_price = if total_qty > Decimal::ZERO {
                 total_quote / total_qty
             } else {
-                // executed_qty > 0 is verified above; derive from cumulative.
                 if response.cummulative_quote_qty > Decimal::ZERO {
                     response.cummulative_quote_qty / executed_qty
                 } else {
-                    // Should not happen for FILLED with executed_qty > 0.
-                    // Log warning but proceed — the execution is real.
                     tracing::warn!(
                         order_id = %response.order_id,
                         executed_qty = %executed_qty,
-                        "FILLS present but no usable price source — using executed_qty to indicate issue"
+                        "FILLS present but no usable price source"
                     );
                     return Err(ExecError::Exchange(format!(
                         "Cannot determine fill price for order {} (fills empty, cummulativeQuoteQty=0)",
@@ -177,25 +162,20 @@ impl ExchangePort for BinanceExchangeAdapter {
 
             (vwap_price, total_fee, fee_asset)
         } else {
-            // No fills array — derive price from cumulative quantities.
             let fill_price = if response.cummulative_quote_qty > Decimal::ZERO {
                 response.cummulative_quote_qty / executed_qty
             } else {
-                // executed_qty > 0 but no quote qty — cannot derive price.
                 return Err(ExecError::Exchange(format!(
                     "Cannot determine fill price for order {} (no fills, cummulativeQuoteQty=0)",
                     response.order_id
                 )));
             };
 
-            // No commission data available — estimate 0.1% (conservative upper bound)
             let estimated_fee = response.cummulative_quote_qty * Decimal::new(1, 3);
 
             (fill_price, estimated_fee, "USDT".to_string())
         };
 
-        // Parse Binance transact time. Log a clear warning on parse failure
-        // and use Utc::now as fallback — the fill is real regardless.
         let filled_at = chrono::DateTime::from_timestamp_millis(response.transact_time)
             .unwrap_or_else(|| {
                 tracing::warn!(

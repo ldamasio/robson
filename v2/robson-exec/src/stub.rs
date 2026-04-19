@@ -13,7 +13,7 @@ use rust_decimal::Decimal;
 use crate::{
     error::ExecError,
     ports::{
-        CandleInterval, ExchangePort, MarginSettings, MarketDataPort, OhlcvPort, OrderResult,
+        CandleInterval, ExchangePort, FuturesSettings, MarketDataPort, OhlcvPort, OrderResult,
         PriceUpdate,
     },
 };
@@ -25,7 +25,7 @@ use crate::{
 /// Stub exchange for testing.
 ///
 /// Simulates immediate fills at a configured price.
-/// Default configuration: isolated margin, 10x leverage.
+/// Default configuration: One-way position mode, 10x leverage.
 pub struct StubExchange {
     /// Current prices by symbol
     prices: RwLock<HashMap<String, Decimal>>,
@@ -37,14 +37,14 @@ pub struct StubExchange {
     order_counter: RwLock<u64>,
     /// Whether to simulate failures
     fail_next: RwLock<bool>,
-    /// Simulated margin settings (is_isolated, leverage)
-    margin_settings: RwLock<(bool, u8)>,
+    /// Simulated futures settings (position_mode, leverage)
+    futures_settings: RwLock<(String, u8)>,
 }
 
 impl StubExchange {
     /// Create a new stub exchange with default price.
     ///
-    /// Default margin settings: isolated=true, leverage=10
+    /// Default futures settings: position_mode="One-way", leverage=10
     pub fn new(default_price: Decimal) -> Self {
         Self {
             prices: RwLock::new(HashMap::new()),
@@ -52,19 +52,19 @@ impl StubExchange {
             fee_rate: Decimal::new(1, 3), // 0.001 = 0.1%
             order_counter: RwLock::new(0),
             fail_next: RwLock::new(false),
-            margin_settings: RwLock::new((true, 10)), // Default: isolated, 10x
+            futures_settings: RwLock::new(("One-way".to_string(), 10)),
         }
     }
 
-    /// Set simulated margin settings (for testing failure scenarios).
+    /// Set simulated futures settings (for testing failure scenarios).
     ///
     /// # Arguments
     ///
-    /// * `is_isolated` - Whether margin is isolated (false = cross)
+    /// * `position_mode` - Position mode (e.g., "One-way", "Hedge")
     /// * `leverage` - Leverage multiplier
-    pub fn set_margin_settings(&self, is_isolated: bool, leverage: u8) {
-        let mut settings = self.margin_settings.write().unwrap();
-        *settings = (is_isolated, leverage);
+    pub fn set_futures_settings(&self, position_mode: &str, leverage: u8) {
+        let mut settings = self.futures_settings.write().unwrap();
+        *settings = (position_mode.to_string(), leverage);
     }
 
     /// Set price for a specific symbol.
@@ -103,40 +103,40 @@ impl StubExchange {
 
 #[async_trait]
 impl ExchangePort for StubExchange {
-    async fn validate_margin_settings(
+    async fn validate_futures_settings(
         &self,
         symbol: &Symbol,
         expected_leverage: u8,
-    ) -> Result<MarginSettings, ExecError> {
+    ) -> Result<FuturesSettings, ExecError> {
         if self.should_fail() {
-            return Err(ExecError::Exchange("Simulated margin check failure".to_string()));
+            return Err(ExecError::Exchange("Simulated futures check failure".to_string()));
         }
 
-        let (is_isolated, leverage) = {
-            let settings = self.margin_settings.read().unwrap();
-            *settings
+        let (position_mode, leverage) = {
+            let settings = self.futures_settings.read().unwrap();
+            settings.clone()
         };
 
-        // Safety check: fail if not isolated margin
-        if !is_isolated {
-            return Err(ExecError::MarginSafetyViolation {
-                expected: "isolated margin".to_string(),
-                actual: "cross margin".to_string(),
-                advice: "Switch to isolated margin mode before trading".to_string(),
+        // Safety check: fail if not One-way mode
+        if position_mode != "One-way" {
+            return Err(ExecError::FuturesSafetyViolation {
+                expected: "One-way position mode".to_string(),
+                actual: format!("{} mode", position_mode),
+                advice: "Switch to One-way position mode before trading".to_string(),
             });
         }
 
         // Safety check: fail if leverage doesn't match
         if leverage != expected_leverage {
-            return Err(ExecError::MarginSafetyViolation {
+            return Err(ExecError::FuturesSafetyViolation {
                 expected: format!("{}x leverage", expected_leverage),
                 actual: format!("{}x leverage", leverage),
                 advice: format!("Set leverage to {}x before trading", expected_leverage),
             });
         }
 
-        Ok(MarginSettings {
-            is_isolated,
+        Ok(FuturesSettings {
+            position_mode,
             leverage,
             symbol: symbol.as_pair(),
         })
@@ -148,6 +148,7 @@ impl ExchangePort for StubExchange {
         _side: OrderSide,
         quantity: Quantity,
         client_order_id: &str,
+        _reduce_only: bool,
     ) -> Result<OrderResult, ExecError> {
         // Check if we should simulate a failure
         if self.should_fail() {
@@ -407,6 +408,7 @@ mod tests {
                 OrderSide::Buy,
                 Quantity::new(dec!(0.1)).unwrap(),
                 "test-1",
+                false,
             )
             .await
             .unwrap();
@@ -426,12 +428,24 @@ mod tests {
         let btc = Symbol::from_pair("BTCUSDT").unwrap();
 
         let eth_result = exchange
-            .place_market_order(&eth, OrderSide::Buy, Quantity::new(dec!(1.0)).unwrap(), "eth-1")
+            .place_market_order(
+                &eth,
+                OrderSide::Buy,
+                Quantity::new(dec!(1.0)).unwrap(),
+                "eth-1",
+                false,
+            )
             .await
             .unwrap();
 
         let btc_result = exchange
-            .place_market_order(&btc, OrderSide::Buy, Quantity::new(dec!(0.1)).unwrap(), "btc-1")
+            .place_market_order(
+                &btc,
+                OrderSide::Buy,
+                Quantity::new(dec!(0.1)).unwrap(),
+                "btc-1",
+                false,
+            )
             .await
             .unwrap();
 
@@ -453,6 +467,7 @@ mod tests {
                 OrderSide::Buy,
                 Quantity::new(dec!(0.1)).unwrap(),
                 "fail-1",
+                false,
             )
             .await;
 
@@ -460,7 +475,13 @@ mod tests {
 
         // Next call should succeed
         let result = exchange
-            .place_market_order(&symbol, OrderSide::Buy, Quantity::new(dec!(0.1)).unwrap(), "ok-1")
+            .place_market_order(
+                &symbol,
+                OrderSide::Buy,
+                Quantity::new(dec!(0.1)).unwrap(),
+                "ok-1",
+                false,
+            )
             .await;
 
         assert!(result.is_ok());
