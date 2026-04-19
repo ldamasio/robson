@@ -227,16 +227,81 @@ authoritative for accounting or tax reporting.
 | Risk per trade | 1% of capital | NO |
 | Max monthly drawdown | 4% of capital | NO |
 
-### Soft Limits (existing from v2, not expanded in v3)
+### Derived Limits — Not Independent Parameters
 
-| Limit | Default | Note |
-|-------|---------|------|
-| Max open positions | 3 | Preserved from v2 |
-| Max total exposure | 30% of capital | Preserved from v2 |
-| Max single position | 15% of capital | Preserved from v2 |
-| No duplicate position | same symbol+side | Preserved from v2 |
+`max_open_positions`, `max_total_exposure_pct`, and `max_single_position_pct` are
+**eliminated** as independent configuration parameters. See ADR-0024.
 
-These soft limits are preserved as-is. v3 does not add new soft limits.
+The only real bound on a single position's size is physical: its notional value cannot
+exceed available capital (spot) or available capital × leverage (isolated margin). The
+Golden Rule guarantees the risk is exactly 1% of capital regardless of notional size.
+Any percentage-based cap on position size would either be redundant or contradict the
+Golden Rule silently.
+
+**What replaces max_open_positions:** dynamic slot calculation (see below).
+
+**No-duplicate-position guard** (same symbol+side) is preserved as an operational
+constraint.
+
+---
+
+## Dynamic Slot Calculation
+
+The question "can a new position be opened?" is answered at each decision point:
+
+```
+monthly_budget   = capital_base_current_month × 4%
+realized_loss    = |sum of losses on positions closed this calendar month|
+latent_risk      = Σ max(0, loss_if_current_stop_hit) for each open position
+remaining_budget = monthly_budget − realized_loss − latent_risk
+can_open         = remaining_budget ≥ capital_base_current_month × 1%
+slots_available  = floor(remaining_budget / risk_per_trade_amount)
+```
+
+**Latent risk per position:**
+
+| Stop position | Latent risk |
+|---------------|-------------|
+| At original stop level | ≈ 1% of capital (full span risk) |
+| At breakeven (trailing = entry) | 0 |
+| Above entry (locked profit) | 0 (floor at zero; cannot lose) |
+
+**Consequence:** the number of simultaneously open positions is unbounded by policy.
+With multiple positions at breakeven, the operator may hold 6, 9, or more positions
+simultaneously, all within the 4% monthly budget. Each new batch of positions moves
+to breakeven, freeing budget for the next batch.
+
+---
+
+## Month Boundary Rule
+
+Open positions are **never closed** by a calendar event. Stop levels, span, and
+trailing stop logic are unaffected by the month change. What changes is the budget
+accounting.
+
+**At 00:00 UTC on the first day of a new month:**
+
+```
+latent_risk_carried = Σ max(0, loss_if_current_stop_hit) for all currently open positions
+current_equity      = realized_capital + unrealized_pnl_of_open_positions (mark-to-market)
+capital_base        = current_equity − latent_risk_carried
+monthly_budget      = capital_base × 4%
+realized_loss       = 0  (reset)
+```
+
+The capital base assumes worst case for all carried positions. This absorbs inherited
+risk into the base rather than carrying it as a debt against the new month's budget.
+
+**Result:** the new month always starts with `slots_available = 4`, regardless of how
+many positions are carried over.
+
+**Wins from carried positions** that close during the new month flow into `current_equity`
+and feed the capital base of the month after. They do not retroactively increase the
+current month's budget.
+
+**Month boundary implementation status:** follow-up work, tracked as MIG-v3#11. The
+daemon must detect the UTC calendar boundary, compute the new capital base, persist it,
+reset the monthly loss accumulator, and emit a `MonthBoundaryReset` event.
 
 ---
 
@@ -245,6 +310,7 @@ These soft limits are preserved as-is. v3 does not add new soft limits.
 The following were in the previous spec and are explicitly **removed from v3 scope**:
 
 - **Escalation Ladder (L1/L2/L3/L4)**: replaced by binary MonthlyHalt
+- **Static soft limits (max_open_positions=3, max_single_position_pct=15%, max_total_exposure_pct=30%)**: replaced by dynamic slot calculation derived from policy (ADR-0024)
 - **Dynamic Limits**: volatility adjustment, funding rate adjustment, correlation adjustment
 - **Soft Limit Overrides with expiry**: no operator override mechanism
 - **Circuit Breaker with auto-escalation**: no timed escalation
@@ -287,4 +353,7 @@ Priorities:
 | Monthly PnL — fees deduction | Implemented | `fees_paid` is tracked per position and subtracted: `p.realized_pnl - p.fees_paid`. MonthlyHalt triggers on net PnL. |
 | Unrealized PnL — exchange mark price | Not implemented | `unrealized_pnl` uses last tick price, not exchange mark price. Known approximation. |
 | Entering position cancel on halt | Not implemented | `trigger_monthly_halt()` cannot cancel pending entry orders on exchange. Entering positions remain until fill or exchange session expiry. |
-| MonthlyHalt auto-reset | Not implemented | No calendar-month boundary detection. MonthlyHalt persists until process restart. |
+| MonthlyHalt auto-reset | Not implemented — tracked as MIG-v3#11 | Calendar-month boundary detection required. On boundary: compute new `capital_base`, reset `realized_loss`, emit `MonthBoundaryReset`, clear MonthlyHalt state. MonthlyHalt persists until process restart in current implementation. |
+| Policy Layer — `TradingPolicy` + `TechStopConfig` | Not implemented — tracked as MIG-v3#11 | `robson-domain::policy` module must be created. `RiskGate` must be refactored to consume `TradingPolicy` for slot calculation instead of static `RiskLimits`. Static `RiskLimits` struct is eliminated. See ADR-0024. |
+| Dynamic slot calculation | Not implemented — tracked as MIG-v3#11 | `RiskContext::slots_available()` must be added. `RiskGate::evaluate()` checks this instead of `max_open_positions`. Enables unbounded simultaneous positions within monthly budget. |
+| MonthlyHalt latent-risk trigger | Not implemented — tracked as MIG-v3#11 | Current trigger fires on realized PnL only. Correct trigger: `remaining_budget < risk_per_trade` where `remaining_budget = monthly_budget − realized_loss − latent_risk_of_open_positions`. |
