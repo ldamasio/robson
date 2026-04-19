@@ -98,6 +98,8 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     query_engine: Arc<QueryEngine<Arc<dyn QueryRecorder>>>,
     /// Binary MonthlyHalt gate (v3 policy: 4% drawdown → halt).
     pub(crate) circuit_breaker: Arc<CircuitBreaker>,
+    /// Trading policy for circuit breaker halt evaluation (ADR-0024 §5).
+    trading_policy: TradingPolicy,
     /// Optional postgres pool for persisting domain events to robson-eventlog.
     #[cfg(feature = "postgres")]
     event_log_pool: Option<PgPool>,
@@ -159,6 +161,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             entry_flow_lock: Mutex::new(()),
             query_engine,
             circuit_breaker: Arc::new(CircuitBreaker::default()),
+            trading_policy,
             #[cfg(feature = "postgres")]
             event_log_pool: None,
             #[cfg(feature = "postgres")]
@@ -1234,14 +1237,21 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self.panic_close_all().await
     }
 
-    /// Evaluate monthly PnL and trigger MonthlyHalt if the 4% limit is crossed.
+    /// Evaluate monthly halt trigger using ADR-0024 §5 latent risk semantics.
     ///
-    /// This is the automatic runtime trigger. It must be called:
-    /// - After any position close that changes realized PnL
-    ///   (`handle_exit_fill`)
-    /// - It MUST NOT be called while holding `entry_flow_lock`, because it
-    ///   calls `panic_close_all()` which calls `disarm_position()` (which takes
-    ///   `entry_flow_lock` internally).
+    /// Trigger condition: `remaining_budget < risk_per_trade_amount`
+    /// where:
+    ///   remaining_budget = (capital_base × max_monthly_drawdown_pct) − realized_loss − latent_risk
+    ///   latent_risk = Σ max(0, (entry−stop)×qty) for each open Active position
+    ///   risk_per_trade_amount = capital_base × risk_per_trade_pct
+    ///
+    /// This replaces the previous trigger which compared `total_monthly_pnl ≤ −4%`
+    /// (realized + unrealized) and did not account for stop-based latent risk.
+    ///
+    /// Must be called:
+    /// - After any position close that changes realized PnL (`handle_exit_fill`)
+    /// - MUST NOT be called while holding `entry_flow_lock` (calls panic_close_all
+    ///   → disarm_position → entry_flow_lock).
     ///
     /// Returns true if MonthlyHalt was triggered this call.
     pub async fn evaluate_monthly_halt(&self) -> bool {
@@ -1250,10 +1260,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             return false;
         }
 
-        let capital = self.engine.lock().unwrap().risk_config().capital();
+        let capital_base = self.engine.lock().unwrap().risk_config().capital();
+        let policy = self.trading_policy;
+
         let now = chrono::Utc::now();
 
-        // Monthly realized PnL from closed positions
+        // Realized loss: sum of absolute losses from positions closed this month.
+        // Wins do NOT offset losses (ADR-0024 §5).
         let monthly_closed = match self
             .store
             .positions()
@@ -1266,10 +1279,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 return false;
             },
         };
-        let monthly_realized_pnl: Decimal =
-            monthly_closed.iter().map(|p| p.realized_pnl - p.fees_paid).sum();
+        let realized_loss: Decimal = monthly_closed
+            .iter()
+            .map(|p| {
+                let net = p.realized_pnl - p.fees_paid;
+                if net < Decimal::ZERO { net.abs() } else { Decimal::ZERO }
+            })
+            .sum();
 
-        // Monthly unrealized PnL from open Active positions
+        // Latent risk: max(0, loss_if_current_stop_hit) for each open Active position.
         let active_positions = match self.store.positions().find_risk_open().await {
             Ok(positions) => positions,
             Err(e) => {
@@ -1277,28 +1295,41 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 return false;
             },
         };
-        let monthly_unrealized_pnl: Decimal = active_positions
+        let latent_risk: Decimal = active_positions
             .iter()
-            .filter_map(|p| match &p.state {
-                PositionState::Active { .. } => Some(p.calculate_pnl()),
-                _ => None,
+            .filter_map(|p| {
+                let entry = p.entry_price?.as_decimal();
+                let qty = p.quantity.as_decimal();
+                let stop = match &p.state {
+                    PositionState::Active { trailing_stop, .. } => trailing_stop.as_decimal(),
+                    _ => return None,
+                };
+                let risk = match p.side {
+                    Side::Long => (entry - stop) * qty,
+                    Side::Short => (stop - entry) * qty,
+                };
+                Some(risk.max(Decimal::ZERO))
             })
             .sum();
 
-        let total_monthly_pnl = monthly_realized_pnl + monthly_unrealized_pnl;
-        let monthly_limit = capital * Decimal::from(4) / Decimal::from(100);
+        // ADR-0024 §5: halt if remaining_budget < risk_per_trade_amount
+        let monthly_budget = policy.monthly_budget(capital_base);
+        let remaining_budget = monthly_budget - realized_loss - latent_risk;
+        let risk_amount = policy.risk_per_trade_amount(capital_base);
 
-        if total_monthly_pnl <= -monthly_limit {
+        if remaining_budget < risk_amount {
             let reason = format!(
-                "Monthly loss {:.2}% reached 4% limit (realized: {}, unrealized: {})",
-                (total_monthly_pnl / capital * Decimal::from(100)),
-                monthly_realized_pnl,
-                monthly_unrealized_pnl,
+                "Monthly budget exhausted: remaining={:.2} < risk_per_trade={:.2} \
+                 (budget={:.2}, realized_loss={:.2}, latent_risk={:.2})",
+                remaining_budget, risk_amount, monthly_budget, realized_loss, latent_risk,
             );
             warn!(
-                total_monthly_pnl = %total_monthly_pnl,
-                limit = %monthly_limit,
-                "MonthlyHalt auto-triggered"
+                %remaining_budget,
+                %risk_amount,
+                %monthly_budget,
+                %realized_loss,
+                %latent_risk,
+                "MonthlyHalt auto-triggered (ADR-0024 §5)"
             );
             match self.trigger_monthly_halt(reason).await {
                 Ok(_) => true,
@@ -3409,14 +3440,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_monthly_halt_not_triggered_at_399_pct_loss() {
+    async fn test_monthly_halt_triggered_at_399_pct_loss() {
         let manager = create_test_manager().await;
-        // Capital is 10000, 4% = 400. At -399, should NOT trigger.
+        // ADR-0024 §5: remaining = budget - realized_loss = 400 - 399 = 1
+        // risk_per_trade = 10000 * 1% = 100. Since 1 < 100 → MUST trigger.
         save_closed_position_with_pnl(&manager, dec!(-399)).await;
 
         let triggered = manager.evaluate_monthly_halt().await;
-        assert!(!triggered, "3.99% monthly loss must not trigger MonthlyHalt");
-        assert!(!manager.circuit_breaker.blocks_new_entries().await);
+        assert!(
+            triggered,
+            "3.99% loss exhausts remaining budget (1 < 100 risk_per_trade) — ADR-0024 §5"
+        );
+        assert!(manager.circuit_breaker.blocks_new_entries().await);
     }
 
     #[tokio::test]
@@ -3515,6 +3550,144 @@ mod tests {
 
         let second = manager.evaluate_monthly_halt().await;
         assert!(!second, "subsequent evaluation should not re-trigger");
+    }
+
+    // =========================================================================
+    // ADR-0024 §5: Latent risk halt trigger tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_monthly_halt_triggered_by_latent_risk_alone() {
+        // No realized losses, but open positions consume the entire budget via
+        // latent risk. remaining = budget - 0 - latent → if < risk_per_trade, halt.
+        let manager = create_test_manager().await;
+        // capital = 10000, budget = 400, risk_per_trade = 100
+        // Need latent_risk > 300 to exhaust (400 - latent < 100 → latent > 300)
+        // save_active_position: entry=3000, stop=2990, qty=0.1 → risk = 10 * 0.1 = 1
+        // We need ~31 such positions, or use a helper with custom stop distance.
+        // Instead, create one position with high latent risk directly.
+        let account_id = Uuid::now_v7();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(95000)).unwrap();
+        let stop = Price::new(dec!(91900)).unwrap(); // 3100 below entry
+        let qty = Quantity::new(dec!(0.1)).unwrap();
+        let now = chrono::Utc::now();
+
+        let mut position = Position::new(account_id, symbol, Side::Long);
+        position.entry_price = Some(entry);
+        position.quantity = qty;
+        position.state = PositionState::Active {
+            current_price: entry,
+            trailing_stop: stop,
+            favorable_extreme: entry,
+            extreme_at: now,
+            insurance_stop_id: None,
+            last_emitted_stop: None,
+        };
+        position.updated_at = now;
+        manager.store.positions().save(&position).await.unwrap();
+        // latent_risk = (95000 - 91900) * 0.1 = 310
+        // remaining = 400 - 0 - 310 = 90 < 100 → halt
+
+        let triggered = manager.evaluate_monthly_halt().await;
+        assert!(
+            triggered,
+            "latent risk of 310 must exhaust budget (remaining=90 < risk_per_trade=100)"
+        );
+        assert!(manager.circuit_breaker.blocks_new_entries().await);
+    }
+
+    #[tokio::test]
+    async fn test_monthly_halt_not_triggered_with_breakeven_positions() {
+        // Positions at breakeven contribute zero latent risk.
+        let manager = create_test_manager().await;
+        // Use save_active_position which sets stop = entry - 10 for Long.
+        // With entry=3000, stop=2990, qty=0.1 → latent = 1 per position.
+        // 3 positions: latent = 3, remaining = 400 - 0 - 3 = 397 >= 100 → no halt
+        save_active_position(&manager, "BTCUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
+        save_active_position(&manager, "ETHUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
+        save_active_position(&manager, "SOLUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
+
+        let triggered = manager.evaluate_monthly_halt().await;
+        assert!(
+            !triggered,
+            "3 positions with tiny latent risk (3 total) should not halt (remaining=397)"
+        );
+        assert!(!manager.circuit_breaker.blocks_new_entries().await);
+    }
+
+    #[tokio::test]
+    async fn test_monthly_halt_triggered_by_combined_realized_loss_and_latent_risk() {
+        // realized_loss = 150, latent_risk = 200 → remaining = 400 - 150 - 200 = 50 < 100
+        let manager = create_test_manager().await;
+
+        // Realized loss of 150
+        save_closed_position_with_pnl(&manager, dec!(-150)).await;
+
+        // Latent risk of 200: entry=95000, stop=93000 (2000 diff), qty=0.1 → risk = 200
+        let account_id = Uuid::now_v7();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(95000)).unwrap();
+        let stop = Price::new(dec!(93000)).unwrap();
+        let qty = Quantity::new(dec!(0.1)).unwrap();
+        let now = chrono::Utc::now();
+
+        let mut position = Position::new(account_id, symbol, Side::Long);
+        position.entry_price = Some(entry);
+        position.quantity = qty;
+        position.state = PositionState::Active {
+            current_price: entry,
+            trailing_stop: stop,
+            favorable_extreme: entry,
+            extreme_at: now,
+            insurance_stop_id: None,
+            last_emitted_stop: None,
+        };
+        position.updated_at = now;
+        manager.store.positions().save(&position).await.unwrap();
+
+        let triggered = manager.evaluate_monthly_halt().await;
+        assert!(
+            triggered,
+            "realized=150 + latent=200 → remaining=50 < 100 must trigger"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_monthly_halt_not_triggered_when_remaining_equals_risk_amount() {
+        // remaining = risk_per_trade → exactly at boundary, should NOT halt (< is strict)
+        let manager = create_test_manager().await;
+        // budget = 400, need remaining = 100 → realized + latent = 300
+        // realized = 200, latent = 100 → remaining = 100 → NOT triggered (not < 100)
+        save_closed_position_with_pnl(&manager, dec!(-200)).await;
+
+        // latent = 100: entry=95000, stop=94000 (1000 diff), qty=0.1 → 100
+        let account_id = Uuid::now_v7();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(95000)).unwrap();
+        let stop = Price::new(dec!(94000)).unwrap();
+        let qty = Quantity::new(dec!(0.1)).unwrap();
+        let now = chrono::Utc::now();
+
+        let mut position = Position::new(account_id, symbol, Side::Long);
+        position.entry_price = Some(entry);
+        position.quantity = qty;
+        position.state = PositionState::Active {
+            current_price: entry,
+            trailing_stop: stop,
+            favorable_extreme: entry,
+            extreme_at: now,
+            insurance_stop_id: None,
+            last_emitted_stop: None,
+        };
+        position.updated_at = now;
+        manager.store.positions().save(&position).await.unwrap();
+
+        let triggered = manager.evaluate_monthly_halt().await;
+        assert!(
+            !triggered,
+            "remaining=100 == risk_per_trade=100 → exactly at boundary, should not halt"
+        );
     }
 
     #[tokio::test]
