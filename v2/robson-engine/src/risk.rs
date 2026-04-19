@@ -129,6 +129,9 @@ pub struct RiskContext {
     pub monthly_realized_pnl: Decimal,
     /// Monthly unrealized PnL
     pub monthly_unrealized_pnl: Decimal,
+    /// Sum of absolute losses from closed positions this month (ADR-0024 slot calc).
+    /// Wins do NOT offset this value. Used exclusively by `realized_loss_abs()`.
+    pub monthly_realized_loss: Decimal,
     /// Daily realized PnL (reset at UTC midnight)
     pub daily_realized_pnl: Decimal,
     /// Daily unrealized PnL
@@ -144,6 +147,7 @@ impl RiskContext {
             total_notional_exposure: Decimal::ZERO,
             monthly_realized_pnl: Decimal::ZERO,
             monthly_unrealized_pnl: Decimal::ZERO,
+            monthly_realized_loss: Decimal::ZERO,
             daily_realized_pnl: Decimal::ZERO,
             daily_unrealized_pnl: Decimal::ZERO,
         }
@@ -159,6 +163,7 @@ impl RiskContext {
             total_notional_exposure,
             monthly_realized_pnl: Decimal::ZERO,
             monthly_unrealized_pnl: Decimal::ZERO,
+            monthly_realized_loss: Decimal::ZERO,
             daily_realized_pnl: Decimal::ZERO,
             daily_unrealized_pnl: Decimal::ZERO,
         }
@@ -171,6 +176,11 @@ impl RiskContext {
         monthly_realized_pnl: Decimal,
         monthly_unrealized_pnl: Decimal,
     ) -> Self {
+        let monthly_realized_loss = if monthly_realized_pnl.is_sign_negative() {
+            monthly_realized_pnl.abs()
+        } else {
+            Decimal::ZERO
+        };
         let total_notional_exposure = open_positions.iter().map(|p| p.notional_value).sum();
 
         Self {
@@ -179,6 +189,7 @@ impl RiskContext {
             total_notional_exposure,
             monthly_realized_pnl,
             monthly_unrealized_pnl,
+            monthly_realized_loss,
             daily_realized_pnl: Decimal::ZERO,
             daily_unrealized_pnl: Decimal::ZERO,
         }
@@ -190,6 +201,7 @@ impl RiskContext {
         open_positions: Vec<PositionSummary>,
         monthly_realized_pnl: Decimal,
         monthly_unrealized_pnl: Decimal,
+        monthly_realized_loss: Decimal,
         daily_realized_pnl: Decimal,
         daily_unrealized_pnl: Decimal,
     ) -> Self {
@@ -201,6 +213,7 @@ impl RiskContext {
             total_notional_exposure,
             monthly_realized_pnl,
             monthly_unrealized_pnl,
+            monthly_realized_loss,
             daily_realized_pnl,
             daily_unrealized_pnl,
         }
@@ -247,14 +260,10 @@ impl RiskContext {
 
     /// Absolute realized loss for the current month (ADR-0024).
     ///
-    /// Returns `|monthly_realized_pnl|` only when negative (loss);
-    /// returns zero when PnL is positive or zero.
+    /// Returns the sum of absolute losses from closed positions this month.
+    /// Wins do NOT offset losses — this is the budget consumed by losing trades.
     pub fn realized_loss_abs(&self) -> Decimal {
-        if self.monthly_realized_pnl < Decimal::ZERO {
-            self.monthly_realized_pnl.abs()
-        } else {
-            Decimal::ZERO
-        }
+        self.monthly_realized_loss
     }
 
     /// Dynamic slot count via TradingPolicy (ADR-0024 Decision 5).
@@ -560,6 +569,7 @@ mod tests {
             total_notional_exposure: Decimal::ZERO,
             monthly_realized_pnl: dec!(-350),
             monthly_unrealized_pnl: dec!(-100),
+            monthly_realized_loss: dec!(350),
             daily_realized_pnl: Decimal::ZERO,
             daily_unrealized_pnl: Decimal::ZERO,
         };
@@ -581,6 +591,7 @@ mod tests {
             total_notional_exposure: Decimal::ZERO,
             monthly_realized_pnl: dec!(-300),
             monthly_unrealized_pnl: dec!(0),
+            monthly_realized_loss: dec!(300),
             daily_realized_pnl: Decimal::ZERO,
             daily_unrealized_pnl: Decimal::ZERO,
         };
@@ -599,6 +610,7 @@ mod tests {
             total_notional_exposure: Decimal::ZERO,
             monthly_realized_pnl: dec!(-300),
             monthly_unrealized_pnl: dec!(0),
+            monthly_realized_loss: dec!(300),
             daily_realized_pnl: Decimal::ZERO,
             daily_unrealized_pnl: Decimal::ZERO,
         };
@@ -623,6 +635,7 @@ mod tests {
             total_notional_exposure: Decimal::ZERO,
             monthly_realized_pnl: dec!(-399),
             monthly_unrealized_pnl: dec!(0),
+            monthly_realized_loss: dec!(399),
             daily_realized_pnl: Decimal::ZERO,
             daily_unrealized_pnl: Decimal::ZERO,
         };
@@ -644,6 +657,7 @@ mod tests {
             total_notional_exposure: Decimal::ZERO,
             monthly_realized_pnl: dec!(-400),
             monthly_unrealized_pnl: dec!(0),
+            monthly_realized_loss: dec!(400),
             daily_realized_pnl: Decimal::ZERO,
             daily_unrealized_pnl: Decimal::ZERO,
         };
@@ -692,6 +706,7 @@ mod tests {
             total_notional_exposure: Decimal::ZERO,
             monthly_realized_pnl: Decimal::ZERO,
             monthly_unrealized_pnl: Decimal::ZERO,
+            monthly_realized_loss: Decimal::ZERO,
             daily_realized_pnl: dec!(-120),
             daily_unrealized_pnl: Decimal::ZERO,
         };
@@ -713,6 +728,7 @@ mod tests {
             total_notional_exposure: Decimal::ZERO,
             monthly_realized_pnl: Decimal::ZERO,
             monthly_unrealized_pnl: Decimal::ZERO,
+            monthly_realized_loss: Decimal::ZERO,
             daily_realized_pnl: dec!(-99),
             daily_unrealized_pnl: Decimal::ZERO,
         };
@@ -731,6 +747,7 @@ mod tests {
             total_notional_exposure: Decimal::ZERO,
             monthly_realized_pnl: Decimal::ZERO,
             monthly_unrealized_pnl: Decimal::ZERO,
+            monthly_realized_loss: Decimal::ZERO,
             daily_realized_pnl: dec!(-100),
             daily_unrealized_pnl: Decimal::ZERO,
         };
@@ -752,6 +769,7 @@ mod tests {
             total_notional_exposure: Decimal::ZERO,
             monthly_realized_pnl: Decimal::ZERO,
             monthly_unrealized_pnl: Decimal::ZERO,
+            monthly_realized_loss: Decimal::ZERO,
             daily_realized_pnl: dec!(-60),
             daily_unrealized_pnl: dec!(-41),
         };
@@ -840,6 +858,7 @@ mod tests {
             total_notional_exposure: Decimal::ZERO,
             monthly_realized_pnl: dec!(-150),
             monthly_unrealized_pnl: Decimal::ZERO,
+            monthly_realized_loss: dec!(150),
             daily_realized_pnl: Decimal::ZERO,
             daily_unrealized_pnl: Decimal::ZERO,
         };
@@ -854,10 +873,31 @@ mod tests {
             total_notional_exposure: Decimal::ZERO,
             monthly_realized_pnl: dec!(200),
             monthly_unrealized_pnl: Decimal::ZERO,
+            monthly_realized_loss: Decimal::ZERO,
             daily_realized_pnl: Decimal::ZERO,
             daily_unrealized_pnl: Decimal::ZERO,
         };
         assert_eq!(ctx.realized_loss_abs(), dec!(0));
+    }
+
+    #[test]
+    fn test_realized_loss_is_not_offset_by_wins() {
+        let policy = TradingPolicy::default();
+        let ctx = RiskContext {
+            capital: dec!(10000),
+            open_positions: vec![],
+            total_notional_exposure: Decimal::ZERO,
+            // One -100 loser and one +100 winner net to zero PnL.
+            monthly_realized_pnl: Decimal::ZERO,
+            monthly_unrealized_pnl: Decimal::ZERO,
+            // ADR-0024 slots consume the losing trade only; wins do not offset it.
+            monthly_realized_loss: dec!(100),
+            daily_realized_pnl: Decimal::ZERO,
+            daily_unrealized_pnl: Decimal::ZERO,
+        };
+
+        assert_eq!(ctx.realized_loss_abs(), dec!(100));
+        assert_eq!(ctx.slots_available(&policy, dec!(10000)), 3);
     }
 
     #[test]

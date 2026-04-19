@@ -587,6 +587,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let monthly_realized_pnl: Decimal =
             monthly_closed.iter().map(|p| p.realized_pnl - p.fees_paid).sum();
 
+        // ADR-0024: realized_loss is the sum of absolute net losses from closed
+        // positions. Wins must NOT offset losses for slot calculation.
+        let monthly_realized_loss: Decimal = monthly_closed
+            .iter()
+            .map(|p| p.realized_pnl - p.fees_paid)
+            .filter(|net| net.is_negative())
+            .map(|net| net.abs())
+            .sum();
+
         // Monthly unrealized PnL: sum unrealized PnL from currently open Active
         // positions.
         let monthly_unrealized_pnl: Decimal = active_positions
@@ -616,6 +625,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             summaries,
             monthly_realized_pnl,
             monthly_unrealized_pnl,
+            monthly_realized_loss,
             daily_realized_pnl,
             daily_unrealized_pnl,
         ))
@@ -3181,31 +3191,35 @@ mod tests {
         );
     }
 
-    /// Entering positions are included in risk context (find_risk_open).
+    /// Entering positions reserve latent risk for dynamic slots.
     ///
-    /// Under ADR-0024, the duplicate-position guard prevents same symbol+side.
-    /// Seed an Entering BTCUSDT Long, then arm another and send a signal.
-    /// The duplicate check denies entry.
+    /// Seed four Entering positions with unique symbol+side pairs, each carrying
+    /// one risk unit. A new non-duplicate entry must be denied because the
+    /// monthly slot budget is exhausted before those orders fill.
     #[tokio::test]
     async fn test_entering_positions_count_in_risk_context() {
         let manager = create_test_manager().await;
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
 
-        // Seed an Entering BTCUSDT Long to trigger duplicate guard
-        let mut pos = Position::new(uuid::Uuid::now_v7(), symbol.clone(), Side::Long);
-        pos.quantity = Quantity::new(dec!(0.01)).unwrap();
-        pos.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(
-            Price::new(dec!(95000)).unwrap(),
-            Price::new(dec!(93500)).unwrap(),
-        ));
-        pos.state = PositionState::Entering {
-            entry_order_id: uuid::Uuid::now_v7(),
-            expected_entry: Price::new(dec!(95000)).unwrap(),
-            signal_id: uuid::Uuid::now_v7(),
-        };
-        manager.store.positions().save(&pos).await.unwrap();
+        // Capital is 10_000, so one risk unit is 100.
+        // Each seeded Entering position has latent risk:
+        // (entry 100 - stop 96) * qty 25 = 100.
+        for pair in ["ETHUSDT", "SOLUSDT", "XRPUSDT", "DOGEUSDT"] {
+            let entry = Price::new(dec!(100)).unwrap();
+            let stop = Price::new(dec!(96)).unwrap();
+            let mut pos =
+                Position::new(uuid::Uuid::now_v7(), Symbol::from_pair(pair).unwrap(), Side::Long);
+            pos.quantity = Quantity::new(dec!(25)).unwrap();
+            pos.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(entry, stop));
+            pos.state = PositionState::Entering {
+                entry_order_id: uuid::Uuid::now_v7(),
+                expected_entry: entry,
+                signal_id: uuid::Uuid::now_v7(),
+            };
+            manager.store.positions().save(&pos).await.unwrap();
+        }
 
-        // Arm a 2nd BTCUSDT Long (the one we will try to enter).
+        // Arm a non-duplicate position (the one we will try to enter).
         let entry = Price::new(dec!(100)).unwrap();
         let stop = Price::new(dec!(92)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
@@ -3233,11 +3247,23 @@ mod tests {
 
         manager.handle_signal(signal).await.unwrap();
 
-        // Position must still be Armed — entry was denied by duplicate guard
+        let halt = manager.circuit_breaker.snapshot().await;
+        assert_eq!(halt.state, crate::circuit_breaker::HaltState::MonthlyHalt);
+        assert!(halt.blocks_new_entries, "Slot exhaustion must trigger MonthlyHalt");
+
+        // Slot exhaustion is represented as MonthlyDrawdown today, so the
+        // MonthlyHalt path closes all lifecycle positions, including the
+        // newly armed one.
         let updated = manager.get_position(position.id).await.unwrap().unwrap();
         assert!(
-            matches!(updated.state, PositionState::Armed),
-            "Expected Armed after denial (Entering position triggered duplicate guard), got {:?}",
+            matches!(
+                updated.state,
+                PositionState::Closed {
+                    exit_reason: robson_domain::ExitReason::DisarmedByUser,
+                    ..
+                }
+            ),
+            "Expected Closed after MonthlyHalt (Entering positions exhausted slots), got {:?}",
             updated.state
         );
     }

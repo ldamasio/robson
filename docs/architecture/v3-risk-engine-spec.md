@@ -299,7 +299,7 @@ many positions are carried over.
 and feed the capital base of the month after. They do not retroactively increase the
 current month's budget.
 
-**Month boundary implementation status:** follow-up work, tracked as MIG-v3#11. The
+**Month boundary implementation status:** follow-up work, tracked as MIG-v3#12. The
 daemon must detect the UTC calendar boundary, compute the new capital base, persist it,
 reset the monthly loss accumulator, and emit a `MonthBoundaryReset` event.
 
