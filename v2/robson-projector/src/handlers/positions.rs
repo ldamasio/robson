@@ -200,7 +200,8 @@ fn validate_entry_accepted_technical_stop(
     Ok(())
 }
 
-/// Handle legacy entry_order_placed (audit-only, does NOT transition to entering).
+/// Handle legacy entry_order_placed (audit-only, does NOT transition to
+/// entering).
 pub(crate) async fn handle_entry_order_placed(
     pool: &PgPool,
     envelope: &EventEnvelope,
@@ -345,7 +346,8 @@ pub(crate) async fn handle_entry_order_requested(
     .execute(&mut *tx)
     .await?;
 
-    // Audit-only for position state: record entry data, do NOT set state = 'entering'.
+    // Audit-only for position state: record entry data, do NOT set state =
+    // 'entering'.
     sqlx::query(
         r#"
         UPDATE positions_current

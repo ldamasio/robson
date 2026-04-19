@@ -79,13 +79,17 @@ pub struct EngineConfig {
 /// use fraction semantics and are mapped by multiplying by 100.
 #[derive(Debug, Clone)]
 pub struct TechStopConfigEnv {
-    /// Minimum tech stop as percentage (env: ROBSON_MIN_TECH_STOP_PCT, default 1.0%)
+    /// Minimum tech stop as percentage (env: ROBSON_MIN_TECH_STOP_PCT, default
+    /// 1.0%)
     pub min_stop_pct: Decimal,
-    /// Maximum tech stop as percentage (env: ROBSON_MAX_TECH_STOP_PCT, default 10.0%)
+    /// Maximum tech stop as percentage (env: ROBSON_MAX_TECH_STOP_PCT, default
+    /// 10.0%)
     pub max_stop_pct: Decimal,
-    /// Support/resistance level to use (env: ROBSON_TECH_STOP_SUPPORT_N, default 2)
+    /// Support/resistance level to use (env: ROBSON_TECH_STOP_SUPPORT_N,
+    /// default 2)
     pub support_level_n: usize,
-    /// Lookback candles for analysis (env: ROBSON_TECH_STOP_LOOKBACK, default 100)
+    /// Lookback candles for analysis (env: ROBSON_TECH_STOP_LOOKBACK, default
+    /// 100)
     pub lookback_candles: usize,
 }
 
@@ -238,8 +242,9 @@ impl Config {
     }
 
     fn load_tech_stop_config() -> DaemonResult<TechStopConfigEnv> {
-        // Primary: ROBSON_MIN_TECH_STOP_PCT / ROBSON_MAX_TECH_STOP_PCT (percentage semantics)
-        // Legacy fallback: ROBSON_MIN_TECH_STOP_PERCENT / ROBSON_MAX_TECH_STOP_PERCENT (fraction semantics → × 100)
+        // Primary: ROBSON_MIN_TECH_STOP_PCT / ROBSON_MAX_TECH_STOP_PCT (percentage
+        // semantics) Legacy fallback: ROBSON_MIN_TECH_STOP_PERCENT /
+        // ROBSON_MAX_TECH_STOP_PERCENT (fraction semantics → × 100)
         let min_stop_pct = match env::var("ROBSON_MIN_TECH_STOP_PCT") {
             Ok(val) => Decimal::from_str(&val).map_err(|_| {
                 DaemonError::Config(format!("Invalid ROBSON_MIN_TECH_STOP_PCT value: {}", val))

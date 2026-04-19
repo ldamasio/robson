@@ -394,7 +394,8 @@ impl Engine {
     ///
     /// # Returns
     ///
-    /// * `Ok(EngineDecision)` with EntryOrderRequested + PlaceEntryOrder actions
+    /// * `Ok(EngineDecision)` with EntryOrderRequested + PlaceEntryOrder
+    ///   actions
     /// * `Err(EngineError)` if validation fails
     ///
     /// # State Transition

@@ -445,7 +445,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     position_id = %record.position.id,
                     "Pending approval has no tech_stop_distance; latent risk defaults to zero"
                 );
-                record.proposed.entry_price // fallback: stop at entry → zero risk
+                record.proposed.entry_price // fallback: stop at entry → zero
+                                            // risk
             });
 
         PositionSummary {
@@ -802,8 +803,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         {
             let mut pending_approvals = self.pending_approvals.write().await;
-            pending_approvals
-                .insert(query_id, PendingApprovalRecord { query, position, proposed, governed });
+            pending_approvals.insert(query_id, PendingApprovalRecord {
+                query,
+                position,
+                proposed,
+                governed,
+            });
         }
 
         let pending_approvals = self.pending_approvals.read().await;
@@ -1241,17 +1246,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     ///
     /// Trigger condition: `remaining_budget < risk_per_trade_amount`
     /// where:
-    ///   remaining_budget = (capital_base × max_monthly_drawdown_pct) − realized_loss − latent_risk
-    ///   latent_risk = Σ max(0, (entry−stop)×qty) for each open Active position
+    ///   remaining_budget = (capital_base × max_monthly_drawdown_pct) −
+    /// realized_loss − latent_risk   latent_risk = Σ max(0,
+    /// (entry−stop)×qty) for each open Active position
     ///   risk_per_trade_amount = capital_base × risk_per_trade_pct
     ///
-    /// This replaces the previous trigger which compared `total_monthly_pnl ≤ −4%`
-    /// (realized + unrealized) and did not account for stop-based latent risk.
+    /// This replaces the previous trigger which compared `total_monthly_pnl ≤
+    /// −4%` (realized + unrealized) and did not account for stop-based
+    /// latent risk.
     ///
     /// Must be called:
-    /// - After any position close that changes realized PnL (`handle_exit_fill`)
-    /// - MUST NOT be called while holding `entry_flow_lock` (calls panic_close_all
-    ///   → disarm_position → entry_flow_lock).
+    /// - After any position close that changes realized PnL
+    ///   (`handle_exit_fill`)
+    /// - MUST NOT be called while holding `entry_flow_lock` (calls
+    ///   panic_close_all → disarm_position → entry_flow_lock).
     ///
     /// Returns true if MonthlyHalt was triggered this call.
     pub async fn evaluate_monthly_halt(&self) -> bool {
@@ -1283,7 +1291,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .iter()
             .map(|p| {
                 let net = p.realized_pnl - p.fees_paid;
-                if net < Decimal::ZERO { net.abs() } else { Decimal::ZERO }
+                if net < Decimal::ZERO {
+                    net.abs()
+                } else {
+                    Decimal::ZERO
+                }
             })
             .sum();
 
@@ -3094,7 +3106,8 @@ mod tests {
         assert!(matches!(approval_result, Err(DaemonError::QueryNotFound(id)) if id == query_id));
     }
 
-    /// Approval is denied when risk context changes (ADR-0024: duplicate guard).
+    /// Approval is denied when risk context changes (ADR-0024: duplicate
+    /// guard).
     ///
     /// Get a pending approval, then seed a duplicate position. Revalidation
     /// denies the approval.
@@ -3224,9 +3237,10 @@ mod tests {
 
     /// Entering positions reserve latent risk for dynamic slots.
     ///
-    /// Seed four Entering positions with unique symbol+side pairs, each carrying
-    /// one risk unit. A new non-duplicate entry must be denied because the
-    /// monthly slot budget is exhausted before those orders fill.
+    /// Seed four Entering positions with unique symbol+side pairs, each
+    /// carrying one risk unit. A new non-duplicate entry must be denied
+    /// because the monthly slot budget is exhausted before those orders
+    /// fill.
     #[tokio::test]
     async fn test_entering_positions_count_in_risk_context() {
         let manager = create_test_manager().await;
@@ -3287,13 +3301,10 @@ mod tests {
         // newly armed one.
         let updated = manager.get_position(position.id).await.unwrap().unwrap();
         assert!(
-            matches!(
-                updated.state,
-                PositionState::Closed {
-                    exit_reason: robson_domain::ExitReason::DisarmedByUser,
-                    ..
-                }
-            ),
+            matches!(updated.state, PositionState::Closed {
+                exit_reason: robson_domain::ExitReason::DisarmedByUser,
+                ..
+            }),
             "Expected Closed after MonthlyHalt (Entering positions exhausted slots), got {:?}",
             updated.state
         );
@@ -3618,7 +3629,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_monthly_halt_triggered_by_combined_realized_loss_and_latent_risk() {
-        // realized_loss = 150, latent_risk = 200 → remaining = 400 - 150 - 200 = 50 < 100
+        // realized_loss = 150, latent_risk = 200 → remaining = 400 - 150 - 200 = 50 <
+        // 100
         let manager = create_test_manager().await;
 
         // Realized loss of 150
@@ -3647,15 +3659,13 @@ mod tests {
         manager.store.positions().save(&position).await.unwrap();
 
         let triggered = manager.evaluate_monthly_halt().await;
-        assert!(
-            triggered,
-            "realized=150 + latent=200 → remaining=50 < 100 must trigger"
-        );
+        assert!(triggered, "realized=150 + latent=200 → remaining=50 < 100 must trigger");
     }
 
     #[tokio::test]
     async fn test_monthly_halt_not_triggered_when_remaining_equals_risk_amount() {
-        // remaining = risk_per_trade → exactly at boundary, should NOT halt (< is strict)
+        // remaining = risk_per_trade → exactly at boundary, should NOT halt (< is
+        // strict)
         let manager = create_test_manager().await;
         // budget = 400, need remaining = 100 → realized + latent = 300
         // realized = 200, latent = 100 → remaining = 100 → NOT triggered (not < 100)
