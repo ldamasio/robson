@@ -744,26 +744,33 @@ mod tests {
 
     fn saturated_context() -> RiskContext {
         // 3 open positions — triggers MaxOpenPositions
-        RiskContext::with_positions(dec!(10000), vec![
-            PositionSummary {
-                position_id: uuid::Uuid::nil(),
-                symbol: "ETHUSDT".to_string(),
-                side: "long".to_string(),
-                notional_value: dec!(1000),
-                margin_used: dec!(100),
-                unrealized_pnl: Decimal::ZERO,
-            };
-            3
-        ])
+        RiskContext::with_positions(
+            dec!(10000),
+            vec![
+                PositionSummary {
+                    position_id: uuid::Uuid::nil(),
+                    symbol: "ETHUSDT".to_string(),
+                    side: "long".to_string(),
+                    notional_value: dec!(1000),
+                    margin_used: dec!(100),
+                    unrealized_pnl: Decimal::ZERO,
+                };
+                3
+            ],
+        )
     }
 
     fn dummy_actions() -> Vec<EngineAction> {
-        use robson_domain::{OrderSide, Quantity, Symbol};
+        use robson_domain::{OrderSide, Price, Quantity, Symbol};
         vec![EngineAction::PlaceEntryOrder {
             position_id: uuid::Uuid::nil(),
+            cycle_id: None,
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
             side: OrderSide::Buy,
             quantity: Quantity::new(dec!(0.01)).unwrap(),
+            order_id: uuid::Uuid::nil(),
+            client_order_id: String::new(),
+            expected_price: Price::new(dec!(95000)).unwrap(),
             signal_id: uuid::Uuid::nil(),
         }]
     }
@@ -787,7 +794,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_governed_action_stamps_cycle_id_on_entry_order_placed() {
+    async fn test_governed_action_stamps_cycle_id_on_entry_order_requested() {
         use robson_domain::{Event, OrderSide, Quantity, Symbol};
 
         let recorder = Arc::new(MockRecorder::new());
@@ -799,10 +806,11 @@ mod tests {
         let position_id = Uuid::now_v7();
         let signal_id = Uuid::now_v7();
         let actions = vec![
-            EngineAction::EmitEvent(Event::EntryOrderPlaced {
+            EngineAction::EmitEvent(Event::EntryOrderRequested {
                 position_id,
                 cycle_id: None,
                 order_id: Uuid::now_v7(),
+                client_order_id: signal_id.to_string(),
                 expected_price: Price::new(dec!(95000)).unwrap(),
                 quantity: Quantity::new(dec!(0.01)).unwrap(),
                 signal_id,
@@ -810,9 +818,13 @@ mod tests {
             }),
             EngineAction::PlaceEntryOrder {
                 position_id,
+                cycle_id: None,
                 symbol: Symbol::from_pair("BTCUSDT").unwrap(),
                 side: OrderSide::Buy,
                 quantity: Quantity::new(dec!(0.01)).unwrap(),
+                order_id: Uuid::now_v7(),
+                client_order_id: signal_id.to_string(),
+                expected_price: Price::new(dec!(95000)).unwrap(),
                 signal_id,
             },
         ];
@@ -826,7 +838,7 @@ mod tests {
 
         let returned = governed.into_actions();
         let cycle_id = returned.iter().find_map(|action| match action {
-            EngineAction::EmitEvent(Event::EntryOrderPlaced { cycle_id, .. }) => *cycle_id,
+            EngineAction::EmitEvent(Event::EntryOrderRequested { cycle_id, .. }) => *cycle_id,
             _ => None,
         });
 

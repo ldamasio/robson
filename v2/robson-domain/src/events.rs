@@ -52,23 +52,82 @@ pub enum Event {
         timestamp: DateTime<Utc>,
     },
 
-    /// Entry order placed on exchange
+    /// LEGACY: Entry order placed (pre-exchange, old semantics).
+    /// Kept for eventlog replay compatibility. Do NOT interpret as ack.
     EntryOrderPlaced {
         /// Position identifier
         position_id: PositionId,
         /// Query/risk cycle identifier proving governed execution.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         cycle_id: Option<uuid::Uuid>,
-        /// Order identifier (matches entry_order_id in PositionState::Entering)
+        /// Legacy local order identifier. This event is not an exchange ack.
         order_id: OrderId,
         /// Expected entry price
         expected_price: Price,
         /// Order quantity
         quantity: Quantity,
-        /// Signal ID for idempotency (matches signal_id in
-        /// PositionState::Entering)
+        /// Signal ID for legacy idempotency evidence
         signal_id: uuid::Uuid,
-        /// When the order was placed
+        /// When the legacy pre-exchange event was recorded
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Governed intent to place entry order (pre-exchange).
+    EntryOrderRequested {
+        position_id: PositionId,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cycle_id: Option<uuid::Uuid>,
+        order_id: OrderId,
+        client_order_id: String,
+        expected_price: Price,
+        quantity: Quantity,
+        signal_id: uuid::Uuid,
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Exchange acknowledged the entry order (post-exchange).
+    /// Does NOT carry fill semantics — EntryFilled is the only fill event.
+    EntryOrderAccepted {
+        position_id: PositionId,
+        cycle_id: uuid::Uuid,
+        order_id: OrderId,
+        client_order_id: String,
+        exchange_order_id: String,
+        expected_price: Price,
+        quantity: Quantity,
+        signal_id: uuid::Uuid,
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Exchange rejected or failed the entry order.
+    EntryOrderFailed {
+        position_id: PositionId,
+        cycle_id: uuid::Uuid,
+        order_id: OrderId,
+        client_order_id: String,
+        signal_id: uuid::Uuid,
+        reason: String,
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Entry execution rejected by an internal safety or policy check before
+    /// any exchange placement was attempted.
+    EntryExecutionRejected {
+        /// Position identifier
+        position_id: PositionId,
+        /// Query/risk cycle identifier proving governed execution.
+        cycle_id: uuid::Uuid,
+        /// Local order identifier for the blocked attempt
+        order_id: OrderId,
+        /// Client order identifier that would have been sent to the exchange
+        client_order_id: String,
+        /// Signal ID for idempotency tracking
+        signal_id: uuid::Uuid,
+        /// Human-readable rejection reason
+        reason: String,
+        /// Whether the rejection is recoverable by operator intervention
+        recoverable: bool,
+        /// When the rejection occurred
         timestamp: DateTime<Utc>,
     },
 
@@ -252,6 +311,10 @@ impl Event {
             Event::PositionArmed { position_id, .. }
             | Event::EntrySignalReceived { position_id, .. }
             | Event::EntryOrderPlaced { position_id, .. }
+            | Event::EntryOrderRequested { position_id, .. }
+            | Event::EntryOrderAccepted { position_id, .. }
+            | Event::EntryOrderFailed { position_id, .. }
+            | Event::EntryExecutionRejected { position_id, .. }
             | Event::EntryFilled { position_id, .. }
             | Event::TrailingStopUpdated { position_id, .. }
             | Event::PositionMonitorTick { position_id, .. }
@@ -272,6 +335,10 @@ impl Event {
             Event::PositionArmed { timestamp, .. }
             | Event::EntrySignalReceived { timestamp, .. }
             | Event::EntryOrderPlaced { timestamp, .. }
+            | Event::EntryOrderRequested { timestamp, .. }
+            | Event::EntryOrderAccepted { timestamp, .. }
+            | Event::EntryOrderFailed { timestamp, .. }
+            | Event::EntryExecutionRejected { timestamp, .. }
             | Event::EntryFilled { timestamp, .. }
             | Event::TrailingStopUpdated { timestamp, .. }
             | Event::PositionMonitorTick { timestamp, .. }
@@ -292,6 +359,10 @@ impl Event {
             Event::PositionArmed { .. } => "position_armed",
             Event::EntrySignalReceived { .. } => "entry_signal_received",
             Event::EntryOrderPlaced { .. } => "entry_order_placed",
+            Event::EntryOrderRequested { .. } => "entry_order_requested",
+            Event::EntryOrderAccepted { .. } => "entry_order_accepted",
+            Event::EntryOrderFailed { .. } => "entry_order_failed",
+            Event::EntryExecutionRejected { .. } => "entry_execution_rejected",
             Event::EntryFilled { .. } => "entry_filled",
             Event::TrailingStopUpdated { .. } => "trailing_stop_updated",
             Event::PositionMonitorTick { .. } => "position_monitor_tick",
@@ -505,5 +576,125 @@ mod tests {
         for (expected_type, event) in events {
             assert_eq!(event.event_type(), expected_type);
         }
+    }
+
+    fn sample_entry_order_requested(cycle_id: Option<Uuid>) -> Event {
+        Event::EntryOrderRequested {
+            position_id: Uuid::now_v7(),
+            cycle_id,
+            order_id: Uuid::now_v7(),
+            client_order_id: "test-client-order-id".to_string(),
+            expected_price: Price::new(dec!(95000)).unwrap(),
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            signal_id: Uuid::now_v7(),
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn sample_entry_order_accepted(cycle_id: Uuid) -> Event {
+        Event::EntryOrderAccepted {
+            position_id: Uuid::now_v7(),
+            cycle_id,
+            order_id: Uuid::now_v7(),
+            client_order_id: "test-client-order-id".to_string(),
+            exchange_order_id: "exchange-123".to_string(),
+            expected_price: Price::new(dec!(95000)).unwrap(),
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            signal_id: Uuid::now_v7(),
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn sample_entry_order_failed(cycle_id: Uuid) -> Event {
+        Event::EntryOrderFailed {
+            position_id: Uuid::now_v7(),
+            cycle_id,
+            order_id: Uuid::now_v7(),
+            client_order_id: "test-client-order-id".to_string(),
+            signal_id: Uuid::now_v7(),
+            reason: "insufficient balance".to_string(),
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn sample_entry_execution_rejected(cycle_id: Uuid) -> Event {
+        Event::EntryExecutionRejected {
+            position_id: Uuid::now_v7(),
+            cycle_id,
+            order_id: Uuid::now_v7(),
+            client_order_id: "test-client-order-id".to_string(),
+            signal_id: Uuid::now_v7(),
+            reason: "margin safety violation".to_string(),
+            recoverable: true,
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_entry_order_requested_serializes_optional_cycle_id() {
+        let cycle_id = Uuid::now_v7();
+        let event = sample_entry_order_requested(Some(cycle_id));
+        let payload = serde_json::to_value(&event).unwrap();
+        assert_eq!(payload["type"].as_str(), Some("entry_order_requested"));
+        assert_eq!(payload["cycle_id"].as_str(), Some(cycle_id.to_string().as_str()));
+        assert_eq!(payload["client_order_id"].as_str(), Some("test-client-order-id"));
+
+        let event_none = sample_entry_order_requested(None);
+        let payload_none = serde_json::to_value(&event_none).unwrap();
+        assert!(payload_none.get("cycle_id").is_none(), "None cycle_id should be skipped");
+    }
+
+    #[test]
+    fn test_entry_order_accepted_serializes_exchange_order_id_no_fill() {
+        let cycle_id = Uuid::now_v7();
+        let event = sample_entry_order_accepted(cycle_id);
+        let payload = serde_json::to_value(&event).unwrap();
+        assert_eq!(payload["type"].as_str(), Some("entry_order_accepted"));
+        assert_eq!(payload["cycle_id"].as_str(), Some(cycle_id.to_string().as_str()));
+        assert_eq!(payload["exchange_order_id"].as_str(), Some("exchange-123"));
+        assert!(
+            payload.get("fill_price").is_none(),
+            "EntryOrderAccepted must not contain fill_price"
+        );
+        assert!(
+            payload.get("filled_quantity").is_none(),
+            "EntryOrderAccepted must not contain filled_quantity"
+        );
+        assert!(payload.get("fee").is_none(), "EntryOrderAccepted must not contain fee");
+    }
+
+    #[test]
+    fn test_entry_order_failed_serializes_reason() {
+        let cycle_id = Uuid::now_v7();
+        let event = sample_entry_order_failed(cycle_id);
+        let payload = serde_json::to_value(&event).unwrap();
+        assert_eq!(payload["type"].as_str(), Some("entry_order_failed"));
+        assert_eq!(payload["cycle_id"].as_str(), Some(cycle_id.to_string().as_str()));
+        assert_eq!(payload["reason"].as_str(), Some("insufficient balance"));
+    }
+
+    #[test]
+    fn test_entry_execution_rejected_serializes_reason_and_recoverable() {
+        let cycle_id = Uuid::now_v7();
+        let event = sample_entry_execution_rejected(cycle_id);
+        let payload = serde_json::to_value(&event).unwrap();
+        assert_eq!(payload["type"].as_str(), Some("entry_execution_rejected"));
+        assert_eq!(payload["cycle_id"].as_str(), Some(cycle_id.to_string().as_str()));
+        assert_eq!(payload["reason"].as_str(), Some("margin safety violation"));
+        assert_eq!(payload["recoverable"].as_bool(), Some(true));
+    }
+
+    #[test]
+    fn test_new_entry_event_types() {
+        assert_eq!(sample_entry_order_requested(None).event_type(), "entry_order_requested");
+        assert_eq!(
+            sample_entry_order_accepted(Uuid::now_v7()).event_type(),
+            "entry_order_accepted"
+        );
+        assert_eq!(sample_entry_order_failed(Uuid::now_v7()).event_type(), "entry_order_failed");
+        assert_eq!(
+            sample_entry_execution_rejected(Uuid::now_v7()).event_type(),
+            "entry_execution_rejected"
+        );
     }
 }

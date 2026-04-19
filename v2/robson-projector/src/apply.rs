@@ -20,6 +20,10 @@ enum ProjectionRoute {
     PositionOpened,
     PositionClosedLegacy,
     EntryOrderPlaced,
+    EntryOrderRequested,
+    EntryOrderAccepted,
+    EntryOrderFailed,
+    EntryExecutionRejected,
     EntryFilled,
     EntrySignalReceived,
     TrailingStopUpdated,
@@ -52,6 +56,10 @@ fn projection_route(event_type: &str) -> Option<ProjectionRoute> {
         "POSITION_OPENED" => Some(ProjectionRoute::PositionOpened),
         "POSITION_CLOSED" => Some(ProjectionRoute::PositionClosedLegacy),
         "entry_order_placed" | "ENTRY_ORDER_PLACED" => Some(ProjectionRoute::EntryOrderPlaced),
+        "entry_order_requested" => Some(ProjectionRoute::EntryOrderRequested),
+        "entry_order_accepted" => Some(ProjectionRoute::EntryOrderAccepted),
+        "entry_order_failed" => Some(ProjectionRoute::EntryOrderFailed),
+        "entry_execution_rejected" => Some(ProjectionRoute::EntryExecutionRejected),
         "entry_filled" | "ENTRY_FILLED" => Some(ProjectionRoute::EntryFilled),
         "entry_signal_received" | "ENTRY_SIGNAL_RECEIVED" => {
             Some(ProjectionRoute::EntrySignalReceived)
@@ -117,6 +125,18 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
         },
         Some(ProjectionRoute::EntryOrderPlaced) => {
             handlers::positions::handle_entry_order_placed(pool, envelope).await?
+        },
+        Some(ProjectionRoute::EntryOrderRequested) => {
+            handlers::positions::handle_entry_order_requested(pool, envelope).await?
+        },
+        Some(ProjectionRoute::EntryOrderAccepted) => {
+            handlers::positions::handle_entry_order_accepted(pool, envelope).await?
+        },
+        Some(ProjectionRoute::EntryOrderFailed) => {
+            handlers::positions::handle_entry_order_failed(pool, envelope).await?
+        },
+        Some(ProjectionRoute::EntryExecutionRejected) => {
+            handlers::positions::handle_entry_execution_rejected(pool, envelope).await?
         },
         Some(ProjectionRoute::EntryFilled) => {
             handlers::positions::handle_entry_filled(pool, envelope).await?
@@ -193,7 +213,11 @@ mod tests {
             "position_armed",
             "position_disarmed",
             "entry_signal_received",
-            "entry_order_placed",
+            "entry_order_placed", // legacy
+            "entry_order_requested",
+            "entry_order_accepted",
+            "entry_order_failed",
+            "entry_execution_rejected",
             "entry_filled",
             "trailing_stop_updated",
             "position_monitor_tick",

@@ -115,7 +115,7 @@ pub struct PositionOpened {
     pub stop_loss_order_id: Option<Uuid>,
 }
 
-/// ENTRY_ORDER_PLACED payload
+/// ENTRY_ORDER_PLACED payload (legacy)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntryOrderPlaced {
     pub position_id: Uuid,
@@ -123,6 +123,58 @@ pub struct EntryOrderPlaced {
     pub expected_price: Decimal,
     pub quantity: Decimal,
     pub signal_id: Uuid,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// ENTRY_ORDER_REQUESTED payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntryOrderRequested {
+    pub position_id: Uuid,
+    pub cycle_id: Option<Uuid>,
+    pub order_id: Uuid,
+    pub client_order_id: String,
+    pub expected_price: Decimal,
+    pub quantity: Decimal,
+    pub signal_id: Uuid,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// ENTRY_ORDER_ACCEPTED payload (post-exchange ack, no fill fields)
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntryOrderAccepted {
+    pub position_id: Uuid,
+    pub cycle_id: Uuid,
+    pub order_id: Uuid,
+    pub client_order_id: String,
+    pub exchange_order_id: String,
+    pub expected_price: Decimal,
+    pub quantity: Decimal,
+    pub signal_id: Uuid,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// ENTRY_ORDER_FAILED payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntryOrderFailed {
+    pub position_id: Uuid,
+    pub cycle_id: Uuid,
+    pub order_id: Uuid,
+    pub client_order_id: String,
+    pub signal_id: Uuid,
+    pub reason: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// ENTRY_EXECUTION_REJECTED payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntryExecutionRejected {
+    pub position_id: Uuid,
+    pub cycle_id: Uuid,
+    pub order_id: Uuid,
+    pub client_order_id: String,
+    pub signal_id: Uuid,
+    pub reason: String,
+    pub recoverable: bool,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -150,7 +202,7 @@ pub struct EntryFilled {
 ///
 /// Emitted by the engine when a detector signal is received for an armed
 /// position. This carries the detector-derived technical stop. It does not
-/// change position state; entry_order_placed performs the Entering transition
+/// change position state; entry_order_accepted performs the Entering transition
 /// after the projector verifies this stop exists.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntrySignalReceived {

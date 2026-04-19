@@ -295,7 +295,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// persistence for events in action results:
     /// - `ActionResult::EventEmitted(event)` - events from EmitEvent action
     /// - `ActionResult::OrderPlaced { event: Some(event), .. }` - events from
-    ///   exit orders
+    ///   exit or entry orders
+    /// - `ActionResult::OrderFailed { event, .. }` - entry order failure events
+    /// - `ActionResult::EntryExecutionRejected { event, .. }` - internal
+    ///   pre-placement safety/policy rejections
     ///
     /// When `event_log_pool` is configured, persistence is **fail-fast**: any
     /// failure in `persist_event_to_log()` (append OR projection apply) is
@@ -320,7 +323,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     self.persist_event_to_log(event).await?;
                 },
                 ActionResult::OrderPlaced { event: Some(event), .. } => {
-                    // Exit orders carry ExitOrderPlaced event - persist it before PositionClosed
+                    self.persist_event_to_log(event).await?;
+                },
+                ActionResult::OrderFailed { event, .. } => {
+                    self.persist_event_to_log(event).await?;
+                },
+                ActionResult::EntryExecutionRejected { event, .. } => {
                     self.persist_event_to_log(event).await?;
                 },
                 _ => {},
@@ -738,12 +746,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         {
             let mut pending_approvals = self.pending_approvals.write().await;
-            pending_approvals.insert(query_id, PendingApprovalRecord {
-                query,
-                position,
-                proposed,
-                governed,
-            });
+            pending_approvals
+                .insert(query_id, PendingApprovalRecord { query, position, proposed, governed });
         }
 
         let pending_approvals = self.pending_approvals.read().await;
@@ -796,13 +800,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let actions_count = results.len();
         for result in results {
             match result {
-                ActionResult::OrderPlaced { order, .. } => {
+                ActionResult::OrderPlaced { order, event } => {
                     info!(
                         %position_id,
                         exchange_order_id = %order.exchange_order_id,
                         fill_price = %order.fill_price.as_decimal(),
                         fee = %order.fee,
-                        "Entry order placed and filled"
+                        event_type = event.as_ref().map(|e| e.event_type()).unwrap_or("none"),
+                        "Entry order accepted and filled"
                     );
                     crate::metrics::ORDERS.with_label_values(&["entry"]).inc();
 
@@ -821,7 +826,39 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         self.record_query_failure(query).await?;
                         return Err(e);
                     }
-                    // Note: event persistence handled by execute_and_persist()
+                },
+                ActionResult::OrderFailed { event, error } => {
+                    warn!(
+                        %position_id,
+                        event_type = event.event_type(),
+                        %error,
+                        "Entry order failed on exchange"
+                    );
+                    query.fail(error.clone(), "acting".to_string());
+                    self.record_query_failure(query).await?;
+
+                    // Rearm detector so the Armed position can receive future signals
+                    let position = self.store.positions().find_by_id(position_id).await?;
+                    if let Some(pos) = position {
+                        self.rearm_detector_after_governed_block(
+                            position_id,
+                            &pos,
+                            "exchange entry failed",
+                        )
+                        .await;
+                    }
+                    return Err(DaemonError::Exec(ExecError::Exchange(error)));
+                },
+                ActionResult::EntryExecutionRejected { event, error } => {
+                    warn!(
+                        %position_id,
+                        event_type = event.event_type(),
+                        %error,
+                        "Entry execution rejected before exchange placement"
+                    );
+                    query.fail(error.clone(), "acting".to_string());
+                    self.record_query_failure(query).await?;
+                    return Err(DaemonError::Exec(ExecError::InvalidState(error)));
                 },
                 ActionResult::AlreadyProcessed(id) => {
                     warn!(%position_id, %id, "Signal already processed (idempotent skip)");
@@ -2722,6 +2759,73 @@ mod tests {
         assert!(
             detectors.contains_key(&position.id),
             "Expected detector to be re-armed after risk denial"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_margin_rejection_moves_to_error_without_rearming_detector() {
+        let exchange = Arc::new(StubExchange::new(dec!(95000)));
+        exchange.set_margin_settings(false, RiskConfig::LEVERAGE);
+        let journal = Arc::new(IntentJournal::new());
+        let store = Arc::new(MemoryStore::new());
+        let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+        let event_bus = Arc::new(EventBus::new(100));
+        let risk_config = RiskConfig::new(dec!(10000)).unwrap();
+        let engine = Engine::new(risk_config);
+        let manager = Arc::new(
+            PositionManager::with_approval_policy(
+                engine,
+                executor,
+                store,
+                event_bus,
+                Arc::new(TracingQueryRecorder),
+                ApprovalPolicy::new(Decimal::from(100u32), 300),
+            )
+            .with_ohlcv_port(Arc::new(StubOhlcv::new(create_test_candles()))),
+        );
+
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(95000)).unwrap();
+        let stop = Price::new(dec!(87400)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let position = manager
+            .arm_position(
+                symbol.clone(),
+                Side::Long,
+                create_test_risk_config(),
+                Some(tech_stop),
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol,
+            side: Side::Long,
+            entry_price: entry,
+            stop_loss: stop,
+            timestamp: chrono::Utc::now(),
+        };
+
+        let result = manager.handle_signal(signal).await;
+        assert!(matches!(
+            result,
+            Err(DaemonError::Exec(robson_exec::ExecError::InvalidState(_)))
+        ));
+
+        let updated = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(
+            matches!(updated.state, PositionState::Error { recoverable: true, .. }),
+            "Expected recoverable Error after margin rejection, got {:?}",
+            updated.state
+        );
+
+        let detectors = manager.detectors.read().await;
+        assert!(
+            !detectors.contains_key(&position.id),
+            "Detector must not be re-armed after internal margin rejection"
         );
     }
 

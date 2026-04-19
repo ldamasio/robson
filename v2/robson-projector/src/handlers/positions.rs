@@ -4,7 +4,7 @@
 //! technical_stop_distance. INVARIANT: trailing_stop_price is initially derived
 //! from technical_stop_distance. Domain position_armed may not have technical
 //! stop data yet; the real detector stop is captured from entry_signal_received
-//! and enforced before entry_order_placed transitions the position.
+//! and enforced before entry_order_accepted transitions the position.
 
 use robson_eventlog::EventEnvelope;
 use rust_decimal::Decimal;
@@ -13,7 +13,8 @@ use sqlx::PgPool;
 use crate::{
     error::{ProjectionError, Result},
     types::{
-        EntryOrderPlaced, EntrySignalReceived, ExitFilled, ExitOrderPlaced, PositionArmed,
+        EntryExecutionRejected, EntryOrderAccepted, EntryOrderFailed, EntryOrderPlaced,
+        EntryOrderRequested, EntrySignalReceived, ExitFilled, ExitOrderPlaced, PositionArmed,
         PositionClosed, PositionClosedDomain, PositionDisarmed, PositionOpened,
         TechnicalStopDistancePayload,
     },
@@ -168,30 +169,30 @@ fn signal_stop_distance(entry_price: Decimal, stop_loss: Decimal) -> Decimal {
     }
 }
 
-fn validate_entry_order_technical_stop(
+fn validate_entry_accepted_technical_stop(
     technical_stop_price: Option<Decimal>,
     technical_stop_distance: Option<Decimal>,
 ) -> Result<()> {
     let stop = technical_stop_price.ok_or_else(|| ProjectionError::InvariantViolated {
-        event_type: "entry_order_placed".to_string(),
-        reason: "technical_stop_price is required before entry_order_placed".to_string(),
+        event_type: "entry_order_accepted".to_string(),
+        reason: "technical_stop_price is required before entry_order_accepted".to_string(),
     })?;
 
     if stop.is_zero() {
         return Err(ProjectionError::InvariantViolated {
-            event_type: "entry_order_placed".to_string(),
+            event_type: "entry_order_accepted".to_string(),
             reason: "technical_stop_price must be non-zero".to_string(),
         });
     }
 
     let distance = technical_stop_distance.ok_or_else(|| ProjectionError::InvariantViolated {
-        event_type: "entry_order_placed".to_string(),
-        reason: "technical_stop_distance is required before entry_order_placed".to_string(),
+        event_type: "entry_order_accepted".to_string(),
+        reason: "technical_stop_distance is required before entry_order_accepted".to_string(),
     })?;
 
     if distance.is_zero() {
         return Err(ProjectionError::InvariantViolated {
-            event_type: "entry_order_placed".to_string(),
+            event_type: "entry_order_accepted".to_string(),
             reason: "technical_stop_distance must be non-zero".to_string(),
         });
     }
@@ -199,11 +200,188 @@ fn validate_entry_order_technical_stop(
     Ok(())
 }
 
+/// Handle legacy entry_order_placed (audit-only, does NOT transition to entering).
 pub(crate) async fn handle_entry_order_placed(
     pool: &PgPool,
     envelope: &EventEnvelope,
 ) -> Result<()> {
     let payload: EntryOrderPlaced =
+        serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+            ProjectionError::InvalidPayload {
+                event_type: envelope.event_type.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+
+    let Some((last_seq,)) = sqlx::query_as::<_, (i64,)>(
+        r#"
+            SELECT last_seq
+            FROM positions_current
+            WHERE position_id = $1
+            "#,
+    )
+    .bind(payload.position_id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Err(ProjectionError::InvariantViolated {
+            event_type: "entry_order_placed".to_string(),
+            reason: "position must exist before entry_order_placed (legacy)".to_string(),
+        });
+    };
+
+    if last_seq >= envelope.seq {
+        tracing::debug!("entry_order_placed already applied: seq={}", last_seq);
+        return Ok(());
+    }
+
+    // Legacy: audit-only. Record entry data but do NOT set state = 'entering'.
+    // Do not set entry_order_id here: positions_current.entry_order_id has a
+    // foreign key to orders_current, and legacy domain events do not create an
+    // orders_current row.
+    sqlx::query(
+        r#"
+        UPDATE positions_current
+        SET
+            entry_price = $2,
+            entry_quantity = $3,
+            current_quantity = $3,
+            entry_signal_id = $4,
+            last_event_id = $5,
+            last_seq = $6,
+            updated_at = $7
+        WHERE position_id = $1 AND last_seq < $6
+        "#,
+    )
+    .bind(payload.position_id)
+    .bind(payload.expected_price)
+    .bind(payload.quantity)
+    .bind(payload.signal_id)
+    .bind(envelope.event_id)
+    .bind(envelope.seq)
+    .bind(envelope.occurred_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Handle entry_order_requested (audit-only, does NOT transition to entering).
+pub(crate) async fn handle_entry_order_requested(
+    pool: &PgPool,
+    envelope: &EventEnvelope,
+) -> Result<()> {
+    let payload: EntryOrderRequested =
+        serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+            ProjectionError::InvalidPayload {
+                event_type: envelope.event_type.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+
+    let Some((last_seq,)) = sqlx::query_as::<_, (i64,)>(
+        r#"
+            SELECT last_seq
+            FROM positions_current
+            WHERE position_id = $1
+            "#,
+    )
+    .bind(payload.position_id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Err(ProjectionError::InvariantViolated {
+            event_type: "entry_order_requested".to_string(),
+            reason: "position must exist before entry_order_requested".to_string(),
+        });
+    };
+
+    if last_seq >= envelope.seq {
+        tracing::debug!("entry_order_requested already applied: seq={}", last_seq);
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+
+    // EntryOrderRequested is the projection home for the local order row.
+    // Create it before setting positions_current.entry_order_id so the FK is valid.
+    sqlx::query(
+        r#"
+        INSERT INTO orders_current (
+            order_id, tenant_id, account_id, position_id,
+            client_order_id, symbol, side, order_type,
+            quantity, price, stop_price,
+            status, filled_quantity, total_fee,
+            last_event_id, last_seq,
+            created_at, updated_at
+        )
+        SELECT
+            $2, tenant_id, account_id, position_id,
+            $3, symbol,
+            CASE side WHEN 'long' THEN 'buy' ELSE 'sell' END,
+            'market',
+            $4, NULL, NULL,
+            'pending', 0, 0,
+            $5, $6,
+            $7, $7
+        FROM positions_current
+        WHERE position_id = $1
+        ON CONFLICT (order_id) DO UPDATE SET
+            client_order_id = EXCLUDED.client_order_id,
+            quantity = EXCLUDED.quantity,
+            last_event_id = EXCLUDED.last_event_id,
+            last_seq = EXCLUDED.last_seq,
+            updated_at = EXCLUDED.updated_at
+        WHERE orders_current.last_seq < EXCLUDED.last_seq
+        "#,
+    )
+    .bind(payload.position_id)
+    .bind(payload.order_id)
+    .bind(&payload.client_order_id)
+    .bind(payload.quantity)
+    .bind(envelope.event_id)
+    .bind(envelope.seq)
+    .bind(envelope.occurred_at)
+    .execute(&mut *tx)
+    .await?;
+
+    // Audit-only for position state: record entry data, do NOT set state = 'entering'.
+    sqlx::query(
+        r#"
+        UPDATE positions_current
+        SET
+            entry_price = $2,
+            entry_quantity = $3,
+            current_quantity = $3,
+            entry_order_id = $4,
+            entry_signal_id = $5,
+            last_event_id = $6,
+            last_seq = $7,
+            updated_at = $8
+        WHERE position_id = $1 AND last_seq < $7
+        "#,
+    )
+    .bind(payload.position_id)
+    .bind(payload.expected_price)
+    .bind(payload.quantity)
+    .bind(payload.order_id)
+    .bind(payload.signal_id)
+    .bind(envelope.event_id)
+    .bind(envelope.seq)
+    .bind(envelope.occurred_at)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Handle entry_order_accepted (transitions to entering).
+pub(crate) async fn handle_entry_order_accepted(
+    pool: &PgPool,
+    envelope: &EventEnvelope,
+) -> Result<()> {
+    let payload: EntryOrderAccepted =
         serde_json::from_value(envelope.payload.clone()).map_err(|e| {
             ProjectionError::InvalidPayload {
                 event_type: envelope.event_type.clone(),
@@ -224,17 +402,64 @@ pub(crate) async fn handle_entry_order_placed(
         .await?
     else {
         return Err(ProjectionError::InvariantViolated {
-            event_type: "entry_order_placed".to_string(),
-            reason: "position_armed must exist before entry_order_placed".to_string(),
+            event_type: "entry_order_accepted".to_string(),
+            reason: "position must exist before entry_order_accepted".to_string(),
         });
     };
 
     if last_seq >= envelope.seq {
-        tracing::debug!("entry_order_placed already applied: seq={}", last_seq);
+        tracing::debug!("entry_order_accepted already applied: seq={}", last_seq);
         return Ok(());
     }
 
-    validate_entry_order_technical_stop(technical_stop_price, technical_stop_distance)?;
+    validate_entry_accepted_technical_stop(technical_stop_price, technical_stop_distance)?;
+
+    let mut tx = pool.begin().await?;
+
+    // Upsert the order row so positions_current.entry_order_id remains a valid FK
+    // and accepted-but-not-filled entries can be reconstructed after restart.
+    sqlx::query(
+        r#"
+        INSERT INTO orders_current (
+            order_id, tenant_id, account_id, position_id,
+            exchange_order_id, client_order_id, symbol, side, order_type,
+            quantity, price, stop_price,
+            status, filled_quantity, total_fee,
+            last_event_id, last_seq,
+            created_at, updated_at
+        )
+        SELECT
+            $2, tenant_id, account_id, position_id,
+            $3, $4, symbol,
+            CASE side WHEN 'long' THEN 'buy' ELSE 'sell' END,
+            'market',
+            $5, NULL, NULL,
+            'acknowledged', 0, 0,
+            $6, $7,
+            $8, $8
+        FROM positions_current
+        WHERE position_id = $1
+        ON CONFLICT (order_id) DO UPDATE SET
+            exchange_order_id = EXCLUDED.exchange_order_id,
+            client_order_id = EXCLUDED.client_order_id,
+            quantity = EXCLUDED.quantity,
+            status = 'acknowledged',
+            last_event_id = EXCLUDED.last_event_id,
+            last_seq = EXCLUDED.last_seq,
+            updated_at = EXCLUDED.updated_at
+        WHERE orders_current.last_seq < EXCLUDED.last_seq
+        "#,
+    )
+    .bind(payload.position_id)
+    .bind(payload.order_id)
+    .bind(&payload.exchange_order_id)
+    .bind(&payload.client_order_id)
+    .bind(payload.quantity)
+    .bind(envelope.event_id)
+    .bind(envelope.seq)
+    .bind(envelope.occurred_at)
+    .execute(&mut *tx)
+    .await?;
 
     sqlx::query(
         r#"
@@ -260,9 +485,162 @@ pub(crate) async fn handle_entry_order_placed(
     .bind(envelope.event_id)
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Handle entry_order_failed (audit-only, no state transition).
+pub(crate) async fn handle_entry_order_failed(
+    pool: &PgPool,
+    envelope: &EventEnvelope,
+) -> Result<()> {
+    let payload: EntryOrderFailed =
+        serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+            ProjectionError::InvalidPayload {
+                event_type: envelope.event_type.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+
+    let Some((last_seq,)) = sqlx::query_as::<_, (i64,)>(
+        r#"
+            SELECT last_seq
+            FROM positions_current
+            WHERE position_id = $1
+            "#,
+    )
+    .bind(payload.position_id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Err(ProjectionError::InvariantViolated {
+            event_type: "entry_order_failed".to_string(),
+            reason: "position must exist before entry_order_failed".to_string(),
+        });
+    };
+
+    if last_seq >= envelope.seq {
+        tracing::debug!("entry_order_failed already applied: seq={}", last_seq);
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+
+    sqlx::query(
+        r#"
+        UPDATE orders_current
+        SET
+            status = 'rejected',
+            last_event_id = $2,
+            last_seq = $3,
+            updated_at = $4
+        WHERE order_id = $1 AND last_seq < $3
+        "#,
+    )
+    .bind(payload.order_id)
+    .bind(envelope.event_id)
+    .bind(envelope.seq)
+    .bind(envelope.occurred_at)
+    .execute(&mut *tx)
+    .await?;
+
+    // Audit-only for position state: update last_event_id/seq, no state change.
+    sqlx::query(
+        r#"
+        UPDATE positions_current
+        SET
+            last_event_id = $2,
+            last_seq = $3,
+            updated_at = $4
+        WHERE position_id = $1 AND last_seq < $3
+        "#,
+    )
+    .bind(payload.position_id)
+    .bind(envelope.event_id)
+    .bind(envelope.seq)
+    .bind(envelope.occurred_at)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
+    Ok(())
+}
+
+/// Handle entry_execution_rejected (recoverable manual-review state).
+pub(crate) async fn handle_entry_execution_rejected(
+    pool: &PgPool,
+    envelope: &EventEnvelope,
+) -> Result<()> {
+    let payload: EntryExecutionRejected = serde_json::from_value(envelope.payload.clone())
+        .map_err(|e| ProjectionError::InvalidPayload {
+            event_type: envelope.event_type.clone(),
+            reason: e.to_string(),
+        })?;
+
+    let Some((last_seq,)) = sqlx::query_as::<_, (i64,)>(
+        r#"
+            SELECT last_seq
+            FROM positions_current
+            WHERE position_id = $1
+            "#,
+    )
+    .bind(payload.position_id)
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Err(ProjectionError::InvariantViolated {
+            event_type: "entry_execution_rejected".to_string(),
+            reason: "position must exist before entry_execution_rejected".to_string(),
+        });
+    };
+
+    if last_seq >= envelope.seq {
+        tracing::debug!("entry_execution_rejected already applied: seq={}", last_seq);
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+
+    sqlx::query(
+        r#"
+        UPDATE orders_current
+        SET
+            status = 'rejected',
+            last_event_id = $2,
+            last_seq = $3,
+            updated_at = $4
+        WHERE order_id = $1 AND last_seq < $3
+        "#,
+    )
+    .bind(payload.order_id)
+    .bind(envelope.event_id)
+    .bind(envelope.seq)
+    .bind(envelope.occurred_at)
+    .execute(&mut *tx)
+    .await?;
+
+    sqlx::query(
+        r#"
+        UPDATE positions_current
+        SET
+            state = 'error',
+            last_event_id = $2,
+            last_seq = $3,
+            updated_at = $4
+        WHERE position_id = $1 AND last_seq < $3
+        "#,
+    )
+    .bind(payload.position_id)
+    .bind(envelope.event_id)
+    .bind(envelope.seq)
+    .bind(envelope.occurred_at)
+    .execute(&mut *tx)
+    .await?;
+
+    tx.commit().await?;
     Ok(())
 }
 
@@ -309,7 +687,7 @@ pub(crate) async fn handle_entry_filled(pool: &PgPool, envelope: &EventEnvelope)
 /// Handle entry_signal_received (robson-domain::Event::EntrySignalReceived)
 ///
 /// This event carries the detector-derived technical stop. It does not change
-/// position state; entry_order_placed performs the Entering transition after
+/// position state; entry_order_accepted performs the Entering transition after
 /// verifying these fields are present and non-zero.
 pub(crate) async fn handle_entry_signal_received(
     pool: &PgPool,
@@ -445,6 +823,48 @@ pub(crate) async fn handle_exit_order_placed(
             }
         })?;
 
+    let mut tx = pool.begin().await?;
+
+    // Upsert the exit order into orders_current first so the FK
+    // positions_current.exit_order_id → orders_current is satisfied.
+    sqlx::query(
+        r#"
+        INSERT INTO orders_current (
+            order_id, tenant_id, account_id, position_id,
+            client_order_id, symbol, side, order_type,
+            quantity, price, stop_price,
+            status, filled_quantity, total_fee,
+            last_event_id, last_seq,
+            created_at, updated_at
+        )
+        SELECT
+            $2, tenant_id, account_id, position_id,
+            $2::text, symbol,
+            CASE side WHEN 'long' THEN 'sell' ELSE 'buy' END,
+            'market',
+            $3, $4, NULL,
+            'pending', 0, 0,
+            $5, $6,
+            $7, $7
+        FROM positions_current
+        WHERE position_id = $1
+        ON CONFLICT (order_id) DO UPDATE SET
+            last_event_id = EXCLUDED.last_event_id,
+            last_seq = EXCLUDED.last_seq,
+            updated_at = EXCLUDED.updated_at
+        WHERE orders_current.last_seq < EXCLUDED.last_seq
+        "#,
+    )
+    .bind(payload.position_id)
+    .bind(payload.order_id)
+    .bind(payload.quantity)
+    .bind(payload.expected_price)
+    .bind(envelope.event_id)
+    .bind(envelope.seq)
+    .bind(envelope.occurred_at)
+    .execute(&mut *tx)
+    .await?;
+
     sqlx::query(
         r#"
         UPDATE positions_current
@@ -464,9 +884,10 @@ pub(crate) async fn handle_exit_order_placed(
     .bind(envelope.event_id)
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
-    .execute(pool)
+    .execute(&mut *tx)
     .await?;
 
+    tx.commit().await?;
     Ok(())
 }
 
@@ -566,14 +987,16 @@ mod tests {
     }
 
     #[test]
-    fn entry_order_placed_requires_non_zero_detector_technical_stop() {
-        assert!(validate_entry_order_technical_stop(None, Some(dec!(1500))).is_err());
-        assert!(validate_entry_order_technical_stop(Some(Decimal::ZERO), Some(dec!(1500))).is_err());
-        assert!(validate_entry_order_technical_stop(Some(dec!(93500)), None).is_err());
+    fn entry_order_accepted_requires_non_zero_detector_technical_stop() {
+        assert!(validate_entry_accepted_technical_stop(None, Some(dec!(1500))).is_err());
         assert!(
-            validate_entry_order_technical_stop(Some(dec!(93500)), Some(Decimal::ZERO)).is_err()
+            validate_entry_accepted_technical_stop(Some(Decimal::ZERO), Some(dec!(1500))).is_err()
         );
-        assert!(validate_entry_order_technical_stop(Some(dec!(93500)), Some(dec!(1500))).is_ok());
+        assert!(validate_entry_accepted_technical_stop(Some(dec!(93500)), None).is_err());
+        assert!(
+            validate_entry_accepted_technical_stop(Some(dec!(93500)), Some(Decimal::ZERO)).is_err()
+        );
+        assert!(validate_entry_accepted_technical_stop(Some(dec!(93500)), Some(dec!(1500))).is_ok());
     }
 }
 

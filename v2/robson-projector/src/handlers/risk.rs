@@ -30,16 +30,22 @@ pub(crate) async fn handle_risk_check_failed(
         r#"
         INSERT INTO risk_state_current (
             risk_id, tenant_id, account_id, strategy_id,
+            total_exposure, max_exposure,
+            daily_pnl, daily_loss_limit,
+            drawdown, max_drawdown,
             is_violated, violation_reason, violated_at,
             last_event_id, last_seq,
             calculated_at, updated_at
         ) VALUES (
             $1, $2, $3, $4,
+            0, 0,
+            0, 0,
+            0, 0,
             true, $5, $6,
             $7, $8,
             $9, $9
         )
-        ON CONFLICT (uk_risk_account_strategy) DO UPDATE SET
+        ON CONFLICT ON CONSTRAINT uk_risk_account_strategy DO UPDATE SET
             is_violated = true,
             violation_reason = EXCLUDED.violation_reason,
             violated_at = EXCLUDED.violated_at,
