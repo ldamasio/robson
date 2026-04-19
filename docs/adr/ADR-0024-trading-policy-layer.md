@@ -194,16 +194,54 @@ With `min_tech_stop_pct = 1%` (env override for testnet), and BTCUSDT typical st
 limit to block this. The testnet loop unblocks without requiring artificial limit
 overrides.
 
-**Month boundary implementation (new work):**
+**Month boundary implementation (MIG-v3#12 — separate from MIG-v3#11):**
 
-A month boundary detection task must be added to the daemon. On detection:
-1. Fetch current equity (realized capital + mark-to-market of open positions).
-2. Compute `latent_risk_carried` from all open positions.
-3. Persist `capital_base` for the new month.
-4. Reset `realized_loss` accumulator for the new month.
-5. Emit `MonthBoundaryReset` event to event log.
+MIG-v3#11 implements the policy layer and dynamic slot calculation with a best-effort
+in-memory approximation of `capital_base` (sufficient for testnet / VAL-001). MIG-v3#12
+delivers the event-sourced persistence required before real capital operations (VAL-002).
 
-This is follow-up work (MIG-v3#11).
+MIG-v3#12 scope:
+
+1. **New domain event** in `robson-domain::events`:
+   ```
+   MonthBoundaryReset {
+     capital_base: Decimal,          // current_equity − latent_risk_carried
+     carried_positions_risk: Decimal, // Σ latent risk of open positions absorbed
+     month: u32,
+     year: u32,
+     timestamp: DateTime<Utc>,
+   }
+   ```
+
+2. **New DB migration**: `monthly_state` table:
+   ```sql
+   CREATE TABLE monthly_state (
+     id            UUID PRIMARY KEY,
+     year          SMALLINT NOT NULL,
+     month         SMALLINT NOT NULL,
+     capital_base  NUMERIC(20,8) NOT NULL,
+     created_at    TIMESTAMPTZ NOT NULL,
+     UNIQUE (year, month)
+   );
+   ```
+
+3. **New projector handler** for `MonthBoundaryReset` → upserts `monthly_state`.
+
+4. **Daemon month boundary detection**: UTC calendar check on each daemon tick.
+   On boundary:
+   - Compute `current_equity` (realized capital + mark-to-market of open positions).
+   - Compute `latent_risk_carried` (Σ max(0, loss_if_stop_hit) for open positions).
+   - Compute `capital_base = current_equity − latent_risk_carried`.
+   - Emit `MonthBoundaryReset` event to event log.
+   - Reset monthly realized loss accumulator.
+   - Clear `MonthlyHalt` state if active (auto-reset).
+   - Must be idempotent: if the daemon restarts mid-month, the event must not
+     be re-emitted. Gate on `monthly_state` having no entry for the current month.
+
+5. **RiskContext**: on startup, read `capital_base` from `monthly_state` projection
+   for the current month. Fall back to current equity if no entry exists (first month).
+
+MIG-v3#12 is a hard prerequisite for VAL-002 (real capital activation).
 
 ---
 

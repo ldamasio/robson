@@ -120,14 +120,15 @@ Status rule for this table: code-backed items may be marked done from repository
 | MIG-v3#8 | Chaos testing suite | Pending |
 | MIG-v3#9 | Position Reconciliation Worker (ADR-0022 — Robson-authored position invariant) | Pending — follow-up from ADR-0022; scans every account type and every symbol; closes UNTRACKED positions |
 | MIG-v3#10 | Symbol-agnostic documentation + test sweep (ADR-0023) | Pending — follow-up from ADR-0023; rewrite symbol-coupled docs, parameterize risk tests across ≥2 symbols |
-| MIG-v3#11 | Policy Layer + Dynamic Slot Calculation (ADR-0024) | Pending — implement `robson-domain::policy` (`TradingPolicy`, `TechStopConfig`); refactor `RiskGate` to consume policy; eliminate static `RiskLimits`; add month-boundary `MonthBoundaryReset` event and capital-base reset logic |
+| MIG-v3#11 | Policy Layer + Dynamic Slot Calculation (ADR-0024) | Pending — implement `robson-domain::policy` (`TradingPolicy`, `TechStopConfig`); refactor `RiskGate` to consume policy; eliminate static `RiskLimits`; dynamic slot calculation uses best-effort in-memory `capital_base` (persisted base lands in MIG-v3#12) |
+| MIG-v3#12 | Monthly State Persistence — `MonthBoundaryReset` + `monthly_state` projection | Pending — depends on MIG-v3#11; event-sourced capital base and realized loss across restarts; required before real capital (VAL-002) |
 | QE-P1 | Passive Wrapper (Non-Breaking) | ✅ Done |
 | QE-P2 | Blocking Governance | ✅ Done (2026-04-04) |
 | QE-P3 | Approval Gates | ✅ Done (2026-04-05) |
 | QE-P4 | Full Audit & Replay | ✅ Done (2026-04-05) |
 | QE-P5 | Context Governance (LLM) | Deferred (v3+) |
 | VAL-001 | Testnet E2E validation (arm → signal → fill → trailing stop → exit) | Phase 1 PASS (2026-04-16) / Phase 2 blocked — root cause identified 2026-04-19: static `max_single_position_pct=15%` and `max_total_exposure_pct=30%` (legacy v2 values) contradict the Golden Rule for testnet capital scale. Resolution: MIG-v3#11 (Policy Layer) eliminates these static limits; slot check becomes dynamic budget calculation. See [ADR-0024](../adr/ADR-0024-trading-policy-layer.md) and [runbooks/val-001-testnet-e2e-validation.md](../runbooks/val-001-testnet-e2e-validation.md) |
-| VAL-002 | Real capital activation (Binance real keys + monitor enabled in prod) | Pending — blocked on VAL-001 PASS |
+| VAL-002 | Real capital activation (Binance real keys + monitor enabled in prod) | Pending — blocked on VAL-001 PASS + MIG-v3#12 (monthly state persistence required before real capital) |
 
 ### MIG-v2.5#2 Technical Notes (2026-04-05, validated 2026-04-10)
 
