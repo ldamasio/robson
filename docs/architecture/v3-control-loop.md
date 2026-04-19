@@ -163,7 +163,7 @@ pub enum Interpretation {
 
 **Owner**: Engine (robson-engine) — PURE, NO I/O
 
-**Input**: `Interpretation` + `RiskLimits` + `PositionState`
+**Input**: `Interpretation` + `TradingPolicy` + `RiskContext` + `PositionState`
 
 **Output**: `EngineAction` enum:
 ```rust

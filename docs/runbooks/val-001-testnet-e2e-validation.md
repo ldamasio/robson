@@ -13,8 +13,9 @@
 | 2026-04-15 | Codex | **READY** | Detector now computes chart-derived stops via `TechnicalStopAnalyzer`; verified with `cargo test --all` and `cargo check --all-targets` |
 | 2026-04-16 | GLM+Codex | **Phase 1 PASS / Phase 2 inconclusive** | ARM fix deployed (sha-5db3daad, 377 tests). Phase 1: `position_armed` confirmed, `tech_stop_distance: null`. Phase 2: detector fired (MA crossover, chart stop $73,825.27), but Risk Engine correctly blocked entry — exposure $87 > 30% of capital $100 ($30 limit). Position disarmed cleanly. |
 | 2026-04-18 | GLM+Codex | **Phase 2 blocked by RiskGate** | Testnet Binance secret was sanitized and invalid testnet key was rotated. Detector emitted chart-derived BTCUSDT signals, but RiskGate correctly denied entries: current stop distance produced proposed notional around 50-55% of capital, above the 30% total exposure limit (and above the 15% single-position limit). Capital-only retries are not valid because sizing and exposure limits both scale from the same `RiskConfig.capital`. All armed positions were disarmed; final `/status` was clean. |
+| 2026-04-19 | Codex | **Phase 2 unblocked in repository / pending rollout** | MIG-v3#11 implemented ADR-0024 dynamic slots (`2db23ad2`, corrected by `0b3653a7`) and removed enforcement of legacy 15%/30% exposure caps. Testnet config commit `c3b1bc3` adds `ROBSON_MIN_TECH_STOP_PCT: "1.0"`. Repository validation: `cargo fmt --all --check`, `cargo build --all`, and `cargo test --all` pass; `cargo clippy --all-targets -- -D warnings` is still blocked by pre-existing missing-docs/config baseline. Next step: deploy latest image, sync ArgoCD, then rerun Phase 2. |
 
-*VAL-001 Phase 1 PASS. Phase 2 remains blocked until a detector-provided technical stop produces policy-compliant sizing, or an explicit testnet-only policy change is approved and documented. VAL-002 remains blocked.*
+*VAL-001 Phase 1 PASS. Phase 2 is no longer blocked by the static exposure policy in repository state as of 2026-04-19. It remains pending operational deployment and live testnet execution. VAL-002 remains blocked.*
 
 ---
 
@@ -63,35 +64,34 @@ VAL-001 must not bypass the Technical Stop Distance policy. The detector must
 derive `stop_loss` from chart analysis; do not inject a percentage stop or
 manually override `tech_stop_distance` to force the test through RiskGate.
 
-Current sizing uses the same operator-supplied capital for both the 1% per-trade
-risk amount and the portfolio exposure limits:
+Current sizing follows ADR-0024. The 1% per-trade risk and 4% monthly budget
+are immutable policy values; notional exposure is derived from the chart stop and
+is not capped by the removed v2 15%/30% soft limits.
 
 ```text
-risk_amount = capital * 1%
-technical_stop_distance = abs(entry_price - detector_stop_loss)
-position_size = risk_amount / technical_stop_distance
+risk_amount = capital_base * 1%
+technical_stop_span = abs(entry_price - detector_stop_loss)
+position_size = risk_amount / technical_stop_span
 notional_exposure = position_size * entry_price
-max_total_exposure = capital * 30%
-max_single_position = capital * 15%
+
+monthly_budget = capital_base * 4%
+latent_risk = sum(max(0, loss_if_current_stop_hit)) for open positions
+realized_loss = sum(abs(net_loss)) for positions closed this month
+slots_available = floor((monthly_budget - realized_loss - latent_risk) / risk_amount)
 ```
 
-Because both `notional_exposure` and exposure limits scale with capital,
-increasing `capital` alone does not change the exposure ratio:
+With $100 capital, BTCUSDT at $80,000, and a chart-derived stop 2% away:
 
 ```text
-notional_exposure / capital = 1% / technical_stop_distance_pct
+span = $1,600
+position_size = $1 / $1,600 = 0.000625 BTC
+notional_exposure = $50 = 50% of capital
+slots_available after entry = floor(($4 - $0 - $1) / $1) = 3
 ```
 
-With the default limits, a candidate entry requires approximately:
-
-```text
-technical_stop_distance_pct >= 3.33%  # total exposure <= 30%
-technical_stop_distance_pct >= 6.67%  # single position <= 15%
-```
-
-If the detector emits a valid chart-derived stop closer than this, RiskGate must
-deny entry and VAL-001 Phase 2 remains inconclusive/blocked. Do not treat that as
-a daemon failure.
+This is policy-compliant and should be approved if the monthly budget has room and
+there is no duplicate open position on the same symbol+side. Do not treat high
+notional exposure alone as a Phase 2 blocker after MIG-v3#11.
 
 ---
 
@@ -107,7 +107,7 @@ a daemon failure.
 | P4 | Symbol-under-test ticks flowing | `kubectl logs -n robson-testnet deploy/robsond --since=2m \| grep -iE "tick\|market_data\|$SYMBOL"` | Tick events visible for the symbol under validation (default example: `BTCUSDT`; any configured pair is acceptable per ADR-0023) |
 | P5 | Clean state (no open positions) | `curl http://localhost:8080/status` (after port-forward) | `"active_positions": 0` |
 | P6 | API token available | `kubectl get secret -n robson-testnet robsond-testnet-secret -o jsonpath='{.data.api-token}' \| base64 -d` | Non-empty string |
-| P7 | No UNTRACKED exchange positions (ADR-0022) | Query Binance testnet account for ALL open positions/balances across ALL account types and symbols; cross-check against `event_log` `entry_order_placed` by exchange order id | Zero UNTRACKED positions. Any position without a matching event is a P0 block — close it before proceeding (see [UNTRACKED-POSITION-RECONCILIATION.md](../policies/UNTRACKED-POSITION-RECONCILIATION.md)) |
+| P7 | No UNTRACKED exchange positions (ADR-0022) | Query Binance testnet account for ALL open positions/balances across ALL account types and symbols; cross-check with Robson projections/orders where available. Domain-event `exchange_order_id` correlation is still pending audit follow-up. | Zero UNTRACKED positions. Any position without a Robson-authored trace is a P0 block — close it before proceeding (see [UNTRACKED-POSITION-RECONCILIATION.md](../policies/UNTRACKED-POSITION-RECONCILIATION.md)) |
 
 **Setup**:
 ```bash

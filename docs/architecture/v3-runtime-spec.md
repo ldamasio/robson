@@ -24,6 +24,11 @@ The Runtime's execution pipeline is implemented by the **QueryEngine** (`robsond
 
 **Current v2.5 implementation note**: governance is already enforced inside `robsond`, but the executor boundary is still transitional. `QueryEngine` uses an internal `GovernedAction` token after risk approval; `Executor` still accepts `Vec<EngineAction>`; query lifecycle audit events append directly to `robson-eventlog`; and executor domain events still persist through `Store`.
 
+**ADR-0024 policy note (implemented 2026-04-19)**: runtime risk evaluation now
+uses `TradingPolicy` and dynamic monthly-budget slots. Legacy static
+`max_open_positions`, `max_total_exposure_pct`, and `max_single_position_pct`
+settings are no longer enforced by `RiskGate`.
+
 See **[v3-query-query-engine.md](v3-query-query-engine.md)** for the full specification.
 
 ---
@@ -419,11 +424,15 @@ cycle_timeout_ms = 5000
 health_check_interval_s = 30
 
 [risk]
-max_open_positions = 3
-max_total_exposure_pct = 30
-max_single_position_pct = 15
-max_daily_loss_pct = 3
-max_monthly_drawdown_pct = 4
+# ADR-0024 primary policy values are immutable in code:
+# risk_per_trade_pct = 1
+# max_monthly_drawdown_pct = 4
+#
+# Environment-configurable technical stop policy:
+min_tech_stop_pct = 1.0
+max_tech_stop_pct = 10.0
+tech_stop_support_n = 2
+tech_stop_lookback = 100
 max_orders_per_minute = 10
 max_slippage_pct = 5
 risk_engine_timeout_ms = 200

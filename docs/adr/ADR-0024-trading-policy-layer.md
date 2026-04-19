@@ -1,7 +1,7 @@
 # ADR-0024 — Trading Policy Layer
 
 **Date**: 2026-04-19
-**Status**: DECIDED
+**Status**: DECIDED — MIG-v3#11 IMPLEMENTED (2026-04-19)
 **Deciders**: RBX Systems (operator + architecture)
 
 ---
@@ -242,6 +242,39 @@ MIG-v3#12 scope:
    for the current month. Fall back to current equity if no entry exists (first month).
 
 MIG-v3#12 is a hard prerequisite for VAL-002 (real capital activation).
+
+---
+
+## Implementation Status (2026-04-19)
+
+MIG-v3#11 is implemented and repository-verified:
+
+- `robson` commit `2db23ad2` added `robson-domain::policy::{TradingPolicy,
+  TechStopConfig}`, wired `TradingPolicy` into `RiskGate`, and removed enforcement
+  of legacy `max_open_positions`, `max_total_exposure_pct`, and
+  `max_single_position_pct`.
+- `robson` commit `0b3653a7` corrected dynamic slot accounting so
+  `realized_loss` is the sum of absolute losing closed positions for the current
+  month. Winning positions do not offset consumed loss budget.
+- `robson` commit `19130cf3` updated architecture verification references.
+- `rbx-infra` commit `c3b1bc3` added the testnet `ROBSON_MIN_TECH_STOP_PCT`
+  configuration.
+
+Validation status:
+
+- `cargo fmt --all --check`: pass
+- `cargo build --all`: pass
+- `cargo test --all`: pass (`409 passed, 24 ignored`)
+- `cargo clippy --all-targets -- -D warnings`: still blocked by pre-existing
+  repository baseline issues outside MIG-v3#11 (`missing_docs` in domain support
+  modules and clippy config deprecation warnings)
+
+Operational status:
+
+- VAL-001 Phase 2 is unblocked in repository state.
+- Testnet still needs a new image, ArgoCD sync, and live Phase 2 execution.
+- MIG-v3#12 remains required before VAL-002 because `capital_base` and monthly
+  realized loss are not yet event-sourced across restarts/month boundaries.
 
 ---
 

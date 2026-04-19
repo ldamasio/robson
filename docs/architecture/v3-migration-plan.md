@@ -127,7 +127,7 @@ Status rule for this table: code-backed items may be marked done from repository
 | QE-P3 | Approval Gates | ✅ Done (2026-04-05) |
 | QE-P4 | Full Audit & Replay | ✅ Done (2026-04-05) |
 | QE-P5 | Context Governance (LLM) | Deferred (v3+) |
-| VAL-001 | Testnet E2E validation (arm → signal → fill → trailing stop → exit) | Phase 1 PASS (2026-04-16) / Phase 2 blocked — root cause identified 2026-04-19: static `max_single_position_pct=15%` and `max_total_exposure_pct=30%` (legacy v2 values) contradict the Golden Rule for testnet capital scale. Resolution: MIG-v3#11 (Policy Layer) eliminates these static limits; slot check becomes dynamic budget calculation. See [ADR-0024](../adr/ADR-0024-trading-policy-layer.md) and [runbooks/val-001-testnet-e2e-validation.md](../runbooks/val-001-testnet-e2e-validation.md) |
+| VAL-001 | Testnet E2E validation (arm -> signal -> fill -> trailing stop -> exit) | Phase 1 PASS (2026-04-16) / Phase 2 ready for redeploy-and-run. The static exposure blocker found on 2026-04-18 was resolved by MIG-v3#11 (`2db23ad2`, corrected by `0b3653a7`) and testnet config commit `c3b1bc3`; `RiskGate` now uses ADR-0024 dynamic slots instead of legacy 15%/30% exposure caps. Remaining work: build/deploy latest image, sync ArgoCD, execute the Phase 2 runbook, and record exchange/fill/trailing-stop evidence. See [ADR-0024](../adr/ADR-0024-trading-policy-layer.md) and [runbooks/val-001-testnet-e2e-validation.md](../runbooks/val-001-testnet-e2e-validation.md) |
 | VAL-002 | Real capital activation (Binance real keys + monitor enabled in prod) | Pending — blocked on VAL-001 PASS + MIG-v3#12 (monthly state persistence required before real capital) |
 
 ### MIG-v2.5#2 Technical Notes (2026-04-05, validated 2026-04-10)
@@ -243,7 +243,7 @@ Observe -> Interpret -> Decide -> Act -> Evaluate -> Persist
 |------|-----------------|-------|--------|----------------|
 | **Observe** | Runtime (MarketDataManager) | WebSocket tick, operator command, detector signal, timer event | Typed observation: `MarketTick(symbol, price, ts)`, `OperatorCommand(cmd)`, `DetectorSignal(signal_id, ...)`, `TimerFire(interval_id)` | Deterministic (event parsing) |
 | **Interpret** | Runtime (PositionManager) | Observation + current PositionState | Interpretation: `StopBreached(position_id, price)`, `SignalValid(signal_id, position_id)`, `NoAction`, `RiskAlert(kind)` | Deterministic (pure function of state + observation) |
-| **Decide** | Engine (robson-engine) | Interpretation + RiskLimits + PositionState | EngineAction: `PlaceEntryOrder`, `UpdateTrailingStop`, `TriggerExit`, `RejectTrade` | Deterministic (pure, no I/O) |
+| **Decide** | Engine (robson-engine) | Interpretation + `TradingPolicy` + `RiskContext` + PositionState | EngineAction: `PlaceEntryOrder`, `UpdateTrailingStop`, `TriggerExit`, `RejectTrade` | Deterministic (pure, no I/O) |
 | **Act** | Executor (robson-exec) via ExchangePort | EngineAction + Permission check | ActionResult: `OrderPlaced(order_id)`, `OrderFailed(reason)`, `Blocked(guard)` | Probabilistic (exchange interaction) |
 | **Evaluate** | Runtime (PositionManager) | ActionResult + PositionState | New PositionState + domain events | Deterministic (state machine transition) |
 | **Persist** | EventLog (robson-eventlog) | Domain events | EventEnvelope(event_id, stream_key, sequence, payload, timestamp) | Deterministic (append-only) |
@@ -397,7 +397,7 @@ Every action requires explicit permission. Permissions are scoped:
 
 1. `PlaceEntryOrder` when position value > 5% of capital
 2. `TriggerExit` when manual (not stop-hit)
-3. `AdjustRiskLimits` (any change to hard limits)
+3. `AdjustTechnicalStopConfig` (any environment change to chart-stop policy)
 4. `CircuitBreakerReset` after activation
 5. `PanicClose` (always requires confirmation, even from CLI)
 
@@ -739,8 +739,8 @@ Every risk decision is logged:
 RiskDecision {
     cycle_id: Ulid,
     action_evaluated: EngineAction,
-    limits_applied: RiskLimits,           // snapshot of current limits
-    dynamic_adjustments: Option<DynamicAdjustments>, // if any
+    policy_applied: TradingPolicy,        // immutable policy snapshot
+    tech_stop_config: TechStopConfig,     // environment policy snapshot
     current_exposure: ExposureSnapshot,    // portfolio state at decision time
     verdict: RiskVerdict,                  // Approved | Denied(reason)
     operator_override: Option<OverrideRecord>,
@@ -916,7 +916,7 @@ Reconsider TRON integration when ALL of these are true:
 | **Unit** | Domain entities, Engine logic, Risk calculations | `cargo test` (Rust), `pytest` (Django during v2.5) | Every commit | v2 domain+engine: good coverage. v1: decent coverage. |
 | **Integration** | Component interactions, EventLog append/replay, Executor+Exchange | `cargo test --features integration` + testcontainers (Postgres) | Every PR | v2: partial (projector stubs). Needs completion. |
 | **Contract** | API contracts (CLI<->daemon, frontend<->backend), event schemas | JSON Schema validation + OpenAPI spec tests | Every PR | Not yet implemented. **v2.5 priority.** |
-| **Risk Engine** | Threshold behavior, circuit breakers (binary MonthlyHalt), edge cases | Dedicated `risk_engine_tests` module with property-based testing | Every PR + nightly | v2: RiskLimits tested. Binary MonthlyHalt: implemented in `circuit_breaker.rs`. **v2.5 priority.** |
+| **Risk Engine** | TradingPolicy slot behavior, realized-loss accounting, latent-risk accounting, circuit breakers (binary MonthlyHalt), edge cases | Dedicated `risk_engine_tests` module with property-based testing | Every PR + nightly | v3: ADR-0024 dynamic slots covered by unit tests. Binary MonthlyHalt implemented in `circuit_breaker.rs`. MIG-v3#12 must persist monthly state before VAL-002. |
 | **Replay** | EventLog replay produces identical state | Custom harness: insert events, replay, compare state hash | Nightly | v2: basic replay exists. Determinism assertion: NOT YET. **v2.5 priority.** |
 | **Chaos** | Component failures, slow Risk Engine, exchange timeouts | tokio::test with injected delays + mock failures | Weekly / pre-release | NOT YET. **v3 priority.** |
 | **Regulatory** | Audit trail completeness, permission logging, data retention | Custom validators: for each event type, verify all required fields present | Pre-release | NOT YET. **v3 priority.** |
@@ -1023,10 +1023,11 @@ Reconsider TRON integration when ALL of these are true:
 
 The repository already shows `MIG-v2.5#4`, `MIG-v2.5#6`, `MIG-v2.5#10`, and `QE-P1` through `QE-P4` implemented. The next actions should stay inside the pending `MIG-v2.5` items:
 
-1. **VAL-001 Phase 2 — Unblock and complete testnet E2E validation**: resolve exposure-limit blocker (testnet-only policy exception or wait for wider stops), then validate full lifecycle from entry to exit.
-2. **Entry order identity design (§7 of audit)**: resolve open questions on `exchange_order_id` in domain events — prerequisite for MIG-v3#9.
-3. **MIG-v3#9 — Position Reconciliation Worker**: implement UNTRACKED detection, `StartupReconciling` state, and auto-close via Safety Net. Critical for VAL-002.
-4. **MIG-v3#10 — Symbol-agnostic documentation + test sweep**: parameterize risk tests across ≥2 symbols, remove BTC-coupled assumptions.
+1. **VAL-001 Phase 2 — Deploy MIG-v3#11 and complete testnet E2E validation**: build/deploy latest `robsond`, sync `rbx-infra` testnet config (`c3b1bc3`), then validate full lifecycle from entry to exit. No testnet exposure-limit exception is required after ADR-0024.
+2. **Entry order identity and event ordering (§7 of audit)**: add `exchange_order_id` to order events and ensure `EntryOrderPlaced` is emitted only after exchange acknowledgement. Prerequisite for reliable reconciliation.
+3. **Startup reconciliation / MIG-v3#9**: implement UNTRACKED detection, `StartupReconciling` state, and auto-close via Safety Net. Critical for VAL-002.
+4. **MIG-v3#12 — Monthly State Persistence**: persist `capital_base` and loss-only monthly realized loss via `MonthBoundaryReset` before real capital operations.
+5. **MIG-v3#10 — Symbol-agnostic documentation + test sweep**: parameterize risk tests across >=2 symbols, remove BTC-coupled assumptions.
 
 ### Explicitly NOT Building Yet
 

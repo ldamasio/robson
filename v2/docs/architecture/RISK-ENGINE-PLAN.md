@@ -5,6 +5,13 @@
 **Scope**: Risk management formal design for Robson v2.5 → v3
 **Prerequisite**: EventLog as source of truth (see source-of-truth decision)
 
+> **2026-04-19 update**: This is a historical v2.5 planning document. The
+> independent `RiskLimits` model described below was superseded for v3 by
+> [ADR-0024](../../../docs/adr/ADR-0024-trading-policy-layer.md) and MIG-v3#11.
+> `RiskGate` now uses `TradingPolicy` and dynamic monthly-budget slots; legacy
+> `max_open_positions`, `max_total_exposure_pct`, and `max_single_position_pct`
+> are preserved only for compatibility and are not enforced.
+
 ---
 
 ## 1. Current State of Risk (Factual)

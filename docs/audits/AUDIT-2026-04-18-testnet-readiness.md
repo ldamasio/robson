@@ -9,6 +9,31 @@
 
 ---
 
+## 2026-04-19 Addendum — MIG-v3#11 Repository Unblock
+
+The static exposure-limit blocker documented in this audit has been superseded by
+ADR-0024 and MIG-v3#11:
+
+- `robson` commit `2db23ad2` added `TradingPolicy`, `TechStopConfig`, and dynamic
+  slot calculation.
+- `robson` commit `0b3653a7` corrected realized-loss accounting so wins do not
+  offset losses in the ADR-0024 slot budget.
+- `robson` commit `19130cf3` updated the architecture verification SHA references.
+- `rbx-infra` commit `c3b1bc3` added the testnet `ROBSON_MIN_TECH_STOP_PCT`
+  configuration.
+
+VAL-001 Phase 2 is no longer blocked in repository state by the legacy
+`max_single_position_pct=15%` and `max_total_exposure_pct=30%` gates. The remaining
+Phase 2 work is operational: deploy the latest image, sync the testnet manifest, and
+execute the runbook to collect exchange order, fill, trailing-stop, exit, and PnL
+evidence.
+
+The other production-readiness findings remain open: `exchange_order_id` in domain
+events, entry event ordering after exchange acknowledgement, startup reconciliation,
+and monthly state persistence.
+
+---
+
 ## 1. Documentation Alignment Findings
 
 ### 1.1 Consistent Documents
@@ -86,15 +111,15 @@ Component Owner | Status | Evidence | Testnet Ready | Blocker | Next Action
 | detector signal generation | detector.rs | **implemented** | MA crossover detection, `TechnicalStopAnalyzer` for chart stops | Yes | Stop distance too tight for testnet capital | Detector must emit wider stops, or testnet capital/policy adjusted |
 | chart-derived TechnicalStopAnalyzer | robson-engine | **implemented** | `technical_stop_analyzer.rs` — swing point detection, support/resistance, ATR fallback | Yes | Chart conditions produce stops ~2-3% from entry; need ≥6.67% for single-position limit | This is a market-conditions blocker, not a code blocker |
 | Golden Rule sizing | robson-domain | **implemented** | `calculate_position_size()` in entities.rs, `RISK_PER_TRADE_PCT = 1` | Yes | None | — |
-| RiskGate approval/denial | robson-engine | **implemented** | `RiskGate::evaluate()` in risk.rs, wired in `QueryEngine::check_risk()` | Yes | Correctly denying entries that exceed exposure limits | This is correct behavior; workaround requires policy change |
-| high-notional approval gate | QueryEngine (QE-P3) | **implemented** | `AwaitingApproval` state, `/queries/{id}/approve`, 300s TTL, `/status` pending | Yes | Not reached — entries denied at RiskGate before reaching approval | — |
+| RiskGate approval/denial | robson-engine | **implemented** | `RiskGate::evaluate()` in risk.rs, wired in `QueryEngine::check_risk()` | Yes | 2026-04-18 static exposure denials superseded by ADR-0024 dynamic slots | Deploy MIG-v3#11 and rerun VAL-001 Phase 2 |
+| high-notional approval gate | QueryEngine (QE-P3) | **implemented** | `AwaitingApproval` state, `/queries/{id}/approve`, 300s TTL, `/status` pending | Yes | Not validated after MIG-v3#11 policy rollout | Rerun VAL-001 Phase 2 |
 | entry order placement | Executor | **implemented** | `executor.rs`, `ExchangePort::place_order()`, Binance REST adapter | Yes | None | — |
 
 ### 2.3 Position Lifecycle — Fill & Monitoring
 
 | Step | Owner | Status | Evidence | Testnet | Blocker | Next Action |
 |------|-------|--------|----------|---------|---------|-------------|
-| entry fill handling | PositionManager | **implemented** | `handle_entry_fill()`, `EntryFilled` event, `PositionActive` transition | Yes | Not validated (Phase 2 blocked) | Pass VAL-001 Phase 2 |
+| entry fill handling | PositionManager | **implemented** | `handle_entry_fill()`, `EntryFilled` event, `PositionActive` transition | Yes | Not validated after MIG-v3#11 policy rollout | Pass VAL-001 Phase 2 |
 | EventLog append | robson-eventlog | **implemented** | `append_event()` with idempotency_key, `execute_and_persist()` fail-fast path | Yes | None | — |
 | projection update | robson-projector | **implemented** | `apply_event_to_projections()`, handlers for all lifecycle events including `entry_signal_received` | Yes | None | — |
 | active position monitoring | position_monitor.rs | **implemented** | `PositionMonitor` spawned in daemon.rs, tick-based monitoring | Yes | None | — |
@@ -105,10 +130,10 @@ Component Owner | Status | Evidence | Testnet Ready | Blocker | Next Action
 
 | Step | Owner | Status | Evidence | Testnet | Blocker | Next Action |
 |------|-------|--------|----------|---------|---------|-------------|
-| manual exit | api.rs + PositionManager | **implemented** | `DELETE /positions/{id}`, calls exit flow | Yes | Not validated (Phase 2 blocked) | Pass VAL-001 Phase 2 → Phase 5A |
-| stop-triggered exit | robson-engine + PositionManager | **implemented** | `TriggerExit` in EngineAction, `update_trailing_stop_discrete()` in trailing_stop.rs | Yes | Not validated (Phase 2 blocked) | Pass VAL-001 Phase 2 → Phase 5B |
-| exit fill handling | PositionManager | **implemented** | `handle_exit_fill()`, `ExitFilled` event, `PositionClosed` transition | Yes | Not validated (Phase 2 blocked) | Pass VAL-001 Phase 2 → Phase 5 |
-| position_closed + PnL | robson-domain | **implemented** | `PositionClosed` event with `realized_pnl`, `fees_paid` | Yes | Not validated (Phase 2 blocked) | Pass VAL-001 Phase 2 → Phase 5 |
+| manual exit | api.rs + PositionManager | **implemented** | `DELETE /positions/{id}`, calls exit flow | Yes | Not validated after MIG-v3#11 policy rollout | Pass VAL-001 Phase 2 → Phase 5A |
+| stop-triggered exit | robson-engine + PositionManager | **implemented** | `TriggerExit` in EngineAction, `update_trailing_stop_discrete()` in trailing_stop.rs | Yes | Not validated after MIG-v3#11 policy rollout | Pass VAL-001 Phase 2 → Phase 5B |
+| exit fill handling | PositionManager | **implemented** | `handle_exit_fill()`, `ExitFilled` event, `PositionClosed` transition | Yes | Not validated after MIG-v3#11 policy rollout | Pass VAL-001 Phase 2 → Phase 5 |
+| position_closed + PnL | robson-domain | **implemented** | `PositionClosed` event with `realized_pnl`, `fees_paid` | Yes | Not validated after MIG-v3#11 policy rollout | Pass VAL-001 Phase 2 → Phase 5 |
 
 ### 2.5 Cross-Cutting Concerns
 
@@ -117,7 +142,7 @@ Component Owner | Status | Evidence | Testnet Ready | Blocker | Next Action
 | untracked position reconciliation | MIG-v3#9 | **pending** | ADR-0022 + policy doc exist; NO reconciliation worker, NO `StartupReconciling` state, NO `position_untracked_detected` event type. Safety Net infrastructure exists but does not implement ADR-0022 flow. | No | Missing implementation | Implement reconciliation worker (MIG-v3#9) |
 | exchange_order_id in order events | robson-domain | **pending** | `EntryOrderPlaced` and `ExitOrderPlaced` carry `cycle_id` (governance proof) but do NOT carry `exchange_order_id`. The engine emits `EntryOrderPlaced` via `EmitEvent` BEFORE the `PlaceEntryOrder` action reaches the executor (lib.rs:418–434), so `exchange_order_id` is not yet available at emission time. `ExitOrderPlaced` can likely be amended directly because the executor creates it after the exchange response. Existing DB support: `orders_current.exchange_order_id` is populated by `OrderAcked` connector-level events (projector handlers/orders.rs), not by domain events. There is no dedicated `event_log` exchange_order_id column index. | No | Critical for reconciliation | Design note required — see §7 |
 | symbol-agnostic behavior | MIG-v3#10 | **partial** | Core risk/trailing-stop/sizing algorithms are symbol-agnostic. Risk tests use ETHUSDT in some cases. But `sample_proposed()` in risk.rs defaults to BTCUSDT. Most tests single-symbol. | Partial | No cross-symbol VAL-001 validation | Parameterize risk tests across ≥2 symbols |
-| VAL-001 pass/fail evidence | runbook | **Phase 1 PASS / Phase 2 blocked** | Run log entries for 2026-04-16 and 2026-04-18 confirm Phase 1 pass, Phase 2 blocked by RiskGate | — | Detector stop distance produces notional > 30% exposure | See §3 options |
+| VAL-001 pass/fail evidence | runbook | **Phase 1 PASS / Phase 2 pending rerun** | Run log entries for 2026-04-16 and 2026-04-18 confirm the original blocker; 2026-04-19 addendum records repository unblock via MIG-v3#11 | — | Latest image and testnet config not yet operationally validated | Deploy and run VAL-001 Phase 2 |
 | VAL-002 block condition | runbook | **blocked** | VAL-002 requires VAL-001 PASS; VAL-001 Phase 2 not passed | — | VAL-001 Phase 2 | — |
 | MonthlyHalt circuit breaker | circuit_breaker.rs | **implemented** | Binary `Active | MonthlyHalt`, `trigger_halt()`, blocks entries and signals, 4% drawdown trigger | Yes | None | — |
 | Monthly drawdown PnL model | risk.rs + position_manager | **implemented** | `build_risk_context()` sums realized PnL - fees from `find_closed_in_month()`, adds unrealized PnL from Active positions | Yes | Unrealized PnL uses last tick, not exchange mark price (known approximation) | — |
@@ -147,7 +172,7 @@ All fixes marked ✅ Applied below are present in the current working tree — t
 | I1 | `robson-domain/src/events.rs` + executor wiring | Exit-side: add `exchange_order_id: Option<String>` to `ExitOrderPlaced`, populate from `ActionResult`. Entry-side: requires design decision (see §7) — `EntryOrderPlaced` is emitted before exchange placement. Options include new `EntryOrderAcked` event or action-sequence restructuring. | Critical for reconciliation (MIG-v3#9 dependency) | Exit-side: low (additive). Entry-side: medium (requires architecture choice). |
 | I2 | `robson-engine/src/risk.rs` | Replace `sample_proposed()` BTCUSDT default with parameterized symbol. Add at least one risk test using a non-BTC symbol with different notional characteristics. | ADR-0023 compliance | Low |
 | I3 | MIG-v3#9: Reconciliation worker | Implement in `robsond/src/reconciliation_worker.rs`: periodic scan of exchange positions, match against `entry_order_placed` events by `exchange_order_id`, classify UNTRACKED, close via Safety Net. Add `StartupReconciling` daemon state. Add `position_untracked_detected` and `untracked_position_closed` event types. | Critical for production safety | Medium — new subsystem, needs careful testing |
-| I4 | VAL-001 Phase 2 unblock | Two valid paths (pick one with operator approval): (a) Document a testnet-only policy exception: raise `max_total_exposure_pct` to 100 and `max_single_position_pct` to 100 in testnet ConfigMap, explicitly labeled as testnet-only. (b) Wait for market conditions where detector chart stops are ≥6.67% from entry. | Operational decision | (a) requires discipline to revert before VAL-002. (b) may wait indefinitely. |
+| I4 | VAL-001 Phase 2 unblock | **Resolved in repository by ADR-0024 / MIG-v3#11.** Static exposure caps are no longer enforced; the correct unblock path is deploy latest `robsond`, sync testnet config, and rerun Phase 2. | Operational rollout | Needs live testnet validation; no testnet-only exposure exception required. |
 
 ### 3.3 Test Additions
 
@@ -162,7 +187,7 @@ All fixes marked ✅ Applied below are present in the current working tree — t
 
 | ID | Change | Detail |
 |----|--------|--------|
-| R1 | VAL-001 testnet policy exception procedure | If operator approves path I4(a), add a documented procedure to the runbook: set testnet ConfigMap exposure limits to 100%, run Phase 2, then revert to production limits before VAL-002 |
+| R1 | VAL-001 testnet policy exception procedure | **Superseded by ADR-0024.** Do not add a 100% exposure-limit exception; deploy MIG-v3#11 and use dynamic slots. |
 | R2 | VAL-001 prerequisite P7 enhancement | Add automated check script for UNTRACKED positions (currently manual "query Binance for ALL open positions") |
 | R3 | Deploy latest HEAD to testnet | 11 docs-only commits (ADR integration) not yet deployed. No code changes, but docs alignment improvements. New image build + tag update needed. |
 
@@ -172,7 +197,7 @@ All fixes marked ✅ Applied below are present in the current working tree — t
 |------|-----|
 | Risk per trade percentage (1%) | Core invariant — ADR/AGENTS.md non-negotiable |
 | Monthly drawdown threshold (4%) | Core invariant — risk engine spec |
-| `max_total_exposure_pct` or `max_single_position_pct` in production | Real capital safety limit |
+| Primary immutable policy values (`risk_per_trade_pct=1`, `max_monthly_drawdown_pct=4`) | Core ADR-0024 invariants |
 | Production ConfigMap — any change to `apps/prod/robson/` | Production isolation |
 | `ROBSON_POSITION_MONITOR_ENABLED` in production | VAL-002 gating |
 | Testnet → production endpoint routing | Could cause real trades on testnet credentials or vice versa |
@@ -223,19 +248,21 @@ All fixes marked ✅ Applied below are present in the current working tree — t
 
 ## 5. Answer: What Is Still Not Ready, and Why?
 
-### Not ready for VAL-001 Phase 2:
+### VAL-001 Phase 2 post-audit status:
 
-The **RiskGate correctly blocks entry** because detector-provided chart stops on BTCUSDT produce stop distances around 2–3% of entry price. With $100 capital:
-- Notional exposure ≈ $50–55 (50–55% of capital)
-- Max single position: $15 (15%)
-- Max total exposure: $30 (30%)
+The 2026-04-18 finding that RiskGate blocked BTCUSDT entries due to the legacy
+15%/30% exposure caps is resolved in repository state by ADR-0024 / MIG-v3#11.
+RiskGate now evaluates monthly-budget slots:
 
-Both limits are exceeded. This is **correct governance behavior** — the system is working as designed. The blocker is that testnet capital ($100) and chart conditions produce stops that are too tight relative to exposure limits.
+- 1% risk per trade
+- 4% monthly budget
+- realized-loss-only budget consumption
+- latent risk from open positions
 
-**Valid unblock paths** (ranked by safety):
-1. **Testnet-only policy exception** (I4a): Temporarily raise exposure limits to 100% in the testnet ConfigMap. Document the exception. Revert before VAL-002.
-2. **Wait for wider stops**: Market conditions may produce chart stops ≥6.67% from entry. Timing unknown.
-3. **Increase testnet capital**: Does NOT help — sizing and exposure limits both scale from capital, so the ratio is invariant.
+Phase 2 is still not passed because the latest code and testnet ConfigMap have not
+yet been deployed and exercised against Binance testnet. The valid next action is
+operational rollout plus the VAL-001 runbook. A testnet-only exposure exception is
+no longer valid or necessary.
 
 ### Not ready for VAL-002:
 
@@ -247,7 +274,7 @@ VAL-002 is correctly blocked on VAL-001 PASS. Even if VAL-001 passes, the follow
 
 ### What IS repository-verified (but not operationally validated):
 
-Repository implementation is present for the full lifecycle, but exchange placement, fill, trailing stop, and exit have NOT been validated in VAL-001 because Phase 2 is blocked by RiskGate:
+Repository implementation is present for the full lifecycle, but exchange placement, fill, trailing stop, and exit have NOT been validated in VAL-001 after the MIG-v3#11 policy change:
 
 - Arm → detector signal → RiskGate evaluation ✅ (validated in VAL-001 Phase 1)
 - EventLog persistence and projection recovery ✅ (repository-verified)
@@ -257,23 +284,24 @@ Repository implementation is present for the full lifecycle, but exchange placem
 - QueryEngine governance pipeline (QE-P1–P4) ✅ (repository-verified)
 - Testnet environment isolation ✅ (validated in VAL-001 Phase 1)
 - Bearer token auth on mutating routes ✅ (validated in VAL-001 Phase 1)
-- Entry order placement → fill → active monitoring → exit → PnL ⏳ (blocked at Phase 2 — not operationally validated)
+- Entry order placement → fill → active monitoring → exit → PnL ⏳ (pending Phase 2 redeploy-and-run)
 
 ---
 
 ## 6. Proposed Action Sequence (For Codex Review)
 
-1. **Docs fixes** (D1–D6): Low-risk, can proceed immediately.
-2. **Design note for exchange identity** (§7): Resolve open questions before implementation.
-3. **Exit-side `exchange_order_id` minimal safe patch**: Lower-risk than entry-side. Add field to `ExitOrderPlaced` (emitted after exchange response via `execute_and_persist()`).
-4. **I4(a) if approved: testnet policy exception**: Unblocks VAL-001 Phase 2 for testing.
-5. **VAL-001 Phase 2 execution**: Once unblocked, run full lifecycle.
-6. **I2: symbol-agnostic test parameterization**: Can parallel with VAL-001.
-7. **Entry-side `exchange_order_id` resolution**: After design note answers are accepted.
+1. **Deploy MIG-v3#11 to testnet**: build latest image and sync `rbx-infra` commit `c3b1bc3`.
+2. **VAL-001 Phase 2 execution**: Run full lifecycle and record exchange, fill, trailing-stop, exit, and PnL evidence.
+3. **Design note for exchange identity** (§7): Resolve open questions before reconciliation implementation.
+4. **Exit-side `exchange_order_id` minimal safe patch**: Lower-risk than entry-side. Add field to `ExitOrderPlaced` (emitted after exchange response via `execute_and_persist()`).
+5. **Entry-side event ordering fix**: Emit request before exchange call, then placed/failed after exchange acknowledgement.
+6. **StartupReconciling gate**: Prevent new decisions until startup exchange state has been checked.
+7. **I2: symbol-agnostic test parameterization**: Can parallel with VAL-001.
 8. **I3: reconciliation worker**: Largest item. Can start design while VAL-001 runs.
-9. **VAL-001 full PASS**: Including fill → exit → clean state.
-10. **I3 completion + testnet validation**: Reconciliation worker tested on testnet.
-11. **VAL-002**: Real capital activation.
+9. **MIG-v3#12 monthly state persistence**: Required before VAL-002.
+10. **VAL-001 full PASS**: Including fill → exit → clean state.
+11. **I3 completion + testnet validation**: Reconciliation worker tested on testnet.
+12. **VAL-002**: Real capital activation.
 
 ---
 

@@ -520,7 +520,8 @@ color = true
 [risk]
 default_capital = 10000.0
 default_leverage = 3
-max_open_positions = 3
+# Position count is governed by ADR-0024 dynamic slots in robsond.
+# Legacy max_open_positions is not enforced by RiskGate.
 
 [logging]
 level = "info"  # debug | info | warn | error
