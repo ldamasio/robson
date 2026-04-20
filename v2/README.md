@@ -21,6 +21,10 @@ Complete rewrite of Robson trading platform with focus on reliability, safety, a
 | `robson-exec` | Execution layer (idempotent order execution) |
 | `robson-connectors` | Exchange adapters (REST + WebSocket) |
 | `robson-store` | PostgreSQL persistence + event sourcing |
+| `robson-eventlog` | Immutable event log with hash-chained integrity |
+| `robson-projector` | Event log → projections (positions_current, queries_current) |
+| `robson-db` | Database connection and migration tooling |
+| `robson-testkit` | Shared test utilities and fixtures |
 | `robsond` | Runtime daemon (orchestration + API server) |
 | `robson-sim` | Backtesting and simulation |
 
@@ -28,7 +32,7 @@ Complete rewrite of Robson trading platform with focus on reliability, safety, a
 
 ### Prerequisites
 
-- Rust 1.75+
+- Rust 1.83+
 - Bun 1.0+
 - PostgreSQL 16+
 

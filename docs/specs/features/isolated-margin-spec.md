@@ -1,7 +1,9 @@
 # Isolated Margin Trading - Technical Specification
 
+> ⚠️ **LEGACY DOCUMENT** — This specification describes the Robson v1/v2 isolated-margin implementation on Binance Spot/Margin accounts. **Robson v3 operates on USD-M Futures** (MIG-v3#13, implemented 2026-04-19) using FAPI endpoints instead of SAPI isolated-margin endpoints. The architectural patterns described here (transfer operations, margin order execution, P&L tracking) informed the v3 futures implementation but the specific API calls, data structures, and account types are no longer applicable. This document is preserved for historical reference. For current v3 architecture, see `docs/architecture/v3-migration-plan.md` and `v2/robsond/src/binance_exchange.rs`.
+
 **Document ID**: SPEC-MARGIN-001  
-**Status**: Draft  
+**Status**: Draft (Legacy — v1/v2 only)  
 **Created**: 2024-12-23  
 **Requirements**: REQ-FUT-MARGIN-001 through REQ-FUT-MARGIN-014  
 

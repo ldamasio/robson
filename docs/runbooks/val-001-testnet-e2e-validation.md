@@ -46,12 +46,15 @@ open exchange position on the testnet account must trace to a `robsond`-authored
 entry. Any UNTRACKED position detected at any phase is a P0 abort condition. See
 prerequisite **P7** and [UNTRACKED-POSITION-RECONCILIATION.md](../policies/UNTRACKED-POSITION-RECONCILIATION.md).
 
-**Environment facts** (repository-verified, 2026-04-15):
+**Environment facts** (repository-verified, 2026-04-20):
 
 | Key | Value |
 |-----|-------|
 | Namespace | `robson-testnet` |
-| Exchange | `testnet.binancefuture.com` (`ROBSON_BINANCE_USE_TESTNET: "true"`) |
+| Exchange | Binance USD-M Futures Testnet (`testnet.binancefuture.com`) |
+| Account type | USD-M Futures (One-way position mode) |
+| API endpoints | FAPI (`/fapi/v2/positionRisk`, `/fapi/v1/order`, `/fapi/v1/leverage`) |
+| WebSocket | `fstream.binancefuture.com` / `stream.binancefuture.com` |
 | Position monitor | enabled (`ROBSON_POSITION_MONITOR_ENABLED: "true"`, symbol: `BTCUSDT`) |
 | API access | ClusterIP — `kubectl port-forward` only |
 | Mutating routes | Bearer token required |
