@@ -1942,33 +1942,24 @@ cargo build --all
 
 ## Entry Point Selection Guide
 
-**For VAL-001 PASS (30 min)**:
-```
-Execute: EP-001 (VAL-001-P2-INJECT)
-```
+Choose the correct entrypoint based on objective:
 
-**For Testnet Low-Volume Mitigation (2h)**:
-```
-Execute: EP-002 (VAL-001-P2-CONFIG)
-```
+| Objective                              | Entry Point |
+|---------------------------------------|-------------|
+| Complete VAL-001 quickly              | EP-001      |
+| Investigate detector behaviour        | EP-002      |
+| Remove BTCUSDT hardcode               | EP-003      |
+| Enable symbol-agnostic config         | EP-004      |
+| Validate futures position mode        | EP-005      |
+| Implement month boundary (VAL-002)    | EP-006      |
+| Implement reconciliation worker       | EP-007      |
 
-**For ADR-0023 Full Compliance (4-5h)**:
-```
-Execute in sequence:
-1. EP-003 (ADR-0023-C1)
-2. EP-004 (ADR-0023-C2)
-3. EP-005 (ADR-0023-C3)
-```
+### Default Execution Order (if unsure)
 
-**For VAL-002 Unblock (14-20h = 3-4 days)**:
-```
-Execute in sequence:
-1. EP-003 (ADR-0023-C1)
-2. EP-004 (ADR-0023-C2)
-3. EP-005 (ADR-0023-C3)
-4. EP-006 (MIG-v3#12)
-5. EP-007 (ADR-0022-R1)
-```
+1. EP-001 (unblock VAL-001)
+2. EP-005 (ensure exchange correctness)
+3. EP-003 → EP-004 (ADR-0023 compliance)
+4. EP-006 → EP-007 (VAL-002 blockers)
 
 ---
 
