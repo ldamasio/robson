@@ -371,6 +371,7 @@ impl BinanceRestClient {
             ("side", side_str.to_string()),
             ("type", "MARKET".to_string()),
             ("quantity", quantity.to_string()),
+            ("newOrderRespType", "RESULT".to_string()),
         ];
 
         if reduce_only {
@@ -557,7 +558,11 @@ pub struct BinanceKline {
     pub trades: u64,
 }
 
-/// Binance order response.
+/// Binance USD-M Futures order response (FAPI).
+///
+/// Field names match `/fapi/v1/order` response format:
+/// - `updateTime` (not `transactTime` which is spot)
+/// - `cumQuote` (not `cummulativeQuoteQty` which is spot)
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BinanceOrderResponse {
@@ -567,16 +572,19 @@ pub struct BinanceOrderResponse {
     pub order_id: u64,
     /// Client order ID
     pub client_order_id: String,
-    /// Transaction time
-    pub transact_time: i64,
+    /// Update time (ms since epoch) — futures uses `updateTime`, not `transactTime`
+    pub update_time: i64,
     /// Price
     pub price: Decimal,
+    /// Average fill price (futures RESULT response)
+    #[serde(default)]
+    pub avg_price: Decimal,
     /// Original quantity
     pub orig_qty: Decimal,
     /// Executed quantity
     pub executed_qty: Decimal,
-    /// Cummulative quoted quantity
-    pub cummulative_quote_qty: Decimal,
+    /// Cumulative quote quantity — futures uses `cumQuote`
+    pub cum_quote: Decimal,
     /// Status
     pub status: String,
     /// Side
@@ -584,7 +592,7 @@ pub struct BinanceOrderResponse {
     /// Type
     #[serde(rename = "type")]
     pub order_type: String,
-    /// Individual fills
+    /// Individual fills (present in spot, usually empty in futures)
     #[serde(default)]
     pub fills: Vec<BinanceFill>,
 }

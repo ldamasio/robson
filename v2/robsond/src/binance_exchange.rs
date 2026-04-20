@@ -164,8 +164,8 @@ impl ExchangePort for BinanceExchangeAdapter {
             let vwap_price = if total_qty > Decimal::ZERO {
                 total_quote / total_qty
             } else {
-                if response.cummulative_quote_qty > Decimal::ZERO {
-                    response.cummulative_quote_qty / executed_qty
+                if response.cum_quote > Decimal::ZERO {
+                    response.cum_quote / executed_qty
                 } else {
                     tracing::warn!(
                         order_id = %response.order_id,
@@ -173,7 +173,7 @@ impl ExchangePort for BinanceExchangeAdapter {
                         "FILLS present but no usable price source"
                     );
                     return Err(ExecError::Exchange(format!(
-                        "Cannot determine fill price for order {} (fills empty, cummulativeQuoteQty=0)",
+                        "Cannot determine fill price for order {} (fills empty, cumQuote=0)",
                         response.order_id
                     )));
                 }
@@ -181,26 +181,28 @@ impl ExchangePort for BinanceExchangeAdapter {
 
             (vwap_price, total_fee, fee_asset)
         } else {
-            let fill_price = if response.cummulative_quote_qty > Decimal::ZERO {
-                response.cummulative_quote_qty / executed_qty
+            let fill_price = if response.cum_quote > Decimal::ZERO {
+                response.cum_quote / executed_qty
+            } else if response.avg_price > Decimal::ZERO {
+                response.avg_price
             } else {
                 return Err(ExecError::Exchange(format!(
-                    "Cannot determine fill price for order {} (no fills, cummulativeQuoteQty=0)",
+                    "Cannot determine fill price for order {} (no fills, cumQuote=0, avgPrice=0)",
                     response.order_id
                 )));
             };
 
-            let estimated_fee = response.cummulative_quote_qty * Decimal::new(1, 3);
+            let estimated_fee = response.cum_quote * Decimal::new(1, 3);
 
             (fill_price, estimated_fee, "USDT".to_string())
         };
 
-        let filled_at = chrono::DateTime::from_timestamp_millis(response.transact_time)
+        let filled_at = chrono::DateTime::from_timestamp_millis(response.update_time)
             .unwrap_or_else(|| {
                 tracing::warn!(
                     order_id = %response.order_id,
-                    transact_time = response.transact_time,
-                    "Invalid transact_time from Binance — using local clock as fallback"
+                    update_time = response.update_time,
+                    "Invalid update_time from Binance — using local clock as fallback"
                 );
                 Utc::now()
             });
