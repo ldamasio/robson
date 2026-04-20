@@ -20,6 +20,12 @@ use robson_exec::{ports::FuturesSettings, ExchangePort, ExecError, OrderResult};
 use rust_decimal::Decimal;
 use tracing::info;
 
+/// Truncate a quantity to a given number of decimal places (round down).
+fn trunc_to_scale(value: Decimal, scale: u32) -> Decimal {
+    let factor = Decimal::from(10i64.pow(scale));
+    (value * factor).floor() / factor
+}
+
 // =============================================================================
 // Adapter
 // =============================================================================
@@ -96,12 +102,25 @@ impl ExchangePort for BinanceExchangeAdapter {
             OrderSide::Sell => Side::Short,
         };
 
+        // Truncate quantity to exchange step size precision.
+        // BTCUSDT futures step size = 0.001 (3 decimal places).
+        // TODO: query exchangeInfo per symbol for dynamic step size.
+        let raw_qty = quantity.as_decimal();
+        let qty = trunc_to_scale(raw_qty, 3);
+
+        if qty <= Decimal::ZERO {
+            return Err(ExecError::Exchange(format!(
+                "Quantity {} truncated to zero for {} — stop distance too small relative to capital",
+                raw_qty, symbol.as_pair()
+            )));
+        }
+
         let response = self
             .client
             .place_market_order(
                 &symbol.as_pair(),
                 binance_side,
-                quantity.as_decimal(),
+                qty,
                 Some(client_order_id),
                 reduce_only,
             )
