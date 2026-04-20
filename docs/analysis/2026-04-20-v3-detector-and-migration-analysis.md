@@ -1108,3 +1108,893 @@ CLIPPY-001: Add missing_docs to public items in robson-domain support modules
 **Documento criado**: 2026-04-20  
 **Próxima revisão**: Após completion de track escolhido (A/B/C)  
 **Maintainer**: RBX Systems Architecture Team
+## 7. Agent Entry Points
+
+**Purpose**: Executable task definitions for autonomous agent execution.  
+**Format**: Each entry point is self-contained and requires zero interpretation.  
+**Success criterion**: Any agent can execute without asking clarifying questions.
+
+---
+
+### EP-001: VAL-001-P2-INJECT — Manual Signal Injection
+
+**Objective**: Unblock VAL-001 Phase 2 by injecting detector signal manually.
+
+**Preconditions**:
+```bash
+# VERIFY: Position exists in Armed state
+curl -s http://localhost:8080/status | jq '.positions[] | select(.state == "Armed")' | grep -q "Armed"
+# EXIT CODE 0 = precondition met; EXIT CODE 1 = ABORT (no armed position)
+
+# VERIFY: API token available
+test -n "$ROBSON_TOKEN"
+# EXIT CODE 0 = precondition met; EXIT CODE 1 = ABORT (token not set)
+
+# VERIFY: Port-forward active
+curl -s http://localhost:8080/health > /dev/null
+# EXIT CODE 0 = precondition met; EXIT CODE != 0 = ABORT (no connection)
+```
+
+**Inputs**:
+- `ROBSON_TOKEN` (env var) — API bearer token from `kubectl get secret robsond-testnet-secret`
+- `POSITION_ID` (extracted) — UUID of Armed position
+- `ENTRY_PRICE` (hardcoded) — `"95000.00"` (BTCUSDT reference)
+- `STOP_LOSS` (hardcoded) — `"85500.00"` (10% below entry, chart-derived equivalent for testnet)
+
+**Steps**:
+```bash
+# Step 1: Extract POSITION_ID
+export POSITION_ID=$(curl -s http://localhost:8080/status | \
+  jq -r '.positions[] | select(.state == "Armed") | .id' | head -1)
+
+# Step 2: Verify extraction succeeded
+test -n "$POSITION_ID" || { echo "FAIL: No Armed position found"; exit 1; }
+
+# Step 3: Inject signal
+RESPONSE=$(curl -s -w "\n%{http_code}" -X POST \
+  http://localhost:8080/positions/$POSITION_ID/signal \
+  -H "Authorization: Bearer $ROBSON_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "entry_price": "95000.00",
+    "stop_loss": "85500.00"
+  }')
+
+# Step 4: Extract HTTP status code
+HTTP_CODE=$(echo "$RESPONSE" | tail -1)
+BODY=$(echo "$RESPONSE" | head -n -1)
+
+# Step 5: Verify HTTP 200 or 201
+if [[ "$HTTP_CODE" != "200" && "$HTTP_CODE" != "201" ]]; then
+  echo "FAIL: HTTP $HTTP_CODE"
+  echo "$BODY"
+  exit 1
+fi
+
+# Step 6: Verify response contains expected state transition
+echo "$BODY" | jq -e '.state == "Entering" or .state == "Active"' > /dev/null || {
+  echo "FAIL: Unexpected state in response"
+  echo "$BODY"
+  exit 1
+}
+
+echo "SUCCESS: Signal injected, position transitioning"
+```
+
+**Expected Outcome**:
+```bash
+# PASS condition:
+curl -s http://localhost:8080/status | \
+  jq -e '.positions[] | select(.id == env.POSITION_ID) | .state' | \
+  grep -qE "Entering|Active"
+# EXIT CODE 0 = PASS
+
+# Visible in logs within 10 seconds:
+kubectl logs -n robson-testnet deploy/robsond --since=30s | \
+  grep -E "entry_order_placed|Entering"
+# OUTPUT contains "entry_order_placed" = PASS
+```
+
+**Failure Detection**:
+```bash
+# FAIL if HTTP 4xx/5xx
+# FAIL if response.state not in [Entering, Active]
+# FAIL if no entry_order_placed log within 30s
+# FAIL if position remains Armed after 60s
+```
+
+**Rollback**: Not applicable (signal injection is idempotent; position can be disarmed manually if needed).
+
+---
+
+### EP-002: VAL-001-P2-CONFIG — Configurable MA Periods
+
+**Objective**: Enable configurable MA periods for testnet to reduce ticks needed for crossover detection.
+
+**Preconditions**:
+```bash
+# VERIFY: Working directory is robson/v2
+pwd | grep -q "/robson/v2$"
+
+# VERIFY: No uncommitted changes in target files
+git diff --exit-code v2/robsond/src/config.rs v2/robsond/src/detector.rs v2/robsond/src/position_manager.rs
+# EXIT CODE 0 = clean; EXIT CODE 1 = ABORT (uncommitted changes)
+
+# VERIFY: Cargo builds successfully
+cargo check --all
+# EXIT CODE 0 = precondition met
+```
+
+**Inputs**:
+- Target files:
+  - `v2/robsond/src/config.rs`
+  - `v2/robsond/src/detector.rs`
+  - `v2/robsond/src/position_manager.rs`
+- Default values: `MA_FAST=9`, `MA_SLOW=21`
+- Env vars: `ROBSON_DETECTOR_MA_FAST`, `ROBSON_DETECTOR_MA_SLOW`
+
+**Steps**:
+```bash
+# Step 1: Add DetectorConfig to config.rs (after line 94)
+# Insert after TechStopConfigEnv definition:
+cat >> /tmp/detector_config.rs <<'EOF'
+
+/// Detector MA period configuration (configurable for testnet low-volume scenarios).
+#[derive(Debug, Clone)]
+pub struct DetectorConfig {
+    /// Fast MA period (default 9)
+    pub ma_fast_period: usize,
+    /// Slow MA period (default 21)
+    pub ma_slow_period: usize,
+}
+
+impl Default for DetectorConfig {
+    fn default() -> Self {
+        Self {
+            ma_fast_period: 9,
+            ma_slow_period: 21,
+        }
+    }
+}
+EOF
+
+# Apply edit to config.rs at line 95 (after TechStopConfigEnv closing brace)
+# (Agent must use Edit tool with exact insertion point)
+
+# Step 2: Add detector field to Config struct (line 18)
+# Add after tech_stop field:
+#   pub detector: DetectorConfig,
+
+# Step 3: Parse from env in load_detector_config() (new function after line 160)
+cat > /tmp/load_detector_config.rs <<'EOF'
+fn load_detector_config() -> DaemonResult<DetectorConfig> {
+    let ma_fast = env::var("ROBSON_DETECTOR_MA_FAST")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(9);
+    
+    let ma_slow = env::var("ROBSON_DETECTOR_MA_SLOW")
+        .ok()
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(21);
+    
+    if ma_fast >= ma_slow {
+        return Err(DaemonError::Config(format!(
+            "ROBSON_DETECTOR_MA_FAST ({}) must be < ROBSON_DETECTOR_MA_SLOW ({})",
+            ma_fast, ma_slow
+        )));
+    }
+    
+    Ok(DetectorConfig {
+        ma_fast_period: ma_fast,
+        ma_slow_period: ma_slow,
+    })
+}
+EOF
+
+# Step 4: Wire detector config to DetectorTask in position_manager.rs
+# Update arm_position() call to DetectorTask::from_position() around line 1173
+# Change from:
+#   DetectorTask::from_position(&position, event_bus, ohlcv_port, cancel_token)
+# To:
+#   DetectorTask::from_position_with_config(
+#       &position,
+#       event_bus,
+#       ohlcv_port,
+#       cancel_token,
+#       &self.config.detector
+#   )
+
+# Step 5: Update DetectorTask::from_position in detector.rs to accept config
+# Add new constructor from_position_with_config() at line 210
+
+# Step 6: Compile and verify
+cargo build --bin robsond
+# EXIT CODE 0 = SUCCESS; EXIT CODE 1 = FAIL (compilation error)
+
+# Step 7: Run tests
+cargo test --package robsond detector
+# EXIT CODE 0 = SUCCESS
+```
+
+**Expected Outcome**:
+```bash
+# PASS condition 1: Cargo builds without errors
+cargo build --bin robsond 2>&1 | grep -q "Finished"
+
+# PASS condition 2: Env var parsing works
+ROBSON_DETECTOR_MA_FAST=3 ROBSON_DETECTOR_MA_SLOW=5 \
+  cargo run --bin robsond -- --help 2>&1 | grep -v "Error"
+# EXIT CODE 0 = PASS
+
+# PASS condition 3: Validation triggers on invalid config
+ROBSON_DETECTOR_MA_FAST=21 ROBSON_DETECTOR_MA_SLOW=9 \
+  cargo run --bin robsond 2>&1 | grep -q "must be <"
+# EXIT CODE 0 = PASS (validation working)
+```
+
+**Failure Detection**:
+```bash
+# FAIL if cargo build fails
+# FAIL if tests fail
+# FAIL if env var validation doesn't trigger on invalid input
+# FAIL if detector still uses hardcoded 9/21 after deploy
+```
+
+**Rollback**:
+```bash
+git restore v2/robsond/src/config.rs v2/robsond/src/detector.rs v2/robsond/src/position_manager.rs
+```
+
+---
+
+### EP-003: ADR-0023-C1 — Remove daemon.rs Hardcoded BTCUSDT
+
+**Objective**: Replace hardcoded BTCUSDT in WebSocket spawn with configurable symbol list from env.
+
+**Preconditions**:
+```bash
+# VERIFY: On branch with clean state
+git status --porcelain | wc -l | grep -q "^0$"
+
+# VERIFY: Current code has hardcoded BTCUSDT
+grep -q 'Symbol::from_pair("BTCUSDT")' v2/robsond/src/daemon.rs
+# EXIT CODE 0 = precondition met
+
+# VERIFY: Baseline compiles
+cargo build --bin robsond
+# EXIT CODE 0 = precondition met
+```
+
+**Inputs**:
+- File: `v2/robsond/src/daemon.rs` (line 388-394)
+- File: `v2/robsond/src/config.rs` (multiple locations)
+- Env var: `ROBSON_MARKET_DATA_SYMBOLS` (comma-separated)
+- Default: NONE (fail-fast if not provided in production)
+
+**Steps**:
+```bash
+# Step 1: Add MarketDataConfig to config.rs after line 109
+# Use Edit tool to insert after PositionMonitorConfig definition
+
+# Step 2: Add load_market_data_config() function to config.rs
+# Insert before load_environment() function
+
+# Step 3: Add market_data field to Config struct (line ~30)
+# Insert after position_monitor field
+
+# Step 4: Call load_market_data_config() in from_env() (line ~145)
+
+# Step 5: Update daemon.rs lines 388-394
+# BEFORE (single symbol hardcoded):
+#   let btcusdt = Symbol::from_pair("BTCUSDT").unwrap();
+#   let ws_handle = market_data_manager.spawn_ws_client(btcusdt)?;
+#
+# AFTER (loop over configured symbols):
+#   let mut ws_handles = vec![];
+#   for symbol_str in &self.config.market_data.symbols {
+#       let symbol = Symbol::from_pair(symbol_str)
+#           .map_err(|e| DaemonError::Config(format!("Invalid symbol {}: {}", symbol_str, e)))?;
+#       let handle = market_data_manager.spawn_ws_client(symbol)?;
+#       ws_handles.push(handle);
+#       info!(symbol = %symbol_str, "WebSocket client spawned");
+#   }
+
+# Step 6: Update shutdown logic (line ~467)
+# Replace single ws_handle with loop over ws_handles
+
+# Step 7: Compile
+cargo build --bin robsond 2>&1 | tee /tmp/build.log
+grep -q "Finished" /tmp/build.log || { echo "FAIL: Build error"; cat /tmp/build.log; exit 1; }
+
+# Step 8: Test fail-fast on missing env var
+ROBSON_MARKET_DATA_SYMBOLS="" cargo run --bin robsond 2>&1 | grep -q "is required"
+# EXIT CODE 0 = PASS (validation works)
+
+# Step 9: Test multi-symbol parsing
+ROBSON_MARKET_DATA_SYMBOLS="BTCUSDT,ETHUSDT" cargo run --bin robsond -- --version
+# EXIT CODE 0 = PASS (parsing works)
+
+# Step 10: Run unit tests
+cargo test --package robsond config::tests
+# EXIT CODE 0 = PASS
+```
+
+**Expected Outcome**:
+```bash
+# PASS condition 1: grep confirms hardcode removed
+! grep -q 'let btcusdt = Symbol::from_pair("BTCUSDT")' v2/robsond/src/daemon.rs
+
+# PASS condition 2: Build succeeds
+cargo build --bin robsond 2>&1 | grep -q "Finished"
+
+# PASS condition 3: Env validation works
+ROBSON_MARKET_DATA_SYMBOLS="" cargo run --bin robsond 2>&1 | grep -q "ROBSON_MARKET_DATA_SYMBOLS is required"
+
+# PASS condition 4: Multi-symbol accepted
+ROBSON_MARKET_DATA_SYMBOLS="BTCUSDT,ETHUSDT,SOLUSDC" cargo run --bin robsond -- --version
+# EXIT CODE 0 = PASS
+```
+
+**Failure Detection**:
+```bash
+# FAIL if build fails after edits
+# FAIL if empty env var doesn't trigger error
+# FAIL if invalid symbol (e.g., "INVALID") doesn't fail gracefully
+# FAIL if tests fail
+```
+
+**Rollback**:
+```bash
+git restore v2/robsond/src/daemon.rs v2/robsond/src/config.rs
+cargo build --bin robsond  # Verify rollback successful
+```
+
+---
+
+### EP-004: ADR-0023-C2 — Remove config.rs Default Hardcoded Symbols
+
+**Objective**: Change PositionMonitorConfig default from `["BTCUSDT"]` to `[]` and require explicit env var.
+
+**Preconditions**:
+```bash
+# VERIFY: Current default contains BTCUSDT
+grep -A5 'impl Default for PositionMonitorConfig' v2/robsond/src/config.rs | \
+  grep -q 'vec!\["BTCUSDT"'
+# EXIT CODE 0 = precondition met
+
+# VERIFY: Baseline builds
+cargo build --package robsond
+# EXIT CODE 0 = precondition met
+```
+
+**Inputs**:
+- File: `v2/robsond/src/config.rs` (lines 111-120, 188-194)
+- Env var: `ROBSON_POSITION_MONITOR_SYMBOLS` (comma-separated)
+
+**Steps**:
+```bash
+# Step 1: Edit config.rs line 116
+# BEFORE:
+#   symbols: vec!["BTCUSDT".to_string()],
+# AFTER:
+#   symbols: vec![],
+
+# Execute edit
+cd /home/psyctl/apps/robson
+# (Use Edit tool: old_string='symbols: vec!["BTCUSDT".to_string()],' new_string='symbols: vec![],')
+
+# Step 2: Add validation to load_position_monitor_config() after line 520
+# Insert before Ok(PositionMonitorConfig { ... }):
+#   if enabled && symbols.is_empty() {
+#       return Err(DaemonError::Config(
+#           "ROBSON_POSITION_MONITOR_SYMBOLS is required when monitor is enabled".to_string()
+#       ));
+#   }
+
+# Step 3: Test config can remain with BTCUSDT (line 191) — leave unchanged
+# (This is test fixture, not production default)
+
+# Step 4: Compile
+cargo build --package robsond
+# EXIT CODE 0 = SUCCESS
+
+# Step 5: Test validation triggers
+ROBSON_POSITION_MONITOR_ENABLED=true ROBSON_POSITION_MONITOR_SYMBOLS="" \
+  cargo run --bin robsond 2>&1 | grep -q "is required when monitor is enabled"
+# EXIT CODE 0 = PASS
+
+# Step 6: Test disabled monitor doesn't require symbols
+ROBSON_POSITION_MONITOR_ENABLED=false cargo run --bin robsond -- --version
+# EXIT CODE 0 = PASS
+
+# Step 7: Run tests
+cargo test --package robsond position_monitor
+# EXIT CODE 0 = PASS
+```
+
+**Expected Outcome**:
+```bash
+# PASS condition 1: Default changed to empty vec
+grep -A5 'impl Default for PositionMonitorConfig' v2/robsond/src/config.rs | \
+  grep -q 'symbols: vec!\[\]'
+
+# PASS condition 2: Validation enforced
+ROBSON_POSITION_MONITOR_ENABLED=true ROBSON_POSITION_MONITOR_SYMBOLS="" \
+  cargo run --bin robsond 2>&1 | grep -q "is required"
+
+# PASS condition 3: Tests pass
+cargo test --package robsond position_monitor 2>&1 | grep -q "test result: ok"
+```
+
+**Failure Detection**:
+```bash
+# FAIL if default still contains BTCUSDT after edit
+# FAIL if enabled monitor with empty symbols doesn't error
+# FAIL if tests fail
+```
+
+**Rollback**:
+```bash
+git restore v2/robsond/src/config.rs
+cargo build --package robsond
+```
+
+---
+
+### EP-005: ADR-0023-C3 — Position Mode Verification
+
+**Objective**: Add runtime verification that Binance account is in One-way position mode before allowing trades.
+
+**Preconditions**:
+```bash
+# VERIFY: binance_exchange.rs exists and has validate_futures_settings
+grep -q 'async fn validate_futures_settings' v2/robsond/src/binance_exchange.rs
+
+# VERIFY: Baseline builds
+cargo build --package robsond
+# EXIT CODE 0 = precondition met
+
+# VERIFY: binance_rest.rs exists
+test -f v2/robson-connectors/src/binance_rest.rs
+```
+
+**Inputs**:
+- Files:
+  - `v2/robsond/src/binance_exchange.rs` (lines 65-95)
+  - `v2/robson-connectors/src/binance_rest.rs` (add new method)
+  - `v2/robson-exec/src/error.rs` (verify FuturesConfigMismatch exists)
+- API endpoint: `GET /fapi/v1/positionSide/dual`
+- Response: `{"dualSidePosition": bool}`
+
+**Steps**:
+```bash
+# Step 1: Add PositionModeResponse struct to binance_exchange.rs before line 65
+# Insert:
+#[derive(Debug, serde::Deserialize)]
+struct PositionModeResponse {
+    #[serde(rename = "dualSidePosition")]
+    dual_side_position: bool,
+}
+
+# Step 2: Update validate_futures_settings() in binance_exchange.rs
+# Replace lines 82-86 with full implementation (see doc section 4 Track A A3 Step 2)
+# Key changes:
+#   - Add API call to /fapi/v1/positionSide/dual
+#   - Parse response
+#   - Return error if dual_side_position == true
+#   - Only return Ok if One-way mode confirmed
+
+# Step 3: Add get_position_mode() to binance_rest.rs
+# Insert before closing impl block:
+pub async fn get_position_mode(&self) -> Result<bool, BinanceError> {
+    let response: serde_json::Value = self
+        .signed_request("GET", "/fapi/v1/positionSide/dual", &[])
+        .await?;
+    Ok(response["dualSidePosition"].as_bool().unwrap_or(false))
+}
+
+# Step 4: Compile
+cargo build --package robsond --package robson-connectors
+# EXIT CODE 0 = SUCCESS
+
+# Step 5: Run unit tests
+cargo test --package robsond binance_exchange
+# EXIT CODE 0 = PASS
+
+# Step 6: Add integration test (if DATABASE_URL available)
+cat > v2/robsond/tests/position_mode_check.rs <<'EOF'
+#[tokio::test]
+#[ignore = "requires Binance testnet keys"]
+async fn test_validate_futures_settings_one_way_mode() {
+    // Test with real testnet credentials
+    // Verify One-way mode accepted, Hedge mode rejected
+}
+EOF
+
+cargo test --package robsond position_mode_check -- --ignored
+# EXIT CODE 0 = PASS (if keys available)
+```
+
+**Expected Outcome**:
+```bash
+# PASS condition 1: Code added successfully
+grep -q 'dual_side_position' v2/robsond/src/binance_exchange.rs
+
+# PASS condition 2: Builds without errors
+cargo build --package robsond 2>&1 | grep -q "Finished"
+
+# PASS condition 3: Function signature exists
+grep -q 'pub async fn get_position_mode' v2/robson-connectors/src/binance_rest.rs
+
+# PASS condition 4: Tests pass
+cargo test --package robsond binance_exchange 2>&1 | grep -q "test result: ok"
+```
+
+**Failure Detection**:
+```bash
+# FAIL if struct not added
+# FAIL if validate_futures_settings still returns hardcoded "One-way"
+# FAIL if API call not present
+# FAIL if build fails
+# FAIL if tests fail
+```
+
+**Rollback**:
+```bash
+git restore v2/robsond/src/binance_exchange.rs v2/robson-connectors/src/binance_rest.rs
+cargo build --package robsond
+```
+
+---
+
+### EP-006: MIG-v3#12 — Event-Sourced Month Boundary
+
+**Objective**: Implement MonthBoundaryReset event + monthly_state projection for capital base persistence across restarts.
+
+**Preconditions**:
+```bash
+# VERIFY: MIG-v3#11 (ADR-0024) is implemented
+grep -q 'TradingPolicy' v2/robson-domain/src/lib.rs
+
+# VERIFY: migrations/ directory exists
+test -d v2/migrations
+
+# VERIFY: Latest migration number
+LATEST=$(ls v2/migrations/*.sql | sort | tail -1 | grep -oE '[0-9]{14}')
+echo "Latest migration: $LATEST"
+# Should be 20240101000007 or similar
+
+# VERIFY: Baseline builds
+cargo build --all
+# EXIT CODE 0 = precondition met
+```
+
+**Inputs**:
+- Files to create:
+  - `v2/robson-domain/src/events.rs` (add variant to Event enum)
+  - `v2/migrations/00000008_create_monthly_state.sql` (new migration)
+  - `v2/robson-projector/src/handlers.rs` (new handler)
+  - `v2/robsond/src/daemon.rs` (month detection + boundary handler)
+  - `v2/robsond/src/position_manager.rs` (capital_base loading)
+- Migration number: `00000008` (increment from 00000007)
+- Table: `monthly_state` (year, month, capital_base, carried_risk)
+
+**Steps**:
+```bash
+# Step 1: Add MonthBoundaryReset to Event enum in events.rs
+# Insert after last variant before closing brace (around line 200):
+    MonthBoundaryReset {
+        capital_base: Decimal,
+        carried_positions_risk: Decimal,
+        month: u32,
+        year: i32,
+        timestamp: DateTime<Utc>,
+    },
+
+# Step 2: Create migration file
+cat > v2/migrations/00000008_create_monthly_state.sql <<'EOF'
+-- Month boundary state tracking (MIG-v3#12)
+CREATE TABLE monthly_state (
+    id            UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    year          SMALLINT NOT NULL,
+    month         SMALLINT NOT NULL CHECK (month BETWEEN 1 AND 12),
+    capital_base  NUMERIC(20,8) NOT NULL CHECK (capital_base >= 0),
+    carried_risk  NUMERIC(20,8) NOT NULL DEFAULT 0 CHECK (carried_risk >= 0),
+    created_at    TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+    UNIQUE (year, month)
+);
+
+CREATE INDEX idx_monthly_state_year_month ON monthly_state(year, month);
+EOF
+
+# Step 3: Add projector handler to handlers.rs
+# Insert new function before closing brace:
+pub async fn handle_month_boundary_reset(
+    pool: &PgPool,
+    event: &Event,
+) -> Result<(), ProjectorError> {
+    let (capital_base, carried_risk, month, year, _timestamp) = match event {
+        Event::MonthBoundaryReset {
+            capital_base,
+            carried_positions_risk,
+            month,
+            year,
+            timestamp,
+        } => (capital_base, carried_positions_risk, month, year, timestamp),
+        _ => return Err(ProjectorError::EventTypeMismatch),
+    };
+    
+    sqlx::query(
+        "INSERT INTO monthly_state (year, month, capital_base, carried_risk)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (year, month) DO UPDATE SET
+           capital_base = EXCLUDED.capital_base,
+           carried_risk = EXCLUDED.carried_risk"
+    )
+    .bind(year)
+    .bind(*month as i16)
+    .bind(capital_base)
+    .bind(carried_risk)
+    .execute(pool)
+    .await?;
+    
+    Ok(())
+}
+
+# Step 4: Register handler in apply_event_to_projections() dispatcher
+
+# Step 5: Add last_month_check to Daemon struct in daemon.rs (line ~83)
+# Add field:
+#   last_month_check: Arc<RwLock<(i32, u32)>>,
+
+# Step 6: Initialize in Daemon::new() constructors
+
+# Step 7: Add month detection logic to main event loop (line ~439)
+# See doc section 4 Track C C1 Step 4 for exact code
+
+# Step 8: Add handle_month_boundary() method to Daemon impl
+# See doc section 4 Track C C1 Step 5 for full implementation
+
+# Step 9: Update build_risk_context() in position_manager.rs
+# See doc section 4 Track C C1 Step 6 for capital_base loading logic
+
+# Step 10: Run migration locally
+cd v2
+DATABASE_URL="postgres://..." sqlx migrate run
+# EXIT CODE 0 = migration applied
+
+# Step 11: Compile
+cargo build --all
+# EXIT CODE 0 = SUCCESS
+
+# Step 12: Run tests
+cargo test --package robsond month_boundary
+cargo test --package robson-projector handle_month_boundary
+# EXIT CODE 0 = PASS
+```
+
+**Expected Outcome**:
+```bash
+# PASS condition 1: Migration file exists
+test -f v2/migrations/00000008_create_monthly_state.sql
+
+# PASS condition 2: Migration applied successfully
+psql $DATABASE_URL -c "SELECT COUNT(*) FROM monthly_state;" | grep -q "0"
+
+# PASS condition 3: Event variant added
+grep -q 'MonthBoundaryReset' v2/robson-domain/src/events.rs
+
+# PASS condition 4: Handler exists
+grep -q 'handle_month_boundary_reset' v2/robson-projector/src/handlers.rs
+
+# PASS condition 5: Builds successfully
+cargo build --all 2>&1 | grep -q "Finished"
+
+# PASS condition 6: Tests pass
+cargo test --all 2>&1 | grep -q "test result: ok"
+```
+
+**Failure Detection**:
+```bash
+# FAIL if migration fails to apply
+# FAIL if Event enum doesn't compile after variant addition
+# FAIL if handler not registered in dispatcher
+# FAIL if tests fail
+# FAIL if daemon panics on month boundary simulation
+```
+
+**Rollback**:
+```bash
+# Rollback migration
+cd v2
+DATABASE_URL="postgres://..." sqlx migrate revert
+
+# Rollback code
+git restore v2/robson-domain/src/events.rs \
+           v2/robson-projector/src/handlers.rs \
+           v2/robsond/src/daemon.rs \
+           v2/robsond/src/position_manager.rs
+rm v2/migrations/00000008_create_monthly_state.sql
+
+cargo build --all
+```
+
+---
+
+### EP-007: ADR-0022-R1 — Position Reconciliation Worker
+
+**Objective**: Implement reconciliation worker to detect and close UNTRACKED positions (not authored by robsond).
+
+**Preconditions**:
+```bash
+# VERIFY: ADR-0023-C2 completed (config symbols not hardcoded)
+grep -q 'symbols: vec!\[\]' v2/robsond/src/config.rs
+
+# VERIFY: Exchange port has base implementation
+grep -q 'trait ExchangePort' v2/robson-exec/src/ports.rs
+
+# VERIFY: Baseline builds
+cargo build --all
+# EXIT CODE 0 = precondition met
+```
+
+**Inputs**:
+- Files to create:
+  - `v2/robsond/src/reconciliation_worker.rs` (new module)
+  - Updates to `v2/robson-exec/src/ports.rs` (extend trait)
+  - Updates to `v2/robsond/src/binance_exchange.rs` (implement trait methods)
+  - Updates to `v2/robson-exec/src/stub.rs` (mock implementation)
+  - Updates to `v2/robsond/src/daemon.rs` (spawn worker)
+  - Updates to `v2/robsond/src/lib.rs` (add module)
+- Scan interval: 60 seconds (configurable via `ROBSON_RECONCILIATION_INTERVAL_SECS`)
+- API endpoint: `GET /fapi/v2/positionRisk` (all symbols)
+
+**Steps**:
+```bash
+# Step 1: Extend ExchangePort trait in ports.rs (after line 40)
+# Add methods (see doc section 4 Track C C2 Step 2):
+#   async fn get_all_open_positions(&self) -> ExecResult<Vec<ExchangePosition>>;
+#   async fn close_position_market(...) -> ExecResult<Order>;
+
+# Step 2: Define ExchangePosition struct in ports.rs
+
+# Step 3: Create reconciliation_worker.rs (see doc section 4 Track C C2 Step 1)
+# Full scaffold with ReconciliationWorker struct + run() + scan_and_reconcile() methods
+
+# Step 4: Implement get_all_open_positions() in binance_exchange.rs
+# See doc section 4 Track C C2 Step 3 for Binance FAPI implementation
+
+# Step 5: Implement close_position_market() in binance_exchange.rs
+# Use POST /fapi/v1/order with type=MARKET, reduceOnly=true
+
+# Step 6: Add mock implementations to stub.rs
+# Return empty vec for get_all_open_positions in StubExchange
+
+# Step 7: Add reconciliation_worker module to lib.rs
+# Insert: pub mod reconciliation_worker;
+
+# Step 8: Spawn worker in daemon.rs (after line 400)
+# See doc section 4 Track C C2 Step 4 for integration code
+
+# Step 9: Add startup gating (blocking scan before first arm)
+# See doc section 4 Track C C2 Step 5
+
+# Step 10: Compile
+cargo build --all
+# EXIT CODE 0 = SUCCESS
+
+# Step 11: Run unit tests
+cargo test --package robsond reconciliation_worker
+cargo test --package robson-exec exchange_port
+# EXIT CODE 0 = PASS
+
+# Step 12: Integration test (manual on testnet)
+# Place manual order via Binance UI
+# Start robsond
+# Verify UNTRACKED position detected and closed within 60s
+```
+
+**Expected Outcome**:
+```bash
+# PASS condition 1: Module file exists
+test -f v2/robsond/src/reconciliation_worker.rs
+
+# PASS condition 2: Trait methods added
+grep -q 'get_all_open_positions' v2/robson-exec/src/ports.rs
+
+# PASS condition 3: Binance implementation exists
+grep -q 'get_all_open_positions' v2/robsond/src/binance_exchange.rs
+
+# PASS condition 4: Worker spawned in daemon
+grep -q 'reconciliation_worker.run()' v2/robsond/src/daemon.rs
+
+# PASS condition 5: Builds successfully
+cargo build --all 2>&1 | grep -q "Finished"
+
+# PASS condition 6: Tests pass
+cargo test --all 2>&1 | grep -q "test result: ok"
+```
+
+**Failure Detection**:
+```bash
+# FAIL if trait methods missing
+# FAIL if worker not spawned in daemon
+# FAIL if manual UNTRACKED position not detected in testnet
+# FAIL if close_position_market fails to execute
+# FAIL if tests fail
+```
+
+**Rollback**:
+```bash
+git restore v2/robsond/src/reconciliation_worker.rs \
+           v2/robson-exec/src/ports.rs \
+           v2/robsond/src/binance_exchange.rs \
+           v2/robson-exec/src/stub.rs \
+           v2/robsond/src/daemon.rs \
+           v2/robsond/src/lib.rs
+rm -f v2/robsond/src/reconciliation_worker.rs
+
+cargo build --all
+```
+
+---
+
+## Entry Point Selection Guide
+
+**For VAL-001 PASS (30 min)**:
+```
+Execute: EP-001 (VAL-001-P2-INJECT)
+```
+
+**For Testnet Low-Volume Mitigation (2h)**:
+```
+Execute: EP-002 (VAL-001-P2-CONFIG)
+```
+
+**For ADR-0023 Full Compliance (4-5h)**:
+```
+Execute in sequence:
+1. EP-003 (ADR-0023-C1)
+2. EP-004 (ADR-0023-C2)
+3. EP-005 (ADR-0023-C3)
+```
+
+**For VAL-002 Unblock (14-20h = 3-4 days)**:
+```
+Execute in sequence:
+1. EP-003 (ADR-0023-C1)
+2. EP-004 (ADR-0023-C2)
+3. EP-005 (ADR-0023-C3)
+4. EP-006 (MIG-v3#12)
+5. EP-007 (ADR-0022-R1)
+```
+
+---
+
+## Verification Commands Reference
+
+**Check if position Armed**:
+```bash
+curl -s http://localhost:8080/status | jq '.positions[] | select(.state == "Armed")'
+```
+
+**Check if build successful**:
+```bash
+cargo build --all 2>&1 | grep -q "Finished" && echo "PASS" || echo "FAIL"
+```
+
+**Check if tests pass**:
+```bash
+cargo test --all 2>&1 | tail -1 | grep -q "test result: ok" && echo "PASS" || echo "FAIL"
+```
+
+**Check if migration applied**:
+```bash
+psql $DATABASE_URL -c "\d monthly_state" | grep -q "Table" && echo "PASS" || echo "FAIL"
+```
+
+**Check if hardcode removed**:
+```bash
+! grep -q 'Symbol::from_pair("BTCUSDT")' v2/robsond/src/daemon.rs && echo "PASS" || echo "FAIL"
+```
