@@ -572,7 +572,7 @@ pub struct BinanceOrderResponse {
     pub order_id: u64,
     /// Client order ID
     pub client_order_id: String,
-    /// Update time (ms since epoch) — futures uses `updateTime`, not `transactTime`
+    /// Update time (ms since epoch); futures uses `updateTime`, not `transactTime`
     pub update_time: i64,
     /// Price
     pub price: Decimal,
