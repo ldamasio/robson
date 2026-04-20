@@ -803,12 +803,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         {
             let mut pending_approvals = self.pending_approvals.write().await;
-            pending_approvals.insert(query_id, PendingApprovalRecord {
-                query,
-                position,
-                proposed,
-                governed,
-            });
+            pending_approvals
+                .insert(query_id, PendingApprovalRecord { query, position, proposed, governed });
         }
 
         let pending_approvals = self.pending_approvals.read().await;
@@ -3301,10 +3297,13 @@ mod tests {
         // newly armed one.
         let updated = manager.get_position(position.id).await.unwrap().unwrap();
         assert!(
-            matches!(updated.state, PositionState::Closed {
-                exit_reason: robson_domain::ExitReason::DisarmedByUser,
-                ..
-            }),
+            matches!(
+                updated.state,
+                PositionState::Closed {
+                    exit_reason: robson_domain::ExitReason::DisarmedByUser,
+                    ..
+                }
+            ),
             "Expected Closed after MonthlyHalt (Entering positions exhausted slots), got {:?}",
             updated.state
         );
