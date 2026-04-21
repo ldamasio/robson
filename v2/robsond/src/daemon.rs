@@ -18,7 +18,7 @@
 //! 7. Main event loop (process events, market data)
 //! 8. Graceful shutdown on SIGINT/SIGTERM
 
-use std::{net::SocketAddr, sync::Arc};
+use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 // Macro for creating Decimal literals
 use async_trait::async_trait;
@@ -59,6 +59,7 @@ use crate::{
     position_manager::PositionManager,
     position_monitor::{PositionMonitor, PositionMonitorConfig as RuntimePositionMonitorConfig},
     query_engine::{QueryRecorder, TracingQueryRecorder},
+    reconciliation_worker::ReconciliationWorker,
 };
 
 // =============================================================================
@@ -69,6 +70,8 @@ use crate::{
 pub struct Daemon<E: ExchangePort + 'static, S: Store + 'static> {
     /// Configuration
     config: Config,
+    /// Exchange adapter shared with execution and reconciliation flows.
+    exchange: Arc<E>,
     /// Position manager
     position_manager: Arc<RwLock<PositionManager<E, S>>>,
     /// Event bus
@@ -151,7 +154,7 @@ impl Daemon<StubExchange, MemoryStore> {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
-        let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+        let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder = default_query_recorder();
         let risk_config = RiskConfig::new(dec!(10000)).unwrap();
@@ -169,6 +172,7 @@ impl Daemon<StubExchange, MemoryStore> {
 
         Self {
             config,
+            exchange,
             position_manager,
             event_bus,
             store,
@@ -193,7 +197,7 @@ impl Daemon<StubExchange, MemoryStore> {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
-        let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+        let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder: Arc<dyn QueryRecorder> =
             if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
@@ -224,6 +228,7 @@ impl Daemon<StubExchange, MemoryStore> {
 
         Self {
             config,
+            exchange,
             position_manager,
             event_bus,
             store,
@@ -244,7 +249,7 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
             Arc::new(BinanceOhlcvAdapter::new(client));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
-        let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+        let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder = default_query_recorder();
         let risk_config = RiskConfig::new(dec!(10000)).unwrap();
@@ -265,6 +270,7 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
 
         Self {
             config,
+            exchange,
             position_manager,
             event_bus,
             store,
@@ -292,7 +298,7 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
             Arc::new(BinanceOhlcvAdapter::new(client));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
-        let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+        let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
         let event_bus = Arc::new(EventBus::new(1000));
 
         let query_recorder: Arc<dyn QueryRecorder> =
@@ -325,6 +331,7 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
 
         Self {
             config,
+            exchange,
             position_manager,
             event_bus,
             store,
@@ -339,6 +346,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
     /// Create a new daemon with provided components.
     pub fn new(
         config: Config,
+        exchange: Arc<E>,
         position_manager: Arc<RwLock<PositionManager<E, S>>>,
         event_bus: Arc<EventBus>,
         store: Arc<S>,
@@ -347,6 +355,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
     ) -> Self {
         Self {
             config,
+            exchange,
             position_manager,
             event_bus,
             store,
@@ -387,6 +396,24 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         // 2. Restore active positions
         self.restore_positions().await?;
 
+        let reconciliation_interval = Duration::from_secs(self.config.reconciliation.interval_secs);
+        let startup_reconciliation = ReconciliationWorker::new(
+            Arc::clone(&self.exchange),
+            Arc::clone(&self.store),
+            Arc::clone(&self.event_bus),
+            reconciliation_interval,
+            shutdown.clone(),
+        );
+        info!("Running startup reconciliation scan");
+        let untracked_count = startup_reconciliation.scan_and_reconcile_blocking().await?;
+        if untracked_count > 0 {
+            return Err(DaemonError::Config(format!(
+                "Startup aborted: {} UNTRACKED positions detected and closed. Review exchange account before restarting.",
+                untracked_count
+            )));
+        }
+        info!("Startup reconciliation clean (0 UNTRACKED)");
+
         // 3. Initialize safety net monitor (when configured with Binance credentials)
         let position_monitor = self.initialize_position_monitor().await?;
         let position_monitor_handle =
@@ -396,7 +423,21 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         let api_addr = self.start_api_server(position_monitor.clone()).await?;
         info!(%api_addr, "API server started");
 
-        // 5. Spawn WebSocket clients (Phase 6: Market Data)
+        // 5. Spawn reconciliation worker
+        let reconciliation_worker = ReconciliationWorker::new(
+            Arc::clone(&self.exchange),
+            Arc::clone(&self.store),
+            Arc::clone(&self.event_bus),
+            reconciliation_interval,
+            shutdown.clone(),
+        );
+        let reconciliation_handle = tokio::spawn(async move {
+            if let Err(e) = reconciliation_worker.run().await {
+                error!(error = %e, "Reconciliation worker failed");
+            }
+        });
+
+        // 6. Spawn WebSocket clients (Phase 6: Market Data)
         let ws_use_testnet =
             std::env::var("ROBSON_BINANCE_USE_TESTNET").unwrap_or_default() == "true";
         let market_data_manager =
@@ -411,7 +452,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             info!(symbol = %symbol_str, "WebSocket client spawned");
         }
 
-        // 6. Spawn projection worker (if pg_pool configured)
+        // 7. Spawn projection worker (if pg_pool configured)
         #[cfg(feature = "postgres")]
         let projection_handle = if let (Some(pool), Some(tenant_id)) =
             (&self.pg_pool, self.config.projection.tenant_id)
@@ -439,10 +480,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         #[cfg(not(feature = "postgres"))]
         let projection_handle: Option<tokio::task::JoinHandle<()>> = None;
 
-        // 7. Subscribe to event bus
+        // 8. Subscribe to event bus
         let mut event_receiver = self.event_bus.subscribe();
 
-        // 8. Spawn ctrl+c handler
+        // 9. Spawn ctrl+c handler
         let ctrl_c_shutdown = shutdown.clone();
         tokio::spawn(async move {
             if let Err(_) = tokio::signal::ctrl_c().await {
@@ -456,7 +497,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             tokio::time::interval(tokio::time::Duration::from_secs(60));
         month_boundary_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // 9. Main event loop
+        // 10. Main event loop
         info!("Entering main event loop");
         loop {
             tokio::select! {
@@ -489,8 +530,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             }
         }
 
-        // 8. Graceful shutdown
+        // 11. Graceful shutdown
         shutdown_sig.cancel(); // Ensure any remaining tasks are cancelled
+
+        info!("Waiting for reconciliation worker to finish...");
+        let _ = tokio::time::timeout(Duration::from_secs(10), reconciliation_handle).await;
 
         info!(count = ws_handles.len(), "Waiting for WebSocket clients to finish...");
         for handle in ws_handles {

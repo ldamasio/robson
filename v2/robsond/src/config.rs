@@ -34,6 +34,9 @@ pub struct Config {
     /// Position monitor configuration (safety net)
     pub position_monitor: PositionMonitorConfig,
 
+    /// Reconciliation worker configuration.
+    pub reconciliation: ReconciliationConfig,
+
     /// Environment (test, development, production)
     pub environment: Environment,
 }
@@ -136,6 +139,19 @@ impl Default for PositionMonitorConfig {
     }
 }
 
+/// Reconciliation worker configuration.
+#[derive(Debug, Clone)]
+pub struct ReconciliationConfig {
+    /// Interval between full account reconciliation scans.
+    pub interval_secs: u64,
+}
+
+impl Default for ReconciliationConfig {
+    fn default() -> Self {
+        Self { interval_secs: 60 }
+    }
+}
+
 /// Environment type.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Environment {
@@ -160,6 +176,7 @@ impl Config {
         let projection = Self::load_projection_config()?;
         let market_data = Self::load_market_data_config()?;
         let position_monitor = Self::load_position_monitor_config()?;
+        let reconciliation = Self::load_reconciliation_config()?;
 
         // Fail-fast: API token is mandatory in production
         if environment == Environment::Production && api.api_token.is_none() {
@@ -175,6 +192,7 @@ impl Config {
             projection,
             market_data,
             position_monitor,
+            reconciliation,
             environment,
         })
     }
@@ -211,6 +229,7 @@ impl Config {
                 binance_api_key: None,
                 binance_api_secret: None,
             },
+            reconciliation: ReconciliationConfig { interval_secs: 1 },
             environment: Environment::Test,
         }
     }
@@ -411,6 +430,25 @@ impl Config {
             binance_api_secret,
         })
     }
+
+    fn load_reconciliation_config() -> DaemonResult<ReconciliationConfig> {
+        let interval_str =
+            env::var("ROBSON_RECONCILIATION_INTERVAL_SECS").unwrap_or_else(|_| "60".to_string());
+        let interval_secs = interval_str.parse::<u64>().map_err(|_| {
+            DaemonError::Config(format!(
+                "Invalid ROBSON_RECONCILIATION_INTERVAL_SECS: {}",
+                interval_str
+            ))
+        })?;
+
+        if interval_secs == 0 {
+            return Err(DaemonError::Config(
+                "ROBSON_RECONCILIATION_INTERVAL_SECS must be greater than 0".to_string(),
+            ));
+        }
+
+        Ok(ReconciliationConfig { interval_secs })
+    }
 }
 
 impl Default for Config {
@@ -439,6 +477,7 @@ impl Default for Config {
             },
             market_data: MarketDataConfig::default(),
             position_monitor: PositionMonitorConfig::default(),
+            reconciliation: ReconciliationConfig::default(),
             environment: Environment::Development,
         }
     }
@@ -512,6 +551,7 @@ mod tests {
         assert_eq!(config.tech_stop.lookback_candles, 100);
         assert!(config.market_data.symbols.is_empty());
         assert!(config.position_monitor.symbols.is_empty());
+        assert_eq!(config.reconciliation.interval_secs, 60);
     }
 
     #[test]
@@ -523,6 +563,7 @@ mod tests {
         assert_eq!(config.tech_stop.min_stop_pct, Decimal::new(1, 1)); // 0.1%
         assert_eq!(config.tech_stop.max_stop_pct, Decimal::from(20));
         assert_eq!(config.market_data.symbols, vec!["BTCUSDT"]);
+        assert_eq!(config.reconciliation.interval_secs, 1);
     }
 
     #[test]
@@ -591,5 +632,27 @@ mod tests {
         let config = Config::load_position_monitor_config().unwrap();
         assert!(!config.enabled);
         assert!(config.symbols.is_empty());
+    }
+
+    #[test]
+    fn test_load_reconciliation_config_defaults_to_sixty_seconds() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[("ROBSON_RECONCILIATION_INTERVAL_SECS", None)]);
+
+        let config = Config::load_reconciliation_config().unwrap();
+        assert_eq!(config.interval_secs, 60);
+    }
+
+    #[test]
+    fn test_load_reconciliation_config_rejects_zero() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[("ROBSON_RECONCILIATION_INTERVAL_SECS", Some("0"))]);
+
+        let err = Config::load_reconciliation_config().unwrap_err();
+        assert!(matches!(
+            err,
+            DaemonError::Config(message)
+                if message == "ROBSON_RECONCILIATION_INTERVAL_SECS must be greater than 0"
+        ));
     }
 }

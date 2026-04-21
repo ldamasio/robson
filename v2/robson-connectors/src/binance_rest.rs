@@ -289,42 +289,13 @@ impl BinanceRestClient {
         let params = vec![("symbol", symbol.to_string())];
 
         let body = self.get_signed("/fapi/v2/positionRisk", params).await?;
+        Self::parse_open_positions(&body)
+    }
 
-        let positions: Vec<PositionRiskResponse> =
-            serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
-
-        positions
-            .into_iter()
-            .filter(|p| p.position_amt != Decimal::ZERO)
-            .map(|p| {
-                let side = if p.position_amt > Decimal::ZERO {
-                    Side::Long
-                } else {
-                    Side::Short
-                };
-
-                let quantity = p.position_amt.abs();
-                let leverage: u8 = p.leverage.parse().map_err(|e: std::num::ParseIntError| {
-                    BinanceRestError::ParseError(format!(
-                        "Invalid leverage '{}': {}",
-                        p.leverage, e
-                    ))
-                })?;
-
-                Ok(FuturesPosition {
-                    symbol: p.symbol,
-                    side,
-                    quantity: Quantity::new(quantity).map_err(|e| {
-                        BinanceRestError::ParseError(format!("Invalid quantity: {}", e))
-                    })?,
-                    entry_price: Price::new(p.entry_price).map_err(|e| {
-                        BinanceRestError::ParseError(format!("Invalid entry price: {}", e))
-                    })?,
-                    unrealized_pnl: p.unrealized_profit,
-                    leverage,
-                })
-            })
-            .collect()
+    /// Get every open futures position across the account.
+    pub async fn get_all_open_positions(&self) -> Result<Vec<FuturesPosition>, BinanceRestError> {
+        let body = self.get_signed("/fapi/v2/positionRisk", vec![]).await?;
+        Self::parse_open_positions(&body)
     }
 
     // =========================================================================
@@ -492,12 +463,51 @@ impl BinanceRestClient {
     pub async fn get_position_mode(&self) -> Result<bool, BinanceRestError> {
         let body = self.get_signed("/fapi/v1/positionSide/dual", vec![]).await?;
 
-        let response: serde_json::Value = serde_json::from_str(&body)
-            .map_err(|e| BinanceRestError::ParseError(format!("Failed to parse position mode response: {}", e)))?;
+        let response: serde_json::Value = serde_json::from_str(&body).map_err(|e| {
+            BinanceRestError::ParseError(format!("Failed to parse position mode response: {}", e))
+        })?;
 
         let dual_side = response["dualSidePosition"].as_bool().unwrap_or(false);
 
         Ok(dual_side)
+    }
+
+    fn parse_open_positions(body: &str) -> Result<Vec<FuturesPosition>, BinanceRestError> {
+        let positions: Vec<PositionRiskResponse> =
+            serde_json::from_str(body).map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+
+        positions
+            .into_iter()
+            .filter(|p| p.position_amt != Decimal::ZERO)
+            .map(|p| {
+                let side = if p.position_amt > Decimal::ZERO {
+                    Side::Long
+                } else {
+                    Side::Short
+                };
+
+                let quantity = p.position_amt.abs();
+                let leverage: u8 = p.leverage.parse().map_err(|e: std::num::ParseIntError| {
+                    BinanceRestError::ParseError(format!(
+                        "Invalid leverage '{}': {}",
+                        p.leverage, e
+                    ))
+                })?;
+
+                Ok(FuturesPosition {
+                    symbol: p.symbol,
+                    side,
+                    quantity: Quantity::new(quantity).map_err(|e| {
+                        BinanceRestError::ParseError(format!("Invalid quantity: {}", e))
+                    })?,
+                    entry_price: Price::new(p.entry_price).map_err(|e| {
+                        BinanceRestError::ParseError(format!("Invalid entry price: {}", e))
+                    })?,
+                    unrealized_pnl: p.unrealized_profit,
+                    leverage,
+                })
+            })
+            .collect()
     }
 
     /// Ping Binance futures API to check connectivity.

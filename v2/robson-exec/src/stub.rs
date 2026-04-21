@@ -13,8 +13,8 @@ use rust_decimal::Decimal;
 use crate::{
     error::ExecError,
     ports::{
-        CandleInterval, ExchangePort, FuturesSettings, MarketDataPort, OhlcvPort, OrderResult,
-        PriceUpdate,
+        CandleInterval, ExchangePort, ExchangePosition, FuturesSettings, MarketDataPort, OhlcvPort,
+        OrderResult, PriceUpdate,
     },
 };
 
@@ -39,6 +39,8 @@ pub struct StubExchange {
     fail_next: RwLock<bool>,
     /// Simulated futures settings (position_mode, leverage)
     futures_settings: RwLock<(String, u8)>,
+    /// Simulated open positions returned by reconciliation scans.
+    open_positions: RwLock<HashMap<String, ExchangePosition>>,
 }
 
 impl StubExchange {
@@ -53,6 +55,7 @@ impl StubExchange {
             order_counter: RwLock::new(0),
             fail_next: RwLock::new(false),
             futures_settings: RwLock::new(("One-way".to_string(), 10)),
+            open_positions: RwLock::new(HashMap::new()),
         }
     }
 
@@ -98,6 +101,28 @@ impl StubExchange {
         let fail = *fail_next;
         *fail_next = false; // Reset after check
         fail
+    }
+
+    fn position_key(symbol: &Symbol, side: robson_domain::Side) -> String {
+        format!("{}:{:?}", symbol.as_pair(), side)
+    }
+
+    /// Seed an exchange position for reconciliation tests.
+    pub fn set_open_position(
+        &self,
+        symbol: Symbol,
+        side: robson_domain::Side,
+        quantity: Quantity,
+        entry_price: Price,
+    ) {
+        let key = Self::position_key(&symbol, side);
+        let mut positions = self.open_positions.write().unwrap();
+        positions.insert(key, ExchangePosition { symbol, side, quantity, entry_price });
+    }
+
+    /// Number of currently simulated open positions.
+    pub fn open_positions_len(&self) -> usize {
+        self.open_positions.read().unwrap().len()
     }
 }
 
@@ -200,6 +225,55 @@ impl ExchangePort for StubExchange {
             return Err(ExecError::Exchange("Simulated health check failure".to_string()));
         }
         Ok(())
+    }
+
+    async fn get_all_open_positions(&self) -> Result<Vec<ExchangePosition>, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated reconciliation scan failure".to_string()));
+        }
+
+        let positions = self.open_positions.read().unwrap();
+        Ok(positions.values().cloned().collect())
+    }
+
+    async fn close_position_market(
+        &self,
+        symbol: &Symbol,
+        side: robson_domain::Side,
+        quantity: Quantity,
+        client_order_id: &str,
+    ) -> Result<OrderResult, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated reconciliation close failure".to_string()));
+        }
+
+        let key = Self::position_key(symbol, side);
+        let removed = {
+            let mut positions = self.open_positions.write().unwrap();
+            positions.remove(&key)
+        };
+
+        if removed.is_none() {
+            return Err(ExecError::OrderRejected(format!(
+                "No simulated open position found for {} {:?}",
+                symbol.as_pair(),
+                side
+            )));
+        }
+
+        let price = self.get_price_decimal(&symbol.as_pair());
+        let fee = price * quantity.as_decimal() * self.fee_rate;
+        let exchange_order_id = self.next_order_id();
+
+        Ok(OrderResult {
+            exchange_order_id,
+            client_order_id: client_order_id.to_string(),
+            fill_price: Price::new(price).unwrap(),
+            filled_quantity: quantity,
+            fee,
+            fee_asset: "USDT".to_string(),
+            filled_at: Utc::now(),
+        })
     }
 }
 

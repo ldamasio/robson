@@ -54,6 +54,7 @@ pub mod position_manager;
 pub mod position_monitor;
 pub mod query;
 pub mod query_engine;
+pub mod reconciliation_worker;
 mod sse;
 
 #[cfg(feature = "postgres")]
@@ -65,7 +66,7 @@ pub use binance_ohlcv::BinanceOhlcvAdapter;
 pub use circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot};
 pub use config::{
     ApiConfig, Config, EngineConfig, Environment, MarketDataConfig, PositionMonitorConfig,
-    ProjectionConfig,
+    ProjectionConfig, ReconciliationConfig,
 };
 pub use daemon::Daemon;
 pub use detector::{DetectorConfig, DetectorTask};
@@ -86,3 +87,4 @@ pub use query_engine::{
     QueryEngine, QueryRecorder, QueryRecorderError, QueryStateChangedEvent, QueryTransitionError,
     TracingQueryRecorder,
 };
+pub use reconciliation_worker::ReconciliationWorker;

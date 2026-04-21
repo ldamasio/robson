@@ -16,7 +16,10 @@ use async_trait::async_trait;
 use chrono::Utc;
 use robson_connectors::{BinanceRestClient, BinanceRestError};
 use robson_domain::{OrderSide, Price, Quantity, Side, Symbol};
-use robson_exec::{ports::FuturesSettings, ExchangePort, ExecError, OrderResult};
+use robson_exec::{
+    ports::{ExchangePosition, FuturesSettings},
+    ExchangePort, ExecError, OrderResult,
+};
 use rust_decimal::Decimal;
 use tracing::info;
 
@@ -68,8 +71,10 @@ impl ExchangePort for BinanceExchangeAdapter {
         expected_leverage: u8,
     ) -> Result<FuturesSettings, ExecError> {
         // 1. Check position mode via API
-        let dual_side: bool = self.client.get_position_mode().await
-            .map_err(|e| ExecError::Exchange(format!("Failed to check position mode: {}", e)))?;
+        let dual_side: bool =
+            self.client.get_position_mode().await.map_err(|e| {
+                ExecError::Exchange(format!("Failed to check position mode: {}", e))
+            })?;
 
         if dual_side {
             return Err(ExecError::FuturesSafetyViolation {
@@ -249,5 +254,44 @@ impl ExchangePort for BinanceExchangeAdapter {
 
     async fn health_check(&self) -> Result<(), ExecError> {
         self.client.ping().await.map_err(Self::map_error)
+    }
+
+    async fn get_all_open_positions(&self) -> Result<Vec<ExchangePosition>, ExecError> {
+        let positions = self.client.get_all_open_positions().await.map_err(Self::map_error)?;
+
+        positions
+            .into_iter()
+            .map(|position| {
+                let symbol = Symbol::from_pair(&position.symbol).map_err(|e| {
+                    ExecError::Exchange(format!(
+                        "Invalid symbol '{}' returned by exchange: {}",
+                        position.symbol, e
+                    ))
+                })?;
+
+                Ok(ExchangePosition {
+                    symbol,
+                    side: position.side,
+                    quantity: position.quantity,
+                    entry_price: position.entry_price,
+                })
+            })
+            .collect()
+    }
+
+    async fn close_position_market(
+        &self,
+        symbol: &Symbol,
+        side: Side,
+        quantity: Quantity,
+        client_order_id: &str,
+    ) -> Result<OrderResult, ExecError> {
+        let close_side = match side {
+            Side::Long => OrderSide::Sell,
+            Side::Short => OrderSide::Buy,
+        };
+
+        self.place_market_order(symbol, close_side, quantity, client_order_id, true)
+            .await
     }
 }

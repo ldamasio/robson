@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use robson_domain::{Candle, OrderSide, Price, Quantity, Symbol};
+use robson_domain::{Candle, OrderSide, Price, Quantity, Side, Symbol};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -88,6 +88,24 @@ pub trait ExchangePort: Send + Sync {
 
     /// Check if exchange is healthy/connected.
     async fn health_check(&self) -> Result<(), ExecError>;
+
+    /// Query every currently open exchange position.
+    ///
+    /// Used by the daemon reconciliation worker to detect positions that
+    /// exist on the exchange but are not tracked in Robson state.
+    async fn get_all_open_positions(&self) -> Result<Vec<ExchangePosition>, ExecError>;
+
+    /// Close an existing exchange position using a reduce-only market order.
+    ///
+    /// `side` represents the position side being closed, not the outbound
+    /// order side.
+    async fn close_position_market(
+        &self,
+        symbol: &Symbol,
+        side: Side,
+        quantity: Quantity,
+        client_order_id: &str,
+    ) -> Result<OrderResult, ExecError>;
 }
 
 /// USD-M Futures account settings for a symbol.
@@ -118,6 +136,19 @@ pub struct OrderResult {
     pub fee_asset: String,
     /// When the order was filled
     pub filled_at: DateTime<Utc>,
+}
+
+/// Open position observed directly on the exchange.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ExchangePosition {
+    /// Trading pair (e.g. BTCUSDT)
+    pub symbol: Symbol,
+    /// Position direction on the exchange
+    pub side: Side,
+    /// Open quantity
+    pub quantity: Quantity,
+    /// Average entry price reported by the exchange
+    pub entry_price: Price,
 }
 
 // =============================================================================
