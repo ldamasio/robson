@@ -256,11 +256,11 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         }
 
         // 3. Record intent
-        let intent = Intent::new(
-            signal_id,
-            position_id,
-            IntentAction::PlaceEntryOrder { symbol: symbol.clone(), side, quantity },
-        );
+        let intent = Intent::new(signal_id, position_id, IntentAction::PlaceEntryOrder {
+            symbol: symbol.clone(),
+            side,
+            quantity,
+        });
 
         if let Err(ExecError::AlreadyProcessed(id)) = self.journal.record(intent) {
             info!(%id, "Intent already recorded, checking status");
@@ -366,16 +366,12 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         self.exchange.validate_futures_settings(&symbol, RiskConfig::LEVERAGE).await?;
 
         // 2. Record intent
-        let intent = Intent::new(
-            intent_id,
-            position_id,
-            IntentAction::PlaceExitOrder {
-                symbol: symbol.clone(),
-                side,
-                quantity,
-                reason: reason.clone(),
-            },
-        );
+        let intent = Intent::new(intent_id, position_id, IntentAction::PlaceExitOrder {
+            symbol: symbol.clone(),
+            side,
+            quantity,
+            reason: reason.clone(),
+        });
 
         self.journal.record(intent)?;
         self.journal.mark_executing(intent_id)?;

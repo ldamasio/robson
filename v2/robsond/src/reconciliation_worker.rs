@@ -5,6 +5,8 @@
 
 use std::{sync::Arc, time::Duration};
 
+use robson_exec::{ExchangePort, ExchangePosition};
+use robson_store::Store;
 use tokio::time::MissedTickBehavior;
 use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
@@ -14,8 +16,6 @@ use crate::{
     error::{DaemonError, DaemonResult},
     event_bus::{DaemonEvent, EventBus},
 };
-use robson_exec::{ExchangePort, ExchangePosition};
-use robson_store::Store;
 
 /// Background worker that reconciles exchange state with Robson state.
 pub struct ReconciliationWorker<E: ExchangePort + 'static, S: Store + 'static> {
