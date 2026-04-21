@@ -129,7 +129,7 @@ impl Default for PositionMonitorConfig {
         Self {
             enabled: true,
             poll_interval_secs: 20,
-            symbols: vec!["BTCUSDT".to_string()],
+            symbols: vec![],
             binance_api_key: None,
             binance_api_secret: None,
         }
@@ -381,17 +381,16 @@ impl Config {
         })?;
 
         // Symbols to monitor
-        let symbols_str =
-            env::var("ROBSON_POSITION_MONITOR_SYMBOLS").unwrap_or_else(|_| "BTCUSDT".to_string());
+        let symbols_str = env::var("ROBSON_POSITION_MONITOR_SYMBOLS").unwrap_or_default();
         let symbols: Vec<String> = symbols_str
             .split(',')
             .map(|s| s.trim().to_uppercase())
             .filter(|s| !s.is_empty())
             .collect();
 
-        if symbols.is_empty() {
+        if enabled && symbols.is_empty() {
             return Err(DaemonError::Config(
-                "ROBSON_POSITION_MONITOR_SYMBOLS cannot be empty".to_string(),
+                "ROBSON_POSITION_MONITOR_SYMBOLS is required when monitor is enabled".to_string(),
             ));
         }
 
@@ -512,6 +511,7 @@ mod tests {
         assert_eq!(config.tech_stop.support_level_n, 2);
         assert_eq!(config.tech_stop.lookback_candles, 100);
         assert!(config.market_data.symbols.is_empty());
+        assert!(config.position_monitor.symbols.is_empty());
     }
 
     #[test]
@@ -561,5 +561,35 @@ mod tests {
 
         let config = Config::load_market_data_config().unwrap();
         assert_eq!(config.symbols, vec!["BTCUSDT", "ETHUSDT", "SOLUSDC"]);
+    }
+
+    #[test]
+    fn test_load_position_monitor_config_requires_symbols_when_enabled() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_POSITION_MONITOR_ENABLED", Some("true")),
+            ("ROBSON_POSITION_MONITOR_SYMBOLS", Some("")),
+        ]);
+
+        let err = Config::load_position_monitor_config().unwrap_err();
+        assert!(matches!(
+            err,
+            DaemonError::Config(message)
+                if message
+                    == "ROBSON_POSITION_MONITOR_SYMBOLS is required when monitor is enabled"
+        ));
+    }
+
+    #[test]
+    fn test_load_position_monitor_config_allows_empty_symbols_when_disabled() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_POSITION_MONITOR_ENABLED", Some("false")),
+            ("ROBSON_POSITION_MONITOR_SYMBOLS", Some("")),
+        ]);
+
+        let config = Config::load_position_monitor_config().unwrap();
+        assert!(!config.enabled);
+        assert!(config.symbols.is_empty());
     }
 }
