@@ -26,7 +26,8 @@ pub use detected_position::{CalculatedStop, DetectedPosition, StopMethod};
 pub use entities::{
     calculate_margin_required, calculate_notional_value, calculate_position_size, AccountId,
     DetectorSignal, ExitReason, Order, OrderId, OrderStatus, OrderType, Position, PositionId,
-    PositionState,
+    PositionState, TechnicalStopAnalysisAudit, TechnicalStopConfidenceSnapshot,
+    TechnicalStopConfigSnapshot, TechnicalStopMethodSnapshot,
 };
 pub use events::Event;
 pub use market_data::{Candle, MarketDataEvent, OrderBookSnapshot, Tick};

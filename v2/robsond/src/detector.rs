@@ -47,15 +47,19 @@
 
 use std::{collections::VecDeque, sync::Arc};
 
-use chrono::Utc;
-use robson_domain::{DetectorSignal, Position, PositionId, Price, Side, Symbol};
-use robson_engine::technical_stop_analyzer::{TechnicalStopAnalyzer, TechnicalStopConfig};
+use robson_domain::{
+    DetectorSignal, Position, PositionId, Price, Side, Symbol, TechnicalStopAnalysisAudit,
+    TechnicalStopConfidenceSnapshot, TechnicalStopConfigSnapshot, TechnicalStopMethodSnapshot,
+};
+use robson_engine::technical_stop_analyzer::{
+    StopConfidence as AnalyzerStopConfidence, TechnicalStopAnalysis, TechnicalStopAnalyzer,
+    TechnicalStopConfig, TechnicalStopMethod as AnalyzerTechnicalStopMethod,
+};
 use robson_exec::{CandleInterval, OhlcvPort};
 use rust_decimal::Decimal;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
-use uuid::Uuid;
 
 use crate::{
     event_bus::{DaemonEvent, EventBus, MarketData},
@@ -451,19 +455,21 @@ impl DetectorTask {
     async fn create_signal(&self, market_data: &MarketData) -> DaemonResult<DetectorSignal> {
         let entry_price = market_data.price;
 
-        let stop_loss = self
+        let analysis = self
             .compute_technical_stop(entry_price, self.config.side, &self.config.symbol)
             .await?;
 
-        Ok(DetectorSignal {
-            signal_id: Uuid::now_v7(),
-            position_id: self.config.position_id,
-            symbol: self.config.symbol.clone(),
-            side: self.config.side,
+        Ok(DetectorSignal::new(
+            self.config.position_id,
+            self.config.symbol.clone(),
+            self.config.side,
             entry_price,
-            stop_loss,
-            timestamp: Utc::now(),
-        })
+            analysis.stop_price,
+        )
+        .with_technical_stop_analysis(Self::build_technical_stop_audit(
+            &analysis,
+            &self.config.technical_stop_config,
+        )))
     }
 
     /// Compute the chart-derived stop for the detector signal.
@@ -472,20 +478,61 @@ impl DetectorTask {
         entry_price: Price,
         side: Side,
         symbol: &Symbol,
-    ) -> DaemonResult<Price> {
+    ) -> DaemonResult<TechnicalStopAnalysis> {
         let candles = self
             .ohlcv_port
             .fetch_candles(symbol, CandleInterval::FifteenMinutes, 100)
             .await?;
-        let analysis = TechnicalStopAnalyzer::analyze(
+        TechnicalStopAnalyzer::analyze(
             &candles,
             entry_price,
             side,
             &self.config.technical_stop_config,
         )
-        .map_err(|e| DaemonError::Detector(e.to_string()))?;
+        .map_err(|e| DaemonError::Detector(e.to_string()))
+    }
 
-        Ok(analysis.stop_price)
+    fn build_technical_stop_audit(
+        analysis: &TechnicalStopAnalysis,
+        config: &TechnicalStopConfig,
+    ) -> TechnicalStopAnalysisAudit {
+        TechnicalStopAnalysisAudit {
+            stop_price: analysis.stop_price,
+            method: Self::map_technical_stop_method(analysis.method),
+            confidence: Self::map_technical_stop_confidence(analysis.confidence),
+            detected_levels: analysis.detected_levels.clone(),
+            config: TechnicalStopConfigSnapshot {
+                min_candles: config.min_candles,
+                swing_lookback: config.swing_lookback,
+                support_level_n: config.support_level_n,
+                level_tolerance: config.level_tolerance,
+                atr_period: config.atr_period,
+                atr_multiplier: config.atr_multiplier,
+                min_stop_distance_pct: config.min_stop_distance_pct,
+                max_stop_distance_pct: config.max_stop_distance_pct,
+            },
+        }
+    }
+
+    fn map_technical_stop_method(
+        method: AnalyzerTechnicalStopMethod,
+    ) -> TechnicalStopMethodSnapshot {
+        match method {
+            AnalyzerTechnicalStopMethod::SwingPoint { level_n } => {
+                TechnicalStopMethodSnapshot::SwingPoint { level_n }
+            },
+            AnalyzerTechnicalStopMethod::AtrFallback => TechnicalStopMethodSnapshot::AtrFallback,
+        }
+    }
+
+    fn map_technical_stop_confidence(
+        confidence: AnalyzerStopConfidence,
+    ) -> TechnicalStopConfidenceSnapshot {
+        match confidence {
+            AnalyzerStopConfidence::High => TechnicalStopConfidenceSnapshot::High,
+            AnalyzerStopConfidence::Medium => TechnicalStopConfidenceSnapshot::Medium,
+            AnalyzerStopConfidence::Low => TechnicalStopConfidenceSnapshot::Low,
+        }
     }
 }
 
@@ -495,10 +542,11 @@ impl DetectorTask {
 
 #[cfg(test)]
 mod tests {
-    use chrono::Duration;
+    use chrono::{Duration, Utc};
     use robson_domain::{Candle, Side};
     use robson_exec::StubOhlcv;
     use rust_decimal_macros::dec;
+    use uuid::Uuid;
 
     use super::*;
 
@@ -619,7 +667,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(stop.as_decimal(), dec!(90));
+        assert_eq!(stop.stop_price.as_decimal(), dec!(90));
+        assert_eq!(stop.method, AnalyzerTechnicalStopMethod::SwingPoint { level_n: 2 });
+        assert_eq!(stop.confidence, AnalyzerStopConfidence::High);
+        assert_eq!(stop.detected_levels.len(), 2);
     }
 
     #[tokio::test]
@@ -646,7 +697,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(stop.as_decimal(), dec!(110));
+        assert_eq!(stop.stop_price.as_decimal(), dec!(110));
+        assert_eq!(stop.method, AnalyzerTechnicalStopMethod::SwingPoint { level_n: 2 });
+        assert_eq!(stop.confidence, AnalyzerStopConfidence::High);
+        assert_eq!(stop.detected_levels.len(), 2);
     }
 
     #[tokio::test]

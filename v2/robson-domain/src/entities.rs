@@ -4,6 +4,7 @@
 //! All entities have identity and state transitions.
 
 use chrono::{DateTime, Utc};
+use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -469,6 +470,67 @@ pub enum OrderStatus {
 // Detector Signal
 // =============================================================================
 
+/// Method used to derive a detector technical stop.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum TechnicalStopMethodSnapshot {
+    /// Stop derived from the Nth clustered swing level below/above entry.
+    SwingPoint {
+        /// 1-indexed support/resistance level selected by the analyzer.
+        level_n: usize,
+    },
+    /// Stop derived from ATR fallback because swing levels were insufficient.
+    AtrFallback,
+}
+
+/// Confidence assigned to a technical stop analysis result.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TechnicalStopConfidenceSnapshot {
+    /// Primary path succeeded with the configured support/resistance level.
+    High,
+    /// Analyzer found fewer levels than requested and degraded gracefully.
+    Medium,
+    /// Analyzer had to fall back to ATR.
+    Low,
+}
+
+/// Immutable snapshot of the analyzer configuration used for a detector signal.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TechnicalStopConfigSnapshot {
+    /// Minimum candle count required before analysis runs.
+    pub min_candles: usize,
+    /// Swing-point lookback on each side of a candidate candle.
+    pub swing_lookback: usize,
+    /// 1-indexed support/resistance level requested by policy.
+    pub support_level_n: usize,
+    /// Tolerance used to cluster nearby levels, as a fraction of entry.
+    pub level_tolerance: Decimal,
+    /// ATR period used by the fallback path.
+    pub atr_period: usize,
+    /// ATR multiplier used by the fallback path.
+    pub atr_multiplier: Decimal,
+    /// Minimum allowed stop distance as a fraction of entry.
+    pub min_stop_distance_pct: Decimal,
+    /// Maximum allowed stop distance as a fraction of entry.
+    pub max_stop_distance_pct: Decimal,
+}
+
+/// Audit payload describing how the detector derived a technical stop.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TechnicalStopAnalysisAudit {
+    /// Absolute stop price selected by the analyzer.
+    pub stop_price: Price,
+    /// Method used to derive the stop.
+    pub method: TechnicalStopMethodSnapshot,
+    /// Confidence assigned to the result.
+    pub confidence: TechnicalStopConfidenceSnapshot,
+    /// Swing levels detected on the chart, ordered by distance from entry.
+    pub detected_levels: Vec<Price>,
+    /// Analyzer configuration snapshot used to produce this result.
+    pub config: TechnicalStopConfigSnapshot,
+}
+
 /// Signal from detector to trigger entry
 ///
 /// Emitted by a DetectorTask when entry conditions are met.
@@ -493,6 +555,9 @@ pub struct DetectorSignal {
     pub entry_price: Price,
     /// Technical stop loss from chart analysis
     pub stop_loss: Price,
+    /// Optional audit payload describing how the technical stop was derived.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub technical_stop_analysis: Option<TechnicalStopAnalysisAudit>,
     /// When the signal was generated
     pub timestamp: DateTime<Utc>,
 }
@@ -513,8 +578,15 @@ impl DetectorSignal {
             side,
             entry_price,
             stop_loss,
+            technical_stop_analysis: None,
             timestamp: Utc::now(),
         }
+    }
+
+    /// Attach technical stop audit metadata to this signal.
+    pub fn with_technical_stop_analysis(mut self, analysis: TechnicalStopAnalysisAudit) -> Self {
+        self.technical_stop_analysis = Some(analysis);
+        self
     }
 
     /// Calculate technical stop distance from signal

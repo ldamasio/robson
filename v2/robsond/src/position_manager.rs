@@ -1536,6 +1536,24 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Kill detector (it's single-shot)
         self.kill_detector(position_id).await;
 
+        if let Some(analysis) = signal.technical_stop_analysis.clone() {
+            let event = Event::TechnicalStopAnalyzed {
+                position_id,
+                signal_id: signal.signal_id,
+                symbol: signal.symbol.clone(),
+                side: signal.side,
+                entry_price: signal.entry_price,
+                analysis,
+                timestamp: signal.timestamp,
+            };
+
+            if let Err(e) = self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await {
+                query.fail(format!("{}", e), "processing".to_string());
+                self.record_query_failure(&query).await?;
+                return Err(e);
+            }
+        }
+
         // Use engine to decide entry (pure: State+Signal → Decision)
         let decision = {
             let engine = self.engine.lock().unwrap();
@@ -2424,7 +2442,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 #[cfg(test)]
 mod tests {
     use chrono::Duration;
-    use robson_domain::Candle;
+    use robson_domain::{
+        Candle, TechnicalStopAnalysisAudit, TechnicalStopConfidenceSnapshot,
+        TechnicalStopConfigSnapshot, TechnicalStopMethodSnapshot,
+    };
     use robson_exec::{IntentJournal, StubExchange, StubOhlcv};
     use robson_store::MemoryStore;
     use rust_decimal::Decimal;
@@ -2533,6 +2554,25 @@ mod tests {
         );
 
         candles
+    }
+
+    fn sample_technical_stop_analysis(stop_price: Price) -> TechnicalStopAnalysisAudit {
+        TechnicalStopAnalysisAudit {
+            stop_price,
+            method: TechnicalStopMethodSnapshot::SwingPoint { level_n: 2 },
+            confidence: TechnicalStopConfidenceSnapshot::High,
+            detected_levels: vec![Price::new(dec!(90000)).unwrap(), stop_price],
+            config: TechnicalStopConfigSnapshot {
+                min_candles: 100,
+                swing_lookback: 2,
+                support_level_n: 2,
+                level_tolerance: dec!(0.005),
+                atr_period: 14,
+                atr_multiplier: dec!(1.5),
+                min_stop_distance_pct: dec!(0.001),
+                max_stop_distance_pct: dec!(0.10),
+            },
+        }
     }
 
     async fn save_active_position(
@@ -2665,6 +2705,7 @@ mod tests {
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(87400)).unwrap(), // 8% below — passes risk gate
+            technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
 
@@ -2691,6 +2732,89 @@ mod tests {
             }
         }
         assert!(opened, "Expected CorePositionOpened event");
+    }
+
+    #[tokio::test]
+    async fn test_handle_signal_persists_technical_stop_audit_before_entry_signal() {
+        let manager = create_test_manager().await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(98)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        let position = manager
+            .arm_position(
+                symbol.clone(),
+                Side::Long,
+                create_test_risk_config(),
+                Some(tech_stop),
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+
+        let signal_id = Uuid::now_v7();
+        let entry_price = Price::new(dec!(95000)).unwrap();
+        let stop_loss = Price::new(dec!(87400)).unwrap();
+        let signal = DetectorSignal {
+            signal_id,
+            position_id: position.id,
+            symbol,
+            side: Side::Long,
+            entry_price,
+            stop_loss,
+            technical_stop_analysis: Some(sample_technical_stop_analysis(stop_loss)),
+            timestamp: chrono::Utc::now(),
+        };
+
+        manager.handle_signal(signal).await.unwrap();
+
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        let technical_idx = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    Event::TechnicalStopAnalyzed {
+                        signal_id: event_signal_id,
+                        ..
+                    } if *event_signal_id == signal_id
+                )
+            })
+            .expect("technical_stop_analyzed must be appended");
+        let entry_signal_idx = events
+            .iter()
+            .position(|event| {
+                matches!(
+                    event,
+                    Event::EntrySignalReceived {
+                        signal_id: event_signal_id,
+                        ..
+                    } if *event_signal_id == signal_id
+                )
+            })
+            .expect("entry_signal_received must be appended");
+
+        assert!(
+            technical_idx < entry_signal_idx,
+            "technical stop audit must be persisted before entry signal"
+        );
+
+        match &events[technical_idx] {
+            Event::TechnicalStopAnalyzed {
+                entry_price: persisted_entry_price,
+                analysis,
+                ..
+            } => {
+                assert_eq!(*persisted_entry_price, entry_price);
+                assert_eq!(analysis.stop_price, stop_loss);
+                assert_eq!(analysis.method, TechnicalStopMethodSnapshot::SwingPoint { level_n: 2 });
+                assert_eq!(analysis.confidence, TechnicalStopConfidenceSnapshot::High);
+                assert_eq!(analysis.detected_levels.len(), 2);
+                assert_eq!(analysis.detected_levels[1], stop_loss);
+            },
+            other => panic!("expected TechnicalStopAnalyzed, got {:?}", other),
+        }
     }
 
     #[tokio::test]
@@ -2722,6 +2846,7 @@ mod tests {
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(87400)).unwrap(), // 8% below — passes risk gate
+            technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
         manager.handle_signal(signal).await.unwrap();
@@ -2769,6 +2894,7 @@ mod tests {
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(87400)).unwrap(), // 8% below — passes risk gate
+            technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
         manager.handle_signal(signal).await.unwrap();
@@ -2847,6 +2973,7 @@ mod tests {
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(93100)).unwrap(),
+            technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
 
@@ -2914,6 +3041,7 @@ mod tests {
             side: Side::Long,
             entry_price: entry,
             stop_loss: stop,
+            technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
 
@@ -2965,6 +3093,7 @@ mod tests {
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(85500)).unwrap(), /* 10% below -> approval required, risk
                                                           * approved */
+            technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
 
@@ -3029,6 +3158,7 @@ mod tests {
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(85500)).unwrap(), /* 10% below -> approval required, risk
                                                           * approved */
+            technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
 
@@ -3078,6 +3208,7 @@ mod tests {
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(85500)).unwrap(),
+            technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
 
@@ -3134,6 +3265,7 @@ mod tests {
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(85500)).unwrap(),
+            technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
 
@@ -3197,6 +3329,7 @@ mod tests {
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(85500)).unwrap(), /* 10% below -> approval required, risk
                                                           * approved */
+            technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
 
@@ -3283,6 +3416,7 @@ mod tests {
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(87400)).unwrap(),
+            technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
 
@@ -3535,6 +3669,7 @@ mod tests {
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(85500)).unwrap(),
+            technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
         manager.handle_signal(signal).await.unwrap();
@@ -3793,6 +3928,7 @@ mod tests {
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(85500)).unwrap(),
+            technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
 
@@ -3866,6 +4002,7 @@ mod tests {
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(85500)).unwrap(), // 10% below -> approval required
+            technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
 
@@ -4211,6 +4348,7 @@ mod tests {
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(87400)).unwrap(), // 8% stop
+            technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
 

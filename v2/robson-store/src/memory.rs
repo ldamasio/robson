@@ -120,6 +120,10 @@ impl MemoryStore {
                 }
             },
 
+            // TechnicalStopAnalyzed: audit-only. State remains Armed until the
+            // signal is accepted and entry processing begins.
+            Event::TechnicalStopAnalyzed { .. } => {},
+
             // EntryOrderPlaced (LEGACY): audit-only, does NOT transition to Entering.
             // Kept for eventlog replay compatibility.
             Event::EntryOrderPlaced {

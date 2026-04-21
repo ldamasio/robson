@@ -25,6 +25,7 @@ enum ProjectionRoute {
     EntryOrderFailed,
     EntryExecutionRejected,
     EntryFilled,
+    TechnicalStopAnalyzed,
     EntrySignalReceived,
     TrailingStopUpdated,
     PositionMonitorTick,
@@ -61,6 +62,7 @@ fn projection_route(event_type: &str) -> Option<ProjectionRoute> {
         "entry_order_failed" => Some(ProjectionRoute::EntryOrderFailed),
         "entry_execution_rejected" => Some(ProjectionRoute::EntryExecutionRejected),
         "entry_filled" | "ENTRY_FILLED" => Some(ProjectionRoute::EntryFilled),
+        "technical_stop_analyzed" => Some(ProjectionRoute::TechnicalStopAnalyzed),
         "entry_signal_received" | "ENTRY_SIGNAL_RECEIVED" => {
             Some(ProjectionRoute::EntrySignalReceived)
         },
@@ -141,6 +143,10 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
         Some(ProjectionRoute::EntryFilled) => {
             handlers::positions::handle_entry_filled(pool, envelope).await?
         },
+        Some(ProjectionRoute::TechnicalStopAnalyzed) => {
+            // Audit-only event. The full analysis payload is recoverable from
+            // event_log and does not mutate positions_current.
+        },
         Some(ProjectionRoute::EntrySignalReceived) => {
             handlers::positions::handle_entry_signal_received(pool, envelope).await?
         },
@@ -212,6 +218,7 @@ mod tests {
         let runtime_event_types = [
             "position_armed",
             "position_disarmed",
+            "technical_stop_analyzed",
             "entry_signal_received",
             "entry_order_placed", // legacy
             "entry_order_requested",

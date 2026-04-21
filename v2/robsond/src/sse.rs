@@ -228,6 +228,7 @@ mod tests {
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(87400)).unwrap(),
+            technical_stop_analysis: None,
             timestamp: Utc::now(),
         })
     }

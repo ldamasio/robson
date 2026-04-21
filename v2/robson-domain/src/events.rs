@@ -8,7 +8,7 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    entities::{AccountId, ExitReason, OrderId, PositionId},
+    entities::{AccountId, ExitReason, OrderId, PositionId, TechnicalStopAnalysisAudit},
     value_objects::{Price, Quantity, Side, Symbol, TechnicalStopDistance},
 };
 
@@ -33,6 +33,24 @@ pub enum Event {
         /// sizing on signal)
         tech_stop_distance: Option<TechnicalStopDistance>,
         /// When the position was armed
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Detector completed technical stop analysis for a candidate entry signal.
+    TechnicalStopAnalyzed {
+        /// Position identifier
+        position_id: PositionId,
+        /// Signal ID that will later identify the detector signal
+        signal_id: uuid::Uuid,
+        /// Trading pair symbol
+        symbol: Symbol,
+        /// Position direction
+        side: Side,
+        /// Entry price used as the analysis anchor
+        entry_price: Price,
+        /// Full audit payload for the analysis result
+        analysis: TechnicalStopAnalysisAudit,
+        /// When the analysis completed
         timestamp: DateTime<Utc>,
     },
 
@@ -309,6 +327,7 @@ impl Event {
     pub fn position_id(&self) -> PositionId {
         match self {
             Event::PositionArmed { position_id, .. }
+            | Event::TechnicalStopAnalyzed { position_id, .. }
             | Event::EntrySignalReceived { position_id, .. }
             | Event::EntryOrderPlaced { position_id, .. }
             | Event::EntryOrderRequested { position_id, .. }
@@ -333,6 +352,7 @@ impl Event {
     pub fn timestamp(&self) -> DateTime<Utc> {
         match self {
             Event::PositionArmed { timestamp, .. }
+            | Event::TechnicalStopAnalyzed { timestamp, .. }
             | Event::EntrySignalReceived { timestamp, .. }
             | Event::EntryOrderPlaced { timestamp, .. }
             | Event::EntryOrderRequested { timestamp, .. }
@@ -357,6 +377,7 @@ impl Event {
     pub fn event_type(&self) -> &'static str {
         match self {
             Event::PositionArmed { .. } => "position_armed",
+            Event::TechnicalStopAnalyzed { .. } => "technical_stop_analyzed",
             Event::EntrySignalReceived { .. } => "entry_signal_received",
             Event::EntryOrderPlaced { .. } => "entry_order_placed",
             Event::EntryOrderRequested { .. } => "entry_order_requested",
@@ -409,6 +430,36 @@ mod tests {
             fee: dec!(0.001),
             initial_stop: Price::new(dec!(93500)).unwrap(),
             binance_position_id: None,
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn sample_technical_stop_analyzed() -> Event {
+        Event::TechnicalStopAnalyzed {
+            position_id: Uuid::now_v7(),
+            signal_id: Uuid::now_v7(),
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            analysis: TechnicalStopAnalysisAudit {
+                stop_price: Price::new(dec!(93500)).unwrap(),
+                method: crate::entities::TechnicalStopMethodSnapshot::SwingPoint { level_n: 2 },
+                confidence: crate::entities::TechnicalStopConfidenceSnapshot::High,
+                detected_levels: vec![
+                    Price::new(dec!(94200)).unwrap(),
+                    Price::new(dec!(93500)).unwrap(),
+                ],
+                config: crate::entities::TechnicalStopConfigSnapshot {
+                    min_candles: 100,
+                    swing_lookback: 2,
+                    support_level_n: 2,
+                    level_tolerance: dec!(0.005),
+                    atr_period: 14,
+                    atr_multiplier: dec!(1.5),
+                    min_stop_distance_pct: dec!(0.001),
+                    max_stop_distance_pct: dec!(0.10),
+                },
+            },
             timestamp: Utc::now(),
         }
     }
@@ -479,6 +530,16 @@ mod tests {
 
         assert_eq!(event.position_id(), deserialized.position_id());
         assert_eq!(event.event_type(), "entry_filled");
+    }
+
+    #[test]
+    fn test_event_serialization_technical_stop_analyzed() {
+        let event = sample_technical_stop_analyzed();
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: Event = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(event.position_id(), deserialized.position_id());
+        assert_eq!(event.event_type(), "technical_stop_analyzed");
     }
 
     #[test]
@@ -569,6 +630,7 @@ mod tests {
         // Ensure all event types can be created and have correct type names
         let events = vec![
             ("position_armed", sample_position_armed()),
+            ("technical_stop_analyzed", sample_technical_stop_analyzed()),
             ("entry_filled", sample_entry_filled()),
             ("position_closed", sample_position_closed()),
         ];

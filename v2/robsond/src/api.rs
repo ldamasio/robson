@@ -707,6 +707,7 @@ where
                 }),
             )
         })?,
+        technical_stop_analysis: None,
         timestamp: chrono::Utc::now(),
     };
 
@@ -1220,6 +1221,7 @@ mod tests {
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(85500)).unwrap(),
+            technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
 
@@ -1282,6 +1284,7 @@ mod tests {
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(85500)).unwrap(), /* 10% stop -> approval required, risk
                                                           * approved */
+            technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
 
