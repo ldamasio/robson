@@ -67,7 +67,19 @@ impl ExchangePort for BinanceExchangeAdapter {
         symbol: &Symbol,
         expected_leverage: u8,
     ) -> Result<FuturesSettings, ExecError> {
-        // Set leverage on the symbol — idempotent, safe to call on every check.
+        // 1. Check position mode via API
+        let dual_side: bool = self.client.get_position_mode().await
+            .map_err(|e| ExecError::Exchange(format!("Failed to check position mode: {}", e)))?;
+
+        if dual_side {
+            return Err(ExecError::FuturesSafetyViolation {
+                expected: "One-way position mode".to_string(),
+                actual: "Hedge mode".to_string(),
+                advice: "Switch to One-way position mode before trading".to_string(),
+            });
+        }
+
+        // 2. Set leverage on the symbol — idempotent, safe to call on every check.
         self.client
             .set_leverage(&symbol.as_pair(), expected_leverage)
             .await
@@ -76,12 +88,10 @@ impl ExchangePort for BinanceExchangeAdapter {
         info!(
             symbol = %symbol.as_pair(),
             leverage = expected_leverage,
-            "Futures leverage set, account verified"
+            position_mode = "One-way",
+            "Futures settings verified: One-way mode confirmed, leverage set"
         );
 
-        // One-way mode is assumed (set via Binance UI or API out-of-band).
-        // In One-way mode, positionSide is BOTH and direction is determined
-        // by order side (BUY = long, SELL = short).
         Ok(FuturesSettings {
             position_mode: "One-way".to_string(),
             leverage: expected_leverage,

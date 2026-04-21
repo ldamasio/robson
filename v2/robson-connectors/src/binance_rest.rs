@@ -484,6 +484,22 @@ impl BinanceRestClient {
         Ok(())
     }
 
+    /// Get current position mode (Hedge vs One-way).
+    ///
+    /// `GET /fapi/v1/positionSide/dual` (signed).
+    ///
+    /// Returns `true` for Hedge mode (dualSidePosition=true), `false` for One-way mode.
+    pub async fn get_position_mode(&self) -> Result<bool, BinanceRestError> {
+        let body = self.get_signed("/fapi/v1/positionSide/dual", vec![]).await?;
+
+        let response: serde_json::Value = serde_json::from_str(&body)
+            .map_err(|e| BinanceRestError::ParseError(format!("Failed to parse position mode response: {}", e)))?;
+
+        let dual_side = response["dualSidePosition"].as_bool().unwrap_or(false);
+
+        Ok(dual_side)
+    }
+
     /// Ping Binance futures API to check connectivity.
     ///
     /// `GET /fapi/v1/ping` (public, no authentication required).
