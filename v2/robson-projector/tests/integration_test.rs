@@ -148,6 +148,58 @@ async fn test_order_acked_updates_projection(pool: sqlx::PgPool) -> sqlx::Result
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL (see file header for setup)"]
+async fn test_month_boundary_reset_upserts_monthly_state(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let payload = serde_json::json!({
+        "capital_base": "9750",
+        "carried_positions_risk": "250",
+        "month": 5,
+        "year": 2026,
+        "timestamp": Utc::now(),
+    });
+    let envelope =
+        make_envelope("system:month_boundary:2026-05", "month_boundary_reset", payload, 1);
+
+    apply_event_to_projections(&pool, &envelope).await.unwrap();
+
+    let (capital_base, carried_risk): (Decimal, Decimal) = sqlx::query_as(
+        "SELECT capital_base, carried_risk FROM monthly_state WHERE year = $1 AND month = $2",
+    )
+    .bind(2026_i16)
+    .bind(5_i16)
+    .fetch_one(&pool)
+    .await?;
+
+    assert_eq!(capital_base, Decimal::from(9750));
+    assert_eq!(carried_risk, Decimal::from(250));
+
+    let update_payload = serde_json::json!({
+        "capital_base": "9800",
+        "carried_positions_risk": "200",
+        "month": 5,
+        "year": 2026,
+        "timestamp": Utc::now(),
+    });
+    let update_envelope =
+        make_envelope("system:month_boundary:2026-05", "month_boundary_reset", update_payload, 2);
+
+    apply_event_to_projections(&pool, &update_envelope).await.unwrap();
+
+    let (capital_base, carried_risk): (Decimal, Decimal) = sqlx::query_as(
+        "SELECT capital_base, carried_risk FROM monthly_state WHERE year = $1 AND month = $2",
+    )
+    .bind(2026_i16)
+    .bind(5_i16)
+    .fetch_one(&pool)
+    .await?;
+
+    assert_eq!(capital_base, Decimal::from(9800));
+    assert_eq!(carried_risk, Decimal::from(200));
+
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_position_opened_enforces_invariants(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Arrange
     let position_id = Uuid::new_v4();

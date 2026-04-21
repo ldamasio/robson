@@ -245,6 +245,16 @@ pub struct ExitOrderPlaced {
     pub timestamp: DateTime<Utc>,
 }
 
+/// MONTH_BOUNDARY_RESET payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MonthBoundaryReset {
+    pub capital_base: Decimal,
+    pub carried_positions_risk: Decimal,
+    pub month: u32,
+    pub year: i32,
+    pub timestamp: DateTime<Utc>,
+}
+
 // =============================================================================
 // BALANCE EVENTS
 // =============================================================================

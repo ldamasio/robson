@@ -124,6 +124,10 @@ impl MemoryStore {
             // signal is accepted and entry processing begins.
             Event::TechnicalStopAnalyzed { .. } => {},
 
+            // MonthBoundaryReset: system-level audit/projection event. It does
+            // not mutate per-position state in the in-memory projection.
+            Event::MonthBoundaryReset { .. } => {},
+
             // EntryOrderPlaced (LEGACY): audit-only, does NOT transition to Entering.
             // Kept for eventlog replay compatibility.
             Event::EntryOrderPlaced {

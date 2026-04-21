@@ -110,6 +110,54 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
 }
 
 impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
+    pub(crate) fn configured_capital(&self) -> Decimal {
+        self.engine.lock().unwrap().risk_config().capital()
+    }
+
+    #[cfg(feature = "postgres")]
+    fn event_stream_key(event: &Event) -> String {
+        match event {
+            Event::MonthBoundaryReset { year, month, .. } => {
+                format!("system:month_boundary:{year:04}-{month:02}")
+            },
+            _ => format!("position:{}", event.position_id()),
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn load_capital_base_for_month(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> DaemonResult<Decimal> {
+        let configured_capital = self.configured_capital();
+        let Some(pool) = &self.event_log_pool else {
+            return Ok(configured_capital);
+        };
+
+        let row = sqlx::query_as::<_, (Decimal,)>(
+            "SELECT capital_base FROM monthly_state WHERE year = $1 AND month = $2",
+        )
+        .bind(now.year())
+        .bind(now.month() as i16)
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(row.map(|(capital_base,)| capital_base).unwrap_or(configured_capital))
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    async fn load_capital_base_for_month(
+        &self,
+        _now: chrono::DateTime<chrono::Utc>,
+    ) -> DaemonResult<Decimal> {
+        Ok(self.configured_capital())
+    }
+
+    pub(crate) async fn emit_domain_event(&self, event: Event) -> DaemonResult<()> {
+        self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await?;
+        Ok(())
+    }
+
     /// Create a new position manager.
     ///
     /// After creation, call `start(Arc::clone(&manager))` to start the signal
@@ -209,7 +257,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// When no pool is configured (in-memory only mode) returns `Ok(())`
     /// immediately.
     ///
-    /// Stream key pattern: `position:{position_id}`.
+    /// Stream key pattern:
+    /// - position-scoped events: `position:{position_id}`
+    /// - system-scoped events: dedicated stream chosen by event type
     #[cfg(feature = "postgres")]
     async fn persist_event_to_log(&self, event: &Event) -> DaemonResult<()> {
         let (pool, tenant_id) = match (&self.event_log_pool, &self.event_log_tenant_id) {
@@ -218,14 +268,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         };
 
         let position_id = event.position_id();
-        let stream_key = format!("position:{}", position_id);
+        let stream_key = Self::event_stream_key(event);
         let event_type = event.event_type().to_string();
 
         // Serialize full domain event as payload
         let payload = serde_json::to_value(event).map_err(|e| {
             DaemonError::EventLog(format!(
-                "Failed to serialize {} for eventlog (position {}): {}",
-                event_type, position_id, e
+                "Failed to serialize {} for eventlog (stream {}): {}",
+                event_type, stream_key, e
             ))
         })?;
 
@@ -240,7 +290,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 // re-run projection apply so retries can heal partial failures.
                 tracing::debug!(
                     event_type = %event_type,
-                    %position_id,
+                    %stream_key,
                     event_id = %id,
                     "Domain event already in eventlog (idempotent) — reapplying projection"
                 );
@@ -248,8 +298,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             },
             Err(e) => {
                 return Err(DaemonError::EventLog(format!(
-                    "Failed to append {} to eventlog (position {}): {}",
-                    event_type, position_id, e
+                    "Failed to append {} to eventlog (stream {}): {}",
+                    event_type, stream_key, e
                 )));
             },
         };
@@ -268,15 +318,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         .await
         .map_err(|e| {
             DaemonError::EventLog(format!(
-                "Failed to fetch envelope for {} (position {}, event_id {}): {}",
-                event_type, position_id, event_id, e
+                "Failed to fetch envelope for {} (stream {}, event_id {}): {}",
+                event_type, stream_key, event_id, e
             ))
         })?;
 
         apply_event_to_projections(pool, &envelope).await.map_err(|e| {
             DaemonError::EventLog(format!(
-                "Failed to apply {} to projection (position {}, seq {}): {}",
-                event_type, position_id, envelope.seq, e
+                "Failed to apply {} to projection (stream {}, seq {}): {}",
+                event_type, stream_key, envelope.seq, e
             ))
         })?;
 
@@ -519,7 +569,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// limits during the order-fill window (signal fires → order submitted
     /// → not yet filled → next signal arrives).
     async fn build_risk_context(&self) -> DaemonResult<RiskContext> {
-        let capital = self.engine.lock().unwrap().risk_config().capital();
+        let now = chrono::Utc::now();
+        let capital = self.load_capital_base_for_month(now).await?;
         let active_positions = self.store.positions().find_risk_open().await?;
 
         // find_risk_open() guarantees only Entering and Active positions.
@@ -585,7 +636,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         // Monthly realized PnL: sum realized_pnl from all positions closed in the
         // current month.
-        let now = chrono::Utc::now();
         let monthly_closed =
             self.store.positions().find_closed_in_month(now.year(), now.month()).await?;
         let monthly_realized_pnl: Decimal =
@@ -1264,10 +1314,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             return false;
         }
 
-        let capital_base = self.engine.lock().unwrap().risk_config().capital();
-        let policy = self.trading_policy;
-
         let now = chrono::Utc::now();
+        let capital_base = match self.load_capital_base_for_month(now).await {
+            Ok(capital_base) => capital_base,
+            Err(e) => {
+                warn!(error = %e, "Failed to load capital_base for MonthlyHalt evaluation");
+                return false;
+            },
+        };
+        let policy = self.trading_policy;
 
         // Realized loss: sum of absolute losses from positions closed this month.
         // Wins do NOT offset losses (ADR-0024 §5).

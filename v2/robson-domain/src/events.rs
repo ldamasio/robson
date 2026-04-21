@@ -268,6 +268,24 @@ pub enum Event {
         timestamp: DateTime<Utc>,
     },
 
+    /// Month boundary processed for monthly capital/risk reset semantics.
+    ///
+    /// This is a system-scoped event. It does not belong to a specific
+    /// position, so helper accessors use `Uuid::nil()` as a synthetic
+    /// sentinel position ID.
+    MonthBoundaryReset {
+        /// New month's capital base (`current_equity - carried_positions_risk`)
+        capital_base: Decimal,
+        /// Sum of latent risk carried by open positions into the new month
+        carried_positions_risk: Decimal,
+        /// UTC month (1-12)
+        month: u32,
+        /// UTC year
+        year: i32,
+        /// When the boundary was processed
+        timestamp: DateTime<Utc>,
+    },
+
     /// Position disarmed by user before any entry order was placed
     ///
     /// Only valid when position is in Armed state.
@@ -323,7 +341,10 @@ pub enum Event {
 }
 
 impl Event {
-    /// Get the position ID from any event
+    /// Get the associated position ID for an event.
+    ///
+    /// System-scoped events that are not tied to a concrete position return
+    /// `Uuid::nil()` as a synthetic sentinel.
     pub fn position_id(&self) -> PositionId {
         match self {
             Event::PositionArmed { position_id, .. }
@@ -345,6 +366,7 @@ impl Event {
             | Event::PositionError { position_id, .. }
             | Event::InsuranceStopPlaced { position_id, .. }
             | Event::InsuranceStopCancelled { position_id, .. } => *position_id,
+            Event::MonthBoundaryReset { .. } => uuid::Uuid::nil(),
         }
     }
 
@@ -366,6 +388,7 @@ impl Event {
             | Event::ExitOrderPlaced { timestamp, .. }
             | Event::ExitFilled { timestamp, .. }
             | Event::PositionClosed { timestamp, .. }
+            | Event::MonthBoundaryReset { timestamp, .. }
             | Event::PositionDisarmed { timestamp, .. }
             | Event::PositionError { timestamp, .. }
             | Event::InsuranceStopPlaced { timestamp, .. }
@@ -391,6 +414,7 @@ impl Event {
             Event::ExitOrderPlaced { .. } => "exit_order_placed",
             Event::ExitFilled { .. } => "exit_filled",
             Event::PositionClosed { .. } => "position_closed",
+            Event::MonthBoundaryReset { .. } => "month_boundary_reset",
             Event::PositionDisarmed { .. } => "position_disarmed",
             Event::PositionError { .. } => "position_error",
             Event::InsuranceStopPlaced { .. } => "insurance_stop_placed",
@@ -512,6 +536,16 @@ mod tests {
         }
     }
 
+    fn sample_month_boundary_reset() -> Event {
+        Event::MonthBoundaryReset {
+            capital_base: dec!(9750),
+            carried_positions_risk: dec!(250),
+            month: 5,
+            year: 2026,
+            timestamp: Utc::now(),
+        }
+    }
+
     #[test]
     fn test_event_serialization_position_armed() {
         let event = sample_position_armed();
@@ -550,6 +584,17 @@ mod tests {
 
         assert_eq!(event.position_id(), deserialized.position_id());
         assert_eq!(event.event_type(), "position_closed");
+    }
+
+    #[test]
+    fn test_event_serialization_month_boundary_reset() {
+        let event = sample_month_boundary_reset();
+        let json = serde_json::to_string(&event).unwrap();
+        let deserialized: Event = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(event.position_id(), deserialized.position_id());
+        assert_eq!(event.position_id(), Uuid::nil());
+        assert_eq!(event.event_type(), "month_boundary_reset");
     }
 
     #[test]
@@ -633,6 +678,7 @@ mod tests {
             ("technical_stop_analyzed", sample_technical_stop_analyzed()),
             ("entry_filled", sample_entry_filled()),
             ("position_closed", sample_position_closed()),
+            ("month_boundary_reset", sample_month_boundary_reset()),
         ];
 
         for (expected_type, event) in events {

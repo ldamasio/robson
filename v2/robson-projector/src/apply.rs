@@ -27,6 +27,7 @@ enum ProjectionRoute {
     EntryFilled,
     TechnicalStopAnalyzed,
     EntrySignalReceived,
+    MonthBoundaryReset,
     TrailingStopUpdated,
     PositionMonitorTick,
     ExitTriggered,
@@ -66,6 +67,7 @@ fn projection_route(event_type: &str) -> Option<ProjectionRoute> {
         "entry_signal_received" | "ENTRY_SIGNAL_RECEIVED" => {
             Some(ProjectionRoute::EntrySignalReceived)
         },
+        "month_boundary_reset" => Some(ProjectionRoute::MonthBoundaryReset),
         "trailing_stop_updated" | "TRAILING_STOP_UPDATED" => {
             Some(ProjectionRoute::TrailingStopUpdated)
         },
@@ -150,6 +152,9 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
         Some(ProjectionRoute::EntrySignalReceived) => {
             handlers::positions::handle_entry_signal_received(pool, envelope).await?
         },
+        Some(ProjectionRoute::MonthBoundaryReset) => {
+            handlers::monthly_state::handle_month_boundary_reset(pool, envelope).await?
+        },
         Some(ProjectionRoute::TrailingStopUpdated) => {
             handlers::positions::handle_trailing_stop_updated(pool, envelope).await?
         },
@@ -220,6 +225,7 @@ mod tests {
             "position_disarmed",
             "technical_stop_analyzed",
             "entry_signal_received",
+            "month_boundary_reset",
             "entry_order_placed", // legacy
             "entry_order_requested",
             "entry_order_accepted",

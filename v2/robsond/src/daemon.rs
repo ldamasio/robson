@@ -22,6 +22,7 @@ use std::{net::SocketAddr, sync::Arc};
 
 // Macro for creating Decimal literals
 use async_trait::async_trait;
+use chrono::{DateTime, Datelike, Utc};
 use robson_connectors::BinanceRestClient;
 use robson_domain::{Position, PositionId, Symbol, TradingPolicy};
 use robson_engine::Engine;
@@ -80,11 +81,18 @@ pub struct Daemon<E: ExchangePort + 'static, S: Store + 'static> {
     /// Shared PostgreSQL connection pool for projection worker (injected)
     #[cfg(feature = "postgres")]
     pg_pool: Option<Arc<sqlx::PgPool>>,
+    /// Last month processed by the month-boundary poller.
+    last_month_check: Arc<RwLock<(i32, u32)>>,
 }
 
 /// Default query recorder (tracing only, no persistence).
 fn default_query_recorder() -> Arc<dyn QueryRecorder> {
     Arc::new(TracingQueryRecorder)
+}
+
+fn initial_month_check() -> Arc<RwLock<(i32, u32)>> {
+    let now = Utc::now();
+    Arc::new(RwLock::new((now.year(), now.month())))
 }
 
 /// Adapts a generic `Store` into a concrete `PositionRepository` trait object.
@@ -168,6 +176,7 @@ impl Daemon<StubExchange, MemoryStore> {
             projection_recovery: None,
             #[cfg(feature = "postgres")]
             pg_pool: None,
+            last_month_check: initial_month_check(),
         }
     }
 
@@ -220,6 +229,7 @@ impl Daemon<StubExchange, MemoryStore> {
             store,
             projection_recovery,
             pg_pool,
+            last_month_check: initial_month_check(),
         }
     }
 }
@@ -262,6 +272,7 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
             projection_recovery: None,
             #[cfg(feature = "postgres")]
             pg_pool: None,
+            last_month_check: initial_month_check(),
         }
     }
 
@@ -319,6 +330,7 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
             store,
             projection_recovery,
             pg_pool,
+            last_month_check: initial_month_check(),
         }
     }
 }
@@ -342,6 +354,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             projection_recovery,
             #[cfg(feature = "postgres")]
             pg_pool,
+            last_month_check: initial_month_check(),
         }
     }
 
@@ -439,6 +452,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             ctrl_c_shutdown.cancel();
         });
 
+        let mut month_boundary_interval =
+            tokio::time::interval(tokio::time::Duration::from_secs(60));
+        month_boundary_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+
         // 9. Main event loop
         info!("Entering main event loop");
         loop {
@@ -460,6 +477,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                         Err(lag_msg) => {
                             warn!(%lag_msg, "Event receiver lagged");
                         }
+                    }
+                }
+
+                _ = month_boundary_interval.tick() => {
+                    let now = Utc::now();
+                    if let Err(e) = self.poll_month_boundary(now).await {
+                        error!(error = %e, "Month boundary check failed");
                     }
                 }
             }
@@ -491,6 +515,122 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         self.shutdown().await?;
 
         Ok(())
+    }
+
+    async fn poll_month_boundary(&self, now: DateTime<Utc>) -> DaemonResult<bool> {
+        let current_month = (now.year(), now.month());
+        let previous_month = { *self.last_month_check.read().await };
+
+        if previous_month == current_month {
+            return Ok(false);
+        }
+
+        info!(
+            previous = ?previous_month,
+            current = ?current_month,
+            "Month boundary detected, processing reset"
+        );
+
+        self.handle_month_boundary(now).await?;
+
+        let mut last_month_check = self.last_month_check.write().await;
+        *last_month_check = current_month;
+
+        Ok(true)
+    }
+
+    async fn handle_month_boundary(&self, now: DateTime<Utc>) -> DaemonResult<()> {
+        #[cfg(feature = "postgres")]
+        if let Some(pool) = &self.pg_pool {
+            let exists = sqlx::query_scalar::<_, bool>(
+                "SELECT EXISTS(SELECT 1 FROM monthly_state WHERE year = $1 AND month = $2)",
+            )
+            .bind(now.year())
+            .bind(now.month() as i16)
+            .fetch_one(&**pool)
+            .await?;
+
+            if exists {
+                tracing::debug!(
+                    year = now.year(),
+                    month = now.month(),
+                    "MonthBoundaryReset already projected for current month, skipping"
+                );
+                return Ok(());
+            }
+        }
+
+        let open_positions = self.store.positions().find_risk_open().await?;
+        let carried_risk = Self::calculate_carried_risk(&open_positions);
+        let current_equity = {
+            let manager = self.position_manager.read().await;
+            manager.configured_capital()
+        };
+        let capital_base = (current_equity - carried_risk).max(rust_decimal::Decimal::ZERO);
+
+        let event = robson_domain::Event::MonthBoundaryReset {
+            capital_base,
+            carried_positions_risk: carried_risk,
+            month: now.month(),
+            year: now.year(),
+            timestamp: now,
+        };
+
+        {
+            let manager = self.position_manager.read().await;
+            manager.emit_domain_event(event).await?;
+        }
+
+        let circuit_breaker = {
+            let manager = self.position_manager.read().await;
+            manager.circuit_breaker()
+        };
+        let _ = circuit_breaker.reset().await;
+
+        info!(
+            year = now.year(),
+            month = now.month(),
+            %capital_base,
+            %carried_risk,
+            "Month boundary processed"
+        );
+
+        Ok(())
+    }
+
+    fn calculate_carried_risk(positions: &[Position]) -> rust_decimal::Decimal {
+        positions
+            .iter()
+            .filter_map(|position| {
+                let qty = position.quantity.as_decimal();
+                if qty.is_zero() {
+                    return None;
+                }
+
+                let (entry, stop) = match &position.state {
+                    robson_domain::PositionState::Active { trailing_stop, .. } => {
+                        (position.entry_price?.as_decimal(), trailing_stop.as_decimal())
+                    },
+                    robson_domain::PositionState::Entering { expected_entry, .. } => {
+                        let entry = expected_entry.as_decimal();
+                        let stop = position
+                            .tech_stop_distance
+                            .as_ref()
+                            .map(|tech_stop| tech_stop.initial_stop.as_decimal())
+                            .unwrap_or(entry);
+                        (entry, stop)
+                    },
+                    _ => return None,
+                };
+
+                let risk = match position.side {
+                    robson_domain::Side::Long => (entry - stop) * qty,
+                    robson_domain::Side::Short => (stop - entry) * qty,
+                };
+
+                Some(risk.max(rust_decimal::Decimal::ZERO))
+            })
+            .sum()
     }
 
     /// Rebuild store from EventLog on startup (crash recovery).
@@ -911,8 +1051,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
 
 #[cfg(test)]
 mod tests {
-    #[cfg(feature = "postgres")]
     use chrono::{TimeZone, Utc};
+    use robson_domain::{PositionState, Price, Quantity, Side, TechnicalStopDistance};
     #[cfg(feature = "postgres")]
     use robson_eventlog::{
         append_event, query_events, ActorType, Event, QueryOptions, QUERY_STATE_CHANGED_EVENT_TYPE,
@@ -973,6 +1113,76 @@ mod tests {
 
         // Shutdown should complete without errors
         daemon.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_poll_month_boundary_emits_reset_once_per_month() {
+        let daemon = Daemon::new_stub(Config::test());
+        {
+            let mut last_month_check = daemon.last_month_check.write().await;
+            *last_month_check = (2026, 4);
+        }
+
+        let first = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 1).single().unwrap();
+        assert!(daemon.poll_month_boundary(first).await.unwrap());
+
+        let second = Utc.with_ymd_and_hms(2026, 5, 2, 12, 0, 0).single().unwrap();
+        assert!(!daemon.poll_month_boundary(second).await.unwrap());
+
+        let events = daemon.store.events().get_all_events().await.unwrap();
+        let month_events: Vec<_> = events
+            .iter()
+            .filter_map(|event| match event {
+                robson_domain::Event::MonthBoundaryReset {
+                    capital_base,
+                    carried_positions_risk,
+                    month,
+                    year,
+                    ..
+                } => Some((*capital_base, *carried_positions_risk, *month, *year)),
+                _ => None,
+            })
+            .collect();
+
+        assert_eq!(month_events.len(), 1, "month boundary must emit once per in-process month");
+        assert_eq!(month_events[0], (dec!(10000), dec!(0), 5, 2026));
+    }
+
+    #[test]
+    fn test_calculate_carried_risk_uses_effective_stop_by_state() {
+        let account_id = uuid::Uuid::now_v7();
+        let now = Utc::now();
+
+        let mut active =
+            Position::new(account_id, Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        active.entry_price = Some(Price::new(dec!(100)).unwrap());
+        active.quantity = Quantity::new(dec!(2)).unwrap();
+        active.state = PositionState::Active {
+            current_price: Price::new(dec!(110)).unwrap(),
+            trailing_stop: Price::new(dec!(95)).unwrap(),
+            favorable_extreme: Price::new(dec!(110)).unwrap(),
+            extreme_at: now,
+            insurance_stop_id: None,
+            last_emitted_stop: None,
+        };
+
+        let mut entering =
+            Position::new(account_id, Symbol::from_pair("ETHUSDT").unwrap(), Side::Long);
+        entering.quantity = Quantity::new(dec!(3)).unwrap();
+        entering.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(
+            Price::new(dec!(100)).unwrap(),
+            Price::new(dec!(90)).unwrap(),
+        ));
+        entering.state = PositionState::Entering {
+            entry_order_id: uuid::Uuid::now_v7(),
+            expected_entry: Price::new(dec!(100)).unwrap(),
+            signal_id: uuid::Uuid::now_v7(),
+        };
+
+        let carried_risk =
+            Daemon::<StubExchange, MemoryStore>::calculate_carried_risk(&[active, entering]);
+
+        assert_eq!(carried_risk, dec!(40));
     }
 
     #[cfg(feature = "postgres")]
