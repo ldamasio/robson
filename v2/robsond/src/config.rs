@@ -28,6 +28,9 @@ pub struct Config {
     /// Projection configuration
     pub projection: ProjectionConfig,
 
+    /// Market data WebSocket configuration
+    pub market_data: MarketDataConfig,
+
     /// Position monitor configuration (safety net)
     pub position_monitor: PositionMonitorConfig,
 
@@ -93,6 +96,19 @@ pub struct TechStopConfigEnv {
     pub lookback_candles: usize,
 }
 
+/// Market data configuration.
+#[derive(Debug, Clone)]
+pub struct MarketDataConfig {
+    /// Symbols to subscribe via WebSocket (e.g., ["BTCUSDT", "ETHUSDT"])
+    pub symbols: Vec<String>,
+}
+
+impl Default for MarketDataConfig {
+    fn default() -> Self {
+        Self { symbols: vec![] }
+    }
+}
+
 /// Position monitor configuration (safety net for rogue positions).
 #[derive(Debug, Clone)]
 pub struct PositionMonitorConfig {
@@ -142,6 +158,7 @@ impl Config {
         let engine = Self::load_engine_config()?;
         let tech_stop = Self::load_tech_stop_config()?;
         let projection = Self::load_projection_config()?;
+        let market_data = Self::load_market_data_config()?;
         let position_monitor = Self::load_position_monitor_config()?;
 
         // Fail-fast: API token is mandatory in production
@@ -156,6 +173,7 @@ impl Config {
             engine,
             tech_stop,
             projection,
+            market_data,
             position_monitor,
             environment,
         })
@@ -185,6 +203,7 @@ impl Config {
                 stream_key: "test:stream".to_string(),
                 poll_interval_ms: 100,
             },
+            market_data: MarketDataConfig { symbols: vec!["BTCUSDT".to_string()] },
             position_monitor: PositionMonitorConfig {
                 enabled: false, // Disabled in tests
                 poll_interval_secs: 1,
@@ -329,6 +348,21 @@ impl Config {
         })
     }
 
+    fn load_market_data_config() -> DaemonResult<MarketDataConfig> {
+        let symbols_str = env::var("ROBSON_MARKET_DATA_SYMBOLS").unwrap_or_default();
+        let symbols: Vec<String> = symbols_str
+            .split(',')
+            .map(|s| s.trim().to_uppercase())
+            .filter(|s| !s.is_empty())
+            .collect();
+
+        if symbols.is_empty() {
+            return Err(DaemonError::Config("ROBSON_MARKET_DATA_SYMBOLS is required".to_string()));
+        }
+
+        Ok(MarketDataConfig { symbols })
+    }
+
     fn load_position_monitor_config() -> DaemonResult<PositionMonitorConfig> {
         // Check if enabled
         let enabled = env::var("ROBSON_POSITION_MONITOR_ENABLED")
@@ -404,6 +438,7 @@ impl Default for Config {
                 stream_key: "robson:daemon".to_string(),
                 poll_interval_ms: 100,
             },
+            market_data: MarketDataConfig::default(),
             position_monitor: PositionMonitorConfig::default(),
             environment: Environment::Development,
         }
@@ -426,7 +461,45 @@ impl std::fmt::Display for Environment {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Mutex, OnceLock};
+
     use super::*;
+
+    struct EnvGuard {
+        saved: Vec<(String, Option<String>)>,
+    }
+
+    impl EnvGuard {
+        fn new(updates: &[(&str, Option<&str>)]) -> Self {
+            let mut saved = Vec::with_capacity(updates.len());
+
+            for (key, value) in updates {
+                saved.push(((*key).to_string(), std::env::var(key).ok()));
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+
+            Self { saved }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.iter().rev() {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+        }
+    }
+
+    fn env_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn test_default_config() {
@@ -438,6 +511,7 @@ mod tests {
         assert_eq!(config.tech_stop.max_stop_pct, Decimal::from(10));
         assert_eq!(config.tech_stop.support_level_n, 2);
         assert_eq!(config.tech_stop.lookback_candles, 100);
+        assert!(config.market_data.symbols.is_empty());
     }
 
     #[test]
@@ -448,6 +522,7 @@ mod tests {
         assert_eq!(config.environment, Environment::Test);
         assert_eq!(config.tech_stop.min_stop_pct, Decimal::new(1, 1)); // 0.1%
         assert_eq!(config.tech_stop.max_stop_pct, Decimal::from(20));
+        assert_eq!(config.market_data.symbols, vec!["BTCUSDT"]);
     }
 
     #[test]
@@ -464,5 +539,27 @@ mod tests {
         assert_eq!(Environment::Test.to_string(), "test");
         assert_eq!(Environment::Development.to_string(), "development");
         assert_eq!(Environment::Production.to_string(), "production");
+    }
+
+    #[test]
+    fn test_load_market_data_config_requires_symbols() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[("ROBSON_MARKET_DATA_SYMBOLS", Some(""))]);
+
+        let err = Config::load_market_data_config().unwrap_err();
+        assert!(matches!(
+            err,
+            DaemonError::Config(message) if message == "ROBSON_MARKET_DATA_SYMBOLS is required"
+        ));
+    }
+
+    #[test]
+    fn test_load_market_data_config_parses_multiple_symbols() {
+        let _lock = env_lock().lock().unwrap();
+        let _env =
+            EnvGuard::new(&[("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT, ethusdt,SOLUSDC"))]);
+
+        let config = Config::load_market_data_config().unwrap();
+        assert_eq!(config.symbols, vec!["BTCUSDT", "ETHUSDT", "SOLUSDC"]);
     }
 }

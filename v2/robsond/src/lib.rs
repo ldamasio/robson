@@ -64,7 +64,8 @@ pub use binance_exchange::BinanceExchangeAdapter;
 pub use binance_ohlcv::BinanceOhlcvAdapter;
 pub use circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot};
 pub use config::{
-    ApiConfig, Config, EngineConfig, Environment, PositionMonitorConfig, ProjectionConfig,
+    ApiConfig, Config, EngineConfig, Environment, MarketDataConfig, PositionMonitorConfig,
+    ProjectionConfig,
 };
 pub use daemon::Daemon;
 pub use detector::{DetectorConfig, DetectorTask};
