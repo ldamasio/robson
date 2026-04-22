@@ -20,7 +20,7 @@ import type {
  * - GET  /status           → List positions
  * - POST /positions        → Arm new position
  * - GET  /positions/:id    → Get position
- * - DELETE /positions/:id  → Disarm position
+ * - DELETE /positions/:id  → Cancel Armed or close Active position
  * - POST /positions/:id/signal → Inject signal (testing)
  * - POST /panic            → Emergency close all
  * - POST /credentials      → Store credentials
@@ -71,9 +71,9 @@ export class RobsonClient {
   }
 
   /**
-   * Disarm (cancel) an armed position.
+   * Cancel an Armed position or close an Active position.
    *
-   * Only works for positions in Armed state.
+   * Uses the same endpoint for both pre-entry cancellation and manual exit.
    */
   async disarm(positionId: string): Promise<void> {
     await this.client.delete(`/positions/${positionId}`);

@@ -1509,6 +1509,77 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         Ok(())
     }
 
+    /// Close a single active position via reduce-only market order.
+    ///
+    /// Only positions in Active state can be closed through this path.
+    pub async fn close_position(&self, position_id: PositionId) -> DaemonResult<()> {
+        let position = match self.store.positions().find_by_id(position_id).await {
+            Ok(Some(pos)) => pos,
+            Ok(None) => return Err(DaemonError::PositionNotFound(position_id)),
+            Err(e) => return Err(e.into()),
+        };
+
+        if !matches!(position.state, PositionState::Active { .. }) {
+            return Err(DaemonError::InvalidPositionState {
+                expected: "Active".to_string(),
+                actual: format!("{:?}", position.state),
+            });
+        }
+
+        let mut query =
+            ExecutionQuery::new(QueryKind::ClosePosition { position_id }, Self::operator_actor());
+        query.position_id = Some(position_id);
+        self.populate_query_context_summary(&mut query).await;
+        self.record_query_accepted(&query).await?;
+
+        match self.panic_close_position_internal(position_id, &mut query).await {
+            Ok(_) => {
+                if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count: 1 }) {
+                    query.fail(format!("{}", e), "acting".to_string());
+                    self.record_query_failure(&query).await?;
+                    return Err(DaemonError::Config(format!("Query completion error: {}", e)));
+                }
+                self.record_query_transition(&query, "completed").await?;
+                Ok(())
+            },
+            Err(e) => {
+                let phase = match &query.state {
+                    QueryState::Accepted => "accepted".to_string(),
+                    QueryState::Processing => "processing".to_string(),
+                    QueryState::RiskChecked => "risk_checked".to_string(),
+                    QueryState::AwaitingApproval => "awaiting_approval".to_string(),
+                    QueryState::Authorized => "authorized".to_string(),
+                    QueryState::Acting => "acting".to_string(),
+                    QueryState::Completed => "completed".to_string(),
+                    QueryState::Expired => "expired".to_string(),
+                    QueryState::Failed { phase, .. } => phase.clone(),
+                    QueryState::Denied { check, .. } => format!("denied:{}", check),
+                };
+                query.fail(format!("{}", e), phase);
+                self.record_query_failure(&query).await?;
+                Err(e)
+            },
+        }
+    }
+
+    /// Cancel an Armed position or close an Active position.
+    pub async fn cancel_or_close_position(&self, position_id: PositionId) -> DaemonResult<()> {
+        let position = match self.store.positions().find_by_id(position_id).await {
+            Ok(Some(pos)) => pos,
+            Ok(None) => return Err(DaemonError::PositionNotFound(position_id)),
+            Err(e) => return Err(e.into()),
+        };
+
+        match position.state {
+            PositionState::Armed => self.disarm_position(position_id).await,
+            PositionState::Active { .. } => self.close_position(position_id).await,
+            actual => Err(DaemonError::InvalidPositionState {
+                expected: "Armed or Active".to_string(),
+                actual: format!("{:?}", actual),
+            }),
+        }
+    }
+
     /// Handle a detector signal (entry signal received).
     ///
     /// Flow: Engine → Execute actions (emit events) → Save state → Process fill
@@ -2722,6 +2793,26 @@ mod tests {
         assert!(
             matches!(loaded.state, PositionState::Closed { .. }),
             "expected Closed after disarm, got {:?}",
+            loaded.state
+        );
+    }
+
+    #[tokio::test]
+    async fn test_cancel_or_close_position_closes_active_position() {
+        let manager = create_test_manager().await;
+        let position = save_active_position(&manager, "BTCUSDT", Side::Long, dec!(95000), dec!(0.01))
+            .await;
+
+        manager.cancel_or_close_position(position.id).await.unwrap();
+
+        let loaded = manager
+            .get_position(position.id)
+            .await
+            .unwrap()
+            .expect("position must still exist after close");
+        assert!(
+            matches!(loaded.state, PositionState::Closed { .. }),
+            "expected Closed after active close, got {:?}",
             loaded.state
         );
     }

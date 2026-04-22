@@ -216,6 +216,86 @@ async fn test_disarm_nonexistent_returns_error() {
     );
 }
 
+#[tokio::test]
+async fn test_delete_active_position_closes_it() {
+    let (base, _) = start_test_server().await;
+    let arm = arm_btcusdt(&base).await;
+
+    let signal_resp = client()
+        .post(format!("{}/positions/{}/signal", base, arm.position_id))
+        .json(&json!({
+            "position_id": arm.position_id,
+            "entry_price": "95000",
+            "stop_loss": "87400"
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(signal_resp.status(), 200);
+
+    let status_after_signal: api::StatusResponse = client()
+        .get(format!("{}/status", base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let approval = status_after_signal
+        .pending_approvals
+        .into_iter()
+        .find(|pending| pending.position_id == Some(arm.position_id))
+        .expect("signal should create a pending approval for this position");
+
+    let approve_resp = client()
+        .post(format!("{}/queries/{}/approve", base, approval.query_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(approve_resp.status(), 200, "approval should return 200");
+
+    let active_position: api::PositionSummary = client()
+        .get(format!("{}/positions/{}", base, arm.position_id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(active_position.state, "Active");
+
+    let delete_resp = client()
+        .delete(format!("{}/positions/{}", base, arm.position_id))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(delete_resp.status(), 204, "active delete should return 204 No Content");
+
+    let closed_position: api::PositionSummary = client()
+        .get(format!("{}/positions/{}", base, arm.position_id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        closed_position.state.starts_with("Closed"),
+        "expected Closed state after delete, got {}",
+        closed_position.state
+    );
+
+    let status: api::StatusResponse = client()
+        .get(format!("{}/status", base))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(status.active_positions, 0);
+}
+
 // =============================================================================
 // Arm — validation errors
 // =============================================================================

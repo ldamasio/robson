@@ -1,7 +1,7 @@
 //! ExecutionQuery: the typed lifecycle unit for one runtime trigger.
 //!
 //! Every trigger that enters the Runtime becomes one or more ExecutionQueries.
-//! For single-position triggers (signal, disarm): one query per trigger.
+//! For single-position triggers (signal, disarm, close): one query per trigger.
 //! For fan-out triggers (market tick, panic): one query PER POSITION affected.
 //!
 //! This is the control-loop unit: it tracks one complete
@@ -60,6 +60,9 @@ pub enum QueryKind {
 
     /// Operator requests position disarming
     DisarmPosition { position_id: PositionId },
+
+    /// Operator requests closing ONE active position
+    ClosePosition { position_id: PositionId },
 
     /// Emergency close ONE position (PanicClose creates one query per position)
     PanicClosePosition { position_id: PositionId },
@@ -878,6 +881,18 @@ mod tests {
             });
 
         assert!(matches!(query.kind, QueryKind::DisarmPosition { .. }));
+    }
+
+    #[test]
+    fn test_close_position_kind() {
+        let position_id = Uuid::now_v7();
+
+        let query =
+            ExecutionQuery::new(QueryKind::ClosePosition { position_id }, ActorKind::Operator {
+                source: CommandSource::Api,
+            });
+
+        assert!(matches!(query.kind, QueryKind::ClosePosition { .. }));
     }
 
     #[test]

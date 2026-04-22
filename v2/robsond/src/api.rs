@@ -4,7 +4,7 @@
 //! - Health check
 //! - Status (active positions)
 //! - Arm position
-//! - Disarm position
+//! - Cancel/close a single position
 //! - Panic (emergency close all)
 //! - Safety net (rogue position monitoring)
 //! - SSE events for operator-facing runtime updates
@@ -351,7 +351,7 @@ where
     });
     let mutating = Router::new()
         .route("/positions", post(arm_handler))
-        .route("/positions/:id", delete(disarm_handler))
+        .route("/positions/:id", delete(cancel_or_close_handler))
         .route("/positions/:id/signal", post(signal_handler))
         .route("/queries/:id/approve", post(approve_query_handler))
         .route("/panic", post(panic_handler))
@@ -643,8 +643,8 @@ where
     ))
 }
 
-/// Disarm (cancel) a position.
-async fn disarm_handler<E, S>(
+/// Cancel an Armed position or close an Active position.
+async fn cancel_or_close_handler<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
     Path(id): Path<Uuid>,
 ) -> Result<StatusCode, (StatusCode, Json<ErrorResponse>)>
@@ -653,7 +653,10 @@ where
     S: Store + 'static,
 {
     let manager = state.position_manager.write().await;
-    manager.disarm_position(id).await.map_err(|e| to_error_response(e))?;
+    manager
+        .cancel_or_close_position(id)
+        .await
+        .map_err(|e| to_error_response(e))?;
 
     Ok(StatusCode::NO_CONTENT)
 }
