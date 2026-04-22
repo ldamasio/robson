@@ -504,7 +504,7 @@ impl BinanceRestClient {
                     entry_price: Price::new(p.entry_price).map_err(|e| {
                         BinanceRestError::ParseError(format!("Invalid entry price: {}", e))
                     })?,
-                    unrealized_pnl: p.unrealized_profit,
+                    unrealized_pnl: p.unrealized_profit.unwrap_or(Decimal::ZERO),
                     leverage,
                 })
             })
@@ -543,7 +543,10 @@ struct PositionRiskResponse {
     symbol: String,
     position_amt: Decimal,
     entry_price: Decimal,
-    unrealized_profit: Decimal,
+    /// Unrealized profit. Optional for Binance testnet compatibility.
+    /// Testnet API may omit this field; production API always includes it.
+    #[serde(default)]
+    unrealized_profit: Option<Decimal>,
     leverage: String,
 }
 
