@@ -10,7 +10,7 @@
 
 | Date | Executor | Result | Notes |
 |------|----------|--------|-------|
-| — | — | blocked | Requires VAL-001 PASS before first execution |
+| 2026-04-22 | GLM-5.1 + psyctl | PASS | Foundation prod sha-9448ce20, monitor ativo, 0 UNTRACKED em 10min |
 
 *Update this table after every execution. VAL-002 must not start until VAL-001 shows `PASS`.*
 
