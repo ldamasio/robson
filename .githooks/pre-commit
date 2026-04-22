@@ -20,27 +20,29 @@ fi
 # --- General checks ---
 STAGED=$(git diff --cached --name-only --diff-filter=ACM)
 
-# Detect private keys
-echo "$STAGED" | grep -qS '' && while IFS= read -r f; do
-  if grep -qE '-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----' "$f" 2>/dev/null; then
-    echo "ERROR: Private key detected in $f" >&2
-    exit 1
-  fi
-done <<< "$STAGED" || true
+if [ -n "$STAGED" ]; then
+  # Detect private keys
+  while IFS= read -r f; do
+    if grep -qE '-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----' "$f" 2>/dev/null; then
+      echo "ERROR: Private key detected in $f" >&2
+      exit 1
+    fi
+  done <<< "$STAGED"
 
-# Merge conflict markers
-echo "$STAGED" | grep -qS '' && while IFS= read -r f; do
-  if grep -qE '^(<<<<<<<|=======|>>>>>>>)' "$f" 2>/dev/null; then
-    echo "ERROR: Merge conflict markers in $f" >&2
-    exit 1
-  fi
-done <<< "$STAGED" || true
+  # Merge conflict markers
+  while IFS= read -r f; do
+    if grep -qE '^(<<<<<<<|=======|>>>>>>>)' "$f" 2>/dev/null; then
+      echo "ERROR: Merge conflict markers in $f" >&2
+      exit 1
+    fi
+  done <<< "$STAGED"
 
-# Large files (>500KB)
-echo "$STAGED" | grep -qS '' && while IFS= read -r f; do
-  size=$(wc -c < "$f" 2>/dev/null || echo 0)
-  if [ "$size" -gt 512000 ]; then
-    echo "ERROR: $f is ${size} bytes (max 500KB)" >&2
-    exit 1
-  fi
-done <<< "$STAGED" || true
+  # Large files (>500KB)
+  while IFS= read -r f; do
+    size=$(wc -c < "$f" 2>/dev/null || echo 0)
+    if [ "$size" -gt 512000 ]; then
+      echo "ERROR: $f is ${size} bytes (max 500KB)" >&2
+      exit 1
+    fi
+  done <<< "$STAGED"
+fi
