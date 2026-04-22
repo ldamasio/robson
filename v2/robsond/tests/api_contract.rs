@@ -103,12 +103,16 @@ async fn test_status_empty_on_fresh_daemon() {
 // =============================================================================
 
 async fn arm_btcusdt(base: &str) -> api::ArmResponse {
+    arm_btcusdt_with_capital(base, "10000").await
+}
+
+async fn arm_btcusdt_with_capital(base: &str, capital: &str) -> api::ArmResponse {
     let resp = client()
         .post(format!("{}/positions", base))
         .json(&json!({
             "symbol": "BTCUSDT",
             "side": "LONG",
-            "capital": "10000"
+            "capital": capital
         }))
         .send()
         .await
@@ -383,6 +387,32 @@ async fn test_signal_on_armed_position_is_accepted() {
 
     // Signal may result in 200 (accepted) or 200 with state change
     assert_eq!(resp.status(), 200, "signal injection should return 200, got: {}", resp.status());
+}
+
+#[tokio::test]
+async fn test_signal_rejects_quantity_below_exchange_minimum() {
+    let (base, _) = start_test_server().await;
+    let arm = arm_btcusdt_with_capital(&base, "100").await;
+
+    let resp = client()
+        .post(format!("{}/positions/{}/signal", base, arm.position_id))
+        .json(&json!({
+            "position_id": arm.position_id,
+            "entry_price": "76200.00",
+            "stop_loss": "73825.27"
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 400);
+    let body: api::ErrorResponse = resp.json().await.unwrap();
+    assert!(body.error.contains("step size 0.001"), "error: {}", body.error);
+    assert!(
+        body.error.contains("minimum quantity 0.001"),
+        "error: {}",
+        body.error
+    );
 }
 
 #[tokio::test]

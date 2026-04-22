@@ -29,6 +29,39 @@ fn trunc_to_scale(value: Decimal, scale: u32) -> Decimal {
     (value * factor).floor() / factor
 }
 
+fn configured_step_size(symbol: &Symbol) -> Decimal {
+    match symbol.as_pair().as_str() {
+        "BTCUSDT" => Decimal::new(1, 3),
+        _ => Decimal::new(1, 3),
+    }
+}
+
+fn configured_step_scale(symbol: &Symbol) -> u32 {
+    configured_step_size(symbol).scale()
+}
+
+pub(crate) fn normalize_market_quantity(
+    symbol: &Symbol,
+    quantity: Quantity,
+) -> Result<Decimal, ExecError> {
+    let raw_qty = quantity.as_decimal();
+    let step_size = configured_step_size(symbol);
+    let qty = trunc_to_scale(raw_qty, configured_step_scale(symbol));
+
+    if qty < step_size {
+        return Err(ExecError::OrderRejected(format!(
+            "Quantity {} for {} rounds down to {} at Binance step size {} and falls below the minimum quantity {}. Increase capital or widen the stop distance; Robson will not round up.",
+            raw_qty,
+            symbol.as_pair(),
+            qty,
+            step_size,
+            step_size
+        )));
+    }
+
+    Ok(qty)
+}
+
 // =============================================================================
 // Adapter
 // =============================================================================
@@ -117,18 +150,9 @@ impl ExchangePort for BinanceExchangeAdapter {
             OrderSide::Sell => Side::Short,
         };
 
-        // Truncate quantity to exchange step size precision.
-        // BTCUSDT futures step size = 0.001 (3 decimal places).
-        // TODO: query exchangeInfo per symbol for dynamic step size.
-        let raw_qty = quantity.as_decimal();
-        let qty = trunc_to_scale(raw_qty, 3);
-
-        if qty <= Decimal::ZERO {
-            return Err(ExecError::Exchange(format!(
-                "Quantity {} truncated to zero for {} — stop distance too small relative to capital",
-                raw_qty, symbol.as_pair()
-            )));
-        }
+        // BTCUSDT futures currently uses hardcoded 0.001 step size / minimum
+        // quantity. TODO: query exchangeInfo per symbol for dynamic filters.
+        let qty = normalize_market_quantity(symbol, quantity)?;
 
         let response = self
             .client
@@ -293,5 +317,30 @@ impl ExchangePort for BinanceExchangeAdapter {
 
         self.place_market_order(symbol, close_side, quantity, client_order_id, true)
             .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use rust_decimal_macros::dec;
+
+    use super::*;
+
+    #[test]
+    fn normalize_market_quantity_rejects_below_btc_step_size() {
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let quantity = Quantity::new(dec!(0.0004211005040573033565921178)).unwrap();
+
+        let err = normalize_market_quantity(&symbol, quantity).unwrap_err();
+
+        match err {
+            ExecError::OrderRejected(message) => {
+                assert!(message.contains("BTCUSDT"), "message: {message}");
+                assert!(message.contains("step size 0.001"), "message: {message}");
+                assert!(message.contains("minimum quantity 0.001"), "message: {message}");
+                assert!(message.contains("will not round up"), "message: {message}");
+            },
+            other => panic!("expected OrderRejected, got {other:?}"),
+        }
     }
 }

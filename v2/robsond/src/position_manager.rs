@@ -47,6 +47,7 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
+    binance_exchange::normalize_market_quantity,
     circuit_breaker::CircuitBreaker,
     detector::DetectorTask,
     error::{DaemonError, DaemonResult},
@@ -1028,6 +1029,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         })
     }
 
+    fn validate_entry_quantity_for_exchange(
+        symbol: &Symbol,
+        proposed: &ProposedTrade,
+    ) -> Result<(), ExecError> {
+        let quantity = Quantity::new(proposed.quantity)
+            .map_err(|e| ExecError::Config(format!("Invalid proposed quantity: {}", e)))?;
+        normalize_market_quantity(symbol, quantity).map(|_| ())
+    }
+
     /// Start background task to listen for detector signals.
     ///
     /// This task subscribes to the EventBus and processes DetectorSignal events
@@ -1746,6 +1756,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             },
         };
 
+        if let Err(error) = Self::validate_entry_quantity_for_exchange(&signal.symbol, &proposed) {
+            let error_message = error.to_string();
+            query.fail(error_message.clone(), "processing".to_string());
+            self.record_query_failure(&query).await?;
+            self.rearm_detector_after_governed_block(
+                position_id,
+                &position,
+                "entry quantity rejected before exchange submission",
+            )
+            .await;
+            return Err(DaemonError::Exec(error));
+        }
+
         let governed: GovernedAction = match self
             .query_engine
             .check_risk(&mut query, &proposed, &risk_context, decision.actions)
@@ -1931,6 +1954,22 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
 
         let risk_context = self.build_risk_context().await?;
+        if let Err(error) =
+            Self::validate_entry_quantity_for_exchange(&current_position.symbol, &record.proposed)
+        {
+            let error_message = error.to_string();
+            record
+                .query
+                .fail(error_message.clone(), "awaiting_approval".to_string());
+            self.record_query_failure(&record.query).await?;
+            self.rearm_detector_after_governed_block(
+                current_position.id,
+                &current_position,
+                "entry quantity rejected before exchange submission",
+            )
+            .await;
+            return Err(DaemonError::Exec(error));
+        }
         match self
             .query_engine
             .revalidate_risk(&mut record.query, &record.proposed, &risk_context)
@@ -3212,6 +3251,76 @@ mod tests {
         assert!(
             !detectors.contains_key(&position.id),
             "Detector must not be re-armed after internal margin rejection"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_handle_signal_rejects_quantity_below_exchange_step_size_and_rearms_detector() {
+        let manager = Arc::new({
+            let exchange = Arc::new(StubExchange::new(dec!(76200)));
+            let journal = Arc::new(IntentJournal::new());
+            let store = Arc::new(MemoryStore::new());
+            let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+            let event_bus = Arc::new(EventBus::new(100));
+            let risk_config = RiskConfig::new(dec!(100)).unwrap();
+            let engine = Engine::new(risk_config);
+
+            PositionManager::with_approval_policy(
+                engine,
+                executor,
+                store,
+                event_bus,
+                Arc::new(TracingQueryRecorder),
+                ApprovalPolicy::new(Decimal::from(100u32), 300),
+                TradingPolicy::default(),
+            )
+            .with_ohlcv_port(Arc::new(StubOhlcv::new(create_test_candles())))
+        });
+
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(98)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let position = manager
+            .arm_position(
+                symbol.clone(),
+                Side::Long,
+                RiskConfig::new(dec!(100)).unwrap(),
+                Some(tech_stop),
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol,
+            side: Side::Long,
+            entry_price: Price::new(dec!(76200)).unwrap(),
+            stop_loss: Price::new(dec!(73825.27)).unwrap(),
+            technical_stop_analysis: None,
+            timestamp: chrono::Utc::now(),
+        };
+
+        let result = manager.handle_signal(signal).await;
+        assert!(matches!(
+            result,
+            Err(DaemonError::Exec(robson_exec::ExecError::OrderRejected(message)))
+            if message.contains("step size 0.001") && message.contains("minimum quantity 0.001")
+        ));
+
+        let updated = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(
+            matches!(updated.state, PositionState::Armed),
+            "Expected Armed after quantity rejection, got {:?}",
+            updated.state
+        );
+
+        let detectors = manager.detectors.read().await;
+        assert!(
+            detectors.contains_key(&position.id),
+            "Detector must be re-armed after pre-exchange quantity rejection"
         );
     }
 
