@@ -1,0 +1,46 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# --- Rust: cargo fmt ---
+if command -v cargo >/dev/null 2>&1; then
+  if ! cargo fmt --all -- --check; then
+    echo "ERROR: cargo fmt found changes. Run 'cargo fmt' and retry." >&2
+    exit 1
+  fi
+fi
+
+# --- Rust: cargo clippy ---
+if command -v cargo >/dev/null 2>&1; then
+  if ! cargo clippy --workspace --all-targets -- -D warnings; then
+    echo "ERROR: cargo clippy failed. Fix warnings and retry." >&2
+    exit 1
+  fi
+fi
+
+# --- General checks ---
+STAGED=$(git diff --cached --name-only --diff-filter=ACM)
+
+# Detect private keys
+echo "$STAGED" | grep -qS '' && while IFS= read -r f; do
+  if grep -qE '-----BEGIN (RSA |EC |DSA )?PRIVATE KEY-----' "$f" 2>/dev/null; then
+    echo "ERROR: Private key detected in $f" >&2
+    exit 1
+  fi
+done <<< "$STAGED" || true
+
+# Merge conflict markers
+echo "$STAGED" | grep -qS '' && while IFS= read -r f; do
+  if grep -qE '^(<<<<<<<|=======|>>>>>>>)' "$f" 2>/dev/null; then
+    echo "ERROR: Merge conflict markers in $f" >&2
+    exit 1
+  fi
+done <<< "$STAGED" || true
+
+# Large files (>500KB)
+echo "$STAGED" | grep -qS '' && while IFS= read -r f; do
+  size=$(wc -c < "$f" 2>/dev/null || echo 0)
+  if [ "$size" -gt 512000 ]; then
+    echo "ERROR: $f is ${size} bytes (max 500KB)" >&2
+    exit 1
+  fi
+done <<< "$STAGED" || true
