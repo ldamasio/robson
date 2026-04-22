@@ -1958,9 +1958,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             Self::validate_entry_quantity_for_exchange(&current_position.symbol, &record.proposed)
         {
             let error_message = error.to_string();
-            record
-                .query
-                .fail(error_message.clone(), "awaiting_approval".to_string());
+            record.query.fail(error_message.clone(), "awaiting_approval".to_string());
             self.record_query_failure(&record.query).await?;
             self.rearm_detector_after_governed_block(
                 current_position.id,
@@ -2839,8 +2837,8 @@ mod tests {
     #[tokio::test]
     async fn test_cancel_or_close_position_closes_active_position() {
         let manager = create_test_manager().await;
-        let position = save_active_position(&manager, "BTCUSDT", Side::Long, dec!(95000), dec!(0.01))
-            .await;
+        let position =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(95000), dec!(0.01)).await;
 
         manager.cancel_or_close_position(position.id).await.unwrap();
 

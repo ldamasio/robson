@@ -408,11 +408,7 @@ async fn test_signal_rejects_quantity_below_exchange_minimum() {
     assert_eq!(resp.status(), 400);
     let body: api::ErrorResponse = resp.json().await.unwrap();
     assert!(body.error.contains("step size 0.001"), "error: {}", body.error);
-    assert!(
-        body.error.contains("minimum quantity 0.001"),
-        "error: {}",
-        body.error
-    );
+    assert!(body.error.contains("minimum quantity 0.001"), "error: {}", body.error);
 }
 
 #[tokio::test]

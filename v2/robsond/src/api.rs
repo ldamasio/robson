@@ -653,10 +653,7 @@ where
     S: Store + 'static,
 {
     let manager = state.position_manager.write().await;
-    manager
-        .cancel_or_close_position(id)
-        .await
-        .map_err(|e| to_error_response(e))?;
+    manager.cancel_or_close_position(id).await.map_err(|e| to_error_response(e))?;
 
     Ok(StatusCode::NO_CONTENT)
 }
