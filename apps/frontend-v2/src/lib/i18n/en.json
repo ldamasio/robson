@@ -1,0 +1,49 @@
+{
+  "nav": {
+    "dashboard": "Dashboard",
+    "history": "History",
+    "operation": "Operation",
+    "settings": "Settings",
+    "killSwitch": "Kill Switch"
+  },
+  "auth": {
+    "login": "Login with GitHub",
+    "logout": "Logout"
+  },
+  "dashboard": {
+    "slotsTitle": "Slots",
+    "activeOperations": "Active operations",
+    "todayEvents": "Today's events",
+    "inheritedFrom": "INHERITED FROM",
+    "carriedInto": "CARRIED INTO",
+    "live": "LIVE",
+    "dryRun": "DRY-RUN",
+    "free": "FREE"
+  },
+  "operation": {
+    "position": "Position",
+    "pnl": "PnL",
+    "liquidationDistance": "Liquidation distance",
+    "status": "Status",
+    "opened": "Opened",
+    "closed": "Closed",
+    "eventStream": "Event stream"
+  },
+  "killSwitch": {
+    "disableTitle": "Disable Robson",
+    "enableTitle": "Enable Robson",
+    "currentState": "Current state",
+    "openPositionsWarning": "The following open positions will remain open:",
+    "preventNewEntriesNote": "This action prevents Robson from opening new positions. Existing positions continue to be managed until they close naturally.",
+    "cooldownNote": "Re-enable will be blocked for 5 minutes after confirmation (backend-enforced cooldown).",
+    "typeToConfirm": "To confirm, type \"DISABLE\" below:",
+    "typeToEnable": "To confirm, type \"ENABLE\" below:",
+    "disableKeyword": "DISABLE",
+    "enableKeyword": "ENABLE",
+    "cancel": "Cancel",
+    "disable": "Disable",
+    "enable": "Enable",
+    "cooldownActive": "Cooldown active",
+    "reenableAvailableIn": "Re-enable available in"
+  }
+}

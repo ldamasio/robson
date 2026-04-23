@@ -1,0 +1,49 @@
+{
+  "nav": {
+    "dashboard": "Painel",
+    "history": "Histórico",
+    "operation": "Operação",
+    "settings": "Configurações",
+    "killSwitch": "Kill Switch"
+  },
+  "auth": {
+    "login": "Entrar com GitHub",
+    "logout": "Sair"
+  },
+  "dashboard": {
+    "slotsTitle": "Slots",
+    "activeOperations": "Operações ativas",
+    "todayEvents": "Eventos de hoje",
+    "inheritedFrom": "HERDADA DE",
+    "carriedInto": "TRANSPORTADA PARA",
+    "live": "AO VIVO",
+    "dryRun": "DRY-RUN",
+    "free": "LIVRE"
+  },
+  "operation": {
+    "position": "Posição",
+    "pnl": "PnL",
+    "liquidationDistance": "Distância de liquidação",
+    "status": "Status",
+    "opened": "Aberta",
+    "closed": "Fechada",
+    "eventStream": "Fluxo de eventos"
+  },
+  "killSwitch": {
+    "disableTitle": "Desligar Robson",
+    "enableTitle": "Religar Robson",
+    "currentState": "Estado atual",
+    "openPositionsWarning": "As seguintes posições abertas permanecerão abertas:",
+    "preventNewEntriesNote": "Esta ação impede Robson de abrir novas posições. As posições existentes continuam sendo gerenciadas até fecharem naturalmente.",
+    "cooldownNote": "A reativação será bloqueada por 5 minutos após a confirmação (cooldown imposto pelo backend).",
+    "typeToConfirm": "Para confirmar, digite \"DESLIGAR\" abaixo:",
+    "typeToEnable": "Para confirmar, digite \"RELIGAR\" abaixo:",
+    "disableKeyword": "DESLIGAR",
+    "enableKeyword": "RELIGAR",
+    "cancel": "Cancelar",
+    "disable": "Desligar",
+    "enable": "Religar",
+    "cooldownActive": "Cooldown ativo",
+    "reenableAvailableIn": "Reativação disponível em"
+  }
+}
