@@ -1,20 +1,97 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import Card from '$design/components/Card.svelte';
   import Stack from '$design/components/Stack.svelte';
   import Row from '$design/components/Row.svelte';
   import Grid from '$design/components/Grid.svelte';
   import TickRuler from '$design/components/TickRuler.svelte';
+  import { robsonApi, connectEventStream, type Position, type SseEvent } from '$api/robson';
+  import { activePositions, upsertPosition, removePosition } from '$stores/operations';
+  import { haltStatus } from '$stores/slots';
+  import { recentEvents, pushEvent } from '$stores/events';
+  import { deriveSlots, SLOT_COUNT } from '$lib/config/slots';
+  import {
+    positionLabel,
+    positionStateLabel,
+    haltStateLabel,
+    eventTypeLabel,
+    isPositionActive
+  } from '$lib/presentation/labels';
 
-  // FE-P1 stub — real data loading via API client in EP-004.
-  const SLOT_COUNT = 6;
-  const slots: Array<{ state: 'free' | 'open'; symbol?: string; pnl?: number }> = [
-    { state: 'open', symbol: 'BTCUSDT', pnl: 1.24 },
-    { state: 'open', symbol: 'ETHUSDT', pnl: -0.42 },
-    { state: 'open', symbol: 'SOLUSDT', pnl: 0.18 },
-    { state: 'open', symbol: 'AVAXUSDT', pnl: 2.01 },
-    { state: 'free' },
-    { state: 'free' }
-  ];
+  let error = $state<string | null>(null);
+  let connected = $state(false);
+  let closeSse: (() => void) | null = $state(null);
+
+  let positions = $derived($activePositions);
+  let slots = $derived(deriveSlots(positions));
+  let occupied = $derived(slots.filter((s) => s.occupied).length);
+  let free = $derived(SLOT_COUNT - occupied);
+  let activeOps = $derived(positions.filter((p) => isPositionActive(p.state)));
+  let todayEvents = $derived(
+    $recentEvents.filter((e) => {
+      const d = new Date(e.occurred_at);
+      const now = new Date();
+      return d.toDateString() === now.toDateString();
+    })
+  );
+  let haltState = $derived($haltStatus?.state ?? 'active');
+
+  function pnlFor(p: Position): number | null {
+    if (typeof p.state === 'object' && 'Closed' in p.state) {
+      return Number(p.state.Closed.realized_pnl);
+    }
+    return p.realized_pnl != null ? Number(p.realized_pnl) : null;
+  }
+
+  function timeStr(iso: string): string {
+    const d = new Date(iso);
+    return d.toTimeString().slice(0, 12);
+  }
+
+  function monthLabel(): string {
+    return new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' }).toUpperCase();
+  }
+
+  async function load() {
+    error = null;
+    try {
+      const [status, halt] = await Promise.all([
+        robsonApi.getStatus(),
+        robsonApi.getHaltStatus()
+      ]);
+      activePositions.set(status.positions);
+      haltStatus.set(halt);
+      connected = true;
+    } catch (e) {
+      error = e instanceof Error ? e.message : 'Failed to connect to Robson backend';
+      connected = false;
+    }
+  }
+
+  function startSse() {
+    closeSse = connectEventStream(
+      (event: SseEvent) => {
+        pushEvent(event);
+        const payload = event.payload as Record<string, unknown>;
+        const posId = payload.position_id as string | undefined;
+        if (posId && event.event_type === 'position.changed') {
+          // Re-fetch status on position state changes
+          void robsonApi.getStatus().then((s) => activePositions.set(s.positions)).catch(() => {});
+        }
+      },
+      () => {
+        connected = false;
+      }
+    );
+  }
+
+  onMount(() => {
+    void load();
+    startSse();
+    return () => {
+      closeSse?.();
+    };
+  });
 </script>
 
 <svelte:head>
@@ -29,65 +106,102 @@
         <img src="/brand/wordmark-robson.svg" alt="RBX Robson" height="22" />
       </Row>
       <div class="status-strip">
-        <span class="dot live"></span> LIVE · SLOT 4/6 · COOLDOWN 00:00
+        {#if error}
+          <span class="dot err"></span> OFFLINE · {error}
+        {:else if !connected}
+          <span class="dot warn"></span> CONNECTING...
+        {:else}
+          <span class="dot live"></span>
+          {haltStateLabel(haltState)} · SLOT {occupied}/{SLOT_COUNT}
+        {/if}
       </div>
     </Row>
   </header>
 
-  <section>
-    <Stack gap={4}>
-      <div class="eyebrow">SLOTS · APRIL 2026</div>
-      <div class="slots-grid">
-        {#each slots as slot, i}
-          <div
-            class="slot"
-            class:occupied={slot.state === 'open'}
-            class:positive={slot.pnl !== undefined && slot.pnl > 0}
-            class:negative={slot.pnl !== undefined && slot.pnl < 0}
-            title={slot.symbol ?? 'Free'}
-          >
-            {slot.state === 'open' ? '●' : '○'}
-          </div>
-        {/each}
-      </div>
-      <div class="eyebrow dim">{SLOT_COUNT - slots.filter((s) => s.state === 'free').length} OCCUPIED · {slots.filter((s) => s.state === 'free').length} FREE</div>
-    </Stack>
-  </section>
+  {#if error}
+    <Card padding={5}>
+      <Stack gap={3}>
+        <div class="eyebrow">CONNECTION ERROR</div>
+        <p class="err-text">{error}</p>
+        <button class="btn-retry" onclick={() => void load()}>Retry</button>
+      </Stack>
+    </Card>
+  {:else}
+    <section>
+      <Stack gap={4}>
+        <div class="eyebrow">SLOTS · {monthLabel()}</div>
+        <div class="slots-grid">
+          {#each slots as slot}
+            <a
+              href={slot.occupied ? `/operation/${slot.positionId}` : ''}
+              class="slot"
+              class:occupied={slot.occupied}
+            >
+              {slot.occupied ? '●' : '○'}
+            </a>
+          {/each}
+        </div>
+        <div class="eyebrow dim">{occupied} OCCUPIED · {free} FREE</div>
+      </Stack>
+    </section>
 
-  <section>
-    <Stack gap={4}>
-      <div class="eyebrow">ACTIVE OPERATIONS</div>
-      <Grid cols={2} gap={4}>
-        {#each slots.filter((s) => s.state === 'open') as op}
+    <section>
+      <Stack gap={4}>
+        <div class="eyebrow">ACTIVE OPERATIONS</div>
+        {#if activeOps.length === 0}
           <Card>
-            <Stack gap={2}>
-              <div class="eyebrow">{op.symbol}</div>
-              <Row justify="between">
-                <span class="meta">PnL</span>
-                <span class="mono" class:ok={(op.pnl ?? 0) > 0} class:err={(op.pnl ?? 0) < 0}>
-                  {(op.pnl ?? 0) > 0 ? '+' : ''}{op.pnl?.toFixed(2)}%
-                </span>
-              </Row>
-            </Stack>
+            <p class="empty">No active positions.</p>
           </Card>
-        {/each}
-      </Grid>
-    </Stack>
-  </section>
+        {:else}
+          <Grid cols={2} gap={4}>
+            {#each activeOps as op}
+              <a href="/operation/{op.id}" class="op-card-link">
+                <Card>
+                  <Stack gap={2}>
+                    <div class="eyebrow">{positionLabel(op)}</div>
+                    <Row justify="between">
+                      <span class="meta">{positionStateLabel(op.state)}</span>
+                      {#if pnlFor(op) !== null}
+                        <span
+                          class="mono"
+                          class:ok={(pnlFor(op) ?? 0) > 0}
+                          class:err={(pnlFor(op) ?? 0) < 0}
+                        >
+                          {(pnlFor(op) ?? 0) > 0 ? '+' : ''}{pnlFor(op)?.toFixed(2)}%
+                        </span>
+                      {/if}
+                    </Row>
+                  </Stack>
+                </Card>
+              </a>
+            {/each}
+          </Grid>
+        {/if}
+      </Stack>
+    </section>
 
-  <section>
-    <Stack gap={4}>
-      <div class="eyebrow">TODAY'S EVENTS</div>
-      <Card>
-        <pre class="event-stream">· 14:22:18.441  PLAN_SUBMITTED      BTCUSDT
-· 14:22:18.891  PLAN_VALIDATED      liquidation distance 12.40%
-· 14:22:19.013  EXECUTE_REQUESTED
-· 14:22:21.664  ORDER_FILLED        64,235.50 · fee 0.06 USDT
-· 14:22:21.664  POSITION_OPEN       +0.00482 BTC</pre>
-        <TickRuler ticks={12} />
-      </Card>
-    </Stack>
-  </section>
+    <section>
+      <Stack gap={4}>
+        <div class="eyebrow">TODAY'S EVENTS</div>
+        <Card>
+          {#if todayEvents.length === 0}
+            <p class="empty">No events today.</p>
+          {:else}
+            <div class="event-stream">
+              {#each todayEvents as e (e.event_id)}
+                <div class="event-line">
+                  <span class="tick">·</span>
+                  <span class="ts">{timeStr(e.occurred_at)}</span>
+                  <span class="type">{eventTypeLabel(e)}</span>
+                </div>
+              {/each}
+            </div>
+          {/if}
+          <TickRuler ticks={12} />
+        </Card>
+      </Stack>
+    </section>
+  {/if}
 </div>
 
 <style>
@@ -117,9 +231,16 @@
     width: 6px;
     height: 6px;
     border-radius: 50%;
+    display: inline-block;
   }
   .dot.live {
     background: var(--ok);
+  }
+  .dot.err {
+    background: var(--err);
+  }
+  .dot.warn {
+    background: var(--warn, #f59e0b);
   }
   .eyebrow {
     font-family: var(--font-mono);
@@ -147,18 +268,12 @@
     border-radius: var(--radius-sm);
     color: var(--fg-3);
     background: var(--bg-1);
+    text-decoration: none;
+    border-bottom: 1px solid var(--border);
   }
   .slot.occupied {
     color: var(--cyan-brand);
     border-color: var(--cyan-dim);
-  }
-  .slot.occupied.positive {
-    color: var(--ok);
-    border-color: var(--ok);
-  }
-  .slot.occupied.negative {
-    color: var(--err);
-    border-color: var(--err);
   }
   .meta {
     font-family: var(--font-mono);
@@ -181,8 +296,58 @@
     font-family: var(--font-mono);
     font-size: var(--text-sm);
     color: var(--fg-1);
-    white-space: pre;
-    margin: 0;
-    line-height: var(--lead-snug);
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-1);
+    margin-bottom: var(--s-3);
+  }
+  .event-line {
+    display: flex;
+    gap: var(--s-3);
+    align-items: baseline;
+  }
+  .tick {
+    color: var(--cyan-brand);
+  }
+  .ts {
+    color: var(--fg-2);
+    font-variant-numeric: tabular-nums;
+    min-width: 10ch;
+  }
+  .type {
+    color: var(--cyan-brand);
+    letter-spacing: var(--track-wide);
+    text-transform: uppercase;
+  }
+  .empty {
+    color: var(--fg-3);
+    font-size: var(--text-sm);
+    font-family: var(--font-mono);
+  }
+  .op-card-link {
+    text-decoration: none;
+    border-bottom: none;
+  }
+  .op-card-link:hover {
+    border-bottom: none;
+  }
+  .err-text {
+    color: var(--err, #ff4444);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    word-break: break-word;
+  }
+  .btn-retry {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    padding: var(--s-2) var(--s-4);
+    border: 1px solid var(--cyan-dim);
+    background: transparent;
+    color: var(--cyan-brand);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+  }
+  .btn-retry:hover {
+    background: var(--cyan-subtle);
   }
 </style>

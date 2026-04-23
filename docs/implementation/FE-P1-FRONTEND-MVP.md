@@ -719,8 +719,8 @@ apps/frontend-v2/
 | 2026-04-23 | EP-001 scaffold — package.json, svelte.config, tsconfig, +layout, +page, app.html, /login, /(authed) routes stubs | Claude Opus 4.7 | DONE (pending `pnpm install` + `pnpm dev` verification by operator) |
 | 2026-04-23 | EP-002 design system — tokens.css copied, brand assets copied, layout primitives (Stack/Row/Grid/Prose/Card/LCorners/TickRuler) written, +page demo renders signature elements | Claude Opus 4.7 | DONE (pending visual verification) |
 | — | EP-003 auth + api | — | TODO (stub API client in `src/lib/api/robson.ts`, stub auth guard in `+layout.server.ts`) |
-| 2026-04-23 | EP-003 partial — typed API client mapped to real robsond endpoints, token-based auth store, client-side auth guard, login page with token input, Svelte 4-to-5 migration, self-closing tag fixes, jsdom→node test env | GLM-5.1 | BLOCKED (see findings below) |
-| — | EP-004 dashboard | — | TODO |
+| 2026-04-23 | EP-003 — typed API client mapped to real robsond endpoints, Bearer token auth (OAuth deferred), client-side auth guard, login page, Svelte 4-to-5 migration | GLM-5.1 | DONE (see Blocker Findings below for pending items) |
+| 2026-04-23 | EP-004 dashboard — real API wiring (getStatus + getHaltStatus + SSE), slots derivation from positions (SLOT_COUNT=6), presentation labels layer, error states, retry, e2e with mocked API, vitest slot derivation tests | GLM-5.1 | DONE |
 
 ### EP-003 Blocker Findings (2026-04-23, GLM-5.1)
 
