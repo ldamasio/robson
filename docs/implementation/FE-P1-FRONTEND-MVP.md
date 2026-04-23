@@ -860,7 +860,7 @@ apps/frontend-v2/
 4. Decision needed: `adapter-static` + OAuth requires server-side component — either switch to `adapter-node`, add edge function, or accept token-based auth for MVP
 
 **Decision needed before EP-004**: Backend response shapes for `/status` are known and typed. Dashboard can proceed using `robsonApi.getStatus()` for positions. "Slots" concept does not exist in backend — dashboard EP-004 must adapt to what `/status` returns.
-| — | EP-005 operation detail | — | TODO |
+| — | EP-005 operation detail | GLM-5.1 | DONE |
 | — | EP-006 kill-switch | — | TODO |
 | — | EP-007 i18n | — | TODO |
 | — | EP-008 deploy | — | TODO |

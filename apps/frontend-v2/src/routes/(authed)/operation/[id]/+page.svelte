@@ -1,61 +1,121 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import Card from '$design/components/Card.svelte';
   import Stack from '$design/components/Stack.svelte';
+  import LCorners from '$design/components/LCorners.svelte';
   import { page } from '$app/stores';
+  import { robsonApi, connectEventStream, type Position, type SseEvent } from '$api/robson';
+  import { formatTimeUtc } from '$lib/utils/time';
+  import {
+    positionLabel,
+    positionSummaryLines,
+    positionMetaLine,
+    eventTypeLabel,
+    eventSummaryText
+  } from '$lib/presentation/labels';
 
-  let operationId = $derived($page.params.id);
+  let operationId = $derived($page.params.id ?? '');
+  let position = $state<Position | null>(null);
+  let error = $state<string | null>(null);
+  type TaggedEvent = SseEvent & { _seq: number };
+  let events = $state<TaggedEvent[]>([]);
+  let seq = $state(0);
+  let closeSse: (() => void) | null = null;
 
-  // FE-P1 stub — real fetch via API client in EP-005.
-  const events = [
-    { seq: 1, ts: '14:22:18.441', type: 'PLAN_SUBMITTED', summary: 'entry 64,230.00 · stop 62,100.00 · size 0.00482' },
-    { seq: 2, ts: '14:22:18.891', type: 'PLAN_VALIDATED', summary: 'liquidation distance 12.40%' },
-    { seq: 3, ts: '14:22:19.013', type: 'EXECUTE_REQUESTED', summary: '' },
-    { seq: 4, ts: '14:22:21.664', type: 'ORDER_FILLED', summary: '64,235.50 · fee 0.06 USDT' },
-    { seq: 5, ts: '14:22:21.664', type: 'POSITION_OPEN', summary: '+0.00482 BTC' },
-    { seq: 6, ts: '18:47:33.201', type: 'STOP_UPDATED', summary: '63,100.00 (technical)' },
-    { seq: 7, ts: '19:02:14.089', type: 'STOP_HIT', summary: '63,098.20' },
-    { seq: 8, ts: '19:02:14.089', type: 'POSITION_CLOSED', summary: 'reason STOP_HIT · pnl -1.77%' }
-  ];
+  let summaryLines = $derived(position ? positionSummaryLines(position) : []);
+  let metaLine = $derived(position ? positionMetaLine(position) : '');
+
+  async function loadPosition() {
+    if (!operationId) return;
+    error = null;
+    try {
+      position = await robsonApi.getPosition(operationId);
+    } catch (e) {
+      error = e instanceof Error ? e.message : 'Failed to load position';
+    }
+  }
+
+  function startSse() {
+    stopSse();
+    closeSse = connectEventStream((event: SseEvent) => {
+      const payload = event.payload as Record<string, unknown>;
+      if (payload.position_id === operationId) {
+        seq += 1;
+        events = [...events, { ...event, _seq: seq }];
+      }
+    });
+  }
+
+  function stopSse() {
+    if (closeSse) {
+      closeSse();
+      closeSse = null;
+    }
+  }
+
+  onMount(() => {
+    void loadPosition();
+    startSse();
+    return () => {
+      stopSse();
+    };
+  });
 </script>
 
 <svelte:head>
-  <title>Operation {operationId} — RBX Robson</title>
+  <title>{position ? positionLabel(position) : operationId} — RBX Robson</title>
 </svelte:head>
 
 <div class="op-page">
-  <header class="header">
-    <div class="eyebrow">RBX ROBSON · OPERATION {operationId}</div>
-    <h1>BTCUSDT · LONG</h1>
-    <div class="meta">Opened 2026-04-12 14:22:18 UTC</div>
-  </header>
+  {#if error}
+    <Card padding={5}>
+      <Stack gap={3}>
+        <div class="eyebrow">LOAD ERROR</div>
+        <p class="err-text">{error}</p>
+        <button class="btn-retry" onclick={() => { void loadPosition(); startSse(); }}>Retry</button>
+      </Stack>
+    </Card>
+  {:else if position}
+    <header class="header">
+      <div class="eyebrow">RBX ROBSON · OPERATION {operationId.slice(0, 8)}</div>
+      <h1>{positionLabel(position)}</h1>
+      <div class="meta">{metaLine}</div>
+    </header>
 
-  <Card>
-    <Stack gap={3}>
-      <div class="eyebrow">SUMMARY</div>
-      <pre class="summary">PLAN      entry 64,230.00 · stop 62,100.00 · size 0.00482
-VALIDATE  liquidation distance 12.40%
-EXECUTE   requested
-FILLED    64,235.50 · fee 0.06 USDT
-OPEN      position +0.00482 BTC
-STOP_UPD  63,100.00 (technical)
-STOP_HIT  63,098.20
-CLOSE     reason STOP_HIT · pnl -1.77%</pre>
-    </Stack>
-  </Card>
+    <LCorners size={14}>
+      <Card>
+        <Stack gap={3}>
+          <div class="eyebrow">SUMMARY</div>
+          <pre class="summary">{summaryLines.join('\n')}</pre>
+        </Stack>
+      </Card>
+    </LCorners>
 
-  <section class="event-stream-section">
-    <div class="eyebrow">EVENT STREAM</div>
-    <div class="events">
-      {#each events as e (e.seq)}
-        <div class="event" id="event-{e.seq}">
-          <span class="tick">·</span>
-          <span class="ts">{e.ts}</span>
-          <span class="type">{e.type}</span>
-          <span class="summary-text">{e.summary}</span>
+    <section class="event-stream-section">
+      <div class="eyebrow">EVENT STREAM</div>
+      <div class="limitation">
+        Events from this session only. Full history in FE-P2.
+      </div>
+      {#if events.length === 0}
+        <p class="empty">No events received yet for this position.</p>
+      {:else}
+        <div class="events">
+          {#each events as e (e._seq)}
+            <div class="event" id="event-{e._seq}">
+              <span class="tick">·</span>
+              <span class="ts">{formatTimeUtc(e.occurred_at)}</span>
+              <span class="type">{eventTypeLabel(e)}</span>
+              <span class="summary-text">{eventSummaryText(e)}</span>
+            </div>
+          {/each}
         </div>
-      {/each}
+      {/if}
+    </section>
+  {:else}
+    <div class="loading">
+      <div class="eyebrow">LOADING...</div>
     </div>
-  </section>
+  {/if}
 </div>
 
 <style>
@@ -95,6 +155,12 @@ CLOSE     reason STOP_HIT · pnl -1.77%</pre>
     flex-direction: column;
     gap: var(--s-3);
   }
+  .limitation {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--fg-3);
+    letter-spacing: var(--track-wide);
+  }
   .events {
     font-family: var(--font-mono);
     font-size: var(--text-sm);
@@ -106,7 +172,7 @@ CLOSE     reason STOP_HIT · pnl -1.77%</pre>
   }
   .event {
     display: grid;
-    grid-template-columns: 16px 140px 200px 1fr;
+    grid-template-columns: 16px 130px 220px 1fr;
     gap: var(--s-3);
     align-items: baseline;
     padding: var(--s-1) 0;
@@ -129,5 +195,34 @@ CLOSE     reason STOP_HIT · pnl -1.77%</pre>
   }
   .summary-text {
     color: var(--fg-1);
+  }
+  .empty {
+    color: var(--fg-3);
+    font-size: var(--text-sm);
+    font-family: var(--font-mono);
+  }
+  .loading {
+    padding: var(--s-7) 0;
+    display: grid;
+    place-items: center;
+  }
+  .err-text {
+    color: var(--err, #ff4444);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    word-break: break-word;
+  }
+  .btn-retry {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    padding: var(--s-2) var(--s-4);
+    border: 1px solid var(--cyan-dim);
+    background: transparent;
+    color: var(--cyan-brand);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+  }
+  .btn-retry:hover {
+    background: var(--cyan-subtle);
   }
 </style>
