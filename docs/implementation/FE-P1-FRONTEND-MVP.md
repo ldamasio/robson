@@ -310,159 +310,235 @@ rm -rf apps/frontend-v2/static/brand
 
 ---
 
-### EP-003: GitHub OAuth + Robson API client
+### EP-003: Bearer-token auth + Robson API client — DONE (2026-04-23)
 
-**Objective**: Integrate Auth.js for GitHub OAuth, implement typed API client, create `/login` and protected routes, persist session via HTTP-only cookie.
+**Status**: DONE by GLM-5.1 on branch `fe-p1/ep-003-auth`, commit `edc19919`.
 
-**Preconditions**:
+**Amended objective** (final, supersedes original GitHub OAuth plan):
+Implement Bearer-token auth for MVP (per ADR-0025 Amendment 1), typed API client mapped to the real `robsond` REST surface, token store with sessionStorage persistence, client-side auth guard, Svelte 5 migration.
+
+**Rationale for amendment**: `adapter-static` has no server runtime, so OAuth callback cannot be handled without an edge function. Bearer token is the simplest MVP path for a single operator and preserves S3 static hosting. See ADR-0025 A1.2.
+
+**Shipped deliverables**:
+- `src/lib/api/robson.ts` — typed client mapped to 7 real endpoints (`/health`, `/status`, `/positions/{id}`, `/positions` POST, `/queries/{id}/approve`, `/monthly-halt` GET/POST, `/panic`, `/safety/status`, SSE `/events`).
+- `src/lib/stores/auth.ts` — `authToken` store with `sessionStorage` persistence, `initAuth`, `setToken`, `clearAuth`.
+- `src/routes/login/+page.svelte` — token input, validates via `GET /health`, redirects to `/dashboard`.
+- `src/routes/(authed)/+layout.server.ts` — static-friendly (no server redirect). Auth guard is client-side via `initAuth()` in root layout.
+- Svelte 5 runes throughout: `$props`, `$state`, `$derived`, `Snippet` for `children`.
+
+**Caveats logged**:
+- No OAuth. No GitHub OAuth app. ADR-0025 A1.2 is authoritative.
+- Token stored in `sessionStorage` key `robson_api_token`. Never logged, never committed.
+- Bearer attached to REST via `Authorization` header; to SSE via `?token=` query param (EventSource limitation).
+
+**Verification outcome**:
+- `pnpm run check`: 0 errors
+- `pnpm run build`: success
+- `pnpm run test`: 1/1 passing
+- Manual: `/login` accepts token → `/dashboard` renders
+
+**Rollback** (if needed):
 ```bash
-# OAuth app created on GitHub
-test -n "$GITHUB_CLIENT_ID"
-test -n "$GITHUB_CLIENT_SECRET"
-
-# Robson backend reachable
-curl -s https://api.robson.internal/health | jq '.status' | grep -q '"ok"' || echo "adjust endpoint"
-```
-
-**Inputs**:
-- `GITHUB_CLIENT_ID`: OAuth app client ID
-- `GITHUB_CLIENT_SECRET`: OAuth app client secret (never log, never commit)
-- `ROBSON_API_BASE`: Robson backend URL (e.g. `https://api.robson.internal`)
-- `SESSION_SECRET`: random 32-byte hex for signing session cookie
-
-**Steps**:
-```bash
-cd apps/frontend-v2
-
-# Install Auth.js
-pnpm add @auth/sveltekit @auth/core
-
-# Create src/hooks.server.ts with SvelteKitAuth({ providers: [GitHub(...)] })
-# Create src/lib/api/robson.ts (typed fetch wrapper with cookie auth)
-# Create src/lib/stores/auth.ts (writable session store)
-# Create src/routes/login/+page.svelte with "Login with GitHub" button
-# Create src/routes/+layout.server.ts with auth guard (redirect to /login if no session)
-
-# Local .env.local
-cat > .env.local <<EOF
-AUTH_SECRET=$(openssl rand -hex 32)
-AUTH_GITHUB_ID=$GITHUB_CLIENT_ID
-AUTH_GITHUB_SECRET=$GITHUB_CLIENT_SECRET
-PUBLIC_ROBSON_API_BASE=http://localhost:8080
-EOF
-
-pnpm run dev
-# Test: /login → GitHub consent → redirect back authenticated → access /dashboard
-```
-
-**Expected Outcome**:
-```bash
-# PASS: login flow completes
-# PASS: authenticated session cookie set (HTTP-only, Secure, SameSite=Strict)
-# PASS: protected routes redirect to /login when unauthenticated
-# PASS: API client attaches session automatically
-```
-
-**Failure Detection**:
-- FAIL if OAuth callback mismatch (check GitHub app callback URL matches `http://localhost:5173/auth/callback/github`)
-- FAIL if session cookie not persisted (check SameSite, Secure in dev vs prod)
-
-**Rollback**:
-```bash
-rm apps/frontend-v2/src/hooks.server.ts
-rm -rf apps/frontend-v2/src/lib/api
-rm -rf apps/frontend-v2/src/lib/stores
-rm apps/frontend-v2/.env.local
+git checkout main -- apps/frontend-v2
 ```
 
 ---
 
-### EP-004: Dashboard current month
+### EP-004: Dashboard current month (adapted to backend reality)
 
-**Objective**: Implement `/dashboard` with compass-mark header, status strip, slots visualizer (discrete cells), active operations panel, today's events mini stream.
+**Objective**: Implement `/dashboard` wired to the real Robson REST + SSE surface. Compass-mark header, status strip from `GET /status` + `GET /monthly-halt`, slots visualizer (discrete cells) derived client-side from positions, active positions panel, today's events mini stream from SSE `/events`.
 
-**Preconditions**: EP-002 and EP-003 complete.
+**Preconditions**: EP-002 and EP-003 complete. Backend reachable at `PUBLIC_ROBSON_API_BASE`.
+
+**Decisions applied** (see ADR-0027 Amendment 1):
+- Backend `Position` type is the canonical model. UI label is "Operation".
+- Slots are frontend-derived. `SLOT_COUNT = 6` (constant in `src/lib/config.ts`).
+- Occupied = count of positions whose state is one of `Armed | Entering | Active`.
+- Inherited indicator DEFERRED to FE-P2.
+- Today events = SSE events with `occurred_at` within current UTC day, buffered client-side.
 
 **Steps**:
 ```bash
-# Create stores: src/lib/stores/slots.ts, operations.ts, events.ts
-# Create components:
-#   src/lib/components/dashboard/SlotsVisualizer.svelte
-#   src/lib/components/dashboard/ActiveOperationsPanel.svelte
-#   src/lib/components/dashboard/TodayEventsStream.svelte
-#   src/lib/components/dashboard/StatusStrip.svelte
-# Create route: src/routes/(authed)/dashboard/+page.svelte + +page.server.ts (load slots + ops + events)
-# Apply L-corners signature to cards via LCorners component
-# Apply tick ruler signature to events stream via TickRuler component
-# Verify inherited operation indicator renders with INHERITED FROM MAR eyebrow
+# 1. Create src/lib/config.ts
+#    export const SLOT_COUNT = 6;
+
+# 2. Create src/lib/presentation/labels.ts
+#    - positionStateLabel(state: PositionState): "ARMED" | "ENTERING" | "ACTIVE" | "EXITING" | "CLOSED" | "ERROR"
+#    - positionPnlPct(p: Position): number | null   (derived from realized_pnl or from Active.current_price/entry_price)
+#    - slotStateForPosition(p: Position): 'occupied-ok' | 'occupied-neg' | 'occupied-signal' | 'occupied-warn'
+
+# 3. Create src/lib/stores:
+#    - stores/status.ts    — writable<StatusResponse | null>
+#    - stores/halt.ts      — writable<MonthlyHaltStatus | null>
+#    - stores/events.ts    — writable<SseEvent[]> capped at last 100 events of current UTC day
+
+# 4. Create components (co-located or under src/lib/components/dashboard/):
+#    - SlotsVisualizer.svelte — 6 cells, state + glyph per ADR-0027
+#    - ActiveOperationsPanel.svelte — grid of position cards
+#    - TodayEventsStream.svelte — mono event list + TickRuler
+#    - StatusStrip.svelte — "● LIVE · SLOT X/6 · HALT: NO" mono eyebrow
+
+# 5. Wire route: src/routes/(authed)/dashboard/+page.svelte
+#    - onMount: call robsonApi.getStatus() + robsonApi.getHaltStatus() into stores
+#    - connectEventStream((e) => events.update(arr => capAndAppend(arr, e)))
+#    - Poll getStatus() + getHaltStatus() every 10s as fallback to SSE
+#    - Show inline error + Retry button if API fails (locator .err-text / .btn-retry per e2e test)
+
+# 6. Unit test: tests/unit/slots-derivation.test.ts
+#    - Pure function deriveSlots(positions, SLOT_COUNT) returns SlotState[]
+#    - Cases: 0 positions → 6 free, 4 Active → 2 free, 6+ positions → 6 occupied (cap)
+
+# 7. Playwright e2e: tests/e2e/dashboard.spec.ts (already written by operator)
+#    - Mocks /health, /status, /monthly-halt
+#    - Asserts 6 slots, 2 occupied, status strip shows "SLOT 2/6"
+#    - Error state test asserts .err-text + .btn-retry visible on 502
 ```
 
 **Expected Outcome**:
 ```bash
-# PASS: /dashboard renders 6 slot cells (configurable via SLOT_COUNT constant, MVP default 6)
-# PASS: active operations list populates from API
-# PASS: today's events stream shows last N events with mono timestamps
-# PASS: inherited indicator shows when applicable
+# PASS: pnpm run check (0 TS errors)
+# PASS: pnpm run build (static output)
+# PASS: pnpm run test (slot derivation test + existing)
+# PASS: pnpm run test:e2e (dashboard.spec.ts + auth)
+# PASS: with backend running, /dashboard shows real position cells
+# PASS: with backend 502, /dashboard shows .err-text + .btn-retry
 ```
 
-**Rollback**: remove dashboard route and components.
+**Failure detection**:
+- FAIL if mocked e2e fails (locator miss)
+- FAIL if `deriveSlots` returns wrong count for any test case
+- FAIL if SSE `connectEventStream` leaks (verify cleanup in `onDestroy`)
+
+**Non-goals for EP-004**:
+- Inherited ops indicator (FE-P2)
+- Monthly history aggregation (FE-P2)
+- Real kill-switch integration beyond read-only halt state display (that's EP-006)
+
+**Rollback**: remove stores, components, route reverts to pre-EP-004 commit.
 
 ---
 
-### EP-005: Operation detail event log
+### EP-005: Operation detail event log (adapted to backend reality)
 
-**Objective**: Implement `/operation/{id}` with summary card + full event stream. Deep-link anchors `#event-{n}` scroll into view and highlight.
+**Objective**: Implement `/operation/{id}` wired to real backend. Fetch position via `GET /positions/{id}`. Filter global SSE `/events` stream by `payload.position_id === id` to populate the event stream. Deep-link anchors `#event-{seq}` scroll into view.
 
 **Preconditions**: EP-002, EP-003 complete.
 
+**Decisions applied** (see ADR-0027 Amendment 1):
+- No per-position history endpoint on backend. FE-P1 shows only events received after page mount.
+- Visible limitation notice: "Events from this session only. History deferred to FE-P2."
+- Hash chain UI deferred to FE-P3 (no hash field in `Position` or `SseEvent` currently).
+
 **Steps**:
 ```bash
-# Create route: src/routes/(authed)/operation/[id]/+page.svelte + +page.server.ts
-# Load operation + full event log via API
-# Render summary card (collapsed high-level outcome) with L-corners
-# Render event stream (always expanded, voltage hairline signature vertical connector)
-# Each event: mono ms timestamp, cyan-brand event type, muted summary, hash placeholder
-# Anchor each event row via id="event-{seq}"
-# Scroll-to-anchor behavior on hash change
+# 1. src/routes/(authed)/operation/[id]/+page.svelte
+#    - onMount: robsonApi.getPosition(id) into a local $state
+#    - connectEventStream((e) => {
+#        if (e.payload.position_id === id) localEvents.push(e)
+#      })
+#    - onDestroy: close SSE
+#    - Render summary card with L-corners from position data
+#    - Render event stream with voltage hairline (border-left cyan)
+#    - Each row: tick "·" + mono ms timestamp + cyan-brand event_type + muted summary
+#    - Anchor each event: id="event-{seq}" where seq = arrival order in this session
+
+# 2. Presentation helpers in src/lib/presentation/labels.ts
+#    - formatMs(iso: string): "HH:mm:ss.SSS"
+#    - formatPayload(e: SseEvent): string   (human-readable summary)
+#    - positionSummary(p: Position): string[]   (lines for summary card)
+
+# 3. Visible limitation banner at top of event stream section:
+#    "Events from this session. Full history in FE-P2."
+
+# 4. Unit tests:
+#    - formatMs(ISO8601) returns millisecond-precision UTC string
+#    - payload summary formatting for main event types (POSITION_*, STOP_*, ORDER_*)
+
+# 5. E2E test:
+#    - Mock GET /positions/{id}
+#    - Mock SSE /events with stream containing events matching and not matching position_id
+#    - Assert only matching events appear
+#    - Assert deep-link scroll: navigate to /operation/X#event-2 and verify :target style
 ```
 
 **Expected Outcome**:
 ```bash
-# PASS: /operation/{id} loads and renders all events chronologically
-# PASS: deep-link /operation/{id}#event-5 scrolls event 5 into view
-# PASS: mono tabular formatting for all numbers and timestamps
+# PASS: /operation/{id} fetches and renders position summary
+# PASS: matching SSE events appear in stream in order
+# PASS: non-matching SSE events are filtered out
+# PASS: #event-{n} anchor scrolls into view and highlights via :target
+# PASS: session-only limitation banner visible
 ```
 
 ---
 
-### EP-006: Kill-switch type-to-confirm + cooldown
+### EP-006: Kill-switch type-to-confirm + cooldown (mapped to /monthly-halt)
 
-**Objective**: Implement `/kill-switch` and inline kill-switch entry on dashboard footer. Modal with type-to-confirm keyword, countdown timer, i18n-aware keywords.
+**Objective**: Implement `/kill-switch` page + modal. Map UI operations to `robsonApi.getHaltStatus()` (read) and `robsonApi.triggerHalt(reason)` (write). Preserve UX keywords DESLIGAR/DISABLE/RELIGAR/ENABLE even though backend endpoint is `/monthly-halt`.
 
-**Preconditions**: EP-002, EP-003 complete. Backend `/kill-switch` endpoint verified.
+**Preconditions**: EP-002, EP-003 complete. Verify backend cooldown enforcement (see below).
+
+**Decisions applied** (see ADR-0027 Amendment 1):
+- Backend endpoint is `/monthly-halt`, not `/kill-switch`. Semantics identical.
+- `MonthlyHaltStatus.triggered_at` is the authoritative timestamp. Derive `cooldown_until = triggered_at + 5min`.
+- **CRITICAL verification step**: test whether backend rejects a second toggle within 5min window with HTTP 409. If not, file backend ticket and document as FE-P1 limitation.
+- UI label stays "Kill Switch". Internal code imports `MonthlyHaltStatus`.
 
 **Steps**:
 ```bash
-# Create route: src/routes/(authed)/kill-switch/+page.svelte
-# Create component: src/lib/components/kill-switch/ConfirmModal.svelte
-#   - role="alertdialog"
-#   - input field with uppercase mono font
-#   - confirm button disabled until input matches keyword exactly
-#   - display current state: open positions preview, slot counts
-# Cooldown countdown: mono tabular, polling /kill-switch/status every 1s
-# i18n keywords: DESLIGAR/RELIGAR (pt-BR), DISABLE/ENABLE (en)
-# Handle locale switch during open modal: close + reopen
-# Handle network failure: retry 3× exponential backoff
+# 1. Before writing code, verify backend cooldown behavior:
+#    - curl -H "Authorization: Bearer $TOKEN" -X POST $API/monthly-halt -d '{"reason":"test"}'
+#    - curl -H "Authorization: Bearer $TOKEN" -X POST $API/monthly-halt -d '{"reason":"test2"}'
+#    - Expect second call: HTTP 409 with cooldown_until message
+#    - If 200: document backend gap, keep UI enforcement as advisory-only
+
+# 2. src/routes/(authed)/kill-switch/+page.svelte
+#    - Load current MonthlyHaltStatus on mount
+#    - State machine:
+#        halt.state === "active"         → show "Disable" confirmation flow
+#        halt.state === "monthly_halt"   → show cooldown countdown or "Enable" flow
+#    - Type-to-confirm input: match KEYWORD_DISABLE / KEYWORD_ENABLE exactly (uppercase)
+#    - Disabled confirm button until match
+
+# 3. Cooldown countdown:
+#    - If halt.triggered_at is set, compute cooldown_until = +5min
+#    - Show mono tabular countdown (HH:MM:SS) updating every second
+#    - Re-enable button disabled until now >= cooldown_until
+
+# 4. i18n keyword mapping:
+#    pt-BR: DESLIGAR (enter halt) / RELIGAR (exit halt)
+#    en:    DISABLE  (enter halt) / ENABLE  (exit halt)
+#    (Note: backend has no "enable" action — halt state is cleared by admin tooling currently.
+#     FE-P1 scope: trigger halt only. Clearing halt = out of scope unless backend supports it.)
+
+# 5. Locale switch during open modal: close + reopen to refresh keyword
+
+# 6. Network failure: retry 3× with exponential backoff (1s, 2s, 4s)
+
+# 7. On success, emit SSE event should appear in dashboard today events panel
+
+# 8. E2E test:
+#    - Mock /monthly-halt GET (state: active)
+#    - Mock /monthly-halt POST (state: monthly_halt with triggered_at: now)
+#    - Mock /monthly-halt POST second call: 409
+#    - Verify type-to-confirm flow
+#    - Verify countdown renders
+#    - Verify second trigger blocked
 ```
 
 **Expected Outcome**:
 ```bash
-# PASS: modal opens with current state + open positions
-# PASS: confirm disabled until keyword matches
-# PASS: successful toggle → cooldown state with countdown
-# PASS: re-enable blocked until cooldown_until timestamp passed (backend-enforced)
-# PASS: event log shows KILL_SWITCH_TRIGGERED event with operator + timestamp
+# PASS: page reads current halt state
+# PASS: confirm button disabled until keyword matches
+# PASS: successful POST transitions to cooldown display
+# PASS: countdown updates every second
+# PASS: second POST within 5min returns 409 (backend-enforced)
+# PASS: backend-emitted event visible in dashboard events stream
 ```
+
+**Failure detection + reporting**:
+- If backend does not return 409 for rapid re-toggle: UI cooldown is advisory only. Document in page as "UI-only cooldown — backend accepts bypass". File backend ticket.
+- If backend has no inverse action (exit monthly_halt): document FE-P1 limitation, treat as one-way.
 
 ---
 
@@ -605,21 +681,43 @@ Progress tracking: update the `## Changelog` section below after each entry poin
 
 ## Appendices
 
-### Appendix A: Backend endpoints needed (FE-P1)
+### Appendix A: Backend endpoints — ACTUAL (verified EP-003 by GLM-5.1 2026-04-23)
+
+Real `robsond` surface (v2 API), used by `src/lib/api/robson.ts`:
 
 ```
-GET  /auth/me                           → session user info
-POST /auth/logout                       → clear session
-GET  /slots?month=YYYY-MM               → slot utilization for month
-GET  /operations?status=open            → active operations
-GET  /operations/{id}                   → operation detail
-GET  /operations/{id}/events            → full event log for operation
-GET  /events?from=YYYY-MM-DD&to=...     → events in time range (dashboard today)
-GET  /kill-switch/status                → current state + cooldown_until
-POST /kill-switch                       → toggle with operator_id + reason
+GET    /health                          → { status: "ok" }
+GET    /status                          → StatusResponse (active_positions + positions[] + pending_approvals[])
+GET    /positions/{id}                  → Position
+POST   /positions                       → arm new position (body: { symbol, side })
+DELETE /positions/{id}                  → close position
+POST   /queries/{id}/approve            → approve pending query
+GET    /monthly-halt                    → MonthlyHaltStatus
+POST   /monthly-halt                    → trigger halt (body: { reason })
+POST   /panic                           → PanicResponse (close all positions)
+GET    /safety/status                   → SafetyStatusResponse
+GET    /events                          → SSE stream (Bearer via ?token= query param)
 ```
 
-Verify each exists; file tickets for any gaps before starting related entry points.
+**Gaps vs original plan** (accepted; reflected in ADR-0027 Amendment 1):
+
+| Originally planned | Reality | Resolution |
+|-------------------|---------|------------|
+| `GET /auth/me` | Not present | Bearer-token auth (ADR-0025 A1.2), `GET /health` validates token |
+| `POST /auth/logout` | Not present | Client clears `sessionStorage`, no server call needed |
+| `GET /slots?month=...` | Not present | Slots derived client-side (ADR-0027 A1.2) |
+| `GET /operations?status=open` | → `GET /status` | Use `status.positions` filtered by state |
+| `GET /operations/{id}` | → `GET /positions/{id}` | Vocabulary mapping in presentation layer |
+| `GET /operations/{id}/events` | Not present | Client-filter global SSE by `payload.position_id` (ADR-0027 A1.3) |
+| `GET /events?from=...&to=...` | → SSE `/events` (live only) | Today's events = client-buffered from SSE; history DEFERRED FE-P2 |
+| `GET /kill-switch/status` | → `GET /monthly-halt` | Vocabulary mapping |
+| `POST /kill-switch` | → `POST /monthly-halt` | Vocabulary mapping |
+
+**Backend ticket candidates** (file before FE-P2):
+- `GET /events?position_id=X&from=...&to=...` — historical event query for operation detail pre-load
+- `GET /positions?status=all&month=YYYY-MM` — historical positions for slot history view
+- Confirm `POST /monthly-halt` enforces 5-minute cooldown server-side (return 409)
+- Inverse action for `/monthly-halt` (clear halt state from UI) if desired for operator ergonomics
 
 ### Appendix B: File tree (target state after FE-P1)
 
@@ -717,10 +815,13 @@ apps/frontend-v2/
 |------|--------|--------|--------|
 | 2026-04-23 | Initial draft | Claude Opus 4.7 | Draft |
 | 2026-04-23 | EP-001 scaffold — package.json, svelte.config, tsconfig, +layout, +page, app.html, /login, /(authed) routes stubs | Claude Opus 4.7 | DONE (pending `pnpm install` + `pnpm dev` verification by operator) |
-| 2026-04-23 | EP-002 design system — tokens.css copied, brand assets copied, layout primitives (Stack/Row/Grid/Prose/Card/LCorners/TickRuler) written, +page demo renders signature elements | Claude Opus 4.7 | DONE (pending visual verification) |
-| — | EP-003 auth + api | — | TODO (stub API client in `src/lib/api/robson.ts`, stub auth guard in `+layout.server.ts`) |
+| 2026-04-23 | EP-002 design system — tokens.css copied, brand assets copied, layout primitives (Stack/Row/Grid/Prose/Card/LCorners/TickRuler) written, +page demo renders signature elements | Claude Opus 4.7 | DONE |
+| 2026-04-23 | EP-003 auth + api — Bearer-token MVP + typed API client mapped to 7 real endpoints + Svelte 5 migration. Commit edc19919 on `fe-p1/ep-003-auth`. Caveats: no OAuth (adapter-static incompatibility, see ADR-0025 A1.2); 6 of 9 originally planned endpoints absent, UI adapts per ADR-0027 A1.1. | GLM-5.1 | DONE |
+| 2026-04-23 | ADR amendments: ADR-0025 A1 (token auth + Svelte 5), ADR-0027 A1 (vocabulary mapping + slots derived + SSE client-filter + cooldown verification requirement) | Claude Opus 4.7 | DONE |
+| — | EP-004 dashboard adapted to real endpoints | GLM-5.1 | IN-PROGRESS (e2e test scaffold present; wire real stores + presentation layer + slot derivation) |
 | 2026-04-23 | EP-003 — typed API client mapped to real robsond endpoints, Bearer token auth (OAuth deferred), client-side auth guard, login page, Svelte 4-to-5 migration | GLM-5.1 | DONE (see Blocker Findings below for pending items) |
 | 2026-04-23 | EP-004 dashboard — real API wiring (getStatus + getHaltStatus + SSE), slots derivation from positions (SLOT_COUNT=6), presentation labels layer, error states, retry, e2e with mocked API, vitest slot derivation tests | GLM-5.1 | DONE |
+| 2026-04-23 | EP-004 corrective pass — UTC time formatting (HH:mm:ss.SSS), UTC day filtering, 100-event cap, 10s polling fallback, full cleanup on destroy, retry reinitializes SSE+polling, 6+ positions regression test, UTC formatter unit tests, auth guard sessionStorage fallback, e2e structural tests | GLM-5.1 | DONE |
 
 ### EP-003 Blocker Findings (2026-04-23, GLM-5.1)
 

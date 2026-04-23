@@ -6,10 +6,11 @@
   import Grid from '$design/components/Grid.svelte';
   import TickRuler from '$design/components/TickRuler.svelte';
   import { robsonApi, connectEventStream, type Position, type SseEvent } from '$api/robson';
-  import { activePositions, upsertPosition, removePosition } from '$stores/operations';
+  import { activePositions } from '$stores/operations';
   import { haltStatus } from '$stores/slots';
   import { recentEvents, pushEvent } from '$stores/events';
   import { deriveSlots, SLOT_COUNT } from '$lib/config/slots';
+  import { formatTimeUtc, isTodayUtc } from '$lib/utils/time';
   import {
     positionLabel,
     positionStateLabel,
@@ -18,22 +19,19 @@
     isPositionActive
   } from '$lib/presentation/labels';
 
+  const POLL_INTERVAL_MS = 10_000;
+
   let error = $state<string | null>(null);
   let connected = $state(false);
-  let closeSse: (() => void) | null = $state(null);
+  let closeSse: (() => void) | null = null;
+  let pollTimer: ReturnType<typeof setInterval> | null = null;
 
   let positions = $derived($activePositions);
   let slots = $derived(deriveSlots(positions));
   let occupied = $derived(slots.filter((s) => s.occupied).length);
   let free = $derived(SLOT_COUNT - occupied);
   let activeOps = $derived(positions.filter((p) => isPositionActive(p.state)));
-  let todayEvents = $derived(
-    $recentEvents.filter((e) => {
-      const d = new Date(e.occurred_at);
-      const now = new Date();
-      return d.toDateString() === now.toDateString();
-    })
-  );
+  let todayEvents = $derived($recentEvents.filter((e) => isTodayUtc(e.occurred_at)));
   let haltState = $derived($haltStatus?.state ?? 'active');
 
   function pnlFor(p: Position): number | null {
@@ -43,13 +41,10 @@
     return p.realized_pnl != null ? Number(p.realized_pnl) : null;
   }
 
-  function timeStr(iso: string): string {
-    const d = new Date(iso);
-    return d.toTimeString().slice(0, 12);
-  }
-
   function monthLabel(): string {
-    return new Date().toLocaleDateString('en-US', { month: 'long', year: 'numeric' }).toUpperCase();
+    const now = new Date();
+    const month = now.toLocaleDateString('en-US', { month: 'long', timeZone: 'UTC' });
+    return `${month.toUpperCase()} ${now.getUTCFullYear()}`;
   }
 
   async function load() {
@@ -69,13 +64,13 @@
   }
 
   function startSse() {
+    stopSse();
     closeSse = connectEventStream(
       (event: SseEvent) => {
         pushEvent(event);
         const payload = event.payload as Record<string, unknown>;
         const posId = payload.position_id as string | undefined;
         if (posId && event.event_type === 'position.changed') {
-          // Re-fetch status on position state changes
           void robsonApi.getStatus().then((s) => activePositions.set(s.positions)).catch(() => {});
         }
       },
@@ -85,11 +80,53 @@
     );
   }
 
+  function stopSse() {
+    if (closeSse) {
+      closeSse();
+      closeSse = null;
+    }
+  }
+
+  function startPolling() {
+    stopPolling();
+    pollTimer = setInterval(() => {
+      void (async () => {
+        try {
+          const [status, halt] = await Promise.all([
+            robsonApi.getStatus(),
+            robsonApi.getHaltStatus()
+          ]);
+          activePositions.set(status.positions);
+          haltStatus.set(halt);
+          connected = true;
+          error = null;
+        } catch {
+          // SSE + polling: silent retry, error shown only if initial load fails
+        }
+      })();
+    }, POLL_INTERVAL_MS);
+  }
+
+  function stopPolling() {
+    if (pollTimer) {
+      clearInterval(pollTimer);
+      pollTimer = null;
+    }
+  }
+
+  function retry() {
+    void load();
+    startSse();
+    startPolling();
+  }
+
   onMount(() => {
     void load();
     startSse();
+    startPolling();
     return () => {
-      closeSse?.();
+      stopSse();
+      stopPolling();
     };
   });
 </script>
@@ -123,7 +160,7 @@
       <Stack gap={3}>
         <div class="eyebrow">CONNECTION ERROR</div>
         <p class="err-text">{error}</p>
-        <button class="btn-retry" onclick={() => void load()}>Retry</button>
+        <button class="btn-retry" onclick={retry}>Retry</button>
       </Stack>
     </Card>
   {:else}
@@ -191,7 +228,7 @@
               {#each todayEvents as e (e.event_id)}
                 <div class="event-line">
                   <span class="tick">·</span>
-                  <span class="ts">{timeStr(e.occurred_at)}</span>
+                  <span class="ts">{formatTimeUtc(e.occurred_at)}</span>
                   <span class="type">{eventTypeLabel(e)}</span>
                 </div>
               {/each}
@@ -312,7 +349,7 @@
   .ts {
     color: var(--fg-2);
     font-variant-numeric: tabular-nums;
-    min-width: 10ch;
+    min-width: 12ch;
   }
   .type {
     color: var(--cyan-brand);
