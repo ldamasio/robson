@@ -4,8 +4,9 @@
 import { browser } from '$app/environment';
 import { get as getStore } from 'svelte/store';
 import { authToken } from '$stores/auth';
+import { env } from '$env/dynamic/public';
 
-const API_BASE = (import.meta.env.PUBLIC_ROBSON_API_BASE as string) ?? '';
+const API_BASE: string = env.PUBLIC_ROBSON_API_BASE ?? '';
 
 // --- Backend response types (match robsond serde output) ---
 

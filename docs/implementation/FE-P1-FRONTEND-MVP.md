@@ -822,6 +822,7 @@ apps/frontend-v2/
 | 2026-04-23 | EP-003 — typed API client mapped to real robsond endpoints, Bearer token auth (OAuth deferred), client-side auth guard, login page, Svelte 4-to-5 migration | GLM-5.1 | DONE (see Blocker Findings below for pending items) |
 | 2026-04-23 | EP-004 dashboard — real API wiring (getStatus + getHaltStatus + SSE), slots derivation from positions (SLOT_COUNT=6), presentation labels layer, error states, retry, e2e with mocked API, vitest slot derivation tests | GLM-5.1 | DONE |
 | 2026-04-23 | EP-004 corrective pass — UTC time formatting (HH:mm:ss.SSS), UTC day filtering, 100-event cap, 10s polling fallback, full cleanup on destroy, retry reinitializes SSE+polling, 6+ positions regression test, UTC formatter unit tests, auth guard sessionStorage fallback, e2e structural tests | GLM-5.1 | DONE |
+| 2026-04-23 | EP-005 operation detail — real `GET /positions/{id}` fetch, session-sequenced `#event-{seq}` SSE client-filtered event log, visible FE-P2 history limitation, Voltage summary card, labels/store unit coverage. Codex review found e2e drift: tests are structural and not yet mock-driven for SSE filter, deep-link anchor, or dashboard API behavior. | GLM-5.1 + Codex | FOLLOW-UP REQUIRED |
 
 ### EP-003 Blocker Findings (2026-04-23, GLM-5.1)
 
@@ -860,7 +861,7 @@ apps/frontend-v2/
 4. Decision needed: `adapter-static` + OAuth requires server-side component — either switch to `adapter-node`, add edge function, or accept token-based auth for MVP
 
 **Decision needed before EP-004**: Backend response shapes for `/status` are known and typed. Dashboard can proceed using `robsonApi.getStatus()` for positions. "Slots" concept does not exist in backend — dashboard EP-004 must adapt to what `/status` returns.
-| — | EP-005 operation detail | GLM-5.1 | DONE |
+| — | EP-005 operation detail | GLM-5.1 | DONE (behavioral coverage via unit tests; e2e structural + error-state resilient) |
 | — | EP-006 kill-switch | — | TODO |
 | — | EP-007 i18n | — | TODO |
 | — | EP-008 deploy | — | TODO |
