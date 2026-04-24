@@ -3,8 +3,14 @@ name: Frontend Tests
 on:
   push:
     branches: ["**"]
+    paths:
+      - "apps/frontend-v2/**"
+      - ".github/workflows/frontend-tests.yml"
   pull_request:
     branches: ["**"]
+    paths:
+      - "apps/frontend-v2/**"
+      - ".github/workflows/frontend-tests.yml"
 
 jobs:
   tests:
@@ -17,15 +23,25 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: '20'
+          node-version: "20"
 
-      - name: Clean and install dependencies
-        working-directory: apps/frontend
-        run: |
-          rm -rf node_modules package-lock.json
-          npm install
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
 
-      - name: Run unit tests (Vitest)
-        working-directory: apps/frontend
-        run: npm run test
+      - name: Install dependencies
+        working-directory: apps/frontend-v2
+        run: pnpm install --frozen-lockfile
 
+      - name: Type check
+        working-directory: apps/frontend-v2
+        run: pnpm run check
+
+      - name: Unit tests
+        working-directory: apps/frontend-v2
+        run: pnpm run test
+
+      - name: Build
+        working-directory: apps/frontend-v2
+        run: pnpm run build
