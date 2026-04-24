@@ -4,8 +4,8 @@
   import Row from '$design/components/Row.svelte';
   import { robsonApi, type MonthlyHaltStatus, type StatusResponse, type ApiError } from '$api/robson';
   import { haltStatus } from '$stores/slots';
-
-  const KEYWORD = 'DESLIGAR';
+  import { _ } from 'svelte-i18n';
+  import { positionLabel, positionStateLabel } from '$lib/presentation/labels';
 
   type PageState = 'loading' | 'active' | 'halted' | 'error';
 
@@ -17,12 +17,18 @@
   let reasonInput = $state('');
   let submitting = $state(false);
 
+  let keyword = $derived($_('killSwitch.disableKeyword') ?? 'DESLIGAR');
+
   let canConfirm = $derived(
-    confirmInput === KEYWORD && reasonInput.trim().length > 0 && !submitting
+    confirmInput === keyword && reasonInput.trim().length > 0 && !submitting
   );
   let activeCount: number = $derived.by(() => {
     if (status) return status.active_positions;
     return 0;
+  });
+  let affectedPositions = $derived.by(() => {
+    if (!status) return [];
+    return status.positions;
   });
 
   async function loadState() {
@@ -84,7 +90,7 @@
   {#if pageState === 'loading'}
     <Card padding={7}>
       <div class="eyebrow">KILL SWITCH</div>
-      <p class="muted">Loading...</p>
+      <p class="muted">{$_('killSwitch.loading') ?? 'Loading...'}</p>
     </Card>
 
   {:else if pageState === 'error'}
@@ -100,36 +106,43 @@
     <Card padding={7}>
       <Stack gap={5}>
         <div class="eyebrow">KILL SWITCH</div>
-        <h1>Desligar Robson</h1>
+        <h1>{$_('killSwitch.disableTitle')}</h1>
 
         <div class="current-state">
-          <div class="eyebrow">ESTADO ATUAL</div>
+          <div class="eyebrow">{$_('killSwitch.currentState')}</div>
           <div class="state-line">
             <span class="dot live"></span>
-            ACTIVE{#if status} · SLOT {activeCount}/6 · {activeCount} {activeCount === 1 ? 'POSIÇÃO ABERTA' : 'POSIÇÕES ABERTAS'}{/if}
+            ACTIVE · {$_('killSwitch.slotLabel')} {activeCount}/6 · {activeCount} {activeCount === 1 ? ($_('killSwitch.openPositions_one') ?? 'OPEN POSITION') : ($_('killSwitch.openPositions_other') ?? 'OPEN POSITIONS')}
           </div>
         </div>
 
+        {#if affectedPositions.length > 0}
+          <div class="positions-preview">
+            <div class="eyebrow">{$_('killSwitch.affectedPositions') ?? 'AFFECTED POSITIONS'}</div>
+            <div class="pos-list">
+              {#each affectedPositions as pos}
+                <div class="pos-row">
+                  <span class="pos-label">{positionLabel(pos)}</span>
+                  <span class="pos-state">{positionStateLabel(pos.state)}</span>
+                </div>
+              {/each}
+            </div>
+          </div>
+        {/if}
+
         <div class="warning-block">
-          <p>
-            Esta ação ativa o <span class="mono">MonthlyHalt</span>.
-            Robson não abrirá novas posições.
-            O backend fechará/desarmará as posições abertas ao executar o halt.
-          </p>
-          <p>
-            O halt persiste até o próximo mês calendário.
-            Não existe reativação pela interface.
-          </p>
+          <p>{$_('killSwitch.triggerWarning')}</p>
+          <p>{$_('killSwitch.persistNote')}</p>
         </div>
 
         <Stack gap={3}>
           <label class="eyebrow" for="reason-input">
-            MOTIVO DA INTERVENÇÃO (obrigatório):
+            {$_('killSwitch.reasonLabel')}
           </label>
           <textarea
             id="reason-input"
             bind:value={reasonInput}
-            placeholder="Descreva o motivo..."
+            placeholder={$_('killSwitch.reasonPlaceholder') ?? ''}
             rows={3}
             class="reason-input"
           ></textarea>
@@ -137,7 +150,7 @@
 
         <Stack gap={2}>
           <label class="eyebrow" for="confirm-input">
-            Para confirmar, digite "{KEYWORD}" abaixo:
+            {$_('killSwitch.typeToConfirm')}
           </label>
           <input
             id="confirm-input"
@@ -154,7 +167,7 @@
         {/if}
 
         <Row gap={3} justify="end">
-          <a href="/dashboard" class="btn-cancel">Cancelar</a>
+          <a href="/dashboard" class="btn-cancel">{$_('killSwitch.cancel')}</a>
           <button
             class="btn-confirm"
             class:ready={canConfirm}
@@ -162,9 +175,9 @@
             onclick={triggerHalt}
           >
             {#if submitting}
-              Executando...
+              {$_('killSwitch.submitting') ?? '...'}
             {:else}
-              Desligar
+              {$_('killSwitch.disable')}
             {/if}
           </button>
         </Row>
@@ -175,13 +188,13 @@
     <Card padding={7}>
       <Stack gap={5}>
         <div class="eyebrow">KILL SWITCH</div>
-        <h1>Robson Desligado</h1>
+        <h1>{$_('killSwitch.haltedTitle')}</h1>
 
         <div class="halted-state">
-          <div class="eyebrow">ESTADO ATUAL</div>
+          <div class="eyebrow">{$_('killSwitch.currentState')}</div>
           <div class="state-line">
             <span class="dot halted"></span>
-            MONTHLY HALT ATIVO
+            {$_('killSwitch.monthlyHaltActive') ?? 'MONTHLY HALT ACTIVE'}
           </div>
         </div>
 
@@ -189,22 +202,22 @@
           <Stack gap={3}>
             {#if halt?.triggered_at}
               <div>
-                <span class="eyebrow">TRIGGERED AT</span>
+                <span class="eyebrow">{$_('killSwitch.triggeredAt')}</span>
                 <div class="mono ts">{formatTimestamp(halt.triggered_at)}</div>
               </div>
             {/if}
             {#if halt?.reason}
               <div>
-                <span class="eyebrow">REASON</span>
+                <span class="eyebrow">{$_('killSwitch.reason')}</span>
                 <div class="reason-text">{halt.reason}</div>
               </div>
             {/if}
             <div>
-              <span class="eyebrow">DESCRIPTION</span>
+              <span class="eyebrow">{$_('killSwitch.description')}</span>
               <div class="reason-text">{halt?.description ?? '—'}</div>
             </div>
             <div>
-              <span class="eyebrow">BLOCKS</span>
+              <span class="eyebrow">{$_('killSwitch.blocks')}</span>
               <div class="mono meta">
                 New entries: {halt?.blocks_new_entries ? 'YES' : 'NO'}
                 · Signals: {halt?.blocks_signals ? 'YES' : 'NO'}
@@ -214,11 +227,7 @@
         </div>
 
         <div class="info-block">
-          <p>
-            MonthlyHalt permanece ativo até o próximo mês calendário.
-            Não é possível reativar por esta interface.
-            Posições abertas foram fechadas/desarmadas pelo backend ao disparar o halt.
-          </p>
+          <p>{$_('killSwitch.haltedInfo')}</p>
         </div>
       </Stack>
     </Card>
@@ -283,6 +292,37 @@
     color: var(--fg-3);
     font-family: var(--font-mono);
     font-size: var(--text-sm);
+  }
+  .positions-preview {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-2);
+    padding: var(--s-4);
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+  }
+  .pos-list {
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-1);
+  }
+  .pos-row {
+    display: flex;
+    justify-content: space-between;
+    align-items: baseline;
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    color: var(--fg-1);
+  }
+  .pos-label {
+    color: var(--fg-0);
+  }
+  .pos-state {
+    color: var(--fg-2);
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: var(--track-label);
   }
   .warning-block {
     padding: var(--s-4);

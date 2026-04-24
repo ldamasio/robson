@@ -32,7 +32,7 @@
   "killSwitch": {
     "disableTitle": "Disable Robson",
     "haltedTitle": "Robson Disabled",
-    "currentState": "Current state",
+    "currentState": "CURRENT STATE",
     "triggerWarning": "This action activates MonthlyHalt. Robson will not open new positions. The backend will close/disarm open positions on trigger.",
     "persistNote": "Halt persists until the next calendar month. No re-enable available from this interface.",
     "haltedInfo": "MonthlyHalt remains active until the next calendar month. Cannot re-enable from this interface. Open positions were closed/disarmed by the backend when halt was triggered.",
@@ -45,6 +45,13 @@
     "triggeredAt": "TRIGGERED AT",
     "reason": "REASON",
     "description": "DESCRIPTION",
-    "blocks": "BLOCKS"
+    "blocks": "BLOCKS",
+    "loading": "Loading...",
+    "submitting": "Disabling...",
+    "slotLabel": "SLOT",
+    "openPositions_one": "OPEN POSITION",
+    "openPositions_other": "OPEN POSITIONS",
+    "affectedPositions": "AFFECTED POSITIONS",
+    "monthlyHaltActive": "MONTHLY HALT ACTIVE"
   }
 }

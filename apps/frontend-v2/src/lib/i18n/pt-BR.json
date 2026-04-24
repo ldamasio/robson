@@ -32,7 +32,7 @@
   "killSwitch": {
     "disableTitle": "Desligar Robson",
     "haltedTitle": "Robson Desligado",
-    "currentState": "Estado atual",
+    "currentState": "ESTADO ATUAL",
     "triggerWarning": "Esta ação ativa o MonthlyHalt. Robson não abrirá novas posições. O backend fechará/desarmará as posições abertas ao executar o halt.",
     "persistNote": "O halt persiste até o próximo mês calendário. Não existe reativação pela interface.",
     "haltedInfo": "MonthlyHalt permanece ativo até o próximo mês calendário. Não é possível reativar por esta interface. Posições abertas foram fechadas/desarmadas pelo backend ao disparar o halt.",
@@ -45,6 +45,13 @@
     "triggeredAt": "TRIGGERED AT",
     "reason": "REASON",
     "description": "DESCRIPTION",
-    "blocks": "BLOCKS"
+    "blocks": "BLOCKS",
+    "loading": "Carregando...",
+    "submitting": "Executando...",
+    "slotLabel": "SLOT",
+    "openPositions_one": "POSIÇÃO ABERTA",
+    "openPositions_other": "POSIÇÕES ABERTAS",
+    "affectedPositions": "POSIÇÕES AFETADAS",
+    "monthlyHaltActive": "MONTHLY HALT ATIVO"
   }
 }

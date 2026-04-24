@@ -1,6 +1,7 @@
 <script lang="ts">
   import '$design/tokens.css';
   import { initAuth } from '$stores/auth';
+  import '$lib/i18n';
   import { browser } from '$app/environment';
 
   import type { Snippet } from 'svelte';
