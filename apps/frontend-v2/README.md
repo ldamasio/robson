@@ -52,3 +52,7 @@ Source of truth: `brand-voltage/` at repo root.
 - `$components` → `src/lib/components`
 - `$icons` → `src/lib/icons`
 - `$i18n` → `src/lib/i18n`
+
+## Deploy
+
+See `docs/runbooks/frontend-deploy.md` for the full deploy procedure. The GitHub Actions workflow `Frontend Deploy` (workflow_dispatch only) builds and syncs to the Contabo S3 bucket `robson-app`. Prerequisites B1–B5 must be satisfied by the operator before the first run; see runbook.

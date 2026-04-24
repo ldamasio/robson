@@ -160,16 +160,16 @@ N/A — greenfield implementation, no gap to analyze.
 
 ## Execution Selector
 
-| Objective | Entry Point | Effort |
-|-----------|-------------|--------|
-| Scaffold SvelteKit app | EP-001 | 2h |
-| Apply Voltage design tokens | EP-002 | 4h |
-| GitHub OAuth + API client | EP-003 | 1 day |
-| Dashboard current month | EP-004 | 1.5 day |
-| Operation event log page | EP-005 | 1 day |
-| Kill-switch type-to-confirm | EP-006 | 1 day |
-| i18n pt-BR + en | EP-007 | 4h |
-| CI/CD + DNS + TLS | EP-008 | 1 day |
+| Objective | Entry Point | Effort | Status |
+|-----------|-------------|--------|--------|
+| Scaffold SvelteKit app | EP-001 | 2h | DONE |
+| Apply Voltage design tokens | EP-002 | 4h | DONE |
+| Bearer-token auth + API client | EP-003 | 1 day | DONE |
+| Dashboard current month | EP-004 | 1.5 day | DONE |
+| Operation event log page | EP-005 | 1 day | DONE |
+| Kill-switch type-to-confirm | EP-006 | 1 day | DONE |
+| i18n pt-BR + en | EP-007 | 4h | DONE |
+| CI/CD + DNS + TLS | EP-008 | 1 day | DONE (skeleton; execution blocked on B1–B5) |
 
 ### Default Execution Order
 
@@ -542,9 +542,11 @@ git checkout main -- apps/frontend-v2
 
 ---
 
-### EP-007: i18n pt-BR + en
+### EP-007: i18n pt-BR + en — DONE (2026-04-24)
 
-**Objective**: Integrate `svelte-i18n` (default choice; `paraglide-js` alternative), create translation files, hostname-driven default.
+**Status**: DONE by GLM-5.1 on branch `fe-p1/ep-007-i18n`, commit `e8fb9d50`.
+
+**Objective**: Integrate `svelte-i18n`, create translation files, hostname-driven default.
 
 **Preconditions**: UI strings extracted and replaced with `$_('key')` references.
 
@@ -571,7 +573,9 @@ pnpm add svelte-i18n
 
 ---
 
-### EP-008: CI/CD + DNS + TLS
+### EP-008: CI/CD + DNS + TLS — DONE (skeleton; 2026-04-24)
+
+**Status**: DONE (skeleton) by GLM-5.1 on branch `fe-p1/ep-008-deploy`, commit `15f86514`. Execution blocked on operator prerequisites B1–B5.
 
 **Objective**: GitHub Actions workflow builds and syncs to Contabo bucket. DNS CNAMEs configured via PowerDNS. TLS strategy implemented.
 
@@ -865,5 +869,5 @@ apps/frontend-v2/
 **Decision needed before EP-004**: Backend response shapes for `/status` are known and typed. Dashboard can proceed using `robsonApi.getStatus()` for positions. "Slots" concept does not exist in backend — dashboard EP-004 must adapt to what `/status` returns.
 | — | EP-005 operation detail | GLM-5.1 | DONE (Codex-verified mocked e2e acceptance; residual gap: no explicit `:target` style assertion) |
 | — | EP-006 kill-switch | — | TODO |
-| — | EP-007 i18n | — | TODO |
-| — | EP-008 deploy | — | TODO |
+| 2026-04-24 | EP-007 i18n — login/dashboard/operation detail extended to svelte-i18n; en.json + pt-BR.json key parity test added; labels.ts kept English (technical state identifiers); root layout guards render behind $isLoading to avoid init race. Commit e8fb9d50 on branch fe-p1/ep-007-i18n. | GLM-5.1 | DONE |
+| 2026-04-24 | EP-008 deploy skeleton — workflow_dispatch-only GitHub Actions workflow targeting Contabo S3 bucket robson-app; runbook docs/runbooks/frontend-deploy.md with prerequisites B1–B5. Workflow does not run until operator provisions bucket, secrets, DNS, TLS decision, backend CORS/public reachability. Commit 15f86514 on branch fe-p1/ep-008-deploy. | GLM-5.1 | DONE (skeleton; execution blocked on B1–B5) |
