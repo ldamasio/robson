@@ -4,6 +4,7 @@
   import Stack from '$design/components/Stack.svelte';
   import { setToken } from '$stores/auth';
   import { robsonApi } from '$api/robson';
+  import { _ } from 'svelte-i18n';
 
   let tokenInput = $state('');
   let error = $state('');
@@ -19,7 +20,7 @@
       const redirect = params.get('redirect') ?? '/dashboard';
       void goto(redirect);
     } catch (e) {
-      error = e instanceof Error ? e.message : 'Connection failed';
+      error = e instanceof Error && e.message ? e.message : $_('login.connectionFailed');
     } finally {
       loading = false;
     }
@@ -27,21 +28,21 @@
 </script>
 
 <svelte:head>
-  <title>Login — RBX Robson</title>
+  <title>{$_('login.pageTitle')}</title>
 </svelte:head>
 
 <div class="login-page">
   <Card padding={7}>
     <Stack gap={5}>
       <img src="/brand/rbx-mark.svg" alt="RBX" width="48" height="48" />
-      <h1>Robson</h1>
-      <p>Enter your API token to access the operations console.</p>
+      <h1>{$_('login.title')}</h1>
+      <p>{$_('login.description')}</p>
       <form onsubmit={(e) => { e.preventDefault(); handleLogin(); }}>
         <Stack gap={3}>
           <input
             type="password"
             bind:value={tokenInput}
-            placeholder="Bearer token"
+            placeholder={$_('login.tokenPlaceholder')}
             autocomplete="off"
             disabled={loading}
           />
@@ -49,7 +50,7 @@
             <p class="error">{error}</p>
           {/if}
           <button class="btn-primary" type="submit" disabled={!tokenInput.trim() || loading}>
-            {loading ? 'Connecting...' : 'Connect'}
+            {loading ? $_('login.connecting') : $_('login.connect')}
           </button>
         </Stack>
       </form>

@@ -2,6 +2,7 @@
   import '$design/tokens.css';
   import { initAuth } from '$stores/auth';
   import '$lib/i18n';
+  import { isLoading } from 'svelte-i18n';
   import { browser } from '$app/environment';
 
   import type { Snippet } from 'svelte';
@@ -10,9 +11,11 @@
   if (browser) initAuth();
 </script>
 
+{#if !$isLoading}
 <main class="rbx-root">
   {@render children()}
 </main>
+{/if}
 
 <style>
   :global(html, body) {

@@ -10,7 +10,17 @@
     "login": "Login with GitHub",
     "logout": "Logout"
   },
+  "login": {
+    "title": "Robson",
+    "pageTitle": "Login — RBX Robson",
+    "description": "Enter your API token to access the operations console.",
+    "tokenPlaceholder": "Bearer token",
+    "connect": "Connect",
+    "connecting": "Connecting...",
+    "connectionFailed": "Connection failed"
+  },
   "dashboard": {
+    "pageTitle": "Dashboard — RBX Robson",
     "slotsTitle": "Slots",
     "activeOperations": "Active operations",
     "todayEvents": "Today's events",
@@ -18,7 +28,18 @@
     "carriedInto": "CARRIED INTO",
     "live": "LIVE",
     "dryRun": "DRY-RUN",
-    "free": "FREE"
+    "free": "FREE",
+    "slots": "SLOTS",
+    "occupied": "{count} OCCUPIED",
+    "freeCount": "{count} FREE",
+    "activeOps": "ACTIVE OPERATIONS",
+    "noActive": "No active positions.",
+    "todayEventsLabel": "TODAY'S EVENTS",
+    "noEventsToday": "No events today.",
+    "connecting": "CONNECTING...",
+    "offline": "OFFLINE",
+    "connectionError": "CONNECTION ERROR",
+    "retry": "Retry"
   },
   "operation": {
     "position": "Position",
@@ -27,7 +48,19 @@
     "status": "Status",
     "opened": "Opened",
     "closed": "Closed",
-    "eventStream": "Event stream"
+    "eventStream": "Event stream",
+    "title": "{label} — RBX Robson",
+    "header": "RBX ROBSON · OPERATION {id}",
+    "summary": "SUMMARY",
+    "eventStreamLabel": "EVENT STREAM",
+    "sessionOnly": "Events from this session only. Full history in FE-P2.",
+    "noEvents": "No events received yet for this position.",
+    "loading": "LOADING...",
+    "loadError": "LOAD ERROR",
+    "retry": "Retry"
+  },
+  "common": {
+    "retry": "Retry"
   },
   "killSwitch": {
     "disableTitle": "Disable Robson",
