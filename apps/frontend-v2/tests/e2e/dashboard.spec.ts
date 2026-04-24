@@ -1,37 +1,61 @@
 import { test, expect } from '@playwright/test';
+import {
+  installMockEventSource,
+  authAndGoto,
+  MOCK_POSITIONS,
+  MOCK_HALT_ACTIVE
+} from './helpers';
+
+const STATUS_OK = {
+  active_positions: 2,
+  positions: MOCK_POSITIONS,
+  pending_approvals: []
+};
 
 test.describe('Dashboard', () => {
-  test('renders dashboard page structure', async ({ page }) => {
-    await page.goto('/login');
-    await page.evaluate(() => sessionStorage.setItem('robson_api_token', 'test-token'));
-    await page.goto('/dashboard');
+  test('data state: 6 slots, 2 occupied, correct status strip', async ({ page }) => {
+    await installMockEventSource(page);
+    await page.route('**/status', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(STATUS_OK)
+      })
+    );
+    await page.route('**/monthly-halt', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(MOCK_HALT_ACTIVE)
+      })
+    );
 
-    // Page should render (auth guard passes via sessionStorage check)
-    await expect(page).toHaveURL(/\/dashboard/);
+    await authAndGoto(page, '/dashboard');
 
-    // Wait for Svelte hydration
     await expect(page.locator('.dashboard')).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator('.slot')).toHaveCount(6);
+    await expect(page.locator('.slot.occupied')).toHaveCount(2);
+    await expect(page.locator('.status-strip')).toContainText('SLOT 2/6');
+    await expect(page.locator('.op-card-link')).toHaveCount(2);
+    await expect(page.locator('.eyebrow', { hasText: "TODAY'S EVENTS" })).toBeVisible();
+    await expect(page.locator('.tick-ruler')).toBeVisible();
+  });
 
-    // Header has brand marks
-    await expect(page.locator('img[alt="RBX"]')).toBeVisible();
-    await expect(page.locator('img[alt="RBX Robson"]')).toBeVisible();
+  test('502 error state: error card and retry button visible', async ({ page }) => {
+    await installMockEventSource(page);
+    await page.route('**/status', (route) =>
+      route.fulfill({ status: 502, body: 'Bad Gateway' })
+    );
+    await page.route('**/monthly-halt', (route) =>
+      route.fulfill({ status: 502, body: 'Bad Gateway' })
+    );
 
-    // Status strip exists
-    await expect(page.locator('.status-strip')).toBeVisible();
+    await authAndGoto(page, '/dashboard');
 
-    // Either error state or data state renders below header
-    const hasError = await page.locator('.err-text').isVisible().catch(() => false);
-    if (hasError) {
-      // Error card has retry
-      await expect(page.locator('.btn-retry')).toBeVisible();
-    } else {
-      // Data state: slots, operations, events sections
-      await expect(page.locator('.slot')).toHaveCount(6);
-      await expect(page.locator('.eyebrow', { hasText: 'SLOTS' })).toBeVisible();
-      await expect(page.locator('.eyebrow', { hasText: 'ACTIVE OPERATIONS' })).toBeVisible();
-      await expect(page.locator('.eyebrow', { hasText: "TODAY'S EVENTS" })).toBeVisible();
-      await expect(page.locator('.tick-ruler')).toBeVisible();
-    }
+    await expect(page.locator('.dashboard')).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator('.err-text')).toBeVisible({ timeout: 5_000 });
+    await expect(page.locator('.btn-retry')).toBeVisible();
+    await expect(page.locator('.eyebrow', { hasText: 'CONNECTION ERROR' })).toBeVisible();
   });
 
   test('redirects to login without token', async ({ page }) => {
@@ -39,62 +63,27 @@ test.describe('Dashboard', () => {
     await expect(page).toHaveURL(/\/login/, { timeout: 5_000 });
   });
 
-  test('slot cells link to operation detail when occupied', async ({ page }) => {
-    await page.goto('/login');
-    await page.evaluate(() => sessionStorage.setItem('robson_api_token', 'test-token'));
-    await page.goto('/dashboard');
+  test('occupied slot links to operation detail', async ({ page }) => {
+    await installMockEventSource(page);
+    await page.route('**/status', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(STATUS_OK)
+      })
+    );
+    await page.route('**/monthly-halt', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(MOCK_HALT_ACTIVE)
+      })
+    );
 
-    await expect(page.locator('.dashboard')).toBeVisible({ timeout: 10_000 });
+    await authAndGoto(page, '/dashboard');
 
-    // Only meaningful if data state (not error)
-    const slotsVisible = await page.locator('.slot').first().isVisible().catch(() => false);
-    if (slotsVisible) {
-      const emptySlots = page.locator('.slot:not(.occupied)');
-      if ((await emptySlots.count()) > 0) {
-        const href = await emptySlots.first().getAttribute('href');
-        expect(href).toBe('');
-      }
-    }
-  });
-
-  test('error state renders correctly when backend unreachable', async ({ page }) => {
-    await page.goto('/login');
-    await page.evaluate(() => sessionStorage.setItem('robson_api_token', 'test-token'));
-    await page.goto('/dashboard');
-
-    await expect(page.locator('.dashboard')).toBeVisible({ timeout: 10_000 });
-
-    // Wait for API call to resolve (error or data)
-    await page.waitForTimeout(2000);
-
-    const hasError = await page.locator('.err-text').isVisible().catch(() => false);
-    if (hasError) {
-      await expect(page.locator('.eyebrow', { hasText: 'CONNECTION ERROR' })).toBeVisible();
-      await expect(page.locator('.btn-retry')).toBeVisible();
-      // Status strip shows offline
-      await expect(page.locator('.dot.err')).toBeVisible();
-    }
-  });
-
-  test('data state renders sections when backend available', async ({ page }) => {
-    await page.goto('/login');
-    await page.evaluate(() => sessionStorage.setItem('robson_api_token', 'test-token'));
-    await page.goto('/dashboard');
-
-    await expect(page.locator('.dashboard')).toBeVisible({ timeout: 10_000 });
-    await page.waitForTimeout(2000);
-
-    // Only test sections if no error (backend unreachable in test env)
-    const hasError = await page.locator('.err-text').isVisible().catch(() => false);
-    if (!hasError) {
-      // Slots grid
-      await expect(page.locator('.slot')).toHaveCount(6);
-      // Active operations section
-      await expect(page.locator('.eyebrow', { hasText: 'ACTIVE OPERATIONS' })).toBeVisible();
-      // Today's events section
-      await expect(page.locator('.eyebrow', { hasText: "TODAY'S EVENTS" })).toBeVisible();
-      // Tick ruler
-      await expect(page.locator('.tick-ruler')).toBeVisible();
-    }
+    await expect(page.locator('.slot.occupied').first()).toBeVisible({ timeout: 10_000 });
+    const href = await page.locator('.slot.occupied').first().getAttribute('href');
+    expect(href).toMatch(/\/operation\/pos-1/);
   });
 });

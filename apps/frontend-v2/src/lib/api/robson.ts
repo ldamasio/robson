@@ -104,6 +104,12 @@ export type SseEvent = {
   payload: Record<string, unknown>;
 };
 
+type EventSourceLike = {
+  onmessage: ((this: EventSource, ev: MessageEvent) => unknown) | null;
+  onerror: ((this: EventSource, ev: Event) => unknown) | null;
+  close: () => void;
+};
+
 // --- Helpers ---
 
 function getToken(): string | null {
@@ -155,7 +161,7 @@ export function connectEventStream(
   // Bearer token via query param for SSE (EventSource doesn't support headers).
   if (token) url.searchParams.set('token', token);
 
-  const source = new EventSource(url.toString());
+  const source = createEventSource(url.toString());
 
   source.onmessage = (msg) => {
     try {
@@ -169,6 +175,16 @@ export function connectEventStream(
   if (onError) source.onerror = onError;
 
   return () => source.close();
+}
+
+function createEventSource(url: string): EventSourceLike {
+  const factory = (
+    window as unknown as {
+      __RBX_EVENT_SOURCE_FACTORY__?: (targetUrl: string) => EventSourceLike;
+    }
+  ).__RBX_EVENT_SOURCE_FACTORY__;
+
+  return factory ? factory(url) : new EventSource(url);
 }
 
 // --- API surface ---

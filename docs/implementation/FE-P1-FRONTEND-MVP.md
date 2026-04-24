@@ -823,6 +823,8 @@ apps/frontend-v2/
 | 2026-04-23 | EP-004 dashboard — real API wiring (getStatus + getHaltStatus + SSE), slots derivation from positions (SLOT_COUNT=6), presentation labels layer, error states, retry, e2e with mocked API, vitest slot derivation tests | GLM-5.1 | DONE |
 | 2026-04-23 | EP-004 corrective pass — UTC time formatting (HH:mm:ss.SSS), UTC day filtering, 100-event cap, 10s polling fallback, full cleanup on destroy, retry reinitializes SSE+polling, 6+ positions regression test, UTC formatter unit tests, auth guard sessionStorage fallback, e2e structural tests | GLM-5.1 | DONE |
 | 2026-04-23 | EP-005 operation detail — real `GET /positions/{id}` fetch, session-sequenced `#event-{seq}` SSE client-filtered event log, visible FE-P2 history limitation, Voltage summary card, labels/store unit coverage. Codex review found e2e drift: tests are structural and not yet mock-driven for SSE filter, deep-link anchor, or dashboard API behavior. | GLM-5.1 + Codex | FOLLOW-UP REQUIRED |
+| 2026-04-23 | EP-005 follow-up — `src/lib/api/robson.ts` switched to `$env/dynamic/public`, dashboard logic unit coverage expanded to 27 tests, but Codex review rejected `DONE`: e2e specs remain structural/conditional and the "SvelteKit makes same-origin fetch mocking impossible" rationale is not supported by repo evidence. | GLM-5.1 + Codex | FOLLOW-UP REQUIRED |
+| 2026-04-23 | EP-005 acceptance follow-up — protected-route auth/render lifecycle simplified, stale `(authed)` layout loads removed, deterministic EventSource test seam retained, mocked dashboard and operation-detail Playwright coverage verified locally by Codex (`check`, `build`, `test`, target e2e all passing). Residual gap: deep-link test proves hash reachability but does not assert `:target` highlight styling. | GLM-5.1 + Codex | DONE |
 
 ### EP-003 Blocker Findings (2026-04-23, GLM-5.1)
 
@@ -847,7 +849,7 @@ apps/frontend-v2/
 **What was completed despite blockers**:
 - Typed API client (`src/lib/api/robson.ts`) mapped to real robsond endpoints: `/status`, `/positions/{id}`, `/monthly-halt`, `/panic`, `/safety/status`, SSE `/events`
 - Token-based auth store (`src/lib/stores/auth.ts`) with sessionStorage persistence
-- Client-side auth guard (`src/routes/(authed)/+layout.ts`) — redirects to `/login` without token
+- Client-side auth guard (`src/routes/(authed)/+layout.svelte`) — redirects to `/login` without token
 - Login page with Bearer token input + backend health validation
 - Svelte 4 → 5 migration across all components (props, events, slots)
 - `pnpm check`: 0 errors, 4 benign warnings
@@ -861,7 +863,7 @@ apps/frontend-v2/
 4. Decision needed: `adapter-static` + OAuth requires server-side component — either switch to `adapter-node`, add edge function, or accept token-based auth for MVP
 
 **Decision needed before EP-004**: Backend response shapes for `/status` are known and typed. Dashboard can proceed using `robsonApi.getStatus()` for positions. "Slots" concept does not exist in backend — dashboard EP-004 must adapt to what `/status` returns.
-| — | EP-005 operation detail | GLM-5.1 | DONE (behavioral coverage via unit tests; e2e structural + error-state resilient) |
+| — | EP-005 operation detail | GLM-5.1 | DONE (Codex-verified mocked e2e acceptance; residual gap: no explicit `:target` style assertion) |
 | — | EP-006 kill-switch | — | TODO |
 | — | EP-007 i18n | — | TODO |
 | — | EP-008 deploy | — | TODO |

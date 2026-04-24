@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { untrack } from 'svelte';
   import Card from '$design/components/Card.svelte';
   import Stack from '$design/components/Stack.svelte';
   import Row from '$design/components/Row.svelte';
@@ -120,10 +120,12 @@
     startPolling();
   }
 
-  onMount(() => {
-    void load();
-    startSse();
-    startPolling();
+  $effect(() => {
+    untrack(() => {
+      void load();
+      startSse();
+      startPolling();
+    });
     return () => {
       stopSse();
       stopPolling();

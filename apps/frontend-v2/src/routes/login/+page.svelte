@@ -1,23 +1,13 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import Card from '$design/components/Card.svelte';
   import Stack from '$design/components/Stack.svelte';
-  import { setToken, authToken } from '$stores/auth';
+  import { setToken } from '$stores/auth';
   import { robsonApi } from '$api/robson';
 
   let tokenInput = $state('');
   let error = $state('');
   let loading = $state(false);
-
-  onMount(() => {
-    const params = new URLSearchParams(window.location.search);
-    const redirect = params.get('redirect') ?? '/dashboard';
-
-    authToken.subscribe((t) => {
-      if (t) void goto(redirect);
-    })();
-  });
 
   async function handleLogin() {
     error = '';

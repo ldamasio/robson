@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { untrack } from 'svelte';
   import Card from '$design/components/Card.svelte';
   import Stack from '$design/components/Stack.svelte';
   import LCorners from '$design/components/LCorners.svelte';
@@ -53,9 +53,11 @@
     }
   }
 
-  onMount(() => {
-    void loadPosition();
-    startSse();
+  $effect(() => {
+    untrack(() => {
+      void loadPosition();
+      startSse();
+    });
     return () => {
       stopSse();
     };

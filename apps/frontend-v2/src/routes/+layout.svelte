@@ -1,12 +1,12 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
   import '$design/tokens.css';
   import { initAuth } from '$stores/auth';
+  import { browser } from '$app/environment';
 
   import type { Snippet } from 'svelte';
   let { children }: { children: Snippet } = $props();
 
-  onMount(initAuth);
+  if (browser) initAuth();
 </script>
 
 <main class="rbx-root">
