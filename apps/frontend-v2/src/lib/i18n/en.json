@@ -31,19 +31,20 @@
   },
   "killSwitch": {
     "disableTitle": "Disable Robson",
-    "enableTitle": "Enable Robson",
+    "haltedTitle": "Robson Disabled",
     "currentState": "Current state",
-    "openPositionsWarning": "The following open positions will remain open:",
-    "preventNewEntriesNote": "This action prevents Robson from opening new positions. Existing positions continue to be managed until they close naturally.",
-    "cooldownNote": "Re-enable will be blocked for 5 minutes after confirmation (backend-enforced cooldown).",
+    "triggerWarning": "This action activates MonthlyHalt. Robson will not open new positions. The backend will close/disarm open positions on trigger.",
+    "persistNote": "Halt persists until the next calendar month. No re-enable available from this interface.",
+    "haltedInfo": "MonthlyHalt remains active until the next calendar month. Cannot re-enable from this interface. Open positions were closed/disarmed by the backend when halt was triggered.",
     "typeToConfirm": "To confirm, type \"DISABLE\" below:",
-    "typeToEnable": "To confirm, type \"ENABLE\" below:",
+    "reasonLabel": "REASON FOR INTERVENTION (required):",
+    "reasonPlaceholder": "Describe the reason...",
     "disableKeyword": "DISABLE",
-    "enableKeyword": "ENABLE",
     "cancel": "Cancel",
     "disable": "Disable",
-    "enable": "Enable",
-    "cooldownActive": "Cooldown active",
-    "reenableAvailableIn": "Re-enable available in"
+    "triggeredAt": "TRIGGERED AT",
+    "reason": "REASON",
+    "description": "DESCRIPTION",
+    "blocks": "BLOCKS"
   }
 }

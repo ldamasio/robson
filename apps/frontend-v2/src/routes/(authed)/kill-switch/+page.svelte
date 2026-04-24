@@ -2,21 +2,78 @@
   import Card from '$design/components/Card.svelte';
   import Stack from '$design/components/Stack.svelte';
   import Row from '$design/components/Row.svelte';
+  import { robsonApi, type MonthlyHaltStatus, type StatusResponse, type ApiError } from '$api/robson';
+  import { haltStatus } from '$stores/slots';
 
-  // FE-P1 stub — real wiring in EP-006.
-  let currentState: 'ACTIVE' | 'DISABLED' = $state('ACTIVE');
-  let input = $state('');
-  const KEYWORD_DISABLE = 'DESLIGAR';
-  const KEYWORD_ENABLE = 'RELIGAR';
-  let targetKeyword = $derived(currentState === 'ACTIVE' ? KEYWORD_DISABLE : KEYWORD_ENABLE);
-  let canConfirm = $derived(input === targetKeyword);
+  const KEYWORD = 'DESLIGAR';
 
-  function confirm() {
-    if (!canConfirm) return;
-    // EP-006: call robsonApi.toggleKillSwitch(...)
-    currentState = currentState === 'ACTIVE' ? 'DISABLED' : 'ACTIVE';
-    input = '';
+  type PageState = 'loading' | 'active' | 'halted' | 'error';
+
+  let pageState: PageState = $state('loading');
+  let halt: MonthlyHaltStatus | null = $state(null);
+  let status: StatusResponse | null = $state(null);
+  let errorMsg = $state<string | null>(null);
+  let confirmInput = $state('');
+  let reasonInput = $state('');
+  let submitting = $state(false);
+
+  let canConfirm = $derived(
+    confirmInput === KEYWORD && reasonInput.trim().length > 0 && !submitting
+  );
+  let activeCount: number = $derived.by(() => {
+    if (status) return status.active_positions;
+    return 0;
+  });
+
+  async function loadState() {
+    errorMsg = null;
+    try {
+      const [haltData, statusData] = await Promise.all([
+        robsonApi.getHaltStatus(),
+        robsonApi.getStatus()
+      ]);
+      halt = haltData;
+      status = statusData;
+      haltStatus.set(haltData);
+      pageState = haltData.state === 'monthly_halt' ? 'halted' : 'active';
+    } catch (e) {
+      errorMsg = e instanceof Error ? e.message : 'Failed to load state';
+      pageState = 'error';
+    }
   }
+
+  async function triggerHalt() {
+    if (!canConfirm) return;
+    submitting = true;
+    errorMsg = null;
+    try {
+      const result = await robsonApi.triggerHalt(reasonInput.trim());
+      halt = result;
+      haltStatus.set(result);
+      pageState = 'halted';
+    } catch (e) {
+      const apiErr = e as ApiError;
+      errorMsg = apiErr?.message ?? 'Failed to trigger MonthlyHalt';
+    } finally {
+      submitting = false;
+    }
+  }
+
+  function formatTimestamp(iso: string | null): string {
+    if (!iso) return '—';
+    const d = new Date(iso);
+    const yyyy = d.getUTCFullYear();
+    const mm = String(d.getUTCMonth() + 1).padStart(2, '0');
+    const dd = String(d.getUTCDate()).padStart(2, '0');
+    const hh = String(d.getUTCHours()).padStart(2, '0');
+    const mi = String(d.getUTCMinutes()).padStart(2, '0');
+    const ss = String(d.getUTCSeconds()).padStart(2, '0');
+    return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss} UTC`;
+  }
+
+  $effect(() => {
+    void loadState();
+  });
 </script>
 
 <svelte:head>
@@ -24,53 +81,148 @@
 </svelte:head>
 
 <div class="ks-page">
-  <Card padding={7}>
-    <Stack gap={5}>
+  {#if pageState === 'loading'}
+    <Card padding={7}>
       <div class="eyebrow">KILL SWITCH</div>
-      <h1>{currentState === 'ACTIVE' ? 'Desligar Robson' : 'Religar Robson'}</h1>
+      <p class="muted">Loading...</p>
+    </Card>
 
-      <div class="current-state">
-        <div class="eyebrow">ESTADO ATUAL</div>
-        <div class="state-line">
-          <span class="dot" class:active={currentState === 'ACTIVE'} class:disabled={currentState === 'DISABLED'}></span>
-          ROBSON {currentState} · SLOT 4/6 · 2 POSIÇÕES ABERTAS
-        </div>
-      </div>
-
-      {#if currentState === 'ACTIVE'}
-        <p>Esta ação impede Robson de abrir novas posições. As posições existentes continuam sendo gerenciadas até fecharem naturalmente.</p>
-        <p>A reativação será bloqueada por 5 minutos após a confirmação (cooldown imposto pelo backend).</p>
-      {:else}
-        <p>Reativar permite Robson abrir novas posições quando sinais de oportunidade chegarem.</p>
-      {/if}
-
-      <Stack gap={2}>
-        <label class="eyebrow" for="confirm-input">
-          Para confirmar, digite "{targetKeyword}" abaixo:
-        </label>
-        <input
-          id="confirm-input"
-          type="text"
-          bind:value={input}
-          autocomplete="off"
-          spellcheck="false"
-          class="confirm-input"
-        />
+  {:else if pageState === 'error'}
+    <Card padding={7}>
+      <Stack gap={4}>
+        <div class="eyebrow">KILL SWITCH</div>
+        <p class="err-text">{errorMsg}</p>
+        <button class="btn-retry" onclick={loadState}>Retry</button>
       </Stack>
+    </Card>
 
-      <Row gap={3} justify="end">
-        <a href="/dashboard" class="btn-cancel">Cancelar</a>
-        <button
-          class="btn-confirm"
-          class:ready={canConfirm}
-          disabled={!canConfirm}
-          onclick={confirm}
-        >
-          {currentState === 'ACTIVE' ? 'Desligar' : 'Religar'}
-        </button>
-      </Row>
-    </Stack>
-  </Card>
+  {:else if pageState === 'active'}
+    <Card padding={7}>
+      <Stack gap={5}>
+        <div class="eyebrow">KILL SWITCH</div>
+        <h1>Desligar Robson</h1>
+
+        <div class="current-state">
+          <div class="eyebrow">ESTADO ATUAL</div>
+          <div class="state-line">
+            <span class="dot live"></span>
+            ACTIVE{#if status} · SLOT {activeCount}/6 · {activeCount} {activeCount === 1 ? 'POSIÇÃO ABERTA' : 'POSIÇÕES ABERTAS'}{/if}
+          </div>
+        </div>
+
+        <div class="warning-block">
+          <p>
+            Esta ação ativa o <span class="mono">MonthlyHalt</span>.
+            Robson não abrirá novas posições.
+            O backend fechará/desarmará as posições abertas ao executar o halt.
+          </p>
+          <p>
+            O halt persiste até o próximo mês calendário.
+            Não existe reativação pela interface.
+          </p>
+        </div>
+
+        <Stack gap={3}>
+          <label class="eyebrow" for="reason-input">
+            MOTIVO DA INTERVENÇÃO (obrigatório):
+          </label>
+          <textarea
+            id="reason-input"
+            bind:value={reasonInput}
+            placeholder="Descreva o motivo..."
+            rows={3}
+            class="reason-input"
+          ></textarea>
+        </Stack>
+
+        <Stack gap={2}>
+          <label class="eyebrow" for="confirm-input">
+            Para confirmar, digite "{KEYWORD}" abaixo:
+          </label>
+          <input
+            id="confirm-input"
+            type="text"
+            bind:value={confirmInput}
+            autocomplete="off"
+            spellcheck="false"
+            class="confirm-input"
+          />
+        </Stack>
+
+        {#if errorMsg}
+          <p class="err-text">{errorMsg}</p>
+        {/if}
+
+        <Row gap={3} justify="end">
+          <a href="/dashboard" class="btn-cancel">Cancelar</a>
+          <button
+            class="btn-confirm"
+            class:ready={canConfirm}
+            disabled={!canConfirm}
+            onclick={triggerHalt}
+          >
+            {#if submitting}
+              Executando...
+            {:else}
+              Desligar
+            {/if}
+          </button>
+        </Row>
+      </Stack>
+    </Card>
+
+  {:else if pageState === 'halted'}
+    <Card padding={7}>
+      <Stack gap={5}>
+        <div class="eyebrow">KILL SWITCH</div>
+        <h1>Robson Desligado</h1>
+
+        <div class="halted-state">
+          <div class="eyebrow">ESTADO ATUAL</div>
+          <div class="state-line">
+            <span class="dot halted"></span>
+            MONTHLY HALT ATIVO
+          </div>
+        </div>
+
+        <div class="halted-detail">
+          <Stack gap={3}>
+            {#if halt?.triggered_at}
+              <div>
+                <span class="eyebrow">TRIGGERED AT</span>
+                <div class="mono ts">{formatTimestamp(halt.triggered_at)}</div>
+              </div>
+            {/if}
+            {#if halt?.reason}
+              <div>
+                <span class="eyebrow">REASON</span>
+                <div class="reason-text">{halt.reason}</div>
+              </div>
+            {/if}
+            <div>
+              <span class="eyebrow">DESCRIPTION</span>
+              <div class="reason-text">{halt?.description ?? '—'}</div>
+            </div>
+            <div>
+              <span class="eyebrow">BLOCKS</span>
+              <div class="mono meta">
+                New entries: {halt?.blocks_new_entries ? 'YES' : 'NO'}
+                · Signals: {halt?.blocks_signals ? 'YES' : 'NO'}
+              </div>
+            </div>
+          </Stack>
+        </div>
+
+        <div class="info-block">
+          <p>
+            MonthlyHalt permanece ativo até o próximo mês calendário.
+            Não é possível reativar por esta interface.
+            Posições abertas foram fechadas/desarmadas pelo backend ao disparar o halt.
+          </p>
+        </div>
+      </Stack>
+    </Card>
+  {/if}
 </div>
 
 <style>
@@ -92,7 +244,8 @@
     color: var(--fg-2);
     font-weight: 500;
   }
-  .current-state {
+  .current-state,
+  .halted-state {
     display: flex;
     flex-direction: column;
     gap: var(--s-2);
@@ -100,6 +253,10 @@
     background: var(--bg-2);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
+  }
+  .halted-state {
+    border-color: var(--err);
+    background: var(--err-subtle);
   }
   .state-line {
     font-family: var(--font-mono);
@@ -114,16 +271,84 @@
     width: 6px;
     height: 6px;
     border-radius: 50%;
+    display: inline-block;
   }
-  .dot.active {
+  .dot.live {
     background: var(--ok);
   }
-  .dot.disabled {
+  .dot.halted {
     background: var(--err);
+  }
+  .muted {
+    color: var(--fg-3);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+  }
+  .warning-block {
+    padding: var(--s-4);
+    background: var(--err-subtle);
+    border: 1px solid var(--err);
+    border-radius: var(--radius-sm);
+  }
+  .warning-block p {
+    color: var(--fg-1);
+    font-size: var(--text-sm);
+    margin: 0;
+  }
+  .warning-block p + p {
+    margin-top: var(--s-2);
+  }
+  .info-block p {
+    color: var(--fg-2);
+    font-size: var(--text-sm);
+    margin: 0;
+  }
+  .mono {
+    font-family: var(--font-mono);
+    font-variant-numeric: tabular-nums;
+  }
+  .ts {
+    font-size: var(--text-sm);
+    color: var(--fg-0);
+    letter-spacing: var(--track-wide);
+    margin-top: var(--s-1);
+  }
+  .meta {
+    font-size: var(--text-xs);
+    color: var(--fg-2);
+    letter-spacing: var(--track-wide);
+    margin-top: var(--s-1);
+  }
+  .reason-text {
+    color: var(--fg-1);
+    font-size: var(--text-sm);
+    margin-top: var(--s-1);
+  }
+  .halted-detail {
+    padding: var(--s-4);
+    background: var(--bg-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
   }
   p {
     color: var(--fg-1);
     font-size: var(--text-base);
+  }
+  .reason-input {
+    font-family: var(--font-sans);
+    font-size: var(--text-sm);
+    padding: var(--s-3);
+    background: var(--bg-3);
+    border: 1px solid var(--border-strong);
+    border-radius: var(--radius-sm);
+    color: var(--fg-0);
+    outline: none;
+    resize: vertical;
+    width: 100%;
+    box-sizing: border-box;
+  }
+  .reason-input:focus {
+    border-color: var(--cyan-brand);
   }
   .confirm-input {
     font-family: var(--font-mono);
@@ -136,6 +361,8 @@
     border-radius: var(--radius-sm);
     color: var(--fg-0);
     outline: none;
+    width: 100%;
+    box-sizing: border-box;
   }
   .confirm-input:focus {
     border-color: var(--cyan-brand);
@@ -149,6 +376,7 @@
     color: var(--fg-0);
     border-radius: var(--radius-sm);
     cursor: pointer;
+    text-decoration: none;
     border-bottom: 1px solid var(--border-strong);
   }
   .btn-confirm {
@@ -172,5 +400,24 @@
   .btn-confirm.ready:hover {
     background: var(--cyan-brand);
     border-color: var(--cyan-brand);
+  }
+  .btn-retry {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    padding: var(--s-2) var(--s-4);
+    border: 1px solid var(--cyan-dim);
+    background: transparent;
+    color: var(--cyan-brand);
+    border-radius: var(--radius-sm);
+    cursor: pointer;
+  }
+  .btn-retry:hover {
+    background: var(--cyan-subtle);
+  }
+  .err-text {
+    color: var(--err, #ff4444);
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    word-break: break-word;
   }
 </style>

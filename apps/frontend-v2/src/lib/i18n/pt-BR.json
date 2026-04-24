@@ -31,19 +31,20 @@
   },
   "killSwitch": {
     "disableTitle": "Desligar Robson",
-    "enableTitle": "Religar Robson",
+    "haltedTitle": "Robson Desligado",
     "currentState": "Estado atual",
-    "openPositionsWarning": "As seguintes posições abertas permanecerão abertas:",
-    "preventNewEntriesNote": "Esta ação impede Robson de abrir novas posições. As posições existentes continuam sendo gerenciadas até fecharem naturalmente.",
-    "cooldownNote": "A reativação será bloqueada por 5 minutos após a confirmação (cooldown imposto pelo backend).",
+    "triggerWarning": "Esta ação ativa o MonthlyHalt. Robson não abrirá novas posições. O backend fechará/desarmará as posições abertas ao executar o halt.",
+    "persistNote": "O halt persiste até o próximo mês calendário. Não existe reativação pela interface.",
+    "haltedInfo": "MonthlyHalt permanece ativo até o próximo mês calendário. Não é possível reativar por esta interface. Posições abertas foram fechadas/desarmadas pelo backend ao disparar o halt.",
     "typeToConfirm": "Para confirmar, digite \"DESLIGAR\" abaixo:",
-    "typeToEnable": "Para confirmar, digite \"RELIGAR\" abaixo:",
+    "reasonLabel": "MOTIVO DA INTERVENÇÃO (obrigatório):",
+    "reasonPlaceholder": "Descreva o motivo...",
     "disableKeyword": "DESLIGAR",
-    "enableKeyword": "RELIGAR",
     "cancel": "Cancelar",
     "disable": "Desligar",
-    "enable": "Religar",
-    "cooldownActive": "Cooldown ativo",
-    "reenableAvailableIn": "Reativação disponível em"
+    "triggeredAt": "TRIGGERED AT",
+    "reason": "REASON",
+    "description": "DESCRIPTION",
+    "blocks": "BLOCKS"
   }
 }
