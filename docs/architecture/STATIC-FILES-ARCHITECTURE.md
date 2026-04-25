@@ -1,5 +1,10 @@
 # Static Files Architecture
 
+> **DEPRECATED** — This document describes the legacy Django + Gunicorn
+> static file architecture. The frontend now serves via nginx in k3s
+> (SvelteKit + adapter-static). See ADR-0028 (hosting pivot to k3s) and
+> `docs/runbooks/frontend-deploy.md` for the current architecture.
+
 ## Overview
 
 Robson uses a layered architecture for serving web traffic, combining

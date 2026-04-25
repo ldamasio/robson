@@ -1,5 +1,8 @@
 # RabbitMQ Operations Runbook
 
+> **STATUS: DEPRECATED** — RabbitMQ is not used in Robson v3. This runbook
+> should be archived to `docs/history/`. Retained pending archive.
+
 **Service**: RabbitMQ Admin Plane
 **Owner**: Platform Team
 **Related ADRs**: [ADR-0015](../adr/ADR-0015-rust-stop-engine-rabbitmq.md), [ADR-0016](../adr/ADR-0016-networking-and-observability-architecture.md)

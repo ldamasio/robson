@@ -17,7 +17,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - **CI uses nightly rustfmt**: Added `rustup toolchain install nightly --component rustfmt`
   step; formatting check now runs `cargo +nightly fmt --all --check` instead of stable.
 - **GitOps paths corrected**: `Build & Push Image` job was targeting non-existent paths
-  `apps/prod/robson-v2/robsond-deployment.yml` in rbx-infra. Fixed to correct paths:
+  `apps/prod/robson/robsond-deploy.yml` in rbx-infra. Fixed to correct paths:
   `apps/prod/robson/robsond-deploy.yml` and `apps/prod/robson/robsond-db-migrate-job.yml`.
 - Codebase reformatted with nightly rustfmt (62 files, net −534 lines).
 
