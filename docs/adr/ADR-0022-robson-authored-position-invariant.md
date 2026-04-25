@@ -163,10 +163,10 @@ Follow-up work required (tracked as `MIG-v3#TBD — Reconciliation Worker`):
 
 ### Related Components
 
-- `v2/robsond/src/position_manager.rs` — will own the reconciliation loop
-- `v2/robsond/src/safety_net.rs` (target) — close path for UNTRACKED positions
-- `v2/robson-eventlog/` — exchange-order-id index on events
-- `v2/robson-exec/src/executor.rs` — exchange query for open positions (all symbols)
+- `v3/robsond/src/position_manager.rs` — will own the reconciliation loop
+- `v3/robsond/src/safety_net.rs` (target) — close path for UNTRACKED positions
+- `v3/robson-eventlog/` — exchange-order-id index on events
+- `v3/robson-exec/src/executor.rs` — exchange query for open positions (all symbols)
 
 ---
 

@@ -11,7 +11,7 @@ for Robson v2 (Rust). The pipeline lives in `.github/workflows/robson-v2.yml`.
 
 | Tag Pattern | When Created | Use Case | Example |
 |-------------|--------------|----------|---------|
-| `sha-<8chars>` | Every push to `main` (via `v2/**` path filter) | **Production** | `sha-776a72f9` |
+| `sha-<8chars>` | Every push to `main` (via `v3/**` path filter) | **Production** | `sha-776a72f9` |
 | `latest` | Every push to `main` | Dev/local only | `latest` |
 
 ### SHA Tags (Golden Standard)
@@ -31,16 +31,16 @@ on:
   push:
     branches: ["main"]
     paths:
-      - "v2/**"
+      - "v3/**"
   pull_request:
     branches: ["main"]
     paths:
-      - "v2/**"
+      - "v3/**"
   workflow_dispatch:
 ```
 
 > **Important**: Changes exclusively in `.github/workflows/` do **not** trigger the
-> workflow automatically due to the `v2/**` path filter. Use `workflow_dispatch` manually:
+> workflow automatically due to the `v3/**` path filter. Use `workflow_dispatch` manually:
 > ```bash
 > gh workflow run robson-v2.yml --repo ldamasio/robson --ref main
 > ```
@@ -51,17 +51,17 @@ on:
 
 ### Job 1: Rust Tests
 
-1. Cache Rust toolchain and deps (`~/.rustup`, `~/.cargo`, `v2/target`)
+1. Cache Rust toolchain and deps (`~/.rustup`, `~/.cargo`, `v3/target`)
 2. `cargo test --all --no-fail-fast`
 3. `rustup toolchain install nightly --component rustfmt`
-4. `cargo +nightly fmt --all --check` (nightly required for options in `v2/rustfmt.toml`)
+4. `cargo +nightly fmt --all --check` (nightly required for options in `v3/rustfmt.toml`)
 5. `cargo clippy --all-targets -- -D clippy::correctness -D clippy::suspicious`
 
 ### Job 2: Build & Push Image (main only, after Job 1)
 
 1. Docker Buildx setup
 2. Login to GHCR (`ghcr.io`) with `GITOPS_TOKEN`
-3. Build from `v2/Dockerfile`, push tags `sha-<8chars>` and `latest`
+3. Build from `v3/Dockerfile`, push tags `sha-<8chars>` and `latest`
 4. Clone `rbxrobotica/rbx-infra`, update manifest image tags via `sed`, commit and push
 5. ArgoCD detects manifest change and syncs automatically
 
@@ -70,7 +70,7 @@ on:
 ## GitOps Flow
 
 ```
-Push to main (v2/** change)
+Push to main (v3/** change)
     │
     ▼
 Rust Tests: cargo test + nightly fmt check + clippy
@@ -94,7 +94,7 @@ ArgoCD syncs (namespace: robson)
 
 ## rustfmt Configuration
 
-`v2/rustfmt.toml` uses **nightly-only options** (e.g., `imports_granularity`,
+`v3/rustfmt.toml` uses **nightly-only options** (e.g., `imports_granularity`,
 `group_imports`, `wrap_comments`, `format_code_in_doc_comments`). The CI explicitly
 installs the nightly toolchain to run formatting checks. Do not simplify `rustfmt.toml`
 to stable-only options.
@@ -158,7 +158,7 @@ cargo +nightly fmt --all --check
 
 ### CI not triggered after workflow file change
 
-The workflow only triggers on `v2/**` path changes. For workflow-only changes,
+The workflow only triggers on `v3/**` path changes. For workflow-only changes,
 dispatch manually:
 ```bash
 gh workflow run robson-v2.yml --repo ldamasio/robson --ref main
@@ -169,6 +169,6 @@ gh workflow run robson-v2.yml --repo ldamasio/robson --ref main
 ## References
 
 - [Workflow](.github/workflows/robson-v2.yml)
-- [rustfmt config](v2/rustfmt.toml)
+- [rustfmt config](v3/rustfmt.toml)
 - [rbx-infra manifests](https://github.com/rbxrobotica/rbx-infra/tree/main/apps/prod/robson)
 - [ADR-0011: GitOps Automatic Manifest Updates](../adr/ADR-0011-gitops-automatic-manifest-updates.md)

@@ -9,9 +9,9 @@ The assessment is about the system as a governed execution runtime. It is not a 
 Repository reality is split across two layers:
 
 - Legacy application surfaces at the repository root, still documented in the top-level `README.md`.
-- The Rust runtime migration track under `v2/`, centered on `robsond`, `robson-exec`, `robson-eventlog`, `robson-projector`, and the `docs/architecture` migration documents.
+- The Rust runtime migration track under `v3/`, centered on `robsond`, `robson-exec`, `robson-eventlog`, `robson-projector`, and the `docs/architecture` migration documents.
 
-This report therefore treats `v2/robsond` and its adjacent runtime crates as the primary assessment boundary.
+This report therefore treats `v3/robsond` and its adjacent runtime crates as the primary assessment boundary.
 
 ## 2. System Classification
 
@@ -21,9 +21,9 @@ Repository-verified status: the system is best classified as a research runtime 
 
 Reasons:
 
-- `v2/README.md` explicitly marks the Rust runtime as `Development (Alpha)`.
-- `v2/robsond/src/main.rs` boots `Daemon::new_stub_with_recovery(...)` or `Daemon::new_stub(...)`, not a production exchange-backed runtime.
-- `v2/robson-exec/src/stub.rs` confirms that the active daemon path uses a stub exchange with simulated fills.
+- `v3/README.md` explicitly marks the Rust runtime as `Development (Alpha)`.
+- `v3/robsond/src/main.rs` boots `Daemon::new_stub_with_recovery(...)` or `Daemon::new_stub(...)`, not a production exchange-backed runtime.
+- `v3/robson-exec/src/stub.rs` confirms that the active daemon path uses a stub exchange with simulated fills.
 - Several governance and durability mechanisms exist, but they remain partial, in-memory, or migration-scoped.
 
 ### Target state: Governed Financial Decision System
@@ -52,17 +52,17 @@ That target state is not yet the repository-verified current implementation.
 
 **What exists**
 
-- Typed domain lifecycle events exist in `v2/robson-domain/src/events.rs` for arming, signal receipt, order placement, fills, trailing stop updates, exits, closure, disarm, and error conditions.
-- A structured PostgreSQL event envelope exists in `v2/robson-eventlog/src/types.rs` with tenant scope, stream key, sequence number, idempotency key, correlation metadata, actor fields, and reserved hash-chain fields.
-- Event append logic in `v2/robson-eventlog/src/append.rs` provides ordered stream persistence plus global idempotency.
-- Query lifecycle persistence exists through `v2/robsond/src/query_engine.rs`, `v2/migrations/20240101000007_query_audit_phase4.sql`, and `v2/robson-projector/src/handlers/queries.rs`.
-- Replayability for query audit projections is repository-verified by `v2/robsond/tests/replay_test.rs`.
+- Typed domain lifecycle events exist in `v3/robson-domain/src/events.rs` for arming, signal receipt, order placement, fills, trailing stop updates, exits, closure, disarm, and error conditions.
+- A structured PostgreSQL event envelope exists in `v3/robson-eventlog/src/types.rs` with tenant scope, stream key, sequence number, idempotency key, correlation metadata, actor fields, and reserved hash-chain fields.
+- Event append logic in `v3/robson-eventlog/src/append.rs` provides ordered stream persistence plus global idempotency.
+- Query lifecycle persistence exists through `v3/robsond/src/query_engine.rs`, `v3/migrations/20240101000007_query_audit_phase4.sql`, and `v3/robson-projector/src/handlers/queries.rs`.
+- Replayability for query audit projections is repository-verified by `v3/robsond/tests/replay_test.rs`.
 
 **What is partial**
 
-- Position-domain events are durably bridged from runtime execution through `v2/robsond/src/position_manager.rs`, but this is a synchronous fail-fast bridge, not a unified transactional state model.
-- `positions_current` is updated synchronously on the runtime write path when PostgreSQL is configured, while query audit projection is worker-driven through `v2/robsond/src/projection_worker.rs`.
-- Restart handling explicitly invalidates in-memory pending approvals by appending `restart_invalidated` query events in `v2/robsond/src/daemon.rs`.
+- Position-domain events are durably bridged from runtime execution through `v3/robsond/src/position_manager.rs`, but this is a synchronous fail-fast bridge, not a unified transactional state model.
+- `positions_current` is updated synchronously on the runtime write path when PostgreSQL is configured, while query audit projection is worker-driven through `v3/robsond/src/projection_worker.rs`.
+- Restart handling explicitly invalidates in-memory pending approvals by appending `restart_invalidated` query events in `v3/robsond/src/daemon.rs`.
 
 **What is missing**
 
@@ -75,9 +75,9 @@ That target state is not yet the repository-verified current implementation.
 
 **What exists**
 
-- `v2/robsond/src/query_engine.rs` implements a real blocking governance path for entry execution via `check_risk()`, `check_approval()`, `revalidate_risk()`, and `authorize()`.
-- `v2/robsond/src/query.rs` defines an explicit query lifecycle: `Accepted -> Processing -> RiskChecked -> AwaitingApproval -> Authorized -> Acting -> Completed`, plus `Failed`, `Denied`, and `Expired`.
-- `v2/robsond/src/position_manager.rs` routes entry-signal handling through the query lifecycle and governance gate before executor dispatch.
+- `v3/robsond/src/query_engine.rs` implements a real blocking governance path for entry execution via `check_risk()`, `check_approval()`, `revalidate_risk()`, and `authorize()`.
+- `v3/robsond/src/query.rs` defines an explicit query lifecycle: `Accepted -> Processing -> RiskChecked -> AwaitingApproval -> Authorized -> Acting -> Completed`, plus `Failed`, `Denied`, and `Expired`.
+- `v3/robsond/src/position_manager.rs` routes entry-signal handling through the query lifecycle and governance gate before executor dispatch.
 - The architecture docs correctly frame the runtime as the control authority and any future model as subordinate dependency.
 
 **What is partial**
@@ -88,19 +88,19 @@ That target state is not yet the repository-verified current implementation.
 
 **What is missing**
 
-- `v2/robsond/src/api.rs` exposes mutating routes for arm, signal injection, approval, disarm, and panic with no repository-visible authentication or authorization layer.
+- `v3/robsond/src/api.rs` exposes mutating routes for arm, signal injection, approval, disarm, and panic with no repository-visible authentication or authorization layer.
 - Operator authority is therefore not attributable at the API boundary.
-- `v2/robsond/src/config.rs` defaults the API bind to `0.0.0.0:8080`, expanding exposure of an unauthenticated control surface.
+- `v3/robsond/src/config.rs` defaults the API bind to `0.0.0.0:8080`, expanding exposure of an unauthenticated control surface.
 - The documented pause/resume and circuit-breaker control model in `docs/architecture/v3-control-loop.md` is not implemented as current runtime authority.
 
 ### Risk Controls
 
 **What exists**
 
-- `v2/robson-engine/src/risk.rs` implements explicit portfolio checks for maximum open positions, total exposure, single-position concentration, duplicate position prevention, and daily loss limit logic.
-- `v2/robsond/src/position_manager.rs` builds a risk context using `find_risk_open()` from `v2/robson-store/src/repository.rs`, which correctly counts `Entering` and `Active` positions for exposure.
-- `v2/robson-exec/src/executor.rs` validates isolated margin and fixed leverage before both entry and exit orders.
-- `v2/robsond/src/position_monitor.rs` implements a rogue-position Safety Net with retries, cooldown, and panic-mode escalation.
+- `v3/robson-engine/src/risk.rs` implements explicit portfolio checks for maximum open positions, total exposure, single-position concentration, duplicate position prevention, and daily loss limit logic.
+- `v3/robsond/src/position_manager.rs` builds a risk context using `find_risk_open()` from `v3/robson-store/src/repository.rs`, which correctly counts `Entering` and `Active` positions for exposure.
+- `v3/robson-exec/src/executor.rs` validates isolated margin and fixed leverage before both entry and exit orders.
+- `v3/robsond/src/position_monitor.rs` implements a rogue-position Safety Net with retries, cooldown, and panic-mode escalation.
 
 **What is partial**
 
@@ -110,9 +110,9 @@ That target state is not yet the repository-verified current implementation.
 
 **What is missing**
 
-- `v2/robsond/src/position_manager.rs` explicitly states that daily realized and unrealized PnL default to zero, which makes the daily loss breaker effectively inactive.
-- `v2/robsond/src/api.rs` accepts `capital` and `risk_percent`, but `v2/robsond/src/position_manager.rs` ignores the supplied `RiskConfig`, while `v2/robsond/src/daemon.rs` initializes the engine with a hardcoded `$10,000 / 1%` configuration.
-- `v2/robson-domain/src/entities.rs` hardcodes fixed 10x leverage at the domain layer.
+- `v3/robsond/src/position_manager.rs` explicitly states that daily realized and unrealized PnL default to zero, which makes the daily loss breaker effectively inactive.
+- `v3/robsond/src/api.rs` accepts `capital` and `risk_percent`, but `v3/robsond/src/position_manager.rs` ignores the supplied `RiskConfig`, while `v3/robsond/src/daemon.rs` initializes the engine with a hardcoded `$10,000 / 1%` configuration.
+- `v3/robson-domain/src/entities.rs` hardcodes fixed 10x leverage at the domain layer.
 - The documented circuit-breaker ladder in `docs/architecture/v3-migration-plan.md` and `docs/architecture/v3-control-loop.md` is still pending.
 - Panic close is incomplete because `Entering` positions are explicitly skipped until cancel-order logic exists.
 
@@ -120,11 +120,11 @@ That target state is not yet the repository-verified current implementation.
 
 **What exists**
 
-- Query lifecycle failures are explicit and typed in `v2/robsond/src/query.rs`.
-- Runtime restart invalidates unsafe pending approvals in `v2/robsond/src/daemon.rs`.
-- The event-log persistence bridge in `v2/robsond/src/position_manager.rs` is fail-fast when PostgreSQL is configured.
-- Safety Net failure handling in `v2/robsond/src/position_monitor.rs` includes transient retry logic, cooldown windows, and panic mode.
-- Recovery from projection is present in `v2/robsond/src/daemon.rs` when the store is empty and projection recovery is configured.
+- Query lifecycle failures are explicit and typed in `v3/robsond/src/query.rs`.
+- Runtime restart invalidates unsafe pending approvals in `v3/robsond/src/daemon.rs`.
+- The event-log persistence bridge in `v3/robsond/src/position_manager.rs` is fail-fast when PostgreSQL is configured.
+- Safety Net failure handling in `v3/robsond/src/position_monitor.rs` includes transient retry logic, cooldown windows, and panic mode.
+- Recovery from projection is present in `v3/robsond/src/daemon.rs` when the store is empty and projection recovery is configured.
 
 **What is partial**
 
@@ -134,20 +134,20 @@ That target state is not yet the repository-verified current implementation.
 
 **What is missing**
 
-- `v2/robson-exec/src/executor.rs` performs one exchange call per order and does not implement the retry semantics described in the architecture docs.
-- `v2/robsond/src/api.rs` reports readiness even when PostgreSQL is absent and without a real Binance connectivity check.
-- `v2/robsond/src/position_manager.rs` leaves `Entering` positions unmanaged during panic if the order must be canceled.
+- `v3/robson-exec/src/executor.rs` performs one exchange call per order and does not implement the retry semantics described in the architecture docs.
+- `v3/robsond/src/api.rs` reports readiness even when PostgreSQL is absent and without a real Binance connectivity check.
+- `v3/robsond/src/position_manager.rs` leaves `Entering` positions unmanaged during panic if the order must be canceled.
 - Because the daemon currently boots `MemoryStore` plus `StubExchange`, the repository does not provide a credible live failure-handling path for the main runtime binary.
 
 ### Observability
 
 **What exists**
 
-- `v2/robsond/src/main.rs` initializes structured tracing.
-- `v2/robsond/src/query_engine.rs` emits structured logs for query-state transitions.
+- `v3/robsond/src/main.rs` initializes structured tracing.
+- `v3/robsond/src/query_engine.rs` emits structured logs for query-state transitions.
 - Query lifecycle snapshots are durable when PostgreSQL is configured.
-- `v2/robsond/src/api.rs` exposes `/events`, `/status`, `/health`, `/healthz`, `/readyz`, and Safety Net status endpoints.
-- SSE event mapping exists in `v2/robsond/src/sse.rs` for operator-facing runtime updates.
+- `v3/robsond/src/api.rs` exposes `/events`, `/status`, `/health`, `/healthz`, `/readyz`, and Safety Net status endpoints.
+- SSE event mapping exists in `v3/robsond/src/sse.rs` for operator-facing runtime updates.
 
 **What is partial**
 
@@ -157,7 +157,7 @@ That target state is not yet the repository-verified current implementation.
 
 **What is missing**
 
-- The runtime does not expose a real `/metrics` endpoint, despite `v2/k8s/prod/robsond-deployment.yml` advertising Prometheus scraping on `/metrics`.
+- The runtime does not expose a real `/metrics` endpoint, despite `v3/k8s/prod/robsond-deployment.yml` advertising Prometheus scraping on `/metrics`.
 - No repository-visible Prometheus counters, histograms, or OpenTelemetry instrumentation exist in the runtime crates.
 - Operator identity is not attached to API-originated actions, so audit metadata cannot support institutional accountability.
 - There is no repository-verified operator-grade inspection surface for replay, drift analysis, or runtime watermark visibility.
@@ -174,7 +174,7 @@ That target state is not yet the repository-verified current implementation.
 **What is partial**
 
 - The implemented model is transitional: `Store` is operational truth during runtime, `EventLog` is durable truth when wired, and projections are partly synchronous and partly worker-updated.
-- `v2/robsond/src/daemon.rs` rebuilds from `store.events().get_all_events()` and falls back to projection recovery when the store is empty.
+- `v3/robsond/src/daemon.rs` rebuilds from `store.events().get_all_events()` and falls back to projection recovery when the store is empty.
 - `docs/architecture/v3-runtime-spec.md` and `docs/architecture/v3-query-query-engine.md` correctly state that explicit `RuntimeState` is a v3 target, not current implementation.
 
 **What is missing**
@@ -200,7 +200,7 @@ That target state is not yet the repository-verified current implementation.
 
 ### Transitional
 
-- Split architecture between legacy root application surfaces and `v2/` Rust runtime track.
+- Split architecture between legacy root application surfaces and `v3/` Rust runtime track.
 - Query audit projection implemented while position projection still relies on synchronous write-path bridging.
 - Pending approvals intentionally non-durable during the migration period.
 - `Store`-based operational truth still stands in for the explicit `RuntimeState` planned for v3.

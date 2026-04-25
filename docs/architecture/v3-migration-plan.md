@@ -700,7 +700,7 @@ The Risk Engine is a mandatory gate in the control loop. Every `EngineAction` pa
 
 > **Note (2026-04-18)**: The L1–L4 escalation ladder described in earlier revisions
 > has been **replaced by a binary MonthlyHalt** per `docs/architecture/v3-risk-engine-spec.md`
-> §"What v3 Does NOT Include". The implementation in `v2/robsond/src/circuit_breaker.rs`
+> §"What v3 Does NOT Include". The implementation in `v3/robsond/src/circuit_breaker.rs`
 > is binary: `Active ⟷ MonthlyHalt`. There are no escalation levels, no auto-escalation
 > timers, and no Half-Open recovery state. See the risk engine spec for the authoritative
 > policy. The table below is retained for historical reference only.
@@ -957,7 +957,7 @@ Reconsider TRON integration when ALL of these are true:
 
 | ID | Change | Why It Cannot Wait | Depends On | Effort | Reversible? | Rollback | Breaks If Skipped |
 |----|--------|--------------------|-----------|--------|-------------|----------|-------------------|
-| MIG-v2.5#1 | **Deploy robsond to k3s alongside Django** | Rust daemon must be running before it can take over stop monitoring. Deploy first, verify stability. | K8s manifests (exist in v2/k8s/) | S | Yes — undeploy pod | `kubectl delete deployment robsond` | v3 has no production-proven daemon |
+| MIG-v2.5#1 | **Deploy robsond to k3s alongside Django** | Rust daemon must be running before it can take over stop monitoring. Deploy first, verify stability. | K8s manifests (exist in v3/k8s/) | S | Yes — undeploy pod | `kubectl delete deployment robsond` | v3 has no production-proven daemon |
 | MIG-v2.5#2 | **Complete projector handlers** (robson-projector, currently 40%) | Without projections, Runtime cannot reconstruct state on restart | MIG-v2.5#1 | M | Yes — code change only | Revert commit | Runtime loses state on restart, requires full EventLog replay every time |
 | MIG-v2.5#3 | **Migrate stop monitoring from Django CronJob to robsond WebSocket** | CronJob has 60s granularity. WebSocket achieves <500ms. This is the core latency improvement. | MIG-v2.5#1, MIG-v2.5#2 | M | Yes — re-enable CronJob | Re-enable `rbs-stop-monitor-cronjob`, disable robsond stop monitor | Stop-loss latency stays at 60s, unacceptable for leveraged trading |
 | MIG-v2.5#4 | **Implement GovernedAction + Risk Engine as blocking gate** | Risk Engine is currently in robson-engine but not wired as mandatory gate. Must block before any v3 feature relies on it. | MIG-v2.5#1 | M | Yes — revert to advisory mode | Config flag: `risk_engine_mode: advisory` | Risk Engine bypass possible, defeating the entire safety architecture |

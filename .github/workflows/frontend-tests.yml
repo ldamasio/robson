@@ -4,12 +4,12 @@ on:
   push:
     branches: ["**"]
     paths:
-      - "apps/frontend-v2/**"
+      - "apps/frontend/**"
       - ".github/workflows/frontend-tests.yml"
   pull_request:
     branches: ["**"]
     paths:
-      - "apps/frontend-v2/**"
+      - "apps/frontend/**"
       - ".github/workflows/frontend-tests.yml"
 
 jobs:
@@ -31,17 +31,17 @@ jobs:
           version: 9
 
       - name: Install dependencies
-        working-directory: apps/frontend-v2
+        working-directory: apps/frontend
         run: pnpm install --frozen-lockfile
 
       - name: Type check
-        working-directory: apps/frontend-v2
+        working-directory: apps/frontend
         run: pnpm run check
 
       - name: Unit tests
-        working-directory: apps/frontend-v2
+        working-directory: apps/frontend
         run: pnpm run test
 
       - name: Build
-        working-directory: apps/frontend-v2
+        working-directory: apps/frontend
         run: pnpm run build

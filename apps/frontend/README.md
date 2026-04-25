@@ -1,26 +1,61 @@
-# robson-frontend
+# RBX Robson Frontend v2
 
-React (Vite) app organized with Ports & Adapters on the client side.
+SvelteKit static frontend for Robson v3. Dual-domain:
+`robson.rbx.ia.br` (pt-BR default) and `robson.rbxsystems.ch` (en default).
 
-- `src/domain`: pure types and logic
-- `src/ports`: interfaces for HTTP/WS/storage
-- `src/adapters`: implementations (fetch/WebSocket/localStorage)
-- `src/application`: client-side use cases/state orchestration
+## Stack
 
-The previous frontend at `frontends/web/` will be migrated here.
+- SvelteKit 2 + `@sveltejs/adapter-static`
+- TypeScript strict
+- Custom design tokens from RBX Voltage System (no Tailwind)
+- `svelte-i18n` for locale handling
+- Auth.js for GitHub OAuth (to be wired in EP-003)
+- Vitest + Playwright
 
-Environment variables
-- `VITE_API_BASE_URL`: Base URL for backend REST API (e.g., http://127.0.0.1:8000)
-- `VITE_WS_URL`: Base URL for WebSocket gateway (e.g., ws://127.0.0.1:8000/ws)
-- `VITE_WS_URL_BINANCE`: public Binance WS override (optional)
+## Quickstart
 
-See `.env.example` and copy to `.env.local` for development.
+```bash
+pnpm install
+cp .env.example .env.local
+# fill in AUTH_GITHUB_ID / AUTH_GITHUB_SECRET / AUTH_SECRET
+pnpm dev
+```
 
-Migration note
-- Deprecated `REACT_APP_BACKEND_URL` from the old app is replaced by `VITE_API_BASE_URL`.
-- If you had `frontends/web/.env.development`, map its values into `.env.local` here.
+## Scripts
 
-Production note
-- Use HTTPS/WSS in production envs:
-  - `VITE_API_BASE_URL=https://api.robson.rbx.ia.br` (example)
-  - `VITE_WS_URL=wss://ws.robson.rbx.ia.br/ws`
+| Command | Purpose |
+|---------|---------|
+| `pnpm dev` | Run dev server (http://localhost:5173) |
+| `pnpm build` | Build static output to `build/` |
+| `pnpm preview` | Preview production build |
+| `pnpm check` | Run TypeScript + svelte-check |
+| `pnpm test` | Run Vitest unit tests |
+| `pnpm test:e2e` | Run Playwright E2E tests |
+| `pnpm lint` | Run Prettier + ESLint |
+
+## Architecture
+
+See `docs/adr/ADR-0025`, `ADR-0026`, `ADR-0027` and
+`docs/implementation/FE-P1-FRONTEND-MVP.md`.
+
+## Brand
+
+Design tokens: `src/lib/design/tokens.css`
+Logo + wordmarks: `static/brand/`
+Source of truth: `brand-voltage/` at repo root.
+
+## Path aliases
+
+- `$design` → `src/lib/design`
+- `$api` → `src/lib/api`
+- `$stores` → `src/lib/stores`
+- `$components` → `src/lib/components`
+- `$icons` → `src/lib/icons`
+- `$i18n` → `src/lib/i18n`
+
+## Deploy
+
+Production deployment: container in k3s rbx-infra cluster,
+image at `ghcr.io/ldamasio/robson-frontend-v2`, ArgoCD-managed.
+
+See `docs/runbooks/frontend-deploy.md` for the full deploy procedure. The GitHub Actions workflow `Frontend Build & Publish` builds the Docker image on push to main (or workflow_dispatch) and pushes to GHCR. ArgoCD reconciles the deployment in rbx-infra. Prerequisites B1–B7 must be satisfied by the operator before the first deployment; see runbook.

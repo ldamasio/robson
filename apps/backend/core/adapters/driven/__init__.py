@@ -1,1 +1,0 @@
-"""Driven adapters (infrastructure implementations)."""

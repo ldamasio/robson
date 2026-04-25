@@ -33,11 +33,11 @@
 - Blog frontend: `rbx-robotica-frontend/` (Next.js) — unrelated, marketing only.
 
 ### Observed Behavior
-- No new frontend exists yet. Scaffold directory `apps/frontend-v2/` is empty.
+- No new frontend exists yet. Scaffold directory `apps/frontend/` is empty.
 - Legacy frontend still deployed; operators currently use Robson CLI for all operations.
 
 ### Expected Behavior
-- `apps/frontend-v2/` contains a production-ready SvelteKit app with Voltage brand applied.
+- `apps/frontend/` contains a production-ready SvelteKit app with Voltage brand applied.
 - Operator can log in via GitHub, view current month slots + active operations + today's events, drill into any operation's event log, and trigger kill-switch with type-to-confirm and 5-minute cooldown.
 - Two domains resolve to the same static bundle; locale defaults by hostname.
 
@@ -53,15 +53,15 @@ N/A — greenfield implementation, no gap to analyze.
 | Priority | File/Location | Issue | Impact |
 |----------|---------------|-------|--------|
 | P1 | `docs/runbooks/frontend-deploy.md` | Does not exist — needed for CI/CD + manual deploy recovery | MED |
-| P2 | `apps/frontend-v2/README.md` | Does not exist — needed for agent/human onboarding | LOW |
+| P2 | `apps/frontend/README.md` | Does not exist — needed for agent/human onboarding | LOW |
 
 ### Code Gaps
 
 | Priority | Component | Issue | Blocker For |
 |----------|-----------|-------|-------------|
-| P0 | `apps/frontend-v2/` | Scaffold missing | Everything |
-| P0 | `apps/frontend-v2/src/lib/design/tokens.css` | Voltage tokens not yet copied from `brand-voltage/` | All UI work |
-| P0 | `apps/frontend-v2/src/lib/api/robson.ts` | API client missing | Auth + dashboard + operations |
+| P0 | `apps/frontend/` | Scaffold missing | Everything |
+| P0 | `apps/frontend/src/lib/design/tokens.css` | Voltage tokens not yet copied from `brand-voltage/` | All UI work |
+| P0 | `apps/frontend/src/lib/api/robson.ts` | API client missing | Auth + dashboard + operations |
 | P0 | Backend `/kill-switch` endpoint verification | Need to confirm endpoint contract exists and behaves per ADR-0027 | Kill-switch feature |
 | P1 | RBX custom icons (20 glyphs) | SVGs must be produced | Polished UI surfaces |
 | P2 | SSE event stream endpoint | Confirm backend supports SSE or fall back to polling | Today's events panel |
@@ -84,7 +84,7 @@ N/A — greenfield implementation, no gap to analyze.
 **Effort**: 1 day
 **Dependencies**: None
 **Deliverables**:
-- `apps/frontend-v2/` with SvelteKit + `adapter-static` initialized
+- `apps/frontend/` with SvelteKit + `adapter-static` initialized
 - Voltage tokens imported and applied to root layout
 - Placeholder landing route renders correctly with L-corners + cyan accents
 - `pnpm dev` runs locally
@@ -186,7 +186,7 @@ N/A — greenfield implementation, no gap to analyze.
 
 ### EP-001: Scaffold SvelteKit app
 
-**Objective**: Create `apps/frontend-v2/` with SvelteKit + `@sveltejs/adapter-static`, TypeScript strict, Vitest, Playwright. App runs with `pnpm dev`.
+**Objective**: Create `apps/frontend/` with SvelteKit + `@sveltejs/adapter-static`, TypeScript strict, Vitest, Playwright. App runs with `pnpm dev`.
 
 **Preconditions**:
 ```bash
@@ -199,12 +199,12 @@ which pnpm
 # robson repo checked out at expected path
 test -d /home/psyctl/apps/robson
 
-# apps/frontend-v2 does not yet exist (idempotence)
-test ! -d /home/psyctl/apps/robson/apps/frontend-v2
+# apps/frontend does not yet exist (idempotence)
+test ! -d /home/psyctl/apps/robson/apps/frontend
 ```
 
 **Inputs** (explicit):
-- `SCAFFOLD_PATH`: `apps/frontend-v2` (relative to repo root)
+- `SCAFFOLD_PATH`: `apps/frontend` (relative to repo root)
 - `PACKAGE_NAME`: `@robson/frontend-v2`
 
 **Steps**:
@@ -212,10 +212,10 @@ test ! -d /home/psyctl/apps/robson/apps/frontend-v2
 cd /home/psyctl/apps/robson
 
 # Use the skeleton scaffold created by this planner (in RELEASE bundle).
-# If running fresh, substitute with `pnpm create svelte@latest apps/frontend-v2`
+# If running fresh, substitute with `pnpm create svelte@latest apps/frontend`
 # and answer: Skeleton project / TypeScript / ESLint / Prettier / Vitest / Playwright.
 
-cd apps/frontend-v2
+cd apps/frontend
 pnpm install
 
 # Verify build works
@@ -229,17 +229,17 @@ pnpm run dev  # should open http://localhost:5173
 **Expected Outcome**:
 ```bash
 # PASS: app directory exists with expected structure
-test -d apps/frontend-v2/src/routes
+test -d apps/frontend/src/routes
 
 # PASS: package.json has svelte + adapter-static
-grep -q '"@sveltejs/kit"' apps/frontend-v2/package.json
-grep -q '"@sveltejs/adapter-static"' apps/frontend-v2/package.json
+grep -q '"@sveltejs/kit"' apps/frontend/package.json
+grep -q '"@sveltejs/adapter-static"' apps/frontend/package.json
 
 # PASS: TypeScript check succeeds
-cd apps/frontend-v2 && pnpm run check && echo "PASS"
+cd apps/frontend && pnpm run check && echo "PASS"
 
 # PASS: Build succeeds
-cd apps/frontend-v2 && pnpm run build && test -d build && echo "PASS"
+cd apps/frontend && pnpm run build && test -d build && echo "PASS"
 ```
 
 **Failure Detection**:
@@ -249,7 +249,7 @@ cd apps/frontend-v2 && pnpm run build && test -d build && echo "PASS"
 
 **Rollback**:
 ```bash
-rm -rf apps/frontend-v2
+rm -rf apps/frontend
 ```
 
 ---
@@ -260,13 +260,13 @@ rm -rf apps/frontend-v2
 
 **Preconditions**:
 ```bash
-test -d /home/psyctl/apps/robson/apps/frontend-v2
+test -d /home/psyctl/apps/robson/apps/frontend
 test -f /home/psyctl/apps/robson/brand-voltage/colors_and_type.css
 ```
 
 **Steps**:
 ```bash
-cd /home/psyctl/apps/robson/apps/frontend-v2
+cd /home/psyctl/apps/robson/apps/frontend
 
 # Copy design tokens
 mkdir -p src/lib/design
@@ -291,8 +291,8 @@ pnpm run dev
 
 **Expected Outcome**:
 ```bash
-test -f apps/frontend-v2/src/lib/design/tokens.css
-test -f apps/frontend-v2/static/brand/rbx-mark.svg
+test -f apps/frontend/src/lib/design/tokens.css
+test -f apps/frontend/static/brand/rbx-mark.svg
 
 # Dev server renders without console errors
 # Manually verify: page has #07080A background, cyan #22E5E5 accents, L-corners visible on card
@@ -304,8 +304,8 @@ test -f apps/frontend-v2/static/brand/rbx-mark.svg
 
 **Rollback**:
 ```bash
-rm -rf apps/frontend-v2/src/lib/design
-rm -rf apps/frontend-v2/static/brand
+rm -rf apps/frontend/src/lib/design
+rm -rf apps/frontend/static/brand
 ```
 
 ---
@@ -339,7 +339,7 @@ Implement Bearer-token auth for MVP (per ADR-0025 Amendment 1), typed API client
 
 **Rollback** (if needed):
 ```bash
-git checkout main -- apps/frontend-v2
+git checkout main -- apps/frontend
 ```
 
 ---
@@ -613,7 +613,7 @@ pnpm add svelte-i18n
 
 **Check if dev server runs**:
 ```bash
-cd apps/frontend-v2 && timeout 10 pnpm run dev &
+cd apps/frontend && timeout 10 pnpm run dev &
 sleep 5
 curl -s http://localhost:5173 | grep -q "RBX" && echo "PASS" || echo "FAIL"
 pkill -f "vite dev"
@@ -621,13 +621,13 @@ pkill -f "vite dev"
 
 **Check if build produces static output**:
 ```bash
-cd apps/frontend-v2 && pnpm run build
+cd apps/frontend && pnpm run build
 test -f build/index.html && echo "PASS" || echo "FAIL"
 ```
 
 **Check if tokens applied**:
 ```bash
-cd apps/frontend-v2 && pnpm run build
+cd apps/frontend && pnpm run build
 grep -q "#07080A" build/_app/**/*.css && echo "PASS" || echo "FAIL"
 ```
 
@@ -652,7 +652,7 @@ grep -q "#07080A" build/_app/**/*.css && echo "PASS" || echo "FAIL"
 
 ### Rollback Pattern 1: Remove entire new frontend
 ```bash
-rm -rf apps/frontend-v2
+rm -rf apps/frontend
 git restore .github/workflows/frontend-deploy.yml  # if committed
 # Revert DNS changes via opentofu in rbx-infra
 ```
@@ -726,7 +726,7 @@ GET    /events                          → SSE stream (Bearer via ?token= query
 ### Appendix B: File tree (target state after FE-P1)
 
 ```
-apps/frontend-v2/
+apps/frontend/
 ├── .env.example
 ├── .gitignore
 ├── README.md

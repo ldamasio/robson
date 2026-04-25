@@ -337,13 +337,13 @@ Priorities:
 
 | Component | File | Description |
 |-----------|------|-------------|
-| Risk per trade | `v2/robson-domain/src/value_objects.rs` | `RiskConfig::RISK_PER_TRADE_PCT = 1` |
-| Position sizing | `v2/robson-domain/src/entities.rs` | `calculate_position_size()` |
-| Trailing stop | `v2/robson-engine/src/trailing_stop.rs` | `update_trailing_stop_discrete()` |
-| Risk gate | `v2/robson-engine/src/risk.rs` | `RiskGate::evaluate()` — monthly check uses `<=` (blocks at exactly 4.00%) |
-| MonthlyHalt gate | `v2/robsond/src/circuit_breaker.rs` | Binary `Active | MonthlyHalt` state machine |
-| MonthlyHalt trigger | `v2/robsond/src/position_manager.rs` | `trigger_monthly_halt()` — closes all positions, blocks new entries |
-| Span definition | `v2/robson-domain/src/value_objects.rs` | `TechnicalStopDistance::span()` |
+| Risk per trade | `v3/robson-domain/src/value_objects.rs` | `RiskConfig::RISK_PER_TRADE_PCT = 1` |
+| Position sizing | `v3/robson-domain/src/entities.rs` | `calculate_position_size()` |
+| Trailing stop | `v3/robson-engine/src/trailing_stop.rs` | `update_trailing_stop_discrete()` |
+| Risk gate | `v3/robson-engine/src/risk.rs` | `RiskGate::evaluate()` — monthly check uses `<=` (blocks at exactly 4.00%) |
+| MonthlyHalt gate | `v3/robsond/src/circuit_breaker.rs` | Binary `Active | MonthlyHalt` state machine |
+| MonthlyHalt trigger | `v3/robsond/src/position_manager.rs` | `trigger_monthly_halt()` — closes all positions, blocks new entries |
+| Span definition | `v3/robson-domain/src/value_objects.rs` | `TechnicalStopDistance::span()` |
 
 ## Follow-up Required
 

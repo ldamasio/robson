@@ -1,7 +1,7 @@
 # Technical Stop-Loss Requirements
 
 > **Implementation note**: This requirements document was written for the v1 Django/Python
-> era. The current implementation lives in `v2/robson-engine/src/technical_stop_analyzer.rs`
+> era. The current implementation lives in `v3/robson-engine/src/technical_stop_analyzer.rs`
 > (Rust). Python/pandas/TA-Lib references below are historical. The Rust implementation
 > uses swing-point detection and ATR-based fallback on OHLCV data fetched from Binance.
 

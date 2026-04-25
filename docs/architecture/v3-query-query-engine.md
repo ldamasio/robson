@@ -92,7 +92,7 @@ The QueryEngine is the **implementation of the Control Loop** (v3-control-loop.m
 
 ### 2.1 ExecutionQuery — The Typed Lifecycle Unit
 
-**File**: `v2/robsond/src/query.rs`
+**File**: `v3/robsond/src/query.rs`
 
 The name `ExecutionQuery` is intentional — it avoids collision with `robson-eventlog/src/query.rs` (database read queries) and communicates that this is an execution lifecycle concept, not a data retrieval concept.
 
@@ -329,7 +329,7 @@ impl ExecutionQuery {
 
 ### 2.2 QueryEngine — The Governed Execution Core
 
-**File**: `v2/robsond/src/query_engine.rs`
+**File**: `v3/robsond/src/query_engine.rs`
 
 The QueryEngine tracks the lifecycle of ExecutionQueries. It sits inside `robsond` (the Runtime crate).
 
@@ -377,7 +377,7 @@ impl<R: QueryRecorder> QueryEngine<R> {
 
 ### 2.3 QueryRecorder — Audit and Observability
 
-**File**: Part of `v2/robsond/src/query_engine.rs`
+**File**: Part of `v3/robsond/src/query_engine.rs`
 
 ```rust
 /// Records query lifecycle events for observability and audit.
@@ -620,12 +620,12 @@ The Control Loop stages map directly to QueryEngine processing:
 **Goal**: Introduce ExecutionQuery and QueryEngine without changing any external behavior. Tracing-only audit. All existing tests pass.
 
 **Files created**:
-- `v2/robsond/src/query.rs` — ExecutionQuery, QueryKind, QueryState, QueryOutcome, ActorKind, ContextSummary, scaffolding enums
-- `v2/robsond/src/query_engine.rs` — QueryEngine, QueryRecorder trait, TracingQueryRecorder
+- `v3/robsond/src/query.rs` — ExecutionQuery, QueryKind, QueryState, QueryOutcome, ActorKind, ContextSummary, scaffolding enums
+- `v3/robsond/src/query_engine.rs` — QueryEngine, QueryRecorder trait, TracingQueryRecorder
 
 **Files modified**:
-- `v2/robsond/src/lib.rs` — add `mod query; mod query_engine;` and re-exports
-- `v2/robsond/src/position_manager.rs` — wrap `arm_position`, `disarm_position`, `handle_signal`, `process_market_data`, `panic_close_all` with query lifecycle tracking
+- `v3/robsond/src/lib.rs` — add `mod query; mod query_engine;` and re-exports
+- `v3/robsond/src/position_manager.rs` — wrap `arm_position`, `disarm_position`, `handle_signal`, `process_market_data`, `panic_close_all` with query lifecycle tracking
 
 **Files NOT touched**:
 - `robson-engine/*` — Engine remains pure, unchanged
