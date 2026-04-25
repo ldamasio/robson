@@ -55,4 +55,7 @@ Source of truth: `brand-voltage/` at repo root.
 
 ## Deploy
 
-See `docs/runbooks/frontend-deploy.md` for the full deploy procedure. The GitHub Actions workflow `Frontend Deploy` (workflow_dispatch only) builds and syncs to the Contabo S3 bucket `robson-app`. Prerequisites B1–B5 must be satisfied by the operator before the first run; see runbook.
+Production deployment: container in k3s rbx-infra cluster,
+image at `ghcr.io/ldamasio/robson-frontend-v2`, ArgoCD-managed.
+
+See `docs/runbooks/frontend-deploy.md` for the full deploy procedure. The GitHub Actions workflow `Frontend Build & Publish` builds the Docker image on push to main (or workflow_dispatch) and pushes to GHCR. ArgoCD reconciles the deployment in rbx-infra. Prerequisites B1–B7 must be satisfied by the operator before the first deployment; see runbook.

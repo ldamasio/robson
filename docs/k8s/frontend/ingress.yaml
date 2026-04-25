@@ -1,0 +1,38 @@
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: robson-frontend-v2
+  namespace: <NAMESPACE>  # adjust
+  annotations:
+    cert-manager.io/cluster-issuer: <CLUSTER_ISSUER>  # adjust, e.g. letsencrypt-prod
+    nginx.ingress.kubernetes.io/ssl-redirect: "true"
+    # kubernetes.io/ingress.class: <INGRESS_CLASS>  # uncomment and adjust if needed
+spec:
+  tls:
+    - hosts:
+        - robson.rbx.ia.br
+      secretName: robson-frontend-tls-rbx-ia-br
+    - hosts:
+        - robson.rbxsystems.ch
+      secretName: robson-frontend-tls-rbxsystems-ch
+  rules:
+    - host: robson.rbx.ia.br
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: robson-frontend-v2
+                port:
+                  number: 80
+    - host: robson.rbxsystems.ch
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: robson-frontend-v2
+                port:
+                  number: 80

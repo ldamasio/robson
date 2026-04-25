@@ -1,0 +1,48 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: robson-frontend-v2
+  namespace: <NAMESPACE>  # adjust
+  labels:
+    app: robson-frontend-v2
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: robson-frontend-v2
+  template:
+    metadata:
+      labels:
+        app: robson-frontend-v2
+    spec:
+      containers:
+        - name: frontend
+          image: ghcr.io/ldamasio/robson-frontend-v2:latest
+          ports:
+            - containerPort: 8080
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 5
+            periodSeconds: 10
+          readinessProbe:
+            httpGet:
+              path: /healthz
+              port: 8080
+            initialDelaySeconds: 3
+            periodSeconds: 5
+          resources:
+            requests:
+              cpu: 10m
+              memory: 32Mi
+            limits:
+              cpu: 200m
+              memory: 128Mi
+          securityContext:
+            runAsNonRoot: true
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: false  # nginx writes /var/cache
+            capabilities:
+              drop: ["ALL"]
+      imagePullSecrets: []  # adjust: add - name: <IMAGE_PULL_SECRET> if GHCR private
