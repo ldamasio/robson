@@ -871,3 +871,44 @@ apps/frontend/
 | — | EP-006 kill-switch | — | TODO |
 | 2026-04-24 | EP-007 i18n — login/dashboard/operation detail extended to svelte-i18n; en.json + pt-BR.json key parity test added; labels.ts kept English (technical state identifiers); root layout guards render behind $isLoading to avoid init race. Commit e8fb9d50 on branch fe-p1/ep-007-i18n. | GLM-5.1 | DONE |
 | 2026-04-24 | EP-008 deploy skeleton — workflow_dispatch-only GitHub Actions workflow targeting Contabo S3 bucket robson-app; runbook docs/runbooks/frontend-deploy.md with prerequisites B1–B5. Workflow does not run until operator provisions bucket, secrets, DNS, TLS decision, backend CORS/public reachability. Commit 15f86514 on branch fe-p1/ep-008-deploy. | GLM-5.1 | DONE (skeleton; execution blocked on B1–B5) |
+| 2026-04-25 | Hosting pivot Contabo S3 → k3s in-cluster (ADR-0028). Frontend becomes containerized nginx; ArgoCD GitOps; cert-manager + Let's Encrypt. | Opus 4.7 + GLM-5.1 | DONE |
+| 2026-04-25 | v3 canonical layout: Django and legacy React deleted; `v2/` → `v3/`; `apps/frontend-v2/` → `apps/frontend/`; obsolete CI workflows removed. | GLM-5.1 | DONE |
+| 2026-04-25 | Production launch — three endpoints HTTPS 200: robson.rbx.ia.br, robson.rbxsystems.ch, api.robson.rbx.ia.br. CORS layer (ADR-0027), nginx non-root config (ADR-0026), Bearer-token auth (ADR-0025) all live. | Opus 4.7 + GLM-5.1 | **FE-P1 LIVE** |
+
+---
+
+## Closing notes (2026-04-25)
+
+**FE-P1 is complete and live.** The frontend serves the operator
+console at two domains with host-based locale; robsond exposes a
+public backend at `api.robson.rbx.ia.br`; the operator authenticates
+with a Bearer token issued by robsond.
+
+**What shipped vs the original plan.** The original FE-P1 plan
+proposed GitHub OAuth and Contabo S3 hosting. Both were replaced:
+
+- **Auth:** Bearer token (ADR-0025) instead of OAuth. `adapter-static`
+  has no server runtime, so an OAuth callback could not be handled
+  without an edge function or `adapter-node`. The single-operator
+  console does not justify the extra surface.
+- **Hosting:** k3s in-cluster nginx (ADR-0028) instead of Contabo S3.
+  Contabo Object Storage lacks native website hosting, per-bucket
+  IAM, and ACL UI. The cluster already had Traefik + cert-manager,
+  so reusing that path eliminated four blockers in one move.
+- **CORS:** env-driven allow-list (ADR-0027). Net-new since the
+  legacy React frontend shared origin with the Django backend.
+- **nginx security context:** non-root + `emptyDir` caches
+  (ADR-0026). Net-new for the cluster baseline.
+
+**Deferred to follow-up slices** (intentionally, not blockers):
+
+- Image rename phase 2: drop the `-v2` suffix from
+  `ghcr.io/ldamasio/robson-frontend-v2` and
+  `ghcr.io/rbxrobotica/robson-v2`. Coordinated PR pair across
+  robson + rbx-infra.
+- Locale switcher UI in the header. Host-based default suffices.
+- Playwright e2e in `frontend-tests.yml` CI. Currently `pnpm test`
+  unit only is the gate.
+- Hash chain UI (FE-P3).
+- History endpoints + monthly views (FE-P2).
+- Cleanup of legacy `fe-p1/*` branches superseded by `main`.

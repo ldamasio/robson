@@ -6,11 +6,16 @@
 
 ## 🚀 Quick Start
 
-**New to Robson Bot?** Start here:
+**New to Robson v3?** Start here:
 
 1. **[README.md](../README.md)** - Project overview and installation
-2. **[ARCHITECTURE.md](ARCHITECTURE.md)** - System architecture and design principles
-3. **[DEVELOPER.md](DEVELOPER.md)** - Development workflow and practices
+2. **[onboarding/DEVELOPER-QUICKSTART.md](onboarding/DEVELOPER-QUICKSTART.md)** - Clone → first PR (current)
+3. **[architecture/v3-runtime-spec.md](architecture/v3-runtime-spec.md)** - Robsond runtime architecture
+4. **[../AGENTS.md](../AGENTS.md)** - Repository-wide rules (canonical)
+
+> **Note:** `DEVELOPER.md` and `AUTH_FLOW.md` describe the v1 Django
+> stack and are kept only for historical reference. Robson v3 is the
+> canonical version (Rust runtime + SvelteKit frontend).
 
 **For AI Agents?** Start here:
 

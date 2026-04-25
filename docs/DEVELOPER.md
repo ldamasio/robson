@@ -1,4 +1,18 @@
-Robson Bot – Developer Guide
+> **DEPRECATED — historical reference only.**
+>
+> This document describes the v1 Django monolith, removed from
+> active code in 2026-04. Robson v3 is the canonical version: a
+> Rust runtime (`v3/robsond/`) plus a SvelteKit static frontend
+> (`apps/frontend/`). The Django code path is gone from the
+> working tree; this file is preserved for historical product
+> archaeology only.
+>
+> For current developer onboarding, read
+> [`docs/onboarding/DEVELOPER-QUICKSTART.md`](onboarding/DEVELOPER-QUICKSTART.md).
+
+---
+
+Robson Bot – Developer Guide (v1, archived)
 
 Overview
 - Robson is open source. This guide standardizes local development, migrations/tests, and contribution practices, keeping production isolated (GitOps/CI/CD).
