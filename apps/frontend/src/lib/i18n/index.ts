@@ -1,8 +1,10 @@
 import { browser } from '$app/environment';
 import { init, register, getLocaleFromNavigator, locale } from 'svelte-i18n';
+import ptBR from './pt-BR.json';
+import en from './en.json';
 
-register('pt-BR', () => import('./pt-BR.json'));
-register('en', () => import('./en.json'));
+register('pt-BR', () => Promise.resolve(ptBR));
+register('en', () => Promise.resolve(en));
 
 export function detectLocale(): string {
   if (!browser) return 'pt-BR';
