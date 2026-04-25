@@ -1,6 +1,6 @@
 # Frontend Deploy Runbook (k3s in-cluster)
 
-**Scope:** apps/frontend-v2 → ghcr.io/ldamasio/robson-frontend-v2
+**Scope:** apps/frontend → ghcr.io/ldamasio/robson-frontend-v2
 → k3s rbx-infra cluster → public domains robson.rbx.ia.br
 (pt-BR) + robson.rbxsystems.ch (en).
 
@@ -71,7 +71,7 @@ match cluster reality. Required objects:
 
 First-time:
 1. Set var `PUBLIC_ROBSON_API_BASE_PROD`.
-2. Push commit to main touching apps/frontend-v2/**.
+2. Push commit to main touching apps/frontend/**.
 3. Workflow builds + pushes image to ghcr.io.
 4. Apply k8s manifests via ArgoCD (sync the Application).
 5. cert-manager emits cert (1–3min).

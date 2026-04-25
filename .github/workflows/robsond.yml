@@ -1,0 +1,146 @@
+name: Robsond CI/CD
+
+on:
+  push:
+    branches: ["main"]
+    paths:
+      - "v3/**"
+  pull_request:
+    branches: ["main"]
+    paths:
+      - "v3/**"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: robsond-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  IMAGE: ghcr.io/rbxrobotica/robson-v2
+
+jobs:
+  test:
+    name: Rust Tests
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: v3
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Cache Rust toolchain and deps
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup
+            ~/.cargo/registry
+            ~/.cargo/git
+            v3/target
+          key: rust-${{ runner.os }}-${{ hashFiles('v3/Cargo.lock') }}
+          restore-keys: rust-${{ runner.os }}-
+
+      - name: Run tests (no postgres feature - uses MemoryStore)
+        run: cargo test --all --no-fail-fast
+
+      - name: Install nightly toolchain (for rustfmt)
+        run: rustup toolchain install nightly --component rustfmt
+
+      - name: Check formatting (nightly rustfmt for unstable options)
+        run: cargo +nightly fmt --all --check
+
+      - name: Clippy
+        run: cargo clippy --all-targets -- -D clippy::correctness -D clippy::suspicious
+
+  build-and-push:
+    name: Build & Push Image
+    runs-on: ubuntu-latest
+    needs: test
+    if: github.ref == 'refs/heads/main'
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ldamasio
+          password: ${{ secrets.GITOPS_TOKEN }}
+
+      - name: Compute SHA tag
+        id: meta
+        run: echo "sha_tag=sha-$(echo ${{ github.sha }} | cut -c1-8)" >> $GITHUB_OUTPUT
+
+      - name: Build and push
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          file: ./v3/Dockerfile
+          push: true
+          tags: |
+            ${{ env.IMAGE }}:${{ steps.meta.outputs.sha_tag }}
+            ${{ env.IMAGE }}:latest
+          no-cache: false
+
+      - name: Update image tags in rbx-infra
+        env:
+          GITOPS_TOKEN: ${{ secrets.GITOPS_TOKEN }}
+          SHA_TAG: ${{ steps.meta.outputs.sha_tag }}
+          REPO: ${{ github.repository }}
+          SHA: ${{ github.sha }}
+        run: |
+          git clone https://x-access-token:${GITOPS_TOKEN}@github.com/rbxrobotica/rbx-infra.git /tmp/rbx-infra
+          cd /tmp/rbx-infra
+
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+          sed -i "s|image: ghcr.io/rbxrobotica/robson-v2:sha-[a-f0-9]*|image: ghcr.io/rbxrobotica/robson-v2:${SHA_TAG}|g" \
+            apps/prod/robson/robsond-deploy.yml \
+            apps/prod/robson/robsond-db-migrate-job.yml
+
+          git add apps/prod/robson/robsond-deploy.yml \
+                  apps/prod/robson/robsond-db-migrate-job.yml
+
+          if git diff --staged --quiet; then
+            echo "No manifest changes needed (already at ${SHA_TAG})"
+            exit 0
+          fi
+
+          git commit -m "chore(robson-v2): update image tag to ${SHA_TAG}" \
+            -m "Automated update by Robson v2 CI/CD pipeline." \
+            -m "Triggered by: ${REPO}@${SHA}" \
+            -m "[skip ci]"
+
+          for i in 1 2 3; do
+            if git push origin main; then
+              echo "Manifests pushed - ArgoCD will auto-sync"
+              exit 0
+            fi
+            echo "Push attempt $i failed, rebasing..."
+            git pull --rebase origin main
+          done
+
+          echo "::error::Failed to push to rbx-infra after 3 attempts"
+          exit 1
+
+      - name: Summary
+        run: |
+          echo "## Robson v2 Published" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "| | |" >> $GITHUB_STEP_SUMMARY
+          echo "|---|---|" >> $GITHUB_STEP_SUMMARY
+          echo "| Image | \`${{ env.IMAGE }}:${{ steps.meta.outputs.sha_tag }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "| Commit | \`${{ github.sha }}\` |" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "ArgoCD will auto-sync when rbx-infra manifest is updated." >> $GITHUB_STEP_SUMMARY

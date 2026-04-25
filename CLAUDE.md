@@ -29,8 +29,8 @@ If this file and `AGENTS.md` ever diverge, `AGENTS.md` is the source of truth.
 - `docs/architecture/v3-query-query-engine.md`
 - `docs/architecture/v3-control-loop.md`
 - `docs/architecture/v3-architectural-decisions.md`
-- `v2/robsond/src/query_engine.rs`
-- `v2/robson-exec/src/executor.rs`
+- `v3/robsond/src/query_engine.rs`
+- `v3/robson-exec/src/executor.rs`
 
 ## Core Invariants (must never be violated)
 

@@ -8,7 +8,7 @@
 
 ## Context
 
-The current `DetectorTask` in `v2/robsond/src/detector.rs` conflates two distinct
+The current `DetectorTask` in `v3/robsond/src/detector.rs` conflates two distinct
 responsibilities into a single component:
 
 1. Detecting WHEN to enter a position (MA crossover on market data)
@@ -95,7 +95,7 @@ These invariants apply to every `DetectorSignal` produced by the system, without
 
 ### Immediate (implementation gap — RESOLVED 2026-04-15)
 
-`v2/robsond/src/detector.rs` previously violated this ADR. Resolved:
+`v3/robsond/src/detector.rs` previously violated this ADR. Resolved:
 - `DetectorConfig.stop_loss_percent` removed
 - `calculate_stop_loss()` (percentage-based) replaced
 - `TechnicalStopAnalyzer` implemented: fetches OHLCV data and performs chart analysis
@@ -142,7 +142,7 @@ derived from price action are the primary method per REQ-CORE-TECHSTOP-001.
 
 - `docs/requirements/technical-stop-requirements.md` — full policy specification
 - `docs/specs/TECHNICAL-STOP-RULE.md` — technical stop rule documentation
-- `v2/robson-domain/src/value_objects.rs` — `TechnicalStopDistance` implementation
-- `v2/robson-domain/src/entities.rs` — `DetectorSignal` domain type
-- `v2/robsond/src/detector.rs` — current implementation (violates this ADR)
+- `v3/robson-domain/src/value_objects.rs` — `TechnicalStopDistance` implementation
+- `v3/robson-domain/src/entities.rs` — `DetectorSignal` domain type
+- `v3/robsond/src/detector.rs` — current implementation (violates this ADR)
 - `docs/runbooks/val-001-testnet-e2e-validation.md` — Phase 1 PASS; see Run Log for current Phase 2 status

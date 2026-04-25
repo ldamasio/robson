@@ -33,7 +33,7 @@ Pivot frontend hosting from Contabo S3 static to k3s in-cluster deployment:
 - FE-P1 stack already on main — only deploy mechanism changes
 
 **New:**
-- Dockerfile + nginx.conf added to apps/frontend-v2/
+- Dockerfile + nginx.conf added to apps/frontend/
 - GitHub Actions workflow rewritten: builds Docker image, pushes to GHCR
 - k8s skeleton manifests in docs/k8s/frontend/ for operator to copy into rbx-infra
 - ArgoCD reconciles on image tag update (no kubectl in CI)

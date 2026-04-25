@@ -13,10 +13,7 @@ It is not an autonomous trading bot.
 It does not justify signals, generate entries, or bypass operator governance.
 Its core concern is what happens after a trading decision exists: execution, risk enforcement, lifecycle control, auditability, and failure handling.
 
-The repository currently contains two major realities:
-
-- Legacy application surfaces in Django/React/CLI at the repository root.
-- The Rust runtime migration track under `v2/`, including `robsond`, EventLog, projector, and related specs in `docs/architecture`.
+The repository contains the Rust runtime (canonical) under `v3/`, the SvelteKit frontend under `apps/frontend/`, and related specs in `docs/architecture`.
 
 ## Non-Negotiable Rules
 
@@ -105,7 +102,7 @@ Application and agent code must never provision databases directly.
 | Layer | Owner | Responsibility |
 |---|---|---|
 | Server, user, base database | `rbx-infra` Ansible | Provisions the Postgres server and emits `DATABASE_URL` to vault |
-| Schema migrations | Application (`v2/migrations/`) | Applied at deploy time via `sqlx migrate run`; applied automatically by `sqlx::test` during testing |
+| Schema migrations | Application (`v3/migrations/`) | Applied at deploy time via `sqlx migrate run`; applied automatically by `sqlx::test` during testing |
 | Per-test database lifecycle | `sqlx::test` macro | Creates isolated ephemeral databases, runs all migrations, drops after test |
 
 ### Rules for agents
@@ -113,10 +110,10 @@ Application and agent code must never provision databases directly.
 1. **Never provision a database** as a side effect of a code or test task. Starting containers, creating users, or running `CREATE DATABASE` is IaC work — delegate it or refuse it.
 2. **Never hardcode `DATABASE_URL`** in source files, test helpers, or scripts. The value always flows in from the infrastructure layer via the environment.
 3. **When writing a test that requires a live database**, gate it with `#[ignore = "requires DATABASE_URL"]` and `#[sqlx::test(migrations = "../migrations")]`. Do not write setup logic that provisions the database.
-4. **`v2/scripts/test-pg.sh`** is the canonical entry point for Postgres-backed tests. It requires `DATABASE_URL` from the environment. It does not resolve or infer it.
+4. **`v3/scripts/test-pg.sh`** is the canonical entry point for Postgres-backed tests. It requires `DATABASE_URL` from the environment. It does not resolve or infer it.
 5. **`just v2-test-pg`** is the local-dev wrapper. It supplies the known local container URL as an explicit fallback only when `DATABASE_URL` is absent. In CI and staging, `DATABASE_URL` must be injected externally.
 6. **Never run Postgres integration tests against a production `DATABASE_URL`**. `sqlx::test` creates and drops databases on the target server. `scripts/test-pg.sh` enforces this with a naming guard; do not bypass it.
-7. **Migration ownership**: migrations live in `v2/migrations/`. If you add a migration, verify that existing `sqlx::test`-based tests still pass with the updated schema. Do not apply migrations manually to shared environments.
+7. **Migration ownership**: migrations live in `v3/migrations/`. If you add a migration, verify that existing `sqlx::test`-based tests still pass with the updated schema. Do not apply migrations manually to shared environments.
 
 ### Test tiers (v2 Rust)
 
@@ -124,7 +121,7 @@ Application and agent code must never provision databases directly.
 |---|---|---|
 | Unit + in-memory | `cargo test --all` | No |
 | Feature-gated (compile check) | `cargo test --features postgres` | No (`--ignored` tests skipped) |
-| Postgres integration | `just v2-test-pg` or `bash v2/scripts/test-pg.sh` | Yes — `DATABASE_URL` must be set |
+| Postgres integration | `just v3-test-pg` or `bash v3/scripts/test-pg.sh` | Yes — `DATABASE_URL` must be set |
 
 CI must pass the first two tiers unconditionally. The third tier requires a provisioned database and should run in environments where `DATABASE_URL` is available.
 
@@ -147,8 +144,8 @@ Start here for v3/runtime work:
 
 Implementation reality for the current Rust executor/runtime boundary:
 
-- `v2/robsond/src/query_engine.rs`
-- `v2/robson-exec/src/executor.rs`
+- `v3/robsond/src/query_engine.rs`
+- `v3/robson-exec/src/executor.rs`
 
 ## Adapter Policy
 
