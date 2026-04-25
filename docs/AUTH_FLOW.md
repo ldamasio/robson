@@ -1,4 +1,14 @@
-# JWT Authentication Flow – Detailed Guide
+> **DEPRECATED — historical reference only.**
+>
+> This document describes the v1 Django JWT auth flow, removed
+> from active code in 2026-04. Robson v3 uses a Bearer token
+> issued by `robsond` and entered manually by the operator at
+> `/login`; see
+> [`docs/adr/ADR-0025-frontend-auth-bearer-token.md`](adr/ADR-0025-frontend-auth-bearer-token.md).
+
+---
+
+# JWT Authentication Flow – Detailed Guide (v1, archived)
 
 ## 1) Login (Obtain Tokens)
 
