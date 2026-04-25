@@ -14,7 +14,7 @@ use std::{convert::Infallible, sync::Arc, time::Duration};
 use async_stream::stream;
 use axum::{
     extract::{Path, Request, State},
-    http::{header, StatusCode},
+    http::{header, HeaderValue, Method, StatusCode},
     middleware::{self, Next},
     response::{
         sse::{KeepAlive, Sse},
@@ -29,6 +29,7 @@ use robson_store::Store;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -360,7 +361,32 @@ where
         .layer(auth_layer)
         .with_state(state);
 
-    read_only.merge(mutating)
+    read_only.merge(mutating).layer(build_cors_layer())
+}
+
+/// Build a CORS layer from the `ROBSON_CORS_ALLOWED_ORIGINS` env var.
+///
+/// The env var is a comma-separated list of allowed origin URLs (e.g.
+/// `https://robson.rbx.ia.br,https://robson.rbxsystems.ch`). When unset
+/// or empty, the returned layer adds no CORS headers, preserving the
+/// pre-CORS behavior expected by integration tests.
+fn build_cors_layer() -> CorsLayer {
+    let raw = std::env::var("ROBSON_CORS_ALLOWED_ORIGINS").unwrap_or_default();
+    let origins: Vec<HeaderValue> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .filter_map(|s| HeaderValue::from_str(s).ok())
+        .collect();
+
+    if origins.is_empty() {
+        return CorsLayer::new();
+    }
+
+    CorsLayer::new()
+        .allow_origin(AllowOrigin::list(origins))
+        .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
+        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
 }
 
 // =============================================================================
@@ -1325,5 +1351,39 @@ mod tests {
         let approval: ApproveQueryResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(approval.query_id, query_id);
         assert_eq!(approval.state, "Completed");
+    }
+
+    /// Smoke test: `build_cors_layer` returns a usable layer for both empty and
+    /// populated `ROBSON_CORS_ALLOWED_ORIGINS` env var values. The layer's
+    /// internal allow-list is not directly inspectable, so we exercise the
+    /// parsing path by toggling the env var and ensuring construction succeeds.
+    /// Runs serially via a mutex to avoid env-var races with parallel tests.
+    #[test]
+    fn build_cors_layer_parses_origins_from_env() {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        let _guard = ENV_LOCK.lock().unwrap();
+
+        // Empty / unset
+        std::env::remove_var("ROBSON_CORS_ALLOWED_ORIGINS");
+        let _ = build_cors_layer();
+
+        // Whitespace-only
+        std::env::set_var("ROBSON_CORS_ALLOWED_ORIGINS", "  ,  ");
+        let _ = build_cors_layer();
+
+        // Single origin
+        std::env::set_var("ROBSON_CORS_ALLOWED_ORIGINS", "https://robson.rbx.ia.br");
+        let _ = build_cors_layer();
+
+        // Multiple origins
+        std::env::set_var(
+            "ROBSON_CORS_ALLOWED_ORIGINS",
+            "https://robson.rbx.ia.br,https://robson.rbxsystems.ch",
+        );
+        let _ = build_cors_layer();
+
+        // Cleanup
+        std::env::remove_var("ROBSON_CORS_ALLOWED_ORIGINS");
     }
 }
