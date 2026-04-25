@@ -43,8 +43,8 @@ pub struct Config {
 
 /// API server configuration.
 ///
-/// CORS allow-list is read directly from `ROBSON_CORS_ALLOWED_ORIGINS` (comma-separated)
-/// inside `api::build_cors_layer`; not duplicated here.
+/// CORS allow-list is read directly from `ROBSON_CORS_ALLOWED_ORIGINS`
+/// (comma-separated) inside `api::build_cors_layer`; not duplicated here.
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
     /// Host to bind to

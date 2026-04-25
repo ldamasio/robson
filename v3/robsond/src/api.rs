@@ -24,12 +24,12 @@ use axum::{
     Json, Router,
 };
 use robson_domain::{DetectorSignal, Position, PositionState, Price, RiskConfig, Side, Symbol};
-use tower_http::cors::{AllowOrigin, CorsLayer};
 use robson_exec::ExchangePort;
 use robson_store::Store;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tokio::sync::RwLock;
+use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::warn;
 use uuid::Uuid;
 
@@ -369,7 +369,8 @@ where
 // =============================================================================
 
 /// Build a CORS layer from the `ROBSON_CORS_ALLOWED_ORIGINS` env var.
-/// Comma-separated origin URLs. Empty/unset → no CORS headers (preserves test behavior).
+/// Comma-separated origin URLs. Empty/unset → no CORS headers (preserves test
+/// behavior).
 fn build_cors_layer() -> CorsLayer {
     let raw = std::env::var("ROBSON_CORS_ALLOWED_ORIGINS").unwrap_or_default();
     let origins: Vec<HeaderValue> = raw
