@@ -1,0 +1,57 @@
+{
+  "nav": {
+    "dashboard": "Painel",
+    "history": "Histórico",
+    "operation": "Operação",
+    "settings": "Configurações",
+    "killSwitch": "Kill Switch"
+  },
+  "auth": {
+    "login": "Entrar com GitHub",
+    "logout": "Sair"
+  },
+  "dashboard": {
+    "slotsTitle": "Slots",
+    "activeOperations": "Operações ativas",
+    "todayEvents": "Eventos de hoje",
+    "inheritedFrom": "HERDADA DE",
+    "carriedInto": "TRANSPORTADA PARA",
+    "live": "AO VIVO",
+    "dryRun": "DRY-RUN",
+    "free": "LIVRE"
+  },
+  "operation": {
+    "position": "Posição",
+    "pnl": "PnL",
+    "liquidationDistance": "Distância de liquidação",
+    "status": "Status",
+    "opened": "Aberta",
+    "closed": "Fechada",
+    "eventStream": "Fluxo de eventos"
+  },
+  "killSwitch": {
+    "disableTitle": "Desligar Robson",
+    "haltedTitle": "Robson Desligado",
+    "currentState": "ESTADO ATUAL",
+    "triggerWarning": "Esta ação ativa o MonthlyHalt. Robson não abrirá novas posições. O backend fechará/desarmará as posições abertas ao executar o halt.",
+    "persistNote": "O halt persiste até o próximo mês calendário. Não existe reativação pela interface.",
+    "haltedInfo": "MonthlyHalt permanece ativo até o próximo mês calendário. Não é possível reativar por esta interface. Posições abertas foram fechadas/desarmadas pelo backend ao disparar o halt.",
+    "typeToConfirm": "Para confirmar, digite \"DESLIGAR\" abaixo:",
+    "reasonLabel": "MOTIVO DA INTERVENÇÃO (obrigatório):",
+    "reasonPlaceholder": "Descreva o motivo...",
+    "disableKeyword": "DESLIGAR",
+    "cancel": "Cancelar",
+    "disable": "Desligar",
+    "triggeredAt": "TRIGGERED AT",
+    "reason": "REASON",
+    "description": "DESCRIPTION",
+    "blocks": "BLOCKS",
+    "loading": "Carregando...",
+    "submitting": "Executando...",
+    "slotLabel": "SLOT",
+    "openPositions_one": "POSIÇÃO ABERTA",
+    "openPositions_other": "POSIÇÕES ABERTAS",
+    "affectedPositions": "POSIÇÕES AFETADAS",
+    "monthlyHaltActive": "MONTHLY HALT ATIVO"
+  }
+}

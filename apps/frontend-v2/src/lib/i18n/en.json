@@ -1,0 +1,57 @@
+{
+  "nav": {
+    "dashboard": "Dashboard",
+    "history": "History",
+    "operation": "Operation",
+    "settings": "Settings",
+    "killSwitch": "Kill Switch"
+  },
+  "auth": {
+    "login": "Login with GitHub",
+    "logout": "Logout"
+  },
+  "dashboard": {
+    "slotsTitle": "Slots",
+    "activeOperations": "Active operations",
+    "todayEvents": "Today's events",
+    "inheritedFrom": "INHERITED FROM",
+    "carriedInto": "CARRIED INTO",
+    "live": "LIVE",
+    "dryRun": "DRY-RUN",
+    "free": "FREE"
+  },
+  "operation": {
+    "position": "Position",
+    "pnl": "PnL",
+    "liquidationDistance": "Liquidation distance",
+    "status": "Status",
+    "opened": "Opened",
+    "closed": "Closed",
+    "eventStream": "Event stream"
+  },
+  "killSwitch": {
+    "disableTitle": "Disable Robson",
+    "haltedTitle": "Robson Disabled",
+    "currentState": "CURRENT STATE",
+    "triggerWarning": "This action activates MonthlyHalt. Robson will not open new positions. The backend will close/disarm open positions on trigger.",
+    "persistNote": "Halt persists until the next calendar month. No re-enable available from this interface.",
+    "haltedInfo": "MonthlyHalt remains active until the next calendar month. Cannot re-enable from this interface. Open positions were closed/disarmed by the backend when halt was triggered.",
+    "typeToConfirm": "To confirm, type \"DISABLE\" below:",
+    "reasonLabel": "REASON FOR INTERVENTION (required):",
+    "reasonPlaceholder": "Describe the reason...",
+    "disableKeyword": "DISABLE",
+    "cancel": "Cancel",
+    "disable": "Disable",
+    "triggeredAt": "TRIGGERED AT",
+    "reason": "REASON",
+    "description": "DESCRIPTION",
+    "blocks": "BLOCKS",
+    "loading": "Loading...",
+    "submitting": "Disabling...",
+    "slotLabel": "SLOT",
+    "openPositions_one": "OPEN POSITION",
+    "openPositions_other": "OPEN POSITIONS",
+    "affectedPositions": "AFFECTED POSITIONS",
+    "monthlyHaltActive": "MONTHLY HALT ACTIVE"
+  }
+}
