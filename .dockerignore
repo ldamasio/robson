@@ -1,19 +1,19 @@
-# Exclude everything except v2/ for Docker build context
-# This is used by the robson-v2 Dockerfile (CI builds from repo root)
+# Exclude everything except v3/ for Docker build context
+# This is used by the robsond Dockerfile (CI builds from repo root)
 *
-!v2/
-!v2/**
-v2/target/
-v2/.github/
-v2/docs/
-v2/cli/
-v2/node_modules/
-v2/.git/
-v2/*.md
-v2/.env
-v2/.env.*
-v2/.DS_Store
-v2/.vscode/
-v2/.idea/
-v2/*.swp
-v2/*.swo
+!v3/
+!v3/**
+v3/target/
+v3/.github/
+v3/docs/
+v3/cli/
+v3/node_modules/
+v3/.git/
+v3/*.md
+v3/.env
+v3/.env.*
+v3/.DS_Store
+v3/.vscode/
+v3/.idea/
+v3/*.swp
+v3/*.swo
