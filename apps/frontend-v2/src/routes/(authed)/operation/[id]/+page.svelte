@@ -13,6 +13,7 @@
     eventTypeLabel,
     eventSummaryText
   } from '$lib/presentation/labels';
+  import { _ } from 'svelte-i18n';
 
   let operationId = $derived($page.params.id ?? '');
   let position = $state<Position | null>(null);
@@ -65,21 +66,21 @@
 </script>
 
 <svelte:head>
-  <title>{position ? positionLabel(position) : operationId} — RBX Robson</title>
+  <title>{$_('operation.title', { values: { label: position ? positionLabel(position) : operationId } })}</title>
 </svelte:head>
 
 <div class="op-page">
   {#if error}
     <Card padding={5}>
       <Stack gap={3}>
-        <div class="eyebrow">LOAD ERROR</div>
+        <div class="eyebrow">{$_('operation.loadError')}</div>
         <p class="err-text">{error}</p>
-        <button class="btn-retry" onclick={() => { void loadPosition(); startSse(); }}>Retry</button>
+        <button class="btn-retry" onclick={() => { void loadPosition(); startSse(); }}>{$_('operation.retry')}</button>
       </Stack>
     </Card>
   {:else if position}
     <header class="header">
-      <div class="eyebrow">RBX ROBSON · OPERATION {operationId.slice(0, 8)}</div>
+      <div class="eyebrow">{$_('operation.header', { values: { id: operationId.slice(0, 8) } })}</div>
       <h1>{positionLabel(position)}</h1>
       <div class="meta">{metaLine}</div>
     </header>
@@ -87,19 +88,19 @@
     <LCorners size={14}>
       <Card>
         <Stack gap={3}>
-          <div class="eyebrow">SUMMARY</div>
+          <div class="eyebrow">{$_('operation.summary')}</div>
           <pre class="summary">{summaryLines.join('\n')}</pre>
         </Stack>
       </Card>
     </LCorners>
 
     <section class="event-stream-section">
-      <div class="eyebrow">EVENT STREAM</div>
+      <div class="eyebrow">{$_('operation.eventStreamLabel')}</div>
       <div class="limitation">
-        Events from this session only. Full history in FE-P2.
+        {$_('operation.sessionOnly')}
       </div>
       {#if events.length === 0}
-        <p class="empty">No events received yet for this position.</p>
+        <p class="empty">{$_('operation.noEvents')}</p>
       {:else}
         <div class="events">
           {#each events as e (e._seq)}
@@ -115,7 +116,7 @@
     </section>
   {:else}
     <div class="loading">
-      <div class="eyebrow">LOADING...</div>
+      <div class="eyebrow">{$_('operation.loading')}</div>
     </div>
   {/if}
 </div>

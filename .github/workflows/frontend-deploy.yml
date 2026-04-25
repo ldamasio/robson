@@ -1,0 +1,67 @@
+name: "Frontend Deploy"
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        type: choice
+        options:
+          - production
+      dry_run:
+        description: "Dry run (skip sync, show what would change)"
+        type: boolean
+        default: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    env:
+      PUBLIC_ROBSON_API_BASE: ${{ vars.PUBLIC_ROBSON_API_BASE_PROD }}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9
+
+      - name: Install dependencies
+        working-directory: apps/frontend-v2
+        run: pnpm install --frozen-lockfile
+
+      - name: Type check
+        working-directory: apps/frontend-v2
+        run: pnpm run check
+
+      - name: Unit tests
+        working-directory: apps/frontend-v2
+        run: pnpm run test
+
+      - name: Build
+        working-directory: apps/frontend-v2
+        run: pnpm run build
+
+      - name: Configure AWS CLI for Contabo
+        run: |
+          aws configure set aws_access_key_id "${{ secrets.AWS_ACCESS_KEY_ID }}" --profile contabo
+          aws configure set aws_secret_access_key "${{ secrets.AWS_SECRET_ACCESS_KEY }}" --profile contabo
+          aws configure set region eu-central-1 --profile contabo
+
+      - name: Sync to S3
+        working-directory: apps/frontend-v2
+        run: |
+          ARGS=(--profile contabo --endpoint-url https://eu2.contabostorage.com --delete)
+          if [ "${{ inputs.dry_run }}" = "true" ]; then
+            ARGS+=(--dryrun)
+          fi
+          aws s3 sync build/ s3://robson-app/ "${ARGS[@]}"

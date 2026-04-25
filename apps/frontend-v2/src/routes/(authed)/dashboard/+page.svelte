@@ -18,6 +18,7 @@
     eventTypeLabel,
     isPositionActive
   } from '$lib/presentation/labels';
+  import { _ } from 'svelte-i18n';
 
   const POLL_INTERVAL_MS = 10_000;
 
@@ -134,7 +135,7 @@
 </script>
 
 <svelte:head>
-  <title>Dashboard — RBX Robson</title>
+  <title>{$_('dashboard.pageTitle')}</title>
 </svelte:head>
 
 <div class="dashboard">
@@ -146,9 +147,9 @@
       </Row>
       <div class="status-strip">
         {#if error}
-          <span class="dot err"></span> OFFLINE · {error}
+          <span class="dot err"></span> {$_('dashboard.offline')} · {error}
         {:else if !connected}
-          <span class="dot warn"></span> CONNECTING...
+          <span class="dot warn"></span> {$_('dashboard.connecting')}
         {:else}
           <span class="dot live"></span>
           {haltStateLabel(haltState)} · SLOT {occupied}/{SLOT_COUNT}
@@ -160,15 +161,15 @@
   {#if error}
     <Card padding={5}>
       <Stack gap={3}>
-        <div class="eyebrow">CONNECTION ERROR</div>
+        <div class="eyebrow">{$_('dashboard.connectionError')}</div>
         <p class="err-text">{error}</p>
-        <button class="btn-retry" onclick={retry}>Retry</button>
+        <button class="btn-retry" onclick={retry}>{$_('dashboard.retry')}</button>
       </Stack>
     </Card>
   {:else}
     <section>
       <Stack gap={4}>
-        <div class="eyebrow">SLOTS · {monthLabel()}</div>
+        <div class="eyebrow">{$_('dashboard.slots')} · {monthLabel()}</div>
         <div class="slots-grid">
           {#each slots as slot}
             <a
@@ -180,16 +181,16 @@
             </a>
           {/each}
         </div>
-        <div class="eyebrow dim">{occupied} OCCUPIED · {free} FREE</div>
+        <div class="eyebrow dim">{$_('dashboard.occupied', { values: { count: occupied } })} · {$_('dashboard.freeCount', { values: { count: free } })}</div>
       </Stack>
     </section>
 
     <section>
       <Stack gap={4}>
-        <div class="eyebrow">ACTIVE OPERATIONS</div>
+        <div class="eyebrow">{$_('dashboard.activeOps')}</div>
         {#if activeOps.length === 0}
           <Card>
-            <p class="empty">No active positions.</p>
+            <p class="empty">{$_('dashboard.noActive')}</p>
           </Card>
         {:else}
           <Grid cols={2} gap={4}>
@@ -221,10 +222,10 @@
 
     <section>
       <Stack gap={4}>
-        <div class="eyebrow">TODAY'S EVENTS</div>
+        <div class="eyebrow">{$_('dashboard.todayEventsLabel')}</div>
         <Card>
           {#if todayEvents.length === 0}
-            <p class="empty">No events today.</p>
+            <p class="empty">{$_('dashboard.noEventsToday')}</p>
           {:else}
             <div class="event-stream">
               {#each todayEvents as e (e.event_id)}
