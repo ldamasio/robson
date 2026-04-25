@@ -1,5 +1,9 @@
 # ADR-0015: Rust Stop Engine with RabbitMQ for Critical Stop-Loss Execution
 
+> **STATUS: SUPERSEDED** — RabbitMQ is not used in Robson v3. The stop-loss
+> engine runs in-process within robsond. This ADR is retained for historical
+> reference only.
+
 **Status**: APPROVED
 **Date**: 2024-12-26
 **Deciders**: Product Owner, System Architect
