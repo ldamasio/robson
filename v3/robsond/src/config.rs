@@ -73,18 +73,12 @@ pub struct ProjectionConfig {
 ///
 /// Note: risk per trade is NOT configurable — it is fixed at 1% by v3 policy.
 /// See `RiskConfig::RISK_PER_TRADE_PCT` in robson-domain.
+///
+/// Capital is NOT configured here — it is derived from the exchange balance
+/// at startup and from `monthly_state` after the first month boundary.
+/// See ADR-0024 §6.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
-    /// Operator's declared starting capital in quote currency (e.g., USDT).
-    ///
-    /// Source: `ROBSON_CAPITAL_BASE` env var. Required for the first month of
-    /// operation. After the first `MonthBoundaryReset`, the persisted
-    /// `monthly_state.capital_base` takes precedence (see ADR-0024 §6).
-    ///
-    /// This value is the initial equity the operator brings to the account.
-    /// Position sizing is derived:
-    /// `position_size = (capital_base × 1%) / stop_distance`.
-    pub capital_base: Decimal,
     /// Minimum tech stop distance (0.001 = 0.1%)
     pub min_tech_stop_percent: Decimal,
     /// Maximum tech stop distance (0.10 = 10%)
@@ -219,8 +213,7 @@ impl Config {
                 api_token: None,
             },
             engine: EngineConfig {
-                capital_base: Decimal::from(10000),
-                min_tech_stop_percent: Decimal::new(1, 3), // 0.1%
+                min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
                 max_tech_stop_percent: Decimal::new(10, 2), // 10%
             },
             tech_stop: TechStopConfigEnv {
@@ -277,6 +270,7 @@ impl Config {
 
     fn load_engine_config() -> DaemonResult<EngineConfig> {
         // Note: risk per trade is NOT loaded from env — fixed at 1% by v3 policy.
+        // Capital is NOT loaded from env — derived from exchange balance.
         let min_tech_stop = Self::load_decimal_env(
             "ROBSON_MIN_TECH_STOP_PERCENT",
             Decimal::new(1, 3), // 0.1%
@@ -287,17 +281,7 @@ impl Config {
             Decimal::new(10, 2), // 10%
         )?;
 
-        let capital_base = Self::load_decimal_env(
-            "ROBSON_CAPITAL_BASE",
-            Decimal::new(10, 3), // 0.01; operator must configure
-        )?;
-
-        if capital_base <= Decimal::ZERO {
-            return Err(DaemonError::Config("ROBSON_CAPITAL_BASE must be positive".to_string()));
-        }
-
         Ok(EngineConfig {
-            capital_base,
             min_tech_stop_percent: min_tech_stop,
             max_tech_stop_percent: max_tech_stop,
         })
@@ -484,8 +468,7 @@ impl Default for Config {
                 api_token: None,
             },
             engine: EngineConfig {
-                capital_base: Decimal::from(10000),
-                min_tech_stop_percent: Decimal::new(1, 3), // 0.1%
+                min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
                 max_tech_stop_percent: Decimal::new(10, 2), // 10%
             },
             tech_stop: TechStopConfigEnv {

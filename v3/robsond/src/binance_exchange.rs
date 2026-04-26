@@ -17,7 +17,7 @@ use chrono::Utc;
 use robson_connectors::{BinanceRestClient, BinanceRestError};
 use robson_domain::{OrderSide, Price, Quantity, Side, Symbol};
 use robson_exec::{
-    ports::{ExchangePosition, FuturesSettings},
+    ports::{ExchangePosition, FuturesBalance, FuturesSettings},
     ExchangePort, ExecError, OrderResult,
 };
 use rust_decimal::Decimal;
@@ -278,6 +278,14 @@ impl ExchangePort for BinanceExchangeAdapter {
 
     async fn health_check(&self) -> Result<(), ExecError> {
         self.client.ping().await.map_err(Self::map_error)
+    }
+
+    async fn get_futures_balance(&self) -> Result<FuturesBalance, ExecError> {
+        let balance = self.client.get_futures_balance().await.map_err(Self::map_error)?;
+        Ok(FuturesBalance {
+            wallet_balance: balance.wallet_balance,
+            available_balance: balance.available_balance,
+        })
     }
 
     async fn get_all_open_positions(&self) -> Result<Vec<ExchangePosition>, ExecError> {

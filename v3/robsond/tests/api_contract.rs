@@ -37,12 +37,11 @@ async fn start_test_server() -> (String, SocketAddr) {
     start_test_server_with_capital(dec!(10000)).await
 }
 
-/// Spin up a stub daemon with a specific capital_base for tests that need
-/// small position sizing (e.g., exchange minimum quantity rejection).
+/// Spin up a stub daemon with a specific capital for tests that need small
+/// position sizing (e.g., exchange minimum quantity rejection).
 async fn start_test_server_with_capital(capital_base: Decimal) -> (String, SocketAddr) {
-    let mut config = Config::test();
-    config.engine.capital_base = capital_base;
-    let daemon = Daemon::new_stub(config);
+    let config = Config::test();
+    let daemon = Daemon::new_stub_with_capital(config, capital_base);
     let addr = daemon.start_api_server(None).await.expect("failed to start test server");
     let base_url = format!("http://{}", addr);
     (base_url, addr)

@@ -115,6 +115,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self.engine.lock().unwrap().risk_config().capital()
     }
 
+    /// Update the engine's capital from an external source (exchange balance).
+    ///
+    /// Called at startup after querying the exchange and whenever the engine's
+    /// capital needs to be refreshed. Updates the internal `RiskConfig` while
+    /// preserving the fixed 1% risk-per-trade policy.
+    pub fn update_engine_capital(&self, capital: Decimal) {
+        use robson_domain::RiskConfig;
+        if let Ok(risk_config) = RiskConfig::new(capital) {
+            let mut engine = self.engine.lock().unwrap();
+            engine.update_risk_config(risk_config);
+        }
+    }
+
     /// Compute current equity per ADR-0024 §6:
     ///
     /// ```text
