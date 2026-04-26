@@ -219,7 +219,7 @@ impl Config {
             },
             engine: EngineConfig {
                 capital_base: Decimal::from(10000),
-                min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
+                min_tech_stop_percent: Decimal::new(1, 3), // 0.1%
                 max_tech_stop_percent: Decimal::new(10, 2), // 10%
             },
             tech_stop: TechStopConfigEnv {
@@ -292,9 +292,7 @@ impl Config {
         )?;
 
         if capital_base <= Decimal::ZERO {
-            return Err(DaemonError::Config(
-                "ROBSON_CAPITAL_BASE must be positive".to_string(),
-            ));
+            return Err(DaemonError::Config("ROBSON_CAPITAL_BASE must be positive".to_string()));
         }
 
         Ok(EngineConfig {
@@ -486,7 +484,7 @@ impl Default for Config {
             },
             engine: EngineConfig {
                 capital_base: Decimal::from(10000),
-                min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
+                min_tech_stop_percent: Decimal::new(1, 3), // 0.1%
                 max_tech_stop_percent: Decimal::new(10, 2), // 10%
             },
             tech_stop: TechStopConfigEnv {
