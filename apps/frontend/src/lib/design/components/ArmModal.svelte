@@ -5,7 +5,6 @@
 
   let symbol = $state('BTCUSDT');
   let side = $state<'Long' | 'Short'>('Long');
-  let capital = $state<number | ''>('');
   let submitting = $state(false);
   let error = $state<string | null>(null);
 
@@ -14,19 +13,13 @@
     symbol = input.value.toUpperCase();
   }
 
-  function toggleSide() {
-    side = side === 'Long' ? 'Short' : 'Long';
-  }
-
   async function submit() {
     error = null;
-    const capitalNum = Number(capital);
     if (!symbol.trim()) { error = 'SYMBOL REQUIRED'; return; }
-    if (!capitalNum || capitalNum < 100) { error = 'MINIMUM CAPITAL IS 100 USDT'; return; }
 
     submitting = true;
     try {
-      await robsonApi.armPosition({ symbol: symbol.trim(), side, capital: capitalNum });
+      await robsonApi.armPosition({ symbol: symbol.trim(), side });
       onclose();
     } catch (e) {
       error = e instanceof Error ? e.message : 'ARM FAILED';
@@ -72,18 +65,6 @@
           >SHORT</button>
         </div>
       </div>
-
-      <label class="field">
-        <span class="label">CAPITAL (USDT)</span>
-        <input
-          type="number"
-          class="input"
-          bind:value={capital}
-          min="100"
-          step="1"
-          placeholder="100"
-        />
-      </label>
     </div>
 
     {#if error}
