@@ -523,6 +523,27 @@ impl BinanceRestClient {
             Err(BinanceRestError::ParseError(format!("Unexpected ping response: {}", body)))
         }
     }
+
+    /// Get USDT-M futures account balance.
+    ///
+    /// `GET /fapi/v2/balance` (signed).
+    ///
+    /// Returns per-asset balances. This method extracts the USDT entry.
+    pub async fn get_futures_balance(&self) -> Result<BinanceFuturesBalance, BinanceRestError> {
+        let body = self.get_signed("/fapi/v2/balance", vec![]).await?;
+
+        let balances: Vec<BinanceBalanceResponse> =
+            serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+
+        let usdt = balances.into_iter().find(|b| b.asset == "USDT").ok_or_else(|| {
+            BinanceRestError::ParseError("No USDT entry in futures balance response".to_string())
+        })?;
+
+        Ok(BinanceFuturesBalance {
+            wallet_balance: usdt.wallet_balance,
+            available_balance: usdt.available_balance,
+        })
+    }
 }
 
 // =============================================================================
@@ -646,6 +667,24 @@ pub struct BinanceFill {
 struct PriceResponse {
     symbol: String,
     price: Decimal,
+}
+
+/// Response from `GET /fapi/v2/balance`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct BinanceBalanceResponse {
+    asset: String,
+    wallet_balance: Decimal,
+    available_balance: Decimal,
+}
+
+/// Parsed USDT-M futures balance for the USDT asset.
+#[derive(Debug, Clone)]
+pub struct BinanceFuturesBalance {
+    /// Total wallet balance (includes unrealized PnL).
+    pub wallet_balance: Decimal,
+    /// Balance available for new positions.
+    pub available_balance: Decimal,
 }
 
 fn parse_futures_klines(body: &str) -> Result<Vec<BinanceKline>, BinanceRestError> {

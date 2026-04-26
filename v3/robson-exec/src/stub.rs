@@ -13,8 +13,8 @@ use rust_decimal::Decimal;
 use crate::{
     error::ExecError,
     ports::{
-        CandleInterval, ExchangePort, ExchangePosition, FuturesSettings, MarketDataPort, OhlcvPort,
-        OrderResult, PriceUpdate,
+        CandleInterval, ExchangePort, ExchangePosition, FuturesBalance, FuturesSettings,
+        MarketDataPort, OhlcvPort, OrderResult, PriceUpdate,
     },
 };
 
@@ -41,12 +41,15 @@ pub struct StubExchange {
     futures_settings: RwLock<(String, u8)>,
     /// Simulated open positions returned by reconciliation scans.
     open_positions: RwLock<HashMap<String, ExchangePosition>>,
+    /// Simulated futures account balance.
+    futures_balance: RwLock<Decimal>,
 }
 
 impl StubExchange {
-    /// Create a new stub exchange with default price.
+    /// Create a new stub exchange with default price and balance.
     ///
     /// Default futures settings: position_mode="One-way", leverage=10
+    /// Default futures balance: 10,000 USDT.
     pub fn new(default_price: Decimal) -> Self {
         Self {
             prices: RwLock::new(HashMap::new()),
@@ -56,7 +59,15 @@ impl StubExchange {
             fail_next: RwLock::new(false),
             futures_settings: RwLock::new(("One-way".to_string(), 10)),
             open_positions: RwLock::new(HashMap::new()),
+            futures_balance: RwLock::new(Decimal::from(10000)),
         }
+    }
+
+    /// Create a stub exchange with a specific futures balance.
+    pub fn with_balance(default_price: Decimal, balance: Decimal) -> Self {
+        let mut exchange = Self::new(default_price);
+        *exchange.futures_balance.write().unwrap() = balance;
+        exchange
     }
 
     /// Set simulated futures settings (for testing failure scenarios).
@@ -123,6 +134,11 @@ impl StubExchange {
     /// Number of currently simulated open positions.
     pub fn open_positions_len(&self) -> usize {
         self.open_positions.read().unwrap().len()
+    }
+
+    /// Set simulated futures account balance.
+    pub fn set_futures_balance(&self, balance: Decimal) {
+        *self.futures_balance.write().unwrap() = balance;
     }
 }
 
@@ -225,6 +241,17 @@ impl ExchangePort for StubExchange {
             return Err(ExecError::Exchange("Simulated health check failure".to_string()));
         }
         Ok(())
+    }
+
+    async fn get_futures_balance(&self) -> Result<FuturesBalance, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated futures balance fetch failure".to_string()));
+        }
+        let balance = *self.futures_balance.read().unwrap();
+        Ok(FuturesBalance {
+            wallet_balance: balance,
+            available_balance: balance,
+        })
     }
 
     async fn get_all_open_positions(&self) -> Result<Vec<ExchangePosition>, ExecError> {
