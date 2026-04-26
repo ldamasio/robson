@@ -82,7 +82,8 @@ pub struct EngineConfig {
     /// `monthly_state.capital_base` takes precedence (see ADR-0024 §6).
     ///
     /// This value is the initial equity the operator brings to the account.
-    /// Position sizing is derived: `position_size = (capital_base × 1%) / stop_distance`.
+    /// Position sizing is derived:
+    /// `position_size = (capital_base × 1%) / stop_distance`.
     pub capital_base: Decimal,
     /// Minimum tech stop distance (0.001 = 0.1%)
     pub min_tech_stop_percent: Decimal,
