@@ -130,7 +130,6 @@ pub struct PendingApprovalSummary {
 pub struct ArmRequest {
     pub symbol: String,
     pub side: String,
-    pub capital: Decimal,
     #[serde(default = "default_account_id")]
     pub account_id: Uuid,
 }
@@ -636,12 +635,40 @@ where
         },
     };
 
-    // Create risk config (v3 policy: risk is fixed at 1%, not from request)
-    let risk_config = RiskConfig::new(req.capital).map_err(|e| {
+    // Capital base for position sizing.
+    //
+    // Source: `monthly_state` table, populated by `MonthBoundaryReset` event.
+    // Falls back to engine startup value when DB is unavailable.
+    //
+    // Policy (ADR-0024 §6, v3-risk-engine-spec §Month Boundary Rule):
+    //   capital_base = current_equity − latent_risk_carried
+    //
+    // The capital base is pessimistic: it assumes every inherited open position
+    // will hit its current stop. Inherited risk is absorbed into the base
+    // rather than carried as debt against the new month's budget. If a carried
+    // position's trailing stop advances (winning trade), the freed risk
+    // increments the capital base of the following month — never the current
+    // one. This guarantees every month starts with 4 available slots.
+    //
+    // The caller never supplies capital. Position sizing is derived:
+    //   position_size = (capital_base × 1%) / technical_stop_distance
+    let capital = {
+        let manager = state.position_manager.read().await;
+        manager.load_capital_base_for_month(chrono::Utc::now()).await
+    };
+    let capital = capital.map_err(|e| {
         (
-            StatusCode::BAD_REQUEST,
+            StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
-                error: format!("Invalid risk config: {}", e),
+                error: format!("Failed to load capital base: {}", e),
+            }),
+        )
+    })?;
+    let risk_config = RiskConfig::new(capital).map_err(|e| {
+        (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse {
+                error: format!("Capital base invalid: {}", e),
             }),
         )
     })?;

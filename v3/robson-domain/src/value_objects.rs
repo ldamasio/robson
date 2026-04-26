@@ -337,12 +337,6 @@ impl RiskConfig {
     }
 }
 
-impl Default for RiskConfig {
-    fn default() -> Self {
-        Self { capital: Decimal::from(10000) }
-    }
-}
-
 impl fmt::Display for RiskConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
@@ -663,14 +657,14 @@ mod tests {
 
     #[test]
     fn test_risk_config_leverage() {
-        let config = RiskConfig::default();
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         assert_eq!(config.leverage(), 10);
         assert_eq!(RiskConfig::LEVERAGE, 10);
     }
 
     #[test]
-    fn test_risk_config_default() {
-        let config = RiskConfig::default();
+    fn test_risk_config_capital() {
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         assert_eq!(config.capital(), dec!(10000));
         assert_eq!(config.risk_per_trade_pct(), dec!(1));
     }

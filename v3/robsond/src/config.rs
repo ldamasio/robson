@@ -75,6 +75,15 @@ pub struct ProjectionConfig {
 /// See `RiskConfig::RISK_PER_TRADE_PCT` in robson-domain.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
+    /// Operator's declared starting capital in quote currency (e.g., USDT).
+    ///
+    /// Source: `ROBSON_CAPITAL_BASE` env var. Required for the first month of
+    /// operation. After the first `MonthBoundaryReset`, the persisted
+    /// `monthly_state.capital_base` takes precedence (see ADR-0024 §6).
+    ///
+    /// This value is the initial equity the operator brings to the account.
+    /// Position sizing is derived: `position_size = (capital_base × 1%) / stop_distance`.
+    pub capital_base: Decimal,
     /// Minimum tech stop distance (0.001 = 0.1%)
     pub min_tech_stop_percent: Decimal,
     /// Maximum tech stop distance (0.10 = 10%)
@@ -209,6 +218,7 @@ impl Config {
                 api_token: None,
             },
             engine: EngineConfig {
+                capital_base: Decimal::from(10000),
                 min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
                 max_tech_stop_percent: Decimal::new(10, 2), // 10%
             },
@@ -276,7 +286,19 @@ impl Config {
             Decimal::new(10, 2), // 10%
         )?;
 
+        let capital_base = Self::load_decimal_env(
+            "ROBSON_CAPITAL_BASE",
+            Decimal::new(10, 3), // 0.01 — deliberately tiny default to force operator configuration
+        )?;
+
+        if capital_base <= Decimal::ZERO {
+            return Err(DaemonError::Config(
+                "ROBSON_CAPITAL_BASE must be positive".to_string(),
+            ));
+        }
+
         Ok(EngineConfig {
+            capital_base,
             min_tech_stop_percent: min_tech_stop,
             max_tech_stop_percent: max_tech_stop,
         })
@@ -463,6 +485,7 @@ impl Default for Config {
                 api_token: None,
             },
             engine: EngineConfig {
+                capital_base: Decimal::from(10000),
                 min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
                 max_tech_stop_percent: Decimal::new(10, 2), // 10%
             },

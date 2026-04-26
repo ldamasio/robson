@@ -144,6 +144,10 @@ impl<S: Store + 'static> PositionRepository for StorePositionRepositoryAdapter<S
     ) -> Result<Vec<Position>, StoreError> {
         self.store.positions().find_closed_in_month(year, month).await
     }
+
+    async fn find_all_closed(&self) -> Result<Vec<Position>, StoreError> {
+        self.store.positions().find_all_closed().await
+    }
 }
 
 impl Daemon<StubExchange, MemoryStore> {
@@ -157,7 +161,7 @@ impl Daemon<StubExchange, MemoryStore> {
         let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder = default_query_recorder();
-        let risk_config = RiskConfig::new(dec!(10000)).unwrap();
+        let risk_config = RiskConfig::new(config.engine.capital_base).unwrap();
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
@@ -209,7 +213,7 @@ impl Daemon<StubExchange, MemoryStore> {
             } else {
                 default_query_recorder()
             };
-        let risk_config = RiskConfig::new(dec!(10000)).unwrap();
+        let risk_config = RiskConfig::new(config.engine.capital_base).unwrap();
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
@@ -252,7 +256,7 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
         let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder = default_query_recorder();
-        let risk_config = RiskConfig::new(dec!(10000)).unwrap();
+        let risk_config = RiskConfig::new(config.engine.capital_base).unwrap();
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
@@ -311,7 +315,7 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
             } else {
                 default_query_recorder()
             };
-        let risk_config = RiskConfig::new(dec!(10000)).unwrap();
+        let risk_config = RiskConfig::new(config.engine.capital_base).unwrap();
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
@@ -606,9 +610,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
 
         let open_positions = self.store.positions().find_risk_open().await?;
         let carried_risk = Self::calculate_carried_risk(&open_positions);
+
+        // current_equity per ADR-0024 §6:
+        //   current_equity = initial_capital + all_time_realized_pnl + unrealized_pnl
+        //
+        // The capital_base is pessimistic: it subtracts carried_risk (worst case
+        // loss from inherited positions) from current_equity. This guarantees
+        // every month starts with 4 available slots.
         let current_equity = {
             let manager = self.position_manager.read().await;
-            manager.configured_capital()
+            manager.compute_current_equity().await?
         };
         let capital_base = (current_equity - carried_risk).max(rust_decimal::Decimal::ZERO);
 

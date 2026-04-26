@@ -477,6 +477,15 @@ impl PositionRepository for MemoryStore {
             .cloned()
             .collect())
     }
+
+    async fn find_all_closed(&self) -> Result<Vec<Position>, StoreError> {
+        let positions = self.positions.read().unwrap();
+        Ok(positions
+            .values()
+            .filter(|p| matches!(p.state, robson_domain::PositionState::Closed { .. }))
+            .cloned()
+            .collect())
+    }
 }
 
 // =============================================================================
