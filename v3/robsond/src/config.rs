@@ -288,7 +288,7 @@ impl Config {
 
         let capital_base = Self::load_decimal_env(
             "ROBSON_CAPITAL_BASE",
-            Decimal::new(10, 3), // 0.01 — deliberately tiny default to force operator configuration
+            Decimal::new(10, 3), // 0.01; operator must configure
         )?;
 
         if capital_base <= Decimal::ZERO {
