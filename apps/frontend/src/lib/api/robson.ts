@@ -244,7 +244,7 @@ export const robsonApi = {
 
   getPosition: async (id: string) => normalizePosition(await apiFetch<Position>(`/positions/${id}`)),
 
-  armPosition: (body: { symbol: string; side: string; capital: number }) =>
+  armPosition: (body: { symbol: string; side: string }) =>
     apiFetch<Position>('/positions', { method: 'POST', body: JSON.stringify(body) }),
 
   injectSignal: (id: string, body: { entry_price: number; stop_loss: number }) =>
