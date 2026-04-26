@@ -22,7 +22,8 @@ export function positionSummaryLines(p: Position): string[] {
 
   if (typeof state === 'string') {
     if (state === 'Armed') {
-      lines.push(label('ARMED', 'awaiting entry signal'));
+      lines.push(label('ARMED', 'awaiting entry signal · SMA crossover'));
+      lines.push(label('LEVERAGE', '10x (fixed)'));
     } else if (state === 'Active') {
       const details = [];
       if (p.entry_price != null) details.push(`entry ${fmtNum(p.entry_price)}`);
@@ -60,8 +61,8 @@ export function positionSummaryLines(p: Position): string[] {
 
 export function positionMetaLine(p: Position): string {
   const state = positionStateLabel(p.state);
-  const created = formatDateUtc(p.created_at);
-  const parts = [`State ${state}`, `Created ${created}`];
+  const parts = [`State ${state}`];
+  if (p.created_at) parts.push(`Created ${formatDateUtc(p.created_at)}`);
   if (p.closed_at) parts.push(`Closed ${formatDateUtc(p.closed_at)}`);
   return parts.join(' · ');
 }
@@ -112,7 +113,9 @@ function fmtPnl(n: number): string {
 }
 
 function formatDateUtc(iso: string): string {
+  if (!iso) return '--';
   const d = new Date(iso);
+  if (isNaN(d.getTime())) return '--';
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} UTC`;
 }
 

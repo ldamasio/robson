@@ -10,6 +10,7 @@
   import { activePositions } from '$stores/operations';
   import { haltStatus } from '$stores/slots';
   import { recentEvents, pushEvent } from '$stores/events';
+  import { toasts, showToast } from '$stores/toast';
   import { deriveSlots, INITIAL_MONTHLY_SLOT_BUDGET } from '$lib/config/slots';
   import { formatTimeUtc, isTodayUtc } from '$lib/utils/time';
   import {
@@ -299,7 +300,17 @@
   {/if}
 
   {#if showArmModal}
-    <ArmModal onclose={() => { showArmModal = false; void load(); }} />
+    <ArmModal onclose={() => { showArmModal = false; void load(); }} onresult={(r) => { showToast(`${r.symbol} ${r.side} armed — detector active`, 'ok'); }} />
+  {/if}
+
+  {#if $toasts.length > 0}
+    <div class="toast-container">
+      {#each $toasts as t (t.id)}
+        <div class="toast" class:ok={t.kind === 'ok'} class:err-toast={t.kind === 'err'}>
+          {t.message}
+        </div>
+      {/each}
+    </div>
   {/if}
 </div>
 
@@ -490,5 +501,36 @@
   }
   .meta.dim {
     color: var(--fg-3);
+  }
+  .toast-container {
+    position: fixed;
+    bottom: var(--s-6);
+    right: var(--s-6);
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-2);
+    z-index: 200;
+  }
+  .toast {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    letter-spacing: var(--track-wide);
+    padding: var(--s-3) var(--s-5);
+    border-radius: var(--radius-sm);
+    animation: toast-in var(--dur) var(--ease);
+  }
+  .toast.ok {
+    color: var(--ok);
+    border: 1px solid var(--ok);
+    background: rgba(127, 183, 126, 0.08);
+  }
+  .toast.err-toast {
+    color: var(--err);
+    border: 1px solid var(--err);
+    background: rgba(197, 106, 106, 0.08);
+  }
+  @keyframes toast-in {
+    from { opacity: 0; transform: translateY(8px); }
+    to { opacity: 1; transform: translateY(0); }
   }
 </style>
