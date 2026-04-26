@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { deriveSlots, occupiedCount, SLOT_COUNT } from '$lib/config/slots';
+import { deriveSlots, occupiedCount, INITIAL_MONTHLY_SLOT_BUDGET } from '$lib/config/slots';
 import type { PositionState } from '$api/robson';
 
 const activeState: PositionState = {
@@ -14,9 +14,9 @@ const activeState: PositionState = {
 };
 
 describe('deriveSlots', () => {
-  it('returns 6 empty slots when no positions', () => {
+  it('returns 4 empty slots when no positions', () => {
     const result = deriveSlots([]);
-    expect(result).toHaveLength(SLOT_COUNT);
+    expect(result).toHaveLength(INITIAL_MONTHLY_SLOT_BUDGET);
     expect(result.every((s) => !s.occupied)).toBe(true);
   });
 
@@ -41,13 +41,13 @@ describe('deriveSlots', () => {
     expect(result.every((s) => !s.occupied)).toBe(true);
   });
 
-  it('caps at SLOT_COUNT even with more than 6 active positions', () => {
+  it('expands beyond the initial monthly budget when more positions are active', () => {
     const positions = Array.from({ length: 8 }, (_, i) => ({
       id: `p-${i}`,
       state: activeState
     }));
     const result = deriveSlots(positions);
-    expect(result).toHaveLength(SLOT_COUNT);
+    expect(result).toHaveLength(8);
     expect(result.every((s) => s.occupied)).toBe(true);
   });
 });
@@ -64,7 +64,7 @@ describe('occupiedCount', () => {
     expect(occupiedCount(positions)).toBe(3);
   });
 
-  it('returns count > SLOT_COUNT when more than 6 active', () => {
+  it('returns count > initial monthly budget when more than 4 active', () => {
     const positions = Array.from({ length: 8 }, () => ({ state: activeState }));
     expect(occupiedCount(positions)).toBe(8);
   });

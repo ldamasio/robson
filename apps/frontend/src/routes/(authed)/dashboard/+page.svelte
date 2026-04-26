@@ -9,7 +9,7 @@
   import { activePositions } from '$stores/operations';
   import { haltStatus } from '$stores/slots';
   import { recentEvents, pushEvent } from '$stores/events';
-  import { deriveSlots, SLOT_COUNT } from '$lib/config/slots';
+  import { deriveSlots, INITIAL_MONTHLY_SLOT_BUDGET } from '$lib/config/slots';
   import { formatTimeUtc, isTodayUtc } from '$lib/utils/time';
   import {
     positionLabel,
@@ -30,7 +30,8 @@
   let positions = $derived($activePositions);
   let slots = $derived(deriveSlots(positions));
   let occupied = $derived(slots.filter((s) => s.occupied).length);
-  let free = $derived(SLOT_COUNT - occupied);
+  let displayedSlots = $derived(slots.length);
+  let free = $derived(Math.max(0, INITIAL_MONTHLY_SLOT_BUDGET - occupied));
   let activeOps = $derived(positions.filter((p) => isPositionActive(p.state)));
   let todayEvents = $derived($recentEvents.filter((e) => isTodayUtc(e.occurred_at)));
   let haltState = $derived($haltStatus?.state ?? 'active');
@@ -39,7 +40,7 @@
     if (typeof p.state === 'object' && 'Closed' in p.state) {
       return Number(p.state.Closed.realized_pnl);
     }
-    return p.realized_pnl != null ? Number(p.realized_pnl) : null;
+    return p.pnl ?? p.realized_pnl ?? null;
   }
 
   function monthLabel(): string {
@@ -152,7 +153,7 @@
           <span class="dot warn"></span> {$_('dashboard.connecting')}
         {:else}
           <span class="dot live"></span>
-          {haltStateLabel(haltState)} · SLOT {occupied}/{SLOT_COUNT}
+          {haltStateLabel(haltState)} · SLOT {occupied}/{displayedSlots}
         {/if}
       </div>
     </Row>
@@ -295,7 +296,7 @@
   }
   .slots-grid {
     display: grid;
-    grid-template-columns: repeat(6, 64px);
+    grid-template-columns: repeat(4, 64px);
     gap: var(--s-2);
   }
   .slot {
