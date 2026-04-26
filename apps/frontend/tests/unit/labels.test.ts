@@ -48,9 +48,10 @@ function makeEvent(payload: Record<string, unknown>): SseEvent {
 describe('positionSummaryLines', () => {
   it('Armed state', () => {
     const lines = positionSummaryLines(basePosition({ state: 'Armed' }));
-    expect(lines).toHaveLength(1);
+    expect(lines).toHaveLength(2);
     expect(lines[0]).toContain('ARMED');
     expect(lines[0]).toContain('awaiting entry signal');
+    expect(lines[1]).toContain('LEVERAGE');
   });
 
   it('Active state with trailing stop', () => {
