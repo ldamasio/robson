@@ -540,8 +540,8 @@ impl BinanceRestClient {
         })?;
 
         Ok(BinanceFuturesBalance {
-            wallet_balance: usdt.wallet_balance,
-            available_balance: usdt.available_balance,
+            wallet_balance: usdt.balance,
+            available_balance: usdt.availableBalance,
         })
     }
 }
@@ -670,12 +670,15 @@ struct PriceResponse {
 }
 
 /// Response from `GET /fapi/v2/balance`.
+///
+/// Binance returns `balance` (not `walletBalance`) for the total wallet field,
+/// but `availableBalance` (camelCase) for the available field.
 #[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
+#[allow(non_snake_case)]
 struct BinanceBalanceResponse {
     asset: String,
-    wallet_balance: Decimal,
-    available_balance: Decimal,
+    balance: Decimal,
+    availableBalance: Decimal,
 }
 
 /// Parsed USDT-M futures balance for the USDT asset.
@@ -906,5 +909,39 @@ mod tests {
         assert_eq!(active[0].symbol, "BTCUSDT");
         assert_eq!(active[0].position_amt, dec!(0.001));
         assert_eq!(active[0].leverage, "10");
+    }
+
+    #[test]
+    fn test_balance_response_parsing() {
+        let body = r#"[
+            {
+                "accountAlias": "SgsR",
+                "asset": "USDT",
+                "balance": "122607.35137903",
+                "crossWalletBalance": "23.72469206",
+                "crossUnPnl": "0.00000000",
+                "availableBalance": "23.72469206",
+                "maxWithdrawAmount": "23.72469206",
+                "marginAvailable": true,
+                "updateTime": 1617939110373
+            },
+            {
+                "accountAlias": "SgsR",
+                "asset": "BNB",
+                "balance": "0.00000000",
+                "crossWalletBalance": "0.00000000",
+                "crossUnPnl": "0.00000000",
+                "availableBalance": "0.00000000",
+                "maxWithdrawAmount": "0.00000000",
+                "marginAvailable": true,
+                "updateTime": 1617939110373
+            }
+        ]"#;
+
+        let balances: Vec<BinanceBalanceResponse> = serde_json::from_str(body).unwrap();
+        let usdt = balances.into_iter().find(|b| b.asset == "USDT").unwrap();
+
+        assert_eq!(usdt.balance, dec!(122607.35137903));
+        assert_eq!(usdt.availableBalance, dec!(23.72469206));
     }
 }
