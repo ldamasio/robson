@@ -115,6 +115,38 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self.engine.lock().unwrap().risk_config().capital()
     }
 
+    /// Compute current equity per ADR-0024 §6:
+    ///
+    /// ```text
+    /// current_equity = initial_capital + all_time_realized_pnl + unrealized_pnl
+    /// ```
+    ///
+    /// Where:
+    /// - `initial_capital`: operator's declared starting capital from config
+    /// - `all_time_realized_pnl`: Σ(realized_pnl − fees_paid) for every closed
+    ///   position since the system started
+    /// - `unrealized_pnl`: mark-to-market PnL of Active positions
+    pub(crate) async fn compute_current_equity(&self) -> DaemonResult<Decimal> {
+        let initial_capital = self.configured_capital();
+
+        // All-time realized PnL (net of fees)
+        let all_closed = self.store.positions().find_all_closed().await?;
+        let all_time_realized: Decimal =
+            all_closed.iter().map(|p| p.realized_pnl - p.fees_paid).sum();
+
+        // Unrealized PnL of open Active positions
+        let active = self.store.positions().find_risk_open().await?;
+        let unrealized: Decimal = active
+            .iter()
+            .filter_map(|p| match &p.state {
+                PositionState::Active { .. } => Some(p.calculate_pnl()),
+                _ => None,
+            })
+            .sum();
+
+        Ok(initial_capital + all_time_realized + unrealized)
+    }
+
     #[cfg(feature = "postgres")]
     fn event_stream_key(event: &Event) -> String {
         match event {
@@ -126,7 +158,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     }
 
     #[cfg(feature = "postgres")]
-    async fn load_capital_base_for_month(
+    pub(crate) async fn load_capital_base_for_month(
         &self,
         now: chrono::DateTime<chrono::Utc>,
     ) -> DaemonResult<Decimal> {
@@ -147,7 +179,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     }
 
     #[cfg(not(feature = "postgres"))]
-    async fn load_capital_base_for_month(
+    pub(crate) async fn load_capital_base_for_month(
         &self,
         _now: chrono::DateTime<chrono::Utc>,
     ) -> DaemonResult<Decimal> {

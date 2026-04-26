@@ -81,6 +81,12 @@ pub trait PositionRepository: Send + Sync {
         year: i32,
         month: u32,
     ) -> Result<Vec<Position>, StoreError>;
+
+    /// Find all closed positions (all-time).
+    ///
+    /// Returns every position in `Closed` state, regardless of when it closed.
+    /// Used to compute cumulative realized PnL for equity calculation.
+    async fn find_all_closed(&self) -> Result<Vec<Position>, StoreError>;
 }
 
 /// Repository for Order entities
