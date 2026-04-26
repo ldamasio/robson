@@ -1,13 +1,15 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
+  import { browser } from '$app/environment';
   import { goto } from '$app/navigation';
   import { authToken } from '$stores/auth';
   import { get } from 'svelte/store';
 
-  onMount(() => {
-    const token = get(authToken);
-    void goto(token ? '/dashboard' : '/login', { replaceState: true });
-  });
+  if (browser) {
+    queueMicrotask(() => {
+      const token = get(authToken);
+      void goto(token ? '/dashboard' : '/login', { replaceState: true });
+    });
+  }
 </script>
 
 <svelte:head>
