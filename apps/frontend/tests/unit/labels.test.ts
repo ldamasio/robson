@@ -175,6 +175,7 @@ describe('eventTypeLabel', () => {
 
 describe('isPositionActive', () => {
   it('Armed is active', () => expect(isPositionActive('Armed')).toBe(true));
+  it('Active string state is active', () => expect(isPositionActive('Active')).toBe(true));
   it('Entering is active', () =>
     expect(
       isPositionActive({

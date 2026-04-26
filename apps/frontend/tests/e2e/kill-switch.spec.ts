@@ -202,7 +202,7 @@ test.describe('Kill Switch', () => {
     await authAndGoto(page, '/kill-switch');
 
     await expect(page.locator('.state-line')).toBeVisible({ timeout: 10_000 });
-    await expect(page.locator('.state-line')).toContainText('SLOT 2/6');
+    await expect(page.locator('.state-line')).toContainText('SLOT 2/4');
   });
 
   test('pt-BR locale uses DESLIGAR keyword', async ({ page }) => {

@@ -12,16 +12,18 @@ const API_BASE: string = env.PUBLIC_ROBSON_API_BASE ?? '';
 
 export type Position = {
   id: string;
-  account_id: string;
+  account_id: string | null;
   symbol: string;
-  side: 'Long' | 'Short';
+  side: 'Long' | 'Short' | string;
   state: PositionState;
   entry_price: number | null;
   entry_filled_at: string | null;
   tech_stop_distance: number | null;
-  quantity: number;
-  realized_pnl: number;
-  fees_paid: number;
+  quantity: number | null;
+  realized_pnl: number | null;
+  pnl?: number | null;
+  fees_paid: number | null;
+  trailing_stop?: number | null;
   entry_order_id: string | null;
   exit_order_id: string | null;
   insurance_stop_id: string | null;
@@ -33,6 +35,11 @@ export type Position = {
 
 export type PositionState =
   | 'Armed'
+  | 'Entering'
+  | 'Active'
+  | 'Exiting'
+  | 'Closed'
+  | 'Error'
   | { Entering: { entry_order_id: string; expected_entry: number; signal_id: string } }
   | {
       Active: {
@@ -136,6 +143,47 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   return res.json() as Promise<T>;
 }
 
+function toNumber(value: unknown): number | null {
+  if (value === null || value === undefined || value === '') return null;
+  const n = Number(value);
+  return Number.isFinite(n) ? n : null;
+}
+
+function normalizePosition(raw: unknown): Position {
+  const p = raw as Record<string, unknown>;
+  return {
+    id: String(p.id ?? ''),
+    account_id: p.account_id == null ? null : String(p.account_id),
+    symbol: String(p.symbol ?? ''),
+    side: String(p.side ?? ''),
+    state: (p.state ?? 'Error') as PositionState,
+    entry_price: toNumber(p.entry_price),
+    entry_filled_at: p.entry_filled_at == null ? null : String(p.entry_filled_at),
+    tech_stop_distance: toNumber(p.tech_stop_distance),
+    quantity: toNumber(p.quantity),
+    realized_pnl: toNumber(p.realized_pnl),
+    pnl: toNumber(p.pnl),
+    fees_paid: toNumber(p.fees_paid),
+    trailing_stop: toNumber(p.trailing_stop),
+    entry_order_id: p.entry_order_id == null ? null : String(p.entry_order_id),
+    exit_order_id: p.exit_order_id == null ? null : String(p.exit_order_id),
+    insurance_stop_id: p.insurance_stop_id == null ? null : String(p.insurance_stop_id),
+    binance_position_id: p.binance_position_id == null ? null : String(p.binance_position_id),
+    created_at: String(p.created_at ?? ''),
+    updated_at: String(p.updated_at ?? ''),
+    closed_at: p.closed_at == null ? null : String(p.closed_at)
+  };
+}
+
+function normalizeStatus(raw: StatusResponse): StatusResponse {
+  return {
+    ...raw,
+    active_positions: Number(raw.active_positions ?? 0),
+    positions: Array.isArray(raw.positions) ? raw.positions.map(normalizePosition) : [],
+    pending_approvals: Array.isArray(raw.pending_approvals) ? raw.pending_approvals : []
+  };
+}
+
 export class ApiError extends Error {
   constructor(
     public readonly path: string,
@@ -192,9 +240,9 @@ function createEventSource(url: string): EventSourceLike {
 export const robsonApi = {
   health: () => apiFetch<{ status: string }>('/health'),
 
-  getStatus: () => apiFetch<StatusResponse>('/status'),
+  getStatus: async () => normalizeStatus(await apiFetch<StatusResponse>('/status')),
 
-  getPosition: (id: string) => apiFetch<Position>(`/positions/${id}`),
+  getPosition: async (id: string) => normalizePosition(await apiFetch<Position>(`/positions/${id}`)),
 
   armPosition: (body: { symbol: string; side: string }) =>
     apiFetch<Position>('/positions', { method: 'POST', body: JSON.stringify(body) }),
