@@ -55,6 +55,7 @@
     "eventStreamLabel": "EVENT STREAM",
     "sessionOnly": "Events from this session only. Full history in FE-P2.",
     "noEvents": "No events received yet for this position.",
+    "armedDescription": "awaiting entry signal · SMA crossover",
     "loading": "LOADING...",
     "loadError": "LOAD ERROR",
     "retry": "Retry"

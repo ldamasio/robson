@@ -105,6 +105,9 @@ pub struct PositionSummary {
     pub symbol: String,
     pub side: String,
     pub state: String,
+    pub created_at: chrono::DateTime<chrono::Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub quantity: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_price: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -979,6 +982,12 @@ fn position_to_summary(position: &Position) -> PositionSummary {
         symbol: position.symbol.as_pair(),
         side: format!("{:?}", position.side),
         state: state_str,
+        created_at: position.created_at,
+        quantity: if position.quantity.as_decimal() > Decimal::ZERO {
+            Some(position.quantity.as_decimal())
+        } else {
+            None
+        },
         entry_price,
         trailing_stop,
         pnl,

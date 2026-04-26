@@ -28,8 +28,8 @@ export type Position = {
   exit_order_id: string | null;
   insurance_stop_id: string | null;
   binance_position_id: string | null;
-  created_at: string;
-  updated_at: string;
+  created_at: string | null;
+  updated_at: string | null;
   closed_at: string | null;
 };
 
@@ -169,8 +169,8 @@ function normalizePosition(raw: unknown): Position {
     exit_order_id: p.exit_order_id == null ? null : String(p.exit_order_id),
     insurance_stop_id: p.insurance_stop_id == null ? null : String(p.insurance_stop_id),
     binance_position_id: p.binance_position_id == null ? null : String(p.binance_position_id),
-    created_at: String(p.created_at ?? ''),
-    updated_at: String(p.updated_at ?? ''),
+    created_at: p.created_at == null ? null : String(p.created_at),
+    updated_at: p.updated_at == null ? null : String(p.updated_at),
     closed_at: p.closed_at == null ? null : String(p.closed_at)
   };
 }
