@@ -21,7 +21,7 @@
     try {
       const result = await robsonApi.armPosition({ symbol: symbol.trim(), side });
       onclose();
-      if (onresult) onresult({ position_id: result.position_id, symbol: result.symbol, side: result.side });
+      if (onresult) onresult({ position_id: result.id, symbol: result.symbol, side: result.side });
     } catch (e) {
       error = e instanceof Error ? e.message : 'ARM FAILED';
     } finally {
