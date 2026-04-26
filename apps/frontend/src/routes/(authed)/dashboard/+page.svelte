@@ -5,7 +5,8 @@
   import Row from '$design/components/Row.svelte';
   import Grid from '$design/components/Grid.svelte';
   import TickRuler from '$design/components/TickRuler.svelte';
-  import { robsonApi, connectEventStream, type Position, type SseEvent } from '$api/robson';
+  import ArmModal from '$design/components/ArmModal.svelte';
+  import { robsonApi, connectEventStream, type Position, type SseEvent, type PendingApproval } from '$api/robson';
   import { activePositions } from '$stores/operations';
   import { haltStatus } from '$stores/slots';
   import { recentEvents, pushEvent } from '$stores/events';
@@ -26,6 +27,10 @@
   let connected = $state(false);
   let closeSse: (() => void) | null = null;
   let pollTimer: ReturnType<typeof setInterval> | null = null;
+  let showArmModal = $state(false);
+  let pendingApprovals = $state<PendingApproval[]>([]);
+  let approvalTick = $state(Date.now());
+  let approvalTickTimer: ReturnType<typeof setInterval> | null = null;
 
   let positions = $derived($activePositions);
   let slots = $derived(deriveSlots(positions));
@@ -35,6 +40,15 @@
   let activeOps = $derived(positions.filter((p) => isPositionActive(p.state)));
   let todayEvents = $derived($recentEvents.filter((e) => isTodayUtc(e.occurred_at)));
   let haltState = $derived($haltStatus?.state ?? 'active');
+
+  function countdownRemaining(expiresAt: string): string {
+    const ms = new Date(expiresAt).getTime() - approvalTick;
+    if (ms <= 0) return 'expired';
+    const totalSec = Math.floor(ms / 1000);
+    const m = Math.floor(totalSec / 60);
+    const s = totalSec % 60;
+    return `${m}m ${s}s`;
+  }
 
   function pnlFor(p: Position): number | null {
     if (typeof p.state === 'object' && 'Closed' in p.state) {
@@ -58,6 +72,7 @@
       ]);
       activePositions.set(status.positions);
       haltStatus.set(halt);
+      pendingApprovals = status.pending_approvals;
       connected = true;
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to connect to Robson backend';
@@ -100,6 +115,7 @@
           ]);
           activePositions.set(status.positions);
           haltStatus.set(halt);
+          pendingApprovals = status.pending_approvals;
           connected = true;
           error = null;
         } catch {
@@ -127,12 +143,23 @@
       void load();
       startSse();
       startPolling();
+      approvalTickTimer = setInterval(() => { approvalTick = Date.now(); }, 1000);
     });
     return () => {
       stopSse();
       stopPolling();
+      if (approvalTickTimer) { clearInterval(approvalTickTimer); approvalTickTimer = null; }
     };
   });
+
+  async function approve(queryId: string) {
+    try {
+      await robsonApi.approveQuery(queryId);
+      void load();
+    } catch {
+      // error handled by next poll refresh
+    }
+  }
 </script>
 
 <svelte:head>
@@ -146,16 +173,23 @@
         <img src="/brand/rbx-mark.svg" alt="RBX" width="32" height="32" />
         <img src="/brand/wordmark-robson.svg" alt="RBX Robson" height="22" />
       </Row>
-      <div class="status-strip">
-        {#if error}
-          <span class="dot err"></span> {$_('dashboard.offline')} · {error}
-        {:else if !connected}
-          <span class="dot warn"></span> {$_('dashboard.connecting')}
+      <Row gap={4} align="center">
+        <div class="status-strip">
+          {#if error}
+            <span class="dot err"></span> {$_('dashboard.offline')} · {error}
+          {:else if !connected}
+            <span class="dot warn"></span> {$_('dashboard.connecting')}
+          {:else}
+            <span class="dot live"></span>
+            {haltStateLabel(haltState)} · SLOT {occupied}/{displayedSlots}
+          {/if}
+        </div>
+        {#if haltState === 'monthly_halt'}
+          <button class="btn-entry" disabled>HALT</button>
         {:else}
-          <span class="dot live"></span>
-          {haltStateLabel(haltState)} · SLOT {occupied}/{displayedSlots}
+          <button class="btn-entry" onclick={() => (showArmModal = true)}>ENTRY</button>
         {/if}
-      </div>
+      </Row>
     </Row>
   </header>
 
@@ -185,6 +219,26 @@
         <div class="eyebrow dim">{$_('dashboard.occupied', { values: { count: occupied } })} · {$_('dashboard.freeCount', { values: { count: free } })}</div>
       </Stack>
     </section>
+
+    {#if pendingApprovals.length > 0}
+      <section>
+        <Stack gap={4}>
+          <div class="eyebrow">PENDING APPROVALS · {pendingApprovals.length}</div>
+          {#each pendingApprovals as approval (approval.query_id)}
+            <Card>
+              <Row justify="between" align="center">
+                <Stack gap={1}>
+                  <span class="mono">{approval.position_id ? approval.position_id.slice(0, 8) : '--------'}</span>
+                  <span class="meta">{approval.reason}</span>
+                  <span class="meta dim">expires in {countdownRemaining(approval.expires_at)}</span>
+                </Stack>
+                <button class="btn-approve" onclick={() => approve(approval.query_id)}>APPROVE</button>
+              </Row>
+            </Card>
+          {/each}
+        </Stack>
+      </section>
+    {/if}
 
     <section>
       <Stack gap={4}>
@@ -242,6 +296,10 @@
         </Card>
       </Stack>
     </section>
+  {/if}
+
+  {#if showArmModal}
+    <ArmModal onclose={() => { showArmModal = false; void load(); }} />
   {/if}
 </div>
 
@@ -390,5 +448,47 @@
   }
   .btn-retry:hover {
     background: var(--cyan-subtle);
+  }
+  .btn-entry {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: var(--track-label);
+    color: var(--cyan-brand);
+    background: transparent;
+    border: 1px solid var(--cyan-dim);
+    border-radius: var(--radius-sm);
+    padding: var(--s-1) var(--s-3);
+    cursor: pointer;
+    transition: background var(--dur) var(--ease);
+  }
+  .btn-entry:hover:not(:disabled) {
+    background: var(--cyan-subtle);
+  }
+  .btn-entry:disabled {
+    color: var(--err);
+    border-color: var(--err);
+    cursor: not-allowed;
+    opacity: 0.8;
+  }
+  .btn-approve {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: var(--track-label);
+    color: var(--cyan-brand);
+    background: transparent;
+    border: 1px solid var(--cyan-dim);
+    border-radius: var(--radius-sm);
+    padding: var(--s-1) var(--s-3);
+    cursor: pointer;
+    transition: background var(--dur) var(--ease);
+    white-space: nowrap;
+  }
+  .btn-approve:hover {
+    background: var(--cyan-subtle);
+  }
+  .meta.dim {
+    color: var(--fg-3);
   }
 </style>
