@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- RBX Holding wordmark — standalone "RBX" -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 240 60" width="240" height="60">
+  <rect width="240" height="60" fill="#07080A"/>
+  <text x="20" y="40"
+    font-family="Inter, system-ui, sans-serif"
+    font-size="28" font-weight="500" letter-spacing="-0.5"
+    fill="#22E5E5">RBX</text>
+  <!-- voltage tick signature -->
+  <line x1="20" y1="48" x2="90" y2="48" stroke="#22E5E5" stroke-width="1" stroke-opacity="0.5"/>
+</svg>

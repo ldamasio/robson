@@ -1,0 +1,22 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  body { margin:0; padding:20px; background:var(--bg-0); color:var(--fg-0); font-family:var(--font-sans); }
+  .wrap { display:grid; grid-template-columns:repeat(5,1fr); gap:8px; }
+  .sw { border:1px solid var(--border); border-radius:var(--radius-sm); overflow:hidden; }
+  .chip { height:48px; }
+  .label { padding:8px 10px; background:var(--bg-1); }
+  .name { font-family:var(--font-mono); font-size:11px; color:var(--fg-0); letter-spacing:0.06em; text-transform:uppercase; }
+  .hex { font-family:var(--font-mono); font-size:11px; color:var(--fg-2); }
+  .row { display:flex; justify-content:space-between; }
+  .usage { margin-top:4px; font-size:10px; color:var(--fg-2); }
+</style></head>
+<body>
+<div class="wrap">
+  <div class="sw"><div class="chip" style="background:#C9A96E"></div><div class="label"><div class="row"><span class="name">accent</span><span class="hex">#C9A96E</span></div><div class="usage">focus, emphasis</div></div></div>
+  <div class="sw"><div class="chip" style="background:#6AA77B"></div><div class="label"><div class="row"><span class="name">positive</span><span class="hex">#6AA77B</span></div><div class="usage">gains, success</div></div></div>
+  <div class="sw"><div class="chip" style="background:#C26B6B"></div><div class="label"><div class="row"><span class="name">negative</span><span class="hex">#C26B6B</span></div><div class="usage">losses, error</div></div></div>
+  <div class="sw"><div class="chip" style="background:#C9A96E"></div><div class="label"><div class="row"><span class="name">warning</span><span class="hex">#C9A96E</span></div><div class="usage">caution, dry-run</div></div></div>
+  <div class="sw"><div class="chip" style="background:#7891A8"></div><div class="label"><div class="row"><span class="name">info</span><span class="hex">#7891A8</span></div><div class="usage">neutral</div></div></div>
+</div>
+</body></html>

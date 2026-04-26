@@ -1,0 +1,31 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+<style>
+  body { margin:0; padding:24px; background:var(--bg-0); font-family:var(--font-sans); color:var(--fg-0); }
+  .grid { display:grid; grid-template-columns:repeat(8,1fr); gap:12px; }
+  .cell { display:flex; flex-direction:column; align-items:center; gap:8px; padding:12px 6px; border:1px solid var(--border); border-radius:2px; color:var(--fg-1); }
+  .cell svg { width:20px; height:20px; stroke-width:1.5; }
+  .lbl { font-family:var(--font-mono); font-size:10px; color:var(--fg-2); letter-spacing:0.04em; }
+</style></head>
+<body>
+  <div class="grid">
+    <div class="cell"><i data-lucide="activity"></i><span class="lbl">activity</span></div>
+    <div class="cell"><i data-lucide="trending-up"></i><span class="lbl">trending-up</span></div>
+    <div class="cell"><i data-lucide="trending-down"></i><span class="lbl">trending-down</span></div>
+    <div class="cell"><i data-lucide="shield"></i><span class="lbl">shield</span></div>
+    <div class="cell"><i data-lucide="zap"></i><span class="lbl">zap</span></div>
+    <div class="cell"><i data-lucide="terminal"></i><span class="lbl">terminal</span></div>
+    <div class="cell"><i data-lucide="check-circle"></i><span class="lbl">check-circle</span></div>
+    <div class="cell"><i data-lucide="alert-triangle"></i><span class="lbl">alert</span></div>
+    <div class="cell"><i data-lucide="x-circle"></i><span class="lbl">x-circle</span></div>
+    <div class="cell"><i data-lucide="clock"></i><span class="lbl">clock</span></div>
+    <div class="cell"><i data-lucide="layers"></i><span class="lbl">layers</span></div>
+    <div class="cell"><i data-lucide="bar-chart-3"></i><span class="lbl">chart</span></div>
+    <div class="cell"><i data-lucide="settings"></i><span class="lbl">settings</span></div>
+    <div class="cell"><i data-lucide="arrow-right"></i><span class="lbl">arrow-r</span></div>
+    <div class="cell"><i data-lucide="circle"></i><span class="lbl">circle</span></div>
+    <div class="cell"><i data-lucide="play"></i><span class="lbl">play</span></div>
+  </div>
+  <script>lucide.createIcons();</script>
+</body></html>

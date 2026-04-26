@@ -1,0 +1,239 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8"/>
+<title>RBX Voltage — Brand System Preview</title>
+<style>
+  @import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+  :root {
+    /* ——— Voltage System tokens ——— */
+    --bg-0: #07080A;
+    --bg-1: #0D0F12;
+    --bg-2: #13161A;
+    --bg-3: #1A1E23;
+    --fg-0: #ECECEC;
+    --fg-1: #B8BCC2;
+    --fg-2: #7A7F87;
+    --fg-3: #4A4F56;
+    --border: #24282E;
+    --border-strong: #3A4048;
+    --cyan-signal: #00FFFF;
+    --cyan-brand:  #22E5E5;
+    --cyan-muted:  #06B6B6;
+    --cyan-dim:    #0B6E6E;
+    --cyan-subtle: rgba(0,255,255,0.08);
+    --ok:    #7FB77E;
+    --warn:  #D9B55A;
+    --err:   #C56A6A;
+    --info:  #7A93B0;
+    --font-sans: 'Inter', system-ui, -apple-system, sans-serif;
+    --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', monospace;
+  }
+  * { box-sizing: border-box; margin: 0; padding: 0; }
+  body {
+    background: var(--bg-0);
+    color: var(--fg-0);
+    font-family: var(--font-sans);
+    font-size: 15px;
+    line-height: 1.55;
+    padding: 48px;
+    -webkit-font-smoothing: antialiased;
+  }
+
+  h1 { font-weight: 300; font-size: 48px; letter-spacing: -0.015em; line-height: 1.1; margin-bottom: 32px; }
+  h2 { font-weight: 400; font-size: 22px; letter-spacing: -0.01em; margin: 48px 0 16px; }
+  h3 { font-weight: 500; font-size: 14px; text-transform: uppercase; letter-spacing: 0.14em; color: var(--fg-2); margin: 24px 0 12px; }
+
+  .row { display: grid; grid-template-columns: repeat(5, 1fr); gap: 16px; margin-bottom: 24px; }
+  .swatch { padding: 16px; border: 1px solid var(--border); border-radius: 4px; }
+  .swatch .chip { width: 100%; height: 64px; border-radius: 2px; margin-bottom: 8px; }
+  .swatch .name { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.04em; text-transform: uppercase; color: var(--fg-1); }
+  .swatch .hex  { font-family: var(--font-mono); font-size: 11px; color: var(--fg-2); }
+
+  /* Signature: L-corners on cards */
+  .card {
+    position: relative;
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: 4px;
+    padding: 32px;
+    margin-bottom: 24px;
+  }
+  .card::before, .card::after,
+  .card .lb, .card .lt {
+    content: ''; position: absolute; width: 10px; height: 10px;
+    border: 1.5px solid var(--cyan-brand); opacity: 0.4;
+  }
+  .card::before { top: -1px; left: -1px; border-right: 0; border-bottom: 0; }
+  .card::after  { top: -1px; right: -1px; border-left: 0; border-bottom: 0; }
+  .card .lb     { bottom: -1px; left: -1px; border-right: 0; border-top: 0; }
+  .card .lt     { bottom: -1px; right: -1px; border-left: 0; border-top: 0; }
+
+  .mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+  .eyebrow {
+    font-family: var(--font-mono);
+    font-size: 11px;
+    text-transform: uppercase;
+    letter-spacing: 0.14em;
+    color: var(--fg-2);
+  }
+
+  /* Status chips */
+  .status {
+    display: inline-flex; align-items: center; gap: 8px;
+    font-family: var(--font-mono); font-size: 11px;
+    text-transform: uppercase; letter-spacing: 0.04em;
+    padding: 4px 8px; border: 1px solid var(--border); border-radius: 2px;
+  }
+  .status .dot { width: 6px; height: 6px; border-radius: 50%; }
+  .status.live .dot    { background: var(--ok); }
+  .status.dry .dot     { background: var(--warn); }
+  .status.stop .dot    { background: var(--err); }
+  .status.signal .dot  { background: var(--cyan-signal); box-shadow: 0 0 8px var(--cyan-signal); }
+
+  /* Buttons */
+  .btn {
+    display: inline-block;
+    padding: 10px 20px;
+    font-family: var(--font-sans); font-size: 14px; font-weight: 500;
+    border: 1px solid var(--border-strong);
+    background: var(--bg-2); color: var(--fg-0);
+    border-radius: 2px; cursor: pointer;
+    transition: all 160ms cubic-bezier(0.2,0,0,1);
+  }
+  .btn:hover { border-color: var(--cyan-brand); color: var(--cyan-brand); }
+  .btn.primary { background: var(--cyan-signal); color: var(--bg-0); border-color: var(--cyan-signal); }
+  .btn.primary:hover { background: var(--cyan-brand); border-color: var(--cyan-brand); color: var(--bg-0); }
+  .btn.danger { border-color: var(--err); color: var(--err); }
+
+  /* Data ticks signature */
+  .ticks { display: flex; gap: 30px; padding: 8px 0; border-top: 1px solid var(--cyan-dim); }
+  .ticks .t { width: 1px; height: 6px; background: var(--cyan-dim); }
+
+  /* Logo preview area */
+  .logo-preview { display: grid; grid-template-columns: 1fr 1fr; gap: 24px; }
+  .logo-preview img { width: 100%; height: auto; background: var(--bg-0); border: 1px solid var(--border); }
+
+  .footer-sig {
+    margin-top: 64px; padding-top: 24px;
+    border-top: 1px solid var(--border);
+    font-family: var(--font-mono); font-size: 11px;
+    color: var(--fg-2); letter-spacing: 0.04em;
+    display: flex; justify-content: space-between;
+  }
+</style>
+</head>
+<body>
+
+<div class="eyebrow">RBX · VOLTAGE · BRAND SYSTEM PREVIEW</div>
+<h1>Systems engineering for operations that demand control.</h1>
+
+<h2>Palette</h2>
+<h3>Backgrounds (warm-dark)</h3>
+<div class="row">
+  <div class="swatch"><div class="chip" style="background:#07080A"></div><div class="name">bg-0</div><div class="hex">#07080A</div></div>
+  <div class="swatch"><div class="chip" style="background:#0D0F12"></div><div class="name">bg-1</div><div class="hex">#0D0F12</div></div>
+  <div class="swatch"><div class="chip" style="background:#13161A"></div><div class="name">bg-2</div><div class="hex">#13161A</div></div>
+  <div class="swatch"><div class="chip" style="background:#1A1E23"></div><div class="name">bg-3</div><div class="hex">#1A1E23</div></div>
+  <div class="swatch"><div class="chip" style="background:#24282E"></div><div class="name">border</div><div class="hex">#24282E</div></div>
+</div>
+
+<h3>Foreground (off-whites)</h3>
+<div class="row">
+  <div class="swatch"><div class="chip" style="background:#ECECEC"></div><div class="name">fg-0</div><div class="hex">#ECECEC</div></div>
+  <div class="swatch"><div class="chip" style="background:#B8BCC2"></div><div class="name">fg-1</div><div class="hex">#B8BCC2</div></div>
+  <div class="swatch"><div class="chip" style="background:#7A7F87"></div><div class="name">fg-2</div><div class="hex">#7A7F87</div></div>
+  <div class="swatch"><div class="chip" style="background:#4A4F56"></div><div class="name">fg-3</div><div class="hex">#4A4F56</div></div>
+  <div class="swatch"><div class="chip" style="background:#3A4048"></div><div class="name">border-strong</div><div class="hex">#3A4048</div></div>
+</div>
+
+<h3>Voltage Cyan scale (single-accent family)</h3>
+<div class="row">
+  <div class="swatch"><div class="chip" style="background:#00FFFF"></div><div class="name">cyan-signal</div><div class="hex">#00FFFF</div></div>
+  <div class="swatch"><div class="chip" style="background:#22E5E5"></div><div class="name">cyan-brand</div><div class="hex">#22E5E5</div></div>
+  <div class="swatch"><div class="chip" style="background:#06B6B6"></div><div class="name">cyan-muted</div><div class="hex">#06B6B6</div></div>
+  <div class="swatch"><div class="chip" style="background:#0B6E6E"></div><div class="name">cyan-dim</div><div class="hex">#0B6E6E</div></div>
+  <div class="swatch"><div class="chip" style="background:rgba(0,255,255,0.08)"></div><div class="name">cyan-subtle</div><div class="hex">rgba(0,255,255,.08)</div></div>
+</div>
+
+<h3>Semantic (status only)</h3>
+<div class="row">
+  <div class="swatch"><div class="chip" style="background:#7FB77E"></div><div class="name">ok</div><div class="hex">#7FB77E</div></div>
+  <div class="swatch"><div class="chip" style="background:#D9B55A"></div><div class="name">warn</div><div class="hex">#D9B55A</div></div>
+  <div class="swatch"><div class="chip" style="background:#C56A6A"></div><div class="name">err</div><div class="hex">#C56A6A</div></div>
+  <div class="swatch"><div class="chip" style="background:#7A93B0"></div><div class="name">info</div><div class="hex">#7A93B0</div></div>
+  <div class="swatch"><div class="chip" style="background:transparent; border:1px dashed var(--border-strong)"></div><div class="name">transparent</div><div class="hex">—</div></div>
+</div>
+
+<h2>Logo marks — B refined vs C structural</h2>
+<div class="logo-preview">
+  <div>
+    <div class="eyebrow">Option B · refined bitmap.svg</div>
+    <img src="../marks/rbx-mark-B-refined.svg" alt="RBX Mark B"/>
+  </div>
+  <div>
+    <div class="eyebrow">Option C · geometric R monogram</div>
+    <img src="../marks/rbx-mark-C-geometric.svg" alt="RBX Mark C"/>
+  </div>
+</div>
+
+<h2>Wordmark lockups</h2>
+<div style="display:grid; grid-template-columns: 1fr; gap: 12px;">
+  <img src="../wordmarks/rbx-wordmark-holding.svg"    alt="RBX"         style="max-width: 300px;"/>
+  <img src="../wordmarks/rbx-wordmark-systems.svg"    alt="RBX Systems" style="max-width: 400px;"/>
+  <img src="../wordmarks/rbx-wordmark-robson.svg"     alt="RBX Robson"  style="max-width: 400px;"/>
+  <img src="../wordmarks/rbx-wordmark-truthmetal.svg" alt="RBX TruthMetal" style="max-width: 460px;"/>
+</div>
+
+<h2>Signature — Card with L-corner brackets</h2>
+<div class="card">
+  <span class="lb"></span><span class="lt"></span>
+  <div class="eyebrow">BTCUSDT · PERPETUAL</div>
+  <div style="display: grid; grid-template-columns: repeat(4, 1fr); gap: 24px; margin-top: 12px;">
+    <div>
+      <div style="color: var(--fg-2); font-size: 11px; text-transform: uppercase; letter-spacing: 0.14em;">Position</div>
+      <div class="mono" style="font-size: 22px; margin-top: 4px;">+0.00482 BTC</div>
+    </div>
+    <div>
+      <div style="color: var(--fg-2); font-size: 11px; text-transform: uppercase; letter-spacing: 0.14em;">PnL</div>
+      <div class="mono" style="font-size: 22px; margin-top: 4px; color: var(--ok);">+1.24%</div>
+    </div>
+    <div>
+      <div style="color: var(--fg-2); font-size: 11px; text-transform: uppercase; letter-spacing: 0.14em;">Liquidation distance</div>
+      <div class="mono" style="font-size: 22px; margin-top: 4px;">12.40%</div>
+    </div>
+    <div>
+      <div style="color: var(--fg-2); font-size: 11px; text-transform: uppercase; letter-spacing: 0.14em;">Status</div>
+      <div style="margin-top: 6px;">
+        <span class="status live"><span class="dot"></span>LIVE</span>
+      </div>
+    </div>
+  </div>
+  <div class="ticks" style="margin-top: 24px;">
+    <div class="t"></div><div class="t"></div><div class="t"></div><div class="t"></div>
+    <div class="t"></div><div class="t"></div><div class="t"></div><div class="t"></div>
+    <div class="t"></div><div class="t"></div><div class="t"></div><div class="t"></div>
+  </div>
+</div>
+
+<h2>Status chips + buttons</h2>
+<div style="display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 24px;">
+  <span class="status live"><span class="dot"></span>LIVE</span>
+  <span class="status dry"><span class="dot"></span>DRY-RUN</span>
+  <span class="status stop"><span class="dot"></span>STOP HIT</span>
+  <span class="status signal"><span class="dot"></span>SIGNAL</span>
+</div>
+<div style="display: flex; gap: 12px; flex-wrap: wrap;">
+  <button class="btn">Cancel</button>
+  <button class="btn primary">Validate plan</button>
+  <button class="btn danger">Desligar Robson</button>
+</div>
+
+<div class="footer-sig">
+  <div>RBX · VOLTAGE · v0.1 · BRAINSTORM</div>
+  <div>2026-04-23</div>
+</div>
+
+</body>
+</html>

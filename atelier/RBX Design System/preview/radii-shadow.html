@@ -1,0 +1,15 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  body { margin:0; padding:24px; background:var(--bg-0); font-family:var(--font-sans); color:var(--fg-0); display:flex; gap:32px; align-items:center; }
+  .demo { text-align:center; }
+  .box { width:80px; height:80px; background:var(--bg-2); border:1px solid var(--border-strong); }
+  .lbl { font-family:var(--font-mono); font-size:11px; color:var(--fg-2); letter-spacing:0.06em; text-transform:uppercase; margin-top:8px; }
+  .val { font-family:var(--font-mono); font-size:11px; color:var(--fg-1); margin-top:2px; }
+</style></head>
+<body>
+  <div class="demo"><div class="box" style="border-radius:2px"></div><div class="lbl">radius-sm</div><div class="val">2px · buttons, inputs</div></div>
+  <div class="demo"><div class="box" style="border-radius:4px"></div><div class="lbl">radius-md</div><div class="val">4px · cards, panels</div></div>
+  <div class="demo"><div class="box" style="border-radius:8px"></div><div class="lbl">radius-lg</div><div class="val">8px · modals</div></div>
+  <div class="demo"><div class="box" style="border-radius:0; box-shadow:var(--shadow-overlay)"></div><div class="lbl">shadow-overlay</div><div class="val">0 8 24 · modals only</div></div>
+</body></html>

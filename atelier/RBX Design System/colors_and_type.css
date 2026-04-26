@@ -1,0 +1,223 @@
+/* ==========================================================================
+   RBX Design System — Tokens
+   Dark-first, Zurich-coded, institutional.
+   ========================================================================== */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=IBM+Plex+Mono:wght@400;500;600&display=swap');
+
+:root {
+  /* ---------- Color: Backgrounds (tiered, never pure black) -------------- */
+  --bg-0: #08090B;          /* page */
+  --bg-1: #101215;          /* cards, panels */
+  --bg-2: #16191D;          /* nested surfaces, inputs */
+  --bg-3: #1C2026;          /* hover / pressed */
+  --bg-overlay: rgba(8, 9, 11, 0.72);  /* sticky header, scrim */
+
+  /* ---------- Color: Foreground (off-white, never pure white) ------------ */
+  --fg-0: #ECECEC;          /* primary text, headings */
+  --fg-1: #B8BCC2;          /* secondary text */
+  --fg-2: #7A7F87;          /* tertiary / meta / disabled */
+  --fg-3: #4A4F56;          /* hint / placeholder */
+
+  /* ---------- Color: Borders --------------------------------------------- */
+  --border: #24282E;        /* default hairline */
+  --border-strong: #3A4048; /* hover, active, focus-within */
+  --border-accent: #C9A96E; /* keyboard focus ring */
+
+  /* ---------- Color: Accent (single, muted, warm metallic) --------------- */
+  --accent: #C9A96E;        /* primary accent */
+  --accent-hover: #D4B87D;
+  --accent-subtle: rgba(201, 169, 110, 0.12);
+
+  /* ---------- Color: Semantic (muted, not saturated) --------------------- */
+  --positive: #6AA77B;      /* gains, confirmations, success */
+  --positive-subtle: rgba(106, 167, 123, 0.12);
+  --negative: #C26B6B;      /* losses, errors, stops hit */
+  --negative-subtle: rgba(194, 107, 107, 0.12);
+  --warning: #C9A96E;       /* attention, dry-run, caution */
+  --warning-subtle: rgba(201, 169, 110, 0.12);
+  --info: #7891A8;          /* neutral information */
+  --info-subtle: rgba(120, 145, 168, 0.12);
+
+  /* ---------- Type: Families --------------------------------------------- */
+  --font-sans: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono: 'IBM Plex Mono', 'JetBrains Mono', 'SF Mono', Menlo, monospace;
+
+  /* ---------- Type: Scale (px, tight for instrument panels) -------------- */
+  --text-xs:   11px;   --lh-xs: 16px;
+  --text-sm:   13px;   --lh-sm: 20px;
+  --text-base: 14px;   --lh-base: 22px;
+  --text-md:   16px;   --lh-md: 24px;
+  --text-lg:   20px;   --lh-lg: 28px;
+  --text-xl:   24px;   --lh-xl: 32px;
+  --text-2xl:  32px;   --lh-2xl: 40px;
+  --text-3xl:  40px;   --lh-3xl: 48px;
+
+  /* ---------- Type: Weight ----------------------------------------------- */
+  --weight-regular: 400;
+  --weight-medium: 500;
+  --weight-semibold: 600;
+  --weight-bold: 700;
+
+  /* ---------- Type: Tracking --------------------------------------------- */
+  --track-tight: -0.02em;   /* headings */
+  --track-normal: 0;
+  --track-wide: 0.06em;     /* labels, small caps */
+  --track-wider: 0.12em;    /* section eyebrows */
+
+  /* ---------- Spacing (4px base, 8pt grid) ------------------------------- */
+  --space-1:  4px;
+  --space-2:  8px;
+  --space-3:  12px;
+  --space-4:  16px;
+  --space-5:  24px;
+  --space-6:  32px;
+  --space-7:  48px;
+  --space-8:  64px;
+  --space-9:  96px;
+
+  /* ---------- Radii (restrained, no pills) ------------------------------- */
+  --radius-sm: 2px;         /* buttons, inputs, badges */
+  --radius-md: 4px;         /* cards, panels */
+  --radius-lg: 8px;         /* modals, top-level containers */
+
+  /* ---------- Elevation (flat; only one overlay shadow) ------------------ */
+  --shadow-none: none;
+  --shadow-overlay: 0 8px 24px rgba(0, 0, 0, 0.5);
+
+  /* ---------- Motion ----------------------------------------------------- */
+  --ease-standard: cubic-bezier(0.2, 0, 0, 1);
+  --duration-fast: 120ms;
+  --duration-base: 160ms;
+  --duration-slow: 240ms;
+
+  /* ---------- Layout ----------------------------------------------------- */
+  --container-max: 1200px;
+  --header-height: 64px;
+}
+
+/* ==========================================================================
+   Semantic typography classes
+   Use these directly or mirror their rules on semantic elements.
+   ========================================================================== */
+
+.rbx-display {
+  font-family: var(--font-sans);
+  font-size: var(--text-3xl);
+  line-height: var(--lh-3xl);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--track-tight);
+  color: var(--fg-0);
+}
+
+.rbx-h1 {
+  font-family: var(--font-sans);
+  font-size: var(--text-2xl);
+  line-height: var(--lh-2xl);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--track-tight);
+  color: var(--fg-0);
+}
+
+.rbx-h2 {
+  font-family: var(--font-sans);
+  font-size: var(--text-xl);
+  line-height: var(--lh-xl);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--track-tight);
+  color: var(--fg-0);
+}
+
+.rbx-h3 {
+  font-family: var(--font-sans);
+  font-size: var(--text-lg);
+  line-height: var(--lh-lg);
+  font-weight: var(--weight-semibold);
+  color: var(--fg-0);
+}
+
+.rbx-body {
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--lh-base);
+  font-weight: var(--weight-regular);
+  color: var(--fg-0);
+}
+
+.rbx-body-secondary {
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--lh-base);
+  color: var(--fg-1);
+}
+
+.rbx-caption {
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  line-height: var(--lh-sm);
+  color: var(--fg-2);
+}
+
+.rbx-eyebrow {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  line-height: var(--lh-xs);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--track-wider);
+  text-transform: uppercase;
+  color: var(--fg-2);
+}
+
+.rbx-mono {
+  font-family: var(--font-mono);
+  font-size: var(--text-base);
+  line-height: var(--lh-base);
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-0);
+}
+
+.rbx-mono-sm {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  line-height: var(--lh-sm);
+  font-variant-numeric: tabular-nums;
+  color: var(--fg-0);
+}
+
+.rbx-label {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: var(--track-wide);
+  text-transform: uppercase;
+  color: var(--fg-2);
+  font-weight: var(--weight-medium);
+}
+
+/* ==========================================================================
+   Base element resets (opt-in; include on design artifacts)
+   ========================================================================== */
+
+.rbx-root {
+  background: var(--bg-0);
+  color: var(--fg-0);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--lh-base);
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+  font-feature-settings: 'ss01', 'cv11';
+}
+
+.rbx-root h1, .rbx-root h2, .rbx-root h3,
+.rbx-root h4, .rbx-root h5, .rbx-root h6 {
+  color: var(--fg-0);
+  font-weight: var(--weight-semibold);
+  letter-spacing: var(--track-tight);
+  margin: 0;
+}
+
+.rbx-root code,
+.rbx-root pre,
+.rbx-root kbd {
+  font-family: var(--font-mono);
+}

@@ -1,0 +1,71 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- RBX Mark Option C — Structural redesign.
+     Zurich-coded geometric R monogram in a square frame with hairline grid registration marks.
+     Inspired by Karl Gerstner / Max Bill / Swiss Style. Precision instrument aesthetic.
+     Single cyan accent #22E5E5, hairline structural elements. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300" width="300" height="300">
+  <!-- warm-dark page background -->
+  <rect width="300" height="300" fill="#07080A"/>
+
+  <!-- outer frame (1px hairline) -->
+  <rect x="30" y="30" width="240" height="240" fill="none" stroke="#22E5E5" stroke-width="1" stroke-opacity="0.25"/>
+
+  <!-- corner brackets — signature L-marks (top-left, top-right, bottom-left, bottom-right) -->
+  <g stroke="#22E5E5" stroke-width="1.5" fill="none">
+    <!-- TL -->
+    <path d="M 30,42 L 30,30 L 42,30"/>
+    <!-- TR -->
+    <path d="M 258,30 L 270,30 L 270,42"/>
+    <!-- BL -->
+    <path d="M 30,258 L 30,270 L 42,270"/>
+    <!-- BR -->
+    <path d="M 258,270 L 270,270 L 270,258"/>
+  </g>
+
+  <!-- center crosshair — tiny registration mark at 150,150 -->
+  <g stroke="#22E5E5" stroke-width="0.75" stroke-opacity="0.35">
+    <line x1="146" y1="150" x2="154" y2="150"/>
+    <line x1="150" y1="146" x2="150" y2="154"/>
+  </g>
+
+  <!-- R monogram — geometric, hairline + solid weight mix -->
+  <!-- R built from:
+       - vertical stem (solid)
+       - top bowl (solid arc via rect+circle)
+       - diagonal leg (solid)
+       - horizontal tick at baseline (hairline signature) -->
+  <g fill="#22E5E5">
+    <!-- vertical stem -->
+    <rect x="90" y="80" width="18" height="140"/>
+    <!-- top arm horizontal -->
+    <rect x="90" y="80" width="85" height="18"/>
+    <!-- right vertical of bowl -->
+    <rect x="157" y="80" width="18" height="78"/>
+    <!-- middle arm -->
+    <rect x="90" y="140" width="85" height="18"/>
+    <!-- diagonal leg (R's descender) -->
+    <polygon points="130,158 148,158 200,220 182,220"/>
+  </g>
+
+  <!-- baseline voltage hairline — signature tick extending past glyph -->
+  <line x1="60" y1="235" x2="240" y2="235" stroke="#22E5E5" stroke-width="1" stroke-opacity="0.6"/>
+  <!-- tick marks on baseline ruler -->
+  <g stroke="#22E5E5" stroke-width="1" stroke-opacity="0.6">
+    <line x1="60" y1="235" x2="60" y2="241"/>
+    <line x1="90" y1="235" x2="90" y2="241"/>
+    <line x1="120" y1="235" x2="120" y2="241"/>
+    <line x1="150" y1="235" x2="150" y2="241"/>
+    <line x1="180" y1="235" x2="180" y2="241"/>
+    <line x1="210" y1="235" x2="210" y2="241"/>
+    <line x1="240" y1="235" x2="240" y2="241"/>
+  </g>
+
+  <!-- tiny mono label under the mark (eyebrow style) -->
+  <text x="150" y="258" text-anchor="middle"
+    font-family="'JetBrains Mono', ui-monospace, monospace"
+    font-size="7" font-weight="500"
+    letter-spacing="2"
+    fill="#22E5E5" fill-opacity="0.6">
+    RBX · VOLTAGE · 001
+  </text>
+</svg>

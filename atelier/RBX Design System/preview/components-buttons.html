@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  body { margin:0; padding:24px; background:var(--bg-0); font-family:var(--font-sans); color:var(--fg-0); }
+  .row { display:flex; gap:12px; margin-bottom:12px; align-items:center; }
+  button { font-family:inherit; font-size:13px; font-weight:500; border-radius:2px; border:1px solid transparent; padding:8px 16px; cursor:pointer; letter-spacing:-0.01em; }
+  .primary { background:#ECECEC; color:#08090B; }
+  .primary:hover { background:#fff; }
+  .secondary { background:var(--bg-2); color:var(--fg-0); border-color:var(--border); }
+  .secondary:hover { border-color:var(--border-strong); background:var(--bg-3); }
+  .ghost { background:transparent; color:var(--fg-1); border-color:transparent; }
+  .ghost:hover { color:var(--fg-0); background:var(--bg-2); }
+  .danger { background:transparent; color:#C26B6B; border-color:rgba(194,107,107,0.4); }
+  .danger:hover { background:rgba(194,107,107,0.08); border-color:#C26B6B; }
+  .accent { background:transparent; color:#C9A96E; border-color:rgba(201,169,110,0.4); }
+  .accent:hover { background:rgba(201,169,110,0.08); border-color:#C9A96E; }
+  .lbl { font-family:var(--font-mono); font-size:10px; color:var(--fg-2); letter-spacing:0.08em; text-transform:uppercase; width:100px; }
+</style></head>
+<body>
+  <div class="row"><div class="lbl">Primary</div><button class="primary">Validate plan</button><button class="primary" disabled style="opacity:0.4">Disabled</button></div>
+  <div class="row"><div class="lbl">Secondary</div><button class="secondary">View details</button><button class="secondary">Cancel</button></div>
+  <div class="row"><div class="lbl">Accent</div><button class="accent">Acknowledge risk</button></div>
+  <div class="row"><div class="lbl">Danger</div><button class="danger">Close position</button></div>
+  <div class="row"><div class="lbl">Ghost</div><button class="ghost">Dismiss</button></div>
+</body></html>

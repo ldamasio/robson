@@ -28,7 +28,7 @@
 ### System Overview
 - Backend: Robson v3 (`v2/`, `v3/`) live in production with real capital (`project_robson_v3_capital_real_state`).
 - Legacy frontend: `apps/frontend/` (React + Vite + `react-bootstrap`) — to be removed post-cutover.
-- Brand assets: `/home/psyctl/apps/robson/brand-voltage/` — tokens, SVGs, preview HTML (approved).
+- Brand assets: `/home/psyctl/apps/robson/atelier/brand-voltage/` — tokens, SVGs, preview HTML (approved).
 - Infrastructure: Contabo S3 (`rbx-content` bucket already in use for blog), PowerDNS sovereign 2-VPS.
 - Blog frontend: `rbx-robotica-frontend/` (Next.js) — unrelated, marketing only.
 
@@ -60,7 +60,7 @@ N/A — greenfield implementation, no gap to analyze.
 | Priority | Component | Issue | Blocker For |
 |----------|-----------|-------|-------------|
 | P0 | `apps/frontend-v2/` | Scaffold missing | Everything |
-| P0 | `apps/frontend-v2/src/lib/design/tokens.css` | Voltage tokens not yet copied from `brand-voltage/` | All UI work |
+| P0 | `apps/frontend-v2/src/lib/design/tokens.css` | Voltage tokens not yet copied from `atelier/brand-voltage/` | All UI work |
 | P0 | `apps/frontend-v2/src/lib/api/robson.ts` | API client missing | Auth + dashboard + operations |
 | P0 | Backend `/kill-switch` endpoint verification | Need to confirm endpoint contract exists and behaves per ADR-0027 | Kill-switch feature |
 | P1 | RBX custom icons (20 glyphs) | SVGs must be produced | Polished UI surfaces |
@@ -256,12 +256,12 @@ rm -rf apps/frontend-v2
 
 ### EP-002: Apply Voltage design system
 
-**Objective**: Copy `brand-voltage/colors_and_type.css` into the app as `src/lib/design/tokens.css`, create layout primitives (`Stack`, `Row`, `Grid`, `Bleed`, `Prose`), and render a placeholder landing page demonstrating L-corner signature + cyan accent.
+**Objective**: Copy `atelier/brand-voltage/colors_and_type.css` into the app as `src/lib/design/tokens.css`, create layout primitives (`Stack`, `Row`, `Grid`, `Bleed`, `Prose`), and render a placeholder landing page demonstrating L-corner signature + cyan accent.
 
 **Preconditions**:
 ```bash
 test -d /home/psyctl/apps/robson/apps/frontend-v2
-test -f /home/psyctl/apps/robson/brand-voltage/colors_and_type.css
+test -f /home/psyctl/apps/robson/atelier/brand-voltage/colors_and_type.css
 ```
 
 **Steps**:
@@ -270,13 +270,13 @@ cd /home/psyctl/apps/robson/apps/frontend-v2
 
 # Copy design tokens
 mkdir -p src/lib/design
-cp ../../brand-voltage/colors_and_type.css src/lib/design/tokens.css
+cp ../../atelier/brand-voltage/colors_and_type.css src/lib/design/tokens.css
 
 # Copy logo + wordmarks
 mkdir -p static/brand
-cp ../../brand-voltage/marks/rbx-mark-B-refined.svg static/brand/rbx-mark.svg
-cp ../../brand-voltage/wordmarks/rbx-wordmark-robson.svg static/brand/wordmark-robson.svg
-cp ../../brand-voltage/wordmarks/rbx-wordmark-holding.svg static/brand/wordmark-holding.svg
+cp ../../atelier/brand-voltage/marks/rbx-mark-B-refined.svg static/brand/rbx-mark.svg
+cp ../../atelier/brand-voltage/wordmarks/rbx-wordmark-robson.svg static/brand/wordmark-robson.svg
+cp ../../atelier/brand-voltage/wordmarks/rbx-wordmark-holding.svg static/brand/wordmark-holding.svg
 
 # Create layout primitives under src/lib/design/components/
 # (Stack.svelte, Row.svelte, Grid.svelte, Bleed.svelte, Prose.svelte, LCorners.svelte, TickRuler.svelte)
@@ -670,7 +670,7 @@ This guide is self-contained. To delegate to Codex or GLM:
 - **GLM**: capable on tooling and infrastructure. Assign Tracks 5–7 plus any backend contract verification.
 - Both agents should be briefed on:
   - ADR-0025, ADR-0026, ADR-0027 (read these first)
-  - Brand artifacts at `brand-voltage/`
+  - Brand artifacts at `atelier/brand-voltage/`
   - Canonical nomenclature: `FE-PN` for frontend phases (do not use bare "Phase N")
   - Editorial rules: no em-dashes, no arrows, no emoji, no pure white backgrounds
   - Security rules: never print secrets, never use bang `!` for interactive prompts

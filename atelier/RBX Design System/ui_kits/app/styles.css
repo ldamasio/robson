@@ -1,0 +1,147 @@
+/* RBX App UI kit styles */
+@import url('../../colors_and_type.css');
+
+* { box-sizing: border-box; }
+html, body { margin:0; background: var(--bg-0); color: var(--fg-0); font-family: var(--font-sans); font-size: 14px; line-height: 22px; -webkit-font-smoothing: antialiased; }
+
+.rbx-app { display: grid; grid-template-columns: 240px 1fr; min-height: 100vh; }
+
+/* ---- Sidebar ---- */
+.rbx-sidebar { background: var(--bg-1); border-right: 1px solid var(--border); padding: 20px 14px; display: flex; flex-direction: column; gap: 20px; position: sticky; top: 0; height: 100vh; }
+.rbx-sidebar__brand { display: flex; align-items: center; gap: 10px; font-weight: 600; letter-spacing: -0.02em; font-size: 16px; padding: 4px 8px 12px; border-bottom: 1px solid var(--border); }
+.rbx-sidebar__bar { width: 20px; height: 2px; background: var(--accent); }
+.rbx-sidebar nav { display: flex; flex-direction: column; gap: 2px; }
+.rbx-nav-item { display: flex; align-items: center; gap: 10px; padding: 8px 10px; background: transparent; border: none; color: var(--fg-1); font-family: inherit; font-size: 13px; text-align: left; border-radius: 2px; cursor: pointer; }
+.rbx-nav-item:hover { background: var(--bg-2); color: var(--fg-0); }
+.rbx-nav-item.is-active { background: var(--bg-2); color: var(--fg-0); box-shadow: inset 2px 0 0 var(--accent); }
+.rbx-nav-item svg { width: 16px; height: 16px; stroke-width: 1.5; }
+.rbx-sidebar__foot { margin-top: auto; padding: 12px 8px; border-top: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
+.rbx-sidebar__foot-row { display: flex; gap: 8px; align-items: center; justify-content: space-between; }
+
+/* ---- Topbar & panels ---- */
+.rbx-main { padding: 32px 40px 180px; max-width: 1280px; }
+.rbx-topbar { display: flex; justify-content: space-between; align-items: flex-end; margin-bottom: 32px; }
+.rbx-topbar__title { font-size: 28px; font-weight: 600; letter-spacing: -0.02em; margin: 4px 0 0; }
+.rbx-topbar__actions { display: flex; gap: 8px; }
+
+.rbx-eyebrow { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--fg-2); font-weight: 500; }
+.rbx-label { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--fg-2); }
+
+.rbx-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 16px; margin-bottom: 24px; }
+.rbx-card { background: var(--bg-1); border: 1px solid var(--border); border-radius: 4px; transition: border-color var(--duration-fast) var(--ease-standard); }
+.rbx-card:hover { border-color: var(--border-strong); }
+.rbx-metric { font-family: var(--font-mono); font-size: 32px; line-height: 40px; font-variant-numeric: tabular-nums; letter-spacing: -0.01em; margin-top: 10px; }
+.rbx-metric--warn { color: var(--warning); }
+.rbx-delta { font-family: var(--font-mono); font-size: 13px; margin-top: 2px; }
+.rbx-delta--pos { color: var(--positive); }
+.rbx-delta--neg { color: var(--negative); }
+.rbx-delta--neutral { color: var(--fg-2); }
+.rbx-card__foot { font-size: 12px; color: var(--fg-2); margin-top: 16px; padding-top: 12px; border-top: 1px solid var(--border); }
+
+.rbx-panel { background: var(--bg-1); border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
+.rbx-panel__head { display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; border-bottom: 1px solid var(--border); }
+.rbx-panel__title { font-size: 18px; font-weight: 600; letter-spacing: -0.01em; margin: 4px 0 0; font-family: var(--font-mono); }
+.rbx-panel__body { padding: 20px; }
+.rbx-panel__foot { display: flex; justify-content: space-between; align-items: center; padding: 16px 20px; border-top: 1px solid var(--border); gap: 16px; }
+.rbx-foot-note { font-size: 12px; color: var(--fg-2); }
+.rbx-foot-note code { font-family: var(--font-mono); color: var(--accent); background: var(--accent-subtle); padding: 1px 4px; border-radius: 2px; }
+
+/* ---- Table ---- */
+.rbx-table { width: 100%; border-collapse: collapse; font-variant-numeric: tabular-nums; }
+.rbx-table th { text-align: left; font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--fg-2); font-weight: 500; padding: 10px 16px; border-bottom: 1px solid var(--border); }
+.rbx-table th.num { text-align: right; }
+.rbx-table td { padding: 12px 16px; border-bottom: 1px solid var(--border); font-size: 13px; }
+.rbx-table td.mono { font-family: var(--font-mono); text-align: right; }
+.rbx-table td.sym { font-weight: 500; }
+.rbx-table td.pos { color: var(--positive); }
+.rbx-table td.neg { color: var(--negative); }
+.rbx-table tr { cursor: pointer; }
+.rbx-table tbody tr:hover td { background: var(--bg-2); }
+.rbx-table tbody tr.is-selected td { background: var(--bg-2); box-shadow: inset 2px 0 0 var(--accent); }
+
+/* ---- Buttons ---- */
+.rbx-btn { font-family: inherit; font-size: 13px; font-weight: 500; padding: 8px 14px; border-radius: 2px; border: 1px solid transparent; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; line-height: 1; transition: all var(--duration-fast) var(--ease-standard); }
+.rbx-btn svg { width: 14px; height: 14px; stroke-width: 1.75; }
+.rbx-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.rbx-btn--primary { background: var(--fg-0); color: var(--bg-0); }
+.rbx-btn--primary:not(:disabled):hover { background: #fff; }
+.rbx-btn--secondary { background: var(--bg-2); color: var(--fg-0); border-color: var(--border); }
+.rbx-btn--secondary:not(:disabled):hover { border-color: var(--border-strong); background: var(--bg-3); }
+.rbx-btn--ghost { background: transparent; color: var(--fg-1); }
+.rbx-btn--ghost:not(:disabled):hover { color: var(--fg-0); background: var(--bg-2); }
+.rbx-btn--accent { background: transparent; color: var(--accent); border-color: rgba(201,169,110,0.4); }
+.rbx-btn--accent:not(:disabled):hover { background: rgba(201,169,110,0.08); border-color: var(--accent); }
+.rbx-btn--danger { background: transparent; color: var(--negative); border-color: rgba(194,107,107,0.4); }
+.rbx-btn--danger:not(:disabled):hover { background: rgba(194,107,107,0.08); border-color: var(--negative); }
+
+/* ---- Chips ---- */
+.rbx-chip { display: inline-flex; align-items: center; gap: 6px; padding: 3px 8px; border-radius: 2px; border: 1px solid; font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.06em; text-transform: uppercase; font-weight: 500; }
+.rbx-chip__dot { width: 6px; height: 6px; border-radius: 50%; }
+.rbx-chip--positive { color: var(--positive); border-color: rgba(106,167,123,0.35); background: var(--positive-subtle); }
+.rbx-chip--positive .rbx-chip__dot { background: var(--positive); }
+.rbx-chip--negative { color: var(--negative); border-color: rgba(194,107,107,0.35); background: var(--negative-subtle); }
+.rbx-chip--negative .rbx-chip__dot { background: var(--negative); }
+.rbx-chip--warning { color: var(--warning); border-color: rgba(201,169,110,0.35); background: var(--warning-subtle); }
+.rbx-chip--warning .rbx-chip__dot { background: var(--warning); }
+.rbx-chip--info { color: var(--info); border-color: rgba(120,145,168,0.35); background: var(--info-subtle); }
+.rbx-chip--info .rbx-chip__dot { background: var(--info); }
+.rbx-chip--neutral { color: var(--fg-1); border-color: var(--border-strong); background: var(--bg-2); }
+.rbx-chip--neutral .rbx-chip__dot { background: var(--fg-2); }
+
+/* ---- Field ---- */
+.rbx-field { display: flex; flex-direction: column; gap: 6px; }
+.rbx-field label { font-family: var(--font-mono); font-size: 10px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--fg-2); font-weight: 500; }
+.rbx-input { display: flex; align-items: center; background: var(--bg-2); border: 1px solid var(--border); border-radius: 2px; padding: 0 10px; }
+.rbx-input:focus-within { border-color: var(--accent); }
+.rbx-input.is-error { border-color: var(--negative); }
+.rbx-input input { flex:1; background: transparent; border: none; outline: none; color: var(--fg-0); font-family: inherit; font-size: 13px; padding: 9px 0; }
+.rbx-input input.mono { font-family: var(--font-mono); font-variant-numeric: tabular-nums; }
+.rbx-input__suffix { font-family: var(--font-mono); font-size: 11px; color: var(--fg-2); letter-spacing: 0.06em; text-transform: uppercase; }
+.rbx-field__hint { font-size: 11px; color: var(--fg-2); }
+.rbx-field__err { font-size: 11px; color: var(--negative); }
+
+/* ---- Pipeline stages ---- */
+.rbx-pipeline { display: flex; align-items: center; gap: 12px; padding: 20px; border-bottom: 1px solid var(--border); }
+.rbx-stage { display: flex; align-items: center; gap: 10px; padding: 8px 14px; border: 1px solid var(--border); border-radius: 2px; }
+.rbx-stage__num { font-family: var(--font-mono); font-size: 11px; color: var(--fg-2); letter-spacing: 0.1em; }
+.rbx-stage__label { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.1em; text-transform: uppercase; color: var(--fg-1); }
+.rbx-stage.is-done { border-color: rgba(106,167,123,0.35); }
+.rbx-stage.is-done .rbx-stage__num, .rbx-stage.is-done .rbx-stage__label { color: var(--positive); }
+.rbx-stage.is-active { border-color: var(--accent); background: var(--accent-subtle); }
+.rbx-stage.is-active .rbx-stage__num, .rbx-stage.is-active .rbx-stage__label { color: var(--accent); }
+.rbx-stage__sep { flex:1; height: 1px; background: var(--border); }
+.rbx-stage__sep.is-done { background: rgba(106,167,123,0.35); }
+
+/* ---- Checklist ---- */
+.rbx-checklist { display: flex; flex-direction: column; margin-top: 12px; }
+.rbx-check { display: grid; grid-template-columns: 20px 1fr auto; align-items: center; gap: 14px; padding: 10px 0; border-bottom: 1px solid var(--border); font-size: 13px; }
+.rbx-check:last-child { border-bottom: none; }
+.rbx-check svg { width: 16px; height: 16px; stroke-width: 1.5; }
+.rbx-check.is-ok svg { color: var(--positive); }
+.rbx-check.is-fail svg { color: var(--negative); }
+.rbx-check.is-fail .rbx-check__label { color: var(--fg-0); }
+.rbx-check__label { color: var(--fg-1); }
+.rbx-check__value { font-family: var(--font-mono); font-size: 12px; color: var(--fg-2); font-variant-numeric: tabular-nums; }
+.rbx-check.is-fail .rbx-check__value { color: var(--negative); }
+
+/* ---- Command dock ---- */
+.rbx-dock { position: fixed; left: 50%; bottom: 20px; transform: translateX(-50%); width: min(960px, calc(100% - 280px)); background: linear-gradient(180deg, rgba(16,18,21,0.98), rgba(8,9,11,0.98)); border: 1px solid rgba(201,169,110,0.2); border-radius: 8px; box-shadow: 0 -18px 60px rgba(0,0,0,0.5); overflow: hidden; backdrop-filter: blur(8px); }
+.rbx-dock__topline { display: flex; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid var(--border); font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg-2); }
+.rbx-dock__brand { display: flex; align-items: center; gap: 8px; color: var(--fg-0); }
+.rbx-dock__sep { color: var(--fg-3); }
+.rbx-dock__dot { width: 6px; height: 6px; border-radius: 50%; background: var(--fg-2); }
+.rbx-dock__dot.is-online { background: var(--positive); box-shadow: 0 0 0 3px rgba(106,167,123,0.15); }
+.rbx-dock__cmds { display: flex; gap: 14px; color: var(--fg-1); }
+.rbx-dock__context { display: flex; gap: 8px; padding: 10px 14px; border-bottom: 1px solid var(--border); flex-wrap: wrap; }
+.rbx-dock__feed { max-height: 140px; overflow-y: auto; padding: 10px 14px; display: flex; flex-direction: column; gap: 6px; }
+.rbx-dock__msg { display: grid; grid-template-columns: 140px 1fr; gap: 12px; font-size: 13px; }
+.rbx-dock__role { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--info); }
+.rbx-dock__msg.is-user .rbx-dock__role { color: var(--accent); }
+.rbx-dock__text { color: var(--fg-0); font-family: var(--font-mono); font-size: 12px; }
+.rbx-dock__msg.is-user .rbx-dock__text { color: var(--fg-0); }
+.rbx-dock__prompt { display: grid; grid-template-columns: auto 1fr auto; align-items: center; gap: 10px; padding: 12px 14px; background: var(--bg-0); border-top: 1px solid var(--border); }
+.rbx-dock__caret { font-family: var(--font-mono); color: var(--accent); font-size: 13px; }
+.rbx-dock__input { flex: 1; background: transparent; border: none; outline: none; color: var(--fg-0); font-family: var(--font-mono); font-size: 13px; }
+.rbx-dock__input::placeholder { color: var(--fg-3); }
+.rbx-dock__send { background: var(--fg-0); color: var(--bg-0); border: none; border-radius: 2px; padding: 6px 12px; font-family: inherit; font-size: 12px; font-weight: 600; cursor: pointer; }
+.rbx-dock__send:disabled { background: var(--bg-3); color: var(--fg-3); cursor: not-allowed; }

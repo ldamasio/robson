@@ -1,0 +1,27 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  body { margin:0; padding:24px; background:var(--bg-0); font-family:var(--font-sans); color:var(--fg-0); }
+  .dock { border:1px solid rgba(201,169,110,0.2); border-radius:8px; background:var(--bg-1); overflow:hidden; }
+  .topline { display:flex; justify-content:space-between; padding:10px 14px; border-bottom:1px solid var(--border); font-family:var(--font-mono); font-size:11px; letter-spacing:0.08em; text-transform:uppercase; color:var(--fg-2); }
+  .brand { display:flex; align-items:center; gap:8px; color:var(--fg-0); }
+  .dot { width:6px; height:6px; border-radius:50%; background:#6AA77B; box-shadow:0 0 0 3px rgba(106,167,123,0.15); }
+  .chip { display:inline-block; padding:2px 6px; border:1px solid var(--border-strong); border-radius:2px; color:var(--fg-1); margin-right:4px; }
+  .prompt { display:flex; align-items:center; gap:10px; padding:12px 14px; background:var(--bg-0); border:1px solid var(--border); margin:12px; border-radius:4px; }
+  .caret { font-family:var(--font-mono); color:#C9A96E; font-size:13px; }
+  .input { flex:1; font-family:var(--font-mono); font-size:13px; color:var(--fg-0); }
+  .cursor { display:inline-block; width:8px; height:16px; background:#C9A96E; vertical-align:middle; animation:blink 1s steps(2) infinite; }
+  @keyframes blink { 50% { opacity:0; } }
+</style></head>
+<body>
+  <div class="dock">
+    <div class="topline">
+      <div class="brand"><span class="dot"></span>Robson · online</div>
+      <div><span class="chip">/plan</span><span class="chip">/validate</span><span class="chip">/execute</span></div>
+    </div>
+    <div class="prompt">
+      <span class="caret">&gt;_</span>
+      <div class="input">plan buy BTCUSDT 0.001 --limit 67420<span class="cursor"></span></div>
+    </div>
+  </div>
+</body></html>
