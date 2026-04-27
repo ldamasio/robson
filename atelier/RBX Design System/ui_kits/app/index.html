@@ -1,0 +1,78 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Robson · Operations</title>
+<link rel="stylesheet" href="styles.css">
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+<script src="https://unpkg.com/react@18.3.1/umd/react.development.js" integrity="sha384-hD6/rw4ppMLGNu3tX5cjIb+uRZ7UkRJ6BPkLpg4hAu/6onKUg4lLsHAs9EBPT82L" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/react-dom@18.3.1/umd/react-dom.development.js" integrity="sha384-u6aeetuaXnQ38mYT8rp6sbXaQe3NL9t+IBXmnYxwkUI2Hw4bsp2Wvmx4yRQF1uAm" crossorigin="anonymous"></script>
+<script src="https://unpkg.com/@babel/standalone@7.29.0/babel.min.js" integrity="sha384-m08KidiNqLdpJqLq95G/LEi8Qvjl/xUYll3QILypMoQ65QorJ9Lvtp2RXYGBFj1y" crossorigin="anonymous"></script>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" src="primitives.jsx"></script>
+<script type="text/babel" src="Shell.jsx"></script>
+<script type="text/babel" src="Portfolio.jsx"></script>
+<script type="text/babel" src="CommandDock.jsx"></script>
+<script type="text/babel" src="TradingIntent.jsx"></script>
+<script type="text/babel">
+const { useState, useEffect } = React;
+
+function App() {
+  const [route, setRoute] = useState('dashboard');
+  const [selected, setSelected] = useState(null);
+  useEffect(() => { lucide.createIcons(); }, [route, selected]);
+
+  return (
+    <div className="rbx-app" data-screen-label={route}>
+      <Sidebar route={route} setRoute={setRoute} />
+      <main className="rbx-main">
+        {route === 'dashboard' && (
+          <>
+            <Topbar
+              eyebrow="Tenant · acme-prod · 2026-04-18"
+              title="Dashboard"
+              actions={<>
+                <Button variant="secondary" icon="download">Export</Button>
+                <Button variant="accent" icon="plus" onClick={() => setRoute('intent')}>New plan</Button>
+              </>}
+            />
+            <div className="rbx-grid">
+              <PortfolioCard /><EquityCard /><ExposureCard />
+            </div>
+            <PositionsTable onSelect={(id) => { setSelected(id); setRoute('intent'); }} selectedId={selected} />
+          </>
+        )}
+        {route === 'intent' && (
+          <>
+            <Topbar
+              eyebrow="Pipeline · plan \u2192 validate \u2192 execute"
+              title="Trading intent"
+              actions={<Button variant="ghost" icon="arrow-left" onClick={() => setRoute('dashboard')}>Back</Button>}
+            />
+            <TradingIntent />
+          </>
+        )}
+        {route === 'positions' && (
+          <>
+            <Topbar eyebrow="3 open \u00b7 1 leveraged" title="Positions" />
+            <PositionsTable onSelect={setSelected} selectedId={selected} />
+          </>
+        )}
+        {(route === 'patterns' || route === 'audit' || route === 'settings') && (
+          <>
+            <Topbar eyebrow="Module" title={route.charAt(0).toUpperCase() + route.slice(1)} />
+            <div className="rbx-panel"><div className="rbx-panel__body" style={{color:'var(--fg-2)'}}>This module is stubbed in the UI kit.</div></div>
+          </>
+        )}
+      </main>
+      <CommandDock />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById('root')).render(<App />);
+</script>
+</body>
+</html>

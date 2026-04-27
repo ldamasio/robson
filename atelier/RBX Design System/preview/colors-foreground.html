@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  body { margin:0; padding:20px; background:var(--bg-0); color:var(--fg-0); font-family:var(--font-sans); }
+  .wrap { display:grid; grid-template-columns:repeat(4,1fr); gap:8px; }
+  .sw { border:1px solid var(--border); border-radius:var(--radius-sm); overflow:hidden; background:var(--bg-1); }
+  .chip { height:56px; }
+  .label { padding:8px 10px; display:flex; justify-content:space-between; font-size:11px; font-family:var(--font-mono); }
+  .name { color:var(--fg-0); letter-spacing:0.06em; text-transform:uppercase; }
+  .hex { color:var(--fg-2); }
+</style></head>
+<body>
+<div class="wrap">
+  <div class="sw"><div class="chip" style="background:#ECECEC"></div><div class="label"><span class="name">fg-0</span><span class="hex">#ECECEC</span></div></div>
+  <div class="sw"><div class="chip" style="background:#B8BCC2"></div><div class="label"><span class="name">fg-1</span><span class="hex">#B8BCC2</span></div></div>
+  <div class="sw"><div class="chip" style="background:#7A7F87"></div><div class="label"><span class="name">fg-2</span><span class="hex">#7A7F87</span></div></div>
+  <div class="sw"><div class="chip" style="background:#4A4F56"></div><div class="label"><span class="name">fg-3</span><span class="hex">#4A4F56</span></div></div>
+</div>
+<div style="margin-top:16px; font-family:var(--font-sans); font-size:13px;">
+  <div style="color:#ECECEC">fg-0 — Primary text and headings. Off-white, never pure white.</div>
+  <div style="color:#B8BCC2">fg-1 — Secondary body copy.</div>
+  <div style="color:#7A7F87">fg-2 — Tertiary, meta, labels.</div>
+  <div style="color:#4A4F56">fg-3 — Hints and placeholders only.</div>
+</div>
+</body></html>

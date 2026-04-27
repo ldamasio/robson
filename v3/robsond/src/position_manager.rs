@@ -23,11 +23,12 @@ use std::{collections::HashMap, sync::Arc};
 
 use chrono::Datelike;
 use robson_domain::{
-    DetectorSignal, Event, Position, PositionId, PositionState, Price, Quantity, RiskConfig, Side,
-    Symbol, TechnicalStopDistance, TradingPolicy,
+    DetectorSignal, EntryPolicyConfig, Event, Position, PositionId, PositionState, Price, Quantity,
+    RiskConfig, Side, Symbol, TechnicalStopDistance, TradingPolicy,
 };
 use robson_engine::{
     Engine, EngineAction, EngineDecision, PositionSummary, ProposedTrade, RiskContext, RiskGate,
+    StrategyRegistry,
 };
 #[cfg(feature = "postgres")]
 use robson_eventlog::{append_event, ActorType as EventlogActorType, Event as EventlogEvent};
@@ -90,6 +91,9 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     shutdown_token: CancellationToken,
     /// Active detector tasks (position_id → task handle)
     detectors: Arc<RwLock<HashMap<PositionId, JoinHandle<Option<DetectorSignal>>>>>,
+    /// Entry policy selected for each armed position. This keeps runtime
+    /// detector re-arming aligned with the policy event emitted at ARM time.
+    entry_policies: Arc<RwLock<HashMap<PositionId, EntryPolicyConfig>>>,
     /// Pending approvals held in runtime memory for Phase 3.
     pending_approvals: Arc<RwLock<HashMap<Uuid, PendingApprovalRecord>>>,
     /// Serializes entry-governance flows so pending reservations remain
@@ -206,6 +210,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             ohlcv_port: Arc::new(StubOhlcv::default()),
             shutdown_token,
             detectors: Arc::new(RwLock::new(HashMap::new())),
+            entry_policies: Arc::new(RwLock::new(HashMap::new())),
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
             entry_flow_lock: Mutex::new(()),
             query_engine,
@@ -689,6 +694,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     async fn rearm_detector(
         position_id: PositionId,
         position: Position,
+        entry_policy: EntryPolicyConfig,
         event_bus: Arc<EventBus>,
         ohlcv_port: Arc<dyn OhlcvPort>,
         detectors: Arc<RwLock<HashMap<PositionId, JoinHandle<Option<DetectorSignal>>>>>,
@@ -696,8 +702,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         reason: &'static str,
     ) {
         let cancel_token = shutdown_token.child_token();
-        match DetectorTask::from_position(
+        match DetectorTask::from_position_with_policy(
             &position,
+            entry_policy,
             Arc::clone(&event_bus),
             ohlcv_port,
             cancel_token,
@@ -719,15 +726,22 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
     }
 
+    async fn entry_policy_for_position(&self, position_id: PositionId) -> EntryPolicyConfig {
+        let entry_policies = self.entry_policies.read().await;
+        entry_policies.get(&position_id).copied().unwrap_or_default()
+    }
+
     async fn rearm_detector_after_governed_block(
         &self,
         position_id: PositionId,
         position: &Position,
         reason: &'static str,
     ) {
+        let entry_policy = self.entry_policy_for_position(position_id).await;
         Self::rearm_detector(
             position_id,
             position.clone(),
+            entry_policy,
             Arc::clone(&self.event_bus),
             Arc::clone(&self.ohlcv_port),
             Arc::clone(&self.detectors),
@@ -783,6 +797,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let event_bus = Arc::clone(&self.event_bus);
         let ohlcv_port = Arc::clone(&self.ohlcv_port);
         let detectors = Arc::clone(&self.detectors);
+        let entry_policies = Arc::clone(&self.entry_policies);
         let shutdown_token = self.shutdown_token.clone();
 
         let wait_duration = expires_at
@@ -822,9 +837,18 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                             expired_at: chrono::Utc::now(),
                         });
 
+                        let entry_policy = {
+                            let policies = entry_policies.read().await;
+                            policies
+                                .get(&record_inner.position.id)
+                                .copied()
+                                .unwrap_or_default()
+                        };
+
                         PositionManager::<E, S>::rearm_detector(
                             record_inner.position.id,
                             record_inner.position,
+                            entry_policy,
                             event_bus,
                             ohlcv_port,
                             detectors,
@@ -854,12 +878,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         {
             let mut pending_approvals = self.pending_approvals.write().await;
-            pending_approvals.insert(query_id, PendingApprovalRecord {
-                query,
-                position,
-                proposed,
-                governed,
-            });
+            pending_approvals
+                .insert(query_id, PendingApprovalRecord { query, position, proposed, governed });
         }
 
         let pending_approvals = self.pending_approvals.read().await;
@@ -1087,6 +1107,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                                     );
                                 }
                             }
+                            Some(Ok(DaemonEvent::DomainEvent(event))) => {
+                                if let Err(e) = manager.emit_domain_event(event).await {
+                                    error!(
+                                        error = %e,
+                                        "Failed to persist daemon domain event"
+                                    );
+                                }
+                            }
                             Some(Err(lag_msg)) => {
                                 warn!(error = %lag_msg, "Signal receiver lagged");
                             }
@@ -1124,6 +1152,27 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         risk_config: RiskConfig,
         tech_stop_distance: Option<TechnicalStopDistance>,
         account_id: Uuid,
+    ) -> DaemonResult<Position> {
+        self.arm_position_with_policy(
+            symbol,
+            side,
+            risk_config,
+            tech_stop_distance,
+            account_id,
+            EntryPolicyConfig::default(),
+        )
+        .await
+    }
+
+    /// Arm a new position with an explicit entry and approval policy.
+    pub async fn arm_position_with_policy(
+        &self,
+        symbol: Symbol,
+        side: Side,
+        risk_config: RiskConfig,
+        tech_stop_distance: Option<TechnicalStopDistance>,
+        account_id: Uuid,
+        entry_policy: EntryPolicyConfig,
     ) -> DaemonResult<Position> {
         // Update engine with operator-supplied capital before any sizing.
         {
@@ -1177,14 +1226,22 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
         self.record_query_transition(&query, "processing").await?;
 
-        // Emit PositionArmed event → apply_event creates position in Armed state
+        // Emit PositionArmed event → apply_event creates position in Armed state.
+        // Then persist policy resolution for replay/audit.
         let now = chrono::Utc::now();
-        let event = Event::PositionArmed {
+        let armed_event = Event::PositionArmed {
             position_id,
             account_id,
             symbol: symbol.clone(),
             side,
             tech_stop_distance,
+            timestamp: now,
+        };
+        let policy_event = Event::EntryPolicyResolved {
+            position_id,
+            entry_policy: entry_policy.mode,
+            approval_policy: entry_policy.approval,
+            strategy_id: StrategyRegistry::strategy_id_for_policy(entry_policy.mode),
             timestamp: now,
         };
 
@@ -1197,7 +1254,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self.record_query_transition(&query, "acting").await?;
 
         // Execute event emission + persist to eventlog for crash recovery
-        let results = match self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await {
+        let results = match self
+            .execute_and_persist(vec![
+                EngineAction::EmitEvent(armed_event),
+                EngineAction::EmitEvent(policy_event),
+            ])
+            .await
+        {
             Ok(r) => r,
             Err(e) => {
                 let err_str = format!("{}", e);
@@ -1214,6 +1277,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             new_state: "Armed".to_string(),
             timestamp: now,
         });
+
+        {
+            let mut entry_policies = self.entry_policies.write().await;
+            entry_policies.insert(position_id, entry_policy);
+        }
 
         // Load position from projection for detector and return
         let position = match self.store.positions().find_by_id(position_id).await {
@@ -1234,8 +1302,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         // Spawn detector task
         let cancel_token = self.child_cancel_token();
-        let detector = match DetectorTask::from_position(
+        let detector = match DetectorTask::from_position_with_policy(
             &position,
+            entry_policy,
             Arc::clone(&self.event_bus),
             Arc::clone(&self.ohlcv_port),
             cancel_token,
@@ -1512,7 +1581,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self.event_bus.send(DaemonEvent::PositionStateChanged {
             position_id,
             previous_state: "Armed".to_string(),
-            new_state: "Closed".to_string(),
+            new_state: "Cancelled".to_string(),
             timestamp: chrono::Utc::now(),
         });
 
@@ -1842,9 +1911,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             },
         };
 
+        // Domain ApprovalPolicy is authoritative over the notional-threshold adapter.
+        let domain_approval = self.entry_policy_for_position(position_id).await.approval;
+
         match self
             .query_engine
-            .check_approval(&mut query, &proposed, &risk_context, governed)
+            .check_approval_with_domain_policy(&mut query, governed, domain_approval)
             .await
         {
             Ok(ApprovalCheckResult::Ready(governed)) => {
@@ -1858,6 +1930,28 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     .as_ref()
                     .map(|approval| approval.expires_at)
                     .expect("awaiting approval query must contain approval metadata");
+
+                // Emit audit event for replay-safe AwaitingApproval stage evidence.
+                let approval_pending_event = Event::EntryApprovalPending {
+                    position_id,
+                    signal_id: signal.signal_id,
+                    timestamp: chrono::Utc::now(),
+                };
+                // Broadcast to event bus so real-time consumers (UI, audit log)
+                // can observe the AwaitingApproval lifecycle stage immediately.
+                self.event_bus
+                    .send(DaemonEvent::DomainEvent(approval_pending_event.clone()));
+                if let Err(e) = self
+                    .execute_and_persist(vec![EngineAction::EmitEvent(approval_pending_event)])
+                    .await
+                {
+                    warn!(
+                        %position_id,
+                        error = %e,
+                        "Failed to persist EntryApprovalPending audit event — approval continues"
+                    );
+                }
+
                 self.store_pending_approval(query, position.clone(), proposed, governed).await;
 
                 info!(
@@ -2452,6 +2546,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         "Panic: Error position encountered outside find_active() contract"
                     );
                 },
+                PositionState::Cancelled => {
+                    // find_active() guarantees this is unreachable — Cancelled is terminal.
+                },
             }
         }
 
@@ -2700,8 +2797,8 @@ mod tests {
         candles[50] = Candle::new(
             symbol.clone(),
             base,
-            dec!(105),
-            dec!(95),
+            dec!(104),
+            dec!(98),
             base,
             dec!(100),
             10,
@@ -2709,15 +2806,44 @@ mod tests {
             now + Duration::minutes(65),
         );
         candles[70] = Candle::new(
-            symbol,
+            symbol.clone(),
             base,
-            dec!(110),
-            dec!(90),
+            dec!(104),
+            dec!(96),
             base,
             dec!(100),
             10,
             now + Duration::minutes(70),
             now + Duration::minutes(85),
+        );
+
+        let pullback_start = candles.len() - 10;
+        for index in pullback_start..candles.len() - 1 {
+            let open_time = now + Duration::minutes(index as i64);
+            candles[index] = Candle::new(
+                symbol.clone(),
+                dec!(99.5),
+                dec!(99.5),
+                dec!(99.5),
+                dec!(99.5),
+                dec!(100),
+                10,
+                open_time,
+                open_time + Duration::minutes(15),
+            );
+        }
+        let final_index = candles.len() - 1;
+        let final_open_time = now + Duration::minutes(final_index as i64);
+        candles[final_index] = Candle::new(
+            symbol.clone(),
+            dec!(105),
+            dec!(105),
+            dec!(105),
+            dec!(105),
+            dec!(100),
+            10,
+            final_open_time,
+            final_open_time + Duration::minutes(15),
         );
 
         candles
@@ -2821,15 +2947,15 @@ mod tests {
 
         manager.disarm_position(position.id).await.unwrap();
 
-        // Position must be kept for audit trail, transitioned to Closed state
+        // Position must be kept for audit trail, transitioned to Cancelled state
         let loaded = manager
             .get_position(position.id)
             .await
             .unwrap()
             .expect("position must exist after disarm");
         assert!(
-            matches!(loaded.state, PositionState::Closed { .. }),
-            "expected Closed after disarm, got {:?}",
+            matches!(loaded.state, PositionState::Cancelled),
+            "expected Cancelled after disarm, got {:?}",
             loaded.state
         );
     }
@@ -3324,20 +3450,26 @@ mod tests {
 
     #[tokio::test]
     async fn test_handle_signal_waits_for_approval_when_required() {
-        let manager = create_phase3_test_manager(300).await;
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+        let manager = create_test_manager().await;
         let mut receiver = manager.event_bus.subscribe();
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
         let entry = Price::new(dec!(100)).unwrap();
         let stop = Price::new(dec!(90)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let hc_policy = EntryPolicyConfig::new(
+            EntryPolicy::ConfirmedTrend,
+            DomainApprovalPolicy::HumanConfirmation,
+        );
 
         let position = manager
-            .arm_position(
+            .arm_position_with_policy(
                 symbol.clone(),
                 Side::Long,
                 create_test_risk_config(),
                 Some(tech_stop),
                 Uuid::now_v7(),
+                hc_policy,
             )
             .await
             .unwrap();
@@ -3388,21 +3520,158 @@ mod tests {
         assert!(awaiting_seen, "Expected QueryAwaitingApproval event");
     }
 
+    // -------------------------------------------------------------------------
+    // Domain ApprovalPolicy integration tests (Phase 4)
+    // -------------------------------------------------------------------------
+
     #[tokio::test]
-    async fn test_approve_query_executes_pending_signal() {
+    async fn test_arm_position_with_explicit_policy_stores_policy() {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+        let manager = create_test_manager().await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let policy = EntryPolicyConfig::new(
+            EntryPolicy::ConfirmedTrend,
+            DomainApprovalPolicy::HumanConfirmation,
+        );
+
+        let position = manager
+            .arm_position_with_policy(
+                symbol,
+                Side::Long,
+                create_test_risk_config(),
+                None,
+                Uuid::now_v7(),
+                policy,
+            )
+            .await
+            .unwrap();
+
+        let stored = manager.entry_policy_for_position(position.id).await;
+        assert_eq!(stored.mode, EntryPolicy::ConfirmedTrend);
+        assert_eq!(stored.approval, DomainApprovalPolicy::HumanConfirmation);
+    }
+
+    /// `ApprovalPolicy::Automatic` must bypass the notional-threshold gate even
+    /// when notional exceeds the threshold that would normally require approval.
+    #[tokio::test]
+    async fn test_handle_signal_automatic_bypasses_notional_threshold() {
+        // phase3 manager has 5% threshold; signal notional will exceed it.
         let manager = create_phase3_test_manager(300).await;
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
         let entry = Price::new(dec!(100)).unwrap();
         let stop = Price::new(dec!(90)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let policy = EntryPolicyConfig {
+            mode: robson_domain::EntryPolicy::ConfirmedTrend,
+            approval: robson_domain::ApprovalPolicy::Automatic,
+        };
 
         let position = manager
-            .arm_position(
+            .arm_position_with_policy(
                 symbol.clone(),
                 Side::Long,
                 create_test_risk_config(),
                 Some(tech_stop),
                 Uuid::now_v7(),
+                policy,
+            )
+            .await
+            .unwrap();
+
+        // Signal with notional > 5% threshold (entry 95000, stop 85500, qty ~0.0105)
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol,
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(85500)).unwrap(),
+            technical_stop_analysis: None,
+            timestamp: chrono::Utc::now(),
+        };
+
+        manager.handle_signal(signal).await.unwrap();
+
+        // Automatic: no pending approval, position must have moved past Armed.
+        let pending = manager.pending_approvals.read().await;
+        assert!(pending.is_empty(), "Expected no pending approvals with Automatic policy");
+    }
+
+    /// `ApprovalPolicy::HumanConfirmation` must always require operator approval
+    /// even when the notional is below the threshold that normally auto-proceeds.
+    #[tokio::test]
+    async fn test_handle_signal_human_confirmation_always_waits() {
+        // create_test_manager uses 100% threshold → normally no approval needed.
+        let manager = create_test_manager().await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(90)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let policy = EntryPolicyConfig {
+            mode: robson_domain::EntryPolicy::ConfirmedTrend,
+            approval: robson_domain::ApprovalPolicy::HumanConfirmation,
+        };
+
+        let position = manager
+            .arm_position_with_policy(
+                symbol.clone(),
+                Side::Long,
+                create_test_risk_config(),
+                Some(tech_stop),
+                Uuid::now_v7(),
+                policy,
+            )
+            .await
+            .unwrap();
+
+        // Low-notional signal that would normally proceed automatically.
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol,
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(85500)).unwrap(),
+            technical_stop_analysis: None,
+            timestamp: chrono::Utc::now(),
+        };
+
+        manager.handle_signal(signal).await.unwrap();
+
+        // HumanConfirmation: position stays Armed, one pending approval.
+        let updated = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(
+            matches!(updated.state, PositionState::Armed),
+            "Expected Armed while awaiting human confirmation, got {:?}",
+            updated.state
+        );
+        let pending = manager.pending_approvals.read().await;
+        assert_eq!(pending.len(), 1, "Expected exactly one pending approval");
+        let record = pending.values().next().expect("pending approval record must exist");
+        assert_eq!(record.query.state, QueryState::AwaitingApproval);
+    }
+
+    #[tokio::test]
+    async fn test_approve_query_executes_pending_signal() {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+        let manager = create_test_manager().await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(90)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let hc_policy = EntryPolicyConfig::new(
+            EntryPolicy::ConfirmedTrend,
+            DomainApprovalPolicy::HumanConfirmation,
+        );
+
+        let position = manager
+            .arm_position_with_policy(
+                symbol.clone(),
+                Side::Long,
+                create_test_risk_config(),
+                Some(tech_stop),
+                Uuid::now_v7(),
+                hc_policy,
             )
             .await
             .unwrap();
@@ -3413,8 +3682,7 @@ mod tests {
             symbol,
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
-            stop_loss: Price::new(dec!(85500)).unwrap(), /* 10% below -> approval required, risk
-                                                          * approved */
+            stop_loss: Price::new(dec!(85500)).unwrap(), /* HumanConfirmation always waits */
             technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
@@ -3441,19 +3709,25 @@ mod tests {
 
     #[tokio::test]
     async fn test_disarm_invalidates_pending_approval() {
-        let manager = create_phase3_test_manager(300).await;
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+        let manager = create_test_manager().await;
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
         let entry = Price::new(dec!(100)).unwrap();
         let stop = Price::new(dec!(90)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let hc_policy = EntryPolicyConfig::new(
+            EntryPolicy::ConfirmedTrend,
+            DomainApprovalPolicy::HumanConfirmation,
+        );
 
         let position = manager
-            .arm_position(
+            .arm_position_with_policy(
                 symbol.clone(),
                 Side::Long,
                 create_test_risk_config(),
                 Some(tech_stop),
                 Uuid::now_v7(),
+                hc_policy,
             )
             .await
             .unwrap();
@@ -3481,8 +3755,8 @@ mod tests {
         assert!(manager.pending_approvals.read().await.is_empty());
         let updated = manager.get_position(position.id).await.unwrap().unwrap();
         assert!(
-            matches!(updated.state, PositionState::Closed { .. }),
-            "Expected Closed after disarm, got {:?}",
+            matches!(updated.state, PositionState::Cancelled),
+            "Expected Cancelled after disarm, got {:?}",
             updated.state
         );
 
@@ -3497,20 +3771,26 @@ mod tests {
     /// denies the approval.
     #[tokio::test]
     async fn test_approve_query_denied_when_risk_context_changes() {
-        let manager = create_phase3_test_manager(300).await;
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+        let manager = create_test_manager().await;
 
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
         let entry = Price::new(dec!(100)).unwrap();
         let stop = Price::new(dec!(90)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let hc_policy = EntryPolicyConfig::new(
+            EntryPolicy::ConfirmedTrend,
+            DomainApprovalPolicy::HumanConfirmation,
+        );
 
         let position = manager
-            .arm_position(
+            .arm_position_with_policy(
                 symbol.clone(),
                 Side::Long,
                 create_test_risk_config(),
                 Some(tech_stop),
                 Uuid::now_v7(),
+                hc_policy,
             )
             .await
             .unwrap();
@@ -3560,20 +3840,27 @@ mod tests {
 
     #[tokio::test]
     async fn test_pending_approval_expires_and_does_not_execute() {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+        // 1-second TTL so the approval expires quickly during the test.
         let manager = create_phase3_test_manager(1).await;
         let mut receiver = manager.event_bus.subscribe();
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
         let entry = Price::new(dec!(100)).unwrap();
         let stop = Price::new(dec!(90)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let hc_policy = EntryPolicyConfig::new(
+            EntryPolicy::ConfirmedTrend,
+            DomainApprovalPolicy::HumanConfirmation,
+        );
 
         let position = manager
-            .arm_position(
+            .arm_position_with_policy(
                 symbol.clone(),
                 Side::Long,
                 create_test_risk_config(),
                 Some(tech_stop),
                 Uuid::now_v7(),
+                hc_policy,
             )
             .await
             .unwrap();
@@ -3684,15 +3971,11 @@ mod tests {
         assert!(halt.blocks_new_entries, "Slot exhaustion must trigger MonthlyHalt");
 
         // Slot exhaustion is represented as MonthlyDrawdown today, so the
-        // MonthlyHalt path closes all lifecycle positions, including the
-        // newly armed one.
+        // MonthlyHalt path cancels all armed positions (no exchange action taken).
         let updated = manager.get_position(position.id).await.unwrap().unwrap();
         assert!(
-            matches!(updated.state, PositionState::Closed {
-                exit_reason: robson_domain::ExitReason::DisarmedByUser,
-                ..
-            }),
-            "Expected Closed after MonthlyHalt (Entering positions exhausted slots), got {:?}",
+            matches!(updated.state, PositionState::Cancelled),
+            "Expected Cancelled after MonthlyHalt (Entering positions exhausted slots), got {:?}",
             updated.state
         );
     }
@@ -3751,10 +4034,8 @@ mod tests {
             event_bus.send(DaemonEvent::MarketData(market_data));
         }
 
-        // Feed ascending prices to trigger MA crossover (fast crosses above slow)
-        let mut signal_found = false;
-        let mut detector_signal = None;
-
+        // Feed ascending prices; strategy confirmation comes from persisted
+        // candles, while market data is only the detector evaluation trigger.
         for i in 0..10 {
             let price = Decimal::from(100 + i * 3); // Larger steps to trigger crossover faster
             let market_data = MarketData {
@@ -3763,36 +4044,24 @@ mod tests {
                 timestamp: chrono::Utc::now(),
             };
             event_bus.send(DaemonEvent::MarketData(market_data));
-
-            // Check if detector emitted signal (after each tick, with timeout)
-            for _ in 0..5 {
-                let deadline = tokio::time::timeout(
-                    std::time::Duration::from_millis(50),
-                    signal_receiver.recv(),
-                );
-
-                match deadline.await {
-                    Ok(Some(Ok(DaemonEvent::DetectorSignal(signal)))) => {
-                        detector_signal = Some(signal);
-                        signal_found = true;
-                        break;
-                    },
-                    Ok(Some(Ok(_))) => continue, // Other events
-                    Ok(Some(Err(_))) | Ok(None) | Err(_) => break, // Channel error or timeout
-                }
-                if signal_found {
-                    break;
-                }
-            }
-            if signal_found {
-                break;
-            }
         }
 
-        // Assert: signal was emitted
-        assert!(signal_found, "Detector should emit signal on MA crossover");
-
-        let signal = detector_signal.expect("Signal should exist");
+        let detector_signal = tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            loop {
+                match signal_receiver.recv().await {
+                    Some(Ok(DaemonEvent::DetectorSignal(signal)))
+                        if signal.position_id == position_id =>
+                    {
+                        return Some(signal);
+                    },
+                    Some(Ok(_)) | Some(Err(_)) => continue,
+                    None => return None,
+                }
+            }
+        })
+        .await
+        .expect("Timed out waiting for detector signal");
+        let signal = detector_signal.expect("Detector should emit signal on MA crossover");
 
         // Assert: signal properties
         assert_eq!(signal.position_id, position_id);
@@ -4227,7 +4496,8 @@ mod tests {
 
     #[tokio::test]
     async fn test_approve_query_monthly_drawdown_closes_active_positions() {
-        let manager = create_phase3_test_manager(300).await;
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+        let manager = create_test_manager().await;
 
         // 1. Save an Active position — it must be closed by MonthlyHalt
         save_active_position(&manager, "ETHUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
@@ -4237,14 +4507,19 @@ mod tests {
         let entry = Price::new(dec!(100)).unwrap();
         let stop = Price::new(dec!(90)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let hc_policy = EntryPolicyConfig::new(
+            EntryPolicy::ConfirmedTrend,
+            DomainApprovalPolicy::HumanConfirmation,
+        );
 
         let position = manager
-            .arm_position(
+            .arm_position_with_policy(
                 symbol.clone(),
                 Side::Long,
                 create_test_risk_config(),
                 Some(tech_stop),
                 Uuid::now_v7(),
+                hc_policy,
             )
             .await
             .unwrap();
@@ -4255,7 +4530,7 @@ mod tests {
             symbol,
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
-            stop_loss: Price::new(dec!(85500)).unwrap(), // 10% below -> approval required
+            stop_loss: Price::new(dec!(85500)).unwrap(), // HumanConfirmation always requires approval
             technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
@@ -4629,6 +4904,350 @@ mod tests {
             updated.quantity.as_decimal(),
             default_qty,
             "Position size with capital=20000 must differ from capital=10000"
+        );
+    }
+
+    // =========================================================================
+    // Phase 5: State Machine integration tests
+    // =========================================================================
+
+    /// Disarmed position transitions to Cancelled (not Closed).
+    #[tokio::test]
+    async fn test_position_state_cancelled_after_disarm() {
+        let manager = create_test_manager().await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+
+        let position = manager
+            .arm_position(symbol, Side::Long, create_test_risk_config(), None, Uuid::now_v7())
+            .await
+            .unwrap();
+
+        manager.disarm_position(position.id).await.unwrap();
+
+        let updated = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(
+            matches!(updated.state, PositionState::Cancelled),
+            "Expected Cancelled after disarm, got {:?}",
+            updated.state
+        );
+    }
+
+    /// Cancelled position must not appear in find_active.
+    #[tokio::test]
+    async fn test_cancelled_position_excluded_from_find_active() {
+        let manager = create_test_manager().await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+
+        let position = manager
+            .arm_position(symbol, Side::Long, create_test_risk_config(), None, Uuid::now_v7())
+            .await
+            .unwrap();
+
+        manager.disarm_position(position.id).await.unwrap();
+
+        let active = manager.store.positions().find_active().await.unwrap();
+        assert!(
+            active.iter().all(|p| p.id != position.id),
+            "Cancelled position must not appear in find_active"
+        );
+    }
+
+    /// EntryApprovalPending event is emitted when HumanConfirmation approval
+    /// policy holds the entry for operator confirmation.
+    #[tokio::test]
+    async fn test_entry_approval_pending_event_emitted() {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+        let manager = create_test_manager().await;
+        let mut receiver = manager.event_bus.subscribe();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(90)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let hc_policy = EntryPolicyConfig::new(
+            EntryPolicy::ConfirmedTrend,
+            DomainApprovalPolicy::HumanConfirmation,
+        );
+
+        let position = manager
+            .arm_position_with_policy(
+                symbol.clone(),
+                Side::Long,
+                create_test_risk_config(),
+                Some(tech_stop),
+                Uuid::now_v7(),
+                hc_policy,
+            )
+            .await
+            .unwrap();
+
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol,
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(85500)).unwrap(),
+            technical_stop_analysis: None,
+            timestamp: chrono::Utc::now(),
+        };
+
+        manager.handle_signal(signal).await.unwrap();
+
+        // Approval must be pending
+        assert_eq!(manager.pending_approvals.read().await.len(), 1);
+
+        // EntryApprovalPending must have been emitted to the event bus as a domain event
+        let mut approval_pending_seen = false;
+        for _ in 0..20 {
+            if let Ok(Some(event)) =
+                tokio::time::timeout(std::time::Duration::from_millis(50), receiver.recv()).await
+            {
+                if let Ok(DaemonEvent::DomainEvent(Event::EntryApprovalPending {
+                    position_id,
+                    ..
+                })) = event
+                {
+                    assert_eq!(position_id, position.id);
+                    approval_pending_seen = true;
+                    break;
+                }
+            }
+        }
+        assert!(approval_pending_seen, "Expected EntryApprovalPending domain event on event bus");
+    }
+
+    /// After approval expiry, the position must remain Armed and the detector
+    /// must be re-armed (retry path).
+    ///
+    /// The background expiry task removes the record from `pending_approvals`
+    /// and re-arms the detector automatically. `approve_query` must NOT be
+    /// called after expiry — the record is gone and would return `QueryNotFound`.
+    /// Instead, wait for the `QueryExpired` event on the event bus, then verify
+    /// the position is still Armed.
+    #[tokio::test]
+    async fn test_approval_expiry_re_arms_position() {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+        // 1-second TTL so the approval expires quickly in the test.
+        let manager = create_phase3_test_manager(1).await;
+        let mut receiver = manager.event_bus.subscribe();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(90)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let hc_policy = EntryPolicyConfig::new(
+            EntryPolicy::ConfirmedTrend,
+            DomainApprovalPolicy::HumanConfirmation,
+        );
+
+        let position = manager
+            .arm_position_with_policy(
+                symbol.clone(),
+                Side::Long,
+                create_test_risk_config(),
+                Some(tech_stop),
+                Uuid::now_v7(),
+                hc_policy,
+            )
+            .await
+            .unwrap();
+
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol,
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(85500)).unwrap(),
+            technical_stop_analysis: None,
+            timestamp: chrono::Utc::now(),
+        };
+
+        manager.handle_signal(signal).await.unwrap();
+
+        // Approval is pending — background task will expire it after 1 second.
+        assert_eq!(manager.pending_approvals.read().await.len(), 1);
+
+        // Wait for the QueryExpired event emitted by the background expiry task.
+        let mut expired_seen = false;
+        for _ in 0..30 {
+            match tokio::time::timeout(
+                std::time::Duration::from_millis(100),
+                receiver.recv(),
+            )
+            .await
+            {
+                Ok(Some(Ok(DaemonEvent::QueryExpired { position_id, .. }))) => {
+                    if position_id == Some(position.id) {
+                        expired_seen = true;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        assert!(expired_seen, "Expected QueryExpired event on event bus after TTL");
+
+        // Background task has already removed the record and re-armed the detector.
+        assert_eq!(
+            manager.pending_approvals.read().await.len(),
+            0,
+            "Pending approvals must be empty after expiry"
+        );
+
+        // Position must stay Armed — expiry is a retry path, not a terminal state.
+        let updated = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(
+            matches!(updated.state, PositionState::Armed),
+            "Expected Armed after approval expiry, got {:?}",
+            updated.state
+        );
+    }
+
+    /// Risk denied entries leave the position in Armed state (retry path, not Cancelled).
+    ///
+    /// This test triggers a DuplicatePosition risk denial (same symbol + side already
+    /// Entering), which is a governed outcome that does NOT activate MonthlyHalt.
+    /// Slot-exhaustion denials also use RiskCheck::MonthlyDrawdown and DO trigger
+    /// MonthlyHalt + panic_close_all — that is correct behaviour and is separately
+    /// tested in the monthly drawdown test.
+    #[tokio::test]
+    async fn test_risk_denial_leaves_position_armed_for_retry() {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+        let manager = create_test_manager().await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+
+        // Seed an Entering BTCUSDT/Long position. The risk gate's DuplicatePosition
+        // check fires when a second BTCUSDT/Long signal arrives, producing a governed
+        // denial that does not trigger MonthlyHalt.
+        let entry = Price::new(dec!(95000)).unwrap();
+        let stop = Price::new(dec!(91200)).unwrap();
+        let mut existing = robson_domain::Position::new(
+            uuid::Uuid::now_v7(),
+            symbol.clone(),
+            Side::Long,
+        );
+        existing.quantity = Quantity::new(dec!(0.001)).unwrap();
+        existing.tech_stop_distance =
+            Some(TechnicalStopDistance::from_entry_and_stop(entry, stop));
+        existing.state = PositionState::Entering {
+            entry_order_id: uuid::Uuid::now_v7(),
+            expected_entry: entry,
+            signal_id: uuid::Uuid::now_v7(),
+        };
+        manager.store.positions().save(&existing).await.unwrap();
+
+        let hc_policy = EntryPolicyConfig::new(
+            EntryPolicy::ConfirmedTrend,
+            DomainApprovalPolicy::Automatic,
+        );
+
+        let position = manager
+            .arm_position_with_policy(
+                symbol.clone(),
+                Side::Long,
+                create_test_risk_config(),
+                Some(TechnicalStopDistance::from_entry_and_stop(
+                    entry,
+                    stop,
+                )),
+                Uuid::now_v7(),
+                hc_policy,
+            )
+            .await
+            .unwrap();
+
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol,
+            side: Side::Long,
+            entry_price: entry,
+            stop_loss: stop,
+            technical_stop_analysis: None,
+            timestamp: chrono::Utc::now(),
+        };
+
+        // handle_signal must succeed: DuplicatePosition denial is a governed outcome.
+        manager.handle_signal(signal).await.unwrap();
+
+        // Position must remain Armed — DuplicatePosition re-arms the detector.
+        let updated = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(
+            matches!(updated.state, PositionState::Armed),
+            "Expected Armed after risk denial, got {:?}",
+            updated.state
+        );
+
+        // Cancelled state must not be set (Cancelled is reserved for pre-entry disarm).
+        assert!(
+            !matches!(updated.state, PositionState::Cancelled),
+            "Risk denial must not produce Cancelled state"
+        );
+    }
+
+    /// Risk-bypass regression: after a risk-denied signal, the position must
+    /// NOT be in Entering state. The only way to reach Entering is via
+    /// execute_signal_query, which requires a GovernedAction token that can
+    /// only be produced by QueryEngine::check_risk() succeeding.
+    #[tokio::test]
+    async fn test_risk_denial_never_produces_entering_state() {
+        let manager = create_test_manager().await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(95000)).unwrap();
+        let stop = Price::new(dec!(91200)).unwrap();
+
+        // Seed an Entering position to trigger DuplicatePosition denial.
+        let mut existing = robson_domain::Position::new(
+            uuid::Uuid::now_v7(),
+            symbol.clone(),
+            Side::Long,
+        );
+        existing.quantity = Quantity::new(dec!(0.001)).unwrap();
+        existing.tech_stop_distance =
+            Some(TechnicalStopDistance::from_entry_and_stop(entry, stop));
+        existing.state = PositionState::Entering {
+            entry_order_id: uuid::Uuid::now_v7(),
+            expected_entry: entry,
+            signal_id: uuid::Uuid::now_v7(),
+        };
+        manager.store.positions().save(&existing).await.unwrap();
+
+        // Arm a second BTCUSDT/Long position.
+        let position = manager
+            .arm_position(
+                symbol.clone(),
+                Side::Long,
+                create_test_risk_config(),
+                Some(TechnicalStopDistance::from_entry_and_stop(entry, stop)),
+                Uuid::nil(),
+            )
+            .await
+            .unwrap();
+
+        // Send signal — DuplicatePosition check should deny this.
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol: symbol.clone(),
+            side: Side::Long,
+            entry_price: entry,
+            stop_loss: stop,
+            technical_stop_analysis: None,
+            timestamp: chrono::Utc::now(),
+        };
+        manager.handle_signal(signal).await.unwrap();
+
+        // Position must NOT be Entering — risk denial prevents GovernedAction.
+        let updated = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(
+            !matches!(updated.state, PositionState::Entering { .. }),
+            "Risk denial must not produce Entering state, got {:?}",
+            updated.state
+        );
+        assert!(
+            matches!(updated.state, PositionState::Armed),
+            "Expected Armed after risk denial, got {:?}",
+            updated.state
         );
     }
 }

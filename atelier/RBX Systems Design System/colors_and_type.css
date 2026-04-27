@@ -1,0 +1,195 @@
+/* RBX Systems — Colors & Type
+   Zurich-coded: dark-first, restrained, high-contrast, institutional.
+   Primary font Inter. Fallback: system-ui, sans-serif.
+   Monospace: JetBrains Mono (for data/code/status).
+*/
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+:root {
+  /* ——— Neutrals (dark-first scale) ——— */
+  --rbx-black:       #050507;   /* page background, deepest surface */
+  --rbx-ink:         #0A0A0B;   /* primary surface (from atelier) */
+  --rbx-surface-1:   #0F1012;   /* raised surface */
+  --rbx-surface-2:   #15161A;   /* card / panel */
+  --rbx-surface-3:   #1D1D22;   /* footer / elevated panel */
+  --rbx-line:        #26272C;   /* hairline borders */
+  --rbx-line-strong: #33343A;   /* strong border / divider */
+
+  /* ——— Foreground (off-whites) ——— */
+  --rbx-fg:          #F5F5F3;   /* primary text, near-white, warm */
+  --rbx-fg-muted:    #B4B5B8;   /* body secondary */
+  --rbx-fg-dim:      #72747A;   /* captions, metadata, labels */
+  --rbx-fg-faint:    #45474D;   /* disabled / tertiary */
+
+  /* ——— Accents (restrained) ——— */
+  --rbx-accent:      #D9CBA3;   /* warm metallic — brass/bone */
+  --rbx-accent-dim:  #8C8369;   /* accent muted */
+  --rbx-cyan:        #01FFFF;   /* legacy product accent — use sparingly */
+  --rbx-cyan-dim:    #01A6A6;
+
+  /* ——— Semantic (status) ——— */
+  --rbx-ok:          #7FB77E;   /* healthy, canonical */
+  --rbx-warn:        #D9B55A;   /* pending, degraded */
+  --rbx-err:         #C56A6A;   /* failed, rejected */
+  --rbx-info:        #7A93B0;   /* informational */
+
+  /* ——— Light-mode inversion (rare; use only when explicitly needed) ——— */
+  --rbx-light-bg:    #F5F5F3;
+  --rbx-light-fg:    #0A0A0B;
+
+  /* ——— Type families ——— */
+  --rbx-font-sans: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --rbx-font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+
+  /* ——— Type scale (1rem = 16px) ——— */
+  --rbx-text-xs:     0.6875rem; /* 11px — micro labels, status */
+  --rbx-text-sm:     0.8125rem; /* 13px — captions */
+  --rbx-text-base:   0.9375rem; /* 15px — body */
+  --rbx-text-md:     1rem;      /* 16px */
+  --rbx-text-lg:     1.125rem;  /* 18px */
+  --rbx-text-xl:     1.375rem;  /* 22px */
+  --rbx-text-2xl:    1.75rem;   /* 28px */
+  --rbx-text-3xl:    2.25rem;   /* 36px */
+  --rbx-text-4xl:    3rem;      /* 48px */
+  --rbx-text-5xl:    4rem;      /* 64px */
+
+  /* ——— Tracking ——— */
+  --rbx-track-label:  0.14em;  /* uppercase labels, eyebrows */
+  --rbx-track-tight: -0.015em; /* display headings */
+  --rbx-track-normal: 0;
+  --rbx-track-wide:   0.04em;  /* mono status */
+
+  /* ——— Leading ——— */
+  --rbx-lead-tight: 1.1;
+  --rbx-lead-snug:  1.25;
+  --rbx-lead-body:  1.55;
+  --rbx-lead-loose: 1.7;
+
+  /* ——— Spacing scale (4px base) ——— */
+  --rbx-s-0:   0;
+  --rbx-s-1:   0.25rem;  /*  4 */
+  --rbx-s-2:   0.5rem;   /*  8 */
+  --rbx-s-3:   0.75rem;  /* 12 */
+  --rbx-s-4:   1rem;     /* 16 */
+  --rbx-s-5:   1.5rem;   /* 24 */
+  --rbx-s-6:   2rem;     /* 32 */
+  --rbx-s-7:   3rem;     /* 48 */
+  --rbx-s-8:   4rem;     /* 64 */
+  --rbx-s-9:   6rem;     /* 96 */
+  --rbx-s-10:  8rem;     /* 128 */
+
+  /* ——— Radii (small, institutional) ——— */
+  --rbx-radius-none: 0;
+  --rbx-radius-sm:   2px;
+  --rbx-radius-md:   4px;
+  --rbx-radius-lg:   8px;
+  --rbx-radius-xl:   12px;
+  --rbx-radius-pill: 999px;
+
+  /* ——— Elevation (very restrained) ——— */
+  --rbx-shadow-none: none;
+  --rbx-shadow-sm:  0 1px 0 rgba(255,255,255,0.03) inset, 0 1px 2px rgba(0,0,0,0.4);
+  --rbx-shadow-md:  0 1px 0 rgba(255,255,255,0.04) inset, 0 8px 24px -8px rgba(0,0,0,0.5);
+  --rbx-shadow-lg:  0 1px 0 rgba(255,255,255,0.05) inset, 0 24px 48px -16px rgba(0,0,0,0.6);
+  --rbx-ring:       0 0 0 1px var(--rbx-line);
+  --rbx-ring-strong:0 0 0 1px var(--rbx-line-strong);
+
+  /* ——— Motion ——— */
+  --rbx-ease:       cubic-bezier(0.2, 0, 0, 1);
+  --rbx-ease-out:   cubic-bezier(0.16, 1, 0.3, 1);
+  --rbx-dur-fast:   120ms;
+  --rbx-dur:        200ms;
+  --rbx-dur-slow:   320ms;
+
+  /* ——— Layout ——— */
+  --rbx-content-w: 72rem;   /* 1152px — comfortable institutional width */
+  --rbx-prose-w:   42rem;   /* 672px — text column */
+  --rbx-gutter:    1.25rem; /* 20px */
+}
+
+/* ——— Semantic element defaults ———
+   Apply `.rbx` to a root container to adopt the system. */
+
+.rbx {
+  background: var(--rbx-ink);
+  color: var(--rbx-fg);
+  font-family: var(--rbx-font-sans);
+  font-size: var(--rbx-text-base);
+  line-height: var(--rbx-lead-body);
+  font-feature-settings: 'ss01', 'cv11', 'calt';
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+.rbx h1, .rbx .rbx-h1 {
+  font-family: var(--rbx-font-sans);
+  font-size: var(--rbx-text-5xl);
+  font-weight: 300;
+  line-height: var(--rbx-lead-tight);
+  letter-spacing: var(--rbx-track-tight);
+  color: var(--rbx-fg);
+}
+.rbx h2, .rbx .rbx-h2 {
+  font-size: var(--rbx-text-3xl);
+  font-weight: 400;
+  line-height: var(--rbx-lead-snug);
+  letter-spacing: var(--rbx-track-tight);
+}
+.rbx h3, .rbx .rbx-h3 {
+  font-size: var(--rbx-text-xl);
+  font-weight: 500;
+  line-height: var(--rbx-lead-snug);
+}
+.rbx h4, .rbx .rbx-h4 {
+  font-size: var(--rbx-text-lg);
+  font-weight: 500;
+  line-height: var(--rbx-lead-snug);
+}
+.rbx p, .rbx .rbx-body {
+  font-size: var(--rbx-text-base);
+  line-height: var(--rbx-lead-body);
+  color: var(--rbx-fg-muted);
+}
+.rbx .rbx-lead {
+  font-size: var(--rbx-text-lg);
+  line-height: var(--rbx-lead-body);
+  color: var(--rbx-fg);
+  font-weight: 300;
+}
+.rbx .rbx-eyebrow,
+.rbx .rbx-label {
+  font-size: var(--rbx-text-xs);
+  text-transform: uppercase;
+  letter-spacing: var(--rbx-track-label);
+  color: var(--rbx-fg-dim);
+  font-weight: 500;
+}
+.rbx .rbx-caption {
+  font-size: var(--rbx-text-sm);
+  color: var(--rbx-fg-dim);
+}
+.rbx .rbx-mono,
+.rbx code,
+.rbx kbd {
+  font-family: var(--rbx-font-mono);
+  font-size: 0.92em;
+  letter-spacing: var(--rbx-track-wide);
+  color: var(--rbx-fg);
+}
+.rbx .rbx-status {
+  font-family: var(--rbx-font-mono);
+  font-size: var(--rbx-text-xs);
+  letter-spacing: var(--rbx-track-wide);
+  text-transform: uppercase;
+  font-weight: 500;
+}
+.rbx a {
+  color: var(--rbx-fg);
+  text-decoration: none;
+  border-bottom: 1px solid var(--rbx-line-strong);
+  transition: border-color var(--rbx-dur) var(--rbx-ease),
+              color var(--rbx-dur) var(--rbx-ease);
+}
+.rbx a:hover { border-color: var(--rbx-fg); }
+.rbx hr { border: 0; border-top: 1px solid var(--rbx-line); margin: var(--rbx-s-6) 0; }

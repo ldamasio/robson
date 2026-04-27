@@ -1,0 +1,129 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>RBX Systems — Design System</title>
+<link rel="stylesheet" href="colors_and_type.css">
+<style>
+  html, body { margin: 0; padding: 0; background: #0A0A0B; min-height: 100vh; }
+  body { font-family: var(--rbx-font-sans); color: #F5F5F3; }
+  *, *::before, *::after { box-sizing: border-box; }
+  a { color: inherit; text-decoration: none; }
+  .mono { font-family: var(--rbx-font-mono); letter-spacing: 0.04em; font-size: 11px; color: var(--rbx-fg-dim); text-transform: uppercase; }
+  .card { border: 1px solid var(--rbx-line); background: var(--rbx-surface-1); border-radius: 8px; padding: 28px; transition: border-color 200ms var(--rbx-ease), background 200ms var(--rbx-ease); }
+  .card:hover { border-color: var(--rbx-line-strong); background: var(--rbx-surface-2); }
+  .hair { border-top: 1px solid var(--rbx-line); }
+</style>
+</head>
+<body class="rbx">
+
+<header style="padding: 80px 0 56px;">
+  <div style="max-width: 1120px; margin: 0 auto; padding: 0 32px;">
+    <div style="display:flex; align-items:center; gap:16px; margin-bottom: 48px;">
+      <img src="assets/bitmap.svg" width="56" height="56" alt="RBX" />
+      <div style="display:flex; flex-direction:column; gap:4px; line-height:1;">
+        <span style="font-size:20px; font-weight:600; letter-spacing:-0.01em;">RBX Systems</span>
+        <span class="mono">Design system · v1.0 · 2026</span>
+      </div>
+    </div>
+    <h1 style="font-size: 64px; font-weight: 300; line-height: 1.05; letter-spacing: -0.015em; margin: 0; max-width: 18ch;">
+      A system designed<br/>for systems that<br/>
+      <span style="color: var(--rbx-accent);">run for years.</span>
+    </h1>
+    <p style="margin-top: 32px; font-size: 18px; line-height: 1.6; font-weight: 300; color: var(--rbx-fg-muted); max-width: 44rem;">
+      The RBX design system codifies the visual and interaction language for rbxsystems.ch — marketing surfaces, the public atelier, and the operational dashboards behind our products.
+    </p>
+  </div>
+</header>
+
+<section class="hair" style="padding: 64px 0;">
+  <div style="max-width: 1120px; margin: 0 auto; padding: 0 32px;">
+    <div class="mono" style="margin-bottom: 32px;">Principles</div>
+    <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap: 24px;">
+      <div>
+        <div style="font-family: var(--rbx-font-mono); font-size: 28px; font-weight: 300; color: var(--rbx-fg-faint); letter-spacing: 0.04em; margin-bottom: 16px;">01</div>
+        <h3 style="font-size: 18px; font-weight: 500; margin: 0 0 10px;">Quiet by default</h3>
+        <p style="font-size: 13px; line-height: 1.6; color: var(--rbx-fg-muted); margin: 0;">The UI should look idle when everything is idle. Color and motion are earned, not sprinkled.</p>
+      </div>
+      <div>
+        <div style="font-family: var(--rbx-font-mono); font-size: 28px; font-weight: 300; color: var(--rbx-fg-faint); letter-spacing: 0.04em; margin-bottom: 16px;">02</div>
+        <h3 style="font-size: 18px; font-weight: 500; margin: 0 0 10px;">Tabular discipline</h3>
+        <p style="font-size: 13px; line-height: 1.6; color: var(--rbx-fg-muted); margin: 0;">Numbers are data. Monospace, tabular-nums, aligned right — everywhere.</p>
+      </div>
+      <div>
+        <div style="font-family: var(--rbx-font-mono); font-size: 28px; font-weight: 300; color: var(--rbx-fg-faint); letter-spacing: 0.04em; margin-bottom: 16px;">03</div>
+        <h3 style="font-size: 18px; font-weight: 500; margin: 0 0 10px;">Earned accent</h3>
+        <p style="font-size: 13px; line-height: 1.6; color: var(--rbx-fg-muted); margin: 0;">Brass #B08D3C is reserved — "institutionalized," active nav, live telemetry. Never decorative.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="hair" style="padding: 64px 0;">
+  <div style="max-width: 1120px; margin: 0 auto; padding: 0 32px;">
+    <div class="mono" style="margin-bottom: 32px;">UI Kits</div>
+    <div style="display:grid; grid-template-columns: 1fr 1fr 1fr; gap: 20px;">
+      <a href="ui_kits/marketing/index.html" class="card">
+        <div class="mono" style="margin-bottom: 24px;">01 · rbxsystems.ch</div>
+        <h3 style="font-size: 22px; font-weight: 500; margin: 0 0 12px; letter-spacing: -0.01em;">Marketing</h3>
+        <p style="font-size: 13px; line-height: 1.6; color: var(--rbx-fg-muted); margin: 0;">Full homepage flow — hero, positioning, capabilities, products index, team.</p>
+      </a>
+      <a href="ui_kits/atelier/index.html" class="card">
+        <div class="mono" style="margin-bottom: 24px;">02 · atelier</div>
+        <h3 style="font-size: 22px; font-weight: 500; margin: 0 0 12px; letter-spacing: -0.01em;">Atelier</h3>
+        <p style="font-size: 13px; line-height: 1.6; color: var(--rbx-fg-muted); margin: 0;">Public laboratory — product index, telemetry strip, activity timeline.</p>
+      </a>
+      <a href="ui_kits/product/index.html" class="card">
+        <div class="mono" style="margin-bottom: 24px;">03 · robson</div>
+        <h3 style="font-size: 22px; font-weight: 500; margin: 0 0 12px; letter-spacing: -0.01em;">Control Plane</h3>
+        <p style="font-size: 13px; line-height: 1.6; color: var(--rbx-fg-muted); margin: 0;">Operational dashboard — sidebar, KPI row, portfolio chart, strategy table, service health.</p>
+      </a>
+    </div>
+  </div>
+</section>
+
+<section class="hair" style="padding: 64px 0;">
+  <div style="max-width: 1120px; margin: 0 auto; padding: 0 32px;">
+    <div class="mono" style="margin-bottom: 32px;">Foundations</div>
+    <div style="display:grid; grid-template-columns: repeat(5, 1fr); gap: 12px;">
+      <div class="card" style="padding:20px;">
+        <div class="mono" style="margin-bottom:12px;">Type</div>
+        <div style="font-size:22px; font-weight:300; letter-spacing:-0.01em;">Inter · JetBrains</div>
+      </div>
+      <div class="card" style="padding:20px;">
+        <div class="mono" style="margin-bottom:12px;">Palette</div>
+        <div style="display:flex; gap:6px;">
+          <div style="width:24px; height:24px; background:#0A0A0B; border:1px solid var(--rbx-line);"></div>
+          <div style="width:24px; height:24px; background:#1A1B1F;"></div>
+          <div style="width:24px; height:24px; background:#B08D3C;"></div>
+          <div style="width:24px; height:24px; background:#64D2A8;"></div>
+        </div>
+      </div>
+      <div class="card" style="padding:20px;">
+        <div class="mono" style="margin-bottom:12px;">Grid</div>
+        <div style="font-size:22px; font-weight:300; letter-spacing:-0.01em; font-family: var(--rbx-font-mono);">12 · 4px</div>
+      </div>
+      <div class="card" style="padding:20px;">
+        <div class="mono" style="margin-bottom:12px;">Radii</div>
+        <div style="font-size:22px; font-weight:300; letter-spacing:-0.01em; font-family: var(--rbx-font-mono);">4 · 6 · 8</div>
+      </div>
+      <div class="card" style="padding:20px;">
+        <div class="mono" style="margin-bottom:12px;">Motion</div>
+        <div style="font-size:22px; font-weight:300; letter-spacing:-0.01em;">200ms · quint</div>
+      </div>
+    </div>
+    <p style="margin-top: 24px; font-size: 13px; color: var(--rbx-fg-dim);">
+      Open the Design System tab for the detailed token cards.
+    </p>
+  </div>
+</section>
+
+<footer class="hair" style="padding: 40px 0; margin-top: 80px;">
+  <div style="max-width: 1120px; margin: 0 auto; padding: 0 32px; display:flex; justify-content:space-between; align-items:center;">
+    <span class="mono">© 2026 RBX SYSTEMS · DESIGN SYSTEM V1.0</span>
+    <span class="mono">ZURICH · SÃO PAULO</span>
+  </div>
+</footer>
+
+</body>
+</html>

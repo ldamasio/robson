@@ -4,7 +4,109 @@
 //! This module is the single source of truth for risk policy decisions.
 //! `robson-engine` consumes policies; `robsond` constructs them at startup.
 
+use std::fmt;
+
 use rust_decimal::Decimal;
+use serde::{Deserialize, Serialize};
+
+/// Entry policy selected by the operator.
+///
+/// This is a selector only. It must not contain signal-detection logic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryPolicy {
+    /// Enter immediately after technical stop analysis, risk, and approval
+    /// gates. No signal strategy is required.
+    Immediate,
+    /// Require deterministic trend confirmation before entry.
+    ConfirmedTrend,
+    /// Require deterministic reversal confirmation before entry.
+    ConfirmedReversal,
+    /// Require deterministic key-level interaction and reaction confirmation.
+    ConfirmedKeyLevel,
+}
+
+impl Default for EntryPolicy {
+    fn default() -> Self {
+        Self::ConfirmedTrend
+    }
+}
+
+/// Operator approval policy for an entry request.
+///
+/// This is independent from [`EntryPolicy`]. A confirmed strategy may still be
+/// automatic, and an immediate entry may still require human confirmation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ApprovalPolicy {
+    /// Proceed automatically after strategy, technical stop, and risk gates.
+    Automatic,
+    /// Hold the risk-approved entry until explicit operator confirmation.
+    HumanConfirmation,
+}
+
+impl Default for ApprovalPolicy {
+    fn default() -> Self {
+        Self::Automatic
+    }
+}
+
+/// Policy bundle supplied by the operator for an entry lifecycle.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct EntryPolicyConfig {
+    /// Signal policy mode.
+    pub mode: EntryPolicy,
+    /// Operator approval mode.
+    pub approval: ApprovalPolicy,
+}
+
+impl EntryPolicyConfig {
+    /// Construct a new entry policy configuration.
+    pub fn new(mode: EntryPolicy, approval: ApprovalPolicy) -> Self {
+        Self { mode, approval }
+    }
+}
+
+impl Default for EntryPolicyConfig {
+    fn default() -> Self {
+        Self {
+            mode: EntryPolicy::default(),
+            approval: ApprovalPolicy::default(),
+        }
+    }
+}
+
+/// Stable strategy identifier used in event payloads and replay.
+#[derive(Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
+pub struct StrategyId {
+    /// Stable strategy name, for example `sma_crossover`.
+    pub name: String,
+    /// Monotonic strategy version.
+    pub version: u32,
+}
+
+impl StrategyId {
+    /// Construct a new strategy identifier.
+    pub fn new(name: impl Into<String>, version: u32) -> Self {
+        Self { name: name.into(), version }
+    }
+}
+
+impl fmt::Display for StrategyId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}:v{}", self.name, self.version)
+    }
+}
+
+/// Persisted outcome type for signal-strategy audit events.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SignalEvaluationOutcome {
+    /// Strategy did not confirm an entry signal.
+    NoSignal,
+    /// Strategy confirmed an entry signal.
+    SignalConfirmed,
+}
 
 /// Primary trading policy with immutable risk parameters (ADR-0024 Decision 2).
 ///

@@ -32,6 +32,7 @@
 
 // Trading strategy modules
 pub mod risk;
+pub mod signal_strategy;
 pub mod technical_stop_analyzer;
 pub mod trailing_stop;
 
@@ -41,11 +42,15 @@ pub use risk::{
     PositionSummary, ProposedTrade, RiskCheck, RiskContext, RiskGate, RiskLimits, RiskVerdict,
 };
 use robson_domain::{
-    calculate_position_size, DetectorSignal, Event, ExitReason, OrderId, Position, PositionId,
+    calculate_position_size, DetectorSignal, Event, ExitReason, Position, PositionId,
     PositionState, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
+pub use signal_strategy::{
+    KeyLevelKind, KeyLevelStrategy, ReversalPattern, ReversalPatternStrategy, SignalContext,
+    SignalDecision, SignalReason, SignalStrategy, SmaCrossoverStrategy, StrategyRegistry,
+};
 use thiserror::Error;
 use tracing::debug;
 

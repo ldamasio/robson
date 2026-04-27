@@ -1,0 +1,191 @@
+/* ==========================================================================
+   RBX Voltage System — Design Tokens
+   Dark-first, Zurich/Zug-coded. Single-accent cyan family.
+   Unified across brand (marketing) and product (apps).
+   ========================================================================== */
+
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap');
+
+:root {
+  /* ——— Backgrounds (warm-dark tiers; never pure black, never cool-blue) ——— */
+  --bg-0: #07080A;          /* page, deepest surface */
+  --bg-1: #0D0F12;          /* raised surface */
+  --bg-2: #13161A;          /* card, panel */
+  --bg-3: #1A1E23;          /* hover, nested */
+  --bg-overlay: rgba(7, 8, 10, 0.72);  /* sticky nav, scrim */
+
+  /* ——— Foreground (off-whites; warm-neutral, never pure white) ——— */
+  --fg-0: #ECECEC;          /* primary text, headings */
+  --fg-1: #B8BCC2;          /* secondary */
+  --fg-2: #7A7F87;          /* meta, labels, disabled */
+  --fg-3: #4A4F56;          /* hint, placeholder */
+
+  /* ——— Borders (hairline discipline) ——— */
+  --border: #24282E;
+  --border-strong: #3A4048;
+  --border-accent: #22E5E5; /* cyan hairline for focus */
+
+  /* ——— Voltage cyan scale (single-accent family) ——— */
+  --cyan-signal:  #00FFFF;  /* critical: kill-switch, alerts, focus, primary CTA */
+  --cyan-brand:   #22E5E5;  /* brand: logos, wordmarks, hero, headlines */
+  --cyan-muted:   #06B6B6;  /* hover, inactive states, links */
+  --cyan-dim:     #0B6E6E;  /* eyebrows, emphasized borders, tick rulers */
+  --cyan-subtle:  rgba(0, 255, 255, 0.08);  /* tints, card highlights */
+
+  /* ——— Semantic (status only; never chrome) ——— */
+  --ok:    #7FB77E;
+  --warn:  #D9B55A;
+  --err:   #C56A6A;
+  --info:  #7A93B0;
+  --ok-subtle:    rgba(127, 183, 126, 0.12);
+  --warn-subtle:  rgba(217, 181,  90, 0.12);
+  --err-subtle:   rgba(197, 106, 106, 0.12);
+  --info-subtle:  rgba(122, 147, 176, 0.12);
+
+  /* ——— Type families ——— */
+  --font-sans: 'Inter', system-ui, -apple-system, 'Segoe UI', sans-serif;
+  --font-mono: 'JetBrains Mono', ui-monospace, 'SF Mono', Menlo, Consolas, monospace;
+
+  /* ——— Type scale (rem; 1rem = 16px) ——— */
+  --text-xs:     0.6875rem;   /* 11px — micro labels, status chips */
+  --text-sm:     0.8125rem;   /* 13px — captions */
+  --text-base:   0.9375rem;   /* 15px — body */
+  --text-md:     1rem;        /* 16px */
+  --text-lg:     1.125rem;    /* 18px */
+  --text-xl:     1.375rem;    /* 22px */
+  --text-2xl:    1.75rem;     /* 28px */
+  --text-3xl:    2.25rem;     /* 36px */
+  --text-4xl:    3rem;        /* 48px */
+  --text-5xl:    4rem;        /* 64px — display hero */
+
+  /* ——— Tracking ——— */
+  --track-label:  0.14em;     /* uppercase labels, eyebrows */
+  --track-wide:   0.04em;     /* mono status */
+  --track-tight: -0.015em;    /* display headings */
+  --track-normal: 0;
+
+  /* ——— Leading ——— */
+  --lead-tight: 1.1;
+  --lead-snug:  1.25;
+  --lead-body:  1.55;
+  --lead-loose: 1.7;
+
+  /* ——— Spacing scale (4px base, strict 8pt rhythm) ——— */
+  --s-0:  0;
+  --s-1:  0.25rem;   /*  4 */
+  --s-2:  0.5rem;    /*  8 */
+  --s-3:  0.75rem;   /* 12 */
+  --s-4:  1rem;      /* 16 */
+  --s-5:  1.5rem;    /* 24 */
+  --s-6:  2rem;      /* 32 */
+  --s-7:  3rem;      /* 48 */
+  --s-8:  4rem;      /* 64 */
+  --s-9:  6rem;      /* 96 */
+  --s-10: 8rem;      /* 128 */
+
+  /* ——— Radii (small, institutional; no pills except status) ——— */
+  --radius-none: 0;
+  --radius-sm:   2px;   /* buttons, inputs, badges */
+  --radius-md:   4px;   /* cards, panels */
+  --radius-lg:   8px;   /* modals, top-level containers */
+  --radius-pill: 999px; /* status dots only */
+
+  /* ——— Elevation (flat; shadow only for overlays) ——— */
+  --shadow-none:    none;
+  --shadow-overlay: 0 8px 24px rgba(0, 0, 0, 0.5);
+  --ring:           0 0 0 1px var(--border);
+  --ring-strong:    0 0 0 1px var(--border-strong);
+  --ring-focus:     0 0 0 2px var(--cyan-brand);
+
+  /* ——— Motion (short, decelerate, no bounce) ——— */
+  --ease:         cubic-bezier(0.2, 0, 0, 1);
+  --ease-out:     cubic-bezier(0.16, 1, 0.3, 1);
+  --dur-fast:     120ms;
+  --dur:          160ms;
+  --dur-slow:     240ms;
+
+  /* ——— Layout ——— */
+  --content-w:  72rem;    /* 1152px — institutional content */
+  --prose-w:    42rem;    /* 672px — editorial prose */
+  --gutter:     1.5rem;   /* 24px */
+  --header-h:   4rem;     /* 64px */
+}
+
+/* ==========================================================================
+   Root application class
+   ========================================================================== */
+.rbx {
+  background: var(--bg-0);
+  color: var(--fg-0);
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--lead-body);
+  font-feature-settings: 'ss01', 'cv11', 'calt';
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+/* ==========================================================================
+   Typography
+   ========================================================================== */
+.rbx-display,
+.rbx h1 { font-family: var(--font-sans); font-size: var(--text-5xl); font-weight: 300; line-height: var(--lead-tight); letter-spacing: var(--track-tight); color: var(--fg-0); }
+.rbx h2 { font-size: var(--text-3xl); font-weight: 400; line-height: var(--lead-snug); letter-spacing: var(--track-tight); }
+.rbx h3 { font-size: var(--text-xl); font-weight: 500; line-height: var(--lead-snug); }
+.rbx h4 { font-size: var(--text-lg); font-weight: 500; line-height: var(--lead-snug); }
+.rbx p,
+.rbx-body { font-size: var(--text-base); line-height: var(--lead-body); color: var(--fg-1); }
+.rbx-lead { font-size: var(--text-lg); line-height: var(--lead-body); color: var(--fg-0); font-weight: 300; }
+.rbx-eyebrow,
+.rbx-label {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  text-transform: uppercase;
+  letter-spacing: var(--track-label);
+  color: var(--fg-2);
+  font-weight: 500;
+}
+.rbx-caption { font-size: var(--text-sm); color: var(--fg-2); }
+.rbx-mono,
+.rbx code,
+.rbx kbd {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+  letter-spacing: var(--track-wide);
+  color: var(--fg-0);
+}
+.rbx-status {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  letter-spacing: var(--track-wide);
+  text-transform: uppercase;
+  font-weight: 500;
+}
+
+/* ==========================================================================
+   Links — voltage hairline signature on hover
+   ========================================================================== */
+.rbx a {
+  color: var(--fg-0);
+  text-decoration: none;
+  border-bottom: 1px solid var(--border-strong);
+  transition: border-color var(--dur) var(--ease), color var(--dur) var(--ease);
+}
+.rbx a:hover {
+  color: var(--cyan-brand);
+  border-bottom-color: var(--cyan-brand);
+}
+
+/* ==========================================================================
+   Focus — voltage ring
+   ========================================================================== */
+.rbx *:focus-visible {
+  outline: none;
+  box-shadow: var(--ring-focus);
+  outline-offset: 2px;
+}
+
+/* ==========================================================================
+   Horizontal rule — hairline structure
+   ========================================================================== */
+.rbx hr { border: 0; border-top: 1px solid var(--border); margin: var(--s-6) 0; }

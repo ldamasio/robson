@@ -1,0 +1,186 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>RBX · Robson</title>
+<link rel="stylesheet" href="../../colors_and_type.css">
+<script src="https://unpkg.com/lucide@latest/dist/umd/lucide.min.js"></script>
+<style>
+  * { box-sizing: border-box; }
+  html, body { margin: 0; background: var(--bg-0); color: var(--fg-0); font-family: var(--font-sans); font-size: 15px; line-height: 24px; -webkit-font-smoothing: antialiased; }
+  a { color: inherit; text-decoration: none; }
+  .wrap { max-width: 1120px; margin: 0 auto; padding: 0 32px; }
+
+  /* Header */
+  .hdr { position: sticky; top: 0; z-index: 10; background: var(--bg-overlay); backdrop-filter: blur(8px); border-bottom: 1px solid var(--border); }
+  .hdr__in { display: flex; justify-content: space-between; align-items: center; height: 64px; }
+  .brand { display: flex; align-items: center; gap: 10px; font-weight: 600; letter-spacing: -0.02em; font-size: 15px; }
+  .brand__bar { width: 22px; height: 2px; background: var(--accent); }
+  .brand__dim { color: var(--fg-2); font-weight: 400; }
+  .nav { display: flex; gap: 28px; font-size: 14px; color: var(--fg-1); }
+  .nav a:hover { color: var(--fg-0); }
+  .hdr__cta { display: flex; gap: 8px; align-items: center; }
+  .btn { font-family: inherit; font-size: 13px; font-weight: 500; padding: 8px 14px; border-radius: 2px; border: 1px solid transparent; cursor: pointer; display: inline-flex; align-items: center; gap: 6px; line-height: 1; }
+  .btn--primary { background: var(--fg-0); color: var(--bg-0); }
+  .btn--primary:hover { background: #fff; }
+  .btn--ghost { color: var(--fg-1); }
+  .btn--ghost:hover { color: var(--fg-0); }
+  .btn--accent { color: var(--accent); border-color: rgba(201,169,110,0.4); }
+  .btn--accent:hover { background: rgba(201,169,110,0.08); border-color: var(--accent); }
+  .btn svg { width: 14px; height: 14px; stroke-width: 1.5; }
+
+  /* Hero */
+  .hero { padding: 96px 0 64px; border-bottom: 1px solid var(--border); }
+  .eyebrow { font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--fg-2); }
+  .eyebrow .accent { color: var(--accent); }
+  .h1 { font-size: 56px; line-height: 64px; font-weight: 600; letter-spacing: -0.03em; margin: 20px 0 20px; max-width: 800px; }
+  .lede { font-size: 18px; line-height: 28px; color: var(--fg-1); max-width: 680px; margin: 0 0 32px; }
+  .hero__cta { display: flex; gap: 12px; align-items: center; }
+  .hero__meta { margin-top: 48px; display: flex; gap: 40px; font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.08em; text-transform: uppercase; color: var(--fg-2); border-top: 1px solid var(--border); padding-top: 24px; }
+  .hero__meta b { color: var(--fg-0); font-weight: 500; }
+
+  /* Features — three numbered columns */
+  .features { padding: 80px 0; border-bottom: 1px solid var(--border); }
+  .feat-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 0; border-top: 1px solid var(--border); }
+  .feat { padding: 32px 28px 32px 0; border-right: 1px solid var(--border); }
+  .feat:last-child { border-right: none; padding-right: 0; }
+  .feat:not(:first-child) { padding-left: 28px; }
+  .feat__num { font-family: var(--font-mono); font-size: 11px; color: var(--accent); letter-spacing: 0.16em; }
+  .feat__title { font-size: 20px; font-weight: 600; letter-spacing: -0.015em; margin: 12px 0 8px; }
+  .feat__body { color: var(--fg-1); font-size: 14px; line-height: 22px; }
+
+  /* Code sample */
+  .code-section { padding: 80px 0; border-bottom: 1px solid var(--border); display: grid; grid-template-columns: 1fr 1.2fr; gap: 64px; align-items: center; }
+  .code-section h2 { font-size: 32px; font-weight: 600; letter-spacing: -0.02em; line-height: 40px; margin: 12px 0 16px; }
+  .code-section p { color: var(--fg-1); font-size: 15px; }
+  .code { background: var(--bg-1); border: 1px solid var(--border); border-radius: 4px; font-family: var(--font-mono); font-size: 13px; overflow: hidden; }
+  .code__head { display: flex; justify-content: space-between; padding: 10px 14px; border-bottom: 1px solid var(--border); font-size: 10px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--fg-2); }
+  .code__body { padding: 20px; color: var(--fg-1); line-height: 22px; }
+  .code .p { color: var(--accent); }
+  .code .c { color: var(--fg-3); }
+  .code .s { color: var(--positive); }
+  .code .k { color: var(--fg-0); }
+
+  /* Quote */
+  .quote { padding: 96px 0; border-bottom: 1px solid var(--border); }
+  .quote blockquote { font-size: 28px; line-height: 40px; font-weight: 500; letter-spacing: -0.015em; margin: 0; max-width: 880px; color: var(--fg-0); }
+  .quote cite { display: block; margin-top: 24px; font-family: var(--font-mono); font-size: 11px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--fg-2); font-style: normal; }
+
+  /* Footer */
+  .ftr { padding: 48px 0; color: var(--fg-2); font-size: 13px; display: flex; justify-content: space-between; align-items: center; }
+  .ftr__links { display: flex; gap: 24px; }
+  .ftr__links a:hover { color: var(--fg-0); }
+</style>
+</head>
+<body data-screen-label="landing">
+
+<header class="hdr">
+  <div class="wrap hdr__in">
+    <div class="brand">
+      <div class="brand__bar"></div>
+      RBX <span class="brand__dim">Systems</span>
+    </div>
+    <nav class="nav">
+      <a href="#">Engine</a>
+      <a href="#">Risk</a>
+      <a href="#">Docs</a>
+      <a href="#">Changelog</a>
+      <a href="#">GitHub</a>
+    </nav>
+    <div class="hdr__cta">
+      <button class="btn btn--ghost">Sign in</button>
+      <button class="btn btn--primary">Request access</button>
+    </div>
+  </div>
+</header>
+
+<section class="hero">
+  <div class="wrap">
+    <div class="eyebrow">Robson · v0.104 · <span class="accent">Execution & risk engine</span></div>
+    <h1 class="h1">An execution runtime for leveraged markets.</h1>
+    <p class="lede">Robson is not a trading bot. It manages what happens after a decision is made — order lifecycle, risk invariants, and failure handling — with deterministic semantics and a full audit trail.</p>
+    <div class="hero__cta">
+      <button class="btn btn--primary">Read the docs <i data-lucide="arrow-right"></i></button>
+      <button class="btn btn--accent">View on GitHub</button>
+    </div>
+    <div class="hero__meta">
+      <div><div>Determinism</div><b>Hexagonal core</b></div>
+      <div><div>Risk</div><b>Enforced by architecture</b></div>
+      <div><div>Audit</div><b>Append-only event log</b></div>
+      <div><div>License</div><b>Open source</b></div>
+    </div>
+  </div>
+</section>
+
+<section class="features">
+  <div class="wrap">
+    <div class="eyebrow">Primary concerns · three subsystems</div>
+    <div class="feat-grid">
+      <div class="feat">
+        <div class="feat__num">01 — EXECUTION</div>
+        <div class="feat__title">Plan. Validate. Execute.</div>
+        <div class="feat__body">A strict PLAN → VALIDATE → EXECUTE pipeline. No unvalidated order reaches the exchange. Dry-run is the default; live execution requires explicit acknowledgement.</div>
+      </div>
+      <div class="feat">
+        <div class="feat__num">02 — RISK</div>
+        <div class="feat__title">Enforced, not advised.</div>
+        <div class="feat__body">Position sizing, stop logic, and liquidation distance are invariants of the runtime. Every exit carries a typed reason code — stop hit, risk limit, manual, validation failure, timeout.</div>
+      </div>
+      <div class="feat">
+        <div class="feat__num">03 — AUDIT</div>
+        <div class="feat__title">Append-only event trail.</div>
+        <div class="feat__body">State transitions, risk checks, and external flows are recorded with causality links. The lifecycle of any position is reconstructible at any point in time.</div>
+      </div>
+    </div>
+  </div>
+</section>
+
+<section class="wrap code-section">
+  <div>
+    <div class="eyebrow">CLI · deterministic</div>
+    <h2>Dry-run by default. Live by declaration.</h2>
+    <p>The execution pipeline defaults to simulation. Live execution requires <code style="font-family:var(--font-mono); color:var(--accent); background:var(--accent-subtle); padding:1px 4px; border-radius:2px;">--live --acknowledge-risk</code> and a prior passing validation.</p>
+  </div>
+  <div class="code">
+    <div class="code__head"><span>bash · robson</span><span>09:14:28</span></div>
+    <div class="code__body">
+<span class="c"># 1. create a plan</span><br/>
+<span class="p">robson</span> plan buy <span class="k">BTCUSDT</span> <span class="s">0.001</span> --limit <span class="s">67420</span><br/>
+<span class="c">&nbsp;&nbsp;→ plan-2847 created · pending validation</span><br/><br/>
+<span class="c"># 2. validate against risk invariants</span><br/>
+<span class="p">robson</span> validate plan-2847 --client-id <span class="s">1</span> --strategy-id <span class="s">5</span><br/>
+<span class="c">&nbsp;&nbsp;→ 4/5 checks passed · stop distance below floor</span><br/><br/>
+<span class="c"># 3. execute (dry-run)</span><br/>
+<span class="p">robson</span> execute plan-2847 --client-id <span class="s">1</span><br/>
+<span class="c">&nbsp;&nbsp;→ simulated · no order sent</span><br/><br/>
+<span class="c"># 4. execute (live)</span><br/>
+<span class="p">robson</span> execute plan-2847 --live --acknowledge-risk
+    </div>
+  </div>
+</section>
+
+<section class="quote">
+  <div class="wrap">
+    <blockquote>In leveraged markets, how you execute matters more than what you execute. A sound signal with poor execution, missing stop logic, or uncontrolled position sizing will lose capital.</blockquote>
+    <cite>— Robson engineering notes</cite>
+  </div>
+</section>
+
+<footer class="ftr wrap">
+  <div class="brand">
+    <div class="brand__bar"></div>
+    RBX <span class="brand__dim">Systems</span>
+  </div>
+  <div class="ftr__links">
+    <a href="#">Docs</a>
+    <a href="#">Changelog</a>
+    <a href="#">GitHub</a>
+    <a href="#">Security</a>
+    <a href="#">Legal</a>
+  </div>
+  <div style="font-family:var(--font-mono); font-size:11px; letter-spacing:0.08em; text-transform:uppercase;">© 2026 RBX Robótica</div>
+</footer>
+
+<script>lucide.createIcons();</script>
+</body>
+</html>

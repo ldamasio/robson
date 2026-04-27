@@ -1,0 +1,23 @@
+<!DOCTYPE html>
+<html><head><meta charset="utf-8"><link rel="stylesheet" href="../colors_and_type.css">
+<style>
+  body { margin:0; padding:24px; background:var(--bg-0); font-family:var(--font-sans); color:var(--fg-0); display:grid; gap:14px; max-width:640px; }
+  .field { display:flex; flex-direction:column; gap:6px; }
+  label { font-family:var(--font-mono); font-size:11px; letter-spacing:0.08em; text-transform:uppercase; color:var(--fg-2); }
+  input, select { font-family:var(--font-sans); font-size:14px; padding:10px 12px; background:var(--bg-2); border:1px solid var(--border); color:var(--fg-0); border-radius:2px; outline:none; }
+  input:focus, select:focus { border-color:var(--accent); box-shadow:0 0 0 1px var(--accent); }
+  input.mono { font-family:var(--font-mono); font-variant-numeric:tabular-nums; }
+  .hint { font-size:12px; color:var(--fg-2); }
+  .err { color:#C26B6B; font-size:12px; }
+  .wrap { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+</style></head>
+<body>
+  <div class="wrap">
+    <div class="field"><label>Symbol</label><input value="BTCUSDT" /></div>
+    <div class="field"><label>Side</label><select><option>BUY</option><option>SELL</option></select></div>
+  </div>
+  <div class="wrap">
+    <div class="field"><label>Quantity</label><input class="mono" value="0.00482" /><div class="hint">BTC, precision 5</div></div>
+    <div class="field"><label>Limit price</label><input class="mono" value="67,420.50" /><div class="err">Exceeds liquidation distance</div></div>
+  </div>
+</body></html>

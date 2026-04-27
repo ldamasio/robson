@@ -23,7 +23,10 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use robson_domain::{DetectorSignal, Position, PositionState, Price, RiskConfig, Side, Symbol};
+use robson_domain::{
+    ApprovalPolicy as DomainApprovalPolicy, DetectorSignal, EntryPolicy, EntryPolicyConfig,
+    Position, PositionState, Price, RiskConfig, Side, Symbol,
+};
 use robson_exec::ExchangePort;
 use robson_store::Store;
 use rust_decimal::Decimal;
@@ -123,9 +126,47 @@ pub struct PendingApprovalSummary {
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Entry policy sub-object for `ArmRequest`.
+///
+/// Both fields default so the entire `entry_policy` object and each field are
+/// optional in JSON. Omitting the object is equivalent to
+/// `{ "mode": "confirmed_trend", "approval": "automatic" }`.
+///
+/// Valid `mode` values:
+/// - `"confirmed_trend"` (default) — SMA crossover confirmation strategy.
+/// - `"confirmed_reversal"` — reversal pattern confirmation strategy.
+/// - `"confirmed_key_level"` — key level confirmation strategy.
+/// - `"immediate"` — no strategy; system stop + risk only.
+///
+/// Valid `approval` values:
+/// - `"automatic"` (default) — execution proceeds without human review.
+/// - `"human_confirmation"` — execution always waits for operator approval.
+#[derive(Debug, Deserialize)]
+pub struct ArmEntryPolicyRequest {
+    #[serde(default)]
+    pub mode: EntryPolicy,
+    #[serde(default)]
+    pub approval: DomainApprovalPolicy,
+}
+
+impl Default for ArmEntryPolicyRequest {
+    fn default() -> Self {
+        Self {
+            mode: EntryPolicy::default(),
+            approval: DomainApprovalPolicy::default(),
+        }
+    }
+}
+
 /// Request to arm a new position.
 ///
 /// Note: risk per trade is fixed at 1% by v3 policy. Not configurable via API.
+///
+/// Omitting `entry_policy` is equivalent to:
+/// ```json
+/// { "mode": "confirmed_trend", "approval": "automatic" }
+/// ```
+/// See `ArmEntryPolicyRequest` for valid mode and approval values.
 #[derive(Debug, Deserialize)]
 pub struct ArmRequest {
     pub symbol: String,
@@ -133,6 +174,8 @@ pub struct ArmRequest {
     pub capital: Decimal,
     #[serde(default = "default_account_id")]
     pub account_id: Uuid,
+    #[serde(default)]
+    pub entry_policy: ArmEntryPolicyRequest,
 }
 
 fn default_account_id() -> Uuid {
@@ -646,10 +689,20 @@ where
         )
     })?;
 
+    // Build entry policy from request (defaults to ConfirmedTrend + Automatic)
+    let entry_policy = EntryPolicyConfig::new(req.entry_policy.mode, req.entry_policy.approval);
+
     // Arm position
     let manager = state.position_manager.write().await;
     let position = manager
-        .arm_position(symbol.clone(), side, risk_config, None, req.account_id)
+        .arm_position_with_policy(
+            symbol.clone(),
+            side,
+            risk_config,
+            None,
+            req.account_id,
+            entry_policy,
+        )
         .await
         .map_err(|e| to_error_response(e))?;
 
@@ -945,6 +998,7 @@ fn position_to_summary(position: &Position) -> PositionSummary {
             )
         },
         PositionState::Error { error, .. } => (format!("Error: {}", error), None, None, None),
+        PositionState::Cancelled => ("Cancelled".to_string(), None, None, None),
     };
 
     PositionSummary {
@@ -1220,16 +1274,21 @@ mod tests {
         let entry = Price::new(dec!(100)).unwrap();
         let stop = Price::new(dec!(90)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let hc_policy = EntryPolicyConfig::new(
+            EntryPolicy::ConfirmedTrend,
+            DomainApprovalPolicy::HumanConfirmation,
+        );
 
         let position = {
             let manager = position_manager.write().await;
             manager
-                .arm_position(
+                .arm_position_with_policy(
                     symbol.clone(),
                     Side::Long,
                     RiskConfig::new(dec!(10000)).unwrap(),
                     Some(tech_stop),
                     Uuid::now_v7(),
+                    hc_policy,
                 )
                 .await
                 .unwrap()
@@ -1282,16 +1341,21 @@ mod tests {
         let entry = Price::new(dec!(100)).unwrap();
         let stop = Price::new(dec!(90)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let hc_policy = EntryPolicyConfig::new(
+            EntryPolicy::ConfirmedTrend,
+            DomainApprovalPolicy::HumanConfirmation,
+        );
 
         let position = {
             let manager = position_manager.write().await;
             manager
-                .arm_position(
+                .arm_position_with_policy(
                     symbol.clone(),
                     Side::Long,
                     RiskConfig::new(dec!(10000)).unwrap(),
                     Some(tech_stop),
                     Uuid::now_v7(),
+                    hc_policy,
                 )
                 .await
                 .unwrap()
@@ -1303,8 +1367,7 @@ mod tests {
             symbol,
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
-            stop_loss: Price::new(dec!(85500)).unwrap(), /* 10% stop -> approval required, risk
-                                                          * approved */
+            stop_loss: Price::new(dec!(85500)).unwrap(), /* HumanConfirmation always requires approval */
             technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
