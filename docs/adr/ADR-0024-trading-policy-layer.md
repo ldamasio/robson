@@ -243,6 +243,16 @@ MIG-v3#12 scope:
 
 MIG-v3#12 is a hard prerequisite for VAL-002 (real capital activation).
 
+**Frontend follow-up (2026-04-27, Option 2 — Slot Count from API Only)**:
+
+MIG-v3#12's dynamic `slots_available` is computed by the backend but not yet exposed to the frontend. The frontend hardcodes `INITIAL_MONTHLY_SLOT_BUDGET = 4` in `apps/frontend/src/lib/config/slots.ts`. The follow-up work (tracked as MIG-v3#12 sub-step in the migration plan) wires the value through:
+
+1. Backend: add `slots_available: u32` to `StatusResponse` in `v3/robsond/src/api.rs`.
+2. Frontend: add `slots_available?: number` to the TypeScript `StatusResponse` type in `robson.ts`, with a fallback of `4` in `normalizeStatus` for the rollout window.
+3. Frontend: refactor `deriveSlots()` to accept the API value as a parameter and remove `INITIAL_MONTHLY_SLOT_BUDGET`.
+
+Full Risk Dashboard (budget bar, realized-loss display) is deferred to MIG-v3#14. See ADR-v3-028 in `v3-architectural-decisions.md` for the decision record.
+
 ---
 
 ## Implementation Status (2026-04-19)

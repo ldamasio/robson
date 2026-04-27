@@ -83,7 +83,7 @@ every reference uses a canonical identifier with a prefix:
 | Axis | Prefix | Identifiers | What it is |
 |------|--------|-------------|------------|
 | **Migration v2 → v2.5** | `MIG-v2.5#` | MIG-v2.5#1 … MIG-v2.5#10 | Migration steps to deploy Rust daemon alongside Django |
-| **Migration v2.5 → v3** | `MIG-v3#` | MIG-v3#1 … MIG-v3#13 | Migration steps to promote Rust daemon as primary runtime |
+| **Migration v2.5 → v3** | `MIG-v3#` | MIG-v3#1 … MIG-v3#14 | Migration steps to promote Rust daemon as primary runtime |
 | **QueryEngine phases** | `QE-P` | QE-P1 … QE-P5 | Internal implementation phases of the QueryEngine subsystem (see v3-query-query-engine.md) |
 | **Pipeline stages** | `Stage` | Stage 1 … Stage N | Sequential stages within a single control loop cycle (see v3-control-loop.md, v3-runtime-spec.md) |
 | **Operational validation gates** | `VAL-` | VAL-001 … VAL-N | Runbook-format validation procedures required before go-live events (see docs/runbooks/val-*.md) |
@@ -121,8 +121,9 @@ Status rule for this table: code-backed items may be marked done from repository
 | MIG-v3#9 | Position Reconciliation Worker (ADR-0022 — Robson-authored position invariant) | ✅ Implemented — `PositionState::Cancelled` added; disarmed positions no longer recorded as `Closed` |
 | MIG-v3#10 | Symbol-agnostic documentation + test sweep (ADR-0023) | ✅ Implemented — `EntryLifecycleStage` computed projection (`entry_lifecycle_stage` fn in `robson-domain/src/events.rs`) |
 | MIG-v3#11 | Policy Layer + Dynamic Slot Calculation (ADR-0024) | Done — repository-verified (2db23ad2, corrected by 0b3653a7); `robson-domain::policy` with `TradingPolicy` and `TechStopConfig`; `RiskGate` consumes policy; static `max_open_positions`, `max_total_exposure_pct`, `max_single_position_pct` eliminated; dynamic slot calculation uses best-effort in-memory `capital_base` (persisted base lands in MIG-v3#12) |
-| MIG-v3#12 | Monthly State Persistence — `MonthBoundaryReset` + `monthly_state` projection | ✅ Implemented — `realized_loss` and `trades_opened` persisted in `monthly_state`; projection handlers for `EntryFilled` and `PositionClosed` events; `load_monthly_state` replaces O(n) recomputation; strict separation: `monthly_state` = ledger, `positions_current` = live execution state |
+| MIG-v3#12 | Monthly State Persistence — `MonthBoundaryReset` + `monthly_state` projection | ✅ Implemented — `realized_loss` and `trades_opened` persisted in `monthly_state`; projection handlers for `EntryFilled` and `PositionClosed` events; `load_monthly_state` replaces O(n) recomputation; strict separation: `monthly_state` = ledger, `positions_current` = live execution state. **Follow-up (Option 2 — Slot Count from API Only)**: expose `slots_available` in `/status` response; replace frontend hardcoded `INITIAL_MONTHLY_SLOT_BUDGET` with API-sourced value. See MIG-v3#12 follow-up subsection below. |
 | MIG-v3#13 | Migrate exchange layer from Isolated Margin to USD-M Futures | Done — exchange connector switched from SAPI isolated-margin endpoints to FAPI USD-M Futures endpoints; position management now operates on Binance USD-M Futures testnet (`testnet.binancefuture.com`) and production |
+| MIG-v3#14 | Risk Dashboard — monthly budget bar, realized-loss display, slot breakdown | Pending — deferred from MIG-v3#12 frontend work. Option 1 (full dashboard UI) was evaluated and postponed in favor of Option 2 (API-only slot exposure). Tentatively a dedicated dashboard story; no implementation date set. |
 | QE-P1 | Passive Wrapper (Non-Breaking) | ✅ Done |
 | QE-P2 | Blocking Governance | ✅ Done (2026-04-04) |
 | QE-P3 | Approval Gates | ✅ Done (2026-04-05) |
@@ -985,6 +986,62 @@ Reconsider TRON integration when ALL of these are true:
 | MIG-v3#11 | **Policy Layer + Dynamic Slot Calculation** (ADR-0024) | Static exposure caps | None | M | Yes — revert to static caps | Config: restore legacy limits | Dynamic slot calculation unavailable; static limits may block valid entries |
 | MIG-v3#12 | **Monthly State Persistence** — `MonthBoundaryReset` + `monthly_state` projection | ✅ Implemented — `realized_loss` and `trades_opened` columns added; dual-routed projection handlers; `load_monthly_state` refactored; backfill script created | MIG-v3#11 | S | Yes — revert to in-memory | Remove monthly_state projection | Monthly realized loss resets on daemon restart; inaccurate budget before real capital |
 | MIG-v3#13 | **Migrate exchange layer from Isolated Margin to USD-M Futures** | SAPI isolated-margin endpoints | MIG-v3#1 | M | Yes — revert to SAPI endpoints | Config: switch back to isolated-margin mode | Orders routed to wrong account type; position mismatches |
+| MIG-v3#14 | **Risk Dashboard** — monthly budget bar, realized-loss display, slot breakdown | Frontend shows only slot count (Option 2) | MIG-v3#12 follow-up | L | Yes — remove dashboard panels | Remove dashboard UI components | Operator lacks visual risk-budget overview; CLI fallback exists |
+
+### MIG-v3#12 Follow-up: Option 2 — Slot Count from API Only
+
+**Date**: 2026-04-27
+**Status**: DECIDED — not yet implemented
+
+**Problem**: `apps/frontend/src/lib/config/slots.ts` hardcodes `INITIAL_MONTHLY_SLOT_BUDGET = 4`.
+The backend (MIG-v3#12) now has authoritative monthly risk state with a dynamic
+`slots_available` calculation via `robson-domain::policy::TradingPolicy::slots_available()`.
+The frontend never reads it.
+
+**Decision (Option 2)**: Expose `slots_available: u32` in the `/status` API response and
+replace the hardcoded constant with the API-sourced value. No new UI panels, no budget bar,
+no realized-loss display. Full Risk Dashboard deferred to MIG-v3#14.
+
+**Rejected alternatives**:
+- **Option 1 (full Risk Dashboard)**: build monthly budget bar, realized-loss display,
+  slot breakdown UI panel. Postponed — correctness fix first, transparency features later.
+- **Option 3 (no change)**: leave the hardcoded `4` in place. Rejected because it silently
+  diverges from the backend's dynamic calculation once positions close at breakeven or
+  profit.
+
+#### Backend steps (robsond / robson-engine)
+
+1. Read `MonthlyStateStore` (or equivalent from MIG-v3#12) inside `status_handler` to
+   obtain `capital_base` and `realized_loss` for the current month.
+2. Compute `latent_risk` from open positions (sum of `risk_per_trade_amount` for each
+   active slot).
+3. Call `policy.slots_available(capital_base, realized_loss, latent_risk)` → `u32`.
+4. Add `slots_available: u32` to `StatusResponse` struct (serde: rename to snake_case,
+   no skip). Current struct is at `v3/robsond/src/api.rs:98–102`.
+5. Populate the field in the `Ok(Json(StatusResponse { ... }))` return.
+6. Add or update the API integration test that calls `/status` and asserts `slots_available`
+   is present and non-negative.
+
+#### Frontend steps (SvelteKit / TypeScript)
+
+1. Add `slots_available?: number` to the `StatusResponse` TypeScript type in `robson.ts`.
+2. In `normalizeStatus`, add:
+   `slots_available: typeof raw.slots_available === 'number' ? raw.slots_available : 4`
+   (fallback 4 keeps backward compat during rollout window).
+3. Refactor `deriveSlots(positions, slotsAvailable: number)` — drop the import of
+   `INITIAL_MONTHLY_SLOT_BUDGET`; receive the API value as a parameter.
+4. Update all call sites of `deriveSlots` to pass `status.slots_available ?? 4`.
+5. Remove `INITIAL_MONTHLY_SLOT_BUDGET` export from `slots.ts` once no callers remain.
+6. Verify the kill-switch page and dashboard slot grid still render correctly (type-check
+   pass).
+
+#### Acceptance criteria
+
+- `/status` response includes `slots_available` as an integer ≥ 0.
+- Frontend slot grid cell count equals `Math.max(slots_available, active_positions.length)`.
+- No hardcoded `4` remains in slot-related frontend logic.
+- Fallback of `4` only appears in `normalizeStatus` with an explicit comment marking it as
+  a rollout-window guard.
 
 ### Migration Rules
 
@@ -1032,7 +1089,7 @@ The repository already shows `MIG-v2.5#4`, `MIG-v2.5#6`, `MIG-v2.5#10`, and `QE-
 1. **VAL-001 Phase 2 — Deploy MIG-v3#11 and complete testnet E2E validation**: build/deploy latest `robsond`, sync `rbx-infra` testnet config (`c3b1bc3`), then validate full lifecycle from entry to exit. No testnet exposure-limit exception is required after ADR-0024.
 2. **Entry order identity and event ordering (§7 of audit)**: add `exchange_order_id` to order events and ensure `EntryOrderPlaced` is emitted only after exchange acknowledgement. Prerequisite for reliable reconciliation.
 3. **Startup reconciliation / MIG-v3#9**: implement UNTRACKED detection, `StartupReconciling` state, and auto-close via Safety Net. Critical for VAL-002.
-4. **MIG-v3#12 — Monthly State Persistence**: persist `capital_base` and loss-only monthly realized loss via `MonthBoundaryReset` before real capital operations.
+4. **MIG-v3#12 — Monthly State Persistence**: persist `capital_base` and loss-only monthly realized loss via `MonthBoundaryReset` before real capital operations. **Follow-up**: expose `slots_available` in `/status` API and wire frontend (Option 2 — see MIG-v3#12 follow-up subsection).
 5. **MIG-v3#10 — Symbol-agnostic documentation + test sweep**: parameterize risk tests across >=2 symbols, remove BTC-coupled assumptions.
 
 ### Explicitly NOT Building Yet
