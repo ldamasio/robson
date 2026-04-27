@@ -1,8 +1,8 @@
-ADR-0027: Frontend UX — Event Log as First-Class Audit Surface
+ADR-0032: Frontend UX — Event Log as First-Class Audit Surface
 
 Status: Accepted (amended 2026-04-23 after EP-003 backend contract review)
 Date: 2026-04-23
-Related: ADR-0007 (Robson is risk assistant), ADR-0021 (opportunity vs technical stop), ADR-0022 (Robson-authored position invariant), ADR-0025 (frontend stack), ADR-0026 (Voltage brand).
+Related: ADR-0007 (Robson is risk assistant), ADR-0021 (opportunity vs technical stop), ADR-0022 (Robson-authored position invariant), ADR-0030 (frontend stack), ADR-0031 (Voltage brand).
 
 Context
 - Robson's core value proposition is deterministic, auditable risk execution. The system emits an append-only event log as source of truth for every state transition (plan → validate → execute → fill → open → stop/close). Derived state (PnL, slot utilization, position roll-up) is projection over this log.

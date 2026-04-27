@@ -1,4 +1,4 @@
-# ADR-0028: Hosting Pivot — Contabo S3 → k3s In-Cluster
+# ADR-0033: Hosting Pivot — Contabo S3 → k3s In-Cluster
 
 **Date:** 2026-04-25
 **Status:** Accepted

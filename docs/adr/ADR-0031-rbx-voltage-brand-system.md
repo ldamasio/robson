@@ -1,4 +1,4 @@
-ADR-0026: RBX Voltage Brand System
+ADR-0031: RBX Voltage Brand System
 
 Status: Accepted
 Date: 2026-04-23

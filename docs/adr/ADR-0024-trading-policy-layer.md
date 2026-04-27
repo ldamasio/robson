@@ -251,7 +251,7 @@ MIG-v3#12's dynamic `slots_available` is computed by the backend but not yet exp
 2. Frontend: add `slots_available?: number` to the TypeScript `StatusResponse` type in `robson.ts`, with a fallback of `4` in `normalizeStatus` for the rollout window.
 3. Frontend: refactor `deriveSlots()` to accept the API value as a parameter and remove `INITIAL_MONTHLY_SLOT_BUDGET`.
 
-Full Risk Dashboard (budget bar, realized-loss display) is deferred to MIG-v3#14. See ADR-v3-028 in `v3-architectural-decisions.md` for the decision record.
+Full Risk Dashboard (budget bar, realized-loss display) is deferred to MIG-v3#14. See [ADR-0034](ADR-0034-frontend-slot-count-api-only.md) for the decision record.
 
 ---
 

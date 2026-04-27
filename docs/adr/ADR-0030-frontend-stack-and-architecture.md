@@ -1,4 +1,4 @@
-ADR-0025: Frontend Stack and Architecture
+ADR-0030: Frontend Stack and Architecture
 
 Status: Accepted (amended 2026-04-23 after EP-003 reality check)
 Date: 2026-04-23
