@@ -7,7 +7,7 @@ import {
   eventSummaryText,
   eventTypeLabel
 } from '$lib/presentation/labels';
-import { deriveSlots, occupiedCount, SLOT_COUNT } from '$lib/config/slots';
+import { deriveSlots, occupiedCount, INITIAL_MONTHLY_SLOT_BUDGET } from '$lib/config/slots';
 import { formatTimeUtc, isTodayUtc } from '$lib/utils/time';
 import type { Position, PositionState, SseEvent, StatusResponse, MonthlyHaltStatus } from '$api/robson';
 
@@ -46,10 +46,10 @@ function makeSseEvent(payload: Record<string, unknown>): SseEvent {
 // --- Dashboard data flow tests ---
 
 describe('dashboard slot derivation from status response', () => {
-  it('empty status yields 6 free slots', () => {
+  it('empty status yields 4 free slots', () => {
     const positions: Position[] = [];
     const slots = deriveSlots(positions);
-    expect(slots).toHaveLength(6);
+    expect(slots).toHaveLength(INITIAL_MONTHLY_SLOT_BUDGET);
     expect(slots.filter(s => s.occupied).length).toBe(0);
     slots.forEach(s => expect(s.occupied).toBe(false));
   });
@@ -61,6 +61,21 @@ describe('dashboard slot derivation from status response', () => {
     const slots = deriveSlots(positions);
     expect(slots.filter(s => s.occupied).length).toBe(1);
     expect(slots.filter(s => s.occupied && s.positionId === 'p1')).toHaveLength(1);
+  });
+
+  it('production Active string position occupies one slot', () => {
+    const positions = [
+      makePosition({
+        id: '019db3dc-c107-7872-bdcb-c3e6602ebbe0',
+        state: 'Active',
+        entry_price: 77932.4,
+        trailing_stop: 76158.25,
+        pnl: 0
+      })
+    ];
+    const slots = deriveSlots(positions);
+    expect(slots).toHaveLength(INITIAL_MONTHLY_SLOT_BUDGET);
+    expect(slots.filter(s => s.occupied)).toHaveLength(1);
   });
 
   it('Armed position counts as occupied', () => {
@@ -115,13 +130,12 @@ describe('dashboard slot derivation from status response', () => {
     expect(deriveSlots(positions).filter(s => s.occupied).length).toBe(3); // Armed + Active + Entering
   });
 
-  it('caps at SLOT_COUNT even with 8+ active positions', () => {
+  it('does not cap displayed active positions at the initial monthly budget', () => {
     const positions = Array.from({ length: 8 }, (_, i) =>
       makePosition({ id: `p${i}`, state: 'Armed' })
     );
     const slots = deriveSlots(positions);
-    expect(slots).toHaveLength(SLOT_COUNT);
-    // All 6 slots occupied
+    expect(slots).toHaveLength(8);
     expect(slots.every(s => s.occupied)).toBe(true);
   });
 });
@@ -230,6 +244,7 @@ describe('event stream rendering logic', () => {
 describe('isPositionActive for dashboard operations panel', () => {
   it('only Armed, Entering, Active are active', () => {
     expect(isPositionActive('Armed')).toBe(true);
+    expect(isPositionActive('Active')).toBe(true);
     expect(isPositionActive({ Entering: { entry_order_id: 'x', expected_entry: 1, signal_id: 'x' } })).toBe(true);
     expect(isPositionActive({ Active: { current_price: 1, trailing_stop: 1, favorable_extreme: 1, extreme_at: '', insurance_stop_id: null, last_emitted_stop: null } })).toBe(true);
     expect(isPositionActive({ Exiting: { exit_order_id: 'x', exit_reason: 'x' } })).toBe(false);

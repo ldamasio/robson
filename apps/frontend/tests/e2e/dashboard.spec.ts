@@ -13,7 +13,7 @@ const STATUS_OK = {
 };
 
 test.describe('Dashboard', () => {
-  test('data state: 6 slots, 2 occupied, correct status strip', async ({ page }) => {
+  test('data state: 4 slots, 2 occupied, correct status strip', async ({ page }) => {
     await installMockEventSource(page);
     await page.route('**/status', (route) =>
       route.fulfill({
@@ -33,9 +33,9 @@ test.describe('Dashboard', () => {
     await authAndGoto(page, '/dashboard');
 
     await expect(page.locator('.dashboard')).toBeVisible({ timeout: 10_000 });
-    await expect(page.locator('.slot')).toHaveCount(6);
+    await expect(page.locator('.slot')).toHaveCount(4);
     await expect(page.locator('.slot.occupied')).toHaveCount(2);
-    await expect(page.locator('.status-strip')).toContainText('SLOT 2/6');
+    await expect(page.locator('.status-strip')).toContainText('SLOT 2/4');
     await expect(page.locator('.op-card-link')).toHaveCount(2);
     await expect(page.locator('.eyebrow', { hasText: "TODAY'S EVENTS" })).toBeVisible();
     await expect(page.locator('.tick-ruler')).toBeVisible();

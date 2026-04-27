@@ -36,6 +36,7 @@ use robson_store::{
     DetectedPositionRepository, MemoryDetectedPositionRepository, MemoryStore, PositionRepository,
     Store, StoreError,
 };
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 #[cfg(feature = "postgres")]
 use sqlx::Row;
@@ -144,6 +145,10 @@ impl<S: Store + 'static> PositionRepository for StorePositionRepositoryAdapter<S
     ) -> Result<Vec<Position>, StoreError> {
         self.store.positions().find_closed_in_month(year, month).await
     }
+
+    async fn find_all_closed(&self) -> Result<Vec<Position>, StoreError> {
+        self.store.positions().find_all_closed().await
+    }
 }
 
 impl Daemon<StubExchange, MemoryStore> {
@@ -158,6 +163,43 @@ impl Daemon<StubExchange, MemoryStore> {
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder = default_query_recorder();
         let risk_config = RiskConfig::new(dec!(10000)).unwrap();
+        let engine = Engine::new(risk_config);
+        let trading_policy = TradingPolicy::default();
+
+        let position_manager = Arc::new(RwLock::new(PositionManager::new(
+            engine,
+            executor,
+            store.clone(),
+            event_bus.clone(),
+            query_recorder,
+            trading_policy,
+        )));
+
+        Self {
+            config,
+            exchange,
+            position_manager,
+            event_bus,
+            store,
+            #[cfg(feature = "postgres")]
+            projection_recovery: None,
+            #[cfg(feature = "postgres")]
+            pg_pool: None,
+            last_month_check: initial_month_check(),
+        }
+    }
+
+    /// Create a stub daemon with a specific capital for position sizing tests.
+    pub fn new_stub_with_capital(config: Config, capital: Decimal) -> Self {
+        use robson_domain::RiskConfig;
+
+        let exchange = Arc::new(StubExchange::with_balance(dec!(95000), capital));
+        let journal = Arc::new(IntentJournal::new());
+        let store = Arc::new(MemoryStore::new());
+        let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
+        let event_bus = Arc::new(EventBus::new(1000));
+        let query_recorder = default_query_recorder();
+        let risk_config = RiskConfig::new(capital).unwrap();
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
@@ -252,7 +294,8 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
         let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder = default_query_recorder();
-        let risk_config = RiskConfig::new(dec!(10000)).unwrap();
+        // Placeholder capital; will be updated from exchange in run().
+        let risk_config = RiskConfig::new(dec!(1)).unwrap();
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
@@ -311,7 +354,8 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
             } else {
                 default_query_recorder()
             };
-        let risk_config = RiskConfig::new(dec!(10000)).unwrap();
+        // Placeholder capital; will be updated from exchange in run().
+        let risk_config = RiskConfig::new(dec!(1)).unwrap();
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
@@ -372,6 +416,39 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         &self.store
     }
 
+    /// Initialize engine capital from the exchange balance.
+    ///
+    /// Queries the exchange for the USDT-M futures wallet balance and updates
+    /// the engine's risk config. This ensures the engine uses real capital for
+    /// position sizing rather than the constructor placeholder.
+    ///
+    /// Best-effort: logs a warning on failure and continues with the
+    /// placeholder so the daemon can still start during exchange outages.
+    async fn initialize_capital(&self) {
+        match self.exchange.get_futures_balance().await {
+            Ok(balance) => {
+                let capital = balance.wallet_balance;
+                if capital <= rust_decimal::Decimal::ZERO {
+                    warn!(
+                        %capital,
+                        "Exchange reports zero or negative wallet balance — keeping placeholder capital"
+                    );
+                    return;
+                }
+                let manager = self.position_manager.read().await;
+                manager.update_engine_capital(capital);
+                info!(%capital, "Engine capital initialized from exchange balance");
+            },
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to query exchange balance — keeping placeholder capital. \
+                     Position sizing may be incorrect until the first arm request."
+                );
+            },
+        }
+    }
+
     /// Run the daemon.
     ///
     /// This method blocks until shutdown is requested (SIGINT/SIGTERM).
@@ -386,14 +463,17 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         let shutdown = tokio_util::sync::CancellationToken::new();
         let shutdown_sig = shutdown.clone();
 
-        // 0. Rebuild store from event log (crash recovery)
+        // 0. Initialize capital from exchange (best-effort)
+        self.initialize_capital().await;
+
+        // 1. Rebuild store from event log (crash recovery)
         self.rebuild_store().await?;
 
-        // 1. Invalidate durable query approvals that cannot be rehydrated safely.
+        // 2. Invalidate durable query approvals that cannot be rehydrated safely.
         #[cfg(feature = "postgres")]
         self.invalidate_restart_pending_queries().await?;
 
-        // 2. Restore active positions
+        // 3. Restore active positions
         self.restore_positions().await?;
 
         let reconciliation_interval = Duration::from_secs(self.config.reconciliation.interval_secs);
@@ -414,16 +494,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         }
         info!("Startup reconciliation clean (0 UNTRACKED)");
 
-        // 3. Initialize safety net monitor (when configured with Binance credentials)
+        // 4. Initialize safety net monitor (when configured with Binance credentials)
         let position_monitor = self.initialize_position_monitor().await?;
         let position_monitor_handle =
             position_monitor.as_ref().map(|monitor| Arc::clone(monitor).start());
 
-        // 4. Start API server
+        // 5. Start API server
         let api_addr = self.start_api_server(position_monitor.clone()).await?;
         info!(%api_addr, "API server started");
 
-        // 5. Spawn reconciliation worker
+        // 6. Spawn reconciliation worker
         let reconciliation_worker = ReconciliationWorker::new(
             Arc::clone(&self.exchange),
             Arc::clone(&self.store),
@@ -437,7 +517,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             }
         });
 
-        // 6. Spawn WebSocket clients (Phase 6: Market Data)
+        // 7. Spawn WebSocket clients (Phase 6: Market Data)
         let ws_use_testnet =
             std::env::var("ROBSON_BINANCE_USE_TESTNET").unwrap_or_default() == "true";
         let market_data_manager =
@@ -452,7 +532,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             info!(symbol = %symbol_str, "WebSocket client spawned");
         }
 
-        // 7. Spawn projection worker (if pg_pool configured)
+        // 8. Spawn projection worker (if pg_pool configured)
         #[cfg(feature = "postgres")]
         let projection_handle = if let (Some(pool), Some(tenant_id)) =
             (&self.pg_pool, self.config.projection.tenant_id)
@@ -480,10 +560,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         #[cfg(not(feature = "postgres"))]
         let projection_handle: Option<tokio::task::JoinHandle<()>> = None;
 
-        // 8. Subscribe to event bus
+        // 9. Subscribe to event bus
         let mut event_receiver = self.event_bus.subscribe();
 
-        // 9. Spawn ctrl+c handler
+        // 10. Spawn ctrl+c handler
         let ctrl_c_shutdown = shutdown.clone();
         tokio::spawn(async move {
             if let Err(_) = tokio::signal::ctrl_c().await {
@@ -497,7 +577,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             tokio::time::interval(tokio::time::Duration::from_secs(60));
         month_boundary_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // 10. Main event loop
+        // 11. Main event loop
         info!("Entering main event loop");
         loop {
             tokio::select! {
@@ -530,7 +610,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             }
         }
 
-        // 11. Graceful shutdown
+        // 12. Graceful shutdown
         shutdown_sig.cancel(); // Ensure any remaining tasks are cancelled
 
         info!("Waiting for reconciliation worker to finish...");
@@ -606,9 +686,22 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
 
         let open_positions = self.store.positions().find_risk_open().await?;
         let carried_risk = Self::calculate_carried_risk(&open_positions);
-        let current_equity = {
-            let manager = self.position_manager.read().await;
-            manager.configured_capital()
+
+        // current_equity per ADR-0024 §6: wallet balance from the exchange.
+        // The capital_base is pessimistic: it subtracts carried_risk (worst case
+        // loss from inherited positions) from current_equity. This guarantees
+        // every month starts with 4 available slots.
+        let current_equity = match self.exchange.get_futures_balance().await {
+            Ok(balance) => balance.wallet_balance,
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    "Failed to query exchange balance for month boundary — \
+                     falling back to local equity estimate"
+                );
+                let manager = self.position_manager.read().await;
+                manager.compute_current_equity().await?
+            },
         };
         let capital_base = (current_equity - carried_risk).max(rust_decimal::Decimal::ZERO);
 

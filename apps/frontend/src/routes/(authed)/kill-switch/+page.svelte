@@ -6,6 +6,7 @@
   import { haltStatus } from '$stores/slots';
   import { _ } from 'svelte-i18n';
   import { positionLabel, positionStateLabel } from '$lib/presentation/labels';
+  import { INITIAL_MONTHLY_SLOT_BUDGET } from '$lib/config/slots';
 
   type PageState = 'loading' | 'active' | 'halted' | 'error';
 
@@ -112,7 +113,7 @@
           <div class="eyebrow">{$_('killSwitch.currentState')}</div>
           <div class="state-line">
             <span class="dot live"></span>
-            ACTIVE · {$_('killSwitch.slotLabel')} {activeCount}/6 · {activeCount} {activeCount === 1 ? ($_('killSwitch.openPositions_one') ?? 'OPEN POSITION') : ($_('killSwitch.openPositions_other') ?? 'OPEN POSITIONS')}
+            ACTIVE · {$_('killSwitch.slotLabel')} {activeCount}/{Math.max(INITIAL_MONTHLY_SLOT_BUDGET, activeCount)} · {activeCount} {activeCount === 1 ? ($_('killSwitch.openPositions_one') ?? 'OPEN POSITION') : ($_('killSwitch.openPositions_other') ?? 'OPEN POSITIONS')}
           </div>
         </div>
 

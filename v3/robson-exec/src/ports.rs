@@ -15,6 +15,15 @@ use crate::error::ExecError;
 // Exchange Port
 // =============================================================================
 
+/// Futures account balance snapshot from the exchange.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FuturesBalance {
+    /// Total wallet balance (includes unrealized PnL).
+    pub wallet_balance: Decimal,
+    /// Balance available for new positions (excludes margin on open positions).
+    pub available_balance: Decimal,
+}
+
 /// Port for exchange operations (placing/canceling orders).
 ///
 /// Implementations:
@@ -88,6 +97,13 @@ pub trait ExchangePort: Send + Sync {
 
     /// Check if exchange is healthy/connected.
     async fn health_check(&self) -> Result<(), ExecError>;
+
+    /// Query the USDT-M futures account balance.
+    ///
+    /// Returns wallet balance (total equity including unrealized PnL) and
+    /// available balance (free for new positions). Used for capital base
+    /// derivation per ADR-0024 §6.
+    async fn get_futures_balance(&self) -> Result<FuturesBalance, ExecError>;
 
     /// Query every currently open exchange position.
     ///

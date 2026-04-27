@@ -55,6 +55,7 @@
     "eventStreamLabel": "FLUXO DE EVENTOS",
     "sessionOnly": "Apenas eventos desta sessão. Histórico completo em FE-P2.",
     "noEvents": "Nenhum evento recebido ainda para esta posição.",
+    "armedDescription": "aguardando sinal de entrada · crossover SMA",
     "loading": "CARREGANDO...",
     "loadError": "ERRO DE CARREGAMENTO",
     "retry": "Tentar novamente"

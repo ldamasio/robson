@@ -21,6 +21,8 @@ use std::net::SocketAddr;
 
 use reqwest::Client;
 use robsond::{api, Config, Daemon};
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use serde_json::{json, Value};
 use uuid::Uuid;
 
@@ -32,8 +34,14 @@ use uuid::Uuid;
 ///
 /// The server binds to port 0 (OS-assigned) so tests never conflict.
 async fn start_test_server() -> (String, SocketAddr) {
+    start_test_server_with_capital(dec!(10000)).await
+}
+
+/// Spin up a stub daemon with a specific capital for tests that need small
+/// position sizing (e.g., exchange minimum quantity rejection).
+async fn start_test_server_with_capital(capital_base: Decimal) -> (String, SocketAddr) {
     let config = Config::test();
-    let daemon = Daemon::new_stub(config);
+    let daemon = Daemon::new_stub_with_capital(config, capital_base);
     let addr = daemon.start_api_server(None).await.expect("failed to start test server");
     let base_url = format!("http://{}", addr);
     (base_url, addr)
@@ -372,10 +380,10 @@ async fn test_arm_invalid_symbol_returns_400() {
 async fn test_arm_missing_required_field_returns_422() {
     let (base, _) = start_test_server().await;
 
-    // Missing capital
+    // Missing symbol (required field)
     let resp = client()
         .post(format!("{}/positions", base))
-        .json(&json!({ "symbol": "BTCUSDT", "side": "LONG" }))
+        .json(&json!({ "side": "LONG" }))
         .send()
         .await
         .unwrap();
@@ -413,8 +421,8 @@ async fn test_signal_on_armed_position_is_accepted() {
 
 #[tokio::test]
 async fn test_signal_rejects_quantity_below_exchange_minimum() {
-    let (base, _) = start_test_server().await;
-    let arm = arm_btcusdt_with_capital(&base, "100").await;
+    let (base, _) = start_test_server_with_capital(dec!(100)).await;
+    let arm = arm_btcusdt(&base).await;
 
     let resp = client()
         .post(format!("{}/positions/{}/signal", base, arm.position_id))

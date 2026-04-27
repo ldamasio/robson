@@ -47,7 +47,7 @@ pub use error::{ExecError, ExecResult};
 pub use executor::{ActionResult, Executor};
 pub use intent::{Intent, IntentAction, IntentJournal, IntentResult, IntentStatus};
 pub use ports::{
-    CandleInterval, ExchangePort, ExchangePosition, FuturesSettings, MarketDataPort, OhlcvPort,
-    OrderResult, PriceUpdate,
+    CandleInterval, ExchangePort, ExchangePosition, FuturesBalance, FuturesSettings,
+    MarketDataPort, OhlcvPort, OrderResult, PriceUpdate,
 };
 pub use stub::{StubExchange, StubMarketData, StubOhlcv};

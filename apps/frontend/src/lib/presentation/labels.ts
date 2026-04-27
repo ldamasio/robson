@@ -22,32 +22,37 @@ export function positionSummaryLines(p: Position): string[] {
 
   if (typeof state === 'string') {
     if (state === 'Armed') {
-      lines.push(label('ARMED', 'awaiting entry signal'));
+      lines.push(label('ARMED', 'awaiting entry signal · SMA crossover'));
+      lines.push(label('LEVERAGE', '10x (fixed)'));
+    } else if (state === 'Active') {
+      const details = [];
+      if (p.entry_price != null) details.push(`entry ${fmtNum(p.entry_price)}`);
+      if (p.trailing_stop != null) details.push(`stop ${fmtNum(p.trailing_stop)}`);
+      lines.push(label('ACTIVE', details.join(' · ') || 'position open'));
     }
-    return lines;
-  }
+  } else {
+    const key = Object.keys(state)[0];
+    const val = (state as Record<string, Record<string, unknown>>)[key];
 
-  const key = Object.keys(state)[0];
-  const val = (state as Record<string, Record<string, unknown>>)[key];
-
-  if (key === 'Entering' && val) {
-    lines.push(label('ENTERING', `expected entry ${fmtNum(val.expected_entry as number)}`));
-  } else if (key === 'Active' && val) {
-    lines.push(label('ACTIVE', `price ${fmtNum(val.current_price as number)} · stop ${fmtNum(val.trailing_stop as number)}`));
-    if (val.favorable_extreme) lines.push(label('EXTREME', fmtNum(val.favorable_extreme as number)));
-  } else if (key === 'Exiting' && val) {
-    lines.push(label('EXITING', `${val.exit_reason}`));
-  } else if (key === 'Closed' && val) {
-    lines.push(label('CLOSED', `exit ${fmtNum(val.exit_price as number)} · reason ${val.exit_reason}`));
-    lines.push(label('PnL', `${fmtPnl(val.realized_pnl as number)}%`));
-  } else if (key === 'Error' && val) {
-    lines.push(label('ERROR', `${val.error}`));
+    if (key === 'Entering' && val) {
+      lines.push(label('ENTERING', `expected entry ${fmtNum(val.expected_entry as number)}`));
+    } else if (key === 'Active' && val) {
+      lines.push(label('ACTIVE', `price ${fmtNum(val.current_price as number)} · stop ${fmtNum(val.trailing_stop as number)}`));
+      if (val.favorable_extreme) lines.push(label('EXTREME', fmtNum(val.favorable_extreme as number)));
+    } else if (key === 'Exiting' && val) {
+      lines.push(label('EXITING', `${val.exit_reason}`));
+    } else if (key === 'Closed' && val) {
+      lines.push(label('CLOSED', `exit ${fmtNum(val.exit_price as number)} · reason ${val.exit_reason}`));
+      lines.push(label('PnL', `${fmtPnl(val.realized_pnl as number)}%`));
+    } else if (key === 'Error' && val) {
+      lines.push(label('ERROR', `${val.error}`));
+    }
   }
 
   if (p.entry_price != null) {
     lines.push(label('ENTRY', fmtNum(p.entry_price)));
   }
-  if (p.quantity > 0) {
+  if (p.quantity != null && p.quantity > 0) {
     lines.push(label('SIZE', String(p.quantity)));
   }
 
@@ -56,8 +61,8 @@ export function positionSummaryLines(p: Position): string[] {
 
 export function positionMetaLine(p: Position): string {
   const state = positionStateLabel(p.state);
-  const created = formatDateUtc(p.created_at);
-  const parts = [`State ${state}`, `Created ${created}`];
+  const parts = [`State ${state}`];
+  if (p.created_at) parts.push(`Created ${formatDateUtc(p.created_at)}`);
   if (p.closed_at) parts.push(`Closed ${formatDateUtc(p.closed_at)}`);
   return parts.join(' · ');
 }
@@ -90,7 +95,7 @@ export function eventTypeLabel(event: SseEvent): string {
 }
 
 export function isPositionActive(state: PositionState): boolean {
-  if (state === 'Armed') return true;
+  if (state === 'Armed' || state === 'Entering' || state === 'Active') return true;
   if (typeof state === 'object') {
     const key = Object.keys(state)[0];
     return key === 'Entering' || key === 'Active';
@@ -108,7 +113,9 @@ function fmtPnl(n: number): string {
 }
 
 function formatDateUtc(iso: string): string {
+  if (!iso) return '--';
   const d = new Date(iso);
+  if (isNaN(d.getTime())) return '--';
   return `${d.getUTCFullYear()}-${pad(d.getUTCMonth() + 1)}-${pad(d.getUTCDate())} ${pad(d.getUTCHours())}:${pad(d.getUTCMinutes())}:${pad(d.getUTCSeconds())} UTC`;
 }
 

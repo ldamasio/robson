@@ -73,6 +73,10 @@ pub struct ProjectionConfig {
 ///
 /// Note: risk per trade is NOT configurable — it is fixed at 1% by v3 policy.
 /// See `RiskConfig::RISK_PER_TRADE_PCT` in robson-domain.
+///
+/// Capital is NOT configured here — it is derived from the exchange balance
+/// at startup and from `monthly_state` after the first month boundary.
+/// See ADR-0024 §6.
 #[derive(Debug, Clone)]
 pub struct EngineConfig {
     /// Minimum tech stop distance (0.001 = 0.1%)
@@ -266,6 +270,7 @@ impl Config {
 
     fn load_engine_config() -> DaemonResult<EngineConfig> {
         // Note: risk per trade is NOT loaded from env — fixed at 1% by v3 policy.
+        // Capital is NOT loaded from env — derived from exchange balance.
         let min_tech_stop = Self::load_decimal_env(
             "ROBSON_MIN_TECH_STOP_PERCENT",
             Decimal::new(1, 3), // 0.1%

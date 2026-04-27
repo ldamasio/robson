@@ -1,7 +1,7 @@
 import type { PositionState } from '$api/robson';
 import { isPositionActive } from '$lib/presentation/labels';
 
-export const SLOT_COUNT = 6;
+export const INITIAL_MONTHLY_SLOT_BUDGET = 4;
 
 export type SlotCell = {
   index: number;
@@ -12,8 +12,10 @@ export type SlotCell = {
 
 export function deriveSlots(positions: { id: string; state: PositionState }[]): SlotCell[] {
   const active = positions.filter((p) => isPositionActive(p.state));
+  const count = Math.max(INITIAL_MONTHLY_SLOT_BUDGET, active.length);
   const cells: SlotCell[] = [];
-  for (let i = 0; i < SLOT_COUNT; i++) {
+  
+  for (let i = 0; i < count; i++) {
     const pos = active[i];
     cells.push({
       index: i,
