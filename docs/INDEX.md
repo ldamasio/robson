@@ -1,62 +1,59 @@
-# Robson Bot Documentation Index
+# Robson Documentation Index
 
-**Central navigation hub for all Robson Bot documentation.**
+Central navigation hub for all Robson documentation.
 
 ---
 
-## 🚀 Quick Start
+## Quick Start
 
 **New to Robson v3?** Start here:
 
 1. **[README.md](../README.md)** - Project overview and installation
-2. **[onboarding/DEVELOPER-QUICKSTART.md](onboarding/DEVELOPER-QUICKSTART.md)** - Clone → first PR (current)
+2. **[onboarding/DEVELOPER-QUICKSTART.md](onboarding/DEVELOPER-QUICKSTART.md)** - Clone to first PR
 3. **[architecture/v3-runtime-spec.md](architecture/v3-runtime-spec.md)** - Robsond runtime architecture
 4. **[../AGENTS.md](../AGENTS.md)** - Repository-wide rules (canonical)
 
-> **Note:** `DEVELOPER.md` and `AUTH_FLOW.md` describe the v1 Django
-> stack and are kept only for historical reference. Robson v3 is the
-> canonical version (Rust runtime + SvelteKit frontend).
-
 **For AI Agents?** Start here:
 
-1. **[AGENTS.md](AGENTS.md)** - Comprehensive guide for AI-assisted development
-2. **[SKILL.md](SKILL.md)** - AI Skills Framework and prompt engineering guide
-3. **[AI-MEMORY-DB.md](AI-MEMORY-DB.md)** - Runtime knowledge store (learns from PRs)
-4. **[../CLAUDE.md](../CLAUDE.md)** - Claude Code specific context
-5. **[AI_WORKFLOW.md](AI_WORKFLOW.md)** - AI collaboration guidelines
+1. **[../AGENTS.md](../AGENTS.md)** - Repository-wide AI instructions (canonical)
+2. **[../CLAUDE.md](../CLAUDE.md)** - Claude Code adapter
+3. **[AI_WORKFLOW.md](AI_WORKFLOW.md)** - AI collaboration guidelines
 
 ---
 
-## 📚 Documentation Structure
+## Documentation Structure
 
 ```
 docs/
 ├── INDEX.md (you are here)          # Central navigation hub
-├── ARCHITECTURE.md                  # High-level architecture overview
-├── DEVELOPER.md                     # Developer workflow and practices
+├── ARCHITECTURE.md                  # Architecture overview (legacy + v3)
+├── DEVELOPER.md                     # v1 developer guide (archived)
 ├── AI_WORKFLOW.md                   # AI collaboration guidelines
-├── AGENTS.md                        # Comprehensive AI agent guide
-├── SKILL.md                         # AI Skills Framework (prompt engineering)
-├── AI-MEMORY-DB.md                  # Runtime knowledge store (learns from PRs)
-├── AUTH_FLOW.md                     # Authentication flow documentation
-├── CONTRIBUTING-ADAPTERS.md         # Adapter development guide
-├── STYLE_GUIDE.md                   # Code style conventions
+├── AGENTIC-TRADING.md               # Trading/agentic lifecycle philosophy
 ├── LANGUAGE-POLICY.md               # English-only policy and rationale
+├── STYLE_GUIDE.md                   # Code style conventions (Python-era)
 ├── ADRs.md                          # Architecture Decision Records index
 ├── adr/                             # Architecture Decision Records
 │   ├── ADR-TEMPLATE.md
-│   ├── ADR-0001 to ADR-0023
+│   ├── ADR-0001 to ADR-0034
 ├── policies/                        # Organizational policies
 │   ├── PRODUCTION-DEPLOYMENT.md     # Production deployment integrity policy
 │   ├── UNTRACKED-POSITION-RECONCILIATION.md  # Robson-authored position invariant (ADR-0022)
 │   └── SYMBOL-AGNOSTIC-POLICIES.md  # Policies apply to every trading pair (ADR-0023)
-├── ai-first/                        # AI-First transformation docs
-│   ├── ARCHITECTURE.md
-│   ├── DEEPSEEK_GATEWAY.md
-│   ├── INGESTION_EVENTS.md
-│   └── SQL_SCHEMA.md
+├── architecture/                    # Architecture documents
+│   ├── v3-migration-plan.md         # v2.5 → v3 migration plan
+│   ├── v3-runtime-spec.md           # v3 runtime specification
+│   ├── v3-query-query-engine.md     # Query engine design
+│   ├── v3-control-loop.md           # Control loop specification
+│   ├── v3-architectural-decisions.md # Architectural decisions log
+│   ├── v3-risk-engine-spec.md       # Risk engine specification
+│   ├── v3-tron-evaluation.md        # TRON/TRC-20 evaluation
+│   ├── INSTITUTIONAL_READINESS_REPORT_v2.md  # v2 institutional readiness snapshot
+│   ├── OPERATION-LIFECYCLE.md        # Operation status state machine
+│   ├── TRANSACTION-HIERARCHY.md      # Strategy → Operation → Movement hierarchy
+│   └── README.md
 ├── quality/                         # Code quality tooling
-│   ├── README.md                    # Quality guide (pre-commit, SonarLint, SonarQube)
+│   ├── README.md                    # Quality guide (pre-commit, SonarLint)
 │   └── sonarlint.md                 # SonarLint IDE setup
 ├── specs/                           # Specifications (TDD/BDD)
 │   ├── README.md
@@ -66,47 +63,85 @@ docs/
 │   └── robson-*-requirements.md
 ├── runbooks/                        # Operational procedures
 │   ├── README.md
+│   ├── val-001-testnet-e2e-validation.md  # VAL-001 E2E testnet validation
+│   ├── val-002-real-capital-activation.md  # VAL-002 real capital activation
 │   ├── argocd-initial-setup.md
 │   ├── ci-cd-image-tagging.md
-│   └── deployment-checklist.md
+│   ├── deployment-checklist.md
+│   ├── deep-storage.md
+│   ├── frontend-deploy.md
+│   ├── FRONTEND-NGINX-TROUBLESHOOTING.md
+│   └── rabbitmq-operations.md
+├── implementation/                  # Implementation closeouts
+│   ├── 2026-04-27-mig-v3-12-monthly-state-persistence.md
+│   ├── AGENTIC-WORKFLOW-FRONTEND-IMPLEMENTATION.md
+│   ├── FE-P1-FRONTEND-MVP.md
+│   ├── GATE-4-OPERATION-CREATION.md
+│   └── entry-policy-strategy-engine.md
 ├── infra/                           # Infrastructure documentation
 │   └── K3S-CLUSTER-GUIDE.md         # k3s cluster deployment guide
+├── k8s/frontend/                    # Frontend K8s manifests
+├── ops/                             # Operations documentation
+│   ├── GITOPS-GUIDE.md
+│   ├── OBSERVABILITY-HARDENED.md
+│   └── POST-MORTEM-2025-12-31-probe-redirect.md
+├── agents/                          # Agent session closeouts
+├── analysis/                        # Analysis documents
+├── audits/                          # Audit reports
+├── entry-gate/                      # Entry gate session logs
+├── history/                         # Legacy/archived docs
+│   ├── AI_FIRST_TRANSFORMATION.md
+│   ├── MIGRATION_PLAN.md
+│   └── monolith/MIGRATION_GUIDE.md
+├── operations/                      # Production operation logs
 ├── plan/                            # Planning documents
-│   ├── infra/                       # Infrastructure deployment plans
-│   └── prompts/                     # AI prompts for implementation
-├── FEATURES/                        # Feature documentation
-│   └── trading-thesis.md            # Trading Thesis feature (v1 Chat)
-└── history/                         # Legacy/archived docs
-    ├── 2024-12-deployment/          # December 2024 deployment archive
-    └── monolith/
+│   ├── README.md
+│   └── infra/README.md
+├── sessions/                        # Session closeout notes
+├── specs/                           # Feature specifications
+├── strategy/                        # Strategy documentation
+│   ├── HAND_SPAN_TRAILING_STOP.md
+│   ├── IRON_EXIT_PROTOCOL.md
+│   └── IMPLEMENTATION_SUMMARY.md (archived to archive/)
+├── onboarding/                      # Onboarding guides
+│   └── DEVELOPER-QUICKSTART.md
+└── archive/                         # Archived (superseded) docs
+    ├── ai-first/                    # ParadeDB/DeepSeek RAG (never built for v3)
+    ├── strategy/                    # Django pattern engine implementations
+    ├── guides/                      # Django migration guides
+    ├── market-context/              # Django market research
+    ├── plan/                        # Django-era planning docs and prompts
+    ├── testing/                     # Django-era test plans
+    ├── ops/                         # Portuguese Django observability
+    ├── features/                    # Django v1 features
+    └── ...                          # Individual archived files
 ```
 
 ---
 
-## 👥 Documentation by Role
+## Documentation by Role
 
-### For **Developers**
+### For Developers
 
 **Getting Started**:
-- [Developer Workflow](DEVELOPER.md) - Day-to-day development practices
+- [Developer Quickstart](onboarding/DEVELOPER-QUICKSTART.md) - Current onboarding
 - [Code Style Guide](STYLE_GUIDE.md) - Coding conventions
 - [Language Policy](LANGUAGE-POLICY.md) - English-only requirement
-- [Quality Tooling](quality/README.md) - Pre-commit, SonarLint, SonarQube
+- [Quality Tooling](quality/README.md) - Pre-commit, SonarLint
 
 **Architecture**:
-- [System Architecture](ARCHITECTURE.md) - Hexagonal architecture overview
+- [System Architecture](ARCHITECTURE.md) - Architecture overview
 - [ADRs Index](ADRs.md) - All architectural decisions
 
 **Contributing**:
 - [CONTRIBUTING.md](../CONTRIBUTING.md) - Contribution guidelines
-- [Adapter Development](CONTRIBUTING-ADAPTERS.md) - Building adapters
 
-### For **Operations / SRE**
+### For Operations / SRE
 
 **Policies** (READ FIRST):
-- [Production Deployment Policy](policies/PRODUCTION-DEPLOYMENT.md) - **CRITICAL**: GitOps-only deployments
-- [Untracked Position Reconciliation](policies/UNTRACKED-POSITION-RECONCILIATION.md) - **CRITICAL**: every open position must be Robson-authored (ADR-0022)
-- [Symbol-Agnostic Policies](policies/SYMBOL-AGNOSTIC-POLICIES.md) - rules apply to every trading pair (ADR-0023)
+- [Production Deployment Policy](policies/PRODUCTION-DEPLOYMENT.md) - GitOps-only deployments
+- [Untracked Position Reconciliation](policies/UNTRACKED-POSITION-RECONCILIATION.md) - ADR-0022
+- [Symbol-Agnostic Policies](policies/SYMBOL-AGNOSTIC-POLICIES.md) - ADR-0023
 
 **Deployment**:
 - [K3s Cluster Guide](infra/K3S-CLUSTER-GUIDE.md) - k3s deployment guide
@@ -117,12 +152,11 @@ docs/
 **Infrastructure**:
 - [ADR-0011: GitOps Auto-Deploy](adr/ADR-0011-gitops-automatic-manifest-updates.md)
 
-### For **AI Agents**
+### For AI Agents
 
 **Start Here**:
-- **[AGENTS.md](AGENTS.md)** - Comprehensive guide for AI-assisted development
-- **[SKILL.md](SKILL.md)** - AI Skills Framework and prompt engineering
-- **[AI-MEMORY-DB.md](AI-MEMORY-DB.md)** - Runtime knowledge store (learns from PRs)
+- **[../AGENTS.md](../AGENTS.md)** - Repository-wide AI instructions (canonical)
+- **[../CLAUDE.md](../CLAUDE.md)** - Claude Code adapter
 - [AI Workflow](AI_WORKFLOW.md) - Collaboration guidelines
 - [Language Policy](LANGUAGE-POLICY.md) - English-only requirement
 
@@ -131,33 +165,15 @@ docs/
 - [ADRs Index](ADRs.md) - All architectural decisions
 - [Specs](specs/README.md) - Feature specifications
 
-**Tool-Specific**:
-- [../CLAUDE.md](../CLAUDE.md) - Claude Code integration
-- [../.cursorrules](../.cursorrules) - Cursor AI rules
-
-### For **Traders / Users**
+### For Traders / Users
 
 **Getting Started**:
-- **[Strategies Guide](STRATEGIES.md)** - Pre-built trading strategies (All In, Rescue Forces, etc.)
 - [Position Sizing Golden Rule](requirements/POSITION-SIZING-GOLDEN-RULE.md) - How position sizes are calculated
-- [Technical Stop Documentation](requirements/TECHNICAL-STOP.md) - Understanding technical stop-loss
-
-**Trading**:
-- [Risk Management](RISK-MANAGEMENT.md) - Risk controls and limits
-- [Pattern Detection](PATTERN-DETECTION.md) - Automated pattern recognition
-
-### For **Product / Business**
-
-**Overview**:
-- [Project README](../README.md) - What is Robson Bot?
-- [Requirements](requirements/README.md) - Business requirements
-
-**API**:
-- [API Documentation](specs/api/openapi.yaml) - API capabilities
+- [Technical Stop Documentation](requirements/technical-stop-requirements.md) - Technical stop-loss
 
 ---
 
-## 🔍 Documentation by Topic
+## Documentation by Topic
 
 ### Architecture
 
@@ -168,38 +184,14 @@ docs/
 | **Robson v3 Runtime** | [architecture/v3-runtime-spec.md](architecture/v3-runtime-spec.md) |
 | **Robson v3 Risk Engine** | [architecture/v3-risk-engine-spec.md](architecture/v3-risk-engine-spec.md) |
 | **Hexagonal Architecture** | [ADR-0002](adr/ADR-0002-hexagonal-architecture.md) |
-| **AI-First Architecture** | [ai-first/ARCHITECTURE.md](ai-first/ARCHITECTURE.md) |
-| **ParadeDB Database** | [ADR-0007](adr/ADR-0007-paradedb-primary-database.md) |
 | **Transaction Hierarchy** | [architecture/TRANSACTION-HIERARCHY.md](architecture/TRANSACTION-HIERARCHY.md) |
 | **GitOps Auto-Deploy** | [ADR-0011](adr/ADR-0011-gitops-automatic-manifest-updates.md) |
 | **Production Integrity** | [ADR-0029](adr/ADR-0029-production-deployment-integrity.md) |
 | **Opportunity Detection vs Technical Stop** | [ADR-0021](adr/ADR-0021-opportunity-detection-vs-technical-stop-analysis.md) |
 | **Robson-Authored Position Invariant** | [ADR-0022](adr/ADR-0022-robson-authored-position-invariant.md) |
 | **Symbol-Agnostic Policy Invariant** | [ADR-0023](adr/ADR-0023-symbol-agnostic-policy-invariant.md) |
-
-### Development
-
-| Topic | Document |
-|-------|----------|
-| **Developer Workflow** | [DEVELOPER.md](DEVELOPER.md) |
-| **Code Style** | [STYLE_GUIDE.md](STYLE_GUIDE.md) |
-| **Contributing** | [../CONTRIBUTING.md](../CONTRIBUTING.md) |
-| **Adapter Development** | [CONTRIBUTING-ADAPTERS.md](CONTRIBUTING-ADAPTERS.md) |
-
-### Code Quality
-
-| Topic | Document |
-|-------|----------|
-| **Quality Tooling Overview** | [quality/README.md](quality/README.md) |
-| **Pre-commit Hooks** | [.pre-commit-config.yaml](../.pre-commit-config.yaml) |
-| **SonarLint (IDE)** | [quality/sonarlint.md](quality/sonarlint.md) |
-| **SonarQube (CI)** | [sonar-project.properties](../sonar-project.properties) |
-
-### Strategies
-
-| Topic | Document |
-|-------|----------|
-| **Iron Exit Protocol** | [strategy/IRON_EXIT_PROTOCOL.md](strategy/IRON_EXIT_PROTOCOL.md) |
+| **Institutional Readiness (v2)** | [architecture/INSTITUTIONAL_READINESS_REPORT_v2.md](architecture/INSTITUTIONAL_READINESS_REPORT_v2.md) |
+| **TRON Evaluation** | [architecture/v3-tron-evaluation.md](architecture/v3-tron-evaluation.md) |
 
 ### Operations
 
@@ -209,9 +201,10 @@ docs/
 | **ArgoCD Setup** | [runbooks/argocd-initial-setup.md](runbooks/argocd-initial-setup.md) |
 | **CI/CD & Image Tagging** | [runbooks/ci-cd-image-tagging.md](runbooks/ci-cd-image-tagging.md) |
 | **Deployment Checklist** | [runbooks/deployment-checklist.md](runbooks/deployment-checklist.md) |
-| **Runbooks Overview** | [runbooks/README.md](runbooks/README.md) |
-| **First Leveraged Position** | [operations/2025-12-24-first-leveraged-position.md](operations/2025-12-24-first-leveraged-position.md) |
-| **Isolated Margin SHORT (BTCUSDC)** | [operations/2026-01-05-isolated-margin-short-btcusdc.md](operations/2026-01-05-isolated-margin-short-btcusdc.md) |
+| **VAL-001 Testnet E2E** | [runbooks/val-001-testnet-e2e-validation.md](runbooks/val-001-testnet-e2e-validation.md) |
+| **VAL-002 Real Capital** | [runbooks/val-002-real-capital-activation.md](runbooks/val-002-real-capital-activation.md) |
+| **GitOps Guide** | [ops/GITOPS-GUIDE.md](ops/GITOPS-GUIDE.md) |
+| **Observability Hardened** | [ops/OBSERVABILITY-HARDENED.md](ops/OBSERVABILITY-HARDENED.md) |
 
 ### API & Specs
 
@@ -232,90 +225,16 @@ docs/
 
 ---
 
-## 🤖 AI-First Documentation
+## Archive
 
-Robson Bot is optimized for AI-assisted development:
+Superseded documentation is moved to `docs/archive/`. These files are kept for historical reference only and should not be used for current development. Key archived collections:
 
-### Core AI Documents
-
-1. **[AGENTS.md](AGENTS.md)** - Master guide for all AI agents
-2. **[SKILL.md](SKILL.md)** - AI Skills Framework and prompt engineering
-3. **[AI-MEMORY-DB.md](AI-MEMORY-DB.md)** - Runtime knowledge store (learns from PRs)
-4. **[../CLAUDE.md](../CLAUDE.md)** - Claude Code specific context
-5. **[AI_WORKFLOW.md](AI_WORKFLOW.md)** - Collaboration rules
-6. **[LANGUAGE-POLICY.md](LANGUAGE-POLICY.md)** - Why English only
-
-### AI Tool Configuration
-
-- **Claude Code**: [../CLAUDE.md](../CLAUDE.md)
-- **Cursor AI**: [../.cursorrules](../.cursorrules)
+- `archive/ai-first/` — ParadeDB/DeepSeek RAG architecture (never built for v3)
+- `archive/plan/` — Django-era planning documents, prompts, and execution plans
+- `archive/strategy/` — Django pattern engine and trailing stop implementation summaries
+- `archive/guides/` — Django migration and event-sourcing guides
+- Individual archived files: `INITIAL-AUDIT.md`, `AUTH_FLOW.md`, `PRODUCTION_TRADING.md`, `STRATEGIES.md`, `STATIC-FILES-ARCHITECTURE.md`, etc.
 
 ---
 
-## 📖 Learning Paths
-
-### Path 1: New Backend Developer
-
-1. [Hexagonal Architecture](ARCHITECTURE.md)
-2. [ADR-0002: Hexagonal Architecture](adr/ADR-0002-hexagonal-architecture.md)
-3. [Adapter Development](CONTRIBUTING-ADAPTERS.md)
-4. [Code Style](STYLE_GUIDE.md)
-
-### Path 2: New Frontend Developer
-
-1. [Frontend README](../apps/frontend/README.md)
-2. [API Specs](specs/api/openapi.yaml)
-
-### Path 3: New DevOps Engineer
-
-1. [Production Deployment Policy](policies/PRODUCTION-DEPLOYMENT.md) ⚠️ **READ FIRST**
-2. [K3s Cluster Guide](infra/K3S-CLUSTER-GUIDE.md)
-3. [ADR-0011: GitOps Auto-Deploy](adr/ADR-0011-gitops-automatic-manifest-updates.md)
-4. [ArgoCD Setup](runbooks/argocd-initial-setup.md)
-5. [Deployment Checklist](runbooks/deployment-checklist.md)
-
-### Path 4: Understanding Architecture
-
-1. [System Architecture](ARCHITECTURE.md)
-2. [All ADRs](ADRs.md)
-3. [AI-First Architecture](ai-first/ARCHITECTURE.md)
-
----
-
-## 🔗 External Resources
-
-### Hexagonal Architecture
-- [Netflix - Ready for changes with Hexagonal Architecture](https://netflixtechblog.com/ready-for-changes-with-hexagonal-architecture-b315ec967749)
-
-### Django Best Practices
-- [Django REST Framework](https://www.django-rest-framework.org/)
-
-### Kubernetes
-- [Traefik Documentation](https://doc.traefik.io/traefik/)
-
-### GitOps
-- [ArgoCD Documentation](https://argo-cd.readthedocs.io/)
-
----
-
-## 📝 Documentation Standards
-
-### Markdown
-- Use GitHub Flavored Markdown
-- Use relative links for internal references
-- Include table of contents for long documents
-
-### Code Samples
-- Always include language identifier for syntax highlighting
-- Keep examples concise and focused
-
-### Cross-Linking
-- Link freely between related documents
-- Use relative paths, not absolute
-- Update INDEX.md when adding new docs
-
----
-
-**Last Updated**: 2026-04-18
-**Maintained by**: Robson Bot Core Team
-**License**: Same as project
+**Last Updated**: 2026-04-27
