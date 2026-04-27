@@ -25,13 +25,16 @@ pub use credentials::{
 pub use detected_position::{CalculatedStop, DetectedPosition, StopMethod};
 pub use entities::{
     calculate_margin_required, calculate_notional_value, calculate_position_size, AccountId,
-    DetectorSignal, ExitReason, Order, OrderId, OrderStatus, OrderType, Position, PositionId,
-    PositionState, TechnicalStopAnalysisAudit, TechnicalStopConfidenceSnapshot,
-    TechnicalStopConfigSnapshot, TechnicalStopMethodSnapshot,
+    DetectorSignal, EntryLifecycleStage, ExitReason, Order, OrderId, OrderStatus, OrderType,
+    Position, PositionId, PositionState, TechnicalStopAnalysisAudit,
+    TechnicalStopConfidenceSnapshot, TechnicalStopConfigSnapshot, TechnicalStopMethodSnapshot,
 };
-pub use events::Event;
+pub use events::{entry_lifecycle_stage, Event};
 pub use market_data::{Candle, MarketDataEvent, OrderBookSnapshot, Tick};
-pub use policy::{TechStopConfig, TradingPolicy};
+pub use policy::{
+    ApprovalPolicy, EntryPolicy, EntryPolicyConfig, SignalEvaluationOutcome, StrategyId,
+    TechStopConfig, TradingPolicy,
+};
 pub use value_objects::{
     DomainError, OrderSide, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance,
 };

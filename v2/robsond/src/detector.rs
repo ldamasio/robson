@@ -45,18 +45,22 @@
 //! - Cooperative: checks token between events
 //! - No orphaned tasks after shutdown
 
-use std::{collections::VecDeque, sync::Arc};
+use std::sync::Arc;
 
 use robson_domain::{
-    DetectorSignal, Position, PositionId, Price, Side, Symbol, TechnicalStopAnalysisAudit,
-    TechnicalStopConfidenceSnapshot, TechnicalStopConfigSnapshot, TechnicalStopMethodSnapshot,
+    DetectorSignal, EntryPolicy, EntryPolicyConfig, Event, Position, PositionId, Price, Side,
+    SignalEvaluationOutcome, Symbol, TechnicalStopAnalysisAudit, TechnicalStopConfidenceSnapshot,
+    TechnicalStopConfigSnapshot, TechnicalStopMethodSnapshot,
 };
 use robson_engine::technical_stop_analyzer::{
     StopConfidence as AnalyzerStopConfidence, TechnicalStopAnalysis, TechnicalStopAnalyzer,
     TechnicalStopConfig, TechnicalStopMethod as AnalyzerTechnicalStopMethod,
 };
+use robson_engine::{
+    KeyLevelStrategy, ReversalPatternStrategy, SignalContext, SignalDecision, SmaCrossoverStrategy,
+    StrategyRegistry,
+};
 use robson_exec::{CandleInterval, OhlcvPort};
-use rust_decimal::Decimal;
 use tokio::task::JoinHandle;
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -88,6 +92,8 @@ pub struct DetectorConfig {
     pub ma_slow_period: usize,
     /// Technical stop analysis settings (WHERE the stop is).
     pub technical_stop_config: TechnicalStopConfig,
+    /// Entry and approval policy selected for this position.
+    pub entry_policy: EntryPolicyConfig,
 }
 
 impl DetectorConfig {
@@ -95,6 +101,14 @@ impl DetectorConfig {
     ///
     /// Uses default MA periods (9/21) and chart-derived technical stop config.
     pub fn from_position(position: &Position) -> DaemonResult<Self> {
+        Self::from_position_with_policy(position, EntryPolicyConfig::default())
+    }
+
+    /// Create detector config from an armed position and explicit entry policy.
+    pub fn from_position_with_policy(
+        position: &Position,
+        entry_policy: EntryPolicyConfig,
+    ) -> DaemonResult<Self> {
         if !position.can_enter() {
             return Err(DaemonError::InvalidPositionState {
                 expected: "Armed".to_string(),
@@ -109,6 +123,7 @@ impl DetectorConfig {
             ma_fast_period: 9,  // Default fast MA
             ma_slow_period: 21, // Default slow MA
             technical_stop_config: TechnicalStopConfig::default(),
+            entry_policy,
         })
     }
 
@@ -159,12 +174,8 @@ pub struct DetectorTask {
     ohlcv_port: Arc<dyn OhlcvPort>,
     /// Cancellation token for graceful shutdown
     cancel_token: CancellationToken,
-    /// Price buffer for MA calculation (circular buffer)
-    price_buffer: VecDeque<Decimal>,
-    /// Previous fast MA value (for crossover detection)
-    prev_fast_ma: Option<Decimal>,
-    /// Previous slow MA value (for crossover detection)
-    prev_slow_ma: Option<Decimal>,
+    /// Deterministic strategy registry for this detector.
+    strategy_registry: StrategyRegistry,
 }
 
 impl DetectorTask {
@@ -188,14 +199,29 @@ impl DetectorTask {
             warn!(error = %e, "Invalid detector config, using defaults");
         }
 
+        let mut strategy_registry = StrategyRegistry::empty();
+        strategy_registry.register(
+            StrategyRegistry::strategy_id_for_policy(EntryPolicy::ConfirmedTrend)
+                .expect("confirmed trend must resolve"),
+            Box::new(SmaCrossoverStrategy::new(config.ma_fast_period, config.ma_slow_period)),
+        );
+        strategy_registry.register(
+            StrategyRegistry::strategy_id_for_policy(EntryPolicy::ConfirmedReversal)
+                .expect("confirmed reversal must resolve"),
+            Box::new(ReversalPatternStrategy::default()),
+        );
+        strategy_registry.register(
+            StrategyRegistry::strategy_id_for_policy(EntryPolicy::ConfirmedKeyLevel)
+                .expect("confirmed key level must resolve"),
+            Box::new(KeyLevelStrategy::default()),
+        );
+
         Self {
             config,
             event_bus,
             ohlcv_port,
             cancel_token,
-            price_buffer: VecDeque::new(),
-            prev_fast_ma: None,
-            prev_slow_ma: None,
+            strategy_registry,
         }
     }
 
@@ -208,7 +234,24 @@ impl DetectorTask {
         ohlcv_port: Arc<dyn OhlcvPort>,
         cancel_token: CancellationToken,
     ) -> DaemonResult<Self> {
-        let config = DetectorConfig::from_position(position)?;
+        Self::from_position_with_policy(
+            position,
+            EntryPolicyConfig::default(),
+            event_bus,
+            ohlcv_port,
+            cancel_token,
+        )
+    }
+
+    /// Create detector directly from an armed position and explicit entry policy.
+    pub fn from_position_with_policy(
+        position: &Position,
+        entry_policy: EntryPolicyConfig,
+        event_bus: Arc<EventBus>,
+        ohlcv_port: Arc<dyn OhlcvPort>,
+        cancel_token: CancellationToken,
+    ) -> DaemonResult<Self> {
+        let config = DetectorConfig::from_position_with_policy(position, entry_policy)?;
         Ok(Self::new(config, event_bus, ohlcv_port, cancel_token))
     }
 
@@ -350,119 +393,123 @@ impl DetectorTask {
             "Detector received market data"
         );
 
-        // Apply MA crossover detection logic
-        if self.should_signal(market_data) {
-            match self.create_signal(market_data).await {
-                Ok(signal) => Some(signal),
-                Err(error) => {
-                    warn!(
-                        position_id = %self.config.position_id,
-                        symbol = %self.config.symbol.as_pair(),
-                        error = %error,
-                        "Detector could not compute technical stop"
-                    );
-                    None
-                },
-            }
-        } else {
-            None
-        }
-    }
+        match self.evaluate_signal(market_data).await {
+            Ok(SignalDecision::NoSignal) => None,
+            Ok(decision @ SignalDecision::SignalConfirmed { .. }) => {
+                if let Some(event) = self.signal_strategy_evaluated_event(&decision, market_data) {
+                    self.event_bus.send(DaemonEvent::DomainEvent(event));
+                }
 
-    /// MA crossover detection logic.
-    ///
-    /// Returns true when:
-    /// - Long: Fast MA crosses ABOVE Slow MA
-    /// - Short: Fast MA crosses BELOW Slow MA
-    ///
-    /// Only the **crossover** triggers, not the position.
-    fn should_signal(&mut self, market_data: &MarketData) -> bool {
-        let price = market_data.price.as_decimal();
-
-        // Add price to buffer
-        self.price_buffer.push_back(price);
-
-        // Maintain buffer size (slow period + 1 for crossover detection)
-        let max_size = self.config.ma_slow_period + 1;
-        if self.price_buffer.len() > max_size {
-            self.price_buffer.pop_front();
-        }
-
-        // Need at least slow_period data points
-        if self.price_buffer.len() < self.config.ma_slow_period {
-            debug!(
-                position_id = %self.config.position_id,
-                buffer_len = self.price_buffer.len(),
-                required = self.config.ma_slow_period,
-                "Insufficient data for MA calculation"
-            );
-            return false;
-        }
-
-        // Calculate current MAs
-        let fast_ma = self.calculate_ma(self.config.ma_fast_period);
-        let slow_ma = self.calculate_ma(self.config.ma_slow_period);
-
-        // Check for crossover
-        let crossover = match (&self.prev_fast_ma, &self.prev_slow_ma) {
-            (Some(prev_fast), Some(prev_slow)) => {
-                // Previous state existed, check for crossover
-                let was_above = prev_fast > prev_slow;
-                let is_above = fast_ma > slow_ma;
-
-                match self.config.side {
-                    Side::Long => !was_above && is_above,  // Crossed above
-                    Side::Short => was_above && !is_above, // Crossed below
+                match self.create_signal(decision).await {
+                    Ok(signal) => Some(signal),
+                    Err(error) => {
+                        warn!(
+                            position_id = %self.config.position_id,
+                            symbol = %self.config.symbol.as_pair(),
+                            error = %error,
+                            "Detector could not compute technical stop"
+                        );
+                        None
+                    },
                 }
             },
-            _ => {
-                // No previous state, wait for next tick
-                debug!(
+            Err(error) => {
+                warn!(
                     position_id = %self.config.position_id,
-                    "No previous MA values, waiting for next tick"
+                    symbol = %self.config.symbol.as_pair(),
+                    error = %error,
+                    "Detector strategy evaluation failed"
                 );
-                false
+                None
             },
-        };
+        }
+    }
 
-        // Store current MA values for next tick
-        self.prev_fast_ma = Some(fast_ma);
-        self.prev_slow_ma = Some(slow_ma);
-
-        if crossover {
-            info!(
-                position_id = %self.config.position_id,
-                side = ?self.config.side,
-                fast_ma = %fast_ma,
-                slow_ma = %slow_ma,
-                "MA crossover detected"
-            );
+    async fn evaluate_signal(&self, market_data: &MarketData) -> DaemonResult<SignalDecision> {
+        if self.config.entry_policy.mode == EntryPolicy::Immediate {
+            return Ok(SignalDecision::SignalConfirmed {
+                side: self.config.side,
+                reason: robson_engine::SignalReason::Immediate,
+                observed_at: market_data.timestamp,
+                reference_price: market_data.price.as_decimal(),
+            });
         }
 
-        crossover
-    }
-
-    /// Calculate Simple Moving Average (SMA).
-    ///
-    /// Returns the average of the last `period` prices.
-    fn calculate_ma(&self, period: usize) -> Decimal {
-        let start_idx = self.price_buffer.len().saturating_sub(period);
-        let sum: Decimal = self.price_buffer.range(start_idx..).sum();
-        sum / Decimal::from(period)
-    }
-
-    /// Create a DetectorSignal from current market data.
-    async fn create_signal(&self, market_data: &MarketData) -> DaemonResult<DetectorSignal> {
-        let entry_price = market_data.price;
-
-        let analysis = self
-            .compute_technical_stop(entry_price, self.config.side, &self.config.symbol)
+        let strategy_id = StrategyRegistry::strategy_id_for_policy(self.config.entry_policy.mode)
+            .ok_or_else(|| {
+            DaemonError::Detector("entry policy has no signal strategy".to_string())
+        })?;
+        let strategy = self.strategy_registry.get(&strategy_id).ok_or_else(|| {
+            DaemonError::Detector(format!("strategy not registered: {}", strategy_id))
+        })?;
+        let candles = self
+            .ohlcv_port
+            .fetch_candles(&self.config.symbol, CandleInterval::FifteenMinutes, 100)
             .await?;
+
+        Ok(strategy.evaluate(SignalContext {
+            position_id: self.config.position_id,
+            symbol: self.config.symbol.clone(),
+            side: self.config.side,
+            candles,
+            evaluated_at: market_data.timestamp,
+        }))
+    }
+
+    fn signal_strategy_evaluated_event(
+        &self,
+        decision: &SignalDecision,
+        market_data: &MarketData,
+    ) -> Option<Event> {
+        let strategy_id = StrategyRegistry::strategy_id_for_policy(self.config.entry_policy.mode)?;
+        match decision {
+            SignalDecision::NoSignal => Some(Event::SignalStrategyEvaluated {
+                position_id: self.config.position_id,
+                entry_policy: self.config.entry_policy.mode,
+                strategy_id,
+                outcome: SignalEvaluationOutcome::NoSignal,
+                side: None,
+                reason: None,
+                observed_at: None,
+                reference_price: None,
+                timestamp: market_data.timestamp,
+            }),
+            SignalDecision::SignalConfirmed {
+                side,
+                reason,
+                observed_at,
+                reference_price,
+            } => Some(Event::SignalStrategyEvaluated {
+                position_id: self.config.position_id,
+                entry_policy: self.config.entry_policy.mode,
+                strategy_id,
+                outcome: SignalEvaluationOutcome::SignalConfirmed,
+                side: Some(*side),
+                reason: Some(reason.to_string()),
+                observed_at: Some(*observed_at),
+                reference_price: Price::new(*reference_price).ok(),
+                timestamp: market_data.timestamp,
+            }),
+        }
+    }
+
+    /// Create a DetectorSignal from a confirmed strategy decision.
+    async fn create_signal(&self, decision: SignalDecision) -> DaemonResult<DetectorSignal> {
+        let SignalDecision::SignalConfirmed { side, reference_price, .. } = decision else {
+            return Err(DaemonError::Detector(
+                "cannot create detector signal from NoSignal decision".to_string(),
+            ));
+        };
+        let entry_price = Price::new(reference_price).map_err(|e| {
+            DaemonError::Detector(format!("strategy reference price is invalid: {}", e))
+        })?;
+
+        let analysis = self.compute_technical_stop(entry_price, side, &self.config.symbol).await?;
 
         Ok(DetectorSignal::new(
             self.config.position_id,
             self.config.symbol.clone(),
-            self.config.side,
+            side,
             entry_price,
             analysis.stop_price,
         )
@@ -545,6 +592,7 @@ mod tests {
     use chrono::{Duration, Utc};
     use robson_domain::{Candle, Side};
     use robson_exec::StubOhlcv;
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use uuid::Uuid;
 
@@ -558,11 +606,16 @@ mod tests {
             ma_fast_period: 3, // Small for faster tests
             ma_slow_period: 5, // Small for faster tests
             technical_stop_config: TechnicalStopConfig::default(),
+            entry_policy: EntryPolicyConfig::default(),
         }
     }
 
     fn create_test_ohlcv() -> Arc<dyn OhlcvPort> {
         Arc::new(StubOhlcv::new(create_test_candles()))
+    }
+
+    fn create_sma_crossover_ohlcv(side: Side) -> Arc<dyn OhlcvPort> {
+        Arc::new(StubOhlcv::new(create_sma_crossover_candles(side)))
     }
 
     fn create_test_candles() -> Vec<Candle> {
@@ -612,6 +665,109 @@ mod tests {
         candles
     }
 
+    fn create_sma_crossover_candles(side: Side) -> Vec<Candle> {
+        let symbol = robson_domain::Symbol::from_pair("BTCUSDT").unwrap();
+        let now = Utc::now();
+        let base = dec!(100);
+        let mut candles: Vec<Candle> = (0..100)
+            .map(|i| {
+                let open_time = now + Duration::minutes(i);
+                Candle::new(
+                    symbol.clone(),
+                    base,
+                    base,
+                    base,
+                    base,
+                    dec!(100),
+                    10,
+                    open_time,
+                    open_time + Duration::minutes(15),
+                )
+            })
+            .collect();
+
+        let closes = match side {
+            Side::Long => vec![dec!(100), dec!(99), dec!(98), dec!(97), dec!(96), dec!(105)],
+            Side::Short => vec![
+                dec!(100),
+                dec!(101),
+                dec!(102),
+                dec!(103),
+                dec!(104),
+                dec!(95),
+            ],
+        };
+        let start = candles.len() - closes.len();
+        for (offset, close) in closes.into_iter().enumerate() {
+            let index = start + offset;
+            let open_time = now + Duration::minutes(index as i64);
+            candles[index] = Candle::new(
+                symbol.clone(),
+                close,
+                close,
+                close,
+                close,
+                dec!(100),
+                10,
+                open_time,
+                open_time + Duration::minutes(15),
+            );
+        }
+
+        match side {
+            Side::Long => {
+                candles[50] = Candle::new(
+                    symbol.clone(),
+                    base,
+                    dec!(104),
+                    dec!(98),
+                    base,
+                    dec!(100),
+                    10,
+                    now + Duration::minutes(50),
+                    now + Duration::minutes(65),
+                );
+                candles[70] = Candle::new(
+                    symbol,
+                    base,
+                    dec!(104),
+                    dec!(96),
+                    base,
+                    dec!(100),
+                    10,
+                    now + Duration::minutes(70),
+                    now + Duration::minutes(85),
+                );
+            },
+            Side::Short => {
+                candles[50] = Candle::new(
+                    symbol.clone(),
+                    base,
+                    dec!(102),
+                    dec!(96),
+                    base,
+                    dec!(100),
+                    10,
+                    now + Duration::minutes(50),
+                    now + Duration::minutes(65),
+                );
+                candles[70] = Candle::new(
+                    symbol,
+                    base,
+                    dec!(104),
+                    dec!(96),
+                    base,
+                    dec!(100),
+                    10,
+                    now + Duration::minutes(70),
+                    now + Duration::minutes(85),
+                );
+            },
+        }
+
+        candles
+    }
+
     fn create_test_market_data(symbol: &str, price: Decimal) -> MarketData {
         MarketData {
             symbol: robson_domain::Symbol::from_pair(symbol).unwrap(),
@@ -652,6 +808,7 @@ mod tests {
             ma_fast_period: 9,
             ma_slow_period: 21,
             technical_stop_config: TechnicalStopConfig::default(),
+            entry_policy: EntryPolicyConfig::default(),
         };
         let event_bus = Arc::new(EventBus::new(10));
         let cancel_token = create_test_cancel_token();
@@ -682,6 +839,7 @@ mod tests {
             ma_fast_period: 9,
             ma_slow_period: 21,
             technical_stop_config: TechnicalStopConfig::default(),
+            entry_policy: EntryPolicyConfig::default(),
         };
         let event_bus = Arc::new(EventBus::new(10));
         let cancel_token = create_test_cancel_token();
@@ -708,7 +866,12 @@ mod tests {
         let config = create_test_config(); // BTCUSDT
         let event_bus = Arc::new(EventBus::new(10));
         let cancel_token = create_test_cancel_token();
-        let mut detector = DetectorTask::new(config, event_bus, create_test_ohlcv(), cancel_token);
+        let mut detector = DetectorTask::new(
+            config,
+            event_bus,
+            create_sma_crossover_ohlcv(Side::Long),
+            cancel_token,
+        );
 
         // Different symbol should be ignored
         let other_data = create_test_market_data("ETHUSDT", dec!(3000));
@@ -726,10 +889,16 @@ mod tests {
             ma_fast_period: 3,
             ma_slow_period: 5,
             technical_stop_config: TechnicalStopConfig::default(),
+            entry_policy: EntryPolicyConfig::default(),
         };
         let event_bus = Arc::new(EventBus::new(10));
         let cancel_token = create_test_cancel_token();
-        let mut detector = DetectorTask::new(config, event_bus, create_test_ohlcv(), cancel_token);
+        let mut detector = DetectorTask::new(
+            config,
+            event_bus,
+            create_sma_crossover_ohlcv(Side::Long),
+            cancel_token,
+        );
 
         // Feed prices where fast MA < slow MA (descending trend)
         // This establishes the "previous state"
@@ -776,10 +945,16 @@ mod tests {
             ma_fast_period: 3,
             ma_slow_period: 5,
             technical_stop_config: TechnicalStopConfig::default(),
+            entry_policy: EntryPolicyConfig::default(),
         };
         let event_bus = Arc::new(EventBus::new(10));
         let cancel_token = create_test_cancel_token();
-        let mut detector = DetectorTask::new(config, event_bus, create_test_ohlcv(), cancel_token);
+        let mut detector = DetectorTask::new(
+            config,
+            event_bus,
+            create_sma_crossover_ohlcv(Side::Short),
+            cancel_token,
+        );
 
         // Feed prices where fast MA > slow MA (ascending trend)
         // This establishes the "previous state"
@@ -826,6 +1001,7 @@ mod tests {
             ma_fast_period: 9,
             ma_slow_period: 21,
             technical_stop_config: TechnicalStopConfig::default(),
+            entry_policy: EntryPolicyConfig::default(),
         };
         let event_bus = Arc::new(EventBus::new(10));
         let cancel_token = create_test_cancel_token();
@@ -850,6 +1026,7 @@ mod tests {
             ma_fast_period: 3,
             ma_slow_period: 5,
             technical_stop_config: TechnicalStopConfig::default(),
+            entry_policy: EntryPolicyConfig::default(),
         };
         let event_bus = Arc::new(EventBus::new(10));
         let cancel_token = create_test_cancel_token();
@@ -881,6 +1058,7 @@ mod tests {
             ma_fast_period: 9,
             ma_slow_period: 21,
             technical_stop_config: TechnicalStopConfig::default(),
+            entry_policy: EntryPolicyConfig::default(),
         };
         assert!(valid_config.validate().is_ok());
 
@@ -910,8 +1088,12 @@ mod tests {
 
         // Create detector
         let cancel_token = create_test_cancel_token();
-        let detector =
-            DetectorTask::new(config, Arc::clone(&event_bus), create_test_ohlcv(), cancel_token);
+        let detector = DetectorTask::new(
+            config,
+            Arc::clone(&event_bus),
+            create_sma_crossover_ohlcv(Side::Long),
+            cancel_token,
+        );
 
         // Subscribe before spawning to receive the signal
         let mut receiver = event_bus.subscribe();
@@ -973,8 +1155,12 @@ mod tests {
         let event_bus = Arc::new(EventBus::new(100));
 
         let cancel_token = create_test_cancel_token();
-        let detector =
-            DetectorTask::new(config, Arc::clone(&event_bus), create_test_ohlcv(), cancel_token);
+        let detector = DetectorTask::new(
+            config,
+            Arc::clone(&event_bus),
+            create_sma_crossover_ohlcv(Side::Long),
+            cancel_token,
+        );
         let handle = detector.spawn();
 
         tokio::task::yield_now().await;

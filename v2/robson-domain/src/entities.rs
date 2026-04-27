@@ -284,6 +284,11 @@ pub enum PositionState {
 
     /// Error state, requires manual intervention
     Error { error: String, recoverable: bool },
+
+    /// Position was cancelled before any entry order was placed.
+    /// Results from user disarm or unrecoverable internal rejection.
+    /// Terminal: no exchange action was taken, P&L is zero.
+    Cancelled,
 }
 
 impl PositionState {
@@ -296,8 +301,46 @@ impl PositionState {
             PositionState::Exiting { .. } => "exiting",
             PositionState::Closed { .. } => "closed",
             PositionState::Error { .. } => "error",
+            PositionState::Cancelled => "cancelled",
         }
     }
+}
+
+// =============================================================================
+// EntryLifecycleStage - computed projection of entry intent lifecycle
+// =============================================================================
+
+/// Computed projection of entry intent lifecycle from domain events.
+///
+/// Derived deterministically from an ordered event sequence; never stored
+/// directly. Replay of the same events always produces the same stage.
+///
+/// Mapping:
+/// - `PositionArmed`              → `IntentCreated`
+/// - `EntryPolicyResolved`        → `AwaitingSignal`
+/// - `EntrySignalReceived`        → `SignalConfirmed`
+/// - `EntryApprovalPending`       → `AwaitingApproval`
+/// - `EntryOrderRequested`        → `OrderSubmitted`
+/// - `EntryFilled`                → `Active`
+/// - `PositionDisarmed` / `EntryExecutionRejected` → `Cancelled`
+/// - `EntryOrderFailed`           → back to `AwaitingSignal` (retry path)
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EntryLifecycleStage {
+    /// ARM request processed; entry intent recorded.
+    IntentCreated,
+    /// Entry policy resolved; detector is running, waiting for signal.
+    AwaitingSignal,
+    /// Signal strategy confirmed a signal; risk/approval evaluation next.
+    SignalConfirmed,
+    /// Signal passed risk; operator confirmation required before order.
+    AwaitingApproval,
+    /// Entry order placed on exchange; awaiting fill.
+    OrderSubmitted,
+    /// Entry filled; position is now live.
+    Active,
+    /// Position was cancelled before any exchange action took place.
+    Cancelled,
 }
 
 /// Exit reason for position closure
