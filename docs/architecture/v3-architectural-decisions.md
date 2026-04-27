@@ -636,3 +636,31 @@ Robson's PnL model is authoritative for **risk gate decisions only**. It is not 
 **Reversibility**: Fully reversible. A future decision to fork policy per symbol could be added as a new ADR superseding this one.
 
 **See**: [ADR-0023](../adr/ADR-0023-symbol-agnostic-policy-invariant.md) and [docs/policies/SYMBOL-AGNOSTIC-POLICIES.md](../policies/SYMBOL-AGNOSTIC-POLICIES.md).
+
+---
+
+### ADR-v3-027: EntryApprovalPending Dual Emission
+
+**Date**: 2026-04-27
+**Status**: DECIDED — implemented
+
+**Context**: When `HumanConfirmation` approval is required, the system needs to notify both real-time consumers (SSE clients, operator dashboard) and maintain a durable audit trail. The event bus (tokio broadcast channel) is ephemeral — late subscribers miss events. The event log (PostgreSQL) is durable but not real-time. Neither path alone satisfies both requirements.
+
+**Decision**: `EntryApprovalPending` is emitted to both the event bus AND the event log. These are two separate write paths with separate failure handling.
+
+**Chose**: Dual emission with independent failure semantics
+**Rejected**: Event bus only (no replay safety); Event log only (no real-time notification); Single unified write path (adds coupling between broadcast and persistence layers)
+
+**Write paths**:
+1. **Event bus** (`EventBus::send`): broadcast channel, consumed by SSE handler and live operator dashboard. Late subscribers miss it. Failure is logged and continues.
+2. **Event log** (`execute_and_persist`): PostgreSQL append-only, consumed by projections and replay. Failure of the event-log write is **non-fatal** — warn + continue. The live approval record in `pending_approvals` is the authoritative runtime state; event-log persistence provides audit evidence, not runtime correctness.
+
+**Rationale**:
+- Event bus provides real-time observability (operator sees `AwaitingApproval` immediately).
+- Event log provides replay safety (replaying the event sequence reconstructs the `AwaitingApproval` stage via `EntryLifecycleStage` projection).
+- Decoupled failure handling prevents a PostgreSQL outage from blocking the approval workflow — the operator can still approve and the system proceeds.
+- The `pending_approvals` map in `QueryEngine` is the authoritative runtime state; the event log is the durable audit trail.
+
+**Breaks if wrong**: If event-log persistence is treated as authoritative for the approval workflow, a PostgreSQL outage blocks all human-approval entries. The design explicitly avoids this by making `pending_approvals` the runtime authority and event-log persistence a best-effort audit path.
+
+**Reversibility**: Fully reversible. Removing the event-log emission leaves the event-bus path intact (real-time only). Removing the event-bus emission breaks real-time observability.
