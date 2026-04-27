@@ -137,3 +137,7 @@ apps/backend/monolith/.old/
 .coverage
 htmlcov/
 package-lock.json
+
+# Legacy directories (renamed to v3/ and apps/frontend/)
+v2/
+apps/frontend-v2/
