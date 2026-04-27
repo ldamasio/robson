@@ -2801,6 +2801,46 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let open = self.store.positions().find_active().await?;
         Ok(open.len())
     }
+
+    /// Compute dynamic slot count from persisted monthly state and open positions.
+    ///
+    /// Used by `/status` API to expose `slots_available` (MIG-v3#12 follow-up, ADR-0034).
+    pub async fn compute_slots_available(&self) -> DaemonResult<u32> {
+        let now = chrono::Utc::now();
+        let monthly = self.load_monthly_state(now).await?;
+        let capital_base = monthly.capital_base;
+
+        // Latent risk: sum max(0, loss_if_stop_hit) for each risk-relevant position.
+        let risk_open = self.store.positions().find_risk_open().await?;
+        let latent_risk: Decimal = risk_open
+            .iter()
+            .filter_map(|p| {
+                let (entry, stop) = match &p.state {
+                    PositionState::Active { trailing_stop, .. } => {
+                        (p.entry_price?.as_decimal(), trailing_stop.as_decimal())
+                    }
+                    PositionState::Entering { expected_entry, .. } => {
+                        let entry = expected_entry.as_decimal();
+                        let stop = p
+                            .tech_stop_distance
+                            .as_ref()
+                            .map(|ts| ts.initial_stop.as_decimal())
+                            .unwrap_or(entry);
+                        (entry, stop)
+                    }
+                    _ => return None,
+                };
+                let qty = p.quantity.as_decimal();
+                let risk = match p.side {
+                    Side::Long => (entry - stop) * qty,
+                    Side::Short => (stop - entry) * qty,
+                };
+                Some(risk.max(Decimal::ZERO))
+            })
+            .sum();
+
+        Ok(self.trading_policy.slots_available(capital_base, monthly.realized_loss, latent_risk))
+    }
 }
 
 // =============================================================================

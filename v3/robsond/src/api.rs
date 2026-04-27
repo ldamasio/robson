@@ -99,6 +99,7 @@ pub struct StatusResponse {
     pub active_positions: usize,
     pub positions: Vec<PositionSummary>,
     pub pending_approvals: Vec<PendingApprovalSummary>,
+    pub slots_available: u32,
 }
 
 /// Summary of a position.
@@ -597,6 +598,7 @@ where
     let manager = state.position_manager.read().await;
     let positions = manager.get_open_positions().await.map_err(|e| to_error_response(e))?;
     let pending_approvals = manager.get_pending_approvals().await;
+    let slots_available = manager.compute_slots_available().await.unwrap_or(4);
 
     let summaries: Vec<PositionSummary> = positions.iter().map(position_to_summary).collect();
 
@@ -620,6 +622,7 @@ where
         active_positions: summaries.len(),
         positions: summaries,
         pending_approvals: pending_summaries,
+        slots_available,
     }))
 }
 
