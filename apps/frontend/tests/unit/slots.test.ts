@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { deriveSlots, occupiedCount, INITIAL_MONTHLY_SLOT_BUDGET } from '$lib/config/slots';
+import { deriveSlots, occupiedCount } from '$lib/config/slots';
 import type { PositionState } from '$api/robson';
 
 const activeState: PositionState = {
@@ -15,8 +15,8 @@ const activeState: PositionState = {
 
 describe('deriveSlots', () => {
   it('returns 4 empty slots when no positions', () => {
-    const result = deriveSlots([]);
-    expect(result).toHaveLength(INITIAL_MONTHLY_SLOT_BUDGET);
+    const result = deriveSlots([], 4);
+    expect(result).toHaveLength(4);
     expect(result.every((s) => !s.occupied)).toBe(true);
   });
 
@@ -25,7 +25,7 @@ describe('deriveSlots', () => {
       { id: 'a', state: 'Armed' as PositionState },
       { id: 'b', state: activeState }
     ];
-    const result = deriveSlots(positions);
+    const result = deriveSlots(positions, 4);
     expect(result.filter((s) => s.occupied)).toHaveLength(2);
     expect(result[0].positionId).toBe('a');
     expect(result[1].positionId).toBe('b');
@@ -37,7 +37,7 @@ describe('deriveSlots', () => {
       { id: 'x', state: { Closed: { exit_price: 100, realized_pnl: 0, exit_reason: 'stop_hit' } } as PositionState },
       { id: 'y', state: { Error: { error: 'test', recoverable: false } } as PositionState }
     ];
-    const result = deriveSlots(positions);
+    const result = deriveSlots(positions, 4);
     expect(result.every((s) => !s.occupied)).toBe(true);
   });
 
@@ -46,7 +46,7 @@ describe('deriveSlots', () => {
       id: `p-${i}`,
       state: activeState
     }));
-    const result = deriveSlots(positions);
+    const result = deriveSlots(positions, 4);
     expect(result).toHaveLength(8);
     expect(result.every((s) => s.occupied)).toBe(true);
   });

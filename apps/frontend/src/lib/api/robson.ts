@@ -59,6 +59,7 @@ export type StatusResponse = {
   active_positions: number;
   positions: Position[];
   pending_approvals: PendingApproval[];
+  slots_available?: number;
 };
 
 export type PendingApproval = {
@@ -180,7 +181,9 @@ function normalizeStatus(raw: StatusResponse): StatusResponse {
     ...raw,
     active_positions: Number(raw.active_positions ?? 0),
     positions: Array.isArray(raw.positions) ? raw.positions.map(normalizePosition) : [],
-    pending_approvals: Array.isArray(raw.pending_approvals) ? raw.pending_approvals : []
+    pending_approvals: Array.isArray(raw.pending_approvals) ? raw.pending_approvals : [],
+    // Fallback to 4 during rollout window while backend may not yet send this field.
+    slots_available: typeof raw.slots_available === 'number' ? raw.slots_available : 4
   };
 }
 

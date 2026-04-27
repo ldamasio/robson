@@ -7,7 +7,7 @@ import {
   eventSummaryText,
   eventTypeLabel
 } from '$lib/presentation/labels';
-import { deriveSlots, occupiedCount, INITIAL_MONTHLY_SLOT_BUDGET } from '$lib/config/slots';
+import { deriveSlots, occupiedCount } from '$lib/config/slots';
 import { formatTimeUtc, isTodayUtc } from '$lib/utils/time';
 import type { Position, PositionState, SseEvent, StatusResponse, MonthlyHaltStatus } from '$api/robson';
 
@@ -48,8 +48,8 @@ function makeSseEvent(payload: Record<string, unknown>): SseEvent {
 describe('dashboard slot derivation from status response', () => {
   it('empty status yields 4 free slots', () => {
     const positions: Position[] = [];
-    const slots = deriveSlots(positions);
-    expect(slots).toHaveLength(INITIAL_MONTHLY_SLOT_BUDGET);
+    const slots = deriveSlots(positions, 4);
+    expect(slots).toHaveLength(4);
     expect(slots.filter(s => s.occupied).length).toBe(0);
     slots.forEach(s => expect(s.occupied).toBe(false));
   });
@@ -58,7 +58,7 @@ describe('dashboard slot derivation from status response', () => {
     const positions = [
       makePosition({ id: 'p1', state: { Active: { current_price: 65000, trailing_stop: 62000, favorable_extreme: 65000, extreme_at: '2026-04-23T14:00:00Z', insurance_stop_id: null, last_emitted_stop: null } } })
     ];
-    const slots = deriveSlots(positions);
+    const slots = deriveSlots(positions, 4);
     expect(slots.filter(s => s.occupied).length).toBe(1);
     expect(slots.filter(s => s.occupied && s.positionId === 'p1')).toHaveLength(1);
   });
@@ -73,14 +73,14 @@ describe('dashboard slot derivation from status response', () => {
         pnl: 0
       })
     ];
-    const slots = deriveSlots(positions);
-    expect(slots).toHaveLength(INITIAL_MONTHLY_SLOT_BUDGET);
+    const slots = deriveSlots(positions, 4);
+    expect(slots).toHaveLength(4);
     expect(slots.filter(s => s.occupied)).toHaveLength(1);
   });
 
   it('Armed position counts as occupied', () => {
     const positions = [makePosition({ id: 'p1', state: 'Armed' })];
-    expect(deriveSlots(positions).filter(s => s.occupied).length).toBe(1);
+    expect(deriveSlots(positions, 4).filter(s => s.occupied).length).toBe(1);
   });
 
   it('Entering position counts as occupied', () => {
@@ -90,7 +90,7 @@ describe('dashboard slot derivation from status response', () => {
         state: { Entering: { entry_order_id: 'o1', expected_entry: 65000, signal_id: 's1' } }
       })
     ];
-    expect(deriveSlots(positions).filter(s => s.occupied).length).toBe(1);
+    expect(deriveSlots(positions, 4).filter(s => s.occupied).length).toBe(1);
   });
 
   it('Closed position does NOT occupy a slot', () => {
@@ -100,14 +100,14 @@ describe('dashboard slot derivation from status response', () => {
         state: { Closed: { exit_price: 70000, realized_pnl: 5.0, exit_reason: 'trailing_stop' } }
       })
     ];
-    expect(deriveSlots(positions).filter(s => s.occupied).length).toBe(0);
+    expect(deriveSlots(positions, 4).filter(s => s.occupied).length).toBe(0);
   });
 
   it('Error position does NOT occupy a slot', () => {
     const positions = [
       makePosition({ id: 'p1', state: { Error: { error: 'conn lost', recoverable: true } } })
     ];
-    expect(deriveSlots(positions).filter(s => s.occupied).length).toBe(0);
+    expect(deriveSlots(positions, 4).filter(s => s.occupied).length).toBe(0);
   });
 
   it('Exiting position does NOT occupy a slot', () => {
@@ -117,7 +117,7 @@ describe('dashboard slot derivation from status response', () => {
         state: { Exiting: { exit_order_id: 'o1', exit_reason: 'manual' } }
       })
     ];
-    expect(deriveSlots(positions).filter(s => s.occupied).length).toBe(0);
+    expect(deriveSlots(positions, 4).filter(s => s.occupied).length).toBe(0);
   });
 
   it('mix of states: correct occupied count', () => {
@@ -127,14 +127,14 @@ describe('dashboard slot derivation from status response', () => {
       makePosition({ id: 'p3', state: { Closed: { exit_price: 1, realized_pnl: 0, exit_reason: 'x' } } }),
       makePosition({ id: 'p4', state: { Entering: { entry_order_id: 'x', expected_entry: 1, signal_id: 'x' } } })
     ];
-    expect(deriveSlots(positions).filter(s => s.occupied).length).toBe(3); // Armed + Active + Entering
+    expect(deriveSlots(positions, 4).filter(s => s.occupied).length).toBe(3); // Armed + Active + Entering
   });
 
   it('does not cap displayed active positions at the initial monthly budget', () => {
     const positions = Array.from({ length: 8 }, (_, i) =>
       makePosition({ id: `p${i}`, state: 'Armed' })
     );
-    const slots = deriveSlots(positions);
+    const slots = deriveSlots(positions, 4);
     expect(slots).toHaveLength(8);
     expect(slots.every(s => s.occupied)).toBe(true);
   });

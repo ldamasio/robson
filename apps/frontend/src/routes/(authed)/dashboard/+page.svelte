@@ -11,7 +11,7 @@
   import { haltStatus } from '$stores/slots';
   import { recentEvents, pushEvent } from '$stores/events';
   import { toasts, showToast } from '$stores/toast';
-  import { deriveSlots, INITIAL_MONTHLY_SLOT_BUDGET } from '$lib/config/slots';
+  import { deriveSlots } from '$lib/config/slots';
   import { formatTimeUtc, isTodayUtc } from '$lib/utils/time';
   import {
     positionLabel,
@@ -30,14 +30,15 @@
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let showArmModal = $state(false);
   let pendingApprovals = $state<PendingApproval[]>([]);
+  let slotsAvailable = $state(4);
   let approvalTick = $state(Date.now());
   let approvalTickTimer: ReturnType<typeof setInterval> | null = null;
 
   let positions = $derived($activePositions);
-  let slots = $derived(deriveSlots(positions));
+  let slots = $derived(deriveSlots(positions, slotsAvailable));
   let occupied = $derived(slots.filter((s) => s.occupied).length);
   let displayedSlots = $derived(slots.length);
-  let free = $derived(Math.max(0, INITIAL_MONTHLY_SLOT_BUDGET - occupied));
+  let free = $derived(Math.max(0, slotsAvailable - occupied));
   let activeOps = $derived(positions.filter((p) => isPositionActive(p.state)));
   let todayEvents = $derived($recentEvents.filter((e) => isTodayUtc(e.occurred_at)));
   let haltState = $derived($haltStatus?.state ?? 'active');
@@ -74,6 +75,7 @@
       activePositions.set(status.positions);
       haltStatus.set(halt);
       pendingApprovals = status.pending_approvals;
+      slotsAvailable = status.slots_available ?? 4;
       connected = true;
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to connect to Robson backend';
@@ -117,6 +119,7 @@
           activePositions.set(status.positions);
           haltStatus.set(halt);
           pendingApprovals = status.pending_approvals;
+          slotsAvailable = status.slots_available ?? 4;
           connected = true;
           error = null;
         } catch {
