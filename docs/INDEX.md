@@ -172,7 +172,7 @@ docs/
 | **ParadeDB Database** | [ADR-0007](adr/ADR-0007-paradedb-primary-database.md) |
 | **Transaction Hierarchy** | [architecture/TRANSACTION-HIERARCHY.md](architecture/TRANSACTION-HIERARCHY.md) |
 | **GitOps Auto-Deploy** | [ADR-0011](adr/ADR-0011-gitops-automatic-manifest-updates.md) |
-| **Production Integrity** | [ADR-0012](adr/ADR-0012-production-deployment-integrity.md) |
+| **Production Integrity** | [ADR-0029](adr/ADR-0029-production-deployment-integrity.md) |
 | **Opportunity Detection vs Technical Stop** | [ADR-0021](adr/ADR-0021-opportunity-detection-vs-technical-stop-analysis.md) |
 | **Robson-Authored Position Invariant** | [ADR-0022](adr/ADR-0022-robson-authored-position-invariant.md) |
 | **Symbol-Agnostic Policy Invariant** | [ADR-0023](adr/ADR-0023-symbol-agnostic-policy-invariant.md) |

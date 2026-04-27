@@ -19,7 +19,7 @@ All branches ff-mergeable from main. No force-push.
 
 ## Key Decisions (do not reopen without explicit escalation)
 
-- **ADR-0025 A1.2**: OAuth server-side discarded for FE-P1. `adapter-static` + static hosting incompatible with OAuth callback. Bearer-token auth is the final MVP approach.
+- **ADR-0030 A1.2**: OAuth server-side discarded for FE-P1. `adapter-static` + static hosting incompatible with OAuth callback. Bearer-token auth is the final MVP approach.
 - **labels.ts stays English-only**: ARMED/ACTIVE/CLOSED/ERROR are technical state identifiers, not user-facing chrome. Localization applies only to UI labels.
 - **SSE token via query param**: EventSource does not support custom headers. Backend must accept `?token=` in production.
 - **Stack**: pnpm 9 + Node 20 + Svelte 5 runes.

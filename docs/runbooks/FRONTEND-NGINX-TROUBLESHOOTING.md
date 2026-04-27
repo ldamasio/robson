@@ -134,7 +134,7 @@ kubectl get deploy robson-frontend-v2 -n robson -o yaml
 
 ## Reference
 
-- ADR-0028: hosting pivot from Contabo S3 to k3s
+- ADR-0033: hosting pivot from Contabo S3 to k3s
 - `docs/runbooks/frontend-deploy.md`: deployment procedure
 - `rbx-infra/apps/prod/robson/robson-frontend-v2-deploy.yml`: current
   deployment manifest with both emptyDir volumes applied

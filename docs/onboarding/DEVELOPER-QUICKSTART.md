@@ -189,7 +189,7 @@ the rbx-infra side). Cluster sync typically completes within
 | `pnpm run check` errors after a merge | run `pnpm install --frozen-lockfile` to sync deps |
 | Frontend dev server can't reach backend | `PUBLIC_ROBSON_API_BASE` in `.env.local` |
 | Tests pass locally, fail in CI | check `cargo test --features postgres` and the database test tier |
-| Production dashboard shows "connection error" | likely CORS — see ADR-0027 and `rbx-infra/docs/runbooks/CERT-MANAGER-DEBUG.md` for related diagnostics |
+| Production dashboard shows "connection error" | likely CORS — see ADR-0032 and `rbx-infra/docs/runbooks/CERT-MANAGER-DEBUG.md` for related diagnostics |
 
 ---
 

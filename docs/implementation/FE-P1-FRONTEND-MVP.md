@@ -3,7 +3,7 @@
 **Date**: 2026-04-23
 **Author**: Claude Opus 4.7 (planner) — execution open to Codex / GLM handoff
 **Status**: Draft
-**Related**: ADR-0025 (stack), ADR-0026 (brand), ADR-0027 (UX)
+**Related**: ADR-0030 (stack), ADR-0031 (brand), ADR-0032 (UX)
 
 ---
 
@@ -62,7 +62,7 @@ N/A — greenfield implementation, no gap to analyze.
 | P0 | `apps/frontend/` | Scaffold missing | Everything |
 | P0 | `apps/frontend/src/lib/design/tokens.css` | Voltage tokens not yet copied from `brand-voltage/` | All UI work |
 | P0 | `apps/frontend/src/lib/api/robson.ts` | API client missing | Auth + dashboard + operations |
-| P0 | Backend `/kill-switch` endpoint verification | Need to confirm endpoint contract exists and behaves per ADR-0027 | Kill-switch feature |
+| P0 | Backend `/kill-switch` endpoint verification | Need to confirm endpoint contract exists and behaves per ADR-0032 | Kill-switch feature |
 | P1 | RBX custom icons (20 glyphs) | SVGs must be produced | Polished UI surfaces |
 | P2 | SSE event stream endpoint | Confirm backend supports SSE or fall back to polling | Today's events panel |
 
@@ -315,9 +315,9 @@ rm -rf apps/frontend/static/brand
 **Status**: DONE by GLM-5.1 on branch `fe-p1/ep-003-auth`, commit `edc19919`.
 
 **Amended objective** (final, supersedes original GitHub OAuth plan):
-Implement Bearer-token auth for MVP (per ADR-0025 Amendment 1), typed API client mapped to the real `robsond` REST surface, token store with sessionStorage persistence, client-side auth guard, Svelte 5 migration.
+Implement Bearer-token auth for MVP (per ADR-0030 Amendment 1), typed API client mapped to the real `robsond` REST surface, token store with sessionStorage persistence, client-side auth guard, Svelte 5 migration.
 
-**Rationale for amendment**: `adapter-static` has no server runtime, so OAuth callback cannot be handled without an edge function. Bearer token is the simplest MVP path for a single operator and preserves S3 static hosting. See ADR-0025 A1.2.
+**Rationale for amendment**: `adapter-static` has no server runtime, so OAuth callback cannot be handled without an edge function. Bearer token is the simplest MVP path for a single operator and preserves S3 static hosting. See ADR-0030 A1.2.
 
 **Shipped deliverables**:
 - `src/lib/api/robson.ts` — typed client mapped to 7 real endpoints (`/health`, `/status`, `/positions/{id}`, `/positions` POST, `/queries/{id}/approve`, `/monthly-halt` GET/POST, `/panic`, `/safety/status`, SSE `/events`).
@@ -327,7 +327,7 @@ Implement Bearer-token auth for MVP (per ADR-0025 Amendment 1), typed API client
 - Svelte 5 runes throughout: `$props`, `$state`, `$derived`, `Snippet` for `children`.
 
 **Caveats logged**:
-- No OAuth. No GitHub OAuth app. ADR-0025 A1.2 is authoritative.
+- No OAuth. No GitHub OAuth app. ADR-0030 A1.2 is authoritative.
 - Token stored in `sessionStorage` key `robson_api_token`. Never logged, never committed.
 - Bearer attached to REST via `Authorization` header; to SSE via `?token=` query param (EventSource limitation).
 
@@ -350,7 +350,7 @@ git checkout main -- apps/frontend
 
 **Preconditions**: EP-002 and EP-003 complete. Backend reachable at `PUBLIC_ROBSON_API_BASE`.
 
-**Decisions applied** (see ADR-0027 Amendment 1):
+**Decisions applied** (see ADR-0032 Amendment 1):
 - Backend `Position` type is the canonical model. UI label is "Operation".
 - Slots are frontend-derived. `SLOT_COUNT = 6` (constant in `src/lib/config.ts`).
 - Occupied = count of positions whose state is one of `Armed | Entering | Active`.
@@ -373,7 +373,7 @@ git checkout main -- apps/frontend
 #    - stores/events.ts    — writable<SseEvent[]> capped at last 100 events of current UTC day
 
 # 4. Create components (co-located or under src/lib/components/dashboard/):
-#    - SlotsVisualizer.svelte — 6 cells, state + glyph per ADR-0027
+#    - SlotsVisualizer.svelte — 6 cells, state + glyph per ADR-0032
 #    - ActiveOperationsPanel.svelte — grid of position cards
 #    - TodayEventsStream.svelte — mono event list + TickRuler
 #    - StatusStrip.svelte — "● LIVE · SLOT X/6 · HALT: NO" mono eyebrow
@@ -424,7 +424,7 @@ git checkout main -- apps/frontend
 
 **Preconditions**: EP-002, EP-003 complete.
 
-**Decisions applied** (see ADR-0027 Amendment 1):
+**Decisions applied** (see ADR-0032 Amendment 1):
 - No per-position history endpoint on backend. FE-P1 shows only events received after page mount.
 - Visible limitation notice: "Events from this session only. History deferred to FE-P2."
 - Hash chain UI deferred to FE-P3 (no hash field in `Position` or `SseEvent` currently).
@@ -478,7 +478,7 @@ git checkout main -- apps/frontend
 
 **Preconditions**: EP-002, EP-003 complete. Verify backend cooldown enforcement (see below).
 
-**Decisions applied** (see ADR-0027 Amendment 1):
+**Decisions applied** (see ADR-0032 Amendment 1):
 - Backend endpoint is `/monthly-halt`, not `/kill-switch`. Semantics identical.
 - `MonthlyHaltStatus.triggered_at` is the authoritative timestamp. Derive `cooldown_until = triggered_at + 5min`.
 - **CRITICAL verification step**: test whether backend rejects a second toggle within 5min window with HTTP 409. If not, file backend ticket and document as FE-P1 limitation.
@@ -596,7 +596,7 @@ pnpm add svelte-i18n
 # TLS decision:
 #   Option A (MVP-fast): accept Contabo TLS, accept domain mismatch warning, ship
 #   Option B (MVP-polished): Cloudflare free tier in front, custom cert via Cloudflare
-# Decision tracked in ADR-0025 pending.
+# Decision tracked in ADR-0030 pending.
 ```
 
 **Expected Outcome**:
@@ -673,7 +673,7 @@ This guide is self-contained. To delegate to Codex or GLM:
 - **Codex**: strong at scaffolding and Svelte component work. Assign Tracks 1–4. Remind Codex that Codex does not run nightly rustfmt (`feedback_rustfmt_pattern`) — this does not apply to Svelte but applies if they touch Rust backend code.
 - **GLM**: capable on tooling and infrastructure. Assign Tracks 5–7 plus any backend contract verification.
 - Both agents should be briefed on:
-  - ADR-0025, ADR-0026, ADR-0027 (read these first)
+  - ADR-0030, ADR-0031, ADR-0032 (read these first)
   - Brand artifacts at `atelier/brand-voltage/`
   - Canonical nomenclature: `FE-PN` for frontend phases (do not use bare "Phase N")
   - Editorial rules: no em-dashes, no arrows, no emoji, no pure white backgrounds
@@ -703,16 +703,16 @@ GET    /safety/status                   → SafetyStatusResponse
 GET    /events                          → SSE stream (Bearer via ?token= query param)
 ```
 
-**Gaps vs original plan** (accepted; reflected in ADR-0027 Amendment 1):
+**Gaps vs original plan** (accepted; reflected in ADR-0032 Amendment 1):
 
 | Originally planned | Reality | Resolution |
 |-------------------|---------|------------|
-| `GET /auth/me` | Not present | Bearer-token auth (ADR-0025 A1.2), `GET /health` validates token |
+| `GET /auth/me` | Not present | Bearer-token auth (ADR-0030 A1.2), `GET /health` validates token |
 | `POST /auth/logout` | Not present | Client clears `sessionStorage`, no server call needed |
-| `GET /slots?month=...` | Not present | Slots derived client-side (ADR-0027 A1.2) |
+| `GET /slots?month=...` | Not present | Slots derived client-side (ADR-0032 A1.2) |
 | `GET /operations?status=open` | → `GET /status` | Use `status.positions` filtered by state |
 | `GET /operations/{id}` | → `GET /positions/{id}` | Vocabulary mapping in presentation layer |
-| `GET /operations/{id}/events` | Not present | Client-filter global SSE by `payload.position_id` (ADR-0027 A1.3) |
+| `GET /operations/{id}/events` | Not present | Client-filter global SSE by `payload.position_id` (ADR-0032 A1.3) |
 | `GET /events?from=...&to=...` | → SSE `/events` (live only) | Today's events = client-buffered from SSE; history DEFERRED FE-P2 |
 | `GET /kill-switch/status` | → `GET /monthly-halt` | Vocabulary mapping |
 | `POST /kill-switch` | → `POST /monthly-halt` | Vocabulary mapping |
@@ -803,13 +803,13 @@ apps/frontend/
 
 ### Appendix C: Decision log
 
-- **SvelteKit over Angular** — ADR-0025 alternatives section
-- **No Tailwind** — ADR-0025 alternatives section
+- **SvelteKit over Angular** — ADR-0030 alternatives section
+- **No Tailwind** — ADR-0030 alternatives section
 - **Defer hash chain to FE-P3** — backend not ready; additive integrity, not core audit info
 - **Defer export to FE-P2** — MVP operator can screenshot; polish bundled with history
 - **Defer command palette to FE-P3** — 6-screen surface doesn't need fuzzy search
-- **Single-accent cyan** — ADR-0026; rejected per-product sub-accents
-- **Type-to-confirm kill-switch** — ADR-0027; rejected modal OK/Cancel
+- **Single-accent cyan** — ADR-0031; rejected per-product sub-accents
+- **Type-to-confirm kill-switch** — ADR-0032; rejected modal OK/Cancel
 
 ---
 
@@ -820,8 +820,8 @@ apps/frontend/
 | 2026-04-23 | Initial draft | Claude Opus 4.7 | Draft |
 | 2026-04-23 | EP-001 scaffold — package.json, svelte.config, tsconfig, +layout, +page, app.html, /login, /(authed) routes stubs | Claude Opus 4.7 | DONE (pending `pnpm install` + `pnpm dev` verification by operator) |
 | 2026-04-23 | EP-002 design system — tokens.css copied, brand assets copied, layout primitives (Stack/Row/Grid/Prose/Card/LCorners/TickRuler) written, +page demo renders signature elements | Claude Opus 4.7 | DONE |
-| 2026-04-23 | EP-003 auth + api — Bearer-token MVP + typed API client mapped to 7 real endpoints + Svelte 5 migration. Commit edc19919 on `fe-p1/ep-003-auth`. Caveats: no OAuth (adapter-static incompatibility, see ADR-0025 A1.2); 6 of 9 originally planned endpoints absent, UI adapts per ADR-0027 A1.1. | GLM-5.1 | DONE |
-| 2026-04-23 | ADR amendments: ADR-0025 A1 (token auth + Svelte 5), ADR-0027 A1 (vocabulary mapping + slots derived + SSE client-filter + cooldown verification requirement) | Claude Opus 4.7 | DONE |
+| 2026-04-23 | EP-003 auth + api — Bearer-token MVP + typed API client mapped to 7 real endpoints + Svelte 5 migration. Commit edc19919 on `fe-p1/ep-003-auth`. Caveats: no OAuth (adapter-static incompatibility, see ADR-0030 A1.2); 6 of 9 originally planned endpoints absent, UI adapts per ADR-0032 A1.1. | GLM-5.1 | DONE |
+| 2026-04-23 | ADR amendments: ADR-0030 A1 (token auth + Svelte 5), ADR-0032 A1 (vocabulary mapping + slots derived + SSE client-filter + cooldown verification requirement) | Claude Opus 4.7 | DONE |
 | — | EP-004 dashboard adapted to real endpoints | GLM-5.1 | IN-PROGRESS (e2e test scaffold present; wire real stores + presentation layer + slot derivation) |
 | 2026-04-23 | EP-003 — typed API client mapped to real robsond endpoints, Bearer token auth (OAuth deferred), client-side auth guard, login page, Svelte 4-to-5 migration | GLM-5.1 | DONE (see Blocker Findings below for pending items) |
 | 2026-04-23 | EP-004 dashboard — real API wiring (getStatus + getHaltStatus + SSE), slots derivation from positions (SLOT_COUNT=6), presentation labels layer, error states, retry, e2e with mocked API, vitest slot derivation tests | GLM-5.1 | DONE |
@@ -863,7 +863,7 @@ apps/frontend/
 **What is needed to unblock EP-003 completion (GitHub OAuth)**:
 1. Backend must add OAuth endpoint (or frontend needs edge function for OAuth callback)
 2. GitHub OAuth app must be created, secrets stored in `.env.local`
-3. Decision needed: Auth.js vs custom session middleware (ADR-0025 pending item)
+3. Decision needed: Auth.js vs custom session middleware (ADR-0030 pending item)
 4. Decision needed: `adapter-static` + OAuth requires server-side component — either switch to `adapter-node`, add edge function, or accept token-based auth for MVP
 
 **Decision needed before EP-004**: Backend response shapes for `/status` are known and typed. Dashboard can proceed using `robsonApi.getStatus()` for positions. "Slots" concept does not exist in backend — dashboard EP-004 must adapt to what `/status` returns.
@@ -871,9 +871,9 @@ apps/frontend/
 | — | EP-006 kill-switch | — | TODO |
 | 2026-04-24 | EP-007 i18n — login/dashboard/operation detail extended to svelte-i18n; en.json + pt-BR.json key parity test added; labels.ts kept English (technical state identifiers); root layout guards render behind $isLoading to avoid init race. Commit e8fb9d50 on branch fe-p1/ep-007-i18n. | GLM-5.1 | DONE |
 | 2026-04-24 | EP-008 deploy skeleton — workflow_dispatch-only GitHub Actions workflow targeting Contabo S3 bucket robson-app; runbook docs/runbooks/frontend-deploy.md with prerequisites B1–B5. Workflow does not run until operator provisions bucket, secrets, DNS, TLS decision, backend CORS/public reachability. Commit 15f86514 on branch fe-p1/ep-008-deploy. | GLM-5.1 | DONE (skeleton; execution blocked on B1–B5) |
-| 2026-04-25 | Hosting pivot Contabo S3 → k3s in-cluster (ADR-0028). Frontend becomes containerized nginx; ArgoCD GitOps; cert-manager + Let's Encrypt. | Opus 4.7 + GLM-5.1 | DONE |
+| 2026-04-25 | Hosting pivot Contabo S3 → k3s in-cluster (ADR-0033). Frontend becomes containerized nginx; ArgoCD GitOps; cert-manager + Let's Encrypt. | Opus 4.7 + GLM-5.1 | DONE |
 | 2026-04-25 | v3 canonical layout: Django and legacy React deleted; `v2/` → `v3/`; `apps/frontend-v2/` → `apps/frontend/`; obsolete CI workflows removed. | GLM-5.1 | DONE |
-| 2026-04-25 | Production launch — three endpoints HTTPS 200: robson.rbx.ia.br, robson.rbxsystems.ch, api.robson.rbx.ia.br. CORS layer (ADR-0027), nginx non-root config (ADR-0026), Bearer-token auth (ADR-0025) all live. | Opus 4.7 + GLM-5.1 | **FE-P1 LIVE** |
+| 2026-04-25 | Production launch — three endpoints HTTPS 200: robson.rbx.ia.br, robson.rbxsystems.ch, api.robson.rbx.ia.br. CORS layer (ADR-0032), nginx non-root config (ADR-0031), Bearer-token auth (ADR-0030) all live. | Opus 4.7 + GLM-5.1 | **FE-P1 LIVE** |
 
 ---
 
@@ -887,18 +887,18 @@ with a Bearer token issued by robsond.
 **What shipped vs the original plan.** The original FE-P1 plan
 proposed GitHub OAuth and Contabo S3 hosting. Both were replaced:
 
-- **Auth:** Bearer token (ADR-0025) instead of OAuth. `adapter-static`
+- **Auth:** Bearer token (ADR-0030) instead of OAuth. `adapter-static`
   has no server runtime, so an OAuth callback could not be handled
   without an edge function or `adapter-node`. The single-operator
   console does not justify the extra surface.
-- **Hosting:** k3s in-cluster nginx (ADR-0028) instead of Contabo S3.
+- **Hosting:** k3s in-cluster nginx (ADR-0033) instead of Contabo S3.
   Contabo Object Storage lacks native website hosting, per-bucket
   IAM, and ACL UI. The cluster already had Traefik + cert-manager,
   so reusing that path eliminated four blockers in one move.
-- **CORS:** env-driven allow-list (ADR-0027). Net-new since the
+- **CORS:** env-driven allow-list (ADR-0032). Net-new since the
   legacy React frontend shared origin with the Django backend.
 - **nginx security context:** non-root + `emptyDir` caches
-  (ADR-0026). Net-new for the cluster baseline.
+  (ADR-0031). Net-new for the cluster baseline.
 
 **Deferred to follow-up slices** (intentionally, not blockers):
 
