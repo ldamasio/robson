@@ -178,6 +178,7 @@ pub(crate) fn map_daemon_event(event: &DaemonEvent) -> Option<PublicSseEvent> {
             Some(PublicSseEvent::new("monthly_halt.reset", json!({})))
         },
         DaemonEvent::DetectorSignal(_)
+        | DaemonEvent::DomainEvent(_)
         | DaemonEvent::MarketData(_)
         | DaemonEvent::OrderFill(_)
         | DaemonEvent::Shutdown => None,

@@ -122,6 +122,25 @@ async fn arm_btcusdt_with_capital(base: &str, capital: &str) -> api::ArmResponse
     resp.json::<api::ArmResponse>().await.unwrap()
 }
 
+/// Arm BTCUSDT with HumanConfirmation approval policy so signals queue a
+/// pending approval rather than executing automatically.
+async fn arm_btcusdt_human_confirmation(base: &str) -> api::ArmResponse {
+    let resp = client()
+        .post(format!("{}/positions", base))
+        .json(&json!({
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "capital": "10000",
+            "entry_policy": { "approval": "human_confirmation" }
+        }))
+        .send()
+        .await
+        .unwrap();
+
+    assert_eq!(resp.status(), 201, "arm should return 201 Created");
+    resp.json::<api::ArmResponse>().await.unwrap()
+}
+
 #[tokio::test]
 async fn test_arm_position_returns_created() {
     let (base, _) = start_test_server().await;
@@ -223,7 +242,10 @@ async fn test_disarm_nonexistent_returns_error() {
 #[tokio::test]
 async fn test_delete_active_position_closes_it() {
     let (base, _) = start_test_server().await;
-    let arm = arm_btcusdt(&base).await;
+    // HumanConfirmation so the signal queues a pending approval rather than
+    // executing automatically (DomainApprovalPolicy::Automatic bypasses the
+    // approval queue).
+    let arm = arm_btcusdt_human_confirmation(&base).await;
 
     let signal_resp = client()
         .post(format!("{}/positions/{}/signal", base, arm.position_id))

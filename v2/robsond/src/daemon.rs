@@ -955,6 +955,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                 // This is just for logging/monitoring
             },
 
+            DaemonEvent::DomainEvent(event) => {
+                let manager = self.position_manager.read().await;
+                manager.emit_domain_event(event).await?;
+            },
+
             DaemonEvent::PositionStateChanged {
                 position_id, previous_state, new_state, ..
             } => {

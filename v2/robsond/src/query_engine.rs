@@ -26,6 +26,7 @@
 //! Ownership: lives INSIDE robsond crate. Not a separate crate.
 
 use async_trait::async_trait;
+use robson_domain::ApprovalPolicy as DomainApprovalPolicy;
 use robson_engine::{EngineAction, ProposedTrade, RiskContext, RiskGate, RiskVerdict};
 #[cfg(feature = "postgres")]
 use robson_eventlog::{
@@ -519,6 +520,32 @@ impl<R: QueryRecorder> QueryEngine<R> {
         }
     }
 
+    /// Check approval using the domain `ApprovalPolicy` as the authoritative gate.
+    ///
+    /// `Automatic` → execution proceeds without human approval, regardless of
+    /// the notional-threshold adapter.  `HumanConfirmation` → execution is
+    /// always held for operator approval, regardless of the notional-threshold
+    /// adapter.
+    pub(crate) async fn check_approval_with_domain_policy(
+        &self,
+        query: &mut ExecutionQuery,
+        governed: GovernedAction,
+        domain_approval: DomainApprovalPolicy,
+    ) -> Result<ApprovalCheckResult, QueryTransitionError> {
+        match domain_approval {
+            DomainApprovalPolicy::Automatic => Ok(ApprovalCheckResult::Ready(governed)),
+            DomainApprovalPolicy::HumanConfirmation => {
+                let ttl_seconds = self.approval_policy.ttl_seconds;
+                query.await_approval(
+                    "Human confirmation required by entry policy".to_string(),
+                    ttl_seconds,
+                )?;
+                self.recorder.record_transition(query, "awaiting_approval").await?;
+                Ok(ApprovalCheckResult::AwaitingApproval(governed))
+            },
+        }
+    }
+
     /// Revalidate a pending approval against the current risk context.
     ///
     /// Approval is not a risk override. If the portfolio changed while the
@@ -746,52 +773,55 @@ mod tests {
         // Exhaust monthly budget: 4 positions each with 100 latent risk.
         // budget = 10000 * 4% = 400, risk_per_trade = 100
         // latent_risk = 4 * 100 = 400 → remaining = 0 → no slots
-        RiskContext::with_positions(dec!(10000), vec![
-            PositionSummary {
-                position_id: uuid::Uuid::nil(),
-                symbol: "ETHUSDT".to_string(),
-                side: "long".to_string(),
-                notional_value: dec!(1000),
-                initial_margin: dec!(100),
-                unrealized_pnl: Decimal::ZERO,
-                entry_price: dec!(10000),
-                quantity: dec!(0.01),
-                current_stop: dec!(0), // stop at 0 → latent = entry * qty = 100
-            },
-            PositionSummary {
-                position_id: uuid::Uuid::nil(),
-                symbol: "SOLUSDT".to_string(),
-                side: "long".to_string(),
-                notional_value: dec!(1000),
-                initial_margin: dec!(100),
-                unrealized_pnl: Decimal::ZERO,
-                entry_price: dec!(10000),
-                quantity: dec!(0.01),
-                current_stop: dec!(0),
-            },
-            PositionSummary {
-                position_id: uuid::Uuid::nil(),
-                symbol: "XRPUSDT".to_string(),
-                side: "long".to_string(),
-                notional_value: dec!(1000),
-                initial_margin: dec!(100),
-                unrealized_pnl: Decimal::ZERO,
-                entry_price: dec!(10000),
-                quantity: dec!(0.01),
-                current_stop: dec!(0),
-            },
-            PositionSummary {
-                position_id: uuid::Uuid::nil(),
-                symbol: "DOGEUSDT".to_string(),
-                side: "long".to_string(),
-                notional_value: dec!(1000),
-                initial_margin: dec!(100),
-                unrealized_pnl: Decimal::ZERO,
-                entry_price: dec!(10000),
-                quantity: dec!(0.01),
-                current_stop: dec!(0),
-            },
-        ])
+        RiskContext::with_positions(
+            dec!(10000),
+            vec![
+                PositionSummary {
+                    position_id: uuid::Uuid::nil(),
+                    symbol: "ETHUSDT".to_string(),
+                    side: "long".to_string(),
+                    notional_value: dec!(1000),
+                    initial_margin: dec!(100),
+                    unrealized_pnl: Decimal::ZERO,
+                    entry_price: dec!(10000),
+                    quantity: dec!(0.01),
+                    current_stop: dec!(0), // stop at 0 → latent = entry * qty = 100
+                },
+                PositionSummary {
+                    position_id: uuid::Uuid::nil(),
+                    symbol: "SOLUSDT".to_string(),
+                    side: "long".to_string(),
+                    notional_value: dec!(1000),
+                    initial_margin: dec!(100),
+                    unrealized_pnl: Decimal::ZERO,
+                    entry_price: dec!(10000),
+                    quantity: dec!(0.01),
+                    current_stop: dec!(0),
+                },
+                PositionSummary {
+                    position_id: uuid::Uuid::nil(),
+                    symbol: "XRPUSDT".to_string(),
+                    side: "long".to_string(),
+                    notional_value: dec!(1000),
+                    initial_margin: dec!(100),
+                    unrealized_pnl: Decimal::ZERO,
+                    entry_price: dec!(10000),
+                    quantity: dec!(0.01),
+                    current_stop: dec!(0),
+                },
+                PositionSummary {
+                    position_id: uuid::Uuid::nil(),
+                    symbol: "DOGEUSDT".to_string(),
+                    side: "long".to_string(),
+                    notional_value: dec!(1000),
+                    initial_margin: dec!(100),
+                    unrealized_pnl: Decimal::ZERO,
+                    entry_price: dec!(10000),
+                    quantity: dec!(0.01),
+                    current_stop: dec!(0),
+                },
+            ],
+        )
     }
 
     fn dummy_actions() -> Vec<EngineAction> {

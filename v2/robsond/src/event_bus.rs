@@ -8,7 +8,7 @@
 //! Uses tokio broadcast channels for fan-out to multiple receivers.
 
 use chrono::{DateTime, Utc};
-use robson_domain::{DetectorSignal, PositionId, Price, Symbol};
+use robson_domain::{DetectorSignal, Event, PositionId, Price, Symbol};
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -21,6 +21,9 @@ use uuid::Uuid;
 pub enum DaemonEvent {
     /// Detector fired an entry signal
     DetectorSignal(DetectorSignal),
+
+    /// Domain event emitted by an internal daemon component.
+    DomainEvent(Event),
 
     /// Market data price update
     MarketData(MarketData),
