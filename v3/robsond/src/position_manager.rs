@@ -114,6 +114,16 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     event_log_tenant_id: Option<Uuid>,
 }
 
+/// Persisted monthly risk state from `monthly_state` table.
+///
+/// Authoritative source for accumulated monthly risk accounting.
+/// Does NOT contain live execution state — that comes from positions_current.
+pub(crate) struct MonthlyRiskState {
+    pub capital_base: Decimal,
+    pub realized_loss: Decimal,
+    pub trades_opened: i32,
+}
+
 impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     pub(crate) fn configured_capital(&self) -> Decimal {
         self.engine.lock().unwrap().risk_config().capital()
@@ -201,6 +211,72 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         _now: chrono::DateTime<chrono::Utc>,
     ) -> DaemonResult<Decimal> {
         Ok(self.configured_capital())
+    }
+
+    /// Load the full persisted monthly risk state from `monthly_state`.
+    ///
+    /// Returns the authoritative accumulated values for:
+    /// - `capital_base`: starting capital for the month
+    /// - `realized_loss`: sum of net losses from closed positions (ADR-0024)
+    /// - `trades_opened`: number of entries filled this month
+    ///
+    /// On miss (no row for this month): returns defaults from config.
+    #[cfg(feature = "postgres")]
+    pub(crate) async fn load_monthly_state(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> DaemonResult<MonthlyRiskState> {
+        let configured_capital = self.configured_capital();
+        let Some(pool) = &self.event_log_pool else {
+            return Ok(MonthlyRiskState {
+                capital_base: configured_capital,
+                realized_loss: Decimal::ZERO,
+                trades_opened: 0,
+            });
+        };
+
+        let row = sqlx::query_as::<_, (Decimal, Decimal, i32)>(
+            "SELECT capital_base, realized_loss, trades_opened FROM monthly_state WHERE year = $1 AND month = $2",
+        )
+        .bind(now.year())
+        .bind(now.month() as i16)
+        .fetch_optional(pool)
+        .await?;
+
+        Ok(row
+            .map(|(capital_base, realized_loss, trades_opened)| MonthlyRiskState {
+                capital_base,
+                realized_loss,
+                trades_opened,
+            })
+            .unwrap_or(MonthlyRiskState {
+                capital_base: configured_capital,
+                realized_loss: Decimal::ZERO,
+                trades_opened: 0,
+            }))
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    pub(crate) async fn load_monthly_state(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> DaemonResult<MonthlyRiskState> {
+        // No DB available: compute realized_loss from in-memory store for
+        // correctness in tests and non-postgres mode.
+        let monthly_closed =
+            self.store.positions().find_closed_in_month(now.year(), now.month()).await?;
+        let realized_loss: Decimal = monthly_closed
+            .iter()
+            .map(|p| {
+                let net = p.realized_pnl - p.fees_paid;
+                if net < Decimal::ZERO { net.abs() } else { Decimal::ZERO }
+            })
+            .sum();
+        Ok(MonthlyRiskState {
+            capital_base: self.configured_capital(),
+            realized_loss,
+            trades_opened: monthly_closed.len() as i32,
+        })
     }
 
     pub(crate) async fn emit_domain_event(&self, event: Event) -> DaemonResult<()> {
@@ -612,7 +688,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     // Phase 2: Risk context helpers
     // =========================================================================
 
-    /// Build a RiskContext snapshot from current store state.
+    /// Build a RiskContext snapshot combining persisted monthly state with live
+    /// execution state.
+    ///
+    /// Combines:
+    /// - **Persisted ledger** (`monthly_state`): authoritative capital_base and
+    ///   realized_loss (MIG-v3#12).
+    /// - **Live execution** (`positions_current`): active positions, pending
+    ///   entries, unrealized PnL.
     ///
     /// Uses `find_risk_open()` (Entering + Active) so positions with a
     /// committed exchange order are counted even before fill confirmation.
@@ -621,7 +704,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// → not yet filled → next signal arrives).
     async fn build_risk_context(&self) -> DaemonResult<RiskContext> {
         let now = chrono::Utc::now();
-        let capital = self.load_capital_base_for_month(now).await?;
+        let monthly = self.load_monthly_state(now).await?;
+        let capital = monthly.capital_base;
         let active_positions = self.store.positions().find_risk_open().await?;
 
         // find_risk_open() guarantees only Entering and Active positions.
@@ -686,20 +770,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         summaries.extend(pending_summaries);
 
         // Monthly realized PnL: sum realized_pnl from all positions closed in the
-        // current month.
+        // current month. Used for daily/monthly PnL reporting, not for risk gates.
         let monthly_closed =
             self.store.positions().find_closed_in_month(now.year(), now.month()).await?;
         let monthly_realized_pnl: Decimal =
             monthly_closed.iter().map(|p| p.realized_pnl - p.fees_paid).sum();
 
-        // ADR-0024: realized_loss is the sum of absolute net losses from closed
-        // positions. Wins must NOT offset losses for slot calculation.
-        let monthly_realized_loss: Decimal = monthly_closed
-            .iter()
-            .map(|p| p.realized_pnl - p.fees_paid)
-            .filter(|net| net.is_negative())
-            .map(|net| net.abs())
-            .sum();
+        // ADR-0024: realized_loss is the authoritative sum of absolute net losses.
+        // Source: persisted `monthly_state.realized_loss` (MIG-v3#12).
+        // Wins must NOT offset losses for slot calculation.
+        let monthly_realized_loss = monthly.realized_loss;
 
         // Monthly unrealized PnL: sum unrealized PnL from currently open Active
         // positions.
@@ -1443,40 +1523,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
 
         let now = chrono::Utc::now();
-        let capital_base = match self.load_capital_base_for_month(now).await {
-            Ok(capital_base) => capital_base,
+        let monthly_state = match self.load_monthly_state(now).await {
+            Ok(state) => state,
             Err(e) => {
-                warn!(error = %e, "Failed to load capital_base for MonthlyHalt evaluation");
+                warn!(error = %e, "Failed to load monthly state for MonthlyHalt evaluation");
                 return false;
             },
         };
+        let capital_base = monthly_state.capital_base;
         let policy = self.trading_policy;
 
-        // Realized loss: sum of absolute losses from positions closed this month.
+        // Realized loss: authoritative from persisted monthly_state (MIG-v3#12).
         // Wins do NOT offset losses (ADR-0024 §5).
-        let monthly_closed = match self
-            .store
-            .positions()
-            .find_closed_in_month(now.year(), now.month())
-            .await
-        {
-            Ok(positions) => positions,
-            Err(e) => {
-                warn!(error = %e, "Failed to query monthly closed positions for MonthlyHalt evaluation");
-                return false;
-            },
-        };
-        let realized_loss: Decimal = monthly_closed
-            .iter()
-            .map(|p| {
-                let net = p.realized_pnl - p.fees_paid;
-                if net < Decimal::ZERO {
-                    net.abs()
-                } else {
-                    Decimal::ZERO
-                }
-            })
-            .sum();
+        let realized_loss = monthly_state.realized_loss;
 
         // Latent risk: max(0, loss_if_current_stop_hit) for each open Active position.
         let active_positions = match self.store.positions().find_risk_open().await {
@@ -5294,5 +5353,85 @@ mod tests {
             "Expected Armed after risk denial, got {:?}",
             updated.state
         );
+    }
+
+    // =========================================================================
+    // MIG-v3#12: Monthly State Persistence tests
+    // =========================================================================
+
+    #[tokio::test]
+    async fn test_load_monthly_state_defaults_when_no_closed_positions() {
+        let manager = create_test_manager().await;
+
+        let state = manager.load_monthly_state(chrono::Utc::now()).await.unwrap();
+        assert_eq!(state.capital_base, dec!(10000), "capital defaults to configured");
+        assert_eq!(state.realized_loss, Decimal::ZERO, "no loss without closed positions");
+        assert_eq!(state.trades_opened, 0, "no trades without closed positions");
+    }
+
+    #[tokio::test]
+    async fn test_load_monthly_state_reflects_closed_losses() {
+        let manager = create_test_manager().await;
+
+        // Two closed positions: one loss (-200), one win (+100).
+        // ADR-0024: realized_loss must be 200 (wins do NOT offset).
+        save_closed_position_with_pnl(&manager, dec!(-200)).await;
+        save_closed_position_with_pnl(&manager, dec!(100)).await;
+
+        let state = manager.load_monthly_state(chrono::Utc::now()).await.unwrap();
+        assert_eq!(state.realized_loss, dec!(200), "only losses count, wins do not offset");
+        assert_eq!(state.trades_opened, 2, "both closed positions counted");
+    }
+
+    #[tokio::test]
+    async fn test_build_risk_context_uses_persisted_realized_loss() {
+        let manager = create_test_manager().await;
+
+        // Seed a closed position with -150 loss.
+        save_closed_position_with_pnl(&manager, dec!(-150)).await;
+
+        let ctx = manager.build_risk_context().await.unwrap();
+
+        // monthly_realized_loss must reflect the seeded loss.
+        assert_eq!(
+            ctx.monthly_realized_loss, dec!(150),
+            "build_risk_context must use realized_loss from load_monthly_state"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_evaluate_monthly_halt_uses_persisted_realized_loss() {
+        let manager = create_test_manager().await;
+
+        // Seed realized loss of 399 (budget = 400, risk_per_trade = 100).
+        // remaining = 400 - 399 = 1 < 100 → MUST trigger.
+        save_closed_position_with_pnl(&manager, dec!(-399)).await;
+
+        let triggered = manager.evaluate_monthly_halt().await;
+        assert!(
+            triggered,
+            "evaluate_monthly_halt must use persisted realized_loss from load_monthly_state"
+        );
+        assert!(manager.circuit_breaker.blocks_new_entries().await);
+    }
+
+    #[tokio::test]
+    async fn test_restart_safety_active_positions_still_count_in_risk_context() {
+        let manager = create_test_manager().await;
+
+        // Seed an active position (simulates post-restart state).
+        let _active =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(95000), dec!(0.1)).await;
+
+        // Simulate rebuild: load_monthly_state returns defaults (no losses).
+        // Active positions must still be counted in risk context.
+        let ctx = manager.build_risk_context().await.unwrap();
+
+        // The active position must appear in open_positions.
+        assert_eq!(
+            ctx.open_positions.len(), 1,
+            "active positions must still count after restart"
+        );
+        assert_eq!(ctx.open_positions[0].symbol, "BTCUSDT");
     }
 }

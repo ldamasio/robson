@@ -143,7 +143,8 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
             handlers::positions::handle_entry_execution_rejected(pool, envelope).await?
         },
         Some(ProjectionRoute::EntryFilled) => {
-            handlers::positions::handle_entry_filled(pool, envelope).await?
+            handlers::positions::handle_entry_filled(pool, envelope).await?;
+            handlers::monthly_state::handle_entry_filled_monthly(pool, envelope).await?;
         },
         Some(ProjectionRoute::TechnicalStopAnalyzed) => {
             // Audit-only event. The full analysis payload is recoverable from
@@ -193,7 +194,8 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
             handlers::positions::handle_exit_filled(pool, envelope).await?
         },
         Some(ProjectionRoute::PositionClosedDomain) => {
-            handlers::positions::handle_position_closed_domain(pool, envelope).await?
+            handlers::positions::handle_position_closed_domain(pool, envelope).await?;
+            handlers::monthly_state::handle_position_closed_monthly(pool, envelope).await?;
         },
         None => {
             // Unknown event types are a configuration error - they indicate the projector
