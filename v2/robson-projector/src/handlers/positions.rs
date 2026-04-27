@@ -1004,7 +1004,7 @@ mod tests {
 
 /// Handle position_disarmed (robson-domain::Event::PositionDisarmed)
 ///
-/// Transitions the position from 'armed' to 'closed'.
+/// Transitions the position from 'armed' to 'cancelled'.
 /// Only valid from 'armed' state (no order was ever placed).
 pub(crate) async fn handle_position_disarmed(
     pool: &PgPool,
@@ -1022,17 +1022,15 @@ pub(crate) async fn handle_position_disarmed(
         r#"
         UPDATE positions_current
         SET
-            state = 'closed',
-            exit_reason = $2,
-            closed_at = $3,
-            last_event_id = $4,
-            last_seq = $5,
-            updated_at = $6
-        WHERE position_id = $1 AND last_seq < $5
+            state = 'cancelled',
+            closed_at = $2,
+            last_event_id = $3,
+            last_seq = $4,
+            updated_at = $5
+        WHERE position_id = $1 AND last_seq < $4
         "#,
     )
     .bind(payload.position_id)
-    .bind("DisarmedByUser")
     .bind(payload.timestamp)
     .bind(envelope.event_id)
     .bind(envelope.seq)

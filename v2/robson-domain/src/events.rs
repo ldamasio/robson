@@ -9,6 +9,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     entities::{AccountId, ExitReason, OrderId, PositionId, TechnicalStopAnalysisAudit},
+    policy::{ApprovalPolicy, EntryPolicy, SignalEvaluationOutcome, StrategyId},
     value_objects::{Price, Quantity, Side, Symbol, TechnicalStopDistance},
 };
 
@@ -33,6 +34,42 @@ pub enum Event {
         /// sizing on signal)
         tech_stop_distance: Option<TechnicalStopDistance>,
         /// When the position was armed
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Entry policy resolved to its deterministic strategy, if any.
+    EntryPolicyResolved {
+        /// Position identifier
+        position_id: PositionId,
+        /// Operator-selected entry policy mode
+        entry_policy: EntryPolicy,
+        /// Operator-selected approval mode
+        approval_policy: ApprovalPolicy,
+        /// Strategy selected for the policy. `None` means immediate entry.
+        strategy_id: Option<StrategyId>,
+        /// When the policy was resolved
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Signal strategy evaluation result for replay and audit.
+    SignalStrategyEvaluated {
+        /// Position identifier
+        position_id: PositionId,
+        /// Entry policy being evaluated
+        entry_policy: EntryPolicy,
+        /// Strategy that produced the evaluation
+        strategy_id: StrategyId,
+        /// Whether the strategy confirmed a signal
+        outcome: SignalEvaluationOutcome,
+        /// Confirmed side, when a signal is present
+        side: Option<Side>,
+        /// Deterministic human-readable reason
+        reason: Option<String>,
+        /// Candle close time or other deterministic observation time
+        observed_at: Option<DateTime<Utc>>,
+        /// Reference price used by the confirmed signal
+        reference_price: Option<Price>,
+        /// When the evaluation event was recorded
         timestamp: DateTime<Utc>,
     },
 
@@ -286,10 +323,24 @@ pub enum Event {
         timestamp: DateTime<Utc>,
     },
 
+    /// Entry is awaiting operator approval before the order can be placed.
+    ///
+    /// Emitted when the entry signal passed risk evaluation but the position's
+    /// `ApprovalPolicy` is `HumanConfirmation`. Provides deterministic replay
+    /// evidence for the `AwaitingApproval` entry lifecycle stage.
+    EntryApprovalPending {
+        /// Position identifier
+        position_id: PositionId,
+        /// Signal ID that triggered the approval gate
+        signal_id: uuid::Uuid,
+        /// When the approval gate was entered
+        timestamp: DateTime<Utc>,
+    },
+
     /// Position disarmed by user before any entry order was placed
     ///
     /// Only valid when position is in Armed state.
-    /// Results in Closed state with zero P&L and ExitReason::DisarmedByUser.
+    /// Results in Cancelled state with zero P&L.
     PositionDisarmed {
         /// Position identifier
         position_id: PositionId,
@@ -348,6 +399,8 @@ impl Event {
     pub fn position_id(&self) -> PositionId {
         match self {
             Event::PositionArmed { position_id, .. }
+            | Event::EntryPolicyResolved { position_id, .. }
+            | Event::SignalStrategyEvaluated { position_id, .. }
             | Event::TechnicalStopAnalyzed { position_id, .. }
             | Event::EntrySignalReceived { position_id, .. }
             | Event::EntryOrderPlaced { position_id, .. }
@@ -362,6 +415,7 @@ impl Event {
             | Event::ExitOrderPlaced { position_id, .. }
             | Event::ExitFilled { position_id, .. }
             | Event::PositionClosed { position_id, .. }
+            | Event::EntryApprovalPending { position_id, .. }
             | Event::PositionDisarmed { position_id, .. }
             | Event::PositionError { position_id, .. }
             | Event::InsuranceStopPlaced { position_id, .. }
@@ -374,6 +428,8 @@ impl Event {
     pub fn timestamp(&self) -> DateTime<Utc> {
         match self {
             Event::PositionArmed { timestamp, .. }
+            | Event::EntryPolicyResolved { timestamp, .. }
+            | Event::SignalStrategyEvaluated { timestamp, .. }
             | Event::TechnicalStopAnalyzed { timestamp, .. }
             | Event::EntrySignalReceived { timestamp, .. }
             | Event::EntryOrderPlaced { timestamp, .. }
@@ -389,6 +445,7 @@ impl Event {
             | Event::ExitFilled { timestamp, .. }
             | Event::PositionClosed { timestamp, .. }
             | Event::MonthBoundaryReset { timestamp, .. }
+            | Event::EntryApprovalPending { timestamp, .. }
             | Event::PositionDisarmed { timestamp, .. }
             | Event::PositionError { timestamp, .. }
             | Event::InsuranceStopPlaced { timestamp, .. }
@@ -400,6 +457,8 @@ impl Event {
     pub fn event_type(&self) -> &'static str {
         match self {
             Event::PositionArmed { .. } => "position_armed",
+            Event::EntryPolicyResolved { .. } => "entry_policy_resolved",
+            Event::SignalStrategyEvaluated { .. } => "signal_strategy_evaluated",
             Event::TechnicalStopAnalyzed { .. } => "technical_stop_analyzed",
             Event::EntrySignalReceived { .. } => "entry_signal_received",
             Event::EntryOrderPlaced { .. } => "entry_order_placed",
@@ -415,12 +474,48 @@ impl Event {
             Event::ExitFilled { .. } => "exit_filled",
             Event::PositionClosed { .. } => "position_closed",
             Event::MonthBoundaryReset { .. } => "month_boundary_reset",
+            Event::EntryApprovalPending { .. } => "entry_approval_pending",
             Event::PositionDisarmed { .. } => "position_disarmed",
             Event::PositionError { .. } => "position_error",
             Event::InsuranceStopPlaced { .. } => "insurance_stop_placed",
             Event::InsuranceStopCancelled { .. } => "insurance_stop_cancelled",
         }
     }
+}
+
+// =============================================================================
+// Entry Lifecycle Stage Projection
+// =============================================================================
+
+use crate::entities::EntryLifecycleStage;
+
+/// Compute the entry lifecycle stage from an ordered domain event sequence.
+///
+/// Deterministic: the same event sequence always produces the same stage.
+/// Replay-safe: this function is the authoritative projection for the entry
+/// intent lifecycle; it never reads mutable state.
+pub fn entry_lifecycle_stage(events: &[Event]) -> EntryLifecycleStage {
+    let mut stage = EntryLifecycleStage::IntentCreated;
+    for event in events {
+        match event {
+            Event::PositionArmed { .. } => stage = EntryLifecycleStage::IntentCreated,
+            Event::EntryPolicyResolved { .. } => stage = EntryLifecycleStage::AwaitingSignal,
+            Event::EntrySignalReceived { .. } => stage = EntryLifecycleStage::SignalConfirmed,
+            Event::EntryApprovalPending { .. } => stage = EntryLifecycleStage::AwaitingApproval,
+            Event::EntryOrderRequested { .. } | Event::EntryOrderPlaced { .. } => {
+                stage = EntryLifecycleStage::OrderSubmitted;
+            },
+            Event::EntryFilled { .. } => stage = EntryLifecycleStage::Active,
+            // Disarm and unrecoverable rejection both terminate the entry intent.
+            Event::PositionDisarmed { .. } | Event::EntryExecutionRejected { .. } => {
+                stage = EntryLifecycleStage::Cancelled;
+            },
+            // Order failure is recoverable: position stays Armed, detector re-armed.
+            Event::EntryOrderFailed { .. } => stage = EntryLifecycleStage::AwaitingSignal,
+            _ => {},
+        }
+    }
+    stage
 }
 
 // =============================================================================
@@ -804,5 +899,328 @@ mod tests {
             sample_entry_execution_rejected(Uuid::now_v7()).event_type(),
             "entry_execution_rejected"
         );
+    }
+
+    // =========================================================================
+    // entry_lifecycle_stage projection tests (Phase 5)
+    // =========================================================================
+
+    fn mk_pid() -> uuid::Uuid {
+        Uuid::now_v7()
+    }
+
+    fn mk_signal_id() -> uuid::Uuid {
+        Uuid::now_v7()
+    }
+
+    fn armed_event(pid: uuid::Uuid) -> Event {
+        Event::PositionArmed {
+            position_id: pid,
+            account_id: Uuid::now_v7(),
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            side: Side::Long,
+            tech_stop_distance: None,
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn policy_resolved_event(pid: uuid::Uuid) -> Event {
+        use crate::policy::{ApprovalPolicy, EntryPolicy, StrategyId};
+        Event::EntryPolicyResolved {
+            position_id: pid,
+            entry_policy: EntryPolicy::ConfirmedTrend,
+            approval_policy: ApprovalPolicy::Automatic,
+            strategy_id: Some(StrategyId { name: "sma_crossover".to_string(), version: 1 }),
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn signal_received_event(pid: uuid::Uuid, sid: uuid::Uuid) -> Event {
+        Event::EntrySignalReceived {
+            position_id: pid,
+            signal_id: sid,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(93500)).unwrap(),
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn approval_pending_event(pid: uuid::Uuid, sid: uuid::Uuid) -> Event {
+        Event::EntryApprovalPending {
+            position_id: pid,
+            signal_id: sid,
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn order_requested_event(pid: uuid::Uuid, sid: uuid::Uuid) -> Event {
+        Event::EntryOrderRequested {
+            position_id: pid,
+            cycle_id: None,
+            order_id: Uuid::now_v7(),
+            client_order_id: "test".to_string(),
+            expected_price: Price::new(dec!(95000)).unwrap(),
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            signal_id: sid,
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn filled_event(pid: uuid::Uuid) -> Event {
+        Event::EntryFilled {
+            position_id: pid,
+            order_id: Uuid::now_v7(),
+            fill_price: Price::new(dec!(95000)).unwrap(),
+            filled_quantity: Quantity::new(dec!(0.1)).unwrap(),
+            fee: dec!(0.001),
+            initial_stop: Price::new(dec!(93500)).unwrap(),
+            binance_position_id: None,
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn disarmed_event(pid: uuid::Uuid) -> Event {
+        Event::PositionDisarmed {
+            position_id: pid,
+            reason: "user_disarmed".to_string(),
+            timestamp: Utc::now(),
+        }
+    }
+
+    fn order_failed_event(pid: uuid::Uuid, sid: uuid::Uuid) -> Event {
+        Event::EntryOrderFailed {
+            position_id: pid,
+            cycle_id: Uuid::now_v7(),
+            order_id: Uuid::now_v7(),
+            client_order_id: "test".to_string(),
+            signal_id: sid,
+            reason: "exchange rejected".to_string(),
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_entry_lifecycle_stage_intent_created_from_armed() {
+        let pid = mk_pid();
+        let events = vec![armed_event(pid)];
+        assert_eq!(entry_lifecycle_stage(&events), EntryLifecycleStage::IntentCreated);
+    }
+
+    #[test]
+    fn test_entry_lifecycle_stage_awaiting_signal_from_policy_resolved() {
+        let pid = mk_pid();
+        let events = vec![armed_event(pid), policy_resolved_event(pid)];
+        assert_eq!(entry_lifecycle_stage(&events), EntryLifecycleStage::AwaitingSignal);
+    }
+
+    #[test]
+    fn test_entry_lifecycle_stage_signal_confirmed_from_entry_signal() {
+        let pid = mk_pid();
+        let sid = mk_signal_id();
+        let events = vec![
+            armed_event(pid),
+            policy_resolved_event(pid),
+            signal_received_event(pid, sid),
+        ];
+        assert_eq!(entry_lifecycle_stage(&events), EntryLifecycleStage::SignalConfirmed);
+    }
+
+    #[test]
+    fn test_entry_lifecycle_stage_awaiting_approval_from_approval_pending() {
+        let pid = mk_pid();
+        let sid = mk_signal_id();
+        let events = vec![
+            armed_event(pid),
+            policy_resolved_event(pid),
+            signal_received_event(pid, sid),
+            approval_pending_event(pid, sid),
+        ];
+        assert_eq!(entry_lifecycle_stage(&events), EntryLifecycleStage::AwaitingApproval);
+    }
+
+    #[test]
+    fn test_entry_lifecycle_stage_order_submitted_from_entry_requested() {
+        let pid = mk_pid();
+        let sid = mk_signal_id();
+        let events = vec![
+            armed_event(pid),
+            policy_resolved_event(pid),
+            signal_received_event(pid, sid),
+            order_requested_event(pid, sid),
+        ];
+        assert_eq!(entry_lifecycle_stage(&events), EntryLifecycleStage::OrderSubmitted);
+    }
+
+    #[test]
+    fn test_entry_lifecycle_stage_active_from_entry_filled() {
+        let pid = mk_pid();
+        let sid = mk_signal_id();
+        let events = vec![
+            armed_event(pid),
+            policy_resolved_event(pid),
+            signal_received_event(pid, sid),
+            order_requested_event(pid, sid),
+            filled_event(pid),
+        ];
+        assert_eq!(entry_lifecycle_stage(&events), EntryLifecycleStage::Active);
+    }
+
+    #[test]
+    fn test_entry_lifecycle_stage_cancelled_from_disarm() {
+        let pid = mk_pid();
+        let events = vec![
+            armed_event(pid),
+            policy_resolved_event(pid),
+            disarmed_event(pid),
+        ];
+        assert_eq!(entry_lifecycle_stage(&events), EntryLifecycleStage::Cancelled);
+    }
+
+    #[test]
+    fn test_entry_lifecycle_stage_order_failed_returns_to_awaiting_signal() {
+        let pid = mk_pid();
+        let sid = mk_signal_id();
+        let events = vec![
+            armed_event(pid),
+            policy_resolved_event(pid),
+            signal_received_event(pid, sid),
+            order_requested_event(pid, sid),
+            order_failed_event(pid, sid),
+        ];
+        // Order failure: position stays Armed, detector re-armed → back to AwaitingSignal
+        assert_eq!(entry_lifecycle_stage(&events), EntryLifecycleStage::AwaitingSignal);
+    }
+
+    #[test]
+    fn test_entry_lifecycle_stage_replay_is_deterministic() {
+        // Same event sequence must produce the same result on multiple calls.
+        let pid = mk_pid();
+        let sid = mk_signal_id();
+        let events = vec![
+            armed_event(pid),
+            policy_resolved_event(pid),
+            signal_received_event(pid, sid),
+            approval_pending_event(pid, sid),
+            order_requested_event(pid, sid),
+            filled_event(pid),
+        ];
+        let stage1 = entry_lifecycle_stage(&events);
+        let stage2 = entry_lifecycle_stage(&events);
+        assert_eq!(stage1, stage2, "entry_lifecycle_stage must be deterministic");
+        assert_eq!(stage1, EntryLifecycleStage::Active);
+    }
+
+    #[test]
+    fn test_entry_lifecycle_stage_empty_events_is_intent_created() {
+        // No events → initial stage (should not panic)
+        assert_eq!(entry_lifecycle_stage(&[]), EntryLifecycleStage::IntentCreated);
+    }
+
+    #[test]
+    fn test_entry_lifecycle_stage_deterministic_replay_all_stages() {
+        // Every valid lifecycle path must produce the same result when the same
+        // event sequence is replayed. This test covers all seven stages and also
+        // verifies that non-advancing events (PositionMonitorTick, TrailingStopUpdated)
+        // do not alter the projection.
+        let pid = mk_pid();
+        let sid = mk_signal_id();
+
+        // Non-advancing events that must not affect the stage.
+        let noise_events: Vec<Event> = vec![
+            Event::TrailingStopUpdated {
+                position_id: pid,
+                previous_stop: Price::new(dec!(93000)).unwrap(),
+                new_stop: Price::new(dec!(93500)).unwrap(),
+                trigger_price: Price::new(dec!(94000)).unwrap(),
+                timestamp: Utc::now(),
+            },
+        ];
+
+        let test_sequences: Vec<(&str, Vec<Event>, EntryLifecycleStage)> = vec![
+            ("intent_created", vec![armed_event(pid)], EntryLifecycleStage::IntentCreated),
+            ("awaiting_signal", vec![armed_event(pid), policy_resolved_event(pid)], EntryLifecycleStage::AwaitingSignal),
+            ("signal_confirmed", vec![armed_event(pid), policy_resolved_event(pid), signal_received_event(pid, sid)], EntryLifecycleStage::SignalConfirmed),
+            ("awaiting_approval", vec![armed_event(pid), policy_resolved_event(pid), signal_received_event(pid, sid), approval_pending_event(pid, sid)], EntryLifecycleStage::AwaitingApproval),
+            ("order_submitted", vec![armed_event(pid), policy_resolved_event(pid), signal_received_event(pid, sid), order_requested_event(pid, sid)], EntryLifecycleStage::OrderSubmitted),
+            ("active", vec![armed_event(pid), policy_resolved_event(pid), signal_received_event(pid, sid), order_requested_event(pid, sid), filled_event(pid)], EntryLifecycleStage::Active),
+            ("cancelled", vec![armed_event(pid), policy_resolved_event(pid), disarmed_event(pid)], EntryLifecycleStage::Cancelled),
+        ];
+
+        for (name, base_events, expected) in &test_sequences {
+            // Replay 100 times without noise.
+            for _ in 0..100 {
+                assert_eq!(
+                    entry_lifecycle_stage(base_events),
+                    *expected,
+                    "determinism failed for stage '{}' (no noise)",
+                    name
+                );
+            }
+
+            // Replay with noise events inserted after every base event.
+            let mut noisy: Vec<Event> = Vec::new();
+            for event in base_events.iter() {
+                noisy.push(event.clone());
+                noisy.extend(noise_events.iter().cloned());
+            }
+            for _ in 0..100 {
+                assert_eq!(
+                    entry_lifecycle_stage(&noisy),
+                    *expected,
+                    "determinism failed for stage '{}' (with noise)",
+                    name
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn test_cancelled_position_never_has_entry_fill_in_lifecycle() {
+        // A Cancelled position (disarmed before entry) must never be projected
+        // to a stage that implies a fill occurred (Active, OrderSubmitted).
+        // If PositionDisarmed appears in the event sequence, the projection
+        // must resolve to Cancelled regardless of subsequent events.
+        let pid = mk_pid();
+        let sid = mk_signal_id();
+
+        // Case 1: Armed → Disarmed (clean cancel).
+        let events = vec![armed_event(pid), disarmed_event(pid)];
+        assert_eq!(entry_lifecycle_stage(&events), EntryLifecycleStage::Cancelled);
+
+        // Case 2: Armed → PolicyResolved → Disarmed.
+        let events = vec![armed_event(pid), policy_resolved_event(pid), disarmed_event(pid)];
+        assert_eq!(entry_lifecycle_stage(&events), EntryLifecycleStage::Cancelled);
+
+        // Case 3: Armed → PolicyResolved → SignalReceived → Disarmed.
+        let events = vec![
+            armed_event(pid),
+            policy_resolved_event(pid),
+            signal_received_event(pid, sid),
+            disarmed_event(pid),
+        ];
+        assert_eq!(entry_lifecycle_stage(&events), EntryLifecycleStage::Cancelled);
+
+        // Case 4: Disarmed after approval pending (operator disarmed during approval).
+        let events = vec![
+            armed_event(pid),
+            policy_resolved_event(pid),
+            signal_received_event(pid, sid),
+            approval_pending_event(pid, sid),
+            disarmed_event(pid),
+        ];
+        assert_eq!(entry_lifecycle_stage(&events), EntryLifecycleStage::Cancelled);
+
+        // Case 5: If EntryFilled is present, stage must NOT be Cancelled.
+        // A filled position that later gets a close event should be Active or later.
+        let events = vec![
+            armed_event(pid),
+            policy_resolved_event(pid),
+            signal_received_event(pid, sid),
+            order_requested_event(pid, sid),
+            filled_event(pid),
+        ];
+        assert_ne!(entry_lifecycle_stage(&events), EntryLifecycleStage::Cancelled);
+        assert_eq!(entry_lifecycle_stage(&events), EntryLifecycleStage::Active);
     }
 }

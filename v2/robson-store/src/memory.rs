@@ -336,19 +336,11 @@ impl MemoryStore {
                 }
             },
 
-            // PositionDisarmed: Armed → Closed with zero P&L (no entry ever happened)
+            // PositionDisarmed: Armed → Cancelled (no exchange action was ever taken)
             Event::PositionDisarmed { position_id, timestamp, .. } => {
                 let mut positions = self.positions.write().unwrap();
                 if let Some(mut position) = positions.get(position_id).cloned() {
-                    // Disarmed positions have no fill price; use a sentinel of 1
-                    // to satisfy Price's non-zero invariant. P&L is always 0.
-                    let sentinel_price = robson_domain::Price::new(rust_decimal::Decimal::ONE)
-                        .map_err(StoreError::Domain)?;
-                    position.state = PositionState::Closed {
-                        exit_price: sentinel_price,
-                        realized_pnl: rust_decimal::Decimal::ZERO,
-                        exit_reason: ExitReason::DisarmedByUser,
-                    };
+                    position.state = PositionState::Cancelled;
                     position.closed_at = Some(*timestamp);
                     position.updated_at = chrono::Utc::now();
                     positions.insert(*position_id, position);
