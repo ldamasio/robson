@@ -538,6 +538,73 @@ pub enum TechnicalStopConfidenceSnapshot {
     Low,
 }
 
+// =============================================================================
+// Stop-Aware Entry Types (ADR-0024)
+// =============================================================================
+
+/// Classification of anchor types for a technical stop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum AnchorType {
+    /// Support level (for LONG entries)
+    Support,
+    /// Resistance level (for SHORT entries)
+    Resistance,
+    /// Swing low point
+    SwingLow,
+    /// Swing high point
+    SwingHigh,
+    /// Breakout retest level
+    BreakoutRetest,
+    /// Liquidity sweep level
+    LiquidityLevel,
+}
+
+/// Explicit metadata about the technical stop anchor event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StopAnchor {
+    /// Type of anchor (support, resistance, swing point, etc.)
+    pub anchor_type: AnchorType,
+    /// Price level of the anchor
+    pub anchor_price: Price,
+    /// Timeframe of the anchor — normalized string (e.g. "15m").
+    /// Will be promoted to a proper domain type in a future slice.
+    pub timeframe: String,
+    /// Reference to the technical event (optional, future)
+    pub source_event_id: Option<Uuid>,
+    /// Reason for anchor invalidation (if applicable)
+    pub invalidation_reason: Option<String>,
+}
+
+/// Stop quality class with associated boost percentage.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StopQuality {
+    /// No boost (0%) — valid anchor, no structural advantage
+    None,
+    /// Weak boost (+5%) — distant/old anchor, low confluence
+    Weak,
+    /// Good boost (+10%) — recent anchor, moderate distance, 1+ confirmation
+    Good,
+    /// Premium boost (+15%) — recent + clean, efficient distance, multiple confluences
+    Premium,
+    /// Exceptional boost (+20%) — rare, feature-flagged, shadow-mode only
+    Exceptional,
+}
+
+/// Stop quality classification result.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct StopQualityClassification {
+    /// Quality class (None through Exceptional)
+    pub class: StopQuality,
+    /// Raw score before thresholds
+    pub raw_score: i32,
+    /// Boost percentage (0.0 to 0.20)
+    pub boost_pct: Decimal,
+    /// Whether this would be Exceptional if flag enabled
+    pub shadow_exceptional: bool,
+    /// Human-readable reasons for classification
+    pub reasons: Vec<String>,
+}
+
 /// Immutable snapshot of the analyzer configuration used for a detector signal.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct TechnicalStopConfigSnapshot {
@@ -572,6 +639,12 @@ pub struct TechnicalStopAnalysisAudit {
     pub detected_levels: Vec<Price>,
     /// Analyzer configuration snapshot used to produce this result.
     pub config: TechnicalStopConfigSnapshot,
+    /// Explicit metadata about the stop anchor event (ADR-0024).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_anchor: Option<Box<StopAnchor>>,
+    /// Stop quality classification in shadow mode (ADR-0024).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_quality: Option<Box<StopQualityClassification>>,
 }
 
 /// Signal from detector to trigger entry

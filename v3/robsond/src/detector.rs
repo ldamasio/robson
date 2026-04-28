@@ -558,6 +558,8 @@ impl DetectorTask {
                 min_stop_distance_pct: config.min_stop_distance_pct,
                 max_stop_distance_pct: config.max_stop_distance_pct,
             },
+            stop_anchor: None,
+            stop_quality: None,
         }
     }
 

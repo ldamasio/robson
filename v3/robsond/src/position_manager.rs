@@ -3009,6 +3009,8 @@ mod tests {
                 min_stop_distance_pct: dec!(0.001),
                 max_stop_distance_pct: dec!(0.10),
             },
+            stop_anchor: None,
+            stop_quality: None,
         }
     }
 
