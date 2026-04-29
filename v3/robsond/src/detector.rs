@@ -516,6 +516,29 @@ impl DetectorTask {
         let classification =
             classify_stop_quality(&stop_quality_input, &StopQualityThresholds::default(), false);
 
+        // Shadow telemetry: extract fields before moving into audit.
+        let stop_anchor_present = stop_anchor.is_some();
+        let anchor_type = stop_anchor.as_ref().map(|a| a.anchor_type);
+        let stop_quality_class = classification.class;
+        let raw_score = classification.raw_score;
+        let boost_pct = classification.boost_pct;
+        let shadow_exceptional = classification.shadow_exceptional;
+        debug!(
+            position_id = %self.config.position_id,
+            symbol = %self.config.symbol.as_pair(),
+            side = ?side,
+            stop_anchor_present,
+            anchor_type = ?anchor_type,
+            stop_quality_class = ?stop_quality_class,
+            raw_score,
+            boost_pct = %boost_pct,
+            shadow_exceptional,
+            technical_stop_method = ?analysis.method,
+            technical_stop_confidence = ?analysis.confidence,
+            detected_levels_count = analysis.detected_levels.len(),
+            "stop-aware entry shadow telemetry"
+        );
+
         let mut audit =
             Self::build_technical_stop_audit(&analysis, &self.config.technical_stop_config);
         audit.stop_anchor = stop_anchor.map(Box::new);
