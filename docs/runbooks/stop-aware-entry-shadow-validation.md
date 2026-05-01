@@ -11,8 +11,56 @@
 | Date | Executor | Result | Notes |
 |------|----------|--------|-------|
 | | | **PENDING** | Runbook created after Slice 004; no operational run yet |
+| 2026-05-01 | Operator session | **PARTIAL PASS** | Binance Futures Testnet secret validated/reloaded for `robson-testnet`; `robsond` restarted successfully; `-2015 Invalid API-key` absent from latest checked logs. Shadow telemetry not observed yet because the testnet image is still `ghcr.io/rbxrobotica/robson-v2:sha-7c3af2b9` and `RUST_LOG` was not changed. |
 
 *Update this table after every validation run.*
+
+---
+
+## Current Operational Status
+
+- Binance Futures Testnet secret was validated/reloaded for `robson-testnet`.
+- `robsond` rollout restart completed successfully.
+- New pod came up healthy.
+- `-2015 Invalid API-key` did not appear in the latest checked logs.
+- Binance WebSocket connected and first tick was received.
+- No image update was performed.
+- `RUST_LOG` was not changed.
+- Production namespace was not touched.
+- No code was changed.
+
+The secret rotation/reload unblocked exchange connectivity for testnet, but it did
+not validate stop-aware shadow telemetry. The testnet deployment still runs image
+`ghcr.io/rbxrobotica/robson-v2:sha-7c3af2b9`, which predates the stop-aware shadow
+commits listed below.
+
+---
+
+## Remaining Gates Before Shadow Observation
+
+1. Build/push/deploy image containing commits through at least `020a0dcd`.
+2. Confirm testnet rollout with the new image.
+3. Temporarily set `RUST_LOG=robsond::detector=debug`.
+4. Observe `stop-aware entry shadow telemetry`.
+5. Confirm:
+   - no boost applied
+   - no RiskEngine change
+   - no decision change
+   - `Exceptional` does not appear
+   - SwingPoint can emit StopAnchor
+   - AtrFallback does not emit StopAnchor
+6. Observe for a few days before any Slice 006 planning.
+
+---
+
+## Explicit Non-Goals
+
+- Do not apply boost.
+- Do not change RiskEngine.
+- Do not change TechnicalStopDistance.
+- Do not change DetectorSignal/EventBus.
+- Do not modify slots or live v3 positions.
+- Do not plan Slice 006 before shadow observation.
 
 ---
 
