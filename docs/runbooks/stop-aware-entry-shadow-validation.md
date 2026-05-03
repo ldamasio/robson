@@ -410,7 +410,7 @@ Use this checklist when observing shadow telemetry in a live environment.
 
 ## Related Documentation
 
-- [ADR-0024 — Stop-Aware Entry Policy (v4)](../adr/ADR-0024-stop-aware-entry-policy.md)
+- [ADR-0035 — Stop-Aware Entry Policy (v4)](../adr/ADR-0035-stop-aware-entry-policy.md)
 - [StopQuality Heuristics Spec](../analysis/2026-04-28-stop-quality-heuristics.md)
 - [Implementation Guide](../analysis/2026-04-28-stop-aware-entry-implementation-guide.md)
 - [VAL-001 — Testnet E2E Validation](val-001-testnet-e2e-validation.md)

@@ -1,4 +1,4 @@
-# ADR-0024 — Stop-Aware Entry Policy (v4)
+# ADR-0035 — Stop-Aware Entry Policy (v4)
 
 **Date**: 2026-04-28
 **Status**: PROPOSED

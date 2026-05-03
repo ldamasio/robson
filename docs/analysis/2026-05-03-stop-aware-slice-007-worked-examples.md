@@ -8,7 +8,7 @@
 **Related:**
 - [Slice 007 Plan — Shadow Decision-Mirror Design](2026-05-03-stop-aware-slice-007-shadow-decision-mirror-plan.md)
 - [Slice 006 Calibration Summary](2026-05-03-stop-aware-slice-006-calibration-summary.md)
-- [ADR-0024 — Stop-Aware Entry Policy (v4)](../adr/ADR-0024-stop-aware-entry-policy.md)
+- [ADR-0035 — Stop-Aware Entry Policy (v4)](../adr/ADR-0035-stop-aware-entry-policy.md)
 
 ---
 

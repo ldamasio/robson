@@ -23,7 +23,7 @@ verified, and tested BEFORE requesting authorization to commit.
 
 ### What Is This?
 
-Robson v4 introduces **Stop-Aware Entry Policy** (ADR-0024):
+Robson v4 introduces **Stop-Aware Entry Policy** (ADR-0035):
 - `StopAnchor`: explicit metadata about the technical stop event
 - `StopQuality`: classification of stop region quality (None → Exceptional)
 - `StopQualityBoost`: capped additive boost to entry signal (+0% to +20%)
@@ -153,7 +153,7 @@ imports, and conventions. Do NOT copy-paste blindly.
 
 ```rust
 // =============================================================================
-// Stop-Aware Entry Types (ADR-0024)
+// Stop-Aware Entry Types (ADR-0035)
 // =============================================================================
 
 /// Explicit metadata about the technical stop anchor event.
@@ -249,7 +249,7 @@ pub struct TechnicalStopAnalysisAudit {
     pub detected_levels: Vec<Price>,
     pub config: TechnicalStopConfigSnapshot,
 
-    // === NEW: Stop-Aware Entry metadata (ADR-0024) ===
+    // === NEW: Stop-Aware Entry metadata (ADR-0035) ===
     /// Explicit metadata about the stop anchor event
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_anchor: Option<StopAnchor>,
@@ -338,7 +338,7 @@ git commit -m "feat(domain): add StopAnchor and StopQuality types (Slice 001)
 
 Shadow metadata only — no behavioral change.
 
-Adds domain types for Stop-Aware Entry policy (ADR-0024):
+Adds domain types for Stop-Aware Entry policy (ADR-0035):
 - StopAnchor: explicit metadata for technical stop anchor event
 - AnchorType: enum for anchor types (Support, Resistance, SwingLow, etc.)
 - StopQuality: classification enum (None, Weak, Good, Premium, Exceptional)
@@ -357,7 +357,7 @@ No behavioral changes:
 
 All tests pass. Shadow metadata preparation only.
 
-Related: ADR-0024, Implementation Guide Step 1-3
+Related: ADR-0035, Implementation Guide Step 1-3
 
 # Optional: add Co-Authored-By only if required by the actual execution agent/session.
 # Do NOT include model-specific authorship unless applicable to the execution context.

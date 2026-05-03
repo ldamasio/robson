@@ -2,7 +2,7 @@
 
 **Date**: 2026-04-28
 **Status**: PROPOSED (Phase 2 — Spec Only)
-**Related**: [ADR-0024 — Stop-Aware Entry Policy (v4)](../adr/ADR-0024-stop-aware-entry-policy.md)
+**Related**: [ADR-0035 — Stop-Aware Entry Policy (v4)](../adr/ADR-0035-stop-aware-entry-policy.md)
 
 ---
 
@@ -424,6 +424,6 @@ Each phase requires separate ADR/update before implementation.
 
 ## 10. References
 
-- [ADR-0024 — Stop-Aware Entry Policy (v4)](../adr/ADR-0024-stop-aware-entry-policy.md)
+- [ADR-0035 — Stop-Aware Entry Policy (v4)](../adr/ADR-0035-stop-aware-entry-policy.md)
 - [ADR-0021 — Opportunity Detection vs Technical Stop Analysis](../adr/ADR-0021-opportunity-detection-vs-technical-stop-analysis.md)
 - [docs/architecture/v3-runtime-spec.md](../architecture/v3-runtime-spec.md)

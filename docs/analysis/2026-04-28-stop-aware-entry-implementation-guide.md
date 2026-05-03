@@ -3,7 +3,7 @@
 **Date**: 2026-04-28
 **Status**: PROPOSED (Phase 3 Runtime — Shadow Metadata Only)
 **Related**:
-- [ADR-0024 — Stop-Aware Entry Policy (v4)](../adr/ADR-0024-stop-aware-entry-policy.md)
+- [ADR-0035 — Stop-Aware Entry Policy (v4)](../adr/ADR-0035-stop-aware-entry-policy.md)
 - [StopQuality Heuristics Spec](2026-04-28-stop-quality-heuristics.md)
 - [Pre-Implementation Discovery](2026-04-28-stop-aware-entry-discovery.md)
 
@@ -11,7 +11,7 @@
 
 ## Purpose
 
-Transform ADR-0024 + heuristics spec + discovery report into a safe incremental plan
+Transform ADR-0035 + heuristics spec + discovery report into a safe incremental plan
 for implementing shadow metadata (StopAnchor + StopQuality telemetry) without
 behavioral change.
 
@@ -21,7 +21,7 @@ behavioral change.
 
 ## 1. Base Documents Summary
 
-### ADR-0024 — Stop-Aware Entry Policy (v4)
+### ADR-0035 — Stop-Aware Entry Policy (v4)
 
 **Status**: PROPOSED, committed as `02d41278`
 
@@ -608,7 +608,7 @@ Phase 3 runtime implementation is accepted ONLY if:
 
 ## 10. References
 
-- [ADR-0024 — Stop-Aware Entry Policy (v4)](../adr/ADR-0024-stop-aware-entry-policy.md)
+- [ADR-0035 — Stop-Aware Entry Policy (v4)](../adr/ADR-0035-stop-aware-entry-policy.md)
 - [StopQuality Heuristics Spec](2026-04-28-stop-quality-heuristics.md)
 - [Pre-Implementation Discovery](2026-04-28-stop-aware-entry-discovery.md)
 - [ADR-0022 — Robson-Authored Position Invariant](../adr/ADR-0022-robson-authored-position-invariant.md)

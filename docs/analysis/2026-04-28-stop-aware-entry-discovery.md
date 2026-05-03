@@ -2,14 +2,14 @@
 
 **Date**: 2026-04-28
 **Status**: COMPLETE (Phase 3 — Discovery Only)
-**Related**: [ADR-0024 — Stop-Aware Entry Policy (v4)](../adr/ADR-0024-stop-aware-entry-policy.md)
+**Related**: [ADR-0035 — Stop-Aware Entry Policy (v4)](../adr/ADR-0035-stop-aware-entry-policy.md)
 **Related**: [StopQuality Heuristics Spec](2026-04-28-stop-quality-heuristics.md)
 
 ---
 
 ## Purpose
 
-Pre-implementation discovery required by ADR-0024 Implementation Notes before
+Pre-implementation discovery required by ADR-0035 Implementation Notes before
 any code changes. This report maps the current v3 architecture and identifies
 integration points for StopAnchor, StopQuality, and telemetry.
 
@@ -250,7 +250,7 @@ v4 must NOT revalidate, cancel, or reclassify existing positions.
 - `confidence`: High, Medium, Low
 - `detected_levels`: All swing levels (audit trail)
 
-**Missing for StopAnchor** (per ADR-0024):
+**Missing for StopAnchor** (per ADR-0035):
 - `anchor_type`: Explicit enum (support, resistance, swing_low, swing_high, breakout_retest, liquidity_level)
 - `anchor_price`: Explicit field (currently implicit in `stop_price`)
 - `timeframe`: Explicit field (hardcoded 15m in TechnicalStopAnalyzer)
@@ -504,7 +504,7 @@ Test scenarios:
 
 ## 13. Compatibility Verification
 
-| Invariant (ADR-0024) | Status |
+| Invariant (ADR-0035) | Status |
 |---------------------|--------|
 | TechnicalStopDistance unchanged | ✅ Pure function, zero changes |
 | StopQuality absence ≠ rejection | ✅ Shadow mode only, no filtering |
@@ -535,7 +535,7 @@ After this discovery is approved:
 
 ## 15. References
 
-- [ADR-0024 — Stop-Aware Entry Policy (v4)](../adr/ADR-0024-stop-aware-entry-policy.md)
+- [ADR-0035 — Stop-Aware Entry Policy (v4)](../adr/ADR-0035-stop-aware-entry-policy.md)
 - [ADR-0021 — Opportunity Detection vs Technical Stop Analysis](../adr/ADR-0021-opportunity-detection-vs-technical-stop-analysis.md)
 - [ADR-0022 — Robson-Authored Position Invariant](../adr/ADR-0022-robson-authored-position-invariant.md)
 - [StopQuality Heuristics Spec](2026-04-28-stop-quality-heuristics.md)

@@ -7,7 +7,7 @@
 **Image under observation**: `ghcr.io/rbxrobotica/robson-v2:sha-447aba4b`
 **Related**:
 - [ADR-0021 — Separation of Opportunity Detection and Technical Stop Analysis](../adr/ADR-0021-opportunity-detection-vs-technical-stop-analysis.md)
-- [ADR-0024 — Stop-Aware Entry Policy](../adr/ADR-0024-stop-aware-entry-policy.md)
+- [ADR-0035 — Stop-Aware Entry Policy](../adr/ADR-0035-stop-aware-entry-policy.md)
 - [Discovery Report](2026-04-28-stop-aware-entry-discovery.md)
 - [Implementation Guide](2026-04-28-stop-aware-entry-implementation-guide.md)
 - [StopQuality Heuristics Spec](2026-04-28-stop-quality-heuristics.md)

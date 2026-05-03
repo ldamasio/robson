@@ -5,7 +5,7 @@
 **Slice:** 007 — Shadow Decision-Mirror Design
 **Branch context:** `stop-aware-shadow-testnet` @ `db6b3a4a`
 **Related:**
-- [ADR-0024 — Stop-Aware Entry Policy (v4)](../adr/ADR-0024-stop-aware-entry-policy.md)
+- [ADR-0035 — Stop-Aware Entry Policy (v4)](../adr/ADR-0035-stop-aware-entry-policy.md)
 - [ADR-0021 — Opportunity Detection vs Technical Stop Analysis](../adr/ADR-0021-opportunity-detection-vs-technical-stop-analysis.md)
 - [StopQuality Heuristics Spec](2026-04-28-stop-quality-heuristics.md)
 - [Stop-Aware Entry Implementation Guide](2026-04-28-stop-aware-entry-implementation-guide.md)

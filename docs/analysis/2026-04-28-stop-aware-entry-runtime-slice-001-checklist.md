@@ -4,7 +4,7 @@
 **Status**: PROPOSED (Not executable yet — requires authorization)
 **Slice**: Shadow Metadata Only
 **Related**:
-- [ADR-0024](../adr/ADR-0024-stop-aware-entry-policy.md)
+- [ADR-0035](../adr/ADR-0035-stop-aware-entry-policy.md)
 - [Heuristics Spec](2026-04-28-stop-quality-heuristics.md)
 - [Discovery Report](2026-04-28-stop-aware-entry-discovery.md)
 - [Implementation Guide](2026-04-28-stop-aware-entry-implementation-guide.md)
@@ -30,7 +30,7 @@ decisions, sizing, Risk Engine, or TechnicalStopDistance.
 - [ ] Confirm no stashed changes: `git stash list`
 
 ### Document Re-Read (Mandatory)
-- [ ] Re-read ADR-0024 (11 invariants, rollout phases)
+- [ ] Re-read ADR-0035 (11 invariants, rollout phases)
 - [ ] Re-read Heuristics Spec (classification scale, inputs, pseudo-code)
 - [ ] Re-read Discovery Report (integration points, files analyzed)
 - [ ] Re-read Implementation Guide (Step 1-8, verification commands)
@@ -345,7 +345,7 @@ feat(domain): add StopAnchor and StopQuality types (Slice 001)
 
 Shadow metadata only — no behavioral change.
 
-Adds domain types for Stop-Aware Entry policy (ADR-0024):
+Adds domain types for Stop-Aware Entry policy (ADR-0035):
 - StopAnchor: explicit metadata for technical stop anchor event
 - AnchorType: enum for anchor types (Support, Resistance, SwingLow, etc.)
 - StopQuality: classification enum (None, Weak, Good, Premium, Exceptional)
@@ -364,7 +364,7 @@ No behavioral changes:
 
 All tests pass. Shadow metadata preparation only.
 
-Related: ADR-0024, Implementation Guide Step 1-3
+Related: ADR-0035, Implementation Guide Step 1-3
 
 Co-Authored-By: Claude Opus 4.7 <noreply@anthropic.com>
 ```
