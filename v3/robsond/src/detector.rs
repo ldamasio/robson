@@ -48,18 +48,16 @@
 use std::sync::Arc;
 
 use robson_domain::{
-    AnchorType, DetectorSignal, EntryPolicy, EntryPolicyConfig, Event, Position, PositionId,
-    Price, Side, SignalEvaluationOutcome, StopAnchor, Symbol, TechnicalStopAnalysisAudit,
+    AnchorType, DetectorSignal, EntryPolicy, EntryPolicyConfig, Event, Position, PositionId, Price,
+    Side, SignalEvaluationOutcome, StopAnchor, Symbol, TechnicalStopAnalysisAudit,
     TechnicalStopConfidenceSnapshot, TechnicalStopConfigSnapshot, TechnicalStopMethodSnapshot,
 };
-use robson_engine::stop_quality_classifier::{
-    classify_stop_quality, StopQualityInput, StopQualityThresholds,
-};
-use robson_engine::technical_stop_analyzer::{
-    StopConfidence as AnalyzerStopConfidence, TechnicalStopAnalysis, TechnicalStopAnalyzer,
-    TechnicalStopConfig, TechnicalStopMethod as AnalyzerTechnicalStopMethod,
-};
 use robson_engine::{
+    stop_quality_classifier::{classify_stop_quality, StopQualityInput, StopQualityThresholds},
+    technical_stop_analyzer::{
+        StopConfidence as AnalyzerStopConfidence, TechnicalStopAnalysis, TechnicalStopAnalyzer,
+        TechnicalStopConfig, TechnicalStopMethod as AnalyzerTechnicalStopMethod,
+    },
     KeyLevelStrategy, ReversalPatternStrategy, SignalContext, SignalDecision, SmaCrossoverStrategy,
     StrategyRegistry,
 };
@@ -246,7 +244,8 @@ impl DetectorTask {
         )
     }
 
-    /// Create detector directly from an armed position and explicit entry policy.
+    /// Create detector directly from an armed position and explicit entry
+    /// policy.
     pub fn from_position_with_policy(
         position: &Position,
         entry_policy: EntryPolicyConfig,
@@ -624,10 +623,7 @@ impl DetectorTask {
     /// Only SwingPoint stops produce a structural anchor. AtrFallback has no
     /// real chart anchor, so it returns `None` (and `stop_anchor_valid = false`
     /// for the quality classifier).
-    fn build_stop_anchor(
-        analysis: &TechnicalStopAnalysis,
-        side: Side,
-    ) -> Option<StopAnchor> {
+    fn build_stop_anchor(analysis: &TechnicalStopAnalysis, side: Side) -> Option<StopAnchor> {
         match analysis.method {
             AnalyzerTechnicalStopMethod::SwingPoint { .. } => Some(StopAnchor {
                 anchor_type: match side {
@@ -653,8 +649,7 @@ impl DetectorTask {
         analysis: &TechnicalStopAnalysis,
         stop_anchor_valid: bool,
     ) -> StopQualityInput {
-        let distance_pct = (entry_price.as_decimal() - analysis.stop_price.as_decimal())
-            .abs()
+        let distance_pct = (entry_price.as_decimal() - analysis.stop_price.as_decimal()).abs()
             / entry_price.as_decimal();
         StopQualityInput {
             stop_anchor_valid,
@@ -1403,7 +1398,10 @@ mod tests {
             detected_levels: match side {
                 Side::Long => vec![Price::new(dec!(95)).unwrap(), Price::new(dec!(90)).unwrap()],
                 Side::Short => {
-                    vec![Price::new(dec!(105)).unwrap(), Price::new(dec!(110)).unwrap()]
+                    vec![
+                        Price::new(dec!(105)).unwrap(),
+                        Price::new(dec!(110)).unwrap(),
+                    ]
                 },
             },
         }
@@ -1485,18 +1483,9 @@ mod tests {
         };
 
         let signal = detector.create_signal(decision).await.unwrap();
-        let audit = signal
-            .technical_stop_analysis
-            .as_ref()
-            .expect("audit must be present");
-        assert!(
-            audit.stop_quality.is_some(),
-            "stop_quality must be populated in shadow mode"
-        );
-        assert!(
-            audit.stop_anchor.is_some(),
-            "stop_anchor must be populated for SwingPoint"
-        );
+        let audit = signal.technical_stop_analysis.as_ref().expect("audit must be present");
+        assert!(audit.stop_quality.is_some(), "stop_quality must be populated in shadow mode");
+        assert!(audit.stop_anchor.is_some(), "stop_anchor must be populated for SwingPoint");
     }
 
     #[tokio::test]

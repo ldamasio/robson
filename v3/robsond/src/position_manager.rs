@@ -269,7 +269,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .iter()
             .map(|p| {
                 let net = p.realized_pnl - p.fees_paid;
-                if net < Decimal::ZERO { net.abs() } else { Decimal::ZERO }
+                if net < Decimal::ZERO {
+                    net.abs()
+                } else {
+                    Decimal::ZERO
+                }
             })
             .sum();
         Ok(MonthlyRiskState {
@@ -1003,8 +1007,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         {
             let mut pending_approvals = self.pending_approvals.write().await;
-            pending_approvals
-                .insert(query_id, PendingApprovalRecord { query, position, proposed, governed });
+            pending_approvals.insert(query_id, PendingApprovalRecord {
+                query,
+                position,
+                proposed,
+                governed,
+            });
         }
 
         let pending_approvals = self.pending_approvals.read().await;
@@ -1656,7 +1664,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
         self.record_query_transition(&query, "acting").await?;
 
-        // Emit PositionDisarmed event → apply_event transitions position to Closed
+        // Emit PositionDisarmed event → apply_event transitions position to Cancelled
         let event = Event::PositionDisarmed {
             position_id,
             reason: "user_disarmed".to_string(),
@@ -2043,8 +2051,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 };
                 // Broadcast to event bus so real-time consumers (UI, audit log)
                 // can observe the AwaitingApproval lifecycle stage immediately.
-                self.event_bus
-                    .send(DaemonEvent::DomainEvent(approval_pending_event.clone()));
+                self.event_bus.send(DaemonEvent::DomainEvent(approval_pending_event.clone()));
                 if let Err(e) = self
                     .execute_and_persist(vec![EngineAction::EmitEvent(approval_pending_event)])
                     .await
@@ -2651,7 +2658,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     );
                 },
                 PositionState::Cancelled => {
-                    // find_active() guarantees this is unreachable — Cancelled is terminal.
+                    // find_active() guarantees this is unreachable — Cancelled
+                    // is terminal.
                 },
             }
         }
@@ -2802,9 +2810,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         Ok(open.len())
     }
 
-    /// Compute dynamic slot count from persisted monthly state and open positions.
+    /// Compute dynamic slot count from persisted monthly state and open
+    /// positions.
     ///
-    /// Used by `/status` API to expose `slots_available` (MIG-v3#12 follow-up, ADR-0034).
+    /// Used by `/status` API to expose `slots_available` (MIG-v3#12 follow-up,
+    /// ADR-0034).
     pub async fn compute_slots_available(&self) -> DaemonResult<u32> {
         let now = chrono::Utc::now();
         let monthly = self.load_monthly_state(now).await?;
@@ -2818,7 +2828,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 let (entry, stop) = match &p.state {
                     PositionState::Active { trailing_stop, .. } => {
                         (p.entry_price?.as_decimal(), trailing_stop.as_decimal())
-                    }
+                    },
                     PositionState::Entering { expected_entry, .. } => {
                         let entry = expected_entry.as_decimal();
                         let stop = p
@@ -2827,7 +2837,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                             .map(|ts| ts.initial_stop.as_decimal())
                             .unwrap_or(entry);
                         (entry, stop)
-                    }
+                    },
                     _ => return None,
                 };
                 let qty = p.quantity.as_decimal();
@@ -2839,7 +2849,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             })
             .sum();
 
-        Ok(self.trading_policy.slots_available(capital_base, monthly.realized_loss, latent_risk))
+        Ok(self
+            .trading_policy
+            .slots_available(capital_base, monthly.realized_loss, latent_risk))
     }
 }
 
@@ -3698,7 +3710,8 @@ mod tests {
     }
 
     /// `ApprovalPolicy::Automatic` must bypass the notional-threshold gate even
-    /// when notional exceeds the threshold that would normally require approval.
+    /// when notional exceeds the threshold that would normally require
+    /// approval.
     #[tokio::test]
     async fn test_handle_signal_automatic_bypasses_notional_threshold() {
         // phase3 manager has 5% threshold; signal notional will exceed it.
@@ -3743,8 +3756,9 @@ mod tests {
         assert!(pending.is_empty(), "Expected no pending approvals with Automatic policy");
     }
 
-    /// `ApprovalPolicy::HumanConfirmation` must always require operator approval
-    /// even when the notional is below the threshold that normally auto-proceeds.
+    /// `ApprovalPolicy::HumanConfirmation` must always require operator
+    /// approval even when the notional is below the threshold that normally
+    /// auto-proceeds.
     #[tokio::test]
     async fn test_handle_signal_human_confirmation_always_waits() {
         // create_test_manager uses 100% threshold → normally no approval needed.
@@ -3828,7 +3842,7 @@ mod tests {
             symbol,
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
-            stop_loss: Price::new(dec!(85500)).unwrap(), /* HumanConfirmation always waits */
+            stop_loss: Price::new(dec!(85500)).unwrap(), // HumanConfirmation always waits
             technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
@@ -4676,7 +4690,8 @@ mod tests {
             symbol,
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
-            stop_loss: Price::new(dec!(85500)).unwrap(), // HumanConfirmation always requires approval
+            stop_loss: Price::new(dec!(85500)).unwrap(), /* HumanConfirmation always requires
+                                                          * approval */
             technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
@@ -5142,7 +5157,8 @@ mod tests {
         // Approval must be pending
         assert_eq!(manager.pending_approvals.read().await.len(), 1);
 
-        // EntryApprovalPending must have been emitted to the event bus as a domain event
+        // EntryApprovalPending must have been emitted to the event bus as a domain
+        // event
         let mut approval_pending_seen = false;
         for _ in 0..20 {
             if let Ok(Some(event)) =
@@ -5167,9 +5183,9 @@ mod tests {
     ///
     /// The background expiry task removes the record from `pending_approvals`
     /// and re-arms the detector automatically. `approve_query` must NOT be
-    /// called after expiry — the record is gone and would return `QueryNotFound`.
-    /// Instead, wait for the `QueryExpired` event on the event bus, then verify
-    /// the position is still Armed.
+    /// called after expiry — the record is gone and would return
+    /// `QueryNotFound`. Instead, wait for the `QueryExpired` event on the
+    /// event bus, then verify the position is still Armed.
     #[tokio::test]
     async fn test_approval_expiry_re_arms_position() {
         use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
@@ -5216,19 +5232,15 @@ mod tests {
         // Wait for the QueryExpired event emitted by the background expiry task.
         let mut expired_seen = false;
         for _ in 0..30 {
-            match tokio::time::timeout(
-                std::time::Duration::from_millis(100),
-                receiver.recv(),
-            )
-            .await
+            match tokio::time::timeout(std::time::Duration::from_millis(100), receiver.recv()).await
             {
                 Ok(Some(Ok(DaemonEvent::QueryExpired { position_id, .. }))) => {
                     if position_id == Some(position.id) {
                         expired_seen = true;
                         break;
                     }
-                }
-                _ => {}
+                },
+                _ => {},
             }
         }
         assert!(expired_seen, "Expected QueryExpired event on event bus after TTL");
@@ -5249,13 +5261,15 @@ mod tests {
         );
     }
 
-    /// Risk denied entries leave the position in Armed state (retry path, not Cancelled).
+    /// Risk denied entries leave the position in Armed state (retry path, not
+    /// Cancelled).
     ///
-    /// This test triggers a DuplicatePosition risk denial (same symbol + side already
-    /// Entering), which is a governed outcome that does NOT activate MonthlyHalt.
-    /// Slot-exhaustion denials also use RiskCheck::MonthlyDrawdown and DO trigger
-    /// MonthlyHalt + panic_close_all — that is correct behaviour and is separately
-    /// tested in the monthly drawdown test.
+    /// This test triggers a DuplicatePosition risk denial (same symbol + side
+    /// already Entering), which is a governed outcome that does NOT
+    /// activate MonthlyHalt. Slot-exhaustion denials also use
+    /// RiskCheck::MonthlyDrawdown and DO trigger MonthlyHalt +
+    /// panic_close_all — that is correct behaviour and is separately tested
+    /// in the monthly drawdown test.
     #[tokio::test]
     async fn test_risk_denial_leaves_position_armed_for_retry() {
         use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
@@ -5267,14 +5281,10 @@ mod tests {
         // denial that does not trigger MonthlyHalt.
         let entry = Price::new(dec!(95000)).unwrap();
         let stop = Price::new(dec!(91200)).unwrap();
-        let mut existing = robson_domain::Position::new(
-            uuid::Uuid::now_v7(),
-            symbol.clone(),
-            Side::Long,
-        );
+        let mut existing =
+            robson_domain::Position::new(uuid::Uuid::now_v7(), symbol.clone(), Side::Long);
         existing.quantity = Quantity::new(dec!(0.001)).unwrap();
-        existing.tech_stop_distance =
-            Some(TechnicalStopDistance::from_entry_and_stop(entry, stop));
+        existing.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(entry, stop));
         existing.state = PositionState::Entering {
             entry_order_id: uuid::Uuid::now_v7(),
             expected_entry: entry,
@@ -5282,20 +5292,15 @@ mod tests {
         };
         manager.store.positions().save(&existing).await.unwrap();
 
-        let hc_policy = EntryPolicyConfig::new(
-            EntryPolicy::ConfirmedTrend,
-            DomainApprovalPolicy::Automatic,
-        );
+        let hc_policy =
+            EntryPolicyConfig::new(EntryPolicy::ConfirmedTrend, DomainApprovalPolicy::Automatic);
 
         let position = manager
             .arm_position_with_policy(
                 symbol.clone(),
                 Side::Long,
                 create_test_risk_config(),
-                Some(TechnicalStopDistance::from_entry_and_stop(
-                    entry,
-                    stop,
-                )),
+                Some(TechnicalStopDistance::from_entry_and_stop(entry, stop)),
                 Uuid::now_v7(),
                 hc_policy,
             )
@@ -5343,14 +5348,10 @@ mod tests {
         let stop = Price::new(dec!(91200)).unwrap();
 
         // Seed an Entering position to trigger DuplicatePosition denial.
-        let mut existing = robson_domain::Position::new(
-            uuid::Uuid::now_v7(),
-            symbol.clone(),
-            Side::Long,
-        );
+        let mut existing =
+            robson_domain::Position::new(uuid::Uuid::now_v7(), symbol.clone(), Side::Long);
         existing.quantity = Quantity::new(dec!(0.001)).unwrap();
-        existing.tech_stop_distance =
-            Some(TechnicalStopDistance::from_entry_and_stop(entry, stop));
+        existing.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(entry, stop));
         existing.state = PositionState::Entering {
             entry_order_id: uuid::Uuid::now_v7(),
             expected_entry: entry,
@@ -5436,7 +5437,8 @@ mod tests {
 
         // monthly_realized_loss must reflect the seeded loss.
         assert_eq!(
-            ctx.monthly_realized_loss, dec!(150),
+            ctx.monthly_realized_loss,
+            dec!(150),
             "build_risk_context must use realized_loss from load_monthly_state"
         );
     }
@@ -5470,10 +5472,7 @@ mod tests {
         let ctx = manager.build_risk_context().await.unwrap();
 
         // The active position must appear in open_positions.
-        assert_eq!(
-            ctx.open_positions.len(), 1,
-            "active positions must still count after restart"
-        );
+        assert_eq!(ctx.open_positions.len(), 1, "active positions must still count after restart");
         assert_eq!(ctx.open_positions[0].symbol, "BTCUSDT");
     }
 }

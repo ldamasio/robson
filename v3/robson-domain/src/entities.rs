@@ -584,7 +584,8 @@ pub enum StopQuality {
     Weak,
     /// Good boost (+10%) — recent anchor, moderate distance, 1+ confirmation
     Good,
-    /// Premium boost (+15%) — recent + clean, efficient distance, multiple confluences
+    /// Premium boost (+15%) — recent + clean, efficient distance, multiple
+    /// confluences
     Premium,
     /// Exceptional boost (+20%) — rare, feature-flagged, shadow-mode only
     Exceptional,

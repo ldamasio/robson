@@ -139,7 +139,11 @@ fn distance_points(distance_pct: Decimal, config: &StopQualityThresholds) -> i32
 fn method_points(method: &TechnicalStopMethod) -> i32 {
     match method {
         TechnicalStopMethod::SwingPoint { level_n } => {
-            if *level_n >= 2 { 15 } else { 10 }
+            if *level_n >= 2 {
+                15
+            } else {
+                10
+            }
         },
         TechnicalStopMethod::AtrFallback => 0,
     }
@@ -235,10 +239,7 @@ pub fn classify_stop_quality(
     let l_pts = levels_points(input.detected_levels_count, config);
     score += l_pts;
     if l_pts > 0 {
-        reasons.push(format!(
-            "Detected levels ({}): +{}",
-            input.detected_levels_count, l_pts
-        ));
+        reasons.push(format!("Detected levels ({}): +{}", input.detected_levels_count, l_pts));
     }
 
     // 4. Classify by thresholds
@@ -273,9 +274,10 @@ pub fn classify_stop_quality(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use robson_domain::StopQuality;
     use rust_decimal_macros::dec;
+
+    use super::*;
 
     fn default_config() -> StopQualityThresholds {
         StopQualityThresholds::default()

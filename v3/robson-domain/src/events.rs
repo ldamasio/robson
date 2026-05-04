@@ -932,7 +932,10 @@ mod tests {
             position_id: pid,
             entry_policy: EntryPolicy::ConfirmedTrend,
             approval_policy: ApprovalPolicy::Automatic,
-            strategy_id: Some(StrategyId { name: "sma_crossover".to_string(), version: 1 }),
+            strategy_id: Some(StrategyId {
+                name: "sma_crossover".to_string(),
+                version: 1,
+            }),
             timestamp: Utc::now(),
         }
     }
@@ -1090,7 +1093,8 @@ mod tests {
             order_requested_event(pid, sid),
             order_failed_event(pid, sid),
         ];
-        // Order failure: position stays Armed, detector re-armed → back to AwaitingSignal
+        // Order failure: position stays Armed, detector re-armed → back to
+        // AwaitingSignal
         assert_eq!(entry_lifecycle_stage(&events), EntryLifecycleStage::AwaitingSignal);
     }
 
@@ -1129,24 +1133,70 @@ mod tests {
         let sid = mk_signal_id();
 
         // Non-advancing events that must not affect the stage.
-        let noise_events: Vec<Event> = vec![
-            Event::TrailingStopUpdated {
-                position_id: pid,
-                previous_stop: Price::new(dec!(93000)).unwrap(),
-                new_stop: Price::new(dec!(93500)).unwrap(),
-                trigger_price: Price::new(dec!(94000)).unwrap(),
-                timestamp: Utc::now(),
-            },
-        ];
+        let noise_events: Vec<Event> = vec![Event::TrailingStopUpdated {
+            position_id: pid,
+            previous_stop: Price::new(dec!(93000)).unwrap(),
+            new_stop: Price::new(dec!(93500)).unwrap(),
+            trigger_price: Price::new(dec!(94000)).unwrap(),
+            timestamp: Utc::now(),
+        }];
 
         let test_sequences: Vec<(&str, Vec<Event>, EntryLifecycleStage)> = vec![
             ("intent_created", vec![armed_event(pid)], EntryLifecycleStage::IntentCreated),
-            ("awaiting_signal", vec![armed_event(pid), policy_resolved_event(pid)], EntryLifecycleStage::AwaitingSignal),
-            ("signal_confirmed", vec![armed_event(pid), policy_resolved_event(pid), signal_received_event(pid, sid)], EntryLifecycleStage::SignalConfirmed),
-            ("awaiting_approval", vec![armed_event(pid), policy_resolved_event(pid), signal_received_event(pid, sid), approval_pending_event(pid, sid)], EntryLifecycleStage::AwaitingApproval),
-            ("order_submitted", vec![armed_event(pid), policy_resolved_event(pid), signal_received_event(pid, sid), order_requested_event(pid, sid)], EntryLifecycleStage::OrderSubmitted),
-            ("active", vec![armed_event(pid), policy_resolved_event(pid), signal_received_event(pid, sid), order_requested_event(pid, sid), filled_event(pid)], EntryLifecycleStage::Active),
-            ("cancelled", vec![armed_event(pid), policy_resolved_event(pid), disarmed_event(pid)], EntryLifecycleStage::Cancelled),
+            (
+                "awaiting_signal",
+                vec![armed_event(pid), policy_resolved_event(pid)],
+                EntryLifecycleStage::AwaitingSignal,
+            ),
+            (
+                "signal_confirmed",
+                vec![
+                    armed_event(pid),
+                    policy_resolved_event(pid),
+                    signal_received_event(pid, sid),
+                ],
+                EntryLifecycleStage::SignalConfirmed,
+            ),
+            (
+                "awaiting_approval",
+                vec![
+                    armed_event(pid),
+                    policy_resolved_event(pid),
+                    signal_received_event(pid, sid),
+                    approval_pending_event(pid, sid),
+                ],
+                EntryLifecycleStage::AwaitingApproval,
+            ),
+            (
+                "order_submitted",
+                vec![
+                    armed_event(pid),
+                    policy_resolved_event(pid),
+                    signal_received_event(pid, sid),
+                    order_requested_event(pid, sid),
+                ],
+                EntryLifecycleStage::OrderSubmitted,
+            ),
+            (
+                "active",
+                vec![
+                    armed_event(pid),
+                    policy_resolved_event(pid),
+                    signal_received_event(pid, sid),
+                    order_requested_event(pid, sid),
+                    filled_event(pid),
+                ],
+                EntryLifecycleStage::Active,
+            ),
+            (
+                "cancelled",
+                vec![
+                    armed_event(pid),
+                    policy_resolved_event(pid),
+                    disarmed_event(pid),
+                ],
+                EntryLifecycleStage::Cancelled,
+            ),
         ];
 
         for (name, base_events, expected) in &test_sequences {
@@ -1191,7 +1241,11 @@ mod tests {
         assert_eq!(entry_lifecycle_stage(&events), EntryLifecycleStage::Cancelled);
 
         // Case 2: Armed → PolicyResolved → Disarmed.
-        let events = vec![armed_event(pid), policy_resolved_event(pid), disarmed_event(pid)];
+        let events = vec![
+            armed_event(pid),
+            policy_resolved_event(pid),
+            disarmed_event(pid),
+        ];
         assert_eq!(entry_lifecycle_stage(&events), EntryLifecycleStage::Cancelled);
 
         // Case 3: Armed → PolicyResolved → SignalReceived → Disarmed.

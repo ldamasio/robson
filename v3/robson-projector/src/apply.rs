@@ -190,8 +190,9 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
             handlers::positions::handle_position_armed(pool, envelope).await?
         },
         Some(ProjectionRoute::EntryPolicyResolved) => {
-            // Audit-only event. Records the resolved entry policy and strategy for
-            // replay and observability. Does not mutate positions_current.
+            // Audit-only event. Records the resolved entry policy and strategy
+            // for replay and observability. Does not mutate
+            // positions_current.
         },
         Some(ProjectionRoute::PositionDisarmed) => {
             handlers::positions::handle_position_disarmed(pool, envelope).await?
