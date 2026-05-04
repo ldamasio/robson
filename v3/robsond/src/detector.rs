@@ -48,15 +48,16 @@
 use std::sync::Arc;
 
 use robson_domain::{
-    DetectorSignal, EntryPolicy, EntryPolicyConfig, Event, Position, PositionId, Price, Side,
-    SignalEvaluationOutcome, Symbol, TechnicalStopAnalysisAudit, TechnicalStopConfidenceSnapshot,
-    TechnicalStopConfigSnapshot, TechnicalStopMethodSnapshot,
-};
-use robson_engine::technical_stop_analyzer::{
-    StopConfidence as AnalyzerStopConfidence, TechnicalStopAnalysis, TechnicalStopAnalyzer,
-    TechnicalStopConfig, TechnicalStopMethod as AnalyzerTechnicalStopMethod,
+    AnchorType, DetectorSignal, EntryPolicy, EntryPolicyConfig, Event, Position, PositionId, Price,
+    Side, SignalEvaluationOutcome, StopAnchor, Symbol, TechnicalStopAnalysisAudit,
+    TechnicalStopConfidenceSnapshot, TechnicalStopConfigSnapshot, TechnicalStopMethodSnapshot,
 };
 use robson_engine::{
+    stop_quality_classifier::{classify_stop_quality, StopQualityInput, StopQualityThresholds},
+    technical_stop_analyzer::{
+        StopConfidence as AnalyzerStopConfidence, TechnicalStopAnalysis, TechnicalStopAnalyzer,
+        TechnicalStopConfig, TechnicalStopMethod as AnalyzerTechnicalStopMethod,
+    },
     KeyLevelStrategy, ReversalPatternStrategy, SignalContext, SignalDecision, SmaCrossoverStrategy,
     StrategyRegistry,
 };
@@ -243,7 +244,8 @@ impl DetectorTask {
         )
     }
 
-    /// Create detector directly from an armed position and explicit entry policy.
+    /// Create detector directly from an armed position and explicit entry
+    /// policy.
     pub fn from_position_with_policy(
         position: &Position,
         entry_policy: EntryPolicyConfig,
@@ -506,6 +508,41 @@ impl DetectorTask {
 
         let analysis = self.compute_technical_stop(entry_price, side, &self.config.symbol).await?;
 
+        // Shadow metadata: StopAnchor + StopQuality (ADR-0035, shadow-only).
+        let stop_anchor = Self::build_stop_anchor(&analysis, side);
+        let stop_quality_input =
+            Self::build_stop_quality_input(entry_price, &analysis, stop_anchor.is_some());
+        let classification =
+            classify_stop_quality(&stop_quality_input, &StopQualityThresholds::default(), false);
+
+        // Shadow telemetry: extract fields before moving into audit.
+        let stop_anchor_present = stop_anchor.is_some();
+        let anchor_type = stop_anchor.as_ref().map(|a| a.anchor_type);
+        let stop_quality_class = classification.class;
+        let raw_score = classification.raw_score;
+        let boost_pct = classification.boost_pct;
+        let shadow_exceptional = classification.shadow_exceptional;
+        debug!(
+            position_id = %self.config.position_id,
+            symbol = %self.config.symbol.as_pair(),
+            side = ?side,
+            stop_anchor_present,
+            anchor_type = ?anchor_type,
+            stop_quality_class = ?stop_quality_class,
+            raw_score,
+            boost_pct = %boost_pct,
+            shadow_exceptional,
+            technical_stop_method = ?analysis.method,
+            technical_stop_confidence = ?analysis.confidence,
+            detected_levels_count = analysis.detected_levels.len(),
+            "stop-aware entry shadow telemetry"
+        );
+
+        let mut audit =
+            Self::build_technical_stop_audit(&analysis, &self.config.technical_stop_config);
+        audit.stop_anchor = stop_anchor.map(Box::new);
+        audit.stop_quality = Some(Box::new(classification));
+
         Ok(DetectorSignal::new(
             self.config.position_id,
             self.config.symbol.clone(),
@@ -513,10 +550,7 @@ impl DetectorTask {
             entry_price,
             analysis.stop_price,
         )
-        .with_technical_stop_analysis(Self::build_technical_stop_audit(
-            &analysis,
-            &self.config.technical_stop_config,
-        )))
+        .with_technical_stop_analysis(audit))
     }
 
     /// Compute the chart-derived stop for the detector signal.
@@ -558,6 +592,8 @@ impl DetectorTask {
                 min_stop_distance_pct: config.min_stop_distance_pct,
                 max_stop_distance_pct: config.max_stop_distance_pct,
             },
+            stop_anchor: None,
+            stop_quality: None,
         }
     }
 
@@ -579,6 +615,48 @@ impl DetectorTask {
             AnalyzerStopConfidence::High => TechnicalStopConfidenceSnapshot::High,
             AnalyzerStopConfidence::Medium => TechnicalStopConfidenceSnapshot::Medium,
             AnalyzerStopConfidence::Low => TechnicalStopConfidenceSnapshot::Low,
+        }
+    }
+
+    /// Build StopAnchor metadata from the technical stop analysis.
+    ///
+    /// Only SwingPoint stops produce a structural anchor. AtrFallback has no
+    /// real chart anchor, so it returns `None` (and `stop_anchor_valid = false`
+    /// for the quality classifier).
+    fn build_stop_anchor(analysis: &TechnicalStopAnalysis, side: Side) -> Option<StopAnchor> {
+        match analysis.method {
+            AnalyzerTechnicalStopMethod::SwingPoint { .. } => Some(StopAnchor {
+                anchor_type: match side {
+                    Side::Long => AnchorType::SwingLow,
+                    Side::Short => AnchorType::SwingHigh,
+                },
+                anchor_price: analysis.stop_price,
+                timeframe: "15m".to_string(),
+                source_event_id: None,
+                invalidation_reason: None,
+            }),
+            AnalyzerTechnicalStopMethod::AtrFallback => None,
+        }
+    }
+
+    /// Build classifier input from the analysis result.
+    ///
+    /// `stop_anchor_valid` is `true` only for SwingPoint stops (structural
+    /// anchor present). ATR fallback stops are valid protection mechanisms
+    /// but lack an explicit structural anchor.
+    fn build_stop_quality_input(
+        entry_price: Price,
+        analysis: &TechnicalStopAnalysis,
+        stop_anchor_valid: bool,
+    ) -> StopQualityInput {
+        let distance_pct = (entry_price.as_decimal() - analysis.stop_price.as_decimal()).abs()
+            / entry_price.as_decimal();
+        StopQualityInput {
+            stop_anchor_valid,
+            method: analysis.method,
+            confidence: analysis.confidence,
+            detected_levels_count: analysis.detected_levels.len(),
+            distance_pct,
         }
     }
 }
@@ -1302,5 +1380,175 @@ mod tests {
             // All should return None (cancelled)
             assert!(result.is_none(), "Detector should not emit signal on cancellation");
         }
+    }
+
+    // =========================================================================
+    // Stop-Aware Entry shadow metadata tests (Slice 003, ADR-0035)
+    // =========================================================================
+
+    fn make_swing_analysis(side: Side) -> TechnicalStopAnalysis {
+        let stop_price = match side {
+            Side::Long => Price::new(dec!(90)).unwrap(),
+            Side::Short => Price::new(dec!(110)).unwrap(),
+        };
+        TechnicalStopAnalysis {
+            stop_price,
+            method: AnalyzerTechnicalStopMethod::SwingPoint { level_n: 2 },
+            confidence: AnalyzerStopConfidence::High,
+            detected_levels: match side {
+                Side::Long => vec![Price::new(dec!(95)).unwrap(), Price::new(dec!(90)).unwrap()],
+                Side::Short => {
+                    vec![
+                        Price::new(dec!(105)).unwrap(),
+                        Price::new(dec!(110)).unwrap(),
+                    ]
+                },
+            },
+        }
+    }
+
+    fn make_atr_analysis() -> TechnicalStopAnalysis {
+        TechnicalStopAnalysis {
+            stop_price: Price::new(dec!(93)).unwrap(),
+            method: AnalyzerTechnicalStopMethod::AtrFallback,
+            confidence: AnalyzerStopConfidence::Low,
+            detected_levels: vec![],
+        }
+    }
+
+    #[test]
+    fn build_stop_anchor_swing_point_long_returns_swing_low() {
+        let analysis = make_swing_analysis(Side::Long);
+        let anchor = DetectorTask::build_stop_anchor(&analysis, Side::Long);
+        assert!(anchor.is_some());
+        let anchor = anchor.unwrap();
+        assert_eq!(anchor.anchor_type, AnchorType::SwingLow);
+        assert_eq!(anchor.anchor_price, Price::new(dec!(90)).unwrap());
+        assert_eq!(anchor.timeframe, "15m");
+        assert!(anchor.source_event_id.is_none());
+        assert!(anchor.invalidation_reason.is_none());
+    }
+
+    #[test]
+    fn build_stop_anchor_swing_point_short_returns_swing_high() {
+        let analysis = make_swing_analysis(Side::Short);
+        let anchor = DetectorTask::build_stop_anchor(&analysis, Side::Short);
+        assert!(anchor.is_some());
+        let anchor = anchor.unwrap();
+        assert_eq!(anchor.anchor_type, AnchorType::SwingHigh);
+        assert_eq!(anchor.anchor_price, Price::new(dec!(110)).unwrap());
+    }
+
+    #[test]
+    fn build_stop_anchor_atr_fallback_returns_none() {
+        let analysis = make_atr_analysis();
+        let anchor = DetectorTask::build_stop_anchor(&analysis, Side::Long);
+        assert!(anchor.is_none());
+    }
+
+    #[test]
+    fn build_stop_quality_input_atr_fallback_anchor_invalid() {
+        let analysis = make_atr_analysis();
+        let entry_price = Price::new(dec!(100)).unwrap();
+        let input = DetectorTask::build_stop_quality_input(entry_price, &analysis, false);
+        assert!(!input.stop_anchor_valid);
+        assert_eq!(input.method, AnalyzerTechnicalStopMethod::AtrFallback);
+        assert_eq!(input.confidence, AnalyzerStopConfidence::Low);
+        assert_eq!(input.detected_levels_count, 0);
+        assert_eq!(input.distance_pct, dec!(0.07));
+    }
+
+    #[tokio::test]
+    async fn create_signal_populates_stop_quality_shadow() {
+        use robson_engine::signal_strategy::SignalReason;
+
+        let config = DetectorConfig {
+            position_id: Uuid::now_v7(),
+            symbol: robson_domain::Symbol::from_pair("BTCUSDT").unwrap(),
+            side: Side::Long,
+            ma_fast_period: 9,
+            ma_slow_period: 21,
+            technical_stop_config: TechnicalStopConfig::default(),
+            entry_policy: EntryPolicyConfig::default(),
+        };
+        let event_bus = Arc::new(EventBus::new(10));
+        let cancel_token = create_test_cancel_token();
+        let detector = DetectorTask::new(config, event_bus, create_test_ohlcv(), cancel_token);
+
+        let decision = SignalDecision::SignalConfirmed {
+            side: Side::Long,
+            reason: SignalReason::Immediate,
+            observed_at: Utc::now(),
+            reference_price: dec!(100),
+        };
+
+        let signal = detector.create_signal(decision).await.unwrap();
+        let audit = signal.technical_stop_analysis.as_ref().expect("audit must be present");
+        assert!(audit.stop_quality.is_some(), "stop_quality must be populated in shadow mode");
+        assert!(audit.stop_anchor.is_some(), "stop_anchor must be populated for SwingPoint");
+    }
+
+    #[tokio::test]
+    async fn create_signal_does_not_return_exceptional() {
+        use robson_domain::StopQuality;
+        use robson_engine::signal_strategy::SignalReason;
+
+        let config = DetectorConfig {
+            position_id: Uuid::now_v7(),
+            symbol: robson_domain::Symbol::from_pair("BTCUSDT").unwrap(),
+            side: Side::Long,
+            ma_fast_period: 9,
+            ma_slow_period: 21,
+            technical_stop_config: TechnicalStopConfig::default(),
+            entry_policy: EntryPolicyConfig::default(),
+        };
+        let event_bus = Arc::new(EventBus::new(10));
+        let cancel_token = create_test_cancel_token();
+        let detector = DetectorTask::new(config, event_bus, create_test_ohlcv(), cancel_token);
+
+        let decision = SignalDecision::SignalConfirmed {
+            side: Side::Long,
+            reason: SignalReason::Immediate,
+            observed_at: Utc::now(),
+            reference_price: dec!(100),
+        };
+
+        let signal = detector.create_signal(decision).await.unwrap();
+        let audit = signal.technical_stop_analysis.as_ref().unwrap();
+        let sq = audit.stop_quality.as_ref().unwrap();
+        assert_ne!(
+            sq.class,
+            StopQuality::Exceptional,
+            "Exceptional must be impossible with exceptional_enabled=false"
+        );
+    }
+
+    #[tokio::test]
+    async fn create_signal_preserves_entry_and_stop_price() {
+        use robson_engine::signal_strategy::SignalReason;
+
+        let config = DetectorConfig {
+            position_id: Uuid::now_v7(),
+            symbol: robson_domain::Symbol::from_pair("BTCUSDT").unwrap(),
+            side: Side::Long,
+            ma_fast_period: 9,
+            ma_slow_period: 21,
+            technical_stop_config: TechnicalStopConfig::default(),
+            entry_policy: EntryPolicyConfig::default(),
+        };
+        let event_bus = Arc::new(EventBus::new(10));
+        let cancel_token = create_test_cancel_token();
+        let detector = DetectorTask::new(config, event_bus, create_test_ohlcv(), cancel_token);
+
+        let decision = SignalDecision::SignalConfirmed {
+            side: Side::Long,
+            reason: SignalReason::Immediate,
+            observed_at: Utc::now(),
+            reference_price: dec!(100),
+        };
+
+        let signal = detector.create_signal(decision).await.unwrap();
+        assert_eq!(signal.entry_price, Price::new(dec!(100)).unwrap());
+        assert_eq!(signal.stop_loss, Price::new(dec!(90)).unwrap());
     }
 }

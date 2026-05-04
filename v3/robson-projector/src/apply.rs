@@ -38,6 +38,7 @@ enum ProjectionRoute {
     StrategyDisabled,
     QueryStateChanged,
     PositionArmed,
+    EntryPolicyResolved,
     PositionDisarmed,
     ExitFilled,
     PositionClosedDomain,
@@ -92,6 +93,7 @@ fn projection_route(event_type: &str) -> Option<ProjectionRoute> {
 
         // Domain position lifecycle events (snake_case, emitted by robsond via executor)
         "position_armed" => Some(ProjectionRoute::PositionArmed),
+        "entry_policy_resolved" => Some(ProjectionRoute::EntryPolicyResolved),
         "position_disarmed" => Some(ProjectionRoute::PositionDisarmed),
         "exit_filled" | "EXIT_FILLED" => Some(ProjectionRoute::ExitFilled),
         "position_closed" => Some(ProjectionRoute::PositionClosedDomain),
@@ -187,6 +189,11 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
         Some(ProjectionRoute::PositionArmed) => {
             handlers::positions::handle_position_armed(pool, envelope).await?
         },
+        Some(ProjectionRoute::EntryPolicyResolved) => {
+            // Audit-only event. Records the resolved entry policy and strategy
+            // for replay and observability. Does not mutate
+            // positions_current.
+        },
         Some(ProjectionRoute::PositionDisarmed) => {
             handlers::positions::handle_position_disarmed(pool, envelope).await?
         },
@@ -224,6 +231,7 @@ mod tests {
         // current runtime path (robson-engine, robsond, robson-exec).
         let runtime_event_types = [
             "position_armed",
+            "entry_policy_resolved",
             "position_disarmed",
             "technical_stop_analyzed",
             "entry_signal_received",

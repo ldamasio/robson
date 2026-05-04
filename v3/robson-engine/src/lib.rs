@@ -33,6 +33,7 @@
 // Trading strategy modules
 pub mod risk;
 pub mod signal_strategy;
+pub mod stop_quality_classifier;
 pub mod technical_stop_analyzer;
 pub mod trailing_stop;
 

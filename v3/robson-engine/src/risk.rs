@@ -543,27 +543,24 @@ mod tests {
     #[test]
     fn test_risk_gate_rejects_duplicate_position() {
         let gate = RiskGate::new();
-        let context = RiskContext::with_positions(
-            dec!(10000),
-            vec![PositionSummary {
-                position_id: uuid::Uuid::nil(),
-                symbol: "BTCUSDT".to_string(),
-                side: "long".to_string(),
-                notional_value: dec!(1000),
-                initial_margin: dec!(100),
-                unrealized_pnl: dec!(0),
-                entry_price: dec!(50000),
-                quantity: dec!(0.02),
-                current_stop: dec!(48000),
-            }],
-        );
+        let context = RiskContext::with_positions(dec!(10000), vec![PositionSummary {
+            position_id: uuid::Uuid::nil(),
+            symbol: "BTCUSDT".to_string(),
+            side: "long".to_string(),
+            notional_value: dec!(1000),
+            initial_margin: dec!(100),
+            unrealized_pnl: dec!(0),
+            entry_price: dec!(50000),
+            quantity: dec!(0.02),
+            current_stop: dec!(48000),
+        }]);
         let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
-        assert!(matches!(
-            verdict,
-            RiskVerdict::Rejected { check: RiskCheck::DuplicatePosition, .. }
-        ));
+        assert!(matches!(verdict, RiskVerdict::Rejected {
+            check: RiskCheck::DuplicatePosition,
+            ..
+        }));
     }
 
     #[test]
@@ -582,10 +579,10 @@ mod tests {
         let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
-        assert!(matches!(
-            verdict,
-            RiskVerdict::Rejected { check: RiskCheck::MonthlyDrawdown, .. }
-        ));
+        assert!(matches!(verdict, RiskVerdict::Rejected {
+            check: RiskCheck::MonthlyDrawdown,
+            ..
+        }));
     }
 
     #[test]
@@ -679,20 +676,17 @@ mod tests {
     #[test]
     fn test_risk_gate_allows_same_symbol_opposite_side() {
         let gate = RiskGate::new();
-        let context = RiskContext::with_positions(
-            dec!(10000),
-            vec![PositionSummary {
-                position_id: uuid::Uuid::nil(),
-                symbol: "BTCUSDT".to_string(),
-                side: "short".to_string(),
-                notional_value: dec!(1000),
-                initial_margin: dec!(100),
-                unrealized_pnl: dec!(0),
-                entry_price: dec!(50000),
-                quantity: dec!(0.02),
-                current_stop: dec!(52000),
-            }],
-        );
+        let context = RiskContext::with_positions(dec!(10000), vec![PositionSummary {
+            position_id: uuid::Uuid::nil(),
+            symbol: "BTCUSDT".to_string(),
+            side: "short".to_string(),
+            notional_value: dec!(1000),
+            initial_margin: dec!(100),
+            unrealized_pnl: dec!(0),
+            entry_price: dec!(50000),
+            quantity: dec!(0.02),
+            current_stop: dec!(52000),
+        }]);
         let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
@@ -794,32 +788,26 @@ mod tests {
 
     #[test]
     fn test_latent_risk_sum_long() {
-        let ctx = RiskContext::with_positions(
-            dec!(10000),
-            vec![summary_with_stop(
-                "BTCUSDT",
-                "long",
-                dec!(80000),
-                dec!(78400),
-                dec!(0.001),
-            )],
-        );
+        let ctx = RiskContext::with_positions(dec!(10000), vec![summary_with_stop(
+            "BTCUSDT",
+            "long",
+            dec!(80000),
+            dec!(78400),
+            dec!(0.001),
+        )]);
         // LONG: (80000 - 78400) * 0.001 = 1.6
         assert_eq!(ctx.latent_risk_sum(), dec!(1.6));
     }
 
     #[test]
     fn test_latent_risk_sum_short() {
-        let ctx = RiskContext::with_positions(
-            dec!(10000),
-            vec![summary_with_stop(
-                "BTCUSDT",
-                "short",
-                dec!(80000),
-                dec!(81600),
-                dec!(0.001),
-            )],
-        );
+        let ctx = RiskContext::with_positions(dec!(10000), vec![summary_with_stop(
+            "BTCUSDT",
+            "short",
+            dec!(80000),
+            dec!(81600),
+            dec!(0.001),
+        )]);
         // SHORT: (81600 - 80000) * 0.001 = 1.6
         assert_eq!(ctx.latent_risk_sum(), dec!(1.6));
     }
@@ -827,32 +815,26 @@ mod tests {
     #[test]
     fn test_latent_risk_breakeven_stop() {
         // Stop at entry → risk = 0 (breakeven)
-        let ctx = RiskContext::with_positions(
-            dec!(10000),
-            vec![summary_with_stop(
-                "BTCUSDT",
-                "long",
-                dec!(80000),
-                dec!(80000),
-                dec!(0.001),
-            )],
-        );
+        let ctx = RiskContext::with_positions(dec!(10000), vec![summary_with_stop(
+            "BTCUSDT",
+            "long",
+            dec!(80000),
+            dec!(80000),
+            dec!(0.001),
+        )]);
         assert_eq!(ctx.latent_risk_sum(), dec!(0));
     }
 
     #[test]
     fn test_latent_risk_stop_beyond_entry() {
         // LONG with stop above entry → max(0, negative) = 0
-        let ctx = RiskContext::with_positions(
-            dec!(10000),
-            vec![summary_with_stop(
-                "BTCUSDT",
-                "long",
-                dec!(80000),
-                dec!(81000),
-                dec!(0.001),
-            )],
-        );
+        let ctx = RiskContext::with_positions(dec!(10000), vec![summary_with_stop(
+            "BTCUSDT",
+            "long",
+            dec!(80000),
+            dec!(81000),
+            dec!(0.001),
+        )]);
         assert_eq!(ctx.latent_risk_sum(), dec!(0));
     }
 

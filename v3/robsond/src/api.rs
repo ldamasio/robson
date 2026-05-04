@@ -1406,7 +1406,8 @@ mod tests {
             symbol,
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
-            stop_loss: Price::new(dec!(85500)).unwrap(), /* HumanConfirmation always requires approval */
+            stop_loss: Price::new(dec!(85500)).unwrap(), /* HumanConfirmation always requires
+                                                          * approval */
             technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };

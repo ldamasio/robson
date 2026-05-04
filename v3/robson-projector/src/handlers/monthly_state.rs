@@ -61,18 +61,18 @@ pub(crate) async fn handle_month_boundary_reset(
 
 /// Increment `trades_opened` for the month when an entry is filled.
 ///
-/// Extracts year/month from the event timestamp. UPSERT ensures idempotent replay.
+/// Extracts year/month from the event timestamp. UPSERT ensures idempotent
+/// replay.
 pub(crate) async fn handle_entry_filled_monthly(
     pool: &PgPool,
     envelope: &EventEnvelope,
 ) -> Result<()> {
-    let payload: EntryFilled =
-        serde_json::from_value(envelope.payload.clone()).map_err(|e| {
-            ProjectionError::InvalidPayload {
-                event_type: envelope.event_type.clone(),
-                reason: e.to_string(),
-            }
-        })?;
+    let payload: EntryFilled = serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+        ProjectionError::InvalidPayload {
+            event_type: envelope.event_type.clone(),
+            reason: e.to_string(),
+        }
+    })?;
 
     let year = envelope.occurred_at.year() as i16;
     let month = envelope.occurred_at.month() as i16;
@@ -96,8 +96,8 @@ pub(crate) async fn handle_entry_filled_monthly(
 
 /// Add realized loss from a closed position to `monthly_state`.
 ///
-/// Only net losses (realized_pnl - total_fees < 0) are counted, matching ADR-0024.
-/// Wins do NOT offset losses for slot calculation.
+/// Only net losses (realized_pnl - total_fees < 0) are counted, matching
+/// ADR-0024. Wins do NOT offset losses for slot calculation.
 pub(crate) async fn handle_position_closed_monthly(
     pool: &PgPool,
     envelope: &EventEnvelope,

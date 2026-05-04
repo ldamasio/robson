@@ -42,7 +42,7 @@ async fn main() -> anyhow::Result<()> {
     // Initialize tracing
     tracing_subscriber::registry()
         .with(fmt::layer())
-        .with(EnvFilter::from_default_env().add_directive("robsond=info".parse()?))
+        .with(EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("robsond=info")))
         .init();
 
     // Check for db subcommand

@@ -1,8 +1,9 @@
 //! Deterministic signal strategy engine.
 //!
-//! Entry policies resolve to strategy identifiers. Strategies evaluate persisted
-//! market data and return pure signal decisions. They do not size positions,
-//! compute technical stops, check risk, request approval, or execute orders.
+//! Entry policies resolve to strategy identifiers. Strategies evaluate
+//! persisted market data and return pure signal decisions. They do not size
+//! positions, compute technical stops, check risk, request approval, or execute
+//! orders.
 
 use std::{collections::HashMap, fmt};
 
@@ -759,13 +760,10 @@ mod tests {
         let strategy = ReversalPatternStrategy::new(3, 4);
         let decision = strategy.evaluate(ctx(Side::Long, candles));
 
-        assert!(matches!(
-            decision,
-            SignalDecision::SignalConfirmed {
-                reason: SignalReason::ReversalPattern { pattern: ReversalPattern::Hammer },
-                ..
-            }
-        ));
+        assert!(matches!(decision, SignalDecision::SignalConfirmed {
+            reason: SignalReason::ReversalPattern { pattern: ReversalPattern::Hammer },
+            ..
+        }));
     }
 
     #[test]
@@ -792,15 +790,12 @@ mod tests {
         let strategy = ReversalPatternStrategy::new(3, 5);
         let decision = strategy.evaluate(ctx(Side::Short, candles));
 
-        assert!(matches!(
-            decision,
-            SignalDecision::SignalConfirmed {
-                reason: SignalReason::ReversalPattern {
-                    pattern: ReversalPattern::BearishEngulfing
-                },
-                ..
-            }
-        ));
+        assert!(matches!(decision, SignalDecision::SignalConfirmed {
+            reason: SignalReason::ReversalPattern {
+                pattern: ReversalPattern::BearishEngulfing
+            },
+            ..
+        }));
     }
 
     #[test]
@@ -885,7 +880,11 @@ mod tests {
         let sma_strategy = registry.get(&sma_id).expect("sma strategy registered");
         let first = sma_strategy.evaluate(sma_ctx.clone());
         for _ in 0..100 {
-            assert_eq!(sma_strategy.evaluate(sma_ctx.clone()), first, "SMA strategy not deterministic");
+            assert_eq!(
+                sma_strategy.evaluate(sma_ctx.clone()),
+                first,
+                "SMA strategy not deterministic"
+            );
         }
 
         // Reversal pattern candles (long hammer).
@@ -900,7 +899,11 @@ mod tests {
         let rev_strategy = registry.get(&rev_id).expect("reversal strategy registered");
         let first = rev_strategy.evaluate(rev_ctx.clone());
         for _ in 0..100 {
-            assert_eq!(rev_strategy.evaluate(rev_ctx.clone()), first, "Reversal strategy not deterministic");
+            assert_eq!(
+                rev_strategy.evaluate(rev_ctx.clone()),
+                first,
+                "Reversal strategy not deterministic"
+            );
         }
 
         // Key level candles (support reaction).
@@ -919,7 +922,11 @@ mod tests {
         let kl_strategy = registry.get(&kl_id).expect("key level strategy registered");
         let first = kl_strategy.evaluate(kl_ctx.clone());
         for _ in 0..100 {
-            assert_eq!(kl_strategy.evaluate(kl_ctx.clone()), first, "Key level strategy not deterministic");
+            assert_eq!(
+                kl_strategy.evaluate(kl_ctx.clone()),
+                first,
+                "Key level strategy not deterministic"
+            );
         }
     }
 }
