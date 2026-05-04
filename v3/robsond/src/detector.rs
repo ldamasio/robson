@@ -509,7 +509,7 @@ impl DetectorTask {
 
         let analysis = self.compute_technical_stop(entry_price, side, &self.config.symbol).await?;
 
-        // Shadow metadata: StopAnchor + StopQuality (ADR-0024, shadow-only).
+        // Shadow metadata: StopAnchor + StopQuality (ADR-0035, shadow-only).
         let stop_anchor = Self::build_stop_anchor(&analysis, side);
         let stop_quality_input =
             Self::build_stop_quality_input(entry_price, &analysis, stop_anchor.is_some());
@@ -1388,7 +1388,7 @@ mod tests {
     }
 
     // =========================================================================
-    // Stop-Aware Entry shadow metadata tests (Slice 003, ADR-0024)
+    // Stop-Aware Entry shadow metadata tests (Slice 003, ADR-0035)
     // =========================================================================
 
     fn make_swing_analysis(side: Side) -> TechnicalStopAnalysis {

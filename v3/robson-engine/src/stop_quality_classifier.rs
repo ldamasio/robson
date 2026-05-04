@@ -1,4 +1,4 @@
-//! Stop Quality Classifier (ADR-0024)
+//! Stop Quality Classifier (ADR-0035)
 //!
 //! Rule-based classification of stop region quality. Pure function with
 //! no I/O, no side effects, and no dependency on detector or runtime.
@@ -176,7 +176,7 @@ fn levels_points(count: usize, config: &StopQualityThresholds) -> i32 {
 /// Pure function: no I/O, no side effects, no events.
 /// `exceptional_enabled` must be explicitly `true` to allow Exceptional
 /// classification. In production this parameter MUST be `false` until
-/// operational evidence supports enabling it (ADR-0024 Phase 5).
+/// operational evidence supports enabling it (ADR-0035 Phase 5).
 pub fn classify_stop_quality(
     input: &StopQualityInput,
     config: &StopQualityThresholds,

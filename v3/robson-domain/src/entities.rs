@@ -539,7 +539,7 @@ pub enum TechnicalStopConfidenceSnapshot {
 }
 
 // =============================================================================
-// Stop-Aware Entry Types (ADR-0024)
+// Stop-Aware Entry Types (ADR-0035)
 // =============================================================================
 
 /// Classification of anchor types for a technical stop.
@@ -639,10 +639,10 @@ pub struct TechnicalStopAnalysisAudit {
     pub detected_levels: Vec<Price>,
     /// Analyzer configuration snapshot used to produce this result.
     pub config: TechnicalStopConfigSnapshot,
-    /// Explicit metadata about the stop anchor event (ADR-0024).
+    /// Explicit metadata about the stop anchor event (ADR-0035).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_anchor: Option<Box<StopAnchor>>,
-    /// Stop quality classification in shadow mode (ADR-0024).
+    /// Stop quality classification in shadow mode (ADR-0035).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_quality: Option<Box<StopQualityClassification>>,
 }
