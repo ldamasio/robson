@@ -2789,6 +2789,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         Ok(self.store.positions().find_by_id(position_id).await?)
     }
 
+    /// Get the latest market price from the exchange.
+    pub async fn get_market_price(&self, symbol: &Symbol) -> DaemonResult<Price> {
+        Ok(self.executor.get_price(symbol).await?)
+    }
+
     /// Get all open core positions.
     ///
     /// Includes Armed, Entering, Active, and Exiting positions.

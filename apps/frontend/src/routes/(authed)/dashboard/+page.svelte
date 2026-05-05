@@ -11,7 +11,7 @@
   import { haltStatus } from '$stores/slots';
   import { recentEvents, pushEvent } from '$stores/events';
   import { toasts, showToast } from '$stores/toast';
-  import { deriveSlots } from '$lib/config/slots';
+  import { deriveSlots, sortPositionsOldestFirst } from '$lib/config/slots';
   import { formatTimeUtc, isTodayUtc } from '$lib/utils/time';
   import {
     positionLabel,
@@ -40,7 +40,7 @@
   let occupied = $derived(slots.filter((s) => s.occupied).length);
   let displayedSlots = $derived(slots.length);
   let free = $derived(newSlotsAvailable);
-  let activeOps = $derived(positions.filter((p) => isPositionActive(p.state)));
+  let activeOps = $derived(sortPositionsOldestFirst(positions.filter((p) => isPositionActive(p.state))));
   let todayEvents = $derived($recentEvents.filter((e) => isTodayUtc(e.occurred_at)));
   let haltState = $derived($haltStatus?.state ?? 'active');
 
@@ -53,11 +53,17 @@
     return `${m}m ${s}s`;
   }
 
-  function pnlFor(p: Position): number | null {
+  function variationFor(p: Position): number | null {
+    if (p.variation_pct !== undefined) return p.variation_pct;
     if (typeof p.state === 'object' && 'Closed' in p.state) {
-      return Number(p.state.Closed.realized_pnl);
+      const entry = p.entry_price;
+      const exit = Number(p.state.Closed.exit_price);
+      if (entry && Number.isFinite(exit)) {
+        const diff = p.side === 'Short' ? entry - exit : exit - entry;
+        return (diff / entry) * 100;
+      }
     }
-    return p.pnl ?? p.realized_pnl ?? null;
+    return null;
   }
 
   function monthLabel(): string {
@@ -263,13 +269,13 @@
                     <div class="eyebrow">{positionLabel(op)}</div>
                     <Row justify="between">
                       <span class="meta">{positionStateLabel(op.state)}</span>
-                      {#if pnlFor(op) !== null}
+                      {#if variationFor(op) !== null}
                         <span
                           class="mono"
-                          class:ok={(pnlFor(op) ?? 0) > 0}
-                          class:err={(pnlFor(op) ?? 0) < 0}
+                          class:ok={(variationFor(op) ?? 0) > 0}
+                          class:err={(variationFor(op) ?? 0) < 0}
                         >
-                          {(pnlFor(op) ?? 0) > 0 ? '+' : ''}{pnlFor(op)?.toFixed(2)}%
+                          {(variationFor(op) ?? 0) > 0 ? '+' : ''}{variationFor(op)?.toFixed(2)}%
                         </span>
                       {/if}
                     </Row>

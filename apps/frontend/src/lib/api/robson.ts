@@ -22,8 +22,10 @@ export type Position = {
   quantity: number | null;
   realized_pnl: number | null;
   pnl?: number | null;
+  variation_pct?: number | null;
   fees_paid: number | null;
   trailing_stop?: number | null;
+  current_price?: number | null;
   entry_order_id: string | null;
   exit_order_id: string | null;
   insurance_stop_id: string | null;
@@ -174,8 +176,10 @@ function normalizePosition(raw: unknown): Position {
     quantity: toNumber(p.quantity),
     realized_pnl: toNumber(p.realized_pnl),
     pnl: toNumber(p.pnl),
+    variation_pct: toNumber(p.variation_pct),
     fees_paid: toNumber(p.fees_paid),
     trailing_stop: toNumber(p.trailing_stop),
+    current_price: toNumber(p.current_price),
     entry_order_id: p.entry_order_id == null ? null : String(p.entry_order_id),
     exit_order_id: p.exit_order_id == null ? null : String(p.exit_order_id),
     insurance_stop_id: p.insurance_stop_id == null ? null : String(p.insurance_stop_id),

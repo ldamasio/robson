@@ -12,7 +12,7 @@
 
 use std::sync::Arc;
 
-use robson_domain::{Event, ExitReason, Position, PositionId, RiskConfig};
+use robson_domain::{Event, ExitReason, PositionId, Price, RiskConfig, Symbol};
 use robson_engine::EngineAction;
 use robson_store::Store;
 use tracing::{debug, error, info};
@@ -83,6 +83,11 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
     /// Create a new executor.
     pub fn new(exchange: Arc<E>, journal: Arc<IntentJournal>, store: Arc<S>) -> Self {
         Self { exchange, journal, store }
+    }
+
+    /// Return the latest exchange price for a symbol.
+    pub async fn get_price(&self, symbol: &Symbol) -> ExecResult<Price> {
+        self.exchange.get_price(symbol).await
     }
 
     /// Execute a list of engine actions.

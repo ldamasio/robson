@@ -122,7 +122,11 @@ pub struct PositionSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trailing_stop: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_price: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub pnl: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub variation_pct: Option<Decimal>,
 }
 
 /// Summary of a pending approval query for REST bootstrap.
@@ -608,7 +612,10 @@ where
     let occupied_slots = positions.len();
     let slot_cells_total = occupied_slots.saturating_add(new_slots_available as usize);
 
-    let summaries: Vec<PositionSummary> = positions.iter().map(position_to_summary).collect();
+    let mut summaries: Vec<PositionSummary> = Vec::with_capacity(positions.len());
+    for position in &positions {
+        summaries.push(position_to_summary_with_live_price(&manager, position).await);
+    }
 
     // Update active positions gauge
     crate::metrics::ACTIVE_POSITIONS.set(summaries.len() as f64);
@@ -660,7 +667,7 @@ where
                 )
             })?;
 
-    Ok(Json(position_to_summary(&position)))
+    Ok(Json(position_to_summary_with_live_price(&manager, &position).await))
 }
 
 /// Arm a new position.
@@ -1009,24 +1016,73 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
     (status, Json(ErrorResponse { error: error.to_string() }))
 }
 
-fn position_to_summary(position: &Position) -> PositionSummary {
-    let (state_str, entry_price, trailing_stop, pnl) = match &position.state {
-        PositionState::Armed => ("Armed".to_string(), None, None, None),
-        PositionState::Entering { expected_entry, .. } => {
-            ("Entering".to_string(), Some(expected_entry.as_decimal()), None, None)
+async fn position_to_summary_with_live_price<E, S>(
+    manager: &PositionManager<E, S>,
+    position: &Position,
+) -> PositionSummary
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let live_price = match &position.state {
+        PositionState::Active { .. } | PositionState::Exiting { .. } => {
+            match manager.get_market_price(&position.symbol).await {
+                Ok(price) => Some(price),
+                Err(error) => {
+                    warn!(
+                        position_id = %position.id,
+                        symbol = %position.symbol,
+                        %error,
+                        "failed to fetch live market price for position summary"
+                    );
+                    None
+                },
+            }
         },
-        PositionState::Active { trailing_stop, .. } => (
-            "Active".to_string(),
-            position.entry_price.map(|p| p.as_decimal()),
-            Some(trailing_stop.as_decimal()),
-            Some(position.calculate_pnl()),
-        ),
-        PositionState::Exiting { .. } => (
-            "Exiting".to_string(),
-            position.entry_price.map(|p| p.as_decimal()),
+        _ => None,
+    };
+
+    position_to_summary(position, live_price)
+}
+
+fn position_to_summary(position: &Position, live_price: Option<Price>) -> PositionSummary {
+    let (state_str, entry_price, trailing_stop, current_price, pnl, variation_pct) = match &position
+        .state
+    {
+        PositionState::Armed => ("Armed".to_string(), None, None, None, None, None),
+        PositionState::Entering { expected_entry, .. } => (
+            "Entering".to_string(),
+            Some(expected_entry.as_decimal()),
             None,
-            Some(position.calculate_pnl()),
+            None,
+            None,
+            None,
         ),
+        PositionState::Active { current_price, trailing_stop, .. } => {
+            let observed_price = live_price.unwrap_or(*current_price);
+            let valuation_price =
+                stop_trigger_price(position.side, observed_price, *trailing_stop)
+                    .unwrap_or(observed_price);
+            (
+                "Active".to_string(),
+                position.entry_price.map(|p| p.as_decimal()),
+                Some(trailing_stop.as_decimal()),
+                Some(observed_price.as_decimal()),
+                pnl_at_price(position, valuation_price),
+                variation_pct_at_price(position, valuation_price),
+            )
+        },
+        PositionState::Exiting { .. } => {
+            let current_price = live_price;
+            (
+                "Exiting".to_string(),
+                position.entry_price.map(|p| p.as_decimal()),
+                None,
+                current_price.map(|p| p.as_decimal()),
+                current_price.and_then(|p| pnl_at_price(position, p)),
+                current_price.and_then(|p| variation_pct_at_price(position, p)),
+            )
+        },
         PositionState::Closed { exit_price, exit_reason, .. } => {
             let realized_pnl = if let PositionState::Closed { realized_pnl, .. } = &position.state {
                 *realized_pnl
@@ -1037,11 +1093,15 @@ fn position_to_summary(position: &Position) -> PositionSummary {
                 format!("Closed ({:?})", exit_reason),
                 position.entry_price.map(|p| p.as_decimal()),
                 Some(exit_price.as_decimal()),
+                Some(exit_price.as_decimal()),
                 Some(realized_pnl),
+                variation_pct_at_price(position, *exit_price),
             )
         },
-        PositionState::Error { error, .. } => (format!("Error: {}", error), None, None, None),
-        PositionState::Cancelled => ("Cancelled".to_string(), None, None, None),
+        PositionState::Error { error, .. } => {
+            (format!("Error: {}", error), None, None, None, None, None)
+        },
+        PositionState::Cancelled => ("Cancelled".to_string(), None, None, None, None, None),
     };
 
     PositionSummary {
@@ -1057,8 +1117,41 @@ fn position_to_summary(position: &Position) -> PositionSummary {
         },
         entry_price,
         trailing_stop,
+        current_price,
         pnl,
+        variation_pct,
     }
+}
+
+fn pnl_at_price(position: &Position, current_price: Price) -> Option<Decimal> {
+    let entry_price = position.entry_price?.as_decimal();
+    let quantity = position.quantity.as_decimal();
+    Some(match position.side {
+        Side::Long => (current_price.as_decimal() - entry_price) * quantity,
+        Side::Short => (entry_price - current_price.as_decimal()) * quantity,
+    })
+}
+
+fn variation_pct_at_price(position: &Position, current_price: Price) -> Option<Decimal> {
+    let entry_price = position.entry_price?.as_decimal();
+    if entry_price <= Decimal::ZERO {
+        return None;
+    }
+
+    let diff = match position.side {
+        Side::Long => current_price.as_decimal() - entry_price,
+        Side::Short => entry_price - current_price.as_decimal(),
+    };
+    Some((diff / entry_price) * Decimal::new(100, 0))
+}
+
+fn stop_trigger_price(side: Side, current_price: Price, trailing_stop: Price) -> Option<Price> {
+    let is_hit = match side {
+        Side::Long => current_price.as_decimal() <= trailing_stop.as_decimal(),
+        Side::Short => current_price.as_decimal() >= trailing_stop.as_decimal(),
+    };
+
+    is_hit.then_some(trailing_stop)
 }
 
 // =============================================================================
@@ -1082,6 +1175,69 @@ mod tests {
 
     use super::*;
     use crate::query_engine::TracingQueryRecorder;
+
+    #[test]
+    fn position_summary_uses_live_price_for_active_variation_pct_before_stop() {
+        let mut position =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        position.entry_price = Some(Price::new(dec!(100)).unwrap());
+        position.quantity = robson_domain::Quantity::new(dec!(2)).unwrap();
+        position.state = PositionState::Active {
+            current_price: Price::new(dec!(100)).unwrap(),
+            trailing_stop: Price::new(dec!(95)).unwrap(),
+            favorable_extreme: Price::new(dec!(105)).unwrap(),
+            extreme_at: chrono::Utc::now(),
+            insurance_stop_id: None,
+            last_emitted_stop: None,
+        };
+
+        let summary = position_to_summary(&position, Some(Price::new(dec!(98)).unwrap()));
+
+        assert_eq!(summary.current_price, Some(dec!(98)));
+        assert_eq!(summary.pnl, Some(dec!(-4)));
+        assert_eq!(summary.variation_pct, Some(dec!(-2.00)));
+    }
+
+    #[test]
+    fn position_summary_uses_trailing_stop_for_active_variation_pct_after_stop_hit() {
+        let mut position =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        position.entry_price = Some(Price::new(dec!(100)).unwrap());
+        position.quantity = robson_domain::Quantity::new(dec!(2)).unwrap();
+        position.state = PositionState::Active {
+            current_price: Price::new(dec!(100)).unwrap(),
+            trailing_stop: Price::new(dec!(95)).unwrap(),
+            favorable_extreme: Price::new(dec!(105)).unwrap(),
+            extreme_at: chrono::Utc::now(),
+            insurance_stop_id: None,
+            last_emitted_stop: None,
+        };
+
+        let summary = position_to_summary(&position, Some(Price::new(dec!(90)).unwrap()));
+
+        assert_eq!(summary.current_price, Some(dec!(90)));
+        assert_eq!(summary.pnl, Some(dec!(-10)));
+        assert_eq!(summary.variation_pct, Some(dec!(-5.00)));
+    }
+
+    #[test]
+    fn position_summary_uses_exit_price_for_closed_variation_pct() {
+        let mut position =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Short);
+        position.entry_price = Some(Price::new(dec!(100)).unwrap());
+        position.quantity = robson_domain::Quantity::new(dec!(2)).unwrap();
+        position.state = PositionState::Closed {
+            exit_price: Price::new(dec!(90)).unwrap(),
+            realized_pnl: dec!(20),
+            exit_reason: robson_domain::ExitReason::UserPanic,
+        };
+
+        let summary = position_to_summary(&position, None);
+
+        assert_eq!(summary.current_price, Some(dec!(90)));
+        assert_eq!(summary.pnl, Some(dec!(20)));
+        assert_eq!(summary.variation_pct, Some(dec!(10.0)));
+    }
 
     async fn create_test_app_with_event_bus(
         capacity: usize,

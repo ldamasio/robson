@@ -1,5 +1,5 @@
 import { describe, it, expect } from 'vitest';
-import { deriveSlots, occupiedCount } from '$lib/config/slots';
+import { deriveSlots, occupiedCount, sortPositionsOldestFirst } from '$lib/config/slots';
 import type { PositionState } from '$api/robson';
 
 const activeState: PositionState = {
@@ -60,6 +60,30 @@ describe('deriveSlots', () => {
     expect(result).toHaveLength(7);
     expect(result.filter((s) => s.occupied)).toHaveLength(3);
     expect(result.filter((s) => !s.occupied)).toHaveLength(4);
+  });
+
+  it('orders occupied slots from oldest to newest and leaves free slots on the right', () => {
+    const positions = [
+      { id: 'newest', state: activeState, created_at: '2026-05-05T10:00:00Z' },
+      { id: 'oldest', state: activeState, created_at: '2026-04-22T06:24:42Z' },
+      { id: 'middle', state: 'Armed' as PositionState, created_at: '2026-04-26T23:03:11Z' }
+    ];
+    const result = deriveSlots(positions, 5);
+
+    expect(result.map((s) => s.positionId)).toEqual(['oldest', 'middle', 'newest', null, null]);
+    expect(result.slice(0, 3).every((s) => s.occupied)).toBe(true);
+    expect(result.slice(3).every((s) => !s.occupied)).toBe(true);
+  });
+});
+
+describe('sortPositionsOldestFirst', () => {
+  it('keeps positions without valid timestamps after dated positions', () => {
+    const sorted = sortPositionsOldestFirst([
+      { id: 'undated' },
+      { id: 'dated', created_at: '2026-04-22T06:24:42Z' }
+    ]);
+
+    expect(sorted.map((p) => p.id)).toEqual(['dated', 'undated']);
   });
 });
 

@@ -32,6 +32,7 @@ docs/
 ├── AGENTIC-TRADING.md               # Trading/agentic lifecycle philosophy
 ├── LANGUAGE-POLICY.md               # English-only policy and rationale
 ├── STYLE_GUIDE.md                   # Code style conventions (Python-era)
+├── technical-debt.md                # Central technical debt register
 ├── ADRs.md                          # Architecture Decision Records index
 ├── adr/                             # Architecture Decision Records
 │   ├── ADR-TEMPLATE.md
@@ -132,6 +133,7 @@ docs/
 **Architecture**:
 - [System Architecture](ARCHITECTURE.md) - Architecture overview
 - [ADRs Index](ADRs.md) - All architectural decisions
+- [Technical Debt Register](technical-debt.md) - Central list of known debt
 
 **Contributing**:
 - [CONTRIBUTING.md](../CONTRIBUTING.md) - Contribution guidelines
@@ -148,6 +150,7 @@ docs/
 - [Deployment Checklist](runbooks/deployment-checklist.md) - Deployment procedures
 - [ArgoCD Setup](runbooks/argocd-initial-setup.md) - ArgoCD configuration
 - [CI/CD Image Tagging](runbooks/ci-cd-image-tagging.md) - Image versioning
+- [Technical Debt Register](technical-debt.md) - Production-relevant known debt
 
 **Infrastructure**:
 - [ADR-0011: GitOps Auto-Deploy](adr/ADR-0011-gitops-automatic-manifest-updates.md)
