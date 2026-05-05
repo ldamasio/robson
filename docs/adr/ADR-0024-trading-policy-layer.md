@@ -245,11 +245,11 @@ MIG-v3#12 is a hard prerequisite for VAL-002 (real capital activation).
 
 **Frontend follow-up (2026-04-27, Option 2 — Slot Count from API Only)**:
 
-MIG-v3#12's dynamic `slots_available` is computed by the backend but not yet exposed to the frontend. The frontend hardcodes `INITIAL_MONTHLY_SLOT_BUDGET = 4` in `apps/frontend/src/lib/config/slots.ts`. The follow-up work (tracked as MIG-v3#12 sub-step in the migration plan) wires the value through:
+MIG-v3#12's dynamic new-entry capacity is computed by the backend and exposed to the frontend through explicit `/status` fields. The frontend must not infer rendered cell count from the monthly budget because carried positions remain occupied across month boundaries.
 
-1. Backend: add `slots_available: u32` to `StatusResponse` in `v3/robsond/src/api.rs`.
-2. Frontend: add `slots_available?: number` to the TypeScript `StatusResponse` type in `robson.ts`, with a fallback of `4` in `normalizeStatus` for the rollout window.
-3. Frontend: refactor `deriveSlots()` to accept the API value as a parameter and remove `INITIAL_MONTHLY_SLOT_BUDGET`.
+1. Backend: expose `new_slots_available`, `occupied_slots`, and `slot_cells_total` in `StatusResponse`.
+2. Frontend: add those fields to the TypeScript `StatusResponse` type in `robson.ts`; no fallback-to-4.
+3. Frontend: refactor `deriveSlots()` to accept `slot_cells_total`.
 
 Full Risk Dashboard (budget bar, realized-loss display) is deferred to MIG-v3#14. See [ADR-0034](ADR-0034-frontend-slot-count-api-only.md) for the decision record.
 

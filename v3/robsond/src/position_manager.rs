@@ -2810,11 +2810,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         Ok(open.len())
     }
 
-    /// Compute dynamic slot count from persisted monthly state and open
-    /// positions.
+    /// Compute dynamic count of new slots available from persisted monthly
+    /// state and open positions.
     ///
-    /// Used by `/status` API to expose `slots_available` (MIG-v3#12 follow-up,
-    /// ADR-0034).
+    /// Used by `/status` API to expose `new_slots_available` (MIG-v3#12
+    /// follow-up, ADR-0034).
     pub async fn compute_slots_available(&self) -> DaemonResult<u32> {
         let now = chrono::Utc::now();
         let monthly = self.load_monthly_state(now).await?;

@@ -99,7 +99,12 @@ pub struct StatusResponse {
     pub active_positions: usize,
     pub positions: Vec<PositionSummary>,
     pub pending_approvals: Vec<PendingApprovalSummary>,
-    pub slots_available: u32,
+    /// Slots available for new entries under the current monthly risk budget.
+    pub new_slots_available: u32,
+    /// Slots currently occupied by open core positions.
+    pub occupied_slots: usize,
+    /// Total cells the UI should render: occupied slots plus new slots.
+    pub slot_cells_total: usize,
 }
 
 /// Summary of a position.
@@ -598,7 +603,10 @@ where
     let manager = state.position_manager.read().await;
     let positions = manager.get_open_positions().await.map_err(|e| to_error_response(e))?;
     let pending_approvals = manager.get_pending_approvals().await;
-    let slots_available = manager.compute_slots_available().await.unwrap_or(4);
+    let new_slots_available =
+        manager.compute_slots_available().await.map_err(|e| to_error_response(e))?;
+    let occupied_slots = positions.len();
+    let slot_cells_total = occupied_slots.saturating_add(new_slots_available as usize);
 
     let summaries: Vec<PositionSummary> = positions.iter().map(position_to_summary).collect();
 
@@ -622,7 +630,9 @@ where
         active_positions: summaries.len(),
         positions: summaries,
         pending_approvals: pending_summaries,
-        slots_available,
+        new_slots_available,
+        occupied_slots,
+        slot_cells_total,
     }))
 }
 
@@ -1366,6 +1376,9 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let status: StatusResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(status.active_positions, 1);
+        assert_eq!(status.occupied_slots, 1);
+        assert_eq!(status.new_slots_available, 4);
+        assert_eq!(status.slot_cells_total, 5);
         assert_eq!(status.pending_approvals.len(), 1);
         assert_eq!(status.pending_approvals[0].query_id, query_id);
         assert_eq!(status.pending_approvals[0].position_id, Some(position.id));
