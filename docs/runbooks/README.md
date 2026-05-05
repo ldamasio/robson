@@ -95,6 +95,7 @@ If something goes wrong:
 | Scenario | Runbook | Time |
 |----------|---------|------|
 | Production deployment | [deployment-checklist.md](deployment-checklist.md) | 15 min |
+| Robsond DB migrations | [robsond-db-migrations.md](robsond-db-migrations.md) | Deploy-time hook |
 | Shared staging validation | [deployment-checklist.md](deployment-checklist.md) | 10 min |
 | Rollback / sync recovery | [argocd-initial-setup.md](argocd-initial-setup.md) | 10 min |
 

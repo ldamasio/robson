@@ -5,13 +5,14 @@
 use std::env;
 
 use anyhow::{anyhow, Result};
-use robson_db::{init_minimal_data, migrate, status};
+use robson_db::{init_minimal_data, migrate, repair_known_migration_state, status};
 use tracing::info;
 
 /// Run database CLI subcommands.
 ///
 /// Supported commands:
 /// - `robsond db migrate` - Run pending migrations
+/// - `robsond db repair` - Normalize known historical migration metadata drift
 /// - `robsond db status` - Check migration status
 /// - `robsond db init [--tenant-id UUID] [--account-id UUID]` - Seed minimal
 ///   data
@@ -28,6 +29,9 @@ pub async fn run_db_command(args: Vec<String>) -> Result<()> {
     match args[2].as_str() {
         "migrate" => {
             migrate(&pool).await?;
+        },
+        "repair" => {
+            repair_known_migration_state(&pool).await?;
         },
         "status" => {
             status(&pool).await?;
@@ -70,7 +74,10 @@ pub async fn run_db_command(args: Vec<String>) -> Result<()> {
             println!("ACCOUNT_ID={}", aid);
         },
         _ => {
-            return Err(anyhow!("Unknown db command: {}. Use migrate, status, or init", args[2]));
+            return Err(anyhow!(
+                "Unknown db command: {}. Use migrate, repair, status, or init",
+                args[2]
+            ));
         },
     }
 

@@ -2,7 +2,7 @@
 //!
 //! Seeds tenant/account/strategy rows for system startup.
 
-use sqlx::{PgPool, Row};
+use sqlx::PgPool;
 use tracing::info;
 use uuid::Uuid;
 

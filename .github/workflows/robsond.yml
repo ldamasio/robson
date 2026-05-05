@@ -26,6 +26,19 @@ jobs:
   test:
     name: Rust Tests
     runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16-alpine
+        env:
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: robson_migration_ci
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
     defaults:
       run:
         working-directory: v3
@@ -47,6 +60,11 @@ jobs:
 
       - name: Run tests (no postgres feature - uses MemoryStore)
         run: cargo test --all --no-fail-fast
+
+      - name: Validate SQLx migrations on clean PostgreSQL
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/robson_migration_ci
+        run: cargo run -p robsond --features postgres -- db migrate
 
       - name: Install nightly toolchain (for rustfmt)
         run: rustup toolchain install nightly --component rustfmt

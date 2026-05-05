@@ -10,6 +10,7 @@
 //!
 //! # Database migrations
 //! robsond db migrate
+//! robsond db repair
 //! robsond db status
 //! robsond db init [--tenant-id UUID] [--account-id UUID]
 //!
