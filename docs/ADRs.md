@@ -37,5 +37,6 @@ Index
 | ADR-0021 | Opportunity Detection vs Technical Stop Analysis | Decided — implementation gap resolved (2026-04-15) | 2026-04-15 |
 | ADR-0022 | Robson-Authored Position Invariant | Decided (Follow-up required) | 2026-04-18 |
 | ADR-0023 | Symbol-Agnostic Policy Invariant | Decided (Follow-up required) | 2026-04-18 |
+| ADR-0036 | Monthly Slot Inheritance and Stop Visibility | Decided | 2026-05-05 |
 
 Files located in `docs/adr/`.
