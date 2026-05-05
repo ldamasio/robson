@@ -1060,9 +1060,8 @@ fn position_to_summary(position: &Position, live_price: Option<Price>) -> Positi
         ),
         PositionState::Active { current_price, trailing_stop, .. } => {
             let observed_price = live_price.unwrap_or(*current_price);
-            let valuation_price =
-                stop_trigger_price(position.side, observed_price, *trailing_stop)
-                    .unwrap_or(observed_price);
+            let valuation_price = stop_trigger_price(position.side, observed_price, *trailing_stop)
+                .unwrap_or(observed_price);
             (
                 "Active".to_string(),
                 position.entry_price.map(|p| p.as_decimal()),
