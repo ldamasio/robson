@@ -8,9 +8,9 @@ export type SlotCell = {
   state: PositionState | null;
 };
 
-export function deriveSlots(positions: { id: string; state: PositionState }[], slotsAvailable: number): SlotCell[] {
+export function deriveSlots(positions: { id: string; state: PositionState }[], slotCellsTotal: number): SlotCell[] {
   const active = positions.filter((p) => isPositionActive(p.state));
-  const count = Math.max(slotsAvailable, active.length);
+  const count = Math.max(slotCellsTotal, active.length);
   const cells: SlotCell[] = [];
 
   for (let i = 0; i < count; i++) {

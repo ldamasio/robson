@@ -14,7 +14,7 @@ const activeState: PositionState = {
 };
 
 describe('deriveSlots', () => {
-  it('returns 4 empty slots when no positions', () => {
+  it('renders the backend-provided slot cell total when no positions are occupied', () => {
     const result = deriveSlots([], 4);
     expect(result).toHaveLength(4);
     expect(result.every((s) => !s.occupied)).toBe(true);
@@ -41,7 +41,7 @@ describe('deriveSlots', () => {
     expect(result.every((s) => !s.occupied)).toBe(true);
   });
 
-  it('expands beyond the initial monthly budget when more positions are active', () => {
+  it('preserves occupied positions beyond the backend cell total', () => {
     const positions = Array.from({ length: 8 }, (_, i) => ({
       id: `p-${i}`,
       state: activeState
@@ -49,6 +49,17 @@ describe('deriveSlots', () => {
     const result = deriveSlots(positions, 4);
     expect(result).toHaveLength(8);
     expect(result.every((s) => s.occupied)).toBe(true);
+  });
+
+  it('renders carried positions plus newly available monthly slots', () => {
+    const positions = Array.from({ length: 3 }, (_, i) => ({
+      id: `p-${i}`,
+      state: activeState
+    }));
+    const result = deriveSlots(positions, 7);
+    expect(result).toHaveLength(7);
+    expect(result.filter((s) => s.occupied)).toHaveLength(3);
+    expect(result.filter((s) => !s.occupied)).toHaveLength(4);
   });
 });
 

@@ -9,7 +9,10 @@ import {
 const STATUS_OK = {
   active_positions: 2,
   positions: MOCK_POSITIONS,
-  pending_approvals: []
+  pending_approvals: [],
+  occupied_slots: 2,
+  new_slots_available: 2,
+  slot_cells_total: 4
 };
 
 test.describe('Dashboard', () => {
@@ -85,5 +88,46 @@ test.describe('Dashboard', () => {
     await expect(page.locator('.slot.occupied').first()).toBeVisible({ timeout: 10_000 });
     const href = await page.locator('.slot.occupied').first().getAttribute('href');
     expect(href).toMatch(/\/operation\/pos-1/);
+  });
+
+  test('month boundary preserves occupied slots and shows new monthly slots', async ({ page }) => {
+    const carriedPositions = [
+      ...MOCK_POSITIONS,
+      {
+        ...MOCK_POSITIONS[0],
+        id: 'pos-3',
+        symbol: 'ADAUSDT'
+      }
+    ];
+    await installMockEventSource(page);
+    await page.route('**/status', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify({
+          active_positions: 3,
+          positions: carriedPositions,
+          pending_approvals: [],
+          occupied_slots: 3,
+          new_slots_available: 4,
+          slot_cells_total: 7
+        })
+      })
+    );
+    await page.route('**/monthly-halt', (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: 'application/json',
+        body: JSON.stringify(MOCK_HALT_ACTIVE)
+      })
+    );
+
+    await authAndGoto(page, '/dashboard');
+
+    await expect(page.locator('.dashboard')).toBeVisible({ timeout: 10_000 });
+    await expect(page.locator('.slot')).toHaveCount(7);
+    await expect(page.locator('.slot.occupied')).toHaveCount(3);
+    await expect(page.locator('.status-strip')).toContainText('SLOT 3/7');
+    await expect(page.locator('.eyebrow', { hasText: '4 FREE' })).toBeVisible();
   });
 });

@@ -30,15 +30,16 @@
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let showArmModal = $state(false);
   let pendingApprovals = $state<PendingApproval[]>([]);
-  let slotsAvailable = $state(4);
+  let newSlotsAvailable = $state(0);
+  let slotCellsTotal = $state(0);
   let approvalTick = $state(Date.now());
   let approvalTickTimer: ReturnType<typeof setInterval> | null = null;
 
   let positions = $derived($activePositions);
-  let slots = $derived(deriveSlots(positions, slotsAvailable));
+  let slots = $derived(deriveSlots(positions, slotCellsTotal));
   let occupied = $derived(slots.filter((s) => s.occupied).length);
   let displayedSlots = $derived(slots.length);
-  let free = $derived(Math.max(0, slotsAvailable - occupied));
+  let free = $derived(newSlotsAvailable);
   let activeOps = $derived(positions.filter((p) => isPositionActive(p.state)));
   let todayEvents = $derived($recentEvents.filter((e) => isTodayUtc(e.occurred_at)));
   let haltState = $derived($haltStatus?.state ?? 'active');
@@ -75,7 +76,8 @@
       activePositions.set(status.positions);
       haltStatus.set(halt);
       pendingApprovals = status.pending_approvals;
-      slotsAvailable = status.slots_available ?? 4;
+      newSlotsAvailable = status.new_slots_available;
+      slotCellsTotal = status.slot_cells_total;
       connected = true;
     } catch (e) {
       error = e instanceof Error ? e.message : 'Failed to connect to Robson backend';
@@ -119,7 +121,8 @@
           activePositions.set(status.positions);
           haltStatus.set(halt);
           pendingApprovals = status.pending_approvals;
-          slotsAvailable = status.slots_available ?? 4;
+          newSlotsAvailable = status.new_slots_available;
+          slotCellsTotal = status.slot_cells_total;
           connected = true;
           error = null;
         } catch {

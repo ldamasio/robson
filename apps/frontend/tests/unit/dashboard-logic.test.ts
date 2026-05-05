@@ -138,6 +138,24 @@ describe('dashboard slot derivation from status response', () => {
     expect(slots).toHaveLength(8);
     expect(slots.every(s => s.occupied)).toBe(true);
   });
+
+  it('renders occupied positions plus newly available monthly slots', () => {
+    const positions = Array.from({ length: 3 }, (_, i) =>
+      makePosition({ id: `p${i}`, state: 'Armed' })
+    );
+    const status: StatusResponse = {
+      active_positions: 3,
+      positions,
+      pending_approvals: [],
+      occupied_slots: 3,
+      new_slots_available: 4,
+      slot_cells_total: 7
+    };
+    const slots = deriveSlots(status.positions, status.slot_cells_total);
+    expect(slots).toHaveLength(7);
+    expect(slots.filter(s => s.occupied)).toHaveLength(3);
+    expect(status.new_slots_available).toBe(4);
+  });
 });
 
 // --- Status strip rendering logic ---

@@ -59,7 +59,9 @@ export type StatusResponse = {
   active_positions: number;
   positions: Position[];
   pending_approvals: PendingApproval[];
-  slots_available?: number;
+  new_slots_available: number;
+  occupied_slots: number;
+  slot_cells_total: number;
 };
 
 export type PendingApproval = {
@@ -150,6 +152,14 @@ function toNumber(value: unknown): number | null {
   return Number.isFinite(n) ? n : null;
 }
 
+function requireNumber(value: unknown, field: string): number {
+  const n = Number(value);
+  if (!Number.isFinite(n)) {
+    throw new Error(`Invalid /status response: missing numeric ${field}`);
+  }
+  return n;
+}
+
 function normalizePosition(raw: unknown): Position {
   const p = raw as Record<string, unknown>;
   return {
@@ -182,8 +192,9 @@ function normalizeStatus(raw: StatusResponse): StatusResponse {
     active_positions: Number(raw.active_positions ?? 0),
     positions: Array.isArray(raw.positions) ? raw.positions.map(normalizePosition) : [],
     pending_approvals: Array.isArray(raw.pending_approvals) ? raw.pending_approvals : [],
-    // Fallback to 4 during rollout window while backend may not yet send this field.
-    slots_available: typeof raw.slots_available === 'number' ? raw.slots_available : 4
+    new_slots_available: requireNumber(raw.new_slots_available, 'new_slots_available'),
+    occupied_slots: requireNumber(raw.occupied_slots, 'occupied_slots'),
+    slot_cells_total: requireNumber(raw.slot_cells_total, 'slot_cells_total')
   };
 }
 

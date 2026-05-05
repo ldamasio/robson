@@ -7,8 +7,6 @@
   import { _ } from 'svelte-i18n';
   import { positionLabel, positionStateLabel } from '$lib/presentation/labels';
 
-  const FALLBACK_SLOT_BUDGET = 4;
-
   type PageState = 'loading' | 'active' | 'halted' | 'error';
 
   let pageState: PageState = $state('loading');
@@ -114,7 +112,7 @@
           <div class="eyebrow">{$_('killSwitch.currentState')}</div>
           <div class="state-line">
             <span class="dot live"></span>
-            ACTIVE · {$_('killSwitch.slotLabel')} {activeCount}/{Math.max(status?.slots_available ?? FALLBACK_SLOT_BUDGET, activeCount)} · {activeCount} {activeCount === 1 ? ($_('killSwitch.openPositions_one') ?? 'OPEN POSITION') : ($_('killSwitch.openPositions_other') ?? 'OPEN POSITIONS')}
+            ACTIVE · {$_('killSwitch.slotLabel')} {activeCount}/{status?.slot_cells_total ?? activeCount} · {activeCount} {activeCount === 1 ? ($_('killSwitch.openPositions_one') ?? 'OPEN POSITION') : ($_('killSwitch.openPositions_other') ?? 'OPEN POSITIONS')}
           </div>
         </div>
 
