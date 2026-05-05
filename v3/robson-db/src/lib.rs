@@ -39,6 +39,7 @@ pub async fn repair_known_migration_state(pool: &PgPool) -> Result<()> {
     repair_event_log_phase9_index_drift(pool).await?;
     repair_monthly_state_zero_checksum(pool).await?;
     record_realized_loss_migration_if_already_applied(pool).await?;
+    repair_safety_net_table_permissions(pool).await?;
 
     Ok(())
 }
@@ -153,6 +154,51 @@ async fn record_realized_loss_migration_if_already_applied(pool: &PgPool) -> Res
     .await?;
 
     info!("Recorded v{VERSION} migration metadata for already-applied monthly_state columns");
+
+    Ok(())
+}
+
+/// Try to grant DML on safety net tables to the current role.
+///
+/// Tables created by a superuser during initial provisioning are owned by that
+/// superuser, not the runtime role. If the current user lacks GRANT OPTION the
+/// attempt is silently skipped (migration 012 also attempts this at the SQL
+/// level). The function never fails the migration run.
+async fn repair_safety_net_table_permissions(pool: &PgPool) -> Result<()> {
+    for table in ["detected_positions", "safety_net_executions"] {
+        // Best-effort GRANT; swallow errors so migrations proceed regardless.
+        let result = sqlx::query(&format!("GRANT ALL PRIVILEGES ON TABLE {table} TO CURRENT_USER"))
+            .execute(pool)
+            .await;
+
+        match result {
+            Ok(_) => info!("Granted DML on {table} to current user"),
+            Err(e) if e.to_string().contains("permission denied") => {
+                // Table exists but is owned by another role.
+                if let Ok(Some(owner)) = sqlx::query_scalar::<_, Option<String>>(
+                    "SELECT tableowner FROM pg_tables WHERE tablename = $1 AND schemaname = 'public'"
+                )
+                .bind(table)
+                .fetch_optional(pool)
+                .await
+                .map(|o| o.flatten())
+                {
+                    warn!(
+                        owner = %owner,
+                        table,
+                        "{table} is owned by '{owner}', not the migration user. \
+                         Run as superuser: GRANT ALL ON TABLE {table} TO robson"
+                    );
+                }
+            },
+            Err(e) if e.to_string().contains("does not exist") => {
+                // Table not created yet — migration 003 will handle it.
+            },
+            Err(e) => {
+                warn!(error = %e, table, "Unexpected error granting on {table}");
+            },
+        }
+    }
 
     Ok(())
 }
