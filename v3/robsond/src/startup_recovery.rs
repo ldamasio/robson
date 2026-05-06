@@ -30,8 +30,8 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use robson_domain::{Candle, PositionState, Price, Side, Symbol};
-use robson_engine::{Engine, EngineAction, MarketData};
+use robson_domain::{Candle, PositionState, Price, Side};
+use robson_engine::MarketData;
 use robson_exec::{ActionResult, CandleInterval, ExchangePort, OhlcvPort};
 use robson_store::Store;
 use tracing::{info, warn};

@@ -1,26 +1,34 @@
 <script lang="ts">
-  import { untrack } from 'svelte';
-  import Card from '$design/components/Card.svelte';
-  import Stack from '$design/components/Stack.svelte';
-  import Row from '$design/components/Row.svelte';
-  import Grid from '$design/components/Grid.svelte';
-  import TickRuler from '$design/components/TickRuler.svelte';
-  import ArmModal from '$design/components/ArmModal.svelte';
-  import { robsonApi, connectEventStream, type Position, type SseEvent, type PendingApproval } from '$api/robson';
-  import { activePositions } from '$stores/operations';
-  import { haltStatus } from '$stores/slots';
-  import { recentEvents, pushEvent } from '$stores/events';
-  import { toasts, showToast } from '$stores/toast';
-  import { deriveSlots, sortPositionsOldestFirst } from '$lib/config/slots';
-  import { formatTimeUtc, isTodayUtc } from '$lib/utils/time';
+  import { untrack } from "svelte";
+  import Card from "$design/components/Card.svelte";
+  import Stack from "$design/components/Stack.svelte";
+  import Row from "$design/components/Row.svelte";
+  import Grid from "$design/components/Grid.svelte";
+  import TickRuler from "$design/components/TickRuler.svelte";
+  import ArmModal from "$design/components/ArmModal.svelte";
+  import {
+    robsonApi,
+    connectEventStream,
+    type Position,
+    type SseEvent,
+    type PendingApproval,
+  } from "$api/robson";
+  import { activePositions } from "$stores/operations";
+  import { haltStatus } from "$stores/slots";
+  import { recentEvents, pushEvent } from "$stores/events";
+  import { toasts, showToast } from "$stores/toast";
+  import { deriveSlots, sortPositionsOldestFirst } from "$lib/config/slots";
+  import { formatTimeUtc, isTodayUtc } from "$lib/utils/time";
   import {
     positionLabel,
     positionStateLabel,
+    positionMetaLine,
+    positionSummaryLines,
     haltStateLabel,
     eventTypeLabel,
-    isPositionActive
-  } from '$lib/presentation/labels';
-  import { _ } from 'svelte-i18n';
+    isPositionActive,
+  } from "$lib/presentation/labels";
+  import { _ } from "svelte-i18n";
 
   const POLL_INTERVAL_MS = 10_000;
 
@@ -32,6 +40,9 @@
   let pendingApprovals = $state<PendingApproval[]>([]);
   let newSlotsAvailable = $state(0);
   let slotCellsTotal = $state(0);
+  let historyError = $state<string | null>(null);
+  let selectedMonth = $state(currentMonthKey());
+  let monthlyPositions = $state<Position[]>([]);
   let approvalTick = $state(Date.now());
   let approvalTickTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -40,13 +51,20 @@
   let occupied = $derived(slots.filter((s) => s.occupied).length);
   let displayedSlots = $derived(slots.length);
   let free = $derived(newSlotsAvailable);
-  let activeOps = $derived(sortPositionsOldestFirst(positions.filter((p) => isPositionActive(p.state))));
-  let todayEvents = $derived($recentEvents.filter((e) => isTodayUtc(e.occurred_at)));
-  let haltState = $derived($haltStatus?.state ?? 'active');
+  let activeOps = $derived(
+    sortPositionsOldestFirst(
+      positions.filter((p) => isPositionActive(p.state)),
+    ),
+  );
+  let monthOps = $derived(sortPositionsOldestFirst(monthlyPositions));
+  let todayEvents = $derived(
+    $recentEvents.filter((e) => isTodayUtc(e.occurred_at)),
+  );
+  let haltState = $derived($haltStatus?.state ?? "active");
 
   function countdownRemaining(expiresAt: string): string {
     const ms = new Date(expiresAt).getTime() - approvalTick;
-    if (ms <= 0) return 'expired';
+    if (ms <= 0) return "expired";
     const totalSec = Math.floor(ms / 1000);
     const m = Math.floor(totalSec / 60);
     const s = totalSec % 60;
@@ -55,11 +73,11 @@
 
   function variationFor(p: Position): number | null {
     if (p.variation_pct !== undefined) return p.variation_pct;
-    if (typeof p.state === 'object' && 'Closed' in p.state) {
+    if (typeof p.state === "object" && "Closed" in p.state) {
       const entry = p.entry_price;
       const exit = Number(p.state.Closed.exit_price);
       if (entry && Number.isFinite(exit)) {
-        const diff = p.side === 'Short' ? entry - exit : exit - entry;
+        const diff = p.side === "Short" ? entry - exit : exit - entry;
         return (diff / entry) * 100;
       }
     }
@@ -67,17 +85,58 @@
   }
 
   function monthLabel(): string {
-    const now = new Date();
-    const month = now.toLocaleDateString('en-US', { month: 'long', timeZone: 'UTC' });
-    return `${month.toUpperCase()} ${now.getUTCFullYear()}`;
+    return monthDisplayLabel(currentMonthKey());
   }
 
-  async function load() {
+  function currentMonthKey(): string {
+    const now = new Date();
+    return `${now.getUTCFullYear()}-${String(now.getUTCMonth() + 1).padStart(2, "0")}`;
+  }
+
+  function monthDisplayLabel(monthKey: string): string {
+    const [year, month] = monthKey.split("-").map(Number);
+    const date = new Date(Date.UTC(year, month - 1, 1));
+    const monthName = date.toLocaleDateString("en-US", {
+      month: "long",
+      timeZone: "UTC",
+    });
+    return `${monthName.toUpperCase()} ${year}`;
+  }
+
+  function parseMonthKey(monthKey: string): Date {
+    const [year, month] = monthKey.split("-").map(Number);
+    return new Date(Date.UTC(year, month - 1, 1));
+  }
+
+  function monthKeyFromDateLike(value?: string | null): string | null {
+    if (!value) return null;
+    const d = new Date(value);
+    if (isNaN(d.getTime())) return null;
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+  }
+
+  function shiftMonth(monthKey: string, delta: number): string {
+    const d = parseMonthKey(monthKey);
+    d.setUTCMonth(d.getUTCMonth() + delta);
+    return `${d.getUTCFullYear()}-${String(d.getUTCMonth() + 1).padStart(2, "0")}`;
+  }
+
+  function isInheritedForMonth(p: Position, monthKey: string): boolean {
+    const createdMonth = monthKeyFromDateLike(p.created_at);
+    return createdMonth !== null && createdMonth !== monthKey;
+  }
+
+  function monthStateLabel(p: Position): string {
+    if (isInheritedForMonth(p, selectedMonth)) return "INHERITED";
+    return "NEW";
+  }
+
+  async function loadStatus() {
     error = null;
     try {
       const [status, halt] = await Promise.all([
         robsonApi.getStatus(),
-        robsonApi.getHaltStatus()
+        robsonApi.getHaltStatus(),
       ]);
       activePositions.set(status.positions);
       haltStatus.set(halt);
@@ -86,9 +145,25 @@
       slotCellsTotal = status.slot_cells_total;
       connected = true;
     } catch (e) {
-      error = e instanceof Error ? e.message : 'Failed to connect to Robson backend';
+      error =
+        e instanceof Error ? e.message : "Failed to connect to Robson backend";
       connected = false;
     }
+  }
+
+  async function loadHistory() {
+    historyError = null;
+    try {
+      const response = await robsonApi.getMonthlyPositions(selectedMonth);
+      monthlyPositions = response.positions;
+    } catch (e) {
+      historyError =
+        e instanceof Error ? e.message : "Failed to load month history";
+    }
+  }
+
+  async function load() {
+    await Promise.all([loadStatus(), loadHistory()]);
   }
 
   function startSse() {
@@ -98,13 +173,19 @@
         pushEvent(event);
         const payload = event.payload as Record<string, unknown>;
         const posId = payload.position_id as string | undefined;
-        if (posId && event.event_type === 'position.changed') {
-          void robsonApi.getStatus().then((s) => activePositions.set(s.positions)).catch(() => {});
+        if (posId && event.event_type === "position.changed") {
+          void Promise.all([
+            robsonApi
+              .getStatus()
+              .then((s) => activePositions.set(s.positions))
+              .catch(() => {}),
+            loadHistory().catch(() => {}),
+          ]);
         }
       },
       () => {
         connected = false;
-      }
+      },
     );
   }
 
@@ -122,7 +203,7 @@
         try {
           const [status, halt] = await Promise.all([
             robsonApi.getStatus(),
-            robsonApi.getHaltStatus()
+            robsonApi.getHaltStatus(),
           ]);
           activePositions.set(status.positions);
           haltStatus.set(halt);
@@ -131,6 +212,7 @@
           slotCellsTotal = status.slot_cells_total;
           connected = true;
           error = null;
+          void loadHistory();
         } catch {
           // SSE + polling: silent retry, error shown only if initial load fails
         }
@@ -151,17 +233,34 @@
     startPolling();
   }
 
+  function prevMonth() {
+    selectedMonth = shiftMonth(selectedMonth, -1);
+    void loadHistory();
+  }
+
+  function nextMonth() {
+    const current = currentMonthKey();
+    if (selectedMonth === current) return;
+    selectedMonth = shiftMonth(selectedMonth, 1);
+    void loadHistory();
+  }
+
   $effect(() => {
     untrack(() => {
       void load();
       startSse();
       startPolling();
-      approvalTickTimer = setInterval(() => { approvalTick = Date.now(); }, 1000);
+      approvalTickTimer = setInterval(() => {
+        approvalTick = Date.now();
+      }, 1000);
     });
     return () => {
       stopSse();
       stopPolling();
-      if (approvalTickTimer) { clearInterval(approvalTickTimer); approvalTickTimer = null; }
+      if (approvalTickTimer) {
+        clearInterval(approvalTickTimer);
+        approvalTickTimer = null;
+      }
     };
   });
 
@@ -176,7 +275,7 @@
 </script>
 
 <svelte:head>
-  <title>{$_('dashboard.pageTitle')}</title>
+  <title>{$_("dashboard.pageTitle")}</title>
 </svelte:head>
 
 <div class="dashboard">
@@ -189,18 +288,20 @@
       <Row gap={4} align="center">
         <div class="status-strip">
           {#if error}
-            <span class="dot err"></span> {$_('dashboard.offline')} · {error}
+            <span class="dot err"></span> {$_("dashboard.offline")} · {error}
           {:else if !connected}
-            <span class="dot warn"></span> {$_('dashboard.connecting')}
+            <span class="dot warn"></span> {$_("dashboard.connecting")}
           {:else}
             <span class="dot live"></span>
             {haltStateLabel(haltState)} · SLOT {occupied}/{displayedSlots}
           {/if}
         </div>
-        {#if haltState === 'monthly_halt'}
+        {#if haltState === "monthly_halt"}
           <button class="btn-entry" disabled>HALT</button>
         {:else}
-          <button class="btn-entry" onclick={() => (showArmModal = true)}>ENTRY</button>
+          <button class="btn-entry" onclick={() => (showArmModal = true)}
+            >ENTRY</button
+          >
         {/if}
       </Row>
     </Row>
@@ -209,43 +310,128 @@
   {#if error}
     <Card padding={5}>
       <Stack gap={3}>
-        <div class="eyebrow">{$_('dashboard.connectionError')}</div>
+        <div class="eyebrow">{$_("dashboard.connectionError")}</div>
         <p class="err-text">{error}</p>
-        <button class="btn-retry" onclick={retry}>{$_('dashboard.retry')}</button>
+        <button class="btn-retry" onclick={retry}
+          >{$_("dashboard.retry")}</button
+        >
       </Stack>
     </Card>
   {:else}
     <section>
       <Stack gap={4}>
-        <div class="eyebrow">{$_('dashboard.slots')} · {monthLabel()}</div>
+        <div class="eyebrow">{$_("dashboard.slots")} · {monthLabel()}</div>
         <div class="slots-grid">
           {#each slots as slot}
             <a
-              href={slot.occupied ? `/operation/${slot.positionId}` : ''}
+              href={slot.occupied ? `/operation/${slot.positionId}` : ""}
               class="slot"
               class:occupied={slot.occupied}
             >
-              {slot.occupied ? '●' : '○'}
+              {slot.occupied ? "●" : "○"}
             </a>
           {/each}
         </div>
-        <div class="eyebrow dim">{$_('dashboard.occupied', { values: { count: occupied } })} · {$_('dashboard.freeCount', { values: { count: free } })}</div>
+        <div class="eyebrow dim">
+          {$_("dashboard.occupied", { values: { count: occupied } })} · {$_(
+            "dashboard.freeCount",
+            { values: { count: free } },
+          )}
+        </div>
+      </Stack>
+    </section>
+
+    <section>
+      <Stack gap={4}>
+        <Row justify="between" align="center">
+          <div class="eyebrow">
+            MONTH HISTORY · {monthDisplayLabel(selectedMonth)}
+          </div>
+          <Row gap={2} align="center">
+            <button class="btn-nav" onclick={prevMonth}>←</button>
+            <button
+              class="btn-nav"
+              onclick={nextMonth}
+              disabled={selectedMonth === currentMonthKey()}>→</button
+            >
+          </Row>
+        </Row>
+        {#if historyError}
+          <Card>
+            <p class="err-text">{historyError}</p>
+          </Card>
+        {:else if monthOps.length === 0}
+          <Card>
+            <p class="empty">
+              No positions alive in {monthDisplayLabel(selectedMonth)}
+            </p>
+          </Card>
+        {:else}
+          <Grid cols={2} gap={4}>
+            {#each monthOps as op}
+              <a href="/operation/{op.id}" class="op-card-link">
+                <Card>
+                  <Stack gap={2}>
+                    <Row justify="between" align="start">
+                      <div class="eyebrow">{positionLabel(op)}</div>
+                      <span
+                        class="state-pill"
+                        class:inherited={isInheritedForMonth(op, selectedMonth)}
+                      >
+                        {monthStateLabel(op)}
+                      </span>
+                    </Row>
+                    <Row justify="between">
+                      <span class="meta">{positionStateLabel(op.state)}</span>
+                      {#if variationFor(op) !== null}
+                        <span
+                          class="mono"
+                          class:ok={(variationFor(op) ?? 0) > 0}
+                          class:err={(variationFor(op) ?? 0) < 0}
+                        >
+                          {(variationFor(op) ?? 0) > 0 ? "+" : ""}{variationFor(
+                            op,
+                          )?.toFixed(2)}%
+                        </span>
+                      {/if}
+                    </Row>
+                    <div class="meta dim">{positionMetaLine(op)}</div>
+                    <pre class="history-summary">{positionSummaryLines(op).join(
+                        "\n",
+                      )}</pre>
+                  </Stack>
+                </Card>
+              </a>
+            {/each}
+          </Grid>
+        {/if}
       </Stack>
     </section>
 
     {#if pendingApprovals.length > 0}
       <section>
         <Stack gap={4}>
-          <div class="eyebrow">PENDING APPROVALS · {pendingApprovals.length}</div>
+          <div class="eyebrow">
+            PENDING APPROVALS · {pendingApprovals.length}
+          </div>
           {#each pendingApprovals as approval (approval.query_id)}
             <Card>
               <Row justify="between" align="center">
                 <Stack gap={1}>
-                  <span class="mono">{approval.position_id ? approval.position_id.slice(0, 8) : '--------'}</span>
+                  <span class="mono"
+                    >{approval.position_id
+                      ? approval.position_id.slice(0, 8)
+                      : "--------"}</span
+                  >
                   <span class="meta">{approval.reason}</span>
-                  <span class="meta dim">expires in {countdownRemaining(approval.expires_at)}</span>
+                  <span class="meta dim"
+                    >expires in {countdownRemaining(approval.expires_at)}</span
+                  >
                 </Stack>
-                <button class="btn-approve" onclick={() => approve(approval.query_id)}>APPROVE</button>
+                <button
+                  class="btn-approve"
+                  onclick={() => approve(approval.query_id)}>APPROVE</button
+                >
               </Row>
             </Card>
           {/each}
@@ -255,10 +441,10 @@
 
     <section>
       <Stack gap={4}>
-        <div class="eyebrow">{$_('dashboard.activeOps')}</div>
+        <div class="eyebrow">{$_("dashboard.activeOps")}</div>
         {#if activeOps.length === 0}
           <Card>
-            <p class="empty">{$_('dashboard.noActive')}</p>
+            <p class="empty">{$_("dashboard.noActive")}</p>
           </Card>
         {:else}
           <Grid cols={2} gap={4}>
@@ -275,7 +461,9 @@
                           class:ok={(variationFor(op) ?? 0) > 0}
                           class:err={(variationFor(op) ?? 0) < 0}
                         >
-                          {(variationFor(op) ?? 0) > 0 ? '+' : ''}{variationFor(op)?.toFixed(2)}%
+                          {(variationFor(op) ?? 0) > 0 ? "+" : ""}{variationFor(
+                            op,
+                          )?.toFixed(2)}%
                         </span>
                       {/if}
                     </Row>
@@ -290,10 +478,10 @@
 
     <section>
       <Stack gap={4}>
-        <div class="eyebrow">{$_('dashboard.todayEventsLabel')}</div>
+        <div class="eyebrow">{$_("dashboard.todayEventsLabel")}</div>
         <Card>
           {#if todayEvents.length === 0}
-            <p class="empty">{$_('dashboard.noEventsToday')}</p>
+            <p class="empty">{$_("dashboard.noEventsToday")}</p>
           {:else}
             <div class="event-stream">
               {#each todayEvents as e (e.event_id)}
@@ -312,13 +500,25 @@
   {/if}
 
   {#if showArmModal}
-    <ArmModal onclose={() => { showArmModal = false; void load(); }} onresult={(r) => { showToast(`${r.symbol} ${r.side} armed — detector active`, 'ok'); }} />
+    <ArmModal
+      onclose={() => {
+        showArmModal = false;
+        void load();
+      }}
+      onresult={(r) => {
+        showToast(`${r.symbol} ${r.side} armed — detector active`, "ok");
+      }}
+    />
   {/if}
 
   {#if $toasts.length > 0}
     <div class="toast-container">
       {#each $toasts as t (t.id)}
-        <div class="toast" class:ok={t.kind === 'ok'} class:err-toast={t.kind === 'err'}>
+        <div
+          class="toast"
+          class:ok={t.kind === "ok"}
+          class:err-toast={t.kind === "err"}
+        >
           {t.message}
         </div>
       {/each}
@@ -397,6 +597,21 @@
     color: var(--cyan-brand);
     border-color: var(--cyan-dim);
   }
+  .state-pill {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: var(--track-label);
+    color: var(--fg-2);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: var(--s-1) var(--s-2);
+    white-space: nowrap;
+  }
+  .state-pill.inherited {
+    color: var(--cyan-brand);
+    border-color: var(--cyan-dim);
+  }
   .meta {
     font-family: var(--font-mono);
     font-size: var(--text-xs);
@@ -452,6 +667,14 @@
   }
   .op-card-link:hover {
     border-bottom: none;
+  }
+  .history-summary {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--fg-1);
+    white-space: pre-wrap;
+    margin: 0;
+    line-height: var(--lead-snug);
   }
   .err-text {
     color: var(--err, #ff4444);
@@ -511,6 +734,21 @@
   .btn-approve:hover {
     background: var(--cyan-subtle);
   }
+  .btn-nav {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    width: 32px;
+    height: 32px;
+    border: 1px solid var(--cyan-dim);
+    border-radius: var(--radius-sm);
+    background: transparent;
+    color: var(--cyan-brand);
+    cursor: pointer;
+  }
+  .btn-nav:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+  }
   .meta.dim {
     color: var(--fg-3);
   }
@@ -542,7 +780,13 @@
     background: rgba(197, 106, 106, 0.08);
   }
   @keyframes toast-in {
-    from { opacity: 0; transform: translateY(8px); }
-    to { opacity: 1; transform: translateY(0); }
+    from {
+      opacity: 0;
+      transform: translateY(8px);
+    }
+    to {
+      opacity: 1;
+      transform: translateY(0);
+    }
   }
 </style>

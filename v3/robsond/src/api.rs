@@ -13,9 +13,9 @@ use std::{convert::Infallible, sync::Arc, time::Duration};
 
 use async_stream::stream;
 use axum::{
-    extract::{Path, Request, State},
+    extract::{Path, Query, Request, State},
     http::{header, HeaderValue, Method, StatusCode},
-    middleware::{self, Next},
+    middleware::Next,
     response::{
         sse::{KeepAlive, Sse},
         IntoResponse,
@@ -23,6 +23,7 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
+use chrono::Datelike;
 use robson_domain::{
     ApprovalPolicy as DomainApprovalPolicy, DetectorSignal, EntryPolicy, EntryPolicyConfig,
     Position, PositionState, Price, RiskConfig, Side, Symbol,
@@ -39,7 +40,7 @@ use uuid::Uuid;
 use crate::{
     circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot},
     error::DaemonError,
-    event_bus::{DaemonEvent, EventBus},
+    event_bus::EventBus,
     position_manager::PositionManager,
     position_monitor::PositionMonitor,
     sse::{map_daemon_event, resync_required_event},
@@ -107,6 +108,13 @@ pub struct StatusResponse {
     pub slot_cells_total: usize,
 }
 
+/// Historical monthly positions response.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct MonthlyPositionsResponse {
+    pub month: String,
+    pub positions: Vec<PositionSummary>,
+}
+
 /// Summary of a position.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PositionSummary {
@@ -137,6 +145,11 @@ pub struct PendingApprovalSummary {
     pub state: String,
     pub reason: String,
     pub expires_at: chrono::DateTime<chrono::Utc>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MonthQuery {
+    month: Option<String>,
 }
 
 /// Entry policy sub-object for `ArmRequest`.
@@ -356,6 +369,7 @@ where
         .route("/health", get(health_handler))
         .route("/events", get(events_handler))
         .route("/status", get(status_handler))
+        .route("/positions", get(month_positions_handler))
         .route("/positions/:id", get(get_position_handler))
         // Prometheus metrics
         .route("/metrics", get(metrics_handler))
@@ -476,14 +490,13 @@ async fn health_liveness() -> Json<HealthResponse> {
 ///
 /// Returns 200 OK if all checks pass, 503 Service Unavailable otherwise.
 async fn health_readiness<E, S>(
-    State(state): State<Arc<ApiState<E, S>>>,
+    State(_state): State<Arc<ApiState<E, S>>>,
 ) -> Result<Json<ReadinessResponse>, (StatusCode, Json<ReadinessResponse>)>
 where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
-    let mut database_ok;
-    let mut binance_ok = false;
+    let database_ok;
 
     // Check PostgreSQL connectivity with a real ping when pool is configured.
     // Falls back to MemoryStore check (always OK) when Postgres is not wired.
@@ -505,11 +518,7 @@ where
     // (Safety Net uses Binance REST client which can ping the API)
     // For now, we'll mark it as OK if position monitor is configured
     // TODO: Add actual ping check via BinanceRestClient
-    if state.position_monitor.is_some() {
-        binance_ok = true; // Assume OK if monitor is configured
-    } else {
-        binance_ok = true; // OK even if not configured (Safety Net is optional)
-    }
+    let binance_ok = true;
 
     let checks = ReadinessChecks {
         database: if database_ok {
@@ -640,6 +649,27 @@ where
         new_slots_available,
         occupied_slots,
         slot_cells_total,
+    }))
+}
+
+/// Get positions that were alive during a given month.
+async fn month_positions_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    Query(query): Query<MonthQuery>,
+) -> Result<Json<MonthlyPositionsResponse>, (StatusCode, Json<ErrorResponse>)>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let requested = parse_month_query(query.month.as_deref())?;
+    let manager = state.position_manager.read().await;
+    let positions = load_positions_for_month(&manager, requested)
+        .await
+        .map_err(|e| to_error_response(e))?;
+
+    Ok(Json(MonthlyPositionsResponse {
+        month: format!("{:04}-{:02}", requested.year(), requested.month()),
+        positions,
     }))
 }
 
@@ -1153,6 +1183,97 @@ fn stop_trigger_price(side: Side, current_price: Price, trailing_stop: Price) ->
     is_hit.then_some(trailing_stop)
 }
 
+fn parse_month_query(
+    month: Option<&str>,
+) -> Result<chrono::DateTime<chrono::Utc>, (StatusCode, Json<ErrorResponse>)> {
+    let now = chrono::Utc::now();
+    let Some(month) = month else {
+        return Ok(month_start(now.year(), now.month()));
+    };
+
+    let parsed =
+        chrono::NaiveDate::parse_from_str(&format!("{month}-01"), "%Y-%m-%d").map_err(|_| {
+            (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Invalid month format: {month}. Expected YYYY-MM"),
+                }),
+            )
+        })?;
+
+    let naive = parsed.and_hms_opt(0, 0, 0).ok_or_else(|| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: format!("Invalid month value: {month}"),
+            }),
+        )
+    })?;
+
+    Ok(chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc))
+}
+
+async fn load_positions_for_month<E, S>(
+    manager: &PositionManager<E, S>,
+    month_start: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<PositionSummary>, DaemonError>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let (next_year, next_month) = next_month(month_start.year(), month_start.month());
+    let month_end = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+        chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1)
+            .expect("valid next month")
+            .and_hms_opt(0, 0, 0)
+            .expect("valid month boundary"),
+        chrono::Utc,
+    );
+
+    let active = manager.store().positions().find_active().await?;
+    let closed = manager.store().positions().find_all_closed().await?;
+
+    let mut positions: Vec<Position> = active
+        .into_iter()
+        .chain(closed.into_iter())
+        .filter(|position| position_overlaps_month(position, month_start, month_end))
+        .collect();
+
+    positions.sort_by_key(|position| position.created_at);
+
+    let mut summaries = Vec::with_capacity(positions.len());
+    for position in &positions {
+        summaries.push(position_to_summary_with_live_price(manager, position).await);
+    }
+
+    Ok(summaries)
+}
+
+fn position_overlaps_month(
+    position: &Position,
+    month_start: chrono::DateTime<chrono::Utc>,
+    month_end: chrono::DateTime<chrono::Utc>,
+) -> bool {
+    position.created_at < month_end
+        && position.closed_at.map(|closed_at| closed_at > month_start).unwrap_or(true)
+}
+
+fn next_month(year: i32, month: u32) -> (i32, u32) {
+    if month == 12 {
+        (year + 1, 1)
+    } else {
+        (year, month + 1)
+    }
+}
+
+fn month_start(year: i32, month: u32) -> chrono::DateTime<chrono::Utc> {
+    let naive = chrono::NaiveDate::from_ymd_opt(year, month, 1)
+        .expect("valid month start")
+        .and_hms_opt(0, 0, 0)
+        .expect("valid month start time");
+    chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc)
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -1236,6 +1357,100 @@ mod tests {
         assert_eq!(summary.current_price, Some(dec!(90)));
         assert_eq!(summary.pnl, Some(dec!(20)));
         assert_eq!(summary.variation_pct, Some(dec!(10.0)));
+    }
+
+    #[test]
+    fn position_overlaps_month_includes_inherited_and_closed_positions() {
+        let month = month_start(2026, 4);
+        let next = month_start(2026, 5);
+
+        let mut inherited =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        inherited.created_at = month - chrono::Duration::days(10);
+        inherited.closed_at = None;
+
+        let mut closed_later =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        closed_later.created_at = month - chrono::Duration::days(10);
+        closed_later.closed_at = Some(next + chrono::Duration::days(2));
+
+        let mut closed_before =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        closed_before.created_at = month - chrono::Duration::days(20);
+        closed_before.closed_at = Some(month - chrono::Duration::days(1));
+
+        let mut born_after =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        born_after.created_at = next + chrono::Duration::days(1);
+        born_after.closed_at = None;
+
+        assert!(position_overlaps_month(&inherited, month, next));
+        assert!(position_overlaps_month(&closed_later, month, next));
+        assert!(!position_overlaps_month(&closed_before, month, next));
+        assert!(!position_overlaps_month(&born_after, month, next));
+    }
+
+    #[test]
+    fn next_month_handles_year_boundary() {
+        assert_eq!(next_month(2026, 12), (2027, 1));
+        assert_eq!(next_month(2026, 4), (2026, 5));
+    }
+
+    #[tokio::test]
+    async fn test_month_positions_endpoint_includes_inherited_positions() {
+        let (app, _event_bus, position_manager) = create_test_app_with_event_bus(100).await;
+        let april = month_start(2026, 4);
+        let may = month_start(2026, 5);
+        let june = month_start(2026, 6);
+
+        let mut inherited =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        inherited.created_at = april - chrono::Duration::days(7);
+        inherited.updated_at = april - chrono::Duration::days(1);
+        inherited.state = PositionState::Armed;
+        inherited.entry_price = Some(Price::new(dec!(100)).unwrap());
+
+        let mut closed_in_may =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("ETHUSDT").unwrap(), Side::Short);
+        closed_in_may.created_at = april - chrono::Duration::days(3);
+        closed_in_may.updated_at = may + chrono::Duration::days(1);
+        closed_in_may.closed_at = Some(may + chrono::Duration::days(1));
+        closed_in_may.state = PositionState::Closed {
+            exit_price: Price::new(dec!(80)).unwrap(),
+            realized_pnl: dec!(20),
+            exit_reason: robson_domain::ExitReason::TrailingStop,
+        };
+        closed_in_may.entry_price = Some(Price::new(dec!(100)).unwrap());
+
+        let mut born_in_june =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("ADAUSDT").unwrap(), Side::Long);
+        born_in_june.created_at = june + chrono::Duration::days(1);
+        born_in_june.updated_at = june + chrono::Duration::days(1);
+        born_in_june.state = PositionState::Armed;
+
+        {
+            let manager = position_manager.write().await;
+            manager.store().positions().save(&inherited).await.unwrap();
+            manager.store().positions().save(&closed_in_may).await.unwrap();
+            manager.store().positions().save(&born_in_june).await.unwrap();
+        }
+
+        let response = app
+            .oneshot(
+                Request::builder().uri("/positions?month=2026-05").body(Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let monthly: MonthlyPositionsResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(monthly.month, "2026-05");
+        assert_eq!(monthly.positions.len(), 2);
+        assert_eq!(monthly.positions[0].id, inherited.id);
+        assert_eq!(monthly.positions[1].id, closed_in_may.id);
+        assert!(monthly.positions.iter().all(|p| p.id != born_in_june.id));
     }
 
     async fn create_test_app_with_event_bus(
