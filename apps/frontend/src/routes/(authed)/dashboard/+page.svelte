@@ -17,7 +17,11 @@
   import { haltStatus } from "$stores/slots";
   import { recentEvents, pushEvent } from "$stores/events";
   import { toasts, showToast } from "$stores/toast";
-  import { deriveSlots, sortPositionsOldestFirst } from "$lib/config/slots";
+  import {
+    deriveHistoricalSlots,
+    deriveLiveSlots,
+    sortPositionsOldestFirst,
+  } from "$lib/config/slots";
   import { formatTimeUtc, isTodayUtc } from "$lib/utils/time";
   import {
     positionLabel,
@@ -47,16 +51,23 @@
   let approvalTickTimer: ReturnType<typeof setInterval> | null = null;
 
   let positions = $derived($activePositions);
-  let slots = $derived(deriveSlots(positions, slotCellsTotal));
-  let occupied = $derived(slots.filter((s) => s.occupied).length);
-  let displayedSlots = $derived(slots.length);
-  let free = $derived(newSlotsAvailable);
-  let activeOps = $derived(
+  let currentMonth = $derived(currentMonthKey());
+  let isHistoricalMonth = $derived(selectedMonth !== currentMonth);
+  let liveOps = $derived(
     sortPositionsOldestFirst(
       positions.filter((p) => isPositionActive(p.state)),
     ),
   );
   let monthOps = $derived(sortPositionsOldestFirst(monthlyPositions));
+  let displayOps = $derived(isHistoricalMonth ? monthOps : liveOps);
+  let slots = $derived(
+    isHistoricalMonth
+      ? deriveHistoricalSlots(displayOps)
+      : deriveLiveSlots(positions, slotCellsTotal),
+  );
+  let occupied = $derived(slots.filter((s) => s.kind === "occupied").length);
+  let displayedSlots = $derived(slots.length);
+  let free = $derived(slots.filter((s) => s.kind !== "occupied").length);
   let todayEvents = $derived(
     $recentEvents.filter((e) => isTodayUtc(e.occurred_at)),
   );
@@ -85,7 +96,7 @@
   }
 
   function monthLabel(): string {
-    return monthDisplayLabel(currentMonthKey());
+    return monthDisplayLabel(selectedMonth);
   }
 
   function currentMonthKey(): string {
@@ -129,6 +140,20 @@
   function monthStateLabel(p: Position): string {
     if (isInheritedForMonth(p, selectedMonth)) return "INHERITED";
     return "NEW";
+  }
+
+  function topBarLabel(): string {
+    return isHistoricalMonth ? "SNAPSHOT" : haltStateLabel(haltState);
+  }
+
+  function topBarActionLabel(): string {
+    return isHistoricalMonth ? "NOW" : "ENTRY";
+  }
+
+  function returnToCurrentMonth() {
+    if (!isHistoricalMonth) return;
+    selectedMonth = currentMonthKey();
+    void load();
   }
 
   async function loadStatus() {
@@ -239,8 +264,7 @@
   }
 
   function nextMonth() {
-    const current = currentMonthKey();
-    if (selectedMonth === current) return;
+    if (selectedMonth === currentMonth) return;
     selectedMonth = shiftMonth(selectedMonth, 1);
     void loadHistory();
   }
@@ -293,14 +317,16 @@
             <span class="dot warn"></span> {$_("dashboard.connecting")}
           {:else}
             <span class="dot live"></span>
-            {haltStateLabel(haltState)} · SLOT {occupied}/{displayedSlots}
+            {topBarLabel()} · SLOT {occupied}/{displayedSlots}
           {/if}
         </div>
-        {#if haltState === "monthly_halt"}
+        {#if isHistoricalMonth}
+          <button class="btn-entry" onclick={returnToCurrentMonth}>NOW</button>
+        {:else if haltState === "monthly_halt"}
           <button class="btn-entry" disabled>HALT</button>
         {:else}
           <button class="btn-entry" onclick={() => (showArmModal = true)}
-            >ENTRY</button
+            >{topBarActionLabel()}</button
           >
         {/if}
       </Row>
@@ -320,23 +346,43 @@
   {:else}
     <section>
       <Stack gap={4}>
-        <div class="eyebrow">{$_("dashboard.slots")} · {monthLabel()}</div>
+        <div class="eyebrow">
+          {isHistoricalMonth ? "MONTH SNAPSHOT" : $_("dashboard.slots")} ·
+          {monthLabel()}
+        </div>
         <div class="slots-grid">
           {#each slots as slot}
-            <a
-              href={slot.occupied ? `/operation/${slot.positionId}` : ""}
-              class="slot"
-              class:occupied={slot.occupied}
-            >
-              {slot.occupied ? "●" : "○"}
-            </a>
+            {#if slot.kind === "occupied" && slot.positionId}
+              <a
+                href={`/operation/${slot.positionId}`}
+                class="slot occupied"
+                title="Occupied Slot"
+                aria-label="Occupied Slot"
+              >
+                ●
+              </a>
+            {:else if slot.kind === "free"}
+              <div class="slot free" title="Free Slot" aria-label="Free Slot">
+                ○
+              </div>
+            {:else}
+              <div
+                class="slot expired"
+                title="Expired Slot"
+                aria-label="Expired Slot"
+              >
+                ×
+              </div>
+            {/if}
           {/each}
         </div>
         <div class="eyebrow dim">
-          {$_("dashboard.occupied", { values: { count: occupied } })} · {$_(
-            "dashboard.freeCount",
-            { values: { count: free } },
-          )}
+          {$_("dashboard.occupied", { values: { count: occupied } })} ·
+          {#if isHistoricalMonth}
+            EXPIRED {free}
+          {:else}
+            {$_("dashboard.freeCount", { values: { count: free } })}
+          {/if}
         </div>
       </Stack>
     </section>
@@ -345,14 +391,15 @@
       <Stack gap={4}>
         <Row justify="between" align="center">
           <div class="eyebrow">
-            MONTH HISTORY · {monthDisplayLabel(selectedMonth)}
+            {isHistoricalMonth ? "OPERATIONS" : $_("dashboard.activeOps")} ·
+            {monthDisplayLabel(selectedMonth)}
           </div>
           <Row gap={2} align="center">
             <button class="btn-nav" onclick={prevMonth}>←</button>
             <button
               class="btn-nav"
               onclick={nextMonth}
-              disabled={selectedMonth === currentMonthKey()}>→</button
+              disabled={selectedMonth === currentMonth}>→</button
             >
           </Row>
         </Row>
@@ -360,7 +407,7 @@
           <Card>
             <p class="err-text">{historyError}</p>
           </Card>
-        {:else if monthOps.length === 0}
+        {:else if displayOps.length === 0}
           <Card>
             <p class="empty">
               No positions alive in {monthDisplayLabel(selectedMonth)}
@@ -368,7 +415,7 @@
           </Card>
         {:else}
           <Grid cols={2} gap={4}>
-            {#each monthOps as op}
+            {#each displayOps as op}
               <a href="/operation/{op.id}" class="op-card-link">
                 <Card>
                   <Stack gap={2}>
@@ -408,7 +455,7 @@
       </Stack>
     </section>
 
-    {#if pendingApprovals.length > 0}
+    {#if !isHistoricalMonth && pendingApprovals.length > 0}
       <section>
         <Stack gap={4}>
           <div class="eyebrow">
@@ -439,64 +486,29 @@
       </section>
     {/if}
 
-    <section>
-      <Stack gap={4}>
-        <div class="eyebrow">{$_("dashboard.activeOps")}</div>
-        {#if activeOps.length === 0}
+    {#if !isHistoricalMonth}
+      <section>
+        <Stack gap={4}>
+          <div class="eyebrow">{$_("dashboard.todayEventsLabel")}</div>
           <Card>
-            <p class="empty">{$_("dashboard.noActive")}</p>
+            {#if todayEvents.length === 0}
+              <p class="empty">{$_("dashboard.noEventsToday")}</p>
+            {:else}
+              <div class="event-stream">
+                {#each todayEvents as e (e.event_id)}
+                  <div class="event-line">
+                    <span class="tick">·</span>
+                    <span class="ts">{formatTimeUtc(e.occurred_at)}</span>
+                    <span class="type">{eventTypeLabel(e)}</span>
+                  </div>
+                {/each}
+              </div>
+            {/if}
+            <TickRuler ticks={12} />
           </Card>
-        {:else}
-          <Grid cols={2} gap={4}>
-            {#each activeOps as op}
-              <a href="/operation/{op.id}" class="op-card-link">
-                <Card>
-                  <Stack gap={2}>
-                    <div class="eyebrow">{positionLabel(op)}</div>
-                    <Row justify="between">
-                      <span class="meta">{positionStateLabel(op.state)}</span>
-                      {#if variationFor(op) !== null}
-                        <span
-                          class="mono"
-                          class:ok={(variationFor(op) ?? 0) > 0}
-                          class:err={(variationFor(op) ?? 0) < 0}
-                        >
-                          {(variationFor(op) ?? 0) > 0 ? "+" : ""}{variationFor(
-                            op,
-                          )?.toFixed(2)}%
-                        </span>
-                      {/if}
-                    </Row>
-                  </Stack>
-                </Card>
-              </a>
-            {/each}
-          </Grid>
-        {/if}
-      </Stack>
-    </section>
-
-    <section>
-      <Stack gap={4}>
-        <div class="eyebrow">{$_("dashboard.todayEventsLabel")}</div>
-        <Card>
-          {#if todayEvents.length === 0}
-            <p class="empty">{$_("dashboard.noEventsToday")}</p>
-          {:else}
-            <div class="event-stream">
-              {#each todayEvents as e (e.event_id)}
-                <div class="event-line">
-                  <span class="tick">·</span>
-                  <span class="ts">{formatTimeUtc(e.occurred_at)}</span>
-                  <span class="type">{eventTypeLabel(e)}</span>
-                </div>
-              {/each}
-            </div>
-          {/if}
-          <TickRuler ticks={12} />
-        </Card>
-      </Stack>
-    </section>
+        </Stack>
+      </section>
+    {/if}
   {/if}
 
   {#if showArmModal}
@@ -596,6 +608,14 @@
   .slot.occupied {
     color: var(--cyan-brand);
     border-color: var(--cyan-dim);
+  }
+  .slot.free {
+    color: var(--fg-3);
+  }
+  .slot.expired {
+    color: var(--fg-4);
+    border-style: dashed;
+    border-color: var(--border-2);
   }
   .state-pill {
     font-family: var(--font-mono);

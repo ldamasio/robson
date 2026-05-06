@@ -22,6 +22,9 @@ During operational review, several product rules were clarified:
    from a previous month.
 5. For active positions, the frontend must be able to show both the original stop and
    the current trailing stop, with a visual distinction when they differ.
+6. Selecting a historical month must switch the dashboard into that month's snapshot
+   context. Live slots remain live only for the current month; for historical months,
+   unused capacity is rendered as `Expired Slot`, not `Free Slot`.
 
 The system currently exposes live state well, but month navigation and inherited slot
 semantics are not yet explicit enough as product contract. This ADR fixes the contract.
@@ -48,6 +51,11 @@ A slot is visible in every month from its activation until its terminal deactiva
 The UI must support navigation across historical months in which Robson was running.
 Each month view should render the set of slots that were alive during that month, not
 only slots created during that month.
+
+Selecting a historical month rebinds the dashboard to that month's snapshot context.
+The top slot grid, summary cards, and month-specific controls should all reflect the
+selected month. Live-only affordances remain available only when the current month is
+selected.
 
 ### 3. Visual differentiation
 
@@ -90,6 +98,8 @@ visible. The backend remains the source of truth for the current stop.
 - The implementation will likely need an explicit monthly projection or history query.
 - The UI becomes slightly denser because it must explain inherited versus newly opened
   slots.
+- Historical months use `Expired Slot` placeholders for unused capacity instead of
+  current-month `Free Slot` terminology.
 
 ---
 
@@ -120,6 +130,8 @@ Rejected. It loses the distinction between thesis origin and trailing evolution.
 - Frontend should not infer month inheritance from rendered slot order alone.
 - Historical month rendering should be driven by a backend contract or projection that
   can answer: "which slots were alive during month M?"
+  The frontend should treat the selected month as the page context, not as a sidecar
+  filter for one section of the page.
 - Related code paths already involved:
   - `v3/robsond/src/api.rs`
   - `apps/frontend/src/lib/config/slots.ts`
@@ -134,4 +146,3 @@ Rejected. It loses the distinction between thesis origin and trailing evolution.
 - [ADR-0034: Frontend Slot Count - API Only](ADR-0034-frontend-slot-count-api-only.md)
 - [docs/architecture/OPERATION-LIFECYCLE.md](../architecture/OPERATION-LIFECYCLE.md)
 - [docs/requirements/robson-api-requirements.md](../requirements/robson-api-requirements.md)
-

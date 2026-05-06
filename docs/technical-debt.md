@@ -48,6 +48,11 @@ valued at the stop price instead of remaining at the stale in-memory
 `current_price`. This improves operator visibility but does not close the
 position lifecycle drift.
 
+The monthly slot history UI now renders historical months as full dashboard
+snapshots. In past months, unused capacity is labeled `Expired Slot` instead of
+`Free Slot`, which keeps the current-month live vocabulary separate from the
+historical view.
+
 ### Required Fix
 
 Add core-position reconciliation for tracked positions that are missing on the

@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { deriveSlots, occupiedCount, sortPositionsOldestFirst } from '$lib/config/slots';
+import {
+  deriveHistoricalSlots,
+  deriveSlots,
+  occupiedCount,
+  sortPositionsOldestFirst
+} from '$lib/config/slots';
 import type { PositionState } from '$api/robson';
 
 const activeState: PositionState = {
@@ -73,6 +78,19 @@ describe('deriveSlots', () => {
     expect(result.map((s) => s.positionId)).toEqual(['oldest', 'middle', 'newest', null, null]);
     expect(result.slice(0, 3).every((s) => s.occupied)).toBe(true);
     expect(result.slice(3).every((s) => !s.occupied)).toBe(true);
+  });
+
+  it('renders historical months with expired slots instead of free slots', () => {
+    const positions = [
+      { id: 'oldest', state: activeState, created_at: '2026-04-22T06:24:42Z' },
+      { id: 'middle', state: 'Armed' as PositionState, created_at: '2026-04-26T23:03:11Z' }
+    ];
+    const result = deriveHistoricalSlots(positions, 4);
+
+    expect(result).toHaveLength(6);
+    expect(result.slice(0, 2).every((s) => s.occupied)).toBe(true);
+    expect(result.slice(2).every((s) => s.kind === 'expired')).toBe(true);
+    expect(result.filter((s) => s.kind === 'expired')).toHaveLength(4);
   });
 });
 

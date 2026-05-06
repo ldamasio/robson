@@ -3,6 +3,7 @@ import { isPositionActive } from '$lib/presentation/labels';
 
 export type SlotCell = {
   index: number;
+  kind: 'occupied' | 'free' | 'expired';
   occupied: boolean;
   positionId: string | null;
   state: PositionState | null;
@@ -24,21 +25,58 @@ export function sortPositionsOldestFirst<T extends { created_at?: string | null 
   return [...positions].sort((a, b) => timestampOrInfinity(a.created_at) - timestampOrInfinity(b.created_at));
 }
 
-export function deriveSlots(positions: SlotPosition[], slotCellsTotal: number): SlotCell[] {
+export function deriveLiveSlots(positions: SlotPosition[], slotCellsTotal: number): SlotCell[] {
   const active = sortPositionsOldestFirst(positions.filter((p) => isPositionActive(p.state)));
   const count = Math.max(slotCellsTotal, active.length);
   const cells: SlotCell[] = [];
 
   for (let i = 0; i < count; i++) {
     const pos = active[i];
+    const occupied = i < active.length;
     cells.push({
       index: i,
-      occupied: i < active.length,
+      kind: occupied ? 'occupied' : 'free',
+      occupied,
       positionId: pos?.id ?? null,
       state: pos?.state ?? null
     });
   }
   return cells;
+}
+
+export function deriveHistoricalSlots(
+  positions: SlotPosition[],
+  expiredCount = 4,
+): SlotCell[] {
+  const sorted = sortPositionsOldestFirst(positions);
+  const cells: SlotCell[] = [];
+
+  for (let i = 0; i < sorted.length; i++) {
+    const pos = sorted[i];
+    cells.push({
+      index: i,
+      kind: 'occupied',
+      occupied: true,
+      positionId: pos?.id ?? null,
+      state: pos?.state ?? null,
+    });
+  }
+
+  for (let i = 0; i < expiredCount; i++) {
+    cells.push({
+      index: sorted.length + i,
+      kind: 'expired',
+      occupied: false,
+      positionId: null,
+      state: null,
+    });
+  }
+
+  return cells;
+}
+
+export function deriveSlots(positions: SlotPosition[], slotCellsTotal: number): SlotCell[] {
+  return deriveLiveSlots(positions, slotCellsTotal);
 }
 
 export function occupiedCount(positions: { state: PositionState }[]): number {
