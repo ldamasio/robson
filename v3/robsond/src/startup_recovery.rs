@@ -32,13 +32,11 @@ use std::sync::Arc;
 use chrono::Utc;
 use robson_domain::{Candle, PositionState, Price, Side, Symbol};
 use robson_engine::{Engine, EngineAction, MarketData};
-use robson_exec::{CandleInterval, OhlcvPort};
+use robson_exec::{ActionResult, CandleInterval, ExchangePort, OhlcvPort};
+use robson_store::Store;
 use tracing::{info, warn};
 
-use crate::error::DaemonResult;
-use crate::position_manager::PositionManager;
-use robson_exec::{ActionResult, ExchangePort};
-use robson_store::Store;
+use crate::{error::DaemonResult, position_manager::PositionManager};
 
 /// Summary of what the startup recovery pass did.
 #[derive(Debug, Clone, Default)]
@@ -58,7 +56,10 @@ impl std::fmt::Display for RecoveryReport {
         write!(
             f,
             "scanned={} updated={} closed={} skipped={}",
-            self.positions_scanned, self.stops_updated, self.positions_closed, self.positions_skipped
+            self.positions_scanned,
+            self.stops_updated,
+            self.positions_closed,
+            self.positions_skipped
         )
     }
 }
@@ -110,11 +111,7 @@ pub async fn run_startup_recovery<E: ExchangePort + 'static, S: Store + 'static>
         // leaving a gap between the last processed tick and the recovery
         // window start.
         let (trailing_stop, anchor) = match &position.state {
-            PositionState::Active {
-                trailing_stop,
-                extreme_at,
-                ..
-            } => {
+            PositionState::Active { trailing_stop, extreme_at, .. } => {
                 // updated_at is always set (Position::new initializes it),
                 // but use the most recent of updated_at and extreme_at to be
                 // safe against edge cases in event-sourced reconstruction.
@@ -163,10 +160,7 @@ pub async fn run_startup_recovery<E: ExchangePort + 'static, S: Store + 'static>
         // Using >= (not >) to include the boundary candle whose open_time
         // coincides with the anchor — this candle may cover the period right
         // after the last processed tick.
-        let gap_candles: Vec<&Candle> = candles
-            .iter()
-            .filter(|c| c.open_time >= anchor)
-            .collect();
+        let gap_candles: Vec<&Candle> = candles.iter().filter(|c| c.open_time >= anchor).collect();
 
         if gap_candles.is_empty() {
             report.positions_skipped += 1;
@@ -232,13 +226,8 @@ async fn replay_candles<E: ExchangePort + 'static, S: Store + 'static>(
             Side::Short => Price::new(candle.low).unwrap_or(Price::from(candle.low)),
         };
 
-        let closed = process_recovery_tick(
-            pm,
-            &current,
-            favorable_price,
-            candle.close_time,
-        )
-        .await?;
+        let closed =
+            process_recovery_tick(pm, &current, favorable_price, candle.close_time).await?;
 
         if closed {
             return Ok(true);
@@ -260,13 +249,7 @@ async fn replay_candles<E: ExchangePort + 'static, S: Store + 'static>(
             return Ok(true);
         }
 
-        let closed = process_recovery_tick(
-            pm,
-            &current,
-            adverse_price,
-            candle.close_time,
-        )
-        .await?;
+        let closed = process_recovery_tick(pm, &current, adverse_price, candle.close_time).await?;
 
         if closed {
             return Ok(true);
@@ -286,8 +269,8 @@ mod tests {
 
     use chrono::Duration;
     use robson_domain::{
-        Candle, Position, PositionState, Price, Quantity, Side, Symbol,
-        TechnicalStopDistance, TradingPolicy,
+        Candle, Position, PositionState, Price, Quantity, Side, Symbol, TechnicalStopDistance,
+        TradingPolicy,
     };
     use robson_engine::Engine;
     use robson_exec::{Executor, IntentJournal, OhlcvPort, StubExchange, StubOhlcv};
@@ -296,11 +279,12 @@ mod tests {
     use rust_decimal_macros::dec;
     use uuid::Uuid;
 
-    use crate::event_bus::EventBus;
-    use crate::position_manager::PositionManager;
-    use crate::query_engine::{ApprovalPolicy, TracingQueryRecorder};
-
     use super::*;
+    use crate::{
+        event_bus::EventBus,
+        position_manager::PositionManager,
+        query_engine::{ApprovalPolicy, TracingQueryRecorder},
+    };
 
     // -- helpers ---------------------------------------------------------------
 
@@ -321,7 +305,8 @@ mod tests {
         let event_bus = Arc::new(EventBus::new(100));
         let risk_config = robson_domain::RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(risk_config);
-        let query_recorder = Arc::new(TracingQueryRecorder) as Arc<dyn crate::query_engine::QueryRecorder>;
+        let query_recorder =
+            Arc::new(TracingQueryRecorder) as Arc<dyn crate::query_engine::QueryRecorder>;
 
         Arc::new(
             PositionManager::with_approval_policy(
@@ -457,7 +442,10 @@ mod tests {
         let report = run_startup_recovery(&pm, &pm.ohlcv_port()).await.unwrap();
 
         assert_eq!(report.positions_scanned, 1);
-        assert_eq!(report.positions_closed, 1, "recovery must close the position whose stop was hit");
+        assert_eq!(
+            report.positions_closed, 1,
+            "recovery must close the position whose stop was hit"
+        );
 
         // Verify the position is now Closed in the store.
         let loaded = pm.store().positions().find_by_id(position_id).await.unwrap().unwrap();
@@ -486,13 +474,25 @@ mod tests {
         let safe_candles = vec![
             Candle::new(
                 symbol.clone(),
-                dec!(77900), dec!(78200), dec!(77500), dec!(78000),
-                dec!(100), 50, base, base + Duration::minutes(15),
+                dec!(77900),
+                dec!(78200),
+                dec!(77500),
+                dec!(78000),
+                dec!(100),
+                50,
+                base,
+                base + Duration::minutes(15),
             ),
             Candle::new(
                 symbol.clone(),
-                dec!(78000), dec!(78500), dec!(77800), dec!(78300),
-                dec!(100), 50, base + Duration::minutes(15), base + Duration::minutes(30),
+                dec!(78000),
+                dec!(78500),
+                dec!(77800),
+                dec!(78300),
+                dec!(100),
+                50,
+                base + Duration::minutes(15),
+                base + Duration::minutes(30),
             ),
         ];
 
@@ -575,11 +575,7 @@ mod tests {
             replay_store.apply_event(event).unwrap();
         }
 
-        let replayed = replay_store
-            .positions()
-            .find_by_id(position_id)
-            .await
-            .unwrap();
+        let replayed = replay_store.positions().find_by_id(position_id).await.unwrap();
 
         let replayed = match replayed {
             Some(p) => p,
@@ -590,7 +586,8 @@ mod tests {
                 // ExitOrderPlaced + PositionClosed) still project correctly
                 // when the initial position exists. For convergence, verify
                 // the runtime state instead.
-                let runtime = pm.store().positions().find_by_id(position_id).await.unwrap().unwrap();
+                let runtime =
+                    pm.store().positions().find_by_id(position_id).await.unwrap().unwrap();
                 assert!(
                     matches!(runtime.state, PositionState::Closed { .. }),
                     "runtime must be Closed, got {:?}",
@@ -652,14 +649,25 @@ mod tests {
         let candles = vec![
             Candle::new(
                 symbol.clone(),
-                dec!(78000), dec!(79000), dec!(77800), dec!(78500),
-                dec!(100), 50, base, base + Duration::minutes(15),
+                dec!(78000),
+                dec!(79000),
+                dec!(77800),
+                dec!(78500),
+                dec!(100),
+                50,
+                base,
+                base + Duration::minutes(15),
             ),
             Candle::new(
                 symbol.clone(),
-                dec!(78500), dec!(80000), // HIGH > 79500 -> stop hit for short
-                dec!(78300), dec!(79800),
-                dec!(100), 50, base + Duration::minutes(15), base + Duration::minutes(30),
+                dec!(78500),
+                dec!(80000), // HIGH > 79500 -> stop hit for short
+                dec!(78300),
+                dec!(79800),
+                dec!(100),
+                50,
+                base + Duration::minutes(15),
+                base + Duration::minutes(30),
             ),
         ];
 
@@ -685,7 +693,6 @@ mod tests {
         assert_eq!(report.positions_closed, 0);
     }
 }
-///
 /// Mirrors the core of `process_market_data` but without query tracking or
 /// metrics. Returns `true` if the position was closed.
 async fn process_recovery_tick<E: ExchangePort + 'static, S: Store + 'static>(
