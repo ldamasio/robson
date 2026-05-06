@@ -11,6 +11,7 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use chrono::Datelike;
 use robson_domain::{
     ExitReason, Position, PositionState, Price, Quantity, Side, Symbol, TechnicalStopDistance,
 };
@@ -90,12 +91,15 @@ struct PositionCurrentRow {
     extreme_at: Option<chrono::DateTime<chrono::Utc>>,
     technical_stop_distance: Option<Decimal>,
     technical_stop_price: Option<Decimal>,
+    realized_pnl: Option<Decimal>,
+    total_fees: Option<Decimal>,
     entry_order_id: Option<Uuid>,
     exit_order_id: Option<Uuid>,
     entry_signal_id: Option<Uuid>,
     exit_reason: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
+    closed_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 /// Helper function to parse a row from positions_current query.
@@ -124,12 +128,15 @@ fn parse_position_row(row: &sqlx::postgres::PgRow) -> Result<PositionCurrentRow,
         extreme_at: row.try_get("extreme_at").ok(),
         technical_stop_distance: try_get_decimal("technical_stop_distance"),
         technical_stop_price: try_get_decimal("technical_stop_price"),
+        realized_pnl: try_get_decimal("realized_pnl"),
+        total_fees: try_get_decimal("total_fees"),
         entry_order_id: row.try_get("entry_order_id").ok(),
         exit_order_id: row.try_get("exit_order_id").ok(),
         entry_signal_id: row.try_get("entry_signal_id").ok(),
         exit_reason: row.try_get("exit_reason").ok(),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
+        closed_at: row.try_get("closed_at").ok(),
     })
 }
 
@@ -143,6 +150,223 @@ fn parse_exit_reason(reason: &str) -> Option<ExitReason> {
         "DisarmedByUser" | "disarmed_by_user" => Some(ExitReason::DisarmedByUser),
         _ => None,
     }
+}
+
+fn row_to_position(row_data: PositionCurrentRow) -> Result<Option<Position>, StoreError> {
+    // Parse symbol
+    let symbol = Symbol::from_pair(&row_data.symbol).map_err(|e| {
+        StoreError::Deserialization(format!("Invalid symbol {}: {}", row_data.symbol, e))
+    })?;
+
+    // Parse side
+    let side = match row_data.side.as_str() {
+        "long" => Side::Long,
+        "short" => Side::Short,
+        _ => {
+            return Err(StoreError::Deserialization(format!(
+                "Invalid side: {}",
+                row_data.side
+            )));
+        },
+    };
+
+    let mut position = Position::new(row_data.account_id, symbol, side);
+    position.id = row_data.position_id;
+    position.entry_order_id = row_data.entry_order_id;
+    position.exit_order_id = row_data.exit_order_id;
+
+    if let Some(entry_price) = row_data.entry_price {
+        position.entry_price = Some(Price::new(entry_price).map_err(|e| {
+            StoreError::Deserialization(format!("Invalid entry_price {}: {}", entry_price, e))
+        })?);
+    }
+
+    if let Some(entry_quantity) = row_data.entry_quantity {
+        position.quantity = Quantity::new(entry_quantity).map_err(|e| {
+            StoreError::Deserialization(format!(
+                "Invalid entry_quantity {}: {}",
+                entry_quantity, e
+            ))
+        })?;
+    }
+
+    if row_data.current_quantity > Decimal::ZERO {
+        position.quantity = Quantity::new(row_data.current_quantity).map_err(|e| {
+            StoreError::Deserialization(format!(
+                "Invalid current_quantity {}: {}",
+                row_data.current_quantity, e
+            ))
+        })?;
+    }
+
+    if let Some(realized_pnl) = row_data.realized_pnl {
+        position.realized_pnl = realized_pnl;
+    }
+
+    if let Some(total_fees) = row_data.total_fees {
+        position.fees_paid = total_fees;
+    }
+
+    if let (Some(_distance), Some(stop_price)) =
+        (row_data.technical_stop_distance, row_data.technical_stop_price)
+    {
+        let entry = position.entry_price.ok_or_else(|| {
+            StoreError::Deserialization("Missing entry_price for technical stop".to_string())
+        })?;
+
+        let stop = Price::new(stop_price).map_err(|e| {
+            StoreError::Deserialization(format!("Invalid technical_stop_price: {}", e))
+        })?;
+
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        position.tech_stop_distance = Some(tech_stop);
+    }
+
+    match row_data.state.as_str() {
+        "armed" => {
+            position.state = PositionState::Armed;
+        },
+        "entering" => {
+            let Some(entry_order_id) = row_data.entry_order_id else {
+                tracing::warn!(
+                    position_id = %row_data.position_id,
+                    "Skipping entering projection row without entry_order_id"
+                );
+                return Ok(None);
+            };
+            let Some(expected_entry) = row_data.entry_price else {
+                tracing::warn!(
+                    position_id = %row_data.position_id,
+                    "Skipping entering projection row without entry_price"
+                );
+                return Ok(None);
+            };
+
+            let signal_id = row_data.entry_signal_id.unwrap_or_else(|| {
+                tracing::warn!(
+                    position_id = %row_data.position_id,
+                    "Recovering entering projection row without signal_id; using nil UUID sentinel"
+                );
+                Uuid::nil()
+            });
+
+            position.state = PositionState::Entering {
+                entry_order_id,
+                expected_entry: Price::new(expected_entry).map_err(|e| {
+                    StoreError::Deserialization(format!(
+                        "Invalid expected_entry {}: {}",
+                        expected_entry, e
+                    ))
+                })?,
+                signal_id,
+            };
+        },
+        "active" => {
+            let current_price =
+                row_data.current_price.or(row_data.entry_price).ok_or_else(|| {
+                    StoreError::Deserialization(
+                        "Missing current_price/entry_price for active position".to_string(),
+                    )
+                })?;
+
+            let trailing_stop = row_data.trailing_stop_price.ok_or_else(|| {
+                StoreError::Deserialization(
+                    "Missing trailing_stop_price for active position".to_string(),
+                )
+            })?;
+
+            let favorable_extreme = row_data.favorable_extreme.ok_or_else(|| {
+                StoreError::Deserialization(
+                    "Missing favorable_extreme for active position".to_string(),
+                )
+            })?;
+
+            let extreme_at = row_data.extreme_at.ok_or_else(|| {
+                StoreError::Deserialization(
+                    "Missing extreme_at for active position".to_string(),
+                )
+            })?;
+
+            position.state = PositionState::Active {
+                current_price: Price::new(current_price).map_err(|e| {
+                    StoreError::Deserialization(format!("Invalid current_price: {}", e))
+                })?,
+                trailing_stop: Price::new(trailing_stop).map_err(|e| {
+                    StoreError::Deserialization(format!("Invalid trailing_stop: {}", e))
+                })?,
+                favorable_extreme: Price::new(favorable_extreme).map_err(|e| {
+                    StoreError::Deserialization(format!("Invalid favorable_extreme: {}", e))
+                })?,
+                extreme_at,
+                insurance_stop_id: None,
+                last_emitted_stop: row_data.trailing_stop_price.map(|p| Price::new(p).unwrap()),
+            };
+        },
+        "exiting" => {
+            let Some(exit_reason_str) = row_data.exit_reason.as_deref() else {
+                tracing::warn!(
+                    position_id = %row_data.position_id,
+                    "Skipping exiting projection row without exit_reason"
+                );
+                return Ok(None);
+            };
+            let Some(exit_reason) = parse_exit_reason(exit_reason_str) else {
+                tracing::warn!(
+                    position_id = %row_data.position_id,
+                    exit_reason = %exit_reason_str,
+                    "Skipping exiting projection row with unknown exit_reason"
+                );
+                return Ok(None);
+            };
+
+            let exit_order_id = row_data.exit_order_id.unwrap_or_else(|| {
+                tracing::warn!(
+                    position_id = %row_data.position_id,
+                    "Recovering exiting projection row without exit_order_id; using nil UUID sentinel"
+                );
+                Uuid::nil()
+            });
+
+            position.state = PositionState::Exiting { exit_order_id, exit_reason };
+        },
+        "closed" => {
+            let exit_price = row_data.current_price.or(row_data.entry_price).ok_or_else(|| {
+                StoreError::Deserialization(
+                    "Missing current_price/entry_price for closed position".to_string(),
+                )
+            })?;
+            let exit_reason = row_data
+                .exit_reason
+                .as_deref()
+                .and_then(parse_exit_reason)
+                .unwrap_or(ExitReason::PositionError);
+            position.state = PositionState::Closed {
+                exit_price: Price::new(exit_price).map_err(|e| {
+                    StoreError::Deserialization(format!("Invalid exit_price: {}", e))
+                })?,
+                realized_pnl: row_data.realized_pnl.unwrap_or(Decimal::ZERO),
+                exit_reason,
+            };
+        },
+        "error" => {
+            position.state = PositionState::Error {
+                error: row_data.exit_reason.unwrap_or_else(|| "unknown".to_string()),
+                recoverable: true,
+            };
+        },
+        "cancelled" => {
+            position.state = PositionState::Cancelled;
+        },
+        _ => {
+            return Ok(None);
+        },
+    }
+
+    position.created_at = row_data.created_at;
+    position.updated_at = row_data.updated_at;
+    position.closed_at = row_data.closed_at;
+
+    Ok(Some(position))
 }
 
 /// Read open core positions from the `positions_current` projection table.
@@ -209,12 +433,15 @@ pub async fn find_active_from_projection(
             extreme_at,
             technical_stop_distance,
             technical_stop_price,
+            realized_pnl,
+            total_fees,
             entry_order_id,
             exit_order_id,
             entry_signal_id,
             exit_reason,
             created_at,
-            updated_at
+            updated_at,
+            closed_at
         FROM positions_current
         WHERE tenant_id = $1
           AND state IN ('armed', 'entering', 'active', 'exiting')
@@ -231,192 +458,81 @@ pub async fn find_active_from_projection(
     for row in rows {
         let row_data = parse_position_row(&row)
             .map_err(|e| StoreError::Database(format!("Failed to parse row: {}", e)))?;
-
-        // Parse symbol
-        let symbol = Symbol::from_pair(&row_data.symbol).map_err(|e| {
-            StoreError::Deserialization(format!("Invalid symbol {}: {}", row_data.symbol, e))
-        })?;
-
-        // Parse side
-        let side = match row_data.side.as_str() {
-            "long" => Side::Long,
-            "short" => Side::Short,
-            _ => {
-                return Err(StoreError::Deserialization(format!(
-                    "Invalid side: {}",
-                    row_data.side
-                )));
-            },
-        };
-
-        // Create base position
-        let mut position = Position::new(row_data.account_id, symbol, side);
-        position.id = row_data.position_id;
-        position.entry_order_id = row_data.entry_order_id;
-        position.exit_order_id = row_data.exit_order_id;
-
-        // Set entry data
-        if let Some(entry_price) = row_data.entry_price {
-            position.entry_price = Some(Price::new(entry_price).map_err(|e| {
-                StoreError::Deserialization(format!("Invalid entry_price {}: {}", entry_price, e))
-            })?);
+        if let Some(position) = row_to_position(row_data)? {
+            positions.push(position);
         }
+    }
 
-        if let Some(entry_quantity) = row_data.entry_quantity {
-            position.quantity = Quantity::new(entry_quantity).map_err(|e| {
-                StoreError::Deserialization(format!(
-                    "Invalid entry_quantity {}: {}",
-                    entry_quantity, e
-                ))
-            })?;
+    Ok(positions)
+}
+
+/// Read all positions that overlapped a given month from the persisted
+/// `positions_current` projection table.
+pub async fn find_positions_overlapping_month(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    month_start: chrono::DateTime<chrono::Utc>,
+) -> Result<Vec<Position>, StoreError> {
+    let (next_year, next_month) = if month_start.month() == 12 {
+        (month_start.year() + 1, 1)
+    } else {
+        (month_start.year(), month_start.month() + 1)
+    };
+    let month_end = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+        chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1)
+            .expect("valid next month")
+            .and_hms_opt(0, 0, 0)
+            .expect("valid month boundary"),
+        chrono::Utc,
+    );
+
+    let rows = sqlx::query(
+        r#"
+        SELECT
+            position_id,
+            account_id,
+            symbol,
+            side,
+            state,
+            entry_price,
+            entry_quantity,
+            current_quantity,
+            current_price,
+            trailing_stop_price,
+            favorable_extreme,
+            extreme_at,
+            technical_stop_distance,
+            technical_stop_price,
+            realized_pnl,
+            total_fees,
+            entry_order_id,
+            exit_order_id,
+            entry_signal_id,
+            exit_reason,
+            created_at,
+            updated_at,
+            closed_at
+        FROM positions_current
+        WHERE tenant_id = $1
+          AND created_at < $3
+          AND COALESCE(closed_at, $3) > $2
+        ORDER BY created_at ASC, position_id ASC
+        "#,
+    )
+    .bind(tenant_id)
+    .bind(month_start)
+    .bind(month_end)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| StoreError::Database(format!("Failed to read historical positions: {}", e)))?;
+
+    let mut positions = Vec::new();
+    for row in rows {
+        let row_data = parse_position_row(&row)
+            .map_err(|e| StoreError::Database(format!("Failed to parse row: {}", e)))?;
+        if let Some(position) = row_to_position(row_data)? {
+            positions.push(position);
         }
-
-        if row_data.current_quantity > Decimal::ZERO {
-            position.quantity = Quantity::new(row_data.current_quantity).map_err(|e| {
-                StoreError::Deserialization(format!(
-                    "Invalid current_quantity {}: {}",
-                    row_data.current_quantity, e
-                ))
-            })?;
-        }
-
-        // Set tech stop distance
-        if let (Some(_distance), Some(stop_price)) =
-            (row_data.technical_stop_distance, row_data.technical_stop_price)
-        {
-            let entry = position.entry_price.ok_or_else(|| {
-                StoreError::Deserialization("Missing entry_price for technical stop".to_string())
-            })?;
-
-            let stop = Price::new(stop_price).map_err(|e| {
-                StoreError::Deserialization(format!("Invalid technical_stop_price: {}", e))
-            })?;
-
-            let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
-            position.tech_stop_distance = Some(tech_stop);
-        }
-
-        // Set state based on row
-        match row_data.state.as_str() {
-            "armed" => {
-                position.state = PositionState::Armed;
-            },
-            "entering" => {
-                let Some(entry_order_id) = row_data.entry_order_id else {
-                    tracing::warn!(
-                        position_id = %row_data.position_id,
-                        "Skipping entering projection row without entry_order_id"
-                    );
-                    continue;
-                };
-                let Some(expected_entry) = row_data.entry_price else {
-                    tracing::warn!(
-                        position_id = %row_data.position_id,
-                        "Skipping entering projection row without entry_price"
-                    );
-                    continue;
-                };
-
-                let signal_id = row_data.entry_signal_id.unwrap_or_else(|| {
-                    tracing::warn!(
-                        position_id = %row_data.position_id,
-                        "Recovering entering projection row without signal_id; using nil UUID sentinel"
-                    );
-                    Uuid::nil()
-                });
-
-                position.state = PositionState::Entering {
-                    entry_order_id,
-                    expected_entry: Price::new(expected_entry).map_err(|e| {
-                        StoreError::Deserialization(format!(
-                            "Invalid expected_entry {}: {}",
-                            expected_entry, e
-                        ))
-                    })?,
-                    signal_id,
-                };
-            },
-            "active" => {
-                // For Active positions, we need to reconstruct the full Active state
-                // This requires: current_price, trailing_stop, favorable_extreme, extreme_at
-                let current_price =
-                    row_data.current_price.or(row_data.entry_price).ok_or_else(|| {
-                        StoreError::Deserialization(
-                            "Missing current_price/entry_price for active position".to_string(),
-                        )
-                    })?;
-
-                let trailing_stop = row_data.trailing_stop_price.ok_or_else(|| {
-                    StoreError::Deserialization(
-                        "Missing trailing_stop_price for active position".to_string(),
-                    )
-                })?;
-
-                let favorable_extreme = row_data.favorable_extreme.ok_or_else(|| {
-                    StoreError::Deserialization(
-                        "Missing favorable_extreme for active position".to_string(),
-                    )
-                })?;
-
-                let extreme_at = row_data.extreme_at.ok_or_else(|| {
-                    StoreError::Deserialization(
-                        "Missing extreme_at for active position".to_string(),
-                    )
-                })?;
-
-                position.state = PositionState::Active {
-                    current_price: Price::new(current_price).map_err(|e| {
-                        StoreError::Deserialization(format!("Invalid current_price: {}", e))
-                    })?,
-                    trailing_stop: Price::new(trailing_stop).map_err(|e| {
-                        StoreError::Deserialization(format!("Invalid trailing_stop: {}", e))
-                    })?,
-                    favorable_extreme: Price::new(favorable_extreme).map_err(|e| {
-                        StoreError::Deserialization(format!("Invalid favorable_extreme: {}", e))
-                    })?,
-                    extreme_at,
-                    insurance_stop_id: None,
-                    last_emitted_stop: row_data.trailing_stop_price.map(|p| Price::new(p).unwrap()),
-                };
-            },
-            "exiting" => {
-                let Some(exit_reason_str) = row_data.exit_reason.as_deref() else {
-                    tracing::warn!(
-                        position_id = %row_data.position_id,
-                        "Skipping exiting projection row without exit_reason"
-                    );
-                    continue;
-                };
-                let Some(exit_reason) = parse_exit_reason(exit_reason_str) else {
-                    tracing::warn!(
-                        position_id = %row_data.position_id,
-                        exit_reason = %exit_reason_str,
-                        "Skipping exiting projection row with unknown exit_reason"
-                    );
-                    continue;
-                };
-
-                let exit_order_id = row_data.exit_order_id.unwrap_or_else(|| {
-                    tracing::warn!(
-                        position_id = %row_data.position_id,
-                        "Recovering exiting projection row without exit_order_id; using nil UUID sentinel"
-                    );
-                    Uuid::nil()
-                });
-
-                position.state = PositionState::Exiting { exit_order_id, exit_reason };
-            },
-            _ => {
-                // Skip terminal/manual states not covered by crash recovery.
-                continue;
-            },
-        }
-
-        // Set timestamps
-        position.created_at = row_data.created_at;
-        position.updated_at = row_data.updated_at;
-
-        positions.push(position);
     }
 
     Ok(positions)

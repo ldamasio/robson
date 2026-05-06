@@ -54,5 +54,8 @@ pub use detected_position::{
 pub use error::StoreError;
 pub use memory::MemoryStore;
 #[cfg(feature = "postgres")]
-pub use postgres::{find_active_from_projection, PgProjectionReader, ProjectionRecovery};
+pub use postgres::{
+    find_active_from_projection, find_positions_overlapping_month, PgProjectionReader,
+    ProjectionRecovery,
+};
 pub use repository::{EventRepository, OrderRepository, PositionRepository, Store};

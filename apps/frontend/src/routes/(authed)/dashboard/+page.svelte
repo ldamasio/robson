@@ -18,8 +18,7 @@
   import { recentEvents, pushEvent } from "$stores/events";
   import { toasts, showToast } from "$stores/toast";
   import {
-    deriveHistoricalSlots,
-    deriveLiveSlots,
+    deriveMonthSlots,
     sortPositionsOldestFirst,
   } from "$lib/config/slots";
   import { formatTimeUtc, isTodayUtc } from "$lib/utils/time";
@@ -30,7 +29,6 @@
     positionSummaryLines,
     haltStateLabel,
     eventTypeLabel,
-    isPositionActive,
   } from "$lib/presentation/labels";
   import { _ } from "svelte-i18n";
 
@@ -42,28 +40,23 @@
   let pollTimer: ReturnType<typeof setInterval> | null = null;
   let showArmModal = $state(false);
   let pendingApprovals = $state<PendingApproval[]>([]);
-  let newSlotsAvailable = $state(0);
-  let slotCellsTotal = $state(0);
   let historyError = $state<string | null>(null);
   let selectedMonth = $state(currentMonthKey());
   let monthlyPositions = $state<Position[]>([]);
+  let monthlySlotCellsTotal = $state<number | null>(null);
   let approvalTick = $state(Date.now());
   let approvalTickTimer: ReturnType<typeof setInterval> | null = null;
 
-  let positions = $derived($activePositions);
   let currentMonth = $derived(currentMonthKey());
-  let isHistoricalMonth = $derived(selectedMonth !== currentMonth);
-  let liveOps = $derived(
-    sortPositionsOldestFirst(
-      positions.filter((p) => isPositionActive(p.state)),
-    ),
-  );
   let monthOps = $derived(sortPositionsOldestFirst(monthlyPositions));
-  let displayOps = $derived(isHistoricalMonth ? monthOps : liveOps);
+  let isHistoricalMonth = $derived(selectedMonth !== currentMonth);
+  let displayOps = $derived(monthOps);
   let slots = $derived(
-    isHistoricalMonth
-      ? deriveHistoricalSlots(displayOps)
-      : deriveLiveSlots(positions, slotCellsTotal),
+    deriveMonthSlots(
+      displayOps,
+      monthlySlotCellsTotal ?? displayOps.length,
+      isHistoricalMonth ? "expired" : "free",
+    ),
   );
   let occupied = $derived(slots.filter((s) => s.kind === "occupied").length);
   let displayedSlots = $derived(slots.length);
@@ -166,8 +159,6 @@
       activePositions.set(status.positions);
       haltStatus.set(halt);
       pendingApprovals = status.pending_approvals;
-      newSlotsAvailable = status.new_slots_available;
-      slotCellsTotal = status.slot_cells_total;
       connected = true;
     } catch (e) {
       error =
@@ -178,9 +169,14 @@
 
   async function loadHistory() {
     historyError = null;
+    monthlySlotCellsTotal = null;
     try {
       const response = await robsonApi.getMonthlyPositions(selectedMonth);
       monthlyPositions = response.positions;
+      const maybeTotal = Number(
+        (response as { slot_cells_total?: unknown }).slot_cells_total,
+      );
+      monthlySlotCellsTotal = Number.isFinite(maybeTotal) ? maybeTotal : null;
     } catch (e) {
       historyError =
         e instanceof Error ? e.message : "Failed to load month history";
@@ -233,8 +229,6 @@
           activePositions.set(status.positions);
           haltStatus.set(halt);
           pendingApprovals = status.pending_approvals;
-          newSlotsAvailable = status.new_slots_available;
-          slotCellsTotal = status.slot_cells_total;
           connected = true;
           error = null;
           void loadHistory();
@@ -346,10 +340,7 @@
   {:else}
     <section>
       <Stack gap={4}>
-        <div class="eyebrow">
-          {isHistoricalMonth ? "MONTH SNAPSHOT" : $_("dashboard.slots")} ·
-          {monthLabel()}
-        </div>
+        <div class="eyebrow">MONTH SNAPSHOT · {monthLabel()}</div>
         <div class="slots-grid">
           {#each slots as slot}
             {#if slot.kind === "occupied" && slot.positionId}

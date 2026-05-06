@@ -961,6 +961,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             position_monitor,
             #[cfg(feature = "postgres")]
             pg_pool: self.pg_pool.clone(),
+            #[cfg(feature = "postgres")]
+            tenant_id: self.config.projection.tenant_id,
             api_token: self.config.api.api_token.clone(),
         });
 

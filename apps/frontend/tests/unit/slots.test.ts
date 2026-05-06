@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import {
   deriveHistoricalSlots,
+  deriveMonthSlots,
   deriveSlots,
   occupiedCount,
   sortPositionsOldestFirst
@@ -85,12 +86,37 @@ describe('deriveSlots', () => {
       { id: 'oldest', state: activeState, created_at: '2026-04-22T06:24:42Z' },
       { id: 'middle', state: 'Armed' as PositionState, created_at: '2026-04-26T23:03:11Z' }
     ];
-    const result = deriveHistoricalSlots(positions, 4);
+    const result = deriveHistoricalSlots(positions, 6);
 
     expect(result).toHaveLength(6);
     expect(result.slice(0, 2).every((s) => s.occupied)).toBe(true);
     expect(result.slice(2).every((s) => s.kind === 'expired')).toBe(true);
     expect(result.filter((s) => s.kind === 'expired')).toHaveLength(4);
+  });
+
+  it('renders current-month snapshots with free slots instead of expired slots', () => {
+    const positions = [
+      { id: 'oldest', state: activeState, created_at: '2026-05-02T10:00:00Z' },
+      { id: 'middle', state: 'Armed' as PositionState, created_at: '2026-05-04T11:00:00Z' }
+    ];
+    const result = deriveMonthSlots(positions, 6, 'free');
+
+    expect(result).toHaveLength(6);
+    expect(result.slice(0, 2).every((s) => s.occupied)).toBe(true);
+    expect(result.slice(2).every((s) => s.kind === 'free')).toBe(true);
+    expect(result.filter((s) => s.kind === 'free')).toHaveLength(4);
+  });
+
+  it('does not add expired slots when the snapshot is already full', () => {
+    const positions = [
+      { id: 'one', state: activeState, created_at: '2026-04-22T06:24:42Z' },
+      { id: 'two', state: 'Armed' as PositionState, created_at: '2026-04-26T23:03:11Z' },
+      { id: 'three', state: activeState, created_at: '2026-05-01T10:00:00Z' }
+    ];
+    const result = deriveHistoricalSlots(positions, 2);
+
+    expect(result).toHaveLength(3);
+    expect(result.every((s) => s.occupied)).toBe(true);
   });
 });
 

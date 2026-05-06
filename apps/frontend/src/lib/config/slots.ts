@@ -46,10 +46,19 @@ export function deriveLiveSlots(positions: SlotPosition[], slotCellsTotal: numbe
 
 export function deriveHistoricalSlots(
   positions: SlotPosition[],
-  expiredCount = 4,
+  slotCellsTotal: number,
+): SlotCell[] {
+  return deriveMonthSlots(positions, slotCellsTotal, "expired");
+}
+
+export function deriveMonthSlots(
+  positions: SlotPosition[],
+  slotCellsTotal: number,
+  emptyKind: "free" | "expired",
 ): SlotCell[] {
   const sorted = sortPositionsOldestFirst(positions);
   const cells: SlotCell[] = [];
+  const expiredCount = Math.max(slotCellsTotal - sorted.length, 0);
 
   for (let i = 0; i < sorted.length; i++) {
     const pos = sorted[i];
@@ -65,7 +74,7 @@ export function deriveHistoricalSlots(
   for (let i = 0; i < expiredCount; i++) {
     cells.push({
       index: sorted.length + i,
-      kind: 'expired',
+      kind: emptyKind,
       occupied: false,
       positionId: null,
       state: null,

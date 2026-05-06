@@ -26,9 +26,11 @@ use axum::{
 use chrono::Datelike;
 use robson_domain::{
     ApprovalPolicy as DomainApprovalPolicy, DetectorSignal, EntryPolicy, EntryPolicyConfig,
-    Position, PositionState, Price, RiskConfig, Side, Symbol,
+    Position, PositionState, Price, RiskConfig, Side, Symbol, TradingPolicy,
 };
 use robson_exec::ExchangePort;
+#[cfg(feature = "postgres")]
+use robson_store::find_positions_overlapping_month;
 use robson_store::Store;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -60,6 +62,8 @@ pub struct ApiState<E: ExchangePort + 'static, S: Store + 'static> {
     /// configured.
     #[cfg(feature = "postgres")]
     pub pg_pool: Option<std::sync::Arc<sqlx::PgPool>>,
+    #[cfg(feature = "postgres")]
+    pub tenant_id: Option<Uuid>,
     /// Bearer token for authenticating mutating routes. `None` means auth is
     /// disabled (non-production environments only).
     pub api_token: Option<String>,
@@ -113,6 +117,8 @@ pub struct StatusResponse {
 pub struct MonthlyPositionsResponse {
     pub month: String,
     pub positions: Vec<PositionSummary>,
+    pub occupied_slots: usize,
+    pub slot_cells_total: usize,
 }
 
 /// Summary of a position.
@@ -663,13 +669,25 @@ where
 {
     let requested = parse_month_query(query.month.as_deref())?;
     let manager = state.position_manager.read().await;
-    let positions = load_positions_for_month(&manager, requested)
+    let positions = load_positions_for_month(&manager, requested, &state)
         .await
         .map_err(|e| to_error_response(e))?;
+    let monthly = manager.load_monthly_state(requested).await.map_err(|e| to_error_response(e))?;
+    let occupied_slots = positions.len();
+    let inherited_slots = positions
+        .iter()
+        .filter(|position| position.created_at < requested)
+        .count();
+    let base_slots_available = TradingPolicy::default()
+        .slots_available(monthly.capital_base, monthly.realized_loss, Decimal::ZERO)
+        as usize;
+    let slot_cells_total = base_slots_available.saturating_add(inherited_slots);
 
     Ok(Json(MonthlyPositionsResponse {
         month: format!("{:04}-{:02}", requested.year(), requested.month()),
         positions,
+        occupied_slots,
+        slot_cells_total,
     }))
 }
 
@@ -1216,11 +1234,45 @@ fn parse_month_query(
 async fn load_positions_for_month<E, S>(
     manager: &PositionManager<E, S>,
     month_start: chrono::DateTime<chrono::Utc>,
+    state: &ApiState<E, S>,
 ) -> Result<Vec<PositionSummary>, DaemonError>
 where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
+    let mut positions: Vec<Position> = load_positions_for_month_positions(manager, month_start, state).await?;
+
+    positions.sort_by_key(|position| position.created_at);
+
+    let mut summaries = Vec::with_capacity(positions.len());
+    for position in &positions {
+        summaries.push(position_to_summary(position, None));
+    }
+
+    Ok(summaries)
+}
+
+async fn load_positions_for_month_positions<E, S>(
+    manager: &PositionManager<E, S>,
+    month_start: chrono::DateTime<chrono::Utc>,
+    state: &ApiState<E, S>,
+) -> Result<Vec<Position>, DaemonError>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    #[cfg(feature = "postgres")]
+    if let (Some(pool), Some(tenant_id)) = (&state.pg_pool, state.tenant_id) {
+        return find_positions_overlapping_month(pool.as_ref(), tenant_id, month_start)
+            .await
+            .map_err(|e| DaemonError::Config(format!("Failed to load month projection: {}", e)));
+    }
+
+    let active = manager.store().positions().find_active().await?;
+    let closed = manager.store().positions().find_all_closed().await?;
+    let error = manager.store().positions().find_by_state("error").await?;
+    let cancelled = manager.store().positions().find_by_state("cancelled").await?;
+
     let (next_year, next_month) = next_month(month_start.year(), month_start.month());
     let month_end = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
         chrono::NaiveDate::from_ymd_opt(next_year, next_month, 1)
@@ -1230,23 +1282,13 @@ where
         chrono::Utc,
     );
 
-    let active = manager.store().positions().find_active().await?;
-    let closed = manager.store().positions().find_all_closed().await?;
-
-    let mut positions: Vec<Position> = active
+    Ok(active
         .into_iter()
         .chain(closed.into_iter())
+        .chain(error.into_iter())
+        .chain(cancelled.into_iter())
         .filter(|position| position_overlaps_month(position, month_start, month_end))
-        .collect();
-
-    positions.sort_by_key(|position| position.created_at);
-
-    let mut summaries = Vec::with_capacity(positions.len());
-    for position in &positions {
-        summaries.push(position_to_summary_with_live_price(manager, position).await);
-    }
-
-    Ok(summaries)
+        .collect())
 }
 
 fn position_overlaps_month(
@@ -1401,56 +1443,151 @@ mod tests {
         let (app, _event_bus, position_manager) = create_test_app_with_event_bus(100).await;
         let april = month_start(2026, 4);
         let may = month_start(2026, 5);
-        let june = month_start(2026, 6);
 
-        let mut inherited =
+        let mut ada_armed =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("ADAUSDT").unwrap(), Side::Long);
+        ada_armed.created_at = april + chrono::Duration::days(1);
+        ada_armed.updated_at = april + chrono::Duration::days(3);
+        ada_armed.state = PositionState::Armed;
+        ada_armed.entry_price = Some(Price::new(dec!(100)).unwrap());
+
+        let mut btc_long =
             Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
-        inherited.created_at = april - chrono::Duration::days(7);
-        inherited.updated_at = april - chrono::Duration::days(1);
-        inherited.state = PositionState::Armed;
-        inherited.entry_price = Some(Price::new(dec!(100)).unwrap());
-
-        let mut closed_in_may =
-            Position::new(Uuid::now_v7(), Symbol::from_pair("ETHUSDT").unwrap(), Side::Short);
-        closed_in_may.created_at = april - chrono::Duration::days(3);
-        closed_in_may.updated_at = may + chrono::Duration::days(1);
-        closed_in_may.closed_at = Some(may + chrono::Duration::days(1));
-        closed_in_may.state = PositionState::Closed {
-            exit_price: Price::new(dec!(80)).unwrap(),
-            realized_pnl: dec!(20),
+        btc_long.created_at = april + chrono::Duration::days(2);
+        btc_long.updated_at = may + chrono::Duration::days(1);
+        btc_long.closed_at = Some(may + chrono::Duration::days(1));
+        btc_long.quantity = robson_domain::Quantity::new(dec!(1)).unwrap();
+        btc_long.entry_price = Some(Price::new(dec!(100)).unwrap());
+        btc_long.state = PositionState::Closed {
+            exit_price: Price::new(dec!(110)).unwrap(),
+            realized_pnl: dec!(10),
             exit_reason: robson_domain::ExitReason::TrailingStop,
         };
-        closed_in_may.entry_price = Some(Price::new(dec!(100)).unwrap());
 
-        let mut born_in_june =
-            Position::new(Uuid::now_v7(), Symbol::from_pair("ADAUSDT").unwrap(), Side::Long);
-        born_in_june.created_at = june + chrono::Duration::days(1);
-        born_in_june.updated_at = june + chrono::Duration::days(1);
-        born_in_june.state = PositionState::Armed;
+        let mut btc_short =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Short);
+        btc_short.created_at = may + chrono::Duration::days(4);
+        btc_short.updated_at = may + chrono::Duration::days(4);
+        btc_short.state = PositionState::Armed;
+        btc_short.entry_price = Some(Price::new(dec!(200)).unwrap());
 
         {
             let manager = position_manager.write().await;
-            manager.store().positions().save(&inherited).await.unwrap();
-            manager.store().positions().save(&closed_in_may).await.unwrap();
-            manager.store().positions().save(&born_in_june).await.unwrap();
+            manager.store().positions().save(&ada_armed).await.unwrap();
+            manager.store().positions().save(&btc_long).await.unwrap();
+            manager.store().positions().save(&btc_short).await.unwrap();
         }
 
-        let response = app
+        let april_response = app.clone()
+            .oneshot(
+                Request::builder().uri("/positions?month=2026-04").body(Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(april_response.status(), StatusCode::OK);
+        let april_body = april_response.into_body().collect().await.unwrap().to_bytes();
+        let april_month: MonthlyPositionsResponse = serde_json::from_slice(&april_body).unwrap();
+
+        let may_response = app
             .oneshot(
                 Request::builder().uri("/positions?month=2026-05").body(Body::empty()).unwrap(),
             )
             .await
             .unwrap();
+        assert_eq!(may_response.status(), StatusCode::OK);
+        let may_body = may_response.into_body().collect().await.unwrap().to_bytes();
+        let may_month: MonthlyPositionsResponse = serde_json::from_slice(&may_body).unwrap();
 
-        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(april_month.month, "2026-04");
+        assert_eq!(may_month.month, "2026-05");
 
-        let body = response.into_body().collect().await.unwrap().to_bytes();
-        let monthly: MonthlyPositionsResponse = serde_json::from_slice(&body).unwrap();
-        assert_eq!(monthly.month, "2026-05");
-        assert_eq!(monthly.positions.len(), 2);
-        assert_eq!(monthly.positions[0].id, inherited.id);
-        assert_eq!(monthly.positions[1].id, closed_in_may.id);
-        assert!(monthly.positions.iter().all(|p| p.id != born_in_june.id));
+        assert_eq!(april_month.occupied_slots, 2);
+        assert_eq!(april_month.slot_cells_total, 4);
+        assert_eq!(april_month.positions.len(), 2);
+        assert_eq!(april_month.positions[0].id, ada_armed.id);
+        assert_eq!(april_month.positions[1].id, btc_long.id);
+
+        assert_eq!(may_month.occupied_slots, 3);
+        assert_eq!(may_month.slot_cells_total, 6);
+        assert_eq!(may_month.positions.len(), 3);
+        assert_eq!(may_month.positions[0].id, ada_armed.id);
+        assert_eq!(may_month.positions[1].id, btc_long.id);
+        assert_eq!(may_month.positions[2].id, btc_short.id);
+    }
+
+    #[tokio::test]
+    async fn test_month_positions_endpoint_keeps_april_may_overlap_and_month_slots_change() {
+        let (app, _event_bus, position_manager) = create_test_app_with_event_bus(100).await;
+        let april = month_start(2026, 4);
+        let may = month_start(2026, 5);
+
+        let mut overlap =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        overlap.created_at = april + chrono::Duration::days(10);
+        overlap.updated_at = may + chrono::Duration::days(2);
+        overlap.closed_at = Some(may + chrono::Duration::days(2));
+        overlap.quantity = robson_domain::Quantity::new(dec!(1)).unwrap();
+        overlap.entry_price = Some(Price::new(dec!(100)).unwrap());
+        overlap.state = PositionState::Closed {
+            exit_price: Price::new(dec!(110)).unwrap(),
+            realized_pnl: dec!(10),
+            exit_reason: robson_domain::ExitReason::TrailingStop,
+        };
+
+        let mut april_only =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("ETHUSDT").unwrap(), Side::Short);
+        april_only.created_at = april + chrono::Duration::days(2);
+        april_only.updated_at = april + chrono::Duration::days(18);
+        april_only.closed_at = Some(april + chrono::Duration::days(18));
+        april_only.quantity = robson_domain::Quantity::new(dec!(2)).unwrap();
+        april_only.entry_price = Some(Price::new(dec!(50)).unwrap());
+        april_only.state = PositionState::Closed {
+            exit_price: Price::new(dec!(40)).unwrap(),
+            realized_pnl: dec!(20),
+            exit_reason: robson_domain::ExitReason::UserPanic,
+        };
+
+        {
+            let manager = position_manager.write().await;
+            manager.store().positions().save(&overlap).await.unwrap();
+            manager.store().positions().save(&april_only).await.unwrap();
+        }
+
+        let april_response = app.clone()
+            .oneshot(
+                Request::builder().uri("/positions?month=2026-04").body(Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(april_response.status(), StatusCode::OK);
+        let april_body = april_response.into_body().collect().await.unwrap().to_bytes();
+        let april_month: MonthlyPositionsResponse = serde_json::from_slice(&april_body).unwrap();
+
+        let may_response = app
+            .oneshot(
+                Request::builder().uri("/positions?month=2026-05").body(Body::empty()).unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(may_response.status(), StatusCode::OK);
+        let may_body = may_response.into_body().collect().await.unwrap().to_bytes();
+        let may_month: MonthlyPositionsResponse = serde_json::from_slice(&may_body).unwrap();
+
+        assert_eq!(april_month.month, "2026-04");
+        assert_eq!(may_month.month, "2026-05");
+        assert_eq!(april_month.occupied_slots, 2);
+        assert_eq!(may_month.occupied_slots, 1);
+        assert_eq!(april_month.slot_cells_total, 4);
+        assert_eq!(may_month.slot_cells_total, 5);
+
+        assert_eq!(april_month.positions.len(), 2);
+        assert!(april_month.positions.iter().any(|p| p.id == overlap.id));
+        assert!(april_month.positions.iter().any(|p| p.id == april_only.id));
+
+        assert_eq!(may_month.positions.len(), 1);
+        assert_eq!(may_month.positions[0].id, overlap.id);
+        assert!(may_month.positions.iter().all(|p| p.id != april_only.id));
     }
 
     async fn create_test_app_with_event_bus(
@@ -1483,6 +1620,8 @@ mod tests {
             position_monitor: None,
             #[cfg(feature = "postgres")]
             pg_pool: None,
+            #[cfg(feature = "postgres")]
+            tenant_id: None,
             api_token: None,
         });
 
