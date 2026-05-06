@@ -2858,6 +2858,53 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .trading_policy
             .slots_available(capital_base, monthly.realized_loss, latent_risk))
     }
+
+    // =========================================================================
+    // Startup recovery accessors
+    // =========================================================================
+
+    /// Access the underlying store (read-only reference via Arc clone).
+    pub fn store(&self) -> Arc<S> {
+        self.store.clone()
+    }
+
+    /// Access the OHLCV port (for startup recovery candle fetches).
+    pub fn ohlcv_port(&self) -> Arc<dyn OhlcvPort> {
+        self.ohlcv_port.clone()
+    }
+
+    /// Clone the engine (recovery needs a snapshot for pure processing).
+    pub fn engine(&self) -> Engine {
+        self.engine.lock().unwrap().clone()
+    }
+
+    /// Execute engine actions and persist events — recovery variant.
+    ///
+    /// Identical to `execute_and_persist` but `pub(crate)` so
+    /// `startup_recovery` can call it without going through the full
+    /// `process_market_data` flow (no query tracking, no metrics).
+    pub(crate) async fn execute_and_persist_recovery(
+        &self,
+        actions: Vec<EngineAction>,
+    ) -> DaemonResult<Vec<ActionResult>> {
+        self.execute_and_persist(actions).await
+    }
+
+    /// Handle exit fill during startup recovery.
+    ///
+    /// Thin wrapper around `handle_exit_fill` exposed as `pub(crate)` so
+    /// `startup_recovery` can use it.
+    pub(crate) async fn handle_exit_fill_recovery(
+        &self,
+        position_id: PositionId,
+        fill_price: Price,
+        filled_quantity: Quantity,
+        exit_fee: Decimal,
+        filled_at: chrono::DateTime<chrono::Utc>,
+    ) -> DaemonResult<()> {
+        self.handle_exit_fill(position_id, fill_price, filled_quantity, exit_fee, filled_at)
+            .await
+    }
 }
 
 // =============================================================================

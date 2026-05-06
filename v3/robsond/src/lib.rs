@@ -56,6 +56,7 @@ pub mod query;
 pub mod query_engine;
 pub mod reconciliation_worker;
 mod sse;
+pub mod startup_recovery;
 
 #[cfg(feature = "postgres")]
 pub mod projection_worker;

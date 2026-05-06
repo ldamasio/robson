@@ -494,6 +494,29 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         }
         info!("Startup reconciliation clean (0 UNTRACKED)");
 
+        // 3b. Startup recovery: catch-up missed stop hits during downtime.
+        {
+            let pm = self.position_manager.read().await;
+            let ohlcv_port = pm.ohlcv_port();
+            match crate::startup_recovery::run_startup_recovery(&pm, &ohlcv_port).await {
+                Ok(report) => {
+                    if report.positions_closed > 0 || report.stops_updated > 0 {
+                        info!(%report, "Startup recovery applied catch-up actions");
+                    } else {
+                        info!("Startup recovery: no catch-up needed");
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        error = %e,
+                        "Startup recovery failed — continuing with live ticks only. \
+                         Positions that crossed their stop during downtime will NOT be \
+                         retroactively closed."
+                    );
+                },
+            }
+        }
+
         // 4. Initialize safety net monitor (when configured with Binance credentials)
         let position_monitor = self.initialize_position_monitor().await?;
         let position_monitor_handle =
