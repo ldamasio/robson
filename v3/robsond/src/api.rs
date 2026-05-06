@@ -674,13 +674,13 @@ where
         .map_err(|e| to_error_response(e))?;
     let monthly = manager.load_monthly_state(requested).await.map_err(|e| to_error_response(e))?;
     let occupied_slots = positions.len();
-    let inherited_slots = positions
-        .iter()
-        .filter(|position| position.created_at < requested)
-        .count();
-    let base_slots_available = TradingPolicy::default()
-        .slots_available(monthly.capital_base, monthly.realized_loss, Decimal::ZERO)
-        as usize;
+    let inherited_slots =
+        positions.iter().filter(|position| position.created_at < requested).count();
+    let base_slots_available = TradingPolicy::default().slots_available(
+        monthly.capital_base,
+        monthly.realized_loss,
+        Decimal::ZERO,
+    ) as usize;
     let slot_cells_total = base_slots_available.saturating_add(inherited_slots);
 
     Ok(Json(MonthlyPositionsResponse {
@@ -1240,7 +1240,8 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
-    let mut positions: Vec<Position> = load_positions_for_month_positions(manager, month_start, state).await?;
+    let mut positions: Vec<Position> =
+        load_positions_for_month_positions(manager, month_start, state).await?;
 
     positions.sort_by_key(|position| position.created_at);
 
@@ -1478,7 +1479,8 @@ mod tests {
             manager.store().positions().save(&btc_short).await.unwrap();
         }
 
-        let april_response = app.clone()
+        let april_response = app
+            .clone()
             .oneshot(
                 Request::builder().uri("/positions?month=2026-04").body(Body::empty()).unwrap(),
             )
@@ -1554,7 +1556,8 @@ mod tests {
             manager.store().positions().save(&april_only).await.unwrap();
         }
 
-        let april_response = app.clone()
+        let april_response = app
+            .clone()
             .oneshot(
                 Request::builder().uri("/positions?month=2026-04").body(Body::empty()).unwrap(),
             )

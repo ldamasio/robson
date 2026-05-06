@@ -163,10 +163,7 @@ fn row_to_position(row_data: PositionCurrentRow) -> Result<Option<Position>, Sto
         "long" => Side::Long,
         "short" => Side::Short,
         _ => {
-            return Err(StoreError::Deserialization(format!(
-                "Invalid side: {}",
-                row_data.side
-            )));
+            return Err(StoreError::Deserialization(format!("Invalid side: {}", row_data.side)));
         },
     };
 
@@ -183,10 +180,7 @@ fn row_to_position(row_data: PositionCurrentRow) -> Result<Option<Position>, Sto
 
     if let Some(entry_quantity) = row_data.entry_quantity {
         position.quantity = Quantity::new(entry_quantity).map_err(|e| {
-            StoreError::Deserialization(format!(
-                "Invalid entry_quantity {}: {}",
-                entry_quantity, e
-            ))
+            StoreError::Deserialization(format!("Invalid entry_quantity {}: {}", entry_quantity, e))
         })?;
     }
 
@@ -282,9 +276,7 @@ fn row_to_position(row_data: PositionCurrentRow) -> Result<Option<Position>, Sto
             })?;
 
             let extreme_at = row_data.extreme_at.ok_or_else(|| {
-                StoreError::Deserialization(
-                    "Missing extreme_at for active position".to_string(),
-                )
+                StoreError::Deserialization("Missing extreme_at for active position".to_string())
             })?;
 
             position.state = PositionState::Active {
