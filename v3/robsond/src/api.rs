@@ -490,7 +490,7 @@ async fn health_liveness() -> Json<HealthResponse> {
 ///
 /// Returns 200 OK if all checks pass, 503 Service Unavailable otherwise.
 async fn health_readiness<E, S>(
-    State(_state): State<Arc<ApiState<E, S>>>,
+    State(state): State<Arc<ApiState<E, S>>>,
 ) -> Result<Json<ReadinessResponse>, (StatusCode, Json<ReadinessResponse>)>
 where
     E: ExchangePort + 'static,
