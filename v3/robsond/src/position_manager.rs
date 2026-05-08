@@ -226,15 +226,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         &self,
         now: chrono::DateTime<chrono::Utc>,
     ) -> DaemonResult<MonthlyRiskState> {
-        let configured_capital = self.configured_capital();
         let Some(pool) = &self.event_log_pool else {
-            return Ok(MonthlyRiskState {
-                capital_base: configured_capital,
-                realized_loss: Decimal::ZERO,
-                trades_opened: 0,
-            });
+            // No DB pool wired — happens in unit tests built with
+            // --features postgres via create_test_manager. Mirror the
+            // non-postgres path so realized_loss reflects in-memory closed
+            // positions (TD-2026-05-08-002). Production wires the pool
+            // unconditionally; this branch is unreachable in deployed builds.
+            return self.load_monthly_state_in_memory(now).await;
         };
 
+        let configured_capital = self.configured_capital();
         let row = sqlx::query_as::<_, (Decimal, Decimal, i32)>(
             "SELECT capital_base, realized_loss, trades_opened FROM monthly_state WHERE year = $1 AND month = $2",
         )
@@ -263,6 +264,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     ) -> DaemonResult<MonthlyRiskState> {
         // No DB available: compute realized_loss from in-memory store for
         // correctness in tests and non-postgres mode.
+        self.load_monthly_state_in_memory(now).await
+    }
+
+    /// Compute monthly state from the in-memory store. Shared between the
+    /// non-postgres feature build and the postgres feature build's
+    /// pool-unwired fallback (TD-2026-05-08-002).
+    async fn load_monthly_state_in_memory(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> DaemonResult<MonthlyRiskState> {
         let monthly_closed =
             self.store.positions().find_closed_in_month(now.year(), now.month()).await?;
         let realized_loss: Decimal = monthly_closed
