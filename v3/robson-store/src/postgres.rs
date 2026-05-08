@@ -148,6 +148,10 @@ fn parse_exit_reason(reason: &str) -> Option<ExitReason> {
         "DegradedMode" | "degraded_mode" => Some(ExitReason::DegradedMode),
         "PositionError" | "position_error" => Some(ExitReason::PositionError),
         "DisarmedByUser" | "disarmed_by_user" => Some(ExitReason::DisarmedByUser),
+        // TD-2026-05-05-001: reverse-reconciliation close.
+        "ReconciledMissingOnExchange" | "reconciled_missing_on_exchange" => {
+            Some(ExitReason::ReconciledMissingOnExchange)
+        },
         _ => None,
     }
 }
@@ -906,5 +910,47 @@ mod tests {
             robson_domain::PositionState::Armed => {},
             _ => panic!("Expected Armed state"),
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // parse_exit_reason — pure-function unit tests (no DB needed).
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_parse_exit_reason_known_variants() {
+        // Each variant accepts both PascalCase (the serde default for the
+        // domain enum) and snake_case (legacy / human-friendly) inputs.
+        assert_eq!(parse_exit_reason("TrailingStop"), Some(ExitReason::TrailingStop));
+        assert_eq!(parse_exit_reason("trailing_stop"), Some(ExitReason::TrailingStop));
+        assert_eq!(parse_exit_reason("InsuranceStop"), Some(ExitReason::InsuranceStop));
+        assert_eq!(parse_exit_reason("insurance_stop"), Some(ExitReason::InsuranceStop));
+        assert_eq!(parse_exit_reason("UserPanic"), Some(ExitReason::UserPanic));
+        assert_eq!(parse_exit_reason("user_panic"), Some(ExitReason::UserPanic));
+        assert_eq!(parse_exit_reason("DegradedMode"), Some(ExitReason::DegradedMode));
+        assert_eq!(parse_exit_reason("degraded_mode"), Some(ExitReason::DegradedMode));
+        assert_eq!(parse_exit_reason("PositionError"), Some(ExitReason::PositionError));
+        assert_eq!(parse_exit_reason("position_error"), Some(ExitReason::PositionError));
+        assert_eq!(parse_exit_reason("DisarmedByUser"), Some(ExitReason::DisarmedByUser));
+        assert_eq!(parse_exit_reason("disarmed_by_user"), Some(ExitReason::DisarmedByUser));
+    }
+
+    /// TD-2026-05-05-001: parser accepts the new variant in both casings.
+    #[test]
+    fn test_parse_exit_reason_reconciled_missing_on_exchange() {
+        assert_eq!(
+            parse_exit_reason("ReconciledMissingOnExchange"),
+            Some(ExitReason::ReconciledMissingOnExchange)
+        );
+        assert_eq!(
+            parse_exit_reason("reconciled_missing_on_exchange"),
+            Some(ExitReason::ReconciledMissingOnExchange)
+        );
+    }
+
+    #[test]
+    fn test_parse_exit_reason_unknown_returns_none() {
+        assert_eq!(parse_exit_reason(""), None);
+        assert_eq!(parse_exit_reason("UnknownReason"), None);
+        assert_eq!(parse_exit_reason("trailing-stop"), None); // hyphen not accepted
     }
 }

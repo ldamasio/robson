@@ -2525,6 +2525,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             exit_price: fill_price,
             realized_pnl: pnl,
             total_fees,
+            closure_evidence: robson_domain::ClosureEvidence::real_exit_fill(None),
             timestamp: filled_at,
         };
         self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await?;
@@ -2760,6 +2761,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             exit_price: fill_price,
             realized_pnl: pnl,
             total_fees,
+            closure_evidence: robson_domain::ClosureEvidence::real_exit_fill(None),
             timestamp: filled_at,
         };
 
