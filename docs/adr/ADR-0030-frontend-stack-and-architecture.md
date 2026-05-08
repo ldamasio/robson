@@ -1,7 +1,8 @@
 ADR-0030: Frontend Stack and Architecture
 
-Status: Accepted (amended 2026-04-23 after EP-003 reality check)
+Status: Accepted — hosting and CDN clauses superseded by ADR-0033 (2026-04-25); see Amendment 2 below.
 Date: 2026-04-23
+Amended: 2026-04-23 (Amendment 1 — auth + Svelte 5), 2026-04-25 (Amendment 2 — hosting pivot to k3s)
 
 Context
 - Robson v3 is live in production operating real capital (see `docs/adr/ADR-0007` and repo state as of 2026-04).
@@ -111,5 +112,40 @@ Removed: "Auth.js vs custom session middleware" — resolved (neither; Bearer to
 
 Added:
 - Cooldown for kill-switch must be verified server-side (backend `/monthly-halt` enforcement); if absent, file a backend ticket and document as FE-P1 limitation.
-- Future: Cloudflare Worker for OAuth callback in FE-P4, or `adapter-node` migration.
+- Future: edge function for OAuth callback in FE-P4, or `adapter-node` migration.
+
+---
+
+## Amendment 2 — 2026-04-25 (hosting pivot to k3s in-cluster)
+
+Operator provisioning of Contabo Object Storage exposed limitations that made it unsuitable for the production SPA: no native website hosting (no index/error document), tenant-wide credentials with no per-bucket IAM, no ACL UI, and TLS termination mismatch on custom-domain CNAMEs. The hosting and CDN clauses of the original Decision are superseded. The auth, framework, state, styling, i18n, and backend-contract clauses are unchanged. See ADR-0033 for the full pivot rationale.
+
+### A2.1 Hosting — k3s in-cluster, not Contabo S3
+
+The static SvelteKit bundle is wrapped in `nginx:alpine` and runs as a container in the `rbx-infra` k3s cluster. The image lives in GHCR and ArgoCD reconciles the deployment from `rbx-infra/apps/prod/robson/`. Cloudflare is not in the path. PowerDNS resolves both hosts directly to the cluster ingress IP.
+
+Authoritative deploy mechanics:
+- Image: `ghcr.io/ldamasio/robson-frontend-v2:sha-<short>`
+- Manifests: `rbx-infra/apps/prod/robson/robson-frontend-v2-{deploy,svc,ingress}.yml`
+- Ingress: Traefik with cert-manager + Let's Encrypt for both `robson.rbx.ia.br` and `robson.rbxsystems.ch`
+- DNS: A/CNAME to cluster ingress, managed via `dns-tofu-env.sh` per `project_dns_secrets_pattern`
+- Build pipeline: GitHub Actions builds Docker image, pushes to GHCR, opens commit on `rbx-infra` bumping the SHA tag in the deploy manifest. ArgoCD reconciles.
+- Operational guide: `docs/runbooks/frontend-deploy.md`
+- Implementation guide: `docs/implementation/FE-DEPLOY-RBX-INFRA.md`
+
+### A2.2 CDN — none, not Cloudflare
+
+No CDN sits in front of the cluster. Latency outside EU is acceptable for a single-operator console. If global latency ever matters, Cloudflare or another CDN can be added without changing the auth or hosting model. There is no FE-P2 commitment to introduce Cloudflare; that bullet from the original Decision is withdrawn.
+
+### A2.3 Build — `pnpm build`, not `aws s3 sync`
+
+CI does not call `aws s3 sync`. The build artifact (`build/`) is copied into the container image by the Dockerfile in `apps/frontend/`. The S3 bucket `robson-app` was never provisioned and is not part of the rollout.
+
+### A2.4 Auth fallback in FE-P4
+
+FE-P4 multi-tenant OAuth no longer assumes a Cloudflare Worker callback. Either an in-cluster edge proxy (small node sidecar in the same namespace) or migrating the frontend to `adapter-node` are the candidate paths; the decision is deferred until FE-P4 starts.
+
+### A2.5 Withdrawn pending decision
+
+Removed from "Pending decisions": "TLS strategy for MVP (Contabo mismatch vs Cloudflare from day 1)". Resolved by ADR-0033 — Traefik ingress + cert-manager, no Cloudflare.
 

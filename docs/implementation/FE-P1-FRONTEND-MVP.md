@@ -2,8 +2,17 @@
 
 **Date**: 2026-04-23
 **Author**: Claude Opus 4.7 (planner) — execution open to Codex / GLM handoff
-**Status**: Draft
-**Related**: ADR-0030 (stack), ADR-0031 (brand), ADR-0032 (UX)
+**Status**: LIVE since 2026-04-25 — historical close-out (see Closing notes)
+**Related**: ADR-0030 (stack), ADR-0031 (brand), ADR-0032 (UX), ADR-0033 (hosting pivot)
+
+> **Hosting note (2026-04-25)** — Sections written before 2026-04-25 describe a Contabo S3 + Cloudflare deploy target. That target was abandoned mid-rollout (ADR-0033). The frontend ships from k3s in-cluster nginx via ArgoCD GitOps in `rbx-infra`. For the current deploy story, read:
+>
+> - **ADR-0033** — hosting pivot decision
+> - **ADR-0030 Amendment 2** — supersedes the hosting/CDN/DNS clauses of the original stack ADR
+> - **`docs/implementation/FE-DEPLOY-RBX-INFRA.md`** — canonical implementation guide for FE deploy via rbx-infra
+> - **`docs/runbooks/frontend-deploy.md`** — operational runbook
+>
+> The "Infrastructure Gaps" table, "Track 7", and "EP-008" sections below are preserved as historical evidence of what was originally planned. Do not act on them.
 
 ---
 
@@ -66,15 +75,17 @@ N/A — greenfield implementation, no gap to analyze.
 | P1 | RBX custom icons (20 glyphs) | SVGs must be produced | Polished UI surfaces |
 | P2 | SSE event stream endpoint | Confirm backend supports SSE or fall back to polling | Today's events panel |
 
-### Infrastructure Gaps
+### Infrastructure Gaps (HISTORICAL — superseded by ADR-0033)
 
-| Priority | Resource | Issue | Impact |
-|----------|----------|-------|--------|
-| P0 | S3 bucket `robson-app` | Does not exist; must be created in Contabo | Deploy blocked |
-| P0 | IAM credentials for CI | Need deploy-only S3 key in GitHub Actions secrets | CI blocked |
-| P0 | DNS CNAME records | `robson.rbx.ia.br` and `robson.rbxsystems.ch` not configured | Public access blocked |
-| P1 | TLS strategy | Contabo domain mismatch for custom domains — decide between accept-redirect or Cloudflare-from-day-1 | Public access quality |
-| P2 | GitHub OAuth app | Create OAuth app, store `GITHUB_CLIENT_ID` + `GITHUB_CLIENT_SECRET` | Auth blocked |
+> The table below was written for a Contabo S3 deploy that was abandoned. Kept here for the audit trail. Current state: all gaps closed by the k3s pivot. See `docs/implementation/FE-DEPLOY-RBX-INFRA.md` for the live infrastructure picture.
+
+| Priority | Resource | Original issue | Resolution |
+|----------|----------|----------------|------------|
+| P0 | S3 bucket `robson-app` | Did not exist in Contabo | Withdrawn — no S3 bucket used (ADR-0033) |
+| P0 | IAM credentials for CI | Needed deploy-only S3 key | Withdrawn — CI uses `GITHUB_TOKEN` for GHCR push and `GITOPS_TOKEN` for rbx-infra bump |
+| P0 | DNS CNAME records | `robson.rbx.ia.br` and `robson.rbxsystems.ch` not configured | Done — A records to cluster ingress via `dns-tofu-env.sh` |
+| P1 | TLS strategy | Contabo domain mismatch | Resolved — Traefik + cert-manager + Let's Encrypt in cluster |
+| P2 | GitHub OAuth app | Needed for OAuth flow | Withdrawn — Bearer-token auth (ADR-0025) |
 
 ---
 
@@ -573,39 +584,18 @@ pnpm add svelte-i18n
 
 ---
 
-### EP-008: CI/CD + DNS + TLS — DONE (skeleton; 2026-04-24)
+### EP-008: Deploy — SUPERSEDED by ADR-0033 (2026-04-25)
 
-**Status**: DONE (skeleton) by GLM-5.1 on branch `fe-p1/ep-008-deploy`, commit `15f86514`. Execution blocked on operator prerequisites B1–B5.
+**Status**: HISTORICAL. The original EP-008 targeted Contabo S3 + `aws s3 sync`. That target was withdrawn after operator provisioning revealed that Contabo Object Storage lacks native website hosting, per-bucket IAM, and ACL UI. The frontend now ships as a containerized nginx via k3s in-cluster, GitOps-managed in `rbx-infra`.
 
-**Objective**: GitHub Actions workflow builds and syncs to Contabo bucket. DNS CNAMEs configured via PowerDNS. TLS strategy implemented.
+**Authoritative replacements**:
+- Decision: ADR-0033 (hosting pivot) + ADR-0030 Amendment 2
+- Implementation guide: `docs/implementation/FE-DEPLOY-RBX-INFRA.md`
+- Operational runbook: `docs/runbooks/frontend-deploy.md`
+- Pipeline: `.github/workflows/frontend-deploy.yml` (builds Docker image, pushes to GHCR, bumps `rbx-infra/apps/prod/robson/robson-frontend-v2-deploy.yml`)
+- Cluster manifests: `rbx-infra/apps/prod/robson/robson-frontend-v2-{deploy,svc,ingress}.yml`
 
-**Preconditions**:
-- S3 bucket `robson-app` created in Contabo
-- IAM credentials with PutObject/DeleteObject for that bucket in GitHub Actions secrets (`AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`)
-- OAuth app secrets added as GitHub Actions secrets
-
-**Steps**:
-```bash
-# Create .github/workflows/frontend-deploy.yml
-# Steps: checkout, setup-pnpm, pnpm install, pnpm build, aws s3 sync
-#
-# Create PowerDNS records (via dns-tofu-env.sh pattern per project_dns_secrets_pattern):
-#   robson.rbx.ia.br       CNAME  eu2.contabostorage.com.
-#   robson.rbxsystems.ch   CNAME  eu2.contabostorage.com.
-#
-# TLS decision:
-#   Option A (MVP-fast): accept Contabo TLS, accept domain mismatch warning, ship
-#   Option B (MVP-polished): Cloudflare free tier in front, custom cert via Cloudflare
-# Decision tracked in ADR-0030 pending.
-```
-
-**Expected Outcome**:
-```bash
-# PASS: push to main triggers deploy, bucket updated
-# PASS: https://robson.rbx.ia.br loads the app (with chosen TLS strategy)
-# PASS: https://robson.rbxsystems.ch loads the app
-# PASS: pt-BR default on .ia.br, en default on .ch
-```
+The original EP-008 skeleton on branch `fe-p1/ep-008-deploy` (commit `15f86514`) was discarded; no Contabo bucket was ever created.
 
 ---
 
