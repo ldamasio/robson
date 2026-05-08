@@ -1,6 +1,6 @@
 # TD-2026-05-05-001 — Core Position Lifecycle Drift
 
-**Status**: Draft (Slice 0 in progress)
+**Status**: In progress — Slices 0/1/2 done; Slice 3 next
 **Severity**: High
 **Area**: `robsond` reconciliation, position lifecycle
 **Discovered**: 2026-05-05
@@ -223,7 +223,7 @@ Each slice is one PR, mergeable, must leave the workspace clean and tests
 green. Slices 0 → 6 below; Slice 0 is the only one being executed in this
 session.
 
-### Slice 0 — Reproduction & analysis (no production code) — IN PROGRESS
+### Slice 0 — Reproduction & analysis (no production code) — DONE (2026-05-08, commit `28b7a58e`)
 
 - **Goal**: deterministic test that demonstrates current asymmetric
   reconciliation as a noop for stale-Active. Lock in the diagnostic.
@@ -251,7 +251,17 @@ session.
 - **Commit (suggested)**:
   `test(robsond): reproduce TD-2026-05-05-001 stale-active drift baseline`
 
-### Slice 1 — Domain: ClosureEvidence + ExitReason
+### Slice 1 — Domain: ClosureEvidence + ExitReason — DONE (2026-05-08, commit `fbdc8f0e`)
+
+Outcome: 6 files changed (+500 / −5). New domain types `ClosureEvidence`,
+`ReconciliationEvidence`, `RealFillEvidence`, `OrderFillEvidence`,
+`UserTradeEvidence`, `AccountSnapshotEvidence`, `EstimatedEvidence`,
+`ExitOrderFillSource`, `EstimationBasis`. `Event::PositionClosed` extended
+with `closure_evidence: ClosureEvidence` (`#[serde(default)]` for
+retro-compat — legacy events deserialize to `RealFill` default). Postgres
+parser maps the new `ReconciledMissingOnExchange` variant in both
+PascalCase and snake_case. 117 + 37 + 179 + 4 + 3 tests green; Slice 0
+canary unchanged.
 
 - Add `ExitReason::ReconciledMissingOnExchange`.
 - Add `ClosureEvidence` enum in `robson-domain/src/entities.rs` (or
@@ -277,7 +287,26 @@ session.
 - **Tests**: round-trip serialization, projector backfill, parser fallback.
 - **Commit**: `feat(domain): add ClosureEvidence and ReconciledMissingOnExchange ExitReason`
 
-### Slice 2 — Policy I3 in documentation
+### Slice 2 — Policy I3 in documentation — DONE (2026-05-08, awaiting commit)
+
+Outcome:
+
+- `docs/policies/UNTRACKED-POSITION-RECONCILIATION.md` gained §I3 with the
+  Active-only scope, grace-period + second-observation detection rule,
+  evidence ordering (`OrderFillRecord` → `UserTradeRecord` →
+  `AccountSnapshot` → `Estimated`), and the `Estimated`-never-silent rule
+  (CRITICAL alert + Prometheus counter + startup-gate downgrade to
+  `abort`).
+- `docs/adr/ADR-0022-robson-authored-position-invariant.md` carries a
+  2026-05-08 amendment recording I3 as the symmetric counterpart of
+  I1/I2 and pointing to the policy + implementation guide + runbook.
+- `docs/runbooks/td-2026-05-05-001-stale-active-recovery.md` exists as a
+  policy-and-decision-flow skeleton. Sections present: Symptoms, Safety
+  Principle, Preconditions, Evidence Collection Order (all four
+  sources), Manual Verification Checklist, Recovery Command (placeholder
+  for Slice 5), Post-Recovery Validation, Rollback / When to Stop. The
+  `robson-cli reconcile-close` command is explicitly marked as not yet
+  implemented.
 
 - Update `docs/policies/UNTRACKED-POSITION-RECONCILIATION.md`: add §I3,
   Active-only scope, evidence ordering, startup gate policy.

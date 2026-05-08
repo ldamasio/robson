@@ -22,7 +22,13 @@ No exceptions. No workarounds. No shortcuts.
 
 ---
 
-## The Two Invariants
+## The Three Invariants
+
+The policy is symmetric: the relation between Robson's local lifecycle state
+and the exchange's view of the account must hold in both directions. I1/I2
+protect the exchange-to-Robson direction (foreign positions get closed). I3
+protects the opposite direction (Robson-Active positions whose exchange
+counterpart has disappeared get reconciled).
 
 ### I1 — Authorship Invariant
 
@@ -52,6 +58,127 @@ MUST:
 
 The close is mandatory and non-overridable by configuration flags. An operator may
 abort the close only through an explicit, audited panic override (see Rollback below).
+
+### I3 — Reverse Reconciliation Invariant (TD-2026-05-05-001)
+
+> **Robson-Active ⊆ Exchange-Open.** Every position the local store holds in
+> `Active` MUST have a corresponding open position on the exchange, matched by
+> `(symbol, side)` and within the configured `quantity` tolerance. If the
+> position is missing on the exchange after a grace period and a second
+> consecutive observation, Robson MUST gather evidence from the exchange and
+> transition the local position to `Closed` via reverse reconciliation.
+
+I3 is the symmetric counterpart of I1/I2:
+
+| Direction | Invariant | Symptom | Action |
+|---|---|---|---|
+| Exchange has, Robson does not | I1 / I2 (UNTRACKED) | Foreign position on operated account | Close at market, tag `UNTRACKED_ON_EXCHANGE` |
+| Robson has `Active`, Exchange does not | I3 (stale-Active) | Local lifecycle drift after liquidation, manual close, externally-resident insurance stop fill, etc. | Gather evidence, close locally with `ReconciledMissingOnExchange` |
+
+**Companion documents**:
+
+- [ADR-0022 — Robson-Authored Position Invariant](../adr/ADR-0022-robson-authored-position-invariant.md) — origin of I1/I2; updated 2026-05-08 to reference I3.
+- [Implementation guide TD-2026-05-05-001](../implementation/TD-2026-05-05-001-CORE-LIFECYCLE-DRIFT.md) — slice-by-slice plan.
+- [Runbook td-2026-05-05-001-stale-active-recovery](../runbooks/td-2026-05-05-001-stale-active-recovery.md) — operator recovery when the startup gate aborts.
+
+#### I3 §A — Scope: `Active` only
+
+For this technical debt, **only `Active` positions are eligible for automatic
+reconciliation-close.**
+
+| Local state | Behavior under I3 |
+|---|---|
+| `Active` | Detected, evidence gathered, closed via `ReconciledMissingOnExchange` |
+| `Entering` | Detected, **logged + skipped** (`DaemonEvent::ReconciliationStaleNonActiveDetected`). May be a placement/fill latency race; auto-close risks double-close. Operator-driven path only. |
+| `Exiting` | Detected, **logged + skipped**. Already mid-flight to terminal via the legitimate path; auto-close risks double-close. |
+| `Armed` / `Cancelled` / `Closed` / `Error` | Out of scope — I3 only matters when the local state asserts an open exchange position. |
+
+A separate technical debt entry will design a safe auto-close for stale
+`Entering`/`Exiting` once the `Active` path is proven in production.
+
+#### I3 §B — Detection: grace period and second observation
+
+A single observation that the exchange does not return the expected
+`(symbol, side)` is insufficient to declare drift. Causes of false-positive
+absence include placement-to-reflection latency, websocket vs REST snapshot
+inconsistencies, and exchange maintenance windows.
+
+The reconciliation worker MUST therefore:
+
+1. **First observation** — exchange snapshot does not contain the expected
+   `(symbol, side)` while the local state is `Active`. Worker records
+   `first_observed_missing_at` for the position id and emits a debug-level
+   structured log entry. **No close.**
+2. **Grace period** — at least one full reconciliation cycle (default 60 s,
+   configurable via `reconciliation.missing_grace_secs`) MUST elapse before
+   the second observation is consulted.
+3. **Second consecutive observation** — the next eligible cycle observes
+   the same absence. Only then is `confirmed_missing_at` recorded and the
+   close path invoked. If the position reappears in any cycle between the
+   two, the grace state for that position is cleared.
+4. **Close** — emit `Event::PositionClosed { exit_reason:
+   ReconciledMissingOnExchange, closure_evidence: Reconciled(...), ... }`
+   via the same eventlog → projector path used by normal exits.
+
+Idempotency: invoking `reconcile_close` for a position that is already in a
+terminal state is a no-op.
+
+#### I3 §C — Evidence ordering, no silent fallback
+
+Every reconciliation-close event MUST carry a `closure_evidence:
+ClosureEvidence::Reconciled(ReconciliationEvidence::*)` payload (introduced
+in Slice 1 of TD-2026-05-05-001). Evidence sources are tried in **strict
+priority order**:
+
+1. **`OrderFillRecord`** — A specific exchange order (typically the resident
+   `insurance_stop_id`, but also any candidate exit order whose
+   `exchange_order_id` is known to the daemon) was confirmed `FILLED` via
+   `GET /fapi/v1/order`. Captures fill price, filled quantity, fee, fee
+   asset, filled timestamp, exchange order id. Highest fidelity — used
+   whenever obtainable.
+2. **`UserTradeRecord`** — Per-symbol user trade history from
+   `GET /fapi/v1/userTrades` covering the gap between the last known live
+   tick and the missing observation. Used when no specific candidate
+   `exchange_order_id` is known (e.g. operator closed the position
+   manually via the Binance UI, producing a market order Robson never
+   knew about). Captures the same fields plus the originating order id.
+3. **`AccountSnapshot`** — Two consecutive `get_all_open_positions()`
+   snapshots prove the position is zeroed; no fill data is available.
+   Captures `first_observed_missing_at`, `confirmed_missing_at`, optional
+   `futures_balance_delta` derived from `get_futures_balance()` between
+   the two snapshots. Used when (1) and (2) failed (rate limit, history
+   outside API window, network error after retries).
+4. **`Estimated`** — Last resort. Captures `estimation_basis`
+   (`TrailingStopAtDetection`, `ExchangeMarkPrice`, or `LastObservedPrice`),
+   the chosen `exit_price`, optional `evaluator` identity, and
+   `detected_at`.
+
+#### I3 §D — Estimated evidence: never silent
+
+A reconciliation-close that reaches the `Estimated` branch MUST produce a
+visible audit trail and an operator alert:
+
+- The realized PnL derived from `Estimated` evidence is flagged as
+  estimated, not real. Downstream consumers (monthly accounting,
+  dashboards) MUST surface this provenance distinctly. Estimated PnL
+  feeds into `monthly_state.realized_loss` because conservatism is the
+  correct default — but every estimated close is auditable.
+- A `CRITICAL` operator alert is emitted on every estimated close
+  (`position_reconciled_with_estimated_evidence`). The Prometheus counter
+  `robson_reconciliation_estimated_closes_total` increments on each
+  occurrence.
+- At startup, an `Estimated`-only close path **never runs automatically**
+  even when `reconciliation.on_startup_stale_active = "auto_reconcile"`.
+  The startup phase aborts with the same exit code as the default
+  `abort` policy and defers the close to the operator runbook.
+- The runtime steady-state path may produce `Estimated` closes
+  automatically (capital safety > delayed detection), but the alert and
+  metric are mandatory and non-overridable.
+
+`Estimated` is never silently substituted for a real fill in any field.
+The on-wire `Event::PositionClosed.closure_evidence.kind` is `reconciled`
+and the inner `source` is `estimated`; nothing about the JSON shape lets a
+downstream consumer mistake estimated PnL for a real exchange fill.
 
 ---
 
