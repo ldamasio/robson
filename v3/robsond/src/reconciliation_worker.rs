@@ -262,4 +262,86 @@ mod tests {
         assert_eq!(exchange.open_positions_len(), 1);
         assert!(receiver.try_recv().is_none());
     }
+
+    // -------------------------------------------------------------------------
+    // TD-2026-05-05-001 — Stale-Active drift baseline canary (Slice 0).
+    //
+    // Documents the *current, buggy* behavior of the asymmetric reconciliation
+    // loop: when a position is `Active` in Robson's store but absent on the
+    // exchange, today's worker is a no-op. It does not detect the drift, does
+    // not emit any event, and does not transition the local state.
+    //
+    // This test pins that observation. When Slice 4 lands the symmetric loop
+    // and `reconcile_close`, the post-condition assertions in this test are
+    // expected to fail; they will be inverted as part of that slice (the
+    // position MUST then be `Closed` and a `CorePositionClosed` event MUST be
+    // observed). Until then, the test passing is the diagnostic — not the
+    // green check mark.
+    //
+    // See:
+    //   - docs/implementation/TD-2026-05-05-001-CORE-LIFECYCLE-DRIFT.md
+    //   - docs/analysis/2026-05-08-lifecycle-drift-repro.md
+    //   - docs/technical-debt.md  (TD-2026-05-05-001)
+    //   - docs/policies/UNTRACKED-POSITION-RECONCILIATION.md  (I3, pending)
+    // -------------------------------------------------------------------------
+    #[tokio::test]
+    async fn test_reconciliation_does_not_close_active_missing_on_exchange() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let mut receiver = event_bus.subscribe();
+
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+
+        // Robson's store believes a Long position is Active...
+        let position = tracked_active_position(symbol.clone(), Side::Long);
+        let position_id = position.id;
+        store.positions().save(&position).await.unwrap();
+
+        // ...but the exchange returns an empty open-positions list.
+        // No `set_open_position` call. exchange.open_positions_len() == 0.
+        assert_eq!(exchange.open_positions_len(), 0);
+
+        let worker = ReconciliationWorker::new(
+            exchange.clone(),
+            store.clone(),
+            event_bus,
+            Duration::from_secs(60),
+            CancellationToken::new(),
+        );
+
+        let reconciled = worker.scan_and_reconcile().await.unwrap();
+
+        // Current behavior: the worker only walks `exchange.get_all_open_positions()`.
+        // Empty list → zero iterations → no UNTRACKED action and, critically,
+        // no reverse check against `store.find_active()`. Reconciled count is 0.
+        assert_eq!(
+            reconciled, 0,
+            "baseline canary: today's asymmetric loop reports 0 even when \
+             a stale Active exists locally"
+        );
+
+        // The Robson store is unchanged — the position is still Active.
+        // This is the bug. Slice 4 will flip this assertion.
+        let still_active = store
+            .positions()
+            .find_by_id(position_id)
+            .await
+            .unwrap()
+            .expect("position must still exist in store");
+        assert!(
+            matches!(still_active.state, PositionState::Active { .. }),
+            "baseline canary: stale Active is NOT transitioned to Closed today \
+             (TD-2026-05-05-001)"
+        );
+
+        // No domain event was emitted: no PositionClosed, no CorePositionClosed,
+        // no RoguePositionDetected, no SafetyExitExecuted, no
+        // ReconciliationStaleNonActiveDetected. The drift is silent.
+        assert!(
+            receiver.try_recv().is_none(),
+            "baseline canary: no event emitted today for Robson-Active / \
+             exchange-missing drift"
+        );
+    }
 }
