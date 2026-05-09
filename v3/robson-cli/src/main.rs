@@ -4,7 +4,11 @@ mod commands;
 use clap::Parser;
 
 #[derive(Parser)]
-#[command(name = "robson-cli", version, about = "Operational CLI for Robson daemon")]
+#[command(
+    name = "robson-cli",
+    version,
+    about = "Operational CLI for Robson daemon"
+)]
 enum Cli {
     ReconcileClose(commands::reconcile_close::ReconcileCloseArgs),
 }

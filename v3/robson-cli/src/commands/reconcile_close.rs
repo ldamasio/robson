@@ -67,11 +67,8 @@ pub struct UserTradeData {
 }
 
 pub fn validate_order_fill(data: &OrderFillData) -> Result<()> {
-    let price: Decimal = data
-        .fill_price
-        .parse()
-        .ok()
-        .context("fill_price is not a valid decimal")?;
+    let price: Decimal =
+        data.fill_price.parse().ok().context("fill_price is not a valid decimal")?;
     if price <= Decimal::ZERO {
         bail!("fill_price must be > 0");
     }
@@ -85,11 +82,7 @@ pub fn validate_order_fill(data: &OrderFillData) -> Result<()> {
         bail!("filled_quantity must be > 0");
     }
 
-    let fee: Decimal = data
-        .fee
-        .parse()
-        .ok()
-        .context("fee is not a valid decimal")?;
+    let fee: Decimal = data.fee.parse().ok().context("fee is not a valid decimal")?;
     if fee < Decimal::ZERO {
         bail!("fee must be >= 0");
     }
@@ -135,11 +128,10 @@ async fn run_inner(args: ReconcileCloseArgs) -> Result<i32, i32> {
         eprintln!("error: failed to read {}: {e}", args.evidence_file.display());
         EXIT_GENERIC_ERROR
     })?;
-    let evidence: EvidenceJson =
-        serde_json::from_str(&raw).map_err(|_| {
-            eprintln!("error: invalid evidence JSON");
-            EXIT_USAGE_ERROR
-        })?;
+    let evidence: EvidenceJson = serde_json::from_str(&raw).map_err(|_| {
+        eprintln!("error: invalid evidence JSON");
+        EXIT_USAGE_ERROR
+    })?;
 
     match &evidence {
         EvidenceJson::AccountSnapshot(_) => {
@@ -170,10 +162,8 @@ async fn run_inner(args: ReconcileCloseArgs) -> Result<i32, i32> {
         },
     }
 
-    let request_body = api_client::ReconcileCloseRequest {
-        position_id: args.position_id,
-        evidence,
-    };
+    let request_body =
+        api_client::ReconcileCloseRequest { position_id: args.position_id, evidence };
 
     let client = api_client::ApiClient::new(&args.robsond_url, args.token.as_deref());
     let response = client.reconcile_close(request_body).await.map_err(|e| {
@@ -194,20 +184,14 @@ async fn run_inner(args: ReconcileCloseArgs) -> Result<i32, i32> {
             Err(EXIT_NOT_FOUND)
         },
         api_client::ReconcileCloseResponse::NotActive(resp) => {
-            eprintln!(
-                "position not active: {} (current_state={})",
-                resp.error, resp.current_state
-            );
+            eprintln!("position not active: {} (current_state={})", resp.error, resp.current_state);
             Err(EXIT_NOT_ACTIVE)
         },
         api_client::ReconcileCloseResponse::Inconsistent(resp) => {
             eprintln!(
                 "inconsistent evidence: {}{}",
                 resp.error,
-                resp.details
-                    .as_ref()
-                    .map(|d| format!(" — {d}"))
-                    .unwrap_or_default()
+                resp.details.as_ref().map(|d| format!(" — {d}")).unwrap_or_default()
             );
             Err(EXIT_INCONSISTENT)
         },
@@ -215,10 +199,7 @@ async fn run_inner(args: ReconcileCloseArgs) -> Result<i32, i32> {
             eprintln!(
                 "unsupported evidence: {}{}",
                 resp.error,
-                resp.details
-                    .as_ref()
-                    .map(|d| format!(" — {d}"))
-                    .unwrap_or_default()
+                resp.details.as_ref().map(|d| format!(" — {d}")).unwrap_or_default()
             );
             Err(EXIT_USAGE_ERROR)
         },
@@ -231,9 +212,11 @@ async fn run_inner(args: ReconcileCloseArgs) -> Result<i32, i32> {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use std::io::Write as IoWrite;
+
     use tempfile::NamedTempFile;
+
+    use super::*;
 
     fn write_evidence_file(content: &str) -> NamedTempFile {
         let mut f = NamedTempFile::new().unwrap();

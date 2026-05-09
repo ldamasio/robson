@@ -72,17 +72,16 @@ impl ApiClient {
         }
     }
 
-    pub async fn reconcile_close(&self, body: ReconcileCloseRequest) -> Result<ReconcileCloseResponse> {
+    pub async fn reconcile_close(
+        &self,
+        body: ReconcileCloseRequest,
+    ) -> Result<ReconcileCloseResponse> {
         let url = format!("{}/reconcile-close", self.base_url);
         let mut req = self.client.post(&url);
         if let Some(token) = &self.token {
             req = req.bearer_auth(token);
         }
-        let resp = req
-            .json(&body)
-            .send()
-            .await
-            .context("failed to connect to robsond")?;
+        let resp = req.json(&body).send().await.context("failed to connect to robsond")?;
 
         match resp.status().as_u16() {
             200 => {
@@ -91,7 +90,8 @@ impl ApiClient {
                 Ok(ReconcileCloseResponse::Success(success))
             },
             400 => {
-                let err: ErrorResponse = resp.json().await.context("failed to parse 400 response")?;
+                let err: ErrorResponse =
+                    resp.json().await.context("failed to parse 400 response")?;
                 if err.error == "unsupported_evidence" {
                     Ok(ReconcileCloseResponse::Unsupported(err))
                 } else {
@@ -104,11 +104,13 @@ impl ApiClient {
                 Ok(ReconcileCloseResponse::Unauthorized(err))
             },
             404 => {
-                let err: NotFoundResponse = resp.json().await.context("failed to parse 404 response")?;
+                let err: NotFoundResponse =
+                    resp.json().await.context("failed to parse 404 response")?;
                 Ok(ReconcileCloseResponse::NotFound(err))
             },
             409 => {
-                let err: NotActiveResponse = resp.json().await.context("failed to parse 409 response")?;
+                let err: NotActiveResponse =
+                    resp.json().await.context("failed to parse 409 response")?;
                 Ok(ReconcileCloseResponse::NotActive(err))
             },
             other => {
