@@ -951,6 +951,7 @@ mod tests {
     fn test_parse_exit_reason_unknown_returns_none() {
         assert_eq!(parse_exit_reason(""), None);
         assert_eq!(parse_exit_reason("UnknownReason"), None);
-        assert_eq!(parse_exit_reason("trailing-stop"), None); // hyphen not accepted
+        assert_eq!(parse_exit_reason("trailing-stop"), None); // hyphen not
+                                                              // accepted
     }
 }

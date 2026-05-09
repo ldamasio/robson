@@ -1641,8 +1641,7 @@ mod tests {
         use robson_domain::Symbol;
         let daemon = Daemon::new_stub(Config::test());
 
-        let mut pos =
-            active_position(Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        let mut pos = active_position(Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
         pos.state = PositionState::Entering {
             entry_order_id: uuid::Uuid::now_v7(),
             expected_entry: Price::new(rust_decimal_macros::dec!(100)).unwrap(),
@@ -1659,8 +1658,7 @@ mod tests {
         use robson_domain::{ExitReason, Symbol};
         let daemon = Daemon::new_stub(Config::test());
 
-        let mut pos =
-            active_position(Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        let mut pos = active_position(Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
         pos.state = PositionState::Exiting {
             exit_order_id: uuid::Uuid::now_v7(),
             exit_reason: ExitReason::TrailingStop,

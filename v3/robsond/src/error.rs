@@ -114,7 +114,8 @@ pub enum DaemonError {
     #[error("Shutdown requested")]
     Shutdown,
 
-    /// One or more Robson-Active positions are absent from the exchange at startup.
+    /// One or more Robson-Active positions are absent from the exchange at
+    /// startup.
     ///
     /// Exit code 78 (EX_CONFIG). Daemon refuses to enter the control loop.
     /// Operator must resolve each position manually before restarting.

@@ -34,7 +34,7 @@ mod db;
 use std::sync::Arc;
 
 use robson_connectors::BinanceRestClient;
-use robsond::{Config, Daemon, DaemonResult, Environment, exit_code_for_daemon_error};
+use robsond::{exit_code_for_daemon_error, Config, Daemon, DaemonResult, Environment};
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
 

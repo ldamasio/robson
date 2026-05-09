@@ -517,13 +517,15 @@ impl Config {
 
         let on_startup_stale_active =
             match env::var("ROBSON_RECONCILIATION_ON_STARTUP_STALE_ACTIVE") {
-                Ok(val) => val
-                    .parse::<StartupStaleActivePolicy>()
-                    .map_err(DaemonError::Config)?,
+                Ok(val) => val.parse::<StartupStaleActivePolicy>().map_err(DaemonError::Config)?,
                 Err(_) => StartupStaleActivePolicy::default(),
             };
 
-        Ok(ReconciliationConfig { interval_secs, missing_grace_secs, on_startup_stale_active })
+        Ok(ReconciliationConfig {
+            interval_secs,
+            missing_grace_secs,
+            on_startup_stale_active,
+        })
     }
 }
 
