@@ -1,6 +1,6 @@
 # TD-2026-05-05-001 — Core Position Lifecycle Drift
 
-**Status**: In progress — Slices 0/1/2 done; Slice 3 next
+**Status**: In progress — Slices 0/1/2/3/4A/4B done; Slice 5 next
 **Severity**: High
 **Area**: `robsond` reconciliation, position lifecycle
 **Discovered**: 2026-05-05
@@ -317,59 +317,63 @@ Outcome:
 - No code.
 - **Commit**: `docs(policies): add I3 reverse reconciliation invariant for TD-2026-05-05-001`
 
-### Slice 3 — Evidence pipeline: `ExchangePort` extension
+### Slice 3 — Evidence pipeline: `ExchangePort` extension — DONE (commit `0835150b`)
 
-- Extend `ExchangePort` with two new methods:
+- Extended `ExchangePort` with two new methods:
   - `async fn get_order_by_exchange_id(symbol, order_id) -> Result<Option<OrderResult>, ExecError>`
   - `async fn get_user_trades_since(symbol, since: DateTime<Utc>, limit: u16) -> Result<Vec<UserTradeRecord>, ExecError>`
-- Implement in `BinanceExchangeAdapter` using existing
+- Implemented in `BinanceExchangeAdapter` using existing
   `BinanceRestClient::get_order_status` and a new
   `get_user_trades` wrapper around `GET /fapi/v1/userTrades`.
-- Implement no-op variants in `StubExchange` plus a `set_user_trades` helper
+- Implemented no-op variants in `StubExchange` plus a `set_user_trades` helper
   for tests.
 - **Tests**: stub round-trips, Binance adapter contract tests
   (`#[ignore]`-gated against testnet credentials).
 - **Commit**: `feat(exec): add evidence retrieval methods to ExchangePort`
 
-### Slice 4 — `PositionManager::reconcile_close` + symmetric worker loop
+### Slice 4A — `PositionManager::reconcile_close` for real evidence — DONE (commit `93db6bb9`)
 
-- New `pub(crate) async fn reconcile_close(&self, position_id,
-  evidence: ReconciliationEvidence) -> DaemonResult<()>` in
-  `position_manager.rs`. Idempotent: returns Ok if already terminal.
-- New helper `gather_evidence(position) -> Result<ReconciliationEvidence,
-  EvidenceError>` that walks sources 1→2→3→4.
-- Symmetric loop in `ReconciliationWorker::scan_and_reconcile`:
-  1. Build `exchange_set: HashSet<(Symbol, Side)>` from
-     `get_all_open_positions()` (existing).
-  2. Iterate `store.positions().find_active().await?` (NEW). For each,
-     match `(symbol, side)`:
-     - Match → no action.
-     - No match AND `position.state == Active` → push to candidate set
-       with first-observation timestamp from a per-position grace map.
-     - No match AND `position.state in {Entering, Exiting}` → emit
-       `ReconciliationStaleNonActiveDetected` event, skip.
-  3. Re-check candidates from the previous cycle. If still missing AND
-     `now - first_seen >= grace_secs` → call `reconcile_close` with
-     gathered evidence.
-- Grace state lives inside `ReconciliationWorker` (in-memory map
-  `position_id → first_seen_at`); cleared when the position reappears or
-  is closed. Lost on restart — startup gate handles startup-time
-  stale-active separately.
-- **Tests** (in this slice):
-  1. Stale-Active in store + empty exchange + 2 cycles past grace →
-     reconciled close emitted with `Reconciled(AccountSnapshot)` evidence.
-  2. Idempotency — running `scan_and_reconcile` twice after close emits
-     nothing further.
-  3. Grace race — exchange empty for 1 cycle then full for 1 cycle → no
-     close.
-  4. Cross-side false-positive — Long Active and Short Active for same
-     symbol, exchange has only Long → only Short is reconciled.
-  5. Entering/Exiting → log + skip + non-Active event emitted.
-  6. Evidence preference — when `OrderFillRecord` is available, the close
-     event carries it (not AccountSnapshot).
-- **Commit**: `feat(robsond): symmetric reconciliation closes stale Active positions`
+- Added `ReconciledCloseInput`, `ReconcileCloseOutcome`, and
+  `PositionManager::reconcile_close`.
+- `reconcile_close` accepts only real evidence:
+  `OrderFillRecord` and `UserTradeRecord`.
+- `AccountSnapshot` and `Estimated` are rejected and do not emit
+  `PositionClosed`.
+- Inconsistent real evidence is rejected before close.
+- Terminal positions are idempotent state-first noops.
+- `PositionClosed` uses `ExitReason::ReconciledMissingOnExchange` and
+  `ClosureEvidence::Reconciled(...)`.
+- **Commit**: `feat(robsond): add reconciled close path for real evidence`
 
-### Slice 5 — Startup gate + runbook
+### Slice 4B — Symmetric stale-Active worker loop — DONE (commit `2a87fb8e`)
+
+- Added the Robson Active → Exchange Open symmetric loop to
+  `ReconciliationWorker`.
+- Matching is by `(symbol, side)`, never by symbol alone.
+- Grace state lives in memory inside `ReconciliationWorker`; first
+  observation only records state, and close is attempted only after a second
+  observation past grace.
+- `Active`-only auto-close calls `PositionManager::reconcile_close` only
+  when real evidence is available.
+- `OrderFillRecord` has priority over `UserTradeRecord`.
+- `UserTradeRecord` closes only when there is exactly one strong candidate:
+  same symbol by query, `filled_at >= first_observed_missing_at`, and
+  `filled_quantity == expected_quantity`. Zero candidates, multiple
+  candidates, or quantity mismatch stay unresolved.
+- `Entering` and `Exiting` are detected, logged, emitted as
+  `ReconciliationStaleNonActiveDetected`, and skipped.
+- Stale Active with no unambiguous real evidence emits
+  `ReconciliationStaleActiveUnresolved`, remains `Active`, and does not call
+  `reconcile_close`.
+- **4B limitation accepted for safety**: `UserTradeRecord` lookup starts at
+  `first_observed_missing_at`. If a manual close or liquidation occurred
+  immediately before the first Robson observation, the real trade can fall
+  outside the lookup window and the case can become `unresolved`. Slice 4B
+  intentionally does not add automatic lookback to avoid associating an
+  unrelated trade with a local position.
+- **Commit**: `feat(robsond): add symmetric stale-active reconciliation loop`
+
+### Slice 5 — Startup gate + runbook — NEXT
 
 - Implement Path A (default `abort`) and Path B (`auto_reconcile`) per
   Amendment §3.
@@ -409,14 +413,18 @@ All asserted via `cargo test -p robsond` plus targeted Postgres tests under
 | Postgres parser fallback for new `ExitReason` value | 1 | Postgres integration |
 | `get_order_by_exchange_id` happy path on stub | 3 | Unit |
 | `get_user_trades_since` returns ordered trades | 3 | Unit |
-| Reverse reconciliation closes stale Active after grace | 4 | Unit |
-| Reverse reconciliation idempotent | 4 | Unit |
-| Grace race does not close prematurely | 4 | Unit |
-| Cross-side (Long/Short same symbol) false-positive guard | 4 | Unit |
-| Entering/Exiting → log + skip, no close | 4 | Unit |
-| Evidence preference order (Fill > Trade > Snapshot > Estimated) | 4 | Unit |
-| Estimated evidence triggers CRITICAL alert and metric | 4 | Unit |
-| MonthlyHalt evaluated after reconciled close | 4 | Unit |
+| `reconcile_close` closes Long/Short with real `OrderFillRecord` / `UserTradeRecord` evidence only | 4A | Unit |
+| `reconcile_close` rejects `AccountSnapshot`, `Estimated`, and inconsistent real evidence | 4A | Unit |
+| Reverse reconciliation first observation does not close | 4B | Unit |
+| Reverse reconciliation closes stale Active after grace when `OrderFillRecord` exists | 4B | Unit |
+| Reverse reconciliation closes stale Active after grace with exactly one strong `UserTradeRecord` candidate | 4B | Unit |
+| Reverse reconciliation idempotent | 4B | Unit |
+| Grace race does not close prematurely | 4B | Unit |
+| Cross-side (Long/Short same symbol) false-positive guard | 4B | Unit |
+| Entering/Exiting → log + skip, no close | 4B | Unit |
+| `UserTradeRecord` zero/multiple/quantity-mismatch candidates stay unresolved | 4B | Unit |
+| Snapshot/Estimated evidence does not auto-close stale Active | 4B | Unit |
+| MonthlyHalt evaluated after reconciled close | 4A | Unit |
 | Startup gate Path A aborts with exit code 78 | 5 | Integration |
 | Startup gate Path B reconciles when evidence available | 5 | Integration |
 | Startup gate Path B aborts when only Estimated evidence available | 5 | Integration |
