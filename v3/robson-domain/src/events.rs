@@ -8,7 +8,9 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    entities::{AccountId, ExitReason, OrderId, PositionId, TechnicalStopAnalysisAudit},
+    entities::{
+        AccountId, ClosureEvidence, ExitReason, OrderId, PositionId, TechnicalStopAnalysisAudit,
+    },
     policy::{ApprovalPolicy, EntryPolicy, SignalEvaluationOutcome, StrategyId},
     value_objects::{Price, Quantity, Side, Symbol, TechnicalStopDistance},
 };
@@ -301,6 +303,14 @@ pub enum Event {
         realized_pnl: Decimal,
         /// Total fees paid
         total_fees: Decimal,
+        /// Provenance of the close — real exchange fill or reverse
+        /// reconciliation. Defaults to `RealFill` with the canonical
+        /// exit-fill source so legacy events written before
+        /// TD-2026-05-05-001 deserialize unchanged.
+        ///
+        /// See `docs/implementation/TD-2026-05-05-001-CORE-LIFECYCLE-DRIFT.md`.
+        #[serde(default)]
+        closure_evidence: ClosureEvidence,
         /// When the position was closed
         timestamp: DateTime<Utc>,
     },
@@ -629,6 +639,7 @@ mod tests {
             exit_price: Price::new(dec!(97000)).unwrap(),
             realized_pnl: dec!(200),
             total_fees: dec!(0.002),
+            closure_evidence: ClosureEvidence::default(),
             timestamp: Utc::now(),
         }
     }
@@ -681,6 +692,253 @@ mod tests {
 
         assert_eq!(event.position_id(), deserialized.position_id());
         assert_eq!(event.event_type(), "position_closed");
+    }
+
+    // =========================================================================
+    // TD-2026-05-05-001 — ClosureEvidence and ExitReason expansion (Slice 1)
+    // =========================================================================
+
+    use crate::entities::{
+        AccountSnapshotEvidence, EstimatedEvidence, EstimationBasis, ExitOrderFillSource,
+        OrderFillEvidence, RealFillEvidence, ReconciliationEvidence, UserTradeEvidence,
+    };
+
+    /// `ClosureEvidence::default()` is `RealFill { source: ExitFill,
+    /// exchange_order_id: None }` so legacy events deserialize unchanged.
+    #[test]
+    fn test_closure_evidence_default_is_real_exit_fill() {
+        match ClosureEvidence::default() {
+            ClosureEvidence::RealFill(real) => {
+                assert_eq!(real.source, ExitOrderFillSource::ExitFill);
+                assert_eq!(real.exchange_order_id, None);
+            },
+            other => panic!("expected RealFill default, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_closure_evidence_helpers() {
+        let real = ClosureEvidence::real_exit_fill(Some("BIN-123".to_string()));
+        assert!(real.is_real_fill());
+        assert!(!real.is_reconciled());
+        match real {
+            ClosureEvidence::RealFill(RealFillEvidence {
+                source: ExitOrderFillSource::ExitFill,
+                exchange_order_id: Some(ref id),
+            }) if id == "BIN-123" => {},
+            other => panic!("unexpected: {:?}", other),
+        }
+
+        let reconciled = ClosureEvidence::Reconciled(ReconciliationEvidence::AccountSnapshot(
+            AccountSnapshotEvidence {
+                first_observed_missing_at: Utc::now(),
+                confirmed_missing_at: Utc::now(),
+                futures_balance_delta: None,
+            },
+        ));
+        assert!(reconciled.is_reconciled());
+        assert!(!reconciled.is_real_fill());
+    }
+
+    #[test]
+    fn test_closure_evidence_real_fill_roundtrip() {
+        let evidence = ClosureEvidence::real_exit_fill(Some("BIN-9999".to_string()));
+        let json = serde_json::to_value(&evidence).unwrap();
+        // Adjacently-tagged: { "kind": "real_fill", "evidence": { ... } }
+        assert_eq!(json["kind"].as_str(), Some("real_fill"));
+        assert_eq!(json["evidence"]["source"].as_str(), Some("exit_fill"));
+        assert_eq!(json["evidence"]["exchange_order_id"].as_str(), Some("BIN-9999"));
+
+        let back: ClosureEvidence = serde_json::from_value(json).unwrap();
+        assert_eq!(back, evidence);
+    }
+
+    #[test]
+    fn test_closure_evidence_real_fill_default_omits_optional_order_id() {
+        let evidence = ClosureEvidence::default();
+        let json = serde_json::to_value(&evidence).unwrap();
+        assert_eq!(json["kind"].as_str(), Some("real_fill"));
+        assert_eq!(json["evidence"]["source"].as_str(), Some("exit_fill"));
+        // skip_serializing_if drops the None
+        assert!(json["evidence"].get("exchange_order_id").is_none());
+
+        let back: ClosureEvidence = serde_json::from_value(json).unwrap();
+        assert_eq!(back, evidence);
+    }
+
+    #[test]
+    fn test_closure_evidence_reconciled_order_fill_roundtrip() {
+        let now = Utc::now();
+        let evidence = ClosureEvidence::Reconciled(ReconciliationEvidence::OrderFillRecord(
+            OrderFillEvidence {
+                exchange_order_id: "BIN-INSURANCE-1".to_string(),
+                fill_price: Price::new(dec!(74000)).unwrap(),
+                filled_quantity: Quantity::new(dec!(0.010)).unwrap(),
+                fee: dec!(0.123),
+                fee_asset: "USDT".to_string(),
+                filled_at: now,
+            },
+        ));
+        let json = serde_json::to_value(&evidence).unwrap();
+        assert_eq!(json["kind"].as_str(), Some("reconciled"));
+        assert_eq!(json["evidence"]["source"].as_str(), Some("order_fill_record"));
+        assert_eq!(json["evidence"]["data"]["exchange_order_id"].as_str(), Some("BIN-INSURANCE-1"));
+
+        let back: ClosureEvidence = serde_json::from_value(json).unwrap();
+        assert_eq!(back, evidence);
+    }
+
+    #[test]
+    fn test_closure_evidence_reconciled_user_trade_roundtrip() {
+        let evidence = ClosureEvidence::Reconciled(ReconciliationEvidence::UserTradeRecord(
+            UserTradeEvidence {
+                exchange_order_id: "BIN-MANUAL-77".to_string(),
+                exchange_trade_id: "T-9988".to_string(),
+                fill_price: Price::new(dec!(73900)).unwrap(),
+                filled_quantity: Quantity::new(dec!(0.010)).unwrap(),
+                fee: dec!(0.456),
+                fee_asset: "USDT".to_string(),
+                filled_at: Utc::now(),
+            },
+        ));
+        let json = serde_json::to_value(&evidence).unwrap();
+        assert_eq!(json["evidence"]["source"].as_str(), Some("user_trade_record"));
+
+        let back: ClosureEvidence = serde_json::from_value(json).unwrap();
+        assert_eq!(back, evidence);
+    }
+
+    #[test]
+    fn test_closure_evidence_reconciled_account_snapshot_roundtrip() {
+        let t1 = Utc::now();
+        let t2 = Utc::now();
+        let evidence = ClosureEvidence::Reconciled(ReconciliationEvidence::AccountSnapshot(
+            AccountSnapshotEvidence {
+                first_observed_missing_at: t1,
+                confirmed_missing_at: t2,
+                futures_balance_delta: Some(dec!(-152.30)),
+            },
+        ));
+        let json = serde_json::to_value(&evidence).unwrap();
+        assert_eq!(json["evidence"]["source"].as_str(), Some("account_snapshot"));
+        assert_eq!(json["evidence"]["data"]["futures_balance_delta"].as_str(), Some("-152.30"));
+
+        let back: ClosureEvidence = serde_json::from_value(json).unwrap();
+        assert_eq!(back, evidence);
+    }
+
+    #[test]
+    fn test_closure_evidence_reconciled_estimated_roundtrip() {
+        let evidence =
+            ClosureEvidence::Reconciled(ReconciliationEvidence::Estimated(EstimatedEvidence {
+                estimation_basis: EstimationBasis::TrailingStopAtDetection,
+                exit_price: Price::new(dec!(73500)).unwrap(),
+                evaluator: Some("operator:ldamasio".to_string()),
+                detected_at: Utc::now(),
+            }));
+        let json = serde_json::to_value(&evidence).unwrap();
+        assert_eq!(json["evidence"]["source"].as_str(), Some("estimated"));
+        assert_eq!(
+            json["evidence"]["data"]["estimation_basis"].as_str(),
+            Some("trailing_stop_at_detection")
+        );
+
+        let back: ClosureEvidence = serde_json::from_value(json).unwrap();
+        assert_eq!(back, evidence);
+    }
+
+    /// Retrocompatibility canary: a `position_closed` event written before
+    /// TD-2026-05-05-001 (no `closure_evidence` field on the wire) must
+    /// deserialize successfully and yield `ClosureEvidence::default()` —
+    /// `RealFill { source: ExitFill, exchange_order_id: None }`.
+    #[test]
+    fn test_legacy_position_closed_without_closure_evidence_deserializes_to_default() {
+        let position_id = Uuid::now_v7();
+        let timestamp = Utc::now();
+        // The exact wire shape produced by robsond pre-TD-2026-05-05-001.
+        // Note: NO `closure_evidence` field.
+        let legacy_json = serde_json::json!({
+            "type": "position_closed",
+            "position_id": position_id,
+            "exit_reason": "TrailingStop",
+            "entry_price": "95000",
+            "exit_price": "97000",
+            "realized_pnl": "200",
+            "total_fees": "0.002",
+            "timestamp": timestamp,
+        });
+
+        let event: Event = serde_json::from_value(legacy_json)
+            .expect("legacy position_closed JSON must remain readable");
+
+        match event {
+            Event::PositionClosed { closure_evidence, exit_reason, .. } => {
+                assert_eq!(exit_reason, ExitReason::TrailingStop);
+                assert_eq!(
+                    closure_evidence,
+                    ClosureEvidence::default(),
+                    "legacy events must default to RealFill(ExitFill)"
+                );
+                assert!(closure_evidence.is_real_fill());
+            },
+            other => panic!("expected PositionClosed, got {:?}", other),
+        }
+    }
+
+    /// Forward-compatibility: a new event with `Reconciled` evidence
+    /// roundtrips through `Event` without losing the evidence payload.
+    #[test]
+    fn test_position_closed_with_reconciled_evidence_roundtrips() {
+        let position_id = Uuid::now_v7();
+        let evidence = ClosureEvidence::Reconciled(ReconciliationEvidence::AccountSnapshot(
+            AccountSnapshotEvidence {
+                first_observed_missing_at: Utc::now(),
+                confirmed_missing_at: Utc::now(),
+                futures_balance_delta: None,
+            },
+        ));
+        let event = Event::PositionClosed {
+            position_id,
+            exit_reason: ExitReason::ReconciledMissingOnExchange,
+            entry_price: Price::new(dec!(80000)).unwrap(),
+            exit_price: Price::new(dec!(78500)).unwrap(),
+            realized_pnl: dec!(-15),
+            total_fees: dec!(0),
+            closure_evidence: evidence.clone(),
+            timestamp: Utc::now(),
+        };
+
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["type"].as_str(), Some("position_closed"));
+        assert_eq!(json["exit_reason"].as_str(), Some("ReconciledMissingOnExchange"));
+        assert_eq!(json["closure_evidence"]["kind"].as_str(), Some("reconciled"));
+
+        let back: Event = serde_json::from_value(json).unwrap();
+        match back {
+            Event::PositionClosed {
+                closure_evidence: back_evidence,
+                exit_reason,
+                ..
+            } => {
+                assert_eq!(exit_reason, ExitReason::ReconciledMissingOnExchange);
+                assert_eq!(back_evidence, evidence);
+            },
+            other => panic!("expected PositionClosed, got {:?}", other),
+        }
+    }
+
+    /// `ExitReason::ReconciledMissingOnExchange` JSON shape is the variant
+    /// name (`PascalCase`) — matches the existing convention that the
+    /// Postgres parser at `robson-store::postgres::parse_exit_reason`
+    /// accepts both `PascalCase` and `snake_case`.
+    #[test]
+    fn test_exit_reason_reconciled_serializes_to_pascal_case_variant_name() {
+        let reason = ExitReason::ReconciledMissingOnExchange;
+        let json = serde_json::to_value(&reason).unwrap();
+        assert_eq!(json.as_str(), Some("ReconciledMissingOnExchange"));
+
+        let back: ExitReason = serde_json::from_value(json).unwrap();
+        assert_eq!(back, reason);
     }
 
     #[test]

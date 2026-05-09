@@ -1,7 +1,8 @@
 # ADR-0022 — Robson-Authored Position Invariant
 
 **Date**: 2026-04-18
-**Status**: DECIDED — FOLLOW-UP REQUIRED (reconciliation worker + close path are target architecture)
+**Last Amended**: 2026-05-08 (I3 — Reverse Reconciliation; see Amendments)
+**Status**: DECIDED — FOLLOW-UP REQUIRED (reconciliation worker + close path are target architecture; reverse reconciliation per I3 in flight under TD-2026-05-05-001)
 **Deciders**: RBX Systems (operator + architecture)
 
 ---
@@ -183,3 +184,84 @@ Follow-up work required (tracked as `MIG-v3#TBD — Reconciliation Worker`):
 - [ADR-0007 — Robson is a Risk Assistant, not an Autotrader](ADR-0007-robson-is-risk-assistant-not-autotrader.md)
 - [ADR-0021 — Opportunity Detection vs Technical Stop Analysis](ADR-0021-opportunity-detection-vs-technical-stop-analysis.md)
 - [ADR-0023 — Symbol-Agnostic Policy Invariant](ADR-0023-symbol-agnostic-policy-invariant.md) (companion)
+- [TD-2026-05-05-001 — Core Position Lifecycle Drift](../technical-debt.md) and its
+  [Implementation Guide](../implementation/TD-2026-05-05-001-CORE-LIFECYCLE-DRIFT.md)
+- [Runbook td-2026-05-05-001-stale-active-recovery](../runbooks/td-2026-05-05-001-stale-active-recovery.md) — operator recovery when the startup gate aborts under I3
+
+---
+
+## Amendments
+
+### 2026-05-08 — I3: Reverse Reconciliation (TD-2026-05-05-001)
+
+**Context.** The original ADR (2026-04-18) established the invariant
+`Open positions on the operated account ⊆ Robson-authored entries`. This
+covers the **exchange-to-Robson direction** of the symmetric relation
+between local lifecycle state and the exchange's view of the account: any
+foreign open position on the operated account is closed (UNTRACKED).
+
+The **opposite direction** was implicitly assumed but not enforced:
+positions tracked locally as `Active` were assumed to remain present on
+the exchange because every exit was supposed to flow through Robson's
+own `Active → Exiting → Closed` pipeline. In practice, three classes of
+event break that assumption:
+
+1. **Forced liquidation by Binance** under maintenance margin breach.
+2. **Manual close on the Binance UI** by the operator.
+3. **Insurance-stop fill while the daemon is offline** beyond the 15-minute
+   `startup_recovery` candle-replay window.
+
+In all three the exchange is the source of truth and the local projection
+remains stale `Active`. None of I1/I2 detect this. The reconciliation
+worker as built today walks only the exchange side.
+
+**Amendment.** Add the symmetric component:
+
+> **I3 — Reverse Reconciliation Invariant.** Every position the local
+> store holds in `Active` MUST have a corresponding open position on the
+> exchange, matched by `(symbol, side)` and within the configured
+> `quantity` tolerance. If the position is missing on the exchange after
+> a grace period and a second consecutive observation, Robson MUST
+> gather evidence from the exchange and transition the local position
+> to `Closed` via reverse reconciliation.
+
+**Symmetry, in summary.**
+
+| Direction | Invariant | Detection target | Action |
+|---|---|---|---|
+| Exchange has, Robson does not | I1 / I2 (UNTRACKED) | Foreign open position on the operated account | Close at market, tag `UNTRACKED_ON_EXCHANGE` |
+| Robson `Active`, Exchange does not | I3 (stale-Active) | Local lifecycle drift after liquidation, manual close, externally-resident insurance stop fill, etc. | Gather evidence (`OrderFillRecord` → `UserTradeRecord` → `AccountSnapshot` → `Estimated`), close locally with `ReconciledMissingOnExchange` |
+
+**Scope clarification (Active-only).** I3 only auto-closes `Active`. The
+worker MUST detect and structurally log `Entering` and `Exiting`
+positions whose exchange counterpart is missing, but MUST NOT auto-close
+them in this TD. A separate technical debt entry will design a safe
+auto-close for those after the `Active` path is proven in production.
+
+**Detection rule.** Single-observation drift is insufficient — placement
+latency, websocket vs REST snapshot inconsistencies, and exchange
+maintenance windows can all produce transient absence. The worker MUST
+require a grace period plus a second consecutive observation before
+invoking the close path. See policy §I3 §B.
+
+**Evidence ordering, no silent fallback.** Every reconciliation-close
+event MUST carry a `ClosureEvidence::Reconciled(...)` payload (introduced
+in Slice 1 of TD-2026-05-05-001) populated in priority order:
+`OrderFillRecord` > `UserTradeRecord` > `AccountSnapshot` > `Estimated`.
+`Estimated` is never silently substituted for a real fill — every
+`Estimated` close emits a `CRITICAL` operator alert and increments
+`robson_reconciliation_estimated_closes_total`. At startup, an
+`Estimated`-only close path NEVER runs automatically; the daemon aborts
+and defers to the operator runbook. See policy §I3 §C and §D.
+
+**Authoritative source documents.** The full operational rules,
+configuration knobs, and rollback semantics for I3 live in:
+
+- [`docs/policies/UNTRACKED-POSITION-RECONCILIATION.md` §I3](../policies/UNTRACKED-POSITION-RECONCILIATION.md) — policy text
+- [`docs/implementation/TD-2026-05-05-001-CORE-LIFECYCLE-DRIFT.md`](../implementation/TD-2026-05-05-001-CORE-LIFECYCLE-DRIFT.md) — slice plan
+- [`docs/runbooks/td-2026-05-05-001-stale-active-recovery.md`](../runbooks/td-2026-05-05-001-stale-active-recovery.md) — recovery procedure (skeleton; finalized in Slice 5)
+
+This ADR remains the canonical authority for the existence and
+non-negotiability of the invariant; the policy holds the operational
+detail and may evolve as I3's mechanics are refined without re-amending
+this ADR.

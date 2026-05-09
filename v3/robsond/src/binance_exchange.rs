@@ -13,11 +13,11 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use robson_connectors::{BinanceRestClient, BinanceRestError};
 use robson_domain::{OrderSide, Price, Quantity, Side, Symbol};
 use robson_exec::{
-    ports::{ExchangePosition, FuturesBalance, FuturesSettings},
+    ports::{ExchangePosition, FuturesBalance, FuturesSettings, UserTradeRecord},
     ExchangePort, ExecError, OrderResult,
 };
 use rust_decimal::Decimal;
@@ -325,6 +325,107 @@ impl ExchangePort for BinanceExchangeAdapter {
 
         self.place_market_order(symbol, close_side, quantity, client_order_id, true)
             .await
+    }
+
+    async fn get_order_by_exchange_id(
+        &self,
+        symbol: &Symbol,
+        order_id: &str,
+    ) -> Result<Option<OrderResult>, ExecError> {
+        let order_id_num: u64 = order_id.parse().map_err(|_| {
+            ExecError::Exchange(format!("Invalid order_id for query: {}", order_id))
+        })?;
+
+        let response = match self.client.get_order_status(&symbol.as_pair(), order_id_num).await {
+            Ok(response) => response,
+            Err(BinanceRestError::ApiError { code: -2013, .. }) => return Ok(None),
+            Err(error) => return Err(Self::map_error(error)),
+        };
+
+        // Only return fill data when the order is definitively filled.
+        if response.status != "FILLED" {
+            return Ok(None);
+        }
+
+        let executed_qty = response.executed_qty;
+        if executed_qty <= Decimal::ZERO {
+            return Ok(None);
+        }
+
+        if response.fills.is_empty() {
+            // `/fapi/v1/order` usually omits fills for USD-M futures. Without
+            // actual fill records, the fee would be an estimate; let callers
+            // fall back to user trades for high-fidelity evidence instead.
+            return Ok(None);
+        }
+
+        let total_quote: Decimal = response.fills.iter().map(|f| f.price * f.qty).sum();
+        let total_qty: Decimal = response.fills.iter().map(|f| f.qty).sum();
+        let fee: Decimal = response.fills.iter().map(|f| f.commission).sum();
+        let fee_asset = response
+            .fills
+            .first()
+            .map(|f| f.commission_asset.clone())
+            .unwrap_or_else(|| "USDT".to_string());
+
+        let fill_price = if total_qty > Decimal::ZERO {
+            total_quote / total_qty
+        } else {
+            return Ok(None);
+        };
+
+        let filled_at =
+            DateTime::from_timestamp_millis(response.update_time).unwrap_or_else(Utc::now);
+
+        Ok(Some(OrderResult {
+            exchange_order_id: response.order_id.to_string(),
+            client_order_id: response.client_order_id,
+            fill_price: Price::new(fill_price)
+                .map_err(|e| ExecError::Exchange(format!("Invalid fill price: {}", e)))?,
+            filled_quantity: Quantity::new(executed_qty)
+                .map_err(|e| ExecError::Exchange(format!("Invalid filled quantity: {}", e)))?,
+            fee,
+            fee_asset,
+            filled_at,
+        }))
+    }
+
+    async fn get_user_trades_since(
+        &self,
+        symbol: &Symbol,
+        since: DateTime<Utc>,
+        limit: u16,
+    ) -> Result<Vec<UserTradeRecord>, ExecError> {
+        let start_time_ms = since.timestamp_millis();
+
+        let trades = self
+            .client
+            .get_user_trades(&symbol.as_pair(), start_time_ms, limit)
+            .await
+            .map_err(Self::map_error)?;
+
+        let mut records = trades
+            .into_iter()
+            .map(|t| {
+                let filled_at = DateTime::from_timestamp_millis(t.time).unwrap_or_else(Utc::now);
+
+                Ok(UserTradeRecord {
+                    exchange_order_id: t.order_id.to_string(),
+                    exchange_trade_id: t.id.to_string(),
+                    fill_price: Price::new(t.price)
+                        .map_err(|e| ExecError::Exchange(format!("Invalid trade price: {}", e)))?,
+                    filled_quantity: Quantity::new(t.qty)
+                        .map_err(|e| ExecError::Exchange(format!("Invalid trade qty: {}", e)))?,
+                    fee: t.commission,
+                    fee_asset: t.commission_asset,
+                    filled_at,
+                })
+            })
+            .collect::<Result<Vec<_>, ExecError>>()?;
+
+        records.sort_by(|a, b| a.filled_at.cmp(&b.filled_at));
+
+        Ok(records)
     }
 }
 

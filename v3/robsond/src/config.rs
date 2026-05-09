@@ -146,16 +146,63 @@ impl Default for PositionMonitorConfig {
     }
 }
 
+/// Policy controlling daemon behavior when stale-Active positions are detected
+/// at startup (Amendment §3 of TD-2026-05-05-001).
+///
+/// In Slice 5A only `Abort` is accepted. Unknown values produce a config error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum StartupStaleActivePolicy {
+    /// Fail closed: log CRITICAL, return exit code 78, refuse to start.
+    #[default]
+    Abort,
+}
+
+impl std::fmt::Display for StartupStaleActivePolicy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Abort => write!(f, "abort"),
+        }
+    }
+}
+
+impl std::str::FromStr for StartupStaleActivePolicy {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s.to_lowercase().as_str() {
+            "abort" => Ok(Self::Abort),
+            other => Err(format!(
+                "Unknown ROBSON_RECONCILIATION_ON_STARTUP_STALE_ACTIVE value: \"{}\". \
+                 Accepted: abort",
+                other
+            )),
+        }
+    }
+}
+
 /// Reconciliation worker configuration.
 #[derive(Debug, Clone)]
 pub struct ReconciliationConfig {
     /// Interval between full account reconciliation scans.
     pub interval_secs: u64,
+    /// Grace period before a missing Active position triggers a close attempt.
+    /// Controls the periodic worker; the startup gate is always immediate.
+    ///
+    /// Env: `ROBSON_RECONCILIATION_MISSING_GRACE_SECS` (default: 60)
+    pub missing_grace_secs: u64,
+    /// Behavior when stale-Active positions are found at startup.
+    ///
+    /// Env: `ROBSON_RECONCILIATION_ON_STARTUP_STALE_ACTIVE` (default: abort)
+    pub on_startup_stale_active: StartupStaleActivePolicy,
 }
 
 impl Default for ReconciliationConfig {
     fn default() -> Self {
-        Self { interval_secs: 60 }
+        Self {
+            interval_secs: 60,
+            missing_grace_secs: 60,
+            on_startup_stale_active: StartupStaleActivePolicy::Abort,
+        }
     }
 }
 
@@ -236,7 +283,11 @@ impl Config {
                 binance_api_key: None,
                 binance_api_secret: None,
             },
-            reconciliation: ReconciliationConfig { interval_secs: 1 },
+            reconciliation: ReconciliationConfig {
+                interval_secs: 1,
+                missing_grace_secs: 60,
+                on_startup_stale_active: StartupStaleActivePolicy::Abort,
+            },
             environment: Environment::Test,
         }
     }
@@ -455,7 +506,26 @@ impl Config {
             ));
         }
 
-        Ok(ReconciliationConfig { interval_secs })
+        let grace_str = env::var("ROBSON_RECONCILIATION_MISSING_GRACE_SECS")
+            .unwrap_or_else(|_| "60".to_string());
+        let missing_grace_secs = grace_str.parse::<u64>().map_err(|_| {
+            DaemonError::Config(format!(
+                "Invalid ROBSON_RECONCILIATION_MISSING_GRACE_SECS: {}",
+                grace_str
+            ))
+        })?;
+
+        let on_startup_stale_active =
+            match env::var("ROBSON_RECONCILIATION_ON_STARTUP_STALE_ACTIVE") {
+                Ok(val) => val.parse::<StartupStaleActivePolicy>().map_err(DaemonError::Config)?,
+                Err(_) => StartupStaleActivePolicy::default(),
+            };
+
+        Ok(ReconciliationConfig {
+            interval_secs,
+            missing_grace_secs,
+            on_startup_stale_active,
+        })
     }
 }
 
@@ -560,6 +630,8 @@ mod tests {
         assert!(config.market_data.symbols.is_empty());
         assert!(config.position_monitor.symbols.is_empty());
         assert_eq!(config.reconciliation.interval_secs, 60);
+        assert_eq!(config.reconciliation.missing_grace_secs, 60);
+        assert_eq!(config.reconciliation.on_startup_stale_active, StartupStaleActivePolicy::Abort);
     }
 
     #[test]
@@ -662,5 +734,54 @@ mod tests {
             DaemonError::Config(message)
                 if message == "ROBSON_RECONCILIATION_INTERVAL_SECS must be greater than 0"
         ));
+    }
+
+    #[test]
+    fn test_reconciliation_config_defaults() {
+        let config = ReconciliationConfig::default();
+        assert_eq!(config.interval_secs, 60);
+        assert_eq!(config.missing_grace_secs, 60);
+        assert_eq!(config.on_startup_stale_active, StartupStaleActivePolicy::Abort);
+    }
+
+    #[test]
+    fn test_load_missing_grace_secs_from_env() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_RECONCILIATION_INTERVAL_SECS", None),
+            ("ROBSON_RECONCILIATION_MISSING_GRACE_SECS", Some("120")),
+            ("ROBSON_RECONCILIATION_ON_STARTUP_STALE_ACTIVE", None),
+        ]);
+
+        let config = Config::load_reconciliation_config().unwrap();
+        assert_eq!(config.missing_grace_secs, 120);
+    }
+
+    #[test]
+    fn test_load_startup_policy_abort_from_env() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_RECONCILIATION_INTERVAL_SECS", None),
+            ("ROBSON_RECONCILIATION_MISSING_GRACE_SECS", None),
+            ("ROBSON_RECONCILIATION_ON_STARTUP_STALE_ACTIVE", Some("abort")),
+        ]);
+
+        let config = Config::load_reconciliation_config().unwrap();
+        assert_eq!(config.on_startup_stale_active, StartupStaleActivePolicy::Abort);
+    }
+
+    #[test]
+    fn test_load_startup_policy_unknown_is_config_error() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[(
+            "ROBSON_RECONCILIATION_ON_STARTUP_STALE_ACTIVE",
+            Some("auto_reconcile"),
+        )]);
+
+        let err = Config::load_reconciliation_config().unwrap_err();
+        assert!(
+            matches!(err, DaemonError::Config(ref msg) if msg.contains("auto_reconcile")),
+            "expected config error for unknown policy, got: {err:?}"
+        );
     }
 }

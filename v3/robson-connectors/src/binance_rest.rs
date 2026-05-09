@@ -524,6 +524,35 @@ impl BinanceRestClient {
         }
     }
 
+    /// Query user trade history for a symbol.
+    ///
+    /// `GET /fapi/v1/userTrades` (signed).
+    ///
+    /// Returns trades ordered oldest-first (Binance default).
+    pub async fn get_user_trades(
+        &self,
+        symbol: &str,
+        start_time_ms: i64,
+        limit: u16,
+    ) -> Result<Vec<BinanceUserTrade>, BinanceRestError> {
+        if limit == 0 || limit > 1000 {
+            return Err(BinanceRestError::InvalidParameter(format!(
+                "userTrades limit must be between 1 and 1000, got {}",
+                limit
+            )));
+        }
+
+        let params = vec![
+            ("symbol", symbol.to_string()),
+            ("startTime", start_time_ms.to_string()),
+            ("limit", limit.to_string()),
+        ];
+
+        let body = self.get_signed("/fapi/v1/userTrades", params).await?;
+
+        serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
+    }
+
     /// Get USDT-M futures account balance.
     ///
     /// `GET /fapi/v2/balance` (signed).
@@ -679,6 +708,32 @@ struct BinanceBalanceResponse {
     asset: String,
     balance: Decimal,
     availableBalance: Decimal,
+}
+
+/// Individual user trade from Binance USD-M futures.
+///
+/// Response from `GET /fapi/v1/userTrades`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceUserTrade {
+    /// Trade ID
+    pub id: u64,
+    /// Order ID
+    pub order_id: u64,
+    /// Symbol
+    pub symbol: String,
+    /// Fill price
+    pub price: Decimal,
+    /// Filled quantity
+    pub qty: Decimal,
+    /// Quote quantity
+    pub quote_qty: Decimal,
+    /// Commission (fee)
+    pub commission: Decimal,
+    /// Commission asset (fee asset)
+    pub commission_asset: String,
+    /// Trade time (ms since epoch)
+    pub time: i64,
 }
 
 /// Parsed USDT-M futures balance for the USDT asset.

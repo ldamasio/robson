@@ -345,6 +345,7 @@ async fn regression_btcusdt_019db3dc_runtime_and_projection_converge_after_repla
         exit_price: Price::new(dec!(74868.00)).unwrap(),
         realized_pnl: (dec!(74868.00) - dec!(77932.40)) * dec!(0.010),
         total_fees: dec!(0),
+        closure_evidence: robson_domain::ClosureEvidence::real_exit_fill(None),
         timestamp: Utc::now(),
     };
     store.events().append(&closed_event).await.unwrap();

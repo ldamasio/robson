@@ -181,6 +181,8 @@ pub(crate) fn map_daemon_event(event: &DaemonEvent) -> Option<PublicSseEvent> {
         | DaemonEvent::DomainEvent(_)
         | DaemonEvent::MarketData(_)
         | DaemonEvent::OrderFill(_)
+        | DaemonEvent::ReconciliationStaleNonActiveDetected { .. }
+        | DaemonEvent::ReconciliationStaleActiveUnresolved { .. }
         | DaemonEvent::Shutdown => None,
     }
 }

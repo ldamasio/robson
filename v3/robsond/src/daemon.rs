@@ -24,7 +24,7 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Utc};
 use robson_connectors::BinanceRestClient;
-use robson_domain::{Position, PositionId, Symbol, TradingPolicy};
+use robson_domain::{Position, PositionId, PositionState, Symbol, TradingPolicy};
 use robson_engine::Engine;
 use robson_exec::{ExchangePort, Executor, IntentJournal, StubExchange};
 #[cfg(feature = "postgres")]
@@ -53,8 +53,8 @@ use crate::{
     api::{create_router, ApiState},
     binance_exchange::BinanceExchangeAdapter,
     binance_ohlcv::BinanceOhlcvAdapter,
-    config::Config,
-    error::{DaemonError, DaemonResult},
+    config::{Config, StartupStaleActivePolicy},
+    error::{DaemonError, DaemonResult, StartupStaleActiveInfo},
     event_bus::{DaemonEvent, EventBus},
     market_data::MarketDataManager,
     position_manager::PositionManager,
@@ -476,12 +476,21 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         // 3. Restore active positions
         self.restore_positions().await?;
 
+        // 3a. Startup stale-active gate (fail-closed; exit code 78 on abort).
+        // Runs immediately — no grace period. Must precede the UNTRACKED scan.
+        info!("Running startup stale-active gate");
+        self.run_startup_stale_active_gate().await?;
+        info!("Startup stale-active gate: passed");
+
         let reconciliation_interval = Duration::from_secs(self.config.reconciliation.interval_secs);
-        let startup_reconciliation = ReconciliationWorker::new(
+        let missing_grace = Duration::from_secs(self.config.reconciliation.missing_grace_secs);
+        let startup_reconciliation = ReconciliationWorker::new_with_missing_grace(
             Arc::clone(&self.exchange),
+            Arc::clone(&self.position_manager),
             Arc::clone(&self.store),
             Arc::clone(&self.event_bus),
             reconciliation_interval,
+            missing_grace,
             shutdown.clone(),
         );
         info!("Running startup reconciliation scan");
@@ -526,12 +535,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         let api_addr = self.start_api_server(position_monitor.clone()).await?;
         info!(%api_addr, "API server started");
 
-        // 6. Spawn reconciliation worker
-        let reconciliation_worker = ReconciliationWorker::new(
+        // 6. Spawn reconciliation worker (uses explicit missing_grace from config)
+        let reconciliation_worker = ReconciliationWorker::new_with_missing_grace(
             Arc::clone(&self.exchange),
+            Arc::clone(&self.position_manager),
             Arc::clone(&self.store),
             Arc::clone(&self.event_bus),
             reconciliation_interval,
+            missing_grace,
             shutdown.clone(),
         );
         let reconciliation_handle = tokio::spawn(async move {
@@ -791,6 +802,59 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                 Some(risk.max(rust_decimal::Decimal::ZERO))
             })
             .sum()
+    }
+
+    /// Check for stale-Active positions at startup and abort if any are found.
+    ///
+    /// Runs immediately after `restore_positions()` and before the UNTRACKED
+    /// scan. The startup gate is unconditional (no grace period). If any local
+    /// `Active` position is absent from the exchange the daemon refuses to
+    /// start (exit code 78). `Entering` and `Exiting` positions are ignored.
+    async fn run_startup_stale_active_gate(&self) -> DaemonResult<()> {
+        match self.config.reconciliation.on_startup_stale_active {
+            StartupStaleActivePolicy::Abort => self.abort_if_stale_active().await,
+        }
+    }
+
+    async fn abort_if_stale_active(&self) -> DaemonResult<()> {
+        let exchange_positions = self.exchange.get_all_open_positions().await?;
+        let local_positions = self.store.positions().find_active().await?;
+
+        let mut stale: Vec<StartupStaleActiveInfo> = Vec::new();
+
+        for position in &local_positions {
+            if !matches!(position.state, PositionState::Active { .. }) {
+                continue;
+            }
+
+            let present_on_exchange = exchange_positions
+                .iter()
+                .any(|ep| ep.symbol == position.symbol && ep.side == position.side);
+
+            if !present_on_exchange {
+                error!(
+                    position_id = %position.id,
+                    symbol = %position.symbol.as_pair(),
+                    side = ?position.side,
+                    quantity = %position.quantity,
+                    "CRITICAL: Startup gate: Robson-Active position absent from exchange"
+                );
+                stale.push(StartupStaleActiveInfo {
+                    position_id: position.id,
+                    symbol: position.symbol.as_pair(),
+                    side: format!("{:?}", position.side),
+                    quantity: position.quantity.as_decimal(),
+                    entry_price: position.entry_price.map(|p| p.as_decimal()),
+                });
+            }
+        }
+
+        if stale.is_empty() {
+            info!("Startup stale-active gate: clean");
+            return Ok(());
+        }
+
+        Err(DaemonError::StartupStaleActiveDetected { count: stale.len(), positions: stale })
     }
 
     /// Rebuild store from EventLog on startup (crash recovery).
@@ -1148,6 +1212,42 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                 );
             },
 
+            DaemonEvent::ReconciliationStaleNonActiveDetected {
+                position_id,
+                state,
+                symbol,
+                side,
+                observed_at,
+            } => {
+                warn!(
+                    %position_id,
+                    %state,
+                    %symbol,
+                    ?side,
+                    %observed_at,
+                    "Reverse reconciliation detected stale non-Active position, skipped"
+                );
+            },
+
+            DaemonEvent::ReconciliationStaleActiveUnresolved {
+                position_id,
+                symbol,
+                side,
+                first_observed_missing_at,
+                confirmed_missing_at,
+                reason,
+            } => {
+                error!(
+                    %position_id,
+                    %symbol,
+                    ?side,
+                    %first_observed_missing_at,
+                    %confirmed_missing_at,
+                    %reason,
+                    "Reverse reconciliation stale Active unresolved"
+                );
+            },
+
             DaemonEvent::SafetyPanic {
                 position_id,
                 symbol,
@@ -1473,5 +1573,98 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(projected_state, "Expired");
+    }
+
+    // -------------------------------------------------------------------------
+    // TD-2026-05-05-001 Slice 5A — Startup stale-active gate tests
+    // -------------------------------------------------------------------------
+
+    fn active_position(symbol: robson_domain::Symbol, side: Side) -> robson_domain::Position {
+        use rust_decimal_macros::dec;
+        let mut pos = robson_domain::Position::new(uuid::Uuid::now_v7(), symbol, side);
+        pos.entry_price = Some(Price::new(dec!(100)).unwrap());
+        pos.quantity = Quantity::new(dec!(0.010)).unwrap();
+        pos.state = PositionState::Active {
+            current_price: Price::new(dec!(101)).unwrap(),
+            trailing_stop: Price::new(dec!(99)).unwrap(),
+            favorable_extreme: Price::new(dec!(101)).unwrap(),
+            extreme_at: chrono::Utc::now(),
+            insurance_stop_id: None,
+            last_emitted_stop: None,
+        };
+        pos
+    }
+
+    #[tokio::test]
+    async fn test_startup_gate_clean_no_positions() {
+        let daemon = Daemon::new_stub(Config::test());
+        // Store empty, exchange empty → gate passes.
+        daemon.abort_if_stale_active().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_startup_gate_stale_active_returns_typed_error() {
+        use robson_domain::Symbol;
+        let daemon = Daemon::new_stub(Config::test());
+
+        let position = active_position(Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        daemon.store.positions().save(&position).await.unwrap();
+        // Exchange returns empty — position is stale-active.
+
+        let err = daemon.abort_if_stale_active().await.unwrap_err();
+        assert!(
+            matches!(err, DaemonError::StartupStaleActiveDetected { count: 1, .. }),
+            "expected StartupStaleActiveDetected with count 1, got: {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_startup_gate_stale_active_does_not_mutate_store() {
+        use robson_domain::Symbol;
+        let daemon = Daemon::new_stub(Config::test());
+
+        let position = active_position(Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        let pid = position.id;
+        daemon.store.positions().save(&position).await.unwrap();
+
+        let _ = daemon.abort_if_stale_active().await;
+
+        let stored = daemon.store.positions().find_by_id(pid).await.unwrap().unwrap();
+        assert!(
+            matches!(stored.state, PositionState::Active { .. }),
+            "gate must not close or mutate the position"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_startup_gate_entering_does_not_abort() {
+        use robson_domain::Symbol;
+        let daemon = Daemon::new_stub(Config::test());
+
+        let mut pos = active_position(Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        pos.state = PositionState::Entering {
+            entry_order_id: uuid::Uuid::now_v7(),
+            expected_entry: Price::new(rust_decimal_macros::dec!(100)).unwrap(),
+            signal_id: uuid::Uuid::now_v7(),
+        };
+        daemon.store.positions().save(&pos).await.unwrap();
+
+        // Entering missing on exchange must NOT cause abort.
+        daemon.abort_if_stale_active().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_startup_gate_exiting_does_not_abort() {
+        use robson_domain::{ExitReason, Symbol};
+        let daemon = Daemon::new_stub(Config::test());
+
+        let mut pos = active_position(Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        pos.state = PositionState::Exiting {
+            exit_order_id: uuid::Uuid::now_v7(),
+            exit_reason: ExitReason::TrailingStop,
+        };
+        daemon.store.positions().save(&pos).await.unwrap();
+
+        daemon.abort_if_stale_active().await.unwrap();
     }
 }

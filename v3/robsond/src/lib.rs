@@ -67,11 +67,11 @@ pub use binance_ohlcv::BinanceOhlcvAdapter;
 pub use circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot};
 pub use config::{
     ApiConfig, Config, EngineConfig, Environment, MarketDataConfig, PositionMonitorConfig,
-    ProjectionConfig, ReconciliationConfig,
+    ProjectionConfig, ReconciliationConfig, StartupStaleActivePolicy,
 };
 pub use daemon::Daemon;
 pub use detector::{DetectorConfig, DetectorTask};
-pub use error::{DaemonError, DaemonResult};
+pub use error::{exit_code_for_daemon_error, DaemonError, DaemonResult};
 pub use event_bus::{DaemonEvent, EventBus, EventReceiver, MarketData, OrderFill};
 pub use position_manager::PositionManager;
 pub use position_monitor::{MonitorError, PositionMonitor, PositionMonitorConfig as MonitorConfig};

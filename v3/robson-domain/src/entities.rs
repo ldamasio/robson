@@ -358,6 +358,192 @@ pub enum ExitReason {
     PositionError,
     /// User disarmed the position before any entry order was placed
     DisarmedByUser,
+    /// Reverse reconciliation closed a Robson `Active` position whose
+    /// counterpart had disappeared from the exchange (liquidation, manual
+    /// close, externally-resident insurance stop fill, etc.).
+    ///
+    /// See `docs/policies/UNTRACKED-POSITION-RECONCILIATION.md` (I3) and
+    /// `docs/implementation/TD-2026-05-05-001-CORE-LIFECYCLE-DRIFT.md`.
+    ReconciledMissingOnExchange,
+}
+
+// =============================================================================
+// Closure Evidence (TD-2026-05-05-001)
+// =============================================================================
+
+/// Source of a real exchange fill that closed a position.
+///
+/// Discriminator inside [`RealFillEvidence`]; identifies which lifecycle
+/// path produced the fill. Default is [`Self::ExitFill`] — the canonical
+/// `Active → Exiting → Closed` path.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ExitOrderFillSource {
+    /// Exit order placed via the daemon's normal exit path.
+    #[default]
+    ExitFill,
+    /// Insurance stop order resident on the exchange was filled.
+    InsuranceStopFill,
+}
+
+/// Evidence captured when a position was closed by a real exchange fill.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct RealFillEvidence {
+    /// Lifecycle path that produced the fill.
+    pub source: ExitOrderFillSource,
+    /// Exchange-assigned order id, when known.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub exchange_order_id: Option<String>,
+}
+
+/// Specific exchange order confirmed filled via `GET /fapi/v1/order`
+/// (highest-fidelity reconciliation evidence).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct OrderFillEvidence {
+    /// Exchange-assigned order id (the order whose fill closed the position).
+    pub exchange_order_id: String,
+    /// Fill price reported by the exchange.
+    pub fill_price: Price,
+    /// Filled quantity reported by the exchange.
+    pub filled_quantity: Quantity,
+    /// Trading fee paid.
+    pub fee: rust_decimal::Decimal,
+    /// Fee asset (e.g. "USDT", "BNB").
+    pub fee_asset: String,
+    /// When the fill occurred (exchange-reported).
+    pub filled_at: DateTime<Utc>,
+}
+
+/// User trade history record covering the gap between last-known-active
+/// and the missing observation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct UserTradeEvidence {
+    /// Exchange-assigned order id of the originating order.
+    pub exchange_order_id: String,
+    /// Exchange-assigned trade id.
+    pub exchange_trade_id: String,
+    /// Fill price reported by the exchange.
+    pub fill_price: Price,
+    /// Filled quantity reported by the exchange.
+    pub filled_quantity: Quantity,
+    /// Trading fee paid.
+    pub fee: rust_decimal::Decimal,
+    /// Fee asset.
+    pub fee_asset: String,
+    /// When the trade occurred (exchange-reported).
+    pub filled_at: DateTime<Utc>,
+}
+
+/// Account-level evidence proving the position is zero on the exchange.
+///
+/// Two consecutive `get_all_open_positions()` snapshots are required;
+/// the close is finalized only after the second confirms absence.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AccountSnapshotEvidence {
+    /// First observation that the position was missing on the exchange.
+    pub first_observed_missing_at: DateTime<Utc>,
+    /// Second consecutive observation (after the grace period) that
+    /// confirmed the position is gone.
+    pub confirmed_missing_at: DateTime<Utc>,
+    /// Optional change in futures wallet balance between the two
+    /// observations, when available.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub futures_balance_delta: Option<rust_decimal::Decimal>,
+}
+
+/// Basis used to estimate the exit price when no fill record exists.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum EstimationBasis {
+    /// Use the trailing stop price recorded in `PositionState::Active`
+    /// at the moment the drift was detected.
+    TrailingStopAtDetection,
+    /// Use the exchange-reported mark price at detection time.
+    ExchangeMarkPrice,
+    /// Use the last price observed by the daemon prior to detection.
+    LastObservedPrice,
+}
+
+/// Estimated terminal-price evidence — last-resort source.
+///
+/// Realized PnL derived from this evidence MUST be flagged as
+/// estimated (not real) by downstream consumers. The daemon emits a
+/// `CRITICAL` alert and increments
+/// `robson_reconciliation_estimated_closes_total` on every close that
+/// reaches this branch.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct EstimatedEvidence {
+    /// How the exit price was estimated.
+    pub estimation_basis: EstimationBasis,
+    /// Estimated exit price.
+    pub exit_price: Price,
+    /// Optional identity of the evaluator that produced the estimate
+    /// (e.g. `"operator:ldamasio"`, `"auto:reconcile_close"`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub evaluator: Option<String>,
+    /// When the drift was detected and the estimate was sealed.
+    pub detected_at: DateTime<Utc>,
+}
+
+/// Evidence sources for a reverse-reconciliation close, in priority order.
+///
+/// See `docs/implementation/TD-2026-05-05-001-CORE-LIFECYCLE-DRIFT.md`
+/// (Amendment §2 — Evidence ordering, no silent fallback).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "source", content = "data", rename_all = "snake_case")]
+pub enum ReconciliationEvidence {
+    /// Specific exchange order (typically the `insurance_stop_id`)
+    /// confirmed filled. Highest fidelity.
+    OrderFillRecord(OrderFillEvidence),
+    /// Per-symbol user trade record covering the drift window.
+    UserTradeRecord(UserTradeEvidence),
+    /// Two consecutive empty snapshots prove the position is gone.
+    /// No fill data available; exit price must be carried separately.
+    AccountSnapshot(AccountSnapshotEvidence),
+    /// Last resort: estimated terminal price. Operator-driven or
+    /// explicitly opted-in via runbook.
+    Estimated(EstimatedEvidence),
+}
+
+/// Provenance of a `PositionClosed` event.
+///
+/// Default is [`Self::RealFill`] with [`ExitOrderFillSource::ExitFill`] —
+/// preserves the historical contract for events written before
+/// TD-2026-05-05-001 landed (legacy events deserialize to this default
+/// via `#[serde(default)]` on `Event::PositionClosed::closure_evidence`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(tag = "kind", content = "evidence", rename_all = "snake_case")]
+pub enum ClosureEvidence {
+    /// Position closed via a real exchange fill (canonical path).
+    RealFill(RealFillEvidence),
+    /// Position closed via reverse reconciliation against the exchange.
+    Reconciled(ReconciliationEvidence),
+}
+
+impl Default for ClosureEvidence {
+    fn default() -> Self {
+        ClosureEvidence::RealFill(RealFillEvidence::default())
+    }
+}
+
+impl ClosureEvidence {
+    /// Convenience constructor for the canonical exit-fill path.
+    pub fn real_exit_fill(exchange_order_id: Option<String>) -> Self {
+        ClosureEvidence::RealFill(RealFillEvidence {
+            source: ExitOrderFillSource::ExitFill,
+            exchange_order_id,
+        })
+    }
+
+    /// `true` if the close came from a real fill (any source).
+    pub fn is_real_fill(&self) -> bool {
+        matches!(self, ClosureEvidence::RealFill(_))
+    }
+
+    /// `true` if the close came from reverse reconciliation.
+    pub fn is_reconciled(&self) -> bool {
+        matches!(self, ClosureEvidence::Reconciled(_))
+    }
 }
 
 // =============================================================================
