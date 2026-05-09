@@ -285,6 +285,36 @@ pub struct ErrorResponse {
 }
 
 // =============================================================================
+// Reconcile Close Types (Slice 5B1)
+// =============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ReconcileCloseRequest {
+    pub position_id: Uuid,
+    pub evidence: robson_domain::ReconciliationEvidence,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReconcileCloseSuccessResponse {
+    pub status: String,
+    pub position_id: Uuid,
+    pub realized_pnl: String,
+    pub exit_price: String,
+    pub closure_evidence: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReconcileCloseErrorResponse {
+    pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_state: Option<String>,
+}
+
+// =============================================================================
 // Safety Net Types
 // =============================================================================
 
@@ -433,6 +463,8 @@ where
         .route("/panic", post(panic_handler))
         // MonthlyHalt trigger (mutating)
         .route("/monthly-halt", post(monthly_halt_trigger_handler))
+        // Manual reconciliation close (Slice 5B1)
+        .route("/reconcile-close", post(reconcile_close_handler))
         .layer(auth_layer)
         .with_state(state);
 
@@ -921,6 +953,183 @@ where
         query_id: query.id,
         state: format!("{:?}", query.state),
     }))
+}
+
+/// `POST /reconcile-close` — operator-driven manual reconciliation close.
+///
+/// Accepts real evidence (`OrderFillRecord` or `UserTradeRecord`) and closes
+/// a stale-Active position. Rejects `AccountSnapshot` and `Estimated` in
+/// Slice 5B1.
+async fn reconcile_close_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    Json(req): Json<ReconcileCloseRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    use robson_domain::ReconciliationEvidence;
+
+    // Reject unsupported evidence types before touching position manager.
+    match &req.evidence {
+        ReconciliationEvidence::AccountSnapshot(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ReconcileCloseErrorResponse {
+                    error: "unsupported_evidence".to_string(),
+                    details: Some(
+                        "account_snapshot evidence is not supported in Slice 5B1".to_string(),
+                    ),
+                    position_id: None,
+                    current_state: None,
+                })
+                .unwrap()),
+            ));
+        },
+        ReconciliationEvidence::Estimated(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ReconcileCloseErrorResponse {
+                    error: "unsupported_evidence".to_string(),
+                    details: Some(
+                        "estimated evidence is not supported in Slice 5B1".to_string(),
+                    ),
+                    position_id: None,
+                    current_state: None,
+                })
+                .unwrap()),
+            ));
+        },
+        _ => {},
+    }
+
+    // Build ReconciledCloseInput from the request evidence.
+    let (exit_price, filled_quantity, fee, fee_asset, closed_at) = match &req.evidence {
+        ReconciliationEvidence::OrderFillRecord(e) => {
+            (e.fill_price, e.filled_quantity, e.fee, e.fee_asset.clone(), e.filled_at)
+        },
+        ReconciliationEvidence::UserTradeRecord(e) => {
+            (e.fill_price, e.filled_quantity, e.fee, e.fee_asset.clone(), e.filled_at)
+        },
+        _ => unreachable!("guarded above"),
+    };
+
+    let input = crate::position_manager::ReconciledCloseInput {
+        position_id: req.position_id,
+        exit_price,
+        filled_quantity,
+        fee,
+        fee_asset,
+        closed_at,
+        evidence: req.evidence,
+    };
+
+    let manager = state.position_manager.write().await;
+    let outcome = manager.reconcile_close(input).await.map_err(|e| match e {
+        DaemonError::PositionNotFound(id) => (
+            StatusCode::NOT_FOUND,
+            Json(serde_json::to_value(ReconcileCloseErrorResponse {
+                error: "position_not_found".to_string(),
+                details: None,
+                position_id: Some(id),
+                current_state: None,
+            })
+            .unwrap()),
+        ),
+        other => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": other.to_string() })),
+        ),
+    })?;
+
+    match outcome {
+        crate::position_manager::ReconcileCloseOutcome::Closed => {
+            // Reload position to get the realized PnL from state.
+            let position = manager
+                .get_position(req.position_id)
+                .await
+                .ok()
+                .flatten();
+            let (realized_pnl, exit_price_val, closure_evidence) = match &position {
+                Some(p) => match &p.state {
+                    PositionState::Closed { realized_pnl, exit_price: ep, exit_reason, .. } => {
+                        let ce = serde_json::json!({
+                            "kind": "reconciled",
+                            "exit_reason": format!("{:?}", exit_reason),
+                        });
+                        (*realized_pnl, ep.as_decimal(), ce)
+                    },
+                    _ => (rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO, serde_json::json!({})),
+                },
+                None => (rust_decimal::Decimal::ZERO, rust_decimal::Decimal::ZERO, serde_json::json!({})),
+            };
+            let resp = ReconcileCloseSuccessResponse {
+                status: "closed".to_string(),
+                position_id: req.position_id,
+                realized_pnl: realized_pnl.to_string(),
+                exit_price: exit_price_val.to_string(),
+                closure_evidence,
+            };
+            Ok((StatusCode::OK, Json(serde_json::to_value(resp).unwrap())))
+        },
+        crate::position_manager::ReconcileCloseOutcome::AlreadyTerminal => {
+            // Reload to report current state.
+            let current_state = manager
+                .get_position(req.position_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|p| p.state.name().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            Err((
+                StatusCode::CONFLICT,
+                Json(serde_json::to_value(ReconcileCloseErrorResponse {
+                    error: "position_not_active".to_string(),
+                    details: Some("Position is already terminal".to_string()),
+                    position_id: Some(req.position_id),
+                    current_state: Some(current_state),
+                })
+                .unwrap()),
+            ))
+        },
+        crate::position_manager::ReconcileCloseOutcome::SkippedNonActive { state } => Err((
+            StatusCode::CONFLICT,
+            Json(serde_json::to_value(ReconcileCloseErrorResponse {
+                error: "position_not_active".to_string(),
+                details: Some(format!("Position is in {} state, expected Active", state)),
+                position_id: Some(req.position_id),
+                current_state: Some(state),
+            })
+            .unwrap()),
+        )),
+        crate::position_manager::ReconcileCloseOutcome::RejectedUnsupportedEvidence { source } => {
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ReconcileCloseErrorResponse {
+                    error: "unsupported_evidence".to_string(),
+                    details: Some(format!(
+                        "{} evidence is not supported in Slice 5B1",
+                        source
+                    )),
+                    position_id: None,
+                    current_state: None,
+                })
+                .unwrap()),
+            ))
+        },
+        crate::position_manager::ReconcileCloseOutcome::RejectedInconsistentEvidence { field } => {
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(serde_json::to_value(ReconcileCloseErrorResponse {
+                    error: "inconsistent_evidence".to_string(),
+                    details: Some(format!("field={} mismatches evidence", field)),
+                    position_id: Some(req.position_id),
+                    current_state: None,
+                })
+                .unwrap()),
+            ))
+        },
+    }
 }
 
 // =============================================================================
