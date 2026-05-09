@@ -23,8 +23,9 @@ use std::{collections::HashMap, sync::Arc};
 
 use chrono::Datelike;
 use robson_domain::{
-    DetectorSignal, EntryPolicyConfig, Event, Position, PositionId, PositionState, Price, Quantity,
-    RiskConfig, Side, Symbol, TechnicalStopDistance, TradingPolicy,
+    ClosureEvidence, DetectorSignal, EntryPolicyConfig, Event, Position, PositionId, PositionState,
+    Price, Quantity, ReconciliationEvidence, RiskConfig, Side, Symbol, TechnicalStopDistance,
+    TradingPolicy,
 };
 use robson_engine::{
     Engine, EngineAction, EngineDecision, PositionSummary, ProposedTrade, RiskContext, RiskGate,
@@ -73,6 +74,29 @@ struct PendingApprovalRecord {
     position: Position,
     proposed: ProposedTrade,
     governed: GovernedAction,
+}
+
+/// Real exchange evidence used to close a stale Active position by reverse
+/// reconciliation.
+#[derive(Debug, Clone)]
+pub(crate) struct ReconciledCloseInput {
+    pub position_id: PositionId,
+    pub exit_price: Price,
+    pub filled_quantity: Quantity,
+    pub fee: Decimal,
+    pub fee_asset: String,
+    pub closed_at: chrono::DateTime<chrono::Utc>,
+    pub evidence: ReconciliationEvidence,
+}
+
+/// Result of an attempted reverse-reconciliation close.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum ReconcileCloseOutcome {
+    Closed,
+    AlreadyTerminal,
+    SkippedNonActive { state: String },
+    RejectedUnsupportedEvidence { source: &'static str },
+    RejectedInconsistentEvidence { field: &'static str },
 }
 
 /// Manages position lifecycle and detector tasks.
@@ -1018,12 +1042,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         {
             let mut pending_approvals = self.pending_approvals.write().await;
-            pending_approvals.insert(query_id, PendingApprovalRecord {
-                query,
-                position,
-                proposed,
-                governed,
-            });
+            pending_approvals
+                .insert(query_id, PendingApprovalRecord { query, position, proposed, governed });
         }
 
         let pending_approvals = self.pending_approvals.read().await;
@@ -2566,6 +2586,176 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self.evaluate_monthly_halt().await;
 
         Ok(())
+    }
+
+    /// Close a stale `Active` position using real exchange evidence gathered by
+    /// reverse reconciliation.
+    ///
+    /// Slice 4A intentionally accepts only real fill/trade evidence. Snapshot
+    /// and estimated evidence prove absence but do not prove a real exit price,
+    /// so they are rejected without changing local lifecycle state.
+    pub(crate) async fn reconcile_close(
+        &self,
+        input: ReconciledCloseInput,
+    ) -> DaemonResult<ReconcileCloseOutcome> {
+        let position = self
+            .store
+            .positions()
+            .find_by_id(input.position_id)
+            .await?
+            .ok_or(DaemonError::PositionNotFound(input.position_id))?;
+
+        match &position.state {
+            PositionState::Closed { .. }
+            | PositionState::Cancelled
+            | PositionState::Error { .. } => {
+                debug!(
+                    position_id = %input.position_id,
+                    state = %position.state.name(),
+                    "Reverse reconciliation close skipped: position is already terminal"
+                );
+                return Ok(ReconcileCloseOutcome::AlreadyTerminal);
+            },
+            PositionState::Active { .. } => {},
+            other => {
+                warn!(
+                    position_id = %input.position_id,
+                    state = ?other,
+                    "Reverse reconciliation close skipped: position is not Active"
+                );
+                return Ok(ReconcileCloseOutcome::SkippedNonActive {
+                    state: position.state.name().to_string(),
+                });
+            },
+        }
+
+        let evidence_source = match &input.evidence {
+            ReconciliationEvidence::OrderFillRecord(evidence) => {
+                if input.exit_price != evidence.fill_price {
+                    return Ok(ReconcileCloseOutcome::RejectedInconsistentEvidence {
+                        field: "exit_price",
+                    });
+                }
+                if input.filled_quantity != evidence.filled_quantity {
+                    return Ok(ReconcileCloseOutcome::RejectedInconsistentEvidence {
+                        field: "filled_quantity",
+                    });
+                }
+                if input.fee != evidence.fee {
+                    return Ok(ReconcileCloseOutcome::RejectedInconsistentEvidence {
+                        field: "fee",
+                    });
+                }
+                if input.fee_asset != evidence.fee_asset {
+                    return Ok(ReconcileCloseOutcome::RejectedInconsistentEvidence {
+                        field: "fee_asset",
+                    });
+                }
+                if input.closed_at != evidence.filled_at {
+                    return Ok(ReconcileCloseOutcome::RejectedInconsistentEvidence {
+                        field: "closed_at",
+                    });
+                }
+                "order_fill_record"
+            },
+            ReconciliationEvidence::UserTradeRecord(evidence) => {
+                if input.exit_price != evidence.fill_price {
+                    return Ok(ReconcileCloseOutcome::RejectedInconsistentEvidence {
+                        field: "exit_price",
+                    });
+                }
+                if input.filled_quantity != evidence.filled_quantity {
+                    return Ok(ReconcileCloseOutcome::RejectedInconsistentEvidence {
+                        field: "filled_quantity",
+                    });
+                }
+                if input.fee != evidence.fee {
+                    return Ok(ReconcileCloseOutcome::RejectedInconsistentEvidence {
+                        field: "fee",
+                    });
+                }
+                if input.fee_asset != evidence.fee_asset {
+                    return Ok(ReconcileCloseOutcome::RejectedInconsistentEvidence {
+                        field: "fee_asset",
+                    });
+                }
+                if input.closed_at != evidence.filled_at {
+                    return Ok(ReconcileCloseOutcome::RejectedInconsistentEvidence {
+                        field: "closed_at",
+                    });
+                }
+                "user_trade_record"
+            },
+            ReconciliationEvidence::AccountSnapshot(_) => {
+                warn!(
+                    position_id = %input.position_id,
+                    "Reverse reconciliation close rejected: account snapshot is not real fill evidence"
+                );
+                return Ok(ReconcileCloseOutcome::RejectedUnsupportedEvidence {
+                    source: "account_snapshot",
+                });
+            },
+            ReconciliationEvidence::Estimated(_) => {
+                warn!(
+                    position_id = %input.position_id,
+                    "Reverse reconciliation close rejected: estimated evidence is not allowed in Slice 4A"
+                );
+                return Ok(ReconcileCloseOutcome::RejectedUnsupportedEvidence {
+                    source: "estimated",
+                });
+            },
+        };
+
+        let entry_price =
+            position.entry_price.ok_or_else(|| DaemonError::InvalidPositionState {
+                expected: "Active with entry_price set".to_string(),
+                actual: format!("Active with entry_price=None for position {}", input.position_id),
+            })?;
+        let qty = input.filled_quantity.as_decimal();
+        let pnl = match position.side {
+            Side::Long => (input.exit_price.as_decimal() - entry_price.as_decimal()) * qty,
+            Side::Short => (entry_price.as_decimal() - input.exit_price.as_decimal()) * qty,
+        };
+
+        info!(
+            position_id = %input.position_id,
+            exit_price = %input.exit_price.as_decimal(),
+            filled_quantity = %input.filled_quantity.as_decimal(),
+            evidence_source,
+            "Reverse reconciliation close accepted, emitting PositionClosed event"
+        );
+
+        let event = Event::PositionClosed {
+            position_id: input.position_id,
+            exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
+            entry_price,
+            exit_price: input.exit_price,
+            realized_pnl: pnl,
+            total_fees: position.fees_paid + input.fee,
+            closure_evidence: ClosureEvidence::Reconciled(input.evidence),
+            timestamp: input.closed_at,
+        };
+        self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await?;
+
+        crate::metrics::POSITION_PNL
+            .with_label_values(&[&input.position_id.to_string()])
+            .set(pnl.to_string().parse::<f64>().unwrap_or(0.0));
+
+        self.event_bus.send(DaemonEvent::PositionStateChanged {
+            position_id: input.position_id,
+            previous_state: "Active".to_string(),
+            new_state: "Closed".to_string(),
+            timestamp: input.closed_at,
+        });
+        self.event_bus.send(DaemonEvent::CorePositionClosed {
+            position_id: input.position_id,
+            symbol: position.symbol.clone(),
+            side: position.side,
+        });
+
+        self.evaluate_monthly_halt().await;
+
+        Ok(ReconcileCloseOutcome::Closed)
     }
 
     /// Emergency close all positions.
@@ -4892,6 +5082,380 @@ mod tests {
             "expected InvalidPositionState, got: {:?}",
             err
         );
+    }
+
+    fn order_fill_reconciled_input(
+        position_id: PositionId,
+        exit_price: Price,
+        quantity: Quantity,
+        fee: Decimal,
+        closed_at: chrono::DateTime<chrono::Utc>,
+    ) -> ReconciledCloseInput {
+        ReconciledCloseInput {
+            position_id,
+            exit_price,
+            filled_quantity: quantity,
+            fee,
+            fee_asset: "USDT".to_string(),
+            closed_at,
+            evidence: ReconciliationEvidence::OrderFillRecord(robson_domain::OrderFillEvidence {
+                exchange_order_id: "ORDER-1".to_string(),
+                fill_price: exit_price,
+                filled_quantity: quantity,
+                fee,
+                fee_asset: "USDT".to_string(),
+                filled_at: closed_at,
+            }),
+        }
+    }
+
+    fn user_trade_reconciled_input(
+        position_id: PositionId,
+        exit_price: Price,
+        quantity: Quantity,
+        fee: Decimal,
+        closed_at: chrono::DateTime<chrono::Utc>,
+    ) -> ReconciledCloseInput {
+        ReconciledCloseInput {
+            position_id,
+            exit_price,
+            filled_quantity: quantity,
+            fee,
+            fee_asset: "USDT".to_string(),
+            closed_at,
+            evidence: ReconciliationEvidence::UserTradeRecord(robson_domain::UserTradeEvidence {
+                exchange_order_id: "ORDER-2".to_string(),
+                exchange_trade_id: "TRADE-1".to_string(),
+                fill_price: exit_price,
+                filled_quantity: quantity,
+                fee,
+                fee_asset: "USDT".to_string(),
+                filled_at: closed_at,
+            }),
+        }
+    }
+
+    #[tokio::test]
+    async fn reconcile_close_order_fill_long_records_realized_pnl() {
+        let manager = create_test_manager().await;
+        let position =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(0.01)).await;
+        let exit_price = Price::new(dec!(90)).unwrap();
+        let quantity = Quantity::new(dec!(0.01)).unwrap();
+        let closed_at = chrono::Utc::now();
+
+        let outcome = manager
+            .reconcile_close(order_fill_reconciled_input(
+                position.id,
+                exit_price,
+                quantity,
+                dec!(0.01),
+                closed_at,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ReconcileCloseOutcome::Closed);
+        let closed = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
+        let expected_pnl = (dec!(90) - dec!(100)) * dec!(0.01);
+        assert_eq!(closed.realized_pnl, expected_pnl);
+        match closed.state {
+            PositionState::Closed {
+                exit_price: state_exit,
+                realized_pnl,
+                exit_reason,
+            } => {
+                assert_eq!(state_exit, exit_price);
+                assert_eq!(realized_pnl, expected_pnl);
+                assert_eq!(exit_reason, robson_domain::ExitReason::ReconciledMissingOnExchange);
+            },
+            other => panic!("expected Closed state, got {:?}", other),
+        }
+
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        let close_event = events
+            .iter()
+            .find_map(|event| {
+                if let Event::PositionClosed { closure_evidence, exit_reason, .. } = event {
+                    Some((closure_evidence, exit_reason))
+                } else {
+                    None
+                }
+            })
+            .expect("PositionClosed event must be emitted");
+        assert_eq!(*close_event.1, robson_domain::ExitReason::ReconciledMissingOnExchange);
+        assert!(matches!(
+            close_event.0,
+            ClosureEvidence::Reconciled(ReconciliationEvidence::OrderFillRecord(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconcile_close_user_trade_short_records_realized_pnl() {
+        let manager = create_test_manager().await;
+        let position =
+            save_active_position(&manager, "BTCUSDT", Side::Short, dec!(100), dec!(0.01)).await;
+        let exit_price = Price::new(dec!(90)).unwrap();
+        let quantity = Quantity::new(dec!(0.01)).unwrap();
+        let closed_at = chrono::Utc::now();
+
+        let outcome = manager
+            .reconcile_close(user_trade_reconciled_input(
+                position.id,
+                exit_price,
+                quantity,
+                dec!(0.01),
+                closed_at,
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ReconcileCloseOutcome::Closed);
+        let closed = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
+        let expected_pnl = (dec!(100) - dec!(90)) * dec!(0.01);
+        assert_eq!(closed.realized_pnl, expected_pnl);
+
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        let close_event = events
+            .iter()
+            .find_map(|event| {
+                if let Event::PositionClosed { closure_evidence, exit_reason, .. } = event {
+                    Some((closure_evidence, exit_reason))
+                } else {
+                    None
+                }
+            })
+            .expect("PositionClosed event must be emitted");
+        assert_eq!(*close_event.1, robson_domain::ExitReason::ReconciledMissingOnExchange);
+        assert!(matches!(
+            close_event.0,
+            ClosureEvidence::Reconciled(ReconciliationEvidence::UserTradeRecord(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn reconcile_close_is_idempotent_for_already_closed() {
+        let manager = create_test_manager().await;
+        let mut receiver = manager.event_bus.subscribe();
+        let position =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(0.01)).await;
+        let original_closed_at = chrono::Utc::now();
+        let original_pnl = dec!(-1);
+        let mut closed_position = position.clone();
+        closed_position.state = PositionState::Closed {
+            exit_price: Price::new(dec!(90)).unwrap(),
+            realized_pnl: original_pnl,
+            exit_reason: robson_domain::ExitReason::TrailingStop,
+        };
+        closed_position.realized_pnl = original_pnl;
+        closed_position.closed_at = Some(original_closed_at);
+        manager.store.positions().save(&closed_position).await.unwrap();
+        let before_events = manager.store.events().find_by_position(position.id).await.unwrap();
+
+        let outcome = manager
+            .reconcile_close(order_fill_reconciled_input(
+                position.id,
+                Price::new(dec!(80)).unwrap(),
+                Quantity::new(dec!(0.01)).unwrap(),
+                dec!(0.01),
+                chrono::Utc::now(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(outcome, ReconcileCloseOutcome::AlreadyTerminal);
+        let after = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
+        assert_eq!(after.realized_pnl, original_pnl);
+        assert_eq!(after.closed_at, Some(original_closed_at));
+        let after_events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert_eq!(after_events.len(), before_events.len());
+        assert!(receiver.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_close_already_closed_is_state_first_for_bad_input() {
+        let manager = create_test_manager().await;
+        let mut receiver = manager.event_bus.subscribe();
+        let position =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(0.01)).await;
+        let original_closed_at = chrono::Utc::now();
+        let original_pnl = dec!(-1);
+        let mut closed_position = position.clone();
+        closed_position.state = PositionState::Closed {
+            exit_price: Price::new(dec!(90)).unwrap(),
+            realized_pnl: original_pnl,
+            exit_reason: robson_domain::ExitReason::TrailingStop,
+        };
+        closed_position.realized_pnl = original_pnl;
+        closed_position.closed_at = Some(original_closed_at);
+        manager.store.positions().save(&closed_position).await.unwrap();
+        let before_events = manager.store.events().find_by_position(position.id).await.unwrap();
+        let now = chrono::Utc::now();
+
+        let snapshot_outcome = manager
+            .reconcile_close(ReconciledCloseInput {
+                position_id: position.id,
+                exit_price: Price::new(dec!(90)).unwrap(),
+                filled_quantity: Quantity::new(dec!(0.01)).unwrap(),
+                fee: Decimal::ZERO,
+                fee_asset: "USDT".to_string(),
+                closed_at: now,
+                evidence: ReconciliationEvidence::AccountSnapshot(
+                    robson_domain::AccountSnapshotEvidence {
+                        first_observed_missing_at: now,
+                        confirmed_missing_at: now,
+                        futures_balance_delta: None,
+                    },
+                ),
+            })
+            .await
+            .unwrap();
+
+        let mut inconsistent_input = order_fill_reconciled_input(
+            position.id,
+            Price::new(dec!(90)).unwrap(),
+            Quantity::new(dec!(0.01)).unwrap(),
+            dec!(0.01),
+            now,
+        );
+        inconsistent_input.exit_price = Price::new(dec!(91)).unwrap();
+        let inconsistent_outcome = manager.reconcile_close(inconsistent_input).await.unwrap();
+
+        assert_eq!(snapshot_outcome, ReconcileCloseOutcome::AlreadyTerminal);
+        assert_eq!(inconsistent_outcome, ReconcileCloseOutcome::AlreadyTerminal);
+        let after = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
+        assert_eq!(after.realized_pnl, original_pnl);
+        assert_eq!(after.closed_at, Some(original_closed_at));
+        let after_events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert_eq!(after_events.len(), before_events.len());
+        assert!(receiver.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_close_skips_non_active() {
+        let manager = create_test_manager().await;
+        let mut receiver = manager.event_bus.subscribe();
+        let mut position =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(0.01)).await;
+        position.state = PositionState::Exiting {
+            exit_order_id: Uuid::now_v7(),
+            exit_reason: robson_domain::ExitReason::TrailingStop,
+        };
+        manager.store.positions().save(&position).await.unwrap();
+
+        let outcome = manager
+            .reconcile_close(order_fill_reconciled_input(
+                position.id,
+                Price::new(dec!(90)).unwrap(),
+                Quantity::new(dec!(0.01)).unwrap(),
+                dec!(0.01),
+                chrono::Utc::now(),
+            ))
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            ReconcileCloseOutcome::SkippedNonActive { state: "exiting".to_string() }
+        );
+        let after = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
+        assert!(matches!(after.state, PositionState::Exiting { .. }));
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert!(events.iter().all(|event| !matches!(event, Event::PositionClosed { .. })));
+        assert!(receiver.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn reconcile_close_rejects_account_snapshot() {
+        let manager = create_test_manager().await;
+        let position =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(0.01)).await;
+        let now = chrono::Utc::now();
+
+        let outcome = manager
+            .reconcile_close(ReconciledCloseInput {
+                position_id: position.id,
+                exit_price: Price::new(dec!(90)).unwrap(),
+                filled_quantity: Quantity::new(dec!(0.01)).unwrap(),
+                fee: Decimal::ZERO,
+                fee_asset: "USDT".to_string(),
+                closed_at: now,
+                evidence: ReconciliationEvidence::AccountSnapshot(
+                    robson_domain::AccountSnapshotEvidence {
+                        first_observed_missing_at: now,
+                        confirmed_missing_at: now,
+                        futures_balance_delta: None,
+                    },
+                ),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            ReconcileCloseOutcome::RejectedUnsupportedEvidence { source: "account_snapshot" }
+        );
+        let after = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
+        assert!(matches!(after.state, PositionState::Active { .. }));
+    }
+
+    #[tokio::test]
+    async fn reconcile_close_rejects_estimated() {
+        let manager = create_test_manager().await;
+        let position =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(0.01)).await;
+        let now = chrono::Utc::now();
+
+        let outcome = manager
+            .reconcile_close(ReconciledCloseInput {
+                position_id: position.id,
+                exit_price: Price::new(dec!(90)).unwrap(),
+                filled_quantity: Quantity::new(dec!(0.01)).unwrap(),
+                fee: Decimal::ZERO,
+                fee_asset: "USDT".to_string(),
+                closed_at: now,
+                evidence: ReconciliationEvidence::Estimated(robson_domain::EstimatedEvidence {
+                    estimation_basis: robson_domain::EstimationBasis::ExchangeMarkPrice,
+                    exit_price: Price::new(dec!(90)).unwrap(),
+                    evaluator: Some("test".to_string()),
+                    detected_at: now,
+                }),
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcome,
+            ReconcileCloseOutcome::RejectedUnsupportedEvidence { source: "estimated" }
+        );
+        let after = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
+        assert!(matches!(after.state, PositionState::Active { .. }));
+    }
+
+    #[tokio::test]
+    async fn reconcile_close_rejects_disconnected_exit_price() {
+        let manager = create_test_manager().await;
+        let position =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(0.01)).await;
+        let quantity = Quantity::new(dec!(0.01)).unwrap();
+        let closed_at = chrono::Utc::now();
+        let mut input = order_fill_reconciled_input(
+            position.id,
+            Price::new(dec!(90)).unwrap(),
+            quantity,
+            dec!(0.01),
+            closed_at,
+        );
+        input.exit_price = Price::new(dec!(91)).unwrap();
+
+        let outcome = manager.reconcile_close(input).await.unwrap();
+
+        assert_eq!(
+            outcome,
+            ReconcileCloseOutcome::RejectedInconsistentEvidence { field: "exit_price" }
+        );
+        let after = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
+        assert!(matches!(after.state, PositionState::Active { .. }));
     }
 
     /// Verify panic_close_position_internal computes realized PnL from
