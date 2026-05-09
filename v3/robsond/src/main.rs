@@ -34,9 +34,29 @@ mod db;
 use std::sync::Arc;
 
 use robson_connectors::BinanceRestClient;
-use robsond::{Config, Daemon, Environment};
+use robsond::{Config, Daemon, DaemonResult, Environment, exit_code_for_daemon_error};
 use tracing::info;
 use tracing_subscriber::{fmt, prelude::*, EnvFilter};
+
+/// Convert a `DaemonResult` into an `anyhow::Result`, mapping known error
+/// variants to their documented exit codes via `std::process::exit`.
+///
+/// The exit code policy lives entirely in `exit_code_for_daemon_error`.
+/// Errors that map to exit code 1 (the default) propagate via `anyhow` so
+/// that the caller can print a formatted error before exiting. Errors with
+/// a non-1 code are already logged by the daemon, so we exit directly.
+fn map_daemon_result(result: DaemonResult<()>) -> anyhow::Result<()> {
+    match result {
+        Ok(()) => Ok(()),
+        Err(e) => {
+            let code = exit_code_for_daemon_error(&e);
+            if code != 1 {
+                std::process::exit(code);
+            }
+            Err(e.into())
+        },
+    }
+}
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
@@ -145,7 +165,7 @@ async fn main() -> anyhow::Result<()> {
             let client = Arc::new(BinanceRestClient::testnet(api_key, api_secret));
             let daemon =
                 Daemon::new_binance_with_recovery(config, client, projection_recovery, pg_pool);
-            daemon.run().await?;
+            map_daemon_result(daemon.run().await)?;
         } else if has_binance_creds && config.environment == Environment::Production {
             info!("Exchange: Binance (production)");
             let (api_key, api_secret) = (
@@ -155,7 +175,7 @@ async fn main() -> anyhow::Result<()> {
             let client = Arc::new(BinanceRestClient::new(api_key, api_secret));
             let daemon =
                 Daemon::new_binance_with_recovery(config, client, projection_recovery, pg_pool);
-            daemon.run().await?;
+            map_daemon_result(daemon.run().await)?;
         } else {
             if has_binance_creds && !use_testnet {
                 tracing::error!(
@@ -167,7 +187,7 @@ async fn main() -> anyhow::Result<()> {
                 info!("Exchange: Stub (no Binance credentials)");
             }
             let daemon = Daemon::new_stub_with_recovery(config, projection_recovery, pg_pool);
-            daemon.run().await?;
+            map_daemon_result(daemon.run().await)?;
         }
     }
 
@@ -181,7 +201,7 @@ async fn main() -> anyhow::Result<()> {
             );
             let client = Arc::new(BinanceRestClient::testnet(api_key, api_secret));
             let daemon = Daemon::new_binance(config, client);
-            daemon.run().await?;
+            map_daemon_result(daemon.run().await)?;
         } else if has_binance_creds && config.environment == Environment::Production {
             info!("Exchange: Binance (production)");
             let (api_key, api_secret) = (
@@ -190,7 +210,7 @@ async fn main() -> anyhow::Result<()> {
             );
             let client = Arc::new(BinanceRestClient::new(api_key, api_secret));
             let daemon = Daemon::new_binance(config, client);
-            daemon.run().await?;
+            map_daemon_result(daemon.run().await)?;
         } else {
             if has_binance_creds && !use_testnet {
                 tracing::error!(
@@ -202,7 +222,7 @@ async fn main() -> anyhow::Result<()> {
                 info!("Exchange: Stub (no Binance credentials)");
             }
             let daemon = Daemon::new_stub(config);
-            daemon.run().await?;
+            map_daemon_result(daemon.run().await)?;
         }
     }
 

@@ -1,6 +1,6 @@
 # TD-2026-05-05-001 — Core Position Lifecycle Drift
 
-**Status**: In progress — Slices 0/1/2/3/4A/4B done; Slice 5 next
+**Status**: In progress — Slices 0/1/2/3/4A/4B/5A done; Slice 5B next
 **Severity**: High
 **Area**: `robsond` reconciliation, position lifecycle
 **Discovered**: 2026-05-05
@@ -373,17 +373,68 @@ Outcome:
   unrelated trade with a local position.
 - **Commit**: `feat(robsond): add symmetric stale-active reconciliation loop`
 
-### Slice 5 — Startup gate + runbook — NEXT
+### Slice 5A — Startup gate (abort path) + config + docs — DONE (2026-05-09)
 
-- Implement Path A (default `abort`) and Path B (`auto_reconcile`) per
-  Amendment §3.
-- New config field `reconciliation.on_startup_stale_active`.
-- Runbook content in
-  `docs/runbooks/td-2026-05-05-001-stale-active-recovery.md`.
-- New CLI subcommand `robson-cli reconcile-close` for operator-driven
-  closes (Path A path).
-- **Tests**: integration (`#[sqlx::test]`) covering both paths.
-- **Commit**: `feat(robsond): startup gate and operator runbook for stale-active drift`
+Outcome:
+
+- `ReconciliationConfig` extended with two new fields:
+  - `missing_grace_secs: u64` (default 60) — governs the periodic worker;
+    parsed from `ROBSON_RECONCILIATION_MISSING_GRACE_SECS`.
+  - `on_startup_stale_active: StartupStaleActivePolicy` (default `Abort`) —
+    parsed from `ROBSON_RECONCILIATION_ON_STARTUP_STALE_ACTIVE`. Only `abort`
+    accepted in 5A; unknown values produce a config error.
+- New `DaemonError::StartupStaleActiveDetected { count, positions }` variant.
+- New `StartupStaleActiveInfo` struct carrying `position_id`, `symbol`, `side`,
+  `quantity`, optional `entry_price` for structured log payload.
+- `Daemon::run()` startup sequence updated:
+  1. After `restore_positions()` and before `scan_and_reconcile_blocking()`,
+     calls `run_startup_stale_active_gate()`.
+  2. Gate checks local `Active` positions against exchange immediately (no
+     grace). `Entering` / `Exiting` are ignored.
+  3. If any stale-Active found: emits CRITICAL log per position, returns
+     `StartupStaleActiveDetected`.
+  4. `map_daemon_result` in `main.rs` converts this to `std::process::exit(78)`.
+- `ReconciliationWorker` instantiation now always uses explicit
+  `missing_grace_secs` from config (no longer implicitly equal to
+  `scan_interval`).
+- `ReconciliationWorker::new_with_missing_grace` promoted to `pub(crate)`.
+- Runbook `docs/runbooks/td-2026-05-05-001-stale-active-recovery.md` updated
+  with Slice 5A operational content (abort flow, exit code, immediate actions).
+
+Scope of 5A (fail-closed only):
+- Exit code 78 on stale-Active detection ✅
+- Structured log per position ✅
+- Explicit `missing_grace_secs` in worker ✅
+- `abort` policy enforced by default ✅
+- Runbook updated ✅
+
+Not in 5A (deferred to 5B):
+- `auto_reconcile` policy (Path B)
+- `robson-cli reconcile-close` command
+- Evidence-driven auto-close at startup
+
+Tests added (210 lib tests passing):
+- `config::test_reconciliation_config_defaults` — `missing_grace_secs == 60`,
+  `on_startup_stale_active == Abort`
+- `config::test_load_missing_grace_secs_from_env`
+- `config::test_load_startup_policy_abort_from_env`
+- `config::test_load_startup_policy_unknown_is_config_error`
+- `error::test_startup_stale_active_exit_code_is_78`
+- `daemon::test_startup_gate_clean_no_positions`
+- `daemon::test_startup_gate_stale_active_returns_typed_error`
+- `daemon::test_startup_gate_stale_active_does_not_mutate_store`
+- `daemon::test_startup_gate_entering_does_not_abort`
+- `daemon::test_startup_gate_exiting_does_not_abort`
+
+- **Commit**: `feat(robsond): startup gate abort path and config for stale-active drift (Slice 5A)`
+
+### Slice 5B — `auto_reconcile` path + robson-cli — NEXT
+
+- Implement Path B (`auto_reconcile`) per Amendment §3.
+- New CLI subcommand `robson-cli reconcile-close` for operator-driven closes
+  (Path A, operator-triggered).
+- **Tests**: integration (`#[sqlx::test]`) covering auto_reconcile path.
+- **Commit**: `feat(robsond): startup auto-reconcile path and operator CLI (Slice 5B)`
 
 ### Slice 6 — Slot/monthly accounting regression coverage
 
@@ -487,3 +538,4 @@ All asserted via `cargo test -p robsond` plus targeted Postgres tests under
 | Date | Change | Author |
 |---|---|---|
 | 2026-05-08 | Initial draft (Slice 0). Amendments §1, §2, §3 incorporated. | Claude Opus 4.7 |
+| 2026-05-09 | Slice 5A done: startup gate abort path, config, exit code 78, runbook. | Claude Sonnet 4.6 |

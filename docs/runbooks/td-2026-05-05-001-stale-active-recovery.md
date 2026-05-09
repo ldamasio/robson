@@ -3,7 +3,7 @@
 **Severity**: Critical
 **Time to Execute**: 10–30 min per affected position (steady state); up to 60 min on first incident
 **Required Access**: `kubectl` for `robson` and `robson-testnet` namespaces, Binance Futures account access (web UI or `binance-cli`), `robsond` API token, `robson-cli` binary at the version that ships Slice 5
-**Status**: SKELETON (Slice 2 of TD-2026-05-05-001) — operational instructions and the `robson-cli reconcile-close` command itself are finalized in Slice 5. Until Slice 5 ships, this runbook documents the **policy** and **decision flow**; the executable command is unavailable and any in-cluster recovery must be coordinated with engineering.
+**Status**: PARTIAL (Slice 5A of TD-2026-05-05-001) — abort path (exit code 78) is live. The `robson-cli reconcile-close` command lands in Slice 5B. Until 5B ships, recovery requires engineering involvement after following §Evidence Collection Order and §Manual Verification Checklist.
 
 ---
 
@@ -15,11 +15,40 @@
 
 ---
 
+## Startup Abort — What Happened (Slice 5A)
+
+When the daemon refuses to start with exit code 78, the log contains:
+
+```
+CRITICAL: Startup gate: Robson-Active position absent from exchange
+  position_id=<UUID> symbol=<PAIR> side=<Long|Short> quantity=<DECIMAL>
+...
+Startup aborted: N stale-active position(s) detected (exit 78 — see runbook ...)
+```
+
+**What this means**: At startup, after restoring the in-memory position store,
+the daemon compared every local `Active` position against the exchange's open
+positions. At least one `Active` position was NOT found on the exchange by
+`(symbol, side)`. The daemon refused to enter the control loop (fail-closed).
+
+**What this does NOT mean**:
+- It does NOT close the position. The store is unchanged.
+- It does NOT invent PnL or evidence.
+- `Entering` and `Exiting` positions are excluded from this check (they do not
+  trigger abort).
+
+**Immediate action** (before any evidence collection):
+1. `kubectl logs -n <ns> deploy/robsond --tail=200 | grep "CRITICAL\|stale-active"`
+   — identify the affected `position_id`(s).
+2. Do NOT restart the daemon until the affected position is resolved (see below).
+
+---
+
 ## Symptoms
 
 This runbook fires when ONE of the following is true:
 
-1. **Daemon refused to start** with the message `Startup aborted: N stale-active position(s) detected`. Exit code 78 (`EX_CONFIG`). Logged at `CRITICAL`.
+1. **Daemon refused to start** with the message `Startup aborted: N stale-active position(s) detected`. Exit code 78 (`EX_CONFIG`). Logged at `CRITICAL`. *(Live since Slice 5A.)*
 2. **Steady-state alert** `position_reconciliation_estimated_evidence_required` fired (Slice 4+ alerting layer): the runtime reconciliation worker confirmed drift but only `Estimated` evidence is available, so the close was deferred for operator confirmation.
 3. **Operator-initiated** verification: `/status` shows an `Active` position whose `(symbol, side)` is not present in `binance-cli futures positions` or the Binance Futures web UI for the operated account.
 
@@ -156,12 +185,13 @@ Before issuing the close, every operator MUST tick all of:
 
 ---
 
-## Recovery Command (placeholder — Slice 5)
+## Recovery Command (Slice 5B — not yet available)
 
-> The CLI surface below is the contract. The `robson-cli reconcile-close`
-> command itself is **not yet implemented**; it lands in Slice 5 of
-> TD-2026-05-05-001. Until then, recovery requires engineering
-> involvement — coordinate via the on-call channel.
+> The `robson-cli reconcile-close` command is **not yet implemented**; it lands
+> in Slice 5B of TD-2026-05-05-001. Until 5B ships, recovery requires
+> engineering involvement: collect evidence per §Evidence Collection Order,
+> validate per §Manual Verification Checklist, then coordinate with engineering
+> to emit the `PositionClosed` event manually via the internal API.
 
 **General shape (target — to be confirmed in Slice 5)**:
 
@@ -244,4 +274,5 @@ There is **no rollback** for a reconciled close. Once `Event::PositionClosed` is
 
 | Date | Change | Author |
 |---|---|---|
-| 2026-05-08 | Initial skeleton (Slice 2 of TD-2026-05-05-001). Operational structure, evidence ordering, decision flow. CLI command and final command surface deferred to Slice 5. | Claude Opus 4.7 |
+| 2026-05-08 | Initial skeleton (Slice 2 of TD-2026-05-05-001). Operational structure, evidence ordering, decision flow. CLI command deferred to Slice 5B. | Claude Opus 4.7 |
+| 2026-05-09 | Slice 5A: startup abort is live (exit 78). Added §Startup Abort section, updated status and recovery command note. | Claude Sonnet 4.6 |

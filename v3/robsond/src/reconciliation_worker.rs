@@ -68,7 +68,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         )
     }
 
-    fn new_with_missing_grace(
+    pub(crate) fn new_with_missing_grace(
         exchange: Arc<E>,
         position_manager: Arc<RwLock<PositionManager<E, S>>>,
         store: Arc<S>,
