@@ -48,6 +48,6 @@ pub use executor::{ActionResult, Executor};
 pub use intent::{Intent, IntentAction, IntentJournal, IntentResult, IntentStatus};
 pub use ports::{
     CandleInterval, ExchangePort, ExchangePosition, FuturesBalance, FuturesSettings,
-    MarketDataPort, OhlcvPort, OrderResult, PriceUpdate,
+    MarketDataPort, OhlcvPort, OrderResult, PriceUpdate, UserTradeRecord,
 };
 pub use stub::{StubExchange, StubMarketData, StubOhlcv};

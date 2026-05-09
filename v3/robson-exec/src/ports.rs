@@ -122,6 +122,31 @@ pub trait ExchangePort: Send + Sync {
         quantity: Quantity,
         client_order_id: &str,
     ) -> Result<OrderResult, ExecError>;
+
+    /// Query a specific order by its exchange-assigned id.
+    ///
+    /// Returns `Some(OrderResult)` if the order exists and has fill data.
+    /// Returns `None` if the order is not found or has not been filled.
+    ///
+    /// Used by the reconciliation pipeline to retrieve `OrderFillEvidence`
+    /// for reverse-reconciliation closes (TD-2026-05-05-001).
+    async fn get_order_by_exchange_id(
+        &self,
+        symbol: &Symbol,
+        order_id: &str,
+    ) -> Result<Option<OrderResult>, ExecError>;
+
+    /// Query user trade history for a symbol since a given timestamp.
+    ///
+    /// Returns trades ordered oldest-first. Used by the reconciliation
+    /// pipeline as evidence source 2 (user trades) when a specific order
+    /// id is not known (TD-2026-05-05-001).
+    async fn get_user_trades_since(
+        &self,
+        symbol: &Symbol,
+        since: DateTime<Utc>,
+        limit: u16,
+    ) -> Result<Vec<UserTradeRecord>, ExecError>;
 }
 
 /// USD-M Futures account settings for a symbol.
@@ -151,6 +176,28 @@ pub struct OrderResult {
     /// Fee asset (e.g., "USDT", "BNB")
     pub fee_asset: String,
     /// When the order was filled
+    pub filled_at: DateTime<Utc>,
+}
+
+/// Individual trade from exchange trade history.
+///
+/// Used by `get_user_trades_since` to provide evidence for
+/// reverse-reconciliation closes.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct UserTradeRecord {
+    /// Exchange-assigned order id of the originating order.
+    pub exchange_order_id: String,
+    /// Exchange-assigned trade id.
+    pub exchange_trade_id: String,
+    /// Fill price reported by the exchange.
+    pub fill_price: Price,
+    /// Filled quantity reported by the exchange.
+    pub filled_quantity: Quantity,
+    /// Trading fee paid.
+    pub fee: Decimal,
+    /// Fee asset (e.g. "USDT", "BNB").
+    pub fee_asset: String,
+    /// When the trade occurred (exchange-reported).
     pub filled_at: DateTime<Utc>,
 }
 

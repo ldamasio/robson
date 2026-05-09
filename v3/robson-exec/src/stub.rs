@@ -6,7 +6,7 @@
 use std::{collections::HashMap, sync::RwLock};
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use robson_domain::{Candle, OrderSide, Price, Quantity, Symbol};
 use rust_decimal::Decimal;
 
@@ -14,7 +14,7 @@ use crate::{
     error::ExecError,
     ports::{
         CandleInterval, ExchangePort, ExchangePosition, FuturesBalance, FuturesSettings,
-        MarketDataPort, OhlcvPort, OrderResult, PriceUpdate,
+        MarketDataPort, OhlcvPort, OrderResult, PriceUpdate, UserTradeRecord,
     },
 };
 
@@ -43,6 +43,10 @@ pub struct StubExchange {
     open_positions: RwLock<HashMap<String, ExchangePosition>>,
     /// Simulated futures account balance.
     futures_balance: RwLock<Decimal>,
+    /// Simulated orders retrievable by `get_order_by_exchange_id`.
+    orders: RwLock<HashMap<String, OrderResult>>,
+    /// Simulated user trades retrievable by `get_user_trades_since`.
+    user_trades: RwLock<HashMap<String, Vec<UserTradeRecord>>>,
 }
 
 impl StubExchange {
@@ -60,6 +64,8 @@ impl StubExchange {
             futures_settings: RwLock::new(("One-way".to_string(), 10)),
             open_positions: RwLock::new(HashMap::new()),
             futures_balance: RwLock::new(Decimal::from(10000)),
+            orders: RwLock::new(HashMap::new()),
+            user_trades: RwLock::new(HashMap::new()),
         }
     }
 
@@ -139,6 +145,18 @@ impl StubExchange {
     /// Set simulated futures account balance.
     pub fn set_futures_balance(&self, balance: Decimal) {
         *self.futures_balance.write().unwrap() = balance;
+    }
+
+    /// Seed a simulated order for evidence-retrieval tests.
+    pub fn set_order_result(&self, order_id: &str, result: OrderResult) {
+        let mut orders = self.orders.write().unwrap();
+        orders.insert(order_id.to_string(), result);
+    }
+
+    /// Seed simulated user trades for evidence-retrieval tests.
+    pub fn set_user_trades(&self, symbol: &str, trades: Vec<UserTradeRecord>) {
+        let mut user_trades = self.user_trades.write().unwrap();
+        user_trades.insert(symbol.to_string(), trades);
     }
 }
 
@@ -301,6 +319,43 @@ impl ExchangePort for StubExchange {
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
         })
+    }
+
+    async fn get_order_by_exchange_id(
+        &self,
+        _symbol: &Symbol,
+        order_id: &str,
+    ) -> Result<Option<OrderResult>, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange(
+                "Simulated get_order_by_exchange_id failure".to_string(),
+            ));
+        }
+
+        let orders = self.orders.read().unwrap();
+        Ok(orders.get(order_id).cloned())
+    }
+
+    async fn get_user_trades_since(
+        &self,
+        symbol: &Symbol,
+        since: DateTime<Utc>,
+        limit: u16,
+    ) -> Result<Vec<UserTradeRecord>, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated get_user_trades_since failure".to_string()));
+        }
+
+        let trades = self.user_trades.read().unwrap();
+        let symbol_trades = trades.get(&symbol.as_pair()).cloned().unwrap_or_default();
+
+        let mut filtered: Vec<UserTradeRecord> =
+            symbol_trades.into_iter().filter(|t| t.filled_at >= since).collect();
+
+        filtered.sort_by(|a, b| a.filled_at.cmp(&b.filled_at));
+        filtered.truncate(limit as usize);
+
+        Ok(filtered)
     }
 }
 
@@ -625,5 +680,86 @@ mod tests {
         // Should fail for unknown symbol
         let result = market_data.get_price(&symbol).await;
         assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn test_stub_exchange_get_order_by_exchange_id() {
+        let exchange = StubExchange::new(dec!(95000));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+
+        let order_result = OrderResult {
+            exchange_order_id: "12345".to_string(),
+            client_order_id: "test-coid".to_string(),
+            fill_price: Price::new(dec!(95000)).unwrap(),
+            filled_quantity: Quantity::new(dec!(0.1)).unwrap(),
+            fee: dec!(9.5),
+            fee_asset: "USDT".to_string(),
+            filled_at: Utc::now(),
+        };
+
+        exchange.set_order_result("12345", order_result.clone());
+
+        let found = exchange.get_order_by_exchange_id(&symbol, "12345").await.unwrap();
+        assert!(found.is_some());
+        let found = found.unwrap();
+        assert_eq!(found.exchange_order_id, "12345");
+        assert_eq!(found.fill_price.as_decimal(), dec!(95000));
+
+        let missing = exchange.get_order_by_exchange_id(&symbol, "99999").await.unwrap();
+        assert!(missing.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_stub_exchange_get_user_trades_since_filters_sorts_and_limits() {
+        let exchange = StubExchange::new(dec!(95000));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let now = Utc::now();
+
+        let trades = vec![
+            UserTradeRecord {
+                exchange_order_id: "100".to_string(),
+                exchange_trade_id: "1".to_string(),
+                fill_price: Price::new(dec!(94000)).unwrap(),
+                filled_quantity: Quantity::new(dec!(0.05)).unwrap(),
+                fee: dec!(4.7),
+                fee_asset: "USDT".to_string(),
+                filled_at: now - chrono::Duration::minutes(10),
+            },
+            UserTradeRecord {
+                exchange_order_id: "102".to_string(),
+                exchange_trade_id: "3".to_string(),
+                fill_price: Price::new(dec!(96000)).unwrap(),
+                filled_quantity: Quantity::new(dec!(0.05)).unwrap(),
+                fee: dec!(4.8),
+                fee_asset: "USDT".to_string(),
+                filled_at: now + chrono::Duration::minutes(1),
+            },
+            UserTradeRecord {
+                exchange_order_id: "101".to_string(),
+                exchange_trade_id: "2".to_string(),
+                fill_price: Price::new(dec!(95000)).unwrap(),
+                filled_quantity: Quantity::new(dec!(0.05)).unwrap(),
+                fee: dec!(4.75),
+                fee_asset: "USDT".to_string(),
+                filled_at: now - chrono::Duration::minutes(5),
+            },
+        ];
+
+        exchange.set_user_trades("BTCUSDT", trades);
+
+        let since = now - chrono::Duration::minutes(7);
+        let filtered = exchange.get_user_trades_since(&symbol, since, 1).await.unwrap();
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].exchange_trade_id, "2");
+    }
+
+    #[tokio::test]
+    async fn test_stub_exchange_get_user_trades_since_empty() {
+        let exchange = StubExchange::new(dec!(95000));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+
+        let trades = exchange.get_user_trades_since(&symbol, Utc::now(), 100).await.unwrap();
+        assert!(trades.is_empty());
     }
 }
