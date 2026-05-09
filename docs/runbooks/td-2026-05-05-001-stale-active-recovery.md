@@ -2,8 +2,8 @@
 
 **Severity**: Critical
 **Time to Execute**: 10–30 min per affected position (steady state); up to 60 min on first incident
-**Required Access**: `kubectl` for `robson` and `robson-testnet` namespaces, Binance Futures account access (web UI or `binance-cli`), `robsond` API token, `robson-cli` binary at the version that ships Slice 5
-**Status**: PARTIAL (Slice 5A of TD-2026-05-05-001) — abort path (exit code 78) is live. The `robson-cli reconcile-close` command lands in Slice 5B. Until 5B ships, recovery requires engineering involvement after following §Evidence Collection Order and §Manual Verification Checklist.
+**Required Access**: `kubectl` for `robson` and `robson-testnet` namespaces, Binance Futures account access (web UI or `binance-cli`), `robsond` API token, `robson-cli` binary at the version that ships Slice 5B1
+**Status**: Slice 5B1 LIVE — operator-driven manual recovery available via `robson-cli reconcile-close`. Startup `auto_reconcile` is Slice 5B2 (future).
 
 ---
 
@@ -185,44 +185,90 @@ Before issuing the close, every operator MUST tick all of:
 
 ---
 
-## Recovery Command (Slice 5B — not yet available)
+## Recovery Command (Slice 5B1 — operator-driven manual path)
 
-> The `robson-cli reconcile-close` command is **not yet implemented**; it lands
-> in Slice 5B of TD-2026-05-05-001. Until 5B ships, recovery requires
-> engineering involvement: collect evidence per §Evidence Collection Order,
-> validate per §Manual Verification Checklist, then coordinate with engineering
-> to emit the `PositionClosed` event manually via the internal API.
+> **Only `order_fill_record` and `user_trade_record` evidence are accepted.**
+> `account_snapshot` and `estimated` are not supported in Slice 5B1. They will
+> land in a future slice.
 
-**General shape (target — to be confirmed in Slice 5)**:
+### Command
 
 ```bash
 robson-cli reconcile-close \
   --position-id <UUID> \
-  --evidence <order_fill_record|user_trade_record|account_snapshot|estimated> \
-  --evidence-payload @evidence.json
+  --evidence-file evidence.json \
+  --robsond-url http://localhost:8080 \
+  --token "$ROBSON_API_TOKEN"
 ```
 
-Where `evidence.json` mirrors the `ReconciliationEvidence::*` payload from
-the domain types in `v3/robson-domain/src/entities.rs` (Slice 1).
+Flags:
 
-The command:
+| Flag | Required | Default | Description |
+|------|----------|---------|-------------|
+| `--position-id` | Yes | — | UUID of the position to close |
+| `--evidence-file` | Yes | — | Path to JSON file with evidence |
+| `--robsond-url` | No | `http://localhost:8080` | Base URL of robsond API |
+| `--token` | No | `$ROBSON_API_TOKEN` env | Bearer token for auth |
 
-1. Validates the evidence shape locally.
-2. Calls `robsond` HTTP API at `/reconcile-close` (TBD — Slice 5).
-3. The API path goes through the same `execute_and_persist` pipeline used
-   by normal exits, emitting `Event::PositionClosed { exit_reason:
-   ReconciledMissingOnExchange, closure_evidence:
-   Reconciled(<your evidence>), ... }`.
-4. Eventlog → projector → `positions_current.state = 'closed'` → `/status`
-   reflects the close on next read.
+### Exit Codes
 
-**TODO (Slice 5)**:
+| Code | Meaning |
+|------|---------|
+| 0 | Success, position closed |
+| 1 | Generic error (network, parse) |
+| 2 | Usage error or evidence locally rejected |
+| 3 | Position not found (404) |
+| 4 | Position not Active (409) |
+| 5 | Evidence inconsistent (400) |
+| 6 | Unauthorized (401) |
 
-- [ ] Final command name and flag set.
-- [ ] Authentication / token requirements.
-- [ ] Exit codes for each rejection class (invalid evidence, position not Active, position not found, api unreachable).
-- [ ] Sample `evidence.json` files for each of the four sources.
-- [ ] Failure-mode runbook (CLI returns 4xx vs 5xx; eventlog write fails; projector lag).
+### Sample evidence.json — OrderFillRecord
+
+```json
+{
+  "source": "order_fill_record",
+  "data": {
+    "exchange_order_id": "12345678",
+    "fill_price": "95000.50",
+    "filled_quantity": "0.010",
+    "fee": "0.95",
+    "fee_asset": "USDT",
+    "filled_at": "2026-05-09T14:30:00Z"
+  }
+}
+```
+
+### Sample evidence.json — UserTradeRecord
+
+```json
+{
+  "source": "user_trade_record",
+  "data": {
+    "exchange_order_id": "12345678",
+    "exchange_trade_id": "87654321",
+    "fill_price": "95000.50",
+    "filled_quantity": "0.010",
+    "fee": "0.95",
+    "fee_asset": "USDT",
+    "filled_at": "2026-05-09T14:30:00Z"
+  }
+}
+```
+
+### What happens
+
+1. CLI validates evidence shape locally (rejects `account_snapshot` and `estimated`).
+2. CLI sends `POST /reconcile-close` to `robsond` with the evidence.
+3. API validates Bearer token, deserializes evidence, calls `PositionManager::reconcile_close()`.
+4. `reconcile_close()` checks position is `Active`, validates evidence consistency, emits `PositionClosed { exit_reason: ReconciledMissingOnExchange }`.
+5. Eventlog → projector → position becomes `Closed`.
+6. CLI prints `realized_pnl` and `exit_price`.
+
+### Not yet supported
+
+- `account_snapshot` evidence — rejected at CLI and API level.
+- `estimated` evidence — rejected at CLI and API level.
+- Startup `auto_reconcile` — Slice 5B2, future work.
 
 ---
 
@@ -276,3 +322,4 @@ There is **no rollback** for a reconciled close. Once `Event::PositionClosed` is
 |---|---|---|
 | 2026-05-08 | Initial skeleton (Slice 2 of TD-2026-05-05-001). Operational structure, evidence ordering, decision flow. CLI command deferred to Slice 5B. | Claude Opus 4.7 |
 | 2026-05-09 | Slice 5A: startup abort is live (exit 78). Added §Startup Abort section, updated status and recovery command note. | Claude Sonnet 4.6 |
+| 2026-05-09 | Slice 5B1: operator-driven manual recovery via `robson-cli reconcile-close` + `POST /reconcile-close`. OrderFillRecord and UserTradeRecord evidence accepted. AccountSnapshot/Estimated rejected. Exit codes 0-6 documented. | Claude Opus 4.7 |
