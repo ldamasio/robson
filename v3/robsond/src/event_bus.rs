@@ -94,6 +94,27 @@ pub enum DaemonEvent {
     /// Safety exit execution failed
     SafetyExitFailed { symbol: String, error: String },
 
+    /// Reverse reconciliation detected a stale non-Active local position and
+    /// skipped automatic close.
+    ReconciliationStaleNonActiveDetected {
+        position_id: PositionId,
+        state: String,
+        symbol: Symbol,
+        side: robson_domain::Side,
+        observed_at: DateTime<Utc>,
+    },
+
+    /// Reverse reconciliation confirmed a stale Active local position, but no
+    /// unambiguous real fill evidence was available for automatic close.
+    ReconciliationStaleActiveUnresolved {
+        position_id: PositionId,
+        symbol: Symbol,
+        side: robson_domain::Side,
+        first_observed_missing_at: DateTime<Utc>,
+        confirmed_missing_at: DateTime<Utc>,
+        reason: String,
+    },
+
     /// Panic mode activated (all retries exhausted)
     SafetyPanic {
         position_id: String,

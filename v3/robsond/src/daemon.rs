@@ -479,6 +479,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         let reconciliation_interval = Duration::from_secs(self.config.reconciliation.interval_secs);
         let startup_reconciliation = ReconciliationWorker::new(
             Arc::clone(&self.exchange),
+            Arc::clone(&self.position_manager),
             Arc::clone(&self.store),
             Arc::clone(&self.event_bus),
             reconciliation_interval,
@@ -529,6 +530,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         // 6. Spawn reconciliation worker
         let reconciliation_worker = ReconciliationWorker::new(
             Arc::clone(&self.exchange),
+            Arc::clone(&self.position_manager),
             Arc::clone(&self.store),
             Arc::clone(&self.event_bus),
             reconciliation_interval,
@@ -1145,6 +1147,42 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                     %symbol,
                     %error,
                     "Safety exit failed"
+                );
+            },
+
+            DaemonEvent::ReconciliationStaleNonActiveDetected {
+                position_id,
+                state,
+                symbol,
+                side,
+                observed_at,
+            } => {
+                warn!(
+                    %position_id,
+                    %state,
+                    %symbol,
+                    ?side,
+                    %observed_at,
+                    "Reverse reconciliation detected stale non-Active position, skipped"
+                );
+            },
+
+            DaemonEvent::ReconciliationStaleActiveUnresolved {
+                position_id,
+                symbol,
+                side,
+                first_observed_missing_at,
+                confirmed_missing_at,
+                reason,
+            } => {
+                error!(
+                    %position_id,
+                    %symbol,
+                    ?side,
+                    %first_observed_missing_at,
+                    %confirmed_missing_at,
+                    %reason,
+                    "Reverse reconciliation stale Active unresolved"
                 );
             },
 

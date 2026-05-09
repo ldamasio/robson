@@ -3,43 +3,88 @@
 //! Periodically compares exchange-open positions with Robson's in-memory store
 //! and force-closes any position that is not tracked by the runtime.
 
-use std::{sync::Arc, time::Duration};
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use robson_exec::{ExchangePort, ExchangePosition};
+use chrono::{DateTime, Utc};
+use robson_domain::{
+    OrderFillEvidence, Position, PositionId, PositionState, Quantity, ReconciliationEvidence, Side,
+    Symbol, UserTradeEvidence,
+};
+use robson_exec::{ExchangePort, ExchangePosition, OrderResult, UserTradeRecord};
 use robson_store::Store;
-use tokio::time::MissedTickBehavior;
+use tokio::{
+    sync::{Mutex, RwLock},
+    time::{Instant, MissedTickBehavior},
+};
 use tokio_util::sync::CancellationToken;
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
     error::{DaemonError, DaemonResult},
     event_bus::{DaemonEvent, EventBus},
+    position_manager::{PositionManager, ReconcileCloseOutcome, ReconciledCloseInput},
 };
 
 /// Background worker that reconciles exchange state with Robson state.
 pub struct ReconciliationWorker<E: ExchangePort + 'static, S: Store + 'static> {
     exchange: Arc<E>,
+    position_manager: Arc<RwLock<PositionManager<E, S>>>,
     store: Arc<S>,
     event_bus: Arc<EventBus>,
     scan_interval: Duration,
+    missing_grace: Duration,
+    missing_observations: Arc<Mutex<HashMap<PositionId, MissingObservation>>>,
     shutdown_token: CancellationToken,
+}
+
+#[derive(Debug, Clone)]
+struct MissingObservation {
+    symbol: Symbol,
+    side: Side,
+    expected_quantity: Quantity,
+    first_observed_missing_at: DateTime<Utc>,
+    first_observed_instant: Instant,
 }
 
 impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     /// Create a new reconciliation worker.
     pub fn new(
         exchange: Arc<E>,
+        position_manager: Arc<RwLock<PositionManager<E, S>>>,
         store: Arc<S>,
         event_bus: Arc<EventBus>,
         scan_interval: Duration,
         shutdown_token: CancellationToken,
     ) -> Self {
-        Self {
+        Self::new_with_missing_grace(
             exchange,
+            position_manager,
             store,
             event_bus,
             scan_interval,
+            scan_interval,
+            shutdown_token,
+        )
+    }
+
+    fn new_with_missing_grace(
+        exchange: Arc<E>,
+        position_manager: Arc<RwLock<PositionManager<E, S>>>,
+        store: Arc<S>,
+        event_bus: Arc<EventBus>,
+        scan_interval: Duration,
+        missing_grace: Duration,
+        shutdown_token: CancellationToken,
+    ) -> Self {
+        Self {
+            exchange,
+            position_manager,
+            store,
+            event_bus,
+            scan_interval,
+            missing_grace,
+            missing_observations: Arc::new(Mutex::new(HashMap::new())),
             shutdown_token,
         }
     }
@@ -74,14 +119,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         let exchange_positions = self.exchange.get_all_open_positions().await?;
         let mut reconciled = 0usize;
 
-        for exchange_position in exchange_positions {
+        for exchange_position in &exchange_positions {
             if self.is_tracked(&exchange_position).await? {
                 continue;
             }
 
-            self.handle_untracked_position(exchange_position).await?;
+            self.handle_untracked_position(exchange_position.clone()).await?;
             reconciled += 1;
         }
+
+        reconciled += self.reconcile_local_missing_positions(&exchange_positions).await?;
 
         Ok(reconciled)
     }
@@ -98,6 +145,328 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
             .find_active_by_symbol_and_side(&exchange_position.symbol, exchange_position.side)
             .await?
             .is_some())
+    }
+
+    async fn reconcile_local_missing_positions(
+        &self,
+        exchange_positions: &[ExchangePosition],
+    ) -> DaemonResult<usize> {
+        let open_positions = self.store.positions().find_active().await?;
+        let mut reconciled = 0usize;
+
+        for position in open_positions {
+            let present_on_exchange = exchange_positions.iter().any(|exchange_position| {
+                exchange_position.symbol == position.symbol
+                    && exchange_position.side == position.side
+            });
+
+            if present_on_exchange {
+                self.clear_missing_observation(position.id).await;
+                continue;
+            }
+
+            match &position.state {
+                PositionState::Active { .. } => {
+                    if self.handle_missing_active_position(&position).await? {
+                        reconciled += 1;
+                    }
+                },
+                PositionState::Entering { .. } | PositionState::Exiting { .. } => {
+                    self.handle_missing_non_active_position(&position).await;
+                },
+                PositionState::Armed
+                | PositionState::Closed { .. }
+                | PositionState::Error { .. }
+                | PositionState::Cancelled => {},
+            }
+        }
+
+        Ok(reconciled)
+    }
+
+    async fn clear_missing_observation(&self, position_id: PositionId) {
+        let mut observations = self.missing_observations.lock().await;
+        observations.remove(&position_id);
+    }
+
+    async fn handle_missing_active_position(&self, position: &Position) -> DaemonResult<bool> {
+        let now = Utc::now();
+        let observation = {
+            let mut observations = self.missing_observations.lock().await;
+            match observations.get(&position.id).cloned() {
+                Some(observation) => observation,
+                None => {
+                    observations.insert(
+                        position.id,
+                        MissingObservation {
+                            symbol: position.symbol.clone(),
+                            side: position.side,
+                            expected_quantity: position.quantity,
+                            first_observed_missing_at: now,
+                            first_observed_instant: Instant::now(),
+                        },
+                    );
+                    debug!(
+                        position_id = %position.id,
+                        symbol = %position.symbol.as_pair(),
+                        side = ?position.side,
+                        quantity = %position.quantity,
+                        "Reverse reconciliation first observed Active position missing on exchange"
+                    );
+                    return Ok(false);
+                },
+            }
+        };
+
+        if observation.first_observed_instant.elapsed() < self.missing_grace {
+            debug!(
+                position_id = %position.id,
+                symbol = %position.symbol.as_pair(),
+                side = ?position.side,
+                "Reverse reconciliation waiting for missing-position grace period"
+            );
+            return Ok(false);
+        }
+
+        let confirmed_missing_at = Utc::now();
+        match self.gather_real_evidence(position, &observation, confirmed_missing_at).await? {
+            Some(input) => {
+                let outcome = {
+                    let manager = self.position_manager.read().await;
+                    manager.reconcile_close(input).await?
+                };
+
+                match outcome {
+                    ReconcileCloseOutcome::Closed | ReconcileCloseOutcome::AlreadyTerminal => {
+                        self.clear_missing_observation(position.id).await;
+                        Ok(matches!(outcome, ReconcileCloseOutcome::Closed))
+                    },
+                    ReconcileCloseOutcome::SkippedNonActive { state } => {
+                        warn!(
+                            position_id = %position.id,
+                            state,
+                            "Reverse reconciliation close skipped by PositionManager"
+                        );
+                        self.clear_missing_observation(position.id).await;
+                        Ok(false)
+                    },
+                    ReconcileCloseOutcome::RejectedUnsupportedEvidence { source } => {
+                        self.emit_unresolved(
+                            position,
+                            &observation,
+                            confirmed_missing_at,
+                            format!("unsupported_evidence:{source}"),
+                        )
+                        .await;
+                        Ok(false)
+                    },
+                    ReconcileCloseOutcome::RejectedInconsistentEvidence { field } => {
+                        self.emit_unresolved(
+                            position,
+                            &observation,
+                            confirmed_missing_at,
+                            format!("inconsistent_evidence:{field}"),
+                        )
+                        .await;
+                        Ok(false)
+                    },
+                }
+            },
+            None => {
+                self.emit_unresolved(
+                    position,
+                    &observation,
+                    confirmed_missing_at,
+                    "no_unambiguous_real_fill_evidence".to_string(),
+                )
+                .await;
+                Ok(false)
+            },
+        }
+    }
+
+    async fn handle_missing_non_active_position(&self, position: &Position) {
+        let observed_at = Utc::now();
+        warn!(
+            position_id = %position.id,
+            state = %position.state.name(),
+            symbol = %position.symbol.as_pair(),
+            side = ?position.side,
+            %observed_at,
+            "Reverse reconciliation detected missing non-Active position, skipped"
+        );
+        self.event_bus.send(DaemonEvent::ReconciliationStaleNonActiveDetected {
+            position_id: position.id,
+            state: position.state.name().to_string(),
+            symbol: position.symbol.clone(),
+            side: position.side,
+            observed_at,
+        });
+    }
+
+    async fn emit_unresolved(
+        &self,
+        position: &Position,
+        observation: &MissingObservation,
+        confirmed_missing_at: DateTime<Utc>,
+        reason: String,
+    ) {
+        error!(
+            position_id = %position.id,
+            symbol = %observation.symbol.as_pair(),
+            side = ?observation.side,
+            expected_quantity = %observation.expected_quantity,
+            %reason,
+            first_observed_missing_at = %observation.first_observed_missing_at,
+            %confirmed_missing_at,
+            "Reverse reconciliation stale Active unresolved"
+        );
+        self.event_bus.send(DaemonEvent::ReconciliationStaleActiveUnresolved {
+            position_id: position.id,
+            symbol: observation.symbol.clone(),
+            side: observation.side,
+            first_observed_missing_at: observation.first_observed_missing_at,
+            confirmed_missing_at,
+            reason,
+        });
+        self.clear_missing_observation(position.id).await;
+    }
+
+    async fn gather_real_evidence(
+        &self,
+        position: &Position,
+        observation: &MissingObservation,
+        _confirmed_missing_at: DateTime<Utc>,
+    ) -> DaemonResult<Option<ReconciledCloseInput>> {
+        if let Some(input) = self.gather_order_fill_evidence(position).await? {
+            return Ok(Some(input));
+        }
+
+        self.gather_user_trade_evidence(position, observation).await
+    }
+
+    async fn gather_order_fill_evidence(
+        &self,
+        position: &Position,
+    ) -> DaemonResult<Option<ReconciledCloseInput>> {
+        let candidate_order_id = match &position.state {
+            PositionState::Active { insurance_stop_id, .. } => {
+                insurance_stop_id.or(position.insurance_stop_id)
+            },
+            _ => position.insurance_stop_id,
+        };
+        let Some(order_id) = candidate_order_id else {
+            return Ok(None);
+        };
+
+        let Some(order) = self.store.orders().find_by_id(order_id).await? else {
+            warn!(
+                position_id = %position.id,
+                %order_id,
+                "Reverse reconciliation could not resolve local insurance stop order"
+            );
+            return Ok(None);
+        };
+        let Some(exchange_order_id) = order.exchange_order_id else {
+            warn!(
+                position_id = %position.id,
+                %order_id,
+                "Reverse reconciliation local insurance stop has no exchange order id"
+            );
+            return Ok(None);
+        };
+
+        let Some(result) = self
+            .exchange
+            .get_order_by_exchange_id(&position.symbol, &exchange_order_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+
+        Ok(Some(Self::input_from_order_result(position.id, result)))
+    }
+
+    async fn gather_user_trade_evidence(
+        &self,
+        position: &Position,
+        observation: &MissingObservation,
+    ) -> DaemonResult<Option<ReconciledCloseInput>> {
+        const USER_TRADES_LIMIT: u16 = 100;
+
+        let trades = self
+            .exchange
+            .get_user_trades_since(
+                &position.symbol,
+                observation.first_observed_missing_at,
+                USER_TRADES_LIMIT,
+            )
+            .await?;
+        let mut compatible = trades.into_iter().filter(|trade| {
+            trade.filled_at >= observation.first_observed_missing_at
+                && trade.filled_quantity == observation.expected_quantity
+        });
+
+        let Some(first) = compatible.next() else {
+            return Ok(None);
+        };
+        if compatible.next().is_some() {
+            warn!(
+                position_id = %position.id,
+                symbol = %position.symbol.as_pair(),
+                side = ?position.side,
+                expected_quantity = %observation.expected_quantity,
+                "Reverse reconciliation found multiple compatible user trades, leaving unresolved"
+            );
+            return Ok(None);
+        }
+
+        Ok(Some(Self::input_from_user_trade(position.id, first)))
+    }
+
+    fn input_from_order_result(
+        position_id: PositionId,
+        result: OrderResult,
+    ) -> ReconciledCloseInput {
+        ReconciledCloseInput {
+            position_id,
+            exit_price: result.fill_price,
+            filled_quantity: result.filled_quantity,
+            fee: result.fee,
+            fee_asset: result.fee_asset.clone(),
+            closed_at: result.filled_at,
+            evidence: ReconciliationEvidence::OrderFillRecord(OrderFillEvidence {
+                exchange_order_id: result.exchange_order_id,
+                fill_price: result.fill_price,
+                filled_quantity: result.filled_quantity,
+                fee: result.fee,
+                fee_asset: result.fee_asset,
+                filled_at: result.filled_at,
+            }),
+        }
+    }
+
+    fn input_from_user_trade(
+        position_id: PositionId,
+        trade: UserTradeRecord,
+    ) -> ReconciledCloseInput {
+        ReconciledCloseInput {
+            position_id,
+            exit_price: trade.fill_price,
+            filled_quantity: trade.filled_quantity,
+            fee: trade.fee,
+            fee_asset: trade.fee_asset.clone(),
+            closed_at: trade.filled_at,
+            evidence: ReconciliationEvidence::UserTradeRecord(UserTradeEvidence {
+                exchange_order_id: trade.exchange_order_id,
+                exchange_trade_id: trade.exchange_trade_id,
+                fill_price: trade.fill_price,
+                filled_quantity: trade.filled_quantity,
+                fee: trade.fee,
+                fee_asset: trade.fee_asset,
+                filled_at: trade.filled_at,
+            }),
+        }
     }
 
     async fn handle_untracked_position(
@@ -172,13 +541,59 @@ mod tests {
     use std::sync::Arc;
 
     use chrono::Utc;
-    use robson_domain::{Position, PositionState, Price, Quantity, Side, Symbol};
-    use robson_exec::StubExchange;
+    use robson_domain::{
+        ExitReason, Order, OrderSide, Position, PositionState, Price, Quantity, RiskConfig, Side,
+        Symbol, TradingPolicy,
+    };
+    use robson_engine::Engine;
+    use robson_exec::{Executor, IntentJournal, OrderResult, StubExchange, UserTradeRecord};
     use robson_store::{MemoryStore, Store};
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
+    use tokio::sync::RwLock;
     use tokio_util::sync::CancellationToken;
 
     use super::*;
+    use crate::query_engine::TracingQueryRecorder;
+
+    fn create_position_manager(
+        exchange: Arc<StubExchange>,
+        store: Arc<MemoryStore>,
+        event_bus: Arc<EventBus>,
+    ) -> Arc<RwLock<PositionManager<StubExchange, MemoryStore>>> {
+        let journal = Arc::new(IntentJournal::new());
+        let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+        let risk_config = RiskConfig::new(dec!(10000)).unwrap();
+        let engine = Engine::new(risk_config);
+
+        Arc::new(RwLock::new(PositionManager::new(
+            engine,
+            executor,
+            store,
+            event_bus,
+            Arc::new(TracingQueryRecorder),
+            TradingPolicy::default(),
+        )))
+    }
+
+    fn create_worker(
+        exchange: Arc<StubExchange>,
+        store: Arc<MemoryStore>,
+        event_bus: Arc<EventBus>,
+        missing_grace: Duration,
+    ) -> ReconciliationWorker<StubExchange, MemoryStore> {
+        let position_manager =
+            create_position_manager(exchange.clone(), store.clone(), event_bus.clone());
+        ReconciliationWorker::new_with_missing_grace(
+            exchange,
+            position_manager,
+            store,
+            event_bus,
+            Duration::from_secs(60),
+            missing_grace,
+            CancellationToken::new(),
+        )
+    }
 
     fn tracked_active_position(symbol: Symbol, side: Side) -> Position {
         let mut position = Position::new(Uuid::now_v7(), symbol, side);
@@ -193,6 +608,78 @@ mod tests {
             last_emitted_stop: None,
         };
         position
+    }
+
+    fn order_result(
+        exchange_order_id: &str,
+        price: Decimal,
+        quantity: Decimal,
+        filled_at: chrono::DateTime<Utc>,
+    ) -> OrderResult {
+        OrderResult {
+            exchange_order_id: exchange_order_id.to_string(),
+            client_order_id: format!("client-{exchange_order_id}"),
+            fill_price: Price::new(price).unwrap(),
+            filled_quantity: Quantity::new(quantity).unwrap(),
+            fee: dec!(0.01),
+            fee_asset: "USDT".to_string(),
+            filled_at,
+        }
+    }
+
+    fn user_trade(
+        exchange_trade_id: &str,
+        exchange_order_id: &str,
+        price: Decimal,
+        quantity: Decimal,
+        filled_at: chrono::DateTime<Utc>,
+    ) -> UserTradeRecord {
+        UserTradeRecord {
+            exchange_order_id: exchange_order_id.to_string(),
+            exchange_trade_id: exchange_trade_id.to_string(),
+            fill_price: Price::new(price).unwrap(),
+            filled_quantity: Quantity::new(quantity).unwrap(),
+            fee: dec!(0.01),
+            fee_asset: "USDT".to_string(),
+            filled_at,
+        }
+    }
+
+    async fn attach_insurance_order(
+        store: &Arc<MemoryStore>,
+        position: &mut Position,
+        exchange_order_id: &str,
+    ) {
+        let order = {
+            let mut order = Order::new_stop_loss_limit(
+                position.id,
+                position.symbol.clone(),
+                OrderSide::Sell,
+                position.quantity,
+                Price::new(dec!(99)).unwrap(),
+                Price::new(dec!(99)).unwrap(),
+            );
+            order.exchange_order_id = Some(exchange_order_id.to_string());
+            order
+        };
+
+        if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+            *insurance_stop_id = Some(order.id);
+        }
+        position.insurance_stop_id = Some(order.id);
+        store.orders().save(&order).await.unwrap();
+        store.positions().save(position).await.unwrap();
+    }
+
+    async fn close_events_for(store: &Arc<MemoryStore>, position_id: PositionId) -> usize {
+        store
+            .events()
+            .find_by_position(position_id)
+            .await
+            .unwrap()
+            .iter()
+            .filter(|event| matches!(event, robson_domain::Event::PositionClosed { .. }))
+            .count()
     }
 
     #[tokio::test]
@@ -210,13 +697,7 @@ mod tests {
             Price::new(dec!(100)).unwrap(),
         );
 
-        let worker = ReconciliationWorker::new(
-            exchange.clone(),
-            store,
-            event_bus,
-            Duration::from_secs(60),
-            CancellationToken::new(),
-        );
+        let worker = create_worker(exchange.clone(), store, event_bus, Duration::from_secs(60));
 
         let reconciled = worker.scan_and_reconcile().await.unwrap();
         assert_eq!(reconciled, 1);
@@ -249,18 +730,351 @@ mod tests {
             .await
             .unwrap();
 
-        let worker = ReconciliationWorker::new(
-            exchange.clone(),
-            store,
-            event_bus,
-            Duration::from_secs(60),
-            CancellationToken::new(),
-        );
+        let worker = create_worker(exchange.clone(), store, event_bus, Duration::from_secs(60));
 
         let reconciled = worker.scan_and_reconcile().await.unwrap();
         assert_eq!(reconciled, 0);
         assert_eq!(exchange.open_positions_len(), 1);
         assert!(receiver.try_recv().is_none());
+    }
+
+    #[tokio::test]
+    async fn test_missing_active_first_observation_does_not_close() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let position = tracked_active_position(symbol, Side::Long);
+        let position_id = position.id;
+        store.positions().save(&position).await.unwrap();
+
+        let worker = create_worker(exchange, store.clone(), event_bus, Duration::from_secs(0));
+
+        let reconciled = worker.scan_and_reconcile().await.unwrap();
+
+        assert_eq!(reconciled, 0);
+        let loaded = store.positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(matches!(loaded.state, PositionState::Active { .. }));
+        assert_eq!(close_events_for(&store, position_id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_missing_active_second_observation_order_fill_closes() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let mut position = tracked_active_position(symbol, Side::Long);
+        let position_id = position.id;
+        attach_insurance_order(&store, &mut position, "EX-ORDER-1").await;
+        exchange.set_order_result(
+            "EX-ORDER-1",
+            order_result("EX-ORDER-1", dec!(90), dec!(0.010), Utc::now()),
+        );
+        let worker = create_worker(exchange, store.clone(), event_bus, Duration::from_secs(0));
+
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 1);
+
+        let closed = store.positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(matches!(
+            closed.state,
+            PositionState::Closed {
+                exit_reason: ExitReason::ReconciledMissingOnExchange,
+                ..
+            }
+        ));
+        assert_eq!(close_events_for(&store, position_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_order_fill_has_priority_over_user_trade() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let mut position = tracked_active_position(symbol.clone(), Side::Long);
+        let position_id = position.id;
+        attach_insurance_order(&store, &mut position, "EX-ORDER-1").await;
+        let now = Utc::now();
+        exchange
+            .set_order_result("EX-ORDER-1", order_result("EX-ORDER-1", dec!(90), dec!(0.010), now));
+        exchange.set_user_trades(
+            &symbol.as_pair(),
+            vec![user_trade(
+                "TRADE-1",
+                "EX-ORDER-2",
+                dec!(91),
+                dec!(0.010),
+                now,
+            )],
+        );
+        let worker = create_worker(exchange, store.clone(), event_bus, Duration::from_secs(0));
+
+        worker.scan_and_reconcile().await.unwrap();
+        worker.scan_and_reconcile().await.unwrap();
+
+        let events = store.events().find_by_position(position_id).await.unwrap();
+        let evidence = events
+            .iter()
+            .find_map(|event| {
+                if let robson_domain::Event::PositionClosed { closure_evidence, .. } = event {
+                    Some(closure_evidence)
+                } else {
+                    None
+                }
+            })
+            .expect("PositionClosed event must be emitted");
+        assert!(matches!(
+            evidence,
+            robson_domain::ClosureEvidence::Reconciled(ReconciliationEvidence::OrderFillRecord(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_missing_active_single_matching_user_trade_closes() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let position = tracked_active_position(symbol.clone(), Side::Long);
+        let position_id = position.id;
+        store.positions().save(&position).await.unwrap();
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+
+        worker.scan_and_reconcile().await.unwrap();
+        exchange.set_user_trades(
+            &symbol.as_pair(),
+            vec![user_trade(
+                "TRADE-1",
+                "EX-ORDER-2",
+                dec!(90),
+                dec!(0.010),
+                Utc::now(),
+            )],
+        );
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 1);
+
+        let closed = store.positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(matches!(closed.state, PositionState::Closed { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_missing_active_zero_user_trades_is_unresolved() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let mut receiver = event_bus.subscribe();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let position = tracked_active_position(symbol, Side::Long);
+        let position_id = position.id;
+        store.positions().save(&position).await.unwrap();
+        let worker = create_worker(exchange, store.clone(), event_bus, Duration::from_secs(0));
+
+        worker.scan_and_reconcile().await.unwrap();
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
+
+        let loaded = store.positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(matches!(loaded.state, PositionState::Active { .. }));
+        assert_eq!(close_events_for(&store, position_id).await, 0);
+        let event = receiver.recv().await.unwrap().unwrap();
+        assert!(matches!(event, DaemonEvent::ReconciliationStaleActiveUnresolved { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_missing_active_multiple_matching_user_trades_is_unresolved() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let mut receiver = event_bus.subscribe();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let position = tracked_active_position(symbol.clone(), Side::Long);
+        let position_id = position.id;
+        store.positions().save(&position).await.unwrap();
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+
+        worker.scan_and_reconcile().await.unwrap();
+        let now = Utc::now();
+        exchange.set_user_trades(
+            &symbol.as_pair(),
+            vec![
+                user_trade("TRADE-1", "EX-ORDER-2", dec!(90), dec!(0.010), now),
+                user_trade("TRADE-2", "EX-ORDER-3", dec!(91), dec!(0.010), now),
+            ],
+        );
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
+
+        let loaded = store.positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(matches!(loaded.state, PositionState::Active { .. }));
+        assert_eq!(close_events_for(&store, position_id).await, 0);
+        let event = receiver.recv().await.unwrap().unwrap();
+        assert!(matches!(event, DaemonEvent::ReconciliationStaleActiveUnresolved { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_missing_active_quantity_mismatch_user_trade_is_unresolved() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let position = tracked_active_position(symbol.clone(), Side::Long);
+        let position_id = position.id;
+        store.positions().save(&position).await.unwrap();
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+
+        worker.scan_and_reconcile().await.unwrap();
+        exchange.set_user_trades(
+            &symbol.as_pair(),
+            vec![user_trade(
+                "TRADE-1",
+                "EX-ORDER-2",
+                dec!(90),
+                dec!(0.020),
+                Utc::now(),
+            )],
+        );
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
+
+        let loaded = store.positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(matches!(loaded.state, PositionState::Active { .. }));
+        assert_eq!(close_events_for(&store, position_id).await, 0);
+    }
+
+    #[tokio::test]
+    async fn test_reconciliation_close_is_idempotent_after_closed() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let mut position = tracked_active_position(symbol, Side::Long);
+        let position_id = position.id;
+        attach_insurance_order(&store, &mut position, "EX-ORDER-1").await;
+        exchange.set_order_result(
+            "EX-ORDER-1",
+            order_result("EX-ORDER-1", dec!(90), dec!(0.010), Utc::now()),
+        );
+        let worker = create_worker(exchange, store.clone(), event_bus, Duration::from_secs(0));
+
+        worker.scan_and_reconcile().await.unwrap();
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 1);
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
+
+        assert_eq!(close_events_for(&store, position_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_position_reappears_clears_missing_grace() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let position = tracked_active_position(symbol.clone(), Side::Long);
+        let position_id = position.id;
+        store.positions().save(&position).await.unwrap();
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+
+        worker.scan_and_reconcile().await.unwrap();
+        assert!(worker.missing_observations.lock().await.contains_key(&position_id));
+        exchange.set_open_position(
+            symbol,
+            Side::Long,
+            Quantity::new(dec!(0.010)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        worker.scan_and_reconcile().await.unwrap();
+
+        assert!(!worker.missing_observations.lock().await.contains_key(&position_id));
+        let loaded = store.positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(matches!(loaded.state, PositionState::Active { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_cross_side_exchange_long_does_not_satisfy_local_short() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let mut position = tracked_active_position(symbol.clone(), Side::Short);
+        let position_id = position.id;
+        attach_insurance_order(&store, &mut position, "EX-ORDER-1").await;
+        exchange.set_open_position(
+            symbol,
+            Side::Long,
+            Quantity::new(dec!(0.010)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        exchange.set_order_result(
+            "EX-ORDER-1",
+            order_result("EX-ORDER-1", dec!(90), dec!(0.010), Utc::now()),
+        );
+        let worker = create_worker(exchange, store.clone(), event_bus, Duration::from_secs(0));
+
+        worker.scan_and_reconcile().await.unwrap();
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 1);
+
+        let closed = store.positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(matches!(closed.state, PositionState::Closed { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_missing_entering_skipped_without_close() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let mut receiver = event_bus.subscribe();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let mut position = tracked_active_position(symbol, Side::Long);
+        position.state = PositionState::Entering {
+            entry_order_id: Uuid::now_v7(),
+            expected_entry: Price::new(dec!(100)).unwrap(),
+            signal_id: Uuid::now_v7(),
+        };
+        let position_id = position.id;
+        store.positions().save(&position).await.unwrap();
+        let worker = create_worker(exchange, store.clone(), event_bus, Duration::from_secs(0));
+
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
+
+        let loaded = store.positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(matches!(loaded.state, PositionState::Entering { .. }));
+        assert_eq!(close_events_for(&store, position_id).await, 0);
+        let event = receiver.recv().await.unwrap().unwrap();
+        assert!(matches!(
+            event,
+            DaemonEvent::ReconciliationStaleNonActiveDetected { state, .. } if state == "entering"
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_missing_exiting_skipped_without_close() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let mut receiver = event_bus.subscribe();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let mut position = tracked_active_position(symbol, Side::Long);
+        position.state = PositionState::Exiting {
+            exit_order_id: Uuid::now_v7(),
+            exit_reason: ExitReason::TrailingStop,
+        };
+        let position_id = position.id;
+        store.positions().save(&position).await.unwrap();
+        let worker = create_worker(exchange, store.clone(), event_bus, Duration::from_secs(0));
+
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
+
+        let loaded = store.positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(matches!(loaded.state, PositionState::Exiting { .. }));
+        assert_eq!(close_events_for(&store, position_id).await, 0);
+        let event = receiver.recv().await.unwrap().unwrap();
+        assert!(matches!(
+            event,
+            DaemonEvent::ReconciliationStaleNonActiveDetected { state, .. } if state == "exiting"
+        ));
     }
 
     // -------------------------------------------------------------------------
@@ -302,13 +1116,8 @@ mod tests {
         // No `set_open_position` call. exchange.open_positions_len() == 0.
         assert_eq!(exchange.open_positions_len(), 0);
 
-        let worker = ReconciliationWorker::new(
-            exchange.clone(),
-            store.clone(),
-            event_bus,
-            Duration::from_secs(60),
-            CancellationToken::new(),
-        );
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(60));
 
         let reconciled = worker.scan_and_reconcile().await.unwrap();
 
