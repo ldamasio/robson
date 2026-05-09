@@ -1007,6 +1007,21 @@ where
         _ => {},
     }
 
+    if let Err(details) = validate_reconcile_close_evidence(&req.evidence) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::to_value(ReconcileCloseErrorResponse {
+                    error: "invalid_evidence".to_string(),
+                    details: Some(details),
+                    position_id: Some(req.position_id),
+                    current_state: None,
+                })
+                .unwrap(),
+            ),
+        ));
+    }
+
     // Build ReconciledCloseInput from the request evidence.
     let (exit_price, filled_quantity, fee, fee_asset, closed_at) = match &req.evidence {
         ReconciliationEvidence::OrderFillRecord(e) => {
@@ -1017,6 +1032,9 @@ where
         },
         _ => unreachable!("guarded above"),
     };
+
+    let closure_evidence_for_response =
+        robson_domain::ClosureEvidence::Reconciled(req.evidence.clone());
 
     let input = crate::position_manager::ReconciledCloseInput {
         position_id: req.position_id,
@@ -1054,16 +1072,8 @@ where
             let position = manager.get_position(req.position_id).await.ok().flatten();
             let (realized_pnl, exit_price_val, closure_evidence) = match &position {
                 Some(p) => match &p.state {
-                    PositionState::Closed {
-                        realized_pnl,
-                        exit_price: ep,
-                        exit_reason,
-                        ..
-                    } => {
-                        let ce = serde_json::json!({
-                            "kind": "reconciled",
-                            "exit_reason": format!("{:?}", exit_reason),
-                        });
+                    PositionState::Closed { realized_pnl, exit_price: ep, .. } => {
+                        let ce = serde_json::to_value(&closure_evidence_for_response).unwrap();
                         (*realized_pnl, ep.as_decimal(), ce)
                     },
                     _ => (
@@ -1150,6 +1160,61 @@ where
             ))
         },
     }
+}
+
+fn validate_reconcile_close_evidence(
+    evidence: &robson_domain::ReconciliationEvidence,
+) -> Result<(), String> {
+    use robson_domain::ReconciliationEvidence;
+
+    match evidence {
+        ReconciliationEvidence::OrderFillRecord(e) => validate_reconcile_close_fields(
+            e.fill_price.as_decimal(),
+            e.filled_quantity.as_decimal(),
+            e.fee,
+            &e.fee_asset,
+            &e.exchange_order_id,
+            None,
+        ),
+        ReconciliationEvidence::UserTradeRecord(e) => validate_reconcile_close_fields(
+            e.fill_price.as_decimal(),
+            e.filled_quantity.as_decimal(),
+            e.fee,
+            &e.fee_asset,
+            &e.exchange_order_id,
+            Some(&e.exchange_trade_id),
+        ),
+        ReconciliationEvidence::AccountSnapshot(_) | ReconciliationEvidence::Estimated(_) => Ok(()),
+    }
+}
+
+fn validate_reconcile_close_fields(
+    fill_price: Decimal,
+    filled_quantity: Decimal,
+    fee: Decimal,
+    fee_asset: &str,
+    exchange_order_id: &str,
+    exchange_trade_id: Option<&str>,
+) -> Result<(), String> {
+    if fill_price <= Decimal::ZERO {
+        return Err("fill_price must be > 0".to_string());
+    }
+    if filled_quantity <= Decimal::ZERO {
+        return Err("filled_quantity must be > 0".to_string());
+    }
+    if fee < Decimal::ZERO {
+        return Err("fee must be >= 0".to_string());
+    }
+    if fee_asset.is_empty() {
+        return Err("fee_asset must not be empty".to_string());
+    }
+    if exchange_order_id.is_empty() {
+        return Err("exchange_order_id must not be empty".to_string());
+    }
+    if matches!(exchange_trade_id, Some("")) {
+        return Err("exchange_trade_id must not be empty".to_string());
+    }
+    Ok(())
 }
 
 // =============================================================================
@@ -2320,6 +2385,9 @@ mod tests {
         let resp: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
         assert_eq!(resp["status"], "closed");
         assert_eq!(resp["position_id"], pos.id.to_string());
+        assert_eq!(resp["closure_evidence"]["kind"], "reconciled");
+        assert_eq!(resp["closure_evidence"]["evidence"]["source"], "order_fill_record");
+        assert_eq!(resp["closure_evidence"]["evidence"]["data"]["exchange_order_id"], "ORD-1");
     }
 
     #[tokio::test]
@@ -2349,6 +2417,9 @@ mod tests {
         let resp_body = response.into_body().collect().await.unwrap().to_bytes();
         let resp: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
         assert_eq!(resp["status"], "closed");
+        assert_eq!(resp["closure_evidence"]["kind"], "reconciled");
+        assert_eq!(resp["closure_evidence"]["evidence"]["source"], "user_trade_record");
+        assert_eq!(resp["closure_evidence"]["evidence"]["data"]["exchange_trade_id"], "TRADE-1");
     }
 
     #[tokio::test]
@@ -2414,20 +2485,40 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_reconcile_close_api_inconsistent_evidence() {
+    async fn test_reconcile_close_api_rejects_invalid_real_evidence_fields() {
         let (app, _event_bus, pm) = create_test_app_with_event_bus(100).await;
         let pos =
             save_active_position_for_api(&pm, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
 
-        // Evidence says fill_price=90, but the serialized ReconciliationEvidence
-        // will have fill_price=90. The input to reconcile_close will use the
-        // evidence's fill_price as exit_price. But we're testing the API-level
-        // deserialization — the inconsistency test needs a mismatch between
-        // the request's implicit exit_price and the evidence.
-        // Since the API derives exit_price from the evidence, there's no way
-        // to create inconsistency at the API layer alone. Instead, we test
-        // that a valid close works and the idempotent 409 is returned.
-        // For actual inconsistent evidence, that's tested in position_manager tests.
+        let body = serde_json::json!({
+            "position_id": pos.id,
+            "evidence": make_order_fill_evidence_json("-1", "1")
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/reconcile-close")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let resp_body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(resp["error"], "invalid_evidence");
+        assert_eq!(resp["details"], "fill_price must be > 0");
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_close_api_second_call_conflicts_after_close() {
+        let (app, _event_bus, pm) = create_test_app_with_event_bus(100).await;
+        let pos =
+            save_active_position_for_api(&pm, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
 
         // First close succeeds
         let body = serde_json::json!({
