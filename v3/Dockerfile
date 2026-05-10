@@ -24,6 +24,7 @@ COPY v3/robson-db/ ./robson-db/
 COPY v3/migrations/ ./migrations/
 COPY v3/robson-testkit/ ./robson-testkit/
 COPY v3/robson-sim/ ./robson-sim/
+COPY v3/robson-cli/ ./robson-cli/
 COPY v3/robsond/ ./robsond/
 
 # Build release binary with postgres feature for production
@@ -63,4 +64,3 @@ HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
 
 # Run daemon
 CMD ["robsond"]
-
