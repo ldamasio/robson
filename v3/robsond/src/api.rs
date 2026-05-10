@@ -285,6 +285,36 @@ pub struct ErrorResponse {
 }
 
 // =============================================================================
+// Reconcile Close Types (Slice 5B1)
+// =============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct ReconcileCloseRequest {
+    pub position_id: Uuid,
+    pub evidence: robson_domain::ReconciliationEvidence,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReconcileCloseSuccessResponse {
+    pub status: String,
+    pub position_id: Uuid,
+    pub realized_pnl: String,
+    pub exit_price: String,
+    pub closure_evidence: serde_json::Value,
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReconcileCloseErrorResponse {
+    pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub position_id: Option<Uuid>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub current_state: Option<String>,
+}
+
+// =============================================================================
 // Safety Net Types
 // =============================================================================
 
@@ -433,6 +463,8 @@ where
         .route("/panic", post(panic_handler))
         // MonthlyHalt trigger (mutating)
         .route("/monthly-halt", post(monthly_halt_trigger_handler))
+        // Manual reconciliation close (Slice 5B1)
+        .route("/reconcile-close", post(reconcile_close_handler))
         .layer(auth_layer)
         .with_state(state);
 
@@ -923,6 +955,268 @@ where
     }))
 }
 
+/// `POST /reconcile-close` — operator-driven manual reconciliation close.
+///
+/// Accepts real evidence (`OrderFillRecord` or `UserTradeRecord`) and closes
+/// a stale-Active position. Rejects `AccountSnapshot` and `Estimated` in
+/// Slice 5B1.
+async fn reconcile_close_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    Json(req): Json<ReconcileCloseRequest>,
+) -> Result<(StatusCode, Json<serde_json::Value>), (StatusCode, Json<serde_json::Value>)>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    use robson_domain::ReconciliationEvidence;
+
+    // Reject unsupported evidence types before touching position manager.
+    match &req.evidence {
+        ReconciliationEvidence::AccountSnapshot(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::to_value(ReconcileCloseErrorResponse {
+                        error: "unsupported_evidence".to_string(),
+                        details: Some(
+                            "account_snapshot evidence is not supported in Slice 5B1".to_string(),
+                        ),
+                        position_id: None,
+                        current_state: None,
+                    })
+                    .unwrap(),
+                ),
+            ));
+        },
+        ReconciliationEvidence::Estimated(_) => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::to_value(ReconcileCloseErrorResponse {
+                        error: "unsupported_evidence".to_string(),
+                        details: Some(
+                            "estimated evidence is not supported in Slice 5B1".to_string(),
+                        ),
+                        position_id: None,
+                        current_state: None,
+                    })
+                    .unwrap(),
+                ),
+            ));
+        },
+        _ => {},
+    }
+
+    if let Err(details) = validate_reconcile_close_evidence(&req.evidence) {
+        return Err((
+            StatusCode::BAD_REQUEST,
+            Json(
+                serde_json::to_value(ReconcileCloseErrorResponse {
+                    error: "invalid_evidence".to_string(),
+                    details: Some(details),
+                    position_id: Some(req.position_id),
+                    current_state: None,
+                })
+                .unwrap(),
+            ),
+        ));
+    }
+
+    // Build ReconciledCloseInput from the request evidence.
+    let (exit_price, filled_quantity, fee, fee_asset, closed_at) = match &req.evidence {
+        ReconciliationEvidence::OrderFillRecord(e) => {
+            (e.fill_price, e.filled_quantity, e.fee, e.fee_asset.clone(), e.filled_at)
+        },
+        ReconciliationEvidence::UserTradeRecord(e) => {
+            (e.fill_price, e.filled_quantity, e.fee, e.fee_asset.clone(), e.filled_at)
+        },
+        _ => unreachable!("guarded above"),
+    };
+
+    let closure_evidence_for_response =
+        robson_domain::ClosureEvidence::Reconciled(req.evidence.clone());
+
+    let input = crate::position_manager::ReconciledCloseInput {
+        position_id: req.position_id,
+        exit_price,
+        filled_quantity,
+        fee,
+        fee_asset,
+        closed_at,
+        evidence: req.evidence,
+    };
+
+    let manager = state.position_manager.write().await;
+    let outcome = manager.reconcile_close(input).await.map_err(|e| match e {
+        DaemonError::PositionNotFound(id) => (
+            StatusCode::NOT_FOUND,
+            Json(
+                serde_json::to_value(ReconcileCloseErrorResponse {
+                    error: "position_not_found".to_string(),
+                    details: None,
+                    position_id: Some(id),
+                    current_state: None,
+                })
+                .unwrap(),
+            ),
+        ),
+        other => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(serde_json::json!({ "error": other.to_string() })),
+        ),
+    })?;
+
+    match outcome {
+        crate::position_manager::ReconcileCloseOutcome::Closed => {
+            // Reload position to get the realized PnL from state.
+            let position = manager.get_position(req.position_id).await.ok().flatten();
+            let (realized_pnl, exit_price_val, closure_evidence) = match &position {
+                Some(p) => match &p.state {
+                    PositionState::Closed { realized_pnl, exit_price: ep, .. } => {
+                        let ce = serde_json::to_value(&closure_evidence_for_response).unwrap();
+                        (*realized_pnl, ep.as_decimal(), ce)
+                    },
+                    _ => (
+                        rust_decimal::Decimal::ZERO,
+                        rust_decimal::Decimal::ZERO,
+                        serde_json::json!({}),
+                    ),
+                },
+                None => (
+                    rust_decimal::Decimal::ZERO,
+                    rust_decimal::Decimal::ZERO,
+                    serde_json::json!({}),
+                ),
+            };
+            let resp = ReconcileCloseSuccessResponse {
+                status: "closed".to_string(),
+                position_id: req.position_id,
+                realized_pnl: realized_pnl.to_string(),
+                exit_price: exit_price_val.to_string(),
+                closure_evidence,
+            };
+            Ok((StatusCode::OK, Json(serde_json::to_value(resp).unwrap())))
+        },
+        crate::position_manager::ReconcileCloseOutcome::AlreadyTerminal => {
+            // Reload to report current state.
+            let current_state = manager
+                .get_position(req.position_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|p| p.state.name().to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            Err((
+                StatusCode::CONFLICT,
+                Json(
+                    serde_json::to_value(ReconcileCloseErrorResponse {
+                        error: "position_not_active".to_string(),
+                        details: Some("Position is already terminal".to_string()),
+                        position_id: Some(req.position_id),
+                        current_state: Some(current_state),
+                    })
+                    .unwrap(),
+                ),
+            ))
+        },
+        crate::position_manager::ReconcileCloseOutcome::SkippedNonActive { state } => Err((
+            StatusCode::CONFLICT,
+            Json(
+                serde_json::to_value(ReconcileCloseErrorResponse {
+                    error: "position_not_active".to_string(),
+                    details: Some(format!("Position is in {} state, expected Active", state)),
+                    position_id: Some(req.position_id),
+                    current_state: Some(state),
+                })
+                .unwrap(),
+            ),
+        )),
+        crate::position_manager::ReconcileCloseOutcome::RejectedUnsupportedEvidence { source } => {
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::to_value(ReconcileCloseErrorResponse {
+                        error: "unsupported_evidence".to_string(),
+                        details: Some(format!("{} evidence is not supported in Slice 5B1", source)),
+                        position_id: None,
+                        current_state: None,
+                    })
+                    .unwrap(),
+                ),
+            ))
+        },
+        crate::position_manager::ReconcileCloseOutcome::RejectedInconsistentEvidence { field } => {
+            Err((
+                StatusCode::BAD_REQUEST,
+                Json(
+                    serde_json::to_value(ReconcileCloseErrorResponse {
+                        error: "inconsistent_evidence".to_string(),
+                        details: Some(format!("field={} mismatches evidence", field)),
+                        position_id: Some(req.position_id),
+                        current_state: None,
+                    })
+                    .unwrap(),
+                ),
+            ))
+        },
+    }
+}
+
+fn validate_reconcile_close_evidence(
+    evidence: &robson_domain::ReconciliationEvidence,
+) -> Result<(), String> {
+    use robson_domain::ReconciliationEvidence;
+
+    match evidence {
+        ReconciliationEvidence::OrderFillRecord(e) => validate_reconcile_close_fields(
+            e.fill_price.as_decimal(),
+            e.filled_quantity.as_decimal(),
+            e.fee,
+            &e.fee_asset,
+            &e.exchange_order_id,
+            None,
+        ),
+        ReconciliationEvidence::UserTradeRecord(e) => validate_reconcile_close_fields(
+            e.fill_price.as_decimal(),
+            e.filled_quantity.as_decimal(),
+            e.fee,
+            &e.fee_asset,
+            &e.exchange_order_id,
+            Some(&e.exchange_trade_id),
+        ),
+        ReconciliationEvidence::AccountSnapshot(_) | ReconciliationEvidence::Estimated(_) => Ok(()),
+    }
+}
+
+fn validate_reconcile_close_fields(
+    fill_price: Decimal,
+    filled_quantity: Decimal,
+    fee: Decimal,
+    fee_asset: &str,
+    exchange_order_id: &str,
+    exchange_trade_id: Option<&str>,
+) -> Result<(), String> {
+    if fill_price <= Decimal::ZERO {
+        return Err("fill_price must be > 0".to_string());
+    }
+    if filled_quantity <= Decimal::ZERO {
+        return Err("filled_quantity must be > 0".to_string());
+    }
+    if fee < Decimal::ZERO {
+        return Err("fee must be >= 0".to_string());
+    }
+    if fee_asset.is_empty() {
+        return Err("fee_asset must not be empty".to_string());
+    }
+    if exchange_order_id.is_empty() {
+        return Err("exchange_order_id must not be empty".to_string());
+    }
+    if matches!(exchange_trade_id, Some("")) {
+        return Err("exchange_trade_id must not be empty".to_string());
+    }
+    Ok(())
+}
+
 // =============================================================================
 // Safety Net Handlers
 // =============================================================================
@@ -1328,7 +1622,7 @@ mod tests {
         http::{header::CONTENT_TYPE, Request},
     };
     use http_body_util::BodyExt;
-    use robson_domain::{RiskConfig, TechnicalStopDistance, TradingPolicy};
+    use robson_domain::{Quantity, RiskConfig, TechnicalStopDistance, TradingPolicy};
     use robson_engine::Engine;
     use robson_exec::{Executor, IntentJournal, StubExchange};
     use robson_store::MemoryStore;
@@ -1993,5 +2287,445 @@ mod tests {
         );
         let _ = build_cors_layer();
         std::env::remove_var("ROBSON_CORS_ALLOWED_ORIGINS");
+    }
+
+    // =========================================================================
+    // Reconcile Close API Tests (Slice 5B1)
+    // =========================================================================
+
+    async fn save_active_position_for_api(
+        position_manager: &Arc<RwLock<PositionManager<StubExchange, MemoryStore>>>,
+        symbol: &str,
+        side: Side,
+        entry_price: Decimal,
+        quantity: Decimal,
+    ) -> Position {
+        let account_id = Uuid::now_v7();
+        let symbol = Symbol::from_pair(symbol).unwrap();
+        let entry_price = Price::new(entry_price).unwrap();
+        let trailing_stop = match side {
+            Side::Long => Price::new(entry_price.as_decimal() - dec!(10)).unwrap(),
+            Side::Short => Price::new(entry_price.as_decimal() + dec!(10)).unwrap(),
+        };
+        let quantity = Quantity::new(quantity).unwrap();
+        let now = chrono::Utc::now();
+
+        let mut position = Position::new(account_id, symbol, side);
+        position.entry_price = Some(entry_price);
+        position.entry_filled_at = Some(now);
+        position.quantity = quantity;
+        position.state = PositionState::Active {
+            current_price: entry_price,
+            trailing_stop,
+            favorable_extreme: entry_price,
+            extreme_at: now,
+            insurance_stop_id: None,
+            last_emitted_stop: None,
+        };
+        position.updated_at = now;
+
+        position_manager.read().await.store().positions().save(&position).await.unwrap();
+        position
+    }
+
+    fn make_order_fill_evidence_json(exit_price: &str, quantity: &str) -> serde_json::Value {
+        serde_json::json!({
+            "source": "order_fill_record",
+            "data": {
+                "exchange_order_id": "ORD-1",
+                "fill_price": exit_price,
+                "filled_quantity": quantity,
+                "fee": "0.01",
+                "fee_asset": "USDT",
+                "filled_at": "2026-05-09T14:30:00Z"
+            }
+        })
+    }
+
+    fn make_user_trade_evidence_json(exit_price: &str, quantity: &str) -> serde_json::Value {
+        serde_json::json!({
+            "source": "user_trade_record",
+            "data": {
+                "exchange_order_id": "ORD-2",
+                "exchange_trade_id": "TRADE-1",
+                "fill_price": exit_price,
+                "filled_quantity": quantity,
+                "fee": "0.01",
+                "fee_asset": "USDT",
+                "filled_at": "2026-05-09T14:30:00Z"
+            }
+        })
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_close_api_success_order_fill() {
+        let (app, _event_bus, pm) = create_test_app_with_event_bus(100).await;
+        let pos =
+            save_active_position_for_api(&pm, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+
+        let body = serde_json::json!({
+            "position_id": pos.id,
+            "evidence": make_order_fill_evidence_json("90", "1")
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/reconcile-close")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let resp_body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(resp["status"], "closed");
+        assert_eq!(resp["position_id"], pos.id.to_string());
+        assert_eq!(resp["closure_evidence"]["kind"], "reconciled");
+        assert_eq!(resp["closure_evidence"]["evidence"]["source"], "order_fill_record");
+        assert_eq!(resp["closure_evidence"]["evidence"]["data"]["exchange_order_id"], "ORD-1");
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_close_api_success_user_trade() {
+        let (app, _event_bus, pm) = create_test_app_with_event_bus(100).await;
+        let pos =
+            save_active_position_for_api(&pm, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+
+        let body = serde_json::json!({
+            "position_id": pos.id,
+            "evidence": make_user_trade_evidence_json("90", "1")
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/reconcile-close")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let resp_body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(resp["status"], "closed");
+        assert_eq!(resp["closure_evidence"]["kind"], "reconciled");
+        assert_eq!(resp["closure_evidence"]["evidence"]["source"], "user_trade_record");
+        assert_eq!(resp["closure_evidence"]["evidence"]["data"]["exchange_trade_id"], "TRADE-1");
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_close_api_position_not_found() {
+        let (app, _event_bus, _pm) = create_test_app_with_event_bus(100).await;
+        let fake_id = Uuid::now_v7();
+
+        let body = serde_json::json!({
+            "position_id": fake_id,
+            "evidence": make_order_fill_evidence_json("90", "1")
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/reconcile-close")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let resp_body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(resp["error"], "position_not_found");
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_close_api_position_not_active() {
+        let (app, _event_bus, pm) = create_test_app_with_event_bus(100).await;
+        // Save position in Armed state (not Active) — reconcile_close should
+        // reject it with SkippedNonActive.
+        let account_id = Uuid::now_v7();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let mut pos = Position::new(account_id, symbol, Side::Long);
+        pos.updated_at = chrono::Utc::now();
+        pm.read().await.store().positions().save(&pos).await.unwrap();
+
+        let body = serde_json::json!({
+            "position_id": pos.id,
+            "evidence": make_order_fill_evidence_json("90", "1")
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/reconcile-close")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let resp_body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(resp["error"], "position_not_active");
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_close_api_rejects_invalid_real_evidence_fields() {
+        let (app, _event_bus, pm) = create_test_app_with_event_bus(100).await;
+        let pos =
+            save_active_position_for_api(&pm, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+
+        let body = serde_json::json!({
+            "position_id": pos.id,
+            "evidence": make_order_fill_evidence_json("-1", "1")
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/reconcile-close")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let resp_body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(resp["error"], "invalid_evidence");
+        assert_eq!(resp["details"], "fill_price must be > 0");
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_close_api_second_call_conflicts_after_close() {
+        let (app, _event_bus, pm) = create_test_app_with_event_bus(100).await;
+        let pos =
+            save_active_position_for_api(&pm, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+
+        // First close succeeds
+        let body = serde_json::json!({
+            "position_id": pos.id,
+            "evidence": make_order_fill_evidence_json("90", "1")
+        });
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/reconcile-close")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Second close returns 409 (idempotent — not active anymore)
+        let body2 = serde_json::json!({
+            "position_id": pos.id,
+            "evidence": make_order_fill_evidence_json("85", "1")
+        });
+        let response2 = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/reconcile-close")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body2.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response2.status(), StatusCode::CONFLICT);
+        let resp_body = response2.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(resp["error"], "position_not_active");
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_close_api_unauthorized() {
+        let (app_with_token, _event_bus, pm) = {
+            let exchange = Arc::new(StubExchange::new(dec!(95000)));
+            let journal = Arc::new(IntentJournal::new());
+            let store = Arc::new(MemoryStore::new());
+            let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+            let event_bus = Arc::new(crate::event_bus::EventBus::new(100));
+            let risk_config = RiskConfig::new(dec!(10000)).unwrap();
+            let engine = Engine::new(risk_config);
+            let manager = PositionManager::new(
+                engine,
+                executor,
+                store,
+                Arc::clone(&event_bus),
+                Arc::new(TracingQueryRecorder),
+                TradingPolicy::default(),
+            );
+            let position_manager = Arc::new(RwLock::new(manager));
+            let circuit_breaker = position_manager.read().await.circuit_breaker();
+
+            let state = Arc::new(ApiState {
+                position_manager: Arc::clone(&position_manager),
+                event_bus: Arc::clone(&event_bus),
+                circuit_breaker,
+                position_monitor: None,
+                #[cfg(feature = "postgres")]
+                pg_pool: None,
+                #[cfg(feature = "postgres")]
+                tenant_id: None,
+                api_token: Some("secret-token-123".to_string()),
+            });
+
+            (create_router(state), event_bus, position_manager)
+        };
+
+        let _pos =
+            save_active_position_for_api(&pm, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+
+        let body = serde_json::json!({
+            "position_id": Uuid::now_v7(),
+            "evidence": make_order_fill_evidence_json("90", "1")
+        });
+
+        let response = app_with_token
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/reconcile-close")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_close_api_idempotent() {
+        let (app, _event_bus, pm) = create_test_app_with_event_bus(100).await;
+        let pos =
+            save_active_position_for_api(&pm, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+
+        let body = serde_json::json!({
+            "position_id": pos.id,
+            "evidence": make_order_fill_evidence_json("90", "1")
+        });
+
+        // First call closes
+        let r1 = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/reconcile-close")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::OK);
+
+        // Second call returns 409
+        let r2 = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/reconcile-close")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::CONFLICT);
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_close_api_rejects_account_snapshot() {
+        let (app, _event_bus, _pm) = create_test_app_with_event_bus(100).await;
+
+        let body = serde_json::json!({
+            "position_id": Uuid::now_v7(),
+            "evidence": {
+                "source": "account_snapshot",
+                "data": {
+                    "first_observed_missing_at": "2026-05-09T14:00:00Z",
+                    "confirmed_missing_at": "2026-05-09T14:01:00Z"
+                }
+            }
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/reconcile-close")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let resp_body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(resp["error"], "unsupported_evidence");
+    }
+
+    #[tokio::test]
+    async fn test_reconcile_close_api_rejects_estimated() {
+        let (app, _event_bus, _pm) = create_test_app_with_event_bus(100).await;
+
+        let body = serde_json::json!({
+            "position_id": Uuid::now_v7(),
+            "evidence": {
+                "source": "estimated",
+                "data": {
+                    "estimation_basis": "trailing_stop_at_detection",
+                    "exit_price": "95000.00",
+                    "evaluator": "op:ldamasio",
+                    "detected_at": "2026-05-09T14:30:00Z"
+                }
+            }
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/reconcile-close")
+                    .header("content-type", "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let resp_body = response.into_body().collect().await.unwrap().to_bytes();
+        let resp: serde_json::Value = serde_json::from_slice(&resp_body).unwrap();
+        assert_eq!(resp["error"], "unsupported_evidence");
     }
 }
