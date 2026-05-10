@@ -47,6 +47,158 @@ struct MissingObservation {
     first_observed_instant: Instant,
 }
 
+// ---------------------------------------------------------------------------
+// Free functions — evidence gathering helpers extracted from
+// ReconciliationWorker for reuse by the planned startup auto_reconcile path
+// (Slice 5B2B).
+// ---------------------------------------------------------------------------
+
+pub(crate) async fn gather_real_evidence<E, S>(
+    exchange: &Arc<E>,
+    store: &Arc<S>,
+    position: &Position,
+    expected_quantity: Quantity,
+    observed_at_floor: DateTime<Utc>,
+) -> DaemonResult<Option<ReconciledCloseInput>>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    if let Some(input) = gather_order_fill_evidence(exchange, store, position).await? {
+        return Ok(Some(input));
+    }
+
+    gather_user_trade_evidence::<E, S>(exchange, position, expected_quantity, observed_at_floor)
+        .await
+}
+
+pub(crate) async fn gather_order_fill_evidence<E, S>(
+    exchange: &Arc<E>,
+    store: &Arc<S>,
+    position: &Position,
+) -> DaemonResult<Option<ReconciledCloseInput>>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let candidate_order_id = match &position.state {
+        PositionState::Active { insurance_stop_id, .. } => {
+            insurance_stop_id.or(position.insurance_stop_id)
+        },
+        _ => position.insurance_stop_id,
+    };
+    let Some(order_id) = candidate_order_id else {
+        return Ok(None);
+    };
+
+    let Some(order) = store.orders().find_by_id(order_id).await? else {
+        warn!(
+            position_id = %position.id,
+            %order_id,
+            "Reverse reconciliation could not resolve local insurance stop order"
+        );
+        return Ok(None);
+    };
+    let Some(exchange_order_id) = order.exchange_order_id else {
+        warn!(
+            position_id = %position.id,
+            %order_id,
+            "Reverse reconciliation local insurance stop has no exchange order id"
+        );
+        return Ok(None);
+    };
+
+    let Some(result) =
+        exchange.get_order_by_exchange_id(&position.symbol, &exchange_order_id).await?
+    else {
+        return Ok(None);
+    };
+
+    Ok(Some(input_from_order_result(position.id, result)))
+}
+
+#[allow(unused_type_params)]
+pub(crate) async fn gather_user_trade_evidence<E, S>(
+    exchange: &Arc<E>,
+    position: &Position,
+    expected_quantity: Quantity,
+    observed_at_floor: DateTime<Utc>,
+) -> DaemonResult<Option<ReconciledCloseInput>>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    const USER_TRADES_LIMIT: u16 = 100;
+
+    let trades = exchange
+        .get_user_trades_since(&position.symbol, observed_at_floor, USER_TRADES_LIMIT)
+        .await?;
+    let mut compatible = trades.into_iter().filter(|trade| {
+        trade.filled_at >= observed_at_floor && trade.filled_quantity == expected_quantity
+    });
+
+    let Some(first) = compatible.next() else {
+        return Ok(None);
+    };
+    if compatible.next().is_some() {
+        warn!(
+            position_id = %position.id,
+            symbol = %position.symbol.as_pair(),
+            side = ?position.side,
+            expected_quantity = %expected_quantity,
+            "Reverse reconciliation found multiple compatible user trades, leaving unresolved"
+        );
+        return Ok(None);
+    }
+
+    Ok(Some(input_from_user_trade(position.id, first)))
+}
+
+pub(crate) fn input_from_order_result(
+    position_id: PositionId,
+    result: OrderResult,
+) -> ReconciledCloseInput {
+    ReconciledCloseInput {
+        position_id,
+        exit_price: result.fill_price,
+        filled_quantity: result.filled_quantity,
+        fee: result.fee,
+        fee_asset: result.fee_asset.clone(),
+        closed_at: result.filled_at,
+        evidence: ReconciliationEvidence::OrderFillRecord(OrderFillEvidence {
+            exchange_order_id: result.exchange_order_id,
+            fill_price: result.fill_price,
+            filled_quantity: result.filled_quantity,
+            fee: result.fee,
+            fee_asset: result.fee_asset,
+            filled_at: result.filled_at,
+        }),
+    }
+}
+
+pub(crate) fn input_from_user_trade(
+    position_id: PositionId,
+    trade: UserTradeRecord,
+) -> ReconciledCloseInput {
+    ReconciledCloseInput {
+        position_id,
+        exit_price: trade.fill_price,
+        filled_quantity: trade.filled_quantity,
+        fee: trade.fee,
+        fee_asset: trade.fee_asset.clone(),
+        closed_at: trade.filled_at,
+        evidence: ReconciliationEvidence::UserTradeRecord(UserTradeEvidence {
+            exchange_order_id: trade.exchange_order_id,
+            exchange_trade_id: trade.exchange_trade_id,
+            fill_price: trade.fill_price,
+            filled_quantity: trade.filled_quantity,
+            fee: trade.fee,
+            fee_asset: trade.fee_asset,
+            filled_at: trade.filled_at,
+        }),
+    }
+}
+
 impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     /// Create a new reconciliation worker.
     pub fn new(
@@ -226,7 +378,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         }
 
         let confirmed_missing_at = Utc::now();
-        match self.gather_real_evidence(position, &observation, confirmed_missing_at).await? {
+        match gather_real_evidence(
+            &self.exchange,
+            &self.store,
+            position,
+            observation.expected_quantity,
+            observation.first_observed_missing_at,
+        )
+        .await?
+        {
             Some(input) => {
                 let outcome = {
                     let manager = self.position_manager.read().await;
@@ -329,142 +489,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         self.clear_missing_observation(position.id).await;
     }
 
-    async fn gather_real_evidence(
-        &self,
-        position: &Position,
-        observation: &MissingObservation,
-        _confirmed_missing_at: DateTime<Utc>,
-    ) -> DaemonResult<Option<ReconciledCloseInput>> {
-        if let Some(input) = self.gather_order_fill_evidence(position).await? {
-            return Ok(Some(input));
-        }
-
-        self.gather_user_trade_evidence(position, observation).await
-    }
-
-    async fn gather_order_fill_evidence(
-        &self,
-        position: &Position,
-    ) -> DaemonResult<Option<ReconciledCloseInput>> {
-        let candidate_order_id = match &position.state {
-            PositionState::Active { insurance_stop_id, .. } => {
-                insurance_stop_id.or(position.insurance_stop_id)
-            },
-            _ => position.insurance_stop_id,
-        };
-        let Some(order_id) = candidate_order_id else {
-            return Ok(None);
-        };
-
-        let Some(order) = self.store.orders().find_by_id(order_id).await? else {
-            warn!(
-                position_id = %position.id,
-                %order_id,
-                "Reverse reconciliation could not resolve local insurance stop order"
-            );
-            return Ok(None);
-        };
-        let Some(exchange_order_id) = order.exchange_order_id else {
-            warn!(
-                position_id = %position.id,
-                %order_id,
-                "Reverse reconciliation local insurance stop has no exchange order id"
-            );
-            return Ok(None);
-        };
-
-        let Some(result) = self
-            .exchange
-            .get_order_by_exchange_id(&position.symbol, &exchange_order_id)
-            .await?
-        else {
-            return Ok(None);
-        };
-
-        Ok(Some(Self::input_from_order_result(position.id, result)))
-    }
-
-    async fn gather_user_trade_evidence(
-        &self,
-        position: &Position,
-        observation: &MissingObservation,
-    ) -> DaemonResult<Option<ReconciledCloseInput>> {
-        const USER_TRADES_LIMIT: u16 = 100;
-
-        let trades = self
-            .exchange
-            .get_user_trades_since(
-                &position.symbol,
-                observation.first_observed_missing_at,
-                USER_TRADES_LIMIT,
-            )
-            .await?;
-        let mut compatible = trades.into_iter().filter(|trade| {
-            trade.filled_at >= observation.first_observed_missing_at
-                && trade.filled_quantity == observation.expected_quantity
-        });
-
-        let Some(first) = compatible.next() else {
-            return Ok(None);
-        };
-        if compatible.next().is_some() {
-            warn!(
-                position_id = %position.id,
-                symbol = %position.symbol.as_pair(),
-                side = ?position.side,
-                expected_quantity = %observation.expected_quantity,
-                "Reverse reconciliation found multiple compatible user trades, leaving unresolved"
-            );
-            return Ok(None);
-        }
-
-        Ok(Some(Self::input_from_user_trade(position.id, first)))
-    }
-
-    fn input_from_order_result(
-        position_id: PositionId,
-        result: OrderResult,
-    ) -> ReconciledCloseInput {
-        ReconciledCloseInput {
-            position_id,
-            exit_price: result.fill_price,
-            filled_quantity: result.filled_quantity,
-            fee: result.fee,
-            fee_asset: result.fee_asset.clone(),
-            closed_at: result.filled_at,
-            evidence: ReconciliationEvidence::OrderFillRecord(OrderFillEvidence {
-                exchange_order_id: result.exchange_order_id,
-                fill_price: result.fill_price,
-                filled_quantity: result.filled_quantity,
-                fee: result.fee,
-                fee_asset: result.fee_asset,
-                filled_at: result.filled_at,
-            }),
-        }
-    }
-
-    fn input_from_user_trade(
-        position_id: PositionId,
-        trade: UserTradeRecord,
-    ) -> ReconciledCloseInput {
-        ReconciledCloseInput {
-            position_id,
-            exit_price: trade.fill_price,
-            filled_quantity: trade.filled_quantity,
-            fee: trade.fee,
-            fee_asset: trade.fee_asset.clone(),
-            closed_at: trade.filled_at,
-            evidence: ReconciliationEvidence::UserTradeRecord(UserTradeEvidence {
-                exchange_order_id: trade.exchange_order_id,
-                exchange_trade_id: trade.exchange_trade_id,
-                fill_price: trade.fill_price,
-                filled_quantity: trade.filled_quantity,
-                fee: trade.fee,
-                fee_asset: trade.fee_asset,
-                filled_at: trade.filled_at,
-            }),
-        }
-    }
 
     async fn handle_untracked_position(
         &self,
