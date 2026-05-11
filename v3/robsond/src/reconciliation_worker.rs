@@ -68,8 +68,7 @@ where
         return Ok(Some(input));
     }
 
-    gather_user_trade_evidence::<E, S>(exchange, position, expected_quantity, observed_at_floor)
-        .await
+    gather_user_trade_evidence::<E>(exchange, position, expected_quantity, observed_at_floor).await
 }
 
 pub(crate) async fn gather_order_fill_evidence<E, S>(
@@ -117,8 +116,7 @@ where
     Ok(Some(input_from_order_result(position.id, result)))
 }
 
-#[allow(unused_type_params)]
-pub(crate) async fn gather_user_trade_evidence<E, S>(
+pub(crate) async fn gather_user_trade_evidence<E>(
     exchange: &Arc<E>,
     position: &Position,
     expected_quantity: Quantity,
@@ -126,7 +124,6 @@ pub(crate) async fn gather_user_trade_evidence<E, S>(
 ) -> DaemonResult<Option<ReconciledCloseInput>>
 where
     E: ExchangePort + 'static,
-    S: Store + 'static,
 {
     const USER_TRADES_LIMIT: u16 = 100;
 
