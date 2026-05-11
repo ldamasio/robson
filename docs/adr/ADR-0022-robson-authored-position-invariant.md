@@ -1,8 +1,8 @@
 # ADR-0022 — Robson-Authored Position Invariant
 
 **Date**: 2026-04-18
-**Last Amended**: 2026-05-08 (I3 — Reverse Reconciliation; see Amendments)
-**Status**: DECIDED — FOLLOW-UP REQUIRED (reconciliation worker + close path are target architecture; reverse reconciliation per I3 in flight under TD-2026-05-05-001)
+**Last Amended**: 2026-05-11 (5B1 live + 5B2A merged; see Amendments)
+**Status**: DECIDED — IN PROGRESS (I3 runtime steady-state and startup abort live; manual recovery 5B1 live; startup auto_reconcile 5B2B planned)
 **Deciders**: RBX Systems (operator + architecture)
 
 ---
@@ -265,3 +265,20 @@ This ADR remains the canonical authority for the existence and
 non-negotiability of the invariant; the policy holds the operational
 detail and may evolve as I3's mechanics are refined without re-amending
 this ADR.
+
+### 2026-05-09 — Slice 5B1: manual recovery path live
+
+Operator-driven manual recovery is live via `robson-cli reconcile-close` and
+`POST /reconcile-close`. Runbook §Recovery Command is now operational for
+`OrderFillRecord` and `UserTradeRecord` evidence. `AccountSnapshot` and
+`Estimated` remain rejected for the operator-CLI path.
+
+### 2026-05-11 — Slice 5B2A: evidence helper refactor merged
+
+`reconciliation_worker.rs` evidence helpers refactored (no behavior change).
+Startup `auto_reconcile` (Slice 5B2B) remains planned.
+
+**Invariant preserved**: auto-close at startup requires real exchange evidence
+(`OrderFillRecord` or `UserTradeRecord`) and is all-or-nothing — any position
+lacking evidence aborts startup with exit 78, consistent with the Robson-authored
+position invariant's fail-closed guarantee.

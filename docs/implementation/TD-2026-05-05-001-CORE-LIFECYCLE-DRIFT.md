@@ -1,6 +1,6 @@
 # TD-2026-05-05-001 — Core Position Lifecycle Drift
 
-**Status**: In progress — Slices 0/1/2/3/4A/4B/5A done; Slice 5B next
+**Status**: In progress — Slices 0/1/2/3/4A/4B/5A/5B1/hotfix-docker/5B2A done; 5B2B/5B2C planned
 **Severity**: High
 **Area**: `robsond` reconciliation, position lifecycle
 **Discovered**: 2026-05-05
@@ -428,13 +428,106 @@ Tests added (210 lib tests passing):
 
 - **Commit**: `feat(robsond): startup gate abort path and config for stale-active drift (Slice 5A)`
 
-### Slice 5B — `auto_reconcile` path + robson-cli — NEXT
+### Slice 5B1 — `robson-cli reconcile-close` (operator-driven manual path) — DONE (2026-05-09, PR #60)
 
-- Implement Path B (`auto_reconcile`) per Amendment §3.
-- New CLI subcommand `robson-cli reconcile-close` for operator-driven closes
-  (Path A, operator-triggered).
-- **Tests**: integration (`#[sqlx::test]`) covering auto_reconcile path.
-- **Commit**: `feat(robsond): startup auto-reconcile path and operator CLI (Slice 5B)`
+Outcome:
+
+- New crate `v3/robson-cli` with `reconcile-close` subcommand.
+  Sends `POST /reconcile-close` to `robsond`; validates evidence shape
+  locally before the network call.
+- New `POST /reconcile-close` API endpoint in `robsond`.
+  Validates Bearer token, deserializes evidence, calls
+  `PositionManager::reconcile_close()`. Returns `realized_pnl` and
+  `exit_price` on success.
+- Only `OrderFillRecord` and `UserTradeRecord` evidence accepted.
+  `AccountSnapshot` and `Estimated` are rejected at both CLI and API level
+  (design decision: unambiguous real evidence only for operator-driven path).
+- Exit codes 0–6 documented in the runbook.
+- Runbook `docs/runbooks/td-2026-05-05-001-stale-active-recovery.md`
+  updated with sample commands and evidence JSON.
+
+Tests added (via `test(robsond): add /reconcile-close API tests`):
+API validation, evidence rejection, position-not-found (404), position-not-active
+(409), and evidence-inconsistent (400) paths covered.
+
+Scoped PR: #60.
+
+### Hotfix — Docker `robson-cli` workspace member — DONE (2026-05-09, PR #61)
+
+Outcome:
+
+- `v3/Dockerfile` updated to include `robson-cli` in the workspace build so
+  the `robson-cli` binary is present inside the `robsond` container image.
+- No algorithm change. Build-system fix only.
+- Commit `1b275638 fix(docker): include robson-cli workspace member in robsond build`.
+
+### Slice 5B2A — Evidence helper refactor in `reconciliation_worker.rs` — DONE (2026-05-11)
+
+Outcome:
+
+- Extracted shared evidence helper functions in
+  `v3/robsond/src/reconciliation_worker.rs` into dedicated private helpers.
+- Simplified the user-trade evidence helper (deduplication, cleaner logic).
+- **No behavior change.** Pure refactor — all existing tests continue passing.
+- Commits:
+  - `20283d9e refactor(robsond): extract reconciliation evidence helpers`
+  - `26e82837 refactor(robsond): simplify user trade evidence helper`
+
+5B2A is the preparatory refactor that makes `reconciliation_worker.rs` ready
+to receive the `auto_reconcile` startup logic in Slice 5B2B without conflating
+the refactor with the behavior change.
+
+---
+
+#### 5B2 Architectural Decision — Sub-slice breakdown and auto_reconcile algorithm
+
+5B is broken into three sub-slices:
+
+| Sub-slice | Scope | Status |
+|---|---|---|
+| 5B2A | Refactor evidence helpers — no behavior change | DONE |
+| 5B2B | Config + startup `auto_reconcile` opt-in algorithm | PLANNED |
+| 5B2C | Docs/runbook/testnet drill | PLANNED |
+
+**Startup `auto_reconcile` algorithm (for 5B2B) — two-phase / all-or-nothing:**
+
+1. Detect all stale-Active positions (same gate as the 5A abort path).
+2. Collect and validate real evidence for each position (`OrderFillRecord` or
+   `UserTradeRecord`) — no partial or estimated substitution.
+3. If any position lacks real unambiguous evidence → abort startup with exit
+   code 78 (same as `abort` policy). No position is closed.
+4. If all positions have real evidence → call `reconcile_close` for each.
+
+**Policy decisions for auto_reconcile (5B2B):**
+
+- `abort` remains the **default** and the safe baseline.
+- `auto_reconcile` is **opt-in** via
+  `ROBSON_RECONCILIATION_ON_STARTUP_STALE_ACTIVE = "auto_reconcile"`.
+- `auto_reconcile` may only auto-close using `OrderFillRecord` or
+  `UserTradeRecord`. No `AccountSnapshot` auto-close at startup.
+- `Estimated` evidence at startup always downgrades to `abort` behavior —
+  never auto-closes.
+- No partial closes: if any stale-Active lacks evidence, the entire startup
+  is aborted without closing any position.
+
+### Slice 5B2B — Startup `auto_reconcile` algorithm + config — PLANNED
+
+- Implement two-phase all-or-nothing `startup_reverse_reconciliation()`.
+- Accept `auto_reconcile` in `StartupStaleActivePolicy` (currently only
+  `abort` is parsed; unknown values produce a config error).
+- Add integration tests covering the auto_reconcile happy path, the
+  Estimated-downgrade path, and the partial-evidence abort path.
+- **Commit (suggested)**: `feat(robsond): startup auto-reconcile two-phase path (Slice 5B2B)`
+
+### Slice 5B2C — Runbook finalization + testnet drill — PLANNED
+
+- Finalize `docs/runbooks/td-2026-05-05-001-stale-active-recovery.md` with
+  the Path C (auto_reconcile) section and a drill checklist.
+- Execute one testnet drill (stale-Active seeded manually → daemon starts
+  with `auto_reconcile` → validates close outcome).
+- Only after testnet drill passes consider enabling `auto_reconcile` in
+  production config.
+- **Commit (suggested)**: `docs(runbooks): add auto_reconcile path and testnet drill checklist`
 
 ### Slice 6 — Slot/monthly accounting regression coverage
 
@@ -539,3 +632,6 @@ All asserted via `cargo test -p robsond` plus targeted Postgres tests under
 |---|---|---|
 | 2026-05-08 | Initial draft (Slice 0). Amendments §1, §2, §3 incorporated. | Claude Opus 4.7 |
 | 2026-05-09 | Slice 5A done: startup gate abort path, config, exit code 78, runbook. | Claude Sonnet 4.6 |
+| 2026-05-09 | Slice 5B1 done (PR #60): `robson-cli reconcile-close` + `POST /reconcile-close`. Operator-driven manual recovery live. | Claude Opus 4.7 |
+| 2026-05-09 | Hotfix done (PR #61): Dockerfile includes `robson-cli` workspace member. | Claude Sonnet 4.6 |
+| 2026-05-11 | Slice 5B2A done: evidence helper refactor in `reconciliation_worker.rs`. No behavior change. 5B2 architectural decision recorded (two-phase auto_reconcile algorithm, opt-in, all-or-nothing). 5B2B/5B2C marked PLANNED. | Claude Sonnet 4.6 |
