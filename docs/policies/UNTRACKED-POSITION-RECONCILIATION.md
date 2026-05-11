@@ -153,6 +153,31 @@ priority order**:
    the chosen `exit_price`, optional `evaluator` identity, and
    `detected_at`.
 
+#### I3 §E — Startup policy and operational status
+
+**Current operational state (as of 2026-05-11):**
+
+- I3 runtime steady-state reconciliation (worker loop) is **live** (Slice 4B).
+- Startup default is **fail-closed abort** — exit code 78 (Slice 5A).
+- Operator-driven manual recovery is **live** via `robson-cli reconcile-close`
+  and `POST /reconcile-close` (Slice 5B1). Accepts `OrderFillRecord` and
+  `UserTradeRecord` only.
+- Startup `auto_reconcile` is **planned** (Slice 5B2B) and is **not yet live**.
+
+**Rules for startup `auto_reconcile` (when it ships):**
+
+- Opt-in only: default remains `abort`.
+- Two-phase / all-or-nothing: collect evidence for all stale-Active positions
+  first; apply closes only if every position has real evidence.
+- Only `OrderFillRecord` or `UserTradeRecord` may auto-close positions at
+  startup. `AccountSnapshot` and `Estimated` do not qualify for startup
+  auto-close.
+- If any position lacks real evidence, abort with exit 78 (same as `abort`
+  policy). No partial close.
+
+Until Slice 5B2B is merged and validated via testnet drill (Slice 5B2C), use
+the operator manual path (Slice 5B1) for all startup-gate scenarios.
+
 #### I3 §D — Estimated evidence: never silent
 
 A reconciliation-close that reaches the `Estimated` branch MUST produce a
@@ -398,6 +423,8 @@ the reconciliation close is non-overridable.
 | Version | Date | Changes | Author |
 |---------|------|---------|--------|
 | 1.0 | 2026-04-18 | Initial policy creation | Engineering Team |
+| 1.1 | 2026-05-08 | Added §I3 — Reverse Reconciliation Invariant (TD-2026-05-05-001). | Claude Opus 4.7 |
+| 1.2 | 2026-05-11 | Added §I3 §E — startup policy and operational status. Reflects Slices 5A/5B1 live, 5B2A merged (refactor), 5B2B planned. | Claude Sonnet 4.6 |
 
 ---
 

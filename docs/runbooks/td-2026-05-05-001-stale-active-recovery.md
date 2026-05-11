@@ -3,7 +3,7 @@
 **Severity**: Critical
 **Time to Execute**: 10–30 min per affected position (steady state); up to 60 min on first incident
 **Required Access**: `kubectl` for `robson` and `robson-testnet` namespaces, Binance Futures account access (web UI or `binance-cli`), `robsond` API token, `robson-cli` binary at the version that ships Slice 5B1
-**Status**: Slice 5B1 LIVE — operator-driven manual recovery available via `robson-cli reconcile-close`. Startup `auto_reconcile` is Slice 5B2 (future).
+**Status**: Slice 5B1 LIVE — operator-driven manual recovery available via `robson-cli reconcile-close`. Slice 5B2A merged (evidence helper refactor, no operational change). Startup `auto_reconcile` is Slice 5B2B (planned, not yet live).
 
 ---
 
@@ -272,6 +272,33 @@ Flags:
 
 ---
 
+## Recovery Paths Summary
+
+| Path | Label | Status | How |
+|------|-------|--------|-----|
+| A | Startup abort (fail-closed) | **LIVE** (Slice 5A) | Daemon exits 78; use Path B to resolve manually, then restart. |
+| B | Operator-driven manual close | **LIVE** (Slice 5B1) | `robson-cli reconcile-close` + `POST /reconcile-close`. |
+| C | Startup `auto_reconcile` | **PLANNED** (Slice 5B2B) | Opt-in config; not live yet. See below. |
+
+### Path C — Startup `auto_reconcile` (planned, Slice 5B2B)
+
+> **DO NOT enable in production.** No functional `auto_reconcile` config exists
+> until Slice 5B2B is merged. Setting `on_startup_stale_active = "auto_reconcile"`
+> today produces a config error.
+
+When Slice 5B2B ships, Path C will work as follows:
+
+- Enabled via `ROBSON_RECONCILIATION_ON_STARTUP_STALE_ACTIVE=auto_reconcile`.
+- **Two-phase / all-or-nothing**: the daemon first collects evidence for ALL
+  stale-Active positions, then applies `reconcile_close` to all only if every
+  position has real evidence (`OrderFillRecord` or `UserTradeRecord`).
+- If any position lacks real evidence → abort with exit 78. No position is closed.
+- `Estimated` evidence at startup always downgrades to abort — never auto-closes.
+- **Current fallback**: use Path B (manual) until 5B2B is merged and validated
+  on testnet (Slice 5B2C drill).
+
+---
+
 ## Post-Recovery Validation
 
 After the close (whether via the CLI or via a Slice 5 `auto_reconcile` startup phase), verify:
@@ -323,3 +350,4 @@ There is **no rollback** for a reconciled close. Once `Event::PositionClosed` is
 | 2026-05-08 | Initial skeleton (Slice 2 of TD-2026-05-05-001). Operational structure, evidence ordering, decision flow. CLI command deferred to Slice 5B. | Claude Opus 4.7 |
 | 2026-05-09 | Slice 5A: startup abort is live (exit 78). Added §Startup Abort section, updated status and recovery command note. | Claude Sonnet 4.6 |
 | 2026-05-09 | Slice 5B1: operator-driven manual recovery via `robson-cli reconcile-close` + `POST /reconcile-close`. OrderFillRecord and UserTradeRecord evidence accepted. AccountSnapshot/Estimated rejected. Exit codes 0-6 documented. | Claude Opus 4.7 |
+| 2026-05-11 | Slice 5B2A merged (evidence helper refactor, no operational change). Added Recovery Paths Summary table and Path C (planned) section. Status updated. | Claude Sonnet 4.6 |
