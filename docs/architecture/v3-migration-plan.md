@@ -126,6 +126,7 @@ Status rule for this table: code-backed items may be marked done from repository
 | MIG-v3#12 | Monthly State Persistence — `MonthBoundaryReset` + `monthly_state` projection | ✅ Done — `realized_loss` and `trades_opened` in `monthly_state`; `/status` exposes `new_slots_available`, `occupied_slots`, `slot_cells_total`. |
 | MIG-v3#13 | Migrate exchange layer from Isolated Margin to USD-M Futures | ✅ Done — FAPI endpoints, testnet and production. |
 | MIG-v3#14 | Risk Dashboard — monthly budget bar, realized-loss display, slot breakdown | ⏳ Pending — kept in v3 scope. All business logic and policy stays in backend; frontend renders only. See ADR-0034. |
+| MIG-v3#15 | ARM Entry Policy Selection — expose `entry_policy.mode` and `entry_policy.approval` in `ArmModal` | ⏳ Pending — kept in v3 scope. Backend has 4 modes + 2 approval options fully implemented. `ArmModal.svelte` sends only `{ symbol, side }`; operator locked to SMA crossover (`ConfirmedTrend` + `Automatic`). Frontend-only change. |
 | QE-P1 | Passive Wrapper (Non-Breaking) | ✅ Done |
 | QE-P2 | Blocking Governance | ✅ Done (2026-04-04) |
 | QE-P3 | Approval Gates | ✅ Done (2026-04-05) |
@@ -989,6 +990,7 @@ Reconsider TRON integration when ALL of these are true:
 | MIG-v3#12 | **Monthly State Persistence** — `MonthBoundaryReset` + `monthly_state` projection | ✅ Implemented — `realized_loss` and `trades_opened` columns added; dual-routed projection handlers; `load_monthly_state` refactored; backfill script created | MIG-v3#11 | S | Yes — revert to in-memory | Remove monthly_state projection | Monthly realized loss resets on daemon restart; inaccurate budget before real capital |
 | MIG-v3#13 | **Migrate exchange layer from Isolated Margin to USD-M Futures** | SAPI isolated-margin endpoints | MIG-v3#1 | M | Yes — revert to SAPI endpoints | Config: switch back to isolated-margin mode | Orders routed to wrong account type; position mismatches |
 | MIG-v3#14 | **Risk Dashboard** — monthly budget bar, realized-loss display, slot breakdown | Frontend shows only slot count (Option 2) | MIG-v3#12 follow-up | L | Yes — remove dashboard panels | Remove dashboard UI components | Operator lacks visual risk-budget overview; CLI fallback exists |
+| MIG-v3#15 | **ARM Entry Policy Selection** — extend `ArmModal.svelte` and `robson.ts:armPosition` to send `entry_policy.mode` + `entry_policy.approval` | Backend gap: `POST /positions` accepts `entry_policy` but frontend never sends it | None (frontend task only) | S | Yes — remove controls | Revert to `{ symbol, side }` only | Operator locked to SMA crossover; `Immediate`, `ConfirmedReversal`, `ConfirmedKeyLevel`, and `HumanConfirmation` inaccessible from UI |
 
 ### MIG-v3#12 Follow-up: Option 2 — Slot Count from API Only
 
@@ -1043,6 +1045,48 @@ budget bar, no realized-loss display. Full Risk Dashboard deferred to MIG-v3#14.
 - A state with 3 occupied carried positions and 4 new slots renders 7 cells.
 - No hardcoded `4` remains in slot-related frontend logic.
 - No fallback-to-4 remains in the frontend API normalization.
+
+### MIG-v3#15: ARM Entry Policy Selection
+
+**Date**: 2026-05-12 — identified as frontend/backend parity gap.
+
+**Problem**: `ArmModal.svelte` (`apps/frontend/src/lib/design/components/ArmModal.svelte`) sends
+only `{ symbol, side }` to `POST /positions`. The `entry_policy` field is never included.
+`robson.ts:armPosition` (line 303) has the same gap. The backend defaults to
+`ConfirmedTrend` + `Automatic` when `entry_policy` is omitted, locking the operator to SMA
+crossover regardless of market regime.
+
+**Backend capabilities already implemented — no Rust changes required**:
+
+| `entry_policy.mode` | Strategy | Implemented in |
+|---------------------|----------|----------------|
+| `confirmed_trend` (default) | SMA crossover | `SmaCrossoverStrategy` |
+| `immediate` | No strategy — manual signal | bypasses detector |
+| `confirmed_reversal` | Hammer, ShootingStar, BullishEngulfing, BearishEngulfing | `ReversalPatternStrategy` |
+| `confirmed_key_level` | Support / Resistance level reactions | `KeyLevelStrategy` |
+
+| `entry_policy.approval` | Behaviour |
+|-------------------------|-----------|
+| `automatic` (default) | Entry executes when signal arrives |
+| `human_confirmation` | Entry queued as pending approval (`POST /queries/{id}/approve`) |
+
+#### Frontend steps
+
+1. Add `entry_policy?: { mode?: string; approval?: string }` to `armPosition` call
+   signature in `robson.ts`.
+2. Add entry mode selector to `ArmModal.svelte` (4 options).
+3. Add approval policy toggle (`AUTOMATIC` / `HUMAN_CONFIRMATION`).
+4. Include `entry_policy` in the POST body only when non-default values are selected
+   (omitting the field preserves backward-compatible defaulting in the backend).
+
+#### Acceptance criteria
+
+- ARM modal exposes all 4 entry modes and both approval options.
+- Selecting no override still defaults to `ConfirmedTrend` + `Automatic` (no regression).
+- `entry_policy` is present in the POST body when non-default values are selected.
+- TypeScript type-check passes.
+
+---
 
 ### Migration Rules
 

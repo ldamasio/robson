@@ -40,5 +40,6 @@ v3 is complete when all of the following are repository-verified:
 - [ ] TD-2026-05-05-001 closed (`docs/technical-debt.md` Status: Closed)
 - [ ] MIG-v3#8 Chaos testing suite merged and CI green
 - [ ] MIG-v3#14 Risk Dashboard shipped in `apps/frontend/` and deployed
+- [ ] MIG-v3#15 ARM Entry Policy Selection shipped in `apps/frontend/` (mode + approval controls in `ArmModal`)
 - [ ] `v3-migration-plan.md` has no items marked `⏳ Pending`
 - [ ] Production running ≥ 30 days with 0 `position_untracked_detected` events (Grafana/Loki)
