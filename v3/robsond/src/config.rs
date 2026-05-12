@@ -157,8 +157,9 @@ pub enum StartupStaleActivePolicy {
     /// Fail closed: log CRITICAL, return exit code 78, refuse to start.
     #[default]
     Abort,
-    /// Attempt to gather real fill evidence and reconcile-close each stale-active
-    /// position at startup. Fails closed if any position lacks unambiguous evidence.
+    /// Attempt to gather real fill evidence and reconcile-close each
+    /// stale-active position at startup. Fails closed if any position lacks
+    /// unambiguous evidence.
     AutoReconcile,
 }
 

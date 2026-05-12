@@ -819,8 +819,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
 
     /// Two-phase startup auto-reconcile for stale-active positions.
     ///
-    /// Phase 1 (read-only): gather real evidence for every stale-active position.
-    /// Phase 2 (write): reconcile-close each position that passed Phase 1.
+    /// Phase 1 (read-only): gather real evidence for every stale-active
+    /// position. Phase 2 (write): reconcile-close each position that passed
+    /// Phase 1.
     ///
     /// Fail-closed: if Phase 1 fails for any position, no writes occur and the
     /// daemon exits with code 78.
@@ -879,7 +880,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                         robson_domain::ReconciliationEvidence::UserTradeRecord(_) => "user_trade",
                         other => {
                             let variant = match other {
-                                robson_domain::ReconciliationEvidence::AccountSnapshot(_) => "account_snapshot",
+                                robson_domain::ReconciliationEvidence::AccountSnapshot(_) => {
+                                    "account_snapshot"
+                                },
                                 robson_domain::ReconciliationEvidence::Estimated(_) => "estimated",
                                 _ => "unknown",
                             };
@@ -953,8 +956,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                 entry_price: p.entry_price.map(|pr| pr.as_decimal()),
             })
             .collect();
-        self.apply_startup_auto_reconcile_batch(inputs, stale_infos)
-            .await?;
+        self.apply_startup_auto_reconcile_batch(inputs, stale_infos).await?;
 
         info!(
             count = stale_actives.len(),
@@ -1971,12 +1973,17 @@ mod tests {
             matches!(err, DaemonError::StartupStaleActiveDetected { count: 1, .. }),
             "Abort policy must fail with stale-active, got: {err:?}"
         );
-        let stored_abort = daemon_abort.store.positions().find_by_id(pid_abort).await.unwrap().unwrap();
-        assert!(matches!(stored_abort.state, PositionState::Active { .. }), "Abort must leave position Active");
+        let stored_abort =
+            daemon_abort.store.positions().find_by_id(pid_abort).await.unwrap().unwrap();
+        assert!(
+            matches!(stored_abort.state, PositionState::Active { .. }),
+            "Abort must leave position Active"
+        );
 
         // --- AutoReconcile path ---
         let mut config_auto = Config::test();
-        config_auto.reconciliation.on_startup_stale_active = StartupStaleActivePolicy::AutoReconcile;
+        config_auto.reconciliation.on_startup_stale_active =
+            StartupStaleActivePolicy::AutoReconcile;
         let daemon_auto = Daemon::new_stub(config_auto);
 
         let mut pos_auto = active_position(symbol.clone(), Side::Long);
@@ -1985,21 +1992,18 @@ mod tests {
         daemon_auto.store.positions().save(&pos_auto).await.unwrap();
 
         let now = chrono::Utc::now();
-        daemon_auto.exchange.set_order_result(
-            "EX-ORDER-1",
-            order_result("EX-ORDER-1", dec!(90), dec!(0.010), now),
-        );
+        daemon_auto
+            .exchange
+            .set_order_result("EX-ORDER-1", order_result("EX-ORDER-1", dec!(90), dec!(0.010), now));
 
         daemon_auto.run_startup_stale_active_gate().await.unwrap();
-        let stored_auto = daemon_auto.store.positions().find_by_id(pid_auto).await.unwrap().unwrap();
+        let stored_auto =
+            daemon_auto.store.positions().find_by_id(pid_auto).await.unwrap().unwrap();
         assert!(
-            matches!(
-                stored_auto.state,
-                PositionState::Closed {
-                    exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
-                    ..
-                }
-            ),
+            matches!(stored_auto.state, PositionState::Closed {
+                exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
+                ..
+            }),
             "AutoReconcile policy must close stale-active with real evidence"
         );
     }
@@ -2051,13 +2055,10 @@ mod tests {
         daemon.run_startup_auto_reconcile().await.unwrap();
 
         let stored = daemon.store.positions().find_by_id(pid).await.unwrap().unwrap();
-        assert!(matches!(
-            stored.state,
-            PositionState::Closed {
-                exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
-                ..
-            }
-        ));
+        assert!(matches!(stored.state, PositionState::Closed {
+            exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
+            ..
+        }));
     }
 
     #[tokio::test]
@@ -2071,27 +2072,21 @@ mod tests {
         daemon.store.positions().save(&position).await.unwrap();
 
         let now = chrono::Utc::now();
-        daemon.exchange.set_user_trades(
-            &symbol.as_pair(),
-            vec![user_trade(
-                "TRADE-1",
-                "EX-ORDER-2",
-                dec!(90),
-                dec!(0.010),
-                now,
-            )],
-        );
+        daemon.exchange.set_user_trades(&symbol.as_pair(), vec![user_trade(
+            "TRADE-1",
+            "EX-ORDER-2",
+            dec!(90),
+            dec!(0.010),
+            now,
+        )]);
 
         daemon.run_startup_auto_reconcile().await.unwrap();
 
         let stored = daemon.store.positions().find_by_id(pid).await.unwrap().unwrap();
-        assert!(matches!(
-            stored.state,
-            PositionState::Closed {
-                exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
-                ..
-            }
-        ));
+        assert!(matches!(stored.state, PositionState::Closed {
+            exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
+            ..
+        }));
     }
 
     #[tokio::test]
@@ -2186,9 +2181,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_startup_auto_reconcile_batch_rejected_unsupported_evidence() {
-        use robson_domain::{
-            AccountSnapshotEvidence, Price, Quantity, ReconciliationEvidence,
-        };
+        use robson_domain::{AccountSnapshotEvidence, Price, Quantity, ReconciliationEvidence};
         let daemon = Daemon::new_stub(config_with_auto_reconcile());
         let symbol = robson_domain::Symbol::from_pair("BTCUSDT").unwrap();
 
@@ -2212,16 +2205,13 @@ mod tests {
         };
 
         let err = daemon
-            .apply_startup_auto_reconcile_batch(
-                vec![input],
-                vec![StartupStaleActiveInfo {
-                    position_id: pid,
-                    symbol: symbol.as_pair(),
-                    side: "Long".to_string(),
-                    quantity: dec!(0.010),
-                    entry_price: Some(dec!(100)),
-                }],
-            )
+            .apply_startup_auto_reconcile_batch(vec![input], vec![StartupStaleActiveInfo {
+                position_id: pid,
+                symbol: symbol.as_pair(),
+                side: "Long".to_string(),
+                quantity: dec!(0.010),
+                entry_price: Some(dec!(100)),
+            }])
             .await
             .unwrap_err();
 
@@ -2231,7 +2221,10 @@ mod tests {
         );
 
         let stored = daemon.store.positions().find_by_id(pid).await.unwrap().unwrap();
-        assert!(matches!(stored.state, PositionState::Active { .. }), "position must remain Active");
+        assert!(
+            matches!(stored.state, PositionState::Active { .. }),
+            "position must remain Active"
+        );
     }
 
     #[tokio::test]
@@ -2272,16 +2265,13 @@ mod tests {
         };
 
         let err = daemon
-            .apply_startup_auto_reconcile_batch(
-                vec![input],
-                vec![StartupStaleActiveInfo {
-                    position_id: pid,
-                    symbol: symbol.as_pair(),
-                    side: "Long".to_string(),
-                    quantity: dec!(0.010),
-                    entry_price: Some(dec!(100)),
-                }],
-            )
+            .apply_startup_auto_reconcile_batch(vec![input], vec![StartupStaleActiveInfo {
+                position_id: pid,
+                symbol: symbol.as_pair(),
+                side: "Long".to_string(),
+                quantity: dec!(0.010),
+                entry_price: Some(dec!(100)),
+            }])
             .await
             .unwrap_err();
 
@@ -2293,9 +2283,7 @@ mod tests {
 
     #[tokio::test]
     async fn test_startup_auto_reconcile_batch_rejected_inconsistent_evidence() {
-        use robson_domain::{
-            OrderFillEvidence, Price, Quantity, ReconciliationEvidence,
-        };
+        use robson_domain::{OrderFillEvidence, Price, Quantity, ReconciliationEvidence};
         let daemon = Daemon::new_stub(config_with_auto_reconcile());
         let symbol = robson_domain::Symbol::from_pair("BTCUSDT").unwrap();
 
@@ -2323,16 +2311,13 @@ mod tests {
         };
 
         let err = daemon
-            .apply_startup_auto_reconcile_batch(
-                vec![input],
-                vec![StartupStaleActiveInfo {
-                    position_id: pid,
-                    symbol: symbol.as_pair(),
-                    side: "Long".to_string(),
-                    quantity: dec!(0.010),
-                    entry_price: Some(dec!(100)),
-                }],
-            )
+            .apply_startup_auto_reconcile_batch(vec![input], vec![StartupStaleActiveInfo {
+                position_id: pid,
+                symbol: symbol.as_pair(),
+                side: "Long".to_string(),
+                quantity: dec!(0.010),
+                entry_price: Some(dec!(100)),
+            }])
             .await
             .unwrap_err();
 
@@ -2342,14 +2327,17 @@ mod tests {
         );
 
         let stored = daemon.store.positions().find_by_id(pid).await.unwrap().unwrap();
-        assert!(matches!(stored.state, PositionState::Active { .. }), "position must remain Active");
+        assert!(
+            matches!(stored.state, PositionState::Active { .. }),
+            "position must remain Active"
+        );
     }
 
     #[tokio::test]
     async fn test_startup_auto_reconcile_batch_fail_fast_stops_at_first_rejection() {
         use robson_domain::{
-            AccountSnapshotEvidence, OrderFillEvidence, Price, Quantity,
-            ReconciliationEvidence, Symbol,
+            AccountSnapshotEvidence, OrderFillEvidence, Price, Quantity, ReconciliationEvidence,
+            Symbol,
         };
         let daemon = Daemon::new_stub(config_with_auto_reconcile());
         let symbol_a = Symbol::from_pair("BTCUSDT").unwrap();
@@ -2400,25 +2388,22 @@ mod tests {
         };
 
         let err = daemon
-            .apply_startup_auto_reconcile_batch(
-                vec![input_a, input_b],
-                vec![
-                    StartupStaleActiveInfo {
-                        position_id: pid_a,
-                        symbol: symbol_a.as_pair(),
-                        side: "Long".to_string(),
-                        quantity: dec!(0.010),
-                        entry_price: Some(dec!(100)),
-                    },
-                    StartupStaleActiveInfo {
-                        position_id: pid_b,
-                        symbol: symbol_b.as_pair(),
-                        side: "Long".to_string(),
-                        quantity: dec!(0.010),
-                        entry_price: Some(dec!(100)),
-                    },
-                ],
-            )
+            .apply_startup_auto_reconcile_batch(vec![input_a, input_b], vec![
+                StartupStaleActiveInfo {
+                    position_id: pid_a,
+                    symbol: symbol_a.as_pair(),
+                    side: "Long".to_string(),
+                    quantity: dec!(0.010),
+                    entry_price: Some(dec!(100)),
+                },
+                StartupStaleActiveInfo {
+                    position_id: pid_b,
+                    symbol: symbol_b.as_pair(),
+                    side: "Long".to_string(),
+                    quantity: dec!(0.010),
+                    entry_price: Some(dec!(100)),
+                },
+            ])
             .await
             .unwrap_err();
 
@@ -2429,10 +2414,16 @@ mod tests {
 
         // pos_a was never going to be closed (rejected first)
         let stored_a = daemon.store.positions().find_by_id(pid_a).await.unwrap().unwrap();
-        assert!(matches!(stored_a.state, PositionState::Active { .. }), "pos_a must remain Active");
+        assert!(
+            matches!(stored_a.state, PositionState::Active { .. }),
+            "pos_a must remain Active"
+        );
 
         // pos_b must also remain Active because the batch stopped at pos_a
         let stored_b = daemon.store.positions().find_by_id(pid_b).await.unwrap().unwrap();
-        assert!(matches!(stored_b.state, PositionState::Active { .. }), "pos_b must remain Active (fail-fast)");
+        assert!(
+            matches!(stored_b.state, PositionState::Active { .. }),
+            "pos_b must remain Active (fail-fast)"
+        );
     }
 }
