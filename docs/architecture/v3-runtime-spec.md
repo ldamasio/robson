@@ -343,31 +343,24 @@ covers the **write side** (nothing leaves the Runtime without governance). This
 invariant adds the **read side**: nothing sits on the exchange that did not leave the
 Runtime.
 
-> **TARGET ARCHITECTURE — FOLLOW-UP REQUIRED (MIG-v3#9)**: The Position Reconciliation
-> Worker described below is not yet implemented. Current startup recovery restores
-> positions from EventLog replay + projection but does NOT scan for UNTRACKED positions.
-> The Safety Net monitors for rogue positions but does not implement the ADR-0022
-> classification flow. Until MIG-v3#9 is complete, the operator must manually verify
-> that the Binance account holds no externally-opened positions before and after daemon
-> restarts.
+The Runtime owns a long-lived **Position Reconciliation Worker** (implemented — MIG-v3#9,
+TD-2026-05-05-001 Slices 0–5B2B) that enforces both sides of the invariant:
 
-Operationally, the Runtime owns a long-lived **Position Reconciliation Worker** that:
+**Exchange → Robson (UNTRACKED close)**:
+- Scans Binance for open positions across all account types and all symbols.
+- Classifies positions without a matching `entry_order_placed` event as UNTRACKED.
+- Closes UNTRACKED positions with exit reason `UNTRACKED_ON_EXCHANGE` and alerts CRITICAL.
 
-- Scans Binance for open positions across **all account types** (spot, isolated margin,
-  cross margin, futures) and **all symbols** — not gated by `allowed_symbols` and not
-  gated by `ROBSON_POSITION_MONITOR_ENABLED`.
-- Looks up each open position by exchange order id in `event_log`.
-- Classifies positions without a matching `entry_order_placed` event as **UNTRACKED**.
-- Closes UNTRACKED positions at market via the Safety Net close path (exit reason
-  `UNTRACKED_ON_EXCHANGE`) and alerts the operator at severity `CRITICAL`.
+**Robson → Exchange (stale-Active close)**:
+- Iterates every local `Active` position and checks for its presence on the exchange.
+- If absent (liquidation, manual close, insurance stop fill outside daemon): gathers
+  `OrderFillRecord` or `UserTradeRecord` evidence and calls `reconcile_close`.
+- If evidence is unavailable: aborts startup with exit 78 (operator must use
+  `robson-cli reconcile-close` manually — see `docs/runbooks/td-2026-05-05-001-stale-active-recovery.md`).
 
-Follow-up required (target architecture):
-
-- Exchange-order-id index on `event_log` for O(1) lookup by the reconciliation worker.
-- Dedicated `safety_net` close path for UNTRACKED positions.
-- Startup reconciliation gate: the daemon must enter `StartupReconciling` before
-  accepting observations; new entries blocked until the UNTRACKED set is empty.
-- Operator panic override endpoint (`POST /reconciliation/suspend`, max TTL 300 s).
+`Estimated` evidence is **permanently blocked** in v3 — `reconcile_close` returns
+`RejectedUnsupportedEvidence` for any `Estimated` input. See Policy I3 in
+`docs/policies/UNTRACKED-POSITION-RECONCILIATION.md`.
 
 ---
 
@@ -515,27 +508,19 @@ violation (ADR-0022).
 
 ### Scenario 5: UNTRACKED Position Detected
 
-> **TARGET ARCHITECTURE — FOLLOW-UP REQUIRED (MIG-v3#9)**: This scenario is not yet
-> implemented. The reconciliation worker, `StartupReconciling` state, and
-> `position_untracked_detected` event type do not exist in the current codebase.
+Implemented — `ReconciliationWorker` (MIG-v3#9, TD-2026-05-05-001).
 
-Triggered when the Position Reconciliation Worker finds an open exchange position
-for which no matching `entry_order_placed` event exists in `event_log`. See
+Triggered when the reconciliation worker finds an open exchange position for which
+no matching `entry_order_placed` event exists in `event_log`. See
 [ADR-0022](../adr/ADR-0022-robson-authored-position-invariant.md) and
 [docs/policies/UNTRACKED-POSITION-RECONCILIATION.md](../policies/UNTRACKED-POSITION-RECONCILIATION.md).
 
-1. Persist `position_untracked_detected` with evidence: exchange order id, symbol,
-   side, quantity, open timestamp.
-2. Emit a CRITICAL operator alert.
-3. Close the position at market via the Safety Net close path, tagged exit reason
-   `UNTRACKED_ON_EXCHANGE`.
-4. Persist `untracked_position_closed` with the resulting fill.
-5. Do NOT reconstruct an `entry_order_placed` event. Do NOT adopt the position into
-   RuntimeState before closing it.
+1. Emit a CRITICAL operator alert.
+2. Close the position via `reconcile_close` with exit reason `UNTRACKED_ON_EXCHANGE`.
+3. Persist the `PositionClosed` event with `ClosureEvidence::Reconciled(...)`.
+4. Do NOT reconstruct an `entry_order_placed` event. Do NOT adopt the position.
 
-This path is unconditional — not gated by `ROBSON_POSITION_MONITOR_ENABLED` or
-`allowed_symbols`. The only permitted override is an operator-issued
-`POST /reconciliation/suspend` (max TTL 300 s, fully audited — v3 target).
-
-At daemon startup, the Runtime MUST enter `StartupReconciling` and resolve all
-UNTRACKED positions before accepting non-critical observations.
+At daemon startup: if stale-Active positions are detected, the daemon aborts with
+exit code 78 (default `abort` policy). The operator resolves them via
+`robson-cli reconcile-close` before restarting. See
+`docs/runbooks/td-2026-05-05-001-stale-active-recovery.md`.

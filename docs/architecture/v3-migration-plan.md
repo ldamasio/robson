@@ -94,9 +94,11 @@ every reference uses a canonical identifier with a prefix:
 - `QE-P5` is NOT a migration step; it is a deferred QueryEngine phase (Context Governance, v3+ with LLM).
 - `Stage N` is a pipeline stage within a single execution tick (e.g., Stage 1: Observe). Not a project milestone.
 
-**Quick status reference** (as of 2026-04-18, repository-verified):
+**Quick status reference** (as of 2026-05-12, repository-verified):
 
 Status rule for this table: code-backed items may be marked done from repository evidence; operational rollout items stay pending unless the repository contains explicit rollout confirmation.
+
+**Abandoned items** are decisions made by the operator (2026-05-12) to drop scope that conflicted with v3 architecture or policy. They do not appear in v4 backlog unless noted.
 
 | ID | Description | Status |
 |----|-------------|--------|
@@ -111,26 +113,26 @@ Status rule for this table: code-backed items may be marked done from repository
 | MIG-v2.5#9 | Contract tests for daemon API | ✅ Done (2026-04-10) — 29 tests |
 | MIG-v2.5#10 | EventLog replay determinism test | ✅ Done (2026-04-05) |
 | MIG-v3#1 | Promote robsond as primary runtime | ✅ Done (2026-04-10) — Django execution CronJobs suspended, robsond sole execution path |
-| MIG-v3#2 | Replace Django API with thin gateway | ✅ Done (2026-04-16) — robsond serves API/SSE directly; separate gateway unnecessary; frontend still on Django (→ MIG-v3#3) |
-| MIG-v3#3 | Frontend direct connection to SSE | Pending |
-| MIG-v3#4 | Dynamic risk limits | Pending |
-| MIG-v3#5 | Operator control surface in UI | Pending |
-| MIG-v3#6 | Hash-chained EventLog | Pending |
-| MIG-v3#7 | PaymentRail trait | Pending |
-| MIG-v3#8 | Chaos testing suite | Pending |
-| MIG-v3#9 | Position Reconciliation Worker (ADR-0022 — Robson-authored position invariant) | ✅ Implemented — `PositionState::Cancelled` added; disarmed positions no longer recorded as `Closed` |
-| MIG-v3#10 | Symbol-agnostic documentation + test sweep (ADR-0023) | ✅ Implemented — `EntryLifecycleStage` computed projection (`entry_lifecycle_stage` fn in `robson-domain/src/events.rs`) |
-| MIG-v3#11 | Policy Layer + Dynamic Slot Calculation (ADR-0024) | Done — repository-verified (2db23ad2, corrected by 0b3653a7); `robson-domain::policy` with `TradingPolicy` and `TechStopConfig`; `RiskGate` consumes policy; static `max_open_positions`, `max_total_exposure_pct`, `max_single_position_pct` eliminated; dynamic slot calculation uses best-effort in-memory `capital_base` (persisted base lands in MIG-v3#12) |
-| MIG-v3#12 | Monthly State Persistence — `MonthBoundaryReset` + `monthly_state` projection | ✅ Implemented — `realized_loss` and `trades_opened` persisted in `monthly_state`; projection handlers for `EntryFilled` and `PositionClosed` events; `load_monthly_state` replaces O(n) recomputation; strict separation: `monthly_state` = ledger, `positions_current` = live execution state. **Follow-up (Option 2 — Slot Count from API Only)**: `/status` exposes explicit `new_slots_available`, `occupied_slots`, and `slot_cells_total` fields. |
-| MIG-v3#13 | Migrate exchange layer from Isolated Margin to USD-M Futures | Done — exchange connector switched from SAPI isolated-margin endpoints to FAPI USD-M Futures endpoints; position management now operates on Binance USD-M Futures testnet (`testnet.binancefuture.com`) and production |
-| MIG-v3#14 | Risk Dashboard — monthly budget bar, realized-loss display, slot breakdown | Pending — deferred from MIG-v3#12 frontend work. Option 1 (full dashboard UI) was evaluated and postponed in favor of Option 2 (API-only slot exposure). Tentatively a dedicated dashboard story; no implementation date set. |
+| MIG-v3#2 | Replace Django API with thin gateway | ✅ Done (2026-04-16) — robsond serves API/SSE directly; no separate gateway needed |
+| MIG-v3#3 | Frontend direct connection to SSE | ✅ Done (2026-05-12) — Django retired. Canonical frontend is SvelteKit at `apps/frontend/` (`@robson/frontend-v2`). SSE endpoint is live in robsond (`/events`). React/nginx legacy frontend removed from working tree. |
+| MIG-v3#4 | Dynamic risk limits | ❌ Abandoned (2026-05-12) — superseded by MIG-v3#11 + ADR-0024. No static hard limits exist. The only monthly constraint is the 4% drawdown policy encoded in `TradingPolicy`. Dynamic limits beyond the slot model conflict with policy invariants and were dropped from scope. |
+| MIG-v3#5 | Operator control surface in UI | ❌ Abandoned (2026-05-12) — pause/resume do not apply in the slot model; panic close belongs in the backend CLI; risk-limit adjustment from UI contradicts policy invariants (ADR-0024). This was a pre-v3 concept that lost relevance after the slot architecture was finalized. |
+| MIG-v3#6 | Hash-chained EventLog | 🔄 Deferred to MIG-v4#1 — good integrity property, not required for v3 launch. |
+| MIG-v3#7 | PaymentRail trait | 🔄 Deferred to MIG-v4#2 — TRON/payment rail abstraction is architecture-ready but inactive. See ADR table entry #12. |
+| MIG-v3#8 | Chaos testing suite | ⏳ Pending — kept in v3 scope. Required for production-grade confidence before full autonomous operation. |
+| MIG-v3#9 | Position Reconciliation Worker — UNTRACKED side (ADR-0022) | ✅ Done — symmetric reconciliation loop, `reconcile_close`, startup abort gate, `robson-cli reconcile-close`, and `POST /reconcile-close` implemented (TD-2026-05-05-001 Slices 0–5B2B). |
+| MIG-v3#10 | Symbol-agnostic documentation + test sweep (ADR-0023) | ✅ Done — `EntryLifecycleStage` computed projection in `robson-domain/src/events.rs`. |
+| MIG-v3#11 | Policy Layer + Dynamic Slot Calculation (ADR-0024) | ✅ Done (2db23ad2, corrected 0b3653a7) — `TradingPolicy`, `TechStopConfig`; `RiskGate` consumes policy; all static exposure caps eliminated. |
+| MIG-v3#12 | Monthly State Persistence — `MonthBoundaryReset` + `monthly_state` projection | ✅ Done — `realized_loss` and `trades_opened` in `monthly_state`; `/status` exposes `new_slots_available`, `occupied_slots`, `slot_cells_total`. |
+| MIG-v3#13 | Migrate exchange layer from Isolated Margin to USD-M Futures | ✅ Done — FAPI endpoints, testnet and production. |
+| MIG-v3#14 | Risk Dashboard — monthly budget bar, realized-loss display, slot breakdown | ⏳ Pending — kept in v3 scope. All business logic and policy stays in backend; frontend renders only. See ADR-0034. |
 | QE-P1 | Passive Wrapper (Non-Breaking) | ✅ Done |
 | QE-P2 | Blocking Governance | ✅ Done (2026-04-04) |
 | QE-P3 | Approval Gates | ✅ Done (2026-04-05) |
 | QE-P4 | Full Audit & Replay | ✅ Done (2026-04-05) |
-| QE-P5 | Context Governance (LLM) | Deferred (v3+) |
-| VAL-001 | Testnet E2E validation (arm -> signal -> fill -> trailing stop -> exit) | Phase 1 PASS (2026-04-16) / Phase 2 ready for redeploy-and-run. The static exposure blocker found on 2026-04-18 was resolved by MIG-v3#11 (`2db23ad2`, corrected by `0b3653a7`) and testnet config commit `c3b1bc3`; `RiskGate` now uses ADR-0024 dynamic slots instead of legacy 15%/30% exposure caps. Remaining work: build/deploy latest image, sync ArgoCD, execute the Phase 2 runbook, and record exchange/fill/trailing-stop evidence. See [ADR-0024](../adr/ADR-0024-trading-policy-layer.md) and [runbooks/val-001-testnet-e2e-validation.md](../runbooks/val-001-testnet-e2e-validation.md) |
-| VAL-002 | Real capital activation (Binance real keys + monitor enabled in prod) | Pending — blocked on VAL-001 PASS + MIG-v3#12 (monthly state persistence required before real capital) |
+| QE-P5 | Context Governance (LLM) | 🔄 Deferred to MIG-v4#5 — no LLM integration in v3. |
+| VAL-001 | Testnet E2E validation (arm → signal → fill → trailing stop → exit) | ✅ PASS (2026-04-22) — full event sequence `position_armed → position_closed` confirmed, `cycle_id` on all orders, PnL calculated, 0 UNTRACKED. See `docs/runbooks/val-001-testnet-e2e-validation.md` Run Log. |
+| VAL-002 | Real capital activation (real Binance keys + monitor enabled in prod) | ✅ PASS (2026-04-22) — sha-9448ce20, monitor active, 0 UNTRACKED in 10 min. See `docs/runbooks/val-002-real-capital-activation.md` Run Log. |
 
 ### MIG-v2.5#2 Technical Notes (2026-04-05, validated 2026-04-10)
 

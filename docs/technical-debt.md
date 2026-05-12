@@ -10,70 +10,42 @@ Each item should stay short and actionable. Long investigations belong in
 
 ## TD-2026-05-05-001: Core Position Lifecycle Drift
 
-**Status**: Open
-**Severity**: High
+**Status**: Pending closure — code complete, branch pending merge
+**Severity**: High → Resolved
 **Area**: `robsond`, reconciliation, position lifecycle
 **Discovered**: 2026-05-05
+**Resolved by**: TD-2026-05-05-001 Slices 0–5B2B (commits `28b7a58e`→`5458c36e`)
 
-### Summary
+### Resolution Summary
 
-Robson can continue projecting a core position as `Active` even after the
-exchange position has already disappeared or been liquidated outside the normal
-Robson `PositionClosed` flow.
+All slices implemented and merged (pending final PR merge from branch
+`feat/td-2026-05-05-001-slice-5b2b-auto-reconcile`):
 
-The existing reconciliation worker protects one side of the invariant: it
-detects exchange-open positions that Robson is not tracking and closes them as
-UNTRACKED. It does not yet protect the opposite side: Robson-tracked core
-positions that no longer exist on the exchange.
+- **Symmetric reconciliation**: `ReconciliationWorker` now iterates both sides —
+  exchange→Robson (UNTRACKED close) and Robson→exchange (stale-Active close).
+- **Evidence pipeline**: `ExchangePort` provides `get_order_by_exchange_id` and
+  `get_user_trades_since`. Only `OrderFillRecord` and `UserTradeRecord` are valid.
+  `Estimated` is permanently hard-blocked.
+- **Startup abort gate**: exit code 78 on any stale-Active at startup (default policy).
+- **Manual recovery path**: `robson-cli reconcile-close` + `POST /reconcile-close`.
+- **Startup `auto_reconcile`**: implemented (opt-in), deferred to production use in v4
+  (MIG-v4#3 in `docs/architecture/v4-backlog.md`).
 
-### Impact
+### What Remains (v3)
 
-- The dashboard can show an occupied slot for a position that should be terminal.
-- Monthly slot accounting can remain conservative because the stale position
-  still occupies a slot.
-- Realized PnL, `closed_at`, and final lifecycle state are not authoritative
-  until a proper close event is recorded.
-- Operators may see `Active` on the operation detail page even when the exchange
-  no longer has the position open.
+- [ ] Merge branch `feat/td-2026-05-05-001-slice-5b2b-auto-reconcile` to main.
+- [ ] Update this entry Status to `Closed` after merge.
 
-### Current Mitigation
+### What is Deferred (v4)
 
-The 2026-05-05 slot variation fix makes `/status` and `/positions/:id` expose
-`variation_pct` from backend business logic instead of letting the frontend
-interpret `pnl` as a percentage.
-
-For `Active` positions, the API now fetches a live exchange price for display.
-If the observed price has crossed the trailing stop, the displayed variation is
-valued at the stop price instead of remaining at the stale in-memory
-`current_price`. This improves operator visibility but does not close the
-position lifecycle drift.
-
-The monthly slot history UI now renders historical months as full dashboard
-snapshots. In past months, unused capacity is labeled `Expired Slot` instead of
-`Free Slot`, which keeps the current-month live vocabulary separate from the
-historical view.
-
-### Required Fix
-
-Add core-position reconciliation for tracked positions that are missing on the
-exchange:
-
-1. Query active Robson core positions.
-2. Query open exchange positions.
-3. For each Robson `Active` position missing on the exchange, determine the
-   safest terminal event source:
-   - Prefer exchange order/trade history if available.
-   - Otherwise record an explicit reconciliation-close event with conservative
-     reason and evidence.
-4. Emit/persist `PositionClosed` through the same eventlog/projector path used
-   by normal exits.
-5. Ensure monthly accounting and slot availability are recalculated from the
-   terminal projection.
-6. Add regression coverage for "Robson active, exchange missing".
+- Testnet drill for startup `auto_reconcile` (MIG-v4#3).
+- Estimated-evidence operator-confirmed close path (MIG-v4#7).
 
 ### References
 
+- `docs/agents/td-2026-05-05-001-execution-memory.md`
+- `docs/implementation/TD-2026-05-05-001-CORE-LIFECYCLE-DRIFT.md`
+- `docs/runbooks/td-2026-05-05-001-stale-active-recovery.md`
 - `v3/robsond/src/reconciliation_worker.rs`
 - `v3/robsond/src/position_manager.rs`
 - `docs/policies/UNTRACKED-POSITION-RECONCILIATION.md`
-- `docs/operations/2026-05-05-v3-slot-variation-fix.md`
