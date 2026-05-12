@@ -24,6 +24,9 @@ use crate::{
     ports::{ExchangePort, OrderResult},
 };
 
+const ENTRY_ORDER_MAX_ATTEMPTS: u32 = 3;
+const ENTRY_ORDER_RETRY_BACKOFF_MS: u64 = 25;
+
 // =============================================================================
 // Execution Result
 // =============================================================================
@@ -286,11 +289,27 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             "Placing entry order"
         );
 
-        // 5. Execute on exchange
-        let result = self
+        // 5. Execute on exchange. Transient exchange failures retry with a
+        // short bounded backoff; a final failure is persisted as EntryOrderFailed.
+        let mut result = self
             .exchange
             .place_market_order(&symbol, side, quantity, &client_order_id, false)
             .await;
+        for attempt in 1..ENTRY_ORDER_MAX_ATTEMPTS {
+            match &result {
+                Err(error) if is_transient_exchange_error(error) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(
+                        ENTRY_ORDER_RETRY_BACKOFF_MS * u64::from(attempt),
+                    ))
+                    .await;
+                    result = self
+                        .exchange
+                        .place_market_order(&symbol, side, quantity, &client_order_id, false)
+                        .await;
+                },
+                _ => break,
+            }
+        }
 
         // 6. Record result and emit appropriate domain event
         match &result {
@@ -443,6 +462,10 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
     pub fn store(&self) -> &S {
         &self.store
     }
+}
+
+fn is_transient_exchange_error(error: &ExecError) -> bool {
+    matches!(error, ExecError::Timeout(_) | ExecError::Exchange(_))
 }
 
 // =============================================================================

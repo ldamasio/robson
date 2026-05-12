@@ -29,6 +29,10 @@ use crate::{
 /// Maximum reconnect backoff in seconds.
 const MAX_BACKOFF_SECS: u64 = 60;
 
+pub(crate) fn next_reconnect_backoff_secs(current: u64) -> u64 {
+    (current * 2).min(MAX_BACKOFF_SECS)
+}
+
 /// Market data manager - spawns and manages WebSocket tasks.
 pub struct MarketDataManager {
     /// Event bus for publishing market data
@@ -86,7 +90,7 @@ impl MarketDataManager {
                             _ = sleep(Duration::from_secs(backoff_secs)) => {},
                             _ = cancel.cancelled() => break 'reconnect,
                         }
-                        backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                        backoff_secs = next_reconnect_backoff_secs(backoff_secs);
                         continue 'reconnect;
                     },
                 };
@@ -184,7 +188,7 @@ impl MarketDataManager {
                     _ = sleep(Duration::from_secs(backoff_secs)) => {},
                     _ = cancel.cancelled() => break 'reconnect,
                 }
-                backoff_secs = (backoff_secs * 2).min(MAX_BACKOFF_SECS);
+                backoff_secs = next_reconnect_backoff_secs(backoff_secs);
             }
 
             info!(symbol = %symbol_str, "WebSocket client task ended");

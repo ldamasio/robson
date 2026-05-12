@@ -320,6 +320,8 @@ pub enum RiskCheck {
     DailyLossLimit,
     /// Already have position on same symbol+side
     DuplicatePosition,
+    /// Risk engine did not return before the runtime safety timeout.
+    RiskEngineTimeout,
 }
 
 impl RiskCheck {
@@ -333,6 +335,7 @@ impl RiskCheck {
             RiskCheck::MonthlyDrawdown => "monthly_drawdown",
             RiskCheck::DailyLossLimit => "daily_loss_limit",
             RiskCheck::DuplicatePosition => "duplicate_position",
+            RiskCheck::RiskEngineTimeout => "risk_engine_timeout",
         }
     }
 }

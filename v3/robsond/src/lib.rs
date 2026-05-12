@@ -61,6 +61,9 @@ pub mod startup_recovery;
 #[cfg(feature = "postgres")]
 pub mod projection_worker;
 
+#[cfg(test)]
+mod chaos_tests;
+
 // Re-exports for convenience
 pub use binance_exchange::BinanceExchangeAdapter;
 pub use binance_ohlcv::BinanceOhlcvAdapter;

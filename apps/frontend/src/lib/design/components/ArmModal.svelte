@@ -5,8 +5,20 @@
 
   let symbol = $state('BTCUSDT');
   let side = $state<'Long' | 'Short'>('Long');
+  let entryMode = $state('confirmed_trend');
+  let approval = $state('automatic');
   let submitting = $state(false);
   let error = $state<string | null>(null);
+
+  const defaultEntryMode = 'confirmed_trend';
+  const defaultApproval = 'automatic';
+
+  const entryModes = [
+    { label: 'CONFIRMED TREND', value: 'confirmed_trend' },
+    { label: 'IMMEDIATE', value: 'immediate' },
+    { label: 'CONFIRMED REVERSAL', value: 'confirmed_reversal' },
+    { label: 'CONFIRMED KEY LEVEL', value: 'confirmed_key_level' },
+  ] as const;
 
   function enforceUppercase(e: Event) {
     const input = e.target as HTMLInputElement;
@@ -19,7 +31,12 @@
 
     submitting = true;
     try {
-      const result = await robsonApi.armPosition({ symbol: symbol.trim(), side });
+      const body: Parameters<typeof robsonApi.armPosition>[0] = { symbol: symbol.trim(), side };
+      if (entryMode !== defaultEntryMode || approval !== defaultApproval) {
+        body.entry_policy = { mode: entryMode, approval };
+      }
+
+      const result = await robsonApi.armPosition(body);
       onclose();
       if (onresult) onresult({ position_id: result.id, symbol: result.symbol, side: result.side });
     } catch (e) {
@@ -66,6 +83,35 @@
           >SHORT</button>
         </div>
       </div>
+
+      <div class="field">
+        <span class="label">ENTRY MODE</span>
+        <div class="toggle mode-toggle">
+          {#each entryModes as mode}
+            <button
+              class="toggle-btn"
+              class:active={entryMode === mode.value}
+              onclick={() => (entryMode = mode.value)}
+            >{mode.label}</button>
+          {/each}
+        </div>
+      </div>
+
+      <div class="field">
+        <span class="label">APPROVAL</span>
+        <div class="toggle">
+          <button
+            class="toggle-btn"
+            class:active={approval === 'automatic'}
+            onclick={() => (approval = 'automatic')}
+          >AUTOMATIC</button>
+          <button
+            class="toggle-btn"
+            class:active={approval === 'human_confirmation'}
+            onclick={() => (approval = 'human_confirmation')}
+          >HUMAN CONFIRMATION</button>
+        </div>
+      </div>
     </div>
 
     {#if error}
@@ -93,7 +139,7 @@
     border-radius: var(--radius-lg);
     padding: var(--s-6);
     min-width: 340px;
-    max-width: 420px;
+    max-width: 560px;
     box-shadow: var(--shadow-overlay);
   }
   .modal-header {
@@ -163,6 +209,10 @@
   .toggle {
     display: flex;
     gap: var(--s-1);
+  }
+  .mode-toggle {
+    display: grid;
+    grid-template-columns: repeat(2, minmax(0, 1fr));
   }
   .toggle-btn {
     flex: 1;

@@ -10,7 +10,7 @@ Each item should stay short and actionable. Long investigations belong in
 
 ## TD-2026-05-05-001: Core Position Lifecycle Drift
 
-**Status**: Pending closure — code complete, branch pending merge
+**Status**: Closed
 **Severity**: High → Resolved
 **Area**: `robsond`, reconciliation, position lifecycle
 **Discovered**: 2026-05-05
@@ -33,8 +33,8 @@ All slices implemented and merged (pending final PR merge from branch
 
 ### What Remains (v3)
 
-- [ ] Merge branch `feat/td-2026-05-05-001-slice-5b2b-auto-reconcile` to main.
-- [ ] Update this entry Status to `Closed` after merge.
+- [x] Merge branch `feat/td-2026-05-05-001-slice-5b2b-auto-reconcile` to main.
+- [x] Update this entry Status to `Closed` after merge.
 
 ### What is Deferred (v4)
 

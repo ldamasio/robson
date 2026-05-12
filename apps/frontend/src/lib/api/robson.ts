@@ -72,6 +72,20 @@ export type StatusResponse = {
   new_slots_available: number;
   occupied_slots: number;
   slot_cells_total: number;
+  monthly_realized_loss: number;
+  monthly_realized_loss_pct: number;
+  capital_base: number;
+};
+
+export type ArmEntryPolicy = {
+  mode?: string;
+  approval?: string;
+};
+
+export type ArmPositionRequest = {
+  symbol: string;
+  side: string;
+  entry_policy?: ArmEntryPolicy;
 };
 
 export type MonthlyPositionsResponse = {
@@ -222,6 +236,15 @@ function normalizeStatus(raw: StatusResponse): StatusResponse {
     ),
     occupied_slots: requireNumber(raw.occupied_slots, "occupied_slots"),
     slot_cells_total: requireNumber(raw.slot_cells_total, "slot_cells_total"),
+    monthly_realized_loss: requireNumber(
+      raw.monthly_realized_loss,
+      "monthly_realized_loss",
+    ),
+    monthly_realized_loss_pct: requireNumber(
+      raw.monthly_realized_loss_pct,
+      "monthly_realized_loss_pct",
+    ),
+    capital_base: requireNumber(raw.capital_base, "capital_base"),
   };
 }
 
@@ -300,7 +323,7 @@ export const robsonApi = {
   getPosition: async (id: string) =>
     normalizePosition(await apiFetch<Position>(`/positions/${id}`)),
 
-  armPosition: (body: { symbol: string; side: string }) =>
+  armPosition: (body: ArmPositionRequest) =>
     apiFetch<Position>("/positions", {
       method: "POST",
       body: JSON.stringify(body),
