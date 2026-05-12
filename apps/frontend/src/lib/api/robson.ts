@@ -16,6 +16,8 @@ export type Position = {
   symbol: string;
   side: "Long" | "Short" | string;
   state: PositionState;
+  entry_mode?: string | null;
+  approval_mode?: string | null;
   entry_price: number | null;
   entry_filled_at: string | null;
   tech_stop_distance: number | null;

@@ -137,6 +137,10 @@ pub struct PositionSummary {
     pub state: String,
     pub created_at: chrono::DateTime<chrono::Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approval_mode: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub quantity: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_price: Option<Decimal>,
@@ -1403,10 +1407,33 @@ where
         _ => None,
     };
 
-    position_to_summary(position, live_price)
+    let entry_policy = manager.entry_policy_for_position(position.id).await;
+    let entry_mode = Some(
+        match entry_policy.mode {
+            robson_domain::EntryPolicy::Immediate => "immediate",
+            robson_domain::EntryPolicy::ConfirmedTrend => "confirmed_trend",
+            robson_domain::EntryPolicy::ConfirmedReversal => "confirmed_reversal",
+            robson_domain::EntryPolicy::ConfirmedKeyLevel => "confirmed_key_level",
+        }
+        .to_string(),
+    );
+    let approval_mode = Some(
+        match entry_policy.approval {
+            robson_domain::ApprovalPolicy::Automatic => "automatic",
+            robson_domain::ApprovalPolicy::HumanConfirmation => "human_confirmation",
+        }
+        .to_string(),
+    );
+
+    position_to_summary(position, live_price, entry_mode, approval_mode)
 }
 
-fn position_to_summary(position: &Position, live_price: Option<Price>) -> PositionSummary {
+fn position_to_summary(
+    position: &Position,
+    live_price: Option<Price>,
+    entry_mode: Option<String>,
+    approval_mode: Option<String>,
+) -> PositionSummary {
     let (state_str, entry_price, trailing_stop, current_price, pnl, variation_pct) = match &position
         .state
     {
@@ -1470,6 +1497,8 @@ fn position_to_summary(position: &Position, live_price: Option<Price>) -> Positi
         side: format!("{:?}", position.side),
         state: state_str,
         created_at: position.created_at,
+        entry_mode,
+        approval_mode,
         quantity: if position.quantity.as_decimal() > Decimal::ZERO {
             Some(position.quantity.as_decimal())
         } else {
@@ -1560,7 +1589,7 @@ where
 
     let mut summaries = Vec::with_capacity(positions.len());
     for position in &positions {
-        summaries.push(position_to_summary(position, None));
+        summaries.push(position_to_summary_with_live_price(manager, position).await);
     }
 
     Ok(summaries)
@@ -1667,7 +1696,8 @@ mod tests {
             last_emitted_stop: None,
         };
 
-        let summary = position_to_summary(&position, Some(Price::new(dec!(98)).unwrap()));
+        let summary =
+            position_to_summary(&position, Some(Price::new(dec!(98)).unwrap()), None, None);
 
         assert_eq!(summary.current_price, Some(dec!(98)));
         assert_eq!(summary.pnl, Some(dec!(-4)));
@@ -1689,7 +1719,8 @@ mod tests {
             last_emitted_stop: None,
         };
 
-        let summary = position_to_summary(&position, Some(Price::new(dec!(90)).unwrap()));
+        let summary =
+            position_to_summary(&position, Some(Price::new(dec!(90)).unwrap()), None, None);
 
         assert_eq!(summary.current_price, Some(dec!(90)));
         assert_eq!(summary.pnl, Some(dec!(-10)));
@@ -1708,7 +1739,7 @@ mod tests {
             exit_reason: robson_domain::ExitReason::UserPanic,
         };
 
-        let summary = position_to_summary(&position, None);
+        let summary = position_to_summary(&position, None, None, None);
 
         assert_eq!(summary.current_price, Some(dec!(90)));
         assert_eq!(summary.pnl, Some(dec!(20)));
@@ -2202,8 +2233,9 @@ mod tests {
         let status: StatusResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(status.active_positions, 1);
         assert_eq!(status.occupied_slots, 1);
-        assert_eq!(status.new_slots_available, 4);
-        assert_eq!(status.slot_cells_total, 5);
+        // Armed positions reserve a slot; new_slots drops by 1 (was 4, now 3).
+        assert_eq!(status.new_slots_available, 3);
+        assert_eq!(status.slot_cells_total, 4);
         assert_eq!(status.pending_approvals.len(), 1);
         assert_eq!(status.pending_approvals[0].query_id, query_id);
         assert_eq!(status.pending_approvals[0].position_id, Some(position.id));
