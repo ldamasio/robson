@@ -27,7 +27,7 @@
 
 use async_trait::async_trait;
 use robson_domain::ApprovalPolicy as DomainApprovalPolicy;
-use robson_engine::{EngineAction, ProposedTrade, RiskContext, RiskGate, RiskVerdict};
+use robson_engine::{EngineAction, ProposedTrade, RiskCheck, RiskContext, RiskGate, RiskVerdict};
 #[cfg(feature = "postgres")]
 use robson_eventlog::{
     append_event, ActorType, Event, EventLogError, QUERY_STATE_CHANGED_EVENT_TYPE,
@@ -37,6 +37,26 @@ use serde::{Deserialize, Serialize};
 #[cfg(feature = "postgres")]
 use sqlx::PgPool;
 use uuid::Uuid;
+
+const RISK_ENGINE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(200);
+
+#[cfg(test)]
+pub(crate) async fn evaluate_risk_with_timeout_for_test<F>(evaluate: F) -> RiskVerdict
+where
+    F: FnOnce() -> RiskVerdict + Send + 'static,
+{
+    match tokio::time::timeout(RISK_ENGINE_TIMEOUT, tokio::task::spawn_blocking(evaluate)).await {
+        Ok(Ok(verdict)) => verdict,
+        Ok(Err(err)) => RiskVerdict::Rejected {
+            check: RiskCheck::RiskEngineTimeout,
+            reason: format!("Risk engine task failed before verdict: {err}"),
+        },
+        Err(_) => RiskVerdict::Rejected {
+            check: RiskCheck::RiskEngineTimeout,
+            reason: format!("Risk engine timed out after {}ms", RISK_ENGINE_TIMEOUT.as_millis()),
+        },
+    }
+}
 
 use crate::query::{ApprovalRequirement, ExecutionQuery, QueryError, QueryState};
 
@@ -470,7 +490,30 @@ impl<R: QueryRecorder> QueryEngine<R> {
             return Err(CheckRiskError::Audit(err));
         }
 
-        let verdict = self.risk_gate.evaluate(proposed, context);
+        let risk_gate = self.risk_gate.clone();
+        let proposed_for_eval = proposed.clone();
+        let context_for_eval = context.clone();
+        let verdict = match tokio::time::timeout(
+            RISK_ENGINE_TIMEOUT,
+            tokio::task::spawn_blocking(move || {
+                risk_gate.evaluate(&proposed_for_eval, &context_for_eval)
+            }),
+        )
+        .await
+        {
+            Ok(Ok(verdict)) => verdict,
+            Ok(Err(err)) => RiskVerdict::Rejected {
+                check: RiskCheck::RiskEngineTimeout,
+                reason: format!("Risk engine task failed before verdict: {err}"),
+            },
+            Err(_) => RiskVerdict::Rejected {
+                check: RiskCheck::RiskEngineTimeout,
+                reason: format!(
+                    "Risk engine timed out after {}ms",
+                    RISK_ENGINE_TIMEOUT.as_millis()
+                ),
+            },
+        };
 
         match verdict {
             RiskVerdict::Approved => {

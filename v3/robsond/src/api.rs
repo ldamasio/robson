@@ -110,6 +110,13 @@ pub struct StatusResponse {
     pub occupied_slots: usize,
     /// Total cells the UI should render: occupied slots plus new slots.
     pub slot_cells_total: usize,
+    /// Absolute realized loss for the current month. Winning trades do not
+    /// offset this value.
+    pub monthly_realized_loss: Decimal,
+    /// Current-month realized loss as a percentage of capital_base.
+    pub monthly_realized_loss_pct: Decimal,
+    /// Starting capital basis for the current month.
+    pub capital_base: Decimal,
 }
 
 /// Historical monthly positions response.
@@ -654,10 +661,19 @@ where
     let manager = state.position_manager.read().await;
     let positions = manager.get_open_positions().await.map_err(|e| to_error_response(e))?;
     let pending_approvals = manager.get_pending_approvals().await;
+    let monthly = manager
+        .load_monthly_state(chrono::Utc::now())
+        .await
+        .map_err(|e| to_error_response(e))?;
     let new_slots_available =
         manager.compute_slots_available().await.map_err(|e| to_error_response(e))?;
     let occupied_slots = positions.len();
     let slot_cells_total = occupied_slots.saturating_add(new_slots_available as usize);
+    let monthly_realized_loss_pct = if monthly.capital_base > Decimal::ZERO {
+        monthly.realized_loss / monthly.capital_base * Decimal::from(100u32)
+    } else {
+        Decimal::ZERO
+    };
 
     let mut summaries: Vec<PositionSummary> = Vec::with_capacity(positions.len());
     for position in &positions {
@@ -687,6 +703,9 @@ where
         new_slots_available,
         occupied_slots,
         slot_cells_total,
+        monthly_realized_loss: monthly.realized_loss,
+        monthly_realized_loss_pct,
+        capital_base: monthly.capital_base,
     }))
 }
 

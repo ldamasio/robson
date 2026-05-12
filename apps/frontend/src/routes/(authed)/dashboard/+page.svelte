@@ -12,6 +12,7 @@
     type Position,
     type SseEvent,
     type PendingApproval,
+    type StatusResponse,
   } from "$api/robson";
   import { activePositions } from "$stores/operations";
   import { haltStatus } from "$stores/slots";
@@ -44,6 +45,7 @@
   let selectedMonth = $state(currentMonthKey());
   let monthlyPositions = $state<Position[]>([]);
   let monthlySlotCellsTotal = $state<number | null>(null);
+  let currentStatus = $state<StatusResponse | null>(null);
   let approvalTick = $state(Date.now());
   let approvalTickTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -51,10 +53,15 @@
   let monthOps = $derived(sortPositionsOldestFirst(monthlyPositions));
   let isHistoricalMonth = $derived(selectedMonth !== currentMonth);
   let displayOps = $derived(monthOps);
+  let slotPositions = $derived(
+    isHistoricalMonth ? displayOps : (currentStatus?.positions ?? []),
+  );
   let slots = $derived(
     deriveMonthSlots(
-      displayOps,
-      monthlySlotCellsTotal ?? displayOps.length,
+      slotPositions,
+      isHistoricalMonth
+        ? (monthlySlotCellsTotal ?? slotPositions.length)
+        : (currentStatus?.slot_cells_total ?? slotPositions.length),
       isHistoricalMonth ? "expired" : "free",
     ),
   );
@@ -65,6 +72,18 @@
     $recentEvents.filter((e) => isTodayUtc(e.occurred_at)),
   );
   let haltState = $derived($haltStatus?.state ?? "active");
+  let monthlyBudgetLimitPct = 4;
+  let budgetUsedPct = $derived(
+    Math.min(
+      100,
+      Math.max(
+        0,
+        ((currentStatus?.monthly_realized_loss_pct ?? 0) /
+          monthlyBudgetLimitPct) *
+          100,
+      ),
+    ),
+  );
 
   function countdownRemaining(expiresAt: string): string {
     const ms = new Date(expiresAt).getTime() - approvalTick;
@@ -143,6 +162,20 @@
     return isHistoricalMonth ? "NOW" : "ENTRY";
   }
 
+  function formatMoney(value: number | null | undefined): string {
+    const amount = Number(value ?? 0);
+    return new Intl.NumberFormat("en-US", {
+      style: "currency",
+      currency: "USD",
+      maximumFractionDigits: 2,
+    }).format(Number.isFinite(amount) ? amount : 0);
+  }
+
+  function formatPct(value: number | null | undefined): string {
+    const pct = Number(value ?? 0);
+    return `${(Number.isFinite(pct) ? pct : 0).toFixed(1)}%`;
+  }
+
   function returnToCurrentMonth() {
     if (!isHistoricalMonth) return;
     selectedMonth = currentMonthKey();
@@ -156,6 +189,7 @@
         robsonApi.getStatus(),
         robsonApi.getHaltStatus(),
       ]);
+      currentStatus = status;
       activePositions.set(status.positions);
       haltStatus.set(halt);
       pendingApprovals = status.pending_approvals;
@@ -198,7 +232,10 @@
           void Promise.all([
             robsonApi
               .getStatus()
-              .then((s) => activePositions.set(s.positions))
+              .then((s) => {
+                currentStatus = s;
+                activePositions.set(s.positions);
+              })
               .catch(() => {}),
             loadHistory().catch(() => {}),
           ]);
@@ -226,6 +263,7 @@
             robsonApi.getStatus(),
             robsonApi.getHaltStatus(),
           ]);
+          currentStatus = status;
           activePositions.set(status.positions);
           haltStatus.set(halt);
           pendingApprovals = status.pending_approvals;
@@ -340,7 +378,44 @@
   {:else}
     <section>
       <Stack gap={4}>
-        <div class="eyebrow">MONTH SNAPSHOT · {monthLabel()}</div>
+        <div class="eyebrow">RISK DASHBOARD · {monthLabel()}</div>
+        {#if !isHistoricalMonth && currentStatus}
+          <div class="risk-grid">
+            <Card padding={4}>
+              <Stack gap={3}>
+                <Row justify="between" align="center">
+                  <span class="label">MONTHLY BUDGET</span>
+                  <span class="mono"
+                    >{formatPct(currentStatus.monthly_realized_loss_pct)} /
+                    {monthlyBudgetLimitPct.toFixed(1)}% USED</span
+                  >
+                </Row>
+                <div
+                  class="budget-bar"
+                  aria-label="Monthly realized loss budget"
+                >
+                  <div
+                    class="budget-fill"
+                    style:width={`${budgetUsedPct}%`}
+                  ></div>
+                </div>
+              </Stack>
+            </Card>
+            <Card padding={4}>
+              <Stack gap={2}>
+                <span class="label">REALIZED LOSS</span>
+                <span class="loss-value"
+                  >{formatMoney(currentStatus.monthly_realized_loss)}</span
+                >
+                <span class="meta dim"
+                  >{formatPct(currentStatus.monthly_realized_loss_pct)} OF
+                  {formatMoney(currentStatus.capital_base)}</span
+                >
+              </Stack>
+            </Card>
+          </div>
+        {/if}
+        <div class="eyebrow">SLOTS · {monthLabel()}</div>
         <div class="slots-grid">
           {#each slots as slot}
             {#if slot.kind === "occupied" && slot.positionId}
@@ -578,9 +653,41 @@
   .eyebrow.dim {
     color: var(--fg-3);
   }
+  .label {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: var(--track-label);
+    color: var(--fg-2);
+    font-weight: 500;
+  }
+  .risk-grid {
+    display: grid;
+    grid-template-columns: minmax(0, 2fr) minmax(220px, 1fr);
+    gap: var(--s-3);
+  }
+  .budget-bar {
+    height: 12px;
+    overflow: hidden;
+    background: var(--bg-0);
+    border: 1px solid var(--border);
+    border-radius: 999px;
+  }
+  .budget-fill {
+    height: 100%;
+    min-width: 0;
+    background: linear-gradient(90deg, var(--cyan-dim), var(--cyan-brand));
+    transition: width var(--dur) var(--ease);
+  }
+  .loss-value {
+    font-family: var(--font-mono);
+    font-size: var(--text-lg);
+    color: var(--fg-0);
+    font-variant-numeric: tabular-nums;
+  }
   .slots-grid {
     display: grid;
-    grid-template-columns: repeat(4, 64px);
+    grid-template-columns: repeat(auto-fit, minmax(64px, 64px));
     gap: var(--s-2);
   }
   .slot {
