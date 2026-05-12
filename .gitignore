@@ -131,7 +131,8 @@ infra/ansible/inventory/contabo/passwords.yml
 
 # Temporary inventory with passwords (NEVER COMMIT)
 infra/ansible/inventory/contabo/hosts.ini.local
-apps/backend/monolith/.old/
+# Django monolith — retired in v3, never tracked, excluded to prevent accidental staging
+apps/backend/
 
 # Coverage reports
 .coverage

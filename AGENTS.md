@@ -50,9 +50,10 @@ The repository contains the Rust runtime (canonical) under `v3/`, the SvelteKit 
 
 Use these identifiers consistently:
 
-- `MIG-v2.5#N`: migration steps from v2 to v2.5
-- `MIG-v3#N`: migration steps from v2.5 to v3
-- `QE-PN`: QueryEngine implementation phases
+- `MIG-v2.5#N`: migration steps from v2 to v2.5 (all complete)
+- `MIG-v3#N`: migration steps from v2.5 to v3 (in progress — see `docs/architecture/v3-migration-plan.md`)
+- `MIG-v4#N`: items deferred to v4 (see `docs/architecture/v4-backlog.md`)
+- `QE-PN`: QueryEngine implementation phases (QE-P1–P4 complete; QE-P5 deferred to v4)
 - `Stage N`: runtime or control-loop pipeline stages inside a single execution tick
 - `VAL-N`: operational validation gates — runbook-format procedures required before go-live events (see `docs/runbooks/val-*.md`)
 
@@ -70,7 +71,8 @@ Prefer these status terms:
 - `implemented`: code and tests/docs in repo support the feature
 - `pending`: not yet implemented or not yet accepted
 - `operational rollout`: code may exist, but real deployment/activation is not yet repository-verified
-- `deferred`: intentionally postponed
+- `deferred`: intentionally postponed to a later version (v4+)
+- `abandoned`: explicitly dropped from scope — will not be implemented (reason must be documented)
 - `follow-up required`: architectural direction is decided, but code alignment is still pending
 
 Repository status rule:
@@ -115,7 +117,7 @@ Application and agent code must never provision databases directly.
 6. **Never run Postgres integration tests against a production `DATABASE_URL`**. `sqlx::test` creates and drops databases on the target server. `scripts/test-pg.sh` enforces this with a naming guard; do not bypass it.
 7. **Migration ownership**: migrations live in `v3/migrations/`. If you add a migration, verify that existing `sqlx::test`-based tests still pass with the updated schema. Do not apply migrations manually to shared environments.
 
-### Test tiers (v2 Rust)
+### Test tiers (v3 Rust)
 
 | Tier | Command | Requires database |
 |---|---|---|
@@ -132,20 +134,36 @@ CI must pass the first two tiers unconditionally. The third tier requires a prov
 - Leave the worktree clean after committing and pushing.
 - Do not silently preserve stale compatibility files; convert them into thin adapters or remove them.
 
+## Policy Invariants
+
+These are architectural constraints that MUST NOT be violated by any agent or human:
+
+10. **No static exposure hard limits.** `max_open_positions`, `max_total_exposure_pct`, and `max_single_position_pct` were eliminated in MIG-v3#11 (ADR-0024). The only static constraint is `risk_per_trade_pct = 1%` and `max_monthly_drawdown_pct = 4%` of `capital_base`. Slot availability governs entry capacity. There is no daily loss limit. Funding rate does not determine exposure limits in long positions.
+11. **`Estimated` evidence is permanently blocked in `reconcile_close`.** Only `OrderFillRecord` and `UserTradeRecord` are accepted for automated reconciled closes. If evidence is unavailable, the daemon aborts startup and requires manual operator intervention via `robson-cli reconcile-close`.
+12. **No LLM, no autonomous trading.** v3 has zero LLM coupling. The operator decides WHEN to trade. Robson decides HOW MUCH and enforces THAT risk rules are never violated. QE-P5 (Context Governance) is deferred to v4.
+
 ## High-Value Source Files
 
 Start here for v3/runtime work:
 
-- `docs/architecture/v3-migration-plan.md`
+- `docs/architecture/v3-migration-plan.md` — authoritative roadmap and status
+- `docs/architecture/v4-backlog.md` — items explicitly deferred to v4
 - `docs/architecture/v3-runtime-spec.md`
 - `docs/architecture/v3-query-query-engine.md`
 - `docs/architecture/v3-control-loop.md`
 - `docs/architecture/v3-architectural-decisions.md`
+- `docs/policies/UNTRACKED-POSITION-RECONCILIATION.md`
+- `docs/policies/SYMBOL-AGNOSTIC-POLICIES.md`
+- `docs/adr/ADR-0022-robson-authored-position-invariant.md`
+- `docs/adr/ADR-0023-symbol-agnostic-policy-invariant.md`
+- `docs/adr/ADR-0024-trading-policy-layer.md`
 
 Implementation reality for the current Rust executor/runtime boundary:
 
 - `v3/robsond/src/query_engine.rs`
 - `v3/robson-exec/src/executor.rs`
+- `v3/robsond/src/reconciliation_worker.rs`
+- `v3/robsond/src/position_manager.rs`
 
 ## Adapter Policy
 

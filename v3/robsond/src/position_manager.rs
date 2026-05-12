@@ -2702,7 +2702,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             ReconciliationEvidence::Estimated(_) => {
                 warn!(
                     position_id = %input.position_id,
-                    "Reverse reconciliation close rejected: estimated evidence is not allowed in Slice 4A"
+                    "reconcile_close rejected: Estimated evidence is permanently \
+                     disallowed in v3. Only OrderFillRecord and UserTradeRecord are \
+                     accepted. Operator must intervene manually."
                 );
                 return Ok(ReconcileCloseOutcome::RejectedUnsupportedEvidence {
                     source: "estimated",

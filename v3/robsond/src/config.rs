@@ -149,18 +149,25 @@ impl Default for PositionMonitorConfig {
 /// Policy controlling daemon behavior when stale-Active positions are detected
 /// at startup (Amendment §3 of TD-2026-05-05-001).
 ///
-/// In Slice 5A only `Abort` is accepted. Unknown values produce a config error.
+/// `Abort` is the default fail-closed behavior. `AutoReconcile` is an
+/// opt-in two-phase startup reconciliation path (Slice 5B2B).
+/// Unknown values produce a config error.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum StartupStaleActivePolicy {
     /// Fail closed: log CRITICAL, return exit code 78, refuse to start.
     #[default]
     Abort,
+    /// Attempt to gather real fill evidence and reconcile-close each
+    /// stale-active position at startup. Fails closed if any position lacks
+    /// unambiguous evidence.
+    AutoReconcile,
 }
 
 impl std::fmt::Display for StartupStaleActivePolicy {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Abort => write!(f, "abort"),
+            Self::AutoReconcile => write!(f, "auto_reconcile"),
         }
     }
 }
@@ -171,9 +178,10 @@ impl std::str::FromStr for StartupStaleActivePolicy {
     fn from_str(s: &str) -> Result<Self, Self::Err> {
         match s.to_lowercase().as_str() {
             "abort" => Ok(Self::Abort),
+            "auto_reconcile" => Ok(Self::AutoReconcile),
             other => Err(format!(
                 "Unknown ROBSON_RECONCILIATION_ON_STARTUP_STALE_ACTIVE value: \"{}\". \
-                 Accepted: abort",
+                 Accepted: abort, auto_reconcile",
                 other
             )),
         }
@@ -771,17 +779,51 @@ mod tests {
     }
 
     #[test]
+    fn test_load_startup_policy_auto_reconcile_from_env() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_RECONCILIATION_INTERVAL_SECS", None),
+            ("ROBSON_RECONCILIATION_MISSING_GRACE_SECS", None),
+            ("ROBSON_RECONCILIATION_ON_STARTUP_STALE_ACTIVE", Some("auto_reconcile")),
+        ]);
+
+        let config = Config::load_reconciliation_config().unwrap();
+        assert_eq!(config.on_startup_stale_active, StartupStaleActivePolicy::AutoReconcile);
+    }
+
+    #[test]
     fn test_load_startup_policy_unknown_is_config_error() {
         let _lock = env_lock().lock().unwrap();
         let _env = EnvGuard::new(&[(
             "ROBSON_RECONCILIATION_ON_STARTUP_STALE_ACTIVE",
-            Some("auto_reconcile"),
+            Some("invalid_policy"),
         )]);
 
         let err = Config::load_reconciliation_config().unwrap_err();
         assert!(
-            matches!(err, DaemonError::Config(ref msg) if msg.contains("auto_reconcile")),
+            matches!(err, DaemonError::Config(ref msg) if msg.contains("invalid_policy")),
             "expected config error for unknown policy, got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn test_startup_stale_active_policy_from_str() {
+        assert_eq!(
+            "abort".parse::<StartupStaleActivePolicy>().unwrap(),
+            StartupStaleActivePolicy::Abort
+        );
+        assert_eq!(
+            "auto_reconcile".parse::<StartupStaleActivePolicy>().unwrap(),
+            StartupStaleActivePolicy::AutoReconcile
+        );
+        assert!(
+            "unknown".parse::<StartupStaleActivePolicy>().is_err(),
+            "unknown policy should fail"
+        );
+        let err = "unknown".parse::<StartupStaleActivePolicy>().unwrap_err();
+        assert!(
+            err.contains("abort, auto_reconcile"),
+            "error should list accepted values: {err}"
         );
     }
 }
