@@ -15,6 +15,16 @@ export function positionStateLabel(state: PositionState): string {
   return key;
 }
 
+export function entryModeLabel(mode?: string | null): string {
+  switch (mode) {
+    case 'immediate':           return 'immediate — awaiting manual signal';
+    case 'confirmed_reversal':  return 'awaiting entry signal · reversal pattern';
+    case 'confirmed_key_level': return 'awaiting entry signal · key level';
+    case 'confirmed_trend':
+    default:                    return 'awaiting entry signal · SMA crossover';
+  }
+}
+
 export function positionSummaryLines(p: Position): string[] {
   const lines: string[] = [];
   const state = p.state;
@@ -22,7 +32,9 @@ export function positionSummaryLines(p: Position): string[] {
 
   if (typeof state === 'string') {
     if (state === 'Armed') {
-      lines.push(label('ARMED', 'awaiting entry signal · SMA crossover'));
+      const modeLabel = entryModeLabel(p.entry_mode);
+      const approvalLabel = p.approval_mode === 'human_confirmation' ? ' · awaiting approval' : '';
+      lines.push(label('ARMED', `${modeLabel}${approvalLabel}`));
       lines.push(label('LEVERAGE', '10x (fixed)'));
     } else if (state === 'Active') {
       const details = [];

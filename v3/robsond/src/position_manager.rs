@@ -890,7 +890,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
     }
 
-    async fn entry_policy_for_position(&self, position_id: PositionId) -> EntryPolicyConfig {
+    pub async fn entry_policy_for_position(&self, position_id: PositionId) -> EntryPolicyConfig {
         let entry_policies = self.entry_policies.read().await;
         entry_policies.get(&position_id).copied().unwrap_or_default()
     }
@@ -3063,9 +3063,18 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             })
             .sum();
 
-        Ok(self
-            .trading_policy
-            .slots_available(capital_base, monthly.realized_loss, latent_risk))
+        let policy_slots =
+            self.trading_policy
+                .slots_available(capital_base, monthly.realized_loss, latent_risk);
+
+        // Armed positions have no measurable latent risk (no entry or stop yet),
+        // but each one reserves a future slot. Subtract them so the operator
+        // cannot arm more positions than the budget allows.
+        let all_open = self.store.positions().find_active().await?;
+        let armed_count =
+            all_open.iter().filter(|p| matches!(p.state, PositionState::Armed)).count() as u32;
+
+        Ok(policy_slots.saturating_sub(armed_count))
     }
 
     // =========================================================================
