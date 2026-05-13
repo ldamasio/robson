@@ -28,10 +28,11 @@
   (set via `gh variable set`)
 
 ### B3 — k8s manifests in rbx-infra
-Operator copies skeleton from `docs/k8s/frontend/` in this repo
-into rbx-infra at the appropriate GitOps path. Adjust namespace,
-ClusterIssuer name, ingress class, and image pull secret to
-match cluster reality. Required objects:
+Operator keeps the frontend manifests in `rbx-infra` at the
+appropriate GitOps path. There is no local `docs/k8s/frontend/`
+tree anymore. Adjust namespace, ClusterIssuer name, ingress
+class, and image pull secret to match cluster reality. Required
+objects:
 - Namespace (or reuse robson namespace)
 - Deployment with 2 replicas, image
   `ghcr.io/ldamasio/robson-frontend-v2:latest`, port 8080

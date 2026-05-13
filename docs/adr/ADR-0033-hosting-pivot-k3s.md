@@ -35,7 +35,7 @@ Pivot frontend hosting from Contabo S3 static to k3s in-cluster deployment:
 **New:**
 - Dockerfile + nginx.conf added to apps/frontend/
 - GitHub Actions workflow rewritten: builds Docker image, pushes to GHCR
-- k8s skeleton manifests in docs/k8s/frontend/ for operator to copy into rbx-infra
+- k8s skeleton manifests live in rbx-infra, not in this repo
 - ArgoCD reconciles on image tag update (no kubectl in CI)
 - Health endpoint `/healthz` for k8s probes
 

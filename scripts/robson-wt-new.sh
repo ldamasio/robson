@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# devtools/robson-wt.sh
+# scripts/robson-wt-new.sh
 #
 # Robson worktree + tmux session bootstrapper.
 # Opinionated layout:
@@ -11,11 +11,11 @@
 #       [3] Shell
 #
 # Usage:
-#   ./devtools/robson-wt.sh <name> <branch>
+#   ./scripts/robson-wt-new.sh <name> <branch>
 #
 # Examples:
-#   ./devtools/robson-wt.sh fix-operations "fix/fix-operations"
-#   ./devtools/robson-wt.sh fix-stop-loss  "fix/fix-stop-loss"
+#   ./scripts/robson-wt-new.sh fix-operations "fix/fix-operations"
+#   ./scripts/robson-wt-new.sh fix-stop-loss  "fix/fix-stop-loss"
 #
 # Optional env vars (Robson-focused now, but generalizable later):
 #   ROBSON_TRUNK=~/apps/robson
@@ -133,4 +133,3 @@ if [[ -n "${TMUX:-}" ]]; then
 else
   exec tmux attach -t "${SESSION}"
 fi
-
