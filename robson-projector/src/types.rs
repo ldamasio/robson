@@ -386,7 +386,8 @@ pub struct ExitFilled {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EntryPolicyResolved {
     pub position_id: Uuid,
-    /// "immediate" | "confirmed_trend" | "confirmed_reversal" | "confirmed_key_level"
+    /// "immediate" | "confirmed_trend" | "confirmed_reversal" |
+    /// "confirmed_key_level"
     pub entry_policy: String,
     /// "automatic" | "human_confirmation"
     pub approval_policy: String,

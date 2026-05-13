@@ -24,9 +24,9 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Utc};
 use robson_connectors::BinanceRestClient;
-use robson_domain::{Position, PositionId, PositionState, Symbol, TradingPolicy};
 #[cfg(feature = "postgres")]
 use robson_domain::{ApprovalPolicy, EntryPolicy, EntryPolicyConfig};
+use robson_domain::{Position, PositionId, PositionState, Symbol, TradingPolicy};
 use robson_engine::Engine;
 use robson_exec::{ExchangePort, Executor, IntentJournal, StubExchange};
 #[cfg(feature = "postgres")]
