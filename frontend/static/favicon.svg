@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- RBX Mark Option B — Refined. Same letterform paths as original bitmap.svg.
+     Changes: cyan #22E5E5 (brand cyan, less pure than #00FFFF), no radial gradient stroke,
+     dark warm-black frame for context. Preserves "jovial + signal" while adding restraint. -->
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 300 300" width="300" height="300">
+  <rect width="300" height="300" fill="#07080A"/>
+  <path
+    fill="#22E5E5"
+    d="M 151.64585,16.458239 A 135.45542,135.45542 0 0 0 16.190435,151.91367 a 135.45542,135.45542 0 0 0 2.31227,23.5724 L 98.558973,95.429806 H 129.51793 L 25.259609,199.68817 a 135.45542,135.45542 0 0 0 35.324226,51.75876 l 61.198345,-61.19832 h 30.95896 l -74.780929,74.78093 a 135.45542,135.45542 0 0 0 73.685639,22.33954 135.45542,135.45542 0 0 0 135.45541,-135.45541 135.45542,135.45542 0 0 0 -0.0271,-1.17996 l -80.15088,80.15153 H 175.96435 L 283.92126,122.92832 A 135.45542,135.45542 0 0 0 246.63396,55.719146 L 152.74114,149.61199 H 121.78218 L 229.74437,41.649772 A 135.45542,135.45542 0 0 0 151.64585,16.458239 Z"
+  />
+</svg>

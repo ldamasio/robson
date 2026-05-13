@@ -48,21 +48,19 @@ In leveraged markets, **how** you execute matters more than **what** you execute
 
 ## Architecture
 
-The canonical runtime is written in Rust and lives under `v3/`. The SvelteKit operations dashboard lives under `apps/frontend/`.
+The canonical runtime is written in Rust and lives at the repository root. The SvelteKit operations dashboard lives under `frontend/`.
 
 ```
-v3/
-  robson-domain/       # Pure domain logic — no external dependencies
-  robson-engine/       # Decision engine (risk calculations, position sizing)
-  robson-exec/         # Execution layer (port definitions, orchestration)
-  robson-connectors/   # Exchange adapters (Binance Futures)
-  robson-store/        # PostgreSQL persistence (SQLx)
-  robsond/             # Runtime daemon (Axum HTTP API, control loop)
-  robson-sim/          # Backtesting and simulation
-  cli/                 # Operator CLI (Bun / TypeScript)
+robson-domain/       # Pure domain logic — no external dependencies
+robson-engine/       # Decision engine (risk calculations, position sizing)
+robson-exec/         # Execution layer (port definitions, orchestration)
+robson-connectors/   # Exchange adapters (Binance Futures)
+robson-store/        # PostgreSQL persistence (SQLx)
+robsond/             # Runtime daemon (Axum HTTP API, control loop)
+robson-sim/          # Backtesting and simulation
+cli/                 # Operator CLI (Bun / TypeScript)
 
-apps/
-  frontend/            # SvelteKit operations dashboard
+frontend/              # SvelteKit operations dashboard
 
 docs/
   adr/                 # Architecture Decision Records
@@ -109,15 +107,13 @@ GET  /events                          # SSE event stream (bearer token via query
 
 - Rust stable + nightly (nightly required for `rustfmt`)
 - PostgreSQL
-- [pnpm](https://pnpm.io) — frontend (`apps/frontend/`)
-- [Bun](https://bun.sh) — operator CLI (`v3/cli/`)
+- [pnpm](https://pnpm.io) — frontend (`frontend/`)
+- [Bun](https://bun.sh) — operator CLI (`cli/`)
 - [`just`](https://just.systems) — task runner
 
 ### Backend (Rust)
 
 ```bash
-cd v3
-
 # Build
 cargo build
 
@@ -132,13 +128,13 @@ cargo clippy --all-targets -- -D warnings
 
 # PostgreSQL integration tests (requires DATABASE_URL)
 just v2-db-up        # start local database container
-just v2-test-pg      # run integration tests against real DB
+just test-pg         # run integration tests against real DB
 ```
 
 ### Frontend (SvelteKit)
 
 ```bash
-cd apps/frontend
+cd frontend
 pnpm install
 pnpm dev             # development server
 pnpm check           # type check (svelte-check + tsc)
@@ -148,7 +144,7 @@ pnpm build           # production build
 ### CLI (Bun)
 
 ```bash
-cd v3/cli
+cd cli
 bun install
 bun run dev          # run CLI in development mode
 bun test             # run tests

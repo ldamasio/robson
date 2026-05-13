@@ -145,9 +145,9 @@ stop_loss = entry_price * 0.98  # Arbitrary!
 ## RELATED DOCUMENTS
 
 - `docs/requirements/technical-stop-requirements.md` - Technical stop detection requirements
-- `v3/robson-engine/src/technical_stop_analyzer.rs` - Current Rust implementation (chart-derived stop analysis)
-- `v3/robson-domain/src/entities.rs` - `calculate_position_size()` (Golden Rule formula)
-- `v3/robson-domain/src/value_objects.rs` - `RiskConfig::RISK_PER_TRADE_PCT` (1% invariant)
+- `robson-engine/src/technical_stop_analyzer.rs` - Current Rust implementation (chart-derived stop analysis)
+- `robson-domain/src/entities.rs` - `calculate_position_size()` (Golden Rule formula)
+- `robson-domain/src/value_objects.rs` - `RiskConfig::RISK_PER_TRADE_PCT` (1% invariant)
 - `AGENTS.md` - Project-wide AI agent instructions
 
 ---

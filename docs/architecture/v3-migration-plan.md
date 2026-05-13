@@ -114,7 +114,7 @@ Status rule for this table: code-backed items may be marked done from repository
 | MIG-v2.5#10 | EventLog replay determinism test | ✅ Done (2026-04-05) |
 | MIG-v3#1 | Promote robsond as primary runtime | ✅ Done (2026-04-10) — Django execution CronJobs suspended, robsond sole execution path |
 | MIG-v3#2 | Replace Django API with thin gateway | ✅ Done (2026-04-16) — robsond serves API/SSE directly; no separate gateway needed |
-| MIG-v3#3 | Frontend direct connection to SSE | ✅ Done (2026-05-12) — Django retired. Canonical frontend is SvelteKit at `apps/frontend/` (`@robson/frontend-v2`). SSE endpoint is live in robsond (`/events`). React/nginx legacy frontend removed from working tree. |
+| MIG-v3#3 | Frontend direct connection to SSE | ✅ Done (2026-05-12) — Django retired. Canonical frontend is SvelteKit at `frontend/` (`@robson/frontend-v2`). SSE endpoint is live in robsond (`/events`). React/nginx legacy frontend removed from working tree. |
 | MIG-v3#4 | Dynamic risk limits | ❌ Abandoned (2026-05-12) — superseded by MIG-v3#11 + ADR-0024. No static hard limits exist. The only monthly constraint is the 4% drawdown policy encoded in `TradingPolicy`. Dynamic limits beyond the slot model conflict with policy invariants and were dropped from scope. |
 | MIG-v3#5 | Operator control surface in UI | ❌ Abandoned (2026-05-12) — pause/resume do not apply in the slot model; panic close belongs in the backend CLI; risk-limit adjustment from UI contradicts policy invariants (ADR-0024). This was a pre-v3 concept that lost relevance after the slot architecture was finalized. |
 | MIG-v3#6 | Hash-chained EventLog | 🔄 Deferred to MIG-v4#1 — good integrity property, not required for v3 launch. |
@@ -704,7 +704,7 @@ The Risk Engine is a mandatory gate in the control loop. Every `EngineAction` pa
 
 > **Note (2026-04-18)**: The L1–L4 escalation ladder described in earlier revisions
 > has been **replaced by a binary MonthlyHalt** per `docs/architecture/v3-risk-engine-spec.md`
-> §"What v3 Does NOT Include". The implementation in `v3/robsond/src/circuit_breaker.rs`
+> §"What v3 Does NOT Include". The implementation in `robsond/src/circuit_breaker.rs`
 > is binary: `Active ⟷ MonthlyHalt`. There are no escalation levels, no auto-escalation
 > timers, and no Half-Open recovery state. See the risk engine spec for the authoritative
 > policy. The table below is retained for historical reference only.
@@ -961,7 +961,7 @@ Reconsider TRON integration when ALL of these are true:
 
 | ID | Change | Why It Cannot Wait | Depends On | Effort | Reversible? | Rollback | Breaks If Skipped |
 |----|--------|--------------------|-----------|--------|-------------|----------|-------------------|
-| MIG-v2.5#1 | **Deploy robsond to k3s alongside Django** | Rust daemon must be running before it can take over stop monitoring. Deploy first, verify stability. | K8s manifests (exist in v3/k8s/) | S | Yes — undeploy pod | `kubectl delete deployment robsond` | v3 has no production-proven daemon |
+| MIG-v2.5#1 | **Deploy robsond to k3s alongside Django** | Rust daemon must be running before it can take over stop monitoring. Deploy first, verify stability. | K8s manifests (exist in k8s/) | S | Yes — undeploy pod | `kubectl delete deployment robsond` | v3 has no production-proven daemon |
 | MIG-v2.5#2 | **Complete projector handlers** (robson-projector, currently 40%) | Without projections, Runtime cannot reconstruct state on restart | MIG-v2.5#1 | M | Yes — code change only | Revert commit | Runtime loses state on restart, requires full EventLog replay every time |
 | MIG-v2.5#3 | **Migrate stop monitoring from Django CronJob to robsond WebSocket** | CronJob has 60s granularity. WebSocket achieves <500ms. This is the core latency improvement. | MIG-v2.5#1, MIG-v2.5#2 | M | Yes — re-enable CronJob | Re-enable `rbs-stop-monitor-cronjob`, disable robsond stop monitor | Stop-loss latency stays at 60s, unacceptable for leveraged trading |
 | MIG-v2.5#4 | **Implement GovernedAction + Risk Engine as blocking gate** | Risk Engine is currently in robson-engine but not wired as mandatory gate. Must block before any v3 feature relies on it. | MIG-v2.5#1 | M | Yes — revert to advisory mode | Config flag: `risk_engine_mode: advisory` | Risk Engine bypass possible, defeating the entire safety architecture |
@@ -1050,7 +1050,7 @@ budget bar, no realized-loss display. Full Risk Dashboard deferred to MIG-v3#14.
 
 **Date**: 2026-05-12 — identified as frontend/backend parity gap.
 
-**Problem**: `ArmModal.svelte` (`apps/frontend/src/lib/design/components/ArmModal.svelte`) sends
+**Problem**: `ArmModal.svelte` (`frontend/src/lib/design/components/ArmModal.svelte`) sends
 only `{ symbol, side }` to `POST /positions`. The `entry_policy` field is never included.
 `robson.ts:armPosition` (line 303) has the same gap. The backend defaults to
 `ConfirmedTrend` + `Automatic` when `entry_policy` is omitted, locking the operator to SMA

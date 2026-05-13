@@ -1,0 +1,19 @@
+[package]
+name = "robson-domain"
+version.workspace = true
+edition.workspace = true
+authors.workspace = true
+license.workspace = true
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+rust_decimal = { workspace = true }
+rust_decimal_macros = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+thiserror = { workspace = true }
+zeroize = { version = "1.8", features = ["derive"] }
+
+[dev-dependencies]
+anyhow = { workspace = true }

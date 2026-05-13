@@ -35,7 +35,7 @@
 ## Current State
 
 ### System Overview
-- Backend: Robson v3 (`v2/`, `v3/`) live in production with real capital (`project_robson_v3_capital_real_state`).
+- Backend: Robson v3 (successor to the historical `v2` and `v3` directories) live in production with real capital (`project_robson_v3_capital_real_state`).
 - Legacy frontend: `apps/frontend/` (React + Vite + `react-bootstrap`) — to be removed post-cutover.
 - Brand assets: `/home/psyctl/apps/robson/atelier/brand-voltage/` — tokens, SVGs, preview HTML (approved).
 - Infrastructure: Contabo S3 (`rbx-content` bucket already in use for blog), PowerDNS sovereign 2-VPS.
@@ -862,7 +862,7 @@ apps/frontend/
 | 2026-04-24 | EP-007 i18n — login/dashboard/operation detail extended to svelte-i18n; en.json + pt-BR.json key parity test added; labels.ts kept English (technical state identifiers); root layout guards render behind $isLoading to avoid init race. Commit e8fb9d50 on branch fe-p1/ep-007-i18n. | GLM-5.1 | DONE |
 | 2026-04-24 | EP-008 deploy skeleton — workflow_dispatch-only GitHub Actions workflow targeting Contabo S3 bucket robson-app; runbook docs/runbooks/frontend-deploy.md with prerequisites B1–B5. Workflow does not run until operator provisions bucket, secrets, DNS, TLS decision, backend CORS/public reachability. Commit 15f86514 on branch fe-p1/ep-008-deploy. | GLM-5.1 | DONE (skeleton; execution blocked on B1–B5) |
 | 2026-04-25 | Hosting pivot Contabo S3 → k3s in-cluster (ADR-0033). Frontend becomes containerized nginx; ArgoCD GitOps; cert-manager + Let's Encrypt. | Opus 4.7 + GLM-5.1 | DONE |
-| 2026-04-25 | v3 canonical layout: Django and legacy React deleted; `v2/` → `v3/`; `apps/frontend-v2/` → `apps/frontend/`; obsolete CI workflows removed. | GLM-5.1 | DONE |
+| 2026-04-25 | v3 canonical layout: Django and legacy React deleted; historical `v2` directory moved to `v3`; `apps/frontend-v2` moved to `apps/frontend`; obsolete CI workflows removed. | GLM-5.1 | DONE |
 | 2026-04-25 | Production launch — three endpoints HTTPS 200: robson.rbx.ia.br, robson.rbxsystems.ch, api.robson.rbx.ia.br. CORS layer (ADR-0032), nginx non-root config (ADR-0031), Bearer-token auth (ADR-0030) all live. | Opus 4.7 + GLM-5.1 | **FE-P1 LIVE** |
 
 ---

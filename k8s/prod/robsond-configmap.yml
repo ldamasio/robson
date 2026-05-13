@@ -1,0 +1,25 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: robsond-config
+  namespace: robson-v2
+  labels:
+    app: robsond
+    version: v2
+data:
+  # Binance API configuration
+  binance-base-url: "https://api.binance.com"
+  
+  # Logging configuration
+  log-level: "info"
+  rust-log: "robsond=info,robson_engine=info,robson_exec=info"
+  
+  # Safety Net configuration
+  safety-net-enabled: "true"
+  safety-net-poll-interval-seconds: "20"
+  safety-net-symbols: "BTCUSDT,ETHUSDT"
+  
+  # Position Monitor configuration
+  position-monitor-max-retry-attempts: "3"
+  position-monitor-execution-cooldown-seconds: "60"
+  position-monitor-price-validation-tolerance-pct: "0.1"

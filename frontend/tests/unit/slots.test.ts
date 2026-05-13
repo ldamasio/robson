@@ -1,0 +1,150 @@
+import { describe, it, expect } from 'vitest';
+import {
+  deriveHistoricalSlots,
+  deriveMonthSlots,
+  deriveSlots,
+  occupiedCount,
+  sortPositionsOldestFirst
+} from '$lib/config/slots';
+import type { PositionState } from '$api/robson';
+
+const activeState: PositionState = {
+  Active: {
+    current_price: 100,
+    trailing_stop: 95,
+    favorable_extreme: 110,
+    extreme_at: '',
+    insurance_stop_id: null,
+    last_emitted_stop: null
+  }
+};
+
+describe('deriveSlots', () => {
+  it('renders the backend-provided slot cell total when no positions are occupied', () => {
+    const result = deriveSlots([], 4);
+    expect(result).toHaveLength(4);
+    expect(result.every((s) => !s.occupied)).toBe(true);
+  });
+
+  it('marks first N slots occupied for N active positions', () => {
+    const positions = [
+      { id: 'a', state: 'Armed' as PositionState },
+      { id: 'b', state: activeState }
+    ];
+    const result = deriveSlots(positions, 4);
+    expect(result.filter((s) => s.occupied)).toHaveLength(2);
+    expect(result[0].positionId).toBe('a');
+    expect(result[1].positionId).toBe('b');
+    expect(result[2].occupied).toBe(false);
+  });
+
+  it('excludes Closed/Error positions', () => {
+    const positions = [
+      { id: 'x', state: { Closed: { exit_price: 100, realized_pnl: 0, exit_reason: 'stop_hit' } } as PositionState },
+      { id: 'y', state: { Error: { error: 'test', recoverable: false } } as PositionState }
+    ];
+    const result = deriveSlots(positions, 4);
+    expect(result.every((s) => !s.occupied)).toBe(true);
+  });
+
+  it('preserves occupied positions beyond the backend cell total', () => {
+    const positions = Array.from({ length: 8 }, (_, i) => ({
+      id: `p-${i}`,
+      state: activeState
+    }));
+    const result = deriveSlots(positions, 4);
+    expect(result).toHaveLength(8);
+    expect(result.every((s) => s.occupied)).toBe(true);
+  });
+
+  it('renders carried positions plus newly available monthly slots', () => {
+    const positions = Array.from({ length: 3 }, (_, i) => ({
+      id: `p-${i}`,
+      state: activeState
+    }));
+    const result = deriveSlots(positions, 7);
+    expect(result).toHaveLength(7);
+    expect(result.filter((s) => s.occupied)).toHaveLength(3);
+    expect(result.filter((s) => !s.occupied)).toHaveLength(4);
+  });
+
+  it('orders occupied slots from oldest to newest and leaves free slots on the right', () => {
+    const positions = [
+      { id: 'newest', state: activeState, created_at: '2026-05-05T10:00:00Z' },
+      { id: 'oldest', state: activeState, created_at: '2026-04-22T06:24:42Z' },
+      { id: 'middle', state: 'Armed' as PositionState, created_at: '2026-04-26T23:03:11Z' }
+    ];
+    const result = deriveSlots(positions, 5);
+
+    expect(result.map((s) => s.positionId)).toEqual(['oldest', 'middle', 'newest', null, null]);
+    expect(result.slice(0, 3).every((s) => s.occupied)).toBe(true);
+    expect(result.slice(3).every((s) => !s.occupied)).toBe(true);
+  });
+
+  it('renders historical months with expired slots instead of free slots', () => {
+    const positions = [
+      { id: 'oldest', state: activeState, created_at: '2026-04-22T06:24:42Z' },
+      { id: 'middle', state: 'Armed' as PositionState, created_at: '2026-04-26T23:03:11Z' }
+    ];
+    const result = deriveHistoricalSlots(positions, 6);
+
+    expect(result).toHaveLength(6);
+    expect(result.slice(0, 2).every((s) => s.occupied)).toBe(true);
+    expect(result.slice(2).every((s) => s.kind === 'expired')).toBe(true);
+    expect(result.filter((s) => s.kind === 'expired')).toHaveLength(4);
+  });
+
+  it('renders current-month snapshots with free slots instead of expired slots', () => {
+    const positions = [
+      { id: 'oldest', state: activeState, created_at: '2026-05-02T10:00:00Z' },
+      { id: 'middle', state: 'Armed' as PositionState, created_at: '2026-05-04T11:00:00Z' }
+    ];
+    const result = deriveMonthSlots(positions, 6, 'free');
+
+    expect(result).toHaveLength(6);
+    expect(result.slice(0, 2).every((s) => s.occupied)).toBe(true);
+    expect(result.slice(2).every((s) => s.kind === 'free')).toBe(true);
+    expect(result.filter((s) => s.kind === 'free')).toHaveLength(4);
+  });
+
+  it('does not add expired slots when the snapshot is already full', () => {
+    const positions = [
+      { id: 'one', state: activeState, created_at: '2026-04-22T06:24:42Z' },
+      { id: 'two', state: 'Armed' as PositionState, created_at: '2026-04-26T23:03:11Z' },
+      { id: 'three', state: activeState, created_at: '2026-05-01T10:00:00Z' }
+    ];
+    const result = deriveHistoricalSlots(positions, 2);
+
+    expect(result).toHaveLength(3);
+    expect(result.every((s) => s.occupied)).toBe(true);
+  });
+});
+
+describe('sortPositionsOldestFirst', () => {
+  it('keeps positions without valid timestamps after dated positions', () => {
+    const sorted = sortPositionsOldestFirst([
+      { id: 'undated' },
+      { id: 'dated', created_at: '2026-04-22T06:24:42Z' }
+    ]);
+
+    expect(sorted.map((p) => p.id)).toEqual(['dated', 'undated']);
+  });
+});
+
+describe('occupiedCount', () => {
+  it('counts Armed + Entering + Active only', () => {
+    const positions = [
+      { state: 'Armed' as PositionState },
+      { state: { Entering: { entry_order_id: '1', expected_entry: 100, signal_id: 's' } } as PositionState },
+      { state: activeState },
+      { state: { Closed: { exit_price: 100, realized_pnl: 0, exit_reason: 'stop_hit' } } as PositionState },
+      { state: { Exiting: { exit_order_id: '2', exit_reason: 'stop_hit' } } as PositionState }
+    ];
+    expect(occupiedCount(positions)).toBe(3);
+  });
+
+  it('returns count > initial monthly budget when more than 4 active', () => {
+    const positions = Array.from({ length: 8 }, () => ({ state: activeState }));
+    expect(occupiedCount(positions)).toBe(8);
+  });
+});

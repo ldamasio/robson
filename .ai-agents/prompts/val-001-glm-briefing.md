@@ -77,7 +77,8 @@ Fetch live BTCUSDT price from `testnet.binance.vision`. Set stop_loss at **8% be
 > A 2% stop yields 50 USDT (50% ❌) — risk-denied silently with HTTP 200, no order placed.
 
 ```bash
-PRICE=$(curl -s "https://testnet.binance.vision/api/v3/ticker/price?symbol=BTCUSDT" | jq -r '.price')
+SPOT_API_VERSION=v3
+PRICE=$(curl -s "https://testnet.binance.vision/api/${SPOT_API_VERSION}/ticker/price?symbol=BTCUSDT" | jq -r '.price')
 STOP=$(echo "$PRICE * 0.92" | bc -l | xargs printf "%.2f")
 ```
 

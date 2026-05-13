@@ -7,7 +7,7 @@
 MIG-v3#12 (introduced the persistent `monthly_state` table — origin of the
 postgres-feature `load_monthly_state` branch),
 [ADR-0024 — Dynamic Slots](../adr/),
-`v3/robsond/src/position_manager.rs:225-284`.
+`robsond/src/position_manager.rs:225-284`.
 
 ---
 
@@ -53,7 +53,7 @@ no production code path changes.
 ### Without `--features postgres` (in-memory branch)
 
 ```bash
-cd /home/psyctl/apps/robson/v3
+cd /home/psyctl/apps/robson
 cargo test -p robsond --lib monthly_halt
 ```
 
@@ -109,7 +109,7 @@ hit; the function simply observed `realized_loss = 0`.
 
 ## Root Cause
 
-`v3/robsond/src/position_manager.rs:225-284` defines two feature-gated
+`robsond/src/position_manager.rs:225-284` defines two feature-gated
 implementations of `load_monthly_state`:
 
 ```rust
@@ -176,7 +176,7 @@ production regression exists.**
 
 ## Proposed Fix
 
-Single change to `v3/robsond/src/position_manager.rs`:
+Single change to `robsond/src/position_manager.rs`:
 
 1. Extract the existing in-memory aggregation logic from the
    `cfg(not(feature = "postgres"))` arm into a private helper:
@@ -287,7 +287,7 @@ trusted.
 After applying the fix, the following must all be green:
 
 ```bash
-cd /home/psyctl/apps/robson/v3
+cd /home/psyctl/apps/robson
 cargo test -p robsond --lib monthly_halt        # already green; must stay green
 cargo test -p robsond --tests --features postgres monthly_halt
 cargo test -p robsond --tests --features postgres

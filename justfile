@@ -20,7 +20,7 @@ default:
 # ============================================================================
 
 # First-time setup: install all dependencies
-setup: setup-python setup-node setup-go
+setup: setup-python setup-node setup-cli
     @echo ""
     @echo "✅ Development environment ready!"
     @echo ""
@@ -36,15 +36,15 @@ setup-python:
     @echo "📦 Installing Python dependencies..."
     cd apps/backend/monolith && pip install -r requirements.txt
 
-# Install Node.js dependencies (React frontend)
+# Install frontend dependencies (SvelteKit)
 setup-node:
-    @echo "📦 Installing Node.js dependencies..."
-    cd apps/frontend && npm install
+    @echo "📦 Installing frontend dependencies..."
+    cd frontend && pnpm install
 
-# Install Go dependencies (CLI)
-setup-go:
-    @echo "📦 Installing Go dependencies..."
-    cd cli && go mod download
+# Install CLI dependencies (Bun)
+setup-cli:
+    @echo "📦 Installing CLI dependencies..."
+    cd cli && bun install
 
 # ============================================================================
 # Build (delegates to Make)
@@ -73,19 +73,15 @@ test-backend:
     @echo "🧪 Running backend tests..."
     cd apps/backend/monolith && python manage.py test -v 2
 
-# Run frontend tests (Vitest)
+# Run frontend type check and tests
 test-frontend:
-    @echo "🧪 Running frontend tests..."
-    cd apps/frontend && npm test
+    @echo "🧪 Running frontend check..."
+    cd frontend && pnpm check
 
 # Run CLI smoke tests
 test-cli:
     @echo "🧪 Running CLI smoke tests..."
-    @if [ ! -f cli/robson-go ]; then \
-        echo "⚠️  CLI not built. Run: make build-cli"; \
-        exit 1; \
-    fi
-    cd cli && ./smoke-test.sh
+    cd cli && bun test
 
 # Watch mode: run backend tests on file changes
 test-watch:
@@ -175,10 +171,10 @@ dev-backend: db-up
 
 # Start frontend development server
 dev-frontend:
-    @echo "🚀 Starting React dev server..."
+    @echo "🚀 Starting SvelteKit dev server..."
     @echo "   URL: http://localhost:5173"
     @echo ""
-    cd apps/frontend && npm run dev
+    cd frontend && pnpm dev
 
 # Open Django shell
 shell:
@@ -191,17 +187,17 @@ shell:
 # Format code (Python, Go, JavaScript)
 fmt:
     @echo "🎨 Formatting code..."
-    @echo "  → Go (gofmt)"
-    @cd cli && go fmt ./...
-    @echo "  ✅ Go formatted"
+    @echo "  → CLI (TypeScript)"
+    @cd cli && bun x tsc --noEmit
+    @echo "  ✅ CLI checked"
     @# TODO: Add Python (black/ruff) and JS (prettier) when configured
 
 # Lint code
 lint:
     @echo "🔍 Linting code..."
-    @echo "  → Go (go vet)"
-    @cd cli && go vet ./...
-    @echo "  ✅ Go linted"
+    @echo "  → CLI (TypeScript)"
+    @cd cli && bun x tsc --noEmit
+    @echo "  ✅ CLI linted"
     @# TODO: Add Python (ruff) and JS (eslint) when configured
 
 # Run validation checks (AI governance, etc.)
@@ -287,8 +283,8 @@ info:
     @echo "Node.js:"
     @node --version || echo "  ❌ Not found"
     @echo ""
-    @echo "Go:"
-    @go version || echo "  ❌ Not found"
+    @echo "Bun:"
+    @bun --version || echo "  ❌ Not found"
     @echo ""
     @echo "Docker:"
     @docker --version || echo "  ❌ Not found"
@@ -300,8 +296,8 @@ info:
     @k9s version 2>/dev/null | head -n 1 || echo "  ❌ Not found"
     @echo ""
     @echo "CLI:"
-    @if [ -f robson ] && [ -f cli/robson-go ]; then \
-        echo "  ✅ Built (robson + robson-go)"; \
+    @if [ -f cli/dist/index.js ]; then \
+        echo "  ✅ Built (cli/dist/index.js)"; \
     else \
         echo "  ⚠️  Not built (run: make build-cli)"; \
     fi
@@ -323,23 +319,23 @@ health: info
     @echo "✅ Environment is healthy!"
 
 # ============================================================================
-# Robson v2 (Rust rewrite)
+# Rust runtime
 # ============================================================================
 
-# v2: Build robsond binary
+# Build robsond binary
 v2-build:
     @echo "🔨 Building robsond..."
-    cd v2 && cargo build --release --bin robsond
+    cargo build --release --bin robsond
 
-# v2: Format code
+# Format Rust code
 v2-fmt:
-    @echo "🎨 Formatting v2 code..."
-    cd v2 && cargo fmt --all
+    @echo "🎨 Formatting Rust code..."
+    cargo fmt --all
 
-# v2: Check compilation
+# Check Rust compilation
 v2-check:
-    @echo "🔍 Checking v2 compilation..."
-    cd v2 && cargo check --workspace -q
+    @echo "🔍 Checking Rust compilation..."
+    cargo check --workspace -q
 
 # v2: Database lifecycle (Podman-first)
 v2-db-up:
@@ -379,8 +375,8 @@ v2-db-down:
 
 v2-db-migrate:
     #!/usr/bin/env bash
-    # Apply migration 002 for v2
-    podman exec -i robson-v2-db psql -U robson -d robson_v2 < v2/migrations/002_event_log_phase9.sql
+    export DATABASE_URL="${DATABASE_URL:-postgresql://robson:robson@localhost:5432/robson_v2}"
+    sqlx migrate run
 
 v2-db-psql:
     podman exec -it robson-v2-db psql -U robson -d robson_v2
@@ -393,12 +389,16 @@ v2-db-psql:
 #   Staging    : set DATABASE_URL from Ansible vault output before calling this target
 #
 # WARNING: Never use a production DATABASE_URL — sqlx::test creates/drops databases on the server.
-v2-test-pg:
+test-pg:
     #!/usr/bin/env bash
     # Local dev: use the known container URL if DATABASE_URL is not already set.
     # In CI/staging, DATABASE_URL must be injected externally (this fallback does not apply).
     export DATABASE_URL="${DATABASE_URL:-postgresql://robson:robson@localhost:5432/robson_v2}"
-    cd v2 && bash scripts/test-pg.sh
+    bash scripts/test-pg.sh
+
+v2-test-pg: test-pg
+
+v3-test-pg: test-pg
 
 # v2: Test projection worker (end-to-end)
 v2-test-projection-worker:

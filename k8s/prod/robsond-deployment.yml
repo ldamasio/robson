@@ -1,0 +1,149 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: robsond
+  namespace: robson-v2
+  labels:
+    app: robsond
+    version: v2
+    component: daemon
+spec:
+  replicas: 1  # Single instance (leader election not yet implemented)
+  strategy:
+    type: Recreate  # No rolling updates (stateful service)
+  selector:
+    matchLabels:
+      app: robsond
+      version: v2
+  template:
+    metadata:
+      labels:
+        app: robsond
+        version: v2
+        component: daemon
+      annotations:
+        prometheus.io/scrape: "true"
+        prometheus.io/port: "8080"
+        prometheus.io/path: "/metrics"
+    spec:
+      serviceAccountName: robsond
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        fsGroup: 1000
+      
+      containers:
+      - name: robsond
+        image: ghcr.io/your-org/robson-v2:latest
+        imagePullPolicy: Always
+        
+        ports:
+        - containerPort: 8080
+          name: http
+          protocol: TCP
+        
+        env:
+        # Database configuration
+        - name: DATABASE_URL
+          valueFrom:
+            secretKeyRef:
+              name: robsond-secret
+              key: database-url
+        
+        # Binance API credentials
+        - name: BINANCE_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: robsond-secret
+              key: binance-api-key
+        
+        - name: BINANCE_API_SECRET
+          valueFrom:
+            secretKeyRef:
+              name: robsond-secret
+              key: binance-api-secret
+        
+        - name: BINANCE_BASE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: robsond-config
+              key: binance-base-url
+        
+        # Logging configuration
+        - name: LOG_LEVEL
+          valueFrom:
+            configMapKeyRef:
+              name: robsond-config
+              key: log-level
+        
+        - name: RUST_LOG
+          valueFrom:
+            configMapKeyRef:
+              name: robsond-config
+              key: rust-log
+        
+        # Safety Net configuration
+        - name: SAFETY_NET_ENABLED
+          valueFrom:
+            configMapKeyRef:
+              name: robsond-config
+              key: safety-net-enabled
+        
+        - name: SAFETY_NET_POLL_INTERVAL_SECONDS
+          valueFrom:
+            configMapKeyRef:
+              name: robsond-config
+              key: safety-net-poll-interval-seconds
+        
+        - name: SAFETY_NET_SYMBOLS
+          valueFrom:
+            configMapKeyRef:
+              name: robsond-config
+              key: safety-net-symbols
+        
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "250m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+        
+        # Liveness probe: Is the process alive?
+        livenessProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 10
+          periodSeconds: 30
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 3
+        
+        # Readiness probe: Is the service ready to accept traffic?
+        readinessProbe:
+          httpGet:
+            path: /readyz
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 5
+          periodSeconds: 10
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 3
+        
+        # Startup probe: Give extra time for initial startup
+        startupProbe:
+          httpGet:
+            path: /healthz
+            port: 8080
+            scheme: HTTP
+          initialDelaySeconds: 0
+          periodSeconds: 5
+          timeoutSeconds: 3
+          successThreshold: 1
+          failureThreshold: 30  # 30 * 5s = 150s max startup time
+      
+      restartPolicy: Always
+      terminationGracePeriodSeconds: 30

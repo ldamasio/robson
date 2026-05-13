@@ -21,57 +21,43 @@ sync-binance-docs:
 	echo "✓ Binance docs ready at $(BINANCE_DOCS_DIR)"
 
 # ==============================
-# CLI Build (C Router + Go)
+# CLI Build (Bun / TypeScript)
 # ==============================
 
 CLI_DIR      ?= cli
-CLI_BIN_C    ?= robson
-CLI_BIN_GO   ?= robson-go
+CLI_BIN      ?= robson
 INSTALL_PATH ?= /usr/local/bin
 
-.PHONY: build-cli build-c build-go clean-cli install-cli test-cli
+.PHONY: build-cli clean-cli install-cli test-cli
 
-build-cli: build-c build-go
+build-cli:
+	@echo "Building Bun CLI..."
+	@cd $(CLI_DIR) && bun install
+	@cd $(CLI_DIR) && bun run build
 	@echo "✓ CLI built successfully"
-	@echo "  - C router: $(CLI_BIN_C)"
-	@echo "  - Go CLI:   $(CLI_DIR)/$(CLI_BIN_GO)"
+	@echo "  - Bun bundle: $(CLI_DIR)/dist/index.js"
 	@echo ""
 	@echo "Next steps:"
 	@echo "  1. Test: make test-cli"
 	@echo "  2. Install: make install-cli"
 
-build-c:
-	@echo "Building C router..."
-	@gcc -o $(CLI_BIN_C) main.c
-	@echo "✓ C router built: $(CLI_BIN_C)"
-
-build-go:
-	@echo "Building Go CLI..."
-	@cd $(CLI_DIR) && go mod download
-	@cd $(CLI_DIR) && go build -o $(CLI_BIN_GO) .
-	@echo "✓ Go CLI built: $(CLI_DIR)/$(CLI_BIN_GO)"
-
 clean-cli:
-	@echo "Cleaning CLI binaries..."
-	@rm -f $(CLI_BIN_C)
-	@rm -f $(CLI_DIR)/$(CLI_BIN_GO)
-	@echo "✓ CLI binaries removed"
+	@echo "Cleaning CLI build artifacts..."
+	@rm -rf $(CLI_DIR)/dist
+	@echo "✓ CLI build artifacts removed"
 
 install-cli: build-cli
 	@echo "Installing CLI to $(INSTALL_PATH)..."
-	@sudo cp $(CLI_BIN_C) $(INSTALL_PATH)/$(CLI_BIN_C)
-	@sudo cp $(CLI_DIR)/$(CLI_BIN_GO) $(INSTALL_PATH)/$(CLI_BIN_GO)
-	@sudo chmod +x $(INSTALL_PATH)/$(CLI_BIN_C)
-	@sudo chmod +x $(INSTALL_PATH)/$(CLI_BIN_GO)
+	@sudo install -m 0755 $(CLI_DIR)/dist/index.js $(INSTALL_PATH)/$(CLI_BIN)
 	@echo "✓ CLI installed to $(INSTALL_PATH)"
 	@echo ""
 	@echo "Verify installation:"
 	@echo "  robson --help"
 
 test-cli: build-cli
-	@echo "Running CLI smoke tests..."
-	@cd $(CLI_DIR) && ./smoke-test.sh
-	@echo "✓ CLI smoke tests passed"
+	@echo "Running CLI tests..."
+	@cd $(CLI_DIR) && bun test
+	@echo "✓ CLI tests passed"
 
 # ==============================
 # Dev helpers (Django + Postgres)
@@ -192,11 +178,11 @@ format-python:
 	@cd apps/backend/monolith && black . && isort .
 	@echo "✓ Python code formatted"
 
-# Format Go code
+# Format CLI code
 format-go:
-	@echo "Formatting Go code..."
-	@gofmt -w cli/
-	@echo "✓ Go code formatted"
+	@echo "Formatting CLI code..."
+	@cd cli && bun x prettier --write "src/**/*.{ts,json}"
+	@echo "✓ CLI code formatted"
 
 # Format JS/JSX code
 format-js:
@@ -210,10 +196,11 @@ lint-python:
 	@ruff check apps/backend/
 	@echo "✓ Python lint passed"
 
-# Lint Go code
+# Lint CLI code
 lint-go:
-	@echo "Linting Go code..."
-	@gofmt -l cli/ | read || echo "✓ Go lint passed (no formatting needed)"
+	@echo "Linting CLI code..."
+	@cd cli && bun x tsc --noEmit
+	@echo "✓ CLI lint passed"
 
 # Lint JS/JSX code
 lint-js:
