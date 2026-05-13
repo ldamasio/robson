@@ -199,6 +199,8 @@ function normalizePosition(raw: unknown): Position {
     symbol: String(p.symbol ?? ""),
     side: String(p.side ?? ""),
     state: (p.state ?? "Error") as PositionState,
+    entry_mode: p.entry_mode == null ? null : String(p.entry_mode),
+    approval_mode: p.approval_mode == null ? null : String(p.approval_mode),
     entry_price: toNumber(p.entry_price),
     entry_filled_at:
       p.entry_filled_at == null ? null : String(p.entry_filled_at),
