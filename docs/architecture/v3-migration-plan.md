@@ -114,7 +114,7 @@ Status rule for this table: code-backed items may be marked done from repository
 | MIG-v2.5#10 | EventLog replay determinism test | ✅ Done (2026-04-05) |
 | MIG-v3#1 | Promote robsond as primary runtime | ✅ Done (2026-04-10) — Django execution CronJobs suspended, robsond sole execution path |
 | MIG-v3#2 | Replace Django API with thin gateway | ✅ Done (2026-04-16) — robsond serves API/SSE directly; no separate gateway needed |
-| MIG-v3#3 | Frontend direct connection to SSE | ✅ Done (2026-05-12) — Django retired. Canonical frontend is SvelteKit at `apps/frontend/` (`@robson/frontend-v2`). SSE endpoint is live in robsond (`/events`). React/nginx legacy frontend removed from working tree. |
+| MIG-v3#3 | Frontend direct connection to SSE | ✅ Done (2026-05-12) — Django retired. Canonical frontend is SvelteKit at `frontend/` (`@robson/frontend-v2`). SSE endpoint is live in robsond (`/events`). React/nginx legacy frontend removed from working tree. |
 | MIG-v3#4 | Dynamic risk limits | ❌ Abandoned (2026-05-12) — superseded by MIG-v3#11 + ADR-0024. No static hard limits exist. The only monthly constraint is the 4% drawdown policy encoded in `TradingPolicy`. Dynamic limits beyond the slot model conflict with policy invariants and were dropped from scope. |
 | MIG-v3#5 | Operator control surface in UI | ❌ Abandoned (2026-05-12) — pause/resume do not apply in the slot model; panic close belongs in the backend CLI; risk-limit adjustment from UI contradicts policy invariants (ADR-0024). This was a pre-v3 concept that lost relevance after the slot architecture was finalized. |
 | MIG-v3#6 | Hash-chained EventLog | 🔄 Deferred to MIG-v4#1 — good integrity property, not required for v3 launch. |
@@ -1050,7 +1050,7 @@ budget bar, no realized-loss display. Full Risk Dashboard deferred to MIG-v3#14.
 
 **Date**: 2026-05-12 — identified as frontend/backend parity gap.
 
-**Problem**: `ArmModal.svelte` (`apps/frontend/src/lib/design/components/ArmModal.svelte`) sends
+**Problem**: `ArmModal.svelte` (`frontend/src/lib/design/components/ArmModal.svelte`) sends
 only `{ symbol, side }` to `POST /positions`. The `entry_policy` field is never included.
 `robson.ts:armPosition` (line 303) has the same gap. The backend defaults to
 `ConfirmedTrend` + `Automatic` when `entry_policy` is omitted, locking the operator to SMA

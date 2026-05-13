@@ -36,10 +36,10 @@ setup-python:
     @echo "📦 Installing Python dependencies..."
     cd apps/backend/monolith && pip install -r requirements.txt
 
-# Install Node.js dependencies (React frontend)
+# Install frontend dependencies (SvelteKit)
 setup-node:
-    @echo "📦 Installing Node.js dependencies..."
-    cd apps/frontend && npm install
+    @echo "📦 Installing frontend dependencies..."
+    cd frontend && pnpm install
 
 # Install Go dependencies (CLI)
 setup-go:
@@ -73,10 +73,10 @@ test-backend:
     @echo "🧪 Running backend tests..."
     cd apps/backend/monolith && python manage.py test -v 2
 
-# Run frontend tests (Vitest)
+# Run frontend type check and tests
 test-frontend:
-    @echo "🧪 Running frontend tests..."
-    cd apps/frontend && npm test
+    @echo "🧪 Running frontend check..."
+    cd frontend && pnpm check
 
 # Run CLI smoke tests
 test-cli:
@@ -175,10 +175,10 @@ dev-backend: db-up
 
 # Start frontend development server
 dev-frontend:
-    @echo "🚀 Starting React dev server..."
+    @echo "🚀 Starting SvelteKit dev server..."
     @echo "   URL: http://localhost:5173"
     @echo ""
-    cd apps/frontend && npm run dev
+    cd frontend && pnpm dev
 
 # Open Django shell
 shell:

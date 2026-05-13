@@ -118,7 +118,7 @@ in-memory store.
 **Frontend + backend together:**
 
 1. Run robsond as above.
-2. In another terminal, run `pnpm run dev` in `apps/frontend/`.
+2. In another terminal, run `pnpm run dev` in `frontend/`.
 3. Generate a dev token (any non-empty string when
    `ROBSON_ENV=development` and `ROBSON_API_TOKEN` is unset; the
    auth middleware is no-op when token is unset).
@@ -167,7 +167,7 @@ CI runs:
 - `Robsond CI/CD` — when `v3/**` changes (`cargo fmt`, `cargo
   clippy`, `cargo test`, build + push image to GHCR if mergeing
   to main).
-- `Frontend Tests` — when `apps/frontend/**` changes (`pnpm
+- `Frontend Tests` — when `frontend/**` changes (`pnpm
   check`, `pnpm test`, `pnpm build`).
 - `Frontend Build & Publish` — when frontend changes are merged
   to main; builds and pushes the image.

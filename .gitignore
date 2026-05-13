@@ -139,6 +139,6 @@ apps/backend/
 htmlcov/
 package-lock.json
 
-# Legacy directories (renamed to v3/ and apps/frontend/)
+# Legacy directories
 v2/
 apps/frontend-v2/

@@ -48,7 +48,7 @@ In leveraged markets, **how** you execute matters more than **what** you execute
 
 ## Architecture
 
-The canonical runtime is written in Rust and lives under `v3/`. The SvelteKit operations dashboard lives under `apps/frontend/`.
+The canonical runtime is written in Rust and lives under `v3/`. The SvelteKit operations dashboard lives under `frontend/`.
 
 ```
 v3/
@@ -61,8 +61,7 @@ v3/
   robson-sim/          # Backtesting and simulation
   cli/                 # Operator CLI (Bun / TypeScript)
 
-apps/
-  frontend/            # SvelteKit operations dashboard
+frontend/              # SvelteKit operations dashboard
 
 docs/
   adr/                 # Architecture Decision Records
@@ -138,7 +137,7 @@ just v2-test-pg      # run integration tests against real DB
 ### Frontend (SvelteKit)
 
 ```bash
-cd apps/frontend
+cd frontend
 pnpm install
 pnpm dev             # development server
 pnpm check           # type check (svelte-check + tsc)

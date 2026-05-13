@@ -13,7 +13,7 @@ It is not an autonomous trading bot.
 It does not justify signals, generate entries, or bypass operator governance.
 Its core concern is what happens after a trading decision exists: execution, risk enforcement, lifecycle control, auditability, and failure handling.
 
-The repository contains the Rust runtime (canonical) under `v3/`, the SvelteKit frontend under `apps/frontend/`, and related specs in `docs/architecture`.
+The repository contains the Rust runtime (canonical) under `v3/`, the SvelteKit frontend under `frontend/`, and related specs in `docs/architecture`.
 
 ## Non-Negotiable Rules
 
