@@ -17,7 +17,7 @@ export function positionStateLabel(state: PositionState): string {
 
 export function entryModeLabel(mode?: string | null): string {
   switch (mode) {
-    case 'immediate':           return 'immediate — awaiting manual signal';
+    case 'immediate':           return 'immediate — no signal required';
     case 'confirmed_reversal':  return 'awaiting entry signal · reversal pattern';
     case 'confirmed_key_level': return 'awaiting entry signal · key level';
     case 'confirmed_trend':
