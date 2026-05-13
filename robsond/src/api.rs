@@ -164,6 +164,22 @@ pub struct PendingApprovalSummary {
     pub expires_at: chrono::DateTime<chrono::Utc>,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ArmedPositionsDebugResponse {
+    pub positions: Vec<ArmedPositionDebugResponse>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ArmedPositionDebugResponse {
+    pub position_id: Uuid,
+    pub symbol: String,
+    pub side: String,
+    pub detector_task_present: bool,
+    pub detector_task_finished: Option<bool>,
+    pub entry_policy: EntryPolicyConfig,
+    pub last_market_data_timestamp: Option<chrono::DateTime<chrono::Utc>>,
+}
+
 #[derive(Debug, Deserialize)]
 struct MonthQuery {
     month: Option<String>,
@@ -418,6 +434,7 @@ where
         .route("/status", get(status_handler))
         .route("/positions", get(month_positions_handler))
         .route("/positions/:id", get(get_position_handler))
+        .route("/debug/armed-positions", get(debug_armed_positions_handler))
         // Prometheus metrics
         .route("/metrics", get(metrics_handler))
         // Safety net read-only endpoints
@@ -744,6 +761,32 @@ where
         occupied_slots,
         slot_cells_total,
     }))
+}
+
+/// Debug snapshot of Armed positions and their detector tasks.
+async fn debug_armed_positions_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+) -> Result<Json<ArmedPositionsDebugResponse>, (StatusCode, Json<ErrorResponse>)>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let manager = state.position_manager.read().await;
+    let positions = manager.debug_armed_positions().await.map_err(|e| to_error_response(e))?;
+    let positions = positions
+        .into_iter()
+        .map(|position| ArmedPositionDebugResponse {
+            position_id: position.position_id,
+            symbol: position.symbol.as_pair(),
+            side: format!("{:?}", position.side),
+            detector_task_present: position.detector_task_present,
+            detector_task_finished: position.detector_task_finished,
+            entry_policy: position.entry_policy,
+            last_market_data_timestamp: position.last_market_data_timestamp,
+        })
+        .collect();
+
+    Ok(Json(ArmedPositionsDebugResponse { positions }))
 }
 
 /// Get a single position.

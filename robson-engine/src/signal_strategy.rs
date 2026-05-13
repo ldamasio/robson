@@ -760,10 +760,13 @@ mod tests {
         let strategy = ReversalPatternStrategy::new(3, 4);
         let decision = strategy.evaluate(ctx(Side::Long, candles));
 
-        assert!(matches!(decision, SignalDecision::SignalConfirmed {
-            reason: SignalReason::ReversalPattern { pattern: ReversalPattern::Hammer },
-            ..
-        }));
+        assert!(matches!(
+            decision,
+            SignalDecision::SignalConfirmed {
+                reason: SignalReason::ReversalPattern { pattern: ReversalPattern::Hammer },
+                ..
+            }
+        ));
     }
 
     #[test]
@@ -790,12 +793,15 @@ mod tests {
         let strategy = ReversalPatternStrategy::new(3, 5);
         let decision = strategy.evaluate(ctx(Side::Short, candles));
 
-        assert!(matches!(decision, SignalDecision::SignalConfirmed {
-            reason: SignalReason::ReversalPattern {
-                pattern: ReversalPattern::BearishEngulfing
-            },
-            ..
-        }));
+        assert!(matches!(
+            decision,
+            SignalDecision::SignalConfirmed {
+                reason: SignalReason::ReversalPattern {
+                    pattern: ReversalPattern::BearishEngulfing
+                },
+                ..
+            }
+        ));
     }
 
     #[test]

@@ -241,12 +241,22 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
 
         // 2. SAFETY CHECK: Validate futures settings (One-way + leverage)
         info!(
+            flow = "entry_immediate",
             %position_id,
             symbol = %symbol.as_pair(),
             "Validating futures settings (One-way + {}x)", RiskConfig::LEVERAGE
         );
         if let Err(e) = self.exchange.validate_futures_settings(&symbol, RiskConfig::LEVERAGE).await
         {
+            info!(
+                flow = "entry_immediate",
+                %position_id,
+                %signal_id,
+                symbol = %symbol.as_pair(),
+                futures_settings_valid = false,
+                error = %e,
+                "Futures settings validation result for entry order"
+            );
             let event = Event::EntryExecutionRejected {
                 position_id,
                 cycle_id,
@@ -262,13 +272,21 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
 
             return Ok(ActionResult::EntryExecutionRejected { event, error: e.to_string() });
         }
+        info!(
+            flow = "entry_immediate",
+            %position_id,
+            %signal_id,
+            symbol = %symbol.as_pair(),
+            futures_settings_valid = true,
+            "Futures settings validation result for entry order"
+        );
 
         // 3. Record intent
-        let intent = Intent::new(signal_id, position_id, IntentAction::PlaceEntryOrder {
-            symbol: symbol.clone(),
-            side,
-            quantity,
-        });
+        let intent = Intent::new(
+            signal_id,
+            position_id,
+            IntentAction::PlaceEntryOrder { symbol: symbol.clone(), side, quantity },
+        );
 
         if let Err(ExecError::AlreadyProcessed(id)) = self.journal.record(intent) {
             info!(%id, "Intent already recorded, checking status");
@@ -281,6 +299,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         self.journal.mark_executing(signal_id)?;
 
         info!(
+            flow = "entry_immediate",
             %position_id,
             %signal_id,
             symbol = %symbol.as_pair(),
@@ -315,9 +334,12 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         match &result {
             Ok(order_result) => {
                 info!(
+                    flow = "entry_immediate",
                     %position_id,
+                    %signal_id,
                     exchange_order_id = %order_result.exchange_order_id,
                     fill_price = %order_result.fill_price.as_decimal(),
+                    exchange_api_result = "filled",
                     "Entry order filled"
                 );
                 self.journal.complete(signal_id, IntentResult::Success(order_result.clone()))?;
@@ -343,7 +365,14 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                 })
             },
             Err(e) => {
-                error!(%position_id, error = %e, "Entry order failed");
+                error!(
+                    flow = "entry_immediate",
+                    %position_id,
+                    %signal_id,
+                    error = %e,
+                    exchange_api_result = "failed",
+                    "Entry order failed"
+                );
 
                 // Emit EntryOrderFailed before journal completion
                 let event = Event::EntryOrderFailed {
@@ -390,12 +419,16 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         self.exchange.validate_futures_settings(&symbol, RiskConfig::LEVERAGE).await?;
 
         // 2. Record intent
-        let intent = Intent::new(intent_id, position_id, IntentAction::PlaceExitOrder {
-            symbol: symbol.clone(),
-            side,
-            quantity,
-            reason: reason.clone(),
-        });
+        let intent = Intent::new(
+            intent_id,
+            position_id,
+            IntentAction::PlaceExitOrder {
+                symbol: symbol.clone(),
+                side,
+                quantity,
+                reason: reason.clone(),
+            },
+        );
 
         self.journal.record(intent)?;
         self.journal.mark_executing(intent_id)?;

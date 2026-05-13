@@ -71,6 +71,21 @@ use crate::{
     DaemonError, DaemonResult,
 };
 
+fn classify_ohlcv_error(error: &DaemonError) -> &'static str {
+    match error {
+        DaemonError::Exec(robson_exec::ExecError::Timeout(_)) => "timeout",
+        DaemonError::Exec(robson_exec::ExecError::Exchange(_)) => "exchange_error",
+        DaemonError::Exec(robson_exec::ExecError::OrderRejected(_)) => "order_rejected",
+        DaemonError::Exec(robson_exec::ExecError::FuturesSafetyViolation { .. }) => {
+            "futures_safety_violation"
+        },
+        DaemonError::Detector(_) => "technical_stop_analysis_error",
+        DaemonError::Domain(_) => "domain_error",
+        DaemonError::Store(_) => "store_error",
+        _ => "other",
+    }
+}
+
 // =============================================================================
 // Detector Configuration
 // =============================================================================
@@ -177,6 +192,8 @@ pub struct DetectorTask {
     cancel_token: CancellationToken,
     /// Deterministic strategy registry for this detector.
     strategy_registry: StrategyRegistry,
+    /// Whether this detector has already logged its first matching market tick.
+    first_market_data_seen: bool,
 }
 
 impl DetectorTask {
@@ -223,6 +240,7 @@ impl DetectorTask {
             ohlcv_port,
             cancel_token,
             strategy_registry,
+            first_market_data_seen: false,
         }
     }
 
@@ -274,6 +292,14 @@ impl DetectorTask {
         // Subscribe before spawning so ticks published immediately after spawn
         // are buffered for this detector instead of being lost to scheduling.
         let receiver = self.event_bus.subscribe();
+        info!(
+            flow = "entry_immediate",
+            position_id = %position_id,
+            symbol = %symbol.as_pair(),
+            entry_mode = ?self.config.entry_policy.mode,
+            approval_mode = ?self.config.entry_policy.approval,
+            "Detector subscribed to event bus"
+        );
 
         tokio::spawn(async move {
             info!(
@@ -398,6 +424,19 @@ impl DetectorTask {
             price = %market_data.price.as_decimal(),
             "Detector received market data"
         );
+        if !self.first_market_data_seen {
+            self.first_market_data_seen = true;
+            info!(
+                flow = "entry_immediate",
+                position_id = %self.config.position_id,
+                symbol = %market_data.symbol.as_pair(),
+                price = %market_data.price.as_decimal(),
+                market_data_timestamp = %market_data.timestamp,
+                entry_mode = ?self.config.entry_policy.mode,
+                approval_mode = ?self.config.entry_policy.approval,
+                "Detector received first matching market data tick"
+            );
+        }
 
         match self.evaluate_signal(market_data).await {
             Ok(SignalDecision::NoSignal) => None,
@@ -407,13 +446,25 @@ impl DetectorTask {
                 }
 
                 match self.create_signal(decision).await {
-                    Ok(signal) => Some(signal),
+                    Ok(signal) => {
+                        info!(
+                            flow = "entry_immediate",
+                            position_id = %self.config.position_id,
+                            signal_id = %signal.signal_id,
+                            symbol = %self.config.symbol.as_pair(),
+                            entry_price = %signal.entry_price.as_decimal(),
+                            stop_loss = %signal.stop_loss.as_decimal(),
+                            "Detector create_signal succeeded"
+                        );
+                        Some(signal)
+                    },
                     Err(error) => {
                         warn!(
+                            flow = "entry_immediate",
                             position_id = %self.config.position_id,
                             symbol = %self.config.symbol.as_pair(),
                             error = %error,
-                            "Detector could not compute technical stop"
+                            "Detector create_signal failed"
                         );
                         None
                     },
@@ -433,6 +484,15 @@ impl DetectorTask {
 
     async fn evaluate_signal(&self, market_data: &MarketData) -> DaemonResult<SignalDecision> {
         if self.config.entry_policy.mode == EntryPolicy::Immediate {
+            info!(
+                flow = "entry_immediate",
+                position_id = %self.config.position_id,
+                symbol = %self.config.symbol.as_pair(),
+                side = ?self.config.side,
+                price = %market_data.price.as_decimal(),
+                market_data_timestamp = %market_data.timestamp,
+                "Detector evaluate_signal immediate branch confirmed"
+            );
             return Ok(SignalDecision::SignalConfirmed {
                 side: self.config.side,
                 reason: robson_engine::SignalReason::Immediate,
@@ -510,7 +570,23 @@ impl DetectorTask {
             DaemonError::Detector(format!("strategy reference price is invalid: {}", e))
         })?;
 
-        let analysis = self.compute_technical_stop(entry_price, side, &self.config.symbol).await?;
+        let analysis =
+            match self.compute_technical_stop(entry_price, side, &self.config.symbol).await {
+                Ok(analysis) => analysis,
+                Err(error) => {
+                    warn!(
+                        flow = "entry_immediate",
+                        position_id = %self.config.position_id,
+                        symbol = %self.config.symbol.as_pair(),
+                        side = ?side,
+                        entry_price = %entry_price.as_decimal(),
+                        ohlcv_error_type = %classify_ohlcv_error(&error),
+                        error = %error,
+                        "Technical stop computation failed while creating detector signal"
+                    );
+                    return Err(error);
+                },
+            };
 
         // Shadow metadata: StopAnchor + StopQuality (ADR-0035, shadow-only).
         let stop_anchor = Self::build_stop_anchor(&analysis, side);

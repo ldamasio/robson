@@ -21,7 +21,7 @@
 
 use std::{collections::HashMap, sync::Arc};
 
-use chrono::Datelike;
+use chrono::{DateTime, Datelike, Utc};
 use robson_domain::{
     ClosureEvidence, DetectorSignal, EntryPolicyConfig, Event, Position, PositionId, PositionState,
     Price, Quantity, ReconciliationEvidence, RiskConfig, Side, Symbol, TechnicalStopDistance,
@@ -45,7 +45,7 @@ use tokio::{
     task::JoinHandle,
 };
 use tokio_util::sync::CancellationToken;
-use tracing::{debug, error, info, warn};
+use tracing::{debug, error, info, warn, Instrument};
 use uuid::Uuid;
 
 use crate::{
@@ -118,6 +118,8 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// Entry policy selected for each armed position. This keeps runtime
     /// detector re-arming aligned with the policy event emitted at ARM time.
     entry_policies: Arc<RwLock<HashMap<PositionId, EntryPolicyConfig>>>,
+    /// Last market-data timestamp observed by the runtime, keyed by symbol.
+    last_market_data_timestamps: Arc<RwLock<HashMap<Symbol, DateTime<Utc>>>>,
     /// Pending approvals held in runtime memory for Phase 3.
     pending_approvals: Arc<RwLock<HashMap<Uuid, PendingApprovalRecord>>>,
     /// Serializes entry-governance flows so pending reservations remain
@@ -146,6 +148,17 @@ pub(crate) struct MonthlyRiskState {
     pub capital_base: Decimal,
     pub realized_loss: Decimal,
     pub trades_opened: i32,
+}
+
+#[derive(Debug, Clone)]
+pub struct ArmedPositionDebug {
+    pub position_id: PositionId,
+    pub symbol: Symbol,
+    pub side: Side,
+    pub detector_task_present: bool,
+    pub detector_task_finished: Option<bool>,
+    pub entry_policy: EntryPolicyConfig,
+    pub last_market_data_timestamp: Option<DateTime<Utc>>,
 }
 
 impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
@@ -371,6 +384,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             shutdown_token,
             detectors: Arc::new(RwLock::new(HashMap::new())),
             entry_policies: Arc::new(RwLock::new(HashMap::new())),
+            last_market_data_timestamps: Arc::new(RwLock::new(HashMap::new())),
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
             entry_flow_lock: Mutex::new(()),
             query_engine,
@@ -895,6 +909,35 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         entry_policies.get(&position_id).copied().unwrap_or_default()
     }
 
+    pub async fn debug_armed_positions(&self) -> DaemonResult<Vec<ArmedPositionDebug>> {
+        let positions = self.store.positions().find_active().await?;
+        let detectors = self.detectors.read().await;
+        let entry_policies = self.entry_policies.read().await;
+        let last_market_data_timestamps = self.last_market_data_timestamps.read().await;
+
+        let mut armed: Vec<ArmedPositionDebug> = positions
+            .into_iter()
+            .filter(|position| matches!(position.state, PositionState::Armed))
+            .map(|position| {
+                let detector_task_finished =
+                    detectors.get(&position.id).map(JoinHandle::is_finished);
+                ArmedPositionDebug {
+                    position_id: position.id,
+                    symbol: position.symbol.clone(),
+                    side: position.side,
+                    detector_task_present: detector_task_finished.is_some(),
+                    detector_task_finished,
+                    entry_policy: entry_policies.get(&position.id).copied().unwrap_or_default(),
+                    last_market_data_timestamp: last_market_data_timestamps
+                        .get(&position.symbol)
+                        .copied(),
+                }
+            })
+            .collect();
+        armed.sort_by_key(|position| position.position_id);
+        Ok(armed)
+    }
+
     async fn rearm_detector_after_governed_block(
         &self,
         position_id: PositionId,
@@ -1042,12 +1085,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         {
             let mut pending_approvals = self.pending_approvals.write().await;
-            pending_approvals.insert(query_id, PendingApprovalRecord {
-                query,
-                position,
-                proposed,
-                governed,
-            });
+            pending_approvals
+                .insert(query_id, PendingApprovalRecord { query, position, proposed, governed });
         }
 
         let pending_approvals = self.pending_approvals.read().await;
@@ -1088,6 +1127,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
         self.record_query_transition(query, "acting").await?;
 
+        info!(
+            flow = "entry_immediate",
+            %position_id,
+            query_id = %query.id,
+            "Dispatching governed entry actions to executor"
+        );
         let results = match self.execute_and_persist(governed.into_actions()).await {
             Ok(r) => r,
             Err(e) => {
@@ -1342,6 +1387,45 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         account_id: Uuid,
         entry_policy: EntryPolicyConfig,
     ) -> DaemonResult<Position> {
+        let span = tracing::info_span!(
+            "arm_position_with_policy",
+            flow = "entry_immediate",
+            symbol = %symbol.as_pair(),
+            ?side,
+            entry_mode = ?entry_policy.mode,
+            approval_mode = ?entry_policy.approval,
+            %account_id,
+        );
+        self.arm_position_with_policy_inner(
+            symbol,
+            side,
+            risk_config,
+            tech_stop_distance,
+            account_id,
+            entry_policy,
+        )
+        .instrument(span)
+        .await
+    }
+
+    async fn arm_position_with_policy_inner(
+        &self,
+        symbol: Symbol,
+        side: Side,
+        risk_config: RiskConfig,
+        tech_stop_distance: Option<TechnicalStopDistance>,
+        account_id: Uuid,
+        entry_policy: EntryPolicyConfig,
+    ) -> DaemonResult<Position> {
+        info!(
+            flow = "entry_immediate",
+            symbol = %symbol.as_pair(),
+            ?side,
+            entry_mode = ?entry_policy.mode,
+            approval_mode = ?entry_policy.approval,
+            %account_id,
+            "arm_position_with_policy received entry policy"
+        );
         // Update engine with operator-supplied capital before any sizing.
         {
             let mut engine = self.engine.lock().unwrap();
@@ -1431,6 +1515,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         {
             Ok(r) => r,
             Err(e) => {
+                warn!(
+                    flow = "entry_immediate",
+                    %position_id,
+                    detector_spawned = false,
+                    error = %e,
+                    "Detector creation failed for armed position"
+                );
                 let err_str = format!("{}", e);
                 query.fail(err_str.clone(), "acting".to_string());
                 self.record_query_failure(&query).await?;
@@ -1486,6 +1577,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             },
         };
         let handle = detector.spawn();
+        info!(
+            flow = "entry_immediate",
+            %position_id,
+            detector_spawned = true,
+            detector_task_finished = handle.is_finished(),
+            "Detector spawned and stored for armed position"
+        );
 
         // Store detector handle for cancellation
         let mut detectors = self.detectors.write().await;
@@ -1854,12 +1952,31 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     pub async fn handle_signal(&self, signal: DetectorSignal) -> DaemonResult<()> {
         let _entry_flow_guard = self.entry_flow_lock.lock().await;
         let position_id = signal.position_id;
+        info!(
+            flow = "entry_immediate",
+            %position_id,
+            signal_id = %signal.signal_id,
+            symbol = %signal.symbol.as_pair(),
+            side = ?signal.side,
+            entry_price = %signal.entry_price.as_decimal(),
+            stop_loss = %signal.stop_loss.as_decimal(),
+            "handle_signal entry point"
+        );
 
         // MonthlyHalt blocks new entries — a detector signal that would
         // transition Armed→Entering counts as a new entry.
-        if self.circuit_breaker.blocks_new_entries().await {
+        let monthly_halt_blocks = self.circuit_breaker.blocks_new_entries().await;
+        info!(
+            flow = "entry_immediate",
+            %position_id,
+            signal_id = %signal.signal_id,
+            monthly_halt_blocks,
+            "MonthlyHalt check completed for detector signal"
+        );
+        if monthly_halt_blocks {
             let snap = self.circuit_breaker.snapshot().await;
             warn!(
+                flow = "entry_immediate",
                 %position_id,
                 state = %snap.state,
                 "Signal dropped — MonthlyHalt blocks new entries"
@@ -2032,8 +2149,27 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .check_risk(&mut query, &proposed, &risk_context, decision.actions)
             .await
         {
-            Ok(g) => g,
+            Ok(g) => {
+                info!(
+                    flow = "entry_immediate",
+                    %position_id,
+                    query_id = %query.id,
+                    signal_id = %signal.signal_id,
+                    risk_check = "approved",
+                    "Risk check result for detector signal"
+                );
+                g
+            },
             Err(CheckRiskError::Denied) => {
+                info!(
+                    flow = "entry_immediate",
+                    %position_id,
+                    query_id = %query.id,
+                    signal_id = %signal.signal_id,
+                    risk_check = "denied",
+                    query_state = ?query.state,
+                    "Risk check result for detector signal"
+                );
                 // Governed denial: query is already in Denied state.
                 //
                 // v3: If the denial was caused by monthly drawdown (>=4%):
@@ -2087,6 +2223,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 return Ok(());
             },
             Err(CheckRiskError::InvalidState(e)) => {
+                warn!(
+                    flow = "entry_immediate",
+                    %position_id,
+                    query_id = %query.id,
+                    signal_id = %signal.signal_id,
+                    risk_check = "invalid_state",
+                    error = %e,
+                    "Risk check result for detector signal"
+                );
                 // Operational error: query lifecycle state machine is inconsistent.
                 // This is NOT a governed denial — it indicates a bug or concurrent
                 // mutation. Fail the query and propagate as a hard error.
@@ -2096,6 +2241,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 return Err(DaemonError::Config(err_str));
             },
             Err(CheckRiskError::Audit(e)) => {
+                warn!(
+                    flow = "entry_immediate",
+                    %position_id,
+                    query_id = %query.id,
+                    signal_id = %signal.signal_id,
+                    risk_check = "audit_error",
+                    error = %e,
+                    "Risk check result for detector signal"
+                );
                 return Err(e.into());
             },
         };
@@ -2109,10 +2263,35 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .await
         {
             Ok(ApprovalCheckResult::Ready(governed)) => {
+                info!(
+                    flow = "entry_immediate",
+                    %position_id,
+                    query_id = %query.id,
+                    signal_id = %signal.signal_id,
+                    approval_policy = ?domain_approval,
+                    approval_result = "ready",
+                    "Approval check result for detector signal"
+                );
+                info!(
+                    flow = "entry_immediate",
+                    %position_id,
+                    query_id = %query.id,
+                    signal_id = %signal.signal_id,
+                    "Calling executor for approved entry signal"
+                );
                 self.execute_signal_query(&mut query, governed).await?;
                 Ok(())
             },
             Ok(ApprovalCheckResult::AwaitingApproval(governed)) => {
+                info!(
+                    flow = "entry_immediate",
+                    %position_id,
+                    query_id = %query.id,
+                    signal_id = %signal.signal_id,
+                    approval_policy = ?domain_approval,
+                    approval_result = "awaiting_approval",
+                    "Approval check result for detector signal"
+                );
                 let query_id = query.id;
                 let expires_at = query
                     .approval
@@ -2151,6 +2330,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 Ok(())
             },
             Err(e) => {
+                warn!(
+                    flow = "entry_immediate",
+                    %position_id,
+                    query_id = %query.id,
+                    signal_id = %signal.signal_id,
+                    approval_policy = ?domain_approval,
+                    approval_result = "error",
+                    error = %e,
+                    "Approval check result for detector signal"
+                );
                 let err_str = format!("Approval gate lifecycle error: {}", e);
                 query.fail(err_str.clone(), "risk_checked".to_string());
                 self.record_query_failure(&query).await?;
@@ -2407,6 +2596,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// → Projection.apply(Event) (async)
     /// ```
     pub async fn process_market_data(&self, data: MarketData) -> DaemonResult<()> {
+        {
+            let mut last_market_data_timestamps = self.last_market_data_timestamps.write().await;
+            last_market_data_timestamps.insert(data.symbol.clone(), data.timestamp);
+        }
+
         // Find all active positions for this symbol (from projection)
         let active_positions = self.store.positions().find_active().await?;
         let active_positions_count = active_positions.len();
@@ -5493,9 +5687,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome, ReconcileCloseOutcome::SkippedNonActive {
-            state: "exiting".to_string()
-        });
+        assert_eq!(
+            outcome,
+            ReconcileCloseOutcome::SkippedNonActive { state: "exiting".to_string() }
+        );
         let after = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
         assert!(matches!(after.state, PositionState::Exiting { .. }));
         let events = manager.store.events().find_by_position(position.id).await.unwrap();
@@ -5529,9 +5724,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome, ReconcileCloseOutcome::RejectedUnsupportedEvidence {
-            source: "account_snapshot"
-        });
+        assert_eq!(
+            outcome,
+            ReconcileCloseOutcome::RejectedUnsupportedEvidence { source: "account_snapshot" }
+        );
         let after = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
         assert!(matches!(after.state, PositionState::Active { .. }));
     }
@@ -5561,9 +5757,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome, ReconcileCloseOutcome::RejectedUnsupportedEvidence {
-            source: "estimated"
-        });
+        assert_eq!(
+            outcome,
+            ReconcileCloseOutcome::RejectedUnsupportedEvidence { source: "estimated" }
+        );
         let after = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
         assert!(matches!(after.state, PositionState::Active { .. }));
     }
@@ -5586,9 +5783,10 @@ mod tests {
 
         let outcome = manager.reconcile_close(input).await.unwrap();
 
-        assert_eq!(outcome, ReconcileCloseOutcome::RejectedInconsistentEvidence {
-            field: "exit_price"
-        });
+        assert_eq!(
+            outcome,
+            ReconcileCloseOutcome::RejectedInconsistentEvidence { field: "exit_price" }
+        );
         let after = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
         assert!(matches!(after.state, PositionState::Active { .. }));
     }

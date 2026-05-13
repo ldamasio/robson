@@ -189,10 +189,10 @@ async fn chaos_risk_engine_slow_denies_by_timeout_safe_default() {
     })
     .await;
 
-    assert!(matches!(verdict, RiskVerdict::Rejected {
-        check: RiskCheck::RiskEngineTimeout,
-        ..
-    }));
+    assert!(matches!(
+        verdict,
+        RiskVerdict::Rejected { check: RiskCheck::RiskEngineTimeout, .. }
+    ));
 }
 
 #[tokio::test]

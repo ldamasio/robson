@@ -2189,10 +2189,13 @@ mod tests {
         let stored_auto =
             daemon_auto.store.positions().find_by_id(pid_auto).await.unwrap().unwrap();
         assert!(
-            matches!(stored_auto.state, PositionState::Closed {
-                exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
-                ..
-            }),
+            matches!(
+                stored_auto.state,
+                PositionState::Closed {
+                    exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
+                    ..
+                }
+            ),
             "AutoReconcile policy must close stale-active with real evidence"
         );
     }
@@ -2244,10 +2247,13 @@ mod tests {
         daemon.run_startup_auto_reconcile().await.unwrap();
 
         let stored = daemon.store.positions().find_by_id(pid).await.unwrap().unwrap();
-        assert!(matches!(stored.state, PositionState::Closed {
-            exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
-            ..
-        }));
+        assert!(matches!(
+            stored.state,
+            PositionState::Closed {
+                exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -2261,21 +2267,27 @@ mod tests {
         daemon.store.positions().save(&position).await.unwrap();
 
         let now = chrono::Utc::now();
-        daemon.exchange.set_user_trades(&symbol.as_pair(), vec![user_trade(
-            "TRADE-1",
-            "EX-ORDER-2",
-            dec!(90),
-            dec!(0.010),
-            now,
-        )]);
+        daemon.exchange.set_user_trades(
+            &symbol.as_pair(),
+            vec![user_trade(
+                "TRADE-1",
+                "EX-ORDER-2",
+                dec!(90),
+                dec!(0.010),
+                now,
+            )],
+        );
 
         daemon.run_startup_auto_reconcile().await.unwrap();
 
         let stored = daemon.store.positions().find_by_id(pid).await.unwrap().unwrap();
-        assert!(matches!(stored.state, PositionState::Closed {
-            exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
-            ..
-        }));
+        assert!(matches!(
+            stored.state,
+            PositionState::Closed {
+                exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -2394,13 +2406,16 @@ mod tests {
         };
 
         let err = daemon
-            .apply_startup_auto_reconcile_batch(vec![input], vec![StartupStaleActiveInfo {
-                position_id: pid,
-                symbol: symbol.as_pair(),
-                side: "Long".to_string(),
-                quantity: dec!(0.010),
-                entry_price: Some(dec!(100)),
-            }])
+            .apply_startup_auto_reconcile_batch(
+                vec![input],
+                vec![StartupStaleActiveInfo {
+                    position_id: pid,
+                    symbol: symbol.as_pair(),
+                    side: "Long".to_string(),
+                    quantity: dec!(0.010),
+                    entry_price: Some(dec!(100)),
+                }],
+            )
             .await
             .unwrap_err();
 
@@ -2454,13 +2469,16 @@ mod tests {
         };
 
         let err = daemon
-            .apply_startup_auto_reconcile_batch(vec![input], vec![StartupStaleActiveInfo {
-                position_id: pid,
-                symbol: symbol.as_pair(),
-                side: "Long".to_string(),
-                quantity: dec!(0.010),
-                entry_price: Some(dec!(100)),
-            }])
+            .apply_startup_auto_reconcile_batch(
+                vec![input],
+                vec![StartupStaleActiveInfo {
+                    position_id: pid,
+                    symbol: symbol.as_pair(),
+                    side: "Long".to_string(),
+                    quantity: dec!(0.010),
+                    entry_price: Some(dec!(100)),
+                }],
+            )
             .await
             .unwrap_err();
 
@@ -2500,13 +2518,16 @@ mod tests {
         };
 
         let err = daemon
-            .apply_startup_auto_reconcile_batch(vec![input], vec![StartupStaleActiveInfo {
-                position_id: pid,
-                symbol: symbol.as_pair(),
-                side: "Long".to_string(),
-                quantity: dec!(0.010),
-                entry_price: Some(dec!(100)),
-            }])
+            .apply_startup_auto_reconcile_batch(
+                vec![input],
+                vec![StartupStaleActiveInfo {
+                    position_id: pid,
+                    symbol: symbol.as_pair(),
+                    side: "Long".to_string(),
+                    quantity: dec!(0.010),
+                    entry_price: Some(dec!(100)),
+                }],
+            )
             .await
             .unwrap_err();
 
@@ -2577,22 +2598,25 @@ mod tests {
         };
 
         let err = daemon
-            .apply_startup_auto_reconcile_batch(vec![input_a, input_b], vec![
-                StartupStaleActiveInfo {
-                    position_id: pid_a,
-                    symbol: symbol_a.as_pair(),
-                    side: "Long".to_string(),
-                    quantity: dec!(0.010),
-                    entry_price: Some(dec!(100)),
-                },
-                StartupStaleActiveInfo {
-                    position_id: pid_b,
-                    symbol: symbol_b.as_pair(),
-                    side: "Long".to_string(),
-                    quantity: dec!(0.010),
-                    entry_price: Some(dec!(100)),
-                },
-            ])
+            .apply_startup_auto_reconcile_batch(
+                vec![input_a, input_b],
+                vec![
+                    StartupStaleActiveInfo {
+                        position_id: pid_a,
+                        symbol: symbol_a.as_pair(),
+                        side: "Long".to_string(),
+                        quantity: dec!(0.010),
+                        entry_price: Some(dec!(100)),
+                    },
+                    StartupStaleActiveInfo {
+                        position_id: pid_b,
+                        symbol: symbol_b.as_pair(),
+                        side: "Long".to_string(),
+                        quantity: dec!(0.010),
+                        entry_price: Some(dec!(100)),
+                    },
+                ],
+            )
             .await
             .unwrap_err();
 

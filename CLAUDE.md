@@ -39,6 +39,11 @@ If this file and `AGENTS.md` ever diverge, `AGENTS.md` is the source of truth.
 - `robsond/src/reconciliation_worker.rs`
 - `robsond/src/position_manager.rs`
 
+## Debug Endpoint
+
+- `GET /debug/armed-positions` — read-only snapshot of Armed positions with detector task status, stored entry policy, and last market data timestamp per symbol. Use for diagnosing immediate+automatic entries that don't execute.
+- All entry flow logs carry `flow = "entry_immediate"`. See AGENTS.md for the full trace sequence.
+
 ## Core Invariants (must never be violated)
 
 - **Robson-authored position invariant** — every open position on the operated

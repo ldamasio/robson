@@ -165,6 +165,38 @@ Implementation reality for the current Rust executor/runtime boundary:
 - `robsond/src/reconciliation_worker.rs`
 - `robsond/src/position_manager.rs`
 
+## Debug and Observability
+
+### Entry flow tracing
+
+All structured logs in the immediate+automatic entry path carry `flow = "entry_immediate"`. To trace a position from ARM to order placement:
+
+```bash
+grep 'flow = "entry_immediate"' robsond.log
+```
+
+Key log messages in order of appearance:
+
+1. `"arm_position_with_policy received entry policy"` — policy received at API layer
+2. `"Detector subscribed to event bus"` — detector subscribed, waiting for market data
+3. `"Detector spawned and stored for armed position"` — task spawned and handle stored
+4. `"Detector received first matching market data tick"` — first WebSocket tick for this symbol
+5. `"Detector evaluate_signal immediate branch confirmed"` — immediate mode triggered
+6. `"Detector create_signal succeeded"` or `"Detector create_signal failed"` — signal creation outcome
+7. `"handle_signal entry point"` — signal reached position manager
+8. `"Risk check result"` with `risk_check = "approved"` or `"denied"`
+9. `"Approval check result"` with `approval_result = "ready"` or `"awaiting_approval"`
+10. `"Futures settings validation result"` — exchange pre-flight check
+11. `"Entry order filled"` or `"Entry order failed"` — exchange result
+
+### Debug endpoint
+
+`GET /debug/armed-positions` — read-only snapshot of all Armed positions with:
+
+- `detector_task_present` / `detector_task_finished` — is the detector alive?
+- `entry_policy` — stored policy for this position
+- `last_market_data_timestamp` — last WebSocket tick for this position's symbol (null if no data received)
+
 ## Adapter Policy
 
 Tool-specific files may exist for compatibility, but they are adapters, not primary policy stores.
