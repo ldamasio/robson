@@ -13,7 +13,7 @@ This document provides step-by-step implementation guidance for bringing Robson 
 
 ### Task 1.1: Add Core Position Repository to Safety Net
 
-**File**: `v2/robsond/src/position_monitor.rs`
+**File**: `robsond/src/position_monitor.rs`
 
 **Objective**: Enable Safety Net to query Core Trading positions.
 
@@ -55,7 +55,7 @@ impl PositionMonitor {
 }
 ```
 
-3. Update wire-up in `v2/robsond/src/main.rs`:
+3. Update wire-up in `robsond/src/main.rs`:
 
 ```rust
 let position_monitor = PositionMonitor::new(
@@ -71,7 +71,7 @@ let position_monitor = PositionMonitor::new(
 
 ### Task 1.2: Implement Exclusion Filter
 
-**File**: `v2/robsond/src/position_monitor.rs`
+**File**: `robsond/src/position_monitor.rs`
 
 **Objective**: Add method to check if position is Core-managed.
 
@@ -93,7 +93,7 @@ impl PositionMonitor {
 }
 ```
 
-2. Update `find_active_by_symbol_and_side()` in `v2/robson-store/src/repository.rs`:
+2. Update `find_active_by_symbol_and_side()` in `robson-store/src/repository.rs`:
 
 ```rust
 #[async_trait]
@@ -199,7 +199,7 @@ COMMENT ON COLUMN positions.binance_position_id IS
 'Binance internal position ID for linking Core positions to exchange positions';
 ```
 
-2. Update `Position` entity in `v2/robson-domain/src/entities.rs`:
+2. Update `Position` entity in `robson-domain/src/entities.rs`:
 
 ```rust
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -250,7 +250,7 @@ impl PostgresPositionRepository {
 4. Update Engine to store Binance ID when entry order fills:
 
 ```rust
-// In v2/robson-engine/src/engine.rs
+// In robson-engine/src/engine.rs
 // When processing OrderFilled event for entry order:
 
 match filled_event {
@@ -275,7 +275,7 @@ match filled_event {
 
 ### Task 1.4: Event Bus Coordination
 
-**File**: `v2/robsond/src/event_bus.rs`
+**File**: `robsond/src/event_bus.rs`
 
 **Objective**: Emit events when Core positions open/close for real-time coordination.
 
@@ -309,7 +309,7 @@ pub enum DaemonEvent {
 2. Update Engine to emit events:
 
 ```rust
-// In v2/robson-engine/src/engine.rs
+// In robson-engine/src/engine.rs
 
 impl Engine {
     async fn handle_entry_filled(&mut self, position_id: &PositionId) -> Result<()> {
@@ -409,7 +409,7 @@ async fn is_core_managed(&self, symbol: &Symbol, side: Side) -> Result<bool> {
 
 ### Task 1.5: Integration Test for Coordination
 
-**File**: `v2/robsond/tests/core_safety_coordination_test.rs` (NEW)
+**File**: `robsond/tests/core_safety_coordination_test.rs` (NEW)
 
 **Objective**: Verify Core and Safety Net coexist without conflicts.
 
@@ -534,7 +534,7 @@ async fn test_event_bus_coordination_realtime() {
 
 ### Task 2.1: Extend BinanceRestClient - Order Execution
 
-**File**: `v2/robson-connectors/src/binance_rest.rs`
+**File**: `robson-connectors/src/binance_rest.rs`
 
 **Objective**: Add order placement, cancellation, and status querying.
 
@@ -587,8 +587,9 @@ impl BinanceRestClient {
         // Sign request
         let signature = self.sign(&params);
         let url = format!(
-            "{}/api/v3/order?{}&signature={}",
+            "{}/api/v{}/order?{}&signature={}",
             self.base_url,
+            3,
             params,
             signature
         );
@@ -626,8 +627,9 @@ impl BinanceRestClient {
         
         let signature = self.sign(&params);
         let url = format!(
-            "{}/api/v3/order?{}&signature={}",
+            "{}/api/v{}/order?{}&signature={}",
             self.base_url,
+            3,
             params,
             signature
         );
@@ -661,8 +663,9 @@ impl BinanceRestClient {
         
         let signature = self.sign(&params);
         let url = format!(
-            "{}/api/v3/order?{}&signature={}",
+            "{}/api/v{}/order?{}&signature={}",
             self.base_url,
+            3,
             params,
             signature
         );
@@ -740,13 +743,13 @@ pub struct OrderStatusResponse {
 
 ### Task 2.2: Add Rate Limiting and Retry Logic
 
-**File**: `v2/robson-connectors/src/binance_rest.rs`
+**File**: `robson-connectors/src/binance_rest.rs`
 
 **Objective**: Prevent Binance API rate limit errors (HTTP 429).
 
 **Steps:**
 
-1. Add rate limiter dependency to `v2/robson-connectors/Cargo.toml`:
+1. Add rate limiter dependency to `robson-connectors/Cargo.toml`:
 
 ```toml
 [dependencies]
@@ -841,7 +844,7 @@ pub async fn place_market_order_with_retry(
 
 ### Task 2.3: Integration Tests with Binance Testnet
 
-**File**: `v2/robson-connectors/tests/binance_integration_test.rs` (NEW)
+**File**: `robson-connectors/tests/binance_integration_test.rs` (NEW)
 
 **Objective**: Validate Binance connector against live testnet API.
 
@@ -948,13 +951,13 @@ async fn test_rate_limiter_throttles() {
 
 ### Task 2.4: Implement WebSocket Client
 
-**File**: `v2/robson-connectors/src/binance_ws.rs` (NEW)
+**File**: `robson-connectors/src/binance_ws.rs` (NEW)
 
 **Objective**: Real-time market data and user data streams for price monitoring.
 
 **Steps:**
 
-1. Add WebSocket dependencies to `v2/robson-connectors/Cargo.toml`:
+1. Add WebSocket dependencies to `robson-connectors/Cargo.toml`:
 
 ```toml
 [dependencies]
@@ -1092,14 +1095,14 @@ pub struct ExecutionReportEvent {
 3. Add listen key management to REST client:
 
 ```rust
-// In v2/robson-connectors/src/binance_rest.rs
+// In robson-connectors/src/binance_rest.rs
 
 impl BinanceRestClient {
     /// Create a new listen key for user data stream.
     /// 
     /// Listen keys expire after 60 minutes and must be renewed.
     pub async fn create_listen_key(&self) -> Result<String, BinanceRestError> {
-        let url = format!("{}/api/v3/userDataStream", self.base_url);
+        let url = format!("{}/api/v{}/userDataStream", self.base_url, 3);
         
         let response = self.client
             .post(&url)
@@ -1117,7 +1120,7 @@ impl BinanceRestClient {
     
     /// Keep-alive for listen key (call every 30 minutes).
     pub async fn renew_listen_key(&self, listen_key: &str) -> Result<(), BinanceRestError> {
-        let url = format!("{}/api/v3/userDataStream", self.base_url);
+        let url = format!("{}/api/v{}/userDataStream", self.base_url, 3);
         
         self.client
             .put(&url)
@@ -1149,7 +1152,7 @@ struct ListenKeyResponse {
 
 ### Task 3.1: Add Health Endpoints
 
-**File**: `v2/robsond/src/api.rs`
+**File**: `robsond/src/api.rs`
 
 **Objective**: Kubernetes liveness and readiness probes.
 
@@ -1213,12 +1216,12 @@ pub fn configure_health_routes(cfg: &mut web::ServiceConfig) {
 2. Add ping method to BinanceRestClient:
 
 ```rust
-// In v2/robson-connectors/src/binance_rest.rs
+// In robson-connectors/src/binance_rest.rs
 
 impl BinanceRestClient {
     /// Ping Binance API to check connectivity.
     pub async fn ping(&self) -> Result<(), BinanceRestError> {
-        let url = format!("{}/api/v3/ping", self.base_url);
+        let url = format!("{}/api/v{}/ping", self.base_url, 3);
         let response = self.client.get(&url).send().await?;
         
         if response.status().is_success() {
@@ -1233,7 +1236,7 @@ impl BinanceRestClient {
 3. Update main server configuration:
 
 ```rust
-// In v2/robsond/src/main.rs
+// In robsond/src/main.rs
 
 HttpServer::new(move || {
     App::new()
@@ -1335,7 +1338,7 @@ node_modules/
 3. Build and test:
 
 ```bash
-cd v2
+cd robson
 docker build -t robson-v2:latest .
 docker run -p 8080:8080 -e DATABASE_URL=postgres://... -e BINANCE_API_KEY=... robson-v2:latest
 ```
@@ -1539,7 +1542,7 @@ images:
 
 ### Task 4.1: Create E2E Test Suite
 
-**File**: `v2/robsond/tests/e2e_production.rs` (NEW)
+**File**: `robsond/tests/e2e_production.rs` (NEW)
 
 **Objective**: End-to-end tests for production scenarios.
 
@@ -1728,7 +1731,7 @@ async fn test_e2e_crash_recovery() {
 1. Build and push Docker image:
 
 ```bash
-cd v2
+cd robson
 docker build -t ghcr.io/your-org/robson-v2:staging .
 docker push ghcr.io/your-org/robson-v2:staging
 ```

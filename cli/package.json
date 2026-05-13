@@ -1,7 +1,7 @@
 {
   "name": "robson-cli",
   "version": "2.0.0-alpha",
-  "description": "Robson v2 CLI - Trading automation platform",
+  "description": "Robson operator CLI",
   "main": "src/index.ts",
   "type": "module",
   "bin": {

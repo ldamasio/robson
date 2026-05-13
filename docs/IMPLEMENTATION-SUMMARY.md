@@ -31,16 +31,16 @@ All **automated implementation tasks** have been completed. Remaining tasks are 
 ### ✅ Core Implementation (Complete)
 
 3. **Safety Net Exclusion Filter**
-   - File: `v2/robsond/src/position_monitor.rs`
+   - File: `robsond/src/position_monitor.rs`
    - Added `core_position_repo` field to `PositionMonitor`
    - Implemented `is_core_managed()` method with fail-safe logic
    - Integrated filter into `process_binance_position()` with early return
    - Prevents Safety Net from monitoring Core Trading positions
 
 4. **Repository Interface Extension**
-   - File: `v2/robson-store/src/repository.rs`
+   - File: `robson-store/src/repository.rs`
    - Added `find_active_by_symbol_and_side()` trait method
-   - File: `v2/robson-store/src/memory.rs`
+   - File: `robson-store/src/memory.rs`
    - Implemented method for in-memory store with state filtering
 
 5. **Database Migration**
@@ -50,7 +50,7 @@ All **automated implementation tasks** have been completed. Remaining tasks are 
    - Enables linking Core positions to Binance exchange positions
 
 6. **Event Bus Coordination**
-   - File: `v2/robsond/src/event_bus.rs`
+   - File: `robsond/src/event_bus.rs`
    - Added `CorePositionOpened` event with position metadata
    - Added `CorePositionClosed` event for cleanup
    - Enables real-time notification between Core Trading and Safety Net
@@ -58,27 +58,27 @@ All **automated implementation tasks** have been completed. Remaining tasks are 
 ### ✅ Binance Integration (Complete)
 
 7. **REST API Extensions**
-   - File: `v2/robson-connectors/src/binance_rest.rs`
+   - File: `robson-connectors/src/binance_rest.rs`
    - Added `get_order_status()` method for order querying
    - Added `ping()` method for connectivity checks
    - Existing: `place_market_order()`, `cancel_order()` (already implemented)
 
 8. **WebSocket Client**
-   - File: `v2/robson-connectors/src/binance_ws.rs` (NEW)
+   - File: `robson-connectors/src/binance_ws.rs` (NEW)
    - Implemented full WebSocket client for real-time data
    - Supports: ticker, aggregated trades, klines, user data streams
    - Auto-reconnection, ping/pong keepalive, proper message parsing
    - Complete event types: `TickerEvent`, `AggTradeEvent`, `KlineEvent`, `ExecutionReportEvent`
 
 9. **Connector Exports**
-   - File: `v2/robson-connectors/src/lib.rs`
+   - File: `robson-connectors/src/lib.rs`
    - Updated exports for new WebSocket types
    - Public API: `BinanceWebSocketClient`, `BinanceWsStream`, message types
 
 ### ✅ Kubernetes Deployment (Complete)
 
 10. **Health Endpoints**
-    - File: `v2/robsond/src/api.rs`
+    - File: `robsond/src/api.rs`
     - Added `/healthz` - Liveness probe (process alive?)
     - Added `/readyz` - Readiness probe (DB + Binance healthy?)
     - Proper response types and status codes (200 OK / 503 Unavailable)
@@ -174,7 +174,7 @@ The following tasks **cannot be automated** and require human operators:
 **Steps:**
 ```bash
 # 1. Build and push Docker image
-cd v2
+cd robson
 docker build -t ghcr.io/your-org/robson-v2:staging .
 docker push ghcr.io/your-org/robson-v2:staging
 
@@ -277,22 +277,22 @@ Before production deployment, ensure:
 ## Key Files Modified/Created
 
 ### Modified Files (10)
-1. `v2/robsond/src/position_monitor.rs` - Exclusion filter
-2. `v2/robson-store/src/repository.rs` - Repository trait
-3. `v2/robson-store/src/memory.rs` - In-memory implementation
-4. `v2/robsond/src/event_bus.rs` - Core position events
-5. `v2/robson-connectors/src/binance_rest.rs` - REST API extensions
-6. `v2/robson-connectors/src/lib.rs` - Exports
-7. `v2/robsond/src/api.rs` - Health endpoints
+1. `robsond/src/position_monitor.rs` - Exclusion filter
+2. `robson-store/src/repository.rs` - Repository trait
+3. `robson-store/src/memory.rs` - In-memory implementation
+4. `robsond/src/event_bus.rs` - Core position events
+5. `robson-connectors/src/binance_rest.rs` - REST API extensions
+6. `robson-connectors/src/lib.rs` - Exports
+7. `robsond/src/api.rs` - Health endpoints
 8. `v2/.gitignore` - Secret protection
 9. `v2/docs/adr/ADR-0013-cli-daemon-ipc.md` - (Pre-existing modifications)
-10. `v2/robson-connectors/src/binance_ws.rs` - WebSocket client (updated)
+10. `robson-connectors/src/binance_ws.rs` - WebSocket client (updated)
 
 ### Created Files (17)
 1. `v2/docs/adr/ADR-0014-safety-net-core-trading-coordination.md`
 2. `v2/docs/plan/PHASE-9-10-PRODUCTION-READINESS.md`
 3. `v2/migrations/006_add_binance_position_id.sql`
-4. `v2/robson-connectors/src/binance_ws.rs` (NEW)
+4. `robson-connectors/src/binance_ws.rs` (NEW)
 5. `v2/Dockerfile`
 6. `v2/.dockerignore`
 7. `v2/k8s/prod/namespace.yml`

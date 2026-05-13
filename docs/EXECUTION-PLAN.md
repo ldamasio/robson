@@ -825,7 +825,7 @@ robson-domain (no external deps)
 
 ```bash
 # Full verification
-cd v2 && ./scripts/verify.sh
+./scripts/verify.sh
 
 # Quick check (no tests)
 ./scripts/verify.sh --fast

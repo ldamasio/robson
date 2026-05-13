@@ -1,6 +1,6 @@
 # Robsond DB Migrations
 
-Robsond owns the schema definition and migration files in `v3/migrations`.
+Robsond owns the schema definition and migration files in `migrations`.
 Production applies them through the `rbx-infra` ArgoCD application.
 
 ## Ownership

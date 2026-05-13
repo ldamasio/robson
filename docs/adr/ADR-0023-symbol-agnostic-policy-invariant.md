@@ -159,10 +159,10 @@ Follow-up work required:
 
 ### Related Components
 
-- `v3/robson-domain/src/value_objects.rs` — `RiskConfig`, `TechnicalStopDistance`
-- `v3/robson-engine/src/risk.rs` — risk-gate evaluation (already parameterized by
+- `robson-domain/src/value_objects.rs` — `RiskConfig`, `TechnicalStopDistance`
+- `robson-engine/src/risk.rs` — risk-gate evaluation (already parameterized by
   symbol)
-- `v3/robson-exec/src/executor.rs` — exchange metadata cache (target architecture)
+- `robson-exec/src/executor.rs` — exchange metadata cache (target architecture)
 - `docs/STRATEGIES.md` — strategy configs accept `symbols: [...]` from operator
 
 ---

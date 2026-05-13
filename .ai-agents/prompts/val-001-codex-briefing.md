@@ -13,14 +13,14 @@ execution authority — every order passes through a blocking Risk Engine via a 
 before reaching the exchange.
 
 **Repository**: `/home/psyctl/apps/robson`
-**Runtime crate**: `v2/robsond/src/`
+**Runtime crate**: `robsond/src/`
 **Key source files**:
-- `v2/robsond/src/position_manager.rs` — state machine, signal processing, fill handling
-- `v2/robsond/src/api.rs` — HTTP routes (arm, signal, disarm, panic)
-- `v2/robsond/src/market_data.rs` — WebSocket tick handling
-- `v2/robsond/src/position_monitor.rs` — trailing stop tracking
-- `v2/robsond/src/query_engine.rs` — GovernedAction + Risk Engine gate
-- `v2/robsond/src/detector.rs` — signal detection
+- `robsond/src/position_manager.rs` — state machine, signal processing, fill handling
+- `robsond/src/api.rs` — HTTP routes (arm, signal, disarm, panic)
+- `robsond/src/market_data.rs` — WebSocket tick handling
+- `robsond/src/position_monitor.rs` — trailing stop tracking
+- `robsond/src/query_engine.rs` — GovernedAction + Risk Engine gate
+- `robsond/src/detector.rs` — signal detection
 
 **Canonical rules**: read `AGENTS.md` and `docs/architecture/v3-migration-plan.md` first.
 **English only** in all output — code, comments, reports.
@@ -45,10 +45,10 @@ All code analysis in this session is read-only unless explicitly instructed othe
 before GLM executes it. Give GLM actionable warnings.
 
 **Read these files** (in order):
-1. `v2/robsond/src/api.rs` — arm handler, signal handler, disarm handler
-2. `v2/robsond/src/position_manager.rs` — `arm_position()`, `execute_signal_query()`, `process_market_data()`
-3. `v2/robsond/src/position_monitor.rs` — trailing stop tick processing
-4. `v2/robsond/src/query_engine.rs` — `GovernedAction` creation, approval gate, `cycle_id` injection
+1. `robsond/src/api.rs` — arm handler, signal handler, disarm handler
+2. `robsond/src/position_manager.rs` — `arm_position()`, `execute_signal_query()`, `process_market_data()`
+3. `robsond/src/position_monitor.rs` — trailing stop tick processing
+4. `robsond/src/query_engine.rs` — `GovernedAction` creation, approval gate, `cycle_id` injection
 
 **For each phase of the E2E cycle, answer**:
 - Is there any known error path that would silently fail without returning an HTTP error?

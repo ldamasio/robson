@@ -3,7 +3,7 @@ name = "robson-eventlog"
 version = "2.0.0-alpha"
 edition = "2021"
 authors = ["Robson Bot Team"]
-description = "Event log implementation for Robson v2 - append-only event storage with idempotency"
+description = "Event log implementation for Robson - append-only event storage with idempotency"
 
 [dependencies]
 # Domain

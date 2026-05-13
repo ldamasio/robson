@@ -46,6 +46,6 @@ All slices implemented and merged (pending final PR merge from branch
 - `docs/agents/td-2026-05-05-001-execution-memory.md`
 - `docs/implementation/TD-2026-05-05-001-CORE-LIFECYCLE-DRIFT.md`
 - `docs/runbooks/td-2026-05-05-001-stale-active-recovery.md`
-- `v3/robsond/src/reconciliation_worker.rs`
-- `v3/robsond/src/position_manager.rs`
+- `robsond/src/reconciliation_worker.rs`
+- `robsond/src/position_manager.rs`
 - `docs/policies/UNTRACKED-POSITION-RECONCILIATION.md`

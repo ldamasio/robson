@@ -6,6 +6,9 @@
 **/.http
 **/venv
 **/build
+/target/
+**/*.rs.bk
+*.pdb
 
 # Logs
 logs
@@ -49,6 +52,10 @@ build/Release
 # Dependency directories
 node_modules/
 jspm_packages/
+/cli/node_modules/
+/cli/dist/
+/cli/bun.lockb
+/cli/bun.lock
 
 # TypeScript v1 declaration files
 typings/
@@ -80,6 +87,10 @@ typings/
 # dotenv environment variables file
 .env
 .env.test
+.env.local
+.env.*.local
+.mcp.json
+.env.mcp
 
 # parcel-bundler cache (https://parceljs.org/)
 .cache
@@ -126,6 +137,11 @@ typings/
 .claude
 **/.codex
 
+# Kubernetes secrets (NEVER commit actual secrets)
+k8s/**/robsond-secret.yml
+k8s/**/*-secret.yml
+!k8s/**/*-secret.yml.template
+
 # VPS passwords (NEVER COMMIT)
 infra/ansible/inventory/contabo/passwords.yml
 
@@ -138,6 +154,13 @@ apps/backend/
 .coverage
 htmlcov/
 package-lock.json
+*.db
+*.sqlite
+*.sqlite3
+*.wasm
+*.so
+*.dylib
+*.dll
 
 # Legacy directories
 v2/

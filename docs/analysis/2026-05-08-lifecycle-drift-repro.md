@@ -20,7 +20,7 @@ are absent on the exchange.
 
 **Key Findings**:
 
-- The current loop in `v3/robsond/src/reconciliation_worker.rs:73-87` is
+- The current loop in `robsond/src/reconciliation_worker.rs:73-87` is
   asymmetric by construction. There is no iteration over
   `store.positions().find_active()`.
 - `PositionClosed` cannot be emitted from `Active` directly. The current
@@ -38,7 +38,7 @@ are absent on the exchange.
   layer (`BinanceRestClient::get_order_status`) or are trivial to add via
   `GET /fapi/v1/userTrades`.
 - Slot accounting (`compute_slots_available` in
-  `v3/robsond/src/position_manager.rs:2823-2860`) and `/status.occupied_slots`
+  `robsond/src/position_manager.rs:2823-2860`) and `/status.occupied_slots`
   derive from `find_active`/`find_risk_open`. They are correct **derivations**
   of the broken state — a stale `Active` automatically inflates
   `occupied_slots` and `latent_risk` until the underlying lifecycle is
@@ -63,7 +63,7 @@ during startup and steady state:
 
 ```
 ┌──────────────────────────────────────────────────────────────────┐
-│ Daemon::run() (v3/robsond/src/daemon.rs)                         │
+│ Daemon::run() (robsond/src/daemon.rs)                         │
 │                                                                  │
 │  1. rebuild_store + restore_positions (eventlog → projection)    │
 │  2. startup ReconciliationWorker.scan_and_reconcile_blocking     │
@@ -153,13 +153,13 @@ re-orients local state to exchange truth in this direction.
 
 | Priority | Component | Issue | Blocker For |
 |----------|-----------|-------|-------------|
-| P0 | `v3/robsond/src/reconciliation_worker.rs:73-87` | Worker iterates only the exchange side | Symmetric reconciliation (Slice 4) |
-| P0 | `v3/robson-domain/src/entities.rs:347-361` | No `ExitReason::ReconciledMissingOnExchange` | Reconciled close audit trail (Slice 1) |
-| P0 | `v3/robson-domain/src/events.rs:291-306` | `PositionClosed` lacks `closure_evidence` field | Evidence-bearing close events (Slice 1) |
-| P0 | `v3/robson-exec/src/ports.rs:108-124` | `ExchangePort` cannot retrieve order/trade evidence | Evidence pipeline (Slice 3) |
-| P0 | `v3/robsond/src/position_manager.rs` | No `reconcile_close` path that goes from `Active` directly to `Closed` with evidence | Reconciled close (Slice 4) |
-| P1 | `v3/robsond/src/daemon.rs:480-518` | Startup gate counts only UNTRACKED, not stale-Active | Path A startup gate (Slice 5) |
-| P2 | `v3/cli/src/commands/` | No `reconcile-close` subcommand for Path A operator workflow | Operator runbook (Slice 5) |
+| P0 | `robsond/src/reconciliation_worker.rs:73-87` | Worker iterates only the exchange side | Symmetric reconciliation (Slice 4) |
+| P0 | `robson-domain/src/entities.rs:347-361` | No `ExitReason::ReconciledMissingOnExchange` | Reconciled close audit trail (Slice 1) |
+| P0 | `robson-domain/src/events.rs:291-306` | `PositionClosed` lacks `closure_evidence` field | Evidence-bearing close events (Slice 1) |
+| P0 | `robson-exec/src/ports.rs:108-124` | `ExchangePort` cannot retrieve order/trade evidence | Evidence pipeline (Slice 3) |
+| P0 | `robsond/src/position_manager.rs` | No `reconcile_close` path that goes from `Active` directly to `Closed` with evidence | Reconciled close (Slice 4) |
+| P1 | `robsond/src/daemon.rs:480-518` | Startup gate counts only UNTRACKED, not stale-Active | Path A startup gate (Slice 5) |
+| P2 | `cli/src/commands/` | No `reconcile-close` subcommand for Path A operator workflow | Operator runbook (Slice 5) |
 
 ### Infrastructure Gaps
 
@@ -182,7 +182,7 @@ re-orients local state to exchange truth in this direction.
 - This analysis document.
 - Unit test
   `test_reconciliation_does_not_close_active_missing_on_exchange` in
-  `v3/robsond/src/reconciliation_worker.rs` documenting current (buggy)
+  `robsond/src/reconciliation_worker.rs` documenting current (buggy)
   behavior as a baseline canary.
 
 **Tasks**:
@@ -261,7 +261,7 @@ git status --short
 **Steps** (already executed in Slice 0; re-runnable for verification):
 ```bash
 # Step 1: format check
-cd v3 && cargo fmt --all --check
+cd . && cargo fmt --all --check
 
 # Step 2: run the new reproduction test in isolation
 cargo test -p robsond --lib reconciliation_worker::tests::test_reconciliation_does_not_close_active_missing_on_exchange -- --nocapture
@@ -294,12 +294,12 @@ cargo clippy -p robsond --lib -- -D warnings 2>&1 | grep -qv 'warning'
 
 **Rollback**:
 ```bash
-git restore v3/robsond/src/reconciliation_worker.rs
+git restore robsond/src/reconciliation_worker.rs
 git restore docs/analysis/2026-05-08-lifecycle-drift-repro.md
 git restore docs/implementation/TD-2026-05-05-001-CORE-LIFECYCLE-DRIFT.md
 git checkout main
 git branch -D fix/td-2026-05-05-001-core-lifecycle-drift
-cd v3 && cargo build --workspace
+cd . && cargo build --workspace
 ```
 
 ---
@@ -335,17 +335,17 @@ git branch --show-current | grep -q '^fix/td-2026-05-05-001-core-lifecycle-drift
 
 **Check Slice 0 baseline test exists**:
 ```bash
-grep -q 'test_reconciliation_does_not_close_active_missing_on_exchange' v3/robsond/src/reconciliation_worker.rs && echo PASS || echo FAIL
+grep -q 'test_reconciliation_does_not_close_active_missing_on_exchange' robsond/src/reconciliation_worker.rs && echo PASS || echo FAIL
 ```
 
 **Check workspace formatted**:
 ```bash
-(cd v3 && cargo fmt --all --check) && echo PASS || echo FAIL
+(cd . && cargo fmt --all --check) && echo PASS || echo FAIL
 ```
 
 **Check the reconciliation worker tests pass**:
 ```bash
-(cd v3 && cargo test -p robsond --lib reconciliation_worker 2>&1 | tail -1 | grep -q 'test result: ok') && echo PASS || echo FAIL
+(cd . && cargo test -p robsond --lib reconciliation_worker 2>&1 | tail -1 | grep -q 'test result: ok') && echo PASS || echo FAIL
 ```
 
 ---
@@ -355,7 +355,7 @@ grep -q 'test_reconciliation_does_not_close_active_missing_on_exchange' v3/robso
 ### Rollback Pattern 1: Slice 0 only
 
 ```bash
-git restore v3/robsond/src/reconciliation_worker.rs
+git restore robsond/src/reconciliation_worker.rs
 git restore docs/analysis/2026-05-08-lifecycle-drift-repro.md
 git restore docs/implementation/TD-2026-05-05-001-CORE-LIFECYCLE-DRIFT.md
 git checkout main
@@ -383,7 +383,7 @@ no migration revert.
 ### Appendix A — Current asymmetric reconciliation flow
 
 ```text
-ReconciliationWorker::scan_and_reconcile (v3/robsond/src/reconciliation_worker.rs:73-87)
+ReconciliationWorker::scan_and_reconcile (robsond/src/reconciliation_worker.rs:73-87)
 
   exchange_positions ← exchange.get_all_open_positions()
   for each exchange_position:
@@ -410,7 +410,7 @@ on the exchange. The store is never iterated in its own right.
    Acceptable for I2.
 2. For the reverse direction (I3) we cannot reuse this method symmetrically.
    We need a method like `find_by_state("active")` (already exists on
-   `PositionRepository`, `v3/robson-store/src/repository.rs:60`) or a
+   `PositionRepository`, `robson-store/src/repository.rs:60`) or a
    simple filter on `find_active().filter(state == Active)`. The new loop
    in Slice 4 will use the latter for clarity.
 
@@ -431,12 +431,12 @@ on the exchange. The store is never iterated in its own right.
 - `docs/policies/SYMBOL-AGNOSTIC-POLICIES.md`
 - `docs/adr/ADR-0022-robson-authored-position-invariant.md`
 - `docs/operations/2026-05-05-v3-slot-variation-fix.md`
-- `v3/robsond/src/reconciliation_worker.rs`
-- `v3/robsond/src/position_manager.rs:2470-2860`
-- `v3/robson-exec/src/ports.rs`
-- `v3/robson-domain/src/entities.rs`
-- `v3/robson-domain/src/events.rs`
-- `v3/robson-connectors/src/binance_rest.rs:427-440`
+- `robsond/src/reconciliation_worker.rs`
+- `robsond/src/position_manager.rs:2470-2860`
+- `robson-exec/src/ports.rs`
+- `robson-domain/src/entities.rs`
+- `robson-domain/src/events.rs`
+- `robson-connectors/src/binance_rest.rs:427-440`
 
 ---
 

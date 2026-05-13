@@ -48,7 +48,7 @@ Validation:
 ## Prompt 0.2: Create Bun CLI Skeleton
 
 ```
-Create the Bun CLI project skeleton at v2/cli/ with:
+Create the Bun CLI project skeleton at cli/ with:
 
 1. Initialize Bun project:
    - package.json with dependencies (commander, axios, cli-table3, chalk)
@@ -68,7 +68,7 @@ Create the Bun CLI project skeleton at v2/cli/ with:
 
 Validation:
 ```bash
-cd v2/cli
+cd cli
 bun install
 bun run src/index.ts --help
 bun run src/index.ts --version
@@ -129,7 +129,7 @@ Implement value objects in robson-domain/src/value_objects.rs:
 
 Validation:
 ```bash
-cd v2
+cd robson
 cargo test -p robson-domain
 cargo clippy -p robson-domain -- -D warnings
 ```
@@ -480,7 +480,7 @@ docker run --name robson-postgres -e POSTGRES_PASSWORD=robson -p 5432:5432 -d po
 cargo install sqlx-cli --no-default-features --features postgres
 
 # Run migration
-cd v2/robson-store
+cd robson-store
 export DATABASE_URL="postgres://postgres:robson@localhost/robson"
 sqlx database create
 sqlx migrate run
@@ -705,7 +705,7 @@ Checklist:
 ### Prompt 6.1: Implement API Client
 
 ```
-Create API client in v2/cli/src/api/client.ts:
+Create API client in cli/src/api/client.ts:
 
 1. Create RobsonClient class:
    - Constructor takes baseURL
@@ -719,7 +719,7 @@ Create API client in v2/cli/src/api/client.ts:
 
 Validation:
 ```bash
-cd v2/cli
+cd cli
 bun run src/test-client.ts  # Create test script
 ```
 
@@ -734,7 +734,7 @@ Checklist:
 ### Prompt 6.2: Implement Status Command
 
 ```
-Implement status command in v2/cli/src/commands/status.ts:
+Implement status command in cli/src/commands/status.ts:
 
 1. Create status command handler:
    - Fetch from API client
@@ -745,7 +745,7 @@ Implement status command in v2/cli/src/commands/status.ts:
 
 3. Test:
 ```bash
-cd v2/cli
+cd cli
 bun run src/index.ts status
 bun run src/index.ts status --json
 ```
@@ -772,7 +772,7 @@ cargo run -p robsond
 
 2. In another terminal, run status:
 ```bash
-cd v2/cli
+cd cli
 bun run src/index.ts status
 ```
 
@@ -808,21 +808,21 @@ After completing all phases, these should work:
 
 ```bash
 # Rust
-cd v2
+cd robson
 cargo build --all
 cargo test --all
 cargo clippy --all -- -D warnings
 cargo fmt --all -- --check
 
 # CLI
-cd v2/cli
+cd cli
 bun install
 bun test
 bun run build
 
 # Integration
 cargo run -p robsond
-cd v2/cli && bun run src/index.ts status
+cd cli && bun run src/index.ts status
 ```
 
 ---

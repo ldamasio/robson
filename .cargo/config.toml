@@ -1,4 +1,4 @@
-# Cargo Configuration for Robson v2 Workspace
+# Cargo Configuration for the Robson Rust Workspace
 # Workspace-level settings for build, clippy, and other tools
 
 # Clippy configuration (linting rules)

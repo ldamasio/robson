@@ -133,11 +133,11 @@ Rejected. It loses the distinction between thesis origin and trailing evolution.
   The frontend should treat the selected month as the page context, not as a sidecar
   filter for one section of the page.
 - Related code paths already involved:
-  - `v3/robsond/src/api.rs`
+  - `robsond/src/api.rs`
   - `apps/frontend/src/lib/config/slots.ts`
   - `apps/frontend/src/routes/(authed)/dashboard/+page.svelte`
-  - `v3/robson-store/src/memory.rs`
-  - `v3/robson-store/src/postgres.rs`
+  - `robson-store/src/memory.rs`
+  - `robson-store/src/postgres.rs`
 
 ---
 

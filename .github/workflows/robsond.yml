@@ -4,11 +4,33 @@ on:
   push:
     branches: ["main"]
     paths:
-      - "v3/**"
+      - ".cargo/**"
+      - ".dockerignore"
+      - ".github/workflows/robsond.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "Dockerfile"
+      - "clippy.toml"
+      - "migrations/**"
+      - "robson-*/**"
+      - "robsond/**"
+      - "rust-toolchain.toml"
+      - "rustfmt.toml"
   pull_request:
     branches: ["main"]
     paths:
-      - "v3/**"
+      - ".cargo/**"
+      - ".dockerignore"
+      - ".github/workflows/robsond.yml"
+      - "Cargo.lock"
+      - "Cargo.toml"
+      - "Dockerfile"
+      - "clippy.toml"
+      - "migrations/**"
+      - "robson-*/**"
+      - "robsond/**"
+      - "rust-toolchain.toml"
+      - "rustfmt.toml"
   workflow_dispatch:
 
 permissions:
@@ -39,10 +61,6 @@ jobs:
           --health-interval 10s
           --health-timeout 5s
           --health-retries 5
-    defaults:
-      run:
-        working-directory: v3
-
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -54,8 +72,8 @@ jobs:
             ~/.rustup
             ~/.cargo/registry
             ~/.cargo/git
-            v3/target
-          key: rust-${{ runner.os }}-${{ hashFiles('v3/Cargo.lock') }}
+            target
+          key: rust-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: rust-${{ runner.os }}-
 
       - name: Run tests (no postgres feature - uses MemoryStore)
@@ -103,7 +121,7 @@ jobs:
         uses: docker/build-push-action@v6
         with:
           context: .
-          file: ./v3/Dockerfile
+          file: ./Dockerfile
           push: true
           tags: |
             ${{ env.IMAGE }}:${{ steps.meta.outputs.sha_tag }}

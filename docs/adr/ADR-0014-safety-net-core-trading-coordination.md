@@ -250,14 +250,14 @@ Remove Core Trading's trailing stop, rely solely on Safety Net:
 ### Phase 9 Changes
 
 **Files Modified:**
-- `v2/robsond/src/position_monitor.rs` - Add `is_core_managed()` filter
-- `v2/robsond/src/event_bus.rs` - Add `CorePositionOpened` event
-- `v2/robson-domain/src/entities.rs` - Add `binance_position_id` field
-- `v2/robson-store/src/repository.rs` - Add `find_active_by_symbol_and_side()`
+- `robsond/src/position_monitor.rs` - Add `is_core_managed()` filter
+- `robsond/src/event_bus.rs` - Add `CorePositionOpened` event
+- `robson-domain/src/entities.rs` - Add `binance_position_id` field
+- `robson-store/src/repository.rs` - Add `find_active_by_symbol_and_side()`
 - `v2/migrations/003_add_binance_position_id.sql` - Schema update
 
 **Files Created:**
-- `v2/robsond/tests/core_safety_coordination_test.rs` - Integration tests
+- `robsond/tests/core_safety_coordination_test.rs` - Integration tests
 
 ### Testing Strategy
 

@@ -1,93 +1,36 @@
-# Contributing to Robson Bot
+# Contributing to Robson
 
-Thank you for your interest in contributing to Robson Bot! This document provides guidelines and best practices for contributing to this open-source cryptocurrency trading platform.
+Thank you for contributing to Robson. This document provides guidelines for contributing code, documentation, and other improvements.
 
 ## Table of Contents
 
 - [Code of Conduct](#code-of-conduct)
-- [Language Policy](#language-policy)
 - [Getting Started](#getting-started)
 - [Development Workflow](#development-workflow)
-- [Coding Standards](#coding-standards)
-- [Testing Requirements](#testing-requirements)
-- [Commit Message Guidelines](#commit-message-guidelines)
+- [Code Standards](#code-standards)
+- [Commit Guidelines](#commit-guidelines)
 - [Pull Request Process](#pull-request-process)
-- [Architecture Guidelines](#architecture-guidelines)
+- [Testing](#testing)
 - [Documentation](#documentation)
-- [Getting Help](#getting-help)
 
 ---
 
 ## Code of Conduct
 
-We are committed to providing a welcoming and inclusive environment. Please be respectful and constructive in all interactions.
+### Core Principles
 
-### Our Standards
+1. **English Only**: All code, comments, documentation, and commit messages must be in English
+2. **Safety First**: No `unwrap()` or `expect()` in production code
+3. **Financial Precision**: Always use `rust_decimal::Decimal` for money/quantities (never `f64`)
+4. **Test Coverage**: All business logic must have tests (aim for >80% coverage)
+5. **Incremental Changes**: Small, focused commits and PRs
 
-- **Be respectful**: Treat all contributors with respect
-- **Be constructive**: Provide helpful feedback
-- **Be inclusive**: Welcome contributors of all backgrounds
-- **Be professional**: Keep discussions focused on technical merits
+### Respect and Collaboration
 
-### Unacceptable Behavior
-
-- Harassment, trolling, or inflammatory comments
-- Personal attacks or insults
-- Publishing others' private information
-- Other conduct inappropriate for a professional setting
-
----
-
-## Language Policy
-
-**CRITICAL**: All technical content in Robson Bot MUST be in English.
-
-### What Must Be in English
-
-- ✅ **Source code**: Variables, functions, classes, methods
-- ✅ **Comments**: Inline, block, docstrings
-- ✅ **Documentation**: README, ADRs, specs, guides
-- ✅ **Git**: Commit messages, branch names, PR descriptions
-- ✅ **Issues & PRs**: Titles, descriptions, comments
-- ✅ **Code reviews**: All feedback and discussions
-- ✅ **Configuration**: YAML, JSON, environment variables
-- ✅ **API contracts**: OpenAPI, AsyncAPI, GraphQL schemas
-- ✅ **Tests**: Test names, assertions, fixtures
-- ✅ **Logs**: Application logs, error messages
-
-### Why English Only?
-
-1. **International Positioning**: Robson Bot targets global open-source community
-2. **AI Compatibility**: AI assistants are 40% more effective with English-only codebases
-3. **Team Scaling**: Enables hiring internationally
-4. **Documentation Quality**: Technical terminology is more precise in English
-5. **Industry Standard**: Top open-source projects are 100% English
-
-Read the full rationale: [docs/LANGUAGE-POLICY.md](docs/LANGUAGE-POLICY.md)
-
-### Enforcement
-
-- Pre-commit hooks detect non-English characters
-- CI checks enforce language policy
-- PRs with non-English content will be requested to update
-
-### Support for Non-Native Speakers
-
-We welcome contributors from all language backgrounds! Tips:
-
-- Use Grammarly or LanguageTool for writing assistance
-- Focus on clarity over perfect grammar
-- Ask for help with technical English in PR comments
-- We're patient and will help with language during code reviews
-
----
-
-## AI-First Instructions
-
-Canonical AI-first repository rules live in [AGENTS.md](AGENTS.md).
-
-Use `AGENTS.md` as the primary place for project-wide agent instructions and conventions.
-Vendor-specific files such as `CLAUDE.md` should stay as thin compatibility adapters and must not become separate sources of truth.
+- Be respectful and constructive in code reviews
+- Assume positive intent
+- Focus on the code, not the person
+- Welcome newcomers and help them learn
 
 ---
 
@@ -95,329 +38,286 @@ Vendor-specific files such as `CLAUDE.md` should stay as thin compatibility adap
 
 ### Prerequisites
 
-- **Python**: 3.12+
-- **Node.js**: 20+ (for frontend)
-- **Docker**: Latest version
-- **Git**: Latest version
-- **IDE**: VS Code, PyCharm, or Cursor recommended
+**Required**:
+- Rust 1.83+ (`rustup`)
+- Bun latest (`curl -fsSL https://bun.sh/install | bash`)
+- Git 2.30+
 
-### Fork and Clone
+**For Postgres integration tests** (optional — unit tests run without it):
+- Podman or Docker (to run the local test container via `just v2-db-up`)
+- `DATABASE_URL` is provisioned by `rbx-infra` (Ansible) in staging/production. For local dev, `just v2-db-up` provides it.
 
-1. Fork the repository on GitHub
-2. Clone your fork:
-   ```bash
-   git clone https://github.com/YOUR-USERNAME/robson.git
-   cd robson
-   ```
+**Optional tooling**:
+- SQLx CLI (`cargo install sqlx-cli`) — for inspecting/running migrations manually
+- Cargo-audit (`cargo install cargo-audit`)
+- Cargo-watch (`cargo install cargo-watch`)
 
-3. Add upstream remote:
-   ```bash
-   git remote add upstream https://github.com/rbxrobotica/robson.git
-   ```
-
-### Local Development Setup
-
-#### Backend Setup
+### First-Time Setup
 
 ```bash
-cd apps/backend/monolith
+# 1. Fork the repository on GitHub
+# (Click "Fork" button at https://github.com/ldamasio/robson)
 
-# Create virtual environment
-python -m venv .venv
-source .venv/bin/activate  # On Windows: .venv\Scripts\activate
+# 2. Clone your fork
+git clone https://github.com/YOUR_USERNAME/robson.git
+cd robson
 
-# Install dependencies
-pip install -r requirements.txt
+# 3. Add upstream remote
+git remote add upstream https://github.com/ldamasio/robson.git
 
-# Copy environment file
-cp .env.development.example .env
+# 4. Install Rust dependencies
+cargo build
 
-# Start local PostgreSQL
-cd ../..
-make dev-db-up
-cd apps/backend/monolith
+# 5. Install CLI dependencies
+cd cli && bun install && cd ..
 
-# Run migrations
-python manage.py migrate
-
-# Run tests
-python manage.py test -v 2
-
-# Start dev server
-python manage.py runserver
+# 6. Run verification to ensure setup is correct
+./scripts/verify.sh
 ```
 
-#### Frontend Setup
+### Keeping Your Fork Updated
 
 ```bash
-cd apps/frontend
+# Fetch latest changes from upstream
+git fetch upstream
 
-# Install dependencies
-npm install
+# Update your main branch
+git checkout main
+git merge upstream/main
 
-# Copy environment file
-cp .env.example .env
-
-# Start dev server
-npm run dev
+# Push to your fork
+git push origin main
 ```
-
-### Install Pre-commit Hooks
-
-```bash
-pip install pre-commit
-pre-commit install
-pre-commit install --hook-type commit-msg
-```
-
-Pre-commit hooks will automatically:
-- Format code (Black, Prettier)
-- Sort imports (isort)
-- Lint code (Ruff, ESLint)
-- Type check (MyPy)
-- Security check (Bandit)
-- Validate commit messages
-- Check language policy
 
 ---
 
 ## Development Workflow
 
-### 1. Create an Issue
-
-Before starting work, create or comment on an issue to discuss your proposed changes.
-
-### 2. Create a Branch
+### 1. Create a Feature Branch
 
 ```bash
-git checkout -b feature/my-feature
+# Update main first
+git checkout main
+git pull upstream main
+
+# Create feature branch (use conventional naming)
+git checkout -b feat/your-feature-name
 # or
 git checkout -b fix/bug-description
 ```
 
-**Branch naming convention**:
-- `feature/description` - New features
-- `fix/description` - Bug fixes
-- `docs/description` - Documentation only
-- `refactor/description` - Code refactoring
-- `test/description` - Test additions/fixes
+### Branch Naming Conventions
 
-### 3. Make Changes
+| Prefix | Purpose | Example |
+|--------|---------|---------|
+| `feat/` | New feature | `feat/add-order-entity` |
+| `fix/` | Bug fix | `fix/division-by-zero` |
+| `refactor/` | Code refactoring | `refactor/extract-risk-calculator` |
+| `docs/` | Documentation only | `docs/update-architecture` |
+| `test/` | Add/update tests | `test/add-engine-tests` |
+| `chore/` | Maintenance | `chore/update-dependencies` |
 
-- Write code following our [coding standards](#coding-standards)
-- Add tests for new functionality
-- Update documentation as needed
-- Run tests and linters locally
+### 2. Make Your Changes
 
-### 4. Commit Changes
-
-Follow [Conventional Commits](#commit-message-guidelines):
+Follow the **incremental development cycle**:
 
 ```bash
+# A. Edit code (small, focused changes)
+vim robson-domain/src/entities.rs
+
+# B. Verify locally (BEFORE committing)
+./scripts/verify.sh --fast  # Quick check
+
+# C. Run full verification
+./scripts/verify.sh  # Includes tests
+
+# D. Commit (if verification passed)
 git add .
-git commit -m "feat(trading): add stop-loss order support
-
-Implement automatic stop-loss order execution.
-Includes risk validation and exchange integration.
-
-Closes #123"
+git commit -m "feat(domain): add Order entity"
 ```
 
-### 5. Push and Create PR
+### 3. Keep Commits Small and Focused
+
+**Good example** (one logical change):
+```
+feat(domain): add Order entity
+
+- Create Order struct with id, symbol, side, quantity, price
+- Implement Order::new() constructor
+- Add OrderStatus enum (Pending, Executed, Cancelled)
+- Add tests for order creation and state transitions
+```
+
+**Bad example** (multiple unrelated changes):
+```
+feat: add orders and fix bug and refactor engine
+
+- Add Order entity
+- Fix division by zero in risk calculator
+- Refactor engine to use new architecture
+- Update documentation
+- Add tests for everything
+```
+
+### 4. Push and Create Pull Request
 
 ```bash
-git push origin feature/my-feature
+# Push to your fork
+git push origin feat/your-feature-name
+
+# Create PR on GitHub
+gh pr create --title "feat: add Order entity" --body "Description..."
+# or use GitHub web UI
 ```
-
-Create a Pull Request on GitHub with:
-- Clear title following Conventional Commits
-- Description of changes
-- Link to related issue(s)
-- Screenshots/GIFs for UI changes
-- Test results
-
-### 6. Code Review
-
-- Address reviewer feedback
-- Keep commits clean (squash if needed)
-- Ensure CI passes
-
-### 7. Merge
-
-Once approved and CI passes, maintainers will merge your PR.
 
 ---
 
-## Coding Standards
+## Code Standards
 
-### Python
+### Rust Code Style
 
-**Style**:
-- Follow PEP 8
-- Line length: 100 characters (enforced by Black)
-- Use type hints for all functions
-- Docstrings for public functions/classes (Google style)
+#### 1. Formatting
 
-**Naming**:
-- `snake_case` for variables and functions
-- `PascalCase` for classes
-- `UPPER_SNAKE_CASE` for constants
-- Prefix private methods with `_`
-
-**Example**:
-```python
-from typing import Protocol
-from decimal import Decimal
-
-class OrderRepository(Protocol):
-    """Repository interface for order persistence."""
-
-    def save(self, order: Order) -> Order:
-        """
-        Save order to persistent storage.
-
-        Args:
-            order: Order entity to save
-
-        Returns:
-            Saved order with generated ID
-
-        Raises:
-            ValidationError: If order is invalid
-        """
-        ...
-```
-
-### JavaScript/React
-
-**Style**:
-- Use ES6+ features
-- Functional components with hooks
-- PropTypes for type checking
-- Line length: 100 characters
-
-**Naming**:
-- `camelCase` for variables and functions
-- `PascalCase` for components
-- `UPPER_SNAKE_CASE` for constants
-
-**Example**:
-```javascript
-import React, { useState } from 'react';
-import PropTypes from 'prop-types';
-
-/**
- * Order form component for placing trades.
- *
- * @param {Function} onSubmit - Callback when form is submitted
- * @returns {JSX.Element}
- */
-const OrderForm = ({ onSubmit }) => {
-  const [quantity, setQuantity] = useState('');
-
-  const handleSubmit = (e) => {
-    e.preventDefault();
-    onSubmit({ quantity: parseFloat(quantity) });
-  };
-
-  return <form onSubmit={handleSubmit}>{/* ... */}</form>;
-};
-
-OrderForm.propTypes = {
-  onSubmit: PropTypes.func.isRequired,
-};
-
-export default OrderForm;
-```
-
-### Architecture Principles
-
-**Hexagonal Architecture** (Ports & Adapters):
-
-1. **Domain Layer** (`apps/backend/core/domain/`):
-   - Pure entities, no framework dependencies
-   - Business logic only
-   - Immutable value objects
-
-2. **Application Layer** (`apps/backend/core/application/`):
-   - Use cases orchestrate domain logic
-   - Port definitions (interfaces)
-   - No framework dependencies
-
-3. **Adapters** (`apps/backend/core/adapters/`):
-   - Concrete implementations of ports
-   - Framework-specific code allowed
-   - Django ORM, Binance API client, etc.
-
-**Rules**:
-- ❌ NO Django imports in `core/domain/` or `core/application/`
-- ✅ Use dependency injection
-- ✅ Depend on abstractions (ports), not concretions
-
-See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for details.
-
----
-
-## Testing Requirements
-
-### Coverage Target
-
-- **Minimum**: 80% overall
-- **Domain layer**: 95%+ (critical business logic)
-- **Application layer**: 90%+ (use cases)
-- **Adapters**: 70%+ (integration tests)
-
-### Test Types
-
-**Unit Tests** (fast, isolated):
-```python
-def test_order_total_value():
-    """Test order total value calculation."""
-    order = Order(
-        symbol=Symbol("BTCUSDT"),
-        quantity=Decimal("0.5"),
-        price=Decimal("50000"),
-    )
-    assert order.total_value == Decimal("25000")
-```
-
-**Integration Tests** (with database):
-```python
-@pytest.mark.django_db
-def test_save_order(client, user):
-    """Test saving order via API."""
-    client.force_authenticate(user=user)
-    response = client.post('/api/orders/', {
-        'symbol': 'BTCUSDT',
-        'quantity': '0.5',
-        'price': '50000',
-    })
-    assert response.status_code == 201
-```
-
-### Running Tests
+**Use `rustfmt`** (enforced by CI):
 
 ```bash
-# Backend (from apps/backend/monolith)
-python manage.py test -v 2
+cargo fmt --all
+```
 
-# With coverage
-pytest --cov --cov-report=html
+Configuration: `rustfmt.toml`
 
-# Frontend (from apps/frontend)
-npm test
+#### 2. Linting
 
-# Watch mode
-npm test -- --watch
+**Use `clippy`** (strict mode):
+
+```bash
+cargo clippy --all-targets -- -D warnings
+```
+
+**No warnings allowed** - treat all warnings as errors.
+
+#### 3. Error Handling
+
+**Never use `unwrap()` or `expect()` in production code**:
+
+```rust
+// ❌ BAD
+pub fn calculate(value: Decimal) -> Decimal {
+    let result = value / Decimal::from(2);
+    result.unwrap()  // NEVER do this
+}
+
+// ✅ GOOD
+pub fn calculate(value: Decimal) -> Result<Decimal, DomainError> {
+    let divisor = Decimal::from(2);
+    value.checked_div(divisor)
+        .ok_or(DomainError::DivisionError)
+}
+
+// ✅ OK in tests
+#[test]
+fn test_calculate() {
+    let result = calculate(dec!(100)).unwrap();  // OK in tests
+    assert_eq!(result, dec!(50));
+}
+```
+
+#### 4. Financial Precision
+
+**Always use `rust_decimal::Decimal`**:
+
+```rust
+// ❌ BAD
+let price: f64 = 50000.0;
+let quantity: f64 = 0.1;
+let total = price * quantity;  // Precision loss!
+
+// ✅ GOOD
+use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
+
+let price = dec!(50000);
+let quantity = dec!(0.1);
+let total = price * quantity;  // Exact precision
+```
+
+#### 5. Async/Await
+
+**Use Tokio idioms properly**:
+
+```rust
+// ✅ GOOD
+use tokio::time::{sleep, Duration};
+
+pub async fn fetch_data() -> Result<Data, ApiError> {
+    let client = reqwest::Client::new();
+    let response = client
+        .get("https://api.example.com/data")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await?;
+
+    response.json().await
+}
+
+// ❌ BAD
+pub async fn fetch_data() -> Data {
+    std::thread::sleep(Duration::from_secs(1));  // Blocks entire runtime!
+    // ...
+}
+```
+
+### TypeScript Code Style
+
+#### 1. Type Safety
+
+**Always use explicit types**:
+
+```typescript
+// ✅ GOOD
+interface Order {
+  id: string;
+  symbol: string;
+  quantity: string;  // Decimal as string
+  price: string;
+}
+
+function createOrder(order: Order): Promise<Order> {
+  // ...
+}
+
+// ❌ BAD
+function createOrder(order: any): Promise<any> {
+  // ...
+}
+```
+
+#### 2. Error Handling
+
+**Use try/catch for async operations**:
+
+```typescript
+// ✅ GOOD
+async function fetchOrder(id: string): Promise<Order> {
+  try {
+    const response = await axios.get(`/api/orders/${id}`);
+    return response.data;
+  } catch (error) {
+    if (axios.isAxiosError(error)) {
+      throw new ApiError(error.message);
+    }
+    throw error;
+  }
+}
 ```
 
 ---
 
-## Commit Message Guidelines
+## Commit Guidelines
 
-We use **Conventional Commits** for clear, semantic version control.
+### Conventional Commits
 
-### Format
+All commits **must** follow the [Conventional Commits](https://www.conventionalcommits.org/) specification:
 
 ```
 <type>(<scope>): <subject>
@@ -427,223 +327,397 @@ We use **Conventional Commits** for clear, semantic version control.
 <footer>
 ```
 
-### Types
+### Commit Types
 
-- `feat`: New feature
-- `fix`: Bug fix
-- `docs`: Documentation only
-- `style`: Code style (formatting, no logic change)
-- `refactor`: Code restructuring (no behavior change)
-- `perf`: Performance improvement
-- `test`: Add/update tests
-- `chore`: Build process, dependencies, tooling
+| Type | Description | Example |
+|------|-------------|---------|
+| `feat` | New feature | `feat(domain): add Order entity` |
+| `fix` | Bug fix | `fix(engine): prevent division by zero` |
+| `docs` | Documentation only | `docs(readme): update setup instructions` |
+| `refactor` | Code refactoring | `refactor(store): extract repository trait` |
+| `test` | Add/update tests | `test(domain): add Order state tests` |
+| `chore` | Maintenance | `chore(deps): update rust_decimal to 1.37` |
+| `perf` | Performance improvement | `perf(engine): optimize risk calculation` |
 
-### Scope
+### Commit Scopes
 
-Component affected: `trading`, `risk`, `api`, `frontend`, `infra`, etc.
+| Scope | Crate/Area | Example |
+|-------|-----------|---------|
+| `domain` | robson-domain | `feat(domain): add Position entity` |
+| `engine` | robson-engine | `fix(engine): correct position sizing` |
+| `exec` | robson-exec | `refactor(exec): extract executor trait` |
+| `connectors` | robson-connectors | `feat(connectors): add Binance adapter` |
+| `store` | robson-store | `feat(store): add order repository` |
+| `daemon` | robsond | `fix(daemon): handle shutdown gracefully` |
+| `sim` | robson-sim | `feat(sim): add backtesting engine` |
+| `cli` | cli/ (TypeScript) | `feat(cli): add status command` |
 
-### Examples
+### Commit Message Examples
 
-```
-feat(trading): add stop-loss order support
-
-Implement automatic stop-loss execution when price
-drops below threshold. Includes risk validation.
-
-Closes #123
-```
-
-```
-fix(api): prevent race condition in order placement
-
-Use database transaction to ensure order atomicity.
-Adds retry logic for transient API failures.
-
-Fixes #456
-```
+**Good commit messages**:
 
 ```
-docs(readme): update installation instructions
+feat(domain): add Order entity with lifecycle states
 
-Add Docker setup steps and troubleshooting section.
+- Create Order struct with id, symbol, side, quantity, price
+- Add OrderStatus enum (Pending, Executed, Cancelled, Failed)
+- Implement state transitions with validation
+- Add unit tests for all state transitions
+
+Closes #42
 ```
 
-### Enforcement
+```
+fix(engine): prevent division by zero in position sizing
 
-Commit messages are validated by pre-commit hook. Invalid messages will be rejected.
+When stop_distance is zero, calculate_position_size would panic.
+Now returns DomainError::InvalidStopDistance instead.
+
+Added test to verify error handling.
+
+Fixes #123
+```
+
+**Bad commit messages**:
+
+```
+fix bug  ❌ (not descriptive, missing scope)
+```
+
+```
+feat: add stuff  ❌ (vague, no details)
+```
+
+```
+Update code  ❌ (no type, no scope, not descriptive)
+```
+
+### Commit Message Rules
+
+1. **Subject line**:
+   - Max 72 characters
+   - Use imperative mood ("add", not "added" or "adds")
+   - No period at the end
+   - Lowercase after scope
+
+2. **Body** (optional):
+   - Wrap at 72 characters
+   - Explain *what* and *why*, not *how*
+   - Separate from subject with blank line
+
+3. **Footer** (optional):
+   - Reference issues: `Closes #123`, `Fixes #456`
+   - Breaking changes: `BREAKING CHANGE: ...`
 
 ---
 
 ## Pull Request Process
 
-### Before Creating PR
+### Before Creating a PR
 
-- [ ] All tests pass locally
-- [ ] Code is formatted (Black, Prettier)
-- [ ] No linting errors (Ruff, ESLint)
-- [ ] Type checking passes (MyPy)
-- [ ] Security scan passes (Bandit)
-- [ ] Coverage meets 80% threshold
-- [ ] Documentation updated
-- [ ] CHANGELOG updated (if applicable)
+**Checklist**:
 
-### PR Title
+- [ ] All tests pass locally (`./scripts/verify.sh`)
+- [ ] Code is formatted (`cargo fmt --all`)
+- [ ] No clippy warnings (`cargo clippy -- -D warnings`)
+- [ ] Commits follow Conventional Commits format
+- [ ] Branch is up-to-date with `main`
+- [ ] Documentation is updated (if needed)
 
-Use Conventional Commits format:
+### Creating the PR
+
+**Title**: Use Conventional Commits format
 
 ```
-feat(trading): add stop-loss orders
+feat: add Order entity
+fix: prevent division by zero in risk calculator
+docs: update architecture documentation
 ```
 
-### PR Description Template
+**Description Template**:
 
 ```markdown
-## Summary
-Brief description of changes.
+## Description
+Brief description of what this PR does.
 
-## Related Issue
-Closes #123
+## Motivation
+Why is this change needed? What problem does it solve?
 
-## Type of Change
-- [ ] Bug fix
-- [ ] New feature
-- [ ] Breaking change
-- [ ] Documentation update
-
-## Changes Made
-- Added stop-loss order type
-- Updated risk validation
-- Added integration tests
+## Changes
+- List of specific changes
+- One per line
+- Be specific
 
 ## Testing
+How was this tested?
 - [ ] Unit tests added/updated
 - [ ] Integration tests added/updated
 - [ ] Manual testing performed
 
-## Screenshots
-(if applicable)
-
 ## Checklist
-- [ ] Code follows project style
-- [ ] All code is in English
+- [ ] Code follows project style guidelines
 - [ ] Tests pass locally
 - [ ] Documentation updated
-- [ ] No breaking changes (or documented)
+- [ ] Conventional commit messages
+- [ ] No unwrap/expect in production code
+- [ ] Uses Decimal for financial amounts
+
+## Related Issues
+Closes #123
+Relates to #456
 ```
 
-### Review Process
+### PR Review Process
 
-1. **Automated Checks**: CI runs tests, linting, security scans
-2. **Code Review**: Maintainer reviews code quality and architecture
-3. **Feedback**: Address reviewer comments
-4. **Approval**: At least one maintainer approval required
-5. **Merge**: Squash and merge (default) or rebase
+1. **Automated Checks** (CI):
+   - Rust tests
+   - Clippy linting
+   - Format checking
+   - TypeScript type checking
 
-### Validation Flow
+2. **Code Review**:
+   - At least one approval required
+   - Address all comments
+   - Update PR if requested
 
-Every PR must pass the standard validation path:
-- **Local checks**: run the relevant tests and linters before pushing
-- **CI**: automated checks run on PR creation and on each push
-- **Shared staging**: maintainers may validate changes in a shared environment when integration testing is needed
+3. **Merge**:
+   - Squash and merge (default)
+   - Ensure final commit message follows Conventional Commits
 
-Use this flow to confirm changes before requesting merge.
+### Responding to Review Comments
+
+**Good response**:
+```
+Thanks for the feedback! I've:
+- Fixed the unwrap() issue (commit abc123)
+- Added tests for edge cases (commit def456)
+- Updated documentation (commit ghi789)
+```
+
+**Bad response**:
+```
+Fixed  ❌ (not specific)
+```
 
 ---
 
-## Architecture Guidelines
+## Testing
 
-### Adding a New Use Case
+### Test tiers
 
-1. **Define domain entity** (if new):
-   ```python
-   # apps/backend/core/domain/my_entity.py
-   @dataclass(frozen=True)
-   class MyEntity:
-       id: str
-       # ... fields
-   ```
+There are three test tiers with different infrastructure requirements:
 
-2. **Define port**:
-   ```python
-   # apps/backend/core/application/ports.py
-   class MyEntityRepository(Protocol):
-       def save(self, entity: MyEntity) -> MyEntity: ...
-   ```
+| Tier | What it covers | Command | Needs database |
+|---|---|---|---|
+| **Unit / in-memory** | Domain logic, engine, pure functions | `cargo test --all` | No |
+| **Feature-gated** | Postgres-specific code paths (compile check only) | `cargo test --features postgres` | No — `#[ignore]` tests are skipped |
+| **Postgres integration** | Crash recovery, replay, projections, store layer | `just test-pg` | Yes |
 
-3. **Implement use case**:
-   ```python
-   # apps/backend/core/application/my_use_case.py
-   class MyUseCase:
-       def __init__(self, repo: MyEntityRepository):
-           self._repo = repo
+CI must pass tiers 1 and 2 unconditionally. Tier 3 requires a provisioned database (`DATABASE_URL`).
 
-       def execute(self, command: MyCommand) -> MyEntity:
-           # Business logic
-           pass
-   ```
+### Test requirements
 
-4. **Implement adapter**:
-   ```python
-   # apps/backend/core/adapters/driven/persistence/django_my_repository.py
-   class DjangoMyRepository:
-       def save(self, entity: MyEntity) -> MyEntity:
-           # Django ORM operations
-           pass
-   ```
+**All business logic must have tests**. Aim for >80% coverage on:
+- Domain entities (`robson-domain`)
+- Engine logic (`robson-engine`)
+- Execution layer (`robson-exec`)
 
-5. **Write tests** (test use case with test doubles)
+### Writing a Postgres integration test
 
-See [docs/AGENTS.md](docs/AGENTS.md) for more patterns.
+Use `sqlx::test` — it handles the full database lifecycle automatically:
 
-### Adding a REST Endpoint
+```rust
+// ✅ Correct pattern for a Postgres-backed test
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn test_projection_restores_state(pool: sqlx::PgPool) {
+    // sqlx::test creates a clean, isolated database for this test.
+    // All migrations in migrations/ are applied automatically.
+    // The database is dropped when the test ends.
+    // Never write manual setup here — let sqlx::test handle it.
 
-1. Create Django view in `apps/backend/monolith/api/views/`
-2. Add URL route
-3. Update OpenAPI spec (`docs/specs/api/openapi.yaml`)
-4. Write integration tests
-5. Update documentation
+    // Use sqlx::query(...) (dynamic), not sqlx::query!(...) (compile-time macro),
+    // to avoid requiring DATABASE_URL at build time.
+    sqlx::query("INSERT INTO ...")
+        .bind(value)
+        .execute(&pool)
+        .await
+        .unwrap();
+}
+```
 
-### Frontend Component
+Rules:
+- Always use `#[ignore = "requires DATABASE_URL"]` on Postgres tests.
+- Always use `#[sqlx::test(migrations = "../migrations")]`, not manual pool creation.
+- Never provision a database or start a container inside a test.
+- Use `sqlx::query(...)`, not `sqlx::query!(...)`, in test files.
 
-1. Create component in `apps/frontend/src/components/`
-2. Follow ports & adapters pattern
-3. Write unit tests
-4. Add PropTypes
-5. Document props in JSDoc
+### DATABASE_URL — where it comes from
+
+`DATABASE_URL` is never hardcoded. It is injected from the appropriate layer:
+
+| Environment | Source |
+|---|---|
+| Local dev | `just v2-db-up` provisions the container; `just test-pg` exports the URL |
+| CI | CI environment variable / secret — database provisioned by CI infrastructure |
+| Staging | `rbx-infra` Ansible vault output |
+| Production | `rbx-infra` Ansible vault — **never used for tests** |
+
+### Running Postgres integration tests
+
+```bash
+# Step 1: start the local test database (first time, or after just v2-db-down)
+just v2-db-up
+
+# Step 2: run all Postgres-backed tests
+just test-pg
+
+# Filter to a specific test
+DATABASE_URL=postgresql://robson:robson@localhost:5432/robson_v2 \
+  bash scripts/test-pg.sh --test crash_recovery
+```
+
+The `scripts/test-pg.sh` script refuses URLs containing `prod`, `production`, or `live` as a safety guard.
+
+### Test organization
+
+```rust
+// Unit tests inline in the source file
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use rust_decimal_macros::dec;
+
+    #[test]
+    fn test_order_creation() {
+        let symbol = Symbol::from("BTCUSDT");
+        let order = Order::new(symbol, OrderSide::Buy, dec!(0.1), dec!(50000));
+        assert_eq!(order.status, OrderStatus::Pending);
+    }
+}
+```
+
+### Test naming
+
+Use descriptive test names:
+
+```rust
+// ✅ GOOD
+fn test_order_execution_transitions_status_from_pending_to_executed() { }
+fn test_zero_stop_distance_returns_invalid_stop_distance_error() { }
+
+// ❌ BAD
+fn test1() { }
+fn test_order() { }
+```
+
+### Running tests
+
+```bash
+# All unit + in-memory tests (no database needed)
+cargo test --all
+
+# Specific crate
+cargo test -p robson-domain
+
+# Specific test
+cargo test test_order_creation
+
+# With output
+cargo test -- --nocapture
+
+# Postgres integration tests
+just v2-db-up && just test-pg
+
+# Coverage (requires cargo-tarpaulin)
+cargo tarpaulin --all
+```
 
 ---
 
 ## Documentation
 
-### When to Update Docs
+### Code Documentation
 
-- **Always**: When adding features, changing APIs, or modifying behavior
-- **ADRs**: For significant architectural decisions
-- **Specs**: For new features (TDD/BDD approach)
-- **README**: For setup or usage changes
-- **OpenAPI**: For API endpoint changes
+**Use doc comments** for public APIs:
 
-### Documentation Standards
-
-- **Markdown**: GitHub Flavored Markdown, linted with markdownlint
-- **Diagrams**: Mermaid format (version controlled)
-- **Code Examples**: Include language identifier, tested examples
-- **Links**: Use relative paths for internal references
-
-### Creating an ADR
-
-Use the template in `docs/adr/ADR-TEMPLATE.md`:
-
-```bash
-cp docs/adr/ADR-TEMPLATE.md docs/adr/ADR-XXXX-my-decision.md
+```rust
+/// Creates a new order with the given parameters.
+///
+/// # Arguments
+///
+/// * `symbol` - Trading pair (e.g., BTCUSDT)
+/// * `side` - Buy or Sell
+/// * `quantity` - Amount to trade (must be > 0)
+/// * `price` - Price per unit (must be > 0)
+///
+/// # Returns
+///
+/// A new `Order` in `Pending` status
+///
+/// # Examples
+///
+/// ```
+/// use robson_domain::{Order, Symbol, OrderSide};
+/// use rust_decimal_macros::dec;
+///
+/// let order = Order::new(
+///     Symbol::from("BTCUSDT"),
+///     OrderSide::Buy,
+///     dec!(0.1),
+///     dec!(50000),
+/// );
+/// ```
+pub fn new(symbol: Symbol, side: OrderSide, quantity: Decimal, price: Decimal) -> Self {
+    // ...
+}
 ```
 
-Fill out:
-- Context (problem)
-- Decision drivers
-- Considered options
-- Decision outcome
-- Consequences
+### Updating Documentation
+
+When making changes that affect:
+
+- **Public APIs**: Update inline doc comments
+- **Architecture**: Update `docs/ARCHITECTURE.md`
+- **Domain model**: Update `docs/DOMAIN.md`
+- **CLI commands**: Update `docs/CLI.md`
+- **Setup process**: Update `README.md`
+
+---
+
+## Additional Guidelines
+
+### File Organization
+
+**Keep files focused and small**:
+- Max ~500 lines per file (guideline, not hard limit)
+- One main concept per file
+- Use modules to organize related functionality
+
+### Dependencies
+
+**Be conservative with dependencies**:
+- Prefer std library when possible
+- Evaluate necessity before adding new crate
+- Check license compatibility (prefer MIT/Apache-2.0)
+- Audit security (`cargo audit`)
+
+**Adding a dependency**:
+```toml
+# Add to workspace Cargo.toml [workspace.dependencies]
+new-crate = "1.0"
+
+# Then in crate Cargo.toml
+[dependencies]
+new-crate = { workspace = true }
+```
+
+### Performance
+
+**Optimize only when necessary**:
+- Profile before optimizing (`cargo flamegraph`)
+- Write clear code first, optimize later
+- Add benchmarks for critical paths (`criterion`)
 
 ---
 
@@ -651,46 +725,32 @@ Fill out:
 
 ### Resources
 
-- **Documentation**: [docs/INDEX.md](docs/INDEX.md)
-- **Developer Guide**: [docs/DEVELOPER.md](docs/DEVELOPER.md)
-- **Architecture**: [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md)
-- **AI Guide**: [docs/AGENTS.md](docs/AGENTS.md)
-
-### Communication
-
+- **Documentation**: `docs/`
+- **CLAUDE.md**: Repository context for AI assistants
 - **GitHub Issues**: Bug reports, feature requests
-- **GitHub Discussions**: Questions, ideas, general discussion
-- **Pull Requests**: Code review, implementation discussion
+- **Discussions**: General questions, ideas
 
-### Common Questions
+### Questions?
 
-**Q: I found a bug, what should I do?**
-A: Create an issue with steps to reproduce, expected vs. actual behavior, and your environment.
-
-**Q: I want to add a feature, where do I start?**
-A: Create an issue to discuss the feature first. Once approved, follow the development workflow.
-
-**Q: My PR is failing CI, what do I do?**
-A: Check the CI logs, fix the issues locally, and push again. Run `pre-commit run --all-files` locally before pushing.
-
-**Q: I'm not sure about code architecture, can I get help?**
-A: Yes! Ask in the PR comments or create a discussion. We're here to help.
-
-**Q: Can I contribute without coding?**
-A: Absolutely! Documentation, testing, bug reports, and design are all valuable contributions.
+If you're unsure about:
+- Architecture decisions: Check `docs/ARCHITECTURE.md`
+- Domain model: Check `docs/DOMAIN.md`
+- Code patterns: Check `CLAUDE.md`
+- Still stuck: Open a GitHub Discussion
 
 ---
 
-## Recognition
+## License
 
-Contributors are recognized in:
-- **CONTRIBUTORS.md**: All contributors listed
-- **Release Notes**: Significant contributions highlighted
-- **GitHub**: Contributor badge on profile
-
-Thank you for contributing to Robson Bot! 🚀
+By contributing to Robson, you agree that your contributions will be licensed under the same license as the project (check root LICENSE file).
 
 ---
 
-**Last Updated**: 2025-11-14
+**Thank you for contributing to Robson!**
+
+Your contributions help build a reliable, safe, and efficient trading platform.
+
+---
+
 **Version**: 1.0
+**Last Updated**: 2026-01-15

@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# test-pg.sh — Run Postgres-backed integration tests for Robson v2
+# test-pg.sh — Run Postgres-backed integration tests for Robson
 #
 # DATABASE_URL must be set in the environment before calling this script.
 # How you obtain it depends on the environment:
@@ -25,7 +25,7 @@
 #   Each test receives an isolated PgPool. sqlx::test:
 #     1. Connects to the server at DATABASE_URL
 #     2. Creates a temporary database per test (needs CREATEDB privilege on the user)
-#     3. Runs all migrations from v2/migrations/ automatically
+#     3. Runs all migrations from migrations/ automatically
 #     4. Runs the test
 #     5. Drops the temporary database
 #   No manual migration step is needed. No persistent state is left behind.
@@ -36,7 +36,7 @@
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-V2_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
+WORKSPACE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -57,7 +57,7 @@ if [[ -z "${DATABASE_URL:-}" ]]; then
     echo ""
     echo "  Local dev (Podman container):"
     echo "    just v2-db-up    # provisions test database"
-    echo "    just v2-test-pg  # sets DATABASE_URL and runs this script"
+    echo "    just test-pg     # sets DATABASE_URL and runs this script"
     echo ""
     echo "  CI:"
     echo "    Set DATABASE_URL as a CI environment variable / secret."
@@ -71,7 +71,7 @@ if [[ -z "${DATABASE_URL:-}" ]]; then
     echo "    DATABASE_URL='postgresql://user:pass@host/dbname' bash scripts/test-pg.sh"
     echo "    The user must have CREATEDB privilege (sqlx::test creates per-test databases)."
     echo ""
-    echo "See: v2/README.md — 'PostgreSQL Integration Tests'"
+    echo "See: README.md — 'PostgreSQL Integration Tests'"
     exit 1
 fi
 
@@ -89,7 +89,7 @@ for _pattern in "prod" "production" "live"; do
 done
 
 # ─── Run tests ─────────────────────────────────────────────────────────────────
-cd "${V2_ROOT}"
+cd "${WORKSPACE_ROOT}"
 
 echo ""
 info "Running Postgres integration tests..."

@@ -36,7 +36,7 @@ change.
 ## Decision
 
 Add a `tower_http::cors::CorsLayer` to the merged Axum router in
-`v3/robsond/src/api.rs`. The allow-list is read from the
+`robsond/src/api.rs`. The allow-list is read from the
 `ROBSON_CORS_ALLOWED_ORIGINS` environment variable as a
 comma-separated list.
 
@@ -112,9 +112,9 @@ ROBSON_CORS_ALLOWED_ORIGINS: "https://robson.rbx.ia.br,https://robson.rbxsystems
 
 ## Implementation Notes
 
-- Code: `v3/robsond/src/api.rs` (`build_cors_layer`, applied via
+- Code: `robsond/src/api.rs` (`build_cors_layer`, applied via
   `.layer()` on the merged router).
-- Doc reference in `v3/robsond/src/config.rs` (`ApiConfig`
+- Doc reference in `robsond/src/config.rs` (`ApiConfig`
   comment) so readers find the env var without grepping.
 - Unit test: `build_cors_layer_parses_origins_from_env` in the
   `tests` module of `api.rs`.

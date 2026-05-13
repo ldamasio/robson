@@ -184,32 +184,32 @@ verified in production.
 
 Slice 0 only reads existing code. No production files are modified.
 
-- `v3/robsond/src/reconciliation_worker.rs` — current asymmetric scanner.
-- `v3/robsond/src/position_manager.rs:2470-2557` (`handle_exit_fill`),
+- `robsond/src/reconciliation_worker.rs` — current asymmetric scanner.
+- `robsond/src/position_manager.rs:2470-2557` (`handle_exit_fill`),
   `:2682-2776` (`panic_close_position_internal`), `:2823-2860`
   (`compute_slots_available`).
-- `v3/robsond/src/daemon.rs:480-518` — startup sequence: rebuild → restore
+- `robsond/src/daemon.rs:480-518` — startup sequence: rebuild → restore
   → UNTRACKED scan → recovery → workers.
-- `v3/robsond/src/startup_recovery.rs` — missed-stop catch-up via candle
+- `robsond/src/startup_recovery.rs` — missed-stop catch-up via candle
   replay (does NOT cover stale-Active).
-- `v3/robsond/src/api.rs:614-692` — `/status`, `/month` slot accounting.
-- `v3/robson-domain/src/entities.rs:240-306` (`PositionState`),
+- `robsond/src/api.rs:614-692` — `/status`, `/month` slot accounting.
+- `robson-domain/src/entities.rs:240-306` (`PositionState`),
   `:347-361` (`ExitReason`).
-- `v3/robson-domain/src/events.rs:240-306` (`ExitTriggered`,
+- `robson-domain/src/events.rs:240-306` (`ExitTriggered`,
   `ExitOrderPlaced`, `ExitFilled`, `PositionClosed`).
-- `v3/robson-exec/src/ports.rs:108-124` (`get_all_open_positions`,
+- `robson-exec/src/ports.rs:108-124` (`get_all_open_positions`,
   `close_position_market`). NOTE: no port method to fetch order/trade
   history today.
-- `v3/robson-connectors/src/binance_rest.rs:427-440` (`get_order_status`).
+- `robson-connectors/src/binance_rest.rs:427-440` (`get_order_status`).
   Already at the connector layer; needs to be exposed at the
   `ExchangePort` trait level for the evidence pipeline.
-- `v3/robson-store/src/repository.rs:35-90` (`find_active`, `find_risk_open`,
+- `robson-store/src/repository.rs:35-90` (`find_active`, `find_risk_open`,
   `find_active_by_symbol_and_side`, `find_closed_in_month`).
-- `v3/robson-store/src/postgres.rs:145-150` (ExitReason parser),
+- `robson-store/src/postgres.rs:145-150` (ExitReason parser),
   `:407` (`find_active_from_projection`).
-- `v3/robson-projector/src/handlers/positions.rs` — `handle_position_closed`
+- `robson-projector/src/handlers/positions.rs` — `handle_position_closed`
   path that the new evidence-bearing event MUST flow through.
-- `v3/robson-projector/src/handlers/monthly_state.rs` —
+- `robson-projector/src/handlers/monthly_state.rs` —
   `handle_position_closed_monthly` path. Realized loss must be updated by
   reconciled closes too.
 - `docs/policies/UNTRACKED-POSITION-RECONCILIATION.md` — current policy
@@ -228,7 +228,7 @@ session.
 - **Goal**: deterministic test that demonstrates current asymmetric
   reconciliation as a noop for stale-Active. Lock in the diagnostic.
 - **Files added/changed**:
-  - `v3/robsond/src/reconciliation_worker.rs` — append a unit test
+  - `robsond/src/reconciliation_worker.rs` — append a unit test
     `test_reconciliation_does_not_close_active_missing_on_exchange`
     inside the existing `mod tests`. Test asserts the **current (buggy)
     behavior**: store keeps the position Active, exchange returns empty,
@@ -243,7 +243,7 @@ session.
 - **No production code** in this slice. No changes to `daemon.rs`,
   `position_manager.rs`, `ports.rs`, `entities.rs`, or `events.rs`.
 - **Verification**:
-  - `cargo fmt --all --check` (workspace `v3/`).
+  - `cargo fmt --all --check` (Rust workspace).
   - `cargo test -p robsond reconciliation_worker --lib` — new test passes.
   - `cargo clippy -p robsond --lib -- -D warnings`.
 - **Rollback**: `git restore` the three files; nothing else touched.
@@ -432,7 +432,7 @@ Tests added (210 lib tests passing):
 
 Outcome:
 
-- New crate `v3/robson-cli` with `reconcile-close` subcommand.
+- New crate `robson-cli` with `reconcile-close` subcommand.
   Sends `POST /reconcile-close` to `robsond`; validates evidence shape
   locally before the network call.
 - New `POST /reconcile-close` API endpoint in `robsond`.
@@ -456,7 +456,7 @@ Scoped PR: #60.
 
 Outcome:
 
-- `v3/Dockerfile` updated to include `robson-cli` in the workspace build so
+- `Dockerfile` updated to include `robson-cli` in the workspace build so
   the `robson-cli` binary is present inside the `robsond` container image.
 - No algorithm change. Build-system fix only.
 - Commit `1b275638 fix(docker): include robson-cli workspace member in robsond build`.
@@ -466,7 +466,7 @@ Outcome:
 Outcome:
 
 - Extracted shared evidence helper functions in
-  `v3/robsond/src/reconciliation_worker.rs` into dedicated private helpers.
+  `robsond/src/reconciliation_worker.rs` into dedicated private helpers.
 - Simplified the user-trade evidence helper (deduplication, cleaner logic).
 - **No behavior change.** Pure refactor — all existing tests continue passing.
 - Commits:

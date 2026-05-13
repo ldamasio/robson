@@ -121,7 +121,7 @@ These invariants are **enforced by the current code** and must remain true:
 ## 3. Local Validation
 
 ```bash
-cd /home/psyctl/apps/robson/v3
+cd /home/psyctl/apps/robson
 
 # Build
 cargo build
@@ -150,7 +150,7 @@ cargo clippy --all-targets -- -D warnings 2>&1 | grep -E "stop_quality|stop_anch
 
 **Critical**: Shadow telemetry uses `debug!` level, but `robsond` defaults to `info`.
 
-In `v3/robsond/src/main.rs`, the tracing subscriber is configured as:
+In `robsond/src/main.rs`, the tracing subscriber is configured as:
 
 ```rust
 tracing_subscriber::registry()
@@ -252,7 +252,7 @@ The following fields must **never** appear in shadow telemetry logs:
 | Full DetectorSignal payload | Excessive logging, potential financial data |
 | Any PII or account identifier | Security |
 
-**Verification**: The telemetry code in `v3/robsond/src/detector.rs:526-539` explicitly
+**Verification**: The telemetry code in `robsond/src/detector.rs:526-539` explicitly
 avoids logging these fields. If a future grep reveals any of them in the telemetry line,
 it must be treated as a security regression.
 
@@ -287,7 +287,7 @@ If this returns matches, stop and investigate before proceeding.
 Additionally, verify that the classifier is called with `false` for `exceptional_enabled`:
 
 ```bash
-rg -n "classify_stop_quality" v3/robsond/src/detector.rs
+rg -n "classify_stop_quality" robsond/src/detector.rs
 # Should show: classify_stop_quality(..., false)
 ```
 
@@ -299,11 +299,11 @@ The third argument (`false`) is `exceptional_enabled`. It must be `false`.
 
 ```bash
 # Confirm risk.rs has no stop_quality references
-rg -n "stop_quality|StopQuality|stop_anchor|StopAnchor" v3/robson-engine/src/risk.rs
+rg -n "stop_quality|StopQuality|stop_anchor|StopAnchor" robson-engine/src/risk.rs
 # Expected: no matches
 
 # Confirm the RiskGate signature is unchanged
-rg -n "pub fn evaluate" v3/robson-engine/src/risk.rs
+rg -n "pub fn evaluate" robson-engine/src/risk.rs
 # Should show the same pure evaluation function
 ```
 
@@ -313,11 +313,11 @@ rg -n "pub fn evaluate" v3/robson-engine/src/risk.rs
 
 ```bash
 # Position manager only has construction sites with None
-rg -n "stop_anchor|stop_quality" v3/robsond/src/position_manager.rs
+rg -n "stop_anchor|stop_quality" robsond/src/position_manager.rs
 # Expected: only "stop_anchor: None" and "stop_quality: None" in construction sites
 
 # No revalidation logic
-rg -n "revalidate|recheck|reassess" v3/robsond/src/position_manager.rs
+rg -n "revalidate|recheck|reassess" robsond/src/position_manager.rs
 # Expected: no matches
 ```
 

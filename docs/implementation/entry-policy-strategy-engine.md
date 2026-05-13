@@ -10,14 +10,14 @@ All validation tests pass. 464 tests, 0 failures.
 
 - Created this resumable implementation guide.
 - Located the current Rust entry path:
-  - API `POST /positions` deserializes `ArmRequest` in `v2/robsond/src/api.rs`.
+  - API `POST /positions` deserializes `ArmRequest` in `robsond/src/api.rs`.
   - `PositionManager::arm_position` creates `PositionArmed` and spawns one `DetectorTask`.
-  - `DetectorTask` in `v2/robsond/src/detector.rs` owns the implicit SMA 9/21 crossover detector.
+  - `DetectorTask` in `robsond/src/detector.rs` owns the implicit SMA 9/21 crossover detector.
   - `DetectorTask::create_signal` computes a chart-derived technical stop through `TechnicalStopAnalyzer`.
   - `PositionManager::handle_signal` processes `DetectorSignal`, persists `TechnicalStopAnalyzed`, calls `Engine::decide_entry`, then runs risk, approval, and execution.
   - `Engine::decide_entry` performs signal validation, `TechnicalStopDistance` validation, position sizing, and emits `EntrySignalReceived`, `EntryOrderRequested`, and `PlaceEntryOrder`.
 - Located current approval handling:
-  - `v2/robsond/src/query_engine.rs` contains a notional-threshold `ApprovalPolicy`.
+  - `robsond/src/query_engine.rs` contains a notional-threshold `ApprovalPolicy`.
   - Approval is currently coupled to risk-approved actions, not to user-selected entry policy.
 - Located current state and event model:
   - `PositionState` is `Armed`, `Entering`, `Active`, `Exiting`, `Closed`, `Error`.
@@ -66,13 +66,13 @@ All validation tests pass. 464 tests, 0 failures.
   - Added `PositionManager::arm_position_with_policy` as the explicit-policy ARM path.
   - Kept `PositionManager::arm_position` as a default-policy compatibility wrapper.
   - `EntryPolicyResolved` is emitted alongside `PositionArmed` at ARM time.
-  - `ArmRequest` in `v2/robsond/src/api.rs` accepts optional `entry_policy.mode` and `entry_policy.approval`.
+  - `ArmRequest` in `robsond/src/api.rs` accepts optional `entry_policy.mode` and `entry_policy.approval`.
   - Serde defaults: omitted `entry_policy` or any sub-field resolves to `ConfirmedTrend + Automatic`.
   - `arm_handler` calls `arm_position_with_policy` with the parsed or default policy.
-  - Added `QueryEngine::check_approval_with_domain_policy` in `v2/robsond/src/query_engine.rs`:
+  - Added `QueryEngine::check_approval_with_domain_policy` in `robsond/src/query_engine.rs`:
     - `Automatic` → execution proceeds without human approval regardless of the notional-threshold adapter.
     - `HumanConfirmation` → execution always waits for operator approval regardless of the notional-threshold adapter.
-  - `handle_signal` in `v2/robsond/src/position_manager.rs` calls `check_approval_with_domain_policy` instead of `check_approval`; the notional-threshold adapter is no longer authoritative.
+  - `handle_signal` in `robsond/src/position_manager.rs` calls `check_approval_with_domain_policy` instead of `check_approval`; the notional-threshold adapter is no longer authoritative.
   - Added three focused Phase 4 tests:
     - `test_arm_position_with_explicit_policy_stores_policy`
     - `test_handle_signal_automatic_bypasses_notional_threshold`
@@ -151,19 +151,19 @@ All validation tests pass. 464 tests, 0 failures.
 
 ## Refactor Surface
 
-- `v2/robson-domain/src/value_objects.rs`
+- `robson-domain/src/value_objects.rs`
   - Add policy and strategy identifiers if they belong in pure domain.
-- `v2/robson-domain/src/entities.rs`
+- `robson-domain/src/entities.rs`
   - Add signal-related pure domain types if they should be reusable across engine and daemon.
-- `v2/robson-domain/src/events.rs`
+- `robson-domain/src/events.rs`
   - Add policy/strategy audit events for replay evidence.
-- `v2/robsond/src/detector.rs`
+- `robsond/src/detector.rs`
   - Replace implicit detector behavior with policy-backed strategy evaluation.
-- `v2/robsond/src/position_manager.rs`
+- `robsond/src/position_manager.rs`
   - Carry entry policy from arm request into detector config and entry query lifecycle.
-- `v2/robsond/src/api.rs`
+- `robsond/src/api.rs`
   - Add API shape for `entry_policy.mode` and `entry_policy.approval`.
-- `v2/robson-engine/src/lib.rs`
+- `robson-engine/src/lib.rs`
   - Keep execution decision and sizing behind mandatory risk controls; avoid embedding opportunity detection logic here.
 
 ## Next Actions

@@ -36,7 +36,7 @@ decisions, sizing, Risk Engine, or TechnicalStopDistance.
 - [ ] Re-read Implementation Guide (Step 1-8, verification commands)
 
 ### Code Re-Validation (Before Edit)
-- [ ] Locate `v3/robson-domain/src/entities.rs` — read current structure
+- [ ] Locate `robson-domain/src/entities.rs` — read current structure
 - [ ] Locate `TechnicalStopAnalysis` struct — confirm current fields
 - [ ] Locate `TechnicalStopAnalysisAudit` struct — confirm current fields
 - [ ] Locate `DetectorSignal` struct — confirm current structure
@@ -55,7 +55,7 @@ decisions, sizing, Risk Engine, or TechnicalStopDistance.
   - If hypothesis wrong: STOP, update checklist, re-authorize
 
 - [ ] **HYPOTHESIS**: No existing code depends on exact `TechnicalStopAnalysisAudit` shape
-  - Action: `grep -r "TechnicalStopAnalysisAudit {" v3/ --include="*.rs"`
+  - Action: `grep -r "TechnicalStopAnalysisAudit {" . --include="*.rs"`
   - If matches found in consumers: STOP, assess backward compat
 
 ---
@@ -89,29 +89,29 @@ This slice MUST NOT:
 
 | File | Purpose | Change Type | Confidence |
 |------|---------|-------------|------------|
-| `v3/robson-domain/src/entities.rs` | Add StopAnchor, StopQuality, AnchorType enums | Additive types | Medium (revalidation required) |
-| `v3/robson-domain/src/entities.rs` | Extend TechnicalStopAnalysisAudit | Additive optional fields | Medium (revalidation required) |
+| `robson-domain/src/entities.rs` | Add StopAnchor, StopQuality, AnchorType enums | Additive types | Medium (revalidation required) |
+| `robson-domain/src/entities.rs` | Extend TechnicalStopAnalysisAudit | Additive optional fields | Medium (revalidation required) |
 
 **Files NOT to touch in Slice 001:**
-- `v3/robson-engine/src/technical_stop_analyzer.rs` — NO CHANGE
-- `v3/robson-engine/src/signal_strategy.rs` — NO CHANGE
-- `v3/robson-engine/src/risk.rs` — NO CHANGE
-- `v3/robson-domain/src/policy.rs` — NO CHANGE
-- `v3/robsond/src/detector.rs` — NO CHANGE (Slice 002)
-- `v3/robson-store/src/*` — NO CHANGE
-- `v3/robson-projector/src/*` — NO CHANGE
+- `robson-engine/src/technical_stop_analyzer.rs` — NO CHANGE
+- `robson-engine/src/signal_strategy.rs` — NO CHANGE
+- `robson-engine/src/risk.rs` — NO CHANGE
+- `robson-domain/src/policy.rs` — NO CHANGE
+- `robsond/src/detector.rs` — NO CHANGE (Slice 002)
+- `robson-store/src/*` — NO CHANGE
+- `robson-projector/src/*` — NO CHANGE
 
 **Revalidation Action Required:**
 Before editing ANY file, run:
 ```bash
 # Confirm file exists and is readable
-ls -la v3/robson-domain/src/entities.rs
+ls -la robson-domain/src/entities.rs
 
 # Read current structure
-head -100 v3/robson-domain/src/entities.rs
+head -100 robson-domain/src/entities.rs
 
 # Search for existing uses
-grep -r "TechnicalStopAnalysisAudit" v3/ --include="*.rs"
+grep -r "TechnicalStopAnalysisAudit" . --include="*.rs"
 ```
 
 If findings contradict hypothesis: **STOP**, update checklist, request re-authorization.
@@ -153,13 +153,13 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all
 
 # Verify no boost application
-grep -r "boost.*apply\|boosted_score.*authorization" v3/ --include="*.rs" || echo "OK"
+grep -r "boost.*apply\|boosted_score.*authorization" . --include="*.rs" || echo "OK"
 
 # Verify no exceptional flag enabled
-grep -r "STOP_QUALITY_EXCEPTIONAL.*true\|exceptional_enabled.*=.*true" v3/ --include="*.rs" || echo "OK"
+grep -r "STOP_QUALITY_EXCEPTIONAL.*true\|exceptional_enabled.*=.*true" . --include="*.rs" || echo "OK"
 
 # Verify no v3 revalidation
-grep -r "revalidate.*v3\|rewrite.*entry.*thesis" v3/ --include="*.rs" || echo "OK"
+grep -r "revalidate.*v3\|rewrite.*entry.*thesis" . --include="*.rs" || echo "OK"
 ```
 
 ### Expected Test Results
@@ -182,20 +182,20 @@ grep -r "revalidate.*v3\|rewrite.*entry.*thesis" v3/ --include="*.rs" || echo "O
 ### Step 1: Read Before Edit
 ```bash
 # Read entities.rs structure
-head -200 v3/robson-domain/src/entities.rs
+head -200 robson-domain/src/entities.rs
 
 # Find TechnicalStopAnalysisAudit location
-grep -n "pub struct TechnicalStopAnalysisAudit" v3/robson-domain/src/entities.rs
+grep -n "pub struct TechnicalStopAnalysisAudit" robson-domain/src/entities.rs
 
 # Read surrounding context
-sed -n '1,50p' v3/robson-domain/src/entities.rs  # Check imports
+sed -n '1,50p' robson-domain/src/entities.rs  # Check imports
 ```
 
 **STOP HERE.** Show findings, request authorization to proceed.
 
 ### Step 2: Add New Types (Entities Only)
 ```rust
-// Add to v3/robson-domain/src/entities.rs
+// Add to robson-domain/src/entities.rs
 // Location: After existing type definitions, before impl blocks
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -321,7 +321,7 @@ cargo test --all
 ### If Step Fails
 1. Identify which step failed
 2. Do NOT commit partial work
-3. Reset working tree: `git restore v3/robson-domain/src/entities.rs`
+3. Reset working tree: `git restore robson-domain/src/entities.rs`
 4. Verify clean: `git status --short`
 5. Analyze failure, update checklist, re-authorize
 

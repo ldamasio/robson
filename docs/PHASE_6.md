@@ -497,9 +497,9 @@ cargo clippy -p robsond --all-targets -D warnings
 
 ### Source Code
 
-- `v2/robsond/src/detector.rs` - DetectorTask implementation
-- `v2/robsond/src/position_manager.rs` - Position Manager with detector lifecycle
-- `v2/robsond/src/daemon.rs` - Daemon with shutdown wire-up
+- `robsond/src/detector.rs` - DetectorTask implementation
+- `robsond/src/position_manager.rs` - Position Manager with detector lifecycle
+- `robsond/src/daemon.rs` - Daemon with shutdown wire-up
 
 ---
 
