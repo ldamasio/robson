@@ -2,214 +2,172 @@
 
 [![Backend Tests](https://github.com/ldamasio/robson/actions/workflows/backend-tests.yml/badge.svg)](https://github.com/ldamasio/robson/actions/workflows/backend-tests.yml)
 
-Robson is an execution and risk management engine designed for leveraged cryptocurrency markets. It is not a trading bot. It does not generate signals, predict prices, or optimize entries.
+Robson is an execution and risk management engine for leveraged cryptocurrency markets. It is not an autonomous trading bot. It does not decide what to trade, predict prices, or scan for opportunities.
 
-Robson is concerned with what happens **after** a trading decision is made: how orders are executed, how risk is enforced, how positions are managed through their lifecycle, and how failures are handled safely under volatile conditions.
+Robson is concerned with what happens **after** a trading decision is made: position sizing from chart-derived stops, governed order execution, lifecycle management through entry to settlement, and safe failure handling under volatile conditions.
 
-The system provides a multi-tenant runtime with deterministic execution semantics, explicit risk controls, full auditability, and a clear separation between signal interpretation and order execution.
+The system provides a single-operator runtime with a slot-based monthly risk model, deterministic execution semantics, and full auditability at every state transition.
 
-## AI-First Repository Rules
+## Risk Model at a Glance
 
-Canonical AI-first repository instructions live in [AGENTS.md](AGENTS.md).
+- **Monthly budget**: 4% of `capital_base` — hard limit enforced by a circuit breaker
+- **Per-trade risk**: 1% of `capital_base` (derived from position size, never set directly)
+- **Position sizing**: `size = (capital_base × 1%) / technical_stop_distance`
+- **Technical stop**: always from chart analysis (second S/R level, 15m timeframe) — never a percentage of entry price
+- **Slot capacity**: 4 concurrent positions maximum
 
-Vendor-specific files such as [CLAUDE.md](CLAUDE.md) are compatibility adapters and should remain thin.
+`capital_base` is set once at month start as a pessimistic snapshot: `wallet_balance − carried_risk(Entering + Active + Armed)`. It is immutable for the duration of the month.
+
+## Position Lifecycle
+
+```
+Armed → Entering → Active → Exiting → Closed
+  └─ Cancelled (disarmed before entry)
+  └─ Error (unrecoverable, requires operator action)
+```
+
+The operator **arms** a position by specifying a symbol, direction (Long/Short), and an entry mode. Robson's detector then monitors the market and fires an entry signal when the chosen condition is met. The signal is routed through the query engine and risk gate before any order reaches the exchange.
+
+**Entry modes** (what triggers the entry signal):
+- `confirmed_trend` — SMA crossover signal (default)
+- `confirmed_reversal` — reversal candlestick pattern
+- `confirmed_key_level` — key level breakout
+- `immediate` — operator injects signal manually via API
+
+**Approval modes** (whether human confirmation is required):
+- `automatic` — entry proceeds without operator action (default)
+- `human_confirmation` — operator must approve via dashboard before the order is placed
 
 ## Why Robson Exists
 
 Most open-source trading systems conflate signal generation with execution. The result is software where risk management is an afterthought bolted onto an indicator library.
 
-Robson inverts this. The execution and risk layers are the primary concern. Signal interpretation exists as an input boundary, not as the core of the system.
+Robson inverts this. The execution and risk layers are the primary concern. The operator makes the trading decision — Robson executes it deterministically, sizes it correctly, and enforces the stop.
 
-This design reflects a simple observation: in leveraged markets, **how** you execute matters more than **what** you execute. A sound signal with poor execution, missing stop logic, or uncontrolled position sizing will lose capital. Robson exists to make the execution path deterministic, auditable, and safe by default.
+In leveraged markets, **how** you execute matters more than **what** you execute. A sound signal with poor execution, missing stop logic, or uncontrolled position sizing will lose capital. Robson exists to make the execution path deterministic, auditable, and safe by default.
 
 ## Architecture
 
-The system follows a **Hexagonal Architecture (Ports & Adapters)** within a Django monolith, with clear domain boundaries between execution, risk, and external integrations.
+The canonical runtime is written in Rust and lives under `v3/`. The SvelteKit operations dashboard lives under `apps/frontend/`.
 
 ```
+v3/
+  robson-domain/       # Pure domain logic — no external dependencies
+  robson-engine/       # Decision engine (risk calculations, position sizing)
+  robson-exec/         # Execution layer (port definitions, orchestration)
+  robson-connectors/   # Exchange adapters (Binance Futures)
+  robson-store/        # PostgreSQL persistence (SQLx)
+  robsond/             # Runtime daemon (Axum HTTP API, control loop)
+  robson-sim/          # Backtesting and simulation
+  cli/                 # Operator CLI (Bun / TypeScript)
+
 apps/
-  backend/
-    monolith/
-      api/
-        application/      # Hexagonal core (ports, use cases, adapters)
-        models/           # Domain models and state persistence
-        views/            # REST API surface
-        tests/            # Test suite
-  frontend/               # Operations dashboard (React/Vite)
-cli/                      # Execution CLI (Go + C router)
-main.c                    # CLI entrypoint (C router)
-infra/                    # Terraform, Ansible, K8s, GitOps, Observability, DB
-docs/                     # ADRs, architecture, developer guides
+  frontend/            # SvelteKit operations dashboard
+
+docs/
+  adr/                 # Architecture Decision Records
+  architecture/        # System specs, migration plans, v4 backlog
+  policies/            # Risk and reconciliation policies
+  runbooks/            # Operational procedures
 ```
 
 ### Core Subsystems
 
-**Execution Engine** — Manages the full order lifecycle: plan creation, pre-execution validation, dry-run simulation, and live execution. All state transitions are explicit and auditable. The engine enforces a strict `PLAN -> VALIDATE -> EXECUTE` pipeline that prevents unvalidated orders from reaching the exchange.
+**Execution Engine** — Manages the full position lifecycle through explicit state transitions. Every transition is governed by the query engine and produces an immutable audit event. No implicit side effects.
 
-**Risk Engine** — Enforces position-level and portfolio-level constraints before and during execution. This includes market stop exits, liquidation distance checks, maximum position sizing, and controlled teardown of positions that violate risk parameters. Every exit carries an explicit reason code.
+**Risk Engine** — Enforces per-position and portfolio-level constraints before and during execution. Position sizing is derived from the Golden Rule. Every exit carries a typed reason code.
 
-**Signal Layer** — An input boundary, not a decision-maker. Robson accepts signals (pattern detections, external triggers, manual commands) and routes them through validation and risk checks before any execution occurs. The signal layer includes a deterministic, idempotent pattern detection engine (Hammer, Inverted Hammer, Bullish/Bearish Engulfing, Morning Star, Head & Shoulders, Inverted H&S) that operates as a diagnostic tool, not an autonomous trading agent.
+**Detector** — Monitors market conditions for the entry mode chosen at ARM time. Fires a single entry signal when conditions are met. It is a governed input boundary — signals do not bypass the risk gate.
 
-**Event and State System** — All position state transitions, risk events, execution outcomes, and external flows (deposits, withdrawals) are recorded as an append-only audit trail. Portfolio valuation is tracked in BTC terms to reflect actual purchasing power independent of fiat inflation.
+**Reconciliation Worker** — Continuously verifies that every open position on the Binance account traces to a `robsond`-authored entry. Untracked positions are automatically closed. This invariant is non-negotiable (ADR-0022).
 
-**API and Multi-Tenant Layer** — A REST API provides programmatic access to execution plans, portfolio state, and risk parameters. The system supports multiple isolated tenants with per-client data boundaries.
+**Query Engine** — Every state transition passes through a lifecycle-tracked `ExecutionQuery`: `Accepted → Processing → RiskChecked → Acting → Completed / Denied / Failed`. Denials are governed outcomes, not errors.
 
-### Determinism and Traceability
+**Event Stream** — All domain events are persisted and broadcast via SSE. The dashboard updates in real time.
 
-Every execution path through the system produces a traceable sequence of events: plan creation, validation result, risk check outcome, execution attempt, and final state. There are no implicit side effects. The same inputs under the same market conditions produce the same execution behavior.
-
-## Risk Management
-
-Risk is not a feature of Robson. It is the architecture.
-
-**Market Stop Exits** — Positions carry explicit stop parameters. When market conditions breach these thresholds, the system initiates controlled exits without waiting for external signals.
-
-**Liquidation Protection** — For leveraged positions, the system monitors liquidation distance and enforces minimum margin requirements. Positions approaching liquidation thresholds are flagged or closed before the exchange liquidation engine intervenes.
-
-**Explicit Exit Reasons** — Every closed position carries a typed exit reason (stop hit, risk limit, manual close, validation failure, timeout). There are no silent exits.
-
-**Controlled Position Lifecycle** — Positions move through defined states with validated transitions. A position cannot be modified without passing through the risk layer. Orphaned or inconsistent positions are detected and surfaced.
-
-**Dry-Run by Default** — The execution pipeline defaults to simulation mode. Live execution requires explicit flags (`--live --acknowledge-risk`) and a prior passing validation. This makes it structurally difficult to execute unintended orders.
-
-## Observability
-
-**Event Tracking** — All system events (order submissions, risk checks, state transitions, external sync operations) are recorded with timestamps, context, and causality links.
-
-**State Transitions** — Position and order state changes are logged as discrete events, enabling reconstruction of the full lifecycle of any position at any point in time.
-
-**Portfolio Audit Trail** — External capital flows (deposits, withdrawals) are synchronized from the exchange and recorded. Portfolio valuation history is maintained for forensic analysis.
-
-**Debugging** — The `PLAN -> VALIDATE -> EXECUTE` pipeline produces structured output at each stage, making it possible to diagnose failures without reproducing market conditions.
-
-### REST API
+## API
 
 ```
-GET /api/portfolio/btc/total/              # Current portfolio value (BTC)
-GET /api/portfolio/btc/profit/             # Profit since inception (BTC)
-GET /api/portfolio/btc/history/            # Historical valuation series
-GET /api/portfolio/deposits-withdrawals/   # External capital flows
+GET  /health                          # Health check
+GET  /status                          # Positions, slots, monthly risk state
+GET  /positions?month=YYYY-MM         # Monthly position history
+GET  /positions/{id}                  # Single position detail
+POST /positions                       # Arm a new position
+POST /positions/{id}/signal           # Inject entry signal (immediate mode)
+DEL  /positions/{id}                  # Cancel Armed / close Active position
+POST /queries/{id}/approve            # Approve a pending human-confirmation query
+GET  /monthly-halt                    # Monthly halt status
+POST /monthly-halt                    # Trigger halt manually (kill switch)
+POST /panic                           # Emergency close all open positions
+GET  /safety/status                   # Reconciliation worker status
+GET  /events                          # SSE event stream (bearer token via query param)
 ```
-
-### CLI
-
-```bash
-# Execution pipeline
-robson plan buy BTCUSDT 0.001 --limit 50000
-robson validate <plan-id> --client-id 1 --strategy-id 5
-robson execute <plan-id> --client-id 1                          # dry-run (default)
-robson execute <plan-id> --client-id 1 --live --acknowledge-risk  # live
-
-# Pattern detection (diagnostic)
-python manage.py detect_patterns BTCUSDT 15m --all
-python manage.py detect_patterns BTCUSDT 1h --candlestick
-python manage.py detect_patterns BTCUSDT 4h --chart
-
-# Portfolio state
-python manage.py portfolio_btc --profit
-python manage.py sync_deposits --days-back 90
-```
-
-### CLI Architecture
-
-```
-robson (C router)
-  └─> robson-go (Go + Cobra)
-       └─> python manage.py {validate_plan,execute_plan} (Django)
-```
-
-The CLI is a thin routing layer. All business logic, risk validation, and execution semantics remain in the application core.
-
-## Positioning
-
-**Robson is not a trading bot.**
-
-It does not tell you what to buy. It does not scan for opportunities. It does not promise returns.
-
-Robson is:
-
-- An **execution system** that manages the lifecycle of orders from plan to settlement
-- A **risk-aware runtime** that enforces safety invariants on every position
-- An **experimental platform** for building and testing financial execution infrastructure
-
-It is designed for engineers and researchers who need a controlled, auditable environment for studying execution behavior in leveraged markets.
 
 ## Development
 
 ### Prerequisites
 
+- Rust stable + nightly (nightly required for `rustfmt`)
+- PostgreSQL
+- [pnpm](https://pnpm.io) — frontend (`apps/frontend/`)
+- [Bun](https://bun.sh) — operator CLI (`v3/cli/`)
+- [`just`](https://just.systems) — task runner
+
+### Backend (Rust)
+
 ```bash
-git clone https://github.com/ldamasio/robson.git
+cd v3
+
+# Build
+cargo build
+
+# Unit and in-memory tests (no database needed)
+cargo test --all
+
+# Format (nightly rustfmt)
+cargo +nightly fmt --all
+
+# Lint
+cargo clippy --all-targets -- -D warnings
+
+# PostgreSQL integration tests (requires DATABASE_URL)
+just v2-db-up        # start local database container
+just v2-test-pg      # run integration tests against real DB
 ```
 
-### Backend
-
-```bash
-cd apps/backend/monolith/
-cp .env.development.example .env
-python -m venv .venv
-source .venv/bin/activate
-pip install --upgrade pip
-pip install -r requirements.txt
-export DJANGO_SETTINGS_MODULE=backend.settings
-
-# Database
-cd .. && make dev-db-up && cd monolith
-./bin/dj makemigrations api
-./bin/dj migrate
-./bin/dj test
-./bin/dj runserver
-```
-
-### Frontend
+### Frontend (SvelteKit)
 
 ```bash
 cd apps/frontend
-nvm use 14
-npm i
-npm start
+pnpm install
+pnpm dev             # development server
+pnpm check           # type check (svelte-check + tsc)
+pnpm build           # production build
 ```
 
-### Build CLI
+### CLI (Bun)
 
 ```bash
-make build-cli
-make test-cli
-make install-cli    # optional: install to system PATH
+cd v3/cli
+bun install
+bun run dev          # run CLI in development mode
+bun test             # run tests
 ```
 
-### Task Runner
+### Environment
 
-Install [just](https://just.systems) for daily development tasks:
-
-```bash
-just --list         # see all tasks
-just setup          # first-time setup
-just db-up          # start database
-just db-migrate     # run migrations
-just test           # run all tests
-just dev-backend    # start backend server
-just dev-frontend   # start frontend server
-just info           # environment info
-```
+Copy `.env.example` and configure `DATABASE_URL` and exchange credentials. The daemon reads configuration from environment variables and a `robsond.toml` file.
 
 ## Deployment
 
-Production deployments are performed via GitOps (GitHub Actions + ArgoCD + k3s) with Traefik ingress and cert-manager-managed TLS. Shared infrastructure automation belongs outside this repository; this repository focuses on the Robson application.
+Production deployments are performed via GitOps (GitHub Actions + ArgoCD + k3s) with Traefik ingress and cert-manager-managed TLS. Infrastructure automation is managed separately in `rbx-infra`.
 
-The `./bin/dj` script and `docker-compose.dev.yml` are for local development only.
+See `docs/runbooks/` for deployment and operational procedures.
 
-See `docs/infra/K3S-CLUSTER-GUIDE.md` and `docs/runbooks/argocd-initial-setup.md` for deployment details.
+## AI-First Repository Rules
 
-## Contributing
-
-Robson is open source. Contributions are welcome.
-
-- `docs/DEVELOPER.md` — development setup and workflow
-- `docs/STYLE_GUIDE.md` — code conventions
-- `docs/ARCHITECTURE.md` — system design
-- `docs/COMMAND-RUNNERS.md` — CLI tool guidelines
+Canonical AI-first instructions live in [AGENTS.md](AGENTS.md). Vendor-specific files such as [CLAUDE.md](CLAUDE.md) are compatibility adapters and must remain thin.
 
 ## License
 
-Open source. See repository for license details.
+Open source. See [LICENSE](LICENSE) for details.
