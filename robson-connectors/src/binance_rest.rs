@@ -168,8 +168,10 @@ impl BinanceRestClient {
                 .map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
 
         let status = response.status();
-        let body =
-            response.text().await.map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+        let body = timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), response.text())
+            .await
+            .map_err(|_| BinanceRestError::Timeout)?
+            .map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
 
         if !status.is_success() {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
@@ -199,8 +201,10 @@ impl BinanceRestClient {
         .map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
 
         let status = response.status();
-        let body =
-            response.text().await.map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+        let body = timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), response.text())
+            .await
+            .map_err(|_| BinanceRestError::Timeout)?
+            .map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
 
         if !status.is_success() {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
@@ -230,8 +234,10 @@ impl BinanceRestClient {
         .map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
 
         let status = response.status();
-        let body =
-            response.text().await.map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+        let body = timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), response.text())
+            .await
+            .map_err(|_| BinanceRestError::Timeout)?
+            .map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
 
         if !status.is_success() {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
@@ -261,8 +267,10 @@ impl BinanceRestClient {
         .map_err(|e| BinanceRestError::RequestFailed(e.to_string()))?;
 
         let status = response.status();
-        let body =
-            response.text().await.map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+        let body = timeout(Duration::from_secs(REQUEST_TIMEOUT_SECS), response.text())
+            .await
+            .map_err(|_| BinanceRestError::Timeout)?
+            .map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
 
         if !status.is_success() {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
