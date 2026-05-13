@@ -1,243 +1,493 @@
-# Robson Documentation Index
+# Robson v2 Documentation Index
 
-Central navigation hub for all Robson documentation.
-
----
-
-## Quick Start
-
-**New to Robson v3?** Start here:
-
-1. **[README.md](../README.md)** - Project overview and installation
-2. **[onboarding/DEVELOPER-QUICKSTART.md](onboarding/DEVELOPER-QUICKSTART.md)** - Clone to first PR
-3. **[architecture/v3-runtime-spec.md](architecture/v3-runtime-spec.md)** - Robsond runtime architecture
-4. **[../AGENTS.md](../AGENTS.md)** - Repository-wide rules (canonical)
-
-**For AI Agents?** Start here:
-
-1. **[../AGENTS.md](../AGENTS.md)** - Repository-wide AI instructions (canonical)
-2. **[../CLAUDE.md](../CLAUDE.md)** - Claude Code adapter
-3. **[AI_WORKFLOW.md](AI_WORKFLOW.md)** - AI collaboration guidelines
+**Version**: 2.0.0-alpha
+**Last Updated**: 2026-01-12
 
 ---
 
-## Documentation Structure
+## Quick Navigation
+
+
+---
+
+## Reading Order
+
+### For Product/Business
+
+1. Start: [ARCHITECTURE.md](./ARCHITECTURE.md) - Executive Summary
+2. Read: [DOMAIN.md](./DOMAIN.md) - Core Concepts section
+3. Try: [CLI.md](./CLI.md) - Examples section
+
+**Time**: 30 minutes
+
+---
+
+### For Engineering (Architecture Review)
+
+1. [ARCHITECTURE.md](./ARCHITECTURE.md) - Full document
+2. [RELIABILITY.md](./RELIABILITY.md) - Full document
+3. [DOMAIN.md](./DOMAIN.md) - Full document
+
+**Time**: 2 hours
+
+**Key Sections**:
+- Architecture Decision Records (ADRs)
+- Failure mode analysis
+- State machine transitions
+- Position sizing golden rule
+
+---
+
+### For Implementation (Developers)
+
+1. [EXECUTION-PLAN.md](./EXECUTION-PLAN.md) - Review all phases
+2. [PROMPT-PACK.md](./PROMPT-PACK.md) - Execute prompts sequentially
+3. Reference: [DOMAIN.md](./DOMAIN.md) - When implementing business logic
+4. Reference: [RELIABILITY.md](./RELIABILITY.md) - When implementing storage/reconciliation
+
+**Time**: Work in progress (4-6 weeks implementation)
+
+---
+
+## Document Summaries
+
+### [ARCHITECTURE.md](./ARCHITECTURE.md)
+
+**Purpose**: High-level system design
+
+**Key Sections**:
+- System overview diagram
+- Component architecture (7 Rust crates)
+- Data flow (happy path + failure scenarios)
+- State machine
+- Technology stack decisions
+- Why Rust? Why Bun? Why Postgres?
+
+**For**: Architects, senior engineers, product leads
+
+---
+
+### [RELIABILITY.md](./RELIABILITY.md)
+
+**Purpose**: Production-grade reliability mechanisms
+
+**Key Sections**:
+- Failure mode analysis (pod crash, network partition, exchange downtime, etc.)
+- Leader election via Postgres advisory locks
+- Reconciliation process (on startup, after reconnect)
+- Idempotency guarantees (intent journal, WAL)
+- Degraded mode (safe fallback)
+- Insurance stop strategy (ADR-001)
+- Observability (logs, metrics, alerts)
+
+**For**: SREs, DevOps, senior engineers
+
+**Critical Topics**:
+- How we prevent split-brain
+- How we survive daemon crashes
+- How we handle exchange downtime
+- Source of truth: always the exchange
+
+---
+
+### [DOMAIN.md](./DOMAIN.md)
+
+**Purpose**: Business logic and domain rules
+
+**Key Sections**:
+- Core concepts ("Palma da Mão", user-initiated/system-managed)
+- Entities (Position, Order, Trade)
+- Value objects (Price, Quantity, Symbol, PalmaDaMao, etc.)
+- State machine (Armed → Entering → Active → Exiting → Closed)
+- **Position sizing golden rule** (CRITICAL)
+- Risk management rules
+- Events for event sourcing
+
+**For**: All developers, product team
+
+**Golden Rule**:
+```
+Position Size = (Capital × Risk %) / Palma Distance
+```
+Where Palma = |Entry - Technical Stop Loss|
+
+**Critical Principle**: Position size is DERIVED from technical stop, NOT chosen arbitrarily.
+
+---
+
+### [CLI.md](./CLI.md)
+
+**Purpose**: User-facing command reference
+
+**Key Sections**:
+- All CLI commands (arm, disarm, status, panic)
+- JSON output schemas (for automation)
+- Examples (basic workflow, automation scripts, monitoring)
+- Configuration (env vars, config file)
+- Troubleshooting
+
+**For**: Users, automation engineers, QA
+
+**Most Used Commands**:
+```bash
+robson arm BTCUSDT --strategy all-in
+robson status --watch
+robson panic --confirm
+```
+
+---
+
+### [SMOKE-TEST.md](./SMOKE-TEST.md)
+
+**Purpose**: Operational smoke test for MVP validation
+
+**Key Sections**:
+- Prerequisites (Rust, Bun only)
+- Copy/paste test cases for all CLI commands
+- Runtime invariants checklist (leverage, margin safety, sizing, etc.)
+- Troubleshooting guide (5+ common issues)
+
+**For**: QA, developers, anyone validating the MVP locally
+
+**Quick Start**:
+```bash
+# Start daemon
+cargo run -p robsond &
+
+# Run smoke test
+# See docs/SMOKE-TEST.md for full test suite
+bun run dev arm BTCUSDT --capital 1000 --risk 1 --side long
+```
+
+---
+
+### [EXECUTION-PLAN.md](./EXECUTION-PLAN.md)
+
+**Purpose**: Step-by-step implementation roadmap
+
+**Key Sections**:
+- 10 phases from bootstrap to production
+- Small, measurable steps with acceptance criteria
+- Validation commands for each step
+- Estimated LOC and timeline
+
+**For**: Implementation team, project managers
+
+**Phases**:
+- **Phase 0**: Bootstrap (workspace, CLI skeleton) - ✅ DONE
+- **Phase 1**: Domain types (pure logic)
+- **Phase 2**: Engine (decision logic)
+- **Phase 3**: Storage (PostgreSQL)
+- **Phase 4**: Execution (idempotency)
+- **Phase 5**: Daemon (runtime)
+- **Phase 6**: CLI integration
+- **Phase 7**: E2E test (MVP milestone)
+- **Phase 8**: Detector interface
+- **Phase 9**: Real exchange connector
+- **Phase 10**: Production readiness
+
+---
+
+### [PROMPT-PACK.md](./PROMPT-PACK.md)
+
+**Purpose**: Agentic coding execution guide
+
+**Key Sections**:
+- 20+ copy-paste prompts
+- Sequential execution (Prompt 0.1 → 0.2 → 1.1 → 1.2 → ...)
+- Clear validation commands
+- Checklists for acceptance criteria
+
+**For**: AI assistants, developers using agentic tools
+
+**How to Use**:
+1. Copy prompt (e.g., Prompt 1.1: Implement Value Objects)
+2. Paste to AI assistant or execute manually
+3. Run validation commands
+4. Check off checklist
+5. Move to next prompt
+
+**Example Prompt**:
+```
+Prompt 1.1: Implement Value Objects
+
+Create value_objects.rs with: Price, Quantity, Symbol, Side, Leverage, PalmaDaMao
+
+Each must have:
+- Private inner field
+- new() constructor with validation
+- Result<Self, DomainError> return type
+
+Add tests for valid/invalid values.
+
+Validation: cargo test -p robson-domain
+
+Checklist:
+- [ ] All value objects implemented
+- [ ] Validation works
+- [ ] Tests pass (minimum 10 tests)
+```
+
+---
+
+## Architecture Decision Records (ADRs)
+
+### ADR-001: Dual-Stop Strategy (Insurance + Local)
+
+**File**: [RELIABILITY.md](./RELIABILITY.md#insurance-stop-optional)
+
+**Problem**: Daemon downtime during stop loss trigger = uncontrolled loss
+
+**Decision**: Place insurance stop on exchange as backup
+
+**Trade-offs**:
+- 🟢 Increased safety (worst-case loss capped)
+- 🔴 Increased complexity (two stop mechanisms)
+- 🟡 Risk of false trigger (mitigated with LIMIT orders)
+
+---
+
+### ADR-002: Postgres Advisory Locks for Leader Election
+
+**File**: [RELIABILITY.md](./RELIABILITY.md#leader-election)
+
+**Problem**: Need leader election for HA
+
+**Decision**: Use Postgres advisory locks + TTL table
+
+**Alternatives Considered**:
+- Kubernetes Lease API (separate system)
+- etcd/Consul (overkill)
+- Redis (less ACID)
+
+**Why Postgres**: Single source of truth, simpler deployment
+
+---
+
+### ADR-003: Event Sourcing with Snapshots
+
+**File**: [RELIABILITY.md](./RELIABILITY.md#event-sourcing-with-snapshots)
+
+**Problem**: How to reconstruct position state after failures?
+
+**Decision**: Append-only event log + periodic snapshots
+
+**Benefits**:
+- Complete audit trail
+- Can replay for debugging
+- Reconciliation after crashes
+
+---
+
+### ADR-0012: Event Sourcing with Postgres Event Log
+
+**File**: [adr/ADR-0012-event-sourcing.md](./adr/ADR-0012-event-sourcing.md)
+
+**Problem**: Audit trail, replay, reconciliation for trading decisions
+
+**Decision**: Postgres-based event sourcing (append-only event_log, projections, snapshots, S3 archival)
+
+**Why Postgres**: ACID, single DB, scale fits non-custodial volume; ParadeDB for search/vectors
+
+---
+
+### ADR-0013: CLI–Daemon IPC (UDS / Named Pipes)
+
+**File**: [adr/ADR-0013-cli-daemon-ipc.md](./adr/ADR-0013-cli-daemon-ipc.md)
+
+**Problem**: Atena CLI (Bun) ↔ Core (Rust) — avoid port binding, local-only, easy binary (Win/Linux/Mac)
+
+**Decision**: Local IPC — Unix Domain Sockets (Linux/macOS), named pipes (Windows); socket/pipe path configurable
+
+**Benefits**: No port, no firewall prompts; lower latency; aligns with “one easy binary” for end user
+
+**Alternatives considered**: HTTP local (current MVP), gRPC, stdio/in-process
+
+---
+
+## Key Concepts Reference
+
+### "Palma da Mão" (Palm of the Hand)
+
+**Definition**: Distance between entry price and technical stop loss
+
+**Why Universal?**:
+- Structural foundation for position sizing
+- Risk is ALWAYS defined by technical invalidation level
+- NOT arbitrary percentage
+
+**Example**:
+```
+Entry: $95,000
+Technical SL: $93,500
+Palma: $1,500 (1.58%)
+
+Position Size = ($10,000 × 1%) / $1,500 = 0.0666 BTC
+```
+
+**File**: [DOMAIN.md](./DOMAIN.md#palma-da-mão-technical-stop-distance)
+
+---
+
+### User-Initiated, System-Managed
+
+**Principle**: User arms → System decides → User confirms
+
+**What User Does**:
+- Choose symbol
+- Choose strategy
+- Choose capital allocation
+
+**What System Does**:
+- Calculate entry price (detector)
+- Calculate stop loss (technical analysis)
+- Calculate position size (golden rule)
+- Execute entry/exit (market orders)
+- Monitor SL/SG 24/7
+
+**File**: [DOMAIN.md](./DOMAIN.md#user-initiated-system-managed)
+
+---
+
+### State Machine
 
 ```
-docs/
-├── INDEX.md (you are here)          # Central navigation hub
-├── ARCHITECTURE.md                  # Architecture overview (legacy + v3)
-├── DEVELOPER.md                     # v1 developer guide (archived)
-├── AI_WORKFLOW.md                   # AI collaboration guidelines
-├── AGENTIC-TRADING.md               # Trading/agentic lifecycle philosophy
-├── LANGUAGE-POLICY.md               # English-only policy and rationale
-├── STYLE_GUIDE.md                   # Code style conventions (Python-era)
-├── technical-debt.md                # Central technical debt register
-├── ADRs.md                          # Architecture Decision Records index
-├── adr/                             # Architecture Decision Records
-│   ├── ADR-TEMPLATE.md
-│   ├── ADR-0001 to ADR-0034
-├── policies/                        # Organizational policies
-│   ├── PRODUCTION-DEPLOYMENT.md     # Production deployment integrity policy
-│   ├── UNTRACKED-POSITION-RECONCILIATION.md  # Robson-authored position invariant (ADR-0022)
-│   └── SYMBOL-AGNOSTIC-POLICIES.md  # Policies apply to every trading pair (ADR-0023)
-├── architecture/                    # Architecture documents
-│   ├── v3-migration-plan.md         # v2.5 → v3 migration plan
-│   ├── v3-runtime-spec.md           # v3 runtime specification
-│   ├── v3-query-query-engine.md     # Query engine design
-│   ├── v3-control-loop.md           # Control loop specification
-│   ├── v3-architectural-decisions.md # Architectural decisions log
-│   ├── v3-risk-engine-spec.md       # Risk engine specification
-│   ├── v3-tron-evaluation.md        # TRON/TRC-20 evaluation
-│   ├── INSTITUTIONAL_READINESS_REPORT_v2.md  # v2 institutional readiness snapshot
-│   ├── OPERATION-LIFECYCLE.md        # Operation status state machine
-│   ├── TRANSACTION-HIERARCHY.md      # Strategy → Operation → Movement hierarchy
-│   └── README.md
-├── quality/                         # Code quality tooling
-│   ├── README.md                    # Quality guide (pre-commit, SonarLint)
-│   └── sonarlint.md                 # SonarLint IDE setup
-├── specs/                           # Specifications (TDD/BDD)
-│   ├── README.md
-│   └── api/openapi.yaml             # REST API (OpenAPI 3.1)
-├── requirements/                    # Business requirements
-│   ├── README.md
-│   └── robson-*-requirements.md
-├── runbooks/                        # Operational procedures
-│   ├── README.md
-│   ├── val-001-testnet-e2e-validation.md  # VAL-001 E2E testnet validation
-│   ├── val-002-real-capital-activation.md  # VAL-002 real capital activation
-│   ├── argocd-initial-setup.md
-│   ├── ci-cd-image-tagging.md
-│   ├── deployment-checklist.md
-│   ├── deep-storage.md
-│   ├── frontend-deploy.md
-│   ├── FRONTEND-NGINX-TROUBLESHOOTING.md
-│   └── rabbitmq-operations.md
-├── implementation/                  # Implementation closeouts
-│   ├── 2026-04-27-mig-v3-12-monthly-state-persistence.md
-│   ├── AGENTIC-WORKFLOW-FRONTEND-IMPLEMENTATION.md
-│   ├── FE-P1-FRONTEND-MVP.md
-│   ├── GATE-4-OPERATION-CREATION.md
-│   └── entry-policy-strategy-engine.md
-├── infra/                           # Infrastructure documentation
-│   └── K3S-CLUSTER-GUIDE.md         # k3s cluster deployment guide
-├── k8s/frontend/                    # Frontend K8s manifests
-├── ops/                             # Operations documentation
-│   ├── GITOPS-GUIDE.md
-│   ├── OBSERVABILITY-HARDENED.md
-│   └── POST-MORTEM-2025-12-31-probe-redirect.md
-├── agents/                          # Agent session closeouts
-├── analysis/                        # Analysis documents
-├── audits/                          # Audit reports
-├── entry-gate/                      # Entry gate session logs
-├── history/                         # Legacy/archived docs
-│   ├── AI_FIRST_TRANSFORMATION.md
-│   ├── MIGRATION_PLAN.md
-│   └── monolith/MIGRATION_GUIDE.md
-├── operations/                      # Production operation logs
-├── plan/                            # Planning documents
-│   ├── README.md
-│   └── infra/README.md
-├── sessions/                        # Session closeout notes
-├── specs/                           # Feature specifications
-├── strategy/                        # Strategy documentation
-│   ├── HAND_SPAN_TRAILING_STOP.md
-│   ├── IRON_EXIT_PROTOCOL.md
-│   └── IMPLEMENTATION_SUMMARY.md (archived to archive/)
-├── onboarding/                      # Onboarding guides
-│   └── DEVELOPER-QUICKSTART.md
-└── archive/                         # Archived (superseded) docs
-    ├── ai-first/                    # ParadeDB/DeepSeek RAG (never built for v3)
-    ├── strategy/                    # Django pattern engine implementations
-    ├── guides/                      # Django migration guides
-    ├── market-context/              # Django market research
-    ├── plan/                        # Django-era planning docs and prompts
-    ├── testing/                     # Django-era test plans
-    ├── ops/                         # Portuguese Django observability
-    ├── features/                    # Django v1 features
-    └── ...                          # Individual archived files
+Armed → Entering → Active → Exiting → Closed
+         (or Error at any stage)
 ```
 
----
+**Valid Transitions**:
+- Armed → Entering: Detector signal received
+- Entering → Active: Entry order filled
+- Active → Exiting: SL/SG trigger or panic
+- Exiting → Closed: Exit order filled
 
-## Documentation by Role
+**Invalid Transitions**:
+- Armed → Active: Cannot skip entering
+- Active → Entering: Cannot re-enter
 
-### For Developers
-
-**Getting Started**:
-- [Developer Quickstart](onboarding/DEVELOPER-QUICKSTART.md) - Current onboarding
-- [Code Style Guide](STYLE_GUIDE.md) - Coding conventions
-- [Language Policy](LANGUAGE-POLICY.md) - English-only requirement
-- [Quality Tooling](quality/README.md) - Pre-commit, SonarLint
-
-**Architecture**:
-- [System Architecture](ARCHITECTURE.md) - Architecture overview
-- [ADRs Index](ADRs.md) - All architectural decisions
-- [Technical Debt Register](technical-debt.md) - Central list of known debt
-
-**Contributing**:
-- [CONTRIBUTING.md](../CONTRIBUTING.md) - Contribution guidelines
-
-### For Operations / SRE
-
-**Policies** (READ FIRST):
-- [Production Deployment Policy](policies/PRODUCTION-DEPLOYMENT.md) - GitOps-only deployments
-- [Untracked Position Reconciliation](policies/UNTRACKED-POSITION-RECONCILIATION.md) - ADR-0022
-- [Symbol-Agnostic Policies](policies/SYMBOL-AGNOSTIC-POLICIES.md) - ADR-0023
-
-**Deployment**:
-- [K3s Cluster Guide](infra/K3S-CLUSTER-GUIDE.md) - k3s deployment guide
-- [Deployment Checklist](runbooks/deployment-checklist.md) - Deployment procedures
-- [ArgoCD Setup](runbooks/argocd-initial-setup.md) - ArgoCD configuration
-- [CI/CD Image Tagging](runbooks/ci-cd-image-tagging.md) - Image versioning
-- [Technical Debt Register](technical-debt.md) - Production-relevant known debt
-
-**Infrastructure**:
-- [ADR-0011: GitOps Auto-Deploy](adr/ADR-0011-gitops-automatic-manifest-updates.md)
-
-### For AI Agents
-
-**Start Here**:
-- **[../AGENTS.md](../AGENTS.md)** - Repository-wide AI instructions (canonical)
-- **[../CLAUDE.md](../CLAUDE.md)** - Claude Code adapter
-- [AI Workflow](AI_WORKFLOW.md) - Collaboration guidelines
-- [Language Policy](LANGUAGE-POLICY.md) - English-only requirement
-
-**Context**:
-- [Architecture](ARCHITECTURE.md) - System design
-- [ADRs Index](ADRs.md) - All architectural decisions
-- [Specs](specs/README.md) - Feature specifications
-
-### For Traders / Users
-
-**Getting Started**:
-- [Position Sizing Golden Rule](requirements/POSITION-SIZING-GOLDEN-RULE.md) - How position sizes are calculated
-- [Technical Stop Documentation](requirements/technical-stop-requirements.md) - Technical stop-loss
+**File**: [DOMAIN.md](./DOMAIN.md#state-machine)
 
 ---
 
-## Documentation by Topic
+## Validation Checklist
 
-### Architecture
+### After Phase 7 (MVP)
 
-| Topic | Document |
-|-------|----------|
-| **High-Level Overview** | [ARCHITECTURE.md](ARCHITECTURE.md) |
-| **Robson v3 Migration** | [architecture/v3-migration-plan.md](architecture/v3-migration-plan.md) |
-| **Robson v3 Runtime** | [architecture/v3-runtime-spec.md](architecture/v3-runtime-spec.md) |
-| **Robson v3 Risk Engine** | [architecture/v3-risk-engine-spec.md](architecture/v3-risk-engine-spec.md) |
-| **Hexagonal Architecture** | [ADR-0002](adr/ADR-0002-hexagonal-architecture.md) |
-| **Transaction Hierarchy** | [architecture/TRANSACTION-HIERARCHY.md](architecture/TRANSACTION-HIERARCHY.md) |
-| **GitOps Auto-Deploy** | [ADR-0011](adr/ADR-0011-gitops-automatic-manifest-updates.md) |
-| **Production Integrity** | [ADR-0029](adr/ADR-0029-production-deployment-integrity.md) |
-| **Opportunity Detection vs Technical Stop** | [ADR-0021](adr/ADR-0021-opportunity-detection-vs-technical-stop-analysis.md) |
-| **Robson-Authored Position Invariant** | [ADR-0022](adr/ADR-0022-robson-authored-position-invariant.md) |
-| **Symbol-Agnostic Policy Invariant** | [ADR-0023](adr/ADR-0023-symbol-agnostic-policy-invariant.md) |
-| **Institutional Readiness (v2)** | [architecture/INSTITUTIONAL_READINESS_REPORT_v2.md](architecture/INSTITUTIONAL_READINESS_REPORT_v2.md) |
-| **TRON Evaluation** | [architecture/v3-tron-evaluation.md](architecture/v3-tron-evaluation.md) |
-
-### Operations
-
-| Topic | Document |
-|-------|----------|
-| **K3s Cluster Deployment** | [infra/K3S-CLUSTER-GUIDE.md](infra/K3S-CLUSTER-GUIDE.md) |
-| **ArgoCD Setup** | [runbooks/argocd-initial-setup.md](runbooks/argocd-initial-setup.md) |
-| **CI/CD & Image Tagging** | [runbooks/ci-cd-image-tagging.md](runbooks/ci-cd-image-tagging.md) |
-| **Deployment Checklist** | [runbooks/deployment-checklist.md](runbooks/deployment-checklist.md) |
-| **VAL-001 Testnet E2E** | [runbooks/val-001-testnet-e2e-validation.md](runbooks/val-001-testnet-e2e-validation.md) |
-| **VAL-002 Real Capital** | [runbooks/val-002-real-capital-activation.md](runbooks/val-002-real-capital-activation.md) |
-| **GitOps Guide** | [ops/GITOPS-GUIDE.md](ops/GITOPS-GUIDE.md) |
-| **Observability Hardened** | [ops/OBSERVABILITY-HARDENED.md](ops/OBSERVABILITY-HARDENED.md) |
-
-### API & Specs
-
-| Topic | Document |
-|-------|----------|
-| **REST API** | [specs/api/openapi.yaml](specs/api/openapi.yaml) |
-| **Spec-Driven Development** | [specs/README.md](specs/README.md) |
-| **Requirements** | [requirements/README.md](requirements/README.md) |
-
-### Policies & Governance
-
-| Topic | Document |
-|-------|----------|
-| **Production Deployment Policy** | [policies/PRODUCTION-DEPLOYMENT.md](policies/PRODUCTION-DEPLOYMENT.md) |
-| **Untracked Position Reconciliation** (ADR-0022) | [policies/UNTRACKED-POSITION-RECONCILIATION.md](policies/UNTRACKED-POSITION-RECONCILIATION.md) |
-| **Symbol-Agnostic Policies** (ADR-0023) | [policies/SYMBOL-AGNOSTIC-POLICIES.md](policies/SYMBOL-AGNOSTIC-POLICIES.md) |
-| **Language Policy** | [LANGUAGE-POLICY.md](LANGUAGE-POLICY.md) |
+- [ ] Workspace compiles: `cargo build --all`
+- [ ] Tests pass: `cargo test --all`
+- [ ] Clippy clean: `cargo clippy --all -- -D warnings`
+- [ ] Daemon runs: `cargo run -p robsond`
+- [ ] API responds: `curl http://localhost:8080/health/live`
+- [ ] CLI works: `cd cli && bun run dev status`
+- [ ] Can arm position via CLI
+- [ ] Position transitions through states
+- [ ] Events logged to database
+- [ ] Lease acquired successfully
+- [ ] **Smoke test passes**: See [SMOKE-TEST.md](./SMOKE-TEST.md)
 
 ---
 
-## Archive
+## Quick Links
 
-Superseded documentation is moved to `docs/archive/`. These files are kept for historical reference only and should not be used for current development. Key archived collections:
+### Code
 
-- `archive/ai-first/` — ParadeDB/DeepSeek RAG architecture (never built for v3)
-- `archive/plan/` — Django-era planning documents, prompts, and execution plans
-- `archive/strategy/` — Django pattern engine and trailing stop implementation summaries
-- `archive/guides/` — Django migration and event-sourcing guides
-- Individual archived files: `INITIAL-AUDIT.md`, `AUTH_FLOW.md`, `PRODUCTION_TRADING.md`, `STRATEGIES.md`, `STATIC-FILES-ARCHITECTURE.md`, etc.
+- [Rust Workspace](../../v2/Cargo.toml)
+- [Domain Crate](../../robson-domain/)
+- [Engine Crate](../../robson-engine/)
+- [Daemon](../../robsond/)
+- [CLI](../../cli/)
+
+### Docs
+
+- [Delivery Summary](../../v2/DELIVERY-SUMMARY.md)
+- [Project README](../../v2/README.md)
+- [CLI README](../../cli/README.md)
 
 ---
 
-**Last Updated**: 2026-04-27
+## FAQ
+
+### Q: Where should I start reading?
+
+**A**: Depends on your role:
+- **Product/Business**: ARCHITECTURE.md Executive Summary
+- **Engineering**: ARCHITECTURE.md → RELIABILITY.md → DOMAIN.md
+- **Implementation**: EXECUTION-PLAN.md → PROMPT-PACK.md
+
+---
+
+### Q: What's the difference between "Palma da Mão" and "stop distance"?
+
+**A**: They're the same thing. "Palma da Mão" (Palm of the Hand) is the business term. "Stop distance" is the technical term. It's the distance between entry and technical stop loss.
+
+---
+
+### Q: Why Rust instead of Python/Go?
+
+**A**:
+- **Safety**: No segfaults, no data races, catches errors at compile time
+- **Performance**: Low latency, predictable performance
+- **Correctness**: Type system enforces invariants
+- **Decimal math**: `rust_decimal` for precise financial calculations
+
+See: [ARCHITECTURE.md - Why Rust?](./ARCHITECTURE.md#why-rust-for-core)
+
+---
+
+### Q: How do we prevent duplicate orders?
+
+**A**: Intent journal with write-ahead log (WAL). Every order gets a unique intent_id. Before execution, we write to journal. On retry, we check journal first.
+
+See: [RELIABILITY.md - Idempotency](./RELIABILITY.md#idempotency)
+
+---
+
+### Q: What happens if the daemon crashes mid-trade?
+
+**A**:
+1. On restart, acquire lease
+2. Reconcile state with exchange
+3. If price passed SL during downtime → Close immediately (degraded mode)
+4. Resume normal operation
+
+See: [RELIABILITY.md - Pod Crash](./RELIABILITY.md#1-pod-crash-oomkill-panic-bug)
+
+---
+
+### Q: How do we prevent split-brain (two active traders)?
+
+**A**: Leader election via Postgres advisory locks. Only one daemon can hold lease per (account, symbol). Lease has TTL and requires heartbeat renewal.
+
+See: [RELIABILITY.md - Leader Election](./RELIABILITY.md#leader-election)
+
+---
+
+## Glossary
+
+| Term | Definition |
+|------|------------|
+| **Palma da Mão** | Distance between entry and technical stop loss |
+| **Armed** | Position waiting for detector signal |
+| **Entering** | Entry order placed, waiting for fill |
+| **Active** | Position open, monitoring SL/SG |
+| **Exiting** | Exit order placed, waiting for fill |
+| **Closed** | Position fully closed, PnL realized |
+| **Intent** | Write-ahead log entry for idempotency |
+| **Lease** | Lock for leader election (per account+symbol) |
+| **Reconciliation** | Process to sync local state with exchange |
+| **Degraded Mode** | Safe fallback when state mismatch detected |
+
+---
+
+## Status
+
+**Planning**: ✅ Complete
+**Skeleton**: ✅ Complete
+**Implementation**: ⏳ Ready to start
+**Production**: 🔜 4-6 weeks away
+
+---
+
+**Last Updated**: 2026-01-12
+**Next Action**: Execute Prompt 1.1 from PROMPT-PACK.md

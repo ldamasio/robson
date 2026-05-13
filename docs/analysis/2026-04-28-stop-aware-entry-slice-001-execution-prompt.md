@@ -57,7 +57,7 @@ Add types to domain layer. No flow changes yet.
 ### Objective
 
 **FIRST**: Validate current code structure and confirm that adding domain types to
-`v3/robson-domain/src/entities.rs` is the correct minimal first change.
+`robson-domain/src/entities.rs` is the correct minimal first change.
 
 **THEN**: If validated, add domain types for StopAnchor and StopQuality WITHOUT altering
 any runtime behavior.
@@ -108,7 +108,7 @@ cargo test --all 2>&1 | tail -20
 # Expected: tests pass
 
 # 1.5: Check for existing StopAnchor/StopQuality
-grep -r "StopAnchor\|StopQuality" v3/robson-domain/src/ --include="*.rs" || echo "NOT FOUND (expected)"
+grep -r "StopAnchor\|StopQuality" robson-domain/src/ --include="*.rs" || echo "NOT FOUND (expected)"
 # Expected: NOT FOUND
 ```
 
@@ -120,19 +120,19 @@ grep -r "StopAnchor\|StopQuality" v3/robson-domain/src/ --include="*.rs" || echo
 
 ```bash
 # 2.1: Read entities.rs structure
-head -100 v3/robson-domain/src/entities.rs
+head -100 robson-domain/src/entities.rs
 
 # 2.2: Find TechnicalStopAnalysisAudit
-grep -n "pub struct TechnicalStopAnalysisAudit" v3/robson-domain/src/entities.rs
+grep -n "pub struct TechnicalStopAnalysisAudit" robson-domain/src/entities.rs
 
 # 2.3: Read the audit struct definition
-sed -n '<found-line>,+20p' v3/robson-domain/src/entities.rs
+sed -n '<found-line>,+20p' robson-domain/src/entities.rs
 
 # 2.4: Check imports at top of file
-head -50 v3/robson-domain/src/entities.rs | grep "^use "
+head -50 robson-domain/src/entities.rs | grep "^use "
 
 # 2.5: Verify no existing uses that would break
-grep -r "TechnicalStopAnalysisAudit" v3/ --include="*.rs" | grep -v "test" | head -10
+grep -r "TechnicalStopAnalysisAudit" . --include="*.rs" | grep -v "test" | head -10
 ```
 
 **Report**: What you found. Current fields of TechnicalStopAnalysisAudit?
@@ -145,7 +145,7 @@ grep -r "TechnicalStopAnalysisAudit" v3/ --include="*.rs" | grep -v "test" | hea
 structure of `entities.rs` in Step 2, adapt this code to match the existing patterns,
 imports, and conventions. Do NOT copy-paste blindly.
 
-**Edit**: `v3/robson-domain/src/entities.rs`
+**Edit**: `robson-domain/src/entities.rs`
 
 **Location**: After existing type definitions, before impl blocks (confirm in Step 2).
 
@@ -235,7 +235,7 @@ cargo build 2>&1 | head -50
 
 ### Step 4: Extend TechnicalStopAnalysisAudit
 
-**Edit**: `v3/robson-domain/src/entities.rs`
+**Edit**: `robson-domain/src/entities.rs`
 
 **Find**: The existing `TechnicalStopAnalysisAudit` struct
 
@@ -289,13 +289,13 @@ cargo fmt --all --check
 cargo test --all 2>&1 | tail -30
 
 # 5.3: Verify no boost application
-grep -r "boost.*apply\|boosted_score.*authorization" v3/ --include="*.rs" || echo "OK: no boost application"
+grep -r "boost.*apply\|boosted_score.*authorization" . --include="*.rs" || echo "OK: no boost application"
 
 # 5.4: Verify no exceptional flag enabled
-grep -r "exceptional.*true\|STOP_QUALITY.*ENABLED.*true" v3/ --include="*.rs" || echo "OK: no exceptional flag"
+grep -r "exceptional.*true\|STOP_QUALITY.*ENABLED.*true" . --include="*.rs" || echo "OK: no exceptional flag"
 
 # 5.5: Verify no v3 revalidation
-grep -r "revalidate.*v3\|rewrite.*entry.*thesis" v3/ --include="*.rs" || echo "OK: no v3 revalidation"
+grep -r "revalidate.*v3\|rewrite.*entry.*thesis" . --include="*.rs" || echo "OK: no v3 revalidation"
 ```
 
 **Expected Results**:
@@ -311,14 +311,14 @@ grep -r "revalidate.*v3\|rewrite.*entry.*thesis" v3/ --include="*.rs" || echo "O
 
 ```bash
 # 6.1: Show diff
-git diff v3/robson-domain/src/entities.rs
+git diff robson-domain/src/entities.rs
 
 # 6.2: Diff stats
-git diff --stat v3/robson-domain/src/entities.rs
+git diff --stat robson-domain/src/entities.rs
 
 # 6.3: Check for unintended changes
 git status --short
-# Expected: only v3/robson-domain/src/entities.rs modified
+# Expected: only robson-domain/src/entities.rs modified
 ```
 
 **Report**: Summary of changes.
@@ -332,7 +332,7 @@ git status --short
 **If and ONLY IF all previous steps passed:**
 
 ```bash
-git add v3/robson-domain/src/entities.rs
+git add robson-domain/src/entities.rs
 
 git commit -m "feat(domain): add StopAnchor and StopQuality types (Slice 001)
 
@@ -389,7 +389,7 @@ git status --short
 1. **DO NOT commit** partial work
 2. Reset working tree:
    ```bash
-   git restore v3/robson-domain/src/entities.rs
+   git restore robson-domain/src/entities.rs
    ```
 3. Verify clean:
    ```bash
@@ -416,7 +416,7 @@ Slice 001 is COMPLETE when:
 - [ ] `cargo fmt --all --check` passes
 - [ ] `cargo test --all` passes (100%)
 - [ ] No grep warnings (boost application, exceptional flag, v3 revalidation)
-- [ ] Only `v3/robson-domain/src/entities.rs` modified
+- [ ] Only `robson-domain/src/entities.rs` modified
 - [ ] Clean commit with conventional commit message
 - [ ] Working tree clean after commit
 

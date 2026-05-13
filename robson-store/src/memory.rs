@@ -1,0 +1,1234 @@
+//! In-memory store implementation
+//!
+//! Used for testing and development without a database.
+//! Thread-safe using RwLock for concurrent access.
+
+use std::{
+    collections::HashMap,
+    sync::{
+        atomic::{AtomicI64, Ordering},
+        RwLock,
+    },
+};
+
+use async_trait::async_trait;
+use chrono::Datelike;
+use robson_domain::{Event, Order, OrderId, OrderStatus, Position, PositionId};
+use uuid::Uuid;
+
+use crate::{
+    error::StoreError,
+    repository::{EventRepository, OrderRepository, PositionRepository, Store},
+};
+
+/// In-memory store for testing
+pub struct MemoryStore {
+    positions: RwLock<HashMap<PositionId, Position>>,
+    orders: RwLock<HashMap<OrderId, Order>>,
+    events: RwLock<Vec<StoredEvent>>,
+    event_seq: AtomicI64,
+}
+
+/// Event with sequence number
+#[derive(Clone)]
+struct StoredEvent {
+    seq: i64,
+    event: Event,
+}
+
+impl MemoryStore {
+    /// Create a new empty in-memory store
+    pub fn new() -> Self {
+        Self {
+            positions: RwLock::new(HashMap::new()),
+            orders: RwLock::new(HashMap::new()),
+            events: RwLock::new(Vec::new()),
+            event_seq: AtomicI64::new(0),
+        }
+    }
+
+    /// Get the number of positions
+    pub fn position_count(&self) -> usize {
+        self.positions.read().unwrap().len()
+    }
+
+    /// Get the number of orders
+    pub fn order_count(&self) -> usize {
+        self.orders.read().unwrap().len()
+    }
+
+    /// Get the number of events
+    pub fn event_count(&self) -> usize {
+        self.events.read().unwrap().len()
+    }
+
+    /// Clear all data (useful for test setup)
+    pub fn clear(&self) {
+        self.positions.write().unwrap().clear();
+        self.orders.write().unwrap().clear();
+        self.events.write().unwrap().clear();
+        self.event_seq.store(0, Ordering::SeqCst);
+    }
+
+    /// Internal method to apply an event to the in-memory position projection.
+    ///
+    /// This is called by the Store trait's apply_event method.
+    /// Order is critical: append FIRST, apply AFTER.
+    ///
+    /// If apply fails, we fail-fast (error is ok).
+    /// The EventLog remains the source of truth for recovery.
+    fn apply_event_internal(&self, event: &Event) -> Result<(), StoreError> {
+        use robson_domain::{ExitReason, Position, PositionState, TechnicalStopDistance};
+
+        match event {
+            // PositionArmed: Create position in Armed state (initial projection entry)
+            Event::PositionArmed {
+                position_id,
+                account_id,
+                symbol,
+                side,
+                tech_stop_distance,
+                timestamp,
+            } => {
+                let mut positions = self.positions.write().unwrap();
+                // Idempotent: skip if already exists
+                if positions.contains_key(position_id) {
+                    return Ok(());
+                }
+                let mut position = Position::new(*account_id, symbol.clone(), *side);
+                position.id = *position_id;
+                position.tech_stop_distance = *tech_stop_distance;
+                position.created_at = *timestamp;
+                position.updated_at = *timestamp;
+                positions.insert(*position_id, position);
+            },
+
+            // EntrySignalReceived: detector supplied the real chart-derived stop
+            Event::EntrySignalReceived {
+                position_id,
+                entry_price,
+                stop_loss,
+                timestamp,
+                ..
+            } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    position.tech_stop_distance =
+                        Some(TechnicalStopDistance::from_entry_and_stop(*entry_price, *stop_loss));
+                    position.updated_at = *timestamp;
+                    positions.insert(*position_id, position);
+                }
+            },
+
+            // TechnicalStopAnalyzed: audit-only. State remains Armed until the
+            // signal is accepted and entry processing begins.
+            Event::TechnicalStopAnalyzed { .. } => {},
+
+            // MonthBoundaryReset: system-level audit/projection event. It does
+            // not mutate per-position state in the in-memory projection.
+            Event::MonthBoundaryReset { .. } => {},
+
+            // EntryOrderPlaced (LEGACY): audit-only, does NOT transition to Entering.
+            // Kept for eventlog replay compatibility.
+            Event::EntryOrderPlaced {
+                position_id,
+                order_id,
+                expected_price,
+                signal_id,
+                ..
+            } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    position.entry_price = Some(*expected_price);
+                    position.entry_order_id = Some(*order_id);
+                    position.updated_at = chrono::Utc::now();
+                    // Do NOT transition to Entering — that is EntryOrderAccepted's job.
+                    positions.insert(*position_id, position);
+                }
+            },
+
+            // EntryOrderRequested: audit-only, no state transition.
+            Event::EntryOrderRequested {
+                position_id,
+                order_id,
+                expected_price,
+                quantity,
+                ..
+            } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    position.entry_price = Some(*expected_price);
+                    position.quantity = *quantity;
+                    position.entry_order_id = Some(*order_id);
+                    position.updated_at = chrono::Utc::now();
+                    positions.insert(*position_id, position);
+                }
+            },
+
+            // EntryOrderAccepted: Transition Armed → Entering
+            Event::EntryOrderAccepted {
+                position_id,
+                order_id,
+                expected_price,
+                quantity,
+                signal_id,
+                ..
+            } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    let tech_stop = position.tech_stop_distance.as_ref().ok_or_else(|| {
+                        StoreError::InvalidState {
+                            message: "technical stop must be present before entry_order_accepted"
+                                .to_string(),
+                        }
+                    })?;
+                    if tech_stop.initial_stop.as_decimal().is_zero() {
+                        return Err(StoreError::InvalidState {
+                            message:
+                                "technical stop initial_stop must be non-zero before entry_order_accepted"
+                                    .to_string(),
+                        });
+                    }
+                    if tech_stop.distance.is_zero() {
+                        return Err(StoreError::InvalidState {
+                            message:
+                                "technical stop distance must be non-zero before entry_order_accepted"
+                                    .to_string(),
+                        });
+                    }
+                    position.state = PositionState::Entering {
+                        entry_order_id: *order_id,
+                        expected_entry: *expected_price,
+                        signal_id: *signal_id,
+                    };
+                    position.entry_price = Some(*expected_price);
+                    position.quantity = *quantity;
+                    position.entry_order_id = Some(*order_id);
+                    position.updated_at = chrono::Utc::now();
+                    positions.insert(*position_id, position);
+                }
+            },
+
+            // EntryOrderFailed: no state transition, position stays Armed
+            Event::EntryOrderFailed { position_id, .. } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    position.updated_at = chrono::Utc::now();
+                    positions.insert(*position_id, position);
+                }
+            },
+
+            // EntryExecutionRejected: internal safety/policy block before exchange
+            // placement. Move to recoverable manual-review state; do not rearm.
+            Event::EntryExecutionRejected { position_id, reason, recoverable, .. } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    position.state = PositionState::Error {
+                        error: reason.clone(),
+                        recoverable: *recoverable,
+                    };
+                    position.updated_at = chrono::Utc::now();
+                    positions.insert(*position_id, position);
+                }
+            },
+
+            // EntryFilled: Transition Entering → Active with initial trailing stop
+            Event::EntryFilled {
+                position_id,
+                order_id,
+                fill_price,
+                filled_quantity,
+                fee,
+                initial_stop,
+                binance_position_id,
+                timestamp,
+                ..
+            } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    position.entry_price = Some(*fill_price);
+                    position.entry_filled_at = Some(*timestamp);
+                    position.quantity = *filled_quantity;
+                    position.fees_paid = *fee;
+                    position.entry_order_id = Some(*order_id);
+                    if binance_position_id.is_some() {
+                        position.binance_position_id = binance_position_id.clone();
+                    }
+                    position.state = PositionState::Active {
+                        current_price: *fill_price,
+                        trailing_stop: *initial_stop,
+                        favorable_extreme: *fill_price,
+                        extreme_at: *timestamp,
+                        insurance_stop_id: None,
+                        last_emitted_stop: Some(*initial_stop),
+                    };
+                    position.updated_at = chrono::Utc::now();
+                    positions.insert(*position_id, position);
+                }
+            },
+
+            // TrailingStopUpdated: Update trailing stop within Active state
+            Event::TrailingStopUpdated {
+                position_id,
+                new_stop,
+                trigger_price,
+                timestamp,
+                ..
+            } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    if let PositionState::Active {
+                        ref mut current_price,
+                        ref mut trailing_stop,
+                        ref mut favorable_extreme,
+                        ref mut extreme_at,
+                        ref mut last_emitted_stop,
+                        ..
+                    } = position.state
+                    {
+                        *current_price = *trigger_price;
+                        *trailing_stop = *new_stop;
+                        *favorable_extreme = *trigger_price;
+                        *extreme_at = *timestamp;
+                        *last_emitted_stop = Some(*new_stop);
+                        position.updated_at = chrono::Utc::now();
+                        positions.insert(*position_id, position);
+                    }
+                }
+            },
+
+            // ExitOrderPlaced: Transition Active → Exiting
+            Event::ExitOrderPlaced { position_id, order_id, exit_reason, .. } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    position.state = PositionState::Exiting {
+                        exit_order_id: *order_id,
+                        exit_reason: *exit_reason,
+                    };
+                    position.exit_order_id = Some(*order_id);
+                    position.updated_at = chrono::Utc::now();
+                    positions.insert(*position_id, position);
+                }
+            },
+
+            // PositionClosed: Transition Exiting → Closed with realized P&L
+            Event::PositionClosed {
+                position_id,
+                exit_price,
+                exit_reason,
+                realized_pnl,
+                total_fees,
+                timestamp,
+                ..
+            } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    position.state = PositionState::Closed {
+                        exit_price: *exit_price,
+                        realized_pnl: *realized_pnl,
+                        exit_reason: *exit_reason,
+                    };
+                    position.realized_pnl = *realized_pnl;
+                    position.fees_paid = *total_fees;
+                    position.closed_at = Some(*timestamp);
+                    position.updated_at = chrono::Utc::now();
+                    positions.insert(*position_id, position);
+                }
+            },
+
+            // PositionDisarmed: Armed → Cancelled (no exchange action was ever taken)
+            Event::PositionDisarmed { position_id, timestamp, .. } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    position.state = PositionState::Cancelled;
+                    position.closed_at = Some(*timestamp);
+                    position.updated_at = chrono::Utc::now();
+                    positions.insert(*position_id, position);
+                }
+            },
+
+            // All other events are audit-only and do not affect the position projection
+            _ => {},
+        }
+
+        Ok(())
+    }
+}
+
+impl Default for MemoryStore {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// =============================================================================
+// Position Repository Implementation
+// =============================================================================
+
+#[async_trait]
+impl PositionRepository for MemoryStore {
+    async fn save(&self, position: &Position) -> Result<(), StoreError> {
+        let mut positions = self.positions.write().unwrap();
+        positions.insert(position.id, position.clone());
+        Ok(())
+    }
+
+    async fn find_by_id(&self, id: PositionId) -> Result<Option<Position>, StoreError> {
+        let positions = self.positions.read().unwrap();
+        Ok(positions.get(&id).cloned())
+    }
+
+    async fn find_by_account(&self, account_id: Uuid) -> Result<Vec<Position>, StoreError> {
+        let positions = self.positions.read().unwrap();
+        Ok(positions.values().filter(|p| p.account_id == account_id).cloned().collect())
+    }
+
+    async fn find_active(&self) -> Result<Vec<Position>, StoreError> {
+        let positions = self.positions.read().unwrap();
+        // Open core-lifecycle states only: Armed, Entering, Active, Exiting.
+        // Excludes Closed and Error. Error requires manual intervention and is
+        // intentionally not treated as an "active" position for lifecycle flows.
+        Ok(positions
+            .values()
+            .filter(|p| {
+                matches!(
+                    p.state,
+                    robson_domain::PositionState::Armed
+                        | robson_domain::PositionState::Entering { .. }
+                        | robson_domain::PositionState::Active { .. }
+                        | robson_domain::PositionState::Exiting { .. }
+                )
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn find_risk_open(&self) -> Result<Vec<Position>, StoreError> {
+        let positions = self.positions.read().unwrap();
+        Ok(positions
+            .values()
+            .filter(|p| {
+                matches!(
+                    p.state,
+                    robson_domain::PositionState::Entering { .. }
+                        | robson_domain::PositionState::Active { .. }
+                )
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn find_by_state(&self, state: &str) -> Result<Vec<Position>, StoreError> {
+        let positions = self.positions.read().unwrap();
+        Ok(positions.values().filter(|p| p.state.name() == state).cloned().collect())
+    }
+
+    async fn find_active_by_symbol_and_side(
+        &self,
+        symbol: &robson_domain::Symbol,
+        side: robson_domain::Side,
+    ) -> Result<Option<Position>, StoreError> {
+        let positions = self.positions.read().unwrap();
+        Ok(positions
+            .values()
+            .find(|p| {
+                p.symbol == *symbol
+                    && p.side == side
+                    && matches!(
+                        p.state,
+                        robson_domain::PositionState::Armed
+                            | robson_domain::PositionState::Entering { .. }
+                            | robson_domain::PositionState::Active { .. }
+                            | robson_domain::PositionState::Exiting { .. }
+                    )
+            })
+            .cloned())
+    }
+
+    async fn delete(&self, id: PositionId) -> Result<(), StoreError> {
+        let mut positions = self.positions.write().unwrap();
+        if positions.remove(&id).is_some() {
+            Ok(())
+        } else {
+            Err(StoreError::not_found("position", id.to_string()))
+        }
+    }
+
+    async fn find_closed_in_month(
+        &self,
+        year: i32,
+        month: u32,
+    ) -> Result<Vec<Position>, StoreError> {
+        let positions = self.positions.read().unwrap();
+        Ok(positions
+            .values()
+            .filter(|p| {
+                matches!(p.state, robson_domain::PositionState::Closed { .. })
+                    && p.closed_at.map(|t| t.year() == year && t.month() == month).unwrap_or(false)
+            })
+            .cloned()
+            .collect())
+    }
+
+    async fn find_all_closed(&self) -> Result<Vec<Position>, StoreError> {
+        let positions = self.positions.read().unwrap();
+        Ok(positions
+            .values()
+            .filter(|p| matches!(p.state, robson_domain::PositionState::Closed { .. }))
+            .cloned()
+            .collect())
+    }
+}
+
+// =============================================================================
+// Order Repository Implementation
+// =============================================================================
+
+#[async_trait]
+impl OrderRepository for MemoryStore {
+    async fn save(&self, order: &Order) -> Result<(), StoreError> {
+        let mut orders = self.orders.write().unwrap();
+        orders.insert(order.id, order.clone());
+        Ok(())
+    }
+
+    async fn find_by_id(&self, id: OrderId) -> Result<Option<Order>, StoreError> {
+        let orders = self.orders.read().unwrap();
+        Ok(orders.get(&id).cloned())
+    }
+
+    async fn find_by_position(&self, position_id: PositionId) -> Result<Vec<Order>, StoreError> {
+        let orders = self.orders.read().unwrap();
+        Ok(orders.values().filter(|o| o.position_id == position_id).cloned().collect())
+    }
+
+    async fn find_by_exchange_id(&self, exchange_id: &str) -> Result<Option<Order>, StoreError> {
+        let orders = self.orders.read().unwrap();
+        Ok(orders
+            .values()
+            .find(|o| o.exchange_order_id.as_deref() == Some(exchange_id))
+            .cloned())
+    }
+
+    async fn find_by_client_id(&self, client_id: &str) -> Result<Option<Order>, StoreError> {
+        let orders = self.orders.read().unwrap();
+        Ok(orders.values().find(|o| o.client_order_id == client_id).cloned())
+    }
+
+    async fn find_pending(&self) -> Result<Vec<Order>, StoreError> {
+        let orders = self.orders.read().unwrap();
+        Ok(orders
+            .values()
+            .filter(|o| matches!(o.status, OrderStatus::Pending | OrderStatus::Submitted))
+            .cloned()
+            .collect())
+    }
+}
+
+// =============================================================================
+// Event Repository Implementation
+// =============================================================================
+
+#[async_trait]
+impl EventRepository for MemoryStore {
+    async fn append(&self, event: &Event) -> Result<i64, StoreError> {
+        let seq = self.event_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        let stored = StoredEvent { seq, event: event.clone() };
+        let mut events = self.events.write().unwrap();
+        events.push(stored);
+        Ok(seq)
+    }
+
+    async fn find_by_position(&self, position_id: PositionId) -> Result<Vec<Event>, StoreError> {
+        let events = self.events.read().unwrap();
+        Ok(events
+            .iter()
+            .filter(|e| e.event.position_id() == position_id)
+            .map(|e| e.event.clone())
+            .collect())
+    }
+
+    async fn find_by_position_after(
+        &self,
+        position_id: PositionId,
+        after_seq: i64,
+    ) -> Result<Vec<Event>, StoreError> {
+        let events = self.events.read().unwrap();
+        Ok(events
+            .iter()
+            .filter(|e| e.event.position_id() == position_id && e.seq > after_seq)
+            .map(|e| e.event.clone())
+            .collect())
+    }
+
+    async fn get_latest_seq(&self, position_id: PositionId) -> Result<Option<i64>, StoreError> {
+        let events = self.events.read().unwrap();
+        Ok(events
+            .iter()
+            .filter(|e| e.event.position_id() == position_id)
+            .map(|e| e.seq)
+            .max())
+    }
+
+    async fn get_all_events(&self) -> Result<Vec<Event>, StoreError> {
+        let events = self.events.read().unwrap();
+        // Clone and sort by sequence number to guarantee ordering
+        let mut sorted: Vec<StoredEvent> = events.iter().cloned().collect();
+        sorted.sort_by_key(|e| e.seq);
+        Ok(sorted.into_iter().map(|e| e.event).collect())
+    }
+}
+
+// =============================================================================
+// Store Implementation
+// =============================================================================
+
+#[async_trait]
+impl Store for MemoryStore {
+    fn positions(&self) -> &dyn PositionRepository {
+        self
+    }
+
+    fn orders(&self) -> &dyn OrderRepository {
+        self
+    }
+
+    fn events(&self) -> &dyn EventRepository {
+        self
+    }
+
+    /// Override to apply events to in-memory projection synchronously.
+    fn apply_event(&self, event: &robson_domain::Event) -> Result<(), StoreError> {
+        self.apply_event_internal(event)
+    }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+#[cfg(test)]
+mod tests {
+    use chrono::Utc;
+    use robson_domain::{OrderSide, PositionState, Price, Quantity, Side, Symbol};
+    use rust_decimal_macros::dec;
+
+    use super::*;
+    use crate::repository::{EventRepository, OrderRepository, PositionRepository};
+
+    fn create_test_position() -> Position {
+        Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long)
+    }
+
+    fn create_test_order(position_id: PositionId) -> Order {
+        Order::new_market(
+            position_id,
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            OrderSide::Buy,
+            Quantity::new(dec!(0.1)).unwrap(),
+        )
+    }
+
+    fn create_test_event(position_id: PositionId) -> Event {
+        Event::PositionArmed {
+            position_id,
+            account_id: Uuid::now_v7(),
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            side: Side::Long,
+            tech_stop_distance: None,
+            timestamp: Utc::now(),
+        }
+    }
+
+    // Position Repository Tests
+    #[tokio::test]
+    async fn test_position_save_and_find() {
+        let store = MemoryStore::new();
+        let position = create_test_position();
+        let id = position.id;
+
+        PositionRepository::save(&store, &position).await.unwrap();
+
+        let found = PositionRepository::find_by_id(&store, id).await.unwrap();
+        assert!(found.is_some());
+        assert_eq!(found.unwrap().id, id);
+    }
+
+    #[tokio::test]
+    async fn test_position_find_active_returns_all_non_terminal() {
+        // find_active() must return open core-lifecycle states only:
+        // Armed, Entering, Active, Exiting.
+        // It must exclude Closed and Error.
+        use robson_domain::{PositionState, Price, Quantity};
+
+        let store = MemoryStore::new();
+        let symbol = robson_domain::Symbol::from_pair("BTCUSDT").unwrap();
+        let account_id = Uuid::now_v7();
+
+        // Armed
+        let armed = Position::new(account_id, symbol.clone(), Side::Long);
+
+        // Entering
+        let mut entering = Position::new(account_id, symbol.clone(), Side::Long);
+        entering.quantity = Quantity::new(dec!(0.01)).unwrap();
+        entering.state = PositionState::Entering {
+            entry_order_id: Uuid::now_v7(),
+            expected_entry: Price::new(dec!(95000)).unwrap(),
+            signal_id: Uuid::now_v7(),
+        };
+
+        // Active
+        let mut active_pos = Position::new(account_id, symbol.clone(), Side::Long);
+        active_pos.quantity = Quantity::new(dec!(0.01)).unwrap();
+        active_pos.entry_price = Some(Price::new(dec!(95000)).unwrap());
+        active_pos.state = PositionState::Active {
+            current_price: Price::new(dec!(95000)).unwrap(),
+            trailing_stop: Price::new(dec!(93500)).unwrap(),
+            favorable_extreme: Price::new(dec!(95000)).unwrap(),
+            extreme_at: Utc::now(),
+            insurance_stop_id: None,
+            last_emitted_stop: None,
+        };
+
+        // Exiting
+        let mut exiting_pos = Position::new(account_id, symbol.clone(), Side::Long);
+        exiting_pos.quantity = Quantity::new(dec!(0.01)).unwrap();
+        exiting_pos.entry_price = Some(Price::new(dec!(95000)).unwrap());
+        exiting_pos.state = PositionState::Exiting {
+            exit_order_id: Uuid::now_v7(),
+            exit_reason: robson_domain::ExitReason::TrailingStop,
+        };
+
+        // Closed (must NOT appear in find_active)
+        let mut closed_pos = Position::new(account_id, symbol.clone(), Side::Long);
+        closed_pos.state = PositionState::Closed {
+            exit_price: Price::new(dec!(95000)).unwrap(),
+            exit_reason: robson_domain::ExitReason::TrailingStop,
+            realized_pnl: dec!(0),
+        };
+
+        // Error (must NOT appear in find_active)
+        let mut error_pos = Position::new(account_id, symbol.clone(), Side::Long);
+        error_pos.state = PositionState::Error {
+            error: "exchange rejected order".to_string(),
+            recoverable: true,
+        };
+
+        for pos in [
+            &armed,
+            &entering,
+            &active_pos,
+            &exiting_pos,
+            &closed_pos,
+            &error_pos,
+        ] {
+            PositionRepository::save(&store, pos).await.unwrap();
+        }
+
+        let result = PositionRepository::find_active(&store).await.unwrap();
+
+        assert_eq!(result.len(), 4, "Expected 4 open positions, got {}", result.len());
+
+        let closed_in_result =
+            result.iter().any(|p| matches!(p.state, PositionState::Closed { .. }));
+        assert!(!closed_in_result, "find_active must not return Closed positions");
+        let error_in_result = result.iter().any(|p| matches!(p.state, PositionState::Error { .. }));
+        assert!(!error_in_result, "find_active must not return Error positions");
+
+        let states: Vec<&str> = result.iter().map(|p| p.state.name()).collect();
+        for expected in ["armed", "entering", "active", "exiting"] {
+            assert!(
+                states.contains(&expected),
+                "Expected state '{}' in find_active result, got: {:?}",
+                expected,
+                states
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn test_position_find_active_excludes_closed() {
+        // Regression: find_active must NOT include terminal/manual states.
+        let store = MemoryStore::new();
+        let mut pos = create_test_position();
+
+        // Save as Armed, then transition to Closed
+        PositionRepository::save(&store, &pos).await.unwrap();
+
+        pos.state = robson_domain::PositionState::Closed {
+            exit_price: robson_domain::Price::new(dec!(95000)).unwrap(),
+            exit_reason: robson_domain::ExitReason::TrailingStop,
+            realized_pnl: dec!(0),
+        };
+        PositionRepository::save(&store, &pos).await.unwrap();
+
+        let result = PositionRepository::find_active(&store).await.unwrap();
+        assert!(result.is_empty(), "Closed position must not appear in find_active");
+    }
+
+    #[tokio::test]
+    async fn test_position_find_active_excludes_error() {
+        let store = MemoryStore::new();
+        let mut pos = create_test_position();
+
+        PositionRepository::save(&store, &pos).await.unwrap();
+
+        pos.state = robson_domain::PositionState::Error {
+            error: "manual intervention required".to_string(),
+            recoverable: false,
+        };
+        PositionRepository::save(&store, &pos).await.unwrap();
+
+        let result = PositionRepository::find_active(&store).await.unwrap();
+        assert!(result.is_empty(), "Error position must not appear in find_active");
+    }
+
+    #[tokio::test]
+    async fn test_position_find_by_account() {
+        let store = MemoryStore::new();
+        let account_id = Uuid::now_v7();
+
+        let mut pos1 = create_test_position();
+        pos1.account_id = account_id;
+        PositionRepository::save(&store, &pos1).await.unwrap();
+
+        let mut pos2 = create_test_position();
+        pos2.account_id = account_id;
+        PositionRepository::save(&store, &pos2).await.unwrap();
+
+        // Different account
+        let pos3 = create_test_position();
+        PositionRepository::save(&store, &pos3).await.unwrap();
+
+        let found = PositionRepository::find_by_account(&store, account_id).await.unwrap();
+        assert_eq!(found.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_position_delete() {
+        let store = MemoryStore::new();
+        let position = create_test_position();
+        let id = position.id;
+
+        PositionRepository::save(&store, &position).await.unwrap();
+        assert_eq!(store.position_count(), 1);
+
+        PositionRepository::delete(&store, id).await.unwrap();
+        assert_eq!(store.position_count(), 0);
+
+        let found = PositionRepository::find_by_id(&store, id).await.unwrap();
+        assert!(found.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_position_delete_not_found() {
+        let store = MemoryStore::new();
+        let result = PositionRepository::delete(&store, Uuid::now_v7()).await;
+        assert!(result.is_err());
+    }
+
+    // Order Repository Tests
+    #[tokio::test]
+    async fn test_order_save_and_find() {
+        let store = MemoryStore::new();
+        let position = create_test_position();
+        let order = create_test_order(position.id);
+        let id = order.id;
+
+        OrderRepository::save(&store, &order).await.unwrap();
+
+        let found = OrderRepository::find_by_id(&store, id).await.unwrap();
+        assert!(found.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_order_find_by_position() {
+        let store = MemoryStore::new();
+        let position_id = Uuid::now_v7();
+
+        let order1 = create_test_order(position_id);
+        let order2 = create_test_order(position_id);
+        let order3 = create_test_order(Uuid::now_v7()); // Different position
+
+        OrderRepository::save(&store, &order1).await.unwrap();
+        OrderRepository::save(&store, &order2).await.unwrap();
+        OrderRepository::save(&store, &order3).await.unwrap();
+
+        let found = OrderRepository::find_by_position(&store, position_id).await.unwrap();
+        assert_eq!(found.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_order_find_by_client_id() {
+        let store = MemoryStore::new();
+        let order = create_test_order(Uuid::now_v7());
+        let client_id = order.client_order_id.clone();
+
+        OrderRepository::save(&store, &order).await.unwrap();
+
+        let found = OrderRepository::find_by_client_id(&store, &client_id).await.unwrap();
+        assert!(found.is_some());
+    }
+
+    #[tokio::test]
+    async fn test_order_find_pending() {
+        let store = MemoryStore::new();
+
+        let pending = create_test_order(Uuid::now_v7());
+        OrderRepository::save(&store, &pending).await.unwrap();
+
+        let found = OrderRepository::find_pending(&store).await.unwrap();
+        assert_eq!(found.len(), 1);
+    }
+
+    // Event Repository Tests
+    #[tokio::test]
+    async fn test_event_append() {
+        let store = MemoryStore::new();
+        let position_id = Uuid::now_v7();
+        let event = create_test_event(position_id);
+
+        let seq = EventRepository::append(&store, &event).await.unwrap();
+        assert_eq!(seq, 1);
+
+        let seq2 = EventRepository::append(&store, &event).await.unwrap();
+        assert_eq!(seq2, 2);
+    }
+
+    #[tokio::test]
+    async fn test_event_find_by_position() {
+        let store = MemoryStore::new();
+        let position_id = Uuid::now_v7();
+
+        let event1 = create_test_event(position_id);
+        let event2 = create_test_event(position_id);
+        let event3 = create_test_event(Uuid::now_v7()); // Different position
+
+        EventRepository::append(&store, &event1).await.unwrap();
+        EventRepository::append(&store, &event2).await.unwrap();
+        EventRepository::append(&store, &event3).await.unwrap();
+
+        let found = EventRepository::find_by_position(&store, position_id).await.unwrap();
+        assert_eq!(found.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_event_find_after_seq() {
+        let store = MemoryStore::new();
+        let position_id = Uuid::now_v7();
+
+        let event = create_test_event(position_id);
+        EventRepository::append(&store, &event).await.unwrap(); // seq 1
+        EventRepository::append(&store, &event).await.unwrap(); // seq 2
+        EventRepository::append(&store, &event).await.unwrap(); // seq 3
+
+        let found = EventRepository::find_by_position_after(&store, position_id, 1).await.unwrap();
+        assert_eq!(found.len(), 2); // seq 2 and 3
+    }
+
+    #[tokio::test]
+    async fn test_event_get_latest_seq() {
+        let store = MemoryStore::new();
+        let position_id = Uuid::now_v7();
+
+        let seq = EventRepository::get_latest_seq(&store, position_id).await.unwrap();
+        assert!(seq.is_none());
+
+        let event = create_test_event(position_id);
+        EventRepository::append(&store, &event).await.unwrap();
+        EventRepository::append(&store, &event).await.unwrap();
+        EventRepository::append(&store, &event).await.unwrap();
+
+        let seq = EventRepository::get_latest_seq(&store, position_id).await.unwrap();
+        assert_eq!(seq, Some(3));
+    }
+
+    // Entry Event State Transition Tests
+    #[tokio::test]
+    async fn test_entry_order_requested_does_not_transition() {
+        use robson_domain::{Event, Price, Quantity};
+
+        let store = MemoryStore::new();
+        let position_id = Uuid::now_v7();
+        let order_id = Uuid::now_v7();
+        let signal_id = Uuid::now_v7();
+
+        // Arm position
+        let armed_event = Event::PositionArmed {
+            position_id,
+            account_id: Uuid::now_v7(),
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            side: Side::Long,
+            tech_stop_distance: None,
+            timestamp: Utc::now(),
+        };
+        EventRepository::append(&store, &armed_event).await.unwrap();
+        store.apply_event(&armed_event).unwrap();
+
+        // Apply EntrySignalReceived first (sets tech stop)
+        let signal_event = Event::EntrySignalReceived {
+            position_id,
+            signal_id,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(93500)).unwrap(),
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            timestamp: Utc::now(),
+        };
+        EventRepository::append(&store, &signal_event).await.unwrap();
+        store.apply_event(&signal_event).unwrap();
+
+        // Apply EntryOrderRequested
+        let requested_event = Event::EntryOrderRequested {
+            position_id,
+            cycle_id: Some(Uuid::now_v7()),
+            order_id,
+            client_order_id: signal_id.to_string(),
+            expected_price: Price::new(dec!(95000)).unwrap(),
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            signal_id,
+            timestamp: Utc::now(),
+        };
+        EventRepository::append(&store, &requested_event).await.unwrap();
+        store.apply_event(&requested_event).unwrap();
+
+        let pos = PositionRepository::find_by_id(&store, position_id).await.unwrap().unwrap();
+        assert!(
+            matches!(pos.state, PositionState::Armed),
+            "EntryOrderRequested must not transition to Entering, got {:?}",
+            pos.state.name()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_entry_order_accepted_transitions_to_entering() {
+        use robson_domain::{Event, Price, Quantity};
+
+        let store = MemoryStore::new();
+        let position_id = Uuid::now_v7();
+        let order_id = Uuid::now_v7();
+        let signal_id = Uuid::now_v7();
+
+        // Arm position
+        let armed_event = Event::PositionArmed {
+            position_id,
+            account_id: Uuid::now_v7(),
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            side: Side::Long,
+            tech_stop_distance: None,
+            timestamp: Utc::now(),
+        };
+        EventRepository::append(&store, &armed_event).await.unwrap();
+        store.apply_event(&armed_event).unwrap();
+
+        // Apply EntrySignalReceived (sets tech stop)
+        let signal_event = Event::EntrySignalReceived {
+            position_id,
+            signal_id,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(93500)).unwrap(),
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            timestamp: Utc::now(),
+        };
+        EventRepository::append(&store, &signal_event).await.unwrap();
+        store.apply_event(&signal_event).unwrap();
+
+        // Apply EntryOrderAccepted
+        let accepted_event = Event::EntryOrderAccepted {
+            position_id,
+            cycle_id: Uuid::now_v7(),
+            order_id,
+            client_order_id: signal_id.to_string(),
+            exchange_order_id: "binance-123".to_string(),
+            expected_price: Price::new(dec!(95000)).unwrap(),
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            signal_id,
+            timestamp: Utc::now(),
+        };
+        EventRepository::append(&store, &accepted_event).await.unwrap();
+        store.apply_event(&accepted_event).unwrap();
+
+        let pos = PositionRepository::find_by_id(&store, position_id).await.unwrap().unwrap();
+        assert!(
+            matches!(pos.state, PositionState::Entering { signal_id: s, .. } if s == signal_id),
+            "EntryOrderAccepted must transition to Entering, got {:?}",
+            pos.state.name()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_entry_order_failed_keeps_armed() {
+        use robson_domain::{Event, Price, Quantity};
+
+        let store = MemoryStore::new();
+        let position_id = Uuid::now_v7();
+        let order_id = Uuid::now_v7();
+        let signal_id = Uuid::now_v7();
+
+        // Arm position + signal
+        let armed_event = Event::PositionArmed {
+            position_id,
+            account_id: Uuid::now_v7(),
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            side: Side::Long,
+            tech_stop_distance: None,
+            timestamp: Utc::now(),
+        };
+        EventRepository::append(&store, &armed_event).await.unwrap();
+        store.apply_event(&armed_event).unwrap();
+
+        let signal_event = Event::EntrySignalReceived {
+            position_id,
+            signal_id,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(93500)).unwrap(),
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            timestamp: Utc::now(),
+        };
+        EventRepository::append(&store, &signal_event).await.unwrap();
+        store.apply_event(&signal_event).unwrap();
+
+        // Apply EntryOrderFailed
+        let failed_event = Event::EntryOrderFailed {
+            position_id,
+            cycle_id: Uuid::now_v7(),
+            order_id,
+            client_order_id: signal_id.to_string(),
+            signal_id,
+            reason: "insufficient balance".to_string(),
+            timestamp: Utc::now(),
+        };
+        EventRepository::append(&store, &failed_event).await.unwrap();
+        store.apply_event(&failed_event).unwrap();
+
+        let pos = PositionRepository::find_by_id(&store, position_id).await.unwrap().unwrap();
+        assert!(
+            matches!(pos.state, PositionState::Armed),
+            "EntryOrderFailed must keep position Armed, got {:?}",
+            pos.state.name()
+        );
+    }
+
+    #[tokio::test]
+    async fn test_entry_execution_rejected_moves_to_recoverable_error() {
+        use robson_domain::Event;
+
+        let store = MemoryStore::new();
+        let position_id = Uuid::now_v7();
+        let signal_id = Uuid::now_v7();
+
+        let armed_event = Event::PositionArmed {
+            position_id,
+            account_id: Uuid::now_v7(),
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            side: Side::Long,
+            tech_stop_distance: None,
+            timestamp: Utc::now(),
+        };
+        EventRepository::append(&store, &armed_event).await.unwrap();
+        store.apply_event(&armed_event).unwrap();
+
+        let rejected_event = Event::EntryExecutionRejected {
+            position_id,
+            cycle_id: Uuid::now_v7(),
+            order_id: Uuid::now_v7(),
+            client_order_id: signal_id.to_string(),
+            signal_id,
+            reason: "margin safety violation".to_string(),
+            recoverable: true,
+            timestamp: Utc::now(),
+        };
+        EventRepository::append(&store, &rejected_event).await.unwrap();
+        store.apply_event(&rejected_event).unwrap();
+
+        let pos = PositionRepository::find_by_id(&store, position_id).await.unwrap().unwrap();
+        assert!(
+            matches!(
+                pos.state,
+                PositionState::Error {
+                    ref error,
+                    recoverable: true
+                } if error == "margin safety violation"
+            ),
+            "EntryExecutionRejected must move position to recoverable Error, got {:?}",
+            pos.state
+        );
+    }
+
+    #[tokio::test]
+    async fn test_legacy_entry_order_placed_does_not_transition() {
+        use robson_domain::{Event, Price, Quantity};
+
+        let store = MemoryStore::new();
+        let position_id = Uuid::now_v7();
+        let order_id = Uuid::now_v7();
+        let signal_id = Uuid::now_v7();
+
+        // Arm + signal
+        let armed_event = Event::PositionArmed {
+            position_id,
+            account_id: Uuid::now_v7(),
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            side: Side::Long,
+            tech_stop_distance: None,
+            timestamp: Utc::now(),
+        };
+        EventRepository::append(&store, &armed_event).await.unwrap();
+        store.apply_event(&armed_event).unwrap();
+
+        let signal_event = Event::EntrySignalReceived {
+            position_id,
+            signal_id,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(93500)).unwrap(),
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            timestamp: Utc::now(),
+        };
+        EventRepository::append(&store, &signal_event).await.unwrap();
+        store.apply_event(&signal_event).unwrap();
+
+        // Apply legacy EntryOrderPlaced — must NOT transition
+        let legacy_event = Event::EntryOrderPlaced {
+            position_id,
+            cycle_id: None,
+            order_id,
+            expected_price: Price::new(dec!(95000)).unwrap(),
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            signal_id,
+            timestamp: Utc::now(),
+        };
+        EventRepository::append(&store, &legacy_event).await.unwrap();
+        store.apply_event(&legacy_event).unwrap();
+
+        let pos = PositionRepository::find_by_id(&store, position_id).await.unwrap().unwrap();
+        assert!(
+            matches!(pos.state, PositionState::Armed),
+            "Legacy EntryOrderPlaced must NOT transition to Entering, got {:?}",
+            pos.state.name()
+        );
+    }
+
+    // Store Tests
+    #[tokio::test]
+    async fn test_store_clear() {
+        let store = MemoryStore::new();
+
+        let position = create_test_position();
+        PositionRepository::save(&store, &position).await.unwrap();
+
+        let order = create_test_order(position.id);
+        OrderRepository::save(&store, &order).await.unwrap();
+
+        let event = create_test_event(position.id);
+        EventRepository::append(&store, &event).await.unwrap();
+
+        assert_eq!(store.position_count(), 1);
+        assert_eq!(store.order_count(), 1);
+        assert_eq!(store.event_count(), 1);
+
+        store.clear();
+
+        assert_eq!(store.position_count(), 0);
+        assert_eq!(store.order_count(), 0);
+        assert_eq!(store.event_count(), 0);
+    }
+}

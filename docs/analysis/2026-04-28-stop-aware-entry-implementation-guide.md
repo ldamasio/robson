@@ -73,11 +73,11 @@ behavioral change.
 **Status**: COMPLETE, committed as `ac3dd86e`
 
 **Key Findings**:
-- TechnicalStopDistance: `v3/robson-engine/src/technical_stop_analyzer.rs` (680 lines)
+- TechnicalStopDistance: `robson-engine/src/technical_stop_analyzer.rs` (680 lines)
 - EntryScore: NOT FOUND in v3 → v4 will create NEW layer
-- EntryPolicy: `v3/robson-engine/src/signal_strategy.rs` with StrategyRegistry
-- Risk Engine: `v3/robson-engine/src/risk.rs` with RiskGate (pure computation)
-- Slots: `v3/robson-domain/src/policy.rs` with dynamic `slots_available()`
+- EntryPolicy: `robson-engine/src/signal_strategy.rs` with StrategyRegistry
+- Risk Engine: `robson-engine/src/risk.rs` with RiskGate (pure computation)
+- Slots: `robson-domain/src/policy.rs` with dynamic `slots_available()`
 - v3 live positions: entities.rs + repository.rs + projector (read-only)
 
 **Integration Points**:
@@ -116,7 +116,7 @@ behavioral change.
 
 ### Step 1: Add Domain Types (Metadata Only)
 
-**File**: `v3/robson-domain/src/entities.rs`
+**File**: `robson-domain/src/entities.rs`
 
 **Action**: Add new types for StopAnchor and StopQuality.
 
@@ -168,7 +168,7 @@ pub enum StopQuality {
 
 ### Step 2: Extend TechnicalStopAnalysisAudit
 
-**File**: `v3/robson-domain/src/entities.rs`
+**File**: `robson-domain/src/entities.rs`
 
 **Action**: Add optional StopAnchor and StopQuality fields to existing audit struct.
 
@@ -194,7 +194,7 @@ pub struct TechnicalStopAnalysisAudit {
 
 ### Step 3: Implement StopQuality Classifier (Pure Function)
 
-**File**: `v3/robson-engine/src/stop_quality_classifier.rs` (NEW)
+**File**: `robson-engine/src/stop_quality_classifier.rs` (NEW)
 
 **Action**: Implement rule-based classifier per heuristics spec.
 
@@ -225,7 +225,7 @@ impl StopQualityClassifier {
 
 ### Step 4: Build StopAnchor from TechnicalStopAnalysis
 
-**File**: `v3/robsond/src/detector.rs`
+**File**: `robsond/src/detector.rs`
 
 **Action**: Extend `build_technical_stop_audit()` to populate StopAnchor.
 
@@ -281,7 +281,7 @@ impl DetectorTask {
 
 ### Step 5: Classify StopQuality in Shadow Mode
 
-**File**: `v3/robsond/src/detector.rs`
+**File**: `robsond/src/detector.rs`
 
 **Action**: Calculate StopQuality after `compute_technical_stop()` but DO NOT apply it.
 
@@ -329,7 +329,7 @@ impl DetectorTask {
 
 ### Step 6: Emit Telemetry Without Decision Change
 
-**File**: `v3/robsond/src/detector.rs`
+**File**: `robsond/src/detector.rs`
 
 **Action**: Add tracing::info! log after signal creation.
 
@@ -365,7 +365,7 @@ Ok(signal)
 
 ### Step 7: Add Tests for Zero Behavioral Change
 
-**File**: `v3/robsond/tests/detector_stop_quality_test.rs` (NEW) or inline in `detector.rs`
+**File**: `robsond/tests/detector_stop_quality_test.rs` (NEW) or inline in `detector.rs`
 
 **Test Cases**:
 
@@ -425,10 +425,10 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all
 
 # Check for accidental exceptional flag usage
-grep -r "exceptional_enabled.*=.*true" v3/ --include="*.rs" || echo "OK: no exceptional=true found"
+grep -r "exceptional_enabled.*=.*true" . --include="*.rs" || echo "OK: no exceptional=true found"
 
 # Verify no boost application
-grep -r "boosted_score.*apply\|boost.*authorization" v3/ --include="*.rs" || echo "OK: no boost application found"
+grep -r "boosted_score.*apply\|boost.*authorization" . --include="*.rs" || echo "OK: no boost application found"
 ```
 
 **After Merge** (before production):
@@ -445,19 +445,19 @@ grep -r "boosted_score.*apply\|boost.*authorization" v3/ --include="*.rs" || ech
 
 | File | Purpose | Change Type |
 |------|---------|-------------|
-| `v3/robson-domain/src/entities.rs` | Add StopAnchor, StopQuality types | Additive |
-| `v3/robson-engine/src/stop_quality_classifier.rs` | NEW: classifier implementation | New file |
-| `v3/robsond/src/detector.rs` | Build StopAnchor, classify StopQuality, emit telemetry | Additive |
-| `v3/robson-engine/src/lib.rs` | Export StopQualityClassifier (if new file) | Additive |
-| `v3/robsond/src/lib.rs` | Export StopQualityClassifier (if used) | Additive |
+| `robson-domain/src/entities.rs` | Add StopAnchor, StopQuality types | Additive |
+| `robson-engine/src/stop_quality_classifier.rs` | NEW: classifier implementation | New file |
+| `robsond/src/detector.rs` | Build StopAnchor, classify StopQuality, emit telemetry | Additive |
+| `robson-engine/src/lib.rs` | Export StopQualityClassifier (if new file) | Additive |
+| `robsond/src/lib.rs` | Export StopQualityClassifier (if used) | Additive |
 
 **Files NOT to be changed in Phase 3**:
-- `v3/robson-engine/src/technical_stop_analyzer.rs` — leave untouched
-- `v3/robson-engine/src/signal_strategy.rs` — leave untouched
-- `v3/robson-engine/src/risk.rs` — leave untouched
-- `v3/robson-domain/src/policy.rs` — leave untouched
-- `v3/robson-store/src/*` — leave untouched
-- `v3/robson-projector/src/*` — leave untouched
+- `robson-engine/src/technical_stop_analyzer.rs` — leave untouched
+- `robson-engine/src/signal_strategy.rs` — leave untouched
+- `robson-engine/src/risk.rs` — leave untouched
+- `robson-domain/src/policy.rs` — leave untouched
+- `robson-store/src/*` — leave untouched
+- `robson-projector/src/*` — leave untouched
 
 ---
 
@@ -465,7 +465,7 @@ grep -r "boosted_score.*apply\|boost.*authorization" v3/ --include="*.rs" || ech
 
 ### Unit Tests
 
-**StopQualityClassifier** (`v3/robson-engine/src/stop_quality_classifier.rs`):
+**StopQualityClassifier** (`robson-engine/src/stop_quality_classifier.rs`):
 - `classify_returns_none_for_valid_anchor_with_no_confluence`
 - `classify_returns_weak_for_distant_anchor`
 - `classify_returns_good_for_recent_anchor_with_moderate_distance`
@@ -474,7 +474,7 @@ grep -r "boosted_score.*apply\|boost.*authorization" v3/ --include="*.rs" || ech
 - `classify_caps_at_premium_when_exceptional_flag_disabled`
 - `classify_respects_configurable_thresholds`
 
-**DetectorTask Integration** (`v3/robsond/src/detector.rs`):
+**DetectorTask Integration** (`robsond/src/detector.rs`):
 - `create_signal_with_stop_quality_metadata_succeeds`
 - `create_signal_stop_quality_none_does_not_reject`
 - `build_stop_anchor_maps_swing_low_correctly`
@@ -519,13 +519,13 @@ cargo clippy --all-targets -- -D warnings
 cargo test --all
 
 # Feature flag check (must be disabled)
-! grep -r "STOP_QUALITY_EXCEPTIONAL_ENABLED.*true" v3/ --include="*.rs" || echo "ERROR: exceptional flag enabled!"
+! grep -r "STOP_QUALITY_EXCEPTIONAL_ENABLED.*true" . --include="*.rs" || echo "ERROR: exceptional flag enabled!"
 
 # Boost application check (must not exist)
-! grep -r "boost.*apply\|boosted_score.*authorization" v3/ --include="*.rs" || echo "ERROR: boost application found!"
+! grep -r "boost.*apply\|boosted_score.*authorization" . --include="*.rs" || echo "ERROR: boost application found!"
 
 # v3 revalidation check (must not exist)
-! grep -r "revalidate.*v3\|rewrite.*entry.*thesis" v3/ --include="*.rs" || echo "ERROR: v3 revalidation found!"
+! grep -r "revalidate.*v3\|rewrite.*entry.*thesis" . --include="*.rs" || echo "ERROR: v3 revalidation found!"
 ```
 
 ### Post-Merge Verification (Testnet)
@@ -612,7 +612,7 @@ Phase 3 runtime implementation is accepted ONLY if:
 - [StopQuality Heuristics Spec](2026-04-28-stop-quality-heuristics.md)
 - [Pre-Implementation Discovery](2026-04-28-stop-aware-entry-discovery.md)
 - [ADR-0022 — Robson-Authored Position Invariant](../adr/ADR-0022-robson-authored-position-invariant.md)
-- [v3/CLAUDE.md](../../v3/CLAUDE.md) — Robson v3 context
+- [CLAUDE.md](../../CLAUDE.md) — Robson v3 context
 
 ---
 

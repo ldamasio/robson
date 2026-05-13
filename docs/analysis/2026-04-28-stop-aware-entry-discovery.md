@@ -21,35 +21,35 @@ integration points for StopAnchor, StopQuality, and telemetry.
 
 ```bash
 # Find TechnicalStopDistance calculation
-grep -r -i "technicalstop\|technical_stop" v3/ --include="*.rs"
+grep -r -i "technicalstop\|technical_stop" . --include="*.rs"
 
 # Find EntryScore existence
-grep -r -i "entry.*score\|entryscore" v3/ --include="*.rs"
+grep -r -i "entry.*score\|entryscore" . --include="*.rs"
 
 # Find EntryPolicy and signal strategy
-grep -r -i "entry.*policy\|signal.*strategy" v3/ --include="*.rs"
+grep -r -i "entry.*policy\|signal.*strategy" . --include="*.rs"
 
 # Find Risk Engine
-grep -r -i "risk.*gate\|RiskGate" v3/ --include="*.rs"
+grep -r -i "risk.*gate\|RiskGate" . --include="*.rs"
 
 # Find slots and position management
-grep -r -i "slot\|position.*manager" v3/ --include="*.rs"
+grep -r -i "slot\|position.*manager" . --include="*.rs"
 
 # Find DetectorSignal creation
-grep -r "DetectorSignal::new\|with_technical_stop_analysis" v3/ --include="*.rs"
+grep -r "DetectorSignal::new\|with_technical_stop_analysis" . --include="*.rs"
 
 # List all Rust files
-find v3/ -name "*.rs" -type f
+find ./ -name "*.rs" -type f
 
 # Count total Rust files
-find v3/ -name "*.rs" -type f | wc -l  # Output: 84
+find ./ -name "*.rs" -type f | wc -l  # Output: 84
 ```
 
 ---
 
 ## 1. TechnicalStopDistance Location
 
-**File**: `v3/robson-engine/src/technical_stop_analyzer.rs` (680 lines)
+**File**: `robson-engine/src/technical_stop_analyzer.rs` (680 lines)
 
 **Function**: `TechnicalStopAnalyzer::analyze()`
 
@@ -107,7 +107,7 @@ of existing v3 code.
 
 ## 3. EntryPolicy Signal Generation
 
-**File**: `v3/robson-engine/src/signal_strategy.rs` (300+ lines)
+**File**: `robson-engine/src/signal_strategy.rs` (300+ lines)
 
 **EntryPolicy Enum**:
 ```rust
@@ -150,7 +150,7 @@ will be a NEW layer applied AFTER signal confirmation.
 
 ## 4. Risk Engine Authorization
 
-**File**: `v3/robson-engine/src/risk.rs` (400+ lines)
+**File**: `robson-engine/src/risk.rs` (400+ lines)
 
 **RiskGate**:
 ```rust
@@ -189,7 +189,7 @@ this purity. `boosted_score` is INPUT, not authorization.
 
 ## 5. Slots Enforcement
 
-**File**: `v3/robson-domain/src/policy.rs`
+**File**: `robson-domain/src/policy.rs`
 
 **TradingPolicy**:
 ```rust
@@ -220,9 +220,9 @@ Slots consume losing trades only; wins do NOT offset (confirmed in tests).
 ## 6. v3 Live Positions State
 
 **Storage**:
-- `v3/robson-domain/src/entities.rs`: `Position` entity
-- `v3/robson-store/src/repository.rs`: Repository pattern
-- `v3/robson-projector/`: Read projections
+- `robson-domain/src/entities.rs`: `Position` entity
+- `robson-store/src/repository.rs`: Repository pattern
+- `robson-projector/`: Read projections
 
 **Position Entity** (excerpt):
 ```rust
@@ -257,7 +257,7 @@ v4 must NOT revalidate, cancel, or reclassify existing positions.
 - `source_event_id`: Reference to technical event
 - `invalidation_reason`: For anchor invalidation tracking
 
-**Integration Point**: `build_technical_stop_audit()` in `v3/robsond/src/detector.rs` (line 542)
+**Integration Point**: `build_technical_stop_audit()` in `robsond/src/detector.rs` (line 542)
 
 **Current Audit**: `TechnicalStopAnalysisAudit`
 ```rust
@@ -347,16 +347,16 @@ pub struct StopQualityTelemetry {
 
 | File | Lines | Purpose |
 |------|-------|---------|
-| `v3/robson-engine/src/technical_stop_analyzer.rs` | 680 | TechnicalStopDistance calculation |
-| `v3/robson-engine/src/signal_strategy.rs` | 300+ | EntryPolicy → Strategy mapping |
-| `v3/robson-engine/src/risk.rs` | 400+ | RiskGate evaluation |
-| `v3/robson-domain/src/policy.rs` | 150+ | TradingPolicy, slots_available |
-| `v3/robson-domain/src/entities.rs` | 500+ | Position, DetectorSignal entities |
-| `v3/robsond/src/detector.rs` | 600+ | DetectorTask, signal creation |
-| `v3/robson-store/src/repository.rs` | 200+ | Position persistence |
-| `v3/robson-projector/src/types.rs` | 100+ | Event types |
+| `robson-engine/src/technical_stop_analyzer.rs` | 680 | TechnicalStopDistance calculation |
+| `robson-engine/src/signal_strategy.rs` | 300+ | EntryPolicy → Strategy mapping |
+| `robson-engine/src/risk.rs` | 400+ | RiskGate evaluation |
+| `robson-domain/src/policy.rs` | 150+ | TradingPolicy, slots_available |
+| `robson-domain/src/entities.rs` | 500+ | Position, DetectorSignal entities |
+| `robsond/src/detector.rs` | 600+ | DetectorTask, signal creation |
+| `robson-store/src/repository.rs` | 200+ | Position persistence |
+| `robson-projector/src/types.rs` | 100+ | Event types |
 
-**Total**: 84 Rust files in v3/ (8 core files analyzed in depth)
+**Total**: 84 Rust files in ./ (8 core files analyzed in depth)
 
 ---
 
@@ -366,7 +366,7 @@ pub struct StopQualityTelemetry {
 
 ### Step 1: Extend Domain Types
 
-**File**: `v3/robson-domain/src/entities.rs`
+**File**: `robson-domain/src/entities.rs`
 
 Add new types:
 ```rust
@@ -424,7 +424,7 @@ pub struct TechnicalStopAnalysisAudit {
 
 ### Step 2: Implement StopQuality Classifier
 
-**File**: `v3/robson-engine/src/stop_quality_classifier.rs` (NEW)
+**File**: `robson-engine/src/stop_quality_classifier.rs` (NEW)
 
 Pure function (no I/O):
 ```rust
@@ -443,7 +443,7 @@ Use heuristics from [StopQuality Heuristics Spec](2026-04-28-stop-quality-heuris
 
 ### Step 3: Integrate in DetectorTask
 
-**File**: `v3/robsond/src/detector.rs`
+**File**: `robsond/src/detector.rs`
 
 Modify `create_signal()`:
 ```rust
@@ -476,7 +476,7 @@ Ok(DetectorSignal::new(...)
 
 ### Step 4: Emit Telemetry
 
-**File**: `v3/robsond/src/detector.rs`
+**File**: `robsond/src/detector.rs`
 
 Add logging after signal creation:
 ```rust
@@ -491,7 +491,7 @@ tracing::info!(
 
 ### Step 5: Tests
 
-**File**: `v3/robson-engine/src/stop_quality_classifier.rs` (tests module)
+**File**: `robson-engine/src/stop_quality_classifier.rs` (tests module)
 
 Test scenarios:
 - None: valid anchor, no confluence
@@ -539,4 +539,4 @@ After this discovery is approved:
 - [ADR-0021 — Opportunity Detection vs Technical Stop Analysis](../adr/ADR-0021-opportunity-detection-vs-technical-stop-analysis.md)
 - [ADR-0022 — Robson-Authored Position Invariant](../adr/ADR-0022-robson-authored-position-invariant.md)
 - [StopQuality Heuristics Spec](2026-04-28-stop-quality-heuristics.md)
-- [v3/CLAUDE.md](../../v3/CLAUDE.md) — Robson v3 context
+- [CLAUDE.md](../../CLAUDE.md) — Robson v3 context

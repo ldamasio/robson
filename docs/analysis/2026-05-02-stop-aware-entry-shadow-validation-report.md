@@ -141,7 +141,7 @@ Six blockers were identified and resolved during the validation phase:
 | 5 | `monthly_state` schema drift | Migrations 000009, 000010, 000011 applied |
 | 6 | `robsond=info` hardcoded in main.rs | Removed `.add_directive("robsond=info")` to respect RUST_LOG (`sha-447aba4b`) |
 
-Issue #6 was the direct blocker for telemetry observability. The fix was minimal: one line removed from `v3/robsond/src/main.rs`.
+Issue #6 was the direct blocker for telemetry observability. The fix was minimal: one line removed from `robsond/src/main.rs`.
 
 ## 7. Remaining Non-Blocking Observations
 

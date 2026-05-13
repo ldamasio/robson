@@ -24,7 +24,7 @@ v2 hybrid) live only in git history.
 - **Operator UI:** `robson.rbx.ia.br` (pt-BR) and
   `robson.rbxsystems.ch` (en).
 
-Read `AGENTS.md` and `v3/CLAUDE.md` for the full project rules
+Read `AGENTS.md` and `CLAUDE.md` for the full project rules
 before writing code.
 
 ---
@@ -41,7 +41,7 @@ Software:
 Optional but recommended:
 
 - `kubectl` and `kustomize` (for inspecting cluster state)
-- `just` (workspace task runner; see `v3/justfile` if present)
+- `just` (workspace task runner; see `justfile` if present)
 
 You do **not** need cluster access to contribute code. Reviewers
 and CI handle deployments.
@@ -58,7 +58,7 @@ cd robson
 ### Backend (Rust)
 
 ```bash
-cd v3
+cd .
 cargo build
 cargo test --all                  # unit + in-memory tests
 cargo clippy --all-targets -- -D warnings
@@ -67,7 +67,7 @@ cargo fmt --all -- --check
 
 The workspace has 11 crates. Pure-domain logic lives in
 `robson-domain`; business logic in `robson-engine`; daemon entry
-in `robsond`. See `v3/CLAUDE.md` for crate dependency rules.
+in `robsond`. See `CLAUDE.md` for crate dependency rules.
 
 Postgres-backed integration tests are gated behind
 `#[ignore = "requires DATABASE_URL"]`. Skip them locally; CI runs
@@ -104,7 +104,7 @@ work without a backend.
 **Backend only:**
 
 ```bash
-cd v3
+cd .
 ROBSON_ENV=development \
 ROBSON_API_HOST=127.0.0.1 \
 ROBSON_API_PORT=8080 \
@@ -164,8 +164,8 @@ gh pr create --base main
 
 CI runs:
 
-- `Robsond CI/CD` — when `v3/**` changes (`cargo fmt`, `cargo
-  clippy`, `cargo test`, build + push image to GHCR if mergeing
+- `Robsond CI/CD` — when the root Rust workspace or Docker build inputs change (`cargo fmt`, `cargo
+  clippy`, `cargo test`, build + push image to GHCR if merging
   to main).
 - `Frontend Tests` — when `frontend/**` changes (`pnpm
   check`, `pnpm test`, `pnpm build`).
@@ -185,7 +185,7 @@ the rbx-infra side). Cluster sync typically completes within
 
 | Symptom | First place to check |
 |---------|---------------------|
-| `cargo clippy` warning that wasn't there yesterday | `v2/clippy.toml` (workspace-level allowlist) |
+| `cargo clippy` warning that wasn't there yesterday | `clippy.toml` (workspace-level allowlist) |
 | `pnpm run check` errors after a merge | run `pnpm install --frozen-lockfile` to sync deps |
 | Frontend dev server can't reach backend | `PUBLIC_ROBSON_API_BASE` in `.env.local` |
 | Tests pass locally, fail in CI | check `cargo test --features postgres` and the database test tier |
@@ -196,7 +196,7 @@ the rbx-infra side). Cluster sync typically completes within
 ## Further reading
 
 - `AGENTS.md` — repository-wide rules
-- `v3/CLAUDE.md` — Rust workspace details
+- `CLAUDE.md` — Rust workspace details
 - `docs/architecture/v3-runtime-spec.md` — runtime architecture
 - `docs/architecture/v3-control-loop.md` — execution stages
 - `docs/adr/` — accepted architectural decisions

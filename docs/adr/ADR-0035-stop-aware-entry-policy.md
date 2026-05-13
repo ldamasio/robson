@@ -97,7 +97,7 @@ must be preserved. If v3 does not have a formal `EntryScore`, this is a new v4 l
 |--------------------|-----------------------------------------------------------------|
 | **Candidate**      | Invalid anchor rejects or expires candidate with explicit reason |
 | **Open Position**  | Anchor invalidation becomes risk/exit event. This does NOT rewrite |
-|                    | the original entry thesis, nor does it revalidate the v3/v4 entry  |
+|                    | the original entry thesis, nor does it revalidate the v3 or v4 entry |
 |                    | decision. It is purely a position management signal.              |
 
 ### Rollout Phases
@@ -196,11 +196,11 @@ The agent must first locate in the current codebase:
 
 ## Related Components
 
-- `v3/robsond/src/entry_policy.rs` (or equivalent) — candidate generation
-- `v3/robsond/src/technical_stop.rs` (to be located) — `TechnicalStopDistance` calculation
-- `v3/robsond/src/risk_engine.rs` — final authority
-- `v3/robson-eventlog/` — `StopAnchor` metadata schema
-- `v3/robsond/src/position_manager.rs` — v3 live position read-only state
+- `robsond/src/entry_policy.rs` (or equivalent) — candidate generation
+- `robsond/src/technical_stop.rs` (to be located) — `TechnicalStopDistance` calculation
+- `robsond/src/risk_engine.rs` — final authority
+- `robson-eventlog/` — `StopAnchor` metadata schema
+- `robsond/src/position_manager.rs` — v3 live position read-only state
 
 ---
 
