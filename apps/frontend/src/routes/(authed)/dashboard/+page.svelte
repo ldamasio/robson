@@ -328,6 +328,15 @@
       // error handled by next poll refresh
     }
   }
+
+  async function disarm(positionId: string) {
+    try {
+      await robsonApi.closePosition(positionId);
+      void load();
+    } catch {
+      // next poll will refresh state
+    }
+  }
 </script>
 
 <svelte:head>
@@ -482,39 +491,75 @@
         {:else}
           <Grid cols={2} gap={4}>
             {#each displayOps as op}
-              <a href="/operation/{op.id}" class="op-card-link">
-                <Card>
-                  <Stack gap={2}>
-                    <Row justify="between" align="start">
-                      <div class="eyebrow">{positionLabel(op)}</div>
-                      <span
-                        class="state-pill"
-                        class:inherited={isInheritedForMonth(op, selectedMonth)}
-                      >
-                        {monthStateLabel(op)}
-                      </span>
-                    </Row>
-                    <Row justify="between">
-                      <span class="meta">{positionStateLabel(op.state)}</span>
-                      {#if variationFor(op) !== null}
+              {#if op.state === "Armed"}
+                <div class="op-card-link">
+                  <Card>
+                    <Stack gap={2}>
+                      <Row justify="between" align="start">
+                        <div class="eyebrow">{positionLabel(op)}</div>
                         <span
-                          class="mono"
-                          class:ok={(variationFor(op) ?? 0) > 0}
-                          class:err={(variationFor(op) ?? 0) < 0}
-                        >
-                          {(variationFor(op) ?? 0) > 0 ? "+" : ""}{variationFor(
+                          class="state-pill"
+                          class:inherited={isInheritedForMonth(
                             op,
-                          )?.toFixed(2)}%
+                            selectedMonth,
+                          )}
+                        >
+                          {monthStateLabel(op)}
                         </span>
-                      {/if}
-                    </Row>
-                    <div class="meta dim">{positionMetaLine(op)}</div>
-                    <pre class="history-summary">{positionSummaryLines(op).join(
-                        "\n",
-                      )}</pre>
-                  </Stack>
-                </Card>
-              </a>
+                      </Row>
+                      <Row justify="between">
+                        <span class="meta">{positionStateLabel(op.state)}</span>
+                      </Row>
+                      <div class="meta dim">{positionMetaLine(op)}</div>
+                      <pre class="history-summary">{positionSummaryLines(
+                          op,
+                        ).join("\n")}</pre>
+                      <Row justify="end">
+                        <button class="btn-disarm" onclick={() => disarm(op.id)}
+                          >DISARM</button
+                        >
+                      </Row>
+                    </Stack>
+                  </Card>
+                </div>
+              {:else}
+                <a href="/operation/{op.id}" class="op-card-link">
+                  <Card>
+                    <Stack gap={2}>
+                      <Row justify="between" align="start">
+                        <div class="eyebrow">{positionLabel(op)}</div>
+                        <span
+                          class="state-pill"
+                          class:inherited={isInheritedForMonth(
+                            op,
+                            selectedMonth,
+                          )}
+                        >
+                          {monthStateLabel(op)}
+                        </span>
+                      </Row>
+                      <Row justify="between">
+                        <span class="meta">{positionStateLabel(op.state)}</span>
+                        {#if variationFor(op) !== null}
+                          <span
+                            class="mono"
+                            class:ok={(variationFor(op) ?? 0) > 0}
+                            class:err={(variationFor(op) ?? 0) < 0}
+                          >
+                            {(variationFor(op) ?? 0) > 0
+                              ? "+"
+                              : ""}{variationFor(op)?.toFixed(2)}%
+                          </span>
+                        {/if}
+                      </Row>
+                      <div class="meta dim">{positionMetaLine(op)}</div>
+                      <pre class="history-summary">{positionSummaryLines(
+                          op,
+                        ).join("\n")}</pre>
+                    </Stack>
+                  </Card>
+                </a>
+              {/if}
             {/each}
           </Grid>
         {/if}
@@ -851,6 +896,21 @@
   }
   .btn-approve:hover {
     background: var(--cyan-subtle);
+  }
+  .btn-disarm {
+    background: transparent;
+    border: 1px solid var(--color-err, #e55);
+    color: var(--color-err, #e55);
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    letter-spacing: 0.08em;
+    padding: 4px 10px;
+    cursor: pointer;
+    border-radius: 2px;
+    transition: background 0.15s;
+  }
+  .btn-disarm:hover {
+    background: color-mix(in srgb, var(--color-err, #e55) 15%, transparent);
   }
   .btn-nav {
     font-family: var(--font-mono);

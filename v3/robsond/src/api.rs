@@ -2233,9 +2233,10 @@ mod tests {
         let status: StatusResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(status.active_positions, 1);
         assert_eq!(status.occupied_slots, 1);
-        // Armed positions reserve a slot; new_slots drops by 1 (was 4, now 3).
-        assert_eq!(status.new_slots_available, 3);
-        assert_eq!(status.slot_cells_total, 4);
+        // Armed-position risk is reflected in capital_base at month boundary,
+        // not subtracted from the live slot count.
+        assert_eq!(status.new_slots_available, 4);
+        assert_eq!(status.slot_cells_total, 5);
         assert_eq!(status.pending_approvals.len(), 1);
         assert_eq!(status.pending_approvals[0].query_id, query_id);
         assert_eq!(status.pending_approvals[0].position_id, Some(position.id));

@@ -1732,6 +1732,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             timestamp: chrono::Utc::now(),
         });
 
+        // Clean up entry policy entry to prevent HashMap growth.
+        {
+            let mut policies = self.entry_policies.write().await;
+            policies.remove(&position_id);
+        }
+
         Ok(())
     }
 
@@ -3067,14 +3073,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             self.trading_policy
                 .slots_available(capital_base, monthly.realized_loss, latent_risk);
 
-        // Armed positions have no measurable latent risk (no entry or stop yet),
-        // but each one reserves a future slot. Subtract them so the operator
-        // cannot arm more positions than the budget allows.
-        let all_open = self.store.positions().find_active().await?;
-        let armed_count =
-            all_open.iter().filter(|p| matches!(p.state, PositionState::Armed)).count() as u32;
-
-        Ok(policy_slots.saturating_sub(armed_count))
+        // Armed positions' risk is reflected in capital_base at month boundary.
+        // The slot count is purely budget-driven.
+        Ok(policy_slots)
     }
 
     // =========================================================================
