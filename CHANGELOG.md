@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed - Repository Cleanup and Layout Normalization (2026-05-13)
+
+- Removed dead legacy roots from the repository: `apps/`, `data/`,
+  `k8s/`, `pyproject.toml`, and `sonar-project.properties`.
+- Moved the worktree helper from `devtools/` to `scripts/` and updated
+  the live developer and deployment docs to match the current layout.
+- Updated the pull request template and frontend deployment runbook to
+  reference the current Rust + SvelteKit + `rbx-infra` structure.
+
 ### Fixed - v2 CI/CD Pipeline (2026-04-14)
 
 - **rustfmt.toml restored**: Rich nightly-only configuration (`imports_granularity`,
