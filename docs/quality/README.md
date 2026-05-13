@@ -183,7 +183,7 @@ See [SonarLint Guide](./sonarlint.md) for detailed setup and usage.
 ### Setup (Optional)
 
 1. **Deploy SonarQube server** (or use SonarCloud)
-2. **Configure scanner**: See [`sonar-project.properties`](../../sonar-project.properties)
+2. **Configure scanner**: Create a local scanner config that matches the current code layout
 3. **Add CI job**: See `.github/workflows/sonarqube.yml` (to be created)
 
 ### Running the Scanner
@@ -231,7 +231,7 @@ jobs:
 
 ### Configuration File
 
-See [`sonar-project.properties`](../../sonar-project.properties) for:
+Keep your scanner config aligned with the active code layout for:
 - Source directories
 - Test report paths
 - Exclusions (migrations, tests, generated files)
@@ -278,7 +278,7 @@ rm .pre-commit-config.yaml
 
 ### Disable SonarQube
 
-- Delete `sonar-project.properties`
+- Remove your local scanner config
 - Remove CI job (if created)
 - No code changes required
 
@@ -331,7 +331,7 @@ pytest --cov --cov-report=xml --cov-report=lcov
 ### SonarQube: "Project not found"
 
 - Create the project in SonarQube UI first
-- Match `sonar.projectKey` in `sonar-project.properties`
+- Match `sonar.projectKey` in your scanner configuration
 
 ### SonarQube: Permission denied
 

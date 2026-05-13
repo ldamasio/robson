@@ -238,7 +238,7 @@ docs-sync-binance:
 
 # Create a git worktree and tmux session (claude|codex|shell)
 wt-new AGENT NAME BRANCH:
-    ./devtools/robson-wt-new.sh "{{AGENT}}" "{{NAME}}" "{{BRANCH}}"
+    ./scripts/robson-wt-new.sh "{{AGENT}}" "{{NAME}}" "{{BRANCH}}"
 
 # ============================================================================
 # Domain Actions (Thin wrappers - prefer using `robson` directly)

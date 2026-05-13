@@ -12,8 +12,8 @@
 ## Tests
 
 - How to verify:
-  - [ ] `cd apps/backend/monolith && ./bin/dj test`
-  - [ ] `cd apps/frontend && npm ci && npm test`
+  - [ ] `cargo test --all`
+  - [ ] `cd frontend && pnpm check`
 - Added/updated tests:
   - 
 

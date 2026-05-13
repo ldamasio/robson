@@ -3,9 +3,9 @@
 > This document describes the v1 Django monolith, removed from
 > active code in 2026-04. Robson v3 is the canonical version: a
 > Rust runtime (`robsond/`) plus a SvelteKit static frontend
-> (`apps/frontend/`). The Django code path is gone from the
-> working tree; this file is preserved for historical product
-> archaeology only.
+> (`frontend/`). The Django code path is gone from the working
+> tree; this file is preserved for historical product archaeology
+> only.
 >
 > For current developer onboarding, read
 > [`docs/onboarding/DEVELOPER-QUICKSTART.md`](onboarding/DEVELOPER-QUICKSTART.md).
@@ -47,7 +47,7 @@ just wt-new codex backend feat/backend-adjust
 
 Direct script (same behavior):
 ```
-./devtools/robson-wt-new.sh codex backend feat/backend-adjust
+./scripts/robson-wt-new.sh codex backend feat/backend-adjust
 ```
 
 Optional env vars:
