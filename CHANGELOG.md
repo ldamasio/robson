@@ -7,6 +7,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added - Entry Pipeline Observability (2026-05-13)
+
+- **Debug endpoint**: `GET /debug/armed-positions` returns detector task status, stored entry policy, and last market data timestamp per symbol for every armed position.
+- **Structured entry logs**: All stages of the immediate+automatic entry flow now emit `tracing` events tagged `flow = "entry_immediate"` — detector spawn, market data tick, signal creation, risk check, approval, and executor dispatch.
+- **OHLCV error classification**: When technical stop computation fails in the detector, the error is classified (`timeout`, `exchange_error`, `technical_stop_analysis_error`, etc.) before logging.
+
 ### Changed - Repository Cleanup and Layout Normalization (2026-05-13)
 
 - Removed dead legacy roots from the repository: `apps/`, `data/`,

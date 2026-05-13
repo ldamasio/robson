@@ -88,6 +88,7 @@ docs/
 ```
 GET  /health                          # Health check
 GET  /status                          # Positions, slots, monthly risk state
+GET  /debug/armed-positions           # Armed positions debug snapshot (detector status, market data)
 GET  /positions?month=YYYY-MM         # Monthly position history
 GET  /positions/{id}                  # Single position detail
 POST /positions                       # Arm a new position

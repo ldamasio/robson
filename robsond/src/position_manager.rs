@@ -1581,8 +1581,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             flow = "entry_immediate",
             %position_id,
             detector_spawned = true,
-            detector_task_finished = handle.is_finished(),
-            "Detector spawned and stored for armed position"
+            "Detector spawned for armed position"
         );
 
         // Store detector handle for cancellation
