@@ -378,6 +378,20 @@ pub struct ExitFilled {
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
 
+/// entry_policy_resolved payload
+///
+/// Emitted immediately after position_armed. Records the entry mode and
+/// approval policy chosen by the operator. Written to positions_current so
+/// the daemon can recover these values after a restart.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct EntryPolicyResolved {
+    pub position_id: Uuid,
+    /// "immediate" | "confirmed_trend" | "confirmed_reversal" | "confirmed_key_level"
+    pub entry_policy: String,
+    /// "automatic" | "human_confirmation"
+    pub approval_policy: String,
+}
+
 /// position_closed payload (robson-domain::Event::PositionClosed, lowercase)
 ///
 /// Emitted after the exit fill is confirmed, with final P&L summary.

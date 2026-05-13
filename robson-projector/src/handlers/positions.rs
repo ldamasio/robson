@@ -14,8 +14,8 @@ use crate::{
     error::{ProjectionError, Result},
     types::{
         EntryExecutionRejected, EntryOrderAccepted, EntryOrderFailed, EntryOrderPlaced,
-        EntryOrderRequested, EntrySignalReceived, ExitFilled, ExitOrderPlaced, PositionArmed,
-        PositionClosed, PositionClosedDomain, PositionDisarmed, PositionOpened,
+        EntryOrderRequested, EntryPolicyResolved, EntrySignalReceived, ExitFilled, ExitOrderPlaced,
+        PositionArmed, PositionClosed, PositionClosedDomain, PositionDisarmed, PositionOpened,
         TechnicalStopDistancePayload,
     },
 };
@@ -1121,6 +1121,42 @@ pub(crate) async fn handle_position_closed_domain(
     .bind(envelope.event_id)
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+pub(crate) async fn handle_entry_policy_resolved(
+    pool: &PgPool,
+    envelope: &EventEnvelope,
+) -> Result<()> {
+    let payload: EntryPolicyResolved =
+        serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+            ProjectionError::InvalidPayload {
+                event_type: envelope.event_type.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+
+    sqlx::query(
+        r#"
+        UPDATE positions_current
+           SET entry_mode    = $1,
+               approval_mode = $2,
+               last_event_id = $3,
+               last_seq      = $4,
+               updated_at    = $5
+         WHERE position_id = $6
+           AND last_seq < $4
+        "#,
+    )
+    .bind(&payload.entry_policy)
+    .bind(&payload.approval_policy)
+    .bind(envelope.event_id)
+    .bind(envelope.seq)
+    .bind(envelope.occurred_at)
+    .bind(payload.position_id)
     .execute(pool)
     .await?;
 

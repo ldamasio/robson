@@ -1504,6 +1504,42 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         Ok(position)
     }
 
+    /// Re-attach entry policy and spawn a detector for an Armed position
+    /// recovered from the projection on daemon startup.
+    ///
+    /// Called after `restore_positions()` has already loaded the position into
+    /// the in-memory store. This method only restores the in-memory
+    /// `entry_policies` map and spawns the detector — it does not re-emit any
+    /// events.
+    pub async fn restore_armed_position(
+        &self,
+        position: &Position,
+        entry_policy: EntryPolicyConfig,
+    ) -> DaemonResult<()> {
+        let position_id = position.id;
+
+        {
+            let mut policies = self.entry_policies.write().await;
+            policies.insert(position_id, entry_policy);
+        }
+
+        let cancel_token = self.child_cancel_token();
+        let detector = DetectorTask::from_position_with_policy(
+            position,
+            entry_policy,
+            Arc::clone(&self.event_bus),
+            Arc::clone(&self.ohlcv_port),
+            cancel_token,
+        )?;
+        let handle = detector.spawn();
+
+        let mut detectors = self.detectors.write().await;
+        detectors.insert(position_id, handle);
+
+        info!(%position_id, "Armed position restored: detector re-spawned");
+        Ok(())
+    }
+
     /// Returns an `Arc` to the circuit breaker so API handlers can read/write
     /// it.
     pub fn circuit_breaker(&self) -> Arc<CircuitBreaker> {

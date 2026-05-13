@@ -55,7 +55,7 @@ pub use error::StoreError;
 pub use memory::MemoryStore;
 #[cfg(feature = "postgres")]
 pub use postgres::{
-    find_active_from_projection, find_positions_overlapping_month, PgProjectionReader,
-    ProjectionRecovery,
+    find_active_from_projection, find_armed_entry_policies, find_positions_overlapping_month,
+    PgProjectionReader, ProjectionRecovery,
 };
 pub use repository::{EventRepository, OrderRepository, PositionRepository, Store};

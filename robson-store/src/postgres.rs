@@ -100,6 +100,8 @@ struct PositionCurrentRow {
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
     closed_at: Option<chrono::DateTime<chrono::Utc>>,
+    entry_mode: Option<String>,
+    approval_mode: Option<String>,
 }
 
 /// Helper function to parse a row from positions_current query.
@@ -137,6 +139,8 @@ fn parse_position_row(row: &sqlx::postgres::PgRow) -> Result<PositionCurrentRow,
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         closed_at: row.try_get("closed_at").ok(),
+        entry_mode: row.try_get("entry_mode").ok().flatten(),
+        approval_mode: row.try_get("approval_mode").ok().flatten(),
     })
 }
 
@@ -437,7 +441,9 @@ pub async fn find_active_from_projection(
             exit_reason,
             created_at,
             updated_at,
-            closed_at
+            closed_at,
+            entry_mode,
+            approval_mode
         FROM positions_current
         WHERE tenant_id = $1
           AND state IN ('armed', 'entering', 'active', 'exiting')
@@ -460,6 +466,46 @@ pub async fn find_active_from_projection(
     }
 
     Ok(positions)
+}
+
+/// Return (position_id, entry_mode, approval_mode) for all Armed positions that
+/// have persisted entry policy data. Used by daemon startup to re-spawn
+/// detector tasks after a crash/restart.
+pub async fn find_armed_entry_policies(
+    pool: &PgPool,
+    tenant_id: Uuid,
+) -> Result<Vec<(Uuid, String, String)>, StoreError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT position_id, entry_mode, approval_mode
+          FROM positions_current
+         WHERE tenant_id = $1
+           AND state = 'armed'
+           AND entry_mode IS NOT NULL
+           AND approval_mode IS NOT NULL
+         ORDER BY created_at ASC
+        "#,
+    )
+    .bind(tenant_id)
+    .fetch_all(pool)
+    .await
+    .map_err(|e| StoreError::Database(format!("Failed to read armed entry policies: {}", e)))?;
+
+    let mut result = Vec::new();
+    for row in rows {
+        let position_id: Uuid = row
+            .try_get("position_id")
+            .map_err(|e| StoreError::Database(format!("Failed to parse position_id: {}", e)))?;
+        let entry_mode: String = row
+            .try_get("entry_mode")
+            .map_err(|e| StoreError::Database(format!("Failed to parse entry_mode: {}", e)))?;
+        let approval_mode: String = row
+            .try_get("approval_mode")
+            .map_err(|e| StoreError::Database(format!("Failed to parse approval_mode: {}", e)))?;
+        result.push((position_id, entry_mode, approval_mode));
+    }
+
+    Ok(result)
 }
 
 /// Read all positions that overlapped a given month from the persisted
