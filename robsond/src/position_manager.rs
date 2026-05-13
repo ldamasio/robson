@@ -3181,16 +3181,14 @@ mod tests {
     use super::*;
     use crate::query_engine::TracingQueryRecorder;
 
-    /// Create a test manager without starting the signal listener.
-    /// Use this for unit tests that call handle_signal() directly.
-    async fn create_test_manager_with_approval_policy(
+    async fn create_test_manager_with_store_and_event_bus(
+        store: Arc<MemoryStore>,
+        event_bus: Arc<EventBus>,
         approval_policy: ApprovalPolicy,
     ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         let journal = Arc::new(IntentJournal::new());
-        let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
-        let event_bus = Arc::new(EventBus::new(100));
         let risk_config = RiskConfig::new(dec!(10000)).unwrap(); // 1% risk
         let engine = Engine::new(risk_config);
 
@@ -3206,6 +3204,19 @@ mod tests {
             )
             .with_ohlcv_port(Arc::new(StubOhlcv::new(create_test_candles()))),
         )
+    }
+
+    /// Create a test manager without starting the signal listener.
+    /// Use this for unit tests that call handle_signal() directly.
+    async fn create_test_manager_with_approval_policy(
+        approval_policy: ApprovalPolicy,
+    ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
+        create_test_manager_with_store_and_event_bus(
+            Arc::new(MemoryStore::new()),
+            Arc::new(EventBus::new(100)),
+            approval_policy,
+        )
+        .await
     }
 
     async fn create_test_manager() -> Arc<PositionManager<StubExchange, MemoryStore>> {
@@ -4540,6 +4551,82 @@ mod tests {
         // Verify detector was cleaned up (single-shot)
         // Detector should be removed after signaling (checked via detector count)
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_restore_armed_immediate_automatic_processes_first_market_tick() {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+
+        let store = Arc::new(MemoryStore::new());
+        let original_manager = create_test_manager_with_store_and_event_bus(
+            Arc::clone(&store),
+            Arc::new(EventBus::new(100)),
+            ApprovalPolicy::new(Decimal::from(100u32), 300),
+        )
+        .await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let policy =
+            EntryPolicyConfig::new(EntryPolicy::Immediate, DomainApprovalPolicy::Automatic);
+
+        let position = original_manager
+            .arm_position_with_policy(
+                symbol.clone(),
+                Side::Long,
+                create_test_risk_config(),
+                None,
+                Uuid::now_v7(),
+                policy,
+            )
+            .await
+            .unwrap();
+
+        original_manager.shutdown().await;
+
+        let restored_event_bus = Arc::new(EventBus::new(100));
+        let restored_manager = create_test_manager_with_store_and_event_bus(
+            Arc::clone(&store),
+            Arc::clone(&restored_event_bus),
+            ApprovalPolicy::new(Decimal::from(100u32), 300),
+        )
+        .await;
+        PositionManager::start(Arc::clone(&restored_manager));
+        tokio::task::yield_now().await;
+
+        let restored_position = store
+            .positions()
+            .find_by_id(position.id)
+            .await
+            .unwrap()
+            .expect("armed position must survive restart");
+
+        restored_manager
+            .restore_armed_position(&restored_position, policy)
+            .await
+            .unwrap();
+
+        // Regression coverage: this first tick is sent immediately after restore,
+        // before the spawned detector task has a chance to poll on current_thread.
+        restored_event_bus.send(DaemonEvent::MarketData(MarketData {
+            symbol: symbol.clone(),
+            price: Price::new(dec!(100)).unwrap(),
+            timestamp: chrono::Utc::now(),
+        }));
+
+        tokio::time::timeout(std::time::Duration::from_secs(1), async {
+            loop {
+                let events = store.events().find_by_position(position.id).await.unwrap();
+                if events.iter().any(|event| {
+                    matches!(event, Event::EntrySignalReceived { position_id, .. } if *position_id == position.id)
+                }) {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("restored immediate detector must process the first market tick");
+
+        restored_manager.shutdown().await;
     }
 
     // =========================================================================

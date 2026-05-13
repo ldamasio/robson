@@ -67,7 +67,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
 use crate::{
-    event_bus::{DaemonEvent, EventBus, MarketData},
+    event_bus::{DaemonEvent, EventBus, EventReceiver, MarketData},
     DaemonError, DaemonResult,
 };
 
@@ -271,6 +271,9 @@ impl DetectorTask {
         let position_id = self.config.position_id;
         let symbol = self.config.symbol.clone();
         let cancel_token = self.cancel_token.clone();
+        // Subscribe before spawning so ticks published immediately after spawn
+        // are buffered for this detector instead of being lost to scheduling.
+        let receiver = self.event_bus.subscribe();
 
         tokio::spawn(async move {
             info!(
@@ -279,7 +282,7 @@ impl DetectorTask {
                 "Detector task started"
             );
 
-            let result = self.run(cancel_token).await;
+            let result = self.run(cancel_token, receiver).await;
 
             match &result {
                 Some(signal) => {
@@ -305,14 +308,15 @@ impl DetectorTask {
     /// Run the detector loop.
     ///
     /// This is the main async loop that:
-    /// 1. Subscribes to EventBus
-    /// 2. Waits for events OR cancellation (cooperative)
-    /// 3. Filters MarketData for our symbol
-    /// 4. Applies MA crossover detection logic
-    /// 5. Returns signal or None
-    async fn run(mut self, cancel_token: CancellationToken) -> Option<DetectorSignal> {
-        let mut receiver = self.event_bus.subscribe();
-
+    /// 1. Waits for events OR cancellation (cooperative)
+    /// 2. Filters MarketData for our symbol
+    /// 3. Applies signal detection logic
+    /// 4. Returns signal or None
+    async fn run(
+        mut self,
+        cancel_token: CancellationToken,
+        mut receiver: EventReceiver,
+    ) -> Option<DetectorSignal> {
         loop {
             // Cooperatively check for cancellation
             tokio::select! {
