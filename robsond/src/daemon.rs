@@ -28,9 +28,9 @@ use robson_connectors::BinanceRestClient;
 use robson_domain::{ApprovalPolicy, EntryPolicy, EntryPolicyConfig};
 use robson_domain::{Position, PositionId, PositionState, Symbol, TradingPolicy};
 use robson_engine::Engine;
-use robson_exec::{ExchangePort, Executor, IntentJournal, StubExchange};
 #[cfg(feature = "postgres")]
-use robson_store::find_armed_entry_policies;
+use robson_eventlog::{query_events, EventEnvelope, QueryOptions};
+use robson_exec::{ExchangePort, Executor, IntentJournal, StubExchange};
 #[cfg(feature = "postgres")]
 use robson_store::PgDetectedPositionRepository;
 // Optional projection recovery for crash recovery
@@ -1277,13 +1277,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         Ok(())
     }
 
-    /// Re-spawn detector tasks for Armed positions that were recovered from
-    /// the projection. Called once after `restore_positions()`.
+    /// Re-spawn detector tasks for Armed positions after a daemon restart.
     ///
-    /// entry_policies is an in-memory HashMap that is lost on daemon restart.
-    /// This method reads the persisted entry_mode/approval_mode columns from
-    /// positions_current and calls PositionManager::restore_armed_position for
-    /// each Armed position that has a valid policy on record.
+    /// entry_policies is an in-memory HashMap lost on every restart. This
+    /// method reads entry_policy_resolved events directly from the eventlog
+    /// (the source of truth, always consistent) rather than the projection
+    /// (which may lag behind by one or more events when the daemon was
+    /// killed mid-flight).
     #[cfg(feature = "postgres")]
     async fn restore_armed_detectors(&self) {
         let (Some(pool), Some(tenant_id)) = (&self.pg_pool, self.config.projection.tenant_id)
@@ -1291,42 +1291,73 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             return;
         };
 
-        let policies = match find_armed_entry_policies(pool, tenant_id).await {
-            Ok(p) => p,
+        // Collect all Armed positions from the in-memory store (already rebuilt
+        // by restore_positions()).
+        let armed_positions: Vec<Position> = match self.store.positions().find_active().await {
+            Ok(positions) => positions
+                .into_iter()
+                .filter(|p| matches!(p.state, PositionState::Armed))
+                .collect(),
             Err(e) => {
-                warn!(error = %e, "Could not load armed entry policies; Armed positions will not have detectors");
+                warn!(error = %e, "Could not read active positions; skipping detector restore");
                 return;
             },
         };
 
-        if policies.is_empty() {
-            info!("No Armed positions with persisted entry policies found");
+        if armed_positions.is_empty() {
+            info!("No Armed positions to restore detectors for");
             return;
         }
 
-        for (position_id, entry_mode, approval_mode) in policies {
-            let entry_policy_opt = parse_entry_policy_config(&entry_mode, &approval_mode);
-            let entry_policy = match entry_policy_opt {
-                Some(p) => p,
-                None => {
-                    warn!(
-                        %position_id,
-                        entry_mode = %entry_mode,
-                        approval_mode = %approval_mode,
-                        "Unknown entry/approval mode; skipping detector restore"
-                    );
+        for position in armed_positions {
+            let position_id = position.id;
+            let stream_key = format!("position:{}", position_id);
+
+            // Read the most recent entry_policy_resolved event for this position
+            // from the eventlog. Descending order so we get the latest one first.
+            let events = match query_events(
+                pool,
+                QueryOptions::new(tenant_id)
+                    .stream(stream_key)
+                    .event_type("entry_policy_resolved")
+                    .descending()
+                    .limit(1),
+            )
+            .await
+            {
+                Ok(e) => e,
+                Err(e) => {
+                    warn!(%position_id, error = %e, "Eventlog query failed; skipping detector restore");
                     continue;
                 },
             };
 
-            let position = match self.store.positions().find_by_id(position_id).await {
-                Ok(Some(p)) => p,
-                Ok(None) => {
-                    warn!(%position_id, "Armed position not found in store after restore; skipping");
+            let envelope: &EventEnvelope = match events.first() {
+                Some(e) => e,
+                None => {
+                    warn!(%position_id, "No entry_policy_resolved event in eventlog; skipping detector restore");
                     continue;
                 },
-                Err(e) => {
-                    warn!(%position_id, error = %e, "Failed to load position from store; skipping detector restore");
+            };
+
+            let entry_mode = envelope.payload.get("entry_policy").and_then(|v| v.as_str());
+            let approval_mode = envelope.payload.get("approval_policy").and_then(|v| v.as_str());
+
+            let entry_policy = match (entry_mode, approval_mode) {
+                (Some(e), Some(a)) => match parse_entry_policy_config(e, a) {
+                    Some(p) => p,
+                    None => {
+                        warn!(
+                            %position_id,
+                            entry_mode = %e,
+                            approval_mode = %a,
+                            "Unknown entry/approval mode in eventlog; skipping"
+                        );
+                        continue;
+                    },
+                },
+                _ => {
+                    warn!(%position_id, "Malformed entry_policy_resolved payload; skipping");
                     continue;
                 },
             };
