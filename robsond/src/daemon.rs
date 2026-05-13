@@ -24,9 +24,13 @@ use std::{net::SocketAddr, sync::Arc, time::Duration};
 use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Utc};
 use robson_connectors::BinanceRestClient;
+#[cfg(feature = "postgres")]
+use robson_domain::{ApprovalPolicy, EntryPolicy, EntryPolicyConfig};
 use robson_domain::{Position, PositionId, PositionState, Symbol, TradingPolicy};
 use robson_engine::Engine;
 use robson_exec::{ExchangePort, Executor, IntentJournal, StubExchange};
+#[cfg(feature = "postgres")]
+use robson_store::find_armed_entry_policies;
 #[cfg(feature = "postgres")]
 use robson_store::PgDetectedPositionRepository;
 // Optional projection recovery for crash recovery
@@ -87,6 +91,25 @@ pub struct Daemon<E: ExchangePort + 'static, S: Store + 'static> {
     pg_pool: Option<Arc<sqlx::PgPool>>,
     /// Last month processed by the month-boundary poller.
     last_month_check: Arc<RwLock<(i32, u32)>>,
+}
+
+/// Parse entry_mode and approval_mode strings from DB into EntryPolicyConfig.
+/// Returns None for unknown variants so callers can log and skip.
+#[cfg(feature = "postgres")]
+fn parse_entry_policy_config(entry_mode: &str, approval_mode: &str) -> Option<EntryPolicyConfig> {
+    let mode = match entry_mode {
+        "immediate" => EntryPolicy::Immediate,
+        "confirmed_trend" => EntryPolicy::ConfirmedTrend,
+        "confirmed_reversal" => EntryPolicy::ConfirmedReversal,
+        "confirmed_key_level" => EntryPolicy::ConfirmedKeyLevel,
+        _ => return None,
+    };
+    let approval = match approval_mode {
+        "automatic" => ApprovalPolicy::Automatic,
+        "human_confirmation" => ApprovalPolicy::HumanConfirmation,
+        _ => return None,
+    };
+    Some(EntryPolicyConfig::new(mode, approval))
 }
 
 /// Default query recorder (tracing only, no persistence).
@@ -475,6 +498,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
 
         // 3. Restore active positions
         self.restore_positions().await?;
+
+        // 3b. Re-spawn detector tasks for Armed positions (entry policy recovery).
+        // entry_policies is in-memory only; restore it from the projection so
+        // Armed positions don't silently stall after a restart.
+        #[cfg(feature = "postgres")]
+        self.restore_armed_detectors().await;
 
         // 3a. Startup stale-active gate (fail-closed; exit code 78 on abort).
         // Runs immediately — no grace period. Must precede the UNTRACKED scan.
@@ -1246,6 +1275,67 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         }
 
         Ok(())
+    }
+
+    /// Re-spawn detector tasks for Armed positions that were recovered from
+    /// the projection. Called once after `restore_positions()`.
+    ///
+    /// entry_policies is an in-memory HashMap that is lost on daemon restart.
+    /// This method reads the persisted entry_mode/approval_mode columns from
+    /// positions_current and calls PositionManager::restore_armed_position for
+    /// each Armed position that has a valid policy on record.
+    #[cfg(feature = "postgres")]
+    async fn restore_armed_detectors(&self) {
+        let (Some(pool), Some(tenant_id)) = (&self.pg_pool, self.config.projection.tenant_id)
+        else {
+            return;
+        };
+
+        let policies = match find_armed_entry_policies(pool, tenant_id).await {
+            Ok(p) => p,
+            Err(e) => {
+                warn!(error = %e, "Could not load armed entry policies; Armed positions will not have detectors");
+                return;
+            },
+        };
+
+        if policies.is_empty() {
+            info!("No Armed positions with persisted entry policies found");
+            return;
+        }
+
+        for (position_id, entry_mode, approval_mode) in policies {
+            let entry_policy_opt = parse_entry_policy_config(&entry_mode, &approval_mode);
+            let entry_policy = match entry_policy_opt {
+                Some(p) => p,
+                None => {
+                    warn!(
+                        %position_id,
+                        entry_mode = %entry_mode,
+                        approval_mode = %approval_mode,
+                        "Unknown entry/approval mode; skipping detector restore"
+                    );
+                    continue;
+                },
+            };
+
+            let position = match self.store.positions().find_by_id(position_id).await {
+                Ok(Some(p)) => p,
+                Ok(None) => {
+                    warn!(%position_id, "Armed position not found in store after restore; skipping");
+                    continue;
+                },
+                Err(e) => {
+                    warn!(%position_id, error = %e, "Failed to load position from store; skipping detector restore");
+                    continue;
+                },
+            };
+
+            let pm = self.position_manager.read().await;
+            if let Err(e) = pm.restore_armed_position(&position, entry_policy).await {
+                warn!(%position_id, error = %e, "Failed to restore detector for Armed position");
+            }
+        }
     }
 
     /// Start the API server.
