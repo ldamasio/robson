@@ -719,7 +719,34 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         }
 
         let open_positions = self.store.positions().find_risk_open().await?;
-        let carried_risk = Self::calculate_carried_risk(&open_positions);
+        let carried_risk_committed = Self::calculate_carried_risk(&open_positions);
+
+        // Armed positions have no measurable committed risk yet, but each will
+        // risk exactly 1% of capital when triggered. Use the previous month's
+        // capital_base to avoid a circular month-boundary calculation.
+        let (prev_year, prev_month_num) = if now.month() == 1 {
+            (now.year() - 1, 12u32)
+        } else {
+            (now.year(), now.month() - 1)
+        };
+        let prev_month = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+            chrono::NaiveDate::from_ymd_opt(prev_year, prev_month_num, 1)
+                .expect("previous month date must be valid")
+                .and_hms_opt(0, 0, 0)
+                .expect("midnight must be valid"),
+            chrono::Utc,
+        );
+        let prev_capital = {
+            let manager = self.position_manager.read().await;
+            manager.load_capital_base_for_month(prev_month).await.unwrap_or(Decimal::ZERO)
+        };
+        let all_open_positions = self.store.positions().find_active().await?;
+        let armed_count = all_open_positions
+            .iter()
+            .filter(|p| matches!(p.state, PositionState::Armed))
+            .count() as u32;
+        let armed_risk = prev_capital * Decimal::new(1, 2) * Decimal::from(armed_count);
+        let carried_risk = carried_risk_committed + armed_risk;
 
         // current_equity per ADR-0024 §6: wallet balance from the exchange.
         // The capital_base is pessimistic: it subtracts carried_risk (worst case
@@ -763,6 +790,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             month = now.month(),
             %capital_base,
             %carried_risk,
+            %carried_risk_committed,
+            armed_count,
+            %armed_risk,
             "Month boundary processed"
         );
 
@@ -1531,7 +1561,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
-    use robson_domain::{PositionState, Price, Quantity, Side, TechnicalStopDistance};
+    use robson_domain::{PositionState, Price, Quantity, RiskConfig, Side, TechnicalStopDistance};
     #[cfg(feature = "postgres")]
     use robson_eventlog::{
         append_event, query_events, ActorType, Event, QueryOptions, QUERY_STATE_CHANGED_EVENT_TYPE,
@@ -1625,6 +1655,44 @@ mod tests {
 
         assert_eq!(month_events.len(), 1, "month boundary must emit once per in-process month");
         assert_eq!(month_events[0], (dec!(10000), dec!(0), 5, 2026));
+    }
+
+    #[tokio::test]
+    async fn test_month_boundary_includes_armed_risk_in_carried_risk() {
+        let daemon = Daemon::new_stub(Config::test());
+        {
+            let manager = daemon.position_manager.read().await;
+            manager
+                .arm_position(
+                    Symbol::from_pair("BTCUSDT").unwrap(),
+                    Side::Long,
+                    RiskConfig::new(dec!(10000)).unwrap(),
+                    None,
+                    uuid::Uuid::now_v7(),
+                )
+                .await
+                .unwrap();
+        }
+
+        let now = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 1).single().unwrap();
+        daemon.handle_month_boundary(now).await.unwrap();
+
+        let events = daemon.store.events().get_all_events().await.unwrap();
+        let month_event = events
+            .iter()
+            .find_map(|event| match event {
+                robson_domain::Event::MonthBoundaryReset {
+                    capital_base,
+                    carried_positions_risk,
+                    month,
+                    year,
+                    ..
+                } => Some((*capital_base, *carried_positions_risk, *month, *year)),
+                _ => None,
+            })
+            .expect("month boundary event must be emitted");
+
+        assert_eq!(month_event, (dec!(9900), dec!(100), 5, 2026));
     }
 
     #[test]
