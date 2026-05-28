@@ -201,7 +201,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     #[cfg(feature = "postgres")]
     fn event_stream_key(event: &Event) -> String {
         match event {
-            Event::MonthBoundaryReset { year, month, .. } => {
+            Event::MonthBoundaryReset { year, month, .. }
+            | Event::CapitalBaseRecalibrated { year, month, .. } => {
                 format!("system:month_boundary:{year:04}-{month:02}")
             },
             _ => format!("position:{}", event.position_id()),

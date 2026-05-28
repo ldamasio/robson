@@ -5,13 +5,14 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use robson_domain::{
-    OrderFillEvidence, Position, PositionId, PositionState, Quantity, ReconciliationEvidence, Side,
-    Symbol, UserTradeEvidence,
+    Event, OrderFillEvidence, Position, PositionId, PositionState, Quantity,
+    ReconciliationEvidence, Side, Symbol, UserTradeEvidence,
 };
 use robson_exec::{ExchangePort, ExchangePosition, OrderResult, UserTradeRecord};
 use robson_store::Store;
+use rust_decimal::Decimal;
 use tokio::{
     sync::{Mutex, RwLock},
     time::{Instant, MissedTickBehavior},
@@ -278,6 +279,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         }
 
         reconciled += self.reconcile_local_missing_positions(&exchange_positions).await?;
+
+        if reconciled > 0 {
+            self.recalibrate_capital_base_after_manual_drift(reconciled).await?;
+        } else {
+            self.recalibrate_capital_base_after_pure_financial_drift().await?;
+        }
 
         Ok(reconciled)
     }
@@ -552,6 +559,179 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
             },
         }
     }
+
+    async fn recalibrate_capital_base_after_manual_drift(
+        &self,
+        reconciled_positions: usize,
+    ) -> DaemonResult<()> {
+        self.recalibrate_capital_base(
+            format!("reconciliation_worker:positions_reconciled={reconciled_positions}"),
+            Some(reconciled_positions),
+        )
+        .await
+    }
+
+    async fn recalibrate_capital_base_after_pure_financial_drift(&self) -> DaemonResult<()> {
+        let now = Utc::now();
+        let risk_open = self.store.positions().find_risk_open().await?;
+        let all_open = self.store.positions().find_active().await?;
+        let armed_count = all_open
+            .iter()
+            .filter(|position| matches!(position.state, PositionState::Armed))
+            .count();
+
+        if !risk_open.is_empty() || armed_count > 0 {
+            debug!(
+                risk_open_count = risk_open.len(),
+                armed_count,
+                "Pure financial drift scan skipped while Robson positions are open or armed"
+            );
+            return Ok(());
+        }
+
+        let wallet_balance = self.exchange.get_futures_balance().await?.wallet_balance;
+        let previous_capital_base = {
+            let manager = self.position_manager.read().await;
+            manager.load_monthly_state(now).await?.capital_base
+        };
+        let closed = self.store.positions().find_closed_in_month(now.year(), now.month()).await?;
+        let robson_month_net: Decimal =
+            closed.iter().map(|position| position.realized_pnl - position.fees_paid).sum();
+        let expected_wallet_balance = previous_capital_base + robson_month_net;
+        let unexplained_delta = wallet_balance - expected_wallet_balance;
+
+        if decimal_abs(unexplained_delta) <= financial_drift_tolerance() {
+            return Ok(());
+        }
+
+        warn!(
+            %wallet_balance,
+            %expected_wallet_balance,
+            %previous_capital_base,
+            %robson_month_net,
+            %unexplained_delta,
+            "Pure financial account drift detected; recalibrating capital_base"
+        );
+
+        self.recalibrate_capital_base(
+            format!(
+                "financial_drift:wallet_balance={wallet_balance};expected_wallet_balance={expected_wallet_balance};unexplained_delta={unexplained_delta}"
+            ),
+            None,
+        )
+        .await
+    }
+
+    async fn recalibrate_capital_base(
+        &self,
+        evidence: String,
+        reconciled_positions: Option<usize>,
+    ) -> DaemonResult<()> {
+        let now = Utc::now();
+        let wallet_balance = self.exchange.get_futures_balance().await?.wallet_balance;
+        let previous_capital_base = {
+            let manager = self.position_manager.read().await;
+            manager.load_monthly_state(now).await?.capital_base
+        };
+
+        let carried_risk_committed =
+            Self::calculate_committed_carried_risk(&self.store.positions().find_risk_open().await?);
+        let armed_count = self
+            .store
+            .positions()
+            .find_active()
+            .await?
+            .iter()
+            .filter(|position| matches!(position.state, PositionState::Armed))
+            .count() as u32;
+        let armed_risk = previous_capital_base * Decimal::new(1, 2) * Decimal::from(armed_count);
+        let carried_risk = carried_risk_committed + armed_risk;
+        let new_capital_base = (wallet_balance - carried_risk).max(Decimal::ZERO);
+
+        if new_capital_base == previous_capital_base {
+            info!(
+                %previous_capital_base,
+                %wallet_balance,
+                %carried_risk,
+                ?reconciled_positions,
+                "Capital base recalibration skipped: value unchanged after reconciliation"
+            );
+            return Ok(());
+        }
+
+        info!(
+            %previous_capital_base,
+            %new_capital_base,
+            %wallet_balance,
+            %carried_risk,
+            ?reconciled_positions,
+            "Capital base recalibrated after manual account drift"
+        );
+
+        let event = Event::CapitalBaseRecalibrated {
+            previous_capital_base,
+            new_capital_base,
+            wallet_balance,
+            carried_risk,
+            reason: "manual_account_change".to_string(),
+            evidence,
+            month: now.month(),
+            year: now.year(),
+            timestamp: now,
+        };
+
+        let manager = self.position_manager.read().await;
+        manager.emit_domain_event(event).await?;
+
+        Ok(())
+    }
+
+    fn calculate_committed_carried_risk(positions: &[Position]) -> Decimal {
+        positions
+            .iter()
+            .filter_map(|position| {
+                let qty = position.quantity.as_decimal();
+                if qty == Decimal::ZERO {
+                    return None;
+                }
+
+                let (entry, stop) = match &position.state {
+                    PositionState::Active { trailing_stop, .. } => {
+                        (position.entry_price?.as_decimal(), trailing_stop.as_decimal())
+                    },
+                    PositionState::Entering { expected_entry, .. } => {
+                        let entry = expected_entry.as_decimal();
+                        let stop = position
+                            .tech_stop_distance
+                            .as_ref()
+                            .map(|tech_stop| tech_stop.initial_stop.as_decimal())
+                            .unwrap_or(entry);
+                        (entry, stop)
+                    },
+                    _ => return None,
+                };
+
+                let risk = match position.side {
+                    Side::Long => (entry - stop) * qty,
+                    Side::Short => (stop - entry) * qty,
+                };
+
+                Some(risk.max(Decimal::ZERO))
+            })
+            .sum()
+    }
+}
+
+fn financial_drift_tolerance() -> Decimal {
+    Decimal::new(1, 2)
+}
+
+fn decimal_abs(value: Decimal) -> Decimal {
+    if value < Decimal::ZERO {
+        -value
+    } else {
+        value
+    }
 }
 
 #[cfg(test)]
@@ -698,6 +878,87 @@ mod tests {
             .iter()
             .filter(|event| matches!(event, robson_domain::Event::PositionClosed { .. }))
             .count()
+    }
+
+    async fn capital_base_recalibration_events(
+        store: &Arc<MemoryStore>,
+    ) -> Vec<robson_domain::Event> {
+        store
+            .events()
+            .get_all_events()
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|event| matches!(event, robson_domain::Event::CapitalBaseRecalibrated { .. }))
+            .collect()
+    }
+
+    async fn save_closed_position_with_pnl_and_fees(
+        store: &Arc<MemoryStore>,
+        realized_pnl: Decimal,
+        fees_paid: Decimal,
+    ) {
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let now = Utc::now();
+        let exit_price = Price::new(dec!(100) + realized_pnl).unwrap();
+        let mut position = Position::new(Uuid::now_v7(), symbol, Side::Long);
+        position.entry_price = Some(Price::new(dec!(100)).unwrap());
+        position.quantity = Quantity::new(dec!(1)).unwrap();
+        position.realized_pnl = realized_pnl;
+        position.fees_paid = fees_paid;
+        position.closed_at = Some(now);
+        position.updated_at = now;
+        position.state = PositionState::Closed {
+            exit_price,
+            realized_pnl,
+            exit_reason: ExitReason::TrailingStop,
+        };
+        store.positions().save(&position).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_pure_financial_drift_recalibrates_capital_base_without_open_risk() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        exchange.set_futures_balance(dec!(7500));
+        let worker = create_worker(exchange, store.clone(), event_bus, Duration::from_secs(0));
+
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
+
+        let events = capital_base_recalibration_events(&store).await;
+        assert_eq!(events.len(), 1);
+        match &events[0] {
+            robson_domain::Event::CapitalBaseRecalibrated {
+                previous_capital_base,
+                new_capital_base,
+                wallet_balance,
+                carried_risk,
+                evidence,
+                ..
+            } => {
+                assert_eq!(*previous_capital_base, dec!(10000));
+                assert_eq!(*new_capital_base, dec!(7500));
+                assert_eq!(*wallet_balance, dec!(7500));
+                assert_eq!(*carried_risk, Decimal::ZERO);
+                assert!(evidence.starts_with("financial_drift:"));
+            },
+            event => panic!("unexpected event: {event:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_pure_financial_drift_ignores_robson_closed_pnl() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        save_closed_position_with_pnl_and_fees(&store, dec!(200), dec!(0.50)).await;
+        exchange.set_futures_balance(dec!(10199.50));
+        let worker = create_worker(exchange, store.clone(), event_bus, Duration::from_secs(0));
+
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
+
+        assert!(capital_base_recalibration_events(&store).await.is_empty());
     }
 
     #[tokio::test]

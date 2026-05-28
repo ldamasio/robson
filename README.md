@@ -16,7 +16,7 @@ The system provides a single-operator runtime with a slot-based monthly risk mod
 - **Technical stop**: always from chart analysis (second S/R level, 15m timeframe) — never a percentage of entry price
 - **Slot capacity**: 4 concurrent positions maximum
 
-`capital_base` is set once at month start as a pessimistic snapshot: `wallet_balance − carried_risk(Entering + Active + Armed)`. It is immutable for the duration of the month.
+`capital_base` is set at month start as a pessimistic snapshot: `wallet_balance − carried_risk(Entering + Active + Armed)`. It is immutable during normal operation, but must be recalibrated if reconciliation detects manual account changes outside Robson.
 
 ## Position Lifecycle
 

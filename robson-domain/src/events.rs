@@ -333,6 +333,33 @@ pub enum Event {
         timestamp: DateTime<Utc>,
     },
 
+    /// Current-month capital base recalibrated after manual or otherwise
+    /// non-Robson account drift was detected.
+    ///
+    /// This is a system-scoped event. It does not belong to a specific
+    /// position, so helper accessors use `Uuid::nil()` as a synthetic
+    /// sentinel position ID.
+    CapitalBaseRecalibrated {
+        /// Previous monthly capital base from `monthly_state`
+        previous_capital_base: Decimal,
+        /// New monthly capital base after wallet-balance reconciliation
+        new_capital_base: Decimal,
+        /// Current Futures wallet balance observed on the exchange
+        wallet_balance: Decimal,
+        /// Risk reserved for carried positions at recalibration time
+        carried_risk: Decimal,
+        /// Machine-readable reason, e.g. `manual_account_change`
+        reason: String,
+        /// Human-readable or structured evidence reference
+        evidence: String,
+        /// UTC month (1-12)
+        month: u32,
+        /// UTC year
+        year: i32,
+        /// When the recalibration was processed
+        timestamp: DateTime<Utc>,
+    },
+
     /// Entry is awaiting operator approval before the order can be placed.
     ///
     /// Emitted when the entry signal passed risk evaluation but the position's
@@ -430,7 +457,9 @@ impl Event {
             | Event::PositionError { position_id, .. }
             | Event::InsuranceStopPlaced { position_id, .. }
             | Event::InsuranceStopCancelled { position_id, .. } => *position_id,
-            Event::MonthBoundaryReset { .. } => uuid::Uuid::nil(),
+            Event::MonthBoundaryReset { .. } | Event::CapitalBaseRecalibrated { .. } => {
+                uuid::Uuid::nil()
+            },
         }
     }
 
@@ -455,6 +484,7 @@ impl Event {
             | Event::ExitFilled { timestamp, .. }
             | Event::PositionClosed { timestamp, .. }
             | Event::MonthBoundaryReset { timestamp, .. }
+            | Event::CapitalBaseRecalibrated { timestamp, .. }
             | Event::EntryApprovalPending { timestamp, .. }
             | Event::PositionDisarmed { timestamp, .. }
             | Event::PositionError { timestamp, .. }
@@ -484,6 +514,7 @@ impl Event {
             Event::ExitFilled { .. } => "exit_filled",
             Event::PositionClosed { .. } => "position_closed",
             Event::MonthBoundaryReset { .. } => "month_boundary_reset",
+            Event::CapitalBaseRecalibrated { .. } => "capital_base_recalibrated",
             Event::EntryApprovalPending { .. } => "entry_approval_pending",
             Event::PositionDisarmed { .. } => "position_disarmed",
             Event::PositionError { .. } => "position_error",
