@@ -151,6 +151,27 @@ If a carried position closes in profit during the new month, that gain flows int
 `current_equity` and will feed the capital base of the month after. It does not
 retroactively increase the current month's `capital_base` or budget.
 
+### 6A. Intra-Month Recalibration After Manual Account Change
+
+The month-start `capital_base` is immutable only while the operated Futures
+account remains exclusively controlled by `robsond`. If reconciliation detects a
+manual or otherwise non-Robson account change, the current month's
+`capital_base` MUST be recalibrated before new entries are allowed.
+
+The recalibrated value uses the same pessimistic shape as the month-boundary
+rule:
+
+```text
+capital_base = max(0, current_futures_wallet_balance - carried_risk)
+```
+
+This recalibration is exceptional and auditable. It MUST be represented by a
+dedicated event such as `CapitalBaseRecalibrated`, not by replaying or mutating
+`MonthBoundaryReset`. The projector updates the current `monthly_state` row's
+`capital_base` while preserving accumulated `realized_loss` and `trades_opened`.
+
+See ADR-0038 for the full decision.
+
 **Rationale for the abstraction:**
 
 This design gives the operator a clean, predictable invariant: every month begins with

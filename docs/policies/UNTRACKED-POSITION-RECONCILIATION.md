@@ -22,13 +22,14 @@ No exceptions. No workarounds. No shortcuts.
 
 ---
 
-## The Three Invariants
+## The Four Invariants
 
 The policy is symmetric: the relation between Robson's local lifecycle state
 and the exchange's view of the account must hold in both directions. I1/I2
 protect the exchange-to-Robson direction (foreign positions get closed). I3
 protects the opposite direction (Robson-Active positions whose exchange
-counterpart has disappeared get reconciled).
+counterpart has disappeared get reconciled). I4 protects the account-level
+risk base after manual or otherwise non-Robson balance changes.
 
 ### I1 — Authorship Invariant
 
@@ -204,6 +205,36 @@ visible audit trail and an operator alert:
 The on-wire `Event::PositionClosed.closure_evidence.kind` is `reconciled`
 and the inner `source` is `estimated`; nothing about the JSON shape lets a
 downstream consumer mistake estimated PnL for a real exchange fill.
+
+### I4 — Capital Base Recalibration Invariant (ADR-0038)
+
+> **Manual account drift invalidates the current risk base.** If Robson detects
+> a manual or otherwise non-Robson change to the operated Futures account that
+> makes the exchange wallet/equity diverge materially from Robson's monthly
+> risk ledger, Robson MUST block new entries and recalculate the current
+> month's `capital_base` from the current Futures wallet balance before
+> trading resumes.
+
+I4 is account-level reconciliation. I1/I2/I3 reconcile positions; I4 reconciles
+the monthly risk base used for position sizing and MonthlyHalt.
+
+Required behavior:
+
+1. Detect account-level drift during reconciliation.
+2. Finish position-level reconciliation first: close UNTRACKED positions and
+   reconcile stale Robson `Active` positions according to I2/I3.
+3. Compute `new_capital_base = max(0, current_futures_wallet_balance - carried_risk)`.
+4. Emit a dedicated `CapitalBaseRecalibrated` event with previous base, new
+   base, wallet balance, carried risk, reason, evidence, month, year, and
+   timestamp.
+5. Project the event into `monthly_state.capital_base` without resetting
+   `realized_loss` or `trades_opened`.
+6. Recompute slots, position sizing, and MonthlyHalt using the recalibrated
+   value before any new entry proceeds.
+
+The canonical reason for this path is `manual_account_change`. Recalibration
+does not legitimize manual trading on the operated account and must not create
+synthetic Robson-authored entry history for manual trades.
 
 ---
 
@@ -409,6 +440,7 @@ the reconciliation close is non-overridable.
 ## Related Documentation
 
 - **[ADR-0022 — Robson-Authored Position Invariant](../adr/ADR-0022-robson-authored-position-invariant.md)**
+- **[ADR-0038 — Capital Base Recalibration After Manual Account Change](../adr/ADR-0038-capital-base-recalibration-after-manual-account-change.md)**
 - **[SYMBOL-AGNOSTIC-POLICIES.md](SYMBOL-AGNOSTIC-POLICIES.md)**
 - [v3-runtime-spec.md](../architecture/v3-runtime-spec.md) — Recovery Procedures §Reconciliation
 - [v3-control-loop.md](../architecture/v3-control-loop.md) — Crash Recovery §Reconciliation

@@ -5,13 +5,14 @@
 
 use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Datelike, Utc};
 use robson_domain::{
-    OrderFillEvidence, Position, PositionId, PositionState, Quantity, ReconciliationEvidence, Side,
-    Symbol, UserTradeEvidence,
+    Event, OrderFillEvidence, Position, PositionId, PositionState, Quantity,
+    ReconciliationEvidence, Side, Symbol, UserTradeEvidence,
 };
 use robson_exec::{ExchangePort, ExchangePosition, OrderResult, UserTradeRecord};
 use robson_store::Store;
+use rust_decimal::Decimal;
 use tokio::{
     sync::{Mutex, RwLock},
     time::{Instant, MissedTickBehavior},
@@ -278,6 +279,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         }
 
         reconciled += self.reconcile_local_missing_positions(&exchange_positions).await?;
+
+        if reconciled > 0 {
+            self.recalibrate_capital_base_after_manual_drift(reconciled).await?;
+        }
 
         Ok(reconciled)
     }
@@ -551,6 +556,105 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                 Err(DaemonError::Exec(error))
             },
         }
+    }
+
+    async fn recalibrate_capital_base_after_manual_drift(
+        &self,
+        reconciled_positions: usize,
+    ) -> DaemonResult<()> {
+        let now = Utc::now();
+        let wallet_balance = self.exchange.get_futures_balance().await?.wallet_balance;
+        let previous_capital_base = {
+            let manager = self.position_manager.read().await;
+            manager.load_monthly_state(now).await?.capital_base
+        };
+
+        let carried_risk_committed =
+            Self::calculate_committed_carried_risk(&self.store.positions().find_risk_open().await?);
+        let armed_count = self
+            .store
+            .positions()
+            .find_active()
+            .await?
+            .iter()
+            .filter(|position| matches!(position.state, PositionState::Armed))
+            .count() as u32;
+        let armed_risk =
+            previous_capital_base * Decimal::new(1, 2) * Decimal::from(armed_count);
+        let carried_risk = carried_risk_committed + armed_risk;
+        let new_capital_base = (wallet_balance - carried_risk).max(Decimal::ZERO);
+
+        if new_capital_base == previous_capital_base {
+            info!(
+                %previous_capital_base,
+                %wallet_balance,
+                %carried_risk,
+                reconciled_positions,
+                "Capital base recalibration skipped: value unchanged after reconciliation"
+            );
+            return Ok(());
+        }
+
+        info!(
+            %previous_capital_base,
+            %new_capital_base,
+            %wallet_balance,
+            %carried_risk,
+            reconciled_positions,
+            "Capital base recalibrated after manual account drift"
+        );
+
+        let event = Event::CapitalBaseRecalibrated {
+            previous_capital_base,
+            new_capital_base,
+            wallet_balance,
+            carried_risk,
+            reason: "manual_account_change".to_string(),
+            evidence: format!("reconciliation_worker:positions_reconciled={reconciled_positions}"),
+            month: now.month(),
+            year: now.year(),
+            timestamp: now,
+        };
+
+        let manager = self.position_manager.read().await;
+        manager.emit_domain_event(event).await?;
+
+        Ok(())
+    }
+
+    fn calculate_committed_carried_risk(positions: &[Position]) -> Decimal {
+        positions
+            .iter()
+            .filter_map(|position| {
+                let qty = position.quantity.as_decimal();
+                if qty == Decimal::ZERO {
+                    return None;
+                }
+
+                let (entry, stop) = match &position.state {
+                    PositionState::Active { trailing_stop, .. } => {
+                        (position.entry_price?.as_decimal(), trailing_stop.as_decimal())
+                    },
+                    PositionState::Entering { expected_entry, .. } => {
+                        let entry = expected_entry.as_decimal();
+                        let stop = position
+                            .tech_stop_distance
+                            .as_ref()
+                            .map(|tech_stop| tech_stop.initial_stop.as_decimal())
+                            .unwrap_or(entry);
+                        (entry, stop)
+                    },
+                    _ => return None,
+                };
+
+                let risk = match position.side {
+                    Side::Long => (entry - stop) * qty,
+                    Side::Short => (stop - entry) * qty,
+                };
+
+                Some(risk.max(Decimal::ZERO))
+            })
+            .sum()
     }
 }
 

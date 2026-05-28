@@ -255,6 +255,20 @@ pub struct MonthBoundaryReset {
     pub timestamp: DateTime<Utc>,
 }
 
+/// CAPITAL_BASE_RECALIBRATED payload
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CapitalBaseRecalibrated {
+    pub previous_capital_base: Decimal,
+    pub new_capital_base: Decimal,
+    pub wallet_balance: Decimal,
+    pub carried_risk: Decimal,
+    pub reason: String,
+    pub evidence: String,
+    pub month: u32,
+    pub year: i32,
+    pub timestamp: DateTime<Utc>,
+}
+
 // =============================================================================
 // BALANCE EVENTS
 // =============================================================================

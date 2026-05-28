@@ -28,6 +28,7 @@ enum ProjectionRoute {
     TechnicalStopAnalyzed,
     EntrySignalReceived,
     MonthBoundaryReset,
+    CapitalBaseRecalibrated,
     TrailingStopUpdated,
     PositionMonitorTick,
     ExitTriggered,
@@ -69,6 +70,7 @@ fn projection_route(event_type: &str) -> Option<ProjectionRoute> {
             Some(ProjectionRoute::EntrySignalReceived)
         },
         "month_boundary_reset" => Some(ProjectionRoute::MonthBoundaryReset),
+        "capital_base_recalibrated" => Some(ProjectionRoute::CapitalBaseRecalibrated),
         "trailing_stop_updated" | "TRAILING_STOP_UPDATED" => {
             Some(ProjectionRoute::TrailingStopUpdated)
         },
@@ -157,6 +159,9 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
         },
         Some(ProjectionRoute::MonthBoundaryReset) => {
             handlers::monthly_state::handle_month_boundary_reset(pool, envelope).await?
+        },
+        Some(ProjectionRoute::CapitalBaseRecalibrated) => {
+            handlers::monthly_state::handle_capital_base_recalibrated(pool, envelope).await?
         },
         Some(ProjectionRoute::TrailingStopUpdated) => {
             handlers::positions::handle_trailing_stop_updated(pool, envelope).await?

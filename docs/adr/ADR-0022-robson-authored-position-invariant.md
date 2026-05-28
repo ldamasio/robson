@@ -1,7 +1,7 @@
 # ADR-0022 — Robson-Authored Position Invariant
 
 **Date**: 2026-04-18
-**Last Amended**: 2026-05-11 (5B1 live + 5B2A merged; see Amendments)
+**Last Amended**: 2026-05-28 (capital base recalibration after manual account drift; see ADR-0038)
 **Status**: DECIDED — IN PROGRESS (I3 runtime steady-state and startup abort live; manual recovery 5B1 live; startup auto_reconcile 5B2B planned)
 **Deciders**: RBX Systems (operator + architecture)
 
@@ -26,6 +26,12 @@ Every such position silently consumes the account's exposure, margin, and risk
 budget that the Risk Engine assumes is free — with cascading effects under leverage.
 It also has no technical stop, no span, no governance trail, and is invisible to the
 monthly drawdown calculation.
+
+Manual account changes can also corrupt the current month's risk base even after
+position-level reconciliation closes the offending position. If the Futures wallet
+balance has fallen materially below the stored monthly `capital_base`, Robson must
+recalibrate the current month's base before allowing new entries. ADR-0038 defines
+that account-level reconciliation rule.
 
 The existing reconciliation flow (`v3-runtime-spec.md` — Recovery Procedure Scenario
 4) reconciles `RuntimeState` against the exchange and adopts the exchange state
@@ -120,6 +126,8 @@ exception (see [ADR-0023](ADR-0023-symbol-agnostic-policy-invariant.md)).
   due to a bug) results in an auto-close of a legitimate position. Mitigation: the
   exchange-order-id ↔ event-log link must be written atomically with the order
   placement (follow-up required).
+- A manual account loss or withdrawal now forces an additional reconciliation step:
+  current-month `capital_base` must be recalibrated before entries resume.
 
 ### Operational
 
@@ -184,6 +192,7 @@ Follow-up work required (tracked as `MIG-v3#TBD — Reconciliation Worker`):
 - [ADR-0007 — Robson is a Risk Assistant, not an Autotrader](ADR-0007-robson-is-risk-assistant-not-autotrader.md)
 - [ADR-0021 — Opportunity Detection vs Technical Stop Analysis](ADR-0021-opportunity-detection-vs-technical-stop-analysis.md)
 - [ADR-0023 — Symbol-Agnostic Policy Invariant](ADR-0023-symbol-agnostic-policy-invariant.md) (companion)
+- [ADR-0038 — Capital Base Recalibration After Manual Account Change](ADR-0038-capital-base-recalibration-after-manual-account-change.md)
 - [TD-2026-05-05-001 — Core Position Lifecycle Drift](../technical-debt.md) and its
   [Implementation Guide](../implementation/TD-2026-05-05-001-CORE-LIFECYCLE-DRIFT.md)
 - [Runbook td-2026-05-05-001-stale-active-recovery](../runbooks/td-2026-05-05-001-stale-active-recovery.md) — operator recovery when the startup gate aborts under I3
