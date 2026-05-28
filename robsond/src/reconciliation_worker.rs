@@ -644,8 +644,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
             .iter()
             .filter(|position| matches!(position.state, PositionState::Armed))
             .count() as u32;
-        let armed_risk =
-            previous_capital_base * Decimal::new(1, 2) * Decimal::from(armed_count);
+        let armed_risk = previous_capital_base * Decimal::new(1, 2) * Decimal::from(armed_count);
         let carried_risk = carried_risk_committed + armed_risk;
         let new_capital_base = (wallet_balance - carried_risk).max(Decimal::ZERO);
 
