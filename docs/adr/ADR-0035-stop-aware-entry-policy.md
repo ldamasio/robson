@@ -1,7 +1,7 @@
 # ADR-0035 — Stop-Aware Entry Policy (v4)
 
 **Date**: 2026-04-28
-**Status**: PROPOSED
+**Status**: DECIDED — Phases 1–2 IMPLEMENTED on `main` (StopAnchor metadata, StopQuality classifier, and shadow telemetry: the boost is computed and logged but NOT applied to decisions); Phases 3–5 DEFERRED to v4 (live `+15%` boost application, `+20%` exceptional shadow comparison, and feature-flagged `+20%` release). Administrative debug/observability surface is NOT part of this ADR and is tracked separately in issue #83.
 **Deciders**: RBX Systems (operator + architecture)
 
 ---
