@@ -321,18 +321,25 @@ export function connectEventStream(
   if (!browser) return () => {};
 
   const token = getToken();
-  const url = new URL(`${API_BASE}/events`, window.location.origin);
-  // Bearer token via query param for SSE (EventSource doesn't support headers).
-  if (token) url.searchParams.set("token", token);
+  const url = `${API_BASE}/events`;
 
-  const source = createEventSource(url.toString());
+  // Test mock factory takes precedence (no real fetch in tests)
+  const factory = (
+    window as unknown as {
+      __RBX_EVENT_SOURCE_FACTORY__?: (targetUrl: string) => EventSourceLike;
+    }
+  ).__RBX_EVENT_SOURCE_FACTORY__;
+
+  const source = factory
+    ? factory(url)
+    : new FetchEventSource(url, token);
 
   source.onmessage = (msg) => {
     try {
       const data = JSON.parse(msg.data) as SseEvent;
       onEvent(data);
     } catch {
-      // ignore malformed events
+      // ignore malformed events (heartbeats, etc.)
     }
   };
 
@@ -341,14 +348,74 @@ export function connectEventStream(
   return () => source.close();
 }
 
-function createEventSource(url: string): EventSourceLike {
-  const factory = (
-    window as unknown as {
-      __RBX_EVENT_SOURCE_FACTORY__?: (targetUrl: string) => EventSourceLike;
-    }
-  ).__RBX_EVENT_SOURCE_FACTORY__;
+/** Fetch-based SSE client — sends Bearer token via header, not query param. */
+class FetchEventSource implements EventSourceLike {
+  onmessage: ((this: EventSource, ev: MessageEvent) => unknown) | null = null;
+  onerror: ((this: EventSource, ev: Event) => unknown) | null = null;
 
-  return factory ? factory(url) : new EventSource(url);
+  private controller = new AbortController();
+
+  constructor(url: string, token: string | null) {
+    this.connect(url, token);
+  }
+
+  private async connect(url: string, token: string | null): Promise<void> {
+    const headers: Record<string, string> = { Accept: "text/event-stream" };
+    if (token) headers["Authorization"] = `Bearer ${token}`;
+
+    try {
+      const res = await fetch(url, {
+        headers,
+        signal: this.controller.signal,
+      });
+      if (!res.ok || !res.body) {
+        this.onerror?.call({} as EventSource, new Event("error"));
+        return;
+      }
+
+      const reader = res.body.getReader();
+      const decoder = new TextDecoder();
+      let buf = "";
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+
+        buf += decoder.decode(value, { stream: true });
+
+        // SSE events are separated by blank lines (\n\n)
+        let boundary: number;
+        while ((boundary = buf.indexOf("\n\n")) !== -1) {
+          const raw = buf.slice(0, boundary);
+          buf = buf.slice(boundary + 2);
+          this.dispatchSseEvent(raw);
+        }
+      }
+    } catch (err) {
+      if ((err as DOMException)?.name === "AbortError") return;
+      this.onerror?.call({} as EventSource, new Event("error"));
+    }
+  }
+
+  /** Parse a single SSE text block and emit onmessage for data lines. */
+  private dispatchSseEvent(text: string): void {
+    let data = "";
+    for (const line of text.split("\n")) {
+      if (line.startsWith(":")) continue; // comment / heartbeat
+      if (line.startsWith("data:")) {
+        data += line.slice(5);
+      }
+    }
+    if (!data) return;
+    this.onmessage?.call(
+      {} as EventSource,
+      new MessageEvent("message", { data }),
+    );
+  }
+
+  close(): void {
+    this.controller.abort();
+  }
 }
 
 // --- API surface ---

@@ -418,7 +418,6 @@ where
         .route("/readyz", get(health_readiness))
         // Standard read-only endpoints
         .route("/health", get(health_handler))
-        .route("/events", get(events_handler))
         .route("/status", get(status_handler))
         .route("/positions", get(month_positions_handler))
         .route("/positions/:id", get(get_position_handler))
@@ -471,6 +470,8 @@ where
         }
     });
     let mutating = Router::new()
+        // SSE — authenticated via Bearer header (not query param)
+        .route("/events", get(events_handler))
         .route("/positions", post(arm_handler))
         .route("/positions/:id", delete(cancel_or_close_handler))
         .route("/positions/:id/signal", post(signal_handler))
@@ -512,7 +513,11 @@ fn build_cors_layer() -> CorsLayer {
     CorsLayer::new()
         .allow_origin(AllowOrigin::list(origins))
         .allow_methods([Method::GET, Method::POST, Method::DELETE, Method::OPTIONS])
-        .allow_headers([header::AUTHORIZATION, header::CONTENT_TYPE])
+        .allow_headers([
+            header::AUTHORIZATION,
+            header::CONTENT_TYPE,
+            header::HeaderName::from_static("idempotency-key"),
+        ])
 }
 
 /// Prometheus metrics endpoint.
