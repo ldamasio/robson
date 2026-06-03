@@ -507,9 +507,10 @@ fn stream_key(saga_id: Uuid) -> String {
     format!("funding:{saga_id}")
 }
 
-/// Binance `origClientOrderId` / `clientTranKey` must match `^[a-zA-Z0-9-_]{1,36}$`.
-/// We use a 16-char truncated UUID (8 bytes hex) to stay well within the 36-char limit
-/// while retaining enough entropy for idempotency (64 bits = 2^64 unique values).
+/// Binance `origClientOrderId` / `clientTranKey` must match
+/// `^[a-zA-Z0-9-_]{1,36}$`. We use a 16-char truncated UUID (8 bytes hex) to
+/// stay well within the 36-char limit while retaining enough entropy for
+/// idempotency (64 bits = 2^64 unique values).
 #[cfg(feature = "postgres")]
 fn spot_client_order_id(saga_id: Uuid, asset: &str) -> String {
     let short = &saga_id.simple().to_string()[..16];
