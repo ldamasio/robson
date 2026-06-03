@@ -34,7 +34,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingWorker<E, S> {
                 }
                 _ = ticker.tick() => {
                     match self.service.resume_non_terminal().await {
-                        Ok(count) if count > 0 => debug!(count, "Funding worker resumed sagas"),
+                        Ok(count) if count > 0 => info!(count, "Funding worker resumed sagas"),
                         Ok(_) => {},
                         Err(error) => error!(%error, "Funding worker poll failed"),
                     }

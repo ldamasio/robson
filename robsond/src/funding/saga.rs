@@ -320,7 +320,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
     pub async fn resume_non_terminal(&self) -> DaemonResult<usize> {
         let rows = sqlx::query(
             r#"
-            SELECT saga_id
+            SELECT saga_id, state
             FROM funding_sagas
             WHERE tenant_id = $1
               AND state NOT IN ('REFRESHED', 'FAILED')
@@ -332,10 +332,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
         .fetch_all(&*self.pool)
         .await?;
 
+        if !rows.is_empty() {
+            tracing::info!(count = rows.len(), "Funding worker found non-terminal sagas");
+        }
+
         let mut resumed = 0;
-        for row in rows {
+        for row in &rows {
             let saga_id: Uuid = row.get("saga_id");
-            let _ = self.execute(saga_id, "funding-worker-resume").await;
+            let state: String = row.get("state");
+            tracing::info!(%saga_id, %state, "Funding worker resuming saga");
+            let result = self.execute(saga_id, "funding-worker-resume").await;
+            if let Err(err) = result {
+                tracing::error!(%saga_id, %err, "Funding worker saga resume failed");
+            }
             resumed += 1;
         }
         Ok(resumed)
