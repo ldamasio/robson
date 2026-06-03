@@ -7,6 +7,9 @@
   import { robsonApi, type FundingSaga, type FundingEvent } from '$api/robson';
   import { _ } from 'svelte-i18n';
 
+  // Decimal strings from the backend; format for display only.
+  const fmtUsdt = (v: string | number): string => Number(v).toFixed(2);
+
   const POLL_INTERVAL_MS = 2_000;
   const TERMINAL_STATES = new Set(['REFRESHED', 'FAILED']);
 
@@ -115,7 +118,7 @@
               <Row gap={4} justify="between" align="baseline">
                 <span class="mono">{item.asset}</span>
                 <span class="mono">{item.qty}</span>
-                <span class="mono dim">{item.est_usdt.toFixed(2)} USDT</span>
+                <span class="mono dim">{fmtUsdt(item.est_usdt)} USDT</span>
               </Row>
             {/each}
           </Stack>

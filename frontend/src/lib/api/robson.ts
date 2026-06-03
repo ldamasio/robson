@@ -154,17 +154,20 @@ export type FundingState =
   | "REFRESHED"
   | "FAILED";
 
+// Monetary fields are rust_decimal::Decimal, serialized by the backend as JSON
+// strings (e.g. "198.79328929...") to preserve precision. Keep them as strings
+// and format for display only — never compute money in the browser.
 export type FundingItem = {
   asset: string;
-  qty: number;
-  est_usdt: number;
+  qty: string;
+  est_usdt: string;
 };
 
 export type FundingQuote = {
   quote_id: string;
   items: FundingItem[];
-  estimated_usdt: number;
-  fees: number;
+  estimated_usdt: string;
+  fees: string;
   slippage_bps: number;
   expires_at: string;
 };
@@ -186,7 +189,7 @@ export type FundingSaga = {
 export type FundingSagaSummary = {
   saga_id: string;
   state: FundingState;
-  estimated_usdt: number;
+  estimated_usdt: string;
   created_at: string;
 };
 
