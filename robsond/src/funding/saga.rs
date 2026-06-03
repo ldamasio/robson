@@ -80,9 +80,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
             if balance.asset == "USDT" || balance.free <= Decimal::ZERO {
                 continue;
             }
-            let symbol = format!("{}USDT", balance.asset);
-            let price = self.exchange.get_spot_price(&symbol).await?;
-            let gross = balance.free * price.as_decimal();
+            let Some(route) = self.resolve_usdt_route(&balance.asset).await? else {
+                tracing::debug!(asset = %balance.asset, "Skipping spot asset without USDT route");
+                continue;
+            };
+            let price = self.exchange.get_spot_price(&route.symbol).await?;
+            let gross = match route.side {
+                SpotOrderSide::Sell => balance.free * price.as_decimal(),
+                SpotOrderSide::Buy => balance.free / price.as_decimal(),
+            };
             if gross < self.config.dust_usdt {
                 continue;
             }
@@ -97,7 +103,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
                 asset: balance.asset,
                 qty: balance.free,
                 est_usdt,
-                symbol,
+                symbol: route.symbol,
             });
         }
 
@@ -152,6 +158,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
         if view.state == FundingState::Converting.as_str() {
             for item in &quote.items {
                 let client_order_id = spot_client_order_id(quote_id, &item.asset);
+                let route = route_from_quote_item(&item.asset, &item.symbol)?;
                 let order =
                     match self.exchange.get_spot_order(&item.symbol, &client_order_id).await? {
                         Some(order) if order.status == "FILLED" => order,
@@ -159,8 +166,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
                             self.exchange
                                 .place_spot_market_order(SpotOrderRequest {
                                     symbol: item.symbol.clone(),
-                                    side: SpotOrderSide::Sell,
-                                    quantity_kind: SpotOrderQuantity::Base,
+                                    side: route.side,
+                                    quantity_kind: route.quantity_kind,
                                     quantity: item.qty,
                                     client_order_id: client_order_id.clone(),
                                 })
@@ -174,6 +181,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
                         item.asset
                     )));
                 }
+                let usdt_out = match route.side {
+                    SpotOrderSide::Sell => order.cummulative_quote_qty,
+                    SpotOrderSide::Buy if order.fee_asset == "USDT" => {
+                        (order.executed_qty - order.fee).max(Decimal::ZERO)
+                    },
+                    SpotOrderSide::Buy => order.executed_qty,
+                };
                 self.append_and_project(
                     quote_id,
                     FundingState::Converting,
@@ -181,7 +195,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
                     json!({
                         "asset": item.asset,
                         "qty": order.executed_qty,
-                        "usdt_out": order.cummulative_quote_qty,
+                        "usdt_out": usdt_out,
                         "client_order_id": client_order_id,
                     }),
                 )
@@ -338,6 +352,28 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
             .unwrap_or(Decimal::ZERO))
     }
 
+    async fn resolve_usdt_route(&self, asset: &str) -> DaemonResult<Option<SpotConversionRoute>> {
+        let direct = format!("{asset}USDT");
+        if self.exchange.spot_symbol_is_trading(&direct).await? {
+            return Ok(Some(SpotConversionRoute {
+                symbol: direct,
+                side: SpotOrderSide::Sell,
+                quantity_kind: SpotOrderQuantity::Base,
+            }));
+        }
+
+        let inverse = format!("USDT{asset}");
+        if self.exchange.spot_symbol_is_trading(&inverse).await? {
+            return Ok(Some(SpotConversionRoute {
+                symbol: inverse,
+                side: SpotOrderSide::Buy,
+                quantity_kind: SpotOrderQuantity::Quote,
+            }));
+        }
+
+        Ok(None)
+    }
+
     async fn fail(&self, saga_id: Uuid, reason: &str) -> DaemonResult<()> {
         self.append_and_project(
             saga_id,
@@ -479,4 +515,32 @@ fn spot_client_order_id(saga_id: Uuid, asset: &str) -> String {
 #[cfg(feature = "postgres")]
 fn transfer_client_key(saga_id: Uuid) -> String {
     format!("rbx-fund-transfer-{}", saga_id.simple())
+}
+
+#[cfg(feature = "postgres")]
+struct SpotConversionRoute {
+    symbol: String,
+    side: SpotOrderSide,
+    quantity_kind: SpotOrderQuantity,
+}
+
+#[cfg(feature = "postgres")]
+fn route_from_quote_item(asset: &str, symbol: &str) -> DaemonResult<SpotConversionRoute> {
+    if symbol == format!("{asset}USDT") {
+        return Ok(SpotConversionRoute {
+            symbol: symbol.to_string(),
+            side: SpotOrderSide::Sell,
+            quantity_kind: SpotOrderQuantity::Base,
+        });
+    }
+
+    if symbol == format!("USDT{asset}") {
+        return Ok(SpotConversionRoute {
+            symbol: symbol.to_string(),
+            side: SpotOrderSide::Buy,
+            quantity_kind: SpotOrderQuantity::Quote,
+        });
+    }
+
+    Err(DaemonError::Config(format!("invalid_funding_route:{asset}:{symbol}")))
 }

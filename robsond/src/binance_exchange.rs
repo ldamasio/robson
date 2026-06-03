@@ -337,6 +337,10 @@ impl ExchangePort for BinanceExchangeAdapter {
         self.client.get_spot_price(symbol).await.map_err(Self::map_error)
     }
 
+    async fn spot_symbol_is_trading(&self, symbol: &str) -> Result<bool, ExecError> {
+        self.client.spot_symbol_is_trading(symbol).await.map_err(Self::map_error)
+    }
+
     async fn place_spot_market_order(
         &self,
         request: SpotOrderRequest,
