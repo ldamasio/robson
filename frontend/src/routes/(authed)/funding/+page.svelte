@@ -6,6 +6,7 @@
   import {
     robsonApi,
     type FundingQuote,
+    type FundingRecoverSpotUsdtResponse,
     type FundingSagaSummary,
     type ApiError,
   } from '$api/robson';
@@ -25,9 +26,20 @@
   let submitting = $state(false);
   let tick = $state(Date.now());
   let tickTimer: ReturnType<typeof setInterval> | null = null;
+  let recoveryPreview = $state<FundingRecoverSpotUsdtResponse | null>(null);
+  let recoveryResult = $state<FundingRecoverSpotUsdtResponse | null>(null);
+  let recoveryError = $state<string | null>(null);
+  let recoveryConfirmInput = $state('');
+  let recoverySubmitting = $state(false);
 
   let keyword = $derived($_('funding.confirmKeyword') ?? 'CONVERTER E MOVER');
   let canConfirm = $derived(confirmInput === keyword && !submitting);
+  const recoveryConfirmPhrase = 'TRANSFER_SPOT_USDT_TO_FUTURES';
+  let recoveryCanExecute = $derived(
+    Boolean(recoveryPreview) &&
+      recoveryConfirmInput === recoveryConfirmPhrase &&
+      !recoverySubmitting,
+  );
 
   let expiresInMs = $derived.by(() => {
     if (!quote) return 0;
@@ -129,6 +141,54 @@
 
   function stateLabel(state: string): string {
     return $_(`funding.state.${state}`) ?? state;
+  }
+
+  function fmtRecovery(v: string | null | undefined): string {
+    if (!v) return '—';
+    return `${Number(v).toFixed(8)} USDT`;
+  }
+
+  async function previewSpotRecovery() {
+    recoveryError = null;
+    recoveryResult = null;
+    recoveryConfirmInput = '';
+    recoverySubmitting = true;
+    try {
+      recoveryPreview = await robsonApi.recoverSpotUsdtToFutures({
+        asset: 'USDT',
+        dry_run: true,
+      });
+    } catch (e) {
+      recoveryPreview = null;
+      recoveryError =
+        e instanceof Error ? e.message : 'Recovery preview failed';
+    } finally {
+      recoverySubmitting = false;
+    }
+  }
+
+  async function executeSpotRecovery() {
+    if (!recoveryPreview || !recoveryCanExecute) return;
+    recoveryError = null;
+    recoverySubmitting = true;
+    try {
+      recoveryResult = await robsonApi.recoverSpotUsdtToFutures({
+        asset: 'USDT',
+        amount: recoveryPreview.amount,
+        execute: true,
+        dry_run: false,
+        confirm: recoveryConfirmPhrase,
+        correlation_id: recoveryPreview.correlation_id,
+      });
+      recoveryPreview = recoveryResult;
+      recoveryConfirmInput = '';
+      void loadRecent();
+    } catch (e) {
+      recoveryError =
+        e instanceof Error ? e.message : 'Recovery execution failed';
+    } finally {
+      recoverySubmitting = false;
+    }
   }
 
   $effect(() => {
@@ -283,6 +343,122 @@
     </Stack>
   </Card>
 
+  <Card padding={6}>
+    <Stack gap={4}>
+      <div class="eyebrow">RECOVERY</div>
+      <h2>Transferir USDT livre da Spot para Futures</h2>
+      <p class="recovery-copy">
+        Recupera funding parcialmente executado sem nova conversão, sem compra e
+        sem trade. O preview é obrigatório antes da execução.
+      </p>
+
+      <Row gap={3} justify="start">
+        <button
+          class="btn-primary"
+          disabled={recoverySubmitting}
+          onclick={previewSpotRecovery}
+        >
+          {#if recoverySubmitting}
+            Consultando...
+          {:else}
+            Preview Spot → Futures
+          {/if}
+        </button>
+      </Row>
+
+      {#if recoveryError}
+        <p class="err-text">{recoveryError}</p>
+      {/if}
+
+      {#if recoveryPreview}
+        <div class="quote-block">
+          <Stack gap={3}>
+            <Row gap={4} justify="between" align="baseline">
+              <span class="eyebrow">Spot USDT antes</span>
+              <span class="mono"
+                >{fmtRecovery(recoveryPreview.spot_usdt_before)}</span
+              >
+            </Row>
+            <Row gap={4} justify="between" align="baseline">
+              <span class="eyebrow">Futures wallet antes</span>
+              <span class="mono"
+                >{fmtRecovery(recoveryPreview.futures_usdt_wallet_before)}</span
+              >
+            </Row>
+            <Row gap={4} justify="between" align="baseline">
+              <span class="eyebrow">Amount proposto</span>
+              <span class="mono">{fmtRecovery(recoveryPreview.amount)}</span>
+            </Row>
+            <Row gap={4} justify="between" align="baseline">
+              <span class="eyebrow">Spot esperado depois</span>
+              <span class="mono"
+                >{fmtRecovery(recoveryPreview.spot_usdt_after_expected)}</span
+              >
+            </Row>
+            <Row gap={4} justify="between" align="baseline">
+              <span class="eyebrow">Futures esperado depois</span>
+              <span class="mono"
+                >{fmtRecovery(
+                  recoveryPreview.futures_usdt_wallet_after_expected,
+                )}</span
+              >
+            </Row>
+            <Row gap={4} justify="between" align="baseline">
+              <span class="eyebrow">Correlation id</span>
+              <span class="mono dim">{recoveryPreview.correlation_id}</span>
+            </Row>
+            {#if recoveryResult}
+              <Row gap={4} justify="between" align="baseline">
+                <span class="eyebrow">Transfer id</span>
+                <span class="mono">{recoveryResult.transfer_id ?? '—'}</span>
+              </Row>
+              <Row gap={4} justify="between" align="baseline">
+                <span class="eyebrow">Spot atual</span>
+                <span class="mono"
+                  >{fmtRecovery(recoveryResult.spot_usdt_after_actual)}</span
+                >
+              </Row>
+              <Row gap={4} justify="between" align="baseline">
+                <span class="eyebrow">Futures atual</span>
+                <span class="mono"
+                  >{fmtRecovery(
+                    recoveryResult.futures_usdt_wallet_after_actual,
+                  )}</span
+                >
+              </Row>
+            {/if}
+          </Stack>
+        </div>
+
+        <Stack gap={2}>
+          <label class="eyebrow" for="recovery-confirm-input">
+            Digite exatamente: {recoveryConfirmPhrase}
+          </label>
+          <input
+            id="recovery-confirm-input"
+            type="text"
+            bind:value={recoveryConfirmInput}
+            autocomplete="off"
+            spellcheck="false"
+            class="confirm-input"
+            disabled={recoverySubmitting}
+          />
+        </Stack>
+
+        <Row gap={3} justify="end">
+          <button
+            class="btn-confirm"
+            class:ready={recoveryCanExecute}
+            disabled={!recoveryCanExecute}
+            onclick={executeSpotRecovery}
+          >
+            Transferir USDT Spot → Futures
+          </button>
+        </Row>
+      {/if}
+    </Stack>
+  </Card>
+
   {#if recent.length > 0}
     <section>
       <Stack gap={4}>
@@ -328,6 +504,11 @@
     font-weight: 300;
     letter-spacing: var(--track-tight);
   }
+  h2 {
+    font-size: var(--text-xl);
+    font-weight: 400;
+    letter-spacing: var(--track-tight);
+  }
   .eyebrow {
     font-family: var(--font-mono);
     font-size: var(--text-xs);
@@ -341,6 +522,11 @@
     background: var(--bg-2);
     border: 1px solid var(--border);
     border-radius: var(--radius-sm);
+  }
+  .recovery-copy {
+    color: var(--fg-2);
+    font-size: var(--text-sm);
+    line-height: 1.5;
   }
   .items {
     display: flex;

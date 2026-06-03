@@ -23,12 +23,12 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use chrono::Datelike;
+use chrono::{Datelike, Duration as ChronoDuration, Utc};
 use robson_domain::{
     ApprovalPolicy as DomainApprovalPolicy, DetectorSignal, EntryPolicy, EntryPolicyConfig,
     Position, PositionState, Price, RiskConfig, Side, Symbol, TradingPolicy,
 };
-use robson_exec::ExchangePort;
+use robson_exec::{ExchangePort, UniversalTransferType};
 #[cfg(feature = "postgres")]
 use robson_store::find_positions_overlapping_month;
 use robson_store::Store;
@@ -299,6 +299,48 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+fn default_usdt_asset() -> String {
+    "USDT".to_string()
+}
+
+fn default_true() -> bool {
+    true
+}
+
+#[derive(Debug, Deserialize)]
+pub struct FundingRecoverSpotUsdtRequest {
+    #[serde(default = "default_usdt_asset")]
+    pub asset: String,
+    pub amount: Option<Decimal>,
+    #[serde(default = "default_true")]
+    pub dry_run: bool,
+    #[serde(default)]
+    pub execute: bool,
+    pub confirm: Option<String>,
+    pub correlation_id: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct FundingRecoverSpotUsdtResponse {
+    pub correlation_id: String,
+    pub asset: String,
+    pub amount: Decimal,
+    pub from: String,
+    pub to: String,
+    pub transfer_type: String,
+    pub spot_usdt_before: Decimal,
+    pub futures_usdt_wallet_before: Decimal,
+    pub futures_usdt_available_before: Decimal,
+    pub spot_usdt_after_expected: Decimal,
+    pub futures_usdt_wallet_after_expected: Decimal,
+    pub spot_usdt_after_actual: Option<Decimal>,
+    pub futures_usdt_wallet_after_actual: Option<Decimal>,
+    pub futures_usdt_available_after_actual: Option<Decimal>,
+    pub transfer_id: Option<String>,
+    pub dry_run: bool,
+    pub idempotent_skip: bool,
+}
+
 // =============================================================================
 // Reconcile Close Types (Slice 5B1)
 // =============================================================================
@@ -483,6 +525,10 @@ where
         .route("/reconcile-close", post(reconcile_close_handler))
         .route("/funding/quote", post(funding_quote_handler::<E, S>))
         .route("/funding/execute", post(funding_execute_handler::<E, S>))
+        .route(
+            "/funding/recover-spot-usdt-to-futures",
+            post(funding_recover_spot_usdt_to_futures_handler::<E, S>),
+        )
         .route("/funding/:id", get(funding_get_handler::<E, S>))
         .route("/funding", get(funding_list_handler::<E, S>))
         .route("/capital/refresh", post(capital_refresh_handler::<E, S>))
@@ -660,6 +706,162 @@ where
         Json(serde_json::json!({ "error": "funding_store_unavailable" })),
     )
         .into_response()
+}
+
+async fn funding_recover_spot_usdt_to_futures_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    Json(request): Json<FundingRecoverSpotUsdtRequest>,
+) -> impl IntoResponse
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    const CONFIRM: &str = "TRANSFER_SPOT_USDT_TO_FUTURES";
+    const TRANSFER_TYPE: UniversalTransferType = UniversalTransferType::MainUmfuture;
+
+    fn bad_request(message: &str) -> axum::response::Response {
+        (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: message.to_string() }))
+            .into_response()
+    }
+
+    let asset = request.asset.trim().to_uppercase();
+    if asset != "USDT" {
+        return bad_request("only_usdt_recovery_is_supported");
+    }
+
+    let dry_run = request.dry_run || !request.execute;
+    if !dry_run && request.confirm.as_deref() != Some(CONFIRM) {
+        return bad_request("missing_exact_confirmation");
+    }
+
+    let spot_balances = match state.exchange.get_spot_account_balances().await {
+        Ok(balances) => balances,
+        Err(error) => {
+            return (StatusCode::BAD_GATEWAY, Json(ErrorResponse { error: error.to_string() }))
+                .into_response()
+        },
+    };
+    let spot_usdt_before = spot_balances
+        .iter()
+        .find(|balance| balance.asset.eq_ignore_ascii_case("USDT"))
+        .map(|balance| balance.free)
+        .unwrap_or(Decimal::ZERO);
+
+    let futures_before = match state.exchange.get_futures_balance().await {
+        Ok(balance) => balance,
+        Err(error) => {
+            return (StatusCode::BAD_GATEWAY, Json(ErrorResponse { error: error.to_string() }))
+                .into_response()
+        },
+    };
+
+    let amount = request.amount.unwrap_or(spot_usdt_before);
+    if amount <= Decimal::ZERO {
+        return bad_request("amount_must_be_positive");
+    }
+    if amount > spot_usdt_before {
+        return bad_request("insufficient_spot_usdt");
+    }
+
+    let correlation_id = request
+        .correlation_id
+        .filter(|id| !id.trim().is_empty())
+        .unwrap_or_else(|| funding_recovery_correlation_id(amount));
+    let transfer_history_start = Utc::now() - ChronoDuration::days(7);
+    let existing_transfer =
+        match state.exchange.get_transfer_history(TRANSFER_TYPE, transfer_history_start).await {
+            Ok(transfers) => transfers.into_iter().find(|transfer| {
+                transfer.client_tran_key.as_deref() == Some(correlation_id.as_str())
+                    && transfer.asset.eq_ignore_ascii_case("USDT")
+                    && transfer.amount == amount
+                    && transfer.transfer_type == TRANSFER_TYPE
+            }),
+            Err(error) => {
+                return (StatusCode::BAD_GATEWAY, Json(ErrorResponse { error: error.to_string() }))
+                    .into_response()
+            },
+        };
+
+    let mut transfer_id = existing_transfer.as_ref().map(|transfer| transfer.transfer_id.0.clone());
+    let idempotent_skip = existing_transfer.is_some();
+    if !dry_run && transfer_id.is_none() {
+        match state
+            .exchange
+            .universal_transfer("USDT", amount, TRANSFER_TYPE, &correlation_id)
+            .await
+        {
+            Ok(id) => transfer_id = Some(id.0),
+            Err(error) => {
+                return (StatusCode::BAD_GATEWAY, Json(ErrorResponse { error: error.to_string() }))
+                    .into_response()
+            },
+        }
+    }
+
+    let moved_amount = if dry_run || idempotent_skip {
+        Decimal::ZERO
+    } else {
+        amount
+    };
+    let (
+        spot_usdt_after_actual,
+        futures_usdt_wallet_after_actual,
+        futures_usdt_available_after_actual,
+    ) = if dry_run {
+        (None, None, None)
+    } else {
+        let spot_after = match state.exchange.get_spot_account_balances().await {
+            Ok(balances) => balances
+                .iter()
+                .find(|balance| balance.asset.eq_ignore_ascii_case("USDT"))
+                .map(|balance| balance.free)
+                .unwrap_or(Decimal::ZERO),
+            Err(error) => {
+                return (StatusCode::BAD_GATEWAY, Json(ErrorResponse { error: error.to_string() }))
+                    .into_response()
+            },
+        };
+        let futures_after = match state.exchange.get_futures_balance().await {
+            Ok(balance) => balance,
+            Err(error) => {
+                return (StatusCode::BAD_GATEWAY, Json(ErrorResponse { error: error.to_string() }))
+                    .into_response()
+            },
+        };
+        (
+            Some(spot_after),
+            Some(futures_after.wallet_balance),
+            Some(futures_after.available_balance),
+        )
+    };
+
+    (
+        StatusCode::OK,
+        Json(FundingRecoverSpotUsdtResponse {
+            correlation_id,
+            asset,
+            amount,
+            from: "spot".to_string(),
+            to: "futures".to_string(),
+            transfer_type: "MAIN_UMFUTURE".to_string(),
+            spot_usdt_before,
+            futures_usdt_wallet_before: futures_before.wallet_balance,
+            futures_usdt_available_before: futures_before.available_balance,
+            spot_usdt_after_expected: spot_usdt_before - moved_amount,
+            futures_usdt_wallet_after_expected: futures_before.wallet_balance + moved_amount,
+            spot_usdt_after_actual,
+            futures_usdt_wallet_after_actual,
+            futures_usdt_available_after_actual,
+            transfer_id,
+            dry_run,
+            idempotent_skip,
+        }),
+    )
+        .into_response()
+}
+
+fn funding_recovery_correlation_id(amount: Decimal) -> String {
+    format!("rbx-recover-spot-to-futures-usdt-{}", amount.normalize())
 }
 
 #[cfg(feature = "postgres")]
@@ -2190,6 +2392,20 @@ mod tests {
         capacity: usize,
     ) -> (Router, Arc<EventBus>, Arc<RwLock<PositionManager<StubExchange, MemoryStore>>>) {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
+        let (router, event_bus, position_manager, _) =
+            create_test_app_with_event_bus_and_exchange(capacity, exchange).await;
+        (router, event_bus, position_manager)
+    }
+
+    async fn create_test_app_with_event_bus_and_exchange(
+        capacity: usize,
+        exchange: Arc<StubExchange>,
+    ) -> (
+        Router,
+        Arc<EventBus>,
+        Arc<RwLock<PositionManager<StubExchange, MemoryStore>>>,
+        Arc<StubExchange>,
+    ) {
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
@@ -2210,7 +2426,7 @@ mod tests {
         let circuit_breaker = position_manager.read().await.circuit_breaker();
 
         let state = Arc::new(ApiState {
-            exchange,
+            exchange: Arc::clone(&exchange),
             position_manager: Arc::clone(&position_manager),
             event_bus: Arc::clone(&event_bus),
             circuit_breaker,
@@ -2223,7 +2439,7 @@ mod tests {
             funding: FundingConfig::default(),
         });
 
-        (create_router(state), event_bus, position_manager)
+        (create_router(state), event_bus, position_manager, exchange)
     }
 
     #[tokio::test]
@@ -2248,6 +2464,108 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json, serde_json::json!({ "error": "funding_disabled" }));
+    }
+
+    #[tokio::test]
+    async fn funding_recovery_dry_run_does_not_transfer() {
+        let exchange = Arc::new(StubExchange::new(dec!(95000)));
+        exchange.set_spot_balance("USDT", dec!(25), Decimal::ZERO);
+        exchange.set_futures_balance(dec!(100));
+        let (app, _, _, exchange) =
+            create_test_app_with_event_bus_and_exchange(100, exchange).await;
+
+        let body = serde_json::json!({ "asset": "USDT", "dry_run": true });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/funding/recover-spot-usdt-to-futures")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(exchange.transfer_call_count(), 0);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: FundingRecoverSpotUsdtResponse = serde_json::from_slice(&body).unwrap();
+        assert!(json.dry_run);
+        assert_eq!(json.amount, dec!(25));
+        assert_eq!(json.spot_usdt_after_expected, dec!(25));
+        assert_eq!(json.futures_usdt_wallet_after_expected, dec!(100));
+    }
+
+    #[tokio::test]
+    async fn funding_recovery_execution_requires_exact_confirmation() {
+        let exchange = Arc::new(StubExchange::new(dec!(95000)));
+        exchange.set_spot_balance("USDT", dec!(25), Decimal::ZERO);
+        let (app, _, _, exchange) =
+            create_test_app_with_event_bus_and_exchange(100, exchange).await;
+
+        let body = serde_json::json!({
+            "asset": "USDT",
+            "amount": "25",
+            "dry_run": false,
+            "execute": true,
+            "confirm": "WRONG"
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/funding/recover-spot-usdt-to-futures")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(exchange.transfer_call_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn funding_recovery_executes_spot_to_futures_transfer() {
+        let exchange = Arc::new(StubExchange::new(dec!(95000)));
+        exchange.set_spot_balance("USDT", dec!(25), Decimal::ZERO);
+        exchange.set_futures_balance(dec!(100));
+        let (app, _, _, exchange) =
+            create_test_app_with_event_bus_and_exchange(100, exchange).await;
+
+        let body = serde_json::json!({
+            "asset": "USDT",
+            "amount": "25",
+            "dry_run": false,
+            "execute": true,
+            "confirm": "TRANSFER_SPOT_USDT_TO_FUTURES",
+            "correlation_id": "test-recover-usdt"
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/funding/recover-spot-usdt-to-futures")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(exchange.transfer_call_count(), 1);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: FundingRecoverSpotUsdtResponse = serde_json::from_slice(&body).unwrap();
+        assert!(!json.dry_run);
+        assert_eq!(json.amount, dec!(25));
+        assert_eq!(json.spot_usdt_after_expected, Decimal::ZERO);
+        assert_eq!(json.futures_usdt_wallet_after_expected, dec!(125));
+        assert_eq!(json.spot_usdt_after_actual, Some(Decimal::ZERO));
+        assert_eq!(json.futures_usdt_wallet_after_actual, Some(dec!(125)));
+        assert_eq!(json.correlation_id, "test-recover-usdt");
     }
 
     // #[tokio::test]

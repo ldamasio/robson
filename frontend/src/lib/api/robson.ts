@@ -193,6 +193,35 @@ export type FundingSagaSummary = {
   created_at: string;
 };
 
+export type FundingRecoverSpotUsdtRequest = {
+  asset?: "USDT";
+  amount?: string;
+  dry_run?: boolean;
+  execute?: boolean;
+  confirm?: string;
+  correlation_id?: string;
+};
+
+export type FundingRecoverSpotUsdtResponse = {
+  correlation_id: string;
+  asset: string;
+  amount: string;
+  from: string;
+  to: string;
+  transfer_type: string;
+  spot_usdt_before: string;
+  futures_usdt_wallet_before: string;
+  futures_usdt_available_before: string;
+  spot_usdt_after_expected: string;
+  futures_usdt_wallet_after_expected: string;
+  spot_usdt_after_actual?: string | null;
+  futures_usdt_wallet_after_actual?: string | null;
+  futures_usdt_available_after_actual?: string | null;
+  transfer_id?: string | null;
+  dry_run: boolean;
+  idempotent_skip: boolean;
+};
+
 type EventSourceLike = {
   onmessage: ((this: EventSource, ev: MessageEvent) => unknown) | null;
   onerror: ((this: EventSource, ev: Event) => unknown) | null;
@@ -488,4 +517,13 @@ export const robsonApi = {
   getFundingSaga: (id: string) => apiFetch<FundingSaga>(`/funding/${id}`),
 
   listFunding: () => apiFetch<FundingSagaSummary[]>("/funding"),
+
+  recoverSpotUsdtToFutures: (body: FundingRecoverSpotUsdtRequest) =>
+    apiFetch<FundingRecoverSpotUsdtResponse>(
+      "/funding/recover-spot-usdt-to-futures",
+      {
+        method: "POST",
+        body: JSON.stringify(body),
+      },
+    ),
 };
