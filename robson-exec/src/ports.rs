@@ -177,6 +177,11 @@ pub trait ExchangePort: Send + Sync {
 
     async fn get_spot_price(&self, symbol: &str) -> Result<Price, ExecError>;
 
+    async fn spot_symbol_is_trading(&self, symbol: &str) -> Result<bool, ExecError> {
+        let _ = symbol;
+        Err(ExecError::Exchange("spot symbol trading lookup is not implemented".to_string()))
+    }
+
     async fn place_spot_market_order(
         &self,
         request: SpotOrderRequest,

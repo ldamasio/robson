@@ -626,6 +626,21 @@ impl BinanceRestClient {
             .map_err(|e| BinanceRestError::ParseError(format!("Invalid spot price: {}", e)))
     }
 
+    pub async fn spot_symbol_is_trading(&self, symbol: &str) -> Result<bool, BinanceRestError> {
+        let body = match self
+            .get_public("/api/v3/exchangeInfo", vec![("symbol", symbol.to_string())])
+            .await
+        {
+            Ok(body) => body,
+            Err(BinanceRestError::ApiError { code: -1121, .. }) => return Ok(false),
+            Err(error) => return Err(error),
+        };
+        let response: BinanceSpotExchangeInfoResponse =
+            serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+
+        Ok(response.symbols.into_iter().any(|info| info.status == "TRADING"))
+    }
+
     pub async fn place_spot_market_order(
         &self,
         symbol: &str,
@@ -880,6 +895,16 @@ pub struct BinanceSpotBalance {
     pub asset: String,
     pub free: Decimal,
     pub locked: Decimal,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BinanceSpotExchangeInfoResponse {
+    symbols: Vec<BinanceSpotSymbolInfo>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BinanceSpotSymbolInfo {
+    status: String,
 }
 
 #[derive(Debug, Clone, Deserialize)]

@@ -152,6 +152,10 @@ impl ExchangePort for PostConvertedCrashExchange {
         self.inner.get_spot_price(symbol).await
     }
 
+    async fn spot_symbol_is_trading(&self, symbol: &str) -> Result<bool, ExecError> {
+        self.inner.spot_symbol_is_trading(symbol).await
+    }
+
     async fn place_spot_market_order(
         &self,
         request: SpotOrderRequest,
@@ -235,6 +239,36 @@ async fn happy_path(pool: PgPool) -> anyhow::Result<()> {
     assert_eq!(capital, dec!(10499.50000));
     let engine_capital = harness.position_manager.read().await.engine().risk_config().capital();
     assert_eq!(engine_capital, capital);
+
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "Requires DATABASE_URL"]
+async fn inverse_pair_brl_to_usdt(pool: PgPool) -> anyhow::Result<()> {
+    let exchange = Arc::new(StubExchange::new(dec!(50000)));
+    exchange.set_futures_balance(dec!(10000));
+    exchange.set_spot_balance("BRL", dec!(1000), Decimal::ZERO);
+    exchange.set_price("USDTBRL", dec!(5.0));
+    exchange.set_trading_symbols(&["USDTBRL"]);
+    let harness = test_service(pool, exchange, FundingConfig::default());
+
+    let quote = harness.service.quote().await?;
+
+    assert_eq!(quote.items.len(), 1);
+    assert_eq!(quote.items[0].asset, "BRL");
+    assert_eq!(quote.items[0].symbol, "USDTBRL");
+    assert_eq!(quote.items[0].qty, dec!(1000));
+    assert_eq!(quote.items[0].est_usdt, dec!(199.4000));
+
+    let response = harness.service.execute(quote.quote_id, "inverse-brl").await?;
+
+    assert_eq!(response.state, FundingState::Refreshed.as_str());
+    assert_eq!(harness.exchange.spot_order_call_count(), 1);
+    assert_eq!(harness.exchange.transfer_call_count(), 1);
+
+    let capital = harness.service.refresh_capital().await?;
+    assert_eq!(capital, dec!(10199.800));
 
     Ok(())
 }

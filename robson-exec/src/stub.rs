@@ -3,7 +3,10 @@
 //! These implementations simulate exchange and market data behavior
 //! without making real API calls.
 
-use std::{collections::HashMap, sync::RwLock};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::RwLock,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -52,6 +55,7 @@ pub struct StubExchange {
     spot_balances: RwLock<HashMap<String, SpotBalance>>,
     spot_orders: RwLock<HashMap<String, SpotOrder>>,
     transfers: RwLock<Vec<Transfer>>,
+    trading_symbols: RwLock<Option<HashSet<String>>>,
     spot_order_calls: RwLock<u64>,
     transfer_calls: RwLock<u64>,
 }
@@ -76,6 +80,7 @@ impl StubExchange {
             spot_balances: RwLock::new(HashMap::new()),
             spot_orders: RwLock::new(HashMap::new()),
             transfers: RwLock::new(Vec::new()),
+            trading_symbols: RwLock::new(None),
             spot_order_calls: RwLock::new(0),
             transfer_calls: RwLock::new(0),
         }
@@ -83,7 +88,7 @@ impl StubExchange {
 
     /// Create a stub exchange with a specific futures balance.
     pub fn with_balance(default_price: Decimal, balance: Decimal) -> Self {
-        let mut exchange = Self::new(default_price);
+        let exchange = Self::new(default_price);
         *exchange.futures_balance.write().unwrap() = balance;
         exchange
     }
@@ -103,6 +108,11 @@ impl StubExchange {
     pub fn set_price(&self, symbol: &str, price: Decimal) {
         let mut prices = self.prices.write().unwrap();
         prices.insert(symbol.to_string(), price);
+    }
+
+    pub fn set_trading_symbols(&self, symbols: &[&str]) {
+        *self.trading_symbols.write().unwrap() =
+            Some(symbols.iter().map(|symbol| (*symbol).to_string()).collect());
     }
 
     /// Get price for a symbol (or default).
@@ -322,6 +332,16 @@ impl ExchangePort for StubExchange {
         Ok(Price::new(self.get_price_decimal(symbol)).unwrap())
     }
 
+    async fn spot_symbol_is_trading(&self, symbol: &str) -> Result<bool, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated symbol lookup failure".to_string()));
+        }
+        if let Some(symbols) = self.trading_symbols.read().unwrap().as_ref() {
+            return Ok(symbols.contains(symbol));
+        }
+        Ok(self.prices.read().unwrap().contains_key(symbol))
+    }
+
     async fn place_spot_market_order(
         &self,
         request: SpotOrderRequest,
@@ -340,7 +360,10 @@ impl ExchangePort for StubExchange {
             SpotOrderSide::Sell => base_qty * price,
             SpotOrderSide::Buy => request.quantity,
         };
-        let fee = quote_qty * self.fee_rate;
+        let fee = match request.side {
+            SpotOrderSide::Sell => quote_qty * self.fee_rate,
+            SpotOrderSide::Buy => base_qty * self.fee_rate,
+        };
         let asset = request.symbol.trim_end_matches("USDT");
 
         if request.side == SpotOrderSide::Sell {
@@ -357,6 +380,28 @@ impl ExchangePort for StubExchange {
                 locked: Decimal::ZERO,
             });
             usdt.free += quote_qty - fee;
+        } else if request.side == SpotOrderSide::Buy
+            && request.quantity_kind == SpotOrderQuantity::Quote
+        {
+            let quote_asset = request.symbol.strip_prefix("USDT").ok_or_else(|| {
+                ExecError::Exchange(format!(
+                    "Stub spot BUY quote order requires an inverse USDT pair, got {}",
+                    request.symbol
+                ))
+            })?;
+            let mut balances = self.spot_balances.write().unwrap();
+            let quote = balances.entry(quote_asset.to_string()).or_insert_with(|| SpotBalance {
+                asset: quote_asset.to_string(),
+                free: Decimal::ZERO,
+                locked: Decimal::ZERO,
+            });
+            quote.free = (quote.free - request.quantity).max(Decimal::ZERO);
+            let usdt = balances.entry("USDT".to_string()).or_insert_with(|| SpotBalance {
+                asset: "USDT".to_string(),
+                free: Decimal::ZERO,
+                locked: Decimal::ZERO,
+            });
+            usdt.free += base_qty - fee;
         }
 
         let order = SpotOrder {
