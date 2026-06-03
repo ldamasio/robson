@@ -145,6 +145,51 @@ export type SseEvent = {
   payload: Record<string, unknown>;
 };
 
+export type FundingState =
+  | "QUOTED"
+  | "CONVERTING"
+  | "CONVERTED"
+  | "TRANSFERRING"
+  | "SETTLED"
+  | "REFRESHED"
+  | "FAILED";
+
+export type FundingItem = {
+  asset: string;
+  qty: number;
+  est_usdt: number;
+};
+
+export type FundingQuote = {
+  quote_id: string;
+  items: FundingItem[];
+  estimated_usdt: number;
+  fees: number;
+  slippage_bps: number;
+  expires_at: string;
+};
+
+export type FundingEvent = {
+  type: string;
+  at: string;
+  [key: string]: unknown;
+};
+
+export type FundingSaga = {
+  saga_id: string;
+  state: FundingState;
+  items: FundingItem[];
+  events: FundingEvent[];
+  updated_at: string;
+};
+
+export type FundingSagaSummary = {
+  saga_id: string;
+  state: FundingState;
+  estimated_usdt: number;
+  created_at: string;
+};
+
 type EventSourceLike = {
   onmessage: ((this: EventSource, ev: MessageEvent) => unknown) | null;
   onerror: ((this: EventSource, ev: Event) => unknown) | null;
@@ -359,4 +404,18 @@ export const robsonApi = {
   panic: () => apiFetch<PanicResponse>("/panic", { method: "POST" }),
 
   getSafetyStatus: () => apiFetch<SafetyStatusResponse>("/safety/status"),
+
+  getFundingQuote: () =>
+    apiFetch<FundingQuote>("/funding/quote", { method: "POST" }),
+
+  executeFunding: (quoteId: string, idempotencyKey: string) =>
+    apiFetch<{ saga_id: string; state: FundingState }>("/funding/execute", {
+      method: "POST",
+      headers: { "Idempotency-Key": idempotencyKey },
+      body: JSON.stringify({ quote_id: quoteId }),
+    }),
+
+  getFundingSaga: (id: string) => apiFetch<FundingSaga>(`/funding/${id}`),
+
+  listFunding: () => apiFetch<FundingSagaSummary[]>("/funding"),
 };

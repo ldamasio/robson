@@ -72,6 +72,11 @@
     $recentEvents.filter((e) => isTodayUtc(e.occurred_at)),
   );
   let haltState = $derived($haltStatus?.state ?? "active");
+  let insufficientCapital = $derived(
+    !isHistoricalMonth && currentStatus
+      ? currentStatus.new_slots_available === 0
+      : false,
+  );
   let monthlyBudgetLimitPct = 4;
   let budgetUsedPct = $derived(
     Math.min(
@@ -385,6 +390,14 @@
       </Stack>
     </Card>
   {:else}
+    {#if insufficientCapital}
+      <a href="/funding" class="capital-banner">
+        <Row justify="between" align="center">
+          <span>{$_("dashboard.insufficientCapitalBanner")}</span>
+          <span class="mono">{$_("dashboard.addFunds")} →</span>
+        </Row>
+      </a>
+    {/if}
     <section>
       <Stack gap={4}>
         <div class="eyebrow">RISK DASHBOARD · {monthLabel()}</div>
@@ -657,6 +670,21 @@
     display: flex;
     flex-direction: column;
     gap: var(--s-7);
+  }
+  .capital-banner {
+    display: block;
+    padding: var(--s-3) var(--s-4);
+    background: var(--err-subtle);
+    border: 1px solid var(--err);
+    border-radius: var(--radius-sm);
+    color: var(--fg-0);
+    font-family: var(--font-sans);
+    font-size: var(--text-sm);
+    text-decoration: none;
+    transition: background var(--dur) var(--ease);
+  }
+  .capital-banner:hover {
+    background: color-mix(in srgb, var(--err) 12%, var(--err-subtle));
   }
   .header {
     padding-bottom: var(--s-5);
