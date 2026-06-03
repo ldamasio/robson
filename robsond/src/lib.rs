@@ -48,6 +48,7 @@ pub mod daemon;
 pub mod detector;
 pub mod error;
 pub mod event_bus;
+pub mod funding;
 pub mod market_data;
 pub mod metrics;
 pub mod position_manager;
@@ -69,8 +70,8 @@ pub use binance_exchange::BinanceExchangeAdapter;
 pub use binance_ohlcv::BinanceOhlcvAdapter;
 pub use circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot};
 pub use config::{
-    ApiConfig, Config, EngineConfig, Environment, MarketDataConfig, PositionMonitorConfig,
-    ProjectionConfig, ReconciliationConfig, StartupStaleActivePolicy,
+    ApiConfig, Config, EngineConfig, Environment, FundingConfig, MarketDataConfig,
+    PositionMonitorConfig, ProjectionConfig, ReconciliationConfig, StartupStaleActivePolicy,
 };
 pub use daemon::Daemon;
 pub use detector::{DetectorConfig, DetectorTask};

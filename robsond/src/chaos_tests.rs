@@ -9,10 +9,14 @@ use std::{
 use async_trait::async_trait;
 use robson_domain::{Event, OrderSide, PositionId, Price, Quantity, Side, Symbol};
 use robson_engine::{EngineAction, RiskCheck, RiskVerdict};
-use robson_exec::{ExchangePort, ExecError, Executor, FuturesBalance, FuturesSettings};
+use robson_exec::{
+    ExchangePort, ExecError, Executor, FuturesBalance, FuturesSettings, SpotBalance, SpotOrder,
+    SpotOrderRequest, Transfer, TransferId, UniversalTransferType,
+};
 use robson_store::{
     EventRepository, MemoryStore, OrderRepository, PositionRepository, Store, StoreError,
 };
+use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 use uuid::Uuid;
 
@@ -79,6 +83,47 @@ impl ExchangePort for TimeoutExchange {
             wallet_balance: dec!(10000),
             available_balance: dec!(10000),
         })
+    }
+
+    async fn get_spot_account_balances(&self) -> Result<Vec<SpotBalance>, ExecError> {
+        Ok(vec![])
+    }
+
+    async fn get_spot_price(&self, _symbol: &str) -> Result<Price, ExecError> {
+        Price::new(dec!(100)).map_err(ExecError::Domain)
+    }
+
+    async fn place_spot_market_order(
+        &self,
+        _request: SpotOrderRequest,
+    ) -> Result<SpotOrder, ExecError> {
+        Err(ExecError::Timeout("simulated exchange timeout".to_string()))
+    }
+
+    async fn get_spot_order(
+        &self,
+        _symbol: &str,
+        _client_order_id: &str,
+    ) -> Result<Option<SpotOrder>, ExecError> {
+        Ok(None)
+    }
+
+    async fn universal_transfer(
+        &self,
+        _asset: &str,
+        _amount: Decimal,
+        _transfer_type: UniversalTransferType,
+        _client_tran_key: &str,
+    ) -> Result<TransferId, ExecError> {
+        Err(ExecError::Timeout("simulated exchange timeout".to_string()))
+    }
+
+    async fn get_transfer_history(
+        &self,
+        _transfer_type: UniversalTransferType,
+        _start_time: chrono::DateTime<chrono::Utc>,
+    ) -> Result<Vec<Transfer>, ExecError> {
+        Ok(vec![])
     }
 
     async fn get_all_open_positions(

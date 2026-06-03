@@ -14,7 +14,9 @@ use crate::{
     error::ExecError,
     ports::{
         CandleInterval, ExchangePort, ExchangePosition, FuturesBalance, FuturesSettings,
-        MarketDataPort, OhlcvPort, OrderResult, PriceUpdate, UserTradeRecord,
+        MarketDataPort, OhlcvPort, OrderResult, PriceUpdate, SpotBalance, SpotOrder,
+        SpotOrderQuantity, SpotOrderRequest, SpotOrderSide, Transfer, TransferId,
+        UniversalTransferType, UserTradeRecord,
     },
 };
 
@@ -47,6 +49,11 @@ pub struct StubExchange {
     orders: RwLock<HashMap<String, OrderResult>>,
     /// Simulated user trades retrievable by `get_user_trades_since`.
     user_trades: RwLock<HashMap<String, Vec<UserTradeRecord>>>,
+    spot_balances: RwLock<HashMap<String, SpotBalance>>,
+    spot_orders: RwLock<HashMap<String, SpotOrder>>,
+    transfers: RwLock<Vec<Transfer>>,
+    spot_order_calls: RwLock<u64>,
+    transfer_calls: RwLock<u64>,
 }
 
 impl StubExchange {
@@ -66,6 +73,11 @@ impl StubExchange {
             futures_balance: RwLock::new(Decimal::from(10000)),
             orders: RwLock::new(HashMap::new()),
             user_trades: RwLock::new(HashMap::new()),
+            spot_balances: RwLock::new(HashMap::new()),
+            spot_orders: RwLock::new(HashMap::new()),
+            transfers: RwLock::new(Vec::new()),
+            spot_order_calls: RwLock::new(0),
+            transfer_calls: RwLock::new(0),
         }
     }
 
@@ -157,6 +169,30 @@ impl StubExchange {
     pub fn set_user_trades(&self, symbol: &str, trades: Vec<UserTradeRecord>) {
         let mut user_trades = self.user_trades.write().unwrap();
         user_trades.insert(symbol.to_string(), trades);
+    }
+
+    pub fn set_spot_balance(&self, asset: &str, free: Decimal, locked: Decimal) {
+        self.spot_balances.write().unwrap().insert(asset.to_string(), SpotBalance {
+            asset: asset.to_string(),
+            free,
+            locked,
+        });
+    }
+
+    pub fn set_spot_order(&self, order: SpotOrder) {
+        self.spot_orders.write().unwrap().insert(order.client_order_id.clone(), order);
+    }
+
+    pub fn set_transfer(&self, transfer: Transfer) {
+        self.transfers.write().unwrap().push(transfer);
+    }
+
+    pub fn spot_order_call_count(&self) -> u64 {
+        *self.spot_order_calls.read().unwrap()
+    }
+
+    pub fn transfer_call_count(&self) -> u64 {
+        *self.transfer_calls.read().unwrap()
     }
 }
 
@@ -270,6 +306,133 @@ impl ExchangePort for StubExchange {
             wallet_balance: balance,
             available_balance: balance,
         })
+    }
+
+    async fn get_spot_account_balances(&self) -> Result<Vec<SpotBalance>, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated spot balance fetch failure".to_string()));
+        }
+        Ok(self.spot_balances.read().unwrap().values().cloned().collect())
+    }
+
+    async fn get_spot_price(&self, symbol: &str) -> Result<Price, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated spot price fetch failure".to_string()));
+        }
+        Ok(Price::new(self.get_price_decimal(symbol)).unwrap())
+    }
+
+    async fn place_spot_market_order(
+        &self,
+        request: SpotOrderRequest,
+    ) -> Result<SpotOrder, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated spot order failure".to_string()));
+        }
+        *self.spot_order_calls.write().unwrap() += 1;
+
+        let price = self.get_price_decimal(&request.symbol);
+        let base_qty = match request.quantity_kind {
+            SpotOrderQuantity::Base => request.quantity,
+            SpotOrderQuantity::Quote => request.quantity / price,
+        };
+        let quote_qty = match request.side {
+            SpotOrderSide::Sell => base_qty * price,
+            SpotOrderSide::Buy => request.quantity,
+        };
+        let fee = quote_qty * self.fee_rate;
+        let asset = request.symbol.trim_end_matches("USDT");
+
+        if request.side == SpotOrderSide::Sell {
+            let mut balances = self.spot_balances.write().unwrap();
+            let balance = balances.entry(asset.to_string()).or_insert_with(|| SpotBalance {
+                asset: asset.to_string(),
+                free: Decimal::ZERO,
+                locked: Decimal::ZERO,
+            });
+            balance.free = (balance.free - base_qty).max(Decimal::ZERO);
+            let usdt = balances.entry("USDT".to_string()).or_insert_with(|| SpotBalance {
+                asset: "USDT".to_string(),
+                free: Decimal::ZERO,
+                locked: Decimal::ZERO,
+            });
+            usdt.free += quote_qty - fee;
+        }
+
+        let order = SpotOrder {
+            symbol: request.symbol,
+            exchange_order_id: self.next_order_id(),
+            client_order_id: request.client_order_id.clone(),
+            status: "FILLED".to_string(),
+            executed_qty: base_qty,
+            cummulative_quote_qty: quote_qty,
+            fee,
+            fee_asset: "USDT".to_string(),
+            transact_time: Utc::now(),
+        };
+        self.spot_orders.write().unwrap().insert(request.client_order_id, order.clone());
+        Ok(order)
+    }
+
+    async fn get_spot_order(
+        &self,
+        _symbol: &str,
+        client_order_id: &str,
+    ) -> Result<Option<SpotOrder>, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated spot order query failure".to_string()));
+        }
+        Ok(self.spot_orders.read().unwrap().get(client_order_id).cloned())
+    }
+
+    async fn universal_transfer(
+        &self,
+        asset: &str,
+        amount: Decimal,
+        transfer_type: UniversalTransferType,
+        client_tran_key: &str,
+    ) -> Result<TransferId, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated universal transfer failure".to_string()));
+        }
+        *self.transfer_calls.write().unwrap() += 1;
+        let transfer_id = TransferId(self.next_order_id());
+        let transfer = Transfer {
+            transfer_id: transfer_id.clone(),
+            client_tran_key: Some(client_tran_key.to_string()),
+            asset: asset.to_string(),
+            amount,
+            transfer_type,
+            status: "CONFIRMED".to_string(),
+            timestamp: Utc::now(),
+        };
+        self.transfers.write().unwrap().push(transfer);
+        if asset == "USDT" {
+            let mut balances = self.spot_balances.write().unwrap();
+            if let Some(usdt) = balances.get_mut("USDT") {
+                usdt.free = (usdt.free - amount).max(Decimal::ZERO);
+            }
+            *self.futures_balance.write().unwrap() += amount;
+        }
+        Ok(transfer_id)
+    }
+
+    async fn get_transfer_history(
+        &self,
+        transfer_type: UniversalTransferType,
+        start_time: DateTime<Utc>,
+    ) -> Result<Vec<Transfer>, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated transfer history failure".to_string()));
+        }
+        Ok(self
+            .transfers
+            .read()
+            .unwrap()
+            .iter()
+            .filter(|t| t.transfer_type == transfer_type && t.timestamp >= start_time)
+            .cloned()
+            .collect())
     }
 
     async fn get_all_open_positions(&self) -> Result<Vec<ExchangePosition>, ExecError> {
@@ -761,5 +924,44 @@ mod tests {
 
         let trades = exchange.get_user_trades_since(&symbol, Utc::now(), 100).await.unwrap();
         assert!(trades.is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_stub_spot_order_and_transfer_are_queryable_for_idempotency() {
+        let exchange = StubExchange::new(dec!(100));
+        exchange.set_price("ABCUSDT", dec!(10));
+        exchange.set_spot_balance("ABC", dec!(5), Decimal::ZERO);
+        exchange.set_spot_balance("USDT", dec!(1), Decimal::ZERO);
+
+        let request = SpotOrderRequest {
+            symbol: "ABCUSDT".to_string(),
+            side: SpotOrderSide::Sell,
+            quantity_kind: SpotOrderQuantity::Base,
+            quantity: dec!(5),
+            client_order_id: "spot-1".to_string(),
+        };
+        let order = exchange.place_spot_market_order(request).await.unwrap();
+        assert_eq!(order.status, "FILLED");
+        assert_eq!(exchange.spot_order_call_count(), 1);
+
+        let found = exchange.get_spot_order("ABCUSDT", "spot-1").await.unwrap();
+        assert!(found.is_some());
+
+        let transfer_id = exchange
+            .universal_transfer("USDT", dec!(10), UniversalTransferType::MainUmfuture, "transfer-1")
+            .await
+            .unwrap();
+        assert!(!transfer_id.0.is_empty());
+        assert_eq!(exchange.transfer_call_count(), 1);
+
+        let history = exchange
+            .get_transfer_history(
+                UniversalTransferType::MainUmfuture,
+                Utc::now() - chrono::Duration::minutes(1),
+            )
+            .await
+            .unwrap();
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0].client_tran_key.as_deref(), Some("transfer-1"));
     }
 }

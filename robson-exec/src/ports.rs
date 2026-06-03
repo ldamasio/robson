@@ -24,6 +24,74 @@ pub struct FuturesBalance {
     pub available_balance: Decimal,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpotBalance {
+    pub asset: String,
+    pub free: Decimal,
+    pub locked: Decimal,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SpotOrderSide {
+    Buy,
+    Sell,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum SpotOrderQuantity {
+    Base,
+    Quote,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpotOrderRequest {
+    pub symbol: String,
+    pub side: SpotOrderSide,
+    pub quantity_kind: SpotOrderQuantity,
+    pub quantity: Decimal,
+    pub client_order_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct SpotOrder {
+    pub symbol: String,
+    pub exchange_order_id: String,
+    pub client_order_id: String,
+    pub status: String,
+    pub executed_qty: Decimal,
+    pub cummulative_quote_qty: Decimal,
+    pub fee: Decimal,
+    pub fee_asset: String,
+    pub transact_time: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+pub enum UniversalTransferType {
+    MainUmfuture,
+}
+
+impl UniversalTransferType {
+    pub fn as_binance_str(&self) -> &'static str {
+        match self {
+            Self::MainUmfuture => "MAIN_UMFUTURE",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct TransferId(pub String);
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct Transfer {
+    pub transfer_id: TransferId,
+    pub client_tran_key: Option<String>,
+    pub asset: String,
+    pub amount: Decimal,
+    pub transfer_type: UniversalTransferType,
+    pub status: String,
+    pub timestamp: DateTime<Utc>,
+}
+
 /// Port for exchange operations (placing/canceling orders).
 ///
 /// Implementations:
@@ -104,6 +172,35 @@ pub trait ExchangePort: Send + Sync {
     /// available balance (free for new positions). Used for capital base
     /// derivation per ADR-0024 §6.
     async fn get_futures_balance(&self) -> Result<FuturesBalance, ExecError>;
+
+    async fn get_spot_account_balances(&self) -> Result<Vec<SpotBalance>, ExecError>;
+
+    async fn get_spot_price(&self, symbol: &str) -> Result<Price, ExecError>;
+
+    async fn place_spot_market_order(
+        &self,
+        request: SpotOrderRequest,
+    ) -> Result<SpotOrder, ExecError>;
+
+    async fn get_spot_order(
+        &self,
+        symbol: &str,
+        client_order_id: &str,
+    ) -> Result<Option<SpotOrder>, ExecError>;
+
+    async fn universal_transfer(
+        &self,
+        asset: &str,
+        amount: Decimal,
+        transfer_type: UniversalTransferType,
+        client_tran_key: &str,
+    ) -> Result<TransferId, ExecError>;
+
+    async fn get_transfer_history(
+        &self,
+        transfer_type: UniversalTransferType,
+        start_time: DateTime<Utc>,
+    ) -> Result<Vec<Transfer>, ExecError>;
 
     /// Query every currently open exchange position.
     ///

@@ -48,6 +48,8 @@ use tokio::{net::TcpListener, sync::RwLock};
 use tracing::{error, info, warn};
 
 #[cfg(feature = "postgres")]
+use crate::funding::{worker::FundingWorker, FundingService};
+#[cfg(feature = "postgres")]
 use crate::projection_worker::ProjectionWorker;
 #[cfg(feature = "postgres")]
 use crate::query::ExecutionQuery;
@@ -448,18 +450,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
     /// Best-effort: logs a warning on failure and continues with the
     /// placeholder so the daemon can still start during exchange outages.
     async fn initialize_capital(&self) {
-        match self.exchange.get_futures_balance().await {
-            Ok(balance) => {
-                let capital = balance.wallet_balance;
-                if capital <= rust_decimal::Decimal::ZERO {
-                    warn!(
-                        %capital,
-                        "Exchange reports zero or negative wallet balance — keeping placeholder capital"
-                    );
-                    return;
-                }
-                let manager = self.position_manager.read().await;
-                manager.update_engine_capital(capital);
+        match crate::api::refresh_capital_from_exchange(&self.exchange, &self.position_manager)
+            .await
+        {
+            Ok(capital) => {
                 info!(%capital, "Engine capital initialized from exchange balance");
             },
             Err(e) => {
@@ -623,6 +617,31 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         #[cfg(not(feature = "postgres"))]
         let projection_handle: Option<tokio::task::JoinHandle<()>> = None;
 
+        #[cfg(feature = "postgres")]
+        let funding_handle = if let (Some(pool), Some(tenant_id)) =
+            (&self.pg_pool, self.config.projection.tenant_id)
+        {
+            let service = FundingService::new(
+                pool.clone(),
+                tenant_id,
+                Arc::clone(&self.exchange),
+                Arc::clone(&self.position_manager),
+                self.config.funding.clone(),
+            );
+            let worker = FundingWorker::new(service);
+            let worker_shutdown = shutdown.clone();
+            Some(tokio::spawn(async move {
+                if let Err(e) = worker.run(worker_shutdown).await {
+                    error!(error = %e, "Funding worker failed");
+                }
+            }))
+        } else {
+            None
+        };
+
+        #[cfg(not(feature = "postgres"))]
+        let funding_handle: Option<tokio::task::JoinHandle<()>> = None;
+
         // 9. Subscribe to event bus
         let mut event_receiver = self.event_bus.subscribe();
 
@@ -687,6 +706,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         if let Some(handle) = projection_handle {
             info!("Waiting for projection worker to finish...");
             let _ = tokio::time::timeout(tokio::time::Duration::from_secs(30), handle).await;
+        }
+
+        if let Some(handle) = funding_handle {
+            info!("Waiting for funding worker to finish...");
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), handle).await;
         }
 
         if let Some(monitor) = position_monitor {
@@ -1382,6 +1406,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             pm.circuit_breaker()
         };
         let state = Arc::new(ApiState {
+            exchange: self.exchange.clone(),
             position_manager: self.position_manager.clone(),
             event_bus: self.event_bus.clone(),
             circuit_breaker,
@@ -1391,6 +1416,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             #[cfg(feature = "postgres")]
             tenant_id: self.config.projection.tenant_id,
             api_token: self.config.api.api_token.clone(),
+            funding: self.config.funding.clone(),
         });
 
         let router = create_router(state);
