@@ -381,11 +381,13 @@ impl DetectorTask {
         }
     }
 
-    /// Attempt an immediate signal using the last OHLCV candle close as entry price.
+    /// Attempt an immediate signal using the last OHLCV candle close as entry
+    /// price.
     ///
-    /// Used by `run` for `Immediate` mode before entering the reactive event loop.
-    /// Fetches candles from the OHLCV port, takes the last close as the reference
-    /// price, and delegates to `create_signal` (which computes the technical stop).
+    /// Used by `run` for `Immediate` mode before entering the reactive event
+    /// loop. Fetches candles from the OHLCV port, takes the last close as
+    /// the reference price, and delegates to `create_signal` (which
+    /// computes the technical stop).
     async fn try_proactive_immediate_signal(&self) -> DaemonResult<DetectorSignal> {
         let candles = self
             .ohlcv_port
