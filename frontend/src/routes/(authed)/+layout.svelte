@@ -2,6 +2,7 @@
   import { goto } from '$app/navigation';
   import { browser } from '$app/environment';
   import type { Snippet } from 'svelte';
+  import NavBar from '$design/components/NavBar.svelte';
 
   let { children }: { children: Snippet } = $props();
   let checked = $state(false);
@@ -20,5 +21,6 @@
 </script>
 
 {#if checked && hasToken}
+  <NavBar />
   {@render children()}
 {/if}

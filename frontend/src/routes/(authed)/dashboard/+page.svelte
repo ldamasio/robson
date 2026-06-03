@@ -351,10 +351,6 @@
 <div class="dashboard">
   <header class="header">
     <Row justify="between" align="center">
-      <Row gap={3} align="center">
-        <img src="/brand/rbx-mark.svg" alt="RBX" width="32" height="32" />
-        <img src="/brand/wordmark-robson.svg" alt="RBX Robson" height="22" />
-      </Row>
       <Row gap={4} align="center">
         <div class="status-strip">
           {#if error}
@@ -366,7 +362,8 @@
             {topBarLabel()} · SLOT {occupied}/{displayedSlots}
           {/if}
         </div>
-        <a href="/funding" class="nav-link">{$_("dashboard.treasuryNav")}</a>
+      </Row>
+      <Row gap={3} align="center">
         {#if isHistoricalMonth}
           <button class="btn-entry" onclick={returnToCurrentMonth}>NOW</button>
         {:else if haltState === "monthly_halt"}
