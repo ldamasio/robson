@@ -41,7 +41,8 @@
     "connectionError": "CONNECTION ERROR",
     "retry": "Retry",
     "insufficientCapitalBanner": "Insufficient capital to operate",
-    "addFunds": "Add funds"
+    "addFunds": "Add funds",
+    "treasuryNav": "Treasury"
   },
   "operation": {
     "position": "Position",

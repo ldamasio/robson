@@ -11,6 +11,10 @@
   } from '$api/robson';
   import { _ } from 'svelte-i18n';
 
+  // Monetary fields arrive as Decimal strings from the backend; format for
+  // display only (no money math in the browser).
+  const fmtUsdt = (v: string | number): string => Number(v).toFixed(2);
+
   type WizardPhase = 'quote' | 'preview' | 'confirm' | 'executing';
 
   let phase = $state<WizardPhase>('quote');
@@ -174,7 +178,7 @@
                   <Row gap={4} justify="between" align="baseline">
                     <span class="mono">{item.asset}</span>
                     <span class="mono">{item.qty}</span>
-                    <span class="mono dim">{item.est_usdt.toFixed(2)} USDT</span
+                    <span class="mono dim">{fmtUsdt(item.est_usdt)} USDT</span
                     >
                   </Row>
                 {/each}
@@ -183,12 +187,12 @@
                 <Row gap={4} justify="between" align="baseline">
                   <span class="eyebrow">{$_('funding.totalEstimated')}</span>
                   <span class="mono"
-                    >{quote.estimated_usdt.toFixed(2)} USDT</span
+                    >{fmtUsdt(quote.estimated_usdt)} USDT</span
                   >
                 </Row>
                 <Row gap={4} justify="between" align="baseline">
                   <span class="eyebrow">{$_('funding.fees')}</span>
-                  <span class="mono">{quote.fees.toFixed(2)} USDT</span>
+                  <span class="mono">{fmtUsdt(quote.fees)} USDT</span>
                 </Row>
                 <Row gap={4} justify="between" align="baseline">
                   <span class="eyebrow">{$_('funding.slippageBps')}</span>
@@ -294,7 +298,7 @@
                   >
                 </Stack>
                 <span class="state-pill">{stateLabel(saga.state)}</span>
-                <span class="mono">{saga.estimated_usdt.toFixed(2)} USDT</span>
+                <span class="mono">{fmtUsdt(saga.estimated_usdt)} USDT</span>
               </Row>
             </Card>
           </a>

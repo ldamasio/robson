@@ -41,7 +41,8 @@
     "connectionError": "ERRO DE CONEXÃO",
     "retry": "Tentar novamente",
     "insufficientCapitalBanner": "Capital insuficiente para operar",
-    "addFunds": "Adicionar fundos"
+    "addFunds": "Adicionar fundos",
+    "treasuryNav": "Tesouraria"
   },
   "operation": {
     "position": "Posição",

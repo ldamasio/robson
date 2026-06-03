@@ -366,6 +366,7 @@
             {topBarLabel()} · SLOT {occupied}/{displayedSlots}
           {/if}
         </div>
+        <a href="/funding" class="nav-link">{$_("dashboard.treasuryNav")}</a>
         {#if isHistoricalMonth}
           <button class="btn-entry" onclick={returnToCurrentMonth}>NOW</button>
         {:else if haltState === "monthly_halt"}
@@ -907,6 +908,20 @@
     border-color: var(--err);
     cursor: not-allowed;
     opacity: 0.8;
+  }
+  /* Sober, always-present treasury link (Zurich): quieter than the primary
+     action button — no border, dim until hover. */
+  .nav-link {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: var(--track-label);
+    color: var(--fg-2);
+    text-decoration: none;
+    transition: color var(--dur) var(--ease);
+  }
+  .nav-link:hover {
+    color: var(--cyan-brand);
   }
   .btn-approve {
     font-family: var(--font-mono);
