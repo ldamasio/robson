@@ -58,8 +58,8 @@ use robson_engine::{
         StopConfidence as AnalyzerStopConfidence, TechnicalStopAnalysis, TechnicalStopAnalyzer,
         TechnicalStopConfig, TechnicalStopMethod as AnalyzerTechnicalStopMethod,
     },
-    KeyLevelStrategy, ReversalPatternStrategy, SignalContext, SignalDecision, SmaCrossoverStrategy,
-    StrategyRegistry,
+    KeyLevelStrategy, ReversalPatternStrategy, SignalContext, SignalDecision, SignalReason,
+    SmaCrossoverStrategy, StrategyRegistry,
 };
 use robson_exec::{CandleInterval, OhlcvPort};
 use tokio::task::JoinHandle;
@@ -343,6 +343,27 @@ impl DetectorTask {
         cancel_token: CancellationToken,
         mut receiver: EventReceiver,
     ) -> Option<DetectorSignal> {
+        // For Immediate mode: fire proactively without waiting for a market data tick.
+        // This prevents the position from staying Armed if no tick arrives promptly or
+        // if compute_technical_stop fails silently on reactive ticks.
+        if self.config.entry_policy.mode == EntryPolicy::Immediate {
+            match self.try_proactive_immediate_signal().await {
+                Ok(signal) => {
+                    self.event_bus.send(DaemonEvent::DetectorSignal(signal.clone()));
+                    return Some(signal);
+                },
+                Err(error) => {
+                    warn!(
+                        flow = "entry_immediate",
+                        position_id = %self.config.position_id,
+                        symbol = %self.config.symbol.as_pair(),
+                        error = %error,
+                        "Immediate proactive fire failed — falling back to reactive loop"
+                    );
+                },
+            }
+        }
+
         loop {
             // Cooperatively check for cancellation
             tokio::select! {
@@ -384,6 +405,43 @@ impl DetectorTask {
                 }
             }
         }
+    }
+
+    /// Attempt an immediate signal using the last OHLCV candle close as entry price.
+    ///
+    /// Used by `run` for `Immediate` mode before entering the reactive event loop.
+    /// Fetches candles from the OHLCV port, takes the last close as the reference
+    /// price, and delegates to `create_signal` (which computes the technical stop).
+    async fn try_proactive_immediate_signal(&self) -> DaemonResult<DetectorSignal> {
+        let candles = self
+            .ohlcv_port
+            .fetch_candles(&self.config.symbol, CandleInterval::FifteenMinutes, 100)
+            .await?;
+
+        let last_close = candles
+            .last()
+            .ok_or_else(|| {
+                DaemonError::Detector("no candles available for immediate entry".to_string())
+            })?
+            .close;
+
+        info!(
+            flow = "entry_immediate",
+            position_id = %self.config.position_id,
+            symbol = %self.config.symbol.as_pair(),
+            side = ?self.config.side,
+            reference_price = %last_close,
+            "Immediate proactive fire: using last candle close as entry price"
+        );
+
+        let decision = SignalDecision::SignalConfirmed {
+            side: self.config.side,
+            reason: SignalReason::Immediate,
+            observed_at: chrono::Utc::now(),
+            reference_price: last_close,
+        };
+
+        self.create_signal(decision).await
     }
 
     /// Handle a single daemon event.
@@ -495,7 +553,7 @@ impl DetectorTask {
             );
             return Ok(SignalDecision::SignalConfirmed {
                 side: self.config.side,
-                reason: robson_engine::SignalReason::Immediate,
+                reason: SignalReason::Immediate,
                 observed_at: market_data.timestamp,
                 reference_price: market_data.price.as_decimal(),
             });
