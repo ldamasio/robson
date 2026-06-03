@@ -935,6 +935,7 @@ pub struct BinanceUniversalTransferResponse {
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct BinanceUniversalTransferHistoryResponse {
+    #[serde(default)]
     pub rows: Vec<BinanceUniversalTransfer>,
 }
 
