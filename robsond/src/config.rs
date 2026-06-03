@@ -37,6 +37,9 @@ pub struct Config {
     /// Reconciliation worker configuration.
     pub reconciliation: ReconciliationConfig,
 
+    /// Funding treasury capability configuration.
+    pub funding: FundingConfig,
+
     /// Environment (test, development, production)
     pub environment: Environment,
 }
@@ -54,6 +57,25 @@ pub struct ApiConfig {
     /// Bearer token for authenticating mutating API routes.
     /// Required when ROBSON_ENV=production; optional otherwise.
     pub api_token: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+pub struct FundingConfig {
+    pub enabled: bool,
+    pub dust_usdt: Decimal,
+    pub quote_ttl_secs: u64,
+    pub slippage_bps: u32,
+}
+
+impl Default for FundingConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            dust_usdt: Decimal::ONE,
+            quote_ttl_secs: 60,
+            slippage_bps: 20,
+        }
+    }
 }
 
 /// Projection configuration.
@@ -239,6 +261,7 @@ impl Config {
         let market_data = Self::load_market_data_config()?;
         let position_monitor = Self::load_position_monitor_config()?;
         let reconciliation = Self::load_reconciliation_config()?;
+        let funding = Self::load_funding_config()?;
 
         // Fail-fast: API token is mandatory in production
         if environment == Environment::Production && api.api_token.is_none() {
@@ -255,6 +278,7 @@ impl Config {
             market_data,
             position_monitor,
             reconciliation,
+            funding,
             environment,
         })
     }
@@ -296,6 +320,7 @@ impl Config {
                 missing_grace_secs: 60,
                 on_startup_stale_active: StartupStaleActivePolicy::Abort,
             },
+            funding: FundingConfig::default(),
             environment: Environment::Test,
         }
     }
@@ -396,6 +421,29 @@ impl Config {
                 .map_err(|_| DaemonError::Config(format!("Invalid {} value: {}", key, val))),
             Err(_) => Ok(default),
         }
+    }
+
+    fn load_funding_config() -> DaemonResult<FundingConfig> {
+        let enabled = env::var("FUNDING_ENABLED")
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        let dust_usdt = Self::load_decimal_env("DUST_USDT", Decimal::ONE)?;
+        let quote_ttl_secs = env::var("FUNDING_QUOTE_TTL_SECS")
+            .ok()
+            .map(|v| {
+                v.parse::<u64>().map_err(|_| {
+                    DaemonError::Config(format!("Invalid FUNDING_QUOTE_TTL_SECS: {v}"))
+                })
+            })
+            .transpose()?
+            .unwrap_or(60);
+
+        Ok(FundingConfig {
+            enabled,
+            dust_usdt,
+            quote_ttl_secs,
+            slippage_bps: 20,
+        })
     }
 
     fn load_projection_config() -> DaemonResult<ProjectionConfig> {
@@ -564,6 +612,7 @@ impl Default for Config {
             market_data: MarketDataConfig::default(),
             position_monitor: PositionMonitorConfig::default(),
             reconciliation: ReconciliationConfig::default(),
+            funding: FundingConfig::default(),
             environment: Environment::Development,
         }
     }

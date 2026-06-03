@@ -14,7 +14,7 @@ use std::{convert::Infallible, sync::Arc, time::Duration};
 use async_stream::stream;
 use axum::{
     extract::{Path, Query, Request, State},
-    http::{header, HeaderValue, Method, StatusCode},
+    http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::{
         sse::{KeepAlive, Sse},
@@ -41,8 +41,10 @@ use uuid::Uuid;
 
 use crate::{
     circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot},
+    config::FundingConfig,
     error::DaemonError,
     event_bus::EventBus,
+    funding::{CapitalRefreshResponse, ExecuteFundingRequest},
     position_manager::PositionManager,
     position_monitor::PositionMonitor,
     sse::{map_daemon_event, resync_required_event},
@@ -54,6 +56,7 @@ use crate::{
 
 /// Shared state for API handlers.
 pub struct ApiState<E: ExchangePort + 'static, S: Store + 'static> {
+    pub exchange: Arc<E>,
     pub position_manager: Arc<RwLock<PositionManager<E, S>>>,
     pub event_bus: Arc<EventBus>,
     pub circuit_breaker: Arc<CircuitBreaker>,
@@ -67,6 +70,7 @@ pub struct ApiState<E: ExchangePort + 'static, S: Store + 'static> {
     /// Bearer token for authenticating mutating routes. `None` means auth is
     /// disabled (non-production environments only).
     pub api_token: Option<String>,
+    pub funding: FundingConfig,
 }
 
 // =============================================================================
@@ -476,6 +480,11 @@ where
         .route("/monthly-halt", post(monthly_halt_trigger_handler))
         // Manual reconciliation close (Slice 5B1)
         .route("/reconcile-close", post(reconcile_close_handler))
+        .route("/funding/quote", post(funding_quote_handler::<E, S>))
+        .route("/funding/execute", post(funding_execute_handler::<E, S>))
+        .route("/funding/:id", get(funding_get_handler::<E, S>))
+        .route("/funding", get(funding_list_handler::<E, S>))
+        .route("/capital/refresh", post(capital_refresh_handler::<E, S>))
         .layer(auth_layer)
         .with_state(state);
 
@@ -517,6 +526,241 @@ async fn metrics_handler() -> impl IntoResponse {
         [(header::CONTENT_TYPE, "text/plain; version=0.0.4; charset=utf-8")],
         body,
     )
+}
+
+#[cfg(feature = "postgres")]
+fn funding_service<E, S>(
+    state: &ApiState<E, S>,
+) -> Result<crate::funding::FundingService<E, S>, (StatusCode, Json<ErrorResponse>)>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let (Some(pool), Some(tenant_id)) = (&state.pg_pool, state.tenant_id) else {
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "funding_store_unavailable".to_string(),
+            }),
+        ));
+    };
+    Ok(crate::funding::FundingService::new(
+        pool.clone(),
+        tenant_id,
+        state.exchange.clone(),
+        state.position_manager.clone(),
+        state.funding.clone(),
+    ))
+}
+
+#[cfg(feature = "postgres")]
+async fn funding_quote_handler<E, S>(State(state): State<Arc<ApiState<E, S>>>) -> impl IntoResponse
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    match funding_service(&state) {
+        Ok(service) => match service.quote().await {
+            Ok(quote) => (StatusCode::OK, Json(quote)).into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: error.to_string() }),
+            )
+                .into_response(),
+        },
+        Err(response) => response.into_response(),
+    }
+}
+
+#[cfg(not(feature = "postgres"))]
+async fn funding_quote_handler<E, S>(State(_state): State<Arc<ApiState<E, S>>>) -> impl IntoResponse
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            error: "funding_store_unavailable".to_string(),
+        }),
+    )
+}
+
+#[cfg(feature = "postgres")]
+async fn funding_execute_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    headers: HeaderMap,
+    Json(request): Json<ExecuteFundingRequest>,
+) -> impl IntoResponse
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    if !state.funding.enabled {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "funding_disabled" })),
+        )
+            .into_response();
+    }
+    let Some(idempotency_key) =
+        headers.get("Idempotency-Key").and_then(|value| value.to_str().ok())
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse {
+                error: "missing_idempotency_key".to_string(),
+            }),
+        )
+            .into_response();
+    };
+
+    match funding_service(&state) {
+        Ok(service) => match service.execute(request.quote_id, idempotency_key).await {
+            Ok(response) => (StatusCode::OK, Json(response)).into_response(),
+            Err(error) if error.to_string().contains("quote_expired") => (
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse { error: "quote_expired".to_string() }),
+            )
+                .into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: error.to_string() }),
+            )
+                .into_response(),
+        },
+        Err(response) => response.into_response(),
+    }
+}
+
+#[cfg(not(feature = "postgres"))]
+async fn funding_execute_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    _headers: HeaderMap,
+    Json(_request): Json<ExecuteFundingRequest>,
+) -> impl IntoResponse
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    if !state.funding.enabled {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(serde_json::json!({ "error": "funding_disabled" })),
+        )
+            .into_response();
+    }
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(serde_json::json!({ "error": "funding_store_unavailable" })),
+    )
+        .into_response()
+}
+
+#[cfg(feature = "postgres")]
+async fn funding_get_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    Path(id): Path<Uuid>,
+) -> impl IntoResponse
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    match funding_service(&state) {
+        Ok(service) => match service.get(id).await {
+            Ok(view) => (StatusCode::OK, Json(view)).into_response(),
+            Err(error) => (StatusCode::NOT_FOUND, Json(ErrorResponse { error: error.to_string() }))
+                .into_response(),
+        },
+        Err(response) => response.into_response(),
+    }
+}
+
+#[cfg(not(feature = "postgres"))]
+async fn funding_get_handler<E, S>(
+    State(_state): State<Arc<ApiState<E, S>>>,
+    Path(_id): Path<Uuid>,
+) -> impl IntoResponse
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            error: "funding_store_unavailable".to_string(),
+        }),
+    )
+}
+
+#[cfg(feature = "postgres")]
+async fn funding_list_handler<E, S>(State(state): State<Arc<ApiState<E, S>>>) -> impl IntoResponse
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    match funding_service(&state) {
+        Ok(service) => match service.list().await {
+            Ok(rows) => (StatusCode::OK, Json(rows)).into_response(),
+            Err(error) => (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(ErrorResponse { error: error.to_string() }),
+            )
+                .into_response(),
+        },
+        Err(response) => response.into_response(),
+    }
+}
+
+#[cfg(not(feature = "postgres"))]
+async fn funding_list_handler<E, S>(State(_state): State<Arc<ApiState<E, S>>>) -> impl IntoResponse
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    (
+        StatusCode::SERVICE_UNAVAILABLE,
+        Json(ErrorResponse {
+            error: "funding_store_unavailable".to_string(),
+        }),
+    )
+}
+
+async fn capital_refresh_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+) -> impl IntoResponse
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    match refresh_capital_from_exchange(&state.exchange, &state.position_manager).await {
+        Ok(capital) => (StatusCode::OK, Json(CapitalRefreshResponse { capital })).into_response(),
+        Err(error) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            Json(ErrorResponse { error: error.to_string() }),
+        )
+            .into_response(),
+    }
+}
+
+pub(crate) async fn refresh_capital_from_exchange<E, S>(
+    exchange: &Arc<E>,
+    position_manager: &Arc<RwLock<PositionManager<E, S>>>,
+) -> Result<Decimal, DaemonError>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let balance = exchange.get_futures_balance().await?;
+    let capital = balance.wallet_balance;
+    if capital <= Decimal::ZERO {
+        return Err(DaemonError::Config(format!(
+            "Exchange reports zero or negative wallet balance: {capital}"
+        )));
+    }
+    let manager = position_manager.read().await;
+    manager.update_engine_capital(capital);
+    Ok(capital)
 }
 
 /// Liveness probe for Kubernetes - checks if the process is alive.
@@ -1943,7 +2187,7 @@ mod tests {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
-        let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+        let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
         let event_bus = Arc::new(crate::event_bus::EventBus::new(capacity));
         let risk_config = RiskConfig::new(dec!(10000)).unwrap();
         let engine = Engine::new(risk_config);
@@ -1961,6 +2205,7 @@ mod tests {
         let circuit_breaker = position_manager.read().await.circuit_breaker();
 
         let state = Arc::new(ApiState {
+            exchange,
             position_manager: Arc::clone(&position_manager),
             event_bus: Arc::clone(&event_bus),
             circuit_breaker,
@@ -1970,9 +2215,34 @@ mod tests {
             #[cfg(feature = "postgres")]
             tenant_id: None,
             api_token: None,
+            funding: FundingConfig::default(),
         });
 
         (create_router(state), event_bus, position_manager)
+    }
+
+    #[tokio::test]
+    async fn funding_execute_returns_503_when_disabled() {
+        let (app, _, _) = create_test_app_with_event_bus(100).await;
+        let body = serde_json::json!({ "quote_id": Uuid::now_v7() });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/funding/execute")
+                    .header(CONTENT_TYPE, "application/json")
+                    .header("Idempotency-Key", "test-key")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json, serde_json::json!({ "error": "funding_disabled" }));
     }
 
     // #[tokio::test]
@@ -2619,7 +2889,7 @@ mod tests {
             let exchange = Arc::new(StubExchange::new(dec!(95000)));
             let journal = Arc::new(IntentJournal::new());
             let store = Arc::new(MemoryStore::new());
-            let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+            let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
             let event_bus = Arc::new(crate::event_bus::EventBus::new(100));
             let risk_config = RiskConfig::new(dec!(10000)).unwrap();
             let engine = Engine::new(risk_config);
@@ -2635,6 +2905,7 @@ mod tests {
             let circuit_breaker = position_manager.read().await.circuit_breaker();
 
             let state = Arc::new(ApiState {
+                exchange,
                 position_manager: Arc::clone(&position_manager),
                 event_bus: Arc::clone(&event_bus),
                 circuit_breaker,
@@ -2644,6 +2915,7 @@ mod tests {
                 #[cfg(feature = "postgres")]
                 tenant_id: None,
                 api_token: Some("secret-token-123".to_string()),
+                funding: FundingConfig::default(),
             });
 
             (create_router(state), event_bus, position_manager)

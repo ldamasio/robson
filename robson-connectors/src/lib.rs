@@ -12,7 +12,7 @@ pub mod binance_ws;
 // Re-exports
 pub use binance_rest::{
     BinanceFill, BinanceKline, BinanceOrderResponse, BinanceRestClient, BinanceRestError,
-    FuturesPosition,
+    BinanceSpotOrderResponse, FuturesPosition,
 };
 pub use binance_ws::{
     AggTradeEvent, BalanceUpdateEvent, BinanceWebSocketClient, BinanceWsError, BinanceWsStream,

@@ -35,6 +35,9 @@ const BINANCE_FUTURES_API_URL: &str = "https://fapi.binance.com";
 /// Binance USD-M futures testnet REST API base URL.
 const BINANCE_FUTURES_TESTNET_API_URL: &str = "https://testnet.binancefuture.com";
 
+const BINANCE_SPOT_API_URL: &str = "https://api.binance.com";
+const BINANCE_SPOT_TESTNET_API_URL: &str = "https://testnet.binance.vision";
+
 /// Request timeout in seconds
 const REQUEST_TIMEOUT_SECS: u64 = 10;
 
@@ -120,6 +123,22 @@ impl BinanceRestClient {
         }
     }
 
+    fn spot_base_url(&self) -> &str {
+        if self.testnet {
+            BINANCE_SPOT_TESTNET_API_URL
+        } else {
+            BINANCE_SPOT_API_URL
+        }
+    }
+
+    fn endpoint_base_url(&self, endpoint: &str) -> &str {
+        if endpoint.starts_with("/fapi/") {
+            self.base_url()
+        } else {
+            self.spot_base_url()
+        }
+    }
+
     /// Build query string with signature for signed requests.
     fn build_signed_query(
         &self,
@@ -154,11 +173,11 @@ impl BinanceRestClient {
         params: Vec<(&str, String)>,
     ) -> Result<String, BinanceRestError> {
         let url = if params.is_empty() {
-            format!("{}{}", self.base_url(), endpoint)
+            format!("{}{}", self.endpoint_base_url(endpoint), endpoint)
         } else {
             let query =
                 params.iter().map(|(k, v)| format!("{}={}", k, v)).collect::<Vec<_>>().join("&");
-            format!("{}{}?{}", self.base_url(), endpoint, query)
+            format!("{}{}?{}", self.endpoint_base_url(endpoint), endpoint, query)
         };
 
         let response =
@@ -190,7 +209,7 @@ impl BinanceRestClient {
         params: Vec<(&str, String)>,
     ) -> Result<String, BinanceRestError> {
         let query = self.build_signed_query(params)?;
-        let url = format!("{}{}?{}", self.base_url(), endpoint, query);
+        let url = format!("{}{}?{}", self.endpoint_base_url(endpoint), endpoint, query);
 
         let response = timeout(
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
@@ -223,7 +242,7 @@ impl BinanceRestClient {
         params: Vec<(&str, String)>,
     ) -> Result<String, BinanceRestError> {
         let query = self.build_signed_query(params)?;
-        let url = format!("{}{}?{}", self.base_url(), endpoint, query);
+        let url = format!("{}{}?{}", self.endpoint_base_url(endpoint), endpoint, query);
 
         let response = timeout(
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
@@ -256,7 +275,7 @@ impl BinanceRestClient {
         params: Vec<(&str, String)>,
     ) -> Result<String, BinanceRestError> {
         let query = self.build_signed_query(params)?;
-        let url = format!("{}{}?{}", self.base_url(), endpoint, query);
+        let url = format!("{}{}?{}", self.endpoint_base_url(endpoint), endpoint, query);
 
         let response = timeout(
             Duration::from_secs(REQUEST_TIMEOUT_SECS),
@@ -581,6 +600,104 @@ impl BinanceRestClient {
             available_balance: usdt.availableBalance,
         })
     }
+
+    pub async fn get_spot_account_balances(
+        &self,
+    ) -> Result<Vec<BinanceSpotBalance>, BinanceRestError> {
+        let body = self.get_signed("/api/v3/account", vec![]).await?;
+        let account: BinanceSpotAccountResponse =
+            serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+
+        Ok(account
+            .balances
+            .into_iter()
+            .filter(|b| b.free != Decimal::ZERO || b.locked != Decimal::ZERO)
+            .collect())
+    }
+
+    pub async fn get_spot_price(&self, symbol: &str) -> Result<Price, BinanceRestError> {
+        let body = self
+            .get_public("/api/v3/ticker/price", vec![("symbol", symbol.to_string())])
+            .await?;
+        let response: PriceResponse =
+            serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+
+        Price::new(response.price)
+            .map_err(|e| BinanceRestError::ParseError(format!("Invalid spot price: {}", e)))
+    }
+
+    pub async fn place_spot_market_order(
+        &self,
+        symbol: &str,
+        side: &str,
+        quantity_param: (&str, Decimal),
+        client_order_id: &str,
+    ) -> Result<BinanceSpotOrderResponse, BinanceRestError> {
+        let params = vec![
+            ("symbol", symbol.to_string()),
+            ("side", side.to_string()),
+            ("type", "MARKET".to_string()),
+            (quantity_param.0, quantity_param.1.to_string()),
+            ("newClientOrderId", client_order_id.to_string()),
+            ("newOrderRespType", "FULL".to_string()),
+        ];
+
+        let body = self.post_signed("/api/v3/order", params).await?;
+        serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
+    }
+
+    pub async fn get_spot_order(
+        &self,
+        symbol: &str,
+        client_order_id: &str,
+    ) -> Result<Option<BinanceSpotOrderResponse>, BinanceRestError> {
+        let params = vec![
+            ("symbol", symbol.to_string()),
+            ("origClientOrderId", client_order_id.to_string()),
+        ];
+
+        match self.get_signed("/api/v3/order", params).await {
+            Ok(body) => serde_json::from_str(&body)
+                .map(Some)
+                .map_err(|e| BinanceRestError::ParseError(e.to_string())),
+            Err(BinanceRestError::ApiError { code: -2013, .. }) => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub async fn universal_transfer(
+        &self,
+        asset: &str,
+        amount: Decimal,
+        transfer_type: &str,
+        client_tran_key: &str,
+    ) -> Result<BinanceUniversalTransferResponse, BinanceRestError> {
+        let params = vec![
+            ("type", transfer_type.to_string()),
+            ("asset", asset.to_string()),
+            ("amount", amount.to_string()),
+            ("clientTranId", client_tran_key.to_string()),
+        ];
+
+        let body = self.post_signed("/sapi/v1/asset/transfer", params).await?;
+        serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
+    }
+
+    pub async fn get_transfer_history(
+        &self,
+        transfer_type: &str,
+        start_time_ms: i64,
+    ) -> Result<Vec<BinanceUniversalTransfer>, BinanceRestError> {
+        let params = vec![
+            ("type", transfer_type.to_string()),
+            ("startTime", start_time_ms.to_string()),
+        ];
+
+        let body = self.get_signed("/sapi/v1/asset/transfer", params).await?;
+        let response: BinanceUniversalTransferHistoryResponse =
+            serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+        Ok(response.rows)
+    }
 }
 
 // =============================================================================
@@ -751,6 +868,63 @@ pub struct BinanceFuturesBalance {
     pub wallet_balance: Decimal,
     /// Balance available for new positions.
     pub available_balance: Decimal,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct BinanceSpotAccountResponse {
+    balances: Vec<BinanceSpotBalance>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BinanceSpotBalance {
+    pub asset: String,
+    pub free: Decimal,
+    pub locked: Decimal,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceSpotOrderResponse {
+    pub symbol: String,
+    pub order_id: u64,
+    pub client_order_id: String,
+    #[serde(default)]
+    pub transact_time: i64,
+    #[serde(default)]
+    pub update_time: i64,
+    pub status: String,
+    pub executed_qty: Decimal,
+    pub cummulative_quote_qty: Decimal,
+    #[serde(default)]
+    pub fills: Vec<BinanceFill>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceUniversalTransferResponse {
+    pub tran_id: u64,
+    #[serde(default)]
+    pub client_tran_id: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceUniversalTransferHistoryResponse {
+    pub rows: Vec<BinanceUniversalTransfer>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceUniversalTransfer {
+    pub tran_id: u64,
+    #[serde(default)]
+    pub client_tran_id: Option<String>,
+    pub asset: String,
+    pub amount: Decimal,
+    #[serde(rename = "type")]
+    pub transfer_type: String,
+    pub status: String,
+    pub timestamp: i64,
 }
 
 fn parse_futures_klines(body: &str) -> Result<Vec<BinanceKline>, BinanceRestError> {

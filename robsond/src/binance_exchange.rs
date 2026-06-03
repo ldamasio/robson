@@ -17,7 +17,11 @@ use chrono::{DateTime, Utc};
 use robson_connectors::{BinanceRestClient, BinanceRestError};
 use robson_domain::{OrderSide, Price, Quantity, Side, Symbol};
 use robson_exec::{
-    ports::{ExchangePosition, FuturesBalance, FuturesSettings, UserTradeRecord},
+    ports::{
+        ExchangePosition, FuturesBalance, FuturesSettings, SpotBalance, SpotOrder,
+        SpotOrderQuantity, SpotOrderRequest, SpotOrderSide, Transfer, TransferId,
+        UniversalTransferType, UserTradeRecord,
+    },
     ExchangePort, ExecError, OrderResult,
 };
 use rust_decimal::Decimal;
@@ -63,6 +67,35 @@ pub(crate) fn normalize_market_quantity(
 }
 
 // =============================================================================
+fn spot_order_from_response(
+    response: robson_connectors::BinanceSpotOrderResponse,
+) -> Result<SpotOrder, ExecError> {
+    let fee: Decimal = response.fills.iter().map(|f| f.commission).sum();
+    let fee_asset = response
+        .fills
+        .first()
+        .map(|f| f.commission_asset.clone())
+        .unwrap_or_else(|| "USDT".to_string());
+    let millis = if response.transact_time > 0 {
+        response.transact_time
+    } else {
+        response.update_time
+    };
+    let transact_time = DateTime::from_timestamp_millis(millis).unwrap_or_else(Utc::now);
+
+    Ok(SpotOrder {
+        symbol: response.symbol,
+        exchange_order_id: response.order_id.to_string(),
+        client_order_id: response.client_order_id,
+        status: response.status,
+        executed_qty: response.executed_qty,
+        cummulative_quote_qty: response.cummulative_quote_qty,
+        fee,
+        fee_asset,
+        transact_time,
+    })
+}
+
 // Adapter
 // =============================================================================
 
@@ -286,6 +319,105 @@ impl ExchangePort for BinanceExchangeAdapter {
             wallet_balance: balance.wallet_balance,
             available_balance: balance.available_balance,
         })
+    }
+
+    async fn get_spot_account_balances(&self) -> Result<Vec<SpotBalance>, ExecError> {
+        let balances = self.client.get_spot_account_balances().await.map_err(Self::map_error)?;
+        Ok(balances
+            .into_iter()
+            .map(|b| SpotBalance {
+                asset: b.asset,
+                free: b.free,
+                locked: b.locked,
+            })
+            .collect())
+    }
+
+    async fn get_spot_price(&self, symbol: &str) -> Result<Price, ExecError> {
+        self.client.get_spot_price(symbol).await.map_err(Self::map_error)
+    }
+
+    async fn place_spot_market_order(
+        &self,
+        request: SpotOrderRequest,
+    ) -> Result<SpotOrder, ExecError> {
+        let side = match request.side {
+            SpotOrderSide::Buy => "BUY",
+            SpotOrderSide::Sell => "SELL",
+        };
+        let quantity_key = match request.quantity_kind {
+            SpotOrderQuantity::Base => "quantity",
+            SpotOrderQuantity::Quote => "quoteOrderQty",
+        };
+
+        let response = self
+            .client
+            .place_spot_market_order(
+                &request.symbol,
+                side,
+                (quantity_key, request.quantity),
+                &request.client_order_id,
+            )
+            .await
+            .map_err(Self::map_error)?;
+
+        spot_order_from_response(response)
+    }
+
+    async fn get_spot_order(
+        &self,
+        symbol: &str,
+        client_order_id: &str,
+    ) -> Result<Option<SpotOrder>, ExecError> {
+        match self.client.get_spot_order(symbol, client_order_id).await {
+            Ok(Some(response)) => spot_order_from_response(response).map(Some),
+            Ok(None) => Ok(None),
+            Err(error) => Err(Self::map_error(error)),
+        }
+    }
+
+    async fn universal_transfer(
+        &self,
+        asset: &str,
+        amount: Decimal,
+        transfer_type: UniversalTransferType,
+        client_tran_key: &str,
+    ) -> Result<TransferId, ExecError> {
+        let response = self
+            .client
+            .universal_transfer(asset, amount, transfer_type.as_binance_str(), client_tran_key)
+            .await
+            .map_err(Self::map_error)?;
+        Ok(TransferId(response.tran_id.to_string()))
+    }
+
+    async fn get_transfer_history(
+        &self,
+        transfer_type: UniversalTransferType,
+        start_time: DateTime<Utc>,
+    ) -> Result<Vec<Transfer>, ExecError> {
+        let transfers = self
+            .client
+            .get_transfer_history(transfer_type.as_binance_str(), start_time.timestamp_millis())
+            .await
+            .map_err(Self::map_error)?;
+
+        transfers
+            .into_iter()
+            .map(|t| {
+                let timestamp =
+                    DateTime::from_timestamp_millis(t.timestamp).unwrap_or_else(Utc::now);
+                Ok(Transfer {
+                    transfer_id: TransferId(t.tran_id.to_string()),
+                    client_tran_key: t.client_tran_id,
+                    asset: t.asset,
+                    amount: t.amount,
+                    transfer_type,
+                    status: t.status,
+                    timestamp,
+                })
+            })
+            .collect()
     }
 
     async fn get_all_open_positions(&self) -> Result<Vec<ExchangePosition>, ExecError> {
