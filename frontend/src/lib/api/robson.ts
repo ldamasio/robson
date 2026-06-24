@@ -44,6 +44,8 @@ export type PositionState =
   | "Exiting"
   | "Closed"
   | "Error"
+  | "Cancelled"
+  | "Canceled"
   | {
       Entering: {
         entry_order_id: string;

@@ -28,6 +28,7 @@
     positionStateLabel,
     positionMetaLine,
     positionSummaryLines,
+    isPositionCancelled,
     haltStateLabel,
     eventTypeLabel,
   } from "$lib/presentation/labels";
@@ -52,9 +53,15 @@
   let currentMonth = $derived(currentMonthKey());
   let monthOps = $derived(sortPositionsOldestFirst(monthlyPositions));
   let isHistoricalMonth = $derived(selectedMonth !== currentMonth);
-  let displayOps = $derived(monthOps);
+  let displayOps = $derived(
+    monthOps.filter((op) => !isPositionCancelled(op.state)),
+  );
   let slotPositions = $derived(
-    isHistoricalMonth ? displayOps : (currentStatus?.positions ?? []),
+    isHistoricalMonth
+      ? displayOps
+      : (currentStatus?.positions ?? []).filter(
+          (op) => !isPositionCancelled(op.state),
+        ),
   );
   let slots = $derived(
     deriveMonthSlots(

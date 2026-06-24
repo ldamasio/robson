@@ -37,10 +37,19 @@ export function positionSummaryLines(p: Position): string[] {
       lines.push(label('ARMED', `${modeLabel}${approvalLabel}`));
       lines.push(label('LEVERAGE', '10x (fixed)'));
     } else if (state === 'Active') {
-      const details = [];
+      const details: string[] = [];
       if (p.entry_price != null) details.push(`entry ${fmtNum(p.entry_price)}`);
       if (p.trailing_stop != null) details.push(`stop ${fmtNum(p.trailing_stop)}`);
       lines.push(label('ACTIVE', details.join(' · ') || 'position open'));
+      const target = trailingStopMoveTarget(p);
+      if (target) {
+        lines.push(
+          label(
+            'TARGET',
+            `${fmtNum(target.trigger_price)} -> stop ${fmtNum(target.next_stop)}`,
+          ),
+        );
+      }
     }
   } else {
     const key = Object.keys(state)[0];
@@ -50,6 +59,15 @@ export function positionSummaryLines(p: Position): string[] {
       lines.push(label('ENTERING', `expected entry ${fmtNum(val.expected_entry as number)}`));
     } else if (key === 'Active' && val) {
       lines.push(label('ACTIVE', `price ${fmtNum(val.current_price as number)} · stop ${fmtNum(val.trailing_stop as number)}`));
+      const target = trailingStopMoveTarget(p);
+      if (target) {
+        lines.push(
+          label(
+            'TARGET',
+            `${fmtNum(target.trigger_price)} -> stop ${fmtNum(target.next_stop)}`,
+          ),
+        );
+      }
       if (val.favorable_extreme) lines.push(label('EXTREME', fmtNum(val.favorable_extreme as number)));
     } else if (key === 'Exiting' && val) {
       lines.push(label('EXITING', `${val.exit_reason}`));
@@ -69,6 +87,49 @@ export function positionSummaryLines(p: Position): string[] {
   }
 
   return lines;
+}
+
+export function isPositionCancelled(state: PositionState): boolean {
+  if (state === 'Cancelled' || state === 'Canceled') return true;
+  if (typeof state === 'object') {
+    const key = Object.keys(state)[0];
+    return key === 'Cancelled' || key === 'Canceled';
+  }
+  return false;
+}
+
+function trailingStopMoveTarget(p: Position): { trigger_price: number; next_stop: number } | null {
+  const entry = p.entry_price;
+  const stop = activeTrailingStop(p);
+  const span = p.tech_stop_distance;
+  if (entry == null || stop == null || span == null) return null;
+  if (!Number.isFinite(entry) || !Number.isFinite(stop) || !Number.isFinite(span) || span <= 0) {
+    return null;
+  }
+
+  if (p.side === 'Short') {
+    return {
+      trigger_price: stop - span * 2,
+      next_stop: stop - span,
+    };
+  }
+
+  return {
+    trigger_price: stop + span * 2,
+    next_stop: stop + span,
+  };
+}
+
+function activeTrailingStop(p: Position): number | null {
+  const state = p.state;
+  if (typeof state === 'string') {
+    return state === 'Active' ? p.trailing_stop ?? null : null;
+  }
+
+  const key = Object.keys(state)[0];
+  const val = (state as Record<string, Record<string, unknown>>)[key];
+  if (key !== 'Active' || !val) return null;
+  return typeof val.trailing_stop === 'number' ? val.trailing_stop : null;
 }
 
 export function positionMetaLine(p: Position): string {
