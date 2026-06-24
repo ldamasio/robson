@@ -11,9 +11,11 @@
 //! 1. Computes the time gap since the last reliable state (`extreme_at`).
 //! 2. Fetches 15-minute candles covering that gap via `OhlcvPort`.
 //! 3. Replays each candle through the engine — favorable extreme first (may
-//!    advance the trailing stop), then adverse extreme (may trigger exit).
-//! 4. Persists every action (events, orders) so the eventlog and projection
-//!    stay convergent.
+//!    advance the trailing stop). Exit actions are not materialized during the
+//!    replay; they are only materialized after replay if the live price at the
+//!    end of recovery is still on the wrong side of the updated stop.
+//! 4. Persists non-exit actions so the eventlog and projection stay convergent
+//!    while the runtime keeps the recovery decision auditable.
 //!
 //! # Idempotency
 //!
@@ -30,8 +32,8 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use robson_domain::{Candle, PositionState, Price, Side};
-use robson_engine::MarketData;
+use robson_domain::{Candle, Event, PositionState, Price, Side};
+use robson_engine::{EngineAction, MarketData};
 use robson_exec::{ActionResult, CandleInterval, ExchangePort, OhlcvPort};
 use robson_store::Store;
 use tracing::{info, warn};
@@ -43,9 +45,11 @@ use crate::{error::DaemonResult, position_manager::PositionManager};
 pub struct RecoveryReport {
     /// Positions examined (Active at startup).
     pub positions_scanned: usize,
-    /// Positions where the trailing stop advanced during the gap.
+    /// Positions kept open after recovery, including trailing-stop updates
+    /// and gap crosses that were forgiven because the live price recovered.
     pub stops_updated: usize,
-    /// Positions closed because the stop was crossed during the gap.
+    /// Positions closed because the live price at recovery still violated the
+    /// updated stop.
     pub positions_closed: usize,
     /// Positions skipped (gap too small, no candles, etc.).
     pub positions_skipped: usize,
@@ -191,12 +195,9 @@ pub async fn run_startup_recovery<E: ExchangePort + 'static, S: Store + 'static>
 
 /// Replay historical candles for a single position through the engine.
 ///
-/// For each candle we process TWO synthetic ticks:
-/// 1. **Favorable extreme** (high for Long, low for Short) — may advance the
-///    trailing stop.
-/// 2. **Adverse extreme** (low for Long, high for Short) — may trigger exit.
-///
-/// Returns `true` if the position was closed during replay.
+/// The replay applies only favorable stop updates during the gap. Exit actions
+/// are deferred until the end of recovery, when the live price is checked
+/// against the updated trailing stop.
 async fn replay_candles<E: ExchangePort + 'static, S: Store + 'static>(
     pm: &PositionManager<E, S>,
     position: &robson_domain::Position,
@@ -204,6 +205,7 @@ async fn replay_candles<E: ExchangePort + 'static, S: Store + 'static>(
 ) -> DaemonResult<bool> {
     let position_id = position.id;
     let side = position.side;
+    let mut stop_cross_observed = false;
 
     for candle in candles {
         // Re-read position from store (state may have changed from previous candle).
@@ -226,20 +228,22 @@ async fn replay_candles<E: ExchangePort + 'static, S: Store + 'static>(
             Side::Short => Price::new(candle.low).unwrap_or(Price::from(candle.low)),
         };
 
-        let closed =
-            process_recovery_tick(pm, &current, favorable_price, candle.close_time).await?;
+        let outcome = process_recovery_tick(
+            pm,
+            &current,
+            favorable_price,
+            candle.close_time,
+            false,
+        )
+        .await?;
+        stop_cross_observed |= outcome.exit_triggered;
 
-        if closed {
-            return Ok(true);
-        }
-
-        // 2. Adverse extreme — may trigger exit.
+        // 2. Adverse extreme — may reveal an exit condition in the gap.
         let adverse_price = match side {
             Side::Long => Price::new(candle.low).unwrap_or(Price::from(candle.low)),
             Side::Short => Price::new(candle.high).unwrap_or(Price::from(candle.high)),
         };
 
-        // Re-read position (stop may have moved).
         let current = match pm.store().positions().find_by_id(position_id).await? {
             Some(p) => p,
             None => return Ok(false),
@@ -249,14 +253,46 @@ async fn replay_candles<E: ExchangePort + 'static, S: Store + 'static>(
             return Ok(true);
         }
 
-        let closed = process_recovery_tick(pm, &current, adverse_price, candle.close_time).await?;
-
-        if closed {
-            return Ok(true);
-        }
+        let outcome = process_recovery_tick(
+            pm,
+            &current,
+            adverse_price,
+            candle.close_time,
+            false,
+        )
+        .await?;
+        stop_cross_observed |= outcome.exit_triggered;
     }
 
-    Ok(false)
+    let current = match pm.store().positions().find_by_id(position_id).await? {
+        Some(p) => p,
+        None => return Ok(false),
+    };
+
+    let PositionState::Active { trailing_stop, .. } = &current.state else {
+        return Ok(true);
+    };
+
+    let live_price = pm.get_market_price(&current.symbol).await?;
+    let should_close_now = match side {
+        Side::Long => live_price.as_decimal() <= trailing_stop.as_decimal(),
+        Side::Short => live_price.as_decimal() >= trailing_stop.as_decimal(),
+    };
+
+    if !should_close_now {
+        if stop_cross_observed {
+            info!(
+                %position_id,
+                live_price = %live_price.as_decimal(),
+                stop = %trailing_stop.as_decimal(),
+                "startup-recovery: gap stop cross observed, but live price recovered; keeping position open"
+            );
+        }
+        return Ok(false);
+    }
+
+    let closed = process_recovery_tick(pm, &current, live_price, Utc::now(), true).await?;
+    Ok(closed.closed)
 }
 
 // =============================================================================
@@ -452,6 +488,38 @@ mod tests {
         assert!(
             matches!(loaded.state, PositionState::Closed { .. }),
             "expected Closed, got {:?}",
+            loaded.state.name()
+        );
+    }
+
+    /// If the gap crossed the stop but the live price recovered before
+    /// reconciliation, the position must remain Active.
+    #[tokio::test]
+    async fn recovery_keeps_position_open_when_stop_crossed_but_price_recovered() {
+        let account_id = Uuid::now_v7();
+        let position = btcusdt_long_position(account_id);
+        let position_id = position.id;
+
+        let extreme_at = match position.state {
+            PositionState::Active { extreme_at, .. } => extreme_at,
+            _ => panic!("expected Active state"),
+        };
+
+        let candles = crash_candles(extreme_at);
+        let ohlcv = Arc::new(StubOhlcv::new(candles)) as Arc<dyn OhlcvPort>;
+
+        let pm = create_manager(ohlcv, dec!(78300)).await;
+        pm.store().positions().save(&position).await.unwrap();
+
+        let report = run_startup_recovery(&pm, &pm.ohlcv_port()).await.unwrap();
+
+        assert_eq!(report.positions_closed, 0, "recovered price must keep the position open");
+        assert_eq!(report.positions_scanned, 1);
+
+        let loaded = pm.store().positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(
+            matches!(loaded.state, PositionState::Active { .. }),
+            "expected Active, got {:?}",
             loaded.state.name()
         );
     }
@@ -693,14 +761,21 @@ mod tests {
         assert_eq!(report.positions_closed, 0);
     }
 }
-/// Mirrors the core of `process_market_data` but without query tracking or
-/// metrics. Returns `true` if the position was closed.
+/// Mirrors the core of `process_market_data` but suppresses exit materialization
+/// unless explicitly requested by the caller.
+#[derive(Debug, Clone, Copy, Default)]
+struct RecoveryTickOutcome {
+    exit_triggered: bool,
+    closed: bool,
+}
+
 async fn process_recovery_tick<E: ExchangePort + 'static, S: Store + 'static>(
     pm: &PositionManager<E, S>,
     position: &robson_domain::Position,
     price: Price,
     timestamp: chrono::DateTime<chrono::Utc>,
-) -> DaemonResult<bool> {
+    materialize_exit: bool,
+) -> DaemonResult<RecoveryTickOutcome> {
     let market_data = MarketData::with_timestamp(position.symbol.clone(), price, timestamp);
 
     let decision = {
@@ -709,25 +784,56 @@ async fn process_recovery_tick<E: ExchangePort + 'static, S: Store + 'static>(
     };
 
     if decision.actions.is_empty() {
-        return Ok(false);
+        return Ok(RecoveryTickOutcome::default());
     }
 
-    let results = pm.execute_and_persist_recovery(decision.actions).await?;
+    let exit_triggered = decision.actions.iter().any(|action| {
+        matches!(
+            action,
+            EngineAction::TriggerExit { .. }
+                | EngineAction::PlaceExitOrder { .. }
+                | EngineAction::EmitEvent(Event::ExitTriggered { .. })
+        )
+    });
 
-    // Check if an exit order was placed (position will be closed).
-    for result in &results {
-        if let ActionResult::OrderPlaced { order, .. } = result {
-            pm.handle_exit_fill_recovery(
-                position.id,
-                order.fill_price,
-                order.filled_quantity,
-                order.fee,
-                order.filled_at,
-            )
-            .await?;
-            return Ok(true);
+    let actions = if materialize_exit {
+        decision.actions
+    } else {
+        decision
+            .actions
+            .into_iter()
+            .filter(|action| {
+                !matches!(
+                    action,
+                    EngineAction::TriggerExit { .. }
+                        | EngineAction::PlaceExitOrder { .. }
+                        | EngineAction::EmitEvent(Event::ExitTriggered { .. })
+                )
+            })
+            .collect()
+    };
+
+    if actions.is_empty() {
+        return Ok(RecoveryTickOutcome { exit_triggered, closed: false });
+    }
+
+    let results = pm.execute_and_persist_recovery(actions).await?;
+
+    if materialize_exit {
+        for result in &results {
+            if let ActionResult::OrderPlaced { order, .. } = result {
+                pm.handle_exit_fill_recovery(
+                    position.id,
+                    order.fill_price,
+                    order.filled_quantity,
+                    order.fee,
+                    order.filled_at,
+                )
+                .await?;
+                return Ok(RecoveryTickOutcome { exit_triggered, closed: true });
+            }
         }
     }
 
-    Ok(false)
+    Ok(RecoveryTickOutcome { exit_triggered, closed: false })
 }
