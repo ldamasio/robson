@@ -273,6 +273,7 @@ async fn replay_candles<E: ExchangePort + 'static, S: Store + 'static>(
         return Ok(true);
     };
 
+    // Re-check live price before materializing any recovery exit.
     let live_price = pm.get_market_price(&current.symbol).await?;
     let should_close_now = match side {
         Side::Long => live_price.as_decimal() <= trailing_stop.as_decimal(),
