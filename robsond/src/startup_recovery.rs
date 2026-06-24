@@ -228,14 +228,8 @@ async fn replay_candles<E: ExchangePort + 'static, S: Store + 'static>(
             Side::Short => Price::new(candle.low).unwrap_or(Price::from(candle.low)),
         };
 
-        let outcome = process_recovery_tick(
-            pm,
-            &current,
-            favorable_price,
-            candle.close_time,
-            false,
-        )
-        .await?;
+        let outcome =
+            process_recovery_tick(pm, &current, favorable_price, candle.close_time, false).await?;
         stop_cross_observed |= outcome.exit_triggered;
 
         // 2. Adverse extreme — may reveal an exit condition in the gap.
@@ -253,14 +247,8 @@ async fn replay_candles<E: ExchangePort + 'static, S: Store + 'static>(
             return Ok(true);
         }
 
-        let outcome = process_recovery_tick(
-            pm,
-            &current,
-            adverse_price,
-            candle.close_time,
-            false,
-        )
-        .await?;
+        let outcome =
+            process_recovery_tick(pm, &current, adverse_price, candle.close_time, false).await?;
         stop_cross_observed |= outcome.exit_triggered;
     }
 
