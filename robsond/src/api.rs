@@ -151,6 +151,8 @@ pub struct PositionSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trailing_stop: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub tech_stop_distance: Option<Decimal>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub current_price: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pnl: Option<Decimal>,
@@ -1885,14 +1887,15 @@ fn position_to_summary(
     entry_mode: Option<String>,
     approval_mode: Option<String>,
 ) -> PositionSummary {
-    let (state_str, entry_price, trailing_stop, current_price, pnl, variation_pct) = match &position
+    let (state_str, entry_price, trailing_stop, tech_stop_distance, current_price, pnl, variation_pct) = match &position
         .state
     {
-        PositionState::Armed => ("Armed".to_string(), None, None, None, None, None),
+        PositionState::Armed => ("Armed".to_string(), None, None, None, None, None, None),
         PositionState::Entering { expected_entry, .. } => (
             "Entering".to_string(),
             Some(expected_entry.as_decimal()),
             None,
+            position.tech_stop_distance.as_ref().map(|t| t.span()),
             None,
             None,
             None,
@@ -1905,6 +1908,7 @@ fn position_to_summary(
                 "Active".to_string(),
                 position.entry_price.map(|p| p.as_decimal()),
                 Some(trailing_stop.as_decimal()),
+                position.tech_stop_distance.as_ref().map(|t| t.span()),
                 Some(observed_price.as_decimal()),
                 pnl_at_price(position, valuation_price),
                 variation_pct_at_price(position, valuation_price),
@@ -1916,6 +1920,7 @@ fn position_to_summary(
                 "Exiting".to_string(),
                 position.entry_price.map(|p| p.as_decimal()),
                 None,
+                position.tech_stop_distance.as_ref().map(|t| t.span()),
                 current_price.map(|p| p.as_decimal()),
                 current_price.and_then(|p| pnl_at_price(position, p)),
                 current_price.and_then(|p| variation_pct_at_price(position, p)),
@@ -1931,15 +1936,16 @@ fn position_to_summary(
                 format!("Closed ({:?})", exit_reason),
                 position.entry_price.map(|p| p.as_decimal()),
                 Some(exit_price.as_decimal()),
+                position.tech_stop_distance.as_ref().map(|t| t.span()),
                 Some(exit_price.as_decimal()),
                 Some(realized_pnl),
                 variation_pct_at_price(position, *exit_price),
             )
         },
         PositionState::Error { error, .. } => {
-            (format!("Error: {}", error), None, None, None, None, None)
+            (format!("Error: {}", error), None, None, None, None, None, None)
         },
-        PositionState::Cancelled => ("Cancelled".to_string(), None, None, None, None, None),
+        PositionState::Cancelled => ("Cancelled".to_string(), None, None, None, None, None, None),
     };
 
     PositionSummary {
@@ -1957,6 +1963,7 @@ fn position_to_summary(
         },
         entry_price,
         trailing_stop,
+        tech_stop_distance,
         current_price,
         pnl,
         variation_pct,
