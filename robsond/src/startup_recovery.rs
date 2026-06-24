@@ -762,8 +762,8 @@ mod tests {
         assert_eq!(report.positions_closed, 0);
     }
 }
-/// Mirrors the core of `process_market_data` but suppresses exit materialization
-/// unless explicitly requested by the caller.
+/// Mirrors the core of `process_market_data` but suppresses exit
+/// materialization unless explicitly requested by the caller.
 #[derive(Debug, Clone, Copy, Default)]
 struct RecoveryTickOutcome {
     exit_triggered: bool,
