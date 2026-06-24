@@ -1887,9 +1887,15 @@ fn position_to_summary(
     entry_mode: Option<String>,
     approval_mode: Option<String>,
 ) -> PositionSummary {
-    let (state_str, entry_price, trailing_stop, tech_stop_distance, current_price, pnl, variation_pct) = match &position
-        .state
-    {
+    let (
+        state_str,
+        entry_price,
+        trailing_stop,
+        tech_stop_distance,
+        current_price,
+        pnl,
+        variation_pct,
+    ) = match &position.state {
         PositionState::Armed => ("Armed".to_string(), None, None, None, None, None, None),
         PositionState::Entering { expected_entry, .. } => (
             "Entering".to_string(),
