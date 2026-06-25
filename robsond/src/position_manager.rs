@@ -821,10 +821,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let now = chrono::Utc::now();
         let monthly = self.load_monthly_state(now).await?;
         let capital = monthly.capital_base;
-        let active_positions = self.live_risk_open_positions().await?;
+        let active_positions = self.store.positions().find_risk_open().await?;
 
-        // live_risk_open_positions() guarantees only Entering and exchange-live
-        // Active positions are returned.
+        // find_risk_open() guarantees only Entering and Active positions.
         // For Entering: use expected_entry from state (order price is committed on
         // exchange). For Active: use the recorded fill price (entry_price
         // field). Defensive: skip positions with zero quantity (should not
