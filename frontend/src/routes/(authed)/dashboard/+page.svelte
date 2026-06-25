@@ -408,10 +408,10 @@
             <Card padding={4}>
               <Stack gap={3}>
                 <Row justify="between" align="center">
-                  <span class="label">MONTHLY BUDGET</span>
+                  <span class="label">MONTHLY LIMIT</span>
                   <span class="mono"
-                    >{formatPct(currentStatus.monthly_realized_loss_pct)} /
-                    {monthlyBudgetLimitPct.toFixed(1)}% USED</span
+                    >{formatPct(currentStatus.monthly_realized_loss_pct)} of a
+                    {monthlyBudgetLimitPct.toFixed(1)}% limit</span
                   >
                 <span class="meta dim">Excludes out-of-band drift</span>
                 </Row>
