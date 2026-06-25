@@ -310,6 +310,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             self.store.positions().find_closed_in_month(now.year(), now.month()).await?;
         let realized_loss: Decimal = monthly_closed
             .iter()
+            .filter(|p| Self::is_governed_monthly_close(p))
             .map(|p| {
                 let net = p.realized_pnl - p.fees_paid;
                 if net < Decimal::ZERO {
@@ -324,6 +325,36 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             realized_loss,
             trades_opened: monthly_closed.len() as i32,
         })
+    }
+
+    pub(crate) async fn governed_monthly_realized_loss(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> DaemonResult<Decimal> {
+        let monthly_closed =
+            self.store.positions().find_closed_in_month(now.year(), now.month()).await?;
+        Ok(monthly_closed
+            .iter()
+            .filter(|position| Self::is_governed_monthly_close(position))
+            .map(|position| {
+                let net = position.realized_pnl - position.fees_paid;
+                if net < Decimal::ZERO { net.abs() } else { Decimal::ZERO }
+            })
+            .sum())
+    }
+
+    fn is_governed_monthly_close(position: &Position) -> bool {
+        matches!(
+            position.state,
+            PositionState::Closed { exit_reason, .. }
+                if matches!(
+                    exit_reason,
+                    robson_domain::ExitReason::TrailingStop
+                        | robson_domain::ExitReason::InsuranceStop
+                        | robson_domain::ExitReason::UserPanic
+                        | robson_domain::ExitReason::DegradedMode
+                )
+        )
     }
 
     pub(crate) async fn emit_domain_event(&self, event: Event) -> DaemonResult<()> {
@@ -826,7 +857,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // ADR-0024: realized_loss is the authoritative sum of absolute net losses.
         // Source: persisted `monthly_state.realized_loss` (MIG-v3#12).
         // Wins must NOT offset losses for slot calculation.
-        let monthly_realized_loss = monthly.realized_loss;
+        let monthly_realized_loss = self.governed_monthly_realized_loss(now).await?;
 
         // Monthly unrealized PnL: sum unrealized PnL from currently open Active
         // positions.
@@ -1620,9 +1651,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let capital_base = monthly_state.capital_base;
         let policy = self.trading_policy;
 
-        // Realized loss: authoritative from persisted monthly_state (MIG-v3#12).
-        // Wins do NOT offset losses (ADR-0024 §5).
-        let realized_loss = monthly_state.realized_loss;
+        // Governed realized loss only: excludes out-of-band exchange drift and
+        // reconciliation-only closes so the budget reflects Robson-authored flow.
+        let realized_loss = match self.governed_monthly_realized_loss(now).await {
+            Ok(loss) => loss,
+            Err(e) => {
+                warn!(error = %e, "Failed to compute governed monthly realized loss for MonthlyHalt evaluation");
+                return false;
+            },
+        };
 
         // Latent risk: max(0, loss_if_current_stop_hit) for each open Active position.
         let active_positions = match self.store.positions().find_risk_open().await {
@@ -3113,9 +3150,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             })
             .sum();
 
+        let realized_loss = self.governed_monthly_realized_loss(now).await?;
         let policy_slots =
             self.trading_policy
-                .slots_available(capital_base, monthly.realized_loss, latent_risk);
+                .slots_available(capital_base, realized_loss, latent_risk);
 
         // Armed positions' risk is reflected in capital_base at month boundary.
         // The slot count is purely budget-driven.
@@ -4646,6 +4684,19 @@ mod tests {
         manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
         realized_pnl: Decimal,
     ) -> Position {
+        save_closed_position_with_pnl_and_reason(
+            manager,
+            realized_pnl,
+            robson_domain::ExitReason::TrailingStop,
+        )
+        .await
+    }
+
+    async fn save_closed_position_with_pnl_and_reason(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        realized_pnl: Decimal,
+        exit_reason: robson_domain::ExitReason,
+    ) -> Position {
         let account_id = Uuid::now_v7();
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
         let entry = Price::new(dec!(95000)).unwrap();
@@ -4661,7 +4712,7 @@ mod tests {
         position.state = PositionState::Closed {
             exit_price: exit,
             realized_pnl,
-            exit_reason: robson_domain::ExitReason::TrailingStop,
+            exit_reason,
         };
 
         manager.store.positions().save(&position).await.unwrap();
@@ -6212,6 +6263,33 @@ mod tests {
             ctx.monthly_realized_loss,
             dec!(150),
             "build_risk_context must use realized_loss from load_monthly_state"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_governed_monthly_loss_excludes_reconciled_missing_closes() {
+        let manager = create_test_manager().await;
+
+        save_closed_position_with_pnl(&manager, dec!(-150)).await;
+        save_closed_position_with_pnl_and_reason(
+            &manager,
+            dec!(-200),
+            robson_domain::ExitReason::ReconciledMissingOnExchange,
+        )
+        .await;
+
+        let ctx = manager.build_risk_context().await.unwrap();
+
+        assert_eq!(
+            ctx.monthly_realized_loss,
+            dec!(150),
+            "governed monthly loss must exclude reconciled missing-on-exchange closes"
+        );
+        let state = manager.load_monthly_state(chrono::Utc::now()).await.unwrap();
+        assert_eq!(
+            state.realized_loss,
+            dec!(150),
+            "in-memory monthly_state mirrors governed loss in tests"
         );
     }
 

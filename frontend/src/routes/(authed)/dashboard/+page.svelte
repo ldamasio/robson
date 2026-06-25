@@ -413,6 +413,7 @@
                     >{formatPct(currentStatus.monthly_realized_loss_pct)} /
                     {monthlyBudgetLimitPct.toFixed(1)}% USED</span
                   >
+                <span class="meta dim">Excludes out-of-band drift</span>
                 </Row>
                 <div
                   class="budget-bar"
@@ -435,6 +436,7 @@
                   >{formatPct(currentStatus.monthly_realized_loss_pct)} OF
                   {formatMoney(currentStatus.capital_base)}</span
                 >
+                <span class="meta dim">Governed Robson flow only</span>
               </Stack>
             </Card>
           </div>

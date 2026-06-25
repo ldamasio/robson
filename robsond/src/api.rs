@@ -114,10 +114,10 @@ pub struct StatusResponse {
     pub occupied_slots: usize,
     /// Total cells the UI should render: occupied slots plus new slots.
     pub slot_cells_total: usize,
-    /// Absolute realized loss for the current month. Winning trades do not
-    /// offset this value.
+    /// Governed realized loss for the current month. Only Robson-authored
+    /// closes count; out-of-band exchange drift is excluded.
     pub monthly_realized_loss: Decimal,
-    /// Current-month realized loss as a percentage of capital_base.
+    /// Governed realized loss as a percentage of capital_base.
     pub monthly_realized_loss_pct: Decimal,
     /// Starting capital basis for the current month.
     pub capital_base: Decimal,
@@ -1120,8 +1120,9 @@ where
     let manager = state.position_manager.read().await;
     let positions = manager.get_open_positions().await.map_err(|e| to_error_response(e))?;
     let pending_approvals = manager.get_pending_approvals().await;
+    let now = chrono::Utc::now();
     let monthly = manager
-        .load_monthly_state(chrono::Utc::now())
+        .load_monthly_state(now)
         .await
         .map_err(|e| to_error_response(e))?;
     let new_slots_available =
@@ -1135,8 +1136,12 @@ where
             None
         },
     };
+    let governed_monthly_realized_loss: Decimal = manager
+        .governed_monthly_realized_loss(now)
+        .await
+        .map_err(|e| to_error_response(e))?;
     let monthly_realized_loss_pct = if monthly.capital_base > Decimal::ZERO {
-        monthly.realized_loss / monthly.capital_base * Decimal::from(100u32)
+        governed_monthly_realized_loss / monthly.capital_base * Decimal::from(100u32)
     } else {
         Decimal::ZERO
     };
@@ -1176,7 +1181,7 @@ where
         new_slots_available,
         occupied_slots,
         slot_cells_total,
-        monthly_realized_loss: monthly.realized_loss,
+        monthly_realized_loss: governed_monthly_realized_loss,
         monthly_realized_loss_pct,
         capital_base: monthly.capital_base,
     }))
