@@ -160,6 +160,39 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self.executor.exchange().get_all_open_positions().await.map_err(Into::into)
     }
 
+    /// Positions that still contribute to live risk.
+    ///
+    /// `Active` positions are only considered live if they are also present on
+    /// the exchange snapshot. `Entering` positions remain live because they are
+    /// already committed in the order/execution pipeline even before fill.
+    pub(crate) async fn live_risk_open_positions(&self) -> DaemonResult<Vec<Position>> {
+        let open_positions = self.store.positions().find_risk_open().await?;
+        let exchange_positions = match self.exchange_open_positions().await {
+            Ok(positions) => Some(positions),
+            Err(error) => {
+                tracing::warn!(error = %error, "failed to query exchange open positions; falling back to local risk-open set");
+                None
+            },
+        };
+
+        Ok(match exchange_positions {
+            Some(exchange_positions) => open_positions
+                .into_iter()
+                .filter(|position| match &position.state {
+                    PositionState::Entering { .. } => true,
+                    PositionState::Active { .. } => {
+                        exchange_positions.iter().any(|exchange_position| {
+                            exchange_position.symbol == position.symbol
+                                && exchange_position.side == position.side
+                        })
+                    },
+                    _ => false,
+                })
+                .collect(),
+            None => open_positions,
+        })
+    }
+
     /// Update the engine's capital from an external source (exchange balance).
     ///
     /// Called at startup after querying the exchange and whenever the engine's
@@ -788,9 +821,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let now = chrono::Utc::now();
         let monthly = self.load_monthly_state(now).await?;
         let capital = monthly.capital_base;
-        let active_positions = self.store.positions().find_risk_open().await?;
+        let active_positions = self.live_risk_open_positions().await?;
 
-        // find_risk_open() guarantees only Entering and Active positions.
+        // live_risk_open_positions() guarantees only Entering and exchange-live
+        // Active positions are returned.
         // For Entering: use expected_entry from state (order price is committed on
         // exchange). For Active: use the recorded fill price (entry_price
         // field). Defensive: skip positions with zero quantity (should not
@@ -3126,7 +3160,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let capital_base = monthly.capital_base;
 
         // Latent risk: sum max(0, loss_if_stop_hit) for each risk-relevant position.
-        let risk_open = self.store.positions().find_risk_open().await?;
+        let risk_open = self.live_risk_open_positions().await?;
         let latent_risk: Decimal = risk_open
             .iter()
             .filter_map(|p| {

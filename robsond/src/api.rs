@@ -1126,8 +1126,6 @@ where
     let monthly = manager.load_monthly_state(now).await.map_err(|e| to_error_response(e))?;
     let new_slots_available =
         manager.compute_slots_available().await.map_err(|e| to_error_response(e))?;
-    let occupied_slots = positions.len();
-    let slot_cells_total = occupied_slots.saturating_add(new_slots_available as usize);
     let exchange_positions = match manager.exchange_open_positions().await {
         Ok(positions) => Some(positions),
         Err(error) => {
@@ -1162,6 +1160,11 @@ where
             .await,
         );
     }
+    summaries.retain(|summary| {
+        summary.exchange_sync_state.as_deref() != Some("stale_missing_on_exchange")
+    });
+    let occupied_slots = summaries.len();
+    let slot_cells_total = occupied_slots.saturating_add(new_slots_available as usize);
 
     // Update active positions gauge
     crate::metrics::ACTIVE_POSITIONS.set(summaries.len() as f64);
@@ -2949,6 +2952,28 @@ mod tests {
         assert_eq!(status.pending_approvals[0].query_id, query_id);
         assert_eq!(status.pending_approvals[0].position_id, Some(position.id));
         assert_eq!(status.pending_approvals[0].state, "AwaitingApproval");
+    }
+
+    #[tokio::test]
+    async fn test_status_hides_stale_missing_positions_from_live_counts() {
+        let (app, _, position_manager) = create_test_app_with_event_bus(8).await;
+        save_active_position_for_api(&position_manager, "BTCUSDT", Side::Long, dec!(100), dec!(1))
+            .await;
+
+        let response = app
+            .oneshot(Request::builder().uri("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let status: StatusResponse = serde_json::from_slice(&body).unwrap();
+        assert_eq!(status.active_positions, 0);
+        assert!(status.positions.is_empty());
+        assert_eq!(status.occupied_slots, 0);
+        assert_eq!(status.new_slots_available, 4);
+        assert_eq!(status.slot_cells_total, 4);
     }
 
     #[tokio::test]

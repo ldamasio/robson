@@ -572,7 +572,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
 
     async fn recalibrate_capital_base_after_pure_financial_drift(&self) -> DaemonResult<()> {
         let now = Utc::now();
-        let risk_open = self.store.positions().find_risk_open().await?;
+        let risk_open = self.live_risk_open_positions().await?;
         let all_open = self.store.positions().find_active().await?;
         let armed_count = all_open
             .iter()
@@ -621,6 +621,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         .await
     }
 
+    async fn live_risk_open_positions(&self) -> DaemonResult<Vec<Position>> {
+        let manager = self.position_manager.read().await;
+        manager.live_risk_open_positions().await
+    }
+
     async fn recalibrate_capital_base(
         &self,
         evidence: String,
@@ -634,7 +639,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         };
 
         let carried_risk_committed =
-            Self::calculate_committed_carried_risk(&self.store.positions().find_risk_open().await?);
+            Self::calculate_committed_carried_risk(&self.live_risk_open_positions().await?);
         let armed_count = self
             .store
             .positions()
