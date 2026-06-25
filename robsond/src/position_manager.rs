@@ -338,7 +338,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .filter(|position| Self::is_governed_monthly_close(position))
             .map(|position| {
                 let net = position.realized_pnl - position.fees_paid;
-                if net < Decimal::ZERO { net.abs() } else { Decimal::ZERO }
+                if net < Decimal::ZERO {
+                    net.abs()
+                } else {
+                    Decimal::ZERO
+                }
             })
             .sum())
     }
@@ -3152,8 +3156,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         let realized_loss = self.governed_monthly_realized_loss(now).await?;
         let policy_slots =
-            self.trading_policy
-                .slots_available(capital_base, realized_loss, latent_risk);
+            self.trading_policy.slots_available(capital_base, realized_loss, latent_risk);
 
         // Armed positions' risk is reflected in capital_base at month boundary.
         // The slot count is purely budget-driven.

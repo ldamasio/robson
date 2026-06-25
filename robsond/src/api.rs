@@ -1123,10 +1123,7 @@ where
     let positions = manager.get_open_positions().await.map_err(|e| to_error_response(e))?;
     let pending_approvals = manager.get_pending_approvals().await;
     let now = chrono::Utc::now();
-    let monthly = manager
-        .load_monthly_state(now)
-        .await
-        .map_err(|e| to_error_response(e))?;
+    let monthly = manager.load_monthly_state(now).await.map_err(|e| to_error_response(e))?;
     let new_slots_available =
         manager.compute_slots_available().await.map_err(|e| to_error_response(e))?;
     let occupied_slots = positions.len();
