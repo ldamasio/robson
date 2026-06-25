@@ -59,3 +59,9 @@ Production deployment: container in k3s rbx-infra cluster,
 image at `ghcr.io/ldamasio/robson-frontend-v2`, ArgoCD-managed.
 
 See `docs/runbooks/frontend-deploy.md` for the full deploy procedure. The GitHub Actions workflow `Frontend Build & Publish` builds the Docker image on push to main (or workflow_dispatch) and pushes to GHCR. ArgoCD reconciles the deployment in rbx-infra. Prerequisites B1–B7 must be satisfied by the operator before the first deployment; see runbook.
+
+## Dashboard Semantics
+
+- The dashboard operations panel renders only live positions that still occupy a slot.
+- Terminal positions such as `Closed`, `Error`, and `Canceled` remain available in historical views, but are omitted from the live slot list.
+- This keeps the slot grid aligned with the current risk surface: occupied slots on one side, available slots on the other.

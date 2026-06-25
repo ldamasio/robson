@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed - Dashboard live-list semantics
+
+- The live dashboard operations panel now shows only positions that still occupy a slot.
+- Terminal operations such as `Closed`, `Error`, and `Canceled` are omitted from the live list and remain in historical views.
+
 ### Changed - Repository Cleanup and Layout Normalization (2026-05-13)
 
 - Removed dead legacy roots from the repository: `apps/`, `data/`,

@@ -28,6 +28,7 @@
     positionStateLabel,
     positionMetaLine,
     positionSummaryLines,
+    isPositionActive,
     isPositionCancelled,
     haltStateLabel,
     eventTypeLabel,
@@ -53,15 +54,11 @@
   let currentMonth = $derived(currentMonthKey());
   let monthOps = $derived(sortPositionsOldestFirst(monthlyPositions));
   let isHistoricalMonth = $derived(selectedMonth !== currentMonth);
-  let displayOps = $derived(
-    monthOps.filter((op) => !isPositionCancelled(op.state)),
-  );
+  let liveOps = $derived((currentStatus?.positions ?? []).filter((op) => isPositionActive(op.state)));
+  let historicalOps = $derived(monthOps.filter((op) => !isPositionCancelled(op.state)));
+  let displayOps = $derived(isHistoricalMonth ? historicalOps : liveOps);
   let slotPositions = $derived(
-    isHistoricalMonth
-      ? displayOps
-      : (currentStatus?.positions ?? []).filter(
-          (op) => !isPositionCancelled(op.state),
-        ),
+    isHistoricalMonth ? displayOps : liveOps,
   );
   let slots = $derived(
     deriveMonthSlots(

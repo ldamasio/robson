@@ -103,3 +103,6 @@ Subsequent deploys:
   latency global matters)
 - Locale switcher UI deferred (host-based default sufficient)
 - Hash chain UI (FE-P3) and history endpoints (FE-P2) pending
+- Live dashboard operations list intentionally excludes terminal
+  positions; only slots still occupied by open lifecycle states are
+  rendered on the main panel.
