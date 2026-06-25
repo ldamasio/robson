@@ -180,27 +180,23 @@ pub async fn seed_balance_sampled_event(
     free: &str,
     locked: &str,
 ) -> Result<EventEnvelope> {
-    append_event(
-        pool,
-        tenant_id,
-        AppendEventOptions {
-            event_type: "BALANCE_SAMPLED".to_string(),
-            stream_key: format!("account:{}", account_id),
-            payload: json!({
-                "balance_id": Uuid::now_v7(),
-                "tenant_id": tenant_id,
-                "account_id": account_id,
-                "asset": asset,
-                "free": free,
-                "locked": locked,
-                "sampled_at": Utc::now()
-            }),
-            seq: None,
-            occurred_at: None,
-            actor_type: ActorType::CLI,
-            actor_id: Some("test-user".to_string()),
-        },
-    )
+    append_event(pool, tenant_id, AppendEventOptions {
+        event_type: "BALANCE_SAMPLED".to_string(),
+        stream_key: format!("account:{}", account_id),
+        payload: json!({
+            "balance_id": Uuid::now_v7(),
+            "tenant_id": tenant_id,
+            "account_id": account_id,
+            "asset": asset,
+            "free": free,
+            "locked": locked,
+            "sampled_at": Utc::now()
+        }),
+        seq: None,
+        occurred_at: None,
+        actor_type: ActorType::CLI,
+        actor_id: Some("test-user".to_string()),
+    })
     .await
 }
 
@@ -217,29 +213,25 @@ pub async fn seed_position_opened_event(
     technical_stop_price: &str,
     technical_stop_distance: &str,
 ) -> Result<EventEnvelope> {
-    append_event(
-        pool,
-        tenant_id,
-        AppendEventOptions {
-            event_type: "POSITION_OPENED".to_string(),
-            stream_key: format!("position:{}", Uuid::now_v7()),
-            payload: json!({
-                "position_id": Uuid::now_v7(),
-                "tenant_id": tenant_id,
-                "account_id": account_id,
-                "symbol": symbol,
-                "side": "long",
-                "entry_price": entry_price,
-                "entry_quantity": quantity,
-                "technical_stop_price": technical_stop_price,
-                "technical_stop_distance": technical_stop_distance,
-                "entry_filled_at": Utc::now()
-            }),
-            seq: None,
-            occurred_at: None,
-            actor_type: ActorType::CLI,
-            actor_id: Some("test-user".to_string()),
-        },
-    )
+    append_event(pool, tenant_id, AppendEventOptions {
+        event_type: "POSITION_OPENED".to_string(),
+        stream_key: format!("position:{}", Uuid::now_v7()),
+        payload: json!({
+            "position_id": Uuid::now_v7(),
+            "tenant_id": tenant_id,
+            "account_id": account_id,
+            "symbol": symbol,
+            "side": "long",
+            "entry_price": entry_price,
+            "entry_quantity": quantity,
+            "technical_stop_price": technical_stop_price,
+            "technical_stop_distance": technical_stop_distance,
+            "entry_filled_at": Utc::now()
+        }),
+        seq: None,
+        occurred_at: None,
+        actor_type: ActorType::CLI,
+        actor_id: Some("test-user".to_string()),
+    })
     .await
 }

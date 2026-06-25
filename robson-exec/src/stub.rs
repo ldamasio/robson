@@ -182,10 +182,11 @@ impl StubExchange {
     }
 
     pub fn set_spot_balance(&self, asset: &str, free: Decimal, locked: Decimal) {
-        self.spot_balances
-            .write()
-            .unwrap()
-            .insert(asset.to_string(), SpotBalance { asset: asset.to_string(), free, locked });
+        self.spot_balances.write().unwrap().insert(asset.to_string(), SpotBalance {
+            asset: asset.to_string(),
+            free,
+            locked,
+        });
     }
 
     pub fn set_spot_order(&self, order: SpotOrder) {
