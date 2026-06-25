@@ -1,5 +1,5 @@
 import type { PositionState } from '$api/robson';
-import { isPositionActive } from '$lib/presentation/labels';
+import { isRenderableLivePosition } from '$lib/presentation/labels';
 
 export type SlotCell = {
   index: number;
@@ -12,6 +12,7 @@ export type SlotCell = {
 type SlotPosition = {
   id: string;
   state: PositionState;
+  exchange_sync_state?: string | null;
   created_at?: string | null;
 };
 
@@ -26,7 +27,7 @@ export function sortPositionsOldestFirst<T extends { created_at?: string | null 
 }
 
 export function deriveLiveSlots(positions: SlotPosition[], slotCellsTotal: number): SlotCell[] {
-  const active = sortPositionsOldestFirst(positions.filter((p) => isPositionActive(p.state)));
+  const active = sortPositionsOldestFirst(positions.filter((p) => isRenderableLivePosition(p)));
   const count = Math.max(slotCellsTotal, active.length);
   const cells: SlotCell[] = [];
 
@@ -89,5 +90,5 @@ export function deriveSlots(positions: SlotPosition[], slotCellsTotal: number): 
 }
 
 export function occupiedCount(positions: { state: PositionState }[]): number {
-  return positions.filter((p) => isPositionActive(p.state)).length;
+  return positions.filter((p) => isRenderableLivePosition(p)).length;
 }

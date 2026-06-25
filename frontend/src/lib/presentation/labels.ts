@@ -123,6 +123,10 @@ export function isPositionCancelled(state: PositionState): boolean {
   return false;
 }
 
+export function isRenderableLivePosition(position: { state: PositionState; exchange_sync_state?: string | null }): boolean {
+  return isPositionActive(position.state) && position.exchange_sync_state !== STALE_SYNC_STATE;
+}
+
 function trailingStopMoveTarget(p: Position): { trigger_price: number; next_stop: number } | null {
   const entry = p.entry_price;
   const stop = activeTrailingStop(p);

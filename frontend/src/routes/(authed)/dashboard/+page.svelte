@@ -28,7 +28,7 @@
     positionStateLabel,
     positionMetaLine,
     positionSummaryLines,
-    isPositionActive,
+    isRenderableLivePosition,
     isPositionCancelled,
     haltStateLabel,
     eventTypeLabel,
@@ -54,7 +54,7 @@
   let currentMonth = $derived(currentMonthKey());
   let monthOps = $derived(sortPositionsOldestFirst(monthlyPositions));
   let isHistoricalMonth = $derived(selectedMonth !== currentMonth);
-  let liveOps = $derived((currentStatus?.positions ?? []).filter((op) => isPositionActive(op.state)));
+  let liveOps = $derived((currentStatus?.positions ?? []).filter((op) => isRenderableLivePosition(op)));
   let historicalOps = $derived(monthOps.filter((op) => !isPositionCancelled(op.state)));
   let displayOps = $derived(isHistoricalMonth ? historicalOps : liveOps);
   let slotPositions = $derived(
@@ -199,7 +199,7 @@
         robsonApi.getHaltStatus(),
       ]);
       currentStatus = status;
-      activePositions.set(status.positions);
+      activePositions.set(status.positions.filter((op) => isRenderableLivePosition(op)));
       haltStatus.set(halt);
       pendingApprovals = status.pending_approvals;
       connected = true;
@@ -273,7 +273,7 @@
             robsonApi.getHaltStatus(),
           ]);
           currentStatus = status;
-          activePositions.set(status.positions);
+          activePositions.set(status.positions.filter((op) => isRenderableLivePosition(op)));
           haltStatus.set(halt);
           pendingApprovals = status.pending_approvals;
           connected = true;
