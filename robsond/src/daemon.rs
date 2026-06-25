@@ -1002,26 +1002,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                     inputs.push(input);
                 },
                 None => {
-                    error!(
+                    warn!(
                         position_id = %position.id,
                         symbol = %position.symbol.as_pair(),
                         side = ?position.side,
-                        "Startup auto-reconcile: no unambiguous real evidence for stale-active position"
+                        "Startup auto-reconcile: no unambiguous real evidence for stale-active position; continuing so the periodic reconciliation worker can resolve it"
                     );
-                    let infos: Vec<StartupStaleActiveInfo> = stale_actives
-                        .iter()
-                        .map(|p| StartupStaleActiveInfo {
-                            position_id: p.id,
-                            symbol: p.symbol.as_pair(),
-                            side: format!("{:?}", p.side),
-                            quantity: p.quantity.as_decimal(),
-                            entry_price: p.entry_price.map(|pr| pr.as_decimal()),
-                        })
-                        .collect();
-                    return Err(DaemonError::StartupStaleActiveDetected {
-                        count: stale_actives.len(),
-                        positions: infos,
-                    });
+                    return Ok(());
                 },
             }
         }
@@ -2305,18 +2292,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_startup_auto_reconcile_no_evidence_returns_typed_error() {
+    async fn test_startup_auto_reconcile_no_evidence_allows_startup() {
         use robson_domain::Symbol;
         let daemon = Daemon::new_stub(config_with_auto_reconcile());
 
         let position = active_position(Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        let pid = position.id;
         daemon.store.positions().save(&position).await.unwrap();
 
-        let err = daemon.run_startup_auto_reconcile().await.unwrap_err();
-        assert!(
-            matches!(err, DaemonError::StartupStaleActiveDetected { count: 1, .. }),
-            "expected StartupStaleActiveDetected, got: {err:?}"
-        );
+        daemon.run_startup_auto_reconcile().await.unwrap();
+
+        let stored = daemon.store.positions().find_by_id(pid).await.unwrap().unwrap();
+        assert!(matches!(stored.state, PositionState::Active { .. }));
     }
 
     #[tokio::test]
