@@ -9,7 +9,23 @@ export function sideLabel(side: string): string {
   return map[side] ?? side;
 }
 
-export function positionStateLabel(state: PositionState): string {
+const STALE_SYNC_STATE = 'stale_missing_on_exchange';
+
+export function positionStateLabel(positionOrState: Position | PositionState): string {
+  if (
+    typeof positionOrState !== 'string' &&
+    'exchange_sync_state' in positionOrState &&
+    positionOrState.exchange_sync_state === STALE_SYNC_STATE
+  ) {
+    return 'Stale';
+  }
+
+  const state =
+    typeof positionOrState === 'string'
+      ? positionOrState
+      : 'state' in positionOrState
+        ? positionOrState.state
+        : positionOrState;
   if (typeof state === 'string') return state;
   const key = Object.keys(state)[0];
   return key;
@@ -28,6 +44,7 @@ export function entryModeLabel(mode?: string | null): string {
 export function positionSummaryLines(p: Position): string[] {
   const lines: string[] = [];
   const state = p.state;
+  const isStale = p.exchange_sync_state === STALE_SYNC_STATE;
   const label = (tag: string, detail: string) => `${tag.padEnd(10)}${detail}`;
 
   if (typeof state === 'string') {
@@ -37,18 +54,22 @@ export function positionSummaryLines(p: Position): string[] {
       lines.push(label('ARMED', `${modeLabel}${approvalLabel}`));
       lines.push(label('LEVERAGE', '10x (fixed)'));
     } else if (state === 'Active') {
-      const details: string[] = [];
-      if (p.entry_price != null) details.push(`entry ${fmtNum(p.entry_price)}`);
-      if (p.trailing_stop != null) details.push(`stop ${fmtNum(p.trailing_stop)}`);
-      lines.push(label('ACTIVE', details.join(' · ') || 'position open'));
-      const target = trailingStopMoveTarget(p);
-      if (target) {
-        lines.push(
-          label(
-            'TARGET',
-            `${fmtNum(target.trigger_price)} -> stop ${fmtNum(target.next_stop)}`,
-          ),
-        );
+      if (isStale) {
+        lines.push(label('STALE', 'not present on exchange'));
+      } else {
+        const details: string[] = [];
+        if (p.entry_price != null) details.push(`entry ${fmtNum(p.entry_price)}`);
+        if (p.trailing_stop != null) details.push(`stop ${fmtNum(p.trailing_stop)}`);
+        lines.push(label('ACTIVE', details.join(' · ') || 'position open'));
+        const target = trailingStopMoveTarget(p);
+        if (target) {
+          lines.push(
+            label(
+              'TARGET',
+              `${fmtNum(target.trigger_price)} -> stop ${fmtNum(target.next_stop)}`,
+            ),
+          );
+        }
       }
     }
   } else {
@@ -58,17 +79,21 @@ export function positionSummaryLines(p: Position): string[] {
     if (key === 'Entering' && val) {
       lines.push(label('ENTERING', `expected entry ${fmtNum(val.expected_entry as number)}`));
     } else if (key === 'Active' && val) {
-      lines.push(label('ACTIVE', `price ${fmtNum(val.current_price as number)} · stop ${fmtNum(val.trailing_stop as number)}`));
-      const target = trailingStopMoveTarget(p);
-      if (target) {
-        lines.push(
-          label(
-            'TARGET',
-            `${fmtNum(target.trigger_price)} -> stop ${fmtNum(target.next_stop)}`,
-          ),
-        );
+      if (isStale) {
+        lines.push(label('STALE', 'not present on exchange'));
+      } else {
+        lines.push(label('ACTIVE', `price ${fmtNum(val.current_price as number)} · stop ${fmtNum(val.trailing_stop as number)}`));
+        const target = trailingStopMoveTarget(p);
+        if (target) {
+          lines.push(
+            label(
+              'TARGET',
+              `${fmtNum(target.trigger_price)} -> stop ${fmtNum(target.next_stop)}`,
+            ),
+          );
+        }
+        if (val.favorable_extreme) lines.push(label('EXTREME', fmtNum(val.favorable_extreme as number)));
       }
-      if (val.favorable_extreme) lines.push(label('EXTREME', fmtNum(val.favorable_extreme as number)));
     } else if (key === 'Exiting' && val) {
       lines.push(label('EXITING', `${val.exit_reason}`));
     } else if (key === 'Closed' && val) {
@@ -133,7 +158,7 @@ function activeTrailingStop(p: Position): number | null {
 }
 
 export function positionMetaLine(p: Position): string {
-  const state = positionStateLabel(p.state);
+  const state = positionStateLabel(p);
   const parts = [`State ${state}`];
   if (p.created_at) parts.push(`Created ${formatDateUtc(p.created_at)}`);
   if (p.closed_at) parts.push(`Closed ${formatDateUtc(p.closed_at)}`);

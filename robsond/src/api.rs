@@ -28,7 +28,7 @@ use robson_domain::{
     ApprovalPolicy as DomainApprovalPolicy, DetectorSignal, EntryPolicy, EntryPolicyConfig,
     Position, PositionState, Price, RiskConfig, Side, Symbol, TradingPolicy,
 };
-use robson_exec::{ExchangePort, UniversalTransferType};
+use robson_exec::{ExchangePort, ExchangePosition, UniversalTransferType};
 #[cfg(feature = "postgres")]
 use robson_store::find_positions_overlapping_month;
 use robson_store::Store;
@@ -139,6 +139,8 @@ pub struct PositionSummary {
     pub symbol: String,
     pub side: String,
     pub state: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exchange_sync_state: Option<String>,
     pub created_at: chrono::DateTime<chrono::Utc>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_mode: Option<String>,
@@ -1126,6 +1128,13 @@ where
         manager.compute_slots_available().await.map_err(|e| to_error_response(e))?;
     let occupied_slots = positions.len();
     let slot_cells_total = occupied_slots.saturating_add(new_slots_available as usize);
+    let exchange_positions = match manager.exchange_open_positions().await {
+        Ok(positions) => Some(positions),
+        Err(error) => {
+            warn!(error = %error, "failed to query exchange open positions for sync check");
+            None
+        },
+    };
     let monthly_realized_loss_pct = if monthly.capital_base > Decimal::ZERO {
         monthly.realized_loss / monthly.capital_base * Decimal::from(100u32)
     } else {
@@ -1134,7 +1143,7 @@ where
 
     let mut summaries: Vec<PositionSummary> = Vec::with_capacity(positions.len());
     for position in &positions {
-        summaries.push(position_to_summary_with_live_price(&manager, position).await);
+        summaries.push(position_to_summary_with_live_price_and_sync(&manager, position, exchange_positions.as_deref()).await);
     }
 
     // Update active positions gauge
@@ -1222,8 +1231,19 @@ where
                     }),
                 )
             })?;
+    let exchange_positions = match manager.exchange_open_positions().await {
+        Ok(positions) => Some(positions),
+        Err(error) => {
+            warn!(error = %error, "failed to query exchange open positions for sync check");
+            None
+        },
+    };
 
-    Ok(Json(position_to_summary_with_live_price(&manager, &position).await))
+    Ok(Json(position_to_summary_with_live_price_and_sync(
+        &manager,
+        &position,
+        exchange_positions.as_deref(),
+    ).await))
 }
 
 /// Arm a new position.
@@ -1881,6 +1901,40 @@ where
     position_to_summary(position, live_price, entry_mode, approval_mode)
 }
 
+async fn position_to_summary_with_live_price_and_sync<E, S>(
+    manager: &PositionManager<E, S>,
+    position: &Position,
+    exchange_positions: Option<&[ExchangePosition]>,
+) -> PositionSummary
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let mut summary = position_to_summary_with_live_price(manager, position).await;
+    summary.exchange_sync_state = exchange_sync_state(position, exchange_positions);
+    summary
+}
+
+fn exchange_sync_state(
+    position: &Position,
+    exchange_positions: Option<&[ExchangePosition]>,
+) -> Option<String> {
+    let exchange_positions = exchange_positions?;
+    if !matches!(&position.state, PositionState::Active { .. }) {
+        return None;
+    }
+
+    let found = exchange_positions.iter().any(|exchange_position| {
+        &exchange_position.symbol == &position.symbol && &exchange_position.side == &position.side
+    });
+
+    if found {
+        None
+    } else {
+        Some("stale_missing_on_exchange".to_string())
+    }
+}
+
 fn position_to_summary(
     position: &Position,
     live_price: Option<Price>,
@@ -1959,6 +2013,7 @@ fn position_to_summary(
         symbol: position.symbol.as_pair(),
         side: format!("{:?}", position.side),
         state: state_str,
+        exchange_sync_state: None,
         created_at: position.created_at,
         entry_mode,
         approval_mode,
@@ -2136,7 +2191,7 @@ mod tests {
     use http_body_util::BodyExt;
     use robson_domain::{Quantity, RiskConfig, TechnicalStopDistance, TradingPolicy};
     use robson_engine::Engine;
-    use robson_exec::{Executor, IntentJournal, StubExchange};
+    use robson_exec::{ExchangePosition, Executor, IntentJournal, StubExchange};
     use robson_store::MemoryStore;
     use rust_decimal_macros::dec;
     use tokio::time::timeout;
@@ -2208,6 +2263,33 @@ mod tests {
         assert_eq!(summary.current_price, Some(dec!(90)));
         assert_eq!(summary.pnl, Some(dec!(20)));
         assert_eq!(summary.variation_pct, Some(dec!(10.0)));
+    }
+
+
+    #[test]
+    fn exchange_sync_state_marks_missing_active_position_as_stale() {
+        let mut position =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        position.state = PositionState::Active {
+            current_price: Price::new(dec!(100)).unwrap(),
+            trailing_stop: Price::new(dec!(95)).unwrap(),
+            favorable_extreme: Price::new(dec!(105)).unwrap(),
+            extreme_at: chrono::Utc::now(),
+            insurance_stop_id: None,
+            last_emitted_stop: None,
+        };
+
+        let stale = exchange_sync_state(&position, Some(&[]));
+        assert_eq!(stale, Some("stale_missing_on_exchange".to_string()));
+
+        let exchange_positions = vec![ExchangePosition {
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            side: Side::Long,
+            quantity: robson_domain::Quantity::new(dec!(1)).unwrap(),
+            entry_price: Price::new(dec!(100)).unwrap(),
+        }];
+        let present = exchange_sync_state(&position, Some(&exchange_positions));
+        assert_eq!(present, None);
     }
 
     #[test]
