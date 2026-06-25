@@ -33,7 +33,9 @@ use robson_engine::{
 };
 #[cfg(feature = "postgres")]
 use robson_eventlog::{append_event, ActorType as EventlogActorType, Event as EventlogEvent};
-use robson_exec::{ActionResult, ExchangePort, ExchangePosition, ExecError, Executor, OhlcvPort, StubOhlcv};
+use robson_exec::{
+    ActionResult, ExchangePort, ExchangePosition, ExecError, Executor, OhlcvPort, StubOhlcv,
+};
 #[cfg(feature = "postgres")]
 use robson_projector::apply_event_to_projections;
 use robson_store::Store;
@@ -1048,12 +1050,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         {
             let mut pending_approvals = self.pending_approvals.write().await;
-            pending_approvals.insert(query_id, PendingApprovalRecord {
-                query,
-                position,
-                proposed,
-                governed,
-            });
+            pending_approvals
+                .insert(query_id, PendingApprovalRecord { query, position, proposed, governed });
         }
 
         let pending_approvals = self.pending_approvals.read().await;
@@ -5499,9 +5497,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome, ReconcileCloseOutcome::SkippedNonActive {
-            state: "exiting".to_string()
-        });
+        assert_eq!(
+            outcome,
+            ReconcileCloseOutcome::SkippedNonActive { state: "exiting".to_string() }
+        );
         let after = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
         assert!(matches!(after.state, PositionState::Exiting { .. }));
         let events = manager.store.events().find_by_position(position.id).await.unwrap();
@@ -5535,9 +5534,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome, ReconcileCloseOutcome::RejectedUnsupportedEvidence {
-            source: "account_snapshot"
-        });
+        assert_eq!(
+            outcome,
+            ReconcileCloseOutcome::RejectedUnsupportedEvidence { source: "account_snapshot" }
+        );
         let after = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
         assert!(matches!(after.state, PositionState::Active { .. }));
     }
@@ -5567,9 +5567,10 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(outcome, ReconcileCloseOutcome::RejectedUnsupportedEvidence {
-            source: "estimated"
-        });
+        assert_eq!(
+            outcome,
+            ReconcileCloseOutcome::RejectedUnsupportedEvidence { source: "estimated" }
+        );
         let after = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
         assert!(matches!(after.state, PositionState::Active { .. }));
     }
@@ -5592,9 +5593,10 @@ mod tests {
 
         let outcome = manager.reconcile_close(input).await.unwrap();
 
-        assert_eq!(outcome, ReconcileCloseOutcome::RejectedInconsistentEvidence {
-            field: "exit_price"
-        });
+        assert_eq!(
+            outcome,
+            ReconcileCloseOutcome::RejectedInconsistentEvidence { field: "exit_price" }
+        );
         let after = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
         assert!(matches!(after.state, PositionState::Active { .. }));
     }

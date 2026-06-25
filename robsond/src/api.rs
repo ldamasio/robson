@@ -1143,7 +1143,14 @@ where
 
     let mut summaries: Vec<PositionSummary> = Vec::with_capacity(positions.len());
     for position in &positions {
-        summaries.push(position_to_summary_with_live_price_and_sync(&manager, position, exchange_positions.as_deref()).await);
+        summaries.push(
+            position_to_summary_with_live_price_and_sync(
+                &manager,
+                position,
+                exchange_positions.as_deref(),
+            )
+            .await,
+        );
     }
 
     // Update active positions gauge
@@ -1239,11 +1246,14 @@ where
         },
     };
 
-    Ok(Json(position_to_summary_with_live_price_and_sync(
-        &manager,
-        &position,
-        exchange_positions.as_deref(),
-    ).await))
+    Ok(Json(
+        position_to_summary_with_live_price_and_sync(
+            &manager,
+            &position,
+            exchange_positions.as_deref(),
+        )
+        .await,
+    ))
 }
 
 /// Arm a new position.
@@ -2264,7 +2274,6 @@ mod tests {
         assert_eq!(summary.pnl, Some(dec!(20)));
         assert_eq!(summary.variation_pct, Some(dec!(10.0)));
     }
-
 
     #[test]
     fn exchange_sync_state_marks_missing_active_position_as_stale() {

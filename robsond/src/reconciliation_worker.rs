@@ -352,13 +352,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
             match observations.get(&position.id).cloned() {
                 Some(observation) => observation,
                 None => {
-                    observations.insert(position.id, MissingObservation {
-                        symbol: position.symbol.clone(),
-                        side: position.side,
-                        expected_quantity: position.quantity,
-                        first_observed_missing_at: now,
-                        first_observed_instant: Instant::now(),
-                    });
+                    observations.insert(
+                        position.id,
+                        MissingObservation {
+                            symbol: position.symbol.clone(),
+                            side: position.side,
+                            expected_quantity: position.quantity,
+                            first_observed_missing_at: now,
+                            first_observed_instant: Instant::now(),
+                        },
+                    );
                     debug!(
                         position_id = %position.id,
                         symbol = %position.symbol.as_pair(),
@@ -492,7 +495,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         });
         self.clear_missing_observation(position.id).await;
     }
-
 
     async fn handle_untracked_position(
         &self,
@@ -1056,10 +1058,13 @@ mod tests {
         assert_eq!(worker.scan_and_reconcile().await.unwrap(), 1);
 
         let closed = store.positions().find_by_id(position_id).await.unwrap().unwrap();
-        assert!(matches!(closed.state, PositionState::Closed {
-            exit_reason: ExitReason::ReconciledMissingOnExchange,
-            ..
-        }));
+        assert!(matches!(
+            closed.state,
+            PositionState::Closed {
+                exit_reason: ExitReason::ReconciledMissingOnExchange,
+                ..
+            }
+        ));
         assert_eq!(close_events_for(&store, position_id).await, 1);
     }
 
@@ -1075,13 +1080,16 @@ mod tests {
         let now = Utc::now();
         exchange
             .set_order_result("EX-ORDER-1", order_result("EX-ORDER-1", dec!(90), dec!(0.010), now));
-        exchange.set_user_trades(&symbol.as_pair(), vec![user_trade(
-            "TRADE-1",
-            "EX-ORDER-2",
-            dec!(91),
-            dec!(0.010),
-            now,
-        )]);
+        exchange.set_user_trades(
+            &symbol.as_pair(),
+            vec![user_trade(
+                "TRADE-1",
+                "EX-ORDER-2",
+                dec!(91),
+                dec!(0.010),
+                now,
+            )],
+        );
         let worker = create_worker(exchange, store.clone(), event_bus, Duration::from_secs(0));
 
         worker.scan_and_reconcile().await.unwrap();
@@ -1117,13 +1125,16 @@ mod tests {
             create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
 
         worker.scan_and_reconcile().await.unwrap();
-        exchange.set_user_trades(&symbol.as_pair(), vec![user_trade(
-            "TRADE-1",
-            "EX-ORDER-2",
-            dec!(90),
-            dec!(0.010),
-            Utc::now(),
-        )]);
+        exchange.set_user_trades(
+            &symbol.as_pair(),
+            vec![user_trade(
+                "TRADE-1",
+                "EX-ORDER-2",
+                dec!(90),
+                dec!(0.010),
+                Utc::now(),
+            )],
+        );
         assert_eq!(worker.scan_and_reconcile().await.unwrap(), 1);
 
         let closed = store.positions().find_by_id(position_id).await.unwrap().unwrap();
@@ -1167,10 +1178,13 @@ mod tests {
 
         worker.scan_and_reconcile().await.unwrap();
         let now = Utc::now();
-        exchange.set_user_trades(&symbol.as_pair(), vec![
-            user_trade("TRADE-1", "EX-ORDER-2", dec!(90), dec!(0.010), now),
-            user_trade("TRADE-2", "EX-ORDER-3", dec!(91), dec!(0.010), now),
-        ]);
+        exchange.set_user_trades(
+            &symbol.as_pair(),
+            vec![
+                user_trade("TRADE-1", "EX-ORDER-2", dec!(90), dec!(0.010), now),
+                user_trade("TRADE-2", "EX-ORDER-3", dec!(91), dec!(0.010), now),
+            ],
+        );
         assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
 
         let loaded = store.positions().find_by_id(position_id).await.unwrap().unwrap();
@@ -1193,13 +1207,16 @@ mod tests {
             create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
 
         worker.scan_and_reconcile().await.unwrap();
-        exchange.set_user_trades(&symbol.as_pair(), vec![user_trade(
-            "TRADE-1",
-            "EX-ORDER-2",
-            dec!(90),
-            dec!(0.020),
-            Utc::now(),
-        )]);
+        exchange.set_user_trades(
+            &symbol.as_pair(),
+            vec![user_trade(
+                "TRADE-1",
+                "EX-ORDER-2",
+                dec!(90),
+                dec!(0.020),
+                Utc::now(),
+            )],
+        );
         assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
 
         let loaded = store.positions().find_by_id(position_id).await.unwrap().unwrap();
