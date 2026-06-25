@@ -80,6 +80,7 @@ export type StatusResponse = {
   monthly_realized_loss: number;
   monthly_realized_loss_pct: number;
   capital_base: number;
+  wallet_balance: number;
 };
 
 export type ArmEntryPolicy = {
@@ -331,6 +332,7 @@ function normalizeStatus(raw: StatusResponse): StatusResponse {
       "monthly_realized_loss_pct",
     ),
     capital_base: requireNumber(raw.capital_base, "capital_base"),
+    wallet_balance: requireNumber(raw.wallet_balance, "wallet_balance"),
   };
 }
 

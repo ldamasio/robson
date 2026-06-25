@@ -8,7 +8,7 @@
   $effect(() => {
     robsonApi
       .getStatus()
-      .then((s) => (capital = s.capital_base))
+      .then((s) => (capital = s.wallet_balance))
       .catch(() => {});
   });
 

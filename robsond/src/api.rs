@@ -121,6 +121,8 @@ pub struct StatusResponse {
     pub monthly_realized_loss_pct: Decimal,
     /// Starting capital basis for the current month.
     pub capital_base: Decimal,
+    /// Current futures wallet balance reported by the exchange.
+    pub wallet_balance: Decimal,
 }
 
 /// Historical monthly positions response.
@@ -1140,6 +1142,12 @@ where
         .governed_monthly_realized_loss(now)
         .await
         .map_err(|e| to_error_response(e))?;
+    let wallet_balance = state
+        .exchange
+        .get_futures_balance()
+        .await
+        .map_err(|e| to_error_response(DaemonError::Exec(e)))?
+        .wallet_balance;
     let monthly_realized_loss_pct = if monthly.capital_base > Decimal::ZERO {
         governed_monthly_realized_loss / monthly.capital_base * Decimal::from(100u32)
     } else {
@@ -1184,6 +1192,7 @@ where
         monthly_realized_loss: governed_monthly_realized_loss,
         monthly_realized_loss_pct,
         capital_base: monthly.capital_base,
+        wallet_balance,
     }))
 }
 

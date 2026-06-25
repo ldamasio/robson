@@ -428,7 +428,7 @@
             </Card>
             <Card padding={4}>
               <Stack gap={2}>
-                <span class="label">REALIZED LOSS</span>
+                <span class="label">GOVERNED REALIZED LOSS</span>
                 <span class="loss-value"
                   >{formatMoney(currentStatus.monthly_realized_loss)}</span
                 >
@@ -437,6 +437,13 @@
                   {formatMoney(currentStatus.capital_base)}</span
                 >
                 <span class="meta dim">Governed Robson flow only</span>
+              </Stack>
+            </Card>
+            <Card padding={4}>
+              <Stack gap={2}>
+                <span class="label">WALLET BALANCE</span>
+                <span class="loss-value">{formatMoney(currentStatus.wallet_balance)}</span>
+                <span class="meta dim">Current futures wallet on exchange</span>
               </Stack>
             </Card>
           </div>
@@ -740,7 +747,7 @@
   }
   .risk-grid {
     display: grid;
-    grid-template-columns: minmax(0, 2fr) minmax(220px, 1fr);
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
     gap: var(--s-3);
   }
   .budget-bar {
