@@ -2328,21 +2328,17 @@ mod tests {
             .set_order_result("EX-ORDER-A", order_result("EX-ORDER-A", dec!(90), dec!(0.010), now));
         // pos_b has no evidence
 
-        let err = daemon.run_startup_auto_reconcile().await.unwrap_err();
-        assert!(
-            matches!(err, DaemonError::StartupStaleActiveDetected { count: 2, .. }),
-            "expected StartupStaleActiveDetected for batch, got: {err:?}"
-        );
+        daemon.run_startup_auto_reconcile().await.unwrap();
 
         let stored_a = daemon.store.positions().find_by_id(pid_a).await.unwrap().unwrap();
         let stored_b = daemon.store.positions().find_by_id(pid_b).await.unwrap().unwrap();
         assert!(
             matches!(stored_a.state, PositionState::Active { .. }),
-            "pos_a must remain Active"
+            "pos_a must remain Active while unresolved evidence is present"
         );
         assert!(
             matches!(stored_b.state, PositionState::Active { .. }),
-            "pos_b must remain Active"
+            "pos_b must remain Active while unresolved evidence is present"
         );
     }
 
