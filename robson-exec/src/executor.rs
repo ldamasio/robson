@@ -93,6 +93,11 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         self.exchange.get_price(symbol).await
     }
 
+    /// Expose the exchange port for read-only inspection.
+    pub fn exchange(&self) -> Arc<E> {
+        Arc::clone(&self.exchange)
+    }
+
     /// Execute a list of engine actions.
     ///
     /// Actions are executed in order. If one fails, subsequent actions

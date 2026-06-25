@@ -123,7 +123,7 @@
               {#each affectedPositions as pos}
                 <div class="pos-row">
                   <span class="pos-label">{positionLabel(pos)}</span>
-                  <span class="pos-state">{positionStateLabel(pos.state)}</span>
+                  <span class="pos-state">{positionStateLabel(pos)}</span>
                 </div>
               {/each}
             </div>

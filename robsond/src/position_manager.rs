@@ -33,7 +33,7 @@ use robson_engine::{
 };
 #[cfg(feature = "postgres")]
 use robson_eventlog::{append_event, ActorType as EventlogActorType, Event as EventlogEvent};
-use robson_exec::{ActionResult, ExchangePort, ExecError, Executor, OhlcvPort, StubOhlcv};
+use robson_exec::{ActionResult, ExchangePort, ExchangePosition, ExecError, Executor, OhlcvPort, StubOhlcv};
 #[cfg(feature = "postgres")]
 use robson_projector::apply_event_to_projections;
 use robson_store::Store;
@@ -151,6 +151,11 @@ pub(crate) struct MonthlyRiskState {
 impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     pub(crate) fn configured_capital(&self) -> Decimal {
         self.engine.lock().unwrap().risk_config().capital()
+    }
+
+    /// Snapshot of open positions observed directly on the exchange.
+    pub(crate) async fn exchange_open_positions(&self) -> DaemonResult<Vec<ExchangePosition>> {
+        self.executor.exchange().get_all_open_positions().await.map_err(Into::into)
     }
 
     /// Update the engine's capital from an external source (exchange balance).

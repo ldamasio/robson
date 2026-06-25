@@ -16,6 +16,7 @@ export type Position = {
   symbol: string;
   side: "Long" | "Short" | string;
   state: PositionState;
+  exchange_sync_state?: string | null;
   entry_mode?: string | null;
   approval_mode?: string | null;
   entry_price: number | null;
@@ -278,6 +279,8 @@ function normalizePosition(raw: unknown): Position {
     symbol: String(p.symbol ?? ""),
     side: String(p.side ?? ""),
     state: (p.state ?? "Error") as PositionState,
+    exchange_sync_state:
+      p.exchange_sync_state == null ? null : String(p.exchange_sync_state),
     entry_mode: p.entry_mode == null ? null : String(p.entry_mode),
     approval_mode: p.approval_mode == null ? null : String(p.approval_mode),
     entry_price: toNumber(p.entry_price),

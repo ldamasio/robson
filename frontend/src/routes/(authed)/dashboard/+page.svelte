@@ -523,7 +523,7 @@
                         </span>
                       </Row>
                       <Row justify="between">
-                        <span class="meta">{positionStateLabel(op.state)}</span>
+                        <span class="meta">{positionStateLabel(op)}</span>
                       </Row>
                       <div class="meta dim">{positionMetaLine(op)}</div>
                       <pre class="history-summary">{positionSummaryLines(
@@ -554,7 +554,7 @@
                         </span>
                       </Row>
                       <Row justify="between">
-                        <span class="meta">{positionStateLabel(op.state)}</span>
+                        <span class="meta">{positionStateLabel(op)}</span>
                         {#if variationFor(op) !== null}
                           <span
                             class="mono"
