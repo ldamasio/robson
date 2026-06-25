@@ -62,7 +62,7 @@ use robson_engine::{
     SmaCrossoverStrategy, StrategyRegistry,
 };
 use robson_exec::{CandleInterval, OhlcvPort};
-use tokio::task::JoinHandle;
+use tokio::{task::JoinHandle, time::sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
 
@@ -317,24 +317,45 @@ impl DetectorTask {
         cancel_token: CancellationToken,
         mut receiver: EventReceiver,
     ) -> Option<DetectorSignal> {
-        // For Immediate mode: fire proactively without waiting for a market data tick.
-        // This prevents the position from staying Armed if no tick arrives promptly or
-        // if compute_technical_stop fails silently on reactive ticks.
+        // For Immediate mode, keep retrying proactively before falling back.
+        // This avoids silently downgrading a no-signal arm into a tick-waiting arm
+        // when the first candle fetch or stop analysis is transiently unavailable.
         if self.config.entry_policy.mode == EntryPolicy::Immediate {
-            match self.try_proactive_immediate_signal().await {
-                Ok(signal) => {
-                    self.event_bus.send(DaemonEvent::DetectorSignal(signal.clone()));
-                    return Some(signal);
-                },
-                Err(error) => {
-                    warn!(
-                        flow = "entry_immediate",
-                        position_id = %self.config.position_id,
-                        symbol = %self.config.symbol.as_pair(),
-                        error = %error,
-                        "Immediate proactive fire failed — falling back to reactive loop"
-                    );
-                },
+            let mut attempt: u8 = 0;
+            loop {
+                attempt = attempt.saturating_add(1);
+                match self.try_proactive_immediate_signal().await {
+                    Ok(signal) => {
+                        self.event_bus.send(DaemonEvent::DetectorSignal(signal.clone()));
+                        return Some(signal);
+                    },
+                    Err(error) => {
+                        warn!(
+                            flow = "entry_immediate",
+                            attempt,
+                            position_id = %self.config.position_id,
+                            symbol = %self.config.symbol.as_pair(),
+                            side = ?self.config.side,
+                            error = %error,
+                            "Immediate proactive fire failed"
+                        );
+
+                        if attempt >= 3 || !Self::is_transient_immediate_error(&error) {
+                            warn!(
+                                flow = "entry_immediate",
+                                attempt,
+                                position_id = %self.config.position_id,
+                                symbol = %self.config.symbol.as_pair(),
+                                side = ?self.config.side,
+                                error = %error,
+                                "Immediate proactive fire exhausted retries — falling back to reactive loop"
+                            );
+                            break;
+                        }
+
+                        sleep(std::time::Duration::from_millis(250)).await;
+                    },
+                }
             }
         }
 
@@ -418,6 +439,15 @@ impl DetectorTask {
         };
 
         self.create_signal(decision).await
+    }
+
+    fn is_transient_immediate_error(error: &DaemonError) -> bool {
+        matches!(error, DaemonError::Detector(msg) if {
+            let msg = msg.as_str();
+            msg.contains("no candles available")
+                || msg.contains("Insufficient candle data")
+                || msg.contains("Fetch more history")
+        })
     }
 
     /// Handle a single daemon event.
@@ -970,6 +1000,52 @@ mod tests {
         assert_eq!(stop.method, AnalyzerTechnicalStopMethod::SwingPoint { level_n: 2 });
         assert_eq!(stop.confidence, AnalyzerStopConfidence::High);
         assert_eq!(stop.detected_levels.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn test_immediate_long_fires_proactively_without_market_tick() {
+        let config = DetectorConfig {
+            position_id: Uuid::now_v7(),
+            symbol: robson_domain::Symbol::from_pair("BTCUSDT").unwrap(),
+            side: Side::Long,
+            ma_fast_period: 9,
+            ma_slow_period: 21,
+            technical_stop_config: TechnicalStopConfig::default(),
+            entry_policy: EntryPolicyConfig::new(
+                EntryPolicy::Immediate,
+                robson_domain::ApprovalPolicy::Automatic,
+            ),
+        };
+        let event_bus = Arc::new(EventBus::new(10));
+        let mut signal_receiver = event_bus.subscribe();
+        let detector_receiver = event_bus.subscribe();
+        let detector = DetectorTask::new(
+            config.clone(),
+            Arc::clone(&event_bus),
+            create_test_ohlcv(),
+            create_test_cancel_token(),
+        );
+
+        let signal = tokio::time::timeout(
+            std::time::Duration::from_secs(1),
+            detector.run(create_test_cancel_token(), detector_receiver),
+        )
+        .await
+        .expect("immediate long detector must not wait for market data")
+        .expect("immediate long detector must emit a signal");
+
+        assert_eq!(signal.position_id, config.position_id);
+        assert_eq!(signal.side, Side::Long);
+        assert_eq!(signal.entry_price, Price::new(dec!(100)).unwrap());
+        assert_eq!(signal.stop_loss, Price::new(dec!(90)).unwrap());
+
+        let emitted =
+            signal_receiver.recv().await.expect("signal event must be broadcast").unwrap();
+        assert!(matches!(
+            emitted,
+            DaemonEvent::DetectorSignal(event_signal)
+                if event_signal.position_id == config.position_id && event_signal.side == Side::Long
+        ));
     }
 
     #[tokio::test]
