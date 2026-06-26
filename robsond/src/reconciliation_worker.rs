@@ -1063,13 +1063,10 @@ mod tests {
         assert_eq!(worker.scan_and_reconcile().await.unwrap(), 1);
 
         let closed = store.positions().find_by_id(position_id).await.unwrap().unwrap();
-        assert!(matches!(
-            closed.state,
-            PositionState::Closed {
-                exit_reason: ExitReason::ReconciledMissingOnExchange,
-                ..
-            }
-        ));
+        assert!(matches!(closed.state, PositionState::Closed {
+            exit_reason: ExitReason::ReconciledMissingOnExchange,
+            ..
+        }));
         assert_eq!(close_events_for(&store, position_id).await, 1);
     }
 
@@ -1085,16 +1082,13 @@ mod tests {
         let now = Utc::now();
         exchange
             .set_order_result("EX-ORDER-1", order_result("EX-ORDER-1", dec!(90), dec!(0.010), now));
-        exchange.set_user_trades(
-            &symbol.as_pair(),
-            vec![user_trade(
-                "TRADE-1",
-                "EX-ORDER-2",
-                dec!(91),
-                dec!(0.010),
-                now,
-            )],
-        );
+        exchange.set_user_trades(&symbol.as_pair(), vec![user_trade(
+            "TRADE-1",
+            "EX-ORDER-2",
+            dec!(91),
+            dec!(0.010),
+            now,
+        )]);
         let worker = create_worker(exchange, store.clone(), event_bus, Duration::from_secs(0));
 
         worker.scan_and_reconcile().await.unwrap();
@@ -1130,16 +1124,13 @@ mod tests {
             create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
 
         worker.scan_and_reconcile().await.unwrap();
-        exchange.set_user_trades(
-            &symbol.as_pair(),
-            vec![user_trade(
-                "TRADE-1",
-                "EX-ORDER-2",
-                dec!(90),
-                dec!(0.010),
-                Utc::now(),
-            )],
-        );
+        exchange.set_user_trades(&symbol.as_pair(), vec![user_trade(
+            "TRADE-1",
+            "EX-ORDER-2",
+            dec!(90),
+            dec!(0.010),
+            Utc::now(),
+        )]);
         assert_eq!(worker.scan_and_reconcile().await.unwrap(), 1);
 
         let closed = store.positions().find_by_id(position_id).await.unwrap().unwrap();
