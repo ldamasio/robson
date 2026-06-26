@@ -249,11 +249,15 @@ mod tests {
     use super::*;
 
     fn create_test_intent() -> Intent {
-        Intent::new(Uuid::now_v7(), Uuid::now_v7(), IntentAction::PlaceEntryOrder {
-            symbol: robson_domain::Symbol::from_pair("BTCUSDT").unwrap(),
-            side: OrderSide::Buy,
-            quantity: Quantity::new(dec!(0.1)).unwrap(),
-        })
+        Intent::new(
+            Uuid::now_v7(),
+            Uuid::now_v7(),
+            IntentAction::PlaceEntryOrder {
+                symbol: robson_domain::Symbol::from_pair("BTCUSDT").unwrap(),
+                side: OrderSide::Buy,
+                quantity: Quantity::new(dec!(0.1)).unwrap(),
+            },
+        )
     }
 
     #[test]
