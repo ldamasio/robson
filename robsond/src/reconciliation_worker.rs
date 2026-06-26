@@ -1183,13 +1183,10 @@ mod tests {
 
         worker.scan_and_reconcile().await.unwrap();
         let now = Utc::now();
-        exchange.set_user_trades(
-            &symbol.as_pair(),
-            vec![
-                user_trade("TRADE-1", "EX-ORDER-2", dec!(90), dec!(0.010), now),
-                user_trade("TRADE-2", "EX-ORDER-3", dec!(91), dec!(0.010), now),
-            ],
-        );
+        exchange.set_user_trades(&symbol.as_pair(), vec![
+            user_trade("TRADE-1", "EX-ORDER-2", dec!(90), dec!(0.010), now),
+            user_trade("TRADE-2", "EX-ORDER-3", dec!(91), dec!(0.010), now),
+        ]);
         assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
 
         let loaded = store.positions().find_by_id(position_id).await.unwrap().unwrap();
@@ -1212,16 +1209,13 @@ mod tests {
             create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
 
         worker.scan_and_reconcile().await.unwrap();
-        exchange.set_user_trades(
-            &symbol.as_pair(),
-            vec![user_trade(
-                "TRADE-1",
-                "EX-ORDER-2",
-                dec!(90),
-                dec!(0.020),
-                Utc::now(),
-            )],
-        );
+        exchange.set_user_trades(&symbol.as_pair(), vec![user_trade(
+            "TRADE-1",
+            "EX-ORDER-2",
+            dec!(90),
+            dec!(0.020),
+            Utc::now(),
+        )]);
         assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
 
         let loaded = store.positions().find_by_id(position_id).await.unwrap().unwrap();
