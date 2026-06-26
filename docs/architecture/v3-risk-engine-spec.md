@@ -232,11 +232,10 @@ authoritative for accounting or tax reporting.
 `max_open_positions`, `max_total_exposure_pct`, and `max_single_position_pct` are
 **eliminated** as independent configuration parameters. See ADR-0024.
 
-The only real bound on a single position's size is physical: its notional value cannot
-exceed available capital (spot) or available capital × leverage (isolated margin). The
-Golden Rule guarantees the risk is exactly 1% of capital regardless of notional size.
-Any percentage-based cap on position size would either be redundant or contradict the
-Golden Rule silently.
+The single-position physical bound is fixed 1x margin availability: the stop-derived
+notional must fit available capital before exchange submission. The Golden Rule targets
+1% technical-stop risk, but a very tight stop can imply notional larger than available
+capital; that trade is rejected unless a future explicit resizing policy is introduced.
 
 **What replaces max_open_positions:** dynamic slot calculation (see below).
 

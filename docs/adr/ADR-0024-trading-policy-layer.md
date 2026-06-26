@@ -16,8 +16,9 @@ The Robson v3 risk engine carries several structural problems inherited from v2:
    (identified in `RISK-ENGINE-PLAN.md` §3).
 3. The relationship between the technical stop distance and position sizing is the core
    invariant of the system, yet the exposure limits contradict it silently: with
-   risk_per_trade=1% and min_stop=0.1%, the derived max single position is 10x capital —
-   but the static limit of 15% implies a minimum stop of 6.67%, which is never enforced.
+   risk_per_trade=1% and min_stop=0.1%, the derived max single position can exceed
+   available capital unless leverage is constrained to 1x and margin availability is
+   enforced before exchange submission.
 4. The static max_open_positions=3 has no policy basis and produces wrong behavior:
    a user with positions at breakeven should be allowed to open more, but the static
    value blocks them.
@@ -63,11 +64,11 @@ configurable per environment (via environment variables) but constrained by vali
 `max_single_position_pct`, `max_total_exposure_pct`, and `max_open_positions` are
 eliminated as independent configuration parameters.
 
-The only real limit on a single position is physical: its notional value cannot exceed
-available capital (spot) or available capital × leverage (isolated margin). Position
-sizing via the Golden Rule already ensures the risk is exactly 1%. Any additional
-percentage-based cap would be either redundant (already guaranteed by the formula) or
-contradictory (it would silently fail trades that are policy-compliant).
+The single-position physical bound is margin availability at fixed 1x leverage: the
+stop-derived notional must fit available capital before exchange submission. Position
+sizing via the Golden Rule still targets 1% technical-stop risk, but tight stops may
+produce a notional larger than available capital; those trades are policy-invalid and
+must be rejected or resized by an explicit future policy, never made viable by leverage.
 
 The duplicate-position guard (no same symbol+side) is preserved as an operational
 constraint, not a risk limit.
@@ -186,8 +187,8 @@ The following structures and parameters are removed:
 | Removed | Replaced by |
 |---------|-------------|
 | `RiskLimits.max_open_positions` | Dynamic slot calculation (Decision 5) |
-| `RiskLimits.max_total_exposure_pct` | Physical capital bound (enforced by exchange) |
-| `RiskLimits.max_single_position_pct` | Physical capital bound (enforced by exchange) |
+| `RiskLimits.max_total_exposure_pct` | Fixed 1x margin availability check |
+| `RiskLimits.max_single_position_pct` | Fixed 1x margin availability check |
 | `RiskLimits` struct (as independent config) | `TradingPolicy` + `TechStopConfig` in `robson-domain::policy` |
 | Soft limit section in risk engine spec | Derived limits section (see updated spec) |
 

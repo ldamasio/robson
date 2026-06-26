@@ -294,8 +294,8 @@ pub struct RiskConfig {
 }
 
 impl RiskConfig {
-    /// Fixed leverage
-    pub const LEVERAGE: u8 = 10;
+    /// Fixed leverage: 1x. Margin availability is the physical bound for stop-derived sizing.
+    pub const LEVERAGE: u8 = 1;
 
     /// Fixed risk per trade: 1% of capital (v3 policy — non-negotiable)
     pub const RISK_PER_TRADE_PCT: Decimal = Decimal::ONE;
@@ -658,8 +658,8 @@ mod tests {
     #[test]
     fn test_risk_config_leverage() {
         let config = RiskConfig::new(dec!(10000)).unwrap();
-        assert_eq!(config.leverage(), 10);
-        assert_eq!(RiskConfig::LEVERAGE, 10);
+        assert_eq!(config.leverage(), 1);
+        assert_eq!(RiskConfig::LEVERAGE, 1);
     }
 
     #[test]

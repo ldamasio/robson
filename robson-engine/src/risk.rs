@@ -8,14 +8,15 @@
 //!
 //! 1. Duplicate position (same symbol+side) — operational constraint
 //! 2. Dynamic slot exhaustion (replaces static max_open_positions)
-//! 3. Monthly drawdown hard limit (from TradingPolicy)
-//! 4. Daily loss limit (existing behavior, outside ADR-0024 scope)
+//! 3. 1x margin availability (stop-derived size must fit available capital)
+//! 4. Monthly drawdown hard limit (from TradingPolicy)
+//! 5. Daily loss limit (existing behavior, outside ADR-0024 scope)
 //!
 //! # Eliminated by ADR-0024
 //!
 //! - max_open_positions → dynamic slot calculation
-//! - max_total_exposure_pct → physical capital bound (enforced by exchange)
-//! - max_single_position_pct → physical capital bound (enforced by exchange)
+//! - max_total_exposure_pct → physical capital bound (1x margin availability)
+//! - max_single_position_pct → physical capital bound (1x margin availability)
 //!
 //! # Design
 //!
@@ -411,7 +412,27 @@ impl RiskGate {
             };
         }
 
-        // 2. Check monthly drawdown hard limit (ADR-0024: sourced from policy)
+        // 2. Check physical capital bound. At 1x, stop-derived notional must fit
+        // available margin; tight stops may create a valid 1% risk amount but an
+        // invalid position size for the account.
+        if proposed.initial_margin > context.capital {
+            debug!(
+                symbol = %proposed.symbol,
+                side = %proposed.side,
+                initial_margin = %proposed.initial_margin,
+                capital = %context.capital,
+                "Risk check failed: insufficient margin for 1x position"
+            );
+            return RiskVerdict::Rejected {
+                check: RiskCheck::InsufficientMargin,
+                reason: format!(
+                    "Initial margin {} exceeds available capital {} at 1x leverage",
+                    proposed.initial_margin, context.capital
+                ),
+            };
+        }
+
+        // 3. Check monthly drawdown hard limit (ADR-0024: sourced from policy)
         let monthly_pnl = context.total_monthly_pnl();
         let monthly_loss_limit =
             context.capital * self.policy.max_monthly_drawdown_pct / Decimal::from(100);
@@ -430,7 +451,7 @@ impl RiskGate {
             };
         }
 
-        // 3. Dynamic slot check (ADR-0024: replaces static max_open_positions)
+        // 4. Dynamic slot check (ADR-0024: replaces static max_open_positions)
         let capital_base = context.capital; // MIG-v3#11 approximation; MIG-v3#12 persists real capital base.
         let slots = context.slots_available(&self.policy, capital_base);
         if slots == 0 {
@@ -451,7 +472,7 @@ impl RiskGate {
             };
         }
 
-        // 4. Check daily loss limit (existing behavior, outside ADR-0024 scope)
+        // 5. Check daily loss limit (existing behavior, outside ADR-0024 scope)
         let daily_pnl = context.total_daily_pnl();
         let daily_loss_limit =
             context.capital * self.limits.daily_loss_limit_pct / Decimal::from(100);
@@ -525,7 +546,7 @@ mod tests {
             symbol: symbol.to_string(),
             side: side.to_string(),
             notional_value: qty * entry,
-            initial_margin: qty * entry / dec!(10),
+            initial_margin: qty * entry,
             unrealized_pnl: Decimal::ZERO,
             entry_price: entry,
             quantity: qty,
@@ -562,6 +583,26 @@ mod tests {
         let verdict = gate.evaluate(&proposed, &context);
         assert!(matches!(verdict, RiskVerdict::Rejected {
             check: RiskCheck::DuplicatePosition,
+            ..
+        }));
+    }
+
+    #[test]
+    fn test_risk_gate_rejects_stop_derived_size_that_exceeds_1x_margin() {
+        let gate = RiskGate::new();
+        let context = RiskContext::new(dec!(352));
+        let proposed = ProposedTrade {
+            symbol: "BTCUSDT".to_string(),
+            side: "long".to_string(),
+            quantity: dec!(0.0586666666666666666666666667),
+            entry_price: dec!(60000),
+            notional_value: dec!(3520.000000000000000000000002),
+            initial_margin: dec!(3520.000000000000000000000002),
+        };
+
+        let verdict = gate.evaluate(&proposed, &context);
+        assert!(matches!(verdict, RiskVerdict::Rejected {
+            check: RiskCheck::InsufficientMargin,
             ..
         }));
     }
@@ -926,7 +967,7 @@ mod tests {
             entry_price: dec!(80000),
             notional_value: dec!(50), /* 50% of capital — would have been rejected by old
                                        * SinglePositionConcentration */
-            initial_margin: dec!(5),
+            initial_margin: dec!(50),
         };
 
         let verdict = gate.evaluate(&proposed, &context);
@@ -961,7 +1002,7 @@ mod tests {
             quantity: dec!(0.001),
             entry_price: dec!(50000),
             notional_value: dec!(50),
-            initial_margin: dec!(5),
+            initial_margin: dec!(50),
         };
 
         let verdict = gate.evaluate(&proposed, &context);
