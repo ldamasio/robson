@@ -1884,7 +1884,7 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
         DaemonError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
         DaemonError::EventLog(_) => StatusCode::INTERNAL_SERVER_ERROR,
         #[cfg(feature = "postgres")]
-        DaemonError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        DaemonError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
         #[cfg(feature = "postgres")]
         DaemonError::Projection(_) => StatusCode::INTERNAL_SERVER_ERROR,
         _ => StatusCode::INTERNAL_SERVER_ERROR,
