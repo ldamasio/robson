@@ -130,7 +130,8 @@ impl StubExchange {
         *fail_next = fail;
     }
 
-    /// Configure the next futures order placement to fail after account validation.
+    /// Configure the next futures order placement to fail after account
+    /// validation.
     pub fn set_order_fail_next(&self, fail: bool) {
         let mut fail_next = self.order_fail_next.write().unwrap();
         *fail_next = fail;

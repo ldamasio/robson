@@ -614,7 +614,10 @@ mod tests {
 
         assert_eq!(results.len(), 1);
         match &results[0] {
-            ActionResult::OrderFailed { event: Event::EntryOrderFailed { cycle_id: actual, .. }, error } => {
+            ActionResult::OrderFailed {
+                event: Event::EntryOrderFailed { cycle_id: actual, .. },
+                error,
+            } => {
                 assert_eq!(*actual, cycle_id);
                 assert!(error.contains("Simulated exchange failure"));
             },
