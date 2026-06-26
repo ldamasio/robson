@@ -253,18 +253,44 @@ impl ExchangePort for BinanceExchangeAdapter {
 
             (vwap_price, total_fee, fee_asset)
         } else {
-            let fill_price = if response.cum_quote > Decimal::ZERO {
-                response.cum_quote / executed_qty
+            // Derive cumulative quote and fill price from the immediate RESULT response.
+            // Binance Futures MARKET orders occasionally return avgPrice=0 / cumQuote=0
+            // even on a FILLED status — re-query by orderId before treating it as an error.
+            let (actual_cum_quote, fill_price) = if response.cum_quote > Decimal::ZERO {
+                let price = response.cum_quote / executed_qty;
+                (response.cum_quote, price)
             } else if response.avg_price > Decimal::ZERO {
-                response.avg_price
+                let cum_quote = response.avg_price * executed_qty;
+                (cum_quote, response.avg_price)
             } else {
-                return Err(ExecError::Exchange(format!(
-                    "Cannot determine fill price for order {} (no fills, cumQuote=0, avgPrice=0)",
-                    response.order_id
-                )));
+                tracing::warn!(
+                    order_id = %response.order_id,
+                    symbol = %symbol.as_pair(),
+                    executed_qty = %executed_qty,
+                    "MARKET order FILLED but price data absent in RESULT response — re-querying by orderId"
+                );
+                let settled = self
+                    .client
+                    .get_order_status(&symbol.as_pair(), response.order_id)
+                    .await
+                    .map_err(Self::map_error)?;
+
+                if settled.cum_quote > Decimal::ZERO {
+                    let price = settled.cum_quote / executed_qty;
+                    (settled.cum_quote, price)
+                } else if settled.avg_price > Decimal::ZERO {
+                    let cum_quote = settled.avg_price * executed_qty;
+                    (cum_quote, settled.avg_price)
+                } else {
+                    return Err(ExecError::Exchange(format!(
+                        "Cannot determine fill price for order {} \
+                         (no fills, cumQuote=0, avgPrice=0 after re-query)",
+                        response.order_id
+                    )));
+                }
             };
 
-            let estimated_fee = response.cum_quote * Decimal::new(1, 3);
+            let estimated_fee = actual_cum_quote * Decimal::new(1, 3);
 
             (fill_price, estimated_fee, "USDT".to_string())
         };
