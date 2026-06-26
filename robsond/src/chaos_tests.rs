@@ -241,14 +241,14 @@ async fn chaos_risk_engine_slow_denies_by_timeout_safe_default() {
 }
 
 #[tokio::test]
-async fn chaos_exchange_timeout_retries_then_records_entry_failure() {
+async fn chaos_exchange_timeout_does_not_retry_ambiguous_entry_order() {
     let exchange = Arc::new(TimeoutExchange::new());
     let store = Arc::new(MemoryStore::new());
     let executor = Executor::new(exchange.clone(), Arc::new(Default::default()), store);
 
     let results = executor.execute(vec![entry_order_action(Uuid::now_v7())]).await.unwrap();
 
-    assert_eq!(exchange.attempts(), 3);
+    assert_eq!(exchange.attempts(), 1);
     assert!(matches!(results.as_slice(), [robson_exec::ActionResult::OrderFailed { .. }]));
 }
 
