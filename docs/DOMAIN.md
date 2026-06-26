@@ -136,7 +136,7 @@ impl Position {
 ```
 
 **Key Design Notes**:
-- No `leverage` field (fixed 10x for Binance isolated margin)
+- No `leverage` field (fixed 1x; margin availability is the physical bound)
 - No `stop_gain` field (trailing stop handles exits)
 - `tech_stop_distance` captures the risk distance
 
@@ -269,7 +269,7 @@ impl RiskConfig {
 }
 ```
 
-**Design Note**: No `max_leverage` - leverage is fixed at 10x.
+**Design Note**: No `max_leverage` - leverage is fixed at 1x (margin availability is the physical bound).
 
 ### Price
 
@@ -657,7 +657,7 @@ pub struct RiskConfig {
 ```
 
 **Removed from original design**:
-- `max_leverage` - Fixed at 10x (Binance isolated margin)
+- `max_leverage` - Fixed at 1x (margin availability is the physical bound)
 - `insurance_stop_enabled` - No insurance stops in v2
 
 ### Risk Checks (Future: Phase 5)

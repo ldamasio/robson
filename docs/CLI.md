@@ -74,12 +74,12 @@ Options:
   --strategy NAME     Strategy name (required)
                       Options: all-in, custom
   --capital AMOUNT    Capital to allocate (default: from config)
-  --leverage N        Leverage multiplier (1-10, default: 3)
+                      Leverage: fixed at 1x (not configurable; ADR-0024)
   --dry-run           Simulate without real orders
 
 Examples:
   robson arm BTCUSDT --strategy all-in
-  robson arm ETHUSDT --strategy all-in --capital 1000 --leverage 2
+  robson arm ETHUSDT --strategy all-in --capital 1000
   robson arm BTCUSDT --strategy all-in --dry-run
 ```
 
@@ -155,9 +155,9 @@ POSITIONS
 
 ID               Symbol    Side   State    Entry      SL         SG         PnL       Leverage
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-pos_01HQZXY123   BTCUSDT   Long   Active   $95,000    $93,500    $98,500    +$156.23  3x
-pos_01HQZXY456   ETHUSDT   Long   Armed    -          -          -          -         2x
-pos_01HQZXY789   BTCUSDT   Long   Closed   $94,000    $92,500    -          -$100.00  3x
+pos_01HQZXY123   BTCUSDT   Long   Active   $95,000    $93,500    $98,500    +$156.23  1x
+pos_01HQZXY456   ETHUSDT   Long   Armed    -          -          -          -         1x
+pos_01HQZXY789   BTCUSDT   Long   Closed   $94,000    $92,500    -          -$100.00  1x
 
 SUMMARY
   Active: 1
@@ -179,7 +179,7 @@ SUMMARY
       "stop_loss": 93500.0,
       "stop_gain": 98500.0,
       "quantity": 0.2001,
-      "leverage": 3,
+      "leverage": 1,
       "unrealized_pnl": 156.23,
       "palma": {
         "distance": 1500.0,
@@ -197,6 +197,8 @@ SUMMARY
   }
 }
 ```
+
+> **Note**: `leverage` is informational only — fixed at 1x, not a configurable parameter (ADR-0024).
 
 ---
 
@@ -519,7 +521,7 @@ color = true
 
 [risk]
 default_capital = 10000.0
-default_leverage = 3
+# Leverage is fixed at 1x (not configurable); margin availability is the physical bound (ADR-0024).
 # Position count is governed by ADR-0024 dynamic slots in robsond.
 # Legacy max_open_positions is not enforced by RiskGate.
 

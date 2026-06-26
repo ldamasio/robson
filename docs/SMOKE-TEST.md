@@ -14,7 +14,7 @@ This document provides a **copy/paste operational smoke test** to validate the R
 - CLI ↔ Daemon communication
 - Position state transitions (Armed → Entering → Active → Closed)
 - Signal orchestration (detector → engine → executor)
-- Margin safety validation (isolated + 10x leverage)
+- Futures settings validation (One-way mode + 1x leverage)
 - Golden Rule position sizing
 - Trailing stop behavior
 - Panic mode
@@ -336,36 +336,36 @@ Verify these invariants hold true during smoke test execution.
 
 ### Leverage Invariant
 
-**Invariant**: All positions use fixed 10x leverage (isolated margin).
+**Invariant**: All positions use fixed 1x leverage in One-way mode; margin availability is the physical bound (ADR-0024).
 
 **How to Verify**:
 
 ```bash
-# Check daemon logs for margin validation
-# Look for: "Validating margin settings (isolated + 10x)"
+# Check daemon logs for futures settings validation
+# Look for: "Validating futures settings (One-way + 1x)"
 
 # Or inspect code constant:
-grep -r "FIXED_LEVERAGE" robson-exec/src/executor.rs
-# Output: pub const FIXED_LEVERAGE: u8 = 10;
+grep -n "LEVERAGE" robson-domain/src/value_objects.rs
+# Output: pub const LEVERAGE: u8 = 1;
 ```
 
-**Expected**: Always 10x, never configurable in MVP.
+**Expected**: Always 1x, never configurable.
 
 ---
 
 ### Margin Safety Invariant
 
-**Invariant**: Margin validation occurs BEFORE entry and BEFORE exit.
+**Invariant**: Futures settings validation occurs BEFORE entry and BEFORE exit.
 
 **How to Verify**:
 
 ```bash
 # In daemon logs during entry (T2), look for:
-# "Validating margin settings (isolated + 10x)"
-# "Margin safety check passed"
+# "Validating futures settings (One-way + 1x)"
+# "Futures settings verified: One-way mode confirmed, leverage set"
 
 # During exit (T3), look for:
-# "Validating margin settings for exit (isolated + 10x)"
+# "Validating futures settings for exit (One-way + 1x)"
 ```
 
 **Expected**: Validation runs for every order placement, never bypassed.
@@ -555,7 +555,7 @@ curl http://localhost:8080/status | jq
 |-------|----------|
 | Stop loss above entry (for LONG) | Ensure stop < entry for LONG positions |
 | Stop loss below entry (for SHORT) | Ensure stop > entry for SHORT positions |
-| Insufficient capital for 10x leverage | Increase --capital amount |
+| Insufficient capital for 1x position (margin bound) | Increase --capital amount |
 | StubExchange returns invalid margin | This is a bug, report it |
 
 **Debug Commands**:

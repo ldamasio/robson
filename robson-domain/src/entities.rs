@@ -224,7 +224,7 @@ pub fn calculate_notional_value(quantity: &Quantity, entry_price: &Price) -> rus
 
 /// Calculate margin required for position
 ///
-/// Margin = Notional / Leverage = Notional / 10
+/// Margin = Notional / Leverage = Notional / 1 (integral margin at 1x)
 pub fn calculate_margin_required(
     quantity: &Quantity,
     entry_price: &Price,

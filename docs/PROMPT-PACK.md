@@ -229,12 +229,12 @@ Add position sizing logic to Position in robson-domain/src/entities/position.rs:
    - Input: entry_price, stop_loss
    - Calculate palma distance
    - Use formula: (capital × risk_pct) / palma_distance
-   - Apply leverage multiplier
+   - Leverage is fixed at 1x (no multiplier; notional == initial margin)
    - Return Quantity
 
 2. Add validate_notional() method:
    - Check min notional ($10)
-   - Check max notional (capital × leverage)
+   - Check max notional against available margin (capital at 1x)
 
 3. Add round_to_precision() helper:
    - Round to exchange precision (8 decimals for BTC)
@@ -242,7 +242,7 @@ Add position sizing logic to Position in robson-domain/src/entities/position.rs:
 4. Add tests:
    - Test sizing calculation (capital $10k, risk 1%, palma $1500 → 0.0666... BTC)
    - Test notional validation
-   - Test leverage multiplication
+   - Test margin bound rejection (notional > capital at 1x)
 
 Validation:
 ```bash

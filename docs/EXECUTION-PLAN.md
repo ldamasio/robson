@@ -70,7 +70,7 @@ The original design had separate stop_loss and stop_gain. The implementation use
 
 Leverage was removed as a configurable parameter:
 - **Old**: `Leverage(u8)` value object with 1-10x range
-- **New**: Fixed 10x leverage (Binance isolated margin default)
+- **New**: Fixed 1x leverage (margin availability is the physical bound, ADR-0024)
 
 **Rationale**: Simplifies position sizing. Risk is controlled by position size, not leverage.
 
@@ -143,7 +143,7 @@ The original design had a backup stop on exchange. Removed for simplicity:
 | Original | Implemented | Reason |
 |----------|-------------|--------|
 | `PalmaDaMao` | `TechnicalStopDistance` | Clearer naming |
-| `Leverage(u8)` | Removed (fixed 10x) | Simplification |
+| `Leverage(u8)` | Removed (fixed 1x) | Simplification |
 | `stop_gain: Price` | Trailing stop in Active state | Better exit strategy |
 | `Trade` entity | Merged into `Order` | Market orders fill immediately |
 
@@ -854,8 +854,8 @@ cargo test --all               # 92 tests currently
    - `disarm()` → DELETE /positions/:id
    - (status and panic already aligned)
 
-2. **Add isolated margin safety check** in executor/connector:
-   - Assert leverage=10x and isolated mode before order execution
+2. **Add futures settings safety check** in executor/connector:
+   - Assert One-way mode and leverage=1x before order execution
    - Fail-safe if account is not in expected state
 
 3. **Complete signal orchestration** in PositionManager:
