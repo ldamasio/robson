@@ -1230,7 +1230,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         %position_id,
                         event_type = event.event_type(),
                         %error,
-                        "Entry execution rejected before exchange placement"
+                        "Entry order rejected before fill"
                     );
                     query.fail(error.clone(), "acting".to_string());
                     self.record_query_failure(query).await?;

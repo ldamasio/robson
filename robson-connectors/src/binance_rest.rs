@@ -804,6 +804,7 @@ pub struct BinanceOrderResponse {
     /// Executed quantity
     pub executed_qty: Decimal,
     /// Cumulative quote quantity — futures uses `cumQuote`
+    #[serde(default)]
     pub cum_quote: Decimal,
     /// Status
     pub status: String,
@@ -1127,6 +1128,29 @@ mod tests {
     async fn test_get_price_requires_no_signature() {
         let client = BinanceRestClient::new("key".to_string(), "secret".to_string());
         let _ = client.get_price("BTCUSDT");
+    }
+
+    #[test]
+    fn test_binance_order_response_defaults_missing_cum_quote() {
+        let body = r#"{
+            "symbol": "BTCUSDT",
+            "orderId": 123456,
+            "clientOrderId": "signal-uuid",
+            "updateTime": 1719372600000,
+            "price": "0.00000000",
+            "avgPrice": "59300.00000000",
+            "origQty": "0.00257030",
+            "executedQty": "0.00257030",
+            "status": "FILLED",
+            "side": "BUY",
+            "type": "MARKET",
+            "fills": []
+        }"#;
+
+        let response: BinanceOrderResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(response.cum_quote, Decimal::ZERO);
+        assert_eq!(response.executed_qty, dec!(0.00257030));
+        assert_eq!(response.avg_price, dec!(59300.00000000));
     }
 
     #[test]

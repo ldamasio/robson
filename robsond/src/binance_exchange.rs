@@ -117,7 +117,7 @@ impl BinanceExchangeAdapter {
     fn map_error(error: BinanceRestError) -> ExecError {
         match &error {
             BinanceRestError::ApiError { code, msg } => match code {
-                -2010 | -2011 | -2013 => ExecError::OrderRejected(msg.clone()),
+                -2010 | -2011 | -2013 | -2019 => ExecError::OrderRejected(msg.clone()),
                 _ => ExecError::Exchange(error.to_string()),
             },
             BinanceRestError::Timeout => {
