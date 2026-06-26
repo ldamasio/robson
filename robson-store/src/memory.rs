@@ -436,8 +436,7 @@ impl PositionRepository for MemoryStore {
                     && p.side == side
                     && matches!(
                         p.state,
-                        robson_domain::PositionState::Armed
-                            | robson_domain::PositionState::Entering { .. }
+                        robson_domain::PositionState::Entering { .. }
                             | robson_domain::PositionState::Active { .. }
                             | robson_domain::PositionState::Exiting { .. }
                     )
@@ -610,7 +609,7 @@ impl Store for MemoryStore {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use robson_domain::{OrderSide, PositionState, Price, Quantity, Side, Symbol};
+    use robson_domain::{OrderSide, PositionState, Quantity, Side, Symbol};
     use rust_decimal_macros::dec;
 
     use super::*;
@@ -781,6 +780,21 @@ mod tests {
 
         let result = PositionRepository::find_active(&store).await.unwrap();
         assert!(result.is_empty(), "Error position must not appear in find_active");
+    }
+
+    #[tokio::test]
+    async fn test_position_find_active_by_symbol_and_side_excludes_armed() {
+        let store = MemoryStore::new();
+        let armed = create_test_position();
+        let symbol = armed.symbol.clone();
+        let side = armed.side;
+
+        PositionRepository::save(&store, &armed).await.unwrap();
+
+        let found = PositionRepository::find_active_by_symbol_and_side(&store, &symbol, side)
+            .await
+            .unwrap();
+        assert!(found.is_none(), "Armed position must not mark exchange exposure as tracked");
     }
 
     #[tokio::test]

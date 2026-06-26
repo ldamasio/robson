@@ -1,15 +1,11 @@
 <script lang="ts">
   import { page } from '$app/stores';
-  import { robsonApi } from '$api/robson';
+  import { status, startStatusPolling, stopStatusPolling } from '$stores/status';
   import Row from './Row.svelte';
 
-  let capital = $state<number | null>(null);
-
   $effect(() => {
-    robsonApi
-      .getStatus()
-      .then((s) => (capital = s.wallet_balance))
-      .catch(() => {});
+    startStatusPolling();
+    return () => stopStatusPolling();
   });
 
   let currentPath = $derived($page.url.pathname);
@@ -35,10 +31,10 @@
       </div>
     </Row>
     <Row gap={4} align="center">
-      {#if capital !== null}
+      {#if $status !== null}
         <span class="capital" title="USDT-M futures wallet">
           <span class="capital-label">FUTURES</span>
-          <span class="capital-value">{capital.toFixed(2)}</span>
+          <span class="capital-value">{($status.wallet_balance).toFixed(2)}</span>
           <span class="capital-unit">USDT</span>
         </span>
       {/if}

@@ -23,9 +23,9 @@ use std::{collections::HashMap, sync::Arc};
 
 use chrono::Datelike;
 use robson_domain::{
-    ClosureEvidence, DetectorSignal, EntryPolicyConfig, Event, Position, PositionId, PositionState,
-    Price, Quantity, ReconciliationEvidence, RiskConfig, Side, Symbol, TechnicalStopDistance,
-    TradingPolicy,
+    ClosureEvidence, DetectorSignal, EntryPolicy, EntryPolicyConfig, Event, Position, PositionId,
+    PositionState, Price, Quantity, ReconciliationEvidence, RiskConfig, Side, Symbol,
+    TechnicalStopDistance, TradingPolicy,
 };
 use robson_engine::{
     Engine, EngineAction, EngineDecision, PositionSummary, ProposedTrade, RiskContext, RiskGate,
@@ -1213,16 +1213,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     query.fail(error.clone(), "acting".to_string());
                     self.record_query_failure(query).await?;
 
-                    // Rearm detector so the Armed position can receive future signals
-                    let position = self.store.positions().find_by_id(position_id).await?;
-                    if let Some(pos) = position {
-                        self.rearm_detector_after_governed_block(
-                            position_id,
-                            &pos,
-                            "exchange entry failed",
-                        )
-                        .await;
-                    }
+                    // Do not rearm after exchange placement failure. Timeout/transport
+                    // failures are ambiguous for MARKET orders and may have been accepted
+                    // by the exchange; reconciliation must resolve exchange/local drift.
                     return Err(DaemonError::Exec(ExecError::Exchange(error)));
                 },
                 ActionResult::EntryExecutionRejected { event, error } => {
@@ -1561,6 +1554,29 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 return Err(e);
             },
         };
+        if entry_policy.mode == EntryPolicy::Immediate {
+            let signal = detector.try_proactive_immediate_signal().await.map_err(|e| {
+                DaemonError::Detector(format!("immediate entry failed before execution: {}", e))
+            })?;
+            debug!(%position_id, "Immediate position armed; processing entry synchronously");
+
+            // Complete the ARM query before entering the PROCESS_SIGNAL query path.
+            if let Err(e) = query.complete(QueryOutcome::ActionsExecuted { actions_count }) {
+                query.fail(format!("{}", e), "acting".to_string());
+                self.record_query_failure(&query).await?;
+                return Err(DaemonError::Config(format!("Query completion error: {}", e)));
+            }
+            self.record_query_transition(&query, "completed").await?;
+
+            self.handle_signal(signal).await?;
+            return self
+                .store
+                .positions()
+                .find_by_id(position_id)
+                .await?
+                .ok_or(DaemonError::PositionNotFound(position_id));
+        }
+
         let handle = detector.spawn();
 
         // Store detector handle for cancellation
@@ -4636,6 +4652,35 @@ mod tests {
     }
 
     #[tokio::test(flavor = "current_thread")]
+    async fn test_arm_immediate_automatic_processes_entry_without_market_tick() {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+
+        let manager = create_test_manager().await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let policy =
+            EntryPolicyConfig::new(EntryPolicy::Immediate, DomainApprovalPolicy::Automatic);
+
+        let position = manager
+            .arm_position_with_policy(
+                symbol,
+                Side::Long,
+                create_test_risk_config(),
+                None,
+                Uuid::now_v7(),
+                policy,
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            !matches!(position.state, PositionState::Armed),
+            "Immediate automatic arm must not remain waiting for a strategy signal"
+        );
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert!(events.iter().any(|event| matches!(event, Event::EntrySignalReceived { .. })));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
     async fn test_restore_armed_immediate_automatic_processes_first_market_tick() {
         use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
 
@@ -4650,15 +4695,27 @@ mod tests {
         let policy =
             EntryPolicyConfig::new(EntryPolicy::Immediate, DomainApprovalPolicy::Automatic);
 
-        let position = original_manager
-            .arm_position_with_policy(
-                symbol.clone(),
-                Side::Long,
-                create_test_risk_config(),
-                None,
-                Uuid::now_v7(),
-                policy,
-            )
+        let position_id = Uuid::now_v7();
+        let account_id = Uuid::now_v7();
+        let now = chrono::Utc::now();
+        original_manager
+            .execute_and_persist(vec![
+                EngineAction::EmitEvent(Event::PositionArmed {
+                    position_id,
+                    account_id,
+                    symbol: symbol.clone(),
+                    side: Side::Long,
+                    tech_stop_distance: None,
+                    timestamp: now,
+                }),
+                EngineAction::EmitEvent(Event::EntryPolicyResolved {
+                    position_id,
+                    entry_policy: policy.mode,
+                    approval_policy: policy.approval,
+                    strategy_id: StrategyRegistry::strategy_id_for_policy(policy.mode),
+                    timestamp: now,
+                }),
+            ])
             .await
             .unwrap();
 
@@ -4676,7 +4733,7 @@ mod tests {
 
         let restored_position = store
             .positions()
-            .find_by_id(position.id)
+            .find_by_id(position_id)
             .await
             .unwrap()
             .expect("armed position must survive restart");
@@ -4696,9 +4753,9 @@ mod tests {
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
             loop {
-                let events = store.events().find_by_position(position.id).await.unwrap();
+                let events = store.events().find_by_position(position_id).await.unwrap();
                 if events.iter().any(|event| {
-                    matches!(event, Event::EntrySignalReceived { position_id, .. } if *position_id == position.id)
+                    matches!(event, Event::EntrySignalReceived { position_id: event_position_id, .. } if *event_position_id == position_id)
                 }) {
                     break;
                 }

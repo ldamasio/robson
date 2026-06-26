@@ -409,7 +409,7 @@ impl DetectorTask {
     /// loop. Fetches candles from the OHLCV port, takes the last close as
     /// the reference price, and delegates to `create_signal` (which
     /// computes the technical stop).
-    async fn try_proactive_immediate_signal(&self) -> DaemonResult<DetectorSignal> {
+    pub(crate) async fn try_proactive_immediate_signal(&self) -> DaemonResult<DetectorSignal> {
         let candles = self
             .ohlcv_port
             .fetch_candles(&self.config.symbol, CandleInterval::FifteenMinutes, 100)

@@ -24,9 +24,6 @@ use crate::{
     ports::{ExchangePort, OrderResult},
 };
 
-const ENTRY_ORDER_MAX_ATTEMPTS: u32 = 3;
-const ENTRY_ORDER_RETRY_BACKOFF_MS: u64 = 25;
-
 // =============================================================================
 // Execution Result
 // =============================================================================
@@ -294,27 +291,13 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             "Placing entry order"
         );
 
-        // 5. Execute on exchange. Transient exchange failures retry with a
-        // short bounded backoff; a final failure is persisted as EntryOrderFailed.
-        let mut result = self
+        // 5. Execute on exchange exactly once. A timeout/transport failure after
+        // order acceptance is ambiguous for MARKET orders; automatic retry can
+        // create duplicate real positions. Reconciliation must resolve drift.
+        let result = self
             .exchange
             .place_market_order(&symbol, side, quantity, &client_order_id, false)
             .await;
-        for attempt in 1..ENTRY_ORDER_MAX_ATTEMPTS {
-            match &result {
-                Err(error) if is_transient_exchange_error(error) => {
-                    tokio::time::sleep(std::time::Duration::from_millis(
-                        ENTRY_ORDER_RETRY_BACKOFF_MS * u64::from(attempt),
-                    ))
-                    .await;
-                    result = self
-                        .exchange
-                        .place_market_order(&symbol, side, quantity, &client_order_id, false)
-                        .await;
-                },
-                _ => break,
-            }
-        }
 
         // 6. Record result and emit appropriate domain event
         match &result {
@@ -469,10 +452,6 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
     }
 }
 
-fn is_transient_exchange_error(error: &ExecError) -> bool {
-    matches!(error, ExecError::Timeout(_) | ExecError::Exchange(_))
-}
-
 // =============================================================================
 // Tests
 // =============================================================================
@@ -605,6 +584,45 @@ mod tests {
             results2[0],
             ActionResult::AlreadyProcessed(id) if id == signal_id
         ));
+    }
+
+    #[tokio::test]
+    async fn test_entry_order_failure_is_not_retried() {
+        let exchange = Arc::new(StubExchange::new(dec!(95000)));
+        exchange.set_order_fail_next(true);
+        let journal = Arc::new(IntentJournal::new());
+        let store = Arc::new(MemoryStore::new());
+        let executor = Executor::new(exchange, journal, store);
+
+        let signal_id = Uuid::now_v7();
+        let position_id = Uuid::now_v7();
+        let cycle_id = Uuid::now_v7();
+
+        let action = EngineAction::PlaceEntryOrder {
+            position_id,
+            cycle_id: Some(cycle_id),
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            side: robson_domain::OrderSide::Buy,
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            order_id: Uuid::now_v7(),
+            client_order_id: signal_id.to_string(),
+            expected_price: robson_domain::Price::new(dec!(95000)).unwrap(),
+            signal_id,
+        };
+
+        let results = executor.execute(vec![action]).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            ActionResult::OrderFailed {
+                event: Event::EntryOrderFailed { cycle_id: actual, .. },
+                error,
+            } => {
+                assert_eq!(*actual, cycle_id);
+                assert!(error.contains("Simulated exchange failure"));
+            },
+            other => panic!("Expected non-retried OrderFailed, got {:?}", other),
+        }
     }
 
     #[tokio::test]
