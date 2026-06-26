@@ -1868,11 +1868,22 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
         DaemonError::PositionNotFound(_) => StatusCode::NOT_FOUND,
         DaemonError::QueryNotFound(_) => StatusCode::NOT_FOUND,
         DaemonError::InvalidPositionState { .. } => StatusCode::CONFLICT,
+        DaemonError::PositionAlreadyExists(_) => StatusCode::CONFLICT,
         DaemonError::ApprovalExpired(_) => StatusCode::GONE,
         DaemonError::ApprovalDenied { .. } => StatusCode::CONFLICT,
         DaemonError::MonthlyHaltActive { .. } => StatusCode::SERVICE_UNAVAILABLE,
         DaemonError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        _ => StatusCode::BAD_REQUEST,
+        // Exchange/execution errors are upstream failures, not client errors.
+        // Immediate-mode arm calls handle_signal synchronously; an exchange
+        // rejection must not surface as 400 (which signals a malformed request).
+        DaemonError::Exec(_) => StatusCode::BAD_GATEWAY,
+        DaemonError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        DaemonError::EventLog(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        #[cfg(feature = "postgres")]
+        DaemonError::Db(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        #[cfg(feature = "postgres")]
+        DaemonError::Projection(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
 
     (status, Json(ErrorResponse { error: error.to_string() }))
@@ -2974,6 +2985,41 @@ mod tests {
         assert_eq!(status.occupied_slots, 0);
         assert_eq!(status.new_slots_available, 4);
         assert_eq!(status.slot_cells_total, 4);
+    }
+
+    #[tokio::test]
+    async fn test_arm_immediate_exchange_failure_returns_502_not_400() {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+
+        let exchange = Arc::new(StubExchange::new(dec!(95000)));
+        // Fail the MARKET order placement that happens synchronously during
+        // immediate-mode arm (added in 0e5e7bd2). Before the to_error_response
+        // fix this would surface as 400 Bad Request instead of 502 Bad Gateway.
+        exchange.set_order_fail_next(true);
+        let (app, _, _, _) = create_test_app_with_event_bus_and_exchange(100, exchange).await;
+
+        let body = serde_json::json!({
+            "symbol": "BTCUSDT",
+            "side": "Long",
+            "entry_policy": { "mode": "immediate", "approval": "automatic" }
+        });
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/positions")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(body.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            response.status(),
+            StatusCode::BAD_GATEWAY,
+            "exchange failure during immediate arm must return 502, not 400"
+        );
     }
 
     #[tokio::test]
