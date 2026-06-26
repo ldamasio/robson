@@ -1873,10 +1873,14 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
         DaemonError::ApprovalDenied { .. } => StatusCode::CONFLICT,
         DaemonError::MonthlyHaltActive { .. } => StatusCode::SERVICE_UNAVAILABLE,
         DaemonError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        // Exchange/execution errors are upstream failures, not client errors.
-        // Immediate-mode arm calls handle_signal synchronously; an exchange
-        // rejection must not surface as 400 (which signals a malformed request).
-        DaemonError::Exec(_) => StatusCode::BAD_GATEWAY,
+        // Exchange transport failures are upstream errors, not client errors.
+        // Immediate-mode arm calls handle_signal synchronously; a connection or
+        // timeout failure must not surface as 400. Other Exec variants
+        // (OrderRejected, InvalidState) reflect business-rule rejections and
+        // stay 400 so callers can distinguish them from infrastructure faults.
+        DaemonError::Exec(robson_exec::ExecError::Exchange(_))
+        | DaemonError::Exec(robson_exec::ExecError::Timeout(_)) => StatusCode::BAD_GATEWAY,
+        DaemonError::Exec(_) => StatusCode::BAD_REQUEST,
         DaemonError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
         DaemonError::EventLog(_) => StatusCode::INTERNAL_SERVER_ERROR,
         #[cfg(feature = "postgres")]
@@ -2987,39 +2991,49 @@ mod tests {
         assert_eq!(status.slot_cells_total, 4);
     }
 
-    #[tokio::test]
-    async fn test_arm_immediate_exchange_failure_returns_502_not_400() {
-        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+    // to_error_response unit tests — catch-all was `_ => 400` before this fix.
+    // Exchange/store/internal errors must not map to 400 (client error).
 
-        let exchange = Arc::new(StubExchange::new(dec!(95000)));
-        // Fail the MARKET order placement that happens synchronously during
-        // immediate-mode arm (added in 0e5e7bd2). Before the to_error_response
-        // fix this would surface as 400 Bad Request instead of 502 Bad Gateway.
-        exchange.set_order_fail_next(true);
-        let (app, _, _, _) = create_test_app_with_event_bus_and_exchange(100, exchange).await;
+    #[test]
+    fn to_error_response_exchange_failure_is_502() {
+        use robson_exec::ExecError;
+        let (status, _) = to_error_response(DaemonError::Exec(ExecError::Exchange(
+            "connection refused".to_string(),
+        )));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
 
-        let body = serde_json::json!({
-            "symbol": "BTCUSDT",
-            "side": "Long",
-            "entry_policy": { "mode": "immediate", "approval": "automatic" }
-        });
-        let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/positions")
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(body.to_string()))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
+    #[test]
+    fn to_error_response_timeout_is_502() {
+        use robson_exec::ExecError;
+        let (status, _) =
+            to_error_response(DaemonError::Exec(ExecError::Timeout("read timeout".to_string())));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
 
-        assert_eq!(
-            response.status(),
-            StatusCode::BAD_GATEWAY,
-            "exchange failure during immediate arm must return 502, not 400"
-        );
+    #[test]
+    fn to_error_response_order_rejected_stays_400() {
+        use robson_exec::ExecError;
+        let (status, _) = to_error_response(DaemonError::Exec(ExecError::InvalidState(
+            "quantity below minimum".to_string(),
+        )));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn to_error_response_store_error_is_500() {
+        use robson_store::StoreError;
+        let (status, _) = to_error_response(DaemonError::Store(StoreError::Database(
+            "connection pool exhausted".to_string(),
+        )));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn to_error_response_event_log_error_is_500() {
+        let (status, _) =
+            to_error_response(DaemonError::EventLog("write failed".to_string()));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
