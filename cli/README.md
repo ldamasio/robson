@@ -56,7 +56,7 @@ robson status --watch
 
 ```bash
 robson arm BTCUSDT --strategy all-in
-robson arm ETHUSDT --strategy all-in --capital 1000 --leverage 2
+robson arm ETHUSDT --capital 1000
 ```
 
 ### Emergency Close

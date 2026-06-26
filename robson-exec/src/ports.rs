@@ -107,7 +107,7 @@ pub trait ExchangePort: Send + Sync {
     /// # Arguments
     ///
     /// * `symbol` - Trading pair to check
-    /// * `expected_leverage` - Expected leverage multiplier (e.g., 10)
+    /// * `expected_leverage` - Expected leverage multiplier (e.g., 1)
     ///
     /// # Returns
     ///

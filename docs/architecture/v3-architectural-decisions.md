@@ -574,7 +574,7 @@ Robson's PnL model is authoritative for **risk gate decisions only**. It is not 
 
 **Rejected**: Continuing with implicit behavior (current state before this ADR) — implicit assumptions about fees and pricing source make correctness analysis impossible.
 
-**Fees deduction**: `build_risk_context()` sums `realized_pnl - fees_paid` from closed positions. MonthlyHalt triggers on net PnL (gross minus fees). At 1% risk per trade with typical 0.04% commission (entry + exit × 10x leverage ≈ 0.8% per cycle in fees), fees are material and correctly accounted for in the drawdown calculation.
+**Fees deduction**: `build_risk_context()` sums `realized_pnl - fees_paid` from closed positions. MonthlyHalt triggers on net PnL (gross minus fees). At 1% risk per trade with typical 0.04% commission (entry + exit at 1x leverage ≈ 0.08% per cycle in fees), fees are material and correctly accounted for in the drawdown calculation.
 
 **Breaks if wrong**: If fees are material and not deducted, the system may allow more capital loss than the 4% policy intends. Conversely, if fees are double-counted in a future correction, MonthlyHalt could trigger prematurely. Fix must be validated with real exchange data.
 
