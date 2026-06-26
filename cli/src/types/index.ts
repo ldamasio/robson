@@ -79,7 +79,7 @@ export interface ClosedPosition extends Position {
  * Request to arm a new position.
  *
  * Note: risk per trade is fixed at 1% by v3 policy (not configurable).
- * Leverage is fixed at 10x (not configurable).
+ * Leverage is fixed at 1x (not configurable).
  * Position size is calculated via Golden Rule: (capital × 0.01) / tech_stop_distance
  */
 export interface ArmRequest {

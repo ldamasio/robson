@@ -52,7 +52,7 @@ pub enum ExecError {
     /// **DO NOT proceed with orders when this error occurs.**
     #[error("FUTURES SAFETY VIOLATION: expected {expected}, got {actual}. {advice}")]
     FuturesSafetyViolation {
-        /// What was expected (e.g., "One-way mode", "10x leverage")
+        /// What was expected (e.g., "One-way mode", "1x leverage")
         expected: String,
         /// What was found (e.g., "Hedge mode", "5x leverage")
         actual: String,

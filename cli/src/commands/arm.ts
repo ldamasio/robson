@@ -26,7 +26,7 @@ export function registerArmCommand(program: Command) {
       console.log(`Arming ${symbol.toUpperCase()} ${side.toUpperCase()}`);
       console.log(`  Capital: ${capital} USDT`);
       console.log(`  Risk: 1% (fixed)`);
-      console.log(`  Leverage: 10x (fixed)`);
+      console.log(`  Leverage: 1x (fixed)`);
       console.log();
 
       try {

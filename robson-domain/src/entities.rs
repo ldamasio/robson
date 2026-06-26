@@ -34,8 +34,8 @@ pub type AccountId = Uuid;
 /// Key concepts:
 /// - NO stop_gain: Exit happens when trailing stop is hit
 /// - Trailing stop uses 1x technical stop distance technique
-/// - Isolated margin trading (not spot)
-/// - **FIXED 10x leverage** (no configuration needed)
+/// - USD-M Futures trading with fixed 1x leverage
+/// - Margin availability is the physical bound for stop-derived sizing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
     pub id: PositionId,
@@ -51,7 +51,7 @@ pub struct Position {
     // Technical stop distance (trailing stop anchor)
     pub tech_stop_distance: Option<TechnicalStopDistance>,
 
-    // Position sizing (10x leverage is implicit)
+    // Position sizing (1x leverage is implicit)
     pub quantity: Quantity,
 
     // P&L Tracking
@@ -1082,8 +1082,8 @@ mod tests {
         let price = Price::new(dec!(95000)).unwrap();
 
         let margin = calculate_margin_required(&quantity, &price);
-        // Notional = $9,500, Leverage = 10x, Margin = $950
-        assert_eq!(margin, dec!(950));
+        // Notional = $9,500, Leverage = 1x, Margin = $9,500
+        assert_eq!(margin, dec!(9500));
     }
 
     #[test]

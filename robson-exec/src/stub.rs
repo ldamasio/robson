@@ -10,7 +10,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use robson_domain::{Candle, OrderSide, Price, Quantity, Symbol};
+use robson_domain::{Candle, OrderSide, Price, Quantity, RiskConfig, Symbol};
 use rust_decimal::Decimal;
 
 use crate::{
@@ -30,7 +30,7 @@ use crate::{
 /// Stub exchange for testing.
 ///
 /// Simulates immediate fills at a configured price.
-/// Default configuration: One-way position mode, 10x leverage.
+/// Default configuration: One-way position mode, 1x leverage.
 pub struct StubExchange {
     /// Current prices by symbol
     prices: RwLock<HashMap<String, Decimal>>,
@@ -65,8 +65,8 @@ pub struct StubExchange {
 impl StubExchange {
     /// Create a new stub exchange with default price and balance.
     ///
-    /// Default futures settings: position_mode="One-way", leverage=10
-    /// Default futures balance: 10,000 USDT.
+    /// Default futures settings: position_mode="One-way",
+    /// leverage=RiskConfig::LEVERAGE Default futures balance: 10,000 USDT.
     pub fn new(default_price: Decimal) -> Self {
         Self {
             prices: RwLock::new(HashMap::new()),
@@ -75,7 +75,7 @@ impl StubExchange {
             order_counter: RwLock::new(0),
             fail_next: RwLock::new(false),
             order_fail_next: RwLock::new(false),
-            futures_settings: RwLock::new(("One-way".to_string(), 10)),
+            futures_settings: RwLock::new(("One-way".to_string(), RiskConfig::LEVERAGE)),
             open_positions: RwLock::new(HashMap::new()),
             futures_balance: RwLock::new(Decimal::from(10000)),
             orders: RwLock::new(HashMap::new()),
