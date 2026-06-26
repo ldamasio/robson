@@ -3031,8 +3031,7 @@ mod tests {
 
     #[test]
     fn to_error_response_event_log_error_is_500() {
-        let (status, _) =
-            to_error_response(DaemonError::EventLog("write failed".to_string()));
+        let (status, _) = to_error_response(DaemonError::EventLog("write failed".to_string()));
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
