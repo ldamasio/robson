@@ -1868,11 +1868,26 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
         DaemonError::PositionNotFound(_) => StatusCode::NOT_FOUND,
         DaemonError::QueryNotFound(_) => StatusCode::NOT_FOUND,
         DaemonError::InvalidPositionState { .. } => StatusCode::CONFLICT,
+        DaemonError::PositionAlreadyExists(_) => StatusCode::CONFLICT,
         DaemonError::ApprovalExpired(_) => StatusCode::GONE,
         DaemonError::ApprovalDenied { .. } => StatusCode::CONFLICT,
         DaemonError::MonthlyHaltActive { .. } => StatusCode::SERVICE_UNAVAILABLE,
         DaemonError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
-        _ => StatusCode::BAD_REQUEST,
+        // Exchange transport failures are upstream errors, not client errors.
+        // Immediate-mode arm calls handle_signal synchronously; a connection or
+        // timeout failure must not surface as 400. Other Exec variants
+        // (OrderRejected, InvalidState) reflect business-rule rejections and
+        // stay 400 so callers can distinguish them from infrastructure faults.
+        DaemonError::Exec(robson_exec::ExecError::Exchange(_))
+        | DaemonError::Exec(robson_exec::ExecError::Timeout(_)) => StatusCode::BAD_GATEWAY,
+        DaemonError::Exec(_) => StatusCode::BAD_REQUEST,
+        DaemonError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        DaemonError::EventLog(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        #[cfg(feature = "postgres")]
+        DaemonError::Database(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        #[cfg(feature = "postgres")]
+        DaemonError::Projection(_) => StatusCode::INTERNAL_SERVER_ERROR,
+        _ => StatusCode::INTERNAL_SERVER_ERROR,
     };
 
     (status, Json(ErrorResponse { error: error.to_string() }))
@@ -2974,6 +2989,50 @@ mod tests {
         assert_eq!(status.occupied_slots, 0);
         assert_eq!(status.new_slots_available, 4);
         assert_eq!(status.slot_cells_total, 4);
+    }
+
+    // to_error_response unit tests — catch-all was `_ => 400` before this fix.
+    // Exchange/store/internal errors must not map to 400 (client error).
+
+    #[test]
+    fn to_error_response_exchange_failure_is_502() {
+        use robson_exec::ExecError;
+        let (status, _) = to_error_response(DaemonError::Exec(ExecError::Exchange(
+            "connection refused".to_string(),
+        )));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn to_error_response_timeout_is_502() {
+        use robson_exec::ExecError;
+        let (status, _) =
+            to_error_response(DaemonError::Exec(ExecError::Timeout("read timeout".to_string())));
+        assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    #[test]
+    fn to_error_response_order_rejected_stays_400() {
+        use robson_exec::ExecError;
+        let (status, _) = to_error_response(DaemonError::Exec(ExecError::InvalidState(
+            "quantity below minimum".to_string(),
+        )));
+        assert_eq!(status, StatusCode::BAD_REQUEST);
+    }
+
+    #[test]
+    fn to_error_response_store_error_is_500() {
+        use robson_store::StoreError;
+        let (status, _) = to_error_response(DaemonError::Store(StoreError::Database(
+            "connection pool exhausted".to_string(),
+        )));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
+    }
+
+    #[test]
+    fn to_error_response_event_log_error_is_500() {
+        let (status, _) = to_error_response(DaemonError::EventLog("write failed".to_string()));
+        assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
     }
 
     #[tokio::test]
