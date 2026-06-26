@@ -65,8 +65,8 @@ pub struct StubExchange {
 impl StubExchange {
     /// Create a new stub exchange with default price and balance.
     ///
-    /// Default futures settings: position_mode="One-way", leverage=RiskConfig::LEVERAGE
-    /// Default futures balance: 10,000 USDT.
+    /// Default futures settings: position_mode="One-way",
+    /// leverage=RiskConfig::LEVERAGE Default futures balance: 10,000 USDT.
     pub fn new(default_price: Decimal) -> Self {
         Self {
             prices: RwLock::new(HashMap::new()),
@@ -199,10 +199,11 @@ impl StubExchange {
     }
 
     pub fn set_spot_balance(&self, asset: &str, free: Decimal, locked: Decimal) {
-        self.spot_balances
-            .write()
-            .unwrap()
-            .insert(asset.to_string(), SpotBalance { asset: asset.to_string(), free, locked });
+        self.spot_balances.write().unwrap().insert(asset.to_string(), SpotBalance {
+            asset: asset.to_string(),
+            free,
+            locked,
+        });
     }
 
     pub fn set_spot_order(&self, order: SpotOrder) {

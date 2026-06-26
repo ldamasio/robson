@@ -294,7 +294,8 @@ pub struct RiskConfig {
 }
 
 impl RiskConfig {
-    /// Fixed leverage: 1x. Margin availability is the physical bound for stop-derived sizing.
+    /// Fixed leverage: 1x. Margin availability is the physical bound for
+    /// stop-derived sizing.
     pub const LEVERAGE: u8 = 1;
 
     /// Fixed risk per trade: 1% of capital (v3 policy — non-negotiable)

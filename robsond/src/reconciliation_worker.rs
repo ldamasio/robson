@@ -352,16 +352,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
             match observations.get(&position.id).cloned() {
                 Some(observation) => observation,
                 None => {
-                    observations.insert(
-                        position.id,
-                        MissingObservation {
-                            symbol: position.symbol.clone(),
-                            side: position.side,
-                            expected_quantity: position.quantity,
-                            first_observed_missing_at: now,
-                            first_observed_instant: Instant::now(),
-                        },
-                    );
+                    observations.insert(position.id, MissingObservation {
+                        symbol: position.symbol.clone(),
+                        side: position.side,
+                        expected_quantity: position.quantity,
+                        first_observed_missing_at: now,
+                        first_observed_instant: Instant::now(),
+                    });
                     debug!(
                         position_id = %position.id,
                         symbol = %position.symbol.as_pair(),

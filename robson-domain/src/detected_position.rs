@@ -63,7 +63,8 @@ impl DetectedPosition {
     /// - LONG: stop = entry × 0.98 (2% below)
     /// - SHORT: stop = entry × 1.02 (2% above)
     ///
-    /// This is a safety-net stop for untracked exposure; core entries use 1x sizing.
+    /// This is a safety-net stop for untracked exposure; core entries use 1x
+    /// sizing.
     pub fn calculate_safety_stop(&mut self) -> CalculatedStop {
         let stop_price = match self.side {
             Side::Long => {
