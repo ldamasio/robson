@@ -1105,29 +1105,43 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         let mut stale: Vec<StartupStaleActiveInfo> = Vec::new();
 
         for position in &local_positions {
-            if !matches!(position.state, PositionState::Active { .. }) {
-                continue;
-            }
-
             let present_on_exchange = exchange_positions
                 .iter()
                 .any(|ep| ep.symbol == position.symbol && ep.side == position.side);
 
-            if !present_on_exchange {
-                error!(
-                    position_id = %position.id,
-                    symbol = %position.symbol.as_pair(),
-                    side = ?position.side,
-                    quantity = %position.quantity,
-                    "CRITICAL: Startup gate: Robson-Active position absent from exchange"
-                );
-                stale.push(StartupStaleActiveInfo {
-                    position_id: position.id,
-                    symbol: position.symbol.as_pair(),
-                    side: format!("{:?}", position.side),
-                    quantity: position.quantity.as_decimal(),
-                    entry_price: position.entry_price.map(|p| p.as_decimal()),
-                });
+            match &position.state {
+                PositionState::Active { .. } if !present_on_exchange => {
+                    error!(
+                        position_id = %position.id,
+                        symbol = %position.symbol.as_pair(),
+                        side = ?position.side,
+                        quantity = %position.quantity,
+                        "CRITICAL: Startup gate: Robson-Active position absent from exchange"
+                    );
+                    stale.push(StartupStaleActiveInfo {
+                        position_id: position.id,
+                        symbol: position.symbol.as_pair(),
+                        side: format!("{:?}", position.side),
+                        quantity: position.quantity.as_decimal(),
+                        entry_price: position.entry_price.map(|p| p.as_decimal()),
+                    });
+                },
+                PositionState::Armed if present_on_exchange => {
+                    error!(
+                        position_id = %position.id,
+                        symbol = %position.symbol.as_pair(),
+                        side = ?position.side,
+                        "CRITICAL: Startup gate: Armed position already appears on exchange"
+                    );
+                    stale.push(StartupStaleActiveInfo {
+                        position_id: position.id,
+                        symbol: position.symbol.as_pair(),
+                        side: format!("{:?}", position.side),
+                        quantity: position.quantity.as_decimal(),
+                        entry_price: position.entry_price.map(|p| p.as_decimal()),
+                    });
+                },
+                _ => {},
             }
         }
 
@@ -2051,6 +2065,33 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_startup_gate_armed_on_exchange_returns_typed_error() {
+        use robson_domain::Symbol;
+        let daemon = Daemon::new_stub(Config::test());
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+
+        let mut position = active_position(symbol.clone(), Side::Long);
+        let pid = position.id;
+        position.state = PositionState::Armed;
+        daemon.store.positions().save(&position).await.unwrap();
+        daemon.exchange.set_open_position(
+            symbol,
+            Side::Long,
+            position.quantity,
+            position.entry_price.unwrap(),
+        );
+
+        let err = daemon.abort_if_stale_active().await.unwrap_err();
+        assert!(
+            matches!(err, DaemonError::StartupStaleActiveDetected { count: 1, .. }),
+            "expected StartupStaleActiveDetected with count 1, got: {err:?}"
+        );
+
+        let stored = daemon.store.positions().find_by_id(pid).await.unwrap().unwrap();
+        assert!(matches!(stored.state, PositionState::Armed));
+    }
+
+    #[tokio::test]
     async fn test_startup_gate_entering_does_not_abort() {
         use robson_domain::Symbol;
         let daemon = Daemon::new_stub(Config::test());
@@ -2202,10 +2243,13 @@ mod tests {
         let stored_auto =
             daemon_auto.store.positions().find_by_id(pid_auto).await.unwrap().unwrap();
         assert!(
-            matches!(stored_auto.state, PositionState::Closed {
-                exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
-                ..
-            }),
+            matches!(
+                stored_auto.state,
+                PositionState::Closed {
+                    exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
+                    ..
+                }
+            ),
             "AutoReconcile policy must close stale-active with real evidence"
         );
     }
@@ -2257,10 +2301,13 @@ mod tests {
         daemon.run_startup_auto_reconcile().await.unwrap();
 
         let stored = daemon.store.positions().find_by_id(pid).await.unwrap().unwrap();
-        assert!(matches!(stored.state, PositionState::Closed {
-            exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
-            ..
-        }));
+        assert!(matches!(
+            stored.state,
+            PositionState::Closed {
+                exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -2274,21 +2321,27 @@ mod tests {
         daemon.store.positions().save(&position).await.unwrap();
 
         let now = chrono::Utc::now();
-        daemon.exchange.set_user_trades(&symbol.as_pair(), vec![user_trade(
-            "TRADE-1",
-            "EX-ORDER-2",
-            dec!(90),
-            dec!(0.010),
-            now,
-        )]);
+        daemon.exchange.set_user_trades(
+            &symbol.as_pair(),
+            vec![user_trade(
+                "TRADE-1",
+                "EX-ORDER-2",
+                dec!(90),
+                dec!(0.010),
+                now,
+            )],
+        );
 
         daemon.run_startup_auto_reconcile().await.unwrap();
 
         let stored = daemon.store.positions().find_by_id(pid).await.unwrap().unwrap();
-        assert!(matches!(stored.state, PositionState::Closed {
-            exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
-            ..
-        }));
+        assert!(matches!(
+            stored.state,
+            PositionState::Closed {
+                exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
+                ..
+            }
+        ));
     }
 
     #[tokio::test]
@@ -2403,13 +2456,16 @@ mod tests {
         };
 
         let err = daemon
-            .apply_startup_auto_reconcile_batch(vec![input], vec![StartupStaleActiveInfo {
-                position_id: pid,
-                symbol: symbol.as_pair(),
-                side: "Long".to_string(),
-                quantity: dec!(0.010),
-                entry_price: Some(dec!(100)),
-            }])
+            .apply_startup_auto_reconcile_batch(
+                vec![input],
+                vec![StartupStaleActiveInfo {
+                    position_id: pid,
+                    symbol: symbol.as_pair(),
+                    side: "Long".to_string(),
+                    quantity: dec!(0.010),
+                    entry_price: Some(dec!(100)),
+                }],
+            )
             .await
             .unwrap_err();
 
@@ -2463,13 +2519,16 @@ mod tests {
         };
 
         let err = daemon
-            .apply_startup_auto_reconcile_batch(vec![input], vec![StartupStaleActiveInfo {
-                position_id: pid,
-                symbol: symbol.as_pair(),
-                side: "Long".to_string(),
-                quantity: dec!(0.010),
-                entry_price: Some(dec!(100)),
-            }])
+            .apply_startup_auto_reconcile_batch(
+                vec![input],
+                vec![StartupStaleActiveInfo {
+                    position_id: pid,
+                    symbol: symbol.as_pair(),
+                    side: "Long".to_string(),
+                    quantity: dec!(0.010),
+                    entry_price: Some(dec!(100)),
+                }],
+            )
             .await
             .unwrap_err();
 
@@ -2509,13 +2568,16 @@ mod tests {
         };
 
         let err = daemon
-            .apply_startup_auto_reconcile_batch(vec![input], vec![StartupStaleActiveInfo {
-                position_id: pid,
-                symbol: symbol.as_pair(),
-                side: "Long".to_string(),
-                quantity: dec!(0.010),
-                entry_price: Some(dec!(100)),
-            }])
+            .apply_startup_auto_reconcile_batch(
+                vec![input],
+                vec![StartupStaleActiveInfo {
+                    position_id: pid,
+                    symbol: symbol.as_pair(),
+                    side: "Long".to_string(),
+                    quantity: dec!(0.010),
+                    entry_price: Some(dec!(100)),
+                }],
+            )
             .await
             .unwrap_err();
 
@@ -2586,22 +2648,25 @@ mod tests {
         };
 
         let err = daemon
-            .apply_startup_auto_reconcile_batch(vec![input_a, input_b], vec![
-                StartupStaleActiveInfo {
-                    position_id: pid_a,
-                    symbol: symbol_a.as_pair(),
-                    side: "Long".to_string(),
-                    quantity: dec!(0.010),
-                    entry_price: Some(dec!(100)),
-                },
-                StartupStaleActiveInfo {
-                    position_id: pid_b,
-                    symbol: symbol_b.as_pair(),
-                    side: "Long".to_string(),
-                    quantity: dec!(0.010),
-                    entry_price: Some(dec!(100)),
-                },
-            ])
+            .apply_startup_auto_reconcile_batch(
+                vec![input_a, input_b],
+                vec![
+                    StartupStaleActiveInfo {
+                        position_id: pid_a,
+                        symbol: symbol_a.as_pair(),
+                        side: "Long".to_string(),
+                        quantity: dec!(0.010),
+                        entry_price: Some(dec!(100)),
+                    },
+                    StartupStaleActiveInfo {
+                        position_id: pid_b,
+                        symbol: symbol_b.as_pair(),
+                        side: "Long".to_string(),
+                        quantity: dec!(0.010),
+                        entry_price: Some(dec!(100)),
+                    },
+                ],
+            )
             .await
             .unwrap_err();
 

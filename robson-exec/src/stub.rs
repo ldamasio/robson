@@ -42,6 +42,8 @@ pub struct StubExchange {
     order_counter: RwLock<u64>,
     /// Whether to simulate failures
     fail_next: RwLock<bool>,
+    /// Whether to simulate a futures order placement failure only.
+    order_fail_next: RwLock<bool>,
     /// Simulated futures settings (position_mode, leverage)
     futures_settings: RwLock<(String, u8)>,
     /// Simulated open positions returned by reconciliation scans.
@@ -72,6 +74,7 @@ impl StubExchange {
             fee_rate: Decimal::new(1, 3), // 0.001 = 0.1%
             order_counter: RwLock::new(0),
             fail_next: RwLock::new(false),
+            order_fail_next: RwLock::new(false),
             futures_settings: RwLock::new(("One-way".to_string(), 10)),
             open_positions: RwLock::new(HashMap::new()),
             futures_balance: RwLock::new(Decimal::from(10000)),
@@ -121,9 +124,15 @@ impl StubExchange {
         prices.get(symbol).copied().unwrap_or(self.default_price)
     }
 
-    /// Configure the next order to fail.
+    /// Configure the next operation to fail.
     pub fn set_fail_next(&self, fail: bool) {
         let mut fail_next = self.fail_next.write().unwrap();
+        *fail_next = fail;
+    }
+
+    /// Configure the next futures order placement to fail after account validation.
+    pub fn set_order_fail_next(&self, fail: bool) {
+        let mut fail_next = self.order_fail_next.write().unwrap();
         *fail_next = fail;
     }
 
@@ -139,6 +148,13 @@ impl StubExchange {
         let mut fail_next = self.fail_next.write().unwrap();
         let fail = *fail_next;
         *fail_next = false; // Reset after check
+        fail
+    }
+
+    fn should_fail_order(&self) -> bool {
+        let mut fail_next = self.order_fail_next.write().unwrap();
+        let fail = *fail_next;
+        *fail_next = false;
         fail
     }
 
@@ -256,7 +272,7 @@ impl ExchangePort for StubExchange {
         _reduce_only: bool,
     ) -> Result<OrderResult, ExecError> {
         // Check if we should simulate a failure
-        if self.should_fail() {
+        if self.should_fail() || self.should_fail_order() {
             return Err(ExecError::Exchange("Simulated exchange failure".to_string()));
         }
 

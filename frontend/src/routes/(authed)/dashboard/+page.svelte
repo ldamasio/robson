@@ -12,12 +12,12 @@
     type Position,
     type SseEvent,
     type PendingApproval,
-    type StatusResponse,
   } from "$api/robson";
   import { activePositions } from "$stores/operations";
   import { haltStatus } from "$stores/slots";
   import { recentEvents, pushEvent } from "$stores/events";
   import { toasts, showToast } from "$stores/toast";
+  import { status as sharedStatus, refreshStatus } from "$stores/status";
   import {
     deriveMonthSlots,
     sortPositionsOldestFirst,
@@ -35,19 +35,16 @@
   } from "$lib/presentation/labels";
   import { _ } from "svelte-i18n";
 
-  const POLL_INTERVAL_MS = 10_000;
-
   let error = $state<string | null>(null);
   let connected = $state(false);
   let closeSse: (() => void) | null = null;
-  let pollTimer: ReturnType<typeof setInterval> | null = null;
   let showArmModal = $state(false);
   let pendingApprovals = $state<PendingApproval[]>([]);
   let historyError = $state<string | null>(null);
   let selectedMonth = $state(currentMonthKey());
   let monthlyPositions = $state<Position[]>([]);
   let monthlySlotCellsTotal = $state<number | null>(null);
-  let currentStatus = $state<StatusResponse | null>(null);
+  let currentStatus = $derived($sharedStatus);
   let approvalTick = $state(Date.now());
   let approvalTickTimer: ReturnType<typeof setInterval> | null = null;
 
@@ -195,13 +192,14 @@
     error = null;
     try {
       const [status, halt] = await Promise.all([
-        robsonApi.getStatus(),
+        refreshStatus(),
         robsonApi.getHaltStatus(),
       ]);
-      currentStatus = status;
-      activePositions.set(status.positions.filter((op) => isRenderableLivePosition(op)));
+      if (status) {
+        activePositions.set(status.positions.filter((op) => isRenderableLivePosition(op)));
+        pendingApprovals = status.pending_approvals;
+      }
       haltStatus.set(halt);
-      pendingApprovals = status.pending_approvals;
       connected = true;
     } catch (e) {
       error =
@@ -239,13 +237,7 @@
         const posId = payload.position_id as string | undefined;
         if (posId && event.event_type === "position.changed") {
           void Promise.all([
-            robsonApi
-              .getStatus()
-              .then((s) => {
-                currentStatus = s;
-                activePositions.set(s.positions);
-              })
-              .catch(() => {}),
+            refreshStatus().catch(() => {}),
             loadHistory().catch(() => {}),
           ]);
         }
@@ -263,40 +255,9 @@
     }
   }
 
-  function startPolling() {
-    stopPolling();
-    pollTimer = setInterval(() => {
-      void (async () => {
-        try {
-          const [status, halt] = await Promise.all([
-            robsonApi.getStatus(),
-            robsonApi.getHaltStatus(),
-          ]);
-          currentStatus = status;
-          activePositions.set(status.positions.filter((op) => isRenderableLivePosition(op)));
-          haltStatus.set(halt);
-          pendingApprovals = status.pending_approvals;
-          connected = true;
-          error = null;
-          void loadHistory();
-        } catch {
-          // SSE + polling: silent retry, error shown only if initial load fails
-        }
-      })();
-    }, POLL_INTERVAL_MS);
-  }
-
-  function stopPolling() {
-    if (pollTimer) {
-      clearInterval(pollTimer);
-      pollTimer = null;
-    }
-  }
-
   function retry() {
     void load();
     startSse();
-    startPolling();
   }
 
   function prevMonth() {
@@ -314,14 +275,12 @@
     untrack(() => {
       void load();
       startSse();
-      startPolling();
       approvalTickTimer = setInterval(() => {
         approvalTick = Date.now();
       }, 1000);
     });
     return () => {
       stopSse();
-      stopPolling();
       if (approvalTickTimer) {
         clearInterval(approvalTickTimer);
         approvalTickTimer = null;
