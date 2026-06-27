@@ -25,8 +25,10 @@ use crate::error::StoreError;
 pub struct DetectedPositionDto {
     /// Composite ID: "{symbol}:{side}" e.g., "BTCUSDT:long"
     pub position_id: String,
-    /// Binance-assigned position ID
-    pub binance_position_id: String,
+    /// Binance-assigned position ID. `Option` because legacy rows (created
+    /// before migration 015) carry NULL; rows written via `save()` always
+    /// carry the real id.
+    pub binance_position_id: Option<String>,
     pub symbol: String,
     pub side: String,
     pub entry_price: Decimal,
@@ -61,7 +63,7 @@ impl DetectedPositionDto {
 
         Self {
             position_id,
-            binance_position_id: pos.binance_position_id.clone(),
+            binance_position_id: Some(pos.binance_position_id.clone()),
             symbol: pos.symbol.as_pair(),
             side: format!("{:?}", pos.side).to_lowercase(),
             entry_price: pos.entry_price.as_decimal(),
@@ -134,13 +136,14 @@ impl DetectedPositionDto {
             StoreError::Deserialization(format!("Invalid quantity {}: {}", self.quantity, e))
         })?;
 
-        let mut pos = DetectedPosition::new(
-            self.binance_position_id.clone(),
-            symbol,
-            side,
-            entry_price,
-            quantity,
-        );
+        // Legacy rows (pre-migration 015) stored NULL here; fall back to the
+        // composite position_id so the domain invariant (non-null id) holds.
+        // This fallback is legacy-compat only — it is NOT proof of an
+        // exchange-assigned position id.
+        let binance_position_id =
+            self.binance_position_id.clone().unwrap_or_else(|| self.position_id.clone());
+        let mut pos =
+            DetectedPosition::new(binance_position_id, symbol, side, entry_price, quantity);
         pos.detected_at = self.detected_at;
         pos.last_verified_at = self.last_verified_at;
 
@@ -388,6 +391,34 @@ impl PgDetectedPositionRepository {
     }
 }
 
+/// Explicit column projection for `detected_positions` reads.
+///
+/// Avoids `SELECT *` so future schema changes cannot silently break
+/// `DetectedPositionDto`'s `FromRow` mapping, and `COALESCE`s the legacy
+/// nullable `verified_at` onto the always-present `detected_at` so old rows
+/// (which may carry `verified_at IS NULL`) load instead of erroring.
+#[cfg(feature = "postgres")]
+const DETECTED_POSITION_COLUMNS: &str = r#"
+    position_id,
+    binance_position_id,
+    symbol,
+    side,
+    entry_price,
+    quantity,
+    stop_price,
+    stop_distance,
+    stop_distance_pct,
+    detected_at,
+    COALESCE(verified_at, detected_at) AS verified_at,
+    closed_at,
+    is_active,
+    last_execution_attempt_at,
+    consecutive_failures,
+    is_panic_mode,
+    last_error,
+    stop_method
+"#;
+
 #[cfg(feature = "postgres")]
 #[async_trait]
 impl DetectedPositionRepository for PgDetectedPositionRepository {
@@ -397,18 +428,20 @@ impl DetectedPositionRepository for PgDetectedPositionRepository {
         sqlx::query(
             r#"
             INSERT INTO detected_positions (
-                position_id, symbol, side, entry_price, quantity,
+                position_id, binance_position_id, symbol, side, entry_price, quantity,
                 stop_price, stop_distance, stop_distance_pct,
                 detected_at, verified_at, closed_at, is_active,
                 stop_method
-            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             ON CONFLICT (position_id) DO UPDATE SET
+                binance_position_id = EXCLUDED.binance_position_id,
                 verified_at = EXCLUDED.verified_at,
                 closed_at = EXCLUDED.closed_at,
                 is_active = EXCLUDED.is_active
             "#,
         )
         .bind(&dto.position_id)
+        .bind(dto.binance_position_id.as_deref())
         .bind(&dto.symbol)
         .bind(&dto.side)
         .bind(dto.entry_price)
@@ -428,9 +461,9 @@ impl DetectedPositionRepository for PgDetectedPositionRepository {
     }
 
     async fn find_by_id(&self, id: &str) -> Result<Option<DetectedPosition>, StoreError> {
-        let row = sqlx::query_as::<_, DetectedPositionDto>(
-            "SELECT * FROM detected_positions WHERE position_id = $1",
-        )
+        let row = sqlx::query_as::<_, DetectedPositionDto>(&format!(
+            "SELECT {DETECTED_POSITION_COLUMNS} FROM detected_positions WHERE position_id = $1"
+        ))
         .bind(id)
         .fetch_optional(&*self.pool)
         .await?;
@@ -439,9 +472,9 @@ impl DetectedPositionRepository for PgDetectedPositionRepository {
     }
 
     async fn find_active(&self) -> Result<Vec<DetectedPosition>, StoreError> {
-        let rows = sqlx::query_as::<_, DetectedPositionDto>(
-            "SELECT * FROM detected_positions WHERE is_active = TRUE ORDER BY detected_at ASC",
-        )
+        let rows = sqlx::query_as::<_, DetectedPositionDto>(&format!(
+            "SELECT {DETECTED_POSITION_COLUMNS} FROM detected_positions WHERE is_active = TRUE ORDER BY detected_at ASC"
+        ))
         .fetch_all(&*self.pool)
         .await?;
 
@@ -455,9 +488,9 @@ impl DetectedPositionRepository for PgDetectedPositionRepository {
     }
 
     async fn find_by_symbol(&self, symbol: &str) -> Result<Vec<DetectedPosition>, StoreError> {
-        let rows = sqlx::query_as::<_, DetectedPositionDto>(
-            "SELECT * FROM detected_positions WHERE symbol = $1 ORDER BY detected_at DESC",
-        )
+        let rows = sqlx::query_as::<_, DetectedPositionDto>(&format!(
+            "SELECT {DETECTED_POSITION_COLUMNS} FROM detected_positions WHERE symbol = $1 ORDER BY detected_at DESC"
+        ))
         .bind(symbol)
         .fetch_all(&*self.pool)
         .await?;
@@ -577,9 +610,9 @@ impl DetectedPositionRepository for PgDetectedPositionRepository {
     }
 
     async fn find_panic_mode(&self) -> Result<Vec<DetectedPosition>, StoreError> {
-        let rows = sqlx::query_as::<_, DetectedPositionDto>(
-            "SELECT * FROM detected_positions WHERE is_panic_mode = TRUE AND is_active = TRUE",
-        )
+        let rows = sqlx::query_as::<_, DetectedPositionDto>(&format!(
+            "SELECT {DETECTED_POSITION_COLUMNS} FROM detected_positions WHERE is_panic_mode = TRUE AND is_active = TRUE"
+        ))
         .fetch_all(&*self.pool)
         .await?;
 
@@ -685,5 +718,120 @@ mod tests {
         let converted = dto.to_domain().unwrap();
         assert_eq!(converted.binance_position_id, pos.binance_position_id);
         assert_eq!(converted.symbol.as_pair(), pos.symbol.as_pair());
+    }
+
+    #[tokio::test]
+    async fn test_dto_round_trip_preserves_binance_position_id() {
+        // Distinct, non-trivial id to catch any accidental overwrite/defaulting.
+        let symbol = Symbol::from_pair("SOLUSDT").unwrap();
+        let pos = DetectedPosition::new(
+            "binance-id-789".to_string(),
+            symbol,
+            Side::Short,
+            Price::new(rust_decimal_macros::dec!(200)).unwrap(),
+            Quantity::new(rust_decimal_macros::dec!(5)).unwrap(),
+        );
+
+        let dto = DetectedPositionDto::from_domain(&pos);
+        assert_eq!(dto.binance_position_id, Some("binance-id-789".to_string()));
+
+        // Round-trip back to domain must keep the exact Binance id. This is the
+        // field whose absence on disk caused the FromRow schema-drift crash.
+        let restored = dto.to_domain().unwrap();
+        assert_eq!(restored.binance_position_id, "binance-id-789");
+    }
+
+    #[test]
+    fn test_dto_legacy_null_falls_back_to_position_id() {
+        // A legacy row (pre-migration 015) carries NULL binance_position_id in
+        // the DB. The domain type is non-null, so to_domain falls back to the
+        // composite position_id. This fallback is legacy-compat only — it is
+        // NOT an exchange-assigned id.
+        let pos = create_test_position();
+        let mut dto = DetectedPositionDto::from_domain(&pos);
+        dto.binance_position_id = None;
+
+        let restored = dto.to_domain().unwrap();
+        assert_eq!(restored.binance_position_id, dto.position_id);
+        assert_eq!(restored.binance_position_id, "BTCUSDT:long");
+    }
+
+    /// Regression for the position-monitor boot crash
+    /// "no column found for name: binance_position_id" and for legacy rows
+    /// that carry `verified_at IS NULL`.
+    ///
+    /// `sqlx::test` spins up an ephemeral Postgres and runs the `migrations/`
+    /// dir (so migration 015 is applied). Run with:
+    ///   DATABASE_URL=postgresql://localhost/test \
+    ///     cargo test -p robson-store --features postgres -- --ignored
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn test_pg_loads_legacy_detected_rows(pool: sqlx::PgPool) {
+        let detected_at = Utc::now();
+
+        // Legacy row: predates migration 015, so it has NO external id
+        // (binance_position_id IS NULL — not a fabricated sentinel) and was
+        // never verified (verified_at IS NULL). This is the exact shape that
+        // crashed the monitor at boot.
+        sqlx::query(
+            r#"
+            INSERT INTO detected_positions (
+                position_id, binance_position_id, symbol, side,
+                entry_price, quantity, stop_price, stop_distance, stop_distance_pct,
+                detected_at, verified_at, is_active, stop_method
+            ) VALUES ('BTCUSDT:long', NULL, 'BTCUSDT', 'long',
+                      95000, 0.1, 93100, 1900, 2,
+                      $1, NULL, TRUE, 'fixed_2pct')
+            "#,
+        )
+        .bind(detected_at)
+        .execute(&pool)
+        .await
+        .expect("insert legacy row");
+
+        // Normal row: real binance_position_id and a populated verified_at.
+        sqlx::query(
+            r#"
+            INSERT INTO detected_positions (
+                position_id, binance_position_id, symbol, side,
+                entry_price, quantity, stop_price, stop_distance, stop_distance_pct,
+                detected_at, verified_at, is_active, stop_method
+            ) VALUES ('ETHUSDT:short', 'bin_456', 'ETHUSDT', 'short',
+                      3000, 1.0, 3060, 60, 2,
+                      $1, $1, TRUE, 'fixed_2pct')
+            "#,
+        )
+        .bind(detected_at)
+        .execute(&pool)
+        .await
+        .expect("insert normal row");
+
+        let repo = PgDetectedPositionRepository::new(Arc::new(pool));
+
+        // Must NOT error with "no column found for name: binance_position_id".
+        let active = repo.find_active().await.expect("find_active loads legacy rows");
+        assert_eq!(active.len(), 2, "both legacy and normal rows should load");
+
+        // Legacy row: no real external id in the DB, so the domain conversion
+        // falls back to the composite position_id (legacy-compat only, not an
+        // exchange id). verified_at NULL fell back to detected_at via
+        // COALESCE(verified_at, detected_at).
+        let legacy = repo
+            .find_by_id("BTCUSDT:long")
+            .await
+            .expect("find_by_id legacy")
+            .expect("legacy row present");
+        assert_eq!(legacy.binance_position_id, "BTCUSDT:long");
+        assert_eq!(legacy.last_verified_at, detected_at);
+
+        // Normal row: real binance_position_id and verified_at preserved.
+        let normal = repo
+            .find_by_id("ETHUSDT:short")
+            .await
+            .expect("find_by_id normal")
+            .expect("normal row present");
+        assert_eq!(normal.binance_position_id, "bin_456");
+        assert_eq!(normal.last_verified_at, detected_at);
     }
 }
