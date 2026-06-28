@@ -77,7 +77,7 @@ CREATE TABLE event_log (
 **Rejected**: Advisory mode (log-only), Hybrid (advisory for low-risk, blocking for high-risk)
 
 **Rationale**:
-- A single trade exceeding 1% risk can wipe 1% of capital. This is not a "log and investigate" scenario.
+- A single trade whose stop-derived loss exceeds the 1% cap can wipe 1% of capital. This is not a "log and investigate" scenario.
 - Advisory mode creates a false sense of safety — risk violations are detected but not prevented
 - Hybrid mode (advisory for low-risk) introduces complexity in categorizing risk levels, with the dangerous possibility of miscategorization letting a high-risk action through as "low-risk"
 - The GovernedAction pattern (Rust type that can only be constructed by Runtime after Risk Engine approval) makes bypass impossible at compile time
@@ -472,22 +472,22 @@ See [v3-query-query-engine.md §11](v3-query-query-engine.md) for details.
 
 ---
 
-### ADR-v3-022: Fixed 1% Risk Per Trade — Non-Configurable
+### ADR-v3-022: Max 1% Loss Per Trade — Non-Configurable
 
 **Date**: 2026-04-11
 **Status**: DECIDED — implemented
 
-**Context**: In v2, `risk_per_trade_pct` was a configurable field in `RiskConfig`, settable via the `ArmRequest` API parameter and the `ROBSON_DEFAULT_RISK_PERCENT` environment variable. This created multiple paths to override a critical safety parameter. The operator's trading methodology prescribes exactly 1% risk per trade — no exceptions, no market-condition adjustments, no operator override.
+**Context**: In v2, `risk_per_trade_pct` was a configurable field in `RiskConfig`, settable via the `ArmRequest` API parameter and the `ROBSON_DEFAULT_RISK_PERCENT` environment variable. This created multiple paths to override a critical safety parameter. The operator's trading methodology now treats 1% as a maximum loss cap per trade: the stop-derived risk must not exceed 1% of capital, and realized risk may be lower when available 1x margin caps the position size.
 
-**Decision**: Risk per trade is a compile-time constant (`RiskConfig::RISK_PER_TRADE_PCT = 1`). All configuration paths are removed.
+**Decision**: Risk per trade remains a compile-time constant (`RiskConfig::RISK_PER_TRADE_PCT = 1`) as a maximum-loss cap. All configuration paths are removed.
 
-**Chose**: Hard-coded constant, zero configuration surface
+**Chose**: Hard-coded cap, zero configuration surface
 **Rejected**: Configurable with default (leaves override path open); Environment variable with validation (still overridable); Per-trade parameter (highest risk — ad-hoc decisions under pressure)
 
 **Rationale**:
-- The 1% rule is the foundation of the position sizing Golden Rule: `position_size = (capital × 0.01) / stop_distance`. Making it configurable means every trade is an opportunity to deviate under emotional pressure.
+- The 1% cap is the foundation of the position sizing Golden Rule: `position_size = min((capital × 0.01) / stop_distance, capital / entry_price)`. Making it configurable means every trade is an opportunity to deviate under emotional pressure.
 - Removing the configuration surface eliminates an entire class of operator error. The system cannot be told to risk more.
-- If the operator's methodology changes (e.g., 0.5% per trade), the constant is updated in code, reviewed, tested, and deployed — a deliberate process, not a runtime decision.
+- If the operator's methodology changes (e.g., 0.5% cap per trade), the constant is updated in code, reviewed, tested, and deployed — a deliberate process, not a runtime decision.
 
 **Changes made**:
 - `RiskConfig` constructor: `new(capital, risk_pct)` → `new(capital)` (field removed, constant added)
@@ -574,7 +574,7 @@ Robson's PnL model is authoritative for **risk gate decisions only**. It is not 
 
 **Rejected**: Continuing with implicit behavior (current state before this ADR) — implicit assumptions about fees and pricing source make correctness analysis impossible.
 
-**Fees deduction**: `build_risk_context()` sums `realized_pnl - fees_paid` from closed positions. MonthlyHalt triggers on net PnL (gross minus fees). At 1% risk per trade with typical 0.04% commission (entry + exit at 1x leverage ≈ 0.08% per cycle in fees), fees are material and correctly accounted for in the drawdown calculation.
+**Fees deduction**: `build_risk_context()` sums `realized_pnl - fees_paid` from closed positions. MonthlyHalt triggers on net PnL (gross minus fees). At a 1% loss cap per trade with typical 0.04% commission (entry + exit at 1x leverage ≈ 0.08% per cycle in fees), fees are material and correctly accounted for in the drawdown calculation.
 
 **Breaks if wrong**: If fees are material and not deducted, the system may allow more capital loss than the 4% policy intends. Conversely, if fees are double-counted in a future correction, MonthlyHalt could trigger prematurely. Fix must be validated with real exchange data.
 

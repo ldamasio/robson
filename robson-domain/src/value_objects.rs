@@ -268,8 +268,9 @@ impl fmt::Display for OrderSide {
 
 /// Risk configuration for position sizing (v3 policy)
 ///
-/// Risk per trade is FIXED at 1% of capital. This is a v3 policy decision:
-/// no configuration, no alternative modes, no overrides.
+/// Risk per trade is capped at 1% of capital. This is a v3 policy decision:
+/// no configuration, no alternative modes, no overrides, and actual realized
+/// risk may be lower when the available 1x margin caps the position size.
 ///
 /// Position size is derived from the Golden Rule:
 ///
@@ -298,7 +299,7 @@ impl RiskConfig {
     /// stop-derived sizing.
     pub const LEVERAGE: u8 = 1;
 
-    /// Fixed risk per trade: 1% of capital (v3 policy — non-negotiable)
+    /// Maximum risk per trade: 1% of capital (v3 policy — non-negotiable)
     pub const RISK_PER_TRADE_PCT: Decimal = Decimal::ONE;
 
     /// Create a new RiskConfig with validation
@@ -320,14 +321,14 @@ impl RiskConfig {
         self.capital
     }
 
-    /// Get risk percentage (always 1%)
+    /// Get risk percentage cap (always 1%)
     pub fn risk_per_trade_pct(&self) -> Decimal {
         Self::RISK_PER_TRADE_PCT
     }
 
     /// Calculate max risk amount in quote currency
     ///
-    /// Returns: Capital × 1% (fixed)
+    /// Returns: Capital × 1% (maximum loss cap)
     pub fn max_risk_amount(&self) -> Decimal {
         self.capital * Self::RISK_PER_TRADE_PCT / Decimal::from(100)
     }
@@ -342,7 +343,7 @@ impl fmt::Display for RiskConfig {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "RiskConfig {{ capital: {}, risk: 1% (fixed), leverage: {}x }}",
+            "RiskConfig {{ capital: {}, risk cap: 1% max, leverage: {}x }}",
             self.capital,
             Self::LEVERAGE
         )
@@ -629,7 +630,7 @@ mod tests {
         assert_eq!(Side::Short.exit_action(), OrderSide::Buy);
     }
 
-    // RiskConfig tests (v3: fixed 1% risk)
+    // RiskConfig tests (v3: 1% maximum-loss cap)
     #[test]
     fn test_risk_config_validation() {
         // Valid: positive capital
@@ -649,11 +650,11 @@ mod tests {
         // Risk is always 1%, regardless of capital
         let config = RiskConfig::new(dec!(10000)).unwrap();
         assert_eq!(config.risk_per_trade_pct(), dec!(1));
-        assert_eq!(config.max_risk_amount(), dec!(100)); // 1% of 10000
+        assert_eq!(config.max_risk_amount(), dec!(100)); // 1% max of 10000
 
         let config2 = RiskConfig::new(dec!(50000)).unwrap();
         assert_eq!(config2.risk_per_trade_pct(), dec!(1)); // still 1%
-        assert_eq!(config2.max_risk_amount(), dec!(500)); // 1% of 50000
+        assert_eq!(config2.max_risk_amount(), dec!(500)); // 1% max of 50000
     }
 
     #[test]

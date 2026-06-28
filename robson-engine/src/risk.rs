@@ -413,7 +413,7 @@ impl RiskGate {
         }
 
         // 2. Check physical capital bound. At 1x, stop-derived notional must fit
-        // available margin; tight stops may create a valid 1% risk amount but an
+        // available margin; tight stops may create a valid 1% loss amount but an
         // invalid position size for the account.
         if proposed.initial_margin > context.capital {
             debug!(

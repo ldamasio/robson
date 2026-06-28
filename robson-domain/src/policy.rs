@@ -110,9 +110,9 @@ pub enum SignalEvaluationOutcome {
 
 /// Primary trading policy with immutable risk parameters (ADR-0024 Decision 2).
 ///
-/// Risk per trade (1%) and max monthly drawdown (4%) are fixed by product
-/// definition. These values are not configurable via environment variables,
-/// operator API, or any runtime mechanism.
+/// Risk per trade (1% maximum-loss cap) and max monthly drawdown (4%) are fixed
+/// by product definition. These values are not configurable via environment
+/// variables, operator API, or any runtime mechanism.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct TradingPolicy {
     /// Risk per trade as percentage of capital. Fixed at 1%.
@@ -122,7 +122,7 @@ pub struct TradingPolicy {
 }
 
 impl TradingPolicy {
-    /// Returns the default policy (1% risk, 4% max drawdown).
+    /// Returns the default policy (1% maximum-loss cap, 4% max drawdown).
     pub fn new() -> Self {
         Self {
             risk_per_trade_pct: Decimal::ONE,

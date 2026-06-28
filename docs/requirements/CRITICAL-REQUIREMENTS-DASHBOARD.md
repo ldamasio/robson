@@ -126,7 +126,7 @@
 ---
 
 ### Rule #2: Position Size from Stop Distance
-**Rule**: Position size MUST be calculated from stop distance (1% risk)
+**Rule**: Position size MUST be calculated from stop distance (1% loss cap)
 
 **Enforcement Points**:
 1. CLI shows calculated size, user confirms

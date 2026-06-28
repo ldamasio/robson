@@ -138,7 +138,7 @@ CI must pass the first two tiers unconditionally. The third tier requires a prov
 
 These are architectural constraints that MUST NOT be violated by any agent or human:
 
-10. **No static exposure hard limits.** `max_open_positions`, `max_total_exposure_pct`, and `max_single_position_pct` were eliminated in MIG-v3#11 (ADR-0024). The only static constraint is `risk_per_trade_pct = 1%` and `max_monthly_drawdown_pct = 4%` of `capital_base`. Slot availability governs entry capacity. There is no daily loss limit. Funding rate does not determine exposure limits in long positions.
+10. **No static exposure hard limits.** `max_open_positions`, `max_total_exposure_pct`, and `max_single_position_pct` were eliminated in MIG-v3#11 (ADR-0024). The only static constraint is `risk_per_trade_pct = 1%` as a maximum-loss cap and `max_monthly_drawdown_pct = 4%` of `capital_base`. Slot availability governs entry capacity. There is no daily loss limit. Funding rate does not determine exposure limits in long positions. Realized risk may be lower when available margin caps the position size.
 11. **`Estimated` evidence is permanently blocked in `reconcile_close`.** Only `OrderFillRecord` and `UserTradeRecord` are accepted for automated reconciled closes. If evidence is unavailable, the daemon aborts startup and requires manual operator intervention via `robson-cli reconcile-close`.
 12. **No LLM, no autonomous trading.** v3 has zero LLM coupling. The operator decides WHEN to trade. Robson decides HOW MUCH and enforces THAT risk rules are never violated. QE-P5 (Context Governance) is deferred to v4.
 

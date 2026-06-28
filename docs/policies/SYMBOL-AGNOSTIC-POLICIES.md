@@ -92,9 +92,9 @@ The rules below are symbol-agnostic by construction and must remain so:
 
 | Rule | Statement | Notes |
 |---|---|---|
-| 1% risk per trade | `risk_amount = capital × 0.01` | Capital is in quote-asset-neutral units (USD equivalent) |
+| 1% loss cap per trade | `risk_amount = capital × 0.01` | Capital is in quote-asset-neutral units (USD equivalent); realized risk may be lower when margin caps size |
 | 4% monthly drawdown | `MonthlyPnL ≤ −(capital × 0.04)` | Aggregated across all symbols |
-| Position size (Golden Rule) | `size = risk_amount / abs(entry − tech_stop)` | Works for any symbol |
+| Position size (Golden Rule) | `size = min(risk_amount / abs(entry − tech_stop), capital / entry)` | Works for any symbol |
 | Span (palmo) | `span = abs(entry_price − technical_stop)` | Symbol-neutral; stop is chart-derived |
 | Hand-Span Trailing Stop | Stop advances in integer multiples of `span` | Monotonic, per-position |
 | Technical Stop Distance | Second support (LONG) / resistance (SHORT) on 15m chart | Chart-derived, not percentage |

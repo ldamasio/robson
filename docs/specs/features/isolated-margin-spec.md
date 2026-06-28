@@ -846,7 +846,7 @@ class OpenMarginPositionUseCase:
     Flow:
     1. Validate inputs (symbol, side, stop price)
     2. Get current margin account status
-    3. Calculate position size using 1% risk rule
+    3. Calculate position size using 1% loss cap
     4. Transfer required margin from Spot (if needed)
     5. Place market order
     6. Place stop-loss order

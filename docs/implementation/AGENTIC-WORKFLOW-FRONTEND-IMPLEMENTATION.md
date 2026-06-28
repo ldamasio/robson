@@ -202,7 +202,7 @@ Authorization: Bearer ${authTokens.access}
 3. **Position size preview appears**
    - Calculates: (10000 × 0.01) / |50000 - 48000| = 0.05 BTC
    - Shows: "Calculated Position Size: 0.05000000 BTC"
-   - Shows: "Based on 1% risk rule: risking $100.00 on this trade"
+   - Shows: "Based on 1% loss cap: risking up to $100.00 on this trade"
 
 4. **User clicks "Create Plan"**
    - Button shows "Creating Plan..." with spinner

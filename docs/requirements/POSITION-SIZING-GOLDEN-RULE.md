@@ -16,10 +16,10 @@
 ```
 ┌─────────────────────────────────────────────────────────────────┐
 │                                                                 │
-│    Position Size = Max Risk Amount / Technical Stop Distance    │
+│    Risk-sized qty = Max Risk Amount / Technical Stop Distance   │
 │                                                                 │
 │    Where:                                                       │
-│    • Max Risk Amount = Capital × 1%                             │
+│    • Max Risk Amount = Capital × 1% (maximum loss cap)          │
 │    • Technical Stop Distance = |Entry Price - Technical Stop|   │
 │    • Technical Stop = 2nd Support Level (from chart analysis)   │
 │                                                                 │
@@ -42,6 +42,9 @@ Step 2: CALCULATE STOP DISTANCE
         │
         └── Stop Distance = |Entry - Technical Stop|
         └── This is in PRICE UNITS (e.g., $950)
+        └── qty_by_risk = Max Risk / Stop Distance
+        └── qty_by_margin = Capital / Entry Price
+        └── Final qty = min(qty_by_risk, qty_by_margin)
         │
         ▼
 Step 3: DETERMINE MAX RISK AMOUNT
@@ -53,7 +56,7 @@ Step 3: DETERMINE MAX RISK AMOUNT
 Step 4: DERIVE POSITION SIZE
         │
         └── Position Size = Max Risk / Stop Distance
-        └── This ensures you lose EXACTLY 1% if stopped
+        └── This ensures you lose at most 1% if stopped
         │
         ▼
 Step 5: EXECUTE ORDER
@@ -79,7 +82,7 @@ CALCULATE:
 
 RESULT:
   • You buy 0.0667 BTC for $6,333.33
-  • If stopped at $93,500, you lose $100 (exactly 1%)
+  • If stopped at $93,500, you lose at most $100 (up to 1%)
   • Position is sized FOR the stop, not despite it
 ```
 
@@ -103,18 +106,18 @@ This is correct. The stop drives the position size.
 If the 2nd support is far away:
 - Stop Distance is large
 - Position Size is small
-- Risk is still 1%
+- Risk stays within the cap
 
 ### 2. Tight Stop = Larger Position
 If the 2nd support is close:
 - Stop Distance is small
 - Position Size is larger
-- Risk is still 1%
+- Risk stays within the cap
 
-### 3. Risk is CONSTANT
+### 3. Risk is CAPPED
 No matter the stop distance:
-- You always risk exactly 1% of capital
-- The position size adjusts to match
+- You risk at most 1% of capital
+- The position size adjusts to fit both stop distance and available margin
 
 ---
 
@@ -173,7 +176,7 @@ There is NO way to place a trade in Robson without:
 |---------|--------|
 | Technical Stop | Chart analysis (2nd support) |
 | Stop Distance | Calculated from stop |
-| Max Risk | 1% of capital (constant) |
+| Max Risk | Up to 1% of capital (maximum loss cap) |
 | Position Size | **DERIVED** from stop distance |
 
 **The stop comes FIRST. Everything else follows.**

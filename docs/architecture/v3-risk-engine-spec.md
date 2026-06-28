@@ -36,12 +36,13 @@ always safe) and is tagged `UNTRACKED_ON_EXCHANGE` in the audit trail.
 
 These decisions are final for v3. No alternatives, no overrides, no flexibility.
 
-### 1. Risk Per Trade: Fixed 1%
+### 1. Risk Per Trade: Max 1% Loss
 
-- Every position risks exactly **1% of total capital**.
-- Position size is derived from the technical stop distance (Golden Rule).
-- Formula: `position_size = (capital × 0.01) / stop_distance`
+- Every position is sized so its stop loss is capped at **1% of total capital**.
+- Position size is derived from the technical stop distance (Golden Rule) and capped by available 1x margin.
+- Formula: `position_size = min((capital × 0.01) / stop_distance, capital / entry_price)`
 - This is not configurable. There is no environment variable, API parameter, or mode selector.
+- Realized loss may be below 1% when margin availability is the binding constraint.
 
 ### 2. Monthly Drawdown: 4% Hard Halt
 

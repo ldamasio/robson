@@ -28,14 +28,14 @@
 5. System calculates stop distance (entry_price - stop_price)
    ↓
 6. System calculates position size:
-   - Max loss = 1% of total capital
-   - Position size = (capital × 0.01) / stop_distance
+   - Max loss = up to 1% of total capital
+   - Position size = min((capital × 0.01) / stop_distance, capital / entry_price)
    ↓
 7. System presents to user:
    - Entry price: $X
    - Technical stop: $Y (distance: Z%)
    - Position size: N units ($M value)
-   - Max loss: $L (1% of capital)
+   - Max loss: $L (1% cap)
    ↓
 8. User confirms or adjusts
    ↓

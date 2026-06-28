@@ -258,7 +258,7 @@ REQ-FUT-XXX-001: Description
 ### Feature Requirements
 - [Isolated Margin Trading](isolated-margin-requirements.md) - Leveraged trading with risk management
 - [Technical Stop Rule](technical-stop-requirements.md) - Stop-loss derived from chart analysis
-- [Position Sizing Golden Rule](POSITION-SIZING-GOLDEN-RULE.md) - 1% risk per trade
+- [Position Sizing Golden Rule](POSITION-SIZING-GOLDEN-RULE.md) - 1% loss cap per trade
 - [Strategy Semantic Clarity](STRATEGY-SEMANTIC-CLARITY.md) - User-driven strategy selection
 - [BALANCE Mode](balance-mode-requirements.md) - Dynamic capital from exchange balance
 

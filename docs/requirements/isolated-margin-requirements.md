@@ -253,7 +253,7 @@ Robson monitors price and executes the exit to ensure reliability.
 
 #### REQ-FUT-MARGIN-008: Position Sizing for Margin
 
-**Description**: System must calculate optimal position size for margin trades using the 1% risk rule, accounting for leverage.
+**Description**: System must calculate optimal position size for margin trades using the 1% loss cap, accounting for leverage and available margin.
 
 **Rationale**: Core Robson intelligence - protecting user capital.
 
@@ -266,7 +266,7 @@ Robson monitors price and executes the exit to ensure reliability.
 **Estimated Complexity**: Moderate
 
 **Acceptance Criteria**:
-- [ ] Calculate position size where max loss = 1% of total capital
+- [ ] Calculate position size where max loss is capped at 1% of total capital
 - [ ] Account for leverage in margin calculations
 - [ ] Ensure margin allocated <= available margin
 - [ ] Warn if position would approach liquidation
@@ -275,13 +275,14 @@ Robson monitors price and executes the exit to ensure reliability.
 **Formula**:
 ```
 Capital = Isolated Margin Equity (quote net + base net * price)
-Risk Amount = Capital × 0.01 (1% rule)
+Max Risk Amount = Capital × 0.01 (1% cap)
 Stop Distance = |Entry Price - Stop Price|
-Base Quantity = Risk Amount / Stop Distance
+Risk-Sized Quantity = Max Risk Amount / Stop Distance
+Margin-Sized Quantity = Available Margin × Leverage / Entry Price
+Final Quantity = min(Risk-Sized Quantity, Margin-Sized Quantity)
 
-Margin Required = (Base Quantity × Entry Price) / Leverage
-If Margin Required > Available Margin:
-    Reduce position proportionally
+If Final Quantity would still violate exchange filters:
+    Reject the trade
 ```
 
 ---

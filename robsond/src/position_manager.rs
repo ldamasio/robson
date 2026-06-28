@@ -197,7 +197,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     ///
     /// Called at startup after querying the exchange and whenever the engine's
     /// capital needs to be refreshed. Updates the internal `RiskConfig` while
-    /// preserving the fixed 1% risk-per-trade policy.
+    /// preserving the 1% maximum-loss cap.
     pub fn update_engine_capital(&self, capital: Decimal) {
         use robson_domain::RiskConfig;
         if let Ok(risk_config) = RiskConfig::new(capital) {
@@ -3324,7 +3324,7 @@ mod tests {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         let journal = Arc::new(IntentJournal::new());
         let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
-        let risk_config = RiskConfig::new(dec!(10000)).unwrap(); // 1% risk
+        let risk_config = RiskConfig::new(dec!(10000)).unwrap(); // 1% cap
         let engine = Engine::new(risk_config);
 
         Arc::new(
@@ -3379,7 +3379,7 @@ mod tests {
     }
 
     fn create_test_risk_config() -> RiskConfig {
-        RiskConfig::new(dec!(10000)).unwrap() // 1% risk
+        RiskConfig::new(dec!(10000)).unwrap() // 1% cap
     }
 
     fn create_test_candles() -> Vec<Candle> {
@@ -3809,8 +3809,7 @@ mod tests {
             .await
             .unwrap();
 
-        // 8% stop — passes risk gate (≥6.67% threshold on $10k capital, 1% risk, 15%
-        // max single)
+        // 8% stop — passes risk gate (1% loss cap on $10k capital; margin still fits)
         let signal = DetectorSignal {
             signal_id: Uuid::now_v7(),
             position_id: position.id,

@@ -432,7 +432,7 @@ impl Engine {
         tech_stop.validate().map_err(|e| EngineError::DomainError(e))?;
 
         // 4. Calculate position size (Golden Rule)
-        let quantity = calculate_position_size(&self.risk_config, &tech_stop)
+        let quantity = calculate_position_size(&self.risk_config, &signal.entry_price, &tech_stop)
             .map_err(|e| EngineError::DomainError(e))?;
 
         debug!(
