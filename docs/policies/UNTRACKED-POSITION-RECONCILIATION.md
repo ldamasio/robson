@@ -82,6 +82,18 @@ I3 is the symmetric counterpart of I1/I2:
 - [Implementation guide TD-2026-05-05-001](../implementation/TD-2026-05-05-001-CORE-LIFECYCLE-DRIFT.md) — slice-by-slice plan.
 - [Runbook td-2026-05-05-001-stale-active-recovery](../runbooks/td-2026-05-05-001-stale-active-recovery.md) — operator recovery when the startup gate aborts.
 
+#### I3 §0 — Projection-only orphan rows
+
+A row that exists in `positions_current` but has no corresponding canonical row
+in `positions`, no related `orders`, and no lifecycle `events` is a projection
+integrity defect, not a real Robson-authored open position. It MUST NOT be
+closed with fabricated exchange evidence. The safe recovery is an audited
+projection repair that deletes only the orphan projection row after confirming
+all three absences. `/status` MUST surface any remaining stale-active blocker
+through `stale_active_count` and `reconciliation_blockers`; a clean list of
+`positions[]` alone is not sufficient evidence that reconciliation is clear.
+
+
 #### I3 §A — Scope: `Active` only
 
 For this technical debt, **only `Active` positions are eligible for automatic

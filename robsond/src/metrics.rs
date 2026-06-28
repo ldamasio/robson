@@ -7,6 +7,7 @@
 //! - `robsond_risk_denials_total` — risk gate rejections, labelled by check
 //! - `robsond_position_pnl` — realized PnL per closed position
 //! - `robsond_active_positions` — currently open position count
+//! - `robsond_stale_active_positions` — open book positions missing on exchange
 //! - `robsond_monthly_halt_active` — MonthlyHalt circuit breaker (0 or 1)
 
 use std::sync::LazyLock;
@@ -57,6 +58,16 @@ pub static POSITION_PNL: LazyLock<GaugeVec> = LazyLock::new(|| {
 pub static ACTIVE_POSITIONS: LazyLock<Gauge> = LazyLock::new(|| {
     register_gauge!("robsond_active_positions", "Number of currently open positions")
         .expect("failed to register robsond_active_positions")
+});
+
+/// Open book positions that are missing on the exchange and require
+/// reconciliation.
+pub static STALE_ACTIVE_POSITIONS: LazyLock<Gauge> = LazyLock::new(|| {
+    register_gauge!(
+        "robsond_stale_active_positions",
+        "Number of open book positions missing on the exchange"
+    )
+    .expect("failed to register robsond_stale_active_positions")
 });
 
 /// MonthlyHalt circuit breaker state (0 = normal, 1 = halted).

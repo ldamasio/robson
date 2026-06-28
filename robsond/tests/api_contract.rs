@@ -620,6 +620,8 @@ async fn test_status_response_has_required_fields() {
     assert!(body["active_positions"].is_number(), "active_positions missing");
     assert!(body["positions"].is_array(), "positions missing");
     assert!(body["pending_approvals"].is_array(), "pending_approvals missing");
+    assert!(body["stale_active_count"].is_number(), "stale_active_count missing");
+    assert!(body["reconciliation_blockers"].is_array(), "reconciliation_blockers missing");
 }
 
 #[tokio::test]

@@ -32,6 +32,7 @@ struct PostConvertedCrashExchange {
     inner: Arc<StubExchange>,
     spot_balance_calls: std::sync::RwLock<u64>,
     fail_spot_balance_call: std::sync::RwLock<Option<u64>>,
+    fail_spot_order: std::sync::RwLock<Option<String>>,
 }
 
 impl PostConvertedCrashExchange {
@@ -40,12 +41,17 @@ impl PostConvertedCrashExchange {
             inner,
             spot_balance_calls: std::sync::RwLock::new(0),
             fail_spot_balance_call: std::sync::RwLock::new(None),
+            fail_spot_order: std::sync::RwLock::new(None),
         }
     }
 
     fn fail_spot_balance_call(&self, call: u64) {
         *self.spot_balance_calls.write().unwrap() = 0;
         *self.fail_spot_balance_call.write().unwrap() = Some(call);
+    }
+
+    fn fail_spot_order(&self, message: &str) {
+        *self.fail_spot_order.write().unwrap() = Some(message.to_string());
     }
 
     fn spot_order_call_count(&self) -> u64 {
@@ -160,6 +166,10 @@ impl ExchangePort for PostConvertedCrashExchange {
         &self,
         request: SpotOrderRequest,
     ) -> Result<SpotOrder, ExecError> {
+        let failure = self.fail_spot_order.write().unwrap().take();
+        if let Some(message) = failure {
+            return Err(ExecError::OrderRejected(message));
+        }
         self.inner.place_spot_market_order(request).await
     }
 
@@ -315,6 +325,48 @@ async fn resume_after_crash_post_converted(pool: PgPool) -> anyhow::Result<()> {
     assert_eq!(response.state, FundingState::Refreshed.as_str());
     assert_eq!(harness.exchange.spot_order_call_count(), spot_calls);
     assert_eq!(harness.exchange.transfer_call_count(), 1);
+
+    Ok(())
+}
+
+#[test]
+fn terminal_spot_order_error_detects_insufficient_balance() {
+    let error = ExecError::OrderRejected(
+        "Account has insufficient balance for requested action.".to_string(),
+    );
+
+    assert_eq!(
+        super::saga::terminal_spot_order_error_reason(&error),
+        Some("spot_order_insufficient_balance")
+    );
+
+    let transient = ExecError::Exchange("temporary gateway timeout".to_string());
+    assert_eq!(super::saga::terminal_spot_order_error_reason(&transient), None);
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "Requires DATABASE_URL"]
+async fn insufficient_balance_marks_saga_failed(pool: PgPool) -> anyhow::Result<()> {
+    let exchange = Arc::new(PostConvertedCrashExchange::new(configured_exchange()));
+    exchange.fail_spot_order("Account has insufficient balance for requested action.");
+    let harness = test_service(pool, exchange, FundingConfig::default());
+
+    let quote = harness.service.quote().await?;
+    let error = harness
+        .service
+        .execute(quote.quote_id, "insufficient-balance")
+        .await
+        .unwrap_err();
+
+    assert!(error.to_string().contains("insufficient balance"));
+    let view = harness.service.get(quote.quote_id).await?;
+    assert_eq!(view.state, FundingState::Failed.as_str());
+    assert!(view.events.iter().any(|event| {
+        event.event_type == "FundingFailed"
+            && event.payload.get("reason").and_then(|reason| reason.as_str())
+                == Some("spot_order_insufficient_balance:BTC")
+    }));
+    assert_eq!(harness.service.resume_non_terminal().await?, 0);
 
     Ok(())
 }

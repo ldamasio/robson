@@ -162,16 +162,32 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
                 let order =
                     match self.exchange.get_spot_order(&item.symbol, &client_order_id).await? {
                         Some(order) if order.status == "FILLED" => order,
-                        _ => {
-                            self.exchange
-                                .place_spot_market_order(SpotOrderRequest {
-                                    symbol: item.symbol.clone(),
-                                    side: route.side,
-                                    quantity_kind: route.quantity_kind,
-                                    quantity: item.qty,
-                                    client_order_id: client_order_id.clone(),
-                                })
-                                .await?
+                        _ => match self
+                            .exchange
+                            .place_spot_market_order(SpotOrderRequest {
+                                symbol: item.symbol.clone(),
+                                side: route.side,
+                                quantity_kind: route.quantity_kind,
+                                quantity: item.qty,
+                                client_order_id: client_order_id.clone(),
+                            })
+                            .await
+                        {
+                            Ok(order) => order,
+                            Err(error) => {
+                                if let Some(reason) = terminal_spot_order_error_reason(&error) {
+                                    let reason = format!("{}:{}", reason, item.asset);
+                                    self.fail(quote_id, &reason).await?;
+                                    tracing::error!(
+                                        %quote_id,
+                                        asset = %item.asset,
+                                        %error,
+                                        reason = %reason,
+                                        "Funding conversion marked terminal after exchange error"
+                                    );
+                                }
+                                return Err(DaemonError::Exec(error));
+                            },
                         },
                     };
                 if order.status != "FILLED" {
@@ -508,6 +524,18 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
         .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(feature = "postgres")]
+pub(crate) fn terminal_spot_order_error_reason(
+    error: &robson_exec::ExecError,
+) -> Option<&'static str> {
+    let message = error.to_string().to_ascii_lowercase();
+    if message.contains("insufficient balance") {
+        Some("spot_order_insufficient_balance")
+    } else {
+        None
     }
 }
 

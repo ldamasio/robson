@@ -70,10 +70,19 @@ export type PositionState =
     }
   | { Error: { error: string; recoverable: boolean } };
 
+export type ReconciliationBlocker = {
+  position_id: string;
+  symbol: string;
+  side: string;
+  reason: string;
+};
+
 export type StatusResponse = {
   active_positions: number;
   positions: Position[];
   pending_approvals: PendingApproval[];
+  stale_active_count: number;
+  reconciliation_blockers: ReconciliationBlocker[];
   new_slots_available: number;
   occupied_slots: number;
   slot_cells_total: number;
@@ -317,6 +326,15 @@ function normalizeStatus(raw: StatusResponse): StatusResponse {
     pending_approvals: Array.isArray(raw.pending_approvals)
       ? raw.pending_approvals
       : [],
+    stale_active_count: Number(raw.stale_active_count ?? 0),
+    reconciliation_blockers: Array.isArray(raw.reconciliation_blockers)
+      ? raw.reconciliation_blockers.map((blocker) => ({
+          position_id: String(blocker.position_id),
+          symbol: String(blocker.symbol),
+          side: String(blocker.side),
+          reason: String(blocker.reason),
+        }))
+      : [],
     new_slots_available: requireNumber(
       raw.new_slots_available,
       "new_slots_available",
@@ -366,9 +384,7 @@ export function connectEventStream(
     }
   ).__RBX_EVENT_SOURCE_FACTORY__;
 
-  const source = factory
-    ? factory(url)
-    : new FetchEventSource(url, token);
+  const source = factory ? factory(url) : new FetchEventSource(url, token);
 
   source.onmessage = (msg) => {
     try {

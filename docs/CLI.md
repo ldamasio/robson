@@ -377,8 +377,25 @@ All commands support `--json` flag for machine-readable output.
 
 ```typescript
 interface StatusResponse {
+  active_positions: number;
   positions: Position[];
-  summary: Summary;
+  pending_approvals: PendingApproval[];
+  stale_active_count: number;
+  reconciliation_blockers: ReconciliationBlocker[];
+  new_slots_available: number;
+  occupied_slots: number;
+  slot_cells_total: number;
+  monthly_realized_loss: number;
+  monthly_realized_loss_pct: number;
+  capital_base: number;
+  wallet_balance: number;
+}
+
+interface ReconciliationBlocker {
+  position_id: string;
+  symbol: string;
+  side: string;
+  reason: "stale_missing_on_exchange" | string;
 }
 
 interface Position {
