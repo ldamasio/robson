@@ -52,7 +52,7 @@ export function positionSummaryLines(p: Position): string[] {
       const modeLabel = entryModeLabel(p.entry_mode);
       const approvalLabel = p.approval_mode === 'human_confirmation' ? ' · awaiting approval' : '';
       lines.push(label('ARMED', `${modeLabel}${approvalLabel}`));
-      lines.push(label('LEVERAGE', '10x (fixed)'));
+      lines.push(label('LEVERAGE', '1x (fixed)'));
     } else if (state === 'Active') {
       if (isStale) {
         lines.push(label('STALE', 'not present on exchange'));

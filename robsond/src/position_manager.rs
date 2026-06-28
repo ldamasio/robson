@@ -2167,9 +2167,46 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     }
                 }
 
-                // Record risk denial in Prometheus metrics
-                if let QueryState::Denied { ref check, .. } = query.state {
+                // Record risk denial in Prometheus metrics.
+                let denied_check = match &query.state {
+                    QueryState::Denied { check, .. } => Some(check.clone()),
+                    _ => None,
+                };
+                if let Some(check) = denied_check.as_deref() {
                     crate::metrics::RISK_DENIALS.with_label_values(&[check]).inc();
+                }
+
+                let entry_policy = self.entry_policy_for_position(position_id).await;
+                if entry_policy.mode == EntryPolicy::Immediate
+                    && denied_check.as_deref() == Some("insufficient_margin")
+                {
+                    info!(
+                        %position_id,
+                        query_id = %query.id,
+                        "Immediate entry denied by margin policy - cancelling Armed position"
+                    );
+                    self.invalidate_pending_approvals_for_position(
+                        position_id,
+                        "immediate entry denied by insufficient margin",
+                    )
+                    .await;
+                    self.kill_detector(position_id).await;
+                    self.execute_and_persist(vec![EngineAction::EmitEvent(
+                        Event::PositionDisarmed {
+                            position_id,
+                            reason: "risk_denied_insufficient_margin".to_string(),
+                            timestamp: chrono::Utc::now(),
+                        },
+                    )])
+                    .await?;
+                    self.event_bus.send(DaemonEvent::PositionStateChanged {
+                        position_id,
+                        previous_state: "Armed".to_string(),
+                        new_state: "Cancelled".to_string(),
+                        timestamp: chrono::Utc::now(),
+                    });
+                    self.entry_policies.write().await.remove(&position_id);
+                    return Ok(());
                 }
 
                 // Re-arm the detector so the Armed position can receive future signals.
@@ -4678,6 +4715,57 @@ mod tests {
         );
         let events = manager.store.events().find_by_position(position.id).await.unwrap();
         assert!(events.iter().any(|event| matches!(event, Event::EntrySignalReceived { .. })));
+    }
+
+    #[tokio::test(flavor = "current_thread")]
+    async fn test_arm_immediate_insufficient_margin_cancels_without_rearming() {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+
+        let manager = create_test_manager().await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let arm_policy =
+            EntryPolicyConfig::new(EntryPolicy::ConfirmedTrend, DomainApprovalPolicy::Automatic);
+        let immediate_policy =
+            EntryPolicyConfig::new(EntryPolicy::Immediate, DomainApprovalPolicy::Automatic);
+
+        let position = manager
+            .arm_position_with_policy(
+                symbol.clone(),
+                Side::Long,
+                RiskConfig::new(dec!(100)).unwrap(),
+                None,
+                Uuid::now_v7(),
+                arm_policy,
+            )
+            .await
+            .unwrap();
+        manager.entry_policies.write().await.insert(position.id, immediate_policy);
+
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol,
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(94700)).unwrap(),
+            technical_stop_analysis: None,
+            timestamp: chrono::Utc::now(),
+        };
+
+        manager.handle_signal(signal).await.unwrap();
+
+        let position = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(
+            matches!(position.state, PositionState::Cancelled),
+            "Immediate insufficient-margin denial must cancel, got {:?}",
+            position.state
+        );
+
+        let detectors = manager.detectors.read().await;
+        assert!(
+            !detectors.contains_key(&position.id),
+            "Immediate insufficient-margin denial must not re-arm detector"
+        );
     }
 
     #[tokio::test(flavor = "current_thread")]
