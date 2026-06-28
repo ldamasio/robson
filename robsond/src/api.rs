@@ -108,6 +108,10 @@ pub struct StatusResponse {
     pub active_positions: usize,
     pub positions: Vec<PositionSummary>,
     pub pending_approvals: Vec<PendingApprovalSummary>,
+    /// Open book positions that are missing on the exchange and need
+    /// reconciliation.
+    pub stale_active_count: usize,
+    pub reconciliation_blockers: Vec<ReconciliationBlockerSummary>,
     /// Slots available for new entries under the current monthly risk budget.
     pub new_slots_available: u32,
     /// Slots currently occupied by open core positions.
@@ -162,6 +166,15 @@ pub struct PositionSummary {
     pub pnl: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub variation_pct: Option<Decimal>,
+}
+
+/// Reconciliation blocker surfaced by `/status`.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ReconciliationBlockerSummary {
+    pub position_id: Uuid,
+    pub symbol: String,
+    pub side: String,
+    pub reason: String,
 }
 
 /// Summary of a pending approval query for REST bootstrap.
@@ -1160,14 +1173,28 @@ where
             .await,
         );
     }
+    let reconciliation_blockers: Vec<ReconciliationBlockerSummary> = summaries
+        .iter()
+        .filter(|summary| {
+            summary.exchange_sync_state.as_deref() == Some("stale_missing_on_exchange")
+        })
+        .map(|summary| ReconciliationBlockerSummary {
+            position_id: summary.id,
+            symbol: summary.symbol.clone(),
+            side: summary.side.clone(),
+            reason: "stale_missing_on_exchange".to_string(),
+        })
+        .collect();
+    let stale_active_count = reconciliation_blockers.len();
+
     summaries.retain(|summary| {
         summary.exchange_sync_state.as_deref() != Some("stale_missing_on_exchange")
     });
     let occupied_slots = summaries.len();
     let slot_cells_total = occupied_slots.saturating_add(new_slots_available as usize);
 
-    // Update active positions gauge
     crate::metrics::ACTIVE_POSITIONS.set(summaries.len() as f64);
+    crate::metrics::STALE_ACTIVE_POSITIONS.set(stale_active_count as f64);
     let pending_summaries: Vec<PendingApprovalSummary> = pending_approvals
         .into_iter()
         .filter_map(|query| {
@@ -1186,6 +1213,8 @@ where
         active_positions: summaries.len(),
         positions: summaries,
         pending_approvals: pending_summaries,
+        stale_active_count,
+        reconciliation_blockers,
         new_slots_available,
         occupied_slots,
         slot_cells_total,
@@ -2963,6 +2992,8 @@ mod tests {
         // not subtracted from the live slot count.
         assert_eq!(status.new_slots_available, 4);
         assert_eq!(status.slot_cells_total, 5);
+        assert_eq!(status.stale_active_count, 0);
+        assert!(status.reconciliation_blockers.is_empty());
         assert_eq!(status.pending_approvals.len(), 1);
         assert_eq!(status.pending_approvals[0].query_id, query_id);
         assert_eq!(status.pending_approvals[0].position_id, Some(position.id));
@@ -2986,6 +3017,10 @@ mod tests {
         let status: StatusResponse = serde_json::from_slice(&body).unwrap();
         assert_eq!(status.active_positions, 0);
         assert!(status.positions.is_empty());
+        assert_eq!(status.stale_active_count, 1);
+        assert_eq!(status.reconciliation_blockers.len(), 1);
+        assert_eq!(status.reconciliation_blockers[0].symbol, "BTCUSDT");
+        assert_eq!(status.reconciliation_blockers[0].reason, "stale_missing_on_exchange");
         assert_eq!(status.occupied_slots, 0);
         assert_eq!(status.new_slots_available, 4);
         assert_eq!(status.slot_cells_total, 4);

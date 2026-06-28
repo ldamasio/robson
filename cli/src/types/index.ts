@@ -104,6 +104,16 @@ export interface ArmResponse {
 export interface StatusResponse {
   active_positions: number;
   positions: PositionSummary[];
+  pending_approvals?: unknown[];
+  stale_active_count?: number;
+  reconciliation_blockers?: ReconciliationBlockerSummary[];
+}
+
+export interface ReconciliationBlockerSummary {
+  position_id: string;
+  symbol: string;
+  side: string;
+  reason: string;
 }
 
 /**

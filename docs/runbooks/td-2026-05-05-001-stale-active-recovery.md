@@ -50,9 +50,20 @@ This runbook fires when ONE of the following is true:
 
 1. **Daemon refused to start** with the message `Startup aborted: N stale-active position(s) detected`. Exit code 78 (`EX_CONFIG`). Logged at `CRITICAL`. *(Live since Slice 5A.)*
 2. **Steady-state alert** `position_reconciliation_estimated_evidence_required` fired (Slice 4+ alerting layer): the runtime reconciliation worker confirmed drift but only `Estimated` evidence is available, so the close was deferred for operator confirmation.
-3. **Operator-initiated** verification: `/status` shows an `Active` position whose `(symbol, side)` is not present in `binance-cli futures positions` or the Binance Futures web UI for the operated account.
+3. **Operator-initiated** verification: `/status` reports `stale_active_count > 0` or a non-empty `reconciliation_blockers[]` list. The affected position may be omitted from `positions[]` so operators do not count it as live capacity, but it remains a blocker until reconciled.
 
 If the trigger is anything else (UNTRACKED on the exchange, DivergentQuantity, MonthlyHalt, panic close failed, etc.), this is the **wrong runbook**. See [val-002-real-capital-activation.md](val-002-real-capital-activation.md) §Safety Checks for the index of safety paths.
+
+### Projection-only orphan path
+
+If the affected `position_id` exists only in `positions_current` and has no row
+in canonical `positions`, no related `orders`, and no lifecycle `events`, do not
+run `reconcile-close`: there is no honest exchange-grade close evidence to
+attach. Treat it as a projection repair. The permitted write is deleting that
+single `positions_current` row inside a transaction after rechecking the three
+negative predicates in the same statement. Record the operator, timestamp, and
+SQL output in the incident log.
+
 
 ---
 

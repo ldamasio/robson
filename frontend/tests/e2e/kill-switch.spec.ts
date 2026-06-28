@@ -5,6 +5,8 @@ const MOCK_STATUS = {
   active_positions: 2,
   positions: MOCK_POSITIONS,
   pending_approvals: [],
+  stale_active_count: 0,
+  reconciliation_blockers: [],
   occupied_slots: 2,
   new_slots_available: 2,
   slot_cells_total: 4,

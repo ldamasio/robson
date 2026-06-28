@@ -134,6 +134,7 @@ Cross-check each exchange order id against `event_log` `entry_order_placed`:
 **Expected Output**:
 ```text
 /status reports active_positions = 0.
+/status reports stale_active_count = 0 and reconciliation_blockers = [].
 The positions_current query returns 0 rows.
 Zero UNTRACKED positions on the Binance production account.
 ```
@@ -179,7 +180,7 @@ Verify the activation succeeded:
 - [ ] `pass show rbx/robson/binance-api-key` and `pass show rbx/robson/binance-api-secret` both exit 0.
 - [ ] Ansible secret refresh completed successfully from `rbx-infra/bootstrap/ansible/`.
 - [ ] Production daemon logs indicate `api.binance.com`, not `testnet.binance.vision`.
-- [ ] Safety checks before flip showed `active_positions = 0` and no open rows in `positions_current`.
+- [ ] Safety checks before flip showed `active_positions = 0`, `stale_active_count = 0`, empty `reconciliation_blockers`, and no open rows in `positions_current`.
 - [ ] **Zero UNTRACKED positions on the production Binance account** (ADR-0022): every open exchange position across all account types and all symbols has a matching `entry_order_placed` event, OR the account is empty.
 - [ ] ArgoCD `robson-prod` is `Synced Healthy`.
 - [ ] Production ConfigMap has `ROBSON_POSITION_MONITOR_ENABLED: "true"`.

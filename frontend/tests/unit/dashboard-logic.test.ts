@@ -204,6 +204,8 @@ describe("dashboard slot derivation from status response", () => {
       active_positions: 3,
       positions,
       pending_approvals: [],
+      stale_active_count: 0,
+      reconciliation_blockers: [],
       occupied_slots: 3,
       new_slots_available: 4,
       slot_cells_total: 7,
