@@ -37,8 +37,8 @@ This decision fundamentally shapes:
 - Set entry and stop levels
 
 **Robson's responsibilities**:
-- Calculate position size (1% risk rule)
-- Validate risk limits (drawdown, exposure)
+- Calculate position size (1% loss cap)
+- Validate risk limits (drawdown, margin)
 - Monitor stops 24/7
 - Execute stops automatically (safety)
 - Track performance per strategy

@@ -88,7 +88,7 @@ Position Value = 0.0667 × $95,000 = $6,333.33
          ▼
 3. ROBSON calculates position size
    - Uses technical stop distance
-   - Applies 1% risk rule
+   - Applies 1% loss cap
    - Returns safe quantity
          │
          ▼

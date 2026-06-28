@@ -43,7 +43,7 @@ variables, operator API, or any runtime mechanism.
 
 | Policy | Value | Rationale |
 |--------|-------|-----------|
-| risk_per_trade_pct | 1% | Golden Rule anchor: position is sized so that 1 span of loss = 1% of capital |
+| risk_per_trade_pct | 1% max | Golden Rule cap: position is sized so stop loss never exceeds 1% of capital; margin may reduce realized risk below the cap |
 | max_monthly_drawdown_pct | 4% | 4 consecutive losses × 1% = 4%; after 4 errors in a month the user is blocked |
 
 ### 3. Technical Stop Configuration (Configurable)
@@ -66,9 +66,11 @@ eliminated as independent configuration parameters.
 
 The single-position physical bound is margin availability at fixed 1x leverage: the
 stop-derived notional must fit available capital before exchange submission. Position
-sizing via the Golden Rule still targets 1% technical-stop risk, but tight stops may
-produce a notional larger than available capital; those trades are policy-invalid and
-must be rejected or resized by an explicit future policy, never made viable by leverage.
+sizing via the Golden Rule uses 1% as a maximum loss cap; tight stops may produce a
+risk-sized quantity that exceeds available capital, so the final quantity is capped by
+margin and the realized risk may be below 1%. If a trade still cannot fit after capping
+and exchange filters, it is policy-invalid and must be rejected, never made viable by
+leverage.
 
 The duplicate-position guard (no same symbol+side) is preserved as an operational
 constraint, not a risk limit.

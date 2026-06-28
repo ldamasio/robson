@@ -775,8 +775,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         let carried_risk_committed = Self::calculate_carried_risk(&open_positions);
 
         // Armed positions have no measurable committed risk yet, but each will
-        // risk exactly 1% of capital when triggered. Use the previous month's
-        // capital_base to avoid a circular month-boundary calculation.
+        // be sized so the stop loss stays at or below 1% of capital when triggered.
+        // Use the previous month's capital_base to avoid a circular month-boundary
+        // calculation.
         let (prev_year, prev_month_num) = if now.month() == 1 {
             (now.year() - 1, 12u32)
         } else {

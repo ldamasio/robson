@@ -538,18 +538,20 @@ Position Size = Max Risk Amount / Tech Stop Distance
 ```rust
 pub fn calculate_position_size(
     risk_config: &RiskConfig,
+    entry_price: &Price,
     tech_stop: &TechnicalStopDistance,
 ) -> Result<Quantity, DomainError> {
     // 1. Validate tech stop
     tech_stop.validate()?;
 
-    // 2. Calculate max risk amount
+    // 2. Calculate max risk amount and 1x margin cap
     let max_risk = risk_config.max_risk_amount();
+    let risk_sized_qty = max_risk / tech_stop.distance();
+    let margin_sized_qty =
+        (risk_config.capital() * Decimal::from(RiskConfig::LEVERAGE)) / entry_price.as_decimal();
+    let size = risk_sized_qty.min(margin_sized_qty);
 
-    // 3. Calculate position size
-    let size = max_risk / tech_stop.distance();
-
-    // 4. Validate minimum
+    // 3. Validate minimum
     if size < Decimal::from_str("0.00001")? {
         return Err(DomainError::PositionSizingError("Size too small"));
     }

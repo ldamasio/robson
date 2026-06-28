@@ -77,9 +77,9 @@ When user says: *"I want to buy BTC with 2% stop-loss using Mean Reversion strat
 - Strategy context: Mean Reversion
 
 **Robson calculates** (the intelligence):
-- Maximum position size that risks exactly 1% of capital
+- Maximum position size that keeps loss at or below the 1% cap
 - Order quantity with proper precision
-- Validates against total exposure limits
+- Validates against available margin and monthly drawdown
 - Confirms monthly drawdown is within 4% limit
 
 **Example**:
@@ -105,8 +105,8 @@ Robson Calculates:
 
 ### What Robson Does
 
-1. **Calculates** optimal position size (1% risk rule)
-2. **Validates** against risk limits (drawdown, exposure)
+1. **Calculates** optimal position size (1% loss cap)
+2. **Validates** against risk limits (drawdown, margin)
 3. **Monitors** stops automatically (24/7 monitoring)
 4. **Executes** stops when triggered (safety automation)
 5. **Tracks** performance per strategy (analytics)
@@ -283,7 +283,7 @@ strategy.config = {
    - Entry: $90,000 (current price)
    - Stop: $88,200 (technical support level - user's analysis)
 4. **Robson calculates**:
-   - Quantity: 0.00555556 BTC (1% risk)
+   - Quantity: 0.00555556 BTC (1% cap)
    - Position value: $500
    - Risk amount: $10
 5. User reviews calculation, confirms

@@ -318,7 +318,7 @@ assert preview_quantity == persisted_quantity
 
 ### Related Documents
 
-- [Position Sizing Golden Rule](POSITION-SIZING-GOLDEN-RULE.md) - 1% risk rule
+- [Position Sizing Golden Rule](POSITION-SIZING-GOLDEN-RULE.md) - 1% loss cap
 - [Strategy Semantic Clarity](STRATEGY-SEMANTIC-CLARITY.md) - User-driven strategy selection
 - [Technical Stop Requirements](technical-stop-requirements.md) - Stop-loss derivation
 
