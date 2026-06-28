@@ -52,6 +52,7 @@ describe('positionSummaryLines', () => {
     expect(lines[0]).toContain('ARMED');
     expect(lines[0]).toContain('awaiting entry signal');
     expect(lines[1]).toContain('LEVERAGE');
+    expect(lines[1]).toContain('1x (fixed)');
   });
 
   it('Active state with trailing stop', () => {
