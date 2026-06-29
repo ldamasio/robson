@@ -9,7 +9,11 @@
 //! - Safety net (rogue position monitoring)
 //! - SSE events for operator-facing runtime updates
 
-use std::{convert::Infallible, sync::Arc, time::Duration};
+use std::{
+    convert::Infallible,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_stream::stream;
 use axum::{
@@ -34,7 +38,7 @@ use robson_store::find_positions_overlapping_month;
 use robson_store::Store;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
-use tokio::sync::RwLock;
+use tokio::sync::{Mutex, RwLock};
 use tower_http::cors::{AllowOrigin, CorsLayer};
 use tracing::warn;
 use uuid::Uuid;
@@ -61,6 +65,7 @@ pub struct ApiState<E: ExchangePort + 'static, S: Store + 'static> {
     pub event_bus: Arc<EventBus>,
     pub circuit_breaker: Arc<CircuitBreaker>,
     pub position_monitor: Option<Arc<PositionMonitor>>,
+    pub(crate) wallet_balance_cache: Mutex<Option<(Decimal, Instant)>>,
     /// PostgreSQL pool for liveness check. Present only when DATABASE_URL is
     /// configured.
     #[cfg(feature = "postgres")]
@@ -74,6 +79,33 @@ pub struct ApiState<E: ExchangePort + 'static, S: Store + 'static> {
 }
 
 // =============================================================================
+impl<E, S> ApiState<E, S>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    async fn wallet_balance(&self) -> Result<Decimal, DaemonError> {
+        const WALLET_BALANCE_CACHE_TTL: Duration = Duration::from_secs(5);
+
+        let mut cache = self.wallet_balance_cache.lock().await;
+        if let Some((cached_balance, fetched_at)) = *cache {
+            if fetched_at.elapsed() < WALLET_BALANCE_CACHE_TTL {
+                return Ok(cached_balance);
+            }
+        }
+
+        let wallet_balance = self
+            .exchange
+            .get_futures_balance()
+            .await
+            .map_err(DaemonError::Exec)?
+            .wallet_balance;
+
+        *cache = Some((wallet_balance, Instant::now()));
+        Ok(wallet_balance)
+    }
+}
+
 // Request/Response Types
 // =============================================================================
 
@@ -1150,12 +1182,7 @@ where
         .governed_monthly_realized_loss(now)
         .await
         .map_err(|e| to_error_response(e))?;
-    let wallet_balance = state
-        .exchange
-        .get_futures_balance()
-        .await
-        .map_err(|e| to_error_response(DaemonError::Exec(e)))?
-        .wallet_balance;
+    let wallet_balance = state.wallet_balance().await.map_err(|e| to_error_response(e))?;
     let monthly_realized_loss_pct = if monthly.capital_base > Decimal::ZERO {
         governed_monthly_realized_loss / monthly.capital_base * Decimal::from(100u32)
     } else {
@@ -2252,21 +2279,221 @@ fn month_start(year: i32, month: u32) -> chrono::DateTime<chrono::Utc> {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc,
+    };
+
+    use async_trait::async_trait;
     use axum::{
         body::Body,
         http::{header::CONTENT_TYPE, Request},
     };
     use http_body_util::BodyExt;
-    use robson_domain::{Quantity, RiskConfig, TechnicalStopDistance, TradingPolicy};
+    use robson_domain::{
+        OrderSide, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance, TradingPolicy,
+    };
     use robson_engine::Engine;
-    use robson_exec::{ExchangePosition, Executor, IntentJournal, StubExchange};
+    use robson_exec::{
+        ExchangePort, ExchangePosition, ExecError, Executor, FuturesBalance, FuturesSettings,
+        IntentJournal, OrderResult, SpotBalance, SpotOrder, SpotOrderRequest, StubExchange,
+        Transfer, TransferId, UniversalTransferType, UserTradeRecord,
+    };
     use robson_store::MemoryStore;
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
     use tokio::time::timeout;
     use tower::ServiceExt;
 
     use super::*;
     use crate::query_engine::TracingQueryRecorder;
+
+    #[derive(Debug)]
+    struct WalletBalanceCacheExchange {
+        calls: Arc<AtomicUsize>,
+        balance: FuturesBalance,
+    }
+
+    impl WalletBalanceCacheExchange {
+        fn new(wallet_balance: Decimal) -> (Arc<Self>, Arc<AtomicUsize>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let exchange = Arc::new(Self {
+                calls: Arc::clone(&calls),
+                balance: FuturesBalance {
+                    wallet_balance,
+                    available_balance: wallet_balance,
+                },
+            });
+            (exchange, calls)
+        }
+    }
+
+    #[async_trait]
+    impl ExchangePort for WalletBalanceCacheExchange {
+        async fn validate_futures_settings(
+            &self,
+            _symbol: &Symbol,
+            _expected_leverage: u8,
+        ) -> Result<FuturesSettings, ExecError> {
+            Err(ExecError::Timeout("unused".to_string()))
+        }
+
+        async fn place_market_order(
+            &self,
+            _symbol: &Symbol,
+            _side: OrderSide,
+            _quantity: Quantity,
+            _client_order_id: &str,
+            _reduce_only: bool,
+        ) -> Result<OrderResult, ExecError> {
+            Err(ExecError::Timeout("unused".to_string()))
+        }
+
+        async fn cancel_order(&self, _symbol: &Symbol, _order_id: &str) -> Result<(), ExecError> {
+            Err(ExecError::Timeout("unused".to_string()))
+        }
+
+        async fn get_price(&self, _symbol: &Symbol) -> Result<Price, ExecError> {
+            Err(ExecError::Timeout("unused".to_string()))
+        }
+
+        async fn health_check(&self) -> Result<(), ExecError> {
+            Ok(())
+        }
+
+        async fn get_futures_balance(&self) -> Result<FuturesBalance, ExecError> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            Ok(self.balance.clone())
+        }
+
+        async fn get_spot_account_balances(&self) -> Result<Vec<SpotBalance>, ExecError> {
+            Ok(vec![])
+        }
+
+        async fn get_spot_price(&self, _symbol: &str) -> Result<Price, ExecError> {
+            Err(ExecError::Timeout("unused".to_string()))
+        }
+
+        async fn place_spot_market_order(
+            &self,
+            _request: SpotOrderRequest,
+        ) -> Result<SpotOrder, ExecError> {
+            Err(ExecError::Timeout("unused".to_string()))
+        }
+
+        async fn get_spot_order(
+            &self,
+            _symbol: &str,
+            _client_order_id: &str,
+        ) -> Result<Option<SpotOrder>, ExecError> {
+            Ok(None)
+        }
+
+        async fn universal_transfer(
+            &self,
+            _asset: &str,
+            _amount: Decimal,
+            _transfer_type: UniversalTransferType,
+            _client_tran_key: &str,
+        ) -> Result<TransferId, ExecError> {
+            Err(ExecError::Timeout("unused".to_string()))
+        }
+
+        async fn get_transfer_history(
+            &self,
+            _transfer_type: UniversalTransferType,
+            _start_time: chrono::DateTime<chrono::Utc>,
+        ) -> Result<Vec<Transfer>, ExecError> {
+            Ok(vec![])
+        }
+
+        async fn get_all_open_positions(&self) -> Result<Vec<ExchangePosition>, ExecError> {
+            Ok(vec![])
+        }
+
+        async fn close_position_market(
+            &self,
+            _symbol: &Symbol,
+            _side: Side,
+            _quantity: Quantity,
+            _client_order_id: &str,
+        ) -> Result<OrderResult, ExecError> {
+            Err(ExecError::Timeout("unused".to_string()))
+        }
+
+        async fn get_order_by_exchange_id(
+            &self,
+            _symbol: &Symbol,
+            _order_id: &str,
+        ) -> Result<Option<OrderResult>, ExecError> {
+            Ok(None)
+        }
+
+        async fn get_user_trades_since(
+            &self,
+            _symbol: &Symbol,
+            _since: chrono::DateTime<chrono::Utc>,
+            _limit: u16,
+        ) -> Result<Vec<UserTradeRecord>, ExecError> {
+            Ok(vec![])
+        }
+    }
+
+    async fn wallet_cache_test_state(
+        exchange: Arc<WalletBalanceCacheExchange>,
+    ) -> Arc<ApiState<WalletBalanceCacheExchange, MemoryStore>> {
+        let journal = Arc::new(IntentJournal::new());
+        let store = Arc::new(MemoryStore::new());
+        let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
+        let event_bus = Arc::new(crate::event_bus::EventBus::new(8));
+        let risk_config = RiskConfig::new(dec!(10000)).unwrap();
+        let engine = Engine::new(risk_config);
+        let manager = PositionManager::new(
+            engine,
+            executor,
+            store,
+            Arc::clone(&event_bus),
+            Arc::new(TracingQueryRecorder),
+            TradingPolicy::default(),
+        );
+        let position_manager = Arc::new(RwLock::new(manager));
+        let circuit_breaker = position_manager.read().await.circuit_breaker();
+
+        Arc::new(ApiState {
+            exchange,
+            position_manager,
+            event_bus,
+            circuit_breaker,
+            position_monitor: None,
+            wallet_balance_cache: Mutex::new(None),
+            #[cfg(feature = "postgres")]
+            pg_pool: None,
+            #[cfg(feature = "postgres")]
+            tenant_id: None,
+            api_token: None,
+            funding: FundingConfig::default(),
+        })
+    }
+
+    #[tokio::test]
+    async fn wallet_balance_cache_reuses_value_within_ttl() {
+        let (exchange, calls) = WalletBalanceCacheExchange::new(dec!(351.92));
+        let state = wallet_cache_test_state(exchange).await;
+
+        let first = state.wallet_balance().await.unwrap();
+        let second = state.wallet_balance().await.unwrap();
+
+        assert_eq!(first, dec!(351.92));
+        assert_eq!(second, dec!(351.92));
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+
+        *state.wallet_balance_cache.lock().await =
+            Some((dec!(111.11), Instant::now() - Duration::from_secs(6)));
+
+        let third = state.wallet_balance().await.unwrap();
+        assert_eq!(third, dec!(351.92));
+        assert_eq!(calls.load(Ordering::SeqCst), 2);
+    }
 
     #[test]
     fn position_summary_uses_live_price_for_active_variation_pct_before_stop() {
@@ -2593,6 +2820,7 @@ mod tests {
             event_bus: Arc::clone(&event_bus),
             circuit_breaker,
             position_monitor: None,
+            wallet_balance_cache: Mutex::new(None),
             #[cfg(feature = "postgres")]
             pg_pool: None,
             #[cfg(feature = "postgres")]
@@ -3467,6 +3695,7 @@ mod tests {
                 event_bus: Arc::clone(&event_bus),
                 circuit_breaker,
                 position_monitor: None,
+                wallet_balance_cache: Mutex::new(None),
                 #[cfg(feature = "postgres")]
                 pg_pool: None,
                 #[cfg(feature = "postgres")]

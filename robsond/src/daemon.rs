@@ -1413,6 +1413,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             event_bus: self.event_bus.clone(),
             circuit_breaker,
             position_monitor,
+            wallet_balance_cache: tokio::sync::Mutex::new(None),
             #[cfg(feature = "postgres")]
             pg_pool: self.pg_pool.clone(),
             #[cfg(feature = "postgres")]
