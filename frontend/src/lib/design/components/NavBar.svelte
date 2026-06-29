@@ -1,11 +1,10 @@
 <script lang="ts">
   import { page } from '$app/stores';
-  import { status, startStatusPolling, stopStatusPolling } from '$stores/status';
+  import { status, refreshStatus } from '$stores/status';
   import Row from './Row.svelte';
 
   $effect(() => {
-    startStatusPolling();
-    return () => stopStatusPolling();
+    void refreshStatus().catch(() => {});
   });
 
   let currentPath = $derived($page.url.pathname);

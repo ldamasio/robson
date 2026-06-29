@@ -47,6 +47,7 @@
   let currentStatus = $derived($sharedStatus);
   let approvalTick = $state(Date.now());
   let approvalTickTimer: ReturnType<typeof setInterval> | null = null;
+  let sseRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
   let currentMonth = $derived(currentMonthKey());
   let monthOps = $derived(sortPositionsOldestFirst(monthlyPositions));
@@ -228,6 +229,14 @@
     await Promise.all([loadStatus(), loadHistory()]);
   }
 
+  function scheduleRefresh(): void {
+    if (sseRefreshTimer) clearTimeout(sseRefreshTimer);
+    sseRefreshTimer = setTimeout(() => {
+      sseRefreshTimer = null;
+      void Promise.all([refreshStatus().catch(() => {}), loadHistory().catch(() => {})]);
+    }, 1_500);
+  }
+
   function startSse() {
     stopSse();
     closeSse = connectEventStream(
@@ -236,14 +245,18 @@
         const payload = event.payload as Record<string, unknown>;
         const posId = payload.position_id as string | undefined;
         if (posId && event.event_type === "position.changed") {
-          void Promise.all([
-            refreshStatus().catch(() => {}),
-            loadHistory().catch(() => {}),
-          ]);
+          scheduleRefresh();
+        }
+        if (event.event_type.startsWith("query.")) {
+          scheduleRefresh();
         }
       },
       () => {
         connected = false;
+      },
+      () => {
+        connected = true;
+        void loadStatus();
       },
     );
   }
@@ -252,6 +265,10 @@
     if (closeSse) {
       closeSse();
       closeSse = null;
+    }
+    if (sseRefreshTimer) {
+      clearTimeout(sseRefreshTimer);
+      sseRefreshTimer = null;
     }
   }
 
