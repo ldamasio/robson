@@ -22,6 +22,7 @@
   let events = $state<TaggedEvent[]>([]);
   let seq = $state(0);
   let closeSse: (() => void) | null = null;
+  const MAX_OP_EVENTS = 500;
 
   let summaryLines = $derived(position ? positionSummaryLines(position) : []);
   let metaLine = $derived(position ? positionMetaLine(position) : '');
@@ -42,7 +43,10 @@
       const payload = event.payload as Record<string, unknown>;
       if (payload.position_id === operationId) {
         seq += 1;
-        events = [...events, { ...event, _seq: seq }];
+        const tagged: TaggedEvent = { ...event, _seq: seq };
+        events = events.length >= MAX_OP_EVENTS
+          ? [...events.slice(-(MAX_OP_EVENTS - 1)), tagged]
+          : [...events, tagged];
       }
     });
   }

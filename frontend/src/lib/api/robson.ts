@@ -371,6 +371,7 @@ export class ApiError extends Error {
 export function connectEventStream(
   onEvent: (event: SseEvent) => void,
   onError?: (err: Event) => void,
+  onReconnect?: () => void,
 ): () => void {
   if (!browser) return () => {};
 
@@ -384,7 +385,7 @@ export function connectEventStream(
     }
   ).__RBX_EVENT_SOURCE_FACTORY__;
 
-  const source = factory ? factory(url) : new FetchEventSource(url, token);
+  const source = factory ? factory(url) : new FetchEventSource(url, token, onReconnect);
 
   source.onmessage = (msg) => {
     try {
@@ -400,20 +401,38 @@ export function connectEventStream(
   return () => source.close();
 }
 
-/** Fetch-based SSE client — sends Bearer token via header, not query param. */
-class FetchEventSource implements EventSourceLike {
+/** Fetch-based SSE client — sends Bearer token via header, not query param.
+ *  Reconnects automatically with exponential backoff on any disconnect. */
+export class FetchEventSource implements EventSourceLike {
   onmessage: ((this: EventSource, ev: MessageEvent) => unknown) | null = null;
   onerror: ((this: EventSource, ev: Event) => unknown) | null = null;
 
   private controller = new AbortController();
+  private retries = 0;
+  private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  private static readonly MAX_RECONNECT_MS = 30_000;
 
-  constructor(url: string, token: string | null) {
+  constructor(
+    url: string,
+    token: string | null,
+    private readonly onReconnect?: () => void,
+  ) {
     this.connect(url, token);
   }
 
+  private scheduleReconnect(url: string, token: string | null): void {
+    if (this.controller.signal.aborted) return;
+    const delay = Math.min(1_000 * 2 ** this.retries, FetchEventSource.MAX_RECONNECT_MS);
+    this.retries++;
+    this.reconnectTimer = setTimeout(() => {
+      this.reconnectTimer = null;
+      if (!this.controller.signal.aborted) this.connect(url, token);
+    }, delay);
+  }
+
   private async connect(url: string, token: string | null): Promise<void> {
-    const headers: Record<string, string> = { Accept: "text/event-stream" };
-    if (token) headers["Authorization"] = `Bearer ${token}`;
+    const headers: Record<string, string> = { Accept: `text/event-stream` };
+    if (token) headers[`Authorization`] = `Bearer ${token}`;
 
     try {
       const res = await fetch(url, {
@@ -421,23 +440,29 @@ class FetchEventSource implements EventSourceLike {
         signal: this.controller.signal,
       });
       if (!res.ok || !res.body) {
-        this.onerror?.call({} as EventSource, new Event("error"));
+        this.onerror?.call({} as EventSource, new Event(`error`));
+        this.scheduleReconnect(url, token);
         return;
       }
 
       const reader = res.body.getReader();
+      if (this.retries > 0) this.onReconnect?.();
+      this.retries = 0; // reset backoff on successful stream start
       const decoder = new TextDecoder();
-      let buf = "";
+      let buf = ``;
 
       while (true) {
         const { done, value } = await reader.read();
-        if (done) break;
+        if (done) {
+          this.scheduleReconnect(url, token);
+          break;
+        }
 
         buf += decoder.decode(value, { stream: true });
 
         // SSE events are separated by blank lines (\n\n)
         let boundary: number;
-        while ((boundary = buf.indexOf("\n\n")) !== -1) {
+        while ((boundary = buf.indexOf(`\n\n`)) !== -1) {
           const raw = buf.slice(0, boundary);
           buf = buf.slice(boundary + 2);
           this.dispatchSseEvent(raw);
@@ -445,27 +470,33 @@ class FetchEventSource implements EventSourceLike {
       }
     } catch (err) {
       if ((err as DOMException)?.name === "AbortError") return;
-      this.onerror?.call({} as EventSource, new Event("error"));
+      this.onerror?.call({} as EventSource, new Event(`error`));
+      this.scheduleReconnect(url, token);
     }
   }
 
   /** Parse a single SSE text block and emit onmessage for data lines. */
   private dispatchSseEvent(text: string): void {
-    let data = "";
-    for (const line of text.split("\n")) {
-      if (line.startsWith(":")) continue; // comment / heartbeat
-      if (line.startsWith("data:")) {
+    let data = ``;
+    for (const line of text.split(`
+`)) {
+      if (line.startsWith(`：`)) continue; // comment / heartbeat
+      if (line.startsWith(`data:`)) {
         data += line.slice(5);
       }
     }
     if (!data) return;
     this.onmessage?.call(
       {} as EventSource,
-      new MessageEvent("message", { data }),
+      new MessageEvent(`message`, { data }),
     );
   }
 
   close(): void {
+    if (this.reconnectTimer) {
+      clearTimeout(this.reconnectTimer);
+      this.reconnectTimer = null;
+    }
     this.controller.abort();
   }
 }

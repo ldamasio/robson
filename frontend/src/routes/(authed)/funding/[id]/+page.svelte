@@ -10,7 +10,7 @@
   // Decimal strings from the backend; format for display only.
   const fmtUsdt = (v: string | number): string => Number(v).toFixed(2);
 
-  const POLL_INTERVAL_MS = 2_000;
+  const POLL_INTERVAL_MS = 5_000;
   const TERMINAL_STATES = new Set(['REFRESHED', 'FAILED']);
 
   let sagaId = $derived($page.params.id ?? '');
