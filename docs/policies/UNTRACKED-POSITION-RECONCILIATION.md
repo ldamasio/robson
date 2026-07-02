@@ -331,6 +331,17 @@ The runtime MUST enforce I1/I2 with at least the following mechanisms:
    risk gate (closing is always permitted) but does emit full audit events.
 4. **Alerting** (follow-up required): `position_untracked_detected` triggers a
    `CRITICAL` alert to the operator channel with the close outcome.
+5. **Orphan insurance-order sweep (ADR-0039)**: every active position carries a
+   reduce-only `STOP_MARKET` protective order on the exchange, placed by
+   `robsond` under a `GovernedAction` with a client order id carrying the
+   `ins-` prefix. The reconciliation worker queries open orders per scanned
+   symbol and cancels any `ins-` reduce-only order whose exchange order id does
+   not match a tracked-open `Active` position's `insurance_stop_id` — i.e. an
+   orphan left behind by a manual/external close, a replace race, or a position
+   since reconciled away. This keeps the operated account free of lingering
+   robsond-authored protective orders. Cancel errors are tolerated (logged, scan
+   continues); each cancellation emits an `InsuranceStopOrphanCancelled` audit
+   event. See [ADR-0039](../adr/ADR-0039-exchange-side-insurance-stop.md).
 
 ---
 
@@ -469,6 +480,7 @@ the reconciliation close is non-overridable.
 | 1.0 | 2026-04-18 | Initial policy creation | Engineering Team |
 | 1.1 | 2026-05-08 | Added §I3 — Reverse Reconciliation Invariant (TD-2026-05-05-001). | Claude Opus 4.7 |
 | 1.2 | 2026-05-11 | Added §I3 §E — startup policy and operational status. Reflects Slices 5A/5B1 live, 5B2A merged (refactor), 5B2B planned. | Claude Sonnet 4.6 |
+| 1.3 | 2026-07-02 | Added orphan insurance-order sweep to Enforcement (ADR-0039). | Claude (glm-5.2) |
 
 ---
 

@@ -1386,7 +1386,14 @@ where
             }),
         )
     })?;
-    let risk_config = RiskConfig::new(capital).map_err(|e| {
+    // Rebuild from the engine snapshot so the operator-configured
+    // execution-cost parameters survive the capital swap (ADR-0039).
+    let risk_config = {
+        let manager = state.position_manager.read().await;
+        manager.risk_config_snapshot()
+    }
+    .with_capital(capital)
+    .map_err(|e| {
         (
             StatusCode::INTERNAL_SERVER_ERROR,
             Json(ErrorResponse {
@@ -2296,8 +2303,8 @@ mod tests {
     use robson_engine::Engine;
     use robson_exec::{
         ExchangePort, ExchangePosition, ExecError, Executor, FuturesBalance, FuturesSettings,
-        IntentJournal, OrderResult, SpotBalance, SpotOrder, SpotOrderRequest, StubExchange,
-        Transfer, TransferId, UniversalTransferType, UserTradeRecord,
+        IntentJournal, OpenOrderRecord, OrderResult, SpotBalance, SpotOrder, SpotOrderRequest,
+        StubExchange, Transfer, TransferId, UniversalTransferType, UserTradeRecord,
     };
     use robson_store::MemoryStore;
     use rust_decimal::Decimal;
@@ -2362,6 +2369,13 @@ mod tests {
 
         async fn cancel_order(&self, _symbol: &Symbol, _order_id: &str) -> Result<(), ExecError> {
             Err(ExecError::Timeout("unused".to_string()))
+        }
+
+        async fn get_open_orders(
+            &self,
+            _symbol: &Symbol,
+        ) -> Result<Vec<OpenOrderRecord>, ExecError> {
+            Ok(vec![])
         }
 
         async fn get_price(&self, _symbol: &Symbol) -> Result<Price, ExecError> {

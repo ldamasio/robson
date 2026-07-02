@@ -18,7 +18,7 @@ use robson_connectors::{BinanceRestClient, BinanceRestError};
 use robson_domain::{OrderSide, Price, Quantity, Side, Symbol};
 use robson_exec::{
     ports::{
-        ExchangePosition, FuturesBalance, FuturesSettings, SpotBalance, SpotOrder,
+        ExchangePosition, FuturesBalance, FuturesSettings, OpenOrderRecord, SpotBalance, SpotOrder,
         SpotOrderQuantity, SpotOrderRequest, SpotOrderSide, Transfer, TransferId,
         UniversalTransferType, UserTradeRecord,
     },
@@ -398,6 +398,46 @@ impl ExchangePort for BinanceExchangeAdapter {
             .map_err(Self::map_error)?;
 
         Ok(())
+    }
+
+    async fn get_open_orders(&self, symbol: &Symbol) -> Result<Vec<OpenOrderRecord>, ExecError> {
+        let orders =
+            self.client.get_open_orders(&symbol.as_pair()).await.map_err(Self::map_error)?;
+
+        orders
+            .into_iter()
+            .map(|order| {
+                let side = match order.side.as_str() {
+                    "BUY" => OrderSide::Buy,
+                    "SELL" => OrderSide::Sell,
+                    other => {
+                        return Err(ExecError::Exchange(format!(
+                            "Open order {} has unexpected side '{}'",
+                            order.order_id, other
+                        )));
+                    },
+                };
+
+                // A stop price of 0 means the order is not conditional.
+                let stop_price =
+                    if order.stop_price != Decimal::ZERO {
+                        Some(Price::new(order.stop_price).map_err(|e| {
+                            ExecError::Exchange(format!("Invalid stop price: {}", e))
+                        })?)
+                    } else {
+                        None
+                    };
+
+                Ok(OpenOrderRecord {
+                    exchange_order_id: order.order_id.to_string(),
+                    client_order_id: order.client_order_id,
+                    order_type: order.order_type,
+                    reduce_only: order.reduce_only,
+                    stop_price,
+                    side,
+                })
+            })
+            .collect()
     }
 
     async fn get_price(&self, symbol: &Symbol) -> Result<Price, ExecError> {

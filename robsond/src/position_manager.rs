@@ -197,13 +197,21 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     ///
     /// Called at startup after querying the exchange and whenever the engine's
     /// capital needs to be refreshed. Updates the internal `RiskConfig` while
-    /// preserving the 1% maximum-loss cap.
+    /// preserving the 1% maximum-loss cap and the operator-configured
+    /// execution-cost parameters (ADR-0039).
     pub fn update_engine_capital(&self, capital: Decimal) {
-        use robson_domain::RiskConfig;
-        if let Ok(risk_config) = RiskConfig::new(capital) {
-            let mut engine = self.engine.lock().unwrap();
+        let mut engine = self.engine.lock().unwrap();
+        if let Ok(risk_config) = engine.risk_config().with_capital(capital) {
             engine.update_risk_config(risk_config);
         }
+    }
+
+    /// Snapshot of the engine's current risk configuration.
+    ///
+    /// Use `.with_capital(...)` on the snapshot when sizing against a
+    /// different capital base so execution-cost parameters are preserved.
+    pub(crate) fn risk_config_snapshot(&self) -> robson_domain::RiskConfig {
+        *self.engine.lock().unwrap().risk_config()
     }
 
     /// Compute current equity per ADR-0024 §6:
@@ -3268,6 +3276,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self.engine.lock().unwrap().clone()
     }
 
+    /// Access the exchange port (for startup-recovery insurance-stop checks).
+    ///
+    /// Recovery needs to query whether the protective stop filled or is still
+    /// open during the downtime gap (ADR-0039 mission 2).
+    pub(crate) fn exchange(&self) -> Arc<E> {
+        self.executor.exchange()
+    }
+
     /// Execute engine actions and persist events — recovery variant.
     ///
     /// Identical to `execute_and_persist` but `pub(crate)` so
@@ -6054,8 +6070,12 @@ mod tests {
             updated.state
         );
 
-        // With capital=20000: qty = 200 / (95000 * 0.08) = 200/7600
-        let expected_qty = dec!(200) / dec!(7600);
+        // With capital=20000 and the execution-cost buffer (ADR-0039):
+        // worst loss per unit = 7600 distance
+        //                     + 87.40 gap allowance (10 bps of stop 87400)
+        //                     + 95 round-trip fees (0.05% × (95000 + 95000))
+        let worst_loss_per_unit = dec!(7600) + dec!(87.4) + dec!(95);
+        let expected_qty = dec!(200) / worst_loss_per_unit;
         assert_eq!(
             updated.quantity.as_decimal(),
             expected_qty,
@@ -6063,7 +6083,7 @@ mod tests {
         );
 
         // Verify it's actually different from the default (capital=10000)
-        let default_qty = dec!(100) / dec!(7600);
+        let default_qty = dec!(100) / worst_loss_per_unit;
         assert_ne!(
             updated.quantity.as_decimal(),
             default_qty,

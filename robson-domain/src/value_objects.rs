@@ -379,6 +379,22 @@ impl RiskConfig {
         Ok(self)
     }
 
+    /// Rebuild this config with a new capital, preserving the
+    /// operator-configured execution-cost parameters.
+    ///
+    /// Use this instead of [`Self::new`] whenever capital is refreshed at
+    /// runtime (month boundary, capital refresh, arm-time sizing) so the
+    /// execution-cost buffer survives the rebuild.
+    ///
+    /// # Errors
+    /// Returns `DomainError::InvalidRiskConfig` if capital <= 0
+    pub fn with_capital(&self, capital: Decimal) -> Result<Self, DomainError> {
+        if capital <= Decimal::ZERO {
+            return Err(DomainError::InvalidRiskConfig("Capital must be positive".to_string()));
+        }
+        Ok(Self { capital, ..*self })
+    }
+
     /// Get capital
     pub fn capital(&self) -> Decimal {
         self.capital

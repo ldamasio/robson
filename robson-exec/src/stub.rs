@@ -17,8 +17,8 @@ use crate::{
     error::ExecError,
     ports::{
         CandleInterval, ExchangePort, ExchangePosition, FuturesBalance, FuturesSettings,
-        MarketDataPort, OhlcvPort, OrderResult, PriceUpdate, SpotBalance, SpotOrder,
-        SpotOrderQuantity, SpotOrderRequest, SpotOrderSide, Transfer, TransferId,
+        MarketDataPort, OhlcvPort, OpenOrderRecord, OrderResult, PriceUpdate, SpotBalance,
+        SpotOrder, SpotOrderQuantity, SpotOrderRequest, SpotOrderSide, Transfer, TransferId,
         UniversalTransferType, UserTradeRecord,
     },
 };
@@ -37,6 +37,8 @@ pub struct StubStopOrder {
     pub exchange_order_id: String,
     /// Client order id supplied by the caller
     pub client_order_id: String,
+    /// Trading pair the order protects
+    pub symbol: Symbol,
     /// Close side for the protected position
     pub side: OrderSide,
     /// Protected quantity
@@ -261,6 +263,20 @@ impl StubExchange {
     pub fn has_stop_order(&self, exchange_order_id: &str) -> bool {
         self.stop_orders.read().unwrap().contains_key(exchange_order_id)
     }
+
+    /// Simulate a protective stop order being filled (ADR-0039).
+    ///
+    /// Removes the order from the live set (a filled `STOP_MARKET` is no longer
+    /// open), so `get_open_orders` and `find_stop_order` stop reporting it.
+    /// Returns the recorded order so tests can seed fill evidence against it.
+    pub fn fill_stop_order(&self, exchange_order_id: &str) -> Option<StubStopOrder> {
+        self.stop_orders.write().unwrap().remove(exchange_order_id)
+    }
+
+    /// Snapshot of all currently live protective stop orders (ADR-0039).
+    pub fn stop_orders_snapshot(&self) -> Vec<StubStopOrder> {
+        self.stop_orders.read().unwrap().values().cloned().collect()
+    }
 }
 
 #[async_trait]
@@ -361,6 +377,7 @@ impl ExchangePort for StubExchange {
             .insert(exchange_order_id.clone(), StubStopOrder {
                 exchange_order_id: exchange_order_id.clone(),
                 client_order_id: client_order_id.to_string(),
+                symbol: symbol.clone(),
                 side,
                 quantity,
                 stop_price,
@@ -398,6 +415,33 @@ impl ExchangePort for StubExchange {
         // Stub: just log and return success
         tracing::debug!(order_id, "Stub: order cancelled");
         Ok(())
+    }
+
+    async fn get_open_orders(&self, symbol: &Symbol) -> Result<Vec<OpenOrderRecord>, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated open-orders query failure".to_string()));
+        }
+
+        // Stub only tracks protective STOP_MARKET orders; report the live ones
+        // for the requested symbol.
+        let orders = self
+            .stop_orders
+            .read()
+            .unwrap()
+            .values()
+            .filter(|order| order.symbol.as_pair() == symbol.as_pair())
+            .cloned()
+            .map(|order| OpenOrderRecord {
+                exchange_order_id: order.exchange_order_id,
+                client_order_id: order.client_order_id,
+                order_type: "STOP_MARKET".to_string(),
+                reduce_only: true,
+                stop_price: Some(order.stop_price),
+                side: order.side,
+            })
+            .collect();
+
+        Ok(orders)
     }
 
     async fn get_price(&self, symbol: &Symbol) -> Result<Price, ExecError> {

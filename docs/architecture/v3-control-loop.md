@@ -377,6 +377,29 @@ The startup reconciliation is unconditional and applies to every symbol on the
 account (not just `allowed_symbols`). See
 [UNTRACKED-POSITION-RECONCILIATION policy](../policies/UNTRACKED-POSITION-RECONCILIATION.md).
 
+### Exchange-Side Insurance Stop (ADR-0039)
+
+The software trailing-stop monitor is the primary exit path, but it only fires
+while the daemon is alive. To bound loss during a crash, node failure, deploy,
+or network partition, `robsond` additionally places a reduce-only `STOP_MARKET`
+protective order on the exchange for every active position at its current
+chart-derived trailing stop (the order is robsond-authored; its client order id
+carries the `ins-` prefix). Lifecycle:
+
+- **Entry fill** → place the stop; recorded in `PositionState::Active.insurance_stop_id`.
+- **Discrete trailing-stop advance** → cancel-replace the stop at the new price.
+- **Software exit takes over** → cancel the stop (never leave both a reduce-only
+  stop and a market exit live).
+- **Startup recovery** (after replay keeps the position open) → heal the stop:
+  if it filled during the gap, reconcile-close the position from the fill; if
+  cancelled/missing, re-place; if open at a stale price, replace.
+- **Reconciliation sweep** → cancel orphaned `ins-` stops that no longer protect
+  a tracked-open position.
+
+Stop-placement/replacement failures are audit-only (`InsuranceStopFailed`) and
+never abort the action batch or the position lifecycle. See
+[ADR-0039](../adr/ADR-0039-exchange-side-insurance-stop.md).
+
 ---
 
 ## Timing Constraints

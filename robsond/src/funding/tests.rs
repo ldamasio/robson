@@ -142,6 +142,13 @@ impl ExchangePort for PostConvertedCrashExchange {
         self.inner.cancel_order(symbol, order_id).await
     }
 
+    async fn get_open_orders(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Vec<robson_exec::OpenOrderRecord>, ExecError> {
+        self.inner.get_open_orders(symbol).await
+    }
+
     async fn get_price(&self, symbol: &Symbol) -> Result<Price, ExecError> {
         self.inner.get_price(symbol).await
     }

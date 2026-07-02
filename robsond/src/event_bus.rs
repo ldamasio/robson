@@ -115,6 +115,15 @@ pub enum DaemonEvent {
         reason: String,
     },
 
+    /// Reconciliation cancelled an orphaned robsond-authored insurance-stop
+    /// order (ADR-0039): an open reduce-only `STOP_MARKET` whose `ins-` client
+    /// order id did not protect any tracked-open position.
+    InsuranceStopOrphanCancelled {
+        symbol: Symbol,
+        exchange_order_id: String,
+        client_order_id: String,
+    },
+
     /// Panic mode activated (all retries exhausted)
     SafetyPanic {
         position_id: String,

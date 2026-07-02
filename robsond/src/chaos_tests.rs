@@ -81,6 +81,13 @@ impl ExchangePort for TimeoutExchange {
         Ok(())
     }
 
+    async fn get_open_orders(
+        &self,
+        _symbol: &Symbol,
+    ) -> Result<Vec<robson_exec::OpenOrderRecord>, ExecError> {
+        Ok(vec![])
+    }
+
     async fn get_price(&self, _symbol: &Symbol) -> Result<Price, ExecError> {
         Price::new(dec!(100)).map_err(ExecError::Domain)
     }

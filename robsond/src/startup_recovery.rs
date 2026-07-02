@@ -36,9 +36,13 @@ use robson_domain::{Candle, Event, PositionState, Price, Side};
 use robson_engine::{EngineAction, MarketData};
 use robson_exec::{ActionResult, CandleInterval, ExchangePort, OhlcvPort};
 use robson_store::Store;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
-use crate::{error::DaemonResult, position_manager::PositionManager};
+use crate::{
+    error::DaemonResult,
+    position_manager::{PositionManager, ReconcileCloseOutcome},
+    reconciliation_worker::input_from_order_result,
+};
 
 /// Summary of what the startup recovery pass did.
 #[derive(Debug, Clone, Default)]
@@ -277,11 +281,194 @@ async fn replay_candles<E: ExchangePort + 'static, S: Store + 'static>(
                 "startup-recovery: gap stop cross observed, but live price recovered; keeping position open"
             );
         }
-        return Ok(false);
+        // ADR-0039 mission 2: the position stays open, so make its exchange-side
+        // protective stop consistent with the post-replay trailing stop. This
+        // may reconcile-close the position if the insurance stop filled during
+        // the gap (returns true); all other outcomes are best-effort and never
+        // abort recovery.
+        let healed_closed = heal_insurance_stop(pm, &current, *trailing_stop).await;
+        return Ok(healed_closed);
     }
 
     let closed = process_recovery_tick(pm, &current, live_price, Utc::now(), true).await?;
     Ok(closed.closed)
+}
+
+/// Heal the protective insurance stop after replay confirms the position stays
+/// open (ADR-0039 mission 2).
+///
+/// The exchange-side stop is made consistent with the post-replay
+/// chart-derived trailing stop:
+///
+/// - `insurance_stop_id = Some(id)`:
+///   - FILLED during the gap → reconcile-close the position from the
+///     `OrderFillRecord` (the position is already closed on the exchange).
+///   - still open at a different stop price → `ReplaceInsuranceStop`.
+///   - still open at the trailing stop → no-op (already consistent).
+///   - cancelled/missing → `PlaceInsuranceStop`.
+/// - `insurance_stop_id = None` (pre-ADR-0039 position) → `PlaceInsuranceStop`.
+///
+/// Returns `true` only when the heal reconcile-closed the position from an
+/// insurance-stop fill. Every step is best-effort: failures are logged (and a
+/// place/replace failure surfaces as an `InsuranceStopFailed` audit event via
+/// the executor) and MUST NOT abort recovery. The software stop remains the
+/// primary exit regardless.
+async fn heal_insurance_stop<E, S>(
+    pm: &PositionManager<E, S>,
+    position: &robson_domain::Position,
+    trailing_stop: Price,
+) -> bool
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let position_id = position.id;
+    let existing_id = match &position.state {
+        PositionState::Active { insurance_stop_id, .. } => {
+            insurance_stop_id.clone().or(position.insurance_stop_id.clone())
+        },
+        _ => position.insurance_stop_id.clone(),
+    };
+
+    let Some(existing_id) = existing_id else {
+        // No stop on record (pre-ADR-0039 position): place one at the trailing stop.
+        place_insurance_stop(pm, position, trailing_stop).await;
+        return false;
+    };
+
+    // 1. Did the insurance stop FILL during the gap? If so the position is already
+    //    closed on the exchange — reconcile-close from the fill.
+    match pm.exchange().get_order_by_exchange_id(&position.symbol, &existing_id).await {
+        Ok(Some(fill)) => {
+            let input = input_from_order_result(position_id, fill);
+            match pm.reconcile_close(input).await {
+                Ok(ReconcileCloseOutcome::Closed) => {
+                    info!(
+                        %position_id,
+                        %existing_id,
+                        "startup-recovery: reconciled close from insurance-stop fill"
+                    );
+                    return true;
+                },
+                Ok(outcome) => {
+                    warn!(
+                        %position_id,
+                        %existing_id,
+                        ?outcome,
+                        "startup-recovery: insurance-stop fill reconcile-close did not close"
+                    );
+                    return false;
+                },
+                Err(error) => {
+                    warn!(
+                        %position_id,
+                        %existing_id,
+                        %error,
+                        "startup-recovery: reconcile-close from insurance-stop fill failed; leaving position Active"
+                    );
+                    return false;
+                },
+            }
+        },
+        Ok(None) => {}, // not filled — fall through to place/replace
+        Err(error) => {
+            warn!(
+                %position_id,
+                %existing_id,
+                %error,
+                "startup-recovery: insurance-stop fill check failed; attempting place/replace"
+            );
+            // Fall through — best-effort place/replace.
+        },
+    }
+
+    // 2. Is the stop still open? Replace only if its price drifted from the
+    //    post-replay trailing stop; re-place if it is gone (cancelled/missing).
+    let live_order = match pm.exchange().get_open_orders(&position.symbol).await {
+        Ok(orders) => orders.into_iter().find(|order| order.exchange_order_id == existing_id),
+        Err(error) => {
+            warn!(
+                %position_id,
+                %existing_id,
+                %error,
+                "startup-recovery: open-orders check failed; leaving insurance stop as-is"
+            );
+            return false;
+        },
+    };
+
+    match live_order {
+        Some(order) => match order.stop_price {
+            Some(stop_price) if stop_price != trailing_stop => {
+                replace_insurance_stop(pm, position, trailing_stop, existing_id).await;
+            },
+            _ => {
+                debug!(
+                    %position_id,
+                    %existing_id,
+                    "startup-recovery: insurance stop already at trailing stop; no heal needed"
+                );
+            },
+        },
+        None => {
+            // Cancelled/missing: re-place at the current trailing stop.
+            place_insurance_stop(pm, position, trailing_stop).await;
+        },
+    }
+
+    false
+}
+
+/// Place a fresh insurance stop at `stop_price` (recovery path).
+async fn place_insurance_stop<E, S>(
+    pm: &PositionManager<E, S>,
+    position: &robson_domain::Position,
+    stop_price: Price,
+) where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let action = EngineAction::PlaceInsuranceStop {
+        position_id: position.id,
+        symbol: position.symbol.clone(),
+        side: position.side.exit_action(),
+        quantity: position.quantity,
+        stop_price,
+    };
+    if let Err(error) = pm.execute_and_persist_recovery(vec![action]).await {
+        warn!(
+            position_id = %position.id,
+            %error,
+            "startup-recovery: PlaceInsuranceStop batch failed"
+        );
+    }
+}
+
+/// Cancel-replace the insurance stop to `stop_price` (recovery path).
+async fn replace_insurance_stop<E, S>(
+    pm: &PositionManager<E, S>,
+    position: &robson_domain::Position,
+    stop_price: Price,
+    previous_order_id: String,
+) where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let action = EngineAction::ReplaceInsuranceStop {
+        position_id: position.id,
+        symbol: position.symbol.clone(),
+        side: position.side.exit_action(),
+        quantity: position.quantity,
+        previous_order_id,
+        new_stop_price: stop_price,
+    };
+    if let Err(error) = pm.execute_and_persist_recovery(vec![action]).await {
+        warn!(
+            position_id = %position.id,
+            %error,
+            "startup-recovery: ReplaceInsuranceStop batch failed"
+        );
+    }
 }
 
 // =============================================================================
@@ -294,11 +481,11 @@ mod tests {
 
     use chrono::Duration;
     use robson_domain::{
-        Candle, Position, PositionState, Price, Quantity, Side, Symbol, TechnicalStopDistance,
-        TradingPolicy,
+        Candle, ClosureEvidence, Event, ExitReason, OrderSide, Position, PositionState, Price,
+        Quantity, ReconciliationEvidence, Side, Symbol, TechnicalStopDistance, TradingPolicy,
     };
     use robson_engine::Engine;
-    use robson_exec::{Executor, IntentJournal, OhlcvPort, StubExchange, StubOhlcv};
+    use robson_exec::{Executor, IntentJournal, OhlcvPort, OrderResult, StubExchange, StubOhlcv};
     use robson_store::{MemoryStore, Store};
     use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
@@ -511,6 +698,236 @@ mod tests {
             "expected Active, got {:?}",
             loaded.state.name()
         );
+    }
+
+    // -- ADR-0039 mission 2: insurance-stop heal (one test per branch) ----------
+    //
+    // `heal_insurance_stop` is the recovery step that runs after replay keeps a
+    // position open. Each test exercises one branch directly with a controlled
+    // post-replay trailing stop. (The `recovery_keeps_position_open...` test
+    // above additionally proves the step is wired into `replay_candles`.)
+
+    /// Set the protective insurance stop id on both the Active state and the
+    /// top-level position field (mirrors how the projection records it).
+    fn with_insurance_stop(mut position: Position, exchange_order_id: &str) -> Position {
+        if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+            *insurance_stop_id = Some(exchange_order_id.to_string());
+        }
+        position.insurance_stop_id = Some(exchange_order_id.to_string());
+        position
+    }
+
+    fn has_insurance_event(events: &[Event], position_id: Uuid, kind: &str) -> bool {
+        events
+            .iter()
+            .any(|event| event.position_id() == position_id && event.event_type() == kind)
+    }
+
+    async fn heal_manager() -> Arc<PositionManager<StubExchange, MemoryStore>> {
+        let ohlcv = Arc::new(StubOhlcv::default()) as Arc<dyn OhlcvPort>;
+        create_manager(ohlcv, dec!(78000)).await
+    }
+
+    #[tokio::test]
+    async fn heal_places_insurance_stop_when_none_recorded() {
+        let pm = heal_manager().await;
+        let position = btcusdt_long_position(Uuid::now_v7());
+        let position_id = position.id;
+        pm.store().positions().save(&position).await.unwrap();
+
+        let trailing_stop = Price::new(dec!(76158.25)).unwrap();
+        let closed = heal_insurance_stop(&pm, &position, trailing_stop).await;
+
+        assert!(!closed, "placing a stop does not close the position");
+        let loaded = pm.store().positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(
+            loaded.insurance_stop_id.is_some(),
+            "insurance_stop_id must be recorded after heal"
+        );
+        let events = pm.store().events().find_by_position(position_id).await.unwrap();
+        assert!(
+            has_insurance_event(&events, position_id, "insurance_stop_placed"),
+            "expected an InsuranceStopPlaced event"
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_replaces_missing_insurance_stop_with_a_new_placement() {
+        let pm = heal_manager().await;
+
+        // A recorded insurance stop that is neither filled nor open on the
+        // exchange (cancelled externally / gone): heal must re-place one.
+        let mut position = btcusdt_long_position(Uuid::now_v7());
+        let position_id = position.id;
+        position = with_insurance_stop(position, "GONE-ORDER");
+        pm.store().positions().save(&position).await.unwrap();
+
+        let trailing_stop = Price::new(dec!(76158.25)).unwrap();
+        let closed = heal_insurance_stop(&pm, &position, trailing_stop).await;
+
+        assert!(!closed);
+        let loaded = pm.store().positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert_ne!(
+            loaded.insurance_stop_id.as_deref(),
+            Some("GONE-ORDER"),
+            "missing insurance stop must be replaced with a new order id"
+        );
+        assert!(loaded.insurance_stop_id.is_some());
+        let events = pm.store().events().find_by_position(position_id).await.unwrap();
+        assert!(
+            has_insurance_event(&events, position_id, "insurance_stop_placed"),
+            "expected an InsuranceStopPlaced event for the re-placement"
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_replaces_insurance_stop_when_open_at_a_different_price() {
+        let pm = heal_manager().await;
+        let symbol = btcusdt();
+
+        // Place a real protective stop at a stale price (below the post-replay
+        // trailing stop) so the heal must cancel-replace it.
+        let stale = pm
+            .exchange()
+            .place_stop_market_order(
+                &symbol,
+                OrderSide::Sell,
+                Quantity::new(dec!(0.01)).unwrap(),
+                Price::new(dec!(50000)).unwrap(),
+                "ins-stale",
+            )
+            .await
+            .unwrap();
+        let stale_id = stale.exchange_order_id.clone();
+
+        let mut position = btcusdt_long_position(Uuid::now_v7());
+        let position_id = position.id;
+        position = with_insurance_stop(position, &stale_id);
+        pm.store().positions().save(&position).await.unwrap();
+
+        let trailing_stop = Price::new(dec!(76158.25)).unwrap();
+        let closed = heal_insurance_stop(&pm, &position, trailing_stop).await;
+
+        assert!(!closed);
+        assert!(
+            !pm.exchange().has_stop_order(&stale_id),
+            "stale stop must be cancelled by the replace"
+        );
+        let events = pm.store().events().find_by_position(position_id).await.unwrap();
+        assert!(
+            has_insurance_event(&events, position_id, "insurance_stop_replaced"),
+            "expected an InsuranceStopReplaced event"
+        );
+        let loaded = pm.store().positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert_ne!(
+            loaded.insurance_stop_id.as_deref(),
+            Some(stale_id.as_str()),
+            "insurance_stop_id must advance to the new stop"
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_replaces_not_when_open_at_the_trailing_stop() {
+        let pm = heal_manager().await;
+        let symbol = btcusdt();
+
+        // Place a real protective stop exactly at the post-replay trailing stop.
+        let trailing_stop = Price::new(dec!(76158.25)).unwrap();
+        let stop = pm
+            .exchange()
+            .place_stop_market_order(
+                &symbol,
+                OrderSide::Sell,
+                Quantity::new(dec!(0.01)).unwrap(),
+                trailing_stop,
+                "ins-current",
+            )
+            .await
+            .unwrap();
+        let stop_id = stop.exchange_order_id.clone();
+
+        let mut position = btcusdt_long_position(Uuid::now_v7());
+        let position_id = position.id;
+        position = with_insurance_stop(position, &stop_id);
+        pm.store().positions().save(&position).await.unwrap();
+
+        let closed = heal_insurance_stop(&pm, &position, trailing_stop).await;
+
+        assert!(!closed);
+        assert!(
+            pm.exchange().has_stop_order(&stop_id),
+            "stop already at the trailing stop must be left intact"
+        );
+        let events = pm.store().events().find_by_position(position_id).await.unwrap();
+        assert!(
+            !has_insurance_event(&events, position_id, "insurance_stop_replaced")
+                && !has_insurance_event(&events, position_id, "insurance_stop_placed"),
+            "no place/replace expected when the stop is already correct"
+        );
+    }
+
+    #[tokio::test]
+    async fn heal_reconciles_close_when_insurance_stop_filled_during_gap() {
+        let pm = heal_manager().await;
+        let symbol = btcusdt();
+        let qty = Quantity::new(dec!(0.01)).unwrap();
+
+        // Place a real protective stop, then model it as FILLED during the gap:
+        // remove it from the live order set and seed the fill in the orders map.
+        let stop = pm
+            .exchange()
+            .place_stop_market_order(
+                &symbol,
+                OrderSide::Sell,
+                qty,
+                Price::new(dec!(76158.25)).unwrap(),
+                "ins-filled",
+            )
+            .await
+            .unwrap();
+        let stop_id = stop.exchange_order_id.clone();
+        pm.exchange().fill_stop_order(&stop_id);
+        pm.exchange().set_order_result(&stop_id, OrderResult {
+            exchange_order_id: stop_id.clone(),
+            client_order_id: "ins-filled".to_string(),
+            fill_price: Price::new(dec!(76000)).unwrap(),
+            filled_quantity: qty,
+            fee: Decimal::ZERO,
+            fee_asset: "USDT".to_string(),
+            filled_at: Utc::now(),
+        });
+
+        let mut position = btcusdt_long_position(Uuid::now_v7());
+        let position_id = position.id;
+        position.quantity = qty;
+        position = with_insurance_stop(position, &stop_id);
+        pm.store().positions().save(&position).await.unwrap();
+
+        let trailing_stop = Price::new(dec!(76158.25)).unwrap();
+        let closed = heal_insurance_stop(&pm, &position, trailing_stop).await;
+
+        assert!(closed, "a filled insurance stop must reconcile-close the position");
+        let loaded = pm.store().positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(
+            matches!(loaded.state, PositionState::Closed {
+                exit_reason: ExitReason::ReconciledMissingOnExchange,
+                ..
+            }),
+            "expected Closed via ReconciledMissingOnExchange, got {:?}",
+            loaded.state.name()
+        );
+        let events = pm.store().events().find_by_position(position_id).await.unwrap();
+        let evidence = events
+            .iter()
+            .find_map(|event| match event {
+                Event::PositionClosed { closure_evidence, .. } => Some(closure_evidence),
+                _ => None,
+            })
+            .expect("PositionClosed event must be emitted");
+        assert!(matches!(
+            evidence,
+            ClosureEvidence::Reconciled(ReconciliationEvidence::OrderFillRecord(_))
+        ));
     }
 
     /// If the stop was NOT crossed during the gap, recovery must leave the

@@ -3,14 +3,18 @@
 //! Periodically compares exchange-open positions with Robson's in-memory store
 //! and force-closes any position that is not tracked by the runtime.
 
-use std::{collections::HashMap, sync::Arc, time::Duration};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+    time::Duration,
+};
 
 use chrono::{DateTime, Datelike, Utc};
 use robson_domain::{
     Event, OrderFillEvidence, Position, PositionId, PositionState, Quantity,
     ReconciliationEvidence, Side, Symbol, UserTradeEvidence,
 };
-use robson_exec::{ExchangePort, ExchangePosition, OrderResult, UserTradeRecord};
+use robson_exec::{ExchangePort, ExchangePosition, OpenOrderRecord, OrderResult, UserTradeRecord};
 use robson_store::Store;
 use rust_decimal::Decimal;
 use tokio::{
@@ -271,6 +275,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
 
         reconciled += self.reconcile_local_missing_positions(&exchange_positions).await?;
 
+        // ADR-0039: cancel orphaned robsond-authored insurance-stop orders left
+        // behind after a manual/external close or a lifecycle race. Best-effort
+        // and never aborts the scan (invariant: insurance-stop maintenance
+        // failures must not break reconciliation).
+        self.sweep_orphan_insurance_orders(&exchange_positions).await;
+
         if reconciled > 0 {
             self.recalibrate_capital_base_after_manual_drift(reconciled).await?;
         } else {
@@ -329,6 +339,128 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         }
 
         Ok(reconciled)
+    }
+
+    /// Cancel orphaned robsond-authored insurance-stop orders (ADR-0039).
+    ///
+    /// An open reduce-only `STOP_MARKET` whose `client_order_id` carries the
+    /// robsond `ins-` prefix, but whose exchange order id is not any
+    /// tracked-open `Active` position's `insurance_stop_id`, is an orphan —
+    /// left behind by a manual/external close, a replace race, or a
+    /// position that has since been reconciled away. It is cancelled so it
+    /// cannot interfere with future entries on the same symbol.
+    ///
+    /// Every step is best-effort: exchange query errors, cancel errors, and
+    /// store read errors are logged and the scan continues. This method never
+    /// returns an error and never aborts `scan_and_reconcile`.
+    async fn sweep_orphan_insurance_orders(&self, exchange_positions: &[ExchangePosition]) {
+        let active_positions = match self.store.positions().find_active().await {
+            Ok(positions) => positions,
+            Err(error) => {
+                warn!(
+                    error = %error,
+                    "Orphan insurance-order sweep: failed to read active positions; skipping"
+                );
+                return;
+            },
+        };
+
+        // Covered set: the exchange order id of every stop protecting an
+        // currently-open Active position. Any `ins-` open order whose id is not
+        // in this set protects nothing and is an orphan.
+        let mut covered: HashSet<String> = HashSet::new();
+        // Symbols where an Active position has NO recorded insurance id: an
+        // `ins-` order there is plausibly that position's stop whose
+        // placement event was lost (e.g., crash between exchange placement
+        // and persistence). Cancelling it would strip a live protection, so
+        // the sweep fails safe: warn and skip; startup recovery or the next
+        // trailing advance re-links or replaces the stop.
+        let mut uncovered_symbols: HashSet<Symbol> = HashSet::new();
+        let mut symbols: HashSet<Symbol> =
+            exchange_positions.iter().map(|p| p.symbol.clone()).collect();
+        for position in &active_positions {
+            symbols.insert(position.symbol.clone());
+            if let PositionState::Active { insurance_stop_id, .. } = &position.state {
+                match insurance_stop_id.clone().or(position.insurance_stop_id.clone()) {
+                    Some(id) => {
+                        covered.insert(id);
+                    },
+                    None => {
+                        uncovered_symbols.insert(position.symbol.clone());
+                    },
+                }
+            }
+        }
+
+        for symbol in &symbols {
+            let open_orders = match self.exchange.get_open_orders(symbol).await {
+                Ok(orders) => orders,
+                Err(error) => {
+                    warn!(
+                        symbol = %symbol.as_pair(),
+                        error = %error,
+                        "Orphan insurance-order sweep: failed to query open orders; skipping symbol"
+                    );
+                    continue;
+                },
+            };
+
+            for order in open_orders {
+                if !Self::is_orphan_insurance_order(&order) {
+                    continue;
+                }
+                if covered.contains(&order.exchange_order_id) {
+                    continue;
+                }
+                if uncovered_symbols.contains(symbol) {
+                    warn!(
+                        symbol = %symbol.as_pair(),
+                        exchange_order_id = %order.exchange_order_id,
+                        client_order_id = %order.client_order_id,
+                        "Insurance-stop order without recorded owner, but an Active \
+                         position on this symbol has no insurance id — plausible lost \
+                         linkage; skipping cancel (fail-safe)"
+                    );
+                    continue;
+                }
+
+                warn!(
+                    symbol = %symbol.as_pair(),
+                    exchange_order_id = %order.exchange_order_id,
+                    client_order_id = %order.client_order_id,
+                    "Orphan insurance-stop order detected; cancelling"
+                );
+
+                match self.exchange.cancel_order(symbol, &order.exchange_order_id).await {
+                    Ok(()) => {
+                        info!(
+                            symbol = %symbol.as_pair(),
+                            exchange_order_id = %order.exchange_order_id,
+                            "Orphan insurance-stop order cancelled"
+                        );
+                        self.event_bus.send(DaemonEvent::InsuranceStopOrphanCancelled {
+                            symbol: symbol.clone(),
+                            exchange_order_id: order.exchange_order_id,
+                            client_order_id: order.client_order_id,
+                        });
+                    },
+                    Err(error) => {
+                        warn!(
+                            symbol = %symbol.as_pair(),
+                            exchange_order_id = %order.exchange_order_id,
+                            error = %error,
+                            "Failed to cancel orphan insurance-stop order; continuing"
+                        );
+                    },
+                }
+            }
+        }
+    }
+
+    /// True for an open order that is a robsond-authored insurance stop
+    /// (reduce-only, `ins-` client order id prefix).
+    fn is_orphan_insurance_order(order: &OpenOrderRecord) -> bool {
+        order.reduce_only && order.client_order_id.starts_with("ins-")
     }
 
     async fn clear_missing_observation(&self, position_id: PositionId) {
@@ -1100,6 +1232,118 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_insurance_stop_fill_closes_position_with_order_fill_evidence() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let mut position = tracked_active_position(symbol.clone(), Side::Long);
+        let position_id = position.id;
+
+        // Mission-1 shape: place the real protective stop, then model it as
+        // having FILLED during the gap (removed from the live order set and
+        // seeded as a fill in the orders map).
+        let stop = exchange
+            .place_stop_market_order(
+                &symbol,
+                OrderSide::Sell,
+                position.quantity,
+                Price::new(dec!(99)).unwrap(),
+                "ins-fill-1",
+            )
+            .await
+            .unwrap();
+        let stop_id = stop.exchange_order_id;
+        exchange.fill_stop_order(&stop_id); // filled -> no longer an open order
+        let now = Utc::now();
+        exchange.set_order_result(
+            &stop_id,
+            order_result(&stop_id, dec!(90), position.quantity.as_decimal(), now),
+        );
+
+        if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+            *insurance_stop_id = Some(stop_id.clone());
+        }
+        position.insurance_stop_id = Some(stop_id);
+        store.positions().save(&position).await.unwrap();
+
+        let worker = create_worker(exchange, store.clone(), event_bus, Duration::from_secs(0));
+
+        // First scan records the missing observation; second scan closes from
+        // the insurance-stop fill evidence.
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 1);
+
+        let loaded = store.positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(
+            matches!(loaded.state, PositionState::Closed {
+                exit_reason: ExitReason::ReconciledMissingOnExchange,
+                ..
+            }),
+            "expected Closed via ReconciledMissingOnExchange, got {:?}",
+            loaded.state.name()
+        );
+
+        let events = store.events().find_by_position(position_id).await.unwrap();
+        let evidence = events
+            .iter()
+            .find_map(|event| {
+                if let robson_domain::Event::PositionClosed { closure_evidence, .. } = event {
+                    Some(closure_evidence)
+                } else {
+                    None
+                }
+            })
+            .expect("PositionClosed event must be emitted");
+        assert!(matches!(
+            evidence,
+            robson_domain::ClosureEvidence::Reconciled(ReconciliationEvidence::OrderFillRecord(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn test_open_unfilled_insurance_order_does_not_auto_close_missing_position() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let mut position = tracked_active_position(symbol.clone(), Side::Long);
+        let position_id = position.id;
+
+        // Mission-1 shape: protective stop placed (NEW/open) but NOT filled. It
+        // is never seeded as a fill, so `get_order_by_exchange_id` resolves
+        // nothing and no user-trade evidence is available either.
+        let stop = exchange
+            .place_stop_market_order(
+                &symbol,
+                OrderSide::Sell,
+                position.quantity,
+                Price::new(dec!(99)).unwrap(),
+                "ins-open-1",
+            )
+            .await
+            .unwrap();
+        let stop_id = stop.exchange_order_id;
+        if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+            *insurance_stop_id = Some(stop_id.clone());
+        }
+        position.insurance_stop_id = Some(stop_id);
+        store.positions().save(&position).await.unwrap();
+
+        let worker = create_worker(exchange, store.clone(), event_bus, Duration::from_secs(0));
+
+        // Two scans let the missing-position grace elapse, but the insurance
+        // order is still open (no fill evidence), so no automated close — the
+        // blocker behavior is preserved.
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
+
+        let loaded = store.positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(matches!(loaded.state, PositionState::Active { .. }));
+        assert_eq!(close_events_for(&store, position_id).await, 0);
+    }
+
+    #[tokio::test]
     async fn test_missing_active_single_matching_user_trade_closes() {
         let exchange = Arc::new(StubExchange::new(dec!(100)));
         let store = Arc::new(MemoryStore::new());
@@ -1222,6 +1466,139 @@ mod tests {
         assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
 
         assert_eq!(close_events_for(&store, position_id).await, 1);
+    }
+
+    #[tokio::test]
+    async fn test_orphan_insurance_stop_order_is_cancelled() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+
+        // A tracked Active position whose recorded insurance stop is a
+        // different order id — the stop placed below is an orphan.
+        let mut position = tracked_active_position(symbol.clone(), Side::Long);
+        let position_id = position.id;
+        if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+            *insurance_stop_id = Some("CURRENT-STOP".to_string());
+        }
+        position.insurance_stop_id = Some("CURRENT-STOP".to_string());
+        store.positions().save(&position).await.unwrap();
+
+        // Place an orphan robsond-authored stop (ins- prefix, reduce-only).
+        let orphan = exchange
+            .place_stop_market_order(
+                &symbol,
+                OrderSide::Sell,
+                Quantity::new(dec!(0.010)).unwrap(),
+                Price::new(dec!(99)).unwrap(),
+                "ins-orphan-1",
+            )
+            .await
+            .unwrap();
+        let orphan_id = orphan.exchange_order_id.clone();
+        assert!(exchange.has_stop_order(&orphan_id));
+
+        let mut receiver = event_bus.subscribe();
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        // The orphan was cancelled on the exchange.
+        assert!(!exchange.has_stop_order(&orphan_id), "orphan insurance stop must be cancelled");
+        // The tracked position is untouched (still Active, still its own stop).
+        let loaded = store.positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(matches!(loaded.state, PositionState::Active { .. }));
+        // An audit event was published for operator visibility.
+        let mut orphan_event_seen = false;
+        while let Some(Ok(event)) = receiver.try_recv() {
+            if let DaemonEvent::InsuranceStopOrphanCancelled { exchange_order_id, .. } = &event {
+                if exchange_order_id == &orphan_id {
+                    orphan_event_seen = true;
+                }
+            }
+        }
+        assert!(orphan_event_seen, "expected InsuranceStopOrphanCancelled audit event");
+    }
+
+    #[tokio::test]
+    async fn test_unlinked_insurance_stop_is_kept_when_active_position_lacks_insurance_id() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+
+        // A tracked Active position with NO recorded insurance id — e.g. the
+        // placement event was lost in a crash after exchange placement. The
+        // live `ins-` stop on the same symbol is plausibly its protection.
+        let position = tracked_active_position(symbol.clone(), Side::Long);
+        assert!(position.insurance_stop_id.is_none());
+        store.positions().save(&position).await.unwrap();
+
+        let stop = exchange
+            .place_stop_market_order(
+                &symbol,
+                OrderSide::Sell,
+                Quantity::new(dec!(0.010)).unwrap(),
+                Price::new(dec!(99)).unwrap(),
+                "ins-unlinked-1",
+            )
+            .await
+            .unwrap();
+        let stop_id = stop.exchange_order_id.clone();
+
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        // Fail-safe: the sweep must NOT cancel the plausible lost linkage.
+        assert!(
+            exchange.has_stop_order(&stop_id),
+            "unlinked insurance stop must be kept when an Active position on \
+             the symbol has no recorded insurance id"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_insurance_stop_protecting_tracked_position_is_not_cancelled() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+
+        // Place the real protective stop FIRST so its exchange order id is known.
+        let stop = exchange
+            .place_stop_market_order(
+                &symbol,
+                OrderSide::Sell,
+                Quantity::new(dec!(0.010)).unwrap(),
+                Price::new(dec!(99)).unwrap(),
+                "ins-tracked-1",
+            )
+            .await
+            .unwrap();
+        let stop_id = stop.exchange_order_id.clone();
+
+        // Track the position and record this stop as its insurance stop.
+        let mut position = tracked_active_position(symbol.clone(), Side::Long);
+        if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+            *insurance_stop_id = Some(stop_id.clone());
+        }
+        position.insurance_stop_id = Some(stop_id.clone());
+        store.positions().save(&position).await.unwrap();
+
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        // The tracked position's protective stop is left intact.
+        assert!(
+            exchange.has_stop_order(&stop_id),
+            "insurance stop protecting a tracked Active position must NOT be cancelled"
+        );
     }
 
     #[tokio::test]
