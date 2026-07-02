@@ -399,31 +399,61 @@ pub enum Event {
         timestamp: DateTime<Utc>,
     },
 
-    /// Insurance stop order placed on exchange (backup protection)
+    /// Protective insurance-stop order placed on the exchange (ADR-0039).
+    ///
+    /// Emitted on entry fill, and on a trailing-stop advance when no prior
+    /// stop exists. Carries the exchange-assigned order id of the accepted,
+    /// reduce-only `STOP_MARKET` order placed at the current trailing stop.
     InsuranceStopPlaced {
         /// Position identifier
         position_id: PositionId,
-        /// Order identifier
-        order_id: OrderId,
-        /// Stop price
+        /// Exchange-assigned order id of the accepted stop order
+        order_id: String,
+        /// Stop price (the position's current chart-derived trailing stop)
         stop_price: Price,
-        /// Limit price (for stop-limit orders)
-        limit_price: Price,
-        /// Order quantity
-        quantity: Quantity,
         /// When the order was placed
         timestamp: DateTime<Utc>,
     },
 
-    /// Insurance stop order cancelled (no longer needed)
+    /// Protective insurance-stop order cancel-replaced on the exchange
+    /// (ADR-0039) after a discrete trailing-stop advance.
+    InsuranceStopReplaced {
+        /// Position identifier
+        position_id: PositionId,
+        /// Exchange-assigned order id of the previous (cancelled) stop order
+        previous_order_id: String,
+        /// Exchange-assigned order id of the new accepted stop order
+        order_id: String,
+        /// New stop price (the advanced trailing stop)
+        stop_price: Price,
+        /// When the replacement occurred
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Protective insurance-stop order cancelled on the exchange (ADR-0039).
+    ///
+    /// Emitted when the software exit path takes over (the market exit is
+    /// placed) so a reduce-only stop and a market exit never coexist.
     InsuranceStopCancelled {
         /// Position identifier
         position_id: PositionId,
-        /// Order identifier
-        order_id: OrderId,
-        /// Reason for cancellation
-        reason: String,
+        /// Exchange-assigned order id of the cancelled stop order
+        order_id: String,
         /// When the cancellation occurred
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Protective insurance-stop placement/replacement/cancellation failed
+    /// (ADR-0039). Audit-only: the software stop remains the primary exit
+    /// path, so this never aborts the action batch or blocks the lifecycle.
+    InsuranceStopFailed {
+        /// Position identifier
+        position_id: PositionId,
+        /// Stop price that was attempted
+        stop_price: Price,
+        /// Error description
+        error: String,
+        /// When the failure occurred
         timestamp: DateTime<Utc>,
     },
 }
@@ -456,7 +486,9 @@ impl Event {
             | Event::PositionDisarmed { position_id, .. }
             | Event::PositionError { position_id, .. }
             | Event::InsuranceStopPlaced { position_id, .. }
-            | Event::InsuranceStopCancelled { position_id, .. } => *position_id,
+            | Event::InsuranceStopReplaced { position_id, .. }
+            | Event::InsuranceStopCancelled { position_id, .. }
+            | Event::InsuranceStopFailed { position_id, .. } => *position_id,
             Event::MonthBoundaryReset { .. } | Event::CapitalBaseRecalibrated { .. } => {
                 uuid::Uuid::nil()
             },
@@ -489,7 +521,9 @@ impl Event {
             | Event::PositionDisarmed { timestamp, .. }
             | Event::PositionError { timestamp, .. }
             | Event::InsuranceStopPlaced { timestamp, .. }
-            | Event::InsuranceStopCancelled { timestamp, .. } => *timestamp,
+            | Event::InsuranceStopReplaced { timestamp, .. }
+            | Event::InsuranceStopCancelled { timestamp, .. }
+            | Event::InsuranceStopFailed { timestamp, .. } => *timestamp,
         }
     }
 
@@ -519,7 +553,9 @@ impl Event {
             Event::PositionDisarmed { .. } => "position_disarmed",
             Event::PositionError { .. } => "position_error",
             Event::InsuranceStopPlaced { .. } => "insurance_stop_placed",
+            Event::InsuranceStopReplaced { .. } => "insurance_stop_replaced",
             Event::InsuranceStopCancelled { .. } => "insurance_stop_cancelled",
+            Event::InsuranceStopFailed { .. } => "insurance_stop_failed",
         }
     }
 }
@@ -1190,6 +1226,52 @@ mod tests {
             sample_entry_execution_rejected(Uuid::now_v7()).event_type(),
             "entry_execution_rejected"
         );
+    }
+
+    #[test]
+    fn test_insurance_stop_event_types_and_roundtrip() {
+        let pid = Uuid::now_v7();
+        let ts = Utc::now();
+
+        let placed = Event::InsuranceStopPlaced {
+            position_id: pid,
+            order_id: "BIN-INS-1".to_string(),
+            stop_price: Price::new(dec!(93500)).unwrap(),
+            timestamp: ts,
+        };
+        assert_eq!(placed.event_type(), "insurance_stop_placed");
+
+        let replaced = Event::InsuranceStopReplaced {
+            position_id: pid,
+            previous_order_id: "BIN-INS-1".to_string(),
+            order_id: "BIN-INS-2".to_string(),
+            stop_price: Price::new(dec!(94000)).unwrap(),
+            timestamp: ts,
+        };
+        assert_eq!(replaced.event_type(), "insurance_stop_replaced");
+
+        let cancelled = Event::InsuranceStopCancelled {
+            position_id: pid,
+            order_id: "BIN-INS-2".to_string(),
+            timestamp: ts,
+        };
+        assert_eq!(cancelled.event_type(), "insurance_stop_cancelled");
+
+        let failed = Event::InsuranceStopFailed {
+            position_id: pid,
+            stop_price: Price::new(dec!(93500)).unwrap(),
+            error: "exchange timeout".to_string(),
+            timestamp: ts,
+        };
+        assert_eq!(failed.event_type(), "insurance_stop_failed");
+
+        // Each event roundtrips through serde and preserves position_id/timestamp.
+        for event in [placed, replaced, cancelled, failed] {
+            let json = serde_json::to_string(&event).unwrap();
+            let back: Event = serde_json::from_str(&json).unwrap();
+            assert_eq!(back.position_id(), pid);
+            assert_eq!(back.timestamp(), ts);
+        }
     }
 
     // =========================================================================

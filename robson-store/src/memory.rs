@@ -347,6 +347,39 @@ impl MemoryStore {
                 }
             },
 
+            // InsuranceStopPlaced/Replaced: record the live protective order id
+            // (ADR-0039). Mirrored on both the Active state and the top-level
+            // position field so the reconciliation worker can read it without a
+            // state match.
+            Event::InsuranceStopPlaced { position_id, order_id, .. }
+            | Event::InsuranceStopReplaced { position_id, order_id, .. } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    position.insurance_stop_id = Some(order_id.clone());
+                    if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+                        *insurance_stop_id = Some(order_id.clone());
+                    }
+                    position.updated_at = chrono::Utc::now();
+                    positions.insert(*position_id, position);
+                }
+            },
+
+            // InsuranceStopCancelled: clear the protective order id (ADR-0039).
+            Event::InsuranceStopCancelled { position_id, .. } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    position.insurance_stop_id = None;
+                    if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+                        *insurance_stop_id = None;
+                    }
+                    position.updated_at = chrono::Utc::now();
+                    positions.insert(*position_id, position);
+                }
+            },
+
+            // InsuranceStopFailed: audit-only, no position state change.
+            Event::InsuranceStopFailed { .. } => {},
+
             // All other events are audit-only and do not affect the position projection
             _ => {},
         }

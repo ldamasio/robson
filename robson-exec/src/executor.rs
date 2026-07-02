@@ -12,10 +12,12 @@
 
 use std::sync::Arc;
 
-use robson_domain::{Event, ExitReason, PositionId, Price, RiskConfig, Symbol};
+use robson_domain::{
+    Event, ExitReason, OrderSide, PositionId, Price, Quantity, RiskConfig, Symbol,
+};
 use robson_engine::EngineAction;
 use robson_store::Store;
-use tracing::{debug, error, info};
+use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
@@ -155,6 +157,40 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             } => {
                 self.execute_exit_order(position_id, cycle_id, symbol, side, quantity, reason)
                     .await
+            },
+
+            EngineAction::PlaceInsuranceStop {
+                position_id,
+                symbol,
+                side,
+                quantity,
+                stop_price,
+            } => {
+                self.execute_place_insurance_stop(position_id, symbol, side, quantity, stop_price)
+                    .await
+            },
+
+            EngineAction::ReplaceInsuranceStop {
+                position_id,
+                symbol,
+                side,
+                quantity,
+                previous_order_id,
+                new_stop_price,
+            } => {
+                self.execute_replace_insurance_stop(
+                    position_id,
+                    symbol,
+                    side,
+                    quantity,
+                    previous_order_id,
+                    new_stop_price,
+                )
+                .await
+            },
+
+            EngineAction::CancelInsuranceStop { position_id, symbol, order_id } => {
+                self.execute_cancel_insurance_stop(position_id, symbol, order_id).await
             },
 
             EngineAction::UpdateTrailingStop {
@@ -441,6 +477,249 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         result.map(|order| ActionResult::OrderPlaced { order, event: exit_event_opt })
     }
 
+    /// Place a reduce-only protective insurance stop on the exchange
+    /// (ADR-0039).
+    ///
+    /// Mirrors `execute_exit_order`: journal an intent, place the order, and on
+    /// success emit `InsuranceStopPlaced` (applied to the store so the live
+    /// order id is recorded). Any placement failure becomes an audit-only
+    /// `InsuranceStopFailed` event — never `OrderFailed`, so the action batch
+    /// is never aborted and the software stop remains the primary exit.
+    async fn execute_place_insurance_stop(
+        &self,
+        position_id: PositionId,
+        symbol: robson_domain::Symbol,
+        side: OrderSide,
+        quantity: Quantity,
+        stop_price: Price,
+    ) -> ExecResult<ActionResult> {
+        let intent_id = Uuid::now_v7();
+        // Binance clientOrderId limit is 36 chars; `ins-` + 32-char uuid.simple() = 36.
+        let client_order_id = format!("ins-{}", intent_id.simple());
+
+        let intent = Intent::new(intent_id, position_id, IntentAction::PlaceInsuranceStopOrder {
+            symbol: symbol.clone(),
+            side,
+            quantity,
+            stop_price,
+        });
+        self.journal.record(intent)?;
+        self.journal.mark_executing(intent_id)?;
+
+        info!(
+            %position_id,
+            %intent_id,
+            symbol = %symbol.as_pair(),
+            ?side,
+            stop_price = %stop_price.as_decimal(),
+            "Placing insurance stop"
+        );
+
+        let result = self
+            .exchange
+            .place_stop_market_order(&symbol, side, quantity, stop_price, &client_order_id)
+            .await;
+
+        match result {
+            Ok(order_result) => {
+                info!(
+                    %position_id,
+                    exchange_order_id = %order_result.exchange_order_id,
+                    stop_price = %stop_price.as_decimal(),
+                    "Insurance stop placed"
+                );
+                self.journal.complete(intent_id, IntentResult::Success(order_result.clone()))?;
+
+                let event = Event::InsuranceStopPlaced {
+                    position_id,
+                    order_id: order_result.exchange_order_id.clone(),
+                    stop_price,
+                    timestamp: chrono::Utc::now(),
+                };
+                self.store.events().append(&event).await?;
+                self.store.apply_event(&event)?;
+
+                Ok(ActionResult::OrderPlaced { order: order_result, event: Some(event) })
+            },
+            Err(e) => {
+                warn!(%position_id, error = %e, "Insurance stop placement failed");
+                self.journal.complete(intent_id, IntentResult::Failed(e.to_string()))?;
+                Ok(self.emit_insurance_stop_failed(position_id, stop_price, e).await)
+            },
+        }
+    }
+
+    /// Cancel-replace the protective insurance stop after a trailing advance
+    /// (ADR-0039). The previous order is cancelled first; an "unknown order"
+    /// error is tolerated (the stop may have just filled) before placing the
+    /// new stop. Any other failure becomes an audit-only `InsuranceStopFailed`.
+    async fn execute_replace_insurance_stop(
+        &self,
+        position_id: PositionId,
+        symbol: robson_domain::Symbol,
+        side: OrderSide,
+        quantity: Quantity,
+        previous_order_id: String,
+        new_stop_price: Price,
+    ) -> ExecResult<ActionResult> {
+        let intent_id = Uuid::now_v7();
+        let client_order_id = format!("ins-{}", intent_id.simple());
+
+        let intent = Intent::new(intent_id, position_id, IntentAction::PlaceInsuranceStopOrder {
+            symbol: symbol.clone(),
+            side,
+            quantity,
+            stop_price: new_stop_price,
+        });
+        self.journal.record(intent)?;
+        self.journal.mark_executing(intent_id)?;
+
+        info!(
+            %position_id,
+            %intent_id,
+            symbol = %symbol.as_pair(),
+            previous_order_id = %previous_order_id,
+            new_stop_price = %new_stop_price.as_decimal(),
+            "Replacing insurance stop"
+        );
+
+        // Cancel the previous stop. An "unknown order" error is expected when
+        // the stop has already filled or been cancelled — log and continue.
+        if let Err(e) = self.exchange.cancel_order(&symbol, &previous_order_id).await {
+            if Self::is_unknown_order_error(&e) {
+                warn!(
+                    %position_id,
+                    %previous_order_id,
+                    error = %e,
+                    "Previous insurance stop already gone; continuing with replace"
+                );
+            } else {
+                warn!(%position_id, error = %e, "Insurance stop cancel-replace failed");
+                self.journal.complete(intent_id, IntentResult::Failed(e.to_string()))?;
+                return Ok(self.emit_insurance_stop_failed(position_id, new_stop_price, e).await);
+            }
+        }
+
+        let result = self
+            .exchange
+            .place_stop_market_order(&symbol, side, quantity, new_stop_price, &client_order_id)
+            .await;
+
+        match result {
+            Ok(order_result) => {
+                info!(
+                    %position_id,
+                    previous_order_id = %previous_order_id,
+                    exchange_order_id = %order_result.exchange_order_id,
+                    new_stop_price = %new_stop_price.as_decimal(),
+                    "Insurance stop replaced"
+                );
+                self.journal.complete(intent_id, IntentResult::Success(order_result.clone()))?;
+
+                let event = Event::InsuranceStopReplaced {
+                    position_id,
+                    previous_order_id,
+                    order_id: order_result.exchange_order_id.clone(),
+                    stop_price: new_stop_price,
+                    timestamp: chrono::Utc::now(),
+                };
+                self.store.events().append(&event).await?;
+                self.store.apply_event(&event)?;
+
+                Ok(ActionResult::OrderPlaced { order: order_result, event: Some(event) })
+            },
+            Err(e) => {
+                warn!(%position_id, error = %e, "Insurance stop replacement failed");
+                self.journal.complete(intent_id, IntentResult::Failed(e.to_string()))?;
+                Ok(self.emit_insurance_stop_failed(position_id, new_stop_price, e).await)
+            },
+        }
+    }
+
+    /// Cancel the protective insurance stop when the software exit takes over
+    /// (ADR-0039). An "unknown order" error is treated as success (the stop is
+    /// already gone); any other failure becomes an audit-only
+    /// `InsuranceStopFailed`. Never errors out of the batch.
+    async fn execute_cancel_insurance_stop(
+        &self,
+        position_id: PositionId,
+        symbol: robson_domain::Symbol,
+        order_id: String,
+    ) -> ExecResult<ActionResult> {
+        debug!(
+            %position_id,
+            symbol = %symbol.as_pair(),
+            order_id = %order_id,
+            "Cancelling insurance stop"
+        );
+
+        match self.exchange.cancel_order(&symbol, &order_id).await {
+            Ok(()) => {},
+            Err(e) if Self::is_unknown_order_error(&e) => {
+                warn!(
+                    %position_id,
+                    %order_id,
+                    error = %e,
+                    "Insurance stop already gone; treating cancel as success"
+                );
+            },
+            Err(e) => {
+                warn!(%position_id, error = %e, "Insurance stop cancellation failed");
+                return Ok(self
+                    .emit_insurance_stop_failed(
+                        position_id,
+                        // No new stop price for a pure cancel; carry zero as a sentinel.
+                        Price::zero(),
+                        e,
+                    )
+                    .await);
+            },
+        }
+
+        let event = Event::InsuranceStopCancelled {
+            position_id,
+            order_id,
+            timestamp: chrono::Utc::now(),
+        };
+        self.store.events().append(&event).await?;
+        self.store.apply_event(&event)?;
+
+        Ok(ActionResult::EventEmitted(event))
+    }
+
+    /// Build, persist, and apply an `InsuranceStopFailed` audit event
+    /// (ADR-0039). Best-effort: the failure must not abort the action batch, so
+    /// a store error is logged rather than propagated — the software stop
+    /// remains the primary exit regardless.
+    async fn emit_insurance_stop_failed(
+        &self,
+        position_id: PositionId,
+        stop_price: Price,
+        error: ExecError,
+    ) -> ActionResult {
+        let event = Event::InsuranceStopFailed {
+            position_id,
+            stop_price,
+            error: error.to_string(),
+            timestamp: chrono::Utc::now(),
+        };
+        if let Err(append_err) = self.store.events().append(&event).await {
+            warn!(%position_id, error = %append_err, "Failed to persist InsuranceStopFailed audit event");
+        } else if let Err(apply_err) = self.store.apply_event(&event) {
+            warn!(%position_id, error = %apply_err, "Failed to apply InsuranceStopFailed audit event");
+        }
+        ActionResult::EventEmitted(event)
+    }
+
+    /// True when an exchange error means the target order no longer exists
+    /// (already filled or cancelled), so a cancel/replace can proceed or be
+    /// treated as success. Binance maps "Unknown order sent" (-2011) and
+    /// related rejection codes to `ExecError::OrderRejected`.
+    fn is_unknown_order_error(error: &ExecError) -> bool {
+        matches!(error, ExecError::OrderRejected(_))
+            || matches!(error, ExecError::Exchange(msg) if msg.to_lowercase().contains("order"))
+    }
+
     /// Get the intent journal (for inspection/recovery).
     pub fn journal(&self) -> &IntentJournal {
         &self.journal
@@ -460,6 +739,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
 mod tests {
     use robson_domain::{Quantity, Side, Symbol};
     use robson_store::MemoryStore;
+    use rust_decimal::Decimal;
     use rust_decimal_macros::dec;
 
     use super::*;
@@ -764,5 +1044,123 @@ mod tests {
             },
             other => panic!("Expected EntryExecutionRejected, got {:?}", other),
         }
+    }
+
+    // =========================================================================
+    // ADR-0039 Insurance Stop Tests
+    // =========================================================================
+
+    fn insurance_executor() -> (Executor<StubExchange, MemoryStore>, Arc<StubExchange>) {
+        let exchange = Arc::new(StubExchange::new(dec!(95000)));
+        let journal = Arc::new(IntentJournal::new());
+        let store = Arc::new(MemoryStore::new());
+        let executor = Executor::new(Arc::clone(&exchange), journal, store);
+        (executor, exchange)
+    }
+
+    fn place_insurance_action(position_id: Uuid, stop_price: Decimal) -> EngineAction {
+        EngineAction::PlaceInsuranceStop {
+            position_id,
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            side: OrderSide::Sell,
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            stop_price: Price::new(stop_price).unwrap(),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_place_insurance_stop_places_order_and_emits_event() {
+        let (executor, exchange) = insurance_executor();
+        let position_id = Uuid::now_v7();
+
+        let results = executor
+            .execute(vec![place_insurance_action(position_id, dec!(93500))])
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        // A reduce-only stop was accepted (unfilled) on the stub.
+        assert_eq!(exchange.stop_order_count(), 1);
+
+        match &results[0] {
+            ActionResult::OrderPlaced {
+                order,
+                event: Some(Event::InsuranceStopPlaced { order_id, stop_price, .. }),
+            } => {
+                assert!(!order.exchange_order_id.is_empty());
+                assert_eq!(order.filled_quantity.as_decimal(), dec!(0)); // accepted, unfilled
+                assert_eq!(order_id, &order.exchange_order_id);
+                assert_eq!(stop_price.as_decimal(), dec!(93500));
+                assert!(exchange.has_stop_order(order_id));
+            },
+            other => panic!("Expected OrderPlaced with InsuranceStopPlaced, got {:?}", other),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_execute_place_insurance_stop_failure_emits_failed_event() {
+        let (executor, exchange) = insurance_executor();
+        exchange.set_order_fail_next(true);
+        let position_id = Uuid::now_v7();
+
+        // Must NOT error out of execute() — the batch continues.
+        let results = executor
+            .execute(vec![place_insurance_action(position_id, dec!(93500))])
+            .await
+            .unwrap();
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            ActionResult::EventEmitted(Event::InsuranceStopFailed {
+                stop_price, error, ..
+            }) => {
+                assert_eq!(stop_price.as_decimal(), dec!(93500));
+                assert!(error.contains("Simulated stop order failure"));
+            },
+            other => panic!("Expected EventEmitted(InsuranceStopFailed), got {:?}", other),
+        }
+        // No stop order was left on the stub.
+        assert_eq!(exchange.stop_order_count(), 0);
+    }
+
+    #[tokio::test]
+    async fn test_execute_cancel_insurance_stop_cancels_order() {
+        let (executor, exchange) = insurance_executor();
+        let position_id = Uuid::now_v7();
+
+        // Place a stop first so there is an order id to cancel.
+        let order_id = match &executor
+            .execute(vec![place_insurance_action(position_id, dec!(93500))])
+            .await
+            .unwrap()[0]
+        {
+            ActionResult::OrderPlaced {
+                event: Some(Event::InsuranceStopPlaced { order_id, .. }),
+                ..
+            } => order_id.clone(),
+            other => panic!("Expected OrderPlaced, got {:?}", other),
+        };
+        assert_eq!(exchange.stop_order_count(), 1);
+
+        let cancel_action = EngineAction::CancelInsuranceStop {
+            position_id,
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            order_id: order_id.clone(),
+        };
+        let results = executor.execute(vec![cancel_action]).await.unwrap();
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            ActionResult::EventEmitted(Event::InsuranceStopCancelled {
+                order_id: cancelled_id,
+                ..
+            }) => {
+                assert_eq!(cancelled_id, &order_id);
+            },
+            other => panic!("Expected EventEmitted(InsuranceStopCancelled), got {:?}", other),
+        }
+
+        // The stop was removed from the stub.
+        assert_eq!(exchange.stop_order_count(), 0);
+        assert!(!exchange.has_stop_order(&order_id));
     }
 }

@@ -14,7 +14,7 @@
 use std::{collections::HashMap, sync::RwLock};
 
 use chrono::{DateTime, Utc};
-use robson_domain::{ExitReason, OrderSide, PositionId, Quantity, Symbol};
+use robson_domain::{ExitReason, OrderSide, PositionId, Price, Quantity, Symbol};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
@@ -91,6 +91,14 @@ pub enum IntentAction {
         side: OrderSide,
         quantity: Quantity,
         reason: ExitReason,
+    },
+
+    /// Place a reduce-only protective insurance stop (ADR-0039)
+    PlaceInsuranceStopOrder {
+        symbol: Symbol,
+        side: OrderSide,
+        quantity: Quantity,
+        stop_price: Price,
     },
 
     /// Cancel an order

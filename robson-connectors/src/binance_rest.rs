@@ -385,6 +385,45 @@ impl BinanceRestClient {
         serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
     }
 
+    /// Place a reduce-only protective `STOP_MARKET` order (ADR-0039).
+    ///
+    /// Mirrors `place_market_order` for signing and response parsing, but posts
+    /// a `STOP_MARKET` that is accepted (status `NEW`) and triggers when price
+    /// crosses `stop_price`. Always reduce-only: it can only close the open
+    /// position it protects.
+    ///
+    /// # Endpoint
+    ///
+    /// `POST /fapi/v1/order`
+    pub async fn place_stop_market_order(
+        &self,
+        symbol: &str,
+        side: Side,
+        quantity: Decimal,
+        stop_price: Decimal,
+        client_order_id: &str,
+    ) -> Result<BinanceOrderResponse, BinanceRestError> {
+        let side_str = match side {
+            Side::Long => "BUY",
+            Side::Short => "SELL",
+        };
+
+        let params = vec![
+            ("symbol", symbol.to_string()),
+            ("side", side_str.to_string()),
+            ("type", "STOP_MARKET".to_string()),
+            ("stopPrice", stop_price.to_string()),
+            ("quantity", quantity.to_string()),
+            ("reduceOnly", "true".to_string()),
+            ("newClientOrderId", client_order_id.to_string()),
+            ("newOrderRespType", "RESULT".to_string()),
+        ];
+
+        let body = self.post_signed("/fapi/v1/order", params).await?;
+
+        serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
+    }
+
     /// Cancel an open order.
     ///
     /// `DELETE /fapi/v1/order`
@@ -399,6 +438,21 @@ impl BinanceRestClient {
         ];
 
         let body = self.delete_signed("/fapi/v1/order", params).await?;
+
+        serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
+    }
+
+    /// Query currently open (unfilled) orders for a symbol.
+    ///
+    /// `GET /fapi/v1/openOrders` (signed). Used by the reconciliation worker's
+    /// orphan insurance-order sweep (ADR-0039).
+    pub async fn get_open_orders(
+        &self,
+        symbol: &str,
+    ) -> Result<Vec<BinanceOpenOrder>, BinanceRestError> {
+        let params = vec![("symbol", symbol.to_string())];
+
+        let body = self.get_signed("/fapi/v1/openOrders", params).await?;
 
         serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
     }
@@ -832,6 +886,30 @@ pub struct BinanceFill {
     pub commission_asset: String,
 }
 
+/// An open order returned by `GET /fapi/v1/openOrders`.
+///
+/// Only the fields the orphan insurance-order sweep needs (ADR-0039).
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceOpenOrder {
+    /// Exchange-assigned order id
+    pub order_id: u64,
+    /// Client-provided order id (robsond insurance stops carry the `ins-`
+    /// prefix)
+    pub client_order_id: String,
+    /// Order side (`BUY` / `SELL`)
+    pub side: String,
+    /// Order type (e.g. `STOP_MARKET`, `MARKET`)
+    #[serde(rename = "type")]
+    pub order_type: String,
+    /// Whether the order can only reduce an existing position
+    #[serde(default)]
+    pub reduce_only: bool,
+    /// Stop/trigger price for conditional orders; `0` when not applicable
+    #[serde(default)]
+    pub stop_price: Decimal,
+}
+
 /// Price ticker response.
 #[derive(Debug, Deserialize)]
 struct PriceResponse {
@@ -1230,5 +1308,35 @@ mod tests {
 
         assert_eq!(usdt.balance, dec!(122607.35137903));
         assert_eq!(usdt.availableBalance, dec!(23.72469206));
+    }
+
+    #[test]
+    fn test_open_order_response_parsing() {
+        let body = r#"[
+            {
+                "symbol": "BTCUSDT",
+                "orderId": 998877,
+                "clientOrderId": "ins-019f10a3-22b7-7093-bb2f-c66a51882bf5",
+                "side": "SELL",
+                "type": "STOP_MARKET",
+                "reduceOnly": true,
+                "stopPrice": "58888.00",
+                "status": "NEW",
+                "price": "0.00",
+                "origQty": "0.00435116",
+                "executedQty": "0.00"
+            }
+        ]"#;
+
+        let orders: Vec<BinanceOpenOrder> = serde_json::from_str(body).unwrap();
+        assert_eq!(orders.len(), 1);
+
+        let order = &orders[0];
+        assert_eq!(order.order_id, 998877);
+        assert_eq!(order.client_order_id, "ins-019f10a3-22b7-7093-bb2f-c66a51882bf5");
+        assert_eq!(order.side, "SELL");
+        assert_eq!(order.order_type, "STOP_MARKET");
+        assert!(order.reduce_only);
+        assert_eq!(order.stop_price, dec!(58888.00));
     }
 }

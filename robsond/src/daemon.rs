@@ -324,7 +324,13 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder = default_query_recorder();
         // Placeholder capital; will be updated from exchange in run().
-        let risk_config = RiskConfig::new(dec!(1)).unwrap();
+        // Execution-cost buffer parameters are operator-configured and are
+        // preserved across capital rebuilds (ADR-0039). Invalid values are a
+        // config error: fail fast at boot.
+        let risk_config = RiskConfig::new(dec!(1))
+            .unwrap()
+            .with_execution_costs(config.engine.taker_fee_rate, config.engine.stop_gap_bps)
+            .expect("invalid ROBSON_TAKER_FEE_RATE / ROBSON_STOP_GAP_BPS configuration");
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
@@ -384,7 +390,13 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
                 default_query_recorder()
             };
         // Placeholder capital; will be updated from exchange in run().
-        let risk_config = RiskConfig::new(dec!(1)).unwrap();
+        // Execution-cost buffer parameters are operator-configured and are
+        // preserved across capital rebuilds (ADR-0039). Invalid values are a
+        // config error: fail fast at boot.
+        let risk_config = RiskConfig::new(dec!(1))
+            .unwrap()
+            .with_execution_costs(config.engine.taker_fee_rate, config.engine.stop_gap_bps)
+            .expect("invalid ROBSON_TAKER_FEE_RATE / ROBSON_STOP_GAP_BPS configuration");
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
@@ -1695,6 +1707,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             DaemonEvent::MonthlyHaltReset {} => {
                 info!("MonthlyHalt reset to Active");
             },
+
+            DaemonEvent::InsuranceStopOrphanCancelled {
+                symbol,
+                exchange_order_id,
+                client_order_id,
+            } => {
+                warn!(
+                    %symbol,
+                    %exchange_order_id,
+                    %client_order_id,
+                    "Reconciliation cancelled an orphan insurance-stop order (ADR-0039)"
+                );
+            },
         }
 
         Ok(())
@@ -2215,9 +2240,9 @@ mod tests {
         };
 
         if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
-            *insurance_stop_id = Some(order.id);
+            *insurance_stop_id = Some(exchange_order_id.to_string());
         }
-        position.insurance_stop_id = Some(order.id);
+        position.insurance_stop_id = Some(exchange_order_id.to_string());
         store.orders().save(&order).await.unwrap();
         store.positions().save(position).await.unwrap();
     }

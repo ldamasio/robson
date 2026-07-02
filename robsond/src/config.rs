@@ -105,6 +105,12 @@ pub struct EngineConfig {
     pub min_tech_stop_percent: Decimal,
     /// Maximum tech stop distance (0.10 = 10%)
     pub max_tech_stop_percent: Decimal,
+    /// Taker fee rate per fill for the sizing execution-cost buffer
+    /// (env: ROBSON_TAKER_FEE_RATE, default 0.0005 = 0.05%). ADR-0039.
+    pub taker_fee_rate: Decimal,
+    /// Gap allowance past the stop in basis points of the stop price
+    /// (env: ROBSON_STOP_GAP_BPS, default 10). ADR-0039.
+    pub stop_gap_bps: Decimal,
 }
 
 /// Technical stop policy configuration loaded from environment (ADR-0024).
@@ -294,6 +300,8 @@ impl Config {
             engine: EngineConfig {
                 min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
                 max_tech_stop_percent: Decimal::new(10, 2), // 10%
+                taker_fee_rate: Decimal::new(5, 4),         // 0.05% per fill
+                stop_gap_bps: Decimal::from(10),            // 10 bps
             },
             tech_stop: TechStopConfigEnv {
                 min_stop_pct: Decimal::new(1, 1), // 0.1%
@@ -365,9 +373,22 @@ impl Config {
             Decimal::new(10, 2), // 10%
         )?;
 
+        // Execution-cost buffer parameters (ADR-0039). Operator-configured;
+        // validated by RiskConfig::with_execution_costs at engine build time.
+        let taker_fee_rate = Self::load_decimal_env(
+            "ROBSON_TAKER_FEE_RATE",
+            Decimal::new(5, 4), // 0.05% per fill
+        )?;
+        let stop_gap_bps = Self::load_decimal_env(
+            "ROBSON_STOP_GAP_BPS",
+            Decimal::from(10), // 10 bps past the stop
+        )?;
+
         Ok(EngineConfig {
             min_tech_stop_percent: min_tech_stop,
             max_tech_stop_percent: max_tech_stop,
+            taker_fee_rate,
+            stop_gap_bps,
         })
     }
 
@@ -596,6 +617,8 @@ impl Default for Config {
             engine: EngineConfig {
                 min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
                 max_tech_stop_percent: Decimal::new(10, 2), // 10%
+                taker_fee_rate: Decimal::new(5, 4),         // 0.05% per fill
+                stop_gap_bps: Decimal::from(10),            // 10 bps
             },
             tech_stop: TechStopConfigEnv {
                 min_stop_pct: Decimal::ONE,      // 1%

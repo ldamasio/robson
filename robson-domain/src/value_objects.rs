@@ -266,17 +266,36 @@ impl fmt::Display for OrderSide {
 // RiskConfig
 // =============================================================================
 
+/// Default taker fee rate per fill: 0.05% (Binance USD-M standard taker).
+/// Operator-configurable via [`RiskConfig::with_execution_costs`].
+fn default_taker_fee_rate() -> Decimal {
+    Decimal::new(5, 4) // 0.0005
+}
+
+/// Default gap allowance past the stop, in basis points of the stop price.
+/// Covers the expected STOP_MARKET trigger→fill slippage.
+fn default_stop_gap_bps() -> Decimal {
+    Decimal::from(10)
+}
+
 /// Risk configuration for position sizing (v3 policy)
 ///
 /// Risk per trade is capped at 1% of capital. This is a v3 policy decision:
 /// no configuration, no alternative modes, no overrides, and actual realized
 /// risk may be lower when the available 1x margin caps the position size.
 ///
-/// Position size is derived from the Golden Rule:
+/// Position size is derived from the Golden Rule with an execution-cost
+/// buffer (ADR-0039): the 1% budget must absorb the worst expected realized
+/// loss — chart distance plus round-trip taker fees plus a gap allowance
+/// past the stop — not just the chart distance.
 ///
 /// ```text
-/// Position Size = (Capital × 1%) / Stop Distance
+/// Position Size = (Capital × 1%) / (Stop Distance + Gap Allowance + Round-trip Fees per unit)
 /// ```
+///
+/// Execution-cost parameters are operator-configured values with
+/// conservative defaults (ADR-0023: never symbol-specific constants in
+/// policy text).
 ///
 /// # Example
 ///
@@ -287,11 +306,19 @@ impl fmt::Display for OrderSide {
 /// assert_eq!(config.capital(), dec!(10000));
 /// assert_eq!(config.risk_per_trade_pct(), dec!(1));
 /// assert_eq!(config.max_risk_amount(), dec!(100)); // 1% of 10000
+/// assert_eq!(config.taker_fee_rate(), dec!(0.0005));
+/// assert_eq!(config.stop_gap_bps(), dec!(10));
 /// ```
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RiskConfig {
     /// Available capital in quote currency (e.g., USDT)
     capital: Decimal,
+    /// Taker fee rate charged per fill (e.g., 0.0005 = 0.05%)
+    #[serde(default = "default_taker_fee_rate")]
+    taker_fee_rate: Decimal,
+    /// Gap allowance past the stop, in basis points of the stop price
+    #[serde(default = "default_stop_gap_bps")]
+    stop_gap_bps: Decimal,
 }
 
 impl RiskConfig {
@@ -305,6 +332,8 @@ impl RiskConfig {
     /// Create a new RiskConfig with validation
     ///
     /// Risk is always 1% — not configurable. Only capital is provided.
+    /// Execution-cost parameters take conservative defaults; override with
+    /// [`Self::with_execution_costs`].
     ///
     /// # Errors
     /// Returns `DomainError::InvalidRiskConfig` if capital <= 0
@@ -313,12 +342,72 @@ impl RiskConfig {
             return Err(DomainError::InvalidRiskConfig("Capital must be positive".to_string()));
         }
 
-        Ok(Self { capital })
+        Ok(Self {
+            capital,
+            taker_fee_rate: default_taker_fee_rate(),
+            stop_gap_bps: default_stop_gap_bps(),
+        })
+    }
+
+    /// Override execution-cost parameters (operator-configured values).
+    ///
+    /// `taker_fee_rate` is the per-fill fee fraction (0 ≤ rate < 0.01);
+    /// `stop_gap_bps` is the allowance past the stop in basis points of the
+    /// stop price (0 ≤ bps ≤ 100). Both feed the sizing denominator so the
+    /// 1% cap covers worst expected realized loss (ADR-0039, Policy 10).
+    ///
+    /// # Errors
+    /// Returns `DomainError::InvalidRiskConfig` when a parameter is out of
+    /// range.
+    pub fn with_execution_costs(
+        mut self,
+        taker_fee_rate: Decimal,
+        stop_gap_bps: Decimal,
+    ) -> Result<Self, DomainError> {
+        if taker_fee_rate < Decimal::ZERO || taker_fee_rate >= Decimal::new(1, 2) {
+            return Err(DomainError::InvalidRiskConfig(format!(
+                "Taker fee rate must be in [0, 0.01): {taker_fee_rate}"
+            )));
+        }
+        if stop_gap_bps < Decimal::ZERO || stop_gap_bps > Decimal::from(100) {
+            return Err(DomainError::InvalidRiskConfig(format!(
+                "Stop gap allowance must be in [0, 100] bps: {stop_gap_bps}"
+            )));
+        }
+        self.taker_fee_rate = taker_fee_rate;
+        self.stop_gap_bps = stop_gap_bps;
+        Ok(self)
+    }
+
+    /// Rebuild this config with a new capital, preserving the
+    /// operator-configured execution-cost parameters.
+    ///
+    /// Use this instead of [`Self::new`] whenever capital is refreshed at
+    /// runtime (month boundary, capital refresh, arm-time sizing) so the
+    /// execution-cost buffer survives the rebuild.
+    ///
+    /// # Errors
+    /// Returns `DomainError::InvalidRiskConfig` if capital <= 0
+    pub fn with_capital(&self, capital: Decimal) -> Result<Self, DomainError> {
+        if capital <= Decimal::ZERO {
+            return Err(DomainError::InvalidRiskConfig("Capital must be positive".to_string()));
+        }
+        Ok(Self { capital, ..*self })
     }
 
     /// Get capital
     pub fn capital(&self) -> Decimal {
         self.capital
+    }
+
+    /// Taker fee rate charged per fill (fraction, e.g. 0.0005)
+    pub fn taker_fee_rate(&self) -> Decimal {
+        self.taker_fee_rate
+    }
+
+    /// Gap allowance past the stop, in basis points of the stop price
+    pub fn stop_gap_bps(&self) -> Decimal {
+        self.stop_gap_bps
     }
 
     /// Get risk percentage cap (always 1%)

@@ -140,6 +140,34 @@ pub trait ExchangePort: Send + Sync {
         reduce_only: bool,
     ) -> Result<OrderResult, ExecError>;
 
+    /// Place a reduce-only protective `STOP_MARKET` order (ADR-0039).
+    ///
+    /// The insurance stop lives on the exchange so stop enforcement survives
+    /// daemon downtime. The order is accepted but not filled; the returned
+    /// `OrderResult` carries the exchange-assigned order id with no fill data
+    /// (zero filled quantity / fee). Use `cancel_order` to remove it.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - Trading pair (e.g., BTCUSDT)
+    /// * `side` - Close side for the position (Long → Sell, Short → Buy)
+    /// * `quantity` - Quantity to protect (the open position size)
+    /// * `stop_price` - Chart-derived trailing stop price (never a percentage
+    ///   of entry — see AGENTS.md rule 6 / ADR-0021)
+    /// * `client_order_id` - Unique ID for idempotency
+    ///
+    /// # Returns
+    ///
+    /// `OrderResult` for the accepted (unfilled) order on success.
+    async fn place_stop_market_order(
+        &self,
+        symbol: &Symbol,
+        side: OrderSide,
+        quantity: Quantity,
+        stop_price: Price,
+        client_order_id: &str,
+    ) -> Result<OrderResult, ExecError>;
+
     /// Cancel an existing order.
     ///
     /// # Arguments
@@ -151,6 +179,22 @@ pub trait ExchangePort: Send + Sync {
     ///
     /// `Ok(())` if cancelled, error otherwise.
     async fn cancel_order(&self, symbol: &Symbol, order_id: &str) -> Result<(), ExecError>;
+
+    /// Query currently open (unfilled) orders for a symbol (ADR-0039).
+    ///
+    /// Used by the reconciliation worker's orphan insurance-order sweep: an
+    /// open reduce-only `STOP_MARKET` whose `client_order_id` carries the
+    /// robsond `ins-` prefix but does not protect any tracked-open position is
+    /// cancelled.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - Trading pair to scan for open orders
+    ///
+    /// # Returns
+    ///
+    /// Open orders for the symbol on success (empty when none are live).
+    async fn get_open_orders(&self, symbol: &Symbol) -> Result<Vec<OpenOrderRecord>, ExecError>;
 
     /// Get current price for a symbol.
     ///
@@ -279,6 +323,28 @@ pub struct OrderResult {
     pub fee_asset: String,
     /// When the order was filled
     pub filled_at: DateTime<Utc>,
+}
+
+/// An open (unfilled) order observed on the exchange.
+///
+/// Returned by `get_open_orders` so the reconciliation worker can detect and
+/// cancel orphaned robsond-authored insurance stops (ADR-0039).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct OpenOrderRecord {
+    /// Exchange-assigned order id
+    pub exchange_order_id: String,
+    /// Client-provided order id (robsond insurance stops carry the `ins-`
+    /// prefix)
+    pub client_order_id: String,
+    /// Order type as reported by the exchange (e.g. `STOP_MARKET`, `MARKET`)
+    pub order_type: String,
+    /// Whether the order can only reduce an existing position
+    pub reduce_only: bool,
+    /// Stop/trigger price for conditional orders (`STOP_MARKET`); `None`
+    /// otherwise
+    pub stop_price: Option<Price>,
+    /// Outbound order side
+    pub side: OrderSide,
 }
 
 /// Individual trade from exchange trade history.

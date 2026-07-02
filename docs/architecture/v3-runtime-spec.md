@@ -362,6 +362,19 @@ TD-2026-05-05-001 Slices 0–5B2B) that enforces both sides of the invariant:
 `RejectedUnsupportedEvidence` for any `Estimated` input. See Policy I3 in
 `docs/policies/UNTRACKED-POSITION-RECONCILIATION.md`.
 
+**Exchange-side protective stop (ADR-0039)**: in addition to the software
+trailing-stop monitor, `robsond` places a reduce-only `STOP_MARKET` protective
+order on the exchange for every active position at its current chart-derived
+trailing stop, so stop enforcement survives daemon downtime. The order is
+robsond-authored under a `GovernedAction` (client order id carries the `ins-`
+prefix) and is recognized as robson-authored, not UNTRACKED. The reconciliation
+worker queries open orders per scanned symbol and cancels any such `ins-` order
+that no longer protects a tracked-open `Active` position (an orphan left behind
+by a manual/external close or a replace race). If the insurance stop fills while
+the daemon is down, the stale-Active close above resolves the fill as
+`OrderFillRecord` evidence. See
+[ADR-0039](../adr/ADR-0039-exchange-side-insurance-stop.md).
+
 ---
 
 ## Symbol-Agnostic Policy Invariant

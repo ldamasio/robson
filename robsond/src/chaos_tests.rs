@@ -66,8 +66,26 @@ impl ExchangePort for TimeoutExchange {
         Err(ExecError::Timeout("simulated exchange timeout".to_string()))
     }
 
+    async fn place_stop_market_order(
+        &self,
+        _symbol: &Symbol,
+        _side: OrderSide,
+        _quantity: Quantity,
+        _stop_price: Price,
+        _client_order_id: &str,
+    ) -> Result<robson_exec::OrderResult, ExecError> {
+        Err(ExecError::Timeout("simulated exchange timeout".to_string()))
+    }
+
     async fn cancel_order(&self, _symbol: &Symbol, _order_id: &str) -> Result<(), ExecError> {
         Ok(())
+    }
+
+    async fn get_open_orders(
+        &self,
+        _symbol: &Symbol,
+    ) -> Result<Vec<robson_exec::OpenOrderRecord>, ExecError> {
+        Ok(vec![])
     }
 
     async fn get_price(&self, _symbol: &Symbol) -> Result<Price, ExecError> {

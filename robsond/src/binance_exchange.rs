@@ -18,7 +18,7 @@ use robson_connectors::{BinanceRestClient, BinanceRestError};
 use robson_domain::{OrderSide, Price, Quantity, Side, Symbol};
 use robson_exec::{
     ports::{
-        ExchangePosition, FuturesBalance, FuturesSettings, SpotBalance, SpotOrder,
+        ExchangePosition, FuturesBalance, FuturesSettings, OpenOrderRecord, SpotBalance, SpotOrder,
         SpotOrderQuantity, SpotOrderRequest, SpotOrderSide, Transfer, TransferId,
         UniversalTransferType, UserTradeRecord,
     },
@@ -318,6 +318,75 @@ impl ExchangePort for BinanceExchangeAdapter {
         })
     }
 
+    async fn place_stop_market_order(
+        &self,
+        symbol: &Symbol,
+        side: OrderSide,
+        quantity: Quantity,
+        stop_price: Price,
+        client_order_id: &str,
+    ) -> Result<OrderResult, ExecError> {
+        let binance_side = match side {
+            OrderSide::Buy => Side::Long,
+            OrderSide::Sell => Side::Short,
+        };
+
+        let qty = normalize_market_quantity(symbol, quantity)?;
+
+        let response = self
+            .client
+            .place_stop_market_order(
+                &symbol.as_pair(),
+                binance_side,
+                qty,
+                stop_price.as_decimal(),
+                client_order_id,
+            )
+            .await
+            .map_err(Self::map_error)?;
+
+        // A protective STOP_MARKET is accepted, not filled: only `NEW` is the
+        // clean success. Any other status (triggered, expired, rejected) is
+        // surfaced so the executor records an `InsuranceStopFailed` audit
+        // event and the software stop remains the primary exit path.
+        match response.status.as_str() {
+            "NEW" => {},
+            "EXPIRED" | "CANCELED" | "REJECTED" => {
+                return Err(ExecError::Exchange(format!(
+                    "Insurance stop {} returned status '{}' (order_id={})",
+                    client_order_id, response.status, response.order_id
+                )));
+            },
+            other => {
+                return Err(ExecError::Exchange(format!(
+                    "Insurance stop {} returned unexpected status '{}' (order_id={})",
+                    client_order_id, other, response.order_id
+                )));
+            },
+        }
+
+        let placed_at = chrono::DateTime::from_timestamp_millis(response.update_time)
+            .unwrap_or_else(|| {
+                tracing::warn!(
+                    order_id = %response.order_id,
+                    update_time = response.update_time,
+                    "Invalid update_time from Binance — using local clock as fallback"
+                );
+                Utc::now()
+            });
+
+        // Accepted but unfilled: protective price recorded, no fill data.
+        Ok(OrderResult {
+            exchange_order_id: response.order_id.to_string(),
+            client_order_id: response.client_order_id,
+            fill_price: stop_price,
+            filled_quantity: Quantity::zero(),
+            fee: Decimal::ZERO,
+            fee_asset: "USDT".to_string(),
+            filled_at: placed_at,
+        })
+    }
+
     async fn cancel_order(&self, symbol: &Symbol, order_id: &str) -> Result<(), ExecError> {
         let order_id_num: u64 = order_id.parse().map_err(|_| {
             ExecError::Exchange(format!("Invalid order_id for cancel: {}", order_id))
@@ -329,6 +398,46 @@ impl ExchangePort for BinanceExchangeAdapter {
             .map_err(Self::map_error)?;
 
         Ok(())
+    }
+
+    async fn get_open_orders(&self, symbol: &Symbol) -> Result<Vec<OpenOrderRecord>, ExecError> {
+        let orders =
+            self.client.get_open_orders(&symbol.as_pair()).await.map_err(Self::map_error)?;
+
+        orders
+            .into_iter()
+            .map(|order| {
+                let side = match order.side.as_str() {
+                    "BUY" => OrderSide::Buy,
+                    "SELL" => OrderSide::Sell,
+                    other => {
+                        return Err(ExecError::Exchange(format!(
+                            "Open order {} has unexpected side '{}'",
+                            order.order_id, other
+                        )));
+                    },
+                };
+
+                // A stop price of 0 means the order is not conditional.
+                let stop_price =
+                    if order.stop_price != Decimal::ZERO {
+                        Some(Price::new(order.stop_price).map_err(|e| {
+                            ExecError::Exchange(format!("Invalid stop price: {}", e))
+                        })?)
+                    } else {
+                        None
+                    };
+
+                Ok(OpenOrderRecord {
+                    exchange_order_id: order.order_id.to_string(),
+                    client_order_id: order.client_order_id,
+                    order_type: order.order_type,
+                    reduce_only: order.reduce_only,
+                    stop_price,
+                    side,
+                })
+            })
+            .collect()
     }
 
     async fn get_price(&self, symbol: &Symbol) -> Result<Price, ExecError> {

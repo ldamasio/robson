@@ -177,6 +177,18 @@ pub(crate) fn map_daemon_event(event: &DaemonEvent) -> Option<PublicSseEvent> {
         DaemonEvent::MonthlyHaltReset {} => {
             Some(PublicSseEvent::new("monthly_halt.reset", json!({})))
         },
+        DaemonEvent::InsuranceStopOrphanCancelled {
+            symbol,
+            exchange_order_id,
+            client_order_id,
+        } => Some(PublicSseEvent::new(
+            "insurance_stop.orphan_cancelled",
+            json!({
+                "symbol": symbol.as_pair(),
+                "exchange_order_id": exchange_order_id,
+                "client_order_id": client_order_id,
+            }),
+        )),
         DaemonEvent::DetectorSignal(_)
         | DaemonEvent::DomainEvent(_)
         | DaemonEvent::MarketData(_)
@@ -325,6 +337,17 @@ mod tests {
         })
         .unwrap();
         assert_eq!(safety_exit_failed.event_type, "safety.exit_failed");
+
+        let orphan_cancelled = map_daemon_event(&DaemonEvent::InsuranceStopOrphanCancelled {
+            symbol: test_symbol(),
+            exchange_order_id: "STUB-1".to_string(),
+            client_order_id: "ins-orphan".to_string(),
+        })
+        .unwrap();
+        assert_eq!(orphan_cancelled.event_type, "insurance_stop.orphan_cancelled");
+        assert_eq!(orphan_cancelled.payload["symbol"], "BTCUSDT");
+        assert_eq!(orphan_cancelled.payload["exchange_order_id"], "STUB-1");
+        assert_eq!(orphan_cancelled.payload["client_order_id"], "ins-orphan");
 
         let safety_panic = map_daemon_event(&DaemonEvent::SafetyPanic {
             position_id: "BTCUSDT:long".to_string(),
