@@ -74,7 +74,11 @@ where
 
 pub(crate) async fn gather_order_fill_evidence<E, S>(
     exchange: &Arc<E>,
-    store: &Arc<S>,
+    // `insurance_stop_id` now carries the exchange-assigned order id directly
+    // (ADR-0039), so this function no longer needs a local order lookup. The
+    // parameter is retained to keep the call signature stable for the
+    // reconciliation callers (mission 2 will rewire evidence gathering).
+    _store: &Arc<S>,
     position: &Position,
 ) -> DaemonResult<Option<ReconciledCloseInput>>
 where
@@ -83,34 +87,21 @@ where
 {
     let candidate_order_id = match &position.state {
         PositionState::Active { insurance_stop_id, .. } => {
-            insurance_stop_id.or(position.insurance_stop_id)
+            insurance_stop_id.clone().or(position.insurance_stop_id.clone())
         },
-        _ => position.insurance_stop_id,
+        _ => position.insurance_stop_id.clone(),
     };
     let Some(order_id) = candidate_order_id else {
         return Ok(None);
     };
 
-    let Some(order) = store.orders().find_by_id(order_id).await? else {
+    // Query the exchange directly by the insurance-stop exchange order id.
+    let Some(result) = exchange.get_order_by_exchange_id(&position.symbol, &order_id).await? else {
         warn!(
             position_id = %position.id,
             %order_id,
-            "Reverse reconciliation could not resolve local insurance stop order"
+            "Reverse reconciliation could not resolve insurance stop fill on exchange"
         );
-        return Ok(None);
-    };
-    let Some(exchange_order_id) = order.exchange_order_id else {
-        warn!(
-            position_id = %position.id,
-            %order_id,
-            "Reverse reconciliation local insurance stop has no exchange order id"
-        );
-        return Ok(None);
-    };
-
-    let Some(result) =
-        exchange.get_order_by_exchange_id(&position.symbol, &exchange_order_id).await?
-    else {
         return Ok(None);
     };
 
@@ -866,9 +857,9 @@ mod tests {
         };
 
         if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
-            *insurance_stop_id = Some(order.id);
+            *insurance_stop_id = Some(exchange_order_id.to_string());
         }
-        position.insurance_stop_id = Some(order.id);
+        position.insurance_stop_id = Some(exchange_order_id.to_string());
         store.orders().save(&order).await.unwrap();
         store.positions().save(position).await.unwrap();
     }

@@ -43,6 +43,13 @@ enum ProjectionRoute {
     PositionDisarmed,
     ExitFilled,
     PositionClosedDomain,
+    // ADR-0039 insurance-stop events are audit-only in the postgres projection
+    // (the live order id is reconciled in mission 2). Routes exist so the
+    // projector does not reject them as unhandled.
+    InsuranceStopPlaced,
+    InsuranceStopReplaced,
+    InsuranceStopCancelled,
+    InsuranceStopFailed,
 }
 
 fn projection_route(event_type: &str) -> Option<ProjectionRoute> {
@@ -79,6 +86,12 @@ fn projection_route(event_type: &str) -> Option<ProjectionRoute> {
         },
         "exit_triggered" | "EXIT_TRIGGERED" => Some(ProjectionRoute::ExitTriggered),
         "exit_order_placed" | "EXIT_ORDER_PLACED" => Some(ProjectionRoute::ExitOrderPlaced),
+
+        // ADR-0039 insurance-stop events (audit-only in the projection).
+        "insurance_stop_placed" => Some(ProjectionRoute::InsuranceStopPlaced),
+        "insurance_stop_replaced" => Some(ProjectionRoute::InsuranceStopReplaced),
+        "insurance_stop_cancelled" => Some(ProjectionRoute::InsuranceStopCancelled),
+        "insurance_stop_failed" => Some(ProjectionRoute::InsuranceStopFailed),
 
         // Balance events
         "BALANCE_SAMPLED" => Some(ProjectionRoute::BalanceSampled),
@@ -176,6 +189,14 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
         Some(ProjectionRoute::ExitOrderPlaced) => {
             handlers::positions::handle_exit_order_placed(pool, envelope).await?
         },
+        Some(ProjectionRoute::InsuranceStopPlaced)
+        | Some(ProjectionRoute::InsuranceStopReplaced)
+        | Some(ProjectionRoute::InsuranceStopCancelled)
+        | Some(ProjectionRoute::InsuranceStopFailed) => {
+            // ADR-0039 insurance-stop events are audit-only here. The live
+            // exchange order id is reconciled against exchange state in mission
+            // 2; for now these events must not block projection advancement.
+        },
         Some(ProjectionRoute::BalanceSampled) => {
             handlers::balances::handle_balance_sampled(pool, envelope).await?
         },
@@ -250,6 +271,11 @@ mod tests {
             "exit_triggered",
             "exit_order_placed",
             "position_closed",
+            // ADR-0039 insurance-stop lifecycle events.
+            "insurance_stop_placed",
+            "insurance_stop_replaced",
+            "insurance_stop_cancelled",
+            "insurance_stop_failed",
         ];
 
         for event_type in runtime_event_types {

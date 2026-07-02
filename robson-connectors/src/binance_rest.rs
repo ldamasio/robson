@@ -385,6 +385,45 @@ impl BinanceRestClient {
         serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
     }
 
+    /// Place a reduce-only protective `STOP_MARKET` order (ADR-0039).
+    ///
+    /// Mirrors `place_market_order` for signing and response parsing, but posts
+    /// a `STOP_MARKET` that is accepted (status `NEW`) and triggers when price
+    /// crosses `stop_price`. Always reduce-only: it can only close the open
+    /// position it protects.
+    ///
+    /// # Endpoint
+    ///
+    /// `POST /fapi/v1/order`
+    pub async fn place_stop_market_order(
+        &self,
+        symbol: &str,
+        side: Side,
+        quantity: Decimal,
+        stop_price: Decimal,
+        client_order_id: &str,
+    ) -> Result<BinanceOrderResponse, BinanceRestError> {
+        let side_str = match side {
+            Side::Long => "BUY",
+            Side::Short => "SELL",
+        };
+
+        let params = vec![
+            ("symbol", symbol.to_string()),
+            ("side", side_str.to_string()),
+            ("type", "STOP_MARKET".to_string()),
+            ("stopPrice", stop_price.to_string()),
+            ("quantity", quantity.to_string()),
+            ("reduceOnly", "true".to_string()),
+            ("newClientOrderId", client_order_id.to_string()),
+            ("newOrderRespType", "RESULT".to_string()),
+        ];
+
+        let body = self.post_signed("/fapi/v1/order", params).await?;
+
+        serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
+    }
+
     /// Cancel an open order.
     ///
     /// `DELETE /fapi/v1/order`

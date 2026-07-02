@@ -61,7 +61,11 @@ pub struct Position {
     // Associated orders
     pub entry_order_id: Option<OrderId>,
     pub exit_order_id: Option<OrderId>,
-    pub insurance_stop_id: Option<OrderId>, // Exchange insurance stop (if enabled)
+    /// Exchange-assigned order id of the protective insurance stop, when one
+    /// is live on the exchange for this position (ADR-0039). Mirrors the id
+    /// held in `PositionState::Active` so the reconciliation worker can read it
+    /// without a state match.
+    pub insurance_stop_id: Option<String>,
     /// Binance exchange identifier captured on entry fill for Core/SafetyNet
     /// coordination.
     pub binance_position_id: Option<String>,
@@ -275,8 +279,9 @@ pub enum PositionState {
         favorable_extreme: Price,
         /// When the favorable extreme was reached
         extreme_at: DateTime<Utc>,
-        /// Insurance stop order on exchange (if enabled)
-        insurance_stop_id: Option<OrderId>,
+        /// Exchange-assigned order id of the protective insurance stop
+        /// (ADR-0039). `None` while no stop is live on the exchange.
+        insurance_stop_id: Option<String>,
         /// Last trailing stop price that was emitted (for idempotency)
         last_emitted_stop: Option<Price>,
     },

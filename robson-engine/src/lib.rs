@@ -193,6 +193,56 @@ pub enum EngineAction {
         reason: ExitReason,
     },
 
+    /// Place a reduce-only protective insurance stop on the exchange
+    /// (ADR-0039).
+    ///
+    /// Emitted on entry fill (and on a trailing-stop advance when no prior
+    /// stop exists). The stop price is always the position's current
+    /// chart-derived trailing stop — never a percentage of entry.
+    PlaceInsuranceStop {
+        /// Position being protected
+        position_id: PositionId,
+        /// Symbol to trade
+        symbol: Symbol,
+        /// Close side for the position (Long → Sell, Short → Buy)
+        side: robson_domain::OrderSide,
+        /// Quantity to protect (the open position size)
+        quantity: Quantity,
+        /// Chart-derived trailing stop price
+        stop_price: Price,
+    },
+
+    /// Cancel-replace the protective insurance stop after a trailing advance
+    /// (ADR-0039). The previous order is cancelled first; "unknown order"
+    /// errors are tolerated (the stop may have just filled).
+    ReplaceInsuranceStop {
+        /// Position being protected
+        position_id: PositionId,
+        /// Symbol to trade
+        symbol: Symbol,
+        /// Close side for the position
+        side: robson_domain::OrderSide,
+        /// Quantity to protect
+        quantity: Quantity,
+        /// Exchange order id of the previous stop being replaced
+        previous_order_id: String,
+        /// New chart-derived trailing stop price
+        new_stop_price: Price,
+    },
+
+    /// Cancel the protective insurance stop (ADR-0039).
+    ///
+    /// Inserted before `PlaceExitOrder` so a reduce-only stop and a market
+    /// exit never coexist. "Unknown order" errors are tolerated.
+    CancelInsuranceStop {
+        /// Position being exited
+        position_id: PositionId,
+        /// Symbol to trade
+        symbol: Symbol,
+        /// Exchange order id of the stop to cancel
+        order_id: String,
+    },
+
     /// Emit domain event for audit/persistence
     EmitEvent(Event),
 }
@@ -572,16 +622,29 @@ impl Engine {
         updated_position.updated_at = filled_at;
 
         // 5. Build actions (emit event)
-        let actions = vec![EngineAction::EmitEvent(Event::EntryFilled {
-            position_id: position.id,
-            order_id: entry_order_id,
-            fill_price,
-            filled_quantity,
-            fee,
-            initial_stop: initial_trailing_stop,
-            binance_position_id,
-            timestamp: filled_at,
-        })];
+        let actions = vec![
+            EngineAction::EmitEvent(Event::EntryFilled {
+                position_id: position.id,
+                order_id: entry_order_id,
+                fill_price,
+                filled_quantity,
+                fee,
+                initial_stop: initial_trailing_stop,
+                binance_position_id,
+                timestamp: filled_at,
+            }),
+            // Place a reduce-only protective stop on the exchange at the initial
+            // trailing stop (ADR-0039). Placement failure is tolerated by the
+            // executor (audit event) — the software stop remains the primary
+            // exit path.
+            EngineAction::PlaceInsuranceStop {
+                position_id: position.id,
+                symbol: position.symbol.clone(),
+                side: position.side.exit_action(),
+                quantity: filled_quantity,
+                stop_price: initial_trailing_stop,
+            },
+        ];
 
         Ok(EngineDecision::with_position(actions, updated_position))
     }
@@ -803,7 +866,15 @@ impl Engine {
         let reason = ExitReason::TrailingStop;
         let exit_side = position.side.exit_action();
 
-        let actions = vec![
+        // Read the live insurance-stop order id (if any) so the market exit can
+        // cancel it first (ADR-0039): a reduce-only stop and a market exit must
+        // never coexist on the exchange.
+        let insurance_stop_id = match &position.state {
+            PositionState::Active { insurance_stop_id, .. } => insurance_stop_id.clone(),
+            _ => None,
+        };
+
+        let mut actions = vec![
             // 1. Trigger exit event
             EngineAction::TriggerExit {
                 position_id: position.id,
@@ -811,7 +882,19 @@ impl Engine {
                 trigger_price,
                 stop_price,
             },
-            // 2. Place exit order
+        ];
+
+        // 2. Cancel the protective stop first, if one is live.
+        if let Some(order_id) = insurance_stop_id {
+            actions.push(EngineAction::CancelInsuranceStop {
+                position_id: position.id,
+                symbol: position.symbol.clone(),
+                order_id,
+            });
+        }
+
+        actions.extend([
+            // 3. Place exit order
             EngineAction::PlaceExitOrder {
                 position_id: position.id,
                 cycle_id: None,
@@ -820,7 +903,7 @@ impl Engine {
                 quantity: position.quantity,
                 reason,
             },
-            // 3. Emit event
+            // 4. Emit event
             EngineAction::EmitEvent(Event::ExitTriggered {
                 position_id: position.id,
                 reason,
@@ -828,7 +911,7 @@ impl Engine {
                 stop_price,
                 timestamp: Utc::now(),
             }),
-        ];
+        ]);
 
         EngineDecision::with_actions(actions)
     }
@@ -843,6 +926,13 @@ impl Engine {
         observed_watermark: Price,
         tick_timestamp: DateTime<Utc>,
     ) -> EngineDecision {
+        // Read the live insurance-stop order id (if any) to decide replace vs
+        // place on this trailing advance (ADR-0039).
+        let insurance_stop_id = match &position.state {
+            PositionState::Active { insurance_stop_id, .. } => insurance_stop_id.clone(),
+            _ => None,
+        };
+
         // Update position state with new trailing stop and favorable extreme
         let mut updated_position = position.clone();
         if let PositionState::Active {
@@ -867,15 +957,40 @@ impl Engine {
             updated_position.updated_at = Utc::now();
         }
 
+        // Move the protective insurance stop to the new trailing level
+        // (ADR-0039). Replace when a stop is already live; otherwise place
+        // (covers positions opened before this feature, or a prior place that
+        // failed). Idempotency derives from the exchange order id; failures are
+        // tolerated by the executor.
+        let insurance_action = match insurance_stop_id {
+            Some(previous_order_id) => EngineAction::ReplaceInsuranceStop {
+                position_id: position.id,
+                symbol: position.symbol.clone(),
+                side: position.side.exit_action(),
+                quantity: position.quantity,
+                previous_order_id,
+                new_stop_price: new_stop,
+            },
+            None => EngineAction::PlaceInsuranceStop {
+                position_id: position.id,
+                symbol: position.symbol.clone(),
+                side: position.side.exit_action(),
+                quantity: position.quantity,
+                stop_price: new_stop,
+            },
+        };
+
         let actions = vec![
-            // 1. Update trailing stop
+            // 1. Update trailing stop (in-memory only; no exchange I/O)
             EngineAction::UpdateTrailingStop {
                 position_id: position.id,
                 previous_stop,
                 new_stop,
                 trigger_price,
             },
-            // 2. Emit event
+            // 2. Move the protective stop to the new level (ADR-0039).
+            insurance_action,
+            // 3. Emit event
             EngineAction::EmitEvent(Event::TrailingStopUpdated {
                 position_id: position.id,
                 previous_stop,
@@ -883,7 +998,7 @@ impl Engine {
                 trigger_price,
                 timestamp: Utc::now(),
             }),
-            // 3. Emit per-tick audit evidence with the post-update stop.
+            // 4. Emit per-tick audit evidence with the post-update stop.
             EngineAction::EmitEvent(self.create_position_monitor_tick_event(
                 position,
                 trigger_price,
@@ -1110,7 +1225,13 @@ mod tests {
         let decision = engine.process_active_position(&position, &market).unwrap();
 
         assert!(decision.has_actions());
-        assert_eq!(decision.actions.len(), 3);
+        // UpdateTrailingStop + PlaceInsuranceStop (no live stop: ADR-0039) +
+        // TrailingStopUpdated event + PositionMonitorTick = 4 actions.
+        assert_eq!(decision.actions.len(), 4);
+        assert!(decision
+            .actions
+            .iter()
+            .any(|a| matches!(a, EngineAction::PlaceInsuranceStop { .. })));
 
         let (new_stop, previous_stop) =
             find_trailing_stop_update(&decision).expect("Expected UpdateTrailingStop action");
@@ -1881,5 +2002,186 @@ mod tests {
             );
             assert!(!has_trailing_stop_update_event(decision));
         }
+    }
+
+    // =========================================================================
+    // ADR-0039 Insurance Stop Emission Tests
+    // =========================================================================
+
+    /// Set a live insurance-stop order id on an active position (ADR-0039).
+    fn with_insurance_stop(mut position: Position, order_id: &str) -> Position {
+        if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+            *insurance_stop_id = Some(order_id.to_string());
+        }
+        position
+    }
+
+    /// Build a position in Entering state for entry-fill tests.
+    fn create_entering_position(side: Side, entry_price: Decimal, stop_price: Decimal) -> Position {
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let mut position = Position::new(Uuid::now_v7(), symbol, side);
+        position.entry_price = Some(Price::new(entry_price).unwrap());
+        position.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(
+            Price::new(entry_price).unwrap(),
+            Price::new(stop_price).unwrap(),
+        ));
+        position.quantity = Quantity::new(dec!(0.1)).unwrap();
+        position.state = PositionState::Entering {
+            entry_order_id: Uuid::now_v7(),
+            expected_entry: Price::new(entry_price).unwrap(),
+            signal_id: Uuid::now_v7(),
+        };
+        position
+    }
+
+    #[test]
+    fn test_entry_fill_decision_contains_place_insurance_stop() {
+        let config = RiskConfig::new(dec!(10000)).unwrap();
+        let engine = Engine::new(config);
+
+        // Entry 95k, technical stop 93.5k → initial trailing stop is 93.5k.
+        let position = create_entering_position(Side::Long, dec!(95000), dec!(93500));
+
+        let decision = engine
+            .process_entry_fill(
+                &position,
+                Price::new(dec!(95000)).unwrap(),
+                Quantity::new(dec!(0.1)).unwrap(),
+                dec!(0.001),
+                Utc::now(),
+                None,
+            )
+            .unwrap();
+
+        let place = decision.actions.iter().find_map(|a| match a {
+            EngineAction::PlaceInsuranceStop { side, quantity, stop_price, .. } => {
+                Some((*side, *quantity, *stop_price))
+            },
+            _ => None,
+        });
+        let (side, quantity, stop_price) =
+            place.expect("entry-fill decision must contain PlaceInsuranceStop");
+
+        // Long → exit side Sell; stop is the initial technical stop (not a pct
+        // of entry); quantity is the filled quantity.
+        assert_eq!(side, robson_domain::OrderSide::Sell);
+        assert_eq!(quantity.as_decimal(), dec!(0.1));
+        assert_eq!(stop_price.as_decimal(), dec!(93500));
+    }
+
+    #[test]
+    fn test_trailing_stop_update_emits_replace_when_insurance_present() {
+        let config = RiskConfig::new(dec!(10000)).unwrap();
+        let engine = Engine::new(config);
+
+        // Active Long with a live insurance stop; price advances one full span.
+        let position = with_insurance_stop(
+            create_active_position(Side::Long, dec!(95000), dec!(93500), dec!(95000), dec!(1500)),
+            "INS-1",
+        );
+        let market = create_market_data(dec!(96500));
+
+        let decision = engine.process_active_position(&position, &market).unwrap();
+
+        let replace = decision.actions.iter().find_map(|a| match a {
+            EngineAction::ReplaceInsuranceStop { previous_order_id, new_stop_price, .. } => {
+                Some((previous_order_id.clone(), *new_stop_price))
+            },
+            _ => None,
+        });
+        let (previous_order_id, new_stop_price) =
+            replace.expect("trailing update with live insurance must ReplaceInsuranceStop");
+
+        assert_eq!(previous_order_id, "INS-1");
+        // After one full span, the stop advances from 93.5k to 95k (breakeven).
+        assert_eq!(new_stop_price.as_decimal(), dec!(95000));
+
+        // Must NOT also emit a Place when replacing.
+        let has_place = decision
+            .actions
+            .iter()
+            .any(|a| matches!(a, EngineAction::PlaceInsuranceStop { .. }));
+        assert!(!has_place, "must not place when an insurance stop is live");
+    }
+
+    #[test]
+    fn test_trailing_stop_update_emits_place_when_insurance_absent() {
+        let config = RiskConfig::new(dec!(10000)).unwrap();
+        let engine = Engine::new(config);
+
+        // Active Long with NO live insurance stop (pre-feature position).
+        let position =
+            create_active_position(Side::Long, dec!(95000), dec!(93500), dec!(95000), dec!(1500));
+        let market = create_market_data(dec!(96500));
+
+        let decision = engine.process_active_position(&position, &market).unwrap();
+
+        let place = decision.actions.iter().find_map(|a| match a {
+            EngineAction::PlaceInsuranceStop { stop_price, .. } => Some(*stop_price),
+            _ => None,
+        });
+        let stop_price = place.expect("trailing update without insurance must PlaceInsuranceStop");
+        assert_eq!(stop_price.as_decimal(), dec!(95000));
+
+        let has_replace = decision
+            .actions
+            .iter()
+            .any(|a| matches!(a, EngineAction::ReplaceInsuranceStop { .. }));
+        assert!(!has_replace, "must not replace when no insurance stop is live");
+    }
+
+    #[test]
+    fn test_exit_decision_cancels_insurance_before_exit_when_present() {
+        let config = RiskConfig::new(dec!(10000)).unwrap();
+        let engine = Engine::new(config);
+
+        // Active Long with a live insurance stop; price falls to the stop.
+        let position = with_insurance_stop(
+            create_active_position(Side::Long, dec!(95000), dec!(93500), dec!(95000), dec!(1500)),
+            "INS-1",
+        );
+        let market = create_market_data(dec!(93500));
+
+        let decision = engine.process_active_position(&position, &market).unwrap();
+
+        let cancel_idx = decision
+            .actions
+            .iter()
+            .position(|a| matches!(a, EngineAction::CancelInsuranceStop { order_id, .. } if order_id == "INS-1"))
+            .expect("exit decision must CancelInsuranceStop when a stop is live");
+        let exit_idx = decision
+            .actions
+            .iter()
+            .position(|a| matches!(a, EngineAction::PlaceExitOrder { .. }))
+            .expect("exit decision must PlaceExitOrder");
+
+        assert!(
+            cancel_idx < exit_idx,
+            "CancelInsuranceStop must precede PlaceExitOrder so a reduce-only stop and a market exit never coexist"
+        );
+    }
+
+    #[test]
+    fn test_exit_decision_no_cancel_when_insurance_absent() {
+        let config = RiskConfig::new(dec!(10000)).unwrap();
+        let engine = Engine::new(config);
+
+        // Active Long with NO live insurance stop; price falls to the stop.
+        let position =
+            create_active_position(Side::Long, dec!(95000), dec!(93500), dec!(95000), dec!(1500));
+        let market = create_market_data(dec!(93500));
+
+        let decision = engine.process_active_position(&position, &market).unwrap();
+
+        let has_cancel = decision
+            .actions
+            .iter()
+            .any(|a| matches!(a, EngineAction::CancelInsuranceStop { .. }));
+        assert!(!has_cancel, "must not cancel when no insurance stop is live");
+
+        assert!(decision
+            .actions
+            .iter()
+            .any(|a| matches!(a, EngineAction::PlaceExitOrder { .. })));
     }
 }

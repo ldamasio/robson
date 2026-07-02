@@ -2349,6 +2349,17 @@ mod tests {
             Err(ExecError::Timeout("unused".to_string()))
         }
 
+        async fn place_stop_market_order(
+            &self,
+            _symbol: &Symbol,
+            _side: OrderSide,
+            _quantity: Quantity,
+            _stop_price: Price,
+            _client_order_id: &str,
+        ) -> Result<OrderResult, ExecError> {
+            Err(ExecError::Timeout("unused".to_string()))
+        }
+
         async fn cancel_order(&self, _symbol: &Symbol, _order_id: &str) -> Result<(), ExecError> {
             Err(ExecError::Timeout("unused".to_string()))
         }

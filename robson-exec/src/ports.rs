@@ -140,6 +140,34 @@ pub trait ExchangePort: Send + Sync {
         reduce_only: bool,
     ) -> Result<OrderResult, ExecError>;
 
+    /// Place a reduce-only protective `STOP_MARKET` order (ADR-0039).
+    ///
+    /// The insurance stop lives on the exchange so stop enforcement survives
+    /// daemon downtime. The order is accepted but not filled; the returned
+    /// `OrderResult` carries the exchange-assigned order id with no fill data
+    /// (zero filled quantity / fee). Use `cancel_order` to remove it.
+    ///
+    /// # Arguments
+    ///
+    /// * `symbol` - Trading pair (e.g., BTCUSDT)
+    /// * `side` - Close side for the position (Long → Sell, Short → Buy)
+    /// * `quantity` - Quantity to protect (the open position size)
+    /// * `stop_price` - Chart-derived trailing stop price (never a percentage
+    ///   of entry — see AGENTS.md rule 6 / ADR-0021)
+    /// * `client_order_id` - Unique ID for idempotency
+    ///
+    /// # Returns
+    ///
+    /// `OrderResult` for the accepted (unfilled) order on success.
+    async fn place_stop_market_order(
+        &self,
+        symbol: &Symbol,
+        side: OrderSide,
+        quantity: Quantity,
+        stop_price: Price,
+        client_order_id: &str,
+    ) -> Result<OrderResult, ExecError>;
+
     /// Cancel an existing order.
     ///
     /// # Arguments

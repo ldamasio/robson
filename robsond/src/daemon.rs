@@ -2215,9 +2215,9 @@ mod tests {
         };
 
         if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
-            *insurance_stop_id = Some(order.id);
+            *insurance_stop_id = Some(exchange_order_id.to_string());
         }
-        position.insurance_stop_id = Some(order.id);
+        position.insurance_stop_id = Some(exchange_order_id.to_string());
         store.orders().save(&order).await.unwrap();
         store.positions().save(position).await.unwrap();
     }

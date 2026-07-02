@@ -125,6 +125,19 @@ impl ExchangePort for PostConvertedCrashExchange {
             .await
     }
 
+    async fn place_stop_market_order(
+        &self,
+        symbol: &Symbol,
+        side: OrderSide,
+        quantity: Quantity,
+        stop_price: Price,
+        client_order_id: &str,
+    ) -> Result<OrderResult, ExecError> {
+        self.inner
+            .place_stop_market_order(symbol, side, quantity, stop_price, client_order_id)
+            .await
+    }
+
     async fn cancel_order(&self, symbol: &Symbol, order_id: &str) -> Result<(), ExecError> {
         self.inner.cancel_order(symbol, order_id).await
     }
