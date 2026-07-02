@@ -20,9 +20,13 @@ Production incident (repository-verified via pod logs and `monthly_state`):
   capital_base 351.71 — Policy 10 cap).
 - `robsond` crashed (`fatal runtime error: stack overflow`) and the position
   went unmonitored for 2726 minutes (~45.4 h) with no order on the exchange.
-- On restart (2026-06-30 21:15 UTC), startup recovery replayed 182 candles,
-  found the stop already crossed, and exited at market: fill 58614.50 —
-  273.50 below the technical stop.
+- On restart (2026-06-30 21:15 UTC), startup recovery replayed 182 candles.
+  During the gap the price had completed one full span of profit, so the
+  replay legitimately advanced the trailing stop to breakeven (59696.90);
+  the price had then fallen through it. Recovery exited at market: fill
+  58614.50 — 1082.40 below the breakeven stop the daemon would have
+  enforced live. The outage turned a ~breakeven exit into the month's
+  full loss.
 - Realized June loss recorded in `monthly_state`: 5.2155 USDT = **1.48% of
   capital_base**, violating the 1% per-trade maximum-loss cap (ADR-0024,
   Policy Invariant 10). The entire excess is attributable to the outage gap;
@@ -145,6 +149,9 @@ Recorded here for traceability; each needs its own fix, none blocks this ADR:
    `MonthBoundaryReset` for that month. July 2026 has no `monthly_state`
    row as a result; needs operator remediation and a code fix (seed from
    persisted state, not wall clock).
-4. `ExitTriggered` audit event logged `stop=59696.90` (the entry price)
-   instead of the actual stop 58888.00 in the startup-recovery exit path —
-   parameter mix-up to fix.
+4. RETRACTED (2026-07-02, same day): `ExitTriggered` logging `stop=59696.90`
+   initially looked like a parameter mix-up (value equals the entry price).
+   Code review of `startup_recovery::replay_candles` showed the replay had
+   legitimately advanced the trailing stop by one full span to breakeven
+   (58888.00 + 808.90 = 59696.90) before the exit — the audit fields were
+   correct. No fix needed; kept here so the wrong lead is not re-chased.
