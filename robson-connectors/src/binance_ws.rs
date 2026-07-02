@@ -215,45 +215,46 @@ impl BinanceWsStream {
     /// Returns `None` if the stream is closed.
     /// Returns `Err` if there was an error receiving or parsing the message.
     pub async fn next(&mut self) -> Option<Result<WsMessage, BinanceWsError>> {
-        // Send ping if needed (every 3 minutes to keep connection alive)
-        if let Some(last_ping) = self.last_ping {
-            if last_ping.elapsed() > Duration::from_secs(180) {
-                if let Err(e) = self.ping().await {
-                    return Some(Err(e));
+        // Iterative, not recursive: skipping control frames must not grow
+        // the poll stack, or a control-frame flood overflows the worker.
+        loop {
+            // Send ping if needed (every 3 minutes to keep connection alive)
+            if let Some(last_ping) = self.last_ping {
+                if last_ping.elapsed() > Duration::from_secs(180) {
+                    if let Err(e) = self.ping().await {
+                        return Some(Err(e));
+                    }
                 }
+            } else {
+                // First message, initialize ping timer
+                self.last_ping = Some(std::time::Instant::now());
             }
-        } else {
-            // First message, initialize ping timer
-            self.last_ping = Some(std::time::Instant::now());
-        }
 
-        match self.inner.next().await {
-            Some(Ok(Message::Text(text))) => {
-                // Parse JSON message based on stream type
-                match serde_json::from_str(&text) {
-                    Ok(msg) => Some(Ok(msg)),
-                    Err(e) => Some(Err(BinanceWsError::ParseError(e.to_string()))),
-                }
-            },
-            Some(Ok(Message::Ping(payload))) => {
-                // Binance requires pong responses to echo the ping payload.
-                if let Err(e) = self.pong(payload).await {
-                    return Some(Err(e));
-                }
-                // Continue receiving next message
-                Box::pin(self.next()).await
-            },
-            Some(Ok(Message::Pong(_))) => {
-                // Pong received, continue
-                Box::pin(self.next()).await
-            },
-            Some(Ok(Message::Close(_))) => None,
-            Some(Err(e)) => Some(Err(BinanceWsError::ReceiveFailed(e.to_string()))),
-            None => None,
-            _ => {
-                // Binary or Frame messages, skip
-                Box::pin(self.next()).await
-            },
+            match self.inner.next().await {
+                Some(Ok(Message::Text(text))) => {
+                    // Parse JSON message based on stream type
+                    return match serde_json::from_str(&text) {
+                        Ok(msg) => Some(Ok(msg)),
+                        Err(e) => Some(Err(BinanceWsError::ParseError(e.to_string()))),
+                    };
+                },
+                Some(Ok(Message::Ping(payload))) => {
+                    // Binance requires pong responses to echo the ping payload.
+                    if let Err(e) = self.pong(payload).await {
+                        return Some(Err(e));
+                    }
+                    // Continue receiving next message
+                },
+                Some(Ok(Message::Pong(_))) => {
+                    // Pong received, continue
+                },
+                Some(Ok(Message::Close(_))) => return None,
+                Some(Err(e)) => return Some(Err(BinanceWsError::ReceiveFailed(e.to_string()))),
+                None => return None,
+                _ => {
+                    // Binary or Frame messages, skip
+                },
+            }
         }
     }
 

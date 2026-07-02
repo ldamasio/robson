@@ -58,8 +58,19 @@ fn map_daemon_result(result: DaemonResult<()>) -> anyhow::Result<()> {
     }
 }
 
-#[tokio::main]
-async fn main() -> anyhow::Result<()> {
+fn main() -> anyhow::Result<()> {
+    // 8 MiB worker stacks (default 2 MiB): robsond aborted twice in
+    // production (2026-06-30, 2026-07-02) with tokio-runtime-worker stack
+    // overflows that leave no backtrace. Larger stacks close that crash
+    // class while the offending path is still being hunted.
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_stack_size(8 * 1024 * 1024)
+        .build()?
+        .block_on(async_main())
+}
+
+async fn async_main() -> anyhow::Result<()> {
     // Initialize tracing
     tracing_subscriber::registry()
         .with(fmt::layer())
