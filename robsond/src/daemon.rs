@@ -120,8 +120,12 @@ fn default_query_recorder() -> Arc<dyn QueryRecorder> {
 }
 
 fn initial_month_check() -> Arc<RwLock<(i32, u32)>> {
-    let now = Utc::now();
-    Arc::new(RwLock::new((now.year(), now.month())))
+    // Sentinel, never the wall-clock month: seeding with the current month
+    // made a restart landing after a month boundary skip that month's
+    // MonthBoundaryReset forever (2026-07 incident). With the sentinel, the
+    // first poll always runs handle_month_boundary, which consults the
+    // persisted monthly_state row and no-ops when the reset already exists.
+    Arc::new(RwLock::new((0, 0)))
 }
 
 /// Adapts a generic `Store` into a concrete `PositionRepository` trait object.
@@ -769,6 +773,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                 );
                 return Ok(());
             }
+
+            // Keep event_log/snapshots partitions ahead before appending the
+            // reset event — the 2026-07 boundary failed because event_log had
+            // no partition for the new month.
+            sqlx::query("SELECT create_event_log_partitions(3)").execute(&**pool).await?;
+            sqlx::query("SELECT create_snapshot_partitions(3)").execute(&**pool).await?;
         }
 
         let open_positions = self.store.positions().find_risk_open().await?;
@@ -1805,6 +1815,19 @@ mod tests {
 
         assert_eq!(month_events.len(), 1, "month boundary must emit once per in-process month");
         assert_eq!(month_events[0], (dec!(10000), dec!(0), 5, 2026));
+    }
+
+    #[tokio::test]
+    async fn test_first_poll_after_startup_always_verifies_month_boundary() {
+        // Regression (2026-07 incident): seeding last_month_check with the
+        // wall-clock month made a restart landing after a month boundary
+        // skip that month's MonthBoundaryReset forever. The sentinel seed
+        // must force the first poll to run the boundary check.
+        let daemon = Daemon::new_stub(Config::test());
+
+        let now = Utc.with_ymd_and_hms(2026, 7, 2, 8, 29, 4).single().unwrap();
+        assert!(daemon.poll_month_boundary(now).await.unwrap());
+        assert!(!daemon.poll_month_boundary(now).await.unwrap());
     }
 
     #[tokio::test]
