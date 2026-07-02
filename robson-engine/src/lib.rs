@@ -1592,7 +1592,9 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        let expected_size = dec!(100) / dec!(1500);
+        // $100 budget / ($1,500 distance + $93.50 gap allowance (10 bps of
+        // stop) + $95 round-trip fees) — execution-cost buffer per ADR-0039.
+        let expected_size = dec!(100) / (dec!(1500) + dec!(93.5) + dec!(95));
         assert_eq!(quantity.as_decimal(), expected_size);
     }
 

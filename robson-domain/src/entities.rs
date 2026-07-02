@@ -158,10 +158,18 @@ impl Position {
 ///
 /// **THE GOLDEN RULE**: Position size is DERIVED from technical stop distance.
 ///
+/// The 1% budget is a maximum-loss cap (ADR-0024 Policy 10), so it must
+/// absorb the worst expected realized loss, not just the chart distance:
+/// round-trip taker fees and a gap allowance past the stop are priced into
+/// the denominator (ADR-0039).
+///
 /// ```text
-/// Risk-sized qty  = Max Risk Amount / Stop Distance
+/// Worst loss per unit = Stop Distance
+///                     + Gap Allowance            (stop × gap_bps / 10000)
+///                     + Round-trip fees per unit (fee_rate × (entry + max(entry, stop)))
+/// Risk-sized qty   = Max Risk Amount / Worst loss per unit
 /// Margin-sized qty = Capital / Entry Price
-/// Position Size   = min(Risk-sized qty, Margin-sized qty)
+/// Position Size    = min(Risk-sized qty, Margin-sized qty)
 /// ```
 ///
 /// # Example
@@ -178,18 +186,19 @@ impl Position {
 /// let size = calculate_position_size(&config, &entry, &tech_stop).unwrap();
 ///
 /// // Max Risk = $10,000 × 1% = $100
-/// // Stop Distance = $1,500
+/// // Worst loss per unit = $1,500 + $93.50 (10 bps of stop)
+/// //                     + $95 (0.05% × ($95,000 + $95,000)) = $1,688.50
 /// // Margin cap = $10,000 / $95,000 = 0.1052... BTC
-/// // Final Position Size = min($100 / $1,500, $10,000 / $95,000)
-/// // = 0.0666... BTC
-/// assert!(size.as_decimal() > dec!(0.066) && size.as_decimal() < dec!(0.067));
+/// // Final Position Size = min($100 / $1,688.50, 0.1052...)
+/// // = 0.0592... BTC
+/// assert!(size.as_decimal() > dec!(0.059) && size.as_decimal() < dec!(0.0593));
 /// ```
 ///
 /// # Key Insight
 ///
 /// - Wide technical stop → Smaller position size
 /// - Tight technical stop → Larger position size
-/// - **Risk amount stays at or below the configured maximum**
+/// - **Worst expected realized loss stays at or below the configured maximum**
 ///
 /// # Errors
 ///
@@ -215,9 +224,18 @@ pub fn calculate_position_size(
         return Err(DomainError::PositionSizingError("Entry price must be positive".to_string()));
     }
 
-    // Golden Rule: size by stop risk, then cap by available 1x margin.
+    // Golden Rule with execution-cost buffer (ADR-0039, Policy 10): the 1%
+    // budget covers worst expected realized loss — chart distance, expected
+    // gap past the stop, and round-trip taker fees — then the available 1x
+    // margin caps the size. The exit-fee base uses max(entry, stop) so the
+    // buffer stays conservative for both sides.
+    let stop = tech_stop.initial_stop.as_decimal();
+    let gap_allowance = stop * risk_config.stop_gap_bps() / rust_decimal::Decimal::from(10_000);
+    let round_trip_fees_per_unit = risk_config.taker_fee_rate() * (entry + entry.max(stop));
+    let worst_loss_per_unit = stop_distance + gap_allowance + round_trip_fees_per_unit;
+
     let max_risk = risk_config.max_risk_amount();
-    let risk_sized_qty = max_risk / stop_distance;
+    let risk_sized_qty = max_risk / worst_loss_per_unit;
     let margin_sized_qty =
         (risk_config.capital() * rust_decimal::Decimal::from(RiskConfig::LEVERAGE)) / entry;
     let position_size = risk_sized_qty.min(margin_sized_qty);
@@ -1029,9 +1047,9 @@ mod tests {
 
         let size = calculate_position_size(&config, &entry, &tech_stop).unwrap();
 
-        // Expected: $100 risk / $1,500 distance = 0.0666... BTC
-        // Check it's approximately 0.0666...
-        let expected = dec!(100) / dec!(1500);
+        // Expected: $100 risk / ($1,500 distance + $93.50 gap allowance
+        // (10 bps of stop) + $95 round-trip fees (0.05% × $190,000))
+        let expected = dec!(100) / (dec!(1500) + dec!(93.5) + dec!(95));
         assert_eq!(size.as_decimal(), expected);
     }
 
@@ -1047,8 +1065,8 @@ mod tests {
 
         let size = calculate_position_size(&config, &entry, &tech_stop).unwrap();
 
-        // Expected: $100 / $3,000 = 0.0333... BTC
-        let expected = dec!(100) / dec!(3000);
+        // Expected: $100 / ($3,000 + $92 gap + $95 fees)
+        let expected = dec!(100) / (dec!(3000) + dec!(92) + dec!(95));
         assert_eq!(size.as_decimal(), expected);
     }
 
@@ -1081,8 +1099,8 @@ mod tests {
 
         let size = calculate_position_size(&config, &entry, &tech_stop).unwrap();
 
-        // Expected: $500 (1% of 50k) / $1,500 = 0.3333... BTC
-        let expected = dec!(500) / dec!(1500);
+        // Expected: $500 (1% of 50k) / ($1,500 + $93.50 gap + $95 fees)
+        let expected = dec!(500) / (dec!(1500) + dec!(93.5) + dec!(95));
         assert_eq!(size.as_decimal(), expected);
     }
 
@@ -1107,31 +1125,31 @@ mod tests {
 
     #[test]
     fn test_position_sizing_risk_stays_within_cap() {
-        // This test validates the golden rule:
-        // Regardless of stop distance, the realized risk stays at or below 1% of
-        // capital
+        // This test validates the golden rule with the execution-cost buffer
+        // (ADR-0039): regardless of stop distance, the WORST EXPECTED realized
+        // loss — price distance through the gap allowance plus round-trip
+        // fees — lands exactly on the 1% budget, so the chart-distance loss
+        // alone stays strictly below it.
         let config = RiskConfig::new(dec!(10000)).unwrap(); // $100 risk
 
-        // Test 1: Wide stop ($3,000)
-        let entry1 = Price::new(dec!(95000)).unwrap();
-        let stop1 = Price::new(dec!(92000)).unwrap();
-        let tech_stop1 = TechnicalStopDistance::from_entry_and_stop(entry1, stop1);
-        let size1 = calculate_position_size(&config, &entry1, &tech_stop1).unwrap();
-        // If stopped out: loss = 0.0333... * $3,000 = $100 ✓
-        let loss1 = size1.as_decimal() * dec!(3000);
-        // Use round to handle decimal precision
-        assert_eq!(loss1.round_dp(2), dec!(100));
+        for (entry, stop) in [(dec!(95000), dec!(92000)), (dec!(95000), dec!(94000))] {
+            let entry = Price::new(entry).unwrap();
+            let stop = Price::new(stop).unwrap();
+            let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+            let size = calculate_position_size(&config, &entry, &tech_stop).unwrap();
+            let qty = size.as_decimal();
 
-        // Test 2: Tight stop ($1,000)
-        let entry2 = Price::new(dec!(95000)).unwrap();
-        let stop2 = Price::new(dec!(94000)).unwrap();
-        let tech_stop2 = TechnicalStopDistance::from_entry_and_stop(entry2, stop2);
-        let size2 = calculate_position_size(&config, &entry2, &tech_stop2).unwrap();
-        // If stopped out: loss = 0.1 * $1,000 = $100 ✓
-        let loss2 = size2.as_decimal() * dec!(1000);
-        assert_eq!(loss2, dec!(100));
+            let gap = stop.as_decimal() * config.stop_gap_bps() / dec!(10000);
+            let fees = config.taker_fee_rate()
+                * (entry.as_decimal() + entry.as_decimal().max(stop.as_decimal()));
+            let worst_loss = qty * (tech_stop.distance + gap + fees);
+            let chart_loss = qty * tech_stop.distance;
 
-        // Both positions stay within the 1% risk cap.
+            // Worst expected loss consumes the budget exactly...
+            assert_eq!(worst_loss.round_dp(2), dec!(100));
+            // ...so the pure chart-distance loss is strictly inside the cap.
+            assert!(chart_loss < config.max_risk_amount());
+        }
     }
 
     #[test]
