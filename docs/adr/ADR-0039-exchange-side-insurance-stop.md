@@ -1,6 +1,6 @@
 # ADR-0039: Exchange-Side Insurance Stop
 
-Status: Proposed (operator-initiated 2026-07-02; implementation FOLLOW-UP REQUIRED)
+Status: Accepted (operator-initiated 2026-07-02; implemented and merged 2026-07-03 via PR #102)
 Date: 2026-07-02
 
 ## Context
