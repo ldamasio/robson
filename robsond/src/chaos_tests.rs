@@ -81,6 +81,14 @@ impl ExchangePort for TimeoutExchange {
         Ok(())
     }
 
+    async fn cancel_stop_market_order(
+        &self,
+        _symbol: &Symbol,
+        _algo_id: &str,
+    ) -> Result<(), ExecError> {
+        Ok(())
+    }
+
     async fn get_open_orders(
         &self,
         _symbol: &Symbol,
@@ -164,6 +172,14 @@ impl ExchangePort for TimeoutExchange {
         &self,
         _symbol: &Symbol,
         _order_id: &str,
+    ) -> Result<Option<robson_exec::OrderResult>, ExecError> {
+        Ok(None)
+    }
+
+    async fn get_stop_order_fill(
+        &self,
+        _symbol: &Symbol,
+        _algo_id: &str,
     ) -> Result<Option<robson_exec::OrderResult>, ExecError> {
         Ok(None)
     }

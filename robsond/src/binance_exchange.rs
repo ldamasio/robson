@@ -25,7 +25,7 @@ use robson_exec::{
     ExchangePort, ExecError, OrderResult,
 };
 use rust_decimal::Decimal;
-use tracing::info;
+use tracing::{info, warn};
 
 /// Truncate a quantity to a given number of decimal places (round down).
 fn trunc_to_scale(value: Decimal, scale: u32) -> Decimal {
@@ -125,6 +125,18 @@ impl BinanceExchangeAdapter {
             },
             BinanceRestError::InvalidParameter(msg) => ExecError::OrderRejected(msg.clone()),
             _ => ExecError::Exchange(error.to_string()),
+        }
+    }
+
+    fn is_tolerated_algo_cancel_error(error: &BinanceRestError) -> bool {
+        match error {
+            BinanceRestError::ApiError { code, msg } => {
+                matches!(*code, -2011 | -2013)
+                    || msg.to_ascii_lowercase().contains("unknown")
+                    || msg.to_ascii_lowercase().contains("not exist")
+                    || msg.to_ascii_lowercase().contains("already")
+            },
+            _ => false,
         }
     }
 }
@@ -349,18 +361,18 @@ impl ExchangePort for BinanceExchangeAdapter {
         // clean success. Any other status (triggered, expired, rejected) is
         // surfaced so the executor records an `InsuranceStopFailed` audit
         // event and the software stop remains the primary exit path.
-        match response.status.as_str() {
+        match response.algo_status.as_str() {
             "NEW" => {},
             "EXPIRED" | "CANCELED" | "REJECTED" => {
                 return Err(ExecError::Exchange(format!(
-                    "Insurance stop {} returned status '{}' (order_id={})",
-                    client_order_id, response.status, response.order_id
+                    "Insurance stop {} returned algoStatus '{}' (algo_id={})",
+                    client_order_id, response.algo_status, response.algo_id
                 )));
             },
             other => {
                 return Err(ExecError::Exchange(format!(
-                    "Insurance stop {} returned unexpected status '{}' (order_id={})",
-                    client_order_id, other, response.order_id
+                    "Insurance stop {} returned unexpected algoStatus '{}' (algo_id={})",
+                    client_order_id, other, response.algo_id
                 )));
             },
         }
@@ -368,7 +380,7 @@ impl ExchangePort for BinanceExchangeAdapter {
         let placed_at = chrono::DateTime::from_timestamp_millis(response.update_time)
             .unwrap_or_else(|| {
                 tracing::warn!(
-                    order_id = %response.order_id,
+                    algo_id = %response.algo_id,
                     update_time = response.update_time,
                     "Invalid update_time from Binance — using local clock as fallback"
                 );
@@ -377,14 +389,37 @@ impl ExchangePort for BinanceExchangeAdapter {
 
         // Accepted but unfilled: protective price recorded, no fill data.
         Ok(OrderResult {
-            exchange_order_id: response.order_id.to_string(),
-            client_order_id: response.client_order_id,
+            exchange_order_id: response.algo_id.to_string(),
+            client_order_id: response.client_algo_id,
             fill_price: stop_price,
             filled_quantity: Quantity::zero(),
             fee: Decimal::ZERO,
             fee_asset: "USDT".to_string(),
             filled_at: placed_at,
         })
+    }
+
+    async fn cancel_stop_market_order(
+        &self,
+        _symbol: &Symbol,
+        algo_id: &str,
+    ) -> Result<(), ExecError> {
+        let algo_id_num: i64 = algo_id.parse().map_err(|_| {
+            ExecError::Exchange(format!("Invalid algo_id for insurance stop cancel: {}", algo_id))
+        })?;
+
+        match self.client.cancel_algo_order(algo_id_num).await {
+            Ok(_) => Ok(()),
+            Err(error) if Self::is_tolerated_algo_cancel_error(&error) => {
+                warn!(
+                    %algo_id,
+                    %error,
+                    "Insurance stop algo order already gone; treating cancel as success"
+                );
+                Ok(())
+            },
+            Err(error) => Err(Self::map_error(error)),
+        }
     }
 
     async fn cancel_order(&self, symbol: &Symbol, order_id: &str) -> Result<(), ExecError> {
@@ -401,8 +436,11 @@ impl ExchangePort for BinanceExchangeAdapter {
     }
 
     async fn get_open_orders(&self, symbol: &Symbol) -> Result<Vec<OpenOrderRecord>, ExecError> {
-        let orders =
-            self.client.get_open_orders(&symbol.as_pair()).await.map_err(Self::map_error)?;
+        let orders = self
+            .client
+            .get_open_algo_orders(&symbol.as_pair())
+            .await
+            .map_err(Self::map_error)?;
 
         orders
             .into_iter()
@@ -412,16 +450,16 @@ impl ExchangePort for BinanceExchangeAdapter {
                     "SELL" => OrderSide::Sell,
                     other => {
                         return Err(ExecError::Exchange(format!(
-                            "Open order {} has unexpected side '{}'",
-                            order.order_id, other
+                            "Open algo order {} has unexpected side '{}'",
+                            order.algo_id, other
                         )));
                     },
                 };
 
                 // A stop price of 0 means the order is not conditional.
                 let stop_price =
-                    if order.stop_price != Decimal::ZERO {
-                        Some(Price::new(order.stop_price).map_err(|e| {
+                    if order.trigger_price != Decimal::ZERO {
+                        Some(Price::new(order.trigger_price).map_err(|e| {
                             ExecError::Exchange(format!("Invalid stop price: {}", e))
                         })?)
                     } else {
@@ -429,8 +467,8 @@ impl ExchangePort for BinanceExchangeAdapter {
                     };
 
                 Ok(OpenOrderRecord {
-                    exchange_order_id: order.order_id.to_string(),
-                    client_order_id: order.client_order_id,
+                    exchange_order_id: order.algo_id.to_string(),
+                    client_order_id: order.client_algo_id,
                     order_type: order.order_type,
                     reduce_only: order.reduce_only,
                     stop_price,
@@ -659,6 +697,28 @@ impl ExchangePort for BinanceExchangeAdapter {
             fee_asset,
             filled_at,
         }))
+    }
+
+    async fn get_stop_order_fill(
+        &self,
+        symbol: &Symbol,
+        algo_id: &str,
+    ) -> Result<Option<OrderResult>, ExecError> {
+        let algo_id_num: i64 = algo_id.parse().map_err(|_| {
+            ExecError::Exchange(format!("Invalid algo_id for insurance stop query: {}", algo_id))
+        })?;
+
+        let detail = match self.client.query_algo_order(algo_id_num).await {
+            Ok(detail) => detail,
+            Err(BinanceRestError::ApiError { code: -2013, .. }) => return Ok(None),
+            Err(error) => return Err(Self::map_error(error)),
+        };
+
+        if detail.actual_order_id.trim().is_empty() {
+            return Ok(None);
+        }
+
+        self.get_order_by_exchange_id(symbol, &detail.actual_order_id).await
     }
 
     async fn get_user_trades_since(

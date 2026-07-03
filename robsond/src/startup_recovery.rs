@@ -338,7 +338,7 @@ where
 
     // 1. Did the insurance stop FILL during the gap? If so the position is already
     //    closed on the exchange — reconcile-close from the fill.
-    match pm.exchange().get_order_by_exchange_id(&position.symbol, &existing_id).await {
+    match pm.exchange().get_stop_order_fill(&position.symbol, &existing_id).await {
         Ok(Some(fill)) => {
             let input = input_from_order_result(position_id, fill);
             match pm.reconcile_close(input).await {

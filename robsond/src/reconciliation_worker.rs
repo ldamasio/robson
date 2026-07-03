@@ -78,10 +78,9 @@ where
 
 pub(crate) async fn gather_order_fill_evidence<E, S>(
     exchange: &Arc<E>,
-    // `insurance_stop_id` now carries the exchange-assigned order id directly
-    // (ADR-0039), so this function no longer needs a local order lookup. The
-    // parameter is retained to keep the call signature stable for the
-    // reconciliation callers (mission 2 will rewire evidence gathering).
+    // `insurance_stop_id` carries the exchange-assigned algoId for the
+    // conditional insurance stop. The exchange port resolves it to the real
+    // triggered order before returning Policy-11 fill evidence.
     _store: &Arc<S>,
     position: &Position,
 ) -> DaemonResult<Option<ReconciledCloseInput>>
@@ -99,8 +98,7 @@ where
         return Ok(None);
     };
 
-    // Query the exchange directly by the insurance-stop exchange order id.
-    let Some(result) = exchange.get_order_by_exchange_id(&position.symbol, &order_id).await? else {
+    let Some(result) = exchange.get_stop_order_fill(&position.symbol, &order_id).await? else {
         warn!(
             position_id = %position.id,
             %order_id,
@@ -431,7 +429,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                     "Orphan insurance-stop order detected; cancelling"
                 );
 
-                match self.exchange.cancel_order(symbol, &order.exchange_order_id).await {
+                match self.exchange.cancel_stop_market_order(symbol, &order.exchange_order_id).await
+                {
                     Ok(()) => {
                         info!(
                             symbol = %symbol.as_pair(),
