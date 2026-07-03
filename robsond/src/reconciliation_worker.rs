@@ -156,6 +156,7 @@ pub(crate) fn input_from_order_result(
         fee: result.fee,
         fee_asset: result.fee_asset.clone(),
         closed_at: result.filled_at,
+        authored_client_order_id: Some(result.client_order_id.clone()),
         evidence: ReconciliationEvidence::OrderFillRecord(OrderFillEvidence {
             exchange_order_id: result.exchange_order_id,
             fill_price: result.fill_price,
@@ -178,6 +179,7 @@ pub(crate) fn input_from_user_trade(
         fee: trade.fee,
         fee_asset: trade.fee_asset.clone(),
         closed_at: trade.filled_at,
+        authored_client_order_id: None,
         evidence: ReconciliationEvidence::UserTradeRecord(UserTradeEvidence {
             exchange_order_id: trade.exchange_order_id,
             exchange_trade_id: trade.exchange_trade_id,
@@ -715,9 +717,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
             let manager = self.position_manager.read().await;
             manager.load_monthly_state(now).await?.capital_base
         };
-        let closed = self.store.positions().find_closed_in_month(now.year(), now.month()).await?;
-        let robson_month_net: Decimal =
-            closed.iter().map(|position| position.realized_pnl - position.fees_paid).sum();
+        let robson_month_net: Decimal = {
+            let manager = self.position_manager.read().await;
+            manager.robson_month_net(now).await?
+        };
         let expected_wallet_balance = previous_capital_base + robson_month_net;
         let unexplained_delta = wallet_balance - expected_wallet_balance;
 
@@ -780,9 +783,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         // insurance-stop fill was absorbed as "manual drift" and the slot
         // gauge showed 4 free after a 1% loss). Back the month's net result
         // out of the wallet before deriving the base.
-        let closed = self.store.positions().find_closed_in_month(now.year(), now.month()).await?;
-        let robson_month_net: Decimal =
-            closed.iter().map(|position| position.realized_pnl - position.fees_paid).sum();
+        let robson_month_net: Decimal = {
+            let manager = self.position_manager.read().await;
+            manager.robson_month_net(now).await?
+        };
         let new_capital_base =
             (wallet_balance - robson_month_net - carried_risk).max(Decimal::ZERO);
 
@@ -1286,12 +1290,15 @@ mod tests {
         assert_eq!(worker.scan_and_reconcile().await.unwrap(), 1);
 
         let loaded = store.positions().find_by_id(position_id).await.unwrap().unwrap();
+        // A fill from robsond's own protective stop (ins- client id) is a
+        // governed InsuranceStop close: it must count toward the monthly
+        // gauge and slot accounting, unlike generic reconciled closes.
         assert!(
             matches!(loaded.state, PositionState::Closed {
-                exit_reason: ExitReason::ReconciledMissingOnExchange,
+                exit_reason: ExitReason::InsuranceStop,
                 ..
             }),
-            "expected Closed via ReconciledMissingOnExchange, got {:?}",
+            "expected Closed via InsuranceStop (governed), got {:?}",
             loaded.state.name()
         );
 

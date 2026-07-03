@@ -224,6 +224,22 @@ pub struct TrailingStopUpdated {
     pub timestamp: DateTime<Utc>,
 }
 
+/// insurance_stop_placed / insurance_stop_replaced payload (ADR-0039).
+/// Both carry the live exchange conditional-order id in `order_id`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InsuranceStopLinked {
+    pub position_id: Uuid,
+    pub order_id: String,
+    pub timestamp: DateTime<Utc>,
+}
+
+/// insurance_stop_cancelled payload (ADR-0039).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct InsuranceStopCleared {
+    pub position_id: Uuid,
+    pub timestamp: DateTime<Utc>,
+}
+
 /// EXIT_TRIGGERED payload (exit_triggered event from domain)
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ExitTriggered {

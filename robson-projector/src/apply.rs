@@ -190,12 +190,17 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
             handlers::positions::handle_exit_order_placed(pool, envelope).await?
         },
         Some(ProjectionRoute::InsuranceStopPlaced)
-        | Some(ProjectionRoute::InsuranceStopReplaced)
-        | Some(ProjectionRoute::InsuranceStopCancelled)
-        | Some(ProjectionRoute::InsuranceStopFailed) => {
-            // ADR-0039 insurance-stop events are audit-only here. The live
-            // exchange order id is reconciled against exchange state in mission
-            // 2; for now these events must not block projection advancement.
+        | Some(ProjectionRoute::InsuranceStopReplaced) => {
+            // Persist the live protective-order linkage so restarts hydrate
+            // it (ADR-0039; 2026-07-03 incident: a lost linkage orphaned the
+            // filled stop and stranded its reconciled close).
+            handlers::positions::handle_insurance_stop_linked(pool, envelope).await?
+        },
+        Some(ProjectionRoute::InsuranceStopCancelled) => {
+            handlers::positions::handle_insurance_stop_cleared(pool, envelope).await?
+        },
+        Some(ProjectionRoute::InsuranceStopFailed) => {
+            // Audit-only: a failed placement leaves no live order to link.
         },
         Some(ProjectionRoute::BalanceSampled) => {
             handlers::balances::handle_balance_sampled(pool, envelope).await?

@@ -103,7 +103,27 @@ impl MarketDataManager {
                             info!(symbol = %symbol_str, "WebSocket client shutting down");
                             break 'reconnect;
                         }
-                        msg = stream.next() => {
+                        // Read-idle watchdog: the keepalive ping is
+                        // fire-and-forget (pongs are never awaited), so a
+                        // half-open connection pends on next() forever with
+                        // no error — a silent, stale feed while the soft
+                        // stop goes blind (2026-07-03: the insurance stop
+                        // fired 39s before the daemon noticed anything).
+                        // An aggTrade stream on a traded symbol is never
+                        // quiet for this long; treat silence as death.
+                        msg = tokio::time::timeout(Duration::from_secs(90), stream.next()) => {
+                            let msg = match msg {
+                                Err(_elapsed) => {
+                                    warn!(
+                                        symbol = %symbol_str,
+                                        idle_secs = 90,
+                                        retry_in_secs = backoff_secs,
+                                        "Market data feed silent past watchdog; reconnecting"
+                                    );
+                                    break; // break inner loop → reconnect
+                                },
+                                Ok(msg) => msg,
+                            };
                             match msg {
                                 None => {
                                     warn!(

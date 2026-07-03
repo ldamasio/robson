@@ -917,12 +917,15 @@ mod tests {
 
         assert!(closed, "a filled insurance stop must reconcile-close the position");
         let loaded = pm.store().positions().find_by_id(position_id).await.unwrap().unwrap();
+        // Governed classification: the fill came from robsond's own
+        // protective stop (ins- client id), so the close is an InsuranceStop
+        // exit and counts toward the monthly gauge/slots.
         assert!(
             matches!(loaded.state, PositionState::Closed {
-                exit_reason: ExitReason::ReconciledMissingOnExchange,
+                exit_reason: ExitReason::InsuranceStop,
                 ..
             }),
-            "expected Closed via ReconciledMissingOnExchange, got {:?}",
+            "expected Closed via InsuranceStop (governed), got {:?}",
             loaded.state.name()
         );
         let events = pm.store().events().find_by_position(position_id).await.unwrap();

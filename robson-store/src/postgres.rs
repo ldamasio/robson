@@ -97,6 +97,7 @@ struct PositionCurrentRow {
     exit_order_id: Option<Uuid>,
     entry_signal_id: Option<Uuid>,
     exit_reason: Option<String>,
+    insurance_stop_id: Option<String>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
     closed_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -136,6 +137,7 @@ fn parse_position_row(row: &sqlx::postgres::PgRow) -> Result<PositionCurrentRow,
         exit_order_id: row.try_get("exit_order_id").ok(),
         entry_signal_id: row.try_get("entry_signal_id").ok(),
         exit_reason: row.try_get("exit_reason").ok(),
+        insurance_stop_id: row.try_get::<Option<String>, _>("insurance_stop_id").ok().flatten(),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         closed_at: row.try_get("closed_at").ok(),
@@ -206,6 +208,7 @@ fn row_to_position(row_data: PositionCurrentRow) -> Result<Option<Position>, Sto
     }
 
     if let Some(total_fees) = row_data.total_fees {
+        position.insurance_stop_id = row_data.insurance_stop_id.clone();
         position.fees_paid = total_fees;
     }
 
@@ -298,7 +301,9 @@ fn row_to_position(row_data: PositionCurrentRow) -> Result<Option<Position>, Sto
                     StoreError::Deserialization(format!("Invalid favorable_extreme: {}", e))
                 })?,
                 extreme_at,
-                insurance_stop_id: None,
+                // Hydrate the live protective-order linkage (ADR-0039): a NULL
+                // here after a placement was the 2026-07-03 orphaning root cause.
+                insurance_stop_id: row_data.insurance_stop_id.clone(),
                 last_emitted_stop: row_data.trailing_stop_price.map(|p| Price::new(p).unwrap()),
             };
         },
@@ -439,6 +444,7 @@ pub async fn find_active_from_projection(
             exit_order_id,
             entry_signal_id,
             exit_reason,
+            insurance_stop_id,
             created_at,
             updated_at,
             closed_at,
@@ -551,6 +557,7 @@ pub async fn find_positions_overlapping_month(
             exit_order_id,
             entry_signal_id,
             exit_reason,
+            insurance_stop_id,
             created_at,
             updated_at,
             closed_at

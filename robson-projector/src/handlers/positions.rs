@@ -779,6 +779,84 @@ pub(crate) async fn handle_trailing_stop_updated(
     Ok(())
 }
 
+/// Persist the live insurance-stop linkage (ADR-0039).
+///
+/// `insurance_stop_placed` and `insurance_stop_replaced` both carry the new
+/// live conditional-order id; restarts hydrate it back into
+/// `PositionState::Active.insurance_stop_id` so the startup heal verifies the
+/// existing order instead of orphaning it (2026-07-03 incident).
+pub(crate) async fn handle_insurance_stop_linked(
+    pool: &PgPool,
+    envelope: &EventEnvelope,
+) -> Result<()> {
+    use crate::types::InsuranceStopLinked;
+
+    let payload: InsuranceStopLinked =
+        serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+            ProjectionError::InvalidPayload {
+                event_type: envelope.event_type.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+
+    sqlx::query(
+        r#"
+        UPDATE positions_current
+        SET
+            insurance_stop_id = $2,
+            last_event_id = $3,
+            last_seq = $4,
+            updated_at = $5
+        WHERE position_id = $1 AND last_seq < $4
+        "#,
+    )
+    .bind(payload.position_id)
+    .bind(&payload.order_id)
+    .bind(envelope.event_id)
+    .bind(envelope.seq)
+    .bind(envelope.occurred_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
+/// Clear the insurance-stop linkage after a cancel (ADR-0039).
+pub(crate) async fn handle_insurance_stop_cleared(
+    pool: &PgPool,
+    envelope: &EventEnvelope,
+) -> Result<()> {
+    use crate::types::InsuranceStopCleared;
+
+    let payload: InsuranceStopCleared =
+        serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+            ProjectionError::InvalidPayload {
+                event_type: envelope.event_type.clone(),
+                reason: e.to_string(),
+            }
+        })?;
+
+    sqlx::query(
+        r#"
+        UPDATE positions_current
+        SET
+            insurance_stop_id = NULL,
+            last_event_id = $2,
+            last_seq = $3,
+            updated_at = $4
+        WHERE position_id = $1 AND last_seq < $3
+        "#,
+    )
+    .bind(payload.position_id)
+    .bind(envelope.event_id)
+    .bind(envelope.seq)
+    .bind(envelope.occurred_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 pub(crate) async fn handle_exit_triggered(pool: &PgPool, envelope: &EventEnvelope) -> Result<()> {
     use crate::types::ExitTriggered;
 

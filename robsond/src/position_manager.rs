@@ -89,6 +89,11 @@ pub(crate) struct ReconciledCloseInput {
     pub fee_asset: String,
     pub closed_at: chrono::DateTime<chrono::Utc>,
     pub evidence: ReconciliationEvidence,
+    /// Client order id of the order whose fill closed the position, when the
+    /// resolver knows it. An `ins-` prefix proves the fill came from
+    /// robsond's own protective stop, which classifies the close as a
+    /// governed InsuranceStop exit (counts toward the monthly gauge/slots).
+    pub authored_client_order_id: Option<String>,
 }
 
 /// Result of an attempted reverse-reconciliation close.
@@ -368,12 +373,64 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         })
     }
 
+    /// Closed positions for the given month, restart-proof.
+    ///
+    /// The in-memory store only hydrates ACTIVE positions after a restart, so
+    /// memory-based month math silently drops every close that happened
+    /// before the last boot (2026-07-03: the monthly gauge zeroed and the
+    /// drift detector re-absorbed the month's governed loss after a deploy).
+    /// When the projection is available, read the durable
+    /// `positions_current` instead; fall back to memory otherwise.
+    pub(crate) async fn closed_positions_in_month(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> DaemonResult<Vec<Position>> {
+        #[cfg(feature = "postgres")]
+        if let (Some(pool), Some(tenant_id)) = (&self.event_log_pool, self.event_log_tenant_id) {
+            let month_start = chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                chrono::NaiveDate::from_ymd_opt(now.year(), now.month(), 1)
+                    .expect("month start must be valid")
+                    .and_hms_opt(0, 0, 0)
+                    .expect("midnight must be valid"),
+                chrono::Utc,
+            );
+            let positions =
+                robson_store::find_positions_overlapping_month(pool, tenant_id, month_start)
+                    .await?;
+            return Ok(positions
+                .into_iter()
+                .filter(|p| {
+                    matches!(p.state, PositionState::Closed { .. })
+                        && p.closed_at
+                            .map(|t| t.year() == now.year() && t.month() == now.month())
+                            .unwrap_or(false)
+                })
+                .collect());
+        }
+
+        Ok(self.store.positions().find_closed_in_month(now.year(), now.month()).await?)
+    }
+
+    /// Net governed month result (realized_pnl − fees over closed positions),
+    /// restart-proof. Used by drift attribution so recalibration only absorbs
+    /// out-of-band changes.
+    pub(crate) async fn robson_month_net(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> DaemonResult<Decimal> {
+        Ok(self
+            .closed_positions_in_month(now)
+            .await?
+            .iter()
+            .map(|position| position.realized_pnl - position.fees_paid)
+            .sum())
+    }
+
     pub(crate) async fn governed_monthly_realized_loss(
         &self,
         now: chrono::DateTime<chrono::Utc>,
     ) -> DaemonResult<Decimal> {
-        let monthly_closed =
-            self.store.positions().find_closed_in_month(now.year(), now.month()).await?;
+        let monthly_closed = self.closed_positions_in_month(now).await?;
         Ok(monthly_closed
             .iter()
             .filter(|position| Self::is_governed_monthly_close(position))
@@ -2916,9 +2973,23 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             "Reverse reconciliation close accepted, emitting PositionClosed event"
         );
 
+        // Classify the close: a fill from robsond's own protective stop is a
+        // governed InsuranceStop exit and must count toward the monthly
+        // gauge and slot accounting (the generic reconciled reason is
+        // excluded from governed math as out-of-band).
+        let exit_reason = if input
+            .authored_client_order_id
+            .as_deref()
+            .is_some_and(|id| id.starts_with("ins-"))
+        {
+            robson_domain::ExitReason::InsuranceStop
+        } else {
+            robson_domain::ExitReason::ReconciledMissingOnExchange
+        };
+
         let event = Event::PositionClosed {
             position_id: input.position_id,
-            exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
+            exit_reason,
             entry_price,
             exit_price: input.exit_price,
             realized_pnl: pnl,
@@ -5492,6 +5563,7 @@ mod tests {
             fee,
             fee_asset: "USDT".to_string(),
             closed_at,
+            authored_client_order_id: None,
             evidence: ReconciliationEvidence::OrderFillRecord(robson_domain::OrderFillEvidence {
                 exchange_order_id: "ORDER-1".to_string(),
                 fill_price: exit_price,
@@ -5517,6 +5589,7 @@ mod tests {
             fee,
             fee_asset: "USDT".to_string(),
             closed_at,
+            authored_client_order_id: None,
             evidence: ReconciliationEvidence::UserTradeRecord(robson_domain::UserTradeEvidence {
                 exchange_order_id: "ORDER-2".to_string(),
                 exchange_trade_id: "TRADE-1".to_string(),
@@ -5694,6 +5767,7 @@ mod tests {
                 fee: Decimal::ZERO,
                 fee_asset: "USDT".to_string(),
                 closed_at: now,
+                authored_client_order_id: None,
                 evidence: ReconciliationEvidence::AccountSnapshot(
                     robson_domain::AccountSnapshotEvidence {
                         first_observed_missing_at: now,
@@ -5773,6 +5847,7 @@ mod tests {
                 fee: Decimal::ZERO,
                 fee_asset: "USDT".to_string(),
                 closed_at: now,
+                authored_client_order_id: None,
                 evidence: ReconciliationEvidence::AccountSnapshot(
                     robson_domain::AccountSnapshotEvidence {
                         first_observed_missing_at: now,
@@ -5806,6 +5881,7 @@ mod tests {
                 fee: Decimal::ZERO,
                 fee_asset: "USDT".to_string(),
                 closed_at: now,
+                authored_client_order_id: None,
                 evidence: ReconciliationEvidence::Estimated(robson_domain::EstimatedEvidence {
                     estimation_basis: robson_domain::EstimationBasis::ExchangeMarkPrice,
                     exit_price: Price::new(dec!(90)).unwrap(),

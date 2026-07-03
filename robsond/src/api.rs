@@ -1630,6 +1630,9 @@ where
         fee,
         fee_asset,
         closed_at,
+        // Operator-supplied evidence carries no client order id, so the
+        // close classifies as the generic reconciled reason.
+        authored_client_order_id: None,
         evidence: req.evidence,
     };
 

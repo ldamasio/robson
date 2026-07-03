@@ -2490,6 +2490,7 @@ mod tests {
             fee: dec!(0.01),
             fee_asset: "USDT".to_string(),
             closed_at: now,
+            authored_client_order_id: None,
             evidence: ReconciliationEvidence::AccountSnapshot(AccountSnapshotEvidence {
                 first_observed_missing_at: now,
                 confirmed_missing_at: now,
@@ -2547,6 +2548,7 @@ mod tests {
             fee: dec!(0.01),
             fee_asset: "USDT".to_string(),
             closed_at: now,
+            authored_client_order_id: None,
             evidence: ReconciliationEvidence::OrderFillRecord(OrderFillEvidence {
                 exchange_order_id: "EX-ORDER-1".to_string(),
                 fill_price: Price::new(dec!(90)).unwrap(),
@@ -2593,6 +2595,7 @@ mod tests {
             fee: dec!(0.01),
             fee_asset: "USDT".to_string(),
             closed_at: now,
+            authored_client_order_id: None,
             evidence: ReconciliationEvidence::OrderFillRecord(OrderFillEvidence {
                 exchange_order_id: "EX-ORDER-1".to_string(),
                 fill_price: Price::new(dec!(90)).unwrap(),
@@ -2655,6 +2658,7 @@ mod tests {
             fee: dec!(0.01),
             fee_asset: "USDT".to_string(),
             closed_at: now,
+            authored_client_order_id: None,
             evidence: ReconciliationEvidence::AccountSnapshot(AccountSnapshotEvidence {
                 first_observed_missing_at: now,
                 confirmed_missing_at: now,
@@ -2670,6 +2674,7 @@ mod tests {
             fee: dec!(0.01),
             fee_asset: "USDT".to_string(),
             closed_at: now,
+            authored_client_order_id: None,
             evidence: ReconciliationEvidence::OrderFillRecord(OrderFillEvidence {
                 exchange_order_id: "EX-ORDER-B".to_string(),
                 fill_price: Price::new(dec!(90)).unwrap(),
