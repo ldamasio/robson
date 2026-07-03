@@ -394,7 +394,7 @@ impl BinanceRestClient {
     ///
     /// # Endpoint
     ///
-    /// `POST /fapi/v1/order`
+    /// `POST /fapi/v1/algoOrder`
     pub async fn place_stop_market_order(
         &self,
         symbol: &str,
@@ -402,24 +402,53 @@ impl BinanceRestClient {
         quantity: Decimal,
         stop_price: Decimal,
         client_order_id: &str,
-    ) -> Result<BinanceOrderResponse, BinanceRestError> {
+    ) -> Result<BinanceAlgoOrderResponse, BinanceRestError> {
         let side_str = match side {
             Side::Long => "BUY",
             Side::Short => "SELL",
         };
 
         let params = vec![
+            ("algoType", "CONDITIONAL".to_string()),
             ("symbol", symbol.to_string()),
             ("side", side_str.to_string()),
             ("type", "STOP_MARKET".to_string()),
-            ("stopPrice", stop_price.to_string()),
+            ("triggerPrice", stop_price.to_string()),
             ("quantity", quantity.to_string()),
             ("reduceOnly", "true".to_string()),
-            ("newClientOrderId", client_order_id.to_string()),
+            ("clientAlgoId", client_order_id.to_string()),
             ("newOrderRespType", "RESULT".to_string()),
         ];
 
-        let body = self.post_signed("/fapi/v1/order", params).await?;
+        let body = self.post_signed("/fapi/v1/algoOrder", params).await?;
+
+        serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
+    }
+
+    /// Cancel an open algo order.
+    ///
+    /// `DELETE /fapi/v1/algoOrder`
+    pub async fn cancel_algo_order(
+        &self,
+        algo_id: i64,
+    ) -> Result<BinanceAlgoCancelResponse, BinanceRestError> {
+        let params = vec![("algoId", algo_id.to_string())];
+
+        let body = self.delete_signed("/fapi/v1/algoOrder", params).await?;
+
+        serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
+    }
+
+    /// Query an algo order by algo id.
+    ///
+    /// `GET /fapi/v1/algoOrder`
+    pub async fn query_algo_order(
+        &self,
+        algo_id: i64,
+    ) -> Result<BinanceAlgoOrderDetail, BinanceRestError> {
+        let params = vec![("algoId", algo_id.to_string())];
+
+        let body = self.get_signed("/fapi/v1/algoOrder", params).await?;
 
         serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
     }
@@ -442,17 +471,17 @@ impl BinanceRestClient {
         serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
     }
 
-    /// Query currently open (unfilled) orders for a symbol.
+    /// Query currently open (unfilled) algo orders for a symbol.
     ///
-    /// `GET /fapi/v1/openOrders` (signed). Used by the reconciliation worker's
-    /// orphan insurance-order sweep (ADR-0039).
-    pub async fn get_open_orders(
+    /// `GET /fapi/v1/openAlgoOrders` (signed). Used by the reconciliation
+    /// worker's orphan insurance-order sweep (ADR-0039).
+    pub async fn get_open_algo_orders(
         &self,
         symbol: &str,
-    ) -> Result<Vec<BinanceOpenOrder>, BinanceRestError> {
+    ) -> Result<Vec<BinanceOpenAlgoOrder>, BinanceRestError> {
         let params = vec![("symbol", symbol.to_string())];
 
-        let body = self.get_signed("/fapi/v1/openOrders", params).await?;
+        let body = self.get_signed("/fapi/v1/openAlgoOrders", params).await?;
 
         serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
     }
@@ -872,6 +901,74 @@ pub struct BinanceOrderResponse {
     pub fills: Vec<BinanceFill>,
 }
 
+/// Response from `POST /fapi/v1/algoOrder`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceAlgoOrderResponse {
+    /// Exchange-assigned algo order id
+    pub algo_id: i64,
+    /// Client-provided algo id
+    pub client_algo_id: String,
+    /// Algo type (`CONDITIONAL`)
+    pub algo_type: String,
+    /// Underlying conditional order type (`STOP_MARKET`)
+    pub order_type: String,
+    /// Symbol
+    pub symbol: String,
+    /// Side (`BUY` / `SELL`)
+    pub side: String,
+    /// Original quantity
+    pub quantity: Decimal,
+    /// Algo status (`NEW`, `CANCELED`, `TRIGGERED`, ...)
+    pub algo_status: String,
+    /// Trigger price
+    pub trigger_price: Decimal,
+    /// Whether the triggered order can only reduce a position
+    pub reduce_only: bool,
+    /// Create time (ms since epoch)
+    pub create_time: i64,
+    /// Update time (ms since epoch)
+    pub update_time: i64,
+}
+
+/// Response from `DELETE /fapi/v1/algoOrder`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceAlgoCancelResponse {
+    pub algo_id: i64,
+    pub client_algo_id: String,
+    pub code: i64,
+    pub msg: String,
+}
+
+/// Response from `GET /fapi/v1/algoOrder`.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceAlgoOrderDetail {
+    pub algo_id: i64,
+    pub client_algo_id: String,
+    pub algo_type: String,
+    pub order_type: String,
+    pub symbol: String,
+    pub side: String,
+    pub quantity: Decimal,
+    pub algo_status: String,
+    pub trigger_price: Decimal,
+    pub reduce_only: bool,
+    pub create_time: i64,
+    pub update_time: i64,
+    #[serde(default)]
+    pub actual_order_id: String,
+    #[serde(default)]
+    pub actual_price: Decimal,
+    #[serde(default)]
+    pub actual_qty: Decimal,
+    #[serde(default)]
+    pub actual_type: String,
+    #[serde(default)]
+    pub trigger_time: i64,
+}
+
 /// Individual fill from a Binance order response.
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -886,28 +983,37 @@ pub struct BinanceFill {
     pub commission_asset: String,
 }
 
-/// An open order returned by `GET /fapi/v1/openOrders`.
+/// An open algo order returned by `GET /fapi/v1/openAlgoOrders`.
 ///
 /// Only the fields the orphan insurance-order sweep needs (ADR-0039).
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
-pub struct BinanceOpenOrder {
-    /// Exchange-assigned order id
-    pub order_id: u64,
-    /// Client-provided order id (robsond insurance stops carry the `ins-`
+pub struct BinanceOpenAlgoOrder {
+    /// Exchange-assigned algo id
+    pub algo_id: i64,
+    /// Client-provided algo id (robsond insurance stops carry the `ins-`
     /// prefix)
-    pub client_order_id: String,
+    pub client_algo_id: String,
     /// Order side (`BUY` / `SELL`)
     pub side: String,
     /// Order type (e.g. `STOP_MARKET`, `MARKET`)
-    #[serde(rename = "type")]
     pub order_type: String,
+    /// Algo type (`CONDITIONAL`)
+    pub algo_type: String,
+    /// Algo status (e.g. `NEW`)
+    pub algo_status: String,
     /// Whether the order can only reduce an existing position
     #[serde(default)]
     pub reduce_only: bool,
-    /// Stop/trigger price for conditional orders; `0` when not applicable
+    /// Trigger price for conditional orders; `0` when not applicable
     #[serde(default)]
-    pub stop_price: Decimal,
+    pub trigger_price: Decimal,
+    /// Original quantity
+    pub quantity: Decimal,
+    /// Create time (ms since epoch)
+    pub create_time: i64,
+    /// Update time (ms since epoch)
+    pub update_time: i64,
 }
 
 /// Price ticker response.
@@ -1311,32 +1417,111 @@ mod tests {
     }
 
     #[test]
-    fn test_open_order_response_parsing() {
+    fn test_algo_order_response_parsing() {
+        let body = r#"{
+            "algoId": 998877,
+            "clientAlgoId": "ins-019f10a322b77093bb2fc66a51882bf5",
+            "algoType": "CONDITIONAL",
+            "orderType": "STOP_MARKET",
+            "symbol": "BTCUSDT",
+            "side": "SELL",
+            "quantity": "0.004",
+            "algoStatus": "NEW",
+            "triggerPrice": "58888.00",
+            "reduceOnly": true,
+            "createTime": 1783045560000,
+            "updateTime": 1783045560001
+        }"#;
+
+        let response: BinanceAlgoOrderResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(response.algo_id, 998877);
+        assert_eq!(response.client_algo_id, "ins-019f10a322b77093bb2fc66a51882bf5");
+        assert_eq!(response.algo_type, "CONDITIONAL");
+        assert_eq!(response.order_type, "STOP_MARKET");
+        assert_eq!(response.algo_status, "NEW");
+        assert_eq!(response.trigger_price, dec!(58888.00));
+        assert!(response.reduce_only);
+    }
+
+    #[test]
+    fn test_algo_cancel_response_parsing() {
+        let body = r#"{
+            "algoId": 998877,
+            "clientAlgoId": "ins-019f10a322b77093bb2fc66a51882bf5",
+            "code": 200,
+            "msg": "success"
+        }"#;
+
+        let response: BinanceAlgoCancelResponse = serde_json::from_str(body).unwrap();
+        assert_eq!(response.algo_id, 998877);
+        assert_eq!(response.client_algo_id, "ins-019f10a322b77093bb2fc66a51882bf5");
+        assert_eq!(response.code, 200);
+        assert_eq!(response.msg, "success");
+    }
+
+    #[test]
+    fn test_algo_order_detail_response_parsing() {
+        let body = r#"{
+            "algoId": 998877,
+            "clientAlgoId": "ins-019f10a322b77093bb2fc66a51882bf5",
+            "algoType": "CONDITIONAL",
+            "orderType": "STOP_MARKET",
+            "symbol": "BTCUSDT",
+            "side": "SELL",
+            "quantity": "0.004",
+            "algoStatus": "TRIGGERED",
+            "triggerPrice": "58888.00",
+            "reduceOnly": true,
+            "createTime": 1783045560000,
+            "updateTime": 1783045570000,
+            "actualOrderId": "123456789",
+            "actualPrice": "58880.50",
+            "actualQty": "0.004",
+            "actualType": "MARKET",
+            "triggerTime": 1783045569000
+        }"#;
+
+        let detail: BinanceAlgoOrderDetail = serde_json::from_str(body).unwrap();
+        assert_eq!(detail.algo_id, 998877);
+        assert_eq!(detail.algo_status, "TRIGGERED");
+        assert_eq!(detail.actual_order_id, "123456789");
+        assert_eq!(detail.actual_price, dec!(58880.50));
+        assert_eq!(detail.actual_qty, dec!(0.004));
+        assert_eq!(detail.actual_type, "MARKET");
+        assert_eq!(detail.trigger_time, 1783045569000);
+    }
+
+    #[test]
+    fn test_open_algo_order_response_parsing() {
         let body = r#"[
             {
                 "symbol": "BTCUSDT",
-                "orderId": 998877,
-                "clientOrderId": "ins-019f10a3-22b7-7093-bb2f-c66a51882bf5",
+                "algoId": 998877,
+                "clientAlgoId": "ins-019f10a322b77093bb2fc66a51882bf5",
                 "side": "SELL",
-                "type": "STOP_MARKET",
+                "orderType": "STOP_MARKET",
+                "algoType": "CONDITIONAL",
+                "algoStatus": "NEW",
                 "reduceOnly": true,
-                "stopPrice": "58888.00",
-                "status": "NEW",
-                "price": "0.00",
-                "origQty": "0.00435116",
-                "executedQty": "0.00"
+                "triggerPrice": "58888.00",
+                "quantity": "0.004",
+                "createTime": 1783045560000,
+                "updateTime": 1783045560001
             }
         ]"#;
 
-        let orders: Vec<BinanceOpenOrder> = serde_json::from_str(body).unwrap();
+        let orders: Vec<BinanceOpenAlgoOrder> = serde_json::from_str(body).unwrap();
         assert_eq!(orders.len(), 1);
 
         let order = &orders[0];
-        assert_eq!(order.order_id, 998877);
-        assert_eq!(order.client_order_id, "ins-019f10a3-22b7-7093-bb2f-c66a51882bf5");
+        assert_eq!(order.algo_id, 998877);
+        assert_eq!(order.client_algo_id, "ins-019f10a322b77093bb2fc66a51882bf5");
         assert_eq!(order.side, "SELL");
         assert_eq!(order.order_type, "STOP_MARKET");
+        assert_eq!(order.algo_type, "CONDITIONAL");
+        assert_eq!(order.algo_status, "NEW");
         assert!(order.reduce_only);
-        assert_eq!(order.stop_price, dec!(58888.00));
+        assert_eq!(order.trigger_price, dec!(58888.00));
+        assert_eq!(order.quantity, dec!(0.004));
     }
 }

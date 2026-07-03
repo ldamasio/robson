@@ -143,9 +143,12 @@ pub trait ExchangePort: Send + Sync {
     /// Place a reduce-only protective `STOP_MARKET` order (ADR-0039).
     ///
     /// The insurance stop lives on the exchange so stop enforcement survives
-    /// daemon downtime. The order is accepted but not filled; the returned
-    /// `OrderResult` carries the exchange-assigned order id with no fill data
-    /// (zero filled quantity / fee). Use `cancel_order` to remove it.
+    /// daemon downtime. Binance implements these as Algo Order API
+    /// conditional orders; the returned `OrderResult.exchange_order_id`
+    /// carries the exchange-assigned algoId, not the eventual triggered
+    /// orderId. The order is accepted but not filled; the result has no fill
+    /// data (zero filled quantity / fee). Use `cancel_stop_market_order` to
+    /// remove it.
     ///
     /// # Arguments
     ///
@@ -168,6 +171,18 @@ pub trait ExchangePort: Send + Sync {
         client_order_id: &str,
     ) -> Result<OrderResult, ExecError>;
 
+    /// Cancel an existing reduce-only protective `STOP_MARKET` order.
+    ///
+    /// `algo_id` is the id returned by `place_stop_market_order`;
+    /// implementations must route this through the exchange's
+    /// conditional/algo-order cancel API, not the regular order cancel
+    /// endpoint.
+    async fn cancel_stop_market_order(
+        &self,
+        symbol: &Symbol,
+        algo_id: &str,
+    ) -> Result<(), ExecError>;
+
     /// Cancel an existing order.
     ///
     /// # Arguments
@@ -182,7 +197,9 @@ pub trait ExchangePort: Send + Sync {
 
     /// Query currently open (unfilled) orders for a symbol (ADR-0039).
     ///
-    /// Used by the reconciliation worker's orphan insurance-order sweep: an
+    /// Used only by the reconciliation worker's orphan insurance-order sweep
+    /// and startup recovery's insurance-stop heal path. Implementations return
+    /// open conditional/algo stop orders, not regular `/order` open orders. An
     /// open reduce-only `STOP_MARKET` whose `client_order_id` carries the
     /// robsond `ins-` prefix but does not protect any tracked-open position is
     /// cancelled.
@@ -282,6 +299,19 @@ pub trait ExchangePort: Send + Sync {
         order_id: &str,
     ) -> Result<Option<OrderResult>, ExecError>;
 
+    /// Query a protective stop by algo id and resolve its real triggered fill.
+    ///
+    /// Returns `Ok(None)` when the conditional order has not triggered. When
+    /// the exchange reports a real triggered order id, implementations must
+    /// resolve that real order via the regular order query path and return its
+    /// `OrderResult`; Policy 11 evidence is from the actual order, never from
+    /// algo-level estimates.
+    async fn get_stop_order_fill(
+        &self,
+        symbol: &Symbol,
+        algo_id: &str,
+    ) -> Result<Option<OrderResult>, ExecError>;
+
     /// Query user trade history for a symbol since a given timestamp.
     ///
     /// Returns trades ordered oldest-first. Used by the reconciliation
@@ -325,13 +355,13 @@ pub struct OrderResult {
     pub filled_at: DateTime<Utc>,
 }
 
-/// An open (unfilled) order observed on the exchange.
+/// An open (unfilled) conditional/algo stop order observed on the exchange.
 ///
 /// Returned by `get_open_orders` so the reconciliation worker can detect and
 /// cancel orphaned robsond-authored insurance stops (ADR-0039).
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct OpenOrderRecord {
-    /// Exchange-assigned order id
+    /// Exchange-assigned algo id
     pub exchange_order_id: String,
     /// Client-provided order id (robsond insurance stops carry the `ins-`
     /// prefix)
@@ -340,7 +370,7 @@ pub struct OpenOrderRecord {
     pub order_type: String,
     /// Whether the order can only reduce an existing position
     pub reduce_only: bool,
-    /// Stop/trigger price for conditional orders (`STOP_MARKET`); `None`
+    /// Stop/trigger price for conditional algo orders (`STOP_MARKET`); `None`
     /// otherwise
     pub stop_price: Option<Price>,
     /// Outbound order side

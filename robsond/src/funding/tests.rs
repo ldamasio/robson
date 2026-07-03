@@ -142,6 +142,14 @@ impl ExchangePort for PostConvertedCrashExchange {
         self.inner.cancel_order(symbol, order_id).await
     }
 
+    async fn cancel_stop_market_order(
+        &self,
+        symbol: &Symbol,
+        algo_id: &str,
+    ) -> Result<(), ExecError> {
+        self.inner.cancel_stop_market_order(symbol, algo_id).await
+    }
+
     async fn get_open_orders(
         &self,
         symbol: &Symbol,
@@ -241,6 +249,14 @@ impl ExchangePort for PostConvertedCrashExchange {
         order_id: &str,
     ) -> Result<Option<OrderResult>, ExecError> {
         self.inner.get_order_by_exchange_id(symbol, order_id).await
+    }
+
+    async fn get_stop_order_fill(
+        &self,
+        symbol: &Symbol,
+        algo_id: &str,
+    ) -> Result<Option<OrderResult>, ExecError> {
+        self.inner.get_stop_order_fill(symbol, algo_id).await
     }
 
     async fn get_user_trades_since(

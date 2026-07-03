@@ -585,7 +585,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
 
         // Cancel the previous stop. An "unknown order" error is expected when
         // the stop has already filled or been cancelled — log and continue.
-        if let Err(e) = self.exchange.cancel_order(&symbol, &previous_order_id).await {
+        if let Err(e) = self.exchange.cancel_stop_market_order(&symbol, &previous_order_id).await {
             if Self::is_unknown_order_error(&e) {
                 warn!(
                     %position_id,
@@ -653,7 +653,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             "Cancelling insurance stop"
         );
 
-        match self.exchange.cancel_order(&symbol, &order_id).await {
+        match self.exchange.cancel_stop_market_order(&symbol, &order_id).await {
             Ok(()) => {},
             Err(e) if Self::is_unknown_order_error(&e) => {
                 warn!(

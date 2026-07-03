@@ -2371,6 +2371,14 @@ mod tests {
             Err(ExecError::Timeout("unused".to_string()))
         }
 
+        async fn cancel_stop_market_order(
+            &self,
+            _symbol: &Symbol,
+            _algo_id: &str,
+        ) -> Result<(), ExecError> {
+            Err(ExecError::Timeout("unused".to_string()))
+        }
+
         async fn get_open_orders(
             &self,
             _symbol: &Symbol,
@@ -2450,6 +2458,14 @@ mod tests {
             &self,
             _symbol: &Symbol,
             _order_id: &str,
+        ) -> Result<Option<OrderResult>, ExecError> {
+            Ok(None)
+        }
+
+        async fn get_stop_order_fill(
+            &self,
+            _symbol: &Symbol,
+            _algo_id: &str,
         ) -> Result<Option<OrderResult>, ExecError> {
             Ok(None)
         }

@@ -27,13 +27,13 @@ use crate::{
 // Stub Exchange
 // =============================================================================
 
-/// A protective stop order recorded on the stub exchange (ADR-0039).
+/// A protective stop algo order recorded on the stub exchange (ADR-0039).
 ///
 /// Placed via `place_stop_market_order` and removed on `cancel_order`, so tests
 /// can assert the insurance-stop lifecycle without a real exchange.
 #[derive(Debug, Clone)]
 pub struct StubStopOrder {
-    /// Exchange-assigned order id (e.g. `STUB-1`)
+    /// Exchange-assigned algo id (e.g. `STUB-1`)
     pub exchange_order_id: String,
     /// Client order id supplied by the caller
     pub client_order_id: String,
@@ -72,7 +72,7 @@ pub struct StubExchange {
     open_positions: RwLock<HashMap<String, ExchangePosition>>,
     /// Simulated futures account balance.
     futures_balance: RwLock<Decimal>,
-    /// Simulated orders retrievable by `get_order_by_exchange_id`.
+    /// Simulated regular orders retrievable by `get_order_by_exchange_id`.
     orders: RwLock<HashMap<String, OrderResult>>,
     /// Simulated user trades retrievable by `get_user_trades_since`.
     user_trades: RwLock<HashMap<String, Vec<UserTradeRecord>>>,
@@ -82,10 +82,12 @@ pub struct StubExchange {
     trading_symbols: RwLock<Option<HashSet<String>>>,
     spot_order_calls: RwLock<u64>,
     transfer_calls: RwLock<u64>,
-    /// Protective stop orders placed via `place_stop_market_order`, keyed by
-    /// exchange order id (ADR-0039). Removed on cancel so tests can assert
+    /// Protective stop algo orders placed via `place_stop_market_order`, keyed
+    /// by algo id (ADR-0039). Removed on cancel so tests can assert
     /// placement and cancellation.
     stop_orders: RwLock<HashMap<String, StubStopOrder>>,
+    /// Simulated real triggered order fills keyed by protective stop algo id.
+    filled_stop_orders: RwLock<HashMap<String, OrderResult>>,
 }
 
 impl StubExchange {
@@ -113,6 +115,7 @@ impl StubExchange {
             spot_order_calls: RwLock::new(0),
             transfer_calls: RwLock::new(0),
             stop_orders: RwLock::new(HashMap::new()),
+            filled_stop_orders: RwLock::new(HashMap::new()),
         }
     }
 
@@ -254,12 +257,12 @@ impl StubExchange {
         self.stop_orders.read().unwrap().len()
     }
 
-    /// Look up a protective stop order by its exchange order id (ADR-0039).
+    /// Look up a protective stop order by its algo id (ADR-0039).
     pub fn find_stop_order(&self, exchange_order_id: &str) -> Option<StubStopOrder> {
         self.stop_orders.read().unwrap().get(exchange_order_id).cloned()
     }
 
-    /// True if a protective stop order with this exchange id is still live.
+    /// True if a protective stop order with this algo id is still live.
     pub fn has_stop_order(&self, exchange_order_id: &str) -> bool {
         self.stop_orders.read().unwrap().contains_key(exchange_order_id)
     }
@@ -267,10 +270,27 @@ impl StubExchange {
     /// Simulate a protective stop order being filled (ADR-0039).
     ///
     /// Removes the order from the live set (a filled `STOP_MARKET` is no longer
-    /// open), so `get_open_orders` and `find_stop_order` stop reporting it.
-    /// Returns the recorded order so tests can seed fill evidence against it.
+    /// open), records a real triggered-order fill for `get_stop_order_fill`,
+    /// and returns the removed algo order for tests that need to inspect it.
     pub fn fill_stop_order(&self, exchange_order_id: &str) -> Option<StubStopOrder> {
-        self.stop_orders.write().unwrap().remove(exchange_order_id)
+        let order = self.stop_orders.write().unwrap().remove(exchange_order_id)?;
+        let fill_price = self.get_price_decimal(&order.symbol.as_pair());
+        let fee = fill_price * order.quantity.as_decimal() * self.fee_rate;
+        let triggered_order_id = format!("TRIGGERED-{}", order.exchange_order_id);
+        let result = OrderResult {
+            exchange_order_id: triggered_order_id,
+            client_order_id: order.client_order_id.clone(),
+            fill_price: Price::new(fill_price).unwrap(),
+            filled_quantity: order.quantity,
+            fee,
+            fee_asset: "USDT".to_string(),
+            filled_at: Utc::now(),
+        };
+        self.filled_stop_orders
+            .write()
+            .unwrap()
+            .insert(exchange_order_id.to_string(), result);
+        Some(order)
     }
 
     /// Snapshot of all currently live protective stop orders (ADR-0039).
@@ -414,6 +434,21 @@ impl ExchangePort for StubExchange {
 
         // Stub: just log and return success
         tracing::debug!(order_id, "Stub: order cancelled");
+        Ok(())
+    }
+
+    async fn cancel_stop_market_order(
+        &self,
+        _symbol: &Symbol,
+        algo_id: &str,
+    ) -> Result<(), ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated stop cancel failure".to_string()));
+        }
+
+        self.stop_orders.write().unwrap().remove(algo_id);
+
+        tracing::debug!(algo_id, "Stub: stop algo order cancelled");
         Ok(())
     }
 
@@ -695,6 +730,23 @@ impl ExchangePort for StubExchange {
 
         let orders = self.orders.read().unwrap();
         Ok(orders.get(order_id).cloned())
+    }
+
+    async fn get_stop_order_fill(
+        &self,
+        _symbol: &Symbol,
+        algo_id: &str,
+    ) -> Result<Option<OrderResult>, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated get_stop_order_fill failure".to_string()));
+        }
+
+        if let Some(result) = self.filled_stop_orders.read().unwrap().get(algo_id).cloned() {
+            return Ok(Some(result));
+        }
+
+        let orders = self.orders.read().unwrap();
+        Ok(orders.get(algo_id).cloned())
     }
 
     async fn get_user_trades_since(
