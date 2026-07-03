@@ -138,9 +138,10 @@ CI must pass the first two tiers unconditionally. The third tier requires a prov
 
 These are architectural constraints that MUST NOT be violated by any agent or human:
 
-10. **No static exposure hard limits.** `max_open_positions`, `max_total_exposure_pct`, and `max_single_position_pct` were eliminated in MIG-v3#11 (ADR-0024). The only static constraint is `risk_per_trade_pct = 1%` as a maximum-loss cap and `max_monthly_drawdown_pct = 4%` of `capital_base`. Slot availability governs entry capacity. There is no daily loss limit. Funding rate does not determine exposure limits in long positions. Realized risk may be lower when available margin caps the position size.
-11. **`Estimated` evidence is permanently blocked in `reconcile_close`.** Only `OrderFillRecord` and `UserTradeRecord` are accepted for automated reconciled closes. If evidence is unavailable, the daemon aborts startup and requires manual operator intervention via `robson-cli reconcile-close`.
+10. **No static exposure hard limits.** `max_open_positions`, `max_total_exposure_pct`, and `max_single_position_pct` were eliminated in MIG-v3#11 (ADR-0024). The only static constraint is `risk_per_trade_pct = 1%` as a maximum-loss cap and `max_monthly_drawdown_pct = 4%` of `capital_base`. The 1% is a **worst-case cap, not a target**: position sizing prices execution costs — a gap allowance past the stop plus round-trip taker fees — into the denominator, so a stop that fills does not breach the cap (ADR-0039; motivated by the 2026-06 incident where distance-only sizing guaranteed a breach on every stop hit). Slot availability governs entry capacity. There is no daily loss limit. Funding rate does not determine exposure limits in long positions. Realized risk may be lower when available margin caps the position size.
+11. **`Estimated` evidence is permanently blocked in `reconcile_close`.** Only `OrderFillRecord` and `UserTradeRecord` are accepted for automated reconciled closes. If evidence is unavailable, the daemon aborts startup and requires manual operator intervention via `robson-cli reconcile-close`. Insurance-stop fills satisfy this by chaining the exchange's conditional-order record to the real triggered order's fill (ADR-0039).
 12. **No LLM, no autonomous trading.** v3 has zero LLM coupling. The operator decides WHEN to trade. Robson decides HOW MUCH and enforces THAT risk rules are never violated. QE-P5 (Context Governance) is deferred to v4.
+13. **Two-layer stop enforcement; exits always take liquidity.** Every Active position carries a robsond-authored, reduce-only conditional stop order on the exchange at the chart-derived trailing stop (the "insurance stop", `ins-` client-id prefix), placed on entry fill and cancel-replaced as the trailing stop advances. The software monitor remains the primary exit path; the exchange-side order exists so stop enforcement survives daemon crashes, deploys, and partitions — availability of `robsond` must never be a precondition for bounded loss (ADR-0039; the 2026-06 incident turned a breakeven exit into the month's full loss during a 45 h outage). Exits and protective stops always execute as market orders: on the loss leg, non-execution is unbounded, so fee optimization (maker-first, ADR-0040) is only ever permitted on legs where non-execution is costless — entries.
 
 ## High-Value Source Files
 
@@ -157,6 +158,8 @@ Start here for v3 runtime work:
 - `docs/adr/ADR-0022-robson-authored-position-invariant.md`
 - `docs/adr/ADR-0023-symbol-agnostic-policy-invariant.md`
 - `docs/adr/ADR-0024-trading-policy-layer.md`
+- `docs/adr/ADR-0039-exchange-side-insurance-stop.md`
+- `docs/adr/ADR-0040-maker-first-entry-execution.md`
 
 Implementation reality for the current Rust executor/runtime boundary:
 

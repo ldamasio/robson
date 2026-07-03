@@ -383,18 +383,27 @@ The software trailing-stop monitor is the primary exit path, but it only fires
 while the daemon is alive. To bound loss during a crash, node failure, deploy,
 or network partition, `robsond` additionally places a reduce-only `STOP_MARKET`
 protective order on the exchange for every active position at its current
-chart-derived trailing stop (the order is robsond-authored; its client order id
-carries the `ins-` prefix). Lifecycle:
+chart-derived trailing stop. The order is robsond-authored and goes through the
+exchange's conditional/algo order facility (a conditional order is an
+exchange-side trigger, not a resting book order; the exchange creates the real
+market order when the trigger fires). Its client id carries the `ins-` prefix
+and `PositionState::Active.insurance_stop_id` stores the exchange's
+conditional-order id. Lifecycle:
 
 - **Entry fill** → place the stop; recorded in `PositionState::Active.insurance_stop_id`.
 - **Discrete trailing-stop advance** → cancel-replace the stop at the new price.
 - **Software exit takes over** → cancel the stop (never leave both a reduce-only
   stop and a market exit live).
 - **Startup recovery** (after replay keeps the position open) → heal the stop:
-  if it filled during the gap, reconcile-close the position from the fill; if
-  cancelled/missing, re-place; if open at a stale price, replace.
+  if it filled during the gap, reconcile-close the position from the fill
+  (evidence is the real triggered order's `OrderFillRecord`, chained from the
+  conditional order — Policy 11); if cancelled/missing, re-place; if open at a
+  stale price, replace.
 - **Reconciliation sweep** → cancel orphaned `ins-` stops that no longer protect
-  a tracked-open position.
+  a tracked-open position. The sweep fails safe: when an Active position on the
+  same symbol has no recorded insurance id, an unmatched `ins-` order is a
+  plausible lost linkage and is kept (warned, never cancelled) — cancelling
+  would strip a live protection, the worse error.
 
 Stop-placement/replacement failures are audit-only (`InsuranceStopFailed`) and
 never abort the action batch or the position lifecycle. See

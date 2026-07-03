@@ -56,6 +56,15 @@ If this file and `AGENTS.md` ever diverge, `AGENTS.md` is the source of truth.
 - **Estimated evidence is permanently blocked** — `reconcile_close` rejects
   `ReconciliationEvidence::Estimated`. Only `OrderFillRecord` and `UserTradeRecord`
   are valid for automated reconciled closes in v3.
+- **Two-layer stop enforcement** — every Active position carries a
+  robsond-authored reduce-only conditional stop on the exchange at the
+  chart-derived trailing stop; the software monitor stays the primary exit
+  path. Daemon availability must never be a precondition for bounded loss.
+  See ADR-0039.
+- **Exits always take liquidity** — exits and protective stops are market
+  orders; maker-first fee optimization is permitted only on entries, where
+  non-execution is costless. The 1% per-trade budget is a worst-case cap that
+  prices in execution costs. See ADR-0039 and ADR-0040.
 
 ## Commit Policy
 

@@ -11,9 +11,11 @@ The system provides a single-operator runtime with a slot-based monthly risk mod
 ## Risk Model at a Glance
 
 - **Monthly budget**: 4% of `capital_base` — hard limit enforced by a circuit breaker
-- **Per-trade risk**: 1% of `capital_base` (derived from position size, never set directly)
-- **Position sizing**: `size = (capital_base × 1%) / technical_stop_distance`
+- **Per-trade risk**: 1% of `capital_base` as a **worst-case cap** (derived from position size, never set directly)
+- **Position sizing**: `size = (capital_base × 1%) / (technical_stop_distance + gap_allowance + round_trip_taker_fees)` — the budget absorbs execution costs, not just chart distance, so a stop that fills never breaches the cap (ADR-0039)
 - **Technical stop**: always from chart analysis (second S/R level, 15m timeframe) — never a percentage of entry price
+- **Stop enforcement**: two independent layers. The software monitor is the primary exit path (discrete trailing, per-tick audit); a robsond-authored reduce-only conditional stop order rests on the exchange as a fail-safe that survives daemon outages (ADR-0039)
+- **Exit execution**: exits and protective stops are always market orders (taker) — non-execution there is an unbounded loss; fee optimization is only ever applied to legs where waiting is costless (ADR-0040)
 - **Slot capacity**: 4 concurrent positions maximum
 
 `capital_base` is set at month start as a pessimistic snapshot: `wallet_balance − carried_risk(Entering + Active + Armed)`. It is immutable during normal operation, but must be recalibrated if reconciliation detects manual account changes outside Robson.
