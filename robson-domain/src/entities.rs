@@ -225,14 +225,17 @@ pub fn calculate_position_size(
     }
 
     // Golden Rule with execution-cost buffer (ADR-0039, Policy 10): the 1%
-    // budget covers worst expected realized loss — chart distance, expected
-    // gap past the stop, and round-trip taker fees — then the available 1x
-    // margin caps the size. The exit-fee base uses max(entry, stop) so the
+    // budget covers worst expected realized loss — chart distance, the
+    // executable-stop buffer beyond the technical level, expected gap past
+    // the stop, and round-trip taker fees — then the available 1x margin
+    // caps the size. The exit-fee base uses max(entry, stop) so the
     // buffer stays conservative for both sides.
     let stop = tech_stop.initial_stop.as_decimal();
+    let stop_buffer = stop * risk_config.stop_buffer_bps() / rust_decimal::Decimal::from(10_000);
     let gap_allowance = stop * risk_config.stop_gap_bps() / rust_decimal::Decimal::from(10_000);
     let round_trip_fees_per_unit = risk_config.taker_fee_rate() * (entry + entry.max(stop));
-    let worst_loss_per_unit = stop_distance + gap_allowance + round_trip_fees_per_unit;
+    let worst_loss_per_unit =
+        stop_distance + stop_buffer + gap_allowance + round_trip_fees_per_unit;
 
     let max_risk = risk_config.max_risk_amount();
     let risk_sized_qty = max_risk / worst_loss_per_unit;
@@ -1150,6 +1153,29 @@ mod tests {
             // ...so the pure chart-distance loss is strictly inside the cap.
             assert!(chart_loss < config.max_risk_amount());
         }
+    }
+
+    #[test]
+    fn test_position_size_prices_stop_buffer_into_budget() {
+        // With an executable-stop buffer the worst realizable distance widens,
+        // so the same budget buys a smaller position and the worst expected
+        // loss (through the buffered stop, gap, and fees) stays on the cap.
+        let base = RiskConfig::new(dec!(10000)).unwrap();
+        let buffered = base.with_stop_buffer(dec!(20)).unwrap(); // 20 bps
+
+        let entry = Price::new(dec!(95000)).unwrap();
+        let stop = Price::new(dec!(93500)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        let size_base = calculate_position_size(&base, &entry, &tech_stop).unwrap();
+        let size_buffered = calculate_position_size(&buffered, &entry, &tech_stop).unwrap();
+        assert!(size_buffered.as_decimal() < size_base.as_decimal());
+
+        let buffer_amount = dec!(93500) * dec!(20) / dec!(10000); // 187.00
+        let gap = dec!(93500) * buffered.stop_gap_bps() / dec!(10000);
+        let fees = buffered.taker_fee_rate() * (dec!(95000) + dec!(95000));
+        let worst_loss = size_buffered.as_decimal() * (dec!(1500) + buffer_amount + gap + fees);
+        assert_eq!(worst_loss.round_dp(2), dec!(100));
     }
 
     #[test]

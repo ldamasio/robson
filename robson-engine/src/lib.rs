@@ -208,7 +208,8 @@ pub enum EngineAction {
         side: robson_domain::OrderSide,
         /// Quantity to protect (the open position size)
         quantity: Quantity,
-        /// Chart-derived trailing stop price
+        /// Executable stop price (technical stop offset by the configured
+        /// buffer; equals the technical stop when the buffer is zero)
         stop_price: Price,
     },
 
@@ -642,7 +643,9 @@ impl Engine {
                 symbol: position.symbol.clone(),
                 side: position.side.exit_action(),
                 quantity: filled_quantity,
-                stop_price: initial_trailing_stop,
+                // Executable price: technical stop offset by the configured
+                // buffer (events keep the technical value).
+                stop_price: self.effective_stop(position.side, initial_trailing_stop),
             },
         ];
 
@@ -770,13 +773,34 @@ impl Engine {
         Ok(EngineDecision::with_actions(vec![EngineAction::EmitEvent(monitor_tick)]))
     }
 
-    /// Check if position should exit (trailing stop hit)
+    /// Derive the executable stop from the chart-derived technical stop.
+    ///
+    /// The technical stop stays the conceptual reference everywhere (trailing
+    /// ladder, events, persistence); execution — the soft-exit comparison and
+    /// the exchange-side insurance stop — triggers a small operator-configured
+    /// buffer beyond it (below for longs, above for shorts). Zero buffer, the
+    /// default, is the historical behavior. The buffer is priced into
+    /// position sizing (Policy 10).
+    fn effective_stop(&self, side: Side, technical_stop: Price) -> Price {
+        robson_domain::value_objects::effective_stop_price(
+            side,
+            technical_stop,
+            self.risk_config.stop_buffer_bps(),
+        )
+    }
+
+    /// Check if position should exit (executable stop hit)
+    ///
+    /// The comparison uses the EXECUTABLE stop (technical stop offset by the
+    /// configured buffer), so the software exit and the exchange-side
+    /// insurance stop trigger at the same level.
     fn should_exit(&self, side: Side, current_price: Price, trailing_stop: Price) -> bool {
+        let effective = self.effective_stop(side, trailing_stop);
         match side {
-            // LONG: exit when price drops to or below trailing stop
-            Side::Long => current_price.as_decimal() <= trailing_stop.as_decimal(),
-            // SHORT: exit when price rises to or above trailing stop
-            Side::Short => current_price.as_decimal() >= trailing_stop.as_decimal(),
+            // LONG: exit when price drops to or below the executable stop
+            Side::Long => current_price.as_decimal() <= effective.as_decimal(),
+            // SHORT: exit when price rises to or above the executable stop
+            Side::Short => current_price.as_decimal() >= effective.as_decimal(),
         }
     }
 
@@ -969,14 +993,14 @@ impl Engine {
                 side: position.side.exit_action(),
                 quantity: position.quantity,
                 previous_order_id,
-                new_stop_price: new_stop,
+                new_stop_price: self.effective_stop(position.side, new_stop),
             },
             None => EngineAction::PlaceInsuranceStop {
                 position_id: position.id,
                 symbol: position.symbol.clone(),
                 side: position.side.exit_action(),
                 quantity: position.quantity,
-                stop_price: new_stop,
+                stop_price: self.effective_stop(position.side, new_stop),
             },
         };
 
@@ -2161,6 +2185,111 @@ mod tests {
             cancel_idx < exit_idx,
             "CancelInsuranceStop must precede PlaceExitOrder so a reduce-only stop and a market exit never coexist"
         );
+    }
+
+    #[test]
+    fn test_exit_waits_for_executable_stop_with_buffer() {
+        // 10 bps buffer: soft exit must NOT fire exactly at the technical
+        // stop; it fires once price crosses the executable stop beyond it.
+        let config = RiskConfig::new(dec!(10000)).unwrap().with_stop_buffer(dec!(10)).unwrap();
+        let engine = Engine::new(config);
+
+        // LONG: technical stop 93500 → executable 93406.50 (93.50 below)
+        let position =
+            create_active_position(Side::Long, dec!(95000), dec!(93500), dec!(95000), dec!(1500));
+        let at_technical = engine
+            .process_active_position(&position, &create_market_data(dec!(93500)))
+            .unwrap();
+        assert!(
+            !at_technical
+                .actions
+                .iter()
+                .any(|a| matches!(a, EngineAction::TriggerExit { .. })),
+            "price at the technical stop must not trigger with a buffer configured"
+        );
+        let at_executable = engine
+            .process_active_position(&position, &create_market_data(dec!(93406.50)))
+            .unwrap();
+        assert!(
+            at_executable
+                .actions
+                .iter()
+                .any(|a| matches!(a, EngineAction::TriggerExit { .. })),
+            "price at the executable stop must trigger the exit"
+        );
+
+        // SHORT: technical stop 96500 → executable 96596.50 (96.50 above)
+        let position =
+            create_active_position(Side::Short, dec!(95000), dec!(96500), dec!(95000), dec!(1500));
+        let at_technical = engine
+            .process_active_position(&position, &create_market_data(dec!(96500)))
+            .unwrap();
+        assert!(!at_technical
+            .actions
+            .iter()
+            .any(|a| matches!(a, EngineAction::TriggerExit { .. })));
+        let at_executable = engine
+            .process_active_position(&position, &create_market_data(dec!(96596.50)))
+            .unwrap();
+        assert!(at_executable
+            .actions
+            .iter()
+            .any(|a| matches!(a, EngineAction::TriggerExit { .. })));
+    }
+
+    #[test]
+    fn test_insurance_actions_carry_executable_stop() {
+        // The exchange-side order must be placed at the executable price
+        // while events keep the technical stop.
+        let config = RiskConfig::new(dec!(10000)).unwrap().with_stop_buffer(dec!(10)).unwrap();
+        let engine = Engine::new(config);
+
+        let mut position =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        position.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(
+            Price::new(dec!(95000)).unwrap(),
+            Price::new(dec!(93500)).unwrap(),
+        ));
+        position.state = PositionState::Entering {
+            entry_order_id: Uuid::now_v7(),
+            expected_entry: Price::new(dec!(95000)).unwrap(),
+            signal_id: Uuid::now_v7(),
+        };
+
+        let decision = engine
+            .process_entry_fill(
+                &position,
+                Price::new(dec!(95000)).unwrap(),
+                Quantity::new(dec!(0.06)).unwrap(),
+                dec!(0.5),
+                Utc::now(),
+                None,
+            )
+            .unwrap();
+
+        let insurance_price = decision
+            .actions
+            .iter()
+            .find_map(|a| match a {
+                EngineAction::PlaceInsuranceStop { stop_price, .. } => Some(*stop_price),
+                _ => None,
+            })
+            .expect("entry fill must place the insurance stop");
+        // Executable: 93500 − 10 bps (93.50) = 93406.50
+        assert_eq!(insurance_price.as_decimal(), dec!(93406.50000));
+
+        let event_stop = decision
+            .actions
+            .iter()
+            .find_map(|a| match a {
+                EngineAction::EmitEvent(Event::EntryFilled { initial_stop, .. }) => {
+                    Some(*initial_stop)
+                },
+                _ => None,
+            })
+            .expect("entry fill must emit EntryFilled");
+        // The event keeps the TECHNICAL stop as the conceptual reference.
+        assert_eq!(event_stop.as_decimal(), dec!(93500));
     }
 
     #[test]

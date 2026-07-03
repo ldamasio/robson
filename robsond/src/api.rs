@@ -190,6 +190,10 @@ pub struct PositionSummary {
     pub entry_price: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trailing_stop: Option<Decimal>,
+    /// Executable stop (technical trailing stop offset by the configured
+    /// buffer, ADR-0041). Equals `trailing_stop` when the buffer is zero.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_stop: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tech_stop_distance: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2000,7 +2004,8 @@ where
         .to_string(),
     );
 
-    position_to_summary(position, live_price, entry_mode, approval_mode)
+    let stop_buffer_bps = manager.risk_config_snapshot().stop_buffer_bps();
+    position_to_summary(position, live_price, entry_mode, approval_mode, stop_buffer_bps)
 }
 
 async fn position_to_summary_with_live_price_and_sync<E, S>(
@@ -2042,6 +2047,7 @@ fn position_to_summary(
     live_price: Option<Price>,
     entry_mode: Option<String>,
     approval_mode: Option<String>,
+    stop_buffer_bps: Decimal,
 ) -> PositionSummary {
     let (
         state_str,
@@ -2126,6 +2132,19 @@ fn position_to_summary(
         },
         entry_price,
         trailing_stop,
+        // Executable stop is derived, never stored: only meaningful while the
+        // technical trailing stop is live (Active state).
+        effective_stop: match &position.state {
+            PositionState::Active { trailing_stop, .. } => Some(
+                robson_domain::value_objects::effective_stop_price(
+                    position.side,
+                    *trailing_stop,
+                    stop_buffer_bps,
+                )
+                .as_decimal(),
+            ),
+            _ => None,
+        },
         tech_stop_distance,
         current_price,
         pnl,
@@ -2551,8 +2570,13 @@ mod tests {
             last_emitted_stop: None,
         };
 
-        let summary =
-            position_to_summary(&position, Some(Price::new(dec!(98)).unwrap()), None, None);
+        let summary = position_to_summary(
+            &position,
+            Some(Price::new(dec!(98)).unwrap()),
+            None,
+            None,
+            Decimal::ZERO,
+        );
 
         assert_eq!(summary.current_price, Some(dec!(98)));
         assert_eq!(summary.pnl, Some(dec!(-4)));
@@ -2574,8 +2598,13 @@ mod tests {
             last_emitted_stop: None,
         };
 
-        let summary =
-            position_to_summary(&position, Some(Price::new(dec!(90)).unwrap()), None, None);
+        let summary = position_to_summary(
+            &position,
+            Some(Price::new(dec!(90)).unwrap()),
+            None,
+            None,
+            Decimal::ZERO,
+        );
 
         assert_eq!(summary.current_price, Some(dec!(90)));
         assert_eq!(summary.pnl, Some(dec!(-10)));
@@ -2594,7 +2623,7 @@ mod tests {
             exit_reason: robson_domain::ExitReason::UserPanic,
         };
 
-        let summary = position_to_summary(&position, None, None, None);
+        let summary = position_to_summary(&position, None, None, None, Decimal::ZERO);
 
         assert_eq!(summary.current_price, Some(dec!(90)));
         assert_eq!(summary.pnl, Some(dec!(20)));

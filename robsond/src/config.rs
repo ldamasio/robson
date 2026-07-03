@@ -111,6 +111,10 @@ pub struct EngineConfig {
     /// Gap allowance past the stop in basis points of the stop price
     /// (env: ROBSON_STOP_GAP_BPS, default 10). ADR-0039.
     pub stop_gap_bps: Decimal,
+    /// Executable-stop buffer beyond the technical stop in basis points
+    /// (env: ROBSON_STOP_BUFFER_BPS, default 0 = execute at the technical
+    /// level). ADR-0041.
+    pub stop_buffer_bps: Decimal,
 }
 
 /// Technical stop policy configuration loaded from environment (ADR-0024).
@@ -302,6 +306,7 @@ impl Config {
                 max_tech_stop_percent: Decimal::new(10, 2), // 10%
                 taker_fee_rate: Decimal::new(5, 4),         // 0.05% per fill
                 stop_gap_bps: Decimal::from(10),            // 10 bps
+                stop_buffer_bps: Decimal::ZERO,             // execute at technical stop
             },
             tech_stop: TechStopConfigEnv {
                 min_stop_pct: Decimal::new(1, 1), // 0.1%
@@ -384,11 +389,16 @@ impl Config {
             Decimal::from(10), // 10 bps past the stop
         )?;
 
+        // Executable-stop buffer (ADR-0041): offset execution beyond the
+        // technical stop. Default 0 keeps the historical behavior.
+        let stop_buffer_bps = Self::load_decimal_env("ROBSON_STOP_BUFFER_BPS", Decimal::ZERO)?;
+
         Ok(EngineConfig {
             min_tech_stop_percent: min_tech_stop,
             max_tech_stop_percent: max_tech_stop,
             taker_fee_rate,
             stop_gap_bps,
+            stop_buffer_bps,
         })
     }
 
@@ -619,6 +629,7 @@ impl Default for Config {
                 max_tech_stop_percent: Decimal::new(10, 2), // 10%
                 taker_fee_rate: Decimal::new(5, 4),         // 0.05% per fill
                 stop_gap_bps: Decimal::from(10),            // 10 bps
+                stop_buffer_bps: Decimal::ZERO,             // execute at technical stop
             },
             tech_stop: TechStopConfigEnv {
                 min_stop_pct: Decimal::ONE,      // 1%

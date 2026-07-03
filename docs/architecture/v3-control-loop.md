@@ -405,6 +405,15 @@ conditional-order id. Lifecycle:
   plausible lost linkage and is kept (warned, never cancelled) — cancelling
   would strip a live protection, the worse error.
 
+Both stop layers trigger at the EXECUTABLE stop: the technical trailing stop
+offset by the operator-configured `stop_buffer_bps` (default 0 = trigger at
+the technical level; below it for longs, above for shorts) so execution
+avoids the obvious chart level. The technical stop remains the reference in
+events, persistence, and the trailing ladder; the executable price is always
+derived (`effective_stop_price`) and exposed as
+`PositionSummary.effective_stop`. See
+[ADR-0041](../adr/ADR-0041-executable-stop-buffer.md).
+
 Stop-placement/replacement failures are audit-only (`InsuranceStopFailed`) and
 never abort the action batch or the position lifecycle. See
 [ADR-0039](../adr/ADR-0039-exchange-side-insurance-stop.md).

@@ -323,6 +323,14 @@ where
     S: Store + 'static,
 {
     let position_id = position.id;
+    // Executable price: technical trailing stop offset by the configured
+    // buffer. The heal must compare AND place with the same derivation the
+    // engine uses, or every restart would replace a correctly-priced stop.
+    let executable_stop = robson_domain::value_objects::effective_stop_price(
+        position.side,
+        trailing_stop,
+        pm.risk_config_snapshot().stop_buffer_bps(),
+    );
     let existing_id = match &position.state {
         PositionState::Active { insurance_stop_id, .. } => {
             insurance_stop_id.clone().or(position.insurance_stop_id.clone())
@@ -331,8 +339,9 @@ where
     };
 
     let Some(existing_id) = existing_id else {
-        // No stop on record (pre-ADR-0039 position): place one at the trailing stop.
-        place_insurance_stop(pm, position, trailing_stop).await;
+        // No stop on record (pre-ADR-0039 position): place one at the
+        // executable stop.
+        place_insurance_stop(pm, position, executable_stop).await;
         return false;
     };
 
@@ -399,8 +408,8 @@ where
 
     match live_order {
         Some(order) => match order.stop_price {
-            Some(stop_price) if stop_price != trailing_stop => {
-                replace_insurance_stop(pm, position, trailing_stop, existing_id).await;
+            Some(stop_price) if stop_price != executable_stop => {
+                replace_insurance_stop(pm, position, executable_stop, existing_id).await;
             },
             _ => {
                 debug!(
@@ -411,8 +420,8 @@ where
             },
         },
         None => {
-            // Cancelled/missing: re-place at the current trailing stop.
-            place_insurance_stop(pm, position, trailing_stop).await;
+            // Cancelled/missing: re-place at the executable stop.
+            place_insurance_stop(pm, position, executable_stop).await;
         },
     }
 

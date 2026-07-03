@@ -278,6 +278,44 @@ fn default_stop_gap_bps() -> Decimal {
     Decimal::from(10)
 }
 
+/// Default executable-stop buffer: zero (execute exactly at the technical
+/// stop, the historical behavior). Operator-configurable via
+/// [`RiskConfig::with_stop_buffer`].
+fn default_stop_buffer_bps() -> Decimal {
+    Decimal::ZERO
+}
+
+/// Derive the executable stop price from the chart-derived technical stop.
+///
+/// The technical stop is the conceptual invalidation level and stays the
+/// system-wide reference (trailing ladder, events, persistence, UI). The
+/// executable stop is where execution actually triggers: offset a small
+/// operator-configured buffer BEYOND the technical level so fills do not
+/// land exactly on the obvious chart level.
+///
+/// - LONG: executable stop sits BELOW the technical stop
+/// - SHORT: executable stop sits ABOVE the technical stop
+/// - `stop_buffer_bps = 0`: identical to the technical stop
+///
+/// The buffer widens the worst realizable loss, so
+/// [`crate::entities::calculate_position_size`] prices it into the risk
+/// budget (Policy 10). This is an execution offset from the chart level,
+/// never a percentage-of-entry stop (ADR-0021 intact).
+pub fn effective_stop_price(side: Side, technical_stop: Price, stop_buffer_bps: Decimal) -> Price {
+    if stop_buffer_bps <= Decimal::ZERO {
+        return technical_stop;
+    }
+    let offset = technical_stop.as_decimal() * stop_buffer_bps / Decimal::from(10_000);
+    let effective = match side {
+        Side::Long => technical_stop.as_decimal() - offset,
+        Side::Short => technical_stop.as_decimal() + offset,
+    };
+    // A valid buffer (≤ 100 bps, enforced by with_stop_buffer) cannot push a
+    // positive price non-positive; fall back to the technical stop if it ever
+    // would rather than panic in the execution path.
+    Price::new(effective).unwrap_or(technical_stop)
+}
+
 /// Risk configuration for position sizing (v3 policy)
 ///
 /// Risk per trade is capped at 1% of capital. This is a v3 policy decision:
@@ -319,6 +357,10 @@ pub struct RiskConfig {
     /// Gap allowance past the stop, in basis points of the stop price
     #[serde(default = "default_stop_gap_bps")]
     stop_gap_bps: Decimal,
+    /// Executable-stop buffer beyond the technical stop, in basis points of
+    /// the stop price (0 = execute exactly at the technical level)
+    #[serde(default = "default_stop_buffer_bps")]
+    stop_buffer_bps: Decimal,
 }
 
 impl RiskConfig {
@@ -346,6 +388,7 @@ impl RiskConfig {
             capital,
             taker_fee_rate: default_taker_fee_rate(),
             stop_gap_bps: default_stop_gap_bps(),
+            stop_buffer_bps: default_stop_buffer_bps(),
         })
     }
 
@@ -408,6 +451,30 @@ impl RiskConfig {
     /// Gap allowance past the stop, in basis points of the stop price
     pub fn stop_gap_bps(&self) -> Decimal {
         self.stop_gap_bps
+    }
+
+    /// Executable-stop buffer beyond the technical stop, in basis points
+    pub fn stop_buffer_bps(&self) -> Decimal {
+        self.stop_buffer_bps
+    }
+
+    /// Override the executable-stop buffer (operator-configured value).
+    ///
+    /// `stop_buffer_bps` offsets the executable stop beyond the chart-derived
+    /// technical stop (below it for longs, above it for shorts) so execution
+    /// does not trigger exactly on the obvious chart level. Range: 0 to 100
+    /// bps. The buffer is priced into position sizing (Policy 10).
+    ///
+    /// # Errors
+    /// Returns `DomainError::InvalidRiskConfig` when out of range.
+    pub fn with_stop_buffer(mut self, stop_buffer_bps: Decimal) -> Result<Self, DomainError> {
+        if stop_buffer_bps < Decimal::ZERO || stop_buffer_bps > Decimal::from(100) {
+            return Err(DomainError::InvalidRiskConfig(format!(
+                "Stop buffer must be in [0, 100] bps: {stop_buffer_bps}"
+            )));
+        }
+        self.stop_buffer_bps = stop_buffer_bps;
+        Ok(self)
     }
 
     /// Get risk percentage cap (always 1%)
@@ -761,6 +828,51 @@ mod tests {
     }
 
     // TechnicalStopDistance tests
+    #[test]
+    fn test_effective_stop_price_long_sits_below_technical() {
+        let technical = Price::new(dec!(58888.00)).unwrap();
+        let effective = effective_stop_price(Side::Long, technical, dec!(10));
+        // 10 bps of 58888.00 = 58.888
+        assert_eq!(effective.as_decimal(), dec!(58829.11200));
+        assert!(effective.as_decimal() < technical.as_decimal());
+    }
+
+    #[test]
+    fn test_effective_stop_price_short_sits_above_technical() {
+        let technical = Price::new(dec!(62180.00)).unwrap();
+        let effective = effective_stop_price(Side::Short, technical, dec!(10));
+        // 10 bps of 62180.00 = 62.18
+        assert_eq!(effective.as_decimal(), dec!(62242.18000));
+        assert!(effective.as_decimal() > technical.as_decimal());
+    }
+
+    #[test]
+    fn test_effective_stop_price_zero_buffer_is_identity() {
+        let technical = Price::new(dec!(62180.00)).unwrap();
+        assert_eq!(effective_stop_price(Side::Long, technical, Decimal::ZERO), technical);
+        assert_eq!(effective_stop_price(Side::Short, technical, Decimal::ZERO), technical);
+    }
+
+    #[test]
+    fn test_effective_stop_price_precision_is_deterministic() {
+        // Sub-tick precision stays exact in Decimal; exchange tick
+        // normalization is a connector concern (exchangeInfo TODO).
+        let technical = Price::new(dec!(0.070001)).unwrap();
+        let effective = effective_stop_price(Side::Long, technical, dec!(7));
+        assert_eq!(effective.as_decimal(), dec!(0.070001) - dec!(0.070001) * dec!(7) / dec!(10000));
+    }
+
+    #[test]
+    fn test_with_stop_buffer_validates_range() {
+        let config = RiskConfig::new(dec!(10000)).unwrap();
+        assert!(config.with_stop_buffer(dec!(-1)).is_err());
+        assert!(config.with_stop_buffer(dec!(101)).is_err());
+        let ok = config.with_stop_buffer(dec!(25)).unwrap();
+        assert_eq!(ok.stop_buffer_bps(), dec!(25));
+        // Default is zero (historical behavior)
+        assert_eq!(config.stop_buffer_bps(), Decimal::ZERO);
+    }
+
     #[test]
     fn test_tech_stop_distance_calculation() {
         let entry = Price::new(dec!(95000.0)).unwrap();
