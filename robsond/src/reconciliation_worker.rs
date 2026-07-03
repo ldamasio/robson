@@ -772,7 +772,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
             .count() as u32;
         let armed_risk = previous_capital_base * Decimal::new(1, 2) * Decimal::from(armed_count);
         let carried_risk = carried_risk_committed + armed_risk;
-        let new_capital_base = (wallet_balance - carried_risk).max(Decimal::ZERO);
+
+        // Recalibration must absorb ONLY out-of-band drift (deposits,
+        // withdrawals, manual trades). Governed month results already live in
+        // monthly_state.realized_loss and slot accounting; folding them into
+        // the base double-counts every governed loss (2026-07-03: the first
+        // insurance-stop fill was absorbed as "manual drift" and the slot
+        // gauge showed 4 free after a 1% loss). Back the month's net result
+        // out of the wallet before deriving the base.
+        let closed = self.store.positions().find_closed_in_month(now.year(), now.month()).await?;
+        let robson_month_net: Decimal =
+            closed.iter().map(|position| position.realized_pnl - position.fees_paid).sum();
+        let new_capital_base =
+            (wallet_balance - robson_month_net - carried_risk).max(Decimal::ZERO);
 
         if new_capital_base == previous_capital_base {
             info!(
