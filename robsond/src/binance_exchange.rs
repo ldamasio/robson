@@ -718,7 +718,57 @@ impl ExchangePort for BinanceExchangeAdapter {
             return Ok(None);
         }
 
-        self.get_order_by_exchange_id(symbol, &detail.actual_order_id).await
+        if let Some(result) = self.get_order_by_exchange_id(symbol, &detail.actual_order_id).await?
+        {
+            return Ok(Some(result));
+        }
+
+        // /fapi/v1/order omits per-fill records on USD-M futures, so the
+        // direct order query yields no fee-grade evidence for filled market
+        // orders. Resolve through user trades keyed by the triggered order id
+        // (UserTradeRecord-grade evidence, Policy 11). Found in production on
+        // 2026-07-03: the first real insurance-stop fill left its position
+        // unreconciled because this fallback was missing.
+        let since = DateTime::from_timestamp_millis(if detail.trigger_time > 0 {
+            detail.trigger_time - 5 * 60 * 1000
+        } else {
+            detail.create_time
+        })
+        .unwrap_or_else(|| Utc::now() - chrono::Duration::hours(24));
+
+        let trades = self.get_user_trades_since(symbol, since, 1000).await?;
+        let fills: Vec<_> = trades
+            .into_iter()
+            .filter(|t| t.exchange_order_id == detail.actual_order_id)
+            .collect();
+        if fills.is_empty() {
+            return Ok(None);
+        }
+
+        let total_qty: Decimal = fills.iter().map(|t| t.filled_quantity.as_decimal()).sum();
+        if total_qty <= Decimal::ZERO {
+            return Ok(None);
+        }
+        let total_quote: Decimal = fills
+            .iter()
+            .map(|t| t.fill_price.as_decimal() * t.filled_quantity.as_decimal())
+            .sum();
+        let fee: Decimal = fills.iter().map(|t| t.fee).sum();
+        let fee_asset =
+            fills.first().map(|t| t.fee_asset.clone()).unwrap_or_else(|| "USDT".to_string());
+        let filled_at = fills.iter().map(|t| t.filled_at).max().unwrap_or_else(Utc::now);
+
+        Ok(Some(OrderResult {
+            exchange_order_id: detail.actual_order_id.clone(),
+            client_order_id: detail.client_algo_id.clone(),
+            fill_price: Price::new(total_quote / total_qty)
+                .map_err(|e| ExecError::Exchange(format!("Invalid fill price: {}", e)))?,
+            filled_quantity: Quantity::new(total_qty)
+                .map_err(|e| ExecError::Exchange(format!("Invalid fill quantity: {}", e)))?,
+            fee,
+            fee_asset,
+            filled_at,
+        }))
     }
 
     async fn get_user_trades_since(
