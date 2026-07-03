@@ -285,13 +285,14 @@ fn default_stop_buffer_bps() -> Decimal {
     Decimal::ZERO
 }
 
-/// Derive the executable stop price from the chart-derived technical stop.
+/// Derive the executable stop price from the chosen stop level.
 ///
-/// The technical stop is the conceptual invalidation level and stays the
-/// system-wide reference (trailing ladder, events, persistence, UI). The
-/// executable stop is where execution actually triggers: offset a small
-/// operator-configured buffer BEYOND the technical level so fills do not
-/// land exactly on the obvious chart level.
+/// The technical stop is the chart-derived invalidation level and stays the
+/// system-wide reference (trailing ladder, events, persistence, UI). An
+/// invalidation guard is a clamp layer that can change which stop level is
+/// chosen before execution pricing. The executable stop is where execution
+/// actually triggers: offset a small operator-configured buffer BEYOND the
+/// chosen level so fills do not land exactly on the obvious chart level.
 ///
 /// - LONG: executable stop sits BELOW the technical stop
 /// - SHORT: executable stop sits ABOVE the technical stop
@@ -302,18 +303,36 @@ fn default_stop_buffer_bps() -> Decimal {
 /// budget (Policy 10). This is an execution offset from the chart level,
 /// never a percentage-of-entry stop (ADR-0021 intact).
 pub fn effective_stop_price(side: Side, technical_stop: Price, stop_buffer_bps: Decimal) -> Price {
+    effective_stop_price_with_guard(side, technical_stop, stop_buffer_bps, None)
+}
+
+/// Derive the executable stop price with an optional invalidation guard.
+pub fn effective_stop_price_with_guard(
+    side: Side,
+    technical_stop: Price,
+    stop_buffer_bps: Decimal,
+    guard: Option<Price>,
+) -> Price {
+    let base = match guard {
+        Some(g) => Price::new(match side {
+            Side::Short => technical_stop.as_decimal().max(g.as_decimal()),
+            Side::Long => technical_stop.as_decimal().min(g.as_decimal()),
+        })
+        .unwrap_or(technical_stop),
+        None => technical_stop,
+    };
     if stop_buffer_bps <= Decimal::ZERO {
-        return technical_stop;
+        return base;
     }
-    let offset = technical_stop.as_decimal() * stop_buffer_bps / Decimal::from(10_000);
+    let offset = base.as_decimal() * stop_buffer_bps / Decimal::from(10_000);
     let effective = match side {
-        Side::Long => technical_stop.as_decimal() - offset,
-        Side::Short => technical_stop.as_decimal() + offset,
+        Side::Long => base.as_decimal() - offset,
+        Side::Short => base.as_decimal() + offset,
     };
     // A valid buffer (≤ 100 bps, enforced by with_stop_buffer) cannot push a
-    // positive price non-positive; fall back to the technical stop if it ever
+    // positive price non-positive; fall back to the chosen base if it ever
     // would rather than panic in the execution path.
-    Price::new(effective).unwrap_or(technical_stop)
+    Price::new(effective).unwrap_or(base)
 }
 
 /// Risk configuration for position sizing (v3 policy)
@@ -860,6 +879,94 @@ mod tests {
         let technical = Price::new(dec!(0.070001)).unwrap();
         let effective = effective_stop_price(Side::Long, technical, dec!(7));
         assert_eq!(effective.as_decimal(), dec!(0.070001) - dec!(0.070001) * dec!(7) / dec!(10000));
+    }
+
+    #[test]
+    fn test_effective_stop_price_with_guard_short_clamps_to_recent_high() {
+        let technical = Price::new(dec!(62214.70)).unwrap();
+        let guard = Price::new(dec!(62386.70)).unwrap();
+        let effective =
+            effective_stop_price_with_guard(Side::Short, technical, dec!(10), Some(guard));
+
+        assert_eq!(effective.as_decimal(), dec!(62449.08670));
+    }
+
+    #[test]
+    fn test_effective_stop_price_with_guard_short_keeps_wider_technical() {
+        let technical = Price::new(dec!(62450.00)).unwrap();
+        let guard = Price::new(dec!(62386.70)).unwrap();
+        let effective =
+            effective_stop_price_with_guard(Side::Short, technical, dec!(10), Some(guard));
+
+        assert_eq!(effective.as_decimal(), dec!(62512.45000));
+    }
+
+    #[test]
+    fn test_effective_stop_price_with_guard_long_clamps_to_recent_low() {
+        let technical = Price::new(dec!(58888.00)).unwrap();
+        let guard = Price::new(dec!(58700.00)).unwrap();
+        let effective =
+            effective_stop_price_with_guard(Side::Long, technical, dec!(10), Some(guard));
+
+        assert_eq!(effective.as_decimal(), dec!(58641.30000));
+    }
+
+    #[test]
+    fn test_effective_stop_price_with_guard_long_keeps_wider_technical() {
+        let technical = Price::new(dec!(58500.00)).unwrap();
+        let guard = Price::new(dec!(58700.00)).unwrap();
+        let effective =
+            effective_stop_price_with_guard(Side::Long, technical, dec!(10), Some(guard));
+
+        assert_eq!(effective.as_decimal(), dec!(58441.50000));
+    }
+
+    #[test]
+    fn test_effective_stop_price_with_guard_none_matches_legacy_helper() {
+        let technical = Price::new(dec!(62180.00)).unwrap();
+
+        assert_eq!(
+            effective_stop_price_with_guard(Side::Short, technical, dec!(10), None),
+            effective_stop_price(Side::Short, technical, dec!(10))
+        );
+    }
+
+    #[test]
+    fn test_effective_stop_price_with_guard_zero_buffer_returns_clamped_level() {
+        let technical = Price::new(dec!(62214.70)).unwrap();
+        let guard = Price::new(dec!(62386.70)).unwrap();
+
+        assert_eq!(
+            effective_stop_price_with_guard(Side::Short, technical, Decimal::ZERO, Some(guard)),
+            guard
+        );
+    }
+
+    #[test]
+    fn test_effective_stop_price_with_guard_favorable_guard_is_noop() {
+        let short_technical = Price::new(dec!(110)).unwrap();
+        let short_guard = Price::new(dec!(105)).unwrap();
+        assert_eq!(
+            effective_stop_price_with_guard(
+                Side::Short,
+                short_technical,
+                Decimal::ZERO,
+                Some(short_guard)
+            ),
+            short_technical
+        );
+
+        let long_technical = Price::new(dec!(90)).unwrap();
+        let long_guard = Price::new(dec!(95)).unwrap();
+        assert_eq!(
+            effective_stop_price_with_guard(
+                Side::Long,
+                long_technical,
+                Decimal::ZERO,
+                Some(long_guard)
+            ),
+            long_technical
+        );
     }
 
     #[test]

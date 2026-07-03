@@ -191,9 +191,23 @@ pub struct PositionSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trailing_stop: Option<Decimal>,
     /// Executable stop (technical trailing stop offset by the configured
-    /// buffer, ADR-0041). Equals `trailing_stop` when the buffer is zero.
+    /// buffer, ADR-0041; clamped to the entry-time invalidation guard while
+    /// it is still active, ADR-0042). Equals `trailing_stop` when the buffer
+    /// is zero and no guard binds.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_stop: Option<Decimal>,
+    /// Analyzer technical stop before the invalidation guard clamp, when a
+    /// guard is active for this position (ADR-0042).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub raw_technical_stop: Option<Decimal>,
+    /// Entry-time invalidation guard level clamping the effective stop, when
+    /// active (ADR-0042).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub invalidation_guard_level: Option<Decimal>,
+    /// Which level forms the effective stop basis before buffering:
+    /// `"technical_stop"` or `"invalidation_guard"` (ADR-0042).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub effective_stop_basis: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tech_stop_distance: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2119,6 +2133,48 @@ fn position_to_summary(
         PositionState::Cancelled => ("Cancelled".to_string(), None, None, None, None, None, None),
     };
 
+    // Executable stop and invalidation-guard summary fields (ADR-0041/ADR-0042),
+    // derived from the Active state. `raw_technical_stop`,
+    // `invalidation_guard_level`, and `effective_stop_basis` are populated only
+    // while an entry-time guard is still active (None once released).
+    let (effective_stop, raw_technical_stop, invalidation_guard_level, effective_stop_basis) =
+        match &position.state {
+            PositionState::Active { trailing_stop, invalidation_guard_level, .. } => {
+                let guard = *invalidation_guard_level;
+                let effective = robson_domain::value_objects::effective_stop_price_with_guard(
+                    position.side,
+                    *trailing_stop,
+                    stop_buffer_bps,
+                    guard,
+                )
+                .as_decimal();
+                let (raw, basis) = match guard {
+                    Some(g) => {
+                        // Mirrors the domain clamp: the guard binds only when it
+                        // lies beyond the technical stop on the adverse side.
+                        let binds = match position.side {
+                            Side::Short => g.as_decimal() > trailing_stop.as_decimal(),
+                            Side::Long => g.as_decimal() < trailing_stop.as_decimal(),
+                        };
+                        let basis = if binds {
+                            "invalidation_guard"
+                        } else {
+                            "technical_stop"
+                        }
+                        .to_string();
+                        let raw = position
+                            .tech_stop_distance
+                            .as_ref()
+                            .map(|t| t.initial_stop.as_decimal());
+                        (raw, Some(basis))
+                    },
+                    None => (None, None),
+                };
+                (Some(effective), raw, guard.map(|g| g.as_decimal()), basis)
+            },
+            _ => (None, None, None, None),
+        };
+
     PositionSummary {
         id: position.id,
         symbol: position.symbol.as_pair(),
@@ -2135,19 +2191,10 @@ fn position_to_summary(
         },
         entry_price,
         trailing_stop,
-        // Executable stop is derived, never stored: only meaningful while the
-        // technical trailing stop is live (Active state).
-        effective_stop: match &position.state {
-            PositionState::Active { trailing_stop, .. } => Some(
-                robson_domain::value_objects::effective_stop_price(
-                    position.side,
-                    *trailing_stop,
-                    stop_buffer_bps,
-                )
-                .as_decimal(),
-            ),
-            _ => None,
-        },
+        effective_stop,
+        raw_technical_stop,
+        invalidation_guard_level,
+        effective_stop_basis,
         tech_stop_distance,
         current_price,
         pnl,
@@ -2570,6 +2617,7 @@ mod tests {
             favorable_extreme: Price::new(dec!(105)).unwrap(),
             extreme_at: chrono::Utc::now(),
             insurance_stop_id: None,
+            invalidation_guard_level: None,
             last_emitted_stop: None,
         };
 
@@ -2598,6 +2646,7 @@ mod tests {
             favorable_extreme: Price::new(dec!(105)).unwrap(),
             extreme_at: chrono::Utc::now(),
             insurance_stop_id: None,
+            invalidation_guard_level: None,
             last_emitted_stop: None,
         };
 
@@ -2643,6 +2692,7 @@ mod tests {
             favorable_extreme: Price::new(dec!(105)).unwrap(),
             extreme_at: chrono::Utc::now(),
             insurance_stop_id: None,
+            invalidation_guard_level: None,
             last_emitted_stop: None,
         };
 
@@ -3500,6 +3550,7 @@ mod tests {
             favorable_extreme: entry_price,
             extreme_at: now,
             insurance_stop_id: None,
+            invalidation_guard_level: None,
             last_emitted_stop: None,
         };
         position.updated_at = now;

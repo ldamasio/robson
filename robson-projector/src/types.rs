@@ -195,6 +195,9 @@ pub struct EntryFilled {
     pub filled_quantity: Decimal,
     pub fee: Decimal,
     pub initial_stop: Decimal,
+    /// Entry-time invalidation guard level, if active (ADR-0042).
+    #[serde(default)]
+    pub invalidation_guard_level: Option<Decimal>,
     pub timestamp: DateTime<Utc>,
 }
 

@@ -98,6 +98,7 @@ struct PositionCurrentRow {
     entry_signal_id: Option<Uuid>,
     exit_reason: Option<String>,
     insurance_stop_id: Option<String>,
+    invalidation_guard_level: Option<Decimal>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
     closed_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -138,6 +139,7 @@ fn parse_position_row(row: &sqlx::postgres::PgRow) -> Result<PositionCurrentRow,
         entry_signal_id: row.try_get("entry_signal_id").ok(),
         exit_reason: row.try_get("exit_reason").ok(),
         insurance_stop_id: row.try_get::<Option<String>, _>("insurance_stop_id").ok().flatten(),
+        invalidation_guard_level: try_get_decimal("invalidation_guard_level"),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         closed_at: row.try_get("closed_at").ok(),
@@ -304,6 +306,11 @@ fn row_to_position(row_data: PositionCurrentRow) -> Result<Option<Position>, Sto
                 // Hydrate the live protective-order linkage (ADR-0039): a NULL
                 // here after a placement was the 2026-07-03 orphaning root cause.
                 insurance_stop_id: row_data.insurance_stop_id.clone(),
+                // Hydrate the entry-time invalidation guard level so the engine
+                // and API see the same effective stop after restart (ADR-0042).
+                invalidation_guard_level: row_data
+                    .invalidation_guard_level
+                    .and_then(|p| Price::new(p).ok()),
                 last_emitted_stop: row_data.trailing_stop_price.map(|p| Price::new(p).unwrap()),
             };
         },
@@ -415,6 +422,7 @@ fn row_to_position(row_data: PositionCurrentRow) -> Result<Option<Position>, Sto
 /// - entry_signal_id: UUID?
 /// - exit_reason: TEXT?
 /// - technical_stop_price: Decimal?
+/// - invalidation_guard_level: Decimal?
 /// - created_at: Timestamp
 /// - updated_at: Timestamp
 pub async fn find_active_from_projection(
@@ -445,6 +453,7 @@ pub async fn find_active_from_projection(
             entry_signal_id,
             exit_reason,
             insurance_stop_id,
+            invalidation_guard_level,
             created_at,
             updated_at,
             closed_at,
@@ -558,6 +567,7 @@ pub async fn find_positions_overlapping_month(
             entry_signal_id,
             exit_reason,
             insurance_stop_id,
+            invalidation_guard_level,
             created_at,
             updated_at,
             closed_at
@@ -1006,5 +1016,76 @@ mod tests {
         assert_eq!(parse_exit_reason("UnknownReason"), None);
         assert_eq!(parse_exit_reason("trailing-stop"), None); // hyphen not
                                                               // accepted
+    }
+
+    /// ADR-0042: crash recovery must hydrate the entry-time invalidation guard
+    /// level into PositionState::Active so the engine and API agree on the
+    /// effective stop after restart.
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn test_projection_recovery_hydrates_invalidation_guard_level(pool: PgPool) {
+        let tenant_id = Uuid::now_v7();
+        let position_id = Uuid::now_v7();
+        let account_id = Uuid::now_v7();
+        let strategy_id = Uuid::now_v7();
+        let now = Utc::now();
+
+        sqlx::query(
+            r#"
+            INSERT INTO positions_current (
+                position_id, tenant_id, account_id, strategy_id,
+                symbol, side, state,
+                entry_price, entry_quantity,
+                current_price, trailing_stop_price, favorable_extreme, extreme_at,
+                technical_stop_distance, technical_stop_price,
+                invalidation_guard_level,
+                current_quantity,
+                last_event_id, last_seq,
+                created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)
+            "#,
+        )
+        .bind(position_id)
+        .bind(tenant_id)
+        .bind(account_id)
+        .bind(strategy_id)
+        .bind("BTCUSDT")
+        .bind("short")
+        .bind("active")
+        .bind(dec!(61909.10))
+        .bind(dec!(0.01))
+        .bind(dec!(61909.10))
+        .bind(dec!(62214.70))
+        .bind(dec!(61800.00))
+        .bind(now)
+        .bind(dec!(305.60))
+        .bind(dec!(62214.70))
+        .bind(dec!(62386.70))
+        .bind(dec!(0.01))
+        .bind(Uuid::now_v7())
+        .bind(1i64)
+        .bind(now)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .expect("Failed to insert test position");
+
+        let reader = PgProjectionReader::new(Arc::new(pool));
+        let restored = reader
+            .find_active_from_projection(tenant_id)
+            .await
+            .expect("Failed to restore positions");
+
+        assert_eq!(restored.len(), 1);
+
+        match &restored[0].state {
+            PositionState::Active { invalidation_guard_level, .. } => {
+                assert_eq!(
+                    invalidation_guard_level.map(|p| p.as_decimal()),
+                    Some(dec!(62386.70))
+                );
+            },
+            _ => panic!("Expected Active state"),
+        }
     }
 }

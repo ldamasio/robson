@@ -482,9 +482,33 @@ impl Engine {
         let tech_stop = signal.tech_stop_distance();
         tech_stop.validate().map_err(|e| EngineError::DomainError(e))?;
 
-        // 4. Calculate position size (Golden Rule)
-        let quantity = calculate_position_size(&self.risk_config, &signal.entry_price, &tech_stop)
-            .map_err(|e| EngineError::DomainError(e))?;
+        // 4. Resolve the effective stop basis for sizing (ADR-0042). When the
+        //    detector supplied an invalidation guard, clamp the chart-derived
+        //    technical stop beyond the recent adverse extreme before sizing so
+        //    the 1% budget absorbs the worst realizable loss at the guarded
+        //    level. The domain clamp helper at zero buffer returns the clamped
+        //    level unchanged; `None` guard is the identity (historical sizing).
+        let guard = signal
+            .technical_stop_analysis
+            .as_ref()
+            .and_then(|audit| audit.invalidation_guard_level);
+        let effective_stop_level = robson_domain::value_objects::effective_stop_price_with_guard(
+            position.side,
+            tech_stop.initial_stop,
+            Decimal::ZERO,
+            guard,
+        );
+
+        // Calculate position size from the (possibly clamped) effective stop
+        // distance. A guard that widens the effective distance past the policy
+        // cap makes this return Err — the entry is rejected (guard too wide).
+        let quantity = calculate_position_size(
+            &self.risk_config,
+            &signal.entry_price,
+            &tech_stop,
+            effective_stop_level,
+        )
+        .map_err(EngineError::DomainError)?;
 
         debug!(
             position_id = %position.id,
@@ -552,6 +576,11 @@ impl Engine {
     /// * `fee` - Trading fee paid (from OrderResult)
     /// * `filled_at` - When the fill occurred (from exchange, not local clock)
     /// * `binance_position_id` - Optional Binance USD-M Futures position ID
+    /// * `invalidation_guard_level` - Entry-time invalidation guard level
+    ///   (ADR-0042), sourced from the detector signal/audit. Carried onto the
+    ///   `Active` state and the `EntryFilled` event so the executable stop
+    ///   (soft exit + insurance) stays clamped to the recent adverse extreme
+    ///   until the first trailing advance releases it.
     ///
     /// # Returns
     ///
@@ -571,6 +600,7 @@ impl Engine {
         fee: rust_decimal::Decimal,
         filled_at: DateTime<Utc>,
         binance_position_id: Option<String>,
+        invalidation_guard_level: Option<Price>,
     ) -> Result<EngineDecision, EngineError> {
         // 1. Validate position is Entering
         let entry_order_id = match &position.state {
@@ -614,6 +644,9 @@ impl Engine {
             favorable_extreme: fill_price,
             extreme_at: filled_at,
             insurance_stop_id: None, // No insurance stop (Robson manages exits)
+            // Entry-time invalidation guard (ADR-0042): clamps the effective
+            // stop until the first trailing advance releases it.
+            invalidation_guard_level,
             last_emitted_stop: None, // No stop emitted yet
         };
         updated_position.entry_price = Some(fill_price);
@@ -631,6 +664,7 @@ impl Engine {
                 filled_quantity,
                 fee,
                 initial_stop: initial_trailing_stop,
+                invalidation_guard_level,
                 binance_position_id,
                 timestamp: filled_at,
             }),
@@ -644,8 +678,10 @@ impl Engine {
                 side: position.side.exit_action(),
                 quantity: filled_quantity,
                 // Executable price: technical stop offset by the configured
-                // buffer (events keep the technical value).
-                stop_price: self.effective_stop(position.side, initial_trailing_stop),
+                // buffer (events keep the technical value), clamped to the
+                // entry-time guard while it is still active (ADR-0042).
+                stop_price: self
+                    .effective_stop(position.side, initial_trailing_stop, invalidation_guard_level),
             },
         ];
 
@@ -677,15 +713,22 @@ impl Engine {
         market_data: &MarketData,
     ) -> Result<EngineDecision, EngineError> {
         // Validate position is active
-        let (_current_price_in_state, trailing_stop, favorable_extreme, last_emitted_stop) =
+        let (_current_price_in_state, trailing_stop, favorable_extreme, last_emitted_stop, guard) =
             match &position.state {
                 PositionState::Active {
                     current_price,
                     trailing_stop,
                     favorable_extreme,
                     last_emitted_stop,
+                    invalidation_guard_level,
                     ..
-                } => (*current_price, *trailing_stop, *favorable_extreme, *last_emitted_stop),
+                } => (
+                    *current_price,
+                    *trailing_stop,
+                    *favorable_extreme,
+                    *last_emitted_stop,
+                    *invalidation_guard_level,
+                ),
                 other => {
                     return Err(EngineError::InvalidPositionState {
                         expected: "active".to_string(),
@@ -712,7 +755,7 @@ impl Engine {
             Self::observed_watermark(position.side, current_price, favorable_extreme);
 
         // Check exit first (higher priority)
-        if self.should_exit(position.side, current_price, trailing_stop) {
+        if self.should_exit(position.side, current_price, trailing_stop, guard) {
             debug!(
                 position_id = %position.id,
                 current_price = %current_price,
@@ -781,21 +824,29 @@ impl Engine {
     /// buffer beyond it (below for longs, above for shorts). Zero buffer, the
     /// default, is the historical behavior. The buffer is priced into
     /// position sizing (Policy 10).
-    fn effective_stop(&self, side: Side, technical_stop: Price) -> Price {
-        robson_domain::value_objects::effective_stop_price(
+    fn effective_stop(&self, side: Side, technical_stop: Price, guard: Option<Price>) -> Price {
+        robson_domain::value_objects::effective_stop_price_with_guard(
             side,
             technical_stop,
             self.risk_config.stop_buffer_bps(),
+            guard,
         )
     }
 
     /// Check if position should exit (executable stop hit)
     ///
     /// The comparison uses the EXECUTABLE stop (technical stop offset by the
-    /// configured buffer), so the software exit and the exchange-side
-    /// insurance stop trigger at the same level.
-    fn should_exit(&self, side: Side, current_price: Price, trailing_stop: Price) -> bool {
-        let effective = self.effective_stop(side, trailing_stop);
+    /// configured buffer, clamped to the entry-time guard while it is still
+    /// active), so the software exit and the exchange-side insurance stop
+    /// trigger at the same level.
+    fn should_exit(
+        &self,
+        side: Side,
+        current_price: Price,
+        trailing_stop: Price,
+        guard: Option<Price>,
+    ) -> bool {
+        let effective = self.effective_stop(side, trailing_stop, guard);
         match side {
             // LONG: exit when price drops to or below the executable stop
             Side::Long => current_price.as_decimal() <= effective.as_decimal(),
@@ -965,17 +1016,26 @@ impl Engine {
             favorable_extreme: _,
             extreme_at: _,
             insurance_stop_id,
+            invalidation_guard_level: _,
             ..
         } = updated_position.state
         {
             // Monotonicity check: stop only moves in favorable direction
             // (enforced by caller via is_more_favorable_stop check)
+            //
+            // The invalidation guard is an entry-time constraint and is released
+            // on the FIRST trailing advance (ADR-0042): for a short the
+            // trailing technical stop only moves down, so a permanent guard
+            // would pin the stop at the entry high forever. After release the
+            // effective stop is the trailing technical stop + buffer (ADR-0041),
+            // so it is cleared to None on every advance (a no-op once cleared).
             updated_position.state = PositionState::Active {
                 current_price: trigger_price,
                 trailing_stop: new_stop,
                 favorable_extreme: trigger_price,
                 extreme_at: Utc::now(),
                 insurance_stop_id,
+                invalidation_guard_level: None,
                 last_emitted_stop: Some(new_stop),
             };
             updated_position.updated_at = Utc::now();
@@ -993,14 +1053,14 @@ impl Engine {
                 side: position.side.exit_action(),
                 quantity: position.quantity,
                 previous_order_id,
-                new_stop_price: self.effective_stop(position.side, new_stop),
+                new_stop_price: self.effective_stop(position.side, new_stop, None),
             },
             None => EngineAction::PlaceInsuranceStop {
                 position_id: position.id,
                 symbol: position.symbol.clone(),
                 side: position.side.exit_action(),
                 quantity: position.quantity,
-                stop_price: self.effective_stop(position.side, new_stop),
+                stop_price: self.effective_stop(position.side, new_stop, None),
             },
         };
 
@@ -1083,6 +1143,7 @@ mod tests {
             favorable_extreme: Price::new(favorable_extreme).unwrap(),
             extreme_at: Utc::now(),
             insurance_stop_id: None,
+            invalidation_guard_level: None,
             last_emitted_stop: None,
         };
 
@@ -1739,6 +1800,7 @@ mod tests {
                 rust_decimal::Decimal::ZERO,
                 Utc::now(),
                 None,
+                None,
             )
             .unwrap();
 
@@ -1792,6 +1854,7 @@ mod tests {
                 rust_decimal::Decimal::ZERO,
                 Utc::now(),
                 None,
+                None,
             )
             .unwrap();
 
@@ -1824,6 +1887,7 @@ mod tests {
             filled_quantity,
             rust_decimal::Decimal::ZERO,
             Utc::now(),
+            None,
             None,
         );
 
@@ -1885,6 +1949,7 @@ mod tests {
                 rust_decimal::Decimal::ZERO,
                 Utc::now(),
                 None,
+                None,
             )
             .unwrap();
         let active_position = fill_decision.updated_position.unwrap();
@@ -1907,6 +1972,7 @@ mod tests {
             favorable_extreme: Price::new(dec!(96500)).unwrap(),
             extreme_at: Utc::now(),
             insurance_stop_id: None,
+            invalidation_guard_level: None,
             last_emitted_stop: Some(Price::new(dec!(95000)).unwrap()),
         };
 
@@ -1958,6 +2024,7 @@ mod tests {
                 favorable_extreme,
                 extreme_at,
                 insurance_stop_id,
+                invalidation_guard_level: None,
                 last_emitted_stop: Some(Price::new(dec!(95000)).unwrap()), // Already emitted
             };
         }
@@ -2006,6 +2073,7 @@ mod tests {
                 favorable_extreme,
                 extreme_at,
                 insurance_stop_id,
+                invalidation_guard_level: None,
                 last_emitted_stop: Some(Price::new(dec!(95000)).unwrap()), // Already emitted
             };
         }
@@ -2075,6 +2143,7 @@ mod tests {
                 Quantity::new(dec!(0.1)).unwrap(),
                 dec!(0.001),
                 Utc::now(),
+                None,
                 None,
             )
             .unwrap();
@@ -2264,6 +2333,7 @@ mod tests {
                 dec!(0.5),
                 Utc::now(),
                 None,
+                None,
             )
             .unwrap();
 
@@ -2314,5 +2384,237 @@ mod tests {
             .actions
             .iter()
             .any(|a| matches!(a, EngineAction::PlaceExitOrder { .. })));
+    }
+
+    // ADR-0042 Invalidation Guard Tests
+
+    /// Build a technical-stop audit carrying an optional invalidation guard.
+    fn analysis_audit_with_guard(
+        stop_price: Price,
+        guard: Option<Price>,
+    ) -> robson_domain::TechnicalStopAnalysisAudit {
+        robson_domain::TechnicalStopAnalysisAudit {
+            stop_price,
+            raw_technical_stop: guard.map(|_| stop_price),
+            invalidation_guard_level: guard,
+            effective_stop_basis: None,
+            method: robson_domain::TechnicalStopMethodSnapshot::SwingPoint { level_n: 2 },
+            confidence: robson_domain::TechnicalStopConfidenceSnapshot::High,
+            detected_levels: vec![],
+            config: robson_domain::TechnicalStopConfigSnapshot {
+                min_candles: 100,
+                swing_lookback: 2,
+                support_level_n: 2,
+                level_tolerance: dec!(0.005),
+                atr_period: 14,
+                atr_multiplier: dec!(1.5),
+                min_stop_distance_pct: dec!(0.001),
+                max_stop_distance_pct: dec!(0.10),
+            },
+            stop_anchor: None,
+            stop_quality: None,
+        }
+    }
+
+    /// Detector signal with a technical-stop audit carrying an invalidation
+    /// guard level.
+    fn create_detector_signal_with_guard(
+        position: &Position,
+        entry_price: Decimal,
+        stop_loss: Decimal,
+        guard: Option<Decimal>,
+    ) -> DetectorSignal {
+        let stop = Price::new(stop_loss).unwrap();
+        let audit = analysis_audit_with_guard(stop, guard.map(|g| Price::new(g).unwrap()));
+        create_detector_signal(position, entry_price, stop_loss).with_technical_stop_analysis(audit)
+    }
+
+    /// Stamp an entry-time invalidation guard onto an Active position.
+    fn with_invalidation_guard(mut position: Position, guard: Decimal) -> Position {
+        if let PositionState::Active { invalidation_guard_level, .. } = &mut position.state {
+            *invalidation_guard_level = Some(Price::new(guard).unwrap());
+        }
+        position
+    }
+
+    #[test]
+    fn test_decide_entry_sizes_with_effective_guard_distance() {
+        // Guard (recent low for Long) clamps the effective stop BELOW the
+        // technical stop, widening the sized distance.
+        let config = RiskConfig::new(dec!(10000)).unwrap();
+        let engine = Engine::new(config);
+
+        let position = create_armed_position(Side::Long);
+        // technical stop 93500 (distance 1500); guard 92500 clamps the
+        // effective base to 92500 (distance 2500).
+        let signal =
+            create_detector_signal_with_guard(&position, dec!(95000), dec!(93500), Some(dec!(92500)));
+
+        let decision = engine.decide_entry(&position, &signal).unwrap();
+        let quantity = decision
+            .actions
+            .iter()
+            .find_map(|a| match a {
+                EngineAction::PlaceEntryOrder { quantity, .. } => Some(*quantity),
+                _ => None,
+            })
+            .unwrap();
+
+        // Sized for the GUARDED distance (2500), not the technical (1500):
+        // 100 / (2500 + 92.5 gap (10 bps of 92500) + 95 fees).
+        let expected = dec!(100) / (dec!(2500) + dec!(92.5) + dec!(95));
+        assert_eq!(quantity.as_decimal(), expected);
+        // Strictly smaller than the unguarded sizing (distance 1500).
+        assert!(quantity.as_decimal() < dec!(100) / (dec!(1500) + dec!(93.5) + dec!(95)));
+    }
+
+    #[test]
+    fn test_decide_entry_rejects_when_guard_widens_past_cap() {
+        let config = RiskConfig::new(dec!(10000)).unwrap();
+        let engine = Engine::new(config);
+
+        let position = create_armed_position(Side::Long);
+        // technical stop 95 (5% distance, valid); guard 80 clamps the effective
+        // base to 80 (20% distance > 10% cap) → rejected (guard too wide).
+        let signal =
+            create_detector_signal_with_guard(&position, dec!(100), dec!(95), Some(dec!(80)));
+
+        let result = engine.decide_entry(&position, &signal);
+        assert!(result.is_err());
+        assert!(matches!(result.unwrap_err(), EngineError::DomainError(_)));
+    }
+
+    #[test]
+    fn test_process_entry_fill_carries_invalidation_guard() {
+        let config = RiskConfig::new(dec!(10000)).unwrap().with_stop_buffer(dec!(10)).unwrap();
+        let engine = Engine::new(config);
+
+        let mut position = create_armed_position(Side::Long);
+        let signal =
+            create_detector_signal_with_guard(&position, dec!(95000), dec!(93500), Some(dec!(92500)));
+        position.tech_stop_distance =
+            Some(TechnicalStopDistance::from_entry_and_stop(signal.entry_price, signal.stop_loss));
+        position.entry_price = Some(signal.entry_price);
+        position.state = PositionState::Entering {
+            entry_order_id: Uuid::now_v7(),
+            expected_entry: signal.entry_price,
+            signal_id: signal.signal_id,
+        };
+
+        let guard = Price::new(dec!(92500)).unwrap();
+        let decision = engine
+            .process_entry_fill(
+                &position,
+                Price::new(dec!(95000)).unwrap(),
+                Quantity::new(dec!(0.05)).unwrap(),
+                dec!(0),
+                Utc::now(),
+                None,
+                Some(guard),
+            )
+            .unwrap();
+
+        // Active state carries the guard.
+        let active = decision.updated_position.expect("updated position");
+        match active.state {
+            PositionState::Active { invalidation_guard_level, .. } => {
+                assert_eq!(invalidation_guard_level, Some(guard));
+            },
+            other => panic!("Expected Active, got {:?}", other.name()),
+        }
+
+        // EntryFilled event carries the guard.
+        let event_guard = decision.actions.iter().find_map(|a| match a {
+            EngineAction::EmitEvent(Event::EntryFilled { invalidation_guard_level, .. }) => {
+                *invalidation_guard_level
+            },
+            _ => None,
+        });
+        assert_eq!(event_guard, Some(guard));
+
+        // Insurance stop is placed at the guard-clamped executable level
+        // (base = min(93500, 92500) = 92500), below the unguarded technical
+        // executable (93406.5).
+        let insurance_price = decision
+            .actions
+            .iter()
+            .find_map(|a| match a {
+                EngineAction::PlaceInsuranceStop { stop_price, .. } => Some(*stop_price),
+                _ => None,
+            })
+            .expect("insurance stop");
+        let expected_insurance = robson_domain::value_objects::effective_stop_price_with_guard(
+            Side::Long,
+            Price::new(dec!(93500)).unwrap(),
+            dec!(10),
+            Some(guard),
+        );
+        assert_eq!(insurance_price, expected_insurance);
+        assert!(insurance_price.as_decimal() < dec!(93406.5));
+    }
+
+    #[test]
+    fn test_should_exit_uses_guard_clamped_executable_stop() {
+        // Long, trailing (technical) stop 93500, guard 93000 clamps the
+        // effective base to 93000. With a 10 bps buffer the executable stop is
+        // 93000 - 93 = 92907, BELOW the technical stop. A price at 93000 (which
+        // WOULD exit under the unguarded technical stop) must NOT exit while
+        // the guard is active.
+        let config = RiskConfig::new(dec!(10000)).unwrap().with_stop_buffer(dec!(10)).unwrap();
+        let engine = Engine::new(config);
+
+        let position = with_invalidation_guard(
+            create_active_position(Side::Long, dec!(95000), dec!(93500), dec!(95000), dec!(1500)),
+            dec!(93000),
+        );
+
+        let no_exit = engine
+            .process_active_position(&position, &create_market_data(dec!(93000)))
+            .unwrap();
+        assert!(
+            !no_exit
+                .actions
+                .iter()
+                .any(|a| matches!(a, EngineAction::TriggerExit { .. })),
+            "price above the guarded executable stop must not trigger"
+        );
+
+        let exit = engine
+            .process_active_position(&position, &create_market_data(dec!(92907)))
+            .unwrap();
+        assert!(
+            exit.actions
+                .iter()
+                .any(|a| matches!(a, EngineAction::TriggerExit { .. })),
+            "price at the guarded executable stop must trigger"
+        );
+    }
+
+    #[test]
+    fn test_first_trailing_advance_releases_invalidation_guard() {
+        let config = RiskConfig::new(dec!(10000)).unwrap();
+        let engine = Engine::new(config);
+
+        // Active Long with an active guard; price advances one full span.
+        let position = with_invalidation_guard(
+            create_active_position(Side::Long, dec!(95000), dec!(93500), dec!(95000), dec!(1500)),
+            dec!(93000),
+        );
+        // 96500 = entry + 1 span → trailing stop advances to 95000 (breakeven).
+        let decision = engine
+            .process_active_position(&position, &create_market_data(dec!(96500)))
+            .unwrap();
+
+        let updated = decision.updated_position.expect("trailing advance updates position");
+        match updated.state {
+            PositionState::Active { invalidation_guard_level, trailing_stop, .. } => {
+                assert_eq!(trailing_stop.as_decimal(), dec!(95000)); // advanced to breakeven
+                assert_eq!(
+                    invalidation_guard_level, None,
+                    "first trailing advance releases the guard"
+                );
+            },
+            other => panic!("Expected Active, got {:?}", other.name()),
+        }
     }
 }

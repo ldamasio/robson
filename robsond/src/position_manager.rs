@@ -125,6 +125,17 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// Entry policy selected for each armed position. This keeps runtime
     /// detector re-arming aligned with the policy event emitted at ARM time.
     entry_policies: Arc<RwLock<HashMap<PositionId, EntryPolicyConfig>>>,
+    /// Entry-time invalidation guard level captured from the detector signal
+    /// (ADR-0042), keyed by position. Populated when a signal carrying a guard
+    /// is processed and consumed by the entry-fill handler so the executable
+    /// stop (soft exit + insurance) stays clamped to the recent adverse
+    /// extreme until the first trailing advance releases it. Survives the
+    /// (possibly deferred) approval→fill flow within a daemon run.
+    invalidation_guards: Arc<RwLock<HashMap<PositionId, Price>>>,
+    /// Whether the entry-time invalidation guard is enabled (ADR-0042).
+    stop_invalidation_guard_enabled: bool,
+    /// Lookback candles for the invalidation guard recent extreme (ADR-0042).
+    stop_invalidation_lookback_candles: usize,
     /// Pending approvals held in runtime memory for Phase 3.
     pending_approvals: Arc<RwLock<HashMap<Uuid, PendingApprovalRecord>>>,
     /// Serializes entry-governance flows so pending reservations remain
@@ -512,6 +523,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             shutdown_token,
             detectors: Arc::new(RwLock::new(HashMap::new())),
             entry_policies: Arc::new(RwLock::new(HashMap::new())),
+            invalidation_guards: Arc::new(RwLock::new(HashMap::new())),
+            // Guard disabled by default; enabled per EngineConfig via
+            // `with_invalidation_guard`.
+            stop_invalidation_guard_enabled: false,
+            stop_invalidation_lookback_candles: 20,
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
             entry_flow_lock: Mutex::new(()),
             query_engine,
@@ -522,6 +538,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             #[cfg(feature = "postgres")]
             event_log_tenant_id: None,
         }
+    }
+
+    /// Configure the entry-time invalidation guard (ADR-0042) for detectors
+    /// spawned by this manager and propagate the guard level from a processed
+    /// signal to the entry-fill handler.
+    pub fn with_invalidation_guard(mut self, enabled: bool, lookback_candles: usize) -> Self {
+        self.stop_invalidation_guard_enabled = enabled;
+        self.stop_invalidation_lookback_candles = lookback_candles.max(1);
+        self
     }
 
     /// Configure the OHLCV source used by newly spawned detector tasks.
@@ -1005,6 +1030,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         detectors: Arc<RwLock<HashMap<PositionId, JoinHandle<Option<DetectorSignal>>>>>,
         shutdown_token: CancellationToken,
         reason: &'static str,
+        stop_invalidation_guard_enabled: bool,
+        stop_invalidation_lookback_candles: usize,
     ) {
         let cancel_token = shutdown_token.child_token();
         match DetectorTask::from_position_with_policy(
@@ -1015,6 +1042,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             cancel_token,
         ) {
             Ok(detector) => {
+                let detector = detector.with_invalidation_guard(
+                    stop_invalidation_guard_enabled,
+                    stop_invalidation_lookback_candles,
+                );
                 let handle = detector.spawn();
                 let mut detectors = detectors.write().await;
                 detectors.insert(position_id, handle);
@@ -1052,6 +1083,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             Arc::clone(&self.detectors),
             self.shutdown_token.clone(),
             reason,
+            self.stop_invalidation_guard_enabled,
+            self.stop_invalidation_lookback_candles,
         )
         .await;
     }
@@ -1103,6 +1136,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let ohlcv_port = Arc::clone(&self.ohlcv_port);
         let detectors = Arc::clone(&self.detectors);
         let entry_policies = Arc::clone(&self.entry_policies);
+        let stop_invalidation_guard_enabled = self.stop_invalidation_guard_enabled;
+        let stop_invalidation_lookback_candles = self.stop_invalidation_lookback_candles;
         let shutdown_token = self.shutdown_token.clone();
 
         let wait_duration = expires_at
@@ -1159,6 +1194,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                             detectors,
                             shutdown_token,
                             "approval expired",
+                            stop_invalidation_guard_enabled,
+                            stop_invalidation_lookback_candles,
                         )
                         .await;
                     }
@@ -1611,7 +1648,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             Arc::clone(&self.ohlcv_port),
             cancel_token,
         ) {
-            Ok(d) => d,
+            Ok(d) => d.with_invalidation_guard(
+                self.stop_invalidation_guard_enabled,
+                self.stop_invalidation_lookback_candles,
+            ),
             Err(e) => {
                 let err_str = format!("{}", e);
                 query.fail(err_str.clone(), "acting".to_string());
@@ -1687,7 +1727,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             Arc::clone(&self.event_bus),
             Arc::clone(&self.ohlcv_port),
             cancel_token,
-        )?;
+        )?
+        .with_invalidation_guard(
+            self.stop_invalidation_guard_enabled,
+            self.stop_invalidation_lookback_candles,
+        );
         let handle = detector.spawn();
 
         let mut detectors = self.detectors.write().await;
@@ -2096,6 +2140,25 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         // Kill detector (it's single-shot)
         self.kill_detector(position_id).await;
+
+        // Cache the entry-time invalidation guard level (ADR-0042) for the fill
+        // handler. Overwrite on each signal so a re-arm without a guard clears
+        // any stale level for this position.
+        let guard_level = signal
+            .technical_stop_analysis
+            .as_ref()
+            .and_then(|a| a.invalidation_guard_level);
+        {
+            let mut guards = self.invalidation_guards.write().await;
+            match guard_level {
+                Some(g) => {
+                    guards.insert(position_id, g);
+                },
+                None => {
+                    guards.remove(&position_id);
+                },
+            }
+        }
 
         if let Some(analysis) = signal.technical_stop_analysis.clone() {
             let event = Event::TechnicalStopAnalyzed {
@@ -2548,6 +2611,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .await?
             .ok_or(DaemonError::PositionNotFound(position_id))?;
 
+        // Consume the entry-time invalidation guard level cached when the
+        // signal was processed (ADR-0042). The guard travels onto the Active
+        // state and the EntryFilled event so the executable stop stays clamped
+        // until the first trailing advance. Missing (e.g. guard disabled, or a
+        // restart during the Entering window) → None = historical behavior.
+        let invalidation_guard_level = {
+            let mut guards = self.invalidation_guards.write().await;
+            guards.remove(&position_id)
+        };
+
         // Use engine to process fill (pure: State+Fill → Decision)
         // binance_position_id is passed through to EntryFilled event
         let decision = self.engine.lock().unwrap().process_entry_fill(
@@ -2557,6 +2630,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             fee,
             filled_at,
             binance_position_id.clone(),
+            invalidation_guard_level,
         )?;
 
         // Execute actions (EntryFilled event transitions position to Active via
@@ -3548,6 +3622,9 @@ mod tests {
     fn sample_technical_stop_analysis(stop_price: Price) -> TechnicalStopAnalysisAudit {
         TechnicalStopAnalysisAudit {
             stop_price,
+            raw_technical_stop: None,
+            invalidation_guard_level: None,
+            effective_stop_basis: None,
             method: TechnicalStopMethodSnapshot::SwingPoint { level_n: 2 },
             confidence: TechnicalStopConfidenceSnapshot::High,
             detected_levels: vec![Price::new(dec!(90000)).unwrap(), stop_price],
@@ -3564,6 +3641,20 @@ mod tests {
             stop_anchor: None,
             stop_quality: None,
         }
+    }
+
+    /// `sample_technical_stop_analysis` with the invalidation guard fields
+    /// populated (ADR-0042).
+    fn sample_technical_stop_analysis_with_guard(
+        stop_price: Price,
+        guard: Price,
+        basis: robson_domain::entities::EffectiveStopBasis,
+    ) -> TechnicalStopAnalysisAudit {
+        let mut audit = sample_technical_stop_analysis(stop_price);
+        audit.raw_technical_stop = Some(stop_price);
+        audit.invalidation_guard_level = Some(guard);
+        audit.effective_stop_basis = Some(basis);
+        audit
     }
 
     async fn save_active_position(
@@ -3593,6 +3684,7 @@ mod tests {
             favorable_extreme: entry_price,
             extreme_at: now,
             insurance_stop_id: None,
+            invalidation_guard_level: None,
             last_emitted_stop: None,
         };
         position.updated_at = now;
@@ -3829,6 +3921,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_handle_signal_persists_invalidation_guard_in_audit() {
+        let manager = create_test_manager().await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(98)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        let position = manager
+            .arm_position(
+                symbol.clone(),
+                Side::Long,
+                create_test_risk_config(),
+                Some(tech_stop),
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+
+        let signal_id = Uuid::now_v7();
+        let entry_price = Price::new(dec!(95000)).unwrap();
+        let stop_loss = Price::new(dec!(87400)).unwrap();
+        let guard = Price::new(dec!(87000)).unwrap();
+        let signal = DetectorSignal {
+            signal_id,
+            position_id: position.id,
+            symbol,
+            side: Side::Long,
+            entry_price,
+            stop_loss,
+            technical_stop_analysis: Some(sample_technical_stop_analysis_with_guard(
+                stop_loss,
+                guard,
+                robson_domain::entities::EffectiveStopBasis::InvalidationGuard,
+            )),
+            timestamp: chrono::Utc::now(),
+        };
+
+        // The audit (with the guard) is persisted before any risk/entry step.
+        let _ = manager.handle_signal(signal).await;
+
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        let analyzed = events
+            .iter()
+            .find_map(|event| match event {
+                Event::TechnicalStopAnalyzed { analysis, .. } => Some(analysis.clone()),
+                _ => None,
+            })
+            .expect("TechnicalStopAnalyzed must be appended");
+
+        assert_eq!(analyzed.invalidation_guard_level, Some(guard));
+        assert_eq!(analyzed.raw_technical_stop, Some(stop_loss));
+        assert_eq!(
+            analyzed.effective_stop_basis,
+            Some(robson_domain::entities::EffectiveStopBasis::InvalidationGuard)
+        );
+    }
+
+    #[tokio::test]
     async fn test_disarm_non_armed_fails() {
         let manager = create_test_manager().await;
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
@@ -3957,6 +4107,7 @@ mod tests {
             favorable_extreme: Price::new(dec!(95000)).unwrap(),
             extreme_at: chrono::Utc::now(),
             insurance_stop_id: None,
+            invalidation_guard_level: None,
             last_emitted_stop: None,
         };
         manager.store.positions().save(&pos).await.unwrap();
@@ -5130,6 +5281,7 @@ mod tests {
             favorable_extreme: entry,
             extreme_at: now,
             insurance_stop_id: None,
+            invalidation_guard_level: None,
             last_emitted_stop: None,
         };
         position.updated_at = now;
@@ -5190,6 +5342,7 @@ mod tests {
             favorable_extreme: entry,
             extreme_at: now,
             insurance_stop_id: None,
+            invalidation_guard_level: None,
             last_emitted_stop: None,
         };
         position.updated_at = now;
@@ -5225,6 +5378,7 @@ mod tests {
             favorable_extreme: entry,
             extreme_at: now,
             insurance_stop_id: None,
+            invalidation_guard_level: None,
             last_emitted_stop: None,
         };
         position.updated_at = now;
@@ -5954,6 +6108,7 @@ mod tests {
             favorable_extreme: entry_price,
             extreme_at: now,
             insurance_stop_id: None,
+            invalidation_guard_level: None,
             last_emitted_stop: None,
         };
         position.updated_at = now;
