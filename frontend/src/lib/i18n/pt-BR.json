@@ -41,6 +41,7 @@
     "connectionError": "ERRO DE CONEXÃO",
     "retry": "Tentar novamente",
     "insufficientCapitalBanner": "Capital insuficiente para operar",
+    "monthlyBudgetExhaustedBanner": "Orçamento de risco mensal esgotado — novas entradas liberam na virada do mês",
     "addFunds": "Adicionar fundos",
     "treasuryNav": "Tesouraria"
   },

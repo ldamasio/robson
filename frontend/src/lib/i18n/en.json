@@ -41,6 +41,7 @@
     "connectionError": "CONNECTION ERROR",
     "retry": "Retry",
     "insufficientCapitalBanner": "Insufficient capital to operate",
+    "monthlyBudgetExhaustedBanner": "Monthly risk budget exhausted — new entries unlock at the month rollover",
     "addFunds": "Add funds",
     "treasuryNav": "Treasury"
   },
