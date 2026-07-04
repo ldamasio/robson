@@ -687,12 +687,14 @@ mod tests {
                 extreme_at: _,
                 insurance_stop_id,
                 last_emitted_stop,
+                invalidation_guard_level,
             } => {
                 assert_eq!(current_price.as_decimal(), dec!(96000));
                 assert_eq!(trailing_stop.as_decimal(), dec!(93500));
                 assert_eq!(favorable_extreme.as_decimal(), dec!(97000));
                 assert!(insurance_stop_id.is_none());
                 assert_eq!(last_emitted_stop.as_ref().map(|p| p.as_decimal()), Some(dec!(93500)));
+                assert!(invalidation_guard_level.is_none(), "NULL column hydrates as None");
             },
             _ => panic!("Expected Active state, got {:?}", pos.state),
         }
