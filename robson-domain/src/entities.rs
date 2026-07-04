@@ -168,7 +168,8 @@ impl Position {
 ///                     + Gap Allowance            (stop × gap_bps / 10000)
 ///                     + Round-trip fees per unit (fee_rate × (entry + max(entry, stop)))
 /// Risk-sized qty   = Max Risk Amount / Worst loss per unit
-/// Margin-sized qty = Capital × (1 − margin_headroom) / Entry Price
+/// Margin basis     = min(Capital, Available Margin)   (live exchange balance when known)
+/// Margin-sized qty = Margin basis × (1 − margin_headroom) / Entry Price
 /// Position Size    = min(Risk-sized qty, Margin-sized qty)
 /// ```
 ///
@@ -184,7 +185,9 @@ impl Position {
 /// let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 /// let effective_stop_level = tech_stop.initial_stop;
 ///
-/// let size = calculate_position_size(&config, &entry, &tech_stop, effective_stop_level).unwrap();
+/// // `None` available margin = size against the policy capital alone.
+/// let size =
+///     calculate_position_size(&config, &entry, &tech_stop, effective_stop_level, None).unwrap();
 ///
 /// // Max Risk = $10,000 × 1% = $100
 /// // Worst loss per unit = $1,500 + $93.50 (10 bps of stop)
@@ -211,6 +214,7 @@ pub fn calculate_position_size(
     entry_price: &Price,
     tech_stop: &TechnicalStopDistance,
     effective_stop_level: Price,
+    available_margin: Option<rust_decimal::Decimal>,
 ) -> Result<Quantity, DomainError> {
     // Validate tech stop first
     tech_stop.validate()?;
@@ -244,21 +248,34 @@ pub fn calculate_position_size(
 
     let max_risk = risk_config.max_risk_amount();
     let risk_sized_qty = max_risk / worst_loss_per_unit;
-    // The margin cap reserves an operator-configured headroom below capital:
-    // the exchange charges the taker fee against available balance and
-    // computes initial margin at the mark price with a worst-price cushion,
-    // so an order sized to 100% of the wallet is rejected (2026-07-04 prod
-    // incident, Binance -2019 "Margin is insufficient"). The cap is then
-    // truncated to 8 decimal places (finer than any exchange quantity step)
-    // so the risk gate's qty × entry round-trip is exact in Decimal and
-    // provably ≤ capital at 1x.
+    // The margin cap is a PHYSICAL bound, distinct from the policy capital
+    // that anchors the 1% risk budget (ADR-0024 §6: capital_base stays at the
+    // month-start snapshot while governed losses accrue). Its basis is the
+    // LIVE exchange balance when known — mid-month drawdown makes the wallet
+    // smaller than the policy capital, and an order sized past the wallet is
+    // rejected by the exchange no matter what the ledger says (2026-07-04
+    // prod incident, Binance -2019 "Margin is insufficient"). The policy
+    // capital stays as an upper bound so a wallet ABOVE the ledger never
+    // sizes beyond policy. On top of the basis, the operator-configured
+    // headroom covers the taker fee and the exchange's mark-price cushion,
+    // and the cap is truncated to 8 decimal places (finer than any exchange
+    // quantity step) so the risk gate's qty × entry round-trip is exact in
+    // Decimal and provably within the basis at 1x.
+    let margin_basis = match available_margin {
+        Some(available) => risk_config.capital().min(available),
+        None => risk_config.capital(),
+    };
+    if margin_basis <= rust_decimal::Decimal::ZERO {
+        return Err(DomainError::PositionSizingError(
+            "Available margin must be positive".to_string(),
+        ));
+    }
     let headroom_factor = (rust_decimal::Decimal::from(10_000) - risk_config.margin_headroom_bps())
         / rust_decimal::Decimal::from(10_000);
-    let margin_sized_qty = ((risk_config.capital()
-        * headroom_factor
-        * rust_decimal::Decimal::from(RiskConfig::LEVERAGE))
-        / entry)
-        .round_dp_with_strategy(8, rust_decimal::RoundingStrategy::ToZero);
+    let margin_sized_qty =
+        ((margin_basis * headroom_factor * rust_decimal::Decimal::from(RiskConfig::LEVERAGE))
+            / entry)
+            .round_dp_with_strategy(8, rust_decimal::RoundingStrategy::ToZero);
     let position_size = risk_sized_qty.min(margin_sized_qty);
 
     if position_size <= rust_decimal::Decimal::ZERO {
@@ -1089,7 +1106,8 @@ mod tests {
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let size =
-            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
+            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop, None)
+                .unwrap();
 
         // Expected: $100 risk / ($1,500 distance + $93.50 gap allowance
         // (10 bps of stop) + $95 round-trip fees (0.05% × $190,000))
@@ -1108,7 +1126,8 @@ mod tests {
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let size =
-            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
+            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop, None)
+                .unwrap();
 
         // Expected: $100 / ($3,000 + $92 gap + $95 fees)
         let expected = dec!(100) / (dec!(3000) + dec!(92) + dec!(95));
@@ -1126,7 +1145,8 @@ mod tests {
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let size =
-            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
+            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop, None)
+                .unwrap();
 
         // The margin cap reserves the headroom (default 100 bps) and is
         // truncated (never rounded up) so the gate's qty × entry round-trip
@@ -1148,7 +1168,8 @@ mod tests {
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let size =
-            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
+            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop, None)
+                .unwrap();
 
         // Expected: $500 (1% of 50k) / ($1,500 + $93.50 gap + $95 fees)
         let expected = dec!(500) / (dec!(1500) + dec!(93.5) + dec!(95));
@@ -1187,8 +1208,9 @@ mod tests {
             let entry = Price::new(entry).unwrap();
             let stop = Price::new(stop).unwrap();
             let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
-            let size = calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop)
-                .unwrap();
+            let size =
+                calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop, None)
+                    .unwrap();
             let qty = size.as_decimal();
 
             let gap = stop.as_decimal() * config.stop_gap_bps() / dec!(10000);
@@ -1217,9 +1239,11 @@ mod tests {
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let size_base =
-            calculate_position_size(&base, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
+            calculate_position_size(&base, &entry, &tech_stop, tech_stop.initial_stop, None)
+                .unwrap();
         let size_buffered =
-            calculate_position_size(&buffered, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
+            calculate_position_size(&buffered, &entry, &tech_stop, tech_stop.initial_stop, None)
+                .unwrap();
         assert!(size_buffered.as_decimal() < size_base.as_decimal());
 
         let buffer_amount = dec!(93500) * dec!(20) / dec!(10000); // 187.00
@@ -1239,8 +1263,10 @@ mod tests {
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, technical);
 
         let size_technical =
-            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
-        let size_guarded = calculate_position_size(&config, &entry, &tech_stop, guard).unwrap();
+            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop, None)
+                .unwrap();
+        let size_guarded =
+            calculate_position_size(&config, &entry, &tech_stop, guard, None).unwrap();
         assert!(size_guarded.as_decimal() < size_technical.as_decimal());
 
         let effective_distance = dec!(3000);
@@ -1260,7 +1286,7 @@ mod tests {
         let guard = Price::new(dec!(111)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, technical);
 
-        let result = calculate_position_size(&config, &entry, &tech_stop, guard);
+        let result = calculate_position_size(&config, &entry, &tech_stop, guard, None);
 
         assert!(matches!(result, Err(DomainError::InvalidTechnicalStopDistance(_))));
     }
@@ -1273,7 +1299,8 @@ mod tests {
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let size =
-            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
+            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop, None)
+                .unwrap();
         let qty = size.as_decimal();
         let risk_loss = qty * dec!(327.50);
         let margin_cap = (config.capital() * dec!(0.99) / entry.as_decimal())
@@ -1296,7 +1323,8 @@ mod tests {
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
         let size =
-            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
+            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop, None)
+                .unwrap();
         let qty = size.as_decimal();
 
         // The margin cap must have engaged (risk-sized qty would exceed 1x)
@@ -1321,10 +1349,11 @@ mod tests {
 
         let with_zero = base.with_margin_headroom(Decimal::ZERO).unwrap();
         let qty_zero =
-            calculate_position_size(&with_zero, &entry, &tech_stop, tech_stop.initial_stop)
+            calculate_position_size(&with_zero, &entry, &tech_stop, tech_stop.initial_stop, None)
                 .unwrap();
         let qty_default =
-            calculate_position_size(&base, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
+            calculate_position_size(&base, &entry, &tech_stop, tech_stop.initial_stop, None)
+                .unwrap();
         // Zero headroom uses full capital; the default reserves 1%.
         assert!(qty_default.as_decimal() < qty_zero.as_decimal());
         assert_eq!(qty_zero.as_decimal(), dec!(0.02));
@@ -1332,5 +1361,60 @@ mod tests {
 
         assert!(base.with_margin_headroom(dec!(-1)).is_err());
         assert!(base.with_margin_headroom(dec!(1001)).is_err());
+    }
+
+    #[test]
+    fn test_margin_cap_bounded_by_live_available_balance() {
+        // Regression: 2026-07-04 prod entry rejection (third act). Sizing used
+        // the month-start policy capital (1643.18) while the live wallet was
+        // 1617.68 after 25.51 of governed monthly loss; the order (notional
+        // 1626.75) exceeded the wallet and Binance rejected it (-2019). The
+        // physical margin cap must bind to the LIVE balance when known.
+        let config = RiskConfig::new(dec!(1643.18373001)).unwrap();
+        let entry = Price::new(dec!(62440.30)).unwrap();
+        let stop = Price::new(dec!(62811.05)).unwrap(); // tight → margin cap binds
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let available = dec!(1617.67600541);
+
+        let qty = calculate_position_size(
+            &config,
+            &entry,
+            &tech_stop,
+            tech_stop.initial_stop,
+            Some(available),
+        )
+        .unwrap();
+        let notional = qty.as_decimal() * entry.as_decimal();
+        // Notional fits the LIVE wallet minus the 100 bps headroom.
+        assert!(notional <= available * dec!(0.99), "notional {} exceeds wallet cap", notional);
+        assert!(
+            notional > available * dec!(0.989),
+            "margin cap must engage, notional {}",
+            notional
+        );
+
+        // An available balance ABOVE policy capital must not size past policy.
+        let qty_rich = calculate_position_size(
+            &config,
+            &entry,
+            &tech_stop,
+            tech_stop.initial_stop,
+            Some(dec!(999999)),
+        )
+        .unwrap();
+        let qty_none =
+            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop, None)
+                .unwrap();
+        assert_eq!(qty_rich, qty_none, "policy capital stays the upper bound");
+
+        // A non-positive available balance is a hard sizing error.
+        assert!(calculate_position_size(
+            &config,
+            &entry,
+            &tech_stop,
+            tech_stop.initial_stop,
+            Some(Decimal::ZERO)
+        )
+        .is_err());
     }
 }

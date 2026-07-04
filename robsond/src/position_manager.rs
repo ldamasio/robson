@@ -2176,10 +2176,29 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             }
         }
 
+        // Fetch the live available balance so the physical margin cap sizes
+        // against the actual wallet, not the month-start policy capital —
+        // mid-month drawdown makes the wallet smaller than capital_base and
+        // the exchange rejects orders sized past it (2026-07-04 incident,
+        // Binance -2019). On fetch failure fall back to None (policy capital
+        // bound only) rather than blocking the entry on a transient error;
+        // the exchange remains the final arbiter.
+        let available_margin = match self.exchange().get_futures_balance().await {
+            Ok(balance) => Some(balance.available_balance),
+            Err(e) => {
+                tracing::warn!(
+                    position_id = %position.id,
+                    error = %e,
+                    "Failed to fetch futures balance for margin cap; sizing against policy capital only"
+                );
+                None
+            },
+        };
+
         // Use engine to decide entry (pure: State+Signal → Decision)
         let decision = {
             let engine = self.engine.lock().unwrap();
-            engine.decide_entry(&position, &signal)
+            engine.decide_entry(&position, &signal, available_margin)
         };
         let decision = match decision {
             Ok(d) => d,
