@@ -10,13 +10,14 @@
 //! 2. Dynamic slot exhaustion (replaces static max_open_positions)
 //! 3. 1x margin availability (stop-derived size must fit available capital)
 //! 4. Monthly drawdown hard limit (from TradingPolicy)
-//! 5. Daily loss limit (existing behavior, outside ADR-0024 scope)
 //!
 //! # Eliminated by ADR-0024
 //!
 //! - max_open_positions → dynamic slot calculation
 //! - max_total_exposure_pct → physical capital bound (1x margin availability)
 //! - max_single_position_pct → physical capital bound (1x margin availability)
+//! - daily_loss_limit_pct → removed: the policy is 1% max loss per operation
+//!   plus the 4% monthly drawdown; there is no per-day loss budget
 //!
 //! # Design
 //!
@@ -55,10 +56,6 @@ pub struct RiskLimits {
     /// Monthly drawdown limit as percentage of capital (sourced from
     /// TradingPolicy).
     pub max_monthly_drawdown_pct: Decimal,
-
-    /// Daily loss limit as percentage of capital
-    /// Default: 1% — when reached, blocks new entries for the day.
-    pub daily_loss_limit_pct: Decimal,
 }
 
 impl Default for RiskLimits {
@@ -68,7 +65,6 @@ impl Default for RiskLimits {
             max_total_exposure_pct: Decimal::from(30),
             max_single_position_pct: Decimal::from(15),
             max_monthly_drawdown_pct: Decimal::from(4),
-            daily_loss_limit_pct: Decimal::ONE,
         }
     }
 }
@@ -85,7 +81,6 @@ impl RiskLimits {
             max_total_exposure_pct,
             max_single_position_pct,
             max_monthly_drawdown_pct: Decimal::from(4),
-            daily_loss_limit_pct: Decimal::ONE,
         }
     }
 }
@@ -137,10 +132,6 @@ pub struct RiskContext {
     /// calc). Wins do NOT offset this value. Used exclusively by
     /// `realized_loss_abs()`.
     pub monthly_realized_loss: Decimal,
-    /// Daily realized PnL (reset at UTC midnight)
-    pub daily_realized_pnl: Decimal,
-    /// Daily unrealized PnL
-    pub daily_unrealized_pnl: Decimal,
 }
 
 impl RiskContext {
@@ -153,8 +144,6 @@ impl RiskContext {
             monthly_realized_pnl: Decimal::ZERO,
             monthly_unrealized_pnl: Decimal::ZERO,
             monthly_realized_loss: Decimal::ZERO,
-            daily_realized_pnl: Decimal::ZERO,
-            daily_unrealized_pnl: Decimal::ZERO,
         }
     }
 
@@ -169,8 +158,6 @@ impl RiskContext {
             monthly_realized_pnl: Decimal::ZERO,
             monthly_unrealized_pnl: Decimal::ZERO,
             monthly_realized_loss: Decimal::ZERO,
-            daily_realized_pnl: Decimal::ZERO,
-            daily_unrealized_pnl: Decimal::ZERO,
         }
     }
 
@@ -195,20 +182,17 @@ impl RiskContext {
             monthly_realized_pnl,
             monthly_unrealized_pnl,
             monthly_realized_loss,
-            daily_realized_pnl: Decimal::ZERO,
-            daily_unrealized_pnl: Decimal::ZERO,
         }
     }
 
-    /// Create context with positions, monthly PnL, and daily PnL
-    pub fn with_monthly_and_daily_pnl(
+    /// Create context with positions, monthly PnL, and the authoritative
+    /// monthly realized loss (ADR-0024: wins do not offset losses).
+    pub fn with_monthly_state(
         capital: Decimal,
         open_positions: Vec<PositionSummary>,
         monthly_realized_pnl: Decimal,
         monthly_unrealized_pnl: Decimal,
         monthly_realized_loss: Decimal,
-        daily_realized_pnl: Decimal,
-        daily_unrealized_pnl: Decimal,
     ) -> Self {
         let total_notional_exposure = open_positions.iter().map(|p| p.notional_value).sum();
 
@@ -219,8 +203,6 @@ impl RiskContext {
             monthly_realized_pnl,
             monthly_unrealized_pnl,
             monthly_realized_loss,
-            daily_realized_pnl,
-            daily_unrealized_pnl,
         }
     }
 
@@ -234,10 +216,6 @@ impl RiskContext {
         self.monthly_realized_pnl + self.monthly_unrealized_pnl
     }
 
-    /// Calculate total daily PnL (realized + unrealized)
-    pub fn total_daily_pnl(&self) -> Decimal {
-        self.daily_realized_pnl + self.daily_unrealized_pnl
-    }
 
     /// Check if there's an existing position with same symbol and side
     pub fn has_duplicate_position(&self, symbol: &str, side: &str) -> bool {
@@ -317,7 +295,8 @@ pub enum RiskCheck {
     InsufficientMargin,
     /// Monthly drawdown limit exceeded (v3: 4% → MonthlyHalt)
     MonthlyDrawdown,
-    /// Daily loss limit exceeded (blocks new entries for the day)
+    /// Daily loss limit exceeded (legacy — no longer emitted; the policy is
+    /// 1% max loss per operation, with no per-day loss budget)
     DailyLossLimit,
     /// Already have position on same symbol+side
     DuplicatePosition,
@@ -472,25 +451,6 @@ impl RiskGate {
             };
         }
 
-        // 5. Check daily loss limit (existing behavior, outside ADR-0024 scope)
-        let daily_pnl = context.total_daily_pnl();
-        let daily_loss_limit =
-            context.capital * self.limits.daily_loss_limit_pct / Decimal::from(100);
-        if daily_pnl <= -daily_loss_limit {
-            debug!(
-                daily_pnl = %daily_pnl,
-                limit = %daily_loss_limit,
-                "Risk check failed: daily loss limit"
-            );
-            return RiskVerdict::Rejected {
-                check: RiskCheck::DailyLossLimit,
-                reason: format!(
-                    "Daily loss {} has exceeded limit of -{}% ({})",
-                    daily_pnl, self.limits.daily_loss_limit_pct, daily_loss_limit
-                ),
-            };
-        }
-
         debug!(
             symbol = %proposed.symbol,
             side = %proposed.side,
@@ -617,8 +577,6 @@ mod tests {
             monthly_realized_pnl: dec!(-350),
             monthly_unrealized_pnl: dec!(-100),
             monthly_realized_loss: dec!(350),
-            daily_realized_pnl: Decimal::ZERO,
-            daily_unrealized_pnl: Decimal::ZERO,
         };
         let proposed = sample_proposed();
 
@@ -639,8 +597,6 @@ mod tests {
             monthly_realized_pnl: dec!(-300),
             monthly_unrealized_pnl: dec!(0),
             monthly_realized_loss: dec!(300),
-            daily_realized_pnl: Decimal::ZERO,
-            daily_unrealized_pnl: Decimal::ZERO,
         };
         let proposed = sample_proposed();
 
@@ -658,8 +614,6 @@ mod tests {
             monthly_realized_pnl: dec!(-300),
             monthly_unrealized_pnl: dec!(0),
             monthly_realized_loss: dec!(300),
-            daily_realized_pnl: Decimal::ZERO,
-            daily_unrealized_pnl: Decimal::ZERO,
         };
         let proposed = sample_proposed();
 
@@ -683,8 +637,6 @@ mod tests {
             monthly_realized_pnl: dec!(-399),
             monthly_unrealized_pnl: dec!(0),
             monthly_realized_loss: dec!(399),
-            daily_realized_pnl: Decimal::ZERO,
-            daily_unrealized_pnl: Decimal::ZERO,
         };
         let proposed = sample_proposed();
 
@@ -705,8 +657,6 @@ mod tests {
             monthly_realized_pnl: dec!(-400),
             monthly_unrealized_pnl: dec!(0),
             monthly_realized_loss: dec!(400),
-            daily_realized_pnl: Decimal::ZERO,
-            daily_unrealized_pnl: Decimal::ZERO,
         };
         let proposed = sample_proposed();
 
@@ -738,91 +688,30 @@ mod tests {
     }
 
     // =========================================================================
-    // Daily loss limit tests
+    // No per-day loss budget (policy: 1% max loss per operation)
     // =========================================================================
 
     #[test]
-    fn test_risk_gate_rejects_daily_loss_limit() {
+    fn test_risk_gate_has_no_daily_loss_limit() {
+        // A loss larger than 1% of capital realized within a single day must
+        // NOT block the next entry while the monthly budget still has room.
+        // (Regression: a phantom 1%/day limit denied entries after one stop-out.)
         let gate = RiskGate::new();
         let context = RiskContext {
             capital: dec!(10000),
             open_positions: vec![],
             total_notional_exposure: Decimal::ZERO,
-            monthly_realized_pnl: Decimal::ZERO,
+            monthly_realized_pnl: dec!(-120),
             monthly_unrealized_pnl: Decimal::ZERO,
-            monthly_realized_loss: Decimal::ZERO,
-            daily_realized_pnl: dec!(-120),
-            daily_unrealized_pnl: Decimal::ZERO,
+            monthly_realized_loss: dec!(120),
         };
         let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
-        assert!(
-            matches!(verdict, RiskVerdict::Rejected { check: RiskCheck::DailyLossLimit, .. }),
-            "Daily loss -120 (1.2% of 10_000) must be blocked"
-        );
-    }
-
-    #[test]
-    fn test_risk_gate_allows_within_daily_loss_limit() {
-        let gate = RiskGate::new();
-        let context = RiskContext {
-            capital: dec!(10000),
-            open_positions: vec![],
-            total_notional_exposure: Decimal::ZERO,
-            monthly_realized_pnl: Decimal::ZERO,
-            monthly_unrealized_pnl: Decimal::ZERO,
-            monthly_realized_loss: Decimal::ZERO,
-            daily_realized_pnl: dec!(-99),
-            daily_unrealized_pnl: Decimal::ZERO,
-        };
-        let proposed = sample_proposed();
-
-        let verdict = gate.evaluate(&proposed, &context);
-        assert_eq!(verdict, RiskVerdict::Approved, "Daily loss -99 (0.99%) must be allowed");
-    }
-
-    #[test]
-    fn test_risk_gate_blocks_at_exactly_1_pct_daily_loss() {
-        let gate = RiskGate::new();
-        let context = RiskContext {
-            capital: dec!(10000),
-            open_positions: vec![],
-            total_notional_exposure: Decimal::ZERO,
-            monthly_realized_pnl: Decimal::ZERO,
-            monthly_unrealized_pnl: Decimal::ZERO,
-            monthly_realized_loss: Decimal::ZERO,
-            daily_realized_pnl: dec!(-100),
-            daily_unrealized_pnl: Decimal::ZERO,
-        };
-        let proposed = sample_proposed();
-
-        let verdict = gate.evaluate(&proposed, &context);
-        assert!(
-            matches!(verdict, RiskVerdict::Rejected { check: RiskCheck::DailyLossLimit, .. }),
-            "exactly 1.00% daily loss must be blocked"
-        );
-    }
-
-    #[test]
-    fn test_risk_gate_daily_loss_includes_unrealized() {
-        let gate = RiskGate::new();
-        let context = RiskContext {
-            capital: dec!(10000),
-            open_positions: vec![],
-            total_notional_exposure: Decimal::ZERO,
-            monthly_realized_pnl: Decimal::ZERO,
-            monthly_unrealized_pnl: Decimal::ZERO,
-            monthly_realized_loss: Decimal::ZERO,
-            daily_realized_pnl: dec!(-60),
-            daily_unrealized_pnl: dec!(-41),
-        };
-        let proposed = sample_proposed();
-
-        let verdict = gate.evaluate(&proposed, &context);
-        assert!(
-            matches!(verdict, RiskVerdict::Rejected { check: RiskCheck::DailyLossLimit, .. }),
-            "daily PnL -101 (realized -60 + unrealized -41) must be blocked"
+        assert_eq!(
+            verdict,
+            RiskVerdict::Approved,
+            "1.2% loss in one day must be allowed while the monthly budget has room"
         );
     }
 
@@ -891,8 +780,6 @@ mod tests {
             monthly_realized_pnl: dec!(-150),
             monthly_unrealized_pnl: Decimal::ZERO,
             monthly_realized_loss: dec!(150),
-            daily_realized_pnl: Decimal::ZERO,
-            daily_unrealized_pnl: Decimal::ZERO,
         };
         assert_eq!(ctx.realized_loss_abs(), dec!(150));
     }
@@ -906,8 +793,6 @@ mod tests {
             monthly_realized_pnl: dec!(200),
             monthly_unrealized_pnl: Decimal::ZERO,
             monthly_realized_loss: Decimal::ZERO,
-            daily_realized_pnl: Decimal::ZERO,
-            daily_unrealized_pnl: Decimal::ZERO,
         };
         assert_eq!(ctx.realized_loss_abs(), dec!(0));
     }
@@ -924,8 +809,6 @@ mod tests {
             monthly_unrealized_pnl: Decimal::ZERO,
             // ADR-0024 slots consume the losing trade only; wins do not offset it.
             monthly_realized_loss: dec!(100),
-            daily_realized_pnl: Decimal::ZERO,
-            daily_unrealized_pnl: Decimal::ZERO,
         };
 
         assert_eq!(ctx.realized_loss_abs(), dec!(100));

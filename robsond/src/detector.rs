@@ -184,6 +184,12 @@ pub struct DetectorTask {
     /// Number of 15m candles (incl. the forming candle) used to sample the
     /// recent adverse extreme when the guard is enabled (ADR-0042).
     stop_invalidation_lookback_candles: usize,
+    /// Delay before the detector starts evaluating after spawn. Set when the
+    /// detector is re-armed after a governed block (risk denial, expired
+    /// approval): without it, Immediate mode refires instantly and a
+    /// persistent denial becomes a ~1/s hot loop against the OHLCV source
+    /// and the event store.
+    initial_fire_delay: Option<std::time::Duration>,
 }
 
 impl DetectorTask {
@@ -234,7 +240,17 @@ impl DetectorTask {
             // `EngineConfig` via `with_invalidation_guard`.
             stop_invalidation_guard_enabled: false,
             stop_invalidation_lookback_candles: 20,
+            initial_fire_delay: None,
         }
+    }
+
+    /// Delay the first evaluation after spawn (governed re-arm backoff).
+    ///
+    /// The delay is cancellable: shutdown/cancel during the wait terminates
+    /// the detector without firing.
+    pub fn with_initial_fire_delay(mut self, delay: std::time::Duration) -> Self {
+        self.initial_fire_delay = if delay.is_zero() { None } else { Some(delay) };
+        self
     }
 
     /// Configure the entry-time invalidation guard (ADR-0042).
@@ -342,6 +358,28 @@ impl DetectorTask {
         cancel_token: CancellationToken,
         mut receiver: EventReceiver,
     ) -> Option<DetectorSignal> {
+        // Governed re-arm backoff: hold the first evaluation so a persistent
+        // governed denial cannot refire in a hot loop. Cancellation during
+        // the wait terminates the detector without firing.
+        if let Some(delay) = self.initial_fire_delay {
+            info!(
+                position_id = %self.config.position_id,
+                symbol = %self.config.symbol.as_pair(),
+                delay_secs = delay.as_secs(),
+                "Detector holding first evaluation (governed re-arm backoff)"
+            );
+            tokio::select! {
+                _ = cancel_token.cancelled() => {
+                    debug!(
+                        position_id = %self.config.position_id,
+                        "Detector cancelled during re-arm backoff"
+                    );
+                    return None;
+                }
+                _ = sleep(delay) => {}
+            }
+        }
+
         // For Immediate mode, keep retrying proactively before falling back.
         // This avoids silently downgrading a no-signal arm into a tick-waiting arm
         // when the first candle fetch or stop analysis is transiently unavailable.
