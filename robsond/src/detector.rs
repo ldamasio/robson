@@ -48,11 +48,11 @@
 use std::sync::Arc;
 
 use robson_domain::{
-    AnchorType, Candle, DetectorSignal, EntryPolicy, EntryPolicyConfig, Event, Position, PositionId,
-    Price, Side, SignalEvaluationOutcome, StopAnchor, Symbol, TechnicalStopAnalysisAudit,
-    TechnicalStopConfidenceSnapshot, TechnicalStopConfigSnapshot, TechnicalStopMethodSnapshot,
+    entities::EffectiveStopBasis, AnchorType, Candle, DetectorSignal, EntryPolicy,
+    EntryPolicyConfig, Event, Position, PositionId, Price, Side, SignalEvaluationOutcome,
+    StopAnchor, Symbol, TechnicalStopAnalysisAudit, TechnicalStopConfidenceSnapshot,
+    TechnicalStopConfigSnapshot, TechnicalStopMethodSnapshot,
 };
-use robson_domain::entities::EffectiveStopBasis;
 use robson_engine::{
     stop_quality_classifier::{classify_stop_quality, StopQualityInput, StopQualityThresholds},
     technical_stop_analyzer::{
@@ -710,11 +710,7 @@ impl DetectorTask {
         // ADR-0042 invalidation guard: sample the recent adverse extreme once
         // at signal time. Disabled → None (historical behavior).
         let guard_level = if self.stop_invalidation_guard_enabled {
-            Self::recent_adverse_extreme(
-                &candles,
-                side,
-                self.stop_invalidation_lookback_candles,
-            )
+            Self::recent_adverse_extreme(&candles, side, self.stop_invalidation_lookback_candles)
         } else {
             None
         };
@@ -1802,7 +1798,11 @@ mod tests {
         (0..100)
             .map(|i| {
                 let open_time = now + Duration::minutes(i);
-                let (high, low) = if i >= 80 { (recent_high, recent_low) } else { (dec!(100), dec!(100)) };
+                let (high, low) = if i >= 80 {
+                    (recent_high, recent_low)
+                } else {
+                    (dec!(100), dec!(100))
+                };
                 Candle::new(
                     symbol.clone(),
                     dec!(100),
@@ -1872,22 +1872,38 @@ mod tests {
         // SHORT: guard binds when above the technical stop.
         let short_tech = Price::new(dec!(110)).unwrap();
         assert_eq!(
-            DetectorTask::effective_stop_basis(Side::Short, short_tech, Price::new(dec!(115)).unwrap()),
+            DetectorTask::effective_stop_basis(
+                Side::Short,
+                short_tech,
+                Price::new(dec!(115)).unwrap()
+            ),
             EffectiveStopBasis::InvalidationGuard
         );
         assert_eq!(
-            DetectorTask::effective_stop_basis(Side::Short, short_tech, Price::new(dec!(105)).unwrap()),
+            DetectorTask::effective_stop_basis(
+                Side::Short,
+                short_tech,
+                Price::new(dec!(105)).unwrap()
+            ),
             EffectiveStopBasis::TechnicalStop
         );
 
         // LONG: guard binds when below the technical stop.
         let long_tech = Price::new(dec!(90)).unwrap();
         assert_eq!(
-            DetectorTask::effective_stop_basis(Side::Long, long_tech, Price::new(dec!(85)).unwrap()),
+            DetectorTask::effective_stop_basis(
+                Side::Long,
+                long_tech,
+                Price::new(dec!(85)).unwrap()
+            ),
             EffectiveStopBasis::InvalidationGuard
         );
         assert_eq!(
-            DetectorTask::effective_stop_basis(Side::Long, long_tech, Price::new(dec!(95)).unwrap()),
+            DetectorTask::effective_stop_basis(
+                Side::Long,
+                long_tech,
+                Price::new(dec!(95)).unwrap()
+            ),
             EffectiveStopBasis::TechnicalStop
         );
     }

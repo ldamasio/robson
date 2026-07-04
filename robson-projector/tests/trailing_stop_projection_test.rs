@@ -271,7 +271,7 @@ async fn test_entry_filled_persists_invalidation_guard_level(pool: PgPool) {
     append_and_project(&pool, filled_event).await;
 
     let row: (String, Option<rust_decimal::Decimal>) = sqlx::query_as(
-        "SELECT state, invalidation_guard_level FROM positions_current WHERE position_id = $1"
+        "SELECT state, invalidation_guard_level FROM positions_current WHERE position_id = $1",
     )
     .bind(position_id)
     .fetch_one(&pool)

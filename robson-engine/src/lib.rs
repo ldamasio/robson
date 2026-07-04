@@ -482,12 +482,12 @@ impl Engine {
         let tech_stop = signal.tech_stop_distance();
         tech_stop.validate().map_err(|e| EngineError::DomainError(e))?;
 
-        // 4. Resolve the effective stop basis for sizing (ADR-0042). When the
-        //    detector supplied an invalidation guard, clamp the chart-derived
-        //    technical stop beyond the recent adverse extreme before sizing so
-        //    the 1% budget absorbs the worst realizable loss at the guarded
-        //    level. The domain clamp helper at zero buffer returns the clamped
-        //    level unchanged; `None` guard is the identity (historical sizing).
+        // 4. Resolve the effective stop basis for sizing (ADR-0042). When the detector
+        //    supplied an invalidation guard, clamp the chart-derived technical stop
+        //    beyond the recent adverse extreme before sizing so the 1% budget absorbs
+        //    the worst realizable loss at the guarded level. The domain clamp helper at
+        //    zero buffer returns the clamped level unchanged; `None` guard is the
+        //    identity (historical sizing).
         let guard = signal
             .technical_stop_analysis
             .as_ref()
@@ -680,8 +680,11 @@ impl Engine {
                 // Executable price: technical stop offset by the configured
                 // buffer (events keep the technical value), clamped to the
                 // entry-time guard while it is still active (ADR-0042).
-                stop_price: self
-                    .effective_stop(position.side, initial_trailing_stop, invalidation_guard_level),
+                stop_price: self.effective_stop(
+                    position.side,
+                    initial_trailing_stop,
+                    invalidation_guard_level,
+                ),
             },
         ];
 
@@ -2447,8 +2450,12 @@ mod tests {
         let position = create_armed_position(Side::Long);
         // technical stop 93500 (distance 1500); guard 92500 clamps the
         // effective base to 92500 (distance 2500).
-        let signal =
-            create_detector_signal_with_guard(&position, dec!(95000), dec!(93500), Some(dec!(92500)));
+        let signal = create_detector_signal_with_guard(
+            &position,
+            dec!(95000),
+            dec!(93500),
+            Some(dec!(92500)),
+        );
 
         let decision = engine.decide_entry(&position, &signal).unwrap();
         let quantity = decision
@@ -2490,8 +2497,12 @@ mod tests {
         let engine = Engine::new(config);
 
         let mut position = create_armed_position(Side::Long);
-        let signal =
-            create_detector_signal_with_guard(&position, dec!(95000), dec!(93500), Some(dec!(92500)));
+        let signal = create_detector_signal_with_guard(
+            &position,
+            dec!(95000),
+            dec!(93500),
+            Some(dec!(92500)),
+        );
         position.tech_stop_distance =
             Some(TechnicalStopDistance::from_entry_and_stop(signal.entry_price, signal.stop_loss));
         position.entry_price = Some(signal.entry_price);
@@ -2572,10 +2583,7 @@ mod tests {
             .process_active_position(&position, &create_market_data(dec!(93000)))
             .unwrap();
         assert!(
-            !no_exit
-                .actions
-                .iter()
-                .any(|a| matches!(a, EngineAction::TriggerExit { .. })),
+            !no_exit.actions.iter().any(|a| matches!(a, EngineAction::TriggerExit { .. })),
             "price above the guarded executable stop must not trigger"
         );
 
@@ -2583,9 +2591,7 @@ mod tests {
             .process_active_position(&position, &create_market_data(dec!(92907)))
             .unwrap();
         assert!(
-            exit.actions
-                .iter()
-                .any(|a| matches!(a, EngineAction::TriggerExit { .. })),
+            exit.actions.iter().any(|a| matches!(a, EngineAction::TriggerExit { .. })),
             "price at the guarded executable stop must trigger"
         );
     }
@@ -2607,7 +2613,9 @@ mod tests {
 
         let updated = decision.updated_position.expect("trailing advance updates position");
         match updated.state {
-            PositionState::Active { invalidation_guard_level, trailing_stop, .. } => {
+            PositionState::Active {
+                invalidation_guard_level, trailing_stop, ..
+            } => {
                 assert_eq!(trailing_stop.as_decimal(), dec!(95000)); // advanced to breakeven
                 assert_eq!(
                     invalidation_guard_level, None,

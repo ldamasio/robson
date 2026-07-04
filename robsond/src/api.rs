@@ -2139,7 +2139,9 @@ fn position_to_summary(
     // while an entry-time guard is still active (None once released).
     let (effective_stop, raw_technical_stop, invalidation_guard_level, effective_stop_basis) =
         match &position.state {
-            PositionState::Active { trailing_stop, invalidation_guard_level, .. } => {
+            PositionState::Active {
+                trailing_stop, invalidation_guard_level, ..
+            } => {
                 let guard = *invalidation_guard_level;
                 let effective = robson_domain::value_objects::effective_stop_price_with_guard(
                     position.side,

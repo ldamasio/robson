@@ -410,10 +410,11 @@ impl Config {
             .ok()
             .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
             .unwrap_or(false);
-        let stop_invalidation_lookback_candles = env::var("ROBSON_STOP_INVALIDATION_LOOKBACK_CANDLES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .unwrap_or(20);
+        let stop_invalidation_lookback_candles =
+            env::var("ROBSON_STOP_INVALIDATION_LOOKBACK_CANDLES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(20);
 
         Ok(EngineConfig {
             min_tech_stop_percent: min_tech_stop,

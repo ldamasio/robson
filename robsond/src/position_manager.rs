@@ -2144,10 +2144,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Cache the entry-time invalidation guard level (ADR-0042) for the fill
         // handler. Overwrite on each signal so a re-arm without a guard clears
         // any stale level for this position.
-        let guard_level = signal
-            .technical_stop_analysis
-            .as_ref()
-            .and_then(|a| a.invalidation_guard_level);
+        let guard_level =
+            signal.technical_stop_analysis.as_ref().and_then(|a| a.invalidation_guard_level);
         {
             let mut guards = self.invalidation_guards.write().await;
             match guard_level {

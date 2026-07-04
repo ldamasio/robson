@@ -656,9 +656,9 @@ pub(crate) async fn handle_entry_filled(pool: &PgPool, envelope: &EventEnvelope)
         }
     })?;
 
-    // Initialize favorable_extreme = fill_price, trailing_stop_price = initial_stop.
-    // Persist the entry-time invalidation guard level so restarts replay the same
-    // effective stop (ADR-0042).
+    // Initialize favorable_extreme = fill_price, trailing_stop_price =
+    // initial_stop. Persist the entry-time invalidation guard level so restarts
+    // replay the same effective stop (ADR-0042).
     sqlx::query(
         r#"
         UPDATE positions_current

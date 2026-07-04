@@ -1082,10 +1082,7 @@ mod tests {
 
         match &restored[0].state {
             PositionState::Active { invalidation_guard_level, .. } => {
-                assert_eq!(
-                    invalidation_guard_level.map(|p| p.as_decimal()),
-                    Some(dec!(62386.70))
-                );
+                assert_eq!(invalidation_guard_level.map(|p| p.as_decimal()), Some(dec!(62386.70)));
             },
             _ => panic!("Expected Active state"),
         }
