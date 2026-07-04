@@ -28,6 +28,10 @@ export type Position = {
   variation_pct?: number | null;
   fees_paid: number | null;
   trailing_stop?: number | null;
+  effective_stop?: number | null;
+  raw_technical_stop?: number | null;
+  invalidation_guard_level?: number | null;
+  effective_stop_basis?: string | null;
   current_price?: number | null;
   entry_order_id: string | null;
   exit_order_id: string | null;
@@ -303,6 +307,11 @@ function normalizePosition(raw: unknown): Position {
     variation_pct: toNumber(p.variation_pct),
     fees_paid: toNumber(p.fees_paid),
     trailing_stop: toNumber(p.trailing_stop),
+    effective_stop: toNumber(p.effective_stop),
+    raw_technical_stop: toNumber(p.raw_technical_stop),
+    invalidation_guard_level: toNumber(p.invalidation_guard_level),
+    effective_stop_basis:
+      p.effective_stop_basis == null ? null : String(p.effective_stop_basis),
     current_price: toNumber(p.current_price),
     entry_order_id: p.entry_order_id == null ? null : String(p.entry_order_id),
     exit_order_id: p.exit_order_id == null ? null : String(p.exit_order_id),
