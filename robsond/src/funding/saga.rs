@@ -234,13 +234,22 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
             let amount = self.current_spot_usdt().await?;
             if amount > Decimal::ZERO {
                 let client_tran_key = transfer_client_key(quote_id);
-                self.append_and_project(
-                    quote_id,
-                    FundingState::Transferring,
-                    "TransferPrepared",
-                    json!({ "client_tran_key": client_tran_key, "amount": amount }),
-                )
-                .await?;
+                // Append TransferPrepared only on the Converted → Transferring
+                // transition. Resumed passes (the worker retries non-terminal
+                // sagas every 5 s) skip the append: a transfer stalled for
+                // hours must not spam one duplicate event per poll into the
+                // saga stream (2026-06-03: ~4 000 TransferPrepared duplicates
+                // over a 5.5 h stall).
+                if view.state == FundingState::Converted.as_str() {
+                    self.append_and_project(
+                        quote_id,
+                        FundingState::Transferring,
+                        "TransferPrepared",
+                        json!({ "client_tran_key": client_tran_key, "amount": amount }),
+                    )
+                    .await?;
+                    view.state = FundingState::Transferring.as_str().to_string();
+                }
                 let existing = self
                     .exchange
                     .get_transfer_history(

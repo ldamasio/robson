@@ -74,12 +74,26 @@
     $recentEvents.filter((e) => isTodayUtc(e.occurred_at)),
   );
   let haltState = $derived($haltStatus?.state ?? "active");
+  // "Cannot operate" only when nothing is open AND nothing can open.
+  // new_slots_available === 0 with an open position just means the capital
+  // is fully at work (the open position's latent risk occupies the slot) —
+  // that must not read as an error.
   let insufficientCapital = $derived(
     !isHistoricalMonth && currentStatus
-      ? currentStatus.new_slots_available === 0
+      ? currentStatus.new_slots_available === 0 &&
+          currentStatus.occupied_slots === 0
       : false,
   );
   let monthlyBudgetLimitPct = 4;
+  // With no open positions (latent risk 0), slots hit zero either because
+  // monthly losses left less than one 1%-risk slot in the 4% budget, or
+  // because the capital itself is too small. Only the latter is fixable by
+  // adding funds.
+  let monthlyBudgetExhausted = $derived(
+    insufficientCapital &&
+      (currentStatus?.monthly_realized_loss_pct ?? 0) >
+        monthlyBudgetLimitPct - 1,
+  );
   let budgetUsedPct = $derived(
     Math.min(
       100,
@@ -369,12 +383,20 @@
     </Card>
   {:else}
     {#if insufficientCapital}
-      <a href="/funding" class="capital-banner">
-        <Row justify="between" align="center">
-          <span>{$_("dashboard.insufficientCapitalBanner")}</span>
-          <span class="mono">{$_("dashboard.addFunds")} →</span>
-        </Row>
-      </a>
+      {#if monthlyBudgetExhausted}
+        <div class="capital-banner">
+          <Row justify="between" align="center">
+            <span>{$_("dashboard.monthlyBudgetExhaustedBanner")}</span>
+          </Row>
+        </div>
+      {:else}
+        <a href="/funding" class="capital-banner">
+          <Row justify="between" align="center">
+            <span>{$_("dashboard.insufficientCapitalBanner")}</span>
+            <span class="mono">{$_("dashboard.addFunds")} →</span>
+          </Row>
+        </a>
+      {/if}
     {/if}
     <section>
       <Stack gap={4}>
