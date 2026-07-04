@@ -77,6 +77,49 @@ describe('positionSummaryLines', () => {
     expect(lines[3]).toContain('SIZE');
   });
 
+  it('Active state shows the executable stop and guard level when the invalidation guard binds', () => {
+    const state: PositionState = {
+      Active: {
+        current_price: 62900,
+        trailing_stop: 62984.17,
+        favorable_extreme: 62800,
+        extreme_at: '2026-07-04T17:10:00Z',
+        insurance_stop_id: 'ins-1',
+        last_emitted_stop: null
+      }
+    };
+    const lines = positionSummaryLines(
+      basePosition({
+        state,
+        side: 'Short',
+        entry_price: 62885.6,
+        quantity: 0.025,
+        effective_stop: 63132.67,
+        raw_technical_stop: 62984.17,
+        invalidation_guard_level: 63069.6,
+        effective_stop_basis: 'invalidation_guard'
+      })
+    );
+    expect(lines[0]).toContain('ACTIVE');
+    expect(lines[0]).toContain('stop 63,132.67');
+    expect(lines[0]).toContain('(guard 63,069.60)');
+    expect(lines[0]).not.toContain('62,984.17');
+  });
+
+  it('Active string state prefers effective_stop over trailing_stop without guard suffix', () => {
+    const lines = positionSummaryLines(
+      basePosition({
+        state: 'Active',
+        entry_price: 63000,
+        trailing_stop: 62000,
+        effective_stop: 61938
+      })
+    );
+    expect(lines[0]).toContain('ACTIVE');
+    expect(lines[0]).toContain('stop 61,938.00');
+    expect(lines[0]).not.toContain('guard');
+  });
+
   it('Closed state with PnL', () => {
     const state: PositionState = {
       Closed: { exit_price: 70000, realized_pnl: 11.11, exit_reason: 'trailing_stop' }

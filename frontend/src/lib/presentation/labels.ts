@@ -59,7 +59,8 @@ export function positionSummaryLines(p: Position): string[] {
       } else {
         const details: string[] = [];
         if (p.entry_price != null) details.push(`entry ${fmtNum(p.entry_price)}`);
-        if (p.trailing_stop != null) details.push(`stop ${fmtNum(p.trailing_stop)}`);
+        const stopDetail = executableStopDetail(p, p.trailing_stop ?? null);
+        if (stopDetail) details.push(stopDetail);
         lines.push(label('ACTIVE', details.join(' · ') || 'position open'));
         const target = trailingStopMoveTarget(p);
         if (target) {
@@ -82,7 +83,16 @@ export function positionSummaryLines(p: Position): string[] {
       if (isStale) {
         lines.push(label('STALE', 'not present on exchange'));
       } else {
-        lines.push(label('ACTIVE', `price ${fmtNum(val.current_price as number)} · stop ${fmtNum(val.trailing_stop as number)}`));
+        const stopDetail = executableStopDetail(
+          p,
+          typeof val.trailing_stop === 'number' ? val.trailing_stop : null,
+        );
+        lines.push(
+          label(
+            'ACTIVE',
+            `price ${fmtNum(val.current_price as number)}${stopDetail ? ` · ${stopDetail}` : ''}`,
+          ),
+        );
         const target = trailingStopMoveTarget(p);
         if (target) {
           lines.push(
@@ -147,6 +157,20 @@ function trailingStopMoveTarget(p: Position): { trigger_price: number; next_stop
     trigger_price: stop + span * 2,
     next_stop: stop + span,
   };
+}
+
+// The executable stop (ADR-0041 buffer, clamped to the ADR-0042 invalidation
+// guard while it is active) is where execution actually triggers — the
+// technical trailing stop is only the conceptual reference. Show the
+// executable level on the card, with the guard level as context while it binds.
+function executableStopDetail(p: Position, technicalStop: number | null): string | null {
+  const stop = p.effective_stop ?? technicalStop;
+  if (stop == null) return null;
+  const guarded =
+    p.effective_stop_basis === 'invalidation_guard' && p.invalidation_guard_level != null;
+  return guarded
+    ? `stop ${fmtNum(stop)} (guard ${fmtNum(p.invalidation_guard_level as number)})`
+    : `stop ${fmtNum(stop)}`;
 }
 
 function activeTrailingStop(p: Position): number | null {
