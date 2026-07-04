@@ -168,7 +168,7 @@ impl Position {
 ///                     + Gap Allowance            (stop × gap_bps / 10000)
 ///                     + Round-trip fees per unit (fee_rate × (entry + max(entry, stop)))
 /// Risk-sized qty   = Max Risk Amount / Worst loss per unit
-/// Margin-sized qty = Capital / Entry Price
+/// Margin-sized qty = Capital × (1 − margin_headroom) / Entry Price
 /// Position Size    = min(Risk-sized qty, Margin-sized qty)
 /// ```
 ///
@@ -189,7 +189,7 @@ impl Position {
 /// // Max Risk = $10,000 × 1% = $100
 /// // Worst loss per unit = $1,500 + $93.50 (10 bps of stop)
 /// //                     + $95 (0.05% × ($95,000 + $95,000)) = $1,688.50
-/// // Margin cap = $10,000 / $95,000 = 0.1052... BTC
+/// // Margin cap = $10,000 × 0.99 / $95,000 = 0.1042... BTC (100 bps headroom)
 /// // Final Position Size = min($100 / $1,688.50, 0.1052...)
 /// // = 0.0592... BTC
 /// assert!(size.as_decimal() > dec!(0.059) && size.as_decimal() < dec!(0.0593));
@@ -244,14 +244,21 @@ pub fn calculate_position_size(
 
     let max_risk = risk_config.max_risk_amount();
     let risk_sized_qty = max_risk / worst_loss_per_unit;
-    // Truncate the margin cap to 8 decimal places (finer than any exchange
-    // quantity step). capital/entry rounds at 28 significant digits, so the
-    // risk gate's qty × entry round-trip could land above capital by ~1e-22
-    // and reject the cap this function itself chose. With qty at 8 dp the
-    // product is exact in Decimal and provably ≤ capital at 1x.
-    let margin_sized_qty =
-        ((risk_config.capital() * rust_decimal::Decimal::from(RiskConfig::LEVERAGE)) / entry)
-            .round_dp_with_strategy(8, rust_decimal::RoundingStrategy::ToZero);
+    // The margin cap reserves an operator-configured headroom below capital:
+    // the exchange charges the taker fee against available balance and
+    // computes initial margin at the mark price with a worst-price cushion,
+    // so an order sized to 100% of the wallet is rejected (2026-07-04 prod
+    // incident, Binance -2019 "Margin is insufficient"). The cap is then
+    // truncated to 8 decimal places (finer than any exchange quantity step)
+    // so the risk gate's qty × entry round-trip is exact in Decimal and
+    // provably ≤ capital at 1x.
+    let headroom_factor = (rust_decimal::Decimal::from(10_000) - risk_config.margin_headroom_bps())
+        / rust_decimal::Decimal::from(10_000);
+    let margin_sized_qty = ((risk_config.capital()
+        * headroom_factor
+        * rust_decimal::Decimal::from(RiskConfig::LEVERAGE))
+        / entry)
+        .round_dp_with_strategy(8, rust_decimal::RoundingStrategy::ToZero);
     let position_size = risk_sized_qty.min(margin_sized_qty);
 
     if position_size <= rust_decimal::Decimal::ZERO {
@@ -1121,9 +1128,10 @@ mod tests {
         let size =
             calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
 
-        // The margin cap is truncated (never rounded up) so the gate's
-        // qty × entry round-trip stays ≤ capital.
-        let expected = (config.capital() / entry.as_decimal())
+        // The margin cap reserves the headroom (default 100 bps) and is
+        // truncated (never rounded up) so the gate's qty × entry round-trip
+        // stays ≤ capital and the order is executable on the exchange.
+        let expected = (config.capital() * dec!(0.99) / entry.as_decimal())
             .round_dp_with_strategy(8, rust_decimal::RoundingStrategy::ToZero);
         let loss = size.as_decimal() * dec!(500);
         assert_eq!(size.as_decimal(), expected);
@@ -1268,7 +1276,7 @@ mod tests {
             calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
         let qty = size.as_decimal();
         let risk_loss = qty * dec!(327.50);
-        let margin_cap = (config.capital() / entry.as_decimal())
+        let margin_cap = (config.capital() * dec!(0.99) / entry.as_decimal())
             .round_dp_with_strategy(8, rust_decimal::RoundingStrategy::ToZero);
 
         assert_eq!(qty, margin_cap);
@@ -1291,14 +1299,38 @@ mod tests {
             calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
         let qty = size.as_decimal();
 
-        // The margin cap must have engaged (risk-sized qty would exceed 1x).
-        assert!(qty * entry.as_decimal() > config.capital() * dec!(0.999));
-        // The gate's round-trip must not exceed capital at 1x leverage.
+        // The margin cap must have engaged (risk-sized qty would exceed 1x)
+        // and reserved the default 100 bps headroom.
+        assert!(qty * entry.as_decimal() > config.capital() * dec!(0.989));
+        // The gate's round-trip must stay below capital with headroom for the
+        // exchange's taker fee and mark-price cushion.
         assert!(
-            qty * entry.as_decimal() <= config.capital(),
-            "margin round-trip {} exceeds capital {}",
+            qty * entry.as_decimal() <= config.capital() * dec!(0.99),
+            "margin round-trip {} exceeds headroom-adjusted capital {}",
             qty * entry.as_decimal(),
-            config.capital()
+            config.capital() * dec!(0.99)
         );
+    }
+
+    #[test]
+    fn test_margin_headroom_is_configurable_and_validated() {
+        let base = RiskConfig::new(dec!(1000)).unwrap();
+        let entry = Price::new(dec!(50000)).unwrap();
+        let stop = Price::new(dec!(49900)).unwrap(); // tight → margin cap binds
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        let with_zero = base.with_margin_headroom(Decimal::ZERO).unwrap();
+        let qty_zero =
+            calculate_position_size(&with_zero, &entry, &tech_stop, tech_stop.initial_stop)
+                .unwrap();
+        let qty_default =
+            calculate_position_size(&base, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
+        // Zero headroom uses full capital; the default reserves 1%.
+        assert!(qty_default.as_decimal() < qty_zero.as_decimal());
+        assert_eq!(qty_zero.as_decimal(), dec!(0.02));
+        assert_eq!(qty_default.as_decimal(), dec!(0.0198));
+
+        assert!(base.with_margin_headroom(dec!(-1)).is_err());
+        assert!(base.with_margin_headroom(dec!(1001)).is_err());
     }
 }

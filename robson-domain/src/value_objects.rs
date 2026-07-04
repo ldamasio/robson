@@ -285,6 +285,16 @@ fn default_stop_buffer_bps() -> Decimal {
     Decimal::ZERO
 }
 
+/// Default margin-cap headroom: 100 bps (1%). A margin-capped order sized to
+/// 100% of the wallet is unexecutable on the exchange — the taker fee is
+/// charged against available balance and initial margin is computed at the
+/// mark price with a worst-price cushion, not at the sizing reference price
+/// (2026-07-04 prod incident: Binance -2019 "Margin is insufficient").
+/// Operator-configurable via [`RiskConfig::with_margin_headroom`].
+fn default_margin_headroom_bps() -> Decimal {
+    Decimal::from(100)
+}
+
 /// Derive the executable stop price from the chosen stop level.
 ///
 /// The technical stop is the chart-derived invalidation level and stays the
@@ -380,6 +390,11 @@ pub struct RiskConfig {
     /// the stop price (0 = execute exactly at the technical level)
     #[serde(default = "default_stop_buffer_bps")]
     stop_buffer_bps: Decimal,
+    /// Headroom reserved when the 1x margin cap binds, in basis points of
+    /// capital (covers taker fee + mark-price cushion so the capped order is
+    /// executable on the exchange)
+    #[serde(default = "default_margin_headroom_bps")]
+    margin_headroom_bps: Decimal,
 }
 
 impl RiskConfig {
@@ -408,6 +423,7 @@ impl RiskConfig {
             taker_fee_rate: default_taker_fee_rate(),
             stop_gap_bps: default_stop_gap_bps(),
             stop_buffer_bps: default_stop_buffer_bps(),
+            margin_headroom_bps: default_margin_headroom_bps(),
         })
     }
 
@@ -494,6 +510,34 @@ impl RiskConfig {
         }
         self.stop_buffer_bps = stop_buffer_bps;
         Ok(self)
+    }
+
+    /// Override the margin-cap headroom (operator-configured value).
+    ///
+    /// `margin_headroom_bps` is the fraction of capital, in basis points,
+    /// reserved when the 1x margin cap binds (0 ≤ bps ≤ 1000). It must cover
+    /// the taker fee plus the exchange's mark-price/worst-price cushion, or
+    /// margin-capped orders are rejected by the exchange.
+    ///
+    /// # Errors
+    /// Returns `DomainError::InvalidRiskConfig` when out of range.
+    pub fn with_margin_headroom(
+        mut self,
+        margin_headroom_bps: Decimal,
+    ) -> Result<Self, DomainError> {
+        if margin_headroom_bps < Decimal::ZERO || margin_headroom_bps > Decimal::from(1000) {
+            return Err(DomainError::InvalidRiskConfig(format!(
+                "Margin headroom must be in [0, 1000] bps: {margin_headroom_bps}"
+            )));
+        }
+        self.margin_headroom_bps = margin_headroom_bps;
+        Ok(self)
+    }
+
+    /// Headroom reserved when the 1x margin cap binds (basis points of
+    /// capital)
+    pub fn margin_headroom_bps(&self) -> Decimal {
+        self.margin_headroom_bps
     }
 
     /// Get risk percentage cap (always 1%)
