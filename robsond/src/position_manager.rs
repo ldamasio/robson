@@ -125,6 +125,10 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// Entry policy selected for each armed position. This keeps runtime
     /// detector re-arming aligned with the policy event emitted at ARM time.
     entry_policies: Arc<RwLock<HashMap<PositionId, EntryPolicyConfig>>>,
+    /// Consecutive governed re-arms per position (risk denial, expired
+    /// approval). Drives the exponential backoff on the re-armed detector's
+    /// first evaluation; cleared when a signal passes the risk gate.
+    governed_rearm_counts: Arc<RwLock<HashMap<PositionId, u32>>>,
     /// Entry-time invalidation guard level captured from the detector signal
     /// (ADR-0042), keyed by position. Populated when a signal carrying a guard
     /// is processed and consumed by the entry-fill handler so the executable
@@ -160,6 +164,20 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
 ///
 /// Authoritative source for accumulated monthly risk accounting.
 /// Does NOT contain live execution state — that comes from positions_current.
+/// Backoff for the Nth consecutive governed re-arm of a detector: 5s doubling
+/// to a 15-minute cap (5, 10, 20, … 640, 900, 900, …).
+///
+/// Applied to the re-armed detector's first evaluation after a governed block
+/// (risk denial, expired approval). Without it, an Immediate-mode re-arm
+/// refires instantly and a persistent governed condition becomes a ~1/s hot
+/// loop against the OHLCV source and the event store.
+fn governed_rearm_backoff(attempt: u32) -> std::time::Duration {
+    const BASE_SECS: u64 = 5;
+    const MAX_SECS: u64 = 900;
+    let shift = attempt.saturating_sub(1).min(8);
+    std::time::Duration::from_secs((BASE_SECS << shift).min(MAX_SECS))
+}
+
 pub(crate) struct MonthlyRiskState {
     pub capital_base: Decimal,
     pub realized_loss: Decimal,
@@ -523,6 +541,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             shutdown_token,
             detectors: Arc::new(RwLock::new(HashMap::new())),
             entry_policies: Arc::new(RwLock::new(HashMap::new())),
+            governed_rearm_counts: Arc::new(RwLock::new(HashMap::new())),
             invalidation_guards: Arc::new(RwLock::new(HashMap::new())),
             // Guard disabled by default; enabled per EngineConfig via
             // `with_invalidation_guard`.
@@ -975,7 +994,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         summaries.extend(pending_summaries);
 
         // Monthly realized PnL: sum realized_pnl from all positions closed in the
-        // current month. Used for daily/monthly PnL reporting, not for risk gates.
+        // current month. Used for monthly PnL reporting, not for risk gates.
         let monthly_closed =
             self.store.positions().find_closed_in_month(now.year(), now.month()).await?;
         let monthly_realized_pnl: Decimal =
@@ -996,28 +1015,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             })
             .sum();
 
-        // Daily realized PnL: filter monthly closed positions to today (UTC date).
-        let today = now.date_naive();
-        let daily_realized_pnl: Decimal = monthly_closed
-            .iter()
-            .filter(|p| p.closed_at.map(|t| t.date_naive() == today).unwrap_or(false))
-            .map(|p| p.realized_pnl - p.fees_paid)
-            .sum();
-
-        // Daily unrealized PnL mirrors monthly unrealized (all open positions are
-        // "today"). This is a simplification: if positions were opened on a
-        // previous day, their unrealized PnL still counts toward the daily
-        // figure. This is conservative (stricter) and matches the v3 spec.
-        let daily_unrealized_pnl = monthly_unrealized_pnl;
-
-        Ok(RiskContext::with_monthly_and_daily_pnl(
+        Ok(RiskContext::with_monthly_state(
             capital,
             summaries,
             monthly_realized_pnl,
             monthly_unrealized_pnl,
             monthly_realized_loss,
-            daily_realized_pnl,
-            daily_unrealized_pnl,
         ))
     }
 
@@ -1032,6 +1035,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         reason: &'static str,
         stop_invalidation_guard_enabled: bool,
         stop_invalidation_lookback_candles: usize,
+        initial_fire_delay: Option<std::time::Duration>,
     ) {
         let cancel_token = shutdown_token.child_token();
         match DetectorTask::from_position_with_policy(
@@ -1042,10 +1046,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             cancel_token,
         ) {
             Ok(detector) => {
-                let detector = detector.with_invalidation_guard(
+                let mut detector = detector.with_invalidation_guard(
                     stop_invalidation_guard_enabled,
                     stop_invalidation_lookback_candles,
                 );
+                if let Some(delay) = initial_fire_delay {
+                    detector = detector.with_initial_fire_delay(delay);
+                }
                 let handle = detector.spawn();
                 let mut detectors = detectors.write().await;
                 detectors.insert(position_id, handle);
@@ -1073,6 +1080,25 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         position: &Position,
         reason: &'static str,
     ) {
+        // Exponential backoff on consecutive governed blocks. Without it, an
+        // Immediate-mode re-arm refires instantly and a persistent governed
+        // condition (no slots, margin, pending duplicate) becomes a ~1/s hot
+        // loop against the OHLCV source and the event store.
+        let attempt = {
+            let mut counts = self.governed_rearm_counts.write().await;
+            let count = counts.entry(position_id).or_insert(0);
+            *count = count.saturating_add(1);
+            *count
+        };
+        let delay = governed_rearm_backoff(attempt);
+        info!(
+            %position_id,
+            %reason,
+            attempt,
+            backoff_secs = delay.as_secs(),
+            "Governed block — re-arming detector with backoff"
+        );
+
         let entry_policy = self.entry_policy_for_position(position_id).await;
         Self::rearm_detector(
             position_id,
@@ -1085,8 +1111,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             reason,
             self.stop_invalidation_guard_enabled,
             self.stop_invalidation_lookback_candles,
+            Some(delay),
         )
         .await;
+    }
+
+    /// Reset the governed re-arm backoff once a signal clears the risk gate.
+    async fn clear_governed_rearm_backoff(&self, position_id: PositionId) {
+        self.governed_rearm_counts.write().await.remove(&position_id);
     }
 
     fn emit_query_awaiting_approval(&self, query: &ExecutionQuery) {
@@ -1136,6 +1168,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let ohlcv_port = Arc::clone(&self.ohlcv_port);
         let detectors = Arc::clone(&self.detectors);
         let entry_policies = Arc::clone(&self.entry_policies);
+        let governed_rearm_counts = Arc::clone(&self.governed_rearm_counts);
         let stop_invalidation_guard_enabled = self.stop_invalidation_guard_enabled;
         let stop_invalidation_lookback_candles = self.stop_invalidation_lookback_candles;
         let shutdown_token = self.shutdown_token.clone();
@@ -1185,6 +1218,17 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                                 .unwrap_or_default()
                         };
 
+                        // Approval expiry is a governed block too: back off the
+                        // re-armed detector so an Immediate arm cannot hot-loop
+                        // through repeated unattended approvals.
+                        let attempt = {
+                            let mut counts = governed_rearm_counts.write().await;
+                            let count = counts.entry(record_inner.position.id).or_insert(0);
+                            *count = count.saturating_add(1);
+                            *count
+                        };
+                        let delay = governed_rearm_backoff(attempt);
+
                         PositionManager::<E, S>::rearm_detector(
                             record_inner.position.id,
                             record_inner.position,
@@ -1196,6 +1240,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                             "approval expired",
                             stop_invalidation_guard_enabled,
                             stop_invalidation_lookback_candles,
+                            Some(delay),
                         )
                         .await;
                     }
@@ -2351,6 +2396,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         timestamp: chrono::Utc::now(),
                     });
                     self.entry_policies.write().await.remove(&position_id);
+                    self.clear_governed_rearm_backoff(position_id).await;
                     return Ok(());
                 }
 
@@ -2379,6 +2425,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 return Err(e.into());
             },
         };
+
+        // Signal cleared the risk gate: reset the governed re-arm backoff so a
+        // future governed block starts from the shortest delay again.
+        self.clear_governed_rearm_backoff(position_id).await;
 
         // Domain ApprovalPolicy is authoritative over the notional-threshold adapter.
         let domain_approval = self.entry_policy_for_position(position_id).await.approval;
@@ -3493,6 +3543,19 @@ mod tests {
 
     use super::*;
     use crate::query_engine::TracingQueryRecorder;
+
+    #[test]
+    fn governed_rearm_backoff_doubles_from_5s_to_15min_cap() {
+        assert_eq!(governed_rearm_backoff(1).as_secs(), 5);
+        assert_eq!(governed_rearm_backoff(2).as_secs(), 10);
+        assert_eq!(governed_rearm_backoff(3).as_secs(), 20);
+        assert_eq!(governed_rearm_backoff(8).as_secs(), 640);
+        assert_eq!(governed_rearm_backoff(9).as_secs(), 900);
+        assert_eq!(governed_rearm_backoff(100).as_secs(), 900);
+        assert_eq!(governed_rearm_backoff(u32::MAX).as_secs(), 900);
+        // attempt 0 never happens (counter starts at 1), but must not panic
+        assert_eq!(governed_rearm_backoff(0).as_secs(), 5);
+    }
 
     async fn create_test_manager_with_store_and_event_bus(
         store: Arc<MemoryStore>,
