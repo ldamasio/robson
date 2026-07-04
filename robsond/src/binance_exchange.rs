@@ -44,6 +44,39 @@ fn configured_step_scale(symbol: &Symbol) -> u32 {
     configured_step_size(symbol).scale()
 }
 
+/// Price decimal precision accepted by the exchange for the symbol
+/// (Binance USD-M `pricePrecision`; BTCUSDT = 2).
+fn configured_price_scale(symbol: &Symbol) -> u32 {
+    match symbol.as_pair().as_str() {
+        "BTCUSDT" => 2,
+        _ => 2,
+    }
+}
+
+/// Normalize a protective stop trigger price to the symbol's price precision,
+/// rounding AWAY from the position — up for a Buy stop (closing a short),
+/// down for a Sell stop (closing a long) — so the stop never lands tighter
+/// than the derived executable level. The sub-precision widening (< one unit
+/// of the last decimal) sits well inside the sizing gap allowance (ADR-0039).
+///
+/// Derived stop prices are not precision-aligned in general: the ADR-0041
+/// buffer is a bps offset (2026-07-04 prod incident: 62811.05 + 10 bps =
+/// 62873.86105 → Binance -1111 "Precision is over the maximum").
+pub(crate) fn normalize_stop_trigger_price(
+    symbol: &Symbol,
+    side: OrderSide,
+    stop_price: Price,
+) -> Decimal {
+    let scale = configured_price_scale(symbol);
+    let factor = Decimal::from(10i64.pow(scale));
+    let scaled = stop_price.as_decimal() * factor;
+    let rounded = match side {
+        OrderSide::Buy => scaled.ceil(),
+        OrderSide::Sell => scaled.floor(),
+    };
+    rounded / factor
+}
+
 pub(crate) fn normalize_market_quantity(
     symbol: &Symbol,
     quantity: Quantity,
@@ -344,6 +377,7 @@ impl ExchangePort for BinanceExchangeAdapter {
         };
 
         let qty = normalize_market_quantity(symbol, quantity)?;
+        let trigger_price = normalize_stop_trigger_price(symbol, side, stop_price);
 
         let response = self
             .client
@@ -351,7 +385,7 @@ impl ExchangePort for BinanceExchangeAdapter {
                 &symbol.as_pair(),
                 binance_side,
                 qty,
-                stop_price.as_decimal(),
+                trigger_price,
                 client_order_id,
             )
             .await
@@ -832,5 +866,31 @@ mod tests {
             },
             other => panic!("expected OrderRejected, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn stop_trigger_price_rounds_away_from_the_position() {
+        // Regression: 2026-07-04 prod. The ADR-0041 buffered stop
+        // 62811.05 + 10 bps = 62873.86105 exceeded BTCUSDT's 2-decimal price
+        // precision and Binance rejected the insurance stop (-1111).
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let buffered = Price::new(dec!(62873.86105)).unwrap();
+
+        // Short protection (Buy stop above): never round DOWN toward entry.
+        assert_eq!(normalize_stop_trigger_price(&symbol, OrderSide::Buy, buffered), dec!(62873.87));
+        // Long protection (Sell stop below): never round UP toward entry.
+        assert_eq!(
+            normalize_stop_trigger_price(&symbol, OrderSide::Sell, buffered),
+            dec!(62873.86)
+        );
+    }
+
+    #[test]
+    fn stop_trigger_price_already_aligned_is_unchanged() {
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let aligned = Price::new(dec!(62811.05)).unwrap();
+
+        assert_eq!(normalize_stop_trigger_price(&symbol, OrderSide::Buy, aligned), dec!(62811.05));
+        assert_eq!(normalize_stop_trigger_price(&symbol, OrderSide::Sell, aligned), dec!(62811.05));
     }
 }
