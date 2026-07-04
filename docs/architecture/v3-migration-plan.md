@@ -715,6 +715,14 @@ The Risk Engine is a mandatory gate in the control loop. Every `EngineAction` pa
 
 ### Hard Limits (v2.5)
 
+> **2026-07-04 update**: this table describes the v2.5 design and is
+> historical. ADR-0024 (MIG-v3#11) eliminated the static exposure limits
+> (position size, open positions, total exposure) in favor of dynamic
+> slots, and the daily loss limit was never adopted as v3 policy — a
+> leftover implementation of it in `RiskGate` was removed in PR #110.
+> Current constraints: 1% worst-case loss per operation (sizing cap) and
+> the 4% monthly drawdown (AGENTS.md §10).
+
 | Limit | Default | Configurable? | Override? |
 |-------|---------|---------------|-----------|
 | Max position size | 15% of capital | Yes (operator, via config) | Yes, with RiskOverride event |

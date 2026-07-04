@@ -550,6 +550,15 @@ trailing_stop = initial_stop - completed_spans × span
 
 **Context**: The system accumulated implicit assumptions about PnL. `realized_pnl` was used in the monthly drawdown trigger without documenting whether fees were included. `unrealized_pnl` pricing source (tick vs. exchange mark price) was unspecified. The daily loss circuit breaker existed in `RiskGate` but was silently disabled due to missing data, without explicit documentation. These gaps created a mismatch between what the spec claimed and what the code did.
 
+> **2026-07-04 update**: the "silently disabled" daily loss breaker noted
+> above later re-activated exactly as this decision warned it could — when
+> daily PnL inputs were wired into `RiskContext`, the dormant check came
+> alive and denied all entries for the rest of the UTC day after one
+> budget-sized stop-out (2026-07-04 incident, BTCUSDT immediate short).
+> No policy document had ever adopted a daily loss budget (AGENTS.md §10:
+> "There is no daily loss limit"), so the check and its daily PnL plumbing
+> were removed in PR #110 rather than documented.
+
 **Decision**: Formalize the canonical PnL model with explicit component definitions, formula, source of truth, and current implementation state.
 
 **Canonical formula**:

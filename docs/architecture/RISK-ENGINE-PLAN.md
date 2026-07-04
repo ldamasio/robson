@@ -11,6 +11,12 @@
 > `RiskGate` now uses `TradingPolicy` and dynamic monthly-budget slots; legacy
 > `max_open_positions`, `max_total_exposure_pct`, and `max_single_position_pct`
 > are preserved only for compatibility and are not enforced.
+>
+> **2026-07-04 update**: the `daily_loss_limit_pct` circuit breaker sketched
+> below made it into `RiskGate` but was never adopted by v3 policy (AGENTS.md
+> §10: "There is no daily loss limit"). It sat dormant with zeroed inputs
+> until daily PnL was wired in, then blocked entries after a single
+> budget-sized stop-out; check and field were removed in PR #110.
 
 ---
 

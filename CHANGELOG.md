@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed - Phantom daily loss limit removed (2026-07-04)
+
+- `RiskGate` enforced a `daily_loss_limit_pct = 1%` check that no policy
+  document ever adopted — AGENTS.md §10 states "There is no daily loss
+  limit" (the policy is 1% worst-case loss per operation plus the 4%
+  monthly drawdown, ADR-0024). The check had been structurally inactive
+  (zeroed inputs, see ADR-v3-024) until daily PnL was wired into
+  `RiskContext`, which silently re-activated it and blocked every new
+  entry for the rest of the UTC day after a single budget-sized stop-out.
+  The check, `RiskLimits::daily_loss_limit_pct`, and the daily PnL
+  plumbing were removed (PR #110). `RiskCheck::DailyLossLimit` remains as
+  a legacy variant for historical event compatibility.
+
+### Fixed - Governed re-arm backoff (2026-07-04)
+
+- A governed entry denial (risk gate, expired approval, entry-quantity
+  rejection) re-armed the detector, and in Immediate mode the fresh
+  detector re-fired instantly — a ~1/s hot loop against the Binance
+  OHLCV API and the event store (84 denials in 92 s observed in prod).
+  Governed re-arms now delay the detector's first evaluation with a
+  per-position exponential backoff (5 s doubling to a 15-minute cap),
+  reset when a signal clears the risk gate or the position is cancelled.
+  The wait is cancellable, so shutdown and cancel-position interrupt it
+  immediately (PR #110).
+
+### Fixed - Position card shows the executable stop (2026-07-04)
+
+- The frontend Active card rendered the raw technical trailing stop,
+  which with an active invalidation guard (ADR-0042) read as if the stop
+  sat below the recent adverse extreme. The card now shows the executable
+  stop (`effective_stop`, ADR-0041 buffer + guard clamp) with the guard
+  level as context while it binds, e.g.
+  `stop 63,132.67 (guard 63,069.60)` (PR #109).
+
 ### Changed - Dashboard live-list semantics
 
 - The live dashboard operations panel now shows only positions that still occupy a slot.
