@@ -33,6 +33,7 @@ struct PostConvertedCrashExchange {
     spot_balance_calls: std::sync::RwLock<u64>,
     fail_spot_balance_call: std::sync::RwLock<Option<u64>>,
     fail_spot_order: std::sync::RwLock<Option<String>>,
+    fail_transfers_remaining: std::sync::RwLock<u64>,
 }
 
 impl PostConvertedCrashExchange {
@@ -42,7 +43,12 @@ impl PostConvertedCrashExchange {
             spot_balance_calls: std::sync::RwLock::new(0),
             fail_spot_balance_call: std::sync::RwLock::new(None),
             fail_spot_order: std::sync::RwLock::new(None),
+            fail_transfers_remaining: std::sync::RwLock::new(0),
         }
+    }
+
+    fn fail_next_transfers(&self, count: u64) {
+        *self.fail_transfers_remaining.write().unwrap() = count;
     }
 
     fn fail_spot_balance_call(&self, call: u64) {
@@ -216,6 +222,13 @@ impl ExchangePort for PostConvertedCrashExchange {
         transfer_type: UniversalTransferType,
         client_tran_key: &str,
     ) -> Result<TransferId, ExecError> {
+        {
+            let mut remaining = self.fail_transfers_remaining.write().unwrap();
+            if *remaining > 0 {
+                *remaining -= 1;
+                return Err(ExecError::Exchange("transfer temporarily unavailable".to_string()));
+            }
+        }
         self.inner
             .universal_transfer(asset, amount, transfer_type, client_tran_key)
             .await
@@ -360,6 +373,46 @@ async fn resume_after_crash_post_converted(pool: PgPool) -> anyhow::Result<()> {
 
     assert_eq!(response.state, FundingState::Refreshed.as_str());
     assert_eq!(harness.exchange.spot_order_call_count(), spot_calls);
+    assert_eq!(harness.exchange.transfer_call_count(), 1);
+
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "Requires DATABASE_URL"]
+async fn transfer_retries_append_transfer_prepared_once(pool: PgPool) -> anyhow::Result<()> {
+    // Regression for the 2026-06-03 saga: a transfer stalled for 5.5 h
+    // accumulated ~4 000 TransferPrepared duplicates because every 5 s
+    // worker resume re-appended the event. Resumed passes through the
+    // Transferring state must NOT append another TransferPrepared.
+    let exchange = Arc::new(PostConvertedCrashExchange::new(configured_exchange()));
+    let harness = test_service(pool, exchange, FundingConfig::default());
+
+    let quote = harness.service.quote().await?;
+    harness.exchange.fail_next_transfers(3);
+
+    for attempt in 0..3 {
+        let result = harness.service.execute(quote.quote_id, "stalled-transfer").await;
+        assert!(result.is_err(), "attempt {attempt} must fail while the transfer is down");
+        assert_eq!(
+            harness.service.get(quote.quote_id).await?.state,
+            FundingState::Transferring.as_str()
+        );
+    }
+
+    let response = harness.service.execute(quote.quote_id, "transfer-recovered").await?;
+    assert_eq!(response.state, FundingState::Refreshed.as_str());
+
+    let view = harness.service.get(quote.quote_id).await?;
+    let prepared_count = view
+        .events
+        .iter()
+        .filter(|event| event.event_type == "TransferPrepared")
+        .count();
+    assert_eq!(
+        prepared_count, 1,
+        "TransferPrepared must be appended exactly once across retries"
+    );
     assert_eq!(harness.exchange.transfer_call_count(), 1);
 
     Ok(())
