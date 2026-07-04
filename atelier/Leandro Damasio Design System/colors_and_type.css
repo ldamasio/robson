@@ -1,0 +1,331 @@
+/*
+ * Leandro Damasio — Design System
+ * colors_and_type.css
+ *
+ * Usage: import this file first; then use the CSS custom properties below
+ * throughout any HTML/CSS artifact or UI kit.
+ *
+ * Font files live in fonts/ (Geist variable font, Geist Mono variable font).
+ * The brief targets Inter + JetBrains Mono for the production stack; Geist /
+ * Geist Mono are the current implementation fonts and are visually compatible.
+ * Both are loaded here via @font-face so artifacts work offline.
+ */
+
+/* ─── FONT FACES ─────────────────────────────────────────────────────────── */
+
+@font-face {
+  font-family: 'Geist';
+  src: url('./fonts/GeistVF.woff') format('woff');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'GeistMono';
+  src: url('./fonts/GeistMonoVF.woff') format('woff');
+  font-weight: 100 900;
+  font-style: normal;
+  font-display: swap;
+}
+
+/* ─── COLOR TOKENS ───────────────────────────────────────────────────────── */
+
+:root {
+
+  /* --- Surfaces (near-black, cold neutral, narrow steps) --- */
+  --surface-page:       #050507;   /* deepest background */
+  --surface-primary:    #0A0A0B;   /* main page body */
+  --surface-raised:     #0F1012;   /* slightly lifted layer */
+  --surface-card:       #15161A;   /* card backgrounds */
+  --surface-footer:     #1D1D22;   /* footer / secondary areas */
+  --surface-hairline:   #26272C;   /* hairline dividers (1px borders) */
+  --surface-divider:    #33343A;   /* stronger section dividers */
+
+  /* --- Text (off-white, warm) --- */
+  --text-primary:       #F5F5F3;   /* headings, primary content */
+  --text-secondary:     #B4B5B8;   /* body text, descriptions */
+  --text-label:         #72747A;   /* labels, captions, metadata */
+  --text-disabled:      #45474D;   /* disabled / placeholder */
+
+  /* --- Accent: Institutional / RBX-inherited --- */
+  --accent-brass:       #D9CBA3;   /* brass/bone metallic — RBX brand accent,
+                                      use sparingly: key emphasis only */
+
+  /* --- Accent: Personal / Authorial (NEW) --- */
+  --accent-personal:    #5C7080;   /* cold steel blue — chosen to read as
+                                      technical precision and individual
+                                      authorship, distinct from the warm brass
+                                      of RBX corporate; sits quietly in the
+                                      palette without demanding attention */
+
+  /* --- Semantic (calm, desaturated) --- */
+  --status-ok:          #7FB77E;   /* success / shipped */
+  --status-warn:        #D9B55A;   /* warning / in progress */
+  --status-err:         #C56A6A;   /* error / deprecated */
+  --status-info:        #7A93B0;   /* informational / active */
+
+  /* --- Light mode surfaces (secondary) --- */
+  --light-surface-page:    #FAFAFA;
+  --light-surface-primary: #F5F5F3;
+  --light-surface-raised:  #EDEDED;
+  --light-surface-card:    #E8E8E6;
+  --light-surface-footer:  #DDDDD9;
+  --light-surface-hairline: #C8C8C4;
+  --light-surface-divider:  #B0B0AA;
+
+  /* --- Light mode text --- */
+  --light-text-primary:    #0A0A0B;
+  --light-text-secondary:  #3A3B3E;
+  --light-text-label:      #6A6B6E;
+  --light-text-disabled:   #A0A1A4;
+}
+
+/* ─── SEMANTIC ALIASES (dark-first, default) ─────────────────────────────── */
+
+:root {
+  --bg:           var(--surface-primary);
+  --fg:           var(--text-primary);
+  --fg2:          var(--text-secondary);
+  --fg3:          var(--text-label);
+  --fg-disabled:  var(--text-disabled);
+  --border:       var(--surface-hairline);
+  --border-strong:var(--surface-divider);
+  --card-bg:      var(--surface-card);
+  --accent:       var(--accent-brass);
+  --accent2:      var(--accent-personal);
+}
+
+/* ─── LIGHT MODE OVERRIDES ───────────────────────────────────────────────── */
+
+[data-theme="light"],
+.light {
+  --bg:           var(--light-surface-primary);
+  --fg:           var(--light-text-primary);
+  --fg2:          var(--light-text-secondary);
+  --fg3:          var(--light-text-label);
+  --fg-disabled:  var(--light-text-disabled);
+  --border:       var(--light-surface-hairline);
+  --border-strong:var(--light-surface-divider);
+  --card-bg:      var(--light-surface-card);
+}
+
+/* ─── TYPOGRAPHY TOKENS ──────────────────────────────────────────────────── */
+
+:root {
+  /* --- Font families --- */
+  --font-sans:  'Geist', 'Inter', system-ui, sans-serif;
+  --font-mono:  'GeistMono', 'JetBrains Mono', 'Fira Mono', monospace;
+
+  /* --- Weight scale --- */
+  --fw-thin:    300;   /* display / H1: presence without shouting */
+  --fw-regular: 400;   /* body text */
+  --fw-medium:  500;   /* labels, UI chrome */
+  --fw-bold:    700;   /* brand mark only */
+
+  /* --- Size scale (rem, base 16px) --- */
+  --text-xs:    0.6875rem;  /* 11px — micro labels */
+  --text-sm:    0.8125rem;  /* 13px — captions, footnotes */
+  --text-base:  1rem;       /* 16px — body */
+  --text-lg:    1.125rem;   /* 18px — lead paragraph */
+  --text-xl:    1.375rem;   /* 22px — small heading */
+  --text-2xl:   1.75rem;    /* 28px — H3 */
+  --text-3xl:   2.25rem;    /* 36px — H2 */
+  --text-4xl:   3rem;       /* 48px — H1 */
+  --text-display: 4.5rem;   /* 72px — Display / hero */
+
+  /* --- Line heights --- */
+  --lh-tight:   1.1;
+  --lh-snug:    1.3;
+  --lh-normal:  1.5;
+  --lh-relaxed: 1.7;
+
+  /* --- Letter spacing --- */
+  --ls-tight:   -0.02em;
+  --ls-normal:   0em;
+  --ls-eyebrow:  0.14em;  /* UPPERCASE eyebrows / section labels */
+  --ls-status:   0.04em;  /* status mono caps */
+
+  /* --- Max widths --- */
+  --prose-width:   42rem;   /* 672px — prose column */
+  --content-width: 72rem;   /* 1152px — content max */
+  --nav-width:     80rem;   /* 1280px — nav max */
+}
+
+/* ─── SEMANTIC TYPE STYLES ───────────────────────────────────────────────── */
+
+/* Display / Hero */
+.t-display {
+  font-family: var(--font-sans);
+  font-size: var(--text-display);
+  font-weight: var(--fw-thin);
+  line-height: var(--lh-tight);
+  letter-spacing: var(--ls-tight);
+  color: var(--fg);
+}
+
+/* H1 */
+.t-h1 {
+  font-family: var(--font-sans);
+  font-size: var(--text-4xl);
+  font-weight: var(--fw-thin);
+  line-height: var(--lh-tight);
+  letter-spacing: var(--ls-tight);
+  color: var(--fg);
+}
+
+/* H2 */
+.t-h2 {
+  font-family: var(--font-sans);
+  font-size: var(--text-3xl);
+  font-weight: var(--fw-thin);
+  line-height: var(--lh-snug);
+  letter-spacing: var(--ls-tight);
+  color: var(--fg);
+}
+
+/* H3 */
+.t-h3 {
+  font-family: var(--font-sans);
+  font-size: var(--text-2xl);
+  font-weight: var(--fw-regular);
+  line-height: var(--lh-snug);
+  color: var(--fg);
+}
+
+/* Lead — opening paragraph */
+.t-lead {
+  font-family: var(--font-sans);
+  font-size: var(--text-lg);
+  font-weight: var(--fw-regular);
+  line-height: var(--lh-relaxed);
+  color: var(--fg2);
+}
+
+/* Body */
+.t-body {
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  font-weight: var(--fw-regular);
+  line-height: var(--lh-relaxed);
+  color: var(--fg2);
+}
+
+/* Caption */
+.t-caption {
+  font-family: var(--font-sans);
+  font-size: var(--text-sm);
+  font-weight: var(--fw-regular);
+  line-height: var(--lh-normal);
+  color: var(--fg3);
+}
+
+/* Eyebrow — UPPERCASE section label */
+.t-eyebrow {
+  font-family: var(--font-sans);
+  font-size: var(--text-xs);
+  font-weight: var(--fw-medium);
+  line-height: var(--lh-normal);
+  letter-spacing: var(--ls-eyebrow);
+  text-transform: uppercase;
+  color: var(--fg3);
+}
+
+/* Status — mono ALL-CAPS with dot */
+.t-status {
+  font-family: var(--font-mono);
+  font-size: var(--text-xs);
+  font-weight: var(--fw-medium);
+  line-height: var(--lh-normal);
+  letter-spacing: var(--ls-status);
+  text-transform: uppercase;
+}
+
+/* Code / data / metrics */
+.t-mono {
+  font-family: var(--font-mono);
+  font-size: var(--text-sm);
+  font-weight: var(--fw-regular);
+  line-height: var(--lh-normal);
+  color: var(--fg2);
+}
+
+/* ─── BASE RESET ─────────────────────────────────────────────────────────── */
+
+*,
+*::before,
+*::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+html {
+  -webkit-text-size-adjust: 100%;
+}
+
+body {
+  font-family: var(--font-sans);
+  font-size: var(--text-base);
+  line-height: var(--lh-relaxed);
+  background-color: var(--bg);
+  color: var(--fg);
+  -webkit-font-smoothing: antialiased;
+  text-rendering: optimizeLegibility;
+  text-wrap: pretty;
+}
+
+/* ─── SPACING TOKENS ─────────────────────────────────────────────────────── */
+
+:root {
+  --space-1:  4px;
+  --space-2:  8px;
+  --space-3:  12px;
+  --space-4:  16px;
+  --space-5:  20px;
+  --space-6:  24px;
+  --space-8:  32px;
+  --space-10: 40px;
+  --space-12: 48px;
+  --space-16: 64px;
+  --space-20: 80px;
+  --space-24: 96px;
+  --space-32: 128px;
+}
+
+/* ─── BORDER RADII ───────────────────────────────────────────────────────── */
+
+:root {
+  --radius-xs:   2px;
+  --radius-sm:   4px;
+  --radius-md:   8px;    /* cards */
+  --radius-btn:  6px;    /* buttons */
+  --radius-pill: 999px;  /* status pills only */
+}
+
+/* ─── SHADOW SYSTEM ──────────────────────────────────────────────────────── */
+
+:root {
+  /* Near-absent shadows — structural hairlines do the heavy lifting */
+  --shadow-card: inset 0 1px 0 rgba(255,255,255,0.04),
+                 0 1px 3px rgba(0,0,0,0.5);
+  --shadow-nav:  0 4px 24px rgba(0,0,0,0.6);
+  --shadow-none: none;
+}
+
+/* ─── MOTION TOKENS ──────────────────────────────────────────────────────── */
+
+:root {
+  --ease-out:       cubic-bezier(0.22, 1, 0.36, 1);
+  --duration-enter: 600ms;   /* page / section entry */
+  --duration-hover: 160ms;   /* hover color / border transitions */
+  --duration-press: 0ms;     /* press: instantaneous */
+}
+
+/* Reduced motion */
+@media (prefers-reduced-motion: reduce) {
+  * {
+    animation-duration: 0.01ms !important;
+    transition-duration: 0.01ms !important;
+  }
+}

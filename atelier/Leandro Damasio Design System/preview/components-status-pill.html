@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  @font-face { font-family:'Geist'; src:url('../fonts/GeistVF.woff') format('woff'); font-weight:100 900; }
+  @font-face { font-family:'GeistMono'; src:url('../fonts/GeistMonoVF.woff') format('woff'); font-weight:100 900; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:#0A0A0B; padding:20px; }
+  .title { font-family:'GeistMono',monospace; font-size:8px; letter-spacing:0.14em; text-transform:uppercase; color:#72747A; margin-bottom:12px; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; margin-bottom:10px; }
+  .pill { font-family:'GeistMono',monospace; font-size:9px; letter-spacing:0.04em; text-transform:uppercase; padding:3px 10px; border-radius:999px; border:1px solid; }
+  .divider { width:100%;height:1px;background:#26272C;margin:12px 0; }
+</style>
+</head>
+<body>
+<div class="title">Status Pills</div>
+<div class="row">
+  <span class="pill" style="color:#7FB77E;border-color:#7FB77E;background:rgba(127,183,126,0.08)">● Shipped</span>
+  <span class="pill" style="color:#7A93B0;border-color:#7A93B0;background:rgba(122,147,176,0.08)">● Active</span>
+  <span class="pill" style="color:#7A93B0;border-color:#7A93B0;background:rgba(122,147,176,0.08)">● In production</span>
+  <span class="pill" style="color:#D9B55A;border-color:#D9B55A;background:rgba(217,181,90,0.08)">● In progress</span>
+  <span class="pill" style="color:#C56A6A;border-color:#C56A6A;background:rgba(197,106,106,0.08)">● Deprecated</span>
+  <span class="pill" style="color:#45474D;border-color:#33343A;background:transparent">● Archived</span>
+</div>
+<div class="divider"></div>
+<div class="title">Hairline Divider</div>
+<div style="border-top:1px solid #26272C;padding-top:10px">
+  <span style="font-family:'GeistMono',monospace;font-size:9px;color:#45474D">1px solid #26272C — primary structural device</span>
+</div>
+<div class="divider"></div>
+<div class="title">Eyebrow + Hairline in Context</div>
+<div>
+  <div style="border-top:1px solid #26272C;padding-top:10px;margin-bottom:6px">
+    <span style="font-family:'Geist',sans-serif;font-size:9px;font-weight:500;letter-spacing:0.14em;text-transform:uppercase;color:#72747A">Selected Projects</span>
+  </div>
+  <div style="font-family:'Geist',sans-serif;font-size:22px;font-weight:300;color:#F5F5F3">Work, 2018–2026</div>
+</div>
+</body>
+</html>

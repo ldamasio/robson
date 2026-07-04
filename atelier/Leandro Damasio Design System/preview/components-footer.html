@@ -1,0 +1,39 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  @font-face { font-family:'Geist'; src:url('../fonts/GeistVF.woff') format('woff'); font-weight:100 900; }
+  @font-face { font-family:'GeistMono'; src:url('../fonts/GeistMonoVF.woff') format('woff'); font-weight:100 900; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:#1D1D22; font-family:'Geist',sans-serif; padding:20px 24px; }
+
+  .footer { display:flex; justify-content:space-between; align-items:flex-end; }
+  .left { display:flex; flex-direction:column; gap:6px; }
+  .brand { font-family:'GeistMono',monospace; font-size:9px; letter-spacing:0.12em; text-transform:uppercase; color:#45474D; }
+  .legal { font-size:10px; color:#45474D; }
+  .right { display:flex; flex-direction:column; align-items:flex-end; gap:6px; }
+  .locale { display:flex; gap:8px; }
+  .locale a { font-family:'GeistMono',monospace; font-size:9px; color:#72747A; text-decoration:none; letter-spacing:0.06em; }
+  .locale a.active { color:#B4B5B8; }
+  .sep { color:#33343A; }
+</style>
+</head>
+<body>
+<div style="border-top:1px solid #26272C; padding-top:16px">
+  <div class="footer">
+    <div class="left">
+      <span class="brand">RBX Systems · CHE-xxx.xxx.xxx</span>
+      <span class="legal">© 2026 Leandro Damasio. All rights reserved.</span>
+    </div>
+    <div class="right">
+      <div class="locale">
+        <a href="#" class="active">EN</a>
+        <span class="sep">/</span>
+        <a href="#">PT-BR</a>
+      </div>
+    </div>
+  </div>
+</div>
+</body>
+</html>

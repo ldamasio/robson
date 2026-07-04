@@ -1,0 +1,75 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  @font-face { font-family:'Geist'; src:url('../fonts/GeistVF.woff') format('woff'); font-weight:100 900; }
+  @font-face { font-family:'GeistMono'; src:url('../fonts/GeistMonoVF.woff') format('woff'); font-weight:100 900; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:#0A0A0B; font-family:'Geist',sans-serif; padding:20px; }
+  .title { font-family:'GeistMono',monospace; font-size:8px; letter-spacing:0.14em; text-transform:uppercase; color:#72747A; margin-bottom:12px; }
+  .divider { width:100%;height:1px;background:#26272C;margin:12px 0; }
+  .row { display:flex; gap:8px; flex-wrap:wrap; align-items:center; }
+
+  /* Button styles */
+  .btn { display:inline-flex; align-items:center; gap:6px; padding:8px 16px; border-radius:6px; font-family:'Geist',sans-serif; font-size:13px; font-weight:500; cursor:pointer; border:1px solid; letter-spacing:0; transition:none; }
+  .btn-ghost   { background:transparent; border-color:transparent; color:#B4B5B8; }
+  .btn-outline { background:transparent; border-color:#33343A; color:#F5F5F3; }
+  .btn-primary { background:#D9CBA3; border-color:#D9CBA3; color:#0A0A0B; }
+  .btn-personal{ background:transparent; border-color:#5C7080; color:#5C7080; }
+
+  /* Hover states (shown as separate items) */
+  .btn-ghost-h   { background:#15161A; border-color:#26272C; color:#F5F5F3; }
+  .btn-outline-h { background:#15161A; border-color:#5C7080; color:#F5F5F3; }
+  .btn-primary-h { background:#C8BA92; border-color:#C8BA92; color:#0A0A0B; }
+
+  .state-label { font-family:'GeistMono',monospace; font-size:8px; color:#45474D; text-align:center; margin-top:4px; }
+  .col { display:flex;flex-direction:column;align-items:center;gap:0; }
+</style>
+</head>
+<body>
+<div class="title">Buttons — Default</div>
+<div class="row">
+  <div class="col">
+    <button class="btn btn-ghost">Ghost</button>
+    <span class="state-label">ghost</span>
+  </div>
+  <div class="col">
+    <button class="btn btn-outline">Outline</button>
+    <span class="state-label">outline</span>
+  </div>
+  <div class="col">
+    <button class="btn btn-primary">Primary</button>
+    <span class="state-label">primary</span>
+  </div>
+  <div class="col">
+    <button class="btn btn-personal">Personal</button>
+    <span class="state-label">personal</span>
+  </div>
+</div>
+
+<div class="divider"></div>
+<div class="title">Buttons — Hover State</div>
+<div class="row">
+  <div class="col">
+    <button class="btn btn-ghost-h">Ghost</button>
+    <span class="state-label">ghost:hover</span>
+  </div>
+  <div class="col">
+    <button class="btn btn-outline-h">Outline</button>
+    <span class="state-label">outline:hover</span>
+  </div>
+  <div class="col">
+    <button class="btn btn-primary-h">Primary</button>
+    <span class="state-label">primary:hover</span>
+  </div>
+</div>
+
+<div class="divider"></div>
+<div class="title">Link</div>
+<div style="display:flex;gap:16px;align-items:center">
+  <a href="#" style="font-family:'Geist',sans-serif;font-size:13px;color:#B4B5B8;text-decoration:none;border-bottom:1px solid #33343A;padding-bottom:1px">leandrodamasio@rbxsystems.ch</a>
+  <a href="#" style="font-family:'GeistMono',monospace;font-size:11px;color:#72747A;text-decoration:none">github.com/ldamasio</a>
+</div>
+</body>
+</html>

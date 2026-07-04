@@ -1,0 +1,55 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  @font-face { font-family:'Geist'; src:url('../fonts/GeistVF.woff') format('woff'); font-weight:100 900; }
+  @font-face { font-family:'GeistMono'; src:url('../fonts/GeistMonoVF.woff') format('woff'); font-weight:100 900; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:#0A0A0B; font-family:'GeistMono',monospace; padding:20px; }
+  .title { font-size:8px; letter-spacing:0.14em; text-transform:uppercase; color:#72747A; margin-bottom:12px; }
+  .row { display:flex; gap:8px; align-items:center; margin-bottom:10px; }
+  .box { background:#15161A; border:1px solid #26272C; width:48px; height:32px; flex-shrink:0; display:flex; align-items:center; justify-content:center; font-size:8px; color:#45474D; }
+  .lbl { font-size:9px; color:#72747A; }
+  .divider { width:100%;height:1px;background:#26272C;margin:10px 0; }
+
+  /* Shadow demos */
+  .shadow-card { width:80px; height:44px; background:#15161A; border:1px solid #26272C; display:flex;align-items:center;justify-content:center;font-size:8px;color:#45474D; }
+  .shadow-nav  { width:80px; height:44px; background:rgba(15,16,18,0.85); border:1px solid rgba(38,39,44,0.5); display:flex;align-items:center;justify-content:center;font-size:8px;color:#72747A; }
+</style>
+</head>
+<body>
+<div class="title">Border Radii</div>
+<div class="row">
+  <div class="box" style="border-radius:2px">2px</div>
+  <span class="lbl">--radius-xs · structural micro</span>
+</div>
+<div class="row">
+  <div class="box" style="border-radius:4px">4px</div>
+  <span class="lbl">--radius-sm · inline elements</span>
+</div>
+<div class="row">
+  <div class="box" style="border-radius:6px">6px</div>
+  <span class="lbl">--radius-btn · buttons</span>
+</div>
+<div class="row">
+  <div class="box" style="border-radius:8px">8px</div>
+  <span class="lbl">--radius-md · cards</span>
+</div>
+<div class="row">
+  <div class="box" style="border-radius:999px;width:64px">pill</div>
+  <span class="lbl">--radius-pill · status labels only</span>
+</div>
+
+<div class="divider"></div>
+<div class="title">Shadow System</div>
+<div class="row">
+  <div class="shadow-card" style="box-shadow:inset 0 1px 0 rgba(255,255,255,0.04),0 1px 3px rgba(0,0,0,0.5)">card</div>
+  <span class="lbl" style="font-size:8px">inset 1px highlight + 1px drop</span>
+</div>
+<div class="row">
+  <div class="shadow-nav" style="box-shadow:0 4px 24px rgba(0,0,0,0.6);border-radius:999px">nav</div>
+  <span class="lbl" style="font-size:8px">0 4px 24px — nav pill only</span>
+</div>
+</body>
+</html>

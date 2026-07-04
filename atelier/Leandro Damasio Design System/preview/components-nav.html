@@ -1,0 +1,53 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  @font-face { font-family:'Geist'; src:url('../fonts/GeistVF.woff') format('woff'); font-weight:100 900; }
+  @font-face { font-family:'GeistMono'; src:url('../fonts/GeistMonoVF.woff') format('woff'); font-weight:100 900; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:#0A0A0B; font-family:'Geist',sans-serif; padding:20px 20px 16px; }
+  .title { font-family:'GeistMono',monospace; font-size:8px; letter-spacing:0.14em; text-transform:uppercase; color:#72747A; margin-bottom:14px; }
+
+  .nav {
+    display:inline-flex;
+    align-items:center;
+    gap:2px;
+    background:rgba(15,16,18,0.85);
+    backdrop-filter:blur(12px);
+    -webkit-backdrop-filter:blur(12px);
+    border:1px solid rgba(38,39,44,0.6);
+    border-radius:999px;
+    padding:6px 10px;
+    box-shadow:0 4px 24px rgba(0,0,0,0.6);
+  }
+  .nav-item {
+    font-size:12px;
+    font-weight:500;
+    color:#B4B5B8;
+    padding:5px 12px;
+    border-radius:999px;
+    cursor:pointer;
+    white-space:nowrap;
+  }
+  .nav-item.active { background:#15161A; color:#F5F5F3; }
+  .nav-item:hover { color:#F5F5F3; }
+  .nav-divider { width:1px; height:16px; background:#26272C; margin:0 2px; }
+  .nav-locale { font-family:'GeistMono',monospace; font-size:10px; color:#72747A; padding:5px 8px; }
+</style>
+</head>
+<body>
+<div class="title">Navigation — Floating Pill</div>
+<div class="nav">
+  <span class="nav-item active">Home</span>
+  <span class="nav-item">Work</span>
+  <span class="nav-item">Notes</span>
+  <span class="nav-item">Contact</span>
+  <div class="nav-divider"></div>
+  <span class="nav-locale">EN</span>
+</div>
+<div style="margin-top:10px;font-family:'GeistMono',monospace;font-size:8px;color:#45474D">
+  backdrop-filter: blur(12px) · border-radius: 999px · sticky z-50 · max-width 80rem
+</div>
+</body>
+</html>

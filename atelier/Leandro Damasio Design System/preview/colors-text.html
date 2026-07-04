@@ -1,0 +1,64 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  @font-face { font-family:'Geist'; src:url('../fonts/GeistVF.woff') format('woff'); font-weight:100 900; }
+  @font-face { font-family:'GeistMono'; src:url('../fonts/GeistMonoVF.woff') format('woff'); font-weight:100 900; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:#0A0A0B; font-family:'Geist',sans-serif; padding:20px; }
+  .stack { display:flex; flex-direction:column; gap:10px; }
+  .row { display:flex; align-items:center; gap:12px; }
+  .dot { width:28px; height:28px; border-radius:50%; flex-shrink:0; }
+  .info { display:flex; flex-direction:column; gap:2px; }
+  .name { font-size:12px; font-weight:500; }
+  .meta { font-family:'GeistMono',monospace; font-size:9px; letter-spacing:0.06em; color:#45474D; }
+  .sample { font-size:13px; }
+  .title { font-family:'GeistMono',monospace; font-size:8px; letter-spacing:0.14em; text-transform:uppercase; color:#72747A; margin-bottom:12px; }
+  .divider { width:100%; height:1px; background:#26272C; margin:12px 0; }
+</style>
+</head>
+<body>
+<div class="title">Text Scale</div>
+<div class="stack">
+  <div class="row">
+    <div class="dot" style="background:#F5F5F3"></div>
+    <div class="info">
+      <span class="name" style="color:#F5F5F3">Primary text</span>
+      <span class="meta">#F5F5F3 — headings, primary content</span>
+    </div>
+    <span class="sample" style="color:#F5F5F3; margin-left:auto">Aa</span>
+  </div>
+  <div class="row">
+    <div class="dot" style="background:#B4B5B8"></div>
+    <div class="info">
+      <span class="name" style="color:#B4B5B8">Secondary text</span>
+      <span class="meta">#B4B5B8 — body, descriptions</span>
+    </div>
+    <span class="sample" style="color:#B4B5B8; margin-left:auto">Aa</span>
+  </div>
+  <div class="row">
+    <div class="dot" style="background:#72747A"></div>
+    <div class="info">
+      <span class="name" style="color:#72747A">Label text</span>
+      <span class="meta">#72747A — labels, captions, metadata</span>
+    </div>
+    <span class="sample" style="color:#72747A; margin-left:auto">Aa</span>
+  </div>
+  <div class="row">
+    <div class="dot" style="background:#45474D; border:1px solid #26272C"></div>
+    <div class="info">
+      <span class="name" style="color:#45474D">Disabled text</span>
+      <span class="meta">#45474D — disabled, placeholder</span>
+    </div>
+    <span class="sample" style="color:#45474D; margin-left:auto">Aa</span>
+  </div>
+</div>
+<div class="divider"></div>
+<div style="font-family:'Geist',sans-serif; font-size:13px; line-height:1.6; color:#B4B5B8; max-width:480px">
+  Computer Engineer. AI systems for finance and<br>
+  high-reliability environments. Based in Brazil,<br>
+  <span style="color:#72747A">working across Zürich and São Paulo.</span>
+</div>
+</body>
+</html>

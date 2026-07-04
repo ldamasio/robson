@@ -1,0 +1,42 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<style>
+  @font-face { font-family:'Geist'; src:url('../fonts/GeistVF.woff') format('woff'); font-weight:100 900; }
+  @font-face { font-family:'GeistMono'; src:url('../fonts/GeistMonoVF.woff') format('woff'); font-weight:100 900; }
+  * { box-sizing:border-box; margin:0; padding:0; }
+  body { background:#0A0A0B; font-family:'Geist',sans-serif; padding:20px; }
+  .title { font-family:'GeistMono',monospace; font-size:8px; letter-spacing:0.14em; text-transform:uppercase; color:#72747A; margin-bottom:14px; }
+  .divider { width:100%; height:1px; background:#26272C; margin:14px 0; }
+  .eyebrow { font-family:'Geist',sans-serif; font-size:11px; font-weight:500; letter-spacing:0.14em; text-transform:uppercase; color:#72747A; }
+  .section-head { margin-top:6px; }
+  .section-head h2 { font-family:'Geist',sans-serif; font-size:24px; font-weight:300; color:#F5F5F3; line-height:1.1; }
+  .status-row { display:flex; gap:10px; flex-wrap:wrap; margin-top:4px; }
+  .pill { font-family:'GeistMono',monospace; font-size:9px; letter-spacing:0.04em; text-transform:uppercase; padding:3px 8px; border-radius:999px; border:1px solid; }
+</style>
+</head>
+<body>
+<div class="title">Eyebrow Pattern</div>
+<div class="eyebrow">Selected Projects</div>
+<div class="section-head"><h2>Work, 2018–2026</h2></div>
+<div style="margin-top:4px;font-size:11px;color:#72747A;font-family:'Geist',sans-serif">UPPERCASE + 0.14em tracking · weight 500 · color --text-label</div>
+
+<div class="divider"></div>
+<div class="title">Status Pills — Mono</div>
+<div class="status-row">
+  <span class="pill" style="color:#7FB77E;border-color:#7FB77E;background:rgba(127,183,126,0.08)">● Shipped</span>
+  <span class="pill" style="color:#7A93B0;border-color:#7A93B0;background:rgba(122,147,176,0.08)">● Active</span>
+  <span class="pill" style="color:#D9B55A;border-color:#D9B55A;background:rgba(217,181,90,0.08)">● In progress</span>
+  <span class="pill" style="color:#C56A6A;border-color:#C56A6A;background:rgba(197,106,106,0.08)">● Deprecated</span>
+  <span class="pill" style="color:#B4B5B8;border-color:#33343A;background:rgba(180,181,184,0.06)">● In production</span>
+</div>
+<div style="margin-top:8px;font-size:9px;color:#45474D;font-family:'GeistMono',monospace">GeistMono · ALL-CAPS · 0.04em tracking · pill radius 999px</div>
+
+<div class="divider"></div>
+<div class="title">Mono Data</div>
+<div style="font-family:'GeistMono',monospace;font-size:13px;color:#B4B5B8;line-height:1.8">
+  <span style="color:#D9CBA3">99.97%</span> uptime · p99: <span style="color:#D9CBA3">48ms</span> · <span style="color:#D9CBA3">12 yrs</span> in production
+</div>
+</body>
+</html>
