@@ -204,10 +204,20 @@ pub enum EngineAction {
 
 **Risk Gate (sub-stage)**:
 Before the Engine decision is accepted, the Risk Engine evaluates:
-1. Is the system in a state where this action is allowed? (circuit breaker check)
-2. Does this specific action violate any limit? (exposure check, position count, daily loss)
+1. Is the system in a state where this action is allowed? (MonthlyHalt check)
+2. Does this specific action violate policy? (duplicate position, 1x margin
+   availability, monthly drawdown, dynamic slot exhaustion — ADR-0024)
+
+> **2026-07-04 update**: the original text listed "exposure check, position
+> count, daily loss". Static exposure and position-count limits were
+> eliminated by ADR-0024 (MIG-v3#11), and the daily loss check was a spec
+> violation removed in PR #110 — there is no daily loss budget (AGENTS.md
+> §10).
 
 If denied, `EngineAction` is replaced with `RejectTrade { reason: RiskVerdict }`.
+A governed denial re-arms the position's detector with exponential backoff
+(5 s doubling to a 15-minute cap) so a persistent denial cannot hot-loop
+against the OHLCV source and the event store.
 
 ---
 

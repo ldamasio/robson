@@ -148,7 +148,7 @@ The system reacts only to complete events. It does not react to "almost".
           │  RISK ENGINE   │
           │                │
           │  Monthly Check │──── 4% drawdown → MonthlyHalt
-          │  Position Check│──── Max positions, exposure, concentration
+          │  Slot Check    │──── Dynamic slots (ADR-0024), duplicate, 1x margin
           │  Verdict        │
           └───────┬────────┘
                   │
