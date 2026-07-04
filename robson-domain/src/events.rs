@@ -202,6 +202,9 @@ pub enum Event {
         fee: Decimal,
         /// Initial trailing stop price
         initial_stop: Price,
+        /// Entry-time invalidation guard level, if active.
+        #[serde(default)]
+        invalidation_guard_level: Option<Price>,
         /// Binance USD-M Futures position ID (for SafetyNet coordination)
         binance_position_id: Option<String>,
         /// When the fill occurred
@@ -625,6 +628,7 @@ mod tests {
             filled_quantity: Quantity::new(dec!(0.1)).unwrap(),
             fee: dec!(0.001),
             initial_stop: Price::new(dec!(93500)).unwrap(),
+            invalidation_guard_level: None,
             binance_position_id: None,
             timestamp: Utc::now(),
         }
@@ -639,6 +643,9 @@ mod tests {
             entry_price: Price::new(dec!(95000)).unwrap(),
             analysis: TechnicalStopAnalysisAudit {
                 stop_price: Price::new(dec!(93500)).unwrap(),
+                raw_technical_stop: None,
+                invalidation_guard_level: None,
+                effective_stop_basis: None,
                 method: crate::entities::TechnicalStopMethodSnapshot::SwingPoint { level_n: 2 },
                 confidence: crate::entities::TechnicalStopConfidenceSnapshot::High,
                 detected_levels: vec![
@@ -1351,6 +1358,7 @@ mod tests {
             filled_quantity: Quantity::new(dec!(0.1)).unwrap(),
             fee: dec!(0.001),
             initial_stop: Price::new(dec!(93500)).unwrap(),
+            invalidation_guard_level: None,
             binance_position_id: None,
             timestamp: Utc::now(),
         }

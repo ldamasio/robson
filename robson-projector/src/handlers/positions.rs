@@ -656,7 +656,9 @@ pub(crate) async fn handle_entry_filled(pool: &PgPool, envelope: &EventEnvelope)
         }
     })?;
 
-    // Initialize favorable_extreme = fill_price, trailing_stop_price = initial_stop
+    // Initialize favorable_extreme = fill_price, trailing_stop_price =
+    // initial_stop. Persist the entry-time invalidation guard level so restarts
+    // replay the same effective stop (ADR-0042).
     sqlx::query(
         r#"
         UPDATE positions_current
@@ -667,16 +669,18 @@ pub(crate) async fn handle_entry_filled(pool: &PgPool, envelope: &EventEnvelope)
             trailing_stop_price = $4,
             favorable_extreme = $2,
             extreme_at = $3,
-            last_event_id = $5,
-            last_seq = $6,
-            updated_at = $7
-        WHERE position_id = $1 AND last_seq < $6
+            invalidation_guard_level = $5,
+            last_event_id = $6,
+            last_seq = $7,
+            updated_at = $8
+        WHERE position_id = $1 AND last_seq < $7
         "#,
     )
     .bind(payload.position_id)
     .bind(payload.fill_price)
     .bind(payload.timestamp)
     .bind(payload.initial_stop)
+    .bind(payload.invalidation_guard_level)
     .bind(envelope.event_id)
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
@@ -752,7 +756,8 @@ pub(crate) async fn handle_trailing_stop_updated(
         })?;
 
     // Update trailing_stop_price + favorable_extreme (trigger_price is the new
-    // extreme)
+    // extreme). The first trailing advance releases the entry-time invalidation
+    // guard so the stop can tighten freely (ADR-0042).
     sqlx::query(
         r#"
         UPDATE positions_current
@@ -760,6 +765,7 @@ pub(crate) async fn handle_trailing_stop_updated(
             trailing_stop_price = $2,
             favorable_extreme = $3,
             extreme_at = $4,
+            invalidation_guard_level = NULL,
             last_event_id = $5,
             last_seq = $6,
             updated_at = $7

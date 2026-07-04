@@ -191,18 +191,32 @@ impl Daemon<StubExchange, MemoryStore> {
         let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder = default_query_recorder();
-        let risk_config = RiskConfig::new(dec!(10000)).unwrap();
+        // Execution-cost buffer parameters are operator-configured and must
+        // apply in stub mode too, or ADR-0040/0041 behavior silently diverges
+        // from the Binance constructors.
+        let risk_config = RiskConfig::new(dec!(10000))
+            .unwrap()
+            .with_execution_costs(config.engine.taker_fee_rate, config.engine.stop_gap_bps)
+            .expect("invalid ROBSON_TAKER_FEE_RATE / ROBSON_STOP_GAP_BPS configuration")
+            .with_stop_buffer(config.engine.stop_buffer_bps)
+            .expect("invalid ROBSON_STOP_BUFFER_BPS configuration");
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
-        let position_manager = Arc::new(RwLock::new(PositionManager::new(
-            engine,
-            executor,
-            store.clone(),
-            event_bus.clone(),
-            query_recorder,
-            trading_policy,
-        )));
+        let position_manager = Arc::new(RwLock::new(
+            PositionManager::new(
+                engine,
+                executor,
+                store.clone(),
+                event_bus.clone(),
+                query_recorder,
+                trading_policy,
+            )
+            .with_invalidation_guard(
+                config.engine.stop_invalidation_guard_enabled,
+                config.engine.stop_invalidation_lookback_candles,
+            ),
+        ));
 
         Self {
             config,
@@ -228,18 +242,29 @@ impl Daemon<StubExchange, MemoryStore> {
         let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder = default_query_recorder();
-        let risk_config = RiskConfig::new(capital).unwrap();
+        let risk_config = RiskConfig::new(capital)
+            .unwrap()
+            .with_execution_costs(config.engine.taker_fee_rate, config.engine.stop_gap_bps)
+            .expect("invalid ROBSON_TAKER_FEE_RATE / ROBSON_STOP_GAP_BPS configuration")
+            .with_stop_buffer(config.engine.stop_buffer_bps)
+            .expect("invalid ROBSON_STOP_BUFFER_BPS configuration");
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
-        let position_manager = Arc::new(RwLock::new(PositionManager::new(
-            engine,
-            executor,
-            store.clone(),
-            event_bus.clone(),
-            query_recorder,
-            trading_policy,
-        )));
+        let position_manager = Arc::new(RwLock::new(
+            PositionManager::new(
+                engine,
+                executor,
+                store.clone(),
+                event_bus.clone(),
+                query_recorder,
+                trading_policy,
+            )
+            .with_invalidation_guard(
+                config.engine.stop_invalidation_guard_enabled,
+                config.engine.stop_invalidation_lookback_candles,
+            ),
+        ));
 
         Self {
             config,
@@ -280,7 +305,12 @@ impl Daemon<StubExchange, MemoryStore> {
             } else {
                 default_query_recorder()
             };
-        let risk_config = RiskConfig::new(dec!(10000)).unwrap();
+        let risk_config = RiskConfig::new(dec!(10000))
+            .unwrap()
+            .with_execution_costs(config.engine.taker_fee_rate, config.engine.stop_gap_bps)
+            .expect("invalid ROBSON_TAKER_FEE_RATE / ROBSON_STOP_GAP_BPS configuration")
+            .with_stop_buffer(config.engine.stop_buffer_bps)
+            .expect("invalid ROBSON_STOP_BUFFER_BPS configuration");
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
@@ -291,6 +321,10 @@ impl Daemon<StubExchange, MemoryStore> {
             event_bus.clone(),
             query_recorder,
             trading_policy,
+        )
+        .with_invalidation_guard(
+            config.engine.stop_invalidation_guard_enabled,
+            config.engine.stop_invalidation_lookback_candles,
         );
         if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
             pm = pm.with_event_log((**pool).clone(), tenant_id);
@@ -345,7 +379,11 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
                 query_recorder,
                 trading_policy,
             )
-            .with_ohlcv_port(ohlcv_port),
+            .with_ohlcv_port(ohlcv_port)
+            .with_invalidation_guard(
+                config.engine.stop_invalidation_guard_enabled,
+                config.engine.stop_invalidation_lookback_candles,
+            ),
         ));
 
         Self {
@@ -412,7 +450,11 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
             query_recorder,
             trading_policy,
         )
-        .with_ohlcv_port(ohlcv_port);
+        .with_ohlcv_port(ohlcv_port)
+        .with_invalidation_guard(
+            config.engine.stop_invalidation_guard_enabled,
+            config.engine.stop_invalidation_lookback_candles,
+        );
         if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
             pm = pm.with_event_log((**pool).clone(), tenant_id);
         }
@@ -1912,6 +1954,7 @@ mod tests {
             favorable_extreme: Price::new(dec!(110)).unwrap(),
             extreme_at: now,
             insurance_stop_id: None,
+            invalidation_guard_level: None,
             last_emitted_stop: None,
         };
 
@@ -2072,6 +2115,7 @@ mod tests {
             favorable_extreme: Price::new(dec!(101)).unwrap(),
             extreme_at: chrono::Utc::now(),
             insurance_stop_id: None,
+            invalidation_guard_level: None,
             last_emitted_stop: None,
         };
         pos

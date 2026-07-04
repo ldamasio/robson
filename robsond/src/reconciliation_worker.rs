@@ -945,6 +945,7 @@ mod tests {
             favorable_extreme: Price::new(dec!(101)).unwrap(),
             extreme_at: Utc::now(),
             insurance_stop_id: None,
+            invalidation_guard_level: None,
             last_emitted_stop: None,
         };
         position

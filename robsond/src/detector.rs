@@ -48,9 +48,10 @@
 use std::sync::Arc;
 
 use robson_domain::{
-    AnchorType, DetectorSignal, EntryPolicy, EntryPolicyConfig, Event, Position, PositionId, Price,
-    Side, SignalEvaluationOutcome, StopAnchor, Symbol, TechnicalStopAnalysisAudit,
-    TechnicalStopConfidenceSnapshot, TechnicalStopConfigSnapshot, TechnicalStopMethodSnapshot,
+    entities::EffectiveStopBasis, AnchorType, Candle, DetectorSignal, EntryPolicy,
+    EntryPolicyConfig, Event, Position, PositionId, Price, Side, SignalEvaluationOutcome,
+    StopAnchor, Symbol, TechnicalStopAnalysisAudit, TechnicalStopConfidenceSnapshot,
+    TechnicalStopConfigSnapshot, TechnicalStopMethodSnapshot,
 };
 use robson_engine::{
     stop_quality_classifier::{classify_stop_quality, StopQualityInput, StopQualityThresholds},
@@ -177,6 +178,12 @@ pub struct DetectorTask {
     cancel_token: CancellationToken,
     /// Deterministic strategy registry for this detector.
     strategy_registry: StrategyRegistry,
+    /// Whether the entry-time invalidation guard clamps the effective stop
+    /// beyond a recent adverse extreme (ADR-0042).
+    stop_invalidation_guard_enabled: bool,
+    /// Number of 15m candles (incl. the forming candle) used to sample the
+    /// recent adverse extreme when the guard is enabled (ADR-0042).
+    stop_invalidation_lookback_candles: usize,
 }
 
 impl DetectorTask {
@@ -223,7 +230,25 @@ impl DetectorTask {
             ohlcv_port,
             cancel_token,
             strategy_registry,
+            // Guard disabled by default; the daemon enables it per
+            // `EngineConfig` via `with_invalidation_guard`.
+            stop_invalidation_guard_enabled: false,
+            stop_invalidation_lookback_candles: 20,
         }
+    }
+
+    /// Configure the entry-time invalidation guard (ADR-0042).
+    ///
+    /// When enabled, `create_signal` samples the recent adverse extreme
+    /// (highest high for shorts / lowest low for longs) over the last
+    /// `lookback_candles` 15m candles — including the forming candle — and
+    /// records it in the technical-stop audit so the engine can clamp the
+    /// effective stop beyond it. Disabled is byte-for-byte identical to the
+    /// historical behavior.
+    pub fn with_invalidation_guard(mut self, enabled: bool, lookback_candles: usize) -> Self {
+        self.stop_invalidation_guard_enabled = enabled;
+        self.stop_invalidation_lookback_candles = lookback_candles.max(1);
+        self
     }
 
     /// Create detector directly from an armed position.
@@ -600,7 +625,8 @@ impl DetectorTask {
             DaemonError::Detector(format!("strategy reference price is invalid: {}", e))
         })?;
 
-        let analysis = self.compute_technical_stop(entry_price, side, &self.config.symbol).await?;
+        let (analysis, guard_level) =
+            self.compute_technical_stop(entry_price, side, &self.config.symbol).await?;
 
         // Shadow metadata: StopAnchor + StopQuality (ADR-0035, shadow-only).
         let stop_anchor = Self::build_stop_anchor(&analysis, side);
@@ -637,6 +663,17 @@ impl DetectorTask {
         audit.stop_anchor = stop_anchor.map(Box::new);
         audit.stop_quality = Some(Box::new(classification));
 
+        // ADR-0042 invalidation guard audit fields. When the guard is active,
+        // record the raw analyzer stop, the sampled guard level, and which
+        // level forms the effective basis before buffering. Disabled → all
+        // three stay None (byte-identical to the historical audit).
+        if let Some(guard) = guard_level {
+            audit.raw_technical_stop = Some(analysis.stop_price);
+            audit.invalidation_guard_level = Some(guard);
+            audit.effective_stop_basis =
+                Some(Self::effective_stop_basis(side, analysis.stop_price, guard));
+        }
+
         Ok(DetectorSignal::new(
             self.config.position_id,
             self.config.symbol.clone(),
@@ -648,23 +685,73 @@ impl DetectorTask {
     }
 
     /// Compute the chart-derived stop for the detector signal.
+    ///
+    /// Returns the analyzer result and, when the invalidation guard is
+    /// enabled (ADR-0042), the sampled recent adverse extreme to clamp the
+    /// effective stop beyond. The guard is `None` when disabled.
     async fn compute_technical_stop(
         &self,
         entry_price: Price,
         side: Side,
         symbol: &Symbol,
-    ) -> DaemonResult<TechnicalStopAnalysis> {
+    ) -> DaemonResult<(TechnicalStopAnalysis, Option<Price>)> {
         let candles = self
             .ohlcv_port
             .fetch_candles(symbol, CandleInterval::FifteenMinutes, 100)
             .await?;
-        TechnicalStopAnalyzer::analyze(
+        let analysis = TechnicalStopAnalyzer::analyze(
             &candles,
             entry_price,
             side,
             &self.config.technical_stop_config,
         )
-        .map_err(|e| DaemonError::Detector(e.to_string()))
+        .map_err(|e| DaemonError::Detector(e.to_string()))?;
+
+        // ADR-0042 invalidation guard: sample the recent adverse extreme once
+        // at signal time. Disabled → None (historical behavior).
+        let guard_level = if self.stop_invalidation_guard_enabled {
+            Self::recent_adverse_extreme(&candles, side, self.stop_invalidation_lookback_candles)
+        } else {
+            None
+        };
+
+        Ok((analysis, guard_level))
+    }
+
+    /// Highest high (short) / lowest low (long) over the last `lookback`
+    /// candles, sampled once at signal time.
+    ///
+    /// # Constraint — the forming candle must be in the slice
+    ///
+    /// The window is taken from the TAIL of the fetched candles so it includes
+    /// the forming (in-progress) candle. Binance `/fapi/v1/klines` returns the
+    /// in-progress candle as the last element, so `fetch_candles(... 100)`
+    /// satisfies this and "include current" is real. If a future OHLCV source
+    /// returns only closed candles, an explicit current-candle high/low fetch
+    /// must be added here before reading the tail window.
+    fn recent_adverse_extreme(candles: &[Candle], side: Side, lookback: usize) -> Option<Price> {
+        let extreme = match side {
+            // SHORT: invalidation is a breakout ABOVE a recent high.
+            Side::Short => candles.iter().rev().take(lookback.max(1)).map(|c| c.high).max(),
+            // LONG: invalidation is a breakout BELOW a recent low.
+            Side::Long => candles.iter().rev().take(lookback.max(1)).map(|c| c.low).min(),
+        }?;
+        Price::new(extreme).ok()
+    }
+
+    /// Which level forms the effective stop basis before buffering, mirroring
+    /// the domain clamp in `effective_stop_price_with_guard`: the guard binds
+    /// only when it lies beyond the technical stop on the adverse side.
+    fn effective_stop_basis(side: Side, technical: Price, guard: Price) -> EffectiveStopBasis {
+        let guard_binds = match side {
+            Side::Short => guard.as_decimal() > technical.as_decimal(),
+            Side::Long => guard.as_decimal() < technical.as_decimal(),
+        };
+        if guard_binds {
+            EffectiveStopBasis::InvalidationGuard
+        } else {
+            EffectiveStopBasis::TechnicalStop
+        }
     }
 
     fn build_technical_stop_audit(
@@ -673,6 +760,11 @@ impl DetectorTask {
     ) -> TechnicalStopAnalysisAudit {
         TechnicalStopAnalysisAudit {
             stop_price: analysis.stop_price,
+            // Invalidation guard audit (ADR-0042): populated by `create_signal`
+            // when the guard is active; None (default) here.
+            raw_technical_stop: None,
+            invalidation_guard_level: None,
+            effective_stop_basis: None,
             method: Self::map_technical_stop_method(analysis.method),
             confidence: Self::map_technical_stop_confidence(analysis.confidence),
             detected_levels: analysis.detected_levels.clone(),
@@ -987,7 +1079,7 @@ mod tests {
         let detector = DetectorTask::new(config, event_bus, create_test_ohlcv(), cancel_token);
 
         let entry = Price::new(dec!(100)).unwrap();
-        let stop = detector
+        let (analysis, guard) = detector
             .compute_technical_stop(
                 entry,
                 Side::Long,
@@ -996,10 +1088,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(stop.stop_price.as_decimal(), dec!(90));
-        assert_eq!(stop.method, AnalyzerTechnicalStopMethod::SwingPoint { level_n: 2 });
-        assert_eq!(stop.confidence, AnalyzerStopConfidence::High);
-        assert_eq!(stop.detected_levels.len(), 2);
+        assert_eq!(analysis.stop_price.as_decimal(), dec!(90));
+        assert_eq!(analysis.method, AnalyzerTechnicalStopMethod::SwingPoint { level_n: 2 });
+        assert_eq!(analysis.confidence, AnalyzerStopConfidence::High);
+        assert_eq!(analysis.detected_levels.len(), 2);
+        // Guard disabled by default → no recent extreme sampled.
+        assert!(guard.is_none());
     }
 
     #[tokio::test]
@@ -1064,7 +1158,7 @@ mod tests {
         let detector = DetectorTask::new(config, event_bus, create_test_ohlcv(), cancel_token);
 
         let entry = Price::new(dec!(100)).unwrap();
-        let stop = detector
+        let (analysis, guard) = detector
             .compute_technical_stop(
                 entry,
                 Side::Short,
@@ -1073,10 +1167,12 @@ mod tests {
             .await
             .unwrap();
 
-        assert_eq!(stop.stop_price.as_decimal(), dec!(110));
-        assert_eq!(stop.method, AnalyzerTechnicalStopMethod::SwingPoint { level_n: 2 });
-        assert_eq!(stop.confidence, AnalyzerStopConfidence::High);
-        assert_eq!(stop.detected_levels.len(), 2);
+        assert_eq!(analysis.stop_price.as_decimal(), dec!(110));
+        assert_eq!(analysis.method, AnalyzerTechnicalStopMethod::SwingPoint { level_n: 2 });
+        assert_eq!(analysis.confidence, AnalyzerStopConfidence::High);
+        assert_eq!(analysis.detected_levels.len(), 2);
+        // Guard disabled by default → no recent extreme sampled.
+        assert!(guard.is_none());
     }
 
     #[tokio::test]
@@ -1690,5 +1786,166 @@ mod tests {
         let signal = detector.create_signal(decision).await.unwrap();
         assert_eq!(signal.entry_price, Price::new(dec!(100)).unwrap());
         assert_eq!(signal.stop_loss, Price::new(dec!(90)).unwrap());
+    }
+
+    // ADR-0042 Invalidation Guard Tests
+
+    /// 100 candles whose last 20 carry the given recent high/low (the rest are
+    /// flat at 100). The last element is the forming candle.
+    fn create_guard_test_candles(recent_high: Decimal, recent_low: Decimal) -> Vec<Candle> {
+        let symbol = robson_domain::Symbol::from_pair("BTCUSDT").unwrap();
+        let now = Utc::now();
+        (0..100)
+            .map(|i| {
+                let open_time = now + Duration::minutes(i);
+                let (high, low) = if i >= 80 {
+                    (recent_high, recent_low)
+                } else {
+                    (dec!(100), dec!(100))
+                };
+                Candle::new(
+                    symbol.clone(),
+                    dec!(100),
+                    high,
+                    low,
+                    dec!(100),
+                    dec!(100),
+                    10,
+                    open_time,
+                    open_time + Duration::minutes(15),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn recent_adverse_extreme_short_picks_highest_high() {
+        let candles = create_guard_test_candles(dec!(120), dec!(80));
+        assert_eq!(
+            DetectorTask::recent_adverse_extreme(&candles, Side::Short, 20),
+            Some(Price::new(dec!(120)).unwrap())
+        );
+    }
+
+    #[test]
+    fn recent_adverse_extreme_long_picks_lowest_low() {
+        let candles = create_guard_test_candles(dec!(120), dec!(80));
+        assert_eq!(
+            DetectorTask::recent_adverse_extreme(&candles, Side::Long, 20),
+            Some(Price::new(dec!(80)).unwrap())
+        );
+    }
+
+    #[test]
+    fn recent_adverse_extreme_includes_forming_candle() {
+        // The forming candle (last element) carries the extreme; the lookback
+        // window reaches it from the tail, so "include current" is real.
+        let symbol = robson_domain::Symbol::from_pair("BTCUSDT").unwrap();
+        let now = Utc::now();
+        let candles: Vec<Candle> = (0..100)
+            .map(|i| {
+                let open_time = now + Duration::minutes(i);
+                let high = if i == 99 { dec!(150) } else { dec!(100) };
+                Candle::new(
+                    symbol.clone(),
+                    dec!(100),
+                    high,
+                    dec!(100),
+                    dec!(100),
+                    dec!(1),
+                    1,
+                    open_time,
+                    open_time + Duration::minutes(15),
+                )
+            })
+            .collect();
+        assert_eq!(
+            DetectorTask::recent_adverse_extreme(&candles, Side::Short, 20),
+            Some(Price::new(dec!(150)).unwrap())
+        );
+    }
+
+    #[test]
+    fn effective_stop_basis_binds_only_when_guard_beyond_technical() {
+        use robson_domain::entities::EffectiveStopBasis;
+
+        // SHORT: guard binds when above the technical stop.
+        let short_tech = Price::new(dec!(110)).unwrap();
+        assert_eq!(
+            DetectorTask::effective_stop_basis(
+                Side::Short,
+                short_tech,
+                Price::new(dec!(115)).unwrap()
+            ),
+            EffectiveStopBasis::InvalidationGuard
+        );
+        assert_eq!(
+            DetectorTask::effective_stop_basis(
+                Side::Short,
+                short_tech,
+                Price::new(dec!(105)).unwrap()
+            ),
+            EffectiveStopBasis::TechnicalStop
+        );
+
+        // LONG: guard binds when below the technical stop.
+        let long_tech = Price::new(dec!(90)).unwrap();
+        assert_eq!(
+            DetectorTask::effective_stop_basis(
+                Side::Long,
+                long_tech,
+                Price::new(dec!(85)).unwrap()
+            ),
+            EffectiveStopBasis::InvalidationGuard
+        );
+        assert_eq!(
+            DetectorTask::effective_stop_basis(
+                Side::Long,
+                long_tech,
+                Price::new(dec!(95)).unwrap()
+            ),
+            EffectiveStopBasis::TechnicalStop
+        );
+    }
+
+    #[tokio::test]
+    async fn create_signal_carries_invalidation_guard_when_enabled() {
+        use robson_domain::entities::EffectiveStopBasis;
+        use robson_engine::signal_strategy::SignalReason;
+
+        let config = DetectorConfig {
+            position_id: Uuid::now_v7(),
+            symbol: robson_domain::Symbol::from_pair("BTCUSDT").unwrap(),
+            side: Side::Long,
+            ma_fast_period: 9,
+            ma_slow_period: 21,
+            technical_stop_config: TechnicalStopConfig::default(),
+            entry_policy: EntryPolicyConfig::default(),
+        };
+        let candles = create_test_candles();
+        let ohlcv: Arc<dyn OhlcvPort> = Arc::new(StubOhlcv::new(candles.clone()));
+        let event_bus = Arc::new(EventBus::new(10));
+        let cancel_token = create_test_cancel_token();
+        let detector = DetectorTask::new(config, event_bus, ohlcv, cancel_token)
+            .with_invalidation_guard(true, 20);
+
+        let decision = SignalDecision::SignalConfirmed {
+            side: Side::Long,
+            reason: SignalReason::Immediate,
+            observed_at: Utc::now(),
+            reference_price: dec!(100),
+        };
+
+        let signal = detector.create_signal(decision).await.unwrap();
+        let audit = signal.technical_stop_analysis.as_ref().expect("audit present");
+
+        // Guard enabled → the sampled recent low is recorded, plus the raw
+        // technical stop and basis.
+        let expected_guard = DetectorTask::recent_adverse_extreme(&candles, Side::Long, 20);
+        assert_eq!(audit.invalidation_guard_level, expected_guard);
+        assert_eq!(audit.raw_technical_stop, Some(signal.stop_loss));
+        // The last 20 candles are flat at 100 (recent low 100), above the
+        // technical stop (90) → the guard does not bind.
+        assert_eq!(audit.effective_stop_basis, Some(EffectiveStopBasis::TechnicalStop));
     }
 }

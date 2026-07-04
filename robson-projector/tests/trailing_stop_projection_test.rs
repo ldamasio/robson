@@ -217,6 +217,151 @@ async fn test_trailing_stop_updated_monotonic(pool: PgPool) {
     assert_eq!(row2.1, Some(dec!(97000.0)));
 }
 
+
+/// Test that EntryFilled persists an active invalidation guard level
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn test_entry_filled_persists_invalidation_guard_level(pool: PgPool) {
+    let tenant_id = Uuid::now_v7();
+    let account_id = Uuid::now_v7();
+    let position_id = Uuid::now_v7();
+    let strategy_id = Uuid::now_v7();
+
+    let opened_event = Event::new(
+        tenant_id,
+        format!("position:{}", position_id),
+        "POSITION_OPENED",
+        serde_json::json!({
+            "position_id": position_id,
+            "tenant_id": tenant_id,
+            "account_id": account_id,
+            "strategy_id": strategy_id,
+            "symbol": "BTCUSDT",
+            "side": "short",
+            "entry_price": null,
+            "entry_quantity": null,
+            "entry_filled_at": null,
+            "technical_stop_price": "62214.70",
+            "technical_stop_distance": "305.60",
+            "entry_order_id": null,
+            "stop_loss_order_id": null
+        }),
+    )
+    .with_actor(ActorType::Daemon, Some("test".to_string()));
+
+    append_and_project(&pool, opened_event).await;
+
+    let filled_event = Event::new(
+        tenant_id,
+        format!("position:{}", position_id),
+        "entry_filled",
+        serde_json::json!({
+            "position_id": position_id,
+            "order_id": Uuid::now_v7(),
+            "fill_price": "61909.10",
+            "filled_quantity": "0.1",
+            "fee": "0.001",
+            "initial_stop": "62214.70",
+            "invalidation_guard_level": "62386.70",
+            "timestamp": Utc::now()
+        }),
+    )
+    .with_actor(ActorType::Daemon, Some("test".to_string()));
+
+    append_and_project(&pool, filled_event).await;
+
+    let row: (String, Option<rust_decimal::Decimal>) = sqlx::query_as(
+        "SELECT state, invalidation_guard_level FROM positions_current WHERE position_id = $1",
+    )
+    .bind(position_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(row.0, "active");
+    assert_eq!(row.1, Some(dec!(62386.70)));
+}
+
+/// Test that TrailingStopUpdated releases the invalidation guard level
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn test_trailing_stop_updated_releases_invalidation_guard(pool: PgPool) {
+    let tenant_id = Uuid::now_v7();
+    let account_id = Uuid::now_v7();
+    let position_id = Uuid::now_v7();
+    let strategy_id = Uuid::now_v7();
+
+    let opened_event = Event::new(
+        tenant_id,
+        format!("position:{}", position_id),
+        "POSITION_OPENED",
+        serde_json::json!({
+            "position_id": position_id,
+            "tenant_id": tenant_id,
+            "account_id": account_id,
+            "strategy_id": strategy_id,
+            "symbol": "BTCUSDT",
+            "side": "short",
+            "entry_price": null,
+            "entry_quantity": null,
+            "entry_filled_at": null,
+            "technical_stop_price": "62214.70",
+            "technical_stop_distance": "305.60",
+            "entry_order_id": null,
+            "stop_loss_order_id": null
+        }),
+    )
+    .with_actor(ActorType::Daemon, Some("test".to_string()));
+
+    append_and_project(&pool, opened_event).await;
+
+    let filled_event = Event::new(
+        tenant_id,
+        format!("position:{}", position_id),
+        "entry_filled",
+        serde_json::json!({
+            "position_id": position_id,
+            "order_id": Uuid::now_v7(),
+            "fill_price": "61909.10",
+            "filled_quantity": "0.1",
+            "fee": "0.001",
+            "initial_stop": "62214.70",
+            "invalidation_guard_level": "62386.70",
+            "timestamp": Utc::now()
+        }),
+    )
+    .with_actor(ActorType::Daemon, Some("test".to_string()));
+
+    append_and_project(&pool, filled_event).await;
+
+    let update = Event::new(
+        tenant_id,
+        format!("position:{}", position_id),
+        "trailing_stop_updated",
+        serde_json::json!({
+            "position_id": position_id,
+            "previous_stop": "62214.70",
+            "new_stop": "62000.00",
+            "trigger_price": "61800.00",
+            "timestamp": Utc::now()
+        }),
+    )
+    .with_actor(ActorType::Daemon, Some("test".to_string()));
+
+    append_and_project(&pool, update).await;
+
+    let row: (Option<rust_decimal::Decimal>, Option<rust_decimal::Decimal>) = sqlx::query_as(
+        "SELECT trailing_stop_price, invalidation_guard_level FROM positions_current WHERE position_id = $1"
+    )
+    .bind(position_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+
+    assert_eq!(row.0, Some(dec!(62000.00)));
+    assert_eq!(row.1, None);
+}
+
 /// Test that ExitTriggered marks position as exiting
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]

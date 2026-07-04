@@ -182,8 +182,9 @@ impl Position {
 /// let entry = Price::new(dec!(95000)).unwrap();
 /// let stop = Price::new(dec!(93500)).unwrap();
 /// let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+/// let effective_stop_level = tech_stop.initial_stop;
 ///
-/// let size = calculate_position_size(&config, &entry, &tech_stop).unwrap();
+/// let size = calculate_position_size(&config, &entry, &tech_stop, effective_stop_level).unwrap();
 ///
 /// // Max Risk = $10,000 × 1% = $100
 /// // Worst loss per unit = $1,500 + $93.50 (10 bps of stop)
@@ -209,11 +210,15 @@ pub fn calculate_position_size(
     risk_config: &RiskConfig,
     entry_price: &Price,
     tech_stop: &TechnicalStopDistance,
+    effective_stop_level: Price,
 ) -> Result<Quantity, DomainError> {
     // Validate tech stop first
     tech_stop.validate()?;
 
-    let stop_distance = tech_stop.distance;
+    let effective_stop =
+        TechnicalStopDistance::from_entry_and_stop(*entry_price, effective_stop_level);
+    effective_stop.validate()?;
+    let stop_distance = effective_stop.distance;
 
     if stop_distance <= rust_decimal::Decimal::ZERO {
         return Err(DomainError::PositionSizingError("Stop distance must be positive".to_string()));
@@ -226,11 +231,11 @@ pub fn calculate_position_size(
 
     // Golden Rule with execution-cost buffer (ADR-0039, Policy 10): the 1%
     // budget covers worst expected realized loss — chart distance, the
-    // executable-stop buffer beyond the technical level, expected gap past
+    // executable-stop buffer beyond the effective stop level, expected gap past
     // the stop, and round-trip taker fees — then the available 1x margin
     // caps the size. The exit-fee base uses max(entry, stop) so the
     // buffer stays conservative for both sides.
-    let stop = tech_stop.initial_stop.as_decimal();
+    let stop = effective_stop_level.as_decimal();
     let stop_buffer = stop * risk_config.stop_buffer_bps() / rust_decimal::Decimal::from(10_000);
     let gap_allowance = stop * risk_config.stop_gap_bps() / rust_decimal::Decimal::from(10_000);
     let round_trip_fees_per_unit = risk_config.taker_fee_rate() * (entry + entry.max(stop));
@@ -303,6 +308,9 @@ pub enum PositionState {
         /// Exchange-assigned order id of the protective insurance stop
         /// (ADR-0039). `None` while no stop is live on the exchange.
         insurance_stop_id: Option<String>,
+        /// Entry-time invalidation guard level, if active.
+        #[serde(default)]
+        invalidation_guard_level: Option<Price>,
         /// Last trailing stop price that was emitted (for idempotency)
         last_emitted_stop: Option<Price>,
     },
@@ -762,6 +770,16 @@ pub enum TechnicalStopConfidenceSnapshot {
     Low,
 }
 
+/// Stop level used as the basis for effective executable stop pricing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EffectiveStopBasis {
+    /// The analyzer's chart-derived technical stop was used directly.
+    TechnicalStop,
+    /// The invalidation guard clamped the effective stop basis.
+    InvalidationGuard,
+}
+
 // =============================================================================
 // Stop-Aware Entry Types (ADR-0035)
 // =============================================================================
@@ -856,6 +874,15 @@ pub struct TechnicalStopConfigSnapshot {
 pub struct TechnicalStopAnalysisAudit {
     /// Absolute stop price selected by the analyzer.
     pub stop_price: Price,
+    /// Raw analyzer stop before any invalidation guard clamp.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub raw_technical_stop: Option<Price>,
+    /// Optional invalidation guard level sampled at signal time.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub invalidation_guard_level: Option<Price>,
+    /// Which level forms the effective stop basis before buffering.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub effective_stop_basis: Option<EffectiveStopBasis>,
     /// Method used to derive the stop.
     pub method: TechnicalStopMethodSnapshot,
     /// Confidence assigned to the result.
@@ -1048,7 +1075,8 @@ mod tests {
         let stop = Price::new(dec!(93500)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
-        let size = calculate_position_size(&config, &entry, &tech_stop).unwrap();
+        let size =
+            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
 
         // Expected: $100 risk / ($1,500 distance + $93.50 gap allowance
         // (10 bps of stop) + $95 round-trip fees (0.05% × $190,000))
@@ -1066,7 +1094,8 @@ mod tests {
         let stop = Price::new(dec!(92000)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
-        let size = calculate_position_size(&config, &entry, &tech_stop).unwrap();
+        let size =
+            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
 
         // Expected: $100 / ($3,000 + $92 gap + $95 fees)
         let expected = dec!(100) / (dec!(3000) + dec!(92) + dec!(95));
@@ -1083,7 +1112,8 @@ mod tests {
         let stop = Price::new(dec!(94500)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
-        let size = calculate_position_size(&config, &entry, &tech_stop).unwrap();
+        let size =
+            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
 
         let expected = config.capital() / entry.as_decimal();
         let loss = size.as_decimal() * dec!(500);
@@ -1100,7 +1130,8 @@ mod tests {
         let stop = Price::new(dec!(93500)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
-        let size = calculate_position_size(&config, &entry, &tech_stop).unwrap();
+        let size =
+            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
 
         // Expected: $500 (1% of 50k) / ($1,500 + $93.50 gap + $95 fees)
         let expected = dec!(500) / (dec!(1500) + dec!(93.5) + dec!(95));
@@ -1139,7 +1170,8 @@ mod tests {
             let entry = Price::new(entry).unwrap();
             let stop = Price::new(stop).unwrap();
             let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
-            let size = calculate_position_size(&config, &entry, &tech_stop).unwrap();
+            let size = calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop)
+                .unwrap();
             let qty = size.as_decimal();
 
             let gap = stop.as_decimal() * config.stop_gap_bps() / dec!(10000);
@@ -1167,8 +1199,10 @@ mod tests {
         let stop = Price::new(dec!(93500)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
-        let size_base = calculate_position_size(&base, &entry, &tech_stop).unwrap();
-        let size_buffered = calculate_position_size(&buffered, &entry, &tech_stop).unwrap();
+        let size_base =
+            calculate_position_size(&base, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
+        let size_buffered =
+            calculate_position_size(&buffered, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
         assert!(size_buffered.as_decimal() < size_base.as_decimal());
 
         let buffer_amount = dec!(93500) * dec!(20) / dec!(10000); // 187.00
@@ -1179,13 +1213,50 @@ mod tests {
     }
 
     #[test]
+    fn test_position_size_uses_binding_guard_distance() {
+        let config = RiskConfig::new(dec!(10000)).unwrap().with_stop_buffer(dec!(20)).unwrap();
+
+        let entry = Price::new(dec!(95000)).unwrap();
+        let technical = Price::new(dec!(96500)).unwrap();
+        let guard = Price::new(dec!(98000)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, technical);
+
+        let size_technical =
+            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
+        let size_guarded = calculate_position_size(&config, &entry, &tech_stop, guard).unwrap();
+        assert!(size_guarded.as_decimal() < size_technical.as_decimal());
+
+        let effective_distance = dec!(3000);
+        let buffer_amount = dec!(98000) * dec!(20) / dec!(10000);
+        let gap = dec!(98000) * config.stop_gap_bps() / dec!(10000);
+        let fees = config.taker_fee_rate() * (dec!(95000) + dec!(98000));
+        let worst_loss =
+            size_guarded.as_decimal() * (effective_distance + buffer_amount + gap + fees);
+        assert_eq!(worst_loss.round_dp(2), dec!(100));
+    }
+
+    #[test]
+    fn test_position_size_rejects_over_wide_effective_guard_distance() {
+        let config = RiskConfig::new(dec!(10000)).unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let technical = Price::new(dec!(105)).unwrap();
+        let guard = Price::new(dec!(111)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, technical);
+
+        let result = calculate_position_size(&config, &entry, &tech_stop, guard);
+
+        assert!(matches!(result, Err(DomainError::InvalidTechnicalStopDistance(_))));
+    }
+
+    #[test]
     fn test_calculate_position_size_caps_by_margin() {
         let config = RiskConfig::new(dec!(351.92170492)).unwrap();
         let entry = Price::new(dec!(59623.10)).unwrap();
         let stop = Price::new(dec!(59295.60)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
-        let size = calculate_position_size(&config, &entry, &tech_stop).unwrap();
+        let size =
+            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
         let qty = size.as_decimal();
         let risk_loss = qty * dec!(327.50);
         let margin_cap = config.capital() / entry.as_decimal();

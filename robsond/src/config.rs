@@ -115,6 +115,14 @@ pub struct EngineConfig {
     /// (env: ROBSON_STOP_BUFFER_BPS, default 0 = execute at the technical
     /// level). ADR-0041.
     pub stop_buffer_bps: Decimal,
+    /// Whether the entry-time invalidation guard clamps the effective stop
+    /// beyond a recent adverse extreme (env:
+    /// `ROBSON_STOP_INVALIDATION_GUARD_ENABLED`, default false). ADR-0042.
+    pub stop_invalidation_guard_enabled: bool,
+    /// Number of 15m candles (incl. the forming candle) used to sample the
+    /// recent adverse extreme when the guard is enabled (env:
+    /// `ROBSON_STOP_INVALIDATION_LOOKBACK_CANDLES`, default 20). ADR-0042.
+    pub stop_invalidation_lookback_candles: usize,
 }
 
 /// Technical stop policy configuration loaded from environment (ADR-0024).
@@ -307,6 +315,8 @@ impl Config {
                 taker_fee_rate: Decimal::new(5, 4),         // 0.05% per fill
                 stop_gap_bps: Decimal::from(10),            // 10 bps
                 stop_buffer_bps: Decimal::ZERO,             // execute at technical stop
+                stop_invalidation_guard_enabled: false,
+                stop_invalidation_lookback_candles: 20,
             },
             tech_stop: TechStopConfigEnv {
                 min_stop_pct: Decimal::new(1, 1), // 0.1%
@@ -393,12 +403,27 @@ impl Config {
         // technical stop. Default 0 keeps the historical behavior.
         let stop_buffer_bps = Self::load_decimal_env("ROBSON_STOP_BUFFER_BPS", Decimal::ZERO)?;
 
+        // Invalidation guard (ADR-0042): opt-in clamp of the effective stop
+        // beyond a recent adverse extreme. Defaults keep the historical
+        // behavior (disabled, 20-candle lookback).
+        let stop_invalidation_guard_enabled = env::var("ROBSON_STOP_INVALIDATION_GUARD_ENABLED")
+            .ok()
+            .map(|v| matches!(v.to_lowercase().as_str(), "1" | "true" | "yes"))
+            .unwrap_or(false);
+        let stop_invalidation_lookback_candles =
+            env::var("ROBSON_STOP_INVALIDATION_LOOKBACK_CANDLES")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(20);
+
         Ok(EngineConfig {
             min_tech_stop_percent: min_tech_stop,
             max_tech_stop_percent: max_tech_stop,
             taker_fee_rate,
             stop_gap_bps,
             stop_buffer_bps,
+            stop_invalidation_guard_enabled,
+            stop_invalidation_lookback_candles,
         })
     }
 
@@ -630,6 +655,8 @@ impl Default for Config {
                 taker_fee_rate: Decimal::new(5, 4),         // 0.05% per fill
                 stop_gap_bps: Decimal::from(10),            // 10 bps
                 stop_buffer_bps: Decimal::ZERO,             // execute at technical stop
+                stop_invalidation_guard_enabled: false,
+                stop_invalidation_lookback_candles: 20,
             },
             tech_stop: TechStopConfigEnv {
                 min_stop_pct: Decimal::ONE,      // 1%

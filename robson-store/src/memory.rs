@@ -240,6 +240,7 @@ impl MemoryStore {
                 filled_quantity,
                 fee,
                 initial_stop,
+                invalidation_guard_level,
                 binance_position_id,
                 timestamp,
                 ..
@@ -260,6 +261,9 @@ impl MemoryStore {
                         favorable_extreme: *fill_price,
                         extreme_at: *timestamp,
                         insurance_stop_id: None,
+                        // Preserve the entry-time guard so in-memory state and
+                        // crash recovery agree on the effective stop (ADR-0042).
+                        invalidation_guard_level: *invalidation_guard_level,
                         last_emitted_stop: Some(*initial_stop),
                     };
                     position.updated_at = chrono::Utc::now();
@@ -282,6 +286,7 @@ impl MemoryStore {
                         ref mut trailing_stop,
                         ref mut favorable_extreme,
                         ref mut extreme_at,
+                        ref mut invalidation_guard_level,
                         ref mut last_emitted_stop,
                         ..
                     } = position.state
@@ -290,6 +295,9 @@ impl MemoryStore {
                         *trailing_stop = *new_stop;
                         *favorable_extreme = *trigger_price;
                         *extreme_at = *timestamp;
+                        // The first trailing advance releases the entry-time
+                        // guard so the stop can tighten freely (ADR-0042).
+                        *invalidation_guard_level = None;
                         *last_emitted_stop = Some(*new_stop);
                         position.updated_at = chrono::Utc::now();
                         positions.insert(*position_id, position);
@@ -719,6 +727,7 @@ mod tests {
             favorable_extreme: Price::new(dec!(95000)).unwrap(),
             extreme_at: Utc::now(),
             insurance_stop_id: None,
+            invalidation_guard_level: None,
             last_emitted_stop: None,
         };
 

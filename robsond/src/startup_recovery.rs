@@ -324,12 +324,20 @@ where
 {
     let position_id = position.id;
     // Executable price: technical trailing stop offset by the configured
-    // buffer. The heal must compare AND place with the same derivation the
-    // engine uses, or every restart would replace a correctly-priced stop.
-    let executable_stop = robson_domain::value_objects::effective_stop_price(
+    // buffer, clamped to the entry-time invalidation guard while it is still
+    // active (ADR-0042). The heal must compare AND place with the same
+    // derivation the engine uses, or every restart would replace a
+    // correctly-priced stop. The guard is hydrated into Active from the
+    // persisted column on replay.
+    let invalidation_guard_level = match &position.state {
+        PositionState::Active { invalidation_guard_level, .. } => *invalidation_guard_level,
+        _ => None,
+    };
+    let executable_stop = robson_domain::value_objects::effective_stop_price_with_guard(
         position.side,
         trailing_stop,
         pm.risk_config_snapshot().stop_buffer_bps(),
+        invalidation_guard_level,
     );
     let existing_id = match &position.state {
         PositionState::Active { insurance_stop_id, .. } => {
@@ -572,6 +580,7 @@ mod tests {
             favorable_extreme: Price::new(entry).unwrap(),
             extreme_at,
             insurance_stop_id: None,
+            invalidation_guard_level: None,
             last_emitted_stop: Some(Price::new(stop).unwrap()),
         };
 
@@ -876,6 +885,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn heal_uses_guard_aware_executable_stop_no_spurious_replace() {
+        let pm = heal_manager().await;
+        let symbol = btcusdt();
+
+        // Active Long whose entry-time guard clamps the effective stop BELOW
+        // the technical trailing stop. Buffer is 0, so the executable stop is
+        // the clamped base: min(76158.25, 76000) = 76000.
+        let technical = dec!(76158.25);
+        let guard = Price::new(dec!(76000.00)).unwrap();
+        let effective = guard;
+
+        // Place a real protective stop exactly at the GUARD-AWARE executable
+        // price — NOT the technical trailing stop. Under the old (non-guard)
+        // derivation the heal would compute 76158.25 and spuriously replace
+        // this correctly-priced stop.
+        let stop = pm
+            .exchange()
+            .place_stop_market_order(
+                &symbol,
+                OrderSide::Sell,
+                Quantity::new(dec!(0.01)).unwrap(),
+                effective,
+                "ins-guard",
+            )
+            .await
+            .unwrap();
+        let stop_id = stop.exchange_order_id.clone();
+
+        let mut position = btcusdt_long_position(Uuid::now_v7());
+        position = with_insurance_stop(position, &stop_id);
+        if let PositionState::Active { invalidation_guard_level, .. } = &mut position.state {
+            *invalidation_guard_level = Some(guard);
+        }
+        let position_id = position.id;
+        pm.store().positions().save(&position).await.unwrap();
+
+        let closed = heal_insurance_stop(&pm, &position, Price::new(technical).unwrap()).await;
+
+        assert!(!closed);
+        assert!(
+            pm.exchange().has_stop_order(&stop_id),
+            "stop already at the guard-aware executable price must be left intact"
+        );
+        let events = pm.store().events().find_by_position(position_id).await.unwrap();
+        assert!(
+            !has_insurance_event(&events, position_id, "insurance_stop_replaced")
+                && !has_insurance_event(&events, position_id, "insurance_stop_placed"),
+            "no place/replace expected when the stop is at the guard-aware price"
+        );
+    }
+
+    #[tokio::test]
     async fn heal_reconciles_close_when_insurance_stop_filled_during_gap() {
         let pm = heal_manager().await;
         let symbol = btcusdt();
@@ -1126,6 +1187,7 @@ mod tests {
             favorable_extreme: Price::new(entry).unwrap(),
             extreme_at,
             insurance_stop_id: None,
+            invalidation_guard_level: None,
             last_emitted_stop: Some(Price::new(stop).unwrap()),
         };
         let position_id = pos.id;

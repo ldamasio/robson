@@ -58,6 +58,7 @@ async fn test_trailing_stop_e2e() {
         favorable_extreme: entry_price,
         extreme_at: Utc::now(),
         insurance_stop_id: None,
+        invalidation_guard_level: None,
         last_emitted_stop: Some(initial_stop),
     };
 
@@ -182,6 +183,7 @@ fn build_btcusdt_position_019db3dc() -> Position {
         favorable_extreme: entry_price,
         extreme_at: Utc::now(),
         insurance_stop_id: None,
+        invalidation_guard_level: None,
         last_emitted_stop: Some(initial_stop),
     };
     position

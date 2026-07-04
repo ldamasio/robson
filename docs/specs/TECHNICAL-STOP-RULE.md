@@ -192,3 +192,10 @@ def find_second_support(candles_15min, current_price, side="LONG"):
 **Priority**: HIGH - Blocks new trading operations
 **Owner**: Development team
 **Related**: ADR-0007 (to be created)
+
+## Note on the Invalidation Guard (ADR-0042)
+
+The technical stop rule above is unchanged. The invalidation guard is a
+separate protective post-analysis layer that may clamp the effective stop
+beyond a recent adverse extreme before the ADR-0041 executable buffer is
+applied. It does not alter how the technical stop itself is chosen.
