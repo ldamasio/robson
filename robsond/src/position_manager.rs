@@ -4952,8 +4952,18 @@ mod tests {
         assert!(events.iter().any(|event| matches!(event, Event::EntrySignalReceived { .. })));
     }
 
+    /// A margin-capped immediate entry must ACTIVATE, not be denied by the
+    /// risk gate's qty × entry round-trip (2026-07-04 prod incident: the
+    /// Decimal round-trip exceeded capital by ~1e-22 and the gate rejected
+    /// the margin cap sizing itself chose, cancelling the position).
+    ///
+    /// With sizing and the gate reading the same in-memory capital, a genuine
+    /// insufficient-margin denial is no longer constructible here; that gate
+    /// branch stays covered by robson-engine's RiskGate tests and remains
+    /// reachable in production only when the persisted monthly ledger capital
+    /// diverges from the engine's configured capital.
     #[tokio::test(flavor = "current_thread")]
-    async fn test_arm_immediate_insufficient_margin_cancels_without_rearming() {
+    async fn test_arm_immediate_margin_capped_entry_activates_within_capital() {
         use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
 
         let manager = create_test_manager().await;
@@ -4991,16 +5001,17 @@ mod tests {
 
         let position = manager.get_position(position.id).await.unwrap().unwrap();
         assert!(
-            matches!(position.state, PositionState::Cancelled),
-            "Immediate insufficient-margin denial must cancel, got {:?}",
+            matches!(position.state, PositionState::Active { .. }),
+            "Margin-capped immediate entry must activate, got {:?}",
             position.state
         );
 
-        let detectors = manager.detectors.read().await;
-        assert!(
-            !detectors.contains_key(&position.id),
-            "Immediate insufficient-margin denial must not re-arm detector"
-        );
+        // The tight stop makes the risk-sized quantity exceed 1x margin, so
+        // the margin cap engages: notional must fit the $100 capital exactly,
+        // with no round-trip excess for the gate to reject.
+        let notional = position.quantity.as_decimal() * dec!(95000);
+        assert!(notional > dec!(99.9), "margin cap must engage, notional {}", notional);
+        assert!(notional <= dec!(100), "notional {} must fit capital at 1x", notional);
     }
 
     #[tokio::test(flavor = "current_thread")]
