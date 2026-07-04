@@ -5007,11 +5007,12 @@ mod tests {
         );
 
         // The tight stop makes the risk-sized quantity exceed 1x margin, so
-        // the margin cap engages: notional must fit the $100 capital exactly,
-        // with no round-trip excess for the gate to reject.
+        // the margin cap engages: notional fits the $100 capital minus the
+        // default 100 bps headroom (exchange fee + mark-price cushion), with
+        // no round-trip excess for the gate to reject.
         let notional = position.quantity.as_decimal() * dec!(95000);
-        assert!(notional > dec!(99.9), "margin cap must engage, notional {}", notional);
-        assert!(notional <= dec!(100), "notional {} must fit capital at 1x", notional);
+        assert!(notional > dec!(98.9), "margin cap must engage, notional {}", notional);
+        assert!(notional <= dec!(99), "notional {} must fit capital minus headroom", notional);
     }
 
     #[tokio::test(flavor = "current_thread")]

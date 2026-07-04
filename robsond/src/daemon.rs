@@ -199,7 +199,9 @@ impl Daemon<StubExchange, MemoryStore> {
             .with_execution_costs(config.engine.taker_fee_rate, config.engine.stop_gap_bps)
             .expect("invalid ROBSON_TAKER_FEE_RATE / ROBSON_STOP_GAP_BPS configuration")
             .with_stop_buffer(config.engine.stop_buffer_bps)
-            .expect("invalid ROBSON_STOP_BUFFER_BPS configuration");
+            .expect("invalid ROBSON_STOP_BUFFER_BPS configuration")
+            .with_margin_headroom(config.engine.margin_headroom_bps)
+            .expect("invalid ROBSON_MARGIN_HEADROOM_BPS configuration");
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
@@ -247,7 +249,9 @@ impl Daemon<StubExchange, MemoryStore> {
             .with_execution_costs(config.engine.taker_fee_rate, config.engine.stop_gap_bps)
             .expect("invalid ROBSON_TAKER_FEE_RATE / ROBSON_STOP_GAP_BPS configuration")
             .with_stop_buffer(config.engine.stop_buffer_bps)
-            .expect("invalid ROBSON_STOP_BUFFER_BPS configuration");
+            .expect("invalid ROBSON_STOP_BUFFER_BPS configuration")
+            .with_margin_headroom(config.engine.margin_headroom_bps)
+            .expect("invalid ROBSON_MARGIN_HEADROOM_BPS configuration");
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
@@ -310,7 +314,9 @@ impl Daemon<StubExchange, MemoryStore> {
             .with_execution_costs(config.engine.taker_fee_rate, config.engine.stop_gap_bps)
             .expect("invalid ROBSON_TAKER_FEE_RATE / ROBSON_STOP_GAP_BPS configuration")
             .with_stop_buffer(config.engine.stop_buffer_bps)
-            .expect("invalid ROBSON_STOP_BUFFER_BPS configuration");
+            .expect("invalid ROBSON_STOP_BUFFER_BPS configuration")
+            .with_margin_headroom(config.engine.margin_headroom_bps)
+            .expect("invalid ROBSON_MARGIN_HEADROOM_BPS configuration");
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
@@ -366,7 +372,9 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
             .with_execution_costs(config.engine.taker_fee_rate, config.engine.stop_gap_bps)
             .expect("invalid ROBSON_TAKER_FEE_RATE / ROBSON_STOP_GAP_BPS configuration")
             .with_stop_buffer(config.engine.stop_buffer_bps)
-            .expect("invalid ROBSON_STOP_BUFFER_BPS configuration");
+            .expect("invalid ROBSON_STOP_BUFFER_BPS configuration")
+            .with_margin_headroom(config.engine.margin_headroom_bps)
+            .expect("invalid ROBSON_MARGIN_HEADROOM_BPS configuration");
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
@@ -438,7 +446,9 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
             .with_execution_costs(config.engine.taker_fee_rate, config.engine.stop_gap_bps)
             .expect("invalid ROBSON_TAKER_FEE_RATE / ROBSON_STOP_GAP_BPS configuration")
             .with_stop_buffer(config.engine.stop_buffer_bps)
-            .expect("invalid ROBSON_STOP_BUFFER_BPS configuration");
+            .expect("invalid ROBSON_STOP_BUFFER_BPS configuration")
+            .with_margin_headroom(config.engine.margin_headroom_bps)
+            .expect("invalid ROBSON_MARGIN_HEADROOM_BPS configuration");
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
