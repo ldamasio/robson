@@ -244,8 +244,14 @@ pub fn calculate_position_size(
 
     let max_risk = risk_config.max_risk_amount();
     let risk_sized_qty = max_risk / worst_loss_per_unit;
+    // Truncate the margin cap to 8 decimal places (finer than any exchange
+    // quantity step). capital/entry rounds at 28 significant digits, so the
+    // risk gate's qty × entry round-trip could land above capital by ~1e-22
+    // and reject the cap this function itself chose. With qty at 8 dp the
+    // product is exact in Decimal and provably ≤ capital at 1x.
     let margin_sized_qty =
-        (risk_config.capital() * rust_decimal::Decimal::from(RiskConfig::LEVERAGE)) / entry;
+        ((risk_config.capital() * rust_decimal::Decimal::from(RiskConfig::LEVERAGE)) / entry)
+            .round_dp_with_strategy(8, rust_decimal::RoundingStrategy::ToZero);
     let position_size = risk_sized_qty.min(margin_sized_qty);
 
     if position_size <= rust_decimal::Decimal::ZERO {
@@ -1115,9 +1121,12 @@ mod tests {
         let size =
             calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
 
-        let expected = config.capital() / entry.as_decimal();
+        // The margin cap is truncated (never rounded up) so the gate's
+        // qty × entry round-trip stays ≤ capital.
+        let expected = (config.capital() / entry.as_decimal())
+            .round_dp_with_strategy(8, rust_decimal::RoundingStrategy::ToZero);
         let loss = size.as_decimal() * dec!(500);
-        assert_eq!(size.as_decimal().round_dp(8), expected.round_dp(8));
+        assert_eq!(size.as_decimal(), expected);
         assert!(loss < config.max_risk_amount());
     }
 
@@ -1259,10 +1268,37 @@ mod tests {
             calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
         let qty = size.as_decimal();
         let risk_loss = qty * dec!(327.50);
-        let margin_cap = config.capital() / entry.as_decimal();
+        let margin_cap = (config.capital() / entry.as_decimal())
+            .round_dp_with_strategy(8, rust_decimal::RoundingStrategy::ToZero);
 
-        assert_eq!(qty.round_dp(8), margin_cap.round_dp(8));
+        assert_eq!(qty, margin_cap);
         assert!(risk_loss < config.max_risk_amount());
         assert!(risk_loss.round_dp(2) < dec!(3.52));
+    }
+
+    #[test]
+    fn test_margin_capped_size_survives_gate_round_trip() {
+        // Regression: 2026-07-04 prod entry denial. capital/entry rounds at 28
+        // significant digits, and the risk gate's qty × entry recomputation
+        // landed 2e-22 ABOVE capital, so the gate rejected the margin cap this
+        // function itself chose. Exact figures from the denied entry.
+        let config = RiskConfig::new(dec!(1643.18373001)).unwrap();
+        let entry = Price::new(dec!(62496.40)).unwrap();
+        let stop = Price::new(dec!(62898.833333333333333333333333)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        let size =
+            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop).unwrap();
+        let qty = size.as_decimal();
+
+        // The margin cap must have engaged (risk-sized qty would exceed 1x).
+        assert!(qty * entry.as_decimal() > config.capital() * dec!(0.999));
+        // The gate's round-trip must not exceed capital at 1x leverage.
+        assert!(
+            qty * entry.as_decimal() <= config.capital(),
+            "margin round-trip {} exceeds capital {}",
+            qty * entry.as_decimal(),
+            config.capital()
+        );
     }
 }
