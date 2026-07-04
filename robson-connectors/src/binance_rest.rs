@@ -937,8 +937,30 @@ pub struct BinanceAlgoOrderResponse {
 pub struct BinanceAlgoCancelResponse {
     pub algo_id: i64,
     pub client_algo_id: String,
+    /// Binance returns this as the STRING "200" on success (2026-07-04 prod
+    /// incident: parsing it as i64 aborted cancel-replace AFTER the exchange
+    /// had already cancelled the stop, leaving the position unprotected).
+    /// Accept both encodings.
+    #[serde(deserialize_with = "de_i64_from_int_or_string")]
     pub code: i64,
     pub msg: String,
+}
+
+/// Deserialize an i64 that Binance may encode as a JSON number or string.
+fn de_i64_from_int_or_string<'de, D>(deserializer: D) -> Result<i64, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum IntOrString {
+        Int(i64),
+        Str(String),
+    }
+    match IntOrString::deserialize(deserializer)? {
+        IntOrString::Int(v) => Ok(v),
+        IntOrString::Str(s) => s.parse::<i64>().map_err(serde::de::Error::custom),
+    }
 }
 
 /// Response from `GET /fapi/v1/algoOrder`.
@@ -1231,6 +1253,24 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
+
+    #[test]
+    fn test_algo_cancel_response_accepts_string_and_numeric_code() {
+        // Regression: 2026-07-04 prod. Binance answered the algo cancel with
+        // "code": "200" (string); parsing it as i64 failed AFTER the exchange
+        // had cancelled the stop, so cancel-replace aborted before placing
+        // the new one and the position was left without exchange-side
+        // protection.
+        let as_string =
+            r#"{"algoId":2000001240350523,"clientAlgoId":"ins-x","code":"200","msg":"OK"}"#;
+        let parsed: BinanceAlgoCancelResponse = serde_json::from_str(as_string).unwrap();
+        assert_eq!(parsed.code, 200);
+        assert_eq!(parsed.algo_id, 2000001240350523);
+
+        let as_number = r#"{"algoId":1,"clientAlgoId":"ins-y","code":200,"msg":"OK"}"#;
+        let parsed: BinanceAlgoCancelResponse = serde_json::from_str(as_number).unwrap();
+        assert_eq!(parsed.code, 200);
+    }
 
     #[test]
     fn test_build_signed_query() {
