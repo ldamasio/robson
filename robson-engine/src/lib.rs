@@ -464,6 +464,7 @@ impl Engine {
         &self,
         position: &Position,
         signal: &DetectorSignal,
+        available_margin: Option<Decimal>,
     ) -> Result<EngineDecision, EngineError> {
         // 1. Validate position is Armed
         if !matches!(position.state, PositionState::Armed) {
@@ -502,11 +503,14 @@ impl Engine {
         // Calculate position size from the (possibly clamped) effective stop
         // distance. A guard that widens the effective distance past the policy
         // cap makes this return Err — the entry is rejected (guard too wide).
+        // `available_margin` (live exchange balance) bounds the physical
+        // margin cap; the policy capital keeps anchoring the 1% risk budget.
         let quantity = calculate_position_size(
             &self.risk_config,
             &signal.entry_price,
             &tech_stop,
             effective_stop_level,
+            available_margin,
         )
         .map_err(EngineError::DomainError)?;
 
@@ -1646,7 +1650,7 @@ mod tests {
         let position = create_armed_position(Side::Long);
         let signal = create_detector_signal(&position, dec!(95000), dec!(93500));
 
-        let decision = engine.decide_entry(&position, &signal).unwrap();
+        let decision = engine.decide_entry(&position, &signal, None).unwrap();
 
         // Should have 3 actions: EmitEvent(EntrySignalReceived) +
         // EmitEvent(EntryOrderRequested) + PlaceEntryOrder
@@ -1695,7 +1699,7 @@ mod tests {
         // For short: stop is above entry
         let signal = create_detector_signal(&position, dec!(95000), dec!(96500));
 
-        let decision = engine.decide_entry(&position, &signal).unwrap();
+        let decision = engine.decide_entry(&position, &signal, None).unwrap();
 
         // Check PlaceEntryOrder has Sell side (short entry)
         let has_entry_order = decision.actions.iter().any(|a| {
@@ -1721,7 +1725,7 @@ mod tests {
             Price::new(dec!(93500)).unwrap(),
         );
 
-        let result = engine.decide_entry(&position, &signal);
+        let result = engine.decide_entry(&position, &signal, None);
 
         assert!(result.is_err());
         match result.unwrap_err() {
@@ -1749,7 +1753,7 @@ mod tests {
             Price::new(dec!(93500)).unwrap(),
         );
 
-        let result = engine.decide_entry(&position, &signal);
+        let result = engine.decide_entry(&position, &signal, None);
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), EngineError::DomainError(_)));
@@ -1765,7 +1769,7 @@ mod tests {
         // Create signal with stop too wide (>10%)
         let signal = create_detector_signal(&position, dec!(100), dec!(80)); // 20% distance
 
-        let result = engine.decide_entry(&position, &signal);
+        let result = engine.decide_entry(&position, &signal, None);
 
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), EngineError::DomainError(_)));
@@ -1916,7 +1920,7 @@ mod tests {
 
         // 2. Detector fires signal — engine emits actions but does NOT transition
         let signal = create_detector_signal(&position, dec!(95000), dec!(93500));
-        let entry_decision = engine.decide_entry(&position, &signal).unwrap();
+        let entry_decision = engine.decide_entry(&position, &signal, None).unwrap();
         // Position stays Armed (no updated_position)
         assert!(entry_decision.updated_position.is_none());
 
@@ -2457,7 +2461,7 @@ mod tests {
             Some(dec!(92500)),
         );
 
-        let decision = engine.decide_entry(&position, &signal).unwrap();
+        let decision = engine.decide_entry(&position, &signal, None).unwrap();
         let quantity = decision
             .actions
             .iter()
@@ -2486,7 +2490,7 @@ mod tests {
         let signal =
             create_detector_signal_with_guard(&position, dec!(100), dec!(95), Some(dec!(80)));
 
-        let result = engine.decide_entry(&position, &signal);
+        let result = engine.decide_entry(&position, &signal, None);
         assert!(result.is_err());
         assert!(matches!(result.unwrap_err(), EngineError::DomainError(_)));
     }
