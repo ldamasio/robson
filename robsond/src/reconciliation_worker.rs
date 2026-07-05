@@ -702,12 +702,25 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
             .iter()
             .filter(|position| matches!(position.state, PositionState::Armed))
             .count();
+        // Book positions still in flight, INCLUDING Active positions missing
+        // on the exchange (which live_risk_open_positions deliberately
+        // excludes for latent-risk math). A book position whose close has not
+        // been reconciled yet — e.g. an insurance-stop fill awaiting real
+        // evidence — is the most likely explanation for any wallet delta, so
+        // classifying drift in that window launders governed flow into
+        // "manual_account_change" (2026-07-05 incident: a +3.84 stop-gain was
+        // absorbed as drift while the reconciled close was still pending).
+        let in_flight_count = all_open
+            .iter()
+            .filter(|position| !matches!(position.state, PositionState::Armed))
+            .count();
 
-        if !risk_open.is_empty() || armed_count > 0 {
+        if !risk_open.is_empty() || armed_count > 0 || in_flight_count > 0 {
             debug!(
                 risk_open_count = risk_open.len(),
                 armed_count,
-                "Pure financial drift scan skipped while Robson positions are open or armed"
+                in_flight_count,
+                "Pure financial drift scan skipped while Robson positions are open, armed, or awaiting reconciliation"
             );
             return Ok(());
         }
@@ -1088,6 +1101,47 @@ mod tests {
             },
             event => panic!("unexpected event: {event:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn test_pure_financial_drift_skipped_while_close_awaits_reconciliation() {
+        // 2026-07-05 incident: an insurance-stop fill closed the position on
+        // the exchange, the book still had it Active (stale missing, close
+        // awaiting real evidence), and the drift path absorbed the profit as
+        // "manual_account_change". A book position in flight must block the
+        // pure-financial-drift recalibration.
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+
+        // Active position in the book; NOT present on the exchange snapshot.
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let now = Utc::now();
+        let mut position = Position::new(Uuid::now_v7(), symbol, Side::Short);
+        position.entry_price = Some(Price::new(dec!(100)).unwrap());
+        position.quantity = Quantity::new(dec!(1)).unwrap();
+        position.state = PositionState::Active {
+            current_price: Price::new(dec!(100)).unwrap(),
+            trailing_stop: Price::new(dec!(101)).unwrap(),
+            favorable_extreme: Price::new(dec!(100)).unwrap(),
+            extreme_at: now,
+            insurance_stop_id: None,
+            invalidation_guard_level: None,
+            last_emitted_stop: None,
+        };
+        position.updated_at = now;
+        store.positions().save(&position).await.unwrap();
+
+        // Wallet drifted well past tolerance (as an unreconciled fill would).
+        exchange.set_futures_balance(dec!(10500));
+        let worker = create_worker(exchange, store.clone(), event_bus, Duration::from_secs(60));
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        assert!(
+            capital_base_recalibration_events(&store).await.is_empty(),
+            "drift recalibration must not run while a book position awaits reconciliation"
+        );
     }
 
     #[tokio::test]
