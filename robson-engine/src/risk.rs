@@ -275,6 +275,13 @@ pub struct ProposedTrade {
     pub notional_value: Decimal,
     /// Initial margin (notional / leverage)
     pub initial_margin: Decimal,
+    /// Planned worst-case loss if the stop is hit, cost-priced per ADR-0039
+    /// (stop distance + executable-stop buffer + gap allowance + round-trip
+    /// fees, × quantity). The gate charges this against the monthly budget
+    /// (ADR-0043). Zero means unpriced — the full 1% per-trade cap is
+    /// reserved instead.
+    #[serde(default)]
+    pub planned_risk: Decimal,
 }
 
 // =============================================================================
@@ -302,6 +309,10 @@ pub enum RiskCheck {
     DuplicatePosition,
     /// Risk engine did not return before the runtime safety timeout.
     RiskEngineTimeout,
+    /// Remaining monthly budget cannot absorb this trade's planned risk
+    /// (ADR-0043). Unlike `MonthlyDrawdown`, budget remains — a smaller
+    /// trade may still fit, so this denial must NOT trigger MonthlyHalt.
+    RiskBudgetInsufficient,
 }
 
 impl RiskCheck {
@@ -316,6 +327,7 @@ impl RiskCheck {
             RiskCheck::DailyLossLimit => "daily_loss_limit",
             RiskCheck::DuplicatePosition => "duplicate_position",
             RiskCheck::RiskEngineTimeout => "risk_engine_timeout",
+            RiskCheck::RiskBudgetInsufficient => "risk_budget_insufficient",
         }
     }
 }
@@ -430,23 +442,52 @@ impl RiskGate {
             };
         }
 
-        // 4. Dynamic slot check (ADR-0024: replaces static max_open_positions)
+        // 4. Budget-metered admission (ADR-0043: replaces the ADR-0024 slot
+        //    reservation at the full 1% cap). The trade is charged its planned
+        //    worst-case loss; the 1% per-trade cap still bounds any single
+        //    trade, and the 4% monthly budget stays the hard invariant.
         let capital_base = context.capital; // MIG-v3#11 approximation; MIG-v3#12 persists real capital base.
-        let slots = context.slots_available(&self.policy, capital_base);
-        if slots == 0 {
+        let realized_loss = context.realized_loss_abs();
+        let latent_risk = context.latent_risk_sum();
+        let remaining = self.policy.remaining_budget(capital_base, realized_loss, latent_risk);
+
+        if remaining <= Decimal::ZERO {
             debug!(
                 capital_base = %capital_base,
-                realized_loss = %context.realized_loss_abs(),
-                latent_risk = %context.latent_risk_sum(),
-                "Risk check failed: no monthly risk slots available"
+                realized_loss = %realized_loss,
+                latent_risk = %latent_risk,
+                "Risk check failed: monthly risk budget exhausted"
             );
             return RiskVerdict::Rejected {
                 check: RiskCheck::MonthlyDrawdown,
                 reason: format!(
-                    "No monthly risk slots available (capital={}, realized_loss={}, latent_risk={})",
-                    capital_base,
-                    context.realized_loss_abs(),
-                    context.latent_risk_sum()
+                    "Monthly risk budget exhausted (capital={}, realized_loss={}, latent_risk={})",
+                    capital_base, realized_loss, latent_risk
+                ),
+            };
+        }
+
+        if !self.policy.can_admit(capital_base, realized_loss, latent_risk, proposed.planned_risk)
+        {
+            let cap = self.policy.risk_per_trade_amount(capital_base);
+            let charge = if proposed.planned_risk <= Decimal::ZERO {
+                cap
+            } else {
+                proposed.planned_risk
+            };
+            debug!(
+                capital_base = %capital_base,
+                remaining_budget = %remaining,
+                planned_risk = %proposed.planned_risk,
+                charged_risk = %charge,
+                per_trade_cap = %cap,
+                "Risk check failed: planned risk does not fit remaining monthly budget"
+            );
+            return RiskVerdict::Rejected {
+                check: RiskCheck::RiskBudgetInsufficient,
+                reason: format!(
+                    "Planned risk {} does not fit remaining monthly budget {} (per-trade cap {})",
+                    charge, remaining, cap
                 ),
             };
         }
@@ -455,7 +496,9 @@ impl RiskGate {
             symbol = %proposed.symbol,
             side = %proposed.side,
             notional = %proposed.notional_value,
-            slots_available = slots,
+            planned_risk = %proposed.planned_risk,
+            remaining_budget = %remaining,
+            guaranteed_full_cap_slots = context.slots_available(&self.policy, capital_base),
             "Risk check passed"
         );
 
@@ -491,6 +534,8 @@ mod tests {
             entry_price: dec!(50000),
             notional_value: dec!(1000),
             initial_margin: dec!(100),
+            // Full 1% cap of the $10k sample context — worst-case pricing.
+            planned_risk: dec!(100),
         }
     }
 
@@ -558,6 +603,7 @@ mod tests {
             entry_price: dec!(60000),
             notional_value: dec!(3520.000000000000000000000002),
             initial_margin: dec!(3520.000000000000000000000002),
+            planned_risk: dec!(3.52),
         };
 
         let verdict = gate.evaluate(&proposed, &context);
@@ -626,9 +672,10 @@ mod tests {
     }
 
     #[test]
-    fn test_risk_gate_slot_exhaustion_at_399_pct_loss() {
-        // 3.99% realized loss (399 out of 400 budget) leaves $1 < $100 risk → slots = 0
-        // This blocks via MonthlyDrawdown even though hard limit hasn't been hit.
+    fn test_risk_gate_denies_full_cap_trade_in_budget_tail_without_halt() {
+        // 3.99% realized loss (399 out of 400 budget) leaves $1. A worst-case
+        // $100 trade does not fit, but budget remains — ADR-0043: deny with
+        // RiskBudgetInsufficient, NOT MonthlyDrawdown (no MonthlyHalt).
         let gate = RiskGate::new();
         let context = RiskContext {
             capital: dec!(10000),
@@ -642,9 +689,83 @@ mod tests {
 
         let verdict = gate.evaluate(&proposed, &context);
         assert!(
-            matches!(verdict, RiskVerdict::Rejected { check: RiskCheck::MonthlyDrawdown, .. }),
-            "3.99% loss exhausts budget for risk unit → must block via MonthlyDrawdown"
+            matches!(
+                verdict,
+                RiskVerdict::Rejected { check: RiskCheck::RiskBudgetInsufficient, .. }
+            ),
+            "full-cap trade in the budget tail must deny without triggering MonthlyHalt"
         );
+    }
+
+    #[test]
+    fn test_risk_gate_admits_small_planned_risk_in_budget_tail() {
+        // ADR-0043: saved risk becomes an extra operation. With $1 of budget
+        // left, a trade whose planned worst-case loss is $0.90 is admitted.
+        let gate = RiskGate::new();
+        let context = RiskContext {
+            capital: dec!(10000),
+            open_positions: vec![],
+            total_notional_exposure: Decimal::ZERO,
+            monthly_realized_pnl: dec!(-399),
+            monthly_unrealized_pnl: dec!(0),
+            monthly_realized_loss: dec!(399),
+        };
+        let proposed = ProposedTrade { planned_risk: dec!(0.90), ..sample_proposed() };
+
+        let verdict = gate.evaluate(&proposed, &context);
+        assert_eq!(
+            verdict,
+            RiskVerdict::Approved,
+            "planned risk below remaining budget must be admitted (extra operation)"
+        );
+    }
+
+    #[test]
+    fn test_risk_gate_rejects_planned_risk_above_per_trade_cap() {
+        // The 1% per-trade cap survives ADR-0043: planned risk above the cap
+        // is never admitted, even with a fresh monthly budget.
+        let gate = RiskGate::new();
+        let context = sample_context();
+        let proposed = ProposedTrade { planned_risk: dec!(101), ..sample_proposed() };
+
+        let verdict = gate.evaluate(&proposed, &context);
+        assert!(
+            matches!(
+                verdict,
+                RiskVerdict::Rejected { check: RiskCheck::RiskBudgetInsufficient, .. }
+            ),
+            "planned risk above the 1% per-trade cap must be rejected"
+        );
+    }
+
+    #[test]
+    fn test_risk_gate_unpriced_trade_reserves_full_cap() {
+        // planned_risk == 0 (unpriced, e.g. legacy caller) falls back to
+        // reserving the full 1% cap — the pre-ADR-0043 behavior.
+        let gate = RiskGate::new();
+        let tail_context = RiskContext {
+            capital: dec!(10000),
+            open_positions: vec![],
+            total_notional_exposure: Decimal::ZERO,
+            monthly_realized_pnl: dec!(-350),
+            monthly_unrealized_pnl: dec!(0),
+            monthly_realized_loss: dec!(350),
+        };
+        let unpriced = ProposedTrade { planned_risk: Decimal::ZERO, ..sample_proposed() };
+
+        // Remaining $50 < $100 full cap → denied.
+        let verdict = gate.evaluate(&unpriced, &tail_context);
+        assert!(
+            matches!(
+                verdict,
+                RiskVerdict::Rejected { check: RiskCheck::RiskBudgetInsufficient, .. }
+            ),
+            "unpriced trade must reserve the full cap and be denied in the tail"
+        );
+
+        // Fresh budget → approved.
+        let verdict = gate.evaluate(&unpriced, &sample_context());
+        assert_eq!(verdict, RiskVerdict::Approved);
     }
 
     #[test]
@@ -851,6 +972,7 @@ mod tests {
             notional_value: dec!(50), /* 50% of capital — would have been rejected by old
                                        * SinglePositionConcentration */
             initial_margin: dec!(50),
+            planned_risk: dec!(1),
         };
 
         let verdict = gate.evaluate(&proposed, &context);
@@ -886,12 +1008,13 @@ mod tests {
             entry_price: dec!(50000),
             notional_value: dec!(50),
             initial_margin: dec!(50),
+            planned_risk: dec!(1),
         };
 
         let verdict = gate.evaluate(&proposed, &context);
         assert!(
             matches!(verdict, RiskVerdict::Rejected { check: RiskCheck::MonthlyDrawdown, .. }),
-            "slots exhausted must reject with MonthlyDrawdown check"
+            "exhausted budget (remaining = 0) must reject with MonthlyDrawdown check"
         );
     }
 }

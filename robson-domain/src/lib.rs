@@ -24,7 +24,8 @@ pub use credentials::{
 };
 pub use detected_position::{CalculatedStop, DetectedPosition, StopMethod};
 pub use entities::{
-    calculate_margin_required, calculate_notional_value, calculate_position_size, AccountId,
+    calculate_margin_required, calculate_notional_value, calculate_position_size,
+    worst_case_loss_per_unit, AccountId,
     AccountSnapshotEvidence, AnchorType, ClosureEvidence, DetectorSignal, EntryLifecycleStage,
     EstimatedEvidence, EstimationBasis, ExitOrderFillSource, ExitReason, Order, OrderFillEvidence,
     OrderId, OrderStatus, OrderType, Position, PositionId, PositionState, RealFillEvidence,

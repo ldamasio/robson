@@ -219,32 +219,9 @@ pub fn calculate_position_size(
     // Validate tech stop first
     tech_stop.validate()?;
 
-    let effective_stop =
-        TechnicalStopDistance::from_entry_and_stop(*entry_price, effective_stop_level);
-    effective_stop.validate()?;
-    let stop_distance = effective_stop.distance;
-
-    if stop_distance <= rust_decimal::Decimal::ZERO {
-        return Err(DomainError::PositionSizingError("Stop distance must be positive".to_string()));
-    }
-
     let entry = entry_price.as_decimal();
-    if entry <= rust_decimal::Decimal::ZERO {
-        return Err(DomainError::PositionSizingError("Entry price must be positive".to_string()));
-    }
-
-    // Golden Rule with execution-cost buffer (ADR-0039, Policy 10): the 1%
-    // budget covers worst expected realized loss — chart distance, the
-    // executable-stop buffer beyond the effective stop level, expected gap past
-    // the stop, and round-trip taker fees — then the available 1x margin
-    // caps the size. The exit-fee base uses max(entry, stop) so the
-    // buffer stays conservative for both sides.
-    let stop = effective_stop_level.as_decimal();
-    let stop_buffer = stop * risk_config.stop_buffer_bps() / rust_decimal::Decimal::from(10_000);
-    let gap_allowance = stop * risk_config.stop_gap_bps() / rust_decimal::Decimal::from(10_000);
-    let round_trip_fees_per_unit = risk_config.taker_fee_rate() * (entry + entry.max(stop));
     let worst_loss_per_unit =
-        stop_distance + stop_buffer + gap_allowance + round_trip_fees_per_unit;
+        worst_case_loss_per_unit(risk_config, entry_price, effective_stop_level)?;
 
     let max_risk = risk_config.max_risk_amount();
     let risk_sized_qty = max_risk / worst_loss_per_unit;
@@ -285,6 +262,44 @@ pub fn calculate_position_size(
     }
 
     Quantity::new(position_size).map_err(|e| DomainError::PositionSizingError(e.to_string()))
+}
+
+/// Worst expected realized loss per unit of quantity for an entry at
+/// `entry_price` with the effective stop at `effective_stop_level`.
+///
+/// Golden Rule cost pricing (ADR-0039, Policy 10): chart distance to the
+/// effective stop, the executable-stop buffer beyond it, expected gap past
+/// the stop, and round-trip taker fees. The exit-fee base uses
+/// max(entry, stop) so the buffer stays conservative for both sides.
+///
+/// This is the same per-unit loss `calculate_position_size` prices the 1%
+/// cap against; multiplied by the final (possibly margin-capped) quantity it
+/// yields the planned worst-case loss the risk gate charges against the
+/// monthly budget (ADR-0043).
+pub fn worst_case_loss_per_unit(
+    risk_config: &RiskConfig,
+    entry_price: &Price,
+    effective_stop_level: Price,
+) -> Result<rust_decimal::Decimal, DomainError> {
+    let effective_stop =
+        TechnicalStopDistance::from_entry_and_stop(*entry_price, effective_stop_level);
+    effective_stop.validate()?;
+    let stop_distance = effective_stop.distance;
+
+    if stop_distance <= rust_decimal::Decimal::ZERO {
+        return Err(DomainError::PositionSizingError("Stop distance must be positive".to_string()));
+    }
+
+    let entry = entry_price.as_decimal();
+    if entry <= rust_decimal::Decimal::ZERO {
+        return Err(DomainError::PositionSizingError("Entry price must be positive".to_string()));
+    }
+
+    let stop = effective_stop_level.as_decimal();
+    let stop_buffer = stop * risk_config.stop_buffer_bps() / rust_decimal::Decimal::from(10_000);
+    let gap_allowance = stop * risk_config.stop_gap_bps() / rust_decimal::Decimal::from(10_000);
+    let round_trip_fees_per_unit = risk_config.taker_fee_rate() * (entry + entry.max(stop));
+    Ok(stop_distance + stop_buffer + gap_allowance + round_trip_fees_per_unit)
 }
 
 /// Calculate notional value of position

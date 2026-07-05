@@ -7,6 +7,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed - Budget-metered entry admission (ADR-0043, 2026-07-05)
+
+- The risk gate now admits an entry when its **actual planned worst-case
+  loss** (cost-priced per ADR-0039: stop distance + executable-stop buffer +
+  gap allowance + round-trip fees, × final quantity) fits the remaining
+  monthly budget, instead of reserving the full 1% per-trade cap for every
+  prospective trade. The 1% cap and the 4% monthly budget are unchanged.
+  Product framing: **at least 4 chances per month — saved risk becomes an
+  extra operation**.
+- `EngineDecision` carries `planned_entry_risk`; `ProposedTrade` carries
+  `planned_risk` (zero = unpriced → the full cap is reserved, the previous
+  behavior).
+- New governed denial `risk_budget_insufficient`: the trade does not fit the
+  remaining budget, but budget remains. It re-arms with standard backoff and
+  does not trigger MonthlyHalt.
+- MonthlyHalt (periodic evaluation and gate denial `monthly_drawdown`) now
+  fires only when `remaining_budget ≤ 0`, not when the tail is smaller than
+  one full risk unit.
+- `slots_available` / `new_slots_available` now mean the guaranteed minimum
+  of remaining full-cap entries (a floor, not a ceiling).
+
 ### Fixed - Phantom daily loss limit removed (2026-07-04)
 
 - `RiskGate` enforced a `daily_loss_limit_pct = 1%` check that no policy

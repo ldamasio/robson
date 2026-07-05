@@ -16,7 +16,7 @@ The system provides a single-operator runtime with a slot-based monthly risk mod
 - **Technical stop**: always from chart analysis (second S/R level, 15m timeframe) — never a percentage of entry price
 - **Stop enforcement**: two independent layers. The software monitor is the primary exit path (discrete trailing, per-tick audit); a robsond-authored reduce-only conditional stop order rests on the exchange as a fail-safe that survives daemon outages (ADR-0039)
 - **Exit execution**: exits and protective stops are always market orders (taker) — non-execution there is an unbounded loss; fee optimization is only ever applied to legs where waiting is costless (ADR-0040)
-- **Slot capacity**: 4 concurrent positions maximum
+- **Entry capacity**: budget-metered (ADR-0043). Each entry is charged its actual planned worst-case loss against the monthly budget, not the full 1% cap — **at least 4 full-cap operations per month are guaranteed, and saved risk becomes extra operations**. No static cap on concurrent positions or entries per day; the budget is the only constraint
 
 `capital_base` is set at month start as a pessimistic snapshot: `wallet_balance − carried_risk(Entering + Active + Armed)`. It is immutable during normal operation, but must be recalibrated if reconciliation detects manual account changes outside Robson.
 
