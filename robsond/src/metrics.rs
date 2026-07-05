@@ -79,6 +79,37 @@ pub static MONTHLY_HALT_ACTIVE: LazyLock<Gauge> = LazyLock::new(|| {
     .expect("failed to register robsond_monthly_halt_active")
 });
 
+/// Market data mode per symbol (0 = WS, 1 = REST fallback) — ADR-0044.
+pub static MARKET_DATA_MODE: LazyLock<GaugeVec> = LazyLock::new(|| {
+    register_gauge_vec!(
+        "robsond_market_data_mode",
+        "Market data source mode per symbol (0=ws, 1=rest_fallback)",
+        &["symbol"]
+    )
+    .expect("failed to register robsond_market_data_mode")
+});
+
+/// Seconds since the last WS tick per symbol — ADR-0044.
+pub static MARKET_DATA_SILENT_SECONDS: LazyLock<GaugeVec> = LazyLock::new(|| {
+    register_gauge_vec!(
+        "robsond_market_data_silent_seconds",
+        "Seconds since the last WebSocket tick per symbol",
+        &["symbol"]
+    )
+    .expect("failed to register robsond_market_data_silent_seconds")
+});
+
+/// REST fallback price polls per symbol, by outcome — ADR-0044 request
+/// budget telemetry.
+pub static MARKET_DATA_FALLBACK_POLLS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        "robsond_market_data_fallback_polls_total",
+        "REST fallback price polls by outcome",
+        &["symbol", "outcome"] // outcome: ok, error
+    )
+    .expect("failed to register robsond_market_data_fallback_polls_total")
+});
+
 /// Render all registered metrics in Prometheus exposition format.
 pub fn render() -> String {
     prometheus::TextEncoder::new()

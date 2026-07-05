@@ -3426,6 +3426,25 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         Ok(open.len())
     }
 
+    /// Whether the symbol carries an Entering or Active position — the
+    /// REST-fallback polling gate (ADR-0044).
+    ///
+    /// Fails protective: a storage error reports `true` so the fallback keeps
+    /// polling rather than leaving a possibly open position blind.
+    pub async fn has_risk_open_on_symbol(&self, symbol: &Symbol) -> bool {
+        match self.store.positions().find_risk_open().await {
+            Ok(positions) => positions.iter().any(|p| p.symbol.as_pair() == symbol.as_pair()),
+            Err(e) => {
+                warn!(
+                    error = %e,
+                    symbol = %symbol.as_pair(),
+                    "Risk-open lookup failed; REST fallback stays protective"
+                );
+                true
+            },
+        }
+    }
+
     /// Compute dynamic count of new slots available from persisted monthly
     /// state and open positions.
     ///
@@ -4967,6 +4986,7 @@ mod tests {
                 symbol: symbol.clone(),
                 price: Price::new(price).unwrap(),
                 timestamp: chrono::Utc::now(),
+                source: crate::event_bus::MarketDataSource::Ws,
             };
             event_bus.send(DaemonEvent::MarketData(market_data));
         }
@@ -4979,6 +4999,7 @@ mod tests {
                 symbol: symbol.clone(),
                 price: Price::new(price).unwrap(),
                 timestamp: chrono::Utc::now(),
+                source: crate::event_bus::MarketDataSource::Ws,
             };
             event_bus.send(DaemonEvent::MarketData(market_data));
         }
@@ -5173,6 +5194,7 @@ mod tests {
             symbol: symbol.clone(),
             price: Price::new(dec!(100)).unwrap(),
             timestamp: chrono::Utc::now(),
+            source: crate::event_bus::MarketDataSource::Ws,
         }));
 
         tokio::time::timeout(std::time::Duration::from_secs(1), async {
