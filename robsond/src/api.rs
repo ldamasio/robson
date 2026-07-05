@@ -1140,18 +1140,30 @@ where
     let mut receiver = state.event_bus.subscribe();
 
     let event_stream = stream! {
+        // RAII connection accounting: inc on first poll, dec + record a
+        // disconnect on drop. Living inside the stream state guarantees a
+        // dropped response future (client disconnect) always releases the slot.
+        let _connection_guard = crate::metrics::SseConnectionGuard::new();
+
         loop {
             match receiver.recv().await {
                 Some(Ok(event)) => {
                     if let Some(public_event) = map_daemon_event(&event) {
+                        let event_type = public_event.event_type.clone();
+                        crate::metrics::SSE_EVENTS
+                            .with_label_values(&[&event_type])
+                            .inc();
                         yield Ok::<_, Infallible>(public_event.into_sse_event());
                     }
                 }
                 Some(Err(lag_message)) => {
                     warn!(message = %lag_message, "SSE receiver lagged; operator client must re-sync");
-                    yield Ok::<_, Infallible>(
-                        resync_required_event("lagged", lag_message).into_sse_event()
-                    );
+                    let resync = resync_required_event("lagged", lag_message);
+                    let event_type = resync.event_type.clone();
+                    crate::metrics::SSE_EVENTS
+                        .with_label_values(&[&event_type])
+                        .inc();
+                    yield Ok::<_, Infallible>(resync.into_sse_event());
                     break;
                 }
                 None => break,

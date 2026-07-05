@@ -9,11 +9,16 @@
 //! - `robsond_active_positions` — currently open position count
 //! - `robsond_stale_active_positions` — open book positions missing on exchange
 //! - `robsond_monthly_halt_active` — MonthlyHalt circuit breaker (0 or 1)
+//! - `robsond_sse_connections` — currently connected SSE clients on `/events`
+//! - `robsond_sse_events_total` — public SSE events sent, labelled by event
+//!   type
+//! - `robsond_sse_disconnects_total` — SSE stream terminations on `/events`
 
 use std::sync::LazyLock;
 
 use prometheus::{
-    self, register_counter_vec, register_gauge, register_gauge_vec, CounterVec, Gauge, GaugeVec,
+    self, register_counter, register_counter_vec, register_gauge, register_gauge_vec, Counter,
+    CounterVec, Gauge, GaugeVec,
 };
 
 /// Total completed engine cycles (each market tick processed).
@@ -110,9 +115,102 @@ pub static MARKET_DATA_FALLBACK_POLLS: LazyLock<CounterVec> = LazyLock::new(|| {
     .expect("failed to register robsond_market_data_fallback_polls_total")
 });
 
+/// Currently connected SSE clients on `/events`.
+///
+/// Incremented when a client stream opens and decremented when it ends. A
+/// dead or dropped SSE stream must never read as a live one — silence must be
+/// visible — so the decrement is wired through [`SseConnectionGuard`].
+pub static SSE_CONNECTIONS: LazyLock<Gauge> = LazyLock::new(|| {
+    register_gauge!("robsond_sse_connections", "Currently connected SSE clients on /events")
+        .expect("failed to register robsond_sse_connections")
+});
+
+/// Public SSE events sent over `/events`, labelled by the public event type
+/// name (e.g. `position.changed`). Heartbeat keep-alive comments are emitted
+/// by axum's `KeepAlive` layer and are intentionally NOT counted here.
+pub static SSE_EVENTS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!("robsond_sse_events_total", "Public SSE events sent by event type", &[
+        "type"
+    ])
+    .expect("failed to register robsond_sse_events_total")
+});
+
+/// SSE stream terminations on `/events` — bumped whether the client
+/// disconnects or the stream ends normally.
+pub static SSE_DISCONNECTS: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!("robsond_sse_disconnects_total", "SSE stream terminations on /events")
+        .expect("failed to register robsond_sse_disconnects_total")
+});
+
+/// RAII guard for a single SSE client connection on `/events`.
+///
+/// Increments [`SSE_CONNECTIONS`] on creation and, on drop, decrements it and
+/// bumps [`SSE_DISCONNECTS`]. The guard lives inside the SSE stream's state
+/// machine, so dropping it — whether the stream ends normally or the client
+/// disconnects mid-await, dropping the response future — always releases the
+/// connection slot.
+pub(crate) struct SseConnectionGuard<'a> {
+    connections: &'a Gauge,
+    disconnects: &'a Counter,
+}
+
+impl SseConnectionGuard<'static> {
+    /// Bind a guard to the global SSE metrics — used by the live `/events`
+    /// handler.
+    pub(crate) fn new() -> Self {
+        SseConnectionGuard::instrumented(&*SSE_CONNECTIONS, &*SSE_DISCONNECTS)
+    }
+}
+
+impl<'a> SseConnectionGuard<'a> {
+    /// Bind a guard to explicit metrics. Exposed for unit tests so they can
+    /// run in isolation against unregistered metrics instead of mutating the
+    /// shared global registry.
+    fn instrumented(connections: &'a Gauge, disconnects: &'a Counter) -> Self {
+        connections.inc();
+        Self { connections, disconnects }
+    }
+}
+
+impl Drop for SseConnectionGuard<'_> {
+    fn drop(&mut self) {
+        self.connections.dec();
+        self.disconnects.inc();
+    }
+}
+
 /// Render all registered metrics in Prometheus exposition format.
 pub fn render() -> String {
     prometheus::TextEncoder::new()
         .encode_to_string(&prometheus::default_registry().gather())
         .expect("failed to encode metrics")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sse_connection_guard_increments_on_create_decrements_on_drop() {
+        // Isolated, unregistered metrics so parallel tests touching the global
+        // SSE counters cannot perturb these assertions.
+        let connections = Gauge::new("test_sse_connections", "test").unwrap();
+        let disconnects = Counter::new("test_sse_disconnects", "test").unwrap();
+
+        assert_eq!(connections.get(), 0.0);
+        assert_eq!(disconnects.get(), 0.0);
+
+        {
+            let _guard = SseConnectionGuard::instrumented(&connections, &disconnects);
+            // While the guard is live, exactly one connection is open and no
+            // disconnect has been recorded.
+            assert_eq!(connections.get(), 1.0);
+            assert_eq!(disconnects.get(), 0.0);
+        }
+
+        // Dropping the guard releases the slot and records the disconnect —
+        // the property that makes client-disconnect accounting robust.
+        assert_eq!(connections.get(), 0.0);
+        assert_eq!(disconnects.get(), 1.0);
+    }
 }
