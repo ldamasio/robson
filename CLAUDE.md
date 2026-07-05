@@ -51,8 +51,10 @@ If this file and `AGENTS.md` ever diverge, `AGENTS.md` is the source of truth.
 - **Opportunity detection vs Technical Stop Analysis** are separate responsibilities.
   See ADR-0021.
 - **No static hard limits** — `max_open_positions`, `max_total_exposure_pct`, and
-  `max_single_position_pct` were eliminated in MIG-v3#11. Only slot logic and the
-  4% monthly drawdown policy govern entry capacity. See ADR-0024.
+  `max_single_position_pct` were eliminated in MIG-v3#11. Entry capacity is
+  budget-metered: entries are admitted by actual planned risk against the 4%
+  monthly budget, with the 1% per-trade cap and at least 4 full-cap operations
+  per month guaranteed. See ADR-0024 and ADR-0043.
 - **Estimated evidence is permanently blocked** — `reconcile_close` rejects
   `ReconciliationEvidence::Estimated`. Only `OrderFillRecord` and `UserTradeRecord`
   are valid for automated reconciled closes in v3.

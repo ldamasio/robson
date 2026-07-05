@@ -140,13 +140,67 @@ impl TradingPolicy {
         capital_base * self.max_monthly_drawdown_pct / Decimal::from(100)
     }
 
-    /// Dynamic slot count (ADR-0024 Decision 5).
+    /// Remaining monthly risk budget (ADR-0024 Decision 5):
+    /// `monthly_budget − realized_loss − latent_risk`.
     ///
-    /// Returns the number of new positions that can be opened given current
-    /// capital, realized losses, and latent risk of open positions.
+    /// May be negative when realized losses plus open-position latent risk
+    /// exceed the budget (e.g. after out-of-band account changes).
+    pub fn remaining_budget(
+        &self,
+        capital_base: Decimal,
+        realized_loss: Decimal,
+        latent_risk: Decimal,
+    ) -> Decimal {
+        self.monthly_budget(capital_base) - realized_loss - latent_risk
+    }
+
+    /// Budget-metered admission for one proposed entry (ADR-0043).
+    ///
+    /// A trade is admitted when its planned worst-case loss — cost-priced per
+    /// ADR-0039: stop distance + executable-stop buffer + gap allowance +
+    /// round-trip taker fees, times the final quantity — fits the remaining
+    /// monthly budget. The per-trade cap still binds: a planned risk above
+    /// `risk_per_trade_amount` is never admitted.
+    ///
+    /// A non-positive `planned_risk` means the caller could not price the
+    /// trade; the full per-trade cap is reserved instead (the pre-ADR-0043
+    /// behavior).
+    pub fn can_admit(
+        &self,
+        capital_base: Decimal,
+        realized_loss: Decimal,
+        latent_risk: Decimal,
+        planned_risk: Decimal,
+    ) -> bool {
+        if capital_base <= Decimal::ZERO {
+            return false;
+        }
+        let cap = self.risk_per_trade_amount(capital_base);
+        if cap <= Decimal::ZERO {
+            return false;
+        }
+        let charge = if planned_risk <= Decimal::ZERO {
+            cap
+        } else {
+            planned_risk
+        };
+        if charge > cap {
+            return false;
+        }
+        self.remaining_budget(capital_base, realized_loss, latent_risk) >= charge
+    }
+
+    /// Guaranteed minimum of new full-cap entries (ADR-0024 Decision 5,
+    /// reframed by ADR-0043).
+    ///
+    /// Counts how many worst-case (full 1%-cap) trades the remaining budget
+    /// still absorbs. Since ADR-0043 this is a display/reporting floor — "at
+    /// least N more chances" — not the admission rule: entries are admitted
+    /// by their actual planned risk via [`Self::can_admit`], so a month can
+    /// hold more entries than this count when trades risk less than the cap.
     ///
     /// Returns 0 if capital_base <= 0, risk amount <= 0, or remaining budget
-    /// is less than one risk unit.
+    /// is less than one full risk unit.
     pub fn slots_available(
         &self,
         capital_base: Decimal,
@@ -160,7 +214,7 @@ impl TradingPolicy {
         if risk_amount <= Decimal::ZERO {
             return 0;
         }
-        let remaining = self.monthly_budget(capital_base) - realized_loss - latent_risk;
+        let remaining = self.remaining_budget(capital_base, realized_loss, latent_risk);
         if remaining < risk_amount {
             return 0;
         }
@@ -299,6 +353,50 @@ mod tests {
         let p = TradingPolicy::default();
         let slots = p.slots_available(dec!(100), dec!(0), dec!(1));
         assert_eq!(slots, 3, "expected floor((4-0-1)/1) = 3");
+    }
+
+    #[test]
+    fn can_admit_charges_actual_planned_risk() {
+        let p = TradingPolicy::default();
+        // budget=4, consumed=3.5 → remaining=0.5: a full-cap (1) trade does
+        // not fit, but a 0.4-risk trade does (ADR-0043: saved risk becomes an
+        // extra operation).
+        assert!(!p.can_admit(dec!(100), dec!(3.5), dec!(0), dec!(1)));
+        assert!(p.can_admit(dec!(100), dec!(3.5), dec!(0), dec!(0.4)));
+        assert!(p.can_admit(dec!(100), dec!(3.5), dec!(0), dec!(0.5)));
+    }
+
+    #[test]
+    fn can_admit_enforces_per_trade_cap() {
+        let p = TradingPolicy::default();
+        // Fresh budget, but planned risk above the 1% cap is never admitted.
+        assert!(!p.can_admit(dec!(100), dec!(0), dec!(0), dec!(1.01)));
+        assert!(p.can_admit(dec!(100), dec!(0), dec!(0), dec!(1)));
+    }
+
+    #[test]
+    fn can_admit_unknown_risk_reserves_full_cap() {
+        let p = TradingPolicy::default();
+        // planned_risk <= 0 → fall back to reserving the full 1% cap.
+        assert!(p.can_admit(dec!(100), dec!(3), dec!(0), dec!(0)));
+        assert!(!p.can_admit(dec!(100), dec!(3.5), dec!(0), dec!(0)));
+        assert!(!p.can_admit(dec!(100), dec!(3.5), dec!(0), dec!(-1)));
+    }
+
+    #[test]
+    fn can_admit_rejects_exhausted_or_invalid_budget() {
+        let p = TradingPolicy::default();
+        assert!(!p.can_admit(dec!(100), dec!(4), dec!(0), dec!(0.1)));
+        assert!(!p.can_admit(dec!(100), dec!(3), dec!(1.5), dec!(0.1)));
+        assert!(!p.can_admit(dec!(0), dec!(0), dec!(0), dec!(0.1)));
+        assert!(!p.can_admit(dec!(-100), dec!(0), dec!(0), dec!(0.1)));
+    }
+
+    #[test]
+    fn remaining_budget_may_go_negative() {
+        let p = TradingPolicy::default();
+        assert_eq!(p.remaining_budget(dec!(100), dec!(3), dec!(2)), dec!(-1));
+        assert_eq!(p.remaining_budget(dec!(100), dec!(1), dec!(1)), dec!(2));
     }
 
     #[test]

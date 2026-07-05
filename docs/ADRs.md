@@ -39,5 +39,6 @@ Index
 | ADR-0023 | Symbol-Agnostic Policy Invariant | Decided (Follow-up required) | 2026-04-18 |
 | ADR-0036 | Monthly Slot Inheritance and Stop Visibility | Decided | 2026-05-05 |
 | ADR-0038 | Capital Base Recalibration After Manual Account Change | Decided (Implementation required) | 2026-05-28 |
+| ADR-0043 | Budget-Metered Entry Admission | Decided | 2026-07-05 |
 
 Files located in `docs/adr/`.

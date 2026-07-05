@@ -360,17 +360,30 @@ pub struct EngineDecision {
     pub actions: Vec<EngineAction>,
     /// Updated position state (if changed)
     pub updated_position: Option<Position>,
+    /// Planned worst-case loss of the entry decided here (cost-priced per
+    /// ADR-0039: per-unit worst loss × final quantity). The risk gate charges
+    /// this against the monthly budget instead of the full 1% cap (ADR-0043).
+    /// `None` for non-entry decisions.
+    pub planned_entry_risk: Option<Decimal>,
 }
 
 impl EngineDecision {
     /// Create an empty decision (no actions needed)
     pub fn no_action() -> Self {
-        Self { actions: vec![], updated_position: None }
+        Self {
+            actions: vec![],
+            updated_position: None,
+            planned_entry_risk: None,
+        }
     }
 
     /// Create a decision with actions
     pub fn with_actions(actions: Vec<EngineAction>) -> Self {
-        Self { actions, updated_position: None }
+        Self {
+            actions,
+            updated_position: None,
+            planned_entry_risk: None,
+        }
     }
 
     /// Create a decision with actions and updated position
@@ -378,6 +391,7 @@ impl EngineDecision {
         Self {
             actions,
             updated_position: Some(position),
+            planned_entry_risk: None,
         }
     }
 
@@ -514,6 +528,24 @@ impl Engine {
         )
         .map_err(EngineError::DomainError)?;
 
+        // Price this entry's planned worst-case loss (ADR-0043): the same
+        // cost-priced per-unit loss the sizing used, times the final
+        // (possibly margin-capped) quantity. The risk gate charges this
+        // against the monthly budget instead of reserving the full 1% cap,
+        // so lower-risk entries leave room for extra operations in the month.
+        // Clamped to the cap: on the risk-sized path qty = max_risk / per_unit
+        // and Decimal quotient rounding can put per_unit × qty a hair above
+        // max_risk; the sizing guarantees the cap by construction, so the
+        // excess is a rounding artifact, not real risk.
+        let planned_entry_risk = (robson_domain::worst_case_loss_per_unit(
+            &self.risk_config,
+            &signal.entry_price,
+            effective_stop_level,
+        )
+        .map_err(EngineError::DomainError)?
+            * quantity.as_decimal())
+        .min(self.risk_config.max_risk_amount());
+
         debug!(
             position_id = %position.id,
             signal_id = %signal.signal_id,
@@ -564,7 +596,11 @@ impl Engine {
         ];
 
         // Position stays Armed — Entering only after EntryOrderAccepted from executor.
-        Ok(EngineDecision::with_actions(actions))
+        Ok(EngineDecision {
+            actions,
+            updated_position: None,
+            planned_entry_risk: Some(planned_entry_risk),
+        })
     }
 
     /// Process entry order fill

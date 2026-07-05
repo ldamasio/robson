@@ -806,6 +806,7 @@ mod tests {
             entry_price: dec!(50000),
             notional_value: dec!(1000),
             initial_margin: dec!(100),
+            planned_risk: dec!(100),
         }
     }
 
@@ -965,6 +966,7 @@ mod tests {
             entry_price: dec!(95000),
             notional_value: dec!(400),
             initial_margin: dec!(40),
+            planned_risk: dec!(40),
         };
 
         let governed = engine
@@ -996,6 +998,7 @@ mod tests {
             entry_price: dec!(95000),
             notional_value: dec!(1000),
             initial_margin: dec!(100),
+            planned_risk: dec!(100),
         };
 
         let governed = engine

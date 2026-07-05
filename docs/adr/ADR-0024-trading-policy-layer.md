@@ -277,6 +277,17 @@ MIG-v3#12's dynamic new-entry capacity is computed by the backend and exposed to
 
 Full Risk Dashboard (budget bar, realized-loss display) is deferred to MIG-v3#14. See [ADR-0034](ADR-0034-frontend-slot-count-api-only.md) for the decision record.
 
+**Amendment (2026-07-05, ADR-0043 — Budget-Metered Entry Admission)**:
+
+Decision 5's admission rule is superseded in part. Entries are now admitted by
+their actual planned worst-case loss (`remaining_budget ≥ planned_risk`), not
+by reserving the full 1% cap (`remaining_budget ≥ risk_per_trade_amount`).
+`slots_available` remains as the guaranteed minimum of full-cap entries (a
+display floor, not a ceiling), and the MonthlyHalt trigger moves from
+`remaining_budget < risk_per_trade_amount` to `remaining_budget ≤ 0`. The 4%
+monthly budget and the 1% per-trade cap are unchanged. See
+[ADR-0043](ADR-0043-budget-metered-entry-admission.md).
+
 ---
 
 ## Implementation Status (2026-04-19)
