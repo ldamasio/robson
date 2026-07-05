@@ -42,5 +42,6 @@ Index
 | ADR-0043 | Budget-Metered Entry Admission | Decided | 2026-07-05 |
 | ADR-0044 | REST Market-Data Fallback for the Trailing Engine | Decided (Implementation pending) | 2026-07-05 |
 | ADR-0045 | Income-Ledger Reconciliation; Drift Demoted to Checksum | Decided (Hotfix shipped; ledger pending) | 2026-07-05 |
+| ADR-0046 | Monthly High-Water-Mark Budget (Trailing Month) | Decided (Implementation pending) | 2026-07-05 |
 
 Files located in `docs/adr/`.
