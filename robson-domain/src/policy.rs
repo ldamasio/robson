@@ -140,18 +140,21 @@ impl TradingPolicy {
         capital_base * self.max_monthly_drawdown_pct / Decimal::from(100)
     }
 
-    /// Remaining monthly risk budget (ADR-0024 Decision 5):
-    /// `monthly_budget − realized_loss − latent_risk`.
+    /// Remaining monthly risk budget (ADR-0046):
+    /// `monthly_budget − budget_consumed − latent_risk`.
+    ///
+    /// `budget_consumed` is the give-back from the month's governed equity
+    /// peak (`month_peak_net − month_equity_net`), not gross realized loss.
     ///
     /// May be negative when realized losses plus open-position latent risk
     /// exceed the budget (e.g. after out-of-band account changes).
     pub fn remaining_budget(
         &self,
         capital_base: Decimal,
-        realized_loss: Decimal,
+        budget_consumed: Decimal,
         latent_risk: Decimal,
     ) -> Decimal {
-        self.monthly_budget(capital_base) - realized_loss - latent_risk
+        self.monthly_budget(capital_base) - budget_consumed - latent_risk
     }
 
     /// Budget-metered admission for one proposed entry (ADR-0043).
@@ -168,7 +171,7 @@ impl TradingPolicy {
     pub fn can_admit(
         &self,
         capital_base: Decimal,
-        realized_loss: Decimal,
+        budget_consumed: Decimal,
         latent_risk: Decimal,
         planned_risk: Decimal,
     ) -> bool {
@@ -187,7 +190,7 @@ impl TradingPolicy {
         if charge > cap {
             return false;
         }
-        self.remaining_budget(capital_base, realized_loss, latent_risk) >= charge
+        self.remaining_budget(capital_base, budget_consumed, latent_risk) >= charge
     }
 
     /// Guaranteed minimum of new full-cap entries (ADR-0024 Decision 5,
@@ -204,7 +207,7 @@ impl TradingPolicy {
     pub fn slots_available(
         &self,
         capital_base: Decimal,
-        realized_loss: Decimal,
+        budget_consumed: Decimal,
         latent_risk: Decimal,
     ) -> u32 {
         if capital_base <= Decimal::ZERO {
@@ -214,7 +217,7 @@ impl TradingPolicy {
         if risk_amount <= Decimal::ZERO {
             return 0;
         }
-        let remaining = self.remaining_budget(capital_base, realized_loss, latent_risk);
+        let remaining = self.remaining_budget(capital_base, budget_consumed, latent_risk);
         if remaining < risk_amount {
             return 0;
         }
@@ -307,35 +310,35 @@ mod tests {
     #[test]
     fn slots_available_basic() {
         let p = TradingPolicy::default();
-        // capital=100, budget=4, risk=1, 0 loss, 0 latent → 4 slots
+        // capital=100, budget=4, risk=1, 0 consumed, 0 latent → 4 slots
         assert_eq!(p.slots_available(dec!(100), dec!(0), dec!(0)), 4);
     }
 
     #[test]
-    fn slots_available_with_realized_loss() {
+    fn slots_available_with_budget_consumed() {
         let p = TradingPolicy::default();
-        // budget=4, loss=1, risk=1 → (4-1)/1 = 3 slots
+        // budget=4, consumed=1, risk=1 → (4-1)/1 = 3 slots
         assert_eq!(p.slots_available(dec!(100), dec!(1), dec!(0)), 3);
     }
 
     #[test]
     fn slots_available_with_latent_risk() {
         let p = TradingPolicy::default();
-        // budget=4, loss=0, latent=1, risk=1 → (4-0-1)/1 = 3 slots
+        // budget=4, consumed=0, latent=1, risk=1 → (4-0-1)/1 = 3 slots
         assert_eq!(p.slots_available(dec!(100), dec!(0), dec!(1)), 3);
     }
 
     #[test]
     fn slots_available_combined() {
         let p = TradingPolicy::default();
-        // budget=4, loss=1, latent=1, risk=1 → (4-1-1)/1 = 2 slots
+        // budget=4, consumed=1, latent=1, risk=1 → (4-1-1)/1 = 2 slots
         assert_eq!(p.slots_available(dec!(100), dec!(1), dec!(1)), 2);
     }
 
     #[test]
     fn slots_available_exhausted() {
         let p = TradingPolicy::default();
-        // budget=4, loss=1, latent=3 → remaining=0 < 1 → 0
+        // budget=4, consumed=1, latent=3 → remaining=0 < 1 → 0
         assert_eq!(p.slots_available(dec!(100), dec!(1), dec!(3)), 0);
     }
 

@@ -39,13 +39,14 @@ pub(crate) async fn handle_month_boundary_reset(
 
     sqlx::query(
         r#"
-        INSERT INTO monthly_state (year, month, capital_base, carried_risk, realized_loss, trades_opened, created_at)
-        VALUES ($1, $2, $3, $4, 0, 0, $5)
+        INSERT INTO monthly_state (year, month, capital_base, carried_risk, realized_loss, trades_opened, month_peak_net, created_at)
+        VALUES ($1, $2, $3, $4, 0, 0, 0, $5)
         ON CONFLICT (year, month) DO UPDATE SET
             capital_base = EXCLUDED.capital_base,
             carried_risk = EXCLUDED.carried_risk,
             realized_loss = 0,
-            trades_opened = 0
+            trades_opened = 0,
+            month_peak_net = 0
         "#,
     )
     .bind(year)
@@ -80,8 +81,8 @@ pub(crate) async fn handle_capital_base_recalibrated(
 
     sqlx::query(
         r#"
-        INSERT INTO monthly_state (year, month, capital_base, carried_risk, realized_loss, trades_opened, created_at)
-        VALUES ($1, $2, $3, $4, 0, 0, $5)
+        INSERT INTO monthly_state (year, month, capital_base, carried_risk, realized_loss, trades_opened, month_peak_net, created_at)
+        VALUES ($1, $2, $3, $4, 0, 0, 0, $5)
         ON CONFLICT (year, month) DO UPDATE SET
             capital_base = EXCLUDED.capital_base,
             carried_risk = EXCLUDED.carried_risk
@@ -106,7 +107,7 @@ pub(crate) async fn handle_entry_filled_monthly(
     pool: &PgPool,
     envelope: &EventEnvelope,
 ) -> Result<()> {
-    let payload: EntryFilled = serde_json::from_value(envelope.payload.clone()).map_err(|e| {
+    let _payload: EntryFilled = serde_json::from_value(envelope.payload.clone()).map_err(|e| {
         ProjectionError::InvalidPayload {
             event_type: envelope.event_type.clone(),
             reason: e.to_string(),
@@ -118,8 +119,8 @@ pub(crate) async fn handle_entry_filled_monthly(
 
     sqlx::query(
         r#"
-        INSERT INTO monthly_state (year, month, capital_base, realized_loss, trades_opened, created_at)
-        VALUES ($1, $2, 0, 0, 1, $3)
+        INSERT INTO monthly_state (year, month, capital_base, realized_loss, trades_opened, month_peak_net, created_at)
+        VALUES ($1, $2, 0, 0, 1, 0, $3)
         ON CONFLICT (year, month) DO UPDATE SET
             trades_opened = monthly_state.trades_opened + 1
         "#,
@@ -161,8 +162,8 @@ pub(crate) async fn handle_position_closed_monthly(
 
     sqlx::query(
         r#"
-        INSERT INTO monthly_state (year, month, capital_base, realized_loss, trades_opened, created_at)
-        VALUES ($1, $2, 0, $3, 0, $4)
+        INSERT INTO monthly_state (year, month, capital_base, realized_loss, trades_opened, month_peak_net, created_at)
+        VALUES ($1, $2, 0, $3, 0, 0, $4)
         ON CONFLICT (year, month) DO UPDATE SET
             realized_loss = monthly_state.realized_loss + $3
         "#,

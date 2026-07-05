@@ -30,7 +30,7 @@ use axum::{
 use chrono::{Datelike, Duration as ChronoDuration, Utc};
 use robson_domain::{
     ApprovalPolicy as DomainApprovalPolicy, DetectorSignal, EntryPolicy, EntryPolicyConfig,
-    Position, PositionState, Price, RiskConfig, Side, Symbol, TradingPolicy,
+    Position, PositionState, Price, Side, Symbol, TradingPolicy,
 };
 use robson_exec::{ExchangePort, ExchangePosition, UniversalTransferType};
 #[cfg(feature = "postgres")]
@@ -155,6 +155,15 @@ pub struct StatusResponse {
     pub monthly_realized_loss: Decimal,
     /// Governed realized loss as a percentage of capital_base.
     pub monthly_realized_loss_pct: Decimal,
+    /// Governed month equity net: realized net plus unrealized PnL of open
+    /// Robson positions (ADR-0046).
+    pub month_equity_net: Decimal,
+    /// Persisted high-water mark of governed month equity net (ADR-0046).
+    pub month_peak_net: Decimal,
+    /// Monthly give-back from peak as percentage of the 4% monthly budget.
+    pub monthly_giveback_pct: Decimal,
+    /// Remaining monthly budget after give-back and latent risk.
+    pub monthly_budget_remaining: Decimal,
     /// Starting capital basis for the current month.
     pub capital_base: Decimal,
     /// Current futures wallet balance reported by the exchange.
@@ -1218,6 +1227,18 @@ where
     } else {
         Decimal::ZERO
     };
+    let (
+        month_equity_net,
+        month_peak_net,
+        monthly_giveback,
+        monthly_budget_remaining,
+        monthly_budget,
+    ) = manager.monthly_budget_snapshot(now).await.map_err(|e| to_error_response(e))?;
+    let monthly_giveback_pct = if monthly_budget > Decimal::ZERO {
+        monthly_giveback / monthly_budget * Decimal::from(100u32)
+    } else {
+        Decimal::ZERO
+    };
 
     let mut summaries: Vec<PositionSummary> = Vec::with_capacity(positions.len());
     for position in &positions {
@@ -1277,6 +1298,10 @@ where
         slot_cells_total,
         monthly_realized_loss: governed_monthly_realized_loss,
         monthly_realized_loss_pct,
+        month_equity_net,
+        month_peak_net,
+        monthly_giveback_pct,
+        monthly_budget_remaining,
         capital_base: monthly.capital_base,
         wallet_balance,
     }))
