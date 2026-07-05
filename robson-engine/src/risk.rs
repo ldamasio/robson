@@ -124,14 +124,19 @@ pub struct RiskContext {
     pub open_positions: Vec<PositionSummary>,
     /// Total notional exposure across all positions
     pub total_notional_exposure: Decimal,
-    /// Monthly realized PnL (v3 policy: halt at -4%)
+    /// Monthly realized PnL, net of fees.
     pub monthly_realized_pnl: Decimal,
     /// Monthly unrealized PnL
     pub monthly_unrealized_pnl: Decimal,
-    /// Sum of absolute losses from closed positions this month (ADR-0024 slot
-    /// calc). Wins do NOT offset this value. Used exclusively by
-    /// `realized_loss_abs()`.
+    /// Sum of absolute losses from closed positions this month. Wins do NOT
+    /// offset this reporting value. Used exclusively by `realized_loss_abs()`.
     pub monthly_realized_loss: Decimal,
+    /// Current governed month equity net (realized net + open-position
+    /// unrealized PnL), per ADR-0046.
+    pub month_equity_net: Decimal,
+    /// Persisted high-water mark of governed month equity net, floored at zero
+    /// and monotonic within the month (ADR-0046).
+    pub month_peak_net: Decimal,
 }
 
 impl RiskContext {
@@ -144,6 +149,8 @@ impl RiskContext {
             monthly_realized_pnl: Decimal::ZERO,
             monthly_unrealized_pnl: Decimal::ZERO,
             monthly_realized_loss: Decimal::ZERO,
+            month_equity_net: Decimal::ZERO,
+            month_peak_net: Decimal::ZERO,
         }
     }
 
@@ -158,6 +165,8 @@ impl RiskContext {
             monthly_realized_pnl: Decimal::ZERO,
             monthly_unrealized_pnl: Decimal::ZERO,
             monthly_realized_loss: Decimal::ZERO,
+            month_equity_net: Decimal::ZERO,
+            month_peak_net: Decimal::ZERO,
         }
     }
 
@@ -182,17 +191,40 @@ impl RiskContext {
             monthly_realized_pnl,
             monthly_unrealized_pnl,
             monthly_realized_loss,
+            month_equity_net: monthly_realized_pnl + monthly_unrealized_pnl,
+            month_peak_net: Decimal::ZERO,
         }
     }
 
     /// Create context with positions, monthly PnL, and the authoritative
-    /// monthly realized loss (ADR-0024: wins do not offset losses).
+    /// monthly realized loss reporting metric.
     pub fn with_monthly_state(
         capital: Decimal,
         open_positions: Vec<PositionSummary>,
         monthly_realized_pnl: Decimal,
         monthly_unrealized_pnl: Decimal,
         monthly_realized_loss: Decimal,
+    ) -> Self {
+        Self::with_month_equity(
+            capital,
+            open_positions,
+            monthly_realized_pnl,
+            monthly_unrealized_pnl,
+            monthly_realized_loss,
+            monthly_realized_pnl + monthly_unrealized_pnl,
+            Decimal::ZERO,
+        )
+    }
+
+    /// Create context with full ADR-0046 monthly high-water-mark state.
+    pub fn with_month_equity(
+        capital: Decimal,
+        open_positions: Vec<PositionSummary>,
+        monthly_realized_pnl: Decimal,
+        monthly_unrealized_pnl: Decimal,
+        monthly_realized_loss: Decimal,
+        month_equity_net: Decimal,
+        month_peak_net: Decimal,
     ) -> Self {
         let total_notional_exposure = open_positions.iter().map(|p| p.notional_value).sum();
 
@@ -203,6 +235,8 @@ impl RiskContext {
             monthly_realized_pnl,
             monthly_unrealized_pnl,
             monthly_realized_loss,
+            month_equity_net,
+            month_peak_net,
         }
     }
 
@@ -250,9 +284,15 @@ impl RiskContext {
         self.monthly_realized_loss
     }
 
-    /// Dynamic slot count via TradingPolicy (ADR-0024 Decision 5).
+    /// Budget consumed by give-back from the month's governed equity peak
+    /// (ADR-0046).
+    pub fn budget_giveback(&self) -> Decimal {
+        (self.month_peak_net - self.month_equity_net).max(Decimal::ZERO)
+    }
+
+    /// Dynamic slot count via TradingPolicy (ADR-0046).
     pub fn slots_available(&self, policy: &TradingPolicy, capital_base: Decimal) -> u32 {
-        policy.slots_available(capital_base, self.realized_loss_abs(), self.latent_risk_sum())
+        policy.slots_available(capital_base, self.budget_giveback(), self.latent_risk_sum())
     }
 }
 
@@ -423,53 +463,36 @@ impl RiskGate {
             };
         }
 
-        // 3. Check monthly drawdown hard limit (ADR-0024: sourced from policy)
-        let monthly_pnl = context.total_monthly_pnl();
-        let monthly_loss_limit =
-            context.capital * self.policy.max_monthly_drawdown_pct / Decimal::from(100);
-        if monthly_pnl <= -monthly_loss_limit {
-            debug!(
-                monthly_pnl = %monthly_pnl,
-                limit = %monthly_loss_limit,
-                "Risk check failed: monthly drawdown limit (MonthlyHalt)"
-            );
-            return RiskVerdict::Rejected {
-                check: RiskCheck::MonthlyDrawdown,
-                reason: format!(
-                    "Monthly P&L {} has exceeded drawdown limit of -{}% (MonthlyHalt triggered)",
-                    monthly_pnl, self.policy.max_monthly_drawdown_pct
-                ),
-            };
-        }
-
-        // 4. Budget-metered admission (ADR-0043: replaces the ADR-0024 slot reservation
-        //    at the full 1% cap). The trade is charged its planned worst-case loss; the
-        //    1% per-trade cap still bounds any single trade, and the 4% monthly budget
-        //    stays the hard invariant.
+        // 3. Budget-metered admission (ADR-0043/ADR-0046: replaces the ADR-0024 slot
+        //    reservation at the full 1% cap). The trade is charged its planned
+        //    worst-case loss; the 1% per-trade cap still bounds any single trade, and
+        //    the 4% monthly budget stays the hard invariant.
         let capital_base = context.capital; // MIG-v3#11 approximation; MIG-v3#12 persists real capital base.
-        let realized_loss = context.realized_loss_abs();
+        let budget_consumed = context.budget_giveback();
         let latent_risk = context.latent_risk_sum();
-        let remaining = self.policy.remaining_budget(capital_base, realized_loss, latent_risk);
+        let remaining = self.policy.remaining_budget(capital_base, budget_consumed, latent_risk);
 
         if remaining <= Decimal::ZERO {
             debug!(
                 capital_base = %capital_base,
-                realized_loss = %realized_loss,
+                budget_consumed = %budget_consumed,
+                month_equity_net = %context.month_equity_net,
+                month_peak_net = %context.month_peak_net,
                 latent_risk = %latent_risk,
                 "Risk check failed: monthly risk budget exhausted"
             );
             return RiskVerdict::Rejected {
                 check: RiskCheck::MonthlyDrawdown,
                 reason: format!(
-                    "Monthly risk budget exhausted (capital={}, realized_loss={}, latent_risk={})",
-                    capital_base, realized_loss, latent_risk
+                    "Monthly risk budget exhausted (capital={}, budget_consumed={}, latent_risk={})",
+                    capital_base, budget_consumed, latent_risk
                 ),
             };
         }
 
         if !self
             .policy
-            .can_admit(capital_base, realized_loss, latent_risk, proposed.planned_risk)
+            .can_admit(capital_base, budget_consumed, latent_risk, proposed.planned_risk)
         {
             let cap = self.policy.risk_per_trade_amount(capital_base);
             let charge = if proposed.planned_risk <= Decimal::ZERO {
@@ -561,6 +584,18 @@ mod tests {
         }
     }
 
+    fn context_with_consumed(capital: Decimal, consumed: Decimal) -> RiskContext {
+        RiskContext::with_month_equity(
+            capital,
+            vec![],
+            -consumed,
+            Decimal::ZERO,
+            consumed,
+            -consumed,
+            Decimal::ZERO,
+        )
+    }
+
     #[test]
     fn test_risk_gate_approves_normal_trade() {
         let gate = RiskGate::new();
@@ -618,14 +653,15 @@ mod tests {
     #[test]
     fn test_risk_gate_rejects_monthly_drawdown() {
         let gate = RiskGate::new();
-        let context = RiskContext {
-            capital: dec!(10000),
-            open_positions: vec![],
-            total_notional_exposure: Decimal::ZERO,
-            monthly_realized_pnl: dec!(-350),
-            monthly_unrealized_pnl: dec!(-100),
-            monthly_realized_loss: dec!(350),
-        };
+        let context = RiskContext::with_month_equity(
+            dec!(10000),
+            vec![],
+            dec!(-350),
+            dec!(-100),
+            dec!(350),
+            dec!(-450),
+            Decimal::ZERO,
+        );
         let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
@@ -638,14 +674,7 @@ mod tests {
     #[test]
     fn test_risk_gate_allows_within_monthly_drawdown() {
         let gate = RiskGate::new();
-        let context = RiskContext {
-            capital: dec!(10000),
-            open_positions: vec![],
-            total_notional_exposure: Decimal::ZERO,
-            monthly_realized_pnl: dec!(-300),
-            monthly_unrealized_pnl: dec!(0),
-            monthly_realized_loss: dec!(300),
-        };
+        let context = context_with_consumed(dec!(10000), dec!(300));
         let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
@@ -655,14 +684,7 @@ mod tests {
     #[test]
     fn test_risk_gate_allows_at_3_pct_monthly_drawdown() {
         let gate = RiskGate::new();
-        let context = RiskContext {
-            capital: dec!(10000),
-            open_positions: vec![],
-            total_notional_exposure: Decimal::ZERO,
-            monthly_realized_pnl: dec!(-300),
-            monthly_unrealized_pnl: dec!(0),
-            monthly_realized_loss: dec!(300),
-        };
+        let context = context_with_consumed(dec!(10000), dec!(300));
         let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
@@ -679,14 +701,7 @@ mod tests {
         // $100 trade does not fit, but budget remains — ADR-0043: deny with
         // RiskBudgetInsufficient, NOT MonthlyDrawdown (no MonthlyHalt).
         let gate = RiskGate::new();
-        let context = RiskContext {
-            capital: dec!(10000),
-            open_positions: vec![],
-            total_notional_exposure: Decimal::ZERO,
-            monthly_realized_pnl: dec!(-399),
-            monthly_unrealized_pnl: dec!(0),
-            monthly_realized_loss: dec!(399),
-        };
+        let context = context_with_consumed(dec!(10000), dec!(399));
         let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
@@ -704,14 +719,7 @@ mod tests {
         // ADR-0043: saved risk becomes an extra operation. With $1 of budget
         // left, a trade whose planned worst-case loss is $0.90 is admitted.
         let gate = RiskGate::new();
-        let context = RiskContext {
-            capital: dec!(10000),
-            open_positions: vec![],
-            total_notional_exposure: Decimal::ZERO,
-            monthly_realized_pnl: dec!(-399),
-            monthly_unrealized_pnl: dec!(0),
-            monthly_realized_loss: dec!(399),
-        };
+        let context = context_with_consumed(dec!(10000), dec!(399));
         let proposed = ProposedTrade {
             planned_risk: dec!(0.90),
             ..sample_proposed()
@@ -751,14 +759,7 @@ mod tests {
         // planned_risk == 0 (unpriced, e.g. legacy caller) falls back to
         // reserving the full 1% cap — the pre-ADR-0043 behavior.
         let gate = RiskGate::new();
-        let tail_context = RiskContext {
-            capital: dec!(10000),
-            open_positions: vec![],
-            total_notional_exposure: Decimal::ZERO,
-            monthly_realized_pnl: dec!(-350),
-            monthly_unrealized_pnl: dec!(0),
-            monthly_realized_loss: dec!(350),
-        };
+        let tail_context = context_with_consumed(dec!(10000), dec!(350));
         let unpriced = ProposedTrade {
             planned_risk: Decimal::ZERO,
             ..sample_proposed()
@@ -782,14 +783,7 @@ mod tests {
     #[test]
     fn test_risk_gate_blocks_at_exactly_4_pct_monthly_drawdown() {
         let gate = RiskGate::new();
-        let context = RiskContext {
-            capital: dec!(10000),
-            open_positions: vec![],
-            total_notional_exposure: Decimal::ZERO,
-            monthly_realized_pnl: dec!(-400),
-            monthly_unrealized_pnl: dec!(0),
-            monthly_realized_loss: dec!(400),
-        };
+        let context = context_with_consumed(dec!(10000), dec!(400));
         let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
@@ -829,14 +823,7 @@ mod tests {
         // NOT block the next entry while the monthly budget still has room.
         // (Regression: a phantom 1%/day limit denied entries after one stop-out.)
         let gate = RiskGate::new();
-        let context = RiskContext {
-            capital: dec!(10000),
-            open_positions: vec![],
-            total_notional_exposure: Decimal::ZERO,
-            monthly_realized_pnl: dec!(-120),
-            monthly_unrealized_pnl: Decimal::ZERO,
-            monthly_realized_loss: dec!(120),
-        };
+        let context = context_with_consumed(dec!(10000), dec!(120));
         let proposed = sample_proposed();
 
         let verdict = gate.evaluate(&proposed, &context);
@@ -905,46 +892,75 @@ mod tests {
 
     #[test]
     fn test_realized_loss_abs_negative() {
-        let ctx = RiskContext {
-            capital: dec!(10000),
-            open_positions: vec![],
-            total_notional_exposure: Decimal::ZERO,
-            monthly_realized_pnl: dec!(-150),
-            monthly_unrealized_pnl: Decimal::ZERO,
-            monthly_realized_loss: dec!(150),
-        };
+        let ctx = context_with_consumed(dec!(10000), dec!(150));
         assert_eq!(ctx.realized_loss_abs(), dec!(150));
     }
 
     #[test]
     fn test_realized_loss_abs_positive() {
-        let ctx = RiskContext {
-            capital: dec!(10000),
-            open_positions: vec![],
-            total_notional_exposure: Decimal::ZERO,
-            monthly_realized_pnl: dec!(200),
-            monthly_unrealized_pnl: Decimal::ZERO,
-            monthly_realized_loss: Decimal::ZERO,
-        };
+        let ctx = RiskContext::with_month_equity(
+            dec!(10000),
+            vec![],
+            dec!(200),
+            Decimal::ZERO,
+            Decimal::ZERO,
+            dec!(200),
+            dec!(200),
+        );
         assert_eq!(ctx.realized_loss_abs(), dec!(0));
     }
 
     #[test]
     fn test_realized_loss_is_not_offset_by_wins() {
         let policy = TradingPolicy::default();
-        let ctx = RiskContext {
-            capital: dec!(10000),
-            open_positions: vec![],
-            total_notional_exposure: Decimal::ZERO,
-            // One -100 loser and one +100 winner net to zero PnL.
-            monthly_realized_pnl: Decimal::ZERO,
-            monthly_unrealized_pnl: Decimal::ZERO,
-            // ADR-0024 slots consume the losing trade only; wins do not offset it.
-            monthly_realized_loss: dec!(100),
-        };
+        let ctx = RiskContext::with_month_equity(
+            dec!(10000),
+            vec![],
+            Decimal::ZERO,
+            Decimal::ZERO,
+            dec!(100),
+            Decimal::ZERO,
+            Decimal::ZERO,
+        );
 
         assert_eq!(ctx.realized_loss_abs(), dec!(100));
-        assert_eq!(ctx.slots_available(&policy, dec!(10000)), 3);
+        assert_eq!(ctx.slots_available(&policy, dec!(10000)), 4);
+    }
+
+    #[test]
+    fn test_positive_equity_peak_rearms_budget_until_given_back() {
+        let gate = RiskGate::new();
+        let full_cap = sample_proposed();
+        let smaller = ProposedTrade {
+            planned_risk: dec!(18),
+            ..sample_proposed()
+        };
+
+        let at_peak = RiskContext::with_month_equity(
+            dec!(10000),
+            vec![],
+            dec!(300),
+            Decimal::ZERO,
+            Decimal::ZERO,
+            dec!(300),
+            dec!(300),
+        );
+        assert_eq!(gate.evaluate(&full_cap, &at_peak), RiskVerdict::Approved);
+
+        let after_giveback = RiskContext::with_month_equity(
+            dec!(10000),
+            vec![],
+            dec!(-80),
+            Decimal::ZERO,
+            dec!(80),
+            dec!(-80),
+            dec!(300),
+        );
+        assert!(matches!(gate.evaluate(&full_cap, &after_giveback), RiskVerdict::Rejected {
+            check: RiskCheck::RiskBudgetInsufficient,
+            ..
+        }));
+        assert_eq!(gate.evaluate(&smaller, &after_giveback), RiskVerdict::Approved);
     }
 
     #[test]
