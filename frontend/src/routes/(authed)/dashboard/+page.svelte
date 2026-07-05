@@ -19,6 +19,12 @@
   import { toasts, showToast } from "$stores/toast";
   import { status as sharedStatus, refreshStatus } from "$stores/status";
   import {
+    sseFreshness,
+    markSseEvent,
+    markSseConnected,
+    markSseStale,
+  } from "$stores/sseFreshness";
+  import {
     deriveMonthSlots,
     sortPositionsOldestFirst,
   } from "$lib/config/slots";
@@ -85,23 +91,28 @@
       : false,
   );
   let monthlyBudgetLimitPct = 4;
+  let hasHwmBudget = $derived(
+    currentStatus != null && currentStatus.monthly_giveback_pct !== null,
+  );
+  let monthlyBudgetSourcePct = $derived(
+    hasHwmBudget
+      ? (currentStatus?.monthly_giveback_pct ?? 0)
+      : (currentStatus?.monthly_realized_loss_pct ?? 0),
+  );
   // With no open positions (latent risk 0), slots hit zero either because
   // monthly losses left less than one 1%-risk slot in the 4% budget, or
   // because the capital itself is too small. Only the latter is fixable by
   // adding funds.
   let monthlyBudgetExhausted = $derived(
     insufficientCapital &&
-      (currentStatus?.monthly_realized_loss_pct ?? 0) >
-        monthlyBudgetLimitPct - 1,
+      monthlyBudgetSourcePct > monthlyBudgetLimitPct - 1,
   );
   let budgetUsedPct = $derived(
     Math.min(
       100,
       Math.max(
         0,
-        ((currentStatus?.monthly_realized_loss_pct ?? 0) /
-          monthlyBudgetLimitPct) *
-          100,
+        (monthlyBudgetSourcePct / monthlyBudgetLimitPct) * 100,
       ),
     ),
   );
@@ -255,6 +266,7 @@
     stopSse();
     closeSse = connectEventStream(
       (event: SseEvent) => {
+        markSseEvent();
         pushEvent(event);
         const payload = event.payload as Record<string, unknown>;
         const posId = payload.position_id as string | undefined;
@@ -270,7 +282,13 @@
       },
       () => {
         connected = true;
+        markSseConnected();
         void loadStatus();
+      },
+      (staleSecs) => {
+        markSseStale();
+        connected = false;
+        console.warn(`SSE stale for ${staleSecs}s, reconnecting`);
       },
     );
   }
@@ -306,12 +324,14 @@
     untrack(() => {
       void load();
       startSse();
+      sseFreshness.start();
       approvalTickTimer = setInterval(() => {
         approvalTick = Date.now();
       }, 1000);
     });
     return () => {
       stopSse();
+      sseFreshness.stop();
       if (approvalTickTimer) {
         clearInterval(approvalTickTimer);
         approvalTickTimer = null;
@@ -356,6 +376,18 @@
             {topBarLabel()} · SLOT {occupied}/{displayedSlots}
           {/if}
         </div>
+        {#if !error}
+          <span
+            class="sse-badge"
+            class:live={$sseFreshness.fresh}
+            class:stale={!$sseFreshness.fresh}
+            title={$sseFreshness.fresh
+              ? "Event stream is fresh"
+              : `No SSE data for ${$sseFreshness.staleSeconds}s`}
+          >
+            {$sseFreshness.fresh ? "LIVE" : "STALE — reconnecting"}
+          </span>
+        {/if}
       </Row>
       <Row gap={3} align="center">
         {#if isHistoricalMonth}
@@ -407,12 +439,23 @@
               <Stack gap={3}>
                 <Row justify="between" align="center">
                   <span class="label">MONTHLY LIMIT</span>
-                  <span class="mono"
-                    >{formatPct(currentStatus.monthly_realized_loss_pct)} of a
-                    {monthlyBudgetLimitPct.toFixed(1)}% limit</span
-                  >
-                <span class="meta dim">Excludes out-of-band drift</span>
+                  <span class="mono">
+                    {formatPct(monthlyBudgetSourcePct)} of a
+                    {monthlyBudgetLimitPct.toFixed(1)}% limit
+                  </span>
                 </Row>
+                {#if hasHwmBudget}
+                  <span class="meta dim"
+                    >From month equity peak · Excludes out-of-band drift</span
+                  >
+                  <span class="meta dim">
+                    peak {formatMoney(currentStatus.month_peak_net)} · now {formatMoney(
+                      currentStatus.month_equity_net,
+                    )}
+                  </span>
+                {:else}
+                  <span class="meta dim">Excludes out-of-band drift</span>
+                {/if}
                 <div
                   class="budget-bar"
                   aria-label="Monthly realized loss budget"
@@ -430,11 +473,17 @@
                 <span class="loss-value"
                   >{formatMoney(currentStatus.monthly_realized_loss)}</span
                 >
-                <span class="meta dim"
-                  >{formatPct(currentStatus.monthly_realized_loss_pct)} OF
-                  {formatMoney(currentStatus.capital_base)}</span
-                >
-                <span class="meta dim">Governed Robson flow only</span>
+                {#if hasHwmBudget}
+                  <span class="meta dim"
+                    >Informational · Governed Robson flow only</span
+                  >
+                {:else}
+                  <span class="meta dim"
+                    >{formatPct(currentStatus.monthly_realized_loss_pct)} OF
+                    {formatMoney(currentStatus.capital_base)}</span
+                  >
+                  <span class="meta dim">Governed Robson flow only</span>
+                {/if}
               </Stack>
             </Card>
             <Card padding={4}>
@@ -723,6 +772,25 @@
   }
   .dot.warn {
     background: var(--warn, #f59e0b);
+  }
+  .sse-badge {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    letter-spacing: var(--track-wide);
+    text-transform: uppercase;
+    padding: var(--s-1) var(--s-2);
+    border-radius: var(--radius-sm);
+    border: 1px solid transparent;
+  }
+  .sse-badge.live {
+    color: var(--ok);
+    border-color: var(--ok);
+    background: rgba(127, 183, 126, 0.08);
+  }
+  .sse-badge.stale {
+    color: var(--warn, #f59e0b);
+    border-color: var(--warn, #f59e0b);
+    background: rgba(245, 158, 11, 0.08);
   }
   .eyebrow {
     font-family: var(--font-mono);

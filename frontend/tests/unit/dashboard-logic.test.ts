@@ -213,6 +213,10 @@ describe("dashboard slot derivation from status response", () => {
       monthly_realized_loss_pct: 0,
       capital_base: 10000,
       wallet_balance: 10000,
+      month_equity_net: null,
+      month_peak_net: null,
+      monthly_giveback_pct: null,
+      monthly_budget_remaining: null,
     };
     const slots = deriveSlots(status.positions, status.slot_cells_total);
     expect(slots).toHaveLength(7);
