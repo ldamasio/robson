@@ -1075,6 +1075,7 @@ mod tests {
             symbol: robson_domain::Symbol::from_pair(symbol).unwrap(),
             price: Price::new(price).unwrap(),
             timestamp: Utc::now(),
+            source: crate::event_bus::MarketDataSource::Ws,
         }
     }
 

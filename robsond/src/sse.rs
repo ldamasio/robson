@@ -253,6 +253,7 @@ mod tests {
             symbol: test_symbol(),
             price: Price::new(dec!(95000)).unwrap(),
             timestamp: Utc::now(),
+            source: crate::event_bus::MarketDataSource::Ws,
         })
     }
 

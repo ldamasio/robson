@@ -26,7 +26,7 @@ use chrono::{DateTime, Datelike, Utc};
 use robson_connectors::BinanceRestClient;
 #[cfg(feature = "postgres")]
 use robson_domain::{ApprovalPolicy, EntryPolicy, EntryPolicyConfig};
-use robson_domain::{Position, PositionId, PositionState, Symbol, TradingPolicy};
+use robson_domain::{Position, PositionId, PositionState, Price, Symbol, TradingPolicy};
 use robson_engine::Engine;
 #[cfg(feature = "postgres")]
 use robson_eventlog::{query_events, EventEnvelope, QueryOptions};
@@ -62,7 +62,7 @@ use crate::{
     config::{Config, StartupStaleActivePolicy},
     error::{DaemonError, DaemonResult, StartupStaleActiveInfo},
     event_bus::{DaemonEvent, EventBus},
-    market_data::MarketDataManager,
+    market_data::{FallbackSupport, FeedHealth, MarketDataManager, RestFallbackConfig},
     position_manager::{PositionManager, ReconcileCloseOutcome, ReconciledCloseInput},
     position_monitor::{PositionMonitor, PositionMonitorConfig as RuntimePositionMonitorConfig},
     query_engine::{QueryRecorder, TracingQueryRecorder},
@@ -72,6 +72,28 @@ use crate::{
 // =============================================================================
 // Daemon
 // =============================================================================
+
+/// REST-fallback support wired to the exchange port and position store
+/// (ADR-0044): a snapshot price for the degraded market-data mode, and the
+/// risk-open gate that limits polling to symbols carrying positions.
+struct DaemonFallbackSupport<E: ExchangePort + 'static, S: Store + 'static> {
+    exchange: Arc<E>,
+    position_manager: Arc<RwLock<PositionManager<E, S>>>,
+}
+
+#[async_trait::async_trait]
+impl<E: ExchangePort + 'static, S: Store + 'static> FallbackSupport
+    for DaemonFallbackSupport<E, S>
+{
+    async fn rest_price(&self, symbol: &Symbol) -> Result<Price, String> {
+        self.exchange.get_price(symbol).await.map_err(|e| e.to_string())
+    }
+
+    async fn has_risk_open(&self, symbol: &Symbol) -> bool {
+        let manager = self.position_manager.read().await;
+        manager.has_risk_open_on_symbol(symbol).await
+    }
+}
 
 /// The main Robson daemon.
 pub struct Daemon<E: ExchangePort + 'static, S: Store + 'static> {
@@ -646,19 +668,37 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
             }
         });
 
-        // 7. Spawn WebSocket clients (Phase 6: Market Data)
+        // 7. Spawn WebSocket clients (Phase 6: Market Data) plus the REST fallback
+        //    companion per symbol (ADR-0044): if the WS feed goes silent past the
+        //    watchdog while a risk-open position exists, the fallback polls the
+        //    exchange REST price into the same pipeline so the trailing engine never
+        //    starves.
         let ws_use_testnet =
             std::env::var("ROBSON_BINANCE_USE_TESTNET").unwrap_or_default() == "true";
         let market_data_manager =
             MarketDataManager::new(self.event_bus.clone(), shutdown.clone(), ws_use_testnet);
-        let mut ws_handles = Vec::with_capacity(self.config.market_data.symbols.len());
+        let fallback_cfg = RestFallbackConfig::from_env();
+        let fallback_support: Arc<dyn FallbackSupport> = Arc::new(DaemonFallbackSupport {
+            exchange: Arc::clone(&self.exchange),
+            position_manager: Arc::clone(&self.position_manager),
+        });
+        let mut ws_handles = Vec::with_capacity(self.config.market_data.symbols.len() * 2);
         for symbol_str in &self.config.market_data.symbols {
             let symbol = Symbol::from_pair(symbol_str).map_err(|e| {
                 DaemonError::Config(format!("Invalid symbol {}: {}", symbol_str, e))
             })?;
-            let handle = market_data_manager.spawn_ws_client(symbol)?;
+            let health = Arc::new(FeedHealth::new());
+            let handle =
+                market_data_manager.spawn_ws_client(symbol.clone(), Arc::clone(&health))?;
             ws_handles.push(handle);
-            info!(symbol = %symbol_str, "WebSocket client spawned");
+            let fallback_handle = market_data_manager.spawn_rest_fallback(
+                symbol,
+                health,
+                Arc::clone(&fallback_support),
+                fallback_cfg,
+            );
+            ws_handles.push(fallback_handle);
+            info!(symbol = %symbol_str, "WebSocket client + REST fallback spawned");
         }
 
         // 8. Spawn projection worker (if pg_pool configured)

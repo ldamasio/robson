@@ -146,6 +146,18 @@ pub enum DaemonEvent {
     Shutdown,
 }
 
+/// Which data path produced a market data update (ADR-0044).
+///
+/// The trailing engine is source-agnostic by design; the tag exists for
+/// observability and audit, never for behavioral branching downstream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MarketDataSource {
+    /// Streaming WebSocket tick (primary path).
+    Ws,
+    /// REST polling while the WS feed is silent (degraded path, ADR-0044).
+    RestFallback,
+}
+
 /// Market data price update.
 #[derive(Debug, Clone)]
 pub struct MarketData {
@@ -155,6 +167,8 @@ pub struct MarketData {
     pub price: Price,
     /// When this price was observed
     pub timestamp: DateTime<Utc>,
+    /// Which data path produced this update (ADR-0044)
+    pub source: MarketDataSource,
 }
 
 /// Order fill notification.
@@ -339,6 +353,7 @@ mod tests {
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
             price: Price::new(dec!(96000)).unwrap(),
             timestamp: Utc::now(),
+            source: MarketDataSource::Ws,
         };
 
         bus.send(DaemonEvent::MarketData(market_data));
