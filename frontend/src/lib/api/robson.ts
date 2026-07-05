@@ -94,6 +94,13 @@ export type StatusResponse = {
   monthly_realized_loss_pct: number;
   capital_base: number;
   wallet_balance: number;
+  // High-water-mark budget metrics (ADR-0046). Backend sends these as decimal
+  // strings; absence means we are talking to an older backend and should fall
+  // back to the legacy monthly_realized_loss display.
+  month_equity_net: number | null;
+  month_peak_net: number | null;
+  monthly_giveback_pct: number | null;
+  monthly_budget_remaining: number | null;
 };
 
 export type ArmEntryPolicy = {
@@ -360,6 +367,10 @@ function normalizeStatus(raw: StatusResponse): StatusResponse {
     ),
     capital_base: requireNumber(raw.capital_base, "capital_base"),
     wallet_balance: requireNumber(raw.wallet_balance, "wallet_balance"),
+    month_equity_net: toNumber(raw.month_equity_net),
+    month_peak_net: toNumber(raw.month_peak_net),
+    monthly_giveback_pct: toNumber(raw.monthly_giveback_pct),
+    monthly_budget_remaining: toNumber(raw.monthly_budget_remaining),
   };
 }
 
@@ -381,6 +392,7 @@ export function connectEventStream(
   onEvent: (event: SseEvent) => void,
   onError?: (err: Event) => void,
   onReconnect?: () => void,
+  onStale?: (staleSecs: number) => void,
 ): () => void {
   if (!browser) return () => {};
 
@@ -394,7 +406,9 @@ export function connectEventStream(
     }
   ).__RBX_EVENT_SOURCE_FACTORY__;
 
-  const source = factory ? factory(url) : new FetchEventSource(url, token, onReconnect);
+  const source = factory
+    ? factory(url)
+    : new FetchEventSource(url, token, onReconnect, onStale);
 
   source.onmessage = (msg) => {
     try {
@@ -416,26 +430,32 @@ export class FetchEventSource implements EventSourceLike {
   onmessage: ((this: EventSource, ev: MessageEvent) => unknown) | null = null;
   onerror: ((this: EventSource, ev: Event) => unknown) | null = null;
 
-  private controller = new AbortController();
+  private currentController: AbortController | null = null;
+  private closed = false;
   private retries = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   private static readonly MAX_RECONNECT_MS = 30_000;
+  private static readonly READ_IDLE_TIMEOUT_MS = 45_000;
 
   constructor(
     url: string,
     token: string | null,
     private readonly onReconnect?: () => void,
+    private readonly onStale?: (staleSecs: number) => void,
   ) {
     this.connect(url, token);
   }
 
   private scheduleReconnect(url: string, token: string | null): void {
-    if (this.controller.signal.aborted) return;
-    const delay = Math.min(1_000 * 2 ** this.retries, FetchEventSource.MAX_RECONNECT_MS);
+    if (this.closed) return;
+    const delay = Math.min(
+      1_000 * 2 ** this.retries,
+      FetchEventSource.MAX_RECONNECT_MS,
+    );
     this.retries++;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      if (!this.controller.signal.aborted) this.connect(url, token);
+      if (!this.closed) this.connect(url, token);
     }, delay);
   }
 
@@ -443,14 +463,36 @@ export class FetchEventSource implements EventSourceLike {
     const headers: Record<string, string> = { Accept: `text/event-stream` };
     if (token) headers[`Authorization`] = `Bearer ${token}`;
 
+    let idleTimer: ReturnType<typeof setTimeout> | null = null;
+    const clearIdle = () => {
+      if (idleTimer) {
+        clearTimeout(idleTimer);
+        idleTimer = null;
+      }
+    };
+    const resetIdle = () => {
+      clearIdle();
+      idleTimer = setTimeout(() => {
+        clearIdle();
+        this.onerror?.call({} as EventSource, new Event(`error`));
+        this.onStale?.(FetchEventSource.READ_IDLE_TIMEOUT_MS / 1_000);
+        this.currentController?.abort();
+        this.scheduleReconnect(url, token);
+      }, FetchEventSource.READ_IDLE_TIMEOUT_MS);
+    };
+
     try {
+      this.currentController = new AbortController();
       const res = await fetch(url, {
         headers,
-        signal: this.controller.signal,
+        signal: this.currentController.signal,
       });
-      if (!res.ok || !res.body) {
-        this.onerror?.call({} as EventSource, new Event(`error`));
-        this.scheduleReconnect(url, token);
+      if (this.closed || !res.ok || !res.body) {
+        clearIdle();
+        if (!this.closed) {
+          this.onerror?.call({} as EventSource, new Event(`error`));
+          this.scheduleReconnect(url, token);
+        }
         return;
       }
 
@@ -459,10 +501,13 @@ export class FetchEventSource implements EventSourceLike {
       this.retries = 0; // reset backoff on successful stream start
       const decoder = new TextDecoder();
       let buf = ``;
+      resetIdle();
 
       while (true) {
         const { done, value } = await reader.read();
+        resetIdle();
         if (done) {
+          clearIdle();
           this.scheduleReconnect(url, token);
           break;
         }
@@ -478,7 +523,8 @@ export class FetchEventSource implements EventSourceLike {
         }
       }
     } catch (err) {
-      if ((err as DOMException)?.name === "AbortError") return;
+      clearIdle();
+      if ((err as DOMException)?.name === "AbortError" || this.closed) return;
       this.onerror?.call({} as EventSource, new Event(`error`));
       this.scheduleReconnect(url, token);
     }
@@ -487,9 +533,8 @@ export class FetchEventSource implements EventSourceLike {
   /** Parse a single SSE text block and emit onmessage for data lines. */
   private dispatchSseEvent(text: string): void {
     let data = ``;
-    for (const line of text.split(`
-`)) {
-      if (line.startsWith(`：`)) continue; // comment / heartbeat
+    for (const line of text.split(`\n`)) {
+      if (line.startsWith(`:`)) continue; // comment / heartbeat
       if (line.startsWith(`data:`)) {
         data += line.slice(5);
       }
@@ -502,11 +547,12 @@ export class FetchEventSource implements EventSourceLike {
   }
 
   close(): void {
+    this.closed = true;
     if (this.reconnectTimer) {
       clearTimeout(this.reconnectTimer);
       this.reconnectTimer = null;
     }
-    this.controller.abort();
+    this.currentController?.abort();
   }
 }
 

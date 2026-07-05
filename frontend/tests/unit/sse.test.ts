@@ -17,9 +17,15 @@ type SseSource = {
 function buildSource(
   fetchImpl: typeof fetch,
   onReconnect?: () => void,
+  onStale?: (staleSecs: number) => void,
 ): SseSource {
   vi.stubGlobal('fetch', fetchImpl);
-  return new FetchEventSource('http://localhost/events', null, onReconnect) as unknown as SseSource;
+  return new FetchEventSource(
+    'http://localhost/events',
+    null,
+    onReconnect,
+    onStale,
+  ) as unknown as SseSource;
 }
 
 describe('FetchEventSource reconnect backoff', () => {
@@ -185,6 +191,86 @@ describe('FetchEventSource reconnect backoff', () => {
     expect(callCount).toBeGreaterThan(before);
 
     src.close();
+  });
+});
+
+// --- Read-idle watchdog ---
+describe('FetchEventSource read-idle watchdog', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+  });
+
+  afterEach(() => {
+    vi.useRealTimers();
+    vi.unstubAllGlobals();
+  });
+
+  it('calls onStale and reconnects when no bytes arrive for 45s', async () => {
+    let callCount = 0;
+    const onStale = vi.fn();
+    const fakeFetch = vi.fn().mockImplementation(async () => {
+      callCount++;
+      const stream = new ReadableStream({
+        start() {
+          // never enqueue; the watchdog should abort this idle read
+        },
+      });
+      return { ok: true, body: stream } as unknown as Response;
+    });
+
+    buildSource(fakeFetch, undefined, onStale);
+
+    await flush();
+    expect(callCount).toBe(1);
+    expect(onStale).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(30_000);
+    await flush();
+    expect(onStale).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(15_100);
+    await flush();
+    expect(onStale).toHaveBeenCalledTimes(1);
+    expect(onStale).toHaveBeenCalledWith(45);
+
+    // A reconnect should be scheduled at 1s backoff
+    await vi.advanceTimersByTimeAsync(1_100);
+    await flush();
+    expect(callCount).toBe(2);
+  });
+
+  it('resets the idle timer on every chunk', async () => {
+    let callCount = 0;
+    const onStale = vi.fn();
+    const encoder = new TextEncoder();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let streamCtrl: any = null;
+    const fakeFetch = vi.fn().mockImplementation(async () => {
+      callCount++;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          streamCtrl = controller;
+        },
+      });
+      return { ok: true, body: stream } as unknown as Response;
+    });
+
+    buildSource(fakeFetch, undefined, onStale);
+
+    await flush();
+    expect(callCount).toBe(1);
+
+    // 44s without data would normally trip the watchdog, but a chunk resets it
+    await vi.advanceTimersByTimeAsync(44_000);
+    await flush();
+    streamCtrl?.enqueue(encoder.encode(':heartbeat\n\n'));
+    await flush();
+    expect(onStale).not.toHaveBeenCalled();
+
+    // Watchdog fires 45s after the last received chunk
+    await vi.advanceTimersByTimeAsync(45_100);
+    await flush();
+    expect(onStale).toHaveBeenCalledTimes(1);
   });
 });
 
