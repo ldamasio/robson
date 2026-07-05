@@ -1,0 +1,18 @@
+# osv-scanner exceptions (guardrails CI — AGENTS.md invariant 14).
+#
+# Every entry here is a documented, dated exception for a finding with NO
+# fixed release on our dependency path. Never add an entry for a finding
+# that has a fix — update the dependency instead. Re-audit on each entry's
+# stated condition.
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2023-0071"
+reason = "rsa (Marvin timing attack): no fixed release exists. Pulled into Cargo.lock via sqlx's optional sqlx-mysql — robson enables postgres only, so rsa is never compiled into any binary. Re-evaluate when rsa ships a fix or sqlx drops the optional edge. (2026-07-05)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2024-0437"
+reason = "protobuf 2.x (recursion crash in parsing): fix requires protobuf 3.x, a semver-major only consumable when prometheus updates its dependency. Exposure is limited to the /metrics exposition path, which is cluster-internal. Re-evaluate on prometheus crate releases. (2026-07-05)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2025-0134"
+reason = "rustls-pemfile 1.x is unmaintained (advisory, not a vulnerability); no fixed 1.x release. Transitive via sqlx TLS setup; migration follows sqlx. (2026-07-05)"

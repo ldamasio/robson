@@ -67,6 +67,9 @@ If this file and `AGENTS.md` ever diverge, `AGENTS.md` is the source of truth.
   orders; maker-first fee optimization is permitted only on entries, where
   non-execution is costless. The 1% per-trade budget is a worst-case cap that
   prices in execution costs. See ADR-0039 and ADR-0040.
+- **RBX engineering guardrails are mandatory** — before planning architecture,
+  implementing, or reviewing code, apply the checklist in
+  `.agents/rbx-engineering-guardrails.md`. CI enforces it via `guardrails.yml`.
 
 ## Commit Policy
 

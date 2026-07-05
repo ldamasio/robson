@@ -1,0 +1,18 @@
+# Gitleaks configuration (ADR guardrails CI — see AGENTS.md invariant 14).
+#
+# Allowlisted paths contain documentation example tokens and SQL test
+# literals only — verified no real credentials on 2026-07-05. Real secrets
+# must never be allowlisted here; rotate them instead.
+
+[extend]
+useDefault = true
+
+[allowlist]
+description = "Documentation examples and test literals (audited 2026-07-05)"
+paths = [
+  '''docs/archive/AUTH_FLOW\.md''',
+  '''docs/requirements/robson-api-requirements\.md''',
+  '''docs/specs/robson-api-v1-spec\.md''',
+  '''justfile''',
+  '''\.env\.example$''',
+]
