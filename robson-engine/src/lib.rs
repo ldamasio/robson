@@ -370,12 +370,20 @@ pub struct EngineDecision {
 impl EngineDecision {
     /// Create an empty decision (no actions needed)
     pub fn no_action() -> Self {
-        Self { actions: vec![], updated_position: None, planned_entry_risk: None }
+        Self {
+            actions: vec![],
+            updated_position: None,
+            planned_entry_risk: None,
+        }
     }
 
     /// Create a decision with actions
     pub fn with_actions(actions: Vec<EngineAction>) -> Self {
-        Self { actions, updated_position: None, planned_entry_risk: None }
+        Self {
+            actions,
+            updated_position: None,
+            planned_entry_risk: None,
+        }
     }
 
     /// Create a decision with actions and updated position

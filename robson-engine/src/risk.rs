@@ -442,10 +442,10 @@ impl RiskGate {
             };
         }
 
-        // 4. Budget-metered admission (ADR-0043: replaces the ADR-0024 slot
-        //    reservation at the full 1% cap). The trade is charged its planned
-        //    worst-case loss; the 1% per-trade cap still bounds any single
-        //    trade, and the 4% monthly budget stays the hard invariant.
+        // 4. Budget-metered admission (ADR-0043: replaces the ADR-0024 slot reservation
+        //    at the full 1% cap). The trade is charged its planned worst-case loss; the
+        //    1% per-trade cap still bounds any single trade, and the 4% monthly budget
+        //    stays the hard invariant.
         let capital_base = context.capital; // MIG-v3#11 approximation; MIG-v3#12 persists real capital base.
         let realized_loss = context.realized_loss_abs();
         let latent_risk = context.latent_risk_sum();
@@ -467,7 +467,9 @@ impl RiskGate {
             };
         }
 
-        if !self.policy.can_admit(capital_base, realized_loss, latent_risk, proposed.planned_risk)
+        if !self
+            .policy
+            .can_admit(capital_base, realized_loss, latent_risk, proposed.planned_risk)
         {
             let cap = self.policy.risk_per_trade_amount(capital_base);
             let charge = if proposed.planned_risk <= Decimal::ZERO {
@@ -689,10 +691,10 @@ mod tests {
 
         let verdict = gate.evaluate(&proposed, &context);
         assert!(
-            matches!(
-                verdict,
-                RiskVerdict::Rejected { check: RiskCheck::RiskBudgetInsufficient, .. }
-            ),
+            matches!(verdict, RiskVerdict::Rejected {
+                check: RiskCheck::RiskBudgetInsufficient,
+                ..
+            }),
             "full-cap trade in the budget tail must deny without triggering MonthlyHalt"
         );
     }
@@ -710,7 +712,10 @@ mod tests {
             monthly_unrealized_pnl: dec!(0),
             monthly_realized_loss: dec!(399),
         };
-        let proposed = ProposedTrade { planned_risk: dec!(0.90), ..sample_proposed() };
+        let proposed = ProposedTrade {
+            planned_risk: dec!(0.90),
+            ..sample_proposed()
+        };
 
         let verdict = gate.evaluate(&proposed, &context);
         assert_eq!(
@@ -726,14 +731,17 @@ mod tests {
         // is never admitted, even with a fresh monthly budget.
         let gate = RiskGate::new();
         let context = sample_context();
-        let proposed = ProposedTrade { planned_risk: dec!(101), ..sample_proposed() };
+        let proposed = ProposedTrade {
+            planned_risk: dec!(101),
+            ..sample_proposed()
+        };
 
         let verdict = gate.evaluate(&proposed, &context);
         assert!(
-            matches!(
-                verdict,
-                RiskVerdict::Rejected { check: RiskCheck::RiskBudgetInsufficient, .. }
-            ),
+            matches!(verdict, RiskVerdict::Rejected {
+                check: RiskCheck::RiskBudgetInsufficient,
+                ..
+            }),
             "planned risk above the 1% per-trade cap must be rejected"
         );
     }
@@ -751,15 +759,18 @@ mod tests {
             monthly_unrealized_pnl: dec!(0),
             monthly_realized_loss: dec!(350),
         };
-        let unpriced = ProposedTrade { planned_risk: Decimal::ZERO, ..sample_proposed() };
+        let unpriced = ProposedTrade {
+            planned_risk: Decimal::ZERO,
+            ..sample_proposed()
+        };
 
         // Remaining $50 < $100 full cap → denied.
         let verdict = gate.evaluate(&unpriced, &tail_context);
         assert!(
-            matches!(
-                verdict,
-                RiskVerdict::Rejected { check: RiskCheck::RiskBudgetInsufficient, .. }
-            ),
+            matches!(verdict, RiskVerdict::Rejected {
+                check: RiskCheck::RiskBudgetInsufficient,
+                ..
+            }),
             "unpriced trade must reserve the full cap and be denied in the tail"
         );
 
