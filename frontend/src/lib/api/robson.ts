@@ -393,6 +393,7 @@ export function connectEventStream(
   onError?: (err: Event) => void,
   onReconnect?: () => void,
   onStale?: (staleSecs: number) => void,
+  onActivity?: () => void,
 ): () => void {
   if (!browser) return () => {};
 
@@ -408,7 +409,7 @@ export function connectEventStream(
 
   const source = factory
     ? factory(url)
-    : new FetchEventSource(url, token, onReconnect, onStale);
+    : new FetchEventSource(url, token, onReconnect, onStale, onActivity);
 
   source.onmessage = (msg) => {
     try {
@@ -442,6 +443,7 @@ export class FetchEventSource implements EventSourceLike {
     token: string | null,
     private readonly onReconnect?: () => void,
     private readonly onStale?: (staleSecs: number) => void,
+    private readonly onActivity?: () => void,
   ) {
     this.connect(url, token);
   }
@@ -512,6 +514,7 @@ export class FetchEventSource implements EventSourceLike {
           break;
         }
 
+        this.onActivity?.();
         buf += decoder.decode(value, { stream: true });
 
         // SSE events are separated by blank lines (\n\n)
