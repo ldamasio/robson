@@ -290,6 +290,9 @@
         connected = false;
         console.warn(`SSE stale for ${staleSecs}s, reconnecting`);
       },
+      () => {
+        markSseEvent();
+      },
     );
   }
 

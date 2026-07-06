@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, afterEach, beforeEach } from 'vitest';
 import { FetchEventSource } from '$api/robson';
+import { markSseEvent, sseFreshness } from '$stores/sseFreshness';
 
 /** Drain microtask queue: needed because vitest fake timers don't flush async chains. */
 async function flush(rounds = 20): Promise<void> {
@@ -18,6 +19,7 @@ function buildSource(
   fetchImpl: typeof fetch,
   onReconnect?: () => void,
   onStale?: (staleSecs: number) => void,
+  onActivity?: () => void,
 ): SseSource {
   vi.stubGlobal('fetch', fetchImpl);
   return new FetchEventSource(
@@ -25,6 +27,7 @@ function buildSource(
     null,
     onReconnect,
     onStale,
+    onActivity,
   ) as unknown as SseSource;
 }
 
@@ -271,6 +274,60 @@ describe('FetchEventSource read-idle watchdog', () => {
     await vi.advanceTimersByTimeAsync(45_100);
     await flush();
     expect(onStale).toHaveBeenCalledTimes(1);
+  });
+
+  it('notifies activity for comment-only heartbeat chunks', async () => {
+    const onActivity = vi.fn();
+    const encoder = new TextEncoder();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    let streamCtrl: any = null;
+    const fakeFetch = vi.fn().mockImplementation(async () => {
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          streamCtrl = controller;
+        },
+      });
+      return { ok: true, body: stream } as unknown as Response;
+    });
+
+    buildSource(fakeFetch, undefined, undefined, onActivity);
+
+    await flush();
+    expect(onActivity).not.toHaveBeenCalled();
+
+    streamCtrl?.enqueue(encoder.encode(':heartbeat\n\n'));
+    await flush();
+
+    expect(onActivity).toHaveBeenCalledTimes(1);
+  });
+});
+
+describe('SSE freshness store', () => {
+  beforeEach(() => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date('2026-07-06T00:00:00.000Z'));
+  });
+
+  afterEach(() => {
+    sseFreshness.stop();
+    vi.useRealTimers();
+  });
+
+  it('stays fresh when byte activity is marked within 45s without messages', async () => {
+    let latest: { fresh: boolean; staleSeconds: number } | null = null;
+    const unsubscribe = sseFreshness.subscribe((value) => {
+      latest = value;
+    });
+
+    sseFreshness.start();
+    markSseEvent();
+
+    await vi.advanceTimersByTimeAsync(44_000);
+    markSseEvent();
+    await vi.advanceTimersByTimeAsync(44_000);
+
+    expect(latest).toEqual({ fresh: true, staleSeconds: 44 });
+    unsubscribe();
   });
 });
 
