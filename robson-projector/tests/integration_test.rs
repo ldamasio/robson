@@ -551,6 +551,88 @@ async fn test_exit_order_placed_updates_projection_with_exit_reason(
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL (see file header for setup)"]
+async fn test_entry_filled_overwrites_quantity_with_real_fill(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    // Regression (2026-07-07 incident): entry_filled must overwrite
+    // entry_quantity/current_quantity with the REAL, exchange-confirmed
+    // filled_quantity. Before this fix, handle_entry_filled left these
+    // columns at whatever theoretical (pre-lot-size) value was written at
+    // request time — POSITION_OPENED here carries entry_quantity=0.00737028,
+    // simulating the risk-sizing formula's raw output before the exchange
+    // truncates it to its LOT_SIZE step. The real fill (0.007, a routine
+    // Binance BTCUSDT truncation) must win. A restart rehydrates the
+    // position straight from this row, so a stale, larger quantity here
+    // would size a future reduce-only exit order above the real exchange
+    // position -- rejected, reproducing the same "wrong local size, live
+    // position" failure class as the reconciliation-anchor bug (ADR-0045
+    // amendment).
+    let position_id = Uuid::new_v4();
+    let tenant_id = Uuid::new_v4();
+    let account_id = Uuid::new_v4();
+    let entry_order_id = Uuid::new_v4();
+
+    let opened = make_envelope(
+        "position:test",
+        "POSITION_OPENED",
+        serde_json::json!({
+            "position_id": position_id,
+            "tenant_id": tenant_id,
+            "account_id": account_id,
+            "strategy_id": null,
+            "symbol": "BTCUSDT",
+            "side": "long",
+            "entry_price": null,
+            "entry_quantity": "0.00737028",
+            "entry_filled_at": null,
+            "technical_stop_price": "61297.00",
+            "technical_stop_distance": "2023.10",
+            "entry_order_id": null,
+            "stop_loss_order_id": null
+        }),
+        1,
+    );
+    apply_event_to_projections(&pool, &opened).await.unwrap();
+
+    let entry_filled = make_envelope(
+        "position:test",
+        "entry_filled",
+        serde_json::json!({
+            "position_id": position_id,
+            "order_id": entry_order_id,
+            "fill_price": "63299.70",
+            "filled_quantity": "0.007",
+            "fee": "0.44309790",
+            "initial_stop": "61297.00",
+            "timestamp": Utc::now(),
+        }),
+        2,
+    );
+    apply_event_to_projections(&pool, &entry_filled).await.unwrap();
+
+    let (entry_quantity, current_quantity): (Decimal, Decimal) = sqlx::query_as(
+        "SELECT entry_quantity, current_quantity FROM positions_current WHERE position_id = $1",
+    )
+    .bind(position_id)
+    .fetch_one(&pool)
+    .await?;
+
+    assert_eq!(
+        entry_quantity,
+        Decimal::new(7, 3),
+        "entry_quantity must be the real fill, not the pre-lot-size request"
+    );
+    assert_eq!(
+        current_quantity,
+        Decimal::new(7, 3),
+        "current_quantity must be the real fill, not the pre-lot-size request"
+    );
+
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_fill_received_idempotent(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Arrange
     let order_id = Uuid::new_v4();
