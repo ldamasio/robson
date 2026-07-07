@@ -399,6 +399,85 @@ pub struct UserTradeRecord {
     pub filled_at: DateTime<Utc>,
 }
 
+/// Category of a typed income item (ADR-0045 §1).
+///
+/// `Other` preserves whatever the exchange sent so an unrecognized type never
+/// fails deserialization — it still reaches the ledger as a named,
+/// persistent anomaly instead of being silently dropped.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IncomeType {
+    RealizedPnl,
+    Commission,
+    FundingFee,
+    Transfer,
+    Other(String),
+}
+
+impl IncomeType {
+    pub fn from_exchange_str(raw: &str) -> Self {
+        match raw {
+            "REALIZED_PNL" => Self::RealizedPnl,
+            "COMMISSION" => Self::Commission,
+            "FUNDING_FEE" => Self::FundingFee,
+            "TRANSFER" => Self::Transfer,
+            other => Self::Other(other.to_string()),
+        }
+    }
+
+    pub fn as_exchange_str(&self) -> &str {
+        match self {
+            Self::RealizedPnl => "REALIZED_PNL",
+            Self::Commission => "COMMISSION",
+            Self::FundingFee => "FUNDING_FEE",
+            Self::Transfer => "TRANSFER",
+            Self::Other(raw) => raw,
+        }
+    }
+}
+
+/// A single item from the exchange's typed income stream (ADR-0045 §1).
+///
+/// Canonical decomposition of every balance movement — the item-typed
+/// alternative to diffing the wallet total.
+#[derive(Debug, Clone, PartialEq)]
+pub struct IncomeRecord {
+    /// Exchange-assigned id for this income record (`tranId`). Unique per
+    /// item — the idempotent-ingestion key.
+    pub exchange_income_id: String,
+    /// `None` for account-level items with no symbol (e.g. `TRANSFER`).
+    pub symbol: Option<Symbol>,
+    pub income_type: IncomeType,
+    /// Signed amount (positive = credit, negative = debit).
+    pub amount: Decimal,
+    pub asset: String,
+    /// Linkage to the originating trade, when the exchange provides one
+    /// (`REALIZED_PNL`/`COMMISSION`). Empty for `FUNDING_FEE` — funding
+    /// never links to a governed fill, by construction.
+    pub exchange_trade_id: Option<String>,
+    pub income_time: DateTime<Utc>,
+}
+
+/// Port for the exchange's typed income/income-history stream (ADR-0045 §1).
+///
+/// Deliberately a separate trait from `ExchangePort` rather than another
+/// flat method on it: `income_ledger`'s worker is a money-adjacent
+/// reconciliation surface that should be structurally unable to place or
+/// cancel orders, and this is the contract Strategos adopts for its own
+/// multi-venue accounting (ADR-0045 §4.2). The same concrete exchange types
+/// implement both traits — this does not require a second injected
+/// dependency anywhere they're already wired.
+#[async_trait]
+pub trait IncomePort: Send + Sync {
+    /// Fetch income items since `since` (inclusive), across all symbols —
+    /// account-level items (e.g. `TRANSFER`) have no symbol and would be
+    /// silently excluded by a per-symbol filter. Ordered oldest-first.
+    async fn get_income_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u16,
+    ) -> Result<Vec<IncomeRecord>, ExecError>;
+}
+
 /// Open position observed directly on the exchange.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ExchangePosition {

@@ -663,6 +663,33 @@ impl BinanceRestClient {
         serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
     }
 
+    /// Get typed income history (ADR-0045 §1).
+    ///
+    /// `GET /fapi/v1/income` (signed). Deliberately no `symbol` filter: it
+    /// would silently drop account-level items (e.g. `TRANSFER`) that carry
+    /// no symbol. Returns items across the whole account since `start_time_ms`.
+    pub async fn get_income(
+        &self,
+        start_time_ms: i64,
+        limit: u16,
+    ) -> Result<Vec<BinanceIncome>, BinanceRestError> {
+        if limit == 0 || limit > 1000 {
+            return Err(BinanceRestError::InvalidParameter(format!(
+                "income limit must be between 1 and 1000, got {}",
+                limit
+            )));
+        }
+
+        let params = vec![
+            ("startTime", start_time_ms.to_string()),
+            ("limit", limit.to_string()),
+        ];
+
+        let body = self.get_signed("/fapi/v1/income", params).await?;
+
+        serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
+    }
+
     /// Get USDT-M futures account balance.
     ///
     /// `GET /fapi/v2/balance` (signed).
@@ -1081,6 +1108,32 @@ pub struct BinanceUserTrade {
     pub commission_asset: String,
     /// Trade time (ms since epoch)
     pub time: i64,
+}
+
+/// Single item from `GET /fapi/v1/income` (ADR-0045 §1).
+///
+/// Field shapes verified live against the production account 2026-07-07
+/// (read-only): `symbol` is `""` for account-level items with no symbol
+/// (not omitted, not null — this was NOT assumed, it is Binance's actual
+/// wire behavior per public docs and is defended here rather than assumed).
+/// `tradeId` is an empty string for `FUNDING_FEE` (funding never links to a
+/// trade) and a numeric string for `COMMISSION`/`REALIZED_PNL`. `tranId` is
+/// always present.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BinanceIncome {
+    /// Trading symbol, or `""` for account-level items (e.g. `TRANSFER`).
+    pub symbol: String,
+    pub income_type: String,
+    pub income: Decimal,
+    pub asset: String,
+    pub time: i64,
+    #[serde(default)]
+    pub info: String,
+    pub tran_id: i64,
+    /// Empty string when the exchange provides no trade linkage.
+    #[serde(default)]
+    pub trade_id: String,
 }
 
 /// Parsed USDT-M futures balance for the USDT asset.

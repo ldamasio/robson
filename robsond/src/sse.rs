@@ -195,6 +195,7 @@ pub(crate) fn map_daemon_event(event: &DaemonEvent) -> Option<PublicSseEvent> {
         | DaemonEvent::OrderFill(_)
         | DaemonEvent::ReconciliationStaleNonActiveDetected { .. }
         | DaemonEvent::ReconciliationStaleActiveUnresolved { .. }
+        | DaemonEvent::IncomeLedgerAnomaliesDetected { .. }
         | DaemonEvent::Shutdown => None,
     }
 }

@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added - Typed income-ledger reconciliation (ADR-0045 §1, 2026-07-07)
+
+- New `IncomePort` trait ingests Binance's typed income stream
+  (`GET /fapi/v1/income`) into a new `income_ledger` table, matching each
+  item against governed state instead of diffing the wallet total.
+  `REALIZED_PNL`/`COMMISSION` match by (symbol, time proximity) against
+  `positions_current` — a disclosed, coarser substitute for exact `tradeId`
+  linkage robson doesn't persist yet (ambiguous candidates stay unmatched
+  and alarm, never guessed). `FUNDING_FEE` is always recognized — this is
+  the first-ever attribution of Binance perpetual funding-rate payments
+  anywhere in robson (previously a real, invisible cost). `TRANSFER` is the
+  only category that may auto-recalibrate `capital_base`, and only when it
+  explains the wallet delta 100% with zero other unmatched items in the same
+  window.
+- `reconciliation_worker::recalibrate_capital_base_after_pure_financial_drift`
+  no longer writes `capital_base` for the generic case — an unexplained
+  residual is now an alarm only, per ADR-0045 §2. The `in_flight_count`
+  guard from the 2026-07-05 hotfix stays as defense in depth.
+- `/status` exposes `unmatched_income_count` additively.
+
 ### Fixed - Reconciliation evidence-gathering anchor reset (ADR-0045 amendment, 2026-07-07)
 
 - `emit_unresolved` cleared the reconciliation worker's missing-position

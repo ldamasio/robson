@@ -60,6 +60,9 @@ mod sse;
 pub mod startup_recovery;
 
 #[cfg(feature = "postgres")]
+pub mod income_ledger;
+
+#[cfg(feature = "postgres")]
 pub mod projection_worker;
 
 #[cfg(test)]
@@ -77,6 +80,8 @@ pub use daemon::Daemon;
 pub use detector::{DetectorConfig, DetectorTask};
 pub use error::{exit_code_for_daemon_error, DaemonError, DaemonResult};
 pub use event_bus::{DaemonEvent, EventBus, EventReceiver, MarketData, OrderFill};
+#[cfg(feature = "postgres")]
+pub use income_ledger::IncomeLedgerWorker;
 pub use position_manager::PositionManager;
 pub use position_monitor::{MonitorError, PositionMonitor, PositionMonitorConfig as MonitorConfig};
 // Query engine re-exports
