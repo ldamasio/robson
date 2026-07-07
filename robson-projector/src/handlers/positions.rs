@@ -659,12 +659,28 @@ pub(crate) async fn handle_entry_filled(pool: &PgPool, envelope: &EventEnvelope)
     // Initialize favorable_extreme = fill_price, trailing_stop_price =
     // initial_stop. Persist the entry-time invalidation guard level so restarts
     // replay the same effective stop (ADR-0042).
+    //
+    // entry_quantity/current_quantity are overwritten here with the REAL,
+    // exchange-confirmed filled_quantity (2026-07-07 incident). Until this
+    // fix, these columns were set once at PositionOpened/entry-request time
+    // from the theoretical (pre-lot-size) sizing output and never corrected
+    // against the actual fill. Whenever the exchange truncated the requested
+    // quantity to its LOT_SIZE step (routine on Binance futures), the
+    // persisted position permanently recorded a quantity larger than the
+    // real exchange position — restart-durable, since projection recovery
+    // reads this row verbatim. The software-side trailing-stop exit sizes
+    // its reduce-only order from this field; an inflated value would be
+    // rejected by the exchange (reduce-only cannot exceed the real open
+    // size), reproducing the same "wrong local size, live position" failure
+    // class as the reconciliation-anchor bug (see ADR-0045 amendment).
     sqlx::query(
         r#"
         UPDATE positions_current
         SET
             state = 'active',
             entry_price = $2,
+            entry_quantity = $9,
+            current_quantity = $9,
             entry_filled_at = $3,
             trailing_stop_price = $4,
             favorable_extreme = $2,
@@ -684,6 +700,7 @@ pub(crate) async fn handle_entry_filled(pool: &PgPool, envelope: &EventEnvelope)
     .bind(envelope.event_id)
     .bind(envelope.seq)
     .bind(envelope.occurred_at)
+    .bind(payload.filled_quantity)
     .execute(pool)
     .await?;
 
