@@ -168,6 +168,12 @@ pub struct StatusResponse {
     pub capital_base: Decimal,
     /// Current futures wallet balance reported by the exchange.
     pub wallet_balance: Decimal,
+    /// Income-ledger items past the evidence-lag grace period with no
+    /// governed match (ADR-0045 §2) — a named, persistent anomaly, never
+    /// silently absorbed into `capital_base`. Zero when no `pg_pool` is
+    /// configured (the ledger requires postgres).
+    #[serde(default)]
+    pub unmatched_income_count: usize,
 }
 
 /// Historical monthly positions response.
@@ -1287,6 +1293,20 @@ where
         })
         .collect();
 
+    #[cfg(feature = "postgres")]
+    let unmatched_income_count = if let Some(pool) = &state.pg_pool {
+        crate::income_ledger::count_confirmed_anomalies(pool, chrono::Duration::minutes(5))
+            .await
+            .unwrap_or_else(|error| {
+                warn!(%error, "failed to query income ledger unmatched count");
+                0
+            })
+    } else {
+        0
+    };
+    #[cfg(not(feature = "postgres"))]
+    let unmatched_income_count = 0;
+
     Ok(Json(StatusResponse {
         active_positions: summaries.len(),
         positions: summaries,
@@ -1304,6 +1324,7 @@ where
         monthly_budget_remaining,
         capital_base: monthly.capital_base,
         wallet_balance,
+        unmatched_income_count,
     }))
 }
 

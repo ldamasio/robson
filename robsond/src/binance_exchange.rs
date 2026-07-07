@@ -18,9 +18,9 @@ use robson_connectors::{BinanceRestClient, BinanceRestError};
 use robson_domain::{OrderSide, Price, Quantity, Side, Symbol};
 use robson_exec::{
     ports::{
-        ExchangePosition, FuturesBalance, FuturesSettings, OpenOrderRecord, SpotBalance, SpotOrder,
-        SpotOrderQuantity, SpotOrderRequest, SpotOrderSide, Transfer, TransferId,
-        UniversalTransferType, UserTradeRecord,
+        ExchangePosition, FuturesBalance, FuturesSettings, IncomePort, IncomeRecord, IncomeType,
+        OpenOrderRecord, SpotBalance, SpotOrder, SpotOrderQuantity, SpotOrderRequest,
+        SpotOrderSide, Transfer, TransferId, UniversalTransferType, UserTradeRecord,
     },
     ExchangePort, ExecError, OrderResult,
 };
@@ -839,6 +839,49 @@ impl ExchangePort for BinanceExchangeAdapter {
             .collect::<Result<Vec<_>, ExecError>>()?;
 
         records.sort_by(|a, b| a.filled_at.cmp(&b.filled_at));
+
+        Ok(records)
+    }
+}
+
+#[async_trait]
+impl IncomePort for BinanceExchangeAdapter {
+    async fn get_income_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u16,
+    ) -> Result<Vec<IncomeRecord>, ExecError> {
+        let start_time_ms = since.timestamp_millis();
+
+        let items = self.client.get_income(start_time_ms, limit).await.map_err(Self::map_error)?;
+
+        let records = items
+            .into_iter()
+            .map(|item| {
+                let income_time =
+                    DateTime::from_timestamp_millis(item.time).unwrap_or_else(Utc::now);
+                let symbol = if item.symbol.is_empty() {
+                    None
+                } else {
+                    Symbol::from_pair(&item.symbol).ok()
+                };
+                let exchange_trade_id = if item.trade_id.is_empty() {
+                    None
+                } else {
+                    Some(item.trade_id)
+                };
+
+                IncomeRecord {
+                    exchange_income_id: item.tran_id.to_string(),
+                    symbol,
+                    income_type: IncomeType::from_exchange_str(&item.income_type),
+                    amount: item.income,
+                    asset: item.asset,
+                    exchange_trade_id,
+                    income_time,
+                }
+            })
+            .collect();
 
         Ok(records)
     }

@@ -30,7 +30,7 @@ use robson_domain::{Position, PositionId, PositionState, Price, Symbol, TradingP
 use robson_engine::Engine;
 #[cfg(feature = "postgres")]
 use robson_eventlog::{query_events, EventEnvelope, QueryOptions};
-use robson_exec::{ExchangePort, Executor, IntentJournal, StubExchange};
+use robson_exec::{ports::IncomePort, ExchangePort, Executor, IntentJournal, StubExchange};
 #[cfg(feature = "postgres")]
 use robson_store::PgDetectedPositionRepository;
 // Optional projection recovery for crash recovery
@@ -49,6 +49,8 @@ use tracing::{error, info, warn};
 
 #[cfg(feature = "postgres")]
 use crate::funding::{worker::FundingWorker, FundingService};
+#[cfg(feature = "postgres")]
+use crate::income_ledger::IncomeLedgerWorker;
 #[cfg(feature = "postgres")]
 use crate::projection_worker::ProjectionWorker;
 #[cfg(feature = "postgres")]
@@ -96,7 +98,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FallbackSupport
 }
 
 /// The main Robson daemon.
-pub struct Daemon<E: ExchangePort + 'static, S: Store + 'static> {
+pub struct Daemon<E: ExchangePort + IncomePort + 'static, S: Store + 'static> {
     /// Configuration
     config: Config,
     /// Exchange adapter shared with execution and reconciliation flows.
@@ -505,7 +507,7 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
     }
 }
 
-impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
+impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
     /// Create a new daemon with provided components.
     pub fn new(
         config: Config,
@@ -754,6 +756,32 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
         #[cfg(not(feature = "postgres"))]
         let funding_handle: Option<tokio::task::JoinHandle<()>> = None;
 
+        // 8b. Spawn income ledger worker (ADR-0045 §1 — if pg_pool configured).
+        #[cfg(feature = "postgres")]
+        let income_ledger_handle = if let Some(pool) = &self.pg_pool {
+            info!("Starting income ledger worker (ADR-0045)");
+            let worker = IncomeLedgerWorker::new(
+                Arc::clone(&self.exchange),
+                Arc::clone(&self.position_manager),
+                Arc::clone(&self.store),
+                (**pool).clone(),
+                Arc::clone(&self.event_bus),
+                std::time::Duration::from_secs(60),
+                shutdown.clone(),
+            );
+            Some(tokio::spawn(async move {
+                if let Err(e) = worker.run().await {
+                    error!(error = %e, "Income ledger worker failed");
+                }
+            }))
+        } else {
+            info!("No income ledger worker configured (no pg_pool)");
+            None
+        };
+
+        #[cfg(not(feature = "postgres"))]
+        let income_ledger_handle: Option<tokio::task::JoinHandle<()>> = None;
+
         // 9. Subscribe to event bus
         let mut event_receiver = self.event_bus.subscribe();
 
@@ -822,6 +850,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
 
         if let Some(handle) = funding_handle {
             info!("Waiting for funding worker to finish...");
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), handle).await;
+        }
+
+        if let Some(handle) = income_ledger_handle {
+            info!("Waiting for income ledger worker to finish...");
             let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), handle).await;
         }
 
@@ -1814,6 +1847,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> Daemon<E, S> {
                     %exchange_order_id,
                     %client_order_id,
                     "Reconciliation cancelled an orphan insurance-stop order (ADR-0039)"
+                );
+            },
+
+            DaemonEvent::IncomeLedgerAnomaliesDetected { count, detected_at } => {
+                warn!(
+                    count,
+                    %detected_at,
+                    "Income ledger has unmatched items past the evidence-lag grace period (ADR-0045)"
                 );
             },
         }

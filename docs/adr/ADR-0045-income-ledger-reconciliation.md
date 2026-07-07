@@ -1,7 +1,7 @@
 # ADR-0045 — Income-Ledger Reconciliation; Drift Demoted to Checksum
 
 **Date**: 2026-07-05
-**Status**: Decided (hotfix shipped; ledger implementation pending)
+**Status**: Decided (fully shipped — hotfix, reconciliation-anchor fix, and the typed income ledger)
 **Deciders**: RBX Systems (operator + architecture)
 
 ---
@@ -183,6 +183,46 @@ This closes the gap between "the fallback evidence path exists" (true since
 before this ADR) and "the fallback path can actually find old evidence"
 (false until this fix) — the missing half of §1's item-typed reconciliation
 promise.
+
+## Amendment (2026-07-07) — §1 typed income ledger implemented
+
+The remaining piece — item-typed reconciliation itself — shipped. New
+`IncomePort` trait (`robson-exec/src/ports.rs`), deliberately separate from
+`ExchangePort` rather than another flat method on it: `income_ledger.rs`'s
+worker is a money-adjacent reconciliation surface that should be
+structurally unable to place or cancel orders, and this is the contract
+Strategos adopts for its own multi-venue accounting (§4.2). Implemented on
+the same concrete exchange types that already implement `ExchangePort`
+(`BinanceExchangeAdapter`, `StubExchange`) — no second injected dependency
+required anywhere they're already wired.
+
+New `robsond/src/income_ledger.rs` owns poll → ingest → match → alarm,
+against a new `income_ledger` table (migration `20240101000020`, idempotent
+on the exchange's own `tranId`). `FUNDING_FEE` is always recognized (it
+never links to a governed fill by construction — a cost of holding, not a
+robsond-authored action); this is the **first-ever attribution of Binance
+perpetual funding-rate payments anywhere in robson** — a real, small,
+previously-invisible cost (confirmed live 2026-07-07: an open BTCUSDT
+position had already paid two funding charges, ~0.056 USDT, entirely
+unaccounted for before this change). `TRANSFER` is the only category that
+may auto-recalibrate `capital_base`, and only when it explains the wallet
+delta 100% with zero other unmatched items in the same window
+(`income_ledger::transfer_explains_delta`).
+`reconciliation_worker::recalibrate_capital_base_after_pure_financial_drift`
+no longer writes `capital_base` for the generic case — it alarms only; the
+`in_flight_count` guard from the 2026-07-05 hotfix stays as defense in
+depth.
+
+**Known, disclosed matching limitation.** Binance's income items carry a
+`tradeId`/`tranId` linkage for `REALIZED_PNL`/`COMMISSION`, but robson does
+not yet persist a queryable `exchange_trade_id` on `positions_current` or in
+`event_log` payloads for ordinary fills — exact id-level matching isn't
+available yet. `REALIZED_PNL`/`COMMISSION` match by (symbol, time proximity
+to `entry_filled_at`/`closed_at`) instead: safe (ambiguous candidates stay
+unmatched and alarm, mirroring `gather_user_trade_evidence`'s discipline),
+but coarser than the exchange's own linkage. The raw `trade_id`/`tran_id` is
+preserved on every ledger row regardless, so a future, more precise matcher
+can use it without re-ingesting history.
 
 ## Related
 

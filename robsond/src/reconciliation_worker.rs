@@ -708,6 +708,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         .await
     }
 
+    /// Pure-financial-drift check (ADR-0045 §2). No longer writes
+    /// `capital_base` itself — it only alarms. `income_ledger.rs`'s
+    /// `IncomeLedgerWorker::recalibrate_from_confirmed_transfers` is the
+    /// only remaining path that may write, and only when the ledger
+    /// explains the delta as 100% matched `TRANSFER` items with zero other
+    /// unmatched items in the same window. This function still runs (same
+    /// `in_flight_count` guard, unchanged) so the alarm continues even
+    /// while the ledger worker independently confirms or fails to confirm
+    /// the same delta.
     async fn recalibrate_capital_base_after_pure_financial_drift(&self) -> DaemonResult<()> {
         let now = Utc::now();
         let risk_open = self.live_risk_open_positions().await?;
@@ -755,22 +764,23 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
             return Ok(());
         }
 
+        // ADR-0045 §2: an unattributed residual is an alarm, never a write.
+        // This used to call self.recalibrate_capital_base(...) here directly
+        // — that write is now gated behind the typed income ledger
+        // confirming the delta is 100% TRANSFER (income_ledger.rs). This
+        // path only alarms so the operator always sees the drift even on
+        // cycles where the ledger worker hasn't run yet or can't confirm it.
         warn!(
             %wallet_balance,
             %expected_wallet_balance,
             %previous_capital_base,
             %robson_month_net,
             %unexplained_delta,
-            "Pure financial account drift detected; recalibrating capital_base"
+            "Pure financial account drift detected — NOT recalibrating capital_base here; \
+             see income_ledger.rs for the ledger-confirmed TRANSFER-only auto-write path"
         );
 
-        self.recalibrate_capital_base(
-            format!(
-                "financial_drift:wallet_balance={wallet_balance};expected_wallet_balance={expected_wallet_balance};unexplained_delta={unexplained_delta}"
-            ),
-            None,
-        )
-        .await
+        Ok(())
     }
 
     async fn live_risk_open_positions(&self) -> DaemonResult<Vec<Position>> {
@@ -1087,7 +1097,15 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_pure_financial_drift_recalibrates_capital_base_without_open_risk() {
+    async fn test_pure_financial_drift_no_longer_recalibrates_capital_base_directly() {
+        // ADR-0045 §2 (income-ledger mission, robson-income-ledger): this
+        // path used to write capital_base directly from an unattributed
+        // scalar residual. It no longer does — an unexplained residual is
+        // an alarm only. The only remaining auto-write path is
+        // `income_ledger::IncomeLedgerWorker::recalibrate_from_confirmed_transfers`,
+        // gated on the typed ledger explaining the delta as 100% matched
+        // TRANSFER with zero other unmatched items (tested separately,
+        // against a real Postgres, in the income_ledger integration suite).
         let exchange = Arc::new(StubExchange::new(dec!(100)));
         let store = Arc::new(MemoryStore::new());
         let event_bus = Arc::new(EventBus::new(16));
@@ -1097,24 +1115,10 @@ mod tests {
         assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
 
         let events = capital_base_recalibration_events(&store).await;
-        assert_eq!(events.len(), 1);
-        match &events[0] {
-            robson_domain::Event::CapitalBaseRecalibrated {
-                previous_capital_base,
-                new_capital_base,
-                wallet_balance,
-                carried_risk,
-                evidence,
-                ..
-            } => {
-                assert_eq!(*previous_capital_base, dec!(10000));
-                assert_eq!(*new_capital_base, dec!(7500));
-                assert_eq!(*wallet_balance, dec!(7500));
-                assert_eq!(*carried_risk, Decimal::ZERO);
-                assert!(evidence.starts_with("financial_drift:"));
-            },
-            event => panic!("unexpected event: {event:?}"),
-        }
+        assert!(
+            events.is_empty(),
+            "pure financial drift must never write capital_base directly anymore, got: {events:?}"
+        );
     }
 
     #[tokio::test]

@@ -17,9 +17,9 @@ use crate::{
     error::ExecError,
     ports::{
         CandleInterval, ExchangePort, ExchangePosition, FuturesBalance, FuturesSettings,
-        MarketDataPort, OhlcvPort, OpenOrderRecord, OrderResult, PriceUpdate, SpotBalance,
-        SpotOrder, SpotOrderQuantity, SpotOrderRequest, SpotOrderSide, Transfer, TransferId,
-        UniversalTransferType, UserTradeRecord,
+        IncomePort, IncomeRecord, MarketDataPort, OhlcvPort, OpenOrderRecord, OrderResult,
+        PriceUpdate, SpotBalance, SpotOrder, SpotOrderQuantity, SpotOrderRequest, SpotOrderSide,
+        Transfer, TransferId, UniversalTransferType, UserTradeRecord,
     },
 };
 
@@ -88,6 +88,8 @@ pub struct StubExchange {
     stop_orders: RwLock<HashMap<String, StubStopOrder>>,
     /// Simulated real triggered order fills keyed by protective stop algo id.
     filled_stop_orders: RwLock<HashMap<String, OrderResult>>,
+    /// Simulated income items retrievable by `get_income_since` (ADR-0045).
+    income_records: RwLock<Vec<IncomeRecord>>,
 }
 
 impl StubExchange {
@@ -116,6 +118,7 @@ impl StubExchange {
             transfer_calls: RwLock::new(0),
             stop_orders: RwLock::new(HashMap::new()),
             filled_stop_orders: RwLock::new(HashMap::new()),
+            income_records: RwLock::new(Vec::new()),
         }
     }
 
@@ -226,6 +229,11 @@ impl StubExchange {
     pub fn set_user_trades(&self, symbol: &str, trades: Vec<UserTradeRecord>) {
         let mut user_trades = self.user_trades.write().unwrap();
         user_trades.insert(symbol.to_string(), trades);
+    }
+
+    /// Seed simulated income items for income-ledger tests (ADR-0045).
+    pub fn set_income_records(&self, records: Vec<IncomeRecord>) {
+        *self.income_records.write().unwrap() = records;
     }
 
     pub fn set_spot_balance(&self, asset: &str, free: Decimal, locked: Decimal) {
@@ -766,6 +774,28 @@ impl ExchangePort for StubExchange {
             symbol_trades.into_iter().filter(|t| t.filled_at >= since).collect();
 
         filtered.sort_by(|a, b| a.filled_at.cmp(&b.filled_at));
+        filtered.truncate(limit as usize);
+
+        Ok(filtered)
+    }
+}
+
+#[async_trait]
+impl IncomePort for StubExchange {
+    async fn get_income_since(
+        &self,
+        since: DateTime<Utc>,
+        limit: u16,
+    ) -> Result<Vec<IncomeRecord>, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated get_income_since failure".to_string()));
+        }
+
+        let records = self.income_records.read().unwrap();
+        let mut filtered: Vec<IncomeRecord> =
+            records.iter().filter(|r| r.income_time >= since).cloned().collect();
+
+        filtered.sort_by(|a, b| a.income_time.cmp(&b.income_time));
         filtered.truncate(limit as usize);
 
         Ok(filtered)
