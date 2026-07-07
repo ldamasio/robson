@@ -148,6 +148,42 @@ Punishes the one case the exchange types unambiguously (`TRANSFER` deposits/
 withdrawals) with operator toil, without adding safety: the typed item IS the
 evidence.
 
+## Amendment (2026-07-07) — evidence-gathering anchor bug fixed
+
+A second, distinct bug surfaced on 2026-07-07: `gather_real_evidence` already
+had the item-typed fallback this ADR calls for (`gather_order_fill_evidence`
+→ `gather_user_trade_evidence`), but it could never *reach* the real closing
+trade once too much time had passed.
+
+**Root cause.** An insurance-stop algo order can trigger and be **rejected**
+by the exchange (`-2022 ReduceOnly Order is rejected`) when the position it
+protects already closed through a different execution. When that happens,
+`emit_unresolved` cleared the reconciliation worker's
+`missing_observations` entry for the position on every unresolved cycle.
+The next cycle then treated the position as *newly* missing and re-anchored
+`first_observed_missing_at` to "now" — so the evidence-lookup window
+(`observed_at_floor`) passed to `gather_user_trades_since` could never look
+back further than one scan interval, no matter how many cycles ran. Once the
+real closing trade fell outside that ever-sliding-forward window, it became
+permanently unreachable: the position stayed a phantom `Active` ghost,
+retried at every market tick (hammering the exchange with rejected
+reduce-only exits) and blocking new same-symbol-side entries via the
+duplicate-position guard — for 14+ hours until an operator supplied the
+`UserTradeRecord` evidence manually via `/reconcile-close`.
+
+**Fix.** `emit_unresolved` no longer clears the observation. The anchor now
+persists across unresolved cycles and is cleared only on the two outcomes
+that were already correct: the position reappearing on the exchange (false
+alarm) or the close actually resolving. Regression test:
+`test_unresolved_cycles_preserve_original_first_observed_at`
+(`robsond/src/reconciliation_worker.rs`) asserts `first_observed_missing_at`
+is byte-identical across repeated unresolved cycles.
+
+This closes the gap between "the fallback evidence path exists" (true since
+before this ADR) and "the fallback path can actually find old evidence"
+(false until this fix) — the missing half of §1's item-typed reconciliation
+promise.
+
 ## Related
 
 - [ADR-0024](ADR-0024-trading-policy-layer.md) — capital base semantics
