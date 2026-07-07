@@ -614,7 +614,21 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
             confirmed_missing_at,
             reason,
         });
-        self.clear_missing_observation(position.id).await;
+        // Do NOT clear the observation here (2026-07-07 incident). Clearing on
+        // every unresolved cycle re-anchors `first_observed_missing_at` to
+        // "now" on the NEXT cycle (handle_missing_active_position treats the
+        // position as newly-missing again), so the evidence-gathering window
+        // (`observed_at_floor`) can never look back further than one
+        // scan/grace interval — even though "now" keeps advancing. Once the
+        // real closing trade falls outside that ever-sliding-forward window,
+        // it is permanently unreachable: the position stays a phantom
+        // "Active" ghost forever, retried at every market tick (hammering
+        // the exchange with rejected reduce-only exits) and blocking new
+        // same-symbol-side entries via the duplicate-position guard. The
+        // observation must persist across unresolved cycles so the anchor
+        // stays pinned to the true first-missing moment; it is only cleared
+        // when the position reappears (line ~321, a false alarm) or the
+        // close actually resolves (Closed/AlreadyTerminal above).
     }
 
     async fn handle_untracked_position(
@@ -1697,6 +1711,63 @@ mod tests {
         worker.scan_and_reconcile().await.unwrap();
 
         assert!(!worker.missing_observations.lock().await.contains_key(&position_id));
+        let loaded = store.positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(matches!(loaded.state, PositionState::Active { .. }));
+    }
+
+    #[tokio::test]
+    async fn test_unresolved_cycles_preserve_original_first_observed_at() {
+        // Regression (2026-07-07 incident): emit_unresolved used to clear the
+        // missing-observation on every unresolved cycle. The next cycle then
+        // treated the position as newly-missing and re-anchored
+        // first_observed_missing_at to "now" — so the evidence-gathering
+        // window (observed_at_floor) could never look back further than one
+        // scan interval, no matter how many cycles ran. Once the real
+        // closing trade fell outside that ever-sliding-forward window, it
+        // was permanently unreachable: the position stayed a phantom
+        // "Active" ghost, retried at every market tick (hammering the
+        // exchange with rejected reduce-only exits) and blocking new
+        // same-symbol-side entries via the duplicate-position guard, for
+        // over 14 hours until an operator manually supplied the evidence.
+        //
+        // The fix: the observation must persist unchanged across unresolved
+        // cycles. It is cleared only when the position reappears (a false
+        // alarm) or the close actually resolves.
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let position = tracked_active_position(symbol, Side::Long);
+        let position_id = position.id;
+        store.positions().save(&position).await.unwrap();
+        let worker = create_worker(exchange, store.clone(), event_bus, Duration::from_secs(0));
+
+        // Cycle 1: first observation — no evidence attempt yet.
+        worker.scan_and_reconcile().await.unwrap();
+        let first_anchor = {
+            let observations = worker.missing_observations.lock().await;
+            observations
+                .get(&position_id)
+                .expect("observation must be recorded on first sight")
+                .first_observed_missing_at
+        };
+
+        // Cycles 2 and 3: no evidence available (zero user trades) — stays
+        // unresolved. The anchor must not move.
+        for cycle in 2..=3 {
+            assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
+            let observations = worker.missing_observations.lock().await;
+            let observation = observations.get(&position_id).unwrap_or_else(|| {
+                panic!("observation must survive unresolved cycle {cycle}, not reset")
+            });
+            assert_eq!(
+                observation.first_observed_missing_at, first_anchor,
+                "first_observed_missing_at must stay pinned to the original detection \
+                 (cycle {cycle}) — an unresolved evidence-gathering attempt must never \
+                 re-anchor it to \"now\""
+            );
+        }
+
         let loaded = store.positions().find_by_id(position_id).await.unwrap().unwrap();
         assert!(matches!(loaded.state, PositionState::Active { .. }));
     }

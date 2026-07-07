@@ -7,6 +7,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed - Reconciliation evidence-gathering anchor reset (ADR-0045 amendment, 2026-07-07)
+
+- `emit_unresolved` cleared the reconciliation worker's missing-position
+  observation on every unresolved cycle, re-anchoring
+  `first_observed_missing_at` to "now" on the next cycle. When an
+  insurance-stop algo order triggered but was rejected (`-2022 ReduceOnly
+  Order is rejected`, meaning the position had already closed through a
+  different execution), the evidence-lookup window could never look back
+  far enough to find the real closing trade — the position stayed a phantom
+  `Active` ghost for 14+ hours, hammering the exchange with rejected
+  reduce-only exit retries every ~5s and blocking new same-symbol-side
+  entries via the duplicate-position guard, until an operator supplied
+  `UserTradeRecord` evidence manually via `/reconcile-close`. The observation
+  now persists across unresolved cycles; it is cleared only when the
+  position reappears on the exchange or the close actually resolves.
+
 ### Changed - Budget-metered entry admission (ADR-0043, 2026-07-05)
 
 - The risk gate now admits an entry when its **actual planned worst-case
