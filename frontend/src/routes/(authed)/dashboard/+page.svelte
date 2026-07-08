@@ -139,6 +139,14 @@
     return null;
   }
 
+  function variationText(variation: number): string {
+    return `${variation > 0 ? "+" : ""}${variation.toFixed(2)}%`;
+  }
+
+  function variationHelpText(variation: number): string {
+    return `Market move ${variationText(variation)}. This is not the 1% risk cap; Robson audits that cap as planned monetary loss against capital_base.`;
+  }
+
   function monthLabel(): string {
     return monthDisplayLabel(selectedMonth);
   }
@@ -615,14 +623,16 @@
                       <Row justify="between">
                         <span class="meta">{positionStateLabel(op)}</span>
                         {#if variationFor(op) !== null}
+                          {@const variation = variationFor(op) ?? 0}
                           <span
-                            class="mono"
-                            class:ok={(variationFor(op) ?? 0) > 0}
-                            class:err={(variationFor(op) ?? 0) < 0}
+                            class="variation-badge"
+                            class:ok={variation > 0}
+                            class:err={variation < 0}
+                            title={variationHelpText(variation)}
+                            aria-label={variationHelpText(variation)}
                           >
-                            {(variationFor(op) ?? 0) > 0
-                              ? "+"
-                              : ""}{variationFor(op)?.toFixed(2)}%
+                            <span class="variation-label">Market move</span>
+                            <span class="mono">{variationText(variation)}</span>
                           </span>
                         {/if}
                       </Row>
@@ -894,11 +904,28 @@
     font-family: var(--font-mono);
     font-variant-numeric: tabular-nums;
   }
-  .mono.ok {
+  .variation-badge {
+    display: inline-flex;
+    align-items: baseline;
+    gap: var(--s-1);
+    min-height: 1.5rem;
+    color: var(--fg-2);
+    white-space: nowrap;
+  }
+  .variation-badge .mono {
+    color: var(--fg-1);
+  }
+  .variation-badge.ok .mono {
     color: var(--ok);
   }
-  .mono.err {
+  .variation-badge.err .mono {
     color: var(--err);
+  }
+  .variation-label {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: var(--track-label);
   }
   .event-stream {
     font-family: var(--font-mono);
