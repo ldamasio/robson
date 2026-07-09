@@ -418,7 +418,7 @@ impl EngineDecision {
 ///
 /// # Example
 ///
-/// ```ignore
+/// ```text
 /// let engine = Engine::new(risk_config);
 /// let decision = engine.process_active_position(&position, &market_data)?;
 /// for action in decision.actions {

@@ -365,6 +365,11 @@ impl SymbolPayload {
 pub struct TechnicalStopDistancePayload {
     pub distance: Decimal,
     pub distance_pct: Decimal,
+    /// entry_price is present in robson-domain::TechnicalStopDistance. It is
+    /// optional here so old/manual payloads without it still replay, but those
+    /// payloads cannot reconstruct a TechnicalStopDistance during recovery.
+    #[serde(default)]
+    pub entry_price: Option<Decimal>,
     /// initial_stop is a Price value object: serialized as Decimal by serde.
     pub initial_stop: Decimal,
 }

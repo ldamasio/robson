@@ -9,7 +9,7 @@
 //!
 //! # Usage
 //!
-//! ```rust,ignore
+//! ```text
 //! use robson_store::{CredentialStore, CredentialId, Exchange, CredentialProfile};
 //!
 //! // Single-user mode

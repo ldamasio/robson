@@ -26,7 +26,7 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```text
 //! use robsond::{Config, Daemon};
 //!
 //! #[tokio::main]
