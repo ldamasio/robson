@@ -847,7 +847,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// from the EventBus and calls `handle_signal()`.
     ///
     /// Must be called after wrapping in Arc:
-    /// ```ignore
+    /// ```text
     /// let manager = Arc::new(PositionManager::new(...));
     /// PositionManager::start(Arc::clone(&manager));
     /// ```

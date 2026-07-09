@@ -768,7 +768,9 @@ mod tests {
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "Requires DATABASE_URL to be set"]
     async fn test_pg_loads_legacy_detected_rows(pool: sqlx::PgPool) {
-        let detected_at = Utc::now();
+        let detected_at = DateTime::parse_from_rfc3339("2026-07-09T05:06:07.522885Z")
+            .expect("fixed test timestamp")
+            .with_timezone(&Utc);
 
         // Legacy row: predates migration 015, so it has NO external id
         // (binance_position_id IS NULL — not a fabricated sentinel) and was

@@ -38,6 +38,8 @@ async fn setup_position_event(
     technical_stop_distance: Decimal,
 ) -> Result<(), anyhow::Error> {
     let now = Utc::now();
+    let entry_order_id = Uuid::now_v7();
+    let stop_loss_order_id = Uuid::now_v7();
 
     // 1. Create POSITION_OPENED event
     let event = Event::new(
@@ -45,6 +47,7 @@ async fn setup_position_event(
         format!("position:{}", position_id),
         "POSITION_OPENED",
         serde_json::json!({
+            "tenant_id": tenant_id,
             "position_id": position_id,
             "account_id": account_id,
             "strategy_id": strategy_id,
@@ -55,8 +58,8 @@ async fn setup_position_event(
             "entry_filled_at": now.to_rfc3339(),
             "technical_stop_price": technical_stop_price,
             "technical_stop_distance": technical_stop_distance,
-            "entry_order_id": Uuid::now_v7(),
-            "stop_loss_order_id": Uuid::now_v7()
+            "entry_order_id": entry_order_id,
+            "stop_loss_order_id": stop_loss_order_id
         }),
     );
 
@@ -70,7 +73,40 @@ async fn setup_position_event(
         .fetch_one(pool)
         .await?;
 
-    // 4. Apply event to projections
+    // 4. Seed referenced orders so the legacy POSITION_OPENED projection
+    // satisfies current FK constraints before applying the position row.
+    for (order_id, order_type, side, stop_price) in [
+        (entry_order_id, "market", "buy", None),
+        (stop_loss_order_id, "stop_loss", "sell", Some(technical_stop_price)),
+    ] {
+        sqlx::query(
+            r#"
+            INSERT INTO orders_current (
+                order_id, tenant_id, account_id, position_id,
+                client_order_id, symbol, side, order_type,
+                quantity, price, stop_price, status,
+                last_event_id, last_seq, created_at, updated_at
+            ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, $10, 'filled', $11, $12, $13, $13)
+            "#,
+        )
+        .bind(order_id)
+        .bind(tenant_id)
+        .bind(account_id)
+        .bind(position_id)
+        .bind(format!("legacy-{}", order_id))
+        .bind(symbol)
+        .bind(side)
+        .bind(order_type)
+        .bind(entry_quantity)
+        .bind(stop_price)
+        .bind(event_id)
+        .bind(envelope.seq)
+        .bind(now)
+        .execute(pool)
+        .await?;
+    }
+
+    // 5. Apply event to projections
     apply_event_to_projections(pool, &envelope).await?;
 
     Ok(())

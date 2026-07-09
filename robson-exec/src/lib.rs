@@ -17,7 +17,7 @@
 //!
 //! # Example
 //!
-//! ```rust,ignore
+//! ```text
 //! use robson_exec::{Executor, IntentJournal, StubExchange};
 //! use robson_store::MemoryStore;
 //! use std::sync::Arc;

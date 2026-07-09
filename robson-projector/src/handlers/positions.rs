@@ -152,12 +152,16 @@ pub(crate) async fn handle_position_closed(pool: &PgPool, envelope: &EventEnvelo
 
 fn technical_stop_fields(
     tech_stop_distance: Option<TechnicalStopDistancePayload>,
-) -> (Option<Decimal>, Option<Decimal>) {
+) -> (Option<Decimal>, Option<Decimal>, Option<Decimal>) {
     match tech_stop_distance {
-        Some(tech) if !tech.initial_stop.is_zero() && !tech.distance.is_zero() => {
-            (Some(tech.initial_stop), Some(tech.distance))
+        Some(tech)
+            if tech.entry_price.is_some()
+                && !tech.initial_stop.is_zero()
+                && !tech.distance.is_zero() =>
+        {
+            (tech.entry_price, Some(tech.initial_stop), Some(tech.distance))
         },
-        _ => (None, None),
+        _ => (None, None, None),
     }
 }
 
@@ -1011,7 +1015,7 @@ pub(crate) async fn handle_position_armed(pool: &PgPool, envelope: &EventEnvelop
         }
     })?;
 
-    let (technical_stop_price, technical_stop_distance) =
+    let (entry_price, technical_stop_price, technical_stop_distance) =
         technical_stop_fields(payload.tech_stop_distance);
     let symbol = payload.symbol.as_pair();
     let side = payload.side.to_lowercase();
@@ -1036,6 +1040,7 @@ pub(crate) async fn handle_position_armed(pool: &PgPool, envelope: &EventEnvelop
         INSERT INTO positions_current (
             position_id, tenant_id, account_id,
             symbol, side,
+            entry_price,
             technical_stop_price, technical_stop_distance,
             trailing_stop_price,
             current_quantity,
@@ -1045,12 +1050,13 @@ pub(crate) async fn handle_position_armed(pool: &PgPool, envelope: &EventEnvelop
         ) VALUES (
             $1, $2, $3,
             $4, $5,
-            $6, $7,
             $6,
+            $7, $8,
+            $7,
             0,
             'armed',
-            $8, $9,
-            $10, $10
+            $9, $10,
+            $11, $11
         )
         ON CONFLICT (position_id) DO NOTHING
         "#,
@@ -1060,6 +1066,7 @@ pub(crate) async fn handle_position_armed(pool: &PgPool, envelope: &EventEnvelop
     .bind(payload.account_id)
     .bind(&symbol)
     .bind(&side)
+    .bind(entry_price)
     .bind(technical_stop_price)
     .bind(technical_stop_distance)
     .bind(envelope.event_id)
@@ -1079,14 +1086,15 @@ mod tests {
 
     #[test]
     fn position_armed_treats_missing_or_zero_technical_stop_as_unknown() {
-        assert_eq!(technical_stop_fields(None), (None, None));
+        assert_eq!(technical_stop_fields(None), (None, None, None));
 
         let zero_stop = TechnicalStopDistancePayload {
             distance: dec!(1),
             distance_pct: dec!(100),
+            entry_price: Some(dec!(1)),
             initial_stop: Decimal::ZERO,
         };
-        assert_eq!(technical_stop_fields(Some(zero_stop)), (None, None));
+        assert_eq!(technical_stop_fields(Some(zero_stop)), (None, None, None));
     }
 
     #[test]
