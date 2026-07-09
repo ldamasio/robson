@@ -38,8 +38,15 @@ jobs:
 
       - name: Install osv-scanner
         run: |
-          curl -sSfL -o osv-scanner https://github.com/google/osv-scanner/releases/download/v2.4.0/osv-scanner_linux_amd64
-          chmod +x osv-scanner
+          url="https://github.com/google/osv-scanner/releases/download/v2.4.0/osv-scanner_linux_amd64"
+          for attempt in 1 2 3; do
+            if curl -sSfL --retry 3 --retry-delay 5 --retry-all-errors -o osv-scanner "$url"; then
+              chmod +x osv-scanner
+              exit 0
+            fi
+            sleep $((attempt * 10))
+          done
+          exit 1
 
       - name: Run osv-scanner
         run: ./osv-scanner scan source --lockfile Cargo.lock
