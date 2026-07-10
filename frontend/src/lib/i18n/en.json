@@ -10,6 +10,10 @@
     "login": "Login with GitHub",
     "logout": "Logout"
   },
+  "disclaimer": {
+    "label": "Risk",
+    "body": "Robson is a crypto futures trading tool. It does not guarantee returns; crypto markets are volatile; past performance does not indicate future results. The 1% per-trade and 4% monthly caps are planned-loss ceilings, not profit guarantees. This is not investment advice. You assume all risk."
+  },
   "login": {
     "title": "Robson",
     "pageTitle": "Login — RBX Robson",
