@@ -10,6 +10,10 @@
     "login": "Entrar com GitHub",
     "logout": "Sair"
   },
+  "disclaimer": {
+    "label": "Risco",
+    "body": "Robson é uma ferramenta de operação em futuros de cripto. Não garante retorno; mercados de cripto são voláteis; desempenho passado não indica resultado futuro. Os limites de 1% por operação e 4% mensal são tetos de perda planejada, não garantia de lucro. Não é recomendação de investimento. Você assume todo o risco."
+  },
   "login": {
     "title": "Robson",
     "pageTitle": "Login — RBX Robson",

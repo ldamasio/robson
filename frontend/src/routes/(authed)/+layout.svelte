@@ -3,6 +3,7 @@
   import { browser } from '$app/environment';
   import type { Snippet } from 'svelte';
   import NavBar from '$design/components/NavBar.svelte';
+  import RiskDisclaimer from '$design/components/RiskDisclaimer.svelte';
 
   let { children }: { children: Snippet } = $props();
   let checked = $state(false);
@@ -23,4 +24,5 @@
 {#if checked && hasToken}
   <NavBar />
   {@render children()}
+  <RiskDisclaimer />
 {/if}
