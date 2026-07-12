@@ -349,7 +349,21 @@ where
     let Some(existing_id) = existing_id else {
         // No stop on record (pre-ADR-0039 position): place one at the
         // executable stop.
-        place_insurance_stop(pm, position, executable_stop).await;
+        let placed = place_insurance_stop(pm, position, executable_stop).await;
+        record_insurance_stop_check(
+            pm,
+            position_id,
+            None,
+            None,
+            executable_stop,
+            None,
+            if placed {
+                "placed_missing_recorded_stop"
+            } else {
+                "place_missing_recorded_stop_failed"
+            },
+        )
+        .await;
         return false;
     };
 
@@ -357,6 +371,7 @@ where
     //    closed on the exchange — reconcile-close from the fill.
     match pm.exchange().get_stop_order_fill(&position.symbol, &existing_id).await {
         Ok(Some(fill)) => {
+            let observed_order_id = Some(fill.exchange_order_id.clone());
             let input = input_from_order_result(position_id, fill);
             match pm.reconcile_close(input).await {
                 Ok(ReconcileCloseOutcome::Closed) => {
@@ -365,6 +380,16 @@ where
                         %existing_id,
                         "startup-recovery: reconciled close from insurance-stop fill"
                     );
+                    record_insurance_stop_check(
+                        pm,
+                        position_id,
+                        Some(existing_id.clone()),
+                        observed_order_id,
+                        executable_stop,
+                        None,
+                        "filled_reconciled_closed",
+                    )
+                    .await;
                     return true;
                 },
                 Ok(outcome) => {
@@ -374,6 +399,16 @@ where
                         ?outcome,
                         "startup-recovery: insurance-stop fill reconcile-close did not close"
                     );
+                    record_insurance_stop_check(
+                        pm,
+                        position_id,
+                        Some(existing_id.clone()),
+                        observed_order_id.clone(),
+                        executable_stop,
+                        None,
+                        "filled_reconcile_close_not_closed",
+                    )
+                    .await;
                     return false;
                 },
                 Err(error) => {
@@ -383,6 +418,16 @@ where
                         %error,
                         "startup-recovery: reconcile-close from insurance-stop fill failed; leaving position Active"
                     );
+                    record_insurance_stop_check(
+                        pm,
+                        position_id,
+                        Some(existing_id.clone()),
+                        observed_order_id.clone(),
+                        executable_stop,
+                        None,
+                        "filled_reconcile_close_failed",
+                    )
+                    .await;
                     return false;
                 },
             }
@@ -410,30 +455,131 @@ where
                 %error,
                 "startup-recovery: open-orders check failed; leaving insurance stop as-is"
             );
+            record_insurance_stop_check(
+                pm,
+                position_id,
+                Some(existing_id.clone()),
+                None,
+                executable_stop,
+                None,
+                "open_orders_check_failed",
+            )
+            .await;
             return false;
         },
     };
 
     match live_order {
-        Some(order) => match order.stop_price {
-            Some(stop_price) if stop_price != executable_stop => {
-                replace_insurance_stop(pm, position, executable_stop, existing_id).await;
-            },
-            _ => {
-                debug!(
-                    %position_id,
-                    %existing_id,
-                    "startup-recovery: insurance stop already at trailing stop; no heal needed"
-                );
-            },
+        Some(order) => {
+            let observed_order_id = Some(order.exchange_order_id.clone());
+            match order.stop_price {
+                Some(stop_price) if stop_price != executable_stop => {
+                    let replaced =
+                        replace_insurance_stop(pm, position, executable_stop, existing_id.clone())
+                            .await;
+                    record_insurance_stop_check(
+                        pm,
+                        position_id,
+                        Some(existing_id.clone()),
+                        observed_order_id,
+                        executable_stop,
+                        Some(stop_price),
+                        if replaced {
+                            "replaced_stale_stop"
+                        } else {
+                            "replace_stale_stop_failed"
+                        },
+                    )
+                    .await;
+                },
+                Some(stop_price) => {
+                    debug!(
+                        %position_id,
+                        %existing_id,
+                        "startup-recovery: insurance stop already at trailing stop; no heal needed"
+                    );
+                    record_insurance_stop_check(
+                        pm,
+                        position_id,
+                        Some(existing_id.clone()),
+                        observed_order_id,
+                        executable_stop,
+                        Some(stop_price),
+                        "already_protected",
+                    )
+                    .await;
+                },
+                None => {
+                    warn!(
+                        %position_id,
+                        %existing_id,
+                        "startup-recovery: open insurance stop has no stop price"
+                    );
+                    record_insurance_stop_check(
+                        pm,
+                        position_id,
+                        Some(existing_id.clone()),
+                        observed_order_id,
+                        executable_stop,
+                        None,
+                        "open_stop_missing_price",
+                    )
+                    .await;
+                },
+            }
         },
         None => {
-            // Cancelled/missing: re-place at the executable stop.
-            place_insurance_stop(pm, position, executable_stop).await;
+            let placed = place_insurance_stop(pm, position, executable_stop).await;
+            record_insurance_stop_check(
+                pm,
+                position_id,
+                Some(existing_id.clone()),
+                None,
+                executable_stop,
+                None,
+                if placed {
+                    "placed_missing_exchange_stop"
+                } else {
+                    "place_missing_exchange_stop_failed"
+                },
+            )
+            .await;
         },
     }
 
     false
+}
+
+async fn record_insurance_stop_check<E, S>(
+    pm: &PositionManager<E, S>,
+    position_id: robson_domain::PositionId,
+    recorded_order_id: Option<String>,
+    observed_order_id: Option<String>,
+    expected_stop: Price,
+    observed_stop: Option<Price>,
+    outcome: &str,
+) where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let event = Event::StartupRecoveryInsuranceStopChecked {
+        position_id,
+        recorded_order_id,
+        observed_order_id,
+        expected_stop,
+        observed_stop,
+        outcome: outcome.to_string(),
+        timestamp: Utc::now(),
+    };
+
+    if let Err(error) = pm.record_recovery_audit_event(event).await {
+        warn!(
+            %position_id,
+            %error,
+            outcome,
+            "startup-recovery: failed to persist insurance-stop check audit event"
+        );
+    }
 }
 
 /// Place a fresh insurance stop at `stop_price` (recovery path).
@@ -441,7 +587,8 @@ async fn place_insurance_stop<E, S>(
     pm: &PositionManager<E, S>,
     position: &robson_domain::Position,
     stop_price: Price,
-) where
+) -> bool
+where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
@@ -452,12 +599,21 @@ async fn place_insurance_stop<E, S>(
         quantity: position.quantity,
         stop_price,
     };
-    if let Err(error) = pm.execute_and_persist_recovery(vec![action]).await {
-        warn!(
-            position_id = %position.id,
-            %error,
-            "startup-recovery: PlaceInsuranceStop batch failed"
-        );
+    match pm.execute_and_persist_recovery(vec![action]).await {
+        Ok(results) => results.iter().any(|result| {
+            matches!(result, ActionResult::OrderPlaced {
+                event: Some(Event::InsuranceStopPlaced { .. }),
+                ..
+            })
+        }),
+        Err(error) => {
+            warn!(
+                position_id = %position.id,
+                %error,
+                "startup-recovery: PlaceInsuranceStop batch failed"
+            );
+            false
+        },
     }
 }
 
@@ -467,7 +623,8 @@ async fn replace_insurance_stop<E, S>(
     position: &robson_domain::Position,
     stop_price: Price,
     previous_order_id: String,
-) where
+) -> bool
+where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
@@ -479,12 +636,21 @@ async fn replace_insurance_stop<E, S>(
         previous_order_id,
         new_stop_price: stop_price,
     };
-    if let Err(error) = pm.execute_and_persist_recovery(vec![action]).await {
-        warn!(
-            position_id = %position.id,
-            %error,
-            "startup-recovery: ReplaceInsuranceStop batch failed"
-        );
+    match pm.execute_and_persist_recovery(vec![action]).await {
+        Ok(results) => results.iter().any(|result| {
+            matches!(result, ActionResult::OrderPlaced {
+                event: Some(Event::InsuranceStopReplaced { .. }),
+                ..
+            })
+        }),
+        Err(error) => {
+            warn!(
+                position_id = %position.id,
+                %error,
+                "startup-recovery: ReplaceInsuranceStop batch failed"
+            );
+            false
+        },
     }
 }
 
@@ -741,6 +907,17 @@ mod tests {
             .any(|event| event.position_id() == position_id && event.event_type() == kind)
     }
 
+    fn recovery_check_outcome(events: &[Event], position_id: Uuid) -> Option<&str> {
+        events.iter().find_map(|event| match event {
+            Event::StartupRecoveryInsuranceStopChecked {
+                position_id: event_position_id,
+                outcome,
+                ..
+            } if *event_position_id == position_id => Some(outcome.as_str()),
+            _ => None,
+        })
+    }
+
     async fn heal_manager() -> Arc<PositionManager<StubExchange, MemoryStore>> {
         let ohlcv = Arc::new(StubOhlcv::default()) as Arc<dyn OhlcvPort>;
         create_manager(ohlcv, dec!(78000)).await
@@ -766,6 +943,10 @@ mod tests {
         assert!(
             has_insurance_event(&events, position_id, "insurance_stop_placed"),
             "expected an InsuranceStopPlaced event"
+        );
+        assert_eq!(
+            recovery_check_outcome(&events, position_id),
+            Some("placed_missing_recorded_stop")
         );
     }
 
@@ -795,6 +976,10 @@ mod tests {
         assert!(
             has_insurance_event(&events, position_id, "insurance_stop_placed"),
             "expected an InsuranceStopPlaced event for the re-placement"
+        );
+        assert_eq!(
+            recovery_check_outcome(&events, position_id),
+            Some("placed_missing_exchange_stop")
         );
     }
 
@@ -836,6 +1021,7 @@ mod tests {
             has_insurance_event(&events, position_id, "insurance_stop_replaced"),
             "expected an InsuranceStopReplaced event"
         );
+        assert_eq!(recovery_check_outcome(&events, position_id), Some("replaced_stale_stop"));
         let loaded = pm.store().positions().find_by_id(position_id).await.unwrap().unwrap();
         assert_ne!(
             loaded.insurance_stop_id.as_deref(),
@@ -882,6 +1068,7 @@ mod tests {
                 && !has_insurance_event(&events, position_id, "insurance_stop_placed"),
             "no place/replace expected when the stop is already correct"
         );
+        assert_eq!(recovery_check_outcome(&events, position_id), Some("already_protected"));
     }
 
     #[tokio::test]
@@ -934,6 +1121,7 @@ mod tests {
                 && !has_insurance_event(&events, position_id, "insurance_stop_placed"),
             "no place/replace expected when the stop is at the guard-aware price"
         );
+        assert_eq!(recovery_check_outcome(&events, position_id), Some("already_protected"));
     }
 
     #[tokio::test]
@@ -1001,6 +1189,7 @@ mod tests {
             evidence,
             ClosureEvidence::Reconciled(ReconciliationEvidence::OrderFillRecord(_))
         ));
+        assert_eq!(recovery_check_outcome(&events, position_id), Some("filled_reconciled_closed"));
     }
 
     /// If the stop was NOT crossed during the gap, recovery must leave the

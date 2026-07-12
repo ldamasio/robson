@@ -3684,6 +3684,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self.execute_and_persist(actions).await
     }
 
+    /// Record a startup-recovery audit event through the normal durable path.
+    ///
+    /// The recovery path has outcomes that may be no-ops from a lifecycle
+    /// perspective (for example, the exchange stop was already correct). This
+    /// helper still appends those checks to the event stream so later audits do
+    /// not depend on volatile daemon logs.
+    pub(crate) async fn record_recovery_audit_event(&self, event: Event) -> DaemonResult<()> {
+        self.store.events().append(&event).await?;
+        self.store.apply_event(&event)?;
+        self.persist_event_to_log(&event).await?;
+        Ok(())
+    }
+
     /// Handle exit fill during startup recovery.
     ///
     /// Thin wrapper around `handle_exit_fill` exposed as `pub(crate)` so

@@ -386,7 +386,8 @@ impl MemoryStore {
             },
 
             // InsuranceStopFailed: audit-only, no position state change.
-            Event::InsuranceStopFailed { .. } => {},
+            Event::InsuranceStopFailed { .. }
+            | Event::StartupRecoveryInsuranceStopChecked { .. } => {},
 
             // All other events are audit-only and do not affect the position projection
             _ => {},
