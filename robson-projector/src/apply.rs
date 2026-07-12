@@ -50,6 +50,7 @@ enum ProjectionRoute {
     InsuranceStopReplaced,
     InsuranceStopCancelled,
     InsuranceStopFailed,
+    StartupRecoveryInsuranceStopChecked,
 }
 
 fn projection_route(event_type: &str) -> Option<ProjectionRoute> {
@@ -92,6 +93,9 @@ fn projection_route(event_type: &str) -> Option<ProjectionRoute> {
         "insurance_stop_replaced" => Some(ProjectionRoute::InsuranceStopReplaced),
         "insurance_stop_cancelled" => Some(ProjectionRoute::InsuranceStopCancelled),
         "insurance_stop_failed" => Some(ProjectionRoute::InsuranceStopFailed),
+        "startup_recovery_insurance_stop_checked" => {
+            Some(ProjectionRoute::StartupRecoveryInsuranceStopChecked)
+        },
 
         // Balance events
         "BALANCE_SAMPLED" => Some(ProjectionRoute::BalanceSampled),
@@ -199,8 +203,9 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
         Some(ProjectionRoute::InsuranceStopCancelled) => {
             handlers::positions::handle_insurance_stop_cleared(pool, envelope).await?
         },
-        Some(ProjectionRoute::InsuranceStopFailed) => {
-            // Audit-only: a failed placement leaves no live order to link.
+        Some(ProjectionRoute::InsuranceStopFailed)
+        | Some(ProjectionRoute::StartupRecoveryInsuranceStopChecked) => {
+            // Audit-only: no position projection mutation.
         },
         Some(ProjectionRoute::BalanceSampled) => {
             handlers::balances::handle_balance_sampled(pool, envelope).await?
@@ -281,6 +286,7 @@ mod tests {
             "insurance_stop_replaced",
             "insurance_stop_cancelled",
             "insurance_stop_failed",
+            "startup_recovery_insurance_stop_checked",
         ];
 
         for event_type in runtime_event_types {

@@ -459,6 +459,29 @@ pub enum Event {
         /// When the failure occurred
         timestamp: DateTime<Utc>,
     },
+
+    /// Startup recovery audited the exchange-side insurance stop.
+    ///
+    /// Emitted once the startup recovery path has checked whether an Active
+    /// position's protective stop is present, missing, stale, filled, or
+    /// unverifiable. This is durable audit evidence for the recovery check
+    /// itself; placement/replacement/close events still record the mutations.
+    StartupRecoveryInsuranceStopChecked {
+        /// Position identifier
+        position_id: PositionId,
+        /// Insurance stop id recorded in Robson state before the check
+        recorded_order_id: Option<String>,
+        /// Stop id observed on the exchange, when one was present
+        observed_order_id: Option<String>,
+        /// Guard/buffer-adjusted stop price recovery expected on exchange
+        expected_stop: Price,
+        /// Stop price observed on the exchange, when available
+        observed_stop: Option<Price>,
+        /// Stable outcome string for audit queries
+        outcome: String,
+        /// When the recovery check completed
+        timestamp: DateTime<Utc>,
+    },
 }
 
 impl Event {
@@ -491,7 +514,8 @@ impl Event {
             | Event::InsuranceStopPlaced { position_id, .. }
             | Event::InsuranceStopReplaced { position_id, .. }
             | Event::InsuranceStopCancelled { position_id, .. }
-            | Event::InsuranceStopFailed { position_id, .. } => *position_id,
+            | Event::InsuranceStopFailed { position_id, .. }
+            | Event::StartupRecoveryInsuranceStopChecked { position_id, .. } => *position_id,
             Event::MonthBoundaryReset { .. } | Event::CapitalBaseRecalibrated { .. } => {
                 uuid::Uuid::nil()
             },
@@ -526,7 +550,8 @@ impl Event {
             | Event::InsuranceStopPlaced { timestamp, .. }
             | Event::InsuranceStopReplaced { timestamp, .. }
             | Event::InsuranceStopCancelled { timestamp, .. }
-            | Event::InsuranceStopFailed { timestamp, .. } => *timestamp,
+            | Event::InsuranceStopFailed { timestamp, .. }
+            | Event::StartupRecoveryInsuranceStopChecked { timestamp, .. } => *timestamp,
         }
     }
 
@@ -559,6 +584,9 @@ impl Event {
             Event::InsuranceStopReplaced { .. } => "insurance_stop_replaced",
             Event::InsuranceStopCancelled { .. } => "insurance_stop_cancelled",
             Event::InsuranceStopFailed { .. } => "insurance_stop_failed",
+            Event::StartupRecoveryInsuranceStopChecked { .. } => {
+                "startup_recovery_insurance_stop_checked"
+            },
         }
     }
 }
@@ -1272,8 +1300,19 @@ mod tests {
         };
         assert_eq!(failed.event_type(), "insurance_stop_failed");
 
+        let checked = Event::StartupRecoveryInsuranceStopChecked {
+            position_id: pid,
+            recorded_order_id: Some("BIN-INS-2".to_string()),
+            observed_order_id: Some("BIN-INS-2".to_string()),
+            expected_stop: Price::new(dec!(94000)).unwrap(),
+            observed_stop: Some(Price::new(dec!(94000)).unwrap()),
+            outcome: "already_protected".to_string(),
+            timestamp: ts,
+        };
+        assert_eq!(checked.event_type(), "startup_recovery_insurance_stop_checked");
+
         // Each event roundtrips through serde and preserves position_id/timestamp.
-        for event in [placed, replaced, cancelled, failed] {
+        for event in [placed, replaced, cancelled, failed, checked] {
             let json = serde_json::to_string(&event).unwrap();
             let back: Event = serde_json::from_str(&json).unwrap();
             assert_eq!(back.position_id(), pid);
