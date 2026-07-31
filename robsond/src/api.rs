@@ -2433,7 +2433,8 @@ mod tests {
     use robson_exec::{
         ExchangePort, ExchangePosition, ExecError, Executor, FuturesBalance, FuturesSettings,
         IntentJournal, OpenOrderRecord, OrderResult, SpotBalance, SpotOrder, SpotOrderRequest,
-        StubExchange, Transfer, TransferId, UniversalTransferType, UserTradeRecord,
+        StopCancelOutcome, StubExchange, Transfer, TransferId, UniversalTransferType,
+        UserTradeRecord,
     };
     use robson_store::MemoryStore;
     use rust_decimal::Decimal;
@@ -2504,7 +2505,7 @@ mod tests {
             &self,
             _symbol: &Symbol,
             _algo_id: &str,
-        ) -> Result<(), ExecError> {
+        ) -> Result<StopCancelOutcome, ExecError> {
             Err(ExecError::Timeout("unused".to_string()))
         }
 

@@ -49,6 +49,7 @@ pub use intent::{Intent, IntentAction, IntentJournal, IntentResult, IntentStatus
 pub use ports::{
     CandleInterval, ExchangePort, ExchangePosition, FuturesBalance, FuturesSettings,
     MarketDataPort, OhlcvPort, OpenOrderRecord, OrderResult, PriceUpdate, SpotBalance, SpotOrder,
-    SpotOrderRequest, Transfer, TransferId, UniversalTransferType, UserTradeRecord,
+    SpotOrderRequest, StopCancelOutcome, Transfer, TransferId, UniversalTransferType,
+    UserTradeRecord,
 };
 pub use stub::{StubExchange, StubMarketData, StubOhlcv};

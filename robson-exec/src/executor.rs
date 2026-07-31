@@ -23,7 +23,7 @@ use uuid::Uuid;
 use crate::{
     error::{ExecError, ExecResult},
     intent::{Intent, IntentAction, IntentJournal, IntentResult},
-    ports::{ExchangePort, OrderResult},
+    ports::{ExchangePort, OrderResult, StopCancelOutcome},
 };
 
 // =============================================================================
@@ -654,7 +654,23 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         );
 
         match self.exchange.cancel_stop_market_order(&symbol, &order_id).await {
-            Ok(()) => {},
+            Ok(StopCancelOutcome::Cancelled) => {},
+            // The exchange no longer knows the order. The dominant cause is
+            // that the stop TRIGGERED and closed the position, so emitting
+            // InsuranceStopCancelled here would both misreport the outcome and
+            // clear `insurance_stop_id` — the pointer reverse reconciliation
+            // needs to resolve the real fill (2026-07-31 incident).
+            Ok(StopCancelOutcome::AlreadyGone) => {
+                warn!(
+                    %position_id,
+                    %order_id,
+                    "Insurance stop already gone on exchange; preserving stop id as \
+                     reconciliation evidence instead of recording a cancellation"
+                );
+                return Ok(ActionResult::Skipped(format!(
+                    "insurance stop {order_id} already gone on exchange"
+                )));
+            },
             Err(e) if Self::is_unknown_order_error(&e) => {
                 warn!(
                     %position_id,
@@ -1162,5 +1178,38 @@ mod tests {
         // The stop was removed from the stub.
         assert_eq!(exchange.stop_order_count(), 0);
         assert!(!exchange.has_stop_order(&order_id));
+    }
+
+    /// Regression: 2026-07-31 production incident.
+    ///
+    /// A conditional stop the exchange no longer knows about has almost always
+    /// TRIGGERED. Recording that as `InsuranceStopCancelled` both misreports
+    /// the outcome and clears `insurance_stop_id`, destroying the pointer the
+    /// reverse-reconciliation order-fill path needs to resolve the real fill.
+    #[tokio::test]
+    async fn test_cancel_insurance_stop_already_gone_does_not_record_a_cancellation() {
+        let (executor, exchange) = insurance_executor();
+        let position_id = Uuid::now_v7();
+
+        // No stop was ever placed, so the exchange reports AlreadyGone — the
+        // same answer it gives for a stop that already fired.
+        let cancel_action = EngineAction::CancelInsuranceStop {
+            position_id,
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            order_id: "2000001325469919".to_string(),
+        };
+        let results = executor.execute(vec![cancel_action]).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        match &results[0] {
+            ActionResult::Skipped(reason) => {
+                assert!(
+                    reason.contains("2000001325469919"),
+                    "the skip reason must name the stop id, got {reason}"
+                );
+            },
+            other => panic!("Expected Skipped for an already-gone stop, got {:?}", other),
+        }
+        assert_eq!(exchange.stop_order_count(), 0);
     }
 }
