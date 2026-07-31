@@ -16,7 +16,7 @@
   },
   "login": {
     "title": "Robson",
-    "pageTitle": "Login — RBX Robson",
+    "pageTitle": "Login · RBX Robson",
     "description": "Enter your API token to access the operations console.",
     "tokenPlaceholder": "Bearer token",
     "connect": "Connect",
@@ -24,7 +24,7 @@
     "connectionFailed": "Connection failed"
   },
   "dashboard": {
-    "pageTitle": "Dashboard — RBX Robson",
+    "pageTitle": "Dashboard · RBX Robson",
     "slotsTitle": "Slots",
     "activeOperations": "Active operations",
     "todayEvents": "Today's events",
@@ -45,7 +45,8 @@
     "connectionError": "CONNECTION ERROR",
     "retry": "Retry",
     "insufficientCapitalBanner": "Insufficient capital to operate",
-    "monthlyBudgetExhaustedBanner": "Monthly risk budget exhausted — new entries unlock at the month rollover",
+    "monthlyBudgetExhaustedBanner": "Monthly risk budget exhausted. New entries unlock at the month rollover.",
+    "monthlyBudgetLowBanner": "Monthly risk budget nearly used. Only entries that risk less than what is left will be admitted.",
     "addFunds": "Add funds",
     "treasuryNav": "Treasury"
   },
@@ -57,7 +58,7 @@
     "opened": "Opened",
     "closed": "Closed",
     "eventStream": "Event stream",
-    "title": "{label} — RBX Robson",
+    "title": "{label} · RBX Robson",
     "header": "RBX ROBSON · OPERATION {id}",
     "summary": "SUMMARY",
     "eventStreamLabel": "EVENT STREAM",
@@ -72,7 +73,7 @@
     "retry": "Retry"
   },
   "funding": {
-    "pageTitle": "Funding — RBX Robson",
+    "pageTitle": "Funding · RBX Robson",
     "previewTitle": "Funding Preview",
     "confirmTitle": "Confirm Funding",
     "quoteButton": "Quote",
