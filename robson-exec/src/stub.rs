@@ -19,7 +19,7 @@ use crate::{
         CandleInterval, ExchangePort, ExchangePosition, FuturesBalance, FuturesSettings,
         IncomePort, IncomeRecord, MarketDataPort, OhlcvPort, OpenOrderRecord, OrderResult,
         PriceUpdate, SpotBalance, SpotOrder, SpotOrderQuantity, SpotOrderRequest, SpotOrderSide,
-        Transfer, TransferId, UniversalTransferType, UserTradeRecord,
+        StopCancelOutcome, Transfer, TransferId, UniversalTransferType, UserTradeRecord,
     },
 };
 
@@ -449,15 +449,19 @@ impl ExchangePort for StubExchange {
         &self,
         _symbol: &Symbol,
         algo_id: &str,
-    ) -> Result<(), ExecError> {
+    ) -> Result<StopCancelOutcome, ExecError> {
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated stop cancel failure".to_string()));
         }
 
-        self.stop_orders.write().unwrap().remove(algo_id);
+        let existed = self.stop_orders.write().unwrap().remove(algo_id).is_some();
 
-        tracing::debug!(algo_id, "Stub: stop algo order cancelled");
-        Ok(())
+        tracing::debug!(algo_id, existed, "Stub: stop algo order cancel");
+        Ok(if existed {
+            StopCancelOutcome::Cancelled
+        } else {
+            StopCancelOutcome::AlreadyGone
+        })
     }
 
     async fn get_open_orders(&self, symbol: &Symbol) -> Result<Vec<OpenOrderRecord>, ExecError> {

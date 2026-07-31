@@ -22,7 +22,7 @@ use robson_exec::{
         OpenOrderRecord, SpotBalance, SpotOrder, SpotOrderQuantity, SpotOrderRequest,
         SpotOrderSide, Transfer, TransferId, UniversalTransferType, UserTradeRecord,
     },
-    ExchangePort, ExecError, OrderResult,
+    ExchangePort, ExecError, OrderResult, StopCancelOutcome,
 };
 use rust_decimal::Decimal;
 use tracing::{info, warn};
@@ -437,20 +437,20 @@ impl ExchangePort for BinanceExchangeAdapter {
         &self,
         _symbol: &Symbol,
         algo_id: &str,
-    ) -> Result<(), ExecError> {
+    ) -> Result<StopCancelOutcome, ExecError> {
         let algo_id_num: i64 = algo_id.parse().map_err(|_| {
             ExecError::Exchange(format!("Invalid algo_id for insurance stop cancel: {}", algo_id))
         })?;
 
         match self.client.cancel_algo_order(algo_id_num).await {
-            Ok(_) => Ok(()),
+            Ok(_) => Ok(StopCancelOutcome::Cancelled),
             Err(error) if Self::is_tolerated_algo_cancel_error(&error) => {
                 warn!(
                     %algo_id,
                     %error,
-                    "Insurance stop algo order already gone; treating cancel as success"
+                    "Insurance stop algo order already gone; most likely triggered"
                 );
-                Ok(())
+                Ok(StopCancelOutcome::AlreadyGone)
             },
             Err(error) => Err(Self::map_error(error)),
         }

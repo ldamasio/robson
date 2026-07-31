@@ -11,7 +11,7 @@ use std::{
 
 use chrono::{DateTime, Datelike, Utc};
 use robson_domain::{
-    Event, OrderFillEvidence, Position, PositionId, PositionState, Quantity,
+    Event, OrderFillEvidence, Position, PositionId, PositionState, Price, Quantity,
     ReconciliationEvidence, Side, Symbol, UserTradeEvidence,
 };
 use robson_exec::{ExchangePort, ExchangePosition, OpenOrderRecord, OrderResult, UserTradeRecord};
@@ -95,6 +95,11 @@ where
         _ => position.insurance_stop_id.clone(),
     };
     let Some(order_id) = candidate_order_id else {
+        debug!(
+            position_id = %position.id,
+            symbol = %position.symbol.as_pair(),
+            "Reverse reconciliation has no insurance stop id; falling back to user trades"
+        );
         return Ok(None);
     };
 
@@ -110,6 +115,51 @@ where
     Ok(Some(input_from_order_result(position.id, result)))
 }
 
+/// One exchange order's worth of user trades, aggregated into a single fill.
+///
+/// A closing order routinely fills in several trades, so evidence must be
+/// summed per `exchange_order_id` before it can be compared with the position
+/// quantity.
+struct AggregatedOrderFill {
+    exchange_order_id: String,
+    fill_price: Price,
+    filled_quantity: Quantity,
+    fee: Decimal,
+    fee_asset: String,
+    filled_at: DateTime<Utc>,
+    /// Set only when the order filled in exactly one trade, which lets the
+    /// caller keep the higher-specificity `UserTradeRecord` evidence.
+    single_trade_id: Option<String>,
+}
+
+/// Collapse the trades of one exchange order into a quantity-weighted fill.
+///
+/// Mirrors the aggregation `BinanceExchange::get_stop_order_fill` already
+/// performs for conditional orders, so both evidence paths report the same
+/// numbers for the same order.
+fn aggregate_order_fills(fills: Vec<UserTradeRecord>) -> Option<AggregatedOrderFill> {
+    let total_qty: Decimal = fills.iter().map(|t| t.filled_quantity.as_decimal()).sum();
+    if total_qty <= Decimal::ZERO {
+        return None;
+    }
+    let total_quote: Decimal = fills
+        .iter()
+        .map(|t| t.fill_price.as_decimal() * t.filled_quantity.as_decimal())
+        .sum();
+
+    let single_trade_id = (fills.len() == 1).then(|| fills[0].exchange_trade_id.clone());
+
+    Some(AggregatedOrderFill {
+        exchange_order_id: fills.first()?.exchange_order_id.clone(),
+        fill_price: Price::new(total_quote / total_qty).ok()?,
+        filled_quantity: Quantity::new(total_qty).ok()?,
+        fee: fills.iter().map(|t| t.fee).sum(),
+        fee_asset: fills.first()?.fee_asset.clone(),
+        filled_at: fills.iter().map(|t| t.filled_at).max()?,
+        single_trade_id,
+    })
+}
+
 pub(crate) async fn gather_user_trade_evidence<E>(
     exchange: &Arc<E>,
     position: &Position,
@@ -119,30 +169,92 @@ pub(crate) async fn gather_user_trade_evidence<E>(
 where
     E: ExchangePort + 'static,
 {
-    const USER_TRADES_LIMIT: u16 = 100;
+    // Raised from 100: the window now spans the position's whole life rather
+    // than the few seconds after detection, so an active symbol can put many
+    // unrelated trades between the entry and the close.
+    const USER_TRADES_LIMIT: u16 = 1000;
 
     let trades = exchange
         .get_user_trades_since(&position.symbol, observed_at_floor, USER_TRADES_LIMIT)
         .await?;
-    let mut compatible = trades.into_iter().filter(|trade| {
-        trade.filled_at >= observed_at_floor && trade.filled_quantity == expected_quantity
-    });
 
-    let Some(first) = compatible.next() else {
-        return Ok(None);
-    };
-    if compatible.next().is_some() {
+    let mut by_order: HashMap<String, Vec<UserTradeRecord>> = HashMap::new();
+    for trade in trades {
+        // Strictly after the floor. With the floor anchored at the entry fill,
+        // this drops the entry's own trades, which match the position quantity
+        // exactly as well as the close does and would otherwise render every
+        // close ambiguous.
+        if trade.filled_at <= observed_at_floor {
+            continue;
+        }
+        by_order.entry(trade.exchange_order_id.clone()).or_default().push(trade);
+    }
+
+    let mut compatible: Vec<AggregatedOrderFill> = by_order
+        .into_values()
+        .filter_map(aggregate_order_fills)
+        .filter(|fill| fill.filled_quantity == expected_quantity)
+        .collect();
+    compatible.sort_by_key(|fill| fill.filled_at);
+
+    if compatible.len() > 1 {
         warn!(
             position_id = %position.id,
             symbol = %position.symbol.as_pair(),
             side = ?position.side,
             expected_quantity = %expected_quantity,
-            "Reverse reconciliation found multiple compatible user trades, leaving unresolved"
+            candidates = compatible.len(),
+            "Reverse reconciliation found multiple compatible closing orders, leaving unresolved"
         );
         return Ok(None);
     }
 
-    Ok(Some(input_from_user_trade(position.id, first)))
+    let Some(fill) = compatible.pop() else {
+        return Ok(None);
+    };
+
+    Ok(Some(input_from_aggregated_fill(position.id, fill)))
+}
+
+/// Build the close input from an aggregated order fill.
+///
+/// A single-trade order keeps `UserTradeRecord` evidence so the exchange trade
+/// id stays in the audit trail; a multi-trade order can only be identified by
+/// its order id, which is what `OrderFillRecord` carries.
+fn input_from_aggregated_fill(
+    position_id: PositionId,
+    fill: AggregatedOrderFill,
+) -> ReconciledCloseInput {
+    let evidence = match &fill.single_trade_id {
+        Some(trade_id) => ReconciliationEvidence::UserTradeRecord(UserTradeEvidence {
+            exchange_order_id: fill.exchange_order_id.clone(),
+            exchange_trade_id: trade_id.clone(),
+            fill_price: fill.fill_price,
+            filled_quantity: fill.filled_quantity,
+            fee: fill.fee,
+            fee_asset: fill.fee_asset.clone(),
+            filled_at: fill.filled_at,
+        }),
+        None => ReconciliationEvidence::OrderFillRecord(OrderFillEvidence {
+            exchange_order_id: fill.exchange_order_id.clone(),
+            fill_price: fill.fill_price,
+            filled_quantity: fill.filled_quantity,
+            fee: fill.fee,
+            fee_asset: fill.fee_asset.clone(),
+            filled_at: fill.filled_at,
+        }),
+    };
+
+    ReconciledCloseInput {
+        position_id,
+        exit_price: fill.fill_price,
+        filled_quantity: fill.filled_quantity,
+        fee: fill.fee,
+        fee_asset: fill.fee_asset,
+        closed_at: fill.filled_at,
+        authored_client_order_id: None,
+        evidence,
+    }
 }
 
 pub(crate) fn input_from_order_result(
@@ -164,30 +276,6 @@ pub(crate) fn input_from_order_result(
             fee: result.fee,
             fee_asset: result.fee_asset,
             filled_at: result.filled_at,
-        }),
-    }
-}
-
-pub(crate) fn input_from_user_trade(
-    position_id: PositionId,
-    trade: UserTradeRecord,
-) -> ReconciledCloseInput {
-    ReconciledCloseInput {
-        position_id,
-        exit_price: trade.fill_price,
-        filled_quantity: trade.filled_quantity,
-        fee: trade.fee,
-        fee_asset: trade.fee_asset.clone(),
-        closed_at: trade.filled_at,
-        authored_client_order_id: None,
-        evidence: ReconciliationEvidence::UserTradeRecord(UserTradeEvidence {
-            exchange_order_id: trade.exchange_order_id,
-            exchange_trade_id: trade.exchange_trade_id,
-            fill_price: trade.fill_price,
-            filled_quantity: trade.filled_quantity,
-            fee: trade.fee,
-            fee_asset: trade.fee_asset,
-            filled_at: trade.filled_at,
         }),
     }
 }
@@ -433,11 +521,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
 
                 match self.exchange.cancel_stop_market_order(symbol, &order.exchange_order_id).await
                 {
-                    Ok(()) => {
+                    // An orphan stop is not attached to any tracked position, so
+                    // either outcome leaves the exchange in the desired state:
+                    // the order is gone.
+                    Ok(outcome) => {
                         info!(
                             symbol = %symbol.as_pair(),
                             exchange_order_id = %order.exchange_order_id,
-                            "Orphan insurance-stop order cancelled"
+                            ?outcome,
+                            "Orphan insurance-stop order cleared"
                         );
                         self.event_bus.send(DaemonEvent::InsuranceStopOrphanCancelled {
                             symbol: symbol.clone(),
@@ -506,12 +598,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         }
 
         let confirmed_missing_at = Utc::now();
+        // Anchor the evidence window at the entry fill, matching the startup
+        // auto-reconcile path. The closing fill always PRECEDES the missing
+        // observation — the worker can only notice an absence on the scan that
+        // follows it — so anchoring at `first_observed_missing_at` excluded the
+        // very trade being looked for and left positions Active forever
+        // (2026-07-31: fills 26 s and 29 s ahead of their observations).
+        let evidence_floor = position.entry_filled_at.unwrap_or(position.created_at);
         match gather_real_evidence(
             &self.exchange,
             &self.store,
             position,
             observation.expected_quantity,
-            observation.first_observed_missing_at,
+            evidence_floor,
         )
         .await?
         {
@@ -1535,6 +1634,163 @@ mod tests {
         let loaded = store.positions().find_by_id(position_id).await.unwrap().unwrap();
         assert!(matches!(loaded.state, PositionState::Active { .. }));
         assert_eq!(close_events_for(&store, position_id).await, 0);
+    }
+
+    /// Regression: 2026-07-31 production incident.
+    ///
+    /// The real closing fill always PRECEDES the missing observation, because
+    /// the worker can only notice an absence on the scan that follows it. While
+    /// the evidence window was anchored at `first_observed_missing_at`, the
+    /// closing trade sat just before the floor and was filtered out on every
+    /// pass, leaving two positions Active (47 min and 10 days) and blocking
+    /// every new entry on the symbol through the duplicate-position risk gate.
+    #[tokio::test]
+    async fn test_user_trade_before_missing_observation_still_resolves() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let mut position = tracked_active_position(symbol.clone(), Side::Long);
+        let position_id = position.id;
+        position.entry_filled_at = Some(Utc::now() - chrono::Duration::minutes(10));
+        store.positions().save(&position).await.unwrap();
+
+        // Fill lands BEFORE the first missing observation, exactly as a stop
+        // that triggered between two scans does.
+        exchange.set_user_trades(&symbol.as_pair(), vec![user_trade(
+            "TRADE-1",
+            "EX-ORDER-2",
+            dec!(90),
+            dec!(0.010),
+            Utc::now() - chrono::Duration::seconds(30),
+        )]);
+
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+        worker.scan_and_reconcile().await.unwrap();
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 1);
+
+        let closed = store.positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(
+            matches!(closed.state, PositionState::Closed {
+                exit_reason: ExitReason::ReconciledMissingOnExchange,
+                ..
+            }),
+            "a fill preceding the observation must still close the position, got {:?}",
+            closed.state
+        );
+    }
+
+    /// Regression: 2026-07-21 production incident.
+    ///
+    /// A closing order routinely fills in several trades (0.007 + 0.017 under
+    /// one order id). Comparing each trade against the position quantity
+    /// matched none of them and left the position unresolved forever.
+    #[tokio::test]
+    async fn test_partial_fills_of_one_order_are_aggregated() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let position = tracked_active_position(symbol.clone(), Side::Long);
+        let position_id = position.id;
+        store.positions().save(&position).await.unwrap();
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+
+        worker.scan_and_reconcile().await.unwrap();
+        let now = Utc::now();
+        exchange.set_user_trades(&symbol.as_pair(), vec![
+            user_trade("TRADE-1", "EX-ORDER-2", dec!(90), dec!(0.003), now),
+            user_trade("TRADE-2", "EX-ORDER-2", dec!(95), dec!(0.007), now),
+        ]);
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 1);
+
+        let events = store.events().find_by_position(position_id).await.unwrap();
+        let evidence = events
+            .iter()
+            .find_map(|event| {
+                if let robson_domain::Event::PositionClosed { closure_evidence, .. } = event {
+                    Some(closure_evidence)
+                } else {
+                    None
+                }
+            })
+            .expect("PositionClosed event must be emitted");
+
+        // Multi-trade orders can only be identified by their order id, so the
+        // evidence is an aggregated OrderFillRecord carrying the VWAP:
+        // (90*0.003 + 95*0.007) / 0.010 = 93.5
+        match evidence {
+            robson_domain::ClosureEvidence::Reconciled(
+                ReconciliationEvidence::OrderFillRecord(e),
+            ) => {
+                assert_eq!(e.exchange_order_id, "EX-ORDER-2");
+                assert_eq!(e.filled_quantity.as_decimal(), dec!(0.010));
+                assert_eq!(e.fill_price.as_decimal(), dec!(93.5));
+                assert_eq!(e.fee, dec!(0.02), "fees of every partial fill must be summed");
+            },
+            other => panic!("expected aggregated OrderFillRecord evidence, got {other:?}"),
+        }
+    }
+
+    /// The entry's own trades match the position quantity just as well as the
+    /// close does. With the window anchored at the entry fill they must be
+    /// excluded, otherwise every close reads as ambiguous.
+    #[tokio::test]
+    async fn test_entry_trade_at_the_floor_is_not_mistaken_for_the_close() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let mut position = tracked_active_position(symbol.clone(), Side::Long);
+        let position_id = position.id;
+        let entry_at = Utc::now() - chrono::Duration::minutes(5);
+        position.entry_filled_at = Some(entry_at);
+        store.positions().save(&position).await.unwrap();
+
+        exchange.set_user_trades(&symbol.as_pair(), vec![
+            // The entry itself, at the floor.
+            user_trade("TRADE-ENTRY", "EX-ORDER-ENTRY", dec!(100), dec!(0.010), entry_at),
+            // The close, after it.
+            user_trade(
+                "TRADE-EXIT",
+                "EX-ORDER-EXIT",
+                dec!(90),
+                dec!(0.010),
+                entry_at + chrono::Duration::minutes(1),
+            ),
+        ]);
+
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+        worker.scan_and_reconcile().await.unwrap();
+        assert_eq!(
+            worker.scan_and_reconcile().await.unwrap(),
+            1,
+            "the entry trade must not make the close ambiguous"
+        );
+
+        let events = store.events().find_by_position(position_id).await.unwrap();
+        let evidence = events
+            .iter()
+            .find_map(|event| {
+                if let robson_domain::Event::PositionClosed { closure_evidence, .. } = event {
+                    Some(closure_evidence)
+                } else {
+                    None
+                }
+            })
+            .expect("PositionClosed event must be emitted");
+        match evidence {
+            robson_domain::ClosureEvidence::Reconciled(
+                ReconciliationEvidence::UserTradeRecord(e),
+            ) => {
+                assert_eq!(e.exchange_order_id, "EX-ORDER-EXIT");
+                assert_eq!(e.fill_price.as_decimal(), dec!(90));
+            },
+            other => panic!("expected the exit trade as evidence, got {other:?}"),
+        }
     }
 
     #[tokio::test]

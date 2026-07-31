@@ -30,6 +30,10 @@
   } from "$lib/config/slots";
   import { formatTimeUtc, isTodayUtc } from "$lib/utils/time";
   import {
+    deriveBudgetView,
+    MONTHLY_BUDGET_LIMIT_PCT,
+  } from "$lib/presentation/budget";
+  import {
     positionLabel,
     positionStateLabel,
     positionMetaLine,
@@ -82,40 +86,23 @@
   let haltState = $derived($haltStatus?.state ?? "active");
   // "Cannot operate" only when nothing is open AND nothing can open.
   // new_slots_available === 0 with an open position just means the capital
-  // is fully at work (the open position's latent risk occupies the slot) —
-  // that must not read as an error.
+  // is fully at work (the open position's latent risk occupies the slot),
+  // which must not read as an error.
   let insufficientCapital = $derived(
     !isHistoricalMonth && currentStatus
       ? currentStatus.new_slots_available === 0 &&
           currentStatus.occupied_slots === 0
       : false,
   );
-  let monthlyBudgetLimitPct = 4;
+  let monthlyBudgetLimitPct = MONTHLY_BUDGET_LIMIT_PCT;
   let hasHwmBudget = $derived(
     currentStatus != null && currentStatus.monthly_giveback_pct !== null,
   );
-  let monthlyBudgetSourcePct = $derived(
-    hasHwmBudget
-      ? (currentStatus?.monthly_giveback_pct ?? 0)
-      : (currentStatus?.monthly_realized_loss_pct ?? 0),
-  );
-  // With no open positions (latent risk 0), slots hit zero either because
-  // monthly losses left less than one 1%-risk slot in the 4% budget, or
-  // because the capital itself is too small. Only the latter is fixable by
-  // adding funds.
-  let monthlyBudgetExhausted = $derived(
-    insufficientCapital &&
-      monthlyBudgetSourcePct > monthlyBudgetLimitPct - 1,
-  );
-  let budgetUsedPct = $derived(
-    Math.min(
-      100,
-      Math.max(
-        0,
-        (monthlyBudgetSourcePct / monthlyBudgetLimitPct) * 100,
-      ),
-    ),
-  );
+  let budget = $derived(deriveBudgetView(currentStatus, insufficientCapital));
+  let budgetUsedPct = $derived(budget.usedPct);
+  let monthlyDrawdownPct = $derived(budget.drawdownPct);
+  let monthlyBudgetExhausted = $derived(budget.exhausted);
+  let monthlyBudgetLow = $derived(budget.low);
 
   function countdownRemaining(expiresAt: string): string {
     const ms = new Date(expiresAt).getTime() - approvalTick;
@@ -396,7 +383,7 @@
               ? "Event stream is fresh"
               : `No SSE data for ${$sseFreshness.staleSeconds}s`}
           >
-            {$sseFreshness.fresh ? "LIVE" : "STALE — reconnecting"}
+            {$sseFreshness.fresh ? "LIVE" : "STALE, reconnecting"}
           </span>
         {/if}
       </Row>
@@ -425,21 +412,25 @@
       </Stack>
     </Card>
   {:else}
-    {#if insufficientCapital}
-      {#if monthlyBudgetExhausted}
-        <div class="capital-banner">
-          <Row justify="between" align="center">
-            <span>{$_("dashboard.monthlyBudgetExhaustedBanner")}</span>
-          </Row>
-        </div>
-      {:else}
-        <a href="/funding" class="capital-banner">
-          <Row justify="between" align="center">
-            <span>{$_("dashboard.insufficientCapitalBanner")}</span>
-            <span class="mono">{$_("dashboard.addFunds")} →</span>
-          </Row>
-        </a>
-      {/if}
+    {#if monthlyBudgetExhausted}
+      <div class="capital-banner">
+        <Row justify="between" align="center">
+          <span>{$_("dashboard.monthlyBudgetExhaustedBanner")}</span>
+        </Row>
+      </div>
+    {:else if monthlyBudgetLow}
+      <div class="capital-banner">
+        <Row justify="between" align="center">
+          <span>{$_("dashboard.monthlyBudgetLowBanner")}</span>
+        </Row>
+      </div>
+    {:else if insufficientCapital}
+      <a href="/funding" class="capital-banner">
+        <Row justify="between" align="center">
+          <span>{$_("dashboard.insufficientCapitalBanner")}</span>
+          <span class="mono">{$_("dashboard.addFunds")}</span>
+        </Row>
+      </a>
     {/if}
     <section>
       <Stack gap={4}>
@@ -451,7 +442,7 @@
                 <Row justify="between" align="center">
                   <span class="label">MONTHLY LIMIT</span>
                   <span class="mono">
-                    {formatPct(monthlyBudgetSourcePct)} of a
+                    {formatPct(monthlyDrawdownPct)} of a
                     {monthlyBudgetLimitPct.toFixed(1)}% limit
                   </span>
                 </Row>
@@ -713,7 +704,7 @@
         void load();
       }}
       onresult={(r) => {
-        showToast(`${r.symbol} ${r.side} armed — detector active`, "ok");
+        showToast(`${r.symbol} ${r.side} armed, detector active`, "ok");
       }}
     />
   {/if}
@@ -1016,7 +1007,7 @@
     opacity: 0.8;
   }
   /* Sober, always-present treasury link (Zurich): quieter than the primary
-     action button — no border, dim until hover. */
+     action button, no border, dim until hover. */
   .nav-link {
     font-family: var(--font-mono);
     font-size: var(--text-xs);

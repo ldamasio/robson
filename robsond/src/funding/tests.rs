@@ -6,8 +6,8 @@ use robson_domain::{OrderSide, Price, Quantity, RiskConfig, Side, Symbol, Tradin
 use robson_engine::Engine;
 use robson_exec::{
     ExchangePort, ExchangePosition, ExecError, Executor, FuturesBalance, FuturesSettings,
-    IntentJournal, OrderResult, SpotBalance, SpotOrder, SpotOrderRequest, StubExchange, Transfer,
-    TransferId, UniversalTransferType, UserTradeRecord,
+    IntentJournal, OrderResult, SpotBalance, SpotOrder, SpotOrderRequest, StopCancelOutcome,
+    StubExchange, Transfer, TransferId, UniversalTransferType, UserTradeRecord,
 };
 use robson_store::{MemoryStore, Store};
 use rust_decimal::Decimal;
@@ -152,7 +152,7 @@ impl ExchangePort for PostConvertedCrashExchange {
         &self,
         symbol: &Symbol,
         algo_id: &str,
-    ) -> Result<(), ExecError> {
+    ) -> Result<StopCancelOutcome, ExecError> {
         self.inner.cancel_stop_market_order(symbol, algo_id).await
     }
 

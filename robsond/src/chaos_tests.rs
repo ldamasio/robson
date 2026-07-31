@@ -11,7 +11,7 @@ use robson_domain::{Event, OrderSide, PositionId, Price, Quantity, Side, Symbol}
 use robson_engine::{EngineAction, RiskCheck, RiskVerdict};
 use robson_exec::{
     ExchangePort, ExecError, Executor, FuturesBalance, FuturesSettings, SpotBalance, SpotOrder,
-    SpotOrderRequest, Transfer, TransferId, UniversalTransferType,
+    SpotOrderRequest, StopCancelOutcome, Transfer, TransferId, UniversalTransferType,
 };
 use robson_store::{
     EventRepository, MemoryStore, OrderRepository, PositionRepository, Store, StoreError,
@@ -85,8 +85,8 @@ impl ExchangePort for TimeoutExchange {
         &self,
         _symbol: &Symbol,
         _algo_id: &str,
-    ) -> Result<(), ExecError> {
-        Ok(())
+    ) -> Result<StopCancelOutcome, ExecError> {
+        Ok(StopCancelOutcome::Cancelled)
     }
 
     async fn get_open_orders(

@@ -177,11 +177,16 @@ pub trait ExchangePort: Send + Sync {
     /// implementations must route this through the exchange's
     /// conditional/algo-order cancel API, not the regular order cancel
     /// endpoint.
+    ///
+    /// An order the exchange no longer knows about is reported as
+    /// [`StopCancelOutcome::AlreadyGone`] rather than as a plain success: the
+    /// commonest reason a conditional stop has vanished is that it *triggered*,
+    /// and the caller must not record that as a cancellation.
     async fn cancel_stop_market_order(
         &self,
         symbol: &Symbol,
         algo_id: &str,
-    ) -> Result<(), ExecError>;
+    ) -> Result<StopCancelOutcome, ExecError>;
 
     /// Cancel an existing order.
     ///
@@ -323,6 +328,17 @@ pub trait ExchangePort: Send + Sync {
         since: DateTime<Utc>,
         limit: u16,
     ) -> Result<Vec<UserTradeRecord>, ExecError>;
+}
+
+/// Result of cancelling a reduce-only protective stop (ADR-0039).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StopCancelOutcome {
+    /// The exchange acknowledged the cancel; the stop never executed.
+    Cancelled,
+    /// The exchange no longer knows the order. It was most likely triggered
+    /// and filled, so callers must preserve the stop id as reconciliation
+    /// evidence instead of recording a cancellation.
+    AlreadyGone,
 }
 
 /// USD-M Futures account settings for a symbol.
