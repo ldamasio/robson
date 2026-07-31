@@ -44,5 +44,6 @@ Index
 | ADR-0045 | Income-Ledger Reconciliation; Drift Demoted to Checksum | Decided (Fully shipped) | 2026-07-05 |
 | ADR-0046 | Monthly High-Water-Mark Budget (Trailing Month) | Decided (Deployed) | 2026-07-05 |
 | ADR-0047 | FE ↔ robsond Communication Topology (Option A, No Change) | Decided | 2026-07-06 |
+| ADR-0048 | A Triggered Insurance Stop Is Not a Cancellation | Decided (Deployed sha-d5803c47; not yet exercised against the live exchange) | 2026-07-31 |
 
 Files located in `docs/adr/`.

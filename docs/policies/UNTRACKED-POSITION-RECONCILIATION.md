@@ -150,46 +150,109 @@ priority order**:
    asset, filled timestamp, exchange order id. Highest fidelity — used
    whenever obtainable.
 2. **`UserTradeRecord`** — Per-symbol user trade history from
-   `GET /fapi/v1/userTrades` covering the gap between the last known live
-   tick and the missing observation. Used when no specific candidate
+   `GET /fapi/v1/userTrades`. Used when no specific candidate
    `exchange_order_id` is known (e.g. operator closed the position
    manually via the Binance UI, producing a market order Robson never
    knew about). Captures the same fields plus the originating order id.
-3. **`AccountSnapshot`** — Two consecutive `get_all_open_positions()`
-   snapshots prove the position is zeroed; no fill data is available.
-   Captures `first_observed_missing_at`, `confirmed_missing_at`, optional
+   See §C.1 for the window and matching rules, which are load-bearing.
+
+**Evidence types that exist in the domain but are NOT reachable in
+current code:** `AccountSnapshot` and `Estimated` are defined in
+`ReconciliationEvidence` and described in the sections below, but neither
+the reconciliation worker nor `POST /reconcile-close` can produce or accept
+them. `gather_real_evidence` only ever returns `OrderFillRecord` or
+`UserTradeRecord`, and the API rejects the other two with
+`unsupported_evidence`. A position with no real fill evidence stays
+`Active` and is surfaced as a blocker; it is never closed on an estimate.
+Treat the `AccountSnapshot` and `Estimated` material below as target
+architecture, not as current behaviour.
+
+#### I3 §C.1: user-trade window and matching
+
+Both rules here are load-bearing and both were the direct cause of the
+2026-07-31 production incident, in which two positions stayed `Active`
+for 47 minutes and 10 days respectively, blocking every new entry on the
+symbol through the duplicate-position risk gate.
+
+**Window anchor.** The closing fill always PRECEDES the missing
+observation: the worker can only notice an absence on the scan that
+follows the close. The window MUST therefore be anchored at the
+position's `entry_filled_at` (falling back to `created_at`), never at
+`first_observed_missing_at`. Anchoring at the observation excludes the
+very trade being looked for. Measured in production: the real fills sat
+26 s and 29 s ahead of their observations and were filtered out on every
+pass, forever.
+
+Trades at or before the anchor MUST be discarded. The entry's own fills
+match the position quantity exactly as well as the close does, so
+including them would render every close ambiguous.
+
+**Per-order aggregation.** A closing order routinely fills in several
+trades. Quantity matching MUST therefore aggregate trades by
+`exchange_order_id` before comparing with the position quantity, summing
+quantities and fees and computing a quantity-weighted fill price. In the
+2026-07-21 case the close filled as `0.007 + 0.017` under one order id,
+and no individual trade matched the position quantity of `0.024`.
+
+The aggregation mirrors what `BinanceExchange::get_stop_order_fill`
+already performs for conditional orders, so both evidence paths report
+the same numbers for the same order.
+
+An order that filled in a single trade keeps `UserTradeRecord` evidence,
+preserving the exchange trade id. An order that filled in several trades
+can only be identified by its order id, so it carries `OrderFillRecord`.
+
+If more than one aggregated order matches the expected quantity, the
+position is left unresolved rather than closed on a guess.
+
+3. **`AccountSnapshot`** (target architecture, not reachable today). Two
+   consecutive `get_all_open_positions()` snapshots prove the position is
+   zeroed; no fill data is available. Captures
+   `first_observed_missing_at`, `confirmed_missing_at`, optional
    `futures_balance_delta` derived from `get_futures_balance()` between
-   the two snapshots. Used when (1) and (2) failed (rate limit, history
-   outside API window, network error after retries).
-4. **`Estimated`** — Last resort. Captures `estimation_basis`
-   (`TrailingStopAtDetection`, `ExchangeMarkPrice`, or `LastObservedPrice`),
-   the chosen `exit_price`, optional `evaluator` identity, and
-   `detected_at`.
+   the two snapshots.
+4. **`Estimated`** (target architecture, permanently blocked in
+   `reconcile_close` per AGENTS.md invariant 11). Captures
+   `estimation_basis` (`TrailingStopAtDetection`, `ExchangeMarkPrice`, or
+   `LastObservedPrice`), the chosen `exit_price`, optional `evaluator`
+   identity, and `detected_at`.
 
 #### I3 §E — Startup policy and operational status
 
-**Current operational state (as of 2026-05-11):**
+**Current operational state (repository-verified, 2026-07-31):**
 
 - I3 runtime steady-state reconciliation (worker loop) is **live** (Slice 4B).
-- Startup default is **fail-closed abort** — exit code 78 (Slice 5A).
+- Startup `auto_reconcile` is **live** and is **the policy prod runs**. The
+  code default remains `abort`; production opts in through
+  `ROBSON_RECONCILIATION_ON_STARTUP_STALE_ACTIVE=auto_reconcile` in the
+  `robsond-config` ConfigMap. Do not assume the startup gate aborts.
 - Operator-driven manual recovery is **live** via `robson-cli reconcile-close`
   and `POST /reconcile-close` (Slice 5B1). Accepts `OrderFillRecord` and
   `UserTradeRecord` only.
-- Startup `auto_reconcile` is **planned** (Slice 5B2B) and is **not yet live**.
 
-**Rules for startup `auto_reconcile` (when it ships):**
+**Rules for startup `auto_reconcile`:**
 
-- Opt-in only: default remains `abort`.
+- Opt-in only: code default remains `abort`.
 - Two-phase / all-or-nothing: collect evidence for all stale-Active positions
   first; apply closes only if every position has real evidence.
 - Only `OrderFillRecord` or `UserTradeRecord` may auto-close positions at
-  startup. `AccountSnapshot` and `Estimated` do not qualify for startup
-  auto-close.
+  startup. `AccountSnapshot` and `Estimated` do not qualify.
 - If any position lacks real evidence, abort with exit 78 (same as `abort`
   policy). No partial close.
 
-Until Slice 5B2B is merged and validated via testnet drill (Slice 5B2C), use
-the operator manual path (Slice 5B1) for all startup-gate scenarios.
+The startup path has always anchored its evidence window at
+`entry_filled_at`. Until 2026-07-31 the periodic worker did not, which is
+what produced the incident described in §C.1. Both now use the same anchor;
+keep them aligned.
+
+**Known gap.** As of 2026-07-31 the automatic reverse-reconciliation close
+has never resolved a real stale-Active position in production. The two
+positions that exposed the defect were closed through the operator manual
+path. The fix is covered by regression tests built on the real production
+payloads, but the end-to-end automatic path remains unproven against the
+live exchange. First real stop-out after deploy `sha-d5803c47` is the
+validation event: expect `PositionClosed` with reconciled evidence, no
+`stale Active unresolved`, and no `-2022` retry burst.
 
 #### I3 §D — Estimated evidence: never silent
 

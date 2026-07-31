@@ -52,6 +52,17 @@ a fail-safe that does not depend on the daemon being alive:
    fills first (daemon down or race), the reconciliation worker closes the
    position from `OrderFillRecord`/`UserTradeRecord` evidence only
    (Policy Invariant 11 unchanged).
+
+   > **Amendment 2026-07-31 (ADR-0048).** Step 3 was correct as written but
+   > was not what the code did. When the insurance order filled first, the
+   > exit path still cancelled it, the exchange answered "unknown order", the
+   > adapter flattened that into success, and robsond recorded
+   > `InsuranceStopCancelled`, clearing the very `insurance_stop_id` the
+   > reconciliation worker needed to resolve the fill. `cancel_stop_market_order`
+   > now returns `StopCancelOutcome::{Cancelled, AlreadyGone}`, and on
+   > `AlreadyGone` the executor preserves the stop id and emits no
+   > cancellation. See
+   > [ADR-0048](ADR-0048-triggered-stop-is-not-a-cancellation.md).
 4. **Authorship**: the insurance order is placed through a `GovernedAction`
    authored by robsond, so exchange state remains traceable to robsond
    entries (ADR-0022 invariant preserved; the reconciliation worker must
