@@ -177,6 +177,16 @@ pub(crate) fn map_daemon_event(event: &DaemonEvent) -> Option<PublicSseEvent> {
         DaemonEvent::MonthlyHaltReset {} => {
             Some(PublicSseEvent::new("monthly_halt.reset", json!({})))
         },
+        DaemonEvent::MonthBoundaryProcessed { year, month, capital_base } => {
+            Some(PublicSseEvent::new(
+                "month_boundary.reset",
+                json!({
+                    "year": year,
+                    "month": month,
+                    "capital_base": capital_base.to_string(),
+                }),
+            ))
+        },
         DaemonEvent::InsuranceStopOrphanCancelled {
             symbol,
             exchange_order_id,
@@ -360,6 +370,20 @@ mod tests {
         })
         .unwrap();
         assert_eq!(safety_panic.event_type, "safety.panic");
+    }
+
+    #[test]
+    fn test_month_boundary_processed_is_mapped_to_public_event() {
+        let rollover = map_daemon_event(&DaemonEvent::MonthBoundaryProcessed {
+            year: 2026,
+            month: 8,
+            capital_base: dec!(1558.44685972),
+        })
+        .unwrap();
+        assert_eq!(rollover.event_type, "month_boundary.reset");
+        assert_eq!(rollover.payload["year"], 2026);
+        assert_eq!(rollover.payload["month"], 8);
+        assert_eq!(rollover.payload["capital_base"], "1558.44685972");
     }
 
     #[test]

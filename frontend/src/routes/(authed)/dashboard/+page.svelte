@@ -59,7 +59,12 @@
   let approvalTickTimer: ReturnType<typeof setInterval> | null = null;
   let sseRefreshTimer: ReturnType<typeof setTimeout> | null = null;
 
-  let currentMonth = $derived(currentMonthKey());
+  // Clock-reactive: recomputed on every approvalTick so an open tab notices
+  // the UTC month rollover instead of keeping the mount-time month (#133).
+  let currentMonth = $derived.by(() => {
+    void approvalTick;
+    return currentMonthKey();
+  });
   let monthOps = $derived(sortPositionsOldestFirst(monthlyPositions));
   let isHistoricalMonth = $derived(selectedMonth !== currentMonth);
   let liveOps = $derived((currentStatus?.positions ?? []).filter((op) => isRenderableLivePosition(op)));
@@ -271,6 +276,9 @@
         if (event.event_type.startsWith("query.")) {
           scheduleRefresh();
         }
+        if (event.event_type === "month_boundary.reset") {
+          scheduleRefresh();
+        }
       },
       () => {
         connected = false;
@@ -317,6 +325,23 @@
     selectedMonth = shiftMonth(selectedMonth, 1);
     void loadHistory();
   }
+
+  // When the clock crosses a month boundary with the tab open, follow the new
+  // month (if the user was viewing the now-previous current month) and reload
+  // both status and history so the header, meter and label agree (#133).
+  let lastObservedMonth = currentMonthKey();
+  $effect(() => {
+    const key = currentMonth;
+    if (key === lastObservedMonth) return;
+    const previous = lastObservedMonth;
+    lastObservedMonth = key;
+    untrack(() => {
+      if (selectedMonth === previous) {
+        selectedMonth = key;
+      }
+      void load();
+    });
+  });
 
   $effect(() => {
     untrack(() => {

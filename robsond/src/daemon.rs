@@ -1001,6 +1001,14 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
             "Month boundary processed"
         );
 
+        // Broadcast so the SSE stream can tell open dashboard tabs the month
+        // rolled over; without this the UI keeps stale prior-month state (#133).
+        self.event_bus.send(DaemonEvent::MonthBoundaryProcessed {
+            year: now.year(),
+            month: now.month(),
+            capital_base,
+        });
+
         Ok(())
     }
 
@@ -1835,6 +1843,10 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
 
             DaemonEvent::MonthlyHaltReset {} => {
                 info!("MonthlyHalt reset to Active");
+            },
+
+            DaemonEvent::MonthBoundaryProcessed { year, month, capital_base } => {
+                info!(year, month, %capital_base, "Month boundary broadcast to SSE consumers");
             },
 
             DaemonEvent::InsuranceStopOrphanCancelled {
