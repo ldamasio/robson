@@ -147,8 +147,8 @@ fn initial_month_check() -> Arc<RwLock<(i32, u32)>> {
     // Sentinel, never the wall-clock month: seeding with the current month
     // made a restart landing after a month boundary skip that month's
     // MonthBoundaryReset forever (2026-07 incident). With the sentinel, the
-    // first poll always runs handle_month_boundary, which consults the
-    // persisted monthly_state row and no-ops when the reset already exists.
+    // first poll always runs handle_month_boundary, which consults persisted
+    // MonthBoundaryReset evidence and no-ops when the reset already exists.
     Arc::new(RwLock::new((0, 0)))
 }
 
@@ -899,7 +899,7 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
         #[cfg(feature = "postgres")]
         if let Some(pool) = &self.pg_pool {
             let exists = sqlx::query_scalar::<_, bool>(
-                "SELECT EXISTS(SELECT 1 FROM monthly_state WHERE year = $1 AND month = $2)",
+                "SELECT EXISTS(SELECT 1 FROM monthly_state WHERE year = $1 AND month = $2 AND boundary_reset_at IS NOT NULL)",
             )
             .bind(now.year())
             .bind(now.month() as i16)
@@ -1990,6 +1990,117 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 7, 2, 8, 29, 4).single().unwrap();
         assert!(daemon.poll_month_boundary(now).await.unwrap());
         assert!(!daemon.poll_month_boundary(now).await.unwrap());
+    }
+
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn test_month_boundary_row_without_reset_evidence_does_not_block(pool: sqlx::PgPool) {
+        let now = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 1).single().unwrap();
+
+        // Mirrors the auxiliary monthly_state UPSERTs: the row exists, but no
+        // MonthBoundaryReset event has supplied durable reset evidence yet.
+        sqlx::query(
+            r#"
+            INSERT INTO monthly_state (year, month, capital_base, month_peak_net, created_at)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (year, month) DO UPDATE SET
+                month_peak_net = GREATEST(monthly_state.month_peak_net, EXCLUDED.month_peak_net)
+            "#,
+        )
+        .bind(now.year() as i16)
+        .bind(now.month() as i16)
+        .bind(dec!(10000))
+        .bind(dec!(250))
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let before: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT boundary_reset_at FROM monthly_state WHERE year = $1 AND month = $2",
+        )
+        .bind(now.year() as i16)
+        .bind(now.month() as i16)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(before.is_none());
+
+        let tenant_id = uuid::Uuid::from_u128(0x13201);
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(tenant_id);
+        let daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())));
+
+        daemon.handle_month_boundary(now).await.unwrap();
+
+        let after: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT boundary_reset_at FROM monthly_state WHERE year = $1 AND month = $2",
+        )
+        .bind(now.year() as i16)
+        .bind(now.month() as i16)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(after, Some(now));
+
+        let event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event_log WHERE tenant_id = $1 AND event_type = 'month_boundary_reset'",
+        )
+        .bind(tenant_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(event_count, 1);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn test_month_boundary_row_with_reset_evidence_blocks_duplicate(pool: sqlx::PgPool) {
+        let reset_at = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 1).single().unwrap();
+        sqlx::query(
+            r#"
+            INSERT INTO monthly_state (
+                year, month, capital_base, month_peak_net, boundary_reset_at, created_at
+            )
+            VALUES ($1, $2, $3, 0, $4, $4)
+            "#,
+        )
+        .bind(reset_at.year() as i16)
+        .bind(reset_at.month() as i16)
+        .bind(dec!(10000))
+        .bind(reset_at)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let tenant_id = uuid::Uuid::from_u128(0x13202);
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(tenant_id);
+        let daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())));
+        let retry = Utc.with_ymd_and_hms(2026, 5, 2, 0, 0, 1).single().unwrap();
+
+        daemon.handle_month_boundary(retry).await.unwrap();
+
+        let event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event_log WHERE tenant_id = $1 AND event_type = 'month_boundary_reset'",
+        )
+        .bind(tenant_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(event_count, 0);
+
+        let persisted_reset_at: Option<chrono::DateTime<Utc>> = sqlx::query_scalar(
+            "SELECT boundary_reset_at FROM monthly_state WHERE year = $1 AND month = $2",
+        )
+        .bind(reset_at.year() as i16)
+        .bind(reset_at.month() as i16)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(persisted_reset_at, Some(reset_at));
     }
 
     #[tokio::test]

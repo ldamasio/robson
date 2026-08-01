@@ -39,14 +39,15 @@ pub(crate) async fn handle_month_boundary_reset(
 
     sqlx::query(
         r#"
-        INSERT INTO monthly_state (year, month, capital_base, carried_risk, realized_loss, trades_opened, month_peak_net, created_at)
-        VALUES ($1, $2, $3, $4, 0, 0, 0, $5)
+        INSERT INTO monthly_state (year, month, capital_base, carried_risk, realized_loss, trades_opened, month_peak_net, boundary_reset_at, created_at)
+        VALUES ($1, $2, $3, $4, 0, 0, 0, $5, $5)
         ON CONFLICT (year, month) DO UPDATE SET
             capital_base = EXCLUDED.capital_base,
             carried_risk = EXCLUDED.carried_risk,
             realized_loss = 0,
             trades_opened = 0,
-            month_peak_net = 0
+            month_peak_net = 0,
+            boundary_reset_at = EXCLUDED.boundary_reset_at
         "#,
     )
     .bind(year)
