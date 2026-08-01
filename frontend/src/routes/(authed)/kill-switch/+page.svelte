@@ -77,8 +77,14 @@
     return `${yyyy}-${mm}-${dd} ${hh}:${mi}:${ss} UTC`;
   }
 
+  // Bounded polling: halt state must not go stale in an open tab across the
+  // month rollover (a July monthly_halt showing after the backend reset, #133).
   $effect(() => {
     void loadState();
+    const poll = setInterval(() => {
+      if (!submitting) void loadState();
+    }, 30_000);
+    return () => clearInterval(poll);
   });
 </script>
 

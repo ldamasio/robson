@@ -150,6 +150,14 @@ pub enum DaemonEvent {
     /// MonthlyHalt reset to Active by operator.
     MonthlyHaltReset {},
 
+    /// Month boundary processed: capital_base recalculated from wallet
+    /// balance, monthly budget reset, circuit breaker cleared.
+    MonthBoundaryProcessed {
+        year: i32,
+        month: u32,
+        capital_base: rust_decimal::Decimal,
+    },
+
     /// Shutdown signal
     Shutdown,
 }
