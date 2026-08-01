@@ -58,7 +58,7 @@ where
     }
 }
 
-use crate::query::{ApprovalRequirement, ExecutionQuery, QueryError, QueryState};
+use crate::query::{ApprovalRequirement, ExecutionQuery, QueryError, QueryKind, QueryState};
 
 // =============================================================================
 // QueryRecorder - Audit and Observability
@@ -234,6 +234,26 @@ impl EventLogQueryRecorder {
     }
 }
 
+/// Whether a query transition is durable audit or routine telemetry.
+///
+/// `ProcessMarketTick` queries run for every active position on every market
+/// tick; persisting their happy-path transitions wrote millions of
+/// `QUERY_STATE_CHANGED` events per month (13 GB by 2026-07, see ADR-0049)
+/// while the actions they gate (stop moves, exits) already emit their own
+/// domain events. Their transitions stay on tracing only, EXCEPT governed or
+/// abnormal outcomes (Denied / Failed / Expired), which are always audited.
+/// Every other query kind (signals, arm/disarm, closes, funding) remains
+/// fully event-sourced.
+pub(crate) fn is_durable_query_transition(query: &ExecutionQuery) -> bool {
+    if matches!(query.kind, QueryKind::ProcessMarketTick { .. }) {
+        return matches!(
+            query.state,
+            QueryState::Denied { .. } | QueryState::Failed { .. } | QueryState::Expired
+        );
+    }
+    true
+}
+
 #[cfg(feature = "postgres")]
 #[async_trait]
 impl QueryRecorder for EventLogQueryRecorder {
@@ -243,6 +263,9 @@ impl QueryRecorder for EventLogQueryRecorder {
         transition_cause: &str,
     ) -> Result<(), QueryRecorderError> {
         trace_query_transition(query, transition_cause);
+        if !is_durable_query_transition(query) {
+            return Ok(());
+        }
         append_query_state_changed_event(
             &self.pool,
             self.tenant_id,
@@ -700,6 +723,71 @@ mod tests {
             },
             ActorKind::Detector,
         )
+    }
+
+    fn create_market_tick_query() -> ExecutionQuery {
+        ExecutionQuery::new(
+            QueryKind::ProcessMarketTick {
+                symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+                price: Price::new(dec!(95000)).unwrap(),
+            },
+            ActorKind::Detector,
+        )
+    }
+
+    #[test]
+    fn test_market_tick_happy_path_transitions_are_telemetry_only() {
+        let mut query = create_market_tick_query();
+        for state in [
+            QueryState::Accepted,
+            QueryState::Processing,
+            QueryState::RiskChecked,
+            QueryState::Acting,
+            QueryState::Completed,
+        ] {
+            query.state = state;
+            assert!(
+                !is_durable_query_transition(&query),
+                "market-tick {} must not be event-sourced",
+                query.state.label()
+            );
+        }
+    }
+
+    #[test]
+    fn test_market_tick_governed_outcomes_are_always_audited() {
+        let mut query = create_market_tick_query();
+        for state in [
+            QueryState::Denied {
+                reason: "budget".to_string(),
+                check: "monthly_budget".to_string(),
+            },
+            QueryState::Failed {
+                reason: "exchange timeout".to_string(),
+                phase: "act".to_string(),
+            },
+            QueryState::Expired,
+        ] {
+            query.state = state;
+            assert!(
+                is_durable_query_transition(&query),
+                "market-tick {} must be event-sourced",
+                query.state.label()
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_tick_queries_are_always_durable() {
+        let mut query = create_test_query();
+        for state in [
+            QueryState::Accepted,
+            QueryState::Completed,
+            QueryState::Expired,
+        ] {
+            query.state = state;
+            assert!(is_durable_query_transition(&query));
+        }
     }
 
     #[tokio::test]
