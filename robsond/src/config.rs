@@ -156,11 +156,14 @@ pub struct TechStopConfigEnv {
 pub struct MarketDataConfig {
     /// Symbols to subscribe via WebSocket (e.g., ["BTCUSDT", "ETHUSDT"])
     pub symbols: Vec<String>,
+    /// Ordered market-stream base URLs. Each base omits the trailing `/ws`.
+    /// An empty list selects the environment-specific built-in default.
+    pub ws_endpoints: Vec<String>,
 }
 
 impl Default for MarketDataConfig {
     fn default() -> Self {
-        Self { symbols: vec![] }
+        Self { symbols: vec![], ws_endpoints: vec![] }
     }
 }
 
@@ -336,7 +339,10 @@ impl Config {
                 stream_key: "test:stream".to_string(),
                 poll_interval_ms: 100,
             },
-            market_data: MarketDataConfig { symbols: vec!["BTCUSDT".to_string()] },
+            market_data: MarketDataConfig {
+                symbols: vec!["BTCUSDT".to_string()],
+                ws_endpoints: vec![],
+            },
             position_monitor: PositionMonitorConfig {
                 enabled: false, // Disabled in tests
                 poll_interval_secs: 1,
@@ -563,7 +569,53 @@ impl Config {
             return Err(DaemonError::Config("ROBSON_MARKET_DATA_SYMBOLS is required".to_string()));
         }
 
-        Ok(MarketDataConfig { symbols })
+        let ws_endpoints = match env::var("ROBSON_MARKET_DATA_WS_ENDPOINTS") {
+            Ok(raw) => Self::parse_market_data_ws_endpoints(&raw)?,
+            Err(env::VarError::NotPresent) => Vec::new(),
+            Err(env::VarError::NotUnicode(_)) => {
+                return Err(DaemonError::Config(
+                    "ROBSON_MARKET_DATA_WS_ENDPOINTS must be valid UTF-8".to_string(),
+                ));
+            },
+        };
+
+        Ok(MarketDataConfig { symbols, ws_endpoints })
+    }
+
+    fn parse_market_data_ws_endpoints(raw: &str) -> DaemonResult<Vec<String>> {
+        let mut endpoints = Vec::new();
+
+        for candidate in raw.split(',').map(str::trim).filter(|value| !value.is_empty()) {
+            let endpoint = candidate.trim_end_matches('/');
+            let authority = endpoint
+                .strip_prefix("wss://")
+                .and_then(|remainder| remainder.split('/').next())
+                .filter(|authority| !authority.is_empty());
+
+            if authority.is_none()
+                || authority.is_some_and(|authority| authority.contains('@'))
+                || endpoint.contains('?')
+                || endpoint.contains('#')
+            {
+                return Err(DaemonError::Config(
+                    "ROBSON_MARKET_DATA_WS_ENDPOINTS entries must be credential-free wss:// base URLs without query strings or fragments"
+                        .to_string(),
+                ));
+            }
+
+            if !endpoints.iter().any(|configured| configured == endpoint) {
+                endpoints.push(endpoint.to_string());
+            }
+        }
+
+        if endpoints.is_empty() {
+            return Err(DaemonError::Config(
+                "ROBSON_MARKET_DATA_WS_ENDPOINTS must contain at least one endpoint when set"
+                    .to_string(),
+            ));
+        }
+
+        Ok(endpoints)
     }
 
     fn load_position_monitor_config() -> DaemonResult<PositionMonitorConfig> {
@@ -760,6 +812,7 @@ mod tests {
         assert_eq!(config.tech_stop.support_level_n, 2);
         assert_eq!(config.tech_stop.lookback_candles, 100);
         assert!(config.market_data.symbols.is_empty());
+        assert!(config.market_data.ws_endpoints.is_empty());
         assert!(config.position_monitor.symbols.is_empty());
         assert_eq!(config.reconciliation.interval_secs, 60);
         assert_eq!(config.reconciliation.missing_grace_secs, 60);
@@ -775,6 +828,7 @@ mod tests {
         assert_eq!(config.tech_stop.min_stop_pct, Decimal::new(1, 1)); // 0.1%
         assert_eq!(config.tech_stop.max_stop_pct, Decimal::from(20));
         assert_eq!(config.market_data.symbols, vec!["BTCUSDT"]);
+        assert!(config.market_data.ws_endpoints.is_empty());
         assert_eq!(config.reconciliation.interval_secs, 1);
     }
 
@@ -797,7 +851,10 @@ mod tests {
     #[test]
     fn test_load_market_data_config_requires_symbols() {
         let _lock = env_lock().lock().unwrap();
-        let _env = EnvGuard::new(&[("ROBSON_MARKET_DATA_SYMBOLS", Some(""))]);
+        let _env = EnvGuard::new(&[
+            ("ROBSON_MARKET_DATA_SYMBOLS", Some("")),
+            ("ROBSON_MARKET_DATA_WS_ENDPOINTS", None),
+        ]);
 
         let err = Config::load_market_data_config().unwrap_err();
         assert!(matches!(
@@ -809,11 +866,39 @@ mod tests {
     #[test]
     fn test_load_market_data_config_parses_multiple_symbols() {
         let _lock = env_lock().lock().unwrap();
-        let _env =
-            EnvGuard::new(&[("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT, ethusdt,SOLUSDC"))]);
+        let _env = EnvGuard::new(&[
+            ("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT, ethusdt,SOLUSDC")),
+            (
+                "ROBSON_MARKET_DATA_WS_ENDPOINTS",
+                Some(
+                    "wss://primary.example/market/, wss://fallback.example/market, \
+                     wss://primary.example/market",
+                ),
+            ),
+        ]);
 
         let config = Config::load_market_data_config().unwrap();
         assert_eq!(config.symbols, vec!["BTCUSDT", "ETHUSDT", "SOLUSDC"]);
+        assert_eq!(config.ws_endpoints, vec![
+            "wss://primary.example/market",
+            "wss://fallback.example/market"
+        ]);
+    }
+
+    #[test]
+    fn test_load_market_data_config_rejects_insecure_ws_endpoint() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT")),
+            ("ROBSON_MARKET_DATA_WS_ENDPOINTS", Some("ws://localhost:9001")),
+        ]);
+
+        let err = Config::load_market_data_config().unwrap_err();
+        assert!(matches!(
+            err,
+            DaemonError::Config(message)
+                if message.contains("credential-free wss:// base URLs")
+        ));
     }
 
     #[test]

@@ -6,9 +6,10 @@
 //! # Reconnection
 //!
 //! The spawned task runs indefinitely. When the WebSocket stream closes or
-//! errors (Binance disconnects periodically — this is normal), the task waits
-//! with exponential backoff (1 s → 2 s → 4 s … capped at 60 s) and reconnects.
-//! The task only terminates on daemon shutdown (via `CancellationToken`).
+//! errors, the task rotates through configured endpoints and waits with
+//! exponential backoff. The cap is 60 s normally and expands to 15 min while
+//! the REST fallback is healthy, avoiding reconnect churn during a persistent
+//! WS outage. The task only terminates on daemon shutdown.
 //!
 //! # REST fallback (ADR-0044)
 //!
@@ -27,7 +28,7 @@
 use std::{
     str::FromStr,
     sync::{
-        atomic::{AtomicI64, Ordering},
+        atomic::{AtomicBool, AtomicI64, Ordering},
         Arc,
     },
 };
@@ -47,15 +48,133 @@ use crate::{
     event_bus::{DaemonEvent, EventBus, MarketDataSource},
 };
 
-/// Maximum reconnect backoff in seconds.
-const MAX_BACKOFF_SECS: u64 = 60;
+/// Default mainnet base for regular futures market streams. Binance routes
+/// `aggTrade` under `/market`; the legacy unrouted path no longer delivers it.
+const MAINNET_MARKET_WS_ENDPOINT: &str = "wss://fstream.binance.com/market";
+
+/// Testnet retains the legacy unrouted stream base.
+const TESTNET_MARKET_WS_ENDPOINT: &str = "wss://stream.binancefuture.com";
+
+/// Maximum reconnect backoff when no healthy REST fallback is protecting the
+/// symbol.
+const MAX_RECONNECT_BACKOFF_SECS: u64 = 60;
+
+/// Maximum reconnect backoff while REST fallback polls are healthy.
+const MAX_DEGRADED_RECONNECT_BACKOFF_SECS: u64 = 15 * 60;
+
+/// Maximum time allowed for the TCP, TLS, and HTTP upgrade attempt.
+const WS_CONNECT_TIMEOUT_SECS: u64 = 10;
 
 /// Read-idle watchdog threshold: a WS feed silent past this is treated as
 /// dead (reconnect) and as the REST-fallback entry condition (ADR-0044).
 pub(crate) const WATCHDOG_IDLE_SECS: u64 = 90;
 
 pub(crate) fn next_reconnect_backoff_secs(current: u64) -> u64 {
-    (current * 2).min(MAX_BACKOFF_SECS)
+    next_reconnect_backoff_secs_for_health(current, false)
+}
+
+fn next_reconnect_backoff_secs_for_health(current: u64, rest_fallback_healthy: bool) -> u64 {
+    let cap = if rest_fallback_healthy {
+        MAX_DEGRADED_RECONNECT_BACKOFF_SECS
+    } else {
+        MAX_RECONNECT_BACKOFF_SECS
+    };
+    current.saturating_mul(2).min(cap)
+}
+
+fn reconnect_delay_secs(current: u64, rest_fallback_healthy: bool) -> u64 {
+    let cap = if rest_fallback_healthy {
+        MAX_DEGRADED_RECONNECT_BACKOFF_SECS
+    } else {
+        MAX_RECONNECT_BACKOFF_SECS
+    };
+    current.min(cap)
+}
+
+#[derive(Debug)]
+struct WsReconnectState {
+    endpoint_index: usize,
+    backoff_secs: u64,
+}
+
+impl WsReconnectState {
+    fn new() -> Self {
+        Self { endpoint_index: 0, backoff_secs: 1 }
+    }
+
+    fn retry_in_secs(&self, rest_fallback_healthy: bool) -> u64 {
+        reconnect_delay_secs(self.backoff_secs, rest_fallback_healthy)
+    }
+
+    fn next_endpoint_index(&self, endpoint_count: usize) -> usize {
+        (self.endpoint_index + 1) % endpoint_count
+    }
+
+    fn record_failure(&mut self, endpoint_count: usize, rest_fallback_healthy: bool) {
+        self.endpoint_index = self.next_endpoint_index(endpoint_count);
+        self.backoff_secs = if rest_fallback_healthy {
+            next_reconnect_backoff_secs_for_health(self.backoff_secs, true)
+        } else {
+            next_reconnect_backoff_secs(self.backoff_secs)
+        };
+    }
+
+    fn record_first_message(&mut self) {
+        self.backoff_secs = 1;
+    }
+}
+
+#[derive(Debug)]
+enum WsAttemptFailure {
+    Connect(String),
+    ConnectTimeout,
+    HandshakeNoData,
+    FeedIdle,
+    ClosedBeforeData,
+    Closed,
+    StreamBeforeData(String),
+    Stream(String),
+}
+
+impl WsAttemptFailure {
+    fn metric_reason(&self) -> &'static str {
+        match self {
+            Self::Connect(_) => "connect",
+            Self::ConnectTimeout => "connect_timeout",
+            Self::HandshakeNoData => "handshake_no_data",
+            Self::FeedIdle => "idle",
+            Self::ClosedBeforeData => "closed_before_data",
+            Self::Closed => "closed",
+            Self::StreamBeforeData(_) => "stream_error_before_data",
+            Self::Stream(_) => "stream_error",
+        }
+    }
+
+    fn error(&self) -> Option<&str> {
+        match self {
+            Self::Connect(error) | Self::StreamBeforeData(error) | Self::Stream(error) => {
+                Some(error)
+            },
+            _ => None,
+        }
+    }
+}
+
+fn watchdog_failure(first_message_received: bool) -> WsAttemptFailure {
+    if first_message_received {
+        WsAttemptFailure::FeedIdle
+    } else {
+        WsAttemptFailure::HandshakeNoData
+    }
+}
+
+fn fallback_persist_warning_due(
+    persisted: Duration,
+    since_last_warning: Option<Duration>,
+    alert_interval: Duration,
+) -> bool {
+    persisted >= alert_interval
+        && since_last_warning.map(|elapsed| elapsed >= alert_interval).unwrap_or(true)
 }
 
 /// Shared per-symbol feed health: the instant of the last WS tick.
@@ -67,6 +186,7 @@ pub(crate) fn next_reconnect_backoff_secs(current: u64) -> u64 {
 #[derive(Debug)]
 pub struct FeedHealth {
     last_ws_tick_ms: AtomicI64,
+    rest_fallback_healthy: AtomicBool,
 }
 
 impl FeedHealth {
@@ -74,6 +194,7 @@ impl FeedHealth {
     pub fn new() -> Self {
         Self {
             last_ws_tick_ms: AtomicI64::new(chrono::Utc::now().timestamp_millis()),
+            rest_fallback_healthy: AtomicBool::new(false),
         }
     }
 
@@ -88,6 +209,16 @@ impl FeedHealth {
         let last = self.last_ws_tick_ms.load(Ordering::Relaxed);
         let now = chrono::Utc::now().timestamp_millis();
         (now.saturating_sub(last).max(0) as u64) / 1000
+    }
+
+    /// Whether the latest REST fallback poll succeeded while fallback mode is
+    /// active. The WS task uses this only to widen its reconnect backoff.
+    pub fn rest_fallback_healthy(&self) -> bool {
+        self.rest_fallback_healthy.load(Ordering::Relaxed)
+    }
+
+    fn set_rest_fallback_healthy(&self, healthy: bool) {
+        self.rest_fallback_healthy.store(healthy, Ordering::Relaxed);
     }
 
     #[cfg(test)]
@@ -165,15 +296,33 @@ pub struct MarketDataManager {
     event_bus: Arc<EventBus>,
     /// Cancellation token for graceful shutdown
     cancel: CancellationToken,
-    /// Whether to connect to Binance testnet streams (mirrors
-    /// ROBSON_BINANCE_USE_TESTNET)
-    use_testnet: bool,
+    /// Ordered stream bases used by each per-symbol reconnect loop.
+    ws_endpoints: Arc<Vec<String>>,
 }
 
 impl MarketDataManager {
     /// Create a new market data manager.
-    pub fn new(event_bus: Arc<EventBus>, cancel: CancellationToken, use_testnet: bool) -> Self {
-        Self { event_bus, cancel, use_testnet }
+    pub fn new(
+        event_bus: Arc<EventBus>,
+        cancel: CancellationToken,
+        use_testnet: bool,
+        configured_ws_endpoints: Vec<String>,
+    ) -> Self {
+        let ws_endpoints = if configured_ws_endpoints.is_empty() {
+            vec![if use_testnet {
+                TESTNET_MARKET_WS_ENDPOINT.to_string()
+            } else {
+                MAINNET_MARKET_WS_ENDPOINT.to_string()
+            }]
+        } else {
+            configured_ws_endpoints
+        };
+
+        Self {
+            event_bus,
+            cancel,
+            ws_endpoints: Arc::new(ws_endpoints),
+        }
     }
 
     /// Spawn a WebSocket client task for a single symbol.
@@ -193,87 +342,85 @@ impl MarketDataManager {
         let cancel = self.cancel.clone();
         let symbol_str = symbol.as_pair();
 
-        let use_testnet = self.use_testnet;
+        let ws_endpoints = Arc::clone(&self.ws_endpoints);
         let handle = tokio::spawn(async move {
-            let ws_client = BinanceWebSocketClient::new(use_testnet);
-            let mut backoff_secs: u64 = 1;
+            let mut reconnect = WsReconnectState::new();
 
             'reconnect: loop {
                 if cancel.is_cancelled() {
                     break;
                 }
 
-                let mut stream = match ws_client.subscribe_agg_trade(&symbol_str).await {
-                    Ok(s) => {
-                        info!(symbol = %symbol_str, "WebSocket client connected");
-                        // Backoff resets only after first tick, not on connect, so that
-                        // Binance accept-then-immediately-close loops still back off.
-                        s
-                    },
-                    Err(e) => {
-                        error!(
-                            error = %e,
-                            symbol = %symbol_str,
-                            retry_in_secs = backoff_secs,
-                            "WebSocket connect failed, retrying"
-                        );
+                let endpoint = ws_endpoints[reconnect.endpoint_index].clone();
+                let ws_client = BinanceWebSocketClient::from_base_url(endpoint.clone());
+
+                let failure = 'attempt: {
+                    let subscription = tokio::select! {
+                        _ = cancel.cancelled() => break 'reconnect,
+                        result = tokio::time::timeout(
+                            Duration::from_secs(WS_CONNECT_TIMEOUT_SECS),
+                            ws_client.subscribe_agg_trade(&symbol_str),
+                        ) => result,
+                    };
+                    let mut stream = match subscription {
+                        Ok(Ok(stream)) => stream,
+                        Ok(Err(error)) => {
+                            break 'attempt WsAttemptFailure::Connect(error.to_string());
+                        },
+                        Err(_elapsed) => break 'attempt WsAttemptFailure::ConnectTimeout,
+                    };
+                    let mut first_message_received = false;
+
+                    loop {
                         tokio::select! {
-                            _ = sleep(Duration::from_secs(backoff_secs)) => {},
-                            _ = cancel.cancelled() => break 'reconnect,
-                        }
-                        backoff_secs = next_reconnect_backoff_secs(backoff_secs);
-                        continue 'reconnect;
-                    },
-                };
+                            _ = cancel.cancelled() => {
+                                info!(symbol = %symbol_str, "WebSocket client shutting down");
+                                break 'reconnect;
+                            }
+                            // Read-idle watchdog: a successful HTTP upgrade is
+                            // not a healthy feed. Only a delivered stream message
+                            // confirms that the endpoint is connected.
+                            msg = tokio::time::timeout(
+                                Duration::from_secs(WATCHDOG_IDLE_SECS),
+                                stream.next(),
+                            ) => {
+                                let msg = match msg {
+                                    Err(_elapsed) => {
+                                        break 'attempt watchdog_failure(first_message_received);
+                                    },
+                                    Ok(msg) => msg,
+                                };
 
-                let mut first_tick_logged = false;
+                                let message = match msg {
+                                    None if first_message_received => {
+                                        break 'attempt WsAttemptFailure::Closed;
+                                    },
+                                    None => {
+                                        break 'attempt WsAttemptFailure::ClosedBeforeData;
+                                    },
+                                    Some(Err(error)) if first_message_received => {
+                                        break 'attempt WsAttemptFailure::Stream(error.to_string());
+                                    },
+                                    Some(Err(error)) => {
+                                        break 'attempt WsAttemptFailure::StreamBeforeData(
+                                            error.to_string(),
+                                        );
+                                    },
+                                    Some(Ok(message)) => message,
+                                };
 
-                loop {
-                    tokio::select! {
-                        _ = cancel.cancelled() => {
-                            info!(symbol = %symbol_str, "WebSocket client shutting down");
-                            break 'reconnect;
-                        }
-                        // Read-idle watchdog: the keepalive ping is
-                        // fire-and-forget (pongs are never awaited), so a
-                        // half-open connection pends on next() forever with
-                        // no error — a silent, stale feed while the soft
-                        // stop goes blind (2026-07-03: the insurance stop
-                        // fired 39s before the daemon noticed anything).
-                        // An aggTrade stream on a traded symbol is never
-                        // quiet for this long; treat silence as death.
-                        msg = tokio::time::timeout(Duration::from_secs(WATCHDOG_IDLE_SECS), stream.next()) => {
-                            let msg = match msg {
-                                Err(_elapsed) => {
-                                    warn!(
+                                if !first_message_received {
+                                    info!(
                                         symbol = %symbol_str,
-                                        idle_secs = WATCHDOG_IDLE_SECS,
-                                        retry_in_secs = backoff_secs,
-                                        "Market data feed silent past watchdog; reconnecting"
+                                        endpoint = %endpoint,
+                                        "WebSocket client connected; first stream message received"
                                     );
-                                    break; // break inner loop → reconnect
-                                },
-                                Ok(msg) => msg,
-                            };
-                            match msg {
-                                None => {
-                                    warn!(
-                                        symbol = %symbol_str,
-                                        retry_in_secs = backoff_secs,
-                                        "WebSocket stream closed, reconnecting"
-                                    );
-                                    break; // break inner loop → reconnect
-                                },
-                                Some(Err(e)) => {
-                                    error!(
-                                        error = %e,
-                                        symbol = %symbol_str,
-                                        retry_in_secs = backoff_secs,
-                                        "WebSocket stream error, reconnecting"
-                                    );
-                                    break; // break inner loop → reconnect
-                                },
-                                Some(Ok(WsMessage::AggTrade(trade))) => {
+                                    first_message_received = true;
+                                    reconnect.record_first_message();
+                                }
+
+                                match message {
+                                    WsMessage::AggTrade(trade) => {
                                     let price_decimal =
                                         match rust_decimal::Decimal::from_str(&trade.price) {
                                             Ok(d) => d,
@@ -294,16 +441,6 @@ impl MarketDataManager {
                                             continue;
                                         },
                                     };
-
-                                    if !first_tick_logged {
-                                        info!(
-                                            symbol = %trade.symbol,
-                                            price = %price_decimal,
-                                            "First tick received"
-                                        );
-                                        first_tick_logged = true;
-                                        backoff_secs = 1; // stable connection confirmed
-                                    }
 
                                     let trade_symbol = match Symbol::from_pair(&trade.symbol) {
                                         Ok(s) => s,
@@ -327,21 +464,69 @@ impl MarketDataManager {
                                         });
 
                                     event_bus.send(daemon_event);
-                                },
-                                Some(Ok(_)) => {
-                                    // Other message types not needed here
-                                },
+                                    },
+                                    _ => {
+                                        // Other message types are not used by
+                                        // this dedicated aggTrade subscription.
+                                    },
+                                }
                             }
                         }
                     }
+                };
+
+                let rest_fallback_healthy = health.rest_fallback_healthy();
+                let retry_in_secs = reconnect.retry_in_secs(rest_fallback_healthy);
+                let next_endpoint =
+                    &ws_endpoints[reconnect.next_endpoint_index(ws_endpoints.len())];
+                crate::metrics::MARKET_DATA_WS_FAILURES
+                    .with_label_values(&[&symbol_str, &endpoint, failure.metric_reason()])
+                    .inc();
+
+                match (&failure, rest_fallback_healthy) {
+                    (WsAttemptFailure::HandshakeNoData, true) => info!(
+                        symbol = %symbol_str,
+                        endpoint = %endpoint,
+                        next_endpoint = %next_endpoint,
+                        idle_secs = WATCHDOG_IDLE_SECS,
+                        retry_in_secs,
+                        "WebSocket handshake succeeded but stream delivered no data; REST fallback healthy"
+                    ),
+                    (WsAttemptFailure::HandshakeNoData, false) => warn!(
+                        symbol = %symbol_str,
+                        endpoint = %endpoint,
+                        next_endpoint = %next_endpoint,
+                        idle_secs = WATCHDOG_IDLE_SECS,
+                        retry_in_secs,
+                        "WebSocket handshake succeeded but stream delivered no data; reconnecting"
+                    ),
+                    (_, true) => info!(
+                        symbol = %symbol_str,
+                        endpoint = %endpoint,
+                        next_endpoint = %next_endpoint,
+                        failure_reason = failure.metric_reason(),
+                        error = failure.error().unwrap_or(""),
+                        retry_in_secs,
+                        "WebSocket endpoint failed; REST fallback healthy"
+                    ),
+                    (_, false) => warn!(
+                        symbol = %symbol_str,
+                        endpoint = %endpoint,
+                        next_endpoint = %next_endpoint,
+                        failure_reason = failure.metric_reason(),
+                        error = failure.error().unwrap_or(""),
+                        retry_in_secs,
+                        "WebSocket endpoint failed; reconnecting"
+                    ),
                 }
+
+                reconnect.record_failure(ws_endpoints.len(), rest_fallback_healthy);
 
                 // Backoff before reconnect attempt
                 tokio::select! {
-                    _ = sleep(Duration::from_secs(backoff_secs)) => {},
+                    _ = sleep(Duration::from_secs(retry_in_secs)) => {},
                     _ = cancel.cancelled() => break 'reconnect,
                 }
-                backoff_secs = next_reconnect_backoff_secs(backoff_secs);
             }
 
             info!(symbol = %symbol_str, "WebSocket client task ended");
@@ -379,6 +564,7 @@ impl MarketDataManager {
             loop {
                 tokio::select! {
                     _ = cancel.cancelled() => {
+                        health.set_rest_fallback_healthy(false);
                         info!(symbol = %symbol_str, "REST fallback task shutting down");
                         break;
                     }
@@ -408,6 +594,7 @@ impl MarketDataManager {
                             fallback_since = None;
                             ws_healthy_since = None;
                             last_persist_warn = None;
+                            health.set_rest_fallback_healthy(false);
                             crate::metrics::MARKET_DATA_MODE
                                 .with_label_values(&[&symbol_str])
                                 .set(0.0);
@@ -427,6 +614,7 @@ impl MarketDataManager {
                         fallback_since = None;
                         ws_healthy_since = None;
                         last_persist_warn = None;
+                        health.set_rest_fallback_healthy(false);
                         crate::metrics::MARKET_DATA_MODE.with_label_values(&[&symbol_str]).set(0.0);
                         continue;
                     }
@@ -448,12 +636,14 @@ impl MarketDataManager {
                     in_fallback = true;
                     fallback_since = Some(tokio::time::Instant::now());
                     ws_healthy_since = None;
+                    health.set_rest_fallback_healthy(false);
                     crate::metrics::MARKET_DATA_MODE.with_label_values(&[&symbol_str]).set(1.0);
                 }
 
                 // In fallback: one poll per interval, no burst retries.
                 match support.rest_price(&symbol).await {
                     Ok(price) => {
+                        health.set_rest_fallback_healthy(true);
                         crate::metrics::MARKET_DATA_FALLBACK_POLLS
                             .with_label_values(&[&symbol_str, "ok"])
                             .inc();
@@ -465,6 +655,7 @@ impl MarketDataManager {
                         }));
                     },
                     Err(e) => {
+                        health.set_rest_fallback_healthy(false);
                         crate::metrics::MARKET_DATA_FALLBACK_POLLS
                             .with_label_values(&[&symbol_str, "error"])
                             .inc();
@@ -480,10 +671,9 @@ impl MarketDataManager {
                 // it persists past the alert threshold.
                 if let Some(since) = fallback_since {
                     let persisted = since.elapsed();
-                    let nag_due = last_persist_warn
-                        .map(|t| t.elapsed() >= Duration::from_secs(300))
-                        .unwrap_or(true);
-                    if persisted >= cfg.alert_after && nag_due {
+                    let since_last_warning = last_persist_warn.map(|t| t.elapsed());
+                    if fallback_persist_warning_due(persisted, since_last_warning, cfg.alert_after)
+                    {
                         warn!(
                             symbol = %symbol_str,
                             fallback_minutes = persisted.as_secs() / 60,
@@ -507,20 +697,99 @@ mod tests {
     fn test_market_data_manager_creation() {
         let event_bus = Arc::new(EventBus::new(100));
         let cancel = CancellationToken::new();
-        let _manager = MarketDataManager::new(event_bus, cancel, false);
-        // Manager is created successfully
+        let manager = MarketDataManager::new(event_bus, cancel, false, vec![]);
+
+        assert_eq!(manager.ws_endpoints.as_slice(), &[MAINNET_MARKET_WS_ENDPOINT]);
+    }
+
+    #[test]
+    fn market_data_manager_uses_testnet_or_configured_endpoints() {
+        let event_bus = Arc::new(EventBus::new(100));
+        let cancel = CancellationToken::new();
+        let testnet = MarketDataManager::new(event_bus.clone(), cancel.clone(), true, vec![]);
+        assert_eq!(testnet.ws_endpoints.as_slice(), &[TESTNET_MARKET_WS_ENDPOINT]);
+
+        let configured = vec![
+            "wss://primary.example/market".to_string(),
+            "wss://fallback.example/market".to_string(),
+        ];
+        let manager = MarketDataManager::new(event_bus, cancel, false, configured.clone());
+        assert_eq!(manager.ws_endpoints.as_slice(), configured.as_slice());
+    }
+
+    #[test]
+    fn websocket_reconnect_policy_rotates_endpoints_and_resets_after_data() {
+        let mut reconnect = WsReconnectState::new();
+        assert_eq!(reconnect.endpoint_index, 0);
+        assert_eq!(reconnect.retry_in_secs(false), 1);
+
+        reconnect.record_failure(3, false);
+        assert_eq!(reconnect.endpoint_index, 1);
+        assert_eq!(reconnect.retry_in_secs(false), 2);
+
+        reconnect.record_failure(3, false);
+        assert_eq!(reconnect.endpoint_index, 2);
+        reconnect.record_failure(3, false);
+        assert_eq!(reconnect.endpoint_index, 0);
+
+        reconnect.record_first_message();
+        assert_eq!(reconnect.retry_in_secs(false), 1);
+    }
+
+    #[test]
+    fn websocket_reconnect_backoff_expands_only_while_rest_is_healthy() {
+        let mut reconnect = WsReconnectState { endpoint_index: 0, backoff_secs: 60 };
+
+        for expected in [120, 240, 480, 900, 900] {
+            reconnect.record_failure(1, true);
+            assert_eq!(reconnect.retry_in_secs(true), expected);
+        }
+
+        reconnect.record_failure(1, false);
+        assert_eq!(reconnect.retry_in_secs(false), 60);
+    }
+
+    #[test]
+    fn watchdog_distinguishes_handshake_without_data_from_later_idle() {
+        assert_eq!(WsAttemptFailure::ConnectTimeout.metric_reason(), "connect_timeout");
+        assert!(matches!(watchdog_failure(false), WsAttemptFailure::HandshakeNoData));
+        assert!(matches!(watchdog_failure(true), WsAttemptFailure::FeedIdle));
+    }
+
+    #[test]
+    fn persistent_fallback_warning_is_periodic_at_the_alert_interval() {
+        let interval = Duration::from_secs(15 * 60);
+
+        assert!(!fallback_persist_warning_due(Duration::from_secs(14 * 60), None, interval,));
+        assert!(fallback_persist_warning_due(interval, None, interval));
+        assert!(!fallback_persist_warning_due(
+            Duration::from_secs(30 * 60),
+            Some(Duration::from_secs(14 * 60)),
+            interval,
+        ));
+        assert!(fallback_persist_warning_due(
+            Duration::from_secs(30 * 60),
+            Some(interval),
+            interval,
+        ));
     }
 
     #[test]
     fn feed_health_starts_healthy_and_tracks_ticks() {
         let health = FeedHealth::new();
         assert!(health.silent_secs() < 2, "fresh health handle must not read as silent");
+        assert!(!health.rest_fallback_healthy());
 
         health.set_last_tick_secs_ago(120);
         assert!(health.silent_secs() >= 119, "must report silence since the last tick");
 
         health.record_ws_tick();
         assert!(health.silent_secs() < 2, "recording a tick must reset silence");
+
+        health.set_rest_fallback_healthy(true);
+        assert!(health.rest_fallback_healthy());
+        health.set_rest_fallback_healthy(false);
+        assert!(!health.rest_fallback_healthy());
     }
 
     #[test]
@@ -571,10 +840,11 @@ mod tests {
         let event_bus = Arc::new(EventBus::new(100));
         let mut receiver = event_bus.subscribe();
         let cancel = CancellationToken::new();
-        let manager = MarketDataManager::new(event_bus, cancel.clone(), false);
+        let manager = MarketDataManager::new(event_bus, cancel.clone(), false, vec![]);
 
         let health = Arc::new(FeedHealth::new());
         health.set_last_tick_secs_ago(120); // silent past the 90s threshold
+        let observed_health = Arc::clone(&health);
 
         let support = Arc::new(StubSupport {
             price: Price::new(dec!(62700)).unwrap(),
@@ -595,9 +865,11 @@ mod tests {
             },
             other => panic!("expected MarketData, got {:?}", other),
         }
+        assert!(observed_health.rest_fallback_healthy());
 
         cancel.cancel();
         let _ = handle.await;
+        assert!(!observed_health.rest_fallback_healthy());
     }
 
     #[tokio::test]
@@ -605,7 +877,7 @@ mod tests {
         let event_bus = Arc::new(EventBus::new(100));
         let mut receiver = event_bus.subscribe();
         let cancel = CancellationToken::new();
-        let manager = MarketDataManager::new(event_bus, cancel.clone(), false);
+        let manager = MarketDataManager::new(event_bus, cancel.clone(), false, vec![]);
 
         let health = Arc::new(FeedHealth::new()); // fresh = healthy
         let support = Arc::new(StubSupport {
@@ -627,7 +899,7 @@ mod tests {
         let event_bus = Arc::new(EventBus::new(100));
         let mut receiver = event_bus.subscribe();
         let cancel = CancellationToken::new();
-        let manager = MarketDataManager::new(event_bus, cancel.clone(), false);
+        let manager = MarketDataManager::new(event_bus, cancel.clone(), false, vec![]);
 
         let health = Arc::new(FeedHealth::new());
         health.set_last_tick_secs_ago(120); // silent, but nothing to protect

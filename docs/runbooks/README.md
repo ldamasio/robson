@@ -109,6 +109,7 @@ If something goes wrong:
 
 | Issue | Runbook | Priority |
 |-------|---------|----------|
+| Futures market data stale or in REST fallback | [market-data-degraded-mode.md](market-data-degraded-mode.md) | High |
 | Pod crash loop | [troubleshooting.md](troubleshooting.md#pod-crash) | High |
 | Database connection | [troubleshooting.md](troubleshooting.md#database) | High |
 | Slow response time | [troubleshooting.md](troubleshooting.md#performance) | Medium |

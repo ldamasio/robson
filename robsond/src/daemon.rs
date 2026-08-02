@@ -677,8 +677,12 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
         //    starves.
         let ws_use_testnet =
             std::env::var("ROBSON_BINANCE_USE_TESTNET").unwrap_or_default() == "true";
-        let market_data_manager =
-            MarketDataManager::new(self.event_bus.clone(), shutdown.clone(), ws_use_testnet);
+        let market_data_manager = MarketDataManager::new(
+            self.event_bus.clone(),
+            shutdown.clone(),
+            ws_use_testnet,
+            self.config.market_data.ws_endpoints.clone(),
+        );
         let fallback_cfg = RestFallbackConfig::from_env();
         let fallback_support: Arc<dyn FallbackSupport> = Arc::new(DaemonFallbackSupport {
             exchange: Arc::clone(&self.exchange),
