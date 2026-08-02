@@ -1,6 +1,6 @@
 # ADR-0025: Frontend Auth — Bearer Token via Robsond
 
-**Date:** 2026-04-23 (original decision); 2026-04-25 (formalized as ADR)
+**Date:** 2026-04-23 (original decision); 2026-04-25 (formalized as ADR); 2026-06-03 (SSE header amendment)
 **Status:** Accepted
 
 ## Context
@@ -36,8 +36,9 @@ The frontend authenticates with a Bearer token issued by robsond.
 - Token entered manually by the operator on `/login`.
 - Persisted in `sessionStorage` under key `robson_api_token`.
 - Sent on every REST call as `Authorization: Bearer <token>`.
-- Sent on the SSE stream as `?token=<token>` query parameter, since
-  the browser `EventSource` API does not allow custom headers.
+- Sent on the SSE stream as `Authorization: Bearer <token>` by the
+  fetch-based SSE reader. Native `EventSource` is not used because it
+  cannot set custom headers.
 - Validated on `/login` by issuing `GET /health` and only navigating
   to `/dashboard` if the request succeeds.
 - Cleared by `clearAuth()` (called on explicit logout).
@@ -59,9 +60,8 @@ The frontend authenticates with a Bearer token issued by robsond.
 - No SSO; operators paste a token manually.
 - `sessionStorage` is per-tab and lost on close; this is acceptable
   for a single-operator console but does not scale to multi-user.
-- SSE token in query string can leak to access logs. Robsond logs
-  must filter the `token` parameter before persisting access logs
-  (see implementation note below).
+- The fetch-based SSE reader owns framing, reconnect backoff, and the
+  idle watchdog that native `EventSource` would otherwise provide.
 
 ## Alternatives
 
@@ -78,21 +78,20 @@ The frontend authenticates with a Bearer token issued by robsond.
 
 ## Implementation Notes
 
-- Auth store: `apps/frontend/src/lib/stores/auth.ts`
+- Auth store: `frontend/src/lib/stores/auth.ts`
   (`authToken`, `setToken`, `clearAuth`, `initAuth`).
-- API client: `apps/frontend/src/lib/api/robson.ts`
+- API client: `frontend/src/lib/api/robson.ts`
   attaches `Authorization` header from `authToken`.
-- Login flow: `apps/frontend/src/routes/login/+page.svelte`
+- Login flow: `frontend/src/routes/login/+page.svelte`
   validates the token via `robsonApi.health()`.
-- Auth guard: `apps/frontend/src/routes/(authed)/+layout.svelte`
+- Auth guard: `frontend/src/routes/(authed)/+layout.svelte`
   redirects to `/login` when no token is present.
-- Root redirect: `apps/frontend/src/routes/+page.svelte` sends `/`
+- Root redirect: `frontend/src/routes/+page.svelte` sends `/`
   to `/dashboard` if a token exists, otherwise to `/login`.
 
-**Backend log-hygiene requirement.** Robsond access logs MUST strip
-the `token` query parameter before persisting. The token is in the
-URL only because `EventSource` cannot send headers; logging it
-defeats the security boundary.
+**Backend log-hygiene requirement.** Bearer tokens MUST remain in the
+`Authorization` header and MUST NOT be accepted as URL query parameters.
+Access logging must continue to redact authorization headers.
 
 **Related**: ADR-0027 (CORS layer for production origins).
 **Supersedes**: prior FE-P1 plan to use Auth.js + GitHub OAuth.

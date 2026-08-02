@@ -1,6 +1,6 @@
 ADR-0032: Frontend UX — Event Log as First-Class Audit Surface
 
-Status: Accepted (amended 2026-04-23 after EP-003 backend contract review)
+Status: Accepted (amended 2026-04-23 and 2026-08-02)
 Date: 2026-04-23
 Related: ADR-0007 (Robson is risk assistant), ADR-0021 (opportunity vs technical stop), ADR-0022 (Robson-authored position invariant), ADR-0030 (frontend stack), ADR-0031 (Voltage brand).
 
@@ -157,3 +157,45 @@ The hard rules (zero default collapse, ms UTC, mono tabular, URL-addressable, 1-
   - Time zone display (UTC only vs operator-local with UTC badge)
   - Cooldown configurable with minimum floor
   - Kill-switch scope: prevent new entries only, or also freeze stop-updates on existing positions (implied: only new entries)
+
+---
+
+## Amendment 2 — 2026-08-02 (durable dashboard event bootstrap)
+
+Issue #139 established that the dashboard's "Today's events" card consumed only
+the ephemeral SSE `/events` stream. Opening or refreshing the page therefore
+started with an empty client buffer even when the canonical `event_log` already
+contained entry, insurance-stop, and trailing-stop events. The current
+fetch-based SSE client already sends the Bearer header, and the UTC filter
+correctly normalizes timestamps with offsets, so neither auth transmission nor
+timezone conversion was the root cause.
+
+The repository-verified contract is now:
+
+- Authenticated `GET /events/history?date=YYYY-MM-DD` queries one UTC calendar
+  day from the canonical `event_log`.
+- The response contains at most the newest 100 events and exposes only
+  `event_id`, `event_type`, `occurred_at`, and `payload`.
+- The dashboard loads this history on mount and UTC day rollover, then merges it
+  with SSE events by `event_id` in newest-first order.
+- A failed or malformed history response produces an explicit error state. Only
+  a successful response with no current-day events produces the empty state.
+- Per-operation durable history remains pending. The operation detail route
+  still documents and renders session-only SSE events.
+
+The separate `/events/history` path was chosen instead of changing `/events`
+content negotiation. This preserves the existing long-lived SSE contract and
+makes JSON request failures observable through the ordinary API client. The
+100-event bound matches the existing frontend store cap and prevents an
+operator page from reading an unbounded audit partition.
+
+### External dependency failure modes
+
+| Dependency or boundary | Failure | Backend behavior | Frontend behavior |
+|---|---|---|---|
+| Bearer authentication | Missing or invalid token | `401` from the shared authenticated route layer | Visible event-card error with retry; never the empty-day copy |
+| PostgreSQL event log | Pool or tenant unavailable | `503` without attempting a query | Visible event-card error while the rest of the dashboard remains usable |
+| PostgreSQL query | Query failure | Logged server-side; sanitized `500` response | Visible event-card error with retry |
+| UTC date input | Missing or invalid `YYYY-MM-DD` | `400` before querying PostgreSQL | Visible event-card error |
+| Response contract | Wrong date, malformed event, or out-of-day event | Not applicable | Client rejects the payload and shows the error state |
+| Successful empty query | No rows for the requested UTC day | `200` with `events: []` | "No events today." |
