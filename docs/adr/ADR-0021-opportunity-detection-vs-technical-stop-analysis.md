@@ -3,6 +3,11 @@
 **Date**: 2026-04-15
 **Status**: DECIDED — IMPLEMENTATION GAP RESOLVED (2026-04-15): `TechnicalStopAnalyzer` implemented; detector now emits chart-derived stops. VAL-001 Phase 1 PASS. The later VAL-001 Phase 2 static exposure blocker was resolved by ADR-0024 / MIG-v3#11 on 2026-04-19; Phase 2 is now pending testnet redeploy and execution.
 **Deciders**: RBX Systems (operator + architecture)
+**Amendment**: ADR-0050 (PROPOSED) amends the level-selection rule: the configured
+Nth level remains the anchor, but when it sits closer than the minimum stop
+distance, selection walks to deeper levels only (never shallower). The core
+prohibition of percentage-of-entry stops is unchanged. Current implemented
+behavior remains as described below until ADR-0050 is accepted and shipped.
 
 ---
 

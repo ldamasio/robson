@@ -2,6 +2,10 @@
 
 Status: Accepted (operator-initiated 2026-07-02; implemented and merged 2026-07-03 via PR #102)
 Date: 2026-07-02
+Amendment: ADR-0050 (PROPOSED) makes the insurance offset span-aware
+(`min(0.1% × price, 0.25 × span)`) and folds it into the executable worst-case
+cost used for sizing. The fixed 0.1% offset described below remains the
+implemented behavior until ADR-0050 is accepted and its sizing slice ships.
 
 ## Context
 
