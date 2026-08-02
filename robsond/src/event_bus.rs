@@ -147,6 +147,28 @@ pub enum DaemonEvent {
         detected_at: DateTime<Utc>,
     },
 
+    /// An entry attempt was rejected by domain validation (ADR-0050 §2/§7).
+    /// `terminal = true` means the position entered `needs_operator_rearm`;
+    /// `terminal = false` means the detector was re-armed under governed
+    /// backoff (strategy modes).
+    EntryRejected {
+        position_id: PositionId,
+        reason_code: String,
+        reason: String,
+        terminal: bool,
+        rejected_at: DateTime<Utc>,
+    },
+
+    /// Internal: an Immediate-mode detector exhausted its proactive fire
+    /// attempts without a valid signal (ADR-0050 §2). The daemon marks the
+    /// position `needs_operator_rearm`; the public `EntryRejected` event is
+    /// emitted by that handler, never directly by the detector.
+    ImmediateEntryExhausted {
+        position_id: PositionId,
+        reason: String,
+        exhausted_at: DateTime<Utc>,
+    },
+
     /// MonthlyHalt reset to Active by operator.
     MonthlyHaltReset {},
 

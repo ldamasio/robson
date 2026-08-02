@@ -418,6 +418,12 @@ impl DetectorTask {
                         );
 
                         if attempt >= 3 || !Self::is_transient_immediate_error(&error) {
+                            // ADR-0050 §2: in Immediate mode the operator
+                            // decided WHEN. A failed immediate fire must NOT
+                            // silently downgrade into a tick-waiting entry
+                            // (an autonomous later entry); it becomes a
+                            // terminal needs_operator_rearm handled by the
+                            // daemon.
                             warn!(
                                 flow = "entry_immediate",
                                 attempt,
@@ -425,9 +431,14 @@ impl DetectorTask {
                                 symbol = %self.config.symbol.as_pair(),
                                 side = ?self.config.side,
                                 error = %error,
-                                "Immediate proactive fire exhausted retries — falling back to reactive loop"
+                                "Immediate proactive fire exhausted retries — needs operator re-arm"
                             );
-                            break;
+                            self.event_bus.send(DaemonEvent::ImmediateEntryExhausted {
+                                position_id: self.config.position_id,
+                                reason: error.to_string(),
+                                exhausted_at: chrono::Utc::now(),
+                            });
+                            return None;
                         }
 
                         sleep(std::time::Duration::from_millis(250)).await;
