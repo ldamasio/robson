@@ -19,7 +19,10 @@
 //! Shutdown → CancellationToken.cancel() → all detectors exit
 //! ```
 
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::{HashMap, HashSet},
+    sync::Arc,
+};
 
 use chrono::Datelike;
 use robson_domain::{
@@ -140,6 +143,12 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     stop_invalidation_guard_enabled: bool,
     /// Lookback candles for the invalidation guard recent extreme (ADR-0042).
     stop_invalidation_lookback_candles: usize,
+    /// Positions whose reduce-only exit the exchange rejected while
+    /// reporting the symbol flat (#142). The exchange-side insurance stop
+    /// has already closed the position, so market ticks stop re-placing
+    /// exit orders for these and poll for the stop's fill evidence until
+    /// reverse reconciliation closes the book position.
+    exit_overtaken_suspects: Arc<RwLock<HashSet<PositionId>>>,
     /// Pending approvals held in runtime memory for Phase 3.
     pending_approvals: Arc<RwLock<HashMap<Uuid, PendingApprovalRecord>>>,
     /// Serializes entry-governance flows so pending reservations remain
@@ -637,6 +646,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             // `with_invalidation_guard`.
             stop_invalidation_guard_enabled: false,
             stop_invalidation_lookback_candles: 20,
+            exit_overtaken_suspects: Arc::new(RwLock::new(HashSet::new())),
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
             entry_flow_lock: Mutex::new(()),
             query_engine,
@@ -2843,6 +2853,67 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// → Executor(Decision) → Result → EventLog.append(Event)
     /// → Projection.apply(Event) (async)
     /// ```
+    /// True when an execution error is the exchange refusing a reduce-only
+    /// order because there is no position left to reduce (Binance -2022).
+    /// The daemon surfaces it either as `ExecError::Exchange` (prod shape,
+    /// 2026-08-02 incident) or `ExecError::OrderRejected`, so classification
+    /// is by message.
+    fn is_reduce_only_rejection(error: &DaemonError) -> bool {
+        let message = error.to_string().to_lowercase();
+        message.contains("-2022") || (message.contains("reduceonly") && message.contains("reject"))
+    }
+
+    /// True when the exchange no longer reports an open position matching
+    /// this position's symbol and side.
+    async fn exchange_reports_flat(&self, position: &Position) -> DaemonResult<bool> {
+        let open = self.exchange_open_positions().await?;
+        Ok(!open.iter().any(|exchange_position| {
+            exchange_position.symbol == position.symbol && exchange_position.side == position.side
+        }))
+    }
+
+    /// Close a book position the exchange already closed (#142).
+    ///
+    /// Reuses the reverse-reconciliation evidence path: resolve the insurance
+    /// stop's real fill on the exchange and run `reconcile_close` with it.
+    /// Returns `Ok(true)` when the position reached a terminal state; `Ok
+    /// (false)` when fill evidence is not visible yet (caller retries on a
+    /// later tick without placing further exit orders).
+    async fn try_close_exchange_overtaken_position(
+        &self,
+        position: &Position,
+    ) -> DaemonResult<bool> {
+        let exchange = self.exchange();
+        let Some(input) = crate::reconciliation_worker::gather_order_fill_evidence(
+            &exchange,
+            &self.store,
+            position,
+        )
+        .await?
+        else {
+            debug!(
+                position_id = %position.id,
+                "Exchange-overtaken exit: insurance stop fill not visible yet; will retry"
+            );
+            return Ok(false);
+        };
+
+        let outcome = self.reconcile_close(input).await?;
+        let closed = matches!(
+            outcome,
+            ReconcileCloseOutcome::Closed | ReconcileCloseOutcome::AlreadyTerminal
+        );
+        if closed {
+            self.exit_overtaken_suspects.write().await.remove(&position.id);
+            info!(
+                position_id = %position.id,
+                symbol = %position.symbol.as_pair(),
+                "Exchange-overtaken exit reconciled to Closed without further exit orders"
+            );
+        }
+        Ok(closed)
+    }
+
     pub async fn process_market_data(&self, data: MarketData) -> DaemonResult<()> {
         // Find all active positions for this symbol (from projection)
         let active_positions = self.store.positions().find_active().await?;
@@ -2883,6 +2954,42 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 return Err(DaemonError::Config(format!("Query transition error: {}", e)));
             }
             self.record_query_transition(&query, "processing").await?;
+
+            // #142 fast-path: the exchange already closed this position (its
+            // insurance stop filled) and rejected our reduce-only exit. Do
+            // not run the engine or place further exit orders; poll for the
+            // stop's fill evidence and close via reverse reconciliation.
+            if self.exit_overtaken_suspects.read().await.contains(&position.id) {
+                if self.exchange_reports_flat(&position).await.unwrap_or(true) {
+                    let closed = match self.try_close_exchange_overtaken_position(&position).await {
+                        Ok(closed) => closed,
+                        Err(e) => {
+                            let err_str = format!("{}", e);
+                            query.fail(err_str.clone(), "processing".to_string());
+                            self.record_query_failure(&query).await?;
+                            return Err(e);
+                        },
+                    };
+                    let outcome = if closed {
+                        QueryOutcome::ActionsExecuted { actions_count: 1 }
+                    } else {
+                        QueryOutcome::NoAction {
+                            reason: "exit overtaken by exchange-side close; awaiting fill evidence"
+                                .to_string(),
+                        }
+                    };
+                    if let Err(e) = query.complete(outcome) {
+                        query.fail(format!("{}", e), "processing".to_string());
+                        self.record_query_failure(&query).await?;
+                        return Err(DaemonError::Config(format!("Query completion error: {}", e)));
+                    }
+                    self.record_query_transition(&query, "completed").await?;
+                    continue;
+                }
+                // The exchange reports the position again: the suspicion was
+                // wrong, resume normal processing.
+                self.exit_overtaken_suspects.write().await.remove(&position.id);
+            }
 
             // Use engine to process (pure: State+Tick → Decision)
             let symbol_clone = data.symbol.clone();
@@ -2930,6 +3037,52 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             let results = match self.execute_and_persist(actions).await {
                 Ok(r) => r,
                 Err(e) => {
+                    // #142: a reduce-only rejection with the exchange flat
+                    // means the exchange-side insurance stop already closed
+                    // the position. Blind retries can never succeed (there is
+                    // nothing left to reduce), so hand off to reverse
+                    // reconciliation instead of failing the query.
+                    let overtaken = Self::is_reduce_only_rejection(&e)
+                        && self.exchange_reports_flat(&position).await.unwrap_or(false);
+                    if overtaken {
+                        warn!(
+                            position_id = %position.id,
+                            symbol = %position.symbol.as_pair(),
+                            error = %e,
+                            "Exit overtaken by exchange-side close; handing off to reverse \
+                             reconciliation instead of retrying the exit order"
+                        );
+                        self.exit_overtaken_suspects.write().await.insert(position.id);
+                        let closed =
+                            match self.try_close_exchange_overtaken_position(&position).await {
+                                Ok(closed) => closed,
+                                Err(reconcile_error) => {
+                                    let err_str = format!("{}", reconcile_error);
+                                    query.fail(err_str.clone(), "acting".to_string());
+                                    self.record_query_failure(&query).await?;
+                                    return Err(reconcile_error);
+                                },
+                            };
+                        let outcome = if closed {
+                            QueryOutcome::ActionsExecuted { actions_count: 1 }
+                        } else {
+                            QueryOutcome::NoAction {
+                                reason: "exit overtaken by exchange-side close; awaiting fill \
+                                         evidence"
+                                    .to_string(),
+                            }
+                        };
+                        if let Err(complete_error) = query.complete(outcome) {
+                            query.fail(format!("{}", complete_error), "acting".to_string());
+                            self.record_query_failure(&query).await?;
+                            return Err(DaemonError::Config(format!(
+                                "Query completion error: {}",
+                                complete_error
+                            )));
+                        }
+                        self.record_query_transition(&query, "completed").await?;
+                        continue;
+                    }
                     let err_str = format!("{}", e);
                     query.fail(err_str.clone(), "acting".to_string());
                     self.record_query_failure(&query).await?;
@@ -4091,6 +4244,181 @@ mod tests {
             },
             other => panic!("real exit fill must leave position Closed, got {other:?}"),
         }
+    }
+
+    /// Regression for #142: when the exchange-side insurance stop already
+    /// closed the position and the reduce-only exit is rejected (-2022), the
+    /// tick must hand off to reverse reconciliation and close the position
+    /// instead of failing the query.
+    #[tokio::test]
+    async fn test_reduce_only_rejection_with_flat_exchange_reconciles_close() {
+        let manager = create_test_manager().await;
+        let mut position =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+        let entry_price = Price::new(dec!(100)).unwrap();
+        let trailing_stop = Price::new(dec!(90)).unwrap();
+        position.tech_stop_distance =
+            Some(TechnicalStopDistance::from_entry_and_stop(entry_price, trailing_stop));
+
+        let exchange = manager.executor.exchange();
+        let insurance_order = exchange
+            .place_stop_market_order(
+                &position.symbol,
+                position.side.exit_action(),
+                position.quantity,
+                trailing_stop,
+                "ins-test-overtaken",
+            )
+            .await
+            .unwrap();
+        position.insurance_stop_id = Some(insurance_order.exchange_order_id.clone());
+        if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+            *insurance_stop_id = Some(insurance_order.exchange_order_id.clone());
+        }
+        manager.store.positions().save(&position).await.unwrap();
+
+        // The exchange-side stop triggers first: order gone from the open set,
+        // real fill recorded, and the exchange is flat (no open positions).
+        exchange.set_price("BTCUSDT", trailing_stop.as_decimal());
+        exchange.fill_stop_order(&insurance_order.exchange_order_id).unwrap();
+        exchange.set_reject_reduce_only_next(true);
+
+        let result = manager
+            .process_market_data(MarketData {
+                symbol: position.symbol.clone(),
+                price: Price::new(dec!(89)).unwrap(),
+                timestamp: chrono::Utc::now(),
+                source: crate::event_bus::MarketDataSource::Ws,
+            })
+            .await;
+        assert!(result.is_ok(), "overtaken exit must not fail the tick: {result:?}");
+        assert_eq!(exchange.market_order_call_count(), 1, "exactly one exit attempt is allowed");
+
+        let closed = manager.get_position(position.id).await.unwrap().unwrap();
+        match &closed.state {
+            PositionState::Closed { exit_price, .. } => {
+                assert_eq!(*exit_price, trailing_stop);
+            },
+            other => panic!("overtaken exit must reconcile to Closed, got {other:?}"),
+        }
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert!(events.iter().any(|event| matches!(event, Event::PositionClosed { .. })));
+    }
+
+    /// Regression for #142: while fill evidence is not visible yet, later
+    /// ticks must not place further exit orders for a suspect position; once
+    /// evidence appears, the position closes.
+    #[tokio::test]
+    async fn test_overtaken_suspect_stops_exit_retries_until_evidence_appears() {
+        let manager = create_test_manager().await;
+        let mut position =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+        let entry_price = Price::new(dec!(100)).unwrap();
+        let trailing_stop = Price::new(dec!(90)).unwrap();
+        position.tech_stop_distance =
+            Some(TechnicalStopDistance::from_entry_and_stop(entry_price, trailing_stop));
+        // The recorded insurance stop id is not resolvable on the exchange
+        // yet, so fill evidence is delayed.
+        position.insurance_stop_id = Some("ins-not-yet-visible".to_string());
+        if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+            *insurance_stop_id = Some("ins-not-yet-visible".to_string());
+        }
+        manager.store.positions().save(&position).await.unwrap();
+
+        let exchange = manager.executor.exchange();
+        exchange.set_reject_reduce_only_next(true);
+
+        let tick = |price: Decimal| MarketData {
+            symbol: position.symbol.clone(),
+            price: Price::new(price).unwrap(),
+            timestamp: chrono::Utc::now(),
+            source: crate::event_bus::MarketDataSource::Ws,
+        };
+
+        // Tick 1: rejection with flat exchange marks the suspect; no close yet.
+        assert!(manager.process_market_data(tick(dec!(89))).await.is_ok());
+        assert_eq!(exchange.market_order_call_count(), 1);
+        let still_active = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(still_active.state, PositionState::Active { .. }));
+
+        // Tick 2: suspect path polls evidence only; no further exit orders.
+        assert!(manager.process_market_data(tick(dec!(88))).await.is_ok());
+        assert_eq!(
+            exchange.market_order_call_count(),
+            1,
+            "suspect position must not re-place exit orders"
+        );
+
+        // Evidence becomes visible: the real triggered stop fill appears.
+        exchange.set_price("BTCUSDT", trailing_stop.as_decimal());
+        let filled_order = exchange
+            .place_stop_market_order(
+                &position.symbol,
+                position.side.exit_action(),
+                position.quantity,
+                trailing_stop,
+                "ins-late-evidence",
+            )
+            .await
+            .unwrap();
+        exchange.fill_stop_order(&filled_order.exchange_order_id).unwrap();
+        let mut stored = manager.get_position(position.id).await.unwrap().unwrap();
+        stored.insurance_stop_id = Some(filled_order.exchange_order_id.clone());
+        if let PositionState::Active { insurance_stop_id, .. } = &mut stored.state {
+            *insurance_stop_id = Some(filled_order.exchange_order_id.clone());
+        }
+        manager.store.positions().save(&stored).await.unwrap();
+
+        // Tick 3: evidence resolves and the position closes; still one order.
+        assert!(manager.process_market_data(tick(dec!(88))).await.is_ok());
+        assert_eq!(exchange.market_order_call_count(), 1);
+        let closed = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(
+            matches!(closed.state, PositionState::Closed { .. }),
+            "evidence must close the suspect position, got {:?}",
+            closed.state
+        );
+    }
+
+    /// #142 guard: a reduce-only rejection while the exchange still reports
+    /// the position open is a real failure and must keep the original
+    /// fail-the-query path.
+    #[tokio::test]
+    async fn test_reduce_only_rejection_with_position_still_open_fails() {
+        let manager = create_test_manager().await;
+        let mut position =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+        let entry_price = Price::new(dec!(100)).unwrap();
+        let trailing_stop = Price::new(dec!(90)).unwrap();
+        position.tech_stop_distance =
+            Some(TechnicalStopDistance::from_entry_and_stop(entry_price, trailing_stop));
+        position.insurance_stop_id = Some("ins-still-open".to_string());
+        if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+            *insurance_stop_id = Some("ins-still-open".to_string());
+        }
+        manager.store.positions().save(&position).await.unwrap();
+
+        let exchange = manager.executor.exchange();
+        exchange.set_open_position(
+            position.symbol.clone(),
+            position.side,
+            position.quantity,
+            entry_price,
+        );
+        exchange.set_reject_reduce_only_next(true);
+
+        let result = manager
+            .process_market_data(MarketData {
+                symbol: position.symbol.clone(),
+                price: Price::new(dec!(89)).unwrap(),
+                timestamp: chrono::Utc::now(),
+                source: crate::event_bus::MarketDataSource::Ws,
+            })
+            .await;
+        assert!(result.is_err(), "rejection with a live exchange position must surface");
+
+        let unchanged = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(unchanged.state, PositionState::Active { .. }));
     }
 
     #[tokio::test]

@@ -90,6 +90,12 @@ pub struct StubExchange {
     filled_stop_orders: RwLock<HashMap<String, OrderResult>>,
     /// Simulated income items retrievable by `get_income_since` (ADR-0045).
     income_records: RwLock<Vec<IncomeRecord>>,
+    /// When set, the next reduce-only market order is rejected the way the
+    /// exchange refuses to reduce an already-flat position (Binance -2022).
+    reject_reduce_only_next: RwLock<bool>,
+    /// Futures market orders attempted via `place_market_order`, rejected or
+    /// not, so tests can assert how many exit attempts reached the exchange.
+    market_order_calls: RwLock<u64>,
 }
 
 impl StubExchange {
@@ -119,6 +125,8 @@ impl StubExchange {
             stop_orders: RwLock::new(HashMap::new()),
             filled_stop_orders: RwLock::new(HashMap::new()),
             income_records: RwLock::new(Vec::new()),
+            reject_reduce_only_next: RwLock::new(false),
+            market_order_calls: RwLock::new(0),
         }
     }
 
@@ -168,6 +176,19 @@ impl StubExchange {
     pub fn set_order_fail_next(&self, fail: bool) {
         let mut fail_next = self.order_fail_next.write().unwrap();
         *fail_next = fail;
+    }
+
+    /// Configure the next reduce-only market order to be rejected as Binance
+    /// rejects reductions of an already-flat position (-2022).
+    pub fn set_reject_reduce_only_next(&self, reject: bool) {
+        let mut flag = self.reject_reduce_only_next.write().unwrap();
+        *flag = reject;
+    }
+
+    /// Futures market orders attempted via `place_market_order` (including
+    /// rejected ones).
+    pub fn market_order_call_count(&self) -> u64 {
+        *self.market_order_calls.read().unwrap()
     }
 
     /// Generate a unique order ID.
@@ -354,11 +375,25 @@ impl ExchangePort for StubExchange {
         _side: OrderSide,
         quantity: Quantity,
         client_order_id: &str,
-        _reduce_only: bool,
+        reduce_only: bool,
     ) -> Result<OrderResult, ExecError> {
+        *self.market_order_calls.write().unwrap() += 1;
+
         // Check if we should simulate a failure
         if self.should_fail() || self.should_fail_order() {
             return Err(ExecError::Exchange("Simulated exchange failure".to_string()));
+        }
+
+        // Simulate the exchange refusing to reduce an already-flat position,
+        // with the same error shape production surfaces (Binance -2022).
+        if reduce_only {
+            let mut flag = self.reject_reduce_only_next.write().unwrap();
+            if *flag {
+                *flag = false;
+                return Err(ExecError::Exchange(
+                    "Binance API error: -2022 - ReduceOnly Order is rejected.".to_string(),
+                ));
+            }
         }
 
         // Get current price
