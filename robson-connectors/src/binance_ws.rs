@@ -101,6 +101,20 @@ impl BinanceWebSocketClient {
         Self { base_url, testnet }
     }
 
+    /// Create a WebSocket client for an explicit stream base URL.
+    ///
+    /// The base URL must omit the trailing `/ws`; subscription methods append
+    /// the stream path. A trailing slash is normalized so configured endpoint
+    /// lists cannot accidentally produce a double slash.
+    pub fn from_base_url(base_url: impl Into<String>) -> Self {
+        let base_url = base_url.into().trim_end_matches('/').to_string();
+        Self { base_url, testnet: false }
+    }
+
+    fn symbol_stream_url(&self, symbol: &str, stream: &str) -> String {
+        format!("{}/ws/{}@{}", self.base_url, symbol.to_lowercase(), stream)
+    }
+
     /// Subscribe to ticker stream for a symbol.
     ///
     /// Receives 24hr ticker updates every second.
@@ -109,8 +123,7 @@ impl BinanceWebSocketClient {
     ///
     /// * `symbol` - Trading pair (e.g., "BTCUSDT")
     pub async fn subscribe_ticker(&self, symbol: &str) -> Result<BinanceWsStream, BinanceWsError> {
-        let symbol_lower = symbol.to_lowercase();
-        let url = format!("{}/ws/{}@ticker", self.base_url, symbol_lower);
+        let url = self.symbol_stream_url(symbol, "ticker");
 
         let (ws_stream, _) = connect_async(&url)
             .await
@@ -130,8 +143,7 @@ impl BinanceWebSocketClient {
         &self,
         symbol: &str,
     ) -> Result<BinanceWsStream, BinanceWsError> {
-        let symbol_lower = symbol.to_lowercase();
-        let url = format!("{}/ws/{}@aggTrade", self.base_url, symbol_lower);
+        let url = self.symbol_stream_url(symbol, "aggTrade");
 
         let (ws_stream, _) = connect_async(&url)
             .await
@@ -174,8 +186,7 @@ impl BinanceWebSocketClient {
         symbol: &str,
         interval: &str,
     ) -> Result<BinanceWsStream, BinanceWsError> {
-        let symbol_lower = symbol.to_lowercase();
-        let url = format!("{}/ws/{}@kline_{}", self.base_url, symbol_lower, interval);
+        let url = self.symbol_stream_url(symbol, &format!("kline_{}", interval));
 
         let (ws_stream, _) = connect_async(&url)
             .await
@@ -615,6 +626,17 @@ mod tests {
 
         assert_eq!(client.base_url, BINANCE_WS_TESTNET_URL);
         assert!(client.testnet);
+    }
+
+    #[test]
+    fn test_websocket_client_builds_stream_url_from_configured_base() {
+        let client = BinanceWebSocketClient::from_base_url("wss://fstream.binance.com/market/");
+
+        assert_eq!(client.base_url, "wss://fstream.binance.com/market");
+        assert_eq!(
+            client.symbol_stream_url("BTCUSDT", "aggTrade"),
+            "wss://fstream.binance.com/market/ws/btcusdt@aggTrade"
+        );
     }
 
     #[test]

@@ -1,7 +1,7 @@
 # ADR-0044 — REST Market-Data Fallback for the Trailing Engine
 
 **Date**: 2026-07-05
-**Status**: Decided (implementation pending)
+**Status**: DECIDED; implemented (repository-verified); operational rollout pending
 **Deciders**: RBX Systems (operator + architecture)
 
 ---
@@ -61,6 +61,10 @@ and guard semantics (ADR-0041/0042) apply identically.
 - **Exit fallback**: the WS connection delivers ticks again and stays healthy
   for a hold-down window (default 60 s). Only then does REST polling stop.
   The hold-down prevents flapping between modes on a half-healthy socket.
+- **Reconnect while degraded**: each failed attempt rotates to the next base
+  in `ROBSON_MARKET_DATA_WS_ENDPOINTS`. The default mainnet market-stream base
+  is `wss://fstream.binance.com/market`. While REST polls are healthy, the WS
+  reconnect backoff grows to a 15 min cap instead of remaining at 60 s.
 - Both sources may deliver concurrently during transitions. Price events
   carry the exchange event time; the pipeline deduplicates by monotonic
   timestamp per symbol so a step can never be applied twice for the same
@@ -85,10 +89,11 @@ The June and July incidents were both silent from the outside. This one must
 not be:
 
 - `market_data_mode` gauge per symbol (`ws` = 0, `rest_fallback` = 1).
-- `market_data_silent_seconds` counter since last tick, per symbol.
+- `market_data_silent_seconds` gauge since last tick, per symbol.
+- `market_data_ws_failures_total` counter by symbol, endpoint, and reason.
 - WARN log on every mode transition, with cause.
 - Alert when fallback mode persists beyond an operator threshold (default
-  15 min) — fallback is a degraded state to leave, not a home.
+  15 min). The persistent WARN repeats no more than once per threshold.
 
 ### 5. Equivalence and concurrency verification
 
@@ -112,7 +117,7 @@ canonical slow leak).
 
 | Failure | Behavior |
 | --- | --- |
-| WS silent, REST healthy | Fallback drives trailing; WARN + gauge flips |
+| WS silent, REST healthy | Fallback drives trailing; endpoints rotate and reconnect backoff grows to 15 min |
 | WS healthy, REST failing | Normal operation; fallback errors logged, no panic |
 | Both paths dead | Loud alert (both-feeds-dead); insurance stop (ADR-0039) remains the bounded-loss floor; startup recovery heals on next boot |
 | Daemon dies entirely | Unchanged from ADR-0039: exchange-side stop executes alone |
@@ -122,8 +127,8 @@ dead REST poll is a logged, counted event, and nothing else.
 
 ### 7. Rollout
 
-1. **robsond first** (this ADR): implement, verify with the property suite,
-   deploy behind the config default (fallback enabled).
+1. **robsond first** (this ADR): implementation and repository verification
+   are complete. Operational deployment confirmation remains pending.
 2. **Strategos next**: this design — silent-feed watchdog, REST degraded
    mode, source-equivalence property tests — is the reference pattern for
    Strategos' market-data layer. A Strategos ADR will adapt it to that

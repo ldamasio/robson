@@ -9,6 +9,7 @@
 //! - `robsond_active_positions` — currently open position count
 //! - `robsond_stale_active_positions` — open book positions missing on exchange
 //! - `robsond_monthly_halt_active` — MonthlyHalt circuit breaker (0 or 1)
+//! - `robsond_market_data_ws_failures_total` — failed WS attempts by endpoint
 //! - `robsond_sse_connections` — currently connected SSE clients on `/events`
 //! - `robsond_sse_events_total` — public SSE events sent, labelled by event
 //!   type
@@ -113,6 +114,16 @@ pub static MARKET_DATA_FALLBACK_POLLS: LazyLock<CounterVec> = LazyLock::new(|| {
         &["symbol", "outcome"] // outcome: ok, error
     )
     .expect("failed to register robsond_market_data_fallback_polls_total")
+});
+
+/// Failed WebSocket attempts per symbol, endpoint, and failure reason.
+pub static MARKET_DATA_WS_FAILURES: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        "robsond_market_data_ws_failures_total",
+        "Failed market-data WebSocket attempts by endpoint and reason",
+        &["symbol", "endpoint", "reason"]
+    )
+    .expect("failed to register robsond_market_data_ws_failures_total")
 });
 
 /// Currently connected SSE clients on `/events`.
