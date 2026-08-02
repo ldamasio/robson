@@ -225,7 +225,13 @@ impl Daemon<StubExchange, MemoryStore> {
             .with_stop_buffer(config.engine.stop_buffer_bps)
             .expect("invalid ROBSON_STOP_BUFFER_BPS configuration")
             .with_margin_headroom(config.engine.margin_headroom_bps)
-            .expect("invalid ROBSON_MARGIN_HEADROOM_BPS configuration");
+            .expect("invalid ROBSON_MARGIN_HEADROOM_BPS configuration")
+            .with_stop_distance_bounds(
+                config
+                    .engine
+                    .stop_distance_bounds()
+                    .expect("invalid ROBSON_MIN/MAX_TECH_STOP_PERCENT configuration"),
+            );
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
@@ -275,7 +281,13 @@ impl Daemon<StubExchange, MemoryStore> {
             .with_stop_buffer(config.engine.stop_buffer_bps)
             .expect("invalid ROBSON_STOP_BUFFER_BPS configuration")
             .with_margin_headroom(config.engine.margin_headroom_bps)
-            .expect("invalid ROBSON_MARGIN_HEADROOM_BPS configuration");
+            .expect("invalid ROBSON_MARGIN_HEADROOM_BPS configuration")
+            .with_stop_distance_bounds(
+                config
+                    .engine
+                    .stop_distance_bounds()
+                    .expect("invalid ROBSON_MIN/MAX_TECH_STOP_PERCENT configuration"),
+            );
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
@@ -340,7 +352,13 @@ impl Daemon<StubExchange, MemoryStore> {
             .with_stop_buffer(config.engine.stop_buffer_bps)
             .expect("invalid ROBSON_STOP_BUFFER_BPS configuration")
             .with_margin_headroom(config.engine.margin_headroom_bps)
-            .expect("invalid ROBSON_MARGIN_HEADROOM_BPS configuration");
+            .expect("invalid ROBSON_MARGIN_HEADROOM_BPS configuration")
+            .with_stop_distance_bounds(
+                config
+                    .engine
+                    .stop_distance_bounds()
+                    .expect("invalid ROBSON_MIN/MAX_TECH_STOP_PERCENT configuration"),
+            );
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
@@ -398,7 +416,13 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
             .with_stop_buffer(config.engine.stop_buffer_bps)
             .expect("invalid ROBSON_STOP_BUFFER_BPS configuration")
             .with_margin_headroom(config.engine.margin_headroom_bps)
-            .expect("invalid ROBSON_MARGIN_HEADROOM_BPS configuration");
+            .expect("invalid ROBSON_MARGIN_HEADROOM_BPS configuration")
+            .with_stop_distance_bounds(
+                config
+                    .engine
+                    .stop_distance_bounds()
+                    .expect("invalid ROBSON_MIN/MAX_TECH_STOP_PERCENT configuration"),
+            );
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
@@ -472,7 +496,13 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
             .with_stop_buffer(config.engine.stop_buffer_bps)
             .expect("invalid ROBSON_STOP_BUFFER_BPS configuration")
             .with_margin_headroom(config.engine.margin_headroom_bps)
-            .expect("invalid ROBSON_MARGIN_HEADROOM_BPS configuration");
+            .expect("invalid ROBSON_MARGIN_HEADROOM_BPS configuration")
+            .with_stop_distance_bounds(
+                config
+                    .engine
+                    .stop_distance_bounds()
+                    .expect("invalid ROBSON_MIN/MAX_TECH_STOP_PERCENT configuration"),
+            );
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 

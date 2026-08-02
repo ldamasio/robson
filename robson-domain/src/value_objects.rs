@@ -376,6 +376,78 @@ pub fn effective_stop_price_with_guard(
 /// assert_eq!(config.taker_fee_rate(), dec!(0.0005));
 /// assert_eq!(config.stop_gap_bps(), dec!(10));
 /// ```
+/// Single source of truth for technical-stop distance bounds (ADR-0050 §5).
+///
+/// Basis points of the entry price: 10 bps = 0.1%, 1000 bps = 10%. Every
+/// validity stage (raw level selection, guard-aware stop, executable stop,
+/// planned cost) must validate against the same instance; the historical
+/// defaults reproduce the previously hard-coded 0.1%-10% range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StopDistanceBounds {
+    min_bps: Decimal,
+    max_bps: Decimal,
+}
+
+impl StopDistanceBounds {
+    /// Create bounds with validation: `0 < min_bps < max_bps <= 10000`.
+    ///
+    /// # Errors
+    /// Returns `DomainError::InvalidRiskConfig` when out of range.
+    pub fn new(min_bps: Decimal, max_bps: Decimal) -> Result<Self, DomainError> {
+        if min_bps <= Decimal::ZERO {
+            return Err(DomainError::InvalidRiskConfig(format!(
+                "Stop distance min must be positive bps: {min_bps}"
+            )));
+        }
+        if max_bps <= min_bps || max_bps > Decimal::from(10_000) {
+            return Err(DomainError::InvalidRiskConfig(format!(
+                "Stop distance max must be in (min, 10000] bps: min={min_bps} max={max_bps}"
+            )));
+        }
+        Ok(Self { min_bps, max_bps })
+    }
+
+    /// Minimum distance in basis points of entry.
+    pub fn min_bps(&self) -> Decimal {
+        self.min_bps
+    }
+
+    /// Maximum distance in basis points of entry.
+    pub fn max_bps(&self) -> Decimal {
+        self.max_bps
+    }
+
+    /// Minimum distance as a fraction of entry (10 bps → 0.001).
+    pub fn min_fraction(&self) -> Decimal {
+        self.min_bps / Decimal::from(10_000)
+    }
+
+    /// Maximum distance as a fraction of entry (1000 bps → 0.10).
+    pub fn max_fraction(&self) -> Decimal {
+        self.max_bps / Decimal::from(10_000)
+    }
+
+    /// Minimum distance in percentage points of entry (10 bps → 0.1).
+    pub fn min_pct(&self) -> Decimal {
+        self.min_bps / Decimal::from(100)
+    }
+
+    /// Maximum distance in percentage points of entry (1000 bps → 10).
+    pub fn max_pct(&self) -> Decimal {
+        self.max_bps / Decimal::from(100)
+    }
+}
+
+impl Default for StopDistanceBounds {
+    /// Historical bounds: 0.1% to 10% of entry.
+    fn default() -> Self {
+        Self {
+            min_bps: Decimal::from(10),
+            max_bps: Decimal::from(1_000),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RiskConfig {
     /// Available capital in quote currency (e.g., USDT)
@@ -395,6 +467,10 @@ pub struct RiskConfig {
     /// executable on the exchange)
     #[serde(default = "default_margin_headroom_bps")]
     margin_headroom_bps: Decimal,
+    /// Technical-stop distance bounds shared by every validity stage
+    /// (ADR-0050 §5)
+    #[serde(default)]
+    stop_distance_bounds: StopDistanceBounds,
 }
 
 impl RiskConfig {
@@ -424,6 +500,7 @@ impl RiskConfig {
             stop_gap_bps: default_stop_gap_bps(),
             stop_buffer_bps: default_stop_buffer_bps(),
             margin_headroom_bps: default_margin_headroom_bps(),
+            stop_distance_bounds: StopDistanceBounds::default(),
         })
     }
 
@@ -538,6 +615,19 @@ impl RiskConfig {
     /// capital)
     pub fn margin_headroom_bps(&self) -> Decimal {
         self.margin_headroom_bps
+    }
+
+    /// Technical-stop distance bounds (single source, ADR-0050 §5)
+    pub fn stop_distance_bounds(&self) -> StopDistanceBounds {
+        self.stop_distance_bounds
+    }
+
+    /// Override the technical-stop distance bounds (operator-configured).
+    ///
+    /// Bounds are constructed validated; this simply installs them.
+    pub fn with_stop_distance_bounds(mut self, bounds: StopDistanceBounds) -> Self {
+        self.stop_distance_bounds = bounds;
+        self
     }
 
     /// Get risk percentage cap (always 1%)
@@ -725,31 +815,47 @@ impl TechnicalStopDistance {
         Ok(Self::from_entry_and_stop(entry, initial_stop))
     }
 
-    /// Validate the TechnicalStopDistance
+    /// Validate the TechnicalStopDistance against the historical default
+    /// bounds (0.1%-10%).
+    ///
+    /// Prefer [`Self::validate_with_bounds`] with the bounds carried by
+    /// `RiskConfig` (ADR-0050 §5, single source). This convenience remains
+    /// for contexts that provably run with default bounds.
+    ///
+    /// # Errors
+    /// Returns `DomainError::InvalidTechnicalStopDistance` if out of bounds.
+    pub fn validate(&self) -> Result<(), DomainError> {
+        self.validate_with_bounds(&StopDistanceBounds::default())
+    }
+
+    /// Validate the TechnicalStopDistance against explicit bounds
+    /// (ADR-0050 §5: every stage validates against the same
+    /// `StopDistanceBounds` instance).
     ///
     /// # Errors
     /// Returns `DomainError::InvalidTechnicalStopDistance` if:
     /// - Distance is <= 0
-    /// - Distance percentage is > 10%
-    /// - Distance percentage is < 0.1%
-    pub fn validate(&self) -> Result<(), DomainError> {
+    /// - Distance percentage is above `bounds.max_pct()`
+    /// - Distance percentage is below `bounds.min_pct()`
+    pub fn validate_with_bounds(&self, bounds: &StopDistanceBounds) -> Result<(), DomainError> {
         if self.distance <= Decimal::ZERO {
             return Err(DomainError::InvalidTechnicalStopDistance(
                 "Distance must be positive".to_string(),
             ));
         }
 
-        if self.distance_pct > Decimal::from(10) {
-            return Err(DomainError::InvalidTechnicalStopDistance(
-                "Stop too wide (>10%)".to_string(),
-            ));
+        if self.distance_pct > bounds.max_pct() {
+            return Err(DomainError::InvalidTechnicalStopDistance(format!(
+                "Stop too wide (>{}%)",
+                bounds.max_pct().normalize()
+            )));
         }
 
-        if self.distance_pct < Decimal::new(1, 1) {
-            // 0.1%
-            return Err(DomainError::InvalidTechnicalStopDistance(
-                "Stop too tight (<0.1%)".to_string(),
-            ));
+        if self.distance_pct < bounds.min_pct() {
+            return Err(DomainError::InvalidTechnicalStopDistance(format!(
+                "Stop too tight (<{}%)",
+                bounds.min_pct().normalize()
+            )));
         }
 
         Ok(())
@@ -793,6 +899,55 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
+
+    // StopDistanceBounds tests (ADR-0050 §5, issue #148)
+    #[test]
+    fn test_stop_distance_bounds_default_preserves_historical_range() {
+        let bounds = StopDistanceBounds::default();
+        assert_eq!(bounds.min_bps(), dec!(10));
+        assert_eq!(bounds.max_bps(), dec!(1000));
+        assert_eq!(bounds.min_fraction(), dec!(0.001));
+        assert_eq!(bounds.max_fraction(), dec!(0.10));
+        assert_eq!(bounds.min_pct(), dec!(0.1));
+        assert_eq!(bounds.max_pct(), dec!(10));
+    }
+
+    #[test]
+    fn test_stop_distance_bounds_validation() {
+        assert!(StopDistanceBounds::new(dec!(10), dec!(1000)).is_ok());
+        assert!(StopDistanceBounds::new(dec!(0), dec!(1000)).is_err());
+        assert!(StopDistanceBounds::new(dec!(-1), dec!(1000)).is_err());
+        assert!(StopDistanceBounds::new(dec!(100), dec!(100)).is_err());
+        assert!(StopDistanceBounds::new(dec!(100), dec!(50)).is_err());
+        assert!(StopDistanceBounds::new(dec!(10), dec!(10001)).is_err());
+    }
+
+    #[test]
+    fn test_validate_with_bounds_uses_the_injected_source() {
+        // 0.5% distance: valid under defaults, too tight under min=100 bps.
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(99.5)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+
+        assert!(tech_stop.validate_with_bounds(&StopDistanceBounds::default()).is_ok());
+        let tight = StopDistanceBounds::new(dec!(100), dec!(1000)).unwrap();
+        let err = tech_stop.validate_with_bounds(&tight).unwrap_err();
+        assert!(err.to_string().contains("Stop too tight (<1%)"), "got: {err}");
+        // And too wide under max=30 bps.
+        let narrow = StopDistanceBounds::new(dec!(10), dec!(30)).unwrap();
+        let err = tech_stop.validate_with_bounds(&narrow).unwrap_err();
+        assert!(err.to_string().contains("Stop too wide (>0.3%)"), "got: {err}");
+    }
+
+    #[test]
+    fn test_risk_config_carries_bounds_single_source() {
+        let bounds = StopDistanceBounds::new(dec!(20), dec!(500)).unwrap();
+        let config = RiskConfig::new(dec!(10000)).unwrap().with_stop_distance_bounds(bounds);
+        assert_eq!(config.stop_distance_bounds(), bounds);
+        // Default construction preserves the historical 0.1%-10% behavior.
+        let default_config = RiskConfig::new(dec!(10000)).unwrap();
+        assert_eq!(default_config.stop_distance_bounds(), StopDistanceBounds::default());
+    }
 
     // Price tests
     #[test]

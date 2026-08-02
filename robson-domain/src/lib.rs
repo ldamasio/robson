@@ -39,5 +39,6 @@ pub use policy::{
     TechStopConfig, TradingPolicy,
 };
 pub use value_objects::{
-    DomainError, OrderSide, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance,
+    DomainError, OrderSide, Price, Quantity, RiskConfig, Side, StopDistanceBounds, Symbol,
+    TechnicalStopDistance,
 };

@@ -101,15 +101,23 @@ pub struct DetectorConfig {
 impl DetectorConfig {
     /// Create detector config from an armed position.
     ///
-    /// Uses default MA periods (9/21) and chart-derived technical stop config.
+    /// Uses default MA periods (9/21) and default technical stop config.
+    /// Runtime callers must prefer [`Self::from_position_with_policy`] with
+    /// the daemon's configured stop bounds (ADR-0050 §5, issue #148).
     pub fn from_position(position: &Position) -> DaemonResult<Self> {
-        Self::from_position_with_policy(position, EntryPolicyConfig::default())
+        Self::from_position_with_policy(
+            position,
+            EntryPolicyConfig::default(),
+            TechnicalStopConfig::default(),
+        )
     }
 
-    /// Create detector config from an armed position and explicit entry policy.
+    /// Create detector config from an armed position, explicit entry policy,
+    /// and the daemon-configured technical stop config (single bounds source).
     pub fn from_position_with_policy(
         position: &Position,
         entry_policy: EntryPolicyConfig,
+        technical_stop_config: TechnicalStopConfig,
     ) -> DaemonResult<Self> {
         if !position.can_enter() {
             return Err(DaemonError::InvalidPositionState {
@@ -124,7 +132,7 @@ impl DetectorConfig {
             side: position.side,
             ma_fast_period: 9,  // Default fast MA
             ma_slow_period: 21, // Default slow MA
-            technical_stop_config: TechnicalStopConfig::default(),
+            technical_stop_config,
             entry_policy,
         })
     }
@@ -279,22 +287,28 @@ impl DetectorTask {
         Self::from_position_with_policy(
             position,
             EntryPolicyConfig::default(),
+            TechnicalStopConfig::default(),
             event_bus,
             ohlcv_port,
             cancel_token,
         )
     }
 
-    /// Create detector directly from an armed position and explicit entry
-    /// policy.
+    /// Create detector directly from an armed position, explicit entry
+    /// policy, and the daemon-configured technical stop config.
     pub fn from_position_with_policy(
         position: &Position,
         entry_policy: EntryPolicyConfig,
+        technical_stop_config: TechnicalStopConfig,
         event_bus: Arc<EventBus>,
         ohlcv_port: Arc<dyn OhlcvPort>,
         cancel_token: CancellationToken,
     ) -> DaemonResult<Self> {
-        let config = DetectorConfig::from_position_with_policy(position, entry_policy)?;
+        let config = DetectorConfig::from_position_with_policy(
+            position,
+            entry_policy,
+            technical_stop_config,
+        )?;
         Ok(Self::new(config, event_bus, ohlcv_port, cancel_token))
     }
 
