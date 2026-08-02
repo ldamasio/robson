@@ -109,6 +109,18 @@ pub(crate) enum ReconcileCloseOutcome {
     RejectedInconsistentEvidence { field: &'static str },
 }
 
+/// Terminal entry rejection for an Armed position in `needs_operator_rearm`
+/// (ADR-0050 §2/§7).
+#[derive(Debug, Clone)]
+pub struct EntryRejectionRecord {
+    /// Machine-readable rejection code.
+    pub reason_code: String,
+    /// Human-readable rejection detail with the numbers involved.
+    pub reason: String,
+    /// When the attempt was exhausted.
+    pub rejected_at: chrono::DateTime<chrono::Utc>,
+}
+
 /// Manages position lifecycle and detector tasks.
 pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// Trading engine (Mutex for interior mutability: arm updates RiskConfig)
@@ -149,6 +161,11 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// exit orders for these and poll for the stop's fill evidence until
     /// reverse reconciliation closes the book position.
     exit_overtaken_suspects: Arc<RwLock<HashSet<PositionId>>>,
+    /// Armed positions whose entry attempt exhausted its autonomy
+    /// (ADR-0050 §2 `needs_operator_rearm`). No detector runs for them and
+    /// none is restored at startup; the operator disarms or arms anew.
+    /// Rebuilt from `entry_attempt_exhausted` eventlog events on restart.
+    entry_exhausted: Arc<RwLock<HashMap<PositionId, EntryRejectionRecord>>>,
     /// Pending approvals held in runtime memory for Phase 3.
     pending_approvals: Arc<RwLock<HashMap<Uuid, PendingApprovalRecord>>>,
     /// Serializes entry-governance flows so pending reservations remain
@@ -647,6 +664,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             stop_invalidation_guard_enabled: false,
             stop_invalidation_lookback_candles: 20,
             exit_overtaken_suspects: Arc::new(RwLock::new(HashSet::new())),
+            entry_exhausted: Arc::new(RwLock::new(HashMap::new())),
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
             entry_flow_lock: Mutex::new(()),
             query_engine,
@@ -1182,6 +1200,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         position: &Position,
         reason: &'static str,
     ) {
+        // ADR-0050 §2: a position in needs_operator_rearm never re-arms
+        // autonomously.
+        if self.is_entry_exhausted(position_id).await {
+            warn!(
+                %position_id,
+                %reason,
+                "Skipping governed re-arm: position needs operator re-arm (ADR-0050)"
+            );
+            return;
+        }
         // Exponential backoff on consecutive governed blocks. Without it, an
         // Immediate-mode re-arm refires instantly and a persistent governed
         // condition (no slots, margin, pending duplicate) becomes a ~1/s hot
@@ -2047,6 +2075,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     pub async fn disarm_position(&self, position_id: PositionId) -> DaemonResult<()> {
         let _entry_flow_guard = self.entry_flow_lock.lock().await;
 
+        // A disarm resolves any terminal needs_operator_rearm record
+        // (ADR-0050 §2): the operator acted.
+        self.clear_entry_exhausted(position_id).await;
+
         // Create query for lifecycle tracking
         let mut query =
             ExecutionQuery::new(QueryKind::DisarmPosition { position_id }, Self::operator_actor());
@@ -2219,6 +2251,123 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// Handle a detector signal (entry signal received).
     ///
     /// Flow: Engine → Execute actions (emit events) → Save state → Process fill
+    /// Mark an Armed position `needs_operator_rearm` (ADR-0050 §2): persist
+    /// the durable `entry_attempt_exhausted` audit event, record the
+    /// rejection for API surfacing, and publish the public SSE event. No
+    /// detector runs for the position afterwards.
+    pub async fn mark_entry_exhausted(
+        &self,
+        position_id: PositionId,
+        signal_id: Option<Uuid>,
+        reason_code: &str,
+        reason: &str,
+    ) -> DaemonResult<()> {
+        let now = chrono::Utc::now();
+        let event = Event::EntryAttemptExhausted {
+            position_id,
+            signal_id,
+            reason_code: reason_code.to_string(),
+            reason: reason.to_string(),
+            timestamp: now,
+        };
+        // Persist first, but never lose the in-memory record on a persistence
+        // failure: without it the position would go silently inert, the exact
+        // defect ADR-0050 eliminates. The error still propagates.
+        let persist_result = self.execute_and_persist(vec![EngineAction::EmitEvent(event)]).await;
+
+        self.entry_exhausted.write().await.insert(position_id, EntryRejectionRecord {
+            reason_code: reason_code.to_string(),
+            reason: reason.to_string(),
+            rejected_at: now,
+        });
+
+        warn!(
+            %position_id,
+            reason_code,
+            reason,
+            "Entry attempt exhausted; position needs operator re-arm (ADR-0050)"
+        );
+        self.event_bus.send(DaemonEvent::EntryRejected {
+            position_id,
+            reason_code: reason_code.to_string(),
+            reason: reason.to_string(),
+            terminal: true,
+            rejected_at: now,
+        });
+        persist_result.map(|_| ())
+    }
+
+    /// Rebuild the `needs_operator_rearm` record from a persisted
+    /// `entry_attempt_exhausted` event at startup, without re-emitting
+    /// events (ADR-0050 §6: durable across restarts).
+    pub async fn restore_entry_exhausted(
+        &self,
+        position_id: PositionId,
+        reason_code: String,
+        reason: String,
+        rejected_at: chrono::DateTime<chrono::Utc>,
+    ) {
+        self.entry_exhausted.write().await.insert(position_id, EntryRejectionRecord {
+            reason_code,
+            reason,
+            rejected_at,
+        });
+    }
+
+    /// The last terminal rejection for a position, when it is in
+    /// `needs_operator_rearm` (ADR-0050 §7 surfacing).
+    pub async fn entry_exhaustion(&self, position_id: PositionId) -> Option<EntryRejectionRecord> {
+        self.entry_exhausted.read().await.get(&position_id).cloned()
+    }
+
+    /// True when the position must NOT have a detector restored or re-armed.
+    pub async fn is_entry_exhausted(&self, position_id: PositionId) -> bool {
+        self.entry_exhausted.read().await.contains_key(&position_id)
+    }
+
+    /// Clear the terminal record (position disarmed or closed).
+    pub(crate) async fn clear_entry_exhausted(&self, position_id: PositionId) {
+        self.entry_exhausted.write().await.remove(&position_id);
+    }
+
+    /// Per-policy handling of a domain-validation rejection of an entry
+    /// signal (ADR-0050 §2). Immediate exhausts (terminal, operator re-arm);
+    /// strategy modes re-arm the detector under governed backoff, requiring
+    /// a fresh trigger by construction.
+    async fn handle_signal_domain_rejection(
+        &self,
+        position: &Position,
+        signal: &DetectorSignal,
+        error_text: &str,
+    ) -> DaemonResult<()> {
+        let policy = self.entry_policy_for_position(position.id).await;
+        if policy.mode == EntryPolicy::Immediate {
+            self.mark_entry_exhausted(
+                position.id,
+                Some(signal.signal_id),
+                "signal_domain_rejection",
+                error_text,
+            )
+            .await?;
+        } else {
+            let now = chrono::Utc::now();
+            self.event_bus.send(DaemonEvent::EntryRejected {
+                position_id: position.id,
+                reason_code: "signal_domain_rejection".to_string(),
+                reason: error_text.to_string(),
+                terminal: false,
+                rejected_at: now,
+            });
+            self.rearm_detector_after_governed_block(
+                position.id,
+                position,
+                "signal domain rejection",
+            )
+            .await;
+        }
+        Ok(())
+    }
+
     pub async fn handle_signal(&self, signal: DetectorSignal) -> DaemonResult<()> {
         let _entry_flow_guard = self.entry_flow_lock.lock().await;
         let position_id = signal.position_id;
@@ -2363,6 +2512,18 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         };
         let decision = match decision {
             Ok(d) => d,
+            Err(robson_engine::EngineError::DomainError(domain_error)) => {
+                // ADR-0050 §2: a domain-validation rejection is a governed
+                // outcome, not an operational failure. Record it on the
+                // query, resolve it per entry policy (terminal for
+                // Immediate, governed re-arm for strategy modes), and
+                // return Ok so no opaque 500/ERROR surfaces.
+                let error_text = domain_error.to_string();
+                query.fail(error_text.clone(), "processing".to_string());
+                self.record_query_failure(&query).await?;
+                self.handle_signal_domain_rejection(&position, &signal, &error_text).await?;
+                return Ok(());
+            },
             Err(e) => {
                 query.fail(format!("{}", e), "processing".to_string());
                 self.record_query_failure(&query).await?;
@@ -4433,6 +4594,135 @@ mod tests {
 
         let unchanged = manager.get_position(position.id).await.unwrap().unwrap();
         assert!(matches!(unchanged.state, PositionState::Active { .. }));
+    }
+
+    /// Save a bare Armed position directly to the store with an explicit
+    /// entry policy, bypassing arm-time detector spawning so tests control
+    /// the signal flow deterministically.
+    async fn save_armed_position_with_policy(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        symbol: &str,
+        side: Side,
+        policy: EntryPolicyConfig,
+    ) -> Position {
+        let symbol = Symbol::from_pair(symbol).unwrap();
+        let position = Position::new(Uuid::now_v7(), symbol, side);
+        manager.store.positions().save(&position).await.unwrap();
+        manager.entry_policies.write().await.insert(position.id, policy);
+        position
+    }
+
+    /// ADR-0050 §2: an Immediate-mode signal rejected by domain validation
+    /// (stop too tight) terminates in needs_operator_rearm: durable audit
+    /// event, no re-arm, no error surfaced.
+    #[tokio::test]
+    async fn test_immediate_domain_rejection_needs_operator_rearm() {
+        use robson_domain::ApprovalPolicy as DomainApprovalPolicy;
+        let manager = create_test_manager().await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let policy =
+            EntryPolicyConfig::new(EntryPolicy::Immediate, DomainApprovalPolicy::Automatic);
+        let position =
+            save_armed_position_with_policy(&manager, "BTCUSDT", Side::Long, policy).await;
+
+        // Stop 0.05% below entry: below the 0.1% minimum bound.
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol,
+            side: Side::Long,
+            entry_price: Price::new(dec!(100)).unwrap(),
+            stop_loss: Price::new(dec!(99.95)).unwrap(),
+            technical_stop_analysis: None,
+            timestamp: chrono::Utc::now(),
+        };
+
+        let result = manager.handle_signal(signal).await;
+        assert!(result.is_ok(), "domain rejection must be a governed outcome: {result:?}");
+
+        assert!(manager.is_entry_exhausted(position.id).await);
+        let rejection = manager.entry_exhaustion(position.id).await.unwrap();
+        assert_eq!(rejection.reason_code, "signal_domain_rejection");
+        assert!(rejection.reason.contains("Stop too tight"), "got: {}", rejection.reason);
+
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert!(
+            events.iter().any(|event| matches!(event, Event::EntryAttemptExhausted { .. })),
+            "durable entry_attempt_exhausted event must be persisted"
+        );
+
+        // Position remains Armed (state untouched) but flagged.
+        let updated = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(updated.state, PositionState::Armed));
+    }
+
+    /// ADR-0050 §2: strategy modes re-arm the detector under governed
+    /// backoff on a domain rejection; no terminal record is created.
+    #[tokio::test]
+    async fn test_strategy_mode_domain_rejection_rearms() {
+        use robson_domain::ApprovalPolicy as DomainApprovalPolicy;
+        let manager = create_test_manager().await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let policy =
+            EntryPolicyConfig::new(EntryPolicy::ConfirmedTrend, DomainApprovalPolicy::Automatic);
+        let position =
+            save_armed_position_with_policy(&manager, "BTCUSDT", Side::Long, policy).await;
+
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol,
+            side: Side::Long,
+            entry_price: Price::new(dec!(100)).unwrap(),
+            stop_loss: Price::new(dec!(99.95)).unwrap(),
+            technical_stop_analysis: None,
+            timestamp: chrono::Utc::now(),
+        };
+
+        let result = manager.handle_signal(signal).await;
+        assert!(result.is_ok(), "domain rejection must be a governed outcome: {result:?}");
+
+        assert!(!manager.is_entry_exhausted(position.id).await);
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert!(
+            !events.iter().any(|event| matches!(event, Event::EntryAttemptExhausted { .. })),
+            "strategy modes must not create the terminal record"
+        );
+        assert!(
+            *manager.governed_rearm_counts.read().await.get(&position.id).unwrap_or(&0) >= 1,
+            "governed re-arm backoff must be scheduled"
+        );
+    }
+
+    /// Disarm resolves needs_operator_rearm; governed re-arm is refused
+    /// while the record exists.
+    #[tokio::test]
+    async fn test_disarm_clears_needs_operator_rearm() {
+        let manager = create_test_manager().await;
+        let position = save_armed_position_with_policy(
+            &manager,
+            "BTCUSDT",
+            Side::Long,
+            EntryPolicyConfig::default(),
+        )
+        .await;
+
+        manager
+            .mark_entry_exhausted(position.id, None, "no_valid_signal", "test reason")
+            .await
+            .unwrap();
+        assert!(manager.is_entry_exhausted(position.id).await);
+
+        // Governed re-arm is refused while terminal.
+        let loaded = manager.get_position(position.id).await.unwrap().unwrap();
+        manager.rearm_detector_after_governed_block(position.id, &loaded, "test").await;
+        assert!(
+            !manager.detectors.read().await.contains_key(&position.id),
+            "no detector may spawn for a needs_operator_rearm position"
+        );
+
+        manager.disarm_position(position.id).await.unwrap();
+        assert!(!manager.is_entry_exhausted(position.id).await);
     }
 
     #[tokio::test]

@@ -93,6 +93,23 @@ pub enum Event {
         timestamp: DateTime<Utc>,
     },
 
+    /// An entry attempt was rejected by domain validation and, under the
+    /// position's entry policy, exhausted its autonomy: the position now
+    /// requires an explicit operator re-arm (ADR-0050 §2, terminal
+    /// `needs_operator_rearm`). Audit-only: position state is unchanged.
+    EntryAttemptExhausted {
+        /// Position identifier
+        position_id: PositionId,
+        /// Signal that triggered the rejected attempt, when one was emitted
+        signal_id: Option<uuid::Uuid>,
+        /// Machine-readable rejection code (e.g. `no_valid_stop`)
+        reason_code: String,
+        /// Human-readable rejection detail with the numbers involved
+        reason: String,
+        /// When the attempt was exhausted
+        timestamp: DateTime<Utc>,
+    },
+
     /// Detector fired entry signal
     EntrySignalReceived {
         /// Position identifier
@@ -492,6 +509,7 @@ impl Event {
     pub fn position_id(&self) -> PositionId {
         match self {
             Event::PositionArmed { position_id, .. }
+            | Event::EntryAttemptExhausted { position_id, .. }
             | Event::EntryPolicyResolved { position_id, .. }
             | Event::SignalStrategyEvaluated { position_id, .. }
             | Event::TechnicalStopAnalyzed { position_id, .. }
@@ -526,6 +544,7 @@ impl Event {
     pub fn timestamp(&self) -> DateTime<Utc> {
         match self {
             Event::PositionArmed { timestamp, .. }
+            | Event::EntryAttemptExhausted { timestamp, .. }
             | Event::EntryPolicyResolved { timestamp, .. }
             | Event::SignalStrategyEvaluated { timestamp, .. }
             | Event::TechnicalStopAnalyzed { timestamp, .. }
@@ -559,6 +578,7 @@ impl Event {
     pub fn event_type(&self) -> &'static str {
         match self {
             Event::PositionArmed { .. } => "position_armed",
+            Event::EntryAttemptExhausted { .. } => "entry_attempt_exhausted",
             Event::EntryPolicyResolved { .. } => "entry_policy_resolved",
             Event::SignalStrategyEvaluated { .. } => "signal_strategy_evaluated",
             Event::TechnicalStopAnalyzed { .. } => "technical_stop_analyzed",

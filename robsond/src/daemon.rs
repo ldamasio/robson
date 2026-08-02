@@ -1532,6 +1532,62 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
             let position_id = position.id;
             let stream_key = format!("position:{}", position_id);
 
+            // ADR-0050 §2/§6: a position with a persisted
+            // entry_attempt_exhausted event is in needs_operator_rearm.
+            // Rebuild the record and do NOT restore a detector; the state is
+            // durable across restarts and only an operator action resolves it.
+            match query_events(
+                pool,
+                QueryOptions::new(tenant_id)
+                    .stream(stream_key.clone())
+                    .event_type("entry_attempt_exhausted")
+                    .descending()
+                    .limit(1),
+            )
+            .await
+            {
+                Ok(events) => {
+                    if let Some(envelope) = events.first() {
+                        let (reason_code, reason) = match serde_json::from_value::<
+                            robson_domain::Event,
+                        >(
+                            envelope.payload.clone()
+                        ) {
+                            Ok(robson_domain::Event::EntryAttemptExhausted {
+                                reason_code,
+                                reason,
+                                ..
+                            }) => (reason_code, reason),
+                            _ => {
+                                ("unknown".to_string(), "unparseable historical event".to_string())
+                            },
+                        };
+                        warn!(
+                            %position_id,
+                            reason_code,
+                            "Skipping detector restore: position needs operator re-arm (ADR-0050)"
+                        );
+                        let manager = self.position_manager.read().await;
+                        manager
+                            .restore_entry_exhausted(
+                                position_id,
+                                reason_code,
+                                reason,
+                                envelope.occurred_at,
+                            )
+                            .await;
+                        continue;
+                    }
+                },
+                Err(e) => {
+                    warn!(
+                        %position_id,
+                        error = %e,
+                        "Eventlog query for entry_attempt_exhausted failed; restoring detector anyway"
+                    );
+                },
+            }
+
             // Read the most recent entry_policy_resolved event for this position
             // from the eventlog. Descending order so we get the latest one first.
             let events = match query_events(
@@ -1902,6 +1958,28 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
                     %detected_at,
                     "New income ledger items became unmatched anomalies past the evidence-lag grace period (ADR-0045)"
                 );
+            },
+
+            DaemonEvent::ImmediateEntryExhausted { position_id, reason, .. } => {
+                // ADR-0050 §2: an Immediate-mode detector ran out of
+                // proactive fire attempts. Persist the terminal
+                // needs_operator_rearm record; the manager emits the public
+                // EntryRejected event.
+                let manager = self.position_manager.read().await;
+                if let Err(error) = manager
+                    .mark_entry_exhausted(position_id, None, "no_valid_signal", &reason)
+                    .await
+                {
+                    error!(
+                        %position_id,
+                        %error,
+                        "Failed to persist entry_attempt_exhausted; record kept in memory only"
+                    );
+                }
+            },
+
+            DaemonEvent::EntryRejected { .. } => {
+                // Public surfacing event (SSE); no daemon-side action.
             },
         }
 

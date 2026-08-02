@@ -57,6 +57,25 @@ impl PublicSseEvent {
 /// to operator clients in the v2.5 SSE stream.
 pub(crate) fn map_daemon_event(event: &DaemonEvent) -> Option<PublicSseEvent> {
     match event {
+        DaemonEvent::EntryRejected {
+            position_id,
+            reason_code,
+            reason,
+            terminal,
+            rejected_at,
+        } => Some(PublicSseEvent::new(
+            "entry.rejected",
+            json!({
+                "position_id": position_id,
+                "reason_code": reason_code,
+                "reason": reason,
+                "terminal": terminal,
+                "rejected_at": rejected_at,
+            }),
+        )),
+        // Internal-only: the daemon converts it into the terminal record and
+        // emits the public EntryRejected event.
+        DaemonEvent::ImmediateEntryExhausted { .. } => None,
         DaemonEvent::PositionStateChanged {
             position_id,
             previous_state,

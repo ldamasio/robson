@@ -249,6 +249,21 @@ pub struct PositionSummary {
     pub pnl: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub variation_pct: Option<Decimal>,
+    /// `"needs_operator_rearm"` when the position's entry attempt exhausted
+    /// its autonomy (ADR-0050 §2); absent otherwise.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_status: Option<String>,
+    /// The terminal rejection behind `needs_operator_rearm` (ADR-0050 §7).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_rejection: Option<LastRejectionSummary>,
+}
+
+/// Terminal entry rejection surfaced with an Armed position (ADR-0050 §7).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct LastRejectionSummary {
+    pub reason_code: String,
+    pub reason: String,
+    pub rejected_at: chrono::DateTime<chrono::Utc>,
 }
 
 /// Reconciliation blocker surfaced by `/status`.
@@ -2357,7 +2372,19 @@ where
     );
 
     let stop_buffer_bps = manager.risk_config_snapshot().stop_buffer_bps();
-    position_to_summary(position, live_price, entry_mode, approval_mode, stop_buffer_bps)
+    let mut summary =
+        position_to_summary(position, live_price, entry_mode, approval_mode, stop_buffer_bps);
+    if matches!(position.state, PositionState::Armed) {
+        if let Some(rejection) = manager.entry_exhaustion(position.id).await {
+            summary.entry_status = Some("needs_operator_rearm".to_string());
+            summary.last_rejection = Some(LastRejectionSummary {
+                reason_code: rejection.reason_code,
+                reason: rejection.reason,
+                rejected_at: rejection.rejected_at,
+            });
+        }
+    }
+    summary
 }
 
 async fn position_to_summary_with_live_price_and_sync<E, S>(
@@ -2536,6 +2563,8 @@ fn position_to_summary(
         current_price,
         pnl,
         variation_pct,
+        entry_status: None,
+        last_rejection: None,
     }
 }
 
