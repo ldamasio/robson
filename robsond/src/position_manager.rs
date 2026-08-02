@@ -4079,6 +4079,10 @@ mod tests {
             },
             stop_anchor: None,
             stop_quality: None,
+            configured_level_n: Some(2),
+            selected_level_n: Some(2),
+            skipped_levels: vec![],
+            selection_rule: Some("anchor_n_walk_deeper".to_string()),
         }
     }
 

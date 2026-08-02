@@ -136,6 +136,36 @@ pub enum StopConfidence {
     Low,
 }
 
+/// Why a chart level was skipped by valid-level selection (ADR-0050 §1).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SkipReason {
+    /// Level distance is below the minimum stop distance bound.
+    BelowMin,
+    /// Level distance is above the maximum stop distance bound.
+    AboveMax,
+}
+
+impl SkipReason {
+    /// Stable snake_case identifier for audit payloads.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SkipReason::BelowMin => "below_min",
+            SkipReason::AboveMax => "above_max",
+        }
+    }
+}
+
+/// A chart level that selection considered and skipped (ADR-0050 §1 audit).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedLevel {
+    /// The skipped chart level.
+    pub level: Price,
+    /// Its distance from entry as a fraction (0.001 = 0.1%).
+    pub distance_fraction: Decimal,
+    /// Why it was skipped.
+    pub reason: SkipReason,
+}
+
 /// Result of technical stop analysis.
 ///
 /// Pass `stop_price` to `TechnicalStopDistance::new_validated(entry,
@@ -152,6 +182,19 @@ pub struct TechnicalStopAnalysis {
     /// All swing levels detected below (LONG) or above (SHORT) the entry,
     /// ordered by distance from entry ascending. Useful for audit trail.
     pub detected_levels: Vec<Price>,
+    /// The `support_level_n` the selection anchored at (ADR-0050 §1).
+    #[serde(default = "default_configured_level_n")]
+    pub configured_level_n: usize,
+    /// The 1-indexed level actually selected; `None` for the ATR fallback.
+    #[serde(default)]
+    pub selected_level_n: Option<usize>,
+    /// Levels considered and skipped during the anchor-N walk (ADR-0050 §1).
+    #[serde(default)]
+    pub skipped_levels: Vec<SkippedLevel>,
+}
+
+fn default_configured_level_n() -> usize {
+    2
 }
 
 // =============================================================================
@@ -266,41 +309,102 @@ impl TechnicalStopAnalyzer {
 
         // ── 6. Select the Nth level or fall back to ATR ───────────────────────
         let n = config.support_level_n;
+        let mut skipped_levels: Vec<SkippedLevel> = Vec::new();
+        let out_of_range = |stop_val: Decimal| TechnicalStopError::AtrStopOutOfRange {
+            stop_price: stop_val,
+            entry_price: entry_val,
+            min_pct: config.min_stop_distance_pct * dec!(100),
+            max_pct: config.max_stop_distance_pct * dec!(100),
+        };
+        let distance_fraction = |level: Decimal| {
+            if entry_val > Decimal::ZERO {
+                (level - entry_val).abs() / entry_val
+            } else {
+                Decimal::ZERO
+            }
+        };
 
         if ordered.len() >= n {
-            // Primary path: Nth support/resistance level
-            let stop_val = ordered[n - 1];
-            let stop_price =
-                Price::new(stop_val).map_err(|_| TechnicalStopError::AtrStopOutOfRange {
-                    stop_price: stop_val,
-                    entry_price: entry_val,
-                    min_pct: config.min_stop_distance_pct * dec!(100),
-                    max_pct: config.max_stop_distance_pct * dec!(100),
-                })?;
-            return Ok(TechnicalStopAnalysis {
-                stop_price,
-                method: TechnicalStopMethod::SwingPoint { level_n: n },
-                confidence: StopConfidence::High,
-                detected_levels,
-            });
-        }
+            // Primary path (ADR-0050 §1): anchor at the configured Nth level
+            // and walk DEEPER ONLY until the first level whose distance is
+            // within bounds. Never select a level shallower than N; a level
+            // above the maximum ends the walk (deeper levels are wider
+            // still). Every skip is recorded for the audit trail.
+            for (index, &level_val) in ordered.iter().enumerate().skip(n - 1) {
+                let fraction = distance_fraction(level_val);
+                if fraction < config.min_stop_distance_pct {
+                    if let Ok(level) = Price::new(level_val) {
+                        skipped_levels.push(SkippedLevel {
+                            level,
+                            distance_fraction: fraction,
+                            reason: SkipReason::BelowMin,
+                        });
+                    }
+                    continue;
+                }
+                if fraction > config.max_stop_distance_pct {
+                    if let Ok(level) = Price::new(level_val) {
+                        skipped_levels.push(SkippedLevel {
+                            level,
+                            distance_fraction: fraction,
+                            reason: SkipReason::AboveMax,
+                        });
+                    }
+                    break;
+                }
 
-        if !ordered.is_empty() {
-            // Degraded path: fewer levels than requested; use what we have
-            let stop_val = ordered[ordered.len() - 1];
-            let stop_price =
-                Price::new(stop_val).map_err(|_| TechnicalStopError::AtrStopOutOfRange {
-                    stop_price: stop_val,
-                    entry_price: entry_val,
-                    min_pct: config.min_stop_distance_pct * dec!(100),
-                    max_pct: config.max_stop_distance_pct * dec!(100),
-                })?;
-            return Ok(TechnicalStopAnalysis {
-                stop_price,
-                method: TechnicalStopMethod::SwingPoint { level_n: ordered.len() },
-                confidence: StopConfidence::Medium,
-                detected_levels,
-            });
+                let selected_level_n = index + 1;
+                let stop_price = Price::new(level_val).map_err(|_| out_of_range(level_val))?;
+                let confidence = if selected_level_n == n {
+                    StopConfidence::High
+                } else {
+                    // Anchor was skipped: a deeper (more conservative) level
+                    // carries the stop (ADR-0050 §1 downgrade).
+                    StopConfidence::Medium
+                };
+                return Ok(TechnicalStopAnalysis {
+                    stop_price,
+                    method: TechnicalStopMethod::SwingPoint { level_n: selected_level_n },
+                    confidence,
+                    detected_levels,
+                    configured_level_n: n,
+                    selected_level_n: Some(selected_level_n),
+                    skipped_levels,
+                });
+            }
+            // No in-bounds level at or beyond the anchor: fall through to the
+            // ATR fallback with the recorded skips.
+        } else if !ordered.is_empty() {
+            // Degraded path: fewer levels than requested; the deepest
+            // available level carries the stop only when it is in bounds
+            // (ADR-0050 §1 closes the previously unchecked path).
+            let index = ordered.len() - 1;
+            let level_val = ordered[index];
+            let fraction = distance_fraction(level_val);
+            if fraction >= config.min_stop_distance_pct && fraction <= config.max_stop_distance_pct
+            {
+                let stop_price = Price::new(level_val).map_err(|_| out_of_range(level_val))?;
+                return Ok(TechnicalStopAnalysis {
+                    stop_price,
+                    method: TechnicalStopMethod::SwingPoint { level_n: ordered.len() },
+                    confidence: StopConfidence::Medium,
+                    detected_levels,
+                    configured_level_n: n,
+                    selected_level_n: Some(ordered.len()),
+                    skipped_levels,
+                });
+            }
+            if let Ok(level) = Price::new(level_val) {
+                skipped_levels.push(SkippedLevel {
+                    level,
+                    distance_fraction: fraction,
+                    reason: if fraction < config.min_stop_distance_pct {
+                        SkipReason::BelowMin
+                    } else {
+                        SkipReason::AboveMax
+                    },
+                });
+            }
         }
 
         // ── 7. ATR fallback ───────────────────────────────────────────────────
@@ -340,6 +444,9 @@ impl TechnicalStopAnalyzer {
             method: TechnicalStopMethod::AtrFallback,
             confidence: StopConfidence::Low,
             detected_levels,
+            configured_level_n: n,
+            selected_level_n: None,
+            skipped_levels,
         })
     }
 }
@@ -701,5 +808,138 @@ mod tests {
         let default_bounds = robson_domain::StopDistanceBounds::default();
         assert_eq!(default_config.min_stop_distance_pct, default_bounds.min_fraction());
         assert_eq!(default_config.max_stop_distance_pct, default_bounds.max_fraction());
+    }
+
+    // ── ADR-0050 §1: anchor-N walk-deeper selection ────────────────────────
+
+    /// Config with a tiny cluster tolerance so closely spaced test levels
+    /// stay distinct, mirroring dense structure near price.
+    fn walk_test_config() -> TechnicalStopConfig {
+        TechnicalStopConfig {
+            level_tolerance: dec!(0.0001),
+            ..TechnicalStopConfig::default()
+        }
+    }
+
+    /// 100 base candles with swing lows injected at well-separated indices.
+    fn candles_with_swing_lows(base: Decimal, lows: &[Decimal]) -> Vec<Candle> {
+        let mut cs: Vec<Candle> = (0..100).map(|_| flat_candle(base)).collect();
+        for (i, &low) in lows.iter().enumerate() {
+            let idx = 30 + i * 10;
+            cs[idx] = candle(low, base, low, low);
+        }
+        cs
+    }
+
+    /// Anchor level in bounds: selection is unchanged (level N, High, no
+    /// skips) and the new audit fields are populated.
+    #[test]
+    fn anchor_in_bounds_selects_level_n_with_audit_fields() {
+        let cs = candles_with_swing_lows(dec!(100), &[dec!(99.5), dec!(99.0)]);
+        let entry = Price::new(dec!(100)).unwrap();
+        let result =
+            TechnicalStopAnalyzer::analyze(&cs, entry, Side::Long, &walk_test_config()).unwrap();
+
+        assert_eq!(result.method, TechnicalStopMethod::SwingPoint { level_n: 2 });
+        assert_eq!(result.confidence, StopConfidence::High);
+        assert_eq!(result.configured_level_n, 2);
+        assert_eq!(result.selected_level_n, Some(2));
+        assert!(result.skipped_levels.is_empty());
+    }
+
+    /// Regression for the 2026-08-02 production incident (#147): the anchor
+    /// level sits inside the minimum distance; selection must walk to the
+    /// next deeper in-bounds level instead of failing downstream, with the
+    /// skip audited and confidence downgraded.
+    #[test]
+    fn too_tight_anchor_walks_to_deeper_valid_level() {
+        // Long mirror of the short incident: level 1 = 0.05%, level 2
+        // (anchor) = 0.07% (too tight), level 3 = 0.5% (valid).
+        let cs = candles_with_swing_lows(dec!(100), &[dec!(99.95), dec!(99.93), dec!(99.5)]);
+        let entry = Price::new(dec!(100)).unwrap();
+        let result =
+            TechnicalStopAnalyzer::analyze(&cs, entry, Side::Long, &walk_test_config()).unwrap();
+
+        assert_eq!(result.method, TechnicalStopMethod::SwingPoint { level_n: 3 });
+        assert_eq!(result.stop_price.as_decimal(), dec!(99.5));
+        assert_eq!(result.confidence, StopConfidence::Medium, "skip downgrades confidence");
+        assert_eq!(result.configured_level_n, 2);
+        assert_eq!(result.selected_level_n, Some(3));
+        assert_eq!(result.skipped_levels.len(), 1);
+        assert_eq!(result.skipped_levels[0].level.as_decimal(), dec!(99.93));
+        assert_eq!(result.skipped_levels[0].reason, SkipReason::BelowMin);
+    }
+
+    /// Every level at or beyond the anchor too tight and no usable ATR:
+    /// analysis fails (slice 3 maps this to the per-policy no-valid-stop
+    /// outcome) instead of emitting an invalid stop.
+    #[test]
+    fn all_levels_too_tight_without_atr_fails() {
+        let cs = candles_with_swing_lows(dec!(100), &[dec!(99.97), dec!(99.95)]);
+        let entry = Price::new(dec!(100)).unwrap();
+        let result = TechnicalStopAnalyzer::analyze(&cs, entry, Side::Long, &walk_test_config());
+        assert!(
+            matches!(result, Err(TechnicalStopError::AtrStopOutOfRange { .. })),
+            "expected out-of-range failure, got {result:?}"
+        );
+    }
+
+    /// Anchor above the maximum: the walk must NOT retreat to the shallower
+    /// level 1; with flat candles (no ATR) the analysis fails.
+    #[test]
+    fn anchor_above_max_never_retreats_to_shallower_level() {
+        // Level 1 = 5% (in bounds but shallower than the anchor), level 2
+        // (anchor) = 15% (above max).
+        let cs = candles_with_swing_lows(dec!(100), &[dec!(95), dec!(85)]);
+        let entry = Price::new(dec!(100)).unwrap();
+        let result = TechnicalStopAnalyzer::analyze(&cs, entry, Side::Long, &walk_test_config());
+        assert!(
+            matches!(result, Err(TechnicalStopError::AtrStopOutOfRange { .. })),
+            "selection must not fall back to a level shallower than the anchor, got {result:?}"
+        );
+    }
+
+    /// Degraded path (fewer than N levels): the deepest available level is
+    /// bounds-checked now; a too-tight single level no longer produces an
+    /// invalid stop.
+    #[test]
+    fn degraded_path_bounds_checks_the_deepest_level() {
+        let cs = candles_with_swing_lows(dec!(100), &[dec!(99.95)]);
+        let entry = Price::new(dec!(100)).unwrap();
+        let result = TechnicalStopAnalyzer::analyze(&cs, entry, Side::Long, &walk_test_config());
+        assert!(
+            matches!(result, Err(TechnicalStopError::AtrStopOutOfRange { .. })),
+            "too-tight degraded level must not be emitted, got {result:?}"
+        );
+
+        // A single in-bounds level still works (existing degraded behavior).
+        let cs = candles_with_swing_lows(dec!(100), &[dec!(99.0)]);
+        let result =
+            TechnicalStopAnalyzer::analyze(&cs, entry, Side::Long, &walk_test_config()).unwrap();
+        assert_eq!(result.method, TechnicalStopMethod::SwingPoint { level_n: 1 });
+        assert_eq!(result.confidence, StopConfidence::Medium);
+        assert_eq!(result.selected_level_n, Some(1));
+    }
+
+    /// Short side walk: the incident's actual direction. Anchor resistance
+    /// too close above entry walks to the deeper (higher) valid level.
+    #[test]
+    fn short_side_too_tight_anchor_walks_up() {
+        // Swing highs above entry 100: 100.05 (level 1), 100.07 (anchor,
+        // too tight), 100.5 (valid).
+        let mut cs: Vec<Candle> = (0..100).map(|_| flat_candle(dec!(100))).collect();
+        for (i, high) in [dec!(100.05), dec!(100.07), dec!(100.5)].iter().enumerate() {
+            let idx = 30 + i * 10;
+            cs[idx] = candle(*high, *high, dec!(100), *high);
+        }
+        let entry = Price::new(dec!(100)).unwrap();
+        let result =
+            TechnicalStopAnalyzer::analyze(&cs, entry, Side::Short, &walk_test_config()).unwrap();
+
+        assert_eq!(result.method, TechnicalStopMethod::SwingPoint { level_n: 3 });
+        assert_eq!(result.stop_price.as_decimal(), dec!(100.5));
+        assert_eq!(result.confidence, StopConfidence::Medium);
+        assert_eq!(result.skipped_levels.len(), 1);
+        assert_eq!(result.skipped_levels[0].reason, SkipReason::BelowMin);
     }
 }

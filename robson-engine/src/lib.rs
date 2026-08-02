@@ -2458,6 +2458,10 @@ mod tests {
             },
             stop_anchor: None,
             stop_quality: None,
+            configured_level_n: None,
+            selected_level_n: None,
+            skipped_levels: vec![],
+            selection_rule: None,
         }
     }
 
