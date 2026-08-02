@@ -27,11 +27,13 @@ use axum::{
     routing::{delete, get, post},
     Json, Router,
 };
-use chrono::{Datelike, Duration as ChronoDuration, Utc};
+use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, Utc};
 use robson_domain::{
     ApprovalPolicy as DomainApprovalPolicy, DetectorSignal, EntryPolicy, EntryPolicyConfig,
     Position, PositionState, Price, Side, Symbol, TradingPolicy,
 };
+#[cfg(feature = "postgres")]
+use robson_eventlog::{query_events, QueryOptions};
 use robson_exec::{ExchangePort, ExchangePosition, UniversalTransferType};
 #[cfg(feature = "postgres")]
 use robson_store::find_positions_overlapping_month;
@@ -185,6 +187,22 @@ pub struct MonthlyPositionsResponse {
     pub slot_cells_total: usize,
 }
 
+/// Durable audit events for one UTC calendar day, newest first.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EventHistoryResponse {
+    pub date: String,
+    pub events: Vec<EventHistoryItem>,
+}
+
+/// Operator-facing subset of a durable event-log envelope.
+#[derive(Debug, Serialize, Deserialize)]
+pub struct EventHistoryItem {
+    pub event_id: Uuid,
+    pub event_type: String,
+    pub occurred_at: chrono::DateTime<chrono::Utc>,
+    pub payload: serde_json::Value,
+}
+
 /// Summary of a position.
 #[derive(Debug, Serialize, Deserialize)]
 pub struct PositionSummary {
@@ -255,6 +273,11 @@ pub struct PendingApprovalSummary {
 #[derive(Debug, Deserialize)]
 struct MonthQuery {
     month: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct EventHistoryQuery {
+    date: String,
 }
 
 /// Entry policy sub-object for `ArmRequest`.
@@ -558,8 +581,8 @@ pub struct BinancePositionInfo {
 
 /// Create the API router.
 ///
-/// Read-only routes are mounted without authentication.
-/// Mutating routes are wrapped in a bearer-token auth middleware.
+/// Public read-only routes are mounted without authentication.
+/// Operator-sensitive and mutating routes use bearer-token authentication.
 pub fn create_router<E, S>(state: Arc<ApiState<E, S>>) -> Router
 where
     E: ExchangePort + 'static,
@@ -584,7 +607,7 @@ where
         .route("/monthly-halt", get(monthly_halt_status_handler))
         .with_state(state.clone());
 
-    // Mutating routes — bearer token required
+    // Operator-sensitive and mutating routes — bearer token required
     let token = state.api_token.clone();
     let auth_layer = axum::middleware::from_fn(move |req: Request, next: Next| {
         let expected = token.clone();
@@ -623,9 +646,11 @@ where
             }
         }
     });
-    let mutating = Router::new()
+    let authenticated = Router::new()
         // SSE — authenticated via Bearer header (not query param)
         .route("/events", get(events_handler))
+        // Durable event bootstrap for the operator dashboard.
+        .route("/events/history", get(event_history_handler))
         .route("/positions", post(arm_handler))
         .route("/positions/:id", delete(cancel_or_close_handler))
         .route("/positions/:id/signal", post(signal_handler))
@@ -649,7 +674,7 @@ where
         .layer(auth_layer)
         .with_state(state);
 
-    read_only.merge(mutating).layer(build_cors_layer())
+    read_only.merge(authenticated).layer(build_cors_layer())
 }
 
 // =============================================================================
@@ -1170,6 +1195,95 @@ async fn health_handler() -> Json<HealthResponse> {
         status: "healthy".to_string(),
         version: env!("CARGO_PKG_VERSION").to_string(),
     })
+}
+
+const EVENT_HISTORY_LIMIT: i64 = 100;
+
+fn utc_day_bounds(
+    date: &str,
+) -> Result<(NaiveDate, chrono::DateTime<Utc>, chrono::DateTime<Utc>), &'static str> {
+    let day = NaiveDate::parse_from_str(date, "%Y-%m-%d")
+        .map_err(|_| "date must be a valid UTC day in YYYY-MM-DD format")?;
+    let next_day = day.succ_opt().ok_or("date is outside the supported range")?;
+    let from = day.and_hms_opt(0, 0, 0).ok_or("date is outside the supported range")?.and_utc();
+    let to = next_day
+        .and_hms_opt(0, 0, 0)
+        .ok_or("date is outside the supported range")?
+        .and_utc();
+    Ok((day, from, to))
+}
+
+/// Return the newest durable audit events for one UTC calendar day.
+async fn event_history_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    Query(query): Query<EventHistoryQuery>,
+) -> impl IntoResponse
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let (day, from, to) = match utc_day_bounds(&query.date) {
+        Ok(bounds) => bounds,
+        Err(error) => {
+            return (StatusCode::BAD_REQUEST, Json(ErrorResponse { error: error.to_string() }))
+                .into_response();
+        },
+    };
+
+    #[cfg(feature = "postgres")]
+    {
+        let (Some(pool), Some(tenant_id)) = (&state.pg_pool, state.tenant_id) else {
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "event history is unavailable".to_string(),
+                }),
+            )
+                .into_response();
+        };
+
+        let options = QueryOptions::new(tenant_id)
+            .time_range(from, to)
+            .limit(EVENT_HISTORY_LIMIT)
+            .descending();
+        let envelopes = match query_events(pool.as_ref(), options).await {
+            Ok(events) => events,
+            Err(error) => {
+                warn!(%error, %tenant_id, %day, "Failed to query event history");
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(ErrorResponse {
+                        error: "failed to load event history".to_string(),
+                    }),
+                )
+                    .into_response();
+            },
+        };
+        let events = envelopes
+            .into_iter()
+            .map(|event| EventHistoryItem {
+                event_id: event.event_id,
+                event_type: event.event_type,
+                occurred_at: event.occurred_at,
+                payload: event.payload,
+            })
+            .collect();
+
+        return (StatusCode::OK, Json(EventHistoryResponse { date: day.to_string(), events }))
+            .into_response();
+    }
+
+    #[cfg(not(feature = "postgres"))]
+    {
+        let _ = (state, day, from, to, EVENT_HISTORY_LIMIT);
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(ErrorResponse {
+                error: "event history is unavailable".to_string(),
+            }),
+        )
+            .into_response()
+    }
 }
 
 /// Stream public operator events over Server-Sent Events.
@@ -3457,6 +3571,53 @@ mod tests {
     //
     //     assert_eq!(response.status(), StatusCode::NOT_FOUND);
     // }
+
+    #[test]
+    fn test_event_history_uses_utc_calendar_day_bounds() {
+        let (day, from, to) = utc_day_bounds("2026-08-01").unwrap();
+
+        assert_eq!(day.to_string(), "2026-08-01");
+        assert_eq!(from.to_rfc3339(), "2026-08-01T00:00:00+00:00");
+        assert_eq!(to.to_rfc3339(), "2026-08-02T00:00:00+00:00");
+        assert!(utc_day_bounds("2026-02-30").is_err());
+    }
+
+    #[tokio::test]
+    async fn test_event_history_returns_503_without_event_log() {
+        let (app, _, _) = create_test_app_with_event_bus(100).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/events/history?date=2026-08-01")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json, serde_json::json!({ "error": "event history is unavailable" }));
+    }
+
+    #[tokio::test]
+    async fn test_event_history_rejects_an_invalid_date() {
+        let (app, _, _) = create_test_app_with_event_bus(100).await;
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/events/history?date=2026-02-30")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 
     #[tokio::test]
     async fn test_events_endpoint_returns_sse_headers_and_frame() {

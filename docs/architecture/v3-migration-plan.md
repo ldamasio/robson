@@ -605,10 +605,13 @@ interface EventStreamMessage {
 }
 ```
 
-**Current endpoint**: `GET /events`
+**Current endpoints**:
+- `GET /events` for the ephemeral SSE projection
+- Authenticated `GET /events/history?date=YYYY-MM-DD` for at most the newest 100 durable audit events in one UTC calendar day
 
 **Current behavior**:
 - REST remains the bootstrap path for snapshots (`/status`, `/positions`, etc.)
+- The dashboard bootstraps today's durable audit events from `/events/history` and merges them by `event_id` with the live stream
 - SSE carries incremental operator-facing updates only
 - Public stream is mapped from internal daemon events; it does NOT expose `DaemonEvent` directly
 - QE-P3 adds approval observability on the same stream via

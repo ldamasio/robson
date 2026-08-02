@@ -83,7 +83,7 @@ docs/
 
 **Query Engine** — Every state transition passes through a lifecycle-tracked `ExecutionQuery`: `Accepted → Processing → RiskChecked → Acting → Completed / Denied / Failed`. Denials are governed outcomes, not errors.
 
-**Event Stream** — All domain events are persisted and broadcast via SSE. The dashboard updates in real time.
+**Event Stream** — All domain events are persisted in the canonical event log. A narrow public SSE projection carries incremental runtime updates, while an authenticated REST bootstrap supplies durable events for the dashboard's current UTC day.
 
 ## API
 
@@ -100,7 +100,8 @@ GET  /monthly-halt                    # Monthly halt status
 POST /monthly-halt                    # Trigger halt manually (kill switch)
 POST /panic                           # Emergency close all open positions
 GET  /safety/status                   # Reconciliation worker status
-GET  /events                          # SSE event stream (bearer token via query param)
+GET  /events/history?date=YYYY-MM-DD  # Latest 100 durable events for a UTC day (bearer header)
+GET  /events                          # SSE event stream (bearer header)
 ```
 
 ## Development

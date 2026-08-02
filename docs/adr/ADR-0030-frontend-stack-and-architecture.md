@@ -101,7 +101,7 @@ Options evaluated:
 ### A1.3 Token handling rules
 
 - Token stored in `sessionStorage` under key `robson_api_token`. Scope per tab. Cleared on close.
-- Token transmitted as `Authorization: Bearer <token>` on REST calls; for SSE `/events`, passed as query param (EventSource cannot set headers).
+- Token transmitted as `Authorization: Bearer <token>` on REST calls and the SSE `/events` fetch. The frontend uses a fetch-based SSE client because native `EventSource` cannot set the header.
 - Token MUST NOT be logged, echoed, printed, or committed.
 - Token MUST NOT be stored in `localStorage` (persists across tabs and windows; larger attack surface).
 - Login page validates the token by calling `GET /health` with the `Authorization` header; rejects on non-2xx.
@@ -148,4 +148,3 @@ FE-P4 multi-tenant OAuth no longer assumes a Cloudflare Worker callback. Either 
 ### A2.5 Withdrawn pending decision
 
 Removed from "Pending decisions": "TLS strategy for MVP (Contabo mismatch vs Cloudflare from day 1)". Resolved by ADR-0033 — Traefik ingress + cert-manager, no Cloudflare.
-

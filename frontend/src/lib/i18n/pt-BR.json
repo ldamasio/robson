@@ -40,6 +40,8 @@
     "noActive": "Nenhuma posição ativa.",
     "todayEventsLabel": "EVENTOS DE HOJE",
     "noEventsToday": "Nenhum evento hoje.",
+    "loadingEvents": "Carregando eventos de hoje...",
+    "eventsLoadError": "Não foi possível carregar os eventos de hoje.",
     "connecting": "CONECTANDO...",
     "offline": "OFFLINE",
     "connectionError": "ERRO DE CONEXÃO",

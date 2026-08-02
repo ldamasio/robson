@@ -15,7 +15,7 @@
   } from "$api/robson";
   import { activePositions } from "$stores/operations";
   import { haltStatus } from "$stores/slots";
-  import { recentEvents, pushEvent } from "$stores/events";
+  import { recentEvents, pushEvent, mergeEvents } from "$stores/events";
   import { toasts, showToast } from "$stores/toast";
   import { status as sharedStatus, refreshStatus } from "$stores/status";
   import {
@@ -28,7 +28,7 @@
     deriveMonthSlots,
     sortPositionsOldestFirst,
   } from "$lib/config/slots";
-  import { formatTimeUtc, isTodayUtc } from "$lib/utils/time";
+  import { formatTimeUtc, isTodayUtc, utcDateKey } from "$lib/utils/time";
   import {
     deriveBudgetView,
     MONTHLY_BUDGET_LIMIT_PCT,
@@ -51,6 +51,9 @@
   let showArmModal = $state(false);
   let pendingApprovals = $state<PendingApproval[]>([]);
   let historyError = $state<string | null>(null);
+  let eventsError = $state<string | null>(null);
+  let eventsLoading = $state(true);
+  let eventHistoryRequest = 0;
   let selectedMonth = $state(currentMonthKey());
   let monthlyPositions = $state<Position[]>([]);
   let monthlySlotCellsTotal = $state<number | null>(null);
@@ -65,14 +68,22 @@
     void approvalTick;
     return currentMonthKey();
   });
+  let currentUtcDate = $derived.by(() => {
+    void approvalTick;
+    return utcDateKey(new Date(approvalTick));
+  });
   let monthOps = $derived(sortPositionsOldestFirst(monthlyPositions));
   let isHistoricalMonth = $derived(selectedMonth !== currentMonth);
-  let liveOps = $derived((currentStatus?.positions ?? []).filter((op) => isRenderableLivePosition(op)));
-  let historicalOps = $derived(monthOps.filter((op) => !isPositionCancelled(op.state)));
-  let displayOps = $derived(isHistoricalMonth ? historicalOps : liveOps);
-  let slotPositions = $derived(
-    isHistoricalMonth ? displayOps : liveOps,
+  let liveOps = $derived(
+    (currentStatus?.positions ?? []).filter((op) =>
+      isRenderableLivePosition(op),
+    ),
   );
+  let historicalOps = $derived(
+    monthOps.filter((op) => !isPositionCancelled(op.state)),
+  );
+  let displayOps = $derived(isHistoricalMonth ? historicalOps : liveOps);
+  let slotPositions = $derived(isHistoricalMonth ? displayOps : liveOps);
   let slots = $derived(
     deriveMonthSlots(
       slotPositions,
@@ -85,9 +96,10 @@
   let occupied = $derived(slots.filter((s) => s.kind === "occupied").length);
   let displayedSlots = $derived(slots.length);
   let free = $derived(slots.filter((s) => s.kind !== "occupied").length);
-  let todayEvents = $derived(
-    $recentEvents.filter((e) => isTodayUtc(e.occurred_at)),
-  );
+  let todayEvents = $derived.by(() => {
+    const now = new Date(approvalTick);
+    return $recentEvents.filter((e) => isTodayUtc(e.occurred_at, now));
+  });
   let haltState = $derived($haltStatus?.state ?? "active");
   // "Cannot operate" only when nothing is open AND nothing can open.
   // new_slots_available === 0 with an open position just means the capital
@@ -222,7 +234,9 @@
         robsonApi.getHaltStatus(),
       ]);
       if (status) {
-        activePositions.set(status.positions.filter((op) => isRenderableLivePosition(op)));
+        activePositions.set(
+          status.positions.filter((op) => isRenderableLivePosition(op)),
+        );
         pendingApprovals = status.pending_approvals;
       }
       haltStatus.set(halt);
@@ -250,15 +264,36 @@
     }
   }
 
+  async function loadTodayEvents(date = utcDateKey()) {
+    const requestId = ++eventHistoryRequest;
+    eventsError = null;
+    eventsLoading = true;
+    try {
+      const response = await robsonApi.getEventHistory(date);
+      if (requestId !== eventHistoryRequest) return;
+      mergeEvents(response.events);
+    } catch (e) {
+      if (requestId !== eventHistoryRequest) return;
+      eventsError =
+        e instanceof Error ? e.message : "Failed to load today's events";
+    } finally {
+      if (requestId === eventHistoryRequest) eventsLoading = false;
+    }
+  }
+
   async function load() {
-    await Promise.all([loadStatus(), loadHistory()]);
+    await Promise.all([loadStatus(), loadHistory(), loadTodayEvents()]);
   }
 
   function scheduleRefresh(): void {
     if (sseRefreshTimer) clearTimeout(sseRefreshTimer);
     sseRefreshTimer = setTimeout(() => {
       sseRefreshTimer = null;
-      void Promise.all([refreshStatus().catch(() => {}), loadHistory().catch(() => {})]);
+      void Promise.all([
+        refreshStatus().catch(() => {}),
+        loadHistory().catch(() => {}),
+        loadTodayEvents(),
+      ]);
     }, 1_500);
   }
 
@@ -279,6 +314,9 @@
         if (event.event_type === "month_boundary.reset") {
           scheduleRefresh();
         }
+        if (event.event_type === "system.resync_required") {
+          scheduleRefresh();
+        }
       },
       () => {
         connected = false;
@@ -286,7 +324,7 @@
       () => {
         connected = true;
         markSseConnected();
-        void loadStatus();
+        void Promise.all([loadStatus(), loadTodayEvents()]);
       },
       (staleSecs) => {
         markSseStale();
@@ -339,7 +377,17 @@
       if (selectedMonth === previous) {
         selectedMonth = key;
       }
-      void load();
+      void Promise.all([loadStatus(), loadHistory()]);
+    });
+  });
+
+  let lastObservedUtcDate = utcDateKey();
+  $effect(() => {
+    const date = currentUtcDate;
+    if (date === lastObservedUtcDate) return;
+    lastObservedUtcDate = date;
+    untrack(() => {
+      void loadTodayEvents(date);
     });
   });
 
@@ -516,7 +564,9 @@
             <Card padding={4}>
               <Stack gap={2}>
                 <span class="label">WALLET BALANCE</span>
-                <span class="loss-value">{formatMoney(currentStatus.wallet_balance)}</span>
+                <span class="loss-value"
+                  >{formatMoney(currentStatus.wallet_balance)}</span
+                >
                 <span class="meta dim">Current futures wallet on exchange</span>
               </Stack>
             </Card>
@@ -702,9 +752,25 @@
         <Stack gap={4}>
           <div class="eyebrow">{$_("dashboard.todayEventsLabel")}</div>
           <Card>
-            {#if todayEvents.length === 0}
+            {#if eventsError}
+              <Stack gap={2}>
+                <p class="err-text" role="alert">
+                  {$_("dashboard.eventsLoadError")} · {eventsError}
+                </p>
+                <Row justify="start">
+                  <button
+                    class="btn-retry"
+                    onclick={() => void loadTodayEvents()}
+                    >{$_("dashboard.retry")}</button
+                  >
+                </Row>
+              </Stack>
+            {/if}
+            {#if eventsLoading && todayEvents.length === 0}
+              <p class="empty">{$_("dashboard.loadingEvents")}</p>
+            {:else if !eventsError && todayEvents.length === 0}
               <p class="empty">{$_("dashboard.noEventsToday")}</p>
-            {:else}
+            {:else if todayEvents.length > 0}
               <div class="event-stream">
                 {#each todayEvents as e (e.event_id)}
                   <div class="event-line">

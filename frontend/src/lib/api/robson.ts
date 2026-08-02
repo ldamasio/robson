@@ -169,6 +169,11 @@ export type SseEvent = {
   payload: Record<string, unknown>;
 };
 
+export type EventHistoryResponse = {
+  date: string;
+  events: SseEvent[];
+};
+
 export type FundingState =
   | "QUOTED"
   | "CONVERTING"
@@ -372,6 +377,55 @@ function normalizeStatus(raw: StatusResponse): StatusResponse {
     monthly_giveback_pct: toNumber(raw.monthly_giveback_pct),
     monthly_budget_remaining: toNumber(raw.monthly_budget_remaining),
   };
+}
+
+function normalizeEventHistory(
+  raw: unknown,
+  expectedDate: string,
+): EventHistoryResponse {
+  if (!raw || typeof raw !== "object") {
+    throw new Error("Invalid /events/history response: expected an object");
+  }
+  const response = raw as Record<string, unknown>;
+  if (typeof response.date !== "string" || !Array.isArray(response.events)) {
+    throw new Error("Invalid /events/history response: missing date or events");
+  }
+  if (response.date !== expectedDate) {
+    throw new Error(
+      "Invalid /events/history response: returned an unexpected UTC date",
+    );
+  }
+
+  const events = response.events.map((rawEvent) => {
+    if (!rawEvent || typeof rawEvent !== "object") {
+      throw new Error("Invalid /events/history response: malformed event");
+    }
+    const event = rawEvent as Record<string, unknown>;
+    const occurredAt = String(event.occurred_at ?? "");
+    if (
+      typeof event.event_id !== "string" ||
+      typeof event.event_type !== "string" ||
+      !Number.isFinite(Date.parse(occurredAt)) ||
+      !event.payload ||
+      typeof event.payload !== "object" ||
+      Array.isArray(event.payload)
+    ) {
+      throw new Error("Invalid /events/history response: malformed event");
+    }
+    if (new Date(occurredAt).toISOString().slice(0, 10) !== expectedDate) {
+      throw new Error(
+        "Invalid /events/history response: event is outside the requested UTC date",
+      );
+    }
+    return {
+      event_id: event.event_id,
+      event_type: event.event_type,
+      occurred_at: occurredAt,
+      payload: event.payload as Record<string, unknown>,
+    };
+  });
+
+  return { date: response.date, events };
 }
 
 export class ApiError extends Error {
@@ -582,6 +636,14 @@ export const robsonApi = {
 
   getPosition: async (id: string) =>
     normalizePosition(await apiFetch<Position>(`/positions/${id}`)),
+
+  getEventHistory: async (date: string) =>
+    normalizeEventHistory(
+      await apiFetch<unknown>(
+        `/events/history?date=${encodeURIComponent(date)}`,
+      ),
+      date,
+    ),
 
   armPosition: (body: ArmPositionRequest) =>
     apiFetch<Position>("/positions", {
