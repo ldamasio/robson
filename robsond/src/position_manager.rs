@@ -2941,8 +2941,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             // actions_count represents ALL ActionResult variants
             let actions_count = results.len();
             for result in results {
-                if let ActionResult::OrderPlaced { order, .. } = result {
-                    // Exit order filled, handle close
+                if let ActionResult::OrderPlaced {
+                    order,
+                    event: Some(Event::ExitOrderPlaced { .. }),
+                } = result
+                {
+                    // Only a filled market exit closes the position. Insurance
+                    // stop placements and replacements also return OrderPlaced,
+                    // but they are accepted protective orders while the
+                    // position remains Active.
                     // Note: handle_exit_fill is internal, covered by this query's lifecycle
                     // Note: ExitOrderPlaced event already persisted by execute_and_persist()
                     crate::metrics::ORDERS.with_label_values(&["exit"]).inc();
@@ -3960,6 +3967,130 @@ mod tests {
 
         manager.store.positions().save(&position).await.unwrap();
         position
+    }
+
+    /// Regression for #137: an accepted insurance-stop replacement is not an
+    /// exit fill. A successful return proves the ProcessMarketTick query did
+    /// not fail in the Acting state by routing the protective order result to
+    /// handle_exit_fill.
+    #[tokio::test]
+    async fn test_process_market_data_keeps_active_position_after_insurance_stop_replace() {
+        let manager = create_test_manager().await;
+        let mut position =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+        let entry_price = Price::new(dec!(100)).unwrap();
+        let initial_stop = Price::new(dec!(90)).unwrap();
+        let previous_order_id = "insurance-old".to_string();
+
+        position.tech_stop_distance =
+            Some(TechnicalStopDistance::from_entry_and_stop(entry_price, initial_stop));
+        position.insurance_stop_id = Some(previous_order_id.clone());
+        if let PositionState::Active { insurance_stop_id, last_emitted_stop, .. } =
+            &mut position.state
+        {
+            *insurance_stop_id = Some(previous_order_id.clone());
+            *last_emitted_stop = Some(initial_stop);
+        }
+        manager.store.positions().save(&position).await.unwrap();
+
+        let result = manager
+            .process_market_data(MarketData {
+                symbol: position.symbol.clone(),
+                price: Price::new(dec!(110)).unwrap(),
+                timestamp: chrono::Utc::now(),
+                source: crate::event_bus::MarketDataSource::Ws,
+            })
+            .await;
+        assert!(result.is_ok(), "insurance-stop replace failed the market tick: {result:?}");
+
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        let (replacement_order_id, replacement_stop) = events
+            .iter()
+            .find_map(|event| match event {
+                Event::InsuranceStopReplaced {
+                    previous_order_id: event_previous_order_id,
+                    order_id,
+                    stop_price,
+                    ..
+                } if event_previous_order_id == &previous_order_id => {
+                    Some((order_id.as_str(), *stop_price))
+                },
+                _ => None,
+            })
+            .expect("insurance stop replacement event must be emitted");
+        assert_ne!(replacement_order_id, previous_order_id);
+        assert_eq!(replacement_stop, entry_price);
+        assert!(events.iter().any(|event| {
+            matches!(
+                event,
+                Event::TrailingStopUpdated { new_stop, .. } if *new_stop == entry_price
+            )
+        }));
+
+        let updated = manager.get_position(position.id).await.unwrap().unwrap();
+        assert_eq!(updated.insurance_stop_id.as_deref(), Some(replacement_order_id));
+        match &updated.state {
+            PositionState::Active { trailing_stop, insurance_stop_id, .. } => {
+                assert_eq!(*trailing_stop, entry_price);
+                assert_eq!(insurance_stop_id.as_deref(), Some(replacement_order_id));
+            },
+            other => panic!("insurance-stop replace must leave position Active, got {other:?}"),
+        }
+    }
+
+    /// The #137 routing fix must preserve the real exit path: ExitOrderPlaced
+    /// transitions the position to Exiting before handle_exit_fill closes it.
+    #[tokio::test]
+    async fn test_process_market_data_routes_real_exit_fill_to_closed() {
+        let manager = create_test_manager().await;
+        let mut position =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+        let entry_price = Price::new(dec!(100)).unwrap();
+        let trailing_stop = Price::new(dec!(90)).unwrap();
+        let fill_price = Price::new(dec!(89)).unwrap();
+        position.tech_stop_distance =
+            Some(TechnicalStopDistance::from_entry_and_stop(entry_price, trailing_stop));
+        let exchange = manager.executor.exchange();
+        let insurance_order = exchange
+            .place_stop_market_order(
+                &position.symbol,
+                position.side.exit_action(),
+                position.quantity,
+                trailing_stop,
+                "ins-test-exit",
+            )
+            .await
+            .unwrap();
+        position.insurance_stop_id = Some(insurance_order.exchange_order_id.clone());
+        if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+            *insurance_stop_id = Some(insurance_order.exchange_order_id);
+        }
+        manager.store.positions().save(&position).await.unwrap();
+        exchange.set_price("BTCUSDT", fill_price.as_decimal());
+
+        let result = manager
+            .process_market_data(MarketData {
+                symbol: position.symbol.clone(),
+                price: trailing_stop,
+                timestamp: chrono::Utc::now(),
+                source: crate::event_bus::MarketDataSource::Ws,
+            })
+            .await;
+        assert!(result.is_ok(), "real exit flow failed: {result:?}");
+
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert!(events.iter().any(|event| matches!(event, Event::InsuranceStopCancelled { .. })));
+        assert!(events.iter().any(|event| matches!(event, Event::ExitOrderPlaced { .. })));
+        assert!(events.iter().any(|event| matches!(event, Event::PositionClosed { .. })));
+
+        let closed = manager.get_position(position.id).await.unwrap().unwrap();
+        match closed.state {
+            PositionState::Closed { exit_price, exit_reason, .. } => {
+                assert_eq!(exit_price, fill_price);
+                assert_eq!(exit_reason, robson_domain::ExitReason::TrailingStop);
+            },
+            other => panic!("real exit fill must leave position Closed, got {other:?}"),
+        }
     }
 
     #[tokio::test]
