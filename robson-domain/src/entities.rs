@@ -942,6 +942,32 @@ pub struct TechnicalStopAnalysisAudit {
     /// Stop quality classification in shadow mode (ADR-0035).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub stop_quality: Option<Box<StopQualityClassification>>,
+    /// The `support_level_n` the selection anchored at (ADR-0050 §1).
+    /// `None` on pre-ADR-0050 events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub configured_level_n: Option<usize>,
+    /// The 1-indexed level actually selected; `None` for the ATR fallback
+    /// and on pre-ADR-0050 events.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selected_level_n: Option<usize>,
+    /// Levels considered and skipped during the anchor-N walk (ADR-0050 §1).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub skipped_levels: Vec<SkippedLevelSnapshot>,
+    /// Selection rule identifier; `"anchor_n_walk_deeper"` after ADR-0050.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub selection_rule: Option<String>,
+}
+
+/// A chart level considered and skipped by valid-level selection
+/// (ADR-0050 §1 audit).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SkippedLevelSnapshot {
+    /// The skipped chart level.
+    pub level: Price,
+    /// Its distance from entry as a fraction (0.001 = 0.1%).
+    pub distance_fraction: rust_decimal::Decimal,
+    /// Why it was skipped (`below_min` | `above_max`).
+    pub reason: String,
 }
 
 /// Signal from detector to trigger entry

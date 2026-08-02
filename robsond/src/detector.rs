@@ -832,6 +832,18 @@ impl DetectorTask {
             },
             stop_anchor: None,
             stop_quality: None,
+            configured_level_n: Some(analysis.configured_level_n),
+            selected_level_n: analysis.selected_level_n,
+            skipped_levels: analysis
+                .skipped_levels
+                .iter()
+                .map(|skip| robson_domain::entities::SkippedLevelSnapshot {
+                    level: skip.level,
+                    distance_fraction: skip.distance_fraction,
+                    reason: skip.reason.as_str().to_string(),
+                })
+                .collect(),
+            selection_rule: Some("anchor_n_walk_deeper".to_string()),
         }
     }
 
@@ -1693,6 +1705,9 @@ mod tests {
                     ]
                 },
             },
+            configured_level_n: 2,
+            selected_level_n: Some(2),
+            skipped_levels: vec![],
         }
     }
 
@@ -1702,6 +1717,9 @@ mod tests {
             method: AnalyzerTechnicalStopMethod::AtrFallback,
             confidence: AnalyzerStopConfidence::Low,
             detected_levels: vec![],
+            configured_level_n: 2,
+            selected_level_n: None,
+            skipped_levels: vec![],
         }
     }
 
