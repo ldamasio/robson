@@ -13,8 +13,9 @@ use chrono::{Duration as ChronoDuration, Utc};
 use robson_domain::Symbol;
 use robson_exec::ports::{IncomeRecord, IncomeType};
 use robsond::income_ledger::{
-    checkpoint, count_confirmed_anomalies, ingest_items, match_pending_items,
-    transfer_explains_delta,
+    acknowledge_income_item, checkpoint, claim_confirmed_anomaly_digest, count_confirmed_anomalies,
+    ingest_items, mark_confirmed_anomalies_alarmed, match_pending_items, transfer_explains_delta,
+    AcknowledgeIncomeOutcome,
 };
 use rust_decimal_macros::dec;
 use uuid::Uuid;
@@ -234,6 +235,145 @@ async fn test_unmatched_item_within_grace_is_not_yet_an_anomaly(pool: sqlx::PgPo
 
     let anomalies = count_confirmed_anomalies(&pool, ChronoDuration::minutes(5)).await.unwrap();
     assert_eq!(anomalies, 0, "item is younger than the grace period");
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "Requires DATABASE_URL to be set"]
+async fn test_new_item_alarms_once_then_emits_spaced_digest(pool: sqlx::PgPool) {
+    let now = Utc::now();
+    let old_time = now - ChronoDuration::minutes(10);
+    ingest_items(&pool, &[income_item(
+        "tran-alarm-once",
+        Some(btcusdt()),
+        IncomeType::RealizedPnl,
+        dec!(-0.5068),
+        old_time,
+    )])
+    .await
+    .unwrap();
+
+    let first = mark_confirmed_anomalies_alarmed(&pool, ChronoDuration::minutes(5), now)
+        .await
+        .unwrap();
+    assert_eq!(first, 1, "new anomaly must transition exactly once");
+
+    let repeated = mark_confirmed_anomalies_alarmed(
+        &pool,
+        ChronoDuration::minutes(5),
+        now + ChronoDuration::minutes(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(repeated, 0, "the next poll must not re-alarm the same item");
+
+    let early_digest = claim_confirmed_anomaly_digest(
+        &pool,
+        ChronoDuration::minutes(5),
+        ChronoDuration::hours(1),
+        now + ChronoDuration::minutes(59),
+    )
+    .await
+    .unwrap();
+    assert_eq!(early_digest, None, "digest must wait for the full interval");
+
+    let first_digest = claim_confirmed_anomaly_digest(
+        &pool,
+        ChronoDuration::minutes(5),
+        ChronoDuration::hours(1),
+        now + ChronoDuration::hours(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first_digest, Some(1));
+
+    let repeated_digest = claim_confirmed_anomaly_digest(
+        &pool,
+        ChronoDuration::minutes(5),
+        ChronoDuration::hours(1),
+        now + ChronoDuration::minutes(61),
+    )
+    .await
+    .unwrap();
+    assert_eq!(repeated_digest, None, "digest must not repeat on the next poll");
+
+    let second_digest = claim_confirmed_anomaly_digest(
+        &pool,
+        ChronoDuration::minutes(5),
+        ChronoDuration::hours(1),
+        now + ChronoDuration::hours(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second_digest, Some(1), "pending anomaly gets the next hourly digest");
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "Requires DATABASE_URL to be set"]
+async fn test_ack_removes_item_from_alarming_set_and_preserves_audit(pool: sqlx::PgPool) {
+    let old_time = Utc::now() - ChronoDuration::minutes(10);
+    ingest_items(&pool, &[income_item(
+        "tran-ack",
+        Some(btcusdt()),
+        IncomeType::RealizedPnl,
+        dec!(-0.5068),
+        old_time,
+    )])
+    .await
+    .unwrap();
+
+    assert_eq!(count_confirmed_anomalies(&pool, ChronoDuration::minutes(5)).await.unwrap(), 1);
+
+    let first = acknowledge_income_item(
+        &pool,
+        "tran-ack",
+        "external close with missing historical event",
+        "operator-1",
+    )
+    .await
+    .unwrap();
+    let AcknowledgeIncomeOutcome::Acknowledged(first_record) = first else {
+        panic!("expected first acknowledgement to update the item");
+    };
+    assert_eq!(first_record.ack_reason, "external close with missing historical event");
+    assert_eq!(first_record.acked_by, "operator-1");
+
+    assert_eq!(
+        count_confirmed_anomalies(&pool, ChronoDuration::minutes(5)).await.unwrap(),
+        0,
+        "acknowledged item must leave the alarming set"
+    );
+    assert_eq!(
+        match_pending_items(&pool, ChronoDuration::minutes(15)).await.unwrap(),
+        0,
+        "acknowledgement must remain distinct from an automatic match"
+    );
+
+    let retry = acknowledge_income_item(&pool, "tran-ack", "replacement reason", "operator-2")
+        .await
+        .unwrap();
+    let AcknowledgeIncomeOutcome::AlreadyAcknowledged(retry_record) = retry else {
+        panic!("expected retry to return the existing acknowledgement");
+    };
+    assert_eq!(retry_record, first_record, "ack audit fields must be immutable on retry");
+
+    let (matched_at, acked_at, ack_reason, acked_by): (
+        Option<chrono::DateTime<Utc>>,
+        Option<chrono::DateTime<Utc>>,
+        Option<String>,
+        Option<String>,
+    ) = sqlx::query_as(
+        r#"
+        SELECT matched_at, acked_at, ack_reason, acked_by
+        FROM income_ledger WHERE exchange_income_id = 'tran-ack'
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(matched_at.is_none());
+    assert_eq!(acked_at, Some(first_record.acked_at));
+    assert_eq!(ack_reason.as_deref(), Some("external close with missing historical event"));
+    assert_eq!(acked_by.as_deref(), Some("operator-1"));
 }
 
 #[sqlx::test(migrations = "../migrations")]

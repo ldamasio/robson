@@ -64,6 +64,12 @@ const MATCH_WINDOW: ChronoDuration = ChronoDuration::seconds(120);
 /// mode: "governed fill lagging its income record").
 const UNMATCHED_ALARM_GRACE: ChronoDuration = ChronoDuration::minutes(5);
 
+/// Persistent digest cadence while one or more unacknowledged items remain.
+const ALARM_DIGEST_INTERVAL: ChronoDuration = ChronoDuration::hours(1);
+
+pub const MAX_ACK_REASON_LENGTH: usize = 2000;
+pub const MAX_ACK_ACTOR_LENGTH: usize = 255;
+
 fn financial_drift_tolerance() -> Decimal {
     Decimal::new(1, 2) // 0.01
 }
@@ -74,6 +80,23 @@ pub struct PollOutcome {
     pub ingested: usize,
     pub matched: usize,
     pub newly_alarmed: usize,
+    pub digest_count: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, sqlx::FromRow)]
+pub struct IncomeAcknowledgement {
+    pub exchange_income_id: String,
+    pub acked_at: DateTime<Utc>,
+    pub ack_reason: String,
+    pub acked_by: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum AcknowledgeIncomeOutcome {
+    Acknowledged(IncomeAcknowledgement),
+    AlreadyAcknowledged(IncomeAcknowledgement),
+    AlreadyMatched,
+    NotFound,
 }
 
 pub struct IncomeLedgerWorker<E: ExchangePort + IncomePort + 'static, S: Store + 'static> {
@@ -122,10 +145,15 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> IncomeLedgerWor
                 }
                 _ = ticker.tick() => {
                     match self.poll_and_match().await {
-                        Ok(outcome) if outcome.newly_alarmed > 0 => {
-                            warn!(?outcome, "Income ledger poll found new unmatched items");
+                        Ok(outcome) => {
+                            if let Some(count) = outcome.digest_count {
+                                warn!(
+                                    count,
+                                    "Income ledger anomaly digest: unmatched items remain past the evidence-lag grace period (ADR-0045)"
+                                );
+                            }
+                            debug!(?outcome, "Income ledger poll complete");
                         }
-                        Ok(outcome) => debug!(?outcome, "Income ledger poll complete"),
                         Err(error) => error!(
                             %error,
                             "Income ledger poll failed — pausing until next tick, no accounting writes"
@@ -144,12 +172,21 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> IncomeLedgerWor
         let items = self.exchange.get_income_since(since, 1000).await?;
         let ingested = ingest_items(&self.pool, &items).await?;
         let matched = match_pending_items(&self.pool, MATCH_WINDOW).await?;
-        let newly_alarmed = count_confirmed_anomalies(&self.pool, UNMATCHED_ALARM_GRACE).await?;
+        let now = Utc::now();
+        let newly_alarmed =
+            mark_confirmed_anomalies_alarmed(&self.pool, UNMATCHED_ALARM_GRACE, now).await?;
+        let digest_count = claim_confirmed_anomaly_digest(
+            &self.pool,
+            UNMATCHED_ALARM_GRACE,
+            ALARM_DIGEST_INTERVAL,
+            now,
+        )
+        .await?;
 
         if newly_alarmed > 0 {
             self.event_bus.send(DaemonEvent::IncomeLedgerAnomaliesDetected {
                 count: newly_alarmed,
-                detected_at: Utc::now(),
+                detected_at: now,
             });
         }
 
@@ -157,7 +194,12 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> IncomeLedgerWor
             warn!(%error, "Transfer-confirmed recalibration check failed this cycle");
         }
 
-        Ok(PollOutcome { ingested, matched, newly_alarmed })
+        Ok(PollOutcome {
+            ingested,
+            matched,
+            newly_alarmed,
+            digest_count,
+        })
     }
 
     /// The only remaining path that may write `capital_base` automatically
@@ -334,7 +376,9 @@ pub async fn match_pending_items(pool: &PgPool, window: ChronoDuration) -> Daemo
         r#"
         UPDATE income_ledger
         SET matched_at = NOW()
-        WHERE matched_at IS NULL AND income_type IN ('TRANSFER', 'FUNDING_FEE')
+        WHERE matched_at IS NULL
+          AND acked_at IS NULL
+          AND income_type IN ('TRANSFER', 'FUNDING_FEE')
         "#,
     )
     .execute(pool)
@@ -351,7 +395,9 @@ pub async fn match_pending_items(pool: &PgPool, window: ChronoDuration) -> Daemo
     let pending: Vec<PendingItem> = sqlx::query_as(
         r#"
         SELECT id, symbol, income_time FROM income_ledger
-        WHERE matched_at IS NULL AND income_type IN ('REALIZED_PNL', 'COMMISSION')
+        WHERE matched_at IS NULL
+          AND acked_at IS NULL
+          AND income_type IN ('REALIZED_PNL', 'COMMISSION')
         "#,
     )
     .fetch_all(pool)
@@ -384,7 +430,11 @@ pub async fn match_pending_items(pool: &PgPool, window: ChronoDuration) -> Daemo
         }
 
         let result = sqlx::query(
-            "UPDATE income_ledger SET matched_at = NOW(), matched_event_id = $2 WHERE id = $1",
+            r#"
+            UPDATE income_ledger
+            SET matched_at = NOW(), matched_event_id = $2
+            WHERE id = $1 AND matched_at IS NULL AND acked_at IS NULL
+            "#,
         )
         .bind(item.id)
         .bind(candidates[0])
@@ -399,16 +449,95 @@ pub async fn match_pending_items(pool: &PgPool, window: ChronoDuration) -> Daemo
     Ok(matched)
 }
 
-/// Count unmatched items older than `grace` — a confirmed anomaly, not a
-/// fill still catching up (ADR-0045 failure mode: "governed fill lagging
-/// its income record").
+/// Persist the first transition from lagging income item to confirmed anomaly.
+/// The conditional update makes the transition single-shot across polls,
+/// daemon restarts, and concurrent workers.
+pub async fn mark_confirmed_anomalies_alarmed(
+    pool: &PgPool,
+    grace: ChronoDuration,
+    now: DateTime<Utc>,
+) -> DaemonResult<usize> {
+    let cutoff = now - grace;
+    let result = sqlx::query(
+        r#"
+        UPDATE income_ledger
+        SET alarmed_at = $1
+        WHERE matched_at IS NULL
+          AND acked_at IS NULL
+          AND alarmed_at IS NULL
+          AND income_time < $2
+        "#,
+    )
+    .bind(now)
+    .bind(cutoff)
+    .execute(pool)
+    .await?;
+
+    Ok(result.rows_affected() as usize)
+}
+
+/// Atomically claim a spaced digest for all currently alarming items.
+/// A new transition must age for one full digest interval before its first
+/// digest. The singleton state row preserves the cadence across restarts and
+/// serializes accidental concurrent workers.
+pub async fn claim_confirmed_anomaly_digest(
+    pool: &PgPool,
+    grace: ChronoDuration,
+    digest_interval: ChronoDuration,
+    now: DateTime<Utc>,
+) -> DaemonResult<Option<usize>> {
+    let due_before = now - digest_interval;
+    let income_cutoff = now - grace;
+    let count: Option<i64> = sqlx::query_scalar(
+        r#"
+        WITH claimed AS (
+            UPDATE income_ledger_alarm_state
+            SET last_digest_at = $1
+            WHERE singleton = TRUE
+              AND (last_digest_at IS NULL OR last_digest_at <= $2)
+              AND EXISTS (
+                  SELECT 1 FROM income_ledger
+                  WHERE matched_at IS NULL
+                    AND acked_at IS NULL
+                    AND alarmed_at IS NOT NULL
+                    AND alarmed_at <= $2
+                    AND income_time < $3
+              )
+            RETURNING singleton
+        )
+        SELECT CASE WHEN EXISTS (SELECT 1 FROM claimed)
+            THEN (
+                SELECT COUNT(*) FROM income_ledger
+                WHERE matched_at IS NULL
+                  AND acked_at IS NULL
+                  AND income_time < $3
+            )
+            ELSE NULL::BIGINT
+        END
+        "#,
+    )
+    .bind(now)
+    .bind(due_before)
+    .bind(income_cutoff)
+    .fetch_one(pool)
+    .await?;
+
+    Ok(count.filter(|count| *count > 0).map(|count| count as usize))
+}
+
+/// Count unacknowledged, unmatched items older than `grace` — a confirmed
+/// anomaly, not a fill still catching up (ADR-0045 failure mode: "governed
+/// fill lagging its income record").
 pub async fn count_confirmed_anomalies(
     pool: &PgPool,
     grace: ChronoDuration,
 ) -> DaemonResult<usize> {
     let cutoff = Utc::now() - grace;
     let count: i64 = sqlx::query_scalar(
-        "SELECT COUNT(*) FROM income_ledger WHERE matched_at IS NULL AND income_time < $1",
+        r#"
+        SELECT COUNT(*) FROM income_ledger
+        WHERE matched_at IS NULL AND acked_at IS NULL AND income_time < $1
+        "#,
     )
     .bind(cutoff)
     .fetch_one(pool)
@@ -417,9 +546,82 @@ pub async fn count_confirmed_anomalies(
     Ok(count as usize)
 }
 
+/// Acknowledge one unmatched income item without deleting it or fabricating a
+/// governed match. The first acknowledgement wins and is immutable through
+/// this API; retries return the original audit record.
+pub async fn acknowledge_income_item(
+    pool: &PgPool,
+    exchange_income_id: &str,
+    reason: &str,
+    actor: &str,
+) -> DaemonResult<AcknowledgeIncomeOutcome> {
+    let acknowledged: Option<IncomeAcknowledgement> = sqlx::query_as(
+        r#"
+        UPDATE income_ledger
+        SET acked_at = NOW(), ack_reason = $2, acked_by = $3
+        WHERE exchange_income_id = $1
+          AND matched_at IS NULL
+          AND acked_at IS NULL
+        RETURNING exchange_income_id, acked_at, ack_reason, acked_by
+        "#,
+    )
+    .bind(exchange_income_id)
+    .bind(reason)
+    .bind(actor)
+    .fetch_optional(pool)
+    .await?;
+
+    if let Some(acknowledgement) = acknowledged {
+        return Ok(AcknowledgeIncomeOutcome::Acknowledged(acknowledgement));
+    }
+
+    #[derive(sqlx::FromRow)]
+    struct ExistingIncomeItem {
+        matched_at: Option<DateTime<Utc>>,
+        acked_at: Option<DateTime<Utc>>,
+        ack_reason: Option<String>,
+        acked_by: Option<String>,
+    }
+
+    let existing: Option<ExistingIncomeItem> = sqlx::query_as(
+        r#"
+        SELECT matched_at, acked_at, ack_reason, acked_by
+        FROM income_ledger
+        WHERE exchange_income_id = $1
+        "#,
+    )
+    .bind(exchange_income_id)
+    .fetch_optional(pool)
+    .await?;
+
+    let Some(existing) = existing else {
+        return Ok(AcknowledgeIncomeOutcome::NotFound);
+    };
+
+    if existing.matched_at.is_some() {
+        return Ok(AcknowledgeIncomeOutcome::AlreadyMatched);
+    }
+
+    match (existing.acked_at, existing.ack_reason, existing.acked_by) {
+        (Some(acked_at), Some(ack_reason), Some(acked_by)) => {
+            Ok(AcknowledgeIncomeOutcome::AlreadyAcknowledged(IncomeAcknowledgement {
+                exchange_income_id: exchange_income_id.to_string(),
+                acked_at,
+                ack_reason,
+                acked_by,
+            }))
+        },
+        _ => Err(crate::error::DaemonError::Config(
+            "income ledger acknowledgement state changed concurrently".to_string(),
+        )),
+    }
+}
+
 /// Whether the ledger explains `unexplained_delta` as 100% matched
 /// `TRANSFER` items since `since`, with zero other unmatched items in the
-/// same window. Returns `Some(matched_transfer_sum)` only when both hold —
+/// same window. Acknowledged items remain unmatched for this safety check:
+/// acknowledgement silences an alarm but does not become accounting
+/// evidence. Returns `Some(matched_transfer_sum)` only when both hold —
 /// `None` means "do not recalibrate" (ADR-0045 §2: never write from a
 /// partially- or un-attributed residual).
 pub async fn transfer_explains_delta(

@@ -224,6 +224,50 @@ but coarser than the exchange's own linkage. The raw `trade_id`/`tran_id` is
 preserved on every ledger row regardless, so a future, more precise matcher
 can use it without re-ingesting history.
 
+## Amendment (2026-08-02) - deduplicated alarms and auditable acknowledgement
+
+Issue #140 exposed that the worker counted every confirmed anomaly on every
+poll and reported that total as `newly_alarmed`. Alarm delivery now has two
+durable states:
+
+- `income_ledger.alarmed_at` is set once with a conditional update when an
+  unacknowledged item first passes the grace period. Only rows changed by that
+  update produce `IncomeLedgerAnomaliesDetected`.
+- `income_ledger_alarm_state.last_digest_at` coordinates a summary warning at
+  most once per hour while a pending anomaly remains. The singleton row makes
+  the cadence survive daemon restarts and serialize concurrent workers.
+
+An operator may resolve an orphaned alarm with `robson-cli income ack
+<exchange_income_id> --reason <reason>`. The authenticated API records
+`acked_at`, `ack_reason`, and `acked_by`; the CLI obtains `acked_by` from
+`--actor`, `ROBSON_OPERATOR_ID`, or the process `USER`. A retry returns the
+original audit fields and never overwrites them.
+
+Acknowledgement is not reconciliation evidence. The exchange row stays in the
+ledger, `matched_at` stays null, and the item still blocks the automatic
+TRANSFER-only accounting writer. It leaves only the operator-facing alarming
+set.
+
+| Failure | Behavior |
+| --- | --- |
+| Postgres unavailable during poll | Transition and digest claims fail; the worker retries next poll and performs no accounting write |
+| Postgres unavailable during acknowledgement | API returns service unavailable; the row and alarm remain unchanged |
+| Concurrent polls see the same new item | Conditional `alarmed_at IS NULL` update lets only one poll claim the transition |
+| Concurrent workers claim a digest | Atomic update of the singleton state row lets only one worker emit it |
+| Acknowledgement request is retried | Original actor, time, and reason are returned unchanged |
+| Process exits after claiming a transition but before event delivery | The transition warning can be missed; the persisted hourly digest remains the recovery signal |
+
+Trade-offs accepted:
+
+- The poll performs two additional constant-count queries. This is independent
+  of ledger cardinality and introduces no per-item request loop.
+- Actor attribution uses the existing single-operator bearer-token model plus
+  a recorded operator label. The current token authenticates authorization,
+  not a multi-user principal.
+- Acknowledged items remain in the conservative unmatched accounting set. This
+  prevents an acknowledgement from silently becoming permission to change
+  `capital_base`.
+
 ## Related
 
 - [ADR-0024](ADR-0024-trading-policy-layer.md) — capital base semantics

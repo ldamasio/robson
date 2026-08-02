@@ -1866,7 +1866,7 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
                 warn!(
                     count,
                     %detected_at,
-                    "Income ledger has unmatched items past the evidence-lag grace period (ADR-0045)"
+                    "New income ledger items became unmatched anomalies past the evidence-lag grace period (ADR-0045)"
                 );
             },
         }
