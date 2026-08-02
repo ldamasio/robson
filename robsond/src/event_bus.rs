@@ -139,9 +139,9 @@ pub enum DaemonEvent {
         triggered_at: DateTime<Utc>,
     },
 
-    /// Income ledger has confirmed anomalies: unmatched income items past
+    /// Income ledger items newly transitioned to confirmed anomalies after
     /// the evidence-lag grace period (ADR-0045 §2). Never triggers a
-    /// `capital_base` write — the alarm itself is the action.
+    /// `capital_base` write; the alarm itself is the action.
     IncomeLedgerAnomaliesDetected {
         count: usize,
         detected_at: DateTime<Utc>,

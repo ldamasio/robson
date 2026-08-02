@@ -13,8 +13,9 @@ use chrono::{Duration as ChronoDuration, Utc};
 use robson_domain::Symbol;
 use robson_exec::ports::{IncomeRecord, IncomeType};
 use robsond::income_ledger::{
-    acknowledge_income_item, checkpoint, count_confirmed_anomalies, ingest_items,
-    match_pending_items, transfer_explains_delta, AcknowledgeIncomeOutcome,
+    acknowledge_income_item, checkpoint, claim_confirmed_anomaly_digest, count_confirmed_anomalies,
+    ingest_items, mark_confirmed_anomalies_alarmed, match_pending_items, transfer_explains_delta,
+    AcknowledgeIncomeOutcome,
 };
 use rust_decimal_macros::dec;
 use uuid::Uuid;
@@ -234,6 +235,76 @@ async fn test_unmatched_item_within_grace_is_not_yet_an_anomaly(pool: sqlx::PgPo
 
     let anomalies = count_confirmed_anomalies(&pool, ChronoDuration::minutes(5)).await.unwrap();
     assert_eq!(anomalies, 0, "item is younger than the grace period");
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "Requires DATABASE_URL to be set"]
+async fn test_new_item_alarms_once_then_emits_spaced_digest(pool: sqlx::PgPool) {
+    let now = Utc::now();
+    let old_time = now - ChronoDuration::minutes(10);
+    ingest_items(&pool, &[income_item(
+        "tran-alarm-once",
+        Some(btcusdt()),
+        IncomeType::RealizedPnl,
+        dec!(-0.5068),
+        old_time,
+    )])
+    .await
+    .unwrap();
+
+    let first = mark_confirmed_anomalies_alarmed(&pool, ChronoDuration::minutes(5), now)
+        .await
+        .unwrap();
+    assert_eq!(first, 1, "new anomaly must transition exactly once");
+
+    let repeated = mark_confirmed_anomalies_alarmed(
+        &pool,
+        ChronoDuration::minutes(5),
+        now + ChronoDuration::minutes(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(repeated, 0, "the next poll must not re-alarm the same item");
+
+    let early_digest = claim_confirmed_anomaly_digest(
+        &pool,
+        ChronoDuration::minutes(5),
+        ChronoDuration::hours(1),
+        now + ChronoDuration::minutes(59),
+    )
+    .await
+    .unwrap();
+    assert_eq!(early_digest, None, "digest must wait for the full interval");
+
+    let first_digest = claim_confirmed_anomaly_digest(
+        &pool,
+        ChronoDuration::minutes(5),
+        ChronoDuration::hours(1),
+        now + ChronoDuration::hours(1),
+    )
+    .await
+    .unwrap();
+    assert_eq!(first_digest, Some(1));
+
+    let repeated_digest = claim_confirmed_anomaly_digest(
+        &pool,
+        ChronoDuration::minutes(5),
+        ChronoDuration::hours(1),
+        now + ChronoDuration::minutes(61),
+    )
+    .await
+    .unwrap();
+    assert_eq!(repeated_digest, None, "digest must not repeat on the next poll");
+
+    let second_digest = claim_confirmed_anomaly_digest(
+        &pool,
+        ChronoDuration::minutes(5),
+        ChronoDuration::hours(1),
+        now + ChronoDuration::hours(2),
+    )
+    .await
+    .unwrap();
+    assert_eq!(second_digest, Some(1), "pending anomaly gets the next hourly digest");
 }
 
 #[sqlx::test(migrations = "../migrations")]
