@@ -400,11 +400,6 @@ function normalizeEventHistory(
     if (!rawEvent || typeof rawEvent !== "object") {
       throw new Error("Invalid /events/history response: malformed event");
     }
-    if (new Date(occurredAt).toISOString().slice(0, 10) !== expectedDate) {
-      throw new Error(
-        "Invalid /events/history response: event is outside the requested UTC date",
-      );
-    }
     const event = rawEvent as Record<string, unknown>;
     const occurredAt = String(event.occurred_at ?? "");
     if (
@@ -416,6 +411,11 @@ function normalizeEventHistory(
       Array.isArray(event.payload)
     ) {
       throw new Error("Invalid /events/history response: malformed event");
+    }
+    if (new Date(occurredAt).toISOString().slice(0, 10) !== expectedDate) {
+      throw new Error(
+        "Invalid /events/history response: event is outside the requested UTC date",
+      );
     }
     return {
       event_id: event.event_id,
