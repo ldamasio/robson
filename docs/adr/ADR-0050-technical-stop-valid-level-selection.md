@@ -3,10 +3,14 @@
 **Date**: 2026-08-02 (v2, after three-way architecture review)
 **Status**: PROPOSED
 **Deciders**: RBX Systems (operator + architecture)
-**Amends**: ADR-0021 (level selection rule), ADR-0039 (insurance offset becomes span-aware; executable cost model)
-**Related**: ADR-0024, ADR-0042, ADR-0043, issue #147, operator branch `fix/immediate-risk-denial-and-leverage-label`
+**Amends**: ADR-0021 (level selection rule AND the sizing formula in its invariant 5),
+ADR-0041 (span-aware cap on the executable stop buffer)
+**Related**: ADR-0024, ADR-0039, ADR-0042, ADR-0043, ADR-0048, issue #147, operator branch
+`fix/immediate-risk-denial-and-leverage-label`
 **Review trail**: v1 reviewed by Codex (gpt-5.6-sol, verdict: reject as written) and GLM 5.2
-(verdict: approve with changes); this v2 incorporates the consensus. Full reviews on issue #147.
+(verdict: approve with changes); v2 incorporated the consensus; v2.1 fixes four normative
+errors found in PR review (wrong amended ADR, 1.25x baseline, ADR-0021 sizing pointer,
+four-stage bounds closure). Full reviews on issue #147.
 
 ---
 
@@ -88,11 +92,14 @@ analysis results cannot fire.
 
 ### 3. Sizing: executable worst-case cost, 1% is a ceiling
 
-The v1 formula (`qty = capital × 1% / span`) is replaced by:
+This section normalizes, into one admission-time formula, the cost model that ADR-0041
+already states (`worst loss per unit = stop_distance + stop_buffer + gap_allowance +
+round_trip_fees`) and that ADR-0039's Policy-10 note already requires. It **supersedes
+the sizing formula in ADR-0021 invariant 5** (`qty = capital × 1% / distance`):
 
 ```text
 worst_case_loss_per_unit =
-    |entry − executable_stop|        # quantized to tick, includes insurance offset (§4)
+    |entry − executable_stop|        # tick-quantized, includes the ADR-0041 buffer (§4)
     + gap_allowance                  # configured, may be zero
     + entry_fee_per_unit + exit_fee_per_unit
 
@@ -111,18 +118,30 @@ before the risk cap and planned risk lands well under the ceiling. Deeper anchor
 *raise* planned risk toward (never past) the ceiling when quantization or the margin
 cap had been binding; the ceiling is enforced at admission either way.
 
-### 4. Insurance offset becomes span-aware (amends ADR-0039)
+### 4. The executable stop buffer becomes span-capped (amends ADR-0041)
 
-Fixed 0.1% offset doubles realized loss versus planned at the minimum span
-(`realized = planned × (1 + offset/span)`; at span = 0.1%, that is 2×). New rule:
+The execution offset observed in production (0.1% beyond the trailing stop) is not an
+ADR constant: it is the operator-configured **ADR-0041 buffer** (`stop_buffer_bps`, env
+`ROBSON_STOP_BUFFER_BPS`, default 0; production currently runs 10 bps). ADR-0041
+requires the software monitor and the insurance stop to trigger at the **same** buffered
+executable price; this ADR preserves that single-price invariant and amends only the
+buffer's magnitude:
 
 ```text
-insurance_offset = min( 0.1% × price, 0.25 × span )
+effective_buffer = min( configured_stop_buffer, 0.25 × span )
 ```
 
-Worst-case realized-through-insurance is thereby capped at 1.25× planned risk at any
-span, and the offset participates in `worst_case_loss_per_unit` (§3). ADR-0039's
-two-layer architecture is otherwise unchanged.
+Rationale: a buffer that is large relative to the span dominates the loss on the
+buffer-triggered path. Measured against the **span-only** loss baseline (the pre-§3
+mental model), a 0.1% buffer at a 0.1% span means the executable path realizes ~2×
+the span loss; the 0.25 × span cap bounds that same ratio at 1.25× for every span.
+Under §3 this is not an overrun — the buffer is priced into `worst_case_loss_per_unit`,
+so `planned_risk` already includes it and the 1% ceiling holds regardless. The cap
+exists to stop the buffer from silently consuming the risk budget that should be
+buying stop distance.
+
+ADR-0041's semantics (chart level untouched, buffer is execution-only, zero-default,
+same price for both stop layers, events store raw values) are otherwise unchanged.
 
 ### 5. One source of truth for bounds
 
@@ -136,11 +155,19 @@ This ADR institutes a single typed `StopDistanceBounds` (basis points) in
 `robson-domain`, validated at startup and injected into both the analyzer and sizing.
 The spec distinguishes four validity layers, in order:
 
-1. raw technical level (this ADR §1);
-2. guard-aware stop (ADR-0042 invalidation guard applied; a `guard_too_wide` outcome
-   maps to `RetryableNoValidStop`, never to inert Armed);
-3. executable stop (tick-quantized, offset applied);
-4. planned cost (§3), validated with fresh price immediately before the order.
+1. raw technical level (this ADR §1) — validated at selection;
+2. guard-aware stop (ADR-0042 invalidation guard applied) — a `guard_too_wide`
+   outcome maps to `RetryableNoValidStop`, never to inert Armed;
+3. executable stop (tick-quantized, §4 buffer applied) — may exceed the maximum
+   even when the raw level was in bounds; this yields the explicit outcome
+   `executable_stop_out_of_bounds`, which also maps to `RetryableNoValidStop`
+   (walk-deeper-only means selection never retreats to a shallower level to
+   compensate);
+4. planned cost (§3), validated with fresh price immediately before the order —
+   a violation here is an admission denial, audited with the same reason codes.
+
+Every stage re-checks against the same `StopDistanceBounds` instance; a level that
+passes stage 1 is not assumed valid at stages 2–4.
 
 ### 6. Durability, atomicity, idempotency
 
@@ -172,8 +199,10 @@ The spec distinguishes four validity layers, in order:
 
 1. Stops are chart-derived levels (or documented ATR fallback) — never a percentage
    of entry (ADR-0021, unchanged).
-2. Emitted signals carry a stop whose executable distance is within configured bounds,
-   enforced at selection time from a single bounds source.
+2. The raw level's distance is validated at selection; the guard-aware, executable,
+   and planned-cost distances are validated at their own stages before admission —
+   all four against the same single bounds source. No stage inherits validity from
+   an earlier stage.
 3. `planned_risk ≤ capital_base × 1%`, where planned risk prices the executable stop,
    insurance offset, gap allowance, and fees. The cap is enforced at admission with
    fresh market data.
@@ -196,7 +225,8 @@ SHORT BTCUSDT, entry reference 63,491.70, capital base 1,558.99 USDT, 1x, cap 15
 - Pre-ADR: level 2 = 63,551.40 (0.094%) → rejected → Armed inert + opaque 500.
 - Post-ADR §1: level 2 too tight (audited skip) → walk deeper; suppose level 3 =
   63,650.00 → raw span 158.30 (0.249%), in bounds.
-- §4 offset: `min(0.1% × 63,491.70 ≈ 63.49, 0.25 × 158.30 ≈ 39.58)` = 39.58.
+- §4 buffer: configured 10 bps gives `0.1% × 63,491.70 ≈ 63.49`; span cap gives
+  `0.25 × 158.30 ≈ 39.58`; effective buffer = 39.58.
 - §3 worst-case per unit (illustrative, fees 0.05% per side, no gap allowance):
   `158.30 + 39.58 + 63.57 ≈ 261.45` → risk-derived qty ≈ 15.59 / 261.45 × ... ≈ 0.0596 BTC.
 - Margin cap at 1x: ≈ 1,558.99 / 63,491.70 ≈ **0.0245 BTC** — the binding constraint.
@@ -240,6 +270,6 @@ a quota to be filled.
 ## References
 
 - `robson-engine/src/technical_stop_analyzer.rs`, `robson-domain/src/value_objects.rs`
-- ADR-0021, ADR-0024, ADR-0039, ADR-0042, ADR-0043
+- ADR-0021, ADR-0024, ADR-0039, ADR-0041, ADR-0042, ADR-0043, ADR-0048
 - Issue #147 (incident, reviews, acceptance); issue #148 (bounds/config plumbing bug)
 - Reviews: Codex gpt-5.6-sol and GLM 5.2, 2026-08-02 (archived on #147)

@@ -2,6 +2,12 @@
 
 Status: Accepted (operator-initiated 2026-07-03)
 Date: 2026-07-03
+Amendment: ADR-0050 (PROPOSED) caps the effective buffer relative to the span
+(`effective_buffer = min(configured_stop_buffer, 0.25 × span)`) and folds it into
+the admission-time worst-case cost formula. The single-executable-price invariant
+(software monitor and insurance stop trigger at the same buffered price) and all
+other semantics below are unchanged. Implemented behavior remains as described
+here until ADR-0050 is accepted and its sizing slice ships.
 
 ## Context
 
