@@ -493,9 +493,11 @@ impl Engine {
             .validate_for_position(position)
             .map_err(|e| EngineError::DomainError(e))?;
 
-        // 3. Validate and get tech stop distance
+        // 3. Validate and get tech stop distance (single bounds source, ADR-0050 §5)
         let tech_stop = signal.tech_stop_distance();
-        tech_stop.validate().map_err(|e| EngineError::DomainError(e))?;
+        tech_stop
+            .validate_with_bounds(&self.risk_config.stop_distance_bounds())
+            .map_err(|e| EngineError::DomainError(e))?;
 
         // 4. Resolve the effective stop basis for sizing (ADR-0042). When the detector
         //    supplied an invalidation guard, clamp the chart-derived technical stop

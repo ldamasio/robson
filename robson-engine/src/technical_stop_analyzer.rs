@@ -87,6 +87,15 @@ pub struct TechnicalStopConfig {
 
 impl Default for TechnicalStopConfig {
     fn default() -> Self {
+        Self::with_bounds(&robson_domain::StopDistanceBounds::default())
+    }
+}
+
+impl TechnicalStopConfig {
+    /// Build the analyzer config from the single distance-bounds source
+    /// (ADR-0050 §5). The distance fields are derived from `bounds` so the
+    /// analyzer, the domain validation, and sizing observe the same limits.
+    pub fn with_bounds(bounds: &robson_domain::StopDistanceBounds) -> Self {
         Self {
             min_candles: 100,
             swing_lookback: 2,
@@ -94,8 +103,8 @@ impl Default for TechnicalStopConfig {
             level_tolerance: dec!(0.005),
             atr_period: 14,
             atr_multiplier: dec!(1.5),
-            min_stop_distance_pct: dec!(0.001),
-            max_stop_distance_pct: dec!(0.10),
+            min_stop_distance_pct: bounds.min_fraction(),
+            max_stop_distance_pct: bounds.max_fraction(),
         }
     }
 }
@@ -675,5 +684,22 @@ mod tests {
         let config = TechnicalStopConfig::default();
         let result = TechnicalStopAnalyzer::analyze(&cs, entry, Side::Short, &config).unwrap();
         assert!(result.stop_price.as_decimal() > entry.as_decimal());
+    }
+
+    /// Contract test (ADR-0050 §5, issue #148): the analyzer config derives
+    /// its distance limits from the single `StopDistanceBounds` source, so
+    /// analyzer, domain validation, and sizing observe the same values.
+    #[test]
+    fn test_config_bounds_derive_from_single_source() {
+        let bounds = robson_domain::StopDistanceBounds::new(dec!(25), dec!(800)).unwrap();
+        let config = TechnicalStopConfig::with_bounds(&bounds);
+        assert_eq!(config.min_stop_distance_pct, bounds.min_fraction());
+        assert_eq!(config.max_stop_distance_pct, bounds.max_fraction());
+
+        // Default config equals default bounds (historical 0.1%-10%).
+        let default_config = TechnicalStopConfig::default();
+        let default_bounds = robson_domain::StopDistanceBounds::default();
+        assert_eq!(default_config.min_stop_distance_pct, default_bounds.min_fraction());
+        assert_eq!(default_config.max_stop_distance_pct, default_bounds.max_fraction());
     }
 }

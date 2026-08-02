@@ -1,7 +1,7 @@
 # ADR-0050 — Valid-Level Selection, Per-Policy No-Valid-Stop Semantics, and Executable Risk Costing
 
 **Date**: 2026-08-02 (v2, after three-way architecture review)
-**Status**: PROPOSED
+**Status**: ACCEPTED (merged 2026-08-02 via PR #149; operator decision)
 **Deciders**: RBX Systems (operator + architecture)
 **Amends**: ADR-0021 (level selection rule AND the sizing formula in its invariant 5),
 ADR-0041 (span-aware cap on the executable stop buffer)

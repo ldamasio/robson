@@ -216,8 +216,8 @@ pub fn calculate_position_size(
     effective_stop_level: Price,
     available_margin: Option<rust_decimal::Decimal>,
 ) -> Result<Quantity, DomainError> {
-    // Validate tech stop first
-    tech_stop.validate()?;
+    // Validate tech stop first (single bounds source, ADR-0050 §5)
+    tech_stop.validate_with_bounds(&risk_config.stop_distance_bounds())?;
 
     let entry = entry_price.as_decimal();
     let worst_loss_per_unit =
@@ -283,7 +283,7 @@ pub fn worst_case_loss_per_unit(
 ) -> Result<rust_decimal::Decimal, DomainError> {
     let effective_stop =
         TechnicalStopDistance::from_entry_and_stop(*entry_price, effective_stop_level);
-    effective_stop.validate()?;
+    effective_stop.validate_with_bounds(&risk_config.stop_distance_bounds())?;
     let stop_distance = effective_stop.distance;
 
     if stop_distance <= rust_decimal::Decimal::ZERO {

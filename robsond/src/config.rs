@@ -130,6 +130,26 @@ pub struct EngineConfig {
     pub stop_invalidation_lookback_candles: usize,
 }
 
+impl EngineConfig {
+    /// Technical-stop distance bounds derived from the loaded fractions
+    /// (ADR-0050 §5, issue #148). This is the single source installed into
+    /// `RiskConfig`, from which the analyzer config and every validation
+    /// stage observe the same limits.
+    ///
+    /// # Errors
+    /// Returns the domain validation error when the configured fractions are
+    /// not `0 < min < max <= 1`.
+    pub fn stop_distance_bounds(
+        &self,
+    ) -> Result<robson_domain::StopDistanceBounds, robson_domain::DomainError> {
+        let bps = Decimal::from(10_000);
+        robson_domain::StopDistanceBounds::new(
+            self.min_tech_stop_percent * bps,
+            self.max_tech_stop_percent * bps,
+        )
+    }
+}
+
 /// Technical stop policy configuration loaded from environment (ADR-0024).
 ///
 /// Canonical env vars use percentage semantics (e.g., 1.0 = 1%).

@@ -31,8 +31,8 @@ use robson_domain::{
     TechnicalStopDistance, TradingPolicy,
 };
 use robson_engine::{
-    Engine, EngineAction, EngineDecision, PositionSummary, ProposedTrade, RiskContext, RiskGate,
-    StrategyRegistry,
+    technical_stop_analyzer::TechnicalStopConfig, Engine, EngineAction, EngineDecision,
+    PositionSummary, ProposedTrade, RiskContext, RiskGate, StrategyRegistry,
 };
 #[cfg(feature = "postgres")]
 use robson_eventlog::{append_event, ActorType as EventlogActorType, Event as EventlogEvent};
@@ -1128,6 +1128,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         position_id: PositionId,
         position: Position,
         entry_policy: EntryPolicyConfig,
+        technical_stop_config: TechnicalStopConfig,
         event_bus: Arc<EventBus>,
         ohlcv_port: Arc<dyn OhlcvPort>,
         detectors: Arc<RwLock<HashMap<PositionId, JoinHandle<Option<DetectorSignal>>>>>,
@@ -1141,6 +1142,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         match DetectorTask::from_position_with_policy(
             &position,
             entry_policy,
+            technical_stop_config,
             Arc::clone(&event_bus),
             ohlcv_port,
             cancel_token,
@@ -1200,10 +1202,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         );
 
         let entry_policy = self.entry_policy_for_position(position_id).await;
+        let technical_stop_config =
+            TechnicalStopConfig::with_bounds(&self.risk_config_snapshot().stop_distance_bounds());
         Self::rearm_detector(
             position_id,
             position.clone(),
             entry_policy,
+            technical_stop_config,
             Arc::clone(&self.event_bus),
             Arc::clone(&self.ohlcv_port),
             Arc::clone(&self.detectors),
@@ -1272,6 +1277,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let stop_invalidation_guard_enabled = self.stop_invalidation_guard_enabled;
         let stop_invalidation_lookback_candles = self.stop_invalidation_lookback_candles;
         let shutdown_token = self.shutdown_token.clone();
+        let technical_stop_config =
+            TechnicalStopConfig::with_bounds(&self.risk_config_snapshot().stop_distance_bounds());
 
         let wait_duration = expires_at
             .signed_duration_since(chrono::Utc::now())
@@ -1333,6 +1340,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                             record_inner.position.id,
                             record_inner.position,
                             entry_policy,
+                            technical_stop_config,
                             event_bus,
                             ohlcv_port,
                             detectors,
@@ -1792,6 +1800,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let detector = match DetectorTask::from_position_with_policy(
             &position,
             entry_policy,
+            TechnicalStopConfig::with_bounds(&self.risk_config_snapshot().stop_distance_bounds()),
             Arc::clone(&self.event_bus),
             Arc::clone(&self.ohlcv_port),
             cancel_token,
@@ -1872,6 +1881,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let detector = DetectorTask::from_position_with_policy(
             position,
             entry_policy,
+            TechnicalStopConfig::with_bounds(&self.risk_config_snapshot().stop_distance_bounds()),
             Arc::clone(&self.event_bus),
             Arc::clone(&self.ohlcv_port),
             cancel_token,
