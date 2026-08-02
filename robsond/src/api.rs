@@ -456,6 +456,34 @@ pub struct ReconcileCloseErrorResponse {
 }
 
 // =============================================================================
+// Income Ledger Acknowledgement Types (Issue #140)
+// =============================================================================
+
+#[derive(Debug, Deserialize)]
+pub struct IncomeAckRequest {
+    pub reason: String,
+    pub actor: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct IncomeAckResponse {
+    pub status: String,
+    pub exchange_income_id: String,
+    pub acked_at: chrono::DateTime<chrono::Utc>,
+    pub ack_reason: String,
+    pub acked_by: String,
+}
+
+#[derive(Debug, Serialize)]
+pub struct IncomeAckErrorResponse {
+    pub error: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub exchange_income_id: Option<String>,
+}
+
+// =============================================================================
 // Safety Net Types
 // =============================================================================
 
@@ -607,6 +635,8 @@ where
         .route("/monthly-halt", post(monthly_halt_trigger_handler))
         // Manual reconciliation close (Slice 5B1)
         .route("/reconcile-close", post(reconcile_close_handler))
+        // Manual acknowledgement of an unmatched income-ledger item.
+        .route("/income/:exchange_income_id/ack", post(income_ack_handler::<E, S>))
         .route("/funding/quote", post(funding_quote_handler::<E, S>))
         .route("/funding/execute", post(funding_execute_handler::<E, S>))
         .route(
@@ -1824,6 +1854,139 @@ where
     }
 }
 
+/// `POST /income/{exchange_income_id}/ack` records an operator acknowledgement
+/// without deleting the income item or treating it as governed evidence.
+async fn income_ack_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    Path(exchange_income_id): Path<String>,
+    Json(req): Json<IncomeAckRequest>,
+) -> Result<(StatusCode, Json<IncomeAckResponse>), (StatusCode, Json<IncomeAckErrorResponse>)>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    #[cfg(not(feature = "postgres"))]
+    {
+        let _ = (state, req);
+        return Err((
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(IncomeAckErrorResponse {
+                error: "income_ledger_unavailable".to_string(),
+                details: Some("robsond was built without postgres support".to_string()),
+                exchange_income_id: Some(exchange_income_id),
+            }),
+        ));
+    }
+
+    #[cfg(feature = "postgres")]
+    {
+        use crate::income_ledger::{
+            acknowledge_income_item, AcknowledgeIncomeOutcome, MAX_ACK_ACTOR_LENGTH,
+            MAX_ACK_REASON_LENGTH,
+        };
+
+        let error_response = |status, error: &str, details: Option<String>| {
+            Err((
+                status,
+                Json(IncomeAckErrorResponse {
+                    error: error.to_string(),
+                    details,
+                    exchange_income_id: Some(exchange_income_id.clone()),
+                }),
+            ))
+        };
+
+        let reason = req.reason.trim();
+        if reason.is_empty() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_ack_reason",
+                Some("reason must not be empty".to_string()),
+            );
+        }
+        if reason.chars().count() > MAX_ACK_REASON_LENGTH {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_ack_reason",
+                Some(format!("reason must be at most {MAX_ACK_REASON_LENGTH} characters")),
+            );
+        }
+
+        let actor = req.actor.trim();
+        if actor.is_empty() {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_ack_actor",
+                Some("actor must not be empty".to_string()),
+            );
+        }
+        if actor.chars().count() > MAX_ACK_ACTOR_LENGTH {
+            return error_response(
+                StatusCode::BAD_REQUEST,
+                "invalid_ack_actor",
+                Some(format!("actor must be at most {MAX_ACK_ACTOR_LENGTH} characters")),
+            );
+        }
+
+        let Some(pool) = &state.pg_pool else {
+            return error_response(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "income_ledger_unavailable",
+                Some("robsond has no postgres pool configured".to_string()),
+            );
+        };
+
+        let outcome = acknowledge_income_item(pool, &exchange_income_id, reason, actor)
+            .await
+            .map_err(|error| {
+                warn!(
+                    %error,
+                    %exchange_income_id,
+                    "failed to acknowledge income ledger item"
+                );
+                (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    Json(IncomeAckErrorResponse {
+                        error: "income_ack_failed".to_string(),
+                        details: None,
+                        exchange_income_id: Some(exchange_income_id.clone()),
+                    }),
+                )
+            })?;
+
+        match outcome {
+            AcknowledgeIncomeOutcome::Acknowledged(acknowledgement) => Ok((
+                StatusCode::OK,
+                Json(IncomeAckResponse {
+                    status: "acknowledged".to_string(),
+                    exchange_income_id: acknowledgement.exchange_income_id,
+                    acked_at: acknowledgement.acked_at,
+                    ack_reason: acknowledgement.ack_reason,
+                    acked_by: acknowledgement.acked_by,
+                }),
+            )),
+            AcknowledgeIncomeOutcome::AlreadyAcknowledged(acknowledgement) => Ok((
+                StatusCode::OK,
+                Json(IncomeAckResponse {
+                    status: "already_acknowledged".to_string(),
+                    exchange_income_id: acknowledgement.exchange_income_id,
+                    acked_at: acknowledgement.acked_at,
+                    ack_reason: acknowledgement.ack_reason,
+                    acked_by: acknowledgement.acked_by,
+                }),
+            )),
+            AcknowledgeIncomeOutcome::AlreadyMatched => error_response(
+                StatusCode::CONFLICT,
+                "income_item_already_matched",
+                Some("matched income items cannot be acknowledged".to_string()),
+            ),
+            AcknowledgeIncomeOutcome::NotFound => {
+                error_response(StatusCode::NOT_FOUND, "income_item_not_found", None)
+            },
+        }
+    }
+}
+
 fn validate_reconcile_close_evidence(
     evidence: &robson_domain::ReconciliationEvidence,
 ) -> Result<(), String> {
@@ -3038,6 +3201,34 @@ mod tests {
         let body = response.into_body().collect().await.unwrap().to_bytes();
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json, serde_json::json!({ "error": "funding_disabled" }));
+    }
+
+    #[tokio::test]
+    async fn income_ack_returns_503_without_postgres_pool() {
+        let (app, _, _) = create_test_app_with_event_bus(100).await;
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/income/tran-ack/ack")
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        serde_json::json!({
+                            "reason": "orphaned historical item",
+                            "actor": "operator-1"
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["error"], "income_ledger_unavailable");
+        assert_eq!(json["exchange_income_id"], "tran-ack");
     }
 
     #[tokio::test]

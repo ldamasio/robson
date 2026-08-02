@@ -10,6 +10,21 @@ pub struct ReconcileCloseRequest {
     pub evidence: EvidenceJson,
 }
 
+#[derive(Debug, Serialize)]
+pub struct IncomeAckRequest {
+    pub reason: String,
+    pub actor: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct IncomeAckSuccessResponse {
+    pub status: String,
+    pub exchange_income_id: String,
+    pub acked_at: chrono::DateTime<chrono::Utc>,
+    pub ack_reason: String,
+    pub acked_by: String,
+}
+
 #[derive(Debug, Deserialize)]
 #[allow(dead_code)]
 pub struct SuccessResponse {
@@ -55,6 +70,16 @@ pub enum ReconcileCloseResponse {
     Inconsistent(ErrorResponse),
     Unsupported(ErrorResponse),
     Unauthorized(UnauthorizedResponse),
+}
+
+#[derive(Debug)]
+pub enum IncomeAckApiResponse {
+    Success(IncomeAckSuccessResponse),
+    Invalid(ErrorResponse),
+    NotFound(ErrorResponse),
+    Conflict(ErrorResponse),
+    Unauthorized(UnauthorizedResponse),
+    Unavailable(ErrorResponse),
 }
 
 pub struct ApiClient {
@@ -112,6 +137,56 @@ impl ApiClient {
                 let err: NotActiveResponse =
                     resp.json().await.context("failed to parse 409 response")?;
                 Ok(ReconcileCloseResponse::NotActive(err))
+            },
+            other => {
+                let text = resp.text().await.unwrap_or_default();
+                anyhow::bail!("unexpected HTTP {} from robsond: {}", other, text)
+            },
+        }
+    }
+
+    pub async fn acknowledge_income(
+        &self,
+        exchange_income_id: &str,
+        body: IncomeAckRequest,
+    ) -> Result<IncomeAckApiResponse> {
+        let mut url =
+            reqwest::Url::parse(&format!("{}/", self.base_url)).context("invalid robsond URL")?;
+        url.path_segments_mut()
+            .map_err(|_| anyhow::anyhow!("robsond URL cannot be used as a base URL"))?
+            .extend(["income", exchange_income_id, "ack"]);
+
+        let mut req = self.client.post(url);
+        if let Some(token) = &self.token {
+            req = req.bearer_auth(token);
+        }
+        let resp = req.json(&body).send().await.context("failed to connect to robsond")?;
+
+        match resp.status().as_u16() {
+            200 => {
+                let success: IncomeAckSuccessResponse =
+                    resp.json().await.context("failed to parse income ack response")?;
+                Ok(IncomeAckApiResponse::Success(success))
+            },
+            400 => {
+                let error = resp.json().await.context("failed to parse 400 response")?;
+                Ok(IncomeAckApiResponse::Invalid(error))
+            },
+            401 => {
+                let error = resp.json().await.context("failed to parse 401 response")?;
+                Ok(IncomeAckApiResponse::Unauthorized(error))
+            },
+            404 => {
+                let error = resp.json().await.context("failed to parse 404 response")?;
+                Ok(IncomeAckApiResponse::NotFound(error))
+            },
+            409 => {
+                let error = resp.json().await.context("failed to parse 409 response")?;
+                Ok(IncomeAckApiResponse::Conflict(error))
+            },
+            503 => {
+                let error = resp.json().await.context("failed to parse 503 response")?;
+                Ok(IncomeAckApiResponse::Unavailable(error))
             },
             other => {
                 let text = resp.text().await.unwrap_or_default();
