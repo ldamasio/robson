@@ -316,12 +316,53 @@ pub fn effective_stop_price(side: Side, technical_stop: Price, stop_buffer_bps: 
     effective_stop_price_with_guard(side, technical_stop, stop_buffer_bps, None)
 }
 
+/// The executable-stop buffer in price units, span-capped (ADR-0050 §4,
+/// amending ADR-0041).
+///
+/// `min(base × bps/10_000, 0.25 × span)`: a buffer that is large relative to
+/// the stop distance would dominate the loss on the buffer-triggered path
+/// (at span = buffer, the executable path realizes ~2x the span loss), so
+/// its effective magnitude is capped at a quarter of the span. `span = None`
+/// applies the uncapped legacy buffer (contexts without a stop distance).
+pub fn capped_stop_buffer_offset(
+    base: Decimal,
+    stop_buffer_bps: Decimal,
+    span: Option<Decimal>,
+) -> Decimal {
+    if stop_buffer_bps <= Decimal::ZERO {
+        return Decimal::ZERO;
+    }
+    let offset = base * stop_buffer_bps / Decimal::from(10_000);
+    match span {
+        Some(span) if span > Decimal::ZERO => offset.min(span * Decimal::new(25, 2)),
+        _ => offset,
+    }
+}
+
 /// Derive the executable stop price with an optional invalidation guard.
+///
+/// Uncapped legacy variant; prefer
+/// [`effective_stop_price_with_guard_and_span`] wherever the position's stop
+/// distance (span) is known, so the ADR-0050 §4 buffer cap applies.
 pub fn effective_stop_price_with_guard(
     side: Side,
     technical_stop: Price,
     stop_buffer_bps: Decimal,
     guard: Option<Price>,
+) -> Price {
+    effective_stop_price_with_guard_and_span(side, technical_stop, stop_buffer_bps, guard, None)
+}
+
+/// Derive the executable stop price with an optional invalidation guard and
+/// the span-capped buffer (ADR-0050 §4). Both stop layers (software monitor
+/// and exchange-side insurance) must derive from this same function so they
+/// trigger at one executable price (ADR-0041 invariant).
+pub fn effective_stop_price_with_guard_and_span(
+    side: Side,
+    technical_stop: Price,
+    stop_buffer_bps: Decimal,
+    guard: Option<Price>,
+    span: Option<Decimal>,
 ) -> Price {
     let base = match guard {
         Some(g) => Price::new(match side {
@@ -331,10 +372,10 @@ pub fn effective_stop_price_with_guard(
         .unwrap_or(technical_stop),
         None => technical_stop,
     };
-    if stop_buffer_bps <= Decimal::ZERO {
+    let offset = capped_stop_buffer_offset(base.as_decimal(), stop_buffer_bps, span);
+    if offset <= Decimal::ZERO {
         return base;
     }
-    let offset = base.as_decimal() * stop_buffer_bps / Decimal::from(10_000);
     let effective = match side {
         Side::Long => base.as_decimal() - offset,
         Side::Short => base.as_decimal() + offset,
@@ -947,6 +988,44 @@ mod tests {
         // Default construction preserves the historical 0.1%-10% behavior.
         let default_config = RiskConfig::new(dec!(10000)).unwrap();
         assert_eq!(default_config.stop_distance_bounds(), StopDistanceBounds::default());
+    }
+
+    // Span-capped executable buffer (ADR-0050 §4)
+    #[test]
+    fn test_capped_stop_buffer_binds_at_tight_spans() {
+        // Buffer 10 bps on stop 100 = 0.10; span 0.10 (0.1%) caps at 0.025.
+        let offset = capped_stop_buffer_offset(dec!(100), dec!(10), Some(dec!(0.10)));
+        assert_eq!(offset, dec!(0.025));
+        // Wide span: cap does not bind, full configured buffer applies.
+        let offset = capped_stop_buffer_offset(dec!(100), dec!(10), Some(dec!(10)));
+        assert_eq!(offset, dec!(0.10));
+        // No span context: legacy uncapped behavior.
+        let offset = capped_stop_buffer_offset(dec!(100), dec!(10), None);
+        assert_eq!(offset, dec!(0.10));
+        // Zero buffer stays zero regardless of span.
+        assert_eq!(capped_stop_buffer_offset(dec!(100), Decimal::ZERO, Some(dec!(1))), dec!(0));
+    }
+
+    #[test]
+    fn test_effective_stop_span_capped_matches_worst_case_ratio() {
+        // At span = min bound with a 10 bps buffer, uncapped realized loss
+        // through the buffer path would be ~2x the span; the 0.25 x span cap
+        // bounds the executable offset at a quarter span for every span.
+        let technical = Price::new(dec!(100)).unwrap();
+        let span = dec!(0.10); // 0.1% of a 100 entry
+        let capped = effective_stop_price_with_guard_and_span(
+            Side::Long,
+            technical,
+            dec!(10),
+            None,
+            Some(span),
+        );
+        assert_eq!(capped.as_decimal(), dec!(100) - dec!(0.025));
+
+        // Same derivation without span reproduces the legacy price.
+        let uncapped =
+            effective_stop_price_with_guard_and_span(Side::Long, technical, dec!(10), None, None);
+        assert_eq!(uncapped, effective_stop_price(Side::Long, technical, dec!(10)));
     }
 
     // Price tests

@@ -333,11 +333,12 @@ where
         PositionState::Active { invalidation_guard_level, .. } => *invalidation_guard_level,
         _ => None,
     };
-    let executable_stop = robson_domain::value_objects::effective_stop_price_with_guard(
+    let executable_stop = robson_domain::value_objects::effective_stop_price_with_guard_and_span(
         position.side,
         trailing_stop,
         pm.risk_config_snapshot().stop_buffer_bps(),
         invalidation_guard_level,
+        position.tech_stop_distance.as_ref().map(|t| t.span()),
     );
     let existing_id = match &position.state {
         PositionState::Active { insurance_stop_id, .. } => {

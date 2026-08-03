@@ -296,7 +296,13 @@ pub fn worst_case_loss_per_unit(
     }
 
     let stop = effective_stop_level.as_decimal();
-    let stop_buffer = stop * risk_config.stop_buffer_bps() / rust_decimal::Decimal::from(10_000);
+    // ADR-0050 §4: the buffer priced here is the same span-capped buffer both
+    // stop layers execute at, so planned risk matches the executable path.
+    let stop_buffer = crate::value_objects::capped_stop_buffer_offset(
+        stop,
+        risk_config.stop_buffer_bps(),
+        Some(stop_distance),
+    );
     let gap_allowance = stop * risk_config.stop_gap_bps() / rust_decimal::Decimal::from(10_000);
     let round_trip_fees_per_unit = risk_config.taker_fee_rate() * (entry + entry.max(stop));
     Ok(stop_distance + stop_buffer + gap_allowance + round_trip_fees_per_unit)

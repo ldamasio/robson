@@ -726,6 +726,7 @@ impl Engine {
                     position.side,
                     initial_trailing_stop,
                     invalidation_guard_level,
+                    position.tech_stop_distance.as_ref().map(|t| t.span()),
                 ),
             },
         ];
@@ -800,7 +801,13 @@ impl Engine {
             Self::observed_watermark(position.side, current_price, favorable_extreme);
 
         // Check exit first (higher priority)
-        if self.should_exit(position.side, current_price, trailing_stop, guard) {
+        if self.should_exit(
+            position.side,
+            current_price,
+            trailing_stop,
+            guard,
+            position.tech_stop_distance.as_ref().map(|t| t.span()),
+        ) {
             debug!(
                 position_id = %position.id,
                 current_price = %current_price,
@@ -869,12 +876,19 @@ impl Engine {
     /// buffer beyond it (below for longs, above for shorts). Zero buffer, the
     /// default, is the historical behavior. The buffer is priced into
     /// position sizing (Policy 10).
-    fn effective_stop(&self, side: Side, technical_stop: Price, guard: Option<Price>) -> Price {
-        robson_domain::value_objects::effective_stop_price_with_guard(
+    fn effective_stop(
+        &self,
+        side: Side,
+        technical_stop: Price,
+        guard: Option<Price>,
+        span: Option<Decimal>,
+    ) -> Price {
+        robson_domain::value_objects::effective_stop_price_with_guard_and_span(
             side,
             technical_stop,
             self.risk_config.stop_buffer_bps(),
             guard,
+            span,
         )
     }
 
@@ -890,8 +904,9 @@ impl Engine {
         current_price: Price,
         trailing_stop: Price,
         guard: Option<Price>,
+        span: Option<Decimal>,
     ) -> bool {
-        let effective = self.effective_stop(side, trailing_stop, guard);
+        let effective = self.effective_stop(side, trailing_stop, guard, span);
         match side {
             // LONG: exit when price drops to or below the executable stop
             Side::Long => current_price.as_decimal() <= effective.as_decimal(),
@@ -1098,14 +1113,24 @@ impl Engine {
                 side: position.side.exit_action(),
                 quantity: position.quantity,
                 previous_order_id,
-                new_stop_price: self.effective_stop(position.side, new_stop, None),
+                new_stop_price: self.effective_stop(
+                    position.side,
+                    new_stop,
+                    None,
+                    position.tech_stop_distance.as_ref().map(|t| t.span()),
+                ),
             },
             None => EngineAction::PlaceInsuranceStop {
                 position_id: position.id,
                 symbol: position.symbol.clone(),
                 side: position.side.exit_action(),
                 quantity: position.quantity,
-                stop_price: self.effective_stop(position.side, new_stop, None),
+                stop_price: self.effective_stop(
+                    position.side,
+                    new_stop,
+                    None,
+                    position.tech_stop_distance.as_ref().map(|t| t.span()),
+                ),
             },
         };
 

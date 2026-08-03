@@ -2505,13 +2505,15 @@ fn position_to_summary(
                 trailing_stop, invalidation_guard_level, ..
             } => {
                 let guard = *invalidation_guard_level;
-                let effective = robson_domain::value_objects::effective_stop_price_with_guard(
-                    position.side,
-                    *trailing_stop,
-                    stop_buffer_bps,
-                    guard,
-                )
-                .as_decimal();
+                let effective =
+                    robson_domain::value_objects::effective_stop_price_with_guard_and_span(
+                        position.side,
+                        *trailing_stop,
+                        stop_buffer_bps,
+                        guard,
+                        position.tech_stop_distance.as_ref().map(|t| t.span()),
+                    )
+                    .as_decimal();
                 let (raw, basis) = match guard {
                     Some(g) => {
                         // Mirrors the domain clamp: the guard binds only when it
