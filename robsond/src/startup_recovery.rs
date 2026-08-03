@@ -139,6 +139,40 @@ pub async fn run_startup_recovery<E: ExchangePort + 'static, S: Store + 'static>
             continue;
         }
 
+        // Fail-closed quarantine (issue #154 deliverable 6): if this
+        // position's executable stop plan cannot be derived (e.g. a
+        // SpanCappedV1 position with a degenerate span or missing trading
+        // rules), recovery must NOT touch it — the existing insurance stop
+        // is preserved untouched, durable evidence is recorded, and the
+        // operator resolves the defect.
+        let guard = match &position.state {
+            PositionState::Active { invalidation_guard_level, .. } => *invalidation_guard_level,
+            _ => None,
+        };
+        let plan_rules = pm.trading_rules_for(position).await;
+        let plan_result =
+            pm.engine().stop_plan(position, trailing_stop, guard, plan_rules.as_ref());
+        if let Err(error) = plan_result {
+            warn!(
+                %position_id,
+                %error,
+                "startup-recovery: stop plan derivation failed; quarantining position \
+                 (insurance stop preserved untouched)"
+            );
+            record_insurance_stop_check(
+                pm,
+                position_id,
+                position.insurance_stop_id.clone(),
+                None,
+                trailing_stop,
+                None,
+                "recovery_quarantined_stop_plan_error",
+            )
+            .await;
+            report.positions_skipped += 1;
+            continue;
+        }
+
         info!(
             %position_id,
             %symbol,
@@ -261,37 +295,43 @@ async fn replay_candles<E: ExchangePort + 'static, S: Store + 'static>(
         None => return Ok(false),
     };
 
+    if !matches!(current.state, PositionState::Active { .. }) {
+        return Ok(true);
+    }
+
+    // Issue #154 deliverable 6: the close decision runs the LIVE price
+    // through the ENGINE, which compares against the executable trigger of
+    // the position's stop plan. Comparing against the raw trailing stop
+    // here used to skip the healing whenever the live price sat between the
+    // raw stop and the executable trigger.
+    let live_price = pm.get_market_price(&current.symbol).await?;
+    let outcome = process_recovery_tick(pm, &current, live_price, Utc::now(), true).await?;
+    if outcome.closed {
+        return Ok(true);
+    }
+
+    // Still open after the engine saw the live price: re-read (the live
+    // tick may have advanced the trailing stop) and heal the exchange-side
+    // protective stop (ADR-0039 mission 2). This may reconcile-close the
+    // position if the insurance stop filled during the gap (returns true);
+    // all other outcomes are best-effort and never abort recovery.
+    let current = match pm.store().positions().find_by_id(position_id).await? {
+        Some(p) => p,
+        None => return Ok(false),
+    };
     let PositionState::Active { trailing_stop, .. } = &current.state else {
         return Ok(true);
     };
-
-    // Re-check live price before materializing any recovery exit.
-    let live_price = pm.get_market_price(&current.symbol).await?;
-    let should_close_now = match side {
-        Side::Long => live_price.as_decimal() <= trailing_stop.as_decimal(),
-        Side::Short => live_price.as_decimal() >= trailing_stop.as_decimal(),
-    };
-
-    if !should_close_now {
-        if stop_cross_observed {
-            info!(
-                %position_id,
-                live_price = %live_price.as_decimal(),
-                stop = %trailing_stop.as_decimal(),
-                "startup-recovery: gap stop cross observed, but live price recovered; keeping position open"
-            );
-        }
-        // ADR-0039 mission 2: the position stays open, so make its exchange-side
-        // protective stop consistent with the post-replay trailing stop. This
-        // may reconcile-close the position if the insurance stop filled during
-        // the gap (returns true); all other outcomes are best-effort and never
-        // abort recovery.
-        let healed_closed = heal_insurance_stop(pm, &current, *trailing_stop).await;
-        return Ok(healed_closed);
+    if stop_cross_observed {
+        info!(
+            %position_id,
+            live_price = %live_price.as_decimal(),
+            stop = %trailing_stop.as_decimal(),
+            "startup-recovery: gap stop cross observed, but live price recovered; keeping position open"
+        );
     }
-
-    let closed = process_recovery_tick(pm, &current, live_price, Utc::now(), true).await?;
-    Ok(closed.closed)
+    let healed_closed = heal_insurance_stop(pm, &current, *trailing_stop).await;
+    Ok(healed_closed)
 }
 
 /// Heal the protective insurance stop after replay confirms the position stays
@@ -323,22 +363,67 @@ where
     S: Store + 'static,
 {
     let position_id = position.id;
-    // Executable price: technical trailing stop offset by the configured
-    // buffer, clamped to the entry-time invalidation guard while it is still
-    // active (ADR-0042). The heal must compare AND place with the same
-    // derivation the engine uses, or every restart would replace a
-    // correctly-priced stop. The guard is hydrated into Active from the
-    // persisted column on replay.
+    // Executable price: THE stop plan trigger, the same derivation every
+    // other surface uses (issue #154). The guard is hydrated into Active
+    // from the persisted column on replay (ADR-0042).
     let invalidation_guard_level = match &position.state {
         PositionState::Active { invalidation_guard_level, .. } => *invalidation_guard_level,
         _ => None,
     };
-    let executable_stop = robson_domain::value_objects::effective_stop_price_with_guard(
-        position.side,
+    // Trading rules are fetched best-effort for EVERY policy here: the
+    // healing comparison quantizes both sides on the tick grid, otherwise
+    // the sub-tick difference between a raw legacy derivation and the
+    // adapter-aligned placed price would cancel-replace a correct stop on
+    // every restart.
+    let comparison_rules = pm.exchange().trading_rules(&position.symbol).await.ok();
+    let plan_rules = pm.trading_rules_for(position).await;
+    let executable_stop = match pm.engine().stop_plan(
+        position,
         trailing_stop,
-        pm.risk_config_snapshot().stop_buffer_bps(),
         invalidation_guard_level,
-    );
+        plan_rules.as_ref(),
+    ) {
+        Ok(plan) => plan.trigger,
+        Err(error) => {
+            // Fail closed (issue #154): never cancel or replace protection
+            // that cannot be re-derived; preserve the existing stop, record
+            // durable evidence, let the operator resolve.
+            warn!(
+                %position_id,
+                %error,
+                "startup-recovery: heal stop plan derivation failed; preserving existing \
+                 insurance stop untouched"
+            );
+            record_insurance_stop_check(
+                pm,
+                position_id,
+                position.insurance_stop_id.clone(),
+                None,
+                trailing_stop,
+                None,
+                "recovery_quarantined_stop_plan_error",
+            )
+            .await;
+            return false;
+        },
+    };
+    // Compare stops on the tick grid when metadata is available: prices
+    // that quantize to the same adverse tick are the SAME protective level.
+    let stops_match = |observed: Price| -> bool {
+        match &comparison_rules {
+            Some(rules) => {
+                let protective_side = position.side.exit_action();
+                let quantized = |price: Price| {
+                    rules
+                        .quantize_stop_trigger(protective_side, price)
+                        .map(|q| q.as_decimal())
+                        .unwrap_or_else(|_| price.as_decimal())
+                };
+                quantized(observed) == quantized(executable_stop)
+            },
+            None => observed == executable_stop,
+        }
+    };
     let existing_id = match &position.state {
         PositionState::Active { insurance_stop_id, .. } => {
             insurance_stop_id.clone().or(position.insurance_stop_id.clone())
@@ -473,7 +558,7 @@ where
         Some(order) => {
             let observed_order_id = Some(order.exchange_order_id.clone());
             match order.stop_price {
-                Some(stop_price) if stop_price != executable_stop => {
+                Some(stop_price) if !stops_match(stop_price) => {
                     let replaced =
                         replace_insurance_stop(pm, position, executable_stop, existing_id.clone())
                             .await;
@@ -1192,6 +1277,159 @@ mod tests {
         assert_eq!(recovery_check_outcome(&events, position_id), Some("filled_reconciled_closed"));
     }
 
+    /// Issue #154 deliverable 7: healing is idempotent. After a heal placed
+    /// or kept a stop, a second heal with the same state is a no-op
+    /// (already_protected), never a cancel-replace loop.
+    #[tokio::test]
+    async fn heal_is_idempotent_second_pass_is_a_no_op() {
+        let pm = heal_manager().await;
+        let position = btcusdt_long_position(Uuid::now_v7());
+        let position_id = position.id;
+        pm.store().positions().save(&position).await.unwrap();
+
+        let trailing_stop = Price::new(dec!(76158.25)).unwrap();
+        assert!(!heal_insurance_stop(&pm, &position, trailing_stop).await);
+
+        // Re-read the healed position (now carrying the placed stop id) and
+        // heal again: the stop is already at the executable price.
+        let healed = pm.store().positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(healed.insurance_stop_id.is_some());
+        assert!(!heal_insurance_stop(&pm, &healed, trailing_stop).await);
+
+        let events = pm.store().events().find_by_position(position_id).await.unwrap();
+        let placements = events
+            .iter()
+            .filter(|e| {
+                matches!(e, Event::InsuranceStopPlaced { .. } | Event::InsuranceStopReplaced { .. })
+            })
+            .count();
+        assert_eq!(placements, 1, "second heal must not place or replace again");
+        let outcomes: Vec<&str> = events
+            .iter()
+            .filter_map(|event| match event {
+                Event::StartupRecoveryInsuranceStopChecked { outcome, .. } => {
+                    Some(outcome.as_str())
+                },
+                _ => None,
+            })
+            .collect();
+        assert_eq!(outcomes.last(), Some(&"already_protected"));
+    }
+
+    /// Issue #154 live-migration fixture: a LEGACY position whose standing
+    /// insurance stop was placed by the old precision-2 adapter (NOT
+    /// tick-aligned) must survive a deploy without a cancel-replace, because
+    /// the healing comparison quantizes both sides on the tick grid.
+    #[tokio::test]
+    async fn heal_tolerates_pre_deploy_precision_rounded_stop_no_replace() {
+        let pm = heal_manager().await;
+        let symbol = btcusdt();
+
+        // Real BTCUSDT-style rules: tick 0.10 (pricePrecision would be 2).
+        pm.exchange().set_trading_rules(
+            robson_domain::SymbolTradingRules::new(
+                symbol.clone(),
+                dec!(0.10),
+                Decimal::ZERO,
+                dec!(0.001),
+                dec!(0.001),
+                dec!(1000),
+                Decimal::ZERO,
+                2,
+                3,
+            )
+            .unwrap(),
+        );
+
+        // Legacy position with a 10 bps arm-time buffer: the raw legacy
+        // executable is 76158.25 - 76.15825 = 76082.09175 (unquantized by
+        // design). The OLD adapter floored it to 2 decimals: 76082.09.
+        let mut position = btcusdt_long_position(Uuid::now_v7());
+        position.stop_buffer_bps_at_arm = Some(dec!(10));
+        let stale_priced = pm
+            .exchange()
+            .place_stop_market_order(
+                &symbol,
+                OrderSide::Sell,
+                Quantity::new(dec!(0.01)).unwrap(),
+                Price::new(dec!(76082.09)).unwrap(),
+                "ins-old-adapter",
+            )
+            .await
+            .unwrap();
+        let stop_id = stale_priced.exchange_order_id.clone();
+        position = with_insurance_stop(position, &stop_id);
+        let position_id = position.id;
+        pm.store().positions().save(&position).await.unwrap();
+
+        let trailing_stop = Price::new(dec!(76158.25)).unwrap();
+        let closed = heal_insurance_stop(&pm, &position, trailing_stop).await;
+
+        assert!(!closed);
+        assert!(
+            pm.exchange().has_stop_order(&stop_id),
+            "pre-deploy precision-rounded stop quantizes to the same tick; must NOT be replaced"
+        );
+        let events = pm.store().events().find_by_position(position_id).await.unwrap();
+        assert_eq!(recovery_check_outcome(&events, position_id), Some("already_protected"));
+    }
+
+    /// Issue #154 fail-closed: a SpanCappedV1 Active position whose stop
+    /// plan cannot be derived (no trading rules on the exchange) is
+    /// QUARANTINED by recovery: skipped, insurance preserved untouched,
+    /// durable evidence recorded. Protection is never cancelled.
+    #[tokio::test]
+    async fn recovery_quarantines_v1_position_without_trading_rules() {
+        let account_id = Uuid::now_v7();
+        let mut position = btcusdt_long_position(account_id);
+        position.stop_policy = robson_domain::StopPolicy::SpanCappedV1;
+        position.stop_buffer_bps_at_arm = Some(dec!(10));
+        let position_id = position.id;
+
+        let extreme_at = match position.state {
+            PositionState::Active { extreme_at, .. } => extreme_at,
+            _ => panic!("expected Active state"),
+        };
+        let candles = crash_candles(extreme_at);
+        let ohlcv = Arc::new(StubOhlcv::new(candles)) as Arc<dyn OhlcvPort>;
+        // Stub has NO trading rules: the v1 plan cannot be derived.
+        let pm = create_manager(ohlcv, dec!(75000)).await;
+
+        // Give the position a live insurance stop that must survive.
+        let stop = pm
+            .exchange()
+            .place_stop_market_order(
+                &btcusdt(),
+                OrderSide::Sell,
+                Quantity::new(dec!(0.01)).unwrap(),
+                Price::new(dec!(76158.20)).unwrap(),
+                "ins-v1",
+            )
+            .await
+            .unwrap();
+        let stop_id = stop.exchange_order_id.clone();
+        position = with_insurance_stop(position, &stop_id);
+        pm.store().positions().save(&position).await.unwrap();
+
+        let report = run_startup_recovery(&pm, &pm.ohlcv_port()).await.unwrap();
+
+        // Quarantined: skipped (not closed), even though the crash candles
+        // crossed the stop.
+        assert_eq!(report.positions_closed, 0, "quarantined position must not be closed");
+        assert_eq!(report.positions_skipped, 1);
+        assert!(
+            pm.exchange().has_stop_order(&stop_id),
+            "quarantine must preserve the existing insurance stop untouched"
+        );
+        let loaded = pm.store().positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(matches!(loaded.state, PositionState::Active { .. }));
+        let events = pm.store().events().find_by_position(position_id).await.unwrap();
+        assert_eq!(
+            recovery_check_outcome(&events, position_id),
+            Some("recovery_quarantined_stop_plan_error")
+        );
+    }
+
     /// If the stop was NOT crossed during the gap, recovery must leave the
     /// position Active and not close it.
     #[tokio::test]
@@ -1447,9 +1685,12 @@ async fn process_recovery_tick<E: ExchangePort + 'static, S: Store + 'static>(
 ) -> DaemonResult<RecoveryTickOutcome> {
     let market_data = MarketData::with_timestamp(position.symbol.clone(), price, timestamp);
 
+    // Rules come from the adapter's TTL cache (issue #154); only fetched for
+    // positions whose stop policy needs them.
+    let rules = pm.trading_rules_for(position).await;
     let decision = {
         let engine = pm.engine();
-        engine.process_active_position(position, &market_data)?
+        engine.process_active_position_with_rules(position, &market_data, rules.as_ref())?
     };
 
     if decision.actions.is_empty() {

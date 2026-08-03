@@ -128,6 +128,13 @@ pub struct EngineConfig {
     /// recent adverse extreme when the guard is enabled (env:
     /// `ROBSON_STOP_INVALIDATION_LOOKBACK_CANDLES`, default 20). ADR-0042.
     pub stop_invalidation_lookback_candles: usize,
+    /// Stop policy pinned to NEW positions at arm time (env:
+    /// `ROBSON_STOP_POLICY`, `legacy_uncapped` | `span_capped_v1`, default
+    /// `legacy_uncapped`). Issue #154: activation of `span_capped_v1` for
+    /// real entries is an EXPLICIT operator decision; a deploy alone never
+    /// changes the derivation, and existing positions keep their arm-time
+    /// policy forever. An unknown value fails startup.
+    pub stop_policy: robson_domain::StopPolicy,
 }
 
 impl EngineConfig {
@@ -346,6 +353,7 @@ impl Config {
                 margin_headroom_bps: Decimal::from(100),    // 1% margin-cap headroom
                 stop_invalidation_guard_enabled: false,
                 stop_invalidation_lookback_candles: 20,
+                stop_policy: robson_domain::StopPolicy::LegacyUncapped,
             },
             tech_stop: TechStopConfigEnv {
                 min_stop_pct: Decimal::new(1, 1), // 0.1%
@@ -454,6 +462,14 @@ impl Config {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(20);
 
+        // Stop policy for NEW arms (issue #154). Strict parse: an unknown
+        // value fails startup instead of silently running legacy.
+        let stop_policy = match env::var("ROBSON_STOP_POLICY") {
+            Ok(value) => robson_domain::StopPolicy::parse(&value)
+                .map_err(|e| DaemonError::Config(format!("ROBSON_STOP_POLICY: {e}")))?,
+            Err(_) => robson_domain::StopPolicy::LegacyUncapped,
+        };
+
         Ok(EngineConfig {
             min_tech_stop_percent: min_tech_stop,
             max_tech_stop_percent: max_tech_stop,
@@ -463,6 +479,7 @@ impl Config {
             margin_headroom_bps,
             stop_invalidation_guard_enabled,
             stop_invalidation_lookback_candles,
+            stop_policy,
         })
     }
 
@@ -743,6 +760,7 @@ impl Default for Config {
                 margin_headroom_bps: Decimal::from(100),    // 1% margin-cap headroom
                 stop_invalidation_guard_enabled: false,
                 stop_invalidation_lookback_candles: 20,
+                stop_policy: robson_domain::StopPolicy::LegacyUncapped,
             },
             tech_stop: TechStopConfigEnv {
                 min_stop_pct: Decimal::ONE,      // 1%

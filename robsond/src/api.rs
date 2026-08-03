@@ -2379,8 +2379,15 @@ where
     );
 
     let stop_buffer_bps = manager.risk_config_snapshot().stop_buffer_bps();
-    let mut summary =
-        position_to_summary(position, live_price, entry_mode, approval_mode, stop_buffer_bps);
+    let trading_rules = manager.trading_rules_for(position).await;
+    let mut summary = position_to_summary(
+        position,
+        live_price,
+        entry_mode,
+        approval_mode,
+        stop_buffer_bps,
+        trading_rules.as_ref(),
+    );
     if matches!(position.state, PositionState::Armed) {
         if let Some(rejection) = manager.entry_exhaustion(position.id).await {
             summary.entry_status = Some("needs_operator_rearm".to_string());
@@ -2434,6 +2441,7 @@ fn position_to_summary(
     entry_mode: Option<String>,
     approval_mode: Option<String>,
     stop_buffer_bps: Decimal,
+    trading_rules: Option<&robson_domain::SymbolTradingRules>,
 ) -> PositionSummary {
     let (
         state_str,
@@ -2512,13 +2520,59 @@ fn position_to_summary(
                 trailing_stop, invalidation_guard_level, ..
             } => {
                 let guard = *invalidation_guard_level;
-                let effective = robson_domain::value_objects::effective_stop_price_with_guard(
-                    position.side,
-                    *trailing_stop,
-                    stop_buffer_bps,
-                    guard,
-                )
-                .as_decimal();
+                // The SAME plan derivation the engine executes with (issue
+                // #154): policy- and snapshot-aware, tick-quantized under
+                // SpanCappedV1. A plan failure (v1 without rules/span)
+                // surfaces as an absent effective stop rather than a wrong
+                // number.
+                let effective =
+                    robson_domain::build_executable_stop_plan(robson_domain::StopPlanInputs {
+                        policy: position.stop_policy,
+                        side: position.side,
+                        technical_stop: *trailing_stop,
+                        guard,
+                        entry_reference: position.entry_price,
+                        technical_span: position.tech_stop_distance.as_ref().map(|t| t.span()),
+                        stop_buffer_bps: position.stop_buffer_bps_at_arm.unwrap_or(stop_buffer_bps),
+                        rules: trading_rules,
+                    })
+                    .map(|plan| plan.trigger.as_decimal());
+                let effective = match effective {
+                    Ok(effective) => effective,
+                    Err(error) => {
+                        warn!(
+                            position_id = %position.id,
+                            %error,
+                            "Stop plan derivation failed for position summary"
+                        );
+                        return PositionSummary {
+                            id: position.id,
+                            symbol: position.symbol.as_pair(),
+                            side: format!("{:?}", position.side),
+                            state: state_str,
+                            exchange_sync_state: None,
+                            created_at: position.created_at,
+                            entry_mode,
+                            approval_mode,
+                            quantity: (position.quantity.as_decimal() > Decimal::ZERO)
+                                .then(|| position.quantity.as_decimal()),
+                            entry_price,
+                            trailing_stop: Some(trailing_stop.as_decimal()),
+                            effective_stop: None,
+                            raw_technical_stop: None,
+                            invalidation_guard_level: None,
+                            effective_stop_basis: None,
+                            stop_policy: position.stop_policy.as_str().to_string(),
+                            stop_buffer_bps_at_arm: position.stop_buffer_bps_at_arm,
+                            tech_stop_distance,
+                            current_price,
+                            pnl,
+                            variation_pct,
+                            entry_status: None,
+                            last_rejection: None,
+                        };
+                    },
+                };
                 let (raw, basis) = match guard {
                     Some(g) => {
                         // Mirrors the domain clamp: the guard binds only when it
@@ -3003,6 +3057,7 @@ mod tests {
             None,
             None,
             Decimal::ZERO,
+            None,
         );
 
         assert_eq!(summary.current_price, Some(dec!(98)));
@@ -3032,6 +3087,7 @@ mod tests {
             None,
             None,
             Decimal::ZERO,
+            None,
         );
 
         assert_eq!(summary.current_price, Some(dec!(90)));
@@ -3051,7 +3107,7 @@ mod tests {
             exit_reason: robson_domain::ExitReason::UserPanic,
         };
 
-        let summary = position_to_summary(&position, None, None, None, Decimal::ZERO);
+        let summary = position_to_summary(&position, None, None, None, Decimal::ZERO, None);
 
         assert_eq!(summary.current_price, Some(dec!(90)));
         assert_eq!(summary.pnl, Some(dec!(20)));
