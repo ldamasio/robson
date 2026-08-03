@@ -7431,12 +7431,13 @@ mod tests {
             updated.state
         );
 
-        // With capital=20000 and the execution-cost buffer (ADR-0039):
-        // worst loss per unit = 7600 distance
-        //                     + 87.40 gap allowance (10 bps of stop 87400)
-        //                     + 95 round-trip fees (0.05% × (95000 + 95000))
-        let worst_loss_per_unit = dec!(7600) + dec!(87.4) + dec!(95);
-        let expected_qty = dec!(200) / worst_loss_per_unit;
+        // With capital=20000 and the adverse-fill costing (issue #154):
+        // trigger 87400 (zero buffer), gap 10 bps below it, fees on entry
+        // and on the adverse fill.
+        let adverse = dec!(87400) - dec!(87.4);
+        let worst_loss_per_unit = (dec!(95000) - adverse) + dec!(0.0005) * (dec!(95000) + adverse);
+        let expected_qty = (dec!(200) / worst_loss_per_unit)
+            .round_dp_with_strategy(12, rust_decimal::RoundingStrategy::ToZero);
         assert_eq!(
             updated.quantity.as_decimal(),
             expected_qty,

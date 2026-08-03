@@ -43,8 +43,9 @@ pub use risk::{
     PositionSummary, ProposedTrade, RiskCheck, RiskContext, RiskGate, RiskLimits, RiskVerdict,
 };
 use robson_domain::{
-    calculate_position_size, DetectorSignal, Event, ExitReason, Position, PositionId,
-    PositionState, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance,
+    build_executable_stop_plan, size_entry, DetectorSignal, Event, ExecutableStopPlan, ExitReason,
+    Position, PositionId, PositionState, Price, Quantity, RiskConfig, Side, StopPlanInputs, Symbol,
+    SymbolTradingRules, TechnicalStopDistance,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -480,6 +481,22 @@ impl Engine {
         signal: &DetectorSignal,
         available_margin: Option<Decimal>,
     ) -> Result<EngineDecision, EngineError> {
+        self.decide_entry_with_rules(position, signal, available_margin, None)
+    }
+
+    /// [`Self::decide_entry`] with runtime symbol trading rules (issue #154).
+    ///
+    /// Rules are required when the position's stop policy is
+    /// `SpanCappedV1` (the executable trigger must be tick-quantized and the
+    /// quantity lot-quantized); a legacy position sizes without them, the
+    /// historical behavior.
+    pub fn decide_entry_with_rules(
+        &self,
+        position: &Position,
+        signal: &DetectorSignal,
+        available_margin: Option<Decimal>,
+        rules: Option<&SymbolTradingRules>,
+    ) -> Result<EngineDecision, EngineError> {
         // 1. Validate position is Armed
         if !matches!(position.state, PositionState::Armed) {
             return Err(EngineError::InvalidPositionState {
@@ -489,64 +506,50 @@ impl Engine {
         }
 
         // 2. Validate signal matches position
-        signal
-            .validate_for_position(position)
-            .map_err(|e| EngineError::DomainError(e))?;
+        signal.validate_for_position(position).map_err(EngineError::DomainError)?;
 
         // 3. Validate and get tech stop distance (single bounds source, ADR-0050 §5)
         let tech_stop = signal.tech_stop_distance();
         tech_stop
             .validate_with_bounds(&self.risk_config.stop_distance_bounds())
-            .map_err(|e| EngineError::DomainError(e))?;
+            .map_err(EngineError::DomainError)?;
 
-        // 4. Resolve the effective stop basis for sizing (ADR-0042). When the detector
-        //    supplied an invalidation guard, clamp the chart-derived technical stop
-        //    beyond the recent adverse extreme before sizing so the 1% budget absorbs
-        //    the worst realizable loss at the guarded level. The domain clamp helper at
-        //    zero buffer returns the clamped level unchanged; `None` guard is the
-        //    identity (historical sizing).
+        // 4. Resolve the executable stop plan ONCE (issue #154): guard-aware basis
+        //    (ADR-0042), span-capped buffer and tick quantization under SpanCappedV1,
+        //    the historical uncapped derivation under legacy. Sizing, the soft exit,
+        //    and the insurance stop all price the SAME trigger from here on.
         let guard = signal
             .technical_stop_analysis
             .as_ref()
             .and_then(|audit| audit.invalidation_guard_level);
-        let effective_stop_level = robson_domain::value_objects::effective_stop_price_with_guard(
-            position.side,
-            tech_stop.initial_stop,
-            Decimal::ZERO,
+        let plan = build_executable_stop_plan(StopPlanInputs {
+            policy: position.stop_policy,
+            side: position.side,
+            technical_stop: tech_stop.initial_stop,
             guard,
-        );
+            entry_reference: Some(signal.entry_price),
+            technical_span: Some(tech_stop.span()),
+            stop_buffer_bps: self.stop_buffer_bps_for(position),
+            rules,
+        })
+        .map_err(EngineError::DomainError)?;
 
-        // Calculate position size from the (possibly clamped) effective stop
-        // distance. A guard that widens the effective distance past the policy
-        // cap makes this return Err — the entry is rejected (guard too wide).
-        // `available_margin` (live exchange balance) bounds the physical
-        // margin cap; the policy capital keeps anchoring the 1% risk budget.
-        let quantity = calculate_position_size(
+        // Size from the plan (ADR-0050 §3): adverse-fill costing, four-stage
+        // bounds validation (the typed executable-stage rejection included),
+        // margin cap against the live balance, and lot-step quantization
+        // down. The planned risk is recomputed from the FINAL quantity and
+        // an overrun is an error, never a clamped report.
+        let sized = size_entry(
             &self.risk_config,
             &signal.entry_price,
             &tech_stop,
-            effective_stop_level,
+            &plan,
             available_margin,
+            rules,
         )
         .map_err(EngineError::DomainError)?;
-
-        // Price this entry's planned worst-case loss (ADR-0043): the same
-        // cost-priced per-unit loss the sizing used, times the final
-        // (possibly margin-capped) quantity. The risk gate charges this
-        // against the monthly budget instead of reserving the full 1% cap,
-        // so lower-risk entries leave room for extra operations in the month.
-        // Clamped to the cap: on the risk-sized path qty = max_risk / per_unit
-        // and Decimal quotient rounding can put per_unit × qty a hair above
-        // max_risk; the sizing guarantees the cap by construction, so the
-        // excess is a rounding artifact, not real risk.
-        let planned_entry_risk = (robson_domain::worst_case_loss_per_unit(
-            &self.risk_config,
-            &signal.entry_price,
-            effective_stop_level,
-        )
-        .map_err(EngineError::DomainError)?
-            * quantity.as_decimal())
-        .min(self.risk_config.max_risk_amount());
+        let quantity = sized.quantity;
+        let planned_entry_risk = sized.planned_risk;
 
         debug!(
             position_id = %position.id,
@@ -644,6 +647,33 @@ impl Engine {
         binance_position_id: Option<String>,
         invalidation_guard_level: Option<Price>,
     ) -> Result<EngineDecision, EngineError> {
+        self.process_entry_fill_with_rules(
+            position,
+            fill_price,
+            filled_quantity,
+            fee,
+            filled_at,
+            binance_position_id,
+            invalidation_guard_level,
+            None,
+        )
+    }
+
+    /// [`Self::process_entry_fill`] with runtime symbol trading rules so the
+    /// insurance stop is placed at the plan's tick-quantized trigger
+    /// (issue #154).
+    #[allow(clippy::too_many_arguments)]
+    pub fn process_entry_fill_with_rules(
+        &self,
+        position: &Position,
+        fill_price: Price,
+        filled_quantity: Quantity,
+        fee: rust_decimal::Decimal,
+        filled_at: DateTime<Utc>,
+        binance_position_id: Option<String>,
+        invalidation_guard_level: Option<Price>,
+        rules: Option<&SymbolTradingRules>,
+    ) -> Result<EngineDecision, EngineError> {
         // 1. Validate position is Entering
         let entry_order_id = match &position.state {
             PositionState::Entering {
@@ -710,27 +740,61 @@ impl Engine {
                 binance_position_id,
                 timestamp: filled_at,
             }),
-            // Place a reduce-only protective stop on the exchange at the initial
-            // trailing stop (ADR-0039). Placement failure is tolerated by the
-            // executor (audit event) — the software stop remains the primary
-            // exit path.
+            // Place a reduce-only protective stop on the exchange at the
+            // plan's executable trigger (ADR-0039/ADR-0041): the SAME price
+            // the soft exit compares against. Placement failure is tolerated
+            // by the executor (audit event) — the software stop remains the
+            // primary exit path.
             EngineAction::PlaceInsuranceStop {
                 position_id: position.id,
                 symbol: position.symbol.clone(),
                 side: position.side.exit_action(),
                 quantity: filled_quantity,
-                // Executable price: technical stop offset by the configured
-                // buffer (events keep the technical value), clamped to the
-                // entry-time guard while it is still active (ADR-0042).
-                stop_price: self.effective_stop(
-                    position.side,
-                    initial_trailing_stop,
-                    invalidation_guard_level,
-                ),
+                stop_price: self
+                    .stop_plan_or_fill_fallback(
+                        &updated_position,
+                        initial_trailing_stop,
+                        invalidation_guard_level,
+                        rules,
+                    )
+                    .trigger,
             },
         ];
 
         Ok(EngineDecision::with_position(actions, updated_position))
+    }
+
+    /// Resolve the fill-time stop plan, degrading to the legacy derivation
+    /// if the plan cannot be built. A real fill already happened here: a
+    /// position left without any insurance stop is strictly worse than one
+    /// protected at an unquantized trigger, so this path is protection-first
+    /// (the failure is logged; the legacy derivation never fails).
+    fn stop_plan_or_fill_fallback(
+        &self,
+        position: &Position,
+        technical_stop: Price,
+        guard: Option<Price>,
+        rules: Option<&SymbolTradingRules>,
+    ) -> ExecutableStopPlan {
+        self.stop_plan(position, technical_stop, guard, rules).unwrap_or_else(|error| {
+            tracing::error!(
+                position_id = %position.id,
+                %error,
+                "Fill-time stop plan failed; falling back to the legacy derivation so the \
+                 insurance stop still exists"
+            );
+            build_executable_stop_plan(StopPlanInputs {
+                policy: robson_domain::StopPolicy::LegacyUncapped,
+                side: position.side,
+                technical_stop,
+                guard,
+                entry_reference: position.entry_price,
+                technical_span: position.tech_stop_distance.as_ref().map(|t| t.span()),
+                stop_buffer_bps: self.stop_buffer_bps_for(position),
+                rules: None,
+            })
+            .expect("legacy stop plan derivation is total")
+        })
     }
 
     // =========================================================================
@@ -756,6 +820,20 @@ impl Engine {
         &self,
         position: &Position,
         market_data: &MarketData,
+    ) -> Result<EngineDecision, EngineError> {
+        self.process_active_position_with_rules(position, market_data, None)
+    }
+
+    /// [`Self::process_active_position`] with runtime symbol trading rules
+    /// (issue #154): the soft-exit comparison and any insurance
+    /// place/replace price derive from the SAME tick-quantized plan trigger
+    /// under `SpanCappedV1`. A v1 position without rules is an error (fail
+    /// closed), never a silent fallback to the unquantized derivation.
+    pub fn process_active_position_with_rules(
+        &self,
+        position: &Position,
+        market_data: &MarketData,
+        rules: Option<&SymbolTradingRules>,
     ) -> Result<EngineDecision, EngineError> {
         // Validate position is active
         let (_current_price_in_state, trailing_stop, favorable_extreme, last_emitted_stop, guard) =
@@ -799,12 +877,15 @@ impl Engine {
         let observed_watermark =
             Self::observed_watermark(position.side, current_price, favorable_extreme);
 
-        // Check exit first (higher priority)
-        if self.should_exit(position.side, current_price, trailing_stop, guard) {
+        // Check exit first (higher priority). The comparison price is THE
+        // plan trigger — the same price the insurance stop sits at.
+        let plan = self.stop_plan(position, trailing_stop, guard, rules)?;
+        if self.should_exit(position.side, current_price, &plan) {
             debug!(
                 position_id = %position.id,
                 current_price = %current_price,
                 trailing_stop = %trailing_stop,
+                executable_trigger = %plan.trigger,
                 "Exit triggered"
             );
             let monitor_tick = self.create_position_monitor_tick_event(
@@ -838,14 +919,15 @@ impl Engine {
                         new_stop = %new_stop,
                         "Trailing stop updated"
                     );
-                    return Ok(self.create_update_stop_decision(
+                    return self.create_update_stop_decision(
                         position,
                         trailing_stop,
                         new_stop,
                         current_price,
                         observed_watermark,
                         market_data.timestamp,
-                    ));
+                        rules,
+                    );
                 }
             }
         }
@@ -861,42 +943,52 @@ impl Engine {
         Ok(EngineDecision::with_actions(vec![EngineAction::EmitEvent(monitor_tick)]))
     }
 
-    /// Derive the executable stop from the chart-derived technical stop.
-    ///
-    /// The technical stop stays the conceptual reference everywhere (trailing
-    /// ladder, events, persistence); execution — the soft-exit comparison and
-    /// the exchange-side insurance stop — triggers a small operator-configured
-    /// buffer beyond it (below for longs, above for shorts). Zero buffer, the
-    /// default, is the historical behavior. The buffer is priced into
-    /// position sizing (Policy 10).
-    fn effective_stop(&self, side: Side, technical_stop: Price, guard: Option<Price>) -> Price {
-        robson_domain::value_objects::effective_stop_price_with_guard(
-            side,
+    /// The ADR-0041 buffer this position's executable stop derives with:
+    /// the arm-time snapshot when present (issue #154: a config change
+    /// between restarts must not move a live stop), else the live config
+    /// (positions armed before versioning, the historical behavior).
+    fn stop_buffer_bps_for(&self, position: &Position) -> Decimal {
+        position
+            .stop_buffer_bps_at_arm
+            .unwrap_or_else(|| self.risk_config.stop_buffer_bps())
+    }
+
+    /// Resolve the executable stop plan for a live position (issue #154):
+    /// the SINGLE derivation behind the soft-exit comparison, insurance
+    /// placement/replacement, the API, and startup recovery. The technical
+    /// stop stays the conceptual reference everywhere (trailing ladder,
+    /// events, persistence); execution triggers at the plan trigger.
+    pub fn stop_plan(
+        &self,
+        position: &Position,
+        technical_stop: Price,
+        guard: Option<Price>,
+        rules: Option<&SymbolTradingRules>,
+    ) -> Result<ExecutableStopPlan, EngineError> {
+        build_executable_stop_plan(StopPlanInputs {
+            policy: position.stop_policy,
+            side: position.side,
             technical_stop,
-            self.risk_config.stop_buffer_bps(),
             guard,
-        )
+            entry_reference: position.entry_price,
+            technical_span: position.tech_stop_distance.as_ref().map(|t| t.span()),
+            stop_buffer_bps: self.stop_buffer_bps_for(position),
+            rules,
+        })
+        .map_err(EngineError::DomainError)
     }
 
     /// Check if position should exit (executable stop hit)
     ///
-    /// The comparison uses the EXECUTABLE stop (technical stop offset by the
-    /// configured buffer, clamped to the entry-time guard while it is still
-    /// active), so the software exit and the exchange-side insurance stop
-    /// trigger at the same level.
-    fn should_exit(
-        &self,
-        side: Side,
-        current_price: Price,
-        trailing_stop: Price,
-        guard: Option<Price>,
-    ) -> bool {
-        let effective = self.effective_stop(side, trailing_stop, guard);
+    /// The comparison uses the plan trigger — the same executable price the
+    /// exchange-side insurance stop sits at (ADR-0041 single-price
+    /// invariant).
+    fn should_exit(&self, side: Side, current_price: Price, plan: &ExecutableStopPlan) -> bool {
         match side {
             // LONG: exit when price drops to or below the executable stop
-            Side::Long => current_price.as_decimal() <= effective.as_decimal(),
+            Side::Long => current_price.as_decimal() <= plan.trigger.as_decimal(),
             // SHORT: exit when price rises to or above the executable stop
-            Side::Short => current_price.as_decimal() >= effective.as_decimal(),
+            Side::Short => current_price.as_decimal() >= plan.trigger.as_decimal(),
         }
     }
 
@@ -1037,6 +1129,7 @@ impl Engine {
     }
 
     /// Create decision for trailing stop update
+    #[allow(clippy::too_many_arguments)]
     fn create_update_stop_decision(
         &self,
         position: &Position,
@@ -1045,7 +1138,8 @@ impl Engine {
         trigger_price: Price,
         observed_watermark: Price,
         tick_timestamp: DateTime<Utc>,
-    ) -> EngineDecision {
+        rules: Option<&SymbolTradingRules>,
+    ) -> Result<EngineDecision, EngineError> {
         // Read the live insurance-stop order id (if any) to decide replace vs
         // place on this trailing advance (ADR-0039).
         let insurance_stop_id = match &position.state {
@@ -1090,7 +1184,12 @@ impl Engine {
         // (ADR-0039). Replace when a stop is already live; otherwise place
         // (covers positions opened before this feature, or a prior place that
         // failed). Idempotency derives from the exchange order id; failures are
-        // tolerated by the executor.
+        // tolerated by the executor. The guard is released on the first
+        // trailing advance (ADR-0042), so the plan derives with no guard;
+        // trailing triggers are NOT re-validated against admission bounds
+        // (they may legitimately cross the entry protecting profit).
+        let new_trigger =
+            self.stop_plan(position, new_stop, None, rules).map(|plan| plan.trigger)?;
         let insurance_action = match insurance_stop_id {
             Some(previous_order_id) => EngineAction::ReplaceInsuranceStop {
                 position_id: position.id,
@@ -1098,14 +1197,14 @@ impl Engine {
                 side: position.side.exit_action(),
                 quantity: position.quantity,
                 previous_order_id,
-                new_stop_price: self.effective_stop(position.side, new_stop, None),
+                new_stop_price: new_trigger,
             },
             None => EngineAction::PlaceInsuranceStop {
                 position_id: position.id,
                 symbol: position.symbol.clone(),
                 side: position.side.exit_action(),
                 quantity: position.quantity,
-                stop_price: self.effective_stop(position.side, new_stop, None),
+                stop_price: new_trigger,
             },
         };
 
@@ -1137,7 +1236,7 @@ impl Engine {
             )),
         ];
 
-        EngineDecision::with_position(actions, updated_position)
+        Ok(EngineDecision::with_position(actions, updated_position))
     }
 }
 
@@ -1722,9 +1821,12 @@ mod tests {
                 _ => None,
             })
             .unwrap();
-        // $100 budget / ($1,500 distance + $93.50 gap allowance (10 bps of
-        // stop) + $95 round-trip fees) — execution-cost buffer per ADR-0039.
-        let expected_size = dec!(100) / (dec!(1500) + dec!(93.5) + dec!(95));
+        // Adverse-fill costing (issue #154): trigger 93500 (zero buffer),
+        // gap 10 bps below it, fees on entry and on the adverse fill.
+        let adverse = dec!(93500) - dec!(93.5);
+        let per_unit = (dec!(95000) - adverse) + dec!(0.0005) * (dec!(95000) + adverse);
+        let expected_size = (dec!(100) / per_unit)
+            .round_dp_with_strategy(12, rust_decimal::RoundingStrategy::ToZero);
         assert_eq!(quantity.as_decimal(), expected_size);
     }
 
@@ -2513,12 +2615,18 @@ mod tests {
             })
             .unwrap();
 
-        // Sized for the GUARDED distance (2500), not the technical (1500):
-        // 100 / (2500 + 92.5 gap (10 bps of 92500) + 95 fees).
-        let expected = dec!(100) / (dec!(2500) + dec!(92.5) + dec!(95));
+        // Sized for the GUARDED trigger (92500), not the technical (93500):
+        // adverse fill = 92500 - 92.5 (gap 10 bps), fees on entry + adverse.
+        let adverse = dec!(92500) - dec!(92.5);
+        let per_unit = (dec!(95000) - adverse) + dec!(0.0005) * (dec!(95000) + adverse);
+        let expected = (dec!(100) / per_unit)
+            .round_dp_with_strategy(12, rust_decimal::RoundingStrategy::ToZero);
         assert_eq!(quantity.as_decimal(), expected);
-        // Strictly smaller than the unguarded sizing (distance 1500).
-        assert!(quantity.as_decimal() < dec!(100) / (dec!(1500) + dec!(93.5) + dec!(95)));
+        // Strictly smaller than the unguarded sizing (trigger 93500).
+        let unguarded_adverse = dec!(93500) - dec!(93.5);
+        let unguarded_per_unit =
+            (dec!(95000) - unguarded_adverse) + dec!(0.0005) * (dec!(95000) + unguarded_adverse);
+        assert!(quantity.as_decimal() < dec!(100) / unguarded_per_unit);
     }
 
     #[test]

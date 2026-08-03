@@ -190,77 +190,85 @@ impl Position {
 // Position Sizing (Golden Rule)
 // =============================================================================
 
-/// Calculate position size based on risk management rules
+/// The admission-time sizing result: the final quantity plus the exact risk
+/// numbers it was priced with, so callers charge the REAL planned risk
+/// against the monthly budget (ADR-0043) instead of re-deriving it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SizedEntry {
+    /// Final quantity: risk-sized, margin-capped, and lot-step quantized
+    /// down when trading rules are available.
+    pub quantity: Quantity,
+    /// Worst expected realized loss per unit (adverse-fill costing from the
+    /// executable stop plan).
+    pub worst_case_loss_per_unit: rust_decimal::Decimal,
+    /// `worst_case_loss_per_unit x quantity`, recomputed AFTER quantization.
+    /// Guaranteed `<= capital x 1%`; an overrun is a hard error, never a
+    /// silently clamped report.
+    pub planned_risk: rust_decimal::Decimal,
+}
+
+/// Calculate the admission-time entry size from the executable stop plan
+/// (ADR-0050 §3, issue #154 deliverable 4).
 ///
-/// **THE GOLDEN RULE**: Position size is DERIVED from technical stop distance.
-///
-/// The 1% budget is a maximum-loss cap (ADR-0024 Policy 10), so it must
-/// absorb the worst expected realized loss, not just the chart distance:
-/// round-trip taker fees and a gap allowance past the stop are priced into
-/// the denominator (ADR-0039).
+/// **THE GOLDEN RULE**: position size is DERIVED from the stop distance, and
+/// the 1% budget is a maximum-loss CEILING that must absorb the worst
+/// expected realized loss through the executable path:
 ///
 /// ```text
-/// Worst loss per unit = Stop Distance
-///                     + Gap Allowance            (stop × gap_bps / 10000)
-///                     + Round-trip fees per unit (fee_rate × (entry + max(entry, stop)))
-/// Risk-sized qty   = Max Risk Amount / Worst loss per unit
-/// Margin basis     = min(Capital, Available Margin)   (live exchange balance when known)
-/// Margin-sized qty = Margin basis × (1 − margin_headroom) / Entry Price
-/// Position Size    = min(Risk-sized qty, Margin-sized qty)
+/// trigger          = plan.trigger (tick-quantized under span_capped_v1)
+/// gap              = trigger x gap_bps / 10_000
+/// adverse_fill     = Long: trigger - gap | Short: trigger + gap
+/// worst_loss/unit  = directional_distance(entry, adverse_fill)
+///                  + taker_fee x entry + taker_fee x adverse_fill
+/// Risk-sized qty   = Max Risk Amount / worst_loss_per_unit   (truncated)
+/// Margin basis     = min(Capital, Available Margin)
+/// Margin-sized qty = Margin basis x (1 - margin_headroom) / Entry Price
+/// qty              = quantize_down(min(risk qty, margin qty), lot step)
+/// planned_risk     = qty x worst_loss_per_unit               (<= ceiling)
 /// ```
 ///
-/// # Example
-///
-/// ```
-/// # use robson_domain::value_objects::{RiskConfig, Price, TechnicalStopDistance};
-/// # use robson_domain::entities::calculate_position_size;
-/// # use rust_decimal_macros::dec;
-/// let config = RiskConfig::new(dec!(10000)).unwrap(); // $10k, 1% cap
-/// let entry = Price::new(dec!(95000)).unwrap();
-/// let stop = Price::new(dec!(93500)).unwrap();
-/// let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
-/// let effective_stop_level = tech_stop.initial_stop;
-///
-/// // `None` available margin = size against the policy capital alone.
-/// let size =
-///     calculate_position_size(&config, &entry, &tech_stop, effective_stop_level, None).unwrap();
-///
-/// // Max Risk = $10,000 × 1% = $100
-/// // Worst loss per unit = $1,500 + $93.50 (10 bps of stop)
-/// //                     + $95 (0.05% × ($95,000 + $95,000)) = $1,688.50
-/// // Margin cap = $10,000 × 0.99 / $95,000 = 0.1042... BTC (100 bps headroom)
-/// // Final Position Size = min($100 / $1,688.50, 0.1052...)
-/// // = 0.0592... BTC
-/// assert!(size.as_decimal() > dec!(0.059) && size.as_decimal() < dec!(0.0593));
-/// ```
-///
-/// # Key Insight
-///
-/// - Wide technical stop → Smaller position size
-/// - Tight technical stop → Larger position size
-/// - **Worst expected realized loss stays at or below the configured maximum**
+/// Validity stages re-checked here against the single bounds source
+/// (ADR-0050 §5): the raw technical span (stage 1), the guard-aware basis
+/// (stage 2), and the FINAL executable trigger (stage 3, typed
+/// [`DomainError::ExecutableStopOutOfBounds`]).
 ///
 /// # Errors
 ///
-/// Returns `DomainError::PositionSizingError` if:
-/// - Technical stop distance is zero
-/// - Calculated quantity would be <= 0
-pub fn calculate_position_size(
+/// Returns a `DomainError` when any validity stage fails, the lot-quantized
+/// quantity falls below the exchange minimum, the notional is below
+/// `MIN_NOTIONAL`, or the recomputed planned risk would exceed the ceiling
+/// (never masked by clamping the reported number).
+pub fn size_entry(
     risk_config: &RiskConfig,
     entry_price: &Price,
     tech_stop: &TechnicalStopDistance,
-    effective_stop_level: Price,
+    plan: &crate::executable_stop::ExecutableStopPlan,
     available_margin: Option<rust_decimal::Decimal>,
-) -> Result<Quantity, DomainError> {
-    // Validate tech stop first (single bounds source, ADR-0050 §5)
-    tech_stop.validate_with_bounds(&risk_config.stop_distance_bounds())?;
+    rules: Option<&crate::trading_rules::SymbolTradingRules>,
+) -> Result<SizedEntry, DomainError> {
+    let bounds = risk_config.stop_distance_bounds();
+
+    // Stage 1: raw technical span.
+    tech_stop.validate_with_bounds(&bounds)?;
+    // Stage 2: guard-aware basis (a guard that widens the distance past the
+    // cap rejects the entry, ADR-0042 "guard too wide").
+    TechnicalStopDistance::from_entry_and_stop(*entry_price, plan.basis)
+        .validate_with_bounds(&bounds)?;
+    // Stage 3: FINAL executable trigger, post guard + cap + tick. Typed so
+    // the rejection carries its own reason code.
+    plan.validate_admission_bounds(*entry_price, &bounds)?;
 
     let entry = entry_price.as_decimal();
     let worst_loss_per_unit =
-        worst_case_loss_per_unit(risk_config, entry_price, effective_stop_level)?;
+        crate::executable_stop::worst_case_loss_per_unit_planned(risk_config, *entry_price, plan)?;
 
     let max_risk = risk_config.max_risk_amount();
-    let risk_sized_qty = max_risk / worst_loss_per_unit;
+    // Truncate the risk-sized quantity (12 dp, far finer than any exchange
+    // lot step) so `qty x per_unit <= max_risk` holds exactly in Decimal:
+    // nearest-rounding of the 28-digit quotient could land a hair ABOVE the
+    // cap, which used to be masked by clamping the reported risk.
+    let risk_sized_qty = (max_risk / worst_loss_per_unit)
+        .round_dp_with_strategy(12, rust_decimal::RoundingStrategy::ToZero);
     // The margin cap is a PHYSICAL bound, distinct from the policy capital
     // that anchors the 1% risk budget (ADR-0024 §6: capital_base stays at the
     // month-start snapshot while governed losses accrue). Its basis is the
@@ -289,7 +297,25 @@ pub fn calculate_position_size(
         ((margin_basis * headroom_factor * rust_decimal::Decimal::from(RiskConfig::LEVERAGE))
             / entry)
             .round_dp_with_strategy(8, rust_decimal::RoundingStrategy::ToZero);
-    let position_size = risk_sized_qty.min(margin_sized_qty);
+    let mut position_size = risk_sized_qty.min(margin_sized_qty);
+
+    // Lot-step quantization DOWN before submission (ADR-0050 §3): the
+    // quantity the risk gate prices is the quantity the exchange executes.
+    if let Some(rules) = rules {
+        position_size = rules.quantize_qty_down(position_size);
+        if position_size < rules.min_qty() {
+            return Err(DomainError::PositionSizingError(format!(
+                "Quantity {position_size} quantizes below {} minimum {} at lot step {}. \
+                 Increase capital or widen the stop distance; Robson will not round up.",
+                rules.symbol().as_pair(),
+                rules.min_qty(),
+                rules.step_size()
+            )));
+        }
+        rules
+            .validate_notional(entry, position_size)
+            .map_err(|e| DomainError::PositionSizingError(e.to_string()))?;
+    }
 
     if position_size <= rust_decimal::Decimal::ZERO {
         return Err(DomainError::PositionSizingError(
@@ -297,45 +323,24 @@ pub fn calculate_position_size(
         ));
     }
 
-    Quantity::new(position_size).map_err(|e| DomainError::PositionSizingError(e.to_string()))
-}
-
-/// Worst expected realized loss per unit of quantity for an entry at
-/// `entry_price` with the effective stop at `effective_stop_level`.
-///
-/// Golden Rule cost pricing (ADR-0039, Policy 10): chart distance to the
-/// effective stop, the executable-stop buffer beyond it, expected gap past
-/// the stop, and round-trip taker fees. The exit-fee base uses
-/// max(entry, stop) so the buffer stays conservative for both sides.
-///
-/// This is the same per-unit loss `calculate_position_size` prices the 1%
-/// cap against; multiplied by the final (possibly margin-capped) quantity it
-/// yields the planned worst-case loss the risk gate charges against the
-/// monthly budget (ADR-0043).
-pub fn worst_case_loss_per_unit(
-    risk_config: &RiskConfig,
-    entry_price: &Price,
-    effective_stop_level: Price,
-) -> Result<rust_decimal::Decimal, DomainError> {
-    let effective_stop =
-        TechnicalStopDistance::from_entry_and_stop(*entry_price, effective_stop_level);
-    effective_stop.validate_with_bounds(&risk_config.stop_distance_bounds())?;
-    let stop_distance = effective_stop.distance;
-
-    if stop_distance <= rust_decimal::Decimal::ZERO {
-        return Err(DomainError::PositionSizingError("Stop distance must be positive".to_string()));
+    // Recompute the REAL planned risk from the final quantity. Quantization
+    // only reduced the quantity, so this must sit at or under the ceiling;
+    // if it ever does not, that is a sizing defect and the entry is
+    // rejected — the number reported to the risk gate is never clamped.
+    let planned_risk = position_size * worst_loss_per_unit;
+    if planned_risk > max_risk {
+        return Err(DomainError::PositionSizingError(format!(
+            "Planned risk {planned_risk} exceeds the per-trade cap {max_risk}"
+        )));
     }
 
-    let entry = entry_price.as_decimal();
-    if entry <= rust_decimal::Decimal::ZERO {
-        return Err(DomainError::PositionSizingError("Entry price must be positive".to_string()));
-    }
-
-    let stop = effective_stop_level.as_decimal();
-    let stop_buffer = stop * risk_config.stop_buffer_bps() / rust_decimal::Decimal::from(10_000);
-    let gap_allowance = stop * risk_config.stop_gap_bps() / rust_decimal::Decimal::from(10_000);
-    let round_trip_fees_per_unit = risk_config.taker_fee_rate() * (entry + entry.max(stop));
-    Ok(stop_distance + stop_buffer + gap_allowance + round_trip_fees_per_unit)
+    let quantity = Quantity::new(position_size)
+        .map_err(|e| DomainError::PositionSizingError(e.to_string()))?;
+    Ok(SizedEntry {
+        quantity,
+        worst_case_loss_per_unit: worst_loss_per_unit,
+        planned_risk,
+    })
 }
 
 /// Calculate notional value of position
@@ -1171,244 +1176,278 @@ mod tests {
         assert_eq!(order.fill_price.unwrap().as_decimal(), dec!(95000.0));
     }
 
-    // Position Sizing tests (Golden Rule)
-    #[test]
-    fn test_calculate_position_size_basic() {
-        // Setup: $10,000 capital, 1% cap
-        let config = RiskConfig::new(dec!(10000)).unwrap();
+    // Position Sizing tests (Golden Rule, plan-based per issue #154)
 
-        // Entry: $95,000, Stop: $93,500 (distance = $1,500)
+    use crate::{
+        executable_stop::{build_executable_stop_plan, StopPlanInputs},
+        stop_policy::StopPolicy,
+        trading_rules::SymbolTradingRules,
+    };
+
+    /// Legacy-policy plan (the derivation production runs today).
+    fn legacy_plan(
+        side: Side,
+        technical_stop: Decimal,
+        stop_buffer_bps: Decimal,
+        guard: Option<Decimal>,
+    ) -> crate::executable_stop::ExecutableStopPlan {
+        build_executable_stop_plan(StopPlanInputs {
+            policy: StopPolicy::LegacyUncapped,
+            side,
+            technical_stop: Price::new(technical_stop).unwrap(),
+            guard: guard.map(|g| Price::new(g).unwrap()),
+            entry_reference: None,
+            technical_span: None,
+            stop_buffer_bps,
+            rules: None,
+        })
+        .unwrap()
+    }
+
+    /// Expected per-unit worst loss under the normative adverse-fill formula
+    /// (gap 10 bps, taker fee 0.05% per side, the RiskConfig defaults).
+    fn expected_per_unit(entry: Decimal, trigger: Decimal, side: Side) -> Decimal {
+        let gap = trigger * dec!(10) / dec!(10000);
+        let adverse = match side {
+            Side::Long => trigger - gap,
+            Side::Short => trigger + gap,
+        };
+        let distance = match side {
+            Side::Long => entry - adverse,
+            Side::Short => adverse - entry,
+        };
+        distance + dec!(0.0005) * (entry + adverse)
+    }
+
+    fn btcusdt_rules() -> SymbolTradingRules {
+        SymbolTradingRules::new(
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            dec!(0.10),
+            dec!(556.80),
+            dec!(0.001),
+            dec!(0.001),
+            dec!(1000),
+            dec!(100),
+            2,
+            3,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn test_size_entry_basic() {
+        // Setup: $10,000 capital, 1% cap; entry $95,000, stop $93,500.
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let entry = Price::new(dec!(95000)).unwrap();
         let stop = Price::new(dec!(93500)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let plan = legacy_plan(Side::Long, dec!(93500), Decimal::ZERO, None);
 
-        let size =
-            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop, None)
-                .unwrap();
+        let sized = size_entry(&config, &entry, &tech_stop, &plan, None, None).unwrap();
 
-        // Expected: $100 risk / ($1,500 distance + $93.50 gap allowance
-        // (10 bps of stop) + $95 round-trip fees (0.05% × $190,000))
-        let expected = dec!(100) / (dec!(1500) + dec!(93.5) + dec!(95));
-        assert_eq!(size.as_decimal(), expected);
+        let per_unit = expected_per_unit(dec!(95000), dec!(93500), Side::Long);
+        assert_eq!(sized.worst_case_loss_per_unit, per_unit);
+        let expected_qty = (dec!(100) / per_unit)
+            .round_dp_with_strategy(12, rust_decimal::RoundingStrategy::ToZero);
+        assert_eq!(sized.quantity.as_decimal(), expected_qty);
+        assert_eq!(sized.planned_risk, expected_qty * per_unit);
+        assert!(sized.planned_risk <= config.max_risk_amount());
     }
 
     #[test]
-    fn test_calculate_position_size_wider_stop() {
-        // Wider stop = smaller position
+    fn test_size_entry_wider_stop_smaller_position() {
         let config = RiskConfig::new(dec!(10000)).unwrap();
-
-        // Wide stop: $3,000 distance
         let entry = Price::new(dec!(95000)).unwrap();
-        let stop = Price::new(dec!(92000)).unwrap();
-        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
-        let size =
-            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop, None)
-                .unwrap();
+        let narrow_stop = Price::new(dec!(93500)).unwrap();
+        let narrow = size_entry(
+            &config,
+            &entry,
+            &TechnicalStopDistance::from_entry_and_stop(entry, narrow_stop),
+            &legacy_plan(Side::Long, dec!(93500), Decimal::ZERO, None),
+            None,
+            None,
+        )
+        .unwrap();
 
-        // Expected: $100 / ($3,000 + $92 gap + $95 fees)
-        let expected = dec!(100) / (dec!(3000) + dec!(92) + dec!(95));
-        assert_eq!(size.as_decimal(), expected);
+        let wide_stop = Price::new(dec!(92000)).unwrap();
+        let wide = size_entry(
+            &config,
+            &entry,
+            &TechnicalStopDistance::from_entry_and_stop(entry, wide_stop),
+            &legacy_plan(Side::Long, dec!(92000), Decimal::ZERO, None),
+            None,
+            None,
+        )
+        .unwrap();
+
+        assert!(wide.quantity.as_decimal() < narrow.quantity.as_decimal());
     }
 
     #[test]
-    fn test_calculate_position_size_tighter_stop_is_margin_capped() {
-        // Tighter stop would normally allow a larger position, but 1x margin caps it.
+    fn test_size_entry_tighter_stop_is_margin_capped() {
+        // Tighter stop would allow a larger position, but 1x margin caps it.
         let config = RiskConfig::new(dec!(10000)).unwrap();
-
-        // Tight stop: $500 distance (still valid, ~0.5%)
         let entry = Price::new(dec!(95000)).unwrap();
         let stop = Price::new(dec!(94500)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let plan = legacy_plan(Side::Long, dec!(94500), Decimal::ZERO, None);
 
-        let size =
-            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop, None)
-                .unwrap();
+        let sized = size_entry(&config, &entry, &tech_stop, &plan, None, None).unwrap();
 
-        // The margin cap reserves the headroom (default 100 bps) and is
-        // truncated (never rounded up) so the gate's qty × entry round-trip
-        // stays ≤ capital and the order is executable on the exchange.
         let expected = (config.capital() * dec!(0.99) / entry.as_decimal())
             .round_dp_with_strategy(8, rust_decimal::RoundingStrategy::ToZero);
-        let loss = size.as_decimal() * dec!(500);
-        assert_eq!(size.as_decimal(), expected);
-        assert!(loss < config.max_risk_amount());
+        assert_eq!(sized.quantity.as_decimal(), expected);
+        assert!(sized.planned_risk < config.max_risk_amount());
     }
 
     #[test]
-    fn test_calculate_position_size_higher_capital() {
-        // v3: risk cap is 1%, but with higher capital ($50k)
+    fn test_size_entry_higher_capital() {
         let config = RiskConfig::new(dec!(50000)).unwrap();
-
         let entry = Price::new(dec!(95000)).unwrap();
         let stop = Price::new(dec!(93500)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let plan = legacy_plan(Side::Long, dec!(93500), Decimal::ZERO, None);
 
-        let size =
-            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop, None)
-                .unwrap();
+        let sized = size_entry(&config, &entry, &tech_stop, &plan, None, None).unwrap();
 
-        // Expected: $500 (1% of 50k) / ($1,500 + $93.50 gap + $95 fees)
-        let expected = dec!(500) / (dec!(1500) + dec!(93.5) + dec!(95));
-        assert_eq!(size.as_decimal(), expected);
+        let per_unit = expected_per_unit(dec!(95000), dec!(93500), Side::Long);
+        let expected_qty = (dec!(500) / per_unit)
+            .round_dp_with_strategy(12, rust_decimal::RoundingStrategy::ToZero);
+        assert_eq!(sized.quantity.as_decimal(), expected_qty);
     }
 
     #[test]
-    fn test_calculate_notional_value() {
-        let quantity = Quantity::new(dec!(0.1)).unwrap();
-        let price = Price::new(dec!(95000)).unwrap();
-
-        let notional = calculate_notional_value(&quantity, &price);
-        assert_eq!(notional, dec!(9500)); // 0.1 * 95000
-    }
-
-    #[test]
-    fn test_calculate_margin_required() {
-        let quantity = Quantity::new(dec!(0.1)).unwrap();
-        let price = Price::new(dec!(95000)).unwrap();
-
-        let margin = calculate_margin_required(&quantity, &price);
-        // Notional = $9,500, Leverage = 1x, Margin = $9,500
-        assert_eq!(margin, dec!(9500));
-    }
-
-    #[test]
-    fn test_position_sizing_risk_stays_within_cap() {
-        // This test validates the golden rule with the execution-cost buffer
-        // (ADR-0039): regardless of stop distance, the WORST EXPECTED realized
-        // loss — price distance through the gap allowance plus round-trip
-        // fees — lands exactly on the 1% budget, so the chart-distance loss
-        // alone stays strictly below it.
-        let config = RiskConfig::new(dec!(10000)).unwrap(); // $100 risk
+    fn test_position_sizing_risk_stays_at_or_under_cap() {
+        // Regardless of stop distance, the planned worst-case loss lands on
+        // the 1% ceiling (within truncation) and NEVER above it.
+        let config = RiskConfig::new(dec!(10000)).unwrap(); // $100 cap
 
         for (entry, stop) in [(dec!(95000), dec!(92000)), (dec!(95000), dec!(94000))] {
             let entry = Price::new(entry).unwrap();
-            let stop = Price::new(stop).unwrap();
-            let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
-            let size =
-                calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop, None)
-                    .unwrap();
-            let qty = size.as_decimal();
+            let stop_price = Price::new(stop).unwrap();
+            let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop_price);
+            let plan = legacy_plan(Side::Long, stop, Decimal::ZERO, None);
+            let sized = size_entry(&config, &entry, &tech_stop, &plan, None, None).unwrap();
 
-            let gap = stop.as_decimal() * config.stop_gap_bps() / dec!(10000);
-            let fees = config.taker_fee_rate()
-                * (entry.as_decimal() + entry.as_decimal().max(stop.as_decimal()));
-            let worst_loss = qty * (tech_stop.distance + gap + fees);
-            let chart_loss = qty * tech_stop.distance;
-
-            // Worst expected loss consumes the budget exactly...
-            assert_eq!(worst_loss.round_dp(2), dec!(100));
-            // ...so the pure chart-distance loss is strictly inside the cap.
+            assert!(sized.planned_risk <= dec!(100), "planned {} > cap", sized.planned_risk);
+            assert!(
+                sized.planned_risk > dec!(99.99),
+                "planned {} too far under",
+                sized.planned_risk
+            );
+            // The chart-distance loss alone stays strictly inside the cap.
+            let chart_loss = sized.quantity.as_decimal() * tech_stop.distance;
             assert!(chart_loss < config.max_risk_amount());
         }
     }
 
     #[test]
-    fn test_position_size_prices_stop_buffer_into_budget() {
-        // With an executable-stop buffer the worst realizable distance widens,
-        // so the same budget buys a smaller position and the worst expected
-        // loss (through the buffered stop, gap, and fees) stays on the cap.
-        let base = RiskConfig::new(dec!(10000)).unwrap();
-        let buffered = base.with_stop_buffer(dec!(20)).unwrap(); // 20 bps
-
+    fn test_size_entry_prices_stop_buffer_into_budget() {
+        // A non-zero buffer widens the executable distance, so the same
+        // budget buys a smaller position.
+        let base_cfg = RiskConfig::new(dec!(10000)).unwrap();
         let entry = Price::new(dec!(95000)).unwrap();
         let stop = Price::new(dec!(93500)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
 
-        let size_base =
-            calculate_position_size(&base, &entry, &tech_stop, tech_stop.initial_stop, None)
-                .unwrap();
-        let size_buffered =
-            calculate_position_size(&buffered, &entry, &tech_stop, tech_stop.initial_stop, None)
-                .unwrap();
-        assert!(size_buffered.as_decimal() < size_base.as_decimal());
+        let base_plan = legacy_plan(Side::Long, dec!(93500), Decimal::ZERO, None);
+        let buffered_plan = legacy_plan(Side::Long, dec!(93500), dec!(20), None);
+        // 20 bps of 93500 = 187.00 below the technical stop.
+        assert_eq!(buffered_plan.trigger.as_decimal(), dec!(93500) - dec!(187.00));
 
-        let buffer_amount = dec!(93500) * dec!(20) / dec!(10000); // 187.00
-        let gap = dec!(93500) * buffered.stop_gap_bps() / dec!(10000);
-        let fees = buffered.taker_fee_rate() * (dec!(95000) + dec!(95000));
-        let worst_loss = size_buffered.as_decimal() * (dec!(1500) + buffer_amount + gap + fees);
-        assert_eq!(worst_loss.round_dp(2), dec!(100));
+        let base = size_entry(&base_cfg, &entry, &tech_stop, &base_plan, None, None).unwrap();
+        let buffered =
+            size_entry(&base_cfg, &entry, &tech_stop, &buffered_plan, None, None).unwrap();
+
+        assert!(buffered.quantity.as_decimal() < base.quantity.as_decimal());
+        assert!(buffered.planned_risk <= base_cfg.max_risk_amount());
+        assert!(buffered.planned_risk > dec!(99.99));
     }
 
     #[test]
-    fn test_position_size_uses_binding_guard_distance() {
-        let config = RiskConfig::new(dec!(10000)).unwrap().with_stop_buffer(dec!(20)).unwrap();
-
+    fn test_size_entry_uses_binding_guard_distance() {
+        let config = RiskConfig::new(dec!(10000)).unwrap();
         let entry = Price::new(dec!(95000)).unwrap();
         let technical = Price::new(dec!(96500)).unwrap();
-        let guard = Price::new(dec!(98000)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, technical);
 
-        let size_technical =
-            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop, None)
-                .unwrap();
-        let size_guarded =
-            calculate_position_size(&config, &entry, &tech_stop, guard, None).unwrap();
-        assert!(size_guarded.as_decimal() < size_technical.as_decimal());
+        let technical_plan = legacy_plan(Side::Short, dec!(96500), dec!(20), None);
+        let guarded_plan = legacy_plan(Side::Short, dec!(96500), dec!(20), Some(dec!(98000)));
+        assert!(guarded_plan.guard_bound);
 
-        let effective_distance = dec!(3000);
-        let buffer_amount = dec!(98000) * dec!(20) / dec!(10000);
-        let gap = dec!(98000) * config.stop_gap_bps() / dec!(10000);
-        let fees = config.taker_fee_rate() * (dec!(95000) + dec!(98000));
-        let worst_loss =
-            size_guarded.as_decimal() * (effective_distance + buffer_amount + gap + fees);
-        assert_eq!(worst_loss.round_dp(2), dec!(100));
+        let sized_technical =
+            size_entry(&config, &entry, &tech_stop, &technical_plan, None, None).unwrap();
+        let sized_guarded =
+            size_entry(&config, &entry, &tech_stop, &guarded_plan, None, None).unwrap();
+        assert!(sized_guarded.quantity.as_decimal() < sized_technical.quantity.as_decimal());
+        assert!(sized_guarded.planned_risk <= config.max_risk_amount());
     }
 
     #[test]
-    fn test_position_size_rejects_over_wide_effective_guard_distance() {
+    fn test_size_entry_rejects_over_wide_effective_guard_distance() {
         let config = RiskConfig::new(dec!(10000)).unwrap();
         let entry = Price::new(dec!(100)).unwrap();
         let technical = Price::new(dec!(105)).unwrap();
-        let guard = Price::new(dec!(111)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, technical);
+        let plan = legacy_plan(Side::Short, dec!(105), Decimal::ZERO, Some(dec!(111)));
 
-        let result = calculate_position_size(&config, &entry, &tech_stop, guard, None);
+        let result = size_entry(&config, &entry, &tech_stop, &plan, None, None);
 
         assert!(matches!(result, Err(DomainError::InvalidTechnicalStopDistance(_))));
     }
 
     #[test]
-    fn test_calculate_position_size_caps_by_margin() {
+    fn test_size_entry_rejects_executable_stop_out_of_bounds() {
+        // The RAW level is inside the 10% max, but a 100 bps buffer pushes
+        // the FINAL executable trigger past it: typed stage-3 rejection.
+        let config = RiskConfig::new(dec!(10000)).unwrap();
+        let entry = Price::new(dec!(100000)).unwrap();
+        let stop = Price::new(dec!(90200)).unwrap(); // 9.8%
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let plan = legacy_plan(Side::Long, dec!(90200), dec!(100), None);
+
+        let result = size_entry(&config, &entry, &tech_stop, &plan, None, None);
+
+        assert!(
+            matches!(result, Err(DomainError::ExecutableStopOutOfBounds(_))),
+            "got {result:?}"
+        );
+    }
+
+    #[test]
+    fn test_size_entry_caps_by_margin() {
         let config = RiskConfig::new(dec!(351.92170492)).unwrap();
         let entry = Price::new(dec!(59623.10)).unwrap();
         let stop = Price::new(dec!(59295.60)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let plan = legacy_plan(Side::Long, dec!(59295.60), Decimal::ZERO, None);
 
-        let size =
-            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop, None)
-                .unwrap();
-        let qty = size.as_decimal();
-        let risk_loss = qty * dec!(327.50);
+        let sized = size_entry(&config, &entry, &tech_stop, &plan, None, None).unwrap();
+        let qty = sized.quantity.as_decimal();
         let margin_cap = (config.capital() * dec!(0.99) / entry.as_decimal())
             .round_dp_with_strategy(8, rust_decimal::RoundingStrategy::ToZero);
 
         assert_eq!(qty, margin_cap);
-        assert!(risk_loss < config.max_risk_amount());
-        assert!(risk_loss.round_dp(2) < dec!(3.52));
+        assert!(sized.planned_risk < config.max_risk_amount());
     }
 
     #[test]
     fn test_margin_capped_size_survives_gate_round_trip() {
-        // Regression: 2026-07-04 prod entry denial. capital/entry rounds at 28
-        // significant digits, and the risk gate's qty × entry recomputation
-        // landed 2e-22 ABOVE capital, so the gate rejected the margin cap this
-        // function itself chose. Exact figures from the denied entry.
+        // Regression: 2026-07-04 prod entry denial. The margin cap must
+        // reserve the 100 bps headroom so the gate's qty x entry round-trip
+        // stays below capital.
         let config = RiskConfig::new(dec!(1643.18373001)).unwrap();
         let entry = Price::new(dec!(62496.40)).unwrap();
         let stop = Price::new(dec!(62898.833333333333333333333333)).unwrap();
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let plan =
+            legacy_plan(Side::Short, dec!(62898.833333333333333333333333), Decimal::ZERO, None);
 
-        let size =
-            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop, None)
-                .unwrap();
-        let qty = size.as_decimal();
+        let sized = size_entry(&config, &entry, &tech_stop, &plan, None, None).unwrap();
+        let qty = sized.quantity.as_decimal();
 
-        // The margin cap must have engaged (risk-sized qty would exceed 1x)
-        // and reserved the default 100 bps headroom.
         assert!(qty * entry.as_decimal() > config.capital() * dec!(0.989));
-        // The gate's round-trip must stay below capital with headroom for the
-        // exchange's taker fee and mark-price cushion.
         assert!(
             qty * entry.as_decimal() <= config.capital() * dec!(0.99),
             "margin round-trip {} exceeds headroom-adjusted capital {}",
@@ -1421,17 +1460,15 @@ mod tests {
     fn test_margin_headroom_is_configurable_and_validated() {
         let base = RiskConfig::new(dec!(1000)).unwrap();
         let entry = Price::new(dec!(50000)).unwrap();
-        let stop = Price::new(dec!(49900)).unwrap(); // tight → margin cap binds
+        let stop = Price::new(dec!(49900)).unwrap(); // tight -> margin cap binds
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let plan = legacy_plan(Side::Long, dec!(49900), Decimal::ZERO, None);
 
         let with_zero = base.with_margin_headroom(Decimal::ZERO).unwrap();
         let qty_zero =
-            calculate_position_size(&with_zero, &entry, &tech_stop, tech_stop.initial_stop, None)
-                .unwrap();
+            size_entry(&with_zero, &entry, &tech_stop, &plan, None, None).unwrap().quantity;
         let qty_default =
-            calculate_position_size(&base, &entry, &tech_stop, tech_stop.initial_stop, None)
-                .unwrap();
-        // Zero headroom uses full capital; the default reserves 1%.
+            size_entry(&base, &entry, &tech_stop, &plan, None, None).unwrap().quantity;
         assert!(qty_default.as_decimal() < qty_zero.as_decimal());
         assert_eq!(qty_zero.as_decimal(), dec!(0.02));
         assert_eq!(qty_default.as_decimal(), dec!(0.0198));
@@ -1442,27 +1479,17 @@ mod tests {
 
     #[test]
     fn test_margin_cap_bounded_by_live_available_balance() {
-        // Regression: 2026-07-04 prod entry rejection (third act). Sizing used
-        // the month-start policy capital (1643.18) while the live wallet was
-        // 1617.68 after 25.51 of governed monthly loss; the order (notional
-        // 1626.75) exceeded the wallet and Binance rejected it (-2019). The
+        // Regression: 2026-07-04 prod entry rejection (third act). The
         // physical margin cap must bind to the LIVE balance when known.
         let config = RiskConfig::new(dec!(1643.18373001)).unwrap();
         let entry = Price::new(dec!(62440.30)).unwrap();
-        let stop = Price::new(dec!(62811.05)).unwrap(); // tight → margin cap binds
+        let stop = Price::new(dec!(62811.05)).unwrap(); // tight -> margin cap binds
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let plan = legacy_plan(Side::Short, dec!(62811.05), Decimal::ZERO, None);
         let available = dec!(1617.67600541);
 
-        let qty = calculate_position_size(
-            &config,
-            &entry,
-            &tech_stop,
-            tech_stop.initial_stop,
-            Some(available),
-        )
-        .unwrap();
-        let notional = qty.as_decimal() * entry.as_decimal();
-        // Notional fits the LIVE wallet minus the 100 bps headroom.
+        let sized = size_entry(&config, &entry, &tech_stop, &plan, Some(available), None).unwrap();
+        let notional = sized.quantity.as_decimal() * entry.as_decimal();
         assert!(notional <= available * dec!(0.99), "notional {} exceeds wallet cap", notional);
         assert!(
             notional > available * dec!(0.989),
@@ -1471,27 +1498,82 @@ mod tests {
         );
 
         // An available balance ABOVE policy capital must not size past policy.
-        let qty_rich = calculate_position_size(
-            &config,
-            &entry,
-            &tech_stop,
-            tech_stop.initial_stop,
-            Some(dec!(999999)),
-        )
-        .unwrap();
-        let qty_none =
-            calculate_position_size(&config, &entry, &tech_stop, tech_stop.initial_stop, None)
-                .unwrap();
-        assert_eq!(qty_rich, qty_none, "policy capital stays the upper bound");
+        let sized_rich =
+            size_entry(&config, &entry, &tech_stop, &plan, Some(dec!(999999)), None).unwrap();
+        let sized_none = size_entry(&config, &entry, &tech_stop, &plan, None, None).unwrap();
+        assert_eq!(sized_rich.quantity, sized_none.quantity);
 
         // A non-positive available balance is a hard sizing error.
-        assert!(calculate_position_size(
-            &config,
-            &entry,
-            &tech_stop,
-            tech_stop.initial_stop,
-            Some(Decimal::ZERO)
-        )
-        .is_err());
+        assert!(size_entry(&config, &entry, &tech_stop, &plan, Some(Decimal::ZERO), None).is_err());
+    }
+
+    #[test]
+    fn test_size_entry_quantizes_down_to_lot_step_and_recomputes_risk() {
+        let rules = btcusdt_rules();
+        let config = RiskConfig::new(dec!(100000)).unwrap();
+        let entry = Price::new(dec!(95000)).unwrap();
+        let stop = Price::new(dec!(93500)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let plan = legacy_plan(Side::Long, dec!(93500), Decimal::ZERO, None);
+
+        let unquantized = size_entry(&config, &entry, &tech_stop, &plan, None, None).unwrap();
+        let quantized = size_entry(&config, &entry, &tech_stop, &plan, None, Some(&rules)).unwrap();
+
+        // The quantity is on the 0.001 lot grid and never rounded up.
+        let steps = quantized.quantity.as_decimal() / rules.step_size();
+        assert_eq!(steps, steps.trunc(), "qty must sit on the lot grid");
+        assert!(quantized.quantity.as_decimal() <= unquantized.quantity.as_decimal());
+        // Planned risk is recomputed from the FINAL quantity, not the
+        // pre-quantization one.
+        assert_eq!(
+            quantized.planned_risk,
+            quantized.quantity.as_decimal() * quantized.worst_case_loss_per_unit
+        );
+        assert!(quantized.planned_risk <= config.max_risk_amount());
+    }
+
+    #[test]
+    fn test_size_entry_rejects_below_min_qty_never_rounds_up() {
+        let rules = btcusdt_rules();
+        // Tiny capital: risk-sized qty quantizes to zero lots.
+        let config = RiskConfig::new(dec!(50)).unwrap();
+        let entry = Price::new(dec!(95000)).unwrap();
+        let stop = Price::new(dec!(93500)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let plan = legacy_plan(Side::Long, dec!(93500), Decimal::ZERO, None);
+
+        let result = size_entry(&config, &entry, &tech_stop, &plan, None, Some(&rules));
+        match result {
+            Err(DomainError::PositionSizingError(message)) => {
+                assert!(message.contains("will not round up"), "message: {message}");
+            },
+            other => panic!("expected PositionSizingError, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_size_entry_short_costing_covers_modeled_loss() {
+        // Short regression (#153 review): the exit fee must be charged on
+        // the adverse fill, so planned risk >= the modeled realized loss.
+        let config = RiskConfig::new(dec!(10000)).unwrap();
+        let entry = Price::new(dec!(62000)).unwrap();
+        let stop = Price::new(dec!(62873.90)).unwrap();
+        let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
+        let plan = legacy_plan(Side::Short, dec!(62873.90), dec!(10), None);
+
+        let sized = size_entry(&config, &entry, &tech_stop, &plan, None, None).unwrap();
+
+        // Model the realized loss at the adverse fill with both fees.
+        let adverse = plan.adverse_fill_bound(config.stop_gap_bps()).unwrap().as_decimal();
+        let modeled = sized.quantity.as_decimal()
+            * ((adverse - entry.as_decimal())
+                + config.taker_fee_rate() * (entry.as_decimal() + adverse));
+        assert!(
+            sized.planned_risk >= modeled,
+            "planned {} < modeled {}",
+            sized.planned_risk,
+            modeled
+        );
+        assert!(sized.planned_risk <= config.max_risk_amount());
     }
 }

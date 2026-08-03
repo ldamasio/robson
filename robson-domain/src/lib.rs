@@ -27,13 +27,13 @@ pub use credentials::{
 };
 pub use detected_position::{CalculatedStop, DetectedPosition, StopMethod};
 pub use entities::{
-    calculate_margin_required, calculate_notional_value, calculate_position_size,
-    worst_case_loss_per_unit, AccountId, AccountSnapshotEvidence, AnchorType, ClosureEvidence,
-    DetectorSignal, EntryLifecycleStage, EstimatedEvidence, EstimationBasis, ExitOrderFillSource,
-    ExitReason, Order, OrderFillEvidence, OrderId, OrderStatus, OrderType, Position, PositionId,
-    PositionState, RealFillEvidence, ReconciliationEvidence, StopAnchor, StopQuality,
-    StopQualityClassification, TechnicalStopAnalysisAudit, TechnicalStopConfidenceSnapshot,
-    TechnicalStopConfigSnapshot, TechnicalStopMethodSnapshot, UserTradeEvidence,
+    calculate_margin_required, calculate_notional_value, size_entry, AccountId,
+    AccountSnapshotEvidence, AnchorType, ClosureEvidence, DetectorSignal, EntryLifecycleStage,
+    EstimatedEvidence, EstimationBasis, ExitOrderFillSource, ExitReason, Order, OrderFillEvidence,
+    OrderId, OrderStatus, OrderType, Position, PositionId, PositionState, RealFillEvidence,
+    ReconciliationEvidence, SizedEntry, StopAnchor, StopQuality, StopQualityClassification,
+    TechnicalStopAnalysisAudit, TechnicalStopConfidenceSnapshot, TechnicalStopConfigSnapshot,
+    TechnicalStopMethodSnapshot, UserTradeEvidence,
 };
 pub use events::{entry_lifecycle_stage, Event};
 pub use executable_stop::{
