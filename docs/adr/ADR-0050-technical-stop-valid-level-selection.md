@@ -2,6 +2,14 @@
 
 **Date**: 2026-08-02 (v2, after three-way architecture review)
 **Status**: ACCEPTED (merged 2026-08-02 via PR #149; operator decision)
+**Implementation status** (2026-08-03): §1 slice 2 (PR #151); §2/§6/§7 slice 3
+(PR #152); §5 slice 1 (PR #150); §3/§4 slice 5 (issue #154, superseding the
+rejected slice-4 PR #153) — `ExecutableStopPlan` single resolver,
+`SymbolTradingRules` runtime metadata, adverse-fill costing, and stop-policy
+versioning (`legacy_uncapped` | `span_capped_v1`). Activation of
+`span_capped_v1` for real entries is operator-gated via `ROBSON_STOP_POLICY`
+(default `legacy_uncapped`); positions armed before activation keep the legacy
+derivation forever.
 **Deciders**: RBX Systems (operator + architecture)
 **Amends**: ADR-0021 (level selection rule AND the sizing formula in its invariant 5),
 ADR-0041 (span-aware cap on the executable stop buffer)

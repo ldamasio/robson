@@ -10,12 +10,16 @@
 //! 2. Fallback to `executedQty + cummulativeQuoteQty` — average price,
 //!    estimated fee
 
-use std::sync::Arc;
+use std::{
+    collections::HashMap,
+    sync::Arc,
+    time::{Duration, Instant},
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use robson_connectors::{BinanceRestClient, BinanceRestError};
-use robson_domain::{OrderSide, Price, Quantity, Side, Symbol};
+use robson_domain::{OrderSide, Price, Quantity, Side, Symbol, SymbolTradingRules};
 use robson_exec::{
     ports::{
         ExchangePosition, FuturesBalance, FuturesSettings, IncomePort, IncomeRecord, IncomeType,
@@ -44,8 +48,11 @@ fn configured_step_scale(symbol: &Symbol) -> u32 {
     configured_step_size(symbol).scale()
 }
 
-/// Price decimal precision accepted by the exchange for the symbol
-/// (Binance USD-M `pricePrecision`; BTCUSDT = 2).
+/// FALLBACK price scale for when exchange metadata is unavailable (issue
+/// #154: the primary path validates against `tickSize` from exchangeInfo;
+/// precision-based rounding does NOT produce tick-aligned prices on symbols
+/// where `tickSize != 10^-pricePrecision`, e.g. BTCUSDT futures with tick
+/// 0.10 and precision 2).
 fn configured_price_scale(symbol: &Symbol) -> u32 {
     match symbol.as_pair().as_str() {
         "BTCUSDT" => 2,
@@ -132,18 +139,98 @@ fn spot_order_from_response(
 // Adapter
 // =============================================================================
 
+/// TTL for cached symbol trading rules (issue #154). Exchange filters change
+/// rarely; six hours keeps the metadata fresh without any per-tick calls.
+const TRADING_RULES_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// Bound on the trading-rules cache (symbols actually traded; a runaway
+/// symbol set is a defect, not a workload).
+const TRADING_RULES_CACHE_CAPACITY: usize = 64;
+
+struct CachedTradingRules {
+    rules: SymbolTradingRules,
+    fetched_at: Instant,
+}
+
 /// Binance USD-M Futures adapter implementing ExchangePort.
 ///
 /// Wraps `BinanceRestClient` and translates between domain types
 /// and Binance-specific API types.
 pub struct BinanceExchangeAdapter {
     client: Arc<BinanceRestClient>,
+    /// Bounded TTL cache of per-symbol trading rules (issue #154). The
+    /// tokio Mutex held across the refresh gives single-flight semantics:
+    /// concurrent callers wait for one fetch instead of stampeding the
+    /// exchange. Market ticks read the cached entry; zero HTTP per tick.
+    trading_rules: tokio::sync::Mutex<HashMap<String, CachedTradingRules>>,
 }
 
 impl BinanceExchangeAdapter {
     /// Create a new adapter wrapping a BinanceRestClient.
     pub fn new(client: Arc<BinanceRestClient>) -> Self {
-        Self { client }
+        Self {
+            client,
+            trading_rules: tokio::sync::Mutex::new(HashMap::new()),
+        }
+    }
+
+    async fn fetch_trading_rules(&self, symbol: &Symbol) -> Result<SymbolTradingRules, ExecError> {
+        let filters = self
+            .client
+            .get_futures_symbol_filters(&symbol.as_pair())
+            .await
+            .map_err(Self::map_error)?;
+        SymbolTradingRules::new(
+            symbol.clone(),
+            filters.tick_size,
+            filters.min_price,
+            filters.step_size,
+            filters.min_qty,
+            filters.max_qty,
+            filters.min_notional,
+            filters.price_precision,
+            filters.quantity_precision,
+        )
+        .map_err(|e| ExecError::Exchange(format!("Invalid exchangeInfo filters: {e}")))
+    }
+
+    /// Serve trading rules from the bounded TTL cache. On a refresh failure
+    /// the STALE snapshot is served with a warning (policy for exchange-side
+    /// filter changes: an existing order remains valid until a replacement
+    /// exists, so stale metadata beats no metadata).
+    async fn trading_rules_cached(&self, symbol: &Symbol) -> Result<SymbolTradingRules, ExecError> {
+        let pair = symbol.as_pair();
+        let mut cache = self.trading_rules.lock().await;
+        if let Some(cached) = cache.get(&pair) {
+            if cached.fetched_at.elapsed() < TRADING_RULES_TTL {
+                return Ok(cached.rules.clone());
+            }
+        }
+        match self.fetch_trading_rules(symbol).await {
+            Ok(rules) => {
+                if cache.len() >= TRADING_RULES_CACHE_CAPACITY && !cache.contains_key(&pair) {
+                    return Err(ExecError::Exchange(format!(
+                        "Trading-rules cache capacity ({TRADING_RULES_CACHE_CAPACITY}) exceeded"
+                    )));
+                }
+                cache.insert(pair, CachedTradingRules {
+                    rules: rules.clone(),
+                    fetched_at: Instant::now(),
+                });
+                Ok(rules)
+            },
+            Err(error) => match cache.get(&pair) {
+                Some(stale) => {
+                    warn!(
+                        symbol = %pair,
+                        %error,
+                        "Trading-rules refresh failed; serving stale snapshot"
+                    );
+                    Ok(stale.rules.clone())
+                },
+                None => Err(error),
+            },
+        }
     }
 
     /// Map BinanceRestError to ExecError.
@@ -176,6 +263,10 @@ impl BinanceExchangeAdapter {
 
 #[async_trait]
 impl ExchangePort for BinanceExchangeAdapter {
+    async fn trading_rules(&self, symbol: &Symbol) -> Result<SymbolTradingRules, ExecError> {
+        self.trading_rules_cached(symbol).await
+    }
+
     async fn validate_futures_settings(
         &self,
         symbol: &Symbol,
@@ -228,9 +319,30 @@ impl ExchangePort for BinanceExchangeAdapter {
             OrderSide::Sell => Side::Short,
         };
 
-        // BTCUSDT futures currently uses hardcoded 0.001 step size / minimum
-        // quantity. TODO: query exchangeInfo per symbol for dynamic filters.
-        let qty = normalize_market_quantity(symbol, quantity)?;
+        // Lot filters from exchange metadata when available (issue #154);
+        // the sizing already quantized down by stepSize, so this is a
+        // validation in the expected case. Falls back to the configured
+        // table when metadata is unavailable.
+        let qty = match self.trading_rules_cached(symbol).await {
+            Ok(rules) => {
+                let qty = rules.quantize_qty_down(quantity.as_decimal());
+                rules.validate_order_qty(qty).map_err(|e| {
+                    ExecError::OrderRejected(format!(
+                        "{e}. Increase capital or widen the stop distance; Robson will not \
+                         round up."
+                    ))
+                })?;
+                qty
+            },
+            Err(error) => {
+                warn!(
+                    symbol = %symbol.as_pair(),
+                    %error,
+                    "Trading rules unavailable; falling back to configured lot filters"
+                );
+                normalize_market_quantity(symbol, quantity)?
+            },
+        };
 
         let response = self
             .client
@@ -377,7 +489,43 @@ impl ExchangePort for BinanceExchangeAdapter {
         };
 
         let qty = normalize_market_quantity(symbol, quantity)?;
-        let trigger_price = normalize_stop_trigger_price(symbol, side, stop_price);
+        // Metadata-driven trigger validation (issue #154 deliverable 1): the
+        // domain quantizes SpanCappedV1 triggers on the tickSize grid, so the
+        // expected case here is a pure pass-through validation. A misaligned
+        // trigger can only come from a legacy-policy derivation (unquantized
+        // by design); it is aligned adversely per tickSize and logged,
+        // because a slightly wider stop beats an order the exchange may
+        // reject under PRICE_FILTER (the empirical Binance leniency for
+        // off-grid algo triggers is undocumented and must not be relied on).
+        // Only when exchange metadata is unavailable does the legacy
+        // precision-table fallback apply.
+        let trigger_price = match self.trading_rules_cached(symbol).await {
+            Ok(rules) => {
+                if rules.is_tick_aligned(stop_price.as_decimal()) {
+                    stop_price.as_decimal()
+                } else {
+                    let aligned = rules
+                        .quantize_stop_trigger(side, stop_price)
+                        .map_err(|e| ExecError::Exchange(format!("Invalid stop trigger: {e}")))?;
+                    warn!(
+                        symbol = %symbol.as_pair(),
+                        requested = %stop_price.as_decimal(),
+                        aligned = %aligned.as_decimal(),
+                        tick_size = %rules.tick_size(),
+                        "Stop trigger not tick-aligned (legacy derivation); aligned adversely"
+                    );
+                    aligned.as_decimal()
+                }
+            },
+            Err(error) => {
+                warn!(
+                    symbol = %symbol.as_pair(),
+                    %error,
+                    "Trading rules unavailable; falling back to precision-based trigger rounding"
+                );
+                normalize_stop_trigger_price(symbol, side, stop_price)
+            },
+        };
 
         let response = self
             .client

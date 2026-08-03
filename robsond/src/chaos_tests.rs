@@ -7,7 +7,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use robson_domain::{Event, OrderSide, PositionId, Price, Quantity, Side, Symbol};
+use robson_domain::{Event, OrderSide, PositionId, Price, Quantity, Side, StopPolicy, Symbol};
 use robson_engine::{EngineAction, RiskCheck, RiskVerdict};
 use robson_exec::{
     ExchangePort, ExecError, Executor, FuturesBalance, FuturesSettings, SpotBalance, SpotOrder,
@@ -316,6 +316,8 @@ async fn chaos_event_log_write_failure_aborts_before_exchange_order() {
         symbol: Symbol::from_pair("BTCUSDT").unwrap(),
         side: Side::Long,
         tech_stop_distance: None,
+        stop_policy: StopPolicy::LegacyUncapped,
+        stop_buffer_bps_at_arm: None,
         timestamp: chrono::Utc::now(),
     };
 

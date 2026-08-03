@@ -387,7 +387,20 @@ pub struct PositionArmed {
     /// "Long" or "Short" (PascalCase, matches Side enum default serde)
     pub side: String,
     pub tech_stop_distance: Option<TechnicalStopDistancePayload>,
+    /// Stop-policy version pinned at arm (issue #154):
+    /// "legacy_uncapped" | "span_capped_v1". Missing on events written
+    /// before versioning = legacy.
+    #[serde(default = "default_stop_policy")]
+    pub stop_policy: String,
+    /// ADR-0041 buffer (bps) snapshotted at arm; None on pre-versioning
+    /// events.
+    #[serde(default)]
+    pub stop_buffer_bps_at_arm: Option<Decimal>,
     pub timestamp: chrono::DateTime<chrono::Utc>,
+}
+
+fn default_stop_policy() -> String {
+    "legacy_uncapped".to_string()
 }
 
 /// position_disarmed payload (robson-domain::Event::PositionDisarmed)

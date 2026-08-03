@@ -1045,6 +1045,7 @@ pub(crate) async fn handle_position_armed(pool: &PgPool, envelope: &EventEnvelop
             trailing_stop_price,
             current_quantity,
             state,
+            stop_policy, stop_buffer_bps_at_arm,
             last_event_id, last_seq,
             created_at, updated_at
         ) VALUES (
@@ -1056,7 +1057,8 @@ pub(crate) async fn handle_position_armed(pool: &PgPool, envelope: &EventEnvelop
             0,
             'armed',
             $9, $10,
-            $11, $11
+            $11, $12,
+            $13, $13
         )
         ON CONFLICT (position_id) DO NOTHING
         "#,
@@ -1069,6 +1071,8 @@ pub(crate) async fn handle_position_armed(pool: &PgPool, envelope: &EventEnvelop
     .bind(entry_price)
     .bind(technical_stop_price)
     .bind(technical_stop_distance)
+    .bind(&payload.stop_policy)
+    .bind(payload.stop_buffer_bps_at_arm)
     .bind(envelope.event_id)
     .bind(envelope.seq)
     .bind(payload.timestamp)

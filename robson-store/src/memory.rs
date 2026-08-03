@@ -13,7 +13,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Datelike;
-use robson_domain::{Event, Order, OrderId, OrderStatus, Position, PositionId};
+use robson_domain::{Event, Order, OrderId, OrderStatus, Position, PositionId, StopPolicy};
 use uuid::Uuid;
 
 use crate::{
@@ -88,6 +88,8 @@ impl MemoryStore {
                 symbol,
                 side,
                 tech_stop_distance,
+                stop_policy,
+                stop_buffer_bps_at_arm,
                 timestamp,
             } => {
                 let mut positions = self.positions.write().unwrap();
@@ -95,7 +97,17 @@ impl MemoryStore {
                 if positions.contains_key(position_id) {
                     return Ok(());
                 }
-                let mut position = Position::new(*account_id, symbol.clone(), *side);
+                // Replay carries the arm-time stop policy verbatim (issue
+                // #154): legacy events (missing field) rebuild as
+                // LegacyUncapped, v1 events as SpanCappedV1 — never promoted
+                // or demoted by a restart.
+                let mut position = Position::new_with_stop_policy(
+                    *account_id,
+                    symbol.clone(),
+                    *side,
+                    *stop_policy,
+                    *stop_buffer_bps_at_arm,
+                );
                 position.id = *position_id;
                 position.tech_stop_distance = *tech_stop_distance;
                 position.created_at = *timestamp;
@@ -677,6 +689,8 @@ mod tests {
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
             side: Side::Long,
             tech_stop_distance: None,
+            stop_policy: StopPolicy::LegacyUncapped,
+            stop_buffer_bps_at_arm: None,
             timestamp: Utc::now(),
         }
     }
@@ -1017,6 +1031,8 @@ mod tests {
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
             side: Side::Long,
             tech_stop_distance: None,
+            stop_policy: StopPolicy::LegacyUncapped,
+            stop_buffer_bps_at_arm: None,
             timestamp: Utc::now(),
         };
         EventRepository::append(&store, &armed_event).await.unwrap();
@@ -1072,6 +1088,8 @@ mod tests {
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
             side: Side::Long,
             tech_stop_distance: None,
+            stop_policy: StopPolicy::LegacyUncapped,
+            stop_buffer_bps_at_arm: None,
             timestamp: Utc::now(),
         };
         EventRepository::append(&store, &armed_event).await.unwrap();
@@ -1128,6 +1146,8 @@ mod tests {
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
             side: Side::Long,
             tech_stop_distance: None,
+            stop_policy: StopPolicy::LegacyUncapped,
+            stop_buffer_bps_at_arm: None,
             timestamp: Utc::now(),
         };
         EventRepository::append(&store, &armed_event).await.unwrap();
@@ -1179,6 +1199,8 @@ mod tests {
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
             side: Side::Long,
             tech_stop_distance: None,
+            stop_policy: StopPolicy::LegacyUncapped,
+            stop_buffer_bps_at_arm: None,
             timestamp: Utc::now(),
         };
         EventRepository::append(&store, &armed_event).await.unwrap();
@@ -1227,6 +1249,8 @@ mod tests {
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
             side: Side::Long,
             tech_stop_distance: None,
+            stop_policy: StopPolicy::LegacyUncapped,
+            stop_buffer_bps_at_arm: None,
             timestamp: Utc::now(),
         };
         EventRepository::append(&store, &armed_event).await.unwrap();
@@ -1262,6 +1286,59 @@ mod tests {
             "Legacy EntryOrderPlaced must NOT transition to Entering, got {:?}",
             pos.state.name()
         );
+    }
+
+    /// Issue #154: replay preserves the arm-time stop policy verbatim.
+    /// Legacy events (no field on the wire) rebuild as LegacyUncapped and v1
+    /// events as SpanCappedV1 — a restart never promotes or demotes.
+    #[tokio::test]
+    async fn test_replay_preserves_stop_policy_legacy_vs_v1() {
+        use robson_domain::StopPolicy;
+
+        let store = MemoryStore::new();
+
+        // Legacy wire shape: PositionArmed serialized BEFORE versioning.
+        let legacy_id = Uuid::now_v7();
+        let legacy_json = serde_json::json!({
+            "type": "position_armed",
+            "position_id": legacy_id,
+            "account_id": Uuid::now_v7(),
+            "symbol": {"base": "BTC", "quote": "USDT"},
+            "side": "Long",
+            "tech_stop_distance": null,
+            "timestamp": Utc::now(),
+        });
+        let legacy_event: Event = serde_json::from_value(legacy_json).unwrap();
+        store.apply_event(&legacy_event).unwrap();
+
+        let v1_id = Uuid::now_v7();
+        let v1_event = Event::PositionArmed {
+            position_id: v1_id,
+            account_id: Uuid::now_v7(),
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            side: Side::Long,
+            tech_stop_distance: None,
+            stop_policy: StopPolicy::SpanCappedV1,
+            stop_buffer_bps_at_arm: Some(dec!(10)),
+            timestamp: Utc::now(),
+        };
+        store.apply_event(&v1_event).unwrap();
+
+        let legacy = PositionRepository::find_by_id(&store, legacy_id).await.unwrap().unwrap();
+        assert_eq!(legacy.stop_policy, StopPolicy::LegacyUncapped);
+        assert_eq!(legacy.stop_buffer_bps_at_arm, None);
+
+        let v1 = PositionRepository::find_by_id(&store, v1_id).await.unwrap().unwrap();
+        assert_eq!(v1.stop_policy, StopPolicy::SpanCappedV1);
+        assert_eq!(v1.stop_buffer_bps_at_arm, Some(dec!(10)));
+
+        // Replaying the same events again (a second restart) changes nothing.
+        store.apply_event(&legacy_event).unwrap();
+        store.apply_event(&v1_event).unwrap();
+        let legacy = PositionRepository::find_by_id(&store, legacy_id).await.unwrap().unwrap();
+        assert_eq!(legacy.stop_policy, StopPolicy::LegacyUncapped);
+        let v1 = PositionRepository::find_by_id(&store, v1_id).await.unwrap().unwrap();
+        assert_eq!(v1.stop_policy, StopPolicy::SpanCappedV1);
     }
 
     // Store Tests

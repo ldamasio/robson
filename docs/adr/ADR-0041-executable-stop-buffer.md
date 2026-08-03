@@ -2,12 +2,16 @@
 
 Status: Accepted (operator-initiated 2026-07-03)
 Date: 2026-07-03
-Amendment: ADR-0050 (PROPOSED) caps the effective buffer relative to the span
-(`effective_buffer = min(configured_stop_buffer, 0.25 × span)`) and folds it into
-the admission-time worst-case cost formula. The single-executable-price invariant
-(software monitor and insurance stop trigger at the same buffered price) and all
-other semantics below are unchanged. Implemented behavior remains as described
-here until ADR-0050 is accepted and its sizing slice ships.
+Amendment: ADR-0050 (ACCEPTED 2026-08-02, PR #149) caps the effective buffer
+relative to the span (`effective_buffer = min(configured_stop_buffer, 0.25 ×
+span)`) and folds it into the admission-time worst-case cost formula.
+IMPLEMENTED in slice 5 (issue #154) as the `span_capped_v1` stop policy: the
+cap and domain-side tick quantization apply only to positions armed under that
+policy (operator activation via `ROBSON_STOP_POLICY`); positions armed under
+`legacy_uncapped` keep the exact derivation described below forever. The
+single-executable-price invariant (software monitor and insurance stop trigger
+at the same executable price) is preserved by construction through the single
+`ExecutableStopPlan` resolver.
 
 ## Context
 

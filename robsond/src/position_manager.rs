@@ -27,7 +27,7 @@ use std::{
 use chrono::Datelike;
 use robson_domain::{
     ClosureEvidence, DetectorSignal, EntryPolicy, EntryPolicyConfig, Event, Position, PositionId,
-    PositionState, Price, Quantity, ReconciliationEvidence, RiskConfig, Side, Symbol,
+    PositionState, Price, Quantity, ReconciliationEvidence, RiskConfig, Side, StopPolicy, Symbol,
     TechnicalStopDistance, TradingPolicy,
 };
 use robson_engine::{
@@ -155,6 +155,10 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     stop_invalidation_guard_enabled: bool,
     /// Lookback candles for the invalidation guard recent extreme (ADR-0042).
     stop_invalidation_lookback_candles: usize,
+    /// Stop policy pinned to NEW positions at arm time (issue #154,
+    /// `ROBSON_STOP_POLICY`). Existing positions keep their arm-time policy;
+    /// this only affects new arms.
+    stop_policy: StopPolicy,
     /// Positions whose reduce-only exit the exchange rejected while
     /// reporting the symbol flat (#142). The exchange-side insurance stop
     /// has already closed the position, so market ticks stop re-placing
@@ -663,6 +667,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             // `with_invalidation_guard`.
             stop_invalidation_guard_enabled: false,
             stop_invalidation_lookback_candles: 20,
+            // Legacy by default (issue #154): SpanCappedV1 is an explicit
+            // operator opt-in via `with_stop_policy`.
+            stop_policy: StopPolicy::LegacyUncapped,
             exit_overtaken_suspects: Arc::new(RwLock::new(HashSet::new())),
             entry_exhausted: Arc::new(RwLock::new(HashMap::new())),
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
@@ -688,10 +695,42 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self
     }
 
+    /// Configure the stop policy pinned to NEW positions at arm time
+    /// (issue #154, `ROBSON_STOP_POLICY`).
+    pub fn with_stop_policy(mut self, stop_policy: StopPolicy) -> Self {
+        self.stop_policy = stop_policy;
+        self
+    }
+
     /// Configure the OHLCV source used by newly spawned detector tasks.
     pub fn with_ohlcv_port(mut self, ohlcv_port: Arc<dyn OhlcvPort>) -> Self {
         self.ohlcv_port = ohlcv_port;
         self
+    }
+
+    /// Cached symbol trading rules for a position whose stop policy needs
+    /// them (issue #154). Legacy positions derive without rules (zero
+    /// overhead on the historical path); for `SpanCappedV1` a fetch failure
+    /// returns `None` and the engine fails closed.
+    pub(crate) async fn trading_rules_for(
+        &self,
+        position: &Position,
+    ) -> Option<robson_domain::SymbolTradingRules> {
+        if position.stop_policy != StopPolicy::SpanCappedV1 {
+            return None;
+        }
+        match self.exchange().trading_rules(&position.symbol).await {
+            Ok(rules) => Some(rules),
+            Err(error) => {
+                warn!(
+                    position_id = %position.id,
+                    symbol = %position.symbol.as_pair(),
+                    %error,
+                    "Trading rules unavailable for SpanCappedV1 position; engine will fail closed"
+                );
+                None
+            },
+        }
     }
 
     /// Configure eventlog persistence for domain events (MIG-v2.5#2).
@@ -1697,6 +1736,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         account_id: Uuid,
         entry_policy: EntryPolicyConfig,
     ) -> DaemonResult<Position> {
+        // Snapshot the ADR-0041 buffer at arm (issue #154): the position's
+        // executable stop derives from this value forever, so a later config
+        // change cannot move a live stop.
+        let stop_buffer_bps_at_arm = risk_config.stop_buffer_bps();
+
         // Update engine with operator-supplied capital before any sizing.
         {
             let mut engine = self.engine.lock().unwrap();
@@ -1752,12 +1796,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Emit PositionArmed event → apply_event creates position in Armed state.
         // Then persist policy resolution for replay/audit.
         let now = chrono::Utc::now();
+        // The stop policy is pinned HERE, atomically with position creation
+        // (issue #154): replay and projection rebuild it verbatim.
         let armed_event = Event::PositionArmed {
             position_id,
             account_id,
             symbol: symbol.clone(),
             side,
             tech_stop_distance,
+            stop_policy: self.stop_policy,
+            stop_buffer_bps_at_arm: Some(stop_buffer_bps_at_arm),
             timestamp: now,
         };
         let policy_event = Event::EntryPolicyResolved {
@@ -2330,6 +2378,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self.entry_exhausted.write().await.remove(&position_id);
     }
 
+    /// Reason code for a domain-validation rejection (issue #154
+    /// deliverable 5): typed failures carry their own code instead of the
+    /// generic `signal_domain_rejection`.
+    fn domain_rejection_code(error: &robson_domain::DomainError) -> &'static str {
+        use robson_domain::DomainError;
+        match error {
+            DomainError::ExecutableStopOutOfBounds(_) => "executable_stop_out_of_bounds",
+            DomainError::TradingRulesUnavailable(_) => "trading_rules_unavailable",
+            DomainError::DegenerateStopSpan(_) => "degenerate_stop_span",
+            _ => "signal_domain_rejection",
+        }
+    }
+
     /// Per-policy handling of a domain-validation rejection of an entry
     /// signal (ADR-0050 §2). Immediate exhausts (terminal, operator re-arm);
     /// strategy modes re-arm the detector under governed backoff, requiring
@@ -2338,23 +2399,25 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         &self,
         position: &Position,
         signal: &DetectorSignal,
-        error_text: &str,
+        error: &robson_domain::DomainError,
     ) -> DaemonResult<()> {
+        let reason_code = Self::domain_rejection_code(error);
+        let error_text = error.to_string();
         let policy = self.entry_policy_for_position(position.id).await;
         if policy.mode == EntryPolicy::Immediate {
             self.mark_entry_exhausted(
                 position.id,
                 Some(signal.signal_id),
-                "signal_domain_rejection",
-                error_text,
+                reason_code,
+                &error_text,
             )
             .await?;
         } else {
             let now = chrono::Utc::now();
             self.event_bus.send(DaemonEvent::EntryRejected {
                 position_id: position.id,
-                reason_code: "signal_domain_rejection".to_string(),
-                reason: error_text.to_string(),
+                reason_code: reason_code.to_string(),
+                reason: error_text.clone(),
                 terminal: false,
                 rejected_at: now,
             });
@@ -2505,10 +2568,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             },
         };
 
+        // Runtime trading rules for the plan (issue #154): fetched from the
+        // adapter's TTL cache only when the position's policy needs them.
+        let trading_rules = self.trading_rules_for(&position).await;
+
         // Use engine to decide entry (pure: State+Signal → Decision)
         let decision = {
             let engine = self.engine.lock().unwrap();
-            engine.decide_entry(&position, &signal, available_margin)
+            engine.decide_entry_with_rules(
+                &position,
+                &signal,
+                available_margin,
+                trading_rules.as_ref(),
+            )
         };
         let decision = match decision {
             Ok(d) => d,
@@ -2521,7 +2593,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 let error_text = domain_error.to_string();
                 query.fail(error_text.clone(), "processing".to_string());
                 self.record_query_failure(&query).await?;
-                self.handle_signal_domain_rejection(&position, &signal, &error_text).await?;
+                self.handle_signal_domain_rejection(&position, &signal, &domain_error).await?;
                 return Ok(());
             },
             Err(e) => {
@@ -2965,9 +3037,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             guards.remove(&position_id)
         };
 
+        // Runtime trading rules so the insurance stop lands on the plan's
+        // tick-quantized trigger (issue #154).
+        let trading_rules = self.trading_rules_for(&position).await;
+
         // Use engine to process fill (pure: State+Fill → Decision)
         // binance_position_id is passed through to EntryFilled event
-        let decision = self.engine.lock().unwrap().process_entry_fill(
+        let decision = self.engine.lock().unwrap().process_entry_fill_with_rules(
             &position,
             fill_price,
             filled_quantity,
@@ -2975,6 +3051,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             filled_at,
             binance_position_id.clone(),
             invalidation_guard_level,
+            trading_rules.as_ref(),
         )?;
 
         // Execute actions (EntryFilled event transitions position to Active via
@@ -3162,12 +3239,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 self.exit_overtaken_suspects.write().await.remove(&position.id);
             }
 
-            // Use engine to process (pure: State+Tick → Decision)
+            // Use engine to process (pure: State+Tick → Decision). Trading
+            // rules come from the adapter's TTL cache (issue #154): no
+            // exchange call on the tick path; legacy positions skip the
+            // lookup entirely.
+            let trading_rules = self.trading_rules_for(&position).await;
             let symbol_clone = data.symbol.clone();
             let market_data = robson_engine::MarketData::new(symbol_clone, data.price);
             let decision = {
                 let engine = self.engine.lock().unwrap();
-                engine.process_active_position(&position, &market_data)
+                engine.process_active_position_with_rules(
+                    &position,
+                    &market_data,
+                    trading_rules.as_ref(),
+                )
             };
             let decision = match decision {
                 Ok(d) => d,
@@ -4141,6 +4226,43 @@ mod tests {
 
     fn create_test_risk_config() -> RiskConfig {
         RiskConfig::new(dec!(10000)).unwrap() // 1% cap
+    }
+
+    /// Issue #154: arm pins the stop policy and the ADR-0041 buffer
+    /// snapshot atomically with position creation, and both survive replay.
+    #[tokio::test]
+    async fn arm_position_pins_stop_policy_and_buffer_snapshot() {
+        let manager = create_test_manager().await;
+        let risk_config = RiskConfig::new(dec!(10000)).unwrap().with_stop_buffer(dec!(10)).unwrap();
+
+        let position = manager
+            .arm_position(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                Side::Long,
+                risk_config,
+                None,
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+
+        // Default manager arms legacy (SpanCappedV1 is an explicit opt-in);
+        // the buffer snapshot is always taken.
+        assert_eq!(position.stop_policy, StopPolicy::LegacyUncapped);
+        assert_eq!(position.stop_buffer_bps_at_arm, Some(dec!(10)));
+
+        // The PositionArmed event carries the same pinned values.
+        let events = manager.store().events().find_by_position(position.id).await.unwrap();
+        let armed = events
+            .iter()
+            .find_map(|event| match event {
+                Event::PositionArmed { stop_policy, stop_buffer_bps_at_arm, .. } => {
+                    Some((*stop_policy, *stop_buffer_bps_at_arm))
+                },
+                _ => None,
+            })
+            .expect("PositionArmed event must exist");
+        assert_eq!(armed, (StopPolicy::LegacyUncapped, Some(dec!(10))));
     }
 
     fn create_test_candles() -> Vec<Candle> {
@@ -6077,6 +6199,8 @@ mod tests {
                     symbol: symbol.clone(),
                     side: Side::Long,
                     tech_stop_distance: None,
+                    stop_policy: StopPolicy::LegacyUncapped,
+                    stop_buffer_bps_at_arm: None,
                     timestamp: now,
                 }),
                 EngineAction::EmitEvent(Event::EntryPolicyResolved {
@@ -7427,12 +7551,13 @@ mod tests {
             updated.state
         );
 
-        // With capital=20000 and the execution-cost buffer (ADR-0039):
-        // worst loss per unit = 7600 distance
-        //                     + 87.40 gap allowance (10 bps of stop 87400)
-        //                     + 95 round-trip fees (0.05% × (95000 + 95000))
-        let worst_loss_per_unit = dec!(7600) + dec!(87.4) + dec!(95);
-        let expected_qty = dec!(200) / worst_loss_per_unit;
+        // With capital=20000 and the adverse-fill costing (issue #154):
+        // trigger 87400 (zero buffer), gap 10 bps below it, fees on entry
+        // and on the adverse fill.
+        let adverse = dec!(87400) - dec!(87.4);
+        let worst_loss_per_unit = (dec!(95000) - adverse) + dec!(0.0005) * (dec!(95000) + adverse);
+        let expected_qty = (dec!(200) / worst_loss_per_unit)
+            .round_dp_with_strategy(12, rust_decimal::RoundingStrategy::ToZero);
         assert_eq!(
             updated.quantity.as_decimal(),
             expected_qty,

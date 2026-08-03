@@ -5,7 +5,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use robson_domain::{Candle, OrderSide, Price, Quantity, Side, Symbol};
+use robson_domain::{Candle, OrderSide, Price, Quantity, Side, Symbol, SymbolTradingRules};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
@@ -117,6 +117,24 @@ pub trait ExchangePort: Send + Sync {
         symbol: &Symbol,
         expected_leverage: u8,
     ) -> Result<FuturesSettings, ExecError>;
+
+    /// Runtime symbol trading rules from exchange metadata (issue #154):
+    /// tickSize/minPrice, lot step and bounds, minNotional, precisions.
+    ///
+    /// Implementations must serve a bounded TTL cache with single-flight
+    /// fetches and must NEVER call the exchange per market tick; on a
+    /// refresh failure they should serve the stale snapshot (an existing
+    /// order remains valid until a replacement exists).
+    ///
+    /// The default implementation reports rules as unavailable: legacy
+    /// stop-policy flows proceed without them, `SpanCappedV1` flows fail
+    /// closed.
+    async fn trading_rules(&self, symbol: &Symbol) -> Result<SymbolTradingRules, ExecError> {
+        Err(ExecError::Exchange(format!(
+            "trading rules not available on this exchange port for {}",
+            symbol.as_pair()
+        )))
+    }
 
     /// Place a market order.
     ///

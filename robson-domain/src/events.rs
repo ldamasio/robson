@@ -12,6 +12,7 @@ use crate::{
         AccountId, ClosureEvidence, ExitReason, OrderId, PositionId, TechnicalStopAnalysisAudit,
     },
     policy::{ApprovalPolicy, EntryPolicy, SignalEvaluationOutcome, StrategyId},
+    stop_policy::StopPolicy,
     value_objects::{Price, Quantity, Side, Symbol, TechnicalStopDistance},
 };
 
@@ -35,6 +36,16 @@ pub enum Event {
         /// Technical stop distance from chart analysis (needed for position
         /// sizing on signal)
         tech_stop_distance: Option<TechnicalStopDistance>,
+        /// Stop-policy version pinned at arm, atomic with position creation
+        /// (issue #154). Missing on events written before versioning =
+        /// `LegacyUncapped`; an unknown value fails deserialization.
+        #[serde(default)]
+        stop_policy: StopPolicy,
+        /// ADR-0041 buffer (bps) snapshotted at arm; `None` on pre-versioning
+        /// events (those positions follow the live config, the historical
+        /// behavior).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        stop_buffer_bps_at_arm: Option<Decimal>,
         /// When the position was armed
         timestamp: DateTime<Utc>,
     },
@@ -664,6 +675,8 @@ mod tests {
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
             side: Side::Long,
             tech_stop_distance: None,
+            stop_policy: StopPolicy::LegacyUncapped,
+            stop_buffer_bps_at_arm: None,
             timestamp: Utc::now(),
         }
     }
@@ -777,6 +790,79 @@ mod tests {
             month: 5,
             year: 2026,
             timestamp: Utc::now(),
+        }
+    }
+
+    /// Retrocompatibility canary (issue #154): a `position_armed` event
+    /// written before stop-policy versioning (no `stop_policy` field on the
+    /// wire) must deserialize to `LegacyUncapped` with no buffer snapshot.
+    #[test]
+    fn test_legacy_position_armed_without_stop_policy_deserializes_to_legacy() {
+        let position_id = Uuid::now_v7();
+        let legacy_json = serde_json::json!({
+            "type": "position_armed",
+            "position_id": position_id,
+            "account_id": Uuid::now_v7(),
+            "symbol": {"base": "BTC", "quote": "USDT"},
+            "side": "Long",
+            "tech_stop_distance": null,
+            "timestamp": Utc::now(),
+        });
+
+        let event: Event = serde_json::from_value(legacy_json)
+            .expect("legacy position_armed JSON must remain readable");
+        match event {
+            Event::PositionArmed { stop_policy, stop_buffer_bps_at_arm, .. } => {
+                assert_eq!(stop_policy, crate::stop_policy::StopPolicy::LegacyUncapped);
+                assert_eq!(stop_buffer_bps_at_arm, None);
+            },
+            other => panic!("expected PositionArmed, got {:?}", other),
+        }
+    }
+
+    /// An UNKNOWN persisted stop-policy version must fail deserialization,
+    /// never fall back to legacy (issue #154: missing = legacy, unknown =
+    /// failure).
+    #[test]
+    fn test_position_armed_with_unknown_stop_policy_fails_deserialization() {
+        let unknown_json = serde_json::json!({
+            "type": "position_armed",
+            "position_id": Uuid::now_v7(),
+            "account_id": Uuid::now_v7(),
+            "symbol": {"base": "BTC", "quote": "USDT"},
+            "side": "Long",
+            "tech_stop_distance": null,
+            "stop_policy": "span_capped_v9",
+            "timestamp": Utc::now(),
+        });
+
+        assert!(serde_json::from_value::<Event>(unknown_json).is_err());
+    }
+
+    /// A v1 event roundtrips with policy and buffer snapshot intact.
+    #[test]
+    fn test_position_armed_span_capped_v1_roundtrips() {
+        let event = Event::PositionArmed {
+            position_id: Uuid::now_v7(),
+            account_id: Uuid::now_v7(),
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            side: Side::Long,
+            tech_stop_distance: None,
+            stop_policy: crate::stop_policy::StopPolicy::SpanCappedV1,
+            stop_buffer_bps_at_arm: Some(dec!(10)),
+            timestamp: Utc::now(),
+        };
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["stop_policy"].as_str(), Some("span_capped_v1"));
+        assert_eq!(json["stop_buffer_bps_at_arm"].as_str(), Some("10"));
+
+        let back: Event = serde_json::from_value(json).unwrap();
+        match back {
+            Event::PositionArmed { stop_policy, stop_buffer_bps_at_arm, .. } => {
+                assert_eq!(stop_policy, crate::stop_policy::StopPolicy::SpanCappedV1);
+                assert_eq!(stop_buffer_bps_at_arm, Some(dec!(10)));
+            },
+            other => panic!("expected PositionArmed, got {:?}", other),
         }
     }
 
@@ -1123,6 +1209,8 @@ mod tests {
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
             side: Side::Long,
             tech_stop_distance: None,
+            stop_policy: StopPolicy::LegacyUncapped,
+            stop_buffer_bps_at_arm: None,
             timestamp: DateTime::parse_from_rfc3339("2024-01-01T00:00:00Z")
                 .unwrap()
                 .with_timezone(&Utc),
@@ -1145,6 +1233,8 @@ mod tests {
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
             side: Side::Long,
             tech_stop_distance: None,
+            stop_policy: StopPolicy::LegacyUncapped,
+            stop_buffer_bps_at_arm: None,
             timestamp: Utc::now(),
         };
 
@@ -1363,6 +1453,8 @@ mod tests {
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
             side: Side::Long,
             tech_stop_distance: None,
+            stop_policy: StopPolicy::LegacyUncapped,
+            stop_buffer_bps_at_arm: None,
             timestamp: Utc::now(),
         }
     }

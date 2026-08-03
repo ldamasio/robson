@@ -13,7 +13,8 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use chrono::Datelike;
 use robson_domain::{
-    ExitReason, Position, PositionState, Price, Quantity, Side, Symbol, TechnicalStopDistance,
+    ExitReason, Position, PositionState, Price, Quantity, Side, StopPolicy, Symbol,
+    TechnicalStopDistance,
 };
 use rust_decimal::Decimal;
 use sqlx::{PgPool, Row};
@@ -99,6 +100,8 @@ struct PositionCurrentRow {
     exit_reason: Option<String>,
     insurance_stop_id: Option<String>,
     invalidation_guard_level: Option<Decimal>,
+    stop_policy: Option<String>,
+    stop_buffer_bps_at_arm: Option<Decimal>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
     closed_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -140,6 +143,8 @@ fn parse_position_row(row: &sqlx::postgres::PgRow) -> Result<PositionCurrentRow,
         exit_reason: row.try_get("exit_reason").ok(),
         insurance_stop_id: row.try_get::<Option<String>, _>("insurance_stop_id").ok().flatten(),
         invalidation_guard_level: try_get_decimal("invalidation_guard_level"),
+        stop_policy: row.try_get::<Option<String>, _>("stop_policy").ok().flatten(),
+        stop_buffer_bps_at_arm: try_get_decimal("stop_buffer_bps_at_arm"),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         closed_at: row.try_get("closed_at").ok(),
@@ -179,7 +184,23 @@ fn row_to_position(row_data: PositionCurrentRow) -> Result<Option<Position>, Sto
         },
     };
 
-    let mut position = Position::new(row_data.account_id, symbol, side);
+    // Stop policy is strict (issue #154): NULL (pre-migration snapshot) or
+    // the default backfill mean legacy; an UNKNOWN persisted value is a hard
+    // deserialization failure, never a silent legacy demotion.
+    let stop_policy = match row_data.stop_policy.as_deref() {
+        None => StopPolicy::LegacyUncapped,
+        Some(value) => {
+            StopPolicy::parse(value).map_err(|e| StoreError::Deserialization(e.to_string()))?
+        },
+    };
+
+    let mut position = Position::new_with_stop_policy(
+        row_data.account_id,
+        symbol,
+        side,
+        stop_policy,
+        row_data.stop_buffer_bps_at_arm,
+    );
     position.id = row_data.position_id;
     position.entry_order_id = row_data.entry_order_id;
     position.exit_order_id = row_data.exit_order_id;
@@ -454,6 +475,8 @@ pub async fn find_active_from_projection(
             exit_reason,
             insurance_stop_id,
             invalidation_guard_level,
+            stop_policy,
+            stop_buffer_bps_at_arm,
             created_at,
             updated_at,
             closed_at,
@@ -568,6 +591,8 @@ pub async fn find_positions_overlapping_month(
             exit_reason,
             insurance_stop_id,
             invalidation_guard_level,
+            stop_policy,
+            stop_buffer_bps_at_arm,
             created_at,
             updated_at,
             closed_at
