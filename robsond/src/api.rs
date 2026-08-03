@@ -2531,7 +2531,14 @@ fn position_to_summary(
                         side: position.side,
                         technical_stop: *trailing_stop,
                         guard,
-                        entry_reference: position.entry_price,
+                        // Signal entry reference, same as the engine's plan
+                        // (the fill price would drift the guard-bound cap
+                        // span away from what execution uses).
+                        entry_reference: position
+                            .tech_stop_distance
+                            .as_ref()
+                            .map(|tech_stop| tech_stop.entry_price)
+                            .or(position.entry_price),
                         technical_span: position.tech_stop_distance.as_ref().map(|t| t.span()),
                         stop_buffer_bps: position.stop_buffer_bps_at_arm.unwrap_or(stop_buffer_bps),
                         rules: trading_rules,

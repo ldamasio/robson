@@ -415,6 +415,67 @@ fn v1_guard_and_cap_bind_and_release_on_first_advance() {
     assert_eq!(released_plan.effective_buffer, span * dec!(0.25));
 }
 
+/// Review fix on PR #155: while the guard binds, the live plan measures its
+/// cap span against the SIGNAL entry reference (the one `decide_entry`
+/// priced the admission risk with), not the fill price. A fill worse than
+/// the signal reference must not widen the capped buffer past what sizing
+/// charged.
+#[test]
+fn v1_guard_bound_plan_uses_signal_entry_reference_not_fill_price() {
+    let rules = btcusdt_rules();
+    let engine = Engine::new(RiskConfig::new(dec!(10000)).unwrap());
+
+    // Short armed off signal entry 61_909.10; filled WORSE at 61_950.00.
+    let signal_entry = Price::new(dec!(61909.10)).unwrap();
+    let fill_price = Price::new(dec!(61950.00)).unwrap();
+    let technical = Price::new(dec!(62214.70)).unwrap();
+    let guard = Price::new(dec!(62386.70)).unwrap();
+
+    let mut position = Position::new_with_stop_policy(
+        Uuid::now_v7(),
+        Symbol::from_pair("BTCUSDT").unwrap(),
+        Side::Short,
+        StopPolicy::SpanCappedV1,
+        Some(dec!(100)),
+    );
+    // tech_stop_distance preserves the SIGNAL entry; entry_price is the fill.
+    position.tech_stop_distance =
+        Some(TechnicalStopDistance::from_entry_and_stop(signal_entry, technical));
+    position.entry_price = Some(fill_price);
+    position.quantity = Quantity::new(dec!(0.01)).unwrap();
+    position.state = PositionState::Active {
+        current_price: fill_price,
+        trailing_stop: technical,
+        favorable_extreme: fill_price,
+        extreme_at: Utc::now(),
+        insurance_stop_id: None,
+        invalidation_guard_level: Some(guard),
+        last_emitted_stop: None,
+    };
+
+    let live_plan = engine.stop_plan(&position, technical, Some(guard), Some(&rules)).unwrap();
+    assert!(live_plan.guard_bound);
+    // Cap span = |signal entry - guard basis| = 62386.70 - 61909.10 = 477.60,
+    // NOT |fill - basis| = 436.70.
+    assert_eq!(live_plan.cap_span, Some(dec!(477.60)));
+
+    // The live plan trigger is identical to the admission-time plan built
+    // from the signal reference: priced == executed.
+    let admission_plan = build_executable_stop_plan(StopPlanInputs {
+        policy: StopPolicy::SpanCappedV1,
+        side: Side::Short,
+        technical_stop: technical,
+        guard: Some(guard),
+        entry_reference: Some(signal_entry),
+        technical_span: Some(dec!(305.60)),
+        stop_buffer_bps: dec!(100),
+        rules: Some(&rules),
+    })
+    .unwrap();
+    assert_eq!(live_plan.trigger, admission_plan.trigger);
+    assert_eq!(live_plan.effective_buffer, admission_plan.effective_buffer);
+}
+
 /// A SpanCappedV1 position without trading rules fails closed at the engine
 /// surface (no silent fallback to the unquantized derivation).
 #[test]

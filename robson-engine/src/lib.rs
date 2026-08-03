@@ -788,7 +788,7 @@ impl Engine {
                 side: position.side,
                 technical_stop,
                 guard,
-                entry_reference: position.entry_price,
+                entry_reference: Self::plan_entry_reference(position),
                 technical_span: position.tech_stop_distance.as_ref().map(|t| t.span()),
                 stop_buffer_bps: self.stop_buffer_bps_for(position),
                 rules: None,
@@ -953,6 +953,24 @@ impl Engine {
             .unwrap_or_else(|| self.risk_config.stop_buffer_bps())
     }
 
+    /// The entry reference the stop plan measures its guard-bound cap span
+    /// against. This is the SIGNAL entry (preserved in
+    /// `tech_stop_distance.entry_price`), the same reference `decide_entry`
+    /// priced the admission risk with — the fill price would silently widen
+    /// or tighten the capped buffer relative to what sizing charged, the
+    /// exact priced-vs-executed drift this slice exists to kill. Falls back
+    /// to the fill price only when the technical stop is absent (residual:
+    /// a Postgres projection restart rebuilds `tech_stop_distance` from the
+    /// fill price, bounding any post-restart drift at one fill-vs-signal
+    /// delta while the guard remains bound).
+    fn plan_entry_reference(position: &Position) -> Option<Price> {
+        position
+            .tech_stop_distance
+            .as_ref()
+            .map(|tech_stop| tech_stop.entry_price)
+            .or(position.entry_price)
+    }
+
     /// Resolve the executable stop plan for a live position (issue #154):
     /// the SINGLE derivation behind the soft-exit comparison, insurance
     /// placement/replacement, the API, and startup recovery. The technical
@@ -970,7 +988,7 @@ impl Engine {
             side: position.side,
             technical_stop,
             guard,
-            entry_reference: position.entry_price,
+            entry_reference: Self::plan_entry_reference(position),
             technical_span: position.tech_stop_distance.as_ref().map(|t| t.span()),
             stop_buffer_bps: self.stop_buffer_bps_for(position),
             rules,
