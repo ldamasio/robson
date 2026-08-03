@@ -751,6 +751,82 @@ impl BinanceRestClient {
         Ok(response.symbols.into_iter().any(|info| info.status == "TRADING"))
     }
 
+    /// Fetch the USD-M futures trading filters for one symbol from
+    /// `/fapi/v1/exchangeInfo` (issue #154 deliverable 1).
+    ///
+    /// Quantization must be driven by `tickSize` (grid anchored at
+    /// `minPrice`), never by `pricePrecision`: BTCUSDT futures has tickSize
+    /// 0.10 with pricePrecision 2, so the two genuinely diverge.
+    pub async fn get_futures_symbol_filters(
+        &self,
+        symbol: &str,
+    ) -> Result<BinanceFuturesSymbolFilters, BinanceRestError> {
+        let body = self
+            .get_public("/fapi/v1/exchangeInfo", vec![("symbol", symbol.to_string())])
+            .await?;
+        let response: serde_json::Value =
+            serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+
+        let info = response["symbols"]
+            .as_array()
+            .and_then(|symbols| symbols.iter().find(|s| s["symbol"].as_str() == Some(symbol)))
+            .ok_or_else(|| {
+                BinanceRestError::ParseError(format!(
+                    "exchangeInfo response has no symbol entry for {symbol}"
+                ))
+            })?;
+
+        let decimal_field =
+            |value: &serde_json::Value, name: &str| -> Result<Decimal, BinanceRestError> {
+                value.as_str().and_then(|s| s.parse::<Decimal>().ok()).ok_or_else(|| {
+                    BinanceRestError::ParseError(format!(
+                        "exchangeInfo filter field {name} missing or not a decimal for {symbol}"
+                    ))
+                })
+            };
+        let filter = |filter_type: &str| -> Result<&serde_json::Value, BinanceRestError> {
+            info["filters"]
+                .as_array()
+                .and_then(|filters| {
+                    filters.iter().find(|f| f["filterType"].as_str() == Some(filter_type))
+                })
+                .ok_or_else(|| {
+                    BinanceRestError::ParseError(format!(
+                        "exchangeInfo response has no {filter_type} filter for {symbol}"
+                    ))
+                })
+        };
+
+        let price_filter = filter("PRICE_FILTER")?;
+        let lot_size = filter("LOT_SIZE")?;
+        // MARKET_LOT_SIZE bounds market orders (the only order kind Robson
+        // sends); combine with LOT_SIZE taking the more restrictive value.
+        let market_lot = filter("MARKET_LOT_SIZE").ok();
+        let min_notional = filter("MIN_NOTIONAL")?;
+
+        let mut step_size = decimal_field(&lot_size["stepSize"], "LOT_SIZE.stepSize")?;
+        let mut min_qty = decimal_field(&lot_size["minQty"], "LOT_SIZE.minQty")?;
+        let mut max_qty = decimal_field(&lot_size["maxQty"], "LOT_SIZE.maxQty")?;
+        if let Some(market_lot) = market_lot {
+            step_size =
+                step_size.max(decimal_field(&market_lot["stepSize"], "MARKET_LOT_SIZE.stepSize")?);
+            min_qty = min_qty.max(decimal_field(&market_lot["minQty"], "MARKET_LOT_SIZE.minQty")?);
+            max_qty = max_qty.min(decimal_field(&market_lot["maxQty"], "MARKET_LOT_SIZE.maxQty")?);
+        }
+
+        Ok(BinanceFuturesSymbolFilters {
+            symbol: symbol.to_string(),
+            price_precision: info["pricePrecision"].as_u64().unwrap_or(0) as u32,
+            quantity_precision: info["quantityPrecision"].as_u64().unwrap_or(0) as u32,
+            tick_size: decimal_field(&price_filter["tickSize"], "PRICE_FILTER.tickSize")?,
+            min_price: decimal_field(&price_filter["minPrice"], "PRICE_FILTER.minPrice")?,
+            step_size,
+            min_qty,
+            max_qty,
+            min_notional: decimal_field(&min_notional["notional"], "MIN_NOTIONAL.notional")?,
+        })
+    }
+
     pub async fn place_spot_market_order(
         &self,
         symbol: &str,
@@ -1160,6 +1236,34 @@ pub struct BinanceSpotBalance {
 #[derive(Debug, Clone, Deserialize)]
 struct BinanceSpotExchangeInfoResponse {
     symbols: Vec<BinanceSpotSymbolInfo>,
+}
+
+/// USD-M futures trading filters for one symbol (issue #154 deliverable 1).
+///
+/// `step_size`/`min_qty`/`max_qty` already combine LOT_SIZE and
+/// MARKET_LOT_SIZE taking the more restrictive value, because Robson only
+/// sends market and stop-market orders.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BinanceFuturesSymbolFilters {
+    /// Trading pair (e.g. "BTCUSDT").
+    pub symbol: String,
+    /// Exchange-reported price precision (informational; quantization uses
+    /// `tick_size`).
+    pub price_precision: u32,
+    /// Exchange-reported quantity precision (informational).
+    pub quantity_precision: u32,
+    /// PRICE_FILTER tickSize.
+    pub tick_size: Decimal,
+    /// PRICE_FILTER minPrice (tick grid anchor).
+    pub min_price: Decimal,
+    /// Combined LOT_SIZE / MARKET_LOT_SIZE stepSize.
+    pub step_size: Decimal,
+    /// Combined LOT_SIZE / MARKET_LOT_SIZE minQty.
+    pub min_qty: Decimal,
+    /// Combined LOT_SIZE / MARKET_LOT_SIZE maxQty.
+    pub max_qty: Decimal,
+    /// MIN_NOTIONAL notional threshold.
+    pub min_notional: Decimal,
 }
 
 #[derive(Debug, Clone, Deserialize)]

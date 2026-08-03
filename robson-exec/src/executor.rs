@@ -549,10 +549,16 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         }
     }
 
-    /// Cancel-replace the protective insurance stop after a trailing advance
-    /// (ADR-0039). The previous order is cancelled first; an "unknown order"
-    /// error is tolerated (the stop may have just filled) before placing the
-    /// new stop. Any other failure becomes an audit-only `InsuranceStopFailed`.
+    /// Replace the protective insurance stop after a trailing advance
+    /// (ADR-0039), PLACE-THEN-CANCEL (issue #154 deliverable 6): the
+    /// existing stop is never cancelled before its replacement is accepted
+    /// by the exchange, so the position is protected at every instant.
+    ///
+    /// Both orders are reduce-only STOP_MARKETs, so the transient window
+    /// where the two coexist is safe: if both ever trigger, the second can
+    /// only reduce an already-flat position and is rejected by the exchange.
+    /// A cancel failure after a successful placement is tolerated (double
+    /// protection over no protection); reconciliation resolves the leftover.
     async fn execute_replace_insurance_stop(
         &self,
         position_id: PositionId,
@@ -580,60 +586,74 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             symbol = %symbol.as_pair(),
             previous_order_id = %previous_order_id,
             new_stop_price = %new_stop_price.as_decimal(),
-            "Replacing insurance stop"
+            "Replacing insurance stop (place-then-cancel)"
         );
 
-        // Cancel the previous stop. An "unknown order" error is expected when
-        // the stop has already filled or been cancelled — log and continue.
-        if let Err(e) = self.exchange.cancel_stop_market_order(&symbol, &previous_order_id).await {
-            if Self::is_unknown_order_error(&e) {
+        // 1. Place the replacement FIRST. If this fails, the previous stop is still
+        //    live on the exchange: protection is preserved and the failure is
+        //    audit-only.
+        let order_result = match self
+            .exchange
+            .place_stop_market_order(&symbol, side, quantity, new_stop_price, &client_order_id)
+            .await
+        {
+            Ok(order_result) => order_result,
+            Err(e) => {
                 warn!(
                     %position_id,
                     %previous_order_id,
                     error = %e,
-                    "Previous insurance stop already gone; continuing with replace"
+                    "Insurance stop replacement placement failed; previous stop remains live"
                 );
-            } else {
-                warn!(%position_id, error = %e, "Insurance stop cancel-replace failed");
                 self.journal.complete(intent_id, IntentResult::Failed(e.to_string()))?;
                 return Ok(self.emit_insurance_stop_failed(position_id, new_stop_price, e).await);
-            }
-        }
+            },
+        };
 
-        let result = self
-            .exchange
-            .place_stop_market_order(&symbol, side, quantity, new_stop_price, &client_order_id)
-            .await;
-
-        match result {
-            Ok(order_result) => {
-                info!(
+        // 2. Cancel the previous stop. "Unknown order"/already-gone is expected (it may
+        //    have just filled); any other failure is logged and tolerated — the
+        //    replacement is already protecting the position.
+        match self.exchange.cancel_stop_market_order(&symbol, &previous_order_id).await {
+            Ok(_) => {},
+            Err(e) if Self::is_unknown_order_error(&e) => {
+                warn!(
                     %position_id,
-                    previous_order_id = %previous_order_id,
-                    exchange_order_id = %order_result.exchange_order_id,
-                    new_stop_price = %new_stop_price.as_decimal(),
-                    "Insurance stop replaced"
+                    %previous_order_id,
+                    error = %e,
+                    "Previous insurance stop already gone during replace"
                 );
-                self.journal.complete(intent_id, IntentResult::Success(order_result.clone()))?;
-
-                let event = Event::InsuranceStopReplaced {
-                    position_id,
-                    previous_order_id,
-                    order_id: order_result.exchange_order_id.clone(),
-                    stop_price: new_stop_price,
-                    timestamp: chrono::Utc::now(),
-                };
-                self.store.events().append(&event).await?;
-                self.store.apply_event(&event)?;
-
-                Ok(ActionResult::OrderPlaced { order: order_result, event: Some(event) })
             },
             Err(e) => {
-                warn!(%position_id, error = %e, "Insurance stop replacement failed");
-                self.journal.complete(intent_id, IntentResult::Failed(e.to_string()))?;
-                Ok(self.emit_insurance_stop_failed(position_id, new_stop_price, e).await)
+                warn!(
+                    %position_id,
+                    %previous_order_id,
+                    error = %e,
+                    "Previous insurance stop cancel failed after replacement placement; \
+                     tolerating the transient double stop (reduce-only)"
+                );
             },
         }
+
+        info!(
+            %position_id,
+            previous_order_id = %previous_order_id,
+            exchange_order_id = %order_result.exchange_order_id,
+            new_stop_price = %new_stop_price.as_decimal(),
+            "Insurance stop replaced"
+        );
+        self.journal.complete(intent_id, IntentResult::Success(order_result.clone()))?;
+
+        let event = Event::InsuranceStopReplaced {
+            position_id,
+            previous_order_id,
+            order_id: order_result.exchange_order_id.clone(),
+            stop_price: new_stop_price,
+            timestamp: chrono::Utc::now(),
+        };
+        self.store.events().append(&event).await?;
+        self.store.apply_event(&event)?;
+
+        Ok(ActionResult::OrderPlaced { order: order_result, event: Some(event) })
     }
 
     /// Cancel the protective insurance stop when the software exit takes over
@@ -1182,6 +1202,91 @@ mod tests {
         // The stop was removed from the stub.
         assert_eq!(exchange.stop_order_count(), 0);
         assert!(!exchange.has_stop_order(&order_id));
+    }
+
+    /// Issue #154 deliverable 6: replacement is PLACE-THEN-CANCEL. When the
+    /// new placement fails, the previous stop must remain live on the
+    /// exchange (protection is never dropped before a validated
+    /// replacement exists).
+    #[tokio::test]
+    async fn test_replace_insurance_stop_keeps_previous_when_placement_fails() {
+        let (executor, exchange) = insurance_executor();
+        let position_id = Uuid::now_v7();
+
+        let previous_id = match &executor
+            .execute(vec![place_insurance_action(position_id, dec!(93500))])
+            .await
+            .unwrap()[0]
+        {
+            ActionResult::OrderPlaced {
+                event: Some(Event::InsuranceStopPlaced { order_id, .. }),
+                ..
+            } => order_id.clone(),
+            other => panic!("Expected OrderPlaced, got {:?}", other),
+        };
+
+        exchange.set_order_fail_next(true);
+        let replace_action = EngineAction::ReplaceInsuranceStop {
+            position_id,
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            side: OrderSide::Sell,
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            previous_order_id: previous_id.clone(),
+            new_stop_price: Price::new(dec!(94000)).unwrap(),
+        };
+        let results = executor.execute(vec![replace_action]).await.unwrap();
+
+        assert!(matches!(
+            &results[0],
+            ActionResult::EventEmitted(Event::InsuranceStopFailed { .. })
+        ));
+        assert!(
+            exchange.has_stop_order(&previous_id),
+            "previous stop must remain live when the replacement placement fails"
+        );
+    }
+
+    /// Issue #154 deliverable 6: on success, the replacement is placed and
+    /// only then the previous stop is cancelled.
+    #[tokio::test]
+    async fn test_replace_insurance_stop_places_then_cancels() {
+        let (executor, exchange) = insurance_executor();
+        let position_id = Uuid::now_v7();
+
+        let previous_id = match &executor
+            .execute(vec![place_insurance_action(position_id, dec!(93500))])
+            .await
+            .unwrap()[0]
+        {
+            ActionResult::OrderPlaced {
+                event: Some(Event::InsuranceStopPlaced { order_id, .. }),
+                ..
+            } => order_id.clone(),
+            other => panic!("Expected OrderPlaced, got {:?}", other),
+        };
+
+        let replace_action = EngineAction::ReplaceInsuranceStop {
+            position_id,
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            side: OrderSide::Sell,
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            previous_order_id: previous_id.clone(),
+            new_stop_price: Price::new(dec!(94000)).unwrap(),
+        };
+        let results = executor.execute(vec![replace_action]).await.unwrap();
+
+        match &results[0] {
+            ActionResult::OrderPlaced {
+                event: Some(Event::InsuranceStopReplaced { previous_order_id, order_id, .. }),
+                ..
+            } => {
+                assert_eq!(previous_order_id, &previous_id);
+                assert!(exchange.has_stop_order(order_id), "replacement must be live");
+            },
+            other => panic!("Expected OrderPlaced with InsuranceStopReplaced, got {:?}", other),
+        }
+        assert!(!exchange.has_stop_order(&previous_id), "previous stop must be cancelled");
+        assert_eq!(exchange.stop_order_count(), 1);
     }
 
     /// Regression: 2026-07-31 production incident.

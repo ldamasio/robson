@@ -96,6 +96,10 @@ pub struct StubExchange {
     /// Futures market orders attempted via `place_market_order`, rejected or
     /// not, so tests can assert how many exit attempts reached the exchange.
     market_order_calls: RwLock<u64>,
+    /// Simulated symbol trading rules served by `trading_rules` (issue
+    /// #154). Unset symbols report rules as unavailable, preserving the
+    /// legacy behavior of pre-metadata tests.
+    trading_rules: RwLock<HashMap<String, robson_domain::SymbolTradingRules>>,
 }
 
 impl StubExchange {
@@ -127,7 +131,13 @@ impl StubExchange {
             income_records: RwLock::new(Vec::new()),
             reject_reduce_only_next: RwLock::new(false),
             market_order_calls: RwLock::new(0),
+            trading_rules: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Install simulated trading rules for a symbol (issue #154).
+    pub fn set_trading_rules(&self, rules: robson_domain::SymbolTradingRules) {
+        self.trading_rules.write().unwrap().insert(rules.symbol().as_pair(), rules);
     }
 
     /// Create a stub exchange with a specific futures balance.
@@ -330,6 +340,23 @@ impl StubExchange {
 
 #[async_trait]
 impl ExchangePort for StubExchange {
+    async fn trading_rules(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<robson_domain::SymbolTradingRules, ExecError> {
+        self.trading_rules
+            .read()
+            .unwrap()
+            .get(&symbol.as_pair())
+            .cloned()
+            .ok_or_else(|| {
+                ExecError::Exchange(format!(
+                    "stub has no trading rules configured for {}",
+                    symbol.as_pair()
+                ))
+            })
+    }
+
     async fn validate_futures_settings(
         &self,
         symbol: &Symbol,
