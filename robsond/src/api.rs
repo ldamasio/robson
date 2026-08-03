@@ -241,6 +241,13 @@ pub struct PositionSummary {
     /// `"technical_stop"` or `"invalidation_guard"` (ADR-0042).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_stop_basis: Option<String>,
+    /// Stop-policy version pinned at arm (issue #154):
+    /// `"legacy_uncapped"` or `"span_capped_v1"`.
+    pub stop_policy: String,
+    /// ADR-0041 buffer (bps) snapshotted at arm; absent on positions armed
+    /// before stop-policy versioning (they follow the live config).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub stop_buffer_bps_at_arm: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tech_stop_distance: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2559,6 +2566,8 @@ fn position_to_summary(
         raw_technical_stop,
         invalidation_guard_level,
         effective_stop_basis,
+        stop_policy: position.stop_policy.as_str().to_string(),
+        stop_buffer_bps_at_arm: position.stop_buffer_bps_at_arm,
         tech_stop_distance,
         current_price,
         pnl,

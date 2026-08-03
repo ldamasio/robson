@@ -27,7 +27,7 @@ use std::{
 use chrono::Datelike;
 use robson_domain::{
     ClosureEvidence, DetectorSignal, EntryPolicy, EntryPolicyConfig, Event, Position, PositionId,
-    PositionState, Price, Quantity, ReconciliationEvidence, RiskConfig, Side, Symbol,
+    PositionState, Price, Quantity, ReconciliationEvidence, RiskConfig, Side, StopPolicy, Symbol,
     TechnicalStopDistance, TradingPolicy,
 };
 use robson_engine::{
@@ -1758,6 +1758,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             symbol: symbol.clone(),
             side,
             tech_stop_distance,
+            stop_policy: StopPolicy::LegacyUncapped,
+            stop_buffer_bps_at_arm: None,
             timestamp: now,
         };
         let policy_event = Event::EntryPolicyResolved {
@@ -6077,6 +6079,8 @@ mod tests {
                     symbol: symbol.clone(),
                     side: Side::Long,
                     tech_stop_distance: None,
+                    stop_policy: StopPolicy::LegacyUncapped,
+                    stop_buffer_bps_at_arm: None,
                     timestamp: now,
                 }),
                 EngineAction::EmitEvent(Event::EntryPolicyResolved {

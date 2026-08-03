@@ -42,6 +42,32 @@ pub enum DomainError {
     /// Invalid state transition
     #[error("Invalid state transition: {0}")]
     InvalidStateTransition(String),
+
+    /// Unknown or malformed stop-policy version (issue #154): an unknown
+    /// persisted version must fail, never demote to legacy.
+    #[error("Invalid stop policy: {0}")]
+    InvalidStopPolicy(String),
+
+    /// Exchange trading rules (tick/lot/notional filters) failed validation.
+    #[error("Invalid trading rules: {0}")]
+    InvalidTradingRules(String),
+
+    /// Symbol trading rules are required but not available (SpanCappedV1
+    /// fail-closed path).
+    #[error("Trading rules unavailable: {0}")]
+    TradingRulesUnavailable(String),
+
+    /// The normative span for a SpanCappedV1 stop plan is missing, zero, or
+    /// negative (fail-closed; never silently uncapped).
+    #[error("Degenerate stop span: {0}")]
+    DegenerateStopSpan(String),
+
+    /// The FINAL executable stop (post guard, cap, and tick quantization)
+    /// left the admission distance bounds (ADR-0050 §5 stage 3). Typed so
+    /// the rejection surfaces under its own reason code instead of the
+    /// generic signal_domain_rejection.
+    #[error("Executable stop out of bounds: {0}")]
+    ExecutableStopOutOfBounds(String),
 }
 
 // =============================================================================

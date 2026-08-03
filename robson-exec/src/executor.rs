@@ -13,7 +13,7 @@
 use std::sync::Arc;
 
 use robson_domain::{
-    Event, ExitReason, OrderSide, PositionId, Price, Quantity, RiskConfig, Symbol,
+    Event, ExitReason, OrderSide, PositionId, Price, Quantity, RiskConfig, StopPolicy, Symbol,
 };
 use robson_engine::EngineAction;
 use robson_store::Store;
@@ -932,6 +932,8 @@ mod tests {
             side: Side::Long,
             timestamp: chrono::Utc::now(),
             tech_stop_distance: None,
+            stop_policy: StopPolicy::LegacyUncapped,
+            stop_buffer_bps_at_arm: None,
         };
 
         let action = EngineAction::EmitEvent(event.clone());
@@ -967,6 +969,8 @@ mod tests {
                 side: Side::Long,
                 timestamp: chrono::Utc::now(),
                 tech_stop_distance: None,
+                stop_policy: StopPolicy::LegacyUncapped,
+                stop_buffer_bps_at_arm: None,
             }),
             EngineAction::EmitEvent(Event::EntrySignalReceived {
                 position_id,

@@ -8,8 +8,11 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
-use crate::value_objects::{
-    DomainError, OrderSide, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance,
+use crate::{
+    stop_policy::StopPolicy,
+    value_objects::{
+        DomainError, OrderSide, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance,
+    },
 };
 
 // =============================================================================
@@ -70,6 +73,20 @@ pub struct Position {
     /// coordination.
     pub binance_position_id: Option<String>,
 
+    /// Stop-policy version pinned at arm time (issue #154). Missing on wire
+    /// data written before versioning = `LegacyUncapped`; the policy never
+    /// changes for the lifetime of the position, so a deploy cannot retroact
+    /// on live positions.
+    #[serde(default)]
+    pub stop_policy: StopPolicy,
+    /// ADR-0041 buffer (basis points) snapshotted at arm. `None` on
+    /// positions armed before stop-policy versioning: those follow the live
+    /// `ROBSON_STOP_BUFFER_BPS` config, the historical behavior. When
+    /// present, the snapshot is authoritative so a config change between
+    /// restarts cannot move a live position's executable stop.
+    #[serde(default)]
+    pub stop_buffer_bps_at_arm: Option<rust_decimal::Decimal>,
+
     // Audit
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
@@ -77,8 +94,25 @@ pub struct Position {
 }
 
 impl Position {
-    /// Create a new armed position
+    /// Create a new armed position with the legacy stop policy.
+    ///
+    /// This constructor never decides between Legacy and V1: it always
+    /// yields `LegacyUncapped`, the safe default for every replay and
+    /// recovery path. Arming a `SpanCappedV1` position is an EXPLICIT
+    /// decision made through [`Self::new_with_stop_policy`].
     pub fn new(account_id: AccountId, symbol: Symbol, side: Side) -> Self {
+        Self::new_with_stop_policy(account_id, symbol, side, StopPolicy::LegacyUncapped, None)
+    }
+
+    /// Create a new armed position under an explicit stop policy with the
+    /// arm-time buffer snapshot (issue #154 deliverable 3).
+    pub fn new_with_stop_policy(
+        account_id: AccountId,
+        symbol: Symbol,
+        side: Side,
+        stop_policy: StopPolicy,
+        stop_buffer_bps_at_arm: Option<rust_decimal::Decimal>,
+    ) -> Self {
         let now = Utc::now();
         Self {
             id: Uuid::now_v7(),
@@ -96,6 +130,8 @@ impl Position {
             exit_order_id: None,
             insurance_stop_id: None,
             binance_position_id: None,
+            stop_policy,
+            stop_buffer_bps_at_arm,
             created_at: now,
             updated_at: now,
             closed_at: None,
