@@ -100,6 +100,9 @@ pub struct StubExchange {
     /// #154). Unset symbols report rules as unavailable, preserving the
     /// legacy behavior of pre-metadata tests.
     trading_rules: RwLock<HashMap<String, robson_domain::SymbolTradingRules>>,
+    /// Per-symbol `trading_rules` calls so tests can enforce constant-count
+    /// metadata resolution instead of per-position exchange I/O.
+    trading_rules_calls: RwLock<HashMap<String, u64>>,
 }
 
 impl StubExchange {
@@ -132,12 +135,18 @@ impl StubExchange {
             reject_reduce_only_next: RwLock::new(false),
             market_order_calls: RwLock::new(0),
             trading_rules: RwLock::new(HashMap::new()),
+            trading_rules_calls: RwLock::new(HashMap::new()),
         }
     }
 
     /// Install simulated trading rules for a symbol (issue #154).
     pub fn set_trading_rules(&self, rules: robson_domain::SymbolTradingRules) {
         self.trading_rules.write().unwrap().insert(rules.symbol().as_pair(), rules);
+    }
+
+    /// Number of simulated trading-rules resolutions for one symbol.
+    pub fn trading_rules_call_count(&self, symbol: &str) -> u64 {
+        self.trading_rules_calls.read().unwrap().get(symbol).copied().unwrap_or(0)
     }
 
     /// Create a stub exchange with a specific futures balance.
@@ -344,17 +353,16 @@ impl ExchangePort for StubExchange {
         &self,
         symbol: &Symbol,
     ) -> Result<robson_domain::SymbolTradingRules, ExecError> {
-        self.trading_rules
-            .read()
+        let symbol_pair = symbol.as_pair();
+        *self
+            .trading_rules_calls
+            .write()
             .unwrap()
-            .get(&symbol.as_pair())
-            .cloned()
-            .ok_or_else(|| {
-                ExecError::Exchange(format!(
-                    "stub has no trading rules configured for {}",
-                    symbol.as_pair()
-                ))
-            })
+            .entry(symbol_pair.clone())
+            .or_default() += 1;
+        self.trading_rules.read().unwrap().get(&symbol_pair).cloned().ok_or_else(|| {
+            ExecError::Exchange(format!("stub has no trading rules configured for {}", symbol_pair))
+        })
     }
 
     async fn validate_futures_settings(

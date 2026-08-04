@@ -338,8 +338,12 @@ that understands `executable_span`, never deployment of the pre-ADR binary.
   prices the trigger with the ADR-0051 gap/fee envelope, and reuses that exact
   reservation in admission, slots, status, and MonthlyHalt. Entering positions
   use their persisted initial executable trigger. Resolution failure sets the
-  snapshot invalid, forces zero remaining capacity, and emits a durable
-  high-severity warning; legacy raw-stop arithmetic is unchanged.
+  snapshot invalid, blocks admission, and forces slots and remaining capacity
+  to zero. It never triggers MonthlyHalt or liquidation: halt evaluation is
+  deferred and the exchange insurance stops remain authoritative under
+  degraded pricing. Admission and halt write paths emit the deduplicated,
+  durable high-severity evidence; `GET /status` only reads the failed snapshot.
+  Legacy raw-stop arithmetic is unchanged.
 - Fill-time insurance resolves against live rules. A persisted/live mismatch
   emits a critical drift event with both triggers and tick sizes; resolver
   failure falls back to the persisted trigger and then the initial technical

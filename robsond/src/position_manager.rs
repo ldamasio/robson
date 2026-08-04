@@ -28,8 +28,8 @@ use chrono::Datelike;
 use robson_domain::{
     latent_risk_per_unit_at_trigger, ClosureEvidence, DetectorSignal, EntryPolicy,
     EntryPolicyConfig, Event, MonthlyBudgetModel, Position, PositionId, PositionState, Price,
-    Quantity, ReconciliationEvidence, RiskConfig, Side, StopPolicy, Symbol, TechnicalStopDistance,
-    TradingPolicy,
+    Quantity, ReconciliationEvidence, RiskConfig, Side, StopPolicy, Symbol, SymbolTradingRules,
+    TechnicalStopDistance, TradingPolicy,
 };
 use robson_engine::{
     technical_stop_analyzer::TechnicalStopConfig, Engine, EngineAction, EngineDecision,
@@ -191,7 +191,7 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// ExecutableSpan positions whose canonical latent-risk resolution has
     /// already emitted a durable warning in this process. Retained only while
     /// the position remains unresolved, so the set is bounded by the current
-    /// risk-open portfolio and status polling cannot flood the event log.
+    /// risk-open portfolio. Read-only snapshots never touch this dedup state.
     latent_risk_warning_positions: RwLock<HashSet<PositionId>>,
     /// Optional postgres pool for persisting domain events to robson-eventlog.
     #[cfg(feature = "postgres")]
@@ -1275,8 +1275,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// superset by design.
     async fn build_risk_context(&self) -> DaemonResult<RiskContext> {
         let now = chrono::Utc::now();
-        let (budget, active_positions, resolved_risk) =
+        let (budget, active_positions, resolved_risk, latent_risk_failures) =
             self.canonical_budget_snapshot_with_positions(now).await?;
+        self.emit_latent_risk_resolution_warnings(&latent_risk_failures).await;
         if budget.latent_risk_invalid {
             return Err(DaemonError::Config(
                 "Canonical monthly budget snapshot is invalid because executable-stop latent risk could not be resolved"
@@ -2203,13 +2204,24 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             return false;
         }
 
-        let snapshot = match self.canonical_budget_snapshot(chrono::Utc::now()).await {
+        let (snapshot, _, _, latent_risk_failures) = match self
+            .canonical_budget_snapshot_with_positions(chrono::Utc::now())
+            .await
+        {
             Ok(snapshot) => snapshot,
             Err(e) => {
                 warn!(error = %e, "Failed to build canonical budget snapshot for MonthlyHalt evaluation");
                 return false;
             },
         };
+
+        self.emit_latent_risk_resolution_warnings(&latent_risk_failures).await;
+        if snapshot.latent_risk_invalid {
+            warn!(
+                "Latent risk unresolved; MonthlyHalt evaluation deferred (admission already blocked, insurance stops remain authoritative)"
+            );
+            return false;
+        }
 
         // ADR-0051 §2 intentionally closes the HWM-era inconsistency here:
         // Entering reservations now reduce the exact same remaining value as
@@ -4139,14 +4151,53 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         })
     }
 
-    /// Resolve the canonical latent reservation once for every risk-open
-    /// position. ExecutableSpan Active positions consume the live cached
-    /// trading-rules resolver over their current trailing stop; Entering
-    /// positions consume the immutable admission trigger. Both use the same
-    /// gap + fee envelope as planned-risk pricing.
-    async fn resolve_latent_risk_for_positions(
+    /// Resolve live rules once per distinct symbol before latent-risk pricing.
+    /// Only ExecutableSpan Active positions need current exchange metadata;
+    /// Entering positions use their immutable admission trigger and legacy
+    /// positions preserve their rules-free provenance path.
+    async fn trading_rules_by_symbol_for_positions(
         &self,
         positions: &[Position],
+    ) -> HashMap<Symbol, SymbolTradingRules> {
+        let symbols: HashSet<Symbol> = positions
+            .iter()
+            .filter(|position| {
+                position.stop_policy == StopPolicy::ExecutableSpan
+                    && matches!(&position.state, PositionState::Active { .. })
+            })
+            .map(|position| position.symbol.clone())
+            .collect();
+        let exchange = self.exchange();
+        let mut rules_by_symbol = HashMap::with_capacity(symbols.len());
+
+        for symbol in symbols {
+            match exchange.trading_rules(&symbol).await {
+                Ok(rules) => {
+                    rules_by_symbol.insert(symbol, rules);
+                },
+                Err(error) => {
+                    warn!(
+                        symbol = %symbol.as_pair(),
+                        %error,
+                        "Trading rules unavailable for ExecutableSpan positions; canonical latent-risk pricing will fail closed for this symbol"
+                    );
+                },
+            }
+        }
+
+        rules_by_symbol
+    }
+
+    /// Resolve the canonical latent reservation once for every risk-open
+    /// position without performing I/O in the pricing loop. ExecutableSpan
+    /// Active positions consume the pre-resolved rules for their symbol over
+    /// the current trailing stop; Entering positions consume the immutable
+    /// admission trigger. Both use the same gap + fee envelope as planned-risk
+    /// pricing.
+    fn resolve_latent_risk_for_positions(
+        &self,
+        positions: &[Position],
+        rules_by_symbol: &HashMap<Symbol, SymbolTradingRules>,
     ) -> (
         Decimal,
         HashMap<PositionId, ResolvedPositionRisk>,
@@ -4172,13 +4223,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     trailing_stop, invalidation_guard_level, ..
                 } => match position.entry_price {
                     Some(entry) => {
-                        let rules = self.trading_rules_for(position).await;
                         engine
                             .stop_plan(
                                 position,
                                 *trailing_stop,
                                 *invalidation_guard_level,
-                                rules.as_ref(),
+                                rules_by_symbol.get(&position.symbol),
                             )
                             .map(|plan| (entry, plan.trigger))
                             .map_err(|error| error.to_string())
@@ -4291,6 +4341,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         MonthlyBudgetSnapshot,
         Vec<Position>,
         HashMap<PositionId, ResolvedPositionRisk>,
+        Vec<LatentRiskResolutionFailure>,
     )> {
         let monthly = self.load_monthly_state(now).await?;
         let governed_realized_net = self.robson_month_net(now).await?;
@@ -4309,9 +4360,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // ADR-0051 failure modes: never omit a durable local risk-bearing
         // position from the reservation, even when the exchange snapshot
         // says it is gone (partial/stale responses must stay conservative).
+        let rules_by_symbol = self.trading_rules_by_symbol_for_positions(&local_risk_open).await;
         let (latent_risk, resolved_risk, latent_risk_failures) =
-            self.resolve_latent_risk_for_positions(&local_risk_open).await;
-        self.emit_latent_risk_resolution_warnings(&latent_risk_failures).await;
+            self.resolve_latent_risk_for_positions(&local_risk_open, &rules_by_symbol);
         let latent_risk_invalid = !latent_risk_failures.is_empty();
 
         let capital_base_invalid = monthly.capital_base <= Decimal::ZERO;
@@ -4418,6 +4469,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             },
             local_risk_open,
             resolved_risk,
+            latent_risk_failures,
         ))
     }
 
@@ -4427,7 +4479,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     ) -> DaemonResult<MonthlyBudgetSnapshot> {
         self.canonical_budget_snapshot_with_positions(now)
             .await
-            .map(|(snapshot, _, _)| snapshot)
+            .map(|(snapshot, _, _, _)| snapshot)
     }
 
     /// Compute dynamic count of new slots available from the canonical
@@ -5020,9 +5072,9 @@ mod tests {
         position
     }
 
-    fn budget_test_rules() -> robson_domain::SymbolTradingRules {
+    fn budget_test_rules_for(symbol: Symbol) -> robson_domain::SymbolTradingRules {
         robson_domain::SymbolTradingRules::new(
-            Symbol::from_pair("BTCUSDT").unwrap(),
+            symbol,
             dec!(0.01),
             Decimal::ZERO,
             dec!(0.001),
@@ -5035,13 +5087,26 @@ mod tests {
         .unwrap()
     }
 
+    fn budget_test_rules() -> robson_domain::SymbolTradingRules {
+        budget_test_rules_for(Symbol::from_pair("BTCUSDT").unwrap())
+    }
+
     fn executable_active_position_for_budget(
+        quantity: Decimal,
+        buffer_bps: Decimal,
+    ) -> (Position, robson_domain::ExecutableStopPlan) {
+        executable_active_position_for_budget_on_symbol("BTCUSDT", quantity, buffer_bps)
+    }
+
+    fn executable_active_position_for_budget_on_symbol(
+        symbol: &str,
         quantity: Decimal,
         buffer_bps: Decimal,
     ) -> (Position, robson_domain::ExecutableStopPlan) {
         let entry = Price::new(dec!(100)).unwrap();
         let technical_stop = Price::new(dec!(90)).unwrap();
-        let rules = budget_test_rules();
+        let symbol = Symbol::from_pair(symbol).unwrap();
+        let rules = budget_test_rules_for(symbol.clone());
         let plan = robson_domain::build_executable_stop_plan(robson_domain::StopPlanInputs {
             policy: StopPolicy::ExecutableSpan,
             side: Side::Long,
@@ -5058,7 +5123,7 @@ mod tests {
         let now = chrono::Utc::now();
         let mut position = Position::new_with_stop_policy(
             Uuid::now_v7(),
-            Symbol::from_pair("BTCUSDT").unwrap(),
+            symbol,
             Side::Long,
             StopPolicy::ExecutableSpan,
             Some(buffer_bps),
@@ -7664,6 +7729,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn snapshot_resolves_rules_once_per_symbol_and_isolates_failures() {
+        let manager = create_budget_test_manager(dec!(10000), false);
+        manager.exchange().set_trading_rules(budget_test_rules());
+
+        let (btc_one, _) =
+            executable_active_position_for_budget_on_symbol("BTCUSDT", dec!(1), dec!(100));
+        let (btc_two, _) =
+            executable_active_position_for_budget_on_symbol("BTCUSDT", dec!(2), dec!(100));
+        let (eth_unpriced, _) =
+            executable_active_position_for_budget_on_symbol("ETHUSDT", dec!(1), dec!(100));
+        for position in [&btc_one, &btc_two, &eth_unpriced] {
+            manager.store.positions().save(position).await.unwrap();
+        }
+
+        let (snapshot, _, resolved, failures) = manager
+            .canonical_budget_snapshot_with_positions(chrono::Utc::now())
+            .await
+            .unwrap();
+
+        assert!(snapshot.latent_risk_invalid);
+        assert!(resolved.contains_key(&btc_one.id));
+        assert!(resolved.contains_key(&btc_two.id));
+        assert!(!resolved.contains_key(&eth_unpriced.id));
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].position_id, eth_unpriced.id);
+        assert!(failures[0].reason.contains("Trading rules unavailable"));
+        assert_eq!(manager.exchange().trading_rules_call_count("BTCUSDT"), 1);
+        assert_eq!(manager.exchange().trading_rules_call_count("ETHUSDT"), 1);
+
+        let events = manager.store.events().find_by_position(eth_unpriced.id).await.unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::ExecutableStopRiskResolutionFailed { .. })),
+            "read-only snapshots must return evidence without appending durable events"
+        );
+    }
+
+    #[tokio::test]
     async fn unresolvable_executable_rules_fail_budget_snapshot_closed() {
         let manager = create_budget_test_manager(dec!(1578), false);
         let (position, _) = executable_active_position_for_budget(dec!(1), dec!(100));
@@ -7676,14 +7780,33 @@ mod tests {
         assert!(manager.build_risk_context().await.is_err());
 
         let events = manager.store.events().find_by_position(position.id).await.unwrap();
-        assert!(events.iter().any(|event| matches!(
-            event,
-            Event::ExecutableStopRiskResolutionFailed { severity, reason, .. }
-                if severity == "critical" && reason.contains("Trading rules unavailable")
-        )));
+        let durable_failures = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    Event::ExecutableStopRiskResolutionFailed { severity, reason, .. }
+                        if severity == "critical" && reason.contains("Trading rules unavailable")
+                )
+            })
+            .count();
+        assert_eq!(durable_failures, 1);
         assert!(
-            manager.evaluate_monthly_halt().await,
-            "invalid executable pricing must take the remaining<=0 halt path"
+            !manager.evaluate_monthly_halt().await,
+            "unpriceable latent risk must defer MonthlyHalt rather than liquidate"
+        );
+        assert!(!manager.circuit_breaker.blocks_new_entries().await);
+
+        let persisted = manager.store.positions().find_by_id(position.id).await.unwrap().unwrap();
+        assert!(matches!(persisted.state, PositionState::Active { .. }));
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, Event::ExecutableStopRiskResolutionFailed { .. }))
+                .count(),
+            1,
+            "halt evaluation must reuse the durable-event dedup"
         );
     }
 

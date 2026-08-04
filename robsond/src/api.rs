@@ -2825,7 +2825,8 @@ mod tests {
     };
     use http_body_util::BodyExt;
     use robson_domain::{
-        OrderSide, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance, TradingPolicy,
+        Event, OrderSide, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance,
+        TradingPolicy,
     };
     use robson_engine::Engine;
     use robson_exec::{
@@ -3976,6 +3977,65 @@ mod tests {
         assert_eq!(status.pending_approvals[0].query_id, query_id);
         assert_eq!(status.pending_approvals[0].position_id, Some(position.id));
         assert_eq!(status.pending_approvals[0].state, "AwaitingApproval");
+    }
+
+    #[tokio::test]
+    async fn test_status_with_unpriced_executable_risk_does_not_append_event() {
+        let (app, _, position_manager) = create_test_app_with_event_bus(8).await;
+        let entry = Price::new(dec!(100)).unwrap();
+        let technical_stop = Price::new(dec!(90)).unwrap();
+        let mut position = Position::new_with_stop_policy(
+            Uuid::now_v7(),
+            Symbol::from_pair("ETHUSDT").unwrap(),
+            Side::Long,
+            robson_domain::StopPolicy::ExecutableSpan,
+            Some(dec!(100)),
+        );
+        position.entry_price = Some(entry);
+        position.entry_filled_at = Some(chrono::Utc::now());
+        position.tech_stop_distance =
+            Some(TechnicalStopDistance::from_entry_and_stop(entry, technical_stop));
+        position.quantity = Quantity::new(dec!(1)).unwrap();
+        position.initial_executable_stop = Some(Price::new(dec!(89.9)).unwrap());
+        position.executable_span = Some(dec!(10.1));
+        position.cap_basis_distance = Some(dec!(10));
+        position.tick_size_at_admission = Some(dec!(0.01));
+        position.state = PositionState::Active {
+            current_price: entry,
+            trailing_stop: technical_stop,
+            favorable_extreme: entry,
+            extreme_at: chrono::Utc::now(),
+            insurance_stop_id: None,
+            invalidation_guard_level: None,
+            last_emitted_stop: None,
+        };
+        position_manager.read().await.store().positions().save(&position).await.unwrap();
+
+        let response = app
+            .oneshot(Request::builder().uri("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let status: StatusResponse = serde_json::from_slice(&body).unwrap();
+        assert!(status.monthly_budget_basis_invalid);
+        assert_eq!(status.new_slots_available, 0);
+
+        let events = position_manager
+            .read()
+            .await
+            .store()
+            .events()
+            .find_by_position(position.id)
+            .await
+            .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::ExecutableStopRiskResolutionFailed { .. })),
+            "GET /status must not append executable-risk failure evidence"
+        );
     }
 
     #[tokio::test]
