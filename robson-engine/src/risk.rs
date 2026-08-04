@@ -25,7 +25,7 @@
 //! - Called by Engine before producing entry actions
 //! - Rejection emits RiskCheckFailed event for audit
 
-use robson_domain::TradingPolicy;
+use robson_domain::{MonthlyBudgetModel, TradingPolicy};
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use tracing::debug;
@@ -137,6 +137,10 @@ pub struct RiskContext {
     /// Persisted high-water mark of governed month equity net, floored at zero
     /// and monotonic within the month (ADR-0046).
     pub month_peak_net: Decimal,
+    /// Persisted monthly budget accounting model. Constructors default to the
+    /// dormant rollout's `hwm_v1` behavior for compatibility.
+    #[serde(default)]
+    pub budget_model: MonthlyBudgetModel,
 }
 
 impl RiskContext {
@@ -151,6 +155,7 @@ impl RiskContext {
             monthly_realized_loss: Decimal::ZERO,
             month_equity_net: Decimal::ZERO,
             month_peak_net: Decimal::ZERO,
+            budget_model: MonthlyBudgetModel::default(),
         }
     }
 
@@ -167,6 +172,7 @@ impl RiskContext {
             monthly_realized_loss: Decimal::ZERO,
             month_equity_net: Decimal::ZERO,
             month_peak_net: Decimal::ZERO,
+            budget_model: MonthlyBudgetModel::default(),
         }
     }
 
@@ -193,6 +199,7 @@ impl RiskContext {
             monthly_realized_loss,
             month_equity_net: monthly_realized_pnl + monthly_unrealized_pnl,
             month_peak_net: Decimal::ZERO,
+            budget_model: MonthlyBudgetModel::default(),
         }
     }
 
@@ -237,7 +244,14 @@ impl RiskContext {
             monthly_realized_loss,
             month_equity_net,
             month_peak_net,
+            budget_model: MonthlyBudgetModel::default(),
         }
+    }
+
+    /// Select the persisted monthly budget model for this snapshot.
+    pub fn with_budget_model(mut self, budget_model: MonthlyBudgetModel) -> Self {
+        self.budget_model = budget_model;
+        self
     }
 
     /// Count open positions
@@ -290,9 +304,22 @@ impl RiskContext {
         (self.month_peak_net - self.month_equity_net).max(Decimal::ZERO)
     }
 
-    /// Dynamic slot count via TradingPolicy (ADR-0046).
+    /// Budget consumed under the persisted monthly accounting model.
+    ///
+    /// The net-from-start branch intentionally reads only signed governed
+    /// realized net. Unrealized P&L never masks realized loss under ADR-0051.
+    pub fn budget_consumed(&self) -> Decimal {
+        match self.budget_model {
+            MonthlyBudgetModel::HwmV1 => self.budget_giveback(),
+            MonthlyBudgetModel::NetFromStartNonExpandingV1 => {
+                (-self.monthly_realized_pnl).max(Decimal::ZERO)
+            },
+        }
+    }
+
+    /// Dynamic slot count via TradingPolicy (ADR-0046/ADR-0051).
     pub fn slots_available(&self, policy: &TradingPolicy, capital_base: Decimal) -> u32 {
-        policy.slots_available(capital_base, self.budget_giveback(), self.latent_risk_sum())
+        policy.slots_available(capital_base, self.budget_consumed(), self.latent_risk_sum())
     }
 }
 
@@ -468,7 +495,7 @@ impl RiskGate {
         //    worst-case loss; the 1% per-trade cap still bounds any single trade, and
         //    the 4% monthly budget stays the hard invariant.
         let capital_base = context.capital; // MIG-v3#11 approximation; MIG-v3#12 persists real capital base.
-        let budget_consumed = context.budget_giveback();
+        let budget_consumed = context.budget_consumed();
         let latent_risk = context.latent_risk_sum();
         let remaining = self.policy.remaining_budget(capital_base, budget_consumed, latent_risk);
 
@@ -969,6 +996,78 @@ mod tests {
         // capital=100, budget=4, risk=1, no loss, no latent → 4 slots
         let ctx = RiskContext::new(dec!(100));
         assert_eq!(ctx.slots_available(&policy, dec!(100)), 4);
+    }
+
+    #[test]
+    fn test_august_regression_models_diverge_without_activating_nfs() {
+        let policy = TradingPolicy::default();
+        let hwm = RiskContext::with_month_equity(
+            dec!(100),
+            vec![],
+            dec!(3),
+            Decimal::ZERO,
+            Decimal::ZERO,
+            dec!(3),
+            dec!(4),
+        );
+        let nfs = hwm.clone().with_budget_model(MonthlyBudgetModel::NetFromStartNonExpandingV1);
+
+        assert_eq!(hwm.budget_consumed(), dec!(1));
+        assert_eq!(hwm.slots_available(&policy, dec!(100)), 3);
+        assert_eq!(nfs.budget_consumed(), Decimal::ZERO);
+        assert_eq!(nfs.slots_available(&policy, dec!(100)), 4);
+    }
+
+    #[test]
+    fn test_nfs_realized_loss_cannot_be_masked_by_unrealized_winner() {
+        let policy = TradingPolicy::default();
+        let winner_at_five = summary_with_stop("ETHUSDT", "long", dec!(100), dec!(100), dec!(1));
+        let base = RiskContext::with_month_equity(
+            dec!(100),
+            vec![winner_at_five.clone()],
+            dec!(-1),
+            dec!(5),
+            dec!(1),
+            dec!(4),
+            dec!(4),
+        )
+        .with_budget_model(MonthlyBudgetModel::NetFromStartNonExpandingV1);
+        let winner_at_ten = RiskContext::with_month_equity(
+            dec!(100),
+            vec![PositionSummary {
+                unrealized_pnl: dec!(10),
+                ..winner_at_five
+            }],
+            dec!(-1),
+            dec!(10),
+            dec!(1),
+            dec!(9),
+            dec!(9),
+        )
+        .with_budget_model(MonthlyBudgetModel::NetFromStartNonExpandingV1);
+
+        for context in [&base, &winner_at_ten] {
+            assert_eq!(context.latent_risk_sum(), Decimal::ZERO);
+            assert_eq!(context.budget_consumed(), dec!(1));
+            assert_eq!(
+                policy.remaining_budget(dec!(100), context.budget_consumed(), Decimal::ZERO),
+                dec!(3)
+            );
+            assert_eq!(context.slots_available(&policy, dec!(100)), 3);
+        }
+    }
+
+    #[test]
+    fn test_slots_cap_applies_under_both_budget_models() {
+        let expanded_reporting_policy = TradingPolicy {
+            risk_per_trade_pct: dec!(1),
+            max_monthly_drawdown_pct: dec!(10),
+        };
+        let hwm = RiskContext::new(dec!(100));
+        let nfs = hwm.clone().with_budget_model(MonthlyBudgetModel::NetFromStartNonExpandingV1);
+
+        assert_eq!(hwm.slots_available(&expanded_reporting_policy, dec!(100)), 4);
+        assert_eq!(nfs.slots_available(&expanded_reporting_policy, dec!(100)), 4);
     }
 
     // =========================================================================
