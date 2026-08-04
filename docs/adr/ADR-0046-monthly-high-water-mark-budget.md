@@ -1,7 +1,7 @@
 # ADR-0046 — Monthly High-Water-Mark Budget (Trailing Month)
 
 **Date**: 2026-07-05
-**Status**: Decided (implementation pending)
+**Status**: Superseded by [ADR-0051](ADR-0051-net-from-start-monthly-budget.md) (operator decision, 2026-08-04)
 **Deciders**: RBX Systems (operator + architecture)
 
 ---
