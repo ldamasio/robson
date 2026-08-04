@@ -1,7 +1,12 @@
 # ADR-0038 — Capital Base Recalibration After Manual Account Change
 
 **Date**: 2026-05-28
-**Status**: DECIDED — IMPLEMENTATION REQUIRED
+**Status**: DECIDED — FOLLOW-UP REQUIRED; partially superseded by
+[ADR-0051](ADR-0051-net-from-start-monthly-budget.md): recalibration may no
+longer increase the monthly budget basis intra-month (deposits update margin
+and sizing capital only; adverse changes may conservatively reduce the
+basis). Detection, typed evidence, and auditability requirements remain in
+force.
 **Deciders**: RBX Systems (operator + architecture)
 
 ---
@@ -108,6 +113,11 @@ The recalibration is an audit event, not a silent projection update.
 - This does not let manual gains silently increase risk. A recalibration may
   reduce or increase `capital_base`, but it must always be auditable and tied to
   detected account drift.
+  **Superseded by [ADR-0051](ADR-0051-net-from-start-monthly-budget.md)**:
+  under the net-from-start budget, a recalibration may only *reduce* the
+  monthly budget basis intra-month; an increase (e.g., a confirmed deposit)
+  affects margin and sizing capital but never expands the current month's
+  budget.
 
 ---
 

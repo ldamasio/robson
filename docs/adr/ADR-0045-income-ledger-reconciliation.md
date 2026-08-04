@@ -1,7 +1,14 @@
 # ADR-0045 — Income-Ledger Reconciliation; Drift Demoted to Checksum
 
 **Date**: 2026-07-05
-**Status**: Decided (fully shipped — hotfix, reconciliation-anchor fix, and the typed income ledger)
+**Status**: Decided (fully shipped — hotfix, reconciliation-anchor fix, and
+the typed income ledger); partially superseded by
+[ADR-0051](ADR-0051-net-from-start-monthly-budget.md): confirmed transfers no
+longer increase the monthly budget basis intra-month, and stale or unavailable
+authoritative accounting fails new-entry admission closed after its freshness
+bound. Exit and protective-stop management, typed evidence, item-level
+reconciliation, raw drift attribution, and the prohibition on absorbing
+unexplained residuals remain in force.
 **Deciders**: RBX Systems (operator + architecture)
 
 ---
@@ -51,6 +58,11 @@ item by item:
 - `FUNDING_FEE` maps to the funding tracking;
 - `TRANSFER` is, by definition, an operator action — the only category that
   may legitimately recalibrate `capital_base` automatically;
+
+  > **ADR-0051 boundary:** a confirmed `TRANSFER` may update margin and
+  > sizing capital and may conservatively reduce the effective monthly budget
+  > basis, but it MUST NOT increase that basis intra-month.
+
 - anything unmatched is a **named, per-item anomaly**, not a scalar mystery.
 
 `expected_wallet_balance` derives from the matched ledger, per symbol. This
@@ -108,7 +120,7 @@ fix path is resolving the reconciled close, not absorbing its money.
 
 | Failure | Behavior |
 | --- | --- |
-| Income endpoint unavailable | Ledger matching pauses; alarm on staleness; no accounting writes; trading unaffected |
+| Income endpoint unavailable | Ledger matching pauses; alarm on staleness; no accounting writes; trading unaffected. **Superseded for new-entry admission by [ADR-0051](ADR-0051-net-from-start-monthly-budget.md)**: new entries fail closed after the freshness bound; exits and protective stops continue |
 | Income item matches nothing governed | Named anomaly, persistent alarm; operator decides (rotation-grade signal if it looks like unauthorized activity) |
 | Governed fill has no income item (lag) | Matching retries with backoff; residual alarm carries the pending fill id |
 | Residual ≠ 0 with all items matched | Invariant breach — loud alarm, block auto-recalibration, operator review |
