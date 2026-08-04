@@ -247,8 +247,7 @@ impl Daemon<StubExchange, MemoryStore> {
             .with_invalidation_guard(
                 config.engine.stop_invalidation_guard_enabled,
                 config.engine.stop_invalidation_lookback_candles,
-            )
-            .with_stop_policy(config.engine.stop_policy),
+            ),
         ));
 
         Self {
@@ -266,29 +265,42 @@ impl Daemon<StubExchange, MemoryStore> {
     }
 
     /// Create a stub daemon with a specific capital for position sizing tests.
-    pub fn new_stub_with_capital(config: Config, capital: Decimal) -> Self {
-        use robson_domain::RiskConfig;
+    ///
+    /// # Errors
+    /// Returns a domain validation error when the supplied capital, engine
+    /// risk configuration, or deterministic stub trading rules are invalid.
+    pub fn new_stub_with_capital(
+        config: Config,
+        capital: Decimal,
+    ) -> Result<Self, robson_domain::DomainError> {
+        use robson_domain::{RiskConfig, SymbolTradingRules};
 
         let exchange = Arc::new(StubExchange::with_balance(dec!(95000), capital));
+        // ExecutableSpan admission consumes exchange metadata before it can
+        // size an order. Keep the HTTP test daemon representative of a live
+        // adapter by installing explicit rules for its configured example
+        // symbol instead of relying on the retired metadata-free path.
+        exchange.set_trading_rules(SymbolTradingRules::new(
+            Symbol::from_pair("BTCUSDT")?,
+            dec!(0.01),
+            Decimal::ZERO,
+            dec!(0.001),
+            dec!(0.001),
+            dec!(1000000),
+            Decimal::ZERO,
+            2,
+            3,
+        )?);
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder = default_query_recorder();
-        let risk_config = RiskConfig::new(capital)
-            .unwrap()
-            .with_execution_costs(config.engine.taker_fee_rate, config.engine.stop_gap_bps)
-            .expect("invalid ROBSON_TAKER_FEE_RATE / ROBSON_STOP_GAP_BPS configuration")
-            .with_stop_buffer(config.engine.stop_buffer_bps)
-            .expect("invalid ROBSON_STOP_BUFFER_BPS configuration")
-            .with_margin_headroom(config.engine.margin_headroom_bps)
-            .expect("invalid ROBSON_MARGIN_HEADROOM_BPS configuration")
-            .with_stop_distance_bounds(
-                config
-                    .engine
-                    .stop_distance_bounds()
-                    .expect("invalid ROBSON_MIN/MAX_TECH_STOP_PERCENT configuration"),
-            );
+        let risk_config = RiskConfig::new(capital)?
+            .with_execution_costs(config.engine.taker_fee_rate, config.engine.stop_gap_bps)?
+            .with_stop_buffer(config.engine.stop_buffer_bps)?
+            .with_margin_headroom(config.engine.margin_headroom_bps)?
+            .with_stop_distance_bounds(config.engine.stop_distance_bounds()?);
         let engine = Engine::new(risk_config);
         let trading_policy = TradingPolicy::default();
 
@@ -304,11 +316,10 @@ impl Daemon<StubExchange, MemoryStore> {
             .with_invalidation_guard(
                 config.engine.stop_invalidation_guard_enabled,
                 config.engine.stop_invalidation_lookback_candles,
-            )
-            .with_stop_policy(config.engine.stop_policy),
+            ),
         ));
 
-        Self {
+        Ok(Self {
             config,
             exchange,
             position_manager,
@@ -319,7 +330,7 @@ impl Daemon<StubExchange, MemoryStore> {
             #[cfg(feature = "postgres")]
             pg_pool: None,
             last_month_check: initial_month_check(),
-        }
+        })
     }
 
     /// Create a new stub daemon with optional projection recovery and shared
@@ -375,8 +386,7 @@ impl Daemon<StubExchange, MemoryStore> {
         .with_invalidation_guard(
             config.engine.stop_invalidation_guard_enabled,
             config.engine.stop_invalidation_lookback_candles,
-        )
-        .with_stop_policy(config.engine.stop_policy);
+        );
         if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
             pm = pm.with_event_log((**pool).clone(), tenant_id);
         }
@@ -442,8 +452,7 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
             .with_invalidation_guard(
                 config.engine.stop_invalidation_guard_enabled,
                 config.engine.stop_invalidation_lookback_candles,
-            )
-            .with_stop_policy(config.engine.stop_policy),
+            ),
         ));
 
         Self {
@@ -522,8 +531,7 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
         .with_invalidation_guard(
             config.engine.stop_invalidation_guard_enabled,
             config.engine.stop_invalidation_lookback_candles,
-        )
-        .with_stop_policy(config.engine.stop_policy);
+        );
         if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
             pm = pm.with_event_log((**pool).clone(), tenant_id);
         }
@@ -1464,29 +1472,19 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
             {
                 info!("Store empty, attempting projection recovery");
 
-                match recovery.find_active_from_projection(tenant_id).await {
-                    Ok(restored_positions) => {
-                        let count = restored_positions.len();
-                        if count > 0 {
-                            // Save restored positions to store
-                            for position in restored_positions {
-                                if let Err(e) = self.store.positions().save(&position).await {
-                                    error!(
-                                        position_id = %position.id,
-                                        error = %e,
-                                        "Failed to save restored position to store"
-                                    );
-                                }
-                            }
+                let restored_positions = recovery.find_active_from_projection(tenant_id).await?;
+                let count = restored_positions.len();
+                if count > 0 {
+                    // A partial reconstruction is not a safe degraded mode:
+                    // every recovered risk-bearing position must enter the
+                    // canonical store before startup can continue.
+                    for position in restored_positions {
+                        self.store.positions().save(&position).await?;
+                    }
 
-                            info!(count, "Restored active positions from projection");
-                        } else {
-                            info!("Projection recovery: no active positions found");
-                        }
-                    },
-                    Err(e) => {
-                        warn!(error = %e, "Projection recovery failed, continuing with empty store");
-                    },
+                    info!(count, "Restored active positions from projection");
+                } else {
+                    info!("Projection recovery: no active positions found");
                 }
             } else {
                 info!("No projection recovery configured, starting with empty store");
@@ -2063,6 +2061,37 @@ mod tests {
 
         // Should not fail with empty store
         daemon.restore_positions().await.unwrap();
+    }
+
+    #[cfg(feature = "postgres")]
+    struct FailingProjectionRecovery;
+
+    #[cfg(feature = "postgres")]
+    #[async_trait::async_trait]
+    impl robson_store::ProjectionRecovery for FailingProjectionRecovery {
+        async fn find_active_from_projection(
+            &self,
+            _tenant_id: uuid::Uuid,
+        ) -> Result<Vec<robson_domain::Position>, robson_store::StoreError> {
+            Err(robson_store::StoreError::Connection("simulated projection outage".to_string()))
+        }
+    }
+
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    async fn projection_recovery_failure_aborts_startup_instead_of_using_empty_store() {
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(uuid::Uuid::now_v7());
+        let daemon =
+            Daemon::new_stub_with_recovery(config, Some(Arc::new(FailingProjectionRecovery)), None);
+
+        let error = daemon.restore_positions().await.unwrap_err();
+        assert!(matches!(
+            error,
+            DaemonError::Store(robson_store::StoreError::Connection(ref detail))
+                if detail == "simulated projection outage"
+        ));
+        assert!(daemon.store.positions().find_active().await.unwrap().is_empty());
     }
 
     #[tokio::test]

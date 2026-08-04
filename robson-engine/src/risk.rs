@@ -110,6 +110,13 @@ pub struct PositionSummary {
     pub quantity: Decimal,
     /// Current stop price (for latent risk calculation)
     pub current_stop: Decimal,
+    /// Cost-priced latent reservation resolved by the canonical budget
+    /// snapshot. `None` preserves the legacy raw stop-distance arithmetic
+    /// byte-for-byte; ExecutableSpan positions carry gap and round-trip fee
+    /// components here so admission consumes the same reservation as status,
+    /// slots, and MonthlyHalt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cost_priced_latent_risk: Option<Decimal>,
 }
 
 /// Snapshot of current portfolio risk state
@@ -279,11 +286,13 @@ impl RiskContext {
         self.open_positions
             .iter()
             .map(|p| {
-                let risk = match p.side.to_lowercase().as_str() {
-                    "long" => (p.entry_price - p.current_stop) * p.quantity,
-                    "short" => (p.current_stop - p.entry_price) * p.quantity,
-                    _ => Decimal::ZERO,
-                };
+                let risk = p.cost_priced_latent_risk.unwrap_or_else(|| {
+                    match p.side.to_lowercase().as_str() {
+                        "long" => (p.entry_price - p.current_stop) * p.quantity,
+                        "short" => (p.current_stop - p.entry_price) * p.quantity,
+                        _ => Decimal::ZERO,
+                    }
+                });
                 risk.max(Decimal::ZERO)
             })
             .sum()
@@ -608,6 +617,7 @@ mod tests {
             entry_price: entry,
             quantity: qty,
             current_stop: stop,
+            cost_priced_latent_risk: None,
         }
     }
 
@@ -646,6 +656,7 @@ mod tests {
             entry_price: dec!(50000),
             quantity: dec!(0.02),
             current_stop: dec!(48000),
+            cost_priced_latent_risk: None,
         }]);
         let proposed = sample_proposed();
 
@@ -833,6 +844,7 @@ mod tests {
             entry_price: dec!(50000),
             quantity: dec!(0.02),
             current_stop: dec!(52000),
+            cost_priced_latent_risk: None,
         }]);
         let proposed = sample_proposed();
 

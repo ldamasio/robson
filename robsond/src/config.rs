@@ -128,13 +128,6 @@ pub struct EngineConfig {
     /// recent adverse extreme when the guard is enabled (env:
     /// `ROBSON_STOP_INVALIDATION_LOOKBACK_CANDLES`, default 20). ADR-0042.
     pub stop_invalidation_lookback_candles: usize,
-    /// Stop policy pinned to NEW positions at arm time (env:
-    /// `ROBSON_STOP_POLICY`, `legacy_uncapped` | `span_capped_v1`, default
-    /// `legacy_uncapped`). Issue #154: activation of `span_capped_v1` for
-    /// real entries is an EXPLICIT operator decision; a deploy alone never
-    /// changes the derivation, and existing positions keep their arm-time
-    /// policy forever. An unknown value fails startup.
-    pub stop_policy: robson_domain::StopPolicy,
 }
 
 impl EngineConfig {
@@ -305,6 +298,7 @@ impl Config {
     pub fn from_env() -> DaemonResult<Self> {
         // Load .env file if present (ignore errors)
         let _ = dotenvy::dotenv();
+        Self::reject_removed_stop_policy_env()?;
 
         let environment = Self::load_environment()?;
         let api = Self::load_api_config()?;
@@ -353,7 +347,6 @@ impl Config {
                 margin_headroom_bps: Decimal::from(100),    // 1% margin-cap headroom
                 stop_invalidation_guard_enabled: false,
                 stop_invalidation_lookback_candles: 20,
-                stop_policy: robson_domain::StopPolicy::LegacyUncapped,
             },
             tech_stop: TechStopConfigEnv {
                 min_stop_pct: Decimal::new(1, 1), // 0.1%
@@ -400,6 +393,19 @@ impl Config {
                 other
             ))),
         }
+    }
+
+    /// ADR-0052 removed runtime stop-policy selection. Presence is rejected
+    /// even when the value is empty so stale deployment manifests cannot
+    /// silently retain a risk-policy knob.
+    fn reject_removed_stop_policy_env() -> DaemonResult<()> {
+        if env::var_os("ROBSON_STOP_POLICY").is_some() {
+            return Err(DaemonError::Config(
+                "ROBSON_STOP_POLICY was removed by ADR-0052; remove it from the deployment manifest"
+                    .to_string(),
+            ));
+        }
+        Ok(())
     }
 
     fn load_api_config() -> DaemonResult<ApiConfig> {
@@ -462,14 +468,6 @@ impl Config {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(20);
 
-        // Stop policy for NEW arms (issue #154). Strict parse: an unknown
-        // value fails startup instead of silently running legacy.
-        let stop_policy = match env::var("ROBSON_STOP_POLICY") {
-            Ok(value) => robson_domain::StopPolicy::parse(&value)
-                .map_err(|e| DaemonError::Config(format!("ROBSON_STOP_POLICY: {e}")))?,
-            Err(_) => robson_domain::StopPolicy::LegacyUncapped,
-        };
-
         Ok(EngineConfig {
             min_tech_stop_percent: min_tech_stop,
             max_tech_stop_percent: max_tech_stop,
@@ -479,7 +477,6 @@ impl Config {
             margin_headroom_bps,
             stop_invalidation_guard_enabled,
             stop_invalidation_lookback_candles,
-            stop_policy,
         })
     }
 
@@ -760,7 +757,6 @@ impl Default for Config {
                 margin_headroom_bps: Decimal::from(100),    // 1% margin-cap headroom
                 stop_invalidation_guard_enabled: false,
                 stop_invalidation_lookback_candles: 20,
-                stop_policy: robson_domain::StopPolicy::LegacyUncapped,
             },
             tech_stop: TechStopConfigEnv {
                 min_stop_pct: Decimal::ONE,      // 1%
@@ -877,6 +873,34 @@ mod tests {
         // Risk per trade is NOT in engine config — fixed at 1% in domain
         assert_eq!(config.engine.min_tech_stop_percent, Decimal::new(1, 3));
         assert_eq!(config.engine.max_tech_stop_percent, Decimal::new(10, 2));
+    }
+
+    #[test]
+    fn startup_fails_fast_when_removed_stop_policy_env_is_present() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[("ROBSON_STOP_POLICY", Some("legacy_uncapped"))]);
+
+        let error = Config::from_env().unwrap_err();
+        assert!(matches!(
+            error,
+            DaemonError::Config(message)
+                if message.contains("ROBSON_STOP_POLICY")
+                    && message.contains("removed by ADR-0052")
+        ));
+    }
+
+    #[test]
+    fn startup_fails_fast_when_removed_stop_policy_env_is_empty() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[("ROBSON_STOP_POLICY", Some(""))]);
+
+        let error = Config::from_env().unwrap_err();
+        assert!(matches!(
+            error,
+            DaemonError::Config(message)
+                if message.contains("ROBSON_STOP_POLICY")
+                    && message.contains("removed by ADR-0052")
+        ));
     }
 
     #[test]

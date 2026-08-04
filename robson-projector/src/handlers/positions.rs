@@ -715,7 +715,8 @@ pub(crate) async fn handle_entry_filled(pool: &PgPool, envelope: &EventEnvelope)
 ///
 /// This event carries the detector-derived technical stop. It does not change
 /// position state; entry_order_accepted performs the Entering transition after
-/// verifying these fields are present and non-zero.
+/// verifying these fields are present and non-zero. ADR-0052 plan fields and
+/// their entry/stop anchor are first-write-wins so replay cannot redefine S.
 pub(crate) async fn handle_entry_signal_received(
     pool: &PgPool,
     envelope: &EventEnvelope,
@@ -734,17 +735,35 @@ pub(crate) async fn handle_entry_signal_received(
         r#"
         UPDATE positions_current
         SET
-            technical_stop_price = $2,
-            technical_stop_distance = $3,
-            last_event_id = $4,
-            last_seq = $5,
-            updated_at = $6
-        WHERE position_id = $1 AND last_seq < $5
+            technical_stop_price = CASE
+                WHEN initial_executable_stop IS NULL
+                 AND executable_span IS NULL
+                 AND cap_basis_distance IS NULL
+                 AND tick_size_at_admission IS NULL
+                THEN $2 ELSE technical_stop_price END,
+            technical_stop_distance = CASE
+                WHEN initial_executable_stop IS NULL
+                 AND executable_span IS NULL
+                 AND cap_basis_distance IS NULL
+                 AND tick_size_at_admission IS NULL
+                THEN $3 ELSE technical_stop_distance END,
+            initial_executable_stop = COALESCE(initial_executable_stop, $4),
+            executable_span = COALESCE(executable_span, $5),
+            cap_basis_distance = COALESCE(cap_basis_distance, $6),
+            tick_size_at_admission = COALESCE(tick_size_at_admission, $7),
+            last_event_id = $8,
+            last_seq = $9,
+            updated_at = $10
+        WHERE position_id = $1 AND last_seq < $9
         "#,
     )
     .bind(payload.position_id)
     .bind(payload.stop_loss)
     .bind(distance)
+    .bind(payload.initial_executable_stop)
+    .bind(payload.executable_span)
+    .bind(payload.cap_basis_distance)
+    .bind(payload.tick_size)
     .bind(envelope.event_id)
     .bind(envelope.seq)
     .bind(envelope.occurred_at)

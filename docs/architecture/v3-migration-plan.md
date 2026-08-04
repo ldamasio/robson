@@ -179,6 +179,14 @@ The chosen mechanism for MIG-v2.5#2 is the **synchronous fail-fast write path**:
 
 6. **Added `entry_signal_received` handler to projector**: The engine emits `EntrySignalReceived` as an audit event during entry signal processing. Previously, the projector had no handler for this event type, which would cause a `MissingHandler` error when `event_log_pool` is configured (fail-fast mode). Added `handle_entry_signal_received()` which acknowledges the event without modifying projection state (it's an audit event, state transition is done by `entry_order_placed`).
 
+   **ADR-0052 implementation update (2026-08-04)**: the handler now projects
+   the admission-time executable trigger, immutable executable span,
+   cap-basis distance, and admission tick size. Ordered action persistence is
+   scoped to the entry-admission sequence and makes this projection a
+   fail-fast durability barrier before entry-order submission. Exit and
+   protective-order cycles retain execute-all-then-persist availability
+   semantics; the handler still does not change lifecycle state.
+
 7. **Added regression test for `entry_signal_received`**: New test `test_entry_signal_received_handled_without_error` in `crash_recovery.rs` verifies that the event is handled without `MissingHandler` error and doesn't change position state.
 
 ### MIG-v2.5#3 Technical Notes (2026-04-10)

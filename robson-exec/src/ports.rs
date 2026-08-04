@@ -127,7 +127,7 @@ pub trait ExchangePort: Send + Sync {
     /// order remains valid until a replacement exists).
     ///
     /// The default implementation reports rules as unavailable: legacy
-    /// stop-policy flows proceed without them, `SpanCappedV1` flows fail
+    /// stop-policy flows proceed without them, `ExecutableSpan` flows fail
     /// closed.
     async fn trading_rules(&self, symbol: &Symbol) -> Result<SymbolTradingRules, ExecError> {
         Err(ExecError::Exchange(format!(

@@ -32,11 +32,11 @@
 use std::sync::Arc;
 
 use chrono::Utc;
-use robson_domain::{Candle, Event, PositionState, Price, Side};
+use robson_domain::{Candle, Event, PositionState, Price, Side, StopPolicy};
 use robson_engine::{EngineAction, MarketData};
 use robson_exec::{ActionResult, CandleInterval, ExchangePort, OhlcvPort};
 use robson_store::Store;
-use tracing::{debug, info, warn};
+use tracing::{debug, error, info, warn};
 
 use crate::{
     error::DaemonResult,
@@ -134,14 +134,41 @@ pub async fn run_startup_recovery<E: ExchangePort + 'static, S: Store + 'static>
 
         let now = Utc::now();
         let gap_minutes = (now - anchor).num_minutes();
-        if gap_minutes < MIN_GAP_MINUTES {
+
+        // ADR-0052 recovery contract: validate immutable admission evidence
+        // before any time-gap fast path. A freshly restarted risk-bearing
+        // position with corrupt S must be quarantined immediately, not skipped
+        // until a later recovery run. No exchange call is needed to detect it.
+        if position.stop_policy == StopPolicy::ExecutableSpan
+            && (position.executable_span.is_none_or(|span| span <= rust_decimal::Decimal::ZERO)
+                || position
+                    .cap_basis_distance
+                    .is_none_or(|distance| distance <= rust_decimal::Decimal::ZERO))
+        {
+            error!(
+                %position_id,
+                executable_span = ?position.executable_span,
+                cap_basis_distance = ?position.cap_basis_distance,
+                "startup-recovery: executable-span admission evidence is missing or non-positive; \
+                 quarantining position (insurance stop preserved untouched)"
+            );
+            record_insurance_stop_check(
+                pm,
+                position_id,
+                position.insurance_stop_id.clone(),
+                None,
+                trailing_stop,
+                None,
+                "recovery_quarantined_invalid_executable_span",
+            )
+            .await;
             report.positions_skipped += 1;
             continue;
         }
 
         // Fail-closed quarantine (issue #154 deliverable 6): if this
-        // position's executable stop plan cannot be derived (e.g. a
-        // SpanCappedV1 position with a degenerate span or missing trading
+        // position's executable stop plan cannot be derived (e.g. an
+        // ExecutableSpan position with invalid state or missing trading
         // rules), recovery must NOT touch it — the existing insurance stop
         // is preserved untouched, durable evidence is recorded, and the
         // operator resolves the defect.
@@ -153,7 +180,7 @@ pub async fn run_startup_recovery<E: ExchangePort + 'static, S: Store + 'static>
         let plan_result =
             pm.engine().stop_plan(position, trailing_stop, guard, plan_rules.as_ref());
         if let Err(error) = plan_result {
-            warn!(
+            error!(
                 %position_id,
                 %error,
                 "startup-recovery: stop plan derivation failed; quarantining position \
@@ -169,6 +196,11 @@ pub async fn run_startup_recovery<E: ExchangePort + 'static, S: Store + 'static>
                 "recovery_quarantined_stop_plan_error",
             )
             .await;
+            report.positions_skipped += 1;
+            continue;
+        }
+
+        if gap_minutes < MIN_GAP_MINUTES {
             report.positions_skipped += 1;
             continue;
         }
@@ -1374,16 +1406,20 @@ mod tests {
         assert_eq!(recovery_check_outcome(&events, position_id), Some("already_protected"));
     }
 
-    /// Issue #154 fail-closed: a SpanCappedV1 Active position whose stop
+    /// ADR-0052 fail-closed: an ExecutableSpan Active position whose stop
     /// plan cannot be derived (no trading rules on the exchange) is
     /// QUARANTINED by recovery: skipped, insurance preserved untouched,
     /// durable evidence recorded. Protection is never cancelled.
     #[tokio::test]
-    async fn recovery_quarantines_v1_position_without_trading_rules() {
+    async fn recovery_quarantines_executable_span_position_without_trading_rules() {
         let account_id = Uuid::now_v7();
         let mut position = btcusdt_long_position(account_id);
-        position.stop_policy = robson_domain::StopPolicy::SpanCappedV1;
+        position.stop_policy = robson_domain::StopPolicy::ExecutableSpan;
         position.stop_buffer_bps_at_arm = Some(dec!(10));
+        position.initial_executable_stop = Some(Price::new(dec!(76158.20)).unwrap());
+        position.executable_span = Some(dec!(1774.20));
+        position.cap_basis_distance = Some(dec!(1774.15));
+        position.tick_size_at_admission = Some(dec!(0.10));
         let position_id = position.id;
 
         let extreme_at = match position.state {
@@ -1392,7 +1428,7 @@ mod tests {
         };
         let candles = crash_candles(extreme_at);
         let ohlcv = Arc::new(StubOhlcv::new(candles)) as Arc<dyn OhlcvPort>;
-        // Stub has NO trading rules: the v1 plan cannot be derived.
+        // Stub has NO trading rules: the executable plan cannot be derived.
         let pm = create_manager(ohlcv, dec!(75000)).await;
 
         // Give the position a live insurance stop that must survive.
@@ -1403,7 +1439,7 @@ mod tests {
                 OrderSide::Sell,
                 Quantity::new(dec!(0.01)).unwrap(),
                 Price::new(dec!(76158.20)).unwrap(),
-                "ins-v1",
+                "ins-executable-span",
             )
             .await
             .unwrap();
@@ -1428,6 +1464,47 @@ mod tests {
             recovery_check_outcome(&events, position_id),
             Some("recovery_quarantined_stop_plan_error")
         );
+    }
+
+    #[tokio::test]
+    async fn recovery_quarantines_missing_or_non_positive_persisted_executable_span() {
+        for invalid_span in [None, Some(Decimal::ZERO), Some(dec!(-1))] {
+            let mut position = btcusdt_long_position(Uuid::now_v7());
+            position.stop_policy = robson_domain::StopPolicy::ExecutableSpan;
+            position.stop_buffer_bps_at_arm = Some(dec!(10));
+            position.initial_executable_stop = Some(Price::new(dec!(76158.20)).unwrap());
+            position.executable_span = invalid_span;
+            position.cap_basis_distance = Some(dec!(1774.15));
+            position.tick_size_at_admission = Some(dec!(0.10));
+            let position_id = position.id;
+
+            let ohlcv = Arc::new(StubOhlcv::new(vec![])) as Arc<dyn OhlcvPort>;
+            let pm = create_manager(ohlcv, dec!(75000)).await;
+            let stop = pm
+                .exchange()
+                .place_stop_market_order(
+                    &btcusdt(),
+                    OrderSide::Sell,
+                    Quantity::new(dec!(0.01)).unwrap(),
+                    Price::new(dec!(76158.20)).unwrap(),
+                    "ins-invalid-executable-span",
+                )
+                .await
+                .unwrap();
+            let stop_id = stop.exchange_order_id.clone();
+            position = with_insurance_stop(position, &stop_id);
+            pm.store().positions().save(&position).await.unwrap();
+
+            let report = run_startup_recovery(&pm, &pm.ohlcv_port()).await.unwrap();
+
+            assert_eq!(report.positions_skipped, 1);
+            assert!(pm.exchange().has_stop_order(&stop_id));
+            let events = pm.store().events().find_by_position(position_id).await.unwrap();
+            assert_eq!(
+                recovery_check_outcome(&events, position_id),
+                Some("recovery_quarantined_invalid_executable_span")
+            );
+        }
     }
 
     /// If the stop was NOT crossed during the gap, recovery must leave the

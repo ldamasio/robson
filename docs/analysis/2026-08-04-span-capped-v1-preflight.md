@@ -41,3 +41,9 @@ predates ADR-0050 slice 5), which is consistent with its event log
 containing zero stamps. Deletion precondition SATISFIED as of
 2026-08-04T16:55:38Z. Any re-run before implementation merge must reproduce
 zero results.
+
+## Pre-merge re-run (ADR-0052 Decision 3 requirement)
+
+**2026-08-04T22:33:13Z**, same method (ephemeral in-cluster pod, secret-injected
+URL): production `event_log` payload scan for `span_capped_v1` returned `0`.
+Precondition remains satisfied at implementation-merge time.

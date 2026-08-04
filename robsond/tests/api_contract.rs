@@ -41,7 +41,8 @@ async fn start_test_server() -> (String, SocketAddr) {
 /// position sizing (e.g., exchange minimum quantity rejection).
 async fn start_test_server_with_capital(capital_base: Decimal) -> (String, SocketAddr) {
     let config = Config::test();
-    let daemon = Daemon::new_stub_with_capital(config, capital_base);
+    let daemon = Daemon::new_stub_with_capital(config, capital_base)
+        .expect("valid API-contract stub configuration");
     let addr = daemon.start_api_server(None).await.expect("failed to start test server");
     let base_url = format!("http://{}", addr);
     (base_url, addr)
@@ -420,9 +421,20 @@ async fn test_signal_on_armed_position_is_accepted() {
 }
 
 #[tokio::test]
-async fn test_signal_rejects_quantity_below_exchange_minimum() {
+async fn test_signal_governs_quantity_below_exchange_minimum() {
     let (base, _) = start_test_server_with_capital(dec!(100)).await;
-    let arm = arm_btcusdt(&base).await;
+    let arm_response = client()
+        .post(format!("{}/positions", base))
+        .json(&json!({
+            "symbol": "BTCUSDT",
+            "side": "LONG",
+            "entry_policy": { "mode": "immediate", "approval": "automatic" }
+        }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(arm_response.status(), 201);
+    let arm: api::ArmResponse = arm_response.json().await.unwrap();
 
     let resp = client()
         .post(format!("{}/positions/{}/signal", base, arm.position_id))
@@ -435,10 +447,35 @@ async fn test_signal_rejects_quantity_below_exchange_minimum() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), 400);
-    let body: api::ErrorResponse = resp.json().await.unwrap();
-    assert!(body.error.contains("step size 0.001"), "error: {}", body.error);
-    assert!(body.error.contains("minimum quantity 0.001"), "error: {}", body.error);
+    // ExecutableSpan validates lot metadata in the domain admission plan.
+    // The signal endpoint therefore accepts the request while the governed
+    // rejection re-arms the position without submitting an exchange order.
+    assert_eq!(resp.status(), 200);
+
+    let position: api::PositionSummary = client()
+        .get(format!("{}/positions/{}", base, arm.position_id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(position.state, "Armed");
+    assert_eq!(position.entry_status.as_deref(), Some("needs_operator_rearm"));
+    let rejection = position
+        .last_rejection
+        .expect("governed rejection must remain operator-visible");
+    assert!(rejection.reason.contains("Quantity"), "{}", rejection.reason);
+    assert!(
+        rejection.reason.contains("minimum 0.001"),
+        "detail must retain at least the former HTTP 400 minimum-quantity body: {}",
+        rejection.reason
+    );
+    assert!(
+        rejection.reason.contains("lot step 0.001"),
+        "new governed detail should add actionable quantization context: {}",
+        rejection.reason
+    );
 }
 
 #[tokio::test]

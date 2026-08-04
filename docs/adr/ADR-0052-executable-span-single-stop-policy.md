@@ -1,9 +1,15 @@
 # ADR-0052 — Executable Span: One Stop Policy, Buffer-Inclusive Unit of Risk
 
 **Date**: 2026-08-04
-**Status**: DECIDED — FOLLOW-UP REQUIRED (operator decision, 2026-08-04;
-revised same day after adversarial secondary-model review; implementation
-pending)
+**Status**: DECIDED — IMPLEMENTED (repository; operational rollout pending)
+**Implementation status** (2026-08-04):
+`feat/adr-0052-executable-span-impl` implements the single-policy domain,
+admission persistence and projection, immutable-span replay/recovery,
+entry-anchored engine and frontend behavior, executable-trigger latent-risk
+pricing, migration, and regression tests. The manifest-validation half of
+rejecting `ROBSON_STOP_POLICY` lives in `rbx-infra` and is pending;
+arming-quiescence remains an explicit operator rollout step with no code
+enforcement in this repository.
 **Deciders**: RBX Systems (operator + architecture)
 **Partially supersedes**: [ADR-0050](ADR-0050-technical-stop-valid-level-selection.md)
 only for the runtime selector (`ROBSON_STOP_POLICY`) and the
@@ -226,6 +232,14 @@ Rollout order is mandatory:
    recovery, trading-rules availability, and insurance-stop health.
 5. Re-enable arm requests.
 
+Rollout compatibility note: for new arms, a quantity below the exchange
+minimum is now a governed signal rejection (`HTTP 200`, position remains
+`Armed`, detail visible through entry status/events) rather than the former
+`HTTP 400` adapter error. New-arm sizing is lot-quantized at the exchange's
+quantity precision (six decimal places for the current contract) instead of
+the historical generic `round_dp(12)` intermediate. Neither change is applied
+retroactively to legacy position replay.
+
 Starting ADR-0052 code against the old constraint is prohibited. Allowing
 an old writer to arm between migration and deployment is prohibited.
 
@@ -314,12 +328,40 @@ that understands `executable_span`, never deployment of the pre-ADR binary.
   entry-anchored formulas, not `stop ± k × tech_stop_distance`),
   projector/store projection fields, startup recovery (replay consumes
   persisted `S`), migration replacing `chk_positions_stop_policy`.
-- Docs to update in the implementation slice:
-  `docs/architecture/v3-architectural-decisions.md` and
-  `docs/architecture/v3-risk-engine-spec.md` still describe
-  `TechnicalStopDistance::span()` as the central span; annotate as current
-  implementation with ADR-0052 follow-up.
-- Tests to pin: new arm stamps `executable_span`, persists `S`, and the
+- Startup verifies all four ADR-0052 projection columns before the daemon can
+  serve traffic, and projection recovery errors abort startup. Recovery also
+  requires `initial_executable_stop` for `ExecutableSpan` positions in
+  `Entering`; historical `Active` rows may omit it because their live stop is
+  resolved from trailing state plus persisted `S` and cap basis.
+- The canonical monthly-budget snapshot resolves `ExecutableSpan` Active
+  positions from the current trailing stop and cached live trading rules,
+  prices the trigger with the ADR-0051 gap/fee envelope, and reuses that exact
+  reservation in admission, slots, status, and MonthlyHalt. Entering positions
+  use their persisted initial executable trigger. Resolution failure sets the
+  snapshot invalid, blocks admission, and forces slots and remaining capacity
+  to zero. It never triggers MonthlyHalt or liquidation: halt evaluation is
+  deferred and the exchange insurance stops remain authoritative under
+  degraded pricing. Admission and halt write paths emit the deduplicated,
+  durable high-severity evidence; `GET /status` only reads the failed snapshot.
+  Legacy raw-stop arithmetic is unchanged.
+- Fill-time insurance resolves against live rules. A persisted/live mismatch
+  emits a critical drift event with both triggers and tick sizes; resolver
+  failure falls back to the persisted trigger and then the initial technical
+  stop so a real fill is protected before operator quarantine evidence is
+  persisted.
+- The persist-before-execute barrier is intentionally scoped to the entry
+  admission sequence (`EntrySignalReceived`, `EntryOrderRequested`, then
+  `PlaceEntryOrder`). Exit, protective-order, recovery, and audit-only cycles
+  retain execute-all-then-persist batch semantics so an event-log outage does
+  not suppress an exit or insurance placement.
+- Migration 20240101000026 enforces the four admission columns as structurally
+  write-once: `NULL` may become a value and replay may repeat that value, but a
+  non-`NULL` value cannot change.
+- The architecture decision and risk-engine specification are aligned with
+  the executable trigger as the canonical latent-risk basis;
+  `TechnicalStopDistance::span()` is retained only for the explicitly labeled
+  legacy provenance path and the admission cap basis.
+- Regression tests pin that a new arm stamps `executable_span`, persists `S`, and the
   ladder's first completed span moves the candidate technical stop to the
   entry reference with the executable trigger derived exactly once; a
   `legacy_uncapped` position's derivation is byte-identical before and
@@ -329,8 +371,8 @@ that understands `executable_span`, never deployment of the pre-ADR binary.
   consumes the persisted `S` (never re-derives); recovery quarantine on
   missing/non-positive persisted `S`; property tests retain trailing
   monotonicity, guard release, and soft-stop/insurance-stop trigger
-  equality; deployment validation rejects a manifest declaring
-  `ROBSON_STOP_POLICY`.
+  equality. Repository code no longer reads `ROBSON_STOP_POLICY`; deployment
+  manifest rejection remains pending in `rbx-infra` as recorded above.
 - Related: ADR-0021 (technical stop from chart analysis), ADR-0024 (risk
   parameters are product definition), ADR-0039 (two-layer enforcement,
   preserved), ADR-0041 (amended: raw distance no longer drives the

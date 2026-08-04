@@ -37,8 +37,9 @@ pub use entities::{
 };
 pub use events::{entry_lifecycle_stage, Event};
 pub use executable_stop::{
-    build_executable_stop_plan, worst_case_loss_per_unit_planned, ExecutableStopPlan,
-    StopPlanInputs, SPAN_CAP_RATIO,
+    build_executable_stop_plan, latent_risk_per_unit_at_trigger,
+    worst_case_loss_per_unit_at_trigger, worst_case_loss_per_unit_planned, ExecutableSpanSource,
+    ExecutableStopPlan, StopPlanInputs, BUFFER_CAP_RATIO,
 };
 pub use market_data::{Candle, MarketDataEvent, OrderBookSnapshot, Tick};
 pub use policy::{

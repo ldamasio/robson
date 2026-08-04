@@ -998,6 +998,10 @@ mod tests {
                 entry_price: robson_domain::Price::new(dec!(95000)).unwrap(),
                 stop_loss: robson_domain::Price::new(dec!(93500)).unwrap(),
                 quantity: Quantity::new(dec!(0.1)).unwrap(),
+                initial_executable_stop: None,
+                executable_span: None,
+                cap_basis_distance: None,
+                tick_size: None,
                 timestamp: chrono::Utc::now(),
             }),
             EngineAction::PlaceEntryOrder {

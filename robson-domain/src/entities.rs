@@ -86,6 +86,21 @@ pub struct Position {
     /// restarts cannot move a live position's executable stop.
     #[serde(default)]
     pub stop_buffer_bps_at_arm: Option<rust_decimal::Decimal>,
+    /// Admission-time executable trigger resolved before entry submission
+    /// (ADR-0052 Decision 5). `None` for legacy positions.
+    #[serde(default)]
+    pub initial_executable_stop: Option<Price>,
+    /// Immutable executable span `S`, including the admission buffer and
+    /// adverse tick quantization. Replay must consume this value and must
+    /// never re-derive it from current exchange metadata.
+    #[serde(default)]
+    pub executable_span: Option<rust_decimal::Decimal>,
+    /// Admission-time buffer-cap basis distance. `None` for legacy positions.
+    #[serde(default)]
+    pub cap_basis_distance: Option<rust_decimal::Decimal>,
+    /// Exchange tick size used for admission-time adverse quantization.
+    #[serde(default)]
+    pub tick_size_at_admission: Option<rust_decimal::Decimal>,
 
     // Audit
     pub created_at: DateTime<Utc>,
@@ -96,10 +111,10 @@ pub struct Position {
 impl Position {
     /// Create a new armed position with the legacy stop policy.
     ///
-    /// This constructor never decides between Legacy and V1: it always
+    /// This constructor never selects a new-position policy: it always
     /// yields `LegacyUncapped`, the safe default for every replay and
-    /// recovery path. Arming a `SpanCappedV1` position is an EXPLICIT
-    /// decision made through [`Self::new_with_stop_policy`].
+    /// historical recovery path. New arms use [`Self::new_with_stop_policy`]
+    /// with the ADR-0052 policy explicitly.
     pub fn new(account_id: AccountId, symbol: Symbol, side: Side) -> Self {
         Self::new_with_stop_policy(account_id, symbol, side, StopPolicy::LegacyUncapped, None)
     }
@@ -132,6 +147,10 @@ impl Position {
             binance_position_id: None,
             stop_policy,
             stop_buffer_bps_at_arm,
+            initial_executable_stop: None,
+            executable_span: None,
+            cap_basis_distance: None,
+            tick_size_at_admission: None,
             created_at: now,
             updated_at: now,
             closed_at: None,
@@ -215,7 +234,7 @@ pub struct SizedEntry {
 /// expected realized loss through the executable path:
 ///
 /// ```text
-/// trigger          = plan.trigger (tick-quantized under span_capped_v1)
+/// trigger          = plan.trigger (tick-quantized under executable_span)
 /// gap              = trigger x gap_bps / 10_000
 /// adverse_fill     = Long: trigger - gap | Short: trigger + gap
 /// worst_loss/unit  = directional_distance(entry, adverse_fill)
@@ -1179,7 +1198,7 @@ mod tests {
     // Position Sizing tests (Golden Rule, plan-based per issue #154)
 
     use crate::{
-        executable_stop::{build_executable_stop_plan, StopPlanInputs},
+        executable_stop::{build_executable_stop_plan, ExecutableSpanSource, StopPlanInputs},
         stop_policy::StopPolicy,
         trading_rules::SymbolTradingRules,
     };
@@ -1199,6 +1218,7 @@ mod tests {
             entry_reference: None,
             technical_span: None,
             stop_buffer_bps,
+            executable_span_source: ExecutableSpanSource::Admission,
             rules: None,
         })
         .unwrap()

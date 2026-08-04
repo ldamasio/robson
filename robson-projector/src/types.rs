@@ -214,6 +214,14 @@ pub struct EntrySignalReceived {
     pub entry_price: Decimal,
     pub stop_loss: Decimal,
     pub quantity: Decimal,
+    #[serde(default)]
+    pub initial_executable_stop: Option<Decimal>,
+    #[serde(default)]
+    pub executable_span: Option<Decimal>,
+    #[serde(default)]
+    pub cap_basis_distance: Option<Decimal>,
+    #[serde(default)]
+    pub tick_size: Option<Decimal>,
     pub timestamp: DateTime<Utc>,
 }
 
@@ -388,7 +396,7 @@ pub struct PositionArmed {
     pub side: String,
     pub tech_stop_distance: Option<TechnicalStopDistancePayload>,
     /// Stop-policy version pinned at arm (issue #154):
-    /// "legacy_uncapped" | "span_capped_v1". Missing on events written
+    /// "legacy_uncapped" | "executable_span". Missing on events written
     /// before versioning = legacy.
     #[serde(default = "default_stop_policy")]
     pub stop_policy: String,

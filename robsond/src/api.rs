@@ -237,6 +237,10 @@ pub struct PositionSummary {
     pub quantity: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub entry_price: Option<Decimal>,
+    /// Signal entry reference anchoring the ADR-0052 executable-span ladder.
+    /// May differ from the exchange fill in `entry_price`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub entry_reference: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trailing_stop: Option<Decimal>,
     /// Executable stop (technical trailing stop offset by the configured
@@ -258,8 +262,11 @@ pub struct PositionSummary {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub effective_stop_basis: Option<String>,
     /// Stop-policy version pinned at arm (issue #154):
-    /// `"legacy_uncapped"` or `"span_capped_v1"`.
+    /// `"legacy_uncapped"` or `"executable_span"`.
     pub stop_policy: String,
+    /// Immutable ADR-0052 executable span `S`; absent for legacy positions.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub executable_span: Option<Decimal>,
     /// ADR-0041 buffer (bps) snapshotted at arm; absent on positions armed
     /// before stop-policy versioning (they follow the live config).
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1504,7 +1511,8 @@ where
         monthly_giveback_pct,
         monthly_budget_remaining: budget_snapshot.remaining_active,
         capital_base: budget_snapshot.capital_base,
-        monthly_budget_basis_invalid: budget_snapshot.capital_base_invalid,
+        monthly_budget_basis_invalid: budget_snapshot.capital_base_invalid
+            || budget_snapshot.latent_risk_invalid,
         wallet_balance,
         unmatched_income_count,
     }))
@@ -2394,14 +2402,14 @@ where
         .to_string(),
     );
 
-    let stop_buffer_bps = manager.risk_config_snapshot().stop_buffer_bps();
+    let engine = manager.engine();
     let trading_rules = manager.trading_rules_for(position).await;
     let mut summary = position_to_summary(
         position,
         live_price,
         entry_mode,
         approval_mode,
-        stop_buffer_bps,
+        &engine,
         trading_rules.as_ref(),
     );
     if matches!(position.state, PositionState::Armed) {
@@ -2456,7 +2464,7 @@ fn position_to_summary(
     live_price: Option<Price>,
     entry_mode: Option<String>,
     approval_mode: Option<String>,
-    stop_buffer_bps: Decimal,
+    engine: &robson_engine::Engine,
     trading_rules: Option<&robson_domain::SymbolTradingRules>,
 ) -> PositionSummary {
     let (
@@ -2538,27 +2546,11 @@ fn position_to_summary(
                 let guard = *invalidation_guard_level;
                 // The SAME plan derivation the engine executes with (issue
                 // #154): policy- and snapshot-aware, tick-quantized under
-                // SpanCappedV1. A plan failure (v1 without rules/span)
+                // ExecutableSpan. A plan failure (missing rules/persistence)
                 // surfaces as an absent effective stop rather than a wrong
                 // number.
-                let effective =
-                    robson_domain::build_executable_stop_plan(robson_domain::StopPlanInputs {
-                        policy: position.stop_policy,
-                        side: position.side,
-                        technical_stop: *trailing_stop,
-                        guard,
-                        // Signal entry reference, same as the engine's plan
-                        // (the fill price would drift the guard-bound cap
-                        // span away from what execution uses).
-                        entry_reference: position
-                            .tech_stop_distance
-                            .as_ref()
-                            .map(|tech_stop| tech_stop.entry_price)
-                            .or(position.entry_price),
-                        technical_span: position.tech_stop_distance.as_ref().map(|t| t.span()),
-                        stop_buffer_bps: position.stop_buffer_bps_at_arm.unwrap_or(stop_buffer_bps),
-                        rules: trading_rules,
-                    })
+                let effective = engine
+                    .stop_plan(position, *trailing_stop, guard, trading_rules)
                     .map(|plan| plan.trigger.as_decimal());
                 let effective = match effective {
                     Ok(effective) => effective,
@@ -2580,12 +2572,22 @@ fn position_to_summary(
                             quantity: (position.quantity.as_decimal() > Decimal::ZERO)
                                 .then(|| position.quantity.as_decimal()),
                             entry_price,
+                            entry_reference: (position.stop_policy
+                                == robson_domain::StopPolicy::ExecutableSpan)
+                                .then(|| {
+                                    position
+                                        .tech_stop_distance
+                                        .as_ref()
+                                        .map(|stop| stop.entry_price.as_decimal())
+                                })
+                                .flatten(),
                             trailing_stop: Some(trailing_stop.as_decimal()),
                             effective_stop: None,
                             raw_technical_stop: None,
                             invalidation_guard_level: None,
                             effective_stop_basis: None,
                             stop_policy: position.stop_policy.as_str().to_string(),
+                            executable_span: position.executable_span,
                             stop_buffer_bps_at_arm: position.stop_buffer_bps_at_arm,
                             tech_stop_distance,
                             current_price,
@@ -2638,12 +2640,16 @@ fn position_to_summary(
             None
         },
         entry_price,
+        entry_reference: (position.stop_policy == robson_domain::StopPolicy::ExecutableSpan)
+            .then(|| position.tech_stop_distance.as_ref().map(|stop| stop.entry_price.as_decimal()))
+            .flatten(),
         trailing_stop,
         effective_stop,
         raw_technical_stop,
         invalidation_guard_level,
         effective_stop_basis,
         stop_policy: position.stop_policy.as_str().to_string(),
+        executable_span: position.executable_span,
         stop_buffer_bps_at_arm: position.stop_buffer_bps_at_arm,
         tech_stop_distance,
         current_price,
@@ -2819,7 +2825,8 @@ mod tests {
     };
     use http_body_util::BodyExt;
     use robson_domain::{
-        OrderSide, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance, TradingPolicy,
+        Event, OrderSide, Price, Quantity, RiskConfig, Side, Symbol, TechnicalStopDistance,
+        TradingPolicy,
     };
     use robson_engine::Engine;
     use robson_exec::{
@@ -3063,6 +3070,10 @@ mod tests {
         let mut position =
             Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
         position.entry_price = Some(Price::new(dec!(100)).unwrap());
+        position.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(
+            Price::new(dec!(100)).unwrap(),
+            Price::new(dec!(95)).unwrap(),
+        ));
         position.quantity = robson_domain::Quantity::new(dec!(2)).unwrap();
         position.state = PositionState::Active {
             current_price: Price::new(dec!(100)).unwrap(),
@@ -3074,18 +3085,24 @@ mod tests {
             last_emitted_stop: None,
         };
 
+        let engine =
+            robson_engine::Engine::new(robson_domain::RiskConfig::new(dec!(10000)).unwrap());
         let summary = position_to_summary(
             &position,
             Some(Price::new(dec!(98)).unwrap()),
             None,
             None,
-            Decimal::ZERO,
+            &engine,
             None,
         );
 
         assert_eq!(summary.current_price, Some(dec!(98)));
         assert_eq!(summary.pnl, Some(dec!(-4)));
         assert_eq!(summary.variation_pct, Some(dec!(-2.00)));
+        assert_eq!(
+            summary.entry_reference, None,
+            "entry_reference is an executable-span contract, not a legacy fill alias"
+        );
     }
 
     #[test]
@@ -3104,18 +3121,76 @@ mod tests {
             last_emitted_stop: None,
         };
 
+        let engine =
+            robson_engine::Engine::new(robson_domain::RiskConfig::new(dec!(10000)).unwrap());
         let summary = position_to_summary(
             &position,
             Some(Price::new(dec!(90)).unwrap()),
             None,
             None,
-            Decimal::ZERO,
+            &engine,
             None,
         );
 
         assert_eq!(summary.current_price, Some(dec!(90)));
         assert_eq!(summary.pnl, Some(dec!(-10)));
         assert_eq!(summary.variation_pct, Some(dec!(-5.00)));
+    }
+
+    #[test]
+    fn position_summary_exposes_persisted_executable_span_and_signal_anchor() {
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry_reference = Price::new(dec!(62000)).unwrap();
+        let technical_stop = Price::new(dec!(61000)).unwrap();
+        let mut position = Position::new_with_stop_policy(
+            Uuid::now_v7(),
+            symbol.clone(),
+            Side::Long,
+            robson_domain::StopPolicy::ExecutableSpan,
+            Some(dec!(10)),
+        );
+        position.entry_price = Some(Price::new(dec!(62020)).unwrap());
+        position.tech_stop_distance =
+            Some(TechnicalStopDistance::from_entry_and_stop(entry_reference, technical_stop));
+        position.initial_executable_stop = Some(Price::new(dec!(60939)).unwrap());
+        position.executable_span = Some(dec!(1061));
+        position.cap_basis_distance = Some(dec!(1000));
+        position.tick_size_at_admission = Some(dec!(0.1));
+        position.state = PositionState::Active {
+            current_price: entry_reference,
+            trailing_stop: technical_stop,
+            favorable_extreme: entry_reference,
+            extreme_at: chrono::Utc::now(),
+            insurance_stop_id: None,
+            invalidation_guard_level: None,
+            last_emitted_stop: None,
+        };
+        let rules = robson_domain::SymbolTradingRules::new(
+            symbol,
+            dec!(0.1),
+            Decimal::ZERO,
+            dec!(0.001),
+            dec!(0.001),
+            dec!(1000),
+            Decimal::ZERO,
+            2,
+            3,
+        )
+        .unwrap();
+
+        let engine = robson_engine::Engine::new(
+            robson_domain::RiskConfig::new(dec!(10000))
+                .unwrap()
+                .with_stop_buffer(dec!(10))
+                .unwrap(),
+        );
+        let summary = position_to_summary(&position, None, None, None, &engine, Some(&rules));
+
+        assert_eq!(summary.stop_policy, "executable_span");
+        assert_eq!(summary.entry_price, Some(dec!(62020)));
+        assert_eq!(summary.entry_reference, Some(dec!(62000)));
+        assert_eq!(summary.executable_span, Some(dec!(1061)));
+        assert_eq!(summary.effective_stop, Some(dec!(60939)));
     }
 
     #[test]
@@ -3130,7 +3205,9 @@ mod tests {
             exit_reason: robson_domain::ExitReason::UserPanic,
         };
 
-        let summary = position_to_summary(&position, None, None, None, Decimal::ZERO, None);
+        let engine =
+            robson_engine::Engine::new(robson_domain::RiskConfig::new(dec!(10000)).unwrap());
+        let summary = position_to_summary(&position, None, None, None, &engine, None);
 
         assert_eq!(summary.current_price, Some(dec!(90)));
         assert_eq!(summary.pnl, Some(dec!(20)));
@@ -3374,6 +3451,20 @@ mod tests {
         Arc<StubExchange>,
     ) {
         let journal = Arc::new(IntentJournal::new());
+        exchange.set_trading_rules(
+            robson_domain::SymbolTradingRules::new(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                dec!(0.01),
+                Decimal::ZERO,
+                dec!(0.000001),
+                dec!(0.000001),
+                dec!(1000000),
+                Decimal::ZERO,
+                2,
+                6,
+            )
+            .unwrap(),
+        );
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
         let event_bus = Arc::new(crate::event_bus::EventBus::new(capacity));
@@ -3841,7 +3932,7 @@ mod tests {
             symbol,
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
-            stop_loss: Price::new(dec!(85500)).unwrap(),
+            stop_loss: Price::new(dec!(86000)).unwrap(),
             technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),
         };
@@ -3886,6 +3977,65 @@ mod tests {
         assert_eq!(status.pending_approvals[0].query_id, query_id);
         assert_eq!(status.pending_approvals[0].position_id, Some(position.id));
         assert_eq!(status.pending_approvals[0].state, "AwaitingApproval");
+    }
+
+    #[tokio::test]
+    async fn test_status_with_unpriced_executable_risk_does_not_append_event() {
+        let (app, _, position_manager) = create_test_app_with_event_bus(8).await;
+        let entry = Price::new(dec!(100)).unwrap();
+        let technical_stop = Price::new(dec!(90)).unwrap();
+        let mut position = Position::new_with_stop_policy(
+            Uuid::now_v7(),
+            Symbol::from_pair("ETHUSDT").unwrap(),
+            Side::Long,
+            robson_domain::StopPolicy::ExecutableSpan,
+            Some(dec!(100)),
+        );
+        position.entry_price = Some(entry);
+        position.entry_filled_at = Some(chrono::Utc::now());
+        position.tech_stop_distance =
+            Some(TechnicalStopDistance::from_entry_and_stop(entry, technical_stop));
+        position.quantity = Quantity::new(dec!(1)).unwrap();
+        position.initial_executable_stop = Some(Price::new(dec!(89.9)).unwrap());
+        position.executable_span = Some(dec!(10.1));
+        position.cap_basis_distance = Some(dec!(10));
+        position.tick_size_at_admission = Some(dec!(0.01));
+        position.state = PositionState::Active {
+            current_price: entry,
+            trailing_stop: technical_stop,
+            favorable_extreme: entry,
+            extreme_at: chrono::Utc::now(),
+            insurance_stop_id: None,
+            invalidation_guard_level: None,
+            last_emitted_stop: None,
+        };
+        position_manager.read().await.store().positions().save(&position).await.unwrap();
+
+        let response = app
+            .oneshot(Request::builder().uri("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        let status: StatusResponse = serde_json::from_slice(&body).unwrap();
+        assert!(status.monthly_budget_basis_invalid);
+        assert_eq!(status.new_slots_available, 0);
+
+        let events = position_manager
+            .read()
+            .await
+            .store()
+            .events()
+            .find_by_position(position.id)
+            .await
+            .unwrap();
+        assert!(
+            !events
+                .iter()
+                .any(|event| matches!(event, Event::ExecutableStopRiskResolutionFailed { .. })),
+            "GET /status must not append executable-risk failure evidence"
+        );
     }
 
     #[tokio::test]
@@ -3996,7 +4146,7 @@ mod tests {
             symbol,
             side: Side::Long,
             entry_price: Price::new(dec!(95000)).unwrap(),
-            stop_loss: Price::new(dec!(85500)).unwrap(), /* HumanConfirmation always requires
+            stop_loss: Price::new(dec!(86000)).unwrap(), /* HumanConfirmation always requires
                                                           * approval */
             technical_stop_analysis: None,
             timestamp: chrono::Utc::now(),

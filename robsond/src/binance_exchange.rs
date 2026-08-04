@@ -490,7 +490,7 @@ impl ExchangePort for BinanceExchangeAdapter {
 
         let qty = normalize_market_quantity(symbol, quantity)?;
         // Metadata-driven trigger validation (issue #154 deliverable 1): the
-        // domain quantizes SpanCappedV1 triggers on the tickSize grid, so the
+        // domain quantizes ExecutableSpan triggers on the tickSize grid, so the
         // expected case here is a pure pass-through validation. A misaligned
         // trigger can only come from a legacy-policy derivation (unquantized
         // by design); it is aligned adversely per tickSize and logged,
