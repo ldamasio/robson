@@ -223,6 +223,33 @@ pub(crate) struct MonthlyRiskState {
     pub budget_model: MonthlyBudgetModel,
 }
 
+/// Canonical monthly budget inputs and both dormant model calculations
+/// (ADR-0051 rollout step 2).
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct MonthlyBudgetSnapshot {
+    pub(crate) model: MonthlyBudgetModel,
+    pub(crate) capital_base: Decimal,
+    pub(crate) governed_realized_net: Decimal,
+    pub(crate) month_equity_net: Decimal,
+    pub(crate) month_peak_net: Decimal,
+    pub(crate) latent_risk: Decimal,
+    pub(crate) consumed_active: Decimal,
+    pub(crate) consumed_hwm: Decimal,
+    pub(crate) consumed_nfs: Decimal,
+    pub(crate) remaining_active: Decimal,
+    pub(crate) remaining_hwm: Decimal,
+    pub(crate) remaining_nfs: Decimal,
+    pub(crate) slots_active: u32,
+    pub(crate) slots_hwm: u32,
+    pub(crate) slots_nfs: u32,
+}
+
+impl MonthlyBudgetSnapshot {
+    pub(crate) fn budget_amount(&self) -> Decimal {
+        self.remaining_active + self.consumed_active + self.latent_risk
+    }
+}
+
 impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     pub(crate) fn configured_capital(&self) -> Decimal {
         self.engine.lock().unwrap().risk_config().capital()
@@ -240,6 +267,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// already committed in the order/execution pipeline even before fill.
     pub(crate) async fn live_risk_open_positions(&self) -> DaemonResult<Vec<Position>> {
         let open_positions = self.store.positions().find_risk_open().await?;
+        Ok(self.filter_live_risk_open_positions(&open_positions).await)
+    }
+
+    /// Apply the canonical exchange-presence filter to one already-loaded
+    /// local risk-open set. Keeping the filter separate lets the monthly
+    /// snapshot reuse the same bulk local read for equity and latent risk.
+    async fn filter_live_risk_open_positions(&self, open_positions: &[Position]) -> Vec<Position> {
         let exchange_positions = match self.exchange_open_positions().await {
             Ok(positions) => Some(positions),
             Err(error) => {
@@ -248,9 +282,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             },
         };
 
-        Ok(match exchange_positions {
+        match exchange_positions {
             Some(exchange_positions) => open_positions
-                .into_iter()
+                .iter()
                 .filter(|position| match &position.state {
                     PositionState::Entering { .. } => true,
                     PositionState::Active { .. } => {
@@ -261,9 +295,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     },
                     _ => false,
                 })
+                .cloned()
                 .collect(),
-            None => open_positions,
-        })
+            None => open_positions.to_vec(),
+        }
     }
 
     /// Update the engine's capital from an external source (exchange balance).
@@ -559,8 +594,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
 
         let monthly = self.load_monthly_state(now).await?;
-        if equity_net <= monthly.month_peak_net {
-            return Ok(equity_net);
+        self.refresh_month_peak_net_from_snapshot(now, &monthly, equity_net).await?;
+        Ok(equity_net)
+    }
+
+    /// Persist a precomputed equity peak without re-reading monthly state or
+    /// positions. Returns the effective monotonic peak after this refresh.
+    async fn refresh_month_peak_net_from_snapshot(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+        monthly: &MonthlyRiskState,
+        equity_net: Decimal,
+    ) -> DaemonResult<Decimal> {
+        if equity_net <= monthly.month_peak_net || equity_net <= Decimal::ZERO {
+            return Ok(monthly.month_peak_net);
         }
 
         #[cfg(feature = "postgres")]
@@ -598,7 +645,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let mut cache = self.month_peak_net_cache.lock().await;
         let cached = cache.entry((now.year(), now.month())).or_insert(Decimal::ZERO);
         *cached = (*cached).max(equity_net);
-        Ok(equity_net)
+        Ok(monthly.month_peak_net.max(equity_net))
     }
 
     pub(crate) async fn governed_monthly_realized_loss(
@@ -1113,10 +1160,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// → not yet filled → next signal arrives).
     async fn build_risk_context(&self) -> DaemonResult<RiskContext> {
         let now = chrono::Utc::now();
-        let month_equity_net = self.refresh_month_peak_net(now).await?;
-        let monthly = self.load_monthly_state(now).await?;
-        let capital = monthly.capital_base;
-        let active_positions = self.store.positions().find_risk_open().await?;
+        let (budget, active_positions) = self.canonical_budget_snapshot_with_positions(now).await?;
 
         // find_risk_open() guarantees only Entering and Active positions.
         // For Entering: use expected_entry from state (order price is committed on
@@ -1179,8 +1223,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .collect();
         summaries.extend(pending_summaries);
 
-        let monthly_realized_pnl = self.robson_month_net(now).await?;
-
         // ADR-0024: realized_loss is the authoritative sum of absolute net losses.
         // Source: persisted `monthly_state.realized_loss` (MIG-v3#12).
         // Wins must NOT offset losses for slot calculation.
@@ -1188,23 +1230,18 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         // Monthly unrealized PnL: sum unrealized PnL from currently open Active
         // positions.
-        let monthly_unrealized_pnl: Decimal = active_positions
-            .iter()
-            .filter_map(|p| match &p.state {
-                PositionState::Active { .. } => Some(p.calculate_pnl()),
-                _ => None,
-            })
-            .sum();
+        let monthly_unrealized_pnl = budget.month_equity_net - budget.governed_realized_net;
 
         Ok(RiskContext::with_month_equity(
-            capital,
+            budget.capital_base,
             summaries,
-            monthly_realized_pnl,
+            budget.governed_realized_net,
             monthly_unrealized_pnl,
             monthly_realized_loss,
-            month_equity_net,
-            monthly.month_peak_net.max(month_equity_net.max(Decimal::ZERO)),
-        ))
+            budget.month_equity_net,
+            budget.month_peak_net,
+        )
+        .with_budget_model(budget.model))
     }
 
     async fn rearm_detector(
@@ -2036,14 +2073,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self.panic_close_all().await
     }
 
-    /// Evaluate monthly halt trigger using ADR-0046 high-water-mark semantics.
+    /// Evaluate MonthlyHalt from the persisted model in the canonical
+    /// ADR-0051 budget snapshot.
     ///
     /// Trigger condition: `remaining_budget <= 0`
     /// where:
     ///   remaining_budget = (capital_base × max_monthly_drawdown_pct) −
     /// consumed − latent_risk
-    ///   consumed = month_peak_net − month_equity_net
-    ///   latent_risk = Σ max(0, loss_if_current_stop_hit)
+    ///   consumed = model(month_peak/equity, governed realized net)
+    ///   latent_risk = Σ max(0, loss_if_current_stop_hit) over the same
+    ///   Active + Entering set used by slot reporting
     ///
     /// Must be called:
     /// - After any position close that changes realized PnL
@@ -2058,77 +2097,41 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             return false;
         }
 
-        let now = chrono::Utc::now();
-        let month_equity_net = match self.refresh_month_peak_net(now).await {
-            Ok(equity) => equity,
+        let snapshot = match self.canonical_budget_snapshot(chrono::Utc::now()).await {
+            Ok(snapshot) => snapshot,
             Err(e) => {
-                warn!(error = %e, "Failed to compute month equity net for MonthlyHalt evaluation");
+                warn!(error = %e, "Failed to build canonical budget snapshot for MonthlyHalt evaluation");
                 return false;
             },
         };
-        let monthly_state = match self.load_monthly_state(now).await {
-            Ok(state) => state,
-            Err(e) => {
-                warn!(error = %e, "Failed to load monthly state for MonthlyHalt evaluation");
-                return false;
-            },
-        };
-        let capital_base = monthly_state.capital_base;
-        let policy = self.trading_policy;
 
-        // Latent risk: max(0, loss_if_current_stop_hit) for each open Active position.
-        let active_positions = match self.store.positions().find_risk_open().await {
-            Ok(positions) => positions,
-            Err(e) => {
-                warn!(error = %e, "Failed to query open positions for MonthlyHalt evaluation");
-                return false;
-            },
-        };
-        let latent_risk: Decimal = active_positions
-            .iter()
-            .filter_map(|p| {
-                let entry = p.entry_price?.as_decimal();
-                let qty = p.quantity.as_decimal();
-                let stop = match &p.state {
-                    PositionState::Active { trailing_stop, .. } => trailing_stop.as_decimal(),
-                    _ => return None,
-                };
-                let risk = match p.side {
-                    Side::Long => (entry - stop) * qty,
-                    Side::Short => (stop - entry) * qty,
-                };
-                Some(risk.max(Decimal::ZERO))
-            })
-            .sum();
-
-        // ADR-0046 + ADR-0043: halt only when the HWM give-back budget is fully
-        // consumed after reserving latent risk. Between zero and one full risk unit the
-        // system stays live: entries are admitted by their actual planned risk
-        // (budget-metered admission), so "cannot fit a worst-case 1% trade" no
-        // longer means "month is over".
-        let monthly_budget = policy.monthly_budget(capital_base);
-        let consumed = (monthly_state.month_peak_net - month_equity_net).max(Decimal::ZERO);
-        let remaining_budget = monthly_budget - consumed - latent_risk;
+        // ADR-0051 §2 intentionally closes the HWM-era inconsistency here:
+        // Entering reservations now reduce the exact same remaining value as
+        // compute_slots_available instead of being omitted by halt math.
+        let monthly_budget = self.trading_policy.monthly_budget(snapshot.capital_base);
+        let remaining_budget = snapshot.remaining_active;
 
         if remaining_budget <= Decimal::ZERO {
             let reason = format!(
                 "Monthly budget exhausted: remaining={:.2} <= 0 \
-                 (budget={:.2}, consumed={:.2}, month_equity_net={:.2}, month_peak_net={:.2}, latent_risk={:.2})",
+                 (model={}, budget={:.2}, consumed={:.2}, month_equity_net={:.2}, month_peak_net={:.2}, latent_risk={:.2})",
                 remaining_budget,
+                snapshot.model.as_str(),
                 monthly_budget,
-                consumed,
-                month_equity_net,
-                monthly_state.month_peak_net,
-                latent_risk,
+                snapshot.consumed_active,
+                snapshot.month_equity_net,
+                snapshot.month_peak_net,
+                snapshot.latent_risk,
             );
             warn!(
+                budget_model = %snapshot.model.as_str(),
                 %remaining_budget,
                 %monthly_budget,
-                %consumed,
-                %month_equity_net,
-                month_peak_net = %monthly_state.month_peak_net,
-                %latent_risk,
-                "MonthlyHalt auto-triggered (ADR-0046)"
+                consumed = %snapshot.consumed_active,
+                month_equity_net = %snapshot.month_equity_net,
+                month_peak_net = %snapshot.month_peak_net,
+                latent_risk = %snapshot.latent_risk,
+                "MonthlyHalt auto-triggered from canonical budget snapshot"
             );
             match self.trigger_monthly_halt(reason).await {
                 Ok(_) => true,
@@ -3996,95 +3999,151 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
     }
 
-    /// Compute dynamic count of new slots available from persisted monthly
-    /// state and open positions.
+    fn latent_risk_for_positions(positions: &[Position]) -> Decimal {
+        positions
+            .iter()
+            .filter_map(|p| {
+                let (entry, stop) = match &p.state {
+                    PositionState::Active { trailing_stop, .. } => {
+                        (p.entry_price?.as_decimal(), trailing_stop.as_decimal())
+                    },
+                    PositionState::Entering { expected_entry, .. } => {
+                        let entry = expected_entry.as_decimal();
+                        let stop = p
+                            .tech_stop_distance
+                            .as_ref()
+                            .map(|ts| ts.initial_stop.as_decimal())
+                            .unwrap_or(entry);
+                        (entry, stop)
+                    },
+                    _ => return None,
+                };
+                let qty = p.quantity.as_decimal();
+                let risk = match p.side {
+                    Side::Long => (entry - stop) * qty,
+                    Side::Short => (stop - entry) * qty,
+                };
+                Some(risk.max(Decimal::ZERO))
+            })
+            .sum()
+    }
+
+    /// Build the single monthly-budget snapshot shared by admission, status,
+    /// slots, and halt evaluation. The returned position set is the one bulk
+    /// local read used to compute HWM equity; admission additionally needs it
+    /// for duplicate checks and per-position summaries.
+    async fn canonical_budget_snapshot_with_positions(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> DaemonResult<(MonthlyBudgetSnapshot, Vec<Position>)> {
+        let monthly = self.load_monthly_state(now).await?;
+        let governed_realized_net = self.robson_month_net(now).await?;
+        let local_risk_open = self.store.positions().find_risk_open().await?;
+        let unrealized_net: Decimal = local_risk_open
+            .iter()
+            .filter_map(|position| match position.state {
+                PositionState::Active { .. } => Some(position.calculate_pnl()),
+                _ => None,
+            })
+            .sum();
+        let month_equity_net = governed_realized_net + unrealized_net;
+        let month_peak_net = self
+            .refresh_month_peak_net_from_snapshot(now, &monthly, month_equity_net)
+            .await?;
+        let live_risk_open = self.filter_live_risk_open_positions(&local_risk_open).await;
+        let latent_risk = Self::latent_risk_for_positions(&live_risk_open);
+
+        let consumed_hwm = (month_peak_net - month_equity_net).max(Decimal::ZERO);
+        let consumed_nfs = (-governed_realized_net).max(Decimal::ZERO);
+        let consumed_active = match monthly.budget_model {
+            MonthlyBudgetModel::HwmV1 => consumed_hwm,
+            MonthlyBudgetModel::NetFromStartNonExpandingV1 => consumed_nfs,
+        };
+        let remaining_hwm =
+            self.trading_policy
+                .remaining_budget(monthly.capital_base, consumed_hwm, latent_risk);
+        let remaining_nfs =
+            self.trading_policy
+                .remaining_budget(monthly.capital_base, consumed_nfs, latent_risk);
+        let remaining_active = match monthly.budget_model {
+            MonthlyBudgetModel::HwmV1 => remaining_hwm,
+            MonthlyBudgetModel::NetFromStartNonExpandingV1 => remaining_nfs,
+        };
+        let slots_hwm =
+            self.trading_policy
+                .slots_available(monthly.capital_base, consumed_hwm, latent_risk);
+        let slots_nfs =
+            self.trading_policy
+                .slots_available(monthly.capital_base, consumed_nfs, latent_risk);
+        let slots_active = match monthly.budget_model {
+            MonthlyBudgetModel::HwmV1 => slots_hwm,
+            MonthlyBudgetModel::NetFromStartNonExpandingV1 => slots_nfs,
+        };
+
+        crate::metrics::BUDGET_MODEL_SHADOW_SLOTS_DELTA.set(slots_nfs as f64 - slots_hwm as f64);
+        let (other_model, other_slots, other_remaining) = match monthly.budget_model {
+            MonthlyBudgetModel::HwmV1 => {
+                (MonthlyBudgetModel::NetFromStartNonExpandingV1, slots_nfs, remaining_nfs)
+            },
+            MonthlyBudgetModel::NetFromStartNonExpandingV1 => {
+                (MonthlyBudgetModel::HwmV1, slots_hwm, remaining_hwm)
+            },
+        };
+        if slots_active != other_slots || remaining_active != other_remaining {
+            info!(
+                active_model = %monthly.budget_model.as_str(),
+                other_model = %other_model.as_str(),
+                %slots_active,
+                %other_slots,
+                %remaining_active,
+                %other_remaining,
+                %consumed_hwm,
+                %consumed_nfs,
+                %latent_risk,
+                "Monthly budget shadow models diverged as expected during dormant rollout"
+            );
+        }
+
+        Ok((
+            MonthlyBudgetSnapshot {
+                model: monthly.budget_model,
+                capital_base: monthly.capital_base,
+                governed_realized_net,
+                month_equity_net,
+                month_peak_net,
+                latent_risk,
+                consumed_active,
+                consumed_hwm,
+                consumed_nfs,
+                remaining_active,
+                remaining_hwm,
+                remaining_nfs,
+                slots_active,
+                slots_hwm,
+                slots_nfs,
+            },
+            local_risk_open,
+        ))
+    }
+
+    pub(crate) async fn canonical_budget_snapshot(
+        &self,
+        now: chrono::DateTime<chrono::Utc>,
+    ) -> DaemonResult<MonthlyBudgetSnapshot> {
+        self.canonical_budget_snapshot_with_positions(now)
+            .await
+            .map(|(snapshot, _)| snapshot)
+    }
+
+    /// Compute dynamic count of new slots available from the canonical
+    /// monthly budget snapshot.
     ///
     /// Used by `/status` API to expose `new_slots_available` (MIG-v3#12
     /// follow-up, ADR-0034). Since ADR-0043 this counts guaranteed full-cap
     /// entries — a floor, not a ceiling: entries are admitted by actual
     /// planned risk, so more operations than this may fit in the month.
     pub async fn compute_slots_available(&self) -> DaemonResult<u32> {
-        let now = chrono::Utc::now();
-        let month_equity_net = self.refresh_month_peak_net(now).await?;
-        let monthly = self.load_monthly_state(now).await?;
-        let capital_base = monthly.capital_base;
-
-        // Latent risk: sum max(0, loss_if_stop_hit) for each risk-relevant position.
-        let risk_open = self.live_risk_open_positions().await?;
-        let latent_risk: Decimal = risk_open
-            .iter()
-            .filter_map(|p| {
-                let (entry, stop) = match &p.state {
-                    PositionState::Active { trailing_stop, .. } => {
-                        (p.entry_price?.as_decimal(), trailing_stop.as_decimal())
-                    },
-                    PositionState::Entering { expected_entry, .. } => {
-                        let entry = expected_entry.as_decimal();
-                        let stop = p
-                            .tech_stop_distance
-                            .as_ref()
-                            .map(|ts| ts.initial_stop.as_decimal())
-                            .unwrap_or(entry);
-                        (entry, stop)
-                    },
-                    _ => return None,
-                };
-                let qty = p.quantity.as_decimal();
-                let risk = match p.side {
-                    Side::Long => (entry - stop) * qty,
-                    Side::Short => (stop - entry) * qty,
-                };
-                Some(risk.max(Decimal::ZERO))
-            })
-            .sum();
-
-        let budget_consumed = (monthly.month_peak_net - month_equity_net).max(Decimal::ZERO);
-        let policy_slots =
-            self.trading_policy.slots_available(capital_base, budget_consumed, latent_risk);
-
-        // Armed positions' risk is reflected in capital_base at month boundary.
-        // The slot count is purely budget-driven.
-        Ok(policy_slots)
-    }
-
-    pub(crate) async fn monthly_budget_snapshot(
-        &self,
-        now: chrono::DateTime<chrono::Utc>,
-    ) -> DaemonResult<(Decimal, Decimal, Decimal, Decimal, Decimal)> {
-        let month_equity_net = self.refresh_month_peak_net(now).await?;
-        let monthly = self.load_monthly_state(now).await?;
-        let latent_risk: Decimal = self
-            .live_risk_open_positions()
-            .await?
-            .iter()
-            .filter_map(|p| {
-                let (entry, stop) = match &p.state {
-                    PositionState::Active { trailing_stop, .. } => {
-                        (p.entry_price?.as_decimal(), trailing_stop.as_decimal())
-                    },
-                    PositionState::Entering { expected_entry, .. } => {
-                        let entry = expected_entry.as_decimal();
-                        let stop = p
-                            .tech_stop_distance
-                            .as_ref()
-                            .map(|ts| ts.initial_stop.as_decimal())
-                            .unwrap_or(entry);
-                        (entry, stop)
-                    },
-                    _ => return None,
-                };
-                let qty = p.quantity.as_decimal();
-                let risk = match p.side {
-                    Side::Long => (entry - stop) * qty,
-                    Side::Short => (stop - entry) * qty,
-                };
-                Some(risk.max(Decimal::ZERO))
-            })
-            .sum();
-        let consumed = (monthly.month_peak_net - month_equity_net).max(Decimal::ZERO);
-        let monthly_budget = self.trading_policy.monthly_budget(monthly.capital_base);
-        let remaining = monthly_budget - consumed - latent_risk;
-        Ok((month_equity_net, monthly.month_peak_net, consumed, remaining, monthly_budget))
+        Ok(self.canonical_budget_snapshot(chrono::Utc::now()).await?.slots_active)
     }
 
     // =========================================================================
@@ -4467,6 +4526,18 @@ mod tests {
 
         manager.store.positions().save(&position).await.unwrap();
         position
+    }
+
+    fn mirror_active_on_exchange(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        position: &Position,
+    ) {
+        manager.executor.exchange().set_open_position(
+            position.symbol.clone(),
+            position.side,
+            position.quantity,
+            position.entry_price.expect("Active test position has entry price"),
+        );
     }
 
     /// Regression for #137: an accepted insurance-stop replacement is not an
@@ -6638,6 +6709,9 @@ mod tests {
         };
         position.updated_at = now;
         manager.store.positions().save(&position).await.unwrap();
+        // ADR-0051 §2 canonical latent risk uses the same exchange-confirmed
+        // Active set as compute_slots_available.
+        mirror_active_on_exchange(&manager, &position);
         // latent_risk = (95000 - 90900) * 0.1 = 410
         // remaining = 400 - 0 - 410 = -10 <= 0 → halt
 
@@ -6656,9 +6730,15 @@ mod tests {
         // Use save_active_position which sets stop = entry - 10 for Long.
         // With entry=3000, stop=2990, qty=0.1 → latent = 1 per position.
         // 3 positions: latent = 3, remaining = 400 - 0 - 3 = 397 >= 100 → no halt
-        save_active_position(&manager, "BTCUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
-        save_active_position(&manager, "ETHUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
-        save_active_position(&manager, "SOLUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
+        let btc =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
+        let eth =
+            save_active_position(&manager, "ETHUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
+        let sol =
+            save_active_position(&manager, "SOLUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
+        for position in [&btc, &eth, &sol] {
+            mirror_active_on_exchange(&manager, position);
+        }
 
         let triggered = manager.evaluate_monthly_halt().await;
         assert!(
@@ -6699,6 +6779,7 @@ mod tests {
         };
         position.updated_at = now;
         manager.store.positions().save(&position).await.unwrap();
+        mirror_active_on_exchange(&manager, &position);
 
         let triggered = manager.evaluate_monthly_halt().await;
         assert!(triggered, "realized=150 + latent=250 → remaining=0 must trigger (ADR-0043)");
@@ -6736,12 +6817,47 @@ mod tests {
         };
         position.updated_at = now;
         manager.store.positions().save(&position).await.unwrap();
+        mirror_active_on_exchange(&manager, &position);
 
         let triggered = manager.evaluate_monthly_halt().await;
         assert!(
             !triggered,
             "remaining=50 > 0 → must stay live for smaller planned-risk entries (ADR-0043)"
         );
+    }
+
+    #[tokio::test]
+    async fn test_entering_risk_is_identical_for_slots_and_monthly_halt() {
+        let manager = create_test_manager().await;
+        save_closed_position_with_pnl(&manager, dec!(-300)).await;
+        assert_eq!(
+            manager.compute_slots_available().await.unwrap(),
+            1,
+            "one full-cap slot remains before the Entering reservation"
+        );
+
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(90)).unwrap();
+        let mut entering =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("ETHUSDT").unwrap(), Side::Long);
+        entering.quantity = Quantity::new(dec!(10)).unwrap();
+        entering.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(entry, stop));
+        entering.state = PositionState::Entering {
+            entry_order_id: Uuid::now_v7(),
+            expected_entry: entry,
+            signal_id: Uuid::now_v7(),
+        };
+        manager.store.positions().save(&entering).await.unwrap();
+
+        let snapshot = manager.canonical_budget_snapshot(chrono::Utc::now()).await.unwrap();
+        assert_eq!(snapshot.latent_risk, dec!(100));
+        assert_eq!(snapshot.remaining_active, Decimal::ZERO);
+        assert_eq!(manager.compute_slots_available().await.unwrap(), 0);
+
+        // ADR-0051 §2: halt consumes that exact Entering reservation instead
+        // of the former Active-only subset.
+        assert!(manager.evaluate_monthly_halt().await);
+        assert!(manager.circuit_breaker.blocks_new_entries().await);
     }
 
     #[tokio::test]
