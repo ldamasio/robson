@@ -38,7 +38,7 @@ impl MonthlyBudgetModel {
     /// Unknown values fail conservative to [`Self::HwmV1`]. Persistence
     /// callers must log the unknown source value so schema/data drift remains
     /// visible without accidentally activating a new accounting model.
-    pub fn from_str(value: &str) -> Self {
+    pub fn from_persisted(value: &str) -> Self {
         match value {
             "hwm_v1" => Self::HwmV1,
             "net_from_start_non_expanding_v1" => Self::NetFromStartNonExpandingV1,
@@ -348,7 +348,7 @@ mod tests {
             MonthlyBudgetModel::NetFromStartNonExpandingV1.as_str(),
             "net_from_start_non_expanding_v1"
         );
-        assert_eq!(MonthlyBudgetModel::from_str("unknown_v2"), MonthlyBudgetModel::HwmV1);
+        assert_eq!(MonthlyBudgetModel::from_persisted("unknown_v2"), MonthlyBudgetModel::HwmV1);
         assert_eq!(
             serde_json::to_string(&MonthlyBudgetModel::NetFromStartNonExpandingV1).unwrap(),
             "\"net_from_start_non_expanding_v1\""

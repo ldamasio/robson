@@ -200,46 +200,6 @@ async fn test_month_boundary_reset_upserts_monthly_state(pool: sqlx::PgPool) -> 
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL (see file header for setup)"]
-async fn test_month_boundary_reset_inherits_budget_model(pool: sqlx::PgPool) -> sqlx::Result<()> {
-    sqlx::query(
-        r#"
-        INSERT INTO monthly_state (
-            year, month, capital_base, monthly_budget_model, boundary_reset_at, created_at
-        )
-        VALUES (2027, 3, 10000, 'net_from_start_non_expanding_v1', NOW(), NOW())
-        "#,
-    )
-    .execute(&pool)
-    .await?;
-
-    // Months in the future on purpose: migration 000011 backfills the CURRENT
-    // calendar month during sqlx::test setup, so a current-month boundary
-    // event would hit ON CONFLICT (which preserves the existing model by
-    // design) and never exercise the inheritance path under test.
-    let payload = serde_json::json!({
-        "capital_base": "10100",
-        "carried_positions_risk": "0",
-        "month": 4,
-        "year": 2027,
-        "timestamp": Utc::now(),
-    });
-    let envelope =
-        make_envelope("system:month_boundary:2027-04", "month_boundary_reset", payload, 1);
-
-    apply_event_to_projections(&pool, &envelope).await.unwrap();
-
-    let model: String = sqlx::query_scalar(
-        "SELECT monthly_budget_model FROM monthly_state WHERE year = 2027 AND month = 4",
-    )
-    .fetch_one(&pool)
-    .await?;
-    assert_eq!(model, "net_from_start_non_expanding_v1");
-
-    Ok(())
-}
-
-#[sqlx::test(migrations = "../migrations")]
-#[ignore = "requires DATABASE_URL (see file header for setup)"]
 async fn test_position_opened_enforces_invariants(pool: sqlx::PgPool) -> sqlx::Result<()> {
     // Arrange
     let position_id = Uuid::new_v4();

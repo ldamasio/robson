@@ -398,7 +398,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// - `realized_loss`: sum of net losses from closed positions (ADR-0024)
     /// - `trades_opened`: number of entries filled this month
     ///
-    /// On miss (no row for this month): returns defaults from config.
+    /// On miss (no row for this month): returns defaults from config while
+    /// inheriting the most recent prior month's persisted budget model.
     #[cfg(feature = "postgres")]
     pub(crate) async fn load_monthly_state(
         &self,
@@ -422,31 +423,66 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         .fetch_optional(pool)
         .await?;
 
-        Ok(row
-            .map(|(capital_base, realized_loss, month_peak_net, trades_opened, stored_model)| {
-                let budget_model = MonthlyBudgetModel::from_str(&stored_model);
-                if stored_model != budget_model.as_str() {
+        if let Some((capital_base, realized_loss, month_peak_net, trades_opened, stored_model)) =
+            row
+        {
+            let budget_model = MonthlyBudgetModel::from_persisted(&stored_model);
+            if stored_model != budget_model.as_str() {
+                warn!(
+                    monthly_budget_model = %stored_model,
+                    fallback = %budget_model.as_str(),
+                    "Unknown persisted monthly budget model; using conservative fallback"
+                );
+            }
+            return Ok(MonthlyRiskState {
+                capital_base,
+                realized_loss,
+                month_peak_net,
+                trades_opened,
+                budget_model,
+            });
+        }
+
+        let inherited_stored_model = sqlx::query_scalar::<_, String>(
+            r#"
+            SELECT monthly_budget_model
+            FROM monthly_state
+            WHERE (year, month) < ($1::SMALLINT, $2::SMALLINT)
+            ORDER BY year DESC, month DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(now.year())
+        .bind(now.month() as i16)
+        .fetch_optional(pool)
+        .await?;
+        let inherited_model = inherited_stored_model
+            .map(|stored_model| {
+                let model = MonthlyBudgetModel::from_persisted(&stored_model);
+                if stored_model != model.as_str() {
                     warn!(
                         monthly_budget_model = %stored_model,
-                        fallback = %budget_model.as_str(),
-                        "Unknown persisted monthly budget model; using conservative fallback"
+                        fallback = %model.as_str(),
+                        "Unknown inherited monthly budget model; using conservative fallback"
                     );
                 }
-                MonthlyRiskState {
-                    capital_base,
-                    realized_loss,
-                    month_peak_net,
-                    trades_opened,
-                    budget_model,
-                }
+                model
             })
-            .unwrap_or(MonthlyRiskState {
-                capital_base: configured_capital,
-                realized_loss: Decimal::ZERO,
-                month_peak_net: Decimal::ZERO,
-                trades_opened: 0,
-                budget_model: MonthlyBudgetModel::default(),
-            }))
+            .unwrap_or_default();
+        warn!(
+            year = now.year(),
+            month = now.month(),
+            inherited_model = %inherited_model.as_str(),
+            "Monthly state row missing; using fallback state with inherited budget model"
+        );
+
+        Ok(MonthlyRiskState {
+            capital_base: configured_capital,
+            realized_loss: Decimal::ZERO,
+            month_peak_net: Decimal::ZERO,
+            trades_opened: 0,
+            budget_model: inherited_model,
+        })
     }
 
     #[cfg(not(feature = "postgres"))]
@@ -499,12 +535,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .get(&(now.year(), now.month()))
             .copied()
             .unwrap_or(Decimal::ZERO);
+        let budget_model = MonthlyBudgetModel::default();
+        warn!(
+            year = now.year(),
+            month = now.month(),
+            inherited_model = %budget_model.as_str(),
+            "Monthly state unavailable in memory; using fallback state with default budget model"
+        );
         Ok(MonthlyRiskState {
             capital_base: self.configured_capital(),
             realized_loss,
             month_peak_net: realized_peak.max(cached_peak),
             trades_opened: monthly_closed.len() as i32,
-            budget_model: MonthlyBudgetModel::default(),
+            budget_model,
         })
     }
 
@@ -4342,6 +4385,35 @@ mod tests {
         )
     }
 
+    #[cfg(feature = "postgres")]
+    fn projector_test_envelope(
+        event_type: &str,
+        payload: serde_json::Value,
+        occurred_at: chrono::DateTime<chrono::Utc>,
+        seq: i64,
+    ) -> robson_eventlog::EventEnvelope {
+        robson_eventlog::EventEnvelope {
+            event_id: Uuid::new_v4(),
+            tenant_id: Uuid::new_v4(),
+            stream_key: format!("test:monthly-budget-model:{seq}"),
+            seq,
+            event_type: event_type.to_string(),
+            payload,
+            payload_schema_version: 1,
+            occurred_at,
+            ingested_at: occurred_at,
+            idempotency_key: format!("test:monthly-budget-model:{event_type}:{seq}"),
+            trace_id: None,
+            causation_id: None,
+            command_id: None,
+            workflow_id: None,
+            actor_type: Some(robson_eventlog::ActorType::CLI),
+            actor_id: Some("test-user".to_string()),
+            prev_hash: None,
+            hash: None,
+        }
+    }
+
     async fn create_phase3_test_manager(
         ttl_seconds: u64,
     ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
@@ -6537,60 +6609,156 @@ mod tests {
     #[cfg(feature = "postgres")]
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires DATABASE_URL"]
-    async fn test_budget_model_reload_and_peak_refresh_preserve_nfs(pool: sqlx::PgPool) {
-        let now = chrono::Utc::now();
-        // Upsert because migration 000011 backfills the current calendar
-        // month during sqlx::test setup; this write models the operator
-        // activation flipping the persisted model.
+    async fn test_all_monthly_state_writers_inherit_prior_budget_model(pool: sqlx::PgPool) {
+        enum WriterCase {
+            Projector {
+                name: &'static str,
+                event_type: &'static str,
+                payload: serde_json::Value,
+            },
+            PeakRefresh,
+        }
+
+        let target = chrono::Utc.with_ymd_and_hms(2027, 4, 15, 12, 0, 0).unwrap();
+        let nfs = MonthlyBudgetModel::NetFromStartNonExpandingV1;
+
+        // Future months avoid migration 000011's current-month backfill, so
+        // every case exercises the INSERT inheritance path rather than an
+        // ON CONFLICT update that intentionally preserves the existing model.
+        sqlx::query(
+            r#"
+            INSERT INTO monthly_state (
+                year, month, capital_base, monthly_budget_model,
+                boundary_reset_at, created_at
+            )
+            VALUES (2027, 3, 10000, 'net_from_start_non_expanding_v1', $1, $1)
+            ON CONFLICT (year, month) DO UPDATE SET
+                monthly_budget_model = EXCLUDED.monthly_budget_model
+            "#,
+        )
+        .bind(target)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let cases = vec![
+            WriterCase::Projector {
+                name: "month_boundary_reset",
+                event_type: "month_boundary_reset",
+                payload: serde_json::json!({
+                    "capital_base": "10100",
+                    "carried_positions_risk": "0",
+                    "month": 4,
+                    "year": 2027,
+                    "timestamp": target,
+                }),
+            },
+            WriterCase::Projector {
+                name: "capital_base_recalibrated",
+                event_type: "capital_base_recalibrated",
+                payload: serde_json::json!({
+                    "previous_capital_base": "10000",
+                    "new_capital_base": "9900",
+                    "wallet_balance": "9900",
+                    "carried_risk": "0",
+                    "reason": "test",
+                    "evidence": "test",
+                    "month": 4,
+                    "year": 2027,
+                    "timestamp": target,
+                }),
+            },
+            WriterCase::Projector {
+                name: "entry_filled",
+                event_type: "entry_filled",
+                payload: serde_json::json!({
+                    "position_id": Uuid::new_v4(),
+                    "order_id": Uuid::new_v4(),
+                    "fill_price": "100",
+                    "filled_quantity": "1",
+                    "fee": "0.1",
+                    "initial_stop": "90",
+                    "invalidation_guard_level": null,
+                    "timestamp": target,
+                }),
+            },
+            WriterCase::Projector {
+                name: "position_closed",
+                event_type: "position_closed",
+                payload: serde_json::json!({
+                    "position_id": Uuid::new_v4(),
+                    "exit_reason": "TrailingStop",
+                    "entry_price": "100",
+                    "exit_price": "90",
+                    "realized_pnl": "-10",
+                    "total_fees": "1",
+                    "timestamp": target,
+                }),
+            },
+            WriterCase::PeakRefresh,
+        ];
+
+        for (index, case) in cases.into_iter().enumerate() {
+            sqlx::query("DELETE FROM monthly_state WHERE year = 2027 AND month = 4")
+                .execute(&pool)
+                .await
+                .unwrap();
+
+            let name = match case {
+                WriterCase::Projector { name, event_type, payload } => {
+                    let envelope =
+                        projector_test_envelope(event_type, payload, target, index as i64 + 1);
+                    apply_event_to_projections(&pool, &envelope).await.unwrap();
+                    name
+                },
+                WriterCase::PeakRefresh => {
+                    let manager = create_postgres_test_manager(pool.clone());
+                    let monthly = manager.load_monthly_state(target).await.unwrap();
+                    assert_eq!(
+                        monthly.budget_model, nfs,
+                        "missing-row runtime fallback must inherit NFS"
+                    );
+                    manager
+                        .refresh_month_peak_net_from_snapshot(target, &monthly, dec!(10))
+                        .await
+                        .unwrap();
+                    "refresh_month_peak_net_from_snapshot"
+                },
+            };
+
+            let model: String = sqlx::query_scalar(
+                "SELECT monthly_budget_model FROM monthly_state WHERE year = 2027 AND month = 4",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            assert_eq!(model, nfs.as_str(), "{name} must inherit NFS");
+        }
+
+        sqlx::query("DELETE FROM monthly_state WHERE year = 2027 AND month = 4")
+            .execute(&pool)
+            .await
+            .unwrap();
         sqlx::query(
             r#"
             INSERT INTO monthly_state (
                 year, month, capital_base, month_peak_net,
                 monthly_budget_model, created_at
             )
-            VALUES ($1, $2, 10000, 0, 'net_from_start_non_expanding_v1', $3)
-            ON CONFLICT (year, month) DO UPDATE SET
-                capital_base = EXCLUDED.capital_base,
-                month_peak_net = EXCLUDED.month_peak_net,
-                monthly_budget_model = EXCLUDED.monthly_budget_model
+            VALUES (2027, 4, 0, 0, 'net_from_start_non_expanding_v1', $1)
             "#,
         )
-        .bind(now.year() as i16)
-        .bind(now.month() as i16)
-        .bind(now)
+        .bind(target)
         .execute(&pool)
         .await
         .unwrap();
-
-        let manager = create_postgres_test_manager(pool.clone());
-        assert_eq!(
-            manager.load_monthly_state(now).await.unwrap().budget_model,
-            MonthlyBudgetModel::NetFromStartNonExpandingV1,
-            "persisted nfs model must survive reload"
-        );
-
-        let mut winner =
-            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
-        if let PositionState::Active { current_price, .. } = &mut winner.state {
-            *current_price = Price::new(dec!(110)).unwrap();
-        }
-        manager.store.positions().save(&winner).await.unwrap();
-
-        manager.refresh_month_peak_net(now).await.unwrap();
-
-        let (peak, model): (Decimal, String) = sqlx::query_as(
-            "SELECT month_peak_net, monthly_budget_model FROM monthly_state WHERE year = $1 AND month = $2",
-        )
-        .bind(now.year() as i16)
-        .bind(now.month() as i16)
-        .fetch_one(&pool)
-        .await
-        .unwrap();
-        assert_eq!(peak, dec!(10));
-        assert_eq!(
-            model, "net_from_start_non_expanding_v1",
-            "peak UPSERT must not reset an activated model"
-        );
+        let invalid_snapshot = create_postgres_test_manager(pool)
+            .canonical_budget_snapshot(target)
+            .await
+            .unwrap();
+        assert!(invalid_snapshot.capital_base_invalid);
+        assert_eq!(invalid_snapshot.budget_amount(), Decimal::ZERO);
+        assert_eq!(invalid_snapshot.slots_active, 0);
     }
 
     #[tokio::test]
