@@ -1,7 +1,8 @@
 # ADR-0051 — Net-From-Start, Non-Expanding Monthly Budget
 
 **Date**: 2026-08-04
-**Status**: Accepted (operator decision, 2026-08-04)
+**Status**: Accepted (operator decision, 2026-08-04; revised same day after
+adversarial secondary-model review)
 **Deciders**: RBX Systems (operator + architecture, with adversarial design
 review by a secondary model)
 **Supersedes**: [ADR-0046](ADR-0046-monthly-high-water-mark-budget.md)
@@ -62,12 +63,31 @@ Let:
 - `capital_base` be the persisted monthly budget basis (ADR-0024 §6);
 - `monthly_budget = capital_base × 4%`;
 - `risk_unit = capital_base × 1%`;
-- `governed_realized_net` be the signed, settlement-complete governed result
-  attributable to the current monthly basis, including fees and funding and
-  excluding unrealized P&L and out-of-band account drift;
-- `latent_risk` be the cost-priced worst-case loss reserved for every
-  Active or Entering position and any unsettled governed liability — the
-  pessimistic assumption of Context item (4) made mechanical.
+- `governed_realized_net` be the signed sum of settlement-complete governed
+  operation results attributable to the current monthly basis by economic
+  event timestamp. It includes evidenced realized P&L, commissions, funding,
+  and other typed governed costs; it excludes unrealized P&L and out-of-band
+  account drift;
+- `latent_risk` be the non-negative aggregate residual cost-priced worst-case
+  loss reserved from atomic admission until settlement completion — the
+  pessimistic assumption of Context item (4) made mechanical. It covers the
+  full committed quantity and unfilled remainder across Entering, partially
+  filled, Active, Exiting, missing-on-exchange/close-in-reconciliation, and
+  every other risk-bearing or unsettled governed lifecycle state, plus
+  bounded liabilities not yet included in `governed_realized_net`. Carried
+  positions use the rebased month-boundary treatment in §3.
+
+For this ADR, `capital_base` is the monthly budget basis fixed at activation
+or the UTC month boundary. It MUST NOT increase during that month. A
+confirmed deposit may update margin and sizing capital, but it does not
+expand the current monthly budget. A confirmed withdrawal or other adverse
+account change may conservatively reduce the effective budget basis,
+preserving accumulated governed net and immediately re-evaluating
+MonthlyHalt.
+
+This supersedes ADR-0024 §6A, ADR-0038, and ADR-0045 only to the extent that
+they permit an intra-month increase of the monthly budget basis. Their typed
+evidence, audit-event, drift, and fail-closed requirements remain in force.
 
 The authoritative calculation is:
 
@@ -77,57 +97,125 @@ remaining_budget  = monthly_budget − consumed − latent_risk
 slots_available   = min(4, floor(max(0, remaining_budget) / risk_unit))
 ```
 
+All policy amounts use `Decimal`; displayed or rounded values never feed
+admission or halt decisions. When quantization is unavoidable, risk charges
+and reservations round conservatively upward and available budget rounds
+conservatively downward using runtime exchange metadata.
+
+`latent_risk` and every risk charge MUST be non-negative. If
+`capital_base ≤ 0`, the snapshot is invalid: `slots_available = 0`, admission
+fails closed, MonthlyHalt latches, and the `risk_unit` division is not
+evaluated. A high-severity accounting alarm is raised.
+
+`remaining_budget` remains signed for admission and halt. Only slot reporting
+clamps it to zero. Therefore, when
+`0 < remaining_budget < risk_unit`, `slots_available = 0`, but ADR-0043 still
+permits a priced trade whose risk is no greater than `remaining_budget`.
+
 Realized gains can offset prior realized losses until net reaches zero.
 Gains above zero do not increase the monthly budget. Unrealized P&L never
 changes the monthly budget, in either direction.
 
-**Safety argument.** Admission (ADR-0043) guarantees that total newly
-admitted planned risk `A` satisfies `A + latent_risk ≤ monthly_budget −
-consumed`. Worst-case final governed net is `governed_realized_net −
-latent_risk − A`. If net ≥ 0 this is ≥ `net − monthly_budget ≥
-−monthly_budget`; if net < 0 then `latent_risk + A ≤ monthly_budget + net`,
-so the result is again ≥ `−monthly_budget`. The proof needs no unrealized
-term, which is precisely why unrealized P&L is excluded from the anchor.
+**Safety argument.** Admission (ADR-0043, as constrained in §2) guarantees
+that total newly admitted planned risk `A` satisfies `A + latent_risk ≤
+monthly_budget − consumed`. Worst-case final governed net is
+`governed_realized_net − latent_risk − A`. If net ≥ 0 this is ≥
+`net − monthly_budget ≥ −monthly_budget`; if net < 0 then
+`latent_risk + A ≤ monthly_budget + net`, so the result is again ≥
+`−monthly_budget`. The proof needs no unrealized term, which is precisely
+why unrealized P&L is excluded from the anchor. It additionally requires the
+premises made normative below: `A` and `latent_risk` are disjoint,
+reservations are durable and serialized, and accounting cannot change
+underneath an admission decision.
 
 **August 2026 under this model**: consumed $0.00, open risk reserved $0.00,
 remaining $63.12, **4 slots**.
 
 ### 2. Admission and halt use one canonical snapshot
 
-A proposed trade is admitted only when its cost-priced planned risk is no
-greater than both the 1% per-trade cap and `remaining_budget`. An unpriced
-trade conservatively reserves the full 1% unit (ADR-0043 fallback).
+Let `effective_planned_risk` equal `planned_risk` when `planned_risk > 0`,
+and `risk_unit` otherwise (ADR-0043 unpriced fallback). Admission requires:
+
+```
+capital_base > 0
+0 < effective_planned_risk ≤ risk_unit
+effective_planned_risk ≤ remaining_budget
+```
+
+The snapshot check and creation of the durable reservation are one
+serialized, atomic state transition. Concurrent proposals and concurrent
+accounting or position updates cannot spend the same remaining budget; a
+snapshot-version change forces the admission to retry. In the safety proof,
+`A` contains only admitted reservations not yet represented in
+`latent_risk`; an operation moves from `A` to `latent_risk` without an
+interval where it appears in both or neither.
 
 MonthlyHalt triggers when `remaining_budget ≤ 0`. It latches, blocks new
 entries, and closes risk-bearing positions. The −4% guarantee applies within
 the execution cost and gap envelope used by planned-risk and latent-risk
-pricing (ADR-0039); a breach outside that envelope latches MonthlyHalt and
-raises a high-severity reconciliation alarm.
+pricing (ADR-0039); a breach outside that envelope keeps MonthlyHalt latched
+and raises a high-severity, durable reconciliation alarm.
 
 Admission, slot reporting, the status API, and MonthlyHalt must consume one
-canonical monthly-budget snapshot. Active, Entering, partially filled, and
-close-in-reconciliation positions may not be treated differently across
-those paths. (This closes a live inconsistency: `evaluate_monthly_halt`
-reserves latent risk for Active positions only, while
-`compute_slots_available` and `monthly_budget_snapshot` also count
+canonical monthly-budget snapshot, produced by a constant-count bulk read
+(consumers never perform per-position database or exchange calls). Active,
+Entering, partially filled, and close-in-reconciliation positions may not be
+treated differently across those paths. (This closes a live inconsistency:
+`evaluate_monthly_halt` reserves latent risk for Active positions only,
+while `compute_slots_available` and `monthly_budget_snapshot` also count
 Entering.)
+
+```
+typed income + governed fills + durable lifecycle/reservations + basis/model
+                                  |
+                                  v
+                    CanonicalMonthlyBudgetSnapshot
+                        K, N, L, B, R, slots
+                         /      |       \
+                admission    /status    slots/halt
+```
 
 ### 3. Accounting lifecycle
 
-A position's latent-risk reservation remains in force until its evidenced
-realized P&L, commissions, funding, and other governed costs have replaced
-that reservation atomically. If authoritative monthly accounting is
-unavailable, or an unsettled liability cannot be bounded, new entries fail
-closed.
+A governed operation is settlement-complete only when authoritative evidence
+for its realized P&L, commissions, attributable funding, and every other
+typed cost required by its settlement contract is durable and matched. Late
+evidence is attributed by economic event timestamp, not ingestion or
+daemon-restart time.
+
+Until settlement is complete, no partial result may create admission
+capacity: the operation's reservation and every bounded, unprojected
+liability remain in `latent_risk`. A single atomic transaction removes that
+reservation and adds the complete signed result to `governed_realized_net`.
+No lifecycle transition may leave an interval where neither is charged.
+Production must not fall back to an incomplete in-memory close projection.
+
+If authoritative accounting is unavailable, stale beyond its contract, or an
+unsettled liability cannot be bounded, new entries fail closed. Existing
+positions remain protected and managed, and the failure is visible through a
+durable alarm and status state.
 
 `robson_month_net` retains its raw signed semantics for drift attribution
-(ADR-0045); budget accounting reads its own settlement-complete projection.
-Out-of-band account changes never enter governed monthly net.
+(ADR-0045); budget accounting reads a separate settlement-complete
+projection. Out-of-band account changes never enter governed monthly net.
 
-At the UTC month boundary, carried-position downside is absorbed into the
-new capital base exactly once (ADR-0024 §6) and carried positions are
-rebased against that pessimistic valuation. The reset and carried basis are
-durable and idempotent.
+At the UTC month boundary, let `carried_downside` be the aggregate
+cost-priced downside from boundary mark-to-market equity to each carried
+operation's pessimistic stop fill, including the execution-cost envelope.
+Then:
+
+```
+new_capital_base = current_governed_equity − carried_downside
+```
+
+Persist a pessimistic boundary basis for every carried operation. The
+absorbed `carried_downside` is not also charged as new-month `latent_risk`;
+only adverse movement beyond the persisted basis is reserved. When a carried
+operation settles, only its result relative to that boundary basis enters
+the new month's `governed_realized_net` — never its full lifetime P&L. The
+model version, new capital base, reset ledger, and carried bases are
+committed atomically, durably, and idempotently. A non-positive result
+follows the invalid-base rule in §1.
 
 ### 4. Peak state is retired
 
@@ -136,42 +224,105 @@ durable and idempotent.
 window. The database column is frozen at cutover and dropped in a later
 migration.
 
-The frontend replaces peak give-back reporting with: governed realized net,
-net loss consumed, open risk reserved, and monthly budget remaining.
-Card copy: "MONTHLY NET-LOSS BUDGET · net governed loss since month start,
-plus risk reserved for open positions. Profits do not increase the 4%
-limit." Mark-to-market month equity may remain only as a separately labelled
-informational metric.
+When `net_from_start_non_expanding_v1` is active, `/status` exposes
+`monthly_budget_model`, `month_governed_realized_net`,
+`monthly_net_loss_consumed`, `monthly_net_loss_pct_of_base`,
+`monthly_open_risk_reserved`, `monthly_budget_amount`,
+`monthly_budget_remaining`, `monthly_budget_utilization_pct`, and
+`new_slots_available`.
+
+`monthly_realized_loss` may remain as a clearly labelled gross informational
+metric. Mark-to-market month equity, if retained, is exposed as
+`month_mark_to_market_net` and explicitly marked informational. HWM fields
+are served only while `hwm_v1` or the compatibility window is active and are
+removed during cleanup.
+
+Frontend card copy: "MONTHLY NET-LOSS BUDGET · net governed loss since month
+start, plus risk reserved for open positions. Profits do not increase the 4%
+limit."
 
 ### 5. Rollout (live production)
 
-1. **DB expansion**: add `monthly_budget_model` to `monthly_state`
-   (default `hwm_v1`); keep `month_peak_net` intact.
+1. **DB expansion**: add `monthly_budget_model` to `monthly_state`,
+   backfilling existing rows as `hwm_v1`; add the durable settlement
+   projection and per-position carried-basis state required above. `hwm_v1`
+   is an expansion default only. After activation, every `MonthBoundaryReset`
+   inherits the active model atomically so a new row cannot revert to HWM.
 2. **Daemon, dormant dual-model release**: one canonical snapshot function
    shared by admission/status/slots/halt; shadow-calculate both models and
    alarm on unexplained divergence.
 3. **Frontend**: model-aware rendering of the new card; stop depending on
    peak/give-back fields.
-4. **Activation**: reconcile the August ledger gap (governed closes sum
-   +$43.63 vs month net $40.63 — the ~$3.00 must be explained: late
-   fees/funding or gross-vs-net figures), verify the account is flat, then
-   atomically switch the persisted model to
-   `net_from_start_non_expanding_v1` without resetting the month.
+4. **Activation**: require a healthy canonical-snapshot shadow period and
+   repository-verified handling for every reservation lifecycle, including
+   cancellation of an Entering order and exit of its filled portion (today
+   `trigger_monthly_halt` documents that Entering positions cannot be
+   cancelled; activation cannot proceed while that remains true). Reconcile
+   the August ledger gap (governed closes sum +$43.63 versus month net
+   $40.63; the approximately $3.00 must be evidenced), and verify the
+   account is flat: no risk-bearing local or exchange position, no in-flight
+   entry/exit or protective order, no stale reconciliation item, and no
+   unsettled governed liability. Then atomically switch the persisted model
+   to `net_from_start_non_expanding_v1` without resetting the month or
+   changing its audited budget basis.
 5. **Cleanup**: remove peak refresh/cache/API code, then drop
    `monthly_state.month_peak_net` in a separate migration.
 
+## Failure modes
+
+| Failure | Required behavior |
+| --- | --- |
+| Postgres/projection unavailable | No new entries; no incomplete in-memory production fallback; existing protection continues; durable visible alarm. |
+| Income endpoint unavailable or stale | Settlement reservations remain; new entries fail closed after the freshness bound; retry with backoff. |
+| Exchange position inventory unavailable | Use the full durable local risk-bearing set conservatively; do not omit positions; deny new entries and expose staleness. |
+| Concurrent admissions/accounting updates | Serialized reservation or versioned compare-and-swap; loser retries from a new snapshot. |
+| Daemon dies between check and reservation | Both commit or neither commits; startup rebuilds the identical snapshot before admission resumes. |
+| Close evidence incomplete | Reservation remains until complete evidence atomically replaces it. |
+| Crash during month reset | Idempotent transaction restores one model/base/basis set and never charges carried downside twice. |
+| Loss outside the priced execution envelope | MonthlyHalt remains latched and a high-severity reconciliation alarm is durable. |
+
 ## Consequences
 
-- Positive: a profitable month always shows 4 guaranteed slots; slot count
-  can no longer flap on mark noise (only governed accounting events move
-  it); no persisted peak state; the −4% floor gets a closed-form proof.
+- Positive: a settlement-complete profitable month with no risk-bearing
+  positions or unsettled liabilities shows 4 guaranteed slots. Unrealized
+  mark changes alone cannot change consumed budget, remaining budget, slots,
+  admission, or halt; governed settlements and reservation lifecycle changes
+  still can.
+- Positive: no persisted peak state; the −4% floor has a closed-form proof
+  under the normative premises of §1 and §2.
+- Accepted consequence inherited from ADR-0043: MonthlyHalt can still
+  trigger while `governed_realized_net ≥ 0` when `latent_risk` alone
+  exhausts the budget. In particular, an admission that exactly reserves the
+  final budget amount produces `remaining_budget = 0` and satisfies the
+  `≤ 0` halt trigger. What disappears is halting caused solely by give-back
+  from a realized or unrealized monthly peak.
 - Trade-off (accepted knowingly): realized gains are not protected by the
   monthly mechanism. Win +3% early and the month may give those gains back
   before the −4% floor binds. Per operator decision, protecting profit is
   the job of each position's trailing stop, not of the monthly budget.
-- Halting while month-positive can no longer happen (halt requires
-  `consumed + latent_risk ≥ 4%`, and consumed > 0 implies realized net
-  loss), removing ADR-0046's main UX surprise.
+
+## Supersession boundaries
+
+This ADR supersedes ADR-0046's high-water-mark anchor, peak persistence,
+peak/give-back API contract, HWM-specific failure behavior, and rejection of
+net-from-start. ADR-0046's gross governed realized-loss value may remain
+only as a separately labelled informational metric.
+
+For budget decisions, this ADR supersedes ADR-0024's gross-loss,
+wins-do-not-offset formula and its "four errors" framing. It preserves and
+refines ADR-0024's month-boundary rule as specified in §3.
+
+ADR-0043 remains authoritative for actual-planned-risk admission, the
+full-cap guaranteed-minimum meaning of slots, the ability to admit a smaller
+trade while slots are zero, and the `remaining_budget ≤ 0` MonthlyHalt
+threshold.
+
+ADR-0045 remains authoritative for typed income evidence, item-level
+reconciliation, raw drift attribution, and the prohibition on absorbing
+unexplained residuals. Under `net_from_start_non_expanding_v1`, ADR-0045's
+"income endpoint unavailable: trading unaffected" behavior is superseded for
+new-entry admission: stale or unavailable authoritative accounting fails
+closed. Exit and protective-stop management continue.
 
 ## Alternatives
 
@@ -192,9 +343,17 @@ informational metric.
 - Code paths: `robsond/src/position_manager.rs`
   (`compute_slots_available`, `evaluate_monthly_halt`,
   `monthly_budget_snapshot`, `refresh_month_peak_net`, `month_equity_net`,
-  `governed_monthly_realized_loss`), `robson-domain/src/policy.rs`
+  `governed_monthly_realized_loss`, `trigger_monthly_halt`),
+  `robsond/src/daemon.rs` (month-boundary capital base),
+  `robsond/src/income_ledger.rs` (recalibration; must stop raising the
+  budget basis intra-month per §1), `robson-domain/src/policy.rs`
   (`TradingPolicy::slots_available`), `robsond/src/api.rs` (`/status`
   fields), `frontend` dashboard MONTHLY LIMIT card.
+- Known pre-existing gaps this ADR turns into activation blockers: Entering
+  positions cannot be cancelled by `trigger_monthly_halt` (documented in
+  code); carried Active positions are absorbed into the new capital base at
+  the boundary and then counted again by `compute_slots_available` (no
+  per-position carried basis exists yet).
 - Test invariants to pin: `0 ≤ consumed`; `remaining ≤ monthly_budget`;
   `slots ≤ 4`; unrealized mark changes alone never change consumed,
   remaining, slots, admission, or halt; every admitted sequence within the
@@ -202,14 +361,25 @@ informational metric.
   interval where neither latent risk nor settled result is charged;
   admission/status/slots/halt read byte-equivalent snapshots; restart
   reproduces the same snapshot; month reset idempotent, carried risk charged
-  exactly once; out-of-band drift never enters governed net.
+  exactly once; out-of-band drift never enters governed net;
+  `capital_base ≤ 0` never divides and always denies and halt-latches;
+  `0 < remaining_budget < risk_unit` reports zero slots but may admit a
+  smaller priced trade; exact final-budget reservation exercises the
+  `remaining = 0` halt behavior; conservative Decimal/quantization boundary
+  cases; a property-based invariant over concurrent admissions, settlement
+  updates, and lifecycle transitions proving no budget is double-spent;
+  carried-position closure contributes only its delta from the persisted
+  pessimistic boundary basis; model selection survives the next month
+  boundary; database, income, and exchange outages exercise the documented
+  fail-closed behavior.
 - Highest-value regression tests: (a) August case — flat account, positive
   net, 4 slots; (b) masked-loss case — realized −1%, unrealized winner with
   breakeven stop, remaining reflects the realized loss and marks do nothing;
   (c) Entering-position consistency across all four consumers; (d) atomic
   close settlement (reservation held until fees/funding evidenced);
   (e) month-boundary restart idempotency.
-- Related: ADR-0024 (policy layer, month boundary), ADR-0039 (cost-priced
-  worst case), ADR-0043 (planned-risk admission, slots as guaranteed
-  minimum, halt at ≤ 0), ADR-0045 (governed-only flow), ADR-0046
-  (superseded).
+- Related: ADR-0024 (policy layer, month boundary), ADR-0038 (recalibration,
+  partially superseded per §1), ADR-0039 (cost-priced worst case), ADR-0043
+  (planned-risk admission, slots as guaranteed minimum, halt at ≤ 0),
+  ADR-0045 (governed-only flow, partially superseded per Supersession
+  boundaries), ADR-0046 (superseded).
