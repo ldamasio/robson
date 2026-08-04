@@ -188,6 +188,9 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// Without it every market tick pays the monthly-state SELECT — the N+1
     /// class the engineering guardrails flag on hot paths.
     month_peak_refreshed_at: Arc<Mutex<Option<std::time::Instant>>>,
+    /// Last active/other shadow-model slot pair observed. The divergence log
+    /// fires only when this pair changes; the gauge is refreshed every time.
+    shadow_slots_last: Mutex<Option<(u32, u32)>>,
     /// Optional postgres pool for persisting domain events to robson-eventlog.
     #[cfg(feature = "postgres")]
     event_log_pool: Option<PgPool>,
@@ -229,6 +232,8 @@ pub(crate) struct MonthlyRiskState {
 pub(crate) struct MonthlyBudgetSnapshot {
     pub(crate) model: MonthlyBudgetModel,
     pub(crate) capital_base: Decimal,
+    pub(crate) capital_base_invalid: bool,
+    pub(crate) budget_amount: Decimal,
     pub(crate) governed_realized_net: Decimal,
     pub(crate) month_equity_net: Decimal,
     pub(crate) month_peak_net: Decimal,
@@ -246,7 +251,7 @@ pub(crate) struct MonthlyBudgetSnapshot {
 
 impl MonthlyBudgetSnapshot {
     pub(crate) fn budget_amount(&self) -> Decimal {
-        self.remaining_active + self.consumed_active + self.latent_risk
+        self.budget_amount
     }
 }
 
@@ -267,13 +272,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// already committed in the order/execution pipeline even before fill.
     pub(crate) async fn live_risk_open_positions(&self) -> DaemonResult<Vec<Position>> {
         let open_positions = self.store.positions().find_risk_open().await?;
-        Ok(self.filter_live_risk_open_positions(&open_positions).await)
-    }
-
-    /// Apply the canonical exchange-presence filter to one already-loaded
-    /// local risk-open set. Keeping the filter separate lets the monthly
-    /// snapshot reuse the same bulk local read for equity and latent risk.
-    async fn filter_live_risk_open_positions(&self, open_positions: &[Position]) -> Vec<Position> {
         let exchange_positions = match self.exchange_open_positions().await {
             Ok(positions) => Some(positions),
             Err(error) => {
@@ -282,9 +280,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             },
         };
 
-        match exchange_positions {
+        Ok(match exchange_positions {
             Some(exchange_positions) => open_positions
-                .iter()
+                .into_iter()
                 .filter(|position| match &position.state {
                     PositionState::Entering { .. } => true,
                     PositionState::Active { .. } => {
@@ -295,10 +293,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     },
                     _ => false,
                 })
-                .cloned()
                 .collect(),
-            None => open_positions.to_vec(),
-        }
+            None => open_positions,
+        })
     }
 
     /// Update the engine's capital from an external source (exchange balance).
@@ -565,6 +562,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .sum())
     }
 
+    #[cfg(test)]
     pub(crate) async fn month_equity_net(
         &self,
         now: chrono::DateTime<chrono::Utc>,
@@ -584,6 +582,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         Ok(realized_net + unrealized)
     }
 
+    #[cfg(test)]
     pub(crate) async fn refresh_month_peak_net(
         &self,
         now: chrono::DateTime<chrono::Utc>,
@@ -752,6 +751,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             trading_policy,
             month_peak_net_cache: Arc::new(Mutex::new(HashMap::new())),
             month_peak_refreshed_at: Arc::new(Mutex::new(None)),
+            shadow_slots_last: Mutex::new(None),
             #[cfg(feature = "postgres")]
             event_log_pool: None,
             #[cfg(feature = "postgres")]
@@ -1158,6 +1158,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// This prevents concurrent entries from slipping under the exposure
     /// limits during the order-fill window (signal fires → order submitted
     /// → not yet filled → next signal arrives).
+    ///
+    /// The canonical snapshot reserves every durable local Active + Entering
+    /// position. Admission intentionally extends that set with pending
+    /// approvals: without pending approvals, its latent-risk sum equals the
+    /// snapshot exactly; with them, admission is a conservative strict
+    /// superset by design.
     async fn build_risk_context(&self) -> DaemonResult<RiskContext> {
         let now = chrono::Utc::now();
         let (budget, active_positions) = self.canonical_budget_snapshot_with_positions(now).await?;
@@ -3434,7 +3440,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             }
         };
         if should_refresh_peak {
-            self.refresh_month_peak_net(chrono::Utc::now()).await?;
+            self.canonical_budget_snapshot(chrono::Utc::now()).await?;
         }
         crate::metrics::CYCLES.with_label_values(&["success"]).inc();
         Ok(())
@@ -4050,8 +4056,21 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let month_peak_net = self
             .refresh_month_peak_net_from_snapshot(now, &monthly, month_equity_net)
             .await?;
-        let live_risk_open = self.filter_live_risk_open_positions(&local_risk_open).await;
-        let latent_risk = Self::latent_risk_for_positions(&live_risk_open);
+        // ADR-0051 failure modes: never omit a durable local risk-bearing
+        // position from the reservation, even when the exchange snapshot
+        // says it is gone (partial/stale responses must stay conservative).
+        let latent_risk = Self::latent_risk_for_positions(&local_risk_open);
+
+        let capital_base_invalid = monthly.capital_base <= Decimal::ZERO;
+        if capital_base_invalid {
+            error!(
+                capital_base = %monthly.capital_base,
+                year = now.year(),
+                month = now.month(),
+                "ADR-0051 §1: monthly budget snapshot is invalid because capital_base <= 0; high-severity accounting alarm required"
+            );
+        }
+        let budget_amount = self.trading_policy.monthly_budget(monthly.capital_base);
 
         let consumed_hwm = (month_peak_net - month_equity_net).max(Decimal::ZERO);
         let consumed_nfs = (-governed_realized_net).max(Decimal::ZERO);
@@ -4089,7 +4108,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 (MonthlyBudgetModel::HwmV1, slots_hwm, remaining_hwm)
             },
         };
-        if slots_active != other_slots || remaining_active != other_remaining {
+        let shadow_slots_changed = {
+            let current = (slots_active, other_slots);
+            let mut last = self.shadow_slots_last.lock().await;
+            let changed = last.as_ref() != Some(&current);
+            *last = Some(current);
+            changed
+        };
+        if slots_active != other_slots && shadow_slots_changed {
             info!(
                 active_model = %monthly.budget_model.as_str(),
                 other_model = %other_model.as_str(),
@@ -4108,6 +4134,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             MonthlyBudgetSnapshot {
                 model: monthly.budget_model,
                 capital_base: monthly.capital_base,
+                capital_base_invalid,
+                budget_amount,
                 governed_realized_net,
                 month_equity_net,
                 month_peak_net,
@@ -4526,18 +4554,6 @@ mod tests {
 
         manager.store.positions().save(&position).await.unwrap();
         position
-    }
-
-    fn mirror_active_on_exchange(
-        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
-        position: &Position,
-    ) {
-        manager.executor.exchange().set_open_position(
-            position.symbol.clone(),
-            position.side,
-            position.quantity,
-            position.entry_price.expect("Active test position has entry price"),
-        );
     }
 
     /// Regression for #137: an accepted insurance-stop replacement is not an
@@ -6716,9 +6732,6 @@ mod tests {
         };
         position.updated_at = now;
         manager.store.positions().save(&position).await.unwrap();
-        // ADR-0051 §2 canonical latent risk uses the same exchange-confirmed
-        // Active set as compute_slots_available.
-        mirror_active_on_exchange(&manager, &position);
         // latent_risk = (95000 - 90900) * 0.1 = 410
         // remaining = 400 - 0 - 410 = -10 <= 0 → halt
 
@@ -6737,15 +6750,9 @@ mod tests {
         // Use save_active_position which sets stop = entry - 10 for Long.
         // With entry=3000, stop=2990, qty=0.1 → latent = 1 per position.
         // 3 positions: latent = 3, remaining = 400 - 0 - 3 = 397 >= 100 → no halt
-        let btc =
-            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
-        let eth =
-            save_active_position(&manager, "ETHUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
-        let sol =
-            save_active_position(&manager, "SOLUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
-        for position in [&btc, &eth, &sol] {
-            mirror_active_on_exchange(&manager, position);
-        }
+        save_active_position(&manager, "BTCUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
+        save_active_position(&manager, "ETHUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
+        save_active_position(&manager, "SOLUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
 
         let triggered = manager.evaluate_monthly_halt().await;
         assert!(
@@ -6786,7 +6793,6 @@ mod tests {
         };
         position.updated_at = now;
         manager.store.positions().save(&position).await.unwrap();
-        mirror_active_on_exchange(&manager, &position);
 
         let triggered = manager.evaluate_monthly_halt().await;
         assert!(triggered, "realized=150 + latent=250 → remaining=0 must trigger (ADR-0043)");
@@ -6824,7 +6830,6 @@ mod tests {
         };
         position.updated_at = now;
         manager.store.positions().save(&position).await.unwrap();
-        mirror_active_on_exchange(&manager, &position);
 
         let triggered = manager.evaluate_monthly_halt().await;
         assert!(
@@ -6865,6 +6870,31 @@ mod tests {
         // of the former Active-only subset.
         assert!(manager.evaluate_monthly_halt().await);
         assert!(manager.circuit_breaker.blocks_new_entries().await);
+    }
+
+    #[tokio::test]
+    async fn test_snapshot_and_admission_latent_risk_match_without_pending_approvals() {
+        let manager = create_test_manager().await;
+        save_active_position(&manager, "BTCUSDT", Side::Long, dec!(3000), dec!(0.1)).await;
+
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(90)).unwrap();
+        let mut entering =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("ETHUSDT").unwrap(), Side::Long);
+        entering.quantity = Quantity::new(dec!(10)).unwrap();
+        entering.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(entry, stop));
+        entering.state = PositionState::Entering {
+            entry_order_id: Uuid::now_v7(),
+            expected_entry: entry,
+            signal_id: Uuid::now_v7(),
+        };
+        manager.store.positions().save(&entering).await.unwrap();
+
+        assert!(manager.pending_approvals.read().await.is_empty());
+        let snapshot = manager.canonical_budget_snapshot(chrono::Utc::now()).await.unwrap();
+        let admission = manager.build_risk_context().await.unwrap();
+
+        assert_eq!(snapshot.latent_risk, admission.latent_risk_sum());
     }
 
     #[tokio::test]

@@ -159,7 +159,10 @@ pub struct StatusResponse {
     pub monthly_realized_loss_pct: Decimal,
     /// Persisted monthly budget accounting model.
     pub monthly_budget_model: String,
-    /// Signed governed realized net since the current month began.
+    /// Signed sum of governed closed-position P&L net of fees for the current
+    /// month. This is not yet ADR-0051 settlement-complete: funding and other
+    /// typed income evidence are excluded, an activation blocker under
+    /// ADR-0051 §3/§5.4.
     pub month_governed_realized_net: Decimal,
     /// Net loss consumed under ADR-0051's net-from-start model.
     pub monthly_net_loss_consumed: Decimal,
@@ -178,6 +181,9 @@ pub struct StatusResponse {
     pub monthly_budget_remaining: Decimal,
     /// Starting capital basis for the current month.
     pub capital_base: Decimal,
+    /// Whether the persisted monthly budget basis is invalid under ADR-0051
+    /// §1 (`capital_base <= 0`).
+    pub monthly_budget_basis_invalid: bool,
     /// Current futures wallet balance reported by the exchange.
     pub wallet_balance: Decimal,
     /// Income-ledger items past the evidence-lag grace period with no
@@ -1498,6 +1504,7 @@ where
         monthly_giveback_pct,
         monthly_budget_remaining: budget_snapshot.remaining_active,
         capital_base: budget_snapshot.capital_base,
+        monthly_budget_basis_invalid: budget_snapshot.capital_base_invalid,
         wallet_balance,
         unmatched_income_count,
     }))
@@ -3872,6 +3879,7 @@ mod tests {
         assert_eq!(status.monthly_open_risk_reserved, Decimal::ZERO);
         assert_eq!(status.monthly_budget_amount, dec!(400));
         assert_eq!(status.monthly_budget_remaining, dec!(400));
+        assert!(!status.monthly_budget_basis_invalid);
         assert_eq!(status.stale_active_count, 0);
         assert!(status.reconciliation_blockers.is_empty());
         assert_eq!(status.pending_approvals.len(), 1);
@@ -3902,8 +3910,12 @@ mod tests {
         assert_eq!(status.reconciliation_blockers[0].symbol, "BTCUSDT");
         assert_eq!(status.reconciliation_blockers[0].reason, "stale_missing_on_exchange");
         assert_eq!(status.occupied_slots, 0);
-        assert_eq!(status.new_slots_available, 4);
-        assert_eq!(status.slot_cells_total, 4);
+        // ADR-0051 failure-mode row "Exchange position inventory unavailable":
+        // status hides the stale position from display counts but reserves its
+        // durable local risk conservatively in the budget snapshot.
+        assert_eq!(status.new_slots_available, 3);
+        assert_eq!(status.slot_cells_total, 3);
+        assert_eq!(status.monthly_open_risk_reserved, dec!(10));
     }
 
     // to_error_response unit tests — catch-all was `_ => 400` before this fix.
