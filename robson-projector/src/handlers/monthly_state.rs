@@ -39,8 +39,22 @@ pub(crate) async fn handle_month_boundary_reset(
 
     sqlx::query(
         r#"
-        INSERT INTO monthly_state (year, month, capital_base, carried_risk, realized_loss, trades_opened, month_peak_net, boundary_reset_at, created_at)
-        VALUES ($1, $2, $3, $4, 0, 0, 0, $5, $5)
+        INSERT INTO monthly_state (
+            year, month, capital_base, carried_risk, realized_loss, trades_opened,
+            month_peak_net, monthly_budget_model, boundary_reset_at, created_at
+        )
+        VALUES (
+            $1, $2, $3, $4, 0, 0, 0,
+            COALESCE(
+                (SELECT monthly_budget_model
+                 FROM monthly_state
+                 WHERE (year, month) < ($1::SMALLINT, $2::SMALLINT)
+                 ORDER BY year DESC, month DESC
+                 LIMIT 1),
+                'hwm_v1'
+            ),
+            $5, $5
+        )
         ON CONFLICT (year, month) DO UPDATE SET
             capital_base = EXCLUDED.capital_base,
             carried_risk = EXCLUDED.carried_risk,
@@ -82,8 +96,22 @@ pub(crate) async fn handle_capital_base_recalibrated(
 
     sqlx::query(
         r#"
-        INSERT INTO monthly_state (year, month, capital_base, carried_risk, realized_loss, trades_opened, month_peak_net, created_at)
-        VALUES ($1, $2, $3, $4, 0, 0, 0, $5)
+        INSERT INTO monthly_state (
+            year, month, capital_base, carried_risk, realized_loss, trades_opened,
+            month_peak_net, monthly_budget_model, created_at
+        )
+        VALUES (
+            $1, $2, $3, $4, 0, 0, 0,
+            COALESCE(
+                (SELECT monthly_budget_model
+                 FROM monthly_state
+                 WHERE (year, month) < ($1::SMALLINT, $2::SMALLINT)
+                 ORDER BY year DESC, month DESC
+                 LIMIT 1),
+                'hwm_v1'
+            ),
+            $5
+        )
         ON CONFLICT (year, month) DO UPDATE SET
             capital_base = EXCLUDED.capital_base,
             carried_risk = EXCLUDED.carried_risk
@@ -120,8 +148,22 @@ pub(crate) async fn handle_entry_filled_monthly(
 
     sqlx::query(
         r#"
-        INSERT INTO monthly_state (year, month, capital_base, realized_loss, trades_opened, month_peak_net, created_at)
-        VALUES ($1, $2, 0, 0, 1, 0, $3)
+        INSERT INTO monthly_state (
+            year, month, capital_base, realized_loss, trades_opened,
+            month_peak_net, monthly_budget_model, created_at
+        )
+        VALUES (
+            $1, $2, 0, 0, 1, 0,
+            COALESCE(
+                (SELECT monthly_budget_model
+                 FROM monthly_state
+                 WHERE (year, month) < ($1::SMALLINT, $2::SMALLINT)
+                 ORDER BY year DESC, month DESC
+                 LIMIT 1),
+                'hwm_v1'
+            ),
+            $3
+        )
         ON CONFLICT (year, month) DO UPDATE SET
             trades_opened = monthly_state.trades_opened + 1
         "#,
@@ -163,8 +205,22 @@ pub(crate) async fn handle_position_closed_monthly(
 
     sqlx::query(
         r#"
-        INSERT INTO monthly_state (year, month, capital_base, realized_loss, trades_opened, month_peak_net, created_at)
-        VALUES ($1, $2, 0, $3, 0, 0, $4)
+        INSERT INTO monthly_state (
+            year, month, capital_base, realized_loss, trades_opened,
+            month_peak_net, monthly_budget_model, created_at
+        )
+        VALUES (
+            $1, $2, 0, $3, 0, 0,
+            COALESCE(
+                (SELECT monthly_budget_model
+                 FROM monthly_state
+                 WHERE (year, month) < ($1::SMALLINT, $2::SMALLINT)
+                 ORDER BY year DESC, month DESC
+                 LIMIT 1),
+                'hwm_v1'
+            ),
+            $4
+        )
         ON CONFLICT (year, month) DO UPDATE SET
             realized_loss = monthly_state.realized_loss + $3
         "#,

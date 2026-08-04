@@ -26,9 +26,9 @@ use std::{
 
 use chrono::Datelike;
 use robson_domain::{
-    ClosureEvidence, DetectorSignal, EntryPolicy, EntryPolicyConfig, Event, Position, PositionId,
-    PositionState, Price, Quantity, ReconciliationEvidence, RiskConfig, Side, StopPolicy, Symbol,
-    TechnicalStopDistance, TradingPolicy,
+    ClosureEvidence, DetectorSignal, EntryPolicy, EntryPolicyConfig, Event, MonthlyBudgetModel,
+    Position, PositionId, PositionState, Price, Quantity, ReconciliationEvidence, RiskConfig, Side,
+    StopPolicy, Symbol, TechnicalStopDistance, TradingPolicy,
 };
 use robson_engine::{
     technical_stop_analyzer::TechnicalStopConfig, Engine, EngineAction, EngineDecision,
@@ -220,6 +220,7 @@ pub(crate) struct MonthlyRiskState {
     pub realized_loss: Decimal,
     pub month_peak_net: Decimal,
     pub trades_opened: i32,
+    pub budget_model: MonthlyBudgetModel,
 }
 
 impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
@@ -381,8 +382,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         };
 
         let configured_capital = self.configured_capital();
-        let row = sqlx::query_as::<_, (Decimal, Decimal, Decimal, i32)>(
-            "SELECT capital_base, realized_loss, month_peak_net, trades_opened FROM monthly_state WHERE year = $1 AND month = $2",
+        let row = sqlx::query_as::<_, (Decimal, Decimal, Decimal, i32, String)>(
+            "SELECT capital_base, realized_loss, month_peak_net, trades_opened, monthly_budget_model FROM monthly_state WHERE year = $1 AND month = $2",
         )
         .bind(now.year())
         .bind(now.month() as i16)
@@ -390,19 +391,29 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         .await?;
 
         Ok(row
-            .map(
-                |(capital_base, realized_loss, month_peak_net, trades_opened)| MonthlyRiskState {
+            .map(|(capital_base, realized_loss, month_peak_net, trades_opened, stored_model)| {
+                let budget_model = MonthlyBudgetModel::from_str(&stored_model);
+                if stored_model != budget_model.as_str() {
+                    warn!(
+                        monthly_budget_model = %stored_model,
+                        fallback = %budget_model.as_str(),
+                        "Unknown persisted monthly budget model; using conservative fallback"
+                    );
+                }
+                MonthlyRiskState {
                     capital_base,
                     realized_loss,
                     month_peak_net,
                     trades_opened,
-                },
-            )
+                    budget_model,
+                }
+            })
             .unwrap_or(MonthlyRiskState {
                 capital_base: configured_capital,
                 realized_loss: Decimal::ZERO,
                 month_peak_net: Decimal::ZERO,
                 trades_opened: 0,
+                budget_model: MonthlyBudgetModel::default(),
             }))
     }
 
@@ -461,6 +472,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             realized_loss,
             month_peak_net: realized_peak.max(cached_peak),
             trades_opened: monthly_closed.len() as i32,
+            budget_model: MonthlyBudgetModel::default(),
         })
     }
 
@@ -555,8 +567,22 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if let Some(pool) = &self.event_log_pool {
             sqlx::query(
                 r#"
-                INSERT INTO monthly_state (year, month, capital_base, month_peak_net, created_at)
-                VALUES ($1, $2, $3, $4, NOW())
+                INSERT INTO monthly_state (
+                    year, month, capital_base, month_peak_net,
+                    monthly_budget_model, created_at
+                )
+                VALUES (
+                    $1, $2, $3, $4,
+                    COALESCE(
+                        (SELECT monthly_budget_model
+                         FROM monthly_state
+                         WHERE (year, month) < ($1::SMALLINT, $2::SMALLINT)
+                         ORDER BY year DESC, month DESC
+                         LIMIT 1),
+                        'hwm_v1'
+                    ),
+                    NOW()
+                )
                 ON CONFLICT (year, month) DO UPDATE SET
                     month_peak_net = GREATEST(monthly_state.month_peak_net, EXCLUDED.month_peak_net)
                 "#,
@@ -4205,6 +4231,30 @@ mod tests {
             .await
     }
 
+    #[cfg(feature = "postgres")]
+    fn create_postgres_test_manager(
+        pool: sqlx::PgPool,
+    ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
+        let exchange = Arc::new(StubExchange::new(dec!(95000)));
+        let journal = Arc::new(IntentJournal::new());
+        let store = Arc::new(MemoryStore::new());
+        let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
+        let engine = Engine::new(RiskConfig::new(dec!(10000)).unwrap());
+
+        Arc::new(
+            PositionManager::with_approval_policy(
+                engine,
+                executor,
+                store,
+                Arc::new(EventBus::new(100)),
+                Arc::new(TracingQueryRecorder),
+                ApprovalPolicy::new(Decimal::from(100u32), 300),
+                TradingPolicy::default(),
+            )
+            .with_event_log(pool, Uuid::now_v7()),
+        )
+    }
+
     async fn create_phase3_test_manager(
         ttl_seconds: u64,
     ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
@@ -6394,6 +6444,58 @@ mod tests {
             manager.load_monthly_state(now).await.unwrap().month_peak_net,
             dec!(300),
             "month_peak_net must never decrease within the month"
+        );
+    }
+
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn test_budget_model_reload_and_peak_refresh_preserve_nfs(pool: sqlx::PgPool) {
+        let now = chrono::Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO monthly_state (
+                year, month, capital_base, month_peak_net,
+                monthly_budget_model, created_at
+            )
+            VALUES ($1, $2, 10000, 0, 'net_from_start_non_expanding_v1', $3)
+            "#,
+        )
+        .bind(now.year() as i16)
+        .bind(now.month() as i16)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let manager = create_postgres_test_manager(pool.clone());
+        assert_eq!(
+            manager.load_monthly_state(now).await.unwrap().budget_model,
+            MonthlyBudgetModel::NetFromStartNonExpandingV1,
+            "persisted nfs model must survive reload"
+        );
+
+        let mut winner =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+        if let PositionState::Active { current_price, .. } = &mut winner.state {
+            *current_price = Price::new(dec!(110)).unwrap();
+        }
+        manager.store.positions().save(&winner).await.unwrap();
+
+        manager.refresh_month_peak_net(now).await.unwrap();
+
+        let (peak, model): (Decimal, String) = sqlx::query_as(
+            "SELECT month_peak_net, monthly_budget_model FROM monthly_state WHERE year = $1 AND month = $2",
+        )
+        .bind(now.year() as i16)
+        .bind(now.month() as i16)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(peak, dec!(10));
+        assert_eq!(
+            model, "net_from_start_non_expanding_v1",
+            "peak UPSERT must not reset an activated model"
         );
     }
 
