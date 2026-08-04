@@ -1,14 +1,14 @@
 # ADR-0045 — Income-Ledger Reconciliation; Drift Demoted to Checksum
 
 **Date**: 2026-07-05
-**Status**: Decided (fully shipped — hotfix, reconciliation-anchor fix, and the typed income ledger); partially superseded by
-[ADR-0051](ADR-0051-net-from-start-monthly-budget.md): under
-`net_from_start_non_expanding_v1`, "income endpoint unavailable: trading
-unaffected" no longer holds for new-entry admission, which fails closed on
-stale or unavailable authoritative accounting (exit and protective-stop
-management continue). Typed evidence, item-level reconciliation, raw drift
-attribution, and the prohibition on absorbing unexplained residuals remain
-in force.
+**Status**: Decided (fully shipped — hotfix, reconciliation-anchor fix, and
+the typed income ledger); partially superseded by
+[ADR-0051](ADR-0051-net-from-start-monthly-budget.md): confirmed transfers no
+longer increase the monthly budget basis intra-month, and stale or unavailable
+authoritative accounting fails new-entry admission closed after its freshness
+bound. Exit and protective-stop management, typed evidence, item-level
+reconciliation, raw drift attribution, and the prohibition on absorbing
+unexplained residuals remain in force.
 **Deciders**: RBX Systems (operator + architecture)
 
 ---
@@ -58,6 +58,11 @@ item by item:
 - `FUNDING_FEE` maps to the funding tracking;
 - `TRANSFER` is, by definition, an operator action — the only category that
   may legitimately recalibrate `capital_base` automatically;
+
+  > **ADR-0051 boundary:** a confirmed `TRANSFER` may update margin and
+  > sizing capital and may conservatively reduce the effective monthly budget
+  > basis, but it MUST NOT increase that basis intra-month.
+
 - anything unmatched is a **named, per-item anomaly**, not a scalar mystery.
 
 `expected_wallet_balance` derives from the matched ledger, per symbol. This

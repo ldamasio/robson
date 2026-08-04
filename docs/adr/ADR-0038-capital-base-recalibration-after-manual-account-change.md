@@ -1,7 +1,7 @@
 # ADR-0038 — Capital Base Recalibration After Manual Account Change
 
 **Date**: 2026-05-28
-**Status**: DECIDED — IMPLEMENTATION REQUIRED; partially superseded by
+**Status**: DECIDED — FOLLOW-UP REQUIRED; partially superseded by
 [ADR-0051](ADR-0051-net-from-start-monthly-budget.md): recalibration may no
 longer increase the monthly budget basis intra-month (deposits update margin
 and sizing capital only; adverse changes may conservatively reduce the

@@ -1,8 +1,9 @@
 # ADR-0051 — Net-From-Start, Non-Expanding Monthly Budget
 
 **Date**: 2026-08-04
-**Status**: Accepted (operator decision, 2026-08-04; revised same day after
-adversarial secondary-model review)
+**Status**: DECIDED — FOLLOW-UP REQUIRED (operator decision, 2026-08-04;
+revised same day after adversarial secondary-model review; implementation and
+operational rollout pending)
 **Deciders**: RBX Systems (operator + architecture, with adversarial design
 review by a secondary model)
 **Supersedes**: [ADR-0046](ADR-0046-monthly-high-water-mark-budget.md)
@@ -116,17 +117,17 @@ Realized gains can offset prior realized losses until net reaches zero.
 Gains above zero do not increase the monthly budget. Unrealized P&L never
 changes the monthly budget, in either direction.
 
-**Safety argument.** Admission (ADR-0043, as constrained in §2) guarantees
-that total newly admitted planned risk `A` satisfies `A + latent_risk ≤
-monthly_budget − consumed`. Worst-case final governed net is
-`governed_realized_net − latent_risk − A`. If net ≥ 0 this is ≥
-`net − monthly_budget ≥ −monthly_budget`; if net < 0 then
-`latent_risk + A ≤ monthly_budget + net`, so the result is again ≥
-`−monthly_budget`. The proof needs no unrealized term, which is precisely
-why unrealized P&L is excluded from the anchor. It additionally requires the
-premises made normative below: `A` and `latent_risk` are disjoint,
-reservations are durable and serialized, and accounting cannot change
-underneath an admission decision.
+**Safety argument.** Let `N = governed_realized_net`, let `L` be
+`latent_risk` in the pre-admission canonical snapshot, and let `A` be only the
+transaction-local aggregate risk of the proposal or proposals evaluated
+against that snapshot. Serialized admission requires
+`A + L ≤ monthly_budget − consumed` and, on success, atomically commits the
+post-state `latent_risk = L + A` before admission becomes externally visible.
+Worst-case final governed net is `N − L − A`. If `N ≥ 0`, this is at least
+`N − monthly_budget ≥ −monthly_budget`; if `N < 0`, then
+`L + A ≤ monthly_budget + N`, so the result is again at least
+`−monthly_budget`. The proof needs no unrealized term, which is precisely why
+unrealized P&L is excluded from the anchor.
 
 **August 2026 under this model**: consumed $0.00, open risk reserved $0.00,
 remaining $63.12, **4 slots**.
@@ -142,13 +143,15 @@ capital_base > 0
 effective_planned_risk ≤ remaining_budget
 ```
 
-The snapshot check and creation of the durable reservation are one
-serialized, atomic state transition. Concurrent proposals and concurrent
-accounting or position updates cannot spend the same remaining budget; a
-snapshot-version change forces the admission to retry. In the safety proof,
-`A` contains only admitted reservations not yet represented in
-`latent_risk`; an operation moves from `A` to `latent_risk` without an
-interval where it appears in both or neither.
+The snapshot check and addition of `effective_planned_risk` to `latent_risk`
+as a durable reservation are one serialized, atomic state transition.
+Concurrent proposals and concurrent accounting or position updates cannot
+spend the same remaining budget; a snapshot-version change forces admission
+to retry. A successful admission is not externally visible until its
+reservation is included in the canonical `latent_risk` snapshot. Lifecycle
+transitions atomically replace the basis of that same reservation; no
+transition may leave an interval where the risk appears in both
+representations or in neither.
 
 MonthlyHalt triggers when `remaining_budget ≤ 0`. It latches, blocks new
 entries, and closes risk-bearing positions. The −4% guarantee applies within
@@ -289,7 +292,7 @@ limit."
   admission, or halt; governed settlements and reservation lifecycle changes
   still can.
 - Positive: no persisted peak state; the −4% floor has a closed-form proof
-  under the normative premises of §1 and §2.
+  under the normative premises of §§1–3.
 - Accepted consequence inherited from ADR-0043: MonthlyHalt can still
   trigger while `governed_realized_net ≥ 0` when `latent_risk` alone
   exhausts the budget. In particular, an admission that exactly reserves the
@@ -311,6 +314,14 @@ only as a separately labelled informational metric.
 For budget decisions, this ADR supersedes ADR-0024's gross-loss,
 wins-do-not-offset formula and its "four errors" framing. It preserves and
 refines ADR-0024's month-boundary rule as specified in §3.
+
+For the monthly budget basis, this ADR also supersedes ADR-0024 §6A,
+ADR-0038, and ADR-0045 only to the extent that they permit a confirmed
+transfer or other recalibration to increase that basis intra-month. Confirmed
+transfers may update margin and sizing capital, and adverse changes may
+conservatively reduce the effective budget basis, but no intra-month event
+may expand the current monthly budget. Their typed-evidence, audit-event,
+drift, and fail-closed requirements remain in force.
 
 ADR-0043 remains authoritative for actual-planned-risk admission, the
 full-cap guaranteed-minimum meaning of slots, the ability to admit a smaller
@@ -337,6 +348,16 @@ closed. Exit and protective-stop management continue.
   wanted.
 - **Keep ADR-0046 HWM** — rejected by operator: the budget must not protect
   peaks.
+
+### Decision matrix
+
+| Option | Budget anchor | Unrealized P&L affects budget? | Treatment of gains | Principal trade-off | Decision |
+| --- | --- | --- | --- | --- | --- |
+| Net-from-start, non-expanding | Settlement-complete governed realized net plus latent risk | No | Offsets prior realized losses down to zero; never expands capacity above 4% | Realized profit may later be given back before the −4% floor binds | Accepted |
+| Equity-net-from-start | Governed realized plus unrealized equity net | Yes | Paper profit can free capacity | An unrealized winner can mask realized loss and breach the month-start floor | Rejected |
+| Realized-only HWM | Peak of settlement-complete realized net | No | Every realized peak re-arms and protects capacity | Late fees or costs recreate peak give-back behavior rejected by the operator | Rejected |
+| Partial profit-lock | Net-from-start with a configurable retained-profit fraction | No | Partially protects realized gains | Adds an unapproved policy parameter and explanation burden | Rejected for now |
+| ADR-0046 equity HWM | Governed equity peak | Yes | Every equity peak re-arms and protects capacity | Protects intra-trade peaks instead of only the month-start loss floor | Rejected |
 
 ## Implementation Notes
 
