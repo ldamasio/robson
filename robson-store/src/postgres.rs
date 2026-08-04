@@ -102,6 +102,10 @@ struct PositionCurrentRow {
     invalidation_guard_level: Option<Decimal>,
     stop_policy: Option<String>,
     stop_buffer_bps_at_arm: Option<Decimal>,
+    initial_executable_stop: Option<Decimal>,
+    executable_span: Option<Decimal>,
+    cap_basis_distance: Option<Decimal>,
+    tick_size_at_admission: Option<Decimal>,
     created_at: chrono::DateTime<chrono::Utc>,
     updated_at: chrono::DateTime<chrono::Utc>,
     closed_at: Option<chrono::DateTime<chrono::Utc>>,
@@ -145,6 +149,10 @@ fn parse_position_row(row: &sqlx::postgres::PgRow) -> Result<PositionCurrentRow,
         invalidation_guard_level: try_get_decimal("invalidation_guard_level"),
         stop_policy: row.try_get::<Option<String>, _>("stop_policy").ok().flatten(),
         stop_buffer_bps_at_arm: try_get_decimal("stop_buffer_bps_at_arm"),
+        initial_executable_stop: try_get_decimal("initial_executable_stop"),
+        executable_span: try_get_decimal("executable_span"),
+        cap_basis_distance: try_get_decimal("cap_basis_distance"),
+        tick_size_at_admission: try_get_decimal("tick_size_at_admission"),
         created_at: row.try_get("created_at")?,
         updated_at: row.try_get("updated_at")?,
         closed_at: row.try_get("closed_at").ok(),
@@ -204,6 +212,13 @@ fn row_to_position(row_data: PositionCurrentRow) -> Result<Option<Position>, Sto
     position.id = row_data.position_id;
     position.entry_order_id = row_data.entry_order_id;
     position.exit_order_id = row_data.exit_order_id;
+    position.initial_executable_stop =
+        row_data.initial_executable_stop.map(Price::new).transpose().map_err(|e| {
+            StoreError::Deserialization(format!("Invalid initial executable stop: {e}"))
+        })?;
+    position.executable_span = row_data.executable_span;
+    position.cap_basis_distance = row_data.cap_basis_distance;
+    position.tick_size_at_admission = row_data.tick_size_at_admission;
 
     if let Some(entry_price) = row_data.entry_price {
         position.entry_price = Some(Price::new(entry_price).map_err(|e| {
@@ -235,16 +250,33 @@ fn row_to_position(row_data: PositionCurrentRow) -> Result<Option<Position>, Sto
         position.fees_paid = total_fees;
     }
 
-    if let (Some(_distance), Some(stop_price)) =
+    if let (Some(distance), Some(stop_price)) =
         (row_data.technical_stop_distance, row_data.technical_stop_price)
     {
-        let entry = position.entry_price.ok_or_else(|| {
-            StoreError::Deserialization("Missing entry_price for technical stop".to_string())
-        })?;
-
         let stop = Price::new(stop_price).map_err(|e| {
             StoreError::Deserialization(format!("Invalid technical_stop_price: {}", e))
         })?;
+        let entry = match stop_policy {
+            // ADR-0052 anchors the ladder to the signal reference E. The
+            // projection's entry_price is overwritten by the exchange fill,
+            // so reconstruct E from the persisted chart stop + distance.
+            // Preserve the historical fill-anchored reconstruction for
+            // legacy rows byte-for-byte.
+            StopPolicy::ExecutableSpan => {
+                let signal_entry = match side {
+                    Side::Long => stop_price + distance,
+                    Side::Short => stop_price - distance,
+                };
+                Price::new(signal_entry).map_err(|e| {
+                    StoreError::Deserialization(format!(
+                        "Invalid executable-span entry reference {signal_entry}: {e}"
+                    ))
+                })?
+            },
+            StopPolicy::LegacyUncapped => position.entry_price.ok_or_else(|| {
+                StoreError::Deserialization("Missing entry_price for technical stop".to_string())
+            })?,
+        };
 
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
         position.tech_stop_distance = Some(tech_stop);
@@ -477,6 +509,10 @@ pub async fn find_active_from_projection(
             invalidation_guard_level,
             stop_policy,
             stop_buffer_bps_at_arm,
+            initial_executable_stop,
+            executable_span,
+            cap_basis_distance,
+            tick_size_at_admission,
             created_at,
             updated_at,
             closed_at,
@@ -593,6 +629,10 @@ pub async fn find_positions_overlapping_month(
             invalidation_guard_level,
             stop_policy,
             stop_buffer_bps_at_arm,
+            initial_executable_stop,
+            executable_span,
+            cap_basis_distance,
+            tick_size_at_admission,
             created_at,
             updated_at,
             closed_at

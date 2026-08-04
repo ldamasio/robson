@@ -11,12 +11,12 @@
 //! - `LegacyUncapped` reproduces the historical path bit for bit: uncapped
 //!   ADR-0041 buffer over the guard-aware basis, no domain-side tick
 //!   quantization (the exchange adapter aligns at placement).
-//! - `SpanCappedV1` (ADR-0050 §3/§4): the buffer is capped at 0.25 x the
-//!   normative span, and the trigger is tick-quantized adversely from
-//!   [`SymbolTradingRules`]. The normative span is `abs(entry_reference -
-//!   guard_clamped_basis)` while the guard binds and the original technical
-//!   span after the guard is released. A degenerate span (missing, zero, or
-//!   negative) is a hard error: fail closed, never fall back to uncapped.
+//! - `ExecutableSpan` (ADR-0052): the buffer is capped at 0.25 x the cap-basis
+//!   distance and the trigger is tick-quantized adversely from
+//!   [`SymbolTradingRules`]. Admission derives the immutable executable span
+//!   from that trigger; every later resolution must consume the persisted span
+//!   and admission cap basis. Missing or non-positive persisted values are hard
+//!   errors: fail closed, never fall back to uncapped.
 
 use rust_decimal::Decimal;
 
@@ -26,9 +26,28 @@ use crate::{
     value_objects::{DomainError, Price, RiskConfig, Side, StopDistanceBounds},
 };
 
-/// Span cap ratio for `SpanCappedV1`: effective buffer <= 0.25 x span
-/// (ADR-0050 §4).
+/// Buffer cap ratio for `ExecutableSpan`: effective buffer <= 0.25 x the
+/// cap-basis distance (ADR-0052 Decision 1).
 pub const SPAN_CAP_RATIO: Decimal = Decimal::from_parts(25, 0, 0, false, 2);
+
+/// Source of the immutable executable-span persistence contract.
+///
+/// Admission is the only point allowed to derive `S`. Every live/replay
+/// resolution carries the persisted values explicitly, including `None`, so
+/// corrupt state cannot be mistaken for a fresh admission and re-derived from
+/// current exchange metadata.
+#[derive(Debug, Clone, Copy)]
+pub enum ExecutableSpanSource {
+    /// Resolve the admission plan and derive `S = |entry_reference - trigger|`.
+    Admission,
+    /// Resolve a risk-bearing position from its durable admission values.
+    Persisted {
+        /// Immutable buffer-inclusive span recorded at admission.
+        executable_span: Option<Decimal>,
+        /// Admission-time distance used to cap the initial buffer.
+        cap_basis_distance: Option<Decimal>,
+    },
+}
 
 /// Inputs to [`build_executable_stop_plan`].
 #[derive(Debug, Clone, Copy)]
@@ -41,15 +60,17 @@ pub struct StopPlanInputs<'a> {
     pub technical_stop: Price,
     /// Entry-time invalidation guard level while active (ADR-0042).
     pub guard: Option<Price>,
-    /// Entry reference price; required by `SpanCappedV1` while the guard
-    /// binds (the normative span is measured against it).
+    /// Signal entry reference price; required by `ExecutableSpan` admission.
     pub entry_reference: Option<Price>,
     /// Original technical span (`TechnicalStopDistance::span()`).
     pub technical_span: Option<Decimal>,
     /// ADR-0041 buffer in basis points (position snapshot at arm, or the
     /// live config for legacy positions without a snapshot).
     pub stop_buffer_bps: Decimal,
-    /// Runtime symbol trading rules; required by `SpanCappedV1`.
+    /// Whether the executable span is being derived at admission or consumed
+    /// from durable position state.
+    pub executable_span_source: ExecutableSpanSource,
+    /// Runtime symbol trading rules; required by `ExecutableSpan`.
     pub rules: Option<&'a SymbolTradingRules>,
 }
 
@@ -65,13 +86,19 @@ pub struct ExecutableStopPlan {
     pub basis: Price,
     /// True when the guard clamped the basis away from the technical stop.
     pub guard_bound: bool,
-    /// Normative span the buffer cap was measured against (`None` under
+    /// Distance the buffer cap was measured against (`None` under
     /// `LegacyUncapped`, which has no cap).
-    pub cap_span: Option<Decimal>,
+    pub cap_basis_distance: Option<Decimal>,
+    /// Immutable buffer-inclusive unit of risk, including adverse tick
+    /// quantization. Derived only at admission and consumed from persistence
+    /// thereafter (`None` under `LegacyUncapped`).
+    pub executable_span: Option<Decimal>,
+    /// Tick size used for this resolution (`None` under `LegacyUncapped`).
+    pub tick_size: Option<Decimal>,
     /// Effective buffer in price units after the span cap.
     pub effective_buffer: Decimal,
     /// THE executable trigger: the one price every surface uses. Tick
-    /// quantized under `SpanCappedV1`; raw under `LegacyUncapped`.
+    /// quantized under `ExecutableSpan`; raw under `LegacyUncapped`.
     pub trigger: Price,
 }
 
@@ -137,11 +164,10 @@ impl ExecutableStopPlan {
 /// Build the executable stop plan: the single derivation every consumer uses.
 ///
 /// # Errors
-/// - [`DomainError::DegenerateStopSpan`] when `SpanCappedV1` has no positive
-///   normative span (fail closed: a v1 entry with a degenerate span is the
-///   exact 2x-loss case ADR-0050 exists to kill).
-/// - [`DomainError::TradingRulesUnavailable`] when `SpanCappedV1` has no symbol
-///   trading rules to quantize with.
+/// - [`DomainError::DegenerateStopSpan`] when `ExecutableSpan` has no positive
+///   cap-basis distance or executable span.
+/// - [`DomainError::TradingRulesUnavailable`] when `ExecutableSpan` has no
+///   symbol trading rules to quantize with.
 /// - [`DomainError::InvalidPrice`] when a derived price is non-positive.
 pub fn build_executable_stop_plan(
     inputs: StopPlanInputs<'_>,
@@ -154,6 +180,7 @@ pub fn build_executable_stop_plan(
         entry_reference,
         technical_span,
         stop_buffer_bps,
+        executable_span_source,
         rules,
     } = inputs;
 
@@ -185,39 +212,64 @@ pub fn build_executable_stop_plan(
                 side,
                 basis,
                 guard_bound,
-                cap_span: None,
+                cap_basis_distance: None,
+                executable_span: None,
+                tick_size: None,
                 effective_buffer,
                 trigger,
             })
         },
-        StopPolicy::SpanCappedV1 => {
-            // Normative span (ADR-0050 §4, per the issue #154 spec): while
-            // the guard binds, the distance actually protected is
-            // entry_reference -> clamped basis; after release, the original
-            // technical span.
-            let span = if guard_bound {
-                let entry = entry_reference.ok_or_else(|| {
-                    DomainError::DegenerateStopSpan(
-                        "SpanCappedV1 with a binding guard requires an entry reference".to_string(),
-                    )
-                })?;
-                (entry.as_decimal() - basis.as_decimal()).abs()
+        StopPolicy::ExecutableSpan => {
+            let persisted_cap_basis = match executable_span_source {
+                ExecutableSpanSource::Admission => None,
+                ExecutableSpanSource::Persisted { cap_basis_distance, .. } => {
+                    let distance = cap_basis_distance.ok_or_else(|| {
+                        DomainError::DegenerateStopSpan(
+                            "ExecutableSpan requires persisted cap_basis_distance".to_string(),
+                        )
+                    })?;
+                    if distance <= Decimal::ZERO {
+                        return Err(DomainError::DegenerateStopSpan(format!(
+                            "ExecutableSpan cap_basis_distance must be positive: {distance}"
+                        )));
+                    }
+                    Some(distance)
+                },
+            };
+
+            // While the guard binds, recovery consumes the admission-time cap
+            // basis verbatim. Admission derives it from E -> A0. After guard
+            // release the original TechnicalStopDistance span is authoritative.
+            let cap_basis_distance = if guard_bound {
+                match persisted_cap_basis {
+                    Some(distance) => distance,
+                    None => {
+                        let entry = entry_reference.ok_or_else(|| {
+                            DomainError::DegenerateStopSpan(
+                                "ExecutableSpan admission with a binding guard requires an entry reference"
+                                    .to_string(),
+                            )
+                        })?;
+                        (entry.as_decimal() - basis.as_decimal()).abs()
+                    },
+                }
             } else {
                 technical_span.ok_or_else(|| {
                     DomainError::DegenerateStopSpan(
-                        "SpanCappedV1 requires the technical span".to_string(),
+                        "ExecutableSpan requires the original technical span".to_string(),
                     )
                 })?
             };
-            if span <= Decimal::ZERO {
+            if cap_basis_distance <= Decimal::ZERO {
                 return Err(DomainError::DegenerateStopSpan(format!(
-                    "SpanCappedV1 span must be positive: {span}"
+                    "ExecutableSpan cap_basis_distance must be positive: {cap_basis_distance}"
                 )));
             }
 
             let rules = rules.ok_or_else(|| {
                 DomainError::TradingRulesUnavailable(
-                    "SpanCappedV1 requires symbol trading rules for tick quantization".to_string(),
+                    "ExecutableSpan requires symbol trading rules for tick quantization"
+                        .to_string(),
                 )
             })?;
 
@@ -225,7 +277,7 @@ pub fn build_executable_stop_plan(
                 Decimal::ZERO
             } else {
                 let offset = basis.as_decimal() * stop_buffer_bps / Decimal::from(10_000);
-                offset.min(span * SPAN_CAP_RATIO)
+                offset.min(cap_basis_distance * SPAN_CAP_RATIO)
             };
             let raw = match side {
                 Side::Long => basis.as_decimal() - effective_buffer,
@@ -235,12 +287,35 @@ pub fn build_executable_stop_plan(
             // Quantize adversely: a Long is protected by a Sell stop (round
             // down), a Short by a Buy stop (round up).
             let trigger = rules.quantize_stop_trigger(side.exit_action(), raw)?;
+            let executable_span = match executable_span_source {
+                ExecutableSpanSource::Admission => {
+                    let entry = entry_reference.ok_or_else(|| {
+                        DomainError::DegenerateStopSpan(
+                            "ExecutableSpan admission requires an entry reference".to_string(),
+                        )
+                    })?;
+                    (entry.as_decimal() - trigger.as_decimal()).abs()
+                },
+                ExecutableSpanSource::Persisted { executable_span, .. } => executable_span
+                    .ok_or_else(|| {
+                        DomainError::DegenerateStopSpan(
+                            "ExecutableSpan requires persisted executable_span".to_string(),
+                        )
+                    })?,
+            };
+            if executable_span <= Decimal::ZERO {
+                return Err(DomainError::DegenerateStopSpan(format!(
+                    "ExecutableSpan executable_span must be positive: {executable_span}"
+                )));
+            }
             Ok(ExecutableStopPlan {
                 policy,
                 side,
                 basis,
                 guard_bound,
-                cap_span: Some(span),
+                cap_basis_distance: Some(cap_basis_distance),
+                executable_span: Some(executable_span),
+                tick_size: Some(rules.tick_size()),
                 effective_buffer,
                 trigger,
             })
@@ -252,7 +327,7 @@ pub fn build_executable_stop_plan(
 /// (issue #154 deliverable 4, normative formula):
 ///
 /// ```text
-/// trigger       = plan.trigger (tick-quantized under v1)
+/// trigger       = plan.trigger (tick-quantized under ExecutableSpan)
 /// gap           = trigger x gap_bps / 10_000
 /// adverse_fill  = Long: trigger - gap | Short: trigger + gap
 /// loss_per_unit = directional_distance(entry, adverse_fill)
@@ -315,7 +390,7 @@ mod tests {
         .unwrap()
     }
 
-    fn v1_inputs(
+    fn executable_inputs(
         side: Side,
         technical_stop: Decimal,
         span: Decimal,
@@ -323,13 +398,20 @@ mod tests {
         rules: &SymbolTradingRules,
     ) -> StopPlanInputs<'_> {
         StopPlanInputs {
-            policy: StopPolicy::SpanCappedV1,
+            policy: StopPolicy::ExecutableSpan,
             side,
             technical_stop: Price::new(technical_stop).unwrap(),
             guard: None,
-            entry_reference: None,
+            entry_reference: Some(
+                Price::new(match side {
+                    Side::Long => technical_stop + span,
+                    Side::Short => technical_stop - span,
+                })
+                .unwrap(),
+            ),
             technical_span: Some(span),
             stop_buffer_bps: bps,
+            executable_span_source: ExecutableSpanSource::Admission,
             rules: Some(rules),
         }
     }
@@ -352,6 +434,7 @@ mod tests {
                 entry_reference: None,
                 technical_span: Some(dec!(300)),
                 stop_buffer_bps: dec!(10),
+                executable_span_source: ExecutableSpanSource::Admission,
                 rules: None,
             })
             .unwrap();
@@ -362,7 +445,8 @@ mod tests {
                 guard,
             );
             assert_eq!(plan.trigger, legacy, "legacy plan must match the historical helper");
-            assert_eq!(plan.cap_span, None);
+            assert_eq!(plan.cap_basis_distance, None);
+            assert_eq!(plan.executable_span, None);
         }
     }
 
@@ -377,6 +461,7 @@ mod tests {
             entry_reference: None,
             technical_span: None,
             stop_buffer_bps: Decimal::ZERO,
+            executable_span_source: ExecutableSpanSource::Admission,
             rules: None,
         })
         .unwrap();
@@ -385,12 +470,12 @@ mod tests {
     }
 
     #[test]
-    fn v1_caps_buffer_at_quarter_span_and_quantizes_adversely() {
+    fn executable_span_caps_buffer_at_quarter_basis_and_quantizes_adversely() {
         let rules = rules();
         // Long, stop 62873.90 (tick-aligned), span 4 (tight), buffer 10 bps.
         // Uncapped offset = 62.8739; cap = 0.25 x 4 = 1.0 binds.
         // Raw = 62872.90 -> already aligned.
-        let plan = build_executable_stop_plan(v1_inputs(
+        let plan = build_executable_stop_plan(executable_inputs(
             Side::Long,
             dec!(62873.90),
             dec!(4),
@@ -404,7 +489,7 @@ mod tests {
 
         // Wide span: cap does not bind; raw = 62873.90 - 62.8739 = 62811.0261
         // -> Sell stop rounds DOWN to 62811.00 (grid-aligned from 556.80).
-        let plan = build_executable_stop_plan(v1_inputs(
+        let plan = build_executable_stop_plan(executable_inputs(
             Side::Long,
             dec!(62873.90),
             dec!(1000),
@@ -416,7 +501,7 @@ mod tests {
 
         // Short mirror: raw = 62873.90 + 62.8739 = 62936.7739 -> Buy stop
         // rounds UP to 62936.80.
-        let plan = build_executable_stop_plan(v1_inputs(
+        let plan = build_executable_stop_plan(executable_inputs(
             Side::Short,
             dec!(62873.90),
             dec!(1000),
@@ -428,9 +513,9 @@ mod tests {
     }
 
     #[test]
-    fn v1_zero_buffer_quantizes_only() {
+    fn executable_span_zero_buffer_quantizes_only() {
         let rules = rules();
-        let plan = build_executable_stop_plan(v1_inputs(
+        let plan = build_executable_stop_plan(executable_inputs(
             Side::Long,
             dec!(62873.90),
             dec!(100),
@@ -443,7 +528,7 @@ mod tests {
 
         // Unaligned technical stop with zero buffer still quantizes
         // adversely: protection must not depend on exchange leniency.
-        let plan = build_executable_stop_plan(v1_inputs(
+        let plan = build_executable_stop_plan(executable_inputs(
             Side::Long,
             dec!(62873.87),
             dec!(100),
@@ -455,42 +540,121 @@ mod tests {
     }
 
     #[test]
-    fn v1_guard_bound_uses_entry_reference_span() {
+    fn executable_span_buffer_cap_boundary_is_exactly_quarter_basis() {
+        let rules = rules();
+        // Configured offset = 1000 x 250 / 10_000 = 25, exactly equal to
+        // 0.25 x cap_basis_distance (100). Equality must not widen or shrink.
+        let plan = build_executable_stop_plan(executable_inputs(
+            Side::Long,
+            dec!(1000),
+            dec!(100),
+            dec!(250),
+            &rules,
+        ))
+        .unwrap();
+        assert_eq!(plan.cap_basis_distance, Some(dec!(100)));
+        assert_eq!(plan.effective_buffer, dec!(25));
+        assert_eq!(plan.trigger.as_decimal(), dec!(975));
+        assert_eq!(plan.executable_span, Some(dec!(125)));
+    }
+
+    #[test]
+    fn persisted_executable_span_is_consumed_not_rederived() {
+        let rules = rules();
+        let plan = build_executable_stop_plan(StopPlanInputs {
+            policy: StopPolicy::ExecutableSpan,
+            side: Side::Long,
+            technical_stop: Price::new(dec!(1100)).unwrap(),
+            guard: None,
+            entry_reference: Some(Price::new(dec!(1100)).unwrap()),
+            technical_span: Some(dec!(100)),
+            stop_buffer_bps: dec!(10),
+            executable_span_source: ExecutableSpanSource::Persisted {
+                executable_span: Some(dec!(125)),
+                cap_basis_distance: Some(dec!(100)),
+            },
+            rules: Some(&rules),
+        })
+        .unwrap();
+
+        assert_eq!(plan.trigger.as_decimal(), dec!(1098.90));
+        assert_eq!(plan.executable_span, Some(dec!(125)));
+        assert_ne!(
+            plan.executable_span,
+            Some((dec!(1100) - plan.trigger.as_decimal()).abs()),
+            "live resolution must never redefine S from the current candidate"
+        );
+    }
+
+    #[test]
+    fn persisted_executable_span_contract_fails_closed() {
+        let rules = rules();
+        for (span, basis) in [
+            (None, Some(dec!(100))),
+            (Some(Decimal::ZERO), Some(dec!(100))),
+            (Some(dec!(-1)), Some(dec!(100))),
+            (Some(dec!(125)), None),
+            (Some(dec!(125)), Some(Decimal::ZERO)),
+            (Some(dec!(125)), Some(dec!(-1))),
+        ] {
+            let result = build_executable_stop_plan(StopPlanInputs {
+                policy: StopPolicy::ExecutableSpan,
+                side: Side::Long,
+                technical_stop: Price::new(dec!(1000)).unwrap(),
+                guard: None,
+                entry_reference: Some(Price::new(dec!(1100)).unwrap()),
+                technical_span: Some(dec!(100)),
+                stop_buffer_bps: dec!(10),
+                executable_span_source: ExecutableSpanSource::Persisted {
+                    executable_span: span,
+                    cap_basis_distance: basis,
+                },
+                rules: Some(&rules),
+            });
+            assert!(matches!(result, Err(DomainError::DegenerateStopSpan(_))));
+        }
+    }
+
+    #[test]
+    fn executable_span_guard_bound_uses_entry_reference_basis() {
         let rules = rules();
         // Short: technical 62214.70, guard 62386.70 binds, entry 61909.10.
         // Normative span = 62386.70 - 61909.10 = 477.60.
         let plan = build_executable_stop_plan(StopPlanInputs {
-            policy: StopPolicy::SpanCappedV1,
+            policy: StopPolicy::ExecutableSpan,
             side: Side::Short,
             technical_stop: Price::new(dec!(62214.70)).unwrap(),
             guard: Some(Price::new(dec!(62386.70)).unwrap()),
             entry_reference: Some(Price::new(dec!(61909.10)).unwrap()),
             technical_span: Some(dec!(305.60)),
             stop_buffer_bps: dec!(10),
+            executable_span_source: ExecutableSpanSource::Admission,
             rules: Some(&rules),
         })
         .unwrap();
         assert!(plan.guard_bound);
-        assert_eq!(plan.cap_span, Some(dec!(477.60)));
+        assert_eq!(plan.cap_basis_distance, Some(dec!(477.60)));
         // Offset = 62386.70 x 0.001 = 62.3867 < 0.25 x 477.60 = 119.40:
         // cap does not bind. Raw = 62449.0867 -> Buy stop rounds UP to the
         // grid: 62449.10.
         assert_eq!(plan.effective_buffer, dec!(62.38670));
         assert_eq!(plan.trigger.as_decimal(), dec!(62449.10));
+        assert_eq!(plan.executable_span, Some(dec!(540.00)));
     }
 
     #[test]
-    fn v1_degenerate_span_fails_closed() {
+    fn executable_span_degenerate_basis_fails_closed() {
         let rules = rules();
         for span in [Some(Decimal::ZERO), Some(dec!(-1)), None] {
             let result = build_executable_stop_plan(StopPlanInputs {
-                policy: StopPolicy::SpanCappedV1,
+                policy: StopPolicy::ExecutableSpan,
                 side: Side::Long,
                 technical_stop: Price::new(dec!(100)).unwrap(),
                 guard: None,
-                entry_reference: None,
+                entry_reference: Some(Price::new(dec!(101)).unwrap()),
                 technical_span: span,
                 stop_buffer_bps: dec!(10),
+                executable_span_source: ExecutableSpanSource::Admission,
                 rules: Some(&rules),
             });
             assert!(
@@ -501,15 +665,16 @@ mod tests {
     }
 
     #[test]
-    fn v1_without_rules_fails_closed() {
+    fn executable_span_without_rules_fails_closed() {
         let result = build_executable_stop_plan(StopPlanInputs {
-            policy: StopPolicy::SpanCappedV1,
+            policy: StopPolicy::ExecutableSpan,
             side: Side::Long,
             technical_stop: Price::new(dec!(100)).unwrap(),
             guard: None,
-            entry_reference: None,
+            entry_reference: Some(Price::new(dec!(101)).unwrap()),
             technical_span: Some(dec!(1)),
             stop_buffer_bps: dec!(10),
+            executable_span_source: ExecutableSpanSource::Admission,
             rules: None,
         });
         assert!(matches!(result, Err(DomainError::TradingRulesUnavailable(_))));
@@ -518,7 +683,7 @@ mod tests {
     #[test]
     fn adverse_fill_bound_per_side() {
         let rules = rules();
-        let plan = build_executable_stop_plan(v1_inputs(
+        let plan = build_executable_stop_plan(executable_inputs(
             Side::Long,
             dec!(62873.90),
             dec!(1000),
@@ -532,7 +697,7 @@ mod tests {
             dec!(62873.90) - dec!(62.87390)
         );
 
-        let plan = build_executable_stop_plan(v1_inputs(
+        let plan = build_executable_stop_plan(executable_inputs(
             Side::Short,
             dec!(62873.90),
             dec!(1000),
@@ -551,7 +716,7 @@ mod tests {
         let rules = rules();
         let config = RiskConfig::new(dec!(10000)).unwrap();
         // Short: entry 62000, trigger 62873.90 (zero buffer), gap 10 bps.
-        let plan = build_executable_stop_plan(v1_inputs(
+        let plan = build_executable_stop_plan(executable_inputs(
             Side::Short,
             dec!(62873.90),
             dec!(1000),
@@ -576,7 +741,7 @@ mod tests {
         let bounds = StopDistanceBounds::default();
         // Long entry 65000, technical stop 58600 (9.8%, inside max 10%);
         // buffer 100 bps on a wide span pushes the trigger past 10%.
-        let plan = build_executable_stop_plan(v1_inputs(
+        let plan = build_executable_stop_plan(executable_inputs(
             Side::Long,
             dec!(58600.00),
             dec!(6400),
@@ -589,7 +754,7 @@ mod tests {
         assert!(matches!(err, DomainError::ExecutableStopOutOfBounds(_)), "got {err:?}");
 
         // A modest buffer keeps the trigger inside the band.
-        let plan = build_executable_stop_plan(v1_inputs(
+        let plan = build_executable_stop_plan(executable_inputs(
             Side::Long,
             dec!(58600.00),
             dec!(6400),

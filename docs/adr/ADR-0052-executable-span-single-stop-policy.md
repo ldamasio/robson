@@ -1,9 +1,11 @@
 # ADR-0052 — Executable Span: One Stop Policy, Buffer-Inclusive Unit of Risk
 
 **Date**: 2026-08-04
-**Status**: DECIDED — FOLLOW-UP REQUIRED (operator decision, 2026-08-04;
-revised same day after adversarial secondary-model review; implementation
-pending)
+**Status**: DECIDED — IMPLEMENTED (repository; operational rollout pending)
+**Implementation status** (2026-08-04):
+`feat/adr-0052-executable-span-impl` implements the single-policy domain,
+admission persistence and projection, immutable-span replay/recovery,
+entry-anchored engine and frontend behavior, migration, and regression tests.
 **Deciders**: RBX Systems (operator + architecture)
 **Partially supersedes**: [ADR-0050](ADR-0050-technical-stop-valid-level-selection.md)
 only for the runtime selector (`ROBSON_STOP_POLICY`) and the

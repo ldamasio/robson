@@ -420,7 +420,7 @@ async fn test_signal_on_armed_position_is_accepted() {
 }
 
 #[tokio::test]
-async fn test_signal_rejects_quantity_below_exchange_minimum() {
+async fn test_signal_governs_quantity_below_exchange_minimum() {
     let (base, _) = start_test_server_with_capital(dec!(100)).await;
     let arm = arm_btcusdt(&base).await;
 
@@ -435,10 +435,20 @@ async fn test_signal_rejects_quantity_below_exchange_minimum() {
         .await
         .unwrap();
 
-    assert_eq!(resp.status(), 400);
-    let body: api::ErrorResponse = resp.json().await.unwrap();
-    assert!(body.error.contains("step size 0.001"), "error: {}", body.error);
-    assert!(body.error.contains("minimum quantity 0.001"), "error: {}", body.error);
+    // ExecutableSpan validates lot metadata in the domain admission plan.
+    // The signal endpoint therefore accepts the request while the governed
+    // rejection re-arms the position without submitting an exchange order.
+    assert_eq!(resp.status(), 200);
+
+    let position: api::PositionSummary = client()
+        .get(format!("{}/positions/{}", base, arm.position_id))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert_eq!(position.state, "Armed");
 }
 
 #[tokio::test]

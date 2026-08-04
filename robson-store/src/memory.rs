@@ -99,8 +99,8 @@ impl MemoryStore {
                 }
                 // Replay carries the arm-time stop policy verbatim (issue
                 // #154): legacy events (missing field) rebuild as
-                // LegacyUncapped, v1 events as SpanCappedV1 — never promoted
-                // or demoted by a restart.
+                // LegacyUncapped and executable-span events verbatim — never
+                // promoted or demoted by a restart.
                 let mut position = Position::new_with_stop_policy(
                     *account_id,
                     symbol.clone(),
@@ -120,13 +120,39 @@ impl MemoryStore {
                 position_id,
                 entry_price,
                 stop_loss,
+                initial_executable_stop,
+                executable_span,
+                cap_basis_distance,
+                tick_size,
                 timestamp,
                 ..
             } => {
                 let mut positions = self.positions.write().unwrap();
                 if let Some(mut position) = positions.get(position_id).cloned() {
-                    position.tech_stop_distance =
-                        Some(TechnicalStopDistance::from_entry_and_stop(*entry_price, *stop_loss));
+                    let has_admission_evidence = position.initial_executable_stop.is_some()
+                        || position.executable_span.is_some()
+                        || position.cap_basis_distance.is_some()
+                        || position.tick_size_at_admission.is_some();
+                    if !has_admission_evidence {
+                        position.tech_stop_distance = Some(
+                            TechnicalStopDistance::from_entry_and_stop(*entry_price, *stop_loss),
+                        );
+                    }
+                    // ADR-0052 admission evidence is immutable. Replay is
+                    // first-write-wins so a later/corrupt signal event cannot
+                    // redefine the position's ruler or original trigger.
+                    if position.initial_executable_stop.is_none() {
+                        position.initial_executable_stop = *initial_executable_stop;
+                    }
+                    if position.executable_span.is_none() {
+                        position.executable_span = *executable_span;
+                    }
+                    if position.cap_basis_distance.is_none() {
+                        position.cap_basis_distance = *cap_basis_distance;
+                    }
+                    if position.tick_size_at_admission.is_none() {
+                        position.tick_size_at_admission = *tick_size;
+                    }
                     position.updated_at = *timestamp;
                     positions.insert(*position_id, position);
                 }
@@ -663,7 +689,7 @@ impl Store for MemoryStore {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use robson_domain::{OrderSide, PositionState, Quantity, Side, Symbol};
+    use robson_domain::{OrderSide, PositionState, Price, Quantity, Side, Symbol};
     use rust_decimal_macros::dec;
 
     use super::*;
@@ -1045,6 +1071,10 @@ mod tests {
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(93500)).unwrap(),
             quantity: Quantity::new(dec!(0.1)).unwrap(),
+            initial_executable_stop: None,
+            executable_span: None,
+            cap_basis_distance: None,
+            tick_size: None,
             timestamp: Utc::now(),
         };
         EventRepository::append(&store, &signal_event).await.unwrap();
@@ -1102,6 +1132,10 @@ mod tests {
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(93500)).unwrap(),
             quantity: Quantity::new(dec!(0.1)).unwrap(),
+            initial_executable_stop: None,
+            executable_span: None,
+            cap_basis_distance: None,
+            tick_size: None,
             timestamp: Utc::now(),
         };
         EventRepository::append(&store, &signal_event).await.unwrap();
@@ -1159,6 +1193,10 @@ mod tests {
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(93500)).unwrap(),
             quantity: Quantity::new(dec!(0.1)).unwrap(),
+            initial_executable_stop: None,
+            executable_span: None,
+            cap_basis_distance: None,
+            tick_size: None,
             timestamp: Utc::now(),
         };
         EventRepository::append(&store, &signal_event).await.unwrap();
@@ -1262,6 +1300,10 @@ mod tests {
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(93500)).unwrap(),
             quantity: Quantity::new(dec!(0.1)).unwrap(),
+            initial_executable_stop: None,
+            executable_span: None,
+            cap_basis_distance: None,
+            tick_size: None,
             timestamp: Utc::now(),
         };
         EventRepository::append(&store, &signal_event).await.unwrap();
@@ -1289,10 +1331,11 @@ mod tests {
     }
 
     /// Issue #154: replay preserves the arm-time stop policy verbatim.
-    /// Legacy events (no field on the wire) rebuild as LegacyUncapped and v1
-    /// events as SpanCappedV1 — a restart never promotes or demotes.
+    /// Legacy events (no field on the wire) rebuild as LegacyUncapped and
+    /// executable-span events retain their stamp — a restart never promotes
+    /// or demotes.
     #[tokio::test]
-    async fn test_replay_preserves_stop_policy_legacy_vs_v1() {
+    async fn test_replay_preserves_stop_policy_provenance() {
         use robson_domain::StopPolicy;
 
         let store = MemoryStore::new();
@@ -1311,34 +1354,83 @@ mod tests {
         let legacy_event: Event = serde_json::from_value(legacy_json).unwrap();
         store.apply_event(&legacy_event).unwrap();
 
-        let v1_id = Uuid::now_v7();
-        let v1_event = Event::PositionArmed {
-            position_id: v1_id,
+        let executable_id = Uuid::now_v7();
+        let executable_event = Event::PositionArmed {
+            position_id: executable_id,
             account_id: Uuid::now_v7(),
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
             side: Side::Long,
             tech_stop_distance: None,
-            stop_policy: StopPolicy::SpanCappedV1,
+            stop_policy: StopPolicy::ExecutableSpan,
             stop_buffer_bps_at_arm: Some(dec!(10)),
             timestamp: Utc::now(),
         };
-        store.apply_event(&v1_event).unwrap();
+        store.apply_event(&executable_event).unwrap();
 
         let legacy = PositionRepository::find_by_id(&store, legacy_id).await.unwrap().unwrap();
         assert_eq!(legacy.stop_policy, StopPolicy::LegacyUncapped);
         assert_eq!(legacy.stop_buffer_bps_at_arm, None);
 
-        let v1 = PositionRepository::find_by_id(&store, v1_id).await.unwrap().unwrap();
-        assert_eq!(v1.stop_policy, StopPolicy::SpanCappedV1);
-        assert_eq!(v1.stop_buffer_bps_at_arm, Some(dec!(10)));
+        let executable =
+            PositionRepository::find_by_id(&store, executable_id).await.unwrap().unwrap();
+        assert_eq!(executable.stop_policy, StopPolicy::ExecutableSpan);
+        assert_eq!(executable.stop_buffer_bps_at_arm, Some(dec!(10)));
 
         // Replaying the same events again (a second restart) changes nothing.
         store.apply_event(&legacy_event).unwrap();
-        store.apply_event(&v1_event).unwrap();
+        store.apply_event(&executable_event).unwrap();
         let legacy = PositionRepository::find_by_id(&store, legacy_id).await.unwrap().unwrap();
         assert_eq!(legacy.stop_policy, StopPolicy::LegacyUncapped);
-        let v1 = PositionRepository::find_by_id(&store, v1_id).await.unwrap().unwrap();
-        assert_eq!(v1.stop_policy, StopPolicy::SpanCappedV1);
+        let executable =
+            PositionRepository::find_by_id(&store, executable_id).await.unwrap().unwrap();
+        assert_eq!(executable.stop_policy, StopPolicy::ExecutableSpan);
+    }
+
+    #[tokio::test]
+    async fn test_replay_keeps_first_executable_span_admission_evidence() {
+        let store = MemoryStore::new();
+        let position_id = Uuid::now_v7();
+        store
+            .apply_event(&Event::PositionArmed {
+                position_id,
+                account_id: Uuid::now_v7(),
+                symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+                side: Side::Long,
+                tech_stop_distance: None,
+                stop_policy: StopPolicy::ExecutableSpan,
+                stop_buffer_bps_at_arm: Some(dec!(10)),
+                timestamp: Utc::now(),
+            })
+            .unwrap();
+
+        for (entry, stop, trigger, span, basis, tick) in [
+            (dec!(62000), dec!(61000), dec!(60939), dec!(1061), dec!(1000), dec!(0.1)),
+            (dec!(63000), dec!(60000), dec!(59900), dec!(3100), dec!(3000), dec!(1)),
+        ] {
+            store
+                .apply_event(&Event::EntrySignalReceived {
+                    position_id,
+                    signal_id: Uuid::now_v7(),
+                    entry_price: Price::new(entry).unwrap(),
+                    stop_loss: Price::new(stop).unwrap(),
+                    quantity: Quantity::new(dec!(0.1)).unwrap(),
+                    initial_executable_stop: Some(Price::new(trigger).unwrap()),
+                    executable_span: Some(span),
+                    cap_basis_distance: Some(basis),
+                    tick_size: Some(tick),
+                    timestamp: Utc::now(),
+                })
+                .unwrap();
+        }
+
+        let position = PositionRepository::find_by_id(&store, position_id).await.unwrap().unwrap();
+        let technical = position.tech_stop_distance.expect("admission technical stop");
+        assert_eq!(technical.entry_price.as_decimal(), dec!(62000));
+        assert_eq!(technical.initial_stop.as_decimal(), dec!(61000));
+        assert_eq!(position.initial_executable_stop.unwrap().as_decimal(), dec!(60939));
+        assert_eq!(position.executable_span, Some(dec!(1061)));
+        assert_eq!(position.cap_basis_distance, Some(dec!(1000)));
+        assert_eq!(position.tick_size_at_admission, Some(dec!(0.1)));
     }
 
     // Store Tests

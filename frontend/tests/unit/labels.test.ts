@@ -6,7 +6,8 @@ import {
   eventTypeLabel,
   isPositionActive,
   positionLabel,
-  positionStateLabel
+  positionStateLabel,
+  trailingStopMoveTarget
 } from '$lib/presentation/labels';
 import type { Position, PositionState, SseEvent } from '$api/robson';
 
@@ -42,6 +43,83 @@ function makeEvent(payload: Record<string, unknown>): SseEvent {
     payload
   };
 }
+
+describe('trailingStopMoveTarget', () => {
+  it('uses the executable span and entry anchor before the first long advance', () => {
+    const target = trailingStopMoveTarget(
+      basePosition({
+        state: 'Active',
+        entry_price: 100,
+        entry_reference: 100,
+        executable_span: 12,
+        trailing_stop: 90,
+        tech_stop_distance: 10
+      })
+    );
+
+    expect(target).toEqual({ trigger_price: 112, next_stop: 100 });
+  });
+
+  it('uses completed executable spans after a long advance', () => {
+    const target = trailingStopMoveTarget(
+      basePosition({
+        state: 'Active',
+        entry_price: 100,
+        entry_reference: 100,
+        executable_span: 12,
+        trailing_stop: 100,
+        tech_stop_distance: 10
+      })
+    );
+
+    expect(target).toEqual({ trigger_price: 124, next_stop: 112 });
+  });
+
+  it('mirrors the entry-anchored formulas for shorts', () => {
+    const target = trailingStopMoveTarget(
+      basePosition({
+        state: 'Active',
+        side: 'Short',
+        entry_price: 100,
+        entry_reference: 100,
+        executable_span: 12,
+        trailing_stop: 110,
+        tech_stop_distance: 10
+      })
+    );
+
+    expect(target).toEqual({ trigger_price: 88, next_stop: 100 });
+  });
+
+  it('preserves the legacy raw-span calculation when S is absent', () => {
+    const target = trailingStopMoveTarget(
+      basePosition({
+        state: 'Active',
+        entry_price: 100,
+        executable_span: null,
+        trailing_stop: 90,
+        tech_stop_distance: 10
+      })
+    );
+
+    expect(target).toEqual({ trigger_price: 110, next_stop: 100 });
+  });
+
+  it('does not fall back to legacy geometry when executable-span evidence is incomplete', () => {
+    const target = trailingStopMoveTarget(
+      basePosition({
+        state: 'Active',
+        entry_price: 100,
+        entry_reference: null,
+        executable_span: 12,
+        trailing_stop: 90,
+        tech_stop_distance: 10
+      })
+    );
+
+    expect(target).toBeNull();
+  });
+});
 
 // --- positionSummaryLines ---
 

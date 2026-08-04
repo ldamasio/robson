@@ -24,6 +24,15 @@ use robson_projector::apply_event_to_projections;
 use rust_decimal::Decimal;
 use uuid::Uuid;
 
+type ExecutableSpanProjectionRow = (
+    Option<Decimal>,
+    Option<Decimal>,
+    Option<Decimal>,
+    Option<Decimal>,
+    Option<Decimal>,
+    Option<Decimal>,
+);
+
 /// Test helper: Create an event envelope from an event
 fn make_envelope(
     stream_key: &str,
@@ -56,6 +65,97 @@ fn make_envelope(
 // =============================================================================
 // SQLX-TEST: Integration tests require DATABASE_URL
 // =============================================================================
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn test_entry_signal_projects_executable_span_admission_payload(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let position_id = Uuid::new_v4();
+    let stream_key = format!("position:{position_id}");
+    let armed = make_envelope(
+        &stream_key,
+        "position_armed",
+        serde_json::json!({
+            "position_id": position_id,
+            "account_id": Uuid::new_v4(),
+            "symbol": {"base": "BTC", "quote": "USDT"},
+            "side": "Long",
+            "tech_stop_distance": null,
+            "stop_policy": "executable_span",
+            "stop_buffer_bps_at_arm": "10",
+            "timestamp": Utc::now(),
+        }),
+        1,
+    );
+    apply_event_to_projections(&pool, &armed).await.unwrap();
+
+    let admitted = make_envelope(
+        &stream_key,
+        "entry_signal_received",
+        serde_json::json!({
+            "position_id": position_id,
+            "signal_id": Uuid::new_v4(),
+            "entry_price": "62000",
+            "stop_loss": "61000",
+            "quantity": "0.1",
+            "initial_executable_stop": "60939",
+            "executable_span": "1061",
+            "cap_basis_distance": "1000",
+            "tick_size": "0.1",
+            "timestamp": Utc::now(),
+        }),
+        2,
+    );
+    apply_event_to_projections(&pool, &admitted).await.unwrap();
+
+    // Admission evidence is first-write-wins. A later corrupt/replayed
+    // signal must not redefine S, its cap basis, tick, or original trigger.
+    let conflicting = make_envelope(
+        &stream_key,
+        "entry_signal_received",
+        serde_json::json!({
+            "position_id": position_id,
+            "signal_id": Uuid::new_v4(),
+            "entry_price": "63000",
+            "stop_loss": "60000",
+            "quantity": "0.2",
+            "initial_executable_stop": "59900",
+            "executable_span": "3100",
+            "cap_basis_distance": "3000",
+            "tick_size": "1",
+            "timestamp": Utc::now(),
+        }),
+        3,
+    );
+    apply_event_to_projections(&pool, &conflicting).await.unwrap();
+
+    let projected: ExecutableSpanProjectionRow = sqlx::query_as(
+        r#"
+            SELECT initial_executable_stop, executable_span,
+                   cap_basis_distance, tick_size_at_admission,
+                   technical_stop_price, technical_stop_distance
+              FROM positions_current
+             WHERE position_id = $1
+            "#,
+    )
+    .bind(position_id)
+    .fetch_one(&pool)
+    .await?;
+    assert_eq!(
+        projected,
+        (
+            Some(Decimal::from(60939)),
+            Some(Decimal::from(1061)),
+            Some(Decimal::from(1000)),
+            Some(Decimal::new(1, 1)),
+            Some(Decimal::from(61000)),
+            Some(Decimal::from(1000)),
+        )
+    );
+
+    Ok(())
+}
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL (see file header for setup)"]

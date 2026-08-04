@@ -343,7 +343,7 @@ Priorities:
 | Risk gate | `robson-engine/src/risk.rs` | `RiskGate::evaluate()` — monthly check uses `<=` (blocks at exactly 4.00%) |
 | MonthlyHalt gate | `robsond/src/circuit_breaker.rs` | Binary `Active | MonthlyHalt` state machine |
 | MonthlyHalt trigger | `robsond/src/position_manager.rs` | `trigger_monthly_halt()` — closes all positions, blocks new entries |
-| Span definition | `robson-domain/src/value_objects.rs` | `TechnicalStopDistance::span()` — current implementation; ADR-0052 (pending) makes the persisted buffer-inclusive executable span the ladder/risk unit for new arms |
+| Span definition | `robson-domain/src/executable_stop.rs` | ADR-0052 is repository-implemented on `feat/adr-0052-executable-span-impl`: new `executable_span` arms persist buffer-inclusive `S` at admission and use it as the ladder/risk unit; `TechnicalStopDistance::span()` remains the raw-span input only for `legacy_uncapped` provenance replay and the post-guard-release buffer cap basis |
 
 ## Follow-up Required
 

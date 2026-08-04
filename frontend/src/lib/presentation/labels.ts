@@ -137,14 +137,57 @@ export function isRenderableLivePosition(position: { state: PositionState; excha
   return isPositionActive(position.state) && position.exchange_sync_state !== STALE_SYNC_STATE;
 }
 
-function trailingStopMoveTarget(p: Position): { trigger_price: number; next_stop: number } | null {
+export function trailingStopMoveTarget(p: Position): { trigger_price: number; next_stop: number } | null {
   const entry = p.entry_price;
   const stop = activeTrailingStop(p);
-  const span = p.tech_stop_distance;
-  if (entry == null || stop == null || span == null) return null;
-  if (!Number.isFinite(entry) || !Number.isFinite(stop) || !Number.isFinite(span) || span <= 0) {
+  if (entry == null || stop == null) return null;
+  if (!Number.isFinite(entry) || !Number.isFinite(stop)) {
     return null;
   }
+
+  const executableSpan = p.executable_span;
+  const entryReference = p.entry_reference;
+  if (executableSpan != null) {
+    // Presence of S identifies the ADR-0052 path. Incomplete/corrupt API
+    // evidence must not silently render a plausible legacy target.
+    if (
+      !Number.isFinite(executableSpan) ||
+      executableSpan <= 0 ||
+      entryReference == null ||
+      !Number.isFinite(entryReference)
+    ) {
+      return null;
+    }
+
+    // ADR-0052: derive the next favorable boundary and candidate technical
+    // stop from the immutable entry-anchored ruler. Before the first advance
+    // the raw technical stop can differ from E +/- S, so its adverse side of
+    // E is the explicit completed_spans = 0 case.
+    const completedSpans =
+      p.side === 'Short'
+        ? stop > entryReference
+          ? 0
+          : Math.floor((entryReference - stop) / executableSpan + 1e-9) + 1
+        : stop < entryReference
+          ? 0
+          : Math.floor((stop - entryReference) / executableSpan + 1e-9) + 1;
+    const nextCompletedSpans = completedSpans + 1;
+
+    if (p.side === 'Short') {
+      return {
+        trigger_price: entryReference - nextCompletedSpans * executableSpan,
+        next_stop: entryReference + executableSpan - nextCompletedSpans * executableSpan,
+      };
+    }
+
+    return {
+      trigger_price: entryReference + nextCompletedSpans * executableSpan,
+      next_stop: entryReference - executableSpan + nextCompletedSpans * executableSpan,
+    };
+  }
+
+  const span = p.tech_stop_distance;
+  if (span == null || !Number.isFinite(span) || span <= 0) return null;
 
   if (p.side === 'Short') {
     return {

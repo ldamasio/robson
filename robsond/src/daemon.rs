@@ -247,8 +247,7 @@ impl Daemon<StubExchange, MemoryStore> {
             .with_invalidation_guard(
                 config.engine.stop_invalidation_guard_enabled,
                 config.engine.stop_invalidation_lookback_candles,
-            )
-            .with_stop_policy(config.engine.stop_policy),
+            ),
         ));
 
         Self {
@@ -267,9 +266,27 @@ impl Daemon<StubExchange, MemoryStore> {
 
     /// Create a stub daemon with a specific capital for position sizing tests.
     pub fn new_stub_with_capital(config: Config, capital: Decimal) -> Self {
-        use robson_domain::RiskConfig;
+        use robson_domain::{RiskConfig, SymbolTradingRules};
 
         let exchange = Arc::new(StubExchange::with_balance(dec!(95000), capital));
+        // ExecutableSpan admission consumes exchange metadata before it can
+        // size an order. Keep the HTTP test daemon representative of a live
+        // adapter by installing explicit rules for its configured example
+        // symbol instead of relying on the retired metadata-free path.
+        exchange.set_trading_rules(
+            SymbolTradingRules::new(
+                Symbol::from_pair("BTCUSDT").expect("valid test symbol"),
+                dec!(0.01),
+                Decimal::ZERO,
+                dec!(0.001),
+                dec!(0.001),
+                dec!(1000000),
+                Decimal::ZERO,
+                2,
+                3,
+            )
+            .expect("valid stub trading rules"),
+        );
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
@@ -304,8 +321,7 @@ impl Daemon<StubExchange, MemoryStore> {
             .with_invalidation_guard(
                 config.engine.stop_invalidation_guard_enabled,
                 config.engine.stop_invalidation_lookback_candles,
-            )
-            .with_stop_policy(config.engine.stop_policy),
+            ),
         ));
 
         Self {
@@ -375,8 +391,7 @@ impl Daemon<StubExchange, MemoryStore> {
         .with_invalidation_guard(
             config.engine.stop_invalidation_guard_enabled,
             config.engine.stop_invalidation_lookback_candles,
-        )
-        .with_stop_policy(config.engine.stop_policy);
+        );
         if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
             pm = pm.with_event_log((**pool).clone(), tenant_id);
         }
@@ -442,8 +457,7 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
             .with_invalidation_guard(
                 config.engine.stop_invalidation_guard_enabled,
                 config.engine.stop_invalidation_lookback_candles,
-            )
-            .with_stop_policy(config.engine.stop_policy),
+            ),
         ));
 
         Self {
@@ -522,8 +536,7 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
         .with_invalidation_guard(
             config.engine.stop_invalidation_guard_enabled,
             config.engine.stop_invalidation_lookback_candles,
-        )
-        .with_stop_policy(config.engine.stop_policy);
+        );
         if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
             pm = pm.with_event_log((**pool).clone(), tenant_id);
         }

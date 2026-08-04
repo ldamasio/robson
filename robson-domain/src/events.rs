@@ -133,6 +133,20 @@ pub enum Event {
         stop_loss: Price,
         /// Calculated position size
         quantity: Quantity,
+        /// Admission-time executable trigger resolved before entry-order
+        /// submission (ADR-0052 Decision 5). Absent on historical events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        initial_executable_stop: Option<Price>,
+        /// Immutable executable span `S`, inclusive of the buffer and adverse
+        /// tick quantization. Absent on historical/legacy events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        executable_span: Option<Decimal>,
+        /// Distance used to cap the admission-time buffer.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        cap_basis_distance: Option<Decimal>,
+        /// Exchange tick size used for admission-time adverse quantization.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        tick_size: Option<Decimal>,
         /// When the signal was received
         timestamp: DateTime<Utc>,
     },
@@ -832,37 +846,90 @@ mod tests {
             "symbol": {"base": "BTC", "quote": "USDT"},
             "side": "Long",
             "tech_stop_distance": null,
-            "stop_policy": "span_capped_v9",
+            "stop_policy": "future_stop_policy",
             "timestamp": Utc::now(),
         });
 
         assert!(serde_json::from_value::<Event>(unknown_json).is_err());
     }
 
-    /// A v1 event roundtrips with policy and buffer snapshot intact.
+    /// An executable-span arm roundtrips with policy and buffer snapshot
+    /// intact.
     #[test]
-    fn test_position_armed_span_capped_v1_roundtrips() {
+    fn test_position_armed_executable_span_roundtrips() {
         let event = Event::PositionArmed {
             position_id: Uuid::now_v7(),
             account_id: Uuid::now_v7(),
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
             side: Side::Long,
             tech_stop_distance: None,
-            stop_policy: crate::stop_policy::StopPolicy::SpanCappedV1,
+            stop_policy: crate::stop_policy::StopPolicy::ExecutableSpan,
             stop_buffer_bps_at_arm: Some(dec!(10)),
             timestamp: Utc::now(),
         };
         let json = serde_json::to_value(&event).unwrap();
-        assert_eq!(json["stop_policy"].as_str(), Some("span_capped_v1"));
+        assert_eq!(json["stop_policy"].as_str(), Some("executable_span"));
         assert_eq!(json["stop_buffer_bps_at_arm"].as_str(), Some("10"));
 
         let back: Event = serde_json::from_value(json).unwrap();
         match back {
             Event::PositionArmed { stop_policy, stop_buffer_bps_at_arm, .. } => {
-                assert_eq!(stop_policy, crate::stop_policy::StopPolicy::SpanCappedV1);
+                assert_eq!(stop_policy, crate::stop_policy::StopPolicy::ExecutableSpan);
                 assert_eq!(stop_buffer_bps_at_arm, Some(dec!(10)));
             },
             other => panic!("expected PositionArmed, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_entry_signal_received_executable_plan_roundtrips() {
+        let event = Event::EntrySignalReceived {
+            position_id: Uuid::now_v7(),
+            signal_id: Uuid::now_v7(),
+            entry_price: Price::new(dec!(62000)).unwrap(),
+            stop_loss: Price::new(dec!(61000)).unwrap(),
+            quantity: Quantity::new(dec!(0.1)).unwrap(),
+            initial_executable_stop: Some(Price::new(dec!(60939)).unwrap()),
+            executable_span: Some(dec!(1061)),
+            cap_basis_distance: Some(dec!(1000)),
+            tick_size: Some(dec!(0.1)),
+            timestamp: Utc::now(),
+        };
+
+        let json = serde_json::to_value(&event).unwrap();
+        assert_eq!(json["initial_executable_stop"].as_str(), Some("60939"));
+        assert_eq!(json["executable_span"].as_str(), Some("1061"));
+        assert_eq!(json["cap_basis_distance"].as_str(), Some("1000"));
+        assert_eq!(json["tick_size"].as_str(), Some("0.1"));
+        assert_eq!(serde_json::from_value::<Event>(json).unwrap(), event);
+    }
+
+    #[test]
+    fn test_historical_entry_signal_received_defaults_executable_plan_fields() {
+        let historical = serde_json::json!({
+            "type": "entry_signal_received",
+            "position_id": Uuid::now_v7(),
+            "signal_id": Uuid::now_v7(),
+            "entry_price": "62000",
+            "stop_loss": "61000",
+            "quantity": "0.1",
+            "timestamp": Utc::now(),
+        });
+
+        match serde_json::from_value::<Event>(historical).unwrap() {
+            Event::EntrySignalReceived {
+                initial_executable_stop,
+                executable_span,
+                cap_basis_distance,
+                tick_size,
+                ..
+            } => {
+                assert_eq!(initial_executable_stop, None);
+                assert_eq!(executable_span, None);
+                assert_eq!(cap_basis_distance, None);
+                assert_eq!(tick_size, None);
+            },
+            other => panic!("expected EntrySignalReceived, got {other:?}"),
         }
     }
 
@@ -1480,6 +1547,10 @@ mod tests {
             entry_price: Price::new(dec!(95000)).unwrap(),
             stop_loss: Price::new(dec!(93500)).unwrap(),
             quantity: Quantity::new(dec!(0.1)).unwrap(),
+            initial_executable_stop: None,
+            executable_span: None,
+            cap_basis_distance: None,
+            tick_size: None,
             timestamp: Utc::now(),
         }
     }

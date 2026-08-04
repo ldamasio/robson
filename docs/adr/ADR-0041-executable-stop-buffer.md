@@ -13,7 +13,8 @@ single-executable-price invariant (software monitor and insurance stop trigger
 at the same executable price) is preserved by construction through the single
 `ExecutableStopPlan` resolver.
 Amendment: [ADR-0052](ADR-0052-executable-span-single-stop-policy.md)
-(DECIDED 2026-08-04, implementation pending) retires the runtime selector and
+(DECIDED and repository-implemented 2026-08-04; operational rollout pending)
+retires the runtime selector and
 the never-persisted `span_capped_v1` identifier, replacing them with the
 single `executable_span` policy. Under it, the buffer described here remains
 the anti-stop-hunt nudge (capped 0.25 × cap_basis_distance), but the raw

@@ -52,13 +52,13 @@ pub enum DomainError {
     #[error("Invalid trading rules: {0}")]
     InvalidTradingRules(String),
 
-    /// Symbol trading rules are required but not available (SpanCappedV1
+    /// Symbol trading rules are required but not available (ExecutableSpan
     /// fail-closed path).
     #[error("Trading rules unavailable: {0}")]
     TradingRulesUnavailable(String),
 
-    /// The normative span for a SpanCappedV1 stop plan is missing, zero, or
-    /// negative (fail-closed; never silently uncapped).
+    /// The cap-basis or persisted span for an ExecutableSpan plan is missing,
+    /// zero, or negative (fail-closed; never silently uncapped).
     #[error("Degenerate stop span: {0}")]
     DegenerateStopSpan(String),
 

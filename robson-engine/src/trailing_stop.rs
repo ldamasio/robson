@@ -1,8 +1,9 @@
 //! Discrete Step Trailing Stop (v3 Policy)
 //!
 //! This module implements the v3 trailing stop using the "span" (palmo)
-//! technique. The span is the technical stop distance calculated at position
-//! entry.
+//! technique. For legacy positions the span is the raw technical-stop
+//! distance. ADR-0052 positions pass their immutable persisted executable
+//! span `S`; this pure ladder never derives or buffers that value itself.
 //!
 //! # Algorithm (Discrete Step / Palmo)
 //!
@@ -54,7 +55,7 @@ pub struct TrailingStopUpdate {
 ///   Short)
 /// * `current_trailing_stop` - Current trailing stop price
 /// * `entry_price` - Entry price of the position (anchor for span steps)
-/// * `span` - Technical stop distance (the "palmo" — unit of movement)
+/// * `span` - Policy-selected ladder unit: legacy raw span or persisted `S`
 ///
 /// # Returns
 ///
@@ -354,6 +355,24 @@ mod tests {
         let update = result.unwrap();
         // Stop moves to $95,000 (breakeven = initial_stop + 1×span)
         assert_eq!(update.new_stop.as_decimal(), dec!(95000));
+    }
+
+    #[test]
+    fn executable_span_first_completed_rung_moves_candidate_to_entry() {
+        // The raw technical stop (61_000) differs from E - S (60_939).
+        // ADR-0052 still requires the first completed persisted-S rung to
+        // place the candidate conceptual stop exactly at E.
+        let update = update_trailing_stop_discrete(
+            Side::Long,
+            Price::new(dec!(63061)).unwrap(),
+            Price::new(dec!(62000)).unwrap(),
+            Price::new(dec!(61000)).unwrap(),
+            Price::new(dec!(62000)).unwrap(),
+            dec!(1061),
+        )
+        .expect("one persisted executable span must advance the ladder");
+
+        assert_eq!(update.new_stop.as_decimal(), dec!(62000));
     }
 
     #[test]

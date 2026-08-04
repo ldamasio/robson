@@ -43,9 +43,10 @@ pub use risk::{
     PositionSummary, ProposedTrade, RiskCheck, RiskContext, RiskGate, RiskLimits, RiskVerdict,
 };
 use robson_domain::{
-    build_executable_stop_plan, size_entry, DetectorSignal, Event, ExecutableStopPlan, ExitReason,
-    Position, PositionId, PositionState, Price, Quantity, RiskConfig, Side, StopPlanInputs, Symbol,
-    SymbolTradingRules, TechnicalStopDistance,
+    build_executable_stop_plan, size_entry, DetectorSignal, Event, ExecutableSpanSource,
+    ExecutableStopPlan, ExitReason, Position, PositionId, PositionState, Price, Quantity,
+    RiskConfig, Side, StopPlanInputs, StopPolicy, Symbol, SymbolTradingRules,
+    TechnicalStopDistance,
 };
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
@@ -487,7 +488,7 @@ impl Engine {
     /// [`Self::decide_entry`] with runtime symbol trading rules (issue #154).
     ///
     /// Rules are required when the position's stop policy is
-    /// `SpanCappedV1` (the executable trigger must be tick-quantized and the
+    /// `ExecutableSpan` (the executable trigger must be tick-quantized and the
     /// quantity lot-quantized); a legacy position sizes without them, the
     /// historical behavior.
     pub fn decide_entry_with_rules(
@@ -508,6 +509,21 @@ impl Engine {
         // 2. Validate signal matches position
         signal.validate_for_position(position).map_err(EngineError::DomainError)?;
 
+        // ADR-0052 admission evidence is write-once. Its presence on an
+        // Armed position means an earlier admission partially completed and
+        // must be recovered explicitly; deriving a second ruler would make S
+        // mutable across retries or metadata refreshes.
+        if position.stop_policy == StopPolicy::ExecutableSpan
+            && (position.initial_executable_stop.is_some()
+                || position.executable_span.is_some()
+                || position.cap_basis_distance.is_some()
+                || position.tick_size_at_admission.is_some())
+        {
+            return Err(EngineError::DomainError(robson_domain::DomainError::DegenerateStopSpan(
+                "ExecutableSpan position already contains immutable admission evidence".to_string(),
+            )));
+        }
+
         // 3. Validate and get tech stop distance (single bounds source, ADR-0050 §5)
         let tech_stop = signal.tech_stop_distance();
         tech_stop
@@ -515,9 +531,9 @@ impl Engine {
             .map_err(EngineError::DomainError)?;
 
         // 4. Resolve the executable stop plan ONCE (issue #154): guard-aware basis
-        //    (ADR-0042), span-capped buffer and tick quantization under SpanCappedV1,
-        //    the historical uncapped derivation under legacy. Sizing, the soft exit,
-        //    and the insurance stop all price the SAME trigger from here on.
+        //    (ADR-0042), capped buffer and tick quantization under ExecutableSpan, the
+        //    historical uncapped derivation under legacy. Sizing, the soft exit, and
+        //    the insurance stop all price the SAME trigger from here on.
         let guard = signal
             .technical_stop_analysis
             .as_ref()
@@ -530,6 +546,7 @@ impl Engine {
             entry_reference: Some(signal.entry_price),
             technical_span: Some(tech_stop.span()),
             stop_buffer_bps: self.stop_buffer_bps_for(position),
+            executable_span_source: ExecutableSpanSource::Admission,
             rules,
         })
         .map_err(EngineError::DomainError)?;
@@ -550,6 +567,16 @@ impl Engine {
         .map_err(EngineError::DomainError)?;
         let quantity = sized.quantity;
         let planned_entry_risk = sized.planned_risk;
+        let (initial_executable_stop, executable_span, cap_basis_distance, tick_size) =
+            match plan.policy {
+                StopPolicy::LegacyUncapped => (None, None, None, None),
+                StopPolicy::ExecutableSpan => (
+                    Some(plan.trigger),
+                    plan.executable_span,
+                    plan.cap_basis_distance,
+                    plan.tick_size,
+                ),
+            };
 
         debug!(
             position_id = %position.id,
@@ -573,6 +600,10 @@ impl Engine {
                 entry_price: signal.entry_price,
                 stop_loss: signal.stop_loss,
                 quantity,
+                initial_executable_stop,
+                executable_span,
+                cap_basis_distance,
+                tick_size,
                 timestamp: Utc::now(),
             }),
             // Emit governed intent (pre-exchange, cycle_id stamped by GovernedAction)
@@ -727,6 +758,28 @@ impl Engine {
         updated_position.entry_filled_at = Some(filled_at);
         updated_position.updated_at = filled_at;
 
+        // ExecutableSpan admission already resolved and persisted the exact
+        // trigger before exchange submission. Reuse that value at fill: a
+        // second resolver call here would apply the buffer twice conceptually
+        // and would make fill protection depend on refreshed metadata. Legacy
+        // positions retain their historical fill-time derivation unchanged.
+        let insurance_trigger = match position.stop_policy {
+            StopPolicy::ExecutableSpan => position.initial_executable_stop.ok_or_else(|| {
+                EngineError::MissingData(
+                    "ExecutableSpan position missing persisted initial_executable_stop".to_string(),
+                )
+            })?,
+            StopPolicy::LegacyUncapped => {
+                self.stop_plan(
+                    &updated_position,
+                    initial_trailing_stop,
+                    invalidation_guard_level,
+                    rules,
+                )?
+                .trigger
+            },
+        };
+
         // 5. Build actions (emit event)
         let actions = vec![
             EngineAction::EmitEvent(Event::EntryFilled {
@@ -750,51 +803,11 @@ impl Engine {
                 symbol: position.symbol.clone(),
                 side: position.side.exit_action(),
                 quantity: filled_quantity,
-                stop_price: self
-                    .stop_plan_or_fill_fallback(
-                        &updated_position,
-                        initial_trailing_stop,
-                        invalidation_guard_level,
-                        rules,
-                    )
-                    .trigger,
+                stop_price: insurance_trigger,
             },
         ];
 
         Ok(EngineDecision::with_position(actions, updated_position))
-    }
-
-    /// Resolve the fill-time stop plan, degrading to the legacy derivation
-    /// if the plan cannot be built. A real fill already happened here: a
-    /// position left without any insurance stop is strictly worse than one
-    /// protected at an unquantized trigger, so this path is protection-first
-    /// (the failure is logged; the legacy derivation never fails).
-    fn stop_plan_or_fill_fallback(
-        &self,
-        position: &Position,
-        technical_stop: Price,
-        guard: Option<Price>,
-        rules: Option<&SymbolTradingRules>,
-    ) -> ExecutableStopPlan {
-        self.stop_plan(position, technical_stop, guard, rules).unwrap_or_else(|error| {
-            tracing::error!(
-                position_id = %position.id,
-                %error,
-                "Fill-time stop plan failed; falling back to the legacy derivation so the \
-                 insurance stop still exists"
-            );
-            build_executable_stop_plan(StopPlanInputs {
-                policy: robson_domain::StopPolicy::LegacyUncapped,
-                side: position.side,
-                technical_stop,
-                guard,
-                entry_reference: Self::plan_entry_reference(position),
-                technical_span: position.tech_stop_distance.as_ref().map(|t| t.span()),
-                stop_buffer_bps: self.stop_buffer_bps_for(position),
-                rules: None,
-            })
-            .expect("legacy stop plan derivation is total")
-        })
     }
 
     // =========================================================================
@@ -827,8 +840,9 @@ impl Engine {
     /// [`Self::process_active_position`] with runtime symbol trading rules
     /// (issue #154): the soft-exit comparison and any insurance
     /// place/replace price derive from the SAME tick-quantized plan trigger
-    /// under `SpanCappedV1`. A v1 position without rules is an error (fail
-    /// closed), never a silent fallback to the unquantized derivation.
+    /// under `ExecutableSpan`. An executable-span position without rules is an
+    /// error (fail closed), never a silent fallback to the unquantized
+    /// derivation.
     pub fn process_active_position_with_rules(
         &self,
         position: &Position,
@@ -902,12 +916,12 @@ impl Engine {
 
         // Check if trailing stop should be updated (discrete step logic)
         if let Some(new_stop) = self.calculate_new_trailing_stop(
-            position.side,
+            position,
             current_price,
             favorable_extreme,
             trailing_stop,
             tech_stop,
-        ) {
+        )? {
             // Discrete logic already ensures monotonicity, but double-check
             if self.is_more_favorable_stop(position.side, new_stop, trailing_stop) {
                 // Idempotency check: only emit if different from last emitted
@@ -959,10 +973,10 @@ impl Engine {
     /// priced the admission risk with — the fill price would silently widen
     /// or tighten the capped buffer relative to what sizing charged, the
     /// exact priced-vs-executed drift this slice exists to kill. Falls back
-    /// to the fill price only when the technical stop is absent (residual:
-    /// a Postgres projection restart rebuilds `tech_stop_distance` from the
-    /// fill price, bounding any post-restart drift at one fill-vs-signal
-    /// delta while the guard remains bound).
+    /// to the fill price only when the technical stop is absent. The
+    /// Postgres projection reconstructs the signal reference from the
+    /// persisted initial stop and technical distance, rather than from the
+    /// later fill price.
     fn plan_entry_reference(position: &Position) -> Option<Price> {
         position
             .tech_stop_distance
@@ -991,6 +1005,13 @@ impl Engine {
             entry_reference: Self::plan_entry_reference(position),
             technical_span: position.tech_stop_distance.as_ref().map(|t| t.span()),
             stop_buffer_bps: self.stop_buffer_bps_for(position),
+            executable_span_source: match position.stop_policy {
+                StopPolicy::LegacyUncapped => ExecutableSpanSource::Admission,
+                StopPolicy::ExecutableSpan => ExecutableSpanSource::Persisted {
+                    executable_span: position.executable_span,
+                    cap_basis_distance: position.cap_basis_distance,
+                },
+            },
             rules,
         })
         .map_err(EngineError::DomainError)
@@ -1017,21 +1038,40 @@ impl Engine {
     /// completed. Returns `None` for partial movements.
     fn calculate_new_trailing_stop(
         &self,
-        side: Side,
+        position: &Position,
         current_price: Price,
         favorable_extreme: Price,
         trailing_stop: Price,
         tech_stop: &TechnicalStopDistance,
-    ) -> Option<Price> {
+    ) -> Result<Option<Price>, EngineError> {
+        let span = match position.stop_policy {
+            // Preserve the historical ladder input without transformation.
+            StopPolicy::LegacyUncapped => tech_stop.distance,
+            StopPolicy::ExecutableSpan => {
+                let span = position.executable_span.ok_or_else(|| {
+                    EngineError::DomainError(robson_domain::DomainError::DegenerateStopSpan(
+                        "ExecutableSpan position missing persisted executable_span".to_string(),
+                    ))
+                })?;
+                if span <= Decimal::ZERO {
+                    return Err(EngineError::DomainError(
+                        robson_domain::DomainError::DegenerateStopSpan(format!(
+                            "ExecutableSpan executable_span must be positive: {span}"
+                        )),
+                    ));
+                }
+                span
+            },
+        };
         let update = trailing_stop::update_trailing_stop_discrete(
-            side,
+            position.side,
             current_price,
             favorable_extreme,
             trailing_stop,
             tech_stop.entry_price,
-            tech_stop.distance,
+            span,
         );
-        update.map(|u| u.new_stop)
+        Ok(update.map(|u| u.new_stop))
     }
 
     /// Check if new stop is more favorable than current stop

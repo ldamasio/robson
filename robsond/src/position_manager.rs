@@ -155,10 +155,6 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     stop_invalidation_guard_enabled: bool,
     /// Lookback candles for the invalidation guard recent extreme (ADR-0042).
     stop_invalidation_lookback_candles: usize,
-    /// Stop policy pinned to NEW positions at arm time (issue #154,
-    /// `ROBSON_STOP_POLICY`). Existing positions keep their arm-time policy;
-    /// this only affects new arms.
-    stop_policy: StopPolicy,
     /// Positions whose reduce-only exit the exchange rejected while
     /// reporting the symbol flat (#142). The exchange-side insurance stop
     /// has already closed the position, so market ticks stop re-placing
@@ -782,9 +778,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             // `with_invalidation_guard`.
             stop_invalidation_guard_enabled: false,
             stop_invalidation_lookback_candles: 20,
-            // Legacy by default (issue #154): SpanCappedV1 is an explicit
-            // operator opt-in via `with_stop_policy`.
-            stop_policy: StopPolicy::LegacyUncapped,
             exit_overtaken_suspects: Arc::new(RwLock::new(HashSet::new())),
             entry_exhausted: Arc::new(RwLock::new(HashMap::new())),
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
@@ -811,13 +804,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self
     }
 
-    /// Configure the stop policy pinned to NEW positions at arm time
-    /// (issue #154, `ROBSON_STOP_POLICY`).
-    pub fn with_stop_policy(mut self, stop_policy: StopPolicy) -> Self {
-        self.stop_policy = stop_policy;
-        self
-    }
-
     /// Configure the OHLCV source used by newly spawned detector tasks.
     pub fn with_ohlcv_port(mut self, ohlcv_port: Arc<dyn OhlcvPort>) -> Self {
         self.ohlcv_port = ohlcv_port;
@@ -825,14 +811,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     }
 
     /// Cached symbol trading rules for a position whose stop policy needs
-    /// them (issue #154). Legacy positions derive without rules (zero
-    /// overhead on the historical path); for `SpanCappedV1` a fetch failure
+    /// them (ADR-0052). Legacy positions derive without rules (zero
+    /// overhead on the historical path); for `ExecutableSpan` a fetch failure
     /// returns `None` and the engine fails closed.
     pub(crate) async fn trading_rules_for(
         &self,
         position: &Position,
     ) -> Option<robson_domain::SymbolTradingRules> {
-        if position.stop_policy != StopPolicy::SpanCappedV1 {
+        if position.stop_policy != StopPolicy::ExecutableSpan {
             return None;
         }
         match self.exchange().trading_rules(&position.symbol).await {
@@ -842,7 +828,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     position_id = %position.id,
                     symbol = %position.symbol.as_pair(),
                     %error,
-                    "Trading rules unavailable for SpanCappedV1 position; engine will fail closed"
+                    "Trading rules unavailable for ExecutableSpan position; engine will fail closed"
                 );
                 None
             },
@@ -973,8 +959,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// Execute engine actions and persist any emitted domain events to the
     /// eventlog.
     ///
-    /// This is a wrapper around `executor.execute()` that adds eventlog
-    /// persistence for events in action results:
+    /// This is an ordered wrapper around `executor.execute()` that persists
+    /// each action's event result before executing the next action:
     /// - `ActionResult::EventEmitted(event)` - events from EmitEvent action
     /// - `ActionResult::OrderPlaced { event: Some(event), .. }` - events from
     ///   exit or entry orders
@@ -988,19 +974,29 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// the current execution cycle.
     ///
     /// This prevents silent projection drift during execution when PostgreSQL
-    /// is in use. Append and projection apply still happen in separate
-    /// steps, so this is fail-fast visibility, not an atomic multi-step
-    /// guarantee.
+    /// is in use. It also makes pre-exchange events a real durability barrier:
+    /// for entry admission, `EntrySignalReceived` and `EntryOrderRequested`
+    /// are both appended and projected before `PlaceEntryOrder` can run
+    /// (ADR-0052 Decision 5). Append and projection apply still happen in
+    /// separate steps, so this is fail-fast ordered visibility, not an atomic
+    /// multi-step guarantee.
     async fn execute_and_persist(
         &self,
         actions: Vec<EngineAction>,
     ) -> DaemonResult<Vec<ActionResult>> {
-        let results = self.executor.execute(actions).await?;
+        let mut results = Vec::with_capacity(actions.len());
 
-        // Persist events from results to eventlog (centralized for MIG-v2.5#2).
-        // Failures propagate — caller must not continue on EventLog error.
-        for result in &results {
-            match result {
+        for action in actions {
+            let mut action_results = self.executor.execute(vec![action]).await?;
+            let result = action_results.pop().ok_or_else(|| {
+                DaemonError::Config(
+                    "Executor returned no result for a successfully executed action".to_string(),
+                )
+            })?;
+
+            // Persist before advancing to the next action. A failure here is
+            // the barrier that prevents a later exchange action from running.
+            match &result {
                 ActionResult::EventEmitted(event) => {
                     self.persist_event_to_log(event).await?;
                 },
@@ -1014,6 +1010,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     self.persist_event_to_log(event).await?;
                 },
                 _ => {},
+            }
+
+            let should_stop = matches!(
+                result,
+                ActionResult::OrderFailed { .. } | ActionResult::EntryExecutionRejected { .. }
+            );
+            results.push(result);
+            if should_stop {
+                break;
             }
         }
 
@@ -1908,15 +1913,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Emit PositionArmed event → apply_event creates position in Armed state.
         // Then persist policy resolution for replay/audit.
         let now = chrono::Utc::now();
-        // The stop policy is pinned HERE, atomically with position creation
-        // (issue #154): replay and projection rebuild it verbatim.
+        // ADR-0052: every new arm is stamped unconditionally. The legacy
+        // policy remains provenance-only for positions armed by older code.
         let armed_event = Event::PositionArmed {
             position_id,
             account_id,
             symbol: symbol.clone(),
             side,
             tech_stop_distance,
-            stop_policy: self.stop_policy,
+            stop_policy: StopPolicy::ExecutableSpan,
             stop_buffer_bps_at_arm: Some(stop_buffer_bps_at_arm),
             timestamp: now,
         };
@@ -4324,6 +4329,20 @@ mod tests {
         approval_policy: ApprovalPolicy,
     ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
+        exchange.set_trading_rules(
+            robson_domain::SymbolTradingRules::new(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                dec!(0.01),
+                Decimal::ZERO,
+                dec!(0.000001),
+                dec!(0.000001),
+                dec!(1000000),
+                Decimal::ZERO,
+                2,
+                6,
+            )
+            .unwrap(),
+        );
         let journal = Arc::new(IntentJournal::new());
         let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
         let risk_config = RiskConfig::new(dec!(10000)).unwrap(); // 1% cap
@@ -4437,7 +4456,7 @@ mod tests {
         RiskConfig::new(dec!(10000)).unwrap() // 1% cap
     }
 
-    /// Issue #154: arm pins the stop policy and the ADR-0041 buffer
+    /// ADR-0052: arm pins the one new-position policy and ADR-0041 buffer
     /// snapshot atomically with position creation, and both survive replay.
     #[tokio::test]
     async fn arm_position_pins_stop_policy_and_buffer_snapshot() {
@@ -4455,9 +4474,7 @@ mod tests {
             .await
             .unwrap();
 
-        // Default manager arms legacy (SpanCappedV1 is an explicit opt-in);
-        // the buffer snapshot is always taken.
-        assert_eq!(position.stop_policy, StopPolicy::LegacyUncapped);
+        assert_eq!(position.stop_policy, StopPolicy::ExecutableSpan);
         assert_eq!(position.stop_buffer_bps_at_arm, Some(dec!(10)));
 
         // The PositionArmed event carries the same pinned values.
@@ -4471,7 +4488,66 @@ mod tests {
                 _ => None,
             })
             .expect("PositionArmed event must exist");
-        assert_eq!(armed, (StopPolicy::LegacyUncapped, Some(dec!(10))));
+        assert_eq!(armed, (StopPolicy::ExecutableSpan, Some(dec!(10))));
+    }
+
+    #[tokio::test]
+    async fn admitted_entry_persists_executable_span_plan_before_submission() {
+        let manager = create_test_manager().await;
+        let position = manager
+            .arm_position(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                Side::Long,
+                RiskConfig::new(dec!(10000)).unwrap().with_stop_buffer(dec!(10)).unwrap(),
+                None,
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol: position.symbol.clone(),
+            side: Side::Long,
+            entry_price: Price::new(dec!(95000)).unwrap(),
+            stop_loss: Price::new(dec!(90250)).unwrap(),
+            technical_stop_analysis: None,
+            timestamp: chrono::Utc::now(),
+        };
+
+        manager.handle_signal(signal).await.unwrap();
+
+        let events = manager.store().events().find_by_position(position.id).await.unwrap();
+        let signal_index = events
+            .iter()
+            .position(|event| matches!(event, Event::EntrySignalReceived { .. }))
+            .expect("entry admission event must be durable");
+        let request_index = events
+            .iter()
+            .position(|event| matches!(event, Event::EntryOrderRequested { .. }))
+            .expect("entry order request must be durable");
+        assert!(signal_index < request_index, "plan must persist before entry submission intent");
+        match &events[signal_index] {
+            Event::EntrySignalReceived {
+                initial_executable_stop,
+                executable_span,
+                cap_basis_distance,
+                tick_size,
+                ..
+            } => {
+                assert_eq!(*initial_executable_stop, Some(Price::new(dec!(90159.75)).unwrap()));
+                assert_eq!(*executable_span, Some(dec!(4840.25)));
+                assert_eq!(*cap_basis_distance, Some(dec!(4750)));
+                assert_eq!(*tick_size, Some(dec!(0.01)));
+            },
+            other => panic!("expected EntrySignalReceived, got {other:?}"),
+        }
+
+        let persisted = manager.get_position(position.id).await.unwrap().unwrap();
+        assert_eq!(persisted.stop_policy, StopPolicy::ExecutableSpan);
+        assert_eq!(persisted.executable_span, Some(dec!(4840.25)));
+        assert_eq!(persisted.cap_basis_distance, Some(dec!(4750)));
+        assert_eq!(persisted.tick_size_at_admission, Some(dec!(0.01)));
     }
 
     fn create_test_candles() -> Vec<Candle> {
@@ -5524,6 +5600,20 @@ mod tests {
     async fn test_margin_rejection_moves_to_error_without_rearming_detector() {
         let exchange = Arc::new(StubExchange::new(dec!(95000)));
         exchange.set_futures_settings("Hedge", RiskConfig::LEVERAGE);
+        exchange.set_trading_rules(
+            robson_domain::SymbolTradingRules::new(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                dec!(0.01),
+                Decimal::ZERO,
+                dec!(0.000001),
+                dec!(0.000001),
+                dec!(1000000),
+                Decimal::ZERO,
+                2,
+                6,
+            )
+            .unwrap(),
+        );
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
         let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
@@ -5590,9 +5680,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_signal_rejects_quantity_below_exchange_step_size_and_rearms_detector() {
+    async fn test_handle_signal_rejects_quantity_below_exchange_step_size_before_exchange() {
         let manager = Arc::new({
             let exchange = Arc::new(StubExchange::new(dec!(76200)));
+            exchange.set_trading_rules(
+                robson_domain::SymbolTradingRules::new(
+                    Symbol::from_pair("BTCUSDT").unwrap(),
+                    dec!(0.01),
+                    Decimal::ZERO,
+                    dec!(0.001),
+                    dec!(0.001),
+                    dec!(1000000),
+                    Decimal::ZERO,
+                    2,
+                    3,
+                )
+                .unwrap(),
+            );
             let journal = Arc::new(IntentJournal::new());
             let store = Arc::new(MemoryStore::new());
             let executor = Arc::new(Executor::new(exchange, journal, store.clone()));
@@ -5638,12 +5742,11 @@ mod tests {
             timestamp: chrono::Utc::now(),
         };
 
-        let result = manager.handle_signal(signal).await;
-        assert!(matches!(
-            result,
-            Err(DaemonError::Exec(robson_exec::ExecError::OrderRejected(message)))
-            if message.contains("step size 0.001") && message.contains("minimum quantity 0.001")
-        ));
+        // ExecutableSpan admission has live lot rules, so the quantity is
+        // quantized and rejected as a governed domain outcome before any
+        // exchange submission rather than relying on an adapter rejection.
+        manager.handle_signal(signal).await.unwrap();
+        assert!(manager.exchange().get_all_open_positions().await.unwrap().is_empty());
 
         let updated = manager.get_position(position.id).await.unwrap().unwrap();
         assert!(
@@ -7980,7 +8083,7 @@ mod tests {
         let adverse = dec!(87400) - dec!(87.4);
         let worst_loss_per_unit = (dec!(95000) - adverse) + dec!(0.0005) * (dec!(95000) + adverse);
         let expected_qty = (dec!(200) / worst_loss_per_unit)
-            .round_dp_with_strategy(12, rust_decimal::RoundingStrategy::ToZero);
+            .round_dp_with_strategy(6, rust_decimal::RoundingStrategy::ToZero);
         assert_eq!(
             updated.quantity.as_decimal(),
             expected_qty,

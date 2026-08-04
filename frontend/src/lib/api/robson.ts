@@ -19,9 +19,12 @@ export type Position = {
   exchange_sync_state?: string | null;
   entry_mode?: string | null;
   approval_mode?: string | null;
+  stop_policy?: string | null;
   entry_price: number | null;
+  entry_reference?: number | null;
   entry_filled_at: string | null;
   tech_stop_distance: number | null;
+  executable_span?: number | null;
   quantity: number | null;
   realized_pnl: number | null;
   pnl?: number | null;
@@ -309,10 +312,13 @@ function normalizePosition(raw: unknown): Position {
       p.exchange_sync_state == null ? null : String(p.exchange_sync_state),
     entry_mode: p.entry_mode == null ? null : String(p.entry_mode),
     approval_mode: p.approval_mode == null ? null : String(p.approval_mode),
+    stop_policy: p.stop_policy == null ? null : String(p.stop_policy),
     entry_price: toNumber(p.entry_price),
+    entry_reference: toNumber(p.entry_reference),
     entry_filled_at:
       p.entry_filled_at == null ? null : String(p.entry_filled_at),
     tech_stop_distance: toNumber(p.tech_stop_distance),
+    executable_span: toNumber(p.executable_span),
     quantity: toNumber(p.quantity),
     realized_pnl: toNumber(p.realized_pnl),
     pnl: toNumber(p.pnl),

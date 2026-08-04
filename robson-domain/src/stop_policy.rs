@@ -1,4 +1,4 @@
-//! Stop-policy versioning (issue #154, ADR-0050 §3/§4).
+//! Stop-policy versioning (ADR-0050 §3/§4, ADR-0052).
 //!
 //! A position's stop derivation is pinned at arm time and never changes for
 //! the lifetime of the position: a deploy must never retroact on live
@@ -21,11 +21,11 @@ pub enum StopPolicy {
     /// versioning replays as this.
     #[default]
     LegacyUncapped,
-    /// ADR-0050 §3/§4 derivation: span-capped buffer
-    /// (`min(configured, 0.25 x span)`), single tick-quantized executable
-    /// trigger consumed by every surface, adverse-fill costing. Requires
-    /// runtime [`crate::trading_rules::SymbolTradingRules`].
-    SpanCappedV1,
+    /// ADR-0052 derivation: the immutable, persisted executable span drives
+    /// the trailing ladder while the buffer remains capped at 0.25 x the
+    /// cap-basis distance. The single adversely tick-quantized trigger is
+    /// consumed by every execution surface.
+    ExecutableSpan,
 }
 
 impl StopPolicy {
@@ -33,7 +33,7 @@ impl StopPolicy {
     pub fn as_str(&self) -> &'static str {
         match self {
             StopPolicy::LegacyUncapped => "legacy_uncapped",
-            StopPolicy::SpanCappedV1 => "span_capped_v1",
+            StopPolicy::ExecutableSpan => "executable_span",
         }
     }
 
@@ -43,9 +43,9 @@ impl StopPolicy {
     pub fn parse(value: &str) -> Result<Self, DomainError> {
         match value {
             "legacy_uncapped" => Ok(StopPolicy::LegacyUncapped),
-            "span_capped_v1" => Ok(StopPolicy::SpanCappedV1),
+            "executable_span" => Ok(StopPolicy::ExecutableSpan),
             other => Err(DomainError::InvalidStopPolicy(format!(
-                "Unknown stop policy '{other}' (expected legacy_uncapped or span_capped_v1)"
+                "Unknown stop policy '{other}' (expected legacy_uncapped or executable_span)"
             ))),
         }
     }
@@ -64,14 +64,14 @@ mod tests {
     #[test]
     fn wire_format_is_snake_case() {
         assert_eq!(serde_json::to_value(StopPolicy::LegacyUncapped).unwrap(), "legacy_uncapped");
-        assert_eq!(serde_json::to_value(StopPolicy::SpanCappedV1).unwrap(), "span_capped_v1");
+        assert_eq!(serde_json::to_value(StopPolicy::ExecutableSpan).unwrap(), "executable_span");
     }
 
     #[test]
     fn parse_accepts_known_and_rejects_unknown() {
         assert_eq!(StopPolicy::parse("legacy_uncapped").unwrap(), StopPolicy::LegacyUncapped);
-        assert_eq!(StopPolicy::parse("span_capped_v1").unwrap(), StopPolicy::SpanCappedV1);
-        assert!(StopPolicy::parse("span_capped_v2").is_err());
+        assert_eq!(StopPolicy::parse("executable_span").unwrap(), StopPolicy::ExecutableSpan);
+        assert!(StopPolicy::parse("executable_span_v2").is_err());
         assert!(StopPolicy::parse("").is_err());
     }
 
@@ -79,7 +79,7 @@ mod tests {
     fn unknown_wire_value_fails_deserialization_never_defaults() {
         // serde must NOT have an `other`-style fallback: an unknown version
         // is a hard failure, only a MISSING field means legacy.
-        let err = serde_json::from_value::<StopPolicy>(serde_json::json!("span_capped_v9"));
+        let err = serde_json::from_value::<StopPolicy>(serde_json::json!("future_stop_policy"));
         assert!(err.is_err());
     }
 
