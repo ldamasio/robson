@@ -12,6 +12,15 @@ policy (operator activation via `ROBSON_STOP_POLICY`); positions armed under
 single-executable-price invariant (software monitor and insurance stop trigger
 at the same executable price) is preserved by construction through the single
 `ExecutableStopPlan` resolver.
+Amendment: [ADR-0052](ADR-0052-executable-span-single-stop-policy.md)
+(DECIDED 2026-08-04, implementation pending) retires the runtime selector and
+the never-persisted `span_capped_v1` identifier, replacing them with the
+single `executable_span` policy. Under it, the buffer described here remains
+the anti-stop-hunt nudge (capped 0.25 × cap_basis_distance), but the raw
+technical distance no longer drives the ladder, targets, or risk derivation:
+the persisted buffer-inclusive executable span does. The description below
+stays accurate for `legacy_uncapped` positions and as the buffer-composition
+reference.
 
 ## Context
 

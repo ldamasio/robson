@@ -343,7 +343,7 @@ Priorities:
 | Risk gate | `robson-engine/src/risk.rs` | `RiskGate::evaluate()` — monthly check uses `<=` (blocks at exactly 4.00%) |
 | MonthlyHalt gate | `robsond/src/circuit_breaker.rs` | Binary `Active | MonthlyHalt` state machine |
 | MonthlyHalt trigger | `robsond/src/position_manager.rs` | `trigger_monthly_halt()` — closes all positions, blocks new entries |
-| Span definition | `robson-domain/src/value_objects.rs` | `TechnicalStopDistance::span()` |
+| Span definition | `robson-domain/src/value_objects.rs` | `TechnicalStopDistance::span()` — current implementation; ADR-0052 (pending) makes the persisted buffer-inclusive executable span the ladder/risk unit for new arms |
 
 ## Follow-up Required
 
