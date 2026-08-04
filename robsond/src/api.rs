@@ -157,6 +157,19 @@ pub struct StatusResponse {
     pub monthly_realized_loss: Decimal,
     /// Governed realized loss as a percentage of capital_base.
     pub monthly_realized_loss_pct: Decimal,
+    /// Persisted monthly budget accounting model.
+    pub monthly_budget_model: String,
+    /// Signed sum of governed closed-position P&L net of fees for the current
+    /// month. This is not yet ADR-0051 settlement-complete: funding and other
+    /// typed income evidence are excluded, an activation blocker under
+    /// ADR-0051 §3/§5.4.
+    pub month_governed_realized_net: Decimal,
+    /// Net loss consumed under ADR-0051's net-from-start model.
+    pub monthly_net_loss_consumed: Decimal,
+    /// Canonical latent risk reserved for live Active + Entering positions.
+    pub monthly_open_risk_reserved: Decimal,
+    /// Fixed 4% monetary budget for the persisted monthly capital base.
+    pub monthly_budget_amount: Decimal,
     /// Governed month equity net: realized net plus unrealized PnL of open
     /// Robson positions (ADR-0046).
     pub month_equity_net: Decimal,
@@ -164,10 +177,13 @@ pub struct StatusResponse {
     pub month_peak_net: Decimal,
     /// Monthly give-back from peak as percentage of the 4% monthly budget.
     pub monthly_giveback_pct: Decimal,
-    /// Remaining monthly budget after give-back and latent risk.
+    /// Remaining monthly budget under the persisted active model.
     pub monthly_budget_remaining: Decimal,
     /// Starting capital basis for the current month.
     pub capital_base: Decimal,
+    /// Whether the persisted monthly budget basis is invalid under ADR-0051
+    /// §1 (`capital_base <= 0`).
+    pub monthly_budget_basis_invalid: bool,
     /// Current futures wallet balance reported by the exchange.
     pub wallet_balance: Decimal,
     /// Income-ledger items past the evidence-lag grace period with no
@@ -1379,9 +1395,9 @@ where
     let positions = manager.get_open_positions().await.map_err(|e| to_error_response(e))?;
     let pending_approvals = manager.get_pending_approvals().await;
     let now = chrono::Utc::now();
-    let monthly = manager.load_monthly_state(now).await.map_err(|e| to_error_response(e))?;
-    let new_slots_available =
-        manager.compute_slots_available().await.map_err(|e| to_error_response(e))?;
+    let budget_snapshot =
+        manager.canonical_budget_snapshot(now).await.map_err(|e| to_error_response(e))?;
+    let new_slots_available = budget_snapshot.slots_active;
     let exchange_positions = match manager.exchange_open_positions().await {
         Ok(positions) => Some(positions),
         Err(error) => {
@@ -1394,20 +1410,14 @@ where
         .await
         .map_err(|e| to_error_response(e))?;
     let wallet_balance = state.wallet_balance().await.map_err(|e| to_error_response(e))?;
-    let monthly_realized_loss_pct = if monthly.capital_base > Decimal::ZERO {
-        governed_monthly_realized_loss / monthly.capital_base * Decimal::from(100u32)
+    let monthly_realized_loss_pct = if budget_snapshot.capital_base > Decimal::ZERO {
+        governed_monthly_realized_loss / budget_snapshot.capital_base * Decimal::from(100u32)
     } else {
         Decimal::ZERO
     };
-    let (
-        month_equity_net,
-        month_peak_net,
-        monthly_giveback,
-        monthly_budget_remaining,
-        monthly_budget,
-    ) = manager.monthly_budget_snapshot(now).await.map_err(|e| to_error_response(e))?;
+    let monthly_budget = budget_snapshot.budget_amount();
     let monthly_giveback_pct = if monthly_budget > Decimal::ZERO {
-        monthly_giveback / monthly_budget * Decimal::from(100u32)
+        budget_snapshot.consumed_hwm / monthly_budget * Decimal::from(100u32)
     } else {
         Decimal::ZERO
     };
@@ -1484,11 +1494,17 @@ where
         slot_cells_total,
         monthly_realized_loss: governed_monthly_realized_loss,
         monthly_realized_loss_pct,
-        month_equity_net,
-        month_peak_net,
+        monthly_budget_model: budget_snapshot.model.as_str().to_string(),
+        month_governed_realized_net: budget_snapshot.governed_realized_net,
+        monthly_net_loss_consumed: budget_snapshot.consumed_nfs,
+        monthly_open_risk_reserved: budget_snapshot.latent_risk,
+        monthly_budget_amount: monthly_budget,
+        month_equity_net: budget_snapshot.month_equity_net,
+        month_peak_net: budget_snapshot.month_peak_net,
         monthly_giveback_pct,
-        monthly_budget_remaining,
-        capital_base: monthly.capital_base,
+        monthly_budget_remaining: budget_snapshot.remaining_active,
+        capital_base: budget_snapshot.capital_base,
+        monthly_budget_basis_invalid: budget_snapshot.capital_base_invalid,
         wallet_balance,
         unmatched_income_count,
     }))
@@ -3857,6 +3873,13 @@ mod tests {
         // not subtracted from the live slot count.
         assert_eq!(status.new_slots_available, 4);
         assert_eq!(status.slot_cells_total, 5);
+        assert_eq!(status.monthly_budget_model, "hwm_v1");
+        assert_eq!(status.month_governed_realized_net, Decimal::ZERO);
+        assert_eq!(status.monthly_net_loss_consumed, Decimal::ZERO);
+        assert_eq!(status.monthly_open_risk_reserved, Decimal::ZERO);
+        assert_eq!(status.monthly_budget_amount, dec!(400));
+        assert_eq!(status.monthly_budget_remaining, dec!(400));
+        assert!(!status.monthly_budget_basis_invalid);
         assert_eq!(status.stale_active_count, 0);
         assert!(status.reconciliation_blockers.is_empty());
         assert_eq!(status.pending_approvals.len(), 1);
@@ -3887,8 +3910,12 @@ mod tests {
         assert_eq!(status.reconciliation_blockers[0].symbol, "BTCUSDT");
         assert_eq!(status.reconciliation_blockers[0].reason, "stale_missing_on_exchange");
         assert_eq!(status.occupied_slots, 0);
-        assert_eq!(status.new_slots_available, 4);
-        assert_eq!(status.slot_cells_total, 4);
+        // ADR-0051 failure-mode row "Exchange position inventory unavailable":
+        // status hides the stale position from display counts but reserves its
+        // durable local risk conservatively in the budget snapshot.
+        assert_eq!(status.new_slots_available, 3);
+        assert_eq!(status.slot_cells_total, 3);
+        assert_eq!(status.monthly_open_risk_reserved, dec!(10));
     }
 
     // to_error_response unit tests — catch-all was `_ => 400` before this fix.

@@ -9,6 +9,8 @@
 //! - `robsond_active_positions` — currently open position count
 //! - `robsond_stale_active_positions` — open book positions missing on exchange
 //! - `robsond_monthly_halt_active` — MonthlyHalt circuit breaker (0 or 1)
+//! - `robsond_budget_model_shadow_slots_delta` — dormant ADR-0051 NFS slots
+//!   minus HWM slots
 //! - `robsond_market_data_ws_failures_total` — failed WS attempts by endpoint
 //! - `robsond_sse_connections` — currently connected SSE clients on `/events`
 //! - `robsond_sse_events_total` — public SSE events sent, labelled by event
@@ -83,6 +85,15 @@ pub static MONTHLY_HALT_ACTIVE: LazyLock<Gauge> = LazyLock::new(|| {
         "MonthlyHalt circuit breaker (0=normal, 1=halted)"
     )
     .expect("failed to register robsond_monthly_halt_active")
+});
+
+/// Dormant ADR-0051 shadow comparison: net-from-start slots minus HWM slots.
+pub static BUDGET_MODEL_SHADOW_SLOTS_DELTA: LazyLock<Gauge> = LazyLock::new(|| {
+    register_gauge!(
+        "robsond_budget_model_shadow_slots_delta",
+        "Net-from-start monthly budget slots minus HWM slots"
+    )
+    .expect("failed to register robsond_budget_model_shadow_slots_delta")
 });
 
 /// Market data mode per symbol (0 = WS, 1 = REST fallback) — ADR-0044.

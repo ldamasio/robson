@@ -16,6 +16,15 @@ use crate::{
     types::{CapitalBaseRecalibrated, EntryFilled, MonthBoundaryReset, PositionClosedDomain},
 };
 
+const INHERIT_BUDGET_MODEL: &str = r#"COALESCE(
+    (SELECT monthly_budget_model
+     FROM monthly_state
+     WHERE (year, month) < ($1::SMALLINT, $2::SMALLINT)
+     ORDER BY year DESC, month DESC
+     LIMIT 1),
+    'hwm_v1'
+)"#;
+
 pub(crate) async fn handle_month_boundary_reset(
     pool: &PgPool,
     envelope: &EventEnvelope,
@@ -37,10 +46,17 @@ pub(crate) async fn handle_month_boundary_reset(
         reason: format!("month out of range for SMALLINT: {}", payload.month),
     })?;
 
-    sqlx::query(
+    let statement = format!(
         r#"
-        INSERT INTO monthly_state (year, month, capital_base, carried_risk, realized_loss, trades_opened, month_peak_net, boundary_reset_at, created_at)
-        VALUES ($1, $2, $3, $4, 0, 0, 0, $5, $5)
+        INSERT INTO monthly_state (
+            year, month, capital_base, carried_risk, realized_loss, trades_opened,
+            month_peak_net, monthly_budget_model, boundary_reset_at, created_at
+        )
+        VALUES (
+            $1, $2, $3, $4, 0, 0, 0,
+            {INHERIT_BUDGET_MODEL},
+            $5, $5
+        )
         ON CONFLICT (year, month) DO UPDATE SET
             capital_base = EXCLUDED.capital_base,
             carried_risk = EXCLUDED.carried_risk,
@@ -49,14 +65,15 @@ pub(crate) async fn handle_month_boundary_reset(
             month_peak_net = 0,
             boundary_reset_at = EXCLUDED.boundary_reset_at
         "#,
-    )
-    .bind(year)
-    .bind(month)
-    .bind(payload.capital_base)
-    .bind(payload.carried_positions_risk)
-    .bind(payload.timestamp)
-    .execute(pool)
-    .await?;
+    );
+    sqlx::query(&statement)
+        .bind(year)
+        .bind(month)
+        .bind(payload.capital_base)
+        .bind(payload.carried_positions_risk)
+        .bind(payload.timestamp)
+        .execute(pool)
+        .await?;
 
     Ok(())
 }
@@ -80,22 +97,30 @@ pub(crate) async fn handle_capital_base_recalibrated(
         reason: format!("month out of range for SMALLINT: {}", payload.month),
     })?;
 
-    sqlx::query(
+    let statement = format!(
         r#"
-        INSERT INTO monthly_state (year, month, capital_base, carried_risk, realized_loss, trades_opened, month_peak_net, created_at)
-        VALUES ($1, $2, $3, $4, 0, 0, 0, $5)
+        INSERT INTO monthly_state (
+            year, month, capital_base, carried_risk, realized_loss, trades_opened,
+            month_peak_net, monthly_budget_model, created_at
+        )
+        VALUES (
+            $1, $2, $3, $4, 0, 0, 0,
+            {INHERIT_BUDGET_MODEL},
+            $5
+        )
         ON CONFLICT (year, month) DO UPDATE SET
             capital_base = EXCLUDED.capital_base,
             carried_risk = EXCLUDED.carried_risk
         "#,
-    )
-    .bind(year)
-    .bind(month)
-    .bind(payload.new_capital_base)
-    .bind(payload.carried_risk)
-    .bind(payload.timestamp)
-    .execute(pool)
-    .await?;
+    );
+    sqlx::query(&statement)
+        .bind(year)
+        .bind(month)
+        .bind(payload.new_capital_base)
+        .bind(payload.carried_risk)
+        .bind(payload.timestamp)
+        .execute(pool)
+        .await?;
 
     Ok(())
 }
@@ -118,19 +143,27 @@ pub(crate) async fn handle_entry_filled_monthly(
     let year = envelope.occurred_at.year() as i16;
     let month = envelope.occurred_at.month() as i16;
 
-    sqlx::query(
+    let statement = format!(
         r#"
-        INSERT INTO monthly_state (year, month, capital_base, realized_loss, trades_opened, month_peak_net, created_at)
-        VALUES ($1, $2, 0, 0, 1, 0, $3)
+        INSERT INTO monthly_state (
+            year, month, capital_base, realized_loss, trades_opened,
+            month_peak_net, monthly_budget_model, created_at
+        )
+        VALUES (
+            $1, $2, 0, 0, 1, 0,
+            {INHERIT_BUDGET_MODEL},
+            $3
+        )
         ON CONFLICT (year, month) DO UPDATE SET
             trades_opened = monthly_state.trades_opened + 1
         "#,
-    )
-    .bind(year)
-    .bind(month)
-    .bind(envelope.occurred_at)
-    .execute(pool)
-    .await?;
+    );
+    sqlx::query(&statement)
+        .bind(year)
+        .bind(month)
+        .bind(envelope.occurred_at)
+        .execute(pool)
+        .await?;
 
     Ok(())
 }
@@ -161,20 +194,28 @@ pub(crate) async fn handle_position_closed_monthly(
     let year = envelope.occurred_at.year() as i16;
     let month = envelope.occurred_at.month() as i16;
 
-    sqlx::query(
+    let statement = format!(
         r#"
-        INSERT INTO monthly_state (year, month, capital_base, realized_loss, trades_opened, month_peak_net, created_at)
-        VALUES ($1, $2, 0, $3, 0, 0, $4)
+        INSERT INTO monthly_state (
+            year, month, capital_base, realized_loss, trades_opened,
+            month_peak_net, monthly_budget_model, created_at
+        )
+        VALUES (
+            $1, $2, 0, $3, 0, 0,
+            {INHERIT_BUDGET_MODEL},
+            $4
+        )
         ON CONFLICT (year, month) DO UPDATE SET
             realized_loss = monthly_state.realized_loss + $3
         "#,
-    )
-    .bind(year)
-    .bind(month)
-    .bind(loss)
-    .bind(envelope.occurred_at)
-    .execute(pool)
-    .await?;
+    );
+    sqlx::query(&statement)
+        .bind(year)
+        .bind(month)
+        .bind(loss)
+        .bind(envelope.occurred_at)
+        .execute(pool)
+        .await?;
 
     Ok(())
 }

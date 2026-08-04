@@ -9,6 +9,50 @@ use std::fmt;
 use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 
+/// Monthly risk-budget accounting model persisted in `monthly_state`
+/// (ADR-0051 rollout steps 1-2).
+///
+/// `HwmV1` remains the default during the dormant dual-model rollout. The
+/// net-from-start model is selected only by a later operator-gated persisted
+/// state change; it is deliberately not configurable through process state.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MonthlyBudgetModel {
+    /// ADR-0046 high-water-mark give-back accounting.
+    HwmV1,
+    /// ADR-0051 governed net-from-start, non-expanding accounting.
+    NetFromStartNonExpandingV1,
+}
+
+impl MonthlyBudgetModel {
+    /// Stable string representation used by persistence and status APIs.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::HwmV1 => "hwm_v1",
+            Self::NetFromStartNonExpandingV1 => "net_from_start_non_expanding_v1",
+        }
+    }
+
+    /// Parse a persisted model name.
+    ///
+    /// Unknown values fail conservative to [`Self::HwmV1`]. Persistence
+    /// callers must log the unknown source value so schema/data drift remains
+    /// visible without accidentally activating a new accounting model.
+    pub fn from_persisted(value: &str) -> Self {
+        match value {
+            "hwm_v1" => Self::HwmV1,
+            "net_from_start_non_expanding_v1" => Self::NetFromStartNonExpandingV1,
+            _ => Self::HwmV1,
+        }
+    }
+}
+
+impl Default for MonthlyBudgetModel {
+    fn default() -> Self {
+        Self::HwmV1
+    }
+}
+
 /// Entry policy selected by the operator.
 ///
 /// This is a selector only. It must not contain signal-detection logic.
@@ -203,7 +247,10 @@ impl TradingPolicy {
     /// hold more entries than this count when trades risk less than the cap.
     ///
     /// Returns 0 if capital_base <= 0, risk amount <= 0, or remaining budget
-    /// is less than one full risk unit.
+    /// is less than one full risk unit. ADR-0051 caps this reporting value at
+    /// four guaranteed full-cap entries even if a caller supplies a policy or
+    /// intermediate state whose remaining budget exceeds four risk units. The
+    /// cap lives here so every engine/daemon reporting path shares one rule.
     pub fn slots_available(
         &self,
         capital_base: Decimal,
@@ -222,7 +269,7 @@ impl TradingPolicy {
             return 0;
         }
         let slots = remaining / risk_amount;
-        decimal_floor_to_u32(slots).unwrap_or(u32::MAX)
+        decimal_floor_to_u32(slots).unwrap_or(u32::MAX).min(4)
     }
 }
 
@@ -294,6 +341,25 @@ mod tests {
     }
 
     #[test]
+    fn monthly_budget_model_has_stable_string_serde_and_conservative_default() {
+        assert_eq!(MonthlyBudgetModel::default(), MonthlyBudgetModel::HwmV1);
+        assert_eq!(MonthlyBudgetModel::HwmV1.as_str(), "hwm_v1");
+        assert_eq!(
+            MonthlyBudgetModel::NetFromStartNonExpandingV1.as_str(),
+            "net_from_start_non_expanding_v1"
+        );
+        assert_eq!(MonthlyBudgetModel::from_persisted("unknown_v2"), MonthlyBudgetModel::HwmV1);
+        assert_eq!(
+            serde_json::to_string(&MonthlyBudgetModel::NetFromStartNonExpandingV1).unwrap(),
+            "\"net_from_start_non_expanding_v1\""
+        );
+        assert_eq!(
+            serde_json::from_str::<MonthlyBudgetModel>("\"hwm_v1\"").unwrap(),
+            MonthlyBudgetModel::HwmV1
+        );
+    }
+
+    #[test]
     fn risk_per_trade_amount() {
         let p = TradingPolicy::default();
         assert_eq!(p.risk_per_trade_amount(dec!(10000)), dec!(100));
@@ -356,6 +422,15 @@ mod tests {
         let p = TradingPolicy::default();
         let slots = p.slots_available(dec!(100), dec!(0), dec!(1));
         assert_eq!(slots, 3, "expected floor((4-0-1)/1) = 3");
+    }
+
+    #[test]
+    fn slots_available_is_capped_at_four() {
+        let expanded_reporting_policy = TradingPolicy {
+            risk_per_trade_pct: dec!(1),
+            max_monthly_drawdown_pct: dec!(10),
+        };
+        assert_eq!(expanded_reporting_policy.slots_available(dec!(100), dec!(0), dec!(0)), 4);
     }
 
     #[test]

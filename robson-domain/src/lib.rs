@@ -42,8 +42,8 @@ pub use executable_stop::{
 };
 pub use market_data::{Candle, MarketDataEvent, OrderBookSnapshot, Tick};
 pub use policy::{
-    ApprovalPolicy, EntryPolicy, EntryPolicyConfig, SignalEvaluationOutcome, StrategyId,
-    TechStopConfig, TradingPolicy,
+    ApprovalPolicy, EntryPolicy, EntryPolicyConfig, MonthlyBudgetModel, SignalEvaluationOutcome,
+    StrategyId, TechStopConfig, TradingPolicy,
 };
 pub use stop_policy::StopPolicy;
 pub use trading_rules::SymbolTradingRules;
