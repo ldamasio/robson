@@ -38,10 +38,10 @@ Index
 | ADR-0022 | Robson-Authored Position Invariant | Decided (Follow-up required) | 2026-04-18 |
 | ADR-0023 | Symbol-Agnostic Policy Invariant | Decided (Follow-up required) | 2026-04-18 |
 | ADR-0036 | Monthly Slot Inheritance and Stop Visibility | Decided | 2026-05-05 |
-| ADR-0038 | Capital Base Recalibration After Manual Account Change | Decided (Implementation required) | 2026-05-28 |
+| ADR-0038 | Capital Base Recalibration After Manual Account Change | Decided (Implementation required; partially superseded by ADR-0051: no intra-month budget-basis increase) | 2026-05-28 |
 | ADR-0043 | Budget-Metered Entry Admission | Decided | 2026-07-05 |
 | ADR-0044 | REST Market-Data Fallback for the Trailing Engine | Decided (Deployed; first prod engagement 2026-07-06) | 2026-07-05 |
-| ADR-0045 | Income-Ledger Reconciliation; Drift Demoted to Checksum | Decided (Fully shipped) | 2026-07-05 |
+| ADR-0045 | Income-Ledger Reconciliation; Drift Demoted to Checksum | Decided (Fully shipped; partially superseded by ADR-0051: new-entry admission fails closed on stale accounting) | 2026-07-05 |
 | ADR-0046 | Monthly High-Water-Mark Budget (Trailing Month) | Superseded by ADR-0051 | 2026-07-05 |
 | ADR-0047 | FE ↔ robsond Communication Topology (Option A, No Change) | Decided | 2026-07-06 |
 | ADR-0048 | A Triggered Insurance Stop Is Not a Cancellation | Decided (Deployed sha-d5803c47; not yet exercised against the live exchange) | 2026-07-31 |

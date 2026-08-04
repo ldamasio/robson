@@ -1,7 +1,14 @@
 # ADR-0045 — Income-Ledger Reconciliation; Drift Demoted to Checksum
 
 **Date**: 2026-07-05
-**Status**: Decided (fully shipped — hotfix, reconciliation-anchor fix, and the typed income ledger)
+**Status**: Decided (fully shipped — hotfix, reconciliation-anchor fix, and the typed income ledger); partially superseded by
+[ADR-0051](ADR-0051-net-from-start-monthly-budget.md): under
+`net_from_start_non_expanding_v1`, "income endpoint unavailable: trading
+unaffected" no longer holds for new-entry admission, which fails closed on
+stale or unavailable authoritative accounting (exit and protective-stop
+management continue). Typed evidence, item-level reconciliation, raw drift
+attribution, and the prohibition on absorbing unexplained residuals remain
+in force.
 **Deciders**: RBX Systems (operator + architecture)
 
 ---
@@ -108,7 +115,7 @@ fix path is resolving the reconciled close, not absorbing its money.
 
 | Failure | Behavior |
 | --- | --- |
-| Income endpoint unavailable | Ledger matching pauses; alarm on staleness; no accounting writes; trading unaffected |
+| Income endpoint unavailable | Ledger matching pauses; alarm on staleness; no accounting writes; trading unaffected. **Superseded for new-entry admission by [ADR-0051](ADR-0051-net-from-start-monthly-budget.md)**: new entries fail closed after the freshness bound; exits and protective stops continue |
 | Income item matches nothing governed | Named anomaly, persistent alarm; operator decides (rotation-grade signal if it looks like unauthorized activity) |
 | Governed fill has no income item (lag) | Matching retries with backoff; residual alarm carries the pending fill id |
 | Residual ≠ 0 with all items matched | Invariant breach — loud alarm, block auto-recalibration, operator review |

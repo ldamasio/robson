@@ -1,7 +1,11 @@
 # ADR-0024 — Trading Policy Layer
 
 **Date**: 2026-04-19
-**Status**: DECIDED — MIG-v3#11 IMPLEMENTED (2026-04-19)
+**Status**: DECIDED — MIG-v3#11 IMPLEMENTED (2026-04-19); partially
+superseded by [ADR-0051](ADR-0051-net-from-start-monthly-budget.md):
+Decision 5's gross `realized_loss` budget formula (wins do not offset) and
+Decision 6A's ability to increase the monthly budget basis intra-month.
+Everything else remains in force.
 **Deciders**: RBX Systems (operator + architecture)
 
 ---
@@ -76,6 +80,15 @@ The duplicate-position guard (no same symbol+side) is preserved as an operationa
 constraint, not a risk limit.
 
 ### 5. Dynamic Slot Calculation Replaces Static max_open_positions
+
+> **Partially superseded by
+> [ADR-0051](ADR-0051-net-from-start-monthly-budget.md)**: the
+> `realized_loss` term below (gross sum of losing closes; wins do not
+> offset) is replaced by `consumed = max(0, −governed_realized_net)` —
+> realized gains offset prior realized losses down to zero, and the budget
+> never expands above 4%. The dynamic-slot structure, `latent_risk`, and
+> the 1% per-trade cap remain in force (as refined by ADR-0043 and
+> ADR-0051).
 
 The question "can a new position be opened?" is answered dynamically by the risk engine
 at each decision point. The calculation:
@@ -155,6 +168,14 @@ If a carried position closes in profit during the new month, that gain flows int
 retroactively increase the current month's `capital_base` or budget.
 
 ### 6A. Intra-Month Recalibration After Manual Account Change
+
+> **Partially superseded by
+> [ADR-0051](ADR-0051-net-from-start-monthly-budget.md)**: recalibration may
+> no longer *increase* the monthly budget basis intra-month. A confirmed
+> deposit updates margin and sizing capital only; a confirmed withdrawal or
+> other adverse change may conservatively reduce the effective budget basis.
+> The typed-evidence, audit-event, and fail-closed requirements below remain
+> in force.
 
 The month-start `capital_base` is immutable only while the operated Futures
 account remains exclusively controlled by `robsond`. If reconciliation detects a
