@@ -1,15 +1,25 @@
 # ADR-0050 — Valid-Level Selection, Per-Policy No-Valid-Stop Semantics, and Executable Risk Costing
 
 **Date**: 2026-08-02 (v2, after three-way architecture review)
-**Status**: ACCEPTED (merged 2026-08-02 via PR #149; operator decision)
+**Status**: ACCEPTED (merged 2026-08-02 via PR #149; operator decision);
+partially superseded by
+[ADR-0052](ADR-0052-executable-span-single-stop-policy.md) (decided
+2026-08-04, implementation pending): the `ROBSON_STOP_POLICY` runtime
+selector and the `span_capped_v1` variant (never persisted) are retired;
+the §4 buffer-cap mechanics are absorbed into the single `executable_span`
+policy with a buffer-inclusive persisted span. Level selection (§1),
+no-valid-stop semantics (§2/§6/§7), executable risk costing (§3), staged
+stop-distance bounds (§5), and per-position policy stamping remain in
+force.
 **Implementation status** (2026-08-03): §1 slice 2 (PR #151); §2/§6/§7 slice 3
 (PR #152); §5 slice 1 (PR #150); §3/§4 slice 5 (issue #154, superseding the
 rejected slice-4 PR #153) — `ExecutableStopPlan` single resolver,
 `SymbolTradingRules` runtime metadata, adverse-fill costing, and stop-policy
 versioning (`legacy_uncapped` | `span_capped_v1`). Activation of
-`span_capped_v1` for real entries is operator-gated via `ROBSON_STOP_POLICY`
-(default `legacy_uncapped`); positions armed before activation keep the legacy
-derivation forever.
+`span_capped_v1` for real entries remains operator-gated via
+`ROBSON_STOP_POLICY` (default `legacy_uncapped`) in the deployed code until
+the ADR-0052 implementation lands; positions armed before that cutover keep
+the legacy derivation forever.
 **Deciders**: RBX Systems (operator + architecture)
 **Amends**: ADR-0021 (level selection rule AND the sizing formula in its invariant 5),
 ADR-0041 (span-aware cap on the executable stop buffer)

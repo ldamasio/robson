@@ -508,6 +508,13 @@ See [v3-query-query-engine.md §11](v3-query-query-engine.md) for details.
 
 **Decision**: The trailing stop moves only in complete span steps, anchored to entry price. The span (`abs(entry_price - technical_stop)`) is the central unit of risk, movement, and decision.
 
+> **ADR-0052 follow-up (2026-08-04, implementation pending)**: the discrete
+> entry-anchored ladder stays, but for positions armed under
+> `executable_span` the unit becomes the persisted buffer-inclusive
+> executable span `S = |entry − executable_stop|`, not the raw technical
+> distance. The description above remains accurate as current
+> implementation and for `legacy_uncapped` positions.
+
 **Chose**: Discrete step trailing stop with span as unit
 **Rejected**: Continuous trailing (v2 behavior — reacts to noise); Percentage-based trailing (not anchored to technical structure); ATR-based trailing (requires indicator dependency, not structural)
 

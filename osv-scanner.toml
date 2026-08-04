@@ -16,3 +16,7 @@ reason = "protobuf 2.x (recursion crash in parsing): fix requires protobuf 3.x, 
 [[IgnoredVulns]]
 id = "RUSTSEC-2025-0134"
 reason = "rustls-pemfile 1.x is unmaintained (advisory, not a vulnerability); no fixed 1.x release. Transitive via sqlx TLS setup; migration follows sqlx. (2026-07-05)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0235"
+reason = "rkyv 0.7 (validation bypass): fix is rkyv 0.8.17, a semver-major only consumable when rust_decimal updates its optional dependency edge (still 0.7 as of rust_decimal 1.42). rkyv is an unenabled optional feature of rust_decimal — it is never compiled into any robson binary (cargo tree -i rkyv is empty on every target). Re-evaluate on rust_decimal releases. (2026-08-04)"
