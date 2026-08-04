@@ -494,7 +494,7 @@ impl RiskGate {
         //    reservation at the full 1% cap). The trade is charged its planned
         //    worst-case loss; the 1% per-trade cap still bounds any single trade, and
         //    the 4% monthly budget stays the hard invariant.
-        let capital_base = context.capital; // MIG-v3#11 approximation; MIG-v3#12 persists real capital base.
+        let capital_base = context.capital;
         let budget_consumed = context.budget_consumed();
         let latent_risk = context.latent_risk_sum();
         let remaining = self.policy.remaining_budget(capital_base, budget_consumed, latent_risk);
@@ -996,6 +996,32 @@ mod tests {
         // capital=100, budget=4, risk=1, no loss, no latent → 4 slots
         let ctx = RiskContext::new(dec!(100));
         assert_eq!(ctx.slots_available(&policy, dec!(100)), 4);
+    }
+
+    #[test]
+    fn hwm_budget_consumed_is_exactly_the_giveback() {
+        for (peak, equity) in [
+            (dec!(0), dec!(0)),
+            (dec!(10), dec!(4)),
+            (dec!(4), dec!(10)),
+            (dec!(0), dec!(-5)),
+        ] {
+            let context = RiskContext::with_month_equity(
+                dec!(100),
+                vec![],
+                Decimal::ZERO,
+                Decimal::ZERO,
+                Decimal::ZERO,
+                equity,
+                peak,
+            );
+
+            assert_eq!(
+                context.budget_consumed(),
+                context.budget_giveback(),
+                "peak={peak}, equity={equity}"
+            );
+        }
     }
 
     #[test]
