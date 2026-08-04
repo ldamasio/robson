@@ -1511,7 +1511,8 @@ where
         monthly_giveback_pct,
         monthly_budget_remaining: budget_snapshot.remaining_active,
         capital_base: budget_snapshot.capital_base,
-        monthly_budget_basis_invalid: budget_snapshot.capital_base_invalid,
+        monthly_budget_basis_invalid: budget_snapshot.capital_base_invalid
+            || budget_snapshot.latent_risk_invalid,
         wallet_balance,
         unmatched_income_count,
     }))
@@ -2401,14 +2402,14 @@ where
         .to_string(),
     );
 
-    let stop_buffer_bps = manager.risk_config_snapshot().stop_buffer_bps();
+    let engine = manager.engine();
     let trading_rules = manager.trading_rules_for(position).await;
     let mut summary = position_to_summary(
         position,
         live_price,
         entry_mode,
         approval_mode,
-        stop_buffer_bps,
+        &engine,
         trading_rules.as_ref(),
     );
     if matches!(position.state, PositionState::Armed) {
@@ -2463,7 +2464,7 @@ fn position_to_summary(
     live_price: Option<Price>,
     entry_mode: Option<String>,
     approval_mode: Option<String>,
-    stop_buffer_bps: Decimal,
+    engine: &robson_engine::Engine,
     trading_rules: Option<&robson_domain::SymbolTradingRules>,
 ) -> PositionSummary {
     let (
@@ -2548,35 +2549,8 @@ fn position_to_summary(
                 // ExecutableSpan. A plan failure (missing rules/persistence)
                 // surfaces as an absent effective stop rather than a wrong
                 // number.
-                let effective =
-                    robson_domain::build_executable_stop_plan(robson_domain::StopPlanInputs {
-                        policy: position.stop_policy,
-                        side: position.side,
-                        technical_stop: *trailing_stop,
-                        guard,
-                        // Signal entry reference, same as the engine's plan
-                        // (the fill price would drift the guard-bound cap
-                        // span away from what execution uses).
-                        entry_reference: position
-                            .tech_stop_distance
-                            .as_ref()
-                            .map(|tech_stop| tech_stop.entry_price)
-                            .or(position.entry_price),
-                        technical_span: position.tech_stop_distance.as_ref().map(|t| t.span()),
-                        stop_buffer_bps: position.stop_buffer_bps_at_arm.unwrap_or(stop_buffer_bps),
-                        executable_span_source: match position.stop_policy {
-                            robson_domain::StopPolicy::LegacyUncapped => {
-                                robson_domain::ExecutableSpanSource::Admission
-                            },
-                            robson_domain::StopPolicy::ExecutableSpan => {
-                                robson_domain::ExecutableSpanSource::Persisted {
-                                    executable_span: position.executable_span,
-                                    cap_basis_distance: position.cap_basis_distance,
-                                }
-                            },
-                        },
-                        rules: trading_rules,
-                    })
+                let effective = engine
+                    .stop_plan(position, *trailing_stop, guard, trading_rules)
                     .map(|plan| plan.trigger.as_decimal());
                 let effective = match effective {
                     Ok(effective) => effective,
@@ -2598,10 +2572,15 @@ fn position_to_summary(
                             quantity: (position.quantity.as_decimal() > Decimal::ZERO)
                                 .then(|| position.quantity.as_decimal()),
                             entry_price,
-                            entry_reference: position
-                                .tech_stop_distance
-                                .as_ref()
-                                .map(|stop| stop.entry_price.as_decimal()),
+                            entry_reference: (position.stop_policy
+                                == robson_domain::StopPolicy::ExecutableSpan)
+                                .then(|| {
+                                    position
+                                        .tech_stop_distance
+                                        .as_ref()
+                                        .map(|stop| stop.entry_price.as_decimal())
+                                })
+                                .flatten(),
                             trailing_stop: Some(trailing_stop.as_decimal()),
                             effective_stop: None,
                             raw_technical_stop: None,
@@ -2661,10 +2640,9 @@ fn position_to_summary(
             None
         },
         entry_price,
-        entry_reference: position
-            .tech_stop_distance
-            .as_ref()
-            .map(|stop| stop.entry_price.as_decimal()),
+        entry_reference: (position.stop_policy == robson_domain::StopPolicy::ExecutableSpan)
+            .then(|| position.tech_stop_distance.as_ref().map(|stop| stop.entry_price.as_decimal()))
+            .flatten(),
         trailing_stop,
         effective_stop,
         raw_technical_stop,
@@ -3091,6 +3069,10 @@ mod tests {
         let mut position =
             Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
         position.entry_price = Some(Price::new(dec!(100)).unwrap());
+        position.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(
+            Price::new(dec!(100)).unwrap(),
+            Price::new(dec!(95)).unwrap(),
+        ));
         position.quantity = robson_domain::Quantity::new(dec!(2)).unwrap();
         position.state = PositionState::Active {
             current_price: Price::new(dec!(100)).unwrap(),
@@ -3102,18 +3084,24 @@ mod tests {
             last_emitted_stop: None,
         };
 
+        let engine =
+            robson_engine::Engine::new(robson_domain::RiskConfig::new(dec!(10000)).unwrap());
         let summary = position_to_summary(
             &position,
             Some(Price::new(dec!(98)).unwrap()),
             None,
             None,
-            Decimal::ZERO,
+            &engine,
             None,
         );
 
         assert_eq!(summary.current_price, Some(dec!(98)));
         assert_eq!(summary.pnl, Some(dec!(-4)));
         assert_eq!(summary.variation_pct, Some(dec!(-2.00)));
+        assert_eq!(
+            summary.entry_reference, None,
+            "entry_reference is an executable-span contract, not a legacy fill alias"
+        );
     }
 
     #[test]
@@ -3132,12 +3120,14 @@ mod tests {
             last_emitted_stop: None,
         };
 
+        let engine =
+            robson_engine::Engine::new(robson_domain::RiskConfig::new(dec!(10000)).unwrap());
         let summary = position_to_summary(
             &position,
             Some(Price::new(dec!(90)).unwrap()),
             None,
             None,
-            Decimal::ZERO,
+            &engine,
             None,
         );
 
@@ -3187,7 +3177,13 @@ mod tests {
         )
         .unwrap();
 
-        let summary = position_to_summary(&position, None, None, None, dec!(10), Some(&rules));
+        let engine = robson_engine::Engine::new(
+            robson_domain::RiskConfig::new(dec!(10000))
+                .unwrap()
+                .with_stop_buffer(dec!(10))
+                .unwrap(),
+        );
+        let summary = position_to_summary(&position, None, None, None, &engine, Some(&rules));
 
         assert_eq!(summary.stop_policy, "executable_span");
         assert_eq!(summary.entry_price, Some(dec!(62020)));
@@ -3208,7 +3204,9 @@ mod tests {
             exit_reason: robson_domain::ExitReason::UserPanic,
         };
 
-        let summary = position_to_summary(&position, None, None, None, Decimal::ZERO, None);
+        let engine =
+            robson_engine::Engine::new(robson_domain::RiskConfig::new(dec!(10000)).unwrap());
+        let summary = position_to_summary(&position, None, None, None, &engine, None);
 
         assert_eq!(summary.current_price, Some(dec!(90)));
         assert_eq!(summary.pnl, Some(dec!(20)));

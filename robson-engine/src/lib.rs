@@ -55,7 +55,7 @@ pub use signal_strategy::{
     SignalDecision, SignalReason, SignalStrategy, SmaCrossoverStrategy, StrategyRegistry,
 };
 use thiserror::Error;
-use tracing::debug;
+use tracing::{debug, error};
 
 // =============================================================================
 // Engine Errors
@@ -519,9 +519,12 @@ impl Engine {
                 || position.cap_basis_distance.is_some()
                 || position.tick_size_at_admission.is_some())
         {
-            return Err(EngineError::DomainError(robson_domain::DomainError::DegenerateStopSpan(
-                "ExecutableSpan position already contains immutable admission evidence".to_string(),
-            )));
+            return Err(EngineError::DomainError(
+                robson_domain::DomainError::AdmissionEvidenceAlreadyPresent(
+                    "ExecutableSpan position already contains immutable admission evidence"
+                        .to_string(),
+                ),
+            ));
         }
 
         // 3. Validate and get tech stop distance (single bounds source, ADR-0050 §5)
@@ -758,30 +761,88 @@ impl Engine {
         updated_position.entry_filled_at = Some(filled_at);
         updated_position.updated_at = filled_at;
 
-        // ExecutableSpan admission already resolved and persisted the exact
-        // trigger before exchange submission. Reuse that value at fill: a
-        // second resolver call here would apply the buffer twice conceptually
-        // and would make fill protection depend on refreshed metadata. Legacy
-        // positions retain their historical fill-time derivation unchanged.
-        let insurance_trigger = match position.stop_policy {
-            StopPolicy::ExecutableSpan => position.initial_executable_stop.ok_or_else(|| {
-                EngineError::MissingData(
-                    "ExecutableSpan position missing persisted initial_executable_stop".to_string(),
-                )
-            })?,
+        // Resolve protection from LIVE trading rules at fill. The persisted
+        // admission trigger is an assertion, not the execution source: an
+        // exchange tick-size refresh must move both software and insurance
+        // protection to the same live grid. A real fill is never left
+        // unprotected because resolution failed — fall back first to the
+        // persisted admission trigger, then to the chart-derived initial
+        // trailing stop, and emit durable quarantine-style evidence.
+        let (insurance_trigger, protection_alert) = match position.stop_policy {
+            StopPolicy::ExecutableSpan => match self.stop_plan(
+                &updated_position,
+                initial_trailing_stop,
+                invalidation_guard_level,
+                rules,
+            ) {
+                Ok(live_plan) => {
+                    let drift_event = position.initial_executable_stop.and_then(|persisted| {
+                        (persisted != live_plan.trigger).then(|| {
+                            error!(
+                                position_id = %position.id,
+                                persisted_trigger = %persisted,
+                                live_trigger = %live_plan.trigger,
+                                tick_size_at_admission = ?position.tick_size_at_admission,
+                                live_tick_size = ?live_plan.tick_size,
+                                "CRITICAL: fill-time executable-stop quantization drift detected; live trigger wins"
+                            );
+                            Event::ExecutableStopPlanDriftDetected {
+                                position_id: position.id,
+                                persisted_trigger: persisted,
+                                live_trigger: live_plan.trigger,
+                                tick_size_at_admission: position.tick_size_at_admission,
+                                live_tick_size: live_plan.tick_size,
+                                severity: "critical".to_string(),
+                                timestamp: filled_at,
+                            }
+                        })
+                    });
+                    (live_plan.trigger, drift_event)
+                },
+                Err(live_error) => {
+                    let (fallback_trigger, fallback_source) = match position.initial_executable_stop
+                    {
+                        Some(persisted) => (persisted, "persisted_initial_executable_stop"),
+                        None => (initial_trailing_stop, "initial_trailing_stop"),
+                    };
+                    error!(
+                        position_id = %position.id,
+                        error = %live_error,
+                        %fallback_source,
+                        fallback_trigger = %fallback_trigger,
+                        "CRITICAL: live executable-stop resolution failed after a real fill; placing fallback insurance and quarantining for operator review"
+                    );
+                    (
+                        fallback_trigger,
+                        Some(Event::EntryFillProtectionFallback {
+                            position_id: position.id,
+                            live_resolution_error: live_error.to_string(),
+                            fallback_source: fallback_source.to_string(),
+                            fallback_trigger,
+                            persisted_trigger: position.initial_executable_stop,
+                            tick_size_at_admission: position.tick_size_at_admission,
+                            live_tick_size: rules.map(SymbolTradingRules::tick_size),
+                            requires_operator_review: true,
+                            timestamp: filled_at,
+                        }),
+                    )
+                },
+            },
             StopPolicy::LegacyUncapped => {
-                self.stop_plan(
-                    &updated_position,
-                    initial_trailing_stop,
-                    invalidation_guard_level,
-                    rules,
-                )?
-                .trigger
+                let trigger = self
+                    .stop_plan(
+                        &updated_position,
+                        initial_trailing_stop,
+                        invalidation_guard_level,
+                        rules,
+                    )?
+                    .trigger;
+                (trigger, None)
             },
         };
 
         // 5. Build actions (emit event)
-        let actions = vec![
+        let mut actions = vec![
             EngineAction::EmitEvent(Event::EntryFilled {
                 position_id: position.id,
                 order_id: entry_order_id,
@@ -806,6 +867,13 @@ impl Engine {
                 stop_price: insurance_trigger,
             },
         ];
+        // Keep the protection action ahead of alert persistence. The daemon's
+        // non-entry batch semantics execute every action before PostgreSQL
+        // persistence, so an event-log outage cannot prevent insurance-stop
+        // placement on a fill that already happened.
+        if let Some(alert) = protection_alert {
+            actions.push(EngineAction::EmitEvent(alert));
+        }
 
         Ok(EngineDecision::with_position(actions, updated_position))
     }

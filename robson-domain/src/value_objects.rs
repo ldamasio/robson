@@ -62,6 +62,13 @@ pub enum DomainError {
     #[error("Degenerate stop span: {0}")]
     DegenerateStopSpan(String),
 
+    /// Immutable ADR-0052 admission evidence was already present when an
+    /// Armed position attempted admission again. This is a recovery boundary,
+    /// not a geometric stop-span failure: the position must require explicit
+    /// operator re-arm instead of deriving a second ruler.
+    #[error("Admission evidence already present: {0}")]
+    AdmissionEvidenceAlreadyPresent(String),
+
     /// The FINAL executable stop (post guard, cap, and tick quantization)
     /// left the admission distance bounds (ADR-0050 §5 stage 3). Typed so
     /// the rejection surfaces under its own reason code instead of the

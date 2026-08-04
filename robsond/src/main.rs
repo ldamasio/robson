@@ -156,6 +156,7 @@ async fn async_main() -> anyhow::Result<()> {
                     }
                 }
             };
+            db::verify_adr0052_schema_readiness(&pool).await?;
             let pool = Arc::new(pool);
 
             // Create projection recovery adapter (uses same pool)

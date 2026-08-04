@@ -6,9 +6,9 @@
 //! 1. every ExecutableSpan trigger is tick-aligned and quantized AWAY from the
 //!    position, never past one tick;
 //! 2. the effective buffer never exceeds the configured buffer nor 0.25 x span;
-//! 3. the engine's soft-exit boundary, the fill-time insurance placement, the
-//!    trailing-advance replacement, and the plan trigger are the SAME price
-//!    (ADR-0041 single-price invariant);
+//! 3. the engine's soft-exit boundary and trailing-advance replacement use the
+//!    live plan trigger; fill-time protection is pinned separately with
+//!    mismatched admission/live tick-size tests;
 //! 4. `planned_risk >= modeled adverse-fill loss` and `planned_risk <= capital
 //!    x 1%`;
 //! 5. a zero buffer under the legacy policy reproduces the historical
@@ -22,7 +22,7 @@ use chrono::Utc;
 use proptest::prelude::*;
 use robson_domain::{
     build_executable_stop_plan, size_entry, value_objects::effective_stop_price, DetectorSignal,
-    ExecutableSpanSource, Position, PositionState, Price, Quantity, RiskConfig, Side,
+    Event, ExecutableSpanSource, Position, PositionState, Price, Quantity, RiskConfig, Side,
     StopPlanInputs, StopPolicy, Symbol, SymbolTradingRules, TechnicalStopDistance,
 };
 use robson_engine::{Engine, EngineAction, EngineError, MarketData};
@@ -169,9 +169,8 @@ proptest! {
         }
     }
 
-    /// Property 3: the soft-exit boundary, the fill-time insurance
-    /// placement, and the trailing-advance replacement all sit exactly on
-    /// the plan trigger.
+    /// Property 3: the soft-exit boundary and trailing-advance replacement
+    /// both sit exactly on the live plan trigger.
     #[test]
     fn executable_span_surfaces_agree_on_the_single_trigger(
         stop_ticks in 600_000u64..640_000,     // trailing stop 60_..64_k on grid
@@ -227,32 +226,7 @@ proptest! {
             "exit must NOT trigger one tick inside the trigger"
         );
 
-        // Surface 3: fill-time insurance placement price.
-        let mut entering = position.clone();
-        entering.state = PositionState::Entering {
-            entry_order_id: Uuid::now_v7(),
-            expected_entry: Price::new(entry).unwrap(),
-            signal_id: Uuid::now_v7(),
-        };
-        let fill_decision = engine
-            .process_entry_fill_with_rules(
-                &entering,
-                Price::new(entry).unwrap(),
-                Quantity::new(dec!(0.01)).unwrap(),
-                Decimal::ZERO,
-                Utc::now(),
-                None,
-                None,
-                Some(&rules),
-            )
-            .unwrap();
-        let placed = fill_decision.actions.iter().find_map(|a| match a {
-            EngineAction::PlaceInsuranceStop { stop_price, .. } => Some(*stop_price),
-            _ => None,
-        });
-        prop_assert_eq!(placed, Some(plan.trigger));
-
-        // Surface 4: trailing-advance replacement price. Advance by one full
+        // Surface 3: trailing-advance replacement price. Advance by one full
         // span; the replacement must sit on the plan trigger for the NEW
         // trailing stop.
         let persisted_span = position.executable_span.unwrap();
@@ -383,6 +357,154 @@ proptest! {
         prop_assert_eq!(plan.trigger, technical);
         prop_assert_eq!(plan.trigger, effective_stop_price(side, technical, Decimal::ZERO));
     }
+}
+
+#[test]
+fn fill_uses_live_tick_size_and_emits_durable_drift_evidence() {
+    let admission_rules = btcusdt_rules();
+    let live_rules = SymbolTradingRules::new(
+        Symbol::from_pair("BTCUSDT").unwrap(),
+        dec!(0.25),
+        MIN_PRICE,
+        dec!(0.001),
+        dec!(0.001),
+        dec!(1000),
+        Decimal::ZERO,
+        2,
+        3,
+    )
+    .unwrap();
+    let engine = Engine::new(RiskConfig::new(dec!(10000)).unwrap());
+    let mut entering = executable_active_position(Side::Long, dec!(62000), dec!(61000), dec!(10));
+    let persisted_trigger = entering.initial_executable_stop.unwrap();
+    entering.state = PositionState::Entering {
+        entry_order_id: Uuid::now_v7(),
+        expected_entry: Price::new(dec!(62000)).unwrap(),
+        signal_id: Uuid::now_v7(),
+    };
+    let live_plan = engine
+        .stop_plan(&entering, Price::new(dec!(61000)).unwrap(), None, Some(&live_rules))
+        .unwrap();
+    assert_ne!(live_plan.trigger, persisted_trigger);
+
+    let decision = engine
+        .process_entry_fill_with_rules(
+            &entering,
+            Price::new(dec!(62000)).unwrap(),
+            Quantity::new(dec!(0.01)).unwrap(),
+            Decimal::ZERO,
+            Utc::now(),
+            None,
+            None,
+            Some(&live_rules),
+        )
+        .unwrap();
+
+    let placed = decision.actions.iter().find_map(|action| match action {
+        EngineAction::PlaceInsuranceStop { stop_price, .. } => Some(*stop_price),
+        _ => None,
+    });
+    assert_eq!(placed, Some(live_plan.trigger), "live trigger must win at fill");
+    assert!(decision.actions.iter().any(|action| matches!(
+        action,
+        EngineAction::EmitEvent(Event::ExecutableStopPlanDriftDetected {
+            persisted_trigger: event_persisted,
+            live_trigger,
+            tick_size_at_admission: Some(admission_tick),
+            live_tick_size: Some(live_tick),
+            severity,
+            ..
+        }) if *event_persisted == persisted_trigger
+            && *live_trigger == live_plan.trigger
+            && *admission_tick == admission_rules.tick_size()
+            && *live_tick == live_rules.tick_size()
+            && severity == "critical"
+    )));
+}
+
+#[test]
+fn fill_without_persisted_trigger_still_places_fallback_insurance() {
+    let engine = Engine::new(RiskConfig::new(dec!(10000)).unwrap());
+    let mut entering = executable_active_position(Side::Long, dec!(62000), dec!(61000), dec!(10));
+    entering.initial_executable_stop = None;
+    entering.state = PositionState::Entering {
+        entry_order_id: Uuid::now_v7(),
+        expected_entry: Price::new(dec!(62000)).unwrap(),
+        signal_id: Uuid::now_v7(),
+    };
+
+    let decision = engine
+        .process_entry_fill_with_rules(
+            &entering,
+            Price::new(dec!(62000)).unwrap(),
+            Quantity::new(dec!(0.01)).unwrap(),
+            Decimal::ZERO,
+            Utc::now(),
+            None,
+            None,
+            None,
+        )
+        .expect("a real fill must never fail before fallback protection");
+
+    assert!(decision.actions.iter().any(|action| matches!(
+        action,
+        EngineAction::PlaceInsuranceStop { stop_price, .. }
+            if *stop_price == Price::new(dec!(61000)).unwrap()
+    )));
+    assert!(decision.actions.iter().any(|action| matches!(
+        action,
+        EngineAction::EmitEvent(Event::EntryFillProtectionFallback {
+            fallback_source,
+            fallback_trigger,
+            persisted_trigger: None,
+            requires_operator_review: true,
+            ..
+        }) if fallback_source == "initial_trailing_stop"
+            && *fallback_trigger == Price::new(dec!(61000)).unwrap()
+    )));
+}
+
+#[test]
+fn fill_resolution_failure_prefers_persisted_trigger_fallback() {
+    let engine = Engine::new(RiskConfig::new(dec!(10000)).unwrap());
+    let mut entering = executable_active_position(Side::Long, dec!(62000), dec!(61000), dec!(10));
+    let persisted_trigger = entering.initial_executable_stop.unwrap();
+    entering.state = PositionState::Entering {
+        entry_order_id: Uuid::now_v7(),
+        expected_entry: Price::new(dec!(62000)).unwrap(),
+        signal_id: Uuid::now_v7(),
+    };
+
+    let decision = engine
+        .process_entry_fill_with_rules(
+            &entering,
+            Price::new(dec!(62000)).unwrap(),
+            Quantity::new(dec!(0.01)).unwrap(),
+            Decimal::ZERO,
+            Utc::now(),
+            None,
+            None,
+            None,
+        )
+        .expect("persisted protection must survive a live-rules outage");
+
+    assert!(decision.actions.iter().any(|action| matches!(
+        action,
+        EngineAction::PlaceInsuranceStop { stop_price, .. }
+            if *stop_price == persisted_trigger
+    )));
+    assert!(decision.actions.iter().any(|action| matches!(
+        action,
+        EngineAction::EmitEvent(Event::EntryFillProtectionFallback {
+            fallback_source,
+            fallback_trigger,
+            persisted_trigger: Some(event_persisted),
+            requires_operator_review: true,
+            ..
+        }) if fallback_source == "persisted_initial_executable_stop"
+            && *fallback_trigger == persisted_trigger
+            && *event_persisted == persisted_trigger
+    )));
 }
 
 /// Guard binding + cap binding, including release on the first trailing
@@ -596,7 +718,9 @@ fn executable_span_admission_refuses_to_rederive_existing_evidence() {
         .unwrap_err();
     assert!(matches!(
         error,
-        EngineError::DomainError(robson_domain::DomainError::DegenerateStopSpan(message))
+        EngineError::DomainError(
+            robson_domain::DomainError::AdmissionEvidenceAlreadyPresent(message)
+        )
             if message.contains("already contains immutable admission evidence")
     ));
 }

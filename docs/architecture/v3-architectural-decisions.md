@@ -513,8 +513,12 @@ See [v3-query-query-engine.md §11](v3-query-query-engine.md) for details.
 > discrete entry-anchored ladder stays, but for positions armed under
 > `executable_span` the unit becomes the persisted buffer-inclusive
 > executable span `S = |entry − executable_stop|`, not the raw technical
-> distance. The raw-span description above now applies only to
-> `legacy_uncapped` provenance replay.
+> distance. Canonical latent risk resolves the current executable trigger and
+> includes its gap/fee envelope, so admission, slots, status, and MonthlyHalt
+> share the same reservation. The raw-span description above now applies only
+> to `legacy_uncapped` provenance replay. Repository implementation is
+> complete; `rbx-infra` manifest rejection and operator arming-quiescence are
+> pending rollout work.
 
 **Chose**: Discrete step trailing stop with span as unit
 **Rejected**: Continuous trailing (v2 behavior — reacts to noise); Percentage-based trailing (not anchored to technical structure); ATR-based trailing (requires indicator dependency, not structural)

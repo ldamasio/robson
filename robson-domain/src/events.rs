@@ -253,6 +253,68 @@ pub enum Event {
         timestamp: DateTime<Utc>,
     },
 
+    /// Fill-time live stop resolution disagreed with the immutable
+    /// admission-time trigger. The live trigger still wins so protection
+    /// matches current exchange rules; this event makes the quantization
+    /// drift durable and operator-visible.
+    ExecutableStopPlanDriftDetected {
+        /// Position identifier
+        position_id: PositionId,
+        /// Trigger persisted during admission
+        persisted_trigger: Price,
+        /// Trigger resolved from live trading rules at fill
+        live_trigger: Price,
+        /// Tick size used during admission, when present in historical state
+        tick_size_at_admission: Option<Decimal>,
+        /// Tick size returned by the live resolver
+        live_tick_size: Option<Decimal>,
+        /// Stable severity label for alert routing
+        severity: String,
+        /// When the drift was detected
+        timestamp: DateTime<Utc>,
+    },
+
+    /// A real entry fill could not resolve its live executable stop and used
+    /// a protection-first fallback. Insurance placement must proceed; the
+    /// position requires operator review after protection is established.
+    EntryFillProtectionFallback {
+        /// Position identifier
+        position_id: PositionId,
+        /// Live resolver failure
+        live_resolution_error: String,
+        /// Fallback source: `persisted_initial_executable_stop` or
+        /// `initial_trailing_stop`
+        fallback_source: String,
+        /// Trigger sent to insurance-stop placement
+        fallback_trigger: Price,
+        /// Admission trigger, when it existed
+        persisted_trigger: Option<Price>,
+        /// Tick size used during admission, when it existed
+        tick_size_at_admission: Option<Decimal>,
+        /// Tick size supplied to the live resolver, when rules were available
+        live_tick_size: Option<Decimal>,
+        /// True: protection remains active but operator review is required
+        requires_operator_review: bool,
+        /// When fallback protection was selected
+        timestamp: DateTime<Utc>,
+    },
+
+    /// Canonical monthly-budget pricing could not resolve an ExecutableSpan
+    /// position. The snapshot fails closed for admission and this durable
+    /// warning identifies the position and cause.
+    ExecutableStopRiskResolutionFailed {
+        /// Position identifier
+        position_id: PositionId,
+        /// Risk-bearing lifecycle state being priced
+        state: String,
+        /// Resolver or persisted-evidence failure
+        reason: String,
+        /// Stable severity label for alert routing
+        severity: String,
+        /// When the canonical snapshot detected the failure
+        timestamp: DateTime<Utc>,
+    },
+
     /// Trailing stop updated due to favorable price movement
     TrailingStopUpdated {
         /// Position identifier
@@ -545,6 +607,9 @@ impl Event {
             | Event::EntryOrderFailed { position_id, .. }
             | Event::EntryExecutionRejected { position_id, .. }
             | Event::EntryFilled { position_id, .. }
+            | Event::ExecutableStopPlanDriftDetected { position_id, .. }
+            | Event::EntryFillProtectionFallback { position_id, .. }
+            | Event::ExecutableStopRiskResolutionFailed { position_id, .. }
             | Event::TrailingStopUpdated { position_id, .. }
             | Event::PositionMonitorTick { position_id, .. }
             | Event::ExitTriggered { position_id, .. }
@@ -580,6 +645,9 @@ impl Event {
             | Event::EntryOrderFailed { timestamp, .. }
             | Event::EntryExecutionRejected { timestamp, .. }
             | Event::EntryFilled { timestamp, .. }
+            | Event::ExecutableStopPlanDriftDetected { timestamp, .. }
+            | Event::EntryFillProtectionFallback { timestamp, .. }
+            | Event::ExecutableStopRiskResolutionFailed { timestamp, .. }
             | Event::TrailingStopUpdated { timestamp, .. }
             | Event::PositionMonitorTick { timestamp, .. }
             | Event::ExitTriggered { timestamp, .. }
@@ -614,6 +682,11 @@ impl Event {
             Event::EntryOrderFailed { .. } => "entry_order_failed",
             Event::EntryExecutionRejected { .. } => "entry_execution_rejected",
             Event::EntryFilled { .. } => "entry_filled",
+            Event::ExecutableStopPlanDriftDetected { .. } => "executable_stop_plan_drift_detected",
+            Event::EntryFillProtectionFallback { .. } => "entry_fill_protection_fallback",
+            Event::ExecutableStopRiskResolutionFailed { .. } => {
+                "executable_stop_risk_resolution_failed"
+            },
             Event::TrailingStopUpdated { .. } => "trailing_stop_updated",
             Event::PositionMonitorTick { .. } => "position_monitor_tick",
             Event::ExitTriggered { .. } => "exit_triggered",

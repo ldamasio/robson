@@ -287,6 +287,14 @@ fn row_to_position(row_data: PositionCurrentRow) -> Result<Option<Position>, Sto
             position.state = PositionState::Armed;
         },
         "entering" => {
+            if stop_policy == StopPolicy::ExecutableSpan
+                && position.initial_executable_stop.is_none()
+            {
+                return Err(StoreError::Deserialization(format!(
+                    "ExecutableSpan Entering position {} is missing persisted initial_executable_stop",
+                    row_data.position_id
+                )));
+            }
             let Some(entry_order_id) = row_data.entry_order_id else {
                 tracing::warn!(
                     position_id = %row_data.position_id,
@@ -924,6 +932,83 @@ mod tests {
             },
             _ => panic!("Expected Exiting state, got {:?}", exiting.state),
         }
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn executable_span_entering_recovery_requires_initial_trigger(pool: PgPool) {
+        let tenant_id = Uuid::now_v7();
+        let account_id = Uuid::now_v7();
+        let strategy_id = Uuid::now_v7();
+        let position_id = Uuid::now_v7();
+        let order_id = Uuid::now_v7();
+        let signal_id = Uuid::now_v7();
+        let now = Utc::now();
+
+        sqlx::query(
+            r#"
+            INSERT INTO orders_current (
+                order_id, tenant_id, account_id, position_id,
+                client_order_id, symbol, side, order_type,
+                quantity, status, filled_quantity, total_fee,
+                last_event_id, last_seq, created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4,
+                $5, 'BTCUSDT', 'buy', 'market',
+                1, 'acknowledged', 0, 0,
+                $6, 1, $7, $7
+            )
+            "#,
+        )
+        .bind(order_id)
+        .bind(tenant_id)
+        .bind(account_id)
+        .bind(position_id)
+        .bind(signal_id.to_string())
+        .bind(Uuid::now_v7())
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        sqlx::query(
+            r#"
+            INSERT INTO positions_current (
+                position_id, tenant_id, account_id, strategy_id,
+                symbol, side, state, entry_price, entry_quantity,
+                current_quantity, entry_order_id, entry_signal_id,
+                stop_policy, executable_span, cap_basis_distance,
+                tick_size_at_admission,
+                last_event_id, last_seq, created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4,
+                'BTCUSDT', 'long', 'entering', 100, 1,
+                1, $5, $6,
+                'executable_span', 10, 10, 0.1,
+                $7, 1, $8, $8
+            )
+            "#,
+        )
+        .bind(position_id)
+        .bind(tenant_id)
+        .bind(account_id)
+        .bind(strategy_id)
+        .bind(order_id)
+        .bind(signal_id)
+        .bind(Uuid::now_v7())
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let reader = PgProjectionReader::new(Arc::new(pool));
+        let error = reader.find_active_from_projection(tenant_id).await.unwrap_err();
+        let detail = error.to_string();
+        assert!(
+            detail.contains("missing persisted initial_executable_stop"),
+            "unexpected recovery error: {detail}"
+        );
+        assert!(detail.contains(&position_id.to_string()));
     }
 
     #[sqlx::test(migrations = "../migrations")]

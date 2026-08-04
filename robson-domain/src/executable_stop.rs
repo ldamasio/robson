@@ -28,7 +28,7 @@ use crate::{
 
 /// Buffer cap ratio for `ExecutableSpan`: effective buffer <= 0.25 x the
 /// cap-basis distance (ADR-0052 Decision 1).
-pub const SPAN_CAP_RATIO: Decimal = Decimal::from_parts(25, 0, 0, false, 2);
+pub const BUFFER_CAP_RATIO: Decimal = Decimal::from_parts(25, 0, 0, false, 2);
 
 /// Source of the immutable executable-span persistence contract.
 ///
@@ -277,7 +277,7 @@ pub fn build_executable_stop_plan(
                 Decimal::ZERO
             } else {
                 let offset = basis.as_decimal() * stop_buffer_bps / Decimal::from(10_000);
-                offset.min(cap_basis_distance * SPAN_CAP_RATIO)
+                offset.min(cap_basis_distance * BUFFER_CAP_RATIO)
             };
             let raw = match side {
                 Side::Long => basis.as_decimal() - effective_buffer,
@@ -342,30 +342,81 @@ pub fn build_executable_stop_plan(
 /// # Errors
 /// Returns [`DomainError::PositionSizingError`] when the adverse-fill
 /// distance is non-positive (the trigger is on the wrong side of entry).
+fn loss_distance_and_fees_at_trigger(
+    risk_config: &RiskConfig,
+    side: Side,
+    entry_price: Price,
+    trigger: Price,
+) -> Result<(Decimal, Decimal), DomainError> {
+    let entry = entry_price.as_decimal();
+    if entry <= Decimal::ZERO {
+        return Err(DomainError::PositionSizingError("Entry price must be positive".to_string()));
+    }
+    let gap = trigger.as_decimal() * risk_config.stop_gap_bps() / Decimal::from(10_000);
+    let adverse_fill = match side {
+        Side::Long => trigger.as_decimal() - gap,
+        Side::Short => trigger.as_decimal() + gap,
+    };
+    if adverse_fill <= Decimal::ZERO {
+        return Err(DomainError::PositionSizingError(format!(
+            "Adverse fill bound {adverse_fill} must be positive"
+        )));
+    }
+    let distance = match side {
+        Side::Long => entry - adverse_fill,
+        Side::Short => adverse_fill - entry,
+    };
+    let fees = risk_config.taker_fee_rate() * (entry + adverse_fill);
+    Ok((distance, fees))
+}
+
+/// Cost-priced residual risk per unit at an executable trigger.
+///
+/// Uses the same adverse gap and round-trip taker-fee envelope as admission
+/// sizing, while clamping directional loss at zero once a trailing stop has
+/// crossed into profit. This is the canonical latent-risk price for an
+/// already committed Entering or Active position.
+pub fn latent_risk_per_unit_at_trigger(
+    risk_config: &RiskConfig,
+    side: Side,
+    entry_price: Price,
+    trigger: Price,
+) -> Result<Decimal, DomainError> {
+    let (distance, fees) =
+        loss_distance_and_fees_at_trigger(risk_config, side, entry_price, trigger)?;
+    Ok(distance.max(Decimal::ZERO) + fees)
+}
+
+/// Worst expected realized loss per unit at an executable trigger.
+///
+/// Unlike latent pricing for an already-open winner, admission requires the
+/// adverse fill to remain on the loss side of entry.
+pub fn worst_case_loss_per_unit_at_trigger(
+    risk_config: &RiskConfig,
+    side: Side,
+    entry_price: Price,
+    trigger: Price,
+) -> Result<Decimal, DomainError> {
+    let (distance, fees) =
+        loss_distance_and_fees_at_trigger(risk_config, side, entry_price, trigger)?;
+    if distance <= Decimal::ZERO {
+        return Err(DomainError::PositionSizingError(format!(
+            "Adverse fill bound for trigger {} is not on the loss side of entry {}",
+            trigger.as_decimal(),
+            entry_price.as_decimal()
+        )));
+    }
+    Ok(distance + fees)
+}
+
+/// Worst expected realized loss per unit for an entry priced from a resolved
+/// executable-stop plan.
 pub fn worst_case_loss_per_unit_planned(
     risk_config: &RiskConfig,
     entry_price: Price,
     plan: &ExecutableStopPlan,
 ) -> Result<Decimal, DomainError> {
-    let entry = entry_price.as_decimal();
-    if entry <= Decimal::ZERO {
-        return Err(DomainError::PositionSizingError("Entry price must be positive".to_string()));
-    }
-    let adverse_fill = plan
-        .adverse_fill_bound(risk_config.stop_gap_bps())
-        .map_err(|e| DomainError::PositionSizingError(e.to_string()))?
-        .as_decimal();
-    let distance = match plan.side {
-        Side::Long => entry - adverse_fill,
-        Side::Short => adverse_fill - entry,
-    };
-    if distance <= Decimal::ZERO {
-        return Err(DomainError::PositionSizingError(format!(
-            "Adverse fill bound {adverse_fill} is not on the loss side of entry {entry}"
-        )));
-    }
-    let fees = risk_config.taker_fee_rate() * (entry + adverse_fill);
-    Ok(distance + fees)
+    worst_case_loss_per_unit_at_trigger(risk_config, plan.side, entry_price, plan.trigger)
 }
 
 #[cfg(test)]
@@ -733,6 +784,20 @@ mod tests {
         // The exit fee base is the adverse fill, strictly above the
         // pre-buffer stop: the Short deficit the review found is gone.
         assert!(adverse > dec!(62873.90));
+    }
+
+    #[test]
+    fn latent_risk_keeps_residual_costs_after_stop_crosses_into_profit() {
+        let config = RiskConfig::new(dec!(10000)).unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let trigger = Price::new(dec!(110)).unwrap();
+
+        let latent = latent_risk_per_unit_at_trigger(&config, Side::Long, entry, trigger).unwrap();
+        let adverse_fill = dec!(110) - dec!(110) * dec!(10) / dec!(10000);
+        let expected_fees = dec!(0.0005) * (dec!(100) + adverse_fill);
+
+        assert!(adverse_fill > dec!(100), "the trigger is already profitable");
+        assert_eq!(latent, expected_fees);
     }
 
     #[test]

@@ -181,9 +181,11 @@ The chosen mechanism for MIG-v2.5#2 is the **synchronous fail-fast write path**:
 
    **ADR-0052 implementation update (2026-08-04)**: the handler now projects
    the admission-time executable trigger, immutable executable span,
-   cap-basis distance, and admission tick size. Ordered action persistence
-   makes this projection a fail-fast durability barrier before entry-order
-   submission; it still does not change the lifecycle state.
+   cap-basis distance, and admission tick size. Ordered action persistence is
+   scoped to the entry-admission sequence and makes this projection a
+   fail-fast durability barrier before entry-order submission. Exit and
+   protective-order cycles retain execute-all-then-persist availability
+   semantics; the handler still does not change lifecycle state.
 
 7. **Added regression test for `entry_signal_received`**: New test `test_entry_signal_received_handled_without_error` in `crash_recovery.rs` verifies that the event is handled without `MissingHandler` error and doesn't change position state.
 

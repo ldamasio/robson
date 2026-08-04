@@ -28,3 +28,41 @@ COMMENT ON COLUMN positions_current.cap_basis_distance IS
     'ADR-0052 admission-time distance used for the 0.25x executable-stop buffer cap; NULL for legacy rows';
 COMMENT ON COLUMN positions_current.tick_size_at_admission IS
     'Exchange tick size used to adversely quantize the ADR-0052 admission trigger; NULL for legacy rows';
+
+-- Structural write-once barrier. Projection replay may fill a NULL column and
+-- may repeat the same value idempotently, but no writer may replace immutable
+-- admission evidence after it has been recorded.
+CREATE OR REPLACE FUNCTION reject_adr0052_admission_evidence_rewrite()
+RETURNS TRIGGER AS $$
+BEGIN
+    IF OLD.initial_executable_stop IS NOT NULL
+       AND NEW.initial_executable_stop IS DISTINCT FROM OLD.initial_executable_stop THEN
+        RAISE EXCEPTION 'initial_executable_stop is immutable once set';
+    END IF;
+    IF OLD.executable_span IS NOT NULL
+       AND NEW.executable_span IS DISTINCT FROM OLD.executable_span THEN
+        RAISE EXCEPTION 'executable_span is immutable once set';
+    END IF;
+    IF OLD.cap_basis_distance IS NOT NULL
+       AND NEW.cap_basis_distance IS DISTINCT FROM OLD.cap_basis_distance THEN
+        RAISE EXCEPTION 'cap_basis_distance is immutable once set';
+    END IF;
+    IF OLD.tick_size_at_admission IS NOT NULL
+       AND NEW.tick_size_at_admission IS DISTINCT FROM OLD.tick_size_at_admission THEN
+        RAISE EXCEPTION 'tick_size_at_admission is immutable once set';
+    END IF;
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS positions_current_adr0052_admission_evidence_write_once
+    ON positions_current;
+CREATE TRIGGER positions_current_adr0052_admission_evidence_write_once
+BEFORE UPDATE OF
+    initial_executable_stop,
+    executable_span,
+    cap_basis_distance,
+    tick_size_at_admission
+ON positions_current
+FOR EACH ROW
+EXECUTE FUNCTION reject_adr0052_admission_evidence_rewrite();

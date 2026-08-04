@@ -138,10 +138,8 @@ export function isRenderableLivePosition(position: { state: PositionState; excha
 }
 
 export function trailingStopMoveTarget(p: Position): { trigger_price: number; next_stop: number } | null {
-  const entry = p.entry_price;
   const stop = activeTrailingStop(p);
-  if (entry == null || stop == null) return null;
-  if (!Number.isFinite(entry) || !Number.isFinite(stop)) {
+  if (stop == null || !Number.isFinite(stop)) {
     return null;
   }
 
@@ -163,14 +161,26 @@ export function trailingStopMoveTarget(p: Position): { trigger_price: number; ne
     // stop from the immutable entry-anchored ruler. Before the first advance
     // the raw technical stop can differ from E +/- S, so its adverse side of
     // E is the explicit completed_spans = 0 case.
+    const favorableExtreme = activeFavorableExtreme(p);
     const completedSpans =
-      p.side === 'Short'
-        ? stop > entryReference
-          ? 0
-          : Math.floor((entryReference - stop) / executableSpan + 1e-9) + 1
-        : stop < entryReference
-          ? 0
-          : Math.floor((stop - entryReference) / executableSpan + 1e-9) + 1;
+      favorableExtreme != null && Number.isFinite(favorableExtreme)
+        ? Math.max(
+            0,
+            Math.floor(
+              (p.side === 'Short'
+                ? entryReference - favorableExtreme
+                : favorableExtreme - entryReference) /
+                executableSpan +
+                1e-9
+            )
+          )
+        : p.side === 'Short'
+          ? stop > entryReference
+            ? 0
+            : Math.floor((entryReference - stop) / executableSpan + 1e-9) + 1
+          : stop < entryReference
+            ? 0
+            : Math.floor((stop - entryReference) / executableSpan + 1e-9) + 1;
     const nextCompletedSpans = completedSpans + 1;
 
     if (p.side === 'Short') {
@@ -186,6 +196,8 @@ export function trailingStopMoveTarget(p: Position): { trigger_price: number; ne
     };
   }
 
+  const entry = p.entry_price;
+  if (entry == null || !Number.isFinite(entry)) return null;
   const span = p.tech_stop_distance;
   if (span == null || !Number.isFinite(span) || span <= 0) return null;
 
@@ -226,6 +238,16 @@ function activeTrailingStop(p: Position): number | null {
   const val = (state as Record<string, Record<string, unknown>>)[key];
   if (key !== 'Active' || !val) return null;
   return typeof val.trailing_stop === 'number' ? val.trailing_stop : null;
+}
+
+function activeFavorableExtreme(p: Position): number | null {
+  const state = p.state;
+  if (typeof state === 'string') return null;
+
+  const key = Object.keys(state)[0];
+  const val = (state as Record<string, Record<string, unknown>>)[key];
+  if (key !== 'Active' || !val) return null;
+  return typeof val.favorable_extreme === 'number' ? val.favorable_extreme : null;
 }
 
 export function positionMetaLine(p: Position): string {

@@ -51,6 +51,9 @@ enum ProjectionRoute {
     InsuranceStopCancelled,
     InsuranceStopFailed,
     StartupRecoveryInsuranceStopChecked,
+    ExecutableStopPlanDriftDetected,
+    EntryFillProtectionFallback,
+    ExecutableStopRiskResolutionFailed,
 }
 
 fn projection_route(event_type: &str) -> Option<ProjectionRoute> {
@@ -95,6 +98,13 @@ fn projection_route(event_type: &str) -> Option<ProjectionRoute> {
         "insurance_stop_failed" => Some(ProjectionRoute::InsuranceStopFailed),
         "startup_recovery_insurance_stop_checked" => {
             Some(ProjectionRoute::StartupRecoveryInsuranceStopChecked)
+        },
+        "executable_stop_plan_drift_detected" => {
+            Some(ProjectionRoute::ExecutableStopPlanDriftDetected)
+        },
+        "entry_fill_protection_fallback" => Some(ProjectionRoute::EntryFillProtectionFallback),
+        "executable_stop_risk_resolution_failed" => {
+            Some(ProjectionRoute::ExecutableStopRiskResolutionFailed)
         },
 
         // Balance events
@@ -204,7 +214,10 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
             handlers::positions::handle_insurance_stop_cleared(pool, envelope).await?
         },
         Some(ProjectionRoute::InsuranceStopFailed)
-        | Some(ProjectionRoute::StartupRecoveryInsuranceStopChecked) => {
+        | Some(ProjectionRoute::StartupRecoveryInsuranceStopChecked)
+        | Some(ProjectionRoute::ExecutableStopPlanDriftDetected)
+        | Some(ProjectionRoute::EntryFillProtectionFallback)
+        | Some(ProjectionRoute::ExecutableStopRiskResolutionFailed) => {
             // Audit-only: no position projection mutation.
         },
         Some(ProjectionRoute::BalanceSampled) => {
@@ -276,6 +289,9 @@ mod tests {
             "entry_order_failed",
             "entry_execution_rejected",
             "entry_filled",
+            "executable_stop_plan_drift_detected",
+            "entry_fill_protection_fallback",
+            "executable_stop_risk_resolution_failed",
             "trailing_stop_updated",
             "position_monitor_tick",
             "exit_triggered",

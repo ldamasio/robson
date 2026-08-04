@@ -75,6 +75,45 @@ describe('trailingStopMoveTarget', () => {
     expect(target).toEqual({ trigger_price: 124, next_stop: 112 });
   });
 
+  it('uses favorable extreme as the completed-span source when present', () => {
+    const state: PositionState = {
+      Active: {
+        current_price: 128,
+        trailing_stop: 100,
+        favorable_extreme: 130,
+        extreme_at: '2026-08-04T12:00:00Z',
+        insurance_stop_id: 'ins-1',
+        last_emitted_stop: 100
+      }
+    };
+    const target = trailingStopMoveTarget(
+      basePosition({
+        state,
+        entry_price: 101,
+        entry_reference: 100,
+        executable_span: 12,
+        tech_stop_distance: 10
+      })
+    );
+
+    expect(target).toEqual({ trigger_price: 136, next_stop: 124 });
+  });
+
+  it('does not require fill entry price for the executable-span branch', () => {
+    const target = trailingStopMoveTarget(
+      basePosition({
+        state: 'Active',
+        entry_price: null,
+        entry_reference: 100,
+        executable_span: 12,
+        trailing_stop: 90,
+        tech_stop_distance: 10
+      })
+    );
+
+    expect(target).toEqual({ trigger_price: 112, next_stop: 100 });
+  });
+
   it('mirrors the entry-anchored formulas for shorts', () => {
     const target = trailingStopMoveTarget(
       basePosition({

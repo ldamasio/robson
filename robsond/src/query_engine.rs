@@ -917,6 +917,7 @@ mod tests {
                 entry_price: dec!(10000),
                 quantity: dec!(0.01),
                 current_stop: dec!(0), // stop at 0 → latent = entry * qty = 100
+                cost_priced_latent_risk: None,
             },
             PositionSummary {
                 position_id: uuid::Uuid::nil(),
@@ -928,6 +929,7 @@ mod tests {
                 entry_price: dec!(10000),
                 quantity: dec!(0.01),
                 current_stop: dec!(0),
+                cost_priced_latent_risk: None,
             },
             PositionSummary {
                 position_id: uuid::Uuid::nil(),
@@ -939,6 +941,7 @@ mod tests {
                 entry_price: dec!(10000),
                 quantity: dec!(0.01),
                 current_stop: dec!(0),
+                cost_priced_latent_risk: None,
             },
             PositionSummary {
                 position_id: uuid::Uuid::nil(),
@@ -950,6 +953,7 @@ mod tests {
                 entry_price: dec!(10000),
                 quantity: dec!(0.01),
                 current_stop: dec!(0),
+                cost_priced_latent_risk: None,
             },
         ])
     }
