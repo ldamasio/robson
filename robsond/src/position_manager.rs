@@ -6523,6 +6523,9 @@ mod tests {
     #[ignore = "requires DATABASE_URL"]
     async fn test_budget_model_reload_and_peak_refresh_preserve_nfs(pool: sqlx::PgPool) {
         let now = chrono::Utc::now();
+        // Upsert because migration 000011 backfills the current calendar
+        // month during sqlx::test setup; this write models the operator
+        // activation flipping the persisted model.
         sqlx::query(
             r#"
             INSERT INTO monthly_state (
@@ -6530,6 +6533,10 @@ mod tests {
                 monthly_budget_model, created_at
             )
             VALUES ($1, $2, 10000, 0, 'net_from_start_non_expanding_v1', $3)
+            ON CONFLICT (year, month) DO UPDATE SET
+                capital_base = EXCLUDED.capital_base,
+                month_peak_net = EXCLUDED.month_peak_net,
+                monthly_budget_model = EXCLUDED.monthly_budget_model
             "#,
         )
         .bind(now.year() as i16)
