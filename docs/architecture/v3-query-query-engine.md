@@ -232,7 +232,7 @@ pub enum QueryOutcome {
 
 /// Who or what initiated the query.
 pub enum ActorKind {
-    /// Operator via CLI or API
+    /// Operator via dashboard, authenticated API, or exceptional CLI
     Operator {
         source: CommandSource,
     },
@@ -509,7 +509,7 @@ pub async fn panic_close_all(&self) -> DaemonResult<Vec<PositionId>> {
                 // One PanicClosePosition query per Active position
                 let mut query = ExecutionQuery::new(
                     QueryKind::PanicClosePosition { position_id: position.id },
-                    ActorKind::Operator { source: CommandSource::Cli },
+                    ActorKind::Operator { source: CommandSource::Api },
                 );
                 query.position_id = Some(position.id);
                 self.query_engine.on_accepted(&query);

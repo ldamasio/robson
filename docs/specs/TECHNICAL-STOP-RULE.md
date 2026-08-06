@@ -153,12 +153,10 @@ def find_second_support(candles_15min, current_price, side="LONG"):
 - [ ] `POST /api/trade/calculate-entry/` - Calculate stop + position size
 - [ ] `GET /api/trade/chart-analysis/{symbol}/` - Get support/resistance levels
 
-### Phase 5: CLI Integration
-- [ ] Update `robson plan buy BTCUSDT 0.001` to:
-  - Fetch 15min candles
-  - Calculate technical stop
-  - Calculate position size
-  - Show analysis to user
+### Phase 5: Operator Surface Integration
+- Routine operator workflows use the dashboard or authenticated `robsond` API.
+- The runtime must calculate and expose the technical stop and derived position size before entry.
+- The narrow Rust `robson-cli` recovery tool is not a trading-entry surface.
 
 ### Phase 6: Frontend
 - [ ] Chart view showing supports/resistances
@@ -175,9 +173,9 @@ def find_second_support(candles_15min, current_price, side="LONG"):
 
 ## Applies To
 
-- ✅ Spot trading (current)
-- ✅ Margin Isolated (future implementation)
-- ✅ All strategies (manual, algorithmic, signals)
+- Binance USD-M Futures, the current exchange account type
+- Long and Short positions
+- Every supported symbol and entry policy
 
 ## Notes
 

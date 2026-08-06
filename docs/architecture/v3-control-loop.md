@@ -307,7 +307,7 @@ Blocked             -> PositionState unchanged (action was prevented)
 | Priority | Trigger | Source | Queuing |
 |----------|---------|--------|---------|
 | Critical | Circuit breaker activation | Risk Engine | Preempts current cycle at next safe point |
-| High | Operator command (panic, pause) | CLI / API | Front of queue |
+| High | Operator command (panic, pause) | Dashboard / authenticated API | Front of queue |
 | High | Risk alert | Risk Engine monitoring | Front of queue |
 | Normal | Detector signal | External / manual | FIFO queue |
 | Normal | Market tick | Binance WebSocket | FIFO queue, droppable if queue >800 |

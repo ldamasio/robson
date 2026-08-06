@@ -5,7 +5,8 @@
 > Rust runtime (`robsond/`) plus a SvelteKit static frontend
 > (`frontend/`). The Django code path is gone from the working
 > tree; this file is preserved for historical product archaeology
-> only.
+> only. The legacy Bun CLI under `cli/` was also removed, so its build and
+> installation commands below are invalid.
 >
 > For current developer onboarding, read
 > [`docs/onboarding/DEVELOPER-QUICKSTART.md`](onboarding/DEVELOPER-QUICKSTART.md).

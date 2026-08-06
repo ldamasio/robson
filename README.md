@@ -60,7 +60,7 @@ robson-connectors/   # Exchange adapters (Binance Futures)
 robson-store/        # PostgreSQL persistence (SQLx)
 robsond/             # Runtime daemon (Axum HTTP API, control loop)
 robson-sim/          # Backtesting and simulation
-cli/                 # Operator CLI (Bun / TypeScript)
+robson-cli/          # Exceptional operator recovery CLI (Rust)
 
 frontend/              # SvelteKit operations dashboard
 
@@ -111,7 +111,6 @@ GET  /events                          # SSE event stream (bearer header)
 - Rust stable + nightly (nightly required for `rustfmt`)
 - PostgreSQL
 - [pnpm](https://pnpm.io) — frontend (`frontend/`)
-- [Bun](https://bun.sh) — operator CLI (`cli/`)
 - [`just`](https://just.systems) — task runner
 
 ### Backend (Rust)
@@ -144,14 +143,16 @@ pnpm check           # type check (svelte-check + tsc)
 pnpm build           # production build
 ```
 
-### CLI (Bun)
+### Operator CLI (Rust)
+
+The narrow `robson-cli` binary supports exceptional reconciliation and income-ledger recovery. Routine trading operations use the SvelteKit dashboard or authenticated `robsond` API.
 
 ```bash
-cd cli
-bun install
-bun run dev          # run CLI in development mode
-bun test             # run tests
+cargo build --release -p robson-cli
+./target/release/robson-cli --help
 ```
+
+The CLI is not currently packaged in the runtime image or published as a versioned artifact. See [docs/CLI.md](docs/CLI.md) before using it against an operated environment.
 
 ### Environment
 

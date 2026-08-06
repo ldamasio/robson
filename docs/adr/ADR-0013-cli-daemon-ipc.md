@@ -1,7 +1,12 @@
 # ADR-0013: CLI–Daemon IPC (Unix Domain Sockets / Named Pipes)
 
 ## Status
-**Accepted** (2025-02-04)
+**Superseded** (2026-08-06)
+
+The Bun CLI and local IPC transport described here are not part of the current
+runtime. Routine operations use the SvelteKit dashboard and authenticated
+`robsond` HTTP API. The narrow Rust `robson-cli` recovery tool also uses the
+authenticated HTTP API. See [the current CLI reference](../CLI.md).
 
 ## Context
 

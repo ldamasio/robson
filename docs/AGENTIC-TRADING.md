@@ -1,3 +1,10 @@
+> **SUPERSEDED CONCEPT NOTE**
+>
+> This note predates the current RBX conceptual boundaries and the current
+> Robson execution model. The legacy `plan / validate / execute` CLI described
+> below was removed. Robson remains an execution and risk engine, not the RBX
+> agent orchestration layer. See the [project README](../README.md).
+>
 # Agentic Trading
 
 ## Purpose

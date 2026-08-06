@@ -1,3 +1,9 @@
+> **SUPERSEDED HISTORICAL DOCUMENT**
+>
+> This guide describes removed v1 Python, Go, and legacy CLI tooling. Use
+> [CONTRIBUTING.md](../../CONTRIBUTING.md), the current GitHub workflows, and
+> `scripts/verify.sh` for the repository-verified Rust and frontend checks.
+>
 # Code Quality Guide - Robson Bot
 
 This guide explains the code-quality tooling stack for the Robson project. All tools are **additive, reversible, and optional** at different levels.

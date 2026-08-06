@@ -219,7 +219,7 @@ position is left unresolved rather than closed on a guess.
 
 #### I3 §E — Startup policy and operational status
 
-**Current operational state (repository-verified, 2026-07-31):**
+**Current operational state (repository and read-only production verified, 2026-08-06):**
 
 - I3 runtime steady-state reconciliation (worker loop) is **live** (Slice 4B).
 - Startup `auto_reconcile` is **live** and is **the policy prod runs**. The
@@ -239,6 +239,18 @@ position is left unresolved rather than closed on a guess.
   startup. `AccountSnapshot` and `Estimated` do not qualify.
 - If any position lacks real evidence, abort with exit 78 (same as `abort`
   policy). No partial close.
+
+**Open implementation drifts (2026-08-06)**:
+
+- Current source returns success when evidence gathering produces no
+  unambiguous match, allowing startup to continue for periodic reconciliation.
+  This is tracked as TD-2026-08-06-001.
+- Phase 2 applies closes sequentially without a batch transaction. A later
+  failure stops processing but does not roll back an earlier persisted close.
+  This is tracked as TD-2026-08-06-002.
+
+Both items are in [the technical debt register](../technical-debt.md). The
+fail-closed and no-partial-close policy has not been relaxed.
 
 The startup path has always anchored its evidence window at
 `entry_filled_at`. Until 2026-07-31 the periodic worker did not, which is

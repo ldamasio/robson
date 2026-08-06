@@ -1,8 +1,8 @@
 # ADR-0022 — Robson-Authored Position Invariant
 
 **Date**: 2026-04-18
-**Last Amended**: 2026-05-28 (capital base recalibration after manual account drift; see ADR-0038)
-**Status**: DECIDED — IN PROGRESS (I3 runtime steady-state and startup abort live; manual recovery 5B1 live; startup auto_reconcile 5B2B planned)
+**Last Amended**: 2026-08-06 (startup operational status and policy drifts documented)
+**Status**: DECIDED - IMPLEMENTED, WITH OPEN STARTUP POLICY DRIFTS
 **Deciders**: RBX Systems (operator + architecture)
 
 ---
@@ -268,7 +268,7 @@ configuration knobs, and rollback semantics for I3 live in:
 
 - [`docs/policies/UNTRACKED-POSITION-RECONCILIATION.md` §I3](../policies/UNTRACKED-POSITION-RECONCILIATION.md) — policy text
 - [`docs/implementation/TD-2026-05-05-001-CORE-LIFECYCLE-DRIFT.md`](../implementation/TD-2026-05-05-001-CORE-LIFECYCLE-DRIFT.md) — slice plan
-- [`docs/runbooks/td-2026-05-05-001-stale-active-recovery.md`](../runbooks/td-2026-05-05-001-stale-active-recovery.md) — recovery procedure (skeleton; finalized in Slice 5)
+- [`docs/runbooks/td-2026-05-05-001-stale-active-recovery.md`](../runbooks/td-2026-05-05-001-stale-active-recovery.md) - current recovery procedure
 
 This ADR remains the canonical authority for the existence and
 non-negotiability of the invariant; the policy holds the operational
@@ -285,9 +285,16 @@ Operator-driven manual recovery is live via `robson-cli reconcile-close` and
 ### 2026-05-11 — Slice 5B2A: evidence helper refactor merged
 
 `reconciliation_worker.rs` evidence helpers refactored (no behavior change).
-Startup `auto_reconcile` (Slice 5B2B) remains planned.
 
-**Invariant preserved**: auto-close at startup requires real exchange evidence
-(`OrderFillRecord` or `UserTradeRecord`) and is all-or-nothing — any position
-lacking evidence aborts startup with exit 78, consistent with the Robson-authored
-position invariant's fail-closed guarantee.
+### 2026-08-06: startup `auto_reconcile` operational status
+
+Startup `auto_reconcile` is implemented and production configuration was
+read-only verified as enabled on 2026-08-06. The invariant still requires real
+exchange evidence and no partial close.
+
+Current source does not preserve the documented exit-78 behavior when evidence
+gathering returns no unambiguous match. It logs a warning and continues startup
+so periodic reconciliation may resolve the stale position. In addition, Phase 2
+persists closes sequentially without a transaction spanning the batch, so a
+later apply failure cannot roll back an earlier close. These are open policy
+drifts, not approved relaxations of the invariant.

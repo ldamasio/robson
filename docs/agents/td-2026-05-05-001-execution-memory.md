@@ -1,3 +1,11 @@
+> **HISTORICAL EXECUTION SNAPSHOT**
+>
+> This file preserves agent handoff state from 2026-05-12. Its production
+> enablement statements and next steps are no longer current. Use the
+> [reconciliation policy](../policies/UNTRACKED-POSITION-RECONCILIATION.md),
+> [current runbook](../runbooks/td-2026-05-05-001-stale-active-recovery.md),
+> and [technical debt register](../technical-debt.md).
+>
 # TD-2026-05-05-001 — Execution Memory
 
 **TD**: Core Position Lifecycle Drift

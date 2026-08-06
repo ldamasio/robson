@@ -21,45 +21,6 @@ sync-binance-docs:
 	echo "✓ Binance docs ready at $(BINANCE_DOCS_DIR)"
 
 # ==============================
-# CLI Build (Bun / TypeScript)
-# ==============================
-
-CLI_DIR      ?= cli
-CLI_BIN      ?= robson
-INSTALL_PATH ?= /usr/local/bin
-
-.PHONY: build-cli clean-cli install-cli test-cli
-
-build-cli:
-	@echo "Building Bun CLI..."
-	@cd $(CLI_DIR) && bun install
-	@cd $(CLI_DIR) && bun run build
-	@echo "✓ CLI built successfully"
-	@echo "  - Bun bundle: $(CLI_DIR)/dist/index.js"
-	@echo ""
-	@echo "Next steps:"
-	@echo "  1. Test: make test-cli"
-	@echo "  2. Install: make install-cli"
-
-clean-cli:
-	@echo "Cleaning CLI build artifacts..."
-	@rm -rf $(CLI_DIR)/dist
-	@echo "✓ CLI build artifacts removed"
-
-install-cli: build-cli
-	@echo "Installing CLI to $(INSTALL_PATH)..."
-	@sudo install -m 0755 $(CLI_DIR)/dist/index.js $(INSTALL_PATH)/$(CLI_BIN)
-	@echo "✓ CLI installed to $(INSTALL_PATH)"
-	@echo ""
-	@echo "Verify installation:"
-	@echo "  robson --help"
-
-test-cli: build-cli
-	@echo "Running CLI tests..."
-	@cd $(CLI_DIR) && bun test
-	@echo "✓ CLI tests passed"
-
-# ==============================
 # Dev helpers (Django + Postgres)
 # ==============================
 
@@ -145,7 +106,7 @@ validate:
 # ==============================
 
 .PHONY: pre-commit-install pre-commit-run pre-commit-update pre-commit-all \
-        format-python format-go format-js lint-python lint-go lint-js \
+        format-python format-js lint-python lint-js \
         quality-all
 
 # Install pre-commit hooks locally
@@ -178,12 +139,6 @@ format-python:
 	@cd apps/backend/monolith && black . && isort .
 	@echo "✓ Python code formatted"
 
-# Format CLI code
-format-go:
-	@echo "Formatting CLI code..."
-	@cd cli && bun x prettier --write "src/**/*.{ts,json}"
-	@echo "✓ CLI code formatted"
-
 # Format JS/JSX code
 format-js:
 	@echo "Formatting JS/JSX code..."
@@ -196,12 +151,6 @@ lint-python:
 	@ruff check apps/backend/
 	@echo "✓ Python lint passed"
 
-# Lint CLI code
-lint-go:
-	@echo "Linting CLI code..."
-	@cd cli && bun x tsc --noEmit
-	@echo "✓ CLI lint passed"
-
 # Lint JS/JSX code
 lint-js:
 	@echo "Linting JS/JSX code..."
@@ -209,7 +158,7 @@ lint-js:
 	@echo "✓ JS/JSX lint passed"
 
 # Run all quality checks
-quality-all: format-python format-go format-js lint-python lint-go lint-js
+quality-all: format-python format-js lint-python lint-js
 	@echo "✓ All quality checks passed"
 
 # ==============================
