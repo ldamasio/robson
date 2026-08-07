@@ -1,0 +1,39 @@
+{
+  "table": "event_log",
+  "redact": [],
+  "row": {
+    "hash": null,
+    "event_id": "0198c9a1-7b2e-7d31-9f4a-3c5d6e7f8a9b",
+    "tenant_id": "11111111-1111-1111-1111-111111111111",
+    "stream_key": "position:0198c9a1-0000-7000-8000-000000000001",
+    "seq": 1,
+    "event_type": "position_armed",
+    "payload": {
+      "type": "position_armed",
+      "timestamp": "2026-08-05T12:00:00.123456Z",
+      "side": "Short",
+      "symbol": {"quote": "USDT", "base": "BTC"},
+      "position_id": "0198c9a1-0000-7000-8000-000000000001",
+      "account_id": "22222222-2222-2222-2222-222222222222",
+      "stop_policy": "executable_span",
+      "stop_buffer_bps_at_arm": "5",
+      "tech_stop_distance": {
+        "initial_stop": "61200.5",
+        "distance_pct": "0.0100",
+        "entry_price": "60594.30",
+        "distance": "606.20"
+      }
+    },
+    "payload_schema_version": 1,
+    "occurred_at": "2026-08-05T12:00:00.123456Z",
+    "ingested_at": "2026-08-05T12:00:00.234567Z",
+    "idempotency_key": "posição-armada-âçãé-01",
+    "trace_id": null,
+    "causation_id": null,
+    "command_id": null,
+    "workflow_id": null,
+    "actor_type": "Daemon",
+    "actor_id": "robsond",
+    "prev_hash": null
+  }
+}

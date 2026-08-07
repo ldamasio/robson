@@ -1,0 +1,44 @@
+{
+ "table": "event_log",
+ "redact": [
+  "$.analysis.stop_quality.reasons[*]"
+ ],
+ "row": {
+  "tenant_id": "11111111-1111-1111-1111-111111111111",
+  "payload_schema_version": 1,
+  "idempotency_key": "k",
+  "trace_id": null,
+  "causation_id": null,
+  "command_id": null,
+  "workflow_id": null,
+  "actor_type": "Daemon",
+  "actor_id": "robsond",
+  "prev_hash": null,
+  "hash": null,
+  "event_id": "0198c9a5-0000-7d31-9f4a-3c5d6e7f8a9b",
+  "stream_key": "position:0198c9a1-0000-7000-8000-000000000005",
+  "seq": 5,
+  "event_type": "technical_stop_analyzed",
+  "occurred_at": "2026-08-05T15:00:00.000001Z",
+  "ingested_at": "2026-08-05T15:00:00.000002Z",
+  "payload": {
+   "type": "technical_stop_analyzed",
+   "analysis": {
+    "stop_quality": {
+     "reasons": [
+      "human text one",
+      null,
+      "human text two"
+     ],
+     "class": "Standard"
+    },
+    "skipped_levels": [
+     {
+      "level": "60000.0",
+      "reason": "below_min"
+     }
+    ]
+   }
+  }
+ }
+}

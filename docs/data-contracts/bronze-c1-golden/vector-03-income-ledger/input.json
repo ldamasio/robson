@@ -1,0 +1,14 @@
+{
+  "table": "income_ledger",
+  "row": {
+    "created_at": "2026-08-05T00:01:02.000000Z",
+    "id": "77777777-7777-7777-7777-777777777777",
+    "exchange_income_id": "1234567890123",
+    "symbol": null,
+    "income_type": "FUNDING_FEE",
+    "amount": "-0.01230000",
+    "asset": "USDT",
+    "exchange_trade_id": null,
+    "income_time": "2026-08-04T23:59:59.999000Z"
+  }
+}
