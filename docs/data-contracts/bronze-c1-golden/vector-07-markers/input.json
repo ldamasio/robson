@@ -1,0 +1,54 @@
+{
+ "kind": "markers",
+ "markers": {
+  "event-window": {
+   "table": "event_log",
+   "env": "prod",
+   "window_start": "2026-08-05T00:00:00.000000Z",
+   "window_end": "2026-08-06T00:00:00.000000Z",
+   "rows": 42,
+   "profile": "c1",
+   "payload_schema_version_min": 1,
+   "payload_schema_version_max": 1,
+   "parts": [
+    {
+     "name": "part-00000.ndjson.zst",
+     "rows": 42,
+     "bytes_ndjson": 21000,
+     "bytes_stored": 4200,
+     "sha256_ndjson": "0000000000000000000000000000000000000000000000000000000000000000",
+     "sha256_stored": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+   ]
+  },
+  "event-empty": {
+   "table": "event_log",
+   "env": "prod",
+   "window_start": "2026-08-06T00:00:00.000000Z",
+   "window_end": "2026-08-07T00:00:00.000000Z",
+   "rows": 0,
+   "profile": "c1",
+   "payload_schema_version_min": null,
+   "payload_schema_version_max": null,
+   "parts": []
+  },
+  "income-window": {
+   "table": "income_ledger",
+   "env": "testnet",
+   "window_start": "2026-08-05T00:00:00.000000Z",
+   "window_end": "2026-08-06T00:00:00.000000Z",
+   "rows": 2,
+   "profile": "c1",
+   "parts": [
+    {
+     "name": "part-00000.ndjson.zst",
+     "rows": 2,
+     "bytes_ndjson": 700,
+     "bytes_stored": 350,
+     "sha256_ndjson": "0000000000000000000000000000000000000000000000000000000000000000",
+     "sha256_stored": "0000000000000000000000000000000000000000000000000000000000000000"
+    }
+   ]
+  }
+ }
+}

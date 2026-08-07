@@ -1,0 +1,2 @@
+{"id":"88888888-8888-8888-8888-888888888881","exchange_income_id":"111","symbol":"BTCUSDT","income_type":"COMMISSION","amount":"-0.00010000","asset":"USDT","exchange_trade_id":"t-1","income_time":"2026-08-05T01:00:00.000000Z","created_at":"2026-08-05T01:00:01.000000Z"}
+{"id":"88888888-8888-8888-8888-888888888882","exchange_income_id":"112","symbol":"BTCUSDT","income_type":"REALIZED_PNL","amount":"15.69000000","asset":"USDT","exchange_trade_id":"t-1","income_time":"2026-08-05T01:00:00.000000Z","created_at":"2026-08-05T01:00:01.000001Z"}
