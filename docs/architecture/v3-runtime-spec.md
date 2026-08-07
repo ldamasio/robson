@@ -94,12 +94,12 @@ pub enum RuntimeInput {
         tech_stop: Price,
         confidence: Decimal,
     },
-    /// Operator command from CLI or API
+    /// Operator command from the dashboard, authenticated API, or exceptional CLI
     OperatorCommand {
         command: Command,
         params: CommandParams,
         issued_at: DateTime<Utc>,
-        source: CommandSource,  // CLI, API, UI
+        source: CommandSource,  // API, UI, or exceptional CLI
     },
     /// Order fill notification from exchange
     OrderFill {

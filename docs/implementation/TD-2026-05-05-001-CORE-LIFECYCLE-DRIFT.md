@@ -1,6 +1,6 @@
 # TD-2026-05-05-001 — Core Position Lifecycle Drift
 
-**Status**: In progress — Slices 0/1/2/3/4A/4B/5A/5B1/hotfix-docker/5B2A done; 5B2B/5B2C planned
+**Status**: Historical implementation record. Slices through 5B2B are implemented; the 5B2C testnet drill remains deferred. Use the companion policy and current runbook for operational status.
 **Severity**: High
 **Area**: `robsond` reconciliation, position lifecycle
 **Discovered**: 2026-05-05
@@ -460,6 +460,11 @@ Outcome:
   the `robson-cli` binary is present inside the `robsond` container image.
 - No algorithm change. Build-system fix only.
 - Commit `1b275638 fix(docker): include robson-cli workspace member in robsond build`.
+
+**Current distribution note (2026-08-06)**: the historical outcome above no
+longer matches the Dockerfile. The CLI source is copied for Cargo workspace
+resolution, but the image builds and copies only `robsond`. No
+`robson-cli` binary is installed in the runtime image.
 
 ### Slice 5B2A — Evidence helper refactor in `reconciliation_worker.rs` — DONE (2026-05-11)
 

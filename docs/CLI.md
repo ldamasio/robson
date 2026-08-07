@@ -1,724 +1,88 @@
-# Robson v2 CLI Reference
+# Robson Operator CLI
 
-**Version**: 2.0.0-alpha
-**Last Updated**: 2026-01-12
-**Status**: Planning Phase
+**Status**: Repository-verified on 2026-08-06
 
----
+Robson has one narrow Rust operator binary at `robson-cli/`. It exists for exceptional recovery workflows. Routine position management uses the SvelteKit dashboard or the authenticated `robsond` API.
 
-## Table of Contents
+The former Bun and TypeScript CLI under `cli/` was removed. It was unpublished, unauthenticated for mutations, and had drifted from the daemon contract. Commands such as `robson arm`, `robson status`, `robson panic`, and `robson credentials` are not supported operator interfaces.
 
-1. [Installation](#installation)
-2. [Commands](#commands)
-3. [JSON Output](#json-output)
-4. [Examples](#examples)
-5. [Configuration](#configuration)
-6. [Automation](#automation)
+## Supported commands
 
----
+| Command | Purpose | Operational class |
+|---|---|---|
+| `robson-cli reconcile-close` | Close a stale local Active position using reviewed exchange evidence | Irreversible recovery mutation |
+| `robson-cli income ack` | Acknowledge one unmatched income-ledger item without deleting it | Audited ledger mutation |
 
-## Installation
+Use `robson-cli --help` and the subcommand help for the exact flags supported by the checked-out revision.
 
-### Prerequisites
+## Build and distribution
 
-- Bun >= 1.0
-- robsond daemon running (localhost or remote)
+The repository currently has no versioned, checksummed release artifact for this binary. The production container builds and copies `robsond` only. Do not assume `robson-cli` is installed in a daemon container or on an operator workstation.
 
-### Install CLI
+For repository validation:
 
 ```bash
-# Install globally
-bun install -g robson-cli
-
-# Or install from source
-cd cli
-bun install
-bun link
-
-# Verify installation
-robson --version
+cargo build --release -p robson-cli
+./target/release/robson-cli --help
 ```
 
----
+For an operated environment, use only an approved binary built from a reviewed source revision compatible with the deployed `robsond` API. Building an arbitrary branch during an incident is not an acceptable distribution procedure.
 
-## Commands
+## Authentication and connectivity
 
-### `robson init`
+Both commands call the authenticated `robsond` HTTP API. The default base URL is `http://localhost:8080`.
 
-Initialize Robson configuration
+Set the bearer token in the process environment:
 
 ```bash
-robson init
-
-# Interactive prompts:
-# - Daemon URL (default: http://localhost:8080)
-# - Output format (default: table)
-# - Log level (default: info)
+export ROBSON_API_TOKEN
 ```
 
-**Creates**: `~/.robson/config.toml`
+The shell must already hold the value. This documentation intentionally does not show a token value or an inline assignment.
 
----
+Prefer the environment variable over `--token`. A command-line token may be retained in shell history or exposed in a process listing. For a remote daemon, use an approved secure tunnel or local port forward. Never send the bearer token over plaintext remote HTTP.
 
-### `robson arm`
+`ROBSON_OPERATOR_ID` may supply the default audited actor for `income ack`.
 
-Arm a new position (wait for detector signal to enter)
+## Stale-Active recovery
+
+Read and execute the operator procedure in [Stale-Active Recovery](runbooks/td-2026-05-05-001-stale-active-recovery.md). The command appends an irreversible terminal event and requires exchange-grade evidence.
+
+Command shape:
 
 ```bash
-robson arm SYMBOL --strategy STRATEGY [OPTIONS]
-
-Arguments:
-  SYMBOL              Trading pair (e.g., BTCUSDT)
-
-Options:
-  --strategy NAME     Strategy name (required)
-                      Options: all-in, custom
-  --capital AMOUNT    Capital to allocate (default: from config)
-                      Leverage: fixed at 1x (not configurable; ADR-0024)
-  --dry-run           Simulate without real orders
-
-Examples:
-  robson arm BTCUSDT --strategy all-in
-  robson arm ETHUSDT --strategy all-in --capital 1000
-  robson arm BTCUSDT --strategy all-in --dry-run
+robson-cli reconcile-close \
+  --position-id <POSITION_UUID> \
+  --evidence-file <REVIEWED_EVIDENCE_JSON> \
+  --robsond-url http://localhost:8080
 ```
 
-**Output**:
-```
-✓ Position armed: pos_01HQZXY123
-  Symbol: BTCUSDT
-  Strategy: all-in
-  Capital: $10,000
-  Leverage: 3x
-  Status: Armed (waiting for entry signal)
+Do not use this command for routine exits, untracked exchange positions, or projection-only orphan repair.
 
-  Next: The detector will scan for entry opportunities.
-        Use 'robson status' to monitor.
-```
+## Income-ledger acknowledgement
 
----
+Read [ADR-0045](adr/ADR-0045-income-ledger-reconciliation.md) and inspect the item before acknowledgement.
 
-### `robson disarm`
-
-Disarm a position (cancel waiting for entry signal)
+Command shape:
 
 ```bash
-robson disarm POSITION_ID
-
-Arguments:
-  POSITION_ID         Position ID or symbol
-
-Options:
-  --force             Force disarm even if entering/active
-
-Examples:
-  robson disarm pos_01HQZXY123
-  robson disarm BTCUSDT
-  robson disarm BTCUSDT --force
+robson-cli income ack <EXCHANGE_INCOME_ID> \
+  --reason "<AUDITABLE_REASON>" \
+  --actor "<OPERATOR_ID>" \
+  --robsond-url http://localhost:8080
 ```
 
-**Output**:
-```
-✓ Position disarmed: pos_01HQZXY123
-  Symbol: BTCUSDT
-  Status: Armed → Cancelled
-```
+Acknowledgement preserves the ledger item and records the reason, actor, and timestamp. It is not a deletion or a substitute for reconciliation.
 
-**Note**: Cannot disarm active positions (use `panic` instead)
+## Safety boundaries
 
----
+- The CLI does not grant operational authorization.
+- Confirm daemon and CLI API compatibility before any mutation.
+- Keep tokens out of arguments, files, logs, and screenshots.
+- Capture command output and incident evidence in the approved audit channel.
+- Stop on authentication, evidence-consistency, or version errors.
+- Use the dashboard for supported routine actions and the runbooks for exceptional recovery.
 
-### `robson status`
+## Distribution follow-up
 
-Show status of all positions
-
-```bash
-robson status [OPTIONS]
-
-Options:
-  --symbol SYMBOL     Filter by symbol
-  --state STATE       Filter by state (armed/active/closed)
-  --json              Output as JSON
-  --watch             Continuous monitoring (refresh every 2s)
-
-Examples:
-  robson status
-  robson status --symbol BTCUSDT
-  robson status --state active
-  robson status --json
-  robson status --watch
-```
-
-**Output (table)**:
-```
-POSITIONS
-
-ID               Symbol    Side   State    Entry      SL         SG         PnL       Leverage
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-pos_01HQZXY123   BTCUSDT   Long   Active   $95,000    $93,500    $98,500    +$156.23  1x
-pos_01HQZXY456   ETHUSDT   Long   Armed    -          -          -          -         1x
-pos_01HQZXY789   BTCUSDT   Long   Closed   $94,000    $92,500    -          -$100.00  1x
-
-SUMMARY
-  Active: 1
-  Armed: 1
-  Closed today: 1
-  Total PnL today: +$56.23
-```
-
-**Output (JSON)**:
-```json
-{
-  "positions": [
-    {
-      "id": "pos_01HQZXY123",
-      "symbol": "BTCUSDT",
-      "side": "long",
-      "state": "active",
-      "entry_price": 95000.0,
-      "stop_loss": 93500.0,
-      "stop_gain": 98500.0,
-      "quantity": 0.2001,
-      "leverage": 1,
-      "unrealized_pnl": 156.23,
-      "palma": {
-        "distance": 1500.0,
-        "distance_pct": 1.58
-      },
-      "created_at": "2026-01-12T10:30:00Z",
-      "entry_filled_at": "2026-01-12T10:32:15Z"
-    }
-  ],
-  "summary": {
-    "active_count": 1,
-    "armed_count": 1,
-    "closed_today_count": 1,
-    "total_pnl_today": 56.23
-  }
-}
-```
-
-> **Note**: `leverage` is informational only — fixed at 1x, not a configurable parameter (ADR-0024).
-
----
-
-### `robson panic`
-
-Emergency close all positions (market orders)
-
-```bash
-robson panic [OPTIONS]
-
-Options:
-  --symbol SYMBOL     Only close positions for this symbol
-  --confirm           Skip confirmation prompt
-  --dry-run           Simulate without real orders
-
-Examples:
-  robson panic
-  robson panic --symbol BTCUSDT
-  robson panic --confirm
-```
-
-**Output**:
-```
-⚠️  PANIC MODE: Close all active positions?
-
-  This will place MARKET orders to exit:
-    - pos_01HQZXY123 (BTCUSDT Long, $19,009.50)
-    - pos_01HQZXY456 (ETHUSDT Long, $5,000.00)
-
-  Total exposure: $24,009.50
-
-  Continue? (y/N): y
-
-✓ Panic executed:
-  - pos_01HQZXY123: Exiting (order_abc123)
-  - pos_01HQZXY456: Exiting (order_def456)
-
-  Waiting for fills...
-
-✓ All positions closed:
-  - pos_01HQZXY123: Closed at $94,800 (PnL: -$40.02)
-  - pos_01HQZXY456: Closed at $3,150 (PnL: +$15.00)
-```
-
----
-
-### `robson history`
-
-Show closed positions history
-
-```bash
-robson history [OPTIONS]
-
-Options:
-  --days N            Show last N days (default: 7)
-  --symbol SYMBOL     Filter by symbol
-  --json              Output as JSON
-  --csv               Output as CSV
-
-Examples:
-  robson history
-  robson history --days 30
-  robson history --symbol BTCUSDT
-  robson history --json
-  robson history --csv > trades.csv
-```
-
-**Output**:
-```
-CLOSED POSITIONS (Last 7 days)
-
-Closed At           Symbol    Side   Entry      Exit       PnL        Exit Reason
-━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-2026-01-12 10:45    BTCUSDT   Long   $95,000    $93,400    -$100.00   Stop Loss
-2026-01-11 14:30    ETHUSDT   Short  $3,100     $3,050     +$150.00   Stop Gain
-2026-01-11 09:15    BTCUSDT   Long   $94,500    $97,200    +$270.00   Stop Gain
-
-SUMMARY
-  Total trades: 3
-  Win rate: 66.67% (2/3)
-  Total PnL: +$320.00
-  Average PnL: +$106.67
-  Best trade: +$270.00 (BTCUSDT)
-  Worst trade: -$100.00 (BTCUSDT)
-```
-
----
-
-### `robson reconcile`
-
-Force reconciliation with exchange
-
-```bash
-robson reconcile [OPTIONS]
-
-Options:
-  --position-id ID    Reconcile specific position
-  --all               Reconcile all positions
-  --json              Output as JSON
-
-Examples:
-  robson reconcile --all
-  robson reconcile --position-id pos_01HQZXY123
-```
-
-**Output**:
-```
-Reconciling positions...
-
-✓ pos_01HQZXY123 (BTCUSDT): OK
-✓ pos_01HQZXY456 (ETHUSDT): OK
-⚠️ pos_01HQZXY789 (SOLUSDT): DISCREPANCY
-
-  Issue: Quantity mismatch
-    Local: 10.0 SOL
-    Exchange: 9.5 SOL
-
-  Corrective action: Update local state to match exchange
-
-Continue? (y/N): y
-
-✓ Reconciliation complete:
-  - 2 positions OK
-  - 1 position corrected
-```
-
----
-
-### `robson config`
-
-Manage configuration
-
-```bash
-robson config [SUBCOMMAND]
-
-Subcommands:
-  show                Show current configuration
-  set KEY VALUE       Set configuration value
-  reset               Reset to defaults
-
-Examples:
-  robson config show
-  robson config set daemon.url http://localhost:8080
-  robson config set output.format json
-  robson config reset
-```
-
----
-
-### `robson logs`
-
-Tail daemon logs
-
-```bash
-robson logs [OPTIONS]
-
-Options:
-  --follow            Follow logs (like tail -f)
-  --level LEVEL       Filter by level (debug/info/warn/error)
-  --position-id ID    Filter by position ID
-  --json              Output as JSON
-
-Examples:
-  robson logs --follow
-  robson logs --level error
-  robson logs --position-id pos_01HQZXY123
-```
-
----
-
-## JSON Output
-
-All commands support `--json` flag for machine-readable output.
-
-### Status JSON Schema
-
-```typescript
-interface StatusResponse {
-  active_positions: number;
-  positions: Position[];
-  pending_approvals: PendingApproval[];
-  stale_active_count: number;
-  reconciliation_blockers: ReconciliationBlocker[];
-  new_slots_available: number;
-  occupied_slots: number;
-  slot_cells_total: number;
-  monthly_realized_loss: number;
-  monthly_realized_loss_pct: number;
-  capital_base: number;
-  wallet_balance: number;
-}
-
-interface ReconciliationBlocker {
-  position_id: string;
-  symbol: string;
-  side: string;
-  reason: "stale_missing_on_exchange" | string;
-}
-
-interface Position {
-  id: string;
-  symbol: string;
-  side: "long" | "short";
-  state: "armed" | "entering" | "active" | "exiting" | "closed" | "error";
-  entry_price?: number;
-  stop_loss: number;
-  stop_gain: number;
-  quantity: number;
-  leverage: number;
-  unrealized_pnl?: number;
-  realized_pnl?: number;
-  palma?: {
-    distance: number;
-    distance_pct: number;
-  };
-  created_at: string;      // ISO 8601
-  entry_filled_at?: string;
-  closed_at?: string;
-}
-
-interface Summary {
-  active_count: number;
-  armed_count: number;
-  closed_today_count: number;
-  total_pnl_today: number;
-}
-```
-
-### Error JSON Schema
-
-```typescript
-interface ErrorResponse {
-  error: {
-    code: string;
-    message: string;
-    details?: Record<string, unknown>;
-  };
-}
-
-// Example
-{
-  "error": {
-    "code": "POSITION_NOT_FOUND",
-    "message": "Position pos_01HQZXY123 not found",
-    "details": {
-      "position_id": "pos_01HQZXY123"
-    }
-  }
-}
-```
-
----
-
-## Examples
-
-### Example 1: Basic Workflow
-
-```bash
-# 1. Arm position
-robson arm BTCUSDT --strategy all-in
-# → pos_01HQZXY123 created
-
-# 2. Monitor status
-robson status --watch
-
-# 3. When entry signal triggers (automatic):
-# Armed → Entering → Active
-
-# 4. When stop loss triggers (automatic):
-# Active → Exiting → Closed
-
-# 5. Check result
-robson history --days 1
-```
-
-### Example 2: Automation Script
-
-```bash
-#!/usr/bin/env bash
-# arm-positions.sh
-
-SYMBOLS=("BTCUSDT" "ETHUSDT" "SOLUSDT")
-
-for symbol in "${SYMBOLS[@]}"; do
-  echo "Arming $symbol..."
-  robson arm "$symbol" --strategy all-in --json \
-    | jq -r '.position_id' \
-    >> armed-positions.txt
-done
-
-echo "Armed $(wc -l < armed-positions.txt) positions"
-```
-
-### Example 3: Monitoring with JSON
-
-```bash
-# Poll status every 10s, alert if loss > $50
-while true; do
-  robson status --json \
-    | jq '.positions[] | select(.unrealized_pnl < -50)' \
-    | while read -r position; do
-        echo "ALERT: Position loss > $50"
-        echo "$position" | jq .
-      done
-
-  sleep 10
-done
-```
-
-### Example 4: Export to CSV
-
-```bash
-# Export last 30 days to CSV
-robson history --days 30 --csv > trades.csv
-
-# Import to Excel/Google Sheets for analysis
-```
-
----
-
-## Configuration
-
-### Config File Location
-
-`~/.robson/config.toml`
-
-### Config Schema
-
-```toml
-[daemon]
-url = "http://localhost:8080"
-timeout_ms = 5000
-
-[output]
-format = "table"  # table | json | csv
-color = true
-
-[risk]
-default_capital = 10000.0
-# Leverage is fixed at 1x (not configurable); margin availability is the physical bound (ADR-0024).
-# Position count is governed by ADR-0024 dynamic slots in robsond.
-# Legacy max_open_positions is not enforced by RiskGate.
-
-[logging]
-level = "info"  # debug | info | warn | error
-```
-
-### Environment Variables
-
-Override config with env vars:
-
-```bash
-export ROBSON_DAEMON_URL="http://localhost:8080"
-export ROBSON_OUTPUT_FORMAT="json"
-export ROBSON_LOG_LEVEL="debug"
-
-robson status
-```
-
----
-
-## Automation
-
-### Systemd Service (Monitor Daemon)
-
-```ini
-# /etc/systemd/system/robson-monitor.service
-[Unit]
-Description=Robson Position Monitor
-After=network.target
-
-[Service]
-Type=simple
-User=trading
-ExecStart=/usr/local/bin/robson status --watch --json
-Restart=always
-
-[Install]
-WantedBy=multi-user.target
-```
-
-### Cron Job (Daily Report)
-
-```cron
-# Send daily PnL report at 9 AM
-0 9 * * * robson history --days 1 --json | mail -s "Daily Trading Report" user@example.com
-```
-
-### Webhook Integration
-
-```bash
-# Post status to webhook on change
-robson status --json \
-  | curl -X POST https://example.com/webhook \
-    -H "Content-Type: application/json" \
-    -d @-
-```
-
----
-
-## Exit Codes
-
-| Code | Meaning |
-|------|---------|
-| 0    | Success |
-| 1    | General error |
-| 2    | Invalid arguments |
-| 3    | Connection error (daemon unreachable) |
-| 4    | Authentication error |
-| 5    | Position not found |
-| 6    | Invalid state transition |
-| 7    | Risk limit exceeded |
-| 8    | Exchange error |
-
-**Usage**:
-```bash
-robson arm BTCUSDT --strategy all-in
-if [ $? -eq 7 ]; then
-  echo "Risk limit exceeded, check config"
-fi
-```
-
----
-
-## CLI Architecture
-
-```
-┌──────────────────────────────────────┐
-│  robson (Bun CLI)                    │
-│                                      │
-│  ┌────────────────────────────────┐ │
-│  │  Commander.js (CLI framework)  │ │
-│  └────────────┬───────────────────┘ │
-│               │                      │
-│  ┌────────────▼───────────────────┐ │
-│  │  API Client (HTTP/gRPC)        │ │
-│  └────────────┬───────────────────┘ │
-│               │                      │
-│  ┌────────────▼───────────────────┐ │
-│  │  Output Formatter (table/JSON) │ │
-│  └────────────────────────────────┘ │
-└────────────────┬─────────────────────┘
-                 │ HTTP/gRPC
-┌────────────────▼─────────────────────┐
-│  robsond (Rust Daemon)               │
-│  API Server                          │
-└──────────────────────────────────────┘
-```
-
----
-
-## Development
-
-### Run from Source
-
-```bash
-cd cli
-bun install
-bun run dev arm BTCUSDT --strategy all-in
-```
-
-### Run Tests
-
-```bash
-bun test
-```
-
-### Build
-
-```bash
-bun run build
-# Output: dist/robson
-```
-
----
-
-## Troubleshooting
-
-### "Cannot connect to daemon"
-
-```bash
-# Check if daemon is running
-curl http://localhost:8080/health/live
-
-# Check daemon logs
-robson logs --follow
-```
-
-### "Position not found"
-
-```bash
-# Verify position ID
-robson status --json | jq '.positions[].id'
-
-# Reconcile state
-robson reconcile --all
-```
-
-### "Invalid state transition"
-
-Trying to disarm an active position:
-
-```bash
-# Wrong:
-robson disarm BTCUSDT  # Error: Position is Active
-
-# Correct:
-robson panic --symbol BTCUSDT
-```
-
----
-
-## Next Steps
-
-See:
-- [ARCHITECTURE.md](./ARCHITECTURE.md) - System architecture
-- [DOMAIN.md](./DOMAIN.md) - Domain model
-- [EXECUTION-PLAN.md](./EXECUTION-PLAN.md) - Implementation roadmap
-
----
-
-**Status**: Ready for implementation
-**Implementation**: Bun + TypeScript, ~2000 LOC
+A separate change should produce a versioned, checksummed `robson-cli` artifact tied to the same source revision as `robsond`. That work is intentionally outside this cleanup because changing runtime packaging affects backend release paths.

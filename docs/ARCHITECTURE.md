@@ -1,3 +1,11 @@
+> **SUPERSEDED HISTORICAL DOCUMENT**
+>
+> This early v2 planning artifact does not describe the current Robson runtime.
+> It includes the removed Bun CLI and other unimplemented or superseded designs.
+> Use the [project README](../README.md), [architecture index](architecture/README.md),
+> and [current operator CLI reference](CLI.md). Commands below are historical
+> examples and must not be used for operations.
+>
 # Robson v2 Architecture
 
 **Version**: 2.0.0-alpha

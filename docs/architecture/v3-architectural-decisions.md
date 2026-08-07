@@ -470,6 +470,11 @@ See [v3-query-query-engine.md §11](v3-query-query-engine.md) for details.
 
 **Breaks if wrong**: Frontend is temporarily non-functional for trading operations. Operator uses CLI. Risk is acceptable — operator confirmed "frontend breaking is acceptable."
 
+**Current note (2026-08-06)**: MIG-v3#3 is complete and the legacy
+general-purpose CLI was removed. The dashboard is the routine operator surface.
+The Rust `robson-cli` binary only covers exceptional reconciliation workflows
+and is not a fallback when the `robsond` API is unreachable.
+
 ---
 
 ### ADR-v3-022: Max 1% Loss Per Trade — Non-Configurable

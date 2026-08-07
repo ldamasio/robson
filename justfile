@@ -2,7 +2,7 @@
 #
 # This focuses on DAILY DEVELOPMENT tasks.
 # For BUILD/INSTALL tasks, see Makefile.
-# For TRADING operations, use `robson` CLI.
+# For trading operations, use the dashboard or authenticated robsond API.
 #
 # Quick start:
 #   just --list       # See all available tasks
@@ -20,16 +20,15 @@ default:
 # ============================================================================
 
 # First-time setup: install all dependencies
-setup: setup-python setup-node setup-cli
+setup: setup-python setup-node
     @echo ""
     @echo "✅ Development environment ready!"
     @echo ""
     @echo "Next steps:"
-    @echo "  1. Build CLI:        make build-cli"
-    @echo "  2. Start database:   just db-up"
-    @echo "  3. Run migrations:   just db-migrate"
-    @echo "  4. Run tests:        just test"
-    @echo "  5. Start dev server: just dev-backend"
+    @echo "  1. Start database:   just db-up"
+    @echo "  2. Run migrations:   just db-migrate"
+    @echo "  3. Run tests:        just test"
+    @echo "  4. Start dev server: just dev-backend"
 
 # Install Python dependencies (Django backend)
 setup-python:
@@ -41,32 +40,19 @@ setup-node:
     @echo "📦 Installing frontend dependencies..."
     cd frontend && pnpm install
 
-# Install CLI dependencies (Bun)
-setup-cli:
-    @echo "📦 Installing CLI dependencies..."
-    cd cli && bun install
-
 # ============================================================================
-# Build (delegates to Make)
+# Build
 # ============================================================================
 
-# Build everything (delegates to Make for compilation)
-build:
-    @echo "🔨 Building via Make..."
-    make build-cli
-    @echo ""
-    @echo "Tip: For system-wide installation, run: make install-cli"
-
-# Clean build artifacts (delegates to Make)
-clean:
-    make clean-cli
+# Build the current Rust daemon
+build: v2-build
 
 # ============================================================================
 # Testing
 # ============================================================================
 
-# Run all tests (backend + frontend + CLI)
-test: test-backend test-frontend test-cli
+# Run all configured backend and frontend tests
+test: test-backend test-frontend
 
 # Run backend tests (Django)
 test-backend:
@@ -77,11 +63,6 @@ test-backend:
 test-frontend:
     @echo "🧪 Running frontend check..."
     cd frontend && pnpm check
-
-# Run CLI smoke tests
-test-cli:
-    @echo "🧪 Running CLI smoke tests..."
-    cd cli && bun test
 
 # Watch mode: run backend tests on file changes
 test-watch:
@@ -184,21 +165,11 @@ shell:
 # Code Quality
 # ============================================================================
 
-# Format code (Python, Go, JavaScript)
-fmt:
-    @echo "🎨 Formatting code..."
-    @echo "  → CLI (TypeScript)"
-    @cd cli && bun x tsc --noEmit
-    @echo "  ✅ CLI checked"
-    @# TODO: Add Python (black/ruff) and JS (prettier) when configured
+# Format current Rust code
+fmt: v2-fmt
 
-# Lint code
-lint:
-    @echo "🔍 Linting code..."
-    @echo "  → CLI (TypeScript)"
-    @cd cli && bun x tsc --noEmit
-    @echo "  ✅ CLI linted"
-    @# TODO: Add Python (ruff) and JS (eslint) when configured
+# Check current Rust compilation
+lint: v2-check
 
 # Run validation checks (AI governance, etc.)
 validate:
@@ -241,33 +212,6 @@ wt-new AGENT NAME BRANCH:
     ./scripts/robson-wt-new.sh "{{AGENT}}" "{{NAME}}" "{{BRANCH}}"
 
 # ============================================================================
-# Domain Actions (Thin wrappers - prefer using `robson` directly)
-# ============================================================================
-
-# Show trading workflow example
-trading-help:
-    @echo "╔════════════════════════════════════════════════════════════╗"
-    @echo "║           ROBSON AGENTIC TRADING WORKFLOW                 ║"
-    @echo "╚════════════════════════════════════════════════════════════╝"
-    @echo ""
-    @echo "For trading operations, use the 'robson' CLI directly:"
-    @echo ""
-    @echo "1. PLAN (create execution blueprint)"
-    @echo "   robson plan buy BTCUSDT 0.001 --limit 50000"
-    @echo ""
-    @echo "2. VALIDATE (paper trading checks)"
-    @echo "   robson validate <plan-id> --client-id 1"
-    @echo ""
-    @echo "3. EXECUTE (DRY-RUN by default)"
-    @echo "   robson execute <plan-id> --client-id 1"
-    @echo ""
-    @echo "4. EXECUTE LIVE (requires explicit acknowledgment)"
-    @echo "   robson execute <plan-id> --client-id 1 --live --acknowledge-risk"
-    @echo ""
-    @echo "See: robson --help"
-    @echo ""
-
-# ============================================================================
 # Utilities
 # ============================================================================
 
@@ -283,8 +227,11 @@ info:
     @echo "Node.js:"
     @node --version || echo "  ❌ Not found"
     @echo ""
-    @echo "Bun:"
-    @bun --version || echo "  ❌ Not found"
+    @echo "Rust:"
+    @rustc --version || echo "  ❌ Not found"
+    @echo ""
+    @echo "Cargo:"
+    @cargo --version || echo "  ❌ Not found"
     @echo ""
     @echo "Docker:"
     @docker --version || echo "  ❌ Not found"
@@ -295,13 +242,6 @@ info:
     @echo "K9s:"
     @k9s version 2>/dev/null | head -n 1 || echo "  ❌ Not found"
     @echo ""
-    @echo "CLI:"
-    @if [ -f cli/dist/index.js ]; then \
-        echo "  ✅ Built (cli/dist/index.js)"; \
-    else \
-        echo "  ⚠️  Not built (run: make build-cli)"; \
-    fi
-    @echo ""
     @echo "Database:"
     @if docker compose -f apps/backend/monolith/docker-compose.dev.yml ps | grep -q "Up"; then \
         echo "  ✅ Running"; \
@@ -310,13 +250,9 @@ info:
     fi
     @echo ""
 
-# Quick health check
-health: info
-    @echo "Running quick health checks..."
-    @echo ""
-    @just test-cli
-    @echo ""
-    @echo "✅ Environment is healthy!"
+# Quick current-Rust check
+health: info v2-check
+    @echo "✅ Current Rust workspace check passed!"
 
 # ============================================================================
 # Rust runtime

@@ -40,8 +40,10 @@ Thank you for contributing to Robson. This document provides guidelines for cont
 
 **Required**:
 - Rust 1.83+ (`rustup`)
-- Bun latest (`curl -fsSL https://bun.sh/install | bash`)
 - Git 2.30+
+
+**For frontend changes**:
+- Node.js and [pnpm](https://pnpm.io/)
 
 **For Postgres integration tests** (optional — unit tests run without it):
 - Podman or Docker (to run the local test container via `just v2-db-up`)
@@ -65,11 +67,11 @@ cd robson
 # 3. Add upstream remote
 git remote add upstream https://github.com/ldamasio/robson.git
 
-# 4. Install Rust dependencies
+# 4. Build the Rust workspace
 cargo build
 
-# 5. Install CLI dependencies
-cd cli && bun install && cd ..
+# 5. Install frontend dependencies when working on the dashboard
+cd frontend && pnpm install && cd ..
 
 # 6. Run verification to ensure setup is correct
 ./scripts/verify.sh
@@ -350,7 +352,7 @@ All commits **must** follow the [Conventional Commits](https://www.conventionalc
 | `store` | robson-store | `feat(store): add order repository` |
 | `daemon` | robsond | `fix(daemon): handle shutdown gracefully` |
 | `sim` | robson-sim | `feat(sim): add backtesting engine` |
-| `cli` | cli/ (TypeScript) | `feat(cli): add status command` |
+| `cli` | robson-cli (Rust) | `feat(cli): add recovery command` |
 
 ### Commit Message Examples
 

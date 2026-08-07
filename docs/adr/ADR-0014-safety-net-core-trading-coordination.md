@@ -1,7 +1,13 @@
 # ADR-0014: Safety Net and Core Trading Coordination
 
 ## Status
-**Accepted** (2026-02-14)
+**Superseded** (2026-08-06)
+
+The external-position safety-net flow and Bun CLI assumptions below are not
+current policy. [ADR-0022](ADR-0022-robson-authored-position-invariant.md)
+requires exchange positions to be Robson-authored, and
+[ADR-0039](ADR-0039-exchange-side-insurance-stop.md) defines the current
+exchange-side protection model. This record is retained as decision history.
 
 ## Context
 

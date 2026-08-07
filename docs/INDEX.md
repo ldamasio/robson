@@ -1,493 +1,67 @@
-# Robson v2 Documentation Index
+# Robson Documentation Index
 
-**Version**: 2.0.0-alpha
-**Last Updated**: 2026-01-12
+**Status**: Repository-verified navigation on 2026-08-06
 
----
+This index points to current repository documentation. Historical v1 and early v2 plans remain available for product archaeology, but they are not implementation or operational instructions.
 
-## Quick Navigation
+## Start here
 
+| Need | Document |
+|---|---|
+| Product and runtime overview | [Project README](../README.md) |
+| Contributor setup | [Developer Quickstart](onboarding/DEVELOPER-QUICKSTART.md) |
+| Repository rules | [AGENTS.md](../AGENTS.md) |
+| Operator CLI boundaries | [Robson Operator CLI](CLI.md) |
+| Current architecture map | [Architecture Index](architecture/README.md) |
+| Architecture decisions | [ADR Index](ADRs.md) |
+| Operational procedures | [Runbook Index](runbooks/README.md) |
+| Known debt and deferred work | [Technical Debt](technical-debt.md) |
 
----
+## Architecture
 
-## Reading Order
+- [v3 Migration Plan](architecture/v3-migration-plan.md)
+- [v3 Runtime Specification](architecture/v3-runtime-spec.md)
+- [v3 Control Loop](architecture/v3-control-loop.md)
+- [v3 Query Engine](architecture/v3-query-query-engine.md)
+- [v3 Architectural Decisions](architecture/v3-architectural-decisions.md)
+- [v4 Backlog](architecture/v4-backlog.md)
 
-### For Product/Business
+Repository evidence and deployed state are different claims. Architecture documents use `repository-verified` when only source evidence is available. Verify live state separately before operational action.
 
-1. Start: [ARCHITECTURE.md](./ARCHITECTURE.md) - Executive Summary
-2. Read: [DOMAIN.md](./DOMAIN.md) - Core Concepts section
-3. Try: [CLI.md](./CLI.md) - Examples section
+## Data contracts
 
-**Time**: 30 minutes
+- [bronze-v1 cold retention export](data-contracts/bronze-v1.md)
 
----
+## Policies and critical ADRs
 
-### For Engineering (Architecture Review)
+- [Robson-Authored Position Invariant](adr/ADR-0022-robson-authored-position-invariant.md)
+- [Trading Policy Layer](adr/ADR-0024-trading-policy-layer.md)
+- [Exchange-Side Insurance Stop](adr/ADR-0039-exchange-side-insurance-stop.md)
+- [Maker-First Entry Execution](adr/ADR-0040-maker-first-entry-execution.md)
+- [Income Ledger Reconciliation](adr/ADR-0045-income-ledger-reconciliation.md)
+- [Executable Span Single Stop Policy](adr/ADR-0052-executable-span-single-stop-policy.md)
+- [Untracked Position Reconciliation Policy](policies/UNTRACKED-POSITION-RECONCILIATION.md)
+- [Production Deployment Policy](policies/PRODUCTION-DEPLOYMENT.md)
 
-1. [ARCHITECTURE.md](./ARCHITECTURE.md) - Full document
-2. [RELIABILITY.md](./RELIABILITY.md) - Full document
-3. [DOMAIN.md](./DOMAIN.md) - Full document
+## Operations
 
-**Time**: 2 hours
+- [Stale-Active Recovery](runbooks/td-2026-05-05-001-stale-active-recovery.md)
+- [Market Data Degraded Mode](runbooks/market-data-degraded-mode.md)
+- [robsond Database Migrations](runbooks/robsond-db-migrations.md)
+- [Real Capital Activation](runbooks/val-002-real-capital-activation.md)
 
-**Key Sections**:
-- Architecture Decision Records (ADRs)
-- Failure mode analysis
-- State machine transitions
-- Position sizing golden rule
+Use the SvelteKit dashboard or authenticated `robsond` API for routine operator actions. The Rust `robson-cli` binary is limited to exceptional recovery workflows documented in [CLI.md](CLI.md).
 
----
+## Historical documents
 
-### For Implementation (Developers)
+The following root-level documents are superseded planning artifacts and are retained only for archaeology:
 
-1. [EXECUTION-PLAN.md](./EXECUTION-PLAN.md) - Review all phases
-2. [PROMPT-PACK.md](./PROMPT-PACK.md) - Execute prompts sequentially
-3. Reference: [DOMAIN.md](./DOMAIN.md) - When implementing business logic
-4. Reference: [RELIABILITY.md](./RELIABILITY.md) - When implementing storage/reconciliation
+- [Robson v2 Architecture](ARCHITECTURE.md)
+- [Robson v2 Execution Plan](EXECUTION-PLAN.md)
+- [Robson v2 Prompt Pack](PROMPT-PACK.md)
+- [Robson v2 Smoke Test](SMOKE-TEST.md)
+- [Robson v2 Reliability Architecture](RELIABILITY.md)
+- [Legacy Developer Guide](DEVELOPER.md)
+- [Agentic Trading Concept Note](AGENTIC-TRADING.md)
 
-**Time**: Work in progress (4-6 weeks implementation)
-
----
-
-## Document Summaries
-
-### [ARCHITECTURE.md](./ARCHITECTURE.md)
-
-**Purpose**: High-level system design
-
-**Key Sections**:
-- System overview diagram
-- Component architecture (7 Rust crates)
-- Data flow (happy path + failure scenarios)
-- State machine
-- Technology stack decisions
-- Why Rust? Why Bun? Why Postgres?
-
-**For**: Architects, senior engineers, product leads
-
----
-
-### [RELIABILITY.md](./RELIABILITY.md)
-
-**Purpose**: Production-grade reliability mechanisms
-
-**Key Sections**:
-- Failure mode analysis (pod crash, network partition, exchange downtime, etc.)
-- Leader election via Postgres advisory locks
-- Reconciliation process (on startup, after reconnect)
-- Idempotency guarantees (intent journal, WAL)
-- Degraded mode (safe fallback)
-- Insurance stop strategy (ADR-001)
-- Observability (logs, metrics, alerts)
-
-**For**: SREs, DevOps, senior engineers
-
-**Critical Topics**:
-- How we prevent split-brain
-- How we survive daemon crashes
-- How we handle exchange downtime
-- Source of truth: always the exchange
-
----
-
-### [DOMAIN.md](./DOMAIN.md)
-
-**Purpose**: Business logic and domain rules
-
-**Key Sections**:
-- Core concepts ("Palma da Mão", user-initiated/system-managed)
-- Entities (Position, Order, Trade)
-- Value objects (Price, Quantity, Symbol, PalmaDaMao, etc.)
-- State machine (Armed → Entering → Active → Exiting → Closed)
-- **Position sizing golden rule** (CRITICAL)
-- Risk management rules
-- Events for event sourcing
-
-**For**: All developers, product team
-
-**Golden Rule**:
-```
-Position Size = (Capital × Risk %) / Palma Distance
-```
-Where Palma = |Entry - Technical Stop Loss|
-
-**Critical Principle**: Position size is DERIVED from technical stop, NOT chosen arbitrarily.
-
----
-
-### [CLI.md](./CLI.md)
-
-**Purpose**: User-facing command reference
-
-**Key Sections**:
-- All CLI commands (arm, disarm, status, panic)
-- JSON output schemas (for automation)
-- Examples (basic workflow, automation scripts, monitoring)
-- Configuration (env vars, config file)
-- Troubleshooting
-
-**For**: Users, automation engineers, QA
-
-**Most Used Commands**:
-```bash
-robson arm BTCUSDT --strategy all-in
-robson status --watch
-robson panic --confirm
-```
-
----
-
-### [SMOKE-TEST.md](./SMOKE-TEST.md)
-
-**Purpose**: Operational smoke test for MVP validation
-
-**Key Sections**:
-- Prerequisites (Rust, Bun only)
-- Copy/paste test cases for all CLI commands
-- Runtime invariants checklist (leverage, margin safety, sizing, etc.)
-- Troubleshooting guide (5+ common issues)
-
-**For**: QA, developers, anyone validating the MVP locally
-
-**Quick Start**:
-```bash
-# Start daemon
-cargo run -p robsond &
-
-# Run smoke test
-# See docs/SMOKE-TEST.md for full test suite
-bun run dev arm BTCUSDT --capital 1000 --risk 1 --side long
-```
-
----
-
-### [EXECUTION-PLAN.md](./EXECUTION-PLAN.md)
-
-**Purpose**: Step-by-step implementation roadmap
-
-**Key Sections**:
-- 10 phases from bootstrap to production
-- Small, measurable steps with acceptance criteria
-- Validation commands for each step
-- Estimated LOC and timeline
-
-**For**: Implementation team, project managers
-
-**Phases**:
-- **Phase 0**: Bootstrap (workspace, CLI skeleton) - ✅ DONE
-- **Phase 1**: Domain types (pure logic)
-- **Phase 2**: Engine (decision logic)
-- **Phase 3**: Storage (PostgreSQL)
-- **Phase 4**: Execution (idempotency)
-- **Phase 5**: Daemon (runtime)
-- **Phase 6**: CLI integration
-- **Phase 7**: E2E test (MVP milestone)
-- **Phase 8**: Detector interface
-- **Phase 9**: Real exchange connector
-- **Phase 10**: Production readiness
-
----
-
-### [PROMPT-PACK.md](./PROMPT-PACK.md)
-
-**Purpose**: Agentic coding execution guide
-
-**Key Sections**:
-- 20+ copy-paste prompts
-- Sequential execution (Prompt 0.1 → 0.2 → 1.1 → 1.2 → ...)
-- Clear validation commands
-- Checklists for acceptance criteria
-
-**For**: AI assistants, developers using agentic tools
-
-**How to Use**:
-1. Copy prompt (e.g., Prompt 1.1: Implement Value Objects)
-2. Paste to AI assistant or execute manually
-3. Run validation commands
-4. Check off checklist
-5. Move to next prompt
-
-**Example Prompt**:
-```
-Prompt 1.1: Implement Value Objects
-
-Create value_objects.rs with: Price, Quantity, Symbol, Side, Leverage, PalmaDaMao
-
-Each must have:
-- Private inner field
-- new() constructor with validation
-- Result<Self, DomainError> return type
-
-Add tests for valid/invalid values.
-
-Validation: cargo test -p robson-domain
-
-Checklist:
-- [ ] All value objects implemented
-- [ ] Validation works
-- [ ] Tests pass (minimum 10 tests)
-```
-
----
-
-## Architecture Decision Records (ADRs)
-
-### ADR-001: Dual-Stop Strategy (Insurance + Local)
-
-**File**: [RELIABILITY.md](./RELIABILITY.md#insurance-stop-optional)
-
-**Problem**: Daemon downtime during stop loss trigger = uncontrolled loss
-
-**Decision**: Place insurance stop on exchange as backup
-
-**Trade-offs**:
-- 🟢 Increased safety (worst-case loss capped)
-- 🔴 Increased complexity (two stop mechanisms)
-- 🟡 Risk of false trigger (mitigated with LIMIT orders)
-
----
-
-### ADR-002: Postgres Advisory Locks for Leader Election
-
-**File**: [RELIABILITY.md](./RELIABILITY.md#leader-election)
-
-**Problem**: Need leader election for HA
-
-**Decision**: Use Postgres advisory locks + TTL table
-
-**Alternatives Considered**:
-- Kubernetes Lease API (separate system)
-- etcd/Consul (overkill)
-- Redis (less ACID)
-
-**Why Postgres**: Single source of truth, simpler deployment
-
----
-
-### ADR-003: Event Sourcing with Snapshots
-
-**File**: [RELIABILITY.md](./RELIABILITY.md#event-sourcing-with-snapshots)
-
-**Problem**: How to reconstruct position state after failures?
-
-**Decision**: Append-only event log + periodic snapshots
-
-**Benefits**:
-- Complete audit trail
-- Can replay for debugging
-- Reconciliation after crashes
-
----
-
-### ADR-0012: Event Sourcing with Postgres Event Log
-
-**File**: [adr/ADR-0012-event-sourcing.md](./adr/ADR-0012-event-sourcing.md)
-
-**Problem**: Audit trail, replay, reconciliation for trading decisions
-
-**Decision**: Postgres-based event sourcing (append-only event_log, projections, snapshots, S3 archival)
-
-**Why Postgres**: ACID, single DB, scale fits non-custodial volume; ParadeDB for search/vectors
-
----
-
-### ADR-0013: CLI–Daemon IPC (UDS / Named Pipes)
-
-**File**: [adr/ADR-0013-cli-daemon-ipc.md](./adr/ADR-0013-cli-daemon-ipc.md)
-
-**Problem**: Atena CLI (Bun) ↔ Core (Rust) — avoid port binding, local-only, easy binary (Win/Linux/Mac)
-
-**Decision**: Local IPC — Unix Domain Sockets (Linux/macOS), named pipes (Windows); socket/pipe path configurable
-
-**Benefits**: No port, no firewall prompts; lower latency; aligns with “one easy binary” for end user
-
-**Alternatives considered**: HTTP local (current MVP), gRPC, stdio/in-process
-
----
-
-## Key Concepts Reference
-
-### "Palma da Mão" (Palm of the Hand)
-
-**Definition**: Distance between entry price and technical stop loss
-
-**Why Universal?**:
-- Structural foundation for position sizing
-- Risk is ALWAYS defined by technical invalidation level
-- NOT arbitrary percentage
-
-**Example**:
-```
-Entry: $95,000
-Technical SL: $93,500
-Palma: $1,500 (1.58%)
-
-Position Size = ($10,000 × 1%) / $1,500 = 0.0666 BTC
-```
-
-**File**: [DOMAIN.md](./DOMAIN.md#palma-da-mão-technical-stop-distance)
-
----
-
-### User-Initiated, System-Managed
-
-**Principle**: User arms → System decides → User confirms
-
-**What User Does**:
-- Choose symbol
-- Choose strategy
-- Choose capital allocation
-
-**What System Does**:
-- Calculate entry price (detector)
-- Calculate stop loss (technical analysis)
-- Calculate position size (golden rule)
-- Execute entry/exit (market orders)
-- Monitor SL/SG 24/7
-
-**File**: [DOMAIN.md](./DOMAIN.md#user-initiated-system-managed)
-
----
-
-### State Machine
-
-```
-Armed → Entering → Active → Exiting → Closed
-         (or Error at any stage)
-```
-
-**Valid Transitions**:
-- Armed → Entering: Detector signal received
-- Entering → Active: Entry order filled
-- Active → Exiting: SL/SG trigger or panic
-- Exiting → Closed: Exit order filled
-
-**Invalid Transitions**:
-- Armed → Active: Cannot skip entering
-- Active → Entering: Cannot re-enter
-
-**File**: [DOMAIN.md](./DOMAIN.md#state-machine)
-
----
-
-## Validation Checklist
-
-### After Phase 7 (MVP)
-
-- [ ] Workspace compiles: `cargo build --all`
-- [ ] Tests pass: `cargo test --all`
-- [ ] Clippy clean: `cargo clippy --all -- -D warnings`
-- [ ] Daemon runs: `cargo run -p robsond`
-- [ ] API responds: `curl http://localhost:8080/health/live`
-- [ ] CLI works: `cd cli && bun run dev status`
-- [ ] Can arm position via CLI
-- [ ] Position transitions through states
-- [ ] Events logged to database
-- [ ] Lease acquired successfully
-- [ ] **Smoke test passes**: See [SMOKE-TEST.md](./SMOKE-TEST.md)
-
----
-
-## Quick Links
-
-### Code
-
-- [Rust Workspace](../../v2/Cargo.toml)
-- [Domain Crate](../../robson-domain/)
-- [Engine Crate](../../robson-engine/)
-- [Daemon](../../robsond/)
-- [CLI](../../cli/)
-
-### Docs
-
-- [Delivery Summary](../../v2/DELIVERY-SUMMARY.md)
-- [Project README](../../v2/README.md)
-- [CLI README](../../cli/README.md)
-
----
-
-## FAQ
-
-### Q: Where should I start reading?
-
-**A**: Depends on your role:
-- **Product/Business**: ARCHITECTURE.md Executive Summary
-- **Engineering**: ARCHITECTURE.md → RELIABILITY.md → DOMAIN.md
-- **Implementation**: EXECUTION-PLAN.md → PROMPT-PACK.md
-
----
-
-### Q: What's the difference between "Palma da Mão" and "stop distance"?
-
-**A**: They're the same thing. "Palma da Mão" (Palm of the Hand) is the business term. "Stop distance" is the technical term. It's the distance between entry and technical stop loss.
-
----
-
-### Q: Why Rust instead of Python/Go?
-
-**A**:
-- **Safety**: No segfaults, no data races, catches errors at compile time
-- **Performance**: Low latency, predictable performance
-- **Correctness**: Type system enforces invariants
-- **Decimal math**: `rust_decimal` for precise financial calculations
-
-See: [ARCHITECTURE.md - Why Rust?](./ARCHITECTURE.md#why-rust-for-core)
-
----
-
-### Q: How do we prevent duplicate orders?
-
-**A**: Intent journal with write-ahead log (WAL). Every order gets a unique intent_id. Before execution, we write to journal. On retry, we check journal first.
-
-See: [RELIABILITY.md - Idempotency](./RELIABILITY.md#idempotency)
-
----
-
-### Q: What happens if the daemon crashes mid-trade?
-
-**A**:
-1. On restart, acquire lease
-2. Reconcile state with exchange
-3. If price passed SL during downtime → Close immediately (degraded mode)
-4. Resume normal operation
-
-See: [RELIABILITY.md - Pod Crash](./RELIABILITY.md#1-pod-crash-oomkill-panic-bug)
-
----
-
-### Q: How do we prevent split-brain (two active traders)?
-
-**A**: Leader election via Postgres advisory locks. Only one daemon can hold lease per (account, symbol). Lease has TTL and requires heartbeat renewal.
-
-See: [RELIABILITY.md - Leader Election](./RELIABILITY.md#leader-election)
-
----
-
-## Glossary
-
-| Term | Definition |
-|------|------------|
-| **Palma da Mão** | Distance between entry and technical stop loss |
-| **Armed** | Position waiting for detector signal |
-| **Entering** | Entry order placed, waiting for fill |
-| **Active** | Position open, monitoring SL/SG |
-| **Exiting** | Exit order placed, waiting for fill |
-| **Closed** | Position fully closed, PnL realized |
-| **Intent** | Write-ahead log entry for idempotency |
-| **Lease** | Lock for leader election (per account+symbol) |
-| **Reconciliation** | Process to sync local state with exchange |
-| **Degraded Mode** | Safe fallback when state mismatch detected |
-
----
-
-## Status
-
-**Planning**: ✅ Complete
-**Skeleton**: ✅ Complete
-**Implementation**: ⏳ Ready to start
-**Production**: 🔜 4-6 weeks away
-
----
-
-**Last Updated**: 2026-01-12
-**Next Action**: Execute Prompt 1.1 from PROMPT-PACK.md
+Do not run commands from a historical document unless a current runbook explicitly repeats and validates them.

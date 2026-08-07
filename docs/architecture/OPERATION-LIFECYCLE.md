@@ -1,3 +1,10 @@
+> **SUPERSEDED HISTORICAL DOCUMENT**
+>
+> This file describes the removed Django `Operation` model and management
+> commands. It is not the current Robson position lifecycle. Use
+> [ADR-0037](../adr/ADR-0037-runtime-state-machine.md) and the
+> [project README](../../README.md).
+>
 # Operation Lifecycle State Machine
 
 **Gate 5**: Minimal lifecycle updates for Operation status based on synchronous outcomes in LIVE execution.

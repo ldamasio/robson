@@ -19,8 +19,8 @@ Robson v3 is an institutional-grade AI risk management assistant for leveraged c
 2. **Risk enforcement**: Hard limits (max position size, max open positions, max daily loss, max drawdown, max exposure) and circuit breakers that HALT execution on breach
 3. **Real-time market data**: Binance WebSocket price feeds with REST fallback
 4. **Event-sourced audit trail**: Every state transition, risk decision, and execution produces an immutable event in PostgreSQL
-5. **Operator control surface**: Web UI for monitoring, intervention (pause/resume/override/panic), risk adjustment, and replay
-6. **CLI**: Terminal commands for all operational actions (arm, disarm, status, panic, credentials)
+5. **Operator control surface**: Web UI for monitoring, ARM, approval, monthly halt, panic, and audit review
+6. **Exceptional operator CLI**: Narrow Rust commands for stale-Active recovery and income-ledger acknowledgement only
 7. **USD-M Futures trading**: Binance USD-M Futures with automatic position management
 
 ### What Robson v3 is NOT
@@ -37,14 +37,14 @@ Robson v3 is an institutional-grade AI risk management assistant for leveraged c
 **Typical session**:
 1. Review market context (funding rates, open interest, volatility regime)
 2. Identify opportunity and form thesis (manual, possibly aided by pattern engine)
-3. Arm position via CLI or UI: specify symbol, side, capital, risk%, technical stop level
+3. Arm the position through the dashboard or authenticated API with the supported policy inputs
 4. Robson calculates position size, validates against risk limits, arms the position
 5. When entry signal triggers (detector or manual injection): Robson places entry order
 6. Position becomes active: trailing stop monitors in real-time via WebSocket
 7. On stop hit or operator intervention: exit order placed, position closed, P&L recorded
 8. Full audit trail available for review and replay
 
-**Emergency workflow**: `robson panic` or UI circuit breaker -> all positions closed immediately
+**Emergency workflow**: use the dashboard kill switch or the authenticated `POST /panic` API, then verify every close
 
 ### Success Criteria
 
@@ -116,7 +116,7 @@ Status rule for this table: code-backed items may be marked done from repository
 | MIG-v3#2 | Replace Django API with thin gateway | ✅ Done (2026-04-16) — robsond serves API/SSE directly; no separate gateway needed |
 | MIG-v3#3 | Frontend direct connection to SSE | ✅ Done (2026-05-12) — Django retired. Canonical frontend is SvelteKit at `frontend/` (`@robson/frontend-v2`). SSE endpoint is live in robsond (`/events`). React/nginx legacy frontend removed from working tree. |
 | MIG-v3#4 | Dynamic risk limits | ❌ Abandoned (2026-05-12) — superseded by MIG-v3#11 + ADR-0024. No static hard limits exist. The only monthly constraint is the 4% drawdown policy encoded in `TradingPolicy`. Dynamic limits beyond the slot model conflict with policy invariants and were dropped from scope. |
-| MIG-v3#5 | Operator control surface in UI | ❌ Abandoned (2026-05-12) — pause/resume do not apply in the slot model; panic close belongs in the backend CLI; risk-limit adjustment from UI contradicts policy invariants (ADR-0024). This was a pre-v3 concept that lost relevance after the slot architecture was finalized. |
+| MIG-v3#5 | Operator control surface in UI | ✅ Rescoped and done (repository-verified) - generalized pause, resume, override, and risk-adjustment controls were abandoned; the dashboard implements supported ARM, approval, monthly-halt, and panic actions. The legacy general-purpose CLI was removed, while the Rust CLI remains limited to exceptional recovery. |
 | MIG-v3#6 | Hash-chained EventLog | 🔄 Deferred to MIG-v4#1 — good integrity property, not required for v3 launch. |
 | MIG-v3#7 | PaymentRail trait | 🔄 Deferred to MIG-v4#2 — TRON/payment rail abstraction is architecture-ready but inactive. See ADR table entry #12. |
 | MIG-v3#8 | Chaos testing suite | ✅ Done (2026-05-12) — `robsond::chaos_tests` covers fail-closed risk timeout, exchange timeout retry/failure, WebSocket reconnect backoff, startup stale-Active exit-code policy, and EventLog fail-fast ordering. |
@@ -267,7 +267,7 @@ Observe -> Interpret -> Decide -> Act -> Evaluate -> Persist
 |---------|--------|----------|
 | Market tick (price update) | Binance WebSocket | Normal |
 | Detector signal (entry trigger) | External detector or manual injection | Normal |
-| Operator command (arm, disarm, panic) | CLI/API | High |
+| Operator command (arm, disarm, panic) | Dashboard or authenticated API | High |
 | Risk alert (threshold approach) | Risk Engine monitoring | High |
 | Timer (periodic health check) | Internal timer (30s) | Low |
 | Circuit breaker activation | Risk Engine | Critical (preempts all) |
@@ -412,7 +412,7 @@ Every action requires explicit permission. Permissions are scoped:
 2. `TriggerExit` when manual (not stop-hit)
 3. `AdjustTechnicalStopConfig` (any environment change to chart-stop policy)
 4. `CircuitBreakerReset` after activation
-5. `PanicClose` (always requires confirmation, even from CLI)
+5. `PanicClose` through the dashboard requires explicit operator confirmation; direct API calls require bearer authorization
 
 This list is configurable via `robsond.toml`.
 
@@ -671,9 +671,9 @@ interface EventStreamMessage {
 | SSE stream drops | Yellow banner: "Connection lost, reconnecting..." Auto-retry with exponential backoff (1s, 2s, 4s, max 30s) | None needed — Runtime continues independently |
 | SSE drops during risk event | Red banner: "CONNECTION LOST DURING RISK EVENT — MANUAL CHECK REQUIRED" | MonthlyHalt activates on 4% drawdown regardless of operator reachability. No escalation levels — system halts until next calendar month or process restart. |
 | WebSocket disconnect (market data) | "Market data delayed" indicator. Prices shown from last known value with stale timestamp | Runtime falls back to REST polling (1s interval) for price data |
-| Full backend unreachable | "System Offline" screen with last known state cached in browser localStorage | Runtime continues operating on k8s. Operator can use CLI as fallback |
+| Full backend unreachable | "System Offline" screen with last known state cached in browser localStorage | Runtime may continue on Kubernetes. The operator follows cluster incident runbooks and exchange emergency procedures; the API-dependent CLI is not a fallback. |
 
-**Automated failsafe when operator unreachable**: If monthly drawdown reaches 4%, MonthlyHalt activates automatically — closes all positions and blocks new entries. No escalation levels. System remains halted until next calendar month or process restart. Operator should monitor via CLI or phone webhook alerts. Kubernetes restarts the pod on liveness failure.
+**Automated failsafe when operator unreachable**: If monthly drawdown reaches 4%, MonthlyHalt activates automatically and closes all positions while blocking new entries. No escalation levels. System remains halted until next calendar month or process restart. The operator monitors through the dashboard and configured alerts. Kubernetes restarts the pod on liveness failure.
 
 ---
 
@@ -939,7 +939,7 @@ Reconsider TRON integration when ALL of these are true:
 |-------|------|------|------|--------|
 | **Unit** | Domain entities, Engine logic, Risk calculations | `cargo test` (Rust), `pytest` (Django during v2.5) | Every commit | v2 domain+engine: good coverage. v1: decent coverage. |
 | **Integration** | Component interactions, EventLog append/replay, Executor+Exchange | `cargo test --features integration` + testcontainers (Postgres) | Every PR | v2: partial (projector stubs). Needs completion. |
-| **Contract** | API contracts (CLI<->daemon, frontend<->backend), event schemas | JSON Schema validation + OpenAPI spec tests | Every PR | Not yet implemented. **v2.5 priority.** |
+| **Contract** | API contracts for the dashboard, exceptional Rust CLI endpoints, and event schemas | JSON Schema validation + OpenAPI spec tests | Every PR | Repository coverage must be verified against the current workflows. |
 | **Risk Engine** | TradingPolicy slot behavior, realized-loss accounting, latent-risk accounting, circuit breakers (binary MonthlyHalt), edge cases | Dedicated `risk_engine_tests` module with property-based testing | Every PR + nightly | v3: ADR-0024 dynamic slots covered by unit tests. Binary MonthlyHalt implemented in `circuit_breaker.rs`. MIG-v3#12 must persist monthly state before VAL-002. |
 | **Replay** | EventLog replay produces identical state | Custom harness: insert events, replay, compare state hash | Nightly | v2: basic replay exists. Determinism assertion: NOT YET. **v2.5 priority.** |
 | **Chaos** | Component failures, slow Risk Engine, exchange timeouts | tokio::test with injected delays + mock failures | Weekly / pre-release | NOT YET. **v3 priority.** |
@@ -988,7 +988,7 @@ Reconsider TRON integration when ALL of these are true:
 | MIG-v2.5#6 | **Add SSE endpoint to robsond for frontend event streaming** — ✅ DONE 2026-04-05 | Frontend needs real-time data from daemon, not Django polling | MIG-v2.5#1 | S | Yes — frontend falls back to REST polling | Remove SSE route, frontend uses REST | Frontend has no real-time capability, operator flies blind |
 | MIG-v2.5#7 | **Implement SOPS for secrets management** | Current secrets are K8s secrets (base64, not encrypted at rest in git). SOPS encrypts in git. | None | S | Yes — revert to plain K8s secrets | Remove .sops.yaml, restore template secrets | Secrets remain unencrypted in git templates (security risk) |
 | MIG-v2.5#8 | **Deploy Prometheus + Grafana + Loki on k3s** | Observability is non-negotiable before v3. Cannot debug production issues without metrics/logs. | k3s cluster (exists) | M | Yes — undeploy | `kubectl delete namespace monitoring` | Flying blind in production. Debugging via `kubectl logs` only. |
-| MIG-v2.5#9 | **Contract tests for daemon API** | CLI and frontend depend on daemon API stability. Breaking changes must be caught in CI. | MIG-v2.5#1 | S | Yes — remove test suite | Revert CI config | API breaks silently, CLI/frontend stop working after daemon update |
+| MIG-v2.5#9 | **Contract tests for daemon API** | The dashboard and exceptional recovery clients depend on API stability. Breaking changes must be caught in CI. | MIG-v2.5#1 | S | Yes - remove test suite | Revert CI config | API breaks silently and operator surfaces fail after a daemon update |
 | MIG-v2.5#10 | **EventLog replay determinism test** — ✅ DONE 2026-04-05 | Must prove replay works before relying on it for state recovery | EventLog implemented (exists in v2) | S | Yes — remove test | N/A | Cannot guarantee state recovery correctness |
 
 ### MIG-v3: v2.5 → v3 (Architectural Evolution)
@@ -996,10 +996,10 @@ Reconsider TRON integration when ALL of these are true:
 | ID | Change | Replaces from v2.5 | Precondition | Effort | Reversible? | Rollback | Breaks If Done Wrong |
 |----|--------|-------------------|-------------|--------|-------------|----------|---------------------|
 | MIG-v3#1 | **Promote robsond as primary runtime** (all execution goes through daemon) ✅ Done 2026-04-10 | Django stop monitor CronJob | MIG-v2.5#1–#4 complete, daemon stable for >2 weeks in prod | M | Yes — rollback to legacy runtime | Re-enable CronJobs (`suspend: false`), robsond continues running passively | Execution path broken if daemon has undiscovered bugs |
-| MIG-v3#2 | **Replace Django API with thin gateway** (FastAPI or axum) that proxies to robsond | Django REST API | MIG-v3#1, MIG-v2.5#6 | L | Partially — can re-enable Django | Redeploy Django, update ingress routing | Frontend/CLI break if gateway has bugs; both have robsond as direct fallback |
+| MIG-v3#2 | **Replace Django API with thin gateway** (FastAPI or axum) that proxies to robsond | Django REST API | MIG-v3#1, MIG-v2.5#6 | L | Partially - can re-enable Django | Redeploy Django, update ingress routing | Operator surfaces break if gateway routing or contracts are wrong |
 | MIG-v3#3 | **Frontend direct connection to robsond SSE** | SSE via Django proxy | MIG-v3#2 | S | Yes — revert to Django proxy | Update frontend VITE_API_BASE_URL to Django endpoint | Frontend loses real-time if SSE path fails; graceful degradation to REST |
 | MIG-v3#4 | **Dynamic risk limits** (volatility-adjusted, funding-rate-aware) | Hard limits only | MIG-v2.5#4, market data pipeline working | M | Yes — disable dynamic, use hard limits | Config: `dynamic_limits_enabled: false` | False sense of security if dynamic computation is wrong; fallback to hard limits is safe |
-| MIG-v3#5 | **Operator control surface** (pause/resume/override in UI) | CLI-only operator interaction | MIG-v3#3, MIG-v2.5#6 | M | Yes — controls are additive | Remove UI controls, operator uses CLI | Operator must use CLI for all interventions, slower response in emergencies |
+| MIG-v3#5 | **Operator control surface** for supported actions | Legacy operator interaction | MIG-v3#3, MIG-v2.5#6 | M | Yes - controls are additive | Revert the affected dashboard control | Operator loses a supported intervention path and must follow the authenticated API runbook |
 | MIG-v3#6 | **Hash-chained EventLog** for tamper detection | Plain EventLog | EventLog stable, MIG-v2.5#10 ✅ DONE 2026-04-05 | S | Yes — stop computing hashes | Remove hash column, revert to plain append | Audit trail tampering undetectable; acceptable for single operator, problematic if audited |
 | MIG-v3#7 | **PaymentRail trait** (architecture readiness for future settlement) | None | None (pure interface definition) | S | Yes — delete trait | Remove trait definition | No impact on v3; delays TRON readiness if ever needed |
 | MIG-v3#8 | **Chaos testing suite** | ✅ Implemented — `robsond::chaos_tests` covers risk timeout, exchange timeout retry, WebSocket reconnect backoff, startup stale-Active exit-code policy, and EventLog fail-fast ordering | All components deployed and stable | M | Yes — disable tests | Remove chaos test suite from CI | Undiscovered failure modes in production; acceptable risk if monitoring is good |
@@ -1008,7 +1008,7 @@ Reconsider TRON integration when ALL of these are true:
 | MIG-v3#11 | **Policy Layer + Dynamic Slot Calculation** (ADR-0024) | Static exposure caps | None | M | Yes — revert to static caps | Config: restore legacy limits | Dynamic slot calculation unavailable; static limits may block valid entries |
 | MIG-v3#12 | **Monthly State Persistence** — `MonthBoundaryReset` + `monthly_state` projection | ✅ Implemented — `realized_loss` and `trades_opened` columns added; dual-routed projection handlers; `load_monthly_state` refactored; backfill script created | MIG-v3#11 | S | Yes — revert to in-memory | Remove monthly_state projection | Monthly realized loss resets on daemon restart; inaccurate budget before real capital |
 | MIG-v3#13 | **Migrate exchange layer from Isolated Margin to USD-M Futures** | SAPI isolated-margin endpoints | MIG-v3#1 | M | Yes — revert to SAPI endpoints | Config: switch back to isolated-margin mode | Orders routed to wrong account type; position mismatches |
-| MIG-v3#14 | **Risk Dashboard** — monthly budget bar, realized-loss display, slot breakdown | ✅ Implemented — dashboard renders budget bar, realized-loss amount/percentage, and backend-sized slot grid from `/status` | MIG-v3#12 follow-up | L | Yes — remove dashboard panels | Remove dashboard UI components | Operator lacks visual risk-budget overview; CLI fallback exists |
+| MIG-v3#14 | **Risk Dashboard**: monthly budget bar, realized-loss display, slot breakdown | Implemented: dashboard renders the budget bar, realized-loss amount and percentage, and backend-sized slot grid from `/status` | MIG-v3#12 follow-up | L | Yes - remove dashboard panels | Remove dashboard UI components | Operator lacks visual risk-budget overview; authenticated API and incident runbooks remain available |
 | MIG-v3#15 | **ARM Entry Policy Selection** — extend `ArmModal.svelte` and `robson.ts:armPosition` to send `entry_policy.mode` + `entry_policy.approval` | ✅ Implemented — `ArmModal` exposes mode and approval controls; `robson.ts:armPosition` accepts optional `entry_policy` | None (frontend task only) | S | Yes — remove controls | Revert to `{ symbol, side }` only | Operator locked to SMA crossover; `Immediate`, `ConfirmedReversal`, `ConfirmedKeyLevel`, and `HumanConfirmation` inaccessible from UI |
 
 ### MIG-v3#12 Follow-up: Option 2 — Slot Count from API Only
