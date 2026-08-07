@@ -76,3 +76,15 @@ Consequences
 - `position_monitor_tick` events (~70k rows, ~20 MB per active month) are
   accepted for now as heartbeat evidence on position streams; revisit if
   they ever dominate a partition.
+
+Amendment (2026-08-07, bronze-v1 retention interlock)
+
+For `event_log` and `income_ledger`, the generic "archived first" allowance
+of Decision 4 is superseded by the bronze-v1 data contract retention
+interlock (docs/data-contracts/bronze-v1.md §6): before any covered row of
+these two tables may be pruned, the retention job MUST fetch and validate
+the bronze commit marker and every referenced part for the affected
+windows. A pg_dump archive alone no longer authorizes deletion from these
+two tables. This amendment does not change Decision 3 for
+event_idempotency and queries_current; ADR-0049 makes no retention
+decision for snapshots.

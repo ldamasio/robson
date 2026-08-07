@@ -1,11 +1,11 @@
 # Data Contract: bronze-v1 (Robson · cold retention export)
 
 **Status**: Proposed (Phase A deliverable; no export runs until Phase B is explicitly approved)
-**Date**: 2026-08-07 (v1.1.0; original 2026-08-06)
+**Date**: 2026-08-07 (v1.1.1; original 2026-08-06)
 **Owner of this contract**: Robson (source schema authority)
 **Pipeline implementer/consumer**: `rbx-data` (ADR-0201)
 **Governance boundary**: rbx-governance ADR-0203 (Robson analytical data boundary)
-**Version**: 1.1.0
+**Version**: 1.1.1
 **Amendment basis**: pre-Phase-B adversarial studies (2026-08-06: payload
 field audit, window-sealing attack) plus the adversarial review of this
 amendment itself (2026-08-07), whose required changes are incorporated.
@@ -50,8 +50,8 @@ retention interlock a Phase B prerequisite so that stays true. Bronze is NOT:
 - **Normative event registry (fail-closed)**: `event_log` contains rows
   beyond the `robson-domain::Event` enum. The registry is a
   version-controlled artifact owned by this contract
-  (`docs/data-contracts/bronze-event-registry.yaml`, to be created as a
-  Phase B prerequisite). It enumerates every accepted `event_type`,
+  (`docs/data-contracts/bronze-event-registry.yaml`, versioned alongside
+  this contract). It enumerates every accepted `event_type`,
   including: all 31 `robson-domain::Event` variants; current auxiliary types
   such as `QUERY_STATE_CHANGED` (uppercase) and the PascalCase funding-saga
   events (`FundingQuoted`, `FundingFailed`, ...); legacy families; allowed
@@ -101,8 +101,11 @@ retention interlock a Phase B prerequisite so that stays true. Bronze is NOT:
 
 Redaction replaces a present string with the literal `"[redacted-bronze-v1]"`
 (`null` stays `null`; array elements are replaced one-by-one preserving
-cardinality). The redaction set is **exactly** the following 12 paths; a
-generic by-field-name rule is wrong in both directions:
+cardinality). For the 31 domain-enum event types the redaction set is
+**exactly** the following 12 paths; auxiliary producers add their own paths
+in the normative registry (`bronze-event-registry.yaml`, currently 6 more
+under `QUERY_STATE_CHANGED`, total 18), which is the single artifact the
+exporter loads. A generic by-field-name rule is wrong in both directions:
 
 | `event_type` | JSONPath |
 |---|---|
@@ -140,7 +143,7 @@ Everything not listed in §2 is out of scope. In particular:
 ### 3.1 Layout
 
 ```
-s3://rbx-data-lake/robson/{env}/7years/bronze/v1/{table}/date=YYYY-MM-DD/part-<window>.ndjson.zst
+s3://rbx-data-lake/robson/{env}/7years/bronze/v1/{table}/date=YYYY-MM-DD/part-<index>.ndjson.zst
 s3://rbx-data-lake/robson/{env}/7years/bronze/v1/{table}/date=YYYY-MM-DD/commit.json
 ```
 
@@ -303,8 +306,8 @@ completeness, and global `event_id` uniqueness detection.
 before any covered source row of `event_log` or `income_ledger` may ever be
 pruned, the retention job MUST fetch and validate the commit marker and
 every referenced part. Today's weekly CronJob touches neither table.
-ADR-0049 MUST be amended (gated PR) so this rule supersedes its generic
-"archived first" allowance for these two tables.
+ADR-0049 carries the matching amendment (2026-08-07): this rule supersedes
+its generic "archived first" allowance for these two tables.
 
 ## 7. Future contract items (explicitly NOT in v1; one gated PR each)
 
@@ -355,6 +358,11 @@ so the need is on record; each requires its own Robson PR and review:
 
 ## Changelog
 
+- 1.1.1 (2026-08-07): part objects named part-<index> (five-digit ascending
+  index per bronze-c1 §5); redaction matrix scoped to the domain enum (12 paths)
+  with auxiliary-producer paths carried by the normative event registry
+  (total 18 including QUERY_STATE_CHANGED); registry file named as the
+  single redaction artifact the exporter loads.
 - 1.1.0 (2026-08-07): incorporate pre-Phase-B adversarial findings and the
   adversarial review of this amendment. Exact 12-path redaction matrix with
   machine-code exceptions guarded by registry value allowlists; normative

@@ -1,0 +1,312 @@
+# bronze-event-registry — normative event_type registry for bronze-v1 §2.1
+#
+# Owned by the bronze-v1 data contract (v1.1.1). The exporter validates every
+# event_log row against this registry and ABORTS the run (schema drift) on:
+#   - an event_type absent from this file;
+#   - a payload whose top-level key set is not (required ∪ subset-of-optional);
+#   - a field whose JSON kind differs from the declared kind;
+#   - a payload.type discriminator mismatch (when has_type_discriminator);
+#   - an exception field whose value violates its allowlist or grammar.
+# Unknown data is never exported and never silently dropped.
+#
+# Kinds: string (default; UUIDs, decimal-strings, timestamps are JSON strings),
+# int, bool, object, array, "string|null", "object|null", etc.
+# `redact` paths are replaced with "[redacted-bronze-v1]" per contract §2.3.
+#
+# Audit basis: pre-Phase-B payload field audit (2026-08-06) for the 31
+# robson-domain::Event variants; code-derived audit (2026-08-07) for
+# QUERY_STATE_CHANGED. Leaf-level classification of nested objects lives in
+# the audit study; this registry validates top-level shape plus every redact
+# and exception path.
+#
+# Completeness gate (contract §2.1): Phase B stays blocked until a live
+# `SELECT DISTINCT event_type` inventory of the source has been compared
+# against this file in the provisioning window (gated, read-only).
+
+version: 1
+contract: bronze-v1/1.1.1
+default_action: abort
+
+exceptions:
+  # Machine-code fields exported verbatim; value-validated (type-only
+  # validation is prohibited by contract §2.1).
+  exit_reason_enum: &exit_reason_enum
+    kind: closed_enum
+    values: [TrailingStop, InsuranceStop, UserPanic, DegradedMode, PositionError, DisarmedByUser, ReconciledMissingOnExchange]
+  skipped_level_reason: &skipped_level_reason
+    kind: closed_enum
+    values: [below_min, above_max]
+  recalibration_reason: &recalibration_reason
+    kind: grammar
+    regex: "^[a-z][a-z0-9_]*(:[a-z0-9_]+)*(:sum=-?[0-9]+(\\.[0-9]+)?)?$"
+    known_values: ["income_ledger:transfer_confirmed:sum=<decimal>", manual_account_change]
+  query_transition_cause: &query_transition_cause
+    kind: closed_enum
+    values: [accepted, processing, risk_checked, risk_denied, awaiting_approval, authorized, acting, completed, failed, expired, restart_invalidated]
+  rejection_reason_code: &rejection_reason_code
+    kind: grammar
+    regex: "^[a-z][a-z0-9_]*$"
+    known_values: [no_valid_signal, executable_stop_out_of_bounds, trading_rules_unavailable, degenerate_stop_span, admission_evidence_present, signal_domain_rejection]
+
+event_types:
+  # ---- robson-domain::Event (31 variants, audited) ----------------------
+  position_armed:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, account_id: string, symbol: object, side: string, tech_stop_distance: "object|null", timestamp: string}
+    optional: {stop_policy: string, stop_buffer_bps_at_arm: string}
+    redact: []
+  entry_policy_resolved:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, entry_policy: string, approval_policy: string, strategy_id: "object|null", timestamp: string}
+    optional: {}
+    redact: []
+  signal_strategy_evaluated:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, entry_policy: string, strategy_id: object, outcome: string, side: "string|null", reason: "string|null", observed_at: "string|null", reference_price: "string|null", timestamp: string}
+    optional: {}
+    redact: ["$.reason"]
+  technical_stop_analyzed:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, signal_id: string, symbol: object, side: string, entry_price: string, analysis: object, timestamp: string}
+    optional: {}
+    redact: ["$.analysis.stop_anchor.invalidation_reason", "$.analysis.stop_quality.reasons[*]"]
+    exceptions:
+      "$.analysis.skipped_levels[*].reason": *skipped_level_reason
+  entry_attempt_exhausted:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, signal_id: "string|null", reason_code: string, reason: string, timestamp: string}
+    optional: {}
+    redact: ["$.reason"]
+    exceptions:
+      "$.reason_code": *rejection_reason_code
+  entry_signal_received:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, signal_id: string, entry_price: string, stop_loss: string, quantity: string, timestamp: string}
+    optional: {initial_executable_stop: string, executable_span: string, cap_basis_distance: string, tick_size: string}
+    redact: []
+  entry_order_placed:  # legacy variant kept for replay
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, order_id: string, expected_price: string, quantity: string, signal_id: string, timestamp: string}
+    optional: {cycle_id: string}
+    redact: []
+  entry_order_requested:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, order_id: string, client_order_id: string, expected_price: string, quantity: string, signal_id: string, timestamp: string}
+    optional: {cycle_id: string}
+    redact: []
+  entry_order_accepted:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, cycle_id: string, order_id: string, client_order_id: string, exchange_order_id: string, expected_price: string, quantity: string, signal_id: string, timestamp: string}
+    optional: {}
+    redact: []
+  entry_order_failed:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, cycle_id: string, order_id: string, client_order_id: string, signal_id: string, reason: string, timestamp: string}
+    optional: {}
+    redact: ["$.reason"]
+  entry_execution_rejected:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, cycle_id: string, order_id: string, client_order_id: string, signal_id: string, reason: string, recoverable: bool, timestamp: string}
+    optional: {}
+    redact: ["$.reason"]
+  entry_filled:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, order_id: string, fill_price: string, filled_quantity: string, fee: string, initial_stop: string, timestamp: string}
+    optional: {invalidation_guard_level: "string|null", binance_position_id: "string|null"}
+    redact: []
+  executable_stop_plan_drift_detected:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, persisted_trigger: string, live_trigger: string, tick_size_at_admission: "string|null", live_tick_size: "string|null", severity: string, timestamp: string}
+    optional: {}
+    redact: []
+  entry_fill_protection_fallback:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, live_resolution_error: string, fallback_source: string, fallback_trigger: string, persisted_trigger: "string|null", tick_size_at_admission: "string|null", live_tick_size: "string|null", requires_operator_review: bool, timestamp: string}
+    optional: {}
+    redact: ["$.live_resolution_error"]
+  executable_stop_risk_resolution_failed:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, state: string, reason: string, severity: string, timestamp: string}
+    optional: {}
+    redact: ["$.reason"]
+  trailing_stop_updated:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, previous_stop: string, new_stop: string, trigger_price: string, timestamp: string}
+    optional: {}
+    redact: []
+  position_monitor_tick:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, symbol: string, price: string, current_stop: string, high_watermark: string, span_remaining: string, timestamp: string}
+    optional: {}
+    redact: []
+  exit_triggered:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, reason: string, trigger_price: string, stop_price: string, timestamp: string}
+    optional: {}
+    redact: []
+    exceptions:
+      "$.reason": *exit_reason_enum
+  exit_order_placed:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, order_id: string, expected_price: string, quantity: string, exit_reason: string, timestamp: string}
+    optional: {cycle_id: string}
+    redact: []
+    exceptions:
+      "$.exit_reason": *exit_reason_enum
+  exit_filled:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, order_id: string, fill_price: string, filled_quantity: string, fee: string, timestamp: string}
+    optional: {}
+    redact: []
+  position_closed:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, exit_reason: string, entry_price: string, exit_price: string, realized_pnl: string, total_fees: string, timestamp: string}
+    optional: {closure_evidence: object}   # historically absent pre-evidence rows
+    redact: []
+    exceptions:
+      "$.exit_reason": *exit_reason_enum
+  month_boundary_reset:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, capital_base: string, carried_positions_risk: string, month: int, year: int, timestamp: string}
+    optional: {}
+    redact: []
+  capital_base_recalibrated:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, previous_capital_base: string, new_capital_base: string, wallet_balance: string, carried_risk: string, reason: string, evidence: string, month: int, year: int, timestamp: string}
+    optional: {}
+    redact: ["$.evidence"]
+    exceptions:
+      "$.reason": *recalibration_reason
+  entry_approval_pending:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, signal_id: string, timestamp: string}
+    optional: {}
+    redact: []
+  position_disarmed:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, reason: string, timestamp: string}
+    optional: {}
+    redact: ["$.reason"]
+  position_error:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, error: string, recoverable: bool, timestamp: string}
+    optional: {}
+    redact: ["$.error"]
+  insurance_stop_placed:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, order_id: string, stop_price: string, timestamp: string}
+    optional: {}
+    redact: []
+  insurance_stop_replaced:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, previous_order_id: string, order_id: string, stop_price: string, timestamp: string}
+    optional: {}
+    redact: []
+  insurance_stop_cancelled:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, order_id: string, timestamp: string}
+    optional: {}
+    redact: []
+  insurance_stop_failed:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, stop_price: string, error: string, timestamp: string}
+    optional: {}
+    redact: ["$.error"]
+  startup_recovery_insurance_stop_checked:
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, recorded_order_id: "string|null", observed_order_id: "string|null", expected_stop: string, observed_stop: "string|null", outcome: string, timestamp: string}
+    optional: {}
+    redact: []
+
+  # ---- auxiliary producers (audited from code) --------------------------
+  QUERY_STATE_CHANGED:
+    status: audited
+    has_type_discriminator: false   # payload is QueryStateChangedEvent, no serde tag
+    required: {query_id: string, position_id: "string|null", state: string, started_at: string, finished_at: "string|null", transition_cause: string, snapshot: object}
+    optional: {}
+    redact:
+      - "$.snapshot.state.Failed.reason"
+      - "$.snapshot.state.Denied.reason"
+      - "$.snapshot.outcome.NoAction.reason"
+      - "$.snapshot.outcome.Denied.reason"
+      - "$.snapshot.approval.reason"
+      - "$.snapshot.kind.SafetyNetExit.reason"
+    exceptions:
+      "$.transition_cause": *query_transition_cause
+    notes: >
+      snapshot is a full ExecutionQuery (externally tagged serde enums
+      inside). Structural fields export verbatim; every free-text reason
+      path above is redacted; transition_cause is a closed vocabulary
+      validated by allowlist. ADR-0049 excludes only the happy-path
+      transitions of ProcessMarketTick queries from persistence; every
+      other query kind is fully persisted, and governed/abnormal outcomes
+      of market ticks are persisted too.
+
+  # ---- funding saga (present in data; ad-hoc payloads; NOT yet audited) --
+  FundingStarted:   {status: pending_audit, action: abort}
+  FundingQuoted:    {status: pending_audit, action: abort}
+  FundingConverted: {status: pending_audit, action: abort}
+  TransferPrepared: {status: pending_audit, action: abort}
+  TransferExecuted: {status: pending_audit, action: abort}
+  FundingSettled:   {status: pending_audit, action: abort}
+  FundingFailed:    {status: pending_audit, action: abort}
+  ConversionExecuted: {status: pending_audit, action: abort}
+  CapitalRefreshed:   {status: pending_audit, action: abort}
+  # Consequence: any window containing a funding-saga event stays unsealed
+  # until this family is audited (registry amendment, minor contract bump).
+
+  # ---- legacy v2-era families (historical partitions only) ---------------
+  ORDER_SUBMITTED:   {status: legacy_pending_audit, action: abort}
+  ORDER_ACKED:       {status: legacy_pending_audit, action: abort}
+  ORDER_REJECTED:    {status: legacy_pending_audit, action: abort}
+  ORDER_CANCELED:    {status: legacy_pending_audit, action: abort}
+  FILL_RECEIVED:     {status: legacy_pending_audit, action: abort}
+  POSITION_OPENED:   {status: legacy_pending_audit, action: abort}
+  POSITION_CLOSED:   {status: legacy_pending_audit, action: abort}
+  ENTRY_FILLED:      {status: legacy_pending_audit, action: abort}
+  BALANCE_SAMPLED:   {status: legacy_pending_audit, action: abort}
+  RISK_CHECK_FAILED: {status: legacy_pending_audit, action: abort}
+  STRATEGY_ENABLED:  {status: legacy_pending_audit, action: abort}
+  STRATEGY_DISABLED: {status: legacy_pending_audit, action: abort}
+  STRATEGY_CREATED:  {status: legacy_pending_audit, action: abort}
+  ENTRY_ORDER_PLACED: {status: legacy_pending_audit, action: abort}
+  ENTRY_SIGNAL_RECEIVED: {status: legacy_pending_audit, action: abort}
+  TRAILING_STOP_UPDATED: {status: legacy_pending_audit, action: abort}
+  POSITION_MONITOR_TICK: {status: legacy_pending_audit, action: abort}
+  EXIT_TRIGGERED:    {status: legacy_pending_audit, action: abort}
+  EXIT_ORDER_PLACED: {status: legacy_pending_audit, action: abort}
+  EXIT_FILLED:       {status: legacy_pending_audit, action: abort}
+  # Consequence: historical backfill of v2-era windows requires auditing
+  # these families first. The Phase B canary targets current windows, where
+  # only v3 producers write.
