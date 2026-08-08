@@ -1,11 +1,11 @@
 # Data Contract: bronze-v1 (Robson · cold retention export)
 
 **Status**: Proposed (Phase A deliverable; no export runs until Phase B is explicitly approved)
-**Date**: 2026-08-07 (v1.1.1; original 2026-08-06)
+**Date**: 2026-08-08 (v1.1.2; original 2026-08-06)
 **Owner of this contract**: Robson (source schema authority)
 **Pipeline implementer/consumer**: `rbx-data` (ADR-0201)
 **Governance boundary**: rbx-governance ADR-0203 (Robson analytical data boundary)
-**Version**: 1.1.1
+**Version**: 1.1.2
 **Amendment basis**: pre-Phase-B adversarial studies (2026-08-06: payload
 field audit, window-sealing attack) plus the adversarial review of this
 amendment itself (2026-08-07), whose required changes are incorporated.
@@ -163,8 +163,8 @@ s3://rbx-data-lake/robson/{env}/7years/bronze/v1/{table}/date=YYYY-MM-DD/commit.
   with `rows: 0` and no parts.
 - **Conditional creation required**: every part and the marker are written
   with `If-None-Match: *`. On `412`, `409`, or an ambiguous timeout, the
-  exporter retrieves and hashes the existing object (a HEAD checksum may be
-  used only if the conformance test proves it is a full-object SHA-256):
+  exporter retrieves and hashes the existing object (verification is
+  always GET plus local SHA-256; HEAD checksums are never trusted):
   equal content = success; different content = fatal, no checkpoint advance.
   A missing object (`404` after an ambiguous outcome) is retried with
   conditional PUT. Checksum semantics are two distinct cases: a **missing
@@ -190,8 +190,10 @@ s3://rbx-data-lake/robson/{env}/7years/bronze/v1/{table}/date=YYYY-MM-DD/commit.
   fence after that snapshot has been acquired is prohibited.
 - The exporter invokes a `SECURITY DEFINER` fence function; direct
   `pg_read_all_stats` membership for the export role is not required. The
-  function is **created by a Robson migration** (gated PR, Phase B
-  prerequisite; the database schema is Robson's, `rbx-data` only invokes)
+  function is **created by a Robson migration** (applied 2026-08-08; the
+  database schema is Robson's, `rbx-data` only invokes). Ownership
+  transfer to the stats definer role per the provisioning runbook §2 is
+  MANDATORY before the first export run
   and MUST be: schema-qualified; owned by a role with the needed stats
   visibility; defined with `SET search_path = pg_catalog, pg_temp`;
   `REVOKE EXECUTE ... FROM PUBLIC`; `GRANT EXECUTE` only to the export role.
@@ -282,6 +284,16 @@ rbx-data catalog with owner and retention class (`7years`).
 2. Uniqueness: `exchange_income_id` unique across bronze; `event_id`
    duplication is **detected and fatal** (the source PK is
    `(event_id, ingested_at)`, which does not guarantee global uniqueness).
+   Enforcement has two levels so it never requires a global source scan
+   (§4): (i) **within-window**, inside the single export snapshot
+   (partition-pruned, allowed); (ii) **cross-window**, via an
+   exporter-side persistent dedup index updated per sealed window. The
+   dedup index is NOT the checkpoint: the checkpoint reconstructs from
+   commit markers alone; the dedup index reconstructs by streaming the
+   committed bronze parts from S3 (never by scanning the source
+   database). A lost dedup index does not block sealing; it suspends only
+   the cross-window assertion until rebuilt, and that suspension is
+   recorded in the run log.
 3. Coverage: every daily window from the first cursor **through the latest
    completed window whose sealing preconditions passed** (never through the
    current database time) has exactly one commit marker (possibly
@@ -357,6 +369,14 @@ so the need is on record; each requires its own Robson PR and review:
 | Object administratively deleted from the bucket | Coverage check fails (marker references missing part); alert; no silent re-publish over a sealed window |
 
 ## Changelog
+
+- 1.1.2 (2026-08-08): pre-implementation critical evaluation (independent
+  Fable 5 pass, pinned refs) resolved: two-level event_id uniqueness
+  design (within-window snapshot check + exporter-side dedup index with
+  an explicit S3-parts reconstruction rule), removing the tension between
+  §6.2, the §4 no-global-scan rule and the markers-as-progress-truth
+  failure mode; fence ownership transfer made explicitly mandatory before
+  first export; dead HEAD-checksum conditional removed (always GET+hash).
 
 - 1.1.1 (2026-08-07): part objects named part-<index> (five-digit ascending
   index per bronze-c1 §5); redaction matrix scoped to the domain enum (12 paths)
