@@ -79,6 +79,17 @@ jobs:
       - name: Run tests (no postgres feature - uses MemoryStore)
         run: cargo test --all --no-fail-fast
 
+      - name: Reject duplicate migration versions
+        # SQLx identifies migrations solely by the numeric prefix; two files
+        # sharing one version fail at runtime with VersionMismatch. Catch it
+        # before PostgreSQL ever sees them.
+        run: |
+          dups=$(ls migrations/*.sql | sed 's|.*/||; s|_.*||; s|^0*||' | sort | uniq -d)
+          if [ -n "$dups" ]; then
+            echo "Duplicate migration version prefix(es): $dups"
+            exit 1
+          fi
+
       - name: Validate SQLx migrations on clean PostgreSQL
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/robson_migration_ci
