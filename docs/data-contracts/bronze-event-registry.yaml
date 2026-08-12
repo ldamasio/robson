@@ -1,6 +1,6 @@
 # bronze-event-registry — normative event_type registry for bronze-v1 §2.1
 #
-# Owned by the bronze-v1 data contract (v1.1.1). The exporter validates every
+# Owned by the bronze-v1 data contract (v1.1.3). The exporter validates every
 # event_log row against this registry and ABORTS the run (schema drift) on:
 #   - an event_type absent from this file;
 #   - a payload whose top-level key set is not (required ∪ subset-of-optional);
@@ -15,7 +15,8 @@
 #
 # Audit basis: pre-Phase-B payload field audit (2026-08-06) for the 31
 # robson-domain::Event variants; code-derived audit (2026-08-07) for
-# QUERY_STATE_CHANGED. Leaf-level classification of nested objects lives in
+# QUERY_STATE_CHANGED; live-row audit (2026-08-12 provisioning-window
+# inventory) for STRATEGY_CREATED. Leaf-level classification of nested objects lives in
 # the audit study; this registry validates top-level shape plus every redact
 # and exception path.
 #
@@ -24,7 +25,7 @@
 # against this file in the provisioning window (gated, read-only).
 
 version: 1
-contract: bronze-v1/1.1.1
+contract: bronze-v1/1.1.3
 default_action: abort
 
 exceptions:
@@ -273,6 +274,21 @@ event_types:
       other query kind is fully persisted, and governed/abnormal outcomes
       of market ticks are persisted too.
 
+  STRATEGY_CREATED:
+    status: audited
+    has_type_discriminator: false   # payload.type is the strategy kind (e.g. "manual"), NOT a serde tag
+    required: {account_id: string, name: string, risk_config: object, strategy_id: string, tenant_id: string, type: string}
+    optional: {}
+    redact: ["$.name"]
+    notes: >
+      v2-era producer still LIVE (strategy-creation path, actor System).
+      Audited from the live rows in the 2026-08-12 provisioning-window
+      inventory: 149 rows, uniform 6-key shape, payload_schema_version=1,
+      latest occurrence 2026-08-08 (inside the first canary window, which
+      is what forced this amendment). risk_config is structural (numeric
+      leaves daily_loss_limit, max_exposure); name is operator free text
+      and is redacted.
+
   # ---- funding saga (present in data; ad-hoc payloads; NOT yet audited) --
   FundingStarted:   {status: pending_audit, action: abort}
   FundingQuoted:    {status: pending_audit, action: abort}
@@ -299,7 +315,6 @@ event_types:
   RISK_CHECK_FAILED: {status: legacy_pending_audit, action: abort}
   STRATEGY_ENABLED:  {status: legacy_pending_audit, action: abort}
   STRATEGY_DISABLED: {status: legacy_pending_audit, action: abort}
-  STRATEGY_CREATED:  {status: legacy_pending_audit, action: abort}
   ENTRY_ORDER_PLACED: {status: legacy_pending_audit, action: abort}
   ENTRY_SIGNAL_RECEIVED: {status: legacy_pending_audit, action: abort}
   TRAILING_STOP_UPDATED: {status: legacy_pending_audit, action: abort}
