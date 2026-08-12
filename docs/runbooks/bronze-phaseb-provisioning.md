@@ -167,9 +167,11 @@ SELECT indexrelid::regclass, indisvalid FROM pg_index
 
 ## 3. Ordering with the rest of Phase B
 
-1. Contract artifacts merged: bronze-v1 1.1.1 + event registry (PR #168)
-   and bronze-c1 profile + golden vectors (PR #170). The canary is
-   contractually blocked without them.
+1. Contract artifacts merged: bronze-v1 at the CURRENT version (1.1.3:
+   registry with STRATEGY_CREATED audited, PR #172; originally 1.1.1 via
+   PR #168) and bronze-c1 profile + golden vectors (PR #170). The canary
+   is contractually blocked without them, and the exporter binary must
+   embed the matching registry (rbx-data re-vendor + rebuild).
 2. Merge + sync applies 000027/000028 (this repo).
 3. Role + pg_hba provisioning (rbx-infra isolated playbook, reload-only)
    creates `robson_bronze_reader` and `bronze_fence_definer`.
