@@ -1,11 +1,11 @@
 # Data Contract: bronze-v1 (Robson · cold retention export)
 
 **Status**: Proposed (Phase A deliverable; no export runs until Phase B is explicitly approved)
-**Date**: 2026-08-08 (v1.1.2; original 2026-08-06)
+**Date**: 2026-08-12 (v1.1.3; original 2026-08-06)
 **Owner of this contract**: Robson (source schema authority)
 **Pipeline implementer/consumer**: `rbx-data` (ADR-0201)
 **Governance boundary**: rbx-governance ADR-0203 (Robson analytical data boundary)
-**Version**: 1.1.2
+**Version**: 1.1.3
 **Amendment basis**: pre-Phase-B adversarial studies (2026-08-06: payload
 field audit, window-sealing attack) plus the adversarial review of this
 amendment itself (2026-08-07), whose required changes are incorporated.
@@ -103,8 +103,9 @@ Redaction replaces a present string with the literal `"[redacted-bronze-v1]"`
 (`null` stays `null`; array elements are replaced one-by-one preserving
 cardinality). For the 31 domain-enum event types the redaction set is
 **exactly** the following 12 paths; auxiliary producers add their own paths
-in the normative registry (`bronze-event-registry.yaml`, currently 6 more
-under `QUERY_STATE_CHANGED`, total 18), which is the single artifact the
+in the normative registry (`bronze-event-registry.yaml`, currently 7 more:
+6 under `QUERY_STATE_CHANGED` and `$.name` under `STRATEGY_CREATED`,
+total 19), which is the single artifact the
 exporter loads. A generic by-field-name rule is wrong in both directions:
 
 | `event_type` | JSONPath |
@@ -370,6 +371,13 @@ so the need is on record; each requires its own Robson PR and review:
 
 ## Changelog
 
+- 1.1.3 (2026-08-12): STRATEGY_CREATED audited and promoted out of the
+  legacy abort list (additive, registry amendment). The 2026-08-12
+  provisioning-window inventory proved the producer is still live and one
+  occurrence lands inside the first canary window; without this amendment
+  the first window could never seal. Uniform 6-key shape from the live-row
+  audit; no type discriminator (payload.type is the strategy kind);
+  `$.name` (operator free text) added to the redaction set (total 19).
 - 1.1.2 (2026-08-08): pre-implementation critical evaluation (independent
   Fable 5 pass, pinned refs) resolved: two-level event_id uniqueness
   design (within-window snapshot check + exporter-side dedup index with
