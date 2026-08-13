@@ -1719,6 +1719,8 @@ mod tests {
             configured_level_n: 2,
             selected_level_n: Some(2),
             skipped_levels: vec![],
+            cluster_representative:
+                robson_engine::technical_stop_analyzer::ClusterRepresentative::AdverseExtreme,
         }
     }
 
@@ -1731,6 +1733,8 @@ mod tests {
             configured_level_n: 2,
             selected_level_n: None,
             skipped_levels: vec![],
+            cluster_representative:
+                robson_engine::technical_stop_analyzer::ClusterRepresentative::AdverseExtreme,
         }
     }
 
