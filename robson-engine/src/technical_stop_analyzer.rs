@@ -216,6 +216,16 @@ pub enum ClusterRepresentative {
     AdverseExtreme,
 }
 
+impl ClusterRepresentative {
+    /// Stable snake_case identifier for audit payloads.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ClusterRepresentative::Mean => "mean",
+            ClusterRepresentative::AdverseExtreme => "adverse_extreme",
+        }
+    }
+}
+
 fn default_configured_level_n() -> usize {
     2
 }

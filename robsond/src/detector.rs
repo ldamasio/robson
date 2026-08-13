@@ -855,6 +855,7 @@ impl DetectorTask {
                 })
                 .collect(),
             selection_rule: Some("anchor_n_walk_deeper".to_string()),
+            cluster_representative: Some(analysis.cluster_representative.as_str().to_string()),
         }
     }
 
