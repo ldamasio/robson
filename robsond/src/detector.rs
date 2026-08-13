@@ -855,6 +855,7 @@ impl DetectorTask {
                 })
                 .collect(),
             selection_rule: Some("anchor_n_walk_deeper".to_string()),
+            cluster_representative: Some(analysis.cluster_representative.as_str().to_string()),
         }
     }
 
@@ -1719,6 +1720,8 @@ mod tests {
             configured_level_n: 2,
             selected_level_n: Some(2),
             skipped_levels: vec![],
+            cluster_representative:
+                robson_engine::technical_stop_analyzer::ClusterRepresentative::AdverseExtreme,
         }
     }
 
@@ -1731,7 +1734,19 @@ mod tests {
             configured_level_n: 2,
             selected_level_n: None,
             skipped_levels: vec![],
+            cluster_representative:
+                robson_engine::technical_stop_analyzer::ClusterRepresentative::AdverseExtreme,
         }
+    }
+
+    /// ADR-0053: the persisted audit records the representative rule that
+    /// produced the stop.
+    #[test]
+    fn build_technical_stop_audit_records_cluster_representative() {
+        let analysis = make_swing_analysis(Side::Long);
+        let audit =
+            DetectorTask::build_technical_stop_audit(&analysis, &TechnicalStopConfig::default());
+        assert_eq!(audit.cluster_representative.as_deref(), Some("adverse_extreme"));
     }
 
     #[test]

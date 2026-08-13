@@ -13,8 +13,12 @@
 //! # Algorithm (priority order per REQ-CORE-TECHSTOP-001)
 //!
 //! 1. **Swing points** (primary): identify swing lows (LONG) or swing highs
-//!    (SHORT) in the candle history. Take the `support_level_n`-th level
-//!    (default: 2nd) ordered by distance from entry.
+//!    (SHORT) in the candle history, merge nearby levels into clusters, and
+//!    take the `support_level_n`-th cluster (default: 2nd) ordered by distance
+//!    from entry. A cluster is represented by its **adverse extreme** — the
+//!    deepest member for LONG, the highest for SHORT — so the stop anchors
+//!    beyond the technical event, never at the zone's statistical center
+//!    (ADR-0053).
 //! 2. **ATR fallback**: when fewer than `support_level_n` swing levels are
 //!    found below/above entry, use `entry ± atr_multiplier × ATR(atr_period)`.
 //!
@@ -179,8 +183,11 @@ pub struct TechnicalStopAnalysis {
     pub method: TechnicalStopMethod,
     /// Confidence level of the result.
     pub confidence: StopConfidence,
-    /// All swing levels detected below (LONG) or above (SHORT) the entry,
-    /// ordered by distance from entry ascending. Useful for audit trail.
+    /// One representative per support/resistance cluster detected below
+    /// (LONG) or above (SHORT) the entry, ordered by distance from entry
+    /// ascending. After ADR-0053 each representative is the cluster's
+    /// adverse extreme; historical payloads carry cluster means. Useful for
+    /// audit trail.
     pub detected_levels: Vec<Price>,
     /// The `support_level_n` the selection anchored at (ADR-0050 §1).
     #[serde(default = "default_configured_level_n")]
@@ -191,6 +198,35 @@ pub struct TechnicalStopAnalysis {
     /// Levels considered and skipped during the anchor-N walk (ADR-0050 §1).
     #[serde(default)]
     pub skipped_levels: Vec<SkippedLevel>,
+    /// Clustering representative rule in effect for this analysis
+    /// (ADR-0053). Historical payloads deserialize as
+    /// [`ClusterRepresentative::Mean`].
+    #[serde(default)]
+    pub cluster_representative: ClusterRepresentative,
+}
+
+/// Which statistic of a support/resistance cluster anchors the stop
+/// (ADR-0053 audit field).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ClusterRepresentative {
+    /// Pre-ADR-0053 behavior: mean of the cluster members. Only produced by
+    /// historical payloads; current analysis never emits this.
+    #[default]
+    Mean,
+    /// Adverse extreme of the cluster members: minimum for Long supports,
+    /// maximum for Short resistances (REQ-CORE-TECHSTOP-001 conformance).
+    AdverseExtreme,
+}
+
+impl ClusterRepresentative {
+    /// Stable snake_case identifier for audit payloads.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            ClusterRepresentative::Mean => "mean",
+            ClusterRepresentative::AdverseExtreme => "adverse_extreme",
+        }
+    }
 }
 
 fn default_configured_level_n() -> usize {
@@ -288,7 +324,7 @@ impl TechnicalStopAnalyzer {
             .collect();
 
         // ── 4. Cluster nearby levels ──────────────────────────────────────────
-        let clustered = cluster_levels(&mut filtered, entry_val, config.level_tolerance);
+        let clustered = cluster_levels(&mut filtered, entry_val, config.level_tolerance, side);
 
         // ── 5. Sort by distance from entry (ascending — closest first) ────────
         let mut ordered = clustered;
@@ -370,6 +406,7 @@ impl TechnicalStopAnalyzer {
                     configured_level_n: n,
                     selected_level_n: Some(selected_level_n),
                     skipped_levels,
+                    cluster_representative: ClusterRepresentative::AdverseExtreme,
                 });
             }
             // No in-bounds level at or beyond the anchor: fall through to the
@@ -392,6 +429,7 @@ impl TechnicalStopAnalyzer {
                     configured_level_n: n,
                     selected_level_n: Some(ordered.len()),
                     skipped_levels,
+                    cluster_representative: ClusterRepresentative::AdverseExtreme,
                 });
             }
             if let Ok(level) = Price::new(level_val) {
@@ -447,6 +485,7 @@ impl TechnicalStopAnalyzer {
             configured_level_n: n,
             selected_level_n: None,
             skipped_levels,
+            cluster_representative: ClusterRepresentative::AdverseExtreme,
         })
     }
 }
@@ -504,9 +543,23 @@ fn detect_swing_levels(candles: &[Candle], side: Side, lookback: usize) -> Vec<D
 /// Cluster nearby price levels together, returning representative levels.
 ///
 /// Levels within `tolerance` (as a fraction of entry) of an existing cluster
-/// center are merged into that cluster. The cluster representative is the mean
-/// of all members. Clusters are ordered in the same order they were first seen.
-fn cluster_levels(levels: &mut Vec<Decimal>, entry: Decimal, tolerance: Decimal) -> Vec<Decimal> {
+/// center are merged into that cluster. Membership is decided against the
+/// running mean of the cluster (its geometric center), but the cluster
+/// representative is the **adverse extreme** of its members: the minimum for
+/// `Long` (deepest support) and the maximum for `Short` (highest resistance).
+///
+/// The representative is what the stop anchors at, and a stop must sit
+/// beyond the technical event, not at the statistical center of the zone
+/// (REQ-CORE-TECHSTOP-001 "below/above the level"; ADR-0053). A mean
+/// representative places the stop inside the zone's test range, where an
+/// ordinary probe of the level fills it without the level ever breaking
+/// (2026-08-13 production stop-out, issue #173).
+fn cluster_levels(
+    levels: &mut Vec<Decimal>,
+    entry: Decimal,
+    tolerance: Decimal,
+    side: Side,
+) -> Vec<Decimal> {
     if levels.is_empty() {
         return vec![];
     }
@@ -537,9 +590,9 @@ fn cluster_levels(levels: &mut Vec<Decimal>, entry: Decimal, tolerance: Decimal)
 
     clusters
         .iter()
-        .map(|c| {
-            let sum = c.iter().fold(Decimal::ZERO, |s, &v| s + v);
-            sum / Decimal::from(c.len() as u32)
+        .filter_map(|c| match side {
+            Side::Long => c.iter().min().copied(),
+            Side::Short => c.iter().max().copied(),
         })
         .collect()
 }
@@ -665,7 +718,7 @@ mod tests {
     #[test]
     fn clusters_nearby_levels_into_one() {
         let mut levels = vec![dec!(93000), dec!(93200), dec!(93100)];
-        let result = cluster_levels(&mut levels, dec!(95000), dec!(0.005));
+        let result = cluster_levels(&mut levels, dec!(95000), dec!(0.005), Side::Long);
         // All within 0.5% of 95000 (= 475); spread is 200 — should merge
         assert_eq!(result.len(), 1);
     }
@@ -673,9 +726,26 @@ mod tests {
     #[test]
     fn keeps_distant_levels_separate() {
         let mut levels = vec![dec!(90000), dec!(93000)];
-        let result = cluster_levels(&mut levels, dec!(95000), dec!(0.005));
+        let result = cluster_levels(&mut levels, dec!(95000), dec!(0.005), Side::Long);
         // Gap of 3000 >> 0.5% of 95000 (475)
         assert_eq!(result.len(), 2);
+    }
+
+    /// ADR-0053: the cluster representative is the adverse extreme of the
+    /// members, never the mean — deepest member for Long supports.
+    #[test]
+    fn long_cluster_representative_is_the_minimum_member() {
+        let mut levels = vec![dec!(93000), dec!(93200), dec!(93100)];
+        let result = cluster_levels(&mut levels, dec!(95000), dec!(0.005), Side::Long);
+        assert_eq!(result, vec![dec!(93000)], "Long support anchors at the deepest member");
+    }
+
+    /// ADR-0053: highest member for Short resistances.
+    #[test]
+    fn short_cluster_representative_is_the_maximum_member() {
+        let mut levels = vec![dec!(97000), dec!(96800), dec!(96900)];
+        let result = cluster_levels(&mut levels, dec!(95000), dec!(0.005), Side::Short);
+        assert_eq!(result, vec![dec!(97000)], "Short resistance anchors at the highest member");
     }
 
     // ── compute_atr ───────────────────────────────────────────────────────────
@@ -941,5 +1011,130 @@ mod tests {
         assert_eq!(result.confidence, StopConfidence::Medium);
         assert_eq!(result.skipped_levels.len(), 1);
         assert_eq!(result.skipped_levels[0].reason, SkipReason::BelowMin);
+    }
+
+    // ── ADR-0053 production replay fixtures (issue #173) ──────────────────────
+
+    /// 100 base candles with swing highs injected at well-separated indices.
+    fn candles_with_swing_highs(base: Decimal, highs: &[Decimal]) -> Vec<Candle> {
+        let mut cs: Vec<Candle> = (0..100).map(|_| flat_candle(base)).collect();
+        for (i, &high) in highs.iter().enumerate() {
+            let idx = 30 + i * 5;
+            cs[idx] = candle(high, high, base, high);
+        }
+        cs
+    }
+
+    /// Incident-derived fixture for the 2026-08-13 Short arm (position
+    /// 019ffb62), the stop-out that motivated ADR-0053. The zone geometry
+    /// (seven swing highs merged into one resistance cluster by the 0.5%
+    /// tolerance) is taken from the production 15m chart; the exact
+    /// production cluster also carried forming-candle state that is not
+    /// byte-reproducible, so this is not a literal replay. The test pins
+    /// both halves of the defect and the fix:
+    /// - the OLD mean representative sits below the 63990.7 swing high the
+    ///   production probe (top 63980.6) never broke, so a stop derived from it
+    ///   fills inside the zone;
+    /// - the NEW adverse-extreme representative anchors at the cluster's
+    ///   highest member, beyond every level of the zone.
+    #[test]
+    fn incident_2026_08_13_short_stop_anchors_beyond_the_whole_resistance_zone() {
+        let entry = Price::new(dec!(63768.50)).unwrap();
+        let zone = [
+            dec!(63800.0),
+            dec!(63828.0),
+            dec!(63881.3),
+            dec!(63916.6),
+            dec!(63990.7),
+            dec!(64050.3),
+            dec!(64131.4),
+        ];
+        let cs = candles_with_swing_highs(dec!(63700), &zone);
+
+        // Old failure mode, pinned arithmetically: the mean of the zone's
+        // members sits BELOW the swing high the production probe never broke,
+        // so a mean-anchored stop fills on an ordinary test of the level.
+        let zone_mean =
+            zone.iter().fold(Decimal::ZERO, |s, &v| s + v) / Decimal::from(zone.len() as u32);
+        assert!(
+            zone_mean < dec!(63990.7),
+            "mean representative {zone_mean} must sit inside the zone for this fixture to \
+             demonstrate the defect"
+        );
+
+        let result = TechnicalStopAnalyzer::analyze(
+            &cs,
+            entry,
+            Side::Short,
+            &TechnicalStopConfig::default(),
+        )
+        .unwrap();
+
+        assert_eq!(result.stop_price.as_decimal(), dec!(64131.4));
+        assert!(
+            result.stop_price.as_decimal() > dec!(63990.7),
+            "stop must clear the swing high the 2026-08-13 probe never broke"
+        );
+        assert_eq!(result.cluster_representative, ClusterRepresentative::AdverseExtreme);
+        assert!(matches!(result.method, TechnicalStopMethod::SwingPoint { .. }));
+    }
+
+    /// Incident-derived fixture for the 2026-08-12 Long arm (position
+    /// 019ff820). The zone geometry is taken from the production 15m chart;
+    /// in production the mean representative fell below the ADR-0050
+    /// minimum bound and the stop degraded to the (live-ATR) fallback. This
+    /// synthetic fixture has flat filler candles, so under the old code the
+    /// zero ATR would have failed the analysis outright instead — either
+    /// way the mean destroyed a valid chart level. The test pins both
+    /// halves:
+    /// - the OLD mean representative is closer to entry than the minimum
+    ///   distance bound, so the chart level cannot carry the stop;
+    /// - the NEW adverse extreme (63283.0, ~0.116% from entry) is in bounds, so
+    ///   the chart-derived level carries the stop.
+    #[test]
+    fn incident_2026_08_12_long_adverse_extreme_keeps_the_chart_level_in_bounds() {
+        let entry = Price::new(dec!(63356.40)).unwrap();
+        let zone = [dec!(63291.1), dec!(63338.9), dec!(63283.0), dec!(63337.5)];
+        let cs = candles_with_swing_lows(dec!(63400), &zone);
+
+        // Old failure mode, pinned arithmetically: the members' mean falls
+        // below the 0.1% minimum distance bound, so under the mean rule the
+        // chart level was discarded (BelowMin) and no chart-derived stop
+        // survived.
+        let zone_mean =
+            zone.iter().fold(Decimal::ZERO, |s, &v| s + v) / Decimal::from(zone.len() as u32);
+        let mean_fraction = (entry.as_decimal() - zone_mean) / entry.as_decimal();
+        assert!(
+            mean_fraction < TechnicalStopConfig::default().min_stop_distance_pct,
+            "mean representative {zone_mean} must violate the minimum bound for this fixture \
+             to demonstrate the defect"
+        );
+
+        let result =
+            TechnicalStopAnalyzer::analyze(&cs, entry, Side::Long, &TechnicalStopConfig::default())
+                .unwrap();
+
+        assert_eq!(result.stop_price.as_decimal(), dec!(63283.0));
+        assert!(matches!(result.method, TechnicalStopMethod::SwingPoint { .. }));
+        assert_eq!(result.cluster_representative, ClusterRepresentative::AdverseExtreme);
+    }
+
+    /// ADR-0053 serde contract: current payloads carry `adverse_extreme`;
+    /// historical payloads (field absent) deserialize as `Mean` — never as a
+    /// false claim of the new rule.
+    #[test]
+    fn analyzer_payload_serde_representative_compatibility() {
+        let entry = Price::new(dec!(95000)).unwrap();
+        let cs = candles_with_two_swing_lows(dec!(94000), dec!(93000), dec!(90000));
+        let result =
+            TechnicalStopAnalyzer::analyze(&cs, entry, Side::Long, &TechnicalStopConfig::default())
+                .unwrap();
+
+        let mut value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["cluster_representative"], "adverse_extreme");
+
+        value.as_object_mut().unwrap().remove("cluster_representative");
+        let historical: TechnicalStopAnalysis = serde_json::from_value(value).unwrap();
+        assert_eq!(historical.cluster_representative, ClusterRepresentative::Mean);
     }
 }

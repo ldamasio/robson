@@ -2690,6 +2690,7 @@ mod tests {
             selected_level_n: None,
             skipped_levels: vec![],
             selection_rule: None,
+            cluster_representative: None,
         }
     }
 

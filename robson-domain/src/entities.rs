@@ -992,7 +992,9 @@ pub struct TechnicalStopAnalysisAudit {
     pub method: TechnicalStopMethodSnapshot,
     /// Confidence assigned to the result.
     pub confidence: TechnicalStopConfidenceSnapshot,
-    /// Swing levels detected on the chart, ordered by distance from entry.
+    /// One representative per support/resistance cluster, ordered by
+    /// distance from entry. The cluster's adverse extreme after ADR-0053
+    /// (see `cluster_representative`); cluster means on historical events.
     pub detected_levels: Vec<Price>,
     /// Analyzer configuration snapshot used to produce this result.
     pub config: TechnicalStopConfigSnapshot,
@@ -1016,6 +1018,10 @@ pub struct TechnicalStopAnalysisAudit {
     /// Selection rule identifier; `"anchor_n_walk_deeper"` after ADR-0050.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub selection_rule: Option<String>,
+    /// Cluster representative rule; `"adverse_extreme"` after ADR-0053.
+    /// Absent on pre-ADR-0053 events (mean representative).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cluster_representative: Option<String>,
 }
 
 /// A chart level considered and skipped by valid-level selection

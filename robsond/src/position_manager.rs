@@ -5019,6 +5019,7 @@ mod tests {
             selected_level_n: Some(2),
             skipped_levels: vec![],
             selection_rule: Some("anchor_n_walk_deeper".to_string()),
+            cluster_representative: None,
         }
     }
 

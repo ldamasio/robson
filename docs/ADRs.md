@@ -47,5 +47,6 @@ Index
 | ADR-0048 | A Triggered Insurance Stop Is Not a Cancellation | Decided (Deployed sha-d5803c47; not yet exercised against the live exchange) | 2026-07-31 |
 | ADR-0051 | Net-From-Start, Non-Expanding Monthly Budget | Decided (Follow-up required; implementation and operational rollout pending) | 2026-08-04 |
 | ADR-0052 | Executable Span: One Stop Policy, Buffer-Inclusive Unit of Risk | Decided (repository-implemented; rbx-infra manifest validation and operator arming-quiescence pending; operational rollout pending) | 2026-08-04 |
+| ADR-0053 | Adverse-Extreme Cluster Representative for the Technical Stop | Proposed (implementation PR open; operator review pending) | 2026-08-13 |
 
 Files located in `docs/adr/`.
