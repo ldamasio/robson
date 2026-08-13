@@ -183,8 +183,11 @@ pub struct TechnicalStopAnalysis {
     pub method: TechnicalStopMethod,
     /// Confidence level of the result.
     pub confidence: StopConfidence,
-    /// All swing levels detected below (LONG) or above (SHORT) the entry,
-    /// ordered by distance from entry ascending. Useful for audit trail.
+    /// One representative per support/resistance cluster detected below
+    /// (LONG) or above (SHORT) the entry, ordered by distance from entry
+    /// ascending. After ADR-0053 each representative is the cluster's
+    /// adverse extreme; historical payloads carry cluster means. Useful for
+    /// audit trail.
     pub detected_levels: Vec<Price>,
     /// The `support_level_n` the selection anchored at (ADR-0050 §1).
     #[serde(default = "default_configured_level_n")]
@@ -1022,15 +1025,20 @@ mod tests {
         cs
     }
 
-    /// Replay of the 2026-08-13 Short arm (position 019ffb62), the incident
-    /// that motivated ADR-0053. The 15m chart carried seven swing highs that
-    /// the 0.5% tolerance merges into a single resistance cluster. Under the
-    /// mean representative the stop landed at ~63927.78 and a probe that
-    /// topped 63980.6 (without breaking the 63990.7 swing high) stopped the
-    /// position out. The adverse-extreme representative must anchor at the
-    /// cluster's highest member, beyond every level of the zone.
+    /// Incident-derived fixture for the 2026-08-13 Short arm (position
+    /// 019ffb62), the stop-out that motivated ADR-0053. The zone geometry
+    /// (seven swing highs merged into one resistance cluster by the 0.5%
+    /// tolerance) is taken from the production 15m chart; the exact
+    /// production cluster also carried forming-candle state that is not
+    /// byte-reproducible, so this is not a literal replay. The test pins
+    /// both halves of the defect and the fix:
+    /// - the OLD mean representative sits below the 63990.7 swing high the
+    ///   production probe (top 63980.6) never broke, so a stop derived from it
+    ///   fills inside the zone;
+    /// - the NEW adverse-extreme representative anchors at the cluster's
+    ///   highest member, beyond every level of the zone.
     #[test]
-    fn replay_2026_08_13_short_stop_anchors_beyond_the_whole_resistance_zone() {
+    fn incident_2026_08_13_short_stop_anchors_beyond_the_whole_resistance_zone() {
         let entry = Price::new(dec!(63768.50)).unwrap();
         let zone = [
             dec!(63800.0),
@@ -1042,6 +1050,17 @@ mod tests {
             dec!(64131.4),
         ];
         let cs = candles_with_swing_highs(dec!(63700), &zone);
+
+        // Old failure mode, pinned arithmetically: the mean of the zone's
+        // members sits BELOW the swing high the production probe never broke,
+        // so a mean-anchored stop fills on an ordinary test of the level.
+        let zone_mean =
+            zone.iter().fold(Decimal::ZERO, |s, &v| s + v) / Decimal::from(zone.len() as u32);
+        assert!(
+            zone_mean < dec!(63990.7),
+            "mean representative {zone_mean} must sit inside the zone for this fixture to \
+             demonstrate the defect"
+        );
 
         let result = TechnicalStopAnalyzer::analyze(
             &cs,
@@ -1060,17 +1079,36 @@ mod tests {
         assert!(matches!(result.method, TechnicalStopMethod::SwingPoint { .. }));
     }
 
-    /// Replay of the 2026-08-12 Long arm (position 019ff820). Under the mean
-    /// representative the single support cluster averaged to 0.069% from
-    /// entry, fell below the ADR-0050 minimum bound, and the stop silently
-    /// degraded to the ATR fallback. The adverse extreme (63283.0, 0.116%
-    /// from entry) is in bounds, so the chart-derived level now carries the
-    /// stop.
+    /// Incident-derived fixture for the 2026-08-12 Long arm (position
+    /// 019ff820). The zone geometry is taken from the production 15m chart;
+    /// in production the mean representative fell below the ADR-0050
+    /// minimum bound and the stop degraded to the (live-ATR) fallback. This
+    /// synthetic fixture has flat filler candles, so under the old code the
+    /// zero ATR would have failed the analysis outright instead — either
+    /// way the mean destroyed a valid chart level. The test pins both
+    /// halves:
+    /// - the OLD mean representative is closer to entry than the minimum
+    ///   distance bound, so the chart level cannot carry the stop;
+    /// - the NEW adverse extreme (63283.0, ~0.116% from entry) is in bounds, so
+    ///   the chart-derived level carries the stop.
     #[test]
-    fn replay_2026_08_12_long_adverse_extreme_rescues_the_chart_level_from_atr() {
+    fn incident_2026_08_12_long_adverse_extreme_keeps_the_chart_level_in_bounds() {
         let entry = Price::new(dec!(63356.40)).unwrap();
         let zone = [dec!(63291.1), dec!(63338.9), dec!(63283.0), dec!(63337.5)];
         let cs = candles_with_swing_lows(dec!(63400), &zone);
+
+        // Old failure mode, pinned arithmetically: the members' mean falls
+        // below the 0.1% minimum distance bound, so under the mean rule the
+        // chart level was discarded (BelowMin) and no chart-derived stop
+        // survived.
+        let zone_mean =
+            zone.iter().fold(Decimal::ZERO, |s, &v| s + v) / Decimal::from(zone.len() as u32);
+        let mean_fraction = (entry.as_decimal() - zone_mean) / entry.as_decimal();
+        assert!(
+            mean_fraction < TechnicalStopConfig::default().min_stop_distance_pct,
+            "mean representative {zone_mean} must violate the minimum bound for this fixture \
+             to demonstrate the defect"
+        );
 
         let result =
             TechnicalStopAnalyzer::analyze(&cs, entry, Side::Long, &TechnicalStopConfig::default())
@@ -1078,11 +1116,25 @@ mod tests {
 
         assert_eq!(result.stop_price.as_decimal(), dec!(63283.0));
         assert!(matches!(result.method, TechnicalStopMethod::SwingPoint { .. }));
-        assert_ne!(
-            result.method,
-            TechnicalStopMethod::AtrFallback,
-            "the chart level must carry the stop instead of the ATR fallback"
-        );
         assert_eq!(result.cluster_representative, ClusterRepresentative::AdverseExtreme);
+    }
+
+    /// ADR-0053 serde contract: current payloads carry `adverse_extreme`;
+    /// historical payloads (field absent) deserialize as `Mean` — never as a
+    /// false claim of the new rule.
+    #[test]
+    fn analyzer_payload_serde_representative_compatibility() {
+        let entry = Price::new(dec!(95000)).unwrap();
+        let cs = candles_with_two_swing_lows(dec!(94000), dec!(93000), dec!(90000));
+        let result =
+            TechnicalStopAnalyzer::analyze(&cs, entry, Side::Long, &TechnicalStopConfig::default())
+                .unwrap();
+
+        let mut value = serde_json::to_value(&result).unwrap();
+        assert_eq!(value["cluster_representative"], "adverse_extreme");
+
+        value.as_object_mut().unwrap().remove("cluster_representative");
+        let historical: TechnicalStopAnalysis = serde_json::from_value(value).unwrap();
+        assert_eq!(historical.cluster_representative, ClusterRepresentative::Mean);
     }
 }

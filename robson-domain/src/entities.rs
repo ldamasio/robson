@@ -992,7 +992,9 @@ pub struct TechnicalStopAnalysisAudit {
     pub method: TechnicalStopMethodSnapshot,
     /// Confidence assigned to the result.
     pub confidence: TechnicalStopConfidenceSnapshot,
-    /// Swing levels detected on the chart, ordered by distance from entry.
+    /// One representative per support/resistance cluster, ordered by
+    /// distance from entry. The cluster's adverse extreme after ADR-0053
+    /// (see `cluster_representative`); cluster means on historical events.
     pub detected_levels: Vec<Price>,
     /// Analyzer configuration snapshot used to produce this result.
     pub config: TechnicalStopConfigSnapshot,

@@ -25,14 +25,16 @@ can still be *inside the zone*.
 
 ### Production incident (2026-08-13, position 019ffb62)
 
-BTCUSDT Short, entry 63794.30. Seven swing highs (63800.0 through 64131.4)
+BTCUSDT Short, analyzer entry reference 63768.50 (last 15m close; the entry
+order later filled at 63794.30). Seven swing highs (63800.0 through 64131.4)
 merged into a single resistance cluster; the mean representative put the
-technical stop at 63927.78 and the buffered insurance stop at 63967.60. Price
-probed the zone, topping at 63980.6 — the 63990.7 swing high never broke — and
-the position stopped out at 63967.90. The operator had flagged the stop as
-"short of the technical event" before the stop-out. A representative at the
-zone's adverse extreme (64131.4) would have kept the stop clear of the entire
-probe.
+technical stop at 63927.78 (the production cluster also carried forming-candle
+state, so the persisted mean differs slightly from the mean of the completed
+candles' levels) and the buffered insurance stop at 63967.60. Price probed the
+zone, topping at 63980.6 — the 63990.7 swing high never broke — and the
+position stopped out at 63967.90. The operator had flagged the stop as "short
+of the technical event" before the stop-out. A representative at the zone's
+adverse extreme (64131.4) would have kept the stop clear of the entire probe.
 
 ### Companion failure mode (2026-08-12, position 019ff820)
 
@@ -86,13 +88,30 @@ mean did not only misplace stops, it also destroyed valid chart levels.
 
 ## Test evidence
 
+The incident fixtures are **incident-derived, not byte-exact replays**: the
+zone geometries come from the production 15m charts, but the production
+cluster membership included forming-candle state that cannot be reproduced
+from persisted klines. Each fixture therefore pins the old failure mode
+arithmetically (the members' mean sits inside the zone / below the minimum
+bound) alongside the new invariant.
+
 `robson-engine/src/technical_stop_analyzer.rs` test module:
 
 - `long_cluster_representative_is_the_minimum_member`,
   `short_cluster_representative_is_the_maximum_member` — unit contract.
-- `replay_2026_08_13_short_stop_anchors_beyond_the_whole_resistance_zone` —
-  the incident fixture; asserts the stop clears the swing high the probe never
-  broke.
-- `replay_2026_08_12_long_adverse_extreme_rescues_the_chart_level_from_atr` —
-  the companion fixture; asserts the chart level carries the stop instead of
-  the ATR fallback.
+- `incident_2026_08_13_short_stop_anchors_beyond_the_whole_resistance_zone` —
+  asserts the zone mean sits below the never-broken swing high (the defect)
+  and that the new stop clears the whole zone (the fix).
+- `incident_2026_08_12_long_adverse_extreme_keeps_the_chart_level_in_bounds` —
+  asserts the zone mean violates the minimum distance bound (the defect) and
+  that the adverse extreme carries an in-bounds chart level (the fix).
+- `analyzer_payload_serde_representative_compatibility` — current payloads
+  serialize `adverse_extreme`; historical payloads deserialize as `mean`.
+
+`robson-domain/src/events.rs`:
+`technical_stop_audit_cluster_representative_serde_compatibility` — historical
+events round-trip with the field absent; current events persist the rule.
+
+`robsond/src/detector.rs`:
+`build_technical_stop_audit_records_cluster_representative` — the detector
+populates the persisted audit from the analyzer result.

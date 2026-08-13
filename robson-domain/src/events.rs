@@ -822,6 +822,33 @@ mod tests {
         }
     }
 
+    /// ADR-0053 serde contract for the audit payload: historical events
+    /// (field absent) deserialize as `None` and stay absent on the wire;
+    /// current events persist the representative rule.
+    #[test]
+    fn technical_stop_audit_cluster_representative_serde_compatibility() {
+        let historical = sample_technical_stop_analyzed();
+        let json = serde_json::to_value(&historical).unwrap();
+        assert!(
+            json["analysis"].get("cluster_representative").is_none(),
+            "None must not serialize a key"
+        );
+        let back: Event = serde_json::from_value(json).unwrap();
+        match back {
+            Event::TechnicalStopAnalyzed { analysis, .. } => {
+                assert_eq!(analysis.cluster_representative, None);
+            },
+            other => panic!("unexpected event after round-trip: {other:?}"),
+        }
+
+        let mut current = sample_technical_stop_analyzed();
+        if let Event::TechnicalStopAnalyzed { ref mut analysis, .. } = current {
+            analysis.cluster_representative = Some("adverse_extreme".to_string());
+        }
+        let json = serde_json::to_value(&current).unwrap();
+        assert_eq!(json["analysis"]["cluster_representative"], "adverse_extreme");
+    }
+
     fn sample_entry_order_placed(cycle_id: Uuid) -> Event {
         Event::EntryOrderPlaced {
             position_id: Uuid::now_v7(),

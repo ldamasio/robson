@@ -1739,6 +1739,16 @@ mod tests {
         }
     }
 
+    /// ADR-0053: the persisted audit records the representative rule that
+    /// produced the stop.
+    #[test]
+    fn build_technical_stop_audit_records_cluster_representative() {
+        let analysis = make_swing_analysis(Side::Long);
+        let audit =
+            DetectorTask::build_technical_stop_audit(&analysis, &TechnicalStopConfig::default());
+        assert_eq!(audit.cluster_representative.as_deref(), Some("adverse_extreme"));
+    }
+
     #[test]
     fn build_stop_anchor_swing_point_long_returns_swing_low() {
         let analysis = make_swing_analysis(Side::Long);
