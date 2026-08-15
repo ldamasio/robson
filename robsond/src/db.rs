@@ -9,6 +9,7 @@ use robson_db::{init_minimal_data, migrate, repair_known_migration_state, status
 use tracing::info;
 
 const ADR0052_MIGRATION: &str = "20240101000026_executable_span_stop_policy";
+const STOP_PLAN_ENTRY_REFERENCE_MIGRATION: &str = "20240101000029_add_stop_plan_entry_reference";
 
 /// Verify that the projection schema required by the ADR-0052 binary is
 /// present before the daemon can recover positions, serve traffic, or accept
@@ -24,16 +25,17 @@ pub(crate) async fn verify_adr0052_schema_readiness(pool: &sqlx::PgPool) -> Resu
               'initial_executable_stop',
               'executable_span',
               'cap_basis_distance',
-              'tick_size_at_admission'
+              'tick_size_at_admission',
+              'stop_plan_entry_reference'
           )
         "#,
     )
     .fetch_one(pool)
     .await?;
 
-    if present != 4 {
+    if present != 5 {
         return Err(anyhow!(
-            "ADR-0052 schema readiness failed: migration {ADR0052_MIGRATION} is required before this binary starts (found {present}/4 admission columns on positions_current)"
+            "ADR-0052 schema readiness failed: migrations {ADR0052_MIGRATION} and {STOP_PLAN_ENTRY_REFERENCE_MIGRATION} are required before this binary starts (found {present}/5 admission columns on positions_current)"
         ));
     }
 
@@ -125,7 +127,7 @@ mod tests {
     async fn adr0052_schema_readiness_rejects_a_missing_admission_column(pool: sqlx::PgPool) {
         verify_adr0052_schema_readiness(&pool).await.unwrap();
 
-        sqlx::query("ALTER TABLE positions_current DROP COLUMN tick_size_at_admission CASCADE")
+        sqlx::query("ALTER TABLE positions_current DROP COLUMN stop_plan_entry_reference CASCADE")
             .execute(&pool)
             .await
             .unwrap();
@@ -133,7 +135,11 @@ mod tests {
         let error = verify_adr0052_schema_readiness(&pool).await.unwrap_err();
         let detail = error.to_string();
         assert!(detail.contains(ADR0052_MIGRATION), "unexpected error: {detail}");
-        assert!(detail.contains("found 3/4"), "unexpected error: {detail}");
+        assert!(
+            detail.contains(STOP_PLAN_ENTRY_REFERENCE_MIGRATION),
+            "unexpected error: {detail}"
+        );
+        assert!(detail.contains("found 4/5"), "unexpected error: {detail}");
     }
 
     #[sqlx::test(migrations = "../migrations")]
@@ -147,6 +153,7 @@ mod tests {
                 position_id, tenant_id, account_id, strategy_id,
                 symbol, side, state, entry_price, entry_quantity,
                 current_quantity, stop_policy,
+                stop_plan_entry_reference,
                 initial_executable_stop, executable_span,
                 cap_basis_distance, tick_size_at_admission,
                 last_event_id, last_seq, created_at, updated_at
@@ -154,6 +161,7 @@ mod tests {
                 $1, $2, $3, $4,
                 'BTCUSDT', 'long', 'armed', 100, 1,
                 1, 'executable_span',
+                100,
                 90, 10, 10, 0.1,
                 $5, 1, $6, $6
             )
@@ -173,7 +181,8 @@ mod tests {
         sqlx::query(
             r#"
             UPDATE positions_current
-            SET initial_executable_stop = 90,
+            SET stop_plan_entry_reference = 100,
+                initial_executable_stop = 90,
                 executable_span = 10,
                 cap_basis_distance = 10,
                 tick_size_at_admission = 0.1
@@ -186,6 +195,10 @@ mod tests {
         .unwrap();
 
         let rewrites = [
+            (
+                "UPDATE positions_current SET stop_plan_entry_reference = 101 WHERE position_id = $1",
+                "stop_plan_entry_reference",
+            ),
             (
                 "UPDATE positions_current SET initial_executable_stop = 89 WHERE position_id = $1",
                 "initial_executable_stop",

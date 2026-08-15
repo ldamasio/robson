@@ -102,6 +102,7 @@ struct PositionCurrentRow {
     invalidation_guard_level: Option<Decimal>,
     stop_policy: Option<String>,
     stop_buffer_bps_at_arm: Option<Decimal>,
+    stop_plan_entry_reference: Option<Decimal>,
     initial_executable_stop: Option<Decimal>,
     executable_span: Option<Decimal>,
     cap_basis_distance: Option<Decimal>,
@@ -149,6 +150,7 @@ fn parse_position_row(row: &sqlx::postgres::PgRow) -> Result<PositionCurrentRow,
         invalidation_guard_level: try_get_decimal("invalidation_guard_level"),
         stop_policy: row.try_get::<Option<String>, _>("stop_policy").ok().flatten(),
         stop_buffer_bps_at_arm: try_get_decimal("stop_buffer_bps_at_arm"),
+        stop_plan_entry_reference: try_get_decimal("stop_plan_entry_reference"),
         initial_executable_stop: try_get_decimal("initial_executable_stop"),
         executable_span: try_get_decimal("executable_span"),
         cap_basis_distance: try_get_decimal("cap_basis_distance"),
@@ -212,6 +214,12 @@ fn row_to_position(row_data: PositionCurrentRow) -> Result<Option<Position>, Sto
     position.id = row_data.position_id;
     position.entry_order_id = row_data.entry_order_id;
     position.exit_order_id = row_data.exit_order_id;
+    if stop_policy == StopPolicy::ExecutableSpan {
+        position.stop_plan_entry_reference =
+            row_data.stop_plan_entry_reference.map(Price::new).transpose().map_err(|e| {
+                StoreError::Deserialization(format!("Invalid stop plan entry reference: {e}"))
+            })?;
+    }
     position.initial_executable_stop =
         row_data.initial_executable_stop.map(Price::new).transpose().map_err(|e| {
             StoreError::Deserialization(format!("Invalid initial executable stop: {e}"))
@@ -257,25 +265,53 @@ fn row_to_position(row_data: PositionCurrentRow) -> Result<Option<Position>, Sto
             StoreError::Deserialization(format!("Invalid technical_stop_price: {}", e))
         })?;
         let entry = match stop_policy {
-            // ADR-0052 anchors the ladder to the signal reference E. The
-            // projection's entry_price is overwritten by the exchange fill,
-            // so reconstruct E from the persisted chart stop + distance.
-            // Preserve the historical fill-anchored reconstruction for
-            // legacy rows byte-for-byte.
-            StopPolicy::ExecutableSpan => {
-                let signal_entry = match side {
-                    Side::Long => stop_price + distance,
-                    Side::Short => stop_price - distance,
-                };
-                Price::new(signal_entry).map_err(|e| {
-                    StoreError::Deserialization(format!(
-                        "Invalid executable-span entry reference {signal_entry}: {e}"
-                    ))
-                })?
+            StopPolicy::ExecutableSpan => match position.stop_plan_entry_reference {
+                Some(entry_reference) => {
+                    tracing::debug!(
+                        position_id = %row_data.position_id,
+                        entry_reference = %entry_reference,
+                        entry_reference_provenance = "persisted_stop_plan_entry_reference",
+                        "Recovered executable-span entry reference"
+                    );
+                    entry_reference
+                },
+                None => {
+                    // Preserve the ADR-0052 pre-migration recovery behavior:
+                    // derive E from the persisted chart stop and distance.
+                    // Absence is provenance loss, not a startup/quarantine
+                    // condition.
+                    let signal_entry = match side {
+                        Side::Long => stop_price + distance,
+                        Side::Short => stop_price - distance,
+                    };
+                    let entry_reference = Price::new(signal_entry).map_err(|e| {
+                        StoreError::Deserialization(format!(
+                            "Invalid executable-span entry reference {signal_entry}: {e}"
+                        ))
+                    })?;
+                    tracing::warn!(
+                        position_id = %row_data.position_id,
+                        entry_reference = %entry_reference,
+                        entry_reference_provenance = "technical_stop_distance_fallback",
+                        "Executable-span row has no persisted stop-plan entry reference; continuing with pre-migration recovery fallback"
+                    );
+                    entry_reference
+                },
             },
-            StopPolicy::LegacyUncapped => position.entry_price.ok_or_else(|| {
-                StoreError::Deserialization("Missing entry_price for technical stop".to_string())
-            })?,
+            StopPolicy::LegacyUncapped => {
+                let fill_price = position.entry_price.ok_or_else(|| {
+                    StoreError::Deserialization(
+                        "Missing entry_price for technical stop".to_string(),
+                    )
+                })?;
+                tracing::debug!(
+                    position_id = %row_data.position_id,
+                    entry_reference = %fill_price,
+                    entry_reference_provenance = "legacy_fill_price_fallback",
+                    "Recovered legacy technical-stop entry reference"
+                );
+                fill_price
+            },
         };
 
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
@@ -484,6 +520,7 @@ fn row_to_position(row_data: PositionCurrentRow) -> Result<Option<Position>, Sto
 /// - exit_reason: TEXT?
 /// - technical_stop_price: Decimal?
 /// - invalidation_guard_level: Decimal?
+/// - stop_plan_entry_reference: Decimal?
 /// - created_at: Timestamp
 /// - updated_at: Timestamp
 pub async fn find_active_from_projection(
@@ -517,6 +554,7 @@ pub async fn find_active_from_projection(
             invalidation_guard_level,
             stop_policy,
             stop_buffer_bps_at_arm,
+            stop_plan_entry_reference,
             initial_executable_stop,
             executable_span,
             cap_basis_distance,
@@ -637,6 +675,7 @@ pub async fn find_positions_overlapping_month(
             invalidation_guard_level,
             stop_policy,
             stop_buffer_bps_at_arm,
+            stop_plan_entry_reference,
             initial_executable_stop,
             executable_span,
             cap_basis_distance,
@@ -775,8 +814,71 @@ mod tests {
         // Verify technical stop distance
         assert!(pos.tech_stop_distance.is_some());
         let tech_stop = pos.tech_stop_distance.as_ref().unwrap();
+        assert_eq!(
+            pos.stop_plan_entry_reference, None,
+            "historical NULL reference must remain recoverable"
+        );
+        assert_eq!(
+            tech_stop.entry_price.as_decimal(),
+            dec!(95000),
+            "legacy NULL reference keeps the historical fill-price fallback"
+        );
         assert_eq!(tech_stop.distance, dec!(1500));
         assert_eq!(tech_stop.distance_pct.round_dp(2), dec!(1.58));
+    }
+
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn executable_span_null_reference_uses_pre_migration_recovery_fallback(pool: PgPool) {
+        let tenant_id = Uuid::now_v7();
+        let position_id = Uuid::now_v7();
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO positions_current (
+                position_id, tenant_id, account_id, strategy_id,
+                symbol, side, state,
+                entry_price, entry_quantity, current_quantity,
+                current_price, trailing_stop_price, favorable_extreme, extreme_at,
+                technical_stop_distance, technical_stop_price,
+                invalidation_guard_level, stop_policy, stop_buffer_bps_at_arm,
+                initial_executable_stop, executable_span,
+                cap_basis_distance, tick_size_at_admission,
+                last_event_id, last_seq, created_at, updated_at
+            ) VALUES (
+                $1, $2, $3, $4,
+                'BTCUSDT', 'short', 'active',
+                61950, 0.01, 0.01,
+                61950, 62214.70, 61950, $5,
+                305.60, 62214.70,
+                62386.70, 'executable_span', 100,
+                62506.10, 597.00,
+                477.60, 0.10,
+                $6, 1, $5, $5
+            )
+            "#,
+        )
+        .bind(position_id)
+        .bind(tenant_id)
+        .bind(Uuid::now_v7())
+        .bind(Uuid::now_v7())
+        .bind(now)
+        .bind(Uuid::now_v7())
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let reader = PgProjectionReader::new(Arc::new(pool));
+        let restored = reader.find_active_from_projection(tenant_id).await.unwrap();
+        let position = restored.iter().find(|position| position.id == position_id).unwrap();
+
+        assert_eq!(position.stop_plan_entry_reference, None);
+        assert_eq!(position.entry_price.unwrap().as_decimal(), dec!(61950));
+        assert_eq!(
+            position.tech_stop_distance.as_ref().unwrap().entry_price.as_decimal(),
+            dec!(61909.10),
+            "NULL executable-span rows keep the current deterministic fallback"
+        );
     }
 
     #[sqlx::test(migrations = "../migrations")]

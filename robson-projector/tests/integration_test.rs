@@ -31,6 +31,7 @@ type ExecutableSpanProjectionRow = (
     Option<Decimal>,
     Option<Decimal>,
     Option<Decimal>,
+    Option<Decimal>,
 );
 
 /// Test helper: Create an event envelope from an event
@@ -110,7 +111,8 @@ async fn test_entry_signal_projects_executable_span_admission_payload(
     apply_event_to_projections(&pool, &admitted).await.unwrap();
 
     // Admission evidence is first-write-wins. A later corrupt/replayed
-    // signal must not redefine S, its cap basis, tick, or original trigger.
+    // signal must not redefine the entry reference, S, its cap basis, tick,
+    // or original trigger.
     let conflicting = make_envelope(
         &stream_key,
         "entry_signal_received",
@@ -132,7 +134,8 @@ async fn test_entry_signal_projects_executable_span_admission_payload(
 
     let projected: ExecutableSpanProjectionRow = sqlx::query_as(
         r#"
-            SELECT initial_executable_stop, executable_span,
+            SELECT stop_plan_entry_reference,
+                   initial_executable_stop, executable_span,
                    cap_basis_distance, tick_size_at_admission,
                    technical_stop_price, technical_stop_distance
               FROM positions_current
@@ -145,6 +148,7 @@ async fn test_entry_signal_projects_executable_span_admission_payload(
     assert_eq!(
         projected,
         (
+            Some(Decimal::from(62000)),
             Some(Decimal::from(60939)),
             Some(Decimal::from(1061)),
             Some(Decimal::from(1000)),

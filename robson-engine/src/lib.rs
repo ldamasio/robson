@@ -514,7 +514,8 @@ impl Engine {
         // must be recovered explicitly; deriving a second ruler would make S
         // mutable across retries or metadata refreshes.
         if position.stop_policy == StopPolicy::ExecutableSpan
-            && (position.initial_executable_stop.is_some()
+            && (position.stop_plan_entry_reference.is_some()
+                || position.initial_executable_stop.is_some()
                 || position.executable_span.is_some()
                 || position.cap_basis_distance.is_some()
                 || position.tick_size_at_admission.is_some())
@@ -1035,21 +1036,14 @@ impl Engine {
             .unwrap_or_else(|| self.risk_config.stop_buffer_bps())
     }
 
-    /// The entry reference the stop plan measures its guard-bound cap span
-    /// against. This is the SIGNAL entry (preserved in
-    /// `tech_stop_distance.entry_price`), the same reference `decide_entry`
-    /// priced the admission risk with — the fill price would silently widen
-    /// or tighten the capped buffer relative to what sizing charged, the
-    /// exact priced-vs-executed drift this slice exists to kill. Falls back
-    /// to the fill price only when the technical stop is absent. The
-    /// Postgres projection reconstructs the signal reference from the
-    /// persisted initial stop and technical distance, rather than from the
-    /// later fill price.
+    /// The signal entry reference the stop plan was priced against. New
+    /// projections persist it directly; pre-migration executable-span state
+    /// falls back to the reference embedded in the technical stop, and legacy
+    /// state ultimately retains its historical fill-price fallback.
     fn plan_entry_reference(position: &Position) -> Option<Price> {
         position
-            .tech_stop_distance
-            .as_ref()
-            .map(|tech_stop| tech_stop.entry_price)
+            .stop_plan_entry_reference
+            .or_else(|| position.tech_stop_distance.as_ref().map(|tech_stop| tech_stop.entry_price))
             .or(position.entry_price)
     }
 
