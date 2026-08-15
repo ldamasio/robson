@@ -4897,12 +4897,14 @@ mod tests {
         assert!(signal_index < request_index, "plan must persist before entry submission intent");
         match &events[signal_index] {
             Event::EntrySignalReceived {
+                entry_price,
                 initial_executable_stop,
                 executable_span,
                 cap_basis_distance,
                 tick_size,
                 ..
             } => {
+                assert_eq!(*entry_price, Price::new(dec!(95000)).unwrap());
                 assert_eq!(*initial_executable_stop, Some(Price::new(dec!(90159.75)).unwrap()));
                 assert_eq!(*executable_span, Some(dec!(4840.25)));
                 assert_eq!(*cap_basis_distance, Some(dec!(4750)));
@@ -4913,6 +4915,7 @@ mod tests {
 
         let persisted = manager.get_position(position.id).await.unwrap().unwrap();
         assert_eq!(persisted.stop_policy, StopPolicy::ExecutableSpan);
+        assert_eq!(persisted.stop_plan_entry_reference, Some(Price::new(dec!(95000)).unwrap()));
         assert_eq!(persisted.executable_span, Some(dec!(4840.25)));
         assert_eq!(persisted.cap_basis_distance, Some(dec!(4750)));
         assert_eq!(persisted.tick_size_at_admission, Some(dec!(0.01)));

@@ -735,29 +735,36 @@ pub(crate) async fn handle_entry_signal_received(
         r#"
         UPDATE positions_current
         SET
+            stop_plan_entry_reference = CASE
+                WHEN stop_policy = 'executable_span'
+                THEN COALESCE(stop_plan_entry_reference, $2)
+                ELSE stop_plan_entry_reference END,
             technical_stop_price = CASE
-                WHEN initial_executable_stop IS NULL
+                WHEN stop_plan_entry_reference IS NULL
+                 AND initial_executable_stop IS NULL
                  AND executable_span IS NULL
                  AND cap_basis_distance IS NULL
                  AND tick_size_at_admission IS NULL
-                THEN $2 ELSE technical_stop_price END,
+                THEN $3 ELSE technical_stop_price END,
             technical_stop_distance = CASE
-                WHEN initial_executable_stop IS NULL
+                WHEN stop_plan_entry_reference IS NULL
+                 AND initial_executable_stop IS NULL
                  AND executable_span IS NULL
                  AND cap_basis_distance IS NULL
                  AND tick_size_at_admission IS NULL
-                THEN $3 ELSE technical_stop_distance END,
-            initial_executable_stop = COALESCE(initial_executable_stop, $4),
-            executable_span = COALESCE(executable_span, $5),
-            cap_basis_distance = COALESCE(cap_basis_distance, $6),
-            tick_size_at_admission = COALESCE(tick_size_at_admission, $7),
-            last_event_id = $8,
-            last_seq = $9,
-            updated_at = $10
-        WHERE position_id = $1 AND last_seq < $9
+                THEN $4 ELSE technical_stop_distance END,
+            initial_executable_stop = COALESCE(initial_executable_stop, $5),
+            executable_span = COALESCE(executable_span, $6),
+            cap_basis_distance = COALESCE(cap_basis_distance, $7),
+            tick_size_at_admission = COALESCE(tick_size_at_admission, $8),
+            last_event_id = $9,
+            last_seq = $10,
+            updated_at = $11
+        WHERE position_id = $1 AND last_seq < $10
         "#,
     )
     .bind(payload.position_id)
+    .bind(payload.entry_price)
     .bind(payload.stop_loss)
     .bind(distance)
     .bind(payload.initial_executable_stop)
@@ -773,6 +780,7 @@ pub(crate) async fn handle_entry_signal_received(
     tracing::debug!(
         position_id = %payload.position_id,
         signal_id = %payload.signal_id,
+        stop_plan_entry_reference = %payload.entry_price,
         stop_loss = %payload.stop_loss,
         distance = %distance,
         "entry_signal_received stored detector technical stop"

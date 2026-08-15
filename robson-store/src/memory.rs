@@ -129,7 +129,8 @@ impl MemoryStore {
             } => {
                 let mut positions = self.positions.write().unwrap();
                 if let Some(mut position) = positions.get(position_id).cloned() {
-                    let has_admission_evidence = position.initial_executable_stop.is_some()
+                    let has_admission_evidence = position.stop_plan_entry_reference.is_some()
+                        || position.initial_executable_stop.is_some()
                         || position.executable_span.is_some()
                         || position.cap_basis_distance.is_some()
                         || position.tick_size_at_admission.is_some();
@@ -141,6 +142,11 @@ impl MemoryStore {
                     // ADR-0052 admission evidence is immutable. Replay is
                     // first-write-wins so a later/corrupt signal event cannot
                     // redefine the position's ruler or original trigger.
+                    if position.stop_policy == robson_domain::StopPolicy::ExecutableSpan
+                        && position.stop_plan_entry_reference.is_none()
+                    {
+                        position.stop_plan_entry_reference = Some(*entry_price);
+                    }
                     if position.initial_executable_stop.is_none() {
                         position.initial_executable_stop = *initial_executable_stop;
                     }
@@ -1427,6 +1433,10 @@ mod tests {
         let technical = position.tech_stop_distance.expect("admission technical stop");
         assert_eq!(technical.entry_price.as_decimal(), dec!(62000));
         assert_eq!(technical.initial_stop.as_decimal(), dec!(61000));
+        assert_eq!(
+            position.stop_plan_entry_reference.map(|price| price.as_decimal()),
+            Some(dec!(62000))
+        );
         assert_eq!(position.initial_executable_stop.unwrap().as_decimal(), dec!(60939));
         assert_eq!(position.executable_span, Some(dec!(1061)));
         assert_eq!(position.cap_basis_distance, Some(dec!(1000)));

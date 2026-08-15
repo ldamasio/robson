@@ -86,6 +86,11 @@ pub struct Position {
     /// restarts cannot move a live position's executable stop.
     #[serde(default)]
     pub stop_buffer_bps_at_arm: Option<rust_decimal::Decimal>,
+    /// Signal entry reference used to resolve the admission-time stop plan.
+    /// This remains distinct from `entry_price`, which becomes the exchange
+    /// fill after entry and may differ from the priced reference.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stop_plan_entry_reference: Option<Price>,
     /// Admission-time executable trigger resolved before entry submission
     /// (ADR-0052 Decision 5). `None` for legacy positions.
     #[serde(default)]
@@ -147,6 +152,7 @@ impl Position {
             binance_position_id: None,
             stop_policy,
             stop_buffer_bps_at_arm,
+            stop_plan_entry_reference: None,
             initial_executable_stop: None,
             executable_span: None,
             cap_basis_distance: None,

@@ -600,7 +600,9 @@ fn executable_span_guard_bound_plan_uses_persisted_admission_basis() {
         StopPolicy::ExecutableSpan,
         Some(dec!(100)),
     );
-    // tech_stop_distance preserves the SIGNAL entry; entry_price is the fill.
+    position.stop_plan_entry_reference = Some(signal_entry);
+    // tech_stop_distance also preserves the SIGNAL entry for pre-migration
+    // replay compatibility; entry_price is the fill.
     position.tech_stop_distance =
         Some(TechnicalStopDistance::from_entry_and_stop(signal_entry, technical));
     position.entry_price = Some(fill_price);
@@ -636,6 +638,7 @@ fn executable_span_guard_bound_plan_uses_persisted_admission_basis() {
 
     let live_plan = engine.stop_plan(&position, technical, Some(guard), Some(&rules)).unwrap();
     assert!(live_plan.guard_bound);
+    assert_eq!(position.stop_plan_entry_reference, Some(signal_entry));
     // Cap basis = |signal entry - guard basis| = 477.60, not the 436.70
     // fill-to-basis distance.
     assert_eq!(live_plan.cap_basis_distance, Some(dec!(477.60)));

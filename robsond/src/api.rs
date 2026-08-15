@@ -2467,6 +2467,15 @@ fn position_to_summary(
     engine: &robson_engine::Engine,
     trading_rules: Option<&robson_domain::SymbolTradingRules>,
 ) -> PositionSummary {
+    let entry_reference = (position.stop_policy == robson_domain::StopPolicy::ExecutableSpan)
+        .then(|| {
+            position
+                .stop_plan_entry_reference
+                .or_else(|| position.tech_stop_distance.as_ref().map(|stop| stop.entry_price))
+        })
+        .flatten()
+        .map(|price| price.as_decimal());
+
     let (
         state_str,
         entry_price,
@@ -2572,15 +2581,7 @@ fn position_to_summary(
                             quantity: (position.quantity.as_decimal() > Decimal::ZERO)
                                 .then(|| position.quantity.as_decimal()),
                             entry_price,
-                            entry_reference: (position.stop_policy
-                                == robson_domain::StopPolicy::ExecutableSpan)
-                                .then(|| {
-                                    position
-                                        .tech_stop_distance
-                                        .as_ref()
-                                        .map(|stop| stop.entry_price.as_decimal())
-                                })
-                                .flatten(),
+                            entry_reference,
                             trailing_stop: Some(trailing_stop.as_decimal()),
                             effective_stop: None,
                             raw_technical_stop: None,
@@ -2640,9 +2641,7 @@ fn position_to_summary(
             None
         },
         entry_price,
-        entry_reference: (position.stop_policy == robson_domain::StopPolicy::ExecutableSpan)
-            .then(|| position.tech_stop_distance.as_ref().map(|stop| stop.entry_price.as_decimal()))
-            .flatten(),
+        entry_reference,
         trailing_stop,
         effective_stop,
         raw_technical_stop,
@@ -3150,6 +3149,7 @@ mod tests {
             Some(dec!(10)),
         );
         position.entry_price = Some(Price::new(dec!(62020)).unwrap());
+        position.stop_plan_entry_reference = Some(entry_reference);
         position.tech_stop_distance =
             Some(TechnicalStopDistance::from_entry_and_stop(entry_reference, technical_stop));
         position.initial_executable_stop = Some(Price::new(dec!(60939)).unwrap());
