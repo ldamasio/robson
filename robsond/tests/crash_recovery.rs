@@ -984,3 +984,148 @@ async fn test_entry_signal_received_handled_without_error(pool: sqlx::PgPool) {
         "entry_signal_received should NOT change position state"
     );
 }
+
+/// The ADR-0052 replacement for the retired span_capped_v1 path must recover
+/// the exact signal reference and its guard-bound cap basis after the fill has
+/// replaced positions_current.entry_price.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "Requires DATABASE_URL to be set"]
+async fn executable_span_restart_preserves_guard_bound_signal_reference(pool: sqlx::PgPool) {
+    use robson_domain::{
+        build_executable_stop_plan, ExecutableSpanSource, Price, RiskConfig, Side, StopPlanInputs,
+        StopPolicy, Symbol, SymbolTradingRules,
+    };
+    use robson_engine::Engine;
+
+    let tenant_id = Uuid::now_v7();
+    let position_id = Uuid::now_v7();
+    let account_id = Uuid::now_v7();
+    let stream_key = format!("position:{position_id}");
+    let signal_entry = Price::new(dec!(61909.10)).unwrap();
+    let fill_price = Price::new(dec!(61950.00)).unwrap();
+    let technical_stop = Price::new(dec!(62214.70)).unwrap();
+    let guard = Price::new(dec!(62386.70)).unwrap();
+    let rules = SymbolTradingRules::new(
+        Symbol::from_pair("BTCUSDT").unwrap(),
+        dec!(0.1),
+        Decimal::ZERO,
+        dec!(0.001),
+        dec!(0.001),
+        dec!(1000),
+        Decimal::ZERO,
+        2,
+        3,
+    )
+    .unwrap();
+    let admission_plan = build_executable_stop_plan(StopPlanInputs {
+        policy: StopPolicy::ExecutableSpan,
+        side: Side::Short,
+        technical_stop,
+        guard: Some(guard),
+        entry_reference: Some(signal_entry),
+        technical_span: Some(dec!(305.60)),
+        stop_buffer_bps: dec!(100),
+        executable_span_source: ExecutableSpanSource::Admission,
+        rules: Some(&rules),
+    })
+    .unwrap();
+    assert!(admission_plan.guard_bound);
+    assert_eq!(admission_plan.cap_basis_distance, Some(dec!(477.60)));
+
+    append_and_apply(
+        &pool,
+        tenant_id,
+        &stream_key,
+        "position_armed",
+        serde_json::json!({
+            "position_id": position_id,
+            "account_id": account_id,
+            "symbol": { "base": "BTC", "quote": "USDT" },
+            "side": "Short",
+            "tech_stop_distance": null,
+            "stop_policy": "executable_span",
+            "stop_buffer_bps_at_arm": "100",
+            "timestamp": Utc::now().to_rfc3339(),
+        }),
+    )
+    .await
+    .expect("Failed to append position_armed");
+
+    append_and_apply(
+        &pool,
+        tenant_id,
+        &stream_key,
+        "entry_signal_received",
+        serde_json::json!({
+            "position_id": position_id,
+            "signal_id": Uuid::now_v7(),
+            "entry_price": signal_entry.as_decimal().to_string(),
+            "stop_loss": technical_stop.as_decimal().to_string(),
+            "quantity": "0.01",
+            "initial_executable_stop": admission_plan.trigger.as_decimal().to_string(),
+            "executable_span": admission_plan.executable_span.unwrap().to_string(),
+            "cap_basis_distance": admission_plan.cap_basis_distance.unwrap().to_string(),
+            "tick_size": admission_plan.tick_size.unwrap().to_string(),
+            "timestamp": Utc::now().to_rfc3339(),
+        }),
+    )
+    .await
+    .expect("Failed to append entry_signal_received");
+
+    append_and_apply(
+        &pool,
+        tenant_id,
+        &stream_key,
+        "entry_filled",
+        serde_json::json!({
+            "position_id": position_id,
+            "order_id": Uuid::now_v7(),
+            "fill_price": fill_price.as_decimal().to_string(),
+            "filled_quantity": "0.01",
+            "fee": "0.1",
+            "initial_stop": technical_stop.as_decimal().to_string(),
+            "invalidation_guard_level": guard.as_decimal().to_string(),
+            "timestamp": Utc::now().to_rfc3339(),
+        }),
+    )
+    .await
+    .expect("Failed to append entry_filled");
+
+    let projected_reference: Option<Decimal> = sqlx::query_scalar(
+        "SELECT stop_plan_entry_reference FROM positions_current WHERE position_id = $1",
+    )
+    .bind(position_id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(projected_reference, Some(signal_entry.as_decimal()));
+
+    let reader = robson_store::PgProjectionReader::new(Arc::new(pool));
+    let restored = reader.find_active_from_projection(tenant_id).await.unwrap();
+    let position = restored.iter().find(|position| position.id == position_id).unwrap();
+    assert_eq!(position.entry_price, Some(fill_price));
+    assert_eq!(position.stop_plan_entry_reference, Some(signal_entry));
+    assert_eq!(
+        position.tech_stop_distance.as_ref().map(|stop| stop.entry_price),
+        Some(signal_entry)
+    );
+
+    let recovered_guard = match &position.state {
+        robson_domain::PositionState::Active { invalidation_guard_level, .. } => {
+            *invalidation_guard_level
+        },
+        other => panic!("Expected Active state, got {other:?}"),
+    };
+    assert_eq!(recovered_guard, Some(guard));
+
+    let recovered_plan = Engine::new(RiskConfig::new(dec!(10000)).unwrap())
+        .stop_plan(position, technical_stop, recovered_guard, Some(&rules))
+        .unwrap();
+    assert!(recovered_plan.guard_bound);
+    assert_eq!(recovered_plan.cap_basis_distance, Some(dec!(477.60)));
+    assert_ne!(
+        recovered_plan.cap_basis_distance,
+        Some((fill_price.as_decimal() - guard.as_decimal()).abs())
+    );
+    assert_eq!(recovered_plan.trigger, admission_plan.trigger);
+}
