@@ -2,7 +2,7 @@
 
 [![Backend Tests](https://github.com/ldamasio/robson/actions/workflows/backend-tests.yml/badge.svg)](https://github.com/ldamasio/robson/actions/workflows/backend-tests.yml)
 
-Robson is an execution and risk management engine for cryptocurrency futures, operating at fixed 1x leverage. The operator decides the entry; Robson executes the exit under deterministic risk and reward policies. It does not generate signals, predict prices, or scan for opportunities.
+Robson is an execution and risk management engine for cryptocurrency futures, operating at fixed 1x leverage. The operator decides the entry and arms it; Robson executes it when the armed condition is met and manages the exit under deterministic risk and reward policies. It does not originate trade ideas, predict prices, or scan for opportunities.
 
 Robson is concerned with what happens **after** a trading decision is made: position sizing from chart-derived stops, governed order execution, lifecycle management through entry to settlement, and safe failure handling under volatile conditions.
 
@@ -31,20 +31,20 @@ Armed → Entering → Active → Exiting → Closed
 The operator **arms** a position by specifying a symbol, direction (Long/Short), and an entry mode. Robson's detector then monitors the market and fires an entry signal when the chosen condition is met. The signal is routed through the query engine and risk gate before any order reaches the exchange.
 
 **Entry modes** (what triggers the entry signal):
-- `confirmed_trend` — SMA crossover signal (default)
-- `confirmed_reversal` — reversal candlestick pattern
-- `confirmed_key_level` — key level breakout
-- `immediate` — operator injects signal manually via API
+- `confirmed_trend`: SMA crossover signal (default)
+- `confirmed_reversal`: reversal candlestick pattern
+- `confirmed_key_level`: key level breakout
+- `immediate`: entry signal generated at arm time; the position enters synchronously
 
 **Approval modes** (whether human confirmation is required):
-- `automatic` — entry proceeds without operator action (default)
-- `human_confirmation` — operator must approve via dashboard before the order is placed
+- `automatic`: entry proceeds without operator action (default)
+- `human_confirmation`: operator must approve via dashboard before the order is placed
 
 ## Why Robson Exists
 
 Most open-source trading systems conflate signal generation with execution. The result is software where risk management is an afterthought bolted onto an indicator library.
 
-Robson inverts this. The execution and risk layers are the primary concern. The operator decides the entry; Robson executes the exit deterministically, sizes the position correctly, and enforces the stop.
+Robson inverts this. The execution and risk layers are the primary concern. The operator decides the entry; Robson times and executes it, sizes the position from the technical stop, and manages the exit deterministically.
 
 In futures markets, **how** you execute matters more than **what** you execute. Even at 1x, a sound entry with poor exit execution, missing stop logic, or uncontrolled position sizing will lose capital. Robson exists to make the execution path deterministic, auditable, and safe by default.
 
@@ -93,7 +93,7 @@ GET  /status                          # Positions, slots, monthly risk state
 GET  /positions?month=YYYY-MM         # Monthly position history
 GET  /positions/{id}                  # Single position detail
 POST /positions                       # Arm a new position
-POST /positions/{id}/signal           # Inject entry signal (immediate mode)
+POST /positions/{id}/signal           # Inject entry signal (testing)
 DEL  /positions/{id}                  # Cancel Armed / close Active position
 POST /queries/{id}/approve            # Approve a pending human-confirmation query
 GET  /monthly-halt                    # Monthly halt status

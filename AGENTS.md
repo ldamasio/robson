@@ -9,8 +9,8 @@ Vendor-specific files such as `CLAUDE.md`, Cursor rules, or other tool adapters 
 
 Robson is an execution and risk management system for cryptocurrency futures, operating at fixed 1x leverage.
 
-The operator decides the entry; Robson executes the exit under deterministic risk and reward policies.
-It does not justify signals, generate entries, or bypass operator governance.
+The operator decides the entry and arms it; Robson executes it when the armed condition is met and manages the exit under deterministic risk and reward policies.
+It does not originate trade ideas, justify signals, or bypass operator governance.
 Its core concern is what happens after a trading decision exists: execution, risk enforcement, lifecycle control, auditability, and failure handling.
 
 The repository contains the Rust runtime (canonical) at the repository root, the SvelteKit frontend under `frontend/`, and related specs in `docs/architecture`.

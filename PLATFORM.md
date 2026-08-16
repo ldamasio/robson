@@ -144,6 +144,6 @@ Mas as quatro responsabilidades permanecem:
 
 **`robson`** é a aplicação operacional de trading da plataforma RBX.
 
-Este repositório implementa o agente de trading autônomo que opera sobre o mercado de Futuros BTC/USDT. Robson é um consumidor das quatro camadas da plataforma: toda chamada a modelos de linguagem deve transitar pelo Thalamus como portão obrigatório; a qualidade das decisões de entrada e saída é avaliada pelo TruthMetal; missões agenticas complexas são coordenadas pelo Agent Orchestration Plane; e toda decisão arquitetural relevante é registrada no RBX Governance.
+Este repositório implementa o motor de execução e gestão de risco que opera futuros de criptomoedas (Binance USDT-M) com alavancagem fixa em 1x, sem restrição a um símbolo específico. O operador decide a entrada; Robson a executa e conduz a saída conforme políticas determinísticas de risco e retorno. Robson é um consumidor das quatro camadas da plataforma: toda chamada a modelos de linguagem deve transitar pelo Thalamus como portão obrigatório; a qualidade das decisões de entrada e saída é avaliada pelo TruthMetal; missões agenticas complexas são coordenadas pelo Agent Orchestration Plane; e toda decisão arquitetural relevante é registrada no RBX Governance.
 
-Robson não roteia tráfego AI, não avalia modelos e não registra políticas institucionais. Robson executa: lê contexto, decide, age no mercado, reporta.
+Robson não roteia tráfego AI, não avalia modelos e não registra políticas institucionais. Robson executa: dimensiona pela distância do stop técnico, entra quando a condição armada é atingida, conduz a saída e reporta.
