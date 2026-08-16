@@ -1,8 +1,8 @@
-# Robson — Execution & Risk Engine for Leveraged Markets
+# Robson: Execution & Risk Engine for Crypto Futures
 
 [![Backend Tests](https://github.com/ldamasio/robson/actions/workflows/backend-tests.yml/badge.svg)](https://github.com/ldamasio/robson/actions/workflows/backend-tests.yml)
 
-Robson is an execution and risk management engine for leveraged cryptocurrency markets. It is not an autonomous trading bot. It does not decide what to trade, predict prices, or scan for opportunities.
+Robson is an execution and risk management engine for cryptocurrency futures, operating at fixed 1x leverage. The operator decides the entry; Robson executes the exit under deterministic risk and reward policies. It does not generate signals, predict prices, or scan for opportunities.
 
 Robson is concerned with what happens **after** a trading decision is made: position sizing from chart-derived stops, governed order execution, lifecycle management through entry to settlement, and safe failure handling under volatile conditions.
 
@@ -44,9 +44,9 @@ The operator **arms** a position by specifying a symbol, direction (Long/Short),
 
 Most open-source trading systems conflate signal generation with execution. The result is software where risk management is an afterthought bolted onto an indicator library.
 
-Robson inverts this. The execution and risk layers are the primary concern. The operator makes the trading decision — Robson executes it deterministically, sizes it correctly, and enforces the stop.
+Robson inverts this. The execution and risk layers are the primary concern. The operator decides the entry; Robson executes the exit deterministically, sizes the position correctly, and enforces the stop.
 
-In leveraged markets, **how** you execute matters more than **what** you execute. A sound signal with poor execution, missing stop logic, or uncontrolled position sizing will lose capital. Robson exists to make the execution path deterministic, auditable, and safe by default.
+In futures markets, **how** you execute matters more than **what** you execute. Even at 1x, a sound entry with poor exit execution, missing stop logic, or uncontrolled position sizing will lose capital. Robson exists to make the execution path deterministic, auditable, and safe by default.
 
 ## Architecture
 
