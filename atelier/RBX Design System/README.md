@@ -53,7 +53,7 @@ What's **preserved** from the source:
 
 ## Content fundamentals
 
-**Tone.** Institutional, precise, technical. Written for engineers and researchers, not retail traders. No hype, no exclamation marks, no "unlock," no "supercharge." If the product README says "Robson is not a trading bot," UI copy should inherit that refusal to oversell.
+**Tone.** Institutional, precise, technical. Written for engineers and researchers, not retail traders. No hype, no exclamation marks, no "unlock," no "supercharge." If the product README says "The operator decides the entry; Robson executes the exit," UI copy should inherit that discipline: state the mechanism, never oversell.
 
 **Voice.** Third-person system voice ("The engine enforces…"), or direct imperative ("Validate plan," "Acknowledge risk"). Avoid "we" / "our." Use "you" sparingly, only when addressing the operator directly ("You are in demo mode").
 

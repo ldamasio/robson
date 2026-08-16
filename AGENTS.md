@@ -7,9 +7,9 @@ Vendor-specific files such as `CLAUDE.md`, Cursor rules, or other tool adapters 
 
 ## Project Identity
 
-Robson is an execution and risk management system for leveraged markets.
+Robson is an execution and risk management system for cryptocurrency futures, operating at fixed 1x leverage.
 
-It is not an autonomous trading bot.
+The operator decides the entry; Robson executes the exit under deterministic risk and reward policies.
 It does not justify signals, generate entries, or bypass operator governance.
 Its core concern is what happens after a trading decision exists: execution, risk enforcement, lifecycle control, auditability, and failure handling.
 

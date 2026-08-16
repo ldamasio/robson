@@ -26,7 +26,7 @@ function ExposureCard() {
       <Eyebrow>Liquidation distance</Eyebrow>
       <div className="rbx-metric rbx-metric--warn">12.40%</div>
       <div className="rbx-delta rbx-delta--neutral">Threshold · 10.00%</div>
-      <div className="rbx-card__foot">2 open positions · 1 leveraged</div>
+      <div className="rbx-card__foot">2 open positions · 2 slots free</div>
     </Card>
   );
 }
