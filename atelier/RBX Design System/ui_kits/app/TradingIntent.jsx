@@ -12,16 +12,16 @@ function TradingIntent() {
   const checks = [
     { label: 'Symbol resolved', value: 'BTCUSDT', ok: true },
     { label: 'Technical stop chart-derived', value: '2nd S/R level · 15m', ok: true },
-    { label: 'Stop distance within bounds', value: '0.96% · below floor 1.00%', ok: false },
+    { label: 'Stop distance within bounds', value: '0.08% · below floor 0.10%', ok: false },
     { label: 'Worst-case loss within 1% cap', value: '0.72% capital_base', ok: true },
-    { label: 'Monthly budget remaining', value: '2.10% of 4.00%', ok: true },
+    { label: 'Monthly budget remaining', value: '2.10% of capital · cap 4.00%', ok: true },
   ];
 
   return (
     <div className="rbx-panel">
       <div className="rbx-panel__head">
         <div>
-          <Eyebrow>Armed position · pos-2847 · 2026-04-18T09:14:22Z</Eyebrow>
+          <Eyebrow>Armed position · 0198f3a2 · 2026-04-18T09:14:22Z</Eyebrow>
           <h2 className="rbx-panel__title">LONG · BTCUSDT · confirmed_trend</h2>
         </div>
         <div style={{display:'flex', gap:8}}>

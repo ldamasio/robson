@@ -7,5 +7,5 @@ Interactive recreation of the Robson operations dashboard. Open `index.html` for
 - `Sidebar.jsx` — navigation rail
 - `PortfolioCard.jsx`, `PositionsTable.jsx` — data surfaces
 - `CommandDock.jsx` — CLI-style prompt (most on-brand surface)
-- `TradingIntent.jsx` — plan / validate / execute pipeline view
+- `TradingIntent.jsx` — arm / detect / execute pipeline view
 - `Button.jsx`, `Badge.jsx`, `Field.jsx` — primitives

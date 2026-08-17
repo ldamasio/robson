@@ -119,12 +119,12 @@
       <div class="feat">
         <div class="feat__num">01 — EXECUTION</div>
         <div class="feat__title">Arm. Detect. Execute.</div>
-        <div class="feat__body">The operator arms; the detector confirms the entry condition; the query engine and risk gate govern every transition. No unvetted order reaches the exchange, and human confirmation mode holds entries for explicit operator approval.</div>
+        <div class="feat__body">The operator arms; the detector confirms the entry condition; the query engine governs every state transition and the risk gate every entry. No unvetted order reaches the exchange, and human confirmation mode holds entries for explicit operator approval.</div>
       </div>
       <div class="feat">
         <div class="feat__num">02 — RISK</div>
         <div class="feat__title">Enforced, not advised.</div>
-        <div class="feat__body">Position sizing from the technical stop, the 1% worst-case cap, and the 4% monthly budget are invariants of the runtime. Every exit executes as a market order and carries a typed reason code: stop hit, budget denial, manual close, panic.</div>
+        <div class="feat__body">Position sizing from the technical stop, the 1% worst-case cap, and the 4% monthly budget are invariants of the runtime. Every exit executes as a market order and carries a typed reason code: trailing stop, insurance stop, panic, disarm, degraded mode.</div>
       </div>
       <div class="feat">
         <div class="feat__num">03 — AUDIT</div>
@@ -145,14 +145,14 @@
     <div class="code__head"><span>robsond · api</span><span>09:14:28</span></div>
     <div class="code__body">
 <span class="c"># 1. operator arms the position</span><br/>
-<span class="p">POST</span> /positions <span class="s">{"symbol":"BTCUSDT","side":"long","entry_mode":"confirmed_trend"}</span><br/>
-<span class="c">&nbsp;&nbsp;201 · pos-2847 armed · detector watching</span><br/><br/>
+<span class="p">POST</span> /positions <span class="s">{"symbol":"BTCUSDT","side":"long","entry_policy":{"mode":"confirmed_trend"}}</span><br/>
+<span class="c">&nbsp;&nbsp;201 · position 0198f3a2 armed · detector watching</span><br/><br/>
 <span class="c"># 2. detector confirms the condition</span><br/>
-<span class="c">&nbsp;&nbsp;event entry_signal · risk gate: budget 2.10% of 4.00% remaining · entry order placed</span><br/><br/>
+<span class="c">&nbsp;&nbsp;event entry_signal_received · risk gate: budget remaining 2.10% of capital (cap 4.00%) · event entry_order_placed</span><br/><br/>
 <span class="c"># 3. entry filled</span><br/>
-<span class="c">&nbsp;&nbsp;event position_active · trailing stop 93,500 · insurance stop resting on exchange</span><br/><br/>
+<span class="c">&nbsp;&nbsp;event entry_filled · trailing stop 93,500 · insurance stop resting on exchange</span><br/><br/>
 <span class="c"># 4. exit under policy</span><br/>
-<span class="c">&nbsp;&nbsp;event stop_hit · market exit · typed reason recorded</span>
+<span class="c">&nbsp;&nbsp;event exit_triggered · market exit · reason trailing_stop</span>
     </div>
   </div>
 </section>

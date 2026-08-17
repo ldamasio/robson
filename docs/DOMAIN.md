@@ -81,7 +81,7 @@ Distance: $1,500 (1.58%)
 
 ### Exchange-Side Insurance Stop (ADR-0039)
 
-**Decision**: Robson manages exits in runtime and additionally keeps a backup stop order on the exchange. On entry fill the engine emits `PlaceInsuranceStop`; the executor places the stop at the chart-derived trailing stop (offset by a configured buffer) and re-places it as the trailing stop advances.
+**Decision**: Robson manages exits in runtime and additionally places a backup stop order on the exchange. On entry fill the engine emits `PlaceInsuranceStop`; the executor places the stop at the chart-derived trailing stop (offset by a configured buffer) and re-places it as the trailing stop advances. A placement failure becomes an audit-only `InsuranceStopFailed` event: it never aborts the action batch, and the software monitor remains the primary exit path.
 
 **Rationale**:
 - The runtime remains the primary exit path (market orders on stop hit)
@@ -258,8 +258,12 @@ impl TechnicalStopDistance {
 
 ```rust
 pub struct RiskConfig {
-    capital: Decimal,  // Only constructor input; execution-cost params and
-                       // stop-distance bounds take defaults
+    capital: Decimal,                 // Only required constructor input
+    taker_fee_rate: Decimal,          // Execution-cost offsets: conservative
+    stop_gap_bps: Decimal,            // defaults, overridable via
+    stop_buffer_bps: Decimal,         // with_execution_costs()
+    margin_headroom_bps: Decimal,
+    stop_distance_bounds: StopDistanceBounds,  // ADR-0050
 }
 
 impl RiskConfig {
@@ -270,7 +274,7 @@ impl RiskConfig {
 }
 ```
 
-**Design Note**: No `max_leverage` - leverage is fixed at 1x (margin availability is the physical bound). Per-trade risk (1%) and the monthly drawdown budget (4%, in `TradingPolicy`, ADR-0024 Decision 2) are fixed by product definition: not configurable via environment, operator API, or any runtime mechanism.
+**Design Note**: No `max_leverage` - leverage is fixed at 1x (margin availability is the physical bound). Per-trade risk (1%) and the monthly drawdown budget (4%, in `TradingPolicy`, ADR-0024 Decision 2) are fixed by product definition: not configurable via environment, operator API, or any runtime mechanism. The execution-cost fields are operator-configurable execution offsets priced into sizing (ADR-0039/ADR-0041); they are not risk knobs.
 
 ### Price
 
@@ -391,7 +395,7 @@ pub enum PositionState {
         trailing_stop: Price,
         favorable_extreme: Price,  // Highest (Long) or lowest (Short) price seen
         extreme_at: DateTime<Utc>,
-        insurance_stop_id: Option<OrderId>,  // Exchange-side insurance stop (ADR-0039)
+        insurance_stop_id: Option<String>,  // Exchange-assigned insurance stop order id (ADR-0039)
     },
 
     /// Exit order submitted, waiting for fill
@@ -653,7 +657,10 @@ if position.state == Entering { signal_id } && signal_id == new_signal.signal_id
 
 ```rust
 pub struct RiskConfig {
-    capital: Decimal,  // Only constructor input; risk parameters are constants
+    capital: Decimal,
+    // plus execution-cost offsets (taker_fee_rate, stop_gap_bps,
+    // stop_buffer_bps, margin_headroom_bps) and stop_distance_bounds;
+    // risk parameters themselves are constants
 }
 
 impl RiskConfig {
@@ -664,7 +671,7 @@ impl RiskConfig {
 
 **Removed from original design**:
 - `max_leverage` - Fixed at 1x (margin availability is the physical bound)
-- `insurance_stop_enabled` - The exchange-side insurance stop is always placed (ADR-0039)
+- `insurance_stop_enabled` - The exchange-side insurance stop is always attempted on entry fill (ADR-0039); placement failures are audit-only events
 - `risk_percent` / `max_drawdown_percent` knobs - Per-trade risk is fixed at 1% and the monthly drawdown budget at 4% (`TradingPolicy`, ADR-0024); neither is configurable
 
 ### Risk Checks (current)

@@ -4,8 +4,8 @@ function CommandDock() {
   const [input, setInput] = useCmdState('');
   const [feed, setFeed] = useCmdState([
     { role: 'system', text: 'Connected · robsond · single-operator · human confirmation on', ts: '09:14:22' },
-    { role: 'user', text: 'arm BTCUSDT long --entry confirmed_trend', ts: '09:14:28' },
-    { role: 'system', text: 'pos-2847 armed · detector watching', ts: '09:14:28' },
+    { role: 'user', text: 'arm BTCUSDT long confirmed_trend', ts: '09:14:28' },
+    { role: 'system', text: 'position 0198f3a2 armed · detector watching', ts: '09:14:28' },
   ]);
 
   const send = () => {
@@ -34,7 +34,7 @@ function CommandDock() {
         <Badge tone="warning">Human confirmation</Badge>
         <Badge tone="info">BTCUSDT · 67,420.50</Badge>
         <Badge tone="positive">Portfolio +3.03%</Badge>
-        <Badge tone="neutral">Budget 2.10% of 4.00%</Badge>
+        <Badge tone="neutral">Budget 2.10% left · cap 4.00%</Badge>
       </div>
       <div className="rbx-dock__feed">
         {feed.map((m, i) => (
