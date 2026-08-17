@@ -33,8 +33,8 @@ The operator **arms** a position by specifying a symbol, direction (Long/Short),
 **Entry modes** (what triggers the entry signal):
 - `confirmed_trend`: SMA crossover signal (default)
 - `confirmed_reversal`: reversal candlestick pattern
-- `confirmed_key_level`: key level breakout
-- `immediate`: entry signal generated at arm time; the position enters synchronously
+- `confirmed_key_level`: reaction at a key support/resistance level
+- `immediate`: entry signal generated and processed at arm time, still subject to the approval mode
 
 **Approval modes** (whether human confirmation is required):
 - `automatic`: entry proceeds without operator action (default)
