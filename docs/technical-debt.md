@@ -118,3 +118,39 @@ mechanically enforced for multi-position startup recovery.
 
 The correction changes a real-money lifecycle path and requires a separate,
 explicitly approved PR. This documentation cleanup does not modify runtime code.
+
+---
+
+## TD-2026-08-15-001: Fee accounting drift on exits (issue #156)
+
+**Status**: Open
+**Severity**: Medium
+**Area**: `robsond` order accounting, income ledger, reconciliation alerting
+**Discovered**: 2026-08 (issue #156; confirmed by the 2026-08-15 doc-vs-code audit)
+
+### Evidence
+
+- When an order response carries `fills`, real commissions are summed; when it
+  does not, `robsond/src/binance_exchange.rs` falls back to an estimated fee of
+  0.1% of the cumulative quote.
+- `PositionClosed` records `fees_paid + exit_fee` using whatever fee the order
+  path produced; a close that used the fallback is persisted with an estimated
+  fee, and no later path corrects the event.
+- The `COMMISSION` income ledger is collected independently via
+  `/fapi/v1/income` and matched to positions only approximately (symbol plus
+  time window); it has no linkage back to the position manager to replace the
+  estimate with the effective commission.
+- The reconciliation worker emits a periodic financial-drift WARN (default
+  60 s interval), which stays noisy while the estimate and the ledger disagree.
+
+### Required correction
+
+- Persist the effective exit commission (from fills or from a matched ledger
+  row) or define an explicit reconciliation step that supersedes the estimate.
+- Make ledger-to-position matching deterministic for robsond-authored exits
+  (client order id, not symbol/time proximity).
+- Bound or gate the drift WARN so an accepted, explained estimate does not
+  alarm every minute.
+
+The correction touches real-money accounting and requires its own explicitly
+approved PR; this register entry only records the debt.

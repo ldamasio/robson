@@ -2,8 +2,14 @@
 
 **Date**: 2026-08-04
 **Status**: DECIDED — FOLLOW-UP REQUIRED (operator decision, 2026-08-04;
-revised same day after adversarial secondary-model review; implementation and
-operational rollout pending)
+revised same day after adversarial secondary-model review). Implementation
+status (2026-08-17): rollout steps 1-2 are in main in dormant form
+(`monthly_budget_model` migration with `hwm_v1` default,
+`MonthlyBudgetModel` in `robson-domain/src/policy.rs`, shadow dual-model
+comparison with divergence logging in `robsond/src/position_manager.rs`).
+Activation, model-aware frontend (it still renders `month_peak_net`),
+settlement completeness (funding and typed income are blockers, see the
+API settlement gate), and cleanup remain pending.
 **Deciders**: RBX Systems (operator + architecture, with adversarial design
 review by a secondary model)
 **Supersedes**: [ADR-0046](ADR-0046-monthly-high-water-mark-budget.md)
