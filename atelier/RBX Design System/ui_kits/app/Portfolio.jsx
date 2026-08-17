@@ -23,10 +23,10 @@ function EquityCard() {
 function ExposureCard() {
   return (
     <Card>
-      <Eyebrow>Liquidation distance</Eyebrow>
-      <div className="rbx-metric rbx-metric--warn">12.40%</div>
-      <div className="rbx-delta rbx-delta--neutral">Threshold · 10.00%</div>
-      <div className="rbx-card__foot">2 open positions · 2 slots free</div>
+      <Eyebrow>Monthly risk budget</Eyebrow>
+      <div className="rbx-metric rbx-metric--warn">2.10%</div>
+      <div className="rbx-delta rbx-delta--neutral">Remaining of 4.00% · circuit breaker at 0</div>
+      <div className="rbx-card__foot">2 open positions · at least 2 full-cap entries left</div>
     </Card>
   );
 }

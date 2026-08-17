@@ -34,7 +34,7 @@
   --positive-subtle: rgba(106, 167, 123, 0.12);
   --negative: #C26B6B;      /* losses, errors, stops hit */
   --negative-subtle: rgba(194, 107, 107, 0.12);
-  --warning: #C9A96E;       /* attention, dry-run, caution */
+  --warning: #C9A96E;       /* attention, awaiting confirmation, caution */
   --warning-subtle: rgba(201, 169, 110, 0.12);
   --info: #7891A8;          /* neutral information */
   --info-subtle: rgba(120, 145, 168, 0.12);

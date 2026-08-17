@@ -55,21 +55,21 @@ What's **preserved** from the source:
 
 **Tone.** Institutional, precise, technical. Written for engineers and researchers, not retail traders. No hype, no exclamation marks, no "unlock," no "supercharge." If the product README says "The operator decides the entry; Robson executes the exit," UI copy should inherit that discipline: state the mechanism, never oversell.
 
-**Voice.** Third-person system voice ("The engine enforces…"), or direct imperative ("Validate plan," "Acknowledge risk"). Avoid "we" / "our." Use "you" sparingly, only when addressing the operator directly ("You are in demo mode").
+**Voice.** Third-person system voice ("The engine enforces…"), or direct imperative ("Arm position," "Confirm entry"). Avoid "we" / "our." Use "you" sparingly, only when addressing the operator directly ("You are in demo mode").
 
-**Language.** Use domain vocabulary exactly — *plan, validate, execute, stop, liquidation distance, exit reason, dry-run*. Don't soften technical terms. "Position closed: stop hit" beats "Your trade has ended."
+**Language.** Use domain vocabulary exactly: *arm, detect, execute, technical stop, trailing stop, risk budget, slot, exit reason, panic*. Don't soften technical terms. "Position closed: stop hit" beats "Your trade has ended."
 
-**Casing.** Sentence case for UI labels and headings. UPPERCASE reserved for status tokens in monospace (`PLAN`, `VALIDATE`, `EXECUTE`, `LIVE`, `DRY-RUN`) and section labels in small caps (`Portfolio · BTC`).
+**Casing.** Sentence case for UI labels and headings. UPPERCASE reserved for status tokens in monospace (`ARMED`, `ENTERING`, `ACTIVE`, `EXITING`, `CLOSED`) and section labels in small caps (`Portfolio · BTC`).
 
 **Numbers.** Always tabular, monospace, with explicit precision. `0.00482 BTC`, not `~0.005 BTC`. Show currency and decimals, show zero fills.
 
 **Emoji.** **Not used.** The Robson frontend currently uses emoji feature cards — these are explicitly deprecated by this system.
 
 **Examples (good):**
-- `Plan validated. Dry-run ready.`
+- `Entry risk-approved. Awaiting confirmation.`
 - `Stop triggered · BTCUSDT · -1.24%`
-- `Liquidation distance: 12.40%`
-- `Execution requires --live --acknowledge-risk`
+- `Monthly budget remaining: 2.10%`
+- `Approval mode: human_confirmation`
 
 **Examples (avoid):**
 - ~~"🚀 Ready to supercharge your trading?"~~

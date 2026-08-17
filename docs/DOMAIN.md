@@ -79,14 +79,14 @@ Distance: $1,500 (1.58%)
 - Market moves fast; we need certainty
 - Trailing stop provides dynamic target
 
-### No Insurance Stop on Exchange
+### Exchange-Side Insurance Stop (ADR-0039)
 
-**Decision**: Robson manages all exits in runtime. No backup stop-limit on exchange.
+**Decision**: Robson manages exits in runtime and additionally keeps a backup stop order on the exchange. On entry fill the engine emits `PlaceInsuranceStop`; the executor places the stop at the chart-derived trailing stop (offset by a configured buffer) and re-places it as the trailing stop advances.
 
 **Rationale**:
-- Simpler architecture
-- Avoids race conditions between local monitor and exchange stop
-- Daemon reliability is the safety mechanism
+- The runtime remains the primary exit path (market orders on stop hit)
+- The exchange-side stop protects the position if the daemon is down or disconnected
+- The stop price is always chart-derived, never a percentage of entry
 
 ---
 
@@ -184,7 +184,7 @@ pub enum OrderStatus {
 }
 ```
 
-**Design Note**: `Trade` entity was removed. Fill information is stored directly in `Order` since market orders fill immediately in isolated margin.
+**Design Note**: `Trade` entity was removed. Fill information is stored directly in `Order` since market orders fill immediately on USDT-M futures.
 
 ### DetectorSignal
 
@@ -258,18 +258,19 @@ impl TechnicalStopDistance {
 
 ```rust
 pub struct RiskConfig {
-    capital: Decimal,           // Total capital allocated
-    risk_percent: Decimal,      // Risk per trade (default: 1%)
-    max_drawdown_percent: Decimal, // Max account drawdown (default: 10%)
+    capital: Decimal,  // Only constructor input; execution-cost params and
+                       // stop-distance bounds take defaults
 }
 
 impl RiskConfig {
-    pub fn new(capital: Decimal, risk_percent: Decimal) -> Result<Self, DomainError>;
-    pub fn max_risk_amount(&self) -> Decimal;  // capital × risk_percent / 100
+    pub const LEVERAGE: u8 = 1;                   // Fixed 1x
+    pub const RISK_PER_TRADE_PCT: Decimal = ONE;  // Fixed 1%
+    pub fn new(capital: Decimal) -> Result<Self, DomainError>;
+    pub fn max_risk_amount(&self) -> Decimal;  // capital × 1%
 }
 ```
 
-**Design Note**: No `max_leverage` - leverage is fixed at 1x (margin availability is the physical bound).
+**Design Note**: No `max_leverage` - leverage is fixed at 1x (margin availability is the physical bound). Per-trade risk (1%) and the monthly drawdown budget (4%, in `TradingPolicy`, ADR-0024 Decision 2) are fixed by product definition: not configurable via environment, operator API, or any runtime mechanism.
 
 ### Price
 
@@ -390,7 +391,7 @@ pub enum PositionState {
         trailing_stop: Price,
         favorable_extreme: Price,  // Highest (Long) or lowest (Short) price seen
         extreme_at: DateTime<Utc>,
-        insurance_stop_id: Option<OrderId>,  // Always None in v2 (no insurance stop)
+        insurance_stop_id: Option<OrderId>,  // Exchange-side insurance stop (ADR-0039)
     },
 
     /// Exit order submitted, waiting for fill
@@ -652,28 +653,29 @@ if position.state == Entering { signal_id } && signal_id == new_signal.signal_id
 
 ```rust
 pub struct RiskConfig {
-    pub capital: Decimal,              // Total allocated capital
-    pub risk_percent: Decimal,         // Risk per trade (default: 1%)
-    pub max_drawdown_percent: Decimal, // Max account drawdown (default: 10%)
+    capital: Decimal,  // Only constructor input; risk parameters are constants
+}
+
+impl RiskConfig {
+    pub const LEVERAGE: u8 = 1;                   // Fixed 1x
+    pub const RISK_PER_TRADE_PCT: Decimal = ONE;  // Fixed 1%
 }
 ```
 
 **Removed from original design**:
 - `max_leverage` - Fixed at 1x (margin availability is the physical bound)
-- `insurance_stop_enabled` - No insurance stops in v2
+- `insurance_stop_enabled` - The exchange-side insurance stop is always placed (ADR-0039)
+- `risk_percent` / `max_drawdown_percent` knobs - Per-trade risk is fixed at 1% and the monthly drawdown budget at 4% (`TradingPolicy`, ADR-0024); neither is configurable
 
-### Risk Checks (Future: Phase 5)
+### Risk Checks (current)
 
-```rust
-impl RiskManager {
-    /// Check if new position can be opened
-    pub fn can_open_position(&self, account: &Account) -> Result<(), RiskError> {
-        // 1. Check daily drawdown limit
-        // 2. Check max open positions
-        // 3. Check account equity
-    }
-}
-```
+Admission is enforced by the risk gate before any entry order reaches the exchange:
+
+1. One position per symbol and side
+2. Physical margin bound at 1x: the stop-derived notional must fit available capital
+3. Budget-metered admission (ADR-0043 / ADR-0046): the trade is charged its planned worst-case loss against the remaining 4% monthly budget (monthly high-water-mark base); the 1% per-trade cap still bounds any single trade
+
+There is no daily drawdown limit and no static maximum-position count; concurrency is bounded by the monthly budget and the physical margin bound.
 
 ---
 
