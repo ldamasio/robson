@@ -1,28 +1,28 @@
 const { useState: useTIState } = React;
 
 function TradingIntent() {
-  const [stage, setStage] = useTIState(1); // 0 plan, 1 validate, 2 execute
+  const [stage, setStage] = useTIState(1); // 0 arm, 1 detect, 2 execute
 
   const steps = [
-    { id: 0, label: 'Plan', status: 'done' },
-    { id: 1, label: 'Validate', status: stage >= 1 ? (stage === 1 ? 'active' : 'done') : 'pending' },
+    { id: 0, label: 'Arm', status: 'done' },
+    { id: 1, label: 'Detect', status: stage >= 1 ? (stage === 1 ? 'active' : 'done') : 'pending' },
     { id: 2, label: 'Execute', status: stage >= 2 ? (stage === 2 ? 'active' : 'done') : 'pending' },
   ];
 
   const checks = [
     { label: 'Symbol resolved', value: 'BTCUSDT', ok: true },
-    { label: 'Quantity within sizing policy', value: '0.00482 · 0.72% equity', ok: true },
-    { label: 'Stop distance', value: '0.96% · below floor 1.00%', ok: false },
-    { label: 'Liquidation headroom', value: '12.40%', ok: true },
-    { label: 'Max concurrent positions', value: '2 / 5', ok: true },
+    { label: 'Technical stop chart-derived', value: '2nd S/R level · 15m', ok: true },
+    { label: 'Stop distance within bounds', value: '0.08% · below floor 0.10%', ok: false },
+    { label: 'Worst-case loss within 1% cap', value: '0.72% capital_base', ok: true },
+    { label: 'Monthly budget remaining', value: '2.10% of capital · cap 4.00%', ok: true },
   ];
 
   return (
     <div className="rbx-panel">
       <div className="rbx-panel__head">
         <div>
-          <Eyebrow>Plan · plan-2847 · 2026-04-18T09:14:22Z</Eyebrow>
-          <h2 className="rbx-panel__title">BUY · BTCUSDT · 0.00482 @ 67,420.50</h2>
+          <Eyebrow>Armed position · 0198f3a2 · 2026-04-18T09:14:22Z</Eyebrow>
+          <h2 className="rbx-panel__title">LONG · BTCUSDT · confirmed_trend</h2>
         </div>
         <div style={{display:'flex', gap:8}}>
           <Button variant="secondary" icon="copy">Duplicate</Button>
@@ -57,12 +57,12 @@ function TradingIntent() {
 
       <div className="rbx-panel__foot">
         <div className="rbx-foot-note">
-          Execution requires <code>--live --acknowledge-risk</code>. One validation failure must clear before stage advance.
+          Approval mode: <code>human_confirmation</code>. The risk-approved entry holds until the operator confirms. A failed check re-arms the detector with backoff.
         </div>
         <div style={{display:'flex', gap:8}}>
-          <Button variant="secondary">Run dry-run</Button>
+          <Button variant="secondary">Cancel arm</Button>
           <Button variant="accent" icon="arrow-right" onClick={() => setStage(2)} disabled={checks.some(c=>!c.ok)}>
-            Acknowledge risk
+            Confirm entry
           </Button>
         </div>
       </div>

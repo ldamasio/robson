@@ -34,7 +34,7 @@ function Sidebar({ route, setRoute }) {
           <span className="rbx-mono-sm">v0.104</span>
         </div>
         <div className="rbx-sidebar__foot-row">
-          <Badge tone="warning">Dry-run</Badge>
+          <Badge tone="warning">Human confirmation</Badge>
         </div>
       </div>
     </aside>

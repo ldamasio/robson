@@ -118,13 +118,13 @@
     <div class="feat-grid">
       <div class="feat">
         <div class="feat__num">01 — EXECUTION</div>
-        <div class="feat__title">Plan. Validate. Execute.</div>
-        <div class="feat__body">A strict PLAN → VALIDATE → EXECUTE pipeline. No unvalidated order reaches the exchange. Dry-run is the default; live execution requires explicit acknowledgement.</div>
+        <div class="feat__title">Arm. Detect. Execute.</div>
+        <div class="feat__body">The operator arms; the detector confirms the entry condition; the query engine governs every state transition and the risk gate every entry. No unvetted order reaches the exchange, and human confirmation mode holds entries for explicit operator approval.</div>
       </div>
       <div class="feat">
         <div class="feat__num">02 — RISK</div>
         <div class="feat__title">Enforced, not advised.</div>
-        <div class="feat__body">Position sizing, stop logic, and liquidation distance are invariants of the runtime. Every exit carries a typed reason code — stop hit, risk limit, manual, validation failure, timeout.</div>
+        <div class="feat__body">Position sizing from the technical stop, the 1% worst-case cap, and the 4% monthly budget are invariants of the runtime. Every exit executes as a market order and carries a typed reason code: trailing stop, insurance stop, panic, disarm, degraded mode.</div>
       </div>
       <div class="feat">
         <div class="feat__num">03 — AUDIT</div>
@@ -137,24 +137,22 @@
 
 <section class="wrap code-section">
   <div>
-    <div class="eyebrow">CLI · deterministic</div>
-    <h2>Dry-run by default. Live by declaration.</h2>
-    <p>The execution pipeline defaults to simulation. Live execution requires <code style="font-family:var(--font-mono); color:var(--accent); background:var(--accent-subtle); padding:1px 4px; border-radius:2px;">--live --acknowledge-risk</code> and a prior passing validation.</p>
+    <div class="eyebrow">API · governed</div>
+    <h2>Armed by the operator. Executed by policy.</h2>
+    <p>Nothing enters on its own. A position exists only after the operator arms it; the entry waits for the armed condition, passes the risk gate, and in <code style="font-family:var(--font-mono); color:var(--accent); background:var(--accent-subtle); padding:1px 4px; border-radius:2px;">human_confirmation</code> mode holds for explicit operator approval.</p>
   </div>
   <div class="code">
-    <div class="code__head"><span>bash · robson</span><span>09:14:28</span></div>
+    <div class="code__head"><span>robsond · api</span><span>09:14:28</span></div>
     <div class="code__body">
-<span class="c"># 1. create a plan</span><br/>
-<span class="p">robson</span> plan buy <span class="k">BTCUSDT</span> <span class="s">0.001</span> --limit <span class="s">67420</span><br/>
-<span class="c">&nbsp;&nbsp;→ plan-2847 created · pending validation</span><br/><br/>
-<span class="c"># 2. validate against risk invariants</span><br/>
-<span class="p">robson</span> validate plan-2847 --client-id <span class="s">1</span> --strategy-id <span class="s">5</span><br/>
-<span class="c">&nbsp;&nbsp;→ 4/5 checks passed · stop distance below floor</span><br/><br/>
-<span class="c"># 3. execute (dry-run)</span><br/>
-<span class="p">robson</span> execute plan-2847 --client-id <span class="s">1</span><br/>
-<span class="c">&nbsp;&nbsp;→ simulated · no order sent</span><br/><br/>
-<span class="c"># 4. execute (live)</span><br/>
-<span class="p">robson</span> execute plan-2847 --live --acknowledge-risk
+<span class="c"># 1. operator arms the position</span><br/>
+<span class="p">POST</span> /positions <span class="s">{"symbol":"BTCUSDT","side":"long","entry_policy":{"mode":"confirmed_trend"}}</span><br/>
+<span class="c">&nbsp;&nbsp;201 · position 0198f3a2 armed · detector watching</span><br/><br/>
+<span class="c"># 2. detector confirms the condition</span><br/>
+<span class="c">&nbsp;&nbsp;event entry_signal_received · risk gate: budget remaining 2.10% of capital (cap 4.00%) · event entry_order_placed</span><br/><br/>
+<span class="c"># 3. entry filled</span><br/>
+<span class="c">&nbsp;&nbsp;event entry_filled · trailing stop 93,500 · insurance stop resting on exchange</span><br/><br/>
+<span class="c"># 4. exit under policy</span><br/>
+<span class="c">&nbsp;&nbsp;event exit_triggered · market exit · reason trailing_stop</span>
     </div>
   </div>
 </section>

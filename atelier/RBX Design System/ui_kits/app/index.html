@@ -31,11 +31,11 @@ function App() {
         {route === 'dashboard' && (
           <>
             <Topbar
-              eyebrow="Tenant · acme-prod · 2026-04-18"
+              eyebrow="Operator · robsond-prod · 2026-04-18"
               title="Dashboard"
               actions={<>
                 <Button variant="secondary" icon="download">Export</Button>
-                <Button variant="accent" icon="plus" onClick={() => setRoute('intent')}>New plan</Button>
+                <Button variant="accent" icon="plus" onClick={() => setRoute('intent')}>Arm position</Button>
               </>}
             />
             <div className="rbx-grid">
@@ -47,7 +47,7 @@ function App() {
         {route === 'intent' && (
           <>
             <Topbar
-              eyebrow="Pipeline · plan \u2192 validate \u2192 execute"
+              eyebrow="Pipeline · arm · detect · execute"
               title="Trading intent"
               actions={<Button variant="ghost" icon="arrow-left" onClick={() => setRoute('dashboard')}>Back</Button>}
             />
@@ -56,7 +56,7 @@ function App() {
         )}
         {route === 'positions' && (
           <>
-            <Topbar eyebrow="3 open \u00b7 1 slot free" title="Positions" />
+            <Topbar eyebrow="3 open \u00b7 at least 1 entry left" title="Positions" />
             <PositionsTable onSelect={setSelected} selectedId={selected} />
           </>
         )}
