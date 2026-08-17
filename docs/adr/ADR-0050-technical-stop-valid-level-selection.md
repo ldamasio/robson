@@ -18,11 +18,14 @@ rejected slice-4 PR #153) — `ExecutableStopPlan` single resolver,
 `SymbolTradingRules` runtime metadata, adverse-fill costing, and stop-policy
 versioning (`legacy_uncapped` | `span_capped_v1`). §2/§6/§7 slice 3 (PR #152)
 implemented the terminal no-valid-stop semantics (`EntryAttemptExhausted`,
-`entry.rejected` SSE, persistence and restore); the `ImmediateUntilValid`
-opt-in retry model (`armed_waiting_valid_stop` state, governed backoff, TTL
-and reference-deviation bounds) remains target architecture, not yet
+`entry.rejected` SSE, persistence and restore), with one known restore
+caveat: if the startup eventlog query for `entry_attempt_exhausted` fails,
+the daemon restores the detector anyway, so an exhausted entry can be
+re-armed after a restart. The `ImmediateUntilValid` opt-in retry model
+(`armed_waiting_valid_stop` state, governed backoff, TTL and
+reference-deviation bounds) remains target architecture, not yet
 implemented. The slice-5 residual (durable resolved entry reference,
-issue #157) was closed by PR #175 on 2026-08-16. Activation of
+issue #157) was closed by PR #175 on 2026-08-15. Activation of
 `span_capped_v1` for real entries was operator-gated via
 `ROBSON_STOP_POLICY` (default `legacy_uncapped`) in the pre-ADR-0052 code.
 The ADR-0052 implementation removes that selector and stamps new arms
@@ -212,7 +215,7 @@ passes stage 1 is not assumed valid at stages 2–4.
 
 ### 7. Operator surfacing
 
-- SSE `entry_rejected` events are deduplicated: emit on change of
+- SSE `entry.rejected` events are deduplicated: emit on change of
   `(code, numbers)` only, with a periodic heartbeat while a waiting state persists.
 - The Armed representation exposes `entry_status` and `last_rejection` so the FE
   renders "waiting for valid stop (nearest level 63,551.40 at 0.094%; min 0.1%)"
