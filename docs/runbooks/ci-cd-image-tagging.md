@@ -84,7 +84,8 @@ on:
 1. Docker Buildx setup
 2. Login to GHCR (`ghcr.io`) with `GITOPS_TOKEN`
 3. Build from `Dockerfile`, push tags `sha-<8chars>` and `latest`
-4. Clone `rbxrobotica/rbx-infra`, update manifest image tags via `sed`, commit and push
+4. Clone `rbxrobotica/rbx-infra`, set `images[].newTag` in the prod overlay with
+   `yq`, commit and push
 5. ArgoCD detects manifest change and syncs automatically
 
 ---
@@ -102,8 +103,7 @@ Build & Push: ghcr.io/rbxrobotica/robson-v2:sha-XXXXXXXX
     │
     ▼
 Update rbx-infra:
-  apps/prod/robson/robsond-deploy.yml
-  apps/prod/robson/robsond-db-migrate-job.yml
+  apps/prod/robson/kustomization.yml (images[].newTag)
     │
     ▼
 ArgoCD syncs (namespace: robson)
@@ -125,16 +125,28 @@ to stable-only options.
 
 ## Rollback
 
+The deployed tag lives in ONE place: `images[].newTag` in the prod overlay.
+Editing `image:` in `robsond-deploy.yml` has no effect, because the kustomize
+images transformer overrides it (Pattern R; the manifests carry the `:latest`
+placeholder).
+
 ```bash
 # 1. Find the previous working SHA from rbx-infra history
 gh api repos/rbxrobotica/rbx-infra/commits \
   --jq '.[0:10] | .[] | {sha: .sha[0:8], message: .commit.message[0:60]}'
 
-# 2. Manually update the manifest in rbx-infra
-# Edit apps/prod/robson/robsond-deploy.yml:
-#   image: ghcr.io/rbxrobotica/robson-v2:sha-<previous>
+# 2. Roll the pin back in rbx-infra
+git clone https://github.com/rbxrobotica/rbx-infra.git /tmp/rbx-infra
+cd /tmp/rbx-infra
+K=apps/prod/robson/kustomization.yml
+yq -i '(.images[] | select(.name == "ghcr.io/rbxrobotica/robson-v2") | .newTag) = "sha-<previous>"' "$K"
 
-# 3. Commit and push to rbx-infra — ArgoCD syncs automatically
+# 3. Confirm the render resolves to the intended tag BEFORE pushing
+kubectl kustomize apps/prod/robson | grep 'image: ghcr.io/rbxrobotica/robson-v2'
+
+# 4. Commit and push to rbx-infra. ArgoCD syncs automatically
+git commit -am "chore(robson-v2): roll back to sha-<previous>"
+git push origin main
 ```
 
 ---
@@ -147,14 +159,17 @@ If the GitOps update fails:
 # Get the SHA tag you want to deploy
 SHA_TAG="sha-776a72f9"
 
-# Clone rbx-infra and update manifests manually
+# Clone rbx-infra and move the pin manually
 git clone https://github.com/rbxrobotica/rbx-infra.git /tmp/rbx-infra
 cd /tmp/rbx-infra
-sed -i "s|image: ghcr.io/rbxrobotica/robson-v2:sha-[a-f0-9]*|image: ghcr.io/rbxrobotica/robson-v2:${SHA_TAG}|g" \
-  apps/prod/robson/robsond-deploy.yml \
-  apps/prod/robson/robsond-db-migrate-job.yml
-git add apps/prod/robson/
-git commit -m "chore(robson-v2): manual rollout to ${SHA_TAG}"
+K=apps/prod/robson/kustomization.yml
+yq -i '(.images[] | select(.name == "ghcr.io/rbxrobotica/robson-v2") | .newTag) = strenv(SHA_TAG)' "$K"
+
+# Verify the render before pushing (both the daemon and the migrate hook
+# resolve from the same pin)
+kubectl kustomize apps/prod/robson | grep 'image: ghcr.io/rbxrobotica/robson-v2'
+
+git commit -am "chore(robson-v2): manual rollout to ${SHA_TAG}"
 git push origin main
 ```
 
@@ -162,12 +177,24 @@ git push origin main
 
 ## Troubleshooting
 
-### Build & Push fails: `sed: can't read ...`
+### Build & Push fails: `must have exactly one images entry`
 
-The GitOps step references incorrect manifest paths. Verify the paths in the
-`Update image tags in rbx-infra` step match:
-- `apps/prod/robson/robsond-deploy.yml`
-- `apps/prod/robson/robsond-db-migrate-job.yml`
+The prod overlay lost its `robson-v2` pin, or gained a duplicate. The promotion
+step refuses to guess. Inspect and repair the overlay:
+
+```bash
+yq '.images' apps/prod/robson/kustomization.yml
+```
+
+There must be exactly one entry with
+`name: ghcr.io/rbxrobotica/robson-v2`. See rbx-infra
+`docs/infra/IMAGE-PROMOTION.md`.
+
+### Build & Push fails: `yq is not available on this runner`
+
+`yq` is preinstalled on GitHub's `ubuntu-latest` images. If it disappears from
+a future runner image, install it explicitly in the workflow before the
+promotion step.
 
 ### Formatting check fails locally
 
