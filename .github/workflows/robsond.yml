@@ -152,12 +152,21 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          sed -i "s|image: ghcr.io/rbxrobotica/robson-v2:sha-[a-f0-9]*|image: ghcr.io/rbxrobotica/robson-v2:${SHA_TAG}|g" \
-            apps/prod/robson/robsond-deploy.yml \
-            apps/prod/robson/robsond-db-migrate-job.yml
+          # Pattern R: the promoted tag lives in the overlay's images
+          # transformer, not in the manifests. See rbx-infra
+          # docs/infra/IMAGE-PROMOTION.md.
+          K=apps/prod/robson/kustomization.yml
 
-          git add apps/prod/robson/robsond-deploy.yml \
-                  apps/prod/robson/robsond-db-migrate-job.yml
+          # Fail loudly if the pin is missing, rather than committing nothing
+          # and letting the deployed image silently freeze.
+          if ! yq -e '.images[] | select(.name == "ghcr.io/rbxrobotica/robson-v2")' "$K" >/dev/null; then
+            echo "::error::$K has no images entry for ghcr.io/rbxrobotica/robson-v2"
+            exit 1
+          fi
+
+          yq -i '(.images[] | select(.name == "ghcr.io/rbxrobotica/robson-v2") | .newTag) = strenv(SHA_TAG)' "$K"
+
+          git add "$K"
 
           if git diff --staged --quiet; then
             echo "No manifest changes needed (already at ${SHA_TAG})"
