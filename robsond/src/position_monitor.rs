@@ -214,22 +214,41 @@ impl PositionMonitor {
         }
     }
 
-    fn exclusion_key(symbol: &str, side: Side) -> String {
-        format!("{symbol}:{}", if side == Side::Long { "long" } else { "short" })
+    /// Canonical identity of a detected position: `"{SYMBOL}:{side}"`, with the
+    /// symbol upper-cased and the side lower-cased (e.g. `"BTCUSDT:long"`).
+    ///
+    /// This is the single source of truth for three things that MUST agree:
+    /// the in-memory `tracked_positions` key, the `core_exclusion_set` key, and
+    /// the `detected_positions.position_id` column written by
+    /// `DetectedPositionDto::from_domain`. Building the key ad hoc from
+    /// `Side`'s `Display` impl yields `"BTCUSDT:LONG"`, which silently
+    /// desynchronises startup-loaded rows from live-detected ones and makes
+    /// every repository call keyed by the id (`mark_closed`,
+    /// `clear_execution_attempts`, `update_execution_attempt`) match zero rows,
+    /// leaving ghost positions `is_active = TRUE` forever. See ADR-0039.
+    pub fn position_key(symbol: &str, side: Side) -> String {
+        format!(
+            "{}:{}",
+            symbol.to_uppercase(),
+            match side {
+                Side::Long => "long",
+                Side::Short => "short",
+            }
+        )
     }
 
     async fn is_core_excluded_in_memory(&self, symbol: &Symbol, side: Side) -> bool {
-        let key = Self::exclusion_key(&symbol.as_pair(), side);
+        let key = Self::position_key(&symbol.as_pair(), side);
         self.core_exclusion_set.read().await.contains(&key)
     }
 
     async fn add_core_exclusion(&self, symbol: &Symbol, side: Side) {
-        let key = Self::exclusion_key(&symbol.as_pair(), side);
+        let key = Self::position_key(&symbol.as_pair(), side);
         self.core_exclusion_set.write().await.insert(key);
     }
 
     async fn remove_core_exclusion(&self, symbol: &Symbol, side: Side) {
-        let key = Self::exclusion_key(&symbol.as_pair(), side);
+        let key = Self::position_key(&symbol.as_pair(), side);
         self.core_exclusion_set.write().await.remove(&key);
     }
 
@@ -240,15 +259,7 @@ impl PositionMonitor {
                 Ok(positions) => {
                     let mut tracked = self.tracked_positions.write().await;
                     for pos in positions {
-                        let position_id = format!(
-                            "{}:{}",
-                            pos.symbol.as_pair(),
-                            if pos.side == Side::Long {
-                                "long"
-                            } else {
-                                "short"
-                            }
-                        );
+                        let position_id = Self::position_key(&pos.symbol.as_pair(), pos.side);
                         tracked.insert(position_id, pos);
                     }
                     info!(count = tracked.len(), "Loaded persisted positions from database");
@@ -365,29 +376,49 @@ impl PositionMonitor {
     async fn check_symbol(&self, symbol: &str) -> Result<(), MonitorError> {
         debug!(symbol, "Checking for futures positions");
 
-        // Get current positions from Binance
+        // Get current positions from Binance. This is the only hard failure of
+        // the tick: without an authoritative position list we cannot tell
+        // "closed on the exchange" from "exchange unreachable", and cleaning up
+        // on the latter would drop a live position from the safety net.
         let binance_positions = self
             .binance_client
             .get_open_positions(symbol)
             .await
             .map_err(|e| MonitorError::BinanceError(e.to_string()))?;
 
-        // Get current price
-        let current_price = self
-            .binance_client
-            .get_price(symbol)
-            .await
-            .map_err(|e| MonitorError::BinanceError(e.to_string()))?;
+        // Every failure below is recorded and reported, but none of them may
+        // skip cleanup: reconciling closures only needs the position list we
+        // already hold, and letting a stop-evaluation error suppress it is what
+        // keeps ghost positions alive for months.
+        let mut first_error: Option<MonitorError> = None;
 
-        // Check each position
-        for binance_pos in binance_positions {
-            self.process_binance_position(binance_pos, current_price).await?;
+        match self.binance_client.get_price(symbol).await {
+            Ok(current_price) => {
+                for binance_pos in binance_positions.iter().cloned() {
+                    if let Err(e) = self.process_binance_position(binance_pos, current_price).await
+                    {
+                        error!(symbol = %symbol, error = %e, "Error processing position");
+                        first_error.get_or_insert(e);
+                    }
+                }
+            },
+            Err(e) => {
+                error!(
+                    symbol = %symbol,
+                    error = %e,
+                    "Failed to get price, skipping stop evaluation for this tick"
+                );
+                first_error.get_or_insert(MonitorError::BinanceError(e.to_string()));
+            },
         }
 
         // Clean up positions that no longer exist
-        self.cleanup_closed_positions(symbol).await;
+        self.cleanup_closed_positions(symbol, &binance_positions).await;
 
-        Ok(())
+        match first_error {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
     /// Process a position detected from Binance.
@@ -396,11 +427,12 @@ impl PositionMonitor {
         binance_pos: FuturesPosition,
         current_price: Price,
     ) -> Result<(), MonitorError> {
-        let position_id = format!("{}:{}", binance_pos.symbol, binance_pos.side);
-
-        // EXCLUSION FILTER: Check if Core Trading is managing this position
+        // Parse the symbol first: the tracking key must be built from the
+        // canonical pair, never from the raw exchange payload.
         let symbol = Symbol::from_pair(&binance_pos.symbol)
             .map_err(|_| MonitorError::InvalidSymbol(binance_pos.symbol.clone()))?;
+
+        let position_id = Self::position_key(&symbol.as_pair(), binance_pos.side);
 
         if self.is_core_managed(&symbol, binance_pos.side).await? {
             info!(
@@ -860,7 +892,7 @@ impl PositionMonitor {
                 );
 
                 // Remove from tracked positions
-                let position_id = format!("{}:{}", position.symbol, position.side);
+                let position_id = Self::position_key(&position.symbol, position.side);
                 let mut tracked = self.tracked_positions.write().await;
                 tracked.remove(&position_id);
 
@@ -892,41 +924,72 @@ impl PositionMonitor {
     }
 
     /// Clean up positions that are no longer open on Binance.
-    async fn cleanup_closed_positions(&self, symbol: &str) {
-        // Get all positions for this symbol
-        let binance_positions = match self.binance_client.get_open_positions(symbol).await {
-            Ok(p) => p,
-            Err(e) => {
-                error!(symbol = %symbol, error = %e, "Failed to get positions for cleanup");
-                return;
-            },
-        };
-
+    ///
+    /// Takes the position list already fetched by the caller: re-fetching here
+    /// would both double the API cost of a tick and open a window where a
+    /// position opened between the two calls is treated as closed.
+    async fn cleanup_closed_positions(&self, symbol: &str, binance_positions: &[FuturesPosition]) {
         // Build set of active position IDs
-        let active_ids: std::collections::HashSet<String> =
-            binance_positions.iter().map(|p| format!("{}:{}", p.symbol, p.side)).collect();
+        let active_ids: HashSet<String> = binance_positions
+            .iter()
+            .map(|p| Self::position_key(&p.symbol, p.side))
+            .collect();
 
         // Remove closed positions
-        let mut tracked = self.tracked_positions.write().await;
-        let mut to_remove = Vec::new();
+        let to_remove: Vec<String> = {
+            let mut tracked = self.tracked_positions.write().await;
+            let closed: Vec<String> = tracked
+                .iter()
+                .filter(|(position_id, position)| {
+                    position.symbol.as_pair().eq_ignore_ascii_case(symbol)
+                        && !active_ids.contains(position_id.as_str())
+                })
+                .map(|(position_id, _)| position_id.clone())
+                .collect();
 
-        for (position_id, position) in tracked.iter() {
-            if position.symbol.as_pair() == symbol && !active_ids.contains(position_id) {
-                to_remove.push(position_id.clone());
-
+            for id in &closed {
                 info!(
                     symbol = %symbol,
-                    %position_id,
+                    position_id = %id,
                     "Position closed externally, removing from tracking"
                 );
+                tracked.remove(id);
+            }
+            closed
+        };
+
+        if to_remove.is_empty() {
+            return;
+        }
+
+        {
+            let mut attempts = self.execution_attempts.write().await;
+            for id in &to_remove {
+                attempts.remove(id);
             }
         }
 
-        for id in to_remove {
-            tracked.remove(&id);
-            // Also remove from execution attempts
-            let mut attempts = self.execution_attempts.write().await;
-            attempts.remove(&id);
+        // Persist the closure. Dropping the position from memory alone leaves
+        // the row `is_active = TRUE`, so the next startup reloads it and the
+        // ghost comes back forever.
+        if let Some(repo) = &self.repository {
+            let closed_at = Utc::now();
+            for id in &to_remove {
+                if let Err(e) = repo.mark_closed(id, closed_at).await {
+                    warn!(
+                        position_id = %id,
+                        error = %e,
+                        "Failed to mark externally closed position as closed in database"
+                    );
+                }
+                if let Err(e) = repo.clear_execution_attempts(id).await {
+                    warn!(
+                        position_id = %id,
+                        error = %e,
+                        "Failed to clear execution attempts in database"
+                    );
+                }
+            }
         }
     }
 
@@ -1001,6 +1064,7 @@ pub type DaemonResult<T> = Result<T, MonitorError>;
 
 #[cfg(test)]
 mod tests {
+    use robson_store::MemoryDetectedPositionRepository;
     use rust_decimal_macros::dec;
 
     use super::*;
@@ -1014,6 +1078,138 @@ mod tests {
             execution_cooldown_secs: 60,
             price_validation_tolerance_pct: dec!(0.1),
         }
+    }
+
+    fn ghost_position() -> DetectedPosition {
+        let mut pos = DetectedPosition::new(
+            "BTCUSDT:long".to_string(),
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            Side::Long,
+            Price::new(dec!(81328.30)).unwrap(),
+            Quantity::new(dec!(0.086)).unwrap(),
+        );
+        pos.calculate_safety_stop();
+        pos
+    }
+
+    fn futures_position(symbol: &str, side: Side, entry: Decimal) -> FuturesPosition {
+        FuturesPosition {
+            symbol: symbol.to_string(),
+            side,
+            quantity: Quantity::new(dec!(0.086)).unwrap(),
+            entry_price: Price::new(entry).unwrap(),
+            unrealized_pnl: dec!(0),
+            leverage: 10,
+        }
+    }
+
+    /// The tracking key must be byte-identical to the id the repository
+    /// persists. When they diverge, every repository call keyed by the id is a
+    /// silent no-op and detected positions stay `is_active = TRUE` forever.
+    #[test]
+    fn test_position_key_matches_persisted_position_id() {
+        assert_eq!(PositionMonitor::position_key("BTCUSDT", Side::Long), "BTCUSDT:long");
+        assert_eq!(PositionMonitor::position_key("BTCUSDT", Side::Short), "BTCUSDT:short");
+
+        // Raw exchange payloads must normalise to the same key.
+        assert_eq!(PositionMonitor::position_key("btcusdt", Side::Long), "BTCUSDT:long");
+
+        // Side's Display impl is uppercase; building the key from it is the
+        // defect this test guards against.
+        assert_ne!(
+            format!("{}:{}", "BTCUSDT", Side::Long),
+            PositionMonitor::position_key("BTCUSDT", Side::Long)
+        );
+
+        let pos = ghost_position();
+        assert_eq!(
+            robson_store::DetectedPositionDto::from_domain(&pos).position_id,
+            PositionMonitor::position_key(&pos.symbol.as_pair(), pos.side),
+        );
+    }
+
+    /// Regression: a row reloaded at startup and the same position seen live
+    /// must land on one entry, not two.
+    #[tokio::test]
+    async fn test_persisted_position_reloads_under_live_detection_key() {
+        let repo = Arc::new(MemoryDetectedPositionRepository::new());
+        repo.save(&ghost_position()).await.unwrap();
+
+        let monitor = PositionMonitor::with_repository(
+            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
+            Arc::new(EventBus::new(100)),
+            create_test_config(),
+            repo.clone(),
+        );
+
+        monitor.load_persisted_positions().await.unwrap();
+        assert_eq!(monitor.get_tracked_positions().await.len(), 1);
+
+        // Live detection of the same (symbol, side), price well above the stop.
+        monitor
+            .process_binance_position(
+                futures_position("BTCUSDT", Side::Long, dec!(81328.30)),
+                Price::new(dec!(81000)).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            monitor.get_tracked_positions().await.len(),
+            1,
+            "startup-loaded and live-detected keys must agree, otherwise the same position is tracked twice"
+        );
+    }
+
+    /// Regression: cleanup must persist the closure. Removing the position from
+    /// memory alone leaves `is_active = TRUE`, so the next startup reloads the
+    /// ghost and it survives indefinitely.
+    #[tokio::test]
+    async fn test_cleanup_marks_externally_closed_position_closed_in_repository() {
+        let repo = Arc::new(MemoryDetectedPositionRepository::new());
+        repo.save(&ghost_position()).await.unwrap();
+
+        let monitor = PositionMonitor::with_repository(
+            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
+            Arc::new(EventBus::new(100)),
+            create_test_config(),
+            repo.clone(),
+        );
+        monitor.load_persisted_positions().await.unwrap();
+
+        // Binance reports no open positions for the symbol.
+        monitor.cleanup_closed_positions("BTCUSDT", &[]).await;
+
+        assert!(monitor.get_tracked_positions().await.is_empty());
+        assert!(
+            repo.find_active().await.unwrap().is_empty(),
+            "externally closed position must be marked closed, otherwise it reloads on restart"
+        );
+    }
+
+    /// Cleanup must not drop a position that is still open on the exchange.
+    #[tokio::test]
+    async fn test_cleanup_keeps_positions_still_open_on_exchange() {
+        let repo = Arc::new(MemoryDetectedPositionRepository::new());
+        repo.save(&ghost_position()).await.unwrap();
+
+        let monitor = PositionMonitor::with_repository(
+            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
+            Arc::new(EventBus::new(100)),
+            create_test_config(),
+            repo.clone(),
+        );
+        monitor.load_persisted_positions().await.unwrap();
+
+        monitor
+            .cleanup_closed_positions(
+                "BTCUSDT",
+                &[futures_position("BTCUSDT", Side::Long, dec!(81328.30))],
+            )
+            .await;
+
+        assert_eq!(monitor.get_tracked_positions().await.len(), 1);
+        assert_eq!(repo.find_active().await.unwrap().len(), 1);
     }
 
     #[tokio::test]

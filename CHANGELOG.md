@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed - Safety Net ghost positions: tracking key vs persisted id (ADR-0039, 2026-08-18)
+
+- `position_monitor` built its `tracked_positions` key three different ways.
+  `load_persisted_positions` used `"{SYMBOL}:long"`, while live detection and
+  cleanup used `Side`'s `Display` impl and produced `"{SYMBOL}:LONG"`. Rows
+  reloaded at startup were therefore invisible to live detection (same position
+  tracked twice, or never re-verified), and every repository call keyed by that
+  id — `mark_closed`, `clear_execution_attempts`, `update_execution_attempt` —
+  matched zero rows against the lowercase `detected_positions.position_id`
+  written by `DetectedPositionDto::from_domain`. All three call sites now go
+  through `PositionMonitor::position_key`, the single canonical form.
+- `cleanup_closed_positions` only dropped positions from memory and never
+  persisted the closure, so `is_active` stayed `TRUE` and the row was reloaded
+  on every restart. It now calls `mark_closed` + `clear_execution_attempts`.
+  It also consumes the position list the caller already fetched instead of
+  re-querying Binance, which removes a duplicate API call per tick and the
+  window in which a position opened between the two calls looked closed.
+- `check_symbol` no longer aborts the tick on the first per-position error. A
+  failed `get_price` or a failed position evaluation is logged and reported,
+  but cleanup still runs; only a failed `get_open_positions` skips cleanup,
+  since without an authoritative position list "closed" and "exchange
+  unreachable" are indistinguishable.
+- `GET /safety/status` now reports `id` in the canonical form
+  (`BTCUSDT:long`), identical to `detected_positions.position_id`, so a
+  tracked position can be traced straight to its row.
+
 ### Added - Typed income-ledger reconciliation (ADR-0045 §1, 2026-07-07)
 
 - New `IncomePort` trait ingests Binance's typed income stream
