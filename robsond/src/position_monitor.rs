@@ -227,14 +227,10 @@ impl PositionMonitor {
     /// `clear_execution_attempts`, `update_execution_attempt`) match zero rows,
     /// leaving ghost positions `is_active = TRUE` forever. See ADR-0039.
     pub fn position_key(symbol: &str, side: Side) -> String {
-        format!(
-            "{}:{}",
-            symbol.to_uppercase(),
-            match side {
-                Side::Long => "long",
-                Side::Short => "short",
-            }
-        )
+        format!("{}:{}", symbol.to_uppercase(), match side {
+            Side::Long => "long",
+            Side::Short => "short",
+        })
     }
 
     async fn is_core_excluded_in_memory(&self, symbol: &Symbol, side: Side) -> bool {
@@ -1202,10 +1198,11 @@ mod tests {
         monitor.load_persisted_positions().await.unwrap();
 
         monitor
-            .cleanup_closed_positions(
+            .cleanup_closed_positions("BTCUSDT", &[futures_position(
                 "BTCUSDT",
-                &[futures_position("BTCUSDT", Side::Long, dec!(81328.30))],
-            )
+                Side::Long,
+                dec!(81328.30),
+            )])
             .await;
 
         assert_eq!(monitor.get_tracked_positions().await.len(), 1);
