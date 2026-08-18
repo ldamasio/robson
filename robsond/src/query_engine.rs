@@ -134,6 +134,19 @@ fn trace_query_transition(query: &ExecutionQuery, transition_cause: &str) {
                 "query state transition"
             );
         },
+        _ if is_routine_market_tick_transition(query) => {
+            tracing::debug!(
+                query_id = %query.id,
+                kind = ?query.kind,
+                state = %query.state.label(),
+                actor = ?query.actor,
+                position_id = ?query.position_id,
+                active_positions_count = ?query.context_summary.as_ref().map(|c| c.active_positions_count),
+                duration_ms = ?duration_ms,
+                transition_cause = %transition_cause,
+                "query state transition"
+            );
+        },
         _ => {
             tracing::info!(
                 query_id = %query.id,
@@ -148,6 +161,29 @@ fn trace_query_transition(query: &ExecutionQuery, transition_cause: &str) {
             );
         },
     }
+}
+
+/// Whether a transition is routine market-tick telemetry rather than an
+/// operator-relevant event.
+///
+/// `ProcessMarketTick` queries run for every active position on every market
+/// tick and emit four transitions each (Accepted, Processing, Acting,
+/// Completed). In production that is roughly 44 log lines per second, which
+/// drowns every other line: the pod log buffer covers about four minutes, so
+/// trailing-stop moves and safety-net activity scroll out of reach before
+/// anyone can read them. ADR-0049 already removed these transitions from the
+/// durable event log for the same reason (13 GB by 2026-07); this keeps them
+/// off the default log stream too.
+///
+/// They stay available at `debug`. Governed or abnormal outcomes (Denied /
+/// Failed / Expired) are never routine and keep their original level, as do
+/// all other query kinds (signals, arm/disarm, closes, funding).
+pub(crate) fn is_routine_market_tick_transition(query: &ExecutionQuery) -> bool {
+    matches!(query.kind, QueryKind::ProcessMarketTick { .. })
+        && !matches!(
+            query.state,
+            QueryState::Denied { .. } | QueryState::Failed { .. } | QueryState::Expired
+        )
 }
 
 #[cfg(feature = "postgres")]
@@ -774,6 +810,61 @@ mod tests {
                 "market-tick {} must be event-sourced",
                 query.state.label()
             );
+        }
+    }
+
+    #[test]
+    fn test_market_tick_happy_path_transitions_are_routine_telemetry() {
+        let mut query = create_market_tick_query();
+        for state in [
+            QueryState::Accepted,
+            QueryState::Processing,
+            QueryState::RiskChecked,
+            QueryState::Acting,
+            QueryState::Completed,
+        ] {
+            query.state = state;
+            assert!(
+                is_routine_market_tick_transition(&query),
+                "market-tick {} must stay off the default log stream",
+                query.state.label()
+            );
+        }
+    }
+
+    #[test]
+    fn test_market_tick_governed_outcomes_are_never_routine() {
+        let mut query = create_market_tick_query();
+        for state in [
+            QueryState::Denied {
+                reason: "budget".to_string(),
+                check: "monthly_budget".to_string(),
+            },
+            QueryState::Failed {
+                reason: "exchange timeout".to_string(),
+                phase: "act".to_string(),
+            },
+            QueryState::Expired,
+        ] {
+            query.state = state;
+            assert!(
+                !is_routine_market_tick_transition(&query),
+                "market-tick {} must stay visible at info or above",
+                query.state.label()
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_tick_queries_are_never_routine() {
+        let mut query = create_test_query();
+        for state in [
+            QueryState::Accepted,
+            QueryState::Completed,
+            QueryState::Expired,
+        ] {
+            query.state = state;
+            assert!(!is_routine_market_tick_transition(&query));
         }
     }
 
