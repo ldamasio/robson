@@ -22,12 +22,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   insurance stop was actually protecting open positions. The timer is now a
   `tokio::time::Interval` created outside the loop, which owns its schedule
   across iterations.
-- The interval uses `MissedTickBehavior::Delay` rather than the default
-  `Burst`, which would fire missed ticks back-to-back to catch up after a slow
-  cycle — the wrong behaviour against a rate-limited exchange API.
-- New `PositionMonitor::poll_count()`. A Safety Net that silently stops polling
-  is indistinguishable from the outside from one with nothing to report: both
-  produce no logs and no events. This is what let the defect above go unnoticed.
+- The gap between cycles is enforced by `Interval::reset()` after each sweep.
+  `MissedTickBehavior::Delay` alone does not provide it: after an overrun the
+  already-missed tick resolves immediately and only the tick *after* it is
+  rescheduled, so a sweep that persistently overruns its period runs
+  back-to-back with no gap — the opposite of what a rate-limited exchange API
+  wants. `reset()` recomputes the deadline from the moment the sweep finished.
+- A zero poll interval is now rejected by `load_position_monitor_config`, with
+  a fallback guard at the call site. `tokio::time::interval` panics on a zero
+  period, and that panic would be invisible: the daemon does not observe the
+  monitor's `JoinHandle` until shutdown, so the API would keep reporting
+  `enabled: true` over a dead monitor. (`sleep(Duration::ZERO)` did not panic,
+  so this is new exposure introduced by the interval.)
+- New `robsond_safety_net_polls_total` counter, plus
+  `PositionMonitor::poll_count()`. A Safety Net that silently stops polling is
+  indistinguishable from the outside from one with nothing to report: both
+  produce no logs and no events, which is what let the defect above go
+  unnoticed for 36h. `increase(robsond_safety_net_polls_total[5m]) == 0` on a
+  daemon reporting `enabled: true` now means the net is not running.
 
 ### Added - Typed income-ledger reconciliation (ADR-0045 §1, 2026-07-07)
 
