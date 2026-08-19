@@ -669,6 +669,16 @@ impl Config {
             ))
         })?;
 
+        // Zero is not a fast poll, it is a dead monitor: `tokio::time::interval`
+        // panics on a zero period, and the panic would be confined to the
+        // monitor's task while the daemon and API stay up reporting
+        // `enabled: true`. Reject it here, as the reconciliation interval does.
+        if poll_interval_secs == 0 {
+            return Err(DaemonError::Config(
+                "ROBSON_POSITION_MONITOR_POLL_INTERVAL must be greater than zero".to_string(),
+            ));
+        }
+
         // Symbols to monitor
         let symbols_str = env::var("ROBSON_POSITION_MONITOR_SYMBOLS").unwrap_or_default();
         let symbols: Vec<String> = symbols_str
@@ -960,6 +970,25 @@ mod tests {
             err,
             DaemonError::Config(message)
                 if message.contains("credential-free wss:// base URLs")
+        ));
+    }
+
+    #[test]
+    fn test_load_position_monitor_config_rejects_zero_poll_interval() {
+        // Zero is not a fast poll, it is a dead monitor: `tokio::time::interval`
+        // panics on a zero period, inside a task nobody observes until shutdown.
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_POSITION_MONITOR_ENABLED", Some("true")),
+            ("ROBSON_POSITION_MONITOR_SYMBOLS", Some("BTCUSDT")),
+            ("ROBSON_POSITION_MONITOR_POLL_INTERVAL", Some("0")),
+        ]);
+
+        let err = Config::load_position_monitor_config().unwrap_err();
+        assert!(matches!(
+            err,
+            DaemonError::Config(message)
+                if message == "ROBSON_POSITION_MONITOR_POLL_INTERVAL must be greater than zero"
         ));
     }
 

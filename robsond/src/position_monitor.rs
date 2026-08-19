@@ -154,6 +154,9 @@ pub struct PositionMonitor {
     poll_count: AtomicU64,
 }
 
+/// Fallback poll period when the configured value is unusable.
+const DEFAULT_POLL_INTERVAL_SECS: u64 = 20;
+
 impl PositionMonitor {
     /// Create a new position monitor.
     pub fn new(
@@ -331,19 +334,37 @@ impl PositionMonitor {
             // zero times in 36h of uptime in production. An `Interval` owns its
             // schedule across iterations and is immune to this.
             //
-            // `Delay` rather than the default `Burst`: if a poll cycle overruns
-            // the period, `Burst` fires the missed ticks back-to-back to catch
-            // up, which against a rate-limited exchange API is precisely wrong.
-            // `Delay` guarantees a full period between the end of one cycle and
-            // the start of the next.
+            // The gap between cycles is enforced by `reset()` after each sweep,
+            // not by `MissedTickBehavior`. `Delay` alone does NOT guarantee a
+            // full period after an overrun: the already-missed tick resolves
+            // immediately and only the tick *after* it is rescheduled, so a
+            // sweep that persistently overruns the period runs back-to-back
+            // with no gap at all — the opposite of what a rate-limited exchange
+            // API wants. `reset()` recomputes the deadline from the moment the
+            // sweep finished, which is the actual guarantee. `Delay` is kept as
+            // defence in depth for a tick missed outside that window.
             //
             // The first tick resolves immediately, so the first poll happens at
             // startup rather than one period later. That is deliberate:
             // `load_persisted_positions` has already run by the time `start()`
             // is called, so the reloaded set is reconciled against the exchange
             // straight away instead of being trusted blindly for 20s.
-            let mut poll =
-                tokio::time::interval(Duration::from_secs(self.config.poll_interval_secs));
+            // Never panic and never hot-loop, whatever the config says. A zero
+            // period panics `interval()`, and that panic would be invisible:
+            // the daemon does not observe this task's JoinHandle until
+            // shutdown, so the API would keep reporting `enabled: true` over a
+            // dead monitor. Config validation rejects zero; this is the
+            // backstop for a caller building the config directly.
+            let poll_interval_secs = if self.config.poll_interval_secs == 0 {
+                error!(
+                    fallback_secs = DEFAULT_POLL_INTERVAL_SECS,
+                    "Position monitor poll interval is zero, using fallback"
+                );
+                DEFAULT_POLL_INTERVAL_SECS
+            } else {
+                self.config.poll_interval_secs
+            };
+            let mut poll = tokio::time::interval(Duration::from_secs(poll_interval_secs));
             poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
 
             loop {
@@ -380,9 +401,14 @@ impl PositionMonitor {
                     }
                     _ = poll.tick() => {
                         self.poll_count.fetch_add(1, Ordering::Relaxed);
+                        crate::metrics::SAFETY_NET_POLLS.inc();
                         if let Err(e) = self.check_positions().await {
                             error!(error = %e, "Error checking positions");
                         }
+                        // Recompute the deadline from the end of the sweep, so
+                        // the next poll starts a full period after this one
+                        // finished rather than after it began.
+                        poll.reset();
                     }
                 }
             }
