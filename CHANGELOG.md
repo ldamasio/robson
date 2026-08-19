@@ -59,6 +59,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   string, so the symbol half is `Symbol::as_pair()` — byte-identical to what the
   DTO persists. Normalising a raw exchange string with `to_uppercase` would have
   reintroduced the same class of divergence one layer down.
+- Core ownership is now three-valued (`CoreOwnership::Owned` / `NotOwned` /
+  `Unknown`) instead of a boolean. The old `is_core_managed` returned `true`
+  both for "Core owns this" and for "the lookup failed", which was harmless
+  while the caller only skipped, but not once a confirmed owner triggers a
+  release: a transient database error would have marked a rogue position
+  `is_active = FALSE` and dropped its retry state. `Unknown` now skips the tick
+  inertly and touches no state.
 
 ### Added - Typed income-ledger reconciliation (ADR-0045 §1, 2026-07-07)
 

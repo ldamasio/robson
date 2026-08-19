@@ -161,6 +161,24 @@ pub struct PositionMonitor {
     pending_closures: RwLock<HashSet<String>>,
 }
 
+/// Whether Core Trading owns a given (symbol, side).
+///
+/// `Unknown` exists because the two failure-safe behaviours are not the same.
+/// Skipping a tick is inert and safe under uncertainty; *releasing* the
+/// position writes `is_active = FALSE` to the database and drops the retry
+/// state. Collapsing "Core owns it" and "the lookup failed" into one boolean
+/// makes a transient database error perform a durable write against a rogue
+/// position the Safety Net was protecting.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CoreOwnership {
+    /// Confirmed: Core holds an active position for this key.
+    Owned,
+    /// Confirmed: Core holds nothing for this key.
+    NotOwned,
+    /// The check could not be completed. Not evidence of ownership.
+    Unknown,
+}
+
 impl PositionMonitor {
     /// Create a new position monitor.
     pub fn new(
@@ -293,36 +311,38 @@ impl PositionMonitor {
         Ok(())
     }
 
-    /// Check if a position is managed by Core Trading.
+    /// Check whether a position is managed by Core Trading.
     ///
-    /// Returns true if there's an active Core position for this (symbol, side).
-    /// Used by Safety Net to exclude Core-managed positions from monitoring.
-    async fn is_core_managed(&self, symbol: &Symbol, side: Side) -> Result<bool, MonitorError> {
-        if let Some(repo) = &self.core_position_repo {
-            match repo.find_active_by_symbol_and_side(symbol, side).await {
-                Ok(Some(_)) => {
-                    debug!(
-                        symbol = %symbol.as_pair(),
-                        ?side,
-                        "Position is Core-managed, Safety Net will skip"
-                    );
-                    Ok(true)
-                },
-                Ok(None) => Ok(false),
-                Err(e) => {
-                    // Fail-safe: On error, skip monitoring (don't risk double execution)
-                    warn!(
-                        symbol = %symbol.as_pair(),
-                        ?side,
-                        error = %e,
-                        "Error checking Core positions, failing safe (skipping monitoring)"
-                    );
-                    Ok(true) // Err on the side of caution
-                },
-            }
-        } else {
+    /// Used by the Safety Net to exclude Core-managed positions from
+    /// monitoring, and — only on a confirmed `Owned` — to release any Safety
+    /// Net state held under the same canonical key.
+    async fn core_ownership(&self, symbol: &Symbol, side: Side) -> CoreOwnership {
+        let Some(repo) = &self.core_position_repo else {
             // No core repo configured, Safety Net monitors everything
-            Ok(false)
+            return CoreOwnership::NotOwned;
+        };
+
+        match repo.find_active_by_symbol_and_side(symbol, side).await {
+            Ok(Some(_)) => {
+                debug!(
+                    symbol = %symbol.as_pair(),
+                    ?side,
+                    "Position is Core-managed, Safety Net will skip"
+                );
+                CoreOwnership::Owned
+            },
+            Ok(None) => CoreOwnership::NotOwned,
+            Err(e) => {
+                // Fail-safe: on error, skip monitoring (don't risk double
+                // execution) — but do not treat the failure as ownership.
+                warn!(
+                    symbol = %symbol.as_pair(),
+                    ?side,
+                    error = %e,
+                    "Error checking Core positions, failing safe (skipping monitoring)"
+                );
+                CoreOwnership::Unknown
+            },
         }
     }
 
@@ -464,14 +484,28 @@ impl PositionMonitor {
         // ghost survives for months. Ownership is exclusive (ADR-0022): a
         // Core-managed position is not a rogue position, so the Safety Net must
         // hold no state for it.
-        if self.is_core_managed(&symbol, binance_pos.side).await? {
-            info!(
-                symbol = %binance_pos.symbol,
-                ?binance_pos.side,
-                "Safety Net: Skipping position (Core-managed)"
-            );
-            self.release_position(&position_id, "core-managed").await;
-            return Ok(());
+        match self.core_ownership(&symbol, binance_pos.side).await {
+            CoreOwnership::Owned => {
+                info!(
+                    symbol = %binance_pos.symbol,
+                    ?binance_pos.side,
+                    "Safety Net: Skipping position (Core-managed)"
+                );
+                self.release_position(&position_id, "core-managed").await;
+                return Ok(());
+            },
+            CoreOwnership::Unknown => {
+                // Skip this tick without touching tracked state. Releasing here
+                // would mark a rogue position closed on the strength of a
+                // failed lookup.
+                warn!(
+                    symbol = %binance_pos.symbol,
+                    ?binance_pos.side,
+                    "Safety Net: Core ownership unknown, skipping tick without releasing"
+                );
+                return Ok(());
+            },
+            CoreOwnership::NotOwned => {},
         }
         if self.is_core_excluded_in_memory(&symbol, binance_pos.side).await {
             info!(
@@ -1272,6 +1306,75 @@ mod tests {
         }
     }
 
+    /// Core position repository whose ownership lookup always fails.
+    struct FailingCoreRepo;
+
+    #[async_trait::async_trait]
+    impl robson_store::PositionRepository for FailingCoreRepo {
+        async fn save(
+            &self,
+            _position: &robson_domain::Position,
+        ) -> Result<(), robson_store::StoreError> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn find_by_id(
+            &self,
+            _id: robson_domain::PositionId,
+        ) -> Result<Option<robson_domain::Position>, robson_store::StoreError> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn find_by_account(
+            &self,
+            _account_id: uuid::Uuid,
+        ) -> Result<Vec<robson_domain::Position>, robson_store::StoreError> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn find_active(
+            &self,
+        ) -> Result<Vec<robson_domain::Position>, robson_store::StoreError> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn find_by_state(
+            &self,
+            _state: &str,
+        ) -> Result<Vec<robson_domain::Position>, robson_store::StoreError> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn find_active_by_symbol_and_side(
+            &self,
+            _symbol: &Symbol,
+            _side: Side,
+        ) -> Result<Option<robson_domain::Position>, robson_store::StoreError> {
+            Err(robson_store::StoreError::Deserialization("injected failure".to_string()))
+        }
+
+        async fn delete(
+            &self,
+            _id: robson_domain::PositionId,
+        ) -> Result<(), robson_store::StoreError> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn find_closed_in_month(
+            &self,
+            _year: i32,
+            _month: u32,
+        ) -> Result<Vec<robson_domain::Position>, robson_store::StoreError> {
+            unimplemented!("not used by these tests")
+        }
+
+        async fn find_all_closed(
+            &self,
+        ) -> Result<Vec<robson_domain::Position>, robson_store::StoreError> {
+            unimplemented!("not used by these tests")
+        }
+    }
+
     /// Repository whose first `n` `mark_closed` calls fail, counting how often
     /// `clear_execution_attempts` was reached.
     struct FlakyRepo {
@@ -1446,6 +1549,44 @@ mod tests {
         assert!(
             repo.find_active().await.unwrap().is_empty(),
             "released row must be marked closed, otherwise it reloads on restart"
+        );
+    }
+
+    /// Regression: a failed Core-ownership lookup must not be read as
+    /// ownership. `Unknown` skips the tick inertly; treating it as `Owned`
+    /// would mark a rogue position closed in the database — a durable write
+    /// on the strength of a transient error.
+    #[tokio::test]
+    async fn test_unknown_core_ownership_does_not_release_position() {
+        let repo = Arc::new(MemoryDetectedPositionRepository::new());
+        repo.save(&ghost_position()).await.unwrap();
+
+        let monitor = PositionMonitor::with_core_exclusion(
+            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
+            Arc::new(EventBus::new(100)),
+            create_test_config(),
+            repo.clone(),
+            Arc::new(FailingCoreRepo),
+        );
+        monitor.load_persisted_positions().await.unwrap();
+
+        monitor
+            .process_binance_position(
+                futures_position("BTCUSDT", Side::Long, dec!(81328.30)),
+                Price::new(dec!(81000)).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            monitor.get_tracked_positions().await.len(),
+            1,
+            "a failed ownership lookup must not drop the position from tracking"
+        );
+        assert_eq!(
+            repo.find_active().await.unwrap().len(),
+            1,
+            "a failed ownership lookup must not mark the row closed"
         );
     }
 
