@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed - Safety Net poll starved by the event bus (ADR-0039, 2026-08-19)
+
+- `PositionMonitor::start` created its poll timer as a `sleep(...)` *inside*
+  `tokio::select!`. The macro re-evaluates each branch expression on every
+  iteration, so the sleep was a new future each time round the loop: any other
+  branch completing first dropped the pending sleep and restarted the countdown
+  from zero. The monitor subscribes to the whole event bus, where
+  `DaemonEvent::MarketData` arrives several times per second, so the 20s
+  deadline was reset roughly every 90ms and never elapsed.
+  Production impact: the Safety Net polled **zero times in 36h of uptime** —
+  no rogue-position detection, no stop evaluation, no reconciliation of closed
+  positions. ADR-0039's software net was inert; only the exchange-side
+  insurance stop was actually protecting open positions. The timer is now a
+  `tokio::time::Interval` created outside the loop, which owns its schedule
+  across iterations.
+- The interval uses `MissedTickBehavior::Delay` rather than the default
+  `Burst`, which would fire missed ticks back-to-back to catch up after a slow
+  cycle — the wrong behaviour against a rate-limited exchange API.
+- New `PositionMonitor::poll_count()`. A Safety Net that silently stops polling
+  is indistinguishable from the outside from one with nothing to report: both
+  produce no logs and no events. This is what let the defect above go unnoticed.
+
 ### Added - Typed income-ledger reconciliation (ADR-0045 §1, 2026-07-07)
 
 - New `IncomePort` trait ingests Binance's typed income stream
