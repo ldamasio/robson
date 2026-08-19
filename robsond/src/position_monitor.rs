@@ -408,6 +408,12 @@ impl PositionMonitor {
                         // Recompute the deadline from the end of the sweep, so
                         // the next poll starts a full period after this one
                         // finished rather than after it began.
+                        //
+                        // This also applies to a sweep that failed fast: the
+                        // next attempt waits a full period rather than
+                        // retrying immediately. That is intended — an exchange
+                        // that is erroring is the last thing to hammer — so
+                        // resist "optimising" this into a shorter retry.
                         poll.reset();
                     }
                 }
@@ -1007,6 +1013,14 @@ impl PositionMonitor {
     ///
     /// Zero on a running monitor means the poll is not executing at all, which
     /// is not the same as having nothing to report.
+    ///
+    /// This deliberately duplicates `metrics::SAFETY_NET_POLLS`, and the two
+    /// are not interchangeable. The Prometheus counter is process-global and is
+    /// the operational signal; this one is per-instance and exists so tests can
+    /// assert about *their* monitor. A test reading the global counter would be
+    /// coupled to every other test that starts a monitor in the same process,
+    /// which `cargo test` runs in parallel. Both are incremented on adjacent
+    /// lines of the same branch so they cannot drift.
     pub fn poll_count(&self) -> u64 {
         self.poll_count.load(Ordering::Relaxed)
     }
