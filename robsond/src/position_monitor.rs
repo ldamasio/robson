@@ -45,6 +45,15 @@ pub struct PositionMonitorConfig {
     pub execution_cooldown_secs: u64,
     /// Tolerance for price validation (0.1% = avoids flickering)
     pub price_validation_tolerance_pct: Decimal,
+    /// Relative tolerance when matching a tracked position's quantity against
+    /// the live exchange quantity (0.5% = 0.005).
+    ///
+    /// Required by invariant I3 of
+    /// `docs/policies/UNTRACKED-POSITION-RECONCILIATION.md`: a local position
+    /// matches an exchange position by `(symbol, side)` *and* quantity within
+    /// tolerance. Beyond it the two are not the same position and the tracked
+    /// state must not be reused.
+    pub quantity_tolerance_pct: Decimal,
 }
 
 impl Default for PositionMonitorConfig {
@@ -56,6 +65,7 @@ impl Default for PositionMonitorConfig {
             max_retry_attempts: 3,
             execution_cooldown_secs: 60, // Don't retry within 60 seconds
             price_validation_tolerance_pct: Decimal::new(1, 3), // 0.1%
+            quantity_tolerance_pct: Decimal::new(5, 3), // 0.5%
         }
     }
 }
@@ -142,6 +152,13 @@ pub struct PositionMonitor {
     core_position_repo: Option<Arc<dyn PositionRepository>>,
     /// In-memory exclusion set maintained from Core open/close events.
     core_exclusion_set: RwLock<HashSet<String>>,
+    /// Closures whose database write failed, retried on later ticks.
+    ///
+    /// Without this, a transient `mark_closed` failure is unrecoverable: the
+    /// position is already out of `tracked_positions`, so no later tick can
+    /// rediscover that the row still needs closing, and the ghost returns on
+    /// the next restart.
+    pending_closures: RwLock<HashSet<String>>,
 }
 
 impl PositionMonitor {
@@ -163,6 +180,7 @@ impl PositionMonitor {
             repository: None,
             core_position_repo: None,
             core_exclusion_set: RwLock::new(HashSet::new()),
+            pending_closures: RwLock::new(HashSet::new()),
         }
     }
 
@@ -185,6 +203,7 @@ impl PositionMonitor {
             repository: Some(repository),
             core_position_repo: None,
             core_exclusion_set: RwLock::new(HashSet::new()),
+            pending_closures: RwLock::new(HashSet::new()),
         }
     }
 
@@ -211,11 +230,12 @@ impl PositionMonitor {
             repository: Some(repository),
             core_position_repo: Some(core_position_repo),
             core_exclusion_set: RwLock::new(HashSet::new()),
+            pending_closures: RwLock::new(HashSet::new()),
         }
     }
 
-    /// Canonical identity of a detected position: `"{SYMBOL}:{side}"`, with the
-    /// symbol upper-cased and the side lower-cased (e.g. `"BTCUSDT:long"`).
+    /// Canonical identity of a detected position: `"{SYMBOL}:{side}"`, e.g.
+    /// `"BTCUSDT:long"`.
     ///
     /// This is the single source of truth for three things that MUST agree:
     /// the in-memory `tracked_positions` key, the `core_exclusion_set` key, and
@@ -226,25 +246,30 @@ impl PositionMonitor {
     /// every repository call keyed by the id (`mark_closed`,
     /// `clear_execution_attempts`, `update_execution_attempt`) match zero rows,
     /// leaving ghost positions `is_active = TRUE` forever. See ADR-0039.
-    pub fn position_key(symbol: &str, side: Side) -> String {
-        format!("{}:{}", symbol.to_uppercase(), match side {
+    ///
+    /// It takes a parsed `Symbol` rather than a raw string on purpose: the
+    /// symbol half is `Symbol::as_pair()`, byte-identical to what the DTO
+    /// persists. Normalising a raw exchange string here instead (upper-casing,
+    /// trimming) would reintroduce the same class of divergence one layer down.
+    pub fn position_key(symbol: &Symbol, side: Side) -> String {
+        format!("{}:{}", symbol.as_pair(), match side {
             Side::Long => "long",
             Side::Short => "short",
         })
     }
 
     async fn is_core_excluded_in_memory(&self, symbol: &Symbol, side: Side) -> bool {
-        let key = Self::position_key(&symbol.as_pair(), side);
+        let key = Self::position_key(symbol, side);
         self.core_exclusion_set.read().await.contains(&key)
     }
 
     async fn add_core_exclusion(&self, symbol: &Symbol, side: Side) {
-        let key = Self::position_key(&symbol.as_pair(), side);
+        let key = Self::position_key(symbol, side);
         self.core_exclusion_set.write().await.insert(key);
     }
 
     async fn remove_core_exclusion(&self, symbol: &Symbol, side: Side) {
-        let key = Self::position_key(&symbol.as_pair(), side);
+        let key = Self::position_key(symbol, side);
         self.core_exclusion_set.write().await.remove(&key);
     }
 
@@ -255,7 +280,7 @@ impl PositionMonitor {
                 Ok(positions) => {
                     let mut tracked = self.tracked_positions.write().await;
                     for pos in positions {
-                        let position_id = Self::position_key(&pos.symbol.as_pair(), pos.side);
+                        let position_id = Self::position_key(&pos.symbol, pos.side);
                         tracked.insert(position_id, pos);
                     }
                     info!(count = tracked.len(), "Loaded persisted positions from database");
@@ -428,14 +453,24 @@ impl PositionMonitor {
         let symbol = Symbol::from_pair(&binance_pos.symbol)
             .map_err(|_| MonitorError::InvalidSymbol(binance_pos.symbol.clone()))?;
 
-        let position_id = Self::position_key(&symbol.as_pair(), binance_pos.side);
+        let position_id = Self::position_key(&symbol, binance_pos.side);
 
+        // EXCLUSION FILTER. Confirmed Core ownership must also *release* any
+        // Safety Net state for this key, not merely skip it. A Core position
+        // and a stale detected row share the canonical id, so a skip leaves the
+        // row tracked and `is_active = TRUE` for as long as the Core position
+        // lives — and `cleanup_closed_positions` sees the Core position in the
+        // exchange list and treats the row as still open. That is exactly how a
+        // ghost survives for months. Ownership is exclusive (ADR-0022): a
+        // Core-managed position is not a rogue position, so the Safety Net must
+        // hold no state for it.
         if self.is_core_managed(&symbol, binance_pos.side).await? {
             info!(
                 symbol = %binance_pos.symbol,
                 ?binance_pos.side,
                 "Safety Net: Skipping position (Core-managed)"
             );
+            self.release_position(&position_id, "core-managed").await;
             return Ok(());
         }
         if self.is_core_excluded_in_memory(&symbol, binance_pos.side).await {
@@ -444,13 +479,51 @@ impl PositionMonitor {
                 ?binance_pos.side,
                 "Safety Net: Skipping position (Core-managed via event cache)"
             );
+            self.release_position(&position_id, "core-managed via event cache").await;
             return Ok(());
         }
 
         let mut tracked = self.tracked_positions.write().await;
 
         if let Some(existing) = tracked.get_mut(&position_id) {
-            // Position already tracked, update and check stop
+            // Position already tracked. Before trusting any of its state,
+            // reconcile it against what the exchange reports right now: the
+            // entry may be a row reloaded at startup, describing a position
+            // that was resized, or closed and reopened, while the daemon was
+            // down. Acting on the persisted entry/quantity would fire the stop
+            // at the wrong level and submit the wrong reduce-only quantity.
+            // Invariant I3 of UNTRACKED-POSITION-RECONCILIATION.md requires the
+            // match to hold on (symbol, side) *and* quantity within tolerance.
+            if !Self::same_position(existing, &binance_pos, self.config.quantity_tolerance_pct) {
+                warn!(
+                    %position_id,
+                    tracked_entry = %existing.entry_price,
+                    live_entry = %binance_pos.entry_price,
+                    tracked_qty = %existing.quantity,
+                    live_qty = %binance_pos.quantity,
+                    "Tracked position diverges from the exchange, replacing tracked state"
+                );
+
+                let mut replacement = DetectedPosition::new(
+                    position_id.clone(),
+                    symbol.clone(),
+                    binance_pos.side,
+                    binance_pos.entry_price,
+                    binance_pos.quantity,
+                );
+                replacement.calculate_safety_stop();
+                *existing = replacement;
+
+                if let Some(repo) = &self.repository {
+                    if let Err(e) = repo.save(existing).await {
+                        warn!(error = %e, "Failed to persist replaced detected position");
+                    }
+                }
+            } else if existing.quantity != binance_pos.quantity {
+                // Within tolerance: same position, refreshed size.
+                existing.quantity = binance_pos.quantity;
+            }
+
             existing.mark_verified();
 
             // Check if stop is hit
@@ -888,7 +961,9 @@ impl PositionMonitor {
                 );
 
                 // Remove from tracked positions
-                let position_id = Self::position_key(&position.symbol, position.side);
+                let position_id = Symbol::from_pair(&position.symbol)
+                    .map(|sym| Self::position_key(&sym, position.side))
+                    .unwrap_or_default();
                 let mut tracked = self.tracked_positions.write().await;
                 tracked.remove(&position_id);
 
@@ -919,16 +994,120 @@ impl PositionMonitor {
         }
     }
 
+    /// Whether a tracked position still describes the live exchange position.
+    ///
+    /// Entry price must match exactly — a different entry means the position
+    /// was closed and reopened, or averaged into, and every derived value
+    /// (including the safety stop) is stale. Quantity is compared relatively,
+    /// within the configured tolerance, per invariant I3.
+    fn same_position(
+        tracked: &DetectedPosition,
+        live: &FuturesPosition,
+        quantity_tolerance_pct: Decimal,
+    ) -> bool {
+        if tracked.entry_price != live.entry_price {
+            return false;
+        }
+
+        let tracked_qty = tracked.quantity.as_decimal();
+        let live_qty = live.quantity.as_decimal();
+        if tracked_qty == live_qty {
+            return true;
+        }
+        if tracked_qty.is_zero() {
+            return false;
+        }
+
+        let drift = (tracked_qty - live_qty).abs() / tracked_qty.abs();
+        drift <= quantity_tolerance_pct
+    }
+
+    /// Persist a position's closure: mark the row closed, then clear its
+    /// execution attempts.
+    ///
+    /// The order matters and is not cosmetic. `clear_execution_attempts` erases
+    /// the panic/retry evidence of a row; doing that when `mark_closed` failed
+    /// leaves an *active* row stripped of the state that explains it. So the
+    /// clear only runs after a successful close, and a failed close is parked
+    /// in `pending_closures` for a later tick to retry.
+    async fn persist_closure(&self, position_id: &str) {
+        let Some(repo) = &self.repository else {
+            return;
+        };
+
+        if let Err(e) = repo.mark_closed(position_id, Utc::now()).await {
+            warn!(
+                %position_id,
+                error = %e,
+                "Failed to mark position closed in database, queued for retry"
+            );
+            self.pending_closures.write().await.insert(position_id.to_string());
+            return;
+        }
+
+        self.pending_closures.write().await.remove(position_id);
+
+        if let Err(e) = repo.clear_execution_attempts(position_id).await {
+            warn!(
+                %position_id,
+                error = %e,
+                "Failed to clear execution attempts in database"
+            );
+        }
+    }
+
+    /// Retry closures whose database write failed on an earlier tick.
+    async fn retry_pending_closures(&self) {
+        let pending: Vec<String> = {
+            let guard = self.pending_closures.read().await;
+            if guard.is_empty() {
+                return;
+            }
+            guard.iter().cloned().collect()
+        };
+
+        info!(count = pending.len(), "Retrying pending position closures");
+        for id in pending {
+            self.persist_closure(&id).await;
+        }
+    }
+
+    /// Drop a position from Safety Net tracking and persist its closure.
+    async fn release_position(&self, position_id: &str, reason: &str) {
+        let was_tracked = self.tracked_positions.write().await.remove(position_id).is_some();
+        self.execution_attempts.write().await.remove(position_id);
+
+        if !was_tracked {
+            return;
+        }
+
+        info!(%position_id, %reason, "Releasing position from Safety Net tracking");
+        self.persist_closure(position_id).await;
+    }
+
     /// Clean up positions that are no longer open on Binance.
     ///
     /// Takes the position list already fetched by the caller: re-fetching here
     /// would both double the API cost of a tick and open a window where a
     /// position opened between the two calls is treated as closed.
     async fn cleanup_closed_positions(&self, symbol: &str, binance_positions: &[FuturesPosition]) {
-        // Build set of active position IDs
+        // A closure whose database write failed earlier is retried here, where
+        // we are already talking to the repository.
+        self.retry_pending_closures().await;
+
+        // Build set of active position IDs. Symbols the domain cannot parse are
+        // skipped rather than normalised: an unparseable symbol could never
+        // have produced a tracked entry in the first place, and inventing a key
+        // for it is how the two forms drift apart again.
         let active_ids: HashSet<String> = binance_positions
             .iter()
-            .map(|p| Self::position_key(&p.symbol, p.side))
+            .filter_map(|p| match Symbol::from_pair(&p.symbol) {
+                Ok(sym) => Some(Self::position_key(&sym, p.side)),
+                Err(_) => {
+                    warn!(symbol = %p.symbol, "Unparseable symbol in cleanup, skipping");
+                    None
+                },
+            })
             .collect();
 
         // Remove closed positions
@@ -968,24 +1147,8 @@ impl PositionMonitor {
         // Persist the closure. Dropping the position from memory alone leaves
         // the row `is_active = TRUE`, so the next startup reloads it and the
         // ghost comes back forever.
-        if let Some(repo) = &self.repository {
-            let closed_at = Utc::now();
-            for id in &to_remove {
-                if let Err(e) = repo.mark_closed(id, closed_at).await {
-                    warn!(
-                        position_id = %id,
-                        error = %e,
-                        "Failed to mark externally closed position as closed in database"
-                    );
-                }
-                if let Err(e) = repo.clear_execution_attempts(id).await {
-                    warn!(
-                        position_id = %id,
-                        error = %e,
-                        "Failed to clear execution attempts in database"
-                    );
-                }
-            }
+        for id in &to_remove {
+            self.persist_closure(id).await;
         }
     }
 
@@ -1073,6 +1236,7 @@ mod tests {
             max_retry_attempts: 3,
             execution_cooldown_secs: 60,
             price_validation_tolerance_pct: dec!(0.1),
+            quantity_tolerance_pct: dec!(0.005),
         }
     }
 
@@ -1089,13 +1253,133 @@ mod tests {
     }
 
     fn futures_position(symbol: &str, side: Side, entry: Decimal) -> FuturesPosition {
+        futures_position_qty(symbol, side, entry, dec!(0.086))
+    }
+
+    fn futures_position_qty(
+        symbol: &str,
+        side: Side,
+        entry: Decimal,
+        quantity: Decimal,
+    ) -> FuturesPosition {
         FuturesPosition {
             symbol: symbol.to_string(),
             side,
-            quantity: Quantity::new(dec!(0.086)).unwrap(),
+            quantity: Quantity::new(quantity).unwrap(),
             entry_price: Price::new(entry).unwrap(),
             unrealized_pnl: dec!(0),
             leverage: 10,
+        }
+    }
+
+    /// Repository whose first `n` `mark_closed` calls fail, counting how often
+    /// `clear_execution_attempts` was reached.
+    struct FlakyRepo {
+        inner: Arc<MemoryDetectedPositionRepository>,
+        remaining_failures: std::sync::atomic::AtomicUsize,
+        clear_calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl FlakyRepo {
+        fn new(inner: Arc<MemoryDetectedPositionRepository>, failures: usize) -> Self {
+            Self {
+                inner,
+                remaining_failures: std::sync::atomic::AtomicUsize::new(failures),
+                clear_calls: std::sync::atomic::AtomicUsize::new(0),
+            }
+        }
+
+        fn clear_calls(&self) -> usize {
+            self.clear_calls.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl DetectedPositionRepository for FlakyRepo {
+        async fn save(&self, position: &DetectedPosition) -> Result<(), robson_store::StoreError> {
+            self.inner.save(position).await
+        }
+
+        async fn find_by_id(
+            &self,
+            id: &str,
+        ) -> Result<Option<DetectedPosition>, robson_store::StoreError> {
+            self.inner.find_by_id(id).await
+        }
+
+        async fn find_active(&self) -> Result<Vec<DetectedPosition>, robson_store::StoreError> {
+            self.inner.find_active().await
+        }
+
+        async fn find_by_symbol(
+            &self,
+            symbol: &str,
+        ) -> Result<Vec<DetectedPosition>, robson_store::StoreError> {
+            self.inner.find_by_symbol(symbol).await
+        }
+
+        async fn mark_closed(
+            &self,
+            id: &str,
+            closed_at: DateTime<Utc>,
+        ) -> Result<(), robson_store::StoreError> {
+            if self
+                .remaining_failures
+                .fetch_update(
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                    |n| if n > 0 { Some(n - 1) } else { None },
+                )
+                .is_ok()
+            {
+                return Err(robson_store::StoreError::Deserialization(
+                    "injected failure".to_string(),
+                ));
+            }
+            self.inner.mark_closed(id, closed_at).await
+        }
+
+        async fn update_execution_attempt(
+            &self,
+            id: &str,
+            attempted_at: DateTime<Utc>,
+            failures: i32,
+            is_panic: bool,
+            error: Option<String>,
+        ) -> Result<(), robson_store::StoreError> {
+            self.inner
+                .update_execution_attempt(id, attempted_at, failures, is_panic, error)
+                .await
+        }
+
+        async fn clear_execution_attempts(&self, id: &str) -> Result<(), robson_store::StoreError> {
+            self.clear_calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.clear_execution_attempts(id).await
+        }
+
+        async fn log_execution(
+            &self,
+            execution: &robson_store::SafetyExecutionDto,
+        ) -> Result<(), robson_store::StoreError> {
+            self.inner.log_execution(execution).await
+        }
+
+        async fn get_executions(
+            &self,
+            position_id: &str,
+        ) -> Result<Vec<robson_store::SafetyExecutionDto>, robson_store::StoreError> {
+            self.inner.get_executions(position_id).await
+        }
+
+        async fn find_panic_mode(&self) -> Result<Vec<DetectedPosition>, robson_store::StoreError> {
+            self.inner.find_panic_mode().await
+        }
+
+        async fn cleanup_old_positions(
+            &self,
+            older_than: DateTime<Utc>,
+        ) -> Result<u64, robson_store::StoreError> {
+            self.inner.cleanup_old_positions(older_than).await
         }
     }
 
@@ -1104,24 +1388,173 @@ mod tests {
     /// silent no-op and detected positions stay `is_active = TRUE` forever.
     #[test]
     fn test_position_key_matches_persisted_position_id() {
-        assert_eq!(PositionMonitor::position_key("BTCUSDT", Side::Long), "BTCUSDT:long");
-        assert_eq!(PositionMonitor::position_key("BTCUSDT", Side::Short), "BTCUSDT:short");
-
-        // Raw exchange payloads must normalise to the same key.
-        assert_eq!(PositionMonitor::position_key("btcusdt", Side::Long), "BTCUSDT:long");
+        let btc = Symbol::from_pair("BTCUSDT").unwrap();
+        assert_eq!(PositionMonitor::position_key(&btc, Side::Long), "BTCUSDT:long");
+        assert_eq!(PositionMonitor::position_key(&btc, Side::Short), "BTCUSDT:short");
 
         // Side's Display impl is uppercase; building the key from it is the
         // defect this test guards against.
         assert_ne!(
             format!("{}:{}", "BTCUSDT", Side::Long),
-            PositionMonitor::position_key("BTCUSDT", Side::Long)
+            PositionMonitor::position_key(&btc, Side::Long)
         );
 
+        // The key must be byte-identical to what the repository persists,
+        // otherwise every repository call keyed by the id is a silent no-op.
         let pos = ghost_position();
         assert_eq!(
             robson_store::DetectedPositionDto::from_domain(&pos).position_id,
-            PositionMonitor::position_key(&pos.symbol.as_pair(), pos.side),
+            PositionMonitor::position_key(&pos.symbol, pos.side),
         );
+    }
+
+    /// Regression: confirmed Core ownership must *release* Safety Net state for
+    /// the key, not merely skip it. A Core position and a stale detected row
+    /// share the canonical id, so a bare skip leaves the row tracked and
+    /// `is_active = TRUE` for as long as the Core position lives — which is how
+    /// the production ghost survived three months.
+    #[tokio::test]
+    async fn test_core_managed_position_releases_tracked_ghost() {
+        let repo = Arc::new(MemoryDetectedPositionRepository::new());
+        repo.save(&ghost_position()).await.unwrap();
+
+        let monitor = PositionMonitor::with_repository(
+            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
+            Arc::new(EventBus::new(100)),
+            create_test_config(),
+            repo.clone(),
+        );
+        monitor.load_persisted_positions().await.unwrap();
+        assert_eq!(monitor.get_tracked_positions().await.len(), 1);
+
+        // Core takes ownership of the same (symbol, side).
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        monitor.add_core_exclusion(&symbol, Side::Long).await;
+
+        monitor
+            .process_binance_position(
+                futures_position("BTCUSDT", Side::Long, dec!(62999.70)),
+                Price::new(dec!(64667)).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert!(
+            monitor.get_tracked_positions().await.is_empty(),
+            "Core-managed key must not stay tracked by the Safety Net"
+        );
+        assert!(
+            repo.find_active().await.unwrap().is_empty(),
+            "released row must be marked closed, otherwise it reloads on restart"
+        );
+    }
+
+    /// Regression: a reloaded row describing a position that was resized, or
+    /// closed and reopened, must not be trusted. Acting on the persisted entry
+    /// would fire the stop at the wrong level and exit the wrong quantity.
+    #[tokio::test]
+    async fn test_diverged_tracked_position_is_replaced_from_exchange() {
+        let repo = Arc::new(MemoryDetectedPositionRepository::new());
+        repo.save(&ghost_position()).await.unwrap();
+
+        let monitor = PositionMonitor::with_repository(
+            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
+            Arc::new(EventBus::new(100)),
+            create_test_config(),
+            repo.clone(),
+        );
+        monitor.load_persisted_positions().await.unwrap();
+
+        // The stale stop (79701.73, from entry 81328.30) is far above the live
+        // price, so trusting it would fire an immediate market exit.
+        let live_price = Price::new(dec!(64667)).unwrap();
+        assert!(monitor.get_tracked_positions().await[0].is_stop_hit(live_price).unwrap());
+
+        monitor
+            .process_binance_position(
+                futures_position_qty("BTCUSDT", Side::Long, dec!(62999.70), dec!(0.022)),
+                live_price,
+            )
+            .await
+            .unwrap();
+
+        let tracked = monitor.get_tracked_positions().await;
+        assert_eq!(tracked.len(), 1);
+        assert_eq!(tracked[0].entry_price, Price::new(dec!(62999.70)).unwrap());
+        assert_eq!(tracked[0].quantity, Quantity::new(dec!(0.022)).unwrap());
+        assert!(
+            !tracked[0].is_stop_hit(live_price).unwrap(),
+            "stop must be recomputed from the live entry, not the stale one"
+        );
+    }
+
+    /// A size change within tolerance is the same position: refresh the
+    /// quantity, keep the row (and its detected_at) intact.
+    #[tokio::test]
+    async fn test_quantity_within_tolerance_refreshes_without_replacing() {
+        let repo = Arc::new(MemoryDetectedPositionRepository::new());
+        let ghost = ghost_position();
+        let detected_at = ghost.detected_at;
+        repo.save(&ghost).await.unwrap();
+
+        let monitor = PositionMonitor::with_repository(
+            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
+            Arc::new(EventBus::new(100)),
+            create_test_config(),
+            repo.clone(),
+        );
+        monitor.load_persisted_positions().await.unwrap();
+
+        // Same entry, 0.086 -> 0.0859 is ~0.12%, inside the 0.5% tolerance.
+        monitor
+            .process_binance_position(
+                futures_position_qty("BTCUSDT", Side::Long, dec!(81328.30), dec!(0.0859)),
+                Price::new(dec!(81000)).unwrap(),
+            )
+            .await
+            .unwrap();
+
+        let tracked = monitor.get_tracked_positions().await;
+        assert_eq!(tracked.len(), 1);
+        assert_eq!(tracked[0].quantity, Quantity::new(dec!(0.0859)).unwrap());
+        assert_eq!(tracked[0].detected_at, detected_at, "same position must not be replaced");
+    }
+
+    /// Regression: a failed `mark_closed` must not clear the row's retry
+    /// evidence, and must stay retryable. Otherwise a transient database error
+    /// leaves an active row stripped of its panic state, with nothing left in
+    /// memory for a later tick to rediscover.
+    #[tokio::test]
+    async fn test_failed_close_is_retried_and_keeps_execution_attempts() {
+        let inner = Arc::new(MemoryDetectedPositionRepository::new());
+        inner.save(&ghost_position()).await.unwrap();
+        let repo = Arc::new(FlakyRepo::new(inner.clone(), 1));
+
+        let monitor = PositionMonitor::with_repository(
+            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
+            Arc::new(EventBus::new(100)),
+            create_test_config(),
+            repo.clone(),
+        );
+        monitor.load_persisted_positions().await.unwrap();
+
+        // First cleanup: mark_closed fails.
+        monitor.cleanup_closed_positions("BTCUSDT", &[]).await;
+        assert!(monitor.get_tracked_positions().await.is_empty());
+        assert_eq!(
+            repo.clear_calls(),
+            0,
+            "attempts must not be cleared while the row is still active"
+        );
+        assert_eq!(inner.find_active().await.unwrap().len(), 1, "row is still active");
+
+        // Second cleanup: nothing tracked, but the pending closure is retried.
+        monitor.cleanup_closed_positions("BTCUSDT", &[]).await;
+        assert!(
+            inner.find_active().await.unwrap().is_empty(),
+            "queued closure must be retried on a later tick"
+        );
+        assert_eq!(repo.clear_calls(), 1, "attempts cleared only after a successful close");
     }
 
     /// Regression: a row reloaded at startup and the same position seen live

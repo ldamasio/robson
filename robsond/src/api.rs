@@ -2227,7 +2227,7 @@ where
                         // Canonical id, byte-identical to the monitor's tracking
                         // key and to `detected_positions.position_id`, so a
                         // tracked position can be traced straight to its row.
-                        id: PositionMonitor::position_key(&pos.symbol.as_pair(), pos.side),
+                        id: PositionMonitor::position_key(&pos.symbol, pos.side),
                         symbol: pos.symbol.as_pair(),
                         side: format!("{:?}", pos.side),
                         entry_price: pos.entry_price.as_decimal(),
