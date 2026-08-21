@@ -84,7 +84,8 @@ on:
 1. Docker Buildx setup
 2. Login to GHCR (`ghcr.io`) with `GITOPS_TOKEN`
 3. Build from `Dockerfile`, push tags `sha-<8chars>` and `latest`
-4. Clone `rbxrobotica/rbx-infra`, update manifest image tags via `sed`, commit and push
+4. Clone `rbxrobotica/rbx-infra`, set `images[].newTag` in the prod overlay with
+   `yq`, commit and push
 5. ArgoCD detects manifest change and syncs automatically
 
 ---
@@ -102,8 +103,7 @@ Build & Push: ghcr.io/rbxrobotica/robson-v2:sha-XXXXXXXX
     │
     ▼
 Update rbx-infra:
-  apps/prod/robson/robsond-deploy.yml
-  apps/prod/robson/robsond-db-migrate-job.yml
+  apps/prod/robson/kustomization.yml (images[].newTag)
     │
     ▼
 ArgoCD syncs (namespace: robson)
@@ -125,17 +125,73 @@ to stable-only options.
 
 ## Rollback
 
+The deployed tag lives in ONE place: `images[].newTag` in the prod overlay.
+Editing `image:` in `robsond-deploy.yml` has no effect, because the kustomize
+images transformer overrides it (Pattern R; the manifests carry a
+`sha-REPLACE_ME` placeholder that is deliberately not a real tag).
+
+**Do not read image tags out of `git log` commit hashes.** A rbx-infra commit
+hash and a `sha-<hex>` image tag are both 8 hex characters and are trivially
+confused under pressure. Only the file history is authoritative.
+
 ```bash
-# 1. Find the previous working SHA from rbx-infra history
-gh api repos/rbxrobotica/rbx-infra/commits \
-  --jq '.[0:10] | .[] | {sha: .sha[0:8], message: .commit.message[0:60]}'
+set -euo pipefail
 
-# 2. Manually update the manifest in rbx-infra
-# Edit apps/prod/robson/robsond-deploy.yml:
-#   image: ghcr.io/rbxrobotica/robson-v2:sha-<previous>
+WORK=$(mktemp -d)                      # never a fixed path: a stale /tmp clone
+git clone https://github.com/rbxrobotica/rbx-infra.git "$WORK/rbx-infra"
+cd "$WORK/rbx-infra"
+K=apps/prod/robson/kustomization.yml
 
-# 3. Commit and push to rbx-infra — ArgoCD syncs automatically
+# 1. Read the ACTUAL promoted tags, newest first. These are image tags,
+#    not commit hashes.
+git log -20 --format='%h %ad %s' --date=short -- "$K"
+git log -20 -p -- "$K" | grep -E '^\+\s+newTag:' | head
+
+PREV=sha-xxxxxxxx                      # pick from the output above
+
+# 2. Prove the tag exists in GHCR BEFORE pointing production at it
+docker manifest inspect "ghcr.io/rbxrobotica/robson-v2:${PREV}" >/dev/null \
+  && echo "tag exists" || { echo "TAG DOES NOT EXIST, stop here"; exit 1; }
+
+# 3. Roll the pin back
+PREV="$PREV" yq -i \
+  '(.images[] | select(.name == "ghcr.io/rbxrobotica/robson-v2") | .newTag) = strenv(PREV)' "$K"
+
+# 4. Prove the render resolves to exactly that tag, on BOTH workloads,
+#    before pushing. Expect two identical lines.
+kubectl kustomize apps/prod/robson | grep 'image: ghcr.io/rbxrobotica/robson-v2'
+
+# 5. Push. ArgoCD syncs automatically.
+git commit -am "chore(robson-v2): roll back to ${PREV}"
+git push origin main
 ```
+
+### Verify the rollback actually landed
+
+`git push` proves nothing. ArgoCD may be degraded, the PreSync migration Job
+may be stuck, or the bad pod may still be serving. With strategy `Recreate`,
+`Synced` alone does not imply available either. Check all four:
+
+```bash
+# a. ArgoCD converged
+kubectl get application -n argocd robson-prod \
+  -o jsonpath='{.status.sync.status}{" "}{.status.health.status}{"\n"}'
+
+# b. The pod is running the tag you intended
+kubectl get pod -n robson -l app.kubernetes.io/name=robsond \
+  -o jsonpath='{.items[*].spec.containers[0].image}{"\n"}'
+
+# c. The pod is actually up, not ImagePullBackOff or CrashLoop
+kubectl get pod -n robson -l app.kubernetes.io/name=robsond
+
+# d. The daemon answers and still holds the book you expect
+curl -s https://api.robson.rbx.ia.br/health
+curl -s https://api.robson.rbx.ia.br/status
+```
+
+If a position is open, (d) is the one that matters: the exchange insurance
+stop covers the gap while the daemon is down (ADR-0039), but you want to see
+the daemon back and reconciled, with `reconciliation_blockers` empty.
 
 ---
 
@@ -144,30 +200,55 @@ gh api repos/rbxrobotica/rbx-infra/commits \
 If the GitOps update fails:
 
 ```bash
-# Get the SHA tag you want to deploy
-SHA_TAG="sha-776a72f9"
+set -euo pipefail
 
-# Clone rbx-infra and update manifests manually
-git clone https://github.com/rbxrobotica/rbx-infra.git /tmp/rbx-infra
-cd /tmp/rbx-infra
-sed -i "s|image: ghcr.io/rbxrobotica/robson-v2:sha-[a-f0-9]*|image: ghcr.io/rbxrobotica/robson-v2:${SHA_TAG}|g" \
-  apps/prod/robson/robsond-deploy.yml \
-  apps/prod/robson/robsond-db-migrate-job.yml
-git add apps/prod/robson/
-git commit -m "chore(robson-v2): manual rollout to ${SHA_TAG}"
+# The tag you want to deploy. It MUST be exported: `yq`'s strenv() reads the
+# environment of the yq process, and a bare assignment silently yields an
+# empty string, writing `newTag: ""` into the overlay.
+export SHA_TAG="sha-776a72f9"
+
+docker manifest inspect "ghcr.io/rbxrobotica/robson-v2:${SHA_TAG}" >/dev/null \
+  && echo "tag exists" || { echo "TAG DOES NOT EXIST, stop here"; exit 1; }
+
+WORK=$(mktemp -d)
+git clone https://github.com/rbxrobotica/rbx-infra.git "$WORK/rbx-infra"
+cd "$WORK/rbx-infra"
+K=apps/prod/robson/kustomization.yml
+yq -i '(.images[] | select(.name == "ghcr.io/rbxrobotica/robson-v2") | .newTag) = strenv(SHA_TAG)' "$K"
+
+# Both the daemon and the migrate hook resolve from the same pin. Expect two
+# identical lines carrying ${SHA_TAG}, and stop if you do not get them.
+kubectl kustomize apps/prod/robson | grep 'image: ghcr.io/rbxrobotica/robson-v2'
+
+git commit -am "chore(robson-v2): manual rollout to ${SHA_TAG}"
 git push origin main
 ```
+
+Then run the four verification checks from the Rollback section above. The
+procedure is not finished at `git push`.
 
 ---
 
 ## Troubleshooting
 
-### Build & Push fails: `sed: can't read ...`
+### Build & Push fails: `must have exactly one images entry`
 
-The GitOps step references incorrect manifest paths. Verify the paths in the
-`Update image tags in rbx-infra` step match:
-- `apps/prod/robson/robsond-deploy.yml`
-- `apps/prod/robson/robsond-db-migrate-job.yml`
+The prod overlay lost its `robson-v2` pin, or gained a duplicate. The promotion
+step refuses to guess. Inspect and repair the overlay:
+
+```bash
+yq '.images' apps/prod/robson/kustomization.yml
+```
+
+There must be exactly one entry with
+`name: ghcr.io/rbxrobotica/robson-v2`. See rbx-infra
+`docs/infra/IMAGE-PROMOTION.md`.
+
+### Build & Push fails: `yq is not available on this runner`
+
+`yq` is preinstalled on GitHub's `ubuntu-latest` images. If it disappears from
+a future runner image, install it explicitly in the workflow before the
+promotion step.
 
 ### Formatting check fails locally
 

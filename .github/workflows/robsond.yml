@@ -152,12 +152,42 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          sed -i "s|image: ghcr.io/rbxrobotica/robson-v2:sha-[a-f0-9]*|image: ghcr.io/rbxrobotica/robson-v2:${SHA_TAG}|g" \
-            apps/prod/robson/robsond-deploy.yml \
-            apps/prod/robson/robsond-db-migrate-job.yml
+          # Pattern R: the promoted tag lives in the overlay's images
+          # transformer, not in the manifests. See rbx-infra
+          # docs/infra/IMAGE-PROMOTION.md.
+          K=apps/prod/robson/kustomization.yml
 
-          git add apps/prod/robson/robsond-deploy.yml \
-                  apps/prod/robson/robsond-db-migrate-job.yml
+          # Fail loudly rather than committing nothing and letting the
+          # deployed image silently freeze at whatever newTag currently holds.
+          if ! command -v yq >/dev/null 2>&1; then
+            echo "::error::yq is not available on this runner; cannot promote the image tag"
+            exit 1
+          fi
+
+          # Exactly one entry, not merely at least one: duplicate entries for
+          # the same name would all be rewritten, and a divergent newName on
+          # one of them would leave the overlay ambiguous while the job stayed
+          # green.
+          #
+          # This runs again after every rebase. A concurrent promotion can add
+          # a second entry between the first check and the push; the rebase
+          # would then apply our newTag change cleanly on top of an overlay
+          # that no longer satisfies the invariant, and the retry would publish
+          # it — defeating exactly the protection this guard exists for.
+          assert_single_pin() {
+            local pins
+            pins=$(yq '[.images[]? | select(.name == "ghcr.io/rbxrobotica/robson-v2")] | length' "$K")
+            if [ "$pins" != "1" ]; then
+              echo "::error::$K must have exactly one images entry for ghcr.io/rbxrobotica/robson-v2 (found ${pins})"
+              exit 1
+            fi
+          }
+
+          assert_single_pin
+
+          yq -i '(.images[] | select(.name == "ghcr.io/rbxrobotica/robson-v2") | .newTag) = strenv(SHA_TAG)' "$K"
+
+          git add "$K"
 
           if git diff --staged --quiet; then
             echo "No manifest changes needed (already at ${SHA_TAG})"
@@ -176,6 +206,15 @@ jobs:
             fi
             echo "Push attempt $i failed, rebasing..."
             git pull --rebase origin main
+
+            # Re-assert the invariant on the rebased tree, and re-assert that
+            # the tag we are about to publish is still the one we resolved.
+            assert_single_pin
+            REBASED_TAG=$(yq '.images[] | select(.name == "ghcr.io/rbxrobotica/robson-v2") | .newTag' "$K")
+            if [ "$REBASED_TAG" != "$SHA_TAG" ]; then
+              echo "::error::after rebase the pin is ${REBASED_TAG}, expected ${SHA_TAG}; refusing to publish"
+              exit 1
+            fi
           done
 
           echo "::error::Failed to push to rbx-infra after 3 attempts"
