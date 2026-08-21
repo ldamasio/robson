@@ -134,6 +134,19 @@ fn trace_query_transition(query: &ExecutionQuery, transition_cause: &str) {
                 "query state transition"
             );
         },
+        _ if is_routine_market_tick_transition(query) => {
+            tracing::debug!(
+                query_id = %query.id,
+                kind = ?query.kind,
+                state = %query.state.label(),
+                actor = ?query.actor,
+                position_id = ?query.position_id,
+                active_positions_count = ?query.context_summary.as_ref().map(|c| c.active_positions_count),
+                duration_ms = ?duration_ms,
+                transition_cause = %transition_cause,
+                "query state transition"
+            );
+        },
         _ => {
             tracing::info!(
                 query_id = %query.id,
@@ -148,6 +161,40 @@ fn trace_query_transition(query: &ExecutionQuery, transition_cause: &str) {
             );
         },
     }
+}
+
+/// Whether a transition is routine market-tick telemetry rather than an
+/// operator-relevant event.
+///
+/// `ProcessMarketTick` queries run for every active position on every market
+/// tick and emit four transitions each (Accepted, Processing, Acting,
+/// Completed). In production that is roughly 44 log lines per second, which
+/// drowns every other line: the pod log buffer covers about four minutes, so
+/// trailing-stop moves and safety-net activity scroll out of reach before
+/// anyone can read them. ADR-0049 already removed these transitions from the
+/// durable event log for the same reason (13 GB by 2026-07); this keeps them
+/// off the default log stream too.
+///
+/// They stay available at `debug`. Governed or abnormal outcomes (Denied /
+/// Failed / Expired) are never routine and keep their original level, as do
+/// all other query kinds (signals, arm/disarm, closes, funding).
+///
+/// This is a positive allowlist of the states a market tick walks on the happy
+/// path, deliberately NOT the inverse of `is_durable_query_transition`. A
+/// denylist would silently demote any state added later, and would already
+/// demote `AwaitingApproval` / `Authorized`: a market tick that reaches an
+/// operator approval gate is abnormal by construction and must stay loud, even
+/// though no path produces that today.
+pub(crate) fn is_routine_market_tick_transition(query: &ExecutionQuery) -> bool {
+    matches!(query.kind, QueryKind::ProcessMarketTick { .. })
+        && matches!(
+            query.state,
+            QueryState::Accepted
+                | QueryState::Processing
+                | QueryState::RiskChecked
+                | QueryState::Acting
+                | QueryState::Completed
+        )
 }
 
 #[cfg(feature = "postgres")]
@@ -774,6 +821,160 @@ mod tests {
                 "market-tick {} must be event-sourced",
                 query.state.label()
             );
+        }
+    }
+
+    #[test]
+    fn test_market_tick_happy_path_transitions_are_routine_telemetry() {
+        let mut query = create_market_tick_query();
+        for state in [
+            QueryState::Accepted,
+            QueryState::Processing,
+            QueryState::RiskChecked,
+            QueryState::Acting,
+            QueryState::Completed,
+        ] {
+            query.state = state;
+            assert!(
+                is_routine_market_tick_transition(&query),
+                "market-tick {} must stay off the default log stream",
+                query.state.label()
+            );
+        }
+    }
+
+    #[test]
+    fn test_market_tick_governed_outcomes_are_never_routine() {
+        let mut query = create_market_tick_query();
+        for state in [
+            QueryState::Denied {
+                reason: "budget".to_string(),
+                check: "monthly_budget".to_string(),
+            },
+            QueryState::Failed {
+                reason: "exchange timeout".to_string(),
+                phase: "act".to_string(),
+            },
+            QueryState::Expired,
+        ] {
+            query.state = state;
+            assert!(
+                !is_routine_market_tick_transition(&query),
+                "market-tick {} must stay visible at info or above",
+                query.state.label()
+            );
+        }
+    }
+
+    /// Asserts the level `trace_query_transition` ACTUALLY emits, not just what
+    /// the classifier returns. The predicate tests alone would stay green if
+    /// someone dropped the guard, reordered the match arms or left
+    /// `tracing::info!` in the routine arm, and production would go back to
+    /// ~44 lines/s with nobody noticing.
+    #[test]
+    fn test_emitted_level_matches_classification() {
+        use std::sync::{Arc, Mutex};
+
+        use tracing::{Event, Level, Subscriber};
+        use tracing_subscriber::layer::{Context, Layer, SubscriberExt};
+
+        #[derive(Clone, Default)]
+        struct LevelCapture(Arc<Mutex<Vec<Level>>>);
+
+        impl<S: Subscriber> Layer<S> for LevelCapture {
+            fn on_event(&self, event: &Event<'_>, _ctx: Context<'_, S>) {
+                self.0.lock().unwrap().push(*event.metadata().level());
+            }
+        }
+
+        fn level_for(query: &ExecutionQuery) -> Level {
+            let capture = LevelCapture::default();
+            let subscriber = tracing_subscriber::registry()
+                .with(tracing_subscriber::filter::LevelFilter::TRACE)
+                .with(capture.clone());
+            tracing::subscriber::with_default(subscriber, || {
+                trace_query_transition(query, "test");
+            });
+            let seen = capture.0.lock().unwrap().clone();
+            assert_eq!(seen.len(), 1, "expected exactly one event, got {seen:?}");
+            seen[0]
+        }
+
+        // Market tick, happy path: demoted to debug. This is the whole point.
+        let mut tick = create_market_tick_query();
+        for state in [
+            QueryState::Accepted,
+            QueryState::Processing,
+            QueryState::RiskChecked,
+            QueryState::Acting,
+            QueryState::Completed,
+        ] {
+            tick.state = state;
+            assert_eq!(
+                level_for(&tick),
+                Level::DEBUG,
+                "market-tick {} must be emitted at debug",
+                tick.state.label()
+            );
+        }
+
+        // Market tick, abnormal: stays loud.
+        tick.state = QueryState::Expired;
+        assert_eq!(level_for(&tick), Level::INFO, "Expired must stay at info");
+
+        tick.state = QueryState::AwaitingApproval;
+        assert_eq!(level_for(&tick), Level::INFO, "AwaitingApproval must stay at info");
+
+        tick.state = QueryState::Denied {
+            reason: "budget".to_string(),
+            check: "monthly_budget".to_string(),
+        };
+        assert_eq!(level_for(&tick), Level::WARN, "Denied must stay at warn");
+
+        tick.state = QueryState::Failed {
+            reason: "exchange timeout".to_string(),
+            phase: "act".to_string(),
+        };
+        assert_eq!(level_for(&tick), Level::ERROR, "Failed must stay at error");
+
+        // Every other query kind keeps info on the happy path.
+        let mut other = create_test_query();
+        for state in [QueryState::Accepted, QueryState::Completed] {
+            other.state = state;
+            assert_eq!(
+                level_for(&other),
+                Level::INFO,
+                "non-tick {} must stay at info",
+                other.state.label()
+            );
+        }
+    }
+
+    #[test]
+    fn test_market_tick_approval_states_are_never_routine() {
+        // No path routes a market tick through approval today. If one ever
+        // appears, it must not be demoted to debug by default.
+        let mut query = create_market_tick_query();
+        for state in [QueryState::AwaitingApproval, QueryState::Authorized] {
+            query.state = state;
+            assert!(
+                !is_routine_market_tick_transition(&query),
+                "market-tick {} must stay visible at info or above",
+                query.state.label()
+            );
+        }
+    }
+
+    #[test]
+    fn test_non_tick_queries_are_never_routine() {
+        let mut query = create_test_query();
+        for state in [
+            QueryState::Accepted,
+            QueryState::Completed,
+            QueryState::Expired,
+        ] {
+            query.state = state;
+            assert!(!is_routine_market_tick_transition(&query));
         }
     }
 
