@@ -7,6 +7,66 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed - Safety Net ghost positions: tracking key vs persisted id (ADR-0039, 2026-08-18)
+
+- `position_monitor` built its `tracked_positions` key three different ways.
+  `load_persisted_positions` used `"{SYMBOL}:long"`, while live detection and
+  cleanup used `Side`'s `Display` impl and produced `"{SYMBOL}:LONG"`. Rows
+  reloaded at startup were therefore invisible to live detection (same position
+  tracked twice, or never re-verified), and every repository call keyed by that
+  id — `mark_closed`, `clear_execution_attempts`, `update_execution_attempt` —
+  matched zero rows against the lowercase `detected_positions.position_id`
+  written by `DetectedPositionDto::from_domain`. All three call sites now go
+  through `PositionMonitor::position_key`, the single canonical form.
+- `cleanup_closed_positions` only dropped positions from memory and never
+  persisted the closure, so `is_active` stayed `TRUE` and the row was reloaded
+  on every restart. It now calls `mark_closed` + `clear_execution_attempts`.
+  It also consumes the position list the caller already fetched instead of
+  re-querying Binance, which removes a duplicate API call per tick and the
+  window in which a position opened between the two calls looked closed.
+- `check_symbol` no longer aborts the tick on the first per-position error. A
+  failed `get_price` or a failed position evaluation is logged and reported,
+  but cleanup still runs; only a failed `get_open_positions` skips cleanup,
+  since without an authoritative position list "closed" and "exchange
+  unreachable" are indistinguishable.
+- `GET /safety/status` now reports `id` in the canonical form
+  (`BTCUSDT:long`), identical to `detected_positions.position_id`, so a
+  tracked position can be traced straight to its row.
+- Confirmed Core ownership now *releases* Safety Net state for the key instead
+  of merely skipping it. A Core position and a stale detected row share the
+  canonical id, so a bare skip left the row tracked and `is_active = TRUE` for
+  as long as the Core position lived — and `cleanup_closed_positions` saw the
+  Core position in the exchange list and treated the row as still open. That is
+  how the production ghost survived three months, and normalising the key alone
+  would not have removed it. Ownership is exclusive (ADR-0022): a Core-managed
+  position is not a rogue position, so the Safety Net holds no state for it.
+- A tracked position is now reconciled against the exchange before its state is
+  trusted. A row reloaded at startup may describe a position that was resized,
+  or closed and reopened, while the daemon was down; acting on the persisted
+  entry fired the stop at the wrong level and exited the wrong quantity. Entry
+  price must match exactly and quantity within the new
+  `quantity_tolerance_pct` (0.5% default), per invariant I3 of
+  `docs/policies/UNTRACKED-POSITION-RECONCILIATION.md` — the first time that
+  invariant is enforced in the Safety Net. A diverged row is replaced and
+  re-persisted with a recomputed stop; a size change within tolerance refreshes
+  the quantity in place.
+- Closure persistence is now ordered and retryable. `clear_execution_attempts`
+  runs only after a successful `mark_closed`, so a transient database failure
+  can no longer strip the panic/retry evidence from a row that is still active,
+  and failed closures are queued in `pending_closures` and retried on later
+  ticks instead of being lost with the in-memory entry.
+- `PositionMonitor::position_key` takes a parsed `Symbol` instead of a raw
+  string, so the symbol half is `Symbol::as_pair()` — byte-identical to what the
+  DTO persists. Normalising a raw exchange string with `to_uppercase` would have
+  reintroduced the same class of divergence one layer down.
+- Core ownership is now three-valued (`CoreOwnership::Owned` / `NotOwned` /
+  `Unknown`) instead of a boolean. The old `is_core_managed` returned `true`
+  both for "Core owns this" and for "the lookup failed", which was harmless
+  while the caller only skipped, but not once a confirmed owner triggers a
+  release: a transient database error would have marked a rogue position
+  `is_active = FALSE` and dropped its retry state. `Unknown` now skips the tick
+  inertly and touches no state.
+
 ### Added - Typed income-ledger reconciliation (ADR-0045 §1, 2026-07-07)
 
 - New `IncomePort` trait ingests Binance's typed income stream
