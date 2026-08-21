@@ -11,7 +11,10 @@
 
 use std::{
     collections::{HashMap, HashSet},
-    sync::Arc,
+    sync::{
+        atomic::{AtomicU64, Ordering},
+        Arc,
+    },
     time::Duration,
 };
 
@@ -142,7 +145,17 @@ pub struct PositionMonitor {
     core_position_repo: Option<Arc<dyn PositionRepository>>,
     /// In-memory exclusion set maintained from Core open/close events.
     core_exclusion_set: RwLock<HashSet<String>>,
+    /// Number of poll cycles the monitor has entered since start.
+    ///
+    /// This exists because a Safety Net that silently stops polling is
+    /// indistinguishable, from the outside, from one with nothing to report:
+    /// both produce no logs and no events. A monotonic counter makes "the net
+    /// is running" observable instead of assumed.
+    poll_count: AtomicU64,
 }
+
+/// Fallback poll period when the configured value is unusable.
+const DEFAULT_POLL_INTERVAL_SECS: u64 = 20;
 
 impl PositionMonitor {
     /// Create a new position monitor.
@@ -163,6 +176,7 @@ impl PositionMonitor {
             repository: None,
             core_position_repo: None,
             core_exclusion_set: RwLock::new(HashSet::new()),
+            poll_count: AtomicU64::new(0),
         }
     }
 
@@ -185,6 +199,7 @@ impl PositionMonitor {
             repository: Some(repository),
             core_position_repo: None,
             core_exclusion_set: RwLock::new(HashSet::new()),
+            poll_count: AtomicU64::new(0),
         }
     }
 
@@ -211,6 +226,7 @@ impl PositionMonitor {
             repository: Some(repository),
             core_position_repo: Some(core_position_repo),
             core_exclusion_set: RwLock::new(HashSet::new()),
+            poll_count: AtomicU64::new(0),
         }
     }
 
@@ -306,6 +322,51 @@ impl PositionMonitor {
                 "Position monitor started"
             );
 
+            // The poll timer MUST be created outside the loop.
+            //
+            // `tokio::select!` re-evaluates each branch expression on every
+            // iteration, so a `sleep(...)` written inline is a *new* future
+            // each time round: any other branch completing first drops the
+            // pending sleep and restarts the countdown from zero. This monitor
+            // subscribes to the whole event bus, where `DaemonEvent::MarketData`
+            // arrives several times per second, so the 20s deadline was reset
+            // roughly every 90ms and never once elapsed — the Safety Net polled
+            // zero times in 36h of uptime in production. An `Interval` owns its
+            // schedule across iterations and is immune to this.
+            //
+            // The gap between cycles is enforced by `reset()` after each sweep,
+            // not by `MissedTickBehavior`. `Delay` alone does NOT guarantee a
+            // full period after an overrun: the already-missed tick resolves
+            // immediately and only the tick *after* it is rescheduled, so a
+            // sweep that persistently overruns the period runs back-to-back
+            // with no gap at all — the opposite of what a rate-limited exchange
+            // API wants. `reset()` recomputes the deadline from the moment the
+            // sweep finished, which is the actual guarantee. `Delay` is kept as
+            // defence in depth for a tick missed outside that window.
+            //
+            // The first tick resolves immediately, so the first poll happens at
+            // startup rather than one period later. That is deliberate:
+            // `load_persisted_positions` has already run by the time `start()`
+            // is called, so the reloaded set is reconciled against the exchange
+            // straight away instead of being trusted blindly for 20s.
+            // Never panic and never hot-loop, whatever the config says. A zero
+            // period panics `interval()`, and that panic would be invisible:
+            // the daemon does not observe this task's JoinHandle until
+            // shutdown, so the API would keep reporting `enabled: true` over a
+            // dead monitor. Config validation rejects zero; this is the
+            // backstop for a caller building the config directly.
+            let poll_interval_secs = if self.config.poll_interval_secs == 0 {
+                error!(
+                    fallback_secs = DEFAULT_POLL_INTERVAL_SECS,
+                    "Position monitor poll interval is zero, using fallback"
+                );
+                DEFAULT_POLL_INTERVAL_SECS
+            } else {
+                self.config.poll_interval_secs
+            };
+            let mut poll = tokio::time::interval(Duration::from_secs(poll_interval_secs));
+            poll.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+
             loop {
                 tokio::select! {
                     _ = self.shutdown_token.cancelled() => {
@@ -338,10 +399,22 @@ impl PositionMonitor {
                             }
                         }
                     }
-                    _ = tokio::time::sleep(Duration::from_secs(self.config.poll_interval_secs)) => {
+                    _ = poll.tick() => {
+                        self.poll_count.fetch_add(1, Ordering::Relaxed);
+                        crate::metrics::SAFETY_NET_POLLS.inc();
                         if let Err(e) = self.check_positions().await {
                             error!(error = %e, "Error checking positions");
                         }
+                        // Recompute the deadline from the end of the sweep, so
+                        // the next poll starts a full period after this one
+                        // finished rather than after it began.
+                        //
+                        // This also applies to a sweep that failed fast: the
+                        // next attempt waits a full period rather than
+                        // retrying immediately. That is intended — an exchange
+                        // that is erroring is the last thing to hammer — so
+                        // resist "optimising" this into a shorter retry.
+                        poll.reset();
                     }
                 }
             }
@@ -936,6 +1009,22 @@ impl PositionMonitor {
         self.shutdown_token.cancel();
     }
 
+    /// Number of poll cycles entered since the monitor started.
+    ///
+    /// Zero on a running monitor means the poll is not executing at all, which
+    /// is not the same as having nothing to report.
+    ///
+    /// This deliberately duplicates `metrics::SAFETY_NET_POLLS`, and the two
+    /// are not interchangeable. The Prometheus counter is process-global and is
+    /// the operational signal; this one is per-instance and exists so tests can
+    /// assert about *their* monitor. A test reading the global counter would be
+    /// coupled to every other test that starts a monitor in the same process,
+    /// which `cargo test` runs in parallel. Both are incremented on adjacent
+    /// lines of the same branch so they cannot drift.
+    pub fn poll_count(&self) -> u64 {
+        self.poll_count.load(Ordering::Relaxed)
+    }
+
     /// Get all tracked positions.
     pub async fn get_tracked_positions(&self) -> Vec<DetectedPosition> {
         self.tracked_positions.read().await.values().cloned().collect()
@@ -1004,6 +1093,7 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
+    use crate::event_bus::{MarketData, MarketDataSource};
 
     fn create_test_config() -> PositionMonitorConfig {
         PositionMonitorConfig {
@@ -1014,6 +1104,67 @@ mod tests {
             execution_cooldown_secs: 60,
             price_validation_tolerance_pct: dec!(0.1),
         }
+    }
+
+    /// Regression: the poll must survive a saturated event bus.
+    ///
+    /// The monitor subscribes to the whole bus, and `DaemonEvent::MarketData`
+    /// arrives several times per second in production. With the poll timer
+    /// written as a `sleep(...)` inside `tokio::select!`, every one of those
+    /// events dropped the pending sleep and restarted the countdown, so the
+    /// poll never ran — zero cycles in 36h of production uptime.
+    ///
+    /// This test fails against that implementation: it floods the bus far
+    /// faster than the poll period and asserts the monitor still polls.
+    /// `symbols` is empty so `check_positions` performs no exchange calls; the
+    /// assertion is about the scheduler, not about Binance.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn test_poll_runs_under_continuous_event_load() {
+        let event_bus = Arc::new(EventBus::new(1024));
+        let config = PositionMonitorConfig {
+            poll_interval_secs: 1,
+            symbols: vec![],
+            ..create_test_config()
+        };
+
+        let monitor = Arc::new(PositionMonitor::new(
+            Arc::new(BinanceRestClient::new("key".to_string(), "secret".to_string())),
+            Arc::clone(&event_bus),
+            config,
+        ));
+        let handle = Arc::clone(&monitor).start();
+
+        // Saturate the bus the way the live market feed does.
+        let flood_bus = Arc::clone(&event_bus);
+        let flooder = tokio::spawn(async move {
+            let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+            loop {
+                flood_bus.send(DaemonEvent::MarketData(MarketData {
+                    symbol: symbol.clone(),
+                    price: Price::new(dec!(65000)).unwrap(),
+                    timestamp: Utc::now(),
+                    source: MarketDataSource::Ws,
+                }));
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        });
+
+        let mut polled = false;
+        for _ in 0..30 {
+            if monitor.poll_count() > 0 {
+                polled = true;
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+
+        flooder.abort();
+        handle.abort();
+
+        assert!(
+            polled,
+            "poll never ran in 3s with a 1s period: the event bus is starving the timer"
+        );
     }
 
     #[tokio::test]
