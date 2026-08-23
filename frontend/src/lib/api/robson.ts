@@ -107,14 +107,14 @@ export type StatusResponse = {
 };
 
 export type ArmEntryPolicy = {
-  mode?: string;
-  approval?: string;
+  mode: "immediate";
+  approval: "automatic" | "human_confirmation";
 };
 
 export type ArmPositionRequest = {
   symbol: string;
   side: string;
-  entry_policy?: ArmEntryPolicy;
+  entry_policy: ArmEntryPolicy;
 };
 
 export type MonthlyPositionsResponse = {

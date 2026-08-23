@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-08-23
+
+### Changed - v2.5 release baseline
+
+- Aligned every Rust workspace crate and the SvelteKit frontend package on
+  version `2.5.0`.
+- Restricted the v2.5 dashboard ARM flow to the operationally accepted
+  `immediate` entry mode. The request now always sends
+  `entry_policy.mode = "immediate"` explicitly, so the backend's legacy
+  `confirmed_trend` default cannot be selected accidentally.
+- Kept the three strategy-backed entry modes in the backend for event/API
+  compatibility, but removed them from the operator surface until each mode
+  has passed its own operational acceptance gate.
+
 ### Added - Typed income-ledger reconciliation (ADR-0045 §1, 2026-07-07)
 
 - New `IncomePort` trait ingests Binance's typed income stream

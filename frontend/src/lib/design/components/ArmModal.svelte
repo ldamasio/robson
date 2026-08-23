@@ -1,24 +1,23 @@
 <script lang="ts">
-  import { robsonApi } from '$api/robson';
+  import { robsonApi } from "$api/robson";
 
-  let { onclose, onresult }: { onclose: () => void; onresult?: (r: { position_id: string; symbol: string; side: string }) => void } = $props();
+  let {
+    onclose,
+    onresult,
+  }: {
+    onclose: () => void;
+    onresult?: (r: {
+      position_id: string;
+      symbol: string;
+      side: string;
+    }) => void;
+  } = $props();
 
-  let symbol = $state('BTCUSDT');
-  let side = $state<'Long' | 'Short'>('Long');
-  let entryMode = $state('confirmed_trend');
-  let approval = $state('automatic');
+  let symbol = $state("BTCUSDT");
+  let side = $state<"Long" | "Short">("Long");
+  let approval = $state<"automatic" | "human_confirmation">("automatic");
   let submitting = $state(false);
   let error = $state<string | null>(null);
-
-  const defaultEntryMode = 'confirmed_trend';
-  const defaultApproval = 'automatic';
-
-  const entryModes = [
-    { label: 'CONFIRMED TREND', value: 'confirmed_trend' },
-    { label: 'IMMEDIATE', value: 'immediate' },
-    { label: 'CONFIRMED REVERSAL', value: 'confirmed_reversal' },
-    { label: 'CONFIRMED KEY LEVEL', value: 'confirmed_key_level' },
-  ] as const;
 
   function enforceUppercase(e: Event) {
     const input = e.target as HTMLInputElement;
@@ -27,33 +26,51 @@
 
   async function submit() {
     error = null;
-    if (!symbol.trim()) { error = 'SYMBOL REQUIRED'; return; }
+    if (!symbol.trim()) {
+      error = "SYMBOL REQUIRED";
+      return;
+    }
 
     submitting = true;
     try {
-      const body: Parameters<typeof robsonApi.armPosition>[0] = { symbol: symbol.trim(), side };
-      if (entryMode !== defaultEntryMode || approval !== defaultApproval) {
-        body.entry_policy = { mode: entryMode, approval };
-      }
+      const body: Parameters<typeof robsonApi.armPosition>[0] = {
+        symbol: symbol.trim(),
+        side,
+        entry_policy: { mode: "immediate", approval },
+      };
 
       const result = await robsonApi.armPosition(body);
       onclose();
-      if (onresult) onresult({ position_id: result.id, symbol: result.symbol, side: result.side });
+      if (onresult)
+        onresult({
+          position_id: result.id,
+          symbol: result.symbol,
+          side: result.side,
+        });
     } catch (e) {
-      error = e instanceof Error ? e.message : 'ARM FAILED';
+      error = e instanceof Error ? e.message : "ARM FAILED";
     } finally {
       submitting = false;
     }
   }
 </script>
 
-<svelte:window onkeydown={(e) => { if (e.key === 'Escape') onclose(); }} />
+<svelte:window
+  onkeydown={(e) => {
+    if (e.key === "Escape" && !submitting) onclose();
+  }}
+/>
 
 <div class="overlay" role="dialog" aria-modal="true">
-  <div class="modal">
+  <div class="modal" aria-busy={submitting}>
     <div class="modal-header">
       <span class="eyebrow">ARM POSITION</span>
-      <button class="btn-close" onclick={onclose} aria-label="Close">ESC</button>
+      <button
+        class="btn-close"
+        onclick={onclose}
+        aria-label="Close"
+        disabled={submitting}>ESC</button
+      >
     </div>
 
     <div class="fields">
@@ -65,6 +82,7 @@
           bind:value={symbol}
           oninput={enforceUppercase}
           placeholder="BTCUSDT"
+          disabled={submitting}
         />
       </label>
 
@@ -73,28 +91,22 @@
         <div class="toggle">
           <button
             class="toggle-btn"
-            class:active={side === 'Long'}
-            onclick={() => (side = 'Long')}
-          >LONG</button>
+            class:active={side === "Long"}
+            onclick={() => (side = "Long")}
+            disabled={submitting}>LONG</button
+          >
           <button
             class="toggle-btn"
-            class:active={side === 'Short'}
-            onclick={() => (side = 'Short')}
-          >SHORT</button>
+            class:active={side === "Short"}
+            onclick={() => (side = "Short")}
+            disabled={submitting}>SHORT</button
+          >
         </div>
       </div>
 
       <div class="field">
         <span class="label">ENTRY MODE</span>
-        <div class="toggle mode-toggle">
-          {#each entryModes as mode}
-            <button
-              class="toggle-btn"
-              class:active={entryMode === mode.value}
-              onclick={() => (entryMode = mode.value)}
-            >{mode.label}</button>
-          {/each}
-        </div>
+        <div class="fixed-value" aria-label="Entry mode">IMMEDIATE</div>
       </div>
 
       <div class="field">
@@ -102,14 +114,16 @@
         <div class="toggle">
           <button
             class="toggle-btn"
-            class:active={approval === 'automatic'}
-            onclick={() => (approval = 'automatic')}
-          >AUTOMATIC</button>
+            class:active={approval === "automatic"}
+            onclick={() => (approval = "automatic")}
+            disabled={submitting}>AUTOMATIC</button
+          >
           <button
             class="toggle-btn"
-            class:active={approval === 'human_confirmation'}
-            onclick={() => (approval = 'human_confirmation')}
-          >HUMAN CONFIRMATION</button>
+            class:active={approval === "human_confirmation"}
+            onclick={() => (approval = "human_confirmation")}
+            disabled={submitting}>HUMAN CONFIRMATION</button
+          >
         </div>
       </div>
     </div>
@@ -119,7 +133,7 @@
     {/if}
 
     <button class="btn-submit" onclick={submit} disabled={submitting}>
-      {submitting ? 'ARMING...' : 'ARM'}
+      {submitting ? "ARMING..." : "ARM"}
     </button>
   </div>
 </div>
@@ -210,9 +224,15 @@
     display: flex;
     gap: var(--s-1);
   }
-  .mode-toggle {
-    display: grid;
-    grid-template-columns: repeat(2, minmax(0, 1fr));
+  .fixed-value {
+    font-family: var(--font-mono);
+    font-size: var(--text-sm);
+    letter-spacing: var(--track-label);
+    color: var(--cyan-brand);
+    background: var(--cyan-subtle);
+    border: 1px solid var(--cyan-dim);
+    border-radius: var(--radius-sm);
+    padding: var(--s-2) var(--s-3);
   }
   .toggle-btn {
     flex: 1;
@@ -226,10 +246,18 @@
     border-radius: var(--radius-sm);
     padding: var(--s-2) var(--s-3);
     cursor: pointer;
-    transition: color var(--dur) var(--ease), border-color var(--dur) var(--ease), background var(--dur) var(--ease);
+    transition:
+      color var(--dur) var(--ease),
+      border-color var(--dur) var(--ease),
+      background var(--dur) var(--ease);
   }
   .toggle-btn:hover {
     border-color: var(--border-strong);
+  }
+  .toggle-btn:disabled,
+  .btn-close:disabled {
+    cursor: not-allowed;
+    opacity: 0.55;
   }
   .toggle-btn.active {
     color: var(--cyan-brand);

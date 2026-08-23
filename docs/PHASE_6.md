@@ -1,6 +1,6 @@
 # Phase 6: Detector Runtime ✅ COMPLETE
 
-**Version**: 2.0.0-alpha
+**Version**: 2.5.0
 **Status**: COMPLETE
 **Tests**: 35/35 passing
 **Last Updated**: 2026-01-17

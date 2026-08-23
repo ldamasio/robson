@@ -2,7 +2,7 @@
 
 **Status**: Living document — items accumulate as v3 scope is finalized.
 **Owner**: Operator (Leandro Damasio)
-**Last updated**: 2026-08-06
+**Last updated**: 2026-08-23
 
 Items in this backlog were explicitly deferred from v3 scope. They are not forgotten —
 they are intentionally parked until v3 is declared complete.
@@ -39,7 +39,9 @@ v3 is complete when all of the following are repository-verified:
 
 - [x] TD-2026-05-05-001 closed (`docs/technical-debt.md` Status: Closed)
 - [x] MIG-v3#8 Chaos testing suite implemented with repository tests passing
-- [x] MIG-v3#14 Risk Dashboard shipped in `apps/frontend/`
-- [x] MIG-v3#15 ARM Entry Policy Selection shipped in `apps/frontend/` (mode + approval controls in `ArmModal`)
+- [x] MIG-v3#14 Risk Dashboard shipped in `frontend/`
+- [ ] MIG-v3#15 strategy-backed ENTRY modes are each operationally accepted,
+  or explicitly deferred/abandoned for the v3 operator surface. The v2.5
+  dashboard intentionally supports `immediate` only.
 - [x] `v3-migration-plan.md` has no items marked `⏳ Pending`
 - [ ] Production running ≥ 30 days with 0 `position_untracked_detected` events (Grafana/Loki)

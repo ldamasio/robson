@@ -8,7 +8,7 @@
 >
 # Robson v2 Architecture
 
-**Version**: 2.0.0-alpha
+**Version**: 2.5.0
 **Last Updated**: 2026-01-12
 **Status**: Planning Phase
 

@@ -8,7 +8,7 @@
 >
 # Operational Smoke Test - Robson v2 MVP
 
-**Version**: 2.0.0-alpha
+**Version**: 2.5.0
 **Last Updated**: 2026-01-17
 **Scope**: Local MVP validation (StubExchange + MemoryStore)
 
@@ -77,7 +77,7 @@ sleep 3
 
 # 3. Check health endpoint
 curl http://localhost:8080/health
-# Expected: {"status":"healthy","version":"2.0.0-alpha"}
+# Expected: {"status":"healthy","version":"2.5.0"}
 
 # 4. Check status endpoint (should be empty initially)
 curl http://localhost:8080/status | jq

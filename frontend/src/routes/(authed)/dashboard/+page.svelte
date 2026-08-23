@@ -795,7 +795,7 @@
         void load();
       }}
       onresult={(r) => {
-        showToast(`${r.symbol} ${r.side} armed, detector active`, "ok");
+        showToast(`${r.symbol} ${r.side} immediate entry submitted`, "ok");
       }}
     />
   {/if}
