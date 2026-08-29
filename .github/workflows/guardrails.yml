@@ -49,7 +49,9 @@ jobs:
           exit 1
 
       - name: Run osv-scanner
-        run: ./osv-scanner scan source --lockfile Cargo.lock
+        run: |
+          ./osv-scanner scan source --lockfile Cargo.lock
+          ./osv-scanner scan source --lockfile frontend/pnpm-lock.yaml
 
   cargo-audit:
     name: Cargo Audit

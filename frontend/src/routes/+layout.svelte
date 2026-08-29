@@ -1,10 +1,10 @@
 <script lang="ts">
-  import '$design/tokens.css';
-  import { initAuth } from '$stores/auth';
-  import '$lib/i18n';
-  import { browser } from '$app/environment';
+  import "$design/tokens.css";
+  import { initAuth } from "$stores/auth";
+  import "$lib/i18n";
+  import { browser } from "$app/environment";
 
-  import type { Snippet } from 'svelte';
+  import type { Snippet } from "svelte";
   let { children }: { children: Snippet } = $props();
 
   if (browser) initAuth();
@@ -26,6 +26,12 @@
     -webkit-font-smoothing: antialiased;
     -moz-osx-font-smoothing: grayscale;
   }
+  :global(body) {
+    padding-top: env(safe-area-inset-top);
+    padding-right: env(safe-area-inset-right);
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-left: env(safe-area-inset-left);
+  }
   :global(*, *::before, *::after) {
     box-sizing: border-box;
   }
@@ -41,7 +47,9 @@
     color: var(--fg-0);
     text-decoration: none;
     border-bottom: 1px solid var(--border-strong);
-    transition: border-color var(--dur) var(--ease), color var(--dur) var(--ease);
+    transition:
+      border-color var(--dur) var(--ease),
+      color var(--dur) var(--ease);
   }
   :global(a:hover) {
     color: var(--cyan-brand);
@@ -52,7 +60,7 @@
     outline-offset: 2px;
   }
   .rbx-root {
-    min-height: 100vh;
+    min-height: 100dvh;
     background: var(--bg-0);
   }
 </style>

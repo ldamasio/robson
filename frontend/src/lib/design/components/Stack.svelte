@@ -1,7 +1,15 @@
 <script lang="ts">
-  import type { Snippet } from 'svelte';
-  let { gap = 4, align = 'stretch', children }: { gap?: number; align?: 'start' | 'center' | 'end' | 'stretch'; children: Snippet } = $props();
-  const gapVar = `var(--s-${gap})`;
+  import type { Snippet } from "svelte";
+  let {
+    gap = 4,
+    align = "stretch",
+    children,
+  }: {
+    gap?: number;
+    align?: "start" | "center" | "end" | "stretch";
+    children: Snippet;
+  } = $props();
+  const gapVar = $derived(`var(--s-${gap})`);
 </script>
 
 <div class="stack" style:--stack-gap={gapVar} style:--stack-align={align}>

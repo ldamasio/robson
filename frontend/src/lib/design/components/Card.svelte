@@ -1,7 +1,8 @@
 <script lang="ts">
-  import type { Snippet } from 'svelte';
-  let { padding = 5, children }: { padding?: number; children: Snippet } = $props();
-  const padVar = `var(--s-${padding})`;
+  import type { Snippet } from "svelte";
+  let { padding = 5, children }: { padding?: number; children: Snippet } =
+    $props();
+  const padVar = $derived(`var(--s-${padding})`);
 </script>
 
 <div class="card" style:--card-pad={padVar}>
@@ -23,7 +24,7 @@
   /* L-corner signature */
   .card::before,
   .card::after {
-    content: '';
+    content: "";
     position: absolute;
     width: 10px;
     height: 10px;

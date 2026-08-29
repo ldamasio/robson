@@ -5,6 +5,7 @@ dist/
 .env
 .env.*
 !.env.example
+!.env.android
 .DS_Store
 *.log
 coverage/

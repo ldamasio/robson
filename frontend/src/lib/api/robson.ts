@@ -5,8 +5,10 @@ import { browser } from "$app/environment";
 import { get as getStore } from "svelte/store";
 import { authToken } from "$stores/auth";
 import { env } from "$env/dynamic/public";
+import { assertMethodAllowed, resolveClientMode } from "$lib/config/clientMode";
 
 const API_BASE: string = env.PUBLIC_ROBSON_API_BASE ?? "";
+const CLIENT_MODE = resolveClientMode(env.PUBLIC_ROBSON_CLIENT_MODE);
 
 // --- Backend response types (match robsond serde output) ---
 
@@ -268,6 +270,8 @@ function getToken(): string | null {
 }
 
 async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+  const method = (init?.method ?? "GET").toUpperCase();
+  assertMethodAllowed(CLIENT_MODE, method, path);
   const token = getToken();
   const headers: Record<string, string> = {
     "Content-Type": "application/json",

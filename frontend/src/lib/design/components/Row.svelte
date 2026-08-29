@@ -1,13 +1,23 @@
 <script lang="ts">
-  import type { Snippet } from 'svelte';
-  let { gap = 4, align = 'center', justify = 'start', children }: { gap?: number; align?: 'start' | 'center' | 'end' | 'baseline'; justify?: 'start' | 'center' | 'end' | 'between' | 'around'; children: Snippet } = $props();
-  const gapVar = `var(--s-${gap})`;
+  import type { Snippet } from "svelte";
+  let {
+    gap = 4,
+    align = "center",
+    justify = "start",
+    children,
+  }: {
+    gap?: number;
+    align?: "start" | "center" | "end" | "baseline";
+    justify?: "start" | "center" | "end" | "between" | "around";
+    children: Snippet;
+  } = $props();
+  const gapVar = $derived(`var(--s-${gap})`);
   const justifyMap = {
-    start: 'flex-start',
-    center: 'center',
-    end: 'flex-end',
-    between: 'space-between',
-    around: 'space-around'
+    start: "flex-start",
+    center: "center",
+    end: "flex-end",
+    between: "space-between",
+    around: "space-around",
   };
 </script>
 

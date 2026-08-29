@@ -1,7 +1,11 @@
 <script lang="ts">
-  import type { Snippet } from 'svelte';
-  let { cols = 12, gap = 5, children }: { cols?: number; gap?: number; children: Snippet } = $props();
-  const gapVar = `var(--s-${gap})`;
+  import type { Snippet } from "svelte";
+  let {
+    cols = 12,
+    gap = 5,
+    children,
+  }: { cols?: number; gap?: number; children: Snippet } = $props();
+  const gapVar = $derived(`var(--s-${gap})`);
 </script>
 
 <div
@@ -17,5 +21,11 @@
     display: grid;
     grid-template-columns: var(--grid-cols);
     gap: var(--grid-gap);
+  }
+
+  @media (max-width: 640px) {
+    .grid {
+      grid-template-columns: 1fr;
+    }
   }
 </style>

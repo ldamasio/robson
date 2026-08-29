@@ -3,6 +3,10 @@
   "version": "0.0.1",
   "private": true,
   "type": "module",
+  "packageManager": "pnpm@11.19.0",
+  "engines": {
+    "node": ">=22"
+  },
   "scripts": {
     "dev": "vite dev",
     "build": "vite build",
@@ -12,25 +16,37 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "test:e2e": "playwright test",
-    "lint": "prettier --check . && eslint ."
+    "lint": "eslint .",
+    "build:android:web": "vite build --mode android",
+    "android:sync": "pnpm run build:android:web && cap sync android",
+    "android:open": "cap open android",
+    "android:run": "pnpm run android:sync && cap run android"
   },
   "devDependencies": {
-    "@playwright/test": "^1.40.0",
-    "@sveltejs/adapter-static": "^3.0.0",
-    "@sveltejs/kit": "^2.5.0",
-    "@sveltejs/vite-plugin-svelte": "^4.0.0",
-    "@types/node": "^20.11.0",
-    "eslint": "^9.0.0",
-    "jsdom": "^29.0.2",
-    "prettier": "^3.2.0",
-    "prettier-plugin-svelte": "^3.2.0",
-    "svelte": "^5.0.0",
-    "svelte-check": "^4.0.0",
-    "typescript": "^5.3.0",
-    "vite": "^6.0.0",
-    "vitest": "^3.0.0"
+    "@capacitor/android": "8.5.0",
+    "@capacitor/cli": "8.5.0",
+    "@eslint/js": "^9.39.5",
+    "@playwright/test": "^1.62.1",
+    "@sveltejs/adapter-static": "^3.0.10",
+    "@sveltejs/kit": "^2.70.3",
+    "@sveltejs/vite-plugin-svelte": "^5.1.1",
+    "@types/node": "^20.19.43",
+    "eslint": "^9.39.5",
+    "eslint-plugin-security": "^3.0.1",
+    "eslint-plugin-svelte": "^3.23.0",
+    "globals": "^16.5.0",
+    "jsdom": "^29.1.1",
+    "prettier": "^3.9.6",
+    "prettier-plugin-svelte": "^3.5.2",
+    "svelte": "^5.56.10",
+    "svelte-check": "^4.7.6",
+    "typescript": "^5.9.3",
+    "typescript-eslint": "^8.68.0",
+    "vite": "^6.4.3",
+    "vitest": "^3.2.7"
   },
   "dependencies": {
-    "svelte-i18n": "^4.0.0"
+    "@capacitor/core": "8.5.0",
+    "svelte-i18n": "^4.0.1"
   }
 }

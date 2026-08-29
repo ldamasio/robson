@@ -1,0 +1,11 @@
+allowBuilds:
+  es5-ext: false
+  esbuild: true
+  msw: false
+
+# Security backports for transitive dependencies whose parents still declare
+# vulnerable ranges. These are exercised by the repository verification suite.
+overrides:
+  cookie@<0.7.0: 0.7.2
+  esbuild@<=0.24.2: 0.25.12
+  uuid@<11.1.1: 11.1.1

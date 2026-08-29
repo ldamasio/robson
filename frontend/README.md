@@ -23,15 +23,40 @@ pnpm dev
 
 ## Scripts
 
-| Command | Purpose |
-|---------|---------|
-| `pnpm dev` | Run dev server (http://localhost:5173) |
-| `pnpm build` | Build static output to `build/` |
-| `pnpm preview` | Preview production build |
-| `pnpm check` | Run TypeScript + svelte-check |
-| `pnpm test` | Run Vitest unit tests |
-| `pnpm test:e2e` | Run Playwright E2E tests |
-| `pnpm lint` | Run Prettier + ESLint |
+| Command                  | Purpose                                                |
+| ------------------------ | ------------------------------------------------------ |
+| `pnpm dev`               | Run dev server (http://localhost:5173)                 |
+| `pnpm build`             | Build static output to `build/`                        |
+| `pnpm preview`           | Preview production build                               |
+| `pnpm check`             | Run TypeScript + svelte-check                          |
+| `pnpm test`              | Run Vitest unit tests                                  |
+| `pnpm test:e2e`          | Run Playwright E2E tests                               |
+| `pnpm lint`              | Run ESLint with TypeScript, Svelte, and security rules |
+| `pnpm build:android:web` | Build the MOB-P1 read-only Android web bundle          |
+| `pnpm android:sync`      | Build and copy the web bundle into the Android project |
+| `pnpm android:run`       | Sync and run on an attached Android device             |
+
+## Android MOB-P1
+
+The Android client is a Capacitor delivery target of this SvelteKit app. The
+first milestone is intentionally read-only: its token is memory-only, mutation
+controls are hidden, and non-GET/HEAD API calls are rejected before `fetch`.
+
+Capacitor 8 requires Node.js 22 or later. Android packaging also requires the
+official Android SDK on an x86_64 host. The POCO can build and test the web
+bundle through `scripts/poco-web-worker.sh`, but Gradle packaging remains on
+the Linux Mint host.
+
+```bash
+pnpm install --frozen-lockfile
+pnpm android:sync
+adb devices
+pnpm android:run
+```
+
+See ADR-0054 and
+`docs/implementation/2026-08-29-android-client-mob-p1.md` for scope and
+acceptance gates.
 
 ## Architecture
 

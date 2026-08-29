@@ -44,6 +44,11 @@
     eventTypeLabel,
   } from "$lib/presentation/labels";
   import { _ } from "svelte-i18n";
+  import { env } from "$env/dynamic/public";
+  import { resolveClientMode } from "$lib/config/clientMode";
+
+  const mutationsEnabled =
+    resolveClientMode(env.PUBLIC_ROBSON_CLIENT_MODE) === "operator";
 
   let error = $state<string | null>(null);
   let connected = $state(false);
@@ -465,10 +470,12 @@
           <button class="btn-entry" onclick={returnToCurrentMonth}>NOW</button>
         {:else if haltState === "monthly_halt"}
           <button class="btn-entry" disabled>HALT</button>
-        {:else}
+        {:else if mutationsEnabled}
           <button class="btn-entry" onclick={() => (showArmModal = true)}
             >{topBarActionLabel()}</button
           >
+        {:else}
+          <span class="read-only-label">MOBILE OBSERVER</span>
         {/if}
       </Row>
     </Row>
@@ -497,7 +504,7 @@
           <span>{$_("dashboard.monthlyBudgetLowBanner")}</span>
         </Row>
       </div>
-    {:else if insufficientCapital}
+    {:else if insufficientCapital && mutationsEnabled}
       <a href="/funding" class="capital-banner">
         <Row justify="between" align="center">
           <span>{$_("dashboard.insufficientCapitalBanner")}</span>
@@ -662,11 +669,14 @@
                       <pre class="history-summary">{positionSummaryLines(
                           op,
                         ).join("\n")}</pre>
-                      <Row justify="end">
-                        <button class="btn-disarm" onclick={() => disarm(op.id)}
-                          >DISARM</button
-                        >
-                      </Row>
+                      {#if mutationsEnabled}
+                        <Row justify="end">
+                          <button
+                            class="btn-disarm"
+                            onclick={() => disarm(op.id)}>DISARM</button
+                          >
+                        </Row>
+                      {/if}
                     </Stack>
                   </Card>
                 </div>
@@ -736,10 +746,12 @@
                     >expires in {countdownRemaining(approval.expires_at)}</span
                   >
                 </Stack>
-                <button
-                  class="btn-approve"
-                  onclick={() => approve(approval.query_id)}>APPROVE</button
-                >
+                {#if mutationsEnabled}
+                  <button
+                    class="btn-approve"
+                    onclick={() => approve(approval.query_id)}>APPROVE</button
+                  >
+                {/if}
               </Row>
             </Card>
           {/each}
@@ -788,7 +800,7 @@
     {/if}
   {/if}
 
-  {#if showArmModal}
+  {#if mutationsEnabled && showArmModal}
     <ArmModal
       onclose={() => {
         showArmModal = false;
@@ -823,6 +835,12 @@
     display: flex;
     flex-direction: column;
     gap: var(--s-7);
+  }
+  .read-only-label {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    letter-spacing: var(--track-label);
+    color: var(--warn);
   }
   .capital-banner {
     display: block;
@@ -1097,20 +1115,6 @@
     cursor: not-allowed;
     opacity: 0.8;
   }
-  /* Sober, always-present treasury link (Zurich): quieter than the primary
-     action button, no border, dim until hover. */
-  .nav-link {
-    font-family: var(--font-mono);
-    font-size: var(--text-xs);
-    text-transform: uppercase;
-    letter-spacing: var(--track-label);
-    color: var(--fg-2);
-    text-decoration: none;
-    transition: color var(--dur) var(--ease);
-  }
-  .nav-link:hover {
-    color: var(--cyan-brand);
-  }
   .btn-approve {
     font-family: var(--font-mono);
     font-size: var(--text-xs);
@@ -1196,6 +1200,37 @@
     to {
       opacity: 1;
       transform: translateY(0);
+    }
+  }
+  @media (max-width: 640px) {
+    .dashboard {
+      padding: var(--s-4) var(--s-3);
+      gap: var(--s-5);
+    }
+    .risk-grid {
+      grid-template-columns: 1fr;
+    }
+    .slots-grid {
+      grid-template-columns: repeat(auto-fit, minmax(48px, 1fr));
+    }
+    .slot {
+      width: 100%;
+      height: auto;
+      aspect-ratio: 1;
+    }
+    .event-line {
+      display: grid;
+      grid-template-columns: auto 1fr;
+      gap: var(--s-1) var(--s-2);
+    }
+    .event-line .type {
+      grid-column: 2;
+      overflow-wrap: anywhere;
+    }
+    .toast-container {
+      right: var(--s-3);
+      bottom: calc(var(--s-3) + env(safe-area-inset-bottom));
+      left: var(--s-3);
     }
   }
 </style>

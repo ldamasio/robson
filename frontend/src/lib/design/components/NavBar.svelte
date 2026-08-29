@@ -1,7 +1,12 @@
 <script lang="ts">
-  import { page } from '$app/stores';
-  import { status, refreshStatus } from '$stores/status';
-  import Row from './Row.svelte';
+  import { page } from "$app/stores";
+  import { status, refreshStatus } from "$stores/status";
+  import { env } from "$env/dynamic/public";
+  import { resolveClientMode } from "$lib/config/clientMode";
+  import Row from "./Row.svelte";
+
+  const mobileReadOnly =
+    resolveClientMode(env.PUBLIC_ROBSON_CLIENT_MODE) === "mobile-readonly";
 
   $effect(() => {
     void refreshStatus().catch(() => {});
@@ -10,7 +15,7 @@
   let currentPath = $derived($page.url.pathname);
 
   function isActive(href: string): boolean {
-    if (href === '/') return currentPath === '/';
+    if (href === "/") return currentPath === "/";
     return currentPath.startsWith(href);
   }
 </script>
@@ -23,17 +28,24 @@
         <img src="/brand/wordmark-robson.svg" alt="Robson" height={16} />
       </a>
       <div class="nav-links">
-        <a href="/" class="nav-link" class:active={isActive('/')}>Dashboard</a>
-        <a href="/funding" class="nav-link" class:active={isActive('/funding')}
-          >Tesouraria</a
-        >
+        <a href="/" class="nav-link" class:active={isActive("/")}>Dashboard</a>
+        {#if !mobileReadOnly}
+          <a
+            href="/funding"
+            class="nav-link"
+            class:active={isActive("/funding")}>Tesouraria</a
+          >
+        {/if}
       </div>
     </Row>
     <Row gap={4} align="center">
+      {#if mobileReadOnly}
+        <span class="read-only">READ ONLY</span>
+      {/if}
       {#if $status !== null}
         <span class="capital" title="USDT-M futures wallet">
           <span class="capital-label">FUTURES</span>
-          <span class="capital-value">{($status.wallet_balance).toFixed(2)}</span>
+          <span class="capital-value">{$status.wallet_balance.toFixed(2)}</span>
           <span class="capital-unit">USDT</span>
         </span>
       {/if}
@@ -82,7 +94,8 @@
     text-decoration: none;
     padding: var(--s-1) var(--s-2);
     border-bottom: 1px solid transparent;
-    transition: color var(--dur) var(--ease),
+    transition:
+      color var(--dur) var(--ease),
       border-color var(--dur) var(--ease);
   }
 
@@ -120,5 +133,27 @@
   .capital-unit {
     font-size: var(--text-xs);
     color: var(--fg-2);
+  }
+  .read-only {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    letter-spacing: var(--track-label);
+    color: var(--warn);
+    border: 1px solid var(--warn);
+    border-radius: var(--radius-sm);
+    padding: var(--s-1) var(--s-2);
+    white-space: nowrap;
+  }
+  @media (max-width: 640px) {
+    .navbar {
+      height: auto;
+      min-height: var(--header-h);
+      padding: var(--s-2) var(--s-3);
+    }
+    .capital-label,
+    .capital-unit,
+    .nav-links {
+      display: none;
+    }
   }
 </style>
