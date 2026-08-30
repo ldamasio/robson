@@ -73,9 +73,10 @@ Collected on 2026-08-29 from the isolated `feat/android-client` worktree:
 - The minimal JDK/SDK toolchain occupies 980 MB. The reusable first-build
   Gradle cache occupies 689 MB; no Android Studio, emulator, system image,
   NDK, or CMake is installed.
-- ADB reports the authorized physical device `2602BPC18G`, Android 16/API 36,
-  ARM64, with WebView 151. HyperOS blocked `adb install`, so the verified APK
-  was copied to Downloads and installed manually by the operator.
+- ADB reports one authorized physical POCO device, Android 16/API 36, ARM64,
+  with WebView 151. The device serial is intentionally excluded from repository
+  evidence. HyperOS blocked `adb install`, so the verified APK was copied to
+  Downloads and installed manually by the operator.
 - ADB confirms `br.ia.rbx.robson/.MainActivity` is foreground with no fatal
   application error. Capacitor emits an early, non-fatal safe-area CSS
   injection error that needs follow-up before release packaging.
@@ -113,3 +114,20 @@ Collected on 2026-08-29 from the isolated `feat/android-client` worktree:
 MOB-P1 repository implementation and physical launch are complete through
 MOB-P1-G6 and MOB-P1-G8. Authenticated physical-device rollout remains pending
 until observer authentication exists and MOB-P1-G7 is recorded.
+
+## Mobile Continuity Validation
+
+Validated locally on 2026-08-30 without changing phone settings:
+
+- `scripts/android-device-cycle.sh doctor` confirmed the minimal host toolchain
+  and exactly one authorized physical device without printing its serial.
+- Frontend type-check passed with no diagnostics, ESLint passed with the eight
+  pre-existing warnings, and all 122 frontend unit tests passed.
+- The Android application unit test, debug APK, and instrumentation APK built
+  successfully from the `:app` module.
+- ADB replacement installation of the application APK passed and MainActivity
+  became the focused activity on the physical device.
+- Installation of the `testOnly` instrumentation APK remains locally blocked by
+  the device's user-restriction policy. No phone setting was changed to bypass
+  it. Device instrumentation is therefore pending, while host-side Android tests
+  and the physical application install/launch cycle are validated.
