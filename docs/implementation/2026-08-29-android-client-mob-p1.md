@@ -131,3 +131,67 @@ Validated locally on 2026-08-30 without changing phone settings:
   the device's user-restriction policy. No phone setting was changed to bypass
   it. Device instrumentation is therefore pending, while host-side Android tests
   and the physical application install/launch cycle are validated.
+
+## Offline-State Follow-up
+
+Repository-verified on 2026-08-30:
+
+- The client observes the browser and Android WebView `online` and `offline`
+  hints and rechecks the hint when the application returns to the foreground.
+- A localized global banner marks displayed data as potentially stale while the
+  device reports that it is offline.
+- The dashboard reloads its REST snapshot and restarts the bounded-backoff SSE
+  connection immediately after an offline-to-online transition.
+- Listener setup is idempotent and all network listeners are removed with the
+  root application lifecycle. Four focused unit tests cover initialization,
+  transitions, foreground refresh, and cleanup.
+- `navigator.onLine` is only a device-network hint. Backend errors and SSE
+  freshness remain separate signals because an online device can still be
+  unable to reach robsond.
+
+Locally validated:
+
+- The online login page rendered without a false offline banner or browser
+  console errors.
+- The offline banner rendered with the RBX warning color, centered status text,
+  and a live-region role in an isolated local browser check.
+- Frontend type-check and Android-mode build passed, all 133 unit tests passed,
+  and ESLint retained only the eight pre-existing warnings.
+
+Physical loss and restoration of Wi-Fi or mobile data remains pending an
+operator-confirmed device test. No phone network setting was changed during
+this implementation.
+
+## Native Leave-Application Follow-up
+
+Repository-verified on 2026-08-30:
+
+- The Android app exposes a native-only leave button on every route. The web
+  client does not render the action.
+- The button uses the Capacitor `minimizeApp()` lifecycle API. It does not call
+  `exitApp()`, kill the process, intercept system Back, or disable Android
+  Predictive Back behavior.
+- Leaving the app and logging out are separate actions. The leave action moves
+  Robson to the background and preserves the in-memory session; logout clears
+  local authentication and returns to the login route.
+- The control has an accessible localized name, a 48 by 48 CSS-pixel touch
+  target, keyboard focus behavior from the shared design system, and protection
+  against duplicate taps while the native lifecycle call is in flight.
+- Two unit tests verify the Android lifecycle call and ensure that the web path
+  does not invoke the Android-only API.
+
+Locally validated:
+
+- At a 393 by 852 mobile viewport, the native-only control rendered at 48 by 48
+  CSS pixels without horizontal overflow or browser console errors.
+- The unmodified web runtime did not render the native action.
+
+Physical-device status:
+
+- The final APK passed the full device cycle, installed successfully, and left
+  Robson as the focused activity on the physical POCO.
+- The device screen slept before the accessibility-tree and button-tap check.
+  HyperOS rejected ADB input injection, so no wake, unlock, or policy bypass was
+  attempted. A manual operator tap remains pending.
+- No application process, phone permission, or device setting was changed to
+  bypass that restriction.
