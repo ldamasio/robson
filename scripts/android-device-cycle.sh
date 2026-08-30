@@ -133,6 +133,13 @@ verify_frontend() {
   )
 }
 
+verify_android_identity() {
+  (
+    cd "${FRONTEND_DIR}"
+    pnpm run verify:android:identity
+  )
+}
+
 build_apk() {
   prepare_host
   (
@@ -153,6 +160,7 @@ build_apk() {
 
 install_apk() {
   prepare_host
+  verify_android_identity
   require_one_physical_device
   [[ -f "${APK_PATH}" ]] || fail "debug APK is missing; run build first"
   if ! adb install -r "${APK_PATH}"; then
@@ -162,6 +170,7 @@ install_apk() {
 
 stage_apk() {
   prepare_host
+  verify_android_identity
   require_one_physical_device
   [[ -f "${APK_PATH}" ]] || fail "debug APK is missing; run build first"
   adb push "${APK_PATH}" /sdcard/Download/Robson-debug.apk >/dev/null
@@ -204,6 +213,8 @@ case "${ACTION}" in
   instrumented-test) run_instrumented_tests ;;
   launch) launch_app ;;
   cycle)
+    prepare_host
+    verify_android_identity
     doctor
     verify_frontend
     build_apk

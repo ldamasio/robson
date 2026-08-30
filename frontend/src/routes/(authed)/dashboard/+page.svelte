@@ -18,6 +18,7 @@
   import { recentEvents, pushEvent, mergeEvents } from "$stores/events";
   import { toasts, showToast } from "$stores/toast";
   import { status as sharedStatus, refreshStatus } from "$stores/status";
+  import { connectivity } from "$stores/connectivity";
   import {
     sseFreshness,
     markSseEvent,
@@ -66,6 +67,8 @@
   let approvalTick = $state(Date.now());
   let approvalTickTimer: ReturnType<typeof setInterval> | null = null;
   let sseRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let connectivityObserved = false;
+  let wasOnline = true;
 
   // Clock-reactive: recomputed on every approvalTick so an open tab notices
   // the UTC month rollover instead of keeping the mount-time month (#133).
@@ -357,6 +360,16 @@
     void load();
     startSse();
   }
+
+  $effect(() => {
+    const { initialized, online } = $connectivity;
+    if (!initialized) return;
+    if (connectivityObserved && online && !wasOnline) {
+      untrack(retry);
+    }
+    connectivityObserved = true;
+    wasOnline = online;
+  });
 
   function prevMonth() {
     selectedMonth = shiftMonth(selectedMonth, -1);

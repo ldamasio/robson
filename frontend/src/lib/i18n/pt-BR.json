@@ -8,7 +8,11 @@
   },
   "auth": {
     "login": "Entrar com GitHub",
-    "logout": "Sair"
+    "logout": "Sair",
+    "leaveApp": "Sair do app"
+  },
+  "network": {
+    "offline": "OFFLINE · DADOS TALVEZ DEFASADOS"
   },
   "disclaimer": {
     "label": "Risco",
