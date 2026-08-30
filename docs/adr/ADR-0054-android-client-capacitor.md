@@ -37,9 +37,10 @@ the existing SvelteKit application.
 - Mobile read-only mode hides primary mutation affordances and rejects every
   non-GET/HEAD API request in the shared API client. This is defense in depth,
   not an authorization boundary; robsond remains authoritative.
-- The bearer token is memory-only in mobile read-only mode and must be entered
-  again after the WebView process is destroyed. The existing browser build
-  keeps its accepted `sessionStorage` behavior from ADR-0025.
+- The RBX Identity OIDC access token is memory-only in mobile read-only mode and
+  is obtained through native Authorization Code + PKCE. The legacy token input
+  is disabled in the Android build. The existing operator browser build keeps
+  its ADR-0025 fallback until the session BFF rollout in ADR-0055.
 - Android packaging and deployment use the Mint Android SDK. Web bundle,
   type-check, lint, and unit-test work may run on the POCO through the
   allow-listed `scripts/poco-web-worker.sh` wrapper.
@@ -88,9 +89,10 @@ Capacitor plugin.
 
 ## Security Controls
 
-- No API token, signing key, or endpoint credential is embedded in the APK.
-- MOB-P1 tokens are memory-only and read-only mode is enforced at the UI and
-  API-client layers.
+- No API token, client secret, signing key, or endpoint credential is embedded
+  in the APK. Public OIDC client metadata is injected at build time.
+- Android OIDC tokens are memory-only. Read-only mode is enforced at the UI and
+  API-client layers, and the backend additionally requires the observer role.
 - Release signing material stays outside the repository. MOB-P1 produces
   debug APKs only.
 - Dependencies are version-pinned, the pnpm lockfile is committed, and the
@@ -148,3 +150,4 @@ Capacitor plugin.
 - Verification guide:
   `docs/implementation/2026-08-29-android-client-mob-p1.md`.
 - Related decisions: ADR-0025, ADR-0027, ADR-0030, ADR-0032, ADR-0047.
+- Identity follow-up: ADR-0055.

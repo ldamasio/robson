@@ -17,12 +17,12 @@ use std::{
 
 use async_stream::stream;
 use axum::{
-    extract::{Path, Query, Request, State},
+    extract::{Extension, Path, Query, Request, State},
     http::{header, HeaderMap, HeaderValue, Method, StatusCode},
     middleware::Next,
     response::{
         sse::{KeepAlive, Sse},
-        IntoResponse,
+        IntoResponse, Response,
     },
     routing::{delete, get, post},
     Json, Router,
@@ -46,6 +46,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
+    auth::{AuthContext, AuthError, AuthService, RequiredPermission},
     circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot},
     config::FundingConfig,
     error::DaemonError,
@@ -74,9 +75,8 @@ pub struct ApiState<E: ExchangePort + 'static, S: Store + 'static> {
     pub pg_pool: Option<std::sync::Arc<sqlx::PgPool>>,
     #[cfg(feature = "postgres")]
     pub tenant_id: Option<Uuid>,
-    /// Bearer token for authenticating mutating routes. `None` means auth is
-    /// disabled (non-production environments only).
-    pub api_token: Option<String>,
+    /// RBX Identity OIDC verifier plus temporary legacy-token fallback.
+    pub auth: AuthService,
     pub funding: FundingConfig,
 }
 
@@ -451,6 +451,17 @@ pub struct ErrorResponse {
     pub error: String,
 }
 
+#[derive(Debug, Serialize)]
+pub struct AuthSessionResponse {
+    pub authenticated: bool,
+    pub auth_method: crate::auth::AuthMethod,
+    pub issuer: String,
+    pub subject: String,
+    pub client_id: Option<String>,
+    pub roles: Vec<String>,
+    pub permissions: Vec<&'static str>,
+}
+
 fn default_usdt_asset() -> String {
     "USDT".to_string()
 }
@@ -626,100 +637,143 @@ pub struct BinancePositionInfo {
 
 /// Create the API router.
 ///
-/// Public read-only routes are mounted without authentication.
-/// Operator-sensitive and mutating routes use bearer-token authentication.
+/// Health and metrics routes stay public for platform probes. Product data,
+/// SSE, and mutations require backend-enforced RBX roles. A configured legacy
+/// token temporarily grants every permission during migration.
 pub fn create_router<E, S>(state: Arc<ApiState<E, S>>) -> Router
 where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
-    // Read-only routes — no auth required
-    let read_only = Router::new()
+    let public = Router::new()
         // Kubernetes health probes
         .route("/healthz", get(health_liveness))
         .route("/readyz", get(health_readiness))
-        // Standard read-only endpoints
         .route("/health", get(health_handler))
+        // Prometheus metrics
+        .route("/metrics", get(metrics_handler))
+        .with_state(state.clone());
+
+    let observer_auth = state.auth.clone();
+    let observer = Router::new()
+        .route("/auth/session", get(auth_session_handler))
         .route("/status", get(status_handler))
         .route("/positions", get(month_positions_handler))
         .route("/positions/:id", get(get_position_handler))
-        // Prometheus metrics
-        .route("/metrics", get(metrics_handler))
         // Safety net read-only endpoints
         .route("/safety/status", get(safety_status_handler))
         .route("/safety/test", get(safety_test_handler))
         // MonthlyHalt status (read-only)
         .route("/monthly-halt", get(monthly_halt_status_handler))
-        .with_state(state.clone());
-
-    // Operator-sensitive and mutating routes — bearer token required
-    let token = state.api_token.clone();
-    let auth_layer = axum::middleware::from_fn(move |req: Request, next: Next| {
-        let expected = token.clone();
-        async move {
-            // No token configured — auth disabled
-            let Some(expected) = expected else {
-                return next.run(req).await;
-            };
-
-            // Extract Authorization header
-            let auth_header =
-                req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
-
-            match auth_header {
-                Some(value) if value.starts_with("Bearer ") => {
-                    let provided = &value[7..];
-                    if provided == expected {
-                        next.run(req).await
-                    } else {
-                        (
-                            StatusCode::UNAUTHORIZED,
-                            Json(ErrorResponse {
-                                error: "Invalid bearer token".to_string(),
-                            }),
-                        )
-                            .into_response()
-                    }
-                },
-                _ => (
-                    StatusCode::UNAUTHORIZED,
-                    Json(ErrorResponse {
-                        error: "Missing or invalid Authorization header".to_string(),
-                    }),
-                )
-                    .into_response(),
-            }
-        }
-    });
-    let authenticated = Router::new()
         // SSE — authenticated via Bearer header (not query param)
         .route("/events", get(events_handler))
         // Durable event bootstrap for the operator dashboard.
         .route("/events/history", get(event_history_handler))
+        .route("/funding/:id", get(funding_get_handler::<E, S>))
+        .route("/funding", get(funding_list_handler::<E, S>))
+        .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
+            let auth = observer_auth.clone();
+            async move {
+                authorize_request(auth, RequiredPermission::Observer, req, next).await
+            }
+        }))
+        .with_state(state.clone());
+
+    let operator_auth = state.auth.clone();
+    let operator = Router::new()
         .route("/positions", post(arm_handler))
         .route("/positions/:id", delete(cancel_or_close_handler))
         .route("/positions/:id/signal", post(signal_handler))
         .route("/queries/:id/approve", post(approve_query_handler))
-        .route("/panic", post(panic_handler))
-        // MonthlyHalt trigger (mutating)
-        .route("/monthly-halt", post(monthly_halt_trigger_handler))
         // Manual reconciliation close (Slice 5B1)
         .route("/reconcile-close", post(reconcile_close_handler))
         // Manual acknowledgement of an unmatched income-ledger item.
         .route("/income/:exchange_income_id/ack", post(income_ack_handler::<E, S>))
+        .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
+            let auth = operator_auth.clone();
+            async move {
+                authorize_request(auth, RequiredPermission::Operator, req, next).await
+            }
+        }))
+        .with_state(state.clone());
+
+    let funding_auth = state.auth.clone();
+    let funding = Router::new()
         .route("/funding/quote", post(funding_quote_handler::<E, S>))
         .route("/funding/execute", post(funding_execute_handler::<E, S>))
         .route(
             "/funding/recover-spot-usdt-to-futures",
             post(funding_recover_spot_usdt_to_futures_handler::<E, S>),
         )
-        .route("/funding/:id", get(funding_get_handler::<E, S>))
-        .route("/funding", get(funding_list_handler::<E, S>))
         .route("/capital/refresh", post(capital_refresh_handler::<E, S>))
-        .layer(auth_layer)
+        .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
+            let auth = funding_auth.clone();
+            async move { authorize_request(auth, RequiredPermission::Funding, req, next).await }
+        }))
+        .with_state(state.clone());
+
+    let emergency_auth = state.auth.clone();
+    let emergency = Router::new()
+        .route("/panic", post(panic_handler))
+        .route("/monthly-halt", post(monthly_halt_trigger_handler))
+        .layer(axum::middleware::from_fn(move |req: Request, next: Next| {
+            let auth = emergency_auth.clone();
+            async move { authorize_request(auth, RequiredPermission::Emergency, req, next).await }
+        }))
         .with_state(state);
 
-    read_only.merge(authenticated).layer(build_cors_layer())
+    public
+        .merge(observer)
+        .merge(operator)
+        .merge(funding)
+        .merge(emergency)
+        .layer(build_cors_layer())
+}
+
+async fn authorize_request(
+    auth: AuthService,
+    required: RequiredPermission,
+    mut request: Request,
+    next: Next,
+) -> Response {
+    let authorization = request
+        .headers()
+        .get(header::AUTHORIZATION)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
+
+    match auth.authenticate(authorization.as_deref(), required).await {
+        Ok(context) => {
+            request.extensions_mut().insert(context);
+            next.run(request).await
+        },
+        Err(error) => {
+            let (status, code) = match error {
+                AuthError::MissingBearer => (StatusCode::UNAUTHORIZED, "authentication_required"),
+                AuthError::InvalidToken => (StatusCode::UNAUTHORIZED, "invalid_bearer_token"),
+                AuthError::Forbidden => (StatusCode::FORBIDDEN, "insufficient_robson_role"),
+                AuthError::IdentityUnavailable => {
+                    (StatusCode::SERVICE_UNAVAILABLE, "identity_unavailable")
+                },
+            };
+            (status, Json(ErrorResponse { error: code.to_owned() })).into_response()
+        },
+    }
+}
+
+async fn auth_session_handler(
+    Extension(context): Extension<AuthContext>,
+) -> Json<AuthSessionResponse> {
+    let permissions = context.permissions();
+    Json(AuthSessionResponse {
+        authenticated: true,
+        auth_method: context.method,
+        issuer: context.issuer,
+        subject: context.subject,
+        client_id: context.client_id,
+        roles: context.roles.into_iter().collect(),
+        permissions,
+    })
 }
 
 // =============================================================================
@@ -3039,7 +3093,7 @@ mod tests {
             pg_pool: None,
             #[cfg(feature = "postgres")]
             tenant_id: None,
-            api_token: None,
+            auth: AuthService::new(None, None),
             funding: FundingConfig::default(),
         })
     }
@@ -3494,7 +3548,7 @@ mod tests {
             pg_pool: None,
             #[cfg(feature = "postgres")]
             tenant_id: None,
-            api_token: None,
+            auth: AuthService::new(None, None),
             funding: FundingConfig::default(),
         });
 
@@ -4515,7 +4569,7 @@ mod tests {
                 pg_pool: None,
                 #[cfg(feature = "postgres")]
                 tenant_id: None,
-                api_token: Some("secret-token-123".to_string()),
+                auth: AuthService::new(Some("secret-token-123".to_string()), None),
                 funding: FundingConfig::default(),
             });
 
@@ -4531,6 +4585,7 @@ mod tests {
         });
 
         let response = app_with_token
+            .clone()
             .oneshot(
                 Request::builder()
                     .method("POST")
@@ -4543,6 +4598,33 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let read_response = app_with_token
+            .clone()
+            .oneshot(Request::builder().method("GET").uri("/status").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        assert_eq!(read_response.status(), StatusCode::UNAUTHORIZED);
+
+        let session_response = app_with_token
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/auth/session")
+                    .header("authorization", "Bearer secret-token-123")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(session_response.status(), StatusCode::OK);
+        let body = session_response.into_body().collect().await.unwrap().to_bytes();
+        let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+        assert_eq!(json["auth_method"], "legacy_token");
+        assert_eq!(
+            json["permissions"],
+            serde_json::json!(["observer", "operator", "funding", "emergency"])
+        );
     }
 
     #[tokio::test]

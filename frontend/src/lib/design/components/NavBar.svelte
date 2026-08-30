@@ -1,8 +1,10 @@
 <script lang="ts">
+  import { goto } from "$app/navigation";
   import { page } from "$app/stores";
   import { status, refreshStatus } from "$stores/status";
   import { env } from "$env/dynamic/public";
   import { resolveClientMode } from "$lib/config/clientMode";
+  import { clearAuth } from "$stores/auth";
   import Row from "./Row.svelte";
 
   const mobileReadOnly =
@@ -17,6 +19,11 @@
   function isActive(href: string): boolean {
     if (href === "/") return currentPath === "/";
     return currentPath.startsWith(href);
+  }
+
+  function logout() {
+    clearAuth();
+    void goto("/login", { replaceState: true });
   }
 </script>
 
@@ -49,6 +56,7 @@
           <span class="capital-unit">USDT</span>
         </span>
       {/if}
+      <button class="logout" type="button" onclick={logout}>Sair</button>
     </Row>
   </Row>
 </nav>
@@ -143,6 +151,18 @@
     border-radius: var(--radius-sm);
     padding: var(--s-1) var(--s-2);
     white-space: nowrap;
+  }
+  .logout {
+    border: 0;
+    background: transparent;
+    color: var(--fg-2);
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    cursor: pointer;
+    text-transform: uppercase;
+  }
+  .logout:hover {
+    color: var(--cyan-brand);
   }
   @media (max-width: 640px) {
     .navbar {

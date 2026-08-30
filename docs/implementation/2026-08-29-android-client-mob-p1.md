@@ -1,6 +1,6 @@
 # MOB-P1 Android Client Implementation
 
-Status: Repository implementation and device launch complete; authenticated smoke pending
+Status: Repository implementation and device launch complete; RBX Identity smoke pending
 Date: 2026-08-29
 Decision: ADR-0054
 
@@ -14,13 +14,15 @@ read-only. It must not arm, approve, disarm, halt, panic, or move funds.
 
 - `frontend/` is a SvelteKit static application and already talks to robsond
   through typed REST and SSE clients.
-- The web application stores the operator token in `sessionStorage` under the
-  accepted ADR-0025 policy.
+- The operator web build retains the ADR-0025 migration fallback. The Android
+  build disables manual tokens and implements memory-only RBX Identity OIDC per
+  ADR-0055.
 - The Mint host has a checksummed, user-local JDK 21 and minimal Android API 36
   toolchain under `~/.local/share/rbx/android`; no IDE or emulator is installed.
 - The POCO Termux and SSH worker setup is not yet operationally verified.
 - A debug APK has been built, manually installed on the connected POCO, and
-  launched. Observer-scoped authentication is not implemented yet.
+  launched. Observer authentication is repository-implemented; operational
+  client registration and device login remain pending.
 
 ## MOB-P1 Deliverables
 
@@ -78,20 +80,19 @@ Collected on 2026-08-29 from the isolated `feat/android-client` worktree:
   application error. Capacitor emits an early, non-fatal safe-area CSS
   injection error that needs follow-up before release packaging.
 
-## Authentication Limitation Found on Device
+## Authentication Limitation Found on Device and Resolution
 
-- The login probe calls public `GET /health`, so any non-empty placeholder
-  currently passes the login screen. This does not prove authentication.
-- robsond currently uses one `ROBSON_API_TOKEN` for authenticated SSE/history
-  and every mutation route; it does not expose an observer-only scope.
-- The mobile API client still rejects every non-GET/HEAD request and keeps the
-  token in memory, but that client-side control cannot reduce the authority of
-  a production token.
-- MOB-P1 device testing therefore uses a non-secret dummy value only. Exchange
-  API keys and the production Robson operator token are prohibited in this
-  debug client.
-- The next security slice must add backend-enforced observer credentials and a
-  real authentication probe before MOB-P1-G7 can pass.
+- The original login probe called public `GET /health`, so any placeholder
+  passed. IAM-P1 replaces it with protected `GET /auth/session`.
+- `robsond` now validates RBX Identity JWTs and enforces observer, operator,
+  funding, and emergency roles. Product reads and SSE require at least the
+  observer role.
+- The Android build no longer renders the legacy-token form. Its OIDC client id
+  is intentionally empty until the native client is registered, so it fails
+  visibly as not configured rather than accepting a dummy value.
+- Physical authenticated validation remains pending because no operational
+  ZITADEL client/role grant is repository-verified. Production operator or
+  exchange tokens remain prohibited in the debug client.
 
 ## Physical Device Smoke Test
 
@@ -100,8 +101,9 @@ Collected on 2026-08-29 from the isolated `feat/android-client` worktree:
 3. Build and sync the Android web bundle.
 4. Build the debug APK on Mint.
 5. Install with ADB and open Robson.
-6. Enter a test or scoped read-only token. Never paste a production mutation
-   token into logs or terminal history.
+6. Authenticate through RBX Identity with an invited observer-only test user.
+   Never paste a production mutation token into the app, logs, or terminal
+   history.
 7. Confirm dashboard, operation detail, event history, and stale SSE behavior.
 8. Confirm ARM, approval, disarm, halt, panic, and funding mutations are absent
    or rejected.

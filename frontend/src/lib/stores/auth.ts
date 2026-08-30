@@ -5,7 +5,7 @@ import { resolveClientMode } from "$lib/config/clientMode";
 
 export type Session = {
   authenticated: boolean;
-  tokenSource: "stored" | "session" | "none";
+  tokenSource: "legacy" | "oidc" | "none";
 };
 
 const STORAGE_KEY = "robson_api_token";
@@ -14,9 +14,10 @@ const persistToken =
 
 function createAuthStore() {
   const token = writable<string | null>(null);
-  const session = derived(token, ($token): Session => {
+  const source = writable<Session["tokenSource"]>("none");
+  const session = derived([token, source], ([$token, $source]): Session => {
     if (!$token) return { authenticated: false, tokenSource: "none" };
-    return { authenticated: true, tokenSource: "stored" };
+    return { authenticated: true, tokenSource: $source };
   });
 
   function init() {
@@ -24,17 +25,22 @@ function createAuthStore() {
     const stored = sessionStorage.getItem(STORAGE_KEY);
     if (stored) {
       token.set(stored);
+      source.set("legacy");
     }
   }
 
-  function setToken(t: string) {
-    if (browser && persistToken) sessionStorage.setItem(STORAGE_KEY, t);
+  function setToken(t: string, tokenSource: "legacy" | "oidc" = "legacy") {
+    if (browser && persistToken && tokenSource === "legacy") {
+      sessionStorage.setItem(STORAGE_KEY, t);
+    }
     token.set(t);
+    source.set(tokenSource);
   }
 
   function clear() {
     if (browser && persistToken) sessionStorage.removeItem(STORAGE_KEY);
     token.set(null);
+    source.set("none");
   }
 
   return { token, session, init, setToken, clear };

@@ -9,7 +9,7 @@ SvelteKit static frontend for Robson v3. Dual-domain:
 - TypeScript strict
 - Custom design tokens from RBX Voltage System (no Tailwind)
 - `svelte-i18n` for locale handling
-- Auth.js for GitHub OAuth (to be wired in EP-003)
+- RBX Identity OIDC for native login; legacy web bearer fallback during migration
 - Vitest + Playwright
 
 ## Quickstart
@@ -17,7 +17,7 @@ SvelteKit static frontend for Robson v3. Dual-domain:
 ```bash
 pnpm install
 cp .env.example .env.local
-# fill in AUTH_GITHUB_ID / AUTH_GITHUB_SECRET / AUTH_SECRET
+# fill in the public RBX OIDC client metadata; never add a client secret
 pnpm dev
 ```
 
@@ -39,8 +39,9 @@ pnpm dev
 ## Android MOB-P1
 
 The Android client is a Capacitor delivery target of this SvelteKit app. The
-first milestone is intentionally read-only: its token is memory-only, mutation
-controls are hidden, and non-GET/HEAD API calls are rejected before `fetch`.
+first milestone is intentionally read-only: it signs in through RBX Identity
+using Authorization Code + PKCE, keeps its token in memory, hides mutation
+controls, and rejects non-GET/HEAD API calls before `fetch`.
 
 Capacitor 8 requires Node.js 22 or later. Android packaging also requires the
 official Android SDK on an x86_64 host. The POCO can build and test the web
@@ -54,7 +55,7 @@ adb devices
 pnpm android:run
 ```
 
-See ADR-0054 and
+See ADR-0054, ADR-0055, and
 `docs/implementation/2026-08-29-android-client-mob-p1.md` for scope and
 acceptance gates.
 

@@ -40,6 +40,7 @@
 #![warn(clippy::all)]
 
 pub mod api;
+pub mod auth;
 pub mod binance_exchange;
 pub mod binance_ohlcv;
 pub mod circuit_breaker;
@@ -73,7 +74,7 @@ pub use binance_exchange::BinanceExchangeAdapter;
 pub use binance_ohlcv::BinanceOhlcvAdapter;
 pub use circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot};
 pub use config::{
-    ApiConfig, Config, EngineConfig, Environment, FundingConfig, MarketDataConfig,
+    ApiConfig, Config, EngineConfig, Environment, FundingConfig, MarketDataConfig, OidcConfig,
     PositionMonitorConfig, ProjectionConfig, ReconciliationConfig, StartupStaleActivePolicy,
 };
 pub use daemon::Daemon;

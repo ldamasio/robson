@@ -272,7 +272,7 @@ impl BinanceWsStream {
     /// Send ping to keep connection alive.
     pub async fn ping(&mut self) -> Result<(), BinanceWsError> {
         self.inner
-            .send(Message::Ping(vec![]))
+            .send(Message::Ping(Default::default()))
             .await
             .map_err(|e| BinanceWsError::SendFailed(e.to_string()))?;
 
@@ -281,7 +281,10 @@ impl BinanceWsStream {
     }
 
     /// Send pong in response to ping.
-    async fn pong(&mut self, payload: Vec<u8>) -> Result<(), BinanceWsError> {
+    async fn pong(
+        &mut self,
+        payload: tokio_tungstenite::tungstenite::Bytes,
+    ) -> Result<(), BinanceWsError> {
         self.inner
             .send(Message::Pong(payload))
             .await
@@ -738,7 +741,7 @@ mod tests {
                 let (tcp, _) = listener.accept().await.unwrap();
                 let mut server_ws = accept_async(tcp).await.unwrap();
 
-                server_ws.send(Message::Ping(expected.clone())).await.unwrap();
+                server_ws.send(Message::Ping(expected.clone().into())).await.unwrap();
 
                 let response = timeout(Duration::from_secs(1), server_ws.next())
                     .await
@@ -747,7 +750,7 @@ mod tests {
                     .unwrap();
 
                 match response {
-                    Message::Pong(actual) => assert_eq!(actual, expected),
+                    Message::Pong(actual) => assert_eq!(actual.as_ref(), expected.as_slice()),
                     other => panic!("Expected pong, got {:?}", other),
                 }
 

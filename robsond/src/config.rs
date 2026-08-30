@@ -55,8 +55,19 @@ pub struct ApiConfig {
     /// Port to bind to
     pub port: u16,
     /// Bearer token for authenticating mutating API routes.
-    /// Required when ROBSON_ENV=production; optional otherwise.
+    /// Temporary migration fallback; optional when OIDC is configured.
     pub api_token: Option<String>,
+    /// RBX Identity OIDC verification contract.
+    pub oidc: Option<OidcConfig>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OidcConfig {
+    pub issuer: String,
+    pub audience: String,
+    pub jwks_uri: String,
+    pub allowed_client_ids: Vec<String>,
+    pub allowed_organization_ids: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -310,10 +321,11 @@ impl Config {
         let reconciliation = Self::load_reconciliation_config()?;
         let funding = Self::load_funding_config()?;
 
-        // Fail-fast: API token is mandatory in production
-        if environment == Environment::Production && api.api_token.is_none() {
+        // Fail-fast: production must have at least one configured verifier.
+        if environment == Environment::Production && api.api_token.is_none() && api.oidc.is_none() {
             return Err(DaemonError::Config(
-                "ROBSON_API_TOKEN is required when ROBSON_ENV=production".to_string(),
+                "ROBSON_API_TOKEN or a complete ROBSON_OIDC_* configuration is required when ROBSON_ENV=production"
+                    .to_string(),
             ));
         }
 
@@ -337,6 +349,7 @@ impl Config {
                 host: "127.0.0.1".to_string(),
                 port: 0, // Let OS assign port
                 api_token: None,
+                oidc: None,
             },
             engine: EngineConfig {
                 min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
@@ -417,8 +430,82 @@ impl Config {
             .map_err(|_| DaemonError::Config(format!("Invalid ROBSON_API_PORT: {}", port_str)))?;
 
         let api_token = env::var("ROBSON_API_TOKEN").ok().filter(|v| !v.trim().is_empty());
+        let oidc = Self::load_oidc_config()?;
 
-        Ok(ApiConfig { host, port, api_token })
+        Ok(ApiConfig { host, port, api_token, oidc })
+    }
+
+    fn load_oidc_config() -> DaemonResult<Option<OidcConfig>> {
+        const VARIABLES: [&str; 5] = [
+            "ROBSON_OIDC_ISSUER",
+            "ROBSON_OIDC_AUDIENCE",
+            "ROBSON_OIDC_JWKS_URI",
+            "ROBSON_OIDC_ALLOWED_CLIENT_IDS",
+            "ROBSON_OIDC_ALLOWED_ORGANIZATION_IDS",
+        ];
+
+        let values =
+            VARIABLES.map(|name| env::var(name).ok().filter(|value| !value.trim().is_empty()));
+        if values.iter().all(Option::is_none) {
+            return Ok(None);
+        }
+
+        let required = |index: usize| {
+            values[index].clone().ok_or_else(|| {
+                DaemonError::Config(format!(
+                    "{} is required when any ROBSON_OIDC_* variable is configured",
+                    VARIABLES[index]
+                ))
+            })
+        };
+
+        let issuer = Self::validate_https_oidc_url(VARIABLES[0], &required(0)?)?
+            .trim_end_matches('/')
+            .to_owned();
+        let audience = required(1)?.trim().to_owned();
+        let jwks_uri = Self::validate_https_oidc_url(VARIABLES[2], &required(2)?)?;
+        let allowed_client_ids = Self::parse_nonempty_csv(VARIABLES[3], &required(3)?)?;
+        let allowed_organization_ids = Self::parse_nonempty_csv(VARIABLES[4], &required(4)?)?;
+
+        Ok(Some(OidcConfig {
+            issuer,
+            audience,
+            jwks_uri,
+            allowed_client_ids,
+            allowed_organization_ids,
+        }))
+    }
+
+    fn validate_https_oidc_url(name: &str, value: &str) -> DaemonResult<String> {
+        let url = reqwest::Url::parse(value.trim())
+            .map_err(|error| DaemonError::Config(format!("Invalid {name}: {error}")))?;
+        if url.scheme() != "https"
+            || !url.username().is_empty()
+            || url.password().is_some()
+            || url.host_str().is_none()
+            || url.query().is_some()
+            || url.fragment().is_some()
+        {
+            return Err(DaemonError::Config(format!(
+                "{name} must be a credential-free https URL without query or fragment"
+            )));
+        }
+        Ok(url.to_string().trim_end_matches('/').to_owned())
+    }
+
+    fn parse_nonempty_csv(name: &str, value: &str) -> DaemonResult<Vec<String>> {
+        let mut entries = value
+            .split(',')
+            .map(str::trim)
+            .filter(|entry| !entry.is_empty())
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries.dedup();
+        if entries.is_empty() {
+            return Err(DaemonError::Config(format!("{name} must contain at least one value")));
+        }
+        Ok(entries)
     }
 
     fn load_engine_config() -> DaemonResult<EngineConfig> {
@@ -747,6 +834,7 @@ impl Default for Config {
                 host: "0.0.0.0".to_string(),
                 port: 8080,
                 api_token: None,
+                oidc: None,
             },
             engine: EngineConfig {
                 min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
@@ -840,6 +928,7 @@ mod tests {
         let config = Config::default();
 
         assert_eq!(config.api.port, 8080);
+        assert!(config.api.oidc.is_none());
         assert_eq!(config.environment, Environment::Development);
         assert_eq!(config.tech_stop.min_stop_pct, Decimal::ONE);
         assert_eq!(config.tech_stop.max_stop_pct, Decimal::from(10));
@@ -873,6 +962,61 @@ mod tests {
         // Risk per trade is NOT in engine config — fixed at 1% in domain
         assert_eq!(config.engine.min_tech_stop_percent, Decimal::new(1, 3));
         assert_eq!(config.engine.max_tech_stop_percent, Decimal::new(10, 2));
+    }
+
+    #[test]
+    fn test_load_oidc_config_requires_complete_fail_closed_contract() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_OIDC_ISSUER", Some("https://auth.rbx.ia.br")),
+            ("ROBSON_OIDC_AUDIENCE", None),
+            ("ROBSON_OIDC_JWKS_URI", None),
+            ("ROBSON_OIDC_ALLOWED_CLIENT_IDS", None),
+            ("ROBSON_OIDC_ALLOWED_ORGANIZATION_IDS", None),
+        ]);
+
+        let error = Config::load_oidc_config().unwrap_err();
+        assert!(matches!(
+            error,
+            DaemonError::Config(message) if message.contains("ROBSON_OIDC_AUDIENCE is required")
+        ));
+    }
+
+    #[test]
+    fn test_load_oidc_config_parses_allowlists() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_OIDC_ISSUER", Some("https://auth.rbx.ia.br/")),
+            ("ROBSON_OIDC_AUDIENCE", Some("robson-api")),
+            ("ROBSON_OIDC_JWKS_URI", Some("https://auth.rbx.ia.br/oauth/v2/keys")),
+            ("ROBSON_OIDC_ALLOWED_CLIENT_IDS", Some("robson-web, robson-android,robson-web")),
+            ("ROBSON_OIDC_ALLOWED_ORGANIZATION_IDS", Some("org-rbx")),
+        ]);
+
+        let config = Config::load_oidc_config().unwrap().unwrap();
+        assert_eq!(config.issuer, "https://auth.rbx.ia.br");
+        assert_eq!(config.audience, "robson-api");
+        assert_eq!(config.allowed_client_ids, vec!["robson-android", "robson-web"]);
+        assert_eq!(config.allowed_organization_ids, vec!["org-rbx"]);
+    }
+
+    #[test]
+    fn test_load_oidc_config_rejects_insecure_urls() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_OIDC_ISSUER", Some("http://auth.example.test")),
+            ("ROBSON_OIDC_AUDIENCE", Some("robson-api")),
+            ("ROBSON_OIDC_JWKS_URI", Some("https://auth.example.test/oauth/v2/keys")),
+            ("ROBSON_OIDC_ALLOWED_CLIENT_IDS", Some("robson-android")),
+            ("ROBSON_OIDC_ALLOWED_ORGANIZATION_IDS", Some("org-rbx")),
+        ]);
+
+        let error = Config::load_oidc_config().unwrap_err();
+        assert!(matches!(
+            error,
+            DaemonError::Config(message)
+                if message.contains("ROBSON_OIDC_ISSUER must be a credential-free https URL")
+        ));
     }
 
     #[test]

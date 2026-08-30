@@ -42,10 +42,15 @@ chrono = { workspace = true }
 async-trait = { workspace = true }
 async-stream = "0.3"
 prometheus = { workspace = true }
+reqwest = { workspace = true }
+jsonwebtoken = { workspace = true }
+subtle = { workspace = true }
 
 [dev-dependencies]
+aws-lc-rs = "=1.18.0"
+base64 = "=0.22.1"
 rust_decimal_macros = { workspace = true }
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
 http-body-util = "0.1"
 robson-eventlog = { path = "../robson-eventlog" }
 robson-projector = { path = "../robson-projector" }

@@ -59,6 +59,7 @@ use crate::query::ExecutionQuery;
 use crate::query_engine::{append_query_state_changed_event, EventLogQueryRecorder};
 use crate::{
     api::{create_router, ApiState},
+    auth::AuthService,
     binance_exchange::BinanceExchangeAdapter,
     binance_ohlcv::BinanceOhlcvAdapter,
     config::{Config, StartupStaleActivePolicy},
@@ -1670,7 +1671,7 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
             pg_pool: self.pg_pool.clone(),
             #[cfg(feature = "postgres")]
             tenant_id: self.config.projection.tenant_id,
-            api_token: self.config.api.api_token.clone(),
+            auth: AuthService::new(self.config.api.api_token.clone(), self.config.api.oidc.clone()),
             funding: self.config.funding.clone(),
         });
 

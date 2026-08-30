@@ -1,7 +1,7 @@
 # ADR-0025: Frontend Auth — Bearer Token via Robsond
 
 **Date:** 2026-04-23 (original decision); 2026-04-25 (formalized as ADR); 2026-06-03 (SSE header amendment)
-**Status:** Accepted
+**Status:** Superseded as target architecture by ADR-0055; retained as a migration fallback
 
 ## Context
 
@@ -30,6 +30,10 @@ audited end-to-end by robsond regardless of who triggers an action;
 identity at the frontend exists only to gate access to the surface.
 
 ## Decision
+
+> Amendment 2026-08-30: ADR-0055 replaces the shared static token as the target
+> with RBX Identity OIDC and backend-enforced roles. The implementation below
+> remains available temporarily for the operator web build during migration.
 
 The frontend authenticates with a Bearer token issued by robsond.
 

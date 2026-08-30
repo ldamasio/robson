@@ -3,7 +3,7 @@
 
 import { browser } from "$app/environment";
 import { get as getStore } from "svelte/store";
-import { authToken } from "$stores/auth";
+import { authToken, clearAuth } from "$stores/auth";
 import { env } from "$env/dynamic/public";
 import { assertMethodAllowed, resolveClientMode } from "$lib/config/clientMode";
 
@@ -45,6 +45,16 @@ export type Position = {
   created_at: string | null;
   updated_at: string | null;
   closed_at: string | null;
+};
+
+export type AuthSessionResponse = {
+  authenticated: boolean;
+  auth_method: "disabled" | "legacy_token" | "oidc";
+  issuer: string;
+  subject: string;
+  client_id: string | null;
+  roles: string[];
+  permissions: Array<"observer" | "operator" | "funding" | "emergency">;
 };
 
 export type PositionState =
@@ -282,6 +292,7 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
+  if (res.status === 401) clearAuth();
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new ApiError(path, res.status, res.statusText, body);
@@ -627,6 +638,8 @@ export class FetchEventSource implements EventSourceLike {
 
 export const robsonApi = {
   health: () => apiFetch<{ status: string }>("/health"),
+
+  authSession: () => apiFetch<AuthSessionResponse>("/auth/session"),
 
   getStatus: async () =>
     normalizeStatus(await apiFetch<StatusResponse>("/status")),

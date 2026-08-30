@@ -56,10 +56,12 @@ tower-http = { version = "0.5", features = ["trace", "cors"] }
 tower = "0.4"
 
 # HTTP client
-reqwest = { version = "0.12", features = ["json"] }
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+jsonwebtoken = { version = "=11.0.0", default-features = false, features = ["aws_lc_rs"] }
+subtle = "=2.6.1"
 
 # WebSocket
-tokio-tungstenite = { version = "0.21", features = ["native-tls"] }
+tokio-tungstenite = { version = "=0.30.0", features = ["rustls-tls-native-roots"] }
 
 # Async trait
 async-trait = "0.1"
