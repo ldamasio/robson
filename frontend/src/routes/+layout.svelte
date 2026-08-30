@@ -1,13 +1,27 @@
 <script lang="ts">
   import "$design/tokens.css";
-  import { initAuth } from "$stores/auth";
+  import { expireAuthIfNeeded, initAuth } from "$stores/auth";
   import "$lib/i18n";
   import { browser } from "$app/environment";
+  import { onMount } from "svelte";
 
   import type { Snippet } from "svelte";
   let { children }: { children: Snippet } = $props();
 
   if (browser) initAuth();
+
+  onMount(() => {
+    const expireWhenVisible = () => {
+      if (document.visibilityState === "visible") expireAuthIfNeeded();
+    };
+    expireAuthIfNeeded();
+    document.addEventListener("visibilitychange", expireWhenVisible);
+    window.addEventListener("pageshow", expireWhenVisible);
+    return () => {
+      document.removeEventListener("visibilitychange", expireWhenVisible);
+      window.removeEventListener("pageshow", expireWhenVisible);
+    };
+  });
 </script>
 
 <main class="rbx-root">

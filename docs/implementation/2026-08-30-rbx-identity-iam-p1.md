@@ -32,6 +32,22 @@ dual-auth migration from `ROBSON_API_TOKEN`.
 - Google is not yet configured and no ZITADEL/Google secret or production
   client identifier exists in this repository.
 
+## Client Session Lifecycle
+
+- An OIDC token response must include a positive integer `expires_in`. The
+  client rejects the response instead of creating a session with an unknown
+  lifetime.
+- The access token and its expiry deadline remain in memory. A bounded timer
+  clears the session at expiry, while `visibilitychange` and `pageshow` checks
+  cover application suspension and resume.
+- Starting an OIDC session removes any migration-only legacy token from browser
+  session storage. The Android build still has no normal API-token login path.
+- Logout and expiry currently clear only client-local state. Provider session
+  termination and token revocation remain pending an approved RBX Identity
+  contract for the relevant endpoints, token types, and client requirements.
+- Refresh-token issuance, secure persistence through Android Keystore, and
+  background renewal are not implemented.
+
 ## Operational Values Required
 
 The identity and infrastructure owners must resolve and inject these values.
@@ -100,8 +116,8 @@ never exist.
 | IAM-P1-G3 | Observer cannot acquire operator/funding/emergency permission | Pass in backend unit tests |
 | IAM-P1-G4 | `/auth/session` rejects missing bearer and accepts migration token | Pass in router test |
 | IAM-P1-G5 | PKCE authorization request contains S256/state and no client secret | Pass in frontend unit test |
-| IAM-P1-G6 | Callback rejects wrong state before token exchange | Pass in frontend unit test |
-| IAM-P1-G7 | Capacitor sync and Android debug build | Pass; 7.2 MB debug APK |
+| IAM-P1-G6 | Callback rejects wrong state or invalid token lifetime | Pass in frontend unit tests |
+| IAM-P1-G7 | Capacitor sync, Android debug build, install, and launch | Pass on an authorized physical POCO |
 | IAM-P1-G8 | Physical Google/RBX login and authenticated SSE on POCO | Pending operational registration |
 | IAM-P1-G9 | Google account cannot self-create privileged Robson access | Pending ZITADEL policy verification |
 
@@ -131,11 +147,13 @@ never exist.
 ## Build Evidence
 
 - Frontend type-check completed with zero errors and zero warnings.
-- All 122 frontend unit tests passed; ESLint reported zero errors and the same
+- All 127 frontend unit tests passed; ESLint reported zero errors and the same
   eight pre-existing object-indexing warnings.
 - Normal and Android-mode static builds, Capacitor sync, and Gradle
   `assembleDebug` passed.
+- The updated debug APK installed successfully and Robson reached the foreground
+  on one authorized physical POCO. No device setting was changed.
 - Debug APK: `frontend/android/app/build/outputs/apk/debug/app-debug.apk`
-  (7.2 MB).
+  (4,360,586 bytes).
 - SHA-256:
-  `6a9a66fd57aa716f453ed246d867d009ca684a003b0b951fe6413939dfd707c8`.
+  `390af73ad36004c4aac1ca06c69be1d45ad6a26e201e85fcb620ac9daa533c67`.
