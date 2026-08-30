@@ -5,6 +5,7 @@
   import { env } from "$env/dynamic/public";
   import { resolveClientMode } from "$lib/config/clientMode";
   import { clearAuth } from "$stores/auth";
+  import { _ } from "svelte-i18n";
   import Row from "./Row.svelte";
 
   const mobileReadOnly =
@@ -56,7 +57,9 @@
           <span class="capital-unit">USDT</span>
         </span>
       {/if}
-      <button class="logout" type="button" onclick={logout}>Sair</button>
+      <button class="logout" type="button" onclick={logout}
+        >{$_("auth.logout")}</button
+      >
     </Row>
   </Row>
 </nav>

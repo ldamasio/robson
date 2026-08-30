@@ -51,7 +51,7 @@
     loading = true;
     try {
       const result = await handleOidcCallback(url, oidcConfig);
-      setToken(result.accessToken, "oidc");
+      setToken(result.accessToken, "oidc", result.expiresIn);
       await robsonApi.authSession();
       const { Capacitor } = await import("@capacitor/core");
       if (Capacitor.isNativePlatform()) {
@@ -96,6 +96,7 @@
       const redirect = returnPath();
       void goto(redirect);
     } catch (e) {
+      clearAuth();
       error =
         e instanceof Error && e.message
           ? e.message
@@ -122,10 +123,7 @@
         });
         removeListener = () => listener.remove();
         const launch = await App.getLaunchUrl();
-        if (
-          launch?.url &&
-          isOidcCallback(launch.url, oidcConfig.redirectUri)
-        ) {
+        if (launch?.url && isOidcCallback(launch.url, oidcConfig.redirectUri)) {
           void completeOidcLogin(launch.url);
         }
       });

@@ -134,6 +134,29 @@ describe("RBX Identity OIDC", () => {
     expect(body.get("code_verifier")).toBe("pkce-verifier");
     expect(body.get("client_secret")).toBeNull();
   });
+
+  it("rejects a token response without a positive integer lifetime", async () => {
+    storeTransaction("expected-state");
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(
+        new Response(
+          JSON.stringify({
+            access_token: "signed-access-token",
+            token_type: "Bearer",
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      ),
+    );
+
+    await expect(
+      handleOidcCallback(
+        "br.ia.rbx.robson://oauth/callback?code=code-1&state=expected-state",
+        config,
+      ),
+    ).rejects.toThrow("invalid token response");
+  });
 });
 
 function storeTransaction(state: string): void {

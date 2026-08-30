@@ -29,7 +29,7 @@ type TokenResponse = {
 
 export type OidcLoginResult = {
   accessToken: string;
-  expiresIn: number | null;
+  expiresIn: number;
   returnPath: string;
 };
 
@@ -157,17 +157,16 @@ export async function handleOidcCallback(
     typeof token.access_token !== "string" ||
     token.access_token.length === 0 ||
     typeof token.token_type !== "string" ||
-    token.token_type.toLowerCase() !== "bearer"
+    token.token_type.toLowerCase() !== "bearer" ||
+    !Number.isSafeInteger(token.expires_in) ||
+    (token.expires_in as number) <= 0
   ) {
     throw new Error("RBX Identity returned an invalid token response");
   }
 
   return {
     accessToken: token.access_token,
-    expiresIn:
-      typeof token.expires_in === "number" && Number.isFinite(token.expires_in)
-        ? token.expires_in
-        : null,
+    expiresIn: token.expires_in as number,
     returnPath: transaction.returnPath,
   };
 }
