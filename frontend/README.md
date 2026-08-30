@@ -36,6 +36,24 @@ pnpm dev
 | `pnpm android:sync`      | Build and copy the web bundle into the Android project |
 | `pnpm android:run`       | Sync and run on an attached Android device             |
 
+The host-side physical-device loop is available through
+`scripts/android-device-cycle.sh`. It discovers the SDK from `ANDROID_HOME`,
+`ANDROID_SDK_ROOT`, or the ignored Android `local.properties` file and never
+prints an ADB serial.
+
+```bash
+scripts/android-device-cycle.sh doctor
+scripts/android-device-cycle.sh verify
+scripts/android-device-cycle.sh build
+scripts/android-device-cycle.sh install
+scripts/android-device-cycle.sh instrumented-test
+scripts/android-device-cycle.sh launch
+```
+
+If HyperOS rejects installation through ADB, use the explicit `stage-apk`
+action and confirm installation on the device. The script does not change phone
+settings or install emulator assets.
+
 ## Android MOB-P1
 
 The Android client is a Capacitor delivery target of this SvelteKit app. The
@@ -72,12 +90,12 @@ Source of truth: `brand-voltage/` at repo root.
 
 ## Path aliases
 
-- `$design` → `src/lib/design`
-- `$api` → `src/lib/api`
-- `$stores` → `src/lib/stores`
-- `$components` → `src/lib/components`
-- `$icons` → `src/lib/icons`
-- `$i18n` → `src/lib/i18n`
+- `$design` maps to `src/lib/design`
+- `$api` maps to `src/lib/api`
+- `$stores` maps to `src/lib/stores`
+- `$components` maps to `src/lib/components`
+- `$icons` maps to `src/lib/icons`
+- `$i18n` maps to `src/lib/i18n`
 
 ## Deploy
 
