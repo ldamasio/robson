@@ -17,6 +17,7 @@
     "test:watch": "vitest",
     "test:e2e": "playwright test",
     "lint": "eslint .",
+    "verify:android:identity": "node scripts/validate-android-identity-config.mjs",
     "build:android:web": "vite build --mode android",
     "android:sync": "pnpm run build:android:web && cap sync android",
     "android:open": "cap open android",

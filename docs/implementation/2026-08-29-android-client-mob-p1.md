@@ -94,6 +94,12 @@ Collected on 2026-08-29 from the isolated `feat/android-client` worktree:
 - Physical authenticated validation remains pending because no operational
   ZITADEL client/role grant is repository-verified. Production operator or
   exchange tokens remain prohibited in the debug client.
+- The physical-device helper now blocks `install`, `stage-apk`, and `cycle`
+  when the effective Android environment lacks structurally complete public
+  Identity metadata. Repository and UI-shell builds remain possible without
+  claiming an operational login.
+- An incomplete Android configuration renders the localized pending-registration
+  state instead of exposing an internal English exception to the user.
 
 ## Physical Device Smoke Test
 

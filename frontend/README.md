@@ -50,6 +50,13 @@ scripts/android-device-cycle.sh instrumented-test
 scripts/android-device-cycle.sh launch
 ```
 
+The `install`, `stage-apk`, and `cycle` actions refuse to place a login-capable
+APK on a device unless Vite resolves complete public RBX Identity metadata for
+Android. Keep real public metadata in an ignored local environment file or
+inject it into the build environment. A client secret must never be present.
+`build` remains available for repository and UI-shell verification while the
+operational Identity contract is pending.
+
 If HyperOS rejects installation through ADB, use the explicit `stage-apk`
 action and confirm installation on the device. The script does not change phone
 settings or install emulator assets.

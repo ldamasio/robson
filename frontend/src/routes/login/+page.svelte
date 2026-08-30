@@ -24,18 +24,18 @@
     : resolveClientMode(env.PUBLIC_ROBSON_CLIENT_MODE) === "operator";
   const identityConfiguration = (() => {
     try {
-      return { oidcConfig: resolveOidcConfig(env), configurationError: "" };
-    } catch (e) {
+      return {
+        oidcConfig: resolveOidcConfig(env),
+        configurationInvalid: false,
+      };
+    } catch {
       return {
         oidcConfig: null,
-        configurationError:
-          e instanceof Error
-            ? e.message
-            : "RBX Identity configuration is invalid",
+        configurationInvalid: true,
       };
     }
   })();
-  const { oidcConfig, configurationError } = identityConfiguration;
+  const { oidcConfig, configurationInvalid } = identityConfiguration;
 
   function returnPath(): string {
     const path = new URLSearchParams(window.location.search).get("redirect");
@@ -180,8 +180,8 @@
           </Stack>
         </form>
       {/if}
-      {#if configurationError || (!oidcConfig && !allowLegacyLogin)}
-        <p class="error">{configurationError || $_("login.notConfigured")}</p>
+      {#if configurationInvalid || (!oidcConfig && !allowLegacyLogin)}
+        <p class="error">{$_("login.notConfigured")}</p>
       {/if}
       {#if error}
         <p class="error">{error}</p>
