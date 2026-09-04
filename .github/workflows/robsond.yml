@@ -95,11 +95,23 @@ jobs:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/robson_migration_ci
         run: cargo run -p robsond --features postgres -- db migrate
 
+      # Pinned, not rolling. rustfmt.toml enables unstable options
+      # (wrap_comments, comment_width, normalize_comments,
+      # format_code_in_doc_comments, imports_granularity, group_imports), whose
+      # output is not stable across nightlies. With a rolling `nightly`, a
+      # toolchain change reformats files no PR touched, and every Rust PR turns
+      # red at once while main's last green run stays green because it ran on
+      # an older nightly. That happened on 2026-09-04: comment reflow in
+      # robson-domain/src/{entities,events,value_objects}.rs failed #186, a PR
+      # that touches none of them.
+      #
+      # Bumping this pin is a deliberate step: install the new nightly, run
+      # `cargo +nightly-<date> fmt --all` and commit the reformat in its own PR.
       - name: Install nightly toolchain (for rustfmt)
-        run: rustup toolchain install nightly --component rustfmt
+        run: rustup toolchain install nightly-2026-08-22 --component rustfmt
 
       - name: Check formatting (nightly rustfmt for unstable options)
-        run: cargo +nightly fmt --all --check
+        run: cargo +nightly-2026-08-22 fmt --all --check
 
       - name: Clippy
         run: cargo clippy --all-targets -- -D clippy::correctness -D clippy::suspicious
