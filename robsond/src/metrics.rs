@@ -62,6 +62,28 @@ pub static POSITION_PNL: LazyLock<GaugeVec> = LazyLock::new(|| {
     .expect("failed to register robsond_position_pnl")
 });
 
+/// Safety Net poll cycles entered (ADR-0039).
+///
+/// A Safety Net that silently stops polling is indistinguishable, from the
+/// outside, from one with nothing to report: both produce no logs and no
+/// events. That is how a starved poll went unnoticed for 36h of production
+/// uptime. `increase(robsond_safety_net_polls_total[5m]) == 0` on a daemon
+/// reporting `enabled: true` means the net is not running.
+///
+/// This generalises past the starvation bug that motivated it. The counter is
+/// incremented by the monitor's own task, so it also stops on any death of
+/// that task — a panic inside `check_positions`, an abort, a future that never
+/// resolves. It is a liveness signal for the task, not just for the timer.
+///
+/// Incremented *before* the sweep, deliberately: counting attempts rather than
+/// successes keeps "the net is not running" distinguishable from "the net runs
+/// and the exchange calls fail". Counting only successes would collapse the
+/// two into the same silence.
+pub static SAFETY_NET_POLLS: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!("robsond_safety_net_polls_total", "Safety Net poll cycles entered")
+        .expect("failed to register robsond_safety_net_polls_total")
+});
+
 /// Currently open position count.
 pub static ACTIVE_POSITIONS: LazyLock<Gauge> = LazyLock::new(|| {
     register_gauge!("robsond_active_positions", "Number of currently open positions")

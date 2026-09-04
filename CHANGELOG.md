@@ -7,6 +7,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed - Safety Net poll starved by the event bus (ADR-0039, 2026-08-19)
+
+- `PositionMonitor::start` created its poll timer as a `sleep(...)` *inside*
+  `tokio::select!`. The macro re-evaluates each branch expression on every
+  iteration, so the sleep was a new future each time round the loop: any other
+  branch completing first dropped the pending sleep and restarted the countdown
+  from zero. The monitor subscribes to the whole event bus, where
+  `DaemonEvent::MarketData` arrives several times per second, so the 20s
+  deadline was reset roughly every 90ms and never elapsed.
+  Production impact: the Safety Net polled **zero times in 36h of uptime** —
+  no rogue-position detection, no stop evaluation, no reconciliation of closed
+  positions. ADR-0039's software net was inert; only the exchange-side
+  insurance stop was actually protecting open positions. The timer is now a
+  `tokio::time::Interval` created outside the loop, which owns its schedule
+  across iterations.
+- The gap between cycles is enforced by `Interval::reset()` after each sweep.
+  `MissedTickBehavior::Delay` alone does not provide it: after an overrun the
+  already-missed tick resolves immediately and only the tick *after* it is
+  rescheduled, so a sweep that persistently overruns its period runs
+  back-to-back with no gap — the opposite of what a rate-limited exchange API
+  wants. `reset()` recomputes the deadline from the moment the sweep finished.
+- A zero poll interval is now rejected by `load_position_monitor_config`, with
+  a fallback guard at the call site. `tokio::time::interval` panics on a zero
+  period, and that panic would be invisible: the daemon does not observe the
+  monitor's `JoinHandle` until shutdown, so the API would keep reporting
+  `enabled: true` over a dead monitor. (`sleep(Duration::ZERO)` did not panic,
+  so this is new exposure introduced by the interval.)
+- New `robsond_safety_net_polls_total` counter, plus
+  `PositionMonitor::poll_count()`. A Safety Net that silently stops polling is
+  indistinguishable from the outside from one with nothing to report: both
+  produce no logs and no events, which is what let the defect above go
+  unnoticed for 36h. `increase(robsond_safety_net_polls_total[5m]) == 0` on a
+  daemon reporting `enabled: true` now means the net is not running.
+
 ### Added - Typed income-ledger reconciliation (ADR-0045 §1, 2026-07-07)
 
 - New `IncomePort` trait ingests Binance's typed income stream
