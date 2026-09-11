@@ -1,20 +1,32 @@
 <script lang="ts">
+  import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
+  import { browser } from '$app/environment';
+  import { PUBLIC_GOOGLE_WEB_CLIENT_ID } from '$env/static/public';
   import Card from '$design/components/Card.svelte';
   import Stack from '$design/components/Stack.svelte';
   import { setToken } from '$stores/auth';
   import { robsonApi } from '$api/robson';
   import { _ } from 'svelte-i18n';
 
-  let tokenInput = $state('');
   let error = $state('');
   let loading = $state(false);
+  let buttonContainer: HTMLDivElement | undefined = $state();
 
-  async function handleLogin() {
+  // ADR-0054: Google Identity Services (GIS) replaces the pasted-token
+  // form. GIS runs entirely client-side — it hands the ID token straight
+  // to this callback — so there is no OAuth callback server involved,
+  // which is exactly the constraint ADR-0025 amends around (see
+  // docs/adr/ADR-0025-frontend-auth-bearer-token.md and the new ADR).
+  async function handleCredentialResponse(response: { credential?: string }) {
     error = '';
+    if (!response.credential) {
+      error = $_('login.connectionFailed');
+      return;
+    }
     loading = true;
     try {
-      setToken(tokenInput.trim());
+      setToken(response.credential);
       await robsonApi.health();
       const params = new URLSearchParams(window.location.search);
       const redirect = params.get('redirect') ?? '/dashboard';
@@ -25,6 +37,39 @@
       loading = false;
     }
   }
+
+  onMount(() => {
+    if (!browser) return;
+
+    // Loaded client-side only (onMount never runs during SSR/prerender),
+    // so this never touches the static build.
+    const script = document.createElement('script');
+    script.src = 'https://accounts.google.com/gsi/client';
+    script.async = true;
+    script.defer = true;
+    script.onload = () => {
+      if (!window.google?.accounts?.id || !buttonContainer) return;
+      window.google.accounts.id.initialize({
+        client_id: PUBLIC_GOOGLE_WEB_CLIENT_ID,
+        callback: handleCredentialResponse,
+      });
+      window.google.accounts.id.renderButton(buttonContainer, {
+        type: 'standard',
+        theme: 'filled_black',
+        size: 'large',
+        text: 'signin_with',
+        shape: 'rectangular',
+      });
+    };
+    script.onerror = () => {
+      error = $_('login.connectionFailed');
+    };
+    document.head.appendChild(script);
+
+    return () => {
+      script.remove();
+    };
+  });
 </script>
 
 <svelte:head>
@@ -37,23 +82,13 @@
       <img src="/brand/rbx-mark.svg" alt="RBX" width="48" height="48" />
       <h1>{$_('login.title')}</h1>
       <p>{$_('login.description')}</p>
-      <form onsubmit={(e) => { e.preventDefault(); handleLogin(); }}>
-        <Stack gap={3}>
-          <input
-            type="password"
-            bind:value={tokenInput}
-            placeholder={$_('login.tokenPlaceholder')}
-            autocomplete="off"
-            disabled={loading}
-          />
-          {#if error}
-            <p class="error">{error}</p>
-          {/if}
-          <button class="btn-primary" type="submit" disabled={!tokenInput.trim() || loading}>
-            {loading ? $_('login.connecting') : $_('login.connect')}
-          </button>
-        </Stack>
-      </form>
+      <div class="google-button" bind:this={buttonContainer} aria-live="polite"></div>
+      {#if loading}
+        <p class="status">{$_('login.signingIn')}</p>
+      {/if}
+      {#if error}
+        <p class="error">{error}</p>
+      {/if}
     </Stack>
   </Card>
 </div>
@@ -72,42 +107,16 @@
   p {
     color: var(--fg-1);
   }
-  input {
-    font-family: var(--font-mono);
-    font-size: var(--text-sm);
-    width: 100%;
-    padding: var(--s-3);
-    background: var(--bg-1);
-    border: 1px solid var(--border-strong);
-    border-radius: var(--radius-sm);
-    color: var(--fg-0);
+  .google-button {
+    min-height: 44px;
+    display: flex;
+    justify-content: flex-start;
   }
-  input:focus {
-    border-color: var(--cyan-brand);
-    outline: none;
+  .status {
+    font-size: var(--text-sm);
   }
   .error {
     color: var(--fg-error, #ff4444);
     font-size: var(--text-sm);
-  }
-  .btn-primary {
-    font-family: var(--font-sans);
-    font-size: var(--text-base);
-    font-weight: 500;
-    padding: var(--s-3) var(--s-5);
-    border: 1px solid var(--cyan-signal);
-    background: var(--cyan-signal);
-    color: var(--bg-0);
-    border-radius: var(--radius-sm);
-    cursor: pointer;
-    transition: background var(--dur) var(--ease), border-color var(--dur) var(--ease);
-  }
-  .btn-primary:hover:not(:disabled) {
-    background: var(--cyan-brand);
-    border-color: var(--cyan-brand);
-  }
-  .btn-primary:disabled {
-    opacity: 0.5;
-    cursor: not-allowed;
   }
 </style>

@@ -20,6 +20,8 @@ uuid = { workspace = true }
 chrono = { workspace = true }
 rust_decimal = { workspace = true }
 thiserror = { workspace = true }
+oauth2 = "4"
+base64 = "0.22"
 
 [dev-dependencies]
 tempfile = "3"

@@ -21,8 +21,8 @@ source of truth, and require git-repo ceremony for routine pause/resume.
 
 **Recommended Action**: Implement RSM-P1..P5 below to introduce a Postgres-backed
 state machine (RUNNING / PAUSED / DRAINING / STOPPED), enforce it in `robsond`,
-expose via existing Bearer-token API, and replace the FE kill-switch with a
-state panel.
+expose via the existing Google-OAuth-authenticated API (ADR-0054), and
+replace the FE kill-switch with a state panel.
 
 **Estimated Effort**: ~5 working days, sequenced as five PRs (one per phase).
 
@@ -281,11 +281,11 @@ cargo build --all
 ### EP-003: RSM-P3 — API
 
 **Objective**: Operators (and the FE) can read and transition state via the
-existing Bearer-token API.
+existing Google-OAuth-authenticated API (ADR-0054).
 
 **Preconditions**:
 ```bash
-curl -s -H "Authorization: Bearer $ROBSON_API_TOKEN" localhost:8080/api/health | jq -e '.ok'
+curl -s -H "Authorization: Bearer $(robson-cli auth print-token)" localhost:8080/api/health | jq -e '.ok'
 ```
 
 **Steps**:
@@ -296,16 +296,16 @@ curl -s -H "Authorization: Bearer $ROBSON_API_TOKEN" localhost:8080/api/health |
 
 **Expected Outcome**:
 ```bash
-curl -s -H "Authorization: Bearer $ROBSON_API_TOKEN" \
+curl -s -H "Authorization: Bearer $(robson-cli auth print-token)" \
   localhost:8080/api/runtime/state | jq -r '.state' | grep -q "RUNNING"
 
-curl -s -X PATCH -H "Authorization: Bearer $ROBSON_API_TOKEN" \
+curl -s -X PATCH -H "Authorization: Bearer $(robson-cli auth print-token)" \
   -d '{"target":"PAUSED","reason":"smoke test"}' \
   localhost:8080/api/runtime/state | jq -r '.state' | grep -q "PAUSED"
 
 # Disallowed transition rejected
 curl -s -o /dev/null -w "%{http_code}" -X PATCH \
-  -H "Authorization: Bearer $ROBSON_API_TOKEN" \
+  -H "Authorization: Bearer $(robson-cli auth print-token)" \
   -d '{"target":"STOPPED","reason":"should fail"}' \
   localhost:8080/api/runtime/state | grep -q "409"
 ```
@@ -377,7 +377,7 @@ cargo test -p robsond runtime_state_gate 2>&1 | tail -1 | grep -q "test result: 
 curl -s localhost:8080/metrics | grep -E '^robson_runtime_state\{state="[^"]+"\} 1$'
 
 # API healthy
-curl -s -H "Authorization: Bearer $ROBSON_API_TOKEN" localhost:8080/api/runtime/state | jq -e '.state'
+curl -s -H "Authorization: Bearer $(robson-cli auth print-token)" localhost:8080/api/runtime/state | jq -e '.state'
 
 # Build green
 cargo build --all 2>&1 | grep -q "Finished"

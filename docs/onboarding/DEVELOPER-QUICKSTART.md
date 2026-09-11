@@ -115,15 +115,39 @@ The daemon refuses to start in production mode without a real
 exchange configuration. Development mode runs against the
 in-memory store.
 
-**Frontend + backend together:**
+**Frontend + backend together (ADR-0054, Google OAuth):**
 
-1. Run robsond as above.
-2. In another terminal, run `pnpm run dev` in `frontend/`.
-3. Generate a dev token (any non-empty string when
-   `ROBSON_ENV=development` and `ROBSON_API_TOKEN` is unset; the
-   auth middleware is no-op when token is unset).
-4. Open `http://localhost:5173`, paste any non-empty string at
-   `/login`, and the dashboard loads.
+robsond's auth middleware is a no-op — same as before — as long as
+`ROBSON_ALLOWED_EMAIL` and both `ROBSON_GOOGLE_WEB_CLIENT_ID` /
+`ROBSON_GOOGLE_CLI_CLIENT_ID` are left unset in development. That part
+is unchanged from the old bearer-token setup. What changed is the
+frontend: `/login` no longer has a paste-a-token field, only a "Sign in
+with Google" button, so getting into the dashboard locally without a
+real Google OAuth client needs one extra step:
+
+1. Run robsond as above (no `ROBSON_GOOGLE_*` / `ROBSON_ALLOWED_EMAIL`
+   set — auth stays disabled, identical to today).
+2. In another terminal, run `pnpm run dev` in `frontend/` (with
+   `PUBLIC_GOOGLE_WEB_CLIENT_ID` unset or a placeholder — the button
+   will render but does not need to actually work for this path).
+3. Open `http://localhost:5173/dashboard` directly. The `(authed)`
+   layout only checks for the *presence* of a cached credential, and
+   the backend isn't checking its contents (auth disabled), so open the
+   browser devtools console and run:
+   ```js
+   sessionStorage.setItem('robson_google_id_token', 'dev-placeholder');
+   ```
+   then reload. The dashboard loads exactly as it did with the old
+   paste-any-string flow.
+
+**To test the real Google sign-in flow locally** (verifying GIS
+end-to-end, not just the disabled-auth dev path): register a Google
+OAuth 2.0 "Web application" client in Google Cloud Console with
+`http://localhost:5173` as an authorized JavaScript origin, then set
+`PUBLIC_GOOGLE_WEB_CLIENT_ID` (frontend `.env`) and
+`ROBSON_GOOGLE_WEB_CLIENT_ID` + `ROBSON_ALLOWED_EMAIL` (robsond env) to
+matching real values before starting both processes. See
+`frontend/.env.example` and `docs/adr/ADR-0054-google-oauth-api-authentication.md`.
 
 ---
 

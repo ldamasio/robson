@@ -179,8 +179,15 @@ Before issuing the close, every operator MUST tick all of:
 
 ### Command
 
-Ensure `ROBSON_API_TOKEN` is already present in the process environment. Do not
-place the token on the command line.
+Ensure you are signed in (ADR-0054: Google OAuth, not a static token):
+
+```bash
+robson-cli auth status || robson-cli auth login
+```
+
+`robson-cli` reads the cached, transparently-refreshed Google ID token
+from `~/.config/robson/credentials.json` — there is no token to place on
+the command line or in the process environment.
 
 ```bash
 robson-cli reconcile-close \
@@ -197,7 +204,9 @@ Flags:
 | `--position-id` | Yes | - | UUID of the position to close |
 | `--evidence-file` | Yes | - | Path to JSON file with evidence |
 | `--robsond-url` | No | `http://localhost:8080` | Base URL of robsond API |
-| `--token` | No | `$ROBSON_API_TOKEN` env | Supported by the binary, but avoid it because process arguments and shell history may expose the token |
+
+If the command fails with an authentication error, run `robson-cli auth
+login` and retry — do not fall back to a shared token of any kind.
 
 ### Exit Codes
 
@@ -290,7 +299,7 @@ Flags:
 After the close, whether manual or from startup `auto_reconcile`, verify:
 
 - [ ] `kubectl logs -n <ns> deploy/robsond --tail=200 | grep <position_id>` shows `PositionClosed` emitted with the chosen `closure_evidence`.
-- [ ] `curl -s -H "Authorization: Bearer $ROBSON_API_TOKEN" http://localhost:8080/positions/<id>` returns `state: "closed"` and a non-null `exit_price`.
+- [ ] `curl -s -H "Authorization: Bearer $(robson-cli auth print-token)" http://localhost:8080/positions/<id>` returns `state: "closed"` and a non-null `exit_price`.
 - [ ] `/status.occupied_slots` decremented by 1 (or matches the new ground truth).
 - [ ] `monthly_state.realized_loss` updated (if the close was a loss).
 - [ ] `/status.stale_active_count` and `/status.reconciliation_blockers[]` no longer include the resolved position.
