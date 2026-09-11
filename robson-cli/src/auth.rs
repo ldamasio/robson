@@ -49,16 +49,16 @@ fn http_client() -> Result<reqwest::Client> {
 }
 
 /// Google's OAuth 2.0 "TVs and Limited-Input devices" client ID registered
-/// for `robson-cli`'s Device Authorization Grant flow.
+/// for `robson-cli`'s Device Authorization Grant flow (project rbx-systems,
+/// registered 2026-09-11). This client type has no client secret — Google's
+/// console only exposes a Name field for it, confirming it's a public
+/// client, matching this module's device-flow usage (no secret is sent).
 ///
-/// TODO(owner): fill in the real Client ID after registering it in Google
-/// Cloud Console (APIs & Services -> Credentials -> Create Credentials ->
-/// OAuth client ID -> "TVs and Limited Input devices"). This is
-/// deliberately compiled into the binary rather than operator-configurable
+/// Deliberately compiled into the binary rather than operator-configurable
 /// — see ADR-0054's "amends ADR-0025" section: the CLI's audience is a
 /// fixed, pre-registered OAuth client, not a per-deployment setting.
 pub const GOOGLE_CLI_CLIENT_ID: &str =
-    "TODO-REPLACE-WITH-REAL-GOOGLE-CLI-CLIENT-ID.apps.googleusercontent.com";
+    "844825462148-3nk0f2943000rev55hdj3jir1nadchev.apps.googleusercontent.com";
 
 const GOOGLE_DEVICE_AUTH_URL: &str = "https://oauth2.googleapis.com/device/code";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
