@@ -11,6 +11,12 @@ COPY . .
 
 ARG PUBLIC_ROBSON_API_BASE
 ENV PUBLIC_ROBSON_API_BASE=$PUBLIC_ROBSON_API_BASE
+# ADR-0054: Google OAuth Client ID (Web application type) for Google
+# Identity Services. Not secret — GIS client IDs are meant to be visible
+# in the browser — but still build-time-baked like PUBLIC_ROBSON_API_BASE
+# above, since this is a static site with no runtime server.
+ARG PUBLIC_GOOGLE_WEB_CLIENT_ID
+ENV PUBLIC_GOOGLE_WEB_CLIENT_ID=$PUBLIC_GOOGLE_WEB_CLIENT_ID
 
 RUN pnpm run build
 

@@ -2,7 +2,8 @@
   import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { browser } from '$app/environment';
-  import { PUBLIC_GOOGLE_WEB_CLIENT_ID } from '$env/static/public';
+  // ADR-0054: dynamic, not static, public env — see robson.ts for why.
+  import { env } from '$env/dynamic/public';
   import Card from '$design/components/Card.svelte';
   import Stack from '$design/components/Stack.svelte';
   import { setToken } from '$stores/auth';
@@ -50,7 +51,7 @@
     script.onload = () => {
       if (!window.google?.accounts?.id || !buttonContainer) return;
       window.google.accounts.id.initialize({
-        client_id: PUBLIC_GOOGLE_WEB_CLIENT_ID,
+        client_id: env.PUBLIC_GOOGLE_WEB_CLIENT_ID ?? '',
         callback: handleCredentialResponse,
       });
       window.google.accounts.id.renderButton(buttonContainer, {

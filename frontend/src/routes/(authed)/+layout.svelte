@@ -2,7 +2,8 @@
   import { onDestroy, onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { browser } from '$app/environment';
-  import { PUBLIC_GOOGLE_WEB_CLIENT_ID } from '$env/static/public';
+  // ADR-0054: dynamic, not static, public env — see robson.ts for why.
+  import { env } from '$env/dynamic/public';
   import type { Snippet } from 'svelte';
   import NavBar from '$design/components/NavBar.svelte';
   import RiskDisclaimer from '$design/components/RiskDisclaimer.svelte';
@@ -44,7 +45,7 @@
     refreshTimer = setInterval(() => {
       const token = currentToken();
       if (token && isNearExpiry(token)) {
-        void silentRefreshGoogleToken(PUBLIC_GOOGLE_WEB_CLIENT_ID);
+        void silentRefreshGoogleToken(env.PUBLIC_GOOGLE_WEB_CLIENT_ID ?? '');
       }
     }, REFRESH_CHECK_INTERVAL_MS);
   });

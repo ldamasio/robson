@@ -5,9 +5,16 @@ import { browser } from "$app/environment";
 import { get as getStore } from "svelte/store";
 import { authToken, clearAuth, silentRefreshGoogleToken } from "$stores/auth";
 import { env } from "$env/dynamic/public";
-import { PUBLIC_GOOGLE_WEB_CLIENT_ID } from "$env/static/public";
 
 const API_BASE: string = env.PUBLIC_ROBSON_API_BASE ?? "";
+// ADR-0054: `$env/dynamic/public` rather than `$env/static/public` — the
+// latter's named exports only exist when the var is set at `vite
+// build`/`svelte-kit sync` time, which fails typecheck entirely in any
+// environment (CI, a fresh clone) that hasn't configured a real Google
+// Client ID yet. Same build-time-baked-in mechanism either way once
+// deployed (see frontend/Dockerfile's PUBLIC_ROBSON_API_BASE precedent) —
+// this only relaxes the compile-time contract, not the runtime one.
+const GOOGLE_WEB_CLIENT_ID: string = env.PUBLIC_GOOGLE_WEB_CLIENT_ID ?? "";
 
 // --- Backend response types (match robsond serde output) ---
 
@@ -287,7 +294,7 @@ async function apiFetch<T>(path: string, init?: RequestInit, isRetry = false): P
   const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
 
   if (res.status === 401 && !isRetry && browser) {
-    const refreshed = await silentRefreshGoogleToken(PUBLIC_GOOGLE_WEB_CLIENT_ID);
+    const refreshed = await silentRefreshGoogleToken(GOOGLE_WEB_CLIENT_ID);
     if (refreshed) {
       return apiFetch<T>(path, init, true);
     }
@@ -591,7 +598,7 @@ export class FetchEventSource implements EventSourceLike {
       if (!this.closed && res.status === 401 && !this.triedSilentRefreshOn401) {
         this.triedSilentRefreshOn401 = true;
         clearIdle();
-        const refreshed = await silentRefreshGoogleToken(PUBLIC_GOOGLE_WEB_CLIENT_ID);
+        const refreshed = await silentRefreshGoogleToken(GOOGLE_WEB_CLIENT_ID);
         if (!this.closed) {
           if (refreshed) {
             this.connect(url);

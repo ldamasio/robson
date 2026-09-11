@@ -21,15 +21,32 @@ use std::{
 
 use anyhow::{bail, Context, Result};
 use oauth2::{
-    basic::{BasicErrorResponseType, BasicTokenType},
-    devicecode::StandardDeviceAuthorizationResponse,
-    reqwest::async_http_client,
-    AuthUrl, Client, ClientId, DeviceAuthorizationUrl, EmptyExtraTokenFields,
-    RefreshToken, RevocationErrorResponseType, Scope, StandardErrorResponse,
-    StandardRevocableToken, StandardTokenIntrospectionResponse, StandardTokenResponse,
+    basic::{
+        BasicErrorResponse, BasicRevocationErrorResponse, BasicTokenIntrospectionResponse,
+        BasicTokenType,
+    },
+    AuthUrl, Client, ClientId, DeviceAuthorizationUrl, EndpointNotSet, EndpointSet, RefreshToken,
+    Scope, StandardDeviceAuthorizationResponse, StandardRevocableToken, StandardTokenResponse,
     TokenResponse, TokenUrl,
 };
 use serde::{Deserialize, Serialize};
+
+/// A plain `reqwest::Client` implements `oauth2`'s `AsyncHttpClient` trait
+/// directly (via the crate's `reqwest` feature) — no glue code needed, and
+/// critically, no *second* HTTP/TLS stack: `oauth2 = "5"`'s own `reqwest`
+/// dependency is already `reqwest = "0.12"` (same major this workspace
+/// uses everywhere else), unlike `oauth2 = "4"`'s bundled `reqwest 0.11`
+/// (which pulled an old, RUSTSEC-flagged `rustls-webpki` — see
+/// RUSTSEC-2026-0098/0099/0104/0258 — alongside the one this repo already
+/// fixed once in the `fix(deps): resolve RUSTSEC-2026-0258` commit).
+fn http_client() -> Result<reqwest::Client> {
+    reqwest::Client::builder()
+        // Following redirects opens the client up to SSRF vulnerabilities,
+        // same rationale as oauth2's own bundled client.
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .context("failed to build HTTP client for Google OAuth requests")
+}
 
 /// Google's OAuth 2.0 "TVs and Limited-Input devices" client ID registered
 /// for `robson-cli`'s Device Authorization Grant flow.
@@ -72,13 +89,36 @@ impl oauth2::ExtraTokenFields for GoogleExtraTokenFields {}
 
 type GoogleTokenResponse = StandardTokenResponse<GoogleExtraTokenFields, BasicTokenType>;
 
+/// Like `oauth2::basic::BasicClient`, but with `GoogleTokenResponse` (which
+/// carries the non-standard `id_token` extra field) in place of
+/// `BasicClient`'s hardcoded `EmptyExtraTokenFields` token response — the
+/// one piece `BasicClient` can't be used for as-is. Endpoint-state type
+/// parameters mirror `build_client()`: auth/device-auth/token URLs are set,
+/// introspection/revocation are not.
 type GoogleClient = Client<
-    StandardErrorResponse<BasicErrorResponseType>,
+    BasicErrorResponse,
     GoogleTokenResponse,
-    BasicTokenType,
-    StandardTokenIntrospectionResponse<EmptyExtraTokenFields, BasicTokenType>,
+    BasicTokenIntrospectionResponse,
     StandardRevocableToken,
-    StandardErrorResponse<RevocationErrorResponseType>,
+    BasicRevocationErrorResponse,
+    EndpointSet,   // HasAuthUrl
+    EndpointSet,   // HasDeviceAuthUrl
+    EndpointNotSet, // HasIntrospectionUrl
+    EndpointNotSet, // HasRevocationUrl
+    EndpointSet,   // HasTokenUrl
+>;
+
+/// `Client::new()` only exists on the type with every endpoint left
+/// unset (`GoogleClient`'s type alias defaults) — `build_client()` starts
+/// from this and transitions to `GoogleClient`'s state via the `set_*_uri`
+/// builder calls, which is how `oauth2`'s type-state builder is meant to
+/// be used (see the crate's own `google_devicecode.rs` example).
+type GoogleClientInitial = Client<
+    BasicErrorResponse,
+    GoogleTokenResponse,
+    BasicTokenIntrospectionResponse,
+    StandardRevocableToken,
+    BasicRevocationErrorResponse,
 >;
 
 /// Minimal, unverified decode of an ID token's payload claims we care
@@ -111,16 +151,15 @@ fn decode_id_token_claims(id_token: &str) -> Result<IdTokenClaims> {
 }
 
 fn build_client() -> Result<GoogleClient> {
-    Ok(GoogleClient::new(
-        ClientId::new(GOOGLE_CLI_CLIENT_ID.to_string()),
-        None,
-        AuthUrl::new(GOOGLE_AUTH_URL.to_string()).context("invalid Google auth URL")?,
-        Some(TokenUrl::new(GOOGLE_TOKEN_URL.to_string()).context("invalid Google token URL")?),
-    )
-    .set_device_authorization_url(
-        DeviceAuthorizationUrl::new(GOOGLE_DEVICE_AUTH_URL.to_string())
-            .context("invalid Google device authorization URL")?,
-    ))
+    Ok(GoogleClientInitial::new(ClientId::new(GOOGLE_CLI_CLIENT_ID.to_string()))
+        .set_auth_uri(AuthUrl::new(GOOGLE_AUTH_URL.to_string()).context("invalid Google auth URL")?)
+        .set_token_uri(
+            TokenUrl::new(GOOGLE_TOKEN_URL.to_string()).context("invalid Google token URL")?,
+        )
+        .set_device_authorization_url(
+            DeviceAuthorizationUrl::new(GOOGLE_DEVICE_AUTH_URL.to_string())
+                .context("invalid Google device authorization URL")?,
+        ))
 }
 
 /// Run the Device Authorization Grant end to end: request a device code,
@@ -130,13 +169,13 @@ fn build_client() -> Result<GoogleClient> {
 /// Returns the signed-in email on success.
 pub async fn login() -> Result<String> {
     let client = build_client()?;
+    let http = http_client()?;
 
     let details: StandardDeviceAuthorizationResponse = client
         .exchange_device_code()
-        .context("failed to build device authorization request")?
         .add_scope(Scope::new("openid".to_string()))
         .add_scope(Scope::new("email".to_string()))
-        .request_async(async_http_client)
+        .request_async(&http)
         .await
         .context("failed to start Google device authorization")?;
 
@@ -152,7 +191,7 @@ pub async fn login() -> Result<String> {
 
     let token = client
         .exchange_device_access_token(&details)
-        .request_async(async_http_client, tokio::time::sleep, None)
+        .request_async(&http, tokio::time::sleep, None)
         .await
         .map_err(|e| anyhow::anyhow!("Google device authorization failed: {e}"))?;
 
@@ -172,9 +211,10 @@ pub async fn login() -> Result<String> {
 
 async fn refresh(refresh_token: &str) -> Result<Credentials> {
     let client = build_client()?;
+    let http = http_client()?;
     let token = client
         .exchange_refresh_token(&RefreshToken::new(refresh_token.to_string()))
-        .request_async(async_http_client)
+        .request_async(&http)
         .await
         .map_err(|e| anyhow::anyhow!("failed to refresh Google credentials: {e}"))?;
 
