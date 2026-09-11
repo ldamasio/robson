@@ -7,7 +7,7 @@
     "killSwitch": "Kill Switch"
   },
   "auth": {
-    "login": "Login with GitHub",
+    "login": "Login with Google",
     "logout": "Logout"
   },
   "disclaimer": {
@@ -17,10 +17,9 @@
   "login": {
     "title": "Robson",
     "pageTitle": "Login · RBX Robson",
-    "description": "Enter your API token to access the operations console.",
-    "tokenPlaceholder": "Bearer token",
-    "connect": "Connect",
-    "connecting": "Connecting...",
+    "description": "Sign in with Google to access the operations console.",
+    "signIn": "Sign in with Google",
+    "signingIn": "Signing in...",
     "connectionFailed": "Connection failed"
   },
   "dashboard": {

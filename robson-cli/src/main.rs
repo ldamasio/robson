@@ -1,4 +1,5 @@
 mod api_client;
+pub mod auth;
 mod commands;
 
 use clap::Parser;
@@ -10,6 +11,8 @@ use clap::Parser;
     about = "Operational CLI for Robson daemon"
 )]
 enum Cli {
+    /// Google OAuth sign-in for the CLI (ADR-0054).
+    Auth(commands::auth::AuthArgs),
     ReconcileClose(commands::reconcile_close::ReconcileCloseArgs),
     Income(commands::income::IncomeArgs),
 }
@@ -18,6 +21,7 @@ enum Cli {
 async fn main() {
     let cli = Cli::parse();
     let code = match cli {
+        Cli::Auth(args) => commands::auth::run(args).await,
         Cli::ReconcileClose(args) => commands::reconcile_close::run(args).await,
         Cli::Income(args) => commands::income::run(args).await,
     };

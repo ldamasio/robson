@@ -3,10 +3,18 @@
 
 import { browser } from "$app/environment";
 import { get as getStore } from "svelte/store";
-import { authToken } from "$stores/auth";
+import { authToken, clearAuth, silentRefreshGoogleToken } from "$stores/auth";
 import { env } from "$env/dynamic/public";
 
 const API_BASE: string = env.PUBLIC_ROBSON_API_BASE ?? "";
+// ADR-0054: `$env/dynamic/public` rather than `$env/static/public` — the
+// latter's named exports only exist when the var is set at `vite
+// build`/`svelte-kit sync` time, which fails typecheck entirely in any
+// environment (CI, a fresh clone) that hasn't configured a real Google
+// Client ID yet. Same build-time-baked-in mechanism either way once
+// deployed (see frontend/Dockerfile's PUBLIC_ROBSON_API_BASE precedent) —
+// this only relaxes the compile-time contract, not the runtime one.
+const GOOGLE_WEB_CLIENT_ID: string = env.PUBLIC_GOOGLE_WEB_CLIENT_ID ?? "";
 
 // --- Backend response types (match robsond serde output) ---
 
@@ -267,7 +275,13 @@ function getToken(): string | null {
   return getStore(authToken);
 }
 
-async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
+// ADR-0054: a Google ID token is valid for ~1h, so a request can land just
+// past expiry mid-session. On a 401, try one silent refresh
+// (`google.accounts.id.prompt()`, no visible click) and retry the request
+// once before giving up — this is what lets a long-lived tab keep working
+// without an interruption most of the time. `isRetry` bounds this to a
+// single attempt per call so a persistently-401ing endpoint can't loop.
+async function apiFetch<T>(path: string, init?: RequestInit, isRetry = false): Promise<T> {
   const token = getToken();
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -278,6 +292,18 @@ async function apiFetch<T>(path: string, init?: RequestInit): Promise<T> {
   }
 
   const res = await fetch(`${API_BASE}${path}`, { ...init, headers });
+
+  if (res.status === 401 && !isRetry && browser) {
+    const refreshed = await silentRefreshGoogleToken(GOOGLE_WEB_CLIENT_ID);
+    if (refreshed) {
+      return apiFetch<T>(path, init, true);
+    }
+    // Silent refresh couldn't produce a fresh credential — fall back to
+    // the normal expired-session handling: drop the dead token so the
+    // (authed) layout's reactive guard redirects to /login.
+    clearAuth();
+  }
+
   if (!res.ok) {
     const body = await res.text().catch(() => "");
     throw new ApiError(path, res.status, res.statusText, body);
@@ -495,20 +521,29 @@ export class FetchEventSource implements EventSourceLike {
   private closed = false;
   private retries = 0;
   private reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  // ADR-0054: bounds the 401 silent-refresh attempt to once per outage,
+  // mirroring `apiFetch`'s `isRetry` — otherwise a genuinely expired
+  // session (refresh declined/unavailable) would retry a doomed GIS
+  // prompt on every reconnect, in addition to the connection backoff.
+  private triedSilentRefreshOn401 = false;
   private static readonly MAX_RECONNECT_MS = 30_000;
   private static readonly READ_IDLE_TIMEOUT_MS = 45_000;
 
   constructor(
     url: string,
-    token: string | null,
+    // ADR-0054: intentionally NOT stored — a Google ID token can be
+    // refreshed mid-connection (silent refresh, ~1h lifetime), so every
+    // (re)connect re-reads the current token from the auth store via
+    // `getToken()` instead of closing over the value captured here.
+    _initialToken: string | null,
     private readonly onReconnect?: () => void,
     private readonly onStale?: (staleSecs: number) => void,
     private readonly onActivity?: () => void,
   ) {
-    this.connect(url, token);
+    this.connect(url);
   }
 
-  private scheduleReconnect(url: string, token: string | null): void {
+  private scheduleReconnect(url: string): void {
     if (this.closed) return;
     const delay = Math.min(
       1_000 * 2 ** this.retries,
@@ -517,11 +552,15 @@ export class FetchEventSource implements EventSourceLike {
     this.retries++;
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
-      if (!this.closed) this.connect(url, token);
+      if (!this.closed) this.connect(url);
     }, delay);
   }
 
-  private async connect(url: string, token: string | null): Promise<void> {
+  private async connect(url: string): Promise<void> {
+    // Re-read at connect time (not passed in) so a token refreshed since
+    // the last attempt — or since this client was constructed — is picked
+    // up on every reconnect, not just the first connection.
+    const token = getToken();
     const headers: Record<string, string> = { Accept: `text/event-stream` };
     if (token) headers[`Authorization`] = `Bearer ${token}`;
 
@@ -539,7 +578,7 @@ export class FetchEventSource implements EventSourceLike {
         this.onerror?.call({} as EventSource, new Event(`error`));
         this.onStale?.(FetchEventSource.READ_IDLE_TIMEOUT_MS / 1_000);
         this.currentController?.abort();
-        this.scheduleReconnect(url, token);
+        this.scheduleReconnect(url);
       }, FetchEventSource.READ_IDLE_TIMEOUT_MS);
     };
 
@@ -549,11 +588,33 @@ export class FetchEventSource implements EventSourceLike {
         headers,
         signal: this.currentController.signal,
       });
+
+      // ADR-0054: a plain reconnect-with-backoff is right for transient
+      // network/server errors, but a 401 means this specific credential is
+      // dead — reconnecting with the *same* (or an equally-expired) token
+      // would just loop 401s forever. Try one silent refresh first; if that
+      // can't produce a fresh credential either, stop retrying so the
+      // normal expired-session UI takes over instead of churning quietly.
+      if (!this.closed && res.status === 401 && !this.triedSilentRefreshOn401) {
+        this.triedSilentRefreshOn401 = true;
+        clearIdle();
+        const refreshed = await silentRefreshGoogleToken(GOOGLE_WEB_CLIENT_ID);
+        if (!this.closed) {
+          if (refreshed) {
+            this.connect(url);
+          } else {
+            clearAuth();
+            this.onerror?.call({} as EventSource, new Event(`error`));
+          }
+        }
+        return;
+      }
+
       if (this.closed || !res.ok || !res.body) {
         clearIdle();
         if (!this.closed) {
           this.onerror?.call({} as EventSource, new Event(`error`));
-          this.scheduleReconnect(url, token);
+          this.scheduleReconnect(url);
         }
         return;
       }
@@ -561,6 +622,7 @@ export class FetchEventSource implements EventSourceLike {
       const reader = res.body.getReader();
       if (this.retries > 0) this.onReconnect?.();
       this.retries = 0; // reset backoff on successful stream start
+      this.triedSilentRefreshOn401 = false; // this credential just proved itself good
       const decoder = new TextDecoder();
       let buf = ``;
       resetIdle();
@@ -570,7 +632,7 @@ export class FetchEventSource implements EventSourceLike {
         resetIdle();
         if (done) {
           clearIdle();
-          this.scheduleReconnect(url, token);
+          this.scheduleReconnect(url);
           break;
         }
 
@@ -589,7 +651,7 @@ export class FetchEventSource implements EventSourceLike {
       clearIdle();
       if ((err as DOMException)?.name === "AbortError" || this.closed) return;
       this.onerror?.call({} as EventSource, new Event(`error`));
-      this.scheduleReconnect(url, token);
+      this.scheduleReconnect(url);
     }
   }
 

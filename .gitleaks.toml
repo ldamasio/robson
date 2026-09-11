@@ -15,4 +15,9 @@ paths = [
   '''docs/specs/robson-api-v1-spec\.md''',
   '''justfile''',
   '''\.env\.example$''',
+  # Test-only RSA keypair generated solely to sign fixture Google ID
+  # tokens in robsond's unit tests (ADR-0054) — never used for anything
+  # real, not derived from or related to any production credential.
+  # Audited 2026-09-11.
+  '''robsond/src/testdata/test_rsa_key(_pub)?\.pem$''',
 ]

@@ -40,6 +40,7 @@
 #![warn(clippy::all)]
 
 pub mod api;
+pub mod auth;
 pub mod binance_exchange;
 pub mod binance_ohlcv;
 pub mod circuit_breaker;
@@ -49,6 +50,7 @@ pub mod detector;
 pub mod error;
 pub mod event_bus;
 pub mod funding;
+pub mod google_jwks;
 pub mod market_data;
 pub mod metrics;
 pub mod position_manager;
@@ -69,6 +71,7 @@ pub mod projection_worker;
 mod chaos_tests;
 
 // Re-exports for convenience
+pub use auth::{AuthError, GoogleAuthConfig, GoogleClaims};
 pub use binance_exchange::BinanceExchangeAdapter;
 pub use binance_ohlcv::BinanceOhlcvAdapter;
 pub use circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot};
@@ -78,6 +81,7 @@ pub use config::{
 };
 pub use daemon::Daemon;
 pub use detector::{DetectorConfig, DetectorTask};
+pub use google_jwks::GoogleJwksCache;
 pub use error::{exit_code_for_daemon_error, DaemonError, DaemonResult};
 pub use event_bus::{DaemonEvent, EventBus, EventReceiver, MarketData, OrderFill};
 #[cfg(feature = "postgres")]

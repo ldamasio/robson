@@ -41,10 +41,6 @@ pub struct IncomeAckArgs {
     /// Base URL of the robsond API.
     #[arg(long, default_value = "http://localhost:8080")]
     pub robsond_url: String,
-
-    /// Bearer token for authentication. Falls back to ROBSON_API_TOKEN.
-    #[arg(long, value_name = "TOKEN", env = "ROBSON_API_TOKEN")]
-    pub token: Option<String>,
 }
 
 pub async fn run(args: IncomeArgs) -> i32 {
@@ -79,7 +75,11 @@ async fn run_ack_inner(args: IncomeAckArgs) -> Result<i32, i32> {
         EXIT_USAGE_ERROR
     })?;
 
-    let client = api_client::ApiClient::new(&args.robsond_url, args.token.as_deref());
+    let token = crate::auth::current_id_token().await.map_err(|error| {
+        eprintln!("error: {error:#}");
+        EXIT_UNAUTHORIZED
+    })?;
+    let client = api_client::ApiClient::new(&args.robsond_url, &token);
     let response = client
         .acknowledge_income(&exchange_income_id, api_client::IncomeAckRequest { reason, actor })
         .await
