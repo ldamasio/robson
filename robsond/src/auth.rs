@@ -74,15 +74,9 @@ pub async fn verify_google_id_token(
     cfg: &GoogleAuthConfig,
 ) -> Result<GoogleClaims, AuthError> {
     let header = decode_header(token).map_err(|e| AuthError::Malformed(e.to_string()))?;
-    let kid = header
-        .kid
-        .ok_or_else(|| AuthError::Malformed("missing kid".to_string()))?;
+    let kid = header.kid.ok_or_else(|| AuthError::Malformed("missing kid".to_string()))?;
 
-    let key = cfg
-        .jwks
-        .get_key(&kid)
-        .await
-        .map_err(|e| AuthError::UnknownKey(e.to_string()))?;
+    let key = cfg.jwks.get_key(&kid).await.map_err(|e| AuthError::UnknownKey(e.to_string()))?;
 
     let mut validation = Validation::new(Algorithm::RS256);
     validation.set_audience(&cfg.client_ids);
@@ -116,9 +110,7 @@ pub fn looks_like_jwt(value: &str) -> bool {
     let parts: Vec<&str> = value.split('.').collect();
     parts.len() == 3
         && parts.iter().all(|p| {
-            !p.is_empty()
-                && p.bytes()
-                    .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            !p.is_empty() && p.bytes().all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
         })
 }
 

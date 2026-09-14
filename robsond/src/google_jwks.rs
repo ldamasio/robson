@@ -149,11 +149,9 @@ impl GoogleJwksCache {
         // below fails, so a degraded/unreachable Google endpoint can't be
         // hammered by every subsequent request either.
         let now = Instant::now();
-        let too_soon = self
-            .last_refresh_attempt
-            .read()
-            .await
-            .is_some_and(|attempted_at| now.duration_since(attempted_at) < MIN_ON_DEMAND_REFRESH_INTERVAL);
+        let too_soon = self.last_refresh_attempt.read().await.is_some_and(|attempted_at| {
+            now.duration_since(attempted_at) < MIN_ON_DEMAND_REFRESH_INTERVAL
+        });
         if too_soon {
             return Err(JwksError::Key(format!(
                 "unknown kid {kid}; last on-demand refresh attempt was under {}s ago",
@@ -172,14 +170,8 @@ impl GoogleJwksCache {
     }
 
     async fn refresh(&self) -> Result<(), JwksError> {
-        let resp: GoogleJwksResponse = self
-            .http
-            .get(GOOGLE_CERTS_URL)
-            .send()
-            .await?
-            .error_for_status()?
-            .json()
-            .await?;
+        let resp: GoogleJwksResponse =
+            self.http.get(GOOGLE_CERTS_URL).send().await?.error_for_status()?.json().await?;
 
         if resp.keys.is_empty() {
             return Err(JwksError::Parse("Google JWKS response had no keys".into()));

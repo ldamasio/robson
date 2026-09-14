@@ -81,9 +81,9 @@ pub use config::{
 };
 pub use daemon::Daemon;
 pub use detector::{DetectorConfig, DetectorTask};
-pub use google_jwks::GoogleJwksCache;
 pub use error::{exit_code_for_daemon_error, DaemonError, DaemonResult};
 pub use event_bus::{DaemonEvent, EventBus, EventReceiver, MarketData, OrderFill};
+pub use google_jwks::GoogleJwksCache;
 #[cfg(feature = "postgres")]
 pub use income_ledger::IncomeLedgerWorker;
 pub use position_manager::PositionManager;

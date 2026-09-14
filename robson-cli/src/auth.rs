@@ -101,11 +101,11 @@ type GoogleClient = Client<
     BasicTokenIntrospectionResponse,
     StandardRevocableToken,
     BasicRevocationErrorResponse,
-    EndpointSet,   // HasAuthUrl
-    EndpointSet,   // HasDeviceAuthUrl
+    EndpointSet,    // HasAuthUrl
+    EndpointSet,    // HasDeviceAuthUrl
     EndpointNotSet, // HasIntrospectionUrl
     EndpointNotSet, // HasRevocationUrl
-    EndpointSet,   // HasTokenUrl
+    EndpointSet,    // HasTokenUrl
 >;
 
 /// `Client::new()` only exists on the type with every endpoint left
@@ -145,8 +145,9 @@ fn decode_id_token_claims(id_token: &str) -> Result<IdTokenClaims> {
         .split('.')
         .nth(1)
         .context("malformed id_token: expected a three-part JWT")?;
-    let decoded = base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload)
-        .context("malformed id_token: invalid base64url payload")?;
+    let decoded =
+        base64::Engine::decode(&base64::engine::general_purpose::URL_SAFE_NO_PAD, payload)
+            .context("malformed id_token: invalid base64url payload")?;
     serde_json::from_slice(&decoded).context("malformed id_token: payload is not valid JSON")
 }
 
@@ -203,7 +204,11 @@ pub async fn login() -> Result<String> {
     let claims = decode_id_token_claims(&id_token)?;
     let refresh_token = token.refresh_token().map(|t| t.secret().clone());
 
-    let creds = Credentials { id_token, refresh_token, expiry: claims.exp };
+    let creds = Credentials {
+        id_token,
+        refresh_token,
+        expiry: claims.exp,
+    };
     save_credentials(&creds)?;
 
     Ok(claims.email.unwrap_or_else(|| "<unknown email>".to_string()))
@@ -226,10 +231,16 @@ async fn refresh(refresh_token: &str) -> Result<Credentials> {
     let claims = decode_id_token_claims(&id_token)?;
     // Google does not always return a new refresh_token on refresh; keep
     // reusing the existing one when it doesn't.
-    let refresh_token =
-        token.refresh_token().map(|t| t.secret().clone()).or_else(|| Some(refresh_token.to_string()));
+    let refresh_token = token
+        .refresh_token()
+        .map(|t| t.secret().clone())
+        .or_else(|| Some(refresh_token.to_string()));
 
-    Ok(Credentials { id_token, refresh_token, expiry: claims.exp })
+    Ok(Credentials {
+        id_token,
+        refresh_token,
+        expiry: claims.exp,
+    })
 }
 
 /// Load the cached credentials without any network call or refresh — used
@@ -263,10 +274,12 @@ pub fn load_credentials() -> Result<Credentials> {
         }
     }
 
-    let raw = fs::read_to_string(&path)
-        .map_err(|_| anyhow::anyhow!("no cached Google credentials found; run `robson auth login` first"))?;
+    let raw = fs::read_to_string(&path).map_err(|_| {
+        anyhow::anyhow!("no cached Google credentials found; run `robson auth login` first")
+    })?;
 
-    serde_json::from_str(&raw).context("cached credentials file is corrupt; run `robson auth login` again")
+    serde_json::from_str(&raw)
+        .context("cached credentials file is corrupt; run `robson auth login` again")
 }
 
 fn save_credentials(creds: &Credentials) -> Result<()> {
@@ -338,8 +351,10 @@ mod tests {
 
     fn make_id_token(payload_json: &str) -> String {
         use base64::Engine;
-        let header = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{\"alg\":\"RS256\"}");
-        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload_json.as_bytes());
+        let header =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(b"{\"alg\":\"RS256\"}");
+        let payload =
+            base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(payload_json.as_bytes());
         format!("{header}.{payload}.signature-not-checked-client-side")
     }
 
@@ -382,10 +397,8 @@ mod tests {
         // SAFETY: see `credentials_path_prefers_xdg_config_home` above —
         // same narrowly-scoped env mutation, immediately restored.
         let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
-        let dir = std::env::temp_dir().join(format!(
-            "robson-cli-test-perms-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("robson-cli-test-perms-{}", std::process::id()));
         std::env::set_var("XDG_CONFIG_HOME", &dir);
 
         let path = credentials_path().unwrap();

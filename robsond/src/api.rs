@@ -3666,13 +3666,7 @@ mod tests {
         let app = create_test_app_with_google_auth(Some(test_google_auth_config())).await;
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/panic")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().method("POST").uri("/panic").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
@@ -3807,13 +3801,7 @@ mod tests {
         let app = create_test_app_with_google_auth(None).await;
 
         let response = app
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri("/panic")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(Request::builder().method("POST").uri("/panic").body(Body::empty()).unwrap())
             .await
             .unwrap();
 
