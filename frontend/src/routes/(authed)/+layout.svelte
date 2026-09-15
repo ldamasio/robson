@@ -1,5 +1,5 @@
 <script lang="ts">
-  import { onDestroy, onMount } from 'svelte';
+  import { onDestroy } from 'svelte';
   import { goto } from '$app/navigation';
   import { browser } from '$app/environment';
   // ADR-0054: dynamic, not static, public env — see robson.ts for why.
@@ -29,7 +29,6 @@
   // mid-action. If the silent refresh fails, the next API call's own
   // 401 handling (see `apiFetch`) takes over and redirects to /login.
   const REFRESH_CHECK_INTERVAL_MS = 3 * 60 * 1000;
-  let refreshTimer: ReturnType<typeof setInterval> | undefined;
 
   /** Read the store's current value synchronously (subscribe + immediately
    *  unsubscribe) without needing a component-level reactive binding. */
@@ -40,19 +39,25 @@
     return value;
   }
 
-  onMount(() => {
+  // `$effect`, not `onMount` — see the login page's own note
+  // (frontend/src/routes/login/+page.svelte) on a Rollup/Vite
+  // production-build bug that silently drops `onMount`-registered
+  // callbacks from the shipped bundle in this app. Verified this same
+  // interval is retained in the compiled output as `$effect`, where it
+  // was not as `onMount`.
+  $effect(() => {
     if (!browser) return;
-    refreshTimer = setInterval(() => {
+    const refreshTimer = setInterval(() => {
       const token = currentToken();
       if (token && isNearExpiry(token)) {
         void silentRefreshGoogleToken(env.PUBLIC_GOOGLE_WEB_CLIENT_ID ?? '');
       }
     }, REFRESH_CHECK_INTERVAL_MS);
+    return () => clearInterval(refreshTimer);
   });
 
   onDestroy(() => {
     unsubscribeAuth();
-    if (refreshTimer) clearInterval(refreshTimer);
   });
 
   $effect(() => {
