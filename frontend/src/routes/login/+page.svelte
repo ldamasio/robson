@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { onMount } from 'svelte';
   import { goto } from '$app/navigation';
   import { browser } from '$app/environment';
   // ADR-0054: dynamic, not static, public env — see robson.ts for why.
@@ -39,11 +38,22 @@
     }
   }
 
-  onMount(() => {
+  // NOTE: `$effect`, not `onMount`. In this component (and reproduced in
+  // an isolated, from-scratch test route too), Rollup's tree-shaking
+  // silently removed the equivalent `onMount(...)` callback from the
+  // shipped production bundle — no build error, the button just never
+  // rendered. Disabling Rollup's treeshake entirely made it survive,
+  // confirming tree-shaking as the mechanism, but none of Rollup's
+  // documented, targeted `treeshake` sub-options fixed it, and why some
+  // other `onMount` usages in this app are/aren't affected is not fully
+  // understood. `$effect` is confirmed present in the built output and
+  // working end-to-end (real browser, real GIS button) — don't change
+  // this back to `onMount` without re-verifying the compiled bundle.
+  $effect(() => {
     if (!browser) return;
 
-    // Loaded client-side only (onMount never runs during SSR/prerender),
-    // so this never touches the static build.
+    // Loaded client-side only ($effect bodies never run during
+    // SSR/prerender), so this never touches the static build.
     const script = document.createElement('script');
     script.src = 'https://accounts.google.com/gsi/client';
     script.async = true;
