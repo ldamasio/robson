@@ -53,6 +53,7 @@ jobs:
           labels: ${{ steps.meta.outputs.labels }}
           build-args: |
             PUBLIC_ROBSON_API_BASE=${{ vars.PUBLIC_ROBSON_API_BASE_PROD }}
+            PUBLIC_GOOGLE_WEB_CLIENT_ID=${{ vars.PUBLIC_GOOGLE_WEB_CLIENT_ID_PROD }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 

@@ -48,15 +48,35 @@ pub struct Config {
 ///
 /// CORS allow-list is read directly from `ROBSON_CORS_ALLOWED_ORIGINS`
 /// (comma-separated) inside `api::build_cors_layer`; not duplicated here.
+///
+/// ADR-0054 replaced the static `ROBSON_API_TOKEN` bearer token with Google
+/// OAuth ID token verification. `google_web_client_id` / `google_cli_client_id`
+/// are the acceptable `aud` values (frontend GIS flow and `robson-cli`'s
+/// Device Authorization Grant respectively); `allowed_email` is the single
+/// operator allowlisted to authenticate. At least one client id plus
+/// `allowed_email` is required when `ROBSON_ENV=production`.
 #[derive(Debug, Clone)]
 pub struct ApiConfig {
     /// Host to bind to
     pub host: String,
     /// Port to bind to
     pub port: u16,
-    /// Bearer token for authenticating mutating API routes.
-    /// Required when ROBSON_ENV=production; optional otherwise.
-    pub api_token: Option<String>,
+    /// Google OAuth Web client id — `aud` for ID tokens issued to the
+    /// SvelteKit frontend via Google Identity Services.
+    pub google_web_client_id: Option<String>,
+    /// Google OAuth CLI (TV/limited-input) client id — `aud` for ID tokens
+    /// issued to `robson-cli` via the Device Authorization Grant.
+    pub google_cli_client_id: Option<String>,
+    /// The single allowlisted operator email (case-insensitive match).
+    pub allowed_email: Option<String>,
+    /// TEMPORARY: dual-accept bridge during ADR-0054 rollout, remove after
+    /// cutover — see ADR-0054 migration plan. Read from the renamed
+    /// `ROBSON_LEGACY_API_TOKEN` env var (the old `ROBSON_API_TOKEN` name is
+    /// rejected outright, see `reject_removed_api_token_env`). When set, the
+    /// auth middleware still accepts an exact match against this value for
+    /// non-JWT-shaped bearer credentials, alongside Google ID token
+    /// verification.
+    pub legacy_api_token: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -299,6 +319,7 @@ impl Config {
         // Load .env file if present (ignore errors)
         let _ = dotenvy::dotenv();
         Self::reject_removed_stop_policy_env()?;
+        Self::reject_removed_api_token_env()?;
 
         let environment = Self::load_environment()?;
         let api = Self::load_api_config()?;
@@ -310,11 +331,20 @@ impl Config {
         let reconciliation = Self::load_reconciliation_config()?;
         let funding = Self::load_funding_config()?;
 
-        // Fail-fast: API token is mandatory in production
-        if environment == Environment::Production && api.api_token.is_none() {
-            return Err(DaemonError::Config(
-                "ROBSON_API_TOKEN is required when ROBSON_ENV=production".to_string(),
-            ));
+        // Fail-fast: Google OAuth auth is mandatory in production (ADR-0054).
+        if environment == Environment::Production {
+            if api.allowed_email.is_none() {
+                return Err(DaemonError::Config(
+                    "ROBSON_ALLOWED_EMAIL is required when ROBSON_ENV=production".to_string(),
+                ));
+            }
+            if api.google_web_client_id.is_none() && api.google_cli_client_id.is_none() {
+                return Err(DaemonError::Config(
+                    "At least one of ROBSON_GOOGLE_WEB_CLIENT_ID / ROBSON_GOOGLE_CLI_CLIENT_ID \
+                     is required when ROBSON_ENV=production"
+                        .to_string(),
+                ));
+            }
         }
 
         Ok(Self {
@@ -336,7 +366,10 @@ impl Config {
             api: ApiConfig {
                 host: "127.0.0.1".to_string(),
                 port: 0, // Let OS assign port
-                api_token: None,
+                google_web_client_id: None,
+                google_cli_client_id: None,
+                allowed_email: None,
+                legacy_api_token: None,
             },
             engine: EngineConfig {
                 min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
@@ -408,6 +441,25 @@ impl Config {
         Ok(())
     }
 
+    /// ADR-0054 replaced the static `ROBSON_API_TOKEN` bearer token with
+    /// Google OAuth ID token verification. Presence of the old var is
+    /// rejected outright (not silently ignored) so a stale deployment
+    /// manifest can't keep the old scheme's blast radius around by
+    /// accident. Operators who still need the temporary dual-accept
+    /// rollout bridge (see `ApiConfig::legacy_api_token`) must rename the
+    /// value to `ROBSON_LEGACY_API_TOKEN`.
+    fn reject_removed_api_token_env() -> DaemonResult<()> {
+        if env::var_os("ROBSON_API_TOKEN").is_some() {
+            return Err(DaemonError::Config(
+                "ROBSON_API_TOKEN was removed by ADR-0054; rename it to \
+                 ROBSON_LEGACY_API_TOKEN to keep the temporary dual-accept rollout bridge, \
+                 or remove it once Google OAuth is confirmed stable"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     fn load_api_config() -> DaemonResult<ApiConfig> {
         let host = env::var("ROBSON_API_HOST").unwrap_or_else(|_| "0.0.0.0".to_string());
         let port_str = env::var("ROBSON_API_PORT").unwrap_or_else(|_| "8080".to_string());
@@ -416,9 +468,27 @@ impl Config {
             .parse::<u16>()
             .map_err(|_| DaemonError::Config(format!("Invalid ROBSON_API_PORT: {}", port_str)))?;
 
-        let api_token = env::var("ROBSON_API_TOKEN").ok().filter(|v| !v.trim().is_empty());
+        let google_web_client_id =
+            env::var("ROBSON_GOOGLE_WEB_CLIENT_ID").ok().filter(|v| !v.trim().is_empty());
+        let google_cli_client_id =
+            env::var("ROBSON_GOOGLE_CLI_CLIENT_ID").ok().filter(|v| !v.trim().is_empty());
+        let allowed_email = env::var("ROBSON_ALLOWED_EMAIL").ok().filter(|v| !v.trim().is_empty());
 
-        Ok(ApiConfig { host, port, api_token })
+        // TEMPORARY: dual-accept bridge during ADR-0054 rollout, remove
+        // after cutover — see ADR-0054 migration plan. Deliberately a
+        // separate, clearly-deprecated env var name (not `ROBSON_API_TOKEN`,
+        // which `reject_removed_api_token_env` rejects outright above).
+        let legacy_api_token =
+            env::var("ROBSON_LEGACY_API_TOKEN").ok().filter(|v| !v.trim().is_empty());
+
+        Ok(ApiConfig {
+            host,
+            port,
+            google_web_client_id,
+            google_cli_client_id,
+            allowed_email,
+            legacy_api_token,
+        })
     }
 
     fn load_engine_config() -> DaemonResult<EngineConfig> {
@@ -746,7 +816,10 @@ impl Default for Config {
             api: ApiConfig {
                 host: "0.0.0.0".to_string(),
                 port: 8080,
-                api_token: None,
+                google_web_client_id: None,
+                google_cli_client_id: None,
+                allowed_email: None,
+                legacy_api_token: None,
             },
             engine: EngineConfig {
                 min_tech_stop_percent: Decimal::new(1, 3),  // 0.1%
@@ -900,6 +973,59 @@ mod tests {
             DaemonError::Config(message)
                 if message.contains("ROBSON_STOP_POLICY")
                     && message.contains("removed by ADR-0052")
+        ));
+    }
+
+    #[test]
+    fn startup_fails_fast_when_removed_api_token_env_is_present() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[("ROBSON_API_TOKEN", Some("old-secret-123"))]);
+
+        let error = Config::from_env().unwrap_err();
+        assert!(matches!(
+            error,
+            DaemonError::Config(message)
+                if message.contains("ROBSON_API_TOKEN")
+                    && message.contains("removed by ADR-0054")
+        ));
+    }
+
+    #[test]
+    fn startup_fails_fast_in_production_without_allowed_email() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_ENV", Some("production")),
+            ("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT")),
+            ("ROBSON_POSITION_MONITOR_ENABLED", Some("false")),
+            ("ROBSON_ALLOWED_EMAIL", None),
+            ("ROBSON_GOOGLE_WEB_CLIENT_ID", Some("web-client-id")),
+        ]);
+
+        let error = Config::from_env().unwrap_err();
+        assert!(matches!(
+            error,
+            DaemonError::Config(message) if message.contains("ROBSON_ALLOWED_EMAIL")
+        ));
+    }
+
+    #[test]
+    fn startup_fails_fast_in_production_without_any_google_client_id() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_ENV", Some("production")),
+            ("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT")),
+            ("ROBSON_POSITION_MONITOR_ENABLED", Some("false")),
+            ("ROBSON_ALLOWED_EMAIL", Some("ldamasio@gmail.com")),
+            ("ROBSON_GOOGLE_WEB_CLIENT_ID", None),
+            ("ROBSON_GOOGLE_CLI_CLIENT_ID", None),
+        ]);
+
+        let error = Config::from_env().unwrap_err();
+        assert!(matches!(
+            error,
+            DaemonError::Config(message)
+                if message.contains("ROBSON_GOOGLE_WEB_CLIENT_ID")
+                    && message.contains("ROBSON_GOOGLE_CLI_CLIENT_ID")
         ));
     }
 

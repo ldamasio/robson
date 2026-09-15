@@ -30,10 +30,6 @@ pub struct ReconcileCloseArgs {
     /// Base URL of the robsond API.
     #[arg(long, default_value = "http://localhost:8080")]
     pub robsond_url: String,
-
-    /// Bearer token for authentication. Falls back to ROBSON_API_TOKEN env var.
-    #[arg(long, value_name = "TOKEN", env = "ROBSON_API_TOKEN")]
-    pub token: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -165,7 +161,11 @@ async fn run_inner(args: ReconcileCloseArgs) -> Result<i32, i32> {
     let request_body =
         api_client::ReconcileCloseRequest { position_id: args.position_id, evidence };
 
-    let client = api_client::ApiClient::new(&args.robsond_url, args.token.as_deref());
+    let token = crate::auth::current_id_token().await.map_err(|e| {
+        eprintln!("error: {e:#}");
+        EXIT_UNAUTHORIZED
+    })?;
+    let client = api_client::ApiClient::new(&args.robsond_url, &token);
     let response = client.reconcile_close(request_body).await.map_err(|e| {
         eprintln!("error: {e:#}");
         EXIT_GENERIC_ERROR

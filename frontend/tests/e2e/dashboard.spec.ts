@@ -80,6 +80,71 @@ test.describe("Dashboard", () => {
     await expect(page.locator(".tick-ruler")).toBeVisible();
   });
 
+  test("ARM exposes only immediate entry and sends it explicitly", async ({
+    page,
+  }) => {
+    await installMockEventSource(page);
+    await routeHealthyDashboard(page);
+    await page.route("**/events/history?date=*", (route) =>
+      route.fulfill({
+        status: 200,
+        contentType: "application/json",
+        body: JSON.stringify({
+          date: new Date().toISOString().slice(0, 10),
+          events: [],
+        }),
+      }),
+    );
+
+    let releasePost!: () => void;
+    const holdPost = new Promise<void>((resolve) => {
+      releasePost = resolve;
+    });
+    let submittedBody: unknown;
+    await page.route("**/positions", async (route) => {
+      submittedBody = route.request().postDataJSON();
+      await holdPost;
+      await route.fulfill({
+        status: 201,
+        contentType: "application/json",
+        body: JSON.stringify({
+          id: "pos-immediate",
+          symbol: "ETHUSDT",
+          side: "Short",
+          state: "Armed",
+        }),
+      });
+    });
+
+    await authAndGoto(page, "/dashboard");
+    await page.getByRole("button", { name: "ENTRY", exact: true }).click();
+
+    const dialog = page.getByRole("dialog");
+    await expect(dialog.getByLabel("Entry mode")).toHaveText("IMMEDIATE");
+    await expect(dialog.getByText("CONFIRMED TREND")).toHaveCount(0);
+    await expect(dialog.getByText("CONFIRMED REVERSAL")).toHaveCount(0);
+    await expect(dialog.getByText("CONFIRMED KEY LEVEL")).toHaveCount(0);
+
+    const symbolInput = dialog.getByRole("textbox");
+    await symbolInput.fill("ethusdt");
+    await dialog.getByRole("button", { name: "SHORT" }).click();
+    await dialog.getByRole("button", { name: "ARM", exact: true }).click();
+
+    await expect(
+      dialog.getByRole("button", { name: "ARMING...", exact: true }),
+    ).toBeDisabled();
+    await expect(symbolInput).toBeDisabled();
+    await expect(dialog.getByRole("button", { name: "Close" })).toBeDisabled();
+    expect(submittedBody).toEqual({
+      symbol: "ETHUSDT",
+      side: "Short",
+      entry_policy: { mode: "immediate", approval: "automatic" },
+    });
+
+    releasePost();
+    await expect(dialog).toHaveCount(0);
+  });
+
   test("502 error state: error card and retry button visible", async ({
     page,
   }) => {

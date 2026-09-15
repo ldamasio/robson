@@ -1,6 +1,6 @@
 # Robson v2 Domain Model
 
-**Version**: 2.0.0-alpha
+**Version**: 2.5.0
 **Last Updated**: 2026-01-16
 **Status**: Implementation Phase (Phases 0-3 Complete)
 

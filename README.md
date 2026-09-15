@@ -28,15 +28,24 @@ Armed → Entering → Active → Exiting → Closed
   └─ Error (unrecoverable, requires operator action)
 ```
 
-The operator **arms** a position by specifying a symbol, direction (Long/Short), and an entry mode. Robson's detector then monitors the market and fires an entry signal when the chosen condition is met. The signal is routed through the query engine and risk gate before any order reaches the exchange.
+The operator **arms** a position by specifying a symbol and direction
+(Long/Short). In the v2.5 operator surface, Robson processes the entry
+immediately at ARM time. The request still passes through technical-stop
+analysis, the query engine, and the risk gate before any order reaches the
+exchange.
 
-**Entry modes** (what triggers the entry signal):
-- `confirmed_trend`: SMA crossover signal (default)
-- `confirmed_reversal`: reversal candlestick pattern
-- `confirmed_key_level`: reaction at a key support/resistance level
-- `immediate`: entry signal generated and processed at arm time, still subject to the approval mode
+**Supported v2.5 entry mode**:
+
+- `immediate`: entry intent is generated and processed at ARM time, still
+  subject to the selected approval mode and every risk control
+
+The backend retains `confirmed_trend`, `confirmed_reversal`, and
+`confirmed_key_level` for historical event/API compatibility. They are not
+operationally accepted for v2.5 and are intentionally unavailable in the
+dashboard.
 
 **Approval modes** (whether human confirmation is required):
+
 - `automatic`: entry proceeds without operator action (default)
 - `human_confirmation`: operator must approve via dashboard before the order is placed
 
@@ -77,7 +86,9 @@ docs/
 
 **Risk Engine** — Enforces per-position and portfolio-level constraints before and during execution. Position sizing is derived from the Golden Rule. Every exit carries a typed reason code.
 
-**Detector** — Monitors market conditions for the entry mode chosen at ARM time. Fires a single entry signal when conditions are met. It is a governed input boundary — signals do not bypass the risk gate.
+**Detector** — Preserves the governed strategy boundary used by deferred entry
+policies. The supported v2.5 `immediate` mode bypasses strategy waiting but
+does not bypass technical-stop analysis, the query engine, or the risk gate.
 
 **Reconciliation Worker** — Continuously verifies that every open position on the Binance account traces to a `robsond`-authored entry. Untracked positions are automatically closed. This invariant is non-negotiable (ADR-0022).
 

@@ -94,9 +94,15 @@ every reference uses a canonical identifier with a prefix:
 - `QE-P5` is NOT a migration step; it is a deferred QueryEngine phase (Context Governance, v3+ with LLM).
 - `Stage N` is a pipeline stage within a single execution tick (e.g., Stage 1: Observe). Not a project milestone.
 
-**Quick status reference** (as of 2026-05-12, repository-verified):
+**Quick status reference** (as of 2026-08-23):
 
 Status rule for this table: code-backed items may be marked done from repository evidence; operational rollout items stay pending unless the repository contains explicit rollout confirmation.
+
+**Current release baseline**: Robson v2.5 is the production line and VAL-002
+records real-capital activation. The Rust runtime and SvelteKit frontend are
+versioned `2.5.0`. The v2.5 dashboard exposes only the operationally accepted
+`immediate` entry mode. Strategy-backed entry modes remain implemented in the
+backend for compatibility, but are not release-supported operator actions.
 
 **Abandoned items** are decisions made by the operator (2026-05-12) to drop scope that conflicted with v3 architecture or policy. They do not appear in v4 backlog unless noted.
 
@@ -126,7 +132,7 @@ Status rule for this table: code-backed items may be marked done from repository
 | MIG-v3#12 | Monthly State Persistence — `MonthBoundaryReset` + `monthly_state` projection | ✅ Done — `realized_loss` and `trades_opened` in `monthly_state`; `/status` exposes `new_slots_available`, `occupied_slots`, `slot_cells_total`. |
 | MIG-v3#13 | Migrate exchange layer from Isolated Margin to USD-M Futures | ✅ Done — FAPI endpoints, testnet and production. |
 | MIG-v3#14 | Risk Dashboard — monthly budget bar, realized-loss display, slot breakdown | ✅ Done (2026-05-12) — `/status` exposes `capital_base`, `monthly_realized_loss`, and `monthly_realized_loss_pct`; dashboard renders monthly budget, realized-loss display, and backend-sized slot grid. |
-| MIG-v3#15 | ARM Entry Policy Selection — expose `entry_policy.mode` and `entry_policy.approval` in `ArmModal` | ✅ Done (2026-05-12) — `ArmModal.svelte` exposes all four entry modes plus automatic/human-confirmation approval and sends `entry_policy` on non-default selection. |
+| MIG-v3#15 | Operational acceptance for strategy-backed ENTRY modes | ⚠️ Follow-up required (2026-08-23) — v2.5 exposes only `immediate`; `confirmed_trend`, `confirmed_reversal`, and `confirmed_key_level` stay hidden until independently validated. Approval selection remains available. |
 | QE-P1 | Passive Wrapper (Non-Breaking) | ✅ Done |
 | QE-P2 | Blocking Governance | ✅ Done (2026-04-04) |
 | QE-P3 | Approval Gates | ✅ Done (2026-04-05) |
@@ -1009,7 +1015,7 @@ Reconsider TRON integration when ALL of these are true:
 | MIG-v3#12 | **Monthly State Persistence** — `MonthBoundaryReset` + `monthly_state` projection | ✅ Implemented — `realized_loss` and `trades_opened` columns added; dual-routed projection handlers; `load_monthly_state` refactored; backfill script created | MIG-v3#11 | S | Yes — revert to in-memory | Remove monthly_state projection | Monthly realized loss resets on daemon restart; inaccurate budget before real capital |
 | MIG-v3#13 | **Migrate exchange layer from Isolated Margin to USD-M Futures** | SAPI isolated-margin endpoints | MIG-v3#1 | M | Yes — revert to SAPI endpoints | Config: switch back to isolated-margin mode | Orders routed to wrong account type; position mismatches |
 | MIG-v3#14 | **Risk Dashboard**: monthly budget bar, realized-loss display, slot breakdown | Implemented: dashboard renders the budget bar, realized-loss amount and percentage, and backend-sized slot grid from `/status` | MIG-v3#12 follow-up | L | Yes - remove dashboard panels | Remove dashboard UI components | Operator lacks visual risk-budget overview; authenticated API and incident runbooks remain available |
-| MIG-v3#15 | **ARM Entry Policy Selection** — extend `ArmModal.svelte` and `robson.ts:armPosition` to send `entry_policy.mode` + `entry_policy.approval` | ✅ Implemented — `ArmModal` exposes mode and approval controls; `robson.ts:armPosition` accepts optional `entry_policy` | None (frontend task only) | S | Yes — remove controls | Revert to `{ symbol, side }` only | Operator locked to SMA crossover; `Immediate`, `ConfirmedReversal`, `ConfirmedKeyLevel`, and `HumanConfirmation` inaccessible from UI |
+| MIG-v3#15 | **Operational acceptance for strategy-backed ENTRY modes** — validate each mode before restoring it to `ArmModal.svelte` | ⚠️ Follow-up required — v2.5 sends explicit `immediate`; three unaccepted modes are hidden | Mode-specific testnet and operational evidence | M | Yes — UI exposure is additive | Keep the v2.5 immediate-only surface | Exposing an implemented but unaccepted strategy can leave real-capital intent waiting or behaving differently from the operator's expectation |
 
 ### MIG-v3#12 Follow-up: Option 2 — Slot Count from API Only
 
@@ -1067,15 +1073,18 @@ budget bar, no realized-loss display. Full Risk Dashboard deferred to MIG-v3#14.
 
 ### MIG-v3#15: ARM Entry Policy Selection
 
-**Date**: 2026-05-12 — identified as frontend/backend parity gap.
+**Date**: 2026-05-12; release decision updated 2026-08-23.
 
-**Problem**: `ArmModal.svelte` (`frontend/src/lib/design/components/ArmModal.svelte`) sends
-only `{ symbol, side }` to `POST /positions`. The `entry_policy` field is never included.
-`robson.ts:armPosition` (line 303) has the same gap. The backend defaults to
-`ConfirmedTrend` + `Automatic` when `entry_policy` is omitted, locking the operator to SMA
-crossover regardless of market regime.
+**Status**: FOLLOW-UP REQUIRED. Backend capability is not sufficient evidence
+for operator-surface support. The v2.5 release supports only `immediate`.
 
-**Backend capabilities already implemented — no Rust changes required**:
+**Current release decision**: `ArmModal.svelte` displays `IMMEDIATE` as a
+fixed, non-selectable mode and always sends
+`entry_policy: { mode: "immediate", approval }` to `POST /positions`. This is
+deliberately explicit because the backend compatibility default remains
+`ConfirmedTrend + Automatic` when `entry_policy` is omitted.
+
+**Backend compatibility capabilities (not all operationally accepted)**:
 
 | `entry_policy.mode` | Strategy | Implemented in |
 |---------------------|----------|----------------|
@@ -1089,21 +1098,30 @@ crossover regardless of market regime.
 | `automatic` (default) | Entry executes when signal arrives |
 | `human_confirmation` | Entry queued as pending approval (`POST /queries/{id}/approve`) |
 
-#### Frontend steps
+#### v2.5 frontend release steps
 
-1. Add `entry_policy?: { mode?: string; approval?: string }` to `armPosition` call
-   signature in `robson.ts`.
-2. Add entry mode selector to `ArmModal.svelte` (4 options).
-3. Add approval policy toggle (`AUTOMATIC` / `HUMAN_CONFIRMATION`).
-4. Include `entry_policy` in the POST body only when non-default values are selected
-   (omitting the field preserves backward-compatible defaulting in the backend).
+1. Constrain the frontend request type to `mode: "immediate"`.
+2. Remove selectable controls for `confirmed_trend`, `confirmed_reversal`, and
+   `confirmed_key_level`.
+3. Keep `IMMEDIATE` visible as the fixed release behavior.
+4. Keep the independent approval toggle (`AUTOMATIC` /
+   `HUMAN_CONFIRMATION`).
+5. Include the explicit immediate policy in every ARM request.
 
 #### Acceptance criteria
 
-- ARM modal exposes all 4 entry modes and both approval options.
-- Selecting no override still defaults to `ConfirmedTrend` + `Automatic` (no regression).
-- `entry_policy` is present in the POST body when non-default values are selected.
+- ARM modal exposes no strategy-backed entry option.
+- `IMMEDIATE` is visible as the fixed entry behavior.
+- Every ARM request contains `entry_policy.mode = "immediate"`.
+- The screen remains frozen while the ARM mutation is in flight.
 - TypeScript type-check passes.
+
+#### v3 follow-up gate
+
+Restore a strategy-backed mode only after that specific mode has repository
+tests plus testnet operational evidence for signal detection, governed denial,
+restart recovery, and operator-visible failure behavior. UI exposure is the
+last step of that acceptance, not evidence that the mode works.
 
 ---
 

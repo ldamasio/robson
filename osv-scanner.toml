@@ -7,7 +7,7 @@
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2023-0071"
-reason = "rsa (Marvin timing attack): no fixed release exists. Pulled into Cargo.lock via sqlx's optional sqlx-mysql — robson enables postgres only, so rsa is never compiled into any binary. Re-evaluate when rsa ships a fix or sqlx drops the optional edge. (2026-07-05)"
+reason = "rsa (Marvin timing attack): no fixed release exists. Two inclusion paths as of 2026-09-11: (1) sqlx's optional sqlx-mysql — robson enables postgres only, so unused there; (2) jsonwebtoken's rust_crypto feature (ADR-0054, RS256 Google ID token verification in robsond), which IS compiled and actively used. The Marvin attack leaks the *private* key via timing sidechannels in PKCS#1v1.5 decryption/signing (see the advisory: 'information about the private key is leaked'); robsond only ever performs RS256 *verification* with a *public* key built from Google's published JWKS (robsond/src/auth.rs, robsond/src/google_jwks.rs) and never holds or uses an RSA private key, so this attack's precondition (attacker-observable timing over private-key-dependent computation) does not apply to that path either. Re-evaluate when rsa ships a fix, sqlx drops the optional edge, or jsonwebtoken's usage here changes to include private-key operations. (2026-09-11)"
 
 [[IgnoredVulns]]
 id = "RUSTSEC-2024-0437"

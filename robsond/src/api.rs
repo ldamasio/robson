@@ -46,6 +46,7 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::{
+    auth::{constant_time_eq, looks_like_jwt, verify_google_id_token, GoogleAuthConfig},
     circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot},
     config::FundingConfig,
     error::DaemonError,
@@ -74,9 +75,15 @@ pub struct ApiState<E: ExchangePort + 'static, S: Store + 'static> {
     pub pg_pool: Option<std::sync::Arc<sqlx::PgPool>>,
     #[cfg(feature = "postgres")]
     pub tenant_id: Option<Uuid>,
-    /// Bearer token for authenticating mutating routes. `None` means auth is
-    /// disabled (non-production environments only).
-    pub api_token: Option<String>,
+    /// Google OAuth ID token verification config for authenticating
+    /// mutating routes (ADR-0054). `None` means auth is disabled
+    /// (non-production environments only).
+    pub google_auth: Option<GoogleAuthConfig>,
+    /// TEMPORARY: dual-accept bridge during ADR-0054 rollout, remove after
+    /// cutover — see ADR-0054 migration plan. When set, a non-JWT-shaped
+    /// bearer credential is still accepted via exact string match against
+    /// this legacy value, alongside Google ID token verification.
+    pub legacy_api_token: Option<String>,
     pub funding: FundingConfig,
 }
 
@@ -652,42 +659,65 @@ where
         .route("/monthly-halt", get(monthly_halt_status_handler))
         .with_state(state.clone());
 
-    // Operator-sensitive and mutating routes — bearer token required
-    let token = state.api_token.clone();
+    // Operator-sensitive and mutating routes — Google ID token required
+    // (ADR-0054). See `verify_google_id_token` for the verification steps;
+    // any failure returns a generic 401 here and the real reason is logged
+    // via `tracing::warn!` inside that function — never leaked to the
+    // client.
+    let google_auth = state.google_auth.clone();
+    // TEMPORARY: dual-accept bridge during ADR-0054 rollout, remove after
+    // cutover — see ADR-0054 migration plan.
+    let legacy_api_token = state.legacy_api_token.clone();
     let auth_layer = axum::middleware::from_fn(move |req: Request, next: Next| {
-        let expected = token.clone();
+        let google_auth = google_auth.clone();
+        let legacy_api_token = legacy_api_token.clone();
         async move {
-            // No token configured — auth disabled
-            let Some(expected) = expected else {
+            // Neither Google auth nor the legacy bridge is configured — auth
+            // disabled (non-production environments only).
+            if google_auth.is_none() && legacy_api_token.is_none() {
                 return next.run(req).await;
+            }
+
+            let unauthorized = || {
+                (
+                    StatusCode::UNAUTHORIZED,
+                    Json(ErrorResponse { error: "Unauthorized".to_string() }),
+                )
+                    .into_response()
             };
 
-            // Extract Authorization header
             let auth_header =
                 req.headers().get(header::AUTHORIZATION).and_then(|v| v.to_str().ok());
 
-            match auth_header {
-                Some(value) if value.starts_with("Bearer ") => {
-                    let provided = &value[7..];
-                    if provided == expected {
+            let Some(value) = auth_header.and_then(|v| v.strip_prefix("Bearer ")) else {
+                return unauthorized();
+            };
+
+            if looks_like_jwt(value) {
+                let Some(cfg) = google_auth.as_ref() else {
+                    warn!("Received JWT-shaped credential but Google auth is not configured");
+                    return unauthorized();
+                };
+                match verify_google_id_token(value, cfg).await {
+                    Ok(_claims) => next.run(req).await,
+                    Err(e) => {
+                        warn!(error = %e, "Google ID token verification failed");
+                        unauthorized()
+                    },
+                }
+            } else {
+                // TEMPORARY: dual-accept bridge during ADR-0054 rollout,
+                // remove after cutover — see ADR-0054 migration plan.
+                match legacy_api_token.as_deref() {
+                    Some(expected) if constant_time_eq(expected, value) => {
+                        warn!(
+                            "Authenticated via deprecated legacy bearer token bridge \
+                             (ADR-0054 rollout); migrate this caller to Google OAuth"
+                        );
                         next.run(req).await
-                    } else {
-                        (
-                            StatusCode::UNAUTHORIZED,
-                            Json(ErrorResponse {
-                                error: "Invalid bearer token".to_string(),
-                            }),
-                        )
-                            .into_response()
-                    }
-                },
-                _ => (
-                    StatusCode::UNAUTHORIZED,
-                    Json(ErrorResponse {
-                        error: "Missing or invalid Authorization header".to_string(),
-                    }),
-                )
-                    .into_response(),
+                    },
+                    _ => unauthorized(),
+                }
             }
         }
     });
@@ -3039,7 +3069,8 @@ mod tests {
             pg_pool: None,
             #[cfg(feature = "postgres")]
             tenant_id: None,
-            api_token: None,
+            google_auth: None,
+            legacy_api_token: None,
             funding: FundingConfig::default(),
         })
     }
@@ -3494,11 +3525,287 @@ mod tests {
             pg_pool: None,
             #[cfg(feature = "postgres")]
             tenant_id: None,
-            api_token: None,
+            google_auth: None,
+            legacy_api_token: None,
             funding: FundingConfig::default(),
         });
 
         (create_router(state), event_bus, position_manager, exchange)
+    }
+
+    /// Build a test app with Google ID token verification enabled — mirrors
+    /// `create_test_app_with_event_bus` but wires `google_auth` instead of
+    /// leaving auth disabled. Used by the ADR-0054 auth middleware tests.
+    async fn create_test_app_with_google_auth(google_auth: Option<GoogleAuthConfig>) -> Router {
+        let exchange = Arc::new(StubExchange::new(dec!(95000)));
+        let journal = Arc::new(IntentJournal::new());
+        let store = Arc::new(MemoryStore::new());
+        let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
+        let event_bus = Arc::new(crate::event_bus::EventBus::new(100));
+        let risk_config = RiskConfig::new(dec!(10000)).unwrap();
+        let engine = Engine::new(risk_config);
+        let manager = PositionManager::new(
+            engine,
+            executor,
+            store,
+            Arc::clone(&event_bus),
+            Arc::new(TracingQueryRecorder),
+            TradingPolicy::default(),
+        );
+        let position_manager = Arc::new(RwLock::new(manager));
+        let circuit_breaker = position_manager.read().await.circuit_breaker();
+
+        let state = Arc::new(ApiState {
+            exchange,
+            position_manager,
+            event_bus,
+            circuit_breaker,
+            position_monitor: None,
+            wallet_balance_cache: Mutex::new(None),
+            #[cfg(feature = "postgres")]
+            pg_pool: None,
+            #[cfg(feature = "postgres")]
+            tenant_id: None,
+            google_auth,
+            legacy_api_token: None,
+            funding: FundingConfig::default(),
+        });
+
+        create_router(state)
+    }
+
+    // =========================================================================
+    // ADR-0054: Google OAuth ID token verification — test fixtures.
+    // =========================================================================
+
+    const TEST_GOOGLE_KID: &str = "test-key-1";
+    const TEST_GOOGLE_CLIENT_ID: &str = "test-client-id.apps.googleusercontent.com";
+    const TEST_ALLOWED_EMAIL: &str = "ldamasio@gmail.com";
+
+    /// TEST-ONLY, NON-SECRET RSA keypair used to sign fixture Google ID
+    /// tokens — see `robsond/src/testdata/`.
+    fn test_rsa_private_pem() -> &'static [u8] {
+        include_bytes!("testdata/test_rsa_key.pem")
+    }
+
+    fn test_rsa_public_pem() -> &'static [u8] {
+        include_bytes!("testdata/test_rsa_key_pub.pem")
+    }
+
+    fn test_google_auth_config() -> GoogleAuthConfig {
+        let decoding_key = jsonwebtoken::DecodingKey::from_rsa_pem(test_rsa_public_pem())
+            .expect("valid test RSA public key");
+        let mut keys = std::collections::HashMap::new();
+        keys.insert(TEST_GOOGLE_KID.to_string(), decoding_key);
+
+        GoogleAuthConfig {
+            client_ids: vec![TEST_GOOGLE_CLIENT_ID.to_string()],
+            allowed_email: TEST_ALLOWED_EMAIL.to_string(),
+            jwks: crate::google_jwks::GoogleJwksCache::from_keys_for_test(keys),
+        }
+    }
+
+    #[derive(serde::Serialize)]
+    struct TestGoogleClaims {
+        sub: String,
+        email: String,
+        email_verified: bool,
+        iss: String,
+        aud: String,
+        exp: i64,
+        iat: i64,
+    }
+
+    impl Default for TestGoogleClaims {
+        fn default() -> Self {
+            let now = chrono::Utc::now().timestamp();
+            Self {
+                sub: "1234567890".to_string(),
+                email: TEST_ALLOWED_EMAIL.to_string(),
+                email_verified: true,
+                iss: "https://accounts.google.com".to_string(),
+                aud: TEST_GOOGLE_CLIENT_ID.to_string(),
+                exp: now + 3600,
+                iat: now,
+            }
+        }
+    }
+
+    /// Sign `claims` with the test-only RSA key, producing a JWT shaped
+    /// exactly like a real Google ID token (RS256, `kid` set in the header).
+    fn make_test_google_token(claims: TestGoogleClaims) -> String {
+        let mut header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::RS256);
+        header.kid = Some(TEST_GOOGLE_KID.to_string());
+        let key = jsonwebtoken::EncodingKey::from_rsa_pem(test_rsa_private_pem())
+            .expect("valid test RSA private key");
+        jsonwebtoken::encode(&header, &claims, &key).expect("token encoding cannot fail here")
+    }
+
+    #[tokio::test]
+    async fn google_auth_valid_token_returns_200_on_authenticated_route() {
+        let app = create_test_app_with_google_auth(Some(test_google_auth_config())).await;
+        let token = make_test_google_token(TestGoogleClaims::default());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/panic")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn google_auth_missing_header_returns_401() {
+        let app = create_test_app_with_google_auth(Some(test_google_auth_config())).await;
+
+        let response = app
+            .oneshot(Request::builder().method("POST").uri("/panic").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn google_auth_wrong_audience_returns_401() {
+        let app = create_test_app_with_google_auth(Some(test_google_auth_config())).await;
+        let token = make_test_google_token(TestGoogleClaims {
+            aud: "some-other-client-id.apps.googleusercontent.com".to_string(),
+            ..TestGoogleClaims::default()
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/panic")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn google_auth_wrong_issuer_returns_401() {
+        let app = create_test_app_with_google_auth(Some(test_google_auth_config())).await;
+        let token = make_test_google_token(TestGoogleClaims {
+            iss: "https://evil.example.com".to_string(),
+            ..TestGoogleClaims::default()
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/panic")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn google_auth_expired_token_returns_401() {
+        let app = create_test_app_with_google_auth(Some(test_google_auth_config())).await;
+        let now = chrono::Utc::now().timestamp();
+        // `jsonwebtoken`'s default `Validation` applies a 60s leeway around
+        // `exp`, so back this off well past that to land unambiguously
+        // outside the acceptance window.
+        let token = make_test_google_token(TestGoogleClaims {
+            exp: now - 3600,
+            iat: now - 7200,
+            ..TestGoogleClaims::default()
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/panic")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn google_auth_email_not_verified_returns_401() {
+        let app = create_test_app_with_google_auth(Some(test_google_auth_config())).await;
+        let token = make_test_google_token(TestGoogleClaims {
+            email_verified: false,
+            ..TestGoogleClaims::default()
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/panic")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn google_auth_email_not_allowlisted_returns_401() {
+        let app = create_test_app_with_google_auth(Some(test_google_auth_config())).await;
+        let token = make_test_google_token(TestGoogleClaims {
+            email: "someone-else@gmail.com".to_string(),
+            ..TestGoogleClaims::default()
+        });
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/panic")
+                    .header(header::AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn google_auth_disabled_allows_request_without_header() {
+        // Mirrors the pre-existing dev-mode-no-op coverage: when neither
+        // Google auth nor the legacy bridge is configured, auth is disabled
+        // entirely (non-production environments only).
+        let app = create_test_app_with_google_auth(None).await;
+
+        let response = app
+            .oneshot(Request::builder().method("POST").uri("/panic").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -4515,7 +4822,8 @@ mod tests {
                 pg_pool: None,
                 #[cfg(feature = "postgres")]
                 tenant_id: None,
-                api_token: Some("secret-token-123".to_string()),
+                google_auth: None,
+                legacy_api_token: Some("secret-token-123".to_string()),
                 funding: FundingConfig::default(),
             });
 

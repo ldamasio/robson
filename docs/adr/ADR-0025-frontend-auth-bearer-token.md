@@ -1,5 +1,13 @@
 # ADR-0025: Frontend Auth — Bearer Token via Robsond
 
+> **Amended by ADR-0054** (2026-09-10): the static bearer token described
+> below is replaced by stateless Google OAuth ID token verification.
+> ADR-0054 amends this decision — it does not reopen or reverse the
+> "no callback server, static frontend" constraint below, which is exactly
+> why Google Identity Services (a client-side-only flow) was chosen. The
+> body of this ADR is preserved unchanged as the historical record of the
+> original decision. See `docs/adr/ADR-0054-google-oauth-api-authentication.md`.
+
 **Date:** 2026-04-23 (original decision); 2026-04-25 (formalized as ADR); 2026-06-03 (SSE header amendment)
 **Status:** Accepted
 

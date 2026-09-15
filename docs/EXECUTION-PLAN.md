@@ -8,7 +8,7 @@
 >
 # Robson v2 Execution Plan
 
-**Version**: 2.0.0-alpha
+**Version**: 2.5.0
 **Last Updated**: 2026-01-17
 **Status**: Phase 6 Complete (Detector Runtime)
 

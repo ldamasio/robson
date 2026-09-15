@@ -84,15 +84,20 @@ pub enum IncomeAckApiResponse {
 
 pub struct ApiClient {
     base_url: String,
-    token: Option<String>,
+    /// Google ID token (ADR-0054) — always present. Callers obtain it via
+    /// `crate::auth::current_id_token()`, which transparently refreshes it
+    /// and errors out (telling the operator to run `robson auth login`)
+    /// when there is no usable cached credential, so by the time an
+    /// `ApiClient` exists there is always a token to send.
+    token: String,
     client: reqwest::Client,
 }
 
 impl ApiClient {
-    pub fn new(base_url: &str, token: Option<&str>) -> Self {
+    pub fn new(base_url: &str, token: &str) -> Self {
         Self {
             base_url: base_url.trim_end_matches('/').to_string(),
-            token: token.map(|t| t.to_string()),
+            token: token.to_string(),
             client: reqwest::Client::new(),
         }
     }
@@ -103,9 +108,7 @@ impl ApiClient {
     ) -> Result<ReconcileCloseResponse> {
         let url = format!("{}/reconcile-close", self.base_url);
         let mut req = self.client.post(&url);
-        if let Some(token) = &self.token {
-            req = req.bearer_auth(token);
-        }
+        req = req.bearer_auth(&self.token);
         let resp = req.json(&body).send().await.context("failed to connect to robsond")?;
 
         match resp.status().as_u16() {
@@ -157,9 +160,7 @@ impl ApiClient {
             .extend(["income", exchange_income_id, "ack"]);
 
         let mut req = self.client.post(url);
-        if let Some(token) = &self.token {
-            req = req.bearer_auth(token);
-        }
+        req = req.bearer_auth(&self.token);
         let resp = req.json(&body).send().await.context("failed to connect to robsond")?;
 
         match resp.status().as_u16() {
