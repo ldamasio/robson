@@ -96,6 +96,20 @@ function createAuthStore() {
     token.set(null);
   }
 
+  // Google only allows one `navigator.credentials.get()` (FedCM) call
+  // outstanding at a time — a second concurrent call rejects with
+  // NotAllowedError, and re-calling `initialize()` while one is pending
+  // logs GIS's own "called multiple times" warning. `apiFetch`'s 401
+  // handler, `FetchEventSource`'s 401 handler, and the periodic
+  // near-expiry timer in `(authed)/+layout.svelte` can all independently
+  // decide to refresh around the same time (e.g. several dashboard
+  // requests landing together right after mount) — without sharing one
+  // in-flight attempt, each caller raced its own `initialize()`/`prompt()`
+  // against the others', producing a self-sustaining loop of these
+  // warnings. This holds the one in-flight attempt so every concurrent
+  // caller awaits the same result instead of starting a new one.
+  let inFlightRefresh: Promise<string | null> | null = null;
+
   /** Ask Google Identity Services for a fresh credential in the background
    *  (`google.accounts.id.prompt()`), without forcing a visible click.
    *  Resolves with the new token on success — via the same `setToken` path
@@ -103,11 +117,13 @@ function createAuthStore() {
    *  declines to issue one silently (e.g. third-party cookies blocked,
    *  session revoked, no active Google session). Callers should treat
    *  `null` as "let the normal expired-token/401 handling take over"
-   *  rather than as an error. */
+   *  rather than as an error. Safe to call concurrently from multiple call
+   *  sites — see `inFlightRefresh` above. */
   function silentRefresh(clientId: string): Promise<string | null> {
     if (!browser || !window.google?.accounts?.id) return Promise.resolve(null);
+    if (inFlightRefresh) return inFlightRefresh;
 
-    return new Promise((resolve) => {
+    inFlightRefresh = new Promise<string | null>((resolve) => {
       let settled = false;
       const settle = (value: string | null) => {
         if (settled) return;
@@ -140,7 +156,11 @@ function createAuthStore() {
       // Safety timeout: GIS's moment listener isn't guaranteed to fire in
       // every browser/state combination — never hang the caller forever.
       setTimeout(() => settle(null), 5000);
+    }).finally(() => {
+      inFlightRefresh = null;
     });
+
+    return inFlightRefresh;
   }
 
   return { token, session, init, setToken, clear, silentRefresh };
