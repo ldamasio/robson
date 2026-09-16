@@ -32,6 +32,7 @@ type GoogleAccountsId = {
   initialize: (config: GoogleIdConfig) => void;
   renderButton: (parent: HTMLElement, options: Record<string, unknown>) => void;
   prompt: (momentListener?: (notification: GooglePromptMoment) => void) => void;
+  cancel: () => void;
 };
 
 declare global {
@@ -155,18 +156,23 @@ function createAuthStore() {
 
       // Safety timeout: GIS's moment listener isn't guaranteed to fire in
       // every browser/state combination — never hang the caller forever.
-      // This same timeout also governs how long `inFlightRefresh` (above)
-      // stays held, which is why it's a conservative 60s rather than a
-      // snappier UX-oriented value: Google's own docs say the underlying
-      // FedCM `navigator.credentials.get()` this triggers can take up to
-      // a minute to notify (or never notify at all), so resolving this
-      // promise sooner would release the lock while that browser-level
-      // call might still be outstanding — letting a second concurrent
-      // caller start another `initialize()`/`prompt()` cycle into it and
+      // Waiting it out passively isn't enough, though: Google's own docs
+      // say the underlying FedCM `navigator.credentials.get()` this
+      // triggers can take up to a minute to notify (or never notify at
+      // all), so merely *timing out* on our end doesn't mean that
+      // browser-level call has actually finished — releasing
+      // `inFlightRefresh` at that point could let a second concurrent
+      // caller start another `initialize()`/`prompt()` cycle into it,
       // reproducing the exact NotAllowedError race this lock exists to
-      // prevent. The moment-listener callback above still settles fast in
-      // the common case; this is only the rare-case ceiling.
-      setTimeout(() => settle(null), 60_000);
+      // prevent (confirmed by a Codex review round on an earlier version
+      // of this fix that just extended the timeout instead). So this
+      // explicitly cancels the pending GIS operation first — the
+      // documented way to actually terminate it — before releasing the
+      // lock, rather than assuming it settled on its own.
+      setTimeout(() => {
+        window.google?.accounts?.id?.cancel?.();
+        settle(null);
+      }, 5000);
     }).finally(() => {
       inFlightRefresh = null;
     });
