@@ -32,6 +32,7 @@ type GoogleAccountsId = {
   initialize: (config: GoogleIdConfig) => void;
   renderButton: (parent: HTMLElement, options: Record<string, unknown>) => void;
   prompt: (momentListener?: (notification: GooglePromptMoment) => void) => void;
+  cancel: () => void;
 };
 
 declare global {
@@ -96,6 +97,20 @@ function createAuthStore() {
     token.set(null);
   }
 
+  // Google only allows one `navigator.credentials.get()` (FedCM) call
+  // outstanding at a time — a second concurrent call rejects with
+  // NotAllowedError, and re-calling `initialize()` while one is pending
+  // logs GIS's own "called multiple times" warning. `apiFetch`'s 401
+  // handler, `FetchEventSource`'s 401 handler, and the periodic
+  // near-expiry timer in `(authed)/+layout.svelte` can all independently
+  // decide to refresh around the same time (e.g. several dashboard
+  // requests landing together right after mount) — without sharing one
+  // in-flight attempt, each caller raced its own `initialize()`/`prompt()`
+  // against the others', producing a self-sustaining loop of these
+  // warnings. This holds the one in-flight attempt so every concurrent
+  // caller awaits the same result instead of starting a new one.
+  let inFlightRefresh: Promise<string | null> | null = null;
+
   /** Ask Google Identity Services for a fresh credential in the background
    *  (`google.accounts.id.prompt()`), without forcing a visible click.
    *  Resolves with the new token on success — via the same `setToken` path
@@ -103,15 +118,25 @@ function createAuthStore() {
    *  declines to issue one silently (e.g. third-party cookies blocked,
    *  session revoked, no active Google session). Callers should treat
    *  `null` as "let the normal expired-token/401 handling take over"
-   *  rather than as an error. */
+   *  rather than as an error. Safe to call concurrently from multiple call
+   *  sites — see `inFlightRefresh` above. */
   function silentRefresh(clientId: string): Promise<string | null> {
     if (!browser || !window.google?.accounts?.id) return Promise.resolve(null);
+    if (inFlightRefresh) return inFlightRefresh;
 
-    return new Promise((resolve) => {
+    inFlightRefresh = new Promise<string | null>((resolve) => {
       let settled = false;
+      // Cleared on every settlement path (not just its own timeout firing)
+      // so an early settle via the credential callback or moment listener
+      // doesn't leave this timer armed to `cancel()` a *later*,
+      // independent silentRefresh call after this one's lock has already
+      // been released — Codex review caught this as a real, separate race
+      // from the one the timeout/cancel logic itself was added to fix.
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
       const settle = (value: string | null) => {
         if (settled) return;
         settled = true;
+        clearTimeout(timeoutId);
         resolve(value);
       };
 
@@ -139,8 +164,34 @@ function createAuthStore() {
 
       // Safety timeout: GIS's moment listener isn't guaranteed to fire in
       // every browser/state combination — never hang the caller forever.
-      setTimeout(() => settle(null), 5000);
+      // Waiting it out passively isn't enough, though: Google's own docs
+      // say the underlying FedCM `navigator.credentials.get()` this
+      // triggers can take up to a minute to notify (or never notify at
+      // all), so merely *timing out* on our end doesn't mean that
+      // browser-level call has actually finished — releasing
+      // `inFlightRefresh` at that point could let a second concurrent
+      // caller start another `initialize()`/`prompt()` cycle into it,
+      // reproducing the exact NotAllowedError race this lock exists to
+      // prevent (confirmed by a Codex review round on an earlier version
+      // of this fix that just extended the timeout instead). So this
+      // explicitly cancels the pending GIS operation first — the
+      // documented way to actually terminate it — before releasing the
+      // lock, rather than assuming it settled on its own. `cancel()`'s
+      // failure/no-op behavior isn't documented, so this doesn't assume
+      // it's safe to call unconditionally.
+      timeoutId = setTimeout(() => {
+        try {
+          window.google?.accounts?.id?.cancel?.();
+        } catch {
+          // best-effort — still settle below either way
+        }
+        settle(null);
+      }, 5000);
+    }).finally(() => {
+      inFlightRefresh = null;
     });
+
+    return inFlightRefresh;
   }
 
   return { token, session, init, setToken, clear, silentRefresh };
