@@ -126,9 +126,17 @@ function createAuthStore() {
 
     inFlightRefresh = new Promise<string | null>((resolve) => {
       let settled = false;
+      // Cleared on every settlement path (not just its own timeout firing)
+      // so an early settle via the credential callback or moment listener
+      // doesn't leave this timer armed to `cancel()` a *later*,
+      // independent silentRefresh call after this one's lock has already
+      // been released — Codex review caught this as a real, separate race
+      // from the one the timeout/cancel logic itself was added to fix.
+      let timeoutId: ReturnType<typeof setTimeout> | undefined;
       const settle = (value: string | null) => {
         if (settled) return;
         settled = true;
+        clearTimeout(timeoutId);
         resolve(value);
       };
 
@@ -168,9 +176,15 @@ function createAuthStore() {
       // of this fix that just extended the timeout instead). So this
       // explicitly cancels the pending GIS operation first — the
       // documented way to actually terminate it — before releasing the
-      // lock, rather than assuming it settled on its own.
-      setTimeout(() => {
-        window.google?.accounts?.id?.cancel?.();
+      // lock, rather than assuming it settled on its own. `cancel()`'s
+      // failure/no-op behavior isn't documented, so this doesn't assume
+      // it's safe to call unconditionally.
+      timeoutId = setTimeout(() => {
+        try {
+          window.google?.accounts?.id?.cancel?.();
+        } catch {
+          // best-effort — still settle below either way
+        }
         settle(null);
       }, 5000);
     }).finally(() => {
