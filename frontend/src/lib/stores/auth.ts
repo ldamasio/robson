@@ -155,7 +155,18 @@ function createAuthStore() {
 
       // Safety timeout: GIS's moment listener isn't guaranteed to fire in
       // every browser/state combination — never hang the caller forever.
-      setTimeout(() => settle(null), 5000);
+      // This same timeout also governs how long `inFlightRefresh` (above)
+      // stays held, which is why it's a conservative 60s rather than a
+      // snappier UX-oriented value: Google's own docs say the underlying
+      // FedCM `navigator.credentials.get()` this triggers can take up to
+      // a minute to notify (or never notify at all), so resolving this
+      // promise sooner would release the lock while that browser-level
+      // call might still be outstanding — letting a second concurrent
+      // caller start another `initialize()`/`prompt()` cycle into it and
+      // reproducing the exact NotAllowedError race this lock exists to
+      // prevent. The moment-listener callback above still settles fast in
+      // the common case; this is only the rare-case ceiling.
+      setTimeout(() => settle(null), 60_000);
     }).finally(() => {
       inFlightRefresh = null;
     });
