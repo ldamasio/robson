@@ -1,5 +1,4 @@
 <script lang="ts">
-  import { onDestroy } from 'svelte';
   import { goto } from '$app/navigation';
   import { browser } from '$app/environment';
   // ADR-0054: dynamic, not static, public env — see robson.ts for why.
@@ -56,8 +55,23 @@
     return () => clearInterval(refreshTimer);
   });
 
-  onDestroy(() => {
-    unsubscribeAuth();
+  // `$effect` cleanup, not `onDestroy` — this project's adapter-static
+  // build (`ssr = false` + `prerender = true`, see src/routes/+layout.ts)
+  // resolves `import { onDestroy } from 'svelte'` to the package's
+  // *server* conditional export in the shipped browser bundle instead of
+  // the client one. Server-side `onDestroy` isn't a no-op like server-side
+  // `onMount` is: it dereferences a server-only render context that's
+  // `null` in the browser, throwing `Cannot read properties of null
+  // (reading 'r')` the instant this component mounts — confirmed via a
+  // full unminified stack trace (`onDestroy` at `svelte/src/index-server.js`),
+  // not just a hunch. An `$effect` that only returns a cleanup function is
+  // the exact same semantics (runs once on mount, cleanup on unmount) and
+  // compiles through Svelte's rune machinery instead of this package
+  // import, so it isn't subject to the same resolution bug.
+  $effect(() => {
+    return () => {
+      unsubscribeAuth();
+    };
   });
 
   $effect(() => {
