@@ -11,6 +11,7 @@
 // requested, and the G logo keeps Google's mandated treatment.
 const GIS_DARK_CLASSES = ["MFS4be-JaPV2b-Ia7Qfc", "MFS4be-Ia7Qfc"];
 const GIS_LIGHT_CLASSES = ["i5vt6e-Ia7Qfc", "i5vt6e-to915-Ia7Qfc"];
+const XHTML_NAMESPACE = "http://www.w3.org/1999/xhtml";
 
 // GIS's markup is undocumented and its class names are obfuscated, so we never
 // assume the classes above still mean anything. We apply them and then ask the
@@ -70,16 +71,21 @@ export function enforceDarkTheme(container: HTMLElement): void {
 export function watchGisTheme(container: HTMLElement): () => void {
   const doc = container.ownerDocument;
   const apply = () => enforceDarkTheme(container);
-  // Element -> "stop listening to it", so a link is only ever tracked once and
-  // can be dropped again when it settles or leaves the document.
+  // Element -> "stop listening to it", so a link is only ever tracked once
+  // while it is in the document, and is dropped when it leaves.
   const trackedLinks = new Map<Element, () => void>();
 
   // Deliberately not `instanceof HTMLLinkElement`: that is per realm, so a link
   // belonging to another document would not match. Tag and rel are checked the
-  // way HTML defines them - rel keywords are ASCII case-insensitive.
+  // way HTML defines them - rel keywords are ASCII case-insensitive, and an
+  // SVG-namespace <link> is not a stylesheet link.
   function isStylesheetLink(node: Node): node is Element {
     const element = node as Element;
-    if (element.nodeType !== 1 || element.tagName?.toLowerCase() !== "link") {
+    if (element.nodeType !== 1) return false;
+    if (
+      element.localName !== "link" ||
+      element.namespaceURI !== XHTML_NAMESPACE
+    ) {
       return false;
     }
     const rel = element.getAttribute("rel") ?? "";
@@ -96,20 +102,19 @@ export function watchGisTheme(container: HTMLElement): () => void {
   // A <link rel="stylesheet"> is in the DOM well before its CSS has loaded, so
   // its insertion alone is not a readiness signal: we have to wait for its load
   // event too, or an attempt that ran in between would be the last one.
+  //
+  // We keep listening for as long as the link is in the document rather than
+  // releasing after the first event: a link that fails can be retried by
+  // pointing its href somewhere else, and that fetch reports on the same
+  // element. Removal is what bounds the map.
   function trackStylesheetLink(node: Node) {
     if (!isStylesheetLink(node) || trackedLinks.has(node)) return;
     const link = node;
-    // A link only settles once, so drop it afterwards rather than holding on to
-    // every stylesheet the page ever inserted.
-    const onSettled = () => {
-      untrackLink(link);
-      apply();
-    };
-    link.addEventListener("load", onSettled);
-    link.addEventListener("error", onSettled);
+    link.addEventListener("load", apply);
+    link.addEventListener("error", apply);
     trackedLinks.set(link, () => {
-      link.removeEventListener("load", onSettled);
-      link.removeEventListener("error", onSettled);
+      link.removeEventListener("load", apply);
+      link.removeEventListener("error", apply);
     });
   }
 
@@ -118,13 +123,25 @@ export function watchGisTheme(container: HTMLElement): () => void {
 
   const stylesheetObserver = new MutationObserver((records) => {
     for (const record of records) {
+      // `rel` can turn a link we ignored into one we care about (preload
+      // promoted to stylesheet), and `href` can point it at a new fetch.
+      if (record.type === "attributes") {
+        if (isStylesheetLink(record.target)) trackStylesheetLink(record.target);
+        else untrackLink(record.target);
+        continue;
+      }
       for (const node of Array.from(record.addedNodes))
         trackStylesheetLink(node);
       for (const node of Array.from(record.removedNodes)) untrackLink(node);
     }
     apply();
   });
-  stylesheetObserver.observe(doc.head, { childList: true });
+  stylesheetObserver.observe(doc.head, {
+    childList: true,
+    subtree: true,
+    attributes: true,
+    attributeFilter: ["rel", "href"],
+  });
 
   // Links already in <head> may still be in flight when we start watching.
   for (const link of Array.from(doc.head.children)) trackStylesheetLink(link);

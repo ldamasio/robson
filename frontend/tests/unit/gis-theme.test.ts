@@ -207,30 +207,79 @@ describe("watchGisTheme", () => {
     frame.remove();
   });
 
-  it("tracks each link once and drops it once it settles", async () => {
+  it("still retries after a failed stylesheet is pointed at a new href", async () => {
     const container = mount(personalizedButton());
     const unwatch = watchGisTheme(container);
     const link = document.createElement("link");
     link.rel = "stylesheet";
-
-    // Churn: the same link inserted, removed and reinserted.
-    document.head.appendChild(link);
-    link.remove();
+    link.href = "https://accounts.google.com/gsi/style";
     document.head.appendChild(link);
     await flush();
 
-    installGisStylesheet();
-    link.dispatchEvent(new Event("load"));
-    expect(button(container).classList.contains(DARK)).toBe(true);
-
-    // Settled links are released, so a later event from one is a no-op.
-    button(container).setAttribute(
-      "class",
-      `nsm7Bb-HzV7m-LgbsSe jVeSEe ${LIGHT}`,
-    );
-    link.dispatchEvent(new Event("load"));
+    // The fetch fails; the button correctly stays as GIS rendered it.
+    link.dispatchEvent(new Event("error"));
     expect(button(container).classList.contains(DARK)).toBe(false);
 
+    // The same element is retried against another href and this time loads.
+    link.href = "https://accounts.google.com/gsi/style?retry";
+    await flush();
+    installGisStylesheet();
+    link.dispatchEvent(new Event("load"));
+
+    expect(button(container).classList.contains(DARK)).toBe(true);
+    unwatch();
+  });
+
+  it("picks up a preload link once it is promoted to a stylesheet", async () => {
+    const container = mount(personalizedButton());
+    const unwatch = watchGisTheme(container);
+    const link = document.createElement("link");
+    link.rel = "preload";
+    document.head.appendChild(link);
+    await flush();
+
+    link.rel = "stylesheet";
+    await flush();
+    installGisStylesheet();
+    link.dispatchEvent(new Event("load"));
+
+    expect(button(container).classList.contains(DARK)).toBe(true);
+    unwatch();
+  });
+
+  it("registers one listener pair per link and releases them when it leaves <head>", async () => {
+    const container = mount(personalizedButton());
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    const added: string[] = [];
+    const removed: string[] = [];
+    const realAdd = link.addEventListener.bind(link);
+    const realRemove = link.removeEventListener.bind(link);
+    link.addEventListener = (type: string, ...rest: unknown[]) => {
+      added.push(type);
+      return (realAdd as never as (...a: unknown[]) => void)(type, ...rest);
+    };
+    link.removeEventListener = (type: string, ...rest: unknown[]) => {
+      removed.push(type);
+      return (realRemove as never as (...a: unknown[]) => void)(type, ...rest);
+    };
+
+    const unwatch = watchGisTheme(container);
+    document.head.appendChild(link);
+    await flush();
+    // Unrelated churn in <head> must not re-register anything.
+    document.head.appendChild(document.createElement("style"));
+    link.setAttribute("href", "/a.css");
+    await flush();
+
+    expect(added).toEqual(["load", "error"]);
+    expect(removed).toEqual([]);
+
+    // Removal - and only removal - releases it.
+    link.remove();
+    await flush();
+
+    expect(removed).toEqual(["load", "error"]);
     unwatch();
   });
 
