@@ -69,7 +69,9 @@ If this file and `AGENTS.md` ever diverge, `AGENTS.md` is the source of truth.
   prices in execution costs. See ADR-0039 and ADR-0040.
 - **RBX engineering guardrails are mandatory** — before planning architecture,
   implementing, or reviewing code, apply the checklist in
-  `.agents/rbx-engineering-guardrails.md`. CI enforces it via `guardrails.yml`.
+  `rbx-engineering-guardrails.md` at the root of the `rbxrobotica/rbx-agent-layer`
+  repository. It is not vendored here; see `AGENTS.md` rule 14 for how to read it.
+  CI enforces it via `guardrails.yml`.
 
 ## Commit Policy
 
