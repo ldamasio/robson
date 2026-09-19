@@ -38,6 +38,27 @@
     }
   }
 
+  // Google Identity Services honours `theme` on its standard button, but
+  // not on the "personalized" variant it swaps in when a Google session
+  // already exists ("Entrar como <nome>"): that one comes back carrying
+  // the default light classes instead of the filled_black ones we asked
+  // for, so it rendered as a white pill on our dark card. Re-apply
+  // Google's own dark classes instead of hand-rolling colours, so the
+  // hover/active states and the dimmer second line (the e-mail) all come
+  // from the theme we requested. If Google ever renames these, the button
+  // simply falls back to its light styling - nothing breaks.
+  const GIS_DARK_CLASSES = ['MFS4be-JaPV2b-Ia7Qfc', 'MFS4be-Ia7Qfc'];
+  const GIS_LIGHT_CLASSES = ['i5vt6e-Ia7Qfc', 'i5vt6e-to915-Ia7Qfc'];
+
+  function enforceDarkTheme(container: HTMLElement) {
+    const button = container.querySelector<HTMLElement>(
+      '[role="button"][aria-labelledby="button-label"]',
+    );
+    if (!button || button.classList.contains(GIS_DARK_CLASSES[0])) return;
+    button.classList.remove(...GIS_LIGHT_CLASSES);
+    button.classList.add(...GIS_DARK_CLASSES);
+  }
+
   // NOTE: `$effect`, not `onMount`. In this component (and reproduced in
   // an isolated, from-scratch test route too), Rollup's tree-shaking
   // silently removed the equivalent `onMount(...)` callback from the
@@ -52,6 +73,8 @@
   $effect(() => {
     if (!browser) return;
 
+    let observer: MutationObserver | undefined;
+
     // Loaded client-side only ($effect bodies never run during
     // SSR/prerender), so this never touches the static build.
     const script = document.createElement('script');
@@ -59,18 +82,25 @@
     script.async = true;
     script.defer = true;
     script.onload = () => {
-      if (!window.google?.accounts?.id || !buttonContainer) return;
+      const container = buttonContainer;
+      if (!window.google?.accounts?.id || !container) return;
       window.google.accounts.id.initialize({
         client_id: env.PUBLIC_GOOGLE_WEB_CLIENT_ID ?? '',
         callback: handleCredentialResponse,
       });
-      window.google.accounts.id.renderButton(buttonContainer, {
+      // GIS re-renders the button on its own (e.g. once it resolves the
+      // signed-in account), so watch the container rather than patching
+      // a single render.
+      observer = new MutationObserver(() => enforceDarkTheme(container));
+      observer.observe(container, { childList: true, subtree: true });
+      window.google.accounts.id.renderButton(container, {
         type: 'standard',
         theme: 'filled_black',
         size: 'large',
         text: 'signin_with',
         shape: 'rectangular',
       });
+      enforceDarkTheme(container);
     };
     script.onerror = () => {
       error = $_('login.connectionFailed');
@@ -78,6 +108,7 @@
     document.head.appendChild(script);
 
     return () => {
+      observer?.disconnect();
       script.remove();
     };
   });
