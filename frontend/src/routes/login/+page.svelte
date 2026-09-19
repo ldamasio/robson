@@ -8,6 +8,7 @@
   import { setToken } from '$stores/auth';
   import { robsonApi } from '$api/robson';
   import { _ } from 'svelte-i18n';
+  import { enforceDarkTheme } from '$lib/utils/gis-theme';
 
   let error = $state('');
   let loading = $state(false);
@@ -36,27 +37,6 @@
     } finally {
       loading = false;
     }
-  }
-
-  // Google Identity Services honours `theme` on its standard button, but
-  // not on the "personalized" variant it swaps in when a Google session
-  // already exists ("Entrar como <nome>"): that one comes back carrying
-  // the default light classes instead of the filled_black ones we asked
-  // for, so it rendered as a white pill on our dark card. Re-apply
-  // Google's own dark classes instead of hand-rolling colours, so the
-  // hover/active states and the dimmer second line (the e-mail) all come
-  // from the theme we requested. If Google ever renames these, the button
-  // simply falls back to its light styling - nothing breaks.
-  const GIS_DARK_CLASSES = ['MFS4be-JaPV2b-Ia7Qfc', 'MFS4be-Ia7Qfc'];
-  const GIS_LIGHT_CLASSES = ['i5vt6e-Ia7Qfc', 'i5vt6e-to915-Ia7Qfc'];
-
-  function enforceDarkTheme(container: HTMLElement) {
-    const button = container.querySelector<HTMLElement>(
-      '[role="button"][aria-labelledby="button-label"]',
-    );
-    if (!button || button.classList.contains(GIS_DARK_CLASSES[0])) return;
-    button.classList.remove(...GIS_LIGHT_CLASSES);
-    button.classList.add(...GIS_DARK_CLASSES);
   }
 
   // NOTE: `$effect`, not `onMount`. In this component (and reproduced in
