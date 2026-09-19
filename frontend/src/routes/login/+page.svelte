@@ -8,7 +8,6 @@
   import { setToken } from '$stores/auth';
   import { robsonApi } from '$api/robson';
   import { _ } from 'svelte-i18n';
-  import { watchGisTheme } from '$lib/utils/gis-theme';
 
   let error = $state('');
   let loading = $state(false);
@@ -53,14 +52,6 @@
   $effect(() => {
     if (!browser) return;
 
-    // The script can finish loading after this effect is torn down (a fast
-    // navigation away from /login), and removing an already-fetching script
-    // does not reliably cancel its load event. Without this flag we would
-    // initialize GIS and start observers on a detached container, with no
-    // cleanup left to stop them.
-    let disposed = false;
-    let unwatch: (() => void) | undefined;
-
     // Loaded client-side only ($effect bodies never run during
     // SSR/prerender), so this never touches the static build.
     const script = document.createElement('script');
@@ -68,16 +59,12 @@
     script.async = true;
     script.defer = true;
     script.onload = () => {
-      const container = buttonContainer;
-      if (disposed || !window.google?.accounts?.id || !container) return;
+      if (!window.google?.accounts?.id || !buttonContainer) return;
       window.google.accounts.id.initialize({
         client_id: env.PUBLIC_GOOGLE_WEB_CLIENT_ID ?? '',
         callback: handleCredentialResponse,
       });
-      // Keeps the requested filled_black theme on whichever button variant
-      // GIS renders, now and on its later re-renders. See gis-theme.ts.
-      unwatch = watchGisTheme(container);
-      window.google.accounts.id.renderButton(container, {
+      window.google.accounts.id.renderButton(buttonContainer, {
         type: 'standard',
         theme: 'filled_black',
         size: 'large',
@@ -91,10 +78,6 @@
     document.head.appendChild(script);
 
     return () => {
-      disposed = true;
-      script.onload = null;
-      script.onerror = null;
-      unwatch?.();
       script.remove();
     };
   });
