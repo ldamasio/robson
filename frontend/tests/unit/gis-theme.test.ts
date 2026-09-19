@@ -135,6 +135,43 @@ describe("watchGisTheme", () => {
     unwatch();
   });
 
+  it("retries when a stylesheet <link> finishes loading, not merely when it is inserted", async () => {
+    const container = mount(personalizedButton());
+    const unwatch = watchGisTheme(container);
+    await flush();
+
+    // Inserted, but its CSS is not available yet - the attempt it triggers
+    // must fail and leave the button as GIS rendered it.
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    link.href = "https://accounts.google.com/gsi/style";
+    document.head.appendChild(link);
+    await flush();
+    expect(button(container).classList.contains(DARK)).toBe(false);
+
+    // Now the CSS is live and the link reports it.
+    installGisStylesheet();
+    link.dispatchEvent(new Event("load"));
+
+    expect(button(container).classList.contains(DARK)).toBe(true);
+    unwatch();
+  });
+
+  it("stops listening to stylesheet links once disposed", async () => {
+    const container = mount(personalizedButton());
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+    document.head.appendChild(link);
+    const unwatch = watchGisTheme(container);
+    await flush();
+
+    unwatch();
+    installGisStylesheet();
+    link.dispatchEvent(new Event("load"));
+
+    expect(button(container).classList.contains(DARK)).toBe(false);
+  });
+
   it("stops enforcing once disposed", async () => {
     installGisStylesheet();
     const container = mount("");

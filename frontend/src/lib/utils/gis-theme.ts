@@ -62,25 +62,49 @@ export function enforceDarkTheme(container: HTMLElement): void {
  *
  * Two things can happen after we first enforce the theme, in either order, so
  * we watch for both: GIS re-renders the button (it does that once it resolves
- * the signed-in account and swaps in the personalized variant), and GIS injects
- * the stylesheet those theme classes depend on. Watching only the container
- * would leave the button light forever whenever the stylesheet arrives after
- * the last render.
+ * the signed-in account and swaps in the personalized variant), and the
+ * stylesheet those theme classes depend on becomes available. Watching only the
+ * container would leave the button light forever whenever the stylesheet lands
+ * after the last render.
  */
 export function watchGisTheme(container: HTMLElement): () => void {
   const doc = container.ownerDocument;
   const apply = () => enforceDarkTheme(container);
+  const linkListeners: Array<() => void> = [];
+
+  // A <link rel="stylesheet"> is in the DOM well before its CSS has loaded, so
+  // its insertion alone is not a readiness signal: we have to wait for its load
+  // event too, or an attempt that ran in between would be the last one.
+  function trackStylesheetLink(node: Node) {
+    if (!(node instanceof HTMLLinkElement)) return;
+    if (!node.rel.split(/\s+/).includes("stylesheet")) return;
+    node.addEventListener("load", apply);
+    linkListeners.push(() => node.removeEventListener("load", apply));
+  }
 
   const buttonObserver = new MutationObserver(apply);
   buttonObserver.observe(container, { childList: true, subtree: true });
 
-  const stylesheetObserver = new MutationObserver(apply);
+  const stylesheetObserver = new MutationObserver((records) => {
+    for (const record of records) {
+      for (const node of Array.from(record.addedNodes))
+        trackStylesheetLink(node);
+    }
+    apply();
+  });
   stylesheetObserver.observe(doc.head, { childList: true });
+
+  // Links already in <head> may still be in flight when we start watching.
+  for (const link of Array.from(doc.head.querySelectorAll("link"))) {
+    trackStylesheetLink(link);
+  }
 
   apply();
 
   return () => {
     buttonObserver.disconnect();
     stylesheetObserver.disconnect();
+    for (const remove of linkListeners) remove();
+    linkListeners.length = 0;
   };
 }
