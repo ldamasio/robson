@@ -70,16 +70,47 @@ export function enforceDarkTheme(container: HTMLElement): void {
 export function watchGisTheme(container: HTMLElement): () => void {
   const doc = container.ownerDocument;
   const apply = () => enforceDarkTheme(container);
-  const linkListeners: Array<() => void> = [];
+  // Element -> "stop listening to it", so a link is only ever tracked once and
+  // can be dropped again when it settles or leaves the document.
+  const trackedLinks = new Map<Element, () => void>();
+
+  // Deliberately not `instanceof HTMLLinkElement`: that is per realm, so a link
+  // belonging to another document would not match. Tag and rel are checked the
+  // way HTML defines them - rel keywords are ASCII case-insensitive.
+  function isStylesheetLink(node: Node): node is Element {
+    const element = node as Element;
+    if (element.nodeType !== 1 || element.tagName?.toLowerCase() !== "link") {
+      return false;
+    }
+    const rel = element.getAttribute("rel") ?? "";
+    return rel.toLowerCase().split(/\s+/).includes("stylesheet");
+  }
+
+  function untrackLink(node: Node) {
+    const stopListening = trackedLinks.get(node as Element);
+    if (!stopListening) return;
+    stopListening();
+    trackedLinks.delete(node as Element);
+  }
 
   // A <link rel="stylesheet"> is in the DOM well before its CSS has loaded, so
   // its insertion alone is not a readiness signal: we have to wait for its load
   // event too, or an attempt that ran in between would be the last one.
   function trackStylesheetLink(node: Node) {
-    if (!(node instanceof HTMLLinkElement)) return;
-    if (!node.rel.split(/\s+/).includes("stylesheet")) return;
-    node.addEventListener("load", apply);
-    linkListeners.push(() => node.removeEventListener("load", apply));
+    if (!isStylesheetLink(node) || trackedLinks.has(node)) return;
+    const link = node;
+    // A link only settles once, so drop it afterwards rather than holding on to
+    // every stylesheet the page ever inserted.
+    const onSettled = () => {
+      untrackLink(link);
+      apply();
+    };
+    link.addEventListener("load", onSettled);
+    link.addEventListener("error", onSettled);
+    trackedLinks.set(link, () => {
+      link.removeEventListener("load", onSettled);
+      link.removeEventListener("error", onSettled);
+    });
   }
 
   const buttonObserver = new MutationObserver(apply);
@@ -89,22 +120,21 @@ export function watchGisTheme(container: HTMLElement): () => void {
     for (const record of records) {
       for (const node of Array.from(record.addedNodes))
         trackStylesheetLink(node);
+      for (const node of Array.from(record.removedNodes)) untrackLink(node);
     }
     apply();
   });
   stylesheetObserver.observe(doc.head, { childList: true });
 
   // Links already in <head> may still be in flight when we start watching.
-  for (const link of Array.from(doc.head.querySelectorAll("link"))) {
-    trackStylesheetLink(link);
-  }
+  for (const link of Array.from(doc.head.children)) trackStylesheetLink(link);
 
   apply();
 
   return () => {
     buttonObserver.disconnect();
     stylesheetObserver.disconnect();
-    for (const remove of linkListeners) remove();
-    linkListeners.length = 0;
+    for (const stopListening of trackedLinks.values()) stopListening();
+    trackedLinks.clear();
   };
 }

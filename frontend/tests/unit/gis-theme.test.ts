@@ -157,6 +157,83 @@ describe("watchGisTheme", () => {
     unwatch();
   });
 
+  it("matches rel case-insensitively, as HTML defines it", async () => {
+    const container = mount(personalizedButton());
+    const unwatch = watchGisTheme(container);
+    await flush();
+
+    const link = document.createElement("link");
+    link.setAttribute("rel", "StyleSheet");
+    document.head.appendChild(link);
+    await flush();
+
+    installGisStylesheet();
+    link.dispatchEvent(new Event("load"));
+
+    expect(button(container).classList.contains(DARK)).toBe(true);
+    unwatch();
+  });
+
+  it("tracks links from another realm, where instanceof HTMLLinkElement fails", async () => {
+    // An iframe has its own constructors, so `instanceof HTMLLinkElement`
+    // against the outer realm is false for its elements. That is the case a
+    // regression back to instanceof would break.
+    const frame = document.createElement("iframe");
+    document.body.appendChild(frame);
+    const inner = frame.contentDocument!;
+    expect(inner.createElement("link") instanceof HTMLLinkElement).toBe(false);
+
+    const container = inner.createElement("div");
+    container.innerHTML = personalizedButton();
+    inner.body.appendChild(container);
+
+    const unwatch = watchGisTheme(container);
+    await flush();
+    expect(button(container).classList.contains(DARK)).toBe(false);
+
+    const link = inner.createElement("link");
+    link.rel = "stylesheet";
+    inner.head.appendChild(link);
+    await flush();
+    expect(button(container).classList.contains(DARK)).toBe(false);
+
+    const style = inner.createElement("style");
+    style.textContent = `.${DARK}{background-color:#202124}`;
+    inner.head.appendChild(style);
+    link.dispatchEvent(new Event("load"));
+
+    expect(button(container).classList.contains(DARK)).toBe(true);
+    unwatch();
+    frame.remove();
+  });
+
+  it("tracks each link once and drops it once it settles", async () => {
+    const container = mount(personalizedButton());
+    const unwatch = watchGisTheme(container);
+    const link = document.createElement("link");
+    link.rel = "stylesheet";
+
+    // Churn: the same link inserted, removed and reinserted.
+    document.head.appendChild(link);
+    link.remove();
+    document.head.appendChild(link);
+    await flush();
+
+    installGisStylesheet();
+    link.dispatchEvent(new Event("load"));
+    expect(button(container).classList.contains(DARK)).toBe(true);
+
+    // Settled links are released, so a later event from one is a no-op.
+    button(container).setAttribute(
+      "class",
+      `nsm7Bb-HzV7m-LgbsSe jVeSEe ${LIGHT}`,
+    );
+    link.dispatchEvent(new Event("load"));
+    expect(button(container).classList.contains(DARK)).toBe(false);
+
+    unwatch();
+  });
+
   it("stops listening to stylesheet links once disposed", async () => {
     const container = mount(personalizedButton());
     const link = document.createElement("link");
