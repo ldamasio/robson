@@ -9,45 +9,78 @@
 // colours, so the hover/active states and the dimmer second line (the e-mail,
 // otherwise #5f6368 on a dark surface) all stay consistent with the theme we
 // requested, and the G logo keeps Google's mandated treatment.
-//
-// These are obfuscated, undocumented class names, so treat them as a best
-// effort: see `enforceDarkTheme` for how we avoid making things worse if
-// Google renames them.
 const GIS_DARK_CLASSES = ["MFS4be-JaPV2b-Ia7Qfc", "MFS4be-Ia7Qfc"];
 const GIS_LIGHT_CLASSES = ["i5vt6e-Ia7Qfc", "i5vt6e-to915-Ia7Qfc"];
 
-// GIS ships its stylesheet inside the same injected <style> block, so if the
-// dark classes we are about to add are not styled by anything on the page,
-// Google has renamed them. Stripping the light classes then would leave an
-// unstyled button - worse than the white pill we set out to fix - so in that
-// case we leave the GIS rendering exactly as it is.
-function darkClassesAreStyled(doc: Document): boolean {
-  for (const sheet of Array.from(doc.styleSheets)) {
-    let rules: CSSRuleList;
-    try {
-      rules = sheet.cssRules;
-    } catch {
-      continue; // cross-origin stylesheet, not ours to inspect
-    }
-    for (const rule of Array.from(rules)) {
-      if (rule.cssText?.includes(GIS_DARK_CLASSES[0])) return true;
-    }
-  }
-  return false;
+// GIS's markup is undocumented and its class names are obfuscated, so we never
+// assume the classes above still mean anything. We apply them and then ask the
+// browser what it actually painted: if the button did not become a dark
+// surface, the classes no longer carry filled_black and we put the button back
+// exactly as GIS rendered it. Stripping the light classes without that check
+// is how a Google rename would turn the white pill into an unstyled button.
+//
+// Deliberately a "is it dark" test rather than an exact hex, so Google can
+// tweak the shade of filled_black without disabling the fix.
+function isDarkSurface(color: string): boolean {
+  const match = /^rgba?\(([^)]+)\)$/.exec(color.trim());
+  if (!match) return false;
+  const parts = match[1].split(",").map((p) => Number.parseFloat(p));
+  const [r, g, b, a = 1] = parts;
+  if (![r, g, b].every(Number.isFinite) || a < 0.9) return false;
+  // Rec. 601 luma; filled_black's #202124 lands at ~33.
+  return 0.299 * r + 0.587 * g + 0.114 * b < 96;
 }
 
 /**
  * Force GIS's dark (filled_black) theme onto whichever button variant it
- * rendered inside `container`. Safe to call repeatedly: it is a no-op once the
- * button already carries the dark classes, which is the normal case for the
- * standard (non-personalized) button.
+ * rendered inside `container`.
+ *
+ * Safe to call repeatedly: it is a no-op once the button already carries the
+ * dark classes, which is the normal case for the standard button. If applying
+ * them does not actually produce a dark surface - Google renamed something, or
+ * the GIS stylesheet has not landed yet - the button is restored untouched, so
+ * a later call can try again.
  */
 export function enforceDarkTheme(container: HTMLElement): void {
   const button = container.querySelector<HTMLElement>(
     '[role="button"][aria-labelledby="button-label"]',
   );
   if (!button || button.classList.contains(GIS_DARK_CLASSES[0])) return;
-  if (!darkClassesAreStyled(container.ownerDocument)) return;
+
+  const original = button.getAttribute("class") ?? "";
   button.classList.remove(...GIS_LIGHT_CLASSES);
   button.classList.add(...GIS_DARK_CLASSES);
+
+  const view = container.ownerDocument.defaultView;
+  const painted = view?.getComputedStyle(button).backgroundColor ?? "";
+  if (!isDarkSurface(painted)) button.setAttribute("class", original);
+}
+
+/**
+ * Keep the GIS button dark for as long as it is on screen, and return a
+ * disposer.
+ *
+ * Two things can happen after we first enforce the theme, in either order, so
+ * we watch for both: GIS re-renders the button (it does that once it resolves
+ * the signed-in account and swaps in the personalized variant), and GIS injects
+ * the stylesheet those theme classes depend on. Watching only the container
+ * would leave the button light forever whenever the stylesheet arrives after
+ * the last render.
+ */
+export function watchGisTheme(container: HTMLElement): () => void {
+  const doc = container.ownerDocument;
+  const apply = () => enforceDarkTheme(container);
+
+  const buttonObserver = new MutationObserver(apply);
+  buttonObserver.observe(container, { childList: true, subtree: true });
+
+  const stylesheetObserver = new MutationObserver(apply);
+  stylesheetObserver.observe(doc.head, { childList: true });
+
+  apply();
+
+  return () => {
+    buttonObserver.disconnect();
+    stylesheetObserver.disconnect();
+  };
 }

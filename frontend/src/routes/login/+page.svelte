@@ -8,7 +8,7 @@
   import { setToken } from '$stores/auth';
   import { robsonApi } from '$api/robson';
   import { _ } from 'svelte-i18n';
-  import { enforceDarkTheme } from '$lib/utils/gis-theme';
+  import { watchGisTheme } from '$lib/utils/gis-theme';
 
   let error = $state('');
   let loading = $state(false);
@@ -53,7 +53,13 @@
   $effect(() => {
     if (!browser) return;
 
-    let observer: MutationObserver | undefined;
+    // The script can finish loading after this effect is torn down (a fast
+    // navigation away from /login), and removing an already-fetching script
+    // does not reliably cancel its load event. Without this flag we would
+    // initialize GIS and start observers on a detached container, with no
+    // cleanup left to stop them.
+    let disposed = false;
+    let unwatch: (() => void) | undefined;
 
     // Loaded client-side only ($effect bodies never run during
     // SSR/prerender), so this never touches the static build.
@@ -63,16 +69,14 @@
     script.defer = true;
     script.onload = () => {
       const container = buttonContainer;
-      if (!window.google?.accounts?.id || !container) return;
+      if (disposed || !window.google?.accounts?.id || !container) return;
       window.google.accounts.id.initialize({
         client_id: env.PUBLIC_GOOGLE_WEB_CLIENT_ID ?? '',
         callback: handleCredentialResponse,
       });
-      // GIS re-renders the button on its own (e.g. once it resolves the
-      // signed-in account), so watch the container rather than patching
-      // a single render.
-      observer = new MutationObserver(() => enforceDarkTheme(container));
-      observer.observe(container, { childList: true, subtree: true });
+      // Keeps the requested filled_black theme on whichever button variant
+      // GIS renders, now and on its later re-renders. See gis-theme.ts.
+      unwatch = watchGisTheme(container);
       window.google.accounts.id.renderButton(container, {
         type: 'standard',
         theme: 'filled_black',
@@ -80,7 +84,6 @@
         text: 'signin_with',
         shape: 'rectangular',
       });
-      enforceDarkTheme(container);
     };
     script.onerror = () => {
       error = $_('login.connectionFailed');
@@ -88,7 +91,10 @@
     document.head.appendChild(script);
 
     return () => {
-      observer?.disconnect();
+      disposed = true;
+      script.onload = null;
+      script.onerror = null;
+      unwatch?.();
       script.remove();
     };
   });
