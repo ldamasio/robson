@@ -1258,23 +1258,25 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_failed_scan_increments_error_metric() {
+    async fn test_failed_scan_increments_error_and_preserves_last_completed_metric() {
         let exchange = Arc::new(StubExchange::new(dec!(100)));
         let store = Arc::new(MemoryStore::new());
         let event_bus = Arc::new(EventBus::new(16));
         let (worker, metrics) =
             create_worker_with_metrics(exchange.clone(), store, event_bus, Duration::from_secs(0));
 
-        assert_eq!(metrics.last_completed_timestamp_seconds(), 0.0);
+        // Seed the state left by an earlier completed scan. A failing scan
+        // must preserve this heartbeat rather than advancing or clearing it.
+        metrics.scan_completed(1);
         exchange.set_fail_next(true);
 
         assert!(worker.scan_and_reconcile().await.is_err());
 
-        assert_eq!(metrics.completed_count(), 0.0);
+        assert_eq!(metrics.completed_count(), 1.0);
         assert_eq!(metrics.error_count(), 1.0);
         assert_eq!(metrics.scan_in_progress(), 0.0);
         assert!(metrics.last_attempt_timestamp_seconds() > 0.0);
-        assert_eq!(metrics.last_completed_timestamp_seconds(), 0.0);
+        assert_eq!(metrics.last_completed_timestamp_seconds(), 1.0);
     }
 
     #[tokio::test]
