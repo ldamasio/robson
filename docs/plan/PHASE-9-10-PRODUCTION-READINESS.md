@@ -1,5 +1,10 @@
 # Phase 9-10: V2 Production Readiness - Execution Plan
 
+> **Historical v2 plan — do not execute.** ADR-0014 and the fixed-percentage
+> Safety Net described below are superseded. The implementation has been removed;
+> current UNTRACKED-position enforcement belongs to the ADR-0022
+> `ReconciliationWorker`. The body is preserved as planning history.
+
 ## Overview
 
 This document provides step-by-step implementation guidance for bringing Robson v2 to production, resolving the coordination between Core Trading and Safety Net modalities, and completing the Binance connector integration.

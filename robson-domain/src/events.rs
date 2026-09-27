@@ -247,7 +247,7 @@ pub enum Event {
         /// Entry-time invalidation guard level, if active.
         #[serde(default)]
         invalidation_guard_level: Option<Price>,
-        /// Binance USD-M Futures position ID (for SafetyNet coordination)
+        /// Binance USD-M Futures position ID used by reconciliation
         binance_position_id: Option<String>,
         /// When the fill occurred
         timestamp: DateTime<Utc>,

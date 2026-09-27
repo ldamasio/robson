@@ -23,9 +23,10 @@
 > Fixed-percentage technical stops are forbidden by ADR-0021 and AGENTS.md.
 > `ReconciliationWorker` now owns mandatory UNTRACKED-position enforcement;
 > Robson-authored positions use the chart-derived trailing policy and ADR-0039
-> insurance stop. The daemon runtime wiring for the legacy monitor is retired,
-> while its physical module, types, configuration, and storage artifacts remain
-> pending removal.
+> insurance stop. The legacy monitor module, `DetectedPosition` types, monitor
+> configuration, storage adapters, frontend client, and HTTP routes have now
+> been physically removed. Applied migration files and their tables remain inert
+> schema history. The historical design below is intentionally unchanged.
 
 ---
 

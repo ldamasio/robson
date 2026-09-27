@@ -61,7 +61,7 @@ pub enum DaemonEvent {
         expired_at: DateTime<Utc>,
     },
 
-    /// Core Trading position opened (for Safety Net coordination)
+    /// Core Trading position opened (for reconciliation coordination)
     CorePositionOpened {
         position_id: PositionId,
         symbol: Symbol,
@@ -69,7 +69,7 @@ pub enum DaemonEvent {
         binance_position_id: String,
     },
 
-    /// Core Trading position closed (for Safety Net coordination)
+    /// Core Trading position closed (for reconciliation coordination)
     CorePositionClosed {
         position_id: PositionId,
         symbol: Symbol,
@@ -122,15 +122,6 @@ pub enum DaemonEvent {
         symbol: Symbol,
         exchange_order_id: String,
         client_order_id: String,
-    },
-
-    /// Panic mode activated (all retries exhausted)
-    SafetyPanic {
-        position_id: String,
-        symbol: String,
-        side: robson_domain::Side,
-        error: String,
-        consecutive_failures: u32,
     },
 
     /// MonthlyHalt triggered (4% drawdown reached or operator action).

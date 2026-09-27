@@ -163,7 +163,8 @@ async fn record_realized_loss_migration_if_already_applied(pool: &PgPool) -> Res
 /// Tables created by a superuser during initial provisioning are owned by that
 /// superuser, not the runtime role. If the current user lacks GRANT OPTION the
 /// attempt is silently skipped (migration 012 also attempts this at the SQL
-/// level). The function never fails the migration run.
+/// level). The function remains while the historical tables are retained for
+/// rollback and audit compatibility.
 async fn repair_safety_net_table_permissions(pool: &PgPool) -> Result<()> {
     for table in ["detected_positions", "safety_net_executions"] {
         // Best-effort GRANT; swallow errors so migrations proceed regardless.

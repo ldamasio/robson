@@ -18,13 +18,18 @@ The 2026-04-22 entry is historical evidence. “legacy monitor active” referre
 now-superseded fixed-percentage `PositionMonitor`; it is not authorization to
 re-enable that runtime path and is not evidence for the retirement rollout.
 
+As of 2026-09-27, physical removal of that monitor and its compatibility surfaces
+is repository-verified. Deployment of the removal image is still pending and must
+be established by a new Run Log entry; repository status is not rollout evidence.
+
 ---
 
 ## Purpose
 
 Activate a reviewed production `robsond` image with real Binance credentials,
-the legacy fixed-percentage `PositionMonitor` disabled, and the unconditional
-ADR-0022 reconciliation worker demonstrably live.
+the legacy fixed-percentage `PositionMonitor` physically absent, its retired HTTP
+routes returning `404`, and the unconditional ADR-0022 reconciliation worker
+demonstrably live.
 
 **Blocking prerequisite**: [VAL-001 — Testnet E2E Validation](val-001-testnet-e2e-validation.md) must show `PASS` in its Run Log.
 
@@ -99,14 +104,15 @@ kubectl exec -n robson "$PARADEDB_POD" -- psql -U robson -d robson -c \
 
 Then enumerate every open position on the real Binance production account across
 every account type (spot, isolated margin, cross margin, futures) and every symbol.
-Cross-check each exchange order id against `event_log` `entry_order_placed`:
+Cross-check each exchange order id against the current `event_log`
+`entry_order_accepted` contract:
 
 ```bash
 # All non-zero balances (spot + margin) on the operator's Binance account
 # All non-zero positions on futures
 # ... (use the binance-cli / private tooling available to the operator)
-# For each open position, verify an entry_order_placed event exists with a
-# matching exchange order id in event_log.
+# For each open position, verify an entry_order_accepted event exists with a
+# governed cycle_id and matching exchange_order_id in event_log.
 ```
 
 **Expected Output**:
@@ -176,10 +182,13 @@ selection is an abort condition.
 
 ### Step 5: Roll Out A Reviewed Image Via GitOps
 
-Keep `ROBSON_POSITION_MONITOR_ENABLED: "false"`. Submit and merge a reviewed
-`rbx-infra` change that pins both the `robsond` Deployment and database-migration
-Job to the same immutable application image SHA. Never re-enable the legacy flag
-as a rollout or rollback mechanism.
+Keep `ROBSON_POSITION_MONITOR_ENABLED: "false"` in GitOps solely as a rollback
+guard while an accepted rollback image may still contain the old code path. The
+new application does not parse this value. Submit and merge a reviewed `rbx-infra`
+change that pins both the `robsond` Deployment and database-migration Job to the
+same immutable application image SHA. Never re-enable the legacy flag, and do not
+remove it from infrastructure until the rollback floor excludes every
+legacy-capable image.
 
 Before merging, record the current image SHA and confirm the account is still
 flat. After ArgoCD sync, confirm that exactly the reviewed SHA is running.
@@ -222,12 +231,11 @@ Verify the rollout succeeded:
 - [ ] Ansible secret refresh completed successfully from `rbx-infra/bootstrap/ansible/`.
 - [ ] New production daemon logs contain `Exchange: Binance (production)`, never the testnet or Stub selection, and `ROBSON_BINANCE_USE_TESTNET` is not `true`.
 - [ ] Safety checks before rollout showed `active_positions = 0`, `stale_active_count = 0`, empty `reconciliation_blockers`, and no open rows in `positions_current`.
-- [ ] **Zero UNTRACKED positions on the production Binance account** (ADR-0022): every open exchange position across all account types and all symbols has a matching `entry_order_placed` event, OR the account is empty.
+- [ ] **Zero UNTRACKED positions on the production Binance account** (ADR-0022): every open exchange position across all account types and all symbols has matching `entry_order_accepted` evidence (`cycle_id` plus `exchange_order_id`), OR the account is empty.
 - [ ] ArgoCD `robson-prod` is `Synced Healthy`.
-- [ ] Production ConfigMap has `ROBSON_POSITION_MONITOR_ENABLED: "false"`.
+- [ ] Production ConfigMap has `ROBSON_POSITION_MONITOR_ENABLED: "false"` as a rollback guard; the reviewed application image does not parse it.
 - [ ] Production daemon pod is Running and Ready on the reviewed image SHA with zero unexpected restarts.
-- [ ] `/safety/status` reports the disabled legacy contract and `/safety/test` reports `success=false`.
-- [ ] Logs contain the runtime-retirement message and do not contain legacy monitor initialization/start messages.
+- [ ] On the reviewed removal image, both `/safety/status` and `/safety/test` return `404`; the disabled compatibility contracts no longer exist.
 - [ ] `robsond_reconciliation_scans_total{result="completed"}` and both reconciliation timestamps advance across at least one configured interval; the error counter does not advance and the in-progress gauge returns to zero.
 - [ ] No unexpected `UNTRACKED position detected`, `UNTRACKED position closed`, or failed-close structured logs appear in the first 10 minutes. These logs are the current signal; durable I2 EventLog records remain follow-up work.
 
@@ -237,7 +245,7 @@ kubectl get app robson-prod -n argocd -o jsonpath='{.status.sync.status} {.statu
 kubectl get configmap -n robson robsond-config -o jsonpath='{.data.ROBSON_POSITION_MONITOR_ENABLED}{"\n"}'
 kubectl get pods -n robson -l app.kubernetes.io/name=robsond
 kubectl logs -n robson deploy/robsond --since=10m \
-  | rg "Exchange:|Legacy PositionMonitor|Position monitor initialized|Position monitor started|UNTRACKED|panic"
+  | rg "Exchange:|UNTRACKED|panic"
 
 kubectl port-forward svc/robsond 18080:8080 -n robson
 ```
@@ -247,8 +255,8 @@ reconciliation interval between samples:
 
 ```bash
 curl -fsS http://localhost:18080/readyz | jq .
-curl -fsS http://localhost:18080/safety/status | jq .
-curl -fsS http://localhost:18080/safety/test | jq .
+test "$(curl -sS -o /dev/null -w '%{http_code}' http://localhost:18080/safety/status)" = "404"
+test "$(curl -sS -o /dev/null -w '%{http_code}' http://localhost:18080/safety/test)" = "404"
 curl -fsS http://localhost:18080/metrics \
   | rg '^robsond_reconciliation_(scans_total|scan_in_progress|last_attempt_timestamp_seconds|last_completed_timestamp_seconds)'
 ```
@@ -264,9 +272,9 @@ Stop immediately and rollback if any of these occur:
 - Real Binance credentials cannot be verified in `pass`.
 - Ansible secret refresh fails or writes the wrong credential source.
 - Safety checks show any `armed`, `entering`, `active`, or `exiting` production positions before the rollout.
-- **Any UNTRACKED position is found on the production Binance account** (ADR-0022): an open exchange position on any symbol or account type with no matching `entry_order_placed` event. Do not proceed until the account is clean and the root cause is identified.
+- **Any UNTRACKED position is found on the production Binance account** (ADR-0022): an open exchange position on any symbol or account type with no matching `entry_order_accepted` evidence. Do not proceed until the account is clean and the root cause is identified.
 - ArgoCD sync is degraded after the image change.
-- The legacy `/safety/status` contract reports `enabled=true`, or logs show the legacy `PositionMonitor` initialized or started.
+- Either retired `/safety/*` route returns anything other than `404` on the reviewed removal image, which indicates that the wrong application contract is running.
 - Reconciliation completed scans and timestamps do not advance, the error counter advances, or the in-progress gauge remains stuck.
 - Unexpected reconciliation exits or panic events appear after rollout.
 
@@ -289,7 +297,10 @@ If the reviewed application image causes an issue:
 2. Submit a reviewed GitOps rollback that pins both the `robsond` Deployment and
    database-migration Job to the last accepted immutable image SHA.
 3. Confirm the account is flat, merge the rollback, and wait for ArgoCD auto-sync.
-4. Re-run the full validation above, including reconciliation-worker liveness.
+4. Re-run the flat-account, adapter-selection, and reconciliation-liveness checks.
+   The `404` route-absence criterion applies to the removal image; a known older
+   rollback image may restore the compatibility routes, but they must remain
+   disabled while the GitOps guard is false.
 
 A prior image may still contain the legacy code path; keeping the flag false is
 therefore a required rollback invariant, not an optional feature toggle.

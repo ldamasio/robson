@@ -9,7 +9,6 @@
 // Public modules
 pub mod context;
 pub mod credentials;
-pub mod detected_position;
 pub mod entities;
 pub mod events;
 pub mod executable_stop;
@@ -25,7 +24,6 @@ pub use credentials::{
     ApiCredentials, CredentialError, CredentialId, CredentialProfile, CredentialStatus, Exchange,
     StoredCredential,
 };
-pub use detected_position::{CalculatedStop, DetectedPosition, StopMethod};
 pub use entities::{
     calculate_margin_required, calculate_notional_value, size_entry, AccountId,
     AccountSnapshotEvidence, AnchorType, ClosureEvidence, DetectorSignal, EntryLifecycleStage,

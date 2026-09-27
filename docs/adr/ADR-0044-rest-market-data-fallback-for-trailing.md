@@ -4,6 +4,13 @@
 **Status**: DECIDED; implemented (repository-verified); operational rollout pending
 **Deciders**: RBX Systems (operator + architecture)
 
+> **2026-09-27 maintenance note**: References below to the Safety Net's 20-second
+> position poll describe the incident-time legacy `PositionMonitor`. That
+> fixed-percentage component has since been physically removed from the
+> repository, with deployment of the removal image still pending. The current
+> ADR-0022 `ReconciliationWorker` is independent from market-data fallback and
+> does not supply prices to the trailing engine.
+
 ---
 
 ## Context
@@ -32,12 +39,11 @@ recovery replayed the gap candles, advanced the trailing stop two steps into
 the locked-profit zone, and cancel-replaced the insurance stop accordingly.
 The WS delivered ticks normally on the new pod.
 
-The structural gap remains: **the watchdog can only reconnect**. There is no
-alternate data path into the trailing engine. Meanwhile, the Safety Net
-already polls the exchange REST API every 20 s — but only for position
-reconciliation; it does not drive trailing. The failure was invisible from
-the outside: `/status` served a fresh `current_price` (REST) while the
-tick pipeline starved.
+At the time of the incident, the structural gap was that **the watchdog could
+only reconnect**. There was no alternate data path into the trailing engine.
+The then-active legacy Safety Net polled exchange positions every 20 s, but did
+not drive trailing. The failure was invisible from the outside: `/status`
+served a fresh `current_price` from REST while the tick pipeline starved.
 
 ## Decision
 
@@ -74,8 +80,8 @@ and guard semantics (ADR-0041/0042) apply identically.
 
 REST fallback must fit the exchange rate-limit budget by construction:
 
-- Poll only symbols with an Entering or Active position (the same set the
-  Safety Net tracks), never the full watchlist.
+- Poll only symbols with an Entering or Active position, never the full
+  watchlist.
 - One price request per symbol per interval; no burst retries — a failed poll
   waits for the next interval.
 - Request-count telemetry with an alert threshold, so an accidental
@@ -167,13 +173,14 @@ still a single path. June taught that daemon availability cannot be a
 precondition for bounded loss; July taught that feed availability cannot be
 a precondition for profit protection.
 
-### Let the Safety Net drive trailing directly (rejected)
+### Let a reconciliation poll drive trailing directly (rejected)
 
-The Safety Net is a reconciliation auditor. Feeding its 20 s position poll
-into the trailing engine would mix responsibilities and create a second,
-subtly different trailing path — exactly the class of divergence the
-equivalence property exists to prevent. The fallback reuses the *pipeline*,
-not the auditor.
+The incident-time Safety Net poll was a reconciliation mechanism, not a market
+data source. The current `ReconciliationWorker` has the same separation of
+responsibility. Feeding either reconciliation path into the trailing engine
+would create a second, subtly different trailing path — exactly the class of
+divergence the equivalence property exists to prevent. The fallback reuses the
+*market-data pipeline*, not reconciliation.
 
 ### Candle replay on each reconnect (rejected)
 

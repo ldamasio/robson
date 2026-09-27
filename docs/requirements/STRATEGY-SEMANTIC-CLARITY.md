@@ -2,6 +2,7 @@
 
 **Status**: APPROVED
 **Date**: 2025-12-23
+**Last Amended**: 2026-09-27 (chart-derived technical-stop invariant)
 **Priority**: CRITICAL
 **Type**: Semantic Definition & Architectural Constraint
 
@@ -68,45 +69,59 @@ The user chooses:
 
 ### The 1% Rule Implementation
 
-When user says: *"I want to buy BTC with 2% stop-loss using Mean Reversion strategy"*
+When the operator says: *"I want to buy BTC using my Mean Reversion strategy"*,
+that intent answers **WHEN** to trade. A separate Technical Stop Analysis answers
+**WHERE** the stop belongs by selecting the second support or resistance level
+on the 15-minute chart. A fixed percentage of entry is never an acceptable
+substitute for that chart-derived level.
 
-**User provides**:
+**Operator provides**:
 - Symbol: BTCUSDC
 - Direction: BUY
-- Stop-loss level: 2% below entry
 - Strategy context: Mean Reversion
+- The entry decision and authorization
+
+**Technical Stop Analysis provides**:
+- Technical stop: the second 15-minute support for a long, or the second
+  15-minute resistance for a short
+- Evidence identifying the chart level used
 
 **Robson calculates** (the intelligence):
-- Maximum position size that keeps loss at or below the 1% cap
+- Maximum position size whose planned worst-case loss, including the validated
+  gap allowance and round-trip taker fees, stays at or below the 1% cap
 - Order quantity with proper precision
-- Validates against available margin and monthly drawdown
-- Confirms monthly drawdown is within 4% limit
+- Validates against available margin and remaining monthly risk budget
+- Confirms the monthly drawdown policy remains satisfied
 
 **Example**:
 ```
-User Input:
+Operator Intent:
   Entry: $90,000
-  Stop:  $88,200 (2% stop)
   Strategy: Mean Reversion MA99
+
+Technical Stop Analysis:
+  Second 15-minute support: $87,650
+  Raw stop distance: $2,350
 
 Robson Calculates:
   Capital: $1,000
-  Max Risk (1%): $10
-  Stop Distance: $1,800
-  → Quantity: 0.00555556 BTC
-  → Position Value: $500 (50% of capital)
+  Worst-case risk cap (1%): $10
+  Cost-priced unit loss:
+    raw stop distance + validated gap allowance + round-trip taker fees
+  → Quantity: at most $10 / cost-priced unit loss, rounded to exchange metadata
 
   Validation:
-  ✓ Risk = $10 (1% of capital)
-  ✓ Exposure = $500 (50% of capital, within limit)
-  ✓ Monthly DD = 1.5% (within 4% limit)
+  ✓ Technical stop is chart-derived
+  ✓ Planned worst-case loss is at or below $10
+  ✓ Planned loss fits the remaining monthly risk budget
+  ✓ Required margin is available
   → APPROVED
 ```
 
 ### What Robson Does
 
-1. **Calculates** optimal position size (1% loss cap)
-2. **Validates** against risk limits (drawdown, margin)
+1. **Calculates** cost-priced position size (1% worst-case loss cap, not a target)
+2. **Validates** against the monthly risk budget and available margin
 3. **Monitors** stops automatically (24/7 monitoring)
 4. **Executes** stops when triggered (safety automation)
 5. **Tracks** performance per strategy (analytics)
@@ -135,7 +150,7 @@ class Strategy:
     name: str                # e.g., "Mean Reversion MA99"
     description: str         # User's documented approach
     config: dict            # Indicator settings (MA periods, etc.)
-    risk_config: dict       # Risk rules (stop %, take-profit %)
+    risk_config: dict       # Risk-cap and reward-policy settings; never a stop percentage
     is_active: bool         # User can enable/disable
 ```
 
@@ -189,21 +204,29 @@ class TradingIntent:
 
 **Implementation**:
 ```python
-# CORRECT: User provides intent
+# CORRECT: operator provides entry intent
 user_intent = {
     'symbol': 'BTCUSDC',
     'side': 'BUY',
     'entry_price': 90000,
-    'stop_price': 88200,
     'strategy_name': 'Mean Reversion MA99',  # User's chosen strategy
 }
 
-# Robson calculates position size
-calculated_quantity = calculate_position_size(
+# A separate chart-analysis component determines WHERE the stop belongs.
+technical_stop = analyze_technical_stop(
+    chart='15m',
+    side='BUY',
+    level_n=2,
+)
+
+# Robson cost-prices the position size, including execution costs.
+calculated_quantity = calculate_cost_priced_position_size(
     capital=1000,
     entry_price=90000,
-    stop_price=88200,
-    max_risk_percent=1.0
+    technical_stop_price=technical_stop.price,
+    risk_cap_pct=1.0,
+    gap_allowance=validated_gap_allowance,
+    round_trip_taker_fee_rate=exchange_metadata.taker_fee_rate,
 )
 
 # User confirms before execution
@@ -281,13 +304,12 @@ strategy.config = {
 3. User enters:
    - Symbol: BTCUSDC
    - Entry: $90,000 (current price)
-   - Stop: $88,200 (technical support level - user's analysis)
-4. **Robson calculates**:
-   - Quantity: 0.00555556 BTC (1% cap)
-   - Position value: $500
-   - Risk amount: $10
-5. User reviews calculation, confirms
-6. System places order, monitors stop
+4. A separate Technical Stop Analysis selects the second support on the
+   15-minute chart and records its evidence
+5. **Robson calculates** a cost-priced quantity whose planned worst-case loss,
+   including gap allowance and round-trip taker fees, is at or below the 1% cap
+6. User reviews the calculation and confirms
+7. System places the order and monitors the chart-derived stop
 
 **Key Point**: User decided to enter, user chose strategy, **Robson only calculated size**.
 
@@ -376,8 +398,9 @@ class Operation(BaseModel):
     side = models.CharField(...)            # BUY/SELL (user chose)
 
     # Risk parameters (calculated by Robson)
-    stop_gain_percent = models.DecimalField()
-    stop_loss_percent = models.DecimalField()
+    technical_stop_price = models.DecimalField()
+    technical_stop_method = models.CharField()  # second 15-minute support/resistance
+    risk_cap_pct = models.DecimalField()         # worst-case cap, never a target
 ```
 
 **Semantics**: `strategy` is a **reference**, not a controller.
@@ -390,7 +413,8 @@ class Operation(BaseModel):
 
 ✅ **DO**:
 - Ask user for strategy selection
-- Calculate position size based on strategy's risk_config
+- Calculate cost-priced position size from the chart-derived technical stop and
+  the active trading policy
 - Track performance by strategy
 - Validate user inputs against strategy limits
 

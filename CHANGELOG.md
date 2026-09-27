@@ -7,26 +7,36 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-### Changed - Legacy PositionMonitor runtime retirement (ADR-0014 / ADR-0022)
+### Removed - Legacy fixed-percentage PositionMonitor artifacts (ADR-0014 / ADR-0022)
 
-- Removed the daemon startup, task, shutdown, repository adapter, and API
-  injection wiring for the superseded fixed-percentage `PositionMonitor`.
-  ADR-0022 `ReconciliationWorker` remains the unconditional owner of
-  UNTRACKED-position enforcement; tracked positions remain protected by the
-  chart-derived trailing policy and exchange-side insurance stop.
-- Preserved `/safety/status` and `/safety/test` as disabled compatibility
-  contracts. Legacy config, public types, storage artifacts, and the physical
-  fixed-stop implementation remain temporarily for a follow-up removal; this
-  change does not describe them as deleted.
-- Legacy monitor-only settings now default disabled and cannot reject daemon
-  startup for empty symbols or an invalid polling interval. The existing
-  Binance credential fields remain loadable for the primary exchange adapter.
-- `Daemon::start_api_server` no longer accepts a `PositionMonitor` argument;
-  workspace callers now use the no-argument method. This intentionally removes
-  the last daemon-level injection seam for the retired runtime.
-- Production's legacy enable flag is already disabled by `rbx-infra` PR #325;
-  operational rollout of this application change remains pending until its
-  reviewed image is deployed and reconciliation liveness is revalidated.
+- Physically removed the superseded `PositionMonitor` implementation, its
+  `DetectedPosition` domain and store types, repository adapters, monitor-only
+  configuration, daemon/API wiring, frontend client surface, and unused
+  `SafetyPanic` event. ADR-0022 `ReconciliationWorker` remains the unconditional
+  owner of UNTRACKED-position enforcement; tracked positions remain protected
+  by the chart-derived trailing policy and exchange-side insurance stop.
+- Removed the corresponding public Rust exports:
+  `robson_domain::{DetectedPosition, CalculatedStop, StopMethod}`, the
+  detected-position repository/DTO exports from `robson-store`, and
+  `robsond::{PositionMonitor, MonitorError, MonitorConfig,
+  PositionMonitorConfig}` plus `DaemonError::Monitor`.
+- Removed `/safety/status` and `/safety/test`. API contract coverage now verifies
+  that both retired routes return `404`; no replacement safety-net API exists.
+- Moved the existing Binance credential environment inputs into the dedicated
+  `BinanceConfig`. The application no longer parses
+  `ROBSON_POSITION_MONITOR_ENABLED`, `ROBSON_POSITION_MONITOR_POLL_INTERVAL`, or
+  `ROBSON_POSITION_MONITOR_SYMBOLS`.
+- Preserved `position_monitor_tick`: despite its historical name, it is a current
+  `robson-engine` audit event for chart-derived trailing-stop processing and is
+  unrelated to the deleted fixed-percentage monitor.
+- Preserved the already-applied safety-net migration files unchanged. This
+  change removes application storage access but does not drop the legacy
+  `detected_positions` or `safety_net_executions` tables.
+- Production's legacy enable flag is already false through `rbx-infra` PR #325.
+  It remains an infrastructure rollback guard for images that still contain the
+  old code path; the new application does not read it. Operational rollout of
+  this application removal remains pending until the reviewed image is deployed
+  and reconciliation liveness is revalidated.
 
 ### Added - Reconciliation worker liveness metrics (ADR-0022)
 

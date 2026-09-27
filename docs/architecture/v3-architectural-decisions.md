@@ -611,24 +611,24 @@ Robson's PnL model is authoritative for **risk gate decisions only**. It is not 
 **Date**: 2026-04-18
 **Status**: DECIDED — PARTIALLY IMPLEMENTED, FOLLOW-UP REQUIRED
 
-**Context**: Nothing in the prior architecture prevented an open position from existing on the Robson-operated Binance account without a matching `entry_order_placed` event in `event_log`. Such a position could arise from manual operator orders via the Binance UI, a leaked API key, a legacy service writing orders without event-log persistence, or a partial deploy. Each such position silently consumes the account's risk budget without passing the Risk Engine, has no technical stop, has no span, and is invisible to the monthly drawdown calculation.
+**Context**: Nothing in the prior architecture prevented an open position from existing on the Robson-operated Binance account without matching exchange-ack authorship evidence in `event_log`. Such a position could arise from manual operator orders via the Binance UI, a leaked API key, a legacy service writing orders without event-log persistence, or a partial deploy. Each such position silently consumes the account's risk budget without passing the Risk Engine, has no technical stop, has no span, and is invisible to the monthly drawdown calculation.
 
-**Decision**: Every open position on the operated Binance account MUST be the direct result of an entry authored by `robsond` through a `GovernedAction`. A position without a matching `entry_order_placed` event (by exchange order id) is **UNTRACKED** and MUST be closed.
+**Decision**: Every open position on the operated Binance account MUST be the direct result of an entry authored by `robsond` through a `GovernedAction`. In the current event contract, authorship evidence is `entry_order_accepted` with a governed `cycle_id` and matching `exchange_order_id`; the replay-only legacy `entry_order_placed` event is not an acknowledgement. A position without accepted authorship evidence is **UNTRACKED** and MUST be closed.
 
 **Enforcement**:
 - **Write side** (already in place): `QueryEngine` produces a `GovernedAction` before every entry; the entry is recorded with `cycle_id` in `event_log`.
 - **Read side** (partially implemented): a long-lived **Position Reconciliation Worker** inside `robsond` performs startup and periodic USD-M Futures scans and closes UNTRACKED positions at market. Current matching uses `(symbol, side)`, not the originating exchange order id. Spot/margin coverage and exact order-id correlation remain follow-up work.
 - **Startup gate**: startup reconciliation runs before the normal runtime proceeds. The fuller `StartupReconciling` state described by the target architecture remains follow-up work.
-- **Unconditional**: not gated by `allowed_symbols` or by `ROBSON_POSITION_MONITOR_ENABLED`. That setting is a parsed legacy compatibility value and starts no runtime monitor. The audited `POST /reconciliation/suspend` remains v3 target architecture, not a current operator control.
+- **Unconditional**: not gated by `allowed_symbols` or any feature flag. The former `ROBSON_POSITION_MONITOR_ENABLED` application setting has been removed; its false GitOps value remains only as a rollback guard for older images. The audited `POST /reconciliation/suspend` remains v3 target architecture, not a current operator control.
 
 **Rejected**:
 - Adopting UNTRACKED positions into the Runtime (whitewashes policy breaches, creates retroactive "governance" for trades that never passed risk evaluation).
 - Advisory-only detection (under leverage, seconds matter).
-- Gating the worker behind `ROBSON_POSITION_MONITOR_ENABLED` (the legacy setting starts no runtime monitor; UNTRACKED closure is unconditional).
+- Gating the worker behind `ROBSON_POSITION_MONITOR_ENABLED` (the former legacy setting has been removed from the application; UNTRACKED closure is unconditional).
 
 **Rationale**: The Risk Engine's guarantees hold end-to-end only if no shadow positions exist outside its scope. The reconciliation worker is the read-side complement to the QueryEngine's write-side `GovernedAction` gate. Operator self-discipline ("I won't place manual orders") is not a sufficient safeguard for a leveraged system; the architecture must enforce this against its own operator.
 
-**Breaks if wrong**: A false positive — a legitimate position whose `entry_order_placed` event is missing due to a bug — results in an auto-close of a valid trade. Mitigation: the exchange-order-id ↔ event-log link must be written atomically with order placement. An exchange-order-id index on `event_log` is part of the follow-up work.
+**Breaks if wrong**: A false positive — a legitimate position whose `entry_order_accepted` event is missing due to a bug — results in an auto-close of a valid trade. Mitigation: the exchange-order-id ↔ event-log link must be recorded with the exchange acknowledgement. An exchange-order-id index on `event_log` is part of the follow-up work.
 
 **Reversibility**: There is no supported runtime flag that disables the reconciliation worker. Replacing this invariant requires a reviewed ADR and policy migration; an operational rollback must preserve equivalent UNTRACKED-position enforcement.
 

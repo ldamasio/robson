@@ -11,15 +11,17 @@ exchange-side protection model. This record is retained as decision history.
 
 ### Repository and rollout status (2026-09-27)
 
-- **Repository-verified**: `Daemon::run` no longer constructs, starts, or stops
-  the superseded fixed-percentage `PositionMonitor`. Its module, public types,
-  configuration, storage artifacts, and disabled HTTP compatibility routes
-  remain pending physical removal.
+- **Repository-verified**: the superseded fixed-percentage `PositionMonitor`,
+  its `DetectedPosition` domain and store types, monitor configuration, storage
+  adapters, frontend client, and disabled HTTP compatibility routes have been
+  removed. The applied migration files and their legacy tables remain as inert
+  schema history; this change does not drop them.
 - **Infrastructure rollout verified**: production keeps the legacy flag
-  `ROBSON_POSITION_MONITOR_ENABLED=false` through `rbx-infra` PR #325.
-- **Application rollout pending**: retiring the executable wiring becomes
-  operationally verified only after the reviewed application image is deployed
-  and the reconciliation-worker liveness signals are observed in production.
+  `ROBSON_POSITION_MONITOR_ENABLED=false` through `rbx-infra` PR #325 solely as
+  a rollback guard for older images. The current application no longer parses it.
+- **Application rollout pending**: physical removal becomes operationally
+  verified only after the reviewed application image is deployed and the
+  reconciliation-worker liveness signals are observed in production.
 - **Current owners**: `ReconciliationWorker` partially enforces the current
   USD-M Futures scope using `(symbol, side)` matching; `PositionManager` and the
   ADR-0039 exchange-side insurance stop protect Robson-authored positions.

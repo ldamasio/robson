@@ -99,11 +99,9 @@ async fn async_main() -> anyhow::Result<()> {
     );
 
     // Select exchange adapter based on Binance credentials and environment marker.
-    // Reuses position_monitor.binance_api_key/secret from config (same env vars).
     // ROBSON_BINANCE_USE_TESTNET is a birth-time environment marker set in the
     // ConfigMap — never a runtime toggle. See ADR-0003.
-    let has_binance_creds = config.position_monitor.binance_api_key.is_some()
-        && config.position_monitor.binance_api_secret.is_some();
+    let has_binance_creds = config.binance.api_key.is_some() && config.binance.api_secret.is_some();
     let use_testnet = std::env::var("ROBSON_BINANCE_USE_TESTNET").unwrap_or_default() == "true";
 
     // Create daemon with optional projection recovery (wiring layer)
@@ -171,8 +169,8 @@ async fn async_main() -> anyhow::Result<()> {
         if has_binance_creds && use_testnet {
             info!("Exchange: Binance (testnet)");
             let (api_key, api_secret) = (
-                config.position_monitor.binance_api_key.clone().unwrap(),
-                config.position_monitor.binance_api_secret.clone().unwrap(),
+                config.binance.api_key.clone().unwrap(),
+                config.binance.api_secret.clone().unwrap(),
             );
             let client = Arc::new(BinanceRestClient::testnet(api_key, api_secret));
             let daemon =
@@ -181,8 +179,8 @@ async fn async_main() -> anyhow::Result<()> {
         } else if has_binance_creds && config.environment == Environment::Production {
             info!("Exchange: Binance (production)");
             let (api_key, api_secret) = (
-                config.position_monitor.binance_api_key.clone().unwrap(),
-                config.position_monitor.binance_api_secret.clone().unwrap(),
+                config.binance.api_key.clone().unwrap(),
+                config.binance.api_secret.clone().unwrap(),
             );
             let client = Arc::new(BinanceRestClient::new(api_key, api_secret));
             let daemon =
@@ -208,8 +206,8 @@ async fn async_main() -> anyhow::Result<()> {
         if has_binance_creds && use_testnet {
             info!("Exchange: Binance (testnet)");
             let (api_key, api_secret) = (
-                config.position_monitor.binance_api_key.clone().unwrap(),
-                config.position_monitor.binance_api_secret.clone().unwrap(),
+                config.binance.api_key.clone().unwrap(),
+                config.binance.api_secret.clone().unwrap(),
             );
             let client = Arc::new(BinanceRestClient::testnet(api_key, api_secret));
             let daemon = Daemon::new_binance(config, client);
@@ -217,8 +215,8 @@ async fn async_main() -> anyhow::Result<()> {
         } else if has_binance_creds && config.environment == Environment::Production {
             info!("Exchange: Binance (production)");
             let (api_key, api_secret) = (
-                config.position_monitor.binance_api_key.clone().unwrap(),
-                config.position_monitor.binance_api_secret.clone().unwrap(),
+                config.binance.api_key.clone().unwrap(),
+                config.binance.api_secret.clone().unwrap(),
             );
             let client = Arc::new(BinanceRestClient::new(api_key, api_secret));
             let daemon = Daemon::new_binance(config, client);

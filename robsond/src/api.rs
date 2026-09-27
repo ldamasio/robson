@@ -6,7 +6,6 @@
 //! - Arm position
 //! - Cancel/close a single position
 //! - Panic (emergency close all)
-//! - Safety net (rogue position monitoring)
 //! - SSE events for operator-facing runtime updates
 
 use std::{
@@ -53,7 +52,6 @@ use crate::{
     event_bus::EventBus,
     funding::{CapitalRefreshResponse, ExecuteFundingRequest},
     position_manager::PositionManager,
-    position_monitor::PositionMonitor,
     sse::{map_daemon_event, resync_required_event},
 };
 
@@ -67,7 +65,6 @@ pub struct ApiState<E: ExchangePort + 'static, S: Store + 'static> {
     pub position_manager: Arc<RwLock<PositionManager<E, S>>>,
     pub event_bus: Arc<EventBus>,
     pub circuit_breaker: Arc<CircuitBreaker>,
-    pub position_monitor: Option<Arc<PositionMonitor>>,
     pub(crate) wallet_balance_cache: Mutex<Option<(Decimal, Instant)>>,
     /// PostgreSQL pool for liveness check. Present only when DATABASE_URL is
     /// configured.
@@ -559,75 +556,6 @@ pub struct IncomeAckErrorResponse {
 }
 
 // =============================================================================
-// Safety Net Types
-// =============================================================================
-
-/// Safety net status response.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SafetyStatusResponse {
-    /// Whether the safety net is enabled
-    pub enabled: bool,
-    /// Symbols being monitored
-    pub symbols: Vec<String>,
-    /// Polling interval in seconds
-    pub poll_interval_secs: u64,
-    /// Currently tracked rogue positions
-    pub tracked_positions: Vec<DetectedPositionSummary>,
-    /// Number of execution attempts (failed)
-    pub pending_executions: usize,
-}
-
-/// Summary of a detected rogue position.
-#[derive(Debug, Serialize, Deserialize)]
-pub struct DetectedPositionSummary {
-    /// Position ID (symbol:side)
-    pub id: String,
-    /// Trading symbol
-    pub symbol: String,
-    /// Position side
-    pub side: String,
-    /// Entry price
-    pub entry_price: Decimal,
-    /// Quantity
-    pub quantity: Decimal,
-    /// Calculated stop price
-    pub stop_price: Decimal,
-    /// Stop distance percentage
-    pub stop_distance_pct: Decimal,
-    /// When position was first detected
-    pub detected_at: String,
-}
-
-/// Request to enable/disable safety net.
-#[derive(Debug, Deserialize)]
-pub struct SafetyEnableRequest {
-    /// Whether to enable or disable
-    pub enabled: bool,
-}
-
-/// Safety net test response.
-#[derive(Debug, Serialize)]
-pub struct SafetyTestResponse {
-    /// Whether the test was successful
-    pub success: bool,
-    /// Message describing the result
-    pub message: String,
-    /// Current positions from Binance (if any)
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub positions: Option<Vec<BinancePositionInfo>>,
-}
-
-/// Info about a Binance position (for testing).
-#[derive(Debug, Serialize)]
-pub struct BinancePositionInfo {
-    pub symbol: String,
-    pub side: String,
-    pub quantity: Decimal,
-    pub entry_price: Decimal,
-    pub calculated_stop: Decimal,
-}
-
-// =============================================================================
 // Router
 // =============================================================================
 
@@ -652,9 +580,6 @@ where
         .route("/positions/:id", get(get_position_handler))
         // Prometheus metrics
         .route("/metrics", get(metrics_handler))
-        // Safety net read-only endpoints
-        .route("/safety/status", get(safety_status_handler))
-        .route("/safety/test", get(safety_test_handler))
         // MonthlyHalt status (read-only)
         .route("/monthly-halt", get(monthly_halt_status_handler))
         .with_state(state.clone());
@@ -2231,86 +2156,6 @@ fn validate_reconcile_close_fields(
 }
 
 // =============================================================================
-// Safety Net Handlers
-// =============================================================================
-
-/// Get safety net status.
-async fn safety_status_handler<E, S>(
-    State(state): State<Arc<ApiState<E, S>>>,
-) -> Result<Json<SafetyStatusResponse>, (StatusCode, Json<ErrorResponse>)>
-where
-    E: ExchangePort + 'static,
-    S: Store + 'static,
-{
-    match &state.position_monitor {
-        Some(monitor) => {
-            let tracked = monitor.get_tracked_positions().await;
-            let attempts_count = monitor.get_pending_execution_count().await;
-
-            let summaries: Vec<DetectedPositionSummary> = tracked
-                .iter()
-                .map(|pos| {
-                    let stop = pos.calculated_stop.as_ref();
-                    DetectedPositionSummary {
-                        id: format!("{}:{}", pos.symbol.as_pair(), pos.side),
-                        symbol: pos.symbol.as_pair(),
-                        side: format!("{:?}", pos.side),
-                        entry_price: pos.entry_price.as_decimal(),
-                        quantity: pos.quantity.as_decimal(),
-                        stop_price: stop.map(|s| s.stop_price.as_decimal()).unwrap_or_default(),
-                        stop_distance_pct: stop.map(|s| s.distance_pct).unwrap_or_default(),
-                        detected_at: pos.detected_at.to_rfc3339(),
-                    }
-                })
-                .collect();
-
-            Ok(Json(SafetyStatusResponse {
-                enabled: true,
-                symbols: vec!["BTCUSDT".to_string()], // TODO: Get from config
-                poll_interval_secs: 20,               // TODO: Get from config
-                tracked_positions: summaries,
-                pending_executions: attempts_count,
-            }))
-        },
-        None => Ok(Json(SafetyStatusResponse {
-            enabled: false,
-            symbols: vec![],
-            poll_interval_secs: 0,
-            tracked_positions: vec![],
-            pending_executions: 0,
-        })),
-    }
-}
-
-/// Test safety net (dry run).
-async fn safety_test_handler<E, S>(
-    State(state): State<Arc<ApiState<E, S>>>,
-) -> Result<Json<SafetyTestResponse>, (StatusCode, Json<ErrorResponse>)>
-where
-    E: ExchangePort + 'static,
-    S: Store + 'static,
-{
-    match &state.position_monitor {
-        Some(_monitor) => {
-            // TODO: Actually test the Binance connection and show positions
-            // For now, return a simple success message
-            Ok(Json(SafetyTestResponse {
-                success: true,
-                message:
-                    "Safety net is running. Use 'robson safety-status' to see tracked positions."
-                        .to_string(),
-                positions: None,
-            }))
-        },
-        None => Ok(Json(SafetyTestResponse {
-            success: false,
-            message: "Safety net is not enabled.".to_string(),
-            positions: None,
-        })),
-    }
-}
-
-// =============================================================================
 // Helpers
 // =============================================================================
 // MonthlyHalt handlers (v3 policy)
@@ -3061,7 +2906,6 @@ mod tests {
             position_manager,
             event_bus,
             circuit_breaker,
-            position_monitor: None,
             wallet_balance_cache: Mutex::new(None),
             #[cfg(feature = "postgres")]
             pg_pool: None,
@@ -3517,7 +3361,6 @@ mod tests {
             position_manager: Arc::clone(&position_manager),
             event_bus: Arc::clone(&event_bus),
             circuit_breaker,
-            position_monitor: None,
             wallet_balance_cache: Mutex::new(None),
             #[cfg(feature = "postgres")]
             pg_pool: None,
@@ -3558,7 +3401,6 @@ mod tests {
             position_manager,
             event_bus,
             circuit_breaker,
-            position_monitor: None,
             wallet_balance_cache: Mutex::new(None),
             #[cfg(feature = "postgres")]
             pg_pool: None,
@@ -4814,7 +4656,6 @@ mod tests {
                 position_manager: Arc::clone(&position_manager),
                 event_bus: Arc::clone(&event_bus),
                 circuit_breaker,
-                position_monitor: None,
                 wallet_balance_cache: Mutex::new(None),
                 #[cfg(feature = "postgres")]
                 pg_pool: None,

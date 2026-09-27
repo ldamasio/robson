@@ -13,6 +13,10 @@
 > - **`docs/runbooks/frontend-deploy.md`** — operational runbook
 >
 > The "Infrastructure Gaps" table, "Track 7", and "EP-008" sections below are preserved as historical evidence of what was originally planned. Do not act on them.
+>
+> **API note (2026-09-27)** — Endpoint inventories below are also historical.
+> The retired `/safety/status` and `/safety/test` routes and their frontend
+> client types have been removed; both paths now return `404`.
 
 ---
 

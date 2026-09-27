@@ -20,7 +20,7 @@
 
 This runbook describes how to temporarily stop the `robsond` daemon so the operator can perform manual operations on the Binance account (e.g., placing an order via the Binance website or app, emergency manual close, account inspection).
 
-**Critical constraint**: the Binance account operated by `robsond` is under daemon authority at all times when the daemon is running. The reconciliation worker enforces ADR-0022 unconditionally — any position not traceable to a `robsond`-authored entry will be closed at market within one reconciliation interval (~60 s). This is not a bug; it is the intended behavior.
+**Critical constraint**: the Binance account operated by `robsond` is under daemon authority at all times when the daemon is running. In the current implementation, the reconciliation worker scans USD-M Futures unconditionally and treats an exchange position as tracked only when an active local position has the same `(symbol, side)`. An unmatched USD-M position is closed at market, normally within one reconciliation interval (~60 s). Exact originating-order correlation and spot/margin coverage remain follow-up work; this implementation boundary does not authorize manual trading.
 
 **The safe window for manual operations is: after the pod terminates, before the pod restarts.**
 
@@ -107,7 +107,10 @@ Take note of every position you open so you can close them before restarting the
 
 Before scaling `robsond` back up, close every position you opened manually. Verify on the Binance website or app that the account has zero open positions (or only positions that Robson authored in Step 1 and that you did not touch).
 
-If you restart the daemon with any manually-opened position still open, the reconciliation worker will close it automatically within one reconciliation interval (~60 s). The close is a mandatory Market Sell and is not overridable by configuration.
+If you restart the daemon with any manually-opened USD-M Futures position still
+open and it has no active local `(symbol, side)` match, the reconciliation worker
+will close it automatically, normally within one reconciliation interval (~60 s).
+The close is a side-appropriate market order and is not overridable by configuration.
 
 ### Step 6 — Restore replicas via GitOps
 
@@ -146,12 +149,22 @@ kubectl logs -n robson -l app.kubernetes.io/name=robsond --since=2m | grep -i "u
 
 ## What Happens If You Scale Up With Open Manual Positions
 
-The reconciliation worker runs every ~60 s and is not gated by `ROBSON_POSITION_MONITOR_ENABLED`. On its first scan after startup, it queries Binance for all open positions, checks each one against `event_log`, and classifies any position without a matching `entry_order_placed` event as UNTRACKED. It then:
+The reconciliation worker runs on startup and then every ~60 s. It has no runtime
+disable flag; the former `ROBSON_POSITION_MONITOR_ENABLED` application setting
+has been removed. In the current USD-M Futures implementation, it queries Binance
+for open positions and treats an exchange position as tracked when an active local
+position has the same `(symbol, side)`. An unmatched position is classified as
+UNTRACKED. The worker then:
 
-1. Emits `position_untracked_detected` to `event_log`.
-2. Sends a CRITICAL alert to the operator channel.
-3. Issues a Market Sell (or Market Buy for Short positions) for the full UNTRACKED quantity.
-4. Emits `untracked_position_closed` with the resulting fill.
+1. Broadcasts `RoguePositionDetected` on the in-process event bus and SSE surface,
+   which the daemon also logs.
+2. Issues a Market Sell (or Market Buy for Short positions) for the full UNTRACKED
+   quantity.
+3. Broadcasts and logs `SafetyExitExecuted` or `SafetyExitFailed` for the result.
+
+Exact originating-order-id authorship, durable `position_untracked_detected` and
+`untracked_position_closed` EventLog records, complete account-type coverage, and
+CRITICAL alert delivery remain follow-up work under ADR-0022.
 
 The close cannot be aborted once triggered. The `POST /reconciliation/suspend` endpoint (planned, not yet implemented) will allow a short TTL suspension in future; until then, the close is non-overridable.
 
