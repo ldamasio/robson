@@ -28,6 +28,7 @@ use uuid::Uuid;
 use crate::{
     error::{DaemonError, DaemonResult},
     event_bus::{DaemonEvent, EventBus},
+    metrics::ReconciliationMetrics,
     position_manager::{PositionManager, ReconcileCloseOutcome, ReconciledCloseInput},
 };
 
@@ -41,6 +42,7 @@ pub struct ReconciliationWorker<E: ExchangePort + 'static, S: Store + 'static> {
     missing_grace: Duration,
     missing_observations: Arc<Mutex<HashMap<PositionId, MissingObservation>>>,
     shutdown_token: CancellationToken,
+    metrics: ReconciliationMetrics,
 }
 
 #[derive(Debug, Clone)]
@@ -319,7 +321,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
             missing_grace,
             missing_observations: Arc::new(Mutex::new(HashMap::new())),
             shutdown_token,
+            metrics: ReconciliationMetrics::global(),
         }
+    }
+
+    #[cfg(test)]
+    fn with_metrics(mut self, metrics: ReconciliationMetrics) -> Self {
+        self.metrics = metrics;
+        self
     }
 
     /// Run the periodic reconciliation loop until shutdown.
@@ -346,9 +355,27 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         }
     }
 
-    /// Run one reconciliation pass, returning how many untracked positions were
-    /// closed.
+    /// Run one reconciliation pass, returning how many position-level
+    /// reconciliation actions completed (UNTRACKED closes plus resolved local
+    /// missing positions).
     pub async fn scan_and_reconcile(&self) -> DaemonResult<usize> {
+        self.metrics.scan_started(Utc::now().timestamp());
+
+        let result = self.scan_and_reconcile_inner().await;
+
+        match &result {
+            Ok(_) => {
+                self.metrics.scan_completed(Utc::now().timestamp());
+            },
+            Err(_) => {
+                self.metrics.scan_failed();
+            },
+        }
+
+        result
+    }
+
+    async fn scan_and_reconcile_inner(&self) -> DaemonResult<usize> {
         let exchange_positions = self.exchange.get_all_open_positions().await?;
         let mut reconciled = 0usize;
 
@@ -1058,9 +1085,19 @@ mod tests {
         event_bus: Arc<EventBus>,
         missing_grace: Duration,
     ) -> ReconciliationWorker<StubExchange, MemoryStore> {
+        create_worker_with_metrics(exchange, store, event_bus, missing_grace).0
+    }
+
+    fn create_worker_with_metrics(
+        exchange: Arc<StubExchange>,
+        store: Arc<MemoryStore>,
+        event_bus: Arc<EventBus>,
+        missing_grace: Duration,
+    ) -> (ReconciliationWorker<StubExchange, MemoryStore>, ReconciliationMetrics) {
         let position_manager =
             create_position_manager(exchange.clone(), store.clone(), event_bus.clone());
-        ReconciliationWorker::new_with_missing_grace(
+        let metrics = ReconciliationMetrics::unregistered();
+        let worker = ReconciliationWorker::new_with_missing_grace(
             exchange,
             position_manager,
             store,
@@ -1069,6 +1106,8 @@ mod tests {
             missing_grace,
             CancellationToken::new(),
         )
+        .with_metrics(metrics.clone());
+        (worker, metrics)
     }
 
     fn tracked_active_position(symbol: Symbol, side: Side) -> Position {
@@ -1193,6 +1232,51 @@ mod tests {
             exit_reason: ExitReason::TrailingStop,
         };
         store.positions().save(&position).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_completed_scan_updates_reconciliation_liveness_metrics() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let (worker, metrics) =
+            create_worker_with_metrics(exchange, store, event_bus, Duration::from_secs(0));
+
+        assert_eq!(metrics.completed_count(), 0.0);
+        assert_eq!(metrics.error_count(), 0.0);
+        assert_eq!(metrics.scan_in_progress(), 0.0);
+        assert_eq!(metrics.last_attempt_timestamp_seconds(), 0.0);
+        assert_eq!(metrics.last_completed_timestamp_seconds(), 0.0);
+
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
+
+        assert_eq!(metrics.completed_count(), 1.0);
+        assert_eq!(metrics.error_count(), 0.0);
+        assert_eq!(metrics.scan_in_progress(), 0.0);
+        assert!(metrics.last_attempt_timestamp_seconds() > 0.0);
+        assert!(metrics.last_completed_timestamp_seconds() > 0.0);
+    }
+
+    #[tokio::test]
+    async fn test_failed_scan_increments_error_and_preserves_last_completed_metric() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let (worker, metrics) =
+            create_worker_with_metrics(exchange.clone(), store, event_bus, Duration::from_secs(0));
+
+        // Seed the state left by an earlier completed scan. A failing scan
+        // must preserve this heartbeat rather than advancing or clearing it.
+        metrics.scan_completed(1);
+        exchange.set_fail_next(true);
+
+        assert!(worker.scan_and_reconcile().await.is_err());
+
+        assert_eq!(metrics.completed_count(), 1.0);
+        assert_eq!(metrics.error_count(), 1.0);
+        assert_eq!(metrics.scan_in_progress(), 0.0);
+        assert!(metrics.last_attempt_timestamp_seconds() > 0.0);
+        assert_eq!(metrics.last_completed_timestamp_seconds(), 1.0);
     }
 
     #[tokio::test]
