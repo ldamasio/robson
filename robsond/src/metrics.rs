@@ -6,6 +6,7 @@
 //! - `robsond_orders_total` — exchange orders placed (entry + exit)
 //! - `robsond_risk_denials_total` — risk gate rejections, labelled by check
 //! - `robsond_position_pnl` — realized PnL per closed position
+//! - `robsond_safety_net_polls_total` — Safety Net poll attempts
 //! - `robsond_active_positions` — currently open position count
 //! - `robsond_stale_active_positions` — open book positions missing on exchange
 //! - `robsond_monthly_halt_active` — MonthlyHalt circuit breaker (0 or 1)

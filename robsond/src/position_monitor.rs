@@ -1134,6 +1134,18 @@ mod tests {
         ));
         let handle = Arc::clone(&monitor).start();
 
+        // The interval intentionally polls once immediately at startup. Wait
+        // for that baseline before flooding the bus so this regression proves
+        // a *subsequent* scheduled tick is not starved.
+        for _ in 0..20 {
+            if monitor.poll_count() > 0 {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        let baseline_poll_count = monitor.poll_count();
+        assert!(baseline_poll_count > 0, "startup poll did not run");
+
         // Saturate the bus the way the live market feed does.
         let flood_bus = Arc::clone(&event_bus);
         let flooder = tokio::spawn(async move {
@@ -1149,10 +1161,10 @@ mod tests {
             }
         });
 
-        let mut polled = false;
+        let mut recurring_poll_ran = false;
         for _ in 0..30 {
-            if monitor.poll_count() > 0 {
-                polled = true;
+            if monitor.poll_count() > baseline_poll_count {
+                recurring_poll_ran = true;
                 break;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -1162,8 +1174,8 @@ mod tests {
         handle.abort();
 
         assert!(
-            polled,
-            "poll never ran in 3s with a 1s period: the event bus is starving the timer"
+            recurring_poll_ran,
+            "recurring poll never ran in 3s with a 1s period: the event bus is starving the timer"
         );
     }
 
