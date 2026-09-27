@@ -139,6 +139,102 @@ pub static RECONCILIATION_LAST_COMPLETED_TIMESTAMP_SECONDS: LazyLock<Gauge> = La
     .expect("failed to register robsond_reconciliation_last_completed_timestamp_seconds")
 });
 
+/// Metric handles used by one reconciliation worker.
+///
+/// Production instances clone the registered global collectors. Tests inject
+/// unregistered collectors so parallel workers cannot satisfy each other's
+/// assertions or overwrite each other's gauges.
+#[derive(Clone)]
+pub(crate) struct ReconciliationMetrics {
+    scans: CounterVec,
+    scan_in_progress: Gauge,
+    last_attempt_timestamp_seconds: Gauge,
+    last_completed_timestamp_seconds: Gauge,
+}
+
+impl ReconciliationMetrics {
+    pub(crate) fn global() -> Self {
+        Self {
+            scans: (*RECONCILIATION_SCANS).clone(),
+            scan_in_progress: (*RECONCILIATION_SCAN_IN_PROGRESS).clone(),
+            last_attempt_timestamp_seconds: (*RECONCILIATION_LAST_ATTEMPT_TIMESTAMP_SECONDS)
+                .clone(),
+            last_completed_timestamp_seconds: (*RECONCILIATION_LAST_COMPLETED_TIMESTAMP_SECONDS)
+                .clone(),
+        }
+    }
+
+    pub(crate) fn scan_started(&self, timestamp_seconds: i64) {
+        self.scan_in_progress.set(1.0);
+        self.last_attempt_timestamp_seconds.set(timestamp_seconds as f64);
+    }
+
+    pub(crate) fn scan_completed(&self, timestamp_seconds: i64) {
+        self.scan_in_progress.set(0.0);
+        self.scans.with_label_values(&["completed"]).inc();
+        self.last_completed_timestamp_seconds.set(timestamp_seconds as f64);
+    }
+
+    pub(crate) fn scan_failed(&self) {
+        self.scan_in_progress.set(0.0);
+        self.scans.with_label_values(&["error"]).inc();
+    }
+
+    #[cfg(test)]
+    pub(crate) fn unregistered() -> Self {
+        Self {
+            scans: CounterVec::new(
+                prometheus::Opts::new(
+                    "test_reconciliation_scans_total",
+                    "Test reconciliation scans by result",
+                ),
+                &["result"],
+            )
+            .expect("test reconciliation counter must be valid"),
+            scan_in_progress: Gauge::new(
+                "test_reconciliation_scan_in_progress",
+                "Test reconciliation scan in progress",
+            )
+            .expect("test reconciliation in-progress gauge must be valid"),
+            last_attempt_timestamp_seconds: Gauge::new(
+                "test_reconciliation_last_attempt_timestamp_seconds",
+                "Test reconciliation last attempt timestamp",
+            )
+            .expect("test reconciliation last-attempt gauge must be valid"),
+            last_completed_timestamp_seconds: Gauge::new(
+                "test_reconciliation_last_completed_timestamp_seconds",
+                "Test reconciliation last completed timestamp",
+            )
+            .expect("test reconciliation last-completed gauge must be valid"),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn completed_count(&self) -> f64 {
+        self.scans.with_label_values(&["completed"]).get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn error_count(&self) -> f64 {
+        self.scans.with_label_values(&["error"]).get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn scan_in_progress(&self) -> f64 {
+        self.scan_in_progress.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_attempt_timestamp_seconds(&self) -> f64 {
+        self.last_attempt_timestamp_seconds.get()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn last_completed_timestamp_seconds(&self) -> f64 {
+        self.last_completed_timestamp_seconds.get()
+    }
+}
+
 /// MonthlyHalt circuit breaker state (0 = normal, 1 = halted).
 pub static MONTHLY_HALT_ACTIVE: LazyLock<Gauge> = LazyLock::new(|| {
     register_gauge!(
@@ -272,6 +368,19 @@ pub fn render() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reconciliation_metric_family_is_registered() {
+        let metrics = ReconciliationMetrics::global();
+        metrics.scans.with_label_values(&["completed"]);
+        metrics.scans.with_label_values(&["error"]);
+
+        let rendered = render();
+        assert!(rendered.contains("robsond_reconciliation_scans_total"));
+        assert!(rendered.contains("robsond_reconciliation_scan_in_progress"));
+        assert!(rendered.contains("robsond_reconciliation_last_attempt_timestamp_seconds"));
+        assert!(rendered.contains("robsond_reconciliation_last_completed_timestamp_seconds"));
+    }
 
     #[test]
     fn sse_connection_guard_increments_on_create_decrements_on_drop() {

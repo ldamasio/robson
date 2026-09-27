@@ -13,7 +13,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bounded-cardinality Prometheus signals for completed/error outcomes, an
   in-progress gauge, and last-attempt/last-completed timestamps. This makes a
   stopped, hung, or repeatedly failing ADR-0022 worker externally observable
-  without relying on the superseded fixed-percentage PositionMonitor.
+  without inferring its health from unrelated PositionMonitor activity.
 - A `completed` scan means the worker returned successfully at its top-level
   boundary; it deliberately does not claim that every best-effort maintenance
   substep succeeded.
