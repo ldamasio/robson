@@ -170,14 +170,14 @@ impl ReconciliationMetrics {
     }
 
     pub(crate) fn scan_completed(&self, timestamp_seconds: i64) {
-        self.scan_in_progress.set(0.0);
         self.scans.with_label_values(&["completed"]).inc();
         self.last_completed_timestamp_seconds.set(timestamp_seconds as f64);
+        self.scan_in_progress.set(0.0);
     }
 
     pub(crate) fn scan_failed(&self) {
-        self.scan_in_progress.set(0.0);
         self.scans.with_label_values(&["error"]).inc();
+        self.scan_in_progress.set(0.0);
     }
 
     #[cfg(test)]
