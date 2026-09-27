@@ -69,8 +69,7 @@ pub struct Position {
     /// held in `PositionState::Active` so the reconciliation worker can read it
     /// without a state match.
     pub insurance_stop_id: Option<String>,
-    /// Binance exchange identifier captured on entry fill for Core/SafetyNet
-    /// coordination.
+    /// Binance exchange identifier captured on entry fill for reconciliation.
     pub binance_position_id: Option<String>,
 
     /// Stop-policy version pinned at arm time (issue #154). Missing on wire

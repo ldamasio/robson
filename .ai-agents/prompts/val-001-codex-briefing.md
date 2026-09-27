@@ -12,15 +12,17 @@ Architecture: hexagonal, event-sourced, single control loop. The Rust daemon (`r
 execution authority — every order passes through a blocking Risk Engine via a `GovernedAction` token
 before reaching the exchange.
 
-**Repository**: `/home/psyctl/apps/robson`
+**Repository**: the current Robson workspace
 **Runtime crate**: `robsond/src/`
 **Key source files**:
 - `robsond/src/position_manager.rs` — state machine, signal processing, fill handling
 - `robsond/src/api.rs` — HTTP routes (arm, signal, disarm, panic)
 - `robsond/src/market_data.rs` — WebSocket tick handling
-- `robsond/src/position_monitor.rs` — trailing stop tracking
+- `robson-engine/src/lib.rs` — chart-derived trailing-stop decisions and
+  `position_monitor_tick` audit events
 - `robsond/src/query_engine.rs` — GovernedAction + Risk Engine gate
 - `robsond/src/detector.rs` — signal detection
+- `robsond/src/reconciliation_worker.rs` — unconditional UNTRACKED-position enforcement
 
 **Canonical rules**: read `AGENTS.md` and `docs/architecture/v3-migration-plan.md` first.
 **English only** in all output — code, comments, reports.
@@ -29,9 +31,10 @@ before reaching the exchange.
 
 ## Critical Constraint
 
-**Do NOT push to `main` or any branch that triggers a CI build for `robsond` during GLM's execution.**
-The deployed testnet image is `sha-88242685`. A rebuild mid-run invalidates the validation.
-All code analysis in this session is read-only unless explicitly instructed otherwise.
+Before Phase 1, record the testnet Deployment image, pod UID, and restart count.
+Do not deploy, restart, or trigger an image rollout during GLM's execution. A
+runtime change mid-run invalidates the validation. All code analysis in this
+session is read-only unless explicitly instructed otherwise.
 
 ---
 
@@ -47,13 +50,16 @@ before GLM executes it. Give GLM actionable warnings.
 **Read these files** (in order):
 1. `robsond/src/api.rs` — arm handler, signal handler, disarm handler
 2. `robsond/src/position_manager.rs` — `arm_position()`, `execute_signal_query()`, `process_market_data()`
-3. `robsond/src/position_monitor.rs` — trailing stop tick processing
+3. `robson-engine/src/lib.rs` — trailing-stop tick processing and
+   `position_monitor_tick` emission
 4. `robsond/src/query_engine.rs` — `GovernedAction` creation, approval gate, `cycle_id` injection
 
 **For each phase of the E2E cycle, answer**:
 - Is there any known error path that would silently fail without returning an HTTP error?
-- Is `cycle_id` guaranteed to be set on `entry_order_placed` and `exit_order_placed` events?
-- Is there any condition where the position monitor would NOT emit trailing stop updates on ticks?
+- Is `cycle_id` guaranteed to be set on the current `entry_order_accepted` and
+  `exit_order_placed` events?
+- Is there any condition where the trailing engine would not emit its
+  `position_monitor_tick` audit event or advance the stop on eligible ticks?
 - Are there any timeout or retry limits GLM should know about?
 - Is there any known issue with signal injection when `capital = 100` USDT?
 
@@ -75,27 +81,32 @@ RECOMMENDED ACTIONS FOR GLM: <list or NONE>
 
 ---
 
-### Task B1 — Write VAL-002 Runbook (run in parallel while GLM executes Phases 1–5)
+### Task B1 — Audit VAL-002 Runbook (run in parallel while GLM executes Phases 1–5)
 
-**Objective**: create `docs/runbooks/val-002-real-capital-activation.md`.
+**Objective**: review the existing
+`docs/runbooks/val-002-real-capital-activation.md` against current code and
+infrastructure. Do not create or rotate credentials during this audit.
 
 **This runbook covers the 4-step blocking sequence after VAL-001 PASS**:
 
-1. Create Binance real API keys in `pass`: `rbx/robson-v2/binance-api-key` and `rbx/robson-v2/binance-api-secret`
-2. Update Ansible defaults: change `pass_robson_v2_testnet_binance_api_key` from `rbx/robson-v2-testnet/` to `rbx/robson-v2/` and re-run Ansible
-3. Verify prod daemon connects to `api.binance.com` (not testnet) with the real keys
-4. Enable `ROBSON_POSITION_MONITOR_ENABLED: "true"` in `apps/prod/robson/robsond-config.yml` → push → ArgoCD auto-sync → verify
+1. Verify the canonical `rbx/robson/binance-api-key` and
+   `rbx/robson/binance-api-secret` entries exist without printing their values.
+2. Verify current `rbx-infra` Ansible variables and paths directly; never infer
+   them from old `robson-v2` names.
+3. Verify the production daemon selects `Exchange: Binance (production)` and
+   that `ROBSON_BINANCE_USE_TESTNET` is absent or not true. The USD-M connector
+   uses `fapi.binance.com`, but the URL is not emitted in startup logs.
+4. Keep the infrastructure rollback guard
+   `ROBSON_POSITION_MONITOR_ENABLED: "false"`, roll out the reviewed immutable
+   image through GitOps, verify both retired `/safety/*` routes return `404`, and
+   verify reconciliation-worker liveness. The current application does not parse
+   the legacy flag; never enable it.
 
-**Format**: follow the exact runbook template from `docs/runbooks/README.md`.
-
-**Include**:
-- Run Log header (same anti-abandonment pattern as VAL-001)
-- Prerequisites: VAL-001 PASS required, real Binance keys available, Ansible access
-- A "Safety checks before flip" section: verify prod namespace has NO active positions before enabling monitor
-- Abort criteria: if prod connects to testnet endpoint after Ansible run, rollback immediately
-- Related docs: link VAL-001, `docs/architecture/v3-migration-plan.md`, Ansible role path in `rbx-infra`
-
-**Do not** speculate about the Ansible role internals — reference `rbx-infra/bootstrap/ansible/` as the path and note that the exact variable names must be verified against the current role.
+Confirm the runbook keeps repository-verified state separate from operational
+rollout evidence, requires a flat account before any change, and validates the
+exact immutable image plus reconciliation liveness after rollout. Report any
+stale command or unsafe secret-handling instruction; do not execute VAL-002 as
+part of this audit.
 
 ---
 
@@ -118,13 +129,15 @@ WHERE stream_key = 'position:<POSITION_ID>' ORDER BY sequence;
 
 **After Phase 2 (SIGNAL)**:
 ```sql
-SELECT event_type, payload->>'cycle_id' AS cycle_id, timestamp
+SELECT event_type,
+       payload->>'cycle_id' AS cycle_id,
+       payload->>'exchange_order_id' AS exchange_order_id,
+       timestamp
 FROM event_log
 WHERE stream_key = 'position:<POSITION_ID>' ORDER BY sequence;
--- Verify: entry_signal_received AND entry_order_placed both present
--- Note: cycle_id may be null in payload (known gap — GovernedAction token is not serialized
---   to EventLog in current implementation). Absence is NOT a FAIL for VAL-001; record as
---   follow-up item "cycle_id serialization to EventLog" in your final report.
+-- Verify: technical_stop_analyzed, entry_signal_received,
+-- entry_order_requested, and entry_order_accepted are present.
+-- Require a non-null cycle_id and exchange_order_id on entry_order_accepted.
 ```
 
 **After Phase 3 (FILL)**:
@@ -132,9 +145,10 @@ WHERE stream_key = 'position:<POSITION_ID>' ORDER BY sequence;
 SELECT event_type, payload->>'fill_price', payload->>'entry_price', timestamp
 FROM event_log
 WHERE stream_key = 'position:<POSITION_ID>'
-  AND event_type IN ('entry_filled', 'position_active')
+  AND event_type IN ('entry_signal_received', 'entry_filled')
 ORDER BY sequence;
--- Verify: entry_filled present, fill_price within 1% of entry_price
+-- Verify: entry_filled present; compare its fill_price with the
+-- entry_signal_received entry_price and confirm GET /positions/:id is Active.
 ```
 
 **After Phase 4 (TRAILING STOP)**:
@@ -142,23 +156,24 @@ ORDER BY sequence;
 SELECT event_type, payload, timestamp
 FROM event_log
 WHERE stream_key = 'position:<POSITION_ID>'
-  AND event_type ILIKE '%stop%'
+  AND event_type IN ('position_monitor_tick', 'trailing_stop_updated')
 ORDER BY sequence;
--- Note: trailing_stop_updated events only emit after a full favorable price span.
--- On a short testnet run, zero such events is acceptable.
--- Primary evidence for Phase 4 is GLM's log output showing ticks processed.
--- If events ARE present: verify stop value is increasing (long position). Record count.
+-- position_monitor_tick is a current robson-engine event despite its historical name;
+-- it is unrelated to the removed fixed-percentage PositionMonitor module.
+-- Require at least 3 position_monitor_tick rows and verify high_watermark is
+-- non-decreasing for a long. trailing_stop_updated remains optional on a short run
+-- because it emits only after a full favorable span.
 ```
 
 **After Phase 5 (EXIT)**:
 ```sql
-SELECT event_type, payload->>'cycle_id', payload->>'pnl', timestamp
+SELECT event_type, payload->>'cycle_id', payload->>'realized_pnl', timestamp
 FROM event_log
 WHERE stream_key = 'position:<POSITION_ID>'
 ORDER BY sequence;
 -- Verify full sequence present (see runbook)
 -- Verify: exit_order_placed has cycle_id
--- Verify: position_closed has pnl field with numeric value
+-- Verify: position_closed has a numeric realized_pnl field
 ```
 
 **At each phase, output**:
@@ -177,7 +192,7 @@ AUDIT PHASE <N>: PASS | FAIL
 After Phase 5 audit, write the PASS/FAIL verdict in the VAL-001 Run Log:
 
 ```
-File: /home/psyctl/apps/robson/docs/runbooks/val-001-testnet-e2e-validation.md
+File: docs/runbooks/val-001-testnet-e2e-validation.md
 
 Run Log entry:
 | <date> | GLM + Codex | ✅ PASS / ❌ FAIL | <one-line summary including POSITION_ID> |
@@ -187,5 +202,5 @@ Then report to the PO (Claude):
 1. Verdict: PASS or FAIL
 2. Full event sequence found (list all event_types in order)
 3. Any governance gap detected (missing cycle_id, bypassed Risk Engine)
-4. VAL-002 runbook status (created / blocked)
+4. VAL-002 runbook audit status (clear / findings / blocked)
 5. Any code issues found in B3 that should become follow-up tasks

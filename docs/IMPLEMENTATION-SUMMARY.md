@@ -1,7 +1,13 @@
 # Phase 9-10 Implementation Summary
 
+> **Historical v2 record — do not execute as a current deployment guide.** This
+> document records the repository state and conclusions reached on 2026-02-14.
+> ADR-0014 is superseded, and its fixed-percentage Safety Net implementation has
+> since been removed. Use the current architecture documents and VAL runbooks.
+
 **Date**: 2026-02-14  
-**Status**: Implementation Complete - Ready for Manual Deployment  
+**Historical Status**: Implementation Complete - Ready for Manual Deployment
+
 **Agent Model**: Cursor Sonnet 4.5
 
 ---

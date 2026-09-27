@@ -62,7 +62,8 @@ pub trait PositionRepository: Send + Sync {
     /// Find active Core Trading position by symbol and side.
     ///
     /// Returns Some(position) if found in Entering, Active, or Exiting state.
-    /// Used by Safety Net to exclude Core-managed positions.
+    /// Used by exchange reconciliation to match locally tracked exposure by
+    /// `(symbol, side)`.
     async fn find_active_by_symbol_and_side(
         &self,
         symbol: &robson_domain::Symbol,

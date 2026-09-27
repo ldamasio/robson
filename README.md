@@ -113,7 +113,6 @@ POST /queries/{id}/approve            # Approve a pending human-confirmation que
 GET  /monthly-halt                    # Monthly halt status
 POST /monthly-halt                    # Trigger halt manually (kill switch)
 POST /panic                           # Emergency close all open positions
-GET  /safety/status                   # Legacy compatibility status (disabled)
 GET  /events/history?date=YYYY-MM-DD  # Latest 100 durable events for a UTC day (bearer header)
 GET  /events                          # SSE event stream (bearer header)
 ```

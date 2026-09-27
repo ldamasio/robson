@@ -31,10 +31,8 @@ pub struct Config {
     /// Market data WebSocket configuration
     pub market_data: MarketDataConfig,
 
-    /// Legacy PositionMonitor compatibility settings. The daemon no longer
-    /// starts that runtime path; its Binance credentials still feed the
-    /// primary exchange adapter during the staged cleanup.
-    pub position_monitor: PositionMonitorConfig,
+    /// Binance exchange credentials.
+    pub binance: BinanceConfig,
 
     /// Reconciliation worker configuration.
     pub reconciliation: ReconciliationConfig,
@@ -209,35 +207,21 @@ impl Default for MarketDataConfig {
     }
 }
 
-/// Legacy fixed-percentage PositionMonitor configuration.
-///
-/// The executable monitor wiring is retired. These fields remain loadable for
-/// environment compatibility, and the Binance credentials are still consumed
-/// by `main` when constructing the primary exchange adapter.
-#[derive(Debug, Clone)]
-pub struct PositionMonitorConfig {
-    /// Legacy enable flag. Loaded for compatibility, but ignored by the daemon
-    /// runtime and never allowed to block startup.
-    pub enabled: bool,
-    /// Legacy polling interval in seconds.
-    pub poll_interval_secs: u64,
-    /// Legacy monitor symbols (e.g., ["BTCUSDT", "ETHUSDT"]).
-    pub symbols: Vec<String>,
+/// Binance exchange configuration.
+#[derive(Clone, Default)]
+pub struct BinanceConfig {
     /// Binance API key used by the primary exchange adapter.
-    pub binance_api_key: Option<String>,
+    pub api_key: Option<String>,
     /// Binance API secret used by the primary exchange adapter.
-    pub binance_api_secret: Option<String>,
+    pub api_secret: Option<String>,
 }
 
-impl Default for PositionMonitorConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            poll_interval_secs: 20,
-            symbols: vec![],
-            binance_api_key: None,
-            binance_api_secret: None,
-        }
+impl std::fmt::Debug for BinanceConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("BinanceConfig")
+            .field("api_key_configured", &self.api_key.is_some())
+            .field("api_secret_configured", &self.api_secret.is_some())
+            .finish()
     }
 }
 
@@ -334,7 +318,7 @@ impl Config {
         let tech_stop = Self::load_tech_stop_config()?;
         let projection = Self::load_projection_config()?;
         let market_data = Self::load_market_data_config()?;
-        let position_monitor = Self::load_position_monitor_config()?;
+        let binance = Self::load_binance_config();
         let reconciliation = Self::load_reconciliation_config()?;
         let funding = Self::load_funding_config()?;
 
@@ -360,7 +344,7 @@ impl Config {
             tech_stop,
             projection,
             market_data,
-            position_monitor,
+            binance,
             reconciliation,
             funding,
             environment,
@@ -404,13 +388,7 @@ impl Config {
                 symbols: vec!["BTCUSDT".to_string()],
                 ws_endpoints: vec![],
             },
-            position_monitor: PositionMonitorConfig {
-                enabled: false, // Disabled in tests
-                poll_interval_secs: 1,
-                symbols: vec!["BTCUSDT".to_string()],
-                binance_api_key: None,
-                binance_api_secret: None,
-            },
+            binance: BinanceConfig::default(),
             reconciliation: ReconciliationConfig {
                 interval_secs: 1,
                 missing_grace_secs: 60,
@@ -729,44 +707,17 @@ impl Config {
         Ok(endpoints)
     }
 
-    fn load_position_monitor_config() -> DaemonResult<PositionMonitorConfig> {
-        // Legacy values remain observable during staged compatibility cleanup,
-        // but must not block startup now that no monitor runtime consumes them.
-        let enabled = env::var("ROBSON_POSITION_MONITOR_ENABLED")
-            .ok()
-            .and_then(|v| v.parse::<bool>().ok())
-            .unwrap_or(false);
-
-        // Invalid legacy polling values fall back instead of blocking the
-        // primary exchange adapter and unconditional reconciliation worker.
-        let poll_interval_str =
-            env::var("ROBSON_POSITION_MONITOR_POLL_INTERVAL").unwrap_or_else(|_| "20".to_string());
-        let poll_interval_secs = poll_interval_str.parse::<u64>().unwrap_or(20);
-
-        // Symbols to monitor
-        let symbols_str = env::var("ROBSON_POSITION_MONITOR_SYMBOLS").unwrap_or_default();
-        let symbols: Vec<String> = symbols_str
-            .split(',')
-            .map(|s| s.trim().to_uppercase())
-            .filter(|s| !s.is_empty())
-            .collect();
-
-        let binance_api_key = env::var("ROBSON_BINANCE_API_KEY")
+    fn load_binance_config() -> BinanceConfig {
+        let api_key = env::var("ROBSON_BINANCE_API_KEY")
             .ok()
             .or_else(|| env::var("BINANCE_API_KEY").ok())
             .filter(|v| !v.trim().is_empty());
-        let binance_api_secret = env::var("ROBSON_BINANCE_API_SECRET")
+        let api_secret = env::var("ROBSON_BINANCE_API_SECRET")
             .ok()
             .or_else(|| env::var("BINANCE_API_SECRET").ok())
             .filter(|v| !v.trim().is_empty());
 
-        Ok(PositionMonitorConfig {
-            enabled,
-            poll_interval_secs,
-            symbols,
-            binance_api_key,
-            binance_api_secret,
-        })
+        BinanceConfig { api_key, api_secret }
     }
 
     fn load_reconciliation_config() -> DaemonResult<ReconciliationConfig> {
@@ -842,7 +793,7 @@ impl Default for Config {
                 poll_interval_ms: 100,
             },
             market_data: MarketDataConfig::default(),
-            position_monitor: PositionMonitorConfig::default(),
+            binance: BinanceConfig::default(),
             reconciliation: ReconciliationConfig::default(),
             funding: FundingConfig::default(),
             environment: Environment::Development,
@@ -918,8 +869,8 @@ mod tests {
         assert_eq!(config.tech_stop.lookback_candles, 100);
         assert!(config.market_data.symbols.is_empty());
         assert!(config.market_data.ws_endpoints.is_empty());
-        assert!(!config.position_monitor.enabled);
-        assert!(config.position_monitor.symbols.is_empty());
+        assert!(config.binance.api_key.is_none());
+        assert!(config.binance.api_secret.is_none());
         assert_eq!(config.reconciliation.interval_secs, 60);
         assert_eq!(config.reconciliation.missing_grace_secs, 60);
         assert_eq!(config.reconciliation.on_startup_stale_active, StartupStaleActivePolicy::Abort);
@@ -995,7 +946,6 @@ mod tests {
         let _env = EnvGuard::new(&[
             ("ROBSON_ENV", Some("production")),
             ("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT")),
-            ("ROBSON_POSITION_MONITOR_ENABLED", Some("false")),
             ("ROBSON_ALLOWED_EMAIL", None),
             ("ROBSON_GOOGLE_WEB_CLIENT_ID", Some("web-client-id")),
         ]);
@@ -1013,7 +963,6 @@ mod tests {
         let _env = EnvGuard::new(&[
             ("ROBSON_ENV", Some("production")),
             ("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT")),
-            ("ROBSON_POSITION_MONITOR_ENABLED", Some("false")),
             ("ROBSON_ALLOWED_EMAIL", Some("ldamasio@gmail.com")),
             ("ROBSON_GOOGLE_WEB_CLIENT_ID", None),
             ("ROBSON_GOOGLE_CLI_CLIENT_ID", None),
@@ -1089,51 +1038,49 @@ mod tests {
     }
 
     #[test]
-    fn test_legacy_monitor_settings_do_not_block_primary_runtime() {
+    fn test_binance_config_prefers_canonical_credentials() {
         let _lock = env_lock().lock().unwrap();
         let _env = EnvGuard::new(&[
-            ("ROBSON_POSITION_MONITOR_ENABLED", Some("true")),
-            ("ROBSON_POSITION_MONITOR_SYMBOLS", Some("")),
-            ("ROBSON_POSITION_MONITOR_POLL_INTERVAL", Some("invalid")),
-        ]);
-
-        let config = Config::load_position_monitor_config().unwrap();
-        assert!(config.enabled);
-        assert!(config.symbols.is_empty());
-        assert_eq!(config.poll_interval_secs, 20);
-    }
-
-    #[test]
-    fn test_load_position_monitor_config_allows_empty_symbols_when_disabled() {
-        let _lock = env_lock().lock().unwrap();
-        let _env = EnvGuard::new(&[
-            ("ROBSON_POSITION_MONITOR_ENABLED", Some("false")),
-            ("ROBSON_POSITION_MONITOR_SYMBOLS", Some("")),
-        ]);
-
-        let config = Config::load_position_monitor_config().unwrap();
-        assert!(!config.enabled);
-        assert!(config.symbols.is_empty());
-    }
-
-    #[test]
-    fn test_disabled_legacy_monitor_still_loads_primary_binance_credentials() {
-        let _lock = env_lock().lock().unwrap();
-        let _env = EnvGuard::new(&[
-            ("ROBSON_POSITION_MONITOR_ENABLED", Some("false")),
-            ("ROBSON_POSITION_MONITOR_SYMBOLS", Some("")),
             ("ROBSON_BINANCE_API_KEY", Some("canonical-test-key")),
             ("ROBSON_BINANCE_API_SECRET", Some("canonical-test-secret")),
             ("BINANCE_API_KEY", Some("fallback-test-key")),
             ("BINANCE_API_SECRET", Some("fallback-test-secret")),
         ]);
 
-        let config = Config::load_position_monitor_config().unwrap();
+        let config = Config::load_binance_config();
 
-        assert!(!config.enabled);
-        assert!(config.symbols.is_empty());
-        assert_eq!(config.binance_api_key.as_deref(), Some("canonical-test-key"));
-        assert_eq!(config.binance_api_secret.as_deref(), Some("canonical-test-secret"));
+        assert_eq!(config.api_key.as_deref(), Some("canonical-test-key"));
+        assert_eq!(config.api_secret.as_deref(), Some("canonical-test-secret"));
+    }
+
+    #[test]
+    fn test_binance_config_loads_fallback_credentials() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_BINANCE_API_KEY", None),
+            ("ROBSON_BINANCE_API_SECRET", None),
+            ("BINANCE_API_KEY", Some("fallback-test-key")),
+            ("BINANCE_API_SECRET", Some("fallback-test-secret")),
+        ]);
+
+        let config = Config::load_binance_config();
+
+        assert_eq!(config.api_key.as_deref(), Some("fallback-test-key"));
+        assert_eq!(config.api_secret.as_deref(), Some("fallback-test-secret"));
+    }
+
+    #[test]
+    fn test_binance_config_debug_redacts_credentials() {
+        let config = BinanceConfig {
+            api_key: Some("do-not-log-key".to_string()),
+            api_secret: Some("do-not-log-secret".to_string()),
+        };
+
+        let rendered = format!("{config:?}");
+        assert!(!rendered.contains("do-not-log-key"));
+        assert!(!rendered.contains("do-not-log-secret"));
+        assert!(rendered.contains("api_key_configured: true"));
+        assert!(rendered.contains("api_secret_configured: true"));
     }
 
     #[test]

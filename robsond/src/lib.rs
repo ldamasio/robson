@@ -55,7 +55,6 @@ pub mod google_jwks;
 pub mod market_data;
 pub mod metrics;
 pub mod position_manager;
-pub mod position_monitor;
 pub mod query;
 pub mod query_engine;
 pub mod reconciliation_worker;
@@ -77,8 +76,8 @@ pub use binance_exchange::BinanceExchangeAdapter;
 pub use binance_ohlcv::BinanceOhlcvAdapter;
 pub use circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot};
 pub use config::{
-    ApiConfig, Config, EngineConfig, Environment, FundingConfig, MarketDataConfig,
-    PositionMonitorConfig, ProjectionConfig, ReconciliationConfig, StartupStaleActivePolicy,
+    ApiConfig, BinanceConfig, Config, EngineConfig, Environment, FundingConfig, MarketDataConfig,
+    ProjectionConfig, ReconciliationConfig, StartupStaleActivePolicy,
 };
 pub use daemon::Daemon;
 pub use detector::{DetectorConfig, DetectorTask};
@@ -88,9 +87,6 @@ pub use google_jwks::GoogleJwksCache;
 #[cfg(feature = "postgres")]
 pub use income_ledger::IncomeLedgerWorker;
 pub use position_manager::PositionManager;
-// Legacy compatibility exports. The daemon no longer wires this monitor into
-// the runtime; remove these with the remaining fixed-stop implementation.
-pub use position_monitor::{MonitorError, PositionMonitor, PositionMonitorConfig as MonitorConfig};
 // Query engine re-exports
 pub use query::{
     ActionClass, ActorKind, ApprovalRequirement, CommandSource, ContextSummary, ExecutionQuery,

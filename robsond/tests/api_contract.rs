@@ -574,35 +574,17 @@ async fn test_approve_nonexistent_query_returns_404() {
 }
 
 // =============================================================================
-// Safety net
+// Retired legacy safety net
 // =============================================================================
 
 #[tokio::test]
-async fn test_safety_status_returns_disabled_in_stub_mode() {
+async fn test_legacy_safety_routes_are_removed() {
     let (base, _) = start_test_server().await;
 
-    let resp = client().get(format!("{}/safety/status", base)).send().await.unwrap();
-
-    assert_eq!(resp.status(), 200);
-    let body: api::SafetyStatusResponse = resp.json().await.unwrap();
-    assert!(!body.enabled, "legacy safety net must remain disabled");
-    assert!(body.symbols.is_empty());
-    assert_eq!(body.poll_interval_secs, 0);
-    assert!(body.tracked_positions.is_empty());
-    assert_eq!(body.pending_executions, 0);
-}
-
-#[tokio::test]
-async fn test_safety_test_preserves_disabled_compatibility_contract() {
-    let (base, _) = start_test_server().await;
-
-    let resp = client().get(format!("{}/safety/test", base)).send().await.unwrap();
-
-    assert_eq!(resp.status(), 200);
-    let body: Value = resp.json().await.unwrap();
-    assert_eq!(body["success"], false);
-    assert_eq!(body["message"], "Safety net is not enabled.");
-    assert!(body.get("positions").is_none());
+    for path in ["/safety/status", "/safety/test"] {
+        let resp = client().get(format!("{base}{path}")).send().await.unwrap();
+        assert_eq!(resp.status(), 404, "retired route {path} must not be mounted");
+    }
 }
 
 // =============================================================================

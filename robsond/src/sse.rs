@@ -170,22 +170,6 @@ pub(crate) fn map_daemon_event(event: &DaemonEvent) -> Option<PublicSseEvent> {
                 "error": error,
             }),
         )),
-        DaemonEvent::SafetyPanic {
-            position_id,
-            symbol,
-            side,
-            error,
-            consecutive_failures,
-        } => Some(PublicSseEvent::new(
-            "safety.panic",
-            json!({
-                "position_id": position_id,
-                "symbol": symbol,
-                "side": side.to_string().to_lowercase(),
-                "error": error,
-                "consecutive_failures": consecutive_failures,
-            }),
-        )),
         DaemonEvent::MonthlyHaltTriggered { reason, triggered_at } => Some(PublicSseEvent::new(
             "monthly_halt.triggered",
             json!({
@@ -379,16 +363,6 @@ mod tests {
         assert_eq!(orphan_cancelled.payload["symbol"], "BTCUSDT");
         assert_eq!(orphan_cancelled.payload["exchange_order_id"], "STUB-1");
         assert_eq!(orphan_cancelled.payload["client_order_id"], "ins-orphan");
-
-        let safety_panic = map_daemon_event(&DaemonEvent::SafetyPanic {
-            position_id: "BTCUSDT:long".to_string(),
-            symbol: "BTCUSDT".to_string(),
-            side: Side::Long,
-            error: "all retries exhausted".to_string(),
-            consecutive_failures: 5,
-        })
-        .unwrap();
-        assert_eq!(safety_panic.event_type, "safety.panic");
     }
 
     #[test]

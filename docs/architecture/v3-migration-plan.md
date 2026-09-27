@@ -94,7 +94,7 @@ every reference uses a canonical identifier with a prefix:
 - `QE-P5` is NOT a migration step; it is a deferred QueryEngine phase (Context Governance, v3+ with LLM).
 - `Stage N` is a pipeline stage within a single execution tick (e.g., Stage 1: Observe). Not a project milestone.
 
-**Quick status reference** (as of 2026-08-23):
+**Quick status reference** (as of 2026-09-27):
 
 Status rule for this table: code-backed items may be marked done from repository evidence; operational rollout items stay pending unless the repository contains explicit rollout confirmation.
 
@@ -139,7 +139,7 @@ backend for compatibility, but are not release-supported operator actions.
 | QE-P4 | Full Audit & Replay | ✅ Done (2026-04-05) |
 | QE-P5 | Context Governance (LLM) | 🔄 Deferred to MIG-v4#5 — no LLM integration in v3. |
 | VAL-001 | Testnet E2E validation (arm → signal → fill → trailing stop → exit) | ✅ PASS (2026-04-22) — full event sequence `position_armed → position_closed` confirmed, `cycle_id` on all orders, PnL calculated, 0 UNTRACKED. See `docs/runbooks/val-001-testnet-e2e-validation.md` Run Log. |
-| VAL-002 | Real capital activation | Historical PASS (2026-04-22) — sha-9448ce20 ran the now-superseded monitor and observed 0 UNTRACKED in 10 min. Production flag-off is verified through `rbx-infra` PR #325; application runtime-retirement rollout remains pending. See `docs/runbooks/val-002-real-capital-activation.md`. |
+| VAL-002 | Real capital activation | Historical PASS (2026-04-22) — sha-9448ce20 ran the now-superseded monitor and observed 0 UNTRACKED in 10 min. Physical removal of the fixed-percentage monitor and compatibility surfaces is repository-verified. Production flag-off is verified through `rbx-infra` PR #325 as a rollback guard; rollout of the removal image and reconciliation-liveness validation remain pending. See `docs/runbooks/val-002-real-capital-activation.md`. |
 
 ### MIG-v2.5#2 Technical Notes (2026-04-05, validated 2026-04-10)
 
@@ -183,7 +183,7 @@ The chosen mechanism for MIG-v2.5#2 is the **synchronous fail-fast write path**:
 
 **2026-04-05 Session Update**:
 
-6. **Added `entry_signal_received` handler to projector**: The engine emits `EntrySignalReceived` as an audit event during entry signal processing. Previously, the projector had no handler for this event type, which would cause a `MissingHandler` error when `event_log_pool` is configured (fail-fast mode). Added `handle_entry_signal_received()` which acknowledges the event without modifying projection state (it's an audit event, state transition is done by `entry_order_placed`).
+6. **Added `entry_signal_received` handler to projector**: The engine emits `EntrySignalReceived` as an audit event during entry signal processing. Previously, the projector had no handler for this event type, which would cause a `MissingHandler` error when `event_log_pool` is configured (fail-fast mode). Added `handle_entry_signal_received()` which acknowledges the event without modifying projection state (it is an audit event; the Entering transition is performed by `entry_order_accepted`).
 
    **ADR-0052 implementation update (2026-08-04)**: the handler now projects
    the admission-time executable trigger, immutable executable span,
@@ -641,7 +641,6 @@ interface EventStreamMessage {
 - `safety.rogue_position_detected`
 - `safety.exit_executed`
 - `safety.exit_failed`
-- `safety.panic`
 - `system.resync_required`
 
 ### Operator Capabilities

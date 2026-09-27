@@ -154,25 +154,6 @@ export type PanicResponse = {
   count: number;
 };
 
-export type SafetyStatusResponse = {
-  enabled: boolean;
-  symbols: string[];
-  poll_interval_secs: number;
-  tracked_positions: DetectedPosition[];
-  pending_executions: number;
-};
-
-export type DetectedPosition = {
-  id: string;
-  symbol: string;
-  side: string;
-  entry_price: number;
-  quantity: number;
-  stop_price: number;
-  stop_distance_pct: number;
-  detected_at: string;
-};
-
 export type SseEvent = {
   event_id: string;
   event_type: string;
@@ -281,7 +262,11 @@ function getToken(): string | null {
 // once before giving up — this is what lets a long-lived tab keep working
 // without an interruption most of the time. `isRetry` bounds this to a
 // single attempt per call so a persistently-401ing endpoint can't loop.
-async function apiFetch<T>(path: string, init?: RequestInit, isRetry = false): Promise<T> {
+async function apiFetch<T>(
+  path: string,
+  init?: RequestInit,
+  isRetry = false,
+): Promise<T> {
   const token = getToken();
   const headers: Record<string, string> = {
     "Content-Type": "application/json",
@@ -743,8 +728,6 @@ export const robsonApi = {
     }),
 
   panic: () => apiFetch<PanicResponse>("/panic", { method: "POST" }),
-
-  getSafetyStatus: () => apiFetch<SafetyStatusResponse>("/safety/status"),
 
   getFundingQuote: () =>
     apiFetch<FundingQuote>("/funding/quote", { method: "POST" }),

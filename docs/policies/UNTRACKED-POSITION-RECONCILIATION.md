@@ -3,7 +3,7 @@
 **Status**: Active
 **Effective Date**: 2026-04-18
 **Owner**: Risk Engineering / robsond Runtime
-**Version**: 1.4
+**Version**: 1.5
 **Companion ADR**: [ADR-0022 — Robson-Authored Position Invariant](../adr/ADR-0022-robson-authored-position-invariant.md)
 
 ---
@@ -40,9 +40,11 @@ entry order was placed by `robsond` under a `GovernedAction` token.
 - "Open position" = any position, order, or balance delta whose lifecycle is still
   active on the exchange (`NEW`, `PARTIALLY_FILLED`, `FILLED` with open inventory,
   `PLACED` futures position with non-zero size).
-- "Robson-authored" = there exists, in `event_log`, an `entry_order_placed` event
-  (or equivalent v3 event) with a `cycle_id` pointing to a `GovernedAction` cleared by
-  the Risk Engine, whose exchange order id matches the position's originating order.
+- "Robson-authored" = there exists, in `event_log`, a current
+  `entry_order_accepted` event with a `cycle_id` pointing to a
+  `GovernedAction` cleared by the Risk Engine and an `exchange_order_id`
+  matching the position's originating order. The replay-only legacy
+  `entry_order_placed` event is not exchange-ack evidence.
 
 ### I2 — Reconciliation Invariant
 
@@ -332,8 +334,8 @@ synthetic Robson-authored entry history for manual trades.
    against the 1% per-trade rule, has no technical stop, has no span, and is not counted
    in the monthly drawdown calculation. Leaving it open corrupts every subsequent risk
    decision.
-2. **The EventLog is the source of audit truth.** An open position without a matching
-   `entry_order_placed` event breaks replay, reconciliation, and post-mortem analysis.
+2. **The EventLog is the source of audit truth.** An open position without matching
+   `entry_order_accepted` evidence breaks replay, reconciliation, and post-mortem analysis.
 3. **Operator safety.** A human-opened position on the same account silently consumes
    margin and exposure budget that `robsond` assumes is free. Under leverage this
    cascades into unintended liquidations.
@@ -375,11 +377,14 @@ in-process event bus and SSE surface; the daemon logs them, but does not persist
 the required `position_untracked_detected` or `untracked_position_closed`
 events in `event_log`.
 
-The fixed-percentage legacy `PositionMonitor` is not this worker. Its daemon
-runtime wiring is repository-retired, while its physical implementation and
-compatibility artifacts remain pending removal. Production's legacy enable flag
-is disabled by `rbx-infra` PR #325; the application retirement is operationally
-pending until its reviewed image is deployed and the worker metrics are observed.
+The fixed-percentage legacy `PositionMonitor` is not this worker. Its module,
+`DetectedPosition` model, storage adapters, monitor configuration, frontend
+client, and `/safety/*` routes are physically removed in the repository. Applied
+migration files and their legacy tables remain inert schema history. Production's
+legacy enable flag is false through `rbx-infra` PR #325 solely as a rollback
+guard for older images; the current application no longer parses it. Operational
+rollout remains pending until the reviewed removal image is deployed and the
+worker metrics are observed.
 
 ---
 
@@ -388,17 +393,18 @@ pending until its reviewed image is deployed and the worker metrics are observed
 ### Reconciliation Worker Target
 
 The complete policy requires a periodic **Position Reconciliation Worker**
-(recommended interval: 60s, max 300s). It runs unconditionally. The parsed
-legacy setting `ROBSON_POSITION_MONITOR_ENABLED` starts no runtime monitor and
-never gates this worker. The current implementation boundary is stated above;
-the algorithm below is the target where it exceeds that boundary.
+(recommended interval: 60s, max 300s). It runs unconditionally. The former
+`ROBSON_POSITION_MONITOR_ENABLED` application setting has been removed and never
+gates this worker. Its false GitOps value remains only for rollback safety. The
+current implementation boundary is stated above; the algorithm below is the
+target where it exceeds that boundary.
 
 Each cycle:
 
 1. Query Binance for all open positions / non-zero balances across all account types
    (spot, margin isolated, margin cross, futures) — for every symbol, not just tracked
    symbols.
-2. For each open position, look up the matching `entry_order_placed` event in
+2. For each open position, look up the matching `entry_order_accepted` event in
    `event_log` by exchange order id.
 3. If no matching event exists → the position is **UNTRACKED**.
 4. If a matching event exists but it references a different symbol, side, or size
@@ -458,7 +464,8 @@ entries go through:
   `DetectorSignal`
 - `QueryEngine` clears the entry through the Risk Engine
 - Executor places the entry order
-- `event_log` records `entry_order_placed` with the exchange order id
+- `event_log` records `entry_order_requested`, then
+  `entry_order_accepted` with the governed `cycle_id` and exchange order id
 
 ### If The Operator Needs To Experiment
 
@@ -468,7 +475,7 @@ Use an account whose credentials are not loaded by `robsond`. Credentials that e
 ### If An UNTRACKED Position Is Detected
 
 - The reconciliation worker closes it automatically. Do not attempt to "adopt" an
-  UNTRACKED position into the event log. Back-dating an `entry_order_placed` event for
+  UNTRACKED position into the event log. Back-dating an `entry_order_accepted` event for
   a position the operator opened by hand is an audit-integrity violation.
 - Post-incident: investigate how the UNTRACKED position was opened (leaked API key?
   shared account? forgotten script?) and remediate at the source.
@@ -490,7 +497,8 @@ order "looks correct".
 ```python
 # NEVER DO THIS
 event_log.append({
-    "event_type": "entry_order_placed",
+    "event_type": "entry_order_accepted",
+    "cycle_id": "fabricated-governed-cycle",
     "exchange_order_id": "123456",  # order placed manually earlier
     ...
 })
@@ -507,10 +515,11 @@ reconciliation worker ignore an UNTRACKED position is a policy violation.
 
 ### ❌ Disabling The Reconciliation Worker
 
-`ROBSON_POSITION_MONITOR_ENABLED` is a legacy parsed setting whose monitor runtime
-wiring is retired. It does not gate the reconciliation worker. The reconciliation
-worker is always on; tracked positions are protected separately by the core
-chart-derived trailing engine and ADR-0039 insurance stop.
+There is no application setting or feature flag that disables the reconciliation
+worker. The former `ROBSON_POSITION_MONITOR_ENABLED` value is retained as false
+in GitOps only to keep rollback to a legacy-capable image safe. Tracked positions
+are protected separately by the core chart-derived trailing engine and ADR-0039
+insurance stop.
 
 ---
 
@@ -588,6 +597,7 @@ Do not run this command against the current runtime; the endpoint does not exist
 | 1.2 | 2026-05-11 | Added §I3 §E — startup policy and operational status. Reflects Slices 5A/5B1 live, 5B2A merged (refactor), 5B2B planned. | Claude Sonnet 4.6 |
 | 1.3 | 2026-07-02 | Added orphan insurance-order sweep to Enforcement (ADR-0039). | Claude (glm-5.2) |
 | 1.4 | 2026-09-27 | Retired legacy PositionMonitor runtime wiring; documented current Futures `(symbol, side)` matching and the durable I2 audit gap. | Codex |
+| 1.5 | 2026-09-27 | Removed legacy PositionMonitor application artifacts; retained applied migrations and the infrastructure flag only for rollback safety. | Codex |
 
 ---
 

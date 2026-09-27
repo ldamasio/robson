@@ -34,7 +34,6 @@
 
 // Modules
 mod credential_store;
-mod detected_position;
 mod error;
 mod memory;
 #[cfg(feature = "postgres")]
@@ -45,12 +44,6 @@ mod repository;
 #[cfg(feature = "postgres")]
 pub use credential_store::PgCredentialStore;
 pub use credential_store::{CredentialStore, MemoryCredentialStore};
-#[cfg(feature = "postgres")]
-pub use detected_position::PgDetectedPositionRepository;
-pub use detected_position::{
-    DetectedPositionDto, DetectedPositionRepository, MemoryDetectedPositionRepository,
-    SafetyExecutionDto,
-};
 pub use error::StoreError;
 pub use memory::MemoryStore;
 #[cfg(feature = "postgres")]

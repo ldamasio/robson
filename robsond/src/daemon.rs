@@ -630,23 +630,11 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
             }
         }
 
-        // 4. ADR-0022 owns UNTRACKED-position enforcement. The legacy
-        // fixed-percentage PositionMonitor configuration remains loadable for
-        // compatibility, but no longer starts an executable runtime path.
-        if self.config.position_monitor.enabled {
-            warn!(
-                "Legacy PositionMonitor configuration is ignored; ADR-0022 ReconciliationWorker \
-                 owns UNTRACKED-position enforcement"
-            );
-        } else {
-            info!("Legacy PositionMonitor runtime wiring is retired");
-        }
-
-        // 5. Start API server
+        // 4. Start API server
         let api_addr = self.start_api_server().await?;
         info!(%api_addr, "API server started");
 
-        // 6. Spawn reconciliation worker (uses explicit missing_grace from config)
+        // 5. Spawn reconciliation worker (uses explicit missing_grace from config)
         let reconciliation_worker = ReconciliationWorker::new_with_missing_grace(
             Arc::clone(&self.exchange),
             Arc::clone(&self.position_manager),
@@ -662,7 +650,7 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
             }
         });
 
-        // 7. Spawn WebSocket clients (Phase 6: Market Data) plus the REST fallback
+        // 6. Spawn WebSocket clients (Phase 6: Market Data) plus the REST fallback
         //    companion per symbol (ADR-0044): if the WS feed goes silent past the
         //    watchdog while a risk-open position exists, the fallback polls the
         //    exchange REST price into the same pipeline so the trailing engine never
@@ -699,7 +687,7 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
             info!(symbol = %symbol_str, "WebSocket client + REST fallback spawned");
         }
 
-        // 8. Spawn projection worker (if pg_pool configured)
+        // 7. Spawn projection worker (if pg_pool configured)
         #[cfg(feature = "postgres")]
         let projection_handle = if let (Some(pool), Some(tenant_id)) =
             (&self.pg_pool, self.config.projection.tenant_id)
@@ -778,10 +766,10 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
         #[cfg(not(feature = "postgres"))]
         let income_ledger_handle: Option<tokio::task::JoinHandle<()>> = None;
 
-        // 9. Subscribe to event bus
+        // 8. Subscribe to event bus
         let mut event_receiver = self.event_bus.subscribe();
 
-        // 10. Spawn ctrl+c handler
+        // 9. Spawn ctrl+c handler
         let ctrl_c_shutdown = shutdown.clone();
         tokio::spawn(async move {
             if let Err(_) = tokio::signal::ctrl_c().await {
@@ -795,7 +783,7 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
             tokio::time::interval(tokio::time::Duration::from_secs(60));
         month_boundary_interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-        // 11. Main event loop
+        // 10. Main event loop
         info!("Entering main event loop");
         loop {
             tokio::select! {
@@ -828,7 +816,7 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
             }
         }
 
-        // 12. Graceful shutdown
+        // 11. Graceful shutdown
         shutdown_sig.cancel(); // Ensure any remaining tasks are cancelled
 
         info!("Waiting for reconciliation worker to finish...");
@@ -1631,9 +1619,6 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
             position_manager: self.position_manager.clone(),
             event_bus: self.event_bus.clone(),
             circuit_breaker,
-            // Compatibility routes remain available, but the retired legacy
-            // monitor can no longer be injected into the daemon runtime.
-            position_monitor: None,
             wallet_balance_cache: tokio::sync::Mutex::new(None),
             #[cfg(feature = "postgres")]
             pg_pool: self.pg_pool.clone(),
@@ -1804,23 +1789,6 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
                     %confirmed_missing_at,
                     %reason,
                     "Reverse reconciliation stale Active unresolved"
-                );
-            },
-
-            DaemonEvent::SafetyPanic {
-                position_id,
-                symbol,
-                side,
-                error,
-                consecutive_failures,
-            } => {
-                error!(
-                    %position_id,
-                    %symbol,
-                    ?side,
-                    %error,
-                    %consecutive_failures,
-                    "PANIC: Safety exit failed repeatedly, position in panic mode"
                 );
             },
 

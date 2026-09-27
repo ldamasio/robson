@@ -8,7 +8,7 @@ use rust_decimal::Decimal;
 use thiserror::Error;
 use uuid::Uuid;
 
-use crate::{position_monitor::MonitorError, query_engine::QueryRecorderError};
+use crate::query_engine::QueryRecorderError;
 
 /// Minimal payload describing one stale-Active position detected at startup.
 #[derive(Debug, Clone)]
@@ -88,10 +88,6 @@ pub enum DaemonError {
     /// Approval was requested, but current risk no longer allows execution
     #[error("Approval denied for query {query_id}: {reason}")]
     ApprovalDenied { query_id: Uuid, reason: String },
-
-    /// Monitor error
-    #[error("Monitor error: {0}")]
-    Monitor(#[from] MonitorError),
 
     /// EventLog persistence failure (append or projection apply).
     ///
