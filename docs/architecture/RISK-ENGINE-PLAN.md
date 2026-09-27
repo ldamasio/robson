@@ -17,6 +17,15 @@
 > §10: "There is no daily loss limit"). It sat dormant with zeroed inputs
 > until daily PnL was wired in, then blocked entries after a single
 > budget-sized stop-out; check and field were removed in PR #110.
+>
+> **2026-09-27 update**: every section below that describes a Safety Net or
+> `PositionMonitor` using a fixed 2% stop is superseded historical design.
+> Fixed-percentage technical stops are forbidden by ADR-0021 and AGENTS.md.
+> `ReconciliationWorker` now owns mandatory UNTRACKED-position enforcement;
+> Robson-authored positions use the chart-derived trailing policy and ADR-0039
+> insurance stop. The daemon runtime wiring for the legacy monitor is retired,
+> while its physical module, types, configuration, and storage artifacts remain
+> pending removal.
 
 ---
 

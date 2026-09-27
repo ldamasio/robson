@@ -31,7 +31,9 @@ pub struct Config {
     /// Market data WebSocket configuration
     pub market_data: MarketDataConfig,
 
-    /// Position monitor configuration (safety net)
+    /// Legacy PositionMonitor compatibility settings. The daemon no longer
+    /// starts that runtime path; its Binance credentials still feed the
+    /// primary exchange adapter during the staged cleanup.
     pub position_monitor: PositionMonitorConfig,
 
     /// Reconciliation worker configuration.
@@ -207,25 +209,30 @@ impl Default for MarketDataConfig {
     }
 }
 
-/// Position monitor configuration (safety net for rogue positions).
+/// Legacy fixed-percentage PositionMonitor configuration.
+///
+/// The executable monitor wiring is retired. These fields remain loadable for
+/// environment compatibility, and the Binance credentials are still consumed
+/// by `main` when constructing the primary exchange adapter.
 #[derive(Debug, Clone)]
 pub struct PositionMonitorConfig {
-    /// Whether the position monitor is enabled
+    /// Legacy enable flag. Loaded for compatibility, but ignored by the daemon
+    /// runtime and never allowed to block startup.
     pub enabled: bool,
-    /// Polling interval in seconds
+    /// Legacy polling interval in seconds.
     pub poll_interval_secs: u64,
-    /// Symbols to monitor (e.g., ["BTCUSDT", "ETHUSDT"])
+    /// Legacy monitor symbols (e.g., ["BTCUSDT", "ETHUSDT"]).
     pub symbols: Vec<String>,
-    /// Binance API key (required to enable runtime monitor).
+    /// Binance API key used by the primary exchange adapter.
     pub binance_api_key: Option<String>,
-    /// Binance API secret (required to enable runtime monitor).
+    /// Binance API secret used by the primary exchange adapter.
     pub binance_api_secret: Option<String>,
 }
 
 impl Default for PositionMonitorConfig {
     fn default() -> Self {
         Self {
-            enabled: true,
+            enabled: false,
             poll_interval_secs: 20,
             symbols: vec![],
             binance_api_key: None,
@@ -723,21 +730,18 @@ impl Config {
     }
 
     fn load_position_monitor_config() -> DaemonResult<PositionMonitorConfig> {
-        // Check if enabled
+        // Legacy values remain observable during staged compatibility cleanup,
+        // but must not block startup now that no monitor runtime consumes them.
         let enabled = env::var("ROBSON_POSITION_MONITOR_ENABLED")
             .ok()
             .and_then(|v| v.parse::<bool>().ok())
-            .unwrap_or(true); // Default: enabled
+            .unwrap_or(false);
 
-        // Poll interval
+        // Invalid legacy polling values fall back instead of blocking the
+        // primary exchange adapter and unconditional reconciliation worker.
         let poll_interval_str =
             env::var("ROBSON_POSITION_MONITOR_POLL_INTERVAL").unwrap_or_else(|_| "20".to_string());
-        let poll_interval_secs = poll_interval_str.parse::<u64>().map_err(|_| {
-            DaemonError::Config(format!(
-                "Invalid ROBSON_POSITION_MONITOR_POLL_INTERVAL: {}",
-                poll_interval_str
-            ))
-        })?;
+        let poll_interval_secs = poll_interval_str.parse::<u64>().unwrap_or(20);
 
         // Symbols to monitor
         let symbols_str = env::var("ROBSON_POSITION_MONITOR_SYMBOLS").unwrap_or_default();
@@ -746,12 +750,6 @@ impl Config {
             .map(|s| s.trim().to_uppercase())
             .filter(|s| !s.is_empty())
             .collect();
-
-        if enabled && symbols.is_empty() {
-            return Err(DaemonError::Config(
-                "ROBSON_POSITION_MONITOR_SYMBOLS is required when monitor is enabled".to_string(),
-            ));
-        }
 
         let binance_api_key = env::var("ROBSON_BINANCE_API_KEY")
             .ok()
@@ -920,6 +918,7 @@ mod tests {
         assert_eq!(config.tech_stop.lookback_candles, 100);
         assert!(config.market_data.symbols.is_empty());
         assert!(config.market_data.ws_endpoints.is_empty());
+        assert!(!config.position_monitor.enabled);
         assert!(config.position_monitor.symbols.is_empty());
         assert_eq!(config.reconciliation.interval_secs, 60);
         assert_eq!(config.reconciliation.missing_grace_secs, 60);
@@ -1090,20 +1089,18 @@ mod tests {
     }
 
     #[test]
-    fn test_load_position_monitor_config_requires_symbols_when_enabled() {
+    fn test_legacy_monitor_settings_do_not_block_primary_runtime() {
         let _lock = env_lock().lock().unwrap();
         let _env = EnvGuard::new(&[
             ("ROBSON_POSITION_MONITOR_ENABLED", Some("true")),
             ("ROBSON_POSITION_MONITOR_SYMBOLS", Some("")),
+            ("ROBSON_POSITION_MONITOR_POLL_INTERVAL", Some("invalid")),
         ]);
 
-        let err = Config::load_position_monitor_config().unwrap_err();
-        assert!(matches!(
-            err,
-            DaemonError::Config(message)
-                if message
-                    == "ROBSON_POSITION_MONITOR_SYMBOLS is required when monitor is enabled"
-        ));
+        let config = Config::load_position_monitor_config().unwrap();
+        assert!(config.enabled);
+        assert!(config.symbols.is_empty());
+        assert_eq!(config.poll_interval_secs, 20);
     }
 
     #[test]
@@ -1117,6 +1114,26 @@ mod tests {
         let config = Config::load_position_monitor_config().unwrap();
         assert!(!config.enabled);
         assert!(config.symbols.is_empty());
+    }
+
+    #[test]
+    fn test_disabled_legacy_monitor_still_loads_primary_binance_credentials() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_POSITION_MONITOR_ENABLED", Some("false")),
+            ("ROBSON_POSITION_MONITOR_SYMBOLS", Some("")),
+            ("ROBSON_BINANCE_API_KEY", Some("canonical-test-key")),
+            ("ROBSON_BINANCE_API_SECRET", Some("canonical-test-secret")),
+            ("BINANCE_API_KEY", Some("fallback-test-key")),
+            ("BINANCE_API_SECRET", Some("fallback-test-secret")),
+        ]);
+
+        let config = Config::load_position_monitor_config().unwrap();
+
+        assert!(!config.enabled);
+        assert!(config.symbols.is_empty());
+        assert_eq!(config.binance_api_key.as_deref(), Some("canonical-test-key"));
+        assert_eq!(config.binance_api_secret.as_deref(), Some("canonical-test-secret"));
     }
 
     #[test]

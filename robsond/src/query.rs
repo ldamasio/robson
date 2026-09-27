@@ -67,7 +67,8 @@ pub enum QueryKind {
     /// Emergency close ONE position (PanicClose creates one query per position)
     PanicClosePosition { position_id: PositionId },
 
-    /// Safety Net detected rogue position
+    /// Legacy Safety Net compatibility query. The current reconciliation
+    /// worker's risk-reducing close does not construct this variant.
     #[allow(dead_code)]
     SafetyNetExit {
         position_id: PositionId,
@@ -225,7 +226,7 @@ pub enum ActorKind {
     /// Market data feed (WebSocket or REST fallback)
     MarketData,
 
-    /// Safety Net (rogue position monitor)
+    /// Legacy Safety Net actor retained for audit compatibility.
     SafetyNet,
 
     /// Internal system (timer, recovery, reconciliation)

@@ -357,12 +357,12 @@ Risk Engine detects threshold breach
 
 ### Crash Recovery
 
-> **TARGET ARCHITECTURE — FOLLOW-UP REQUIRED (MIG-v3#9)**: The UNTRACKED position
-> scanning and `StartupReconciling` state described below are not yet implemented.
-> Current crash recovery restores from EventLog replay + projection, which correctly
-> recovers tracked positions but does NOT detect positions opened outside `robsond`.
-> Until MIG-v3#9 is complete, the operator must manually verify the Binance account
-> is clean before and after daemon restarts.
+> **TARGET ARCHITECTURE — FOLLOW-UP REQUIRED (MIG-v3#9)**: Current startup and
+> periodic reconciliation scan USD-M Futures and close an exchange position when
+> no active local `(symbol, side)` match exists. The stronger flow below — explicit
+> `StartupReconciling`, every account type, originating-order-id authorship,
+> durable I2 events, and CRITICAL alerting — is not yet implemented. The operator
+> must still verify the complete Binance account before and after daemon restarts.
 
 ```
 Runtime restarts (Kubernetes pod restart)
@@ -376,7 +376,7 @@ Runtime restarts (Kubernetes pod restart)
    - No match → the position is UNTRACKED (ADR-0022):
      - Persist `position_untracked_detected`
      - Alert operator at CRITICAL
-     - Close the position at market via Safety Net (`UNTRACKED_ON_EXCHANGE`)
+     - Close the position at market via the reconciliation close path (`UNTRACKED_ON_EXCHANGE`)
      - Persist `untracked_position_closed`
      - Do NOT reconstruct an `entry_order_placed` event
 -> Exit StartupReconciling only when the UNTRACKED set is empty

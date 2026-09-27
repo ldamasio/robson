@@ -10,16 +10,17 @@
 //!                    Event Bus (signals, market data)
 //!                         ↑
 //!                    Detector Tasks
-//!                         ↑
-//!                 Position Monitor (Safety Net)
+//!
+//! Exchange → Reconciliation Worker → UNTRACKED close
 //! ```
 //!
 //! # Components
 //!
 //! - **Daemon**: Main runtime orchestrator
 //! - **Position Manager**: Manages position lifecycle and detector tasks
-//! - **Position Monitor**: Safety net for rogue positions (opened outside
-//!   Robson v2)
+//! - **Reconciliation Worker**: Runs current Futures reconciliation and closes
+//!   unmatched exchange positions; exact ADR-0022 order-id authorship remains
+//!   follow-up work
 //! - **Event Bus**: Internal communication (detector → engine, market data)
 //! - **API**: HTTP endpoints for CLI interaction
 //! - **Config**: Environment-based configuration
@@ -87,6 +88,8 @@ pub use google_jwks::GoogleJwksCache;
 #[cfg(feature = "postgres")]
 pub use income_ledger::IncomeLedgerWorker;
 pub use position_manager::PositionManager;
+// Legacy compatibility exports. The daemon no longer wires this monitor into
+// the runtime; remove these with the remaining fixed-stop implementation.
 pub use position_monitor::{MonitorError, PositionMonitor, PositionMonitorConfig as MonitorConfig};
 // Query engine re-exports
 pub use query::{

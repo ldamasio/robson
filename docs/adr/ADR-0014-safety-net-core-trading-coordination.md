@@ -9,6 +9,21 @@ requires exchange positions to be Robson-authored, and
 [ADR-0039](ADR-0039-exchange-side-insurance-stop.md) defines the current
 exchange-side protection model. This record is retained as decision history.
 
+### Repository and rollout status (2026-09-27)
+
+- **Repository-verified**: `Daemon::run` no longer constructs, starts, or stops
+  the superseded fixed-percentage `PositionMonitor`. Its module, public types,
+  configuration, storage artifacts, and disabled HTTP compatibility routes
+  remain pending physical removal.
+- **Infrastructure rollout verified**: production keeps the legacy flag
+  `ROBSON_POSITION_MONITOR_ENABLED=false` through `rbx-infra` PR #325.
+- **Application rollout pending**: retiring the executable wiring becomes
+  operationally verified only after the reviewed application image is deployed
+  and the reconciliation-worker liveness signals are observed in production.
+- **Current owners**: `ReconciliationWorker` partially enforces the current
+  USD-M Futures scope using `(symbol, side)` matching; `PositionManager` and the
+  ADR-0039 exchange-side insurance stop protect Robson-authored positions.
+
 ## Context
 
 Robson v2 implements **two distinct stop loss modalities** that operate on the same Binance account:

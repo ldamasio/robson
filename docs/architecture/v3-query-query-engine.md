@@ -168,7 +168,8 @@ pub enum QueryKind {
     PanicClosePosition {
         position_id: PositionId,
     },
-    /// Safety Net detected rogue position
+    /// Legacy Safety Net compatibility query; the current reconciliation
+    /// worker does not construct this variant
     SafetyNetExit {
         position_id: PositionId,
         reason: String,
@@ -240,7 +241,7 @@ pub enum ActorKind {
     Detector,
     /// Market data feed (WebSocket or REST fallback)
     MarketData,
-    /// Safety Net (rogue position monitor)
+    /// Legacy Safety Net actor retained for audit compatibility
     SafetyNet,
     /// Internal system (timer, recovery, reconciliation)
     System {

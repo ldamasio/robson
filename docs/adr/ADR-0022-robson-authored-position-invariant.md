@@ -1,8 +1,8 @@
 # ADR-0022 — Robson-Authored Position Invariant
 
 **Date**: 2026-04-18
-**Last Amended**: 2026-08-06 (startup operational status and policy drifts documented)
-**Status**: DECIDED - IMPLEMENTED, WITH OPEN STARTUP POLICY DRIFTS
+**Last Amended**: 2026-09-27 (legacy PositionMonitor runtime retirement)
+**Status**: DECIDED - PARTIALLY IMPLEMENTED, FOLLOW-UP REQUIRED
 **Deciders**: RBX Systems (operator + architecture)
 
 ---
@@ -71,11 +71,28 @@ A **Position Reconciliation Worker** runs periodically in the runtime. On each s
    `event_log` by exchange order id.
 3. If no matching event exists → classify the position as **UNTRACKED**.
 4. Persist `position_untracked_detected`, alert the operator, and **close the
-   position at market** via the Safety Net close path.
+   position at market** via the reconciliation close path.
 5. Persist `untracked_position_closed` on the resulting fill.
 
-The close is mandatory and runs unconditionally — it is not gated by
-`ROBSON_POSITION_MONITOR_ENABLED` (which only gates the trailing-stop monitor).
+The close is mandatory and runs unconditionally. The legacy
+`ROBSON_POSITION_MONITOR_ENABLED` setting is still parsed for compatibility but
+starts no runtime monitor and never gates reconciliation. Tracked positions are
+managed separately by `PositionManager` and the ADR-0039 exchange-side insurance
+stop.
+
+### Current implementation boundary (2026-09-27)
+
+The startup and periodic `ReconciliationWorker` are implemented for the current
+USD-M Futures adapter and close exchange positions that have no matching active
+local position. Current authorship matching is by `(symbol, side)`, not by the
+originating exchange order id. Exact order-id correlation, every account type,
+durable I2 detection/close events, the audited suspend endpoint, and complete
+alerting remain target architecture. The current close path broadcasts
+`RoguePositionDetected` and `SafetyExitExecuted`/`SafetyExitFailed` on the
+in-process event bus and SSE surface, but does not persist the I2-required
+`position_untracked_detected` or `untracked_position_closed` events.
+The legacy fixed-percentage `PositionMonitor` runtime wiring is retired; its
+implementation and compatibility artifacts remain pending physical removal.
 
 ### Scope
 
@@ -93,9 +110,8 @@ exception (see [ADR-0023](ADR-0023-symbol-agnostic-policy-invariant.md)).
   with an open policy-violating position while they decide what to do. Under
   leverage, seconds matter.
 - **Gate the reconciliation worker behind `ROBSON_POSITION_MONITOR_ENABLED`.**
-  Rejected — that flag gates the trailing-stop monitor for active, tracked
-  positions. An UNTRACKED position is a policy violation that must be closed
-  regardless of whether the operator has enabled live trailing-stop management.
+  Rejected — this legacy setting starts no runtime monitor. An UNTRACKED
+  position is a policy violation that must be closed unconditionally.
 - **Single-user honor system.** Rejected — Robson must be architecturally correct
   against its own operator, not just against third parties. A single rushed manual
   order can destroy weeks of compounded gains.
@@ -106,12 +122,16 @@ exception (see [ADR-0023](ADR-0023-symbol-agnostic-policy-invariant.md)).
 
 ### Positive
 
-- The Risk Engine's guarantees hold end-to-end: no shadow positions outside its
-  scope.
-- Audit trail is closed: every open position has a matching governance event.
+- Target state makes the Risk Engine's guarantees end-to-end: no shadow
+  positions outside its scope. Current Futures `(symbol, side)` matching is a
+  partial enforcement step, not proof of origin.
+- Target state closes the audit trail: every open position has a matching
+  governance event once exact order-id correlation and durable I2 events land.
 - Reconciliation becomes proactive rather than passive adoption.
-- Failure mode for leaked / shared API keys: an attacker's position is closed within
-  one reconciliation interval.
+- Target failure mode for leaked / shared API keys: an attacker's position is
+  identified by origin and closed within one reconciliation interval. Current
+  automatic coverage is limited to USD-M Futures and can miss a foreign
+  position that shares `(symbol, side)` with a local active position.
 
 ### Negative / Trade-offs
 
@@ -131,8 +151,8 @@ exception (see [ADR-0023](ADR-0023-symbol-agnostic-policy-invariant.md)).
 
 ### Operational
 
-- `ROBSON_POSITION_MONITOR_ENABLED` gates trailing-stop management only. A new
-  conceptual flag — the reconciliation worker — is **always on**.
+- `ROBSON_POSITION_MONITOR_ENABLED` is a parsed legacy compatibility setting
+  and starts no runtime monitor. The reconciliation worker is **always on**.
 - VAL-001 gains a new pre-flight / phase: confirm zero UNTRACKED positions before
   starting the lifecycle validation.
 - VAL-002 Safety Checks Before Flip explicitly include reconciliation-worker-scan
@@ -142,22 +162,17 @@ exception (see [ADR-0023](ADR-0023-symbol-agnostic-policy-invariant.md)).
 
 ## Implementation Notes
 
-Follow-up work required (tracked as `MIG-v3#TBD — Reconciliation Worker`):
+Implemented current scope and remaining follow-up:
 
-1. **Event indexing**: projector indexes `entry_order_placed` and `exit_order_placed`
-   events by exchange order id for O(1) lookup.
-2. **Reconciliation worker**: new long-lived task inside `robsond` scanning every
-   60–300 s (configurable). Scans all account types (spot, margin, futures) and
-   all symbols.
-3. **Close path**: dedicated Safety Net path tagged `UNTRACKED_ON_EXCHANGE`. Does
-   not go through the entry-side risk gate (closing is always allowed).
-4. **Alerting**: `position_untracked_detected` emits a CRITICAL operator alert.
-5. **Startup gating**: daemon enters `StartupReconciling` state before accepting
-   observations; blocks new entries until UNTRACKED set is empty.
-6. **Operator override**: `POST /reconciliation/suspend` with max TTL 300 s for
-   exceptional cases (e.g., a human-in-the-loop migration). Audited end-to-end.
-7. **VAL-001 scenario**: open an UNTRACKED position manually on testnet, confirm
-   detection and auto-close.
+1. **Implemented**: startup and periodic futures reconciliation plus a mandatory
+   market-close path outside the entry-side risk gate.
+2. **Follow-up required**: index and match the originating exchange order id in
+   O(1); the current worker matches `(symbol, side)`.
+3. **Follow-up required**: cover spot and margin account types in addition to the
+   current USD-M Futures adapter.
+4. **Follow-up required**: complete CRITICAL alert delivery and the audited,
+   bounded `POST /reconciliation/suspend` target.
+5. **Follow-up required**: add a controlled VAL-001 UNTRACKED-position scenario.
 
 ### Invariants (non-negotiable)
 
@@ -172,8 +187,8 @@ Follow-up work required (tracked as `MIG-v3#TBD — Reconciliation Worker`):
 
 ### Related Components
 
-- `robsond/src/position_manager.rs` — will own the reconciliation loop
-- `robsond/src/safety_net.rs` (target) — close path for UNTRACKED positions
+- `robsond/src/reconciliation_worker.rs` — current startup and periodic worker
+- `robsond/src/position_manager.rs` — tracked-position lifecycle and close path
 - `robson-eventlog/` — exchange-order-id index on events
 - `robson-exec/src/executor.rs` — exchange query for open positions (all symbols)
 
