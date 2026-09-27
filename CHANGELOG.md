@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added - Reconciliation worker liveness metrics (ADR-0022)
+
+- Instrumented both startup and periodic exchange-reconciliation scans with
+  bounded-cardinality Prometheus signals for completed/error outcomes, an
+  in-progress gauge, and last-attempt/last-completed timestamps. This makes a
+  stopped, hung, or repeatedly failing ADR-0022 worker externally observable
+  without relying on the superseded fixed-percentage PositionMonitor.
+- A `completed` scan means the worker returned successfully at its top-level
+  boundary; it deliberately does not claim that every best-effort maintenance
+  substep succeeded.
+
 ## [2.5.0] - 2026-08-23
 
 ### Changed - v2.5 release baseline

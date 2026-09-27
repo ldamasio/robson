@@ -346,9 +346,32 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         }
     }
 
-    /// Run one reconciliation pass, returning how many untracked positions were
-    /// closed.
+    /// Run one reconciliation pass, returning how many position-level
+    /// reconciliation actions completed (UNTRACKED closes plus resolved local
+    /// missing positions).
     pub async fn scan_and_reconcile(&self) -> DaemonResult<usize> {
+        crate::metrics::RECONCILIATION_SCAN_IN_PROGRESS.set(1.0);
+        crate::metrics::RECONCILIATION_LAST_ATTEMPT_TIMESTAMP_SECONDS
+            .set(Utc::now().timestamp() as f64);
+
+        let result = self.scan_and_reconcile_inner().await;
+
+        crate::metrics::RECONCILIATION_SCAN_IN_PROGRESS.set(0.0);
+        match &result {
+            Ok(_) => {
+                crate::metrics::RECONCILIATION_SCANS.with_label_values(&["completed"]).inc();
+                crate::metrics::RECONCILIATION_LAST_COMPLETED_TIMESTAMP_SECONDS
+                    .set(Utc::now().timestamp() as f64);
+            },
+            Err(_) => {
+                crate::metrics::RECONCILIATION_SCANS.with_label_values(&["error"]).inc();
+            },
+        }
+
+        result
+    }
+
+    async fn scan_and_reconcile_inner(&self) -> DaemonResult<usize> {
         let exchange_positions = self.exchange.get_all_open_positions().await?;
         let mut reconciled = 0usize;
 
@@ -1193,6 +1216,45 @@ mod tests {
             exit_reason: ExitReason::TrailingStop,
         };
         store.positions().save(&position).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_completed_scan_updates_reconciliation_liveness_metrics() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let worker = create_worker(exchange, store, event_bus, Duration::from_secs(0));
+
+        let completed = crate::metrics::RECONCILIATION_SCANS.with_label_values(&["completed"]);
+        let before = completed.get();
+
+        assert_eq!(worker.scan_and_reconcile().await.unwrap(), 0);
+
+        assert!(completed.get() >= before + 1.0);
+        assert!(crate::metrics::RECONCILIATION_LAST_ATTEMPT_TIMESTAMP_SECONDS.get() > 0.0);
+        assert!(crate::metrics::RECONCILIATION_LAST_COMPLETED_TIMESTAMP_SECONDS.get() > 0.0);
+        let rendered = crate::metrics::render();
+        assert!(rendered.contains("robsond_reconciliation_scans_total"));
+        assert!(rendered.contains("robsond_reconciliation_scan_in_progress"));
+        assert!(rendered.contains("robsond_reconciliation_last_attempt_timestamp_seconds"));
+        assert!(rendered.contains("robsond_reconciliation_last_completed_timestamp_seconds"));
+    }
+
+    #[tokio::test]
+    async fn test_failed_scan_increments_error_metric() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let worker = create_worker(exchange.clone(), store, event_bus, Duration::from_secs(0));
+
+        let errors = crate::metrics::RECONCILIATION_SCANS.with_label_values(&["error"]);
+        let before = errors.get();
+        exchange.set_fail_next(true);
+
+        assert!(worker.scan_and_reconcile().await.is_err());
+
+        assert!(errors.get() >= before + 1.0);
+        assert!(crate::metrics::RECONCILIATION_LAST_ATTEMPT_TIMESTAMP_SECONDS.get() > 0.0);
     }
 
     #[tokio::test]

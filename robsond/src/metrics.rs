@@ -8,6 +8,14 @@
 //! - `robsond_position_pnl` — realized PnL per closed position
 //! - `robsond_active_positions` — currently open position count
 //! - `robsond_stale_active_positions` — open book positions missing on exchange
+//! - `robsond_reconciliation_scans_total` — completed reconciliation scans by
+//!   result
+//! - `robsond_reconciliation_scan_in_progress` — reconciliation scan currently
+//!   running
+//! - `robsond_reconciliation_last_attempt_timestamp_seconds` — last scan start
+//!   time
+//! - `robsond_reconciliation_last_completed_timestamp_seconds` — last completed
+//!   scan time
 //! - `robsond_monthly_halt_active` — MonthlyHalt circuit breaker (0 or 1)
 //! - `robsond_budget_model_shadow_slots_delta` — dormant ADR-0051 NFS slots
 //!   minus HWM slots
@@ -76,6 +84,59 @@ pub static STALE_ACTIVE_POSITIONS: LazyLock<Gauge> = LazyLock::new(|| {
         "Number of open book positions missing on the exchange"
     )
     .expect("failed to register robsond_stale_active_positions")
+});
+
+/// Exchange-reconciliation scans, labelled by `completed` or `error`.
+///
+/// This is owned exclusively by `ReconciliationWorker`. Startup and periodic
+/// scans use the same instrumentation path, so a process that never completes
+/// its startup scan cannot look healthy merely because the periodic task has
+/// not been spawned yet. `completed` means the worker's top-level scan returned
+/// `Ok`; best-effort substeps that already log and continue remain outside this
+/// liveness signal and must not be inferred as fully healthy from it.
+pub static RECONCILIATION_SCANS: LazyLock<CounterVec> = LazyLock::new(|| {
+    register_counter_vec!(
+        "robsond_reconciliation_scans_total",
+        "Completed exchange reconciliation scans by result",
+        &["result"]
+    )
+    .expect("failed to register robsond_reconciliation_scans_total")
+});
+
+/// Whether the singleton reconciliation worker currently has a scan in flight.
+///
+/// A value stuck at 1 while the last-completed timestamp ages exposes a hung or
+/// panicked exchange call. Production starts exactly one reconciliation scan
+/// at a time; startup completes before the periodic worker is spawned.
+pub static RECONCILIATION_SCAN_IN_PROGRESS: LazyLock<Gauge> = LazyLock::new(|| {
+    register_gauge!(
+        "robsond_reconciliation_scan_in_progress",
+        "Whether an exchange reconciliation scan is currently running (0 or 1)"
+    )
+    .expect("failed to register robsond_reconciliation_scan_in_progress")
+});
+
+/// Unix timestamp of the most recent reconciliation scan attempt.
+pub static RECONCILIATION_LAST_ATTEMPT_TIMESTAMP_SECONDS: LazyLock<Gauge> = LazyLock::new(|| {
+    register_gauge!(
+        "robsond_reconciliation_last_attempt_timestamp_seconds",
+        "Unix timestamp of the most recent exchange reconciliation scan attempt"
+    )
+    .expect("failed to register robsond_reconciliation_last_attempt_timestamp_seconds")
+});
+
+/// Unix timestamp of the most recent completed reconciliation scan.
+///
+/// This gauge is never advanced on a top-level error. Alerting can therefore
+/// distinguish a worker that is attempting and failing from one that still
+/// completes its top-level account scans. It deliberately does not claim that
+/// every best-effort substep succeeded.
+pub static RECONCILIATION_LAST_COMPLETED_TIMESTAMP_SECONDS: LazyLock<Gauge> = LazyLock::new(|| {
+    register_gauge!(
+        "robsond_reconciliation_last_completed_timestamp_seconds",
+        "Unix timestamp of the most recent completed exchange reconciliation scan"
+    )
+    .expect("failed to register robsond_reconciliation_last_completed_timestamp_seconds")
 });
 
 /// MonthlyHalt circuit breaker state (0 = normal, 1 = halted).
