@@ -345,13 +345,24 @@ covers the **write side** (nothing leaves the Runtime without governance). This
 invariant adds the **read side**: nothing sits on the exchange that did not leave the
 Runtime.
 
-The Runtime owns a long-lived **Position Reconciliation Worker** (implemented — MIG-v3#9,
-TD-2026-05-05-001 Slices 0–5B2B) that enforces both sides of the invariant:
+The Runtime owns a long-lived **Position Reconciliation Worker**. Its current
+USD-M Futures implementation covers startup and periodic scans, mandatory market
+close for unmatched exchange positions, and stale-Active reconciliation. It does
+not yet implement the complete ADR-0022 authorship proof.
 
-**Exchange → Robson (UNTRACKED close)**:
-- Scans Binance for open positions across all account types and all symbols.
-- Classifies positions without a matching `entry_order_placed` event as UNTRACKED.
-- Closes UNTRACKED positions with exit reason `UNTRACKED_ON_EXCHANGE` and alerts CRITICAL.
+**Exchange → Robson (current UNTRACKED close)**:
+- Scans open positions exposed by the USD-M Futures adapter.
+- Treats an exchange position as tracked when an active local position has the
+  same `(symbol, side)`; originating exchange-order-id correlation is follow-up.
+- Closes unmatched positions at market and broadcasts transient
+  `RoguePositionDetected` plus `SafetyExitExecuted`/`SafetyExitFailed` events.
+- Does not yet persist the required `position_untracked_detected` and
+  `untracked_position_closed` records or deliver the target CRITICAL alert.
+
+**Exchange → Robson (ADR-0022 target)**:
+- Scan every account type and symbol, correlate the originating exchange order
+  id with the governed entry event, persist the I2 audit events, and deliver the
+  CRITICAL alert.
 
 **Robson → Exchange (stale-Active close)**:
 - Iterates every local `Active` position and checks for its presence on the exchange.
@@ -515,25 +526,29 @@ projection_reconciliation_interval_s = 300
 5. If corruption source is identifiable (e.g., missed fill event): log as
    `MissedEvent` for investigation.
 
-**Important**: adoption applies ONLY to positions whose entry is already recorded in
-`event_log` with a matching exchange order id. A position without a matching
-`entry_order_placed` event is UNTRACKED and handled by Scenario 5 — not by adoption.
-Back-filling an `entry_order_placed` event for an UNTRACKED position is a policy
-violation (ADR-0022).
+**Target rule**: adoption applies ONLY to positions whose entry is already recorded
+in `event_log` with a matching exchange order id. Current exchange-to-Robson
+matching is coarser `(symbol, side)` matching; closing that gap is MIG-v3#9
+follow-up. Back-filling an `entry_order_placed` event for an UNTRACKED position is
+a policy violation (ADR-0022).
 
 ### Scenario 5: UNTRACKED Position Detected
 
-Implemented — `ReconciliationWorker` (MIG-v3#9, TD-2026-05-05-001).
+Partially implemented — `ReconciliationWorker` (MIG-v3#9).
 
-Triggered when the reconciliation worker finds an open exchange position for which
-no matching `entry_order_placed` event exists in `event_log`. See
+Current code triggers when the USD-M Futures scan finds an exchange position with
+no active local `(symbol, side)` match. See
 [ADR-0022](../adr/ADR-0022-robson-authored-position-invariant.md) and
 [docs/policies/UNTRACKED-POSITION-RECONCILIATION.md](../policies/UNTRACKED-POSITION-RECONCILIATION.md).
 
-1. Emit a CRITICAL operator alert.
-2. Close the position via `reconcile_close` with exit reason `UNTRACKED_ON_EXCHANGE`.
-3. Persist the `PositionClosed` event with `ClosureEvidence::Reconciled(...)`.
-4. Do NOT reconstruct an `entry_order_placed` event. Do NOT adopt the position.
+1. Log the detection and broadcast transient `RoguePositionDetected`.
+2. Close the exchange position at market through `ExchangePort`.
+3. Broadcast `SafetyExitExecuted` or `SafetyExitFailed`; the daemon logs and SSE
+   surface expose these events.
+4. Do NOT reconstruct an `entry_order_placed` event or adopt the position.
+
+Exact originating-order matching, durable I2 events, typed closure evidence, the
+CRITICAL alert, and non-Futures account coverage remain target architecture.
 
 At daemon startup: if stale-Active positions are detected, the daemon aborts with
 exit code 78 (default `abort` policy). The operator resolves them via

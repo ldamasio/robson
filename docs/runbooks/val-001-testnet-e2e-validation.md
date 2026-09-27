@@ -24,7 +24,9 @@
 
 Validate the complete position lifecycle on `robson-testnet` before enabling real capital in production.
 
-**Blocking gate for**: VAL-002 (real capital activation — Binance real keys + `ROBSON_POSITION_MONITOR_ENABLED: "true"` in prod).
+**Blocking gate for**: VAL-002 (real capital activation — Binance real keys,
+legacy `ROBSON_POSITION_MONITOR_ENABLED=false`, and healthy reconciliation-worker
+liveness in production).
 
 **Cycle under validation**:
 ```
@@ -56,7 +58,7 @@ prerequisite **P7** and [UNTRACKED-POSITION-RECONCILIATION.md](../policies/UNTRA
 | Account type | USD-M Futures (One-way position mode) |
 | API endpoints | FAPI (`/fapi/v2/positionRisk`, `/fapi/v1/order`, `/fapi/v1/leverage`) |
 | WebSocket | `fstream.binancefuture.com` / `stream.binancefuture.com` |
-| Position monitor | enabled (`ROBSON_POSITION_MONITOR_ENABLED: "true"`, symbol: `BTCUSDT`) |
+| Legacy PositionMonitor | Historical GitOps value was enabled; it is not part of this lifecycle and MUST be set to `false` before rolling out the retirement image |
 | API access | ClusterIP — `kubectl port-forward` only |
 | Mutating routes | Bearer token required |
 
@@ -239,21 +241,20 @@ ORDER BY sequence;
 
 ---
 
-### Phase 4 — Trailing Stop Monitor
+### Phase 4 — Core Trailing-Stop Engine
 
 > **Executor: GLM**
 
 ```bash
-# Monitor position monitor ticks for at least 3 ticks
+# Observe core trailing-stop processing for at least 3 ticks
 kubectl logs -n robson-testnet deploy/robsond -f \
   | grep -E "trailing|stop|monitor|tick|BTCUSDT" \
   | head -20
 ```
 
-**Expected log pattern**:
-```
-DEBUG robsond::position_monitor: tick BTCUSDT price=X trailing_stop=Y
-```
+The durable EventLog query below is the acceptance evidence. The historical
+event name `position_monitor_tick` is emitted by `robson-engine`; it does not
+refer to the retired legacy `PositionMonitor` module.
 
 **EventLog audit** — Codex verifies:
 ```sql
@@ -303,7 +304,7 @@ kubectl logs -n robson-testnet deploy/robsond -f \
 
 **5B — Stop-triggered exit** (more complete, validates the automatic path):
 
-> **Executor: GLM** — arm a new position and wait for the detector-provided technical stop plus position monitor to trigger the exit automatically. Do not manufacture a stop from a percentage of entry.
+> **Executor: GLM** — arm a new position and wait for the detector-provided technical stop plus the core trailing-stop engine to trigger the exit automatically. Do not manufacture a stop from a percentage of entry.
 
 **EventLog audit** — Codex verifies full sequence:
 ```sql

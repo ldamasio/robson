@@ -609,7 +609,7 @@ Robson's PnL model is authoritative for **risk gate decisions only**. It is not 
 ### ADR-v3-025: Robson-Authored Position Invariant
 
 **Date**: 2026-04-18
-**Status**: DECIDED — FOLLOW-UP REQUIRED (reconciliation worker + close path are target architecture)
+**Status**: DECIDED — PARTIALLY IMPLEMENTED, FOLLOW-UP REQUIRED
 
 **Context**: Nothing in the prior architecture prevented an open position from existing on the Robson-operated Binance account without a matching `entry_order_placed` event in `event_log`. Such a position could arise from manual operator orders via the Binance UI, a leaked API key, a legacy service writing orders without event-log persistence, or a partial deploy. Each such position silently consumes the account's risk budget without passing the Risk Engine, has no technical stop, has no span, and is invisible to the monthly drawdown calculation.
 
@@ -617,20 +617,20 @@ Robson's PnL model is authoritative for **risk gate decisions only**. It is not 
 
 **Enforcement**:
 - **Write side** (already in place): `QueryEngine` produces a `GovernedAction` before every entry; the entry is recorded with `cycle_id` in `event_log`.
-- **Read side** (follow-up): a long-lived **Position Reconciliation Worker** inside `robsond` scans every open position across every account type (spot, isolated margin, cross margin, futures) and every symbol, looks up each by exchange order id, and closes any whose entry is not in `event_log` via a dedicated Safety Net close path (`UNTRACKED_ON_EXCHANGE`).
-- **Startup gate**: daemon enters `StartupReconciling` before accepting observations; exits only when UNTRACKED set is empty.
-- **Unconditional**: not gated by `ROBSON_POSITION_MONITOR_ENABLED` or `allowed_symbols`. Only permitted override: operator-issued `POST /reconciliation/suspend` with max TTL 300 s, fully audited (v3 target).
+- **Read side** (partially implemented): a long-lived **Position Reconciliation Worker** inside `robsond` performs startup and periodic USD-M Futures scans and closes UNTRACKED positions at market. Current matching uses `(symbol, side)`, not the originating exchange order id. Spot/margin coverage and exact order-id correlation remain follow-up work.
+- **Startup gate**: startup reconciliation runs before the normal runtime proceeds. The fuller `StartupReconciling` state described by the target architecture remains follow-up work.
+- **Unconditional**: not gated by `allowed_symbols` or by `ROBSON_POSITION_MONITOR_ENABLED`. That setting is a parsed legacy compatibility value and starts no runtime monitor. The audited `POST /reconciliation/suspend` remains v3 target architecture, not a current operator control.
 
 **Rejected**:
 - Adopting UNTRACKED positions into the Runtime (whitewashes policy breaches, creates retroactive "governance" for trades that never passed risk evaluation).
 - Advisory-only detection (under leverage, seconds matter).
-- Gating the worker behind `ROBSON_POSITION_MONITOR_ENABLED` (that flag gates trailing-stop management for tracked positions; UNTRACKED closure is a different concern).
+- Gating the worker behind `ROBSON_POSITION_MONITOR_ENABLED` (the legacy setting starts no runtime monitor; UNTRACKED closure is unconditional).
 
 **Rationale**: The Risk Engine's guarantees hold end-to-end only if no shadow positions exist outside its scope. The reconciliation worker is the read-side complement to the QueryEngine's write-side `GovernedAction` gate. Operator self-discipline ("I won't place manual orders") is not a sufficient safeguard for a leveraged system; the architecture must enforce this against its own operator.
 
 **Breaks if wrong**: A false positive — a legitimate position whose `entry_order_placed` event is missing due to a bug — results in an auto-close of a valid trade. Mitigation: the exchange-order-id ↔ event-log link must be written atomically with order placement. An exchange-order-id index on `event_log` is part of the follow-up work.
 
-**Reversibility**: Fully reversible. Disabling the reconciliation worker restores the prior permissive state. The policy document and invariant can be unwound if a different governance model is chosen.
+**Reversibility**: There is no supported runtime flag that disables the reconciliation worker. Replacing this invariant requires a reviewed ADR and policy migration; an operational rollback must preserve equivalent UNTRACKED-position enforcement.
 
 **See**: [ADR-0022](../adr/ADR-0022-robson-authored-position-invariant.md) and [docs/policies/UNTRACKED-POSITION-RECONCILIATION.md](../policies/UNTRACKED-POSITION-RECONCILIATION.md).
 

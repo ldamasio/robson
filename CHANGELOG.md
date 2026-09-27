@@ -7,13 +7,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed - Legacy PositionMonitor runtime retirement (ADR-0014 / ADR-0022)
+
+- Removed the daemon startup, task, shutdown, repository adapter, and API
+  injection wiring for the superseded fixed-percentage `PositionMonitor`.
+  ADR-0022 `ReconciliationWorker` remains the unconditional owner of
+  UNTRACKED-position enforcement; tracked positions remain protected by the
+  chart-derived trailing policy and exchange-side insurance stop.
+- Preserved `/safety/status` and `/safety/test` as disabled compatibility
+  contracts. Legacy config, public types, storage artifacts, and the physical
+  fixed-stop implementation remain temporarily for a follow-up removal; this
+  change does not describe them as deleted.
+- Legacy monitor-only settings now default disabled and cannot reject daemon
+  startup for empty symbols or an invalid polling interval. The existing
+  Binance credential fields remain loadable for the primary exchange adapter.
+- `Daemon::start_api_server` no longer accepts a `PositionMonitor` argument;
+  workspace callers now use the no-argument method. This intentionally removes
+  the last daemon-level injection seam for the retired runtime.
+- Production's legacy enable flag is already disabled by `rbx-infra` PR #325;
+  operational rollout of this application change remains pending until its
+  reviewed image is deployed and reconciliation liveness is revalidated.
+
 ### Added - Reconciliation worker liveness metrics (ADR-0022)
 
 - Instrumented both startup and periodic exchange-reconciliation scans with
   bounded-cardinality Prometheus signals for completed/error outcomes, an
   in-progress gauge, and last-attempt/last-completed timestamps. This makes a
   stopped, hung, or repeatedly failing ADR-0022 worker externally observable
-  without inferring its health from unrelated PositionMonitor activity.
+  without inferring its health from unrelated legacy PositionMonitor activity.
 - A `completed` scan means the worker returned successfully at its top-level
   boundary; it deliberately does not claim that every best-effort maintenance
   substep succeeded.

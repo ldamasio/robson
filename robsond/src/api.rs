@@ -1198,9 +1198,8 @@ async fn health_liveness() -> Json<HealthResponse> {
 /// Readiness probe for Kubernetes - checks if the service is ready to accept
 /// traffic.
 ///
-/// Checks:
-/// - Database connectivity (via store)
-/// - Binance API reachability
+/// Checks database connectivity via the configured store. The response retains
+/// a Binance field for compatibility, but no exchange probe is implemented.
 ///
 /// Returns 200 OK if all checks pass, 503 Service Unavailable otherwise.
 async fn health_readiness<E, S>(
@@ -1228,10 +1227,9 @@ where
         database_ok = true;
     }
 
-    // Check Binance API reachability via position monitor
-    // (Safety Net uses Binance REST client which can ping the API)
-    // For now, we'll mark it as OK if position monitor is configured
-    // TODO: Add actual ping check via BinanceRestClient
+    // Compatibility field only: no live Binance probe is implemented yet.
+    // Do not use /readyz as evidence of exchange selection or reachability.
+    // TODO: Add an exchange-health probe through ExchangePort.
     let binance_ok = true;
 
     let checks = ReadinessChecks {

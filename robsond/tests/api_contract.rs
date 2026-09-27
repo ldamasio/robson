@@ -43,7 +43,7 @@ async fn start_test_server_with_capital(capital_base: Decimal) -> (String, Socke
     let config = Config::test();
     let daemon = Daemon::new_stub_with_capital(config, capital_base)
         .expect("valid API-contract stub configuration");
-    let addr = daemon.start_api_server(None).await.expect("failed to start test server");
+    let addr = daemon.start_api_server().await.expect("failed to start test server");
     let base_url = format!("http://{}", addr);
     (base_url, addr)
 }
@@ -585,9 +585,24 @@ async fn test_safety_status_returns_disabled_in_stub_mode() {
 
     assert_eq!(resp.status(), 200);
     let body: api::SafetyStatusResponse = resp.json().await.unwrap();
-    // Stub mode: position monitor not configured → enabled=false
-    assert!(!body.enabled, "safety net should be disabled in stub mode");
+    assert!(!body.enabled, "legacy safety net must remain disabled");
+    assert!(body.symbols.is_empty());
+    assert_eq!(body.poll_interval_secs, 0);
     assert!(body.tracked_positions.is_empty());
+    assert_eq!(body.pending_executions, 0);
+}
+
+#[tokio::test]
+async fn test_safety_test_preserves_disabled_compatibility_contract() {
+    let (base, _) = start_test_server().await;
+
+    let resp = client().get(format!("{}/safety/test", base)).send().await.unwrap();
+
+    assert_eq!(resp.status(), 200);
+    let body: Value = resp.json().await.unwrap();
+    assert_eq!(body["success"], false);
+    assert_eq!(body["message"], "Safety net is not enabled.");
+    assert!(body.get("positions").is_none());
 }
 
 // =============================================================================

@@ -3,7 +3,7 @@
 **Status**: Active
 **Effective Date**: 2026-04-18
 **Owner**: Risk Engineering / robsond Runtime
-**Version**: 1.0
+**Version**: 1.4
 **Companion ADR**: [ADR-0022 — Robson-Authored Position Invariant](../adr/ADR-0022-robson-authored-position-invariant.md)
 
 ---
@@ -53,7 +53,7 @@ MUST:
 2. Record the classification as a `position_untracked_detected` event in `event_log`,
    with evidence: exchange order id, symbol, side, quantity, open timestamp.
 3. Alert the operator at severity `CRITICAL`.
-4. **Close the UNTRACKED position at market** via the Safety Net close path, tagged
+4. **Close the UNTRACKED position at market** via the reconciliation close path, tagged
    with exit reason `UNTRACKED_ON_EXCHANGE`.
 5. Record `untracked_position_closed` in `event_log` with the resulting fill.
 
@@ -361,14 +361,37 @@ The policy applies uniformly to **any symbol** the exchange supports (see
 [Symbol-Agnostic Policies](SYMBOL-AGNOSTIC-POLICIES.md)). The reconciliation worker
 must not special-case `BTCUSDT`, `BTCUSDC`, or any other pair.
 
+### Current implementation boundary (repository-verified 2026-09-27)
+
+The startup and periodic worker, mandatory market close, reverse reconciliation,
+and worker-liveness metrics are implemented for the current USD-M Futures
+adapter. I1 authorship detection currently treats an active local position with
+the same `(symbol, side)` as tracked; it does not yet correlate the originating
+exchange order id. Exact order-id authorship, spot and margin scanning, the full
+alerting target, durable I2 detection/close events, and the audited suspend
+endpoint remain follow-up work. The current close path broadcasts
+`RoguePositionDetected` and `SafetyExitExecuted`/`SafetyExitFailed` on the
+in-process event bus and SSE surface; the daemon logs them, but does not persist
+the required `position_untracked_detected` or `untracked_position_closed`
+events in `event_log`.
+
+The fixed-percentage legacy `PositionMonitor` is not this worker. Its daemon
+runtime wiring is repository-retired, while its physical implementation and
+compatibility artifacts remain pending removal. Production's legacy enable flag
+is disabled by `rbx-infra` PR #325; the application retirement is operationally
+pending until its reviewed image is deployed and the worker metrics are observed.
+
 ---
 
 ## Detection
 
-### Reconciliation Worker
+### Reconciliation Worker Target
 
-The runtime runs a periodic **Position Reconciliation Worker** (recommended interval:
-60s, max 300s; runs unconditionally, not gated by `ROBSON_POSITION_MONITOR_ENABLED`).
+The complete policy requires a periodic **Position Reconciliation Worker**
+(recommended interval: 60s, max 300s). It runs unconditionally. The parsed
+legacy setting `ROBSON_POSITION_MONITOR_ENABLED` starts no runtime monitor and
+never gates this worker. The current implementation boundary is stated above;
+the algorithm below is the target where it exceeds that boundary.
 
 Each cycle:
 
@@ -382,7 +405,7 @@ Each cycle:
    outside exchange tolerance → the position is **DIVERGENT** and is handled by the
    standard `ReconciliationEvent` flow (not by this policy).
 
-### Startup Reconciliation
+### Startup Reconciliation Target
 
 On daemon startup (after `RuntimeState::replay_from_log()`), a reconciliation pass
 MUST run **before** the Control Loop begins accepting observations. If any UNTRACKED
@@ -401,11 +424,14 @@ The runtime MUST enforce I1/I2 with at least the following mechanisms:
 2. **Exchange order-id ↔ event-log link** (follow-up required): every order placed via
    the Executor MUST be recorded in `event_log` with the exchange-assigned order id
    indexed for O(1) lookup by the reconciliation worker.
-3. **Reconciliation worker close path** (follow-up required): a dedicated Safety Net
-   path for closing UNTRACKED positions. This path does not consult the entry-side
-   risk gate (closing is always permitted) but does emit full audit events.
-4. **Alerting** (follow-up required): `position_untracked_detected` triggers a
-   `CRITICAL` alert to the operator channel with the close outcome.
+3. **Reconciliation worker close path** (implemented for USD-M Futures): a dedicated
+   market-close path for UNTRACKED positions. This path does not consult the
+   entry-side risk gate (closing is always permitted). It currently broadcasts
+   transient daemon/SSE events; durable I2 event-log persistence remains
+   follow-up work.
+4. **Alerting and durable audit** (follow-up required): persist
+   `position_untracked_detected` and `untracked_position_closed`, and deliver a
+   `CRITICAL` operator alert with the close outcome.
 5. **Orphan insurance-order sweep (ADR-0039)**: every active position carries a
    reduce-only `STOP_MARKET` protective order on the exchange, placed by
    `robsond` under a `GovernedAction` with a client order id carrying the
@@ -481,8 +507,10 @@ reconciliation worker ignore an UNTRACKED position is a policy violation.
 
 ### ❌ Disabling The Reconciliation Worker
 
-`ROBSON_POSITION_MONITOR_ENABLED` gates the **trailing-stop / active-position monitor**.
-It does not gate the reconciliation worker. The reconciliation worker is always on.
+`ROBSON_POSITION_MONITOR_ENABLED` is a legacy parsed setting whose monitor runtime
+wiring is retired. It does not gate the reconciliation worker. The reconciliation
+worker is always on; tracked positions are protected separately by the core
+chart-derived trailing engine and ADR-0039 insurance stop.
 
 ---
 
@@ -493,8 +521,10 @@ If the operator wants to hold a long-term position in a symbol Robson does not t
 1. Transfer the asset out of the Robson-operated account to a separate wallet or
    account.
 2. Robson does not see it and does not touch it.
-3. Never keep long-term holdings on the account Robson operates — the reconciliation
-   worker will close them.
+3. Never keep long-term holdings on the account Robson operates. Policy requires
+   them to be closed; current automatic enforcement covers USD-M Futures only,
+   so spot and margin remain an explicit operator-verification gap until the
+   account-coverage follow-up lands.
 
 ---
 
@@ -505,19 +535,21 @@ check for this policy:
 
 - VAL-001 Phase 0 (pre-flight): assert `GET /status` reports zero open positions on
   testnet AND reconciliation worker scan returns zero UNTRACKED positions.
-- VAL-002 safety checks before flip: identical assertion on production.
+- VAL-002 safety checks before rollout: identical assertion on production.
 
 A new `UNTRACKED_DETECTION` scenario should be added to VAL-001 (follow-up required):
 manually open a position via Binance testnet UI, then confirm the reconciliation
 worker classifies it as UNTRACKED, emits the expected events, and closes it within
-one reconciliation interval.
+one reconciliation interval. Until durable I2 events are implemented, the
+acceptance evidence is the current structured log/SSE pair plus the confirmed
+exchange close.
 
 ---
 
-## Abort / Panic Override
+## Abort / Panic Override Target (Not Implemented)
 
-The close path is mandatory. The only permitted override is an operator-issued
-panic suspension:
+The current reconciliation close is non-overridable. The target architecture may
+add this audited operator-issued suspension:
 
 ```bash
 curl -s -X POST http://localhost:8080/reconciliation/suspend \
@@ -530,8 +562,7 @@ curl -s -X POST http://localhost:8080/reconciliation/suspend \
 - While suspended: no automatic close, but reconciliation scans continue and
   `position_untracked_detected` events are still emitted.
 
-**The suspension endpoint is a v3 target, not a current feature.** Until implemented,
-the reconciliation close is non-overridable.
+Do not run this command against the current runtime; the endpoint does not exist.
 
 ---
 
@@ -556,6 +587,7 @@ the reconciliation close is non-overridable.
 | 1.1 | 2026-05-08 | Added §I3 — Reverse Reconciliation Invariant (TD-2026-05-05-001). | Claude Opus 4.7 |
 | 1.2 | 2026-05-11 | Added §I3 §E — startup policy and operational status. Reflects Slices 5A/5B1 live, 5B2A merged (refactor), 5B2B planned. | Claude Sonnet 4.6 |
 | 1.3 | 2026-07-02 | Added orphan insurance-order sweep to Enforcement (ADR-0039). | Claude (glm-5.2) |
+| 1.4 | 2026-09-27 | Retired legacy PositionMonitor runtime wiring; documented current Futures `(symbol, side)` matching and the durable I2 audit gap. | Codex |
 
 ---
 

@@ -90,7 +90,10 @@ docs/
 policies. The supported v2.5 `immediate` mode bypasses strategy waiting but
 does not bypass technical-stop analysis, the query engine, or the risk gate.
 
-**Reconciliation Worker** — Continuously verifies that every open position on the Binance account traces to a `robsond`-authored entry. Untracked positions are automatically closed. This invariant is non-negotiable (ADR-0022).
+**Reconciliation Worker** — Runs startup and periodic USD-M Futures scans and
+closes exchange positions that have no matching active local `(symbol, side)`.
+Exact originating-order correlation and wider account coverage remain ADR-0022
+follow-up work; the authorship invariant itself is non-negotiable.
 
 **Query Engine** — Every state transition passes through a lifecycle-tracked `ExecutionQuery`: `Accepted → Processing → RiskChecked → Acting → Completed / Denied / Failed`. Denials are governed outcomes, not errors.
 
@@ -110,7 +113,7 @@ POST /queries/{id}/approve            # Approve a pending human-confirmation que
 GET  /monthly-halt                    # Monthly halt status
 POST /monthly-halt                    # Trigger halt manually (kill switch)
 POST /panic                           # Emergency close all open positions
-GET  /safety/status                   # Reconciliation worker status
+GET  /safety/status                   # Legacy compatibility status (disabled)
 GET  /events/history?date=YYYY-MM-DD  # Latest 100 durable events for a UTC day (bearer header)
 GET  /events                          # SSE event stream (bearer header)
 ```

@@ -71,7 +71,7 @@ Robson operates from Baar/Zug under Swiss jurisdiction:
 
 Robson currently exists as two parallel implementations: a Django monolith (v1, live in production on k3s) and a Rust system (v2, architecturally superior, 12 crates, ~21K LOC). The v1 system has accumulated 31 Django migrations, event-sourced stop monitoring, a 3-level audit trail, margin trading, pattern detection, and an agentic workflow (PLAN->VALIDATE->EXECUTE). The v2 system implements the correct architecture — pure domain layer, event sourcing with ULID ordering, trailing stop engine, risk gate, idempotent executor with intent journal, Binance REST+WS connectors, and a daemon with HTTP API — but still has incomplete projections (40%), no backtesting, and the robsond k3s rollout is not treated as complete in this repository. The migration path is: v2.5 deploys the Rust daemon alongside the Django monolith, with Django continuing to serve the API, frontend, and pattern engine while the Rust runtime assumes execution responsibilities. Once the Rust path is validated in production, the v1 execution CronJobs are disabled and removed from desired state. v3 then promotes the Rust daemon to the primary runtime, replaces Django with a thin API gateway, and the React frontend connects directly to the daemon's event stream. The single most important architectural decision is that the Rust Runtime (robsond) becomes the sole guardian of execution — no context reaches the model, no tool executes, no order places without passing through its governance pipeline. Every other decision flows from this.
 
-In the v3 desired state there are no Django execution CronJobs. Critical monitoring moves to long-lived Rust runtime components such as the Control Loop, Safety Net, and reconciliation workers. Kubernetes CronJobs remain acceptable only for non-critical maintenance jobs such as retention, backfills, or report generation.
+In the v3 desired state there are no Django execution CronJobs. Critical monitoring moves to long-lived Rust runtime components such as the Control Loop, the reconciliation worker, and exchange-side insurance-stop management. Kubernetes CronJobs remain acceptable only for non-critical maintenance jobs such as retention, backfills, or report generation.
 
 ---
 
@@ -126,7 +126,7 @@ backend for compatibility, but are not release-supported operator actions.
 | MIG-v3#6 | Hash-chained EventLog | 🔄 Deferred to MIG-v4#1 — good integrity property, not required for v3 launch. |
 | MIG-v3#7 | PaymentRail trait | 🔄 Deferred to MIG-v4#2 — TRON/payment rail abstraction is architecture-ready but inactive. See ADR table entry #12. |
 | MIG-v3#8 | Chaos testing suite | ✅ Done (2026-05-12) — `robsond::chaos_tests` covers fail-closed risk timeout, exchange timeout retry/failure, WebSocket reconnect backoff, startup stale-Active exit-code policy, and EventLog fail-fast ordering. |
-| MIG-v3#9 | Position Reconciliation Worker — UNTRACKED side (ADR-0022) | ✅ Done — symmetric reconciliation loop, `reconcile_close`, startup abort gate, `robson-cli reconcile-close`, and `POST /reconcile-close` implemented (TD-2026-05-05-001 Slices 0–5B2B). |
+| MIG-v3#9 | Position Reconciliation Worker — UNTRACKED side (ADR-0022) | ⚠️ Implemented in part — startup/periodic USD-M Futures reconciliation and market close are live; exact originating-order authorship, durable I2 audit events, and spot/margin coverage remain follow-up. |
 | MIG-v3#10 | Symbol-agnostic documentation + test sweep (ADR-0023) | ✅ Done — `EntryLifecycleStage` computed projection in `robson-domain/src/events.rs`. |
 | MIG-v3#11 | Policy Layer + Dynamic Slot Calculation (ADR-0024) | ✅ Done (2db23ad2, corrected 0b3653a7) — `TradingPolicy`, `TechStopConfig`; `RiskGate` consumes policy; all static exposure caps eliminated. |
 | MIG-v3#12 | Monthly State Persistence — `MonthBoundaryReset` + `monthly_state` projection | ✅ Done — `realized_loss` and `trades_opened` in `monthly_state`; `/status` exposes `new_slots_available`, `occupied_slots`, `slot_cells_total`. |
@@ -139,7 +139,7 @@ backend for compatibility, but are not release-supported operator actions.
 | QE-P4 | Full Audit & Replay | ✅ Done (2026-04-05) |
 | QE-P5 | Context Governance (LLM) | 🔄 Deferred to MIG-v4#5 — no LLM integration in v3. |
 | VAL-001 | Testnet E2E validation (arm → signal → fill → trailing stop → exit) | ✅ PASS (2026-04-22) — full event sequence `position_armed → position_closed` confirmed, `cycle_id` on all orders, PnL calculated, 0 UNTRACKED. See `docs/runbooks/val-001-testnet-e2e-validation.md` Run Log. |
-| VAL-002 | Real capital activation (real Binance keys + monitor enabled in prod) | ✅ PASS (2026-04-22) — sha-9448ce20, monitor active, 0 UNTRACKED in 10 min. See `docs/runbooks/val-002-real-capital-activation.md` Run Log. |
+| VAL-002 | Real capital activation | Historical PASS (2026-04-22) — sha-9448ce20 ran the now-superseded monitor and observed 0 UNTRACKED in 10 min. Production flag-off is verified through `rbx-infra` PR #325; application runtime-retirement rollout remains pending. See `docs/runbooks/val-002-real-capital-activation.md`. |
 
 ### MIG-v2.5#2 Technical Notes (2026-04-05, validated 2026-04-10)
 
@@ -213,7 +213,7 @@ Error: error communicating with database: failed to lookup address information: 
 
 2. **WebSocket reconnection** (`market_data.rs`): The `spawn_ws_client` task now runs indefinitely. On stream close or error, it waits with exponential backoff (1 s → 60 s cap) and reconnects. Backoff resets only after receiving the **first tick** (not just on connect), so Binance accept-then-immediately-close loops still back off. The task exits cleanly when the `CancellationToken` is cancelled (daemon shutdown).
 
-3. **WS handle awaited on shutdown** (`daemon.rs`): `ws_handle` is now retained and awaited with a 5-second timeout during graceful shutdown, consistent with projection worker and position monitor.
+3. **WS handle awaited on shutdown** (`daemon.rs`): `ws_handle` is now retained and awaited with a 5-second timeout during graceful shutdown, consistent with the other long-lived runtime workers.
 
 **Migration metadata repair (one-time operational fix)**:
 
@@ -705,12 +705,12 @@ The Risk Engine is a mandatory gate in the control loop. Every `EngineAction` pa
               │            │            │
               v            v            v
     ┌─────────────┐ ┌───────────┐ ┌──────────┐
-    │Safety Net   │ │Control    │ │ EventLog │
-    │(independent)│ │Loop       │ │(audit)   │
+    │Reconcile    │ │Control    │ │ EventLog │
+    │Worker       │ │Loop       │ │(audit)   │
     └─────────────┘ └───────────┘ └──────────┘
 ```
 
-**Safety Net**: INDEPENDENT from Risk Engine (defense in depth). Safety Net monitors Binance for rogue positions not opened by Robson and closes them. It does NOT share state with Risk Engine. If Risk Engine fails, Safety Net still operates. If Safety Net fails, Risk Engine still operates. Neither can disable the other.
+**Reconciliation Worker**: INDEPENDENT from the entry-side Risk Engine (defense in depth). The current USD-M Futures worker closes exchange positions with no active local `(symbol, side)` match. It is unconditional and has no supported runtime-disable flag. Exact proof that a position was not opened by Robson requires the originating-order correlation and wider account coverage that remain follow-up work under ADR-0022.
 
 **Control Loop integration**: Risk Engine evaluates at:
 1. **Before Decide**: Pre-check — is the system in a state where ANY action is allowed? (circuit breaker check)
@@ -816,7 +816,7 @@ RiskDecision {
 
 **Resource budget**: Prometheus + Grafana + Loki together should consume <1GB RAM, <500m CPU. Deployed on jaguar alongside Postgres.
 
-**Monitoring model**: Critical runtime monitoring is continuous, not scheduled. robsond owns the Control Loop, Safety Net, exchange reconciliation, and market-data failover as long-lived processes. New Kubernetes CronJobs are allowed only for non-critical housekeeping such as retention, backfills, and offline reports.
+**Monitoring model**: Critical runtime monitoring is continuous, not scheduled. robsond owns the Control Loop, exchange reconciliation, insurance-stop management, and market-data failover as long-lived processes. New Kubernetes CronJobs are allowed only for non-critical housekeeping such as retention, backfills, and offline reports.
 
 ### CI/CD
 
@@ -1009,7 +1009,7 @@ Reconsider TRON integration when ALL of these are true:
 | MIG-v3#6 | **Hash-chained EventLog** for tamper detection | Plain EventLog | EventLog stable, MIG-v2.5#10 ✅ DONE 2026-04-05 | S | Yes — stop computing hashes | Remove hash column, revert to plain append | Audit trail tampering undetectable; acceptable for single operator, problematic if audited |
 | MIG-v3#7 | **PaymentRail trait** (architecture readiness for future settlement) | None | None (pure interface definition) | S | Yes — delete trait | Remove trait definition | No impact on v3; delays TRON readiness if ever needed |
 | MIG-v3#8 | **Chaos testing suite** | ✅ Implemented — `robsond::chaos_tests` covers risk timeout, exchange timeout retry, WebSocket reconnect backoff, startup stale-Active exit-code policy, and EventLog fail-fast ordering | All components deployed and stable | M | Yes — disable tests | Remove chaos test suite from CI | Undiscovered failure modes in production; acceptable risk if monitoring is good |
-| MIG-v3#9 | **Position Reconciliation Worker** (ADR-0022) | No UNTRACKED detection | MIG-v3#1 | M | Yes — disable worker | Config: disable reconciliation worker | UNTRACKED positions remain undetected; safety net gap | ✅ `PositionState::Cancelled` added; disarmed positions no longer recorded as `Closed`.
+| MIG-v3#9 | **Position Reconciliation Worker** (ADR-0022) — startup/periodic USD-M Futures worker and close path implemented; exact order-id authorship and full account coverage remain follow-up | No UNTRACKED detection | MIG-v3#1 | M | No runtime disable — policy invariant | Roll back only to a reviewed implementation that preserves equivalent UNTRACKED enforcement | False positives can close a valid position; false negatives leave unauthorized risk open |
 | MIG-v3#10 | **Symbol-agnostic documentation + test sweep** (ADR-0023) | BTC-coupled docs/tests | None | S | Yes — revert docs | Revert documentation changes | Symbol-specific assumptions persist in policy and tests | ✅ `EntryLifecycleStage` computed projection (`entry_lifecycle_stage` fn in `robson-domain/src/events.rs`). |
 | MIG-v3#11 | **Policy Layer + Dynamic Slot Calculation** (ADR-0024) | Static exposure caps | None | M | Yes — revert to static caps | Config: restore legacy limits | Dynamic slot calculation unavailable; static limits may block valid entries |
 | MIG-v3#12 | **Monthly State Persistence** — `MonthBoundaryReset` + `monthly_state` projection | ✅ Implemented — `realized_loss` and `trades_opened` columns added; dual-routed projection handlers; `load_monthly_state` refactored; backfill script created | MIG-v3#11 | S | Yes — revert to in-memory | Remove monthly_state projection | Monthly realized loss resets on daemon restart; inaccurate budget before real capital |
@@ -1154,7 +1154,7 @@ last step of that acceptance, not evidence that the mode works.
 
 | # | Risk | Likelihood | Impact | Mitigation | Owner |
 |---|------|-----------|--------|------------|-------|
-| 1 | **Risk Engine bug allows trade exceeding limits** | Low | Critical (financial loss) | 100% branch coverage, property-based testing, circuit breaker as independent safety net, Safety Net monitors exchange directly | Leandro (architect + operator) |
+| 1 | **Risk Engine bug allows trade exceeding limits** | Low | Critical (financial loss) | 100% branch coverage, property-based testing, circuit breaker, exchange-side insurance stops, and independent exchange reconciliation | Leandro (architect + operator) |
 | 2 | **Rust daemon instability in production** (memory leak, panic, deadlock) | Medium | High (system downtime) | Deploy alongside Django first (v2.5), monitor for 2+ weeks before promoting. Kubernetes auto-restart on liveness failure. | Leandro |
 | 3 | **Single-operator bus factor** | High | Critical (system unmaintained if operator unavailable) | Binary MonthlyHalt self-protects on 4% drawdown. K8s restarts pod on liveness failure. Documentation sufficient for another engineer to operate. Manual runbooks for circuit breaker reset and position verification. | Leandro |
 | 4 | **Binance API changes break connectors** | Medium | High (trading halted) | Pin Binance API version, monitor deprecation notices. REST+WS fallback pattern. Connector is isolated behind trait — swap implementation without changing Runtime. | Leandro |
@@ -1170,7 +1170,7 @@ The repository already shows `MIG-v2.5#4`, `MIG-v2.5#6`, `MIG-v2.5#10`, and `QE-
 
 1. **VAL-001 Phase 2 — Deploy MIG-v3#11 and complete testnet E2E validation**: build/deploy latest `robsond`, sync `rbx-infra` testnet config (`c3b1bc3`), then validate full lifecycle from entry to exit. No testnet exposure-limit exception is required after ADR-0024.
 2. **Entry order identity and event ordering (§7 of audit)**: add `exchange_order_id` to order events and ensure `EntryOrderPlaced` is emitted only after exchange acknowledgement. Prerequisite for reliable reconciliation.
-3. **Startup reconciliation / MIG-v3#9**: implement UNTRACKED detection, `StartupReconciling` state, and auto-close via Safety Net. Critical for VAL-002.
+3. **Complete MIG-v3#9**: replace current `(symbol, side)` authorship matching with originating exchange-order-id correlation, extend coverage beyond USD-M Futures, and complete the explicit `StartupReconciling` target state. The startup/periodic worker and current futures market-close path are already implemented.
 4. **MIG-v3#12 — Monthly State Persistence**: persist `capital_base` and loss-only monthly realized loss via `MonthBoundaryReset` before real capital operations. **Follow-up**: expose explicit slot fields in `/status` API and wire frontend (Option 2 — see MIG-v3#12 follow-up subsection).
 5. **MIG-v3#10 — Symbol-agnostic documentation + test sweep**: parameterize risk tests across >=2 symbols, remove BTC-coupled assumptions.
 

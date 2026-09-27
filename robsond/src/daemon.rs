@@ -20,26 +20,19 @@
 
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
-// Macro for creating Decimal literals
-use async_trait::async_trait;
 use chrono::{DateTime, Datelike, Utc};
 use robson_connectors::BinanceRestClient;
 #[cfg(feature = "postgres")]
 use robson_domain::{ApprovalPolicy, EntryPolicy, EntryPolicyConfig};
-use robson_domain::{Position, PositionId, PositionState, Price, Symbol, TradingPolicy};
+use robson_domain::{Position, PositionState, Price, Symbol, TradingPolicy};
 use robson_engine::Engine;
 #[cfg(feature = "postgres")]
 use robson_eventlog::{query_events, EventEnvelope, QueryOptions};
 use robson_exec::{ports::IncomePort, ExchangePort, Executor, IntentJournal, StubExchange};
-#[cfg(feature = "postgres")]
-use robson_store::PgDetectedPositionRepository;
 // Optional projection recovery for crash recovery
 #[cfg(feature = "postgres")]
 use robson_store::ProjectionRecovery;
-use robson_store::{
-    DetectedPositionRepository, MemoryDetectedPositionRepository, MemoryStore, PositionRepository,
-    Store, StoreError,
-};
+use robson_store::{MemoryStore, Store};
 use rust_decimal::Decimal;
 use rust_decimal_macros::dec;
 #[cfg(feature = "postgres")]
@@ -68,7 +61,6 @@ use crate::{
     google_jwks::GoogleJwksCache,
     market_data::{FallbackSupport, FeedHealth, MarketDataManager, RestFallbackConfig},
     position_manager::{PositionManager, ReconcileCloseOutcome, ReconciledCloseInput},
-    position_monitor::{PositionMonitor, PositionMonitorConfig as RuntimePositionMonitorConfig},
     query_engine::{QueryRecorder, TracingQueryRecorder},
     reconciliation_worker::{gather_real_evidence, ReconciliationWorker},
 };
@@ -152,58 +144,6 @@ fn initial_month_check() -> Arc<RwLock<(i32, u32)>> {
     // first poll always runs handle_month_boundary, which consults persisted
     // MonthBoundaryReset evidence and no-ops when the reset already exists.
     Arc::new(RwLock::new((0, 0)))
-}
-
-/// Adapts a generic `Store` into a concrete `PositionRepository` trait object.
-struct StorePositionRepositoryAdapter<S: Store + 'static> {
-    store: Arc<S>,
-}
-
-#[async_trait]
-impl<S: Store + 'static> PositionRepository for StorePositionRepositoryAdapter<S> {
-    async fn save(&self, position: &Position) -> Result<(), StoreError> {
-        self.store.positions().save(position).await
-    }
-
-    async fn find_by_id(&self, id: PositionId) -> Result<Option<Position>, StoreError> {
-        self.store.positions().find_by_id(id).await
-    }
-
-    async fn find_by_account(&self, account_id: uuid::Uuid) -> Result<Vec<Position>, StoreError> {
-        self.store.positions().find_by_account(account_id).await
-    }
-
-    async fn find_active(&self) -> Result<Vec<Position>, StoreError> {
-        self.store.positions().find_active().await
-    }
-
-    async fn find_by_state(&self, state: &str) -> Result<Vec<Position>, StoreError> {
-        self.store.positions().find_by_state(state).await
-    }
-
-    async fn find_active_by_symbol_and_side(
-        &self,
-        symbol: &robson_domain::Symbol,
-        side: robson_domain::Side,
-    ) -> Result<Option<Position>, StoreError> {
-        self.store.positions().find_active_by_symbol_and_side(symbol, side).await
-    }
-
-    async fn delete(&self, id: PositionId) -> Result<(), StoreError> {
-        self.store.positions().delete(id).await
-    }
-
-    async fn find_closed_in_month(
-        &self,
-        year: i32,
-        month: u32,
-    ) -> Result<Vec<Position>, StoreError> {
-        self.store.positions().find_closed_in_month(year, month).await
-    }
-
-    async fn find_all_closed(&self) -> Result<Vec<Position>, StoreError> {
-        self.store.positions().find_all_closed().await
-    }
 }
 
 impl Daemon<StubExchange, MemoryStore> {
@@ -690,13 +630,20 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
             }
         }
 
-        // 4. Initialize safety net monitor (when configured with Binance credentials)
-        let position_monitor = self.initialize_position_monitor().await?;
-        let position_monitor_handle =
-            position_monitor.as_ref().map(|monitor| Arc::clone(monitor).start());
+        // 4. ADR-0022 owns UNTRACKED-position enforcement. The legacy
+        // fixed-percentage PositionMonitor configuration remains loadable for
+        // compatibility, but no longer starts an executable runtime path.
+        if self.config.position_monitor.enabled {
+            warn!(
+                "Legacy PositionMonitor configuration is ignored; ADR-0022 ReconciliationWorker \
+                 owns UNTRACKED-position enforcement"
+            );
+        } else {
+            info!("Legacy PositionMonitor runtime wiring is retired");
+        }
 
         // 5. Start API server
-        let api_addr = self.start_api_server(position_monitor.clone()).await?;
+        let api_addr = self.start_api_server().await?;
         info!(%api_addr, "API server started");
 
         // 6. Spawn reconciliation worker (uses explicit missing_grace from config)
@@ -904,16 +851,6 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
 
         if let Some(handle) = income_ledger_handle {
             info!("Waiting for income ledger worker to finish...");
-            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), handle).await;
-        }
-
-        if let Some(monitor) = position_monitor {
-            if let Ok(m) = Arc::try_unwrap(monitor) {
-                m.shutdown().await;
-            }
-        }
-        if let Some(handle) = position_monitor_handle {
-            info!("Waiting for position monitor to finish...");
             let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), handle).await;
         }
 
@@ -1653,10 +1590,7 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
     ///
     /// Public to allow integration tests to start the server and get the
     /// address.
-    pub async fn start_api_server(
-        &self,
-        position_monitor: Option<Arc<PositionMonitor>>,
-    ) -> DaemonResult<SocketAddr> {
+    pub async fn start_api_server(&self) -> DaemonResult<SocketAddr> {
         let circuit_breaker = {
             let pm = self.position_manager.read().await;
             pm.circuit_breaker()
@@ -1697,7 +1631,9 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
             position_manager: self.position_manager.clone(),
             event_bus: self.event_bus.clone(),
             circuit_breaker,
-            position_monitor,
+            // Compatibility routes remain available, but the retired legacy
+            // monitor can no longer be injected into the daemon runtime.
+            position_monitor: None,
             wallet_balance_cache: tokio::sync::Mutex::new(None),
             #[cfg(feature = "postgres")]
             pg_pool: self.pg_pool.clone(),
@@ -1729,63 +1665,6 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
         });
 
         Ok(local_addr)
-    }
-
-    async fn initialize_position_monitor(&self) -> DaemonResult<Option<Arc<PositionMonitor>>> {
-        if !self.config.position_monitor.enabled {
-            info!("Position monitor disabled by configuration");
-            return Ok(None);
-        }
-
-        let Some(api_key) = self.config.position_monitor.binance_api_key.clone() else {
-            info!("Position monitor enabled but Binance API key not configured; skipping");
-            return Ok(None);
-        };
-        let Some(api_secret) = self.config.position_monitor.binance_api_secret.clone() else {
-            info!("Position monitor enabled but Binance API secret not configured; skipping");
-            return Ok(None);
-        };
-
-        let monitor_config = RuntimePositionMonitorConfig {
-            poll_interval_secs: self.config.position_monitor.poll_interval_secs,
-            symbols: self.config.position_monitor.symbols.clone(),
-            enabled: self.config.position_monitor.enabled,
-            ..RuntimePositionMonitorConfig::default()
-        };
-
-        let detected_repo: Arc<dyn DetectedPositionRepository> = {
-            #[cfg(feature = "postgres")]
-            {
-                if let Some(pool) = &self.pg_pool {
-                    Arc::new(PgDetectedPositionRepository::new(pool.clone()))
-                } else {
-                    Arc::new(MemoryDetectedPositionRepository::new())
-                }
-            }
-            #[cfg(not(feature = "postgres"))]
-            {
-                Arc::new(MemoryDetectedPositionRepository::new())
-            }
-        };
-
-        let core_repo: Arc<dyn PositionRepository> =
-            Arc::new(StorePositionRepositoryAdapter { store: self.store.clone() });
-        let binance_client = Arc::new(BinanceRestClient::new(api_key, api_secret));
-
-        let monitor = Arc::new(PositionMonitor::with_core_exclusion(
-            binance_client,
-            self.event_bus.clone(),
-            monitor_config,
-            detected_repo,
-            core_repo,
-        ));
-
-        monitor.load_persisted_positions().await?;
-        info!(
-            symbols = ?self.config.position_monitor.symbols,
-            "Position monitor initialized"
-        );
-        Ok(Some(monitor))
     }
 
     /// Handle an event from the event bus.
@@ -2078,7 +1957,7 @@ mod tests {
         let config = Config::test();
         let daemon = Daemon::new_stub(config);
 
-        let addr = daemon.start_api_server(None).await.unwrap();
+        let addr = daemon.start_api_server().await.unwrap();
 
         // Server should be running on a port
         assert!(addr.port() > 0);
