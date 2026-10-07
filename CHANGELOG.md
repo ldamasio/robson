@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added - Unmatched exchange income is visible on the dashboard (ADR-0045)
+
+- `/status` already reported `unmatched_income_count`, but the frontend neither
+  parsed nor displayed it; the only trace was an hourly `warn!` digest in the
+  daemon log. Production carried 4 unmatched items on 2026-10-07, silently
+  blocking the automatic `capital_base` recalibration from confirmed transfers.
+- The risk dashboard now shows a banner with the count and the acknowledgement
+  path while the count is above zero. Listing and acknowledging the items from
+  the UI remains backlog.
 ### Fixed - Dashboard showed "STALE, reconnecting" on every mount
 
 - The SSE client only reported a connection to the page when it was a

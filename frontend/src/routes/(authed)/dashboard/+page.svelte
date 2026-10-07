@@ -514,6 +514,21 @@
     <section>
       <Stack gap={4}>
         <div class="eyebrow">RISK DASHBOARD · {monthLabel()}</div>
+        {#if !isHistoricalMonth && currentStatus && (currentStatus.unmatched_income_count ?? 0) > 0}
+          <!-- ADR-0045: unmatched exchange income blocks the automatic
+               capital_base recalibration; until the operator acks the rows
+               (robson-cli income ack) the alarm is invisible anywhere else. -->
+          <div class="capital-banner" role="status">
+            <Row justify="between" align="center">
+              <span>
+                {$_("dashboard.unmatchedIncomeBanner", {
+                  values: { count: currentStatus.unmatched_income_count ?? 0 },
+                })}
+              </span>
+              <span class="mono">{$_("dashboard.unmatchedIncomeAction")}</span>
+            </Row>
+          </div>
+        {/if}
         {#if !isHistoricalMonth && currentStatus}
           <div class="risk-grid">
             <Card padding={4}>

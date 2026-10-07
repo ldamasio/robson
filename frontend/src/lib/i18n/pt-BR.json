@@ -46,6 +46,8 @@
     "connectionError": "ERRO DE CONEXÃO",
     "retry": "Tentar novamente",
     "insufficientCapitalBanner": "Capital insuficiente para operar",
+    "unmatchedIncomeBanner": "{count} lançamento(s) de income da exchange sem posição Robson correspondente · recalibração do capital_base bloqueada",
+    "unmatchedIncomeAction": "ack: robson-cli income ack <id>",
     "monthlyBudgetExhaustedBanner": "Orçamento de risco mensal esgotado. Novas entradas liberam na virada do mês.",
     "monthlyBudgetLowBanner": "Orçamento de risco mensal quase esgotado. Só entram operações que arrisquem menos do que o saldo restante.",
     "addFunds": "Adicionar fundos",
