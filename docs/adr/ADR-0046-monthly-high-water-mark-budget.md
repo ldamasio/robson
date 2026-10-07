@@ -136,3 +136,17 @@ equity and the accumulators reset — `governed_net = 0`, `month_peak_net = 0`.
 - Refines ADR-0043 (`remaining_budget` input becomes give-back from peak).
 - [ADR-0045](ADR-0045-income-ledger-reconciliation.md) — governed-only flow
   feeding the peak.
+
+Amendment (2026-10-07, live marks)
+
+§3 says the peak updates "on every monitor tick (20 s cadence, which already
+computes unrealized P&L)". Until this amendment the unrealized P&L in that
+refresh came from the stored `Active.current_price`, which the projection
+only updates on fill and on `TrailingStopUpdated`, and which a restart
+resets to the entry price. Peaks were thus observed at ratchet extremes
+only, intra-trade give-back was invisible, and a restart produced a phantom
+drawdown. The runtime now marks open robsond-authored positions at the last
+market price seen for the symbol (falling back to the stored price until the
+first tick after startup). The exclusion of out-of-band drift is unchanged:
+marks apply only to governed open positions, never to the wallet balance.
+

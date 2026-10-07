@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed - Month equity marked at live price (ADR-0046)
+
+- `month_equity_net` valued open positions at the stored `current_price`, which
+  only moves on fill and on trailing-stop advances and resets to the entry price
+  after a restart. The month peak was therefore set at ratchet extremes while
+  intra-trade give-back never showed, and a restart with an open winner showed a
+  phantom drawdown (2026-10-07: 1.7% of the 4% budget and one slot lost while
+  the position was at its best).
+- `PositionManager` now keeps the last market price per symbol and marks Active
+  positions with it in the canonical budget snapshot, the monthly halt
+  evaluation and the equity peak refresh. The stored price remains the fallback
+  until the first tick after startup.
+
 ### Fixed - Position monitor tick storm (ADR-0049)
 
 - `position_monitor_tick` was emitted once per Binance `aggTrade` message per
