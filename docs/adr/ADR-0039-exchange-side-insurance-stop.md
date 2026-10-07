@@ -166,3 +166,23 @@ Recorded here for traceability; each needs its own fix, none blocks this ADR:
    legitimately advanced the trailing stop by one full span to breakeven
    (58888.00 + 808.90 = 59696.90) before the exit — the audit fields were
    correct. No fix needed; kept here so the wrong lead is not re-chased.
+
+Amendment (2026-10-07, re-placement retry)
+
+The cancel-replace on a trailing advance is place-then-cancel: a failed
+placement leaves the previous exchange stop live, which is the safe
+direction, but nothing re-issued the move afterwards. The engine's
+idempotency key for the advance is the technical stop recorded by
+`TrailingStopUpdated`, which is applied even when the exchange leg fails,
+so the exchange stop could lag the software stop by one span until the next
+rung or a restart heal. The runtime now tracks positions whose placement or
+re-placement failed and re-places the stop at the current executable
+trigger at tick cadence with a 30 s backoff, through the same executor path
+and events. The two-layer invariant is unchanged; this closes the gap
+between "software stop advanced" and "exchange stop follows".
+
+Note on exit labels: with both layers at the same trigger price, the
+exchange order fires in the matching engine before the trade reaches the
+daemon, so `Closed (InsuranceStop)` is the expected steady-state outcome of
+a stopped position while the daemon is healthy, not evidence of an outage.
+

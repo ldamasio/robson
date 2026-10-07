@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed - Failed insurance-stop re-placement is now retried (ADR-0039)
+
+- After a trailing advance the executor places the new exchange stop and then
+  cancels the old one; if the placement failed it only emitted an audit
+  `InsuranceStopFailed` and left the previous stop live. Because
+  `TrailingStopUpdated` still recorded the new level as emitted, the engine
+  never re-issued the move, so the exchange stop could sit one full rung behind
+  the software stop until the next rung or a restart (daemon-down exposure of
+  one span).
+- `PositionManager` now remembers such positions, re-places the stop at the
+  current software trigger on a later tick with a 30 s backoff, and clears the
+  entry when the exchange accepts the order. Failed initial placements after an
+  entry fill are healed the same way. New gauge
+  `robsond_insurance_stop_stale_positions`.
+
 ### Fixed - Month equity marked at live price (ADR-0046)
 
 - `month_equity_net` valued open positions at the stored `current_price`, which
