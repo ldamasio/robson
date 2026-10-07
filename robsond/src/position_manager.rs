@@ -172,6 +172,10 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// only moves on fill and on trailing advances (and resets to the entry
     /// price on restart).
     last_market_price: Arc<RwLock<HashMap<Symbol, Price>>>,
+    /// Active positions whose exchange-side insurance stop is known to sit
+    /// behind the software stop plan because a placement or re-placement
+    /// failed (ADR-0039). Value: earliest instant the next attempt may run.
+    insurance_stop_stale: Arc<RwLock<HashMap<PositionId, std::time::Instant>>>,
     /// Armed positions whose entry attempt exhausted its autonomy
     /// (ADR-0050 §2 `needs_operator_rearm`). No detector runs for them and
     /// none is restored at startup; the operator disarms or arms anew.
@@ -223,6 +227,12 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
 /// (risk denial, expired approval). Without it, an Immediate-mode re-arm
 /// refires instantly and a persistent governed condition becomes a ~1/s hot
 /// loop against the OHLCV source and the event store.
+/// Minimum spacing between two attempts to re-place an exchange insurance
+/// stop that a previous placement or re-placement failed to put at the
+/// software trigger (ADR-0039). The first attempt waits this long too, so
+/// a transient exchange error is not hammered at tick cadence.
+const INSURANCE_STOP_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Pure throttle rule for audit-only monitor ticks (ADR-0049): drop the
 /// tick when one was emitted for the position less than `interval` ago.
 fn should_drop_monitor_tick(
@@ -829,6 +839,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             monitor_tick_interval: std::time::Duration::ZERO,
             last_monitor_tick_at: Arc::new(RwLock::new(HashMap::new())),
             last_market_price: Arc::new(RwLock::new(HashMap::new())),
+            insurance_stop_stale: Arc::new(RwLock::new(HashMap::new())),
             entry_exhausted: Arc::new(RwLock::new(HashMap::new())),
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
             entry_flow_lock: Mutex::new(()),
@@ -1043,6 +1054,158 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// separate steps, so this is fail-fast ordered visibility, not an atomic
     /// multi-step guarantee.
     async fn execute_and_persist(
+        &self,
+        actions: Vec<EngineAction>,
+    ) -> DaemonResult<Vec<ActionResult>> {
+        let results = self.execute_and_persist_inner(actions).await?;
+        self.note_insurance_stop_results(&results).await;
+        Ok(results)
+    }
+
+    /// Track exchange-side insurance stop outcomes (ADR-0039). A failed
+    /// placement or re-placement leaves the previous stop (or none) live on
+    /// the exchange while the software plan has already advanced; the engine
+    /// will not re-emit the move (its idempotency key is the technical stop),
+    /// so the position is remembered here and healed at tick cadence by
+    /// `retry_stale_insurance_stop`. An accepted placement clears it.
+    async fn note_insurance_stop_results(&self, results: &[ActionResult]) {
+        let mut stale = self.insurance_stop_stale.write().await;
+        let mut changed = false;
+        for result in results {
+            match result {
+                ActionResult::EventEmitted(Event::InsuranceStopFailed {
+                    position_id,
+                    stop_price,
+                    error,
+                    ..
+                }) => {
+                    stale.insert(
+                        *position_id,
+                        std::time::Instant::now() + INSURANCE_STOP_RETRY_BACKOFF,
+                    );
+                    changed = true;
+                    warn!(
+                        %position_id,
+                        stop_price = %stop_price.as_decimal(),
+                        %error,
+                        retry_in_secs = INSURANCE_STOP_RETRY_BACKOFF.as_secs(),
+                        "Exchange insurance stop is behind the software stop plan; re-placement scheduled (ADR-0039)"
+                    );
+                },
+                ActionResult::OrderPlaced {
+                    event:
+                        Some(
+                            Event::InsuranceStopPlaced { position_id, .. }
+                            | Event::InsuranceStopReplaced { position_id, .. },
+                        ),
+                    ..
+                } => {
+                    if stale.remove(position_id).is_some() {
+                        changed = true;
+                        info!(%position_id, "Exchange insurance stop healed to the software stop plan");
+                    }
+                },
+                _ => {},
+            }
+        }
+        if changed {
+            crate::metrics::INSURANCE_STOP_STALE_POSITIONS.set(stale.len() as f64);
+        }
+    }
+
+    /// Forget stale-insurance bookkeeping for positions that are no longer
+    /// Active (closed, errored, reconciled away).
+    async fn prune_insurance_stop_stale(&self, active: &[Position]) {
+        if self.insurance_stop_stale.read().await.is_empty() {
+            return;
+        }
+        let active_ids: HashSet<PositionId> = active.iter().map(|p| p.id).collect();
+        let mut stale = self.insurance_stop_stale.write().await;
+        let before = stale.len();
+        stale.retain(|id, _| active_ids.contains(id));
+        if stale.len() != before {
+            crate::metrics::INSURANCE_STOP_STALE_POSITIONS.set(stale.len() as f64);
+        }
+    }
+
+    /// Re-place the exchange insurance stop of a stale position at the
+    /// current software trigger (ADR-0039), if its retry window is due.
+    /// Returns whether an attempt was made; success and failure bookkeeping
+    /// happens in `note_insurance_stop_results` through the executor path.
+    async fn retry_stale_insurance_stop(&self, position: &Position) -> bool {
+        let due = match self.insurance_stop_stale.read().await.get(&position.id) {
+            Some(retry_at) => std::time::Instant::now() >= *retry_at,
+            None => return false,
+        };
+        if !due {
+            return false;
+        }
+        let (trailing_stop, guard, insurance_stop_id) = match &position.state {
+            PositionState::Active {
+                trailing_stop,
+                invalidation_guard_level,
+                insurance_stop_id,
+                ..
+            } => (*trailing_stop, *invalidation_guard_level, insurance_stop_id.clone()),
+            _ => {
+                self.insurance_stop_stale.write().await.remove(&position.id);
+                return false;
+            },
+        };
+        // Push the window first so a batch error (not only an audit failure)
+        // also backs off instead of retrying on every tick.
+        self.insurance_stop_stale
+            .write()
+            .await
+            .insert(position.id, std::time::Instant::now() + INSURANCE_STOP_RETRY_BACKOFF);
+
+        let rules = self.trading_rules_for(position).await;
+        let trigger = match self.engine().stop_plan(position, trailing_stop, guard, rules.as_ref())
+        {
+            Ok(plan) => plan.trigger,
+            Err(error) => {
+                // Fail closed: never touch protection that cannot be re-derived.
+                warn!(
+                    position_id = %position.id,
+                    %error,
+                    "Cannot re-derive the executable stop; leaving the exchange insurance stop as is"
+                );
+                return true;
+            },
+        };
+        let action = match insurance_stop_id {
+            Some(previous_order_id) => EngineAction::ReplaceInsuranceStop {
+                position_id: position.id,
+                symbol: position.symbol.clone(),
+                side: position.side.exit_action(),
+                quantity: position.quantity,
+                previous_order_id,
+                new_stop_price: trigger,
+            },
+            None => EngineAction::PlaceInsuranceStop {
+                position_id: position.id,
+                symbol: position.symbol.clone(),
+                side: position.side.exit_action(),
+                quantity: position.quantity,
+                stop_price: trigger,
+            },
+        };
+        info!(
+            position_id = %position.id,
+            trigger = %trigger.as_decimal(),
+            "Re-placing the exchange insurance stop at the current software trigger (ADR-0039)"
+        );
+        if let Err(error) = self.execute_and_persist(vec![action]).await {
+            warn!(
+                position_id = %position.id,
+                %error,
+                "Insurance stop re-placement batch failed; will retry after backoff"
+            );
+        }
+        true
+    }
+
+    async fn execute_and_persist_inner(
         &self,
         actions: Vec<EngineAction>,
     ) -> DaemonResult<Vec<ActionResult>> {
@@ -3388,12 +3551,26 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Find all active positions for this symbol (from projection)
         let active_positions = self.store.positions().find_active().await?;
         let active_positions_count = active_positions.len();
+        self.prune_insurance_stop_stale(&active_positions).await;
 
         for position in active_positions {
             if position.symbol != data.symbol {
                 continue;
             }
 
+            if !matches!(position.state, PositionState::Active { .. }) {
+                continue;
+            }
+
+            // ADR-0039: an exchange stop left behind by a failed placement or
+            // re-placement is healed here, at tick cadence with backoff,
+            // before this tick is evaluated. Re-read the position afterwards
+            // so the engine sees the new insurance order id.
+            let position = if self.retry_stale_insurance_stop(&position).await {
+                self.get_position(position.id).await?.unwrap_or(position)
+            } else {
+                position
+            };
             if !matches!(position.state, PositionState::Active { .. }) {
                 continue;
             }
@@ -5274,6 +5451,87 @@ mod tests {
     /// exit fill. A successful return proves the ProcessMarketTick query did
     /// not fail in the Acting state by routing the protective order result to
     /// handle_exit_fill.
+    /// ADR-0039: when the cancel-replace of the exchange insurance stop fails
+    /// after a trailing advance, the software plan has moved but the exchange
+    /// stop sits one rung behind and the engine never re-emits the move. The
+    /// manager must remember the position and re-place the stop on a later
+    /// tick, with backoff.
+    #[tokio::test]
+    async fn test_failed_insurance_stop_replace_is_retried_on_a_later_tick() {
+        let manager = create_test_manager().await;
+        let mut position =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+        let entry_price = Price::new(dec!(100)).unwrap();
+        let initial_stop = Price::new(dec!(90)).unwrap();
+        let previous_order_id = "insurance-old".to_string();
+        position.tech_stop_distance =
+            Some(TechnicalStopDistance::from_entry_and_stop(entry_price, initial_stop));
+        position.insurance_stop_id = Some(previous_order_id.clone());
+        if let PositionState::Active { insurance_stop_id, last_emitted_stop, .. } =
+            &mut position.state
+        {
+            *insurance_stop_id = Some(previous_order_id.clone());
+            *last_emitted_stop = Some(initial_stop);
+        }
+        manager.store.positions().save(&position).await.unwrap();
+        let tick = |price: Decimal| MarketData {
+            symbol: position.symbol.clone(),
+            price: Price::new(price).unwrap(),
+            timestamp: chrono::Utc::now(),
+            source: crate::event_bus::MarketDataSource::Ws,
+        };
+
+        // Tick 1: the stop advances to breakeven, but the exchange rejects
+        // the replacement order. Audit-only failure; old stop stays live.
+        let exchange = manager.executor.exchange();
+        exchange.set_order_fail_next(true);
+        manager.process_market_data(tick(dec!(110))).await.unwrap();
+
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert!(events.iter().any(|e| matches!(e, Event::InsuranceStopFailed { .. })));
+        assert!(!events.iter().any(|e| matches!(e, Event::InsuranceStopReplaced { .. })));
+        let after_failure = manager.get_position(position.id).await.unwrap().unwrap();
+        assert_eq!(after_failure.insurance_stop_id.as_deref(), Some("insurance-old"));
+        match &after_failure.state {
+            PositionState::Active { trailing_stop, .. } => assert_eq!(*trailing_stop, entry_price),
+            other => panic!("expected Active, got {other:?}"),
+        }
+        assert!(manager.insurance_stop_stale.read().await.contains_key(&position.id));
+
+        // Tick 2, inside the backoff window: no retry yet.
+        manager.process_market_data(tick(dec!(111))).await.unwrap();
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert!(!events.iter().any(|e| matches!(e, Event::InsuranceStopReplaced { .. })));
+
+        // Backoff elapsed: the next tick re-places the stop at the current
+        // software trigger even though the engine has nothing new to emit.
+        manager
+            .insurance_stop_stale
+            .write()
+            .await
+            .insert(position.id, std::time::Instant::now());
+        manager.process_market_data(tick(dec!(111))).await.unwrap();
+
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        let (new_order_id, stop_price) = events
+            .iter()
+            .find_map(|event| match event {
+                Event::InsuranceStopReplaced {
+                    previous_order_id: prev,
+                    order_id,
+                    stop_price,
+                    ..
+                } if prev == "insurance-old" => Some((order_id.clone(), *stop_price)),
+                _ => None,
+            })
+            .expect("retry must re-place the insurance stop");
+        assert_eq!(stop_price, entry_price);
+        let healed = manager.get_position(position.id).await.unwrap().unwrap();
+        assert_eq!(healed.insurance_stop_id.as_deref(), Some(new_order_id.as_str()));
+        assert!(matches!(healed.state, PositionState::Active { .. }));
+        assert!(!manager.insurance_stop_stale.read().await.contains_key(&position.id));
+    }
+
     #[tokio::test]
     async fn test_process_market_data_keeps_active_position_after_insurance_stop_replace() {
         let manager = create_test_manager().await;
