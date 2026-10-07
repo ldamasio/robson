@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed - Position monitor tick storm (ADR-0049)
+
+- `position_monitor_tick` was emitted once per Binance `aggTrade` message per
+  Active position since the market-data WebSocket became live (#145), with no
+  throttle: tens of rows per second into `event_log` plus one clone per tick
+  pushed into the in-memory `MemoryStore` event vector, which is never read at
+  runtime. That unbounded vector is the most likely cause of the 2026-08-18
+  OOMKill recorded in rbx-infra (growth only while a position was Active).
+- `MemoryStore::append` now sequences but does not retain `PositionMonitorTick`.
+- `PositionManager` throttles audit-only ticks per position with
+  `ROBSON_POSITION_MONITOR_TICK_INTERVAL_SECS` (default 20; 0 restores one event
+  per trade). The engine still evaluates every trade; exits and trailing advances
+  are never throttled and keep their accompanying tick.
+- `GET /events/history` excludes `position_monitor_tick` so the dashboard's
+  daily feed shows decision events instead of the last three seconds of ticks.
+  `QueryOptions::exclude_event_type` is the new eventlog filter.
+- Operational rollout pending: existing tick rows in `event_log_2026_08/09/10`
+  remain until pruned under the bronze-v1 retention interlock.
 ### Added - Unmatched exchange income is visible on the dashboard (ADR-0045)
 
 - `/status` already reported `unmatched_income_count`, but the frontend neither

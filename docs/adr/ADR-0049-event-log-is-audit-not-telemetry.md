@@ -88,3 +88,23 @@ windows. A pg_dump archive alone no longer authorizes deletion from these
 two tables. This amendment does not change Decision 3 for
 event_idempotency and queries_current; ADR-0049 makes no retention
 decision for snapshots.
+
+Amendment (2026-10-07, position_monitor_tick rate)
+
+The "~70k rows / ~20 MB per active month" premise above was measured while
+the engine saw one price every 5 s (REST fallback). Since the market-data
+WebSocket became live (#145, 2026-08-02) the engine processes every
+`aggTrade`, and `position_monitor_tick` followed at the same rate (tens of
+rows per second in bursts), both into `event_log` and into the runtime
+`MemoryStore` event vector, which nothing reads back. Decisions:
+
+1. The runtime in-memory store does not retain `PositionMonitorTick`; the
+   durable event log remains the only audit copy.
+2. Audit-only ticks are throttled per position to one event per
+   `ROBSON_POSITION_MONITOR_TICK_INTERVAL_SECS` (default 20 s). Ticks that
+   accompany an exit or a trailing advance are never dropped, so the
+   decision trail is unchanged.
+3. `GET /events/history` excludes `position_monitor_tick`; the operator feed
+   is for decisions and effects.
+
+Existing tick rows stay under the 2026-08-07 bronze-v1 interlock.
