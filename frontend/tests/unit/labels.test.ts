@@ -7,7 +7,8 @@ import {
   isPositionActive,
   positionLabel,
   positionStateLabel,
-  trailingStopMoveTarget
+  trailingStopMoveTarget,
+  trailingLadderRung
 } from '$lib/presentation/labels';
 import type { Position, PositionState, SseEvent } from '$api/robson';
 
@@ -162,7 +163,145 @@ describe('trailingStopMoveTarget', () => {
 
 // --- positionSummaryLines ---
 
+describe('trailingLadderRung', () => {
+  it('reports the rung, next trigger and distance for a short on the second rung', () => {
+    // Live geometry from the 2026-10-05 BTCUSDT short: E 85,879.90, S 1,183.20,
+    // technical stop at E - S after the price touched 83,500.
+    const rung = trailingLadderRung(
+      basePosition({
+        state: 'Active',
+        side: 'Short',
+        entry_price: 85879.9,
+        entry_reference: 85879.9,
+        executable_span: 1183.2,
+        trailing_stop: 84696.7,
+        current_price: 83120.8,
+        tech_stop_distance: 1096.2
+      })
+    );
+
+    expect(rung).not.toBeNull();
+    expect(rung?.completed_spans).toBe(2);
+    expect(rung?.favorable_extreme).toBeNull();
+    expect(rung?.next_trigger).toBeCloseTo(82330.3, 6);
+    // (83,120.80 - 82,330.30) / 83,120.80
+    expect(rung?.distance_to_next_pct).toBeCloseTo(0.951, 2);
+  });
+
+  it('is rung 0 before the first advance and uses the favorable extreme when present', () => {
+    const state: PositionState = {
+      Active: {
+        current_price: 108,
+        trailing_stop: 90,
+        favorable_extreme: 110,
+        extreme_at: '2026-08-04T12:00:00Z',
+        insurance_stop_id: 'ins-1',
+        last_emitted_stop: null
+      }
+    };
+    const rung = trailingLadderRung(
+      basePosition({ state, entry_price: 100, entry_reference: 100, executable_span: 12 })
+    );
+
+    expect(rung).toEqual({
+      completed_spans: 0,
+      favorable_extreme: 110,
+      next_trigger: 112,
+      distance_to_next_pct: expect.closeTo((112 - 108) / 108 * 100, 6)
+    });
+  });
+
+  it('clamps the distance at zero once the price is past the next trigger', () => {
+    const rung = trailingLadderRung(
+      basePosition({
+        state: 'Active',
+        entry_price: 100,
+        entry_reference: 100,
+        executable_span: 12,
+        trailing_stop: 100,
+        current_price: 125
+      })
+    );
+
+    expect(rung?.completed_spans).toBe(1);
+    expect(rung?.next_trigger).toBe(124);
+    expect(rung?.distance_to_next_pct).toBe(0);
+  });
+
+  it('leaves the distance null when the current price is unknown', () => {
+    const rung = trailingLadderRung(
+      basePosition({
+        state: 'Active',
+        entry_price: 100,
+        entry_reference: 100,
+        executable_span: 12,
+        trailing_stop: 90
+      })
+    );
+
+    expect(rung?.distance_to_next_pct).toBeNull();
+  });
+
+  it('has no ruler on the legacy path or outside Active', () => {
+    expect(
+      trailingLadderRung(
+        basePosition({ state: 'Active', entry_price: 100, trailing_stop: 90, tech_stop_distance: 10 })
+      )
+    ).toBeNull();
+    expect(
+      trailingLadderRung(
+        basePosition({ state: 'Armed', entry_reference: 100, executable_span: 12, trailing_stop: 90 })
+      )
+    ).toBeNull();
+  });
+});
+
 describe('positionSummaryLines', () => {
+  it('renders the RUNG line after TARGET on the executable-span path', () => {
+    const lines = positionSummaryLines(
+      basePosition({
+        state: 'Active',
+        side: 'Short',
+        entry_price: 85879.9,
+        entry_reference: 85879.9,
+        executable_span: 1183.2,
+        trailing_stop: 84696.7,
+        effective_stop: 84781.4,
+        current_price: 83120.8,
+        quantity: 0.012
+      })
+    );
+
+    expect(lines[0]).toContain('ACTIVE');
+    expect(lines[1]).toContain('TARGET');
+    expect(lines[1]).toContain('82,330.30 -> stop 83,513.50');
+    expect(lines[2]).toMatch(/^RUNG\s+2 · next 82,330.30 \(0\.95% away\)$/);
+    expect(lines[3]).toContain('ENTRY');
+    expect(lines[4]).toContain('SIZE');
+  });
+
+  it('folds the favorable extreme into the RUNG line instead of a separate EXTREME line', () => {
+    const state: PositionState = {
+      Active: {
+        current_price: 128,
+        trailing_stop: 100,
+        favorable_extreme: 130,
+        extreme_at: '2026-08-04T12:00:00Z',
+        insurance_stop_id: 'ins-1',
+        last_emitted_stop: 100
+      }
+    };
+    const lines = positionSummaryLines(
+      basePosition({ state, entry_price: 101, entry_reference: 100, executable_span: 12 })
+    );
+
+    const rungLine = lines.find((l) => l.startsWith('RUNG'));
+    expect(rungLine).toBeDefined();
+    expect(rungLine).toContain('2 · extreme 130.00 · next 136.00');
+    expect(lines.some((l) => l.startsWith('EXTREME'))).toBe(false);
+  });
+
+
   it('Armed state', () => {
     const lines = positionSummaryLines(basePosition({ state: 'Armed' }));
     expect(lines).toHaveLength(2);
