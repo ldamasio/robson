@@ -167,6 +167,11 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     monitor_tick_interval: std::time::Duration,
     /// When the last `PositionMonitorTick` was emitted per position.
     last_monitor_tick_at: Arc<RwLock<HashMap<PositionId, std::time::Instant>>>,
+    /// Last market price seen per symbol. Marks Active positions for the
+    /// ADR-0046 month equity instead of the stored `current_price`, which
+    /// only moves on fill and on trailing advances (and resets to the entry
+    /// price on restart).
+    last_market_price: Arc<RwLock<HashMap<Symbol, Price>>>,
     /// Armed positions whose entry attempt exhausted its autonomy
     /// (ADR-0050 §2 `needs_operator_rearm`). No detector runs for them and
     /// none is restored at startup; the operator disarms or arms anew.
@@ -354,6 +359,22 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         *self.engine.lock().unwrap().risk_config()
     }
 
+    /// Unrealized P&L of the Active positions in `positions`, each marked at
+    /// the last market price seen for its symbol when one is known, else at
+    /// the stored `current_price` (fill price, or the last trailing ratchet).
+    /// ADR-0046 §3: the month equity peak must observe live marks.
+    async fn unrealized_pnl_marked(&self, positions: &[Position]) -> Decimal {
+        let marks = self.last_market_price.read().await;
+        positions
+            .iter()
+            .filter(|position| matches!(position.state, PositionState::Active { .. }))
+            .map(|position| match marks.get(&position.symbol) {
+                Some(mark) => position.unrealized_pnl_at(*mark),
+                None => position.calculate_pnl(),
+            })
+            .sum()
+    }
+
     /// Compute current equity per ADR-0024 §6:
     ///
     /// ```text
@@ -373,15 +394,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let all_time_realized: Decimal =
             all_closed.iter().map(|p| p.realized_pnl - p.fees_paid).sum();
 
-        // Unrealized PnL of open Active positions
+        // Unrealized PnL of open Active positions at live marks
         let active = self.store.positions().find_risk_open().await?;
-        let unrealized: Decimal = active
-            .iter()
-            .filter_map(|p| match &p.state {
-                PositionState::Active { .. } => Some(p.calculate_pnl()),
-                _ => None,
-            })
-            .sum();
+        let unrealized = self.unrealized_pnl_marked(&active).await;
 
         Ok(initial_capital + all_time_realized + unrealized)
     }
@@ -646,17 +661,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         now: chrono::DateTime<chrono::Utc>,
     ) -> DaemonResult<Decimal> {
         let realized_net = self.robson_month_net(now).await?;
-        let unrealized: Decimal = self
-            .store
-            .positions()
-            .find_risk_open()
-            .await?
-            .iter()
-            .filter_map(|position| match position.state {
-                PositionState::Active { .. } => Some(position.calculate_pnl()),
-                _ => None,
-            })
-            .sum();
+        let risk_open = self.store.positions().find_risk_open().await?;
+        let unrealized = self.unrealized_pnl_marked(&risk_open).await;
         Ok(realized_net + unrealized)
     }
 
@@ -822,6 +828,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             // `with_monitor_tick_interval`.
             monitor_tick_interval: std::time::Duration::ZERO,
             last_monitor_tick_at: Arc::new(RwLock::new(HashMap::new())),
+            last_market_price: Arc::new(RwLock::new(HashMap::new())),
             entry_exhausted: Arc::new(RwLock::new(HashMap::new())),
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
             entry_flow_lock: Mutex::new(()),
@@ -3374,6 +3381,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     }
 
     pub async fn process_market_data(&self, data: MarketData) -> DaemonResult<()> {
+        // Remember the latest mark for this symbol so month equity (ADR-0046)
+        // values open positions at the live price, not at the last ratchet.
+        self.last_market_price.write().await.insert(data.symbol.clone(), data.price);
+
         // Find all active positions for this symbol (from projection)
         let active_positions = self.store.positions().find_active().await?;
         let active_positions_count = active_positions.len();
@@ -4416,13 +4427,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let monthly = self.load_monthly_state(now).await?;
         let governed_realized_net = self.robson_month_net(now).await?;
         let local_risk_open = self.store.positions().find_risk_open().await?;
-        let unrealized_net: Decimal = local_risk_open
-            .iter()
-            .filter_map(|position| match position.state {
-                PositionState::Active { .. } => Some(position.calculate_pnl()),
-                _ => None,
-            })
-            .sum();
+        let unrealized_net = self.unrealized_pnl_marked(&local_risk_open).await;
         let month_equity_net = governed_realized_net + unrealized_net;
         let month_peak_net = self
             .refresh_month_peak_net_from_snapshot(now, &monthly, month_equity_net)
@@ -7253,6 +7258,62 @@ mod tests {
         let triggered = manager.evaluate_monthly_halt().await;
         assert!(triggered, "exactly 4% monthly loss must trigger MonthlyHalt");
         assert!(manager.circuit_breaker.blocks_new_entries().await);
+    }
+
+    /// ADR-0046 §3: month equity must mark open positions at the live price,
+    /// not at the stored `current_price` (fill price, or the last trailing
+    /// ratchet, or the entry price again after a restart).
+    #[tokio::test]
+    async fn test_month_equity_marks_open_positions_at_last_market_price() {
+        let manager = create_test_manager().await;
+        let now = chrono::Utc::now();
+        // Stored current_price == entry (as after a restart): unrealized 0.
+        let mut position =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+        position.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(
+            Price::new(dec!(100)).unwrap(),
+            Price::new(dec!(90)).unwrap(),
+        ));
+        manager.store.positions().save(&position).await.unwrap();
+        assert_eq!(manager.month_equity_net(now).await.unwrap(), Decimal::ZERO);
+
+        // A tick that moves neither the stop nor the stored price (legacy
+        // span is 10, favorable move is 5).
+        manager
+            .process_market_data(MarketData {
+                symbol: position.symbol.clone(),
+                price: Price::new(dec!(105)).unwrap(),
+                timestamp: now,
+                source: crate::event_bus::MarketDataSource::Ws,
+            })
+            .await
+            .unwrap();
+
+        let stored = manager.get_position(position.id).await.unwrap().unwrap();
+        match stored.state {
+            PositionState::Active { current_price, .. } => {
+                assert_eq!(current_price.as_decimal(), dec!(100), "store keeps the fill price")
+            },
+            other => panic!("expected Active, got {other:?}"),
+        }
+        assert_eq!(
+            manager.month_equity_net(now).await.unwrap(),
+            dec!(5),
+            "equity must use the live mark (105) rather than the stored price (100)"
+        );
+
+        // A later adverse tick lowers equity again: give-back is visible
+        // intra-trade, not only at exit.
+        manager
+            .process_market_data(MarketData {
+                symbol: position.symbol.clone(),
+                price: Price::new(dec!(98)).unwrap(),
+                timestamp: now,
+                source: crate::event_bus::MarketDataSource::Ws,
+            })
+            .await
+            .unwrap();
+        assert_eq!(manager.month_equity_net(now).await.unwrap(), dec!(-2));
     }
 
     #[tokio::test]
