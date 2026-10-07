@@ -465,6 +465,7 @@ export function connectEventStream(
   onReconnect?: () => void,
   onStale?: (staleSecs: number) => void,
   onActivity?: () => void,
+  onOpen?: () => void,
 ): () => void {
   if (!browser) return () => {};
 
@@ -480,7 +481,7 @@ export function connectEventStream(
 
   const source = factory
     ? factory(url)
-    : new FetchEventSource(url, token, onReconnect, onStale, onActivity);
+    : new FetchEventSource(url, token, onReconnect, onStale, onActivity, onOpen);
 
   source.onmessage = (msg) => {
     try {
@@ -521,9 +522,15 @@ export class FetchEventSource implements EventSourceLike {
     // (re)connect re-reads the current token from the auth store via
     // `getToken()` instead of closing over the value captured here.
     _initialToken: string | null,
+    // Fires only when a stream is re-established after a failure; callers
+    // use it to refetch state they may have missed.
     private readonly onReconnect?: () => void,
     private readonly onStale?: (staleSecs: number) => void,
     private readonly onActivity?: () => void,
+    // Fires on every successful stream start, the first one included, so
+    // the UI can mark the stream live before the first byte arrives (the
+    // server's first heartbeat comes after 15 s of silence).
+    private readonly onOpen?: () => void,
   ) {
     this.connect(url);
   }
@@ -605,6 +612,7 @@ export class FetchEventSource implements EventSourceLike {
       }
 
       const reader = res.body.getReader();
+      this.onOpen?.();
       if (this.retries > 0) this.onReconnect?.();
       this.retries = 0; // reset backoff on successful stream start
       this.triedSilentRefreshOn401 = false; // this credential just proved itself good

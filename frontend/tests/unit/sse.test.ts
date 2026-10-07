@@ -20,6 +20,7 @@ function buildSource(
   onReconnect?: () => void,
   onStale?: (staleSecs: number) => void,
   onActivity?: () => void,
+  onOpen?: () => void,
 ): SseSource {
   vi.stubGlobal('fetch', fetchImpl);
   return new FetchEventSource(
@@ -28,6 +29,7 @@ function buildSource(
     onReconnect,
     onStale,
     onActivity,
+    onOpen,
   ) as unknown as SseSource;
 }
 
@@ -168,6 +170,46 @@ describe('FetchEventSource reconnect backoff', () => {
     await vi.advanceTimersByTimeAsync(1_100);
     await flush();
     expect(callCount).toBe(2);
+    expect(onReconnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('notifies onOpen on the first successful stream, before any byte arrives', async () => {
+    const onOpen = vi.fn();
+    const onReconnect = vi.fn();
+    // A stream that opens but never sends anything (server heartbeat is 15s).
+    const silent = new ReadableStream({ start() {} });
+    const fakeFetch = vi
+      .fn()
+      .mockResolvedValue({ ok: true, body: silent } as unknown as Response);
+
+    buildSource(fakeFetch, onReconnect, undefined, undefined, onOpen);
+    await flush();
+
+    expect(onOpen).toHaveBeenCalledTimes(1);
+    expect(onReconnect).not.toHaveBeenCalled();
+  });
+
+  it('notifies onOpen again on a recovered stream, alongside onReconnect', async () => {
+    let callCount = 0;
+    const onOpen = vi.fn();
+    const onReconnect = vi.fn();
+    const fakeFetch = vi.fn().mockImplementation(async () => {
+      callCount++;
+      if (callCount === 1) {
+        return { ok: false, body: null } as unknown as Response;
+      }
+      const stream = new ReadableStream({ start() {} });
+      return { ok: true, body: stream } as unknown as Response;
+    });
+
+    buildSource(fakeFetch, onReconnect, undefined, undefined, onOpen);
+    await flush();
+    expect(onOpen).not.toHaveBeenCalled();
+
+    await vi.advanceTimersByTimeAsync(1_100);
+    await flush();
+    expect(callCount).toBe(2);
+    expect(onOpen).toHaveBeenCalledTimes(1);
     expect(onReconnect).toHaveBeenCalledTimes(1);
   });
 
