@@ -334,6 +334,12 @@
       () => {
         markSseEvent();
       },
+      () => {
+        // First connection included: without this the badge read "STALE,
+        // reconnecting" on every mount until the first heartbeat.
+        connected = true;
+        markSseConnected();
+      },
     );
   }
 

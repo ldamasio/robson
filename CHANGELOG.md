@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed - Dashboard showed "STALE, reconnecting" on every mount
+
+- The SSE client only reported a connection to the page when it was a
+  recovery (`retries > 0`), and the freshness badge requires a connect or an
+  event to turn green. Since the server's first heartbeat arrives after 15 s of
+  silence and live events are rare, every dashboard load sat on "STALE,
+  reconnecting" while REST had already filled the page.
+- `FetchEventSource` now exposes `onOpen`, fired on every successful stream
+  start including the first; the dashboard marks the stream connected from it.
+  `onReconnect` keeps its recovery-only meaning (refetch missed state).
+
 ### Removed - Legacy fixed-percentage PositionMonitor artifacts (ADR-0014 / ADR-0022)
 
 - Physically removed the superseded `PositionMonitor` implementation, its
