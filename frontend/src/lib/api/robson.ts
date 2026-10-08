@@ -112,6 +112,11 @@ export type StatusResponse = {
   month_peak_net: number | null;
   monthly_giveback_pct: number | null;
   monthly_budget_remaining: number | null;
+  // Exchange income rows (ADR-0045) the ledger could not match to a governed
+  // position and the operator has not acknowledged. While > 0 the automatic
+  // capital_base recalibration from confirmed transfers stays blocked.
+  // Optional: older backends do not send it.
+  unmatched_income_count?: number;
 };
 
 export type ArmEntryPolicy = {
@@ -393,6 +398,7 @@ function normalizeStatus(raw: StatusResponse): StatusResponse {
     month_peak_net: toNumber(raw.month_peak_net),
     monthly_giveback_pct: toNumber(raw.monthly_giveback_pct),
     monthly_budget_remaining: toNumber(raw.monthly_budget_remaining),
+    unmatched_income_count: Number(raw.unmatched_income_count ?? 0),
   };
 }
 
