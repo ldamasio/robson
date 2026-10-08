@@ -185,6 +185,26 @@ impl Position {
         }
     }
 
+    /// Unrealized P&L of an Active position marked at `mark` instead of the
+    /// stored `current_price` (which only moves on fill and on trailing
+    /// advances). Zero outside Active or without an entry price. ADR-0046.
+    pub fn unrealized_pnl_at(&self, mark: Price) -> rust_decimal::Decimal {
+        let entry_price = match self.entry_price {
+            Some(p) => p.as_decimal(),
+            None => return rust_decimal::Decimal::ZERO,
+        };
+        match &self.state {
+            PositionState::Active { .. } => {
+                let quantity = self.quantity.as_decimal();
+                match self.side {
+                    Side::Long => (mark.as_decimal() - entry_price) * quantity,
+                    Side::Short => (entry_price - mark.as_decimal()) * quantity,
+                }
+            },
+            _ => rust_decimal::Decimal::ZERO,
+        }
+    }
+
     /// Calculate realized P&L for this position
     ///
     /// For active positions, returns unrealized P&L.
@@ -1140,6 +1160,45 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
+
+    #[test]
+    fn unrealized_pnl_at_marks_active_positions_at_the_given_price() {
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let stored = Price::new(dec!(100)).unwrap();
+        let qty = Quantity::new(dec!(2)).unwrap();
+        let now = chrono::Utc::now();
+
+        let mut long = Position::new(Uuid::now_v7(), symbol.clone(), Side::Long);
+        long.entry_price = Some(entry);
+        long.quantity = qty;
+        long.state = PositionState::Active {
+            current_price: stored,
+            trailing_stop: Price::new(dec!(90)).unwrap(),
+            favorable_extreme: entry,
+            extreme_at: now,
+            insurance_stop_id: None,
+            invalidation_guard_level: None,
+            last_emitted_stop: None,
+        };
+        // Stored price says 0; the live mark says +10 (105 - 100) * 2.
+        assert_eq!(long.calculate_pnl(), dec!(0));
+        assert_eq!(long.unrealized_pnl_at(Price::new(dec!(105)).unwrap()), dec!(10));
+
+        let mut short = long.clone();
+        short.side = Side::Short;
+        assert_eq!(short.unrealized_pnl_at(Price::new(dec!(105)).unwrap()), dec!(-10));
+
+        // Outside Active the mark is irrelevant.
+        let mut armed = long.clone();
+        armed.state = PositionState::Armed;
+        assert_eq!(armed.unrealized_pnl_at(Price::new(dec!(105)).unwrap()), dec!(0));
+
+        // Without an entry price there is nothing to mark.
+        let mut no_entry = long.clone();
+        no_entry.entry_price = None;
+        assert_eq!(no_entry.unrealized_pnl_at(Price::new(dec!(105)).unwrap()), dec!(0));
+    }
 
     #[test]
     fn test_position_creation() {
