@@ -18,6 +18,9 @@ pub struct QueryOptions {
     /// Filter by event type
     pub event_type: Option<String>,
 
+    /// Event types to leave out (applied with `event_type <> ALL(...)`)
+    pub exclude_event_types: Vec<String>,
+
     /// Start time (inclusive)
     pub from_time: Option<DateTime<Utc>>,
 
@@ -53,6 +56,7 @@ impl QueryOptions {
             tenant_id,
             stream_key: None,
             event_type: None,
+            exclude_event_types: Vec::new(),
             from_time: None,
             to_time: None,
             from_seq: None,
@@ -74,6 +78,12 @@ impl QueryOptions {
     /// Filter by event type
     pub fn event_type(mut self, event_type: impl Into<String>) -> Self {
         self.event_type = Some(event_type.into());
+        self
+    }
+
+    /// Exclude an event type (may be called repeatedly)
+    pub fn exclude_event_type(mut self, event_type: impl Into<String>) -> Self {
+        self.exclude_event_types.push(event_type.into());
         self
     }
 
@@ -124,6 +134,11 @@ pub async fn query_events(pool: &PgPool, options: QueryOptions) -> Result<Vec<Ev
     if options.event_type.is_some() {
         bind_count += 1;
         query.push_str(&format!(" AND event_type = ${}", bind_count));
+    }
+
+    if !options.exclude_event_types.is_empty() {
+        bind_count += 1;
+        query.push_str(&format!(" AND event_type <> ALL(${})", bind_count));
     }
 
     if options.from_time.is_some() {
@@ -179,6 +194,9 @@ pub async fn query_events(pool: &PgPool, options: QueryOptions) -> Result<Vec<Ev
     }
     if let Some(ref event_type) = options.event_type {
         q = q.bind(event_type);
+    }
+    if !options.exclude_event_types.is_empty() {
+        q = q.bind(&options.exclude_event_types);
     }
     if let Some(from_time) = options.from_time {
         q = q.bind(from_time);
@@ -283,4 +301,16 @@ mod tests {
     // - Test query by time range
     // - Test query by trace ID
     // - Test pagination with limit
+
+    #[test]
+    fn exclude_event_type_accumulates() {
+        let options = QueryOptions::new(Uuid::nil())
+            .exclude_event_type("position_monitor_tick")
+            .exclude_event_type("query_state_changed");
+        assert_eq!(options.exclude_event_types, vec![
+            "position_monitor_tick".to_string(),
+            "query_state_changed".to_string()
+        ]);
+        assert!(options.event_type.is_none());
+    }
 }

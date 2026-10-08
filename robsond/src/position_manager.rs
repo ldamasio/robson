@@ -162,6 +162,11 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// exit orders for these and poll for the stop's fill evidence until
     /// reverse reconciliation closes the book position.
     exit_overtaken_suspects: Arc<RwLock<HashSet<PositionId>>>,
+    /// Minimum spacing between two audit-only `PositionMonitorTick` events
+    /// for the same position (ADR-0049). Zero disables the throttle.
+    monitor_tick_interval: std::time::Duration,
+    /// When the last `PositionMonitorTick` was emitted per position.
+    last_monitor_tick_at: Arc<RwLock<HashMap<PositionId, std::time::Instant>>>,
     /// Armed positions whose entry attempt exhausted its autonomy
     /// (ADR-0050 §2 `needs_operator_rearm`). No detector runs for them and
     /// none is restored at startup; the operator disarms or arms anew.
@@ -213,6 +218,19 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
 /// (risk denial, expired approval). Without it, an Immediate-mode re-arm
 /// refires instantly and a persistent governed condition becomes a ~1/s hot
 /// loop against the OHLCV source and the event store.
+/// Pure throttle rule for audit-only monitor ticks (ADR-0049): drop the
+/// tick when one was emitted for the position less than `interval` ago.
+fn should_drop_monitor_tick(
+    last_emitted: Option<std::time::Instant>,
+    now: std::time::Instant,
+    interval: std::time::Duration,
+) -> bool {
+    match last_emitted {
+        Some(last) => now.saturating_duration_since(last) < interval,
+        None => false,
+    }
+}
+
 fn governed_rearm_backoff(attempt: u32) -> std::time::Duration {
     const BASE_SECS: u64 = 5;
     const MAX_SECS: u64 = 900;
@@ -800,6 +818,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             stop_invalidation_guard_enabled: false,
             stop_invalidation_lookback_candles: 20,
             exit_overtaken_suspects: Arc::new(RwLock::new(HashSet::new())),
+            // Throttle disabled by default; enabled per EngineConfig via
+            // `with_monitor_tick_interval`.
+            monitor_tick_interval: std::time::Duration::ZERO,
+            last_monitor_tick_at: Arc::new(RwLock::new(HashMap::new())),
             entry_exhausted: Arc::new(RwLock::new(HashMap::new())),
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
             entry_flow_lock: Mutex::new(()),
@@ -823,6 +845,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     pub fn with_invalidation_guard(mut self, enabled: bool, lookback_candles: usize) -> Self {
         self.stop_invalidation_guard_enabled = enabled;
         self.stop_invalidation_lookback_candles = lookback_candles.max(1);
+        self
+    }
+
+    /// Configure the minimum spacing between audit-only
+    /// `PositionMonitorTick` events per position (ADR-0049). Exits and
+    /// trailing advances are never throttled.
+    pub fn with_monitor_tick_interval(mut self, interval: std::time::Duration) -> Self {
+        self.monitor_tick_interval = interval;
         self
     }
 
@@ -3312,6 +3342,37 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         Ok(closed)
     }
 
+    /// Drop a decision that carries nothing but the `PositionMonitorTick`
+    /// heartbeat when the previous heartbeat for this position is younger
+    /// than `monitor_tick_interval`. Any decision that does emit a tick
+    /// (alone or alongside an exit / trailing advance) refreshes the stamp.
+    /// Returns the possibly emptied decision and whether it was throttled.
+    async fn throttle_monitor_tick(
+        &self,
+        position_id: PositionId,
+        mut decision: robson_engine::EngineDecision,
+    ) -> (robson_engine::EngineDecision, bool) {
+        if self.monitor_tick_interval.is_zero() {
+            return (decision, false);
+        }
+        let is_tick = |action: &EngineAction| {
+            matches!(action, EngineAction::EmitEvent(Event::PositionMonitorTick { .. }))
+        };
+        let only_tick = decision.actions.len() == 1 && is_tick(&decision.actions[0]);
+        let now = std::time::Instant::now();
+        if only_tick {
+            let last = self.last_monitor_tick_at.read().await.get(&position_id).copied();
+            if should_drop_monitor_tick(last, now, self.monitor_tick_interval) {
+                decision.actions.clear();
+                return (decision, true);
+            }
+        }
+        if decision.actions.iter().any(is_tick) {
+            self.last_monitor_tick_at.write().await.insert(position_id, now);
+        }
+        (decision, false)
+    }
+
     pub async fn process_market_data(&self, data: MarketData) -> DaemonResult<()> {
         // Find all active positions for this symbol (from projection)
         let active_positions = self.store.positions().find_active().await?;
@@ -3414,11 +3475,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 },
             };
 
+            // Audit tick throttle (ADR-0049): the engine still evaluated this
+            // trade for exit and trailing advance; only the heartbeat event
+            // is dropped when the previous one is too recent.
+            let (decision, tick_throttled) =
+                self.throttle_monitor_tick(position.id, decision).await;
+
             // Check if we have actions to execute
             if decision.actions.is_empty() {
-                if let Err(e) =
-                    query.complete(QueryOutcome::NoAction { reason: "No stop trigger".to_string() })
-                {
+                let reason = if tick_throttled {
+                    "Monitor tick throttled".to_string()
+                } else {
+                    "No stop trigger".to_string()
+                };
+                if let Err(e) = query.complete(QueryOutcome::NoAction { reason }) {
                     let err_str = format!("{}", e);
                     query.fail(err_str.clone(), "processing".to_string());
                     self.record_query_failure(&query).await?;
@@ -4592,6 +4662,25 @@ mod tests {
         assert_eq!(governed_rearm_backoff(u32::MAX).as_secs(), 900);
         // attempt 0 never happens (counter starts at 1), but must not panic
         assert_eq!(governed_rearm_backoff(0).as_secs(), 5);
+    }
+
+    #[test]
+    fn monitor_tick_throttle_drops_only_recent_repeats() {
+        use std::time::{Duration, Instant};
+        let interval = Duration::from_secs(20);
+        // Offset so subtracting up to a minute can never underflow the
+        // monotonic clock on a freshly booted host.
+        let now = Instant::now() + Duration::from_secs(3600);
+
+        // First tick for a position is never dropped.
+        assert!(!should_drop_monitor_tick(None, now, interval));
+        // A tick younger than the interval is dropped.
+        assert!(should_drop_monitor_tick(Some(now - Duration::from_secs(5)), now, interval));
+        // At or beyond the interval the tick goes through again.
+        assert!(!should_drop_monitor_tick(Some(now - Duration::from_secs(20)), now, interval));
+        assert!(!should_drop_monitor_tick(Some(now - Duration::from_secs(60)), now, interval));
+        // A zero interval never drops (throttle disabled).
+        assert!(!should_drop_monitor_tick(Some(now), now, Duration::ZERO));
     }
 
     async fn create_test_manager_with_store_and_event_bus(

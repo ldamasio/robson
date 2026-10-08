@@ -148,6 +148,11 @@ pub struct EngineConfig {
     /// recent adverse extreme when the guard is enabled (env:
     /// `ROBSON_STOP_INVALIDATION_LOOKBACK_CANDLES`, default 20). ADR-0042.
     pub stop_invalidation_lookback_candles: usize,
+    /// Minimum seconds between two `position_monitor_tick` audit events for
+    /// the same position when the tick carries no exit or trailing advance
+    /// (env: `ROBSON_POSITION_MONITOR_TICK_INTERVAL_SECS`, default 20;
+    /// 0 emits one event per market trade). ADR-0049.
+    pub position_monitor_tick_interval_secs: u64,
 }
 
 impl EngineConfig {
@@ -371,6 +376,7 @@ impl Config {
                 margin_headroom_bps: Decimal::from(100),    // 1% margin-cap headroom
                 stop_invalidation_guard_enabled: false,
                 stop_invalidation_lookback_candles: 20,
+                position_monitor_tick_interval_secs: 20,
             },
             tech_stop: TechStopConfigEnv {
                 min_stop_pct: Decimal::new(1, 1), // 0.1%
@@ -523,6 +529,20 @@ impl Config {
                 .and_then(|v| v.parse::<usize>().ok())
                 .unwrap_or(20);
 
+        // Audit tick throttle (ADR-0049): the engine evaluates every market
+        // trade, but the heartbeat event is persisted at most once per
+        // interval per position unless it accompanies an exit or a trailing
+        // advance.
+        let tick_interval_str = env::var("ROBSON_POSITION_MONITOR_TICK_INTERVAL_SECS")
+            .unwrap_or_else(|_| "20".to_string());
+        let position_monitor_tick_interval_secs =
+            tick_interval_str.parse::<u64>().map_err(|_| {
+                DaemonError::Config(format!(
+                    "Invalid ROBSON_POSITION_MONITOR_TICK_INTERVAL_SECS: {}",
+                    tick_interval_str
+                ))
+            })?;
+
         Ok(EngineConfig {
             min_tech_stop_percent: min_tech_stop,
             max_tech_stop_percent: max_tech_stop,
@@ -532,6 +552,7 @@ impl Config {
             margin_headroom_bps,
             stop_invalidation_guard_enabled,
             stop_invalidation_lookback_candles,
+            position_monitor_tick_interval_secs,
         })
     }
 
@@ -779,6 +800,7 @@ impl Default for Config {
                 margin_headroom_bps: Decimal::from(100),    // 1% margin-cap headroom
                 stop_invalidation_guard_enabled: false,
                 stop_invalidation_lookback_candles: 20,
+                position_monitor_tick_interval_secs: 20,
             },
             tech_stop: TechStopConfigEnv {
                 min_stop_pct: Decimal::ONE,      // 1%

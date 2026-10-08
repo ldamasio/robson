@@ -1240,8 +1240,12 @@ where
                 .into_response();
         };
 
+        // Audit-only heartbeat ticks (ADR-0049) are telemetry, not history:
+        // at one row per market trade they would fill the whole page and
+        // evict every decision event from the operator feed.
         let options = QueryOptions::new(tenant_id)
             .time_range(from, to)
+            .exclude_event_type("position_monitor_tick")
             .limit(EVENT_HISTORY_LIMIT)
             .descending();
         let envelopes = match query_events(pool.as_ref(), options).await {

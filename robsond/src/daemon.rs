@@ -189,7 +189,10 @@ impl Daemon<StubExchange, MemoryStore> {
             .with_invalidation_guard(
                 config.engine.stop_invalidation_guard_enabled,
                 config.engine.stop_invalidation_lookback_candles,
-            ),
+            )
+            .with_monitor_tick_interval(std::time::Duration::from_secs(
+                config.engine.position_monitor_tick_interval_secs,
+            )),
         ));
 
         Self {
@@ -258,7 +261,10 @@ impl Daemon<StubExchange, MemoryStore> {
             .with_invalidation_guard(
                 config.engine.stop_invalidation_guard_enabled,
                 config.engine.stop_invalidation_lookback_candles,
-            ),
+            )
+            .with_monitor_tick_interval(std::time::Duration::from_secs(
+                config.engine.position_monitor_tick_interval_secs,
+            )),
         ));
 
         Ok(Self {
@@ -328,7 +334,10 @@ impl Daemon<StubExchange, MemoryStore> {
         .with_invalidation_guard(
             config.engine.stop_invalidation_guard_enabled,
             config.engine.stop_invalidation_lookback_candles,
-        );
+        )
+        .with_monitor_tick_interval(std::time::Duration::from_secs(
+            config.engine.position_monitor_tick_interval_secs,
+        ));
         if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
             pm = pm.with_event_log((**pool).clone(), tenant_id);
         }
@@ -394,7 +403,10 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
             .with_invalidation_guard(
                 config.engine.stop_invalidation_guard_enabled,
                 config.engine.stop_invalidation_lookback_candles,
-            ),
+            )
+            .with_monitor_tick_interval(std::time::Duration::from_secs(
+                config.engine.position_monitor_tick_interval_secs,
+            )),
         ));
 
         Self {
@@ -473,7 +485,10 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
         .with_invalidation_guard(
             config.engine.stop_invalidation_guard_enabled,
             config.engine.stop_invalidation_lookback_candles,
-        );
+        )
+        .with_monitor_tick_interval(std::time::Duration::from_secs(
+            config.engine.position_monitor_tick_interval_secs,
+        ));
         if let (Some(pool), Some(tenant_id)) = (&pg_pool, config.projection.tenant_id) {
             pm = pm.with_event_log((**pool).clone(), tenant_id);
         }

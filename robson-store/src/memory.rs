@@ -21,7 +21,10 @@ use crate::{
     repository::{EventRepository, OrderRepository, PositionRepository, Store},
 };
 
-/// In-memory store for testing
+/// In-memory store.
+///
+/// Used by tests and as the robsond runtime projection store. Events are
+/// kept for in-process replay, except audit-only telemetry (see `append`).
 pub struct MemoryStore {
     positions: RwLock<HashMap<PositionId, Position>>,
     orders: RwLock<HashMap<OrderId, Order>>,
@@ -618,6 +621,14 @@ impl OrderRepository for MemoryStore {
 impl EventRepository for MemoryStore {
     async fn append(&self, event: &Event) -> Result<i64, StoreError> {
         let seq = self.event_seq.fetch_add(1, Ordering::SeqCst) + 1;
+        // Audit-only telemetry is never read back from this store: recovery
+        // and audit replay the durable event log (ADR-0049). Keeping one
+        // entry per market tick grew the daemon without bound while a
+        // position was Active (2026-08-18 OOMKill), so ticks are sequenced
+        // but not retained.
+        if matches!(event, Event::PositionMonitorTick { .. }) {
+            return Ok(seq);
+        }
         let stored = StoredEvent { seq, event: event.clone() };
         let mut events = self.events.write().unwrap();
         events.push(stored);
@@ -712,6 +723,41 @@ mod tests {
             OrderSide::Buy,
             Quantity::new(dec!(0.1)).unwrap(),
         )
+    }
+
+    #[tokio::test]
+    async fn append_does_not_retain_position_monitor_ticks() {
+        let store = MemoryStore::new();
+        let position_id = Uuid::now_v7();
+
+        let armed_seq =
+            EventRepository::append(&store, &create_test_event(position_id)).await.unwrap();
+        let tick = Event::PositionMonitorTick {
+            position_id,
+            symbol: "BTCUSDT".to_string(),
+            price: Price::new(dec!(85000)).unwrap(),
+            current_stop: Price::new(dec!(84000)).unwrap(),
+            high_watermark: Price::new(dec!(85500)).unwrap(),
+            span_remaining: dec!(1500),
+            timestamp: Utc::now(),
+        };
+        let tick_seq = EventRepository::append(&store, &tick).await.unwrap();
+        let later_seq =
+            EventRepository::append(&store, &create_test_event(position_id)).await.unwrap();
+
+        // The tick still consumes a sequence number so ordering evidence
+        // is preserved for callers that compare seqs.
+        assert_eq!(tick_seq, armed_seq + 1);
+        assert_eq!(later_seq, tick_seq + 1);
+
+        // But it is not kept in memory (ADR-0049: audit-only telemetry).
+        let events = EventRepository::find_by_position(&store, position_id).await.unwrap();
+        assert_eq!(events.len(), 2);
+        assert!(events.iter().all(|e| !matches!(e, Event::PositionMonitorTick { .. })));
+        assert_eq!(
+            EventRepository::get_latest_seq(&store, position_id).await.unwrap(),
+            Some(later_seq)
+        );
     }
 
     fn create_test_event(position_id: PositionId) -> Event {
