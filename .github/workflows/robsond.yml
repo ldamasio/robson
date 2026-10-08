@@ -164,12 +164,17 @@ jobs:
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
 
-          sed -i "s|image: ghcr.io/rbxrobotica/robson-v2:sha-[a-f0-9]*|image: ghcr.io/rbxrobotica/robson-v2:${SHA_TAG}|g" \
-            apps/prod/robson/robsond-deploy.yml \
-            apps/prod/robson/robsond-db-migrate-job.yml
+          # Pattern R (rbx-infra docs/infra/IMAGE-PROMOTION.md): the single
+          # pin for every robson-v2 image lives in the overlay's images
+          # transformer. The Deployment and migrate Job carry a
+          # `sha-REPLACE_ME` placeholder on purpose (rbx-infra #206), so
+          # editing them is a no-op for the cluster and corrupts the
+          # placeholder; bump the kustomize pin instead.
+          K=apps/prod/robson/kustomization.yml
+          yq -i "(.images[] | select(.name == \"ghcr.io/rbxrobotica/robson-v2\") | .newTag) = \"${SHA_TAG}\"" "$K"
+          grep -q "newTag: ${SHA_TAG}$" "$K" || { echo "::error::kustomize pin was not updated in $K"; exit 1; }
 
-          git add apps/prod/robson/robsond-deploy.yml \
-                  apps/prod/robson/robsond-db-migrate-job.yml
+          git add "$K"
 
           if git diff --staged --quiet; then
             echo "No manifest changes needed (already at ${SHA_TAG})"
