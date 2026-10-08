@@ -71,6 +71,8 @@ export function positionSummaryLines(p: Position): string[] {
             ),
           );
         }
+        const rung = trailingLadderRung(p);
+        if (rung) lines.push(label('RUNG', rungDetail(rung)));
       }
     }
   } else {
@@ -102,7 +104,13 @@ export function positionSummaryLines(p: Position): string[] {
             ),
           );
         }
-        if (val.favorable_extreme) lines.push(label('EXTREME', fmtNum(val.favorable_extreme as number)));
+        const rung = trailingLadderRung(p);
+        if (rung) {
+          // The rung line already carries the favorable extreme.
+          lines.push(label('RUNG', rungDetail(rung)));
+        } else if (val.favorable_extreme) {
+          lines.push(label('EXTREME', fmtNum(val.favorable_extreme as number)));
+        }
       }
     } else if (key === 'Exiting' && val) {
       lines.push(label('EXITING', `${val.exit_reason}`));
@@ -137,7 +145,18 @@ export function isRenderableLivePosition(position: { state: PositionState; excha
   return isPositionActive(position.state) && position.exchange_sync_state !== STALE_SYNC_STATE;
 }
 
-export function trailingStopMoveTarget(p: Position): { trigger_price: number; next_stop: number } | null {
+// ADR-0052 entry-anchored ruler geometry for an Active position. Returns
+// null when the position is not on the executable-span path or when the
+// span evidence is incomplete (incomplete/corrupt API evidence must not
+// silently render a plausible legacy target).
+type ExecutableSpanGeometry = {
+  entryReference: number;
+  executableSpan: number;
+  favorableExtreme: number | null;
+  completedSpans: number;
+};
+
+function executableSpanGeometry(p: Position): ExecutableSpanGeometry | null {
   const stop = activeTrailingStop(p);
   if (stop == null || !Number.isFinite(stop)) {
     return null;
@@ -145,42 +164,61 @@ export function trailingStopMoveTarget(p: Position): { trigger_price: number; ne
 
   const executableSpan = p.executable_span;
   const entryReference = p.entry_reference;
-  if (executableSpan != null) {
-    // Presence of S identifies the ADR-0052 path. Incomplete/corrupt API
-    // evidence must not silently render a plausible legacy target.
-    if (
-      !Number.isFinite(executableSpan) ||
-      executableSpan <= 0 ||
-      entryReference == null ||
-      !Number.isFinite(entryReference)
-    ) {
-      return null;
-    }
+  if (executableSpan == null) return null;
+  if (
+    !Number.isFinite(executableSpan) ||
+    executableSpan <= 0 ||
+    entryReference == null ||
+    !Number.isFinite(entryReference)
+  ) {
+    return null;
+  }
 
-    // ADR-0052: derive the next favorable boundary and candidate technical
-    // stop from the immutable entry-anchored ruler. Before the first advance
-    // the raw technical stop can differ from E +/- S, so its adverse side of
-    // E is the explicit completed_spans = 0 case.
-    const favorableExtreme = activeFavorableExtreme(p);
-    const completedSpans =
-      favorableExtreme != null && Number.isFinite(favorableExtreme)
-        ? Math.max(
-            0,
-            Math.floor(
-              (p.side === 'Short'
-                ? entryReference - favorableExtreme
-                : favorableExtreme - entryReference) /
-                executableSpan +
-                1e-9
-            )
+  // Derive completed spans from the favorable extreme when the API carries
+  // it; otherwise infer them from the current technical stop. Before the
+  // first advance the raw technical stop can differ from E +/- S, so its
+  // adverse side of E is the explicit completed_spans = 0 case.
+  const favorableExtreme = activeFavorableExtreme(p);
+  const completedSpans =
+    favorableExtreme != null && Number.isFinite(favorableExtreme)
+      ? Math.max(
+          0,
+          Math.floor(
+            (p.side === 'Short'
+              ? entryReference - favorableExtreme
+              : favorableExtreme - entryReference) /
+              executableSpan +
+              1e-9
           )
-        : p.side === 'Short'
-          ? stop > entryReference
-            ? 0
-            : Math.floor((entryReference - stop) / executableSpan + 1e-9) + 1
-          : stop < entryReference
-            ? 0
-            : Math.floor((stop - entryReference) / executableSpan + 1e-9) + 1;
+        )
+      : p.side === 'Short'
+        ? stop > entryReference
+          ? 0
+          : Math.floor((entryReference - stop) / executableSpan + 1e-9) + 1
+        : stop < entryReference
+          ? 0
+          : Math.floor((stop - entryReference) / executableSpan + 1e-9) + 1;
+
+  return {
+    entryReference,
+    executableSpan,
+    favorableExtreme:
+      favorableExtreme != null && Number.isFinite(favorableExtreme) ? favorableExtreme : null,
+    completedSpans,
+  };
+}
+
+export function trailingStopMoveTarget(p: Position): { trigger_price: number; next_stop: number } | null {
+  const stop = activeTrailingStop(p);
+  if (stop == null || !Number.isFinite(stop)) {
+    return null;
+  }
+
+  if (p.executable_span != null) {
+    // Presence of S identifies the ADR-0052 path.
+    const geometry = executableSpanGeometry(p);
+    if (!geometry) return null;
+    const { entryReference, executableSpan, completedSpans } = geometry;
     const nextCompletedSpans = completedSpans + 1;
 
     if (p.side === 'Short') {
@@ -214,6 +252,57 @@ export function trailingStopMoveTarget(p: Position): { trigger_price: number; ne
   };
 }
 
+export type TrailingLadderRung = {
+  // Completed favorable spans on the ADR-0052 ruler (0 before the first advance).
+  completed_spans: number;
+  // Favorable extreme the ruler was measured against, when the API carries it.
+  favorable_extreme: number | null;
+  // Price that completes the next span and advances the stop one rung.
+  next_trigger: number;
+  // Favorable distance still to travel from the current price to
+  // `next_trigger`, as a percentage of the current price. Null when the
+  // current price is unknown; clamped at 0 once the trigger is reached.
+  distance_to_next_pct: number | null;
+};
+
+// Which rung of the fixed, entry-anchored ruler the position is on. Only the
+// ADR-0052 executable-span path has a ruler; legacy positions return null.
+export function trailingLadderRung(p: Position): TrailingLadderRung | null {
+  const geometry = executableSpanGeometry(p);
+  if (!geometry) return null;
+  const { entryReference, executableSpan, favorableExtreme, completedSpans } = geometry;
+
+  const nextTrigger =
+    p.side === 'Short'
+      ? entryReference - (completedSpans + 1) * executableSpan
+      : entryReference + (completedSpans + 1) * executableSpan;
+
+  const price = activeCurrentPrice(p);
+  const distanceToNextPct =
+    price != null && Number.isFinite(price) && price > 0
+      ? Math.max(
+          0,
+          ((p.side === 'Short' ? price - nextTrigger : nextTrigger - price) / price) * 100
+        )
+      : null;
+
+  return {
+    completed_spans: completedSpans,
+    favorable_extreme: favorableExtreme,
+    next_trigger: nextTrigger,
+    distance_to_next_pct: distanceToNextPct,
+  };
+}
+
+function rungDetail(rung: TrailingLadderRung): string {
+  const parts = [String(rung.completed_spans)];
+  if (rung.favorable_extreme != null) parts.push(`extreme ${fmtNum(rung.favorable_extreme)}`);
+  const away =
+    rung.distance_to_next_pct != null ? ` (${rung.distance_to_next_pct.toFixed(2)}% away)` : '';
+  parts.push(`next ${fmtNum(rung.next_trigger)}${away}`);
+  return parts.join(' · ');
+}
+
 // The executable stop (ADR-0041 buffer, clamped to the ADR-0042 invalidation
 // guard while it is active) is where execution actually triggers — the
 // technical trailing stop is only the conceptual reference. Show the
@@ -238,6 +327,18 @@ function activeTrailingStop(p: Position): number | null {
   const val = (state as Record<string, Record<string, unknown>>)[key];
   if (key !== 'Active' || !val) return null;
   return typeof val.trailing_stop === 'number' ? val.trailing_stop : null;
+}
+
+function activeCurrentPrice(p: Position): number | null {
+  const state = p.state;
+  if (typeof state === 'object') {
+    const key = Object.keys(state)[0];
+    const val = (state as Record<string, Record<string, unknown>>)[key];
+    if (key === 'Active' && val && typeof val.current_price === 'number') {
+      return val.current_price;
+    }
+  }
+  return p.current_price ?? null;
 }
 
 function activeFavorableExtreme(p: Position): number | null {
