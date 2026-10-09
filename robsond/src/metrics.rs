@@ -86,6 +86,18 @@ pub static STALE_ACTIVE_POSITIONS: LazyLock<Gauge> = LazyLock::new(|| {
     .expect("failed to register robsond_stale_active_positions")
 });
 
+/// Open positions whose exchange-side insurance stop is known to sit behind
+/// the software stop plan because a placement or re-placement failed
+/// (ADR-0039). Non-zero means daemon-down exposure is wider than one rung
+/// until the tick-cadence retry heals it.
+pub static INSURANCE_STOP_STALE_POSITIONS: LazyLock<Gauge> = LazyLock::new(|| {
+    register_gauge!(
+        "robsond_insurance_stop_stale_positions",
+        "Number of open positions whose exchange insurance stop is behind the software stop plan"
+    )
+    .expect("failed to register robsond_insurance_stop_stale_positions")
+});
+
 /// Exchange-reconciliation scans, labelled by `completed` or `error`.
 ///
 /// This is owned exclusively by `ReconciliationWorker`. Startup and periodic
