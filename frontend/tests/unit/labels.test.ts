@@ -8,7 +8,8 @@ import {
   positionLabel,
   positionStateLabel,
   trailingStopMoveTarget,
-  trailingLadderRung
+  trailingLadderRung,
+  stopMethodDetail
 } from '$lib/presentation/labels';
 import type { Position, PositionState, SseEvent } from '$api/robson';
 
@@ -256,7 +257,58 @@ describe('trailingLadderRung', () => {
   });
 });
 
+describe('stopMethodDetail', () => {
+  it('names the ATR fallback as a warning with its confidence', () => {
+    const p = basePosition({ tech_stop_method: 'atr_fallback', tech_stop_confidence: 'low' });
+    expect(stopMethodDetail(p)).toBe('ATR fallback, no chart level in bounds · LOW confidence');
+  });
+
+  it('names the swing level used', () => {
+    const p = basePosition({
+      tech_stop_method: 'swing_point',
+      tech_stop_level_n: 2,
+      tech_stop_confidence: 'high'
+    });
+    expect(stopMethodDetail(p)).toBe('swing level 2 · HIGH confidence');
+  });
+
+  it('is absent when the API carries no audit', () => {
+    expect(stopMethodDetail(basePosition())).toBeNull();
+  });
+});
+
 describe('positionSummaryLines', () => {
+  it('renders the METHOD line for Active positions after the ladder lines', () => {
+    const lines = positionSummaryLines(
+      basePosition({
+        state: 'Active',
+        side: 'Short',
+        entry_price: 83849.7,
+        entry_reference: 83857.6,
+        executable_span: 209.2,
+        trailing_stop: 84024.9,
+        effective_stop: 84066.8,
+        current_price: 83759.3,
+        quantity: 0.02,
+        tech_stop_method: 'atr_fallback',
+        tech_stop_confidence: 'low'
+      })
+    );
+    const idx = lines.findIndex((l) => l.startsWith('METHOD'));
+    expect(idx).toBeGreaterThan(lines.findIndex((l) => l.startsWith('RUNG')));
+    expect(idx).toBeLessThan(lines.findIndex((l) => l.startsWith('ENTRY')));
+    expect(lines[idx]).toContain('ATR fallback');
+    expect(lines[idx]).toContain('LOW confidence');
+  });
+
+  it('renders the METHOD line for Armed positions', () => {
+    const lines = positionSummaryLines(
+      basePosition({ state: 'Armed', tech_stop_method: 'swing_point', tech_stop_level_n: 2, tech_stop_confidence: 'high' })
+    );
+    expect(lines[2]).toMatch(/^METHOD\s+swing level 2 · HIGH confidence$/);
+  });
+
+
   it('renders the RUNG line after TARGET on the executable-span path', () => {
     const lines = positionSummaryLines(
       basePosition({

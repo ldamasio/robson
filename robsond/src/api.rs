@@ -277,6 +277,17 @@ pub struct PositionSummary {
     pub stop_buffer_bps_at_arm: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub tech_stop_distance: Option<Decimal>,
+    /// How the technical stop was derived: `"swing_point"` (chart level) or
+    /// `"atr_fallback"` (no valid level in bounds; ADR-0050 §7). Absent when
+    /// no analysis audit is on record.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tech_stop_method: Option<String>,
+    /// 1-indexed support/resistance level a swing-point stop anchored at.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tech_stop_level_n: Option<usize>,
+    /// Analyzer confidence: `"high"`, `"medium"` or `"low"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tech_stop_confidence: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub current_price: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -2289,6 +2300,11 @@ where
         &engine,
         trading_rules.as_ref(),
     );
+    if let Some(audit) = manager.tech_stop_audit_for_position(position.id).await {
+        summary.tech_stop_method = Some(audit.method);
+        summary.tech_stop_level_n = audit.level_n;
+        summary.tech_stop_confidence = Some(audit.confidence);
+    }
     if matches!(position.state, PositionState::Armed) {
         if let Some(rejection) = manager.entry_exhaustion(position.id).await {
             summary.entry_status = Some("needs_operator_rearm".to_string());
@@ -2468,6 +2484,9 @@ fn position_to_summary(
                             executable_span: position.executable_span,
                             stop_buffer_bps_at_arm: position.stop_buffer_bps_at_arm,
                             tech_stop_distance,
+                            tech_stop_method: None,
+                            tech_stop_level_n: None,
+                            tech_stop_confidence: None,
                             current_price,
                             pnl,
                             variation_pct,
@@ -2528,6 +2547,9 @@ fn position_to_summary(
         executable_span: position.executable_span,
         stop_buffer_bps_at_arm: position.stop_buffer_bps_at_arm,
         tech_stop_distance,
+        tech_stop_method: None,
+        tech_stop_level_n: None,
+        tech_stop_confidence: None,
         current_price,
         pnl,
         variation_pct,

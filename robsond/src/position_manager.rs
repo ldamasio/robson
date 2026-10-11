@@ -176,6 +176,11 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// behind the software stop plan because a placement or re-placement
     /// failed (ADR-0039). Value: earliest instant the next attempt may run.
     insurance_stop_stale: Arc<RwLock<HashMap<PositionId, std::time::Instant>>>,
+    /// How each position's technical stop was derived (method, confidence),
+    /// taken from the `TechnicalStopAnalyzed` audit at signal time and
+    /// re-read from the durable event log after a restart. Operator-facing
+    /// only: an ATR-fallback stop deserves a visible warning on the card.
+    tech_stop_audits: Arc<RwLock<HashMap<PositionId, TechStopAuditSummary>>>,
     /// Armed positions whose entry attempt exhausted its autonomy
     /// (ADR-0050 §2 `needs_operator_rearm`). No detector runs for them and
     /// none is restored at startup; the operator disarms or arms anew.
@@ -227,6 +232,50 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
 /// (risk denial, expired approval). Without it, an Immediate-mode re-arm
 /// refires instantly and a persistent governed condition becomes a ~1/s hot
 /// loop against the OHLCV source and the event store.
+/// Operator-facing digest of a `TechnicalStopAnalyzed` audit: how the stop
+/// was derived and how much the analyzer trusted it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TechStopAuditSummary {
+    /// `"swing_point"` or `"atr_fallback"` (serde names of
+    /// `TechnicalStopMethodSnapshot`).
+    pub method: String,
+    /// 1-indexed level used by a swing-point stop; `None` for the fallback.
+    pub level_n: Option<usize>,
+    /// `"high"`, `"medium"` or `"low"`.
+    pub confidence: String,
+}
+
+impl TechStopAuditSummary {
+    pub fn from_audit(audit: &robson_domain::TechnicalStopAnalysisAudit) -> Self {
+        use robson_domain::{TechnicalStopConfidenceSnapshot, TechnicalStopMethodSnapshot};
+        let (method, level_n) = match audit.method {
+            TechnicalStopMethodSnapshot::SwingPoint { level_n } => {
+                ("swing_point".to_string(), Some(level_n))
+            },
+            TechnicalStopMethodSnapshot::AtrFallback => ("atr_fallback".to_string(), None),
+        };
+        let confidence = match audit.confidence {
+            TechnicalStopConfidenceSnapshot::High => "high",
+            TechnicalStopConfidenceSnapshot::Medium => "medium",
+            TechnicalStopConfidenceSnapshot::Low => "low",
+        }
+        .to_string();
+        Self { method, level_n, confidence }
+    }
+
+    /// Parse the digest out of a persisted `technical_stop_analyzed` event
+    /// payload (the serialized domain event). Tolerant: returns `None` when
+    /// the shape is not recognised rather than failing the caller.
+    pub fn from_event_payload(payload: &serde_json::Value) -> Option<Self> {
+        let analysis = payload.get("analysis")?;
+        let method_obj = analysis.get("method")?;
+        let method = method_obj.get("type")?.as_str()?.to_string();
+        let level_n = method_obj.get("level_n").and_then(|v| v.as_u64()).map(|v| v as usize);
+        let confidence = analysis.get("confidence")?.as_str()?.to_string();
+        Some(Self { method, level_n, confidence })
+    }
+}
+
 /// Minimum spacing between two attempts to re-place an exchange insurance
 /// stop that a previous placement or re-placement failed to put at the
 /// software trigger (ADR-0039). The first attempt waits this long too, so
@@ -840,6 +889,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             last_monitor_tick_at: Arc::new(RwLock::new(HashMap::new())),
             last_market_price: Arc::new(RwLock::new(HashMap::new())),
             insurance_stop_stale: Arc::new(RwLock::new(HashMap::new())),
+            tech_stop_audits: Arc::new(RwLock::new(HashMap::new())),
             entry_exhausted: Arc::new(RwLock::new(HashMap::new())),
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
             entry_flow_lock: Mutex::new(()),
@@ -1595,6 +1645,45 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     "Failed to re-arm detector — position requires manual re-arm"
                 );
             },
+        }
+    }
+
+    /// How this position's technical stop was derived. Served from memory
+    /// when the analysis ran in this process; otherwise re-read once from the
+    /// durable event log (latest `technical_stop_analyzed` on the position
+    /// stream) and cached. `None` when no analysis is on record.
+    pub async fn tech_stop_audit_for_position(
+        &self,
+        position_id: PositionId,
+    ) -> Option<TechStopAuditSummary> {
+        if let Some(summary) = self.tech_stop_audits.read().await.get(&position_id) {
+            return Some(summary.clone());
+        }
+        #[cfg(feature = "postgres")]
+        {
+            let (Some(pool), Some(tenant_id)) = (&self.event_log_pool, self.event_log_tenant_id)
+            else {
+                return None;
+            };
+            let options = robson_eventlog::QueryOptions::new(tenant_id)
+                .stream(format!("position:{position_id}"))
+                .event_type("technical_stop_analyzed")
+                .limit(1)
+                .descending();
+            let envelope = match robson_eventlog::query_events(pool, options).await {
+                Ok(mut events) => events.pop(),
+                Err(error) => {
+                    warn!(%position_id, %error, "Failed to read technical stop audit from event log");
+                    return None;
+                },
+            };
+            let summary = TechStopAuditSummary::from_event_payload(&envelope?.payload)?;
+            self.tech_stop_audits.write().await.insert(position_id, summary.clone());
+            return Some(summary);
+        }
+        #[cfg(not(feature = "postgres"))]
+        {
+            None
         }
     }
 
@@ -2882,6 +2971,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
 
         if let Some(analysis) = signal.technical_stop_analysis.clone() {
+            self.tech_stop_audits
+                .write()
+                .await
+                .insert(position_id, TechStopAuditSummary::from_audit(&analysis));
             let event = Event::TechnicalStopAnalyzed {
                 position_id,
                 signal_id: signal.signal_id,
@@ -4844,6 +4937,44 @@ mod tests {
         assert_eq!(governed_rearm_backoff(u32::MAX).as_secs(), 900);
         // attempt 0 never happens (counter starts at 1), but must not panic
         assert_eq!(governed_rearm_backoff(0).as_secs(), 5);
+    }
+
+    #[test]
+    fn tech_stop_audit_summary_parses_persisted_event_payloads() {
+        let swing = serde_json::json!({
+            "type": "technical_stop_analyzed",
+            "analysis": {
+                "method": {"type": "swing_point", "level_n": 2},
+                "confidence": "high",
+                "stop_price": "100"
+            }
+        });
+        assert_eq!(
+            TechStopAuditSummary::from_event_payload(&swing),
+            Some(TechStopAuditSummary {
+                method: "swing_point".to_string(),
+                level_n: Some(2),
+                confidence: "high".to_string(),
+            })
+        );
+
+        let atr = serde_json::json!({
+            "type": "technical_stop_analyzed",
+            "analysis": {"method": {"type": "atr_fallback"}, "confidence": "low"}
+        });
+        assert_eq!(
+            TechStopAuditSummary::from_event_payload(&atr),
+            Some(TechStopAuditSummary {
+                method: "atr_fallback".to_string(),
+                level_n: None,
+                confidence: "low".to_string(),
+            })
+        );
+
+        assert_eq!(
+            TechStopAuditSummary::from_event_payload(&serde_json::json!({"type": "other"})),
+            None
+        );
     }
 
     #[test]
