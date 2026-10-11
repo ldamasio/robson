@@ -53,6 +53,8 @@ export function positionSummaryLines(p: Position): string[] {
       const approvalLabel = p.approval_mode === 'human_confirmation' ? ' · awaiting approval' : '';
       lines.push(label('ARMED', `${modeLabel}${approvalLabel}`));
       lines.push(label('LEVERAGE', '1x (fixed)'));
+      const method = stopMethodDetail(p);
+      if (method) lines.push(label('METHOD', method));
     } else if (state === 'Active') {
       if (isStale) {
         lines.push(label('STALE', 'not present on exchange'));
@@ -73,6 +75,8 @@ export function positionSummaryLines(p: Position): string[] {
         }
         const rung = trailingLadderRung(p);
         if (rung) lines.push(label('RUNG', rungDetail(rung)));
+        const method = stopMethodDetail(p);
+        if (method) lines.push(label('METHOD', method));
       }
     }
   } else {
@@ -111,6 +115,8 @@ export function positionSummaryLines(p: Position): string[] {
         } else if (val.favorable_extreme) {
           lines.push(label('EXTREME', fmtNum(val.favorable_extreme as number)));
         }
+        const method = stopMethodDetail(p);
+        if (method) lines.push(label('METHOD', method));
       }
     } else if (key === 'Exiting' && val) {
       lines.push(label('EXITING', `${val.exit_reason}`));
@@ -292,6 +298,24 @@ export function trailingLadderRung(p: Position): TrailingLadderRung | null {
     next_trigger: nextTrigger,
     distance_to_next_pct: distanceToNextPct,
   };
+}
+
+// How the technical stop was derived (ADR-0050). The ATR fallback means the
+// analyzer found no valid support/resistance level in bounds and placed the
+// stop at a volatility multiple instead: a stop against noise, not against
+// chart structure, which the operator must be able to see at a glance.
+export function stopMethodDetail(p: Position): string | null {
+  const method = p.tech_stop_method;
+  if (!method) return null;
+  const confidence = p.tech_stop_confidence ? ` · ${p.tech_stop_confidence.toUpperCase()} confidence` : '';
+  if (method === 'atr_fallback') {
+    return `ATR fallback, no chart level in bounds${confidence}`;
+  }
+  if (method === 'swing_point') {
+    const level = p.tech_stop_level_n != null ? `swing level ${p.tech_stop_level_n}` : 'swing level';
+    return `${level}${confidence}`;
+  }
+  return `${method}${confidence}`;
 }
 
 function rungDetail(rung: TrailingLadderRung): string {

@@ -32,6 +32,12 @@ export type Position = {
   entry_reference?: number | null;
   entry_filled_at: string | null;
   tech_stop_distance: number | null;
+  // How the technical stop was derived (ADR-0050): "swing_point" with the
+  // 1-indexed level, or "atr_fallback" when no valid chart level was in
+  // bounds; with the analyzer's confidence ("high" | "medium" | "low").
+  tech_stop_method?: string | null;
+  tech_stop_level_n?: number | null;
+  tech_stop_confidence?: string | null;
   executable_span?: number | null;
   quantity: number | null;
   realized_pnl: number | null;
@@ -334,6 +340,10 @@ function normalizePosition(raw: unknown): Position {
     entry_filled_at:
       p.entry_filled_at == null ? null : String(p.entry_filled_at),
     tech_stop_distance: toNumber(p.tech_stop_distance),
+    tech_stop_method: p.tech_stop_method == null ? null : String(p.tech_stop_method),
+    tech_stop_level_n: toNumber(p.tech_stop_level_n),
+    tech_stop_confidence:
+      p.tech_stop_confidence == null ? null : String(p.tech_stop_confidence),
     executable_span: toNumber(p.executable_span),
     quantity: toNumber(p.quantity),
     realized_pnl: toNumber(p.realized_pnl),
