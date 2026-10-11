@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added - Technical stop method and confidence on the position card
+
+- Two consecutive arms on 2026-10-11 got ATR-fallback stops (no valid
+  support/resistance level in bounds, ADR-0050 §7) at 0.15% and 0.26% of
+  price; the first was stopped by noise 25 s after the fill. Nothing on the
+  dashboard said the stop was a fallback.
+- `/status` and `/positions/:id` now carry `tech_stop_method`
+  (`swing_point` | `atr_fallback`), `tech_stop_level_n` and
+  `tech_stop_confidence`, served from memory when the analysis ran in this
+  process and re-read once from the event log (`technical_stop_analyzed`)
+  after a restart. The card shows a `METHOD` line, e.g.
+  `ATR fallback, no chart level in bounds · LOW confidence`.
+
 ### Fixed - Failed insurance-stop re-placement is now retried (ADR-0039)
 
 - After a trailing advance the executor places the new exchange stop and then
