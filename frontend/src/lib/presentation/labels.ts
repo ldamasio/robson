@@ -367,7 +367,9 @@ function activeCurrentPrice(p: Position): number | null {
 
 function activeFavorableExtreme(p: Position): number | null {
   const state = p.state;
-  if (typeof state === 'string') return null;
+  if (typeof state === 'string') {
+    return state === 'Active' && typeof p.favorable_extreme === 'number' ? p.favorable_extreme : null;
+  }
 
   const key = Object.keys(state)[0];
   const val = (state as Record<string, Record<string, unknown>>)[key];
