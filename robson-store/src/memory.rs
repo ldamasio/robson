@@ -432,6 +432,32 @@ impl MemoryStore {
                 }
             },
 
+            // FavorableExtremeAdvanced (issue #192): move the watermark and
+            // the last known price within Active; the stop is untouched.
+            Event::FavorableExtremeAdvanced {
+                position_id,
+                favorable_extreme,
+                timestamp,
+                ..
+            } => {
+                let mut positions = self.positions.write().unwrap();
+                if let Some(mut position) = positions.get(position_id).cloned() {
+                    if let PositionState::Active {
+                        ref mut current_price,
+                        favorable_extreme: ref mut stored_extreme,
+                        ref mut extreme_at,
+                        ..
+                    } = position.state
+                    {
+                        *current_price = *favorable_extreme;
+                        *stored_extreme = *favorable_extreme;
+                        *extreme_at = *timestamp;
+                        position.updated_at = chrono::Utc::now();
+                        positions.insert(*position_id, position);
+                    }
+                }
+            },
+
             // InsuranceStopFailed: audit-only, no position state change.
             Event::InsuranceStopFailed { .. }
             | Event::StartupRecoveryInsuranceStopChecked { .. } => {},

@@ -833,6 +833,45 @@ pub(crate) async fn handle_trailing_stop_updated(
     Ok(())
 }
 
+/// Persist a bounded favorable-watermark advance (issue #192) so a restart
+/// hydrates the real extreme and the recovery replay window starts at the
+/// last observed extreme instead of the last discrete trailing advance.
+pub(crate) async fn handle_favorable_extreme_advanced(
+    pool: &PgPool,
+    envelope: &EventEnvelope,
+) -> Result<()> {
+    use crate::types::FavorableExtremeAdvanced;
+    let payload: FavorableExtremeAdvanced = serde_json::from_value(envelope.payload.clone())
+        .map_err(|e| ProjectionError::InvalidPayload {
+            event_type: envelope.event_type.clone(),
+            reason: e.to_string(),
+        })?;
+
+    sqlx::query(
+        r#"
+        UPDATE positions_current
+        SET
+            favorable_extreme = $2,
+            extreme_at = $3,
+            current_price = $2,
+            last_event_id = $4,
+            last_seq = $5,
+            updated_at = $6
+        WHERE position_id = $1 AND state = 'active' AND last_seq < $5
+        "#,
+    )
+    .bind(payload.position_id)
+    .bind(payload.favorable_extreme)
+    .bind(payload.timestamp)
+    .bind(envelope.event_id)
+    .bind(envelope.seq)
+    .bind(envelope.occurred_at)
+    .execute(pool)
+    .await?;
+
+    Ok(())
+}
+
 /// Persist the live insurance-stop linkage (ADR-0039).
 ///
 /// `insurance_stop_placed` and `insurance_stop_replaced` both carry the new
