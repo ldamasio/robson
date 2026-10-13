@@ -425,8 +425,18 @@ derived (`effective_stop_price`) and exposed as
 [ADR-0041](../adr/ADR-0041-executable-stop-buffer.md).
 
 Stop-placement/replacement failures are audit-only (`InsuranceStopFailed`) and
-never abort the action batch or the position lifecycle. See
-[ADR-0039](../adr/ADR-0039-exchange-side-insurance-stop.md).
+never abort the action batch or the position lifecycle. The position manager
+remembers the position and re-places the order at the current executable
+trigger on a later tick with a 30 s backoff until the exchange accepts it
+(`robsond_insurance_stop_stale_positions` counts positions waiting for that
+heal). See [ADR-0039](../adr/ADR-0039-exchange-side-insurance-stop.md) and its
+2026-10-07 amendment.
+
+Audit-only `position_monitor_tick` events are throttled to one per
+`ROBSON_POSITION_MONITOR_TICK_INTERVAL_SECS` (default 20 s) per position; the
+engine still evaluates every trade, and ticks that accompany an exit, a
+trailing advance or a bounded watermark advance (`favorable_extreme_advanced`)
+are never dropped. See the ADR-0049 amendment of 2026-10-07.
 
 ---
 
