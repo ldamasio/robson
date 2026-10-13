@@ -1023,7 +1023,62 @@ impl Engine {
             market_data.timestamp,
         );
 
-        Ok(EngineDecision::with_actions(vec![EngineAction::EmitEvent(monitor_tick)]))
+        // Issue #192: persist the watermark as it advances (bounded), not
+        // only when a rung completes, so restarts and the operator card see
+        // the real extreme. Carried alongside the tick so the audit-only
+        // tick throttle never drops it (a two-action decision is not a bare
+        // heartbeat).
+        let mut actions = Vec::with_capacity(2);
+        if let Some(advance) = self.create_favorable_extreme_advanced_event(
+            position,
+            favorable_extreme,
+            observed_watermark,
+            market_data.timestamp,
+        ) {
+            actions.push(EngineAction::EmitEvent(advance));
+        }
+        actions.push(EngineAction::EmitEvent(monitor_tick));
+        Ok(EngineDecision::with_actions(actions))
+    }
+
+    /// Persistence step for the favorable watermark (issue #192): a tenth of
+    /// the executable span (ADR-0052) or of the technical span on legacy
+    /// positions; 10 bps of price when neither is known.
+    fn favorable_extreme_step(position: &Position, price: Price) -> Decimal {
+        let span = position
+            .executable_span
+            .or_else(|| position.tech_stop_distance.as_ref().map(|t| t.span()));
+        match span {
+            Some(span) if span > Decimal::ZERO => span / Decimal::from(10),
+            _ => price.as_decimal() * Decimal::new(1, 3),
+        }
+    }
+
+    /// Emit `FavorableExtremeAdvanced` when the observed watermark beats the
+    /// persisted extreme by at least one persistence step. Pure.
+    fn create_favorable_extreme_advanced_event(
+        &self,
+        position: &Position,
+        persisted_extreme: Price,
+        observed_watermark: Price,
+        timestamp: DateTime<Utc>,
+    ) -> Option<Event> {
+        let advance = match position.side {
+            Side::Long => observed_watermark.as_decimal() - persisted_extreme.as_decimal(),
+            Side::Short => persisted_extreme.as_decimal() - observed_watermark.as_decimal(),
+        };
+        if advance <= Decimal::ZERO {
+            return None;
+        }
+        if advance < Self::favorable_extreme_step(position, observed_watermark) {
+            return None;
+        }
+        Some(Event::FavorableExtremeAdvanced {
+            position_id: position.id,
+            previous_extreme: persisted_extreme,
+            favorable_extreme: observed_watermark,
+            timestamp,
+        })
     }
 
     /// The ADR-0041 buffer this position's executable stop derives with:
@@ -1483,9 +1538,61 @@ mod tests {
         let market = create_market_data(dec!(96000));
         let decision = engine.process_active_position(&position, &market).unwrap();
 
-        assert_eq!(decision.actions.len(), 1);
+        // Issue #192: a new extreme 1,000 above the persisted one (step is
+        // 150 = span / 10) is persisted alongside the tick.
+        assert_eq!(decision.actions.len(), 2);
         assert_position_monitor_tick(&decision, dec!(96000), dec!(93500), dec!(96000), dec!(2500));
         assert!(!has_trailing_stop_update_event(&decision));
+        assert_eq!(find_favorable_extreme_advanced(&decision), Some((dec!(95000), dec!(96000))));
+    }
+
+    #[test]
+    fn test_favorable_extreme_advance_is_persisted_only_past_one_step() {
+        let config = RiskConfig::new(dec!(10000)).unwrap();
+        let engine = Engine::new(config);
+        // Span 1,500 -> persistence step 150.
+        let position =
+            create_active_position(Side::Long, dec!(95000), dec!(93500), dec!(95000), dec!(1500));
+
+        // Below one step: heartbeat only, the watermark stays in memory.
+        let decision = engine
+            .process_active_position(&position, &create_market_data(dec!(95100)))
+            .unwrap();
+        assert_eq!(decision.actions.len(), 1);
+        assert_eq!(find_favorable_extreme_advanced(&decision), None);
+
+        // Adverse move: never an advance.
+        let decision = engine
+            .process_active_position(&position, &create_market_data(dec!(94800)))
+            .unwrap();
+        assert_eq!(find_favorable_extreme_advanced(&decision), None);
+
+        // One full step: persisted, stop untouched.
+        let decision = engine
+            .process_active_position(&position, &create_market_data(dec!(95150)))
+            .unwrap();
+        assert_eq!(decision.actions.len(), 2);
+        assert!(!has_trailing_stop_update_event(&decision));
+        assert_eq!(find_favorable_extreme_advanced(&decision), Some((dec!(95000), dec!(95150))));
+
+        // Shorts mirror the rule.
+        let short =
+            create_active_position(Side::Short, dec!(95000), dec!(96500), dec!(95000), dec!(1500));
+        let decision = engine
+            .process_active_position(&short, &create_market_data(dec!(94840)))
+            .unwrap();
+        assert_eq!(find_favorable_extreme_advanced(&decision), Some((dec!(95000), dec!(94840))));
+    }
+
+    fn find_favorable_extreme_advanced(decision: &EngineDecision) -> Option<(Decimal, Decimal)> {
+        decision.actions.iter().find_map(|action| match action {
+            EngineAction::EmitEvent(Event::FavorableExtremeAdvanced {
+                previous_extreme,
+                favorable_extreme,
+                ..
+            }) => Some((previous_extreme.as_decimal(), favorable_extreme.as_decimal())),
+            _ => None,
+        })
     }
 
     #[test]
@@ -1546,13 +1653,15 @@ mod tests {
             dec!(1500),  // tech distance
         );
 
-        // Price moved up to $96k — NOT a full span ($96.5k needed). No update.
+        // Price moved up to $96k — NOT a full span ($96.5k needed). No stop
+        // update; the watermark advance is persisted (issue #192) with the tick.
         let market = create_market_data(dec!(96000));
         let decision = engine.process_active_position(&position, &market).unwrap();
 
-        assert_eq!(decision.actions.len(), 1);
+        assert_eq!(decision.actions.len(), 2);
         assert_position_monitor_tick(&decision, dec!(96000), dec!(93500), dec!(96000), dec!(2500));
         assert!(!has_trailing_stop_update_event(&decision));
+        assert_eq!(find_favorable_extreme_advanced(&decision), Some((dec!(95000), dec!(96000))));
     }
 
     #[test]
@@ -1709,12 +1818,14 @@ mod tests {
             dec!(1500),  // tech distance
         );
 
-        // Price moved down to $94,000 — NOT a full span ($93,500 needed). No update.
+        // Price moved down to $94,000 — NOT a full span ($93,500 needed). No
+        // stop update; the watermark advance is persisted (issue #192).
         let market = create_market_data(dec!(94000));
         let decision = engine.process_active_position(&position, &market).unwrap();
-        assert_eq!(decision.actions.len(), 1);
+        assert_eq!(decision.actions.len(), 2);
         assert_position_monitor_tick(&decision, dec!(94000), dec!(96500), dec!(94000), dec!(2500));
         assert!(!has_trailing_stop_update_event(&decision));
+        assert_eq!(find_favorable_extreme_advanced(&decision), Some((dec!(95000), dec!(94000))));
     }
 
     #[test]

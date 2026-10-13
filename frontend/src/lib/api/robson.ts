@@ -45,6 +45,9 @@ export type Position = {
   variation_pct?: number | null;
   fees_paid: number | null;
   trailing_stop?: number | null;
+  // Favorable watermark of an Active position (issue #192), carried on the
+  // flat summary so the dashboard can show the ruler extreme too.
+  favorable_extreme?: number | null;
   effective_stop?: number | null;
   raw_technical_stop?: number | null;
   invalidation_guard_level?: number | null;
@@ -351,6 +354,7 @@ function normalizePosition(raw: unknown): Position {
     variation_pct: toNumber(p.variation_pct),
     fees_paid: toNumber(p.fees_paid),
     trailing_stop: toNumber(p.trailing_stop),
+    favorable_extreme: toNumber(p.favorable_extreme),
     effective_stop: toNumber(p.effective_stop),
     raw_technical_stop: toNumber(p.raw_technical_stop),
     invalidation_guard_level: toNumber(p.invalidation_guard_level),

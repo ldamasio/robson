@@ -212,6 +212,25 @@ describe('trailingLadderRung', () => {
     });
   });
 
+  it('uses the flat favorable_extreme on string-state summaries', () => {
+    // Live 2026-10-12 short: E 82,739.80, S 1,684.80; extreme 81,000 completes
+    // one span even though the stop has not been ratcheted yet.
+    const rung = trailingLadderRung(
+      basePosition({
+        state: 'Active',
+        side: 'Short',
+        entry_price: 82739.8,
+        entry_reference: 82739.8,
+        executable_span: 1684.8,
+        trailing_stop: 84424.6,
+        favorable_extreme: 81000,
+        current_price: 81200
+      })
+    );
+    expect(rung?.completed_spans).toBe(1);
+    expect(rung?.favorable_extreme).toBe(81000);
+  });
+
   it('clamps the distance at zero once the price is past the next trigger', () => {
     const rung = trailingLadderRung(
       basePosition({

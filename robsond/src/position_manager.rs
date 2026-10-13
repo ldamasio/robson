@@ -7678,21 +7678,20 @@ mod tests {
             .await
             .unwrap();
 
+        // The favorable move persisted the watermark (issue #192), so the
+        // stored price now reads 105 too; equity agrees.
         let stored = manager.get_position(position.id).await.unwrap().unwrap();
         match stored.state {
             PositionState::Active { current_price, .. } => {
-                assert_eq!(current_price.as_decimal(), dec!(100), "store keeps the fill price")
+                assert_eq!(current_price.as_decimal(), dec!(105), "watermark advance persisted")
             },
             other => panic!("expected Active, got {other:?}"),
         }
-        assert_eq!(
-            manager.month_equity_net(now).await.unwrap(),
-            dec!(5),
-            "equity must use the live mark (105) rather than the stored price (100)"
-        );
+        assert_eq!(manager.month_equity_net(now).await.unwrap(), dec!(5));
 
         // A later adverse tick lowers equity again: give-back is visible
-        // intra-trade, not only at exit.
+        // intra-trade, not only at exit. The stored price stays at the
+        // watermark (105), so this is where the live mark must win.
         manager
             .process_market_data(MarketData {
                 symbol: position.symbol.clone(),
@@ -7702,7 +7701,22 @@ mod tests {
             })
             .await
             .unwrap();
-        assert_eq!(manager.month_equity_net(now).await.unwrap(), dec!(-2));
+        let stored = manager.get_position(position.id).await.unwrap().unwrap();
+        match stored.state {
+            PositionState::Active { current_price, .. } => {
+                assert_eq!(
+                    current_price.as_decimal(),
+                    dec!(105),
+                    "adverse ticks never move the stored price"
+                )
+            },
+            other => panic!("expected Active, got {other:?}"),
+        }
+        assert_eq!(
+            manager.month_equity_net(now).await.unwrap(),
+            dec!(-2),
+            "equity must use the live mark (98) rather than the stored price (105)"
+        );
     }
 
     #[tokio::test]

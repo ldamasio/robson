@@ -235,6 +235,15 @@ pub struct TrailingStopUpdated {
     pub timestamp: DateTime<Utc>,
 }
 
+/// favorable_extreme_advanced payload (issue #192).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FavorableExtremeAdvanced {
+    pub position_id: Uuid,
+    pub previous_extreme: Decimal,
+    pub favorable_extreme: Decimal,
+    pub timestamp: DateTime<Utc>,
+}
+
 /// insurance_stop_placed / insurance_stop_replaced payload (ADR-0039).
 /// Both carry the live exchange conditional-order id in `order_id`.
 #[derive(Debug, Clone, Serialize, Deserialize)]

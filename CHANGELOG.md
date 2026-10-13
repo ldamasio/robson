@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed - Favorable watermark persisted as it advances (#192)
+
+- `favorable_extreme` / `extreme_at` were written only on discrete trailing
+  advances (`TrailingStopUpdated`), so between rungs the real extreme lived in
+  memory only, the EXTREME line and `/status` lagged, and a restart replayed
+  candles from a stale anchor. The ladder itself was not affected: rung
+  completion is detected on the crossing tick and the restart replay covers
+  gaps.
+- New bounded domain event `favorable_extreme_advanced`, emitted by the engine
+  when the watermark beats the persisted extreme by at least a tenth of the
+  executable span (10 bps of price without a span), applied to the in-memory
+  state and to `positions_current`. `/status` now carries `favorable_extreme`
+  on the flat summary and the dashboard RUNG line uses it.
+
 ### Added - Technical stop method and confidence on the position card
 
 - Two consecutive arms on 2026-10-11 got ATR-fallback stops (no valid

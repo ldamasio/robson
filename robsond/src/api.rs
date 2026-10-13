@@ -247,6 +247,10 @@ pub struct PositionSummary {
     pub entry_reference: Option<Decimal>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub trailing_stop: Option<Decimal>,
+    /// Best favorable price observed for an Active position (the ADR-0052
+    /// ruler watermark), persisted as it advances (issue #192).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub favorable_extreme: Option<Decimal>,
     /// Executable stop (technical trailing stop offset by the configured
     /// buffer, ADR-0041; clamped to the entry-time invalidation guard while
     /// it is still active, ADR-0042). Equals `trailing_stop` when the buffer
@@ -2369,6 +2373,10 @@ fn position_to_summary(
         .flatten()
         .map(|price| price.as_decimal());
 
+    let favorable_extreme = match &position.state {
+        PositionState::Active { favorable_extreme, .. } => Some(favorable_extreme.as_decimal()),
+        _ => None,
+    };
     let (
         state_str,
         entry_price,
@@ -2485,6 +2493,7 @@ fn position_to_summary(
                             stop_buffer_bps_at_arm: position.stop_buffer_bps_at_arm,
                             tech_stop_distance,
                             tech_stop_method: None,
+                            favorable_extreme,
                             tech_stop_level_n: None,
                             tech_stop_confidence: None,
                             current_price,
@@ -2548,6 +2557,7 @@ fn position_to_summary(
         stop_buffer_bps_at_arm: position.stop_buffer_bps_at_arm,
         tech_stop_distance,
         tech_stop_method: None,
+        favorable_extreme,
         tech_stop_level_n: None,
         tech_stop_confidence: None,
         current_price,

@@ -329,6 +329,24 @@ pub enum Event {
         timestamp: DateTime<Utc>,
     },
 
+    /// The favorable watermark of an Active position advanced by at least
+    /// one persistence step (issue #192). Bounded: emitted only on a new
+    /// extreme and only once the advance since the last persisted extreme
+    /// reaches a tenth of the executable span (or 10 bps of price when no
+    /// span is known), so a trending leg produces at most ~10 of these per
+    /// rung. Keeps `favorable_extreme` / `extreme_at` truthful across
+    /// restarts instead of only on discrete trailing advances.
+    FavorableExtremeAdvanced {
+        /// Position identifier
+        position_id: PositionId,
+        /// Extreme recorded before this advance
+        previous_extreme: Price,
+        /// New favorable extreme (the current price at this tick)
+        favorable_extreme: Price,
+        /// When the advance was observed
+        timestamp: DateTime<Utc>,
+    },
+
     /// Position monitor observed an active-position market tick
     PositionMonitorTick {
         /// Position identifier
@@ -612,6 +630,7 @@ impl Event {
             | Event::ExecutableStopRiskResolutionFailed { position_id, .. }
             | Event::TrailingStopUpdated { position_id, .. }
             | Event::PositionMonitorTick { position_id, .. }
+            | Event::FavorableExtremeAdvanced { position_id, .. }
             | Event::ExitTriggered { position_id, .. }
             | Event::ExitOrderPlaced { position_id, .. }
             | Event::ExitFilled { position_id, .. }
@@ -650,6 +669,7 @@ impl Event {
             | Event::ExecutableStopRiskResolutionFailed { timestamp, .. }
             | Event::TrailingStopUpdated { timestamp, .. }
             | Event::PositionMonitorTick { timestamp, .. }
+            | Event::FavorableExtremeAdvanced { timestamp, .. }
             | Event::ExitTriggered { timestamp, .. }
             | Event::ExitOrderPlaced { timestamp, .. }
             | Event::ExitFilled { timestamp, .. }
@@ -689,6 +709,7 @@ impl Event {
             },
             Event::TrailingStopUpdated { .. } => "trailing_stop_updated",
             Event::PositionMonitorTick { .. } => "position_monitor_tick",
+            Event::FavorableExtremeAdvanced { .. } => "favorable_extreme_advanced",
             Event::ExitTriggered { .. } => "exit_triggered",
             Event::ExitOrderPlaced { .. } => "exit_order_placed",
             Event::ExitFilled { .. } => "exit_filled",

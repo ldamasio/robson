@@ -30,6 +30,7 @@ enum ProjectionRoute {
     MonthBoundaryReset,
     CapitalBaseRecalibrated,
     TrailingStopUpdated,
+    FavorableExtremeAdvanced,
     PositionMonitorTick,
     ExitTriggered,
     ExitOrderPlaced,
@@ -85,6 +86,7 @@ fn projection_route(event_type: &str) -> Option<ProjectionRoute> {
         "trailing_stop_updated" | "TRAILING_STOP_UPDATED" => {
             Some(ProjectionRoute::TrailingStopUpdated)
         },
+        "favorable_extreme_advanced" => Some(ProjectionRoute::FavorableExtremeAdvanced),
         "position_monitor_tick" | "POSITION_MONITOR_TICK" => {
             Some(ProjectionRoute::PositionMonitorTick)
         },
@@ -192,6 +194,9 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
         },
         Some(ProjectionRoute::TrailingStopUpdated) => {
             handlers::positions::handle_trailing_stop_updated(pool, envelope).await?
+        },
+        Some(ProjectionRoute::FavorableExtremeAdvanced) => {
+            handlers::positions::handle_favorable_extreme_advanced(pool, envelope).await?
         },
         Some(ProjectionRoute::PositionMonitorTick) => {
             // Audit-only tick evidence. The canonical position projection is
