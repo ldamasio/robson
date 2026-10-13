@@ -81,10 +81,10 @@ Distance: $1,500 (1.58%)
 
 ### Exchange-Side Insurance Stop (ADR-0039)
 
-**Decision**: Robson manages exits in runtime and additionally places a backup stop order on the exchange. On entry fill the engine emits `PlaceInsuranceStop`; the executor places the stop at the chart-derived trailing stop (offset by a configured buffer) and re-places it as the trailing stop advances. A placement failure becomes an audit-only `InsuranceStopFailed` event: it never aborts the action batch, and the software monitor remains the primary exit path.
+**Decision**: Robson manages exits in runtime and additionally places a backup stop order on the exchange. On entry fill the engine emits `PlaceInsuranceStop`; the executor places the stop at the executable trigger (chart-derived trailing stop offset by the configured buffer, ADR-0041/ADR-0052) and cancel-replaces it as the trailing stop advances. A placement failure becomes an audit-only `InsuranceStopFailed` event that never aborts the action batch; the runtime then re-places the order at the current trigger on a later tick with a 30 s backoff until the exchange accepts it (ADR-0039 amendment 2026-10-07).
 
 **Rationale**:
-- The runtime remains the primary exit path (market orders on stop hit)
+- Both layers consume the same executable trigger. The exchange order fires in the matching engine before the trade reaches the daemon, so `Closed (InsuranceStop)` is the normal exit label while the daemon is healthy; the runtime's market exit is the fallback
 - The exchange-side stop protects the position if the daemon is down or disconnected
 - The stop price is always chart-derived, never a percentage of entry
 
@@ -471,27 +471,31 @@ Distance %: 1.58%
 
 ### How It Works
 
-The trailing stop **follows** favorable price movement by maintaining a fixed distance (tech stop distance) from the most favorable price seen.
+The trailing stop **follows** favorable price movement in discrete steps (ADR-0052): the executable span `S` is fixed at admission from the chart-derived technical stop plus the execution buffer, and the stop only moves when price has completed whole spans away from the entry reference `E`. The favorable extreme (watermark) is tracked on every tick and persisted as it advances in bounded steps (`favorable_extreme_advanced`, issue #192); the stop itself moves only on rung completion (`trailing_stop_updated`).
 
 #### For Long Positions
 
 ```
-Initial: trailing_stop = entry_price - tech_distance
-Update:  IF current_price > favorable_extreme THEN
-           favorable_extreme = current_price
-           trailing_stop = current_price - tech_distance
-Exit:    IF current_price <= trailing_stop THEN trigger exit
+Initial:   trailing_stop = E - S
+Each tick: favorable_extreme = max(favorable_extreme, current_price)
+           completed = floor((favorable_extreme - E) / S)
+           candidate = E - S + completed × S
+           IF candidate > trailing_stop THEN trailing_stop = candidate
+Exit:      IF current_price <= executable_trigger(trailing_stop) THEN trigger exit
 ```
 
 #### For Short Positions
 
 ```
-Initial: trailing_stop = entry_price + tech_distance
-Update:  IF current_price < favorable_extreme THEN
-           favorable_extreme = current_price
-           trailing_stop = current_price + tech_distance
-Exit:    IF current_price >= trailing_stop THEN trigger exit
+Initial:   trailing_stop = E + S
+Each tick: favorable_extreme = min(favorable_extreme, current_price)
+           completed = floor((E - favorable_extreme) / S)
+           candidate = E + S - completed × S
+           IF candidate < trailing_stop THEN trailing_stop = candidate
+Exit:      IF current_price >= executable_trigger(trailing_stop) THEN trigger exit
 ```
+
+The first completed span moves the technical stop to `E` (a technical breakeven; the executable trigger still sits one buffer beyond it). The chart is consulted once, at arm time, to size `S`; later support/resistance levels do not redefine it.
 
 ### Example: Long Position
 
@@ -500,20 +504,21 @@ Entry: $95,000
 Tech Distance: $1,500
 Initial Stop: $93,500
 
-Price moves to $96,000 (new high!)
-→ favorable_extreme = $96,000
-→ trailing_stop = $96,000 - $1,500 = $94,500
+Price moves to $96,000 (new high, 0.66 spans)
+  favorable_extreme = $96,000; no rung completed; stop stays at $93,500
 
-Price moves to $97,000 (new high!)
-→ favorable_extreme = $97,000
-→ trailing_stop = $97,000 - $1,500 = $95,500
+Price moves to $96,500 (one full span)
+  completed = 1; trailing_stop = $95,000 (technical breakeven)
 
-Price drops to $95,500 (hits trailing stop)
-→ EXIT TRIGGERED
-→ Profit: $95,500 - $95,000 = $500
+Price moves to $98,000 (two full spans)
+  completed = 2; trailing_stop = $96,500
 
-Without trailing: would have exited at fixed stop gain or held longer
-With trailing: captured $2,000 of the $2,000 move, then protected $500 profit
+Price drops to $96,500 (hits trailing stop)
+  EXIT TRIGGERED (the exchange insurance stop usually fills first)
+  Profit: $96,500 - $95,000 = $1,500 before buffer and fees
+
+The ladder gives back between one and two spans from the extreme by design;
+in exchange, a wick that does not complete a span never moves the stop.
 ```
 
 ### Why Trailing Stop Instead of Fixed Stop Gain?

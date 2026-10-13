@@ -589,7 +589,7 @@ MonthlyPnL = Σ(realized_pnl_gross) - Σ(fees_paid) + unrealized_pnl
 |---|---|---|---|
 | `realized_pnl_gross` | Gross P&L of a closed position: `(exit_price − entry_price) × quantity`, signed by side. Does NOT include fees. | `Event::PositionClosed { realized_pnl }` → `Position.realized_pnl` | Implemented |
 | `fees_paid` | Commissions paid (entry + exit). Does NOT include funding rates. | `Event::PositionClosed { total_fees }` → `Position.fees_paid` | Implemented — subtracted in `build_risk_context()` |
-| `unrealized_pnl` | Mark-to-market of open Active positions using last received tick price. NOT exchange mark price. | `Position::calculate_pnl()` with `current_price` | Implemented (approximation) |
+| `unrealized_pnl` | Mark-to-market of open Active positions using the last market price received for the symbol (`PositionManager` keeps it per symbol since the ADR-0046 amendment of 2026-10-07). NOT exchange mark price. Until the first tick after startup it falls back to the stored `current_price`. | `Position::unrealized_pnl_at(last_market_price)`, fallback `Position::calculate_pnl()` | Implemented (approximation) |
 | Funding rates | Costs from perpetual contract funding. | Not captured | Not tracked |
 
 **Source of truth**: Exchange (Binance) is the primary financial authority. Robson maintains a local projection derived from events. This projection is not continuously reconciled against the exchange. Divergence sources: slippage not captured, fees partially modeled (no funding), fill prices approximated from ticks rather than confirmed fills.

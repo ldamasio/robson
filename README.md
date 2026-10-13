@@ -10,11 +10,11 @@ The system provides a single-operator runtime with a slot-based monthly risk mod
 
 ## Risk Model at a Glance
 
-- **Monthly budget**: 4% of `capital_base` — hard limit enforced by a circuit breaker
+- **Monthly budget**: 4% of `capital_base`, measured as give-back from the month's equity peak with open positions marked at the live price (ADR-0046) — hard limit enforced by a circuit breaker
 - **Per-trade risk**: 1% of `capital_base` as a **worst-case cap** (derived from position size, never set directly)
 - **Position sizing**: `size = (capital_base × 1%) / (technical_stop_distance + gap_allowance + round_trip_taker_fees)` — the budget absorbs execution costs, not just chart distance, so a stop that fills never breaches the cap (ADR-0039)
 - **Technical stop**: always from chart analysis (second S/R level, 15m timeframe) — never a percentage of entry price
-- **Stop enforcement**: two independent layers. The software monitor is the primary exit path (discrete trailing, per-tick audit); a robsond-authored reduce-only conditional stop order rests on the exchange as a fail-safe that survives daemon outages (ADR-0039)
+- **Stop enforcement**: two independent layers at one executable trigger. A robsond-authored reduce-only conditional stop order rests on the exchange and fills first in practice; the software monitor evaluates every trade (discrete trailing, audit ticks persisted at most once per 20 s per position) and is the fallback, so stop enforcement survives daemon outages (ADR-0039)
 - **Exit execution**: exits and protective stops are always market orders (taker) — non-execution there is an unbounded loss; fee optimization is only ever applied to legs where waiting is costless (ADR-0040)
 - **Entry capacity**: budget-metered (ADR-0043). Each entry is charged its actual planned worst-case loss against the monthly budget, not the full 1% cap — **at least 4 full-cap operations per month are guaranteed, and saved risk becomes extra operations**. No static cap on concurrent positions or entries per day; the budget is the only constraint
 

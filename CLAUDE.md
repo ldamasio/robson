@@ -59,10 +59,12 @@ If this file and `AGENTS.md` ever diverge, `AGENTS.md` is the source of truth.
   `ReconciliationEvidence::Estimated`. Only `OrderFillRecord` and `UserTradeRecord`
   are valid for automated reconciled closes in v3.
 - **Two-layer stop enforcement** — every Active position carries a
-  robsond-authored reduce-only conditional stop on the exchange at the
-  chart-derived trailing stop; the software monitor stays the primary exit
-  path. Daemon availability must never be a precondition for bounded loss.
-  See ADR-0039.
+  robsond-authored reduce-only conditional stop on the exchange at the same
+  executable trigger the software monitor uses; the exchange order fills
+  first in practice (`Closed (InsuranceStop)` is the normal exit label) and
+  the software monitor is the fallback. A failed re-placement is retried with
+  backoff. Daemon availability must never be a precondition for bounded loss.
+  See ADR-0039 and its 2026-10-07 amendment.
 - **Exits always take liquidity** — exits and protective stops are market
   orders; maker-first fee optimization is permitted only on entries, where
   non-execution is costless. The 1% per-trade budget is a worst-case cap that
