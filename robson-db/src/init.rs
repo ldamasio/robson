@@ -81,7 +81,7 @@ pub async fn init_minimal_data(
     let stream_key = format!("strategy:{}", strategy_id);
     let idempotency_key = format!("strategy-created-{}", strategy_id);
 
-    sqlx::query(
+    let claimed = sqlx::query(
         r#"
         INSERT INTO event_idempotency (tenant_id, idempotency_key, event_id)
         VALUES ($1, $2, $3)
@@ -92,7 +92,18 @@ pub async fn init_minimal_data(
     .bind(&idempotency_key)
     .bind(event_id)
     .execute(&mut *tx)
-    .await?;
+    .await?
+    .rows_affected();
+
+    // The strategy and its idempotency key already exist: this is a re-run
+    // (every ArgoCD sync runs this hook), not a creation. Writing the
+    // STRATEGY_CREATED row again would put a spurious event in the operator
+    // feed on every deploy (robson#231).
+    if claimed == 0 {
+        tx.commit().await?;
+        info!("Minimal data already initialized; STRATEGY_CREATED not re-emitted");
+        return Ok((tenant_id, account_id));
+    }
 
     // Then insert the event log entry
     sqlx::query(

@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed - Feed hygiene: watermark steps and deploy-time STRATEGY_CREATED
+
+- `GET /events/history` now also excludes `favorable_extreme_advanced`; the
+  card already shows the extreme, the daily feed is for decisions.
+- `robson-db` init re-emitted `STRATEGY_CREATED` on every ArgoCD sync because
+  only the strategy upsert and the idempotency insert were conflict-safe, not
+  the event-log insert (#231). The event is now written only when the
+  idempotency key was actually claimed.
+
 ### Fixed - Favorable watermark persisted as it advances (#192)
 
 - `favorable_extreme` / `extreme_at` were written only on discrete trailing
