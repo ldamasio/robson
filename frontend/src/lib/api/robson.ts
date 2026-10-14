@@ -139,6 +139,38 @@ export type ArmPositionRequest = {
   entry_policy: ArmEntryPolicy;
 };
 
+// Dry run of an immediate arm (POST /entry/preview): what the chart analysis
+// and the engine sizing would produce right now, nothing persisted.
+export type EntryPreviewAnalysis = {
+  technical_stop: number;
+  stop_distance: number;
+  stop_distance_pct: number;
+  method: string;
+  level_n: number | null;
+  confidence: string;
+  invalidation_guard_level: number | null;
+};
+
+export type EntryPreviewSizing = {
+  quantity: number;
+  notional: number;
+  planned_risk: number;
+  planned_risk_pct_of_capital: number;
+  executable_trigger: number | null;
+  executable_span: number | null;
+};
+
+export type EntryPreview = {
+  symbol: string;
+  side: string;
+  reference_price: number;
+  capital_base: number;
+  analysis: EntryPreviewAnalysis | null;
+  sizing: EntryPreviewSizing | null;
+  rejection: string | null;
+  warnings: string[];
+};
+
 export type MonthlyPositionsResponse = {
   month: string;
   positions: Position[];
@@ -323,6 +355,40 @@ function requireNumber(value: unknown, field: string): number {
     throw new Error(`Invalid /status response: missing numeric ${field}`);
   }
   return n;
+}
+
+export function normalizeEntryPreview(raw: Record<string, unknown>): EntryPreview {
+  const a = raw.analysis as Record<string, unknown> | null | undefined;
+  const z = raw.sizing as Record<string, unknown> | null | undefined;
+  return {
+    symbol: String(raw.symbol ?? ""),
+    side: String(raw.side ?? ""),
+    reference_price: toNumber(raw.reference_price) ?? 0,
+    capital_base: toNumber(raw.capital_base) ?? 0,
+    analysis: a
+      ? {
+          technical_stop: toNumber(a.technical_stop) ?? 0,
+          stop_distance: toNumber(a.stop_distance) ?? 0,
+          stop_distance_pct: toNumber(a.stop_distance_pct) ?? 0,
+          method: String(a.method ?? ""),
+          level_n: toNumber(a.level_n),
+          confidence: String(a.confidence ?? ""),
+          invalidation_guard_level: toNumber(a.invalidation_guard_level),
+        }
+      : null,
+    sizing: z
+      ? {
+          quantity: toNumber(z.quantity) ?? 0,
+          notional: toNumber(z.notional) ?? 0,
+          planned_risk: toNumber(z.planned_risk) ?? 0,
+          planned_risk_pct_of_capital: toNumber(z.planned_risk_pct_of_capital) ?? 0,
+          executable_trigger: toNumber(z.executable_trigger),
+          executable_span: toNumber(z.executable_span),
+        }
+      : null,
+    rejection: raw.rejection == null ? null : String(raw.rejection),
+    warnings: Array.isArray(raw.warnings) ? raw.warnings.map(String) : [],
+  };
 }
 
 function normalizePosition(raw: unknown): Position {
@@ -725,6 +791,14 @@ export const robsonApi = {
       ),
       date,
     ),
+
+  previewEntry: async (body: { symbol: string; side: string }) => {
+    const raw = await apiFetch<Record<string, unknown>>("/entry/preview", {
+      method: "POST",
+      body: JSON.stringify(body),
+    });
+    return normalizeEntryPreview(raw);
+  },
 
   armPosition: (body: ArmPositionRequest) =>
     apiFetch<Position>("/positions", {

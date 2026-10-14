@@ -1,5 +1,6 @@
 <script lang="ts">
-  import { robsonApi } from "$api/robson";
+  import { robsonApi, type EntryPreview } from "$api/robson";
+  import { previewLines, previewSeverity } from "$lib/presentation/preview";
 
   let {
     onclose,
@@ -18,6 +19,36 @@
   let approval = $state<"automatic" | "human_confirmation">("automatic");
   let submitting = $state(false);
   let error = $state<string | null>(null);
+  // Dry run of the arm: what the stop analysis and the sizing would do for
+  // the current symbol/side. Keyed so a change of inputs invalidates it.
+  let preview = $state<EntryPreview | null>(null);
+  let previewKey = $state<string | null>(null);
+  let previewing = $state(false);
+  let previewError = $state<string | null>(null);
+  let currentKey = $derived(`${symbol.trim().toUpperCase()}|${side}`);
+  let previewFresh = $derived(preview !== null && previewKey === currentKey);
+  let severity = $derived(preview && previewFresh ? previewSeverity(preview) : null);
+
+  async function runPreview() {
+    previewError = null;
+    if (!symbol.trim()) {
+      previewError = "SYMBOL REQUIRED";
+      return;
+    }
+    previewing = true;
+    try {
+      const key = currentKey;
+      const result = await robsonApi.previewEntry({ symbol: symbol.trim(), side });
+      preview = result;
+      previewKey = key;
+    } catch (e) {
+      preview = null;
+      previewKey = null;
+      previewError = e instanceof Error ? e.message : "PREVIEW FAILED";
+    } finally {
+      previewing = false;
+    }
+  }
 
   function enforceUppercase(e: Event) {
     const input = e.target as HTMLInputElement;
@@ -128,12 +159,45 @@
       </div>
     </div>
 
+    <div class="preview">
+      <div class="preview-head">
+        <span class="label">STOP PREVIEW</span>
+        <button
+          class="btn-preview"
+          onclick={runPreview}
+          disabled={submitting || previewing}
+          >{previewing ? "ANALYZING..." : previewFresh ? "REFRESH" : "PREVIEW STOP"}</button
+        >
+      </div>
+      {#if previewError}
+        <p class="err-text">{previewError}</p>
+      {:else if preview && previewFresh}
+        <pre class="preview-lines">{previewLines(preview).join("\n")}</pre>
+        {#each preview.warnings as warning (warning)}
+          <p class="warn-text">{warning}</p>
+        {/each}
+      {:else}
+        <p class="hint">Run the preview to see the technical stop, its method and the size before arming.</p>
+      {/if}
+    </div>
+
     {#if error}
       <p class="err-text">{error}</p>
     {/if}
 
-    <button class="btn-submit" onclick={submit} disabled={submitting}>
-      {submitting ? "ARMING..." : "ARM"}
+    <button
+      class="btn-submit"
+      class:warn={severity === "warn"}
+      onclick={submit}
+      disabled={submitting || severity === "reject"}
+    >
+      {submitting
+        ? "ARMING..."
+        : severity === "reject"
+          ? "ARM BLOCKED BY REJECTION"
+          : severity === "warn"
+            ? "ARM ANYWAY"
+            : "ARM"}
     </button>
   </div>
 </div>
@@ -188,6 +252,59 @@
     flex-direction: column;
     gap: var(--s-4);
     margin-bottom: var(--s-4);
+  }
+  .preview {
+    border: 1px solid var(--border);
+    border-radius: var(--radius-md);
+    padding: var(--s-3);
+    margin-bottom: var(--s-4);
+    display: flex;
+    flex-direction: column;
+    gap: var(--s-2);
+  }
+  .preview-head {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+  }
+  .btn-preview {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    text-transform: uppercase;
+    letter-spacing: var(--track-label);
+    color: var(--fg-1);
+    background: var(--bg-1);
+    border: 1px solid var(--border);
+    border-radius: var(--radius-sm);
+    padding: var(--s-1) var(--s-2);
+    cursor: pointer;
+  }
+  .btn-preview:disabled {
+    opacity: 0.6;
+    cursor: default;
+  }
+  .preview-lines {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--fg-0);
+    margin: 0;
+    white-space: pre;
+    overflow-x: auto;
+  }
+  .warn-text {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--warn, #e0a94a);
+    margin: 0;
+  }
+  .hint {
+    font-family: var(--font-mono);
+    font-size: var(--text-xs);
+    color: var(--fg-3);
+    margin: 0;
+  }
+  .btn-submit.warn {
+    border-color: var(--warn, #e0a94a);
   }
   .field {
     display: flex;
