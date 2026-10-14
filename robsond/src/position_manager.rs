@@ -1109,7 +1109,36 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     ) -> DaemonResult<Vec<ActionResult>> {
         let results = self.execute_and_persist_inner(actions).await?;
         self.note_insurance_stop_results(&results).await;
+        self.broadcast_mark_advances(&results);
         Ok(results)
+    }
+
+    /// Tell operator surfaces that an Active position's stop or watermark
+    /// moved without a lifecycle transition, so the card refreshes between
+    /// state changes. Both sources are bounded by the engine (one per rung,
+    /// at most ~10 watermark steps per rung), so this never approaches tick
+    /// volume. Not a domain event: nothing is persisted here.
+    fn broadcast_mark_advances(&self, results: &[ActionResult]) {
+        for result in results {
+            let (position_id, reason, timestamp) = match result {
+                ActionResult::EventEmitted(Event::TrailingStopUpdated {
+                    position_id,
+                    timestamp,
+                    ..
+                }) => (*position_id, "trailing_stop_updated", *timestamp),
+                ActionResult::EventEmitted(Event::FavorableExtremeAdvanced {
+                    position_id,
+                    timestamp,
+                    ..
+                }) => (*position_id, "favorable_extreme_advanced", *timestamp),
+                _ => continue,
+            };
+            self.event_bus.send(DaemonEvent::PositionMarkAdvanced {
+                position_id,
+                reason,
+                timestamp,
+            });
+        }
     }
 
     /// Track exchange-side insurance stop outcomes (ADR-0039). A failed
@@ -4429,6 +4458,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// Get the latest market price from the exchange.
     pub async fn get_market_price(&self, symbol: &Symbol) -> DaemonResult<Price> {
         Ok(self.executor.get_price(symbol).await?)
+    }
+
+    /// Last market price received for `symbol` on the tick path (ADR-0046
+    /// amendment). `None` until the first tick after startup. Operator reads
+    /// should prefer this over an exchange round trip.
+    pub async fn last_market_price_for(&self, symbol: &Symbol) -> Option<Price> {
+        self.last_market_price.read().await.get(symbol).copied()
     }
 
     /// Get all open core positions.
