@@ -7,6 +7,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added - Entry preview before arming
+
+- Three of October's stops were ATR fallbacks or single-level stops at 0.15% to
+  0.26% of price, stopped by noise within minutes; the operator only learned
+  the method after the fill. `POST /entry/preview` now dry-runs an immediate
+  arm through the production pieces (same capital base, transient Armed
+  position, the detector's immediate-signal analysis, the engine's entry
+  decision on a cloned engine) and returns reference price, technical stop
+  with distance, method and confidence, size, notional, planned risk, the
+  executable trigger and span, the domain rejection the arm would hit, and
+  advisory warnings. Nothing is persisted and no order is placed.
+- The arm modal gains a STOP PREVIEW panel. Warnings turn the button into
+  ARM ANYWAY; a rejection disables it with the reason shown.
+
 ### Fixed - Favorable watermark persisted as it advances (#192)
 
 - `favorable_extreme` / `extreme_at` were written only on discrete trailing

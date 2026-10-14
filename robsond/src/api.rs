@@ -376,6 +376,14 @@ impl Default for ArmEntryPolicyRequest {
     }
 }
 
+/// Request for an entry preview (same shape as the arm request's identity
+/// fields; the policy is always immediate for a preview).
+#[derive(Debug, Deserialize)]
+pub struct PreviewEntryRequest {
+    pub symbol: String,
+    pub side: String,
+}
+
 /// Request to arm a new position.
 ///
 /// Note: risk per trade is fixed at 1% by v3 policy. Not configurable via API.
@@ -667,6 +675,9 @@ where
         // Durable event bootstrap for the operator dashboard.
         .route("/events/history", get(event_history_handler))
         .route("/positions", post(arm_handler))
+        // Dry run of an immediate arm: analysis, sizing and the rejection the
+        // real arm would hit, with nothing persisted.
+        .route("/entry/preview", post(preview_entry_handler::<E, S>))
         .route("/positions/:id", delete(cancel_or_close_handler))
         .route("/positions/:id/signal", post(signal_handler))
         .route("/queries/:id/approve", post(approve_query_handler))
@@ -2354,6 +2365,37 @@ fn exchange_sync_state(
     } else {
         Some("stale_missing_on_exchange".to_string())
     }
+}
+
+async fn preview_entry_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    Json(req): Json<PreviewEntryRequest>,
+) -> Result<Json<crate::position_manager::EntryPreview>, (StatusCode, Json<ErrorResponse>)>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let symbol = Symbol::from_pair(&req.symbol).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: format!("Invalid symbol: {}", e) }),
+        )
+    })?;
+    let side = match req.side.to_uppercase().as_str() {
+        "LONG" | "BUY" => Side::Long,
+        "SHORT" | "SELL" => Side::Short,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Invalid side: {}. Expected: LONG or SHORT", req.side),
+                }),
+            ));
+        },
+    };
+    let manager = state.position_manager.read().await;
+    let preview = manager.preview_entry(symbol, side).await.map_err(to_error_response)?;
+    Ok(Json(preview))
 }
 
 fn position_to_summary(
