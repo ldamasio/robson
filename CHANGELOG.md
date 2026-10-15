@@ -38,6 +38,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cross-check, shadow sanity), the guarded `UPDATE monthly_state` for the
   current month, validation and rollback. Later months inherit the
   persisted model on every insert path.
+### Fixed - Feed hygiene: watermark steps and deploy-time STRATEGY_CREATED
+
+- `GET /events/history` now also excludes `favorable_extreme_advanced`; the
+  card already shows the extreme, the daily feed is for decisions.
+- `robson-db` init appended a strategy row and a `STRATEGY_CREATED` event on
+  every ArgoCD sync (#231). Root cause: the migrate hook runs
+  `robsond db init --tenant-id ...` without an account id, so each run
+  minted a fresh account and a fresh strategy, and the per-(tenant, account)
+  existence check never matched. The bootstrap identity is now the tenant:
+  when the tenant already owns a strategy, its oldest account is returned
+  and nothing is written. The event-log insert is additionally gated on the
+  idempotency claim. Regression tests run against Postgres
+  (`cargo test -p robson-db -- --include-ignored` with `DATABASE_URL`).
 
 ### Fixed - Favorable watermark persisted as it advances (#192)
 
