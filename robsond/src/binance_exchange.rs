@@ -169,6 +169,19 @@ fn evict_lru_trading_rules(cache: &mut HashMap<String, CachedTradingRules>) {
     }
 }
 
+/// Serve the stale snapshot for `pair` after a failed refresh and mark it as
+/// used now (keeping `fetched_at`, so the next lookup still tries to refresh).
+/// An actively traded symbol living on its stale fallback must stay out of the
+/// LRU eviction candidates exactly like one served fresh.
+fn touch_stale_trading_rules(
+    cache: &mut HashMap<String, CachedTradingRules>,
+    pair: &str,
+) -> Option<SymbolTradingRules> {
+    let stale = cache.get_mut(pair)?;
+    stale.last_used_at = Instant::now();
+    Some(stale.rules.clone())
+}
+
 /// Binance USD-M Futures adapter implementing ExchangePort.
 ///
 /// Wraps `BinanceRestClient` and translates between domain types
@@ -241,14 +254,14 @@ impl BinanceExchangeAdapter {
                 });
                 Ok(rules)
             },
-            Err(error) => match cache.get(&pair) {
+            Err(error) => match touch_stale_trading_rules(&mut cache, &pair) {
                 Some(stale) => {
                     warn!(
                         symbol = %pair,
                         %error,
                         "Trading-rules refresh failed; serving stale snapshot"
                     );
-                    Ok(stale.rules.clone())
+                    Ok(stale)
                 },
                 None => Err(error),
             },
@@ -1109,7 +1122,8 @@ mod tests {
             )
             .unwrap()
         };
-        let base = std::time::Instant::now();
+        // Fixtures live in the past so that "used now" is strictly newer.
+        let base = std::time::Instant::now() - std::time::Duration::from_secs(100_000);
         let mut cache: HashMap<String, super::CachedTradingRules> = HashMap::new();
         for i in 0..super::TRADING_RULES_CACHE_CAPACITY {
             let pair = format!("S{i:02}USDT");
@@ -1122,14 +1136,25 @@ mod tests {
         }
         // The oldest FETCH is the symbol with an active position: it is hit
         // on every tick, so it is the most recently USED and must survive.
-        cache.get_mut("S00USDT").unwrap().last_used_at =
-            base + std::time::Duration::from_secs(10_000);
+        cache.get_mut("S00USDT").unwrap().last_used_at = std::time::Instant::now();
 
         super::evict_lru_trading_rules(&mut cache);
 
         assert_eq!(cache.len(), super::TRADING_RULES_CACHE_CAPACITY - 1);
         assert!(cache.contains_key("S00USDT"), "the active symbol is never the LRU candidate");
         assert!(!cache.contains_key("S01USDT"), "the idle oldest-used entry is evicted");
+
+        // An expired entry served as the stale fallback after a failed
+        // refresh counts as used too: S02 is now the LRU candidate, S00 is
+        // not, and S00's fetched_at is untouched so the next lookup retries.
+        let before = cache.get("S02USDT").unwrap().fetched_at;
+        let served = super::touch_stale_trading_rules(&mut cache, "S02USDT");
+        assert!(served.is_some());
+        assert_eq!(cache.get("S02USDT").unwrap().fetched_at, before);
+        assert!(super::touch_stale_trading_rules(&mut cache, "NOPEUSDT").is_none());
+        super::evict_lru_trading_rules(&mut cache);
+        assert!(cache.contains_key("S02USDT"), "a stale fallback in use is not evicted");
+        assert!(!cache.contains_key("S03USDT"));
     }
 
     use rust_decimal_macros::dec;

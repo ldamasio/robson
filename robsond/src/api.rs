@@ -2393,16 +2393,24 @@ where
             ));
         },
     };
-    // Identical inputs within a few seconds (double click, second tab)
-    // reuse the last answer instead of re-querying the exchange.
-    let coalesce_key = format!("{}|{side:?}", symbol.as_pair());
-    if let Some(recent) = recent_preview(&coalesce_key) {
-        return Ok(Json(recent));
+    // Request budget across all inputs: a preview costs two candle fetches,
+    // a balance read and possibly an exchangeInfo call, and alternating
+    // symbols must not turn the endpoint into an exchange-call amplifier.
+    // Human operator pace fits easily; beyond it the caller gets 429.
+    if !preview_budget_allows() {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse {
+                error: format!(
+                    "Entry preview budget exhausted: at most {PREVIEW_BUDGET_MAX} per {}s",
+                    PREVIEW_BUDGET_WINDOW.as_secs()
+                ),
+            }),
+        ));
     }
     // One preview at a time per daemon: the real arm serializes through the
-    // manager write lock, and a preview costs two candle fetches, a balance
-    // read and possibly an exchangeInfo call. Excess callers get 429 instead
-    // of queueing exchange requests.
+    // manager write lock. Overlapping callers get 429 instead of queueing
+    // exchange requests.
     let _permit = PREVIEW_GATE.try_acquire().map_err(|_| {
         (
             StatusCode::TOO_MANY_REQUESTS,
@@ -2419,11 +2427,7 @@ where
         manager.prepare_entry_preview(symbol, side).await.map_err(to_error_response)?
     };
     match tokio::time::timeout(PREVIEW_TIMEOUT, job.run()).await {
-        Ok(preview) => {
-            let preview = preview.map_err(to_error_response)?;
-            remember_preview(coalesce_key, &preview);
-            Ok(Json(preview))
-        },
+        Ok(preview) => Ok(Json(preview.map_err(to_error_response)?)),
         Err(_elapsed) => Err((
             StatusCode::GATEWAY_TIMEOUT,
             Json(ErrorResponse {
@@ -2440,26 +2444,25 @@ where
 static PREVIEW_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 /// Upper bound for the exchange/candle I/O of one preview.
 const PREVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
-/// Window in which a repeated preview for the same symbol/side is answered
-/// from the last result (no exchange traffic).
-const PREVIEW_COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
-type PreviewMemo = (String, Instant, crate::position_manager::EntryPreview);
-static LAST_PREVIEW: std::sync::Mutex<Option<PreviewMemo>> = std::sync::Mutex::new(None);
+/// Sliding-window request budget for previews, across every symbol/side.
+/// No memoisation: every served preview reloads capital and candles, so a
+/// REFRESH after a recalibration or a month rollover is always current.
+const PREVIEW_BUDGET_MAX: usize = 6;
+const PREVIEW_BUDGET_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+static PREVIEW_HISTORY: std::sync::Mutex<Vec<Instant>> = std::sync::Mutex::new(Vec::new());
 
-fn recent_preview(key: &str) -> Option<crate::position_manager::EntryPreview> {
-    let memo = LAST_PREVIEW.lock().ok()?;
-    match memo.as_ref() {
-        Some((k, at, preview)) if k == key && at.elapsed() < PREVIEW_COALESCE_WINDOW => {
-            Some(preview.clone())
-        },
-        _ => None,
+/// Admit one preview into the budget (recording it) or refuse it.
+fn preview_budget_allows() -> bool {
+    let Ok(mut history) = PREVIEW_HISTORY.lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    history.retain(|at| now.duration_since(*at) < PREVIEW_BUDGET_WINDOW);
+    if history.len() >= PREVIEW_BUDGET_MAX {
+        return false;
     }
-}
-
-fn remember_preview(key: String, preview: &crate::position_manager::EntryPreview) {
-    if let Ok(mut memo) = LAST_PREVIEW.lock() {
-        *memo = Some((key, Instant::now(), preview.clone()));
-    }
+    history.push(now);
+    true
 }
 
 fn position_to_summary(
@@ -2827,6 +2830,19 @@ fn month_start(year: i32, month: u32) -> chrono::DateTime<chrono::Utc> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preview_budget_admits_at_most_max_per_window() {
+        // Process-wide state: drain whatever earlier tests left behind by
+        // consuming until refused, then assert the refusal is sticky within
+        // the window.
+        let mut admitted = 0usize;
+        while super::preview_budget_allows() {
+            admitted += 1;
+            assert!(admitted <= super::PREVIEW_BUDGET_MAX, "budget must be bounded");
+        }
+        assert!(!super::preview_budget_allows());
+    }
+
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
