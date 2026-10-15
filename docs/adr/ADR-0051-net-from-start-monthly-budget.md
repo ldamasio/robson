@@ -13,7 +13,16 @@ per-position carried-basis state that step 1 requires do not exist yet
 `month_peak_net`), settlement completeness (funding and typed income are
 excluded, an activation blocker documented on the
 `month_governed_realized_net` API field; no runtime gate exists), and
-cleanup remain pending.
+cleanup remain pending. Update (2026-10-15): rollout step 3 is done —
+`/status` serves `monthly_budget_utilization_pct` for the active model and
+withholds `month_peak_net`/`monthly_giveback_pct` once net-from-start is
+persisted; the dashboard MONTHLY LIMIT card renders model-aware copy. Step 4
+is an operator action documented in
+[`docs/runbooks/activate-net-from-start-budget.md`](../runbooks/activate-net-from-start-budget.md)
+(one guarded `UPDATE monthly_state`, no restart; the funding-exclusion and
+Entering-cancel gaps are recorded there as accepted, not removed). Trigger:
+2026-10-15, a net +83.50 USDT October with an empty book showed 2 slots under
+`hwm_v1`, the August scenario again.
 **Deciders**: RBX Systems (operator + architecture, with adversarial design
 review by a secondary model)
 **Supersedes**: [ADR-0046](ADR-0046-monthly-high-water-mark-budget.md)

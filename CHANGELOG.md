@@ -7,6 +7,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added - Model-aware monthly budget gauge and ADR-0051 activation runbook
+
+- On 2026-10-15 a net +83.50 USDT October with an empty book showed 2 of 4
+  slots and "1.0% of a 4.0% limit": production still runs the superseded
+  `hwm_v1` model (ADR-0046), which charges the give-back from an intra-trade
+  equity peak, while the operator decision ADR-0051 (net-from-start) has sat
+  dormant since August with both models computed in the shadow.
+- `/status` now carries `monthly_budget_utilization_pct`, the share of the
+  4% budget consumed under the ACTIVE model, and serves `month_peak_net` /
+  `monthly_giveback_pct` only while `hwm_v1` is persisted (`null` under
+  net-from-start, ADR-0051 §4). Slots, remaining budget and halt were
+  already model-aware.
+- Dashboard: `deriveBudgetView` prefers the utilization field and exposes
+  the model; the MONTHLY LIMIT card explains the limit the daemon actually
+  enforces ("Net governed loss since month start · Profits do not raise the
+  limit", with `net / reserved / left`) instead of `peak / now`. Older
+  backends keep the previous rendering.
+- New runbook `docs/runbooks/activate-net-from-start-budget.md`: ADR-0051
+  §5.4 preconditions (flat account, no unmatched income, shadow check), the
+  guarded `UPDATE monthly_state` for the current month, validation and
+  rollback. Later months inherit the persisted model on every insert path.
+
 ### Fixed - Favorable watermark persisted as it advances (#192)
 
 - `favorable_extreme` / `extreme_at` were written only on discrete trailing

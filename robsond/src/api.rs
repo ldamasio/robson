@@ -29,7 +29,7 @@ use axum::{
 use chrono::{Datelike, Duration as ChronoDuration, NaiveDate, Utc};
 use robson_domain::{
     ApprovalPolicy as DomainApprovalPolicy, DetectorSignal, EntryPolicy, EntryPolicyConfig,
-    Position, PositionState, Price, Side, Symbol, TradingPolicy,
+    MonthlyBudgetModel, Position, PositionState, Price, Side, Symbol, TradingPolicy,
 };
 #[cfg(feature = "postgres")]
 use robson_eventlog::{query_events, QueryOptions};
@@ -175,12 +175,24 @@ pub struct StatusResponse {
     /// Fixed 4% monetary budget for the persisted monthly capital base.
     pub monthly_budget_amount: Decimal,
     /// Governed month equity net: realized net plus unrealized PnL of open
-    /// Robson positions (ADR-0046).
+    /// Robson positions. Drives the budget under `hwm_v1` (ADR-0046); under
+    /// `net_from_start_non_expanding_v1` it is informational mark-to-market
+    /// only (ADR-0051 §4) and never feeds admission, slots or halt.
     pub month_equity_net: Decimal,
     /// Persisted high-water mark of governed month equity net (ADR-0046).
-    pub month_peak_net: Decimal,
+    /// Served only while `hwm_v1` is the active model; `null` otherwise
+    /// (ADR-0051 §4: HWM fields are retired with the peak anchor).
+    pub month_peak_net: Option<Decimal>,
     /// Monthly give-back from peak as percentage of the 4% monthly budget.
-    pub monthly_giveback_pct: Decimal,
+    /// Served only while `hwm_v1` is the active model; `null` otherwise.
+    pub monthly_giveback_pct: Option<Decimal>,
+    /// Share of the 4% monthly budget consumed under the ACTIVE model, as a
+    /// percentage of the budget (0-100, may exceed 100 on a breach): give-back
+    /// from peak under `hwm_v1`, net governed loss since month start under
+    /// `net_from_start_non_expanding_v1` (ADR-0051 §4). Open-position risk is
+    /// reserved separately in `monthly_open_risk_reserved` and already
+    /// subtracted from `monthly_budget_remaining`.
+    pub monthly_budget_utilization_pct: Decimal,
     /// Remaining monthly budget under the persisted active model.
     pub monthly_budget_remaining: Decimal,
     /// Starting capital basis for the current month.
@@ -1395,11 +1407,20 @@ where
         Decimal::ZERO
     };
     let monthly_budget = budget_snapshot.budget_amount();
-    let monthly_giveback_pct = if monthly_budget > Decimal::ZERO {
-        budget_snapshot.consumed_hwm / monthly_budget * Decimal::from(100u32)
-    } else {
-        Decimal::ZERO
+    let pct_of_budget = |consumed: Decimal| {
+        if monthly_budget > Decimal::ZERO {
+            consumed / monthly_budget * Decimal::from(100u32)
+        } else {
+            Decimal::ZERO
+        }
     };
+    // ADR-0051 §4: the peak anchor and its give-back are HWM-only outputs.
+    // Once net-from-start is the persisted model they are withheld so no
+    // consumer can keep rendering a limit the daemon no longer enforces.
+    let hwm_active = budget_snapshot.model == MonthlyBudgetModel::HwmV1;
+    let monthly_giveback_pct = hwm_active.then(|| pct_of_budget(budget_snapshot.consumed_hwm));
+    let month_peak_net = hwm_active.then_some(budget_snapshot.month_peak_net);
+    let monthly_budget_utilization_pct = pct_of_budget(budget_snapshot.consumed_active);
 
     let mut summaries: Vec<PositionSummary> = Vec::with_capacity(positions.len());
     for position in &positions {
@@ -1479,8 +1500,9 @@ where
         monthly_open_risk_reserved: budget_snapshot.latent_risk,
         monthly_budget_amount: monthly_budget,
         month_equity_net: budget_snapshot.month_equity_net,
-        month_peak_net: budget_snapshot.month_peak_net,
+        month_peak_net,
         monthly_giveback_pct,
+        monthly_budget_utilization_pct,
         monthly_budget_remaining: budget_snapshot.remaining_active,
         capital_base: budget_snapshot.capital_base,
         monthly_budget_basis_invalid: budget_snapshot.capital_base_invalid
@@ -4150,6 +4172,11 @@ mod tests {
         assert_eq!(status.monthly_budget_model, "hwm_v1");
         assert_eq!(status.month_governed_realized_net, Decimal::ZERO);
         assert_eq!(status.monthly_net_loss_consumed, Decimal::ZERO);
+        // HWM outputs are present while hwm_v1 is the persisted model and the
+        // model-agnostic utilization mirrors the active consumption.
+        assert_eq!(status.month_peak_net, Some(Decimal::ZERO));
+        assert_eq!(status.monthly_giveback_pct, Some(Decimal::ZERO));
+        assert_eq!(status.monthly_budget_utilization_pct, Decimal::ZERO);
         assert_eq!(status.monthly_open_risk_reserved, Decimal::ZERO);
         assert_eq!(status.monthly_budget_amount, dec!(400));
         assert_eq!(status.monthly_budget_remaining, dec!(400));
