@@ -136,6 +136,18 @@ pub trait ExchangePort: Send + Sync {
         )))
     }
 
+    /// Trading rules for a read-only preview (dry-run arm). Implementations
+    /// MUST NOT populate, refresh or evict any production metadata cache and
+    /// MUST NOT hold a lock shared with order paths across network I/O; a
+    /// preview may never delay or degrade a real close. Default: the normal
+    /// lookup, for adapters without a shared cache.
+    async fn trading_rules_preview(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<SymbolTradingRules, ExecError> {
+        self.trading_rules(symbol).await
+    }
+
     /// Place a market order.
     ///
     /// # Arguments
