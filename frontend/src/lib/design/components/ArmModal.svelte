@@ -176,6 +176,9 @@
         {#each preview.warnings as warning (warning)}
           <p class="warn-text">{warning}</p>
         {/each}
+        {#if preview.unavailable}
+          <p class="warn-text">Preview incomplete: {preview.unavailable}. Arming stays available.</p>
+        {/if}
       {:else}
         <p class="hint">Run the preview to see the technical stop, its method and the size before arming.</p>
       {/if}

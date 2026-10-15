@@ -168,6 +168,8 @@ export type EntryPreview = {
   analysis: EntryPreviewAnalysis | null;
   sizing: EntryPreviewSizing | null;
   rejection: string | null;
+  /** Preview could not complete (no candles, metadata down). Never blocks. */
+  unavailable: string | null;
   warnings: string[];
 };
 
@@ -387,6 +389,7 @@ export function normalizeEntryPreview(raw: Record<string, unknown>): EntryPrevie
         }
       : null,
     rejection: raw.rejection == null ? null : String(raw.rejection),
+    unavailable: raw.unavailable == null ? null : String(raw.unavailable),
     warnings: Array.isArray(raw.warnings) ? raw.warnings.map(String) : [],
   };
 }
