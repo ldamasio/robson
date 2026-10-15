@@ -90,6 +90,20 @@ pub(crate) fn map_daemon_event(event: &DaemonEvent) -> Option<PublicSseEvent> {
                 "source_occurred_at": timestamp,
             }),
         )),
+        // Stop or watermark moved on an Active position: reuse the
+        // `position.changed` contract so existing clients refresh the card.
+        DaemonEvent::PositionMarkAdvanced { position_id, reason, timestamp } => {
+            Some(PublicSseEvent::new(
+                "position.changed",
+                json!({
+                    "position_id": position_id,
+                    "previous_state": "Active",
+                    "new_state": "Active",
+                    "reason": reason,
+                    "source_occurred_at": timestamp,
+                }),
+            ))
+        },
         DaemonEvent::QueryAwaitingApproval {
             query_id,
             position_id,
@@ -247,6 +261,25 @@ mod tests {
             new_state: "active".to_string(),
             timestamp: Utc::now(),
         }
+    }
+
+    fn test_mark_advanced() -> DaemonEvent {
+        DaemonEvent::PositionMarkAdvanced {
+            position_id: Uuid::now_v7(),
+            reason: "trailing_stop_updated",
+            timestamp: Utc::now(),
+        }
+    }
+
+    #[test]
+    fn test_mark_advance_maps_to_position_changed_with_reason() {
+        let event = map_daemon_event(&test_mark_advanced()).unwrap();
+        assert_eq!(event.event_type, "position.changed");
+        assert_eq!(event.payload["reason"], "trailing_stop_updated");
+        assert_eq!(event.payload["previous_state"], "Active");
+        assert_eq!(event.payload["new_state"], "Active");
+        assert!(event.payload["position_id"].as_str().is_some());
+        assert!(event.payload["source_occurred_at"].as_str().is_some());
     }
 
     fn test_detector_signal() -> DaemonEvent {

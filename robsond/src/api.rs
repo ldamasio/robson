@@ -2276,16 +2276,23 @@ where
 {
     let live_price = match &position.state {
         PositionState::Active { .. } | PositionState::Exiting { .. } => {
-            match manager.get_market_price(&position.symbol).await {
-                Ok(price) => Some(price),
-                Err(error) => {
-                    warn!(
-                        position_id = %position.id,
-                        symbol = %position.symbol,
-                        %error,
-                        "failed to fetch live market price for position summary"
-                    );
-                    None
+            // The tick path already holds the last market price per symbol;
+            // reading it keeps /status off the exchange REST path. The round
+            // trip remains only as a fallback before the first tick after
+            // startup.
+            match manager.last_market_price_for(&position.symbol).await {
+                Some(price) => Some(price),
+                None => match manager.get_market_price(&position.symbol).await {
+                    Ok(price) => Some(price),
+                    Err(error) => {
+                        warn!(
+                            position_id = %position.id,
+                            symbol = %position.symbol,
+                            %error,
+                            "failed to fetch live market price for position summary"
+                        );
+                        None
+                    },
                 },
             }
         },

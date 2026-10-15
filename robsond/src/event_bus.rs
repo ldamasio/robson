@@ -40,6 +40,17 @@ pub enum DaemonEvent {
     },
 
     /// Query is blocked awaiting operator approval.
+    /// An Active position's protection or watermark moved without a
+    /// lifecycle transition (trailing-stop advance, bounded favorable-extreme
+    /// advance). Lets the operator surface refresh the card between state
+    /// changes; bounded by the engine's rung and watermark-step rules.
+    PositionMarkAdvanced {
+        position_id: PositionId,
+        /// `"trailing_stop_updated"` or `"favorable_extreme_advanced"`.
+        reason: &'static str,
+        timestamp: DateTime<Utc>,
+    },
+
     QueryAwaitingApproval {
         query_id: Uuid,
         position_id: Option<PositionId>,

@@ -20,6 +20,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   advisory warnings. Nothing is persisted and no order is placed.
 - The arm modal gains a STOP PREVIEW panel. Warnings turn the button into
   ARM ANYWAY; a rejection disables it with the reason shown.
+### Changed - Live position card without polling the exchange
+
+- `/status` and `/positions/:id` priced open positions through an exchange
+  REST round trip on every call. They now use the last market price the tick
+  path already holds per symbol; the round trip remains only as a fallback
+  before the first tick after startup.
+- New daemon event `PositionMarkAdvanced`, emitted after a persisted
+  `trailing_stop_updated` or `favorable_extreme_advanced`, is published on the
+  SSE stream as `position.changed` with a `reason`, so the dashboard refreshes
+  the card when the stop or the watermark moves instead of waiting for a
+  lifecycle transition. Bounded by the engine's rung and watermark-step rules.
+- Dashboard polls `/status` every 20 s only while a position is open and the
+  tab is visible, and once more when the tab becomes visible again.
 ### Fixed - Feed hygiene: watermark steps and deploy-time STRATEGY_CREATED
 
 - `GET /events/history` now also excludes `favorable_extreme_advanced`; the
