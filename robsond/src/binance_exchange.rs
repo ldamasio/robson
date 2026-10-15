@@ -150,16 +150,21 @@ const TRADING_RULES_CACHE_CAPACITY: usize = 64;
 struct CachedTradingRules {
     rules: SymbolTradingRules,
     fetched_at: Instant,
+    /// Last cache hit; eviction is least-recently-used so an actively traded
+    /// symbol is never displaced by a burst of one-off lookups.
+    last_used_at: Instant,
 }
 
-/// Drop the least recently fetched entry so a new symbol can be cached.
-fn evict_oldest_trading_rules(cache: &mut HashMap<String, CachedTradingRules>) {
-    let oldest = cache
+/// Drop the least recently USED entry so a new symbol can be cached. Active
+/// positions touch their symbol's rules on every tick, so they are never the
+/// LRU candidate; only idle symbols are displaced.
+fn evict_lru_trading_rules(cache: &mut HashMap<String, CachedTradingRules>) {
+    let lru = cache
         .iter()
-        .min_by_key(|(_, cached)| cached.fetched_at)
+        .min_by_key(|(_, cached)| cached.last_used_at)
         .map(|(pair, _)| pair.clone());
-    if let Some(pair) = oldest {
-        warn!(symbol = %pair, capacity = TRADING_RULES_CACHE_CAPACITY, "Trading-rules cache full; evicting oldest entry");
+    if let Some(pair) = lru {
+        warn!(symbol = %pair, capacity = TRADING_RULES_CACHE_CAPACITY, "Trading-rules cache full; evicting least recently used entry");
         cache.remove(&pair);
     }
 }
@@ -213,23 +218,26 @@ impl BinanceExchangeAdapter {
     async fn trading_rules_cached(&self, symbol: &Symbol) -> Result<SymbolTradingRules, ExecError> {
         let pair = symbol.as_pair();
         let mut cache = self.trading_rules.lock().await;
-        if let Some(cached) = cache.get(&pair) {
+        if let Some(cached) = cache.get_mut(&pair) {
             if cached.fetched_at.elapsed() < TRADING_RULES_TTL {
+                cached.last_used_at = Instant::now();
                 return Ok(cached.rules.clone());
             }
         }
         match self.fetch_trading_rules(symbol).await {
             Ok(rules) => {
                 if cache.len() >= TRADING_RULES_CACHE_CAPACITY && !cache.contains_key(&pair) {
-                    // Bounded, never fail-closed: evicting the oldest entry
+                    // Bounded, never fail-closed: evicting the LRU entry
                     // costs one exchangeInfo call on that symbol's next use,
                     // whereas refusing would make a real arm on a new symbol
-                    // fail after enough distinct previews or symbols.
-                    evict_oldest_trading_rules(&mut cache);
+                    // fail once 64 distinct symbols have been seen.
+                    evict_lru_trading_rules(&mut cache);
                 }
+                let now = Instant::now();
                 cache.insert(pair, CachedTradingRules {
                     rules: rules.clone(),
-                    fetched_at: Instant::now(),
+                    fetched_at: now,
+                    last_used_at: now,
                 });
                 Ok(rules)
             },
@@ -244,6 +252,29 @@ impl BinanceExchangeAdapter {
                 },
                 None => Err(error),
             },
+        }
+    }
+
+    /// Read-only lookup for the arm preview: a fresh cached entry is served
+    /// from a momentary lock (no network under it); otherwise exchangeInfo is
+    /// fetched WITHOUT touching the cache, so a preview can neither populate,
+    /// refresh nor evict production metadata, nor hold the adapter mutex
+    /// across HTTP while a close or panic waits for it.
+    async fn trading_rules_peek_or_fetch(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<SymbolTradingRules, ExecError> {
+        let pair = symbol.as_pair();
+        let cached = {
+            let cache = self.trading_rules.lock().await;
+            cache
+                .get(&pair)
+                .filter(|cached| cached.fetched_at.elapsed() < TRADING_RULES_TTL)
+                .map(|cached| cached.rules.clone())
+        };
+        match cached {
+            Some(rules) => Ok(rules),
+            None => self.fetch_trading_rules(symbol).await,
         }
     }
 
@@ -279,6 +310,13 @@ impl BinanceExchangeAdapter {
 impl ExchangePort for BinanceExchangeAdapter {
     async fn trading_rules(&self, symbol: &Symbol) -> Result<SymbolTradingRules, ExecError> {
         self.trading_rules_cached(symbol).await
+    }
+
+    async fn trading_rules_preview(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<SymbolTradingRules, ExecError> {
+        self.trading_rules_peek_or_fetch(symbol).await
     }
 
     async fn validate_futures_settings(
@@ -1052,7 +1090,7 @@ impl IncomePort for BinanceExchangeAdapter {
 #[cfg(test)]
 mod tests {
     #[test]
-    fn trading_rules_cache_evicts_the_oldest_entry_when_full() {
+    fn trading_rules_cache_evicts_the_least_recently_used_entry_when_full() {
         use std::collections::HashMap;
 
         use rust_decimal_macros::dec;
@@ -1075,17 +1113,23 @@ mod tests {
         let mut cache: HashMap<String, super::CachedTradingRules> = HashMap::new();
         for i in 0..super::TRADING_RULES_CACHE_CAPACITY {
             let pair = format!("S{i:02}USDT");
+            let fetched_at = base + std::time::Duration::from_secs(i as u64);
             cache.insert(pair.clone(), super::CachedTradingRules {
                 rules: rules(&pair),
-                fetched_at: base + std::time::Duration::from_secs(i as u64),
+                fetched_at,
+                last_used_at: fetched_at,
             });
         }
+        // The oldest FETCH is the symbol with an active position: it is hit
+        // on every tick, so it is the most recently USED and must survive.
+        cache.get_mut("S00USDT").unwrap().last_used_at =
+            base + std::time::Duration::from_secs(10_000);
 
-        super::evict_oldest_trading_rules(&mut cache);
+        super::evict_lru_trading_rules(&mut cache);
 
         assert_eq!(cache.len(), super::TRADING_RULES_CACHE_CAPACITY - 1);
-        assert!(!cache.contains_key("S00USDT"), "the oldest fetch is the one evicted");
-        assert!(cache.contains_key("S01USDT"));
+        assert!(cache.contains_key("S00USDT"), "the active symbol is never the LRU candidate");
+        assert!(!cache.contains_key("S01USDT"), "the idle oldest-used entry is evicted");
     }
 
     use rust_decimal_macros::dec;

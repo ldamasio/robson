@@ -2393,6 +2393,12 @@ where
             ));
         },
     };
+    // Identical inputs within a few seconds (double click, second tab)
+    // reuse the last answer instead of re-querying the exchange.
+    let coalesce_key = format!("{}|{side:?}", symbol.as_pair());
+    if let Some(recent) = recent_preview(&coalesce_key) {
+        return Ok(Json(recent));
+    }
     // One preview at a time per daemon: the real arm serializes through the
     // manager write lock, and a preview costs two candle fetches, a balance
     // read and possibly an exchangeInfo call. Excess callers get 429 instead
@@ -2413,7 +2419,11 @@ where
         manager.prepare_entry_preview(symbol, side).await.map_err(to_error_response)?
     };
     match tokio::time::timeout(PREVIEW_TIMEOUT, job.run()).await {
-        Ok(preview) => Ok(Json(preview.map_err(to_error_response)?)),
+        Ok(preview) => {
+            let preview = preview.map_err(to_error_response)?;
+            remember_preview(coalesce_key, &preview);
+            Ok(Json(preview))
+        },
         Err(_elapsed) => Err((
             StatusCode::GATEWAY_TIMEOUT,
             Json(ErrorResponse {
@@ -2430,6 +2440,27 @@ where
 static PREVIEW_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
 /// Upper bound for the exchange/candle I/O of one preview.
 const PREVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Window in which a repeated preview for the same symbol/side is answered
+/// from the last result (no exchange traffic).
+const PREVIEW_COALESCE_WINDOW: std::time::Duration = std::time::Duration::from_secs(5);
+type PreviewMemo = (String, Instant, crate::position_manager::EntryPreview);
+static LAST_PREVIEW: std::sync::Mutex<Option<PreviewMemo>> = std::sync::Mutex::new(None);
+
+fn recent_preview(key: &str) -> Option<crate::position_manager::EntryPreview> {
+    let memo = LAST_PREVIEW.lock().ok()?;
+    match memo.as_ref() {
+        Some((k, at, preview)) if k == key && at.elapsed() < PREVIEW_COALESCE_WINDOW => {
+            Some(preview.clone())
+        },
+        _ => None,
+    }
+}
+
+fn remember_preview(key: String, preview: &crate::position_manager::EntryPreview) {
+    if let Ok(mut memo) = LAST_PREVIEW.lock() {
+        *memo = Some((key, Instant::now(), preview.clone()));
+    }
+}
 
 fn position_to_summary(
     position: &Position,

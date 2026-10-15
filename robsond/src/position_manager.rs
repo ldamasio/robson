@@ -5130,11 +5130,13 @@ impl<E: ExchangePort + 'static> EntryPreviewJob<E> {
                 None
             },
         };
-        // Same lookup the arm performs (the adapter's bounded TTL cache); a
-        // miss here is an availability failure, not a policy rejection: the
-        // engine would fail closed on it, which must not read as "the arm is
-        // blocked".
-        let trading_rules = match exchange.trading_rules(&position.symbol).await {
+        // Read-only lookup (`ExchangePort::trading_rules_preview`): served
+        // from the production cache when fresh, fetched without caching
+        // otherwise, so a preview never populates, refreshes or evicts the
+        // metadata real arms depend on. A failure here is an availability
+        // failure, not a policy rejection: the engine would fail closed on
+        // it, which must not read as "the arm is blocked".
+        let trading_rules = match exchange.trading_rules_preview(&position.symbol).await {
             Ok(rules) => Some(rules),
             Err(error) => {
                 warn!(symbol = %position.symbol.as_pair(), %error, "Entry preview: trading rules unavailable");
