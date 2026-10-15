@@ -2393,10 +2393,43 @@ where
             ));
         },
     };
-    let manager = state.position_manager.read().await;
-    let preview = manager.preview_entry(symbol, side).await.map_err(to_error_response)?;
-    Ok(Json(preview))
+    // One preview at a time per daemon: the real arm serializes through the
+    // manager write lock, and a preview costs two candle fetches, a balance
+    // read and possibly an exchangeInfo call. Excess callers get 429 instead
+    // of queueing exchange requests.
+    let _permit = PREVIEW_GATE.try_acquire().map_err(|_| {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse {
+                error: "An entry preview is already running; retry in a moment".to_string(),
+            }),
+        )
+    })?;
+    // Hold the manager lock only to capture the inputs; the exchange and
+    // candle I/O runs after it is released so a slow exchange cannot delay
+    // arm, close or panic handlers waiting for `write()`.
+    let job = {
+        let manager = state.position_manager.read().await;
+        manager.prepare_entry_preview(symbol, side).await.map_err(to_error_response)?
+    };
+    match tokio::time::timeout(PREVIEW_TIMEOUT, job.run()).await {
+        Ok(preview) => Ok(Json(preview.map_err(to_error_response)?)),
+        Err(_elapsed) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(ErrorResponse {
+                error: format!(
+                    "Entry preview timed out after {}s waiting for the exchange",
+                    PREVIEW_TIMEOUT.as_secs()
+                ),
+            }),
+        )),
+    }
 }
+
+/// Serializes `POST /entry/preview` (single operator, single daemon).
+static PREVIEW_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+/// Upper bound for the exchange/candle I/O of one preview.
+const PREVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
 
 fn position_to_summary(
     position: &Position,

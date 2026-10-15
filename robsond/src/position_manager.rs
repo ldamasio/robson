@@ -250,6 +250,11 @@ pub struct EntryPreview {
     pub sizing: Option<EntryPreviewSizing>,
     /// Domain or analyzer rejection the real arm would hit, verbatim.
     pub rejection: Option<String>,
+    /// The preview could not be completed for an availability reason (no or
+    /// too few candles, exchange metadata unavailable). Unlike `rejection`
+    /// this says nothing about whether the arm would be admitted, so the UI
+    /// must not block on it.
+    pub unavailable: Option<String>,
     /// Advisory notes for the operator; never block the arm by themselves.
     pub warnings: Vec<String>,
 }
@@ -1695,12 +1700,22 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
     /// Dry run of an immediate arm for `symbol`/`side` (see `EntryPreview`).
     ///
+    /// Capture everything an entry preview needs while the manager lock is
+    /// held, so the slow part (candles, balance, exchange metadata) runs in
+    /// `EntryPreviewJob::run` after the caller has released the lock. The
+    /// only I/O under the lock is the local `monthly_state` read, the same
+    /// one `/status` performs on every call.
+    ///
     /// Reuses the production pieces end to end: the same capital base the
     /// arm would load, a transient Armed position shaped like
     /// `arm_position_with_policy` builds, the detector's immediate-signal
     /// path for the chart analysis, and the engine's entry decision on a
     /// cloned engine for sizing. Nothing is saved and no order is placed.
-    pub async fn preview_entry(&self, symbol: Symbol, side: Side) -> DaemonResult<EntryPreview> {
+    pub async fn prepare_entry_preview(
+        &self,
+        symbol: Symbol,
+        side: Side,
+    ) -> DaemonResult<EntryPreviewJob<E>> {
         let now = chrono::Utc::now();
         let capital = self.load_capital_base_for_month(now).await?;
         let risk_config = self
@@ -1710,7 +1725,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 
         let position = Position::new_with_stop_policy(
             Uuid::nil(),
-            symbol.clone(),
+            symbol,
             side,
             StopPolicy::ExecutableSpan,
             Some(risk_config.stop_buffer_bps()),
@@ -1733,112 +1748,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             self.stop_invalidation_lookback_candles,
         );
 
-        let mut preview = EntryPreview {
-            symbol: symbol.as_pair(),
-            side: format!("{side:?}"),
-            reference_price: Decimal::ZERO,
-            capital_base: capital,
-            analysis: None,
-            sizing: None,
-            rejection: None,
-            warnings: Vec::new(),
-        };
+        Ok(EntryPreviewJob {
+            capital,
+            risk_config,
+            position,
+            detector,
+            exchange: self.exchange(),
+            engine: self.engine(),
+        })
+    }
 
-        let signal = match detector.preview_immediate_signal().await {
-            Ok(signal) => signal,
-            Err(DaemonError::Detector(text)) => {
-                preview.rejection = Some(text);
-                return Ok(preview);
-            },
-            Err(error) => return Err(error),
-        };
-        let entry = signal.entry_price.as_decimal();
-        preview.reference_price = entry;
-
-        if let Some(audit) = &signal.technical_stop_analysis {
-            let summary = TechStopAuditSummary::from_audit(audit);
-            let distance = (signal.stop_loss.as_decimal() - entry).abs();
-            let distance_pct = if entry > Decimal::ZERO {
-                distance / entry * Decimal::from(100)
-            } else {
-                Decimal::ZERO
-            };
-            if summary.method == "atr_fallback" {
-                preview.warnings.push(
-                    "ATR fallback: no support/resistance level within bounds on the 15m chart"
-                        .to_string(),
-                );
-            } else if summary.confidence == "medium" {
-                preview.warnings.push(
-                    "Fewer chart levels than configured; the stop uses the deepest available"
-                        .to_string(),
-                );
-            }
-            if distance_pct < Decimal::new(5, 1) {
-                preview.warnings.push(
-                    "Stop distance below 0.5% of price: within typical 15m noise".to_string(),
-                );
-            }
-            preview.analysis = Some(EntryPreviewAnalysis {
-                technical_stop: signal.stop_loss.as_decimal(),
-                stop_distance: distance,
-                stop_distance_pct: distance_pct,
-                method: summary.method,
-                level_n: summary.level_n,
-                confidence: summary.confidence,
-                invalidation_guard_level: audit.invalidation_guard_level.map(|p| p.as_decimal()),
-            });
-        }
-
-        let available_margin = match self.exchange().get_futures_balance().await {
-            Ok(balance) => Some(balance.available_balance),
-            Err(error) => {
-                warn!(%error, "Entry preview: futures balance unavailable; sizing against policy capital only");
-                None
-            },
-        };
-        let trading_rules = self.trading_rules_for(&position).await;
-        let mut engine = self.engine();
-        engine.update_risk_config(risk_config);
-        match engine.decide_entry_with_rules(
-            &position,
-            &signal,
-            available_margin,
-            trading_rules.as_ref(),
-        ) {
-            Ok(decision) => {
-                let planned_risk = decision.planned_entry_risk.unwrap_or(Decimal::ZERO);
-                preview.sizing = decision.actions.iter().find_map(|action| match action {
-                    EngineAction::EmitEvent(Event::EntrySignalReceived {
-                        quantity,
-                        initial_executable_stop,
-                        executable_span,
-                        ..
-                    }) => {
-                        let qty = quantity.as_decimal();
-                        Some(EntryPreviewSizing {
-                            quantity: qty,
-                            notional: qty * entry,
-                            planned_risk,
-                            planned_risk_pct_of_capital: if capital > Decimal::ZERO {
-                                planned_risk / capital * Decimal::from(100)
-                            } else {
-                                Decimal::ZERO
-                            },
-                            executable_trigger: initial_executable_stop.map(|p| p.as_decimal()),
-                            executable_span: *executable_span,
-                        })
-                    },
-                    _ => None,
-                });
-            },
-            Err(robson_engine::EngineError::DomainError(domain_error)) => {
-                preview.rejection = Some(domain_error.to_string());
-            },
-            Err(error) => return Err(error.into()),
-        }
-
-        Ok(preview)
+    /// Prepare and run an entry preview in one call (tests and callers that
+    /// do not hold the manager lock). API handlers use the two-step form.
+    pub async fn preview_entry(&self, symbol: Symbol, side: Side) -> DaemonResult<EntryPreview> {
+        self.prepare_entry_preview(symbol, side).await?.run().await
     }
 
     /// How this position's technical stop was derived. Served from memory
@@ -5104,6 +5027,166 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
 // Tests
 // =============================================================================
 
+/// An entry preview captured under the manager lock (see
+/// `PositionManager::prepare_entry_preview`) and executed after it.
+pub struct EntryPreviewJob<E: ExchangePort + 'static> {
+    capital: Decimal,
+    risk_config: robson_domain::RiskConfig,
+    position: Position,
+    detector: DetectorTask,
+    exchange: Arc<E>,
+    engine: Engine,
+}
+
+impl<E: ExchangePort + 'static> EntryPreviewJob<E> {
+    /// Availability failures of the chart step, as opposed to the analyzer
+    /// refusing the setup. `TechnicalStopError::InsufficientData` and the
+    /// empty-candle guard are the two sources today.
+    fn is_availability_failure(text: &str) -> bool {
+        let lower = text.to_ascii_lowercase();
+        lower.contains("no candles") || lower.contains("insufficient")
+    }
+
+    pub async fn run(self) -> DaemonResult<EntryPreview> {
+        let Self {
+            capital,
+            risk_config,
+            position,
+            detector,
+            exchange,
+            engine,
+        } = self;
+        let entry_side = position.side;
+        let mut preview = EntryPreview {
+            symbol: position.symbol.as_pair(),
+            side: format!("{entry_side:?}"),
+            reference_price: Decimal::ZERO,
+            capital_base: capital,
+            analysis: None,
+            sizing: None,
+            rejection: None,
+            unavailable: None,
+            warnings: Vec::new(),
+        };
+
+        let signal = match detector.preview_immediate_signal().await {
+            Ok(signal) => signal,
+            Err(DaemonError::Detector(text)) => {
+                if Self::is_availability_failure(&text) {
+                    preview.unavailable = Some(text);
+                } else {
+                    preview.rejection = Some(text);
+                }
+                return Ok(preview);
+            },
+            Err(error) => return Err(error),
+        };
+        let entry = signal.entry_price.as_decimal();
+        preview.reference_price = entry;
+
+        if let Some(audit) = &signal.technical_stop_analysis {
+            let summary = TechStopAuditSummary::from_audit(audit);
+            let distance = (signal.stop_loss.as_decimal() - entry).abs();
+            let distance_pct = if entry > Decimal::ZERO {
+                distance / entry * Decimal::from(100)
+            } else {
+                Decimal::ZERO
+            };
+            if summary.method == "atr_fallback" {
+                preview.warnings.push(
+                    "ATR fallback: no support/resistance level within bounds on the 15m chart"
+                        .to_string(),
+                );
+            } else if summary.confidence == "medium" {
+                preview.warnings.push(
+                    "Fewer chart levels than configured; the stop uses the deepest available"
+                        .to_string(),
+                );
+            }
+            if distance_pct < Decimal::new(5, 1) {
+                preview.warnings.push(
+                    "Stop distance below 0.5% of price: within typical 15m noise".to_string(),
+                );
+            }
+            preview.analysis = Some(EntryPreviewAnalysis {
+                technical_stop: signal.stop_loss.as_decimal(),
+                stop_distance: distance,
+                stop_distance_pct: distance_pct,
+                method: summary.method,
+                level_n: summary.level_n,
+                confidence: summary.confidence,
+                invalidation_guard_level: audit.invalidation_guard_level.map(|p| p.as_decimal()),
+            });
+        }
+
+        let available_margin = match exchange.get_futures_balance().await {
+            Ok(balance) => Some(balance.available_balance),
+            Err(error) => {
+                warn!(%error, "Entry preview: futures balance unavailable; sizing against policy capital only");
+                preview.warnings.push(
+                    "Futures balance unavailable; size assumes policy capital as margin"
+                        .to_string(),
+                );
+                None
+            },
+        };
+        // Same lookup the arm performs (the adapter's bounded TTL cache); a
+        // miss here is an availability failure, not a policy rejection: the
+        // engine would fail closed on it, which must not read as "the arm is
+        // blocked".
+        let trading_rules = match exchange.trading_rules(&position.symbol).await {
+            Ok(rules) => Some(rules),
+            Err(error) => {
+                warn!(symbol = %position.symbol.as_pair(), %error, "Entry preview: trading rules unavailable");
+                preview.unavailable =
+                    Some(format!("exchange trading rules unavailable: {error}; size not computed"));
+                return Ok(preview);
+            },
+        };
+        let mut engine = engine;
+        engine.update_risk_config(risk_config);
+        match engine.decide_entry_with_rules(
+            &position,
+            &signal,
+            available_margin,
+            trading_rules.as_ref(),
+        ) {
+            Ok(decision) => {
+                let planned_risk = decision.planned_entry_risk.unwrap_or(Decimal::ZERO);
+                preview.sizing = decision.actions.iter().find_map(|action| match action {
+                    EngineAction::EmitEvent(Event::EntrySignalReceived {
+                        quantity,
+                        initial_executable_stop,
+                        executable_span,
+                        ..
+                    }) => {
+                        let qty = quantity.as_decimal();
+                        Some(EntryPreviewSizing {
+                            quantity: qty,
+                            notional: qty * entry,
+                            planned_risk,
+                            planned_risk_pct_of_capital: if capital > Decimal::ZERO {
+                                planned_risk / capital * Decimal::from(100)
+                            } else {
+                                Decimal::ZERO
+                            },
+                            executable_trigger: initial_executable_stop.map(|p| p.as_decimal()),
+                            executable_span: *executable_span,
+                        })
+                    },
+                    _ => None,
+                });
+            },
+            Err(robson_engine::EngineError::DomainError(domain_error)) => {
+                preview.rejection = Some(domain_error.to_string());
+            },
+            Err(error) => return Err(error.into()),
+        }
+
+        Ok(preview)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{Duration, TimeZone};
@@ -5148,10 +5231,21 @@ mod tests {
         assert!(sizing.quantity > Decimal::ZERO);
         assert!(sizing.planned_risk > Decimal::ZERO);
         assert!(preview.rejection.is_none());
+        assert!(preview.unavailable.is_none());
 
         // Nothing was armed, nothing was ordered.
         assert!(manager.store.positions().find_active().await.unwrap().is_empty());
         assert_eq!(manager.executor.exchange().market_order_call_count(), 0);
+    }
+
+    #[test]
+    fn preview_availability_failures_are_not_rejections() {
+        type Job = EntryPreviewJob<StubExchange>;
+        assert!(Job::is_availability_failure("no candles available for entry preview"));
+        assert!(Job::is_availability_failure("Insufficient data: required 20, got 3"));
+        assert!(!Job::is_availability_failure(
+            "stop distance 0.05% below the configured minimum of 0.10%"
+        ));
     }
 
     #[test]

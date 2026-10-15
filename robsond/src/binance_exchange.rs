@@ -152,6 +152,18 @@ struct CachedTradingRules {
     fetched_at: Instant,
 }
 
+/// Drop the least recently fetched entry so a new symbol can be cached.
+fn evict_oldest_trading_rules(cache: &mut HashMap<String, CachedTradingRules>) {
+    let oldest = cache
+        .iter()
+        .min_by_key(|(_, cached)| cached.fetched_at)
+        .map(|(pair, _)| pair.clone());
+    if let Some(pair) = oldest {
+        warn!(symbol = %pair, capacity = TRADING_RULES_CACHE_CAPACITY, "Trading-rules cache full; evicting oldest entry");
+        cache.remove(&pair);
+    }
+}
+
 /// Binance USD-M Futures adapter implementing ExchangePort.
 ///
 /// Wraps `BinanceRestClient` and translates between domain types
@@ -209,9 +221,11 @@ impl BinanceExchangeAdapter {
         match self.fetch_trading_rules(symbol).await {
             Ok(rules) => {
                 if cache.len() >= TRADING_RULES_CACHE_CAPACITY && !cache.contains_key(&pair) {
-                    return Err(ExecError::Exchange(format!(
-                        "Trading-rules cache capacity ({TRADING_RULES_CACHE_CAPACITY}) exceeded"
-                    )));
+                    // Bounded, never fail-closed: evicting the oldest entry
+                    // costs one exchangeInfo call on that symbol's next use,
+                    // whereas refusing would make a real arm on a new symbol
+                    // fail after enough distinct previews or symbols.
+                    evict_oldest_trading_rules(&mut cache);
                 }
                 cache.insert(pair, CachedTradingRules {
                     rules: rules.clone(),
@@ -1037,6 +1051,43 @@ impl IncomePort for BinanceExchangeAdapter {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn trading_rules_cache_evicts_the_oldest_entry_when_full() {
+        use std::collections::HashMap;
+
+        use rust_decimal_macros::dec;
+
+        let rules = |pair: &str| {
+            robson_domain::SymbolTradingRules::new(
+                robson_domain::Symbol::from_pair(pair).unwrap(),
+                dec!(0.1),
+                dec!(0.1),
+                dec!(0.001),
+                dec!(0.001),
+                dec!(1000),
+                dec!(5),
+                1,
+                3,
+            )
+            .unwrap()
+        };
+        let base = std::time::Instant::now();
+        let mut cache: HashMap<String, super::CachedTradingRules> = HashMap::new();
+        for i in 0..super::TRADING_RULES_CACHE_CAPACITY {
+            let pair = format!("S{i:02}USDT");
+            cache.insert(pair.clone(), super::CachedTradingRules {
+                rules: rules(&pair),
+                fetched_at: base + std::time::Duration::from_secs(i as u64),
+            });
+        }
+
+        super::evict_oldest_trading_rules(&mut cache);
+
+        assert_eq!(cache.len(), super::TRADING_RULES_CACHE_CAPACITY - 1);
+        assert!(!cache.contains_key("S00USDT"), "the oldest fetch is the one evicted");
+        assert!(cache.contains_key("S01USDT"));
+    }
+
     use rust_decimal_macros::dec;
 
     use super::*;
