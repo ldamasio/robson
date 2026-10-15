@@ -28,6 +28,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   account drift can no longer raise `capital_base` intra-month
   (`MonthlyBudgetModel::allows_capital_base_change`, applied in the income
   ledger and reconciliation recalibration paths); decreases still apply.
+  Known consequence: after an intra-month deposit the idle drift scan warns
+  every cycle until the month boundary (fail-loud; persisted attribution is
+  #242).
 - New runbook `docs/runbooks/activate-net-from-start-budget.md`: a policy
   gate (the ADR-0051 "Activation exceptions" amendment must be approved by
   the operator), §5.4 preconditions (flat account, halt not latched, ledger

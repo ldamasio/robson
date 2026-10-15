@@ -172,12 +172,6 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// only moves on fill and on trailing advances (and resets to the entry
     /// price on restart).
     last_market_price: Arc<RwLock<HashMap<Symbol, Price>>>,
-    /// Wallet increase (confirmed deposit or reconciled manual gain) that
-    /// the active budget model refused to fold into `capital_base`
-    /// (ADR-0051 §1, non-expanding basis). Kept so the idle drift scan can
-    /// attribute the wallet surplus instead of alarming on it every cycle.
-    /// In-memory only: a restart re-derives it on the next ledger cycle.
-    withheld_basis_increase: std::sync::Mutex<Decimal>,
     /// Active positions whose exchange-side insurance stop is known to sit
     /// behind the software stop plan because a placement or re-placement
     /// failed (ADR-0039). Value: earliest instant the next attempt may run.
@@ -361,18 +355,6 @@ impl MonthlyBudgetSnapshot {
 }
 
 impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
-    /// Record (or clear, with zero) the wallet increase the budget model
-    /// withheld from `capital_base`; see `withheld_basis_increase`.
-    pub(crate) fn set_withheld_basis_increase(&self, amount: Decimal) {
-        *self.withheld_basis_increase.lock().unwrap() = amount.max(Decimal::ZERO);
-    }
-
-    /// Wallet surplus explained by a withheld basis increase (zero when the
-    /// basis follows the wallet, i.e. under `hwm_v1` or after a decrease).
-    pub(crate) fn withheld_basis_increase(&self) -> Decimal {
-        *self.withheld_basis_increase.lock().unwrap()
-    }
-
     pub(crate) fn configured_capital(&self) -> Decimal {
         self.engine.lock().unwrap().risk_config().capital()
     }
@@ -906,7 +888,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             monitor_tick_interval: std::time::Duration::ZERO,
             last_monitor_tick_at: Arc::new(RwLock::new(HashMap::new())),
             last_market_price: Arc::new(RwLock::new(HashMap::new())),
-            withheld_basis_increase: std::sync::Mutex::new(Decimal::ZERO),
             insurance_stop_stale: Arc::new(RwLock::new(HashMap::new())),
             tech_stop_audits: Arc::new(RwLock::new(HashMap::new())),
             entry_exhausted: Arc::new(RwLock::new(HashMap::new())),

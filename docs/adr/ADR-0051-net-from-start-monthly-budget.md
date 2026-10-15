@@ -338,7 +338,7 @@ with the approval date in this heading and in the Status line; until then
 | Settlement completeness (§3): funding and typed income outside `governed_realized_net` | Activate without funding in the budget anchor | Runbook step 2 measures the month's out-of-band sum and refuses activation above 10% of remaining budget; funding at the operator's sizes is cents per 8 h and visible in the ledger and in `WALLET BALANCE` |
 | `trigger_monthly_halt` cannot cancel `Entering` (§5.4) | Activate on a flat book | No cutover exposure; the gap applies equally under `hwm_v1` and is tracked as its own issue |
 | August 2026 ledger gap (+43.63 vs 40.63) must be evidenced (§5.4) | Not re-opened | October has its own basis and ledger; the August row stays `hwm_v1` |
-| Non-expanding basis (§1) was not enforced in code | Enforced from the activation-readiness release | `MonthlyBudgetModel::allows_capital_base_change` withholds increases in both recalibration paths under net-from-start |
+| Non-expanding basis (§1) was not enforced in code | Enforced from the activation-readiness release | `MonthlyBudgetModel::allows_capital_base_change` withholds increases in both recalibration paths under net-from-start. Known consequence: after an intra-month deposit the idle drift scan warns every cycle until the month boundary (fail-loud; persisted attribution is #242). Operating constraint until then: no intra-month deposits under net-from-start |
 
 Everything else in §5.4 (flat account, no in-flight entry/exit, no stale
 reconciliation item, canonical snapshot shadow) is checked by the runbook.

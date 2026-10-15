@@ -875,21 +875,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         }
 
         let wallet_balance = self.exchange.get_futures_balance().await?.wallet_balance;
-        let (previous_capital_base, withheld_basis_increase) = {
+        let previous_capital_base = {
             let manager = self.position_manager.read().await;
-            (
-                manager.load_monthly_state(now).await?.capital_base,
-                manager.withheld_basis_increase(),
-            )
+            manager.load_monthly_state(now).await?.capital_base
         };
         let robson_month_net: Decimal = {
             let manager = self.position_manager.read().await;
             manager.robson_month_net(now).await?
         };
-        // ADR-0051 §1: a confirmed deposit the budget model refused to fold
-        // into the basis is explained wallet surplus, not drift.
-        let expected_wallet_balance =
-            previous_capital_base + robson_month_net + withheld_basis_increase;
+        let expected_wallet_balance = previous_capital_base + robson_month_net;
         let unexplained_delta = wallet_balance - expected_wallet_balance;
 
         if decimal_abs(unexplained_delta) <= financial_drift_tolerance() {
@@ -907,7 +901,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
             %expected_wallet_balance,
             %previous_capital_base,
             %robson_month_net,
-            %withheld_basis_increase,
             %unexplained_delta,
             "Pure financial account drift detected — NOT recalibrating capital_base here; \
              see income_ledger.rs for the ledger-confirmed TRANSFER-only auto-write path"
@@ -986,10 +979,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                 ?reconciled_positions,
                 "Capital base increase withheld after manual account drift: non-expanding monthly budget basis"
             );
-            self.position_manager
-                .read()
-                .await
-                .set_withheld_basis_increase(new_capital_base - previous_capital_base);
             return Ok(());
         }
 

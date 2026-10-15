@@ -101,11 +101,25 @@ Run from a shell with the production kubeconfig.
    still unmatched; transfers are basis events, not costs, and are left out.
    Their `amount` sum is the settlement gap the budget does not see; write
    it down. If `|sum|` exceeds 10% of the month's remaining budget, do not
-   activate until it is evidenced. The reconciliation scan must have
-   completed within the last 10 minutes (`last_completed_timestamp_seconds`
-   against `date +%s`) and `scans_total{result="error"}` must not be
-   climbing; the ledger poll has no freshness metric of its own, so a scan
-   that is older than that means the evidence above may be stale.
+   activate until it is evidenced.
+
+   The ledger is only evidence if it is **current**. Income polling runs on
+   its own loop and can fail while position reconciliation keeps
+   succeeding, so the reconciliation metric does not prove ledger
+   freshness. Check the ledger against the exchange directly:
+
+   ```bash
+   kubectl exec -n robson "$PARADEDB_POD" -- psql -U robson -d robson -c \
+     "SELECT MAX(income_time) AS newest_income, MAX(created_at) AS newest_ingest, COUNT(*) FILTER (WHERE income_time >= date_trunc('month', now() AT TIME ZONE 'UTC')) AS rows_this_month FROM income_ledger;"
+   kubectl logs -n robson deploy/robsond --since=30m | grep -iE "income (poll|ledger).*(error|fail)" | tail -5
+   ```
+
+   Open Binance → Futures → Transaction History → Income for the current
+   month: the newest item there (funding, commission, realized P&L or
+   transfer) must be present in the ledger (`newest_income` ≥ its time) and
+   the month's row count must match. Any ingestion error in the last 30
+   minutes, or an exchange item missing from the ledger, means the gap
+   query above is not evidence: fix ingestion and re-run this step.
 
 3. **Governed net cross-check.** `month_governed_realized_net` must agree
    with the closed-position projection for the month:
@@ -201,11 +215,15 @@ Run from a shell with the production kubeconfig.
   with `risk_unit = capital_base × 1%`.
 - [ ] Deposit path (only if one happens): a confirmed TRANSFER does **not**
   raise `capital_base`; the daemon logs
-  `Capital base increase withheld: non-expanding monthly budget basis`,
-  `WALLET BALANCE` moves while `capital_base` stays, and the idle drift
-  scan does **not** keep warning (the withheld amount is attributed as
-  explained wallet surplus; it is re-derived after a restart on the next
-  ledger cycle).
+  `Capital base increase withheld: non-expanding monthly budget basis` and
+  `WALLET BALANCE` moves while `capital_base` stays. **Known, accepted
+  nuisance** (#242): the idle drift scan then warns
+  `Pure financial account drift detected` on every cycle until the month
+  boundary, because the wallet sits above `capital_base + month net` by
+  the withheld amount. It is fail-loud by design (an in-memory attribution
+  was tried and rejected in review because it could mask a later genuine
+  withdrawal); the persisted design is tracked in #242. Avoid intra-month
+  deposits under net-from-start until it lands.
 
 ## Rollback
 
