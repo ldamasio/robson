@@ -89,15 +89,23 @@ Run from a shell with the production kubeconfig.
    kubectl exec -n robson "$PARADEDB_POD" -- psql -U robson -d robson -c \
      "SELECT COUNT(*) AS unmatched_any_age FROM income_ledger WHERE matched_at IS NULL AND acked_at IS NULL;"
    kubectl exec -n robson "$PARADEDB_POD" -- psql -U robson -d robson -c \
-     "SELECT income_type, COUNT(*), SUM(amount) FROM income_ledger WHERE income_time >= date_trunc('month', now() AT TIME ZONE 'UTC') AND (matched_at IS NULL) GROUP BY 1 ORDER BY 1;"
+     "SELECT income_type, COUNT(*) FILTER (WHERE matched_at IS NULL AND acked_at IS NULL) AS unmatched, COUNT(*) FILTER (WHERE acked_at IS NOT NULL) AS acked, SUM(amount) AS amount FROM income_ledger WHERE income_time >= date_trunc('month', now() AT TIME ZONE 'UTC') AND income_type <> 'TRANSFER' AND (income_type = 'FUNDING_FEE' OR acked_at IS NOT NULL OR matched_at IS NULL) GROUP BY 1 ORDER BY 1;"
+   curl -s https://api.robson.rbx.ia.br/metrics | grep -E 'robsond_reconciliation_(last_completed_timestamp_seconds|scans_total)'
    ```
 
    Expected: `unmatched_any_age == 0` (acknowledge with
    `robson-cli income ack <id>` only after the item is understood, ADR-0045).
    The second query lists this month's items that are **outside governed
-   net** (acknowledged items and funding). Their sum is the settlement gap
-   the budget does not see; write it down. If `|sum|` exceeds 10% of the
-   month's remaining budget, do not activate until it is evidenced.
+   net**: all funding (the matcher marks `FUNDING_FEE` rows matched, so the
+   filter is by type, not by `matched_at`), acknowledged items, and anything
+   still unmatched; transfers are basis events, not costs, and are left out.
+   Their `amount` sum is the settlement gap the budget does not see; write
+   it down. If `|sum|` exceeds 10% of the month's remaining budget, do not
+   activate until it is evidenced. The reconciliation scan must have
+   completed within the last 10 minutes (`last_completed_timestamp_seconds`
+   against `date +%s`) and `scans_total{result="error"}` must not be
+   climbing; the ledger poll has no freshness metric of its own, so a scan
+   that is older than that means the evidence above may be stale.
 
 3. **Governed net cross-check.** `month_governed_realized_net` must agree
    with the closed-position projection for the month:
@@ -187,12 +195,17 @@ Run from a shell with the production kubeconfig.
 - [ ] Daemon log shows no `Unknown persisted monthly budget model` warning.
 - [ ] First admitted entry after the switch: an **Armed** position reserves
   nothing (arm is not admission); once it is `Entering`/`Active`,
-  `monthly_open_risk_reserved` equals its priced worst-case risk and
-  `new_slots_available` reflects `floor((remaining − reserved) / risk_unit)`.
+  `monthly_open_risk_reserved` equals its priced worst-case risk,
+  `monthly_budget_remaining` already has it subtracted, and
+  `new_slots_available == min(4, floor(monthly_budget_remaining / risk_unit))`
+  with `risk_unit = capital_base × 1%`.
 - [ ] Deposit path (only if one happens): a confirmed TRANSFER does **not**
   raise `capital_base`; the daemon logs
-  `Capital base increase withheld: non-expanding monthly budget basis` and
-  `WALLET BALANCE` moves while `capital_base` stays.
+  `Capital base increase withheld: non-expanding monthly budget basis`,
+  `WALLET BALANCE` moves while `capital_base` stays, and the idle drift
+  scan does **not** keep warning (the withheld amount is attributed as
+  explained wallet surplus; it is re-derived after a restart on the next
+  ledger cycle).
 
 ## Rollback
 

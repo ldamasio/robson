@@ -236,6 +236,7 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> IncomeLedgerWor
         let unexplained_delta = wallet_balance - expected_wallet_balance;
 
         if unexplained_delta.abs() <= financial_drift_tolerance() {
+            manager.set_withheld_basis_increase(Decimal::ZERO);
             return Ok(());
         }
 
@@ -281,6 +282,7 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> IncomeLedgerWor
             // ADR-0051 §1: a confirmed deposit must not expand the current
             // month's 4% budget. The money is in the wallet and in margin;
             // the basis follows at the next month boundary.
+            manager.set_withheld_basis_increase(new_capital_base - previous_capital_base);
             debug!(
                 %previous_capital_base,
                 %new_capital_base,
@@ -315,6 +317,7 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> IncomeLedgerWor
 
         self.event_bus.send(DaemonEvent::DomainEvent(event.clone()));
         manager.emit_domain_event(event).await?;
+        manager.set_withheld_basis_increase(Decimal::ZERO);
 
         Ok(())
     }
