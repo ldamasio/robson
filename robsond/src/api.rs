@@ -1268,10 +1268,15 @@ where
 
         // Audit-only heartbeat ticks (ADR-0049) are telemetry, not history:
         // at one row per market trade they would fill the whole page and
-        // evict every decision event from the operator feed.
+        // evict every decision event from the operator feed. The same goes
+        // for watermark steps.
         let options = QueryOptions::new(tenant_id)
             .time_range(from, to)
             .exclude_event_type("position_monitor_tick")
+            // Bounded watermark persistence (#192) is state, not a decision:
+            // the card already shows the extreme, the feed should not list
+            // every step of it.
+            .exclude_event_type("favorable_extreme_advanced")
             .limit(EVENT_HISTORY_LIMIT)
             .descending();
         let envelopes = match query_events(pool.as_ref(), options).await {
