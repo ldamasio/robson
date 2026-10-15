@@ -13,14 +13,16 @@ per-position carried-basis state that step 1 requires do not exist yet
 `month_peak_net`), settlement completeness (funding and typed income are
 excluded, an activation blocker documented on the
 `month_governed_realized_net` API field; no runtime gate exists), and
-cleanup remain pending. Update (2026-10-15): rollout step 3 is done —
+cleanup remain pending. Update (2026-10-15): rollout step 3 is done and §1's non-expanding basis is
+now enforced in code —
 `/status` serves `monthly_budget_utilization_pct` for the active model and
 withholds `month_peak_net`/`monthly_giveback_pct` once net-from-start is
 persisted; the dashboard MONTHLY LIMIT card renders model-aware copy. Step 4
 is an operator action documented in
 [`docs/runbooks/activate-net-from-start-budget.md`](../runbooks/activate-net-from-start-budget.md)
-(one guarded `UPDATE monthly_state`, no restart; the funding-exclusion and
-Entering-cancel gaps are recorded there as accepted, not removed). Trigger:
+(one guarded `UPDATE monthly_state`, no restart). The remaining §5.4
+blockers are **not** waived by this update: see "Activation exceptions",
+which the operator must approve before the runbook may proceed. Trigger:
 2026-10-15, a net +83.50 USDT October with an empty book showed 2 slots under
 `hwm_v1`, the August scenario again.
 **Deciders**: RBX Systems (operator + architecture, with adversarial design
@@ -322,6 +324,24 @@ limit."
   monthly mechanism. Win +3% early and the month may give those gains back
   before the −4% floor binds. Per operator decision, protecting profit is
   the job of each position's trailing stop, not of the monthly budget.
+
+## Activation exceptions (proposed 2026-10-15 — PENDING OPERATOR APPROVAL)
+
+§5.4 names blockers that are still open. Activation in October 2026 is
+possible only if the operator explicitly accepts the following bounded
+exceptions. Approval is recorded by replacing "PENDING OPERATOR APPROVAL"
+with the approval date in this heading and in the Status line; until then
+`docs/runbooks/activate-net-from-start-budget.md` step 0 stops.
+
+| Open requirement | Exception accepted | Bound / mitigation |
+| --- | --- | --- |
+| Settlement completeness (§3): funding and typed income outside `governed_realized_net` | Activate without funding in the budget anchor | Runbook step 2 measures the month's out-of-band sum and refuses activation above 10% of remaining budget; funding at the operator's sizes is cents per 8 h and visible in the ledger and in `WALLET BALANCE` |
+| `trigger_monthly_halt` cannot cancel `Entering` (§5.4) | Activate on a flat book | No cutover exposure; the gap applies equally under `hwm_v1` and is tracked as its own issue |
+| August 2026 ledger gap (+43.63 vs 40.63) must be evidenced (§5.4) | Not re-opened | October has its own basis and ledger; the August row stays `hwm_v1` |
+| Non-expanding basis (§1) was not enforced in code | Enforced from the activation-readiness release | `MonthlyBudgetModel::allows_capital_base_change` withholds increases in both recalibration paths under net-from-start |
+
+Everything else in §5.4 (flat account, no in-flight entry/exit, no stale
+reconciliation item, canonical snapshot shadow) is checked by the runbook.
 
 ## Supersession boundaries
 

@@ -38,7 +38,10 @@ protected by the monthly mechanism. With `governed_realized_net = +83.50` and
   and access to the `robson` namespace.
 - Daemon image and frontend at or after the release that made `/status` and
   the MONTHLY LIMIT card model-aware (`monthly_budget_utilization_pct`,
-  HWM fields withheld under net-from-start). Verify:
+  HWM fields withheld under net-from-start) and that enforces the
+  non-expanding basis (`MonthlyBudgetModel::allows_capital_base_change`:
+  under net-from-start a confirmed deposit or manual drift can no longer
+  raise `capital_base` intra-month; decreases still apply). Verify:
 
   ```bash
   curl -s https://api.robson.rbx.ia.br/status | jq '{monthly_budget_model, monthly_budget_utilization_pct, monthly_giveback_pct}'
@@ -51,13 +54,22 @@ protected by the monthly mechanism. With `governed_realized_net = +83.50` and
 
 Run from a shell with the production kubeconfig.
 
-1. **Account flat, nothing in flight.**
+0. **Policy gate.** ADR-0051 §5.4 lists blockers that this runbook cannot
+   remove (see item 5). Activation requires the operator to have approved
+   the "Activation exceptions" amendment in ADR-0051 (status line of the
+   ADR says so, with a date). Without that approval, stop here.
+
+1. **Account flat, nothing in flight, halt not latched.**
 
    ```bash
    curl -s https://api.robson.rbx.ia.br/status | jq '{active_positions, occupied_slots, stale_active_count, pending_approvals: (.pending_approvals|length), reconciliation_blockers: (.reconciliation_blockers|length), monthly_open_risk_reserved}'
+   curl -s https://api.robson.rbx.ia.br/monthly-halt
    ```
 
-   Expected: every count `0`, `monthly_open_risk_reserved == "0"`.
+   Expected: every count `0`, `monthly_open_risk_reserved == "0"`, and
+   `monthly-halt.state == "active"` (normal operation). A latched halt is
+   **not** cleared by switching models: the budget and slots would read
+   healthy while arming stays rejected until the month rollover.
 
    ```bash
    PARADEDB_POD=$(kubectl get pod -n robson -l app.kubernetes.io/name=robson-paradedb -o jsonpath='{.items[0].metadata.name}')
@@ -68,39 +80,62 @@ Run from a shell with the production kubeconfig.
    Expected: zero rows. Also confirm on Binance that the USDⓈ-M account has
    no open position and no open order for the traded symbols.
 
-2. **No stale reconciliation item.** `unmatched_income_count` must be `0`;
-   acknowledge pending rows first (`robson-cli income ack <id>`, ADR-0045).
+2. **Income ledger reconciled with evidence, not just acknowledged.**
+   `unmatched_income_count` in `/status` excludes acknowledged rows and rows
+   inside the evidence-lag grace period, and reads `0` when the query
+   fails, so it is necessary but not sufficient. Check the ledger directly:
 
    ```bash
-   curl -s https://api.robson.rbx.ia.br/status | jq .unmatched_income_count
+   kubectl exec -n robson "$PARADEDB_POD" -- psql -U robson -d robson -c \
+     "SELECT COUNT(*) AS unmatched_any_age FROM income_ledger WHERE matched_at IS NULL AND acked_at IS NULL;"
+   kubectl exec -n robson "$PARADEDB_POD" -- psql -U robson -d robson -c \
+     "SELECT income_type, COUNT(*), SUM(amount) FROM income_ledger WHERE income_time >= date_trunc('month', now() AT TIME ZONE 'UTC') AND (matched_at IS NULL) GROUP BY 1 ORDER BY 1;"
    ```
 
-3. **Shadow period healthy.** The dormant release computes both models on
-   every snapshot. With an empty book the two models must differ only by the
-   give-back term:
+   Expected: `unmatched_any_age == 0` (acknowledge with
+   `robson-cli income ack <id>` only after the item is understood, ADR-0045).
+   The second query lists this month's items that are **outside governed
+   net** (acknowledged items and funding). Their sum is the settlement gap
+   the budget does not see; write it down. If `|sum|` exceeds 10% of the
+   month's remaining budget, do not activate until it is evidenced.
+
+3. **Governed net cross-check.** `month_governed_realized_net` must agree
+   with the closed-position projection for the month:
+
+   ```bash
+   curl -s https://api.robson.rbx.ia.br/status | jq '{month_governed_realized_net, monthly_net_loss_consumed, monthly_budget_amount, monthly_budget_remaining, new_slots_available}'
+   kubectl exec -n robson "$PARADEDB_POD" -- psql -U robson -d robson -c \
+     "SELECT COUNT(*) AS closes, SUM(realized_pnl) AS pnl, SUM(total_fees) AS fees, SUM(realized_pnl - total_fees) AS net FROM positions_current WHERE state = 'closed' AND closed_at >= date_trunc('month', now() AT TIME ZONE 'UTC');"
+   ```
+
+   Expected: `net` equals `month_governed_realized_net` within rounding.
+
+4. **Shadow sanity.** The dormant release computes both models on every
+   snapshot and exports `robsond_budget_model_shadow_slots_delta =
+   slots_nfs − slots_hwm` (the metric keeps that meaning after activation;
+   it does not go to zero). Compute by hand from the values above:
+   `remaining_nfs = monthly_budget_amount − max(0, −month_governed_realized_net)
+   − monthly_open_risk_reserved`; `slots_nfs = min(4, floor(remaining_nfs /
+   (capital_base × 1%)))`. The metric must equal
+   `slots_nfs − new_slots_available`.
 
    ```bash
    curl -s https://api.robson.rbx.ia.br/metrics | grep robsond_budget_model_shadow_slots_delta
-   curl -s https://api.robson.rbx.ia.br/status | jq '{month_governed_realized_net, monthly_net_loss_consumed, month_peak_net, month_equity_net, monthly_budget_remaining, new_slots_available}'
    ```
 
-   Sanity check by hand: `remaining_nfs = monthly_budget_amount −
-   max(0, −month_governed_realized_net)`; `slots_nfs = min(4,
-   floor(remaining_nfs / (capital_base × 1%)))`. The gauge delta must equal
-   `slots_nfs − new_slots_available`.
-
-4. **Known, accepted gaps** (documented ADR-0051 activation blockers that
-   this runbook does not remove; record the acceptance in the PR or issue
-   that authorises the switch):
+5. **Known gaps versus ADR-0051 §5.4** (covered by the amendment in item 0,
+   never silently):
 
    - `month_governed_realized_net` excludes funding and other typed income
-     (ADR-0051 §3 settlement completeness). At the operator's sizes
-     (≤ 0.02 BTC, intraday to a few days) funding is cents per 8 h; it is
-     visible in the income ledger and in `WALLET BALANCE`, never in the
-     budget.
-   - `trigger_monthly_halt` cannot cancel an `Entering` order; with an empty
-     book at activation this does not apply to the switch itself.
-   - Ledger reconciliation of earlier months is not re-opened by this switch.
+     (settlement completeness, §3). Bounded by item 2; at the operator's
+     sizes (≤ 0.02 BTC, intraday to a few days) funding is cents per 8 h.
+   - `trigger_monthly_halt` cannot cancel an `Entering` order. The switch
+     happens on a flat book, so no cutover exposure; the gap applies to
+     later entries under both models and is tracked separately.
+   - The August 2026 ledger discrepancy (+43.63 closes vs 40.63 month net)
+     is not re-opened by this switch; October has its own basis.
+   - Non-expanding basis (§1) is enforced from the release named in
+     Prerequisites; before it, a confirmed deposit could raise the basis.
 
 ## Procedure
 
@@ -141,16 +176,23 @@ Run from a shell with the production kubeconfig.
   Expected on a net-positive empty book: `new_slots_available == 4`,
   `monthly_budget_utilization_pct == "0"`, `month_peak_net == null`,
   `monthly_giveback_pct == null`.
-- [ ] `robsond_budget_model_shadow_slots_delta` reads `0` after the switch
-  (the metric is `slots_nfs − slots_hwm` and now compares the active model
-  with the retired one; a non-zero value is informational).
+- [ ] `robsond_budget_model_shadow_slots_delta` still equals
+  `slots_nfs − slots_hwm` (now `new_slots_available − slots_hwm`); a
+  non-zero value is expected whenever the month has a give-back from its
+  peak. It is informational after activation.
 - [ ] Dashboard MONTHLY LIMIT card shows the net-from-start copy ("Net
   governed loss since month start · Profits do not raise the limit") with
   `net / reserved / left` instead of `peak / now`, and the SLOTS row shows
   4 free cells.
 - [ ] Daemon log shows no `Unknown persisted monthly budget model` warning.
-- [ ] First arm after the switch: `monthly_open_risk_reserved` equals the
-  planned risk of the new position and `new_slots_available` drops by one.
+- [ ] First admitted entry after the switch: an **Armed** position reserves
+  nothing (arm is not admission); once it is `Entering`/`Active`,
+  `monthly_open_risk_reserved` equals its priced worst-case risk and
+  `new_slots_available` reflects `floor((remaining − reserved) / risk_unit)`.
+- [ ] Deposit path (only if one happens): a confirmed TRANSFER does **not**
+  raise `capital_base`; the daemon logs
+  `Capital base increase withheld: non-expanding monthly budget basis` and
+  `WALLET BALANCE` moves while `capital_base` stays.
 
 ## Rollback
 

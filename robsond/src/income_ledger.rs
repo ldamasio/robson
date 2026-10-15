@@ -229,7 +229,8 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> IncomeLedgerWor
         }
 
         let wallet_balance = self.exchange.get_futures_balance().await?.wallet_balance;
-        let previous_capital_base = manager.load_monthly_state(now).await?.capital_base;
+        let monthly = manager.load_monthly_state(now).await?;
+        let previous_capital_base = monthly.capital_base;
         let robson_month_net = manager.robson_month_net(now).await?;
         let expected_wallet_balance = previous_capital_base + robson_month_net;
         let unexplained_delta = wallet_balance - expected_wallet_balance;
@@ -271,6 +272,22 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> IncomeLedgerWor
             (wallet_balance - robson_month_net - carried_risk).max(Decimal::ZERO);
 
         if new_capital_base == previous_capital_base {
+            return Ok(());
+        }
+        if !monthly
+            .budget_model
+            .allows_capital_base_change(previous_capital_base, new_capital_base)
+        {
+            // ADR-0051 §1: a confirmed deposit must not expand the current
+            // month's 4% budget. The money is in the wallet and in margin;
+            // the basis follows at the next month boundary.
+            debug!(
+                %previous_capital_base,
+                %new_capital_base,
+                %matched_transfer_sum,
+                model = %monthly.budget_model.as_str(),
+                "Capital base increase withheld: non-expanding monthly budget basis"
+            );
             return Ok(());
         }
 

@@ -24,10 +24,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   enforces ("Net governed loss since month start · Profits do not raise the
   limit", with `net / reserved / left`) instead of `peak / now`. Older
   backends keep the previous rendering.
-- New runbook `docs/runbooks/activate-net-from-start-budget.md`: ADR-0051
-  §5.4 preconditions (flat account, no unmatched income, shadow check), the
-  guarded `UPDATE monthly_state` for the current month, validation and
-  rollback. Later months inherit the persisted model on every insert path.
+- ADR-0051 §1 enforced: under net-from-start a confirmed deposit or manual
+  account drift can no longer raise `capital_base` intra-month
+  (`MonthlyBudgetModel::allows_capital_base_change`, applied in the income
+  ledger and reconciliation recalibration paths); decreases still apply.
+- New runbook `docs/runbooks/activate-net-from-start-budget.md`: a policy
+  gate (the ADR-0051 "Activation exceptions" amendment must be approved by
+  the operator), §5.4 preconditions (flat account, halt not latched, ledger
+  reconciled with evidence rather than acknowledged, governed-net
+  cross-check, shadow sanity), the guarded `UPDATE monthly_state` for the
+  current month, validation and rollback. Later months inherit the
+  persisted model on every insert path.
 
 ### Fixed - Favorable watermark persisted as it advances (#192)
 
