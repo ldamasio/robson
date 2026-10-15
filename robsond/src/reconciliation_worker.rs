@@ -921,10 +921,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     ) -> DaemonResult<()> {
         let now = Utc::now();
         let wallet_balance = self.exchange.get_futures_balance().await?.wallet_balance;
-        let previous_capital_base = {
+        let monthly = {
             let manager = self.position_manager.read().await;
-            manager.load_monthly_state(now).await?.capital_base
+            manager.load_monthly_state(now).await?
         };
+        let previous_capital_base = monthly.capital_base;
 
         let carried_risk_committed =
             Self::calculate_committed_carried_risk(&self.live_risk_open_positions().await?);
@@ -960,6 +961,23 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                 %carried_risk,
                 ?reconciled_positions,
                 "Capital base recalibration skipped: value unchanged after reconciliation"
+            );
+            return Ok(());
+        }
+
+        if !monthly
+            .budget_model
+            .allows_capital_base_change(previous_capital_base, new_capital_base)
+        {
+            // ADR-0051 §1: manual drift may only shrink the basis intra-month
+            // under net-from-start; an increase waits for the month boundary.
+            info!(
+                %previous_capital_base,
+                %new_capital_base,
+                %wallet_balance,
+                model = %monthly.budget_model.as_str(),
+                ?reconciled_positions,
+                "Capital base increase withheld after manual account drift: non-expanding monthly budget basis"
             );
             return Ok(());
         }

@@ -129,10 +129,10 @@
       : false,
   );
   let monthlyBudgetLimitPct = MONTHLY_BUDGET_LIMIT_PCT;
-  let hasHwmBudget = $derived(
-    currentStatus != null && currentStatus.monthly_giveback_pct !== null,
-  );
   let budget = $derived(deriveBudgetView(currentStatus, insufficientCapital));
+  // Which monthly accounting the daemon enforces (ADR-0051 §4): the card copy
+  // must describe the limit the daemon actually applies, never the other one.
+  let budgetModel = $derived(budget.model);
   let budgetUsedPct = $derived(budget.usedPct);
   let monthlyDrawdownPct = $derived(budget.drawdownPct);
   let monthlyBudgetExhausted = $derived(budget.exhausted);
@@ -230,6 +230,12 @@
       currency: "USD",
       maximumFractionDigits: 2,
     }).format(Number.isFinite(amount) ? amount : 0);
+  }
+
+  function formatSignedMoney(value: number | null | undefined): string {
+    const amount = Number(value ?? 0);
+    const sign = amount > 0 ? "+" : amount < 0 ? "-" : "";
+    return `${sign}${formatMoney(Math.abs(amount))}`;
   }
 
   function formatPct(value: number | null | undefined): string {
@@ -564,7 +570,19 @@
                     {monthlyBudgetLimitPct.toFixed(1)}% limit
                   </span>
                 </Row>
-                {#if hasHwmBudget}
+                {#if budgetModel === "net_from_start"}
+                  <span class="meta dim"
+                    >Net governed loss since month start · Profits do not
+                    raise the limit</span
+                  >
+                  <span class="meta dim">
+                    net {formatSignedMoney(
+                      currentStatus.month_governed_realized_net,
+                    )} · reserved {formatMoney(
+                      currentStatus.monthly_open_risk_reserved,
+                    )} · left {formatMoney(currentStatus.monthly_budget_remaining)}
+                  </span>
+                {:else if budgetModel === "hwm"}
                   <span class="meta dim"
                     >From month equity peak · Excludes out-of-band drift</span
                   >
@@ -593,7 +611,7 @@
                 <span class="loss-value"
                   >{formatMoney(currentStatus.monthly_realized_loss)}</span
                 >
-                {#if hasHwmBudget}
+                {#if budgetModel !== "legacy"}
                   <span class="meta dim"
                     >Informational · Governed Robson flow only</span
                   >

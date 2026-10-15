@@ -47,6 +47,19 @@ impl MonthlyBudgetModel {
     }
 }
 
+impl MonthlyBudgetModel {
+    /// ADR-0051 §1: under the net-from-start model the monthly budget basis
+    /// MUST NOT increase during the month; a confirmed deposit stays in the
+    /// wallet and in margin, never in the 4% budget. Decreases (withdrawals,
+    /// adverse account changes) remain allowed under both models.
+    pub fn allows_capital_base_change(self, previous: Decimal, next: Decimal) -> bool {
+        match self {
+            Self::HwmV1 => true,
+            Self::NetFromStartNonExpandingV1 => next <= previous,
+        }
+    }
+}
+
 impl Default for MonthlyBudgetModel {
     fn default() -> Self {
         Self::HwmV1
@@ -349,6 +362,13 @@ mod tests {
             "net_from_start_non_expanding_v1"
         );
         assert_eq!(MonthlyBudgetModel::from_persisted("unknown_v2"), MonthlyBudgetModel::HwmV1);
+        // ADR-0051 §1: non-expanding basis under net-from-start only.
+        let hwm = MonthlyBudgetModel::HwmV1;
+        let nfs = MonthlyBudgetModel::NetFromStartNonExpandingV1;
+        assert!(hwm.allows_capital_base_change(Decimal::new(1000, 0), Decimal::new(1500, 0)));
+        assert!(!nfs.allows_capital_base_change(Decimal::new(1000, 0), Decimal::new(1500, 0)));
+        assert!(nfs.allows_capital_base_change(Decimal::new(1000, 0), Decimal::new(1000, 0)));
+        assert!(nfs.allows_capital_base_change(Decimal::new(1000, 0), Decimal::new(900, 0)));
         assert_eq!(
             serde_json::to_string(&MonthlyBudgetModel::NetFromStartNonExpandingV1).unwrap(),
             "\"net_from_start_non_expanding_v1\""
