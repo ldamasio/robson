@@ -38,7 +38,7 @@ use rust_decimal_macros::dec;
 #[cfg(feature = "postgres")]
 use sqlx::Row;
 use tokio::{net::TcpListener, sync::RwLock};
-use tracing::{error, info, warn};
+use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "postgres")]
 use crate::funding::{worker::FundingWorker, FundingService};
@@ -1710,6 +1710,10 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
                     %new_state,
                     "Position state changed"
                 );
+            },
+
+            DaemonEvent::PositionMarkAdvanced { position_id, reason, .. } => {
+                debug!(%position_id, reason, "Position mark advanced");
             },
 
             DaemonEvent::QueryAwaitingApproval { query_id, position_id, expires_at, .. } => {

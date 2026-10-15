@@ -171,7 +171,7 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// ADR-0046 month equity instead of the stored `current_price`, which
     /// only moves on fill and on trailing advances (and resets to the entry
     /// price on restart).
-    last_market_price: Arc<RwLock<HashMap<Symbol, Price>>>,
+    last_market_price: Arc<RwLock<HashMap<Symbol, (Price, std::time::Instant)>>>,
     /// Active positions whose exchange-side insurance stop is known to sit
     /// behind the software stop plan because a placement or re-placement
     /// failed (ADR-0039). Value: earliest instant the next attempt may run.
@@ -310,6 +310,13 @@ pub(crate) struct MonthlyRiskState {
     pub budget_model: MonthlyBudgetModel,
 }
 
+/// Freshness bound for `/status` reads of the tick-path price cache. Matches
+/// the market-data watchdog (ADR-0044: 90 s of silence triggers the REST
+/// fallback), so a cached price older than this is one the engine itself no
+/// longer trusts without a fallback poll.
+pub(crate) const MARKET_PRICE_CACHE_MAX_AGE: std::time::Duration =
+    std::time::Duration::from_secs(90);
+
 /// Canonical monthly budget inputs and both dormant model calculations
 /// (ADR-0051 rollout step 2).
 #[derive(Debug, Clone, PartialEq)]
@@ -428,7 +435,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             .iter()
             .filter(|position| matches!(position.state, PositionState::Active { .. }))
             .map(|position| match marks.get(&position.symbol) {
-                Some(mark) => position.unrealized_pnl_at(*mark),
+                Some((mark, _)) => position.unrealized_pnl_at(*mark),
                 None => position.calculate_pnl(),
             })
             .sum()
@@ -1109,7 +1116,36 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     ) -> DaemonResult<Vec<ActionResult>> {
         let results = self.execute_and_persist_inner(actions).await?;
         self.note_insurance_stop_results(&results).await;
+        self.broadcast_mark_advances(&results);
         Ok(results)
+    }
+
+    /// Tell operator surfaces that an Active position's stop or watermark
+    /// moved without a lifecycle transition, so the card refreshes between
+    /// state changes. Both sources are bounded by the engine (one per rung,
+    /// at most ~10 watermark steps per rung), so this never approaches tick
+    /// volume. Not a domain event: nothing is persisted here.
+    fn broadcast_mark_advances(&self, results: &[ActionResult]) {
+        for result in results {
+            let (position_id, reason, timestamp) = match result {
+                ActionResult::EventEmitted(Event::TrailingStopUpdated {
+                    position_id,
+                    timestamp,
+                    ..
+                }) => (*position_id, "trailing_stop_updated", *timestamp),
+                ActionResult::EventEmitted(Event::FavorableExtremeAdvanced {
+                    position_id,
+                    timestamp,
+                    ..
+                }) => (*position_id, "favorable_extreme_advanced", *timestamp),
+                _ => continue,
+            };
+            self.event_bus.send(DaemonEvent::PositionMarkAdvanced {
+                position_id,
+                reason,
+                timestamp,
+            });
+        }
     }
 
     /// Track exchange-side insurance stop outcomes (ADR-0039). A failed
@@ -3639,7 +3675,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     pub async fn process_market_data(&self, data: MarketData) -> DaemonResult<()> {
         // Remember the latest mark for this symbol so month equity (ADR-0046)
         // values open positions at the live price, not at the last ratchet.
-        self.last_market_price.write().await.insert(data.symbol.clone(), data.price);
+        self.last_market_price
+            .write()
+            .await
+            .insert(data.symbol.clone(), (data.price, std::time::Instant::now()));
 
         // Find all active positions for this symbol (from projection)
         let active_positions = self.store.positions().find_active().await?;
@@ -4429,6 +4468,32 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// Get the latest market price from the exchange.
     pub async fn get_market_price(&self, symbol: &Symbol) -> DaemonResult<Price> {
         Ok(self.executor.get_price(symbol).await?)
+    }
+
+    /// Last market price received for `symbol` on the tick path (ADR-0046
+    /// amendment), if it is younger than [`MARKET_PRICE_CACHE_MAX_AGE`].
+    /// `None` until the first tick after startup and again once the feed for
+    /// the symbol has gone quiet: a symbol with only an Exiting position is
+    /// not covered by the ADR-0044 REST fallback poll, so without this bound
+    /// an operator read could serve an arbitrarily old price. Callers fall
+    /// back to an exchange round trip on `None`.
+    pub async fn last_market_price_for(&self, symbol: &Symbol) -> Option<Price> {
+        self.last_market_price
+            .read()
+            .await
+            .get(symbol)
+            .filter(|(_, seen_at)| seen_at.elapsed() <= MARKET_PRICE_CACHE_MAX_AGE)
+            .map(|(price, _)| *price)
+    }
+
+    #[cfg(test)]
+    pub(crate) async fn set_last_market_price_for_test(
+        &self,
+        symbol: &Symbol,
+        price: Price,
+        seen_at: std::time::Instant,
+    ) {
+        self.last_market_price.write().await.insert(symbol.clone(), (price, seen_at));
     }
 
     /// Get all open core positions.
@@ -7652,6 +7717,29 @@ mod tests {
     /// ADR-0046 §3: month equity must mark open positions at the live price,
     /// not at the stored `current_price` (fill price, or the last trailing
     /// ratchet, or the entry price again after a restart).
+    #[tokio::test]
+    async fn last_market_price_for_expires_after_the_watchdog_window() {
+        let manager = create_test_manager().await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let price = Price::new(dec!(80_000)).unwrap();
+
+        assert!(manager.last_market_price_for(&symbol).await.is_none());
+
+        manager
+            .set_last_market_price_for_test(&symbol, price, std::time::Instant::now())
+            .await;
+        assert_eq!(manager.last_market_price_for(&symbol).await, Some(price));
+
+        // A symbol whose feed went quiet (e.g. only an Exiting position, not
+        // covered by the REST fallback poll) must not serve an old mark to
+        // `/status`; the caller falls back to the exchange.
+        let stale = std::time::Instant::now()
+            - MARKET_PRICE_CACHE_MAX_AGE
+            - std::time::Duration::from_secs(1);
+        manager.set_last_market_price_for_test(&symbol, price, stale).await;
+        assert!(manager.last_market_price_for(&symbol).await.is_none());
+    }
+
     #[tokio::test]
     async fn test_month_equity_marks_open_positions_at_last_market_price() {
         let manager = create_test_manager().await;
