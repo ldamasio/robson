@@ -18,6 +18,7 @@
   import { recentEvents, pushEvent, mergeEvents } from "$stores/events";
   import { toasts, showToast } from "$stores/toast";
   import { status as sharedStatus, refreshStatus } from "$stores/status";
+  import { STATUS_POLL_MS, shouldPollStatus } from "$lib/config/polling";
   import {
     sseFreshness,
     markSseEvent,
@@ -61,6 +62,22 @@
   let approvalTick = $state(Date.now());
   let approvalTickTimer: ReturnType<typeof setInterval> | null = null;
   let sseRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+  let statusPollTimer: ReturnType<typeof setInterval> | null = null;
+
+  // Open P&L, the market-move badge and the rung distance only change when
+  // /status is re-read; SSE carries no prices. Poll slowly while a position
+  // is open and the tab is visible, and catch up once when it becomes visible.
+  function pollStatusTick() {
+    const activeCount = (currentStatus?.positions ?? []).filter((op) =>
+      isRenderableLivePosition(op),
+    ).length;
+    if (!shouldPollStatus(activeCount, document.visibilityState)) return;
+    void refreshStatus().catch(() => {});
+  }
+
+  function onVisibilityChange() {
+    if (document.visibilityState === "visible") pollStatusTick();
+  }
 
   // Clock-reactive: recomputed on every approvalTick so an open tab notices
   // the UTC month rollover instead of keeping the mount-time month (#133).
@@ -405,6 +422,8 @@
       approvalTickTimer = setInterval(() => {
         approvalTick = Date.now();
       }, 1000);
+      statusPollTimer = setInterval(pollStatusTick, STATUS_POLL_MS);
+      document.addEventListener("visibilitychange", onVisibilityChange);
     });
     return () => {
       stopSse();
@@ -413,6 +432,11 @@
         clearInterval(approvalTickTimer);
         approvalTickTimer = null;
       }
+      if (statusPollTimer) {
+        clearInterval(statusPollTimer);
+        statusPollTimer = null;
+      }
+      document.removeEventListener("visibilitychange", onVisibilityChange);
     };
   });
 
