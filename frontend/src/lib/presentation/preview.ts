@@ -62,7 +62,10 @@ function fmtMoney(n: number): string {
  */
 export function fmtNum(n: number): string {
   const abs = Math.abs(n);
-  const decimals =
-    abs === 0 ? 2 : Math.min(8, Math.max(2, 4 - Math.floor(Math.log10(abs))));
+  if (abs === 0) return '0.00';
+  // Below a millionth, fixed decimals stop being readable: use scientific
+  // notation with four significant digits (a 2e-9 span prints as 2.000e-9).
+  if (abs < 1e-6) return n.toExponential(3);
+  const decimals = Math.min(10, Math.max(2, 4 - Math.floor(Math.log10(abs))));
   return n.toLocaleString('en-US', { minimumFractionDigits: decimals, maximumFractionDigits: decimals });
 }

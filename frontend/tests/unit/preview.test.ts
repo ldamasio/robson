@@ -60,6 +60,20 @@ describe('fmtNum', () => {
     expect(fmtNum(0.001)).toBe('0.0010000');
     expect(fmtNum(0)).toBe('0.00');
   });
+  it('keeps sub-micro prices and spans distinguishable', () => {
+    expect(fmtNum(0.00000123)).toBe('0.0000012300');
+    expect(fmtNum(0.000001228)).toBe('0.0000012280');
+    expect(fmtNum(0.000000002)).toBe('2.000e-9');
+    const lines = previewLines(
+      preview({
+        reference_price: 0.00000123,
+        analysis: { ...preview().analysis!, technical_stop: 0.000001228, stop_distance: 0.000000002, stop_distance_pct: 0.16 },
+        sizing: null
+      })
+    );
+    expect(lines[0]).toMatch(/0\.0000012300$/);
+    expect(lines[1]).toContain('0.0000012280 · 2.000e-9 pts');
+  });
 });
 
 describe('previewLines', () => {
