@@ -10,12 +10,6 @@ on:
       - '.github/workflows/openspec-tracking.yml'
   push:
     branches: [main]
-    paths:
-      - 'openspec/**'
-      - 'scripts/openspec_github.py'
-      - 'scripts/tests/test_openspec_github.py'
-      - 'scripts/requirements-security.txt'
-      - '.github/workflows/openspec-tracking.yml'
   workflow_dispatch:
 
 permissions:

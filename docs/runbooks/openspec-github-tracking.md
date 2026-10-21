@@ -39,6 +39,11 @@ changes their bodies, assignments, labels or comments, changes Project status,
 or writes back into OpenSpec. Apart from that single mapped report, discussion
 is exclusively human/agent authored. A checksum detects manual edits to the
 generated report and stops publication instead of overwriting those edits.
+CRLF and final-newline normalization are tolerated. The checksum protects
+against edits already present at read time, not a concurrent editor: the API has
+no compare-and-swap here, so an edit between GET and PATCH can be overwritten.
+This is why the report is exclusively publisher-owned and discussion belongs in
+separate comments.
 
 Issue closure, card movement, a complete planning document, and an implementation
 checkbox are distinct signals. No GitHub action authorizes deployment or starts
@@ -91,6 +96,16 @@ finish before the next run. A stale main SHA is rejected before writing. A newer
 commit may land after the head check; the report remains explicitly anchored to
 its source SHA until the next queued run. Do not configure another publisher
 against the same comment. Manual local preview cannot publish.
+Every push to main queues publication, including commits unrelated to OpenSpec,
+so a newer unrelated commit cannot strand a stale rejected run. Intermediate
+pending runs may be replaced by GitHub; the newest main run updates the report.
+The source SHA changes on each main commit even when checklist counts do not.
+
+Bootstrap the dedicated comment from the script's exact output through the
+GitHub API, then record its returned ID in the mapping. Do not create a duplicate
+on an uncertain response; inspect the parent issue first. The pilot's live POST
+round trip returned the exact submitted body; newline-normalization tests also
+cover CRLF and a trimmed final newline. Review any later mapping replacement.
 
 ## Failure and recovery
 

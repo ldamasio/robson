@@ -56,7 +56,7 @@ def parse_tasks(text):
             packages[key] = current
         elif line.startswith('## '):
             current = None
-        elif re.match(r'^\s*(?:[-*+]|\d+[.)])\s+\[', line):
+        elif re.match(r'^\s*(?:[-*+]|\d+[.)])\s*(?:\[|\d+\.\d+\b)', line):
             task = TASK.fullmatch(line)
             if not task or current is None:
                 raise ValueError(f'Unrecognized checklist at line {line_number}')
@@ -73,12 +73,20 @@ def parse_tasks(text):
     return packages
 
 
+def canonical_text(text):
+    if not isinstance(text, str):
+        raise ValueError('Expected a textual report')
+    return text.replace('\r\n', '\n').rstrip() + '\n'
+
+
 def seal_report(change, content):
+    content = canonical_text(content)
     digest = hashlib.sha256(content.encode()).hexdigest()
     return f'<!-- robson-openspec-report:v1 {change} sha256={digest} -->\n{content}'
 
 
 def verify_report(change, body):
+    body = canonical_text(body)
     _, separator, content = body.partition('\n')
     if not separator or seal_report(change, content) != body:
         raise ValueError('Progress comment is missing its marker or was edited; refusing overwrite')
@@ -142,7 +150,7 @@ class GitHub:
                 data = response.read(LIMIT + 1)
         except urllib.error.HTTPError as error:
             raise ValueError(f'GitHub API returned HTTP {error.code}; no automatic retry') from None
-        except urllib.error.URLError:
+        except (urllib.error.URLError, TimeoutError):
             raise ValueError('GitHub API unavailable; no automatic retry') from None
         if len(data) > LIMIT:
             raise ValueError('GitHub response exceeds 1 MiB')
@@ -168,10 +176,10 @@ def publish(config, report, source_sha, api, environment):
     if existing.get('issue_url') != expected_issue:
         raise ValueError('Progress comment belongs to a different issue')
     verify_report(config['change'], existing.get('body', ''))
-    if existing['body'] == report:
+    if canonical_text(existing['body']) == canonical_text(report):
         return False
     result = api.request('PATCH', path, {'body': report})
-    if result.get('body') != report:
+    if canonical_text(result.get('body')) != canonical_text(report):
         raise ValueError('GitHub did not confirm the expected report; inspect before retry')
     return True
 

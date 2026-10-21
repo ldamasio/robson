@@ -49,6 +49,7 @@ class TrackingTests(unittest.TestCase):
         for text in ['', TASKS + '- [ ] 1.1 Duplicate', TASKS.replace('1.2 Tests', '2.2 Wrong'),
                      TASKS + '\n## Notes\n- [ ] Unmapped', TASKS.replace('[x]', '[?]'),
                      TASKS.replace('- [x]', '* [x]'), TASKS.replace('- [x]', '-  [x]'),
+                     TASKS.replace('- [x]', '-[x]'), TASKS.replace('- [x] ', '- '),
                      TASKS + '\n## 1. AUTH-DUR-01: Duplicate']:
             with self.subTest(text=text), self.assertRaises(ValueError):
                 tracking.parse_tasks(text)
@@ -94,12 +95,27 @@ class TrackingTests(unittest.TestCase):
                 tracking.publish(CONFIG, report, SHA, api, ENV)
             self.assertFalse(any(call[0] == 'PATCH' for call in api.calls))
 
-    def test_real_plan_has_exactly_11_packages_and_28_pending_tasks(self):
+    def test_real_config_matches_every_work_package(self):
         plan = tracking.read_text(tracking.ROOT / 'openspec/changes/durable-product-sessions/tasks.md')
         packages = tracking.parse_tasks(plan)
-        self.assertEqual(len(packages), 11)
-        self.assertEqual(sum(p['total'] for p in packages.values()), 28)
-        # Deliberately do not assert completion stays zero as implementation proceeds.
+        self.assertEqual(packages.keys(), tracking.load_config()['issues'].keys())
+
+    def test_comment_line_endings_and_final_newline_are_normalized(self):
+        report = tracking.render(CONFIG, TASKS, SHA)
+        for variant in [report.replace('\n', '\r\n'), report.rstrip(), report + '\n  ']:
+            tracking.verify_report(CONFIG['change'], variant)
+            api = FakeAPI(variant)
+            self.assertFalse(tracking.publish(CONFIG, report, SHA, api, ENV))
+
+    def test_current_main_run_recovers_after_older_run_is_rejected(self):
+        newer = 'b' * 40
+        report = tracking.render(CONFIG, TASKS, SHA)
+        api = FakeAPI(report, head=newer)
+        with self.assertRaisesRegex(ValueError, 'Stale'):
+            tracking.publish(CONFIG, report, SHA, api, ENV)
+        current = tracking.render(CONFIG, TASKS, newer)
+        self.assertTrue(tracking.publish(CONFIG, current, newer, api, dict(ENV, GITHUB_SHA=newer)))
+        self.assertEqual(api.body, current)
 
     def test_http_adapter_bounds_requests_and_response_size(self):
         class Opener:
@@ -140,6 +156,17 @@ class TrackingTests(unittest.TestCase):
         api = tracking.GitHub('test-only')
         api.opener = Opener()
         with self.assertRaisesRegex(ValueError, '^GitHub API returned HTTP 403; no automatic retry$'):
+            api.request('GET', 'repos/ldamasio/robson/git/ref/heads/main')
+        self.assertEqual(api.requests, 1)
+
+    def test_read_timeout_is_bounded_failure_without_retry(self):
+        class Opener:
+            def open(self, request, timeout):
+                raise TimeoutError('raw socket detail')
+
+        api = tracking.GitHub('test-only')
+        api.opener = Opener()
+        with self.assertRaisesRegex(ValueError, '^GitHub API unavailable; no automatic retry$'):
             api.request('GET', 'repos/ldamasio/robson/git/ref/heads/main')
         self.assertEqual(api.requests, 1)
 
