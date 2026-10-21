@@ -1,5 +1,22 @@
 # OpenSpec Studio handoff
 
+## GitHub delivery visibility
+
+The plan is published under [Robson issue #244](https://github.com/ldamasio/robson/issues/244),
+with eleven delivery sub-issues (#245–#255) and a
+[generated progress report](https://github.com/ldamasio/robson/issues/244#issuecomment-6306049749).
+OpenSpec remains the technical source; GitHub owns discussion, assignment and
+delivery links. The repository publisher refreshes one report after the workflow
+is merged into main. It does not write back into OpenSpec or execute Specflow.
+See the [tracking runbook](../../../docs/runbooks/openspec-github-tracking.md).
+
+The Mint installation was completed after the initial planning inspection:
+the local web interface opens from the system menu and the separate local
+session-implementation worktree is registered. The earlier no-install statements below describe only
+the planning inspection. No Studio fork is needed for this first integration.
+
+## Initial planning inspection
+
 The operator identified [davi-fati/openspec-studio](https://github.com/davi-fati/openspec-studio)
 as the suggested Kanban tool. Reference source checked on 2026-10-20 at commit
 `d564f10f6e21cc0a35d64e9eb33ca98f17744dda`; its backend module uses the historical

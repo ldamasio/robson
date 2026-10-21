@@ -1,5 +1,9 @@
 # Proposal: Durable Robson product sessions
 
+GitHub delivery tracking: [parent issue #244](https://github.com/ldamasio/robson/issues/244),
+with one sub-issue per work package. The technical checklist remains in
+[tasks.md](tasks.md); the GitHub report projects its progress without changing it.
+
 ## Why
 
 ADR-0055's local session prototype fixes stale authentication state and defines

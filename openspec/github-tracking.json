@@ -1,0 +1,20 @@
+{
+  "schema_version": 1,
+  "repository": "ldamasio/robson",
+  "change": "durable-product-sessions",
+  "parent_issue": 244,
+  "progress_comment": 6306049749,
+  "issues": {
+    "AUTH-DUR-01": 245,
+    "AUTH-DUR-02": 246,
+    "AUTH-DUR-03": 247,
+    "AUTH-DUR-04": 248,
+    "AUTH-DUR-05": 249,
+    "AUTH-DUR-06": 250,
+    "AUTH-DUR-07": 251,
+    "AUTH-DUR-08": 252,
+    "AUTH-DUR-09": 253,
+    "AUTH-DUR-10": 254,
+    "AUTH-DUR-11": 255
+  }
+}
