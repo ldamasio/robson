@@ -62,6 +62,18 @@ not a second clean model approval.
   change. Existing repository-wide dependency alerts are not resolved or claimed
   clean by the isolated tooling scan; the normal CI guardrails still apply.
 
+## GitHub CI result
+
+At tracking commit `1080f63baf86da66ca85c633b19460fcbacc12cd`, the OpenSpec
+`validate` job and Secret Scan passed; `publish` was correctly skipped for the
+PR event. Cargo Audit and Dependency Scan failed on the unchanged main lockfile's
+`rustls-webpki 0.103.15`, advisory `RUSTSEC-2026-0382` (published 2026-10-20).
+Both scanners identify 0.103.16 as the fixed release on the current minor line.
+This is an outstanding repository acceptance blocker, not a finding in the
+seven newly pinned tooling dependencies. No advisory suppression was added and
+the tracking PR remains a draft. The CI runs and remediation are linked from
+the PR; production exposure or exploitation was not investigated or claimed.
+
 Raw review input/output, hashes, bootstrap mapping, dependency scan results and
 preview are retained outside the public repository at the local artifact
 directory `robson-openspec-github-20261020`. See the
