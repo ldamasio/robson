@@ -747,6 +747,30 @@ impl DetectorTask {
         .with_technical_stop_analysis(audit))
     }
 
+    /// Dry run of the immediate entry path for the operator preview: fetch
+    /// the same candles, anchor on the last close and build the same signal
+    /// the arm would produce. No event, no log line at `info`, no side
+    /// effect beyond the OHLCV read.
+    pub(crate) async fn preview_immediate_signal(&self) -> DaemonResult<DetectorSignal> {
+        let candles = self
+            .ohlcv_port
+            .fetch_candles(&self.config.symbol, CandleInterval::FifteenMinutes, 100)
+            .await?;
+        let last_close = candles
+            .last()
+            .ok_or_else(|| {
+                DaemonError::Detector("no candles available for entry preview".to_string())
+            })?
+            .close;
+        let decision = SignalDecision::SignalConfirmed {
+            side: self.config.side,
+            reason: SignalReason::Immediate,
+            observed_at: chrono::Utc::now(),
+            reference_price: last_close,
+        };
+        self.create_signal(decision).await
+    }
+
     /// Compute the chart-derived stop for the detector signal.
     ///
     /// Returns the analyzer result and, when the invalidation guard is

@@ -32,12 +32,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   every cycle until the month boundary (fail-loud; persisted attribution is
   #242).
 - New runbook `docs/runbooks/activate-net-from-start-budget.md`: a policy
-  gate (the ADR-0051 "Activation exceptions" amendment must be approved by
-  the operator), §5.4 preconditions (flat account, halt not latched, ledger
+  gate (the ADR-0051 "Activation exceptions" amendment, approved by the
+  operator on 2026-10-21 for the 2026-11-01 boundary; October stays
+  `hwm_v1`), a scheduled-activation checklist, §5.4 preconditions (flat account, halt not latched, ledger
   reconciled with evidence rather than acknowledged, governed-net
   cross-check, shadow sanity), the guarded `UPDATE monthly_state` for the
   current month, validation and rollback. Later months inherit the
   persisted model on every insert path.
+### Added - Entry preview before arming
+
+- Three of October's stops were ATR fallbacks or single-level stops at 0.15% to
+  0.26% of price, stopped by noise within minutes; the operator only learned
+  the method after the fill. `POST /entry/preview` now dry-runs an immediate
+  arm through the production pieces (same capital base, transient Armed
+  position, the detector's immediate-signal analysis, the engine's entry
+  decision on a cloned engine) and returns reference price, technical stop
+  with distance, method and confidence, size, notional, planned risk, the
+  executable trigger and span, the domain rejection the arm would hit, and
+  advisory warnings. Nothing is persisted and no order is placed.
+- The arm modal gains a STOP PREVIEW panel. Warnings turn the button into
+  ARM ANYWAY; a rejection disables it with the reason shown.
 ### Changed - Live position card without polling the exchange
 
 - `/status` and `/positions/:id` priced open positions through an exchange

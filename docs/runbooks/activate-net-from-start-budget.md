@@ -56,8 +56,9 @@ Run from a shell with the production kubeconfig.
 
 0. **Policy gate.** ADR-0051 §5.4 lists blockers that this runbook cannot
    remove (see item 5). Activation requires the operator to have approved
-   the "Activation exceptions" amendment in ADR-0051 (status line of the
-   ADR says so, with a date). Without that approval, stop here.
+   the "Activation exceptions" amendment in ADR-0051. **Approved
+   2026-10-21**, for the 2026-11-01 UTC boundary only: do not switch the
+   October 2026 row (see "Scheduled activation" below).
 
 1. **Account flat, nothing in flight, halt not latched.**
 
@@ -168,12 +169,15 @@ Run from a shell with the production kubeconfig.
      "SELECT year, month, capital_base, realized_loss, month_peak_net, trades_opened, monthly_budget_model, boundary_reset_at FROM monthly_state ORDER BY year DESC, month DESC LIMIT 3;"
    ```
 
-2. Switch the **current** month only. The `WHERE` guard makes the statement
-   idempotent and refuses to touch a row that is not on `hwm_v1`:
+2. Switch the **target** month only, named explicitly (never `now()`, so a
+   run on the wrong day cannot touch a month the operator did not intend).
+   The `WHERE` guard makes the statement idempotent and refuses to touch a
+   row that is not on `hwm_v1`:
 
    ```bash
+   TARGET_YEAR=2026 TARGET_MONTH=11
    kubectl exec -n robson "$PARADEDB_POD" -- psql -U robson -d robson -c \
-     "UPDATE monthly_state SET monthly_budget_model = 'net_from_start_non_expanding_v1' WHERE year = EXTRACT(YEAR FROM now() AT TIME ZONE 'UTC')::smallint AND month = EXTRACT(MONTH FROM now() AT TIME ZONE 'UTC')::smallint AND monthly_budget_model = 'hwm_v1' RETURNING year, month, monthly_budget_model;"
+     "UPDATE monthly_state SET monthly_budget_model = 'net_from_start_non_expanding_v1' WHERE year = ${TARGET_YEAR} AND month = ${TARGET_MONTH} AND monthly_budget_model = 'hwm_v1' RETURNING year, month, capital_base, monthly_budget_model;"
    ```
 
    Expected: `UPDATE 1` with the current `year, month`. `UPDATE 0` means the
@@ -186,6 +190,44 @@ Run from a shell with the production kubeconfig.
 
 3. No restart. The next `/status` snapshot (and the next admission or halt
    evaluation) reads the new model.
+
+## Scheduled activation: 2026-11-01 UTC boundary
+
+Operator decision of 2026-10-21: switch November, leave October on `hwm_v1`.
+The November row is created by the daemon's `MonthBoundaryReset` shortly
+after 00:00 UTC on 2026-11-01 and inherits October's model (`hwm_v1`), so
+the switch runs **after** the row exists, with an explicit `month = 11`.
+
+Checklist, in order:
+
+- [ ] Before 2026-10-31 24:00 UTC: this PR's daemon and frontend deployed
+  (Prerequisites check passes); the 4 unmatched income items acknowledged;
+  no intra-month deposit planned for November (#242).
+- [ ] Do not carry a position across the boundary. If one is open at
+  23:00 UTC on 10-31, either let it run and activate on the first flat
+  moment of November, or close it; a carried position makes the boundary
+  snapshot absorb its downside (ADR-0051 §3) and the preconditions fail
+  until it settles.
+- [ ] After 00:05 UTC on 11-01: confirm the November row exists and what
+  it inherited:
+
+  ```bash
+  kubectl exec -n robson "$PARADEDB_POD" -- psql -U robson -d robson -c \
+    "SELECT year, month, capital_base, monthly_budget_model, boundary_reset_at FROM monthly_state WHERE (year, month) IN ((2026, 10), (2026, 11)) ORDER BY year, month;"
+  curl -s https://api.robson.rbx.ia.br/status | jq '{capital_base, monthly_budget_model, new_slots_available, monthly_budget_remaining}'
+  ```
+
+  Expected: a 2026-11 row with `boundary_reset_at` set, `capital_base`
+  re-snapshotted from the wallet, model `hwm_v1`; `/status` shows the new
+  base and 4 slots (fresh month, no give-back yet).
+- [ ] Run Preconditions 1–5 against November (all trivially true on a flat,
+  fresh month except the ledger freshness check in step 2).
+- [ ] Procedure step 2 with `TARGET_YEAR=2026 TARGET_MONTH=11`; then
+  Validation. The October row keeps `hwm_v1` and its audited history.
+
+If the boundary is missed by days, nothing is lost: the switch applies to
+the November row whenever the book is next flat; only avoid doing it right
+after a loss, for the reason recorded in the ADR.
 
 ## Validation
 

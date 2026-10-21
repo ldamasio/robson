@@ -21,8 +21,8 @@ persisted; the dashboard MONTHLY LIMIT card renders model-aware copy. Step 4
 is an operator action documented in
 [`docs/runbooks/activate-net-from-start-budget.md`](../runbooks/activate-net-from-start-budget.md)
 (one guarded `UPDATE monthly_state`, no restart). The remaining §5.4
-blockers are **not** waived by this update: see "Activation exceptions",
-which the operator must approve before the runbook may proceed. Trigger:
+blockers are covered by "Activation exceptions", approved by the operator
+on 2026-10-21 for activation at the 2026-11-01 boundary. Trigger:
 2026-10-15, a net +83.50 USDT October with an empty book showed 2 slots under
 `hwm_v1`, the August scenario again.
 **Deciders**: RBX Systems (operator + architecture, with adversarial design
@@ -325,13 +325,18 @@ limit."
   before the −4% floor binds. Per operator decision, protecting profit is
   the job of each position's trailing stop, not of the monthly budget.
 
-## Activation exceptions (proposed 2026-10-15 — PENDING OPERATOR APPROVAL)
+## Activation exceptions (proposed 2026-10-15 — APPROVED by the operator 2026-10-21, activation at the 2026-11-01 UTC month boundary)
 
 §5.4 names blockers that are still open. Activation in October 2026 is
 possible only if the operator explicitly accepts the following bounded
-exceptions. Approval is recorded by replacing "PENDING OPERATOR APPROVAL"
-with the approval date in this heading and in the Status line; until then
-`docs/runbooks/activate-net-from-start-budget.md` step 0 stops.
+exceptions. The operator approved them on 2026-10-21 with one condition:
+the switch is not applied to the running October month (which on that day
+sat at 82% of its HWM give-back after four stop-outs; changing the model
+mid-measurement would have unlocked budget retroactively). Activation is
+scheduled for the **2026-11-01 UTC month boundary**: the November row is
+switched once it exists, October stays `hwm_v1` in history, and
+`docs/runbooks/activate-net-from-start-budget.md` ("Scheduled activation")
+is the procedure.
 
 | Open requirement | Exception accepted | Bound / mitigation |
 | --- | --- | --- |

@@ -49,7 +49,7 @@ jobs:
           exit 1
 
       - name: Run osv-scanner
-        run: ./osv-scanner scan source --lockfile Cargo.lock
+        run: ./osv-scanner scan source --lockfile Cargo.lock --lockfile scripts/requirements-security.txt
 
   cargo-audit:
     name: Cargo Audit

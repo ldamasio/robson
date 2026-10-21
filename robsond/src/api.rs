@@ -388,6 +388,14 @@ impl Default for ArmEntryPolicyRequest {
     }
 }
 
+/// Request for an entry preview (same shape as the arm request's identity
+/// fields; the policy is always immediate for a preview).
+#[derive(Debug, Deserialize)]
+pub struct PreviewEntryRequest {
+    pub symbol: String,
+    pub side: String,
+}
+
 /// Request to arm a new position.
 ///
 /// Note: risk per trade is fixed at 1% by v3 policy. Not configurable via API.
@@ -679,6 +687,9 @@ where
         // Durable event bootstrap for the operator dashboard.
         .route("/events/history", get(event_history_handler))
         .route("/positions", post(arm_handler))
+        // Dry run of an immediate arm: analysis, sizing and the rejection the
+        // real arm would hit, with nothing persisted.
+        .route("/entry/preview", post(preview_entry_handler::<E, S>))
         .route("/positions/:id", delete(cancel_or_close_handler))
         .route("/positions/:id/signal", post(signal_handler))
         .route("/queries/:id/approve", post(approve_query_handler))
@@ -2390,6 +2401,104 @@ fn exchange_sync_state(
     }
 }
 
+async fn preview_entry_handler<E, S>(
+    State(state): State<Arc<ApiState<E, S>>>,
+    Json(req): Json<PreviewEntryRequest>,
+) -> Result<Json<crate::position_manager::EntryPreview>, (StatusCode, Json<ErrorResponse>)>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    let symbol = Symbol::from_pair(&req.symbol).map_err(|e| {
+        (
+            StatusCode::BAD_REQUEST,
+            Json(ErrorResponse { error: format!("Invalid symbol: {}", e) }),
+        )
+    })?;
+    let side = match req.side.to_uppercase().as_str() {
+        "LONG" | "BUY" => Side::Long,
+        "SHORT" | "SELL" => Side::Short,
+        _ => {
+            return Err((
+                StatusCode::BAD_REQUEST,
+                Json(ErrorResponse {
+                    error: format!("Invalid side: {}. Expected: LONG or SHORT", req.side),
+                }),
+            ));
+        },
+    };
+    // Request budget across all inputs: a preview costs two candle fetches,
+    // a balance read and possibly an exchangeInfo call, and alternating
+    // symbols must not turn the endpoint into an exchange-call amplifier.
+    // Human operator pace fits easily; beyond it the caller gets 429.
+    if !preview_budget_allows() {
+        return Err((
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse {
+                error: format!(
+                    "Entry preview budget exhausted: at most {PREVIEW_BUDGET_MAX} per {}s",
+                    PREVIEW_BUDGET_WINDOW.as_secs()
+                ),
+            }),
+        ));
+    }
+    // One preview at a time per daemon: the real arm serializes through the
+    // manager write lock. Overlapping callers get 429 instead of queueing
+    // exchange requests.
+    let _permit = PREVIEW_GATE.try_acquire().map_err(|_| {
+        (
+            StatusCode::TOO_MANY_REQUESTS,
+            Json(ErrorResponse {
+                error: "An entry preview is already running; retry in a moment".to_string(),
+            }),
+        )
+    })?;
+    // Hold the manager lock only to capture the inputs; the exchange and
+    // candle I/O runs after it is released so a slow exchange cannot delay
+    // arm, close or panic handlers waiting for `write()`.
+    let job = {
+        let manager = state.position_manager.read().await;
+        manager.prepare_entry_preview(symbol, side).await.map_err(to_error_response)?
+    };
+    match tokio::time::timeout(PREVIEW_TIMEOUT, job.run()).await {
+        Ok(preview) => Ok(Json(preview.map_err(to_error_response)?)),
+        Err(_elapsed) => Err((
+            StatusCode::GATEWAY_TIMEOUT,
+            Json(ErrorResponse {
+                error: format!(
+                    "Entry preview timed out after {}s waiting for the exchange",
+                    PREVIEW_TIMEOUT.as_secs()
+                ),
+            }),
+        )),
+    }
+}
+
+/// Serializes `POST /entry/preview` (single operator, single daemon).
+static PREVIEW_GATE: tokio::sync::Semaphore = tokio::sync::Semaphore::const_new(1);
+/// Upper bound for the exchange/candle I/O of one preview.
+const PREVIEW_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+/// Sliding-window request budget for previews, across every symbol/side.
+/// No memoisation: every served preview reloads capital and candles, so a
+/// REFRESH after a recalibration or a month rollover is always current.
+const PREVIEW_BUDGET_MAX: usize = 6;
+const PREVIEW_BUDGET_WINDOW: std::time::Duration = std::time::Duration::from_secs(60);
+static PREVIEW_HISTORY: std::sync::Mutex<Vec<Instant>> = std::sync::Mutex::new(Vec::new());
+
+/// Admit one preview into the budget (recording it) or refuse it.
+fn preview_budget_allows() -> bool {
+    let Ok(mut history) = PREVIEW_HISTORY.lock() else {
+        return false;
+    };
+    let now = Instant::now();
+    history.retain(|at| now.duration_since(*at) < PREVIEW_BUDGET_WINDOW);
+    if history.len() >= PREVIEW_BUDGET_MAX {
+        return false;
+    }
+    history.push(now);
+    true
+}
+
 fn position_to_summary(
     position: &Position,
     live_price: Option<Price>,
@@ -2755,6 +2864,19 @@ fn month_start(year: i32, month: u32) -> chrono::DateTime<chrono::Utc> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn preview_budget_admits_at_most_max_per_window() {
+        // Process-wide state: drain whatever earlier tests left behind by
+        // consuming until refused, then assert the refusal is sticky within
+        // the window.
+        let mut admitted = 0usize;
+        while super::preview_budget_allows() {
+            admitted += 1;
+            assert!(admitted <= super::PREVIEW_BUDGET_MAX, "budget must be bounded");
+        }
+        assert!(!super::preview_budget_allows());
+    }
+
     use std::sync::{
         atomic::{AtomicUsize, Ordering},
         Arc,
