@@ -1,0 +1,10 @@
+schema: spec-driven
+context: |
+  Robson's canonical instructions are in AGENTS.md; follow them and the referenced
+  RBX engineering guardrails. Repository content is English. ADR-0055 owns the
+  product-session architecture; OpenSpec describes pending implementation work.
+  Keep repository-verified implementation separate from targets and operational
+  acceptance. Work is local only: no deployment, shared migrations, database
+  provisioning, real trading, or changes to IdP configuration are authorized here.
+  Infrastructure supplies isolated database and identity test environments.
+  Do not copy proprietary RBX Identity code into this public repository.
