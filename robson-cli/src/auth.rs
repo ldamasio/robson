@@ -349,6 +349,10 @@ pub async fn current_id_token() -> Result<String> {
 mod tests {
     use super::*;
 
+    // XDG_CONFIG_HOME is process-wide. Hold this lock until the original
+    // value is restored in every test that changes the credentials path.
+    static CREDENTIALS_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn make_id_token(payload_json: &str) -> String {
         use base64::Engine;
         let header =
@@ -374,11 +378,7 @@ mod tests {
 
     #[test]
     fn credentials_path_prefers_xdg_config_home() {
-        // SAFETY: single-threaded test, no other test mutates these vars
-        // concurrently within this process invocation of this test binary
-        // section (cargo test runs each test in its own thread, so this
-        // could race with other env-mutating tests; kept narrowly scoped
-        // and immediately restored to minimize the window).
+        let _env_guard = CREDENTIALS_ENV_LOCK.lock().unwrap();
         let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
         std::env::set_var("XDG_CONFIG_HOME", "/tmp/robson-cli-test-xdg");
         let path = credentials_path().unwrap();
@@ -394,8 +394,7 @@ mod tests {
     fn load_credentials_tightens_overly_permissive_file() {
         use std::os::unix::fs::PermissionsExt;
 
-        // SAFETY: see `credentials_path_prefers_xdg_config_home` above —
-        // same narrowly-scoped env mutation, immediately restored.
+        let _env_guard = CREDENTIALS_ENV_LOCK.lock().unwrap();
         let prev_xdg = std::env::var_os("XDG_CONFIG_HOME");
         let dir =
             std::env::temp_dir().join(format!("robson-cli-test-perms-{}", std::process::id()));
