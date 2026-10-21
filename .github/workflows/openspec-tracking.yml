@@ -1,0 +1,58 @@
+name: OpenSpec tracking
+
+on:
+  pull_request:
+    paths:
+      - 'openspec/**'
+      - 'scripts/openspec_github.py'
+      - 'scripts/tests/test_openspec_github.py'
+      - 'scripts/requirements-security.txt'
+      - '.github/workflows/openspec-tracking.yml'
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: openspec-tracking-${{ github.event_name == 'pull_request' && github.event.pull_request.number || 'publication' }}
+  cancel-in-progress: false
+
+jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Verify projection and publication boundaries
+        run: python3 -B -m unittest discover -s scripts/tests -v
+      - name: Security lint with pinned tooling
+        run: |
+          python3.12 -m venv "$RUNNER_TEMP/openspec-security"
+          "$RUNNER_TEMP/openspec-security/bin/pip" install --require-hashes -r scripts/requirements-security.txt
+          "$RUNNER_TEMP/openspec-security/bin/bandit" -q scripts/openspec_github.py
+      - name: Preview progress without GitHub writes
+        env:
+          SOURCE_SHA: ${{ github.sha }}
+        run: python3 -B scripts/openspec_github.py --source-sha "$SOURCE_SHA" >> "$GITHUB_STEP_SUMMARY"
+
+  publish:
+    if: github.repository == 'ldamasio/robson' && github.ref == 'refs/heads/main' && (github.event_name == 'push' || github.event_name == 'workflow_dispatch')
+    needs: validate
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4
+        with:
+          persist-credentials: false
+      - name: Refresh the existing progress report
+        env:
+          GH_TOKEN: ${{ github.token }}
+          SOURCE_SHA: ${{ github.sha }}
+        run: python3 -B scripts/openspec_github.py --source-sha "$SOURCE_SHA" --publish
