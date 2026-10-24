@@ -121,6 +121,19 @@ export type StatusResponse = {
   month_peak_net: number | null;
   monthly_giveback_pct: number | null;
   monthly_budget_remaining: number | null;
+  // Model-aware budget fields (ADR-0051). `monthly_budget_model` names the
+  // persisted accounting model ("hwm_v1" or
+  // "net_from_start_non_expanding_v1"); `monthly_budget_utilization_pct` is
+  // the share of the 4% budget consumed under whichever model is active, in
+  // percent of the budget (0-100). Under net-from-start the HWM fields above
+  // come back null and the net/reserved pair below explains the gauge.
+  // Null when talking to an older backend.
+  monthly_budget_model: string | null;
+  monthly_budget_utilization_pct: number | null;
+  month_governed_realized_net: number | null;
+  monthly_net_loss_consumed: number | null;
+  monthly_open_risk_reserved: number | null;
+  monthly_budget_amount: number | null;
   // Exchange income rows (ADR-0045) the ledger could not match to a governed
   // position and the operator has not acknowledged. While > 0 the automatic
   // capital_base recalibration from confirmed transfers stays blocked.
@@ -481,6 +494,18 @@ function normalizeStatus(raw: StatusResponse): StatusResponse {
     month_peak_net: toNumber(raw.month_peak_net),
     monthly_giveback_pct: toNumber(raw.monthly_giveback_pct),
     monthly_budget_remaining: toNumber(raw.monthly_budget_remaining),
+    monthly_budget_model:
+      typeof raw.monthly_budget_model === "string" &&
+      raw.monthly_budget_model !== ""
+        ? raw.monthly_budget_model
+        : null,
+    monthly_budget_utilization_pct: toNumber(
+      raw.monthly_budget_utilization_pct,
+    ),
+    month_governed_realized_net: toNumber(raw.month_governed_realized_net),
+    monthly_net_loss_consumed: toNumber(raw.monthly_net_loss_consumed),
+    monthly_open_risk_reserved: toNumber(raw.monthly_open_risk_reserved),
+    monthly_budget_amount: toNumber(raw.monthly_budget_amount),
     unmatched_income_count: Number(raw.unmatched_income_count ?? 0),
   };
 }

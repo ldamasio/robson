@@ -1,5 +1,6 @@
 import { describe, it, expect } from "vitest";
 import {
+  budgetModelKind,
   deriveBudgetView,
   MONTHLY_BUDGET_LIMIT_PCT,
 } from "$lib/presentation/budget";
@@ -23,6 +24,12 @@ function makeStatus(overrides: Partial<StatusResponse> = {}): StatusResponse {
     month_peak_net: null,
     monthly_giveback_pct: null,
     monthly_budget_remaining: null,
+    monthly_budget_model: null,
+    monthly_budget_utilization_pct: null,
+    month_governed_realized_net: null,
+    monthly_net_loss_consumed: null,
+    monthly_open_risk_reserved: null,
+    monthly_budget_amount: null,
     ...overrides,
   };
 }
@@ -43,7 +50,95 @@ const PROD_2026_07_31 = makeStatus({
   monthly_budget_remaining: 3.5202358948,
 });
 
+/**
+ * Production `/status` on 2026-10-15 02:40 UTC, right after a +37.5 USDT
+ * insurance-stop close left the book empty: the month was net +83.50 with
+ * no open risk, yet the persisted `hwm_v1` model charged the 17.92 give-back
+ * from the intra-trade equity peak and showed 2 slots. The same payload under
+ * `net_from_start_non_expanding_v1` is what ADR-0051 activation produces.
+ */
+const PROD_2026_10_15_HWM = makeStatus({
+  new_slots_available: 2,
+  slot_cells_total: 2,
+  monthly_realized_loss: 33.9722871,
+  monthly_realized_loss_pct: 1.9857441479818966,
+  capital_base: 1710.80887407,
+  wallet_balance: 1796.92471682,
+  month_equity_net: 83.49757967,
+  month_peak_net: 101.41972607,
+  monthly_giveback_pct: 26.18958007472127,
+  monthly_budget_remaining: 50.5102085628,
+  monthly_budget_model: "hwm_v1",
+  monthly_budget_utilization_pct: 26.18958007472127,
+  month_governed_realized_net: 83.49757967,
+  monthly_net_loss_consumed: 0,
+  monthly_open_risk_reserved: 0,
+  monthly_budget_amount: 68.4323549628,
+});
+
+const PROD_2026_10_15_NFS = makeStatus({
+  ...PROD_2026_10_15_HWM,
+  new_slots_available: 4,
+  slot_cells_total: 4,
+  month_peak_net: null,
+  monthly_giveback_pct: null,
+  monthly_budget_remaining: 68.4323549628,
+  monthly_budget_model: "net_from_start_non_expanding_v1",
+  monthly_budget_utilization_pct: 0,
+});
+
+describe("budgetModelKind", () => {
+  it("names the persisted model and falls back by field presence", () => {
+    expect(budgetModelKind(PROD_2026_10_15_HWM)).toBe("hwm");
+    expect(budgetModelKind(PROD_2026_10_15_NFS)).toBe("net_from_start");
+    expect(budgetModelKind(makeStatus())).toBe("legacy");
+    expect(budgetModelKind(null)).toBe("legacy");
+    // A backend that reports the model but no utilization yet.
+    expect(
+      budgetModelKind(
+        makeStatus({ monthly_budget_model: "hwm_v1", monthly_giveback_pct: 3 }),
+      ),
+    ).toBe("hwm");
+  });
+});
+
 describe("deriveBudgetView", () => {
+  it("reads the active model's utilization: HWM charges the give-back from peak", () => {
+    const view = deriveBudgetView(PROD_2026_10_15_HWM, false);
+
+    expect(view.model).toBe("hwm");
+    expect(view.usedPct).toBeCloseTo(26.19, 2);
+    // 1.05% of capital against the 4% limit, the "1.0% of a 4.0% limit" the
+    // operator questioned on a net-positive month.
+    expect(view.drawdownPct).toBeCloseTo(1.0476, 3);
+  });
+
+  it("reads the active model's utilization: net-from-start shows a clean gauge on a net-positive month", () => {
+    const view = deriveBudgetView(PROD_2026_10_15_NFS, false);
+
+    expect(view.model).toBe("net_from_start");
+    expect(view.usedPct).toBe(0);
+    expect(view.drawdownPct).toBe(0);
+    expect(view.exhausted).toBe(false);
+    expect(view.low).toBe(false);
+  });
+
+  it("never falls back to the gross-loss formula once utilization is reported", () => {
+    // Without utilization the legacy fallback would read 33.97 of gross loss
+    // as 49.6% of the budget on a month that is net +83.50.
+    const legacyLooking = makeStatus({
+      ...PROD_2026_10_15_NFS,
+      monthly_budget_model: null,
+      monthly_budget_utilization_pct: null,
+    });
+    expect(deriveBudgetView(legacyLooking, false).usedPct).toBeCloseTo(
+      49.64,
+      1,
+    );
+    expect(deriveBudgetView(PROD_2026_10_15_NFS, false).usedPct).toBe(0);
+  });
+
+
   it("treats monthly_giveback_pct as a share of the budget, not of capital", () => {
     const view = deriveBudgetView(PROD_2026_07_31, true);
 

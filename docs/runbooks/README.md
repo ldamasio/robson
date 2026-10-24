@@ -95,6 +95,7 @@ If something goes wrong:
 | Scenario | Runbook | Time |
 |----------|---------|------|
 | Temporary shutdown for manual Binance operation | [robsond-temporary-shutdown-manual-op.md](robsond-temporary-shutdown-manual-op.md) | 5–15 min |
+| Activate the net-from-start monthly budget (ADR-0051) | [activate-net-from-start-budget.md](activate-net-from-start-budget.md) | 10 min |
 
 ### Deployment
 
