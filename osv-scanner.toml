@@ -16,3 +16,11 @@ reason = "protobuf 2.x (recursion crash in parsing): fix requires protobuf 3.x, 
 [[IgnoredVulns]]
 id = "RUSTSEC-2026-0235"
 reason = "rkyv 0.7 (validation bypass): fix is rkyv 0.8.17, a semver-major only consumable when rust_decimal updates its optional dependency edge (still 0.7 as of rust_decimal 1.42). rkyv is an unenabled optional feature of rust_decimal — it is never compiled into any robson binary (cargo tree -i rkyv is empty on every target). Re-evaluate on rust_decimal releases. (2026-08-04)"
+
+[[IgnoredVulns]]
+id = "RUSTSEC-2026-0387"
+reason = "crypto-bigint 0.5.5 (timing variability in constant-time ops): fix is 0.7.6, a semver-major reachable only when jsonwebtoken moves from p256 0.13 / elliptic-curve 0.13 to the 0.14 RustCrypto line. Inclusion path: jsonwebtoken rust_crypto -> p256 -> elliptic-curve -> crypto-bigint, i.e. ES256 support that robsond never exercises: the verifier is pinned to Algorithm::RS256 (robsond/src/auth.rs) for Google ID tokens built from the public JWKS. The advisory concerns secret-dependent arithmetic (private keys, signing, inversion of secrets); robsond holds no private key and performs no ECDSA operation at all. Re-evaluate when jsonwebtoken updates its p256/elliptic-curve edge. (2026-10-28)"
+
+[[IgnoredVulns]]
+id = "GHSA-qwgh-2vcv-g2f7"
+reason = "block-buffer 0.10.4 (caught panic inside a digest compress callback leaves the inline cursor corrupted, enabling OOB access afterwards): fix is 0.12.1, reachable only through digest/sha2 0.11, a semver-major across the RustCrypto tree pulled by sqlx, reqwest/rustls and jsonwebtoken. Precondition: catching a panic raised from within a hash compress callback and then reusing the same buffer. robsond never wraps hashing in catch_unwind; a panic there propagates and the task/process ends (panic = abort for the daemon's purposes), so the corrupted-buffer state is never observed. Re-evaluate when the dependency tree moves to digest 0.11. No RUSTSEC id yet, hence absent from .cargo/audit.toml. (2026-10-28)"
