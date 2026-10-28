@@ -6,4 +6,6 @@ ignore = [
   "RUSTSEC-2023-0071", # rsa Marvin: no fix; via optional sqlx-mysql, never compiled (postgres only). 2026-07-05
   "RUSTSEC-2024-0437", # protobuf 2.x: fix is semver-major, blocked on prometheus. /metrics is cluster-internal. 2026-07-05
   "RUSTSEC-2026-0235", # rkyv 0.7: fix is 0.8 semver-major, blocked on rust_decimal optional edge; never compiled (feature unenabled). 2026-08-04
+  "RUSTSEC-2026-0387", # crypto-bigint 0.5: fix is 0.7.6 semver-major, blocked on jsonwebtoken's p256/elliptic-curve 0.13 edge; ES256 path never used (RS256 only, no private keys). 2026-10-28
+  # GHSA-qwgh-2vcv-g2f7 (block-buffer 0.10) has no RUSTSEC id yet; documented in osv-scanner.toml only. 2026-10-28
 ]
