@@ -97,6 +97,10 @@ curl -s http://localhost:18080/status | jq '.active_positions, .positions'
 Then query the projection:
 
 ```bash
+# NOTE (2026-10-28): the production ParadeDB is external to the cluster and
+# there is no `robson-paradedb` pod. Use the `robson_psql` helper defined in
+# activate-net-from-start-budget.md (disposable pod with the daemon's secret)
+# instead of the `kubectl exec` below, which is kept for historical context.
 PARADEDB_POD=$(kubectl get pod -n robson -l app.kubernetes.io/name=robson-paradedb -o jsonpath='{.items[0].metadata.name}')
 kubectl exec -n robson "$PARADEDB_POD" -- psql -U robson -d robson -c \
   "SELECT position_id, symbol, side, state FROM positions_current WHERE state IN ('armed', 'entering', 'active', 'exiting') ORDER BY updated_at DESC;"

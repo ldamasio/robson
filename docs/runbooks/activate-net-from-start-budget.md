@@ -36,6 +36,39 @@ protected by the monthly mechanism. With `governed_realized_net = +83.50` and
 
 - `kubectl` with the production kubeconfig (`KUBECONFIG=~/.kube/config-rbx`)
   and access to the `robson` namespace.
+- A way to run SQL against the production ParadeDB **without taking the
+  credential out of the cluster**. The database is external to the cluster
+  (reached through the `paradedb` Service in `robson`; there is no
+  `robson-paradedb` pod), so every `robson_psql` call below runs a
+  disposable pod with the same image and secret the
+  `robsond-db-retention` CronJob uses, executes one statement, and is
+  deleted on exit. Define it once in the operator shell:
+
+  ```bash
+  export KUBECONFIG=~/.kube/config-rbx
+  robson_psql() {
+    local sql="$1"
+    kubectl run "robson-psql-$(date +%s)" --rm -i --restart=Never -n robson \
+      --image=postgres:16-alpine \
+      --labels="app.kubernetes.io/name=robsond,app.kubernetes.io/component=db-retention" \
+      --overrides="$(python3 - "$sql" <<'PY'
+  import json, sys
+  sql = sys.argv[1]
+  print(json.dumps({"apiVersion": "v1", "spec": {
+    "securityContext": {"runAsNonRoot": True, "runAsUser": 70},
+    "containers": [{"name": "psql", "image": "postgres:16-alpine",
+      "command": ["sh", "-c", "psql \"$DATABASE_URL\" -v ON_ERROR_STOP=1 -P pager=off -c \"$SQL\""],
+      "env": [{"name": "DATABASE_URL", "valueFrom": {"secretKeyRef": {"name": "robsond-secret", "key": "database-url"}}},
+              {"name": "SQL", "value": sql}],
+      "resources": {"requests": {"cpu": "50m", "memory": "64Mi"}, "limits": {"cpu": "250m", "memory": "128Mi"}}}]}}))
+  PY
+  )"
+  }
+  ```
+
+  The pod usually finishes before `kubectl` attaches; the "falling back to
+  streaming logs" warning is harmless and the result follows it. Write
+  statements (the `UPDATE` in the Procedure) go through the same helper.
 - Daemon image and frontend at or after the release that made `/status` and
   the MONTHLY LIMIT card model-aware (`monthly_budget_utilization_pct`,
   HWM fields withheld under net-from-start) and that enforces the
@@ -73,9 +106,7 @@ Run from a shell with the production kubeconfig.
    healthy while arming stays rejected until the month rollover.
 
    ```bash
-   PARADEDB_POD=$(kubectl get pod -n robson -l app.kubernetes.io/name=robson-paradedb -o jsonpath='{.items[0].metadata.name}')
-   kubectl exec -n robson "$PARADEDB_POD" -- psql -U robson -d robson -c \
-     "SELECT position_id, symbol, side, state FROM positions_current WHERE state IN ('armed', 'entering', 'active', 'exiting') ORDER BY updated_at DESC;"
+   robson_psql "SELECT position_id, symbol, side, state FROM positions_current WHERE state IN ('armed', 'entering', 'active', 'exiting') ORDER BY updated_at DESC;"
    ```
 
    Expected: zero rows. Also confirm on Binance that the USDⓈ-M account has
@@ -87,10 +118,8 @@ Run from a shell with the production kubeconfig.
    fails, so it is necessary but not sufficient. Check the ledger directly:
 
    ```bash
-   kubectl exec -n robson "$PARADEDB_POD" -- psql -U robson -d robson -c \
-     "SELECT COUNT(*) AS unmatched_any_age FROM income_ledger WHERE matched_at IS NULL AND acked_at IS NULL;"
-   kubectl exec -n robson "$PARADEDB_POD" -- psql -U robson -d robson -c \
-     "SELECT income_type, COUNT(*) FILTER (WHERE matched_at IS NULL AND acked_at IS NULL) AS unmatched, COUNT(*) FILTER (WHERE acked_at IS NOT NULL) AS acked, SUM(amount) AS amount FROM income_ledger WHERE income_time >= date_trunc('month', now() AT TIME ZONE 'UTC') AND income_type <> 'TRANSFER' AND (income_type = 'FUNDING_FEE' OR acked_at IS NOT NULL OR matched_at IS NULL) GROUP BY 1 ORDER BY 1;"
+   robson_psql "SELECT COUNT(*) AS unmatched_any_age FROM income_ledger WHERE matched_at IS NULL AND acked_at IS NULL;"
+   robson_psql "SELECT income_type, COUNT(*) FILTER (WHERE matched_at IS NULL AND acked_at IS NULL) AS unmatched, COUNT(*) FILTER (WHERE acked_at IS NOT NULL) AS acked, SUM(amount) AS amount FROM income_ledger WHERE income_time >= date_trunc('month', now() AT TIME ZONE 'UTC') AND income_type <> 'TRANSFER' AND (income_type = 'FUNDING_FEE' OR acked_at IS NOT NULL OR matched_at IS NULL) GROUP BY 1 ORDER BY 1;"
    curl -s https://api.robson.rbx.ia.br/metrics | grep -E 'robsond_reconciliation_(last_completed_timestamp_seconds|scans_total)'
    ```
 
@@ -110,8 +139,7 @@ Run from a shell with the production kubeconfig.
    freshness. Check the ledger against the exchange directly:
 
    ```bash
-   kubectl exec -n robson "$PARADEDB_POD" -- psql -U robson -d robson -c \
-     "SELECT MAX(income_time) AS newest_income, MAX(created_at) AS newest_ingest, COUNT(*) FILTER (WHERE income_time >= date_trunc('month', now() AT TIME ZONE 'UTC')) AS rows_this_month FROM income_ledger;"
+   robson_psql "SELECT MAX(income_time) AS newest_income, MAX(created_at) AS newest_ingest, COUNT(*) FILTER (WHERE income_time >= date_trunc('month', now() AT TIME ZONE 'UTC')) AS rows_this_month FROM income_ledger;"
    kubectl logs -n robson deploy/robsond --since=30m | grep -iE "income (poll|ledger).*(error|fail)" | tail -5
    ```
 
@@ -127,8 +155,7 @@ Run from a shell with the production kubeconfig.
 
    ```bash
    curl -s https://api.robson.rbx.ia.br/status | jq '{month_governed_realized_net, monthly_net_loss_consumed, monthly_budget_amount, monthly_budget_remaining, new_slots_available}'
-   kubectl exec -n robson "$PARADEDB_POD" -- psql -U robson -d robson -c \
-     "SELECT COUNT(*) AS closes, SUM(realized_pnl) AS pnl, SUM(total_fees) AS fees, SUM(realized_pnl - total_fees) AS net FROM positions_current WHERE state = 'closed' AND closed_at >= date_trunc('month', now() AT TIME ZONE 'UTC');"
+   robson_psql "SELECT COUNT(*) AS closes, SUM(realized_pnl) AS pnl, SUM(total_fees) AS fees, SUM(realized_pnl - total_fees) AS net FROM positions_current WHERE state = 'closed' AND closed_at >= date_trunc('month', now() AT TIME ZONE 'UTC');"
    ```
 
    Expected: `net` equals `month_governed_realized_net` within rounding.
@@ -165,8 +192,7 @@ Run from a shell with the production kubeconfig.
 1. Read the current row and keep the output (it is the rollback evidence):
 
    ```bash
-   kubectl exec -n robson "$PARADEDB_POD" -- psql -U robson -d robson -c \
-     "SELECT year, month, capital_base, realized_loss, month_peak_net, trades_opened, monthly_budget_model, boundary_reset_at FROM monthly_state ORDER BY year DESC, month DESC LIMIT 3;"
+   robson_psql "SELECT year, month, capital_base, realized_loss, month_peak_net, trades_opened, monthly_budget_model, boundary_reset_at FROM monthly_state ORDER BY year DESC, month DESC LIMIT 3;"
    ```
 
 2. Switch the **target** month only, named explicitly (never `now()`, so a
@@ -176,8 +202,7 @@ Run from a shell with the production kubeconfig.
 
    ```bash
    TARGET_YEAR=2026 TARGET_MONTH=11
-   kubectl exec -n robson "$PARADEDB_POD" -- psql -U robson -d robson -c \
-     "UPDATE monthly_state SET monthly_budget_model = 'net_from_start_non_expanding_v1' WHERE year = ${TARGET_YEAR} AND month = ${TARGET_MONTH} AND monthly_budget_model = 'hwm_v1' RETURNING year, month, capital_base, monthly_budget_model;"
+   robson_psql "UPDATE monthly_state SET monthly_budget_model = 'net_from_start_non_expanding_v1' WHERE year = ${TARGET_YEAR} AND month = ${TARGET_MONTH} AND monthly_budget_model = 'hwm_v1' RETURNING year, month, capital_base, monthly_budget_model;"
    ```
 
    Expected: `UPDATE 1` with the current `year, month`. `UPDATE 0` means the
@@ -203,6 +228,12 @@ Checklist, in order:
 - [ ] Before 2026-10-31 24:00 UTC: this PR's daemon and frontend deployed
   (Prerequisites check passes); the 4 unmatched income items acknowledged;
   no intra-month deposit planned for November (#242).
+- [ ] Capital movements before the boundary: a withdrawal (futures → spot)
+  planned for late October should happen with the book flat, after the
+  income acknowledgements, so the boundary snapshot (`capital_base =
+  wallet − carried risk`) already reflects the reduced wallet; governed
+  performance is unaffected either way (transfers are out-of-band by
+  ADR-0045). Avoid deposits between the boundary and the switch.
 - [ ] Do not carry a position across the boundary. If one is open at
   23:00 UTC on 10-31, either let it run and activate on the first flat
   moment of November, or close it; a carried position makes the boundary
@@ -212,8 +243,7 @@ Checklist, in order:
   it inherited:
 
   ```bash
-  kubectl exec -n robson "$PARADEDB_POD" -- psql -U robson -d robson -c \
-    "SELECT year, month, capital_base, monthly_budget_model, boundary_reset_at FROM monthly_state WHERE (year, month) IN ((2026, 10), (2026, 11)) ORDER BY year, month;"
+  robson_psql "SELECT year, month, capital_base, monthly_budget_model, boundary_reset_at FROM monthly_state WHERE (year, month) IN ((2026, 10), (2026, 11)) ORDER BY year, month;"
   curl -s https://api.robson.rbx.ia.br/status | jq '{capital_base, monthly_budget_model, new_slots_available, monthly_budget_remaining}'
   ```
 
@@ -272,8 +302,7 @@ after a loss, for the reason recorded in the ADR.
 Inverse statement, same guard, no restart:
 
 ```bash
-kubectl exec -n robson "$PARADEDB_POD" -- psql -U robson -d robson -c \
-  "UPDATE monthly_state SET monthly_budget_model = 'hwm_v1' WHERE year = EXTRACT(YEAR FROM now() AT TIME ZONE 'UTC')::smallint AND month = EXTRACT(MONTH FROM now() AT TIME ZONE 'UTC')::smallint AND monthly_budget_model = 'net_from_start_non_expanding_v1' RETURNING year, month, monthly_budget_model;"
+robson_psql "UPDATE monthly_state SET monthly_budget_model = 'hwm_v1' WHERE year = EXTRACT(YEAR FROM now() AT TIME ZONE 'UTC')::smallint AND month = EXTRACT(MONTH FROM now() AT TIME ZONE 'UTC')::smallint AND monthly_budget_model = 'net_from_start_non_expanding_v1' RETURNING year, month, monthly_budget_model;"
 ```
 
 `month_peak_net` keeps being refreshed under both models (the peak upsert is
