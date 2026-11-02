@@ -45,7 +45,7 @@ Index
 | ADR-0046 | Monthly High-Water-Mark Budget (Trailing Month) | Superseded by ADR-0051 | 2026-07-05 |
 | ADR-0047 | FE ↔ robsond Communication Topology (Option A, No Change) | Decided | 2026-07-06 |
 | ADR-0048 | A Triggered Insurance Stop Is Not a Cancellation | Decided (Deployed sha-d5803c47; not yet exercised against the live exchange) | 2026-07-31 |
-| ADR-0051 | Net-From-Start, Non-Expanding Monthly Budget | Decided (Follow-up required; implementation and operational rollout pending) | 2026-08-04 |
+| ADR-0051 | Net-From-Start, Non-Expanding Monthly Budget | Decided (Active in production since 2026-11-02 on the 2026-11 row; §5.5 cleanup and settlement completeness pending) | 2026-08-04 |
 | ADR-0052 | Executable Span: One Stop Policy, Buffer-Inclusive Unit of Risk | Decided (repository-implemented; rbx-infra manifest validation and operator arming-quiescence pending; operational rollout pending) | 2026-08-04 |
 | ADR-0053 | Adverse-Extreme Cluster Representative for the Technical Stop | Proposed (implementation PR open; operator review pending) | 2026-08-13 |
 
