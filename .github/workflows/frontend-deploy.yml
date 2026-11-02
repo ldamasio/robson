@@ -14,7 +14,16 @@ on:
         type: string
 
 jobs:
+  # Gate: the same type check, unit tests and build that frontend-tests.yml
+  # runs on branches and PRs. Before this job existed the image build and
+  # the rbx-infra pin bump ran on every push to main regardless of the
+  # test workflow's outcome (two independent workflows, no `needs`), so a
+  # red frontend could still reach production.
+  tests:
+    uses: ./.github/workflows/frontend-tests.yml
+
   build-and-push:
+    needs: tests
     runs-on: ubuntu-latest
     permissions:
       contents: read

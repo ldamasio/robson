@@ -11,6 +11,10 @@ on:
     paths:
       - "frontend/**"
       - ".github/workflows/frontend-tests.yml"
+  # Reusable: frontend-deploy.yml runs this same job before building the
+  # production image, so a push to main with a failing check, test or build
+  # cannot publish an image or bump the rbx-infra pin.
+  workflow_call:
 
 jobs:
   tests:

@@ -225,21 +225,29 @@ the switch runs **after** the row exists, with an explicit `month = 11`.
 
 Checklist, in order:
 
-- [ ] Before 2026-10-31 24:00 UTC: this PR's daemon and frontend deployed
-  (Prerequisites check passes); the 4 unmatched income items acknowledged;
-  no intra-month deposit planned for November (#242).
-- [ ] Capital movements before the boundary: a withdrawal (futures → spot)
+- [x] Before 2026-10-31 24:00 UTC: this PR's daemon and frontend deployed
+  (Prerequisites check passes; deployed 2026-10-24); no intra-month deposit
+  planned for November (#242).
+- [x] ~~Before the boundary:~~ the 4 unmatched income items acknowledged.
+  **Deviation:** done on 2026-11-02 00:04 UTC, after the boundary and before
+  the switch (the first `robson-cli auth login` failed on a client-secret
+  bug, fixed the same day). Harmless for the boundary snapshot, which does
+  not read unmatched items; still required before the switch (Precondition
+  2), and it was.
+- [x] Capital movements before the boundary: none happened (the withdrawal
+  considered in October was dropped; the wallet was 1805.82071304 on both
+  sides of the boundary). The original guidance stands: a withdrawal (futures → spot)
   planned for late October should happen with the book flat, after the
   income acknowledgements, so the boundary snapshot (`capital_base =
   wallet − carried risk`) already reflects the reduced wallet; governed
   performance is unaffected either way (transfers are out-of-band by
   ADR-0045). Avoid deposits between the boundary and the switch.
-- [ ] Do not carry a position across the boundary. If one is open at
+- [x] Do not carry a position across the boundary. If one is open at
   23:00 UTC on 10-31, either let it run and activate on the first flat
   moment of November, or close it; a carried position makes the boundary
   snapshot absorb its downside (ADR-0051 §3) and the preconditions fail
   until it settles.
-- [ ] After 00:05 UTC on 11-01: confirm the November row exists and what
+- [x] After 00:05 UTC on 11-01: confirm the November row exists and what
   it inherited:
 
   ```bash
@@ -250,18 +258,55 @@ Checklist, in order:
   Expected: a 2026-11 row with `boundary_reset_at` set, `capital_base`
   re-snapshotted from the wallet, model `hwm_v1`; `/status` shows the new
   base and 4 slots (fresh month, no give-back yet).
-- [ ] Run Preconditions 1–5 against November (all trivially true on a flat,
+- [x] Run Preconditions 1–5 against November (all trivially true on a flat,
   fresh month except the ledger freshness check in step 2).
-- [ ] Procedure step 2 with `TARGET_YEAR=2026 TARGET_MONTH=11`; then
+- [x] Procedure step 2 with `TARGET_YEAR=2026 TARGET_MONTH=11`; then
   Validation. The October row keeps `hwm_v1` and its audited history.
 
 If the boundary is missed by days, nothing is lost: the switch applies to
 the November row whenever the book is next flat; only avoid doing it right
 after a loss, for the reason recorded in the ADR.
 
+### Execution record (2026-11-01 → 2026-11-02)
+
+Done by the operator with a wrapper around the commands above
+(`robson_psql` as defined in Prerequisites; read-only preflight, then the
+guarded `UPDATE` behind an explicit confirmation).
+
+| When (UTC) | What | Evidence |
+| --- | --- | --- |
+| 2026-11-01 00:00:49–00:00:51 | `MonthBoundaryReset` for 2026-11 | daemon log `Month boundary processed year=2026 month=11 capital_base=1805.82071304 carried_risk=0 armed_count=0`; the 45 s before it logged `Monthly state row missing; using fallback state with inherited budget model` from the `/status` poll (the #218 ordering race) and inserted nothing, so the boundary created the row itself |
+| 2026-11-01 | November row inherited `hwm_v1`, `capital_base` = wallet 1805.82071304, 4 slots, budget 72.2328285216 | `/status` and the `monthly_state` read in Procedure 1 |
+| 2026-11-02 00:04 | the four orphaned income items acknowledged (`robson-cli income ack`, reasons on ldamasio/robson#232) | `unmatched_income_count` 4 → 0; a re-run answered `already_acknowledged` (idempotent). Deviation from the checklist: the acks happened after the boundary, not before. Harmless: unmatched items do not gate the boundary snapshot, only intra-month TRANSFER recalibration |
+| 2026-11-02 00:08–00:12 | Preconditions 1–5 | flat book, halt `active`; `unmatched_any_age` 0; no November item outside governed net (0 rows); `newest_income` 2026-10-24 with `rows_this_month` 0; governed net 0 on both sides; `robsond_budget_model_shadow_slots_delta` 0. **Deviation:** the exchange-side comparison in Precondition 2 (Binance → Transaction History → Income) was **not** performed: the operator had lost access to the Binance 2FA phone number and could not log in. Accepted because the ledger and the account agreed on every observable the daemon has: no position all month, income polling without errors, `wallet_balance` identical to the boundary `capital_base` (a transfer or any income would have moved it and raised the drift warning), and the budget anchor of a zero-activity month is zero whatever the exchange history says. Not a precedent: on a month with activity this check is mandatory |
+| 2026-11-02 01:25:13 | Procedure step 2, `TARGET_YEAR=2026 TARGET_MONTH=11` | `UPDATE 1` returning `2026 \| 11 \| 1805.82071304 \| net_from_start_non_expanding_v1`; the October row stays `hwm_v1` (peak 146.02636567, realized_loss 77.94553910, 18 trades) |
+| 2026-11-02 01:26 | Validation, first `/status` after the switch | `monthly_budget_model = net_from_start_non_expanding_v1`, 4 slots of 4, `monthly_budget_utilization_pct = "0"`, `monthly_budget_remaining = 72.2328285216`, `month_peak_net = null`, `monthly_giveback_pct = null`, `monthly_net_loss_consumed = "-0"`; no `Unknown persisted monthly budget model` warning; pod not restarted (`robsond-744f94cd5b-lxfb4`, 4d8h) |
+
+Rollback evidence (Procedure 1, before the switch):
+
+```
+ year | month | capital_base  | realized_loss | month_peak_net | trades_opened | monthly_budget_model
+ 2026 |    11 | 1805.82071304 |    0.00000000 |     0.00000000 |             0 | hwm_v1
+ 2026 |    10 | 1710.80887407 |   77.94553910 |   146.02636567 |            18 | hwm_v1
+ 2026 |     9 | 1702.10845335 |   54.62900485 |    67.67423500 |            10 | hwm_v1
+```
+
+Two operational notes from the run:
+
+- `kubectl run --rm -i` sometimes returns before the pod's output is
+  streamed (the pod finishes first); the statement still ran. For a
+  `SELECT` just repeat it. For the `UPDATE`, re-running is safe because of
+  the `WHERE ... = 'hwm_v1'` guard, but `UPDATE 0` alone proves nothing
+  (it is also what a missing row returns): confirm with
+  `SELECT year, month, monthly_budget_model FROM monthly_state WHERE year = 2026 AND month = 11;`
+  showing `net_from_start_non_expanding_v1`.
+- The `monthly_state` timestamps print in the database session's time
+  zone (`+01`/`+02`); `boundary_reset_at = 2026-11-01 01:00:49+01` is the
+  daemon's 00:00:49 UTC.
+
 ## Validation
 
-- [ ] `/status` reports the new model and the HWM outputs are withheld:
+- [x] `/status` reports the new model and the HWM outputs are withheld (2026-11-02 01:26 UTC, see the execution record):
 
   ```bash
   curl -s https://api.robson.rbx.ia.br/status | jq '{monthly_budget_model, new_slots_available, slot_cells_total, monthly_budget_utilization_pct, monthly_budget_remaining, month_peak_net, monthly_giveback_pct, monthly_net_loss_consumed}'
@@ -270,7 +315,7 @@ after a loss, for the reason recorded in the ADR.
   Expected on a net-positive empty book: `new_slots_available == 4`,
   `monthly_budget_utilization_pct == "0"`, `month_peak_net == null`,
   `monthly_giveback_pct == null`.
-- [ ] `robsond_budget_model_shadow_slots_delta` still equals
+- [x] `robsond_budget_model_shadow_slots_delta` still equals
   `slots_nfs − slots_hwm` (now `new_slots_available − slots_hwm`); a
   non-zero value is expected whenever the month has a give-back from its
   peak. It is informational after activation.
@@ -278,7 +323,7 @@ after a loss, for the reason recorded in the ADR.
   governed loss since month start · Profits do not raise the limit") with
   `net / reserved / left` instead of `peak / now`, and the SLOTS row shows
   4 free cells.
-- [ ] Daemon log shows no `Unknown persisted monthly budget model` warning.
+- [x] Daemon log shows no `Unknown persisted monthly budget model` warning.
 - [ ] First admitted entry after the switch: an **Armed** position reserves
   nothing (arm is not admission); once it is `Entering`/`Active`,
   `monthly_open_risk_reserved` equals its priced worst-case risk,

@@ -24,7 +24,14 @@ is an operator action documented in
 blockers are covered by "Activation exceptions", approved by the operator
 on 2026-10-21 for activation at the 2026-11-01 boundary. Trigger:
 2026-10-15, a net +83.50 USDT October with an empty book showed 2 slots under
-`hwm_v1`, the August scenario again.
+`hwm_v1`, the August scenario again. **Update (2026-11-02): ACTIVE in
+production.** The 2026-11 `monthly_state` row was switched to
+`net_from_start_non_expanding_v1` on 2026-11-02 01:25 UTC on a flat book,
+after the four orphaned income items were acknowledged; October and earlier
+rows keep `hwm_v1`. Execution record in the runbook. Still pending: §5.5
+cleanup (peak code and `month_peak_net` column), the §3 settlement
+completeness, #242 (persisted withheld basis increases) and the matcher
+gaps on #232.
 **Deciders**: RBX Systems (operator + architecture, with adversarial design
 review by a secondary model)
 **Supersedes**: [ADR-0046](ADR-0046-monthly-high-water-mark-budget.md)
@@ -325,7 +332,7 @@ limit."
   before the −4% floor binds. Per operator decision, protecting profit is
   the job of each position's trailing stop, not of the monthly budget.
 
-## Activation exceptions (proposed 2026-10-15 — APPROVED by the operator 2026-10-21, activation at the 2026-11-01 UTC month boundary)
+## Activation exceptions (proposed 2026-10-15 — APPROVED by the operator 2026-10-21; EXECUTED 2026-11-02 on the 2026-11 row)
 
 §5.4 names blockers that are still open. Activation in October 2026 is
 possible only if the operator explicitly accepts the following bounded
@@ -347,6 +354,15 @@ is the procedure.
 
 Everything else in §5.4 (flat account, no in-flight entry/exit, no stale
 reconciliation item, canonical snapshot shadow) is checked by the runbook.
+
+Outcome: every exception held at activation time. The local ledger showed
+no November income of any kind (no position, hence no funding; the
+exchange-side comparison was not performed, an accepted deviation recorded
+in the runbook's execution record), the book was flat, August was not
+re-opened, and the non-expanding basis release had been in production
+since 2026-10-24. The switch itself was one guarded
+`UPDATE` (`UPDATE 1`), no restart, and the first `/status` snapshot
+reported the new model with the HWM outputs withheld.
 
 ## Supersession boundaries
 
