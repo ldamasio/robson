@@ -252,9 +252,18 @@ this ADR.
   erroring with "run `robson auth login` first" when nothing is cached.
 - `GOOGLE_CLI_CLIENT_ID` is compiled into the binary as a constant
   (Google's "TVs and Limited-Input devices" client type is not meant to
-  be operator-configurable) — placeholder pending manual registration in
-  Google Cloud Console, see the constant's doc comment in
-  `robson-cli/src/auth.rs`.
+  be operator-configurable); registered 2026-09-11, see the constant's
+  doc comment in `robson-cli/src/auth.rs`.
+- **Amendment 2026-11-01.** The original text assumed that client type has
+  no client secret. It does, and Google's token endpoint rejects the
+  device-code poll and the refresh exchange without it
+  (`invalid_request: Missing required parameter: client_secret`, first
+  production login). The secret is not confidential for installed
+  applications by Google's own definition, but it is kept out of the
+  public repository: the CLI reads it from
+  `ROBSON_GOOGLE_CLI_CLIENT_SECRET` and fails fast when it is unset
+  (`docs/CLI.md`). robsond is unaffected: it verifies the ID token's
+  signature and `aud`, never the client secret.
 
 **Related**: ADR-0025 (Bearer token auth — amended by this ADR; its
 "no callback server, static frontend" constraint is exactly why GIS is

@@ -25,9 +25,9 @@ use oauth2::{
         BasicErrorResponse, BasicRevocationErrorResponse, BasicTokenIntrospectionResponse,
         BasicTokenType,
     },
-    AuthUrl, Client, ClientId, DeviceAuthorizationUrl, EndpointNotSet, EndpointSet, RefreshToken,
-    Scope, StandardDeviceAuthorizationResponse, StandardRevocableToken, StandardTokenResponse,
-    TokenResponse, TokenUrl,
+    AuthType, AuthUrl, Client, ClientId, ClientSecret, DeviceAuthorizationUrl, EndpointNotSet,
+    EndpointSet, RefreshToken, Scope, StandardDeviceAuthorizationResponse, StandardRevocableToken,
+    StandardTokenResponse, TokenResponse, TokenUrl,
 };
 use serde::{Deserialize, Serialize};
 
@@ -50,15 +50,30 @@ fn http_client() -> Result<reqwest::Client> {
 
 /// Google's OAuth 2.0 "TVs and Limited-Input devices" client ID registered
 /// for `robson-cli`'s Device Authorization Grant flow (project rbx-systems,
-/// registered 2026-09-11). This client type has no client secret — Google's
-/// console only exposes a Name field for it, confirming it's a public
-/// client, matching this module's device-flow usage (no secret is sent).
+/// registered 2026-09-11).
 ///
 /// Deliberately compiled into the binary rather than operator-configurable
 /// — see ADR-0054's "amends ADR-0025" section: the CLI's audience is a
 /// fixed, pre-registered OAuth client, not a per-deployment setting.
 pub const GOOGLE_CLI_CLIENT_ID: &str =
     "844825462148-3nk0f2943000rev55hdj3jir1nadchev.apps.googleusercontent.com";
+
+/// Environment variable holding that client's **client secret**.
+///
+/// Google issues a client secret for the "TVs and Limited-Input devices"
+/// client type and its token endpoint rejects both the device-code poll and
+/// the refresh-token exchange without it (`invalid_request: Missing
+/// required parameter: client_secret`, observed on the first production
+/// login attempt, 2026-11-01). For installed/device applications Google
+/// documents the secret as *not* confidential (the binary could embed it),
+/// but it is still an OAuth credential of this project, so it stays out of
+/// the public repository and is supplied by the operator at run time from
+/// the password store (see `docs/CLI.md`, "Authentication and connectivity").
+///
+/// Sent in the request body (`AuthType::RequestBody`), which is the form
+/// Google's device-flow documentation shows; the crate default (HTTP Basic)
+/// is not what Google's examples use for this client type.
+pub const GOOGLE_CLI_CLIENT_SECRET_ENV: &str = "ROBSON_GOOGLE_CLI_CLIENT_SECRET";
 
 const GOOGLE_DEVICE_AUTH_URL: &str = "https://oauth2.googleapis.com/device/code";
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
@@ -151,8 +166,25 @@ fn decode_id_token_claims(id_token: &str) -> Result<IdTokenClaims> {
     serde_json::from_slice(&decoded).context("malformed id_token: payload is not valid JSON")
 }
 
+/// Resolve the device client's secret from its environment variable.
+/// Required: without it Google's token endpoint rejects every exchange, so
+/// fail before printing a user code the operator would approve for nothing.
+fn client_secret_from(raw: Option<String>) -> Result<ClientSecret> {
+    match raw.map(|v| v.trim().to_string()) {
+        Some(secret) if !secret.is_empty() => Ok(ClientSecret::new(secret)),
+        _ => bail!(
+            "{GOOGLE_CLI_CLIENT_SECRET_ENV} is not set; Google requires the robson-cli device \
+             client's secret on the token endpoint. Export it from the operator's password \
+             store (see docs/CLI.md, \"Authentication and connectivity\") and retry"
+        ),
+    }
+}
+
 fn build_client() -> Result<GoogleClient> {
+    let client_secret = client_secret_from(std::env::var(GOOGLE_CLI_CLIENT_SECRET_ENV).ok())?;
     Ok(GoogleClientInitial::new(ClientId::new(GOOGLE_CLI_CLIENT_ID.to_string()))
+        .set_client_secret(client_secret)
+        .set_auth_type(AuthType::RequestBody)
         .set_auth_uri(AuthUrl::new(GOOGLE_AUTH_URL.to_string()).context("invalid Google auth URL")?)
         .set_token_uri(
             TokenUrl::new(GOOGLE_TOKEN_URL.to_string()).context("invalid Google token URL")?,
@@ -368,6 +400,15 @@ mod tests {
         let claims = decode_id_token_claims(&token).unwrap();
         assert_eq!(claims.email.as_deref(), Some("ldamasio@gmail.com"));
         assert_eq!(claims.exp, 1999999999);
+    }
+
+    #[test]
+    fn client_secret_requires_a_non_blank_value() {
+        assert!(client_secret_from(None).is_err());
+        assert!(client_secret_from(Some("   ".to_string())).is_err());
+        let error = client_secret_from(Some(String::new())).unwrap_err().to_string();
+        assert!(error.contains(GOOGLE_CLI_CLIENT_SECRET_ENV), "{error}");
+        assert_eq!(client_secret_from(Some("  s3cret \n".to_string())).unwrap().secret(), "s3cret");
     }
 
     #[test]

@@ -36,6 +36,23 @@ Since ADR-0054, the CLI authenticates as the operator's Google account via
 the OAuth 2.0 Device Authorization Grant — there is no bearer token to
 export or pass on the command line.
 
+The device client's **client secret** must be in the environment for
+`auth login` and for every transparent refresh: Google issues one for the
+"TVs and Limited-Input devices" client type and rejects the token exchange
+without it. It is not treated as confidential by Google for installed
+applications, but it is a credential of the `rbx-systems` project, so it is
+not in the repository: take it from Google Cloud Console → APIs & Services
+→ Credentials → the `robson-cli` OAuth client, keep it in the operator's
+password store, and export it per shell (never on the command line of
+another process, never in tickets):
+
+```bash
+export ROBSON_GOOGLE_CLI_CLIENT_SECRET="$(pass rbx/google/robson-cli-client-secret)"
+```
+
+Without it the CLI fails before printing a user code
+(`ROBSON_GOOGLE_CLI_CLIENT_SECRET is not set; ...`).
+
 Sign in once per machine:
 
 ```bash
@@ -65,6 +82,8 @@ tunnel or local port forward — never send the bearer credential over
 plaintext remote HTTP.
 
 `ROBSON_OPERATOR_ID` may supply the default audited actor for `income ack`.
+`ROBSON_GOOGLE_CLI_CLIENT_SECRET` (above) is read by `auth login` and by the
+silent refresh inside `reconcile-close` and `income ack`.
 
 **Legacy note:** `ROBSON_API_TOKEN` / `--token` are removed. Setting
 `ROBSON_API_TOKEN` on the `robsond` side now fails startup loudly (see
