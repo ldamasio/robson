@@ -48,8 +48,11 @@ jobs:
           done
           exit 1
 
+      # --config is explicit: osv-scanner only auto-loads osv-scanner.toml from
+      # the directory of each scanned lockfile, so without it the root file would
+      # not apply to frontend/pnpm-lock.yaml.
       - name: Run osv-scanner
-        run: ./osv-scanner scan source --lockfile Cargo.lock --lockfile scripts/requirements-security.txt
+        run: ./osv-scanner scan source --config osv-scanner.toml --lockfile Cargo.lock --lockfile frontend/pnpm-lock.yaml --lockfile scripts/requirements-security.txt
 
   cargo-audit:
     name: Cargo Audit
