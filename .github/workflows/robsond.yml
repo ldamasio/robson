@@ -73,8 +73,11 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: rust-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: rust-${{ runner.os }}-
+          # v2: the feature-enabled test artifacts added by the DATABASE_URL
+          # step would otherwise never land in an existing, immutable exact-hit
+          # cache keyed on Cargo.lock alone.
+          key: rust-v2-${{ runner.os }}-${{ hashFiles('Cargo.lock', 'rust-toolchain.toml', '.github/workflows/robsond.yml') }}
+          restore-keys: rust-v2-${{ runner.os }}-
 
       - name: Run tests (no postgres feature - uses MemoryStore)
         run: cargo test --all --no-fail-fast
@@ -94,6 +97,19 @@ jobs:
         env:
           DATABASE_URL: postgresql://postgres:postgres@localhost:5432/robson_migration_ci
         run: cargo run -p robsond --features postgres -- db migrate
+
+      # 68 tests marked #[ignore] need a real PostgreSQL (store, projector,
+      # robson-db, crash recovery, income ledger, replay, trailing stop e2e,
+      # daemon internals). They were never run in CI (2026-10-30 assessment).
+      # Each uses #[sqlx::test(migrations = "../migrations")]: SQLx creates a
+      # fresh database per test on this service, migrates it and drops it, so
+      # tests are isolated and only need DATABASE_URL to reach the server.
+      # robson-connectors' four ignored tests are live Binance REST smoke tests
+      # and stay local: Binance refuses requests from GitHub-hosted (US) runners.
+      - name: Run the DATABASE_URL-gated tests
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/robson_migration_ci
+        run: cargo test --workspace --exclude robson-connectors --features postgres --no-fail-fast -- --ignored
 
       # Pinned, not rolling. rustfmt.toml enables unstable options
       # (wrap_comments, comment_width, normalize_comments,
