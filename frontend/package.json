@@ -23,7 +23,7 @@
     "@sveltejs/kit": "^2.70.3",
     "@sveltejs/vite-plugin-svelte": "^6.2.4",
     "@types/node": "^20.19.43",
-    "eslint": "^9.39.4",
+    "eslint": "^10.14.0",
     "jsdom": "^29.1.1",
     "prettier": "^3.9.10",
     "prettier-plugin-svelte": "^3.5.1",
