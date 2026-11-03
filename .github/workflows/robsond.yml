@@ -76,6 +76,17 @@ jobs:
           key: rust-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: rust-${{ runner.os }}-
 
+      - name: Assert the Dockerfile builds with the pinned toolchain
+        # The production image must be compiled with the same rustc that CI
+        # tests. rust-toolchain.toml is the single source of truth; the
+        # Dockerfile pins the matching docker.io/library/rust image by digest.
+        run: |
+          want=$(sed -n 's/^channel = "\(.*\)"/\1/p' rust-toolchain.toml)
+          have=$(sed -n 's|^FROM docker.io/library/rust:\([0-9.]*\)-slim-bookworm@sha256:[0-9a-f]\{64\} AS builder$|\1|p' Dockerfile)
+          echo "rust-toolchain.toml=$want Dockerfile=$have"
+          test -n "$have" || { echo '::error::Dockerfile builder image is not pinned as rust:<ver>-slim-bookworm@sha256:<digest>'; exit 1; }
+          test "$want" = "$have" || { echo "::error::Dockerfile rust $have != rust-toolchain.toml $want"; exit 1; }
+
       - name: Run tests (no postgres feature - uses MemoryStore)
         run: cargo test --all --no-fail-fast
 

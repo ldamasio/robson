@@ -1,7 +1,14 @@
 # ============================================================================
 # Stage 1: Build
 # ============================================================================
-FROM docker.io/library/rust:1-slim AS builder
+# Pinned by digest (immutable) and to the exact toolchain in rust-toolchain.toml
+# (1.92.0): the image used to be the rolling `rust:1-slim`, so production was
+# compiled with whatever 1.x Docker Hub served that day, not the version CI
+# tested. robsond.yml asserts that this tag matches rust-toolchain.toml.
+# Refresh the digest with
+#   skopeo inspect --raw docker://docker.io/library/rust:<ver>-slim-bookworm | sha256sum
+# (or the Docker-Content-Digest header of the registry's manifest-list HEAD).
+FROM docker.io/library/rust:1.92.0-slim-bookworm@sha256:f1f73538ebe623fd3673a35aff3df358ae1084c64c55646516e5b17b321b6c9b AS builder
 
 WORKDIR /app
 
@@ -33,7 +40,7 @@ RUN cargo build --release -p robsond --features postgres
 # ============================================================================
 # Stage 2: Runtime
 # ============================================================================
-FROM docker.io/library/debian:bookworm-slim
+FROM docker.io/library/debian:bookworm-slim@sha256:99c0b25c46d0214d5a2091092e7908907dcaecd6a962cde0ac700acee222b6f3
 
 # Install runtime dependencies
 RUN apt-get update && apt-get install -y \
