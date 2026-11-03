@@ -1,0 +1,73 @@
+# Dependabot version updates (security updates are enabled separately in
+# the repository settings and keep running regardless of this file).
+#
+# Policy (AGENTS.md invariant 14; enforced by .github/workflows/guardrails.yml):
+# - one grouped minor+patch PR per ecosystem per week keeps the queue small;
+#   each merge still goes through the ruleset gates and the deploy workflows;
+# - frontend semver-majors of the SvelteKit/Vite/vitest toolchain are ignored
+#   here on purpose: the production image and CI run Node 20, and SvelteKit 3
+#   needs Vite 8, vite-plugin-svelte 7, TypeScript 6 and Node 22.17. That
+#   migration is a deliberate PR validated in podman, not a bot bump;
+# - cargo majors are not ignored: the Rust Tests job runs on every PR.
+version: 2
+updates:
+  - package-ecosystem: cargo
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/Sao_Paulo
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      cargo-minor-patch:
+        update-types: [minor, patch]
+
+  - package-ecosystem: npm
+    directory: /frontend
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/Sao_Paulo
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      frontend-minor-patch:
+        update-types: [minor, patch]
+    ignore:
+      # Node 20 / SvelteKit 2 line — see the header comment.
+      - dependency-name: "@sveltejs/kit"
+        update-types: [version-update:semver-major]
+      - dependency-name: "@sveltejs/adapter-static"
+        update-types: [version-update:semver-major]
+      - dependency-name: "@sveltejs/vite-plugin-svelte"
+        update-types: [version-update:semver-major]
+      - dependency-name: vite
+        update-types: [version-update:semver-major]
+      - dependency-name: vitest
+        update-types: [version-update:semver-major]
+      - dependency-name: jsdom
+        update-types: [version-update:semver-major]
+      - dependency-name: typescript
+        update-types: [version-update:semver-major]
+      - dependency-name: "@types/node"
+        update-types: [version-update:semver-major]
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "06:00"
+      timezone: America/Sao_Paulo
+    open-pull-requests-limit: 3
+    commit-message:
+      prefix: "ci(deps)"
+    groups:
+      actions:
+        patterns: ["*"]
+        update-types: [minor, patch]

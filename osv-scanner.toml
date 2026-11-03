@@ -24,3 +24,21 @@ reason = "crypto-bigint 0.5.5 (timing variability in constant-time ops): fix is 
 [[IgnoredVulns]]
 id = "GHSA-qwgh-2vcv-g2f7"
 reason = "block-buffer 0.10.4 (caught panic inside a digest compress callback leaves the inline cursor corrupted, enabling OOB access afterwards): fix is 0.12.1, reachable only through digest/sha2 0.11, a semver-major across the RustCrypto tree pulled by sqlx, reqwest/rustls and jsonwebtoken. Precondition: catching a panic raised from within a hash compress callback and then reusing the same buffer. robsond never wraps hashing in catch_unwind; a panic there propagates and the task/process ends (panic = abort for the daemon's purposes), so the corrupted-buffer state is never observed. Re-evaluate when the dependency tree moves to digest 0.11. No RUSTSEC id yet, hence absent from .cargo/audit.toml. (2026-10-28)"
+
+# --- frontend/pnpm-lock.yaml (scanned since 2026-11-03) ---
+
+[[IgnoredVulns]]
+id = "GHSA-27mw-82g8-phjj"
+reason = "@sveltejs/kit < 3.0.0 (unescaped cache-control value in a prerendered <meta http-equiv> tag): fix is SvelteKit 3.0.0, a semver-major that requires Vite 8 (rolldown), @sveltejs/vite-plugin-svelte 7, TypeScript 6 and Node >= 22.17, while the production image (frontend/Dockerfile) and CI run Node 20 — a deliberate migration PR, not a bump. Precondition absent: the trigger is setHeaders({'cache-control': <untrusted>}) at prerender time; the frontend never calls setHeaders (grep setHeaders src/ is empty) and prerenders only its own static shell (ssr=false, prerender=true in src/routes/+layout.ts) with no request-derived input. Re-evaluate when the SvelteKit 3 migration lands. (2026-11-03)"
+
+[[IgnoredVulns]]
+id = "GHSA-pfhg-q3qv-9q6r"
+reason = "@sveltejs/kit < 3.0.0 (open redirect through enhanced form actions on routes accepting '//' paths): same semver-major fix and Node 22 blocker as GHSA-27mw-82g8-phjj. Precondition absent: the frontend is a static SPA (adapter-static, ssr=false) with no +page.server.ts, no form actions and no use:enhance (grep use:enhance src/ is empty); there is no server to redirect. Re-evaluate when the SvelteKit 3 migration lands. (2026-11-03)"
+
+[[IgnoredVulns]]
+id = "GHSA-gcqx-w48m-w2h4"
+reason = "deepmerge 4.3.1 (prototype pollution via attacker-supplied source objects in mergeObject): no fixed release exists. Two inclusion paths: (1) svelte-i18n 4.0.1 at runtime, which merges only the locale dictionaries the app itself ships (src/lib/i18n/pt-BR.json and en.json, registered in src/lib/i18n/index.ts) — no user- or network-supplied object ever reaches it; (2) @sveltejs/vite-plugin-svelte 6.x at build time, merging the project's own Vite/Svelte config. Re-evaluate when deepmerge publishes a fix or svelte-i18n changes its merge dependency. (2026-11-03)"
+
+[[IgnoredVulns]]
+id = "GHSA-g3hv-75wg-m249"
+reason = "minimatch 3.1.5 (globparts amplification DoS with attacker-supplied patterns at optimizationLevel >= 2): the only fixed release is 11.0.1, a semver-major reachable only when eslint and @eslint/config-array/@eslint/eslintrc move off their ^3 edges (eslint 10 still pins ^10.2.6, also unfixed). Precondition absent: minimatch is pulled solely by eslint, a dev-only tool that is not part of the CI gates or the production image, and the only patterns it sees are the repository's own eslint config globs. Re-evaluate on eslint releases that bump minimatch to >= 11.0.1. (2026-11-03)"
