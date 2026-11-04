@@ -15,12 +15,16 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install gitleaks
+        # Checksum from the release's gitleaks_8.30.1_checksums.txt; a tampered
+        # or truncated download fails here instead of scanning with it.
         run: |
-          curl -sSfL https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz \
-            | tar -xz gitleaks
+          curl -sSfL --retry 3 -o gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.30.1/gitleaks_8.30.1_linux_x64.tar.gz
+          echo "551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
 
       # Scans the working tree (--no-git), not git history: the history
       # carries known pre-guardrails findings (2026-07-05 audit); their
@@ -34,13 +38,15 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install osv-scanner
         run: |
           url="https://github.com/google/osv-scanner/releases/download/v2.4.0/osv-scanner_linux_amd64"
           for attempt in 1 2 3; do
             if curl -sSfL --retry 3 --retry-delay 5 --retry-all-errors -o osv-scanner "$url"; then
+              # Checksum from the release's osv-scanner_SHA256SUMS.
+              echo "15314940c10d26af9c6649f150b8a47c1262e8fc7e17b1d1029b0e479e8ed8a0  osv-scanner" | sha256sum -c -
               chmod +x osv-scanner
               exit 0
             fi
@@ -60,10 +66,10 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Install cargo-audit
-        uses: taiki-e/install-action@v2
+        uses: taiki-e/install-action@682ce6c3c696a4cd5168a05f98e51aa02b877941 # v2.89.1
         with:
           tool: cargo-audit
 

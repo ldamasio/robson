@@ -33,9 +33,11 @@ on:
       - "rustfmt.toml"
   workflow_dispatch:
 
+# Least privilege (RBX guardrails): neither job writes to this repository
+# with GITHUB_TOKEN. The image push and the rbx-infra pin bump use the
+# GITOPS_TOKEN PAT; actions/cache uses the runtime token, not GITHUB_TOKEN.
 permissions:
-  contents: write
-  actions: write
+  contents: read
 
 concurrency:
   group: robsond-${{ github.ref }}
@@ -63,10 +65,10 @@ jobs:
           --health-retries 5
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Cache Rust toolchain and deps
-        uses: actions/cache@v6
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ~/.rustup
@@ -151,13 +153,13 @@ jobs:
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11d5960a326750d5838078e36cf38b85af677262 # v4.4.0
 
       - name: Set up Docker Buildx
-        uses: docker/setup-buildx-action@v3
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
 
       - name: Log in to GHCR
-        uses: docker/login-action@v3
+        uses: docker/login-action@c94ce9fb468520275223c153574b00df6fe4bcc9 # v3.7.0
         with:
           registry: ghcr.io
           username: ldamasio
@@ -168,7 +170,7 @@ jobs:
         run: echo "sha_tag=sha-$(echo ${{ github.sha }} | cut -c1-8)" >> $GITHUB_OUTPUT
 
       - name: Build and push
-        uses: docker/build-push-action@v7
+        uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           file: ./Dockerfile
