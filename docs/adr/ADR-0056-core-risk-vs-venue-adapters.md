@@ -1,6 +1,6 @@
 # ADR-0056 — Core Risk Policy vs Venue Adapters: Port Contracts, Adapter Relocation, Multi-Venue Execution Model
 
-**Date**: 2026-11-04 (v5; v1–v4 reviewed by Codex gpt-6.1-sol xhigh: 15 + 14 + 9 + 4 findings, see Review trail)
+**Date**: 2026-11-04 (v5; v1–v4 reviewed by Codex gpt-6.1-sol xhigh: 15 + 14 + 9 + 4 findings; v5 APPROVED with one P3 nit applied, see Review trail)
 **Status**: PROPOSED (operator decision pending on the items under Needs Input, in particular N1 and N2)
 **Deciders**: RBX Systems (operator + architecture)
 **Amends**: [ADR-0024](ADR-0024-trading-policy-layer.md) §6 (capital base source becomes venue-neutral and names its valuation),
@@ -306,12 +306,12 @@ Prerequisites, all durable: `LogicalOperationId`, `LegId`, `VenueId` and account
 exchange order ids, settlement ids and checkpoints; mapping of every pre-existing position to `binance:usdm`; feed
 isolation (§3); durable intent journal (§8 step 7).
 
-- **Weights allocate planned risk, not quantity.** With `A` the operation's admitted risk, leg *i* receives `A × wᵢ` and
-  derives its own quantity from its own venue price, executable stop (levels from its own feed), cost envelope, cash cap
-  and rules. Quantities are never transferred between venues.
+- **Weights allocate planned risk, not quantity.** With `R` the requested risk before quantization and normalized
+  nonnegative weights, leg *i* is derived from `R × wᵢ`: its own quantity from its own venue price, executable stop
+  (levels from its own feed), cost envelope, cash cap and rules. Its final cost-priced charge is `aᵢ`; the operation
+  reserves `A = Σ aᵢ`. Unused slack is not redistributed. Quantities are never transferred between venues.
 - **One governed admission reserves the aggregate atomically** before anything is externally visible (ADR-0051 §1).
-  With `aᵢ` the final cost-priced charge of leg *i* (after quantization; `A = Σ aᵢ`, weights normalized, nonnegative,
-  quantization slack kept inside the admitted `A`):
+  With `aᵢ` the final cost-priced charge of leg *i* after quantization and `A = Σ aᵢ` as above:
 
   ```text
   A = Σ aᵢ > 0
@@ -543,3 +543,5 @@ Budget model for multi-venue:
   71.37/81.09 vs ceilings 71.38/81.10). Resolved 3, 5, 6, 7, 9 of round 3.
 - v5: crossed trigger carries the old stop's final state and residual and routes to flatten; admission property on
   post-quantization charges; database row, budget statement and matrix qualified; ceilings corrected.
+- v5 (2026-11-04): Codex, **APPROVE** (architecture acceptable at the ADR level with N1–N6 decided by the operator;
+  implementation acceptance gates and rollout pending). One P3 nit (§7 `R × wᵢ` vs `A = Σ aᵢ` notation) applied.
