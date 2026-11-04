@@ -1,15 +1,16 @@
 # ADR-0056 — Core Risk Policy vs Venue Adapters: Port Contracts, Adapter Relocation, Multi-Venue Execution Model
 
-**Date**: 2026-11-04 (v3; v1 and v2 reviewed by Codex gpt-6.1-sol xhigh: 15 + 14 findings, see Review trail)
+**Date**: 2026-11-04 (v4; v1–v3 reviewed by Codex gpt-6.1-sol xhigh: 15 + 14 + 9 findings, see Review trail)
 **Status**: PROPOSED (operator decision pending on the items under Needs Input, in particular N1 and N2)
 **Deciders**: RBX Systems (operator + architecture)
 **Amends**: [ADR-0024](ADR-0024-trading-policy-layer.md) §6 (capital base source becomes venue-neutral and names its valuation),
-[ADR-0039](ADR-0039-exchange-side-insurance-stop.md) (the protective stop becomes a venue contract with an explicit lifecycle; a
-bounded-window exception for balance accounts is **proposed, not decided**: N1)
-**Preserves**: ADR-0021 (level selection), ADR-0022 (unauthored inventory on the operated account is closed; no exception),
-ADR-0050 (valid-level selection, no-valid-stop semantics, executable risk costing), ADR-0051 (net-from-start monthly budget,
-atomic reservation, cost-priced boundary downside), ADR-0052 (executable span, market exits, two-layer same-trigger
-enforcement), ADR-0049 (event payloads do not change)
+[ADR-0039](ADR-0039-exchange-side-insurance-stop.md) (the protective stop becomes a venue contract with an explicit lifecycle).
+**Conditionally amends, if N1-a is chosen**: ADR-0039's protection-continuity guarantee and ADR-0052's two-layer same-trigger
+enforcement claim do **not** hold on balance accounts during a protection transition (§2.2). Risk *numbers* are untouched;
+those two *guarantees* are qualified.
+**Preserves**: ADR-0021 (level selection), ADR-0022 (unauthored inventory on the operated account is closed, account-wide; no
+exception), ADR-0050 (valid-level selection, no-valid-stop semantics, executable risk costing), ADR-0051 (net-from-start
+monthly budget, atomic reservation, cost-priced boundary downside), ADR-0049 (event payloads do not change)
 **Related**: issue #154, TD-2026-05-05-001, docs/policies/UNTRACKED-POSITION-RECONCILIATION.md, 2026-10-30 security assessment
 
 ---
@@ -86,11 +87,12 @@ if the split simply made the futures-only methods optional.
   is an order on the book). Dated futures later.
 - **Account kind**: `PositionAccount` (the venue reports positions) or `BalanceAccount` (the venue reports holdings only;
   Robson derives its governed position from its own fills).
-- **Execution account**: the account a venue trades on. On balance accounts it is a **dedicated** account (a Binance
-  sub-account on the corporate account, or a dedicated API profile when the venue has no sub-accounts) that holds only
-  Robson-governed inventory and quote cash. ADR-0022 applies unchanged on it: any unauthored inventory that appears there
-  is closed per `docs/policies/UNTRACKED-POSITION-RECONCILIATION.md`. The operator's own holdings never live on an
-  execution account; sharing one is out of scope (would require a policy amendment).
+- **Execution account**: the account a venue trades on. On balance accounts it is a **dedicated account** (a Binance
+  sub-account on the corporate account, or a separate account on a venue without sub-accounts; a separate API key on a
+  shared account does **not** isolate inventory and does not qualify) that holds only Robson-governed inventory and quote
+  cash. ADR-0022 applies unchanged and account-wide on it: any unauthored holding of any asset that appears there is closed
+  per `docs/policies/UNTRACKED-POSITION-RECONCILIATION.md`. The operator's own holdings never live on an execution account;
+  sharing one is out of scope (would require a policy amendment).
 - **Governed holding**: base-asset inventory bought by a leg, net of base-asset commission, as evidenced by fills.
 - **Leg**: the execution of a logical operation on one venue. Today every position is a single leg on `binance:usdm`.
 
@@ -106,11 +108,16 @@ TradingPort                      required
   trading_rules / trading_rules_preview                      (issue #154 contracts unchanged)
   place_market_order(symbol, side, qty, client_id, intent: EntryOrReduce) -> OrderResult
   place_protection(symbol, close_side, qty, trigger, client_id) -> StopRef
-  cancel_protection(symbol, StopRef) -> StopCancelOutcome       (AlreadyGone semantics kept)
+  cancel_protection(symbol, StopRef) -> StopCancelOutcome
+      StopCancelOutcome = { Cancelled{filled_before_cancel: Decimal, fills}, AlreadyGone{final: OrderLookup}, Unknown }
   replace_protection(symbol, old: StopRef, new: StopParams) -> ReplaceOutcome
-      ReplaceOutcome = { Replaced{new}, OldKeptNewRejected, OldCancelledNewRejected, Unknown }
+      ReplaceOutcome = { Replaced{new, old_filled: Decimal}, OldKeptNewRejected, OldCancelledNewRejected{old_filled},
+                         TriggerAlreadyCrossed{old_fills}, Unknown }
   order_by_client_id(symbol, client_id) -> OrderLookup
-      OrderLookup = { Absent, Open{filled_qty}, PartiallyFilled{..}, Terminal{fills}, Unknown }
+      OrderLookup = { Absent{finality: VenueFinalityRule}, Open{filled_qty}, PartiallyFilled{..}, Terminal{fills,
+                      cancelled_qty}, Unknown }
+      Absent is returned only under the venue's documented finality rule (e.g. not found on both the live and the
+      historical lookup after the venue's propagation window); a raw not-found response is Unknown
   order_by_exchange_id / protection_fill(symbol, StopRef) / open_protective_orders
   user_trades_since(cursor) / price / health
 
@@ -127,8 +134,10 @@ PositionAccountPort              required when account_kind = PositionAccount
   close_position_market(symbol, side, qty, client_id)
 
 InventoryPort                    required when account_kind = BalanceAccount
-  inventory_snapshot(symbol) -> { holdings: Holding{free, locked}, governed: GovernedInventory{qty, fill_ids},
-                                  unauthored: Decimal, as_of }
+  account_observation() -> { holdings: Vec<(Asset, Holding{free, locked})>   every nonzero holding, all assets,
+                             open_orders: Vec<OpenOrderRef>,                   independent of configured symbols
+                             as_of }
+  governed_inventory(symbol) -> GovernedInventory{qty, fill_ids}            derived from authoritative fills
 
 SettlementPort                   required (every venue)
   settlement_since(cursor) -> Vec<SettlementRecord>      realized pnl, commission (amount, asset), funding
@@ -151,7 +160,7 @@ trait Venue: TradingPort + AccountPort {
 ```
 
 `VenueCapabilities` is data: `market_kind`, `account_kind`, `supports_short`, `reduce_only_wire_flag`,
-`protection: ProtectionKind`, `replacement: ReplacementProtocol`, `has_funding`. The executor and the daemon branch on
+`protection: ProtectionKind`, `replacement: ReplacementProtocol`, `has_funding`, `order_finality: VenueFinalityRule`. The executor and the daemon branch on
 capabilities, never on the venue id. The conformance suite (§10) checks that flags and accessors agree.
 
 **2.1 Protection kind.** An eligible venue must provide exchange-resident protection that triggers **market** execution at
@@ -165,30 +174,46 @@ ADR-0039/0052.
 the inventory, so a second full-quantity stop cannot coexist with it, and no Binance spot primitive replaces a stop
 atomically: `cancelReplace(STOP_ON_FAILURE)` only guarantees that a *failed cancel* prevents the new placement; a
 successful cancel followed by a rejected placement (HTTP 409) leaves no stop. The same holds for a close: the stop must
-be cancelled before the governed quantity can be sold. Therefore, on balance accounts, replacement and close contain an
-**unprotected window of one venue round-trip** that no daemon logic can remove. This ADR puts two options to the
-operator and recommends the first:
+be cancelled before the governed quantity can be sold. Therefore every replacement and close on a balance account is a
+**non-atomic transition** during which the inventory has no exchange-resident protection. This ADR puts two options to
+the operator and recommends the first, with the residual risk stated in full:
 
-- **N1-a (recommended)**: amend ADR-0039 with a *bounded-window exception for balance accounts*: the window is at most
-  one replacement or close request; a failed placement after a successful cancel is retried immediately with the same
-  `client_id` (idempotent); after `ROBSON_PROTECTION_RETRY_MAX` (proposed 3) failures, or when the venue is unreachable,
-  the executor issues a market **flatten** of the governed quantity (risk-reducing, ADR-0052 market-exit rule); a crash
-  inside the window is detected by startup recovery from the durable intent journal (§8 step 7) whose **first** action on
-  that leg is re-protect or flatten. Every window is an event with its duration (ADR-0044 visibility). `ReplacementProtocol
-  ::CancelThenPlaceBoundedWindow`.
+- **N1-a (recommended)**: amend ADR-0039 with a *non-atomic transition exception for balance accounts*. In the
+  successful, uninterrupted path the exposure lasts from the accepted cancel until the successor protection is accepted
+  or the residual inventory is authoritatively sold (one venue round-trip). **There is no guaranteed maximum duration**
+  during a rejection, an unknown execution outcome, venue API unavailability or daemon downtime. The mitigations are
+  best-effort, not bounds: immediate retry of the placement with the same `client_id`, a market **flatten** of the
+  governed residual after `ROBSON_PROTECTION_RETRY_MAX` (proposed 3) failures or when the venue is unreachable, and
+  re-protect-or-flatten as the **first** recovery action on that leg. Issuing a flatten is not evidence of flattening;
+  the transition completes only on confirmed protection or authoritative fills. **During the exposure, loss may exceed
+  the priced execution envelope and the per-trade, global monthly and per-venue caps**: a long spot leg can lose the
+  entire value of its governed holding. ADR-0052's two-layer same-trigger enforcement does not hold during the
+  transition. Admission on the venue is blocked while it has unresolved unprotected inventory. Required mechanics: the
+  transition intent is persisted **before** the cancel is sent (§8 step 7); an `unprotected_inventory` gauge per venue
+  (quantity, notional, age) is exported and alerted on while nonzero, in addition to the completed-transition event
+  with its duration (ADR-0044 visibility). `ReplacementProtocol::CancelThenPlace`.
 - **N1-b**: keep ADR-0039 as is; Binance spot (and every balance account) is ineligible. Consequence: no spot path for a
   Brazilian operator; the direction of this ADR is reduced to the port split and to position-account venues (B3).
 
-**Arbitration before any cancel or close on either account kind**: look the stop up (`protection_fill`); if it filled
-or partially filled, the residual to sell is `governed − filled` from authoritative fills, never the original quantity;
-`Unknown` outcomes keep the leg in a pending state with its reservation held.
+**Arbitration (both account kinds).** Protection and close transitions on the same governed inventory are serialized
+(one in-flight transition per leg). The residual quantity to sell or re-protect is computed **after** the cancel from
+the stop's final lifecycle state and cumulative fills (`StopCancelOutcome`, `ReplaceOutcome`), never from a lookup taken
+before the cancel (the stop can fill in between). An `Unknown` outcome reconciles the original request to a final state
+before any further submission; the leg stays pending with its reservation held. Typed transitions cover partial
+cancellation with partial fill, a replacement whose trigger is already crossed (`TriggerAlreadyCrossed`: the old fills
+are the exit, no new stop), and a partially executed flatten (residual re-protected or re-flattened). Reusing a
+`client_id` is idempotent only within the venue's finality rule; a `Terminal` outcome releases only the liabilities
+proven extinguished: filled inventory and unsettled costs stay charged until settlement evidence arrives.
 
 **2.3 Reconciliation is never optional.** The reconciliation worker, startup recovery, the live-risk filter, orphan-stop
 recognition and `/status` sync consume an `AccountObservation` produced by the venue: `Positions(snapshot)` for position
-accounts, `Inventory(snapshot)` for balance accounts. Unauthored positions and unauthored inventory on the execution
-account are closed (ADR-0022, policy unchanged). A discrepancy between governed inventory and Robson's leg quantity blocks
-new legs on that venue and surfaces in `/status`. The existing gap (matching by symbol/side rather than order-level
-authorship) stays a follow-up.
+accounts, `Inventory(account_observation)` for balance accounts, in both cases **account-wide** (every symbol, every
+asset, every open order in the operated account scope, independent of configured or tracked symbols). Governed inventory
+is identified through authoritative fills; everything else is unauthored and is closed (ADR-0022, policy unchanged).
+A residual that cannot be executed (below the lot or notional minimum) is a visible unresolved liability with durable
+evidence, priced conservatively at the venue mark, never declared closed. A discrepancy between governed inventory and
+Robson's leg quantity blocks new legs on that venue and surfaces in `/status`. The existing gap (matching by symbol/side
+rather than order-level authorship) stays a follow-up.
 
 **2.4 Capital quantities.** `AccountPort`/`PositionAccountPort` expose **wallet balance and unrealized P&L
 separately** (the connector's `wallet_balance` mapping is left as is; a new field is added). The core derives once:
@@ -215,16 +240,21 @@ commission.
   `robson-connectors/src/binance/usdm/` (mechanical; `normalize_market_quantity` moves unchanged).
 - `Daemon<E: Venue + 'static, S: Store + 'static>`; `Daemon::with_venue(config, venue, market_data, ohlcv)`. A
   `VenueFactory` in `robsond` is the only place that names a concrete adapter; it builds the venue, its feeds and its
-  credential scope from `ROBSON_VENUE` (`binance_usdm` today, `binance_spot` next, `stub` for tests). Funding endpoints and
-  the funding worker are constructed **only** when `venue.funding()` is present; each funding saga persists its original
-  credential/account route and is recovered on that route regardless of the current `ROBSON_VENUE`; governed execution
-  inventory is excluded from conversion and eligible conversion quantities are reserved against concurrent execution.
+  credential scope from `ROBSON_VENUE` (`binance_usdm` today, `binance_spot` next, `stub` for tests). **New** funding sagas and the
+  funding endpoints that create them are constructed only when the selected route exposes `venue.funding()`. Every funding
+  saga persists its original credential/account route; at startup a **recovery worker is constructed per durable
+  unfinished saga route**, even when that route is disabled for new execution and even when `ROBSON_VENUE` now selects a
+  venue without funding. A saga whose original credentials are missing stays visibly blocked with its liabilities
+  retained. Governed execution inventory is excluded from conversion and eligible conversion quantities are reserved
+  against concurrent execution. Test: switch to a venue without funding while an older saga is unfinished.
 - `/readyz` keeps `binance_api` and adds `venue: { id, kind, eligible, reasons[] }` (additive; readiness consumers that
   only read `status` see no change). `eligible` means execution and accounting eligibility: rules, costs, valuation and
   account observation fresh; today's adapter `health_check` (a public ping) is not sufficient.
 - **Feed isolation** (prerequisite for a second venue): `MarketData` events, detector subscriptions and the price cache
-  are keyed by `(VenueId, Symbol)`; a feed watchdog marks a venue degraded after `ROBSON_FEED_SILENCE_MAX` (proposed 30 s)
-  without ticks and resyncs from a REST snapshot; a leg's technical analysis uses its own venue's OHLCV.
+  are keyed by `(VenueId, Symbol)`; the existing watchdog, its 90 s default and its fallback-exit hysteresis
+  (`market_data.rs:68,253`) are preserved unchanged by the relocation and become per venue; on reconnect the venue resyncs
+  from a REST snapshot anchored at the last applied tick; a leg's technical analysis uses its own venue's OHLCV. No feed
+  timing changes in this ADR.
 
 ### 4. Domain cleanup with stable encodings
 
@@ -272,48 +302,67 @@ isolation (§3); durable intent journal (§8 step 7).
 - **Weights allocate planned risk, not quantity.** With `A` the operation's admitted risk, leg *i* receives `A × wᵢ` and
   derives its own quantity from its own venue price, executable stop (levels from its own feed), cost envelope, cash cap
   and rules. Quantities are never transferred between venues.
-- **One governed admission reserves the aggregate atomically** before anything is externally visible (ADR-0051 §1):
+- **One governed admission reserves the aggregate atomically** before anything is externally visible (ADR-0051 §1).
+  With `aᵢ` the final cost-priced charge of leg *i* (after quantization; `A = Σ aᵢ`, weights normalized, nonnegative,
+  quantization slack kept inside the admitted `A`):
 
   ```text
-  A ≤ min(0.01 × capital_base, monthly_budget − consumed − latent_before)
-  latent_after = latent_before + A
-  A × wᵢ ≤ 0.01 × Bᵢ                          (per-leg cap on the venue's own basis)
-  Σ_month(leg losses on venue i) + latent_i ≤ λ × Bᵢ   (per-venue monthly cap, N2)
+  A = Σ aᵢ > 0
+  A ≤ 0.01 × capital_base
+  consumed + latent_before + A ≤ monthly_budget                    (global, ADR-0051 net-from-start)
+  aᵢ ≤ 0.01 × Bᵢ                                                  (per-leg cap on the venue's own basis)
+  local_consumedᵢ = max(0, −settlement_complete_local_netᵢ)       (signed net, ADR-0051 semantics)
+  local_consumedᵢ + local_latent_beforeᵢ + aᵢ ≤ λ × Bᵢ            (per-venue monthly cap, N2)
   ```
 
-  Reservations are held through unknown acknowledgements, partial fills and unsettled closes; a failed leg's reservation is
-  released only after `OrderLookup::Absent` or `Terminal` evidence that no liability remains (`Unknown` never releases).
-  Failed weights are not redistributed; a recovered venue is not entered later without the operator's retry policy (N3).
+  Global and local reservations are committed together or not at all. Reservations are held through unknown
+  acknowledgements, partial fills and unsettled closes; a failed leg's reservation is released only after
+  `OrderLookup::Absent` (under the venue's finality rule) or `Terminal` evidence that no liability remains (`Unknown`
+  never releases). Failed weights are not redistributed; a recovered venue is not entered later without the operator's
+  retry policy (N3).
 - **Budget: global 4 % plus a per-venue monthly cap λ (N2).** The global −4 % on the consolidated basis stays the outer
-  bound. A per-venue monthly cap `λ × Bᵢ`, enforced by the same reservation, bounds what any single venue can lose in a
-  month; `λ = 4 %` makes it a pure per-venue budget (no fungibility), larger λ keeps fungibility. Proposed default
-  `λ = 8 %`. Without λ no local survival guarantee exists (one venue could absorb the whole global allowance); the
-  viability floor below is derived from λ and is only a guarantee when λ is enforced.
+  bound. The per-venue cap `λ × Bᵢ` uses the same signed-net definition as ADR-0051, so at `λ = 4 %` it is exactly a
+  per-venue ADR-0051 budget (no fungibility); larger λ keeps fungibility. Proposed default `λ = 8 %`. Without λ no local
+  survival statement exists (one venue could absorb the whole global allowance); the floor below is a guarantee only
+  while λ is enforced, within the execution envelope (N1-a exposure excluded), without external cashflows, and under the
+  prices, rules and costs assumed at evaluation.
 - **Viability floor per venue** (operator requirement). Let `Cₛ = Bᵢ × (1 − λ)^K` be the stressed bankroll after `K`
   worst months at the local cap. Let `q*` be the **single minimum feasible quantity** on the venue for the symbol: the
-  smallest lot-aligned quantity that satisfies the lot minimum, the market-order notional minimum for entry (Binance spot
-  applies it on a 5-minute average price), the exit/protection notional rules, and that remains sellable net of base
-  commission. A venue is viable for the symbol only if both hold:
+  smallest lot-aligned quantity such that (i) the entry market order passes the lot and notional minimums (Binance spot
+  evaluates the notional on a 5-minute average price, so the reference is an envelope, not the entry price), (ii) the
+  **net protectable quantity** after the commission policy (base-asset commission reduces the bought quantity;
+  quantization of the protection rounds down) still passes the lot minimum, and (iii) the protection/exit order passes
+  the notional minimum **at the executable stop region**, not at entry. Any remainder that cannot be protected is a
+  reserved liability priced at the conservative mark. A venue is viable for the symbol only if both hold:
 
   ```text
   0.01 × Cₛ              ≥  q* × worst_loss_per_unit(d_max, costs)     (risk capacity)
-  Cₛ × (1 − headroom)     ≥  q* × entry_price                            (stressed cash)
+  Cₛ × (1 − headroom)     ≥  q* × entry_price_envelope                   (stressed cash)
   ```
 
   `d_max` is the maximum admissible executable distance (ADR-0050 §5 bound; conservative input), `worst_loss_per_unit`
-  the ADR-0050 §3 costing (distance + gap + fees per fill from the envelope). **Illustration** with repository defaults
-  (gap 10 bps, taker 5 bps per fill, `d_max` 10 %, long-side loss ratio 0.10185), `λ = 4 %`, K = 3, entry 77,500 USDT:
-  Binance USDⓈ-M BTCUSDT (`q*` = 0.001 BTC, notional 77.5 ≥ 50 USDT) → risk 7.89 USDT → `Bᵢ ≥ 7.89 / (0.01 × 0.8847)
-  ≈ 892 USDT`; Binance spot BTCUSDT (`q*` = 0.00007 BTC: 0.00001 lots are worth 0.78 USDT, below the 5 USDT minimum)
-  → risk 0.5525 USDT → `Bᵢ ≥ 62.5 USDT`. These use repository fee defaults, not current spot fee quotations. `K` is
-  `ROBSON_VENUE_VIABILITY_MONTHS` (proposed 3). The floor is checked when an allocation is saved, at every month boundary
-  and at admission; a venue below it is flagged in `/status` and excluded from new legs, never from exits.
+  the ADR-0050 §3 costing (adverse fill at `(1 − d_max) × (1 − gap)`, taker per fill, long-side loss ratio 0.10184955
+  with repository defaults). Thresholds round **up** to the venue's cash precision. **Illustrations** (conditional
+  arithmetic with repository fee defaults, entry 77,500 USDT, `d_max` 10 %, loss per BTC 7,893.34 USDT; not accepted
+  floors; metadata in `docs/evidence/2026-11-04-binance-exchangeinfo-btcusdt.md`):
+
+  | Venue | `q*` and why | Planned loss | Floor, λ = 4 %, K = 3 (×0.884736) | Floor, λ = 8 %, K = 3 (×0.778688) |
+  |---|---|---:|---:|---:|
+  | Binance USDⓈ-M BTCUSDT | 0.001 BTC (lot min; 77.5 ≥ 50 USDT) | 7.893 USDT | ≥ 892.17 USDT | ≥ 1,013.68 USDT |
+  | Binance spot BTCUSDT, quote-fee policy | 0.00008 BTC (7 lots = 5.425 USDT at entry but 4.88 USDT at the stop region, failing the 5 USDT exit check; 8 lots = 5.58 USDT there) | 0.631 USDT | ≥ 71.37 USDT | ≥ 81.09 USDT |
+  | Binance spot BTCUSDT, base-fee policy | not shown: 8 lots net of a 5 bps base commission round down to 7 protectable lots; `q*` must be solved with the commission precision and the chosen policy (N5) | — | — | — |
+
+  `K` is `ROBSON_VENUE_VIABILITY_MONTHS` (proposed 3). The floor is checked when an allocation is saved, at every month
+  boundary and at admission. It states bankroll sufficiency, not uninterrupted trading: re-applying a rolling K-month
+  floor can suspend a venue before K months elapse; a venue below it is flagged in `/status` and excluded from new legs,
+  never from exits.
 - **Costs are visible where the weights are edited**: the API returns each venue's envelope next to its weight.
 - **Out of scope here**: cross-venue routing by liquidity, synthetic hedges, transfer automation.
 
 ### 8. Sequencing and rollback boundaries
 
-Eight PRs, each Codex-reviewed before merge, during the empty-book window.
+Eight PRs, each Codex-reviewed before merge, during the empty-book window. Mechanical steps (1, 3) change no timing,
+threshold or budget; any such change is its own step.
 
 | Step | Content | Behaviour | Rollback boundary |
 |------|---------|-----------|-------------------|
@@ -321,12 +370,14 @@ Eight PRs, each Codex-reviewed before merge, during the empty-book window.
 | 2 | New port contracts (§2) + USDⓈ-M adapter implementing them; legacy `ExchangePort` kept as a forwarding compatibility layer; separate `unrealized_pnl` field added, `wallet_balance` untouched | preserving | revert 2 (and 3 if merged) |
 | 3 | `VenueFactory`, `with_venue`, feed injection with `(VenueId, Symbol)` keys, additive `/readyz.venue` | preserving for execution; additive for readiness consumers | revert alone |
 | 4 | Rust naming and endpoint cleanup with stable event, `Position` and credential encodings; fixtures | preserving | revert alone |
-| 5 | Accounting: governed equity derived once; month-boundary basis uses ADR-0051 §3 cost-priced downside; persisted carried bases; atomic reset | **changing** (basis) | revert alone before the next month boundary; after it, the persisted basis of that month stands |
+| 5 | Accounting: governed equity derived once; month-boundary basis uses ADR-0051 §3 cost-priced downside; **migration** for persisted carried bases with compatible settlement attribution and replay handling; atomic reset | **changing** (basis, persisted state version) | once new accounting state is written, rollback needs demonstrated reader/writer compatibility of the older binary with that state, or a verified book free of risk-bearing and unsettled liabilities; keeping `capital_base` alone is insufficient |
 | 6 | Quantisation and metadata rules (§5) with before/after fixtures per order kind | **changing** | revert alone only with a verified empty book (the old helper is incompatible with spot lots) |
-| 7 | Durable intent journal in the store: intents and results persisted in order relative to reservations, stable venue-scoped client ids, explicit unresolved states; process-kill tests at every external-call/persistence boundary | preserving (adds evidence) | revert alone with an empty book |
-| 8 | Spot venue acceptance behind `ROBSON_VENUE=binance_spot`: `InventoryPort`, protection protocol per N1, settlement from fills, conformance suite green; the long-only entry gate is a separate ADR | new venue | disabling a venue stops new admissions on it but **keeps managing its open and unsettled legs**; a binary rollback requires a verified empty book on that venue |
+| 7 | Durable intent journal in the store (migration): intents and results persisted in order relative to reservations, stable venue-scoped client ids, explicit unresolved states, transition intents (§2.2); **durable venue/account routing on every risk-bearing and unsettled leg**, with the legacy mapping of every existing position to `binance:usdm`; process-kill tests at every external-call/persistence boundary | preserving (adds evidence and identity) | revert alone with an empty book; after step 8 only together with step 8 |
+| 8 | Spot venue acceptance behind `ROBSON_VENUE=binance_spot`: `InventoryPort`, protection protocol per N1, settlement from fills, conformance suite green; the long-only entry gate is a separate ADR | new venue | disabling a venue stops new admissions on it but **keeps managing its open and unsettled legs** through the step-7 routing; a binary rollback requires a verified empty book on that venue |
 
-No schema migration in steps 1–6. Step 7 (intent journal tables) and the §7 identities ship with explicit migrations.
+Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
+migrations and persisted-state versions. Every rollback names its transitive dependency prefix: a step is reverted only
+together with every later merged step that imports it, and only at a persisted-state version its binary can read.
 
 ### 9. Not decided here
 
@@ -337,19 +388,31 @@ only).
 
 - **Conformance suite** in `robson-testkit`, run against `StubExchange`, the USDⓈ-M adapter and (step 8) the spot
   adapter: flags agree with accessors; protection is `MarketOnTrigger`; replacement property per protocol
-  (`PlaceThenCancel`: the old stop is never absent while the new one is unaccepted; `CancelThenPlaceBoundedWindow`: every
-  window is one request, is evented with its duration, ends in `Replaced`, re-protect or flatten); arbitration property
-  (a filled stop is never followed by a sell of the original quantity).
+  (`PlaceThenCancel`: the old stop is never absent while the new one is unaccepted; `CancelThenPlace`: the transition
+  intent is persisted before the cancel, the gauge is nonzero for the whole exposure, and the transition ends only in
+  confirmed protection or authoritative closure); arbitration property under concurrent fills (**protected residual
+  inventory or authoritative closure**, never a sell of a stale quantity); finality property (`Absent` only under the
+  venue's finality rule).
 - **Admission property** (money, per proposal): `A ≤ min(0.01 × capital_base, monthly_budget − consumed −
   latent_before)` and `latent_after = latent_before + A`; per-venue `A × wᵢ ≤ 0.01 × Bᵢ` and the λ cap; property-tested
   under concurrent proposals and concurrent settlement.
-- **Request budget** per venue, measured by a per-venue counter exported in `/metrics` and asserted in tests: rules
-  refresh ≤ 1 per symbol per 5 min; costs ≤ 1 per symbol per 24 h; valuation from the feed, REST fallback ≤ 12 per
-  symbol per minute; account observation ≤ 6 per minute; order lookups ≤ pending intents per minute; no REST call on a
-  market tick. Degraded mode (feed silent) keeps the same ceilings.
-- **Concurrency and memory bounds**: at most one in-flight order operation per leg; legs ≤ slot count; event-bus
-  channels bounded (existing capacity); pending recovery work bounded by legs; subscriptions = active `(venue, symbol)`
-  set, torn down on close.
+- **Request and query budget**, measured per handled operation (admission, close, protection transition,
+  reconciliation pass, recovery of one leg) by instrumentation exported in `/metrics` and asserted in tests: DB queries
+  and **weighted** exchange requests per operation, alert above 15 unless a reviewed operation-specific bound is recorded
+  (guardrails §3). Steady-state ceilings per venue: rules refresh ≤ 1 per symbol per 5 min **plus** one per rules
+  rejection (§5); costs ≤ 1 per symbol per 24 h; valuation from the feed, REST fallback ≤ 12 per symbol per minute;
+  account observation ≤ 6 per minute; order lookups ≤ pending intents per minute; no REST call on a market tick. An
+  aggregate weighted-request budget across venues and symbols respects each exchange's shared limits; protective
+  operations (re-protect, flatten, reconciliation of an `Unknown`) have priority and an explicit emergency budget over
+  the steady-state ceilings, recorded per incident. Degraded mode (feed silent) keeps the same ceilings.
+- **Concurrency and memory bounds**: financial admission depends **only** on the monetary constraints of §7 (slots
+  report guaranteed full-cap opportunities, `policy.rs:253`, and never cap legs or admissions). Execution is bounded by
+  worker concurrency (one in-flight transition per leg, `ROBSON_EXEC_WORKERS` proposed 4) and bounded queues; recovery
+  work is durable and paginated, scheduled independently of any financial count; event-bus channels keep their bounded
+  capacity; subscriptions equal the active `(venue, symbol)` set and are torn down on close; caches, tasks and recovery
+  entries are profiled for cleanup at the supported cardinality (legs × venues) and the profile is part of the review.
+- **Feed properties**: reconnect snapshot anchoring, fallback-exit hysteresis (existing), and property tests for
+  duplicate and reordered delivery per venue.
 - **Durable recovery evidence**: every recovery decision emits an event (observed fills, remaining inventory, protection
   evidence, retained liabilities, unresolved failures); `/status` exposes per-venue eligibility, staleness and inventory
   discrepancies (mandatory, not optional).
@@ -368,7 +431,7 @@ only).
 | Venue REST dies | rules/costs/valuation stale → basis invalid, admission fails closed; risk reduction proceeds on the persisted rules snapshot with retries | reads from cache until TTL; protection on the venue | per-venue `eligible=false` + reasons; alert |
 | Venue feed silent | watchdog after `ROBSON_FEED_SILENCE_MAX`; REST snapshot resync; trailing advances continue on REST ticks within the request budget | bounded REST polling | silent-feed metric, event |
 | Daemon dies mid fan-out | accepted legs are protected on their venues except for a leg killed between entry fill and protection placement, which recovery protects or flattens first | startup recovery reads the durable journal and each venue's observation; completes, protects or releases per evidence | recovery events per leg |
-| Daemon dies inside a balance-account window (N1-a) | the leg is unprotected for the outage | first recovery action on that leg: re-protect or flatten | window event with duration; recovery event |
+| Daemon dies, venue unreachable or placement rejected inside a balance-account transition (N1-a) | the leg is unprotected for the whole interval, with no maximum duration; loss can exceed the priced envelope and every cap | retry, flatten, then re-protect-or-flatten as the first recovery action; admission on the venue blocked | `unprotected_inventory` gauge and alert while nonzero; transition event with duration; recovery event |
 | Daemon dies mid replacement (position account) | old stop still live (place-then-cancel) | recovery heals from `open_protective_orders` | recovery event |
 | Unknown order outcome (timeout) | reservation held; `order_by_client_id` before any retry; `Unknown` keeps the leg pending | no blind retry | event, `/status` pending count |
 | Stale fees / rules / valuation | admission fails closed; risk reduction unaffected (persisted snapshot) | — | `/status` per-venue staleness |
@@ -377,12 +440,13 @@ only).
 
 ## Consequences
 
-- Positive: a second venue is an adapter plus a factory arm; the risk ADRs are untouched; spot long-only becomes a small
-  ADR once N1 is decided; the regulatory single point of failure of 2026-11-04 is structurally addressed; failure modes
+- Positive: a second venue is an adapter plus a factory arm; the risk numbers and the ADR-0050/0051 policies are
+  untouched; spot long-only becomes a small ADR once N1 is decided; the regulatory single point of failure of 2026-11-04 is structurally addressed; failure modes
   are written down per venue.
 - Negative / trade-offs: eight refactor PRs with no operator-visible feature before step 8; optional ports add branching;
   the consolidated basis needs every venue reachable and valued at month start; spot inventory accounting is new surface;
-  N1-a accepts a bounded unprotected window that position accounts do not have.
+  N1-a accepts an unprotected interval without a guaranteed maximum duration that position accounts do not have, and
+  qualifies the ADR-0039 and ADR-0052 guarantees on balance accounts.
 - Left on the table: cross-venue netting and routing, transfer automation, order-level authorship verification in
   reconciliation, shared execution accounts.
 
@@ -391,7 +455,7 @@ only).
 | Option | Second venue cost | Safety of spot | Risk-ADR impact | Chosen |
 |---|---|---|---|---|
 | A. Keep `ExchangePort`, stub futures methods in spot adapters | low | unsafe (reconciliation and replacement assume a position account) | none on paper, broken in practice | no |
-| B. Capability-split ports + required observation/settlement + durable journal (this ADR) | medium | safe by contract and conformance, modulo N1 | none | **yes** |
+| B. Capability-split ports + required observation/settlement + durable journal (this ADR) | medium | safe by contract and conformance, modulo N1 | none on numbers; ADR-0039/0052 guarantees qualified on balance accounts under N1-a | **yes** |
 | C. One crate per adapter now | medium+ | as B | none | later |
 | D. Rename the persisted field | — | — | breaks ADR-0049 replay | no |
 
@@ -400,7 +464,7 @@ Budget model for multi-venue:
 | Option | −4 % consolidated | Local monthly loss bounded | Fungibility | Chosen |
 |---|---|---|---|---|
 | Global only | yes | no (one venue can absorb the whole allowance) | full | no |
-| Per-venue 4 % × Bᵢ (Σ = 4 % × ΣBᵢ for any weights) | yes | yes (4 %) | none | = N2 with λ = 4 % |
+| Per-venue 4 % × Bᵢ, signed net (Σ = 4 % × ΣBᵢ for any weights) | yes | yes (4 %) | none | = N2 with λ = 4 % |
 | Global + per-leg 1 % × Bᵢ, no monthly local cap | yes | no | high | no (v2's choice; the survival claim did not hold) |
 | Global + per-venue monthly cap λ × Bᵢ + floor derived from λ | yes | yes (λ) | partial (λ > 4 %) | **yes**, λ per N2 |
 
@@ -408,7 +472,8 @@ Budget model for multi-venue:
 
 ## Needs Input (operator)
 
-- **N1** Protection continuity on balance accounts: N1-a bounded-window amendment to ADR-0039 (recommended) or N1-b spot
+- **N1** Protection continuity on balance accounts: N1-a non-atomic transition exception to ADR-0039 with the exposure
+  stated in §2.2 (no guaranteed maximum duration; loss may exceed the envelope and the caps; recommended) or N1-b spot
   ineligible.
 - **N2** Per-venue monthly cap λ (proposed 8 %; 4 % = pure per-venue budget) and `K` (proposed 3).
 - **N3** Failed-leg policy (never redistribute, proposed) and retry authority for a venue that recovers mid-operation.
@@ -416,7 +481,7 @@ Budget model for multi-venue:
 - **N5** Cost envelope source: venue API (Binance exposes commission rates) with a 24 h staleness rule, or configuration
   with an `as_of` date.
 - **N6** Execution account on spot: dedicated Binance sub-account on the corporate account (recommended; requires the PJ
-  account) or a dedicated API profile on a dedicated account.
+  account) or a separate dedicated account; a separate API key on a shared account is not an option.
 
 ## Implementation Notes
 
@@ -424,12 +489,17 @@ Budget model for multi-venue:
 - Step 2: `robson-exec/src/{ports,executor,stub}.rs`, `robson-connectors/src/binance/usdm/exchange.rs`, `robson-testkit`.
 - Step 3: `robsond/src/{daemon,main,config,api,market_data,event_bus,position_manager}.rs`.
 - Step 4: `robson-domain/src/{credentials,entities,events,lib}.rs`, `robson-engine/src/lib.rs`, `robson-store/src/memory.rs`, fixtures.
-- Step 5: `robsond/src/daemon.rs` (boundary), `robson-domain` (carried basis), migration for persisted carried bases.
+- Step 5: `robsond/src/daemon.rs` (boundary), `robson-domain` (carried basis), migration for persisted carried bases
+  and settlement attribution, persisted-state version bump.
 - Step 6: `robson-exec/src/quantize.rs`, `robsond/src/position_manager.rs`, usdm adapter; before/after fixtures.
-- Step 7: `robson-exec/src/intent.rs` → store-backed journal; migration; process-kill tests.
+- Step 7: `robson-exec/src/intent.rs` → store-backed journal; migration (journal tables, leg routing columns, legacy
+  mapping); process-kill tests.
 - Step 8: `robson-connectors/src/binance/spot/*`; conformance suite; `ROBSON_VENUE=binance_spot`.
-- Evidence: `docs/evidence/2026-11-04-binance-exchangeinfo-btcusdt.md` to be added with timestamped extracts (spot
-  `orderTypes`, `LOT_SIZE`, `NOTIONAL`; futures `LOT_SIZE`, `MIN_NOTIONAL` 50 USDT), source URLs and hashes.
+- Evidence: `docs/evidence/2026-11-04-binance-exchangeinfo-btcusdt.md` (retained in this PR): timestamped verbatim
+  extracts with source URLs and SHA-256 of the raw responses; spot `orderTypes` includes `STOP_LOSS`, `LOT_SIZE` step
+  0.00001, `NOTIONAL` min 5 USDT (applyMinToMarket, avgPriceMins 5); futures `LOT_SIZE` step 0.001, `MIN_NOTIONAL` 50
+  USDT, `orderTypes` includes `STOP_MARKET`. Symbol availability only; account authorisation per order type is an
+  activation gate (§2.1). The 68 DB-gated test annotations reproduce from source; security workflows are unchanged.
 
 ## Review trail
 
@@ -445,3 +515,13 @@ Budget model for multi-venue:
   λ (N2); unrealized P&L separated from the basis change (step 5); durable journal (step 7); client-id lookup in
   `TradingPort`; funding gated and routed; separate admission vs risk-reduction metadata rules; eight-step sequencing with
   honest rollback boundaries; measurable acceptance criteria; serialization contract narrowed.
+- v3 (2026-11-04): Codex, REQUEST_CHANGES, 9 findings (P0: "bounded window" still false under failure; P1: arbitration
+  from final outcomes and finality rule, account-wide inventory enumeration, spot `q*` not shown feasible at the stop
+  region and net of base commission, slot-count ceiling and guardrail bounds, funding worker vs saga recovery conflict,
+  migration/rollback inconsistencies; P2: local-cap semantics (signed net, proposed reservation), survival
+  qualifications; Low: evidence absent). Arithmetic of 892.17 / 62.45 USDT reproduced by the reviewer.
+- v4: N1-a restated without a duration bound and with the loss statement; transition intent persisted before cancel;
+  `unprotected_inventory` gauge; residual from final outcomes; `VenueFinalityRule`; account-wide `account_observation`;
+  `q*` solved at the stop region with 8 lots (71.37 / 81.09 USDT) and base-fee case deferred to N5; slot ceiling removed,
+  per-operation query budgets and aggregate limits added; funding recovery workers per saga route; step 5 migration and
+  step 7 leg routing; signed-net local cap with the proposed reservation; evidence file retained.
