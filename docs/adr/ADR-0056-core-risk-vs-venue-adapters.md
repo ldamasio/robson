@@ -1,6 +1,6 @@
 # ADR-0056 — Core Risk Policy vs Venue Adapters: Port Contracts, Adapter Relocation, Multi-Venue Execution Model
 
-**Date**: 2026-11-04 (v4; v1–v3 reviewed by Codex gpt-6.1-sol xhigh: 15 + 14 + 9 findings, see Review trail)
+**Date**: 2026-11-04 (v5; v1–v4 reviewed by Codex gpt-6.1-sol xhigh: 15 + 14 + 9 + 4 findings, see Review trail)
 **Status**: PROPOSED (operator decision pending on the items under Needs Input, in particular N1 and N2)
 **Deciders**: RBX Systems (operator + architecture)
 **Amends**: [ADR-0024](ADR-0024-trading-policy-layer.md) §6 (capital base source becomes venue-neutral and names its valuation),
@@ -112,7 +112,9 @@ TradingPort                      required
       StopCancelOutcome = { Cancelled{filled_before_cancel: Decimal, fills}, AlreadyGone{final: OrderLookup}, Unknown }
   replace_protection(symbol, old: StopRef, new: StopParams) -> ReplaceOutcome
       ReplaceOutcome = { Replaced{new, old_filled: Decimal}, OldKeptNewRejected, OldCancelledNewRejected{old_filled},
-                         TriggerAlreadyCrossed{old_fills}, Unknown }
+                         TriggerAlreadyCrossed{old: OrderLookup, residual: Decimal}, Unknown }
+      TriggerAlreadyCrossed is a venue rejection of the new trigger, not execution evidence; `old` is the old stop's
+      final state with authoritative cumulative fills and `residual = governed − old_filled`
   order_by_client_id(symbol, client_id) -> OrderLookup
       OrderLookup = { Absent{finality: VenueFinalityRule}, Open{filled_qty}, PartiallyFilled{..}, Terminal{fills,
                       cancelled_qty}, Unknown }
@@ -200,8 +202,13 @@ the operator and recommends the first, with the residual risk stated in full:
 the stop's final lifecycle state and cumulative fills (`StopCancelOutcome`, `ReplaceOutcome`), never from a lookup taken
 before the cancel (the stop can fill in between). An `Unknown` outcome reconciles the original request to a final state
 before any further submission; the leg stays pending with its reservation held. Typed transitions cover partial
-cancellation with partial fill, a replacement whose trigger is already crossed (`TriggerAlreadyCrossed`: the old fills
-are the exit, no new stop), and a partially executed flatten (residual re-protected or re-flattened). Reusing a
+cancellation with partial fill, a replacement whose trigger is already crossed, and a partially executed flatten
+(residual re-protected or re-flattened). `TriggerAlreadyCrossed` is **not** execution evidence: the old stop may have
+zero or partial fills (cancel accepted, then price crossed the new trigger before placement). The executor establishes
+the old stop's final state and authoritative cumulative fills, computes the residual, and if it is positive enters the
+governed market-flatten path immediately, retaining any still-live protection until its cancellation is required; a
+zero residual completes the exit only on authoritative fills, with unsettled costs still charged; unknown outcomes and
+unexecutable residuals stay visibly unresolved. Reusing a
 `client_id` is idempotent only within the venue's finality rule; a `Terminal` outcome releases only the liabilities
 proven extinguished: filled inventory and unsettled costs stay charged until settlement evidence arrives.
 
@@ -320,8 +327,9 @@ isolation (§3); durable intent journal (§8 step 7).
   `OrderLookup::Absent` (under the venue's finality rule) or `Terminal` evidence that no liability remains (`Unknown`
   never releases). Failed weights are not redistributed; a recovered venue is not entered later without the operator's
   retry policy (N3).
-- **Budget: global 4 % plus a per-venue monthly cap λ (N2).** The global −4 % on the consolidated basis stays the outer
-  bound. The per-venue cap `λ × Bᵢ` uses the same signed-net definition as ADR-0051, so at `λ = 4 %` it is exactly a
+- **Budget: global 4 % plus a per-venue monthly cap λ (N2).** These are enforced **admission-budget** constraints;
+  their realized-loss implications depend on the priced execution envelope, and N1-a exposure can exceed every stated
+  cap. Within the envelope the global −4 % on the consolidated basis is the outer bound. The per-venue cap `λ × Bᵢ` uses the same signed-net definition as ADR-0051, so at `λ = 4 %` it is exactly a
   per-venue ADR-0051 budget (no fungibility); larger λ keeps fungibility. Proposed default `λ = 8 %`. Without λ no local
   survival statement exists (one venue could absorb the whole global allowance); the floor below is a guarantee only
   while λ is enforced, within the execution envelope (N1-a exposure excluded), without external cashflows, and under the
@@ -342,14 +350,15 @@ isolation (§3); durable intent journal (§8 step 7).
 
   `d_max` is the maximum admissible executable distance (ADR-0050 §5 bound; conservative input), `worst_loss_per_unit`
   the ADR-0050 §3 costing (adverse fill at `(1 − d_max) × (1 − gap)`, taker per fill, long-side loss ratio 0.10184955
-  with repository defaults). Thresholds round **up** to the venue's cash precision. **Illustrations** (conditional
+  with repository defaults). Thresholds are computed at full precision and rounded **up** (ceiling) to the venue's cash precision; the table
+  shows two-decimal ceilings. **Illustrations** (conditional
   arithmetic with repository fee defaults, entry 77,500 USDT, `d_max` 10 %, loss per BTC 7,893.34 USDT; not accepted
   floors; metadata in `docs/evidence/2026-11-04-binance-exchangeinfo-btcusdt.md`):
 
   | Venue | `q*` and why | Planned loss | Floor, λ = 4 %, K = 3 (×0.884736) | Floor, λ = 8 %, K = 3 (×0.778688) |
   |---|---|---:|---:|---:|
   | Binance USDⓈ-M BTCUSDT | 0.001 BTC (lot min; 77.5 ≥ 50 USDT) | 7.893 USDT | ≥ 892.17 USDT | ≥ 1,013.68 USDT |
-  | Binance spot BTCUSDT, quote-fee policy | 0.00008 BTC (7 lots = 5.425 USDT at entry but 4.88 USDT at the stop region, failing the 5 USDT exit check; 8 lots = 5.58 USDT there) | 0.631 USDT | ≥ 71.37 USDT | ≥ 81.09 USDT |
+  | Binance spot BTCUSDT, quote-fee policy | 0.00008 BTC (7 lots = 5.425 USDT at entry but 4.88 USDT at the stop region, failing the 5 USDT exit check; 8 lots = 5.58 USDT there, conditional on that reference envelope) | 0.631 USDT | ≥ 71.38 USDT | ≥ 81.10 USDT |
   | Binance spot BTCUSDT, base-fee policy | not shown: 8 lots net of a 5 bps base commission round down to 7 protectable lots; `q*` must be solved with the commission precision and the chosen policy (N5) | — | — | — |
 
   `K` is `ROBSON_VENUE_VIABILITY_MONTHS` (proposed 3). The floor is checked when an allocation is saved, at every month
@@ -391,11 +400,15 @@ only).
   (`PlaceThenCancel`: the old stop is never absent while the new one is unaccepted; `CancelThenPlace`: the transition
   intent is persisted before the cancel, the gauge is nonzero for the whole exposure, and the transition ends only in
   confirmed protection or authoritative closure); arbitration property under concurrent fills (**protected residual
-  inventory or authoritative closure**, never a sell of a stale quantity); finality property (`Absent` only under the
+  inventory or authoritative closure**, never a sell of a stale quantity), with crossed-trigger cases at zero old
+  fills, partial old fills and partial flattening; finality property (`Absent` only under the
   venue's finality rule).
-- **Admission property** (money, per proposal): `A ≤ min(0.01 × capital_base, monthly_budget − consumed −
-  latent_before)` and `latent_after = latent_before + A`; per-venue `A × wᵢ ≤ 0.01 × Bᵢ` and the λ cap; property-tested
-  under concurrent proposals and concurrent settlement.
+- **Admission property** (money, per proposal). With `R` the requested risk before quantization and normalized
+  nonnegative operator weights, each leg is derived from `R × wᵢ`, its final post-quantization charge `aᵢ` is computed,
+  and `A = Σ aᵢ` is reserved; unused slack is not redistributed. Asserted on the same charges committed atomically with
+  the global reservation: `A ≤ min(0.01 × capital_base, monthly_budget − consumed − latent_before)`,
+  `latent_after = latent_before + A`, `aᵢ ≤ 0.01 × Bᵢ`, `local_consumedᵢ + local_latent_beforeᵢ + aᵢ ≤ λ × Bᵢ`;
+  property-tested under concurrent proposals and concurrent settlement.
 - **Request and query budget**, measured per handled operation (admission, close, protection transition,
   reconciliation pass, recovery of one leg) by instrumentation exported in `/metrics` and asserted in tests: DB queries
   and **weighted** exchange requests per operation, alert above 15 unless a reviewed operation-specific bound is recorded
@@ -427,7 +440,7 @@ only).
 
 | Dependency / event | What happens | Degraded mode | Visibility |
 |---|---|---|---|
-| Database dies | no admission, no new legs; open legs keep exchange-resident protection; intent results cannot be persisted → in-flight operations enter `Unknown` and are resolved by lookup on recovery | read-only `/status` from memory; arms refused | `/readyz.database=false`; recovery events |
+| Database dies | no admission, no new legs; already-installed protection remains on the exchange; inventory in an N1-a transition may remain unprotected without a duration or loss bound; no cancellation starts without a durable intent, and unfinished transitions retain liabilities and alerts and resume from that intent on recovery; intent results cannot be persisted → in-flight operations enter `Unknown` and are resolved by lookup on recovery | read-only `/status` from memory; arms refused | `/readyz.database=false`; `unprotected_inventory` gauge; recovery events |
 | Venue REST dies | rules/costs/valuation stale → basis invalid, admission fails closed; risk reduction proceeds on the persisted rules snapshot with retries | reads from cache until TTL; protection on the venue | per-venue `eligible=false` + reasons; alert |
 | Venue feed silent | watchdog after `ROBSON_FEED_SILENCE_MAX`; REST snapshot resync; trailing advances continue on REST ticks within the request budget | bounded REST polling | silent-feed metric, event |
 | Daemon dies mid fan-out | accepted legs are protected on their venues except for a leg killed between entry fill and protection placement, which recovery protects or flattens first | startup recovery reads the durable journal and each venue's observation; completes, protects or releases per evidence | recovery events per leg |
@@ -461,7 +474,7 @@ only).
 
 Budget model for multi-venue:
 
-| Option | −4 % consolidated | Local monthly loss bounded | Fungibility | Chosen |
+| Option | −4 % consolidated admission budget | Local monthly admission budget bounded (realized loss within the execution envelope; N1-a exposure excluded) | Fungibility | Chosen |
 |---|---|---|---|---|
 | Global only | yes | no (one venue can absorb the whole allowance) | full | no |
 | Per-venue 4 % × Bᵢ, signed net (Σ = 4 % × ΣBᵢ for any weights) | yes | yes (4 %) | none | = N2 with λ = 4 % |
@@ -525,3 +538,8 @@ Budget model for multi-venue:
   `q*` solved at the stop region with 8 lots (71.37 / 81.09 USDT) and base-fee case deferred to N5; slot ceiling removed,
   per-operation query budgets and aggregate limits added; funding recovery workers per saga route; step 5 migration and
   step 7 leg routing; signed-net local cap with the proposed reservation; evidence file retained.
+- v4 (2026-11-04): Codex, REQUEST_CHANGES, 4 findings (P1: `TriggerAlreadyCrossed` treated as execution evidence; P2:
+  database row and budget wording not yet qualified by N1-a, §10 asserting pre-quantization weights, display rounding
+  71.37/81.09 vs ceilings 71.38/81.10). Resolved 3, 5, 6, 7, 9 of round 3.
+- v5: crossed trigger carries the old stop's final state and residual and routes to flatten; admission property on
+  post-quantization charges; database row, budget statement and matrix qualified; ceilings corrected.
