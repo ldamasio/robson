@@ -1,7 +1,7 @@
 # ADR-0056 — Core Risk Policy vs Venue Adapters: Port Contracts, Adapter Relocation, Multi-Venue Execution Model
 
 **Date**: 2026-11-04 (v5; v1–v4 reviewed by Codex gpt-6.1-sol xhigh: 15 + 14 + 9 + 4 findings; v5 APPROVED with one P3 nit applied, see Review trail)
-**Status**: ACCEPTED 2026-11-05 (operator: N1-a chosen; single-venue spot on the personal account first; N2–N5 remain open until a second venue is added)
+**Status**: ACCEPTED 2026-11-05 (operator: N1-a chosen; single-venue spot on the personal account first; N2–N4 remain open until a second venue is added; N5 must be resolved before step 8 activation, with §2.5's freshness and fee-asset requirements enforced from the first spot admission)
 **Deciders**: RBX Systems (operator + architecture)
 **Amends**: [ADR-0024](ADR-0024-trading-policy-layer.md) §6 (capital base source becomes venue-neutral and names its valuation),
 [ADR-0039](ADR-0039-exchange-side-insurance-stop.md) (the protective stop becomes a venue contract with an explicit lifecycle).
@@ -516,7 +516,8 @@ Budget model for multi-venue:
 - **N3** Failed-leg policy (never redistribute, proposed) and retry authority for a venue that recovers mid-operation.
 - **N4** Numeraire beyond USDT-quoted venues (USDC, BRL on B3): conversion source and staleness rule.
 - **N5** Cost envelope source: venue API (Binance exposes commission rates) with a 24 h staleness rule, or configuration
-  with an `as_of` date.
+  with an `as_of` date. **Required before step 8 activation**; recommendation: venue API with the 24 h rule, configuration
+  only as an explicit, dated override.
 - **N6** — **decided 2026-11-05 for Fase S**: the personal account's spot wallet is the execution account (see §8),
   with non-Robson holdings moved out beforehand; a dedicated sub-account on the corporate account replaces it once the
   PJ account exists. A separate API key on a shared wallet is not an option.
@@ -574,3 +575,5 @@ Budget model for multi-venue:
   REQUEST_CHANGES on the reorder: P1 interim accounting contract for the deferred step 5 (added to §8: persisted interim
   basis, no carried legs across a month boundary until step 5, quiesce and drain); P3 "dedicated account scope" wording
   in §1. Both applied.
+- v7 (2026-11-05): Codex confirmed the round-6 fixes; P2: N5 (cost source) must be resolved before step 8 activation.
+  Applied to the status line and N5.
