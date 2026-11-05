@@ -87,11 +87,12 @@ if the split simply made the futures-only methods optional.
   is an order on the book). Dated futures later.
 - **Account kind**: `PositionAccount` (the venue reports positions) or `BalanceAccount` (the venue reports holdings only;
   Robson derives its governed position from its own fills).
-- **Execution account**: the account a venue trades on. On balance accounts it is a **dedicated account** (a Binance
-  sub-account on the corporate account, or a separate account on a venue without sub-accounts; a separate API key on a
-  shared account does **not** isolate inventory and does not qualify) that holds only Robson-governed inventory and quote
-  cash. ADR-0022 applies unchanged and account-wide on it: any unauthored holding of any asset that appears there is closed
-  per `docs/policies/UNTRACKED-POSITION-RECONCILIATION.md`. The operator's own holdings never live on an execution account;
+- **Execution account**: the account a venue trades on. On balance accounts it is a **dedicated account scope**: a
+  Binance sub-account on the corporate account, a separate account on a venue without sub-accounts, or, during Fase S,
+  the exclusive personal spot wallet specified in §8. It holds only Robson-governed inventory and quote cash; separate
+  API keys do not isolate shared inventory and do not qualify. ADR-0022 applies unchanged across the entire operated
+  scope: any unauthored holding of any asset that appears there is closed per
+  `docs/policies/UNTRACKED-POSITION-RECONCILIATION.md`. The operator's own holdings never live in an execution scope;
   sharing one is out of scope (would require a policy amendment).
 - **Governed holding**: base-asset inventory bought by a leg, net of base-asset commission, as evidenced by fills.
 - **Leg**: the execution of a logical operation on one venue. Today every position is a single leg on `binance:usdm`.
@@ -380,6 +381,17 @@ until after step 8 and before any second venue, with today's basis derivation ke
 this). The rollback boundaries of the table are unchanged by the reordering: step 6 and step 7 still require the stated
 empty-book conditions, and step 8 depends on steps 2, 3, 6 and 7.
 
+**Interim accounting contract while step 5 is deferred.** Step 8 must establish and persist the interim capital basis
+from the operated spot wallet (quote cash plus governed inventory at the venue mark, §2.4), preserving the active
+monthly model and the consumed budget without any intra-month budget increase. Until step 5 ships, **carrying
+risk-bearing or unsettled legs across a UTC month boundary is unsupported**: admissions quiesce before the boundary and
+the book must drain and settle beforehand. If that cannot be verified at the boundary, accounting is invalid and new
+admissions stay blocked while protection and recovery continue. Supporting carried legs requires step 5 or a separately
+reviewed interim accounting contract. (Reason: today's boundary helper clamps entry-to-stop at zero; with a trailing
+stop above entry it would reserve no downside for a spot leg marked at the boundary, and a normal stop fill could exceed
+the monthly allowance.) The deferred step 5 still requires its own verified empty-book window at deployment time; the
+original pre-spot window does not carry over.
+
 **Execution account during Fase S.** Binance does not offer sub-accounts to the operator's personal account, so the
 execution account is the **spot wallet** of that account, which the spot API observes in isolation from the Funding and
 Earn wallets. The operator moves any non-Robson holdings out of the spot wallet before activation; ADR-0022 applies
@@ -558,3 +570,7 @@ Budget model for multi-venue:
   post-quantization charges; database row, budget statement and matrix qualified; ceilings corrected.
 - v5 (2026-11-04): Codex, **APPROVE** (architecture acceptable at the ADR level with N1–N6 decided by the operator;
   implementation acceptance gates and rollout pending). One P3 nit (§7 `R × wᵢ` vs `A = Σ aᵢ` notation) applied.
+- v6 (2026-11-05): operator decisions recorded (N1-a, Fase S order, personal spot wallet as execution scope). Codex
+  REQUEST_CHANGES on the reorder: P1 interim accounting contract for the deferred step 5 (added to §8: persisted interim
+  basis, no carried legs across a month boundary until step 5, quiesce and drain); P3 "dedicated account scope" wording
+  in §1. Both applied.
