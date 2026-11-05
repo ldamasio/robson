@@ -1,7 +1,7 @@
 # ADR-0056 — Core Risk Policy vs Venue Adapters: Port Contracts, Adapter Relocation, Multi-Venue Execution Model
 
 **Date**: 2026-11-04 (v5; v1–v4 reviewed by Codex gpt-6.1-sol xhigh: 15 + 14 + 9 + 4 findings; v5 APPROVED with one P3 nit applied, see Review trail)
-**Status**: PROPOSED (operator decision pending on the items under Needs Input, in particular N1 and N2)
+**Status**: ACCEPTED 2026-11-05 (operator: N1-a chosen; single-venue spot on the personal account first; N2–N5 remain open until a second venue is added)
 **Deciders**: RBX Systems (operator + architecture)
 **Amends**: [ADR-0024](ADR-0024-trading-policy-layer.md) §6 (capital base source becomes venue-neutral and names its valuation),
 [ADR-0039](ADR-0039-exchange-side-insurance-stop.md) (the protective stop becomes a venue contract with an explicit lifecycle).
@@ -373,6 +373,19 @@ isolation (§3); durable intent journal (§8 step 7).
 Eight PRs, each Codex-reviewed before merge, during the empty-book window. Mechanical steps (1, 3) change no timing,
 threshold or budget; any such change is its own step.
 
+**Priority order decided 2026-11-05 ("Fase S", Binance spot first).** The operator's priority is to execute a long on
+Binance spot as soon as it is safe, keeping the USDⓈ-M adapter intact as `binance:usdm`. The steps are therefore merged
+in the order **1 → 2 → 3 → 4 → 6 → 7 → 8**; step 5 (cost-priced boundary downside, carried-basis migration) is deferred
+until after step 8 and before any second venue, with today's basis derivation kept meanwhile (§2.4 already allows
+this). The rollback boundaries of the table are unchanged by the reordering: step 6 and step 7 still require the stated
+empty-book conditions, and step 8 depends on steps 2, 3, 6 and 7.
+
+**Execution account during Fase S.** Binance does not offer sub-accounts to the operator's personal account, so the
+execution account is the **spot wallet** of that account, which the spot API observes in isolation from the Funding and
+Earn wallets. The operator moves any non-Robson holdings out of the spot wallet before activation; ADR-0022 applies
+unchanged to whatever remains there. N6 (dedicated sub-account on the corporate account) applies as soon as the PJ
+account exists.
+
 | Step | Content | Behaviour | Rollback boundary |
 |------|---------|-----------|-------------------|
 | 1 | Mechanical relocation of the two adapters and the futures WS wiring into `robson-connectors`; `ExchangePort` unchanged | preserving | revert alone while nothing else imports the new paths; afterwards revert together with its dependants |
@@ -485,16 +498,16 @@ Budget model for multi-venue:
 
 ## Needs Input (operator)
 
-- **N1** Protection continuity on balance accounts: N1-a non-atomic transition exception to ADR-0039 with the exposure
-  stated in §2.2 (no guaranteed maximum duration; loss may exceed the envelope and the caps; recommended) or N1-b spot
-  ineligible.
+- **N1** — **decided 2026-11-05: N1-a.** Non-atomic transition exception to ADR-0039 with the exposure stated in §2.2
+  (no guaranteed maximum duration; loss may exceed the envelope and the caps).
 - **N2** Per-venue monthly cap λ (proposed 8 %; 4 % = pure per-venue budget) and `K` (proposed 3).
 - **N3** Failed-leg policy (never redistribute, proposed) and retry authority for a venue that recovers mid-operation.
 - **N4** Numeraire beyond USDT-quoted venues (USDC, BRL on B3): conversion source and staleness rule.
 - **N5** Cost envelope source: venue API (Binance exposes commission rates) with a 24 h staleness rule, or configuration
   with an `as_of` date.
-- **N6** Execution account on spot: dedicated Binance sub-account on the corporate account (recommended; requires the PJ
-  account) or a separate dedicated account; a separate API key on a shared account is not an option.
+- **N6** — **decided 2026-11-05 for Fase S**: the personal account's spot wallet is the execution account (see §8),
+  with non-Robson holdings moved out beforehand; a dedicated sub-account on the corporate account replaces it once the
+  PJ account exists. A separate API key on a shared wallet is not an option.
 
 ## Implementation Notes
 
