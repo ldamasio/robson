@@ -2109,6 +2109,7 @@ dependencies = [
  "hmac",
  "reqwest",
  "robson-domain",
+ "robson-exec",
  "rust_decimal",
  "rust_decimal_macros",
  "serde",

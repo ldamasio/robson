@@ -25,6 +25,7 @@ use std::{
 };
 
 use chrono::Datelike;
+use robson_connectors::binance::usdm::normalize_market_quantity;
 use robson_domain::{
     latent_risk_per_unit_at_trigger, ClosureEvidence, DetectorSignal, EntryPolicy,
     EntryPolicyConfig, Event, MonthlyBudgetModel, Position, PositionId, PositionState, Price,
@@ -55,7 +56,6 @@ use tracing::{debug, error, info, warn};
 use uuid::Uuid;
 
 use crate::{
-    binance_exchange::normalize_market_quantity,
     circuit_breaker::CircuitBreaker,
     detector::DetectorTask,
     error::{DaemonError, DaemonResult},

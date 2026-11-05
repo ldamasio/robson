@@ -18,7 +18,6 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use robson_connectors::{BinanceRestClient, BinanceRestError};
 use robson_domain::{OrderSide, Price, Quantity, Side, Symbol, SymbolTradingRules};
 use robson_exec::{
     ports::{
@@ -30,6 +29,8 @@ use robson_exec::{
 };
 use rust_decimal::Decimal;
 use tracing::{info, warn};
+
+use crate::binance_rest::{BinanceRestClient, BinanceRestError};
 
 /// Truncate a quantity to a given number of decimal places (round down).
 fn trunc_to_scale(value: Decimal, scale: u32) -> Decimal {
@@ -84,7 +85,7 @@ pub(crate) fn normalize_stop_trigger_price(
     rounded / factor
 }
 
-pub(crate) fn normalize_market_quantity(
+pub fn normalize_market_quantity(
     symbol: &Symbol,
     quantity: Quantity,
 ) -> Result<Decimal, ExecError> {
@@ -108,7 +109,7 @@ pub(crate) fn normalize_market_quantity(
 
 // =============================================================================
 fn spot_order_from_response(
-    response: robson_connectors::BinanceSpotOrderResponse,
+    response: crate::binance_rest::BinanceSpotOrderResponse,
 ) -> Result<SpotOrder, ExecError> {
     let fee: Decimal = response.fills.iter().map(|f| f.commission).sum();
     let fee_asset = response

@@ -618,7 +618,8 @@ impl CandleInterval {
 /// historical chart data before computing chart-derived stop levels.
 ///
 /// Implementations:
-/// - `BinanceOhlcvAdapter` in `robsond` — fetches from Binance REST klines
+/// - `BinanceOhlcvAdapter` in `robson_connectors::binance::usdm` — fetches
+///   from Binance REST klines
 /// - Stub for testing — configurable candle sequences
 ///
 /// # Hexagonal placement

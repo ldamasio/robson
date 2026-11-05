@@ -131,8 +131,8 @@ explicitly approved PR. This documentation cleanup does not modify runtime code.
 ### Evidence
 
 - When an order response carries `fills`, real commissions are summed; when it
-  does not, `robsond/src/binance_exchange.rs` falls back to an estimated fee of
-  0.1% of the cumulative quote.
+  does not, `robson-connectors/src/binance/usdm/exchange.rs` falls back to an
+  estimated fee of 0.1% of the cumulative quote.
 - `PositionClosed` records `fees_paid + exit_fee` using whatever fee the order
   path produced; a close that used the fallback is persisted with an estimated
   fee, and no later path corrects the event.
