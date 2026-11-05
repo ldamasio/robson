@@ -549,6 +549,26 @@ impl BinanceRestClient {
         serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
     }
 
+    /// Query order status by client order id.
+    ///
+    /// `GET /fapi/v1/order` (signed) with `origClientOrderId`. A not-found is
+    /// returned as the raw `-2013` API error; the caller applies the venue's
+    /// finality rule.
+    pub async fn get_order_status_by_client_id(
+        &self,
+        symbol: &str,
+        client_order_id: &str,
+    ) -> Result<BinanceOrderResponse, BinanceRestError> {
+        let params = vec![
+            ("symbol", symbol.to_string()),
+            ("origClientOrderId", client_order_id.to_string()),
+        ];
+
+        let body = self.get_signed("/fapi/v1/order", params).await?;
+
+        serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
+    }
+
     /// Set leverage for a symbol.
     ///
     /// `POST /fapi/v1/leverage` (signed).
@@ -708,6 +728,7 @@ impl BinanceRestClient {
         Ok(BinanceFuturesBalance {
             wallet_balance: usdt.balance,
             available_balance: usdt.availableBalance,
+            unrealized_pnl: usdt.crossUnPnl,
         })
     }
 
@@ -1158,6 +1179,10 @@ struct BinanceBalanceResponse {
     asset: String,
     balance: Decimal,
     availableBalance: Decimal,
+    /// Unrealized P&L of cross-margin positions. Defaulted so a response
+    /// without it never fails the balance fetch.
+    #[serde(default)]
+    crossUnPnl: Decimal,
 }
 
 /// Individual user trade from Binance USD-M futures.
@@ -1215,10 +1240,14 @@ pub struct BinanceIncome {
 /// Parsed USDT-M futures balance for the USDT asset.
 #[derive(Debug, Clone)]
 pub struct BinanceFuturesBalance {
-    /// Total wallet balance (includes unrealized PnL).
+    /// Binance `balance` (wallet balance). Mapping unchanged (ADR-0056 §2.4);
+    /// the separate `unrealized_pnl` is reported next to it.
     pub wallet_balance: Decimal,
     /// Balance available for new positions.
     pub available_balance: Decimal,
+    /// Binance `crossUnPnl`: unrealized P&L of cross-margin positions
+    /// (isolated positions report theirs in `positionRisk`).
+    pub unrealized_pnl: Decimal,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1611,6 +1640,21 @@ mod tests {
 
         assert_eq!(usdt.balance, dec!(122607.35137903));
         assert_eq!(usdt.availableBalance, dec!(23.72469206));
+        assert_eq!(usdt.crossUnPnl, dec!(0));
+    }
+
+    #[test]
+    fn test_balance_response_maps_unrealized_pnl_separately() {
+        let body = r#"[{"asset": "USDT", "balance": "1000.5", "crossUnPnl": "-12.25",
+                        "availableBalance": "900"}, {"asset": "BNB", "balance": "1",
+                        "availableBalance": "1"}]"#;
+
+        let balances: Vec<BinanceBalanceResponse> = serde_json::from_str(body).unwrap();
+
+        // wallet_balance keeps mapping `balance`; unrealized P&L is separate,
+        // and a response without `crossUnPnl` still parses (as zero).
+        assert_eq!((balances[0].balance, balances[0].crossUnPnl), (dec!(1000.5), dec!(-12.25)));
+        assert_eq!((balances[1].balance, balances[1].crossUnPnl), (dec!(1), dec!(0)));
     }
 
     #[test]

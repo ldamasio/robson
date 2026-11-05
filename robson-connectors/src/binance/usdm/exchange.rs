@@ -1,4 +1,6 @@
-//! Binance USD-M Futures adapter implementing ExchangePort.
+//! Binance USD-M Futures adapter implementing the venue ports (ADR-0056 §2)
+//! as `binance:usdm`; the legacy `ExchangePort`/`IncomePort` reach it through
+//! the forwarding layer in `robson-exec`.
 //!
 //! Wraps `BinanceRestClient` and translates between domain types
 //! and Binance-specific API types.
@@ -21,16 +23,22 @@ use chrono::{DateTime, Utc};
 use robson_domain::{OrderSide, Price, Quantity, Side, Symbol, SymbolTradingRules};
 use robson_exec::{
     ports::{
-        ExchangePosition, FuturesBalance, FuturesSettings, IncomePort, IncomeRecord, IncomeType,
+        ExchangePosition, FuturesBalance, FuturesSettings, IncomeRecord, IncomeType,
         OpenOrderRecord, SpotBalance, SpotOrder, SpotOrderQuantity, SpotOrderRequest,
         SpotOrderSide, Transfer, TransferId, UniversalTransferType, UserTradeRecord,
     },
-    ExchangePort, ExecError, OrderResult, StopCancelOutcome,
+    venue::{
+        self, AccountKind, AccountPort, Cash, EntryOrReduce, ExecutionCostEnvelope, FundingPort,
+        InventoryPort, Mark, MarketKind, OrderLookup, PlacedStop, PositionAccountPort,
+        ProtectionKind, ReplaceOutcome, ReplacementProtocol, SettlementPort, StopCancelOutcome,
+        StopParams, StopRef, TradingPort, Venue, VenueCapabilities, VenueFinalityRule, VenueId,
+    },
+    ExecError, OrderResult,
 };
 use rust_decimal::Decimal;
 use tracing::{info, warn};
 
-use crate::binance_rest::{BinanceRestClient, BinanceRestError};
+use crate::binance_rest::{BinanceOrderResponse, BinanceRestClient, BinanceRestError};
 
 /// Truncate a quantity to a given number of decimal places (round down).
 fn trunc_to_scale(value: Decimal, scale: u32) -> Decimal {
@@ -137,6 +145,78 @@ fn spot_order_from_response(
     })
 }
 
+/// Fee-grade fill evidence from a `/fapi/v1/order` response: `None` when
+/// nothing executed or the response carries no per-fill records (callers fall
+/// back to user trades, Policy 11).
+fn fill_evidence(response: BinanceOrderResponse) -> Result<Option<OrderResult>, ExecError> {
+    let executed_qty = response.executed_qty;
+    if executed_qty <= Decimal::ZERO {
+        return Ok(None);
+    }
+
+    if response.fills.is_empty() {
+        // `/fapi/v1/order` usually omits fills for USD-M futures. Without
+        // actual fill records, the fee would be an estimate; let callers
+        // fall back to user trades for high-fidelity evidence instead.
+        return Ok(None);
+    }
+
+    let total_quote: Decimal = response.fills.iter().map(|f| f.price * f.qty).sum();
+    let total_qty: Decimal = response.fills.iter().map(|f| f.qty).sum();
+    let fee: Decimal = response.fills.iter().map(|f| f.commission).sum();
+    let fee_asset = response
+        .fills
+        .first()
+        .map(|f| f.commission_asset.clone())
+        .unwrap_or_else(|| "USDT".to_string());
+
+    let fill_price = if total_qty > Decimal::ZERO {
+        total_quote / total_qty
+    } else {
+        return Ok(None);
+    };
+
+    let filled_at = DateTime::from_timestamp_millis(response.update_time).unwrap_or_else(Utc::now);
+
+    Ok(Some(OrderResult {
+        exchange_order_id: response.order_id.to_string(),
+        client_order_id: response.client_order_id,
+        fill_price: Price::new(fill_price)
+            .map_err(|e| ExecError::Exchange(format!("Invalid fill price: {}", e)))?,
+        filled_quantity: Quantity::new(executed_qty)
+            .map_err(|e| ExecError::Exchange(format!("Invalid filled quantity: {}", e)))?,
+        fee,
+        fee_asset,
+        filled_at,
+    }))
+}
+
+/// Map a `/fapi/v1/order` response onto the order lifecycle. Unrecognized
+/// statuses are `Unknown`, never guessed.
+fn order_lookup_from_response(response: BinanceOrderResponse) -> Result<OrderLookup, ExecError> {
+    let filled_qty = response.executed_qty;
+    match response.status.as_str() {
+        "NEW" => Ok(OrderLookup::Open { filled_qty }),
+        "PARTIALLY_FILLED" => Ok(OrderLookup::PartiallyFilled { filled_qty }),
+        "FILLED" | "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" | "REJECTED" => {
+            let cancelled_qty = (response.orig_qty - filled_qty).max(Decimal::ZERO);
+            Ok(OrderLookup::Terminal {
+                filled_qty,
+                cancelled_qty,
+                fills: fill_evidence(response)?,
+            })
+        },
+        _ => Ok(OrderLookup::Unknown),
+    }
+}
+
+/// Order finality rule of `binance:usdm`; see
+/// `BinanceExchangeAdapter::order_by_client_id`.
+pub const USDM_FINALITY: VenueFinalityRule = VenueFinalityRule {
+    propagation_window: Duration::from_secs(60),
+    lookup_retention: Duration::from_secs(3 * 24 * 60 * 60),
+};
+
 // Adapter
 // =============================================================================
 
@@ -183,11 +263,12 @@ fn touch_stale_trading_rules(
     Some(stale.rules.clone())
 }
 
-/// Binance USD-M Futures adapter implementing ExchangePort.
+/// Binance USD-M Futures adapter: the `binance:usdm` venue.
 ///
 /// Wraps `BinanceRestClient` and translates between domain types
 /// and Binance-specific API types.
 pub struct BinanceExchangeAdapter {
+    venue_id: VenueId,
     client: Arc<BinanceRestClient>,
     /// Bounded TTL cache of per-symbol trading rules (issue #154). The
     /// tokio Mutex held across the refresh gives single-flight semantics:
@@ -200,6 +281,7 @@ impl BinanceExchangeAdapter {
     /// Create a new adapter wrapping a BinanceRestClient.
     pub fn new(client: Arc<BinanceRestClient>) -> Self {
         Self {
+            venue_id: VenueId::new(VenueId::BINANCE_USDM),
             client,
             trading_rules: tokio::sync::Mutex::new(HashMap::new()),
         }
@@ -321,19 +403,8 @@ impl BinanceExchangeAdapter {
 }
 
 #[async_trait]
-impl ExchangePort for BinanceExchangeAdapter {
-    async fn trading_rules(&self, symbol: &Symbol) -> Result<SymbolTradingRules, ExecError> {
-        self.trading_rules_cached(symbol).await
-    }
-
-    async fn trading_rules_preview(
-        &self,
-        symbol: &Symbol,
-    ) -> Result<SymbolTradingRules, ExecError> {
-        self.trading_rules_peek_or_fetch(symbol).await
-    }
-
-    async fn validate_futures_settings(
+impl PositionAccountPort for BinanceExchangeAdapter {
+    async fn validate_position_settings(
         &self,
         symbol: &Symbol,
         expected_leverage: u8,
@@ -372,14 +443,85 @@ impl ExchangePort for BinanceExchangeAdapter {
         })
     }
 
+    async fn balance(&self) -> Result<FuturesBalance, ExecError> {
+        let balance = self.client.get_futures_balance().await.map_err(Self::map_error)?;
+        Ok(FuturesBalance {
+            wallet_balance: balance.wallet_balance,
+            available_balance: balance.available_balance,
+            unrealized_pnl: balance.unrealized_pnl,
+        })
+    }
+
+    async fn open_positions(&self) -> Result<Vec<ExchangePosition>, ExecError> {
+        let positions = self.client.get_all_open_positions().await.map_err(Self::map_error)?;
+
+        positions
+            .into_iter()
+            .map(|position| {
+                let symbol = Symbol::from_pair(&position.symbol).map_err(|e| {
+                    ExecError::Exchange(format!(
+                        "Invalid symbol '{}' returned by exchange: {}",
+                        position.symbol, e
+                    ))
+                })?;
+
+                Ok(ExchangePosition {
+                    symbol,
+                    side: position.side,
+                    quantity: position.quantity,
+                    entry_price: position.entry_price,
+                })
+            })
+            .collect()
+    }
+
+    async fn close_position_market(
+        &self,
+        symbol: &Symbol,
+        side: Side,
+        quantity: Quantity,
+        client_order_id: &str,
+    ) -> Result<OrderResult, ExecError> {
+        let close_side = match side {
+            Side::Long => OrderSide::Sell,
+            Side::Short => OrderSide::Buy,
+        };
+
+        TradingPort::place_market_order(
+            self,
+            symbol,
+            close_side,
+            quantity,
+            client_order_id,
+            EntryOrReduce::Reduce,
+        )
+        .await
+    }
+}
+
+#[async_trait]
+impl TradingPort for BinanceExchangeAdapter {
+    async fn trading_rules(&self, symbol: &Symbol) -> Result<SymbolTradingRules, ExecError> {
+        self.trading_rules_cached(symbol).await
+    }
+
+    async fn trading_rules_preview(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<SymbolTradingRules, ExecError> {
+        self.trading_rules_peek_or_fetch(symbol).await
+    }
+
     async fn place_market_order(
         &self,
         symbol: &Symbol,
         side: OrderSide,
         quantity: Quantity,
         client_order_id: &str,
-        reduce_only: bool,
+        intent: EntryOrReduce,
     ) -> Result<OrderResult, ExecError> {
+        // USDⓈ-M carries the reduce intent as the `reduceOnly` wire flag.
+        let reduce_only = intent.is_reduce();
         let binance_side = match side {
             OrderSide::Buy => Side::Long,
             OrderSide::Sell => Side::Short,
@@ -541,14 +683,14 @@ impl ExchangePort for BinanceExchangeAdapter {
         })
     }
 
-    async fn place_stop_market_order(
+    async fn place_protection(
         &self,
         symbol: &Symbol,
         side: OrderSide,
         quantity: Quantity,
         stop_price: Price,
         client_order_id: &str,
-    ) -> Result<OrderResult, ExecError> {
+    ) -> Result<PlacedStop, ExecError> {
         let binance_side = match side {
             OrderSide::Buy => Side::Long,
             OrderSide::Sell => Side::Short,
@@ -636,35 +778,87 @@ impl ExchangePort for BinanceExchangeAdapter {
             });
 
         // Accepted but unfilled: protective price recorded, no fill data.
-        Ok(OrderResult {
-            exchange_order_id: response.algo_id.to_string(),
-            client_order_id: response.client_algo_id,
-            fill_price: stop_price,
-            filled_quantity: Quantity::zero(),
-            fee: Decimal::ZERO,
-            fee_asset: "USDT".to_string(),
-            filled_at: placed_at,
+        Ok(PlacedStop {
+            stop: StopRef::new(response.algo_id.to_string()),
+            acceptance: OrderResult {
+                exchange_order_id: response.algo_id.to_string(),
+                client_order_id: response.client_algo_id,
+                fill_price: stop_price,
+                filled_quantity: Quantity::zero(),
+                fee: Decimal::ZERO,
+                fee_asset: "USDT".to_string(),
+                filled_at: placed_at,
+            },
         })
     }
 
-    async fn cancel_stop_market_order(
+    async fn cancel_protection(
         &self,
         _symbol: &Symbol,
-        algo_id: &str,
+        stop: &StopRef,
     ) -> Result<StopCancelOutcome, ExecError> {
+        let algo_id = stop.exchange_order_id.as_str();
         let algo_id_num: i64 = algo_id.parse().map_err(|_| {
             ExecError::Exchange(format!("Invalid algo_id for insurance stop cancel: {}", algo_id))
         })?;
 
         match self.client.cancel_algo_order(algo_id_num).await {
-            Ok(_) => Ok(StopCancelOutcome::Cancelled),
+            // An accepted algo cancel means the conditional never triggered,
+            // so nothing executed.
+            Ok(_) => Ok(StopCancelOutcome::Cancelled {
+                filled_before_cancel: Decimal::ZERO,
+                fills: None,
+            }),
             Err(error) if Self::is_tolerated_algo_cancel_error(&error) => {
                 warn!(target: "robsond::binance_exchange",
                     %algo_id,
                     %error,
                     "Insurance stop algo order already gone; most likely triggered"
                 );
-                Ok(StopCancelOutcome::AlreadyGone)
+                // The final state is not looked up here (no extra request);
+                // `protection_fill` resolves it.
+                Ok(StopCancelOutcome::AlreadyGone { final_state: OrderLookup::Unknown })
+            },
+            Err(error) => Err(Self::map_error(error)),
+        }
+    }
+
+    async fn replace_protection(
+        &self,
+        symbol: &Symbol,
+        old: &StopRef,
+        new: StopParams,
+    ) -> Result<ReplaceOutcome, ExecError> {
+        venue::replace_place_then_cancel(self, symbol, old, new).await
+    }
+
+    /// Lookup via `GET /fapi/v1/order` with `origClientOrderId`, which serves
+    /// open and historical orders alike.
+    ///
+    /// **Finality rule** ([`USDM_FINALITY`]): Binance documents that this
+    /// endpoint does not find an order that is CANCELED or EXPIRED with no
+    /// fill once created time + 3 days has passed, nor any order older than
+    /// 90 days. It does not document a propagation delay; the signed request
+    /// carries `timestamp` and is rejected on arrival outside the default
+    /// `recvWindow` (5 000 ms, not overridden by this client). A `-2013`
+    /// (order does not exist) is therefore [`OrderLookup::Absent`] only when
+    /// `submitted_at` is known, at least 60 s old (recvWindow, clock offset
+    /// and backend queueing, chosen conservatively) and more than 60 s inside
+    /// the 3-day retention. Any other not-found is [`OrderLookup::Unknown`].
+    async fn order_by_client_id(
+        &self,
+        symbol: &Symbol,
+        client_order_id: &str,
+        submitted_at: Option<DateTime<Utc>>,
+    ) -> Result<OrderLookup, ExecError> {
+        match self
+            .client
+            .get_order_status_by_client_id(&symbol.as_pair(), client_order_id)
+            .await
+        {
+            Ok(response) => order_lookup_from_response(response),
+            Err(BinanceRestError::ApiError { code: -2013, .. }) => {
+                Ok(USDM_FINALITY.classify_not_found(submitted_at, Utc::now()))
             },
             Err(error) => Err(Self::map_error(error)),
         }
@@ -683,7 +877,10 @@ impl ExchangePort for BinanceExchangeAdapter {
         Ok(())
     }
 
-    async fn get_open_orders(&self, symbol: &Symbol) -> Result<Vec<OpenOrderRecord>, ExecError> {
+    async fn open_protective_orders(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Vec<OpenOrderRecord>, ExecError> {
         let orders = self
             .client
             .get_open_algo_orders(&symbol.as_pair())
@@ -726,165 +923,15 @@ impl ExchangePort for BinanceExchangeAdapter {
             .collect()
     }
 
-    async fn get_price(&self, symbol: &Symbol) -> Result<Price, ExecError> {
+    async fn price(&self, symbol: &Symbol) -> Result<Price, ExecError> {
         self.client.get_price(&symbol.as_pair()).await.map_err(Self::map_error)
     }
 
-    async fn health_check(&self) -> Result<(), ExecError> {
+    async fn health(&self) -> Result<(), ExecError> {
         self.client.ping().await.map_err(Self::map_error)
     }
 
-    async fn get_futures_balance(&self) -> Result<FuturesBalance, ExecError> {
-        let balance = self.client.get_futures_balance().await.map_err(Self::map_error)?;
-        Ok(FuturesBalance {
-            wallet_balance: balance.wallet_balance,
-            available_balance: balance.available_balance,
-        })
-    }
-
-    async fn get_spot_account_balances(&self) -> Result<Vec<SpotBalance>, ExecError> {
-        let balances = self.client.get_spot_account_balances().await.map_err(Self::map_error)?;
-        Ok(balances
-            .into_iter()
-            .map(|b| SpotBalance {
-                asset: b.asset,
-                free: b.free,
-                locked: b.locked,
-            })
-            .collect())
-    }
-
-    async fn get_spot_price(&self, symbol: &str) -> Result<Price, ExecError> {
-        self.client.get_spot_price(symbol).await.map_err(Self::map_error)
-    }
-
-    async fn spot_symbol_is_trading(&self, symbol: &str) -> Result<bool, ExecError> {
-        self.client.spot_symbol_is_trading(symbol).await.map_err(Self::map_error)
-    }
-
-    async fn place_spot_market_order(
-        &self,
-        request: SpotOrderRequest,
-    ) -> Result<SpotOrder, ExecError> {
-        let side = match request.side {
-            SpotOrderSide::Buy => "BUY",
-            SpotOrderSide::Sell => "SELL",
-        };
-        let quantity_key = match request.quantity_kind {
-            SpotOrderQuantity::Base => "quantity",
-            SpotOrderQuantity::Quote => "quoteOrderQty",
-        };
-
-        let response = self
-            .client
-            .place_spot_market_order(
-                &request.symbol,
-                side,
-                (quantity_key, request.quantity),
-                &request.client_order_id,
-            )
-            .await
-            .map_err(Self::map_error)?;
-
-        spot_order_from_response(response)
-    }
-
-    async fn get_spot_order(
-        &self,
-        symbol: &str,
-        client_order_id: &str,
-    ) -> Result<Option<SpotOrder>, ExecError> {
-        match self.client.get_spot_order(symbol, client_order_id).await {
-            Ok(Some(response)) => spot_order_from_response(response).map(Some),
-            Ok(None) => Ok(None),
-            Err(error) => Err(Self::map_error(error)),
-        }
-    }
-
-    async fn universal_transfer(
-        &self,
-        asset: &str,
-        amount: Decimal,
-        transfer_type: UniversalTransferType,
-        client_tran_key: &str,
-    ) -> Result<TransferId, ExecError> {
-        let response = self
-            .client
-            .universal_transfer(asset, amount, transfer_type.as_binance_str(), client_tran_key)
-            .await
-            .map_err(Self::map_error)?;
-        Ok(TransferId(response.tran_id.to_string()))
-    }
-
-    async fn get_transfer_history(
-        &self,
-        transfer_type: UniversalTransferType,
-        start_time: DateTime<Utc>,
-    ) -> Result<Vec<Transfer>, ExecError> {
-        let transfers = self
-            .client
-            .get_transfer_history(transfer_type.as_binance_str(), start_time.timestamp_millis())
-            .await
-            .map_err(Self::map_error)?;
-
-        transfers
-            .into_iter()
-            .map(|t| {
-                let timestamp =
-                    DateTime::from_timestamp_millis(t.timestamp).unwrap_or_else(Utc::now);
-                Ok(Transfer {
-                    transfer_id: TransferId(t.tran_id.to_string()),
-                    client_tran_key: t.client_tran_id,
-                    asset: t.asset,
-                    amount: t.amount,
-                    transfer_type,
-                    status: t.status,
-                    timestamp,
-                })
-            })
-            .collect()
-    }
-
-    async fn get_all_open_positions(&self) -> Result<Vec<ExchangePosition>, ExecError> {
-        let positions = self.client.get_all_open_positions().await.map_err(Self::map_error)?;
-
-        positions
-            .into_iter()
-            .map(|position| {
-                let symbol = Symbol::from_pair(&position.symbol).map_err(|e| {
-                    ExecError::Exchange(format!(
-                        "Invalid symbol '{}' returned by exchange: {}",
-                        position.symbol, e
-                    ))
-                })?;
-
-                Ok(ExchangePosition {
-                    symbol,
-                    side: position.side,
-                    quantity: position.quantity,
-                    entry_price: position.entry_price,
-                })
-            })
-            .collect()
-    }
-
-    async fn close_position_market(
-        &self,
-        symbol: &Symbol,
-        side: Side,
-        quantity: Quantity,
-        client_order_id: &str,
-    ) -> Result<OrderResult, ExecError> {
-        let close_side = match side {
-            Side::Long => OrderSide::Sell,
-            Side::Short => OrderSide::Buy,
-        };
-
-        self.place_market_order(symbol, close_side, quantity, client_order_id, true)
-            .await
-    }
-
-    async fn get_order_by_exchange_id(
+    async fn order_by_exchange_id(
         &self,
         symbol: &Symbol,
         order_id: &str,
@@ -904,54 +951,15 @@ impl ExchangePort for BinanceExchangeAdapter {
             return Ok(None);
         }
 
-        let executed_qty = response.executed_qty;
-        if executed_qty <= Decimal::ZERO {
-            return Ok(None);
-        }
-
-        if response.fills.is_empty() {
-            // `/fapi/v1/order` usually omits fills for USD-M futures. Without
-            // actual fill records, the fee would be an estimate; let callers
-            // fall back to user trades for high-fidelity evidence instead.
-            return Ok(None);
-        }
-
-        let total_quote: Decimal = response.fills.iter().map(|f| f.price * f.qty).sum();
-        let total_qty: Decimal = response.fills.iter().map(|f| f.qty).sum();
-        let fee: Decimal = response.fills.iter().map(|f| f.commission).sum();
-        let fee_asset = response
-            .fills
-            .first()
-            .map(|f| f.commission_asset.clone())
-            .unwrap_or_else(|| "USDT".to_string());
-
-        let fill_price = if total_qty > Decimal::ZERO {
-            total_quote / total_qty
-        } else {
-            return Ok(None);
-        };
-
-        let filled_at =
-            DateTime::from_timestamp_millis(response.update_time).unwrap_or_else(Utc::now);
-
-        Ok(Some(OrderResult {
-            exchange_order_id: response.order_id.to_string(),
-            client_order_id: response.client_order_id,
-            fill_price: Price::new(fill_price)
-                .map_err(|e| ExecError::Exchange(format!("Invalid fill price: {}", e)))?,
-            filled_quantity: Quantity::new(executed_qty)
-                .map_err(|e| ExecError::Exchange(format!("Invalid filled quantity: {}", e)))?,
-            fee,
-            fee_asset,
-            filled_at,
-        }))
+        fill_evidence(response)
     }
 
-    async fn get_stop_order_fill(
+    async fn protection_fill(
         &self,
         symbol: &Symbol,
-        algo_id: &str,
+        stop: &StopRef,
     ) -> Result<Option<OrderResult>, ExecError> {
+        let algo_id = stop.exchange_order_id.as_str();
         let algo_id_num: i64 = algo_id.parse().map_err(|_| {
             ExecError::Exchange(format!("Invalid algo_id for insurance stop query: {}", algo_id))
         })?;
@@ -966,8 +974,7 @@ impl ExchangePort for BinanceExchangeAdapter {
             return Ok(None);
         }
 
-        if let Some(result) = self.get_order_by_exchange_id(symbol, &detail.actual_order_id).await?
-        {
+        if let Some(result) = self.order_by_exchange_id(symbol, &detail.actual_order_id).await? {
             return Ok(Some(result));
         }
 
@@ -984,7 +991,7 @@ impl ExchangePort for BinanceExchangeAdapter {
         })
         .unwrap_or_else(|| Utc::now() - chrono::Duration::hours(24));
 
-        let trades = self.get_user_trades_since(symbol, since, 1000).await?;
+        let trades = self.user_trades_since(symbol, since, 1000).await?;
         let fills: Vec<_> = trades
             .into_iter()
             .filter(|t| t.exchange_order_id == detail.actual_order_id)
@@ -1019,7 +1026,7 @@ impl ExchangePort for BinanceExchangeAdapter {
         }))
     }
 
-    async fn get_user_trades_since(
+    async fn user_trades_since(
         &self,
         symbol: &Symbol,
         since: DateTime<Utc>,
@@ -1059,8 +1066,114 @@ impl ExchangePort for BinanceExchangeAdapter {
 }
 
 #[async_trait]
-impl IncomePort for BinanceExchangeAdapter {
-    async fn get_income_since(
+impl FundingPort for BinanceExchangeAdapter {
+    async fn spot_balances(&self) -> Result<Vec<SpotBalance>, ExecError> {
+        let balances = self.client.get_spot_account_balances().await.map_err(Self::map_error)?;
+        Ok(balances
+            .into_iter()
+            .map(|b| SpotBalance {
+                asset: b.asset,
+                free: b.free,
+                locked: b.locked,
+            })
+            .collect())
+    }
+
+    async fn spot_price(&self, symbol: &str) -> Result<Price, ExecError> {
+        self.client.get_spot_price(symbol).await.map_err(Self::map_error)
+    }
+
+    async fn spot_symbol_is_trading(&self, symbol: &str) -> Result<bool, ExecError> {
+        self.client.spot_symbol_is_trading(symbol).await.map_err(Self::map_error)
+    }
+
+    async fn place_spot_market_order(
+        &self,
+        request: SpotOrderRequest,
+    ) -> Result<SpotOrder, ExecError> {
+        let side = match request.side {
+            SpotOrderSide::Buy => "BUY",
+            SpotOrderSide::Sell => "SELL",
+        };
+        let quantity_key = match request.quantity_kind {
+            SpotOrderQuantity::Base => "quantity",
+            SpotOrderQuantity::Quote => "quoteOrderQty",
+        };
+
+        let response = self
+            .client
+            .place_spot_market_order(
+                &request.symbol,
+                side,
+                (quantity_key, request.quantity),
+                &request.client_order_id,
+            )
+            .await
+            .map_err(Self::map_error)?;
+
+        spot_order_from_response(response)
+    }
+
+    async fn spot_order(
+        &self,
+        symbol: &str,
+        client_order_id: &str,
+    ) -> Result<Option<SpotOrder>, ExecError> {
+        match self.client.get_spot_order(symbol, client_order_id).await {
+            Ok(Some(response)) => spot_order_from_response(response).map(Some),
+            Ok(None) => Ok(None),
+            Err(error) => Err(Self::map_error(error)),
+        }
+    }
+
+    async fn transfer(
+        &self,
+        asset: &str,
+        amount: Decimal,
+        transfer_type: UniversalTransferType,
+        client_tran_key: &str,
+    ) -> Result<TransferId, ExecError> {
+        let response = self
+            .client
+            .universal_transfer(asset, amount, transfer_type.as_binance_str(), client_tran_key)
+            .await
+            .map_err(Self::map_error)?;
+        Ok(TransferId(response.tran_id.to_string()))
+    }
+
+    async fn transfer_history(
+        &self,
+        transfer_type: UniversalTransferType,
+        start_time: DateTime<Utc>,
+    ) -> Result<Vec<Transfer>, ExecError> {
+        let transfers = self
+            .client
+            .get_transfer_history(transfer_type.as_binance_str(), start_time.timestamp_millis())
+            .await
+            .map_err(Self::map_error)?;
+
+        transfers
+            .into_iter()
+            .map(|t| {
+                let timestamp =
+                    DateTime::from_timestamp_millis(t.timestamp).unwrap_or_else(Utc::now);
+                Ok(Transfer {
+                    transfer_id: TransferId(t.tran_id.to_string()),
+                    client_tran_key: t.client_tran_id,
+                    asset: t.asset,
+                    amount: t.amount,
+                    transfer_type,
+                    status: t.status,
+                    timestamp,
+                })
+            })
+            .collect()
+    }
+}
+
+#[async_trait]
+impl SettlementPort for BinanceExchangeAdapter {
+    async fn settlement_since(
         &self,
         since: DateTime<Utc>,
         limit: u16,
@@ -1101,6 +1214,78 @@ impl IncomePort for BinanceExchangeAdapter {
     }
 }
 
+#[async_trait]
+impl AccountPort for BinanceExchangeAdapter {
+    /// USDT only (the futures balance endpoint mapping extracts the USDT
+    /// entry): `free` is `availableBalance`, `locked` the rest of the wallet
+    /// balance.
+    async fn cash(&self, asset: &str) -> Result<Cash, ExecError> {
+        if asset != "USDT" {
+            return Err(ExecError::Exchange(format!(
+                "binance:usdm cash is only mapped for USDT, not {asset}"
+            )));
+        }
+        let balance = self.client.get_futures_balance().await.map_err(Self::map_error)?;
+        Ok(Cash {
+            free: balance.available_balance,
+            locked: (balance.wallet_balance - balance.available_balance).max(Decimal::ZERO),
+            as_of: Utc::now(),
+        })
+    }
+
+    /// Last price from the same ticker endpoint as `price`, stamped on
+    /// receipt.
+    async fn valuation(&self, symbol: &Symbol) -> Result<Mark, ExecError> {
+        let price = self.client.get_price(&symbol.as_pair()).await.map_err(Self::map_error)?;
+        Ok(Mark { price, as_of: Utc::now() })
+    }
+
+    /// The cost envelope source is undecided (ADR-0056 N5, required before
+    /// step 8); admission still reads `RiskConfig`. Until then this fails
+    /// closed rather than inventing numbers.
+    async fn execution_costs(&self, symbol: &Symbol) -> Result<ExecutionCostEnvelope, ExecError> {
+        Err(ExecError::Config(format!(
+            "binance:usdm execution cost envelope for {} has no source yet (ADR-0056 N5)",
+            symbol.as_pair()
+        )))
+    }
+
+    fn capabilities(&self) -> VenueCapabilities {
+        VenueCapabilities {
+            market_kind: MarketKind::PerpUsdM,
+            account_kind: AccountKind::PositionAccount,
+            supports_short: true,
+            reduce_only_wire_flag: true,
+            protection: ProtectionKind::MarketOnTrigger,
+            replacement: ReplacementProtocol::PlaceThenCancel,
+            has_funding: true,
+            order_finality: USDM_FINALITY,
+        }
+    }
+}
+
+impl Venue for BinanceExchangeAdapter {
+    fn id(&self) -> &VenueId {
+        &self.venue_id
+    }
+
+    fn position_account(&self) -> Option<&dyn PositionAccountPort> {
+        Some(self)
+    }
+
+    fn inventory(&self) -> Option<&dyn InventoryPort> {
+        None
+    }
+
+    fn settlement(&self) -> &dyn SettlementPort {
+        self
+    }
+
+    fn funding(&self) -> Option<&dyn FundingPort> {
+        Some(self)
+    }
+}
+
 #[cfg(test)]
 mod log_target_guard {
     /// The adapter was relocated from `robsond::binance_exchange` (ADR-0056
@@ -1128,6 +1313,65 @@ mod log_target_guard {
 
 #[cfg(test)]
 mod tests {
+    use robson_exec::venue::{
+        capability_mismatches, AccountKind, MarketKind, ProtectionKind, ReplacementProtocol,
+    };
+
+    fn order(status: &str, executed: &str, fills: &str) -> BinanceOrderResponse {
+        serde_json::from_str(&format!(
+            r#"{{"symbol":"BTCUSDT","orderId":7,"clientOrderId":"c7","updateTime":1700000000000,
+               "price":"0","origQty":"1","executedQty":"{executed}","status":"{status}",
+               "side":"BUY","type":"MARKET","fills":[{fills}]}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn usdm_capabilities() {
+        let venue = BinanceExchangeAdapter::new(Arc::new(BinanceRestClient::new(
+            "key".to_string(),
+            "secret".to_string(),
+        )));
+        let caps = venue.capabilities();
+        assert_eq!(venue.id().as_str(), "binance:usdm");
+        assert_eq!(caps.market_kind, MarketKind::PerpUsdM);
+        assert_eq!(caps.account_kind, AccountKind::PositionAccount);
+        assert!(caps.supports_short && caps.reduce_only_wire_flag && caps.has_funding);
+        assert_eq!(caps.protection, ProtectionKind::MarketOnTrigger);
+        assert_eq!(caps.replacement, ReplacementProtocol::PlaceThenCancel);
+        assert_eq!(caps.order_finality, USDM_FINALITY);
+        assert_eq!(USDM_FINALITY.propagation_window, Duration::from_secs(60));
+        assert_eq!(USDM_FINALITY.lookup_retention, Duration::from_secs(3 * 24 * 60 * 60));
+        assert!(capability_mismatches(&venue).is_empty());
+    }
+
+    #[test]
+    fn order_lookup_maps_binance_statuses() {
+        let lookup = |status, executed, fills| {
+            order_lookup_from_response(order(status, executed, fills)).unwrap()
+        };
+        assert!(
+            matches!(lookup("NEW", "0", ""), OrderLookup::Open { filled_qty } if filled_qty.is_zero())
+        );
+        assert!(matches!(
+            lookup("PARTIALLY_FILLED", "0.4", ""),
+            OrderLookup::PartiallyFilled { filled_qty } if filled_qty == dec!(0.4)
+        ));
+        // No per-fill records on /fapi/v1/order: callers use user trades.
+        assert!(matches!(
+            lookup("CANCELED", "0.4", ""),
+            OrderLookup::Terminal { filled_qty, cancelled_qty, fills: None }
+                if filled_qty == dec!(0.4) && cancelled_qty == dec!(0.6)
+        ));
+        let fill = r#"{"price":"95000","qty":"1","commission":"0.5","commissionAsset":"USDT"}"#;
+        assert!(matches!(
+            lookup("FILLED", "1", fill),
+            OrderLookup::Terminal { cancelled_qty, fills: Some(f), .. }
+                if cancelled_qty.is_zero() && f.fee == dec!(0.5) && f.client_order_id == "c7"
+        ));
+        assert!(matches!(lookup("SOMETHING_NEW", "0", ""), OrderLookup::Unknown));
+    }
+
     #[test]
     fn trading_rules_cache_evicts_the_least_recently_used_entry_when_full() {
         use std::collections::HashMap;

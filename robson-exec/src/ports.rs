@@ -18,10 +18,16 @@ use crate::error::ExecError;
 /// Futures account balance snapshot from the exchange.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FuturesBalance {
-    /// Total wallet balance (includes unrealized PnL).
+    /// Wallet balance as mapped by the connector (Binance `balance`). This
+    /// mapping and the capital base derived from it are unchanged (ADR-0056
+    /// §2.4); unrealized P&L is reported separately in `unrealized_pnl`.
     pub wallet_balance: Decimal,
     /// Balance available for new positions (excludes margin on open positions).
     pub available_balance: Decimal,
+    /// Unrealized P&L reported by the venue next to the wallet balance
+    /// (ADR-0056 §2.4). Not yet consumed; defaulted for older payloads.
+    #[serde(default)]
+    pub unrealized_pnl: Decimal,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -94,9 +100,14 @@ pub struct Transfer {
 
 /// Port for exchange operations (placing/canceling orders).
 ///
+/// **Legacy (ADR-0056 step 2)**: kept for one release as a forwarding
+/// compatibility layer. Every [`crate::venue::Venue`] implements it through a
+/// blanket impl (`compat.rs`) that forwards each method to the venue ports;
+/// new code should use the venue ports.
+///
 /// Implementations:
 /// - `StubExchange` - For testing (immediate fills at configured price)
-/// - `BinanceAdapter` - Real Binance USD-M Futures
+/// - `BinanceExchangeAdapter` - Real Binance USD-M Futures
 #[async_trait]
 pub trait ExchangePort: Send + Sync {
     /// Validate account is in One-way position mode with expected leverage.
