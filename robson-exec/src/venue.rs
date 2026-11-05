@@ -100,50 +100,113 @@ pub enum ReplacementProtocol {
     CancelThenPlace,
 }
 
-/// Rule under which a venue's "order not found" is evidence that the order
-/// was never accepted ([`OrderLookup::Absent`]).
+/// Local wall-clock bounds around one venue request, recorded by the
+/// adapter: `started_at` is read before the request is signed and
+/// `completed_at` after the call returned, failed or timed out, so the signed
+/// timestamp lies between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RequestWindow {
+    pub started_at: DateTime<Utc>,
+    pub completed_at: DateTime<Utc>,
+}
+
+impl RequestWindow {
+    /// The window covering both (repeated attempts with one client id).
+    pub fn merge(self, other: Self) -> Self {
+        Self {
+            started_at: self.started_at.min(other.started_at),
+            completed_at: self.completed_at.max(other.completed_at),
+        }
+    }
+}
+
+fn delta(duration: Duration) -> chrono::TimeDelta {
+    chrono::TimeDelta::from_std(duration).unwrap_or(chrono::TimeDelta::MAX)
+}
+
+/// Rule under which a venue's "order not found" proves the order was never
+/// accepted ([`OrderLookup::Absent`]).
 ///
-/// A not-found is final only when the order's age (from `submitted_at`, a
-/// time no later than the moment the order request was signed) is at least
-/// `propagation_window` (the venue can no longer accept or surface the
-/// request) and the age plus that same margin is still below
-/// `lookup_retention` (the venue's order lookup still returns every order it
-/// accepted, including cancelled or expired ones without fills). Outside that
-/// interval, or without a submission time, a not-found is
+/// Inputs are evidence, never intent timestamps: the adapter-recorded
+/// [`RequestWindow`] of every submit attempt with the client id, and the
+/// window of the lookup request(s) that returned not-found. Let `T` be the
+/// order's signed timestamp and `L` the lookup's. The venue accepts a signed
+/// request only while `venue_time − T ≤ request_validity` and
+/// `T < venue_time + clock_tolerance`. Hence:
+/// - the order can no longer be accepted once venue time exceeds
+///   `attempt.completed_at + request_validity`;
+/// - the lookup was served at venue time `≥ L − clock_tolerance ≥
+///   lookup.started_at − clock_tolerance`, and `≤ lookup.completed_at +
+///   request_validity`;
+/// - the order, if accepted, was created at venue time `≥ attempt.started_at −
+///   clock_tolerance`.
+///
+/// A not-found is final only when `lookup.started_at ≥ attempt.completed_at +
+/// request_validity + clock_tolerance + visibility_margin` (acceptance
+/// impossible for at least the margin before the lookup was served) **and**
+/// `lookup.completed_at + request_validity + visibility_margin <
+/// attempt.started_at − clock_tolerance + lookup_retention` (the lookup still
+/// returns every accepted order). `visibility_margin` is an engineering
+/// allowance for an accepted order to become visible to the lookup; venues do
+/// not document one. Without attempt evidence (none recorded, or lost on a
+/// restart), or outside that interval, a not-found is
 /// [`OrderLookup::Unknown`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct VenueFinalityRule {
-    pub propagation_window: Duration,
+    pub request_validity: Duration,
+    pub clock_tolerance: Duration,
+    pub visibility_margin: Duration,
     pub lookup_retention: Duration,
 }
 
 impl VenueFinalityRule {
-    /// True when a not-found on the venue's lookup is final for an order
-    /// submitted at `submitted_at`, observed at `now`.
+    /// True when a not-found observed by `lookup` is final for an order whose
+    /// submit attempts span `attempt`.
     pub fn not_found_is_final(
         &self,
-        submitted_at: Option<DateTime<Utc>>,
-        now: DateTime<Utc>,
+        attempt: Option<RequestWindow>,
+        lookup: RequestWindow,
     ) -> bool {
-        let Some(submitted_at) = submitted_at else {
+        let Some(attempt) = attempt else {
             return false;
         };
-        // A negative age (clock skew) is never final.
-        let Ok(age) = (now - submitted_at).to_std() else {
+        let (validity, tolerance, margin) = (
+            delta(self.request_validity),
+            delta(self.clock_tolerance),
+            delta(self.visibility_margin),
+        );
+        let Some(no_longer_acceptable) = attempt
+            .completed_at
+            .checked_add_signed(validity)
+            .and_then(|t| t.checked_add_signed(tolerance))
+            .and_then(|t| t.checked_add_signed(margin))
+        else {
             return false;
         };
-        age >= self.propagation_window
-            && age.saturating_add(self.propagation_window) < self.lookup_retention
+        let latest_served = lookup
+            .completed_at
+            .checked_add_signed(validity)
+            .and_then(|t| t.checked_add_signed(margin));
+        let retained_until = attempt
+            .started_at
+            .checked_sub_signed(tolerance)
+            .and_then(|t| t.checked_add_signed(delta(self.lookup_retention)));
+        match (latest_served, retained_until) {
+            (Some(served), Some(retained)) => {
+                lookup.started_at >= no_longer_acceptable && served < retained
+            },
+            _ => false,
+        }
     }
 
-    /// Classify a raw not-found response: `Absent` only under this rule,
-    /// otherwise `Unknown`.
+    /// Classify a raw not-found: `Absent` only under this rule, otherwise
+    /// `Unknown`.
     pub fn classify_not_found(
         &self,
-        submitted_at: Option<DateTime<Utc>>,
-        now: DateTime<Utc>,
+        attempt: Option<RequestWindow>,
+        lookup: RequestWindow,
     ) -> OrderLookup {
-        if self.not_found_is_final(submitted_at, now) {
+        if self.not_found_is_final(attempt, lookup) {
             OrderLookup::Absent { finality: *self }
         } else {
             OrderLookup::Unknown
@@ -373,12 +436,20 @@ pub struct Holding {
     pub locked: Decimal,
 }
 
+/// An open order observed account-wide, with the symbol it rests on (the
+/// legacy [`OpenOrderRecord`] comes from a per-symbol query and has none).
+#[derive(Debug, Clone, PartialEq)]
+pub struct AccountOpenOrder {
+    pub symbol: Symbol,
+    pub order: OpenOrderRecord,
+}
+
 /// Account-wide observation of a balance account: every nonzero holding of
 /// every asset and every open order, independent of configured symbols.
 #[derive(Debug, Clone, PartialEq)]
 pub struct InventoryObservation {
     pub holdings: Vec<(String, Holding)>,
-    pub open_orders: Vec<OpenOrderRecord>,
+    pub open_orders: Vec<AccountOpenOrder>,
     pub as_of: DateTime<Utc>,
 }
 
@@ -468,15 +539,16 @@ pub trait TradingPort: Send + Sync {
     /// Cancel a regular (non-protective) order.
     async fn cancel_order(&self, symbol: &Symbol, order_id: &str) -> Result<(), ExecError>;
 
-    /// Look up an order by the client id it was submitted with.
-    /// `submitted_at` (no later than the request signature) is what the
-    /// venue's [`VenueFinalityRule`] is evaluated against; `None` means a
-    /// not-found can never be `Absent`. A request failure is `Err`.
+    /// Look up an order by the client id it was submitted with, in every
+    /// order namespace the venue places under (regular and conditional).
+    /// A not-found is `Absent` only under the venue's [`VenueFinalityRule`],
+    /// evaluated against the [`RequestWindow`]s the adapter itself recorded
+    /// for submit attempts with this client id; without such evidence it is
+    /// `Unknown`. A request failure is `Err`.
     async fn order_by_client_id(
         &self,
         symbol: &Symbol,
         client_order_id: &str,
-        submitted_at: Option<DateTime<Utc>>,
     ) -> Result<OrderLookup, ExecError>;
 
     /// Fee-grade fill evidence for a filled order by exchange id
@@ -720,27 +792,73 @@ mod tests {
 
     use super::*;
 
-    #[test]
-    fn not_found_is_absent_only_between_window_and_retention() {
-        let rule = VenueFinalityRule {
-            propagation_window: Duration::from_secs(60),
+    fn rule() -> VenueFinalityRule {
+        VenueFinalityRule {
+            request_validity: Duration::from_secs(5),
+            clock_tolerance: Duration::from_secs(1),
+            visibility_margin: Duration::from_secs(60),
             lookup_retention: Duration::from_secs(3 * 24 * 60 * 60),
-        };
-        let now = Utc.with_ymd_and_hms(2026, 11, 5, 12, 0, 0).unwrap();
-        let ago = |secs: i64| Some(now - chrono::Duration::seconds(secs));
-        let absent = |at| matches!(rule.classify_not_found(at, now), OrderLookup::Absent { .. });
+        }
+    }
 
-        assert!(!absent(None), "no submission time");
-        assert!(!absent(ago(59)), "inside the propagation window");
-        assert!(!absent(ago(-5)), "clock skew: submitted in the future");
-        assert!(absent(ago(60)));
-        assert!(absent(ago(2 * 24 * 60 * 60)));
-        assert!(!absent(ago(3 * 24 * 60 * 60 - 30)), "within the margin of retention");
-        assert!(!absent(ago(4 * 24 * 60 * 60)), "past retention");
+    fn at(secs: i64) -> DateTime<Utc> {
+        Utc.with_ymd_and_hms(2026, 11, 5, 12, 0, 0).unwrap() + chrono::Duration::seconds(secs)
+    }
+
+    fn window(started: i64, completed: i64) -> RequestWindow {
+        RequestWindow {
+            started_at: at(started),
+            completed_at: at(completed),
+        }
+    }
+
+    fn absent(attempt: Option<RequestWindow>, lookup: RequestWindow) -> bool {
+        matches!(rule().classify_not_found(attempt, lookup), OrderLookup::Absent { .. })
+    }
+
+    #[test]
+    fn not_found_needs_attempt_evidence() {
+        assert!(!absent(None, window(1_000, 1_001)));
+        // 5 s validity + 1 s tolerance + 60 s margin after the attempt ended.
+        assert!(absent(Some(window(0, 0)), window(66, 67)));
+        assert!(!absent(Some(window(0, 0)), window(65, 66)));
         assert!(matches!(
-            rule.classify_not_found(ago(60), now),
-            OrderLookup::Absent { finality } if finality == rule
+            rule().classify_not_found(Some(window(0, 0)), window(66, 67)),
+            OrderLookup::Absent { finality } if finality == rule()
         ));
+    }
+
+    #[test]
+    fn delayed_signing_is_bounded_by_attempt_completion() {
+        // The attempt started long ago but its call only returned at 600 s:
+        // the request may have been signed (and accepted) as late as that.
+        let attempt = Some(window(0, 600));
+        assert!(!absent(attempt, window(620, 621)));
+        assert!(absent(attempt, window(666, 667)));
+    }
+
+    #[test]
+    fn delayed_response_counts_from_lookup_start() {
+        // The lookup was sent too early; a late response does not move its
+        // observation time.
+        assert!(!absent(Some(window(0, 0)), window(30, 500)));
+    }
+
+    #[test]
+    fn not_found_is_unknown_near_or_past_retention() {
+        let day = 24 * 60 * 60;
+        assert!(absent(Some(window(0, 0)), window(2 * day, 2 * day + 1)));
+        // Retention counts from the earliest creation: started_at − tolerance.
+        assert!(!absent(Some(window(0, 0)), window(3 * day - 70, 3 * day - 60)));
+        assert!(!absent(Some(window(0, 0)), window(4 * day, 4 * day + 1)));
+        // A slow lookup response is bounded by its completion.
+        assert!(!absent(Some(window(0, 0)), window(2 * day, 3 * day)));
+    }
+
+    #[test]
+    fn merged_attempts_span_every_attempt() {
+        let merged = window(10, 20).merge(window(5, 30));
+        assert_eq!(merged, window(5, 30));
     }
 
     #[test]

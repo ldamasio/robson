@@ -412,19 +412,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn each_legacy_call_makes_exactly_one_venue_call() {
-        let sym = btc();
-        // The stub's fail flag is consumed by the first venue call.
-        let s = stub();
-        s.set_fail_next(true);
-        assert!(s.get_futures_balance().await.is_err());
-        assert!(s.get_futures_balance().await.is_ok());
-        s.set_fail_next(true);
-        assert!(s.cancel_stop_market_order(&sym, "missing").await.is_err());
-        assert!(s.cancel_stop_market_order(&sym, "missing").await.is_ok());
-    }
-
-    #[tokio::test]
     async fn stub_capabilities_agree_with_accessors() {
         let s = stub();
         let caps = s.capabilities();
@@ -442,8 +429,8 @@ mod tests {
         ));
     }
 
-    async fn lookup(s: &StubExchange, id: &str, at: Option<DateTime<Utc>>) -> OrderLookup {
-        s.order_by_client_id(&btc(), id, at).await.unwrap()
+    async fn lookup(s: &StubExchange, id: &str) -> OrderLookup {
+        s.order_by_client_id(&btc(), id).await.unwrap()
     }
 
     #[tokio::test]
@@ -464,14 +451,40 @@ mod tests {
             .unwrap();
 
         assert!(matches!(
-            lookup(&s, "entry-1", None).await,
+            lookup(&s, "entry-1").await,
             OrderLookup::Terminal { filled_qty, .. } if filled_qty == dec!(0.01)
         ));
-        assert!(matches!(lookup(&s, "ins-1", None).await, OrderLookup::Open { .. }));
-        assert!(matches!(lookup(&s, "never", None).await, OrderLookup::Unknown));
+        assert!(matches!(lookup(&s, "ins-1").await, OrderLookup::Open { .. }));
+        // Never attempted: no evidence, so a not-found is not final.
+        assert!(matches!(lookup(&s, "never").await, OrderLookup::Unknown));
+        // Attempted and refused by the venue: final.
+        s.set_order_fail_next(true);
+        let refused = s.place_protection(&sym, OrderSide::Sell, qty(), px(dec!(90000)), "ins-x");
+        assert!(refused.await.is_err());
+        assert!(matches!(lookup(&s, "ins-x").await, OrderLookup::Absent { .. }));
+    }
+
+    #[tokio::test]
+    async fn stub_lookup_remembers_cancelled_stops_and_closes() {
+        let sym = btc();
+        let s = stub();
+        let placed = s.place_protection(&sym, OrderSide::Sell, qty(), px(dec!(90000)), "ins-1");
+        let placed = placed.await.unwrap();
+        s.cancel_protection(&sym, &placed.stop).await.unwrap();
         assert!(matches!(
-            lookup(&s, "never", Some(Utc::now())).await,
-            OrderLookup::Absent { .. }
+            lookup(&s, "ins-1").await,
+            OrderLookup::Terminal { filled_qty, cancelled_qty, fills: None }
+                if filled_qty.is_zero() && cancelled_qty == dec!(0.01)
+        ));
+
+        s.set_open_position(sym.clone(), Side::Long, qty(), px(dec!(90000)));
+        let closed =
+            PositionAccountPort::close_position_market(&s, &sym, Side::Long, qty(), "close-1");
+        let closed = closed.await.unwrap();
+        assert!(matches!(
+            lookup(&s, "close-1").await,
+            OrderLookup::Terminal { filled_qty, fills: Some(fill), .. }
+                if filled_qty == dec!(0.01) && fill.exchange_order_id == closed.exchange_order_id
         ));
     }
 
@@ -503,5 +516,359 @@ mod tests {
         }
         assert!(!s.has_stop_order(&old.exchange_order_id));
         assert_eq!(s.stop_order_count(), 1);
+    }
+}
+
+#[cfg(test)]
+mod recorded_forwarding {
+    //! Every legacy method makes exactly one venue call, with its arguments
+    //! unchanged, and returns that call's result.
+
+    use std::sync::Mutex;
+
+    use robson_domain::Side;
+    use rust_decimal_macros::dec;
+
+    use super::*;
+    use crate::venue::{
+        AccountPort, Cash, ExecutionCostEnvelope, Mark, OrderLookup, PlacedStop, ReplaceOutcome,
+        SettlementPort, StopParams, VenueCapabilities, VenueId,
+    };
+
+    type R<T> = Result<T, ExecError>;
+
+    struct Recorder {
+        id: VenueId,
+        calls: Mutex<Vec<String>>,
+    }
+
+    impl Recorder {
+        fn new() -> Self {
+            Self {
+                id: VenueId::new("rec"),
+                calls: Mutex::new(Vec::new()),
+            }
+        }
+
+        fn log(&self, call: String) {
+            self.calls.lock().unwrap().push(call);
+        }
+
+        fn take(&self) -> Vec<String> {
+            std::mem::take(&mut *self.calls.lock().unwrap())
+        }
+    }
+
+    fn fill(id: &str) -> OrderResult {
+        OrderResult {
+            exchange_order_id: id.to_string(),
+            client_order_id: format!("c-{id}"),
+            fill_price: Price::new(dec!(1)).unwrap(),
+            filled_quantity: Quantity::zero(),
+            fee: Decimal::ZERO,
+            fee_asset: "USDT".to_string(),
+            filled_at: DateTime::from_timestamp(0, 0).unwrap(),
+        }
+    }
+
+    fn rules(symbol: &Symbol) -> SymbolTradingRules {
+        SymbolTradingRules::new(
+            symbol.clone(),
+            dec!(0.1),
+            dec!(0.1),
+            dec!(0.001),
+            dec!(0.001),
+            dec!(1000),
+            dec!(5),
+            1,
+            3,
+        )
+        .unwrap()
+    }
+
+    #[async_trait]
+    impl TradingPort for Recorder {
+        async fn trading_rules(&self, s: &Symbol) -> R<SymbolTradingRules> {
+            self.log(format!("trading_rules {}", s.as_pair()));
+            Ok(rules(s))
+        }
+        async fn trading_rules_preview(&self, s: &Symbol) -> R<SymbolTradingRules> {
+            self.log(format!("trading_rules_preview {}", s.as_pair()));
+            Ok(rules(s))
+        }
+        async fn place_market_order(
+            &self,
+            s: &Symbol,
+            side: OrderSide,
+            q: Quantity,
+            c: &str,
+            i: EntryOrReduce,
+        ) -> R<OrderResult> {
+            self.log(format!("place_market_order {} {side:?} {q} {c} {i:?}", s.as_pair()));
+            Ok(fill("m"))
+        }
+        async fn place_protection(
+            &self,
+            s: &Symbol,
+            side: OrderSide,
+            q: Quantity,
+            t: Price,
+            c: &str,
+        ) -> R<PlacedStop> {
+            self.log(format!("place_protection {} {side:?} {q} {t} {c}", s.as_pair()));
+            Ok(PlacedStop {
+                stop: StopRef::new("p"),
+                acceptance: fill("p"),
+            })
+        }
+        async fn cancel_protection(&self, s: &Symbol, stop: &StopRef) -> R<StopCancelOutcome> {
+            self.log(format!("cancel_protection {} {}", s.as_pair(), stop.exchange_order_id));
+            Ok(StopCancelOutcome::AlreadyGone { final_state: OrderLookup::Unknown })
+        }
+        async fn replace_protection(
+            &self,
+            _: &Symbol,
+            _: &StopRef,
+            _: StopParams,
+        ) -> R<ReplaceOutcome> {
+            unreachable!("no legacy method forwards here")
+        }
+        async fn cancel_order(&self, s: &Symbol, id: &str) -> R<()> {
+            self.log(format!("cancel_order {} {id}", s.as_pair()));
+            Ok(())
+        }
+        async fn order_by_client_id(&self, _: &Symbol, _: &str) -> R<OrderLookup> {
+            unreachable!("no legacy method forwards here")
+        }
+        async fn order_by_exchange_id(&self, s: &Symbol, id: &str) -> R<Option<OrderResult>> {
+            self.log(format!("order_by_exchange_id {} {id}", s.as_pair()));
+            Ok(Some(fill("e")))
+        }
+        async fn protection_fill(&self, s: &Symbol, stop: &StopRef) -> R<Option<OrderResult>> {
+            self.log(format!("protection_fill {} {}", s.as_pair(), stop.exchange_order_id));
+            Ok(Some(fill("f")))
+        }
+        async fn open_protective_orders(&self, s: &Symbol) -> R<Vec<OpenOrderRecord>> {
+            self.log(format!("open_protective_orders {}", s.as_pair()));
+            Ok(Vec::new())
+        }
+        async fn user_trades_since(
+            &self,
+            s: &Symbol,
+            since: DateTime<Utc>,
+            limit: u16,
+        ) -> R<Vec<UserTradeRecord>> {
+            self.log(format!("user_trades_since {} {} {limit}", s.as_pair(), since.timestamp()));
+            Ok(Vec::new())
+        }
+        async fn price(&self, s: &Symbol) -> R<Price> {
+            self.log(format!("price {}", s.as_pair()));
+            Ok(Price::new(dec!(7)).unwrap())
+        }
+        async fn health(&self) -> R<()> {
+            self.log("health".to_string());
+            Ok(())
+        }
+    }
+
+    #[async_trait]
+    impl AccountPort for Recorder {
+        async fn cash(&self, _: &str) -> R<Cash> {
+            unreachable!("no legacy method forwards here")
+        }
+        async fn valuation(&self, _: &Symbol) -> R<Mark> {
+            unreachable!("no legacy method forwards here")
+        }
+        async fn execution_costs(&self, _: &Symbol) -> R<ExecutionCostEnvelope> {
+            unreachable!("no legacy method forwards here")
+        }
+        fn capabilities(&self) -> VenueCapabilities {
+            crate::stub::StubExchange::new(dec!(1)).capabilities()
+        }
+    }
+
+    #[async_trait]
+    impl PositionAccountPort for Recorder {
+        async fn validate_position_settings(&self, s: &Symbol, lev: u8) -> R<FuturesSettings> {
+            self.log(format!("validate_position_settings {} {lev}", s.as_pair()));
+            Ok(FuturesSettings {
+                position_mode: "One-way".into(),
+                leverage: lev,
+                symbol: s.as_pair(),
+            })
+        }
+        async fn balance(&self) -> R<FuturesBalance> {
+            self.log("balance".to_string());
+            Ok(FuturesBalance {
+                wallet_balance: dec!(3),
+                available_balance: dec!(2),
+                unrealized_pnl: dec!(-1),
+            })
+        }
+        async fn open_positions(&self) -> R<Vec<ExchangePosition>> {
+            self.log("open_positions".to_string());
+            Ok(Vec::new())
+        }
+        async fn close_position_market(
+            &self,
+            s: &Symbol,
+            side: Side,
+            q: Quantity,
+            c: &str,
+        ) -> R<OrderResult> {
+            self.log(format!("close_position_market {} {side:?} {q} {c}", s.as_pair()));
+            Ok(fill("x"))
+        }
+    }
+
+    #[async_trait]
+    impl SettlementPort for Recorder {
+        async fn settlement_since(&self, since: DateTime<Utc>, limit: u16) -> R<Vec<IncomeRecord>> {
+            self.log(format!("settlement_since {} {limit}", since.timestamp()));
+            Ok(Vec::new())
+        }
+    }
+
+    #[async_trait]
+    impl FundingPort for Recorder {
+        async fn spot_balances(&self) -> R<Vec<SpotBalance>> {
+            self.log("spot_balances".to_string());
+            Ok(Vec::new())
+        }
+        async fn spot_price(&self, s: &str) -> R<Price> {
+            self.log(format!("spot_price {s}"));
+            Ok(Price::new(dec!(9)).unwrap())
+        }
+        async fn spot_symbol_is_trading(&self, s: &str) -> R<bool> {
+            self.log(format!("spot_symbol_is_trading {s}"));
+            Ok(true)
+        }
+        async fn place_spot_market_order(&self, r: SpotOrderRequest) -> R<SpotOrder> {
+            self.log(format!("place_spot_market_order {} {}", r.symbol, r.client_order_id));
+            Err(ExecError::Exchange("recorded".to_string()))
+        }
+        async fn spot_order(&self, s: &str, c: &str) -> R<Option<SpotOrder>> {
+            self.log(format!("spot_order {s} {c}"));
+            Ok(None)
+        }
+        async fn transfer(
+            &self,
+            a: &str,
+            amount: Decimal,
+            t: UniversalTransferType,
+            k: &str,
+        ) -> R<TransferId> {
+            self.log(format!("transfer {a} {amount} {t:?} {k}"));
+            Ok(TransferId("t".to_string()))
+        }
+        async fn transfer_history(
+            &self,
+            t: UniversalTransferType,
+            start: DateTime<Utc>,
+        ) -> R<Vec<Transfer>> {
+            self.log(format!("transfer_history {t:?} {}", start.timestamp()));
+            Ok(Vec::new())
+        }
+    }
+
+    impl Venue for Recorder {
+        fn id(&self) -> &VenueId {
+            &self.id
+        }
+        fn position_account(&self) -> Option<&dyn PositionAccountPort> {
+            Some(self)
+        }
+        fn inventory(&self) -> Option<&dyn crate::venue::InventoryPort> {
+            None
+        }
+        fn settlement(&self) -> &dyn SettlementPort {
+            self
+        }
+        fn funding(&self) -> Option<&dyn FundingPort> {
+            Some(self)
+        }
+    }
+
+    #[tokio::test]
+    async fn every_legacy_method_forwards_one_call_with_its_arguments() {
+        let v = Recorder::new();
+        let s = Symbol::from_pair("BTCUSDT").unwrap();
+        let q = Quantity::new(dec!(0.01)).unwrap();
+        let t = Price::new(dec!(90000)).unwrap();
+        let at = DateTime::from_timestamp(1_000, 0).unwrap();
+        let one = |expected: &str| assert_eq!(v.take(), vec![expected.to_string()]);
+
+        ExchangePort::trading_rules(&v, &s).await.unwrap();
+        one("trading_rules BTCUSDT");
+        ExchangePort::trading_rules_preview(&v, &s).await.unwrap();
+        one("trading_rules_preview BTCUSDT");
+        v.validate_futures_settings(&s, 1).await.unwrap();
+        one("validate_position_settings BTCUSDT 1");
+        ExchangePort::place_market_order(&v, &s, OrderSide::Buy, q, "c1", false)
+            .await
+            .unwrap();
+        one("place_market_order BTCUSDT Buy 0.01 c1 Entry");
+        ExchangePort::place_market_order(&v, &s, OrderSide::Sell, q, "c2", true)
+            .await
+            .unwrap();
+        one("place_market_order BTCUSDT Sell 0.01 c2 Reduce");
+        let accepted = v.place_stop_market_order(&s, OrderSide::Sell, q, t, "ins-1").await.unwrap();
+        one("place_protection BTCUSDT Sell 0.01 90000 ins-1");
+        assert_eq!(accepted.exchange_order_id, "p");
+        let outcome = v.cancel_stop_market_order(&s, "77").await.unwrap();
+        one("cancel_protection BTCUSDT 77");
+        assert_eq!(outcome, ports::StopCancelOutcome::AlreadyGone);
+        ExchangePort::cancel_order(&v, &s, "5").await.unwrap();
+        one("cancel_order BTCUSDT 5");
+        v.get_open_orders(&s).await.unwrap();
+        one("open_protective_orders BTCUSDT");
+        assert_eq!(v.get_price(&s).await.unwrap(), Price::new(dec!(7)).unwrap());
+        one("price BTCUSDT");
+        v.health_check().await.unwrap();
+        one("health");
+        let balance = v.get_futures_balance().await.unwrap();
+        one("balance");
+        assert_eq!(
+            (balance.wallet_balance, balance.available_balance, balance.unrealized_pnl),
+            (dec!(3), dec!(2), dec!(-1))
+        );
+        v.get_spot_account_balances().await.unwrap();
+        one("spot_balances");
+        assert_eq!(v.get_spot_price("BTCUSDT").await.unwrap(), Price::new(dec!(9)).unwrap());
+        one("spot_price BTCUSDT");
+        assert!(ExchangePort::spot_symbol_is_trading(&v, "BTCUSDT").await.unwrap());
+        one("spot_symbol_is_trading BTCUSDT");
+        let request = SpotOrderRequest {
+            symbol: "BTCUSDT".to_string(),
+            side: ports::SpotOrderSide::Buy,
+            quantity_kind: ports::SpotOrderQuantity::Quote,
+            quantity: dec!(10),
+            client_order_id: "s1".to_string(),
+        };
+        let err = ExchangePort::place_spot_market_order(&v, request).await.unwrap_err();
+        one("place_spot_market_order BTCUSDT s1");
+        assert_eq!(err.to_string(), "Exchange error: recorded");
+        v.get_spot_order("BTCUSDT", "s1").await.unwrap();
+        one("spot_order BTCUSDT s1");
+        let kind = UniversalTransferType::MainUmfuture;
+        v.universal_transfer("USDT", dec!(5), kind, "k1").await.unwrap();
+        one("transfer USDT 5 MainUmfuture k1");
+        v.get_transfer_history(kind, at).await.unwrap();
+        one("transfer_history MainUmfuture 1000");
+        v.get_all_open_positions().await.unwrap();
+        one("open_positions");
+        ExchangePort::close_position_market(&v, &s, Side::Long, q, "x1").await.unwrap();
+        one("close_position_market BTCUSDT Long 0.01 x1");
+        assert_eq!(
+            v.get_order_by_exchange_id(&s, "9").await.unwrap().unwrap().exchange_order_id,
+            "e"
+        );
+        one("order_by_exchange_id BTCUSDT 9");
+        assert_eq!(v.get_stop_order_fill(&s, "8").await.unwrap().unwrap().exchange_order_id, "f");
+        one("protection_fill BTCUSDT 8");
+        v.get_user_trades_since(&s, at, 50).await.unwrap();
+        one("user_trades_since BTCUSDT 1000 50");
+        v.get_income_since(at, 25).await.unwrap();
+        one("settlement_since 1000 25");
     }
 }

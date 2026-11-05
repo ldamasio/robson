@@ -25,8 +25,8 @@ use crate::{
     venue::{
         self, AccountKind, Cash, EntryOrReduce, ExecutionCostEnvelope, FeeAssetPolicy,
         FundingTerms, Mark, MarketKind, OrderLookup, PlacedStop, ProtectionKind, ReplaceOutcome,
-        ReplacementProtocol, StopCancelOutcome, StopParams, StopRef, VenueCapabilities,
-        VenueFinalityRule, VenueId,
+        ReplacementProtocol, RequestWindow, StopCancelOutcome, StopParams, StopRef,
+        VenueCapabilities, VenueFinalityRule, VenueId,
     },
 };
 
@@ -83,9 +83,15 @@ pub struct StubExchange {
     futures_balance: RwLock<Decimal>,
     /// Simulated unrealized P&L reported next to the wallet balance.
     unrealized_pnl: RwLock<Decimal>,
-    /// Market orders accepted via `place_market_order`, keyed by client id,
-    /// for `order_by_client_id` (ADR-0056).
+    /// Market orders accepted via `place_market_order` or
+    /// `close_position_market`, keyed by client id, for `order_by_client_id`
+    /// (ADR-0056).
     client_orders: RwLock<HashMap<String, OrderResult>>,
+    /// Submit-attempt evidence per client id (placements, accepted or not).
+    submit_attempts: RwLock<HashMap<String, RequestWindow>>,
+    /// Protective stops cancelled on the stub, keyed by algo id, so lookups
+    /// by client id still see them as terminal.
+    cancelled_stop_orders: RwLock<HashMap<String, StubStopOrder>>,
     /// Simulated regular orders retrievable by `get_order_by_exchange_id`.
     orders: RwLock<HashMap<String, OrderResult>>,
     /// Simulated user trades retrievable by `get_user_trades_since`.
@@ -138,6 +144,8 @@ impl StubExchange {
             futures_balance: RwLock::new(Decimal::from(10000)),
             unrealized_pnl: RwLock::new(Decimal::ZERO),
             client_orders: RwLock::new(HashMap::new()),
+            submit_attempts: RwLock::new(HashMap::new()),
+            cancelled_stop_orders: RwLock::new(HashMap::new()),
             orders: RwLock::new(HashMap::new()),
             user_trades: RwLock::new(HashMap::new()),
             spot_balances: RwLock::new(HashMap::new()),
@@ -232,6 +240,16 @@ impl StubExchange {
         let mut counter = self.order_counter.write().unwrap();
         *counter += 1;
         format!("STUB-{}", *counter)
+    }
+
+    /// Record a submit attempt with `client_order_id` (ADR-0056 finality
+    /// evidence). The stub has no network, so the window is a single instant.
+    fn record_attempt(&self, client_order_id: &str) {
+        let now = Utc::now();
+        let window = RequestWindow { started_at: now, completed_at: now };
+        let mut attempts = self.submit_attempts.write().unwrap();
+        let merged = attempts.get(client_order_id).map_or(window, |w| w.merge(window));
+        attempts.insert(client_order_id.to_string(), merged);
     }
 
     /// Check if we should fail the next operation.
@@ -397,6 +415,7 @@ impl venue::TradingPort for StubExchange {
         intent: EntryOrReduce,
     ) -> Result<OrderResult, ExecError> {
         *self.market_order_calls.write().unwrap() += 1;
+        self.record_attempt(client_order_id);
 
         // Check if we should simulate a failure
         if self.should_fail() || self.should_fail_order() {
@@ -449,6 +468,7 @@ impl venue::TradingPort for StubExchange {
         stop_price: Price,
         client_order_id: &str,
     ) -> Result<PlacedStop, ExecError> {
+        self.record_attempt(client_order_id);
         // Simulate placement failure when configured (mirrors market order path).
         if self.should_fail() || self.should_fail_order() {
             return Err(ExecError::Exchange("Simulated stop order failure".to_string()));
@@ -500,7 +520,9 @@ impl venue::TradingPort for StubExchange {
         }
 
         // Remove a protective stop if present (ADR-0039); harmless for other orders.
-        self.stop_orders.write().unwrap().remove(order_id);
+        if let Some(order) = self.stop_orders.write().unwrap().remove(order_id) {
+            self.cancelled_stop_orders.write().unwrap().insert(order_id.to_string(), order);
+        }
 
         // Stub: just log and return success
         tracing::debug!(order_id, "Stub: order cancelled");
@@ -517,7 +539,11 @@ impl venue::TradingPort for StubExchange {
         }
 
         let algo_id = stop.exchange_order_id.as_str();
-        let existed = self.stop_orders.write().unwrap().remove(algo_id).is_some();
+        let removed = self.stop_orders.write().unwrap().remove(algo_id);
+        let existed = removed.is_some();
+        if let Some(order) = removed {
+            self.cancelled_stop_orders.write().unwrap().insert(algo_id.to_string(), order);
+        }
 
         tracing::debug!(algo_id, existed, "Stub: stop algo order cancel");
         Ok(if existed {
@@ -552,7 +578,6 @@ impl venue::TradingPort for StubExchange {
         &self,
         _symbol: &Symbol,
         client_order_id: &str,
-        submitted_at: Option<DateTime<Utc>>,
     ) -> Result<OrderLookup, ExecError> {
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated order_by_client_id failure".to_string()));
@@ -585,7 +610,23 @@ impl venue::TradingPort for StubExchange {
         {
             return Ok(OrderLookup::Open { filled_qty: Decimal::ZERO });
         }
-        Ok(STUB_FINALITY.classify_not_found(submitted_at, Utc::now()))
+        if let Some(order) = self
+            .cancelled_stop_orders
+            .read()
+            .unwrap()
+            .values()
+            .find(|order| order.client_order_id == client_order_id)
+        {
+            return Ok(OrderLookup::Terminal {
+                filled_qty: Decimal::ZERO,
+                cancelled_qty: order.quantity.as_decimal(),
+                fills: None,
+            });
+        }
+        let attempt = self.submit_attempts.read().unwrap().get(client_order_id).copied();
+        let now = Utc::now();
+        Ok(STUB_FINALITY
+            .classify_not_found(attempt, RequestWindow { started_at: now, completed_at: now }))
     }
 
     async fn open_protective_orders(
@@ -925,6 +966,7 @@ impl venue::PositionAccountPort for StubExchange {
         quantity: Quantity,
         client_order_id: &str,
     ) -> Result<OrderResult, ExecError> {
+        self.record_attempt(client_order_id);
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated reconciliation close failure".to_string()));
         }
@@ -947,7 +989,7 @@ impl venue::PositionAccountPort for StubExchange {
         let fee = price * quantity.as_decimal() * self.fee_rate;
         let exchange_order_id = self.next_order_id();
 
-        Ok(OrderResult {
+        let result = OrderResult {
             exchange_order_id,
             client_order_id: client_order_id.to_string(),
             fill_price: Price::new(price).unwrap(),
@@ -955,7 +997,12 @@ impl venue::PositionAccountPort for StubExchange {
             fee,
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
-        })
+        };
+        self.client_orders
+            .write()
+            .unwrap()
+            .insert(client_order_id.to_string(), result.clone());
+        Ok(result)
     }
 }
 
@@ -984,11 +1031,12 @@ impl venue::SettlementPort for StubExchange {
 /// Venue id of the stub exchange.
 pub const STUB_VENUE_ID: &str = "stub";
 
-/// The stub keeps every order in memory, so a not-found is final as soon as a
-/// submission time is known (no propagation delay, effectively unbounded
-/// retention).
+/// The stub keeps every order in memory and has no network or clock skew, so
+/// a not-found is final as soon as a submit attempt was recorded.
 pub const STUB_FINALITY: VenueFinalityRule = VenueFinalityRule {
-    propagation_window: Duration::ZERO,
+    request_validity: Duration::ZERO,
+    clock_tolerance: Duration::ZERO,
+    visibility_margin: Duration::ZERO,
     lookup_retention: Duration::from_secs(365 * 24 * 60 * 60),
 };
 

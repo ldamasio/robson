@@ -453,6 +453,22 @@ impl BinanceRestClient {
         serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
     }
 
+    /// Query an algo order by client algo id.
+    ///
+    /// `GET /fapi/v1/algoOrder` (signed) with `clientAlgoId`. A not-found is
+    /// returned as the raw API error; the caller applies the venue's finality
+    /// rule.
+    pub async fn query_algo_order_by_client_id(
+        &self,
+        client_algo_id: &str,
+    ) -> Result<BinanceAlgoOrderDetail, BinanceRestError> {
+        let params = vec![("clientAlgoId", client_algo_id.to_string())];
+
+        let body = self.get_signed("/fapi/v1/algoOrder", params).await?;
+
+        serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
+    }
+
     /// Cancel an open order.
     ///
     /// `DELETE /fapi/v1/order`
@@ -717,19 +733,7 @@ impl BinanceRestClient {
     /// Returns per-asset balances. This method extracts the USDT entry.
     pub async fn get_futures_balance(&self) -> Result<BinanceFuturesBalance, BinanceRestError> {
         let body = self.get_signed("/fapi/v2/balance", vec![]).await?;
-
-        let balances: Vec<BinanceBalanceResponse> =
-            serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
-
-        let usdt = balances.into_iter().find(|b| b.asset == "USDT").ok_or_else(|| {
-            BinanceRestError::ParseError("No USDT entry in futures balance response".to_string())
-        })?;
-
-        Ok(BinanceFuturesBalance {
-            wallet_balance: usdt.balance,
-            available_balance: usdt.availableBalance,
-            unrealized_pnl: usdt.crossUnPnl,
-        })
+        parse_futures_balance(&body)
     }
 
     pub async fn get_spot_account_balances(
@@ -1344,6 +1348,22 @@ pub struct BinanceUniversalTransfer {
     pub transfer_type: String,
     pub status: String,
     pub timestamp: i64,
+}
+
+/// Extract the USDT entry of a `/fapi/v2/balance` response.
+pub(crate) fn parse_futures_balance(body: &str) -> Result<BinanceFuturesBalance, BinanceRestError> {
+    let balances: Vec<BinanceBalanceResponse> =
+        serde_json::from_str(body).map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+
+    let usdt = balances.into_iter().find(|b| b.asset == "USDT").ok_or_else(|| {
+        BinanceRestError::ParseError("No USDT entry in futures balance response".to_string())
+    })?;
+
+    Ok(BinanceFuturesBalance {
+        wallet_balance: usdt.balance,
+        available_balance: usdt.availableBalance,
+        unrealized_pnl: usdt.crossUnPnl,
+    })
 }
 
 fn parse_futures_klines(body: &str) -> Result<Vec<BinanceKline>, BinanceRestError> {

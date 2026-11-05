@@ -30,15 +30,19 @@ use robson_exec::{
     venue::{
         self, AccountKind, AccountPort, Cash, EntryOrReduce, ExecutionCostEnvelope, FundingPort,
         InventoryPort, Mark, MarketKind, OrderLookup, PlacedStop, PositionAccountPort,
-        ProtectionKind, ReplaceOutcome, ReplacementProtocol, SettlementPort, StopCancelOutcome,
-        StopParams, StopRef, TradingPort, Venue, VenueCapabilities, VenueFinalityRule, VenueId,
+        ProtectionKind, ReplaceOutcome, ReplacementProtocol, RequestWindow, SettlementPort,
+        StopCancelOutcome, StopParams, StopRef, TradingPort, Venue, VenueCapabilities,
+        VenueFinalityRule, VenueId,
     },
     ExecError, OrderResult,
 };
 use rust_decimal::Decimal;
 use tracing::{info, warn};
 
-use crate::binance_rest::{BinanceOrderResponse, BinanceRestClient, BinanceRestError};
+use crate::binance_rest::{
+    BinanceAlgoOrderDetail, BinanceFuturesBalance, BinanceOrderResponse, BinanceRestClient,
+    BinanceRestError,
+};
 
 /// Truncate a quantity to a given number of decimal places (round down).
 fn trunc_to_scale(value: Decimal, scale: u32) -> Decimal {
@@ -191,6 +195,16 @@ fn fill_evidence(response: BinanceOrderResponse) -> Result<Option<OrderResult>, 
     }))
 }
 
+/// Map the connector balance onto the port type: `wallet_balance` unchanged,
+/// `unrealized_pnl` separate (ADR-0056 §2.4).
+fn futures_balance_from(balance: BinanceFuturesBalance) -> FuturesBalance {
+    FuturesBalance {
+        wallet_balance: balance.wallet_balance,
+        available_balance: balance.available_balance,
+        unrealized_pnl: balance.unrealized_pnl,
+    }
+}
+
 /// Map a `/fapi/v1/order` response onto the order lifecycle. Unrecognized
 /// statuses are `Unknown`, never guessed.
 fn order_lookup_from_response(response: BinanceOrderResponse) -> Result<OrderLookup, ExecError> {
@@ -210,12 +224,31 @@ fn order_lookup_from_response(response: BinanceOrderResponse) -> Result<OrderLoo
     }
 }
 
-/// Order finality rule of `binance:usdm`; see
-/// `BinanceExchangeAdapter::order_by_client_id`.
+/// Order finality rule of `binance:usdm` (see [`VenueFinalityRule`] for the
+/// derivation):
+/// - `request_validity` 5 s: Binance rejects a signed request whose `timestamp`
+///   is more than `recvWindow` behind its clock; this client never sends
+///   `recvWindow`, so the documented default 5 000 ms applies.
+/// - `clock_tolerance` 1 s: Binance rejects a `timestamp` more than 1 000 ms
+///   ahead of its clock.
+/// - `visibility_margin` 60 s: engineering allowance for an accepted order to
+///   become visible to the lookups; Binance documents no bound.
+/// - `lookup_retention` 3 days: Query Order and Query Algo Order do not find a
+///   CANCELED or EXPIRED order without fills once created time + 3 days has
+///   passed (any order after 90 days).
+///
+/// Attempt evidence is the local window around each placement call, recorded
+/// in memory by the adapter (bounded); it does not survive a restart, after
+/// which every not-found is `Unknown`.
 pub const USDM_FINALITY: VenueFinalityRule = VenueFinalityRule {
-    propagation_window: Duration::from_secs(60),
+    request_validity: Duration::from_millis(5_000),
+    clock_tolerance: Duration::from_millis(1_000),
+    visibility_margin: Duration::from_secs(60),
     lookup_retention: Duration::from_secs(3 * 24 * 60 * 60),
 };
+
+/// Bound on the in-memory submit-attempt evidence.
+const SUBMIT_ATTEMPTS_CAPACITY: usize = 4096;
 
 // Adapter
 // =============================================================================
@@ -275,6 +308,9 @@ pub struct BinanceExchangeAdapter {
     /// concurrent callers wait for one fetch instead of stampeding the
     /// exchange. Market ticks read the cached entry; zero HTTP per tick.
     trading_rules: tokio::sync::Mutex<HashMap<String, CachedTradingRules>>,
+    /// Local request windows of placement attempts by client id (finality
+    /// evidence for `order_by_client_id`). Never held across I/O.
+    submit_attempts: std::sync::Mutex<HashMap<String, RequestWindow>>,
 }
 
 impl BinanceExchangeAdapter {
@@ -284,6 +320,7 @@ impl BinanceExchangeAdapter {
             venue_id: VenueId::new(VenueId::BINANCE_USDM),
             client,
             trading_rules: tokio::sync::Mutex::new(HashMap::new()),
+            submit_attempts: std::sync::Mutex::new(HashMap::new()),
         }
     }
 
@@ -400,6 +437,133 @@ impl BinanceExchangeAdapter {
             _ => false,
         }
     }
+
+
+    /// Record the local window around a submit attempt with
+    /// `client_order_id` (finality evidence, ADR-0056 §2). Bounded: the
+    /// oldest attempt is dropped when full, which only turns a later
+    /// not-found for it into `Unknown`.
+    fn record_attempt(&self, client_order_id: &str, started_at: DateTime<Utc>) {
+        let window = RequestWindow { started_at, completed_at: Utc::now() };
+        let mut attempts = self.submit_attempts.lock().unwrap_or_else(|e| e.into_inner());
+        if attempts.len() >= SUBMIT_ATTEMPTS_CAPACITY && !attempts.contains_key(client_order_id) {
+            let oldest =
+                attempts.iter().min_by_key(|(_, w)| w.completed_at).map(|(id, _)| id.clone());
+            if let Some(id) = oldest {
+                attempts.remove(&id);
+            }
+        }
+        let merged = attempts.get(client_order_id).map_or(window, |w| w.merge(window));
+        attempts.insert(client_order_id.to_string(), merged);
+    }
+
+    /// Classify a not-found on every lookup namespace.
+    fn classify_not_found(&self, client_order_id: &str, lookup: RequestWindow) -> OrderLookup {
+        let attempt = self
+            .submit_attempts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(client_order_id)
+            .copied();
+        USDM_FINALITY.classify_not_found(attempt, lookup)
+    }
+
+    /// Lifecycle of a protective stop found by client id. A triggered stop
+    /// resolves to its resulting order; its fills come from the order
+    /// response or, when absent there, from user trades.
+    async fn algo_order_lookup(
+        &self,
+        symbol: &Symbol,
+        detail: &BinanceAlgoOrderDetail,
+    ) -> Result<OrderLookup, ExecError> {
+        let actual_order_id = detail.actual_order_id.trim();
+        if actual_order_id.is_empty() {
+            return Ok(match detail.algo_status.as_str() {
+                "NEW" => OrderLookup::Open { filled_qty: Decimal::ZERO },
+                "CANCELED" | "EXPIRED" | "REJECTED" => OrderLookup::Terminal {
+                    filled_qty: Decimal::ZERO,
+                    cancelled_qty: detail.quantity,
+                    fills: None,
+                },
+                // TRIGGERING, or TRIGGERED/FINISHED without the resulting
+                // order id: not established.
+                _ => OrderLookup::Unknown,
+            });
+        }
+        let Ok(order_id) = actual_order_id.parse::<u64>() else {
+            return Ok(OrderLookup::Unknown);
+        };
+        let response = match self.client.get_order_status(&symbol.as_pair(), order_id).await {
+            Ok(response) => response,
+            Err(BinanceRestError::ApiError { code: -2013, .. }) => return Ok(OrderLookup::Unknown),
+            Err(error) => return Err(Self::map_error(error)),
+        };
+        match order_lookup_from_response(response)? {
+            OrderLookup::Terminal { filled_qty, cancelled_qty, fills: None }
+                if filled_qty > Decimal::ZERO =>
+            {
+                let fills = self.triggered_trade_fill(symbol, detail).await?;
+                Ok(OrderLookup::Terminal { filled_qty, cancelled_qty, fills })
+            },
+            other => Ok(other),
+        }
+    }
+
+    /// Fee-grade fill of a triggered protective stop from user trades keyed
+    /// by the triggered order id (`/fapi/v1/order` omits per-fill records on
+    /// USD-M futures).
+    async fn triggered_trade_fill(
+        &self,
+        symbol: &Symbol,
+        detail: &BinanceAlgoOrderDetail,
+    ) -> Result<Option<OrderResult>, ExecError> {
+        // /fapi/v1/order omits per-fill records on USD-M futures, so the
+        // direct order query yields no fee-grade evidence for filled market
+        // orders. Resolve through user trades keyed by the triggered order id
+        // (UserTradeRecord-grade evidence, Policy 11). Found in production on
+        // 2026-07-03: the first real insurance-stop fill left its position
+        // unreconciled because this fallback was missing.
+        let since = DateTime::from_timestamp_millis(if detail.trigger_time > 0 {
+            detail.trigger_time - 5 * 60 * 1000
+        } else {
+            detail.create_time
+        })
+        .unwrap_or_else(|| Utc::now() - chrono::Duration::hours(24));
+
+        let trades = self.user_trades_since(symbol, since, 1000).await?;
+        let fills: Vec<_> = trades
+            .into_iter()
+            .filter(|t| t.exchange_order_id == detail.actual_order_id)
+            .collect();
+        if fills.is_empty() {
+            return Ok(None);
+        }
+
+        let total_qty: Decimal = fills.iter().map(|t| t.filled_quantity.as_decimal()).sum();
+        if total_qty <= Decimal::ZERO {
+            return Ok(None);
+        }
+        let total_quote: Decimal = fills
+            .iter()
+            .map(|t| t.fill_price.as_decimal() * t.filled_quantity.as_decimal())
+            .sum();
+        let fee: Decimal = fills.iter().map(|t| t.fee).sum();
+        let fee_asset =
+            fills.first().map(|t| t.fee_asset.clone()).unwrap_or_else(|| "USDT".to_string());
+        let filled_at = fills.iter().map(|t| t.filled_at).max().unwrap_or_else(Utc::now);
+
+        Ok(Some(OrderResult {
+            exchange_order_id: detail.actual_order_id.clone(),
+            client_order_id: detail.client_algo_id.clone(),
+            fill_price: Price::new(total_quote / total_qty)
+                .map_err(|e| ExecError::Exchange(format!("Invalid fill price: {}", e)))?,
+            filled_quantity: Quantity::new(total_qty)
+                .map_err(|e| ExecError::Exchange(format!("Invalid fill quantity: {}", e)))?,
+            fee,
+            fee_asset,
+            filled_at,
+        }))
+    }
 }
 
 #[async_trait]
@@ -445,11 +609,7 @@ impl PositionAccountPort for BinanceExchangeAdapter {
 
     async fn balance(&self) -> Result<FuturesBalance, ExecError> {
         let balance = self.client.get_futures_balance().await.map_err(Self::map_error)?;
-        Ok(FuturesBalance {
-            wallet_balance: balance.wallet_balance,
-            available_balance: balance.available_balance,
-            unrealized_pnl: balance.unrealized_pnl,
-        })
+        Ok(futures_balance_from(balance))
     }
 
     async fn open_positions(&self) -> Result<Vec<ExchangePosition>, ExecError> {
@@ -552,6 +712,7 @@ impl TradingPort for BinanceExchangeAdapter {
             },
         };
 
+        let started_at = Utc::now();
         let response = self
             .client
             .place_market_order(
@@ -561,8 +722,9 @@ impl TradingPort for BinanceExchangeAdapter {
                 Some(client_order_id),
                 reduce_only,
             )
-            .await
-            .map_err(Self::map_error)?;
+            .await;
+        self.record_attempt(client_order_id, started_at);
+        let response = response.map_err(Self::map_error)?;
 
         match response.status.as_str() {
             "FILLED" => {},
@@ -735,6 +897,7 @@ impl TradingPort for BinanceExchangeAdapter {
             },
         };
 
+        let started_at = Utc::now();
         let response = self
             .client
             .place_stop_market_order(
@@ -744,8 +907,9 @@ impl TradingPort for BinanceExchangeAdapter {
                 trigger_price,
                 client_order_id,
             )
-            .await
-            .map_err(Self::map_error)?;
+            .await;
+        self.record_attempt(client_order_id, started_at);
+        let response = response.map_err(Self::map_error)?;
 
         // A protective STOP_MARKET is accepted, not filled: only `NEW` is the
         // clean success. Any other status (triggered, expired, rejected) is
@@ -832,33 +996,30 @@ impl TradingPort for BinanceExchangeAdapter {
         venue::replace_place_then_cancel(self, symbol, old, new).await
     }
 
-    /// Lookup via `GET /fapi/v1/order` with `origClientOrderId`, which serves
-    /// open and historical orders alike.
-    ///
-    /// **Finality rule** ([`USDM_FINALITY`]): Binance documents that this
-    /// endpoint does not find an order that is CANCELED or EXPIRED with no
-    /// fill once created time + 3 days has passed, nor any order older than
-    /// 90 days. It does not document a propagation delay; the signed request
-    /// carries `timestamp` and is rejected on arrival outside the default
-    /// `recvWindow` (5 000 ms, not overridden by this client). A `-2013`
-    /// (order does not exist) is therefore [`OrderLookup::Absent`] only when
-    /// `submitted_at` is known, at least 60 s old (recvWindow, clock offset
-    /// and backend queueing, chosen conservatively) and more than 60 s inside
-    /// the 3-day retention. Any other not-found is [`OrderLookup::Unknown`].
+    /// Lookup in both order namespaces this adapter places under: `GET
+    /// /fapi/v1/order` with `origClientOrderId` (market orders), then `GET
+    /// /fapi/v1/algoOrder` with `clientAlgoId` (protective stops). A
+    /// triggered algo order resolves to its resulting order and fills (the
+    /// same chain as `protection_fill`). Only a `-2013` on **both** lookups
+    /// is a not-found, classified by [`USDM_FINALITY`] against the submit
+    /// attempts this adapter recorded; at most four requests.
     async fn order_by_client_id(
         &self,
         symbol: &Symbol,
         client_order_id: &str,
-        submitted_at: Option<DateTime<Utc>>,
     ) -> Result<OrderLookup, ExecError> {
-        match self
-            .client
-            .get_order_status_by_client_id(&symbol.as_pair(), client_order_id)
-            .await
-        {
-            Ok(response) => order_lookup_from_response(response),
+        let pair = symbol.as_pair();
+        let started_at = Utc::now();
+        match self.client.get_order_status_by_client_id(&pair, client_order_id).await {
+            Ok(response) => return order_lookup_from_response(response),
+            Err(BinanceRestError::ApiError { code: -2013, .. }) => {},
+            Err(error) => return Err(Self::map_error(error)),
+        }
+        match self.client.query_algo_order_by_client_id(client_order_id).await {
+            Ok(detail) => self.algo_order_lookup(symbol, &detail).await,
             Err(BinanceRestError::ApiError { code: -2013, .. }) => {
-                Ok(USDM_FINALITY.classify_not_found(submitted_at, Utc::now()))
+                let lookup = RequestWindow { started_at, completed_at: Utc::now() };
+                Ok(self.classify_not_found(client_order_id, lookup))
             },
             Err(error) => Err(Self::map_error(error)),
         }
@@ -978,52 +1139,7 @@ impl TradingPort for BinanceExchangeAdapter {
             return Ok(Some(result));
         }
 
-        // /fapi/v1/order omits per-fill records on USD-M futures, so the
-        // direct order query yields no fee-grade evidence for filled market
-        // orders. Resolve through user trades keyed by the triggered order id
-        // (UserTradeRecord-grade evidence, Policy 11). Found in production on
-        // 2026-07-03: the first real insurance-stop fill left its position
-        // unreconciled because this fallback was missing.
-        let since = DateTime::from_timestamp_millis(if detail.trigger_time > 0 {
-            detail.trigger_time - 5 * 60 * 1000
-        } else {
-            detail.create_time
-        })
-        .unwrap_or_else(|| Utc::now() - chrono::Duration::hours(24));
-
-        let trades = self.user_trades_since(symbol, since, 1000).await?;
-        let fills: Vec<_> = trades
-            .into_iter()
-            .filter(|t| t.exchange_order_id == detail.actual_order_id)
-            .collect();
-        if fills.is_empty() {
-            return Ok(None);
-        }
-
-        let total_qty: Decimal = fills.iter().map(|t| t.filled_quantity.as_decimal()).sum();
-        if total_qty <= Decimal::ZERO {
-            return Ok(None);
-        }
-        let total_quote: Decimal = fills
-            .iter()
-            .map(|t| t.fill_price.as_decimal() * t.filled_quantity.as_decimal())
-            .sum();
-        let fee: Decimal = fills.iter().map(|t| t.fee).sum();
-        let fee_asset =
-            fills.first().map(|t| t.fee_asset.clone()).unwrap_or_else(|| "USDT".to_string());
-        let filled_at = fills.iter().map(|t| t.filled_at).max().unwrap_or_else(Utc::now);
-
-        Ok(Some(OrderResult {
-            exchange_order_id: detail.actual_order_id.clone(),
-            client_order_id: detail.client_algo_id.clone(),
-            fill_price: Price::new(total_quote / total_qty)
-                .map_err(|e| ExecError::Exchange(format!("Invalid fill price: {}", e)))?,
-            filled_quantity: Quantity::new(total_qty)
-                .map_err(|e| ExecError::Exchange(format!("Invalid fill quantity: {}", e)))?,
-            fee,
-            fee_asset,
-            filled_at,
-        }))
+        self.triggered_trade_fill(symbol, &detail).await
     }
 
     async fn user_trades_since(
@@ -1328,10 +1444,7 @@ mod tests {
 
     #[test]
     fn usdm_capabilities() {
-        let venue = BinanceExchangeAdapter::new(Arc::new(BinanceRestClient::new(
-            "key".to_string(),
-            "secret".to_string(),
-        )));
+        let venue = adapter();
         let caps = venue.capabilities();
         assert_eq!(venue.id().as_str(), "binance:usdm");
         assert_eq!(caps.market_kind, MarketKind::PerpUsdM);
@@ -1340,9 +1453,74 @@ mod tests {
         assert_eq!(caps.protection, ProtectionKind::MarketOnTrigger);
         assert_eq!(caps.replacement, ReplacementProtocol::PlaceThenCancel);
         assert_eq!(caps.order_finality, USDM_FINALITY);
-        assert_eq!(USDM_FINALITY.propagation_window, Duration::from_secs(60));
+        assert_eq!(USDM_FINALITY.request_validity, Duration::from_millis(5_000));
+        assert_eq!(USDM_FINALITY.clock_tolerance, Duration::from_millis(1_000));
+        assert_eq!(USDM_FINALITY.visibility_margin, Duration::from_secs(60));
         assert_eq!(USDM_FINALITY.lookup_retention, Duration::from_secs(3 * 24 * 60 * 60));
         assert!(capability_mismatches(&venue).is_empty());
+    }
+
+    fn adapter() -> BinanceExchangeAdapter {
+        BinanceExchangeAdapter::new(Arc::new(BinanceRestClient::new(
+            "key".to_string(),
+            "secret".to_string(),
+        )))
+    }
+
+    #[test]
+    fn not_found_is_absent_only_with_recorded_attempt_evidence() {
+        let venue = adapter();
+        let late = Utc::now() + chrono::Duration::seconds(120);
+        let lookup = RequestWindow { started_at: late, completed_at: late };
+        assert!(matches!(venue.classify_not_found("c1", lookup), OrderLookup::Unknown));
+
+        venue.record_attempt("c1", Utc::now());
+        assert!(matches!(venue.classify_not_found("c1", lookup), OrderLookup::Absent { .. }));
+        // A lookup sent right after the attempt cannot be final.
+        let now = Utc::now();
+        let early = RequestWindow { started_at: now, completed_at: now };
+        assert!(matches!(venue.classify_not_found("c1", early), OrderLookup::Unknown));
+    }
+
+    #[tokio::test]
+    async fn untriggered_algo_orders_map_without_further_requests() {
+        let venue = adapter();
+        let detail = |status: &str| -> BinanceAlgoOrderDetail {
+            serde_json::from_str(&format!(
+                r#"{{"algoId":1,"clientAlgoId":"ins-1","algoType":"CONDITIONAL",
+                   "orderType":"STOP_MARKET","symbol":"BTCUSDT","side":"SELL",
+                   "quantity":"0.004","algoStatus":"{status}","triggerPrice":"58888",
+                   "reduceOnly":true,"createTime":1,"updateTime":2}}"#
+            ))
+            .unwrap()
+        };
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let lookup = |status: &'static str| {
+            let (venue, symbol, detail) = (&venue, &symbol, detail(status));
+            async move { venue.algo_order_lookup(symbol, &detail).await.unwrap() }
+        };
+        assert!(
+            matches!(lookup("NEW").await, OrderLookup::Open { filled_qty } if filled_qty.is_zero())
+        );
+        assert!(matches!(
+            lookup("CANCELED").await,
+            OrderLookup::Terminal { filled_qty, cancelled_qty, fills: None }
+                if filled_qty.is_zero() && cancelled_qty == dec!(0.004)
+        ));
+        assert!(matches!(lookup("TRIGGERING").await, OrderLookup::Unknown));
+        assert!(matches!(lookup("TRIGGERED").await, OrderLookup::Unknown));
+    }
+
+    #[test]
+    fn balance_wire_response_maps_to_legacy_balance() {
+        let body = r#"[{"asset":"BNB","balance":"1","availableBalance":"1","crossUnPnl":"0"},
+                       {"asset":"USDT","balance":"1000.5","crossWalletBalance":"1000.5",
+                        "crossUnPnl":"-12.25","availableBalance":"900"}]"#;
+        let balance =
+            futures_balance_from(crate::binance_rest::parse_futures_balance(body).unwrap());
+        assert_eq!(balance.wallet_balance, dec!(1000.5));
+        assert_eq!(balance.available_balance, dec!(900));
+        assert_eq!(balance.unrealized_pnl, dec!(-12.25));
     }
 
     #[test]
