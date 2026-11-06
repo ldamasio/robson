@@ -16,10 +16,7 @@ use sqlx::PgPool;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use super::{
-    FundingRouteMode, FundingService, FundingState, FUNDING_BLOCKED_EVENT,
-    FUNDING_ROUTE_UNAVAILABLE,
-};
+use super::{FundingRouteMode, FundingService, FundingState, FUNDING_ROUTE_UNAVAILABLE};
 use crate::{
     config::{Config, FundingConfig, VenueSelection},
     daemon::Daemon,
@@ -642,44 +639,40 @@ async fn saga_without_its_original_credentials_stays_visibly_blocked(
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "Requires DATABASE_URL"]
-async fn unstarted_quote_only_expires_when_the_route_is_closed_for_new_execution(
-    pool: PgPool,
-) -> anyhow::Result<()> {
-    for route_mode in [FundingRouteMode::Recovery, FundingRouteMode::Blocked] {
-        let original = configured_exchange();
-        let harness = test_service(pool.clone(), Arc::clone(&original), FundingConfig::default());
-        let quote = harness.service.quote().await?;
-        let worker = worker_service_after_switch(
-            pool.clone(),
-            harness.tenant_id,
-            Arc::clone(&original),
-            &venue_without_funding(),
-            route_mode,
-        );
+async fn unstarted_quote_only_expires_on_a_recovery_route(pool: PgPool) -> anyhow::Result<()> {
+    let original = configured_exchange();
+    let harness = test_service(pool.clone(), Arc::clone(&original), FundingConfig::default());
+    let quote = harness.service.quote().await?;
+    let worker = worker_service_after_switch(
+        pool.clone(),
+        harness.tenant_id,
+        Arc::clone(&original),
+        &venue_without_funding(),
+        FundingRouteMode::Recovery,
+    );
 
-        assert_eq!(worker.resume_non_terminal().await?, 0);
-        assert_eq!(worker.get(quote.quote_id).await?.state, FundingState::Quoted.as_str());
-        assert_eq!(original.spot_order_call_count(), 0, "{route_mode:?}");
+    assert_eq!(worker.resume_non_terminal().await?, 0);
+    assert_eq!(worker.get(quote.quote_id).await?.state, FundingState::Quoted.as_str());
+    assert_eq!(original.spot_order_call_count(), 0);
 
-        let expiring = FundingConfig {
-            quote_ttl_secs: 0,
-            ..FundingConfig::default()
-        };
-        let harness = test_service(pool.clone(), Arc::clone(&original), expiring);
-        let expired = harness.service.quote().await?;
-        let worker = worker_service_after_switch(
-            pool.clone(),
-            harness.tenant_id,
-            Arc::clone(&original),
-            &venue_without_funding(),
-            route_mode,
-        );
-        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+    let expiring = FundingConfig {
+        quote_ttl_secs: 0,
+        ..FundingConfig::default()
+    };
+    let harness = test_service(pool.clone(), Arc::clone(&original), expiring);
+    let expired = harness.service.quote().await?;
+    let worker = worker_service_after_switch(
+        pool,
+        harness.tenant_id,
+        Arc::clone(&original),
+        &venue_without_funding(),
+        FundingRouteMode::Recovery,
+    );
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
 
-        assert_eq!(worker.resume_non_terminal().await?, 0);
-        assert_eq!(worker.get(expired.quote_id).await?.state, FundingState::Failed.as_str());
-        assert_eq!(original.spot_order_call_count(), 0, "{route_mode:?}");
-    }
+    assert_eq!(worker.resume_non_terminal().await?, 0);
+    assert_eq!(worker.get(expired.quote_id).await?.state, FundingState::Failed.as_str());
+    assert_eq!(original.spot_order_call_count(), 0);
 
     Ok(())
 }
@@ -695,11 +688,14 @@ async fn no_new_saga_on_a_venue_without_a_funding_surface(pool: PgPool) -> anyho
     Ok(())
 }
 
-fn blocked_event_count(view: &super::FundingSagaView) -> usize {
-    view.events
-        .iter()
-        .filter(|event| event.event_type == FUNDING_BLOCKED_EVENT)
-        .count()
+/// Everything a route could write for a saga: the row's state and timestamp,
+/// and the number of events on its stream.
+async fn durable_record<E: ExchangePort + 'static, S: Store + 'static>(
+    service: &FundingService<E, S>,
+    saga_id: Uuid,
+) -> anyhow::Result<(String, DateTime<Utc>, usize)> {
+    let view = service.get(saga_id).await?;
+    Ok((view.state, view.updated_at, view.events.len()))
 }
 
 /// The daemon `main` builds for `venue` on a real store: factory, then
@@ -739,6 +735,7 @@ async fn a_factory_stub_never_completes_a_persisted_saga(pool: PgPool) -> anyhow
 
         let daemon = daemon_from_factory(pool.clone(), venue, tenant_id);
         let worker = daemon.funding_worker_service().expect("the worker exists with a store");
+        let before = durable_record(&worker, saga_id).await?;
         for _ in 0..3 {
             assert_eq!(worker.resume_non_terminal().await?, 0, "{venue:?}");
         }
@@ -746,13 +743,15 @@ async fn a_factory_stub_never_completes_a_persisted_saga(pool: PgPool) -> anyhow
         let view = worker.get(saga_id).await?;
         assert_eq!(view.state, FundingState::Transferring.as_str(), "{venue:?}");
         assert_eq!(view.blocked_reason.as_deref(), Some(FUNDING_ROUTE_UNAVAILABLE), "{venue:?}");
-        assert_eq!(blocked_event_count(&view), 1, "once, not once per poll: {venue:?}");
         assert_eq!(original.transfer_call_count(), 0, "{venue:?}");
+        assert_eq!(durable_record(&worker, saga_id).await?, before, "no write: {venue:?}");
 
-        // A restart keeps the single event on record.
+        // The reason is recomputed from the route, so a restart still has it.
         let restarted = daemon.funding_worker_service().expect("worker");
         assert_eq!(restarted.resume_non_terminal().await?, 0, "{venue:?}");
-        assert_eq!(blocked_event_count(&restarted.get(saga_id).await?), 1, "{venue:?}");
+        let view = restarted.get(saga_id).await?;
+        assert_eq!(view.blocked_reason.as_deref(), Some(FUNDING_ROUTE_UNAVAILABLE), "{venue:?}");
+        assert_eq!(durable_record(&restarted, saga_id).await?, before, "no write: {venue:?}");
 
         // The read endpoints report what holds the saga.
         let addr = daemon.start_api_server().await?;
@@ -770,6 +769,45 @@ async fn a_factory_stub_never_completes_a_persisted_saga(pool: PgPool) -> anyhow
         assert_eq!(detail["state"], "TRANSFERRING", "{venue:?}");
         assert_eq!(detail["blocked_reason"], FUNDING_ROUTE_UNAVAILABLE, "{venue:?}");
     }
+
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "Requires DATABASE_URL"]
+async fn a_blocked_route_leaves_even_an_expired_quote_for_a_real_route(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let original = configured_exchange();
+    let expiring = FundingConfig {
+        quote_ttl_secs: 0,
+        ..FundingConfig::default()
+    };
+    let harness = test_service(pool.clone(), Arc::clone(&original), expiring);
+    let quote = harness.service.quote().await?;
+    tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+    let daemon = daemon_from_factory(pool.clone(), VenueSelection::Stub, harness.tenant_id);
+    let worker = daemon.funding_worker_service().expect("the worker exists with a store");
+    let before = durable_record(&worker, quote.quote_id).await?;
+
+    assert_eq!(worker.resume_non_terminal().await?, 0);
+
+    assert_eq!(durable_record(&worker, quote.quote_id).await?, before, "no write");
+    let view = worker.get(quote.quote_id).await?;
+    assert_eq!(view.state, FundingState::Quoted.as_str());
+    assert_eq!(view.blocked_reason, None, "an unstarted quote holds no liabilities");
+
+    // It is not stranded: a route that can write expires it.
+    let recovery = worker_service_after_switch(
+        pool,
+        harness.tenant_id,
+        Arc::clone(&original),
+        &venue_without_funding(),
+        FundingRouteMode::Recovery,
+    );
+    assert_eq!(recovery.resume_non_terminal().await?, 0);
+    assert_eq!(recovery.get(quote.quote_id).await?.state, FundingState::Failed.as_str());
 
     Ok(())
 }

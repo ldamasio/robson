@@ -14,16 +14,14 @@ pub enum FundingRouteMode {
     /// expires, and the selected venue's engine capital is left alone.
     Recovery,
     /// No route has a funding surface (the original credentials are missing):
-    /// nothing is sent, and started sagas stay non-terminal with their
-    /// liabilities retained and their blocking on record.
+    /// nothing is sent and nothing is written. Started sagas stay non-terminal
+    /// with their liabilities retained, and the reason is recomputed from the
+    /// route on every start; an unstarted quote waits for a route to expire it.
     Blocked,
 }
 
 /// Why a [`FundingRouteMode::Blocked`] route holds a saga.
 pub const FUNDING_ROUTE_UNAVAILABLE: &str = "funding_route_unavailable";
-
-/// Event type recording, once per saga, that a route holds it.
-pub const FUNDING_BLOCKED_EVENT: &str = "FundingBlocked";
 
 impl FundingRouteMode {
     /// Why this route holds a saga in `state`, if it does. A saga that never
