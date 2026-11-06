@@ -42,8 +42,6 @@
 
 pub mod api;
 pub mod auth;
-pub mod binance_exchange;
-pub mod binance_ohlcv;
 pub mod circuit_breaker;
 pub mod config;
 pub mod daemon;
@@ -72,8 +70,6 @@ mod chaos_tests;
 
 // Re-exports for convenience
 pub use auth::{AuthError, GoogleAuthConfig, GoogleClaims};
-pub use binance_exchange::BinanceExchangeAdapter;
-pub use binance_ohlcv::BinanceOhlcvAdapter;
 pub use circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot};
 pub use config::{
     ApiConfig, BinanceConfig, Config, EngineConfig, Environment, FundingConfig, MarketDataConfig,
@@ -101,3 +97,4 @@ pub use query_engine::{
     TracingQueryRecorder,
 };
 pub use reconciliation_worker::ReconciliationWorker;
+pub use robson_connectors::binance::usdm::{BinanceExchangeAdapter, BinanceOhlcvAdapter};

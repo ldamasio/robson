@@ -21,7 +21,10 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Datelike, Utc};
-use robson_connectors::BinanceRestClient;
+use robson_connectors::{
+    binance::usdm::{BinanceExchangeAdapter, BinanceOhlcvAdapter},
+    BinanceRestClient,
+};
 #[cfg(feature = "postgres")]
 use robson_domain::{ApprovalPolicy, EntryPolicy, EntryPolicyConfig};
 use robson_domain::{Position, PositionState, Price, Symbol, TradingPolicy};
@@ -53,8 +56,6 @@ use crate::query_engine::{append_query_state_changed_event, EventLogQueryRecorde
 use crate::{
     api::{create_router, ApiState},
     auth::GoogleAuthConfig,
-    binance_exchange::BinanceExchangeAdapter,
-    binance_ohlcv::BinanceOhlcvAdapter,
     config::{Config, StartupStaleActivePolicy},
     error::{DaemonError, DaemonResult, StartupStaleActiveInfo},
     event_bus::{DaemonEvent, EventBus},

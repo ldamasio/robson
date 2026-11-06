@@ -18,7 +18,6 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use robson_connectors::{BinanceRestClient, BinanceRestError};
 use robson_domain::{OrderSide, Price, Quantity, Side, Symbol, SymbolTradingRules};
 use robson_exec::{
     ports::{
@@ -30,6 +29,8 @@ use robson_exec::{
 };
 use rust_decimal::Decimal;
 use tracing::{info, warn};
+
+use crate::binance_rest::{BinanceRestClient, BinanceRestError};
 
 /// Truncate a quantity to a given number of decimal places (round down).
 fn trunc_to_scale(value: Decimal, scale: u32) -> Decimal {
@@ -84,7 +85,7 @@ pub(crate) fn normalize_stop_trigger_price(
     rounded / factor
 }
 
-pub(crate) fn normalize_market_quantity(
+pub fn normalize_market_quantity(
     symbol: &Symbol,
     quantity: Quantity,
 ) -> Result<Decimal, ExecError> {
@@ -108,7 +109,7 @@ pub(crate) fn normalize_market_quantity(
 
 // =============================================================================
 fn spot_order_from_response(
-    response: robson_connectors::BinanceSpotOrderResponse,
+    response: crate::binance_rest::BinanceSpotOrderResponse,
 ) -> Result<SpotOrder, ExecError> {
     let fee: Decimal = response.fills.iter().map(|f| f.commission).sum();
     let fee_asset = response
@@ -164,7 +165,7 @@ fn evict_lru_trading_rules(cache: &mut HashMap<String, CachedTradingRules>) {
         .min_by_key(|(_, cached)| cached.last_used_at)
         .map(|(pair, _)| pair.clone());
     if let Some(pair) = lru {
-        warn!(symbol = %pair, capacity = TRADING_RULES_CACHE_CAPACITY, "Trading-rules cache full; evicting least recently used entry");
+        warn!(target: "robsond::binance_exchange", symbol = %pair, capacity = TRADING_RULES_CACHE_CAPACITY, "Trading-rules cache full; evicting least recently used entry");
         cache.remove(&pair);
     }
 }
@@ -256,7 +257,7 @@ impl BinanceExchangeAdapter {
             },
             Err(error) => match touch_stale_trading_rules(&mut cache, &pair) {
                 Some(stale) => {
-                    warn!(
+                    warn!(target: "robsond::binance_exchange",
                         symbol = %pair,
                         %error,
                         "Trading-rules refresh failed; serving stale snapshot"
@@ -357,7 +358,7 @@ impl ExchangePort for BinanceExchangeAdapter {
             .await
             .map_err(Self::map_error)?;
 
-        info!(
+        info!(target: "robsond::binance_exchange",
             symbol = %symbol.as_pair(),
             leverage = expected_leverage,
             position_mode = "One-way",
@@ -400,7 +401,7 @@ impl ExchangePort for BinanceExchangeAdapter {
                 qty
             },
             Err(error) => {
-                warn!(
+                warn!(target: "robsond::binance_exchange",
                     symbol = %symbol.as_pair(),
                     %error,
                     "Trading rules unavailable; falling back to configured lot filters"
@@ -461,7 +462,7 @@ impl ExchangePort for BinanceExchangeAdapter {
                 if response.cum_quote > Decimal::ZERO {
                     response.cum_quote / executed_qty
                 } else {
-                    tracing::warn!(
+                    tracing::warn!(target: "robsond::binance_exchange",
                         order_id = %response.order_id,
                         executed_qty = %executed_qty,
                         "FILLS present but no usable price source"
@@ -485,7 +486,7 @@ impl ExchangePort for BinanceExchangeAdapter {
                 let cum_quote = response.avg_price * executed_qty;
                 (cum_quote, response.avg_price)
             } else {
-                tracing::warn!(
+                tracing::warn!(target: "robsond::binance_exchange",
                     order_id = %response.order_id,
                     symbol = %symbol.as_pair(),
                     executed_qty = %executed_qty,
@@ -519,7 +520,7 @@ impl ExchangePort for BinanceExchangeAdapter {
 
         let filled_at = chrono::DateTime::from_timestamp_millis(response.update_time)
             .unwrap_or_else(|| {
-                tracing::warn!(
+                tracing::warn!(target: "robsond::binance_exchange",
                     order_id = %response.order_id,
                     update_time = response.update_time,
                     "Invalid update_time from Binance — using local clock as fallback"
@@ -572,7 +573,7 @@ impl ExchangePort for BinanceExchangeAdapter {
                     let aligned = rules
                         .quantize_stop_trigger(side, stop_price)
                         .map_err(|e| ExecError::Exchange(format!("Invalid stop trigger: {e}")))?;
-                    warn!(
+                    warn!(target: "robsond::binance_exchange",
                         symbol = %symbol.as_pair(),
                         requested = %stop_price.as_decimal(),
                         aligned = %aligned.as_decimal(),
@@ -583,7 +584,7 @@ impl ExchangePort for BinanceExchangeAdapter {
                 }
             },
             Err(error) => {
-                warn!(
+                warn!(target: "robsond::binance_exchange",
                     symbol = %symbol.as_pair(),
                     %error,
                     "Trading rules unavailable; falling back to precision-based trigger rounding"
@@ -626,7 +627,7 @@ impl ExchangePort for BinanceExchangeAdapter {
 
         let placed_at = chrono::DateTime::from_timestamp_millis(response.update_time)
             .unwrap_or_else(|| {
-                tracing::warn!(
+                tracing::warn!(target: "robsond::binance_exchange",
                     algo_id = %response.algo_id,
                     update_time = response.update_time,
                     "Invalid update_time from Binance — using local clock as fallback"
@@ -658,7 +659,7 @@ impl ExchangePort for BinanceExchangeAdapter {
         match self.client.cancel_algo_order(algo_id_num).await {
             Ok(_) => Ok(StopCancelOutcome::Cancelled),
             Err(error) if Self::is_tolerated_algo_cancel_error(&error) => {
-                warn!(
+                warn!(target: "robsond::binance_exchange",
                     %algo_id,
                     %error,
                     "Insurance stop algo order already gone; most likely triggered"
@@ -1097,6 +1098,31 @@ impl IncomePort for BinanceExchangeAdapter {
             .collect();
 
         Ok(records)
+    }
+}
+
+#[cfg(test)]
+mod log_target_guard {
+    /// The adapter was relocated from `robsond::binance_exchange` (ADR-0056
+    /// step 1). Production `RUST_LOG` filters list `robsond=info` and do
+    /// not include `robson_connectors`, so every log site keeps the legacy
+    /// target explicitly.
+    #[test]
+    fn every_log_site_keeps_the_legacy_target() {
+        let src = include_str!("exchange.rs");
+        for (i, line) in src.lines().enumerate() {
+            let is_site = ["warn!(", "info!(", "error!(", "debug!(", "trace!("].iter().any(|m| {
+                line.trim_start().starts_with(m) || line.contains(&format!("tracing::{m}"))
+            });
+            if is_site && !line.contains("include_str!") {
+                assert!(
+                    line.contains("target: \"robsond::binance_exchange\""),
+                    "log site without legacy target at exchange.rs:{}: {}",
+                    i + 1,
+                    line.trim()
+                );
+            }
+        }
     }
 }
 
