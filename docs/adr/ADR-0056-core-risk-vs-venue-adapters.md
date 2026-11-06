@@ -491,13 +491,13 @@ only).
 
 | Dependency / event | What happens | Degraded mode | Visibility |
 |---|---|---|---|
-| Database dies | no admission, no new legs; already-installed protection remains on the exchange; inventory in an N1-a transition may remain unprotected without a duration or loss bound; no cancellation starts without a durable intent, and unfinished transitions retain liabilities and alerts and resume from that intent on recovery; intent results cannot be persisted → in-flight operations enter `Unknown` and are resolved by lookup on recovery | read-only `/status` from memory; arms refused | `/readyz.database=false`; `unprotected_inventory` gauge; recovery events |
+| Database dies | no admission, no new legs; already-installed protection remains on the exchange; inventory in an N1-a transition may remain unprotected without a duration or loss bound; no cancellation starts without a durable intent, and unfinished transitions retain liabilities and alerts and resume from that intent on recovery; intent results cannot be persisted → in-flight operations enter `Unknown`; recovery looks them up, a lookup may stay `Unknown`, and then the reservation stays held until step 7's explicit resolution path | read-only `/status` from memory; arms refused | `/readyz.database=false`; `unprotected_inventory` gauge; recovery events |
 | Venue REST dies | rules/costs/valuation stale → basis invalid, admission fails closed; risk reduction proceeds on the persisted rules snapshot with retries | reads from cache until TTL; protection on the venue | per-venue `eligible=false` + reasons; alert |
 | Venue feed silent | watchdog after `ROBSON_FEED_SILENCE_MAX`; REST snapshot resync; trailing advances continue on REST ticks within the request budget | bounded REST polling | silent-feed metric, event |
 | Daemon dies mid fan-out | accepted legs are protected on their venues except for a leg killed between entry fill and protection placement, which recovery protects or flattens first | startup recovery reads the durable journal and each venue's observation; completes, protects or releases per evidence | recovery events per leg |
 | Daemon dies, venue unreachable or placement rejected inside a balance-account transition (N1-a) | the leg is unprotected for the whole interval, with no maximum duration; loss can exceed the priced envelope and every cap | retry, flatten, then re-protect-or-flatten as the first recovery action; admission on the venue blocked | `unprotected_inventory` gauge and alert while nonzero; transition event with duration; recovery event |
 | Daemon dies mid replacement (position account) | old stop still live (place-then-cancel) | recovery heals from `open_protective_orders` | recovery event |
-| Unknown order outcome (timeout) | reservation held; `order_by_client_id` before any retry; `Unknown` keeps the leg pending | no blind retry | event, `/status` pending count |
+| Unknown order outcome (timeout) | reservation held; `order_by_client_id` before any retry; `Unknown` keeps the leg pending, possibly indefinitely (time does not resolve it) | no blind retry | event, `/status` pending count |
 | Stale fees / rules / valuation | admission fails closed; risk reduction unaffected (persisted snapshot) | — | `/status` per-venue staleness |
 | Incomplete settlement | commission/pnl missing → month accounting flagged invalid, new legs blocked (ADR-0051) | — | `unmatched_income_count`, event |
 | Unauthored inventory or position on an execution account | closed (ADR-0022); new legs blocked until the account is clean | — | `/status` per-venue discrepancy, event |
@@ -510,7 +510,10 @@ only).
 - Negative / trade-offs: eight refactor PRs with no operator-visible feature before step 8; optional ports add branching;
   the consolidated basis needs every venue reachable and valued at month start; spot inventory accounting is new surface;
   N1-a accepts an unprotected interval without a guaranteed maximum duration that position accounts do not have, and
-  qualifies the ADR-0039 and ADR-0052 guarantees on balance accounts.
+  qualifies the ADR-0039 and ADR-0052 guarantees on balance accounts. A leg whose order outcome stays `Unknown` holds its
+  global and per-venue admission capacity indefinitely: elapsed time, a restart or a month rollover does not release the
+  reservation, only evidence or step 7's explicit resolution path does. During Fase S, a book that cannot be verified as
+  drained also keeps admissions blocked across the month boundary (§8).
 - Left on the table: cross-venue netting and routing, transfer automation, order-level authorship verification in
   reconciliation, shared execution accounts.
 
@@ -612,4 +615,6 @@ Budget model for multi-venue:
 - v8 (2026-11-06): §2 aligned with step 2 as implemented, after Codex rounds 1–4 on `refactor/venue-step2-ports` (APPROVE
   on round 4): the time-based finality wording is replaced by `EveryAttemptRejected` and `SubmitAttemptLedger`; result
   shapes (`PlacedStop`, `reason`, `Unknown{new}`, `final_state`, `AccountOpenOrder`) and cursor-less signatures recorded;
-  step 7 obligations added. No risk number or sequencing changed.
+  step 7 obligations added. No risk number or sequencing changed. Codex REQUEST_CHANGES on the alignment, 2 P2: the
+  failure-mode table still promised resolution by lookup, and Consequences did not state that `Unknown` legs can hold
+  admission capacity indefinitely. Both applied.
