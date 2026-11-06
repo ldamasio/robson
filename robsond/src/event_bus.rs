@@ -9,6 +9,7 @@
 
 use chrono::{DateTime, Utc};
 use robson_domain::{DetectorSignal, Event, PositionId, Price, Symbol};
+use robson_exec::venue::VenueId;
 use tokio::sync::broadcast;
 use uuid::Uuid;
 
@@ -198,9 +199,25 @@ pub enum MarketDataSource {
     RestFallback,
 }
 
+/// Identity of a market data feed (ADR-0056 §3): the same symbol on two venues
+/// is two feeds, with its own subscribers, price cache entry and watchdog.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct FeedKey {
+    pub venue: VenueId,
+    pub symbol: Symbol,
+}
+
+impl FeedKey {
+    pub fn new(venue: VenueId, symbol: Symbol) -> Self {
+        Self { venue, symbol }
+    }
+}
+
 /// Market data price update.
 #[derive(Debug, Clone)]
 pub struct MarketData {
+    /// Venue whose feed produced this update
+    pub venue: VenueId,
     /// Symbol this update is for
     pub symbol: Symbol,
     /// Current price
@@ -209,6 +226,13 @@ pub struct MarketData {
     pub timestamp: DateTime<Utc>,
     /// Which data path produced this update (ADR-0044)
     pub source: MarketDataSource,
+}
+
+impl MarketData {
+    /// The feed this update belongs to.
+    pub fn feed_key(&self) -> FeedKey {
+        FeedKey::new(self.venue.clone(), self.symbol.clone())
+    }
 }
 
 /// Order fill notification.
@@ -390,6 +414,7 @@ mod tests {
         let mut receiver = bus.subscribe();
 
         let market_data = MarketData {
+            venue: VenueId::new(VenueId::BINANCE_USDM),
             symbol: Symbol::from_pair("BTCUSDT").unwrap(),
             price: Price::new(dec!(96000)).unwrap(),
             timestamp: Utc::now(),
@@ -405,6 +430,16 @@ mod tests {
             },
             _ => panic!("Expected MarketData event"),
         }
+    }
+
+    #[test]
+    fn feed_keys_separate_the_same_symbol_on_two_venues() {
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let usdm = FeedKey::new(VenueId::new("binance:usdm"), symbol.clone());
+        let spot = FeedKey::new(VenueId::new("binance:spot"), symbol.clone());
+
+        assert_ne!(usdm, spot);
+        assert_eq!(usdm, FeedKey::new(VenueId::new("binance:usdm"), symbol));
     }
 
     #[tokio::test]

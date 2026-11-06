@@ -33,7 +33,10 @@ use robson_domain::{
 };
 #[cfg(feature = "postgres")]
 use robson_eventlog::{query_events, QueryOptions};
-use robson_exec::{ExchangePort, ExchangePosition, UniversalTransferType};
+use robson_exec::{
+    venue::{MarketKind, Venue, VenueId},
+    ExchangePort, ExchangePosition, UniversalTransferType,
+};
 #[cfg(feature = "postgres")]
 use robson_store::find_positions_overlapping_month;
 use robson_store::Store;
@@ -49,9 +52,9 @@ use crate::{
     circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot},
     config::FundingConfig,
     error::DaemonError,
-    event_bus::EventBus,
+    event_bus::{EventBus, FeedKey},
     funding::{CapitalRefreshResponse, ExecuteFundingRequest},
-    position_manager::PositionManager,
+    position_manager::{PositionManager, PriceCache},
     sse::{map_daemon_event, resync_required_event},
 };
 
@@ -82,6 +85,18 @@ pub struct ApiState<E: ExchangePort + 'static, S: Store + 'static> {
     /// this legacy value, alongside Google ID token verification.
     pub legacy_api_token: Option<String>,
     pub funding: FundingConfig,
+    /// What `/readyz.venue` reads about the venue's feed.
+    pub(crate) venue_feed: VenueFeedView,
+}
+
+/// The venue's feed as `/readyz` sees it: a handle on the price cache taken at
+/// startup, so a probe never waits on the position manager lock, which entry
+/// handling holds across venue requests.
+#[derive(Clone, Default)]
+pub(crate) struct VenueFeedView {
+    pub(crate) prices: PriceCache,
+    /// The symbols the feed is configured for.
+    pub(crate) symbols: Vec<Symbol>,
 }
 
 // =============================================================================
@@ -127,7 +142,21 @@ pub struct HealthResponse {
 pub struct ReadinessResponse {
     pub status: String,
     pub checks: ReadinessChecks,
+    /// The selected venue. Additive and informational: it never changes
+    /// `status` or the HTTP code (ADR-0056 §3).
+    pub venue: VenueReadiness,
     pub timestamp: String,
+}
+
+/// Execution and accounting eligibility of the selected venue (ADR-0056 §3).
+#[derive(Debug, Serialize, Deserialize)]
+pub struct VenueReadiness {
+    pub id: VenueId,
+    pub kind: MarketKind,
+    /// Rules, costs, valuation and account observation are all fresh. `false`
+    /// whenever one of them is stale or not tracked; `reasons` says which.
+    pub eligible: bool,
+    pub reasons: Vec<String>,
 }
 
 /// Individual readiness checks.
@@ -600,7 +629,7 @@ pub struct IncomeAckErrorResponse {
 /// Operator-sensitive and mutating routes use bearer-token authentication.
 pub fn create_router<E, S>(state: Arc<ApiState<E, S>>) -> Router
 where
-    E: ExchangePort + 'static,
+    E: Venue + 'static,
     S: Store + 'static,
 {
     // Read-only routes — no auth required
@@ -681,6 +710,10 @@ where
             }
         }
     });
+    // New funding sagas and the endpoints that create them exist only on a
+    // venue with a funding surface (ADR-0056 §3). The read endpoints below stay
+    // so an older saga remains visible after switching venues.
+    let has_funding = state.exchange.funding().is_some();
     let authenticated = Router::new()
         // SSE — authenticated via Bearer header (not query param)
         .route("/events", get(events_handler))
@@ -699,13 +732,19 @@ where
         // Manual reconciliation close (Slice 5B1)
         .route("/reconcile-close", post(reconcile_close_handler))
         // Manual acknowledgement of an unmatched income-ledger item.
-        .route("/income/:exchange_income_id/ack", post(income_ack_handler::<E, S>))
-        .route("/funding/quote", post(funding_quote_handler::<E, S>))
-        .route("/funding/execute", post(funding_execute_handler::<E, S>))
-        .route(
-            "/funding/recover-spot-usdt-to-futures",
-            post(funding_recover_spot_usdt_to_futures_handler::<E, S>),
-        )
+        .route("/income/:exchange_income_id/ack", post(income_ack_handler::<E, S>));
+    let authenticated = if has_funding {
+        authenticated
+            .route("/funding/quote", post(funding_quote_handler::<E, S>))
+            .route("/funding/execute", post(funding_execute_handler::<E, S>))
+            .route(
+                "/funding/recover-spot-usdt-to-futures",
+                post(funding_recover_spot_usdt_to_futures_handler::<E, S>),
+            )
+    } else {
+        authenticated
+    };
+    let authenticated = authenticated
         .route("/funding/:id", get(funding_get_handler::<E, S>))
         .route("/funding", get(funding_list_handler::<E, S>))
         .route("/capital/refresh", post(capital_refresh_handler::<E, S>))
@@ -1163,13 +1202,15 @@ async fn health_liveness() -> Json<HealthResponse> {
 ///
 /// Checks database connectivity via the configured store. The response retains
 /// a Binance field for compatibility, but no exchange probe is implemented.
+/// `venue` reports the selected venue from state the daemon already holds; it
+/// does not affect `status` or the HTTP code.
 ///
 /// Returns 200 OK if all checks pass, 503 Service Unavailable otherwise.
 async fn health_readiness<E, S>(
     State(state): State<Arc<ApiState<E, S>>>,
 ) -> Result<Json<ReadinessResponse>, (StatusCode, Json<ReadinessResponse>)>
 where
-    E: ExchangePort + 'static,
+    E: Venue + 'static,
     S: Store + 'static,
 {
     let database_ok;
@@ -1190,9 +1231,10 @@ where
         database_ok = true;
     }
 
-    // Compatibility field only: no live Binance probe is implemented yet.
-    // Do not use /readyz as evidence of exchange selection or reachability.
-    // TODO: Add an exchange-health probe through ExchangePort.
+    // Compatibility field only: no live Binance probe is implemented. This is
+    // the Kubernetes readiness probe, so no venue request belongs here; use
+    // `venue.id` for the selection. Nothing in /readyz is evidence of
+    // reachability.
     let binance_ok = true;
 
     let checks = ReadinessChecks {
@@ -1215,6 +1257,7 @@ where
             "not_ready".to_string()
         },
         checks,
+        venue: venue_readiness(state.exchange.as_ref(), &state.venue_feed).await,
         timestamp: chrono::Utc::now().to_rfc3339(),
     };
 
@@ -1222,6 +1265,46 @@ where
         Ok(Json(response))
     } else {
         Err((StatusCode::SERVICE_UNAVAILABLE, Json(response)))
+    }
+}
+
+/// Valuation age that invalidates eligibility (ADR-0056 §2.4, proposed
+/// `ROBSON_VALUATION_MAX_AGE`).
+const VENUE_VALUATION_MAX_AGE: Duration = Duration::from_secs(60);
+
+/// Compute `/readyz.venue` from state the daemon already holds: no venue
+/// request. A ping says nothing about execution eligibility, so what the daemon
+/// does not track yet is reported as a reason, never assumed fresh; only the
+/// feed's valuation has freshness data today.
+async fn venue_readiness<E: Venue + ?Sized>(venue: &E, feed: &VenueFeedView) -> VenueReadiness {
+    let mut reasons = vec![
+        "rules_freshness_not_tracked".to_string(),
+        "costs_freshness_not_tracked".to_string(),
+        "account_observation_freshness_not_tracked".to_string(),
+    ];
+
+    if feed.symbols.is_empty() {
+        reasons.push("valuation_no_feed_symbols".to_string());
+    }
+    {
+        let prices = feed.prices.read().await;
+        for symbol in &feed.symbols {
+            let key = FeedKey::new(venue.id().clone(), symbol.clone());
+            match prices.get(&key) {
+                None => reasons.push(format!("valuation_missing:{}", symbol.as_pair())),
+                Some((_, seen_at)) if seen_at.elapsed() > VENUE_VALUATION_MAX_AGE => {
+                    reasons.push(format!("valuation_stale:{}", symbol.as_pair()));
+                },
+                Some(_) => {},
+            }
+        }
+    }
+
+    VenueReadiness {
+        id: venue.id().clone(),
+        kind: venue.capabilities().market_kind,
+        eligible: reasons.is_empty(),
+        reasons,
     }
 }
 
@@ -3107,6 +3190,7 @@ mod tests {
             google_auth: None,
             legacy_api_token: None,
             funding: FundingConfig::default(),
+            venue_feed: VenueFeedView::default(),
         })
     }
 
@@ -3562,6 +3646,7 @@ mod tests {
             google_auth: None,
             legacy_api_token: None,
             funding: FundingConfig::default(),
+            venue_feed: VenueFeedView::default(),
         });
 
         (create_router(state), event_bus, position_manager, exchange)
@@ -3602,6 +3687,7 @@ mod tests {
             google_auth,
             legacy_api_token: None,
             funding: FundingConfig::default(),
+            venue_feed: VenueFeedView::default(),
         });
 
         create_router(state)
@@ -3891,6 +3977,199 @@ mod tests {
         let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
         assert_eq!(json["error"], "income_ledger_unavailable");
         assert_eq!(json["exchange_income_id"], "tran-ack");
+    }
+
+    // -------------------------------------------------------------------------
+    // ADR-0056 §3: /readyz.venue and funding gating
+    // -------------------------------------------------------------------------
+
+    async fn get_readyz(app: Router) -> (StatusCode, serde_json::Value) {
+        let response = app
+            .oneshot(Request::builder().uri("/readyz").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+        let status = response.status();
+        let body = response.into_body().collect().await.unwrap().to_bytes();
+        (status, serde_json::from_slice(&body).unwrap())
+    }
+
+    #[tokio::test]
+    async fn readyz_venue_is_additive_and_ineligible_changes_nothing() {
+        let (app, _, _, _) = create_test_app_with_event_bus_and_exchange(
+            100,
+            Arc::new(StubExchange::new(dec!(95000))),
+        )
+        .await;
+        let (status, body) = get_readyz(app).await;
+
+        // What a readiness consumer reads is what it always was.
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+        assert_eq!(body["checks"]["database"], "ok");
+        assert_eq!(body["checks"]["binance_api"], "ok");
+        assert!(body["timestamp"].is_string());
+
+        assert_eq!(body["venue"]["id"], "stub");
+        assert_eq!(body["venue"]["kind"], "PerpUsdM");
+        assert_eq!(body["venue"]["eligible"], false);
+        let reasons = body["venue"]["reasons"].as_array().unwrap();
+        for reason in [
+            "rules_freshness_not_tracked",
+            "costs_freshness_not_tracked",
+            "account_observation_freshness_not_tracked",
+        ] {
+            assert!(reasons.iter().any(|r| r == reason), "{reason} missing from {reasons:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn readyz_sends_nothing_to_the_venue() {
+        let (app, _, _, exchange) = create_test_app_with_event_bus_and_exchange(
+            100,
+            Arc::new(StubExchange::new(dec!(95000))),
+        )
+        .await;
+        // The stub consumes this flag on its next request of any kind.
+        exchange.set_fail_next(true);
+
+        let (status, _) = get_readyz(app).await;
+
+        assert_eq!(status, StatusCode::OK);
+        assert!(
+            exchange.get_futures_balance().await.is_err(),
+            "the probe must not have reached the venue"
+        );
+    }
+
+    #[tokio::test]
+    async fn readyz_does_not_wait_on_the_position_manager_lock() {
+        let (app, _, position_manager, _) = create_test_app_with_event_bus_and_exchange(
+            100,
+            Arc::new(StubExchange::new(dec!(95000))),
+        )
+        .await;
+        let _entry_in_progress = position_manager.write().await;
+
+        let (status, body) = tokio::time::timeout(Duration::from_secs(2), get_readyz(app))
+            .await
+            .expect("the readiness probe must answer while the manager is locked");
+
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["status"], "ready");
+    }
+
+    #[tokio::test]
+    async fn venue_eligibility_is_never_a_pass_it_has_no_data_for() {
+        let venue = StubExchange::new(dec!(95000));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let price = Price::new(dec!(95000)).unwrap();
+        let feed = VenueFeedView {
+            prices: PriceCache::default(),
+            symbols: vec![symbol.clone()],
+        };
+        let reasons = |readiness: VenueReadiness| {
+            assert!(!readiness.eligible);
+            readiness.reasons
+        };
+
+        // No tick yet.
+        let missing = reasons(venue_readiness(&venue, &feed).await);
+        assert!(missing.contains(&"valuation_missing:BTCUSDT".to_string()), "{missing:?}");
+
+        // Another venue's tick for the same symbol is not this venue's mark.
+        let foreign = FeedKey::new(VenueId::new("binance:spot"), symbol.clone());
+        feed.prices.write().await.insert(foreign, (price, Instant::now()));
+        let still_missing = reasons(venue_readiness(&venue, &feed).await);
+        assert!(
+            still_missing.contains(&"valuation_missing:BTCUSDT".to_string()),
+            "{still_missing:?}"
+        );
+
+        // A fresh tick clears valuation only: the rest has no freshness data.
+        let key = FeedKey::new(VenueId::new("stub"), symbol);
+        feed.prices.write().await.insert(key.clone(), (price, Instant::now()));
+        let fresh = reasons(venue_readiness(&venue, &feed).await);
+        assert_eq!(fresh, [
+            "rules_freshness_not_tracked",
+            "costs_freshness_not_tracked",
+            "account_observation_freshness_not_tracked",
+        ]);
+
+        let old = Instant::now() - VENUE_VALUATION_MAX_AGE - Duration::from_secs(1);
+        feed.prices.write().await.insert(key, (price, old));
+        let stale = reasons(venue_readiness(&venue, &feed).await);
+        assert!(stale.contains(&"valuation_stale:BTCUSDT".to_string()), "{stale:?}");
+    }
+
+    async fn post_json(app: Router, uri: &str, body: serde_json::Value) -> StatusCode {
+        app.oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(body.to_string()))
+                .unwrap(),
+        )
+        .await
+        .unwrap()
+        .status()
+    }
+
+    #[tokio::test]
+    async fn funding_endpoints_that_create_sagas_do_not_exist_without_a_funding_surface() {
+        let exchange = Arc::new(StubExchange::new(dec!(95000)).without_funding());
+        exchange.set_spot_balance("USDT", dec!(25), Decimal::ZERO);
+        let (app, _, _, exchange) =
+            create_test_app_with_event_bus_and_exchange(100, exchange).await;
+        let quote_id = Uuid::now_v7();
+
+        for (uri, body) in [
+            ("/funding/quote", serde_json::json!({})),
+            ("/funding/execute", serde_json::json!({ "quote_id": quote_id })),
+            (
+                "/funding/recover-spot-usdt-to-futures",
+                serde_json::json!({ "asset": "USDT", "execute": true }),
+            ),
+        ] {
+            // The path still matches the GET-only `/funding/:id`, hence 405.
+            let status = post_json(app.clone(), uri, body).await;
+            assert_eq!(status, StatusCode::METHOD_NOT_ALLOWED, "{uri}");
+        }
+        assert_eq!(exchange.spot_order_call_count(), 0);
+        assert_eq!(exchange.transfer_call_count(), 0);
+
+        // An older saga stays visible: the read endpoints are still routed.
+        for uri in ["/funding", "/funding/0191d3a6-0000-7000-8000-000000000000"] {
+            let response = app
+                .clone()
+                .oneshot(Request::builder().uri(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE, "{uri}");
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(json["error"], "funding_store_unavailable", "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn funding_endpoints_exist_on_a_venue_with_a_funding_surface() {
+        let (app, _, _, _) = create_test_app_with_event_bus_and_exchange(
+            100,
+            Arc::new(StubExchange::new(dec!(95000))),
+        )
+        .await;
+        assert_eq!(
+            post_json(app.clone(), "/funding/quote", serde_json::json!({})).await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "routed: no funding store in this fixture"
+        );
+        assert_eq!(
+            post_json(app, "/funding/execute", serde_json::json!({ "quote_id": Uuid::now_v7() }))
+                .await,
+            StatusCode::SERVICE_UNAVAILABLE,
+            "routed: funding is disabled in this fixture"
+        );
     }
 
     #[tokio::test]
@@ -4862,6 +5141,7 @@ mod tests {
                 google_auth: None,
                 legacy_api_token: Some("secret-token-123".to_string()),
                 funding: FundingConfig::default(),
+                venue_feed: VenueFeedView::default(),
             });
 
             (create_router(state), event_bus, position_manager)

@@ -265,22 +265,22 @@ pub static BUDGET_MODEL_SHADOW_SLOTS_DELTA: LazyLock<Gauge> = LazyLock::new(|| {
     .expect("failed to register robsond_budget_model_shadow_slots_delta")
 });
 
-/// Market data mode per symbol (0 = WS, 1 = REST fallback) — ADR-0044.
+/// Market data mode per feed (0 = WS, 1 = REST fallback) — ADR-0044.
 pub static MARKET_DATA_MODE: LazyLock<GaugeVec> = LazyLock::new(|| {
     register_gauge_vec!(
         "robsond_market_data_mode",
-        "Market data source mode per symbol (0=ws, 1=rest_fallback)",
-        &["symbol"]
+        "Market data source mode per feed (0=ws, 1=rest_fallback)",
+        &["venue", "symbol"]
     )
     .expect("failed to register robsond_market_data_mode")
 });
 
-/// Seconds since the last WS tick per symbol — ADR-0044.
+/// Seconds since the last WS tick per feed — ADR-0044.
 pub static MARKET_DATA_SILENT_SECONDS: LazyLock<GaugeVec> = LazyLock::new(|| {
     register_gauge_vec!(
         "robsond_market_data_silent_seconds",
-        "Seconds since the last WebSocket tick per symbol",
-        &["symbol"]
+        "Seconds since the last WebSocket tick per feed",
+        &["venue", "symbol"]
     )
     .expect("failed to register robsond_market_data_silent_seconds")
 });
@@ -291,17 +291,17 @@ pub static MARKET_DATA_FALLBACK_POLLS: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         "robsond_market_data_fallback_polls_total",
         "REST fallback price polls by outcome",
-        &["symbol", "outcome"] // outcome: ok, error
+        &["venue", "symbol", "outcome"] // outcome: ok, error
     )
     .expect("failed to register robsond_market_data_fallback_polls_total")
 });
 
-/// Failed WebSocket attempts per symbol, endpoint, and failure reason.
+/// Failed WebSocket attempts per feed, endpoint, and failure reason.
 pub static MARKET_DATA_WS_FAILURES: LazyLock<CounterVec> = LazyLock::new(|| {
     register_counter_vec!(
         "robsond_market_data_ws_failures_total",
         "Failed market-data WebSocket attempts by endpoint and reason",
-        &["symbol", "endpoint", "reason"]
+        &["venue", "symbol", "endpoint", "reason"]
     )
     .expect("failed to register robsond_market_data_ws_failures_total")
 });

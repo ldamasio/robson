@@ -3,6 +3,22 @@ use rust_decimal::Decimal;
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
+/// How the funding worker treats unfinished sagas on the route it runs on
+/// (ADR-0056 §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FundingRouteMode {
+    /// The selected venue exposes funding: resume every non-terminal saga.
+    Selected,
+    /// The selected venue has no funding; the worker runs on the saga's
+    /// original route. Started sagas finish there, an unstarted quote only
+    /// expires, and the selected venue's engine capital is left alone.
+    Recovery,
+    /// No route has a funding surface (the original credentials are missing):
+    /// nothing is sent, and sagas stay visibly non-terminal with their
+    /// liabilities retained.
+    Blocked,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "SCREAMING_SNAKE_CASE")]
 pub enum FundingState {

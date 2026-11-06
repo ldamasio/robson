@@ -586,6 +586,56 @@ pub struct PriceUpdate {
 }
 
 // =============================================================================
+// Trade Feed Port
+// =============================================================================
+
+/// One message delivered by a venue's trade stream.
+#[derive(Debug, Clone, PartialEq)]
+pub enum TradeFeedMessage {
+    /// An executed trade. The only message that is a market tick.
+    Trade { symbol: Symbol, price: Price },
+    /// A delivered message that carries no trade. It proves the connection is
+    /// delivering (the read-idle watchdog resets) but it is not a tick.
+    NonTrade,
+    /// A trade message the adapter could not decode: delivered, not a tick.
+    /// `reason` is the log message, `value` the offending field.
+    Malformed {
+        reason: &'static str,
+        value: String,
+        error: String,
+    },
+}
+
+/// One connected trade stream.
+#[async_trait]
+pub trait TradeStream: Send {
+    /// The next delivered message: `None` when the stream closed, `Err` when
+    /// receiving failed.
+    async fn next_message(&mut self) -> Option<Result<TradeFeedMessage, String>>;
+}
+
+/// A venue's live trade feed (ADR-0056 §3), built by the same factory as the
+/// venue.
+///
+/// The port exposes **one connection attempt**, not a subscription: the
+/// reconnect loop, its read-idle watchdog and the REST fallback are venue
+/// neutral and stay with the caller, unchanged per venue. Adapters own only
+/// what is venue specific: the stream bases, the subscription and the wire
+/// decoding.
+#[async_trait]
+pub trait TradeFeedPort: Send + Sync {
+    /// Ordered stream bases the caller rotates through on failure. Never empty.
+    fn endpoints(&self) -> &[String];
+
+    /// Open a trade stream for `symbol` on `endpoint`.
+    async fn connect(
+        &self,
+        endpoint: &str,
+        symbol: &Symbol,
+    ) -> Result<Box<dyn TradeStream>, String>;
+}
+
+// =============================================================================
 // OHLCV Port
 // =============================================================================
 

@@ -39,7 +39,8 @@ use robson_engine::{
 #[cfg(feature = "postgres")]
 use robson_eventlog::{append_event, ActorType as EventlogActorType, Event as EventlogEvent};
 use robson_exec::{
-    ActionResult, ExchangePort, ExchangePosition, ExecError, Executor, OhlcvPort, StubOhlcv,
+    venue::VenueId, ActionResult, ExchangePort, ExchangePosition, ExecError, Executor, OhlcvPort,
+    StubOhlcv,
 };
 #[cfg(feature = "postgres")]
 use robson_projector::apply_event_to_projections;
@@ -59,7 +60,7 @@ use crate::{
     circuit_breaker::CircuitBreaker,
     detector::DetectorTask,
     error::{DaemonError, DaemonResult},
-    event_bus::{DaemonEvent, EventBus, MarketData},
+    event_bus::{DaemonEvent, EventBus, FeedKey, MarketData},
     query::{
         ActorKind, CommandSource, ContextSummary, ExecutionQuery, QueryKind, QueryOutcome,
         QueryState,
@@ -122,6 +123,9 @@ pub struct EntryRejectionRecord {
     pub rejected_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// Last market price seen per feed, with the instant it arrived.
+pub(crate) type PriceCache = Arc<RwLock<HashMap<FeedKey, (Price, std::time::Instant)>>>;
+
 /// Manages position lifecycle and detector tasks.
 pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// Trading engine (Mutex for interior mutability: arm updates RiskConfig)
@@ -132,7 +136,11 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     store: Arc<S>,
     /// Event bus for publishing events
     event_bus: Arc<EventBus>,
-    /// OHLCV source for detector technical stop analysis
+    /// Venue this manager's positions execute on: the feed they are marked
+    /// and monitored from, and the one its detectors subscribe to (ADR-0056
+    /// §3). Positions carry no venue until step 7.
+    venue: VenueId,
+    /// OHLCV source for detector technical stop analysis, from the same venue
     ohlcv_port: Arc<dyn OhlcvPort>,
     /// Master cancellation token for all detector tasks
     shutdown_token: CancellationToken,
@@ -167,11 +175,11 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     monitor_tick_interval: std::time::Duration,
     /// When the last `PositionMonitorTick` was emitted per position.
     last_monitor_tick_at: Arc<RwLock<HashMap<PositionId, std::time::Instant>>>,
-    /// Last market price seen per symbol. Marks Active positions for the
-    /// ADR-0046 month equity instead of the stored `current_price`, which
-    /// only moves on fill and on trailing advances (and resets to the entry
-    /// price on restart).
-    last_market_price: Arc<RwLock<HashMap<Symbol, (Price, std::time::Instant)>>>,
+    /// Last market price seen per `(venue, symbol)` feed. Marks Active
+    /// positions for the ADR-0046 month equity instead of the stored
+    /// `current_price`, which only moves on fill and on trailing advances (and
+    /// resets to the entry price on restart).
+    last_market_price: PriceCache,
     /// Active positions whose exchange-side insurance stop is known to sit
     /// behind the software stop plan because a placement or re-placement
     /// failed (ADR-0039). Value: earliest instant the next attempt may run.
@@ -484,7 +492,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         positions
             .iter()
             .filter(|position| matches!(position.state, PositionState::Active { .. }))
-            .map(|position| match marks.get(&position.symbol) {
+            .map(|position| match marks.get(&self.feed_key(&position.symbol)) {
                 Some((mark, _)) => position.unrealized_pnl_at(*mark),
                 None => position.calculate_pnl(),
             })
@@ -929,6 +937,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             executor,
             store,
             event_bus,
+            // Every position predating venue routing maps to binance:usdm
+            // (ADR-0056 §7); the daemon sets the selected venue.
+            venue: VenueId::new(VenueId::BINANCE_USDM),
             ohlcv_port: Arc::new(StubOhlcv::default()),
             shutdown_token,
             detectors: Arc::new(RwLock::new(HashMap::new())),
@@ -985,6 +996,27 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     pub fn with_ohlcv_port(mut self, ohlcv_port: Arc<dyn OhlcvPort>) -> Self {
         self.ohlcv_port = ohlcv_port;
         self
+    }
+
+    /// Configure the venue this manager's positions execute on (ADR-0056 §3).
+    pub fn with_venue_id(mut self, venue: VenueId) -> Self {
+        self.venue = venue;
+        self
+    }
+
+    /// The venue this manager's positions execute on.
+    pub fn venue_id(&self) -> &VenueId {
+        &self.venue
+    }
+
+    fn feed_key(&self, symbol: &Symbol) -> FeedKey {
+        FeedKey::new(self.venue.clone(), symbol.clone())
+    }
+
+    /// Shared handle on the per-feed price cache, for readers that must not
+    /// wait on the manager lock (`/readyz`).
+    pub(crate) fn price_cache(&self) -> PriceCache {
+        Arc::clone(&self.last_market_price)
     }
 
     /// Cached symbol trading rules for a position whose stop policy needs
@@ -1688,6 +1720,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     }
 
     async fn rearm_detector(
+        venue: VenueId,
         position_id: PositionId,
         position: Position,
         entry_policy: EntryPolicyConfig,
@@ -1706,6 +1739,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             &position,
             entry_policy,
             technical_stop_config,
+            venue,
             Arc::clone(&event_bus),
             ohlcv_port,
             cancel_token,
@@ -1775,6 +1809,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 robson_domain::ApprovalPolicy::Automatic,
             ),
             technical_stop_config,
+            self.venue.clone(),
             Arc::clone(&self.event_bus),
             Arc::clone(&self.ohlcv_port),
             self.shutdown_token.child_token(),
@@ -1883,6 +1918,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let technical_stop_config =
             TechnicalStopConfig::with_bounds(&self.risk_config_snapshot().stop_distance_bounds());
         Self::rearm_detector(
+            self.venue.clone(),
             position_id,
             position.clone(),
             entry_policy,
@@ -1947,6 +1983,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     ) {
         let pending_approvals = Arc::clone(&self.pending_approvals);
         let query_engine = Arc::clone(&self.query_engine);
+        let venue = self.venue.clone();
         let event_bus = Arc::clone(&self.event_bus);
         let ohlcv_port = Arc::clone(&self.ohlcv_port);
         let detectors = Arc::clone(&self.detectors);
@@ -2015,6 +2052,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         let delay = governed_rearm_backoff(attempt);
 
                         PositionManager::<E, S>::rearm_detector(
+                            venue,
                             record_inner.position.id,
                             record_inner.position,
                             entry_policy,
@@ -2488,6 +2526,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             &position,
             entry_policy,
             TechnicalStopConfig::with_bounds(&self.risk_config_snapshot().stop_distance_bounds()),
+            self.venue.clone(),
             Arc::clone(&self.event_bus),
             Arc::clone(&self.ohlcv_port),
             cancel_token,
@@ -2569,6 +2608,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             position,
             entry_policy,
             TechnicalStopConfig::with_bounds(&self.risk_config_snapshot().stop_distance_bounds()),
+            self.venue.clone(),
             Arc::clone(&self.event_bus),
             Arc::clone(&self.ohlcv_port),
             cancel_token,
@@ -3789,12 +3829,18 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     }
 
     pub async fn process_market_data(&self, data: MarketData) -> DaemonResult<()> {
-        // Remember the latest mark for this symbol so month equity (ADR-0046)
+        // Remember the latest mark for this feed so month equity (ADR-0046)
         // values open positions at the live price, not at the last ratchet.
         self.last_market_price
             .write()
             .await
-            .insert(data.symbol.clone(), (data.price, std::time::Instant::now()));
+            .insert(data.feed_key(), (data.price, std::time::Instant::now()));
+
+        // This manager's positions execute on one venue; another venue's tick
+        // for the same symbol is not their market (ADR-0056 §3).
+        if data.venue != self.venue {
+            return Ok(());
+        }
 
         // Find all active positions for this symbol (from projection)
         let active_positions = self.store.positions().find_active().await?;
@@ -4597,7 +4643,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         self.last_market_price
             .read()
             .await
-            .get(symbol)
+            .get(&self.feed_key(symbol))
             .filter(|(_, seen_at)| seen_at.elapsed() <= MARKET_PRICE_CACHE_MAX_AGE)
             .map(|(price, _)| *price)
     }
@@ -4609,7 +4655,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         price: Price,
         seen_at: std::time::Instant,
     ) {
-        self.last_market_price.write().await.insert(symbol.clone(), (price, seen_at));
+        self.last_market_price
+            .write()
+            .await
+            .insert(self.feed_key(symbol), (price, seen_at));
     }
 
     /// Get all open core positions.
@@ -5268,6 +5317,11 @@ mod tests {
 
     use super::*;
     use crate::query_engine::TracingQueryRecorder;
+
+    /// The default venue of a manager built without `with_venue_id`.
+    fn test_venue() -> VenueId {
+        VenueId::new(VenueId::BINANCE_USDM)
+    }
 
     #[test]
     fn governed_rearm_backoff_doubles_from_5s_to_15min_cap() {
@@ -5982,6 +6036,7 @@ mod tests {
         }
         manager.store.positions().save(&position).await.unwrap();
         let tick = |price: Decimal| MarketData {
+            venue: test_venue(),
             symbol: position.symbol.clone(),
             price: Price::new(price).unwrap(),
             timestamp: chrono::Utc::now(),
@@ -6061,6 +6116,7 @@ mod tests {
 
         let result = manager
             .process_market_data(MarketData {
+                venue: test_venue(),
                 symbol: position.symbol.clone(),
                 price: Price::new(dec!(110)).unwrap(),
                 timestamp: chrono::Utc::now(),
@@ -6136,6 +6192,7 @@ mod tests {
 
         let result = manager
             .process_market_data(MarketData {
+                venue: test_venue(),
                 symbol: position.symbol.clone(),
                 price: trailing_stop,
                 timestamp: chrono::Utc::now(),
@@ -6198,6 +6255,7 @@ mod tests {
 
         let result = manager
             .process_market_data(MarketData {
+                venue: test_venue(),
                 symbol: position.symbol.clone(),
                 price: Price::new(dec!(89)).unwrap(),
                 timestamp: chrono::Utc::now(),
@@ -6242,6 +6300,7 @@ mod tests {
         exchange.set_reject_reduce_only_next(true);
 
         let tick = |price: Decimal| MarketData {
+            venue: test_venue(),
             symbol: position.symbol.clone(),
             price: Price::new(price).unwrap(),
             timestamp: chrono::Utc::now(),
@@ -6322,6 +6381,7 @@ mod tests {
 
         let result = manager
             .process_market_data(MarketData {
+                venue: test_venue(),
                 symbol: position.symbol.clone(),
                 price: Price::new(dec!(89)).unwrap(),
                 timestamp: chrono::Utc::now(),
@@ -7721,6 +7781,7 @@ mod tests {
         for i in (0..30).rev() {
             let price = Decimal::from(100 + i);
             let market_data = MarketData {
+                venue: test_venue(),
                 symbol: symbol.clone(),
                 price: Price::new(price).unwrap(),
                 timestamp: chrono::Utc::now(),
@@ -7734,6 +7795,7 @@ mod tests {
         for i in 0..10 {
             let price = Decimal::from(100 + i * 3); // Larger steps to trigger crossover faster
             let market_data = MarketData {
+                venue: test_venue(),
                 symbol: symbol.clone(),
                 price: Price::new(price).unwrap(),
                 timestamp: chrono::Utc::now(),
@@ -7931,6 +7993,7 @@ mod tests {
         // Regression coverage: this first tick is sent immediately after restore,
         // before the spawned detector task has a chance to poll on current_thread.
         restored_event_bus.send(DaemonEvent::MarketData(MarketData {
+            venue: test_venue(),
             symbol: symbol.clone(),
             price: Price::new(dec!(100)).unwrap(),
             timestamp: chrono::Utc::now(),
@@ -8052,6 +8115,64 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn another_venues_tick_moves_neither_prices_nor_positions() {
+        let manager = create_test_manager().await;
+        let mut position =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+        position.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(
+            Price::new(dec!(100)).unwrap(),
+            Price::new(dec!(90)).unwrap(),
+        ));
+        manager.store.positions().save(&position).await.unwrap();
+        let symbol = position.symbol.clone();
+        let events_before = manager.store.events().find_by_position(position.id).await.unwrap();
+
+        // Far through the stop on another venue: not this position's market.
+        let other_venue = VenueId::new("binance:spot");
+        manager
+            .process_market_data(MarketData {
+                venue: other_venue.clone(),
+                symbol: symbol.clone(),
+                price: Price::new(dec!(50)).unwrap(),
+                timestamp: chrono::Utc::now(),
+                source: crate::event_bus::MarketDataSource::Ws,
+            })
+            .await
+            .unwrap();
+
+        assert!(
+            manager.last_market_price_for(&symbol).await.is_none(),
+            "a foreign tick must not read as this venue's price"
+        );
+        let stored = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(stored.state, PositionState::Active { .. }));
+        assert_eq!(manager.executor.exchange().market_order_call_count(), 0);
+        let events_after = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert_eq!(events_after.len(), events_before.len());
+
+        // Both feeds keep their own entry for the same symbol.
+        manager
+            .process_market_data(MarketData {
+                venue: test_venue(),
+                symbol: symbol.clone(),
+                price: Price::new(dec!(101)).unwrap(),
+                timestamp: chrono::Utc::now(),
+                source: crate::event_bus::MarketDataSource::Ws,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            manager.last_market_price_for(&symbol).await,
+            Some(Price::new(dec!(101)).unwrap())
+        );
+        let prices = manager.price_cache();
+        let prices = prices.read().await;
+        assert_eq!(prices.len(), 2);
+        let foreign = prices.get(&FeedKey::new(other_venue, symbol)).unwrap();
+        assert_eq!(foreign.0, Price::new(dec!(50)).unwrap());
+    }
+
+    #[tokio::test]
     async fn test_month_equity_marks_open_positions_at_last_market_price() {
         let manager = create_test_manager().await;
         let now = chrono::Utc::now();
@@ -8069,6 +8190,7 @@ mod tests {
         // span is 10, favorable move is 5).
         manager
             .process_market_data(MarketData {
+                venue: test_venue(),
                 symbol: position.symbol.clone(),
                 price: Price::new(dec!(105)).unwrap(),
                 timestamp: now,
@@ -8093,6 +8215,7 @@ mod tests {
         // watermark (105), so this is where the live mark must win.
         manager
             .process_market_data(MarketData {
+                venue: test_venue(),
                 symbol: position.symbol.clone(),
                 price: Price::new(dec!(98)).unwrap(),
                 timestamp: now,

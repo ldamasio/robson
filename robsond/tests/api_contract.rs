@@ -91,6 +91,32 @@ async fn test_readyz_returns_ready_in_stub_mode() {
     assert!(!body.timestamp.is_empty());
 }
 
+#[tokio::test]
+async fn test_readyz_venue_is_additive_for_status_only_consumers() {
+    #[derive(serde::Deserialize)]
+    struct StatusOnly {
+        status: String,
+    }
+
+    let (base, _) = start_test_server().await;
+    let resp = client().get(format!("{}/readyz", base)).send().await.unwrap();
+
+    // Not eligible on a fresh stub daemon, and the probe does not care.
+    assert_eq!(resp.status(), 200);
+    let body: serde_json::Value = resp.json().await.unwrap();
+    assert_eq!(body["venue"]["id"], "stub");
+    assert_eq!(body["venue"]["kind"], "PerpUsdM");
+    assert_eq!(body["venue"]["eligible"], false);
+    let reasons = body["venue"]["reasons"].as_array().unwrap();
+    assert!(
+        reasons.iter().any(|reason| reason == "valuation_missing:BTCUSDT"),
+        "the daemon's configured symbols reach the handler: {reasons:?}"
+    );
+
+    let status_only: StatusOnly = serde_json::from_value(body).unwrap();
+    assert_eq!(status_only.status, "ready");
+}
+
 // =============================================================================
 // Status
 // =============================================================================

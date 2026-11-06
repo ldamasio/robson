@@ -27,8 +27,8 @@ use uuid::Uuid;
 
 #[cfg(feature = "postgres")]
 use super::types::{
-    ExecuteFundingResponse, FundingEventView, FundingQuote, FundingQuoteItem, FundingSagaSummary,
-    FundingSagaView, FundingState,
+    ExecuteFundingResponse, FundingEventView, FundingQuote, FundingQuoteItem, FundingRouteMode,
+    FundingSagaSummary, FundingSagaView, FundingState,
 };
 #[cfg(feature = "postgres")]
 use crate::{
@@ -47,6 +47,7 @@ pub struct FundingService<E: ExchangePort + 'static, S: Store + 'static> {
     exchange: Arc<E>,
     position_manager: Arc<RwLock<PositionManager<E, S>>>,
     config: FundingConfig,
+    route_mode: FundingRouteMode,
 }
 
 #[cfg(feature = "postgres")]
@@ -64,7 +65,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
             exchange,
             position_manager,
             config,
+            route_mode: FundingRouteMode::Selected,
         }
+    }
+
+    /// Set how the worker treats unfinished sagas on this service's route.
+    pub fn with_route_mode(mut self, route_mode: FundingRouteMode) -> Self {
+        self.route_mode = route_mode;
+        self
     }
 
     pub async fn quote(&self) -> DaemonResult<FundingQuote> {
@@ -308,8 +316,12 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
                 "Exchange reports zero or negative wallet balance: {capital}"
             )));
         }
-        let manager = self.position_manager.read().await;
-        manager.update_engine_capital(capital);
+        // On a recovery route the balance belongs to the saga's original
+        // account, not to the venue the engine trades on.
+        if self.route_mode == FundingRouteMode::Selected {
+            let manager = self.position_manager.read().await;
+            manager.update_engine_capital(capital);
+        }
         Ok(capital)
     }
 
@@ -365,6 +377,25 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
         for row in &rows {
             let saga_id: Uuid = row.get("saga_id");
             let state: String = row.get("state");
+            if self.route_mode != FundingRouteMode::Selected {
+                // An unstarted quote holds no liabilities and this route is
+                // closed for new execution: it can only expire.
+                if state == FundingState::Quoted.as_str() {
+                    if let Err(err) = self.expire_unstarted_quote(saga_id).await {
+                        tracing::error!(%saga_id, %err, "Funding worker quote expiry failed");
+                    }
+                    continue;
+                }
+                if self.route_mode == FundingRouteMode::Blocked {
+                    tracing::error!(
+                        %saga_id,
+                        %state,
+                        "Funding saga blocked: the selected venue has no funding surface and the \
+                         original route's credentials are missing; liabilities retained"
+                    );
+                    continue;
+                }
+            }
             tracing::info!(%saga_id, %state, "Funding worker resuming saga");
             let result = self.execute(saga_id, "funding-worker-resume").await;
             if let Err(err) = result {
@@ -373,6 +404,13 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
             resumed += 1;
         }
         Ok(resumed)
+    }
+
+    async fn expire_unstarted_quote(&self, saga_id: Uuid) -> DaemonResult<()> {
+        if Utc::now() > self.load_quote(saga_id).await?.expires_at {
+            self.fail(saga_id, "quote_expired").await?;
+        }
+        Ok(())
     }
 
     async fn current_spot_usdt(&self) -> DaemonResult<Decimal> {

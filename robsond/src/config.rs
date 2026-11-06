@@ -34,6 +34,9 @@ pub struct Config {
     /// Binance exchange credentials.
     pub binance: BinanceConfig,
 
+    /// Venue selected by `ROBSON_VENUE` (ADR-0056 §3).
+    pub venue: VenueSelection,
+
     /// Reconciliation worker configuration.
     pub reconciliation: ReconciliationConfig,
 
@@ -219,6 +222,9 @@ pub struct BinanceConfig {
     pub api_key: Option<String>,
     /// Binance API secret used by the primary exchange adapter.
     pub api_secret: Option<String>,
+    /// `ROBSON_BINANCE_USE_TESTNET=true`: a birth-time environment marker set
+    /// in the ConfigMap, never a runtime toggle. See ADR-0003.
+    pub use_testnet: bool,
 }
 
 impl std::fmt::Debug for BinanceConfig {
@@ -226,7 +232,42 @@ impl std::fmt::Debug for BinanceConfig {
         f.debug_struct("BinanceConfig")
             .field("api_key_configured", &self.api_key.is_some())
             .field("api_secret_configured", &self.api_secret.is_some())
+            .field("use_testnet", &self.use_testnet)
             .finish()
+    }
+}
+
+/// Venue selected by `ROBSON_VENUE` (ADR-0056 §3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VenueSelection {
+    /// `ROBSON_VENUE` is not set: the historical selection from credentials
+    /// and environment markers, including its fallback to the stub exchange.
+    Unset,
+    /// `binance_usdm`: Binance USDⓈ-M, never anything else.
+    BinanceUsdm,
+    /// `stub`: the in-memory venue and feed, for tests.
+    Stub,
+}
+
+impl VenueSelection {
+    /// Parse the value of `ROBSON_VENUE`. Anything that does not name an
+    /// available venue is a startup error; it never falls through to another
+    /// venue.
+    pub fn parse(value: Option<&str>) -> DaemonResult<Self> {
+        match value {
+            None => Ok(Self::Unset),
+            Some("binance_usdm") => Ok(Self::BinanceUsdm),
+            Some("stub") => Ok(Self::Stub),
+            Some("binance_spot") => Err(DaemonError::Config(
+                "ROBSON_VENUE=binance_spot is not available: the Binance spot venue ships with \
+                 ADR-0056 step 8. Refusing to start on any other venue."
+                    .to_string(),
+            )),
+            Some(other) => Err(DaemonError::Config(format!(
+                "Unknown ROBSON_VENUE value: \"{other}\". Expected: binance_usdm, stub, or unset. \
+                 Refusing to start on any other venue."
+            ))),
+        }
     }
 }
 
@@ -324,6 +365,7 @@ impl Config {
         let projection = Self::load_projection_config()?;
         let market_data = Self::load_market_data_config()?;
         let binance = Self::load_binance_config();
+        let venue = Self::load_venue_selection()?;
         let reconciliation = Self::load_reconciliation_config()?;
         let funding = Self::load_funding_config()?;
 
@@ -350,6 +392,7 @@ impl Config {
             projection,
             market_data,
             binance,
+            venue,
             reconciliation,
             funding,
             environment,
@@ -395,6 +438,7 @@ impl Config {
                 ws_endpoints: vec![],
             },
             binance: BinanceConfig::default(),
+            venue: VenueSelection::Unset,
             reconciliation: ReconciliationConfig {
                 interval_secs: 1,
                 missing_grace_secs: 60,
@@ -738,7 +782,19 @@ impl Config {
             .or_else(|| env::var("BINANCE_API_SECRET").ok())
             .filter(|v| !v.trim().is_empty());
 
-        BinanceConfig { api_key, api_secret }
+        let use_testnet = env::var("ROBSON_BINANCE_USE_TESTNET").unwrap_or_default() == "true";
+
+        BinanceConfig { api_key, api_secret, use_testnet }
+    }
+
+    fn load_venue_selection() -> DaemonResult<VenueSelection> {
+        match env::var("ROBSON_VENUE") {
+            Ok(value) => VenueSelection::parse(Some(&value)),
+            Err(env::VarError::NotPresent) => VenueSelection::parse(None),
+            Err(env::VarError::NotUnicode(_)) => {
+                Err(DaemonError::Config("ROBSON_VENUE must be valid UTF-8".to_string()))
+            },
+        }
     }
 
     fn load_reconciliation_config() -> DaemonResult<ReconciliationConfig> {
@@ -816,6 +872,7 @@ impl Default for Config {
             },
             market_data: MarketDataConfig::default(),
             binance: BinanceConfig::default(),
+            venue: VenueSelection::Unset,
             reconciliation: ReconciliationConfig::default(),
             funding: FundingConfig::default(),
             environment: Environment::Development,
@@ -918,6 +975,67 @@ mod tests {
         // Risk per trade is NOT in engine config — fixed at 1% in domain
         assert_eq!(config.engine.min_tech_stop_percent, Decimal::new(1, 3));
         assert_eq!(config.engine.max_tech_stop_percent, Decimal::new(10, 2));
+    }
+
+    #[test]
+    fn venue_selection_names_only_available_venues() {
+        assert_eq!(VenueSelection::parse(None).unwrap(), VenueSelection::Unset);
+        assert_eq!(
+            VenueSelection::parse(Some("binance_usdm")).unwrap(),
+            VenueSelection::BinanceUsdm
+        );
+        assert_eq!(VenueSelection::parse(Some("stub")).unwrap(), VenueSelection::Stub);
+
+        let spot = VenueSelection::parse(Some("binance_spot")).unwrap_err().to_string();
+        assert!(spot.contains("ROBSON_VENUE=binance_spot") && spot.contains("step 8"), "{spot}");
+
+        // Exact names only: a typo or an empty value selects nothing.
+        for unknown in [
+            "",
+            " ",
+            "BINANCE_USDM",
+            "binance:usdm",
+            "binance_usdm ",
+            "b3",
+        ] {
+            let error = VenueSelection::parse(Some(unknown)).unwrap_err().to_string();
+            assert!(error.contains("Unknown ROBSON_VENUE"), "{unknown:?}: {error}");
+        }
+    }
+
+    #[test]
+    fn startup_fails_closed_on_an_unavailable_venue() {
+        let _lock = env_lock().lock().unwrap();
+        for value in ["binance_spot", "binance_usdn"] {
+            let _env = EnvGuard::new(&[
+                ("ROBSON_VENUE", Some(value)),
+                ("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT")),
+            ]);
+            let error = Config::from_env().unwrap_err().to_string();
+            assert!(error.contains("ROBSON_VENUE"), "{value}: {error}");
+        }
+    }
+
+    #[test]
+    fn unset_venue_loads_with_the_testnet_marker_unchanged() {
+        let _lock = env_lock().lock().unwrap();
+        let _env = EnvGuard::new(&[
+            ("ROBSON_VENUE", None),
+            ("ROBSON_BINANCE_USE_TESTNET", Some("true")),
+            ("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT")),
+        ]);
+        let config = Config::from_env().unwrap();
+        assert_eq!(config.venue, VenueSelection::Unset);
+        assert!(config.binance.use_testnet);
+        drop(_env);
+
+        // Only the exact value marks testnet, as main.rs always read it.
+        let _env = EnvGuard::new(&[
+            ("ROBSON_VENUE", None),
+            ("ROBSON_BINANCE_USE_TESTNET", Some("TRUE")),
+            ("ROBSON_MARKET_DATA_SYMBOLS", Some("BTCUSDT")),
+        ]);
+        assert!(!Config::from_env().unwrap().binance.use_testnet);
     }
 
     #[test]
@@ -1096,6 +1214,7 @@ mod tests {
         let config = BinanceConfig {
             api_key: Some("do-not-log-key".to_string()),
             api_secret: Some("do-not-log-secret".to_string()),
+            use_testnet: false,
         };
 
         let rendered = format!("{config:?}");

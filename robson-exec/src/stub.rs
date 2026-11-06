@@ -19,8 +19,8 @@ use crate::{
     ports::{
         CandleInterval, ExchangePosition, FuturesBalance, FuturesSettings, IncomeRecord,
         MarketDataPort, OhlcvPort, OpenOrderRecord, OrderResult, PriceUpdate, SpotBalance,
-        SpotOrder, SpotOrderQuantity, SpotOrderRequest, SpotOrderSide, Transfer, TransferId,
-        UniversalTransferType, UserTradeRecord,
+        SpotOrder, SpotOrderQuantity, SpotOrderRequest, SpotOrderSide, TradeFeedMessage,
+        TradeFeedPort, TradeStream, Transfer, TransferId, UniversalTransferType, UserTradeRecord,
     },
     venue::{
         self, AccountKind, Cash, EntryOrReduce, ExecutionCostEnvelope, FeeAssetPolicy,
@@ -107,6 +107,8 @@ impl<V> BoundedHistory<V> {
 pub struct StubExchange {
     /// Venue id (`stub`).
     venue_id: VenueId,
+    /// Whether the optional funding surface is exposed (default: yes).
+    has_funding: bool,
     /// Current prices by symbol
     prices: RwLock<HashMap<String, Decimal>>,
     /// Default price for unknown symbols
@@ -185,6 +187,7 @@ impl StubExchange {
     pub(crate) fn with_history_capacity(default_price: Decimal, capacity: usize) -> Self {
         Self {
             venue_id: VenueId::new(STUB_VENUE_ID),
+            has_funding: true,
             prices: RwLock::new(HashMap::new()),
             default_price,
             fee_rate: Decimal::new(1, 3), // 0.001 = 0.1%
@@ -215,6 +218,13 @@ impl StubExchange {
             trading_rules: RwLock::new(HashMap::new()),
             trading_rules_calls: RwLock::new(HashMap::new()),
         }
+    }
+
+    /// Drop the optional funding surface: `funding()` is `None`, as on a venue
+    /// without a spot→derivatives conversion route (ADR-0056 §3).
+    pub fn without_funding(mut self) -> Self {
+        self.has_funding = false;
+        self
     }
 
     /// Install simulated trading rules for a symbol (issue #154).
@@ -1149,7 +1159,7 @@ impl venue::AccountPort for StubExchange {
             reduce_only_wire_flag: true,
             protection: ProtectionKind::MarketOnTrigger,
             replacement: ReplacementProtocol::PlaceThenCancel,
-            has_funding: true,
+            has_funding: self.has_funding,
             order_finality: STUB_FINALITY,
         }
     }
@@ -1173,7 +1183,11 @@ impl venue::Venue for StubExchange {
     }
 
     fn funding(&self) -> Option<&dyn venue::FundingPort> {
-        Some(self)
+        if self.has_funding {
+            Some(self)
+        } else {
+            None
+        }
     }
 }
 
@@ -1282,6 +1296,80 @@ impl MarketDataPort for StubMarketData {
             .ok_or_else(|| ExecError::Exchange(format!("No price for {}", symbol.as_pair())))?;
 
         Ok(Price::new(price).unwrap())
+    }
+}
+
+// =============================================================================
+// Stub Trade Feed
+// =============================================================================
+
+/// Stream base reported by [`StubTradeFeed`].
+pub const STUB_FEED_ENDPOINT: &str = "stub://trades";
+
+/// In-memory trade feed: no network, ticks arrive through [`Self::push`].
+pub struct StubTradeFeed {
+    endpoints: Vec<String>,
+    trades: tokio::sync::broadcast::Sender<(Symbol, Price)>,
+}
+
+impl StubTradeFeed {
+    /// Create a feed with no connected streams.
+    pub fn new() -> Self {
+        let (trades, _) = tokio::sync::broadcast::channel(256);
+        Self {
+            endpoints: vec![STUB_FEED_ENDPOINT.to_string()],
+            trades,
+        }
+    }
+
+    /// Deliver a trade to every connected stream of `symbol`. Returns the
+    /// number of connected streams of any symbol.
+    pub fn push(&self, symbol: &Symbol, price: Price) -> usize {
+        self.trades.send((symbol.clone(), price)).unwrap_or(0)
+    }
+}
+
+impl Default for StubTradeFeed {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+struct StubTradeStream {
+    symbol: Symbol,
+    trades: tokio::sync::broadcast::Receiver<(Symbol, Price)>,
+}
+
+#[async_trait]
+impl TradeStream for StubTradeStream {
+    async fn next_message(&mut self) -> Option<Result<TradeFeedMessage, String>> {
+        loop {
+            match self.trades.recv().await {
+                Ok((symbol, price)) if symbol == self.symbol => {
+                    return Some(Ok(TradeFeedMessage::Trade { symbol, price }));
+                },
+                Ok(_) | Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => {},
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => return None,
+            }
+        }
+    }
+}
+
+#[async_trait]
+impl TradeFeedPort for StubTradeFeed {
+    fn endpoints(&self) -> &[String] {
+        &self.endpoints
+    }
+
+    async fn connect(
+        &self,
+        _endpoint: &str,
+        symbol: &Symbol,
+    ) -> Result<Box<dyn TradeStream>, String> {
+        Ok(Box::new(StubTradeStream {
+            symbol: symbol.clone(),
+            trades: self.trades.subscribe(),
+        }))
     }
 }
 

@@ -16,7 +16,7 @@ use sqlx::PgPool;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use super::{FundingService, FundingState};
+use super::{FundingRouteMode, FundingService, FundingState};
 use crate::{
     config::FundingConfig, event_bus::EventBus, position_manager::PositionManager,
     query_engine::TracingQueryRecorder,
@@ -26,6 +26,7 @@ struct TestFundingService<E: ExchangePort + 'static, S: Store + 'static> {
     exchange: Arc<E>,
     position_manager: Arc<RwLock<PositionManager<E, S>>>,
     service: FundingService<E, S>,
+    tenant_id: Uuid,
 }
 
 struct PostConvertedCrashExchange {
@@ -69,14 +70,12 @@ impl PostConvertedCrashExchange {
     }
 }
 
-fn test_service<E: ExchangePort + 'static>(
-    pool: PgPool,
-    exchange: Arc<E>,
-    config: FundingConfig,
-) -> TestFundingService<E, MemoryStore> {
+fn test_manager<E: ExchangePort + 'static>(
+    exchange: &Arc<E>,
+) -> Arc<RwLock<PositionManager<E, MemoryStore>>> {
     let store = Arc::new(MemoryStore::new());
     let executor = Arc::new(Executor::new(
-        Arc::clone(&exchange),
+        Arc::clone(exchange),
         Arc::new(IntentJournal::new()),
         store.clone(),
     ));
@@ -88,16 +87,30 @@ fn test_service<E: ExchangePort + 'static>(
         Arc::new(TracingQueryRecorder),
         TradingPolicy::default(),
     );
-    let position_manager = Arc::new(RwLock::new(manager));
+    Arc::new(RwLock::new(manager))
+}
+
+fn test_service<E: ExchangePort + 'static>(
+    pool: PgPool,
+    exchange: Arc<E>,
+    config: FundingConfig,
+) -> TestFundingService<E, MemoryStore> {
+    let position_manager = test_manager(&exchange);
+    let tenant_id = Uuid::new_v4();
     let service = FundingService::new(
         Arc::new(pool),
-        Uuid::new_v4(),
+        tenant_id,
         Arc::clone(&exchange),
         Arc::clone(&position_manager),
         config,
     );
 
-    TestFundingService { exchange, position_manager, service }
+    TestFundingService {
+        exchange,
+        position_manager,
+        service,
+        tenant_id,
+    }
 }
 
 fn configured_exchange() -> Arc<StubExchange> {
@@ -502,6 +515,172 @@ async fn dust_skipped(pool: PgPool) -> anyhow::Result<()> {
     let response = harness.service.execute(quote.quote_id, "dust").await?;
     assert_eq!(response.state, FundingState::Refreshed.as_str());
     assert_eq!(harness.exchange.spot_order_call_count(), 1);
+
+    Ok(())
+}
+
+// =============================================================================
+// ADR-0056 §3: funding gating and recovery after switching venue
+// =============================================================================
+
+/// A saga stopped mid-way on its original route (`inner`), as a daemon leaves
+/// it when it is redeployed on another venue.
+async fn unfinished_saga_on(
+    pool: PgPool,
+    inner: Arc<StubExchange>,
+) -> anyhow::Result<(Uuid, Uuid)> {
+    let exchange = Arc::new(PostConvertedCrashExchange::new(inner));
+    let harness = test_service(pool, exchange, FundingConfig::default());
+
+    let quote = harness.service.quote().await?;
+    harness.exchange.fail_next_transfers(1);
+    assert!(harness.service.execute(quote.quote_id, "before-the-switch").await.is_err());
+    assert_eq!(
+        harness.service.get(quote.quote_id).await?.state,
+        FundingState::Transferring.as_str()
+    );
+
+    Ok((harness.tenant_id, quote.quote_id))
+}
+
+/// The worker of a daemon whose selected venue has no funding surface.
+fn worker_service_after_switch(
+    pool: PgPool,
+    tenant_id: Uuid,
+    route: Arc<StubExchange>,
+    selected: &Arc<StubExchange>,
+    route_mode: FundingRouteMode,
+) -> FundingService<StubExchange, MemoryStore> {
+    FundingService::new(
+        Arc::new(pool),
+        tenant_id,
+        route,
+        test_manager(selected),
+        FundingConfig::default(),
+    )
+    .with_route_mode(route_mode)
+}
+
+fn venue_without_funding() -> Arc<StubExchange> {
+    Arc::new(StubExchange::new(dec!(50000)).without_funding())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "Requires DATABASE_URL"]
+async fn older_saga_is_recovered_on_its_route_after_switching_venue(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let original = configured_exchange();
+    let (tenant_id, saga_id) = unfinished_saga_on(pool.clone(), Arc::clone(&original)).await?;
+
+    let selected = venue_without_funding();
+    let position_manager = test_manager(&selected);
+    let capital_before = position_manager.read().await.engine().risk_config().capital();
+    let worker = FundingService::new(
+        Arc::new(pool),
+        tenant_id,
+        Arc::clone(&original),
+        Arc::clone(&position_manager),
+        FundingConfig::default(),
+    )
+    .with_route_mode(FundingRouteMode::Recovery);
+
+    assert_eq!(worker.resume_non_terminal().await?, 1);
+
+    assert_eq!(worker.get(saga_id).await?.state, FundingState::Refreshed.as_str());
+    assert_eq!(original.transfer_call_count(), 1, "the transfer finishes on the original route");
+    assert_eq!(selected.transfer_call_count(), 0);
+    assert_eq!(
+        position_manager.read().await.engine().risk_config().capital(),
+        capital_before,
+        "the original account's balance is not the selected venue's capital"
+    );
+
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "Requires DATABASE_URL"]
+async fn saga_without_its_original_credentials_stays_visibly_blocked(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    let original = configured_exchange();
+    let (tenant_id, saga_id) = unfinished_saga_on(pool.clone(), Arc::clone(&original)).await?;
+    let transfers_before = original.transfer_call_count();
+
+    let selected = venue_without_funding();
+    let worker = worker_service_after_switch(
+        pool,
+        tenant_id,
+        Arc::clone(&selected),
+        &selected,
+        FundingRouteMode::Blocked,
+    );
+
+    assert_eq!(worker.resume_non_terminal().await?, 0);
+
+    assert_eq!(worker.get(saga_id).await?.state, FundingState::Transferring.as_str());
+    let listed = worker.list().await?;
+    assert_eq!(listed.len(), 1);
+    assert_eq!(listed[0].state, FundingState::Transferring.as_str());
+    assert_eq!(original.transfer_call_count(), transfers_before);
+    assert_eq!(selected.transfer_call_count(), 0);
+    assert_eq!(selected.spot_order_call_count(), 0);
+
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "Requires DATABASE_URL"]
+async fn unstarted_quote_only_expires_when_the_route_is_closed_for_new_execution(
+    pool: PgPool,
+) -> anyhow::Result<()> {
+    for route_mode in [FundingRouteMode::Recovery, FundingRouteMode::Blocked] {
+        let original = configured_exchange();
+        let harness = test_service(pool.clone(), Arc::clone(&original), FundingConfig::default());
+        let quote = harness.service.quote().await?;
+        let worker = worker_service_after_switch(
+            pool.clone(),
+            harness.tenant_id,
+            Arc::clone(&original),
+            &venue_without_funding(),
+            route_mode,
+        );
+
+        assert_eq!(worker.resume_non_terminal().await?, 0);
+        assert_eq!(worker.get(quote.quote_id).await?.state, FundingState::Quoted.as_str());
+        assert_eq!(original.spot_order_call_count(), 0, "{route_mode:?}");
+
+        let expiring = FundingConfig {
+            quote_ttl_secs: 0,
+            ..FundingConfig::default()
+        };
+        let harness = test_service(pool.clone(), Arc::clone(&original), expiring);
+        let expired = harness.service.quote().await?;
+        let worker = worker_service_after_switch(
+            pool.clone(),
+            harness.tenant_id,
+            Arc::clone(&original),
+            &venue_without_funding(),
+            route_mode,
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+
+        assert_eq!(worker.resume_non_terminal().await?, 0);
+        assert_eq!(worker.get(expired.quote_id).await?.state, FundingState::Failed.as_str());
+        assert_eq!(original.spot_order_call_count(), 0, "{route_mode:?}");
+    }
+
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "Requires DATABASE_URL"]
+async fn no_new_saga_on_a_venue_without_a_funding_surface(pool: PgPool) -> anyhow::Result<()> {
+    let harness = test_service(pool, venue_without_funding(), FundingConfig::default());
+
+    assert!(harness.service.quote().await.is_err());
+    assert!(harness.service.list().await?.is_empty(), "the refused quote must leave no saga");
 
     Ok(())
 }
