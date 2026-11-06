@@ -82,7 +82,7 @@ if the split simply made the futures-only methods optional.
 ### 1. Vocabulary
 
 - **Venue** = exchange × market kind × account scope. `VenueId` is a stable string (`binance:usdm`, `binance:spot`,
-  `b3:btc-fut`) used in config, logs, `/status`, allocations and, later, on positions and market-data events.
+  `b3:btc-fut`) used in config, logs, `/status`, allocations, market-data events (step 3) and, later, on positions.
 - **Market kind**: `PerpUsdM` (position account, funding, reduce-only) or `Spot` (balance account, holdings, protection
   is an order on the book). Dated futures later.
 - **Account kind**: `PositionAccount` (the venue reports positions) or `BalanceAccount` (the venue reports holdings only;
@@ -649,4 +649,5 @@ Budget model for multi-venue:
 - v9 (2026-11-06): §2, §3 and §8 aligned with step 3 as implemented after Codex rounds 1–2 on
   `refactor/venue-step3-factory` (APPROVE on round 2). Codex required the delivered contracts recorded and every omission
   staged with an owner: durable saga routing (step 7), conversion exclusion and `eligible` inputs (step 8), reconnect resync
-  and feed properties (separate change before a second venue). No risk number or operator decision changed.
+  and feed properties (separate change before a second venue). No risk number or operator decision changed. Codex
+  **APPROVE** with one P3 (§1 wording) applied.
