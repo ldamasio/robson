@@ -15,7 +15,7 @@
 //! ┌─────────────────────────────────────────┐
 //! │ Async Loop                              │
 //! │ - Subscribe to EventBus                 │
-//! │ - Filter MarketData for symbol          │
+//! │ - Filter MarketData for (venue, symbol) │
 //! │ - Apply MA crossover detection          │
 //! │ - Check cancellation token              │
 //! │ - Emit DetectorSignal once → terminate  │
@@ -62,7 +62,7 @@ use robson_engine::{
     KeyLevelStrategy, ReversalPatternStrategy, SignalContext, SignalDecision, SignalReason,
     SmaCrossoverStrategy, StrategyRegistry,
 };
-use robson_exec::{CandleInterval, OhlcvPort};
+use robson_exec::{venue::VenueId, CandleInterval, OhlcvPort};
 use tokio::{task::JoinHandle, time::sleep};
 use tokio_util::sync::CancellationToken;
 use tracing::{debug, info, warn};
@@ -168,7 +168,7 @@ impl DetectorConfig {
 /// 1. Created from an armed Position
 /// 2. Spawned as async task
 /// 3. Subscribes to EventBus for MarketData events
-/// 4. Filters events for its symbol
+/// 4. Filters events for its `(venue, symbol)` feed
 /// 5. Applies MA crossover detection logic
 /// 6. Checks cancellation token for graceful shutdown
 /// 7. Emits DetectorSignal via EventBus (if not cancelled)
@@ -180,6 +180,9 @@ impl DetectorConfig {
 /// The returned JoinHandle can be used to await completion or cancel.
 pub struct DetectorTask {
     config: DetectorConfig,
+    /// Venue whose feed this detector subscribes to (ADR-0056 §3). A tick for
+    /// the same symbol on another venue is not this detector's market.
+    venue: VenueId,
     event_bus: Arc<EventBus>,
     ohlcv_port: Arc<dyn OhlcvPort>,
     /// Cancellation token for graceful shutdown
@@ -240,6 +243,10 @@ impl DetectorTask {
 
         Self {
             config,
+            // Every position predating venue routing maps to binance:usdm
+            // (ADR-0056 §7); runtime callers pass their venue explicitly via
+            // `from_position_with_policy`.
+            venue: VenueId::new(VenueId::BINANCE_USDM),
             event_bus,
             ohlcv_port,
             cancel_token,
@@ -288,6 +295,7 @@ impl DetectorTask {
             position,
             EntryPolicyConfig::default(),
             TechnicalStopConfig::default(),
+            VenueId::new(VenueId::BINANCE_USDM),
             event_bus,
             ohlcv_port,
             cancel_token,
@@ -295,11 +303,13 @@ impl DetectorTask {
     }
 
     /// Create detector directly from an armed position, explicit entry
-    /// policy, and the daemon-configured technical stop config.
+    /// policy, the daemon-configured technical stop config and the venue whose
+    /// feed and OHLCV it runs on.
     pub fn from_position_with_policy(
         position: &Position,
         entry_policy: EntryPolicyConfig,
         technical_stop_config: TechnicalStopConfig,
+        venue: VenueId,
         event_bus: Arc<EventBus>,
         ohlcv_port: Arc<dyn OhlcvPort>,
         cancel_token: CancellationToken,
@@ -309,7 +319,13 @@ impl DetectorTask {
             entry_policy,
             technical_stop_config,
         )?;
-        Ok(Self::new(config, event_bus, ohlcv_port, cancel_token))
+        Ok(Self::new(config, event_bus, ohlcv_port, cancel_token).on_venue(venue))
+    }
+
+    /// Subscribe this detector to `venue`'s feed.
+    pub fn on_venue(mut self, venue: VenueId) -> Self {
+        self.venue = venue;
+        self
     }
 
     /// Spawn the detector as an async task.
@@ -563,10 +579,11 @@ impl DetectorTask {
 
     /// Handle market data event.
     ///
-    /// Filters for our symbol and applies MA crossover detection logic.
+    /// Filters for our `(venue, symbol)` feed and applies MA crossover
+    /// detection logic.
     async fn handle_market_data(&mut self, market_data: &MarketData) -> Option<DetectorSignal> {
-        // Filter: only process our symbol
-        if market_data.symbol != self.config.symbol {
+        // Filter: only process our feed
+        if market_data.venue != self.venue || market_data.symbol != self.config.symbol {
             return None;
         }
 
@@ -1134,6 +1151,7 @@ mod tests {
 
     fn create_test_market_data(symbol: &str, price: Decimal) -> MarketData {
         MarketData {
+            venue: VenueId::new(VenueId::BINANCE_USDM),
             symbol: robson_domain::Symbol::from_pair(symbol).unwrap(),
             price: Price::new(price).unwrap(),
             timestamp: Utc::now(),
@@ -1292,6 +1310,29 @@ mod tests {
         let other_data = create_test_market_data("ETHUSDT", dec!(3000));
         let result = detector.handle_market_data(&other_data).await;
         assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn a_detector_ignores_the_same_symbol_on_another_venue() {
+        // The candles confirm a crossover on any tick of this detector's feed,
+        // so the only thing keeping a tick out is the venue half of the key.
+        let event_bus = Arc::new(EventBus::new(10));
+        let mut detector = DetectorTask::new(
+            create_test_config(), // BTCUSDT
+            event_bus,
+            create_sma_crossover_ohlcv(Side::Long),
+            create_test_cancel_token(),
+        )
+        .on_venue(VenueId::new("binance:spot"));
+
+        let usdm_tick = create_test_market_data("BTCUSDT", dec!(104));
+        assert!(detector.handle_market_data(&usdm_tick).await.is_none());
+
+        let spot_tick = MarketData {
+            venue: VenueId::new("binance:spot"),
+            ..create_test_market_data("BTCUSDT", dec!(104))
+        };
+        assert!(detector.handle_market_data(&spot_tick).await.is_some());
     }
 
     #[tokio::test]

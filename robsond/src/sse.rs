@@ -297,6 +297,7 @@ mod tests {
 
     fn test_market_data() -> DaemonEvent {
         DaemonEvent::MarketData(MarketData {
+            venue: robson_exec::venue::VenueId::new(robson_exec::venue::VenueId::BINANCE_USDM),
             symbol: test_symbol(),
             price: Price::new(dec!(95000)).unwrap(),
             timestamp: Utc::now(),

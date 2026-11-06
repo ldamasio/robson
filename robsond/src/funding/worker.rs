@@ -38,6 +38,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingWorker<E, S> {
                         Ok(_) => {},
                         Err(error) => error!(%error, "Funding worker poll failed"),
                     }
+                    if let Err(error) = self.service.refresh_blocked_gauge().await {
+                        error!(%error, "Funding worker blocked-saga count failed");
+                    }
                 }
             }
         }

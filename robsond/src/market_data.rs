@@ -3,6 +3,11 @@
 //! Spawns WebSocket client tasks and bridges market data events
 //! from connectors to the daemon event bus.
 //!
+//! A manager serves one venue: its feed comes from the venue factory (ADR-0056
+//! §3) and every event it publishes carries that venue. The reconnect loop, the
+//! watchdog and the REST fallback below are venue neutral, and each
+//! `(venue, symbol)` pair runs its own instance with its own [`FeedHealth`].
+//!
 //! # Reconnection
 //!
 //! The spawned task runs indefinitely. When the WebSocket stream closes or
@@ -25,17 +30,18 @@
 //! during transitions cannot double-apply a step (property-tested in
 //! `robson-engine/tests/trailing_stop_properties.rs`).
 
-use std::{
-    str::FromStr,
-    sync::{
-        atomic::{AtomicBool, AtomicI64, Ordering},
-        Arc,
-    },
+use std::sync::{
+    atomic::{AtomicBool, AtomicI64, Ordering},
+    Arc,
 };
 
 use async_trait::async_trait;
-use robson_connectors::{BinanceWebSocketClient, WsMessage};
+#[cfg(test)]
+use robson_connectors::binance::usdm::{
+    BinanceUsdmTradeFeed, MAINNET_MARKET_WS_ENDPOINT, TESTNET_MARKET_WS_ENDPOINT,
+};
 use robson_domain::{Price, Symbol};
+use robson_exec::{venue::VenueId, TradeFeedMessage, TradeFeedPort};
 use tokio::{
     task::JoinHandle,
     time::{sleep, Duration},
@@ -44,16 +50,9 @@ use tokio_util::sync::CancellationToken;
 use tracing::{error, info, warn};
 
 use crate::{
-    error::DaemonResult,
+    error::{DaemonError, DaemonResult},
     event_bus::{DaemonEvent, EventBus, MarketDataSource},
 };
-
-/// Default mainnet base for regular futures market streams. Binance routes
-/// `aggTrade` under `/market`; the legacy unrouted path no longer delivers it.
-const MAINNET_MARKET_WS_ENDPOINT: &str = "wss://fstream.binance.com/market";
-
-/// Testnet retains the legacy unrouted stream base.
-const TESTNET_MARKET_WS_ENDPOINT: &str = "wss://stream.binancefuture.com";
 
 /// Maximum reconnect backoff when no healthy REST fallback is protecting the
 /// symbol.
@@ -177,7 +176,7 @@ fn fallback_persist_warning_due(
         && since_last_warning.map(|elapsed| elapsed >= alert_interval).unwrap_or(true)
 }
 
-/// Shared per-symbol feed health: the instant of the last WS tick.
+/// Shared per-feed health: the instant of the last WS tick.
 ///
 /// Written by the WS client task on every delivered tick; read by the REST
 /// fallback task to decide whether the feed is silent. Initialized to "now"
@@ -290,39 +289,52 @@ impl RestFallbackConfig {
     }
 }
 
-/// Market data manager - spawns and manages WebSocket tasks.
+/// Market data manager - spawns and manages WebSocket tasks for one venue.
 pub struct MarketDataManager {
     /// Event bus for publishing market data
     event_bus: Arc<EventBus>,
     /// Cancellation token for graceful shutdown
     cancel: CancellationToken,
+    /// Venue stamped on every published event.
+    venue: VenueId,
+    /// The venue's trade feed.
+    feed: Arc<dyn TradeFeedPort>,
     /// Ordered stream bases used by each per-symbol reconnect loop.
     ws_endpoints: Arc<Vec<String>>,
 }
 
 impl MarketDataManager {
-    /// Create a new market data manager.
-    pub fn new(
+    /// Create a market data manager for `venue` over its feed.
+    pub fn for_venue(
+        event_bus: Arc<EventBus>,
+        cancel: CancellationToken,
+        venue: VenueId,
+        feed: Arc<dyn TradeFeedPort>,
+    ) -> Self {
+        let ws_endpoints = Arc::new(feed.endpoints().to_vec());
+        Self {
+            event_bus,
+            cancel,
+            venue,
+            feed,
+            ws_endpoints,
+        }
+    }
+
+    /// Test fixture: the USDⓈ-M feed with its environment defaults.
+    #[cfg(test)]
+    fn new(
         event_bus: Arc<EventBus>,
         cancel: CancellationToken,
         use_testnet: bool,
         configured_ws_endpoints: Vec<String>,
     ) -> Self {
-        let ws_endpoints = if configured_ws_endpoints.is_empty() {
-            vec![if use_testnet {
-                TESTNET_MARKET_WS_ENDPOINT.to_string()
-            } else {
-                MAINNET_MARKET_WS_ENDPOINT.to_string()
-            }]
-        } else {
-            configured_ws_endpoints
-        };
-
-        Self {
+        Self::for_venue(
             event_bus,
             cancel,
-            ws_endpoints: Arc::new(ws_endpoints),
-        }
+            VenueId::new(VenueId::BINANCE_USDM),
+            Arc::new(BinanceUsdmTradeFeed::new(use_testnet, configured_ws_endpoints)),
+        )
     }
 
     /// Spawn a WebSocket client task for a single symbol.
@@ -338,9 +350,19 @@ impl MarketDataManager {
         symbol: Symbol,
         health: Arc<FeedHealth>,
     ) -> DaemonResult<JoinHandle<()>> {
+        if self.ws_endpoints.is_empty() {
+            return Err(DaemonError::Config(format!(
+                "Market data feed for venue {} has no endpoints",
+                self.venue
+            )));
+        }
+
         let event_bus = self.event_bus.clone();
         let cancel = self.cancel.clone();
         let symbol_str = symbol.as_pair();
+        let venue = self.venue.clone();
+        let venue_str = venue.to_string();
+        let feed = Arc::clone(&self.feed);
 
         let ws_endpoints = Arc::clone(&self.ws_endpoints);
         let handle = tokio::spawn(async move {
@@ -352,21 +374,18 @@ impl MarketDataManager {
                 }
 
                 let endpoint = ws_endpoints[reconnect.endpoint_index].clone();
-                let ws_client = BinanceWebSocketClient::from_base_url(endpoint.clone());
 
                 let failure = 'attempt: {
                     let subscription = tokio::select! {
                         _ = cancel.cancelled() => break 'reconnect,
                         result = tokio::time::timeout(
                             Duration::from_secs(WS_CONNECT_TIMEOUT_SECS),
-                            ws_client.subscribe_agg_trade(&symbol_str),
+                            feed.connect(&endpoint, &symbol),
                         ) => result,
                     };
                     let mut stream = match subscription {
                         Ok(Ok(stream)) => stream,
-                        Ok(Err(error)) => {
-                            break 'attempt WsAttemptFailure::Connect(error.to_string());
-                        },
+                        Ok(Err(error)) => break 'attempt WsAttemptFailure::Connect(error),
                         Err(_elapsed) => break 'attempt WsAttemptFailure::ConnectTimeout,
                     };
                     let mut first_message_received = false;
@@ -374,7 +393,7 @@ impl MarketDataManager {
                     loop {
                         tokio::select! {
                             _ = cancel.cancelled() => {
-                                info!(symbol = %symbol_str, "WebSocket client shutting down");
+                                info!(venue = %venue_str, symbol = %symbol_str, "WebSocket client shutting down");
                                 break 'reconnect;
                             }
                             // Read-idle watchdog: a successful HTTP upgrade is
@@ -382,7 +401,7 @@ impl MarketDataManager {
                             // confirms that the endpoint is connected.
                             msg = tokio::time::timeout(
                                 Duration::from_secs(WATCHDOG_IDLE_SECS),
-                                stream.next(),
+                                stream.next_message(),
                             ) => {
                                 let msg = match msg {
                                     Err(_elapsed) => {
@@ -399,18 +418,17 @@ impl MarketDataManager {
                                         break 'attempt WsAttemptFailure::ClosedBeforeData;
                                     },
                                     Some(Err(error)) if first_message_received => {
-                                        break 'attempt WsAttemptFailure::Stream(error.to_string());
+                                        break 'attempt WsAttemptFailure::Stream(error);
                                     },
                                     Some(Err(error)) => {
-                                        break 'attempt WsAttemptFailure::StreamBeforeData(
-                                            error.to_string(),
-                                        );
+                                        break 'attempt WsAttemptFailure::StreamBeforeData(error);
                                     },
                                     Some(Ok(message)) => message,
                                 };
 
                                 if !first_message_received {
                                     info!(
+                                        venue = %venue_str,
                                         symbol = %symbol_str,
                                         endpoint = %endpoint,
                                         "WebSocket client connected; first stream message received"
@@ -420,55 +438,23 @@ impl MarketDataManager {
                                 }
 
                                 match message {
-                                    WsMessage::AggTrade(trade) => {
-                                    let price_decimal =
-                                        match rust_decimal::Decimal::from_str(&trade.price) {
-                                            Ok(d) => d,
-                                            Err(e) => {
-                                                error!(error = %e, "Failed to parse price");
-                                                continue;
-                                            },
-                                        };
+                                    TradeFeedMessage::Trade { symbol: trade_symbol, price } => {
+                                        health.record_ws_tick();
+                                        let daemon_event =
+                                            DaemonEvent::MarketData(crate::event_bus::MarketData {
+                                                venue: venue.clone(),
+                                                symbol: trade_symbol,
+                                                price,
+                                                timestamp: chrono::Utc::now(),
+                                                source: MarketDataSource::Ws,
+                                            });
 
-                                    let price = match Price::new(price_decimal) {
-                                        Ok(p) => p,
-                                        Err(e) => {
-                                            error!(
-                                                error = %e,
-                                                price = %trade.price,
-                                                "Invalid price value"
-                                            );
-                                            continue;
-                                        },
-                                    };
-
-                                    let trade_symbol = match Symbol::from_pair(&trade.symbol) {
-                                        Ok(s) => s,
-                                        Err(e) => {
-                                            error!(
-                                                error = %e,
-                                                symbol = %trade.symbol,
-                                                "Failed to parse symbol"
-                                            );
-                                            continue;
-                                        },
-                                    };
-
-                                    health.record_ws_tick();
-                                    let daemon_event =
-                                        DaemonEvent::MarketData(crate::event_bus::MarketData {
-                                            symbol: trade_symbol,
-                                            price,
-                                            timestamp: chrono::Utc::now(),
-                                            source: MarketDataSource::Ws,
-                                        });
-
-                                    event_bus.send(daemon_event);
+                                        event_bus.send(daemon_event);
                                     },
-                                    _ => {
-                                        // Other message types are not used by
-                                        // this dedicated aggTrade subscription.
+                                    TradeFeedMessage::Malformed { reason, value, error } => {
+                                        error!(error = %error, value = %value, "{}", reason);
                                     },
+                                    TradeFeedMessage::NonTrade => {},
                                 }
                             }
                         }
@@ -480,11 +466,17 @@ impl MarketDataManager {
                 let next_endpoint =
                     &ws_endpoints[reconnect.next_endpoint_index(ws_endpoints.len())];
                 crate::metrics::MARKET_DATA_WS_FAILURES
-                    .with_label_values(&[&symbol_str, &endpoint, failure.metric_reason()])
+                    .with_label_values(&[
+                        venue_str.as_str(),
+                        symbol_str.as_str(),
+                        endpoint.as_str(),
+                        failure.metric_reason(),
+                    ])
                     .inc();
 
                 match (&failure, rest_fallback_healthy) {
                     (WsAttemptFailure::HandshakeNoData, true) => info!(
+                        venue = %venue_str,
                         symbol = %symbol_str,
                         endpoint = %endpoint,
                         next_endpoint = %next_endpoint,
@@ -493,6 +485,7 @@ impl MarketDataManager {
                         "WebSocket handshake succeeded but stream delivered no data; REST fallback healthy"
                     ),
                     (WsAttemptFailure::HandshakeNoData, false) => warn!(
+                        venue = %venue_str,
                         symbol = %symbol_str,
                         endpoint = %endpoint,
                         next_endpoint = %next_endpoint,
@@ -501,6 +494,7 @@ impl MarketDataManager {
                         "WebSocket handshake succeeded but stream delivered no data; reconnecting"
                     ),
                     (_, true) => info!(
+                        venue = %venue_str,
                         symbol = %symbol_str,
                         endpoint = %endpoint,
                         next_endpoint = %next_endpoint,
@@ -510,6 +504,7 @@ impl MarketDataManager {
                         "WebSocket endpoint failed; REST fallback healthy"
                     ),
                     (_, false) => warn!(
+                        venue = %venue_str,
                         symbol = %symbol_str,
                         endpoint = %endpoint,
                         next_endpoint = %next_endpoint,
@@ -529,7 +524,7 @@ impl MarketDataManager {
                 }
             }
 
-            info!(symbol = %symbol_str, "WebSocket client task ended");
+            info!(venue = %venue_str, symbol = %symbol_str, "WebSocket client task ended");
         });
 
         Ok(handle)
@@ -554,6 +549,8 @@ impl MarketDataManager {
         let event_bus = self.event_bus.clone();
         let cancel = self.cancel.clone();
         let symbol_str = symbol.as_pair();
+        let venue = self.venue.clone();
+        let venue_str = venue.to_string();
 
         tokio::spawn(async move {
             let mut in_fallback = false;
@@ -565,7 +562,7 @@ impl MarketDataManager {
                 tokio::select! {
                     _ = cancel.cancelled() => {
                         health.set_rest_fallback_healthy(false);
-                        info!(symbol = %symbol_str, "REST fallback task shutting down");
+                        info!(venue = %venue_str, symbol = %symbol_str, "REST fallback task shutting down");
                         break;
                     }
                     _ = sleep(cfg.poll_interval) => {}
@@ -573,7 +570,7 @@ impl MarketDataManager {
 
                 let silent = Duration::from_secs(health.silent_secs());
                 crate::metrics::MARKET_DATA_SILENT_SECONDS
-                    .with_label_values(&[&symbol_str])
+                    .with_label_values(&[&venue_str, &symbol_str])
                     .set(silent.as_secs() as f64);
 
                 // A tick within ~2 poll intervals means the WS is delivering.
@@ -587,6 +584,7 @@ impl MarketDataManager {
                             *ws_healthy_since.get_or_insert_with(tokio::time::Instant::now);
                         if healthy_since.elapsed() >= cfg.ws_holddown {
                             info!(
+                                venue = %venue_str,
                                 symbol = %symbol_str,
                                 "WS feed healthy past hold-down; leaving REST fallback"
                             );
@@ -596,7 +594,7 @@ impl MarketDataManager {
                             last_persist_warn = None;
                             health.set_rest_fallback_healthy(false);
                             crate::metrics::MARKET_DATA_MODE
-                                .with_label_values(&[&symbol_str])
+                                .with_label_values(&[&venue_str, &symbol_str])
                                 .set(0.0);
                             continue;
                         }
@@ -607,6 +605,7 @@ impl MarketDataManager {
                     // A position that closed no longer needs protection.
                     if !support.has_risk_open(&symbol).await {
                         info!(
+                            venue = %venue_str,
                             symbol = %symbol_str,
                             "No risk-open position remains; leaving REST fallback"
                         );
@@ -615,7 +614,9 @@ impl MarketDataManager {
                         ws_healthy_since = None;
                         last_persist_warn = None;
                         health.set_rest_fallback_healthy(false);
-                        crate::metrics::MARKET_DATA_MODE.with_label_values(&[&symbol_str]).set(0.0);
+                        crate::metrics::MARKET_DATA_MODE
+                            .with_label_values(&[&venue_str, &symbol_str])
+                            .set(0.0);
                         continue;
                     }
                 } else {
@@ -628,6 +629,7 @@ impl MarketDataManager {
                         continue;
                     }
                     warn!(
+                        venue = %venue_str,
                         symbol = %symbol_str,
                         silent_secs = silent.as_secs(),
                         poll_secs = cfg.poll_interval.as_secs(),
@@ -637,7 +639,9 @@ impl MarketDataManager {
                     fallback_since = Some(tokio::time::Instant::now());
                     ws_healthy_since = None;
                     health.set_rest_fallback_healthy(false);
-                    crate::metrics::MARKET_DATA_MODE.with_label_values(&[&symbol_str]).set(1.0);
+                    crate::metrics::MARKET_DATA_MODE
+                        .with_label_values(&[&venue_str, &symbol_str])
+                        .set(1.0);
                 }
 
                 // In fallback: one poll per interval, no burst retries.
@@ -645,9 +649,10 @@ impl MarketDataManager {
                     Ok(price) => {
                         health.set_rest_fallback_healthy(true);
                         crate::metrics::MARKET_DATA_FALLBACK_POLLS
-                            .with_label_values(&[&symbol_str, "ok"])
+                            .with_label_values(&[venue_str.as_str(), symbol_str.as_str(), "ok"])
                             .inc();
                         event_bus.send(DaemonEvent::MarketData(crate::event_bus::MarketData {
+                            venue: venue.clone(),
                             symbol: symbol.clone(),
                             price,
                             timestamp: chrono::Utc::now(),
@@ -657,9 +662,10 @@ impl MarketDataManager {
                     Err(e) => {
                         health.set_rest_fallback_healthy(false);
                         crate::metrics::MARKET_DATA_FALLBACK_POLLS
-                            .with_label_values(&[&symbol_str, "error"])
+                            .with_label_values(&[venue_str.as_str(), symbol_str.as_str(), "error"])
                             .inc();
                         warn!(
+                            venue = %venue_str,
                             symbol = %symbol_str,
                             error = %e,
                             "REST fallback price poll failed; retrying next interval"
@@ -675,6 +681,7 @@ impl MarketDataManager {
                     if fallback_persist_warning_due(persisted, since_last_warning, cfg.alert_after)
                     {
                         warn!(
+                            venue = %venue_str,
                             symbol = %symbol_str,
                             fallback_minutes = persisted.as_secs() / 60,
                             "REST fallback persisting; WS feed still silent (investigate)"
@@ -913,6 +920,280 @@ mod tests {
 
         let got = tokio::time::timeout(Duration::from_millis(200), receiver.recv()).await;
         assert!(got.is_err(), "no risk-open position must mean no polling");
+
+        cancel.cancel();
+        let _ = handle.await;
+    }
+
+    // ADR-0056 §3: a manager serves one venue; each (venue, symbol) has its
+    // own loop and health. These drive the unchanged loop through the port.
+
+    /// A feed whose connections deliver scripted messages and then stay open
+    /// and silent. An empty `scripts` refuses the connection.
+    struct ScriptedFeed {
+        endpoints: Vec<String>,
+        connects: std::sync::Mutex<Vec<String>>,
+        scripts: std::sync::Mutex<Vec<Vec<TradeFeedMessage>>>,
+    }
+
+    impl ScriptedFeed {
+        fn new(endpoints: &[&str], scripts: Vec<Vec<TradeFeedMessage>>) -> Arc<Self> {
+            Arc::new(Self {
+                endpoints: endpoints.iter().map(|endpoint| endpoint.to_string()).collect(),
+                connects: std::sync::Mutex::new(Vec::new()),
+                scripts: std::sync::Mutex::new(scripts),
+            })
+        }
+    }
+
+    struct ScriptedStream {
+        messages: std::vec::IntoIter<TradeFeedMessage>,
+    }
+
+    #[async_trait]
+    impl robson_exec::TradeStream for ScriptedStream {
+        async fn next_message(&mut self) -> Option<Result<TradeFeedMessage, String>> {
+            match self.messages.next() {
+                Some(message) => Some(Ok(message)),
+                None => std::future::pending().await,
+            }
+        }
+    }
+
+    #[async_trait]
+    impl TradeFeedPort for ScriptedFeed {
+        fn endpoints(&self) -> &[String] {
+            &self.endpoints
+        }
+
+        async fn connect(
+            &self,
+            endpoint: &str,
+            _symbol: &Symbol,
+        ) -> Result<Box<dyn robson_exec::TradeStream>, String> {
+            self.connects.lock().unwrap().push(endpoint.to_string());
+            let mut scripts = self.scripts.lock().unwrap();
+            if scripts.is_empty() {
+                return Err("connection refused".to_string());
+            }
+            Ok(Box::new(ScriptedStream { messages: scripts.remove(0).into_iter() }))
+        }
+    }
+
+    fn btc() -> Symbol {
+        Symbol::from_pair("BTCUSDT").unwrap()
+    }
+
+    fn trade(price: rust_decimal::Decimal) -> TradeFeedMessage {
+        TradeFeedMessage::Trade {
+            symbol: btc(),
+            price: Price::new(price).unwrap(),
+        }
+    }
+
+    /// Push until a stream of `feed` is connected and has received the trade.
+    async fn push_when_connected(feed: &robson_exec::StubTradeFeed, price: Price) {
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while feed.push(&btc(), price) == 0 {
+                sleep(Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the WS client must connect to the feed");
+    }
+
+    #[tokio::test]
+    async fn the_same_symbol_on_two_venues_does_not_cross_events_or_health() {
+        let event_bus = Arc::new(EventBus::new(100));
+        let mut receiver = event_bus.subscribe();
+        let cancel = CancellationToken::new();
+
+        let venue_a = VenueId::new("binance:usdm");
+        let feed_a = Arc::new(robson_exec::StubTradeFeed::new());
+        let manager_a = MarketDataManager::for_venue(
+            event_bus.clone(),
+            cancel.clone(),
+            venue_a.clone(),
+            feed_a.clone(),
+        );
+        let health_a = Arc::new(FeedHealth::new());
+        health_a.set_last_tick_secs_ago(120);
+        let handle_a = manager_a.spawn_ws_client(btc(), Arc::clone(&health_a)).unwrap();
+
+        let venue_b = VenueId::new("binance:spot");
+        let feed_b = Arc::new(robson_exec::StubTradeFeed::new());
+        let manager_b = MarketDataManager::for_venue(
+            event_bus.clone(),
+            cancel.clone(),
+            venue_b.clone(),
+            feed_b.clone(),
+        );
+        let health_b = Arc::new(FeedHealth::new());
+        health_b.set_last_tick_secs_ago(120);
+        let handle_b = manager_b.spawn_ws_client(btc(), Arc::clone(&health_b)).unwrap();
+
+        push_when_connected(&feed_a, Price::new(dec!(95000)).unwrap()).await;
+        let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("venue A's tick must be published")
+            .expect("receiver open")
+            .expect("no lag");
+        match event {
+            DaemonEvent::MarketData(data) => {
+                assert_eq!(data.venue, venue_a);
+                assert_eq!(data.symbol, btc());
+                assert_eq!(data.source, MarketDataSource::Ws);
+            },
+            other => panic!("expected MarketData, got {other:?}"),
+        }
+        assert!(health_a.silent_secs() < 2, "venue A's feed delivered");
+        assert!(health_b.silent_secs() >= 119, "venue B's watchdog must not see venue A's tick");
+
+        push_when_connected(&feed_b, Price::new(dec!(94000)).unwrap()).await;
+        let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("venue B's tick must be published")
+            .expect("receiver open")
+            .expect("no lag");
+        assert!(matches!(event, DaemonEvent::MarketData(data) if data.venue == venue_b));
+
+        cancel.cancel();
+        let _ = handle_a.await;
+        let _ = handle_b.await;
+    }
+
+    #[tokio::test]
+    async fn delivered_messages_that_are_not_trades_are_never_ticks() {
+        let event_bus = Arc::new(EventBus::new(100));
+        let mut receiver = event_bus.subscribe();
+        let cancel = CancellationToken::new();
+        let feed = ScriptedFeed::new(&["scripted://primary"], vec![vec![
+            TradeFeedMessage::NonTrade,
+            TradeFeedMessage::Malformed {
+                reason: "Failed to parse price",
+                value: "not-a-number".to_string(),
+                error: "invalid decimal".to_string(),
+            },
+        ]]);
+        let manager = MarketDataManager::for_venue(
+            event_bus,
+            cancel.clone(),
+            VenueId::new(VenueId::BINANCE_USDM),
+            feed,
+        );
+        let health = Arc::new(FeedHealth::new());
+        health.set_last_tick_secs_ago(120);
+        let handle = manager.spawn_ws_client(btc(), Arc::clone(&health)).unwrap();
+
+        let got = tokio::time::timeout(Duration::from_millis(100), receiver.recv()).await;
+        assert!(got.is_err(), "neither message may publish market data");
+        assert!(health.silent_secs() >= 119, "neither message is a tick for the fallback");
+
+        cancel.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn a_trade_tick_publishes_the_symbol_on_the_message() {
+        let event_bus = Arc::new(EventBus::new(100));
+        let mut receiver = event_bus.subscribe();
+        let cancel = CancellationToken::new();
+        let feed = ScriptedFeed::new(&["scripted://primary"], vec![vec![trade(dec!(101))]]);
+        let manager =
+            MarketDataManager::for_venue(event_bus, cancel.clone(), VenueId::new("stub"), feed);
+        let handle = manager.spawn_ws_client(btc(), Arc::new(FeedHealth::new())).unwrap();
+
+        let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("the tick must be published")
+            .expect("receiver open")
+            .expect("no lag");
+        match event {
+            DaemonEvent::MarketData(data) => {
+                assert_eq!(data.venue.as_str(), "stub");
+                assert_eq!(data.symbol, btc());
+                assert_eq!(data.price.as_decimal(), dec!(101));
+            },
+            other => panic!("expected MarketData, got {other:?}"),
+        }
+
+        cancel.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_connection_rotates_to_the_feeds_next_endpoint() {
+        let event_bus = Arc::new(EventBus::new(100));
+        let cancel = CancellationToken::new();
+        let feed = ScriptedFeed::new(&["scripted://primary", "scripted://fallback"], vec![]);
+        let manager = MarketDataManager::for_venue(
+            event_bus,
+            cancel.clone(),
+            VenueId::new(VenueId::BINANCE_USDM),
+            feed.clone(),
+        );
+        let handle = manager.spawn_ws_client(btc(), Arc::new(FeedHealth::new())).unwrap();
+
+        // The first retry waits the 1 s initial backoff.
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while feed.connects.lock().unwrap().len() < 2 {
+                sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the client must retry on the next endpoint");
+        assert_eq!(feed.connects.lock().unwrap()[..2], [
+            "scripted://primary".to_string(),
+            "scripted://fallback".to_string()
+        ]);
+
+        cancel.cancel();
+        let _ = handle.await;
+    }
+
+    #[tokio::test]
+    async fn a_feed_without_endpoints_is_refused_instead_of_panicking_its_task() {
+        let manager = MarketDataManager::for_venue(
+            Arc::new(EventBus::new(100)),
+            CancellationToken::new(),
+            VenueId::new(VenueId::BINANCE_USDM),
+            ScriptedFeed::new(&[], vec![]),
+        );
+        let error = manager.spawn_ws_client(btc(), Arc::new(FeedHealth::new())).unwrap_err();
+        assert!(error.to_string().contains("binance:usdm"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn rest_fallback_ticks_carry_the_managers_venue() {
+        let event_bus = Arc::new(EventBus::new(100));
+        let mut receiver = event_bus.subscribe();
+        let cancel = CancellationToken::new();
+        let manager = MarketDataManager::for_venue(
+            event_bus,
+            cancel.clone(),
+            VenueId::new("binance:spot"),
+            Arc::new(robson_exec::StubTradeFeed::new()),
+        );
+        let health = Arc::new(FeedHealth::new());
+        health.set_last_tick_secs_ago(120);
+        let support = Arc::new(StubSupport {
+            price: Price::new(dec!(62700)).unwrap(),
+            risk_open: true,
+        });
+        let handle = manager.spawn_rest_fallback(btc(), health, support, test_cfg());
+
+        let event = tokio::time::timeout(Duration::from_secs(2), receiver.recv())
+            .await
+            .expect("fallback must emit within the timeout")
+            .expect("receiver open")
+            .expect("no lag");
+        match event {
+            DaemonEvent::MarketData(data) => {
+                assert_eq!(data.venue.as_str(), "binance:spot");
+                assert_eq!(data.source, MarketDataSource::RestFallback);
+            },
+            other => panic!("expected MarketData, got {other:?}"),
+        }
 
         cancel.cancel();
         let _ = handle.await;

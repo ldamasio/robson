@@ -21,17 +21,16 @@
 use std::{net::SocketAddr, sync::Arc, time::Duration};
 
 use chrono::{DateTime, Datelike, Utc};
-use robson_connectors::{
-    binance::usdm::{BinanceExchangeAdapter, BinanceOhlcvAdapter},
-    BinanceRestClient,
-};
 #[cfg(feature = "postgres")]
 use robson_domain::{ApprovalPolicy, EntryPolicy, EntryPolicyConfig};
 use robson_domain::{Position, PositionState, Price, Symbol, TradingPolicy};
 use robson_engine::Engine;
 #[cfg(feature = "postgres")]
 use robson_eventlog::{query_events, EventEnvelope, QueryOptions};
-use robson_exec::{ports::IncomePort, ExchangePort, Executor, IntentJournal, StubExchange};
+use robson_exec::{
+    venue::Venue, ExchangePort, Executor, IntentJournal, OhlcvPort, StubExchange, StubTradeFeed,
+    TradeFeedPort,
+};
 // Optional projection recovery for crash recovery
 #[cfg(feature = "postgres")]
 use robson_store::ProjectionRecovery;
@@ -54,11 +53,12 @@ use crate::query::ExecutionQuery;
 #[cfg(feature = "postgres")]
 use crate::query_engine::{append_query_state_changed_event, EventLogQueryRecorder};
 use crate::{
-    api::{create_router, ApiState},
+    api::{create_router, ApiState, VenueFeedView},
     auth::GoogleAuthConfig,
     config::{Config, StartupStaleActivePolicy},
     error::{DaemonError, DaemonResult, StartupStaleActiveInfo},
     event_bus::{DaemonEvent, EventBus},
+    funding::FundingRouteMode,
     google_jwks::GoogleJwksCache,
     market_data::{FallbackSupport, FeedHealth, MarketDataManager, RestFallbackConfig},
     position_manager::{PositionManager, ReconcileCloseOutcome, ReconciledCloseInput},
@@ -93,11 +93,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FallbackSupport
 }
 
 /// The main Robson daemon.
-pub struct Daemon<E: ExchangePort + IncomePort + 'static, S: Store + 'static> {
+pub struct Daemon<E: Venue + 'static, S: Store + 'static> {
     /// Configuration
     config: Config,
     /// Exchange adapter shared with execution and reconciliation flows.
     exchange: Arc<E>,
+    /// The venue's live trade feed.
+    market_data: Arc<dyn TradeFeedPort>,
+    /// Where older unfinished funding sagas are recovered when the venue has no
+    /// funding surface (ADR-0056 §3).
+    funding_recovery_route: Option<Arc<E>>,
     /// Position manager
     position_manager: Arc<RwLock<PositionManager<E, S>>>,
     /// Event bus
@@ -187,6 +192,7 @@ impl Daemon<StubExchange, MemoryStore> {
                 query_recorder,
                 trading_policy,
             )
+            .with_venue_id(exchange.id().clone())
             .with_invalidation_guard(
                 config.engine.stop_invalidation_guard_enabled,
                 config.engine.stop_invalidation_lookback_candles,
@@ -199,6 +205,8 @@ impl Daemon<StubExchange, MemoryStore> {
         Self {
             config,
             exchange,
+            market_data: Arc::new(StubTradeFeed::new()),
+            funding_recovery_route: None,
             position_manager,
             event_bus,
             store,
@@ -259,6 +267,7 @@ impl Daemon<StubExchange, MemoryStore> {
                 query_recorder,
                 trading_policy,
             )
+            .with_venue_id(exchange.id().clone())
             .with_invalidation_guard(
                 config.engine.stop_invalidation_guard_enabled,
                 config.engine.stop_invalidation_lookback_candles,
@@ -271,6 +280,8 @@ impl Daemon<StubExchange, MemoryStore> {
         Ok(Self {
             config,
             exchange,
+            market_data: Arc::new(StubTradeFeed::new()),
+            funding_recovery_route: None,
             position_manager,
             event_bus,
             store,
@@ -283,8 +294,9 @@ impl Daemon<StubExchange, MemoryStore> {
     }
 
     /// Create a new stub daemon with optional projection recovery and shared
-    /// pool.
-    #[cfg(feature = "postgres")]
+    /// pool. Test fixture: this stub exposes funding, which a runtime stub on a
+    /// real database must not (`VenueFactory`).
+    #[cfg(all(test, feature = "postgres"))]
     pub fn new_stub_with_recovery(
         config: Config,
         projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
@@ -332,6 +344,7 @@ impl Daemon<StubExchange, MemoryStore> {
             query_recorder,
             trading_policy,
         )
+        .with_venue_id(exchange.id().clone())
         .with_invalidation_guard(
             config.engine.stop_invalidation_guard_enabled,
             config.engine.stop_invalidation_lookback_candles,
@@ -347,6 +360,8 @@ impl Daemon<StubExchange, MemoryStore> {
         Self {
             config,
             exchange,
+            market_data: Arc::new(StubTradeFeed::new()),
+            funding_recovery_route: None,
             position_manager,
             event_bus,
             store,
@@ -357,17 +372,20 @@ impl Daemon<StubExchange, MemoryStore> {
     }
 }
 
-impl Daemon<BinanceExchangeAdapter, MemoryStore> {
-    /// Create a daemon with Binance exchange adapter (for production).
-    pub fn new_binance(config: Config, client: Arc<BinanceRestClient>) -> Self {
+impl<E: Venue + 'static> Daemon<E, MemoryStore> {
+    /// Create a daemon on `venue`, with the feed and chart history built for it
+    /// (ADR-0056 §3).
+    pub fn with_venue(
+        config: Config,
+        venue: Arc<E>,
+        market_data: Arc<dyn TradeFeedPort>,
+        ohlcv_port: Arc<dyn OhlcvPort>,
+    ) -> Self {
         use robson_domain::RiskConfig;
 
-        let exchange = Arc::new(BinanceExchangeAdapter::new(Arc::clone(&client)));
-        let ohlcv_port: Arc<dyn robson_exec::OhlcvPort> =
-            Arc::new(BinanceOhlcvAdapter::new(client));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
-        let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
+        let executor = Arc::new(Executor::new(Arc::clone(&venue), journal, store.clone()));
         let event_bus = Arc::new(EventBus::new(1000));
         let query_recorder = default_query_recorder();
         // Placeholder capital; will be updated from exchange in run().
@@ -400,6 +418,7 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
                 query_recorder,
                 trading_policy,
             )
+            .with_venue_id(venue.id().clone())
             .with_ohlcv_port(ohlcv_port)
             .with_invalidation_guard(
                 config.engine.stop_invalidation_guard_enabled,
@@ -412,7 +431,9 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
 
         Self {
             config,
-            exchange,
+            exchange: venue,
+            market_data,
+            funding_recovery_route: None,
             position_manager,
             event_bus,
             store,
@@ -424,23 +445,21 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
         }
     }
 
-    /// Create a Binance daemon with optional projection recovery and shared
-    /// pool.
+    /// [`Self::with_venue`] with optional projection recovery and shared pool.
     #[cfg(feature = "postgres")]
-    pub fn new_binance_with_recovery(
+    pub fn with_venue_and_recovery(
         config: Config,
-        client: Arc<BinanceRestClient>,
+        venue: Arc<E>,
+        market_data: Arc<dyn TradeFeedPort>,
+        ohlcv_port: Arc<dyn OhlcvPort>,
         projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
         pg_pool: Option<Arc<sqlx::PgPool>>,
     ) -> Self {
         use robson_domain::RiskConfig;
 
-        let exchange = Arc::new(BinanceExchangeAdapter::new(Arc::clone(&client)));
-        let ohlcv_port: Arc<dyn robson_exec::OhlcvPort> =
-            Arc::new(BinanceOhlcvAdapter::new(client));
         let journal = Arc::new(IntentJournal::new());
         let store = Arc::new(MemoryStore::new());
-        let executor = Arc::new(Executor::new(Arc::clone(&exchange), journal, store.clone()));
+        let executor = Arc::new(Executor::new(Arc::clone(&venue), journal, store.clone()));
         let event_bus = Arc::new(EventBus::new(1000));
 
         let query_recorder: Arc<dyn QueryRecorder> =
@@ -482,6 +501,7 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
             query_recorder,
             trading_policy,
         )
+        .with_venue_id(venue.id().clone())
         .with_ohlcv_port(ohlcv_port)
         .with_invalidation_guard(
             config.engine.stop_invalidation_guard_enabled,
@@ -497,7 +517,9 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
 
         Self {
             config,
-            exchange,
+            exchange: venue,
+            market_data,
+            funding_recovery_route: None,
             position_manager,
             event_bus,
             store,
@@ -508,29 +530,48 @@ impl Daemon<BinanceExchangeAdapter, MemoryStore> {
     }
 }
 
-impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
-    /// Create a new daemon with provided components.
-    pub fn new(
-        config: Config,
-        exchange: Arc<E>,
-        position_manager: Arc<RwLock<PositionManager<E, S>>>,
-        event_bus: Arc<EventBus>,
-        store: Arc<S>,
-        #[cfg(feature = "postgres")] projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
-        #[cfg(feature = "postgres")] pg_pool: Option<Arc<sqlx::PgPool>>,
-    ) -> Self {
-        Self {
-            config,
-            exchange,
-            position_manager,
-            event_bus,
-            store,
-            #[cfg(feature = "postgres")]
-            projection_recovery,
-            #[cfg(feature = "postgres")]
-            pg_pool,
-            last_month_check: initial_month_check(),
+impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
+    /// Set where older unfinished funding sagas are recovered when the venue
+    /// has no funding surface.
+    pub fn with_funding_recovery_route(mut self, route: Option<Arc<E>>) -> Self {
+        self.funding_recovery_route = route;
+        self
+    }
+
+    /// The route the funding worker runs on and how it treats unfinished sagas
+    /// there (ADR-0056 §3). The worker exists whatever the selected venue
+    /// exposes: an older saga is never left without one.
+    fn funding_worker_route(&self) -> (Arc<E>, FundingRouteMode) {
+        if self.exchange.funding().is_some() {
+            return (Arc::clone(&self.exchange), FundingRouteMode::Selected);
         }
+        match &self.funding_recovery_route {
+            Some(route) if route.funding().is_some() => {
+                (Arc::clone(route), FundingRouteMode::Recovery)
+            },
+            _ => (Arc::clone(&self.exchange), FundingRouteMode::Blocked),
+        }
+    }
+
+    /// The funding worker's service, whenever a funding store is configured.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn funding_worker_service(&self) -> Option<FundingService<E, S>> {
+        let (Some(pool), Some(tenant_id)) = (&self.pg_pool, self.config.projection.tenant_id)
+        else {
+            return None;
+        };
+        let (route, route_mode) = self.funding_worker_route();
+        info!(venue = %route.id(), ?route_mode, "Starting funding worker");
+        Some(
+            FundingService::new(
+                pool.clone(),
+                tenant_id,
+                route,
+                Arc::clone(&self.position_manager),
+                self.config.funding.clone(),
+            )
+            .with_route_mode(route_mode),
+        )
     }
 
     /// Get a reference to the store (for testing).
@@ -671,13 +712,11 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
         //    watchdog while a risk-open position exists, the fallback polls the
         //    exchange REST price into the same pipeline so the trailing engine never
         //    starves.
-        let ws_use_testnet =
-            std::env::var("ROBSON_BINANCE_USE_TESTNET").unwrap_or_default() == "true";
-        let market_data_manager = MarketDataManager::new(
+        let market_data_manager = MarketDataManager::for_venue(
             self.event_bus.clone(),
             shutdown.clone(),
-            ws_use_testnet,
-            self.config.market_data.ws_endpoints.clone(),
+            self.exchange.id().clone(),
+            Arc::clone(&self.market_data),
         );
         let fallback_cfg = RestFallbackConfig::from_env();
         let fallback_support: Arc<dyn FallbackSupport> = Arc::new(DaemonFallbackSupport {
@@ -732,16 +771,7 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
         let projection_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         #[cfg(feature = "postgres")]
-        let funding_handle = if let (Some(pool), Some(tenant_id)) =
-            (&self.pg_pool, self.config.projection.tenant_id)
-        {
-            let service = FundingService::new(
-                pool.clone(),
-                tenant_id,
-                Arc::clone(&self.exchange),
-                Arc::clone(&self.position_manager),
-                self.config.funding.clone(),
-            );
+        let funding_handle = if let Some(service) = self.funding_worker_service() {
             let worker = FundingWorker::new(service);
             let worker_shutdown = shutdown.clone();
             Some(tokio::spawn(async move {
@@ -1595,9 +1625,19 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
     /// Public to allow integration tests to start the server and get the
     /// address.
     pub async fn start_api_server(&self) -> DaemonResult<SocketAddr> {
-        let circuit_breaker = {
+        let (circuit_breaker, prices) = {
             let pm = self.position_manager.read().await;
-            pm.circuit_breaker()
+            (pm.circuit_breaker(), pm.price_cache())
+        };
+        let venue_feed = VenueFeedView {
+            prices,
+            symbols: self
+                .config
+                .market_data
+                .symbols
+                .iter()
+                .filter_map(|symbol| Symbol::from_pair(symbol).ok())
+                .collect(),
         };
 
         // ADR-0054: Google OAuth ID token verification, replacing the
@@ -1645,6 +1685,8 @@ impl<E: ExchangePort + IncomePort + 'static, S: Store + 'static> Daemon<E, S> {
             // after cutover — see ADR-0054 migration plan.
             legacy_api_token: self.config.api.legacy_api_token.clone(),
             funding: self.config.funding.clone(),
+            funding_route_mode: self.funding_worker_route().1,
+            venue_feed,
         });
 
         let router = create_router(state);
@@ -1955,6 +1997,217 @@ mod tests {
         let response = client.get(format!("http://{}/health", addr)).send().await.unwrap();
 
         assert!(response.status().is_success());
+    }
+
+    // -------------------------------------------------------------------------
+    // ADR-0056 §3: Daemon::with_venue
+    // -------------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn with_venue_wires_the_feed_and_chart_history_of_that_venue() {
+        let venue = Arc::new(robson_exec::StubExchange::new(dec!(95000)));
+        let feed: Arc<dyn TradeFeedPort> = Arc::new(StubTradeFeed::new());
+        let ohlcv: Arc<dyn OhlcvPort> = Arc::new(robson_exec::StubOhlcv::default());
+
+        let daemon = Daemon::with_venue(
+            Config::test(),
+            Arc::clone(&venue),
+            Arc::clone(&feed),
+            Arc::clone(&ohlcv),
+        );
+
+        assert!(Arc::ptr_eq(&daemon.exchange, &venue));
+        assert!(Arc::ptr_eq(&daemon.market_data, &feed));
+        let manager = daemon.position_manager.read().await;
+        assert_eq!(manager.venue_id(), venue.id());
+        assert!(Arc::ptr_eq(&manager.ohlcv_port(), &ohlcv));
+    }
+
+    #[tokio::test]
+    async fn with_venue_drives_a_stub_venue_through_the_daemon_path() {
+        use robson_domain::Symbol;
+
+        let venue = Arc::new(robson_exec::StubExchange::new(dec!(100)));
+        let feed = Arc::new(StubTradeFeed::new());
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+
+        // An Active position the venue also reports, so every startup gate
+        // passes: the stop at 99 is what the feed will cross.
+        let daemon = Daemon::with_venue(
+            Config::test(),
+            Arc::clone(&venue),
+            feed.clone(),
+            Arc::new(robson_exec::StubOhlcv::default()),
+        );
+        let store = Arc::clone(&daemon.store);
+        let mut position = active_position(symbol.clone(), Side::Long);
+        position.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(
+            Price::new(dec!(100)).unwrap(),
+            Price::new(dec!(99)).unwrap(),
+        ));
+        let position_id = position.id;
+        store.positions().save(&position).await.unwrap();
+        venue.set_open_position(
+            symbol.clone(),
+            Side::Long,
+            position.quantity,
+            position.entry_price.unwrap(),
+        );
+
+        let tick = Price::new(dec!(98)).unwrap();
+        let exit_reached_the_venue = async {
+            for _ in 0..500 {
+                feed.push(&symbol, tick);
+                tokio::time::sleep(Duration::from_millis(10)).await;
+                if venue.market_order_call_count() > 0 {
+                    return true;
+                }
+            }
+            false
+        };
+
+        tokio::select! {
+            result = daemon.run() => panic!("the daemon stopped on its own: {result:?}"),
+            reached = exit_reached_the_venue => assert!(
+                reached,
+                "a tick through the venue's feed must reach the position and exit on the venue"
+            ),
+        }
+
+        let stored = store.positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert!(
+            !matches!(stored.state, PositionState::Active { .. }),
+            "the stop was crossed: {:?}",
+            stored.state
+        );
+    }
+
+    #[tokio::test]
+    async fn the_funding_worker_keeps_a_route_whatever_the_selected_venue_exposes() {
+        fn daemon_on(
+            venue: robson_exec::StubExchange,
+        ) -> Daemon<robson_exec::StubExchange, MemoryStore> {
+            Daemon::with_venue(
+                Config::test(),
+                Arc::new(venue),
+                Arc::new(StubTradeFeed::new()),
+                Arc::new(robson_exec::StubOhlcv::default()),
+            )
+        }
+        let funded = || robson_exec::StubExchange::new(dec!(95000));
+        let no_funding = || funded().without_funding();
+
+        // The selected venue has funding: today's worker, on that venue.
+        let daemon = daemon_on(funded());
+        let (route, mode) = daemon.funding_worker_route();
+        assert_eq!(mode, FundingRouteMode::Selected);
+        assert!(Arc::ptr_eq(&route, &daemon.exchange));
+
+        // No funding: the worker recovers older sagas on the original route.
+        let original = Arc::new(funded());
+        let daemon =
+            daemon_on(no_funding()).with_funding_recovery_route(Some(Arc::clone(&original)));
+        let (route, mode) = daemon.funding_worker_route();
+        assert_eq!(mode, FundingRouteMode::Recovery);
+        assert!(Arc::ptr_eq(&route, &original));
+
+        // Original credentials missing: still a worker, visibly blocked.
+        let (_, mode) = daemon_on(no_funding()).funding_worker_route();
+        assert_eq!(mode, FundingRouteMode::Blocked);
+
+        // A route that cannot fund is no route.
+        let daemon =
+            daemon_on(no_funding()).with_funding_recovery_route(Some(Arc::new(no_funding())));
+        let (_, mode) = daemon.funding_worker_route();
+        assert_eq!(mode, FundingRouteMode::Blocked);
+    }
+
+    // A simulator must not execute or create a persisted funding saga: these go
+    // through the factory, the only way a runtime stub is built.
+
+    fn daemon_from_factory(config: Config) -> Daemon<crate::venue::VenueRuntime, MemoryStore> {
+        let parts = match crate::venue::VenueFactory::build(&config) {
+            Ok(parts) => parts,
+            Err(error) => panic!("expected a venue: {error}"),
+        };
+        Daemon::with_venue(config, parts.venue, parts.market_data, parts.ohlcv)
+            .with_funding_recovery_route(parts.funding_recovery)
+    }
+
+    fn factory_config(
+        venue: crate::config::VenueSelection,
+        credentials: bool,
+        use_testnet: bool,
+        environment: crate::config::Environment,
+    ) -> Config {
+        let mut config = Config::test();
+        config.venue = venue;
+        config.environment = environment;
+        config.binance.use_testnet = use_testnet;
+        if credentials {
+            config.binance.api_key = Some("key-fixture".to_string());
+            config.binance.api_secret = Some("secret-fixture".to_string());
+        }
+        config
+    }
+
+    #[test]
+    fn a_factory_stub_never_selects_itself_as_the_funding_route() {
+        use crate::config::{Environment::*, VenueSelection::*};
+
+        let cases = [
+            // No credentials to reach the real route: blocked.
+            (Stub, false, false, Development, FundingRouteMode::Blocked, "stub"),
+            (Stub, false, true, Development, FundingRouteMode::Blocked, "stub"),
+            (Unset, false, false, Development, FundingRouteMode::Blocked, "stub"),
+            (Unset, false, false, Production, FundingRouteMode::Blocked, "stub"),
+            // Credentials the environment markers refuse: blocked.
+            (Stub, true, false, Development, FundingRouteMode::Blocked, "stub"),
+            (Unset, true, false, Development, FundingRouteMode::Blocked, "stub"),
+            // The real route's credentials are usable: recovery on that route.
+            (Stub, true, true, Development, FundingRouteMode::Recovery, "binance:usdm"),
+            // A real venue keeps its own funding surface.
+            (Unset, true, false, Production, FundingRouteMode::Selected, "binance:usdm"),
+            (Unset, true, true, Development, FundingRouteMode::Selected, "binance:usdm"),
+            (BinanceUsdm, true, false, Production, FundingRouteMode::Selected, "binance:usdm"),
+        ];
+        for (selection, credentials, use_testnet, environment, mode, route_id) in cases {
+            let case = format!("{selection:?} {credentials} {use_testnet} {environment:?}");
+            let daemon = daemon_from_factory(factory_config(
+                selection,
+                credentials,
+                use_testnet,
+                environment,
+            ));
+            let (route, route_mode) = daemon.funding_worker_route();
+            assert_eq!(route_mode, mode, "{case}");
+            assert_eq!(route.id().as_str(), route_id, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_factory_stub_serves_no_endpoint_that_creates_a_saga() {
+        use crate::config::{Environment::Development, VenueSelection::*};
+
+        for selection in [Stub, Unset] {
+            let daemon = daemon_from_factory(factory_config(selection, false, false, Development));
+            let addr = daemon.start_api_server().await.unwrap();
+            let client = reqwest::Client::new();
+
+            for path in [
+                "/funding/quote",
+                "/funding/execute",
+                "/funding/recover-spot-usdt-to-futures",
+            ] {
+                let response = client
+                    .post(format!("http://{addr}{path}"))
+                    .json(&serde_json::json!({ "asset": "USDT", "execute": true }))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 405, "{selection:?} {path}");
+            }
+        }
     }
 
     #[tokio::test]

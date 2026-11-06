@@ -24,6 +24,7 @@
 //! - **Event Bus**: Internal communication (detector → engine, market data)
 //! - **API**: HTTP endpoints for CLI interaction
 //! - **Config**: Environment-based configuration
+//! - **Venue**: Factory for the venue selected by `ROBSON_VENUE`
 //!
 //! # Example
 //!
@@ -58,6 +59,7 @@ pub mod query_engine;
 pub mod reconciliation_worker;
 mod sse;
 pub mod startup_recovery;
+pub mod venue;
 
 #[cfg(feature = "postgres")]
 pub mod income_ledger;
@@ -73,12 +75,12 @@ pub use auth::{AuthError, GoogleAuthConfig, GoogleClaims};
 pub use circuit_breaker::{CircuitBreaker, HaltState, MonthlyHaltSnapshot};
 pub use config::{
     ApiConfig, BinanceConfig, Config, EngineConfig, Environment, FundingConfig, MarketDataConfig,
-    ProjectionConfig, ReconciliationConfig, StartupStaleActivePolicy,
+    ProjectionConfig, ReconciliationConfig, StartupStaleActivePolicy, VenueSelection,
 };
 pub use daemon::Daemon;
 pub use detector::{DetectorConfig, DetectorTask};
 pub use error::{exit_code_for_daemon_error, DaemonError, DaemonResult};
-pub use event_bus::{DaemonEvent, EventBus, EventReceiver, MarketData, OrderFill};
+pub use event_bus::{DaemonEvent, EventBus, EventReceiver, FeedKey, MarketData, OrderFill};
 pub use google_jwks::GoogleJwksCache;
 #[cfg(feature = "postgres")]
 pub use income_ledger::IncomeLedgerWorker;
@@ -97,4 +99,4 @@ pub use query_engine::{
     TracingQueryRecorder,
 };
 pub use reconciliation_worker::ReconciliationWorker;
-pub use robson_connectors::binance::usdm::{BinanceExchangeAdapter, BinanceOhlcvAdapter};
+pub use venue::{VenueFactory, VenueParts, VenueRuntime};
