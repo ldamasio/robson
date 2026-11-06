@@ -9,6 +9,12 @@
 //! `ROBSON_VENUE` unset keeps the historical selection, including the fallback
 //! to the stub exchange when credentials are absent or refused. An explicit
 //! value never falls through to another venue.
+//!
+//! The stub built here exposes no funding surface. Funding sagas are durable
+//! and shared through the database, and a simulator must not create or execute
+//! one: a real saga resumed on simulated balances would skip its transfer and
+//! persist a false `REFRESHED`, and a simulated saga could later be resumed by
+//! a real venue.
 
 use std::sync::Arc;
 
@@ -223,7 +229,8 @@ pub struct VenueParts {
     /// `None` when it uses no credentials.
     pub credential: Option<Exchange>,
     /// Where an older unfinished funding saga is recovered when the venue has
-    /// no funding surface (see [`funding_recovery_route`]).
+    /// no funding surface; `None` leaves it blocked (see
+    /// [`funding_recovery_route`]).
     pub funding_recovery: Option<Arc<VenueRuntime>>,
 }
 
@@ -279,8 +286,9 @@ impl VenueFactory {
     }
 }
 
+/// The runtime stub. No funding surface: see the module docs.
 fn stub_venue() -> VenueRuntime {
-    VenueRuntime::Stub(Box::new(StubExchange::new(dec!(95000))))
+    VenueRuntime::Stub(Box::new(StubExchange::new(dec!(95000)).without_funding()))
 }
 
 /// The credential identity USDⓈ-M may run on: credentials plus an environment
@@ -489,6 +497,24 @@ mod tests {
         assert!(error.contains("ROBSON_VENUE=stub"), "{error}");
     }
 
+    #[test]
+    fn every_factory_stub_has_no_funding_surface() {
+        for (selection, credentials) in [
+            (VenueSelection::Stub, false),
+            (VenueSelection::Stub, true),
+            (VenueSelection::Unset, false),
+            // Credentials refused by the environment markers: the same stub.
+            (VenueSelection::Unset, true),
+        ] {
+            let venue =
+                built(&config(selection, credentials, false, Environment::Development)).venue;
+            assert_eq!(venue.id().as_str(), "stub");
+            assert!(venue.funding().is_none(), "{selection:?} {credentials}");
+            assert!(!venue.capabilities().has_funding, "{selection:?} {credentials}");
+            assert!(capability_mismatches(venue.as_ref()).is_empty());
+        }
+    }
+
     #[tokio::test]
     async fn the_runtime_forwards_to_the_venue_it_holds() {
         let symbol = Symbol::from_pair("BTCUSDT").unwrap();
@@ -530,12 +556,12 @@ mod tests {
 
     #[test]
     fn funding_recovery_route_is_the_implied_usdm_route_when_credentials_allow() {
-        let no_funding =
-            VenueRuntime::Stub(Box::new(StubExchange::new(dec!(95000)).without_funding()));
+        let no_funding = stub_venue();
 
         // A venue with funding recovers its own sagas.
         let usdm_config = config(VenueSelection::Unset, true, false, Environment::Production);
-        assert!(funding_recovery_route(&stub_venue(), &usdm_config).is_none());
+        let funded = VenueRuntime::Stub(Box::new(StubExchange::new(dec!(95000))));
+        assert!(funding_recovery_route(&funded, &usdm_config).is_none());
 
         for use_testnet in [false, true] {
             let config = config(VenueSelection::Unset, true, use_testnet, Environment::Production);

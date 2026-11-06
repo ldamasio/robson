@@ -53,7 +53,7 @@ use crate::{
     config::FundingConfig,
     error::DaemonError,
     event_bus::{EventBus, FeedKey},
-    funding::{CapitalRefreshResponse, ExecuteFundingRequest},
+    funding::{CapitalRefreshResponse, ExecuteFundingRequest, FundingRouteMode},
     position_manager::{PositionManager, PriceCache},
     sse::{map_daemon_event, resync_required_event},
 };
@@ -85,6 +85,9 @@ pub struct ApiState<E: ExchangePort + 'static, S: Store + 'static> {
     /// this legacy value, alongside Google ID token verification.
     pub legacy_api_token: Option<String>,
     pub funding: FundingConfig,
+    /// How the funding worker treats unfinished sagas, so the funding views
+    /// report what holds them.
+    pub funding_route_mode: FundingRouteMode,
     /// What `/readyz.venue` reads about the venue's feed.
     pub(crate) venue_feed: VenueFeedView,
 }
@@ -817,7 +820,8 @@ where
         state.exchange.clone(),
         state.position_manager.clone(),
         state.funding.clone(),
-    ))
+    )
+    .with_route_mode(state.funding_route_mode))
 }
 
 #[cfg(feature = "postgres")]
@@ -3190,6 +3194,7 @@ mod tests {
             google_auth: None,
             legacy_api_token: None,
             funding: FundingConfig::default(),
+            funding_route_mode: FundingRouteMode::Selected,
             venue_feed: VenueFeedView::default(),
         })
     }
@@ -3646,6 +3651,7 @@ mod tests {
             google_auth: None,
             legacy_api_token: None,
             funding: FundingConfig::default(),
+            funding_route_mode: FundingRouteMode::Selected,
             venue_feed: VenueFeedView::default(),
         });
 
@@ -3687,6 +3693,7 @@ mod tests {
             google_auth,
             legacy_api_token: None,
             funding: FundingConfig::default(),
+            funding_route_mode: FundingRouteMode::Selected,
             venue_feed: VenueFeedView::default(),
         });
 
@@ -5141,6 +5148,7 @@ mod tests {
                 google_auth: None,
                 legacy_api_token: Some("secret-token-123".to_string()),
                 funding: FundingConfig::default(),
+                funding_route_mode: FundingRouteMode::Selected,
                 venue_feed: VenueFeedView::default(),
             });
 

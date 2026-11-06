@@ -1,5 +1,8 @@
 #[cfg(feature = "postgres")]
-use std::sync::Arc;
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 
 #[cfg(feature = "postgres")]
 use chrono::{Duration, Utc};
@@ -28,7 +31,7 @@ use uuid::Uuid;
 #[cfg(feature = "postgres")]
 use super::types::{
     ExecuteFundingResponse, FundingEventView, FundingQuote, FundingQuoteItem, FundingRouteMode,
-    FundingSagaSummary, FundingSagaView, FundingState,
+    FundingSagaSummary, FundingSagaView, FundingState, FUNDING_BLOCKED_EVENT,
 };
 #[cfg(feature = "postgres")]
 use crate::{
@@ -48,6 +51,10 @@ pub struct FundingService<E: ExchangePort + 'static, S: Store + 'static> {
     position_manager: Arc<RwLock<PositionManager<E, S>>>,
     config: FundingConfig,
     route_mode: FundingRouteMode,
+    /// Sagas whose blocking this service has already put on record, so a poll
+    /// neither queries the event log nor logs again. Bounded by the tenant's
+    /// non-terminal sagas.
+    blocked_on_record: Mutex<HashSet<Uuid>>,
 }
 
 #[cfg(feature = "postgres")]
@@ -66,6 +73,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
             position_manager,
             config,
             route_mode: FundingRouteMode::Selected,
+            blocked_on_record: Mutex::new(HashSet::new()),
         }
     }
 
@@ -345,11 +353,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
 
         Ok(rows
             .into_iter()
-            .map(|row| FundingSagaSummary {
-                saga_id: row.get("saga_id"),
-                state: row.get("state"),
-                estimated_usdt: row.get("estimated_usdt"),
-                created_at: row.get("created_at"),
+            .map(|row| {
+                let state: String = row.get("state");
+                FundingSagaSummary {
+                    saga_id: row.get("saga_id"),
+                    blocked_reason: self.route_mode.blocking_reason(&state).map(str::to_string),
+                    state,
+                    estimated_usdt: row.get("estimated_usdt"),
+                    created_at: row.get("created_at"),
+                }
             })
             .collect())
     }
@@ -369,7 +381,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
         .fetch_all(&*self.pool)
         .await?;
 
-        if !rows.is_empty() {
+        if !rows.is_empty() && self.route_mode != FundingRouteMode::Blocked {
             tracing::info!(count = rows.len(), "Funding worker found non-terminal sagas");
         }
 
@@ -386,13 +398,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
                     }
                     continue;
                 }
-                if self.route_mode == FundingRouteMode::Blocked {
-                    tracing::error!(
-                        %saga_id,
-                        %state,
-                        "Funding saga blocked: the selected venue has no funding surface and the \
-                         original route's credentials are missing; liabilities retained"
-                    );
+                if let Some(reason) = self.route_mode.blocking_reason(&state) {
+                    if let Err(err) = self.record_blocked(saga_id, &state, reason).await {
+                        tracing::error!(%saga_id, %err, "Funding saga blocking record failed");
+                    }
                     continue;
                 }
             }
@@ -404,6 +413,78 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
             resumed += 1;
         }
         Ok(resumed)
+    }
+
+    /// Put on record that this route holds `saga_id`: one durable event per
+    /// saga, surviving restarts, and one error log per process, never one per
+    /// poll. The saga's own state is not written: it stays non-terminal.
+    async fn record_blocked(&self, saga_id: Uuid, state: &str, reason: &str) -> DaemonResult<()> {
+        if self
+            .blocked_on_record
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .contains(&saga_id)
+        {
+            return Ok(());
+        }
+
+        let stream = stream_key(saga_id);
+        let recorded = robson_eventlog::query_events(
+            &self.pool,
+            QueryOptions::new(self.tenant_id)
+                .stream(stream.clone())
+                .event_type(FUNDING_BLOCKED_EVENT)
+                .limit(1),
+        )
+        .await
+        .map_err(|e| DaemonError::EventLog(e.to_string()))?;
+        if recorded.is_empty() {
+            let mut event = Event::new(
+                self.tenant_id,
+                stream.clone(),
+                FUNDING_BLOCKED_EVENT,
+                json!({ "reason": reason }),
+            )
+            .with_actor(ActorType::Daemon, Some("funding-saga".to_string()));
+            event.workflow_id = Some(saga_id);
+            event.command_id = Some(Uuid::new_v4());
+            append_event(&self.pool, &stream, None, event)
+                .await
+                .map_err(|e| DaemonError::EventLog(e.to_string()))?;
+        }
+
+        tracing::error!(
+            %saga_id,
+            %state,
+            %reason,
+            "Funding saga blocked: the selected venue has no funding surface and the original \
+             route's credentials are missing; liabilities retained"
+        );
+        self.blocked_on_record.lock().unwrap_or_else(|e| e.into_inner()).insert(saga_id);
+        Ok(())
+    }
+
+    /// Refresh `robsond_funding_sagas_blocked`. Only a blocked route holds
+    /// sagas, so any other route reports zero without a query. Counted apart
+    /// from the resume scan, whose page size would otherwise cap it.
+    pub async fn refresh_blocked_gauge(&self) -> DaemonResult<()> {
+        let blocked = if self.route_mode == FundingRouteMode::Blocked {
+            sqlx::query_scalar::<_, i64>(
+                r#"
+                SELECT COUNT(*)
+                FROM funding_sagas
+                WHERE tenant_id = $1
+                  AND state NOT IN ('QUOTED', 'REFRESHED', 'FAILED')
+                "#,
+            )
+            .bind(self.tenant_id)
+            .fetch_one(&*self.pool)
+            .await?
+        } else {
+            0
+        };
+        crate::metrics::FUNDING_SAGAS_BLOCKED.set(blocked);
+        Ok(())
     }
 
     async fn expire_unstarted_quote(&self, saga_id: Uuid) -> DaemonResult<()> {
@@ -500,9 +581,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> FundingService<E, S> {
         })
         .collect();
 
+        let state: String = row.get("state");
         Ok(FundingSagaView {
             saga_id,
-            state: row.get("state"),
+            blocked_reason: self.route_mode.blocking_reason(&state).map(str::to_string),
+            state,
             items: quote.items,
             events,
             updated_at: row.get("updated_at"),

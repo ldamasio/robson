@@ -20,6 +20,8 @@
 //! - `robsond_budget_model_shadow_slots_delta` — dormant ADR-0051 NFS slots
 //!   minus HWM slots
 //! - `robsond_market_data_ws_failures_total` — failed WS attempts by endpoint
+//! - `robsond_funding_sagas_blocked` — started funding sagas no route can
+//!   progress
 //! - `robsond_sse_connections` — currently connected SSE clients on `/events`
 //! - `robsond_sse_events_total` — public SSE events sent, labelled by event
 //!   type
@@ -28,8 +30,8 @@
 use std::sync::LazyLock;
 
 use prometheus::{
-    self, register_counter, register_counter_vec, register_gauge, register_gauge_vec, Counter,
-    CounterVec, Gauge, GaugeVec,
+    self, register_counter, register_counter_vec, register_gauge, register_gauge_vec,
+    register_int_gauge, Counter, CounterVec, Gauge, GaugeVec, IntGauge,
 };
 
 /// Total completed engine cycles (each market tick processed).
@@ -263,6 +265,16 @@ pub static BUDGET_MODEL_SHADOW_SLOTS_DELTA: LazyLock<Gauge> = LazyLock::new(|| {
         "Net-from-start monthly budget slots minus HWM slots"
     )
     .expect("failed to register robsond_budget_model_shadow_slots_delta")
+});
+
+/// Started funding sagas held because no route has a funding surface (ADR-0056
+/// §3). Refreshed on every funding worker poll, so it returns to zero.
+pub static FUNDING_SAGAS_BLOCKED: LazyLock<IntGauge> = LazyLock::new(|| {
+    register_int_gauge!(
+        "robsond_funding_sagas_blocked",
+        "Started funding sagas no route can progress"
+    )
+    .expect("failed to register robsond_funding_sagas_blocked")
 });
 
 /// Market data mode per feed (0 = WS, 1 = REST fallback) — ADR-0044.

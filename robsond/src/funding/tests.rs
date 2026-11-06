@@ -16,10 +16,17 @@ use sqlx::PgPool;
 use tokio::sync::RwLock;
 use uuid::Uuid;
 
-use super::{FundingRouteMode, FundingService, FundingState};
+use super::{
+    FundingRouteMode, FundingService, FundingState, FUNDING_BLOCKED_EVENT,
+    FUNDING_ROUTE_UNAVAILABLE,
+};
 use crate::{
-    config::FundingConfig, event_bus::EventBus, position_manager::PositionManager,
+    config::{Config, FundingConfig, VenueSelection},
+    daemon::Daemon,
+    event_bus::EventBus,
+    position_manager::PositionManager,
     query_engine::TracingQueryRecorder,
+    venue::{VenueFactory, VenueRuntime},
 };
 
 struct TestFundingService<E: ExchangePort + 'static, S: Store + 'static> {
@@ -619,10 +626,13 @@ async fn saga_without_its_original_credentials_stays_visibly_blocked(
 
     assert_eq!(worker.resume_non_terminal().await?, 0);
 
-    assert_eq!(worker.get(saga_id).await?.state, FundingState::Transferring.as_str());
+    let view = worker.get(saga_id).await?;
+    assert_eq!(view.state, FundingState::Transferring.as_str());
+    assert_eq!(view.blocked_reason.as_deref(), Some(FUNDING_ROUTE_UNAVAILABLE));
     let listed = worker.list().await?;
     assert_eq!(listed.len(), 1);
     assert_eq!(listed[0].state, FundingState::Transferring.as_str());
+    assert_eq!(listed[0].blocked_reason.as_deref(), Some(FUNDING_ROUTE_UNAVAILABLE));
     assert_eq!(original.transfer_call_count(), transfers_before);
     assert_eq!(selected.transfer_call_count(), 0);
     assert_eq!(selected.spot_order_call_count(), 0);
@@ -681,6 +691,141 @@ async fn no_new_saga_on_a_venue_without_a_funding_surface(pool: PgPool) -> anyho
 
     assert!(harness.service.quote().await.is_err());
     assert!(harness.service.list().await?.is_empty(), "the refused quote must leave no saga");
+
+    Ok(())
+}
+
+fn blocked_event_count(view: &super::FundingSagaView) -> usize {
+    view.events
+        .iter()
+        .filter(|event| event.event_type == FUNDING_BLOCKED_EVENT)
+        .count()
+}
+
+/// The daemon `main` builds for `venue` on a real store: factory, then
+/// `with_venue_and_recovery`. Nothing else decides the funding route.
+fn daemon_from_factory(
+    pool: PgPool,
+    venue: VenueSelection,
+    tenant_id: Uuid,
+) -> Daemon<VenueRuntime, MemoryStore> {
+    let mut config = Config::test();
+    config.venue = venue;
+    config.projection.tenant_id = Some(tenant_id);
+    let parts = match VenueFactory::build(&config) {
+        Ok(parts) => parts,
+        Err(error) => panic!("expected a venue: {error}"),
+    };
+    Daemon::with_venue_and_recovery(
+        config,
+        parts.venue,
+        parts.market_data,
+        parts.ohlcv,
+        None,
+        Some(Arc::new(pool)),
+    )
+    .with_funding_recovery_route(parts.funding_recovery)
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "Requires DATABASE_URL"]
+async fn a_factory_stub_never_completes_a_persisted_saga(pool: PgPool) -> anyhow::Result<()> {
+    for venue in [VenueSelection::Stub, VenueSelection::Unset] {
+        // A real saga, stopped before its transfer. Simulated balances are
+        // empty, so running it on the stub would skip the transfer and persist
+        // REFRESHED from simulated capital.
+        let original = configured_exchange();
+        let (tenant_id, saga_id) = unfinished_saga_on(pool.clone(), Arc::clone(&original)).await?;
+
+        let daemon = daemon_from_factory(pool.clone(), venue, tenant_id);
+        let worker = daemon.funding_worker_service().expect("the worker exists with a store");
+        for _ in 0..3 {
+            assert_eq!(worker.resume_non_terminal().await?, 0, "{venue:?}");
+        }
+
+        let view = worker.get(saga_id).await?;
+        assert_eq!(view.state, FundingState::Transferring.as_str(), "{venue:?}");
+        assert_eq!(view.blocked_reason.as_deref(), Some(FUNDING_ROUTE_UNAVAILABLE), "{venue:?}");
+        assert_eq!(blocked_event_count(&view), 1, "once, not once per poll: {venue:?}");
+        assert_eq!(original.transfer_call_count(), 0, "{venue:?}");
+
+        // A restart keeps the single event on record.
+        let restarted = daemon.funding_worker_service().expect("worker");
+        assert_eq!(restarted.resume_non_terminal().await?, 0, "{venue:?}");
+        assert_eq!(blocked_event_count(&restarted.get(saga_id).await?), 1, "{venue:?}");
+
+        // The read endpoints report what holds the saga.
+        let addr = daemon.start_api_server().await?;
+        let client = reqwest::Client::new();
+        let listed: serde_json::Value =
+            client.get(format!("http://{addr}/funding")).send().await?.json().await?;
+        assert_eq!(listed[0]["state"], "TRANSFERRING", "{venue:?}");
+        assert_eq!(listed[0]["blocked_reason"], FUNDING_ROUTE_UNAVAILABLE, "{venue:?}");
+        let detail: serde_json::Value = client
+            .get(format!("http://{addr}/funding/{saga_id}"))
+            .send()
+            .await?
+            .json()
+            .await?;
+        assert_eq!(detail["state"], "TRANSFERRING", "{venue:?}");
+        assert_eq!(detail["blocked_reason"], FUNDING_ROUTE_UNAVAILABLE, "{venue:?}");
+    }
+
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "Requires DATABASE_URL"]
+async fn a_factory_stub_creates_no_saga(pool: PgPool) -> anyhow::Result<()> {
+    for venue in [VenueSelection::Stub, VenueSelection::Unset] {
+        let daemon = daemon_from_factory(pool.clone(), venue, Uuid::new_v4());
+        let worker = daemon.funding_worker_service().expect("the worker exists with a store");
+
+        assert!(worker.quote().await.is_err(), "{venue:?}");
+        assert!(worker.list().await?.is_empty(), "{venue:?}");
+    }
+
+    Ok(())
+}
+
+/// The only test that writes the process-wide gauge, so parallel DB tests
+/// cannot disturb it: they call `resume_non_terminal`, which does not touch it.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "Requires DATABASE_URL"]
+async fn blocked_gauge_counts_held_sagas_and_returns_to_zero(pool: PgPool) -> anyhow::Result<()> {
+    let gauge = || crate::metrics::FUNDING_SAGAS_BLOCKED.get();
+    let original = configured_exchange();
+    let (tenant_id, saga_id) = unfinished_saga_on(pool.clone(), Arc::clone(&original)).await?;
+    let selected = venue_without_funding();
+
+    let blocked = worker_service_after_switch(
+        pool.clone(),
+        tenant_id,
+        Arc::clone(&selected),
+        &selected,
+        FundingRouteMode::Blocked,
+    );
+    blocked.refresh_blocked_gauge().await?;
+    assert_eq!(gauge(), 1);
+
+    // A route that can progress the saga holds nothing.
+    let recovery = worker_service_after_switch(
+        pool.clone(),
+        tenant_id,
+        Arc::clone(&original),
+        &selected,
+        FundingRouteMode::Recovery,
+    );
+    recovery.refresh_blocked_gauge().await?;
+    assert_eq!(gauge(), 0);
+    blocked.refresh_blocked_gauge().await?;
+    assert_eq!(gauge(), 1);
+
+    // The blocked route's own count returns to zero when the saga finishes.
+    assert_eq!(recovery.resume_non_terminal().await?, 1);
+    assert_eq!(recovery.get(saga_id).await?.state, FundingState::Refreshed.as_str());
+    blocked.refresh_blocked_gauge().await?;
+    assert_eq!(gauge(), 0);
 
     Ok(())
 }

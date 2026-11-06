@@ -14,9 +14,26 @@ pub enum FundingRouteMode {
     /// expires, and the selected venue's engine capital is left alone.
     Recovery,
     /// No route has a funding surface (the original credentials are missing):
-    /// nothing is sent, and sagas stay visibly non-terminal with their
-    /// liabilities retained.
+    /// nothing is sent, and started sagas stay non-terminal with their
+    /// liabilities retained and their blocking on record.
     Blocked,
+}
+
+/// Why a [`FundingRouteMode::Blocked`] route holds a saga.
+pub const FUNDING_ROUTE_UNAVAILABLE: &str = "funding_route_unavailable";
+
+/// Event type recording, once per saga, that a route holds it.
+pub const FUNDING_BLOCKED_EVENT: &str = "FundingBlocked";
+
+impl FundingRouteMode {
+    /// Why this route holds a saga in `state`, if it does. A saga that never
+    /// started or already finished carries no liability to hold.
+    pub fn blocking_reason(self, state: &str) -> Option<&'static str> {
+        let holds_liabilities = state != FundingState::Quoted.as_str()
+            && state != FundingState::Refreshed.as_str()
+            && state != FundingState::Failed.as_str();
+        (self == Self::Blocked && holds_liabilities).then_some(FUNDING_ROUTE_UNAVAILABLE)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -93,6 +110,9 @@ pub struct FundingEventView {
 pub struct FundingSagaView {
     pub saga_id: Uuid,
     pub state: String,
+    /// Why the saga cannot progress on the current route. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
     pub items: Vec<FundingQuoteItem>,
     pub events: Vec<FundingEventView>,
     pub updated_at: DateTime<Utc>,
@@ -102,6 +122,9 @@ pub struct FundingSagaView {
 pub struct FundingSagaSummary {
     pub saga_id: Uuid,
     pub state: String,
+    /// Why the saga cannot progress on the current route. Absent otherwise.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub blocked_reason: Option<String>,
     pub estimated_usdt: Decimal,
     pub created_at: DateTime<Utc>,
 }
@@ -120,4 +143,68 @@ pub struct ExecuteFundingResponse {
 #[derive(Debug, Clone, Serialize)]
 pub struct CapitalRefreshResponse {
     pub capital: Decimal,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn only_a_blocked_route_holds_a_started_unfinished_saga() {
+        let started = [
+            FundingState::Converting,
+            FundingState::Converted,
+            FundingState::Transferring,
+            FundingState::Settled,
+        ];
+        for state in started {
+            assert_eq!(
+                FundingRouteMode::Blocked.blocking_reason(state.as_str()),
+                Some(FUNDING_ROUTE_UNAVAILABLE),
+                "{state:?}"
+            );
+            assert_eq!(FundingRouteMode::Selected.blocking_reason(state.as_str()), None);
+            assert_eq!(FundingRouteMode::Recovery.blocking_reason(state.as_str()), None);
+        }
+        for state in [
+            FundingState::Quoted,
+            FundingState::Refreshed,
+            FundingState::Failed,
+        ] {
+            assert_eq!(
+                FundingRouteMode::Blocked.blocking_reason(state.as_str()),
+                None,
+                "{state:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_blocking_reason_is_additive_on_the_funding_views() {
+        let mut summary = FundingSagaSummary {
+            saga_id: Uuid::nil(),
+            state: FundingState::Transferring.as_str().to_string(),
+            blocked_reason: None,
+            estimated_usdt: Decimal::ONE,
+            created_at: DateTime::<Utc>::MIN_UTC,
+        };
+
+        // An unblocked saga serializes exactly as it did before the field.
+        let unblocked = serde_json::to_value(&summary).unwrap();
+        assert!(unblocked.get("blocked_reason").is_none());
+        let keys = ["created_at", "estimated_usdt", "saga_id", "state"];
+        let mut found: Vec<&str> =
+            unblocked.as_object().unwrap().keys().map(String::as_str).collect();
+        found.sort_unstable();
+        assert_eq!(found, keys);
+
+        summary.blocked_reason = Some(FUNDING_ROUTE_UNAVAILABLE.to_string());
+        let blocked = serde_json::to_value(&summary).unwrap();
+        assert_eq!(blocked["blocked_reason"], FUNDING_ROUTE_UNAVAILABLE);
+        assert_eq!(blocked["state"], "TRANSFERRING", "the state itself does not change");
+
+        // Older payloads still parse.
+        let parsed: FundingSagaSummary = serde_json::from_value(unblocked).unwrap();
+        assert_eq!(parsed.blocked_reason, None);
+    }
 }

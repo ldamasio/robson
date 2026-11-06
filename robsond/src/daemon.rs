@@ -294,8 +294,9 @@ impl Daemon<StubExchange, MemoryStore> {
     }
 
     /// Create a new stub daemon with optional projection recovery and shared
-    /// pool.
-    #[cfg(feature = "postgres")]
+    /// pool. Test fixture: this stub exposes funding, which a runtime stub on a
+    /// real database must not (`VenueFactory`).
+    #[cfg(all(test, feature = "postgres"))]
     pub fn new_stub_with_recovery(
         config: Config,
         projection_recovery: Option<Arc<dyn ProjectionRecovery>>,
@@ -540,7 +541,6 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     /// The route the funding worker runs on and how it treats unfinished sagas
     /// there (ADR-0056 §3). The worker exists whatever the selected venue
     /// exposes: an older saga is never left without one.
-    #[cfg_attr(not(feature = "postgres"), allow(dead_code))]
     fn funding_worker_route(&self) -> (Arc<E>, FundingRouteMode) {
         if self.exchange.funding().is_some() {
             return (Arc::clone(&self.exchange), FundingRouteMode::Selected);
@@ -551,6 +551,27 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             },
             _ => (Arc::clone(&self.exchange), FundingRouteMode::Blocked),
         }
+    }
+
+    /// The funding worker's service, whenever a funding store is configured.
+    #[cfg(feature = "postgres")]
+    pub(crate) fn funding_worker_service(&self) -> Option<FundingService<E, S>> {
+        let (Some(pool), Some(tenant_id)) = (&self.pg_pool, self.config.projection.tenant_id)
+        else {
+            return None;
+        };
+        let (route, route_mode) = self.funding_worker_route();
+        info!(venue = %route.id(), ?route_mode, "Starting funding worker");
+        Some(
+            FundingService::new(
+                pool.clone(),
+                tenant_id,
+                route,
+                Arc::clone(&self.position_manager),
+                self.config.funding.clone(),
+            )
+            .with_route_mode(route_mode),
+        )
     }
 
     /// Get a reference to the store (for testing).
@@ -750,19 +771,7 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         let projection_handle: Option<tokio::task::JoinHandle<()>> = None;
 
         #[cfg(feature = "postgres")]
-        let funding_handle = if let (Some(pool), Some(tenant_id)) =
-            (&self.pg_pool, self.config.projection.tenant_id)
-        {
-            let (route, route_mode) = self.funding_worker_route();
-            info!(venue = %route.id(), ?route_mode, "Starting funding worker");
-            let service = FundingService::new(
-                pool.clone(),
-                tenant_id,
-                route,
-                Arc::clone(&self.position_manager),
-                self.config.funding.clone(),
-            )
-            .with_route_mode(route_mode);
+        let funding_handle = if let Some(service) = self.funding_worker_service() {
             let worker = FundingWorker::new(service);
             let worker_shutdown = shutdown.clone();
             Some(tokio::spawn(async move {
@@ -1676,6 +1685,7 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             // after cutover — see ADR-0054 migration plan.
             legacy_api_token: self.config.api.legacy_api_token.clone(),
             funding: self.config.funding.clone(),
+            funding_route_mode: self.funding_worker_route().1,
             venue_feed,
         });
 
@@ -2110,6 +2120,94 @@ mod tests {
             daemon_on(no_funding()).with_funding_recovery_route(Some(Arc::new(no_funding())));
         let (_, mode) = daemon.funding_worker_route();
         assert_eq!(mode, FundingRouteMode::Blocked);
+    }
+
+    // A simulator must not execute or create a persisted funding saga: these go
+    // through the factory, the only way a runtime stub is built.
+
+    fn daemon_from_factory(config: Config) -> Daemon<crate::venue::VenueRuntime, MemoryStore> {
+        let parts = match crate::venue::VenueFactory::build(&config) {
+            Ok(parts) => parts,
+            Err(error) => panic!("expected a venue: {error}"),
+        };
+        Daemon::with_venue(config, parts.venue, parts.market_data, parts.ohlcv)
+            .with_funding_recovery_route(parts.funding_recovery)
+    }
+
+    fn factory_config(
+        venue: crate::config::VenueSelection,
+        credentials: bool,
+        use_testnet: bool,
+        environment: crate::config::Environment,
+    ) -> Config {
+        let mut config = Config::test();
+        config.venue = venue;
+        config.environment = environment;
+        config.binance.use_testnet = use_testnet;
+        if credentials {
+            config.binance.api_key = Some("key-fixture".to_string());
+            config.binance.api_secret = Some("secret-fixture".to_string());
+        }
+        config
+    }
+
+    #[test]
+    fn a_factory_stub_never_selects_itself_as_the_funding_route() {
+        use crate::config::{Environment::*, VenueSelection::*};
+
+        let cases = [
+            // No credentials to reach the real route: blocked.
+            (Stub, false, false, Development, FundingRouteMode::Blocked, "stub"),
+            (Stub, false, true, Development, FundingRouteMode::Blocked, "stub"),
+            (Unset, false, false, Development, FundingRouteMode::Blocked, "stub"),
+            (Unset, false, false, Production, FundingRouteMode::Blocked, "stub"),
+            // Credentials the environment markers refuse: blocked.
+            (Stub, true, false, Development, FundingRouteMode::Blocked, "stub"),
+            (Unset, true, false, Development, FundingRouteMode::Blocked, "stub"),
+            // The real route's credentials are usable: recovery on that route.
+            (Stub, true, true, Development, FundingRouteMode::Recovery, "binance:usdm"),
+            // A real venue keeps its own funding surface.
+            (Unset, true, false, Production, FundingRouteMode::Selected, "binance:usdm"),
+            (Unset, true, true, Development, FundingRouteMode::Selected, "binance:usdm"),
+            (BinanceUsdm, true, false, Production, FundingRouteMode::Selected, "binance:usdm"),
+        ];
+        for (selection, credentials, use_testnet, environment, mode, route_id) in cases {
+            let case = format!("{selection:?} {credentials} {use_testnet} {environment:?}");
+            let daemon = daemon_from_factory(factory_config(
+                selection,
+                credentials,
+                use_testnet,
+                environment,
+            ));
+            let (route, route_mode) = daemon.funding_worker_route();
+            assert_eq!(route_mode, mode, "{case}");
+            assert_eq!(route.id().as_str(), route_id, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_factory_stub_serves_no_endpoint_that_creates_a_saga() {
+        use crate::config::{Environment::Development, VenueSelection::*};
+
+        for selection in [Stub, Unset] {
+            let daemon = daemon_from_factory(factory_config(selection, false, false, Development));
+            let addr = daemon.start_api_server().await.unwrap();
+            let client = reqwest::Client::new();
+
+            for path in [
+                "/funding/quote",
+                "/funding/execute",
+                "/funding/recover-spot-usdt-to-futures",
+            ] {
+                let response = client
+                    .post(format!("http://{addr}{path}"))
+                    .json(&serde_json::json!({ "asset": "USDT", "execute": true }))
+                    .send()
+                    .await
+                    .unwrap();
+                assert_eq!(response.status(), 405, "{selection:?} {path}");
+            }
+        }
     }
 
     #[tokio::test]
