@@ -156,7 +156,11 @@ FundingPort                      optional (spot→derivatives conversion feature
   spot_balances / spot_price / spot_symbol_is_trading / place_spot_market_order / spot_order
   transfer / transfer_history
 
-MarketDataPort, OhlcvPort        required; built by the same factory; every PriceUpdate / Candle carries VenueId
+TradeFeedPort, OhlcvPort         required; built by the same factory, one port per venue. TradeFeedPort is one connection
+                                 attempt, because the venue-neutral reconnect loop, watchdog and REST fallback stay in
+                                 robsond and must see each attempt. The market data manager stamps its VenueId on MarketData
+                                 (FeedKey { venue, symbol }); PriceUpdate and Candle stay venue-free. The older
+                                 MarketDataPort is not used by the daemon
 
 trait Venue: TradingPort + AccountPort {
   fn id(&self) -> &VenueId;
@@ -270,8 +274,9 @@ commission.
 
 ### 3. Adapter relocation and construction by configuration
 
-- `robsond/src/{binance_exchange,binance_ohlcv}.rs` and the futures WebSocket wiring in `market_data.rs` move to
-  `robson-connectors/src/binance/usdm/` (mechanical; `normalize_market_quantity` moves unchanged).
+- `robsond/src/{binance_exchange,binance_ohlcv}.rs` (step 1) and the futures WebSocket wiring in `market_data.rs`
+  (endpoints, subscription and wire decoding, step 3) move to `robson-connectors/src/binance/usdm/` (mechanical;
+  `normalize_market_quantity` moves unchanged).
 - `Daemon<E: Venue + 'static, S: Store + 'static>`; `Daemon::with_venue(config, venue, market_data, ohlcv)`. A
   `VenueFactory` in `robsond` is the only place that names a concrete adapter; it builds the venue, its feeds and its
   credential scope from `ROBSON_VENUE` (`binance_usdm` today, `binance_spot` next, `stub` for tests). **New** funding sagas and the
@@ -286,9 +291,31 @@ commission.
   account observation fresh; today's adapter `health_check` (a public ping) is not sufficient.
 - **Feed isolation** (prerequisite for a second venue): `MarketData` events, detector subscriptions and the price cache
   are keyed by `(VenueId, Symbol)`; the existing watchdog, its 90 s default and its fallback-exit hysteresis
-  (`market_data.rs:68,253`) are preserved unchanged by the relocation and become per venue; on reconnect the venue resyncs
-  from a REST snapshot anchored at the last applied tick; a leg's technical analysis uses its own venue's OHLCV. No feed
-  timing changes in this ADR.
+  (`market_data.rs:68,253`) are preserved unchanged by the relocation and become per venue; a leg's technical analysis
+  uses its own venue's OHLCV. No feed timing changes in this ADR's mechanical steps. A reconnect resync from a REST
+  snapshot anchored at the last applied tick is required, but is staged below because it does change feed behaviour.
+
+**What step 3 delivers and what is staged.** Each staged item has an owner and blocks that owner's step:
+
+- **Funding route.** Steps 1–4 have no migration, so a saga's route is not yet persisted. Step 3 runs one worker and treats
+  every unfinished saga's route as the implied `binance:usdm` on this process's credentials, with `FundingRouteMode`:
+  `Selected` (as before), `Recovery` (the selected venue has no funding; finishes started sagas on the implied route,
+  expires unstarted quotes, never touches the selected venue's capital) and `Blocked` (the route's credentials are
+  unusable; writes nothing, liabilities retained). Evidence for `Blocked` is `blocked_reason` on the funding views and the
+  gauge `robsond_funding_sagas_blocked`. **Owner of durable per-saga routing and per-route workers: step 7**, whose legacy
+  mapping must also account for sagas a simulator created earlier on the same database.
+- **Simulated venues.** A factory-built stub has no funding surface, so it can neither create nor execute a persisted saga.
+- **Conversion exclusion.** Excluding governed inventory and reserving conversion quantities is not delivered. It is
+  unreachable while every real selectable venue has funding, but `Recovery` on a spot venue would act on the execution
+  wallet: `current_spot_usdt()` transfers all free spot USDT, which there is quote cash. **Owner: step 8, before
+  activation**, covering recovery work too; refusing recovery while spot is selected is the acceptable alternative.
+- **`eligible`.** `/readyz.venue` computes only valuation freshness today and reports `rules`, `costs` and
+  `account_observation` freshness as untracked reasons, so it reads `false`. **Owner: the steps producing that evidence, and
+  step 8 activation requires all of it.**
+- **Reconnect resync and feed properties.** Today a reconnect takes no snapshot; REST polling starts only after the
+  watchdog's 90 s of silence with a risk-open position, and subscriptions follow the configured symbols rather than the
+  active `(venue, symbol)` set. Step 8 inherits this behaviour. **Owner: a separate reviewed change, before a second
+  venue**, together with the §10 feed property tests.
 
 ### 4. Domain cleanup with stable encodings
 
@@ -426,9 +453,9 @@ account exists.
 
 | Step | Content | Behaviour | Rollback boundary |
 |------|---------|-----------|-------------------|
-| 1 | Mechanical relocation of the two adapters and the futures WS wiring into `robson-connectors`; `ExchangePort` unchanged | preserving | revert alone while nothing else imports the new paths; afterwards revert together with its dependants |
+| 1 | Mechanical relocation of the two adapters into `robson-connectors` (the futures WS wiring moved in step 3); `ExchangePort` unchanged | preserving | revert alone while nothing else imports the new paths; afterwards revert together with its dependants |
 | 2 | New port contracts (§2) + USDⓈ-M adapter implementing them; legacy `ExchangePort` kept as a forwarding compatibility layer; separate `unrealized_pnl` field added, `wallet_balance` untouched | preserving | revert 2 (and 3 if merged) |
-| 3 | `VenueFactory`, `with_venue`, feed injection with `(VenueId, Symbol)` keys, additive `/readyz.venue` | preserving for execution; additive for readiness consumers | revert alone |
+| 3 | `VenueFactory`, `with_venue`, `TradeFeedPort` and the WS wiring relocation, feed injection with `(VenueId, Symbol)` keys, additive `/readyz.venue`, funding route modes (§3 lists what is staged) | preserving for execution with `ROBSON_VENUE` unset and usable credentials; additive for readiness consumers; stub paths lose their funding surface | revert alone |
 | 4 | Rust naming and endpoint cleanup with stable event, `Position` and credential encodings; fixtures | preserving | revert alone |
 | 5 | Accounting: governed equity derived once; month-boundary basis uses ADR-0051 §3 cost-priced downside; **migration** for persisted carried bases with compatible settlement attribution and replay handling; atomic reset | **changing** (basis, persisted state version) | once new accounting state is written, rollback needs demonstrated reader/writer compatibility of the older binary with that state, or a verified book free of risk-bearing and unsettled liabilities; keeping `capital_base` alone is insufficient |
 | 6 | Quantisation and metadata rules (§5) with before/after fixtures per order kind | **changing** | revert alone only with a verified empty book (the old helper is incompatible with spot lots) |
@@ -553,9 +580,10 @@ Budget model for multi-venue:
 
 ## Implementation Notes
 
-- Step 1: `robsond/src/{binance_exchange,binance_ohlcv,market_data,daemon,main}.rs` → `robson-connectors/src/binance/usdm/*`.
+- Step 1: `robsond/src/{binance_exchange,binance_ohlcv,daemon,main}.rs` → `robson-connectors/src/binance/usdm/*`.
 - Step 2: `robson-exec/src/{ports,executor,stub}.rs`, `robson-connectors/src/binance/usdm/exchange.rs`, `robson-testkit`.
-- Step 3: `robsond/src/{daemon,main,config,api,market_data,event_bus,position_manager}.rs`.
+- Step 3: `robsond/src/{venue,daemon,main,config,api,market_data,event_bus,position_manager}.rs`, `robsond/src/funding/`,
+  `robson-connectors/src/binance/usdm/market_data.rs`, `robson-exec/src/ports.rs` (`TradeFeedPort`).
 - Step 4: `robson-domain/src/{credentials,entities,events,lib}.rs`, `robson-engine/src/lib.rs`, `robson-store/src/memory.rs`, fixtures.
 - Step 5: `robsond/src/daemon.rs` (boundary), `robson-domain` (carried basis), migration for persisted carried bases
   and settlement attribution, persisted-state version bump.
@@ -618,3 +646,7 @@ Budget model for multi-venue:
   step 7 obligations added. No risk number or sequencing changed. Codex REQUEST_CHANGES on the alignment, 2 P2: the
   failure-mode table still promised resolution by lookup, and Consequences did not state that `Unknown` legs can hold
   admission capacity indefinitely. Both applied; Codex **APPROVE** on the result.
+- v9 (2026-11-06): §2, §3 and §8 aligned with step 3 as implemented after Codex rounds 1–2 on
+  `refactor/venue-step3-factory` (APPROVE on round 2). Codex required the delivered contracts recorded and every omission
+  staged with an owner: durable saga routing (step 7), conversion exclusion and `eligible` inputs (step 8), reconnect resync
+  and feed properties (separate change before a second venue). No risk number or operator decision changed.
