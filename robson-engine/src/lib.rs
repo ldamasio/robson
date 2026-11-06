@@ -655,7 +655,7 @@ impl Engine {
     /// * `filled_quantity` - Actual filled quantity
     /// * `fee` - Trading fee paid (from OrderResult)
     /// * `filled_at` - When the fill occurred (from exchange, not local clock)
-    /// * `binance_position_id` - Optional Binance USD-M Futures position ID
+    /// * `exchange_position_id` - Optional exchange-assigned position ID
     /// * `invalidation_guard_level` - Entry-time invalidation guard level
     ///   (ADR-0042), sourced from the detector signal/audit. Carried onto the
     ///   `Active` state and the `EntryFilled` event so the executable stop
@@ -679,7 +679,7 @@ impl Engine {
         filled_quantity: Quantity,
         fee: rust_decimal::Decimal,
         filled_at: DateTime<Utc>,
-        binance_position_id: Option<String>,
+        exchange_position_id: Option<String>,
         invalidation_guard_level: Option<Price>,
     ) -> Result<EngineDecision, EngineError> {
         self.process_entry_fill_with_rules(
@@ -688,7 +688,7 @@ impl Engine {
             filled_quantity,
             fee,
             filled_at,
-            binance_position_id,
+            exchange_position_id,
             invalidation_guard_level,
             None,
         )
@@ -705,7 +705,7 @@ impl Engine {
         filled_quantity: Quantity,
         fee: rust_decimal::Decimal,
         filled_at: DateTime<Utc>,
-        binance_position_id: Option<String>,
+        exchange_position_id: Option<String>,
         invalidation_guard_level: Option<Price>,
         rules: Option<&SymbolTradingRules>,
     ) -> Result<EngineDecision, EngineError> {
@@ -852,7 +852,7 @@ impl Engine {
                 fee,
                 initial_stop: initial_trailing_stop,
                 invalidation_guard_level,
-                binance_position_id,
+                exchange_position_id,
                 timestamp: filled_at,
             }),
             // Place a reduce-only protective stop on the exchange at the

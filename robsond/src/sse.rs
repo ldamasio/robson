@@ -325,7 +325,7 @@ mod tests {
             position_id: Uuid::now_v7(),
             symbol: test_symbol(),
             side: Side::Long,
-            binance_position_id: "binance-123".to_string(),
+            exchange_position_id: "binance-123".to_string(),
         })
         .unwrap();
         assert_eq!(position_opened.event_type, "position.opened");
@@ -453,7 +453,7 @@ mod tests {
             position_id: Uuid::now_v7(),
             symbol: test_symbol(),
             side: Side::Long,
-            binance_position_id: "binance-123".to_string(),
+            exchange_position_id: "binance-123".to_string(),
         })
         .unwrap();
         assert!(position_opened.payload["position_id"].as_str().is_some());

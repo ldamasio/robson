@@ -69,8 +69,11 @@ pub struct Position {
     /// held in `PositionState::Active` so the reconciliation worker can read it
     /// without a state match.
     pub insurance_stop_id: Option<String>,
-    /// Binance exchange identifier captured on entry fill for reconciliation.
-    pub binance_position_id: Option<String>,
+    /// Exchange-assigned position identifier captured on entry fill for
+    /// reconciliation. Serialized as `binance_position_id`, the stable wire
+    /// name (ADR-0056 §4).
+    #[serde(rename = "binance_position_id")]
+    pub exchange_position_id: Option<String>,
 
     /// Stop-policy version pinned at arm time (issue #154). Missing on wire
     /// data written before versioning = `LegacyUncapped`; the policy never
@@ -148,7 +151,7 @@ impl Position {
             entry_order_id: None,
             exit_order_id: None,
             insurance_stop_id: None,
-            binance_position_id: None,
+            exchange_position_id: None,
             stop_policy,
             stop_buffer_bps_at_arm,
             stop_plan_entry_reference: None,

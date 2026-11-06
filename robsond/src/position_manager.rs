@@ -3652,7 +3652,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         filled_quantity: Quantity,
         fee: Decimal,
         filled_at: chrono::DateTime<chrono::Utc>,
-        binance_position_id: Option<String>,
+        exchange_position_id: Option<String>,
     ) -> DaemonResult<()> {
         // Load position
         let position = self
@@ -3677,14 +3677,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let trading_rules = self.trading_rules_for(&position).await;
 
         // Use engine to process fill (pure: State+Fill → Decision)
-        // binance_position_id is passed through to EntryFilled event
+        // exchange_position_id is passed through to EntryFilled event
         let decision = self.engine.lock().unwrap().process_entry_fill_with_rules(
             &position,
             fill_price,
             filled_quantity,
             fee,
             filled_at,
-            binance_position_id.clone(),
+            exchange_position_id.clone(),
             invalidation_guard_level,
             trading_rules.as_ref(),
         )?;
@@ -3707,7 +3707,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             timestamp: chrono::Utc::now(),
         });
 
-        let core_exchange_id = binance_position_id.unwrap_or_else(|| {
+        let core_exchange_id = exchange_position_id.unwrap_or_else(|| {
             warn!(
                 %position_id,
                 "Missing binance_position_id on Core open; using position_id fallback"
@@ -3719,7 +3719,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             position_id,
             symbol: position.symbol.clone(),
             side: position.side,
-            binance_position_id: core_exchange_id,
+            exchange_position_id: core_exchange_id,
         });
 
         Ok(())
