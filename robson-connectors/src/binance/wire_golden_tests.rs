@@ -18,7 +18,10 @@ use tokio::{
 };
 
 use crate::{
-    binance::usdm::{BinanceExchangeAdapter, BinanceOhlcvAdapter},
+    binance::{
+        usdm::{BinanceExchangeAdapter, BinanceOhlcvAdapter},
+        Endpoints,
+    },
     binance_rest::BinanceRestClient,
 };
 
@@ -128,6 +131,9 @@ async fn universal_transfer_type_on_the_wire_is_stable() {
 #[test]
 fn rest_base_urls_are_stable() {
     let golden = golden();
-    assert_eq!(Exchange::Binance.base_url(), golden["rest_base_url"]["binance"]);
-    assert_eq!(Exchange::BinanceTestnet.base_url(), golden["rest_base_url"]["binance_testnet"]);
+    assert_eq!(Endpoints::base_url(Exchange::Binance), golden["rest_base_url"]["binance"]);
+    assert_eq!(
+        Endpoints::base_url(Exchange::BinanceTestnet),
+        golden["rest_base_url"]["binance_testnet"]
+    );
 }
