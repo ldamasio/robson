@@ -618,13 +618,15 @@ impl CandleInterval {
 /// historical chart data before computing chart-derived stop levels.
 ///
 /// Implementations:
-/// - `BinanceOhlcvAdapter` in `robsond` — fetches from Binance REST klines
+/// - `BinanceOhlcvAdapter` in `robson_connectors::binance::usdm` — fetches from
+///   Binance REST klines
 /// - Stub for testing — configurable candle sequences
 ///
 /// # Hexagonal placement
 ///
-/// This port is defined in `robson-exec` (the ports layer). The concrete
-/// adapter belongs in `robsond` (composition root). `robson-engine` never
+/// This port is defined in `robson-exec` (the ports layer). Concrete adapters
+/// are implemented in `robson-connectors` (`binance::usdm::ohlcv`) and
+/// constructed by `robsond` (composition root). `robson-engine` never
 /// depends on this port directly — callers fetch candles first, then pass
 /// `Vec<Candle>` into the pure analyzer.
 #[async_trait]

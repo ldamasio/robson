@@ -7,9 +7,10 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use robson_connectors::{BinanceRestClient, BinanceRestError};
 use robson_domain::{Candle, Symbol};
 use robson_exec::{CandleInterval, ExecError, OhlcvPort};
+
+use crate::binance_rest::{BinanceRestClient, BinanceRestError};
 
 /// Binance adapter for historical candlestick data.
 pub struct BinanceOhlcvAdapter {

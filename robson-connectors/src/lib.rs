@@ -6,6 +6,7 @@
 #![warn(clippy::all)]
 
 // Public modules
+pub mod binance;
 pub mod binance_rest;
 pub mod binance_ws;
 
