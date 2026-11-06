@@ -10,7 +10,10 @@ use chrono::{DateTime, Utc};
 use robson_domain::{Candle, Symbol};
 use robson_exec::{CandleInterval, ExecError, OhlcvPort};
 
-use crate::binance_rest::{BinanceRestClient, BinanceRestError};
+use crate::{
+    binance::wire,
+    binance_rest::{BinanceRestClient, BinanceRestError},
+};
 
 /// Binance adapter for historical candlestick data.
 pub struct BinanceOhlcvAdapter {
@@ -50,7 +53,7 @@ impl OhlcvPort for BinanceOhlcvAdapter {
     ) -> Result<Vec<Candle>, ExecError> {
         let klines = self
             .client
-            .get_futures_klines(&symbol.as_pair(), interval.as_binance_str(), limit)
+            .get_futures_klines(&symbol.as_pair(), wire::candle_interval(interval), limit)
             .await
             .map_err(Self::map_error)?;
 

@@ -2,6 +2,7 @@
 
 mod endpoints;
 pub mod usdm;
+mod wire;
 
 pub use endpoints::Endpoints;
 
