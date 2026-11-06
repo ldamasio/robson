@@ -2922,6 +2922,7 @@ mod tests {
                 balance: FuturesBalance {
                     wallet_balance,
                     available_balance: wallet_balance,
+                    unrealized_pnl: Decimal::ZERO,
                 },
             });
             (exchange, calls)

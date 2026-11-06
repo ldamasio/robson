@@ -36,11 +36,13 @@
 
 #![warn(clippy::all)]
 
+mod compat;
 pub mod error;
 pub mod executor;
 pub mod intent;
 pub mod ports;
 pub mod stub;
+pub mod venue;
 
 // Re-exports for convenience
 pub use error::{ExecError, ExecResult};

@@ -56,9 +56,15 @@ pub enum BinanceRestError {
     #[error("HTTP request failed: {0}")]
     RequestFailed(String),
 
-    /// API returned error
+    /// API returned error. Produced for any non-success HTTP status with a
+    /// JSON error body, so `http_status` is what tells a 4xx from a 5xx; it
+    /// stays out of the message and of the error mapping.
     #[error("Binance API error: {code} - {msg}")]
-    ApiError { code: i64, msg: String },
+    ApiError {
+        code: i64,
+        msg: String,
+        http_status: u16,
+    },
 
     /// Failed to parse response
     #[error("Failed to parse response: {0}")]
@@ -91,6 +97,9 @@ pub struct BinanceRestClient {
     api_secret: String,
     /// Use testnet
     testnet: bool,
+    /// Test seam: serve every endpoint from a local listener.
+    #[cfg(test)]
+    local_base_url: Option<String>,
 }
 
 impl BinanceRestClient {
@@ -101,6 +110,8 @@ impl BinanceRestClient {
             api_key,
             api_secret,
             testnet: false,
+            #[cfg(test)]
+            local_base_url: None,
         }
     }
 
@@ -111,6 +122,17 @@ impl BinanceRestClient {
             api_key,
             api_secret,
             testnet: true,
+            #[cfg(test)]
+            local_base_url: None,
+        }
+    }
+
+    /// Client whose every request goes to a local test listener.
+    #[cfg(test)]
+    pub(crate) fn with_local_base_url(base_url: String) -> Self {
+        Self {
+            local_base_url: Some(base_url),
+            ..Self::new("key".to_string(), "secret".to_string())
         }
     }
 
@@ -132,6 +154,10 @@ impl BinanceRestClient {
     }
 
     fn endpoint_base_url(&self, endpoint: &str) -> &str {
+        #[cfg(test)]
+        if let Some(local) = &self.local_base_url {
+            return local;
+        }
         if endpoint.starts_with("/fapi/") {
             self.base_url()
         } else {
@@ -194,7 +220,11 @@ impl BinanceRestClient {
 
         if !status.is_success() {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
-                return Err(BinanceRestError::ApiError { code: err.code, msg: err.msg });
+                return Err(BinanceRestError::ApiError {
+                    code: err.code,
+                    msg: err.msg,
+                    http_status: status.as_u16(),
+                });
             }
             return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
         }
@@ -227,7 +257,11 @@ impl BinanceRestClient {
 
         if !status.is_success() {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
-                return Err(BinanceRestError::ApiError { code: err.code, msg: err.msg });
+                return Err(BinanceRestError::ApiError {
+                    code: err.code,
+                    msg: err.msg,
+                    http_status: status.as_u16(),
+                });
             }
             return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
         }
@@ -260,7 +294,11 @@ impl BinanceRestClient {
 
         if !status.is_success() {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
-                return Err(BinanceRestError::ApiError { code: err.code, msg: err.msg });
+                return Err(BinanceRestError::ApiError {
+                    code: err.code,
+                    msg: err.msg,
+                    http_status: status.as_u16(),
+                });
             }
             return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
         }
@@ -293,7 +331,11 @@ impl BinanceRestClient {
 
         if !status.is_success() {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
-                return Err(BinanceRestError::ApiError { code: err.code, msg: err.msg });
+                return Err(BinanceRestError::ApiError {
+                    code: err.code,
+                    msg: err.msg,
+                    http_status: status.as_u16(),
+                });
             }
             return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
         }
@@ -453,6 +495,22 @@ impl BinanceRestClient {
         serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
     }
 
+    /// Query an algo order by client algo id.
+    ///
+    /// `GET /fapi/v1/algoOrder` (signed) with `clientAlgoId`. A not-found is
+    /// returned as the raw API error; the caller applies the venue's finality
+    /// rule.
+    pub async fn query_algo_order_by_client_id(
+        &self,
+        client_algo_id: &str,
+    ) -> Result<BinanceAlgoOrderDetail, BinanceRestError> {
+        let params = vec![("clientAlgoId", client_algo_id.to_string())];
+
+        let body = self.get_signed("/fapi/v1/algoOrder", params).await?;
+
+        serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
+    }
+
     /// Cancel an open order.
     ///
     /// `DELETE /fapi/v1/order`
@@ -542,6 +600,26 @@ impl BinanceRestClient {
         let params = vec![
             ("symbol", symbol.to_string()),
             ("orderId", order_id.to_string()),
+        ];
+
+        let body = self.get_signed("/fapi/v1/order", params).await?;
+
+        serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))
+    }
+
+    /// Query order status by client order id.
+    ///
+    /// `GET /fapi/v1/order` (signed) with `origClientOrderId`. A not-found is
+    /// returned as the raw `-2013` API error; the caller applies the venue's
+    /// finality rule.
+    pub async fn get_order_status_by_client_id(
+        &self,
+        symbol: &str,
+        client_order_id: &str,
+    ) -> Result<BinanceOrderResponse, BinanceRestError> {
+        let params = vec![
+            ("symbol", symbol.to_string()),
+            ("origClientOrderId", client_order_id.to_string()),
         ];
 
         let body = self.get_signed("/fapi/v1/order", params).await?;
@@ -697,18 +775,7 @@ impl BinanceRestClient {
     /// Returns per-asset balances. This method extracts the USDT entry.
     pub async fn get_futures_balance(&self) -> Result<BinanceFuturesBalance, BinanceRestError> {
         let body = self.get_signed("/fapi/v2/balance", vec![]).await?;
-
-        let balances: Vec<BinanceBalanceResponse> =
-            serde_json::from_str(&body).map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
-
-        let usdt = balances.into_iter().find(|b| b.asset == "USDT").ok_or_else(|| {
-            BinanceRestError::ParseError("No USDT entry in futures balance response".to_string())
-        })?;
-
-        Ok(BinanceFuturesBalance {
-            wallet_balance: usdt.balance,
-            available_balance: usdt.availableBalance,
-        })
+        parse_futures_balance(&body)
     }
 
     pub async fn get_spot_account_balances(
@@ -1158,6 +1225,10 @@ struct BinanceBalanceResponse {
     asset: String,
     balance: Decimal,
     availableBalance: Decimal,
+    /// Unrealized P&L of cross-margin positions. Defaulted so a response
+    /// without it never fails the balance fetch.
+    #[serde(default)]
+    crossUnPnl: Decimal,
 }
 
 /// Individual user trade from Binance USD-M futures.
@@ -1215,10 +1286,14 @@ pub struct BinanceIncome {
 /// Parsed USDT-M futures balance for the USDT asset.
 #[derive(Debug, Clone)]
 pub struct BinanceFuturesBalance {
-    /// Total wallet balance (includes unrealized PnL).
+    /// Binance `balance` (wallet balance). Mapping unchanged (ADR-0056 §2.4);
+    /// the separate `unrealized_pnl` is reported next to it.
     pub wallet_balance: Decimal,
     /// Balance available for new positions.
     pub available_balance: Decimal,
+    /// Binance `crossUnPnl`: unrealized P&L of cross-margin positions
+    /// (isolated positions report theirs in `positionRisk`).
+    pub unrealized_pnl: Decimal,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -1315,6 +1390,22 @@ pub struct BinanceUniversalTransfer {
     pub transfer_type: String,
     pub status: String,
     pub timestamp: i64,
+}
+
+/// Extract the USDT entry of a `/fapi/v2/balance` response.
+pub(crate) fn parse_futures_balance(body: &str) -> Result<BinanceFuturesBalance, BinanceRestError> {
+    let balances: Vec<BinanceBalanceResponse> =
+        serde_json::from_str(body).map_err(|e| BinanceRestError::ParseError(e.to_string()))?;
+
+    let usdt = balances.into_iter().find(|b| b.asset == "USDT").ok_or_else(|| {
+        BinanceRestError::ParseError("No USDT entry in futures balance response".to_string())
+    })?;
+
+    Ok(BinanceFuturesBalance {
+        wallet_balance: usdt.balance,
+        available_balance: usdt.availableBalance,
+        unrealized_pnl: usdt.crossUnPnl,
+    })
 }
 
 fn parse_futures_klines(body: &str) -> Result<Vec<BinanceKline>, BinanceRestError> {
@@ -1611,6 +1702,21 @@ mod tests {
 
         assert_eq!(usdt.balance, dec!(122607.35137903));
         assert_eq!(usdt.availableBalance, dec!(23.72469206));
+        assert_eq!(usdt.crossUnPnl, dec!(0));
+    }
+
+    #[test]
+    fn test_balance_response_maps_unrealized_pnl_separately() {
+        let body = r#"[{"asset": "USDT", "balance": "1000.5", "crossUnPnl": "-12.25",
+                        "availableBalance": "900"}, {"asset": "BNB", "balance": "1",
+                        "availableBalance": "1"}]"#;
+
+        let balances: Vec<BinanceBalanceResponse> = serde_json::from_str(body).unwrap();
+
+        // wallet_balance keeps mapping `balance`; unrealized P&L is separate,
+        // and a response without `crossUnPnl` still parses (as zero).
+        assert_eq!((balances[0].balance, balances[0].crossUnPnl), (dec!(1000.5), dec!(-12.25)));
+        assert_eq!((balances[1].balance, balances[1].crossUnPnl), (dec!(1), dec!(0)));
     }
 
     #[test]

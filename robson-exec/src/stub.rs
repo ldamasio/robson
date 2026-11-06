@@ -4,8 +4,9 @@
 //! without making real API calls.
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{HashMap, HashSet, VecDeque},
     sync::RwLock,
+    time::Duration,
 };
 
 use async_trait::async_trait;
@@ -16,10 +17,16 @@ use rust_decimal::Decimal;
 use crate::{
     error::ExecError,
     ports::{
-        CandleInterval, ExchangePort, ExchangePosition, FuturesBalance, FuturesSettings,
-        IncomePort, IncomeRecord, MarketDataPort, OhlcvPort, OpenOrderRecord, OrderResult,
-        PriceUpdate, SpotBalance, SpotOrder, SpotOrderQuantity, SpotOrderRequest, SpotOrderSide,
-        StopCancelOutcome, Transfer, TransferId, UniversalTransferType, UserTradeRecord,
+        CandleInterval, ExchangePosition, FuturesBalance, FuturesSettings, IncomeRecord,
+        MarketDataPort, OhlcvPort, OpenOrderRecord, OrderResult, PriceUpdate, SpotBalance,
+        SpotOrder, SpotOrderQuantity, SpotOrderRequest, SpotOrderSide, Transfer, TransferId,
+        UniversalTransferType, UserTradeRecord,
+    },
+    venue::{
+        self, AccountKind, Cash, EntryOrReduce, ExecutionCostEnvelope, FeeAssetPolicy,
+        FundingTerms, Mark, MarketKind, OrderLookup, PlacedStop, ProtectionKind, ReplaceOutcome,
+        ReplacementProtocol, StopCancelOutcome, StopParams, StopRef, SubmitAttemptLedger,
+        VenueCapabilities, VenueFinalityRule, VenueId,
     },
 };
 
@@ -49,11 +56,57 @@ pub struct StubStopOrder {
     pub placed_at: DateTime<Utc>,
 }
 
+/// Bound on each stub order history and on its submit-attempt evidence. The
+/// stub also backs the daemon's stub runtime, which can run indefinitely.
+const STUB_HISTORY_CAPACITY: usize = 4096;
+
+/// Insertion-ordered map of at most `capacity` entries; the oldest is dropped
+/// when full. A lookup whose record was dropped falls through to the attempt
+/// evidence and reads `Unknown`: the attempt behind an accepted order never
+/// resolves as rejected.
+struct BoundedHistory<V> {
+    capacity: usize,
+    entries: HashMap<String, V>,
+    order: VecDeque<String>,
+}
+
+impl<V> BoundedHistory<V> {
+    fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            entries: HashMap::new(),
+            order: VecDeque::new(),
+        }
+    }
+
+    fn insert(&mut self, key: String, value: V) {
+        if !self.entries.contains_key(&key) {
+            if self.order.len() >= self.capacity {
+                if let Some(oldest) = self.order.pop_front() {
+                    self.entries.remove(&oldest);
+                }
+            }
+            self.order.push_back(key.clone());
+        }
+        self.entries.insert(key, value);
+    }
+
+    fn get(&self, key: &str) -> Option<&V> {
+        self.entries.get(key)
+    }
+
+    fn values(&self) -> impl Iterator<Item = &V> {
+        self.entries.values()
+    }
+}
+
 /// Stub exchange for testing.
 ///
 /// Simulates immediate fills at a configured price.
 /// Default configuration: One-way position mode, 1x leverage.
 pub struct StubExchange {
+    /// Venue id (`stub`).
+    venue_id: VenueId,
     /// Current prices by symbol
     prices: RwLock<HashMap<String, Decimal>>,
     /// Default price for unknown symbols
@@ -72,6 +125,18 @@ pub struct StubExchange {
     open_positions: RwLock<HashMap<String, ExchangePosition>>,
     /// Simulated futures account balance.
     futures_balance: RwLock<Decimal>,
+    /// Simulated unrealized P&L reported next to the wallet balance.
+    unrealized_pnl: RwLock<Decimal>,
+    /// Market orders accepted via `place_market_order` or
+    /// `close_position_market`, keyed by client id, for `order_by_client_id`
+    /// (ADR-0056). Bounded.
+    client_orders: RwLock<BoundedHistory<OrderResult>>,
+    /// Submit-attempt evidence per client id (placements, accepted or not).
+    /// Bounded; in memory, see its restart limitation.
+    submit_attempts: SubmitAttemptLedger,
+    /// Protective stops cancelled on the stub, keyed by algo id, so lookups
+    /// by client id still see them as terminal. Bounded.
+    cancelled_stop_orders: RwLock<BoundedHistory<StubStopOrder>>,
     /// Simulated regular orders retrievable by `get_order_by_exchange_id`.
     orders: RwLock<HashMap<String, OrderResult>>,
     /// Simulated user trades retrievable by `get_user_trades_since`.
@@ -93,6 +158,9 @@ pub struct StubExchange {
     /// When set, the next reduce-only market order is rejected the way the
     /// exchange refuses to reduce an already-flat position (Binance -2022).
     reject_reduce_only_next: RwLock<bool>,
+    /// When set, the next market order or protective stop is authoritatively
+    /// rejected by the simulated venue.
+    reject_order_next: RwLock<bool>,
     /// Futures market orders attempted via `place_market_order`, rejected or
     /// not, so tests can assert how many exit attempts reached the exchange.
     market_order_calls: RwLock<u64>,
@@ -111,7 +179,12 @@ impl StubExchange {
     /// Default futures settings: position_mode="One-way",
     /// leverage=RiskConfig::LEVERAGE Default futures balance: 10,000 USDT.
     pub fn new(default_price: Decimal) -> Self {
+        Self::with_history_capacity(default_price, STUB_HISTORY_CAPACITY)
+    }
+
+    pub(crate) fn with_history_capacity(default_price: Decimal, capacity: usize) -> Self {
         Self {
+            venue_id: VenueId::new(STUB_VENUE_ID),
             prices: RwLock::new(HashMap::new()),
             default_price,
             fee_rate: Decimal::new(1, 3), // 0.001 = 0.1%
@@ -121,6 +194,10 @@ impl StubExchange {
             futures_settings: RwLock::new(("One-way".to_string(), RiskConfig::LEVERAGE)),
             open_positions: RwLock::new(HashMap::new()),
             futures_balance: RwLock::new(Decimal::from(10000)),
+            unrealized_pnl: RwLock::new(Decimal::ZERO),
+            client_orders: RwLock::new(BoundedHistory::new(capacity)),
+            submit_attempts: SubmitAttemptLedger::new(capacity),
+            cancelled_stop_orders: RwLock::new(BoundedHistory::new(capacity)),
             orders: RwLock::new(HashMap::new()),
             user_trades: RwLock::new(HashMap::new()),
             spot_balances: RwLock::new(HashMap::new()),
@@ -133,6 +210,7 @@ impl StubExchange {
             filled_stop_orders: RwLock::new(HashMap::new()),
             income_records: RwLock::new(Vec::new()),
             reject_reduce_only_next: RwLock::new(false),
+            reject_order_next: RwLock::new(false),
             market_order_calls: RwLock::new(0),
             trading_rules: RwLock::new(HashMap::new()),
             trading_rules_calls: RwLock::new(HashMap::new()),
@@ -184,14 +262,15 @@ impl StubExchange {
         prices.get(symbol).copied().unwrap_or(self.default_price)
     }
 
-    /// Configure the next operation to fail.
+    /// Configure the next operation to fail. For a placement this simulates
+    /// an indeterminate outcome: the attempt stays unresolved.
     pub fn set_fail_next(&self, fail: bool) {
         let mut fail_next = self.fail_next.write().unwrap();
         *fail_next = fail;
     }
 
     /// Configure the next futures order placement to fail after account
-    /// validation.
+    /// validation, with an indeterminate outcome like [`Self::set_fail_next`].
     pub fn set_order_fail_next(&self, fail: bool) {
         let mut fail_next = self.order_fail_next.write().unwrap();
         *fail_next = fail;
@@ -202,6 +281,12 @@ impl StubExchange {
     pub fn set_reject_reduce_only_next(&self, reject: bool) {
         let mut flag = self.reject_reduce_only_next.write().unwrap();
         *flag = reject;
+    }
+
+    /// Configure the next market order or protective stop to be authoritatively
+    /// rejected by the venue (the only failure that can lead to `Absent`).
+    pub fn set_reject_order_next(&self, reject: bool) {
+        *self.reject_order_next.write().unwrap() = reject;
     }
 
     /// Futures market orders attempted via `place_market_order` (including
@@ -232,6 +317,13 @@ impl StubExchange {
         fail
     }
 
+    fn should_reject_order(&self) -> bool {
+        let mut reject_next = self.reject_order_next.write().unwrap();
+        let reject = *reject_next;
+        *reject_next = false;
+        reject
+    }
+
     fn position_key(symbol: &Symbol, side: robson_domain::Side) -> String {
         format!("{}:{:?}", symbol.as_pair(), side)
     }
@@ -257,6 +349,12 @@ impl StubExchange {
     /// Set simulated futures account balance.
     pub fn set_futures_balance(&self, balance: Decimal) {
         *self.futures_balance.write().unwrap() = balance;
+    }
+
+    /// Set the simulated unrealized P&L (reported separately; the wallet
+    /// balance is not affected).
+    pub fn set_unrealized_pnl(&self, unrealized_pnl: Decimal) {
+        *self.unrealized_pnl.write().unwrap() = unrealized_pnl;
     }
 
     /// Seed a simulated order for evidence-retrieval tests.
@@ -348,7 +446,7 @@ impl StubExchange {
 }
 
 #[async_trait]
-impl ExchangePort for StubExchange {
+impl venue::TradingPort for StubExchange {
     async fn trading_rules(
         &self,
         symbol: &Symbol,
@@ -365,66 +463,34 @@ impl ExchangePort for StubExchange {
         })
     }
 
-    async fn validate_futures_settings(
-        &self,
-        symbol: &Symbol,
-        expected_leverage: u8,
-    ) -> Result<FuturesSettings, ExecError> {
-        if self.should_fail() {
-            return Err(ExecError::Exchange("Simulated futures check failure".to_string()));
-        }
-
-        let (position_mode, leverage) = {
-            let settings = self.futures_settings.read().unwrap();
-            settings.clone()
-        };
-
-        // Safety check: fail if not One-way mode
-        if position_mode != "One-way" {
-            return Err(ExecError::FuturesSafetyViolation {
-                expected: "One-way position mode".to_string(),
-                actual: format!("{} mode", position_mode),
-                advice: "Switch to One-way position mode before trading".to_string(),
-            });
-        }
-
-        // Safety check: fail if leverage doesn't match
-        if leverage != expected_leverage {
-            return Err(ExecError::FuturesSafetyViolation {
-                expected: format!("{}x leverage", expected_leverage),
-                actual: format!("{}x leverage", leverage),
-                advice: format!("Set leverage to {}x before trading", expected_leverage),
-            });
-        }
-
-        Ok(FuturesSettings {
-            position_mode,
-            leverage,
-            symbol: symbol.as_pair(),
-        })
-    }
-
     async fn place_market_order(
         &self,
         symbol: &Symbol,
         _side: OrderSide,
         quantity: Quantity,
         client_order_id: &str,
-        reduce_only: bool,
+        intent: EntryOrReduce,
     ) -> Result<OrderResult, ExecError> {
         *self.market_order_calls.write().unwrap() += 1;
+        let attempt = self.submit_attempts.begin(client_order_id);
 
         // Check if we should simulate a failure
         if self.should_fail() || self.should_fail_order() {
             return Err(ExecError::Exchange("Simulated exchange failure".to_string()));
         }
 
+        if self.should_reject_order() {
+            attempt.rejected();
+            return Err(ExecError::OrderRejected("Simulated venue rejection".to_string()));
+        }
+
         // Simulate the exchange refusing to reduce an already-flat position,
         // with the same error shape production surfaces (Binance -2022).
-        if reduce_only {
+        if intent.is_reduce() {
             let mut flag = self.reject_reduce_only_next.write().unwrap();
             if *flag {
                 *flag = false;
+                attempt.rejected();
                 return Err(ExecError::Exchange(
                     "Binance API error: -2022 - ReduceOnly Order is rejected.".to_string(),
                 ));
@@ -441,7 +507,7 @@ impl ExchangePort for StubExchange {
         // Generate order ID
         let exchange_order_id = self.next_order_id();
 
-        Ok(OrderResult {
+        let result = OrderResult {
             exchange_order_id,
             client_order_id: client_order_id.to_string(),
             fill_price: Price::new(price).unwrap(),
@@ -449,20 +515,31 @@ impl ExchangePort for StubExchange {
             fee,
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
-        })
+        };
+        self.client_orders
+            .write()
+            .unwrap()
+            .insert(client_order_id.to_string(), result.clone());
+        Ok(result)
     }
 
-    async fn place_stop_market_order(
+    async fn place_protection(
         &self,
         symbol: &Symbol,
         side: OrderSide,
         quantity: Quantity,
         stop_price: Price,
         client_order_id: &str,
-    ) -> Result<OrderResult, ExecError> {
+    ) -> Result<PlacedStop, ExecError> {
+        let attempt = self.submit_attempts.begin(client_order_id);
         // Simulate placement failure when configured (mirrors market order path).
         if self.should_fail() || self.should_fail_order() {
             return Err(ExecError::Exchange("Simulated stop order failure".to_string()));
+        }
+
+        if self.should_reject_order() {
+            attempt.rejected();
+            return Err(ExecError::OrderRejected("Simulated venue rejection".to_string()));
         }
 
         let exchange_order_id = self.next_order_id();
@@ -491,14 +568,17 @@ impl ExchangePort for StubExchange {
         );
 
         // Accepted but not filled: protective price recorded, zero fill/fee.
-        Ok(OrderResult {
-            exchange_order_id,
-            client_order_id: client_order_id.to_string(),
-            fill_price: stop_price,
-            filled_quantity: Quantity::zero(),
-            fee: Decimal::ZERO,
-            fee_asset: "USDT".to_string(),
-            filled_at: placed_at,
+        Ok(PlacedStop {
+            stop: StopRef::new(exchange_order_id.clone()),
+            acceptance: OrderResult {
+                exchange_order_id,
+                client_order_id: client_order_id.to_string(),
+                fill_price: stop_price,
+                filled_quantity: Quantity::zero(),
+                fee: Decimal::ZERO,
+                fee_asset: "USDT".to_string(),
+                filled_at: placed_at,
+            },
         })
     }
 
@@ -508,33 +588,116 @@ impl ExchangePort for StubExchange {
         }
 
         // Remove a protective stop if present (ADR-0039); harmless for other orders.
-        self.stop_orders.write().unwrap().remove(order_id);
+        if let Some(order) = self.stop_orders.write().unwrap().remove(order_id) {
+            self.cancelled_stop_orders.write().unwrap().insert(order_id.to_string(), order);
+        }
 
         // Stub: just log and return success
         tracing::debug!(order_id, "Stub: order cancelled");
         Ok(())
     }
 
-    async fn cancel_stop_market_order(
+    async fn cancel_protection(
         &self,
         _symbol: &Symbol,
-        algo_id: &str,
+        stop: &StopRef,
     ) -> Result<StopCancelOutcome, ExecError> {
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated stop cancel failure".to_string()));
         }
 
-        let existed = self.stop_orders.write().unwrap().remove(algo_id).is_some();
+        let algo_id = stop.exchange_order_id.as_str();
+        let removed = self.stop_orders.write().unwrap().remove(algo_id);
+        let existed = removed.is_some();
+        if let Some(order) = removed {
+            self.cancelled_stop_orders.write().unwrap().insert(algo_id.to_string(), order);
+        }
 
         tracing::debug!(algo_id, existed, "Stub: stop algo order cancel");
         Ok(if existed {
-            StopCancelOutcome::Cancelled
+            StopCancelOutcome::Cancelled {
+                filled_before_cancel: Decimal::ZERO,
+                fills: None,
+            }
         } else {
-            StopCancelOutcome::AlreadyGone
+            // The stub knows a triggered stop's fill without any I/O.
+            let final_state = match self.filled_stop_orders.read().unwrap().get(algo_id) {
+                Some(fill) => OrderLookup::Terminal {
+                    filled_qty: fill.filled_quantity.as_decimal(),
+                    cancelled_qty: Decimal::ZERO,
+                    fills: Some(fill.clone()),
+                },
+                None => OrderLookup::Unknown,
+            };
+            StopCancelOutcome::AlreadyGone { final_state }
         })
     }
 
-    async fn get_open_orders(&self, symbol: &Symbol) -> Result<Vec<OpenOrderRecord>, ExecError> {
+    async fn replace_protection(
+        &self,
+        symbol: &Symbol,
+        old: &StopRef,
+        new: StopParams,
+    ) -> Result<ReplaceOutcome, ExecError> {
+        venue::replace_place_then_cancel(self, &self.submit_attempts, symbol, old, new).await
+    }
+
+    async fn order_by_client_id(
+        &self,
+        _symbol: &Symbol,
+        client_order_id: &str,
+    ) -> Result<OrderLookup, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated order_by_client_id failure".to_string()));
+        }
+
+        let terminal = |fill: &OrderResult| OrderLookup::Terminal {
+            filled_qty: fill.filled_quantity.as_decimal(),
+            cancelled_qty: Decimal::ZERO,
+            fills: Some(fill.clone()),
+        };
+        if let Some(fill) = self.client_orders.read().unwrap().get(client_order_id) {
+            return Ok(terminal(fill));
+        }
+        if let Some(fill) = self
+            .orders
+            .read()
+            .unwrap()
+            .values()
+            .chain(self.filled_stop_orders.read().unwrap().values())
+            .find(|order| order.client_order_id == client_order_id)
+        {
+            return Ok(terminal(fill));
+        }
+        if self
+            .stop_orders
+            .read()
+            .unwrap()
+            .values()
+            .any(|order| order.client_order_id == client_order_id)
+        {
+            return Ok(OrderLookup::Open { filled_qty: Decimal::ZERO });
+        }
+        if let Some(order) = self
+            .cancelled_stop_orders
+            .read()
+            .unwrap()
+            .values()
+            .find(|order| order.client_order_id == client_order_id)
+        {
+            return Ok(OrderLookup::Terminal {
+                filled_qty: Decimal::ZERO,
+                cancelled_qty: order.quantity.as_decimal(),
+                fills: None,
+            });
+        }
+        Ok(STUB_FINALITY.classify_not_found(self.submit_attempts.evidence(client_order_id)))
+    }
+
+    async fn open_protective_orders(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<Vec<OpenOrderRecord>, ExecError> {
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated open-orders query failure".to_string()));
         }
@@ -561,7 +724,7 @@ impl ExchangePort for StubExchange {
         Ok(orders)
     }
 
-    async fn get_price(&self, symbol: &Symbol) -> Result<Price, ExecError> {
+    async fn price(&self, symbol: &Symbol) -> Result<Price, ExecError> {
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated price fetch failure".to_string()));
         }
@@ -570,32 +733,80 @@ impl ExchangePort for StubExchange {
         Ok(Price::new(price).unwrap())
     }
 
-    async fn health_check(&self) -> Result<(), ExecError> {
+    async fn health(&self) -> Result<(), ExecError> {
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated health check failure".to_string()));
         }
         Ok(())
     }
 
-    async fn get_futures_balance(&self) -> Result<FuturesBalance, ExecError> {
+    async fn order_by_exchange_id(
+        &self,
+        _symbol: &Symbol,
+        order_id: &str,
+    ) -> Result<Option<OrderResult>, ExecError> {
         if self.should_fail() {
-            return Err(ExecError::Exchange("Simulated futures balance fetch failure".to_string()));
+            return Err(ExecError::Exchange(
+                "Simulated get_order_by_exchange_id failure".to_string(),
+            ));
         }
-        let balance = *self.futures_balance.read().unwrap();
-        Ok(FuturesBalance {
-            wallet_balance: balance,
-            available_balance: balance,
-        })
+
+        let orders = self.orders.read().unwrap();
+        Ok(orders.get(order_id).cloned())
     }
 
-    async fn get_spot_account_balances(&self) -> Result<Vec<SpotBalance>, ExecError> {
+    async fn protection_fill(
+        &self,
+        _symbol: &Symbol,
+        stop: &StopRef,
+    ) -> Result<Option<OrderResult>, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated get_stop_order_fill failure".to_string()));
+        }
+
+        let algo_id = stop.exchange_order_id.as_str();
+
+        if let Some(result) = self.filled_stop_orders.read().unwrap().get(algo_id).cloned() {
+            return Ok(Some(result));
+        }
+
+        let orders = self.orders.read().unwrap();
+        Ok(orders.get(algo_id).cloned())
+    }
+
+    async fn user_trades_since(
+        &self,
+        symbol: &Symbol,
+        since: DateTime<Utc>,
+        limit: u16,
+    ) -> Result<Vec<UserTradeRecord>, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated get_user_trades_since failure".to_string()));
+        }
+
+        let trades = self.user_trades.read().unwrap();
+        let symbol_trades = trades.get(&symbol.as_pair()).cloned().unwrap_or_default();
+
+        let mut filtered: Vec<UserTradeRecord> =
+            symbol_trades.into_iter().filter(|t| t.filled_at >= since).collect();
+
+        filtered.sort_by(|a, b| a.filled_at.cmp(&b.filled_at));
+        filtered.truncate(limit as usize);
+
+        Ok(filtered)
+    }
+}
+
+#[async_trait]
+impl venue::FundingPort for StubExchange {
+    async fn spot_balances(&self) -> Result<Vec<SpotBalance>, ExecError> {
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated spot balance fetch failure".to_string()));
         }
         Ok(self.spot_balances.read().unwrap().values().cloned().collect())
     }
 
-    async fn get_spot_price(&self, symbol: &str) -> Result<Price, ExecError> {
+    async fn spot_price(&self, symbol: &str) -> Result<Price, ExecError> {
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated spot price fetch failure".to_string()));
         }
@@ -616,6 +827,8 @@ impl ExchangePort for StubExchange {
         &self,
         request: SpotOrderRequest,
     ) -> Result<SpotOrder, ExecError> {
+        // Never resolves as rejected: lookups do not query the spot namespace.
+        self.submit_attempts.begin(&request.client_order_id);
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated spot order failure".to_string()));
         }
@@ -689,7 +902,7 @@ impl ExchangePort for StubExchange {
         Ok(order)
     }
 
-    async fn get_spot_order(
+    async fn spot_order(
         &self,
         _symbol: &str,
         client_order_id: &str,
@@ -700,7 +913,7 @@ impl ExchangePort for StubExchange {
         Ok(self.spot_orders.read().unwrap().get(client_order_id).cloned())
     }
 
-    async fn universal_transfer(
+    async fn transfer(
         &self,
         asset: &str,
         amount: Decimal,
@@ -732,7 +945,7 @@ impl ExchangePort for StubExchange {
         Ok(transfer_id)
     }
 
-    async fn get_transfer_history(
+    async fn transfer_history(
         &self,
         transfer_type: UniversalTransferType,
         start_time: DateTime<Utc>,
@@ -749,8 +962,62 @@ impl ExchangePort for StubExchange {
             .cloned()
             .collect())
     }
+}
 
-    async fn get_all_open_positions(&self) -> Result<Vec<ExchangePosition>, ExecError> {
+#[async_trait]
+impl venue::PositionAccountPort for StubExchange {
+    async fn validate_position_settings(
+        &self,
+        symbol: &Symbol,
+        expected_leverage: u8,
+    ) -> Result<FuturesSettings, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated futures check failure".to_string()));
+        }
+
+        let (position_mode, leverage) = {
+            let settings = self.futures_settings.read().unwrap();
+            settings.clone()
+        };
+
+        // Safety check: fail if not One-way mode
+        if position_mode != "One-way" {
+            return Err(ExecError::FuturesSafetyViolation {
+                expected: "One-way position mode".to_string(),
+                actual: format!("{} mode", position_mode),
+                advice: "Switch to One-way position mode before trading".to_string(),
+            });
+        }
+
+        // Safety check: fail if leverage doesn't match
+        if leverage != expected_leverage {
+            return Err(ExecError::FuturesSafetyViolation {
+                expected: format!("{}x leverage", expected_leverage),
+                actual: format!("{}x leverage", leverage),
+                advice: format!("Set leverage to {}x before trading", expected_leverage),
+            });
+        }
+
+        Ok(FuturesSettings {
+            position_mode,
+            leverage,
+            symbol: symbol.as_pair(),
+        })
+    }
+
+    async fn balance(&self) -> Result<FuturesBalance, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated futures balance fetch failure".to_string()));
+        }
+        let balance = *self.futures_balance.read().unwrap();
+        Ok(FuturesBalance {
+            wallet_balance: balance,
+            available_balance: balance,
+            unrealized_pnl: *self.unrealized_pnl.read().unwrap(),
+        })
+    }
+
+    async fn open_positions(&self) -> Result<Vec<ExchangePosition>, ExecError> {
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated reconciliation scan failure".to_string()));
         }
@@ -766,6 +1033,7 @@ impl ExchangePort for StubExchange {
         quantity: Quantity,
         client_order_id: &str,
     ) -> Result<OrderResult, ExecError> {
+        let attempt = self.submit_attempts.begin(client_order_id);
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated reconciliation close failure".to_string()));
         }
@@ -777,6 +1045,7 @@ impl ExchangePort for StubExchange {
         };
 
         if removed.is_none() {
+            attempt.rejected();
             return Err(ExecError::OrderRejected(format!(
                 "No simulated open position found for {} {:?}",
                 symbol.as_pair(),
@@ -788,7 +1057,7 @@ impl ExchangePort for StubExchange {
         let fee = price * quantity.as_decimal() * self.fee_rate;
         let exchange_order_id = self.next_order_id();
 
-        Ok(OrderResult {
+        let result = OrderResult {
             exchange_order_id,
             client_order_id: client_order_id.to_string(),
             fill_price: Price::new(price).unwrap(),
@@ -796,67 +1065,18 @@ impl ExchangePort for StubExchange {
             fee,
             fee_asset: "USDT".to_string(),
             filled_at: Utc::now(),
-        })
-    }
-
-    async fn get_order_by_exchange_id(
-        &self,
-        _symbol: &Symbol,
-        order_id: &str,
-    ) -> Result<Option<OrderResult>, ExecError> {
-        if self.should_fail() {
-            return Err(ExecError::Exchange(
-                "Simulated get_order_by_exchange_id failure".to_string(),
-            ));
-        }
-
-        let orders = self.orders.read().unwrap();
-        Ok(orders.get(order_id).cloned())
-    }
-
-    async fn get_stop_order_fill(
-        &self,
-        _symbol: &Symbol,
-        algo_id: &str,
-    ) -> Result<Option<OrderResult>, ExecError> {
-        if self.should_fail() {
-            return Err(ExecError::Exchange("Simulated get_stop_order_fill failure".to_string()));
-        }
-
-        if let Some(result) = self.filled_stop_orders.read().unwrap().get(algo_id).cloned() {
-            return Ok(Some(result));
-        }
-
-        let orders = self.orders.read().unwrap();
-        Ok(orders.get(algo_id).cloned())
-    }
-
-    async fn get_user_trades_since(
-        &self,
-        symbol: &Symbol,
-        since: DateTime<Utc>,
-        limit: u16,
-    ) -> Result<Vec<UserTradeRecord>, ExecError> {
-        if self.should_fail() {
-            return Err(ExecError::Exchange("Simulated get_user_trades_since failure".to_string()));
-        }
-
-        let trades = self.user_trades.read().unwrap();
-        let symbol_trades = trades.get(&symbol.as_pair()).cloned().unwrap_or_default();
-
-        let mut filtered: Vec<UserTradeRecord> =
-            symbol_trades.into_iter().filter(|t| t.filled_at >= since).collect();
-
-        filtered.sort_by(|a, b| a.filled_at.cmp(&b.filled_at));
-        filtered.truncate(limit as usize);
-
-        Ok(filtered)
+        };
+        self.client_orders
+            .write()
+            .unwrap()
+            .insert(client_order_id.to_string(), result.clone());
+        Ok(result)
     }
 }
 
 #[async_trait]
-impl IncomePort for StubExchange {
-    async fn get_income_since(
+impl venue::SettlementPort for StubExchange {
+    async fn settlement_since(
         &self,
         since: DateTime<Utc>,
         limit: u16,
@@ -873,6 +1093,87 @@ impl IncomePort for StubExchange {
         filtered.truncate(limit as usize);
 
         Ok(filtered)
+    }
+}
+
+/// Venue id of the stub exchange.
+pub const STUB_VENUE_ID: &str = "stub";
+
+/// The stub applies the same rule as a real venue. Only a simulated rejection
+/// (`set_reject_order_next`, `set_reject_reduce_only_next`, closing a flat
+/// position) counts as authoritative; a simulated failure is indeterminate.
+pub const STUB_FINALITY: VenueFinalityRule = VenueFinalityRule::EveryAttemptRejected;
+
+#[async_trait]
+impl venue::AccountPort for StubExchange {
+    async fn cash(&self, asset: &str) -> Result<Cash, ExecError> {
+        if self.should_fail() {
+            return Err(ExecError::Exchange("Simulated cash fetch failure".to_string()));
+        }
+        if asset != "USDT" {
+            return Err(ExecError::Exchange(format!("stub futures account holds no {asset}")));
+        }
+        Ok(Cash {
+            free: *self.futures_balance.read().unwrap(),
+            locked: Decimal::ZERO,
+            as_of: Utc::now(),
+        })
+    }
+
+    async fn valuation(&self, symbol: &Symbol) -> Result<Mark, ExecError> {
+        let price = venue::TradingPort::price(self, symbol).await?;
+        Ok(Mark { price, as_of: Utc::now() })
+    }
+
+    async fn execution_costs(&self, _symbol: &Symbol) -> Result<ExecutionCostEnvelope, ExecError> {
+        let fee_bps = self.fee_rate * Decimal::from(10_000);
+        Ok(ExecutionCostEnvelope {
+            maker_bps: fee_bps,
+            taker_bps: fee_bps,
+            gap_bps: Decimal::ZERO,
+            fee_asset_policy: FeeAssetPolicy::Quote,
+            funding: Some(FundingTerms {
+                interval: Duration::from_secs(8 * 60 * 60),
+                rate_bps: Decimal::ZERO,
+            }),
+            as_of: Utc::now(),
+            source: "stub: simulated fee rate".to_string(),
+        })
+    }
+
+    fn capabilities(&self) -> VenueCapabilities {
+        VenueCapabilities {
+            market_kind: MarketKind::PerpUsdM,
+            account_kind: AccountKind::PositionAccount,
+            supports_short: true,
+            reduce_only_wire_flag: true,
+            protection: ProtectionKind::MarketOnTrigger,
+            replacement: ReplacementProtocol::PlaceThenCancel,
+            has_funding: true,
+            order_finality: STUB_FINALITY,
+        }
+    }
+}
+
+impl venue::Venue for StubExchange {
+    fn id(&self) -> &VenueId {
+        &self.venue_id
+    }
+
+    fn position_account(&self) -> Option<&dyn venue::PositionAccountPort> {
+        Some(self)
+    }
+
+    fn inventory(&self) -> Option<&dyn venue::InventoryPort> {
+        None
+    }
+
+    fn settlement(&self) -> &dyn venue::SettlementPort {
+        self
+    }
+
+    fn funding(&self) -> Option<&dyn venue::FundingPort> {
+        Some(self)
     }
 }
 
@@ -1069,6 +1370,7 @@ mod tests {
     use rust_decimal_macros::dec;
 
     use super::*;
+    use crate::ports::ExchangePort;
 
     #[tokio::test]
     async fn test_stub_exchange_place_order() {
@@ -1317,5 +1619,177 @@ mod tests {
             .unwrap();
         assert_eq!(history.len(), 1);
         assert_eq!(history[0].client_tran_key.as_deref(), Some("transfer-1"));
+    }
+
+    mod finality {
+        use super::*;
+        use crate::venue::{AttemptEvidence, PositionAccountPort, TradingPort};
+
+        fn btc() -> Symbol {
+            Symbol::from_pair("BTCUSDT").unwrap()
+        }
+
+        fn qty() -> Quantity {
+            Quantity::new(dec!(0.01)).unwrap()
+        }
+
+        async fn market(s: &StubExchange, id: &str) -> Result<OrderResult, ExecError> {
+            let symbol = btc();
+            let order = TradingPort::place_market_order(
+                s,
+                &symbol,
+                OrderSide::Buy,
+                qty(),
+                id,
+                EntryOrReduce::Entry,
+            );
+            order.await
+        }
+
+        async fn stop(s: &StubExchange, id: &str) -> Result<PlacedStop, ExecError> {
+            let price = Price::new(dec!(90000)).unwrap();
+            s.place_protection(&btc(), OrderSide::Sell, qty(), price, id).await
+        }
+
+        async fn lookup(s: &StubExchange, id: &str) -> OrderLookup {
+            TradingPort::order_by_client_id(s, &btc(), id).await.unwrap()
+        }
+
+        async fn is_unknown(s: &StubExchange, id: &str) -> bool {
+            matches!(lookup(s, id).await, OrderLookup::Unknown)
+        }
+
+        async fn is_absent(s: &StubExchange, id: &str) -> bool {
+            matches!(lookup(s, id).await, OrderLookup::Absent { finality } if finality == STUB_FINALITY)
+        }
+
+        #[tokio::test]
+        async fn only_authoritative_rejections_lead_to_absent() {
+            let s = StubExchange::new(dec!(100));
+            assert!(is_unknown(&s, "never").await);
+
+            s.set_reject_order_next(true);
+            assert!(stop(&s, "refused-stop").await.is_err());
+            assert!(is_absent(&s, "refused-stop").await);
+            s.set_reject_order_next(true);
+            assert!(market(&s, "refused-market").await.is_err());
+            assert!(is_absent(&s, "refused-market").await);
+
+            s.set_reject_reduce_only_next(true);
+            let symbol = btc();
+            let reduce = TradingPort::place_market_order(
+                &s,
+                &symbol,
+                OrderSide::Sell,
+                qty(),
+                "refused-reduce",
+                EntryOrReduce::Reduce,
+            );
+            assert!(reduce.await.is_err());
+            assert!(is_absent(&s, "refused-reduce").await);
+
+            let flat = PositionAccountPort::close_position_market(
+                &s,
+                &symbol,
+                robson_domain::Side::Long,
+                qty(),
+                "refused-close",
+            );
+            assert!(flat.await.is_err());
+            assert!(is_absent(&s, "refused-close").await);
+
+            // A simulated failure is indeterminate, also after a rejected retry.
+            s.set_order_fail_next(true);
+            assert!(stop(&s, "failed").await.is_err());
+            assert!(is_unknown(&s, "failed").await);
+            s.set_reject_order_next(true);
+            assert!(stop(&s, "failed").await.is_err());
+            assert!(is_unknown(&s, "failed").await);
+        }
+
+        #[tokio::test]
+        async fn truncated_evidence_keeps_a_rejected_retry_unknown() {
+            let s = StubExchange::with_history_capacity(dec!(100), 2);
+            s.set_order_fail_next(true);
+            assert!(stop(&s, "indeterminate").await.is_err());
+            s.set_reject_order_next(true);
+            assert!(stop(&s, "refused").await.is_err());
+            assert!(is_absent(&s, "refused").await);
+
+            // The third client id exceeds capacity.
+            market(&s, "overflow").await.unwrap();
+            assert_eq!(s.submit_attempts.evidence("refused"), AttemptEvidence::Truncated);
+            assert!(is_unknown(&s, "refused").await);
+
+            // A fresh record for this retry would read `AllRejected`.
+            s.set_reject_order_next(true);
+            assert!(stop(&s, "indeterminate").await.is_err());
+            assert_eq!(s.submit_attempts.evidence("indeterminate"), AttemptEvidence::Truncated);
+            assert!(is_unknown(&s, "indeterminate").await);
+            // Unrelated to the evidence, a retained record still answers.
+            assert!(matches!(lookup(&s, "overflow").await, OrderLookup::Terminal { .. }));
+        }
+
+        #[tokio::test]
+        async fn evicted_client_order_reads_unknown() {
+            let mut s = StubExchange::with_history_capacity(dec!(100), 2);
+            // Evidence kept, to prove the eviction alone cannot yield `Absent`.
+            s.submit_attempts = SubmitAttemptLedger::new(64);
+
+            // Rejected, then accepted: the evicted record leaves mixed evidence.
+            s.set_reject_order_next(true);
+            assert!(market(&s, "c0").await.is_err());
+            market(&s, "c0").await.unwrap();
+            for id in ["c1", "c2", "c3"] {
+                market(&s, id).await.unwrap();
+                assert!(s.client_orders.read().unwrap().entries.len() <= 2);
+                assert!(s.client_orders.read().unwrap().order.len() <= 2);
+            }
+
+            assert_eq!(s.submit_attempts.evidence("c0"), AttemptEvidence::Unresolved {
+                unresolved: 1,
+                rejected: 1
+            });
+            assert!(is_unknown(&s, "c0").await);
+            assert!(is_unknown(&s, "c1").await);
+            assert!(matches!(lookup(&s, "c2").await, OrderLookup::Terminal { .. }));
+            assert!(matches!(lookup(&s, "c3").await, OrderLookup::Terminal { .. }));
+        }
+
+        #[tokio::test]
+        async fn evicted_cancelled_stop_reads_unknown() {
+            let mut s = StubExchange::with_history_capacity(dec!(100), 2);
+            s.submit_attempts = SubmitAttemptLedger::new(64);
+
+            for id in ["s0", "s1", "s2"] {
+                let placed = stop(&s, id).await.unwrap();
+                s.cancel_protection(&btc(), &placed.stop).await.unwrap();
+                assert!(s.cancelled_stop_orders.read().unwrap().entries.len() <= 2);
+            }
+            let legacy = stop(&s, "s3").await.unwrap();
+            TradingPort::cancel_order(&s, &btc(), &legacy.stop.exchange_order_id)
+                .await
+                .unwrap();
+            assert_eq!(s.cancelled_stop_orders.read().unwrap().entries.len(), 2);
+
+            assert!(is_unknown(&s, "s0").await);
+            assert!(is_unknown(&s, "s1").await);
+            assert!(matches!(lookup(&s, "s2").await, OrderLookup::Terminal { .. }));
+            assert!(matches!(lookup(&s, "s3").await, OrderLookup::Terminal { .. }));
+        }
+
+        #[test]
+        fn history_keeps_insertion_order_when_a_key_repeats() {
+            let mut history = BoundedHistory::new(2);
+            history.insert("a".to_string(), 1);
+            history.insert("b".to_string(), 2);
+            history.insert("a".to_string(), 3);
+            assert_eq!(history.get("a"), Some(&3));
+            history.insert("c".to_string(), 4);
+            assert_eq!(history.get("a"), None);
+            assert_eq!(history.get("b"), Some(&2));
+            assert_eq!(history.get("c"), Some(&4));
+            assert_eq!(history.order.len(), 2);
+        }
     }
 }

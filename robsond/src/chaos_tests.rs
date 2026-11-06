@@ -108,6 +108,7 @@ impl ExchangePort for TimeoutExchange {
         Ok(FuturesBalance {
             wallet_balance: dec!(10000),
             available_balance: dec!(10000),
+            unrealized_pnl: Decimal::ZERO,
         })
     }
 
