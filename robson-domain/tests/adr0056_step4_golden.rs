@@ -1,7 +1,9 @@
 //! ADR-0056 step 4 stability contract (§4, §10).
 //!
-//! Every file under `fixtures/adr0056_step4/` was written by the serializer and
-//! the sizing code of commit 93a3bb76, before the naming cleanup, and must stay
+//! The expected outputs under `fixtures/adr0056_step4/` were written by the
+//! serializer and the sizing code of commit 93a3bb76, before the naming
+//! cleanup. The `*.input.json` files for historical and missing-field payloads
+//! were derived by hand from older struct shapes. All of them must stay
 //! byte-identical. These tests never name the renamed Rust items, so a rename
 //! cannot compile-fix them into agreement with itself.
 

@@ -54,7 +54,8 @@ async fn replay_keeps_the_id_under_the_legacy_key() {
 
 #[tokio::test]
 async fn replay_without_the_field_leaves_null() {
-    assert_eq!(replay(&[MISSING]).await[WIRE_KEY], serde_json::Value::Null);
+    // `get`, because indexing a missing key also reads as null.
+    assert_eq!(replay(&[MISSING]).await.get(WIRE_KEY), Some(&serde_json::Value::Null));
 }
 
 #[tokio::test]

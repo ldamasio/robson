@@ -332,8 +332,9 @@ commission.
   serialization before and after the refactor is equal (fixtures with null and non-null values; a missing optional field
   reserializes as `null` before and after, which is the existing behaviour); historical payloads deserialize; the legacy
   SQL column, the active projector payload (which does not carry the field) and the API/frontend field are unchanged.
-  The API does not serve this field today (`PositionSummary` has none, so the frontend normalizer yields null); the event
-  payload is what reaches the event log. The log text naming the field also stays, because log output is observable.
+  The position-summary API does not serve this field today (`PositionSummary` has none, so the frontend normalizer yields
+  null). The event payload reaches the event log and `/events/history`, which returns raw payloads, so the wire name stays
+  observable there. The log text naming the field also stays, because log output is observable.
 - Sizing vocabulary: the "margin cap" in `size_entry` is named the **capital cap** (`notional ≤ available_quote × (1 −
   headroom)`, leverage constant 1); numbers unchanged. `RiskConfig::leverage()` is validated only by position accounts.
   As implemented, the rename covers `size_entry` and its engine caller. Configured and observable names stay:
@@ -519,7 +520,7 @@ only).
   discrepancies (mandatory, not optional).
 - **Failure tests**: process kill at each external-call/persistence boundary (step 7), database loss during result
   persistence, concurrent settlement/admission, reordered feed delivery, unresolved order outcome; old-ciphertext
-  decryption after step 4; replay fixtures; the 68 DB-gated tests; security gates unchanged (gitleaks, osv-scanner,
+  decryption after step 4; replay fixtures; the DB-gated tests; security gates unchanged (gitleaks, osv-scanner,
   cargo-audit, SHA-pinned actions); allocation and arming mutations frozen during a request (guardrails §4).
 
 ---
@@ -614,7 +615,7 @@ Budget model for multi-venue:
   extracts with source URLs and SHA-256 of the raw responses; spot `orderTypes` includes `STOP_LOSS`, `LOT_SIZE` step
   0.00001, `NOTIONAL` min 5 USDT (applyMinToMarket, avgPriceMins 5); futures `LOT_SIZE` step 0.001, `MIN_NOTIONAL` 50
   USDT, `orderTypes` includes `STOP_MARKET`. Symbol availability only; account authorisation per order type is an
-  activation gate (§2.1). The 68 DB-gated test annotations reproduce from source; security workflows are unchanged.
+  activation gate (§2.1). The DB-gated test annotations reproduce from source (68 when written, 76 after step 3); security workflows are unchanged.
 
 ## Review trail
 
@@ -666,4 +667,6 @@ Budget model for multi-venue:
   **APPROVE** with one P3 (§1 wording) applied.
 - v10 (2026-11-06): §4 and the Implementation Notes aligned with step 4 as implemented on `refactor/venue-step4-naming`:
   `Endpoints::base_url` is not a host table, what keeps the old names and why, and step 8 owns gating
-  `validate_futures_settings` to position accounts. No risk number or operator decision changed.
+  `validate_futures_settings` to position accounts. No risk number or operator decision changed. Codex **APPROVE** on
+  round 1, with four P3s applied (the `/events/history` exposure above, a missing-versus-null assertion, fixture provenance
+  and the stale DB-gated count).
