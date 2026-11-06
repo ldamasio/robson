@@ -457,8 +457,13 @@ mod tests {
         assert!(matches!(lookup(&s, "ins-1").await, OrderLookup::Open { .. }));
         // Never attempted: no evidence, so a not-found is not final.
         assert!(matches!(lookup(&s, "never").await, OrderLookup::Unknown));
-        // Attempted and refused by the venue: final.
+        // A failure with an unknown outcome is not final.
         s.set_order_fail_next(true);
+        let failed = s.place_protection(&sym, OrderSide::Sell, qty(), px(dec!(90000)), "ins-f");
+        assert!(failed.await.is_err());
+        assert!(matches!(lookup(&s, "ins-f").await, OrderLookup::Unknown));
+        // Attempted and refused by the venue: final.
+        s.set_reject_order_next(true);
         let refused = s.place_protection(&sym, OrderSide::Sell, qty(), px(dec!(90000)), "ins-x");
         assert!(refused.await.is_err());
         assert!(matches!(lookup(&s, "ins-x").await, OrderLookup::Absent { .. }));
@@ -744,7 +749,7 @@ mod recorded_forwarding {
             Ok(true)
         }
         async fn place_spot_market_order(&self, r: SpotOrderRequest) -> R<SpotOrder> {
-            self.log(format!("place_spot_market_order {} {}", r.symbol, r.client_order_id));
+            self.log(format!("place_spot_market_order {r:?}"));
             Err(ExecError::Exchange("recorded".to_string()))
         }
         async fn spot_order(&self, s: &str, c: &str) -> R<Option<SpotOrder>> {
@@ -846,7 +851,8 @@ mod recorded_forwarding {
             client_order_id: "s1".to_string(),
         };
         let err = ExchangePort::place_spot_market_order(&v, request).await.unwrap_err();
-        one("place_spot_market_order BTCUSDT s1");
+        one("place_spot_market_order SpotOrderRequest { symbol: \"BTCUSDT\", side: Buy, \
+             quantity_kind: Quote, quantity: 10, client_order_id: \"s1\" }");
         assert_eq!(err.to_string(), "Exchange error: recorded");
         v.get_spot_order("BTCUSDT", "s1").await.unwrap();
         one("spot_order BTCUSDT s1");

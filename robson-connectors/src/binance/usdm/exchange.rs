@@ -30,8 +30,8 @@ use robson_exec::{
     venue::{
         self, AccountKind, AccountPort, Cash, EntryOrReduce, ExecutionCostEnvelope, FundingPort,
         InventoryPort, Mark, MarketKind, OrderLookup, PlacedStop, PositionAccountPort,
-        ProtectionKind, ReplaceOutcome, ReplacementProtocol, RequestWindow, SettlementPort,
-        StopCancelOutcome, StopParams, StopRef, TradingPort, Venue, VenueCapabilities,
+        ProtectionKind, ReplaceOutcome, ReplacementProtocol, SettlementPort, StopCancelOutcome,
+        StopParams, StopRef, SubmitAttemptLedger, TradingPort, Venue, VenueCapabilities,
         VenueFinalityRule, VenueId,
     },
     ExecError, OrderResult,
@@ -224,31 +224,43 @@ fn order_lookup_from_response(response: BinanceOrderResponse) -> Result<OrderLoo
     }
 }
 
-/// Order finality rule of `binance:usdm` (see [`VenueFinalityRule`] for the
-/// derivation):
-/// - `request_validity` 5 s: Binance rejects a signed request whose `timestamp`
-///   is more than `recvWindow` behind its clock; this client never sends
-///   `recvWindow`, so the documented default 5 000 ms applies.
-/// - `clock_tolerance` 1 s: Binance rejects a `timestamp` more than 1 000 ms
-///   ahead of its clock.
-/// - `visibility_margin` 60 s: engineering allowance for an accepted order to
-///   become visible to the lookups; Binance documents no bound.
-/// - `lookup_retention` 3 days: Query Order and Query Algo Order do not find a
-///   CANCELED or EXPIRED order without fills once created time + 3 days has
-///   passed (any order after 90 days).
-///
-/// Attempt evidence is the local window around each placement call, recorded
-/// in memory by the adapter (bounded); it does not survive a restart, after
-/// which every not-found is `Unknown`.
-pub const USDM_FINALITY: VenueFinalityRule = VenueFinalityRule {
-    request_validity: Duration::from_millis(5_000),
-    clock_tolerance: Duration::from_millis(1_000),
-    visibility_margin: Duration::from_secs(60),
-    lookup_retention: Duration::from_secs(3 * 24 * 60 * 60),
-};
+/// Order finality rule of `binance:usdm`: a not-found on both lookups is final
+/// only when every attempt with the client id was authoritatively rejected
+/// (`is_authoritative_rejection`). Binance documents no bound on when an
+/// accepted order becomes visible to Query Order or Query Algo Order, and
+/// `recvWindow` only bounds request acceptance, so time proves nothing.
+pub const USDM_FINALITY: VenueFinalityRule = VenueFinalityRule::EveryAttemptRejected;
 
 /// Bound on the in-memory submit-attempt evidence.
 const SUBMIT_ATTEMPTS_CAPACITY: usize = 4096;
+
+/// Whether a failed placement proves Binance refused the order: HTTP 400 with
+/// an allow-listed code. Anything else is indeterminate, and `Unknown` is
+/// always the safe answer.
+///
+/// The codes, from the USDⓈ-M error code table
+/// (<https://developers.binance.com/docs/derivatives/usds-margined-futures/error-code>):
+/// `-2010` `NEW_ORDER_REJECTED`; `-2019` `MARGIN_NOT_SUFFICIEN` "Margin is
+/// insufficient."; `-2021` `ORDER_WOULD_IMMEDIATELY_TRIGGER` "Order would
+/// immediately trigger."; `-2022` `REDUCE_ONLY_REJECT` "ReduceOnly Order is
+/// rejected.". The table does not say which codes guarantee non-acceptance;
+/// these are the ones whose documented meaning is a refusal of the new order.
+/// Deliberately out: `-1000`, `-1001`, `-1006`, `-1007` (execution status
+/// unknown or unspecified), rate limits (`-1003`, `-1008`, `-1015`), and every
+/// filter or validation code.
+///
+/// The status is checked because `ApiError` covers any non-success status with
+/// a JSON body. Per General Info
+/// (<https://developers.binance.com/docs/derivatives/usds-margined-futures/general-info>)
+/// 5XX is an internal error and a 503 "could have been a success"; 403, 408,
+/// 418 and 429 are WAF, backend timeout and rate limits, not order rejections.
+fn is_authoritative_rejection(error: &BinanceRestError) -> bool {
+    matches!(error, BinanceRestError::ApiError {
+        http_status: 400,
+        code: -2010 | -2019 | -2021 | -2022,
+        ..
+    })
+}
 
 // Adapter
 // =============================================================================
@@ -308,9 +320,9 @@ pub struct BinanceExchangeAdapter {
     /// concurrent callers wait for one fetch instead of stampeding the
     /// exchange. Market ticks read the cached entry; zero HTTP per tick.
     trading_rules: tokio::sync::Mutex<HashMap<String, CachedTradingRules>>,
-    /// Local request windows of placement attempts by client id (finality
-    /// evidence for `order_by_client_id`). Never held across I/O.
-    submit_attempts: std::sync::Mutex<HashMap<String, RequestWindow>>,
+    /// Placement attempts by client id (finality evidence for
+    /// `order_by_client_id`). In memory: see its restart limitation.
+    submit_attempts: SubmitAttemptLedger,
 }
 
 impl BinanceExchangeAdapter {
@@ -320,7 +332,7 @@ impl BinanceExchangeAdapter {
             venue_id: VenueId::new(VenueId::BINANCE_USDM),
             client,
             trading_rules: tokio::sync::Mutex::new(HashMap::new()),
-            submit_attempts: std::sync::Mutex::new(HashMap::new()),
+            submit_attempts: SubmitAttemptLedger::new(SUBMIT_ATTEMPTS_CAPACITY),
         }
     }
 
@@ -414,7 +426,7 @@ impl BinanceExchangeAdapter {
     /// Map BinanceRestError to ExecError.
     fn map_error(error: BinanceRestError) -> ExecError {
         match &error {
-            BinanceRestError::ApiError { code, msg } => match code {
+            BinanceRestError::ApiError { code, msg, .. } => match code {
                 -2010 | -2011 | -2013 | -2019 => ExecError::OrderRejected(msg.clone()),
                 _ => ExecError::Exchange(error.to_string()),
             },
@@ -428,7 +440,7 @@ impl BinanceExchangeAdapter {
 
     fn is_tolerated_algo_cancel_error(error: &BinanceRestError) -> bool {
         match error {
-            BinanceRestError::ApiError { code, msg } => {
+            BinanceRestError::ApiError { code, msg, .. } => {
                 matches!(*code, -2011 | -2013)
                     || msg.to_ascii_lowercase().contains("unknown")
                     || msg.to_ascii_lowercase().contains("not exist")
@@ -436,36 +448,6 @@ impl BinanceExchangeAdapter {
             },
             _ => false,
         }
-    }
-
-
-    /// Record the local window around a submit attempt with
-    /// `client_order_id` (finality evidence, ADR-0056 §2). Bounded: the
-    /// oldest attempt is dropped when full, which only turns a later
-    /// not-found for it into `Unknown`.
-    fn record_attempt(&self, client_order_id: &str, started_at: DateTime<Utc>) {
-        let window = RequestWindow { started_at, completed_at: Utc::now() };
-        let mut attempts = self.submit_attempts.lock().unwrap_or_else(|e| e.into_inner());
-        if attempts.len() >= SUBMIT_ATTEMPTS_CAPACITY && !attempts.contains_key(client_order_id) {
-            let oldest =
-                attempts.iter().min_by_key(|(_, w)| w.completed_at).map(|(id, _)| id.clone());
-            if let Some(id) = oldest {
-                attempts.remove(&id);
-            }
-        }
-        let merged = attempts.get(client_order_id).map_or(window, |w| w.merge(window));
-        attempts.insert(client_order_id.to_string(), merged);
-    }
-
-    /// Classify a not-found on every lookup namespace.
-    fn classify_not_found(&self, client_order_id: &str, lookup: RequestWindow) -> OrderLookup {
-        let attempt = self
-            .submit_attempts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get(client_order_id)
-            .copied();
-        USDM_FINALITY.classify_not_found(attempt, lookup)
     }
 
     /// Lifecycle of a protective stop found by client id. A triggered stop
@@ -712,19 +694,21 @@ impl TradingPort for BinanceExchangeAdapter {
             },
         };
 
-        let started_at = Utc::now();
         let response = self
-            .client
-            .place_market_order(
-                &symbol.as_pair(),
-                binance_side,
-                qty,
-                Some(client_order_id),
-                reduce_only,
+            .submit_attempts
+            .submit(
+                client_order_id,
+                is_authoritative_rejection,
+                self.client.place_market_order(
+                    &symbol.as_pair(),
+                    binance_side,
+                    qty,
+                    Some(client_order_id),
+                    reduce_only,
+                ),
             )
-            .await;
-        self.record_attempt(client_order_id, started_at);
-        let response = response.map_err(Self::map_error)?;
+            .await
+            .map_err(Self::map_error)?;
 
         match response.status.as_str() {
             "FILLED" => {},
@@ -897,19 +881,21 @@ impl TradingPort for BinanceExchangeAdapter {
             },
         };
 
-        let started_at = Utc::now();
         let response = self
-            .client
-            .place_stop_market_order(
-                &symbol.as_pair(),
-                binance_side,
-                qty,
-                trigger_price,
+            .submit_attempts
+            .submit(
                 client_order_id,
+                is_authoritative_rejection,
+                self.client.place_stop_market_order(
+                    &symbol.as_pair(),
+                    binance_side,
+                    qty,
+                    trigger_price,
+                    client_order_id,
+                ),
             )
-            .await;
-        self.record_attempt(client_order_id, started_at);
-        let response = response.map_err(Self::map_error)?;
+            .await
+            .map_err(Self::map_error)?;
 
         // A protective STOP_MARKET is accepted, not filled: only `NEW` is the
         // clean success. Any other status (triggered, expired, rejected) is
@@ -1002,14 +988,14 @@ impl TradingPort for BinanceExchangeAdapter {
     /// triggered algo order resolves to its resulting order and fills (the
     /// same chain as `protection_fill`). Only a `-2013` on **both** lookups
     /// is a not-found, classified by [`USDM_FINALITY`] against the submit
-    /// attempts this adapter recorded; at most four requests.
+    /// attempts this adapter recorded, as they stand after both responses
+    /// returned (a retry started mid-lookup is seen); at most four requests.
     async fn order_by_client_id(
         &self,
         symbol: &Symbol,
         client_order_id: &str,
     ) -> Result<OrderLookup, ExecError> {
         let pair = symbol.as_pair();
-        let started_at = Utc::now();
         match self.client.get_order_status_by_client_id(&pair, client_order_id).await {
             Ok(response) => return order_lookup_from_response(response),
             Err(BinanceRestError::ApiError { code: -2013, .. }) => {},
@@ -1018,8 +1004,7 @@ impl TradingPort for BinanceExchangeAdapter {
         match self.client.query_algo_order_by_client_id(client_order_id).await {
             Ok(detail) => self.algo_order_lookup(symbol, &detail).await,
             Err(BinanceRestError::ApiError { code: -2013, .. }) => {
-                let lookup = RequestWindow { started_at, completed_at: Utc::now() };
-                Ok(self.classify_not_found(client_order_id, lookup))
+                Ok(USDM_FINALITY.classify_not_found(self.submit_attempts.evidence(client_order_id)))
             },
             Err(error) => Err(Self::map_error(error)),
         }
@@ -1216,13 +1201,19 @@ impl FundingPort for BinanceExchangeAdapter {
             SpotOrderQuantity::Quote => "quoteOrderQty",
         };
 
+        // Never resolves as rejected: the allow-list covers USDⓈ-M codes, and
+        // `order_by_client_id` does not query the spot namespace.
         let response = self
-            .client
-            .place_spot_market_order(
-                &request.symbol,
-                side,
-                (quantity_key, request.quantity),
+            .submit_attempts
+            .submit(
                 &request.client_order_id,
+                |_: &BinanceRestError| false,
+                self.client.place_spot_market_order(
+                    &request.symbol,
+                    side,
+                    (quantity_key, request.quantity),
+                    &request.client_order_id,
+                ),
             )
             .await
             .map_err(Self::map_error)?;
@@ -1428,6 +1419,407 @@ mod log_target_guard {
 }
 
 #[cfg(test)]
+mod submit_attempt_evidence {
+    //! Placement evidence through the real adapter and REST client, against a
+    //! local listener standing in for Binance.
+
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use robson_exec::venue::AttemptEvidence;
+    use rust_decimal_macros::dec;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        sync::Notify,
+    };
+
+    use super::*;
+
+    type Reply = Option<(u16, String)>;
+
+    const IN_FLIGHT: AttemptEvidence = AttemptEvidence::Unresolved { unresolved: 1, rejected: 0 };
+    const FILLED: &str = r#"{"symbol":"BTCUSDT","orderId":7,"clientOrderId":"c1",
+        "updateTime":1700000000000,"price":"0","origQty":"0.01","executedQty":"0.01",
+        "cumQuote":"900","status":"FILLED","side":"BUY","type":"MARKET","fills":[]}"#;
+
+    async fn bound_venue() -> (TcpListener, Arc<BinanceExchangeAdapter>) {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let client = BinanceRestClient::with_local_base_url(url);
+        (listener, Arc::new(BinanceExchangeAdapter::new(Arc::new(client))))
+    }
+
+    /// Answer every request per `reply`, given `"METHOD /path"`; `None` reads
+    /// the request and never answers.
+    fn serve(listener: TcpListener, reply: impl Fn(&str) -> Reply + Send + Sync + 'static) {
+        let reply = Arc::new(reply);
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let reply = reply.clone();
+                tokio::spawn(async move {
+                    let mut head = Vec::new();
+                    let mut buf = [0u8; 4096];
+                    while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                        match stream.read(&mut buf).await {
+                            Ok(0) | Err(_) => return,
+                            Ok(n) => head.extend_from_slice(&buf[..n]),
+                        }
+                    }
+                    let request = {
+                        let head = String::from_utf8_lossy(&head);
+                        let mut line = head.split_whitespace();
+                        let method = line.next().unwrap_or_default();
+                        let target = line.next().unwrap_or_default();
+                        format!("{method} {}", target.split('?').next().unwrap_or_default())
+                    };
+                    match reply(&request) {
+                        Some((status, body)) => {
+                            let response = format!(
+                                "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                                 Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                                body.len()
+                            );
+                            let _ = stream.write_all(response.as_bytes()).await;
+                        },
+                        None => while matches!(stream.read(&mut buf).await, Ok(n) if n > 0) {},
+                    }
+                });
+            }
+        });
+    }
+
+    fn api_error(code: i64) -> String {
+        format!(r#"{{"code":{code},"msg":"refused"}}"#)
+    }
+
+    /// Both lookups answer not-found; anything else (exchangeInfo) is a 404,
+    /// so placements fall back to the configured lot filters.
+    fn not_found(request: &str) -> Reply {
+        match request {
+            "GET /fapi/v1/order" | "GET /fapi/v1/algoOrder" => Some((400, api_error(-2013))),
+            _ => Some((404, String::new())),
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Placement {
+        Market,
+        Protection,
+        Spot,
+    }
+
+    impl Placement {
+        fn route(self) -> &'static str {
+            match self {
+                Self::Market => "POST /fapi/v1/order",
+                Self::Protection => "POST /fapi/v1/algoOrder",
+                Self::Spot => "POST /api/v3/order",
+            }
+        }
+
+        async fn place(self, venue: &BinanceExchangeAdapter, id: &str) -> Result<(), ExecError> {
+            let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+            let qty = Quantity::new(dec!(0.01)).unwrap();
+            match self {
+                Self::Market => TradingPort::place_market_order(
+                    venue,
+                    &symbol,
+                    OrderSide::Buy,
+                    qty,
+                    id,
+                    EntryOrReduce::Entry,
+                )
+                .await
+                .map(|_| ()),
+                Self::Protection => {
+                    let trigger = Price::new(dec!(90000)).unwrap();
+                    venue
+                        .place_protection(&symbol, OrderSide::Sell, qty, trigger, id)
+                        .await
+                        .map(|_| ())
+                },
+                Self::Spot => venue
+                    .place_spot_market_order(SpotOrderRequest {
+                        symbol: "BTCUSDT".to_string(),
+                        side: SpotOrderSide::Buy,
+                        quantity_kind: SpotOrderQuantity::Quote,
+                        quantity: dec!(10),
+                        client_order_id: id.to_string(),
+                    })
+                    .await
+                    .map(|_| ()),
+            }
+        }
+    }
+
+    async fn lookup(venue: &BinanceExchangeAdapter, id: &str) -> OrderLookup {
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        venue.order_by_client_id(&symbol, id).await.unwrap()
+    }
+
+    async fn is_unknown(venue: &BinanceExchangeAdapter, id: &str) -> bool {
+        matches!(lookup(venue, id).await, OrderLookup::Unknown)
+    }
+
+    /// A venue answering the first `Placement::route` request per `first` and
+    /// later ones per `then`, with not-found lookups.
+    async fn scripted_venue(
+        placement: Placement,
+        first: Reply,
+        then: Reply,
+    ) -> (Arc<BinanceExchangeAdapter>, Arc<AtomicUsize>) {
+        let (listener, venue) = bound_venue().await;
+        let posts = Arc::new(AtomicUsize::new(0));
+        let counter = posts.clone();
+        serve(listener, move |request| {
+            if request != placement.route() {
+                return not_found(request);
+            }
+            match counter.fetch_add(1, Ordering::SeqCst) {
+                0 => first.clone(),
+                _ => then.clone(),
+            }
+        });
+        (venue, posts)
+    }
+
+    #[test]
+    fn only_allow_listed_codes_on_http_400_are_rejections() {
+        let api = |code, http_status| BinanceRestError::ApiError {
+            code,
+            msg: "x".to_string(),
+            http_status,
+        };
+        for code in [-2010, -2019, -2021, -2022] {
+            assert!(is_authoritative_rejection(&api(code, 400)), "{code}");
+            for status in [200, 401, 403, 408, 418, 429, 500, 502, 503, 504] {
+                assert!(!is_authoritative_rejection(&api(code, status)), "{code} on {status}");
+            }
+        }
+        for code in [
+            -1000, -1001, -1003, -1006, -1007, -1008, -1015, -1016, -1021, -1022, -1111, -2013,
+            -2015, -2018, -2020, -2024, -2025, -4164,
+        ] {
+            assert!(!is_authoritative_rejection(&api(code, 400)), "{code}");
+        }
+        for error in [
+            BinanceRestError::Timeout,
+            BinanceRestError::RequestFailed("x".to_string()),
+            BinanceRestError::ParseError("x".to_string()),
+            BinanceRestError::InvalidParameter("x".to_string()),
+            BinanceRestError::SignatureError("x".to_string()),
+            BinanceRestError::PositionNotFound("x".to_string()),
+        ] {
+            assert!(!is_authoritative_rejection(&error), "{error}");
+        }
+    }
+
+    #[tokio::test]
+    async fn unanswered_placement_is_on_record_and_an_abort_keeps_blocking_absent() {
+        for placement in [Placement::Market, Placement::Protection, Placement::Spot] {
+            let arrived = Arc::new(Notify::new());
+            let signal = arrived.clone();
+            let (listener, venue) = bound_venue().await;
+            serve(listener, move |request| {
+                if request == placement.route() {
+                    signal.notify_one();
+                    return None;
+                }
+                not_found(request)
+            });
+
+            assert_eq!(venue.submit_attempts.evidence("c1"), AttemptEvidence::NoRecord);
+            let task = tokio::spawn({
+                let venue = venue.clone();
+                async move { placement.place(&venue, "c1").await }
+            });
+            arrived.notified().await;
+            assert_eq!(venue.submit_attempts.evidence("c1"), IN_FLIGHT, "{placement:?}");
+            assert!(is_unknown(&venue, "c1").await, "{placement:?}");
+
+            task.abort();
+            assert!(task.await.unwrap_err().is_cancelled());
+            assert_eq!(venue.submit_attempts.evidence("c1"), IN_FLIGHT, "{placement:?}");
+            assert!(is_unknown(&venue, "c1").await, "{placement:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_retry_does_not_clear_an_aborted_attempt() {
+        let arrived = Arc::new(Notify::new());
+        let signal = arrived.clone();
+        let posts = Arc::new(AtomicUsize::new(0));
+        let counter = posts.clone();
+        let (listener, venue) = bound_venue().await;
+        serve(listener, move |request| {
+            if request != Placement::Market.route() {
+                return not_found(request);
+            }
+            if counter.fetch_add(1, Ordering::SeqCst) == 0 {
+                signal.notify_one();
+                return None;
+            }
+            Some((400, api_error(-2010)))
+        });
+
+        let task = tokio::spawn({
+            let venue = venue.clone();
+            async move { Placement::Market.place(&venue, "c1").await }
+        });
+        arrived.notified().await;
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        assert!(Placement::Market.place(&venue, "c1").await.is_err());
+        assert_eq!(venue.submit_attempts.evidence("c1"), AttemptEvidence::Unresolved {
+            unresolved: 1,
+            rejected: 1
+        });
+        assert!(is_unknown(&venue, "c1").await);
+        assert_eq!(posts.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn rejected_placement_is_absent_with_its_error_mapping_unchanged() {
+        for (code, mapped_to_rejected) in
+            [(-2010, true), (-2019, true), (-2021, false), (-2022, false)]
+        {
+            for placement in [Placement::Market, Placement::Protection] {
+                let rejected = Some((400, api_error(code)));
+                let (venue, posts) = scripted_venue(placement, rejected.clone(), rejected).await;
+
+                let error = placement.place(&venue, "c1").await.unwrap_err();
+                assert_eq!(
+                    matches!(error, ExecError::OrderRejected(_)),
+                    mapped_to_rejected,
+                    "{code}: {error}"
+                );
+                assert_eq!(posts.load(Ordering::SeqCst), 1);
+                assert_eq!(venue.submit_attempts.evidence("c1"), AttemptEvidence::AllRejected {
+                    rejected: 1
+                });
+                assert!(matches!(
+                    lookup(&venue, "c1").await,
+                    OrderLookup::Absent { finality } if finality == USDM_FINALITY
+                ));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn non_400_response_with_a_json_body_is_never_a_rejection() {
+        let error = BinanceRestError::ApiError {
+            code: -2010,
+            msg: "x".to_string(),
+            http_status: 503,
+        };
+        assert_eq!(error.to_string(), "Binance API error: -2010 - x");
+
+        for status in [500, 502, 503, 504, 401, 403, 408, 418, 429] {
+            let reply = Some((status, api_error(-2010)));
+            let (venue, _) = scripted_venue(Placement::Market, reply.clone(), reply).await;
+
+            // The mapping other callers see does not depend on the status.
+            let error = Placement::Market.place(&venue, "c1").await.unwrap_err();
+            assert!(matches!(error, ExecError::OrderRejected(_)), "{status}: {error}");
+            assert_eq!(venue.submit_attempts.evidence("c1"), IN_FLIGHT, "{status}");
+            assert!(is_unknown(&venue, "c1").await, "{status}");
+        }
+    }
+
+    #[tokio::test]
+    async fn parse_failure_after_2xx_stays_indeterminate() {
+        for placement in [Placement::Market, Placement::Protection, Placement::Spot] {
+            let reply = Some((200, "not json".to_string()));
+            let (venue, _) = scripted_venue(placement, reply.clone(), reply).await;
+
+            assert!(placement.place(&venue, "c1").await.is_err());
+            assert_eq!(venue.submit_attempts.evidence("c1"), IN_FLIGHT, "{placement:?}");
+            assert!(is_unknown(&venue, "c1").await, "{placement:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn spot_rejection_never_resolves_the_attempt() {
+        let reply = Some((400, api_error(-2010)));
+        let (venue, _) = scripted_venue(Placement::Spot, reply.clone(), reply).await;
+
+        assert!(Placement::Spot.place(&venue, "c1").await.is_err());
+        assert_eq!(venue.submit_attempts.evidence("c1"), IN_FLIGHT);
+        assert!(is_unknown(&venue, "c1").await);
+    }
+
+    #[tokio::test]
+    async fn accepted_attempt_that_lookups_cannot_see_stays_unknown() {
+        // Accepted while both lookups answer not-found (a delayed record), and
+        // after a rejected attempt with the same client id.
+        let (venue, _) = scripted_venue(
+            Placement::Market,
+            Some((400, api_error(-2010))),
+            Some((200, FILLED.to_string())),
+        )
+        .await;
+
+        assert!(Placement::Market.place(&venue, "c1").await.is_err());
+        assert!(matches!(lookup(&venue, "c1").await, OrderLookup::Absent { .. }));
+        Placement::Market.place(&venue, "c1").await.unwrap();
+        assert_eq!(venue.submit_attempts.evidence("c1"), AttemptEvidence::Unresolved {
+            unresolved: 1,
+            rejected: 1
+        });
+        assert!(is_unknown(&venue, "c1").await);
+    }
+
+    #[tokio::test]
+    async fn not_found_without_evidence_is_unknown() {
+        let (venue, _) = scripted_venue(Placement::Market, None, None).await;
+        assert!(is_unknown(&venue, "never").await);
+    }
+
+    #[tokio::test]
+    async fn retry_started_during_a_lookup_is_seen() {
+        let (listener, venue) = bound_venue().await;
+        let during_lookup = venue.clone();
+        serve(listener, move |request| {
+            if request == "GET /fapi/v1/algoOrder" {
+                // After the first not-found, before the second one returns.
+                during_lookup.submit_attempts.begin("c1");
+            }
+            not_found(request)
+        });
+        venue.submit_attempts.begin("c1").rejected();
+        assert_eq!(venue.submit_attempts.evidence("c1"), AttemptEvidence::AllRejected {
+            rejected: 1
+        });
+
+        assert!(is_unknown(&venue, "c1").await);
+    }
+
+    #[tokio::test]
+    async fn truncated_evidence_keeps_a_rejected_retry_unknown() {
+        let (venue, _) = scripted_venue(
+            Placement::Market,
+            Some((503, api_error(-1007))),
+            Some((400, api_error(-2010))),
+        )
+        .await;
+        assert!(Placement::Market.place(&venue, "c1").await.is_err());
+        assert_eq!(venue.submit_attempts.evidence("c1"), IN_FLIGHT);
+
+        for i in 0..SUBMIT_ATTEMPTS_CAPACITY {
+            venue.submit_attempts.begin(&format!("fill-{i}"));
+        }
+        assert_eq!(venue.submit_attempts.evidence("c1"), AttemptEvidence::Truncated);
+
+        // A fresh record for this retry would read `AllRejected`.
+        assert!(Placement::Market.place(&venue, "c1").await.is_err());
+        assert_eq!(venue.submit_attempts.evidence("c1"), AttemptEvidence::Truncated);
+        assert!(is_unknown(&venue, "c1").await);
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use robson_exec::venue::{
         capability_mismatches, AccountKind, MarketKind, ProtectionKind, ReplacementProtocol,
@@ -1452,11 +1844,7 @@ mod tests {
         assert!(caps.supports_short && caps.reduce_only_wire_flag && caps.has_funding);
         assert_eq!(caps.protection, ProtectionKind::MarketOnTrigger);
         assert_eq!(caps.replacement, ReplacementProtocol::PlaceThenCancel);
-        assert_eq!(caps.order_finality, USDM_FINALITY);
-        assert_eq!(USDM_FINALITY.request_validity, Duration::from_millis(5_000));
-        assert_eq!(USDM_FINALITY.clock_tolerance, Duration::from_millis(1_000));
-        assert_eq!(USDM_FINALITY.visibility_margin, Duration::from_secs(60));
-        assert_eq!(USDM_FINALITY.lookup_retention, Duration::from_secs(3 * 24 * 60 * 60));
+        assert_eq!(caps.order_finality, VenueFinalityRule::EveryAttemptRejected);
         assert!(capability_mismatches(&venue).is_empty());
     }
 
@@ -1465,21 +1853,6 @@ mod tests {
             "key".to_string(),
             "secret".to_string(),
         )))
-    }
-
-    #[test]
-    fn not_found_is_absent_only_with_recorded_attempt_evidence() {
-        let venue = adapter();
-        let late = Utc::now() + chrono::Duration::seconds(120);
-        let lookup = RequestWindow { started_at: late, completed_at: late };
-        assert!(matches!(venue.classify_not_found("c1", lookup), OrderLookup::Unknown));
-
-        venue.record_attempt("c1", Utc::now());
-        assert!(matches!(venue.classify_not_found("c1", lookup), OrderLookup::Absent { .. }));
-        // A lookup sent right after the attempt cannot be final.
-        let now = Utc::now();
-        let early = RequestWindow { started_at: now, completed_at: now };
-        assert!(matches!(venue.classify_not_found("c1", early), OrderLookup::Unknown));
     }
 
     #[tokio::test]

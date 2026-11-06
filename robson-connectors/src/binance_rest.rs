@@ -56,9 +56,15 @@ pub enum BinanceRestError {
     #[error("HTTP request failed: {0}")]
     RequestFailed(String),
 
-    /// API returned error
+    /// API returned error. Produced for any non-success HTTP status with a
+    /// JSON error body, so `http_status` is what tells a 4xx from a 5xx; it
+    /// stays out of the message and of the error mapping.
     #[error("Binance API error: {code} - {msg}")]
-    ApiError { code: i64, msg: String },
+    ApiError {
+        code: i64,
+        msg: String,
+        http_status: u16,
+    },
 
     /// Failed to parse response
     #[error("Failed to parse response: {0}")]
@@ -91,6 +97,9 @@ pub struct BinanceRestClient {
     api_secret: String,
     /// Use testnet
     testnet: bool,
+    /// Test seam: serve every endpoint from a local listener.
+    #[cfg(test)]
+    local_base_url: Option<String>,
 }
 
 impl BinanceRestClient {
@@ -101,6 +110,8 @@ impl BinanceRestClient {
             api_key,
             api_secret,
             testnet: false,
+            #[cfg(test)]
+            local_base_url: None,
         }
     }
 
@@ -111,6 +122,17 @@ impl BinanceRestClient {
             api_key,
             api_secret,
             testnet: true,
+            #[cfg(test)]
+            local_base_url: None,
+        }
+    }
+
+    /// Client whose every request goes to a local test listener.
+    #[cfg(test)]
+    pub(crate) fn with_local_base_url(base_url: String) -> Self {
+        Self {
+            local_base_url: Some(base_url),
+            ..Self::new("key".to_string(), "secret".to_string())
         }
     }
 
@@ -132,6 +154,10 @@ impl BinanceRestClient {
     }
 
     fn endpoint_base_url(&self, endpoint: &str) -> &str {
+        #[cfg(test)]
+        if let Some(local) = &self.local_base_url {
+            return local;
+        }
         if endpoint.starts_with("/fapi/") {
             self.base_url()
         } else {
@@ -194,7 +220,11 @@ impl BinanceRestClient {
 
         if !status.is_success() {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
-                return Err(BinanceRestError::ApiError { code: err.code, msg: err.msg });
+                return Err(BinanceRestError::ApiError {
+                    code: err.code,
+                    msg: err.msg,
+                    http_status: status.as_u16(),
+                });
             }
             return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
         }
@@ -227,7 +257,11 @@ impl BinanceRestClient {
 
         if !status.is_success() {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
-                return Err(BinanceRestError::ApiError { code: err.code, msg: err.msg });
+                return Err(BinanceRestError::ApiError {
+                    code: err.code,
+                    msg: err.msg,
+                    http_status: status.as_u16(),
+                });
             }
             return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
         }
@@ -260,7 +294,11 @@ impl BinanceRestClient {
 
         if !status.is_success() {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
-                return Err(BinanceRestError::ApiError { code: err.code, msg: err.msg });
+                return Err(BinanceRestError::ApiError {
+                    code: err.code,
+                    msg: err.msg,
+                    http_status: status.as_u16(),
+                });
             }
             return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
         }
@@ -293,7 +331,11 @@ impl BinanceRestClient {
 
         if !status.is_success() {
             if let Ok(err) = serde_json::from_str::<BinanceErrorResponse>(&body) {
-                return Err(BinanceRestError::ApiError { code: err.code, msg: err.msg });
+                return Err(BinanceRestError::ApiError {
+                    code: err.code,
+                    msg: err.msg,
+                    http_status: status.as_u16(),
+                });
             }
             return Err(BinanceRestError::RequestFailed(format!("HTTP {}: {}", status, body)));
         }

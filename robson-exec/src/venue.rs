@@ -16,7 +16,13 @@
 //! [`ExchangePort`]: crate::ports::ExchangePort
 //! [`IncomePort`]: crate::ports::IncomePort
 
-use std::{fmt, time::Duration};
+use std::{
+    collections::HashMap,
+    fmt,
+    future::Future,
+    sync::{Mutex, MutexGuard},
+    time::Duration,
+};
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -100,116 +106,194 @@ pub enum ReplacementProtocol {
     CancelThenPlace,
 }
 
-/// Local wall-clock bounds around one venue request, recorded by the
-/// adapter: `started_at` is read before the request is signed and
-/// `completed_at` after the call returned, failed or timed out, so the signed
-/// timestamp lies between them.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct RequestWindow {
-    pub started_at: DateTime<Utc>,
-    pub completed_at: DateTime<Utc>,
-}
-
-impl RequestWindow {
-    /// The window covering both (repeated attempts with one client id).
-    pub fn merge(self, other: Self) -> Self {
-        Self {
-            started_at: self.started_at.min(other.started_at),
-            completed_at: self.completed_at.max(other.completed_at),
-        }
-    }
-}
-
-fn delta(duration: Duration) -> chrono::TimeDelta {
-    chrono::TimeDelta::from_std(duration).unwrap_or(chrono::TimeDelta::MAX)
-}
-
 /// Rule under which a venue's "order not found" proves the order was never
 /// accepted ([`OrderLookup::Absent`]).
 ///
-/// Inputs are evidence, never intent timestamps: the adapter-recorded
-/// [`RequestWindow`] of every submit attempt with the client id, and the
-/// window of the lookup request(s) that returned not-found. Let `T` be the
-/// order's signed timestamp and `L` the lookup's. The venue accepts a signed
-/// request only while `venue_time − T ≤ request_validity` and
-/// `T < venue_time + clock_tolerance`. Hence:
-/// - the order can no longer be accepted once venue time exceeds
-///   `attempt.completed_at + request_validity`;
-/// - the lookup was served at venue time `≥ L − clock_tolerance ≥
-///   lookup.started_at − clock_tolerance`, and `≤ lookup.completed_at +
-///   request_validity`;
-/// - the order, if accepted, was created at venue time `≥ attempt.started_at −
-///   clock_tolerance`.
-///
-/// A not-found is final only when `lookup.started_at ≥ attempt.completed_at +
-/// request_validity + clock_tolerance + visibility_margin` (acceptance
-/// impossible for at least the margin before the lookup was served) **and**
-/// `lookup.completed_at + request_validity + visibility_margin <
-/// attempt.started_at − clock_tolerance + lookup_retention` (the lookup still
-/// returns every accepted order). `visibility_margin` is an engineering
-/// allowance for an accepted order to become visible to the lookup; venues do
-/// not document one. Without attempt evidence (none recorded, or lost on a
-/// restart), or outside that interval, a not-found is
-/// [`OrderLookup::Unknown`].
+/// Elapsed time is deliberately not an input. A signed-request window such as
+/// Binance's `recvWindow` bounds when a request can still be accepted, not
+/// when an accepted order becomes visible to a lookup, and no venue used here
+/// documents a visibility bound. A not-found stays `Unknown` however long ago
+/// the attempt was, unless the venue itself refused every attempt.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct VenueFinalityRule {
-    pub request_validity: Duration,
-    pub clock_tolerance: Duration,
-    pub visibility_margin: Duration,
-    pub lookup_retention: Duration,
+pub enum VenueFinalityRule {
+    /// Final only when every submit attempt recorded for the client id ended
+    /// in an authoritative venue rejection
+    /// ([`AttemptEvidence::AllRejected`]).
+    EveryAttemptRejected,
 }
 
 impl VenueFinalityRule {
-    /// True when a not-found observed by `lookup` is final for an order whose
-    /// submit attempts span `attempt`.
-    pub fn not_found_is_final(
-        &self,
-        attempt: Option<RequestWindow>,
-        lookup: RequestWindow,
-    ) -> bool {
-        let Some(attempt) = attempt else {
-            return false;
-        };
-        let (validity, tolerance, margin) = (
-            delta(self.request_validity),
-            delta(self.clock_tolerance),
-            delta(self.visibility_margin),
-        );
-        let Some(no_longer_acceptable) = attempt
-            .completed_at
-            .checked_add_signed(validity)
-            .and_then(|t| t.checked_add_signed(tolerance))
-            .and_then(|t| t.checked_add_signed(margin))
-        else {
-            return false;
-        };
-        let latest_served = lookup
-            .completed_at
-            .checked_add_signed(validity)
-            .and_then(|t| t.checked_add_signed(margin));
-        let retained_until = attempt
-            .started_at
-            .checked_sub_signed(tolerance)
-            .and_then(|t| t.checked_add_signed(delta(self.lookup_retention)));
-        match (latest_served, retained_until) {
-            (Some(served), Some(retained)) => {
-                lookup.started_at >= no_longer_acceptable && served < retained
+    /// Classify a raw not-found: `Absent` only under this rule, otherwise
+    /// `Unknown`. `evidence` must be read after the not-found response(s)
+    /// returned, so an attempt that started during the lookup is seen.
+    pub fn classify_not_found(self, evidence: AttemptEvidence) -> OrderLookup {
+        match self {
+            Self::EveryAttemptRejected => match evidence {
+                AttemptEvidence::AllRejected { .. } => OrderLookup::Absent { finality: self },
+                AttemptEvidence::NoRecord
+                | AttemptEvidence::Truncated
+                | AttemptEvidence::Unresolved { .. } => OrderLookup::Unknown,
             },
-            _ => false,
+        }
+    }
+}
+
+/// What a [`SubmitAttemptLedger`] knows about one client id. It speaks only
+/// for the current process: see the ledger's restart limitation, which is why
+/// `NoRecord` does not mean "never attempted" and `AllRejected` does not cover
+/// attempts made by an earlier process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AttemptEvidence {
+    /// No attempt on record: never attempted by this process.
+    NoRecord,
+    /// The ledger dropped evidence for capacity, so nothing can be concluded
+    /// about any client id.
+    Truncated,
+    /// `unresolved` attempts are not proven rejected (in flight, dropped,
+    /// accepted or indeterminate); `rejected` others were refused.
+    Unresolved { unresolved: u64, rejected: u64 },
+    /// Every attempt on record (`rejected`, at least one) ended in an
+    /// authoritative venue rejection.
+    AllRejected { rejected: u64 },
+}
+
+#[derive(Debug)]
+struct AttemptCounts {
+    unresolved: u64,
+    rejected: u64,
+}
+
+#[derive(Debug, Default)]
+struct LedgerState {
+    attempts: HashMap<String, AttemptCounts>,
+    truncated: bool,
+}
+
+/// Bounded in-memory evidence of submit attempts by client id, the input of
+/// [`VenueFinalityRule`] (ADR-0056 §2).
+///
+/// An attempt is registered before its request can be sent and starts
+/// unresolved. Its only transition is [`SubmitAttempt::rejected`], for an
+/// authoritative venue rejection; acceptance, an indeterminate outcome and a
+/// dropped future all leave it unresolved for good, so cancellation cannot
+/// read as a rejection (there is no `Drop` to run). One unresolved attempt
+/// blocks `Absent` whatever happened to other attempts with that client id.
+/// The lock is private to these synchronous methods, so it cannot be held
+/// across an await.
+///
+/// **Truncation.** A new client id at capacity drops all evidence and sets a
+/// sticky flag: every client id reads [`AttemptEvidence::Truncated`] for the
+/// rest of this instance's life. Evicting per entry would be unsound: once an
+/// indeterminate attempt is evicted, a rejected retry starts a fresh record
+/// that reads `AllRejected`.
+///
+/// **Restart limitation.** The evidence is in memory until ADR-0056 step 7
+/// persists it, and a restart has the same false-fresh shape: an attempt by an
+/// earlier (or any other) process left no record here, so a rejected retry
+/// with the same client id reads `AllRejected` and a not-found becomes a false
+/// `Absent`, although the other attempt may have been accepted. Without a
+/// retry the empty ledger reads `NoRecord`, which is `Unknown`. Until step 7,
+/// no caller may act on `Absent` for a client id that another process may have
+/// submitted. Step 7 must persist each attempt durably before its request is
+/// sent and each rejection when observed, reload them on startup, treat an
+/// attempt without a persisted rejection as unresolved, and keep the truncated
+/// state across restarts.
+#[derive(Debug)]
+pub struct SubmitAttemptLedger {
+    capacity: usize,
+    state: Mutex<LedgerState>,
+}
+
+impl SubmitAttemptLedger {
+    /// A ledger tracking at most `capacity` client ids.
+    pub fn new(capacity: usize) -> Self {
+        Self {
+            capacity,
+            state: Mutex::new(LedgerState::default()),
         }
     }
 
-    /// Classify a raw not-found: `Absent` only under this rule, otherwise
-    /// `Unknown`.
-    pub fn classify_not_found(
+    fn lock(&self) -> MutexGuard<'_, LedgerState> {
+        self.state.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Register one attempt, unresolved until [`SubmitAttempt::rejected`].
+    pub fn begin<'a>(&'a self, client_order_id: &'a str) -> SubmitAttempt<'a> {
+        let mut state = self.lock();
+        if !state.truncated {
+            if let Some(counts) = state.attempts.get_mut(client_order_id) {
+                counts.unresolved += 1;
+            } else if state.attempts.len() < self.capacity {
+                let counts = AttemptCounts { unresolved: 1, rejected: 0 };
+                state.attempts.insert(client_order_id.to_string(), counts);
+            } else {
+                state.attempts = HashMap::new();
+                state.truncated = true;
+                tracing::warn!(
+                    capacity = self.capacity,
+                    "Submit-attempt evidence truncated; every not-found is Unknown until restart"
+                );
+            }
+        }
+        SubmitAttempt { ledger: self, client_order_id }
+    }
+
+    /// Run `request` as one attempt with `client_order_id`. The attempt is on
+    /// record before `request` is first polled, so before anything can be
+    /// sent, and stays unresolved if this future is dropped at any point.
+    /// `is_rejection` is the venue's allow-list of authoritative rejections;
+    /// any other outcome leaves the attempt unresolved.
+    pub async fn submit<T, E>(
         &self,
-        attempt: Option<RequestWindow>,
-        lookup: RequestWindow,
-    ) -> OrderLookup {
-        if self.not_found_is_final(attempt, lookup) {
-            OrderLookup::Absent { finality: *self }
-        } else {
-            OrderLookup::Unknown
+        client_order_id: &str,
+        is_rejection: impl FnOnce(&E) -> bool,
+        request: impl Future<Output = Result<T, E>>,
+    ) -> Result<T, E> {
+        let attempt = self.begin(client_order_id);
+        let result = request.await;
+        if let Err(error) = &result {
+            if is_rejection(error) {
+                attempt.rejected();
+            }
+        }
+        result
+    }
+
+    /// The evidence for `client_order_id` as of now.
+    pub fn evidence(&self, client_order_id: &str) -> AttemptEvidence {
+        let state = self.lock();
+        if state.truncated {
+            return AttemptEvidence::Truncated;
+        }
+        match state.attempts.get(client_order_id) {
+            None => AttemptEvidence::NoRecord,
+            Some(counts) if counts.unresolved == 0 => {
+                AttemptEvidence::AllRejected { rejected: counts.rejected }
+            },
+            Some(counts) => AttemptEvidence::Unresolved {
+                unresolved: counts.unresolved,
+                rejected: counts.rejected,
+            },
+        }
+    }
+}
+
+/// One attempt registered by [`SubmitAttemptLedger::begin`]. Dropping it
+/// leaves the attempt unresolved.
+pub struct SubmitAttempt<'a> {
+    ledger: &'a SubmitAttemptLedger,
+    client_order_id: &'a str,
+}
+
+impl SubmitAttempt<'_> {
+    /// The venue authoritatively refused this attempt. Consumes the handle, so
+    /// one attempt cannot be counted twice.
+    pub fn rejected(self) {
+        let mut state = self.ledger.lock();
+        // Missing only after truncation, when nothing is recorded any more.
+        if let Some(counts) = state.attempts.get_mut(self.client_order_id) {
+            counts.unresolved -= 1;
+            counts.rejected += 1;
         }
     }
 }
@@ -301,8 +385,8 @@ pub struct StopParams {
 #[derive(Debug, Clone)]
 pub enum OrderLookup {
     /// The venue never accepted the order. Returned **only** under the
-    /// venue's documented [`VenueFinalityRule`]; a raw not-found outside that
-    /// rule is `Unknown`.
+    /// venue's [`VenueFinalityRule`]; a raw not-found outside that rule is
+    /// `Unknown`.
     Absent { finality: VenueFinalityRule },
     /// Live on the book with no execution (resting, or a conditional order
     /// that has not triggered).
@@ -542,9 +626,16 @@ pub trait TradingPort: Send + Sync {
     /// Look up an order by the client id it was submitted with, in every
     /// order namespace the venue places under (regular and conditional).
     /// A not-found is `Absent` only under the venue's [`VenueFinalityRule`],
-    /// evaluated against the [`RequestWindow`]s the adapter itself recorded
-    /// for submit attempts with this client id; without such evidence it is
-    /// `Unknown`. A request failure is `Err`.
+    /// evaluated against the [`SubmitAttemptLedger`] evidence for this client
+    /// id, read after the not-found responses returned; otherwise it is
+    /// `Unknown`, however much time has passed. A request failure is `Err`.
+    ///
+    /// **Restart limitation.** The evidence does not survive a restart until
+    /// ADR-0056 step 7 persists it. An attempt by an earlier (or any other)
+    /// process is not on record, so a rejected retry with the same client id
+    /// yields a false `Absent` although that attempt may have been accepted.
+    /// Until then, no caller may act on `Absent` for a client id that another
+    /// process may have submitted. The ledger states what step 7 must do.
     async fn order_by_client_id(
         &self,
         symbol: &Symbol,
@@ -788,77 +879,175 @@ pub async fn replace_place_then_cancel<T: TradingPort + ?Sized>(
 
 #[cfg(test)]
 mod tests {
-    use chrono::TimeZone;
-
     use super::*;
 
-    fn rule() -> VenueFinalityRule {
-        VenueFinalityRule {
-            request_validity: Duration::from_secs(5),
-            clock_tolerance: Duration::from_secs(1),
-            visibility_margin: Duration::from_secs(60),
-            lookup_retention: Duration::from_secs(3 * 24 * 60 * 60),
+    const RULE: VenueFinalityRule = VenueFinalityRule::EveryAttemptRejected;
+
+    fn is_absent(ledger: &SubmitAttemptLedger, id: &str) -> bool {
+        matches!(
+            RULE.classify_not_found(ledger.evidence(id)),
+            OrderLookup::Absent { finality } if finality == RULE
+        )
+    }
+
+    fn is_unknown(ledger: &SubmitAttemptLedger, id: &str) -> bool {
+        matches!(RULE.classify_not_found(ledger.evidence(id)), OrderLookup::Unknown)
+    }
+
+    /// Time cannot promote a lookup because no input carries it: the signature
+    /// takes evidence only, the evidence holds counts only, and the ledger
+    /// reads no clock. Whenever the lookup runs, these inputs give these
+    /// outputs.
+    #[test]
+    fn elapsed_time_cannot_promote_a_not_found() {
+        let classify: fn(VenueFinalityRule, AttemptEvidence) -> OrderLookup =
+            VenueFinalityRule::classify_not_found;
+        for evidence in [
+            AttemptEvidence::NoRecord,
+            AttemptEvidence::Truncated,
+            AttemptEvidence::Unresolved { unresolved: 1, rejected: 0 },
+            AttemptEvidence::Unresolved { unresolved: 1, rejected: u64::MAX },
+        ] {
+            assert!(matches!(classify(RULE, evidence), OrderLookup::Unknown), "{evidence:?}");
         }
     }
 
-    fn at(secs: i64) -> DateTime<Utc> {
-        Utc.with_ymd_and_hms(2026, 11, 5, 12, 0, 0).unwrap() + chrono::Duration::seconds(secs)
+    #[test]
+    fn no_evidence_is_unknown() {
+        let ledger = SubmitAttemptLedger::new(8);
+        assert_eq!(ledger.evidence("c1"), AttemptEvidence::NoRecord);
+        assert!(is_unknown(&ledger, "c1"));
     }
 
-    fn window(started: i64, completed: i64) -> RequestWindow {
-        RequestWindow {
-            started_at: at(started),
-            completed_at: at(completed),
+    #[test]
+    fn all_attempts_rejected_is_absent() {
+        let ledger = SubmitAttemptLedger::new(8);
+        ledger.begin("c1").rejected();
+        assert_eq!(ledger.evidence("c1"), AttemptEvidence::AllRejected { rejected: 1 });
+        assert!(is_absent(&ledger, "c1"));
+        ledger.begin("c1").rejected();
+        assert_eq!(ledger.evidence("c1"), AttemptEvidence::AllRejected { rejected: 2 });
+        assert!(is_absent(&ledger, "c1"));
+        assert!(is_unknown(&ledger, "other"));
+    }
+
+    #[test]
+    fn in_flight_attempt_is_unknown_until_it_is_rejected() {
+        let ledger = SubmitAttemptLedger::new(8);
+        let attempt = ledger.begin("c1");
+        assert_eq!(ledger.evidence("c1"), AttemptEvidence::Unresolved {
+            unresolved: 1,
+            rejected: 0
+        });
+        assert!(is_unknown(&ledger, "c1"));
+        attempt.rejected();
+        assert!(is_absent(&ledger, "c1"));
+    }
+
+    #[test]
+    fn mixed_rejected_and_accepted_is_unknown_in_either_order() {
+        // Nothing ever resolves an accepted (or indeterminate) attempt.
+        let ledger = SubmitAttemptLedger::new(8);
+        ledger.begin("rejected-first").rejected();
+        ledger.begin("rejected-first");
+        ledger.begin("accepted-first");
+        ledger.begin("accepted-first").rejected();
+        for id in ["rejected-first", "accepted-first"] {
+            assert_eq!(ledger.evidence(id), AttemptEvidence::Unresolved {
+                unresolved: 1,
+                rejected: 1
+            });
+            assert!(is_unknown(&ledger, id));
         }
     }
 
-    fn absent(attempt: Option<RequestWindow>, lookup: RequestWindow) -> bool {
-        matches!(rule().classify_not_found(attempt, lookup), OrderLookup::Absent { .. })
+    #[tokio::test]
+    async fn submit_registers_before_the_request_is_polled() {
+        let ledger = SubmitAttemptLedger::new(8);
+        let request = async {
+            assert_eq!(ledger.evidence("c1"), AttemptEvidence::Unresolved {
+                unresolved: 1,
+                rejected: 0
+            });
+            Err::<(), &str>("refused")
+        };
+        let submit = ledger.submit("c1", |_| true, request);
+        // Futures are lazy: built but never polled, nothing was sent.
+        assert_eq!(ledger.evidence("c1"), AttemptEvidence::NoRecord);
+        assert!(submit.await.is_err());
+        assert_eq!(ledger.evidence("c1"), AttemptEvidence::AllRejected { rejected: 1 });
+    }
+
+    #[tokio::test]
+    async fn dropped_submit_stays_unresolved_even_after_a_rejected_retry() {
+        let ledger = SubmitAttemptLedger::new(8);
+        let stuck = ledger.submit("c1", |_: &()| true, std::future::pending::<Result<(), ()>>());
+        // One poll sends the request; the elapsed timeout then drops the future.
+        assert!(tokio::time::timeout(Duration::from_millis(1), stuck).await.is_err());
+        assert_eq!(ledger.evidence("c1"), AttemptEvidence::Unresolved {
+            unresolved: 1,
+            rejected: 0
+        });
+        assert!(is_unknown(&ledger, "c1"));
+
+        let retry = ledger.submit("c1", |_| true, async { Err::<(), ()>(()) });
+        assert!(retry.await.is_err());
+        assert_eq!(ledger.evidence("c1"), AttemptEvidence::Unresolved {
+            unresolved: 1,
+            rejected: 1
+        });
+        assert!(is_unknown(&ledger, "c1"));
+    }
+
+    #[tokio::test]
+    async fn submit_leaves_outcomes_outside_the_allow_list_unresolved() {
+        let ledger = SubmitAttemptLedger::new(8);
+        let accepted = ledger.submit("ok", |_: &()| true, async { Ok::<(), ()>(()) });
+        accepted.await.unwrap();
+        let failed = ledger.submit("failed", |_| false, async { Err::<(), ()>(()) });
+        assert!(failed.await.is_err());
+        for id in ["ok", "failed"] {
+            assert_eq!(ledger.evidence(id), AttemptEvidence::Unresolved {
+                unresolved: 1,
+                rejected: 0
+            });
+        }
     }
 
     #[test]
-    fn not_found_needs_attempt_evidence() {
-        assert!(!absent(None, window(1_000, 1_001)));
-        // 5 s validity + 1 s tolerance + 60 s margin after the attempt ended.
-        assert!(absent(Some(window(0, 0)), window(66, 67)));
-        assert!(!absent(Some(window(0, 0)), window(65, 66)));
-        assert!(matches!(
-            rule().classify_not_found(Some(window(0, 0)), window(66, 67)),
-            OrderLookup::Absent { finality } if finality == rule()
-        ));
+    fn truncation_is_sticky_and_a_rejected_retry_cannot_look_fresh() {
+        let ledger = SubmitAttemptLedger::new(2);
+        ledger.begin("indeterminate");
+        ledger.begin("refused").rejected();
+        assert!(is_absent(&ledger, "refused"));
+        // Repeating a tracked client id at capacity needs no new entry.
+        ledger.begin("refused").rejected();
+        assert!(is_absent(&ledger, "refused"));
+
+        let in_flight = ledger.begin("refused");
+        ledger.begin("overflow").rejected();
+        // A fresh record for this retry would read `AllRejected`.
+        ledger.begin("indeterminate").rejected();
+        in_flight.rejected();
+        for id in ["indeterminate", "refused", "overflow", "never"] {
+            assert_eq!(ledger.evidence(id), AttemptEvidence::Truncated);
+            assert!(is_unknown(&ledger, id));
+        }
+        // Everything was dropped and nothing is recorded any more.
+        assert!(ledger.lock().attempts.is_empty());
     }
 
     #[test]
-    fn delayed_signing_is_bounded_by_attempt_completion() {
-        // The attempt started long ago but its call only returned at 600 s:
-        // the request may have been signed (and accepted) as late as that.
-        let attempt = Some(window(0, 600));
-        assert!(!absent(attempt, window(620, 621)));
-        assert!(absent(attempt, window(666, 667)));
-    }
-
-    #[test]
-    fn delayed_response_counts_from_lookup_start() {
-        // The lookup was sent too early; a late response does not move its
-        // observation time.
-        assert!(!absent(Some(window(0, 0)), window(30, 500)));
-    }
-
-    #[test]
-    fn not_found_is_unknown_near_or_past_retention() {
-        let day = 24 * 60 * 60;
-        assert!(absent(Some(window(0, 0)), window(2 * day, 2 * day + 1)));
-        // Retention counts from the earliest creation: started_at − tolerance.
-        assert!(!absent(Some(window(0, 0)), window(3 * day - 70, 3 * day - 60)));
-        assert!(!absent(Some(window(0, 0)), window(4 * day, 4 * day + 1)));
-        // A slow lookup response is bounded by its completion.
-        assert!(!absent(Some(window(0, 0)), window(2 * day, 3 * day)));
-    }
-
-    #[test]
-    fn merged_attempts_span_every_attempt() {
-        let merged = window(10, 20).merge(window(5, 30));
-        assert_eq!(merged, window(5, 30));
+    fn ledger_stays_within_capacity() {
+        let ledger = SubmitAttemptLedger::new(4);
+        for i in 0..4 {
+            ledger.begin(&format!("c{i}")).rejected();
+            assert!(ledger.lock().attempts.len() <= 4);
+        }
+        assert!(is_absent(&ledger, "c0"));
+        ledger.begin("c4").rejected();
+        assert!(ledger.lock().attempts.is_empty());
+        assert_eq!(ledger.evidence("c0"), AttemptEvidence::Truncated);
     }
 
     #[test]
