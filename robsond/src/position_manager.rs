@@ -6216,6 +6216,122 @@ mod tests {
         }
     }
 
+    /// An Active long of quantity 1 with a live exchange stop at 90.
+    async fn active_leg_with_live_stop(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+    ) -> (Position, String) {
+        let mut position =
+            save_active_position(manager, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+        let trailing_stop = Price::new(dec!(90)).unwrap();
+        position.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(
+            Price::new(dec!(100)).unwrap(),
+            trailing_stop,
+        ));
+        let placed = manager
+            .executor
+            .exchange()
+            .place_stop_market_order(
+                &position.symbol,
+                position.side.exit_action(),
+                position.quantity,
+                trailing_stop,
+                "ins-step6",
+            )
+            .await
+            .unwrap();
+        let stop_id = placed.exchange_order_id;
+        position.insurance_stop_id = Some(stop_id.clone());
+        if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+            *insurance_stop_id = Some(stop_id.clone());
+        }
+        manager.store.positions().save(&position).await.unwrap();
+        (position, stop_id)
+    }
+
+    async fn stop_crossing_tick(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        position: &Position,
+    ) -> DaemonResult<()> {
+        manager
+            .process_market_data(MarketData {
+                venue: test_venue(),
+                symbol: position.symbol.clone(),
+                price: Price::new(dec!(90)).unwrap(),
+                timestamp: chrono::Utc::now(),
+                source: crate::event_bus::MarketDataSource::Ws,
+            })
+            .await
+    }
+
+    /// What a leg looks like afterwards: its state, whether its stop is still
+    /// on the venue, and the events it produced, in order.
+    async fn leg_outcome(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        position: &Position,
+        stop_id: &str,
+    ) -> serde_json::Value {
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        serde_json::json!({
+            "state": leg.state.name(),
+            "stop_live": manager.executor.exchange().has_stop_order(stop_id),
+            "events": events.iter().map(|event| event.event_type()).collect::<Vec<_>>(),
+        })
+    }
+
+    /// ADR-0056 step 6: the leg-level outcomes of the exit path.
+    async fn exit_leg_scenarios() -> serde_json::Value {
+        let manager = create_test_manager().await;
+        let (position, stop_id) = active_leg_with_live_stop(&manager).await;
+        assert!(stop_crossing_tick(&manager, &position).await.is_ok());
+        let clean_exit = leg_outcome(&manager, &position, &stop_id).await;
+
+        let manager = create_test_manager().await;
+        let (position, stop_id) = active_leg_with_live_stop(&manager).await;
+        manager.executor.exchange().set_order_fail_next(true);
+        assert!(stop_crossing_tick(&manager, &position).await.is_err());
+        let exit_order_fails = leg_outcome(&manager, &position, &stop_id).await;
+
+        let manager = create_test_manager().await;
+        let (position, stop_id) = active_leg_with_live_stop(&manager).await;
+        manager
+            .execute_and_persist(vec![EngineAction::PlaceExitOrder {
+                position_id: position.id,
+                cycle_id: None,
+                symbol: position.symbol.clone(),
+                side: position.side.exit_action(),
+                quantity: position.quantity,
+                reason: robson_domain::ExitReason::TrailingStop,
+            }])
+            .await
+            .unwrap();
+        manager
+            .handle_exit_fill(
+                position.id,
+                Price::new(dec!(90)).unwrap(),
+                Quantity::new(dec!(0.9)).unwrap(),
+                Decimal::ZERO,
+                chrono::Utc::now(),
+            )
+            .await
+            .unwrap();
+        let exit_fill_below_leg_quantity = leg_outcome(&manager, &position, &stop_id).await;
+
+        serde_json::json!({
+            "clean_exit": clean_exit,
+            "exit_order_fails": exit_order_fails,
+            "exit_fill_below_leg_quantity": exit_fill_below_leg_quantity,
+        })
+    }
+
+    #[tokio::test]
+    async fn exit_leg_outcomes_match_the_before_fixture() {
+        let observed = exit_leg_scenarios().await;
+        let expected: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/adr0056_step6_leg_before.json")).unwrap();
+        assert_eq!(observed, expected);
+    }
+
     /// Regression for #142: when the exchange-side insurance stop already
     /// closed the position and the reduce-only exit is rejected (-2022), the
     /// tick must hand off to reverse reconciliation and close the position
