@@ -318,7 +318,7 @@ fn default_stop_buffer_bps() -> Decimal {
     Decimal::ZERO
 }
 
-/// Default margin-cap headroom: 100 bps (1%). A margin-capped order sized to
+/// Default capital-cap headroom: 100 bps (1%). A capital-capped order sized to
 /// 100% of the wallet is unexecutable on the exchange — the taker fee is
 /// charged against available balance and initial margin is computed at the
 /// mark price with a worst-price cushion, not at the sizing reference price
@@ -382,7 +382,7 @@ pub fn effective_stop_price_with_guard(
 ///
 /// Risk per trade is capped at 1% of capital. This is a v3 policy decision:
 /// no configuration, no alternative modes, no overrides, and actual realized
-/// risk may be lower when the available 1x margin caps the position size.
+/// risk may be lower when the 1x capital cap bounds the position size.
 ///
 /// Position size is derived from the Golden Rule with an execution-cost
 /// buffer (ADR-0039): the 1% budget must absorb the worst expected realized
@@ -495,7 +495,7 @@ pub struct RiskConfig {
     /// the stop price (0 = execute exactly at the technical level)
     #[serde(default = "default_stop_buffer_bps")]
     stop_buffer_bps: Decimal,
-    /// Headroom reserved when the 1x margin cap binds, in basis points of
+    /// Headroom reserved when the 1x capital cap binds, in basis points of
     /// capital (covers taker fee + mark-price cushion so the capped order is
     /// executable on the exchange)
     #[serde(default = "default_margin_headroom_bps")]
@@ -507,7 +507,7 @@ pub struct RiskConfig {
 }
 
 impl RiskConfig {
-    /// Fixed leverage: 1x. Margin availability is the physical bound for
+    /// Fixed leverage: 1x. Available capital is the physical bound for
     /// stop-derived sizing.
     pub const LEVERAGE: u8 = 1;
 
@@ -622,12 +622,12 @@ impl RiskConfig {
         Ok(self)
     }
 
-    /// Override the margin-cap headroom (operator-configured value).
+    /// Override the capital-cap headroom (operator-configured value).
     ///
     /// `margin_headroom_bps` is the fraction of capital, in basis points,
-    /// reserved when the 1x margin cap binds (0 ≤ bps ≤ 1000). It must cover
+    /// reserved when the 1x capital cap binds (0 ≤ bps ≤ 1000). It must cover
     /// the taker fee plus the exchange's mark-price/worst-price cushion, or
-    /// margin-capped orders are rejected by the exchange.
+    /// capital-capped orders are rejected by the exchange.
     ///
     /// # Errors
     /// Returns `DomainError::InvalidRiskConfig` when out of range.
@@ -644,7 +644,7 @@ impl RiskConfig {
         Ok(self)
     }
 
-    /// Headroom reserved when the 1x margin cap binds (basis points of
+    /// Headroom reserved when the 1x capital cap binds (basis points of
     /// capital)
     pub fn margin_headroom_bps(&self) -> Decimal {
         self.margin_headroom_bps

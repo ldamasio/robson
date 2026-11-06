@@ -480,9 +480,9 @@ impl Engine {
         &self,
         position: &Position,
         signal: &DetectorSignal,
-        available_margin: Option<Decimal>,
+        available_quote: Option<Decimal>,
     ) -> Result<EngineDecision, EngineError> {
-        self.decide_entry_with_rules(position, signal, available_margin, None)
+        self.decide_entry_with_rules(position, signal, available_quote, None)
     }
 
     /// [`Self::decide_entry`] with runtime symbol trading rules (issue #154).
@@ -495,7 +495,7 @@ impl Engine {
         &self,
         position: &Position,
         signal: &DetectorSignal,
-        available_margin: Option<Decimal>,
+        available_quote: Option<Decimal>,
         rules: Option<&SymbolTradingRules>,
     ) -> Result<EngineDecision, EngineError> {
         // 1. Validate position is Armed
@@ -557,7 +557,7 @@ impl Engine {
 
         // Size from the plan (ADR-0050 §3): adverse-fill costing, four-stage
         // bounds validation (the typed executable-stage rejection included),
-        // margin cap against the live balance, and lot-step quantization
+        // capital cap against the live balance, and lot-step quantization
         // down. The planned risk is recomputed from the FINAL quantity and
         // an overrun is an error, never a clamped report.
         let sized = size_entry(
@@ -565,7 +565,7 @@ impl Engine {
             &signal.entry_price,
             &tech_stop,
             &plan,
-            available_margin,
+            available_quote,
             rules,
         )
         .map_err(EngineError::DomainError)?;
