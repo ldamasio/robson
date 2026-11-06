@@ -512,6 +512,18 @@ mod tests {
         assert!(matches!(outcome, ReplaceOutcome::Unknown { new: None }));
         assert!(s.has_stop_order(&old.exchange_order_id));
 
+        // A rejected retry does not resolve that earlier failure.
+        s.set_reject_order_next(true);
+        let outcome = s.replace_protection(&sym, &old, params("ins-2")).await.unwrap();
+        assert!(matches!(outcome, ReplaceOutcome::Unknown { new: None }));
+        assert!(s.has_stop_order(&old.exchange_order_id));
+
+        // A rejection with no other attempt is definitive.
+        s.set_reject_order_next(true);
+        let outcome = s.replace_protection(&sym, &old, params("ins-r")).await.unwrap();
+        assert!(matches!(outcome, ReplaceOutcome::OldKeptNewRejected { .. }));
+        assert!(s.has_stop_order(&old.exchange_order_id));
+
         match s.replace_protection(&sym, &old, params("ins-3")).await.unwrap() {
             ReplaceOutcome::Replaced { new, old_filled } => {
                 assert!(old_filled.is_zero());

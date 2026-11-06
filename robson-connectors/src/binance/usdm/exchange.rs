@@ -979,7 +979,7 @@ impl TradingPort for BinanceExchangeAdapter {
         old: &StopRef,
         new: StopParams,
     ) -> Result<ReplaceOutcome, ExecError> {
-        venue::replace_place_then_cancel(self, symbol, old, new).await
+        venue::replace_place_then_cancel(self, &self.submit_attempts, symbol, old, new).await
     }
 
     /// Lookup in both order namespaces this adapter places under: `GET
@@ -1726,6 +1726,143 @@ mod submit_attempt_evidence {
             assert_eq!(venue.submit_attempts.evidence("c1"), IN_FLIGHT, "{status}");
             assert!(is_unknown(&venue, "c1").await, "{status}");
         }
+    }
+
+    const STOP_ACCEPTED: &str = r#"{"algoId":998877,"clientAlgoId":"ins-2",
+        "algoType":"CONDITIONAL","orderType":"STOP_MARKET","symbol":"BTCUSDT","side":"SELL",
+        "quantity":"0.01","algoStatus":"NEW","triggerPrice":"91000","reduceOnly":true,
+        "createTime":1,"updateTime":2}"#;
+    const STOP_CANCELLED: &str = r#"{"algoId":77,"clientAlgoId":"ins-1","code":"200","msg":"OK"}"#;
+
+    /// A venue scripting the successor's placements as [`scripted_venue`] does,
+    /// counting the cancel requests that reach it.
+    async fn replacement_venue(
+        first: Reply,
+        then: Reply,
+    ) -> (Arc<BinanceExchangeAdapter>, Arc<AtomicUsize>) {
+        let (listener, venue) = bound_venue().await;
+        let posts = AtomicUsize::new(0);
+        let cancels = Arc::new(AtomicUsize::new(0));
+        let counter = cancels.clone();
+        serve(listener, move |request| match request {
+            "POST /fapi/v1/algoOrder" => match posts.fetch_add(1, Ordering::SeqCst) {
+                0 => first.clone(),
+                _ => then.clone(),
+            },
+            "DELETE /fapi/v1/algoOrder" => {
+                counter.fetch_add(1, Ordering::SeqCst);
+                Some((200, STOP_CANCELLED.to_string()))
+            },
+            _ => not_found(request),
+        });
+        (venue, cancels)
+    }
+
+    async fn replace_with(
+        venue: &BinanceExchangeAdapter,
+        quantity: Decimal,
+        client_order_id: &str,
+    ) -> ReplaceOutcome {
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let params = StopParams {
+            close_side: OrderSide::Sell,
+            quantity: Quantity::new(quantity).unwrap(),
+            trigger: Price::new(dec!(91000)).unwrap(),
+            client_order_id: client_order_id.to_string(),
+        };
+        venue.replace_protection(&symbol, &StopRef::new("77"), params).await.unwrap()
+    }
+
+    async fn replace(venue: &BinanceExchangeAdapter) -> ReplaceOutcome {
+        replace_with(venue, dec!(0.01), "ins-2").await
+    }
+
+    #[tokio::test]
+    async fn accepted_successor_cancels_the_old_stop() {
+        // Control: the cancel counter of the tests below does count.
+        let accepted = Some((200, STOP_ACCEPTED.to_string()));
+        let (venue, cancels) = replacement_venue(accepted.clone(), accepted).await;
+
+        let outcome = replace(&venue).await;
+        assert!(matches!(outcome, ReplaceOutcome::Replaced { .. }), "{outcome:?}");
+        assert_eq!(cancels.load(Ordering::SeqCst), 1);
+    }
+
+    #[tokio::test]
+    async fn rejected_successor_keeps_the_old_stop() {
+        // -2021 maps to `ExecError::Exchange`: the variant does not decide.
+        for code in [-2010, -2019, -2021, -2022] {
+            let rejected = Some((400, api_error(code)));
+            let (venue, cancels) = replacement_venue(rejected.clone(), rejected).await;
+
+            let outcome = replace(&venue).await;
+            assert!(
+                matches!(&outcome, ReplaceOutcome::OldKeptNewRejected { reason }
+                    if reason.contains("refused")),
+                "{code}: {outcome:?}"
+            );
+            assert_eq!(cancels.load(Ordering::SeqCst), 0, "{code}");
+        }
+    }
+
+    #[tokio::test]
+    async fn replacement_stays_unknown_without_proof_of_rejection() {
+        for (case, reply) in [
+            ("503 with a JSON rejection code", (503, api_error(-2010))),
+            ("500 with a JSON rejection code", (500, api_error(-2019))),
+            ("parse failure after a 2xx", (200, "not json".to_string())),
+        ] {
+            let reply = Some(reply);
+            let (venue, cancels) = replacement_venue(reply.clone(), reply).await;
+
+            let outcome = replace(&venue).await;
+            assert!(
+                matches!(outcome, ReplaceOutcome::Unknown { new: None }),
+                "{case}: {outcome:?}"
+            );
+            assert_eq!(cancels.load(Ordering::SeqCst), 0, "{case}");
+        }
+    }
+
+    #[tokio::test]
+    async fn rejected_successor_retry_after_an_unresolved_attempt_stays_unknown() {
+        let (venue, cancels) =
+            replacement_venue(Some((503, api_error(-1007))), Some((400, api_error(-2010)))).await;
+
+        let outcome = replace(&venue).await;
+        assert!(matches!(outcome, ReplaceOutcome::Unknown { new: None }), "{outcome:?}");
+        let outcome = replace(&venue).await;
+        assert!(matches!(outcome, ReplaceOutcome::Unknown { new: None }), "{outcome:?}");
+        assert_eq!(venue.submit_attempts.evidence("ins-2"), AttemptEvidence::Unresolved {
+            unresolved: 1,
+            rejected: 1
+        });
+        assert_eq!(cancels.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn rejected_successor_with_truncated_evidence_stays_unknown() {
+        let rejected = Some((400, api_error(-2010)));
+        let (venue, cancels) = replacement_venue(rejected.clone(), rejected).await;
+        for i in 0..=SUBMIT_ATTEMPTS_CAPACITY {
+            venue.submit_attempts.begin(&format!("fill-{i}"));
+        }
+
+        let outcome = replace(&venue).await;
+        assert!(matches!(outcome, ReplaceOutcome::Unknown { new: None }), "{outcome:?}");
+        assert_eq!(cancels.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn successor_refused_before_sending_stays_unknown() {
+        // Below the lot step: `OrderRejected` with nothing sent, so no evidence.
+        let accepted = Some((200, STOP_ACCEPTED.to_string()));
+        let (venue, cancels) = replacement_venue(accepted.clone(), accepted).await;
+
+        let outcome = replace_with(&venue, dec!(0.0001), "ins-2").await;
+        assert!(matches!(outcome, ReplaceOutcome::Unknown { new: None }), "{outcome:?}");
+        assert_eq!(venue.submit_attempts.evidence("ins-2"), AttemptEvidence::NoRecord);
+        assert_eq!(cancels.load(Ordering::SeqCst), 0);
     }
 
     #[tokio::test]

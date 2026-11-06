@@ -639,7 +639,7 @@ impl venue::TradingPort for StubExchange {
         old: &StopRef,
         new: StopParams,
     ) -> Result<ReplaceOutcome, ExecError> {
-        venue::replace_place_then_cancel(self, symbol, old, new).await
+        venue::replace_place_then_cancel(self, &self.submit_attempts, symbol, old, new).await
     }
 
     async fn order_by_client_id(

@@ -434,7 +434,8 @@ pub enum ReplaceOutcome {
         new: PlacedStop,
         old_filled: Decimal,
     },
-    /// The venue rejected the successor; the old stop was never touched.
+    /// The venue authoritatively rejected every attempt with the successor's
+    /// client id; the old stop was never touched.
     OldKeptNewRejected { reason: String },
     /// `CancelThenPlace` only: the old stop was cancelled and the successor
     /// rejected; the residual is unprotected.
@@ -846,8 +847,19 @@ pub fn capability_mismatches<V: Venue + ?Sized>(venue: &V) -> Vec<&'static str> 
 /// is never cancelled before the successor is accepted, so this protocol
 /// never yields `OldCancelledNewRejected` or `TriggerAlreadyCrossed` (a
 /// crossed trigger is a rejection of the successor with the old stop live).
+///
+/// A failed placement is classified from `attempts`, the ledger `venue`
+/// registers its placements in, read after the failure returned; the error
+/// variant proves nothing (Binance `-2010` maps to `OrderRejected` at any HTTP
+/// status). `OldKeptNewRejected` requires
+/// [`AttemptEvidence::AllRejected`] for the successor's client id. Anything
+/// else is `Unknown { new: None }`, to reconcile before any further
+/// submission: a rejected retry after an earlier unresolved attempt, truncated
+/// evidence, and a placement refused locally before anything was sent
+/// (`NoRecord`).
 pub async fn replace_place_then_cancel<T: TradingPort + ?Sized>(
     venue: &T,
+    attempts: &SubmitAttemptLedger,
     symbol: &Symbol,
     old: &StopRef,
     new: StopParams,
@@ -857,11 +869,17 @@ pub async fn replace_place_then_cancel<T: TradingPort + ?Sized>(
         .await
     {
         Ok(placed) => placed,
-        Err(ExecError::OrderRejected(reason)) => {
-            return Ok(ReplaceOutcome::OldKeptNewRejected { reason });
+        Err(error) => {
+            return Ok(match attempts.evidence(&new.client_order_id) {
+                AttemptEvidence::AllRejected { .. } => {
+                    ReplaceOutcome::OldKeptNewRejected { reason: error.to_string() }
+                },
+                // The successor may exist.
+                AttemptEvidence::NoRecord
+                | AttemptEvidence::Truncated
+                | AttemptEvidence::Unresolved { .. } => ReplaceOutcome::Unknown { new: None },
+            });
         },
-        // Transport or unclassified failure: the successor may exist.
-        Err(_) => return Ok(ReplaceOutcome::Unknown { new: None }),
     };
     match venue.cancel_protection(symbol, old).await {
         Ok(StopCancelOutcome::Cancelled { filled_before_cancel, .. }) => {
