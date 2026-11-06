@@ -108,21 +108,25 @@ release as a **forwarding compatibility layer** (same method names, implemented 
 TradingPort                      required
   trading_rules / trading_rules_preview                      (issue #154 contracts unchanged)
   place_market_order(symbol, side, qty, client_id, intent: EntryOrReduce) -> OrderResult
-  place_protection(symbol, close_side, qty, trigger, client_id) -> StopRef
+  place_protection(symbol, close_side, qty, trigger, client_id) -> PlacedStop { stop: StopRef, acceptance: OrderResult }
   cancel_protection(symbol, StopRef) -> StopCancelOutcome
-      StopCancelOutcome = { Cancelled{filled_before_cancel: Decimal, fills}, AlreadyGone{final: OrderLookup}, Unknown }
+      StopCancelOutcome = { Cancelled{filled_before_cancel: Decimal, fills}, AlreadyGone{final_state: OrderLookup}, Unknown }
   replace_protection(symbol, old: StopRef, new: StopParams) -> ReplaceOutcome
-      ReplaceOutcome = { Replaced{new, old_filled: Decimal}, OldKeptNewRejected, OldCancelledNewRejected{old_filled},
-                         TriggerAlreadyCrossed{old: OrderLookup, residual: Decimal}, Unknown }
+      ReplaceOutcome = { Replaced{new: PlacedStop, old_filled: Decimal}, OldKeptNewRejected{reason},
+                         OldCancelledNewRejected{old_filled, reason},
+                         TriggerAlreadyCrossed{old: OrderLookup, residual: Decimal}, Unknown{new: Option<PlacedStop>} }
       TriggerAlreadyCrossed is a venue rejection of the new trigger, not execution evidence; `old` is the old stop's
-      final state with authoritative cumulative fills and `residual = governed − old_filled`
+      final state with authoritative cumulative fills and `residual = governed − old_filled`.
+      A replacement reports a rejection only when every attempt on record for the successor's client id was
+      authoritatively refused; any other placement failure is Unknown{new: None}. Unknown{new: Some(..)} means the
+      successor is accepted and the old stop's state is what is unknown
   order_by_client_id(symbol, client_id) -> OrderLookup
-      OrderLookup = { Absent{finality: VenueFinalityRule}, Open{filled_qty}, PartiallyFilled{..}, Terminal{fills,
-                      cancelled_qty}, Unknown }
-      Absent is returned only under the venue's documented finality rule (e.g. not found on both the live and the
-      historical lookup after the venue's propagation window); a raw not-found response is Unknown
+      OrderLookup = { Absent{finality: VenueFinalityRule}, Open{filled_qty}, PartiallyFilled{..},
+                      Terminal{filled_qty, cancelled_qty, fills}, Unknown }
+      Absent is returned only under the venue's finality rule (below), never because time has passed; a raw not-found
+      response is Unknown
   order_by_exchange_id / protection_fill(symbol, StopRef) / open_protective_orders
-  user_trades_since(cursor) / price / health
+  user_trades_since(symbol, since, limit) / price / health
 
 AccountPort                      required
   cash(asset) -> Cash { free, locked, as_of }
@@ -133,17 +137,18 @@ AccountPort                      required
 
 PositionAccountPort              required when account_kind = PositionAccount
   validate_position_settings(symbol, expected_leverage = 1)  (One-way)
-  position_snapshot() -> { wallet_balance, unrealized_pnl, positions: Vec<ExchangePosition>, as_of }
+  balance() / open_positions()
+  position_snapshot() -> { wallet_balance, unrealized_pnl, positions: Vec<ExchangePosition>, as_of }   built from those two
   close_position_market(symbol, side, qty, client_id)
 
 InventoryPort                    required when account_kind = BalanceAccount
   account_observation() -> { holdings: Vec<(Asset, Holding{free, locked})>   every nonzero holding, all assets,
-                             open_orders: Vec<OpenOrderRef>,                   independent of configured symbols
+                             open_orders: Vec<AccountOpenOrder{symbol, order}>, independent of configured symbols
                              as_of }
   governed_inventory(symbol) -> GovernedInventory{qty, fill_ids}            derived from authoritative fills
 
 SettlementPort                   required (every venue)
-  settlement_since(cursor) -> Vec<SettlementRecord>      realized pnl, commission (amount, asset), funding
+  settlement_since(since, limit) -> Vec<SettlementRecord>  realized pnl, commission (amount, asset), funding
                                                          where applicable; derived from authoritative fills and
                                                          account records when the venue has no income endpoint
 
@@ -165,6 +170,26 @@ trait Venue: TradingPort + AccountPort {
 `VenueCapabilities` is data: `market_kind`, `account_kind`, `supports_short`, `reduce_only_wire_flag`,
 `protection: ProtectionKind`, `replacement: ReplacementProtocol`, `has_funding`, `order_finality: VenueFinalityRule`. The executor and the daemon branch on
 capabilities, never on the venue id. The conformance suite (§10) checks that flags and accessors agree.
+
+**Order finality.** The one rule is `VenueFinalityRule::EveryAttemptRejected`: a not-found is `Absent` only when every
+submit attempt on record for the client id ended in an authoritative venue rejection. Elapsed time is not an input: a
+signed-request window bounds when a request can still be accepted, not when an accepted order becomes visible to a
+lookup, and no venue used here documents a visibility bound. A not-found therefore stays `Unknown` for as long as an
+attempt is unresolved, and may stay `Unknown` indefinitely (see step 7, §8).
+
+The evidence is a `SubmitAttemptLedger` kept by the adapter. An attempt is on record before its request can be sent and
+starts unresolved; its only transition is an authoritative rejection, so an accepted, indeterminate, in-flight or dropped
+attempt blocks `Absent` for that client id whatever happened to other attempts with it. A lookup reads the evidence after
+its not-found responses have returned. The ledger is bounded: a new client id at capacity drops all evidence and every
+not-found reads `Unknown` for the rest of that instance's life, because per-entry eviction would let a rejected retry
+look like a fresh record. What counts as an authoritative rejection is per venue and is a narrow allow-list. For
+`binance:usdm` it is HTTP 400 with `-2010`, `-2019`, `-2021` or `-2022`, excluding every other status and the codes
+Binance documents as execution-status-unknown. This reads the codes' documented meanings; Binance gives no explicit
+finality guarantee, and the HTTP condition is an inference that fails safe to `Unknown`.
+
+The evidence is in memory until step 7 persists it. An attempt by an earlier or another process leaves no record, so a
+rejected retry with the same client id would read as all-rejected. Until step 7, no caller may act on `Absent` for a
+client id that another process may have submitted.
 
 **2.1 Protection kind.** An eligible venue must provide exchange-resident protection that triggers **market** execution at
 the resolved executable trigger: `ProtectionKind::MarketOnTrigger`. Binance USDⓈ-M: conditional `STOP_MARKET`. Binance
@@ -210,7 +235,8 @@ the old stop's final state and authoritative cumulative fills, computes the resi
 governed market-flatten path immediately, retaining any still-live protection until its cancellation is required; a
 zero residual completes the exit only on authoritative fills, with unsettled costs still charged; unknown outcomes and
 unexecutable residuals stay visibly unresolved. Reusing a
-`client_id` is idempotent only within the venue's finality rule; a `Terminal` outcome releases only the liabilities
+`client_id` does not establish an earlier attempt's outcome: a rejected retry after an unresolved attempt is still
+`Unknown`. A `Terminal` outcome releases only the liabilities
 proven extinguished: filled inventory and unsettled costs stay charged until settlement evidence arrives.
 
 **2.3 Reconciliation is never optional.** The reconciliation worker, startup recovery, the live-risk filter, orphan-stop
@@ -406,7 +432,7 @@ account exists.
 | 4 | Rust naming and endpoint cleanup with stable event, `Position` and credential encodings; fixtures | preserving | revert alone |
 | 5 | Accounting: governed equity derived once; month-boundary basis uses ADR-0051 §3 cost-priced downside; **migration** for persisted carried bases with compatible settlement attribution and replay handling; atomic reset | **changing** (basis, persisted state version) | once new accounting state is written, rollback needs demonstrated reader/writer compatibility of the older binary with that state, or a verified book free of risk-bearing and unsettled liabilities; keeping `capital_base` alone is insufficient |
 | 6 | Quantisation and metadata rules (§5) with before/after fixtures per order kind | **changing** | revert alone only with a verified empty book (the old helper is incompatible with spot lots) |
-| 7 | Durable intent journal in the store (migration): intents and results persisted in order relative to reservations, stable venue-scoped client ids, explicit unresolved states, transition intents (§2.2); **durable venue/account routing on every risk-bearing and unsettled leg**, with the legacy mapping of every existing position to `binance:usdm`; process-kill tests at every external-call/persistence boundary | preserving (adds evidence and identity) | revert alone with an empty book; after step 8 only together with step 8 |
+| 7 | Durable intent journal in the store (migration): intents and results persisted in order relative to reservations, stable venue-scoped client ids, durable attempt evidence (§2), explicit unresolved states, transition intents (§2.2); **durable venue/account routing on every risk-bearing and unsettled leg**, with the legacy mapping of every existing position to `binance:usdm`; process-kill tests at every external-call/persistence boundary | preserving (adds evidence and identity) | revert alone with an empty book; after step 8 only together with step 8 |
 | 8 | Spot venue acceptance behind `ROBSON_VENUE=binance_spot`: `InventoryPort`, protection protocol per N1, settlement from fills, conformance suite green; the long-only entry gate is a separate ADR | new venue | disabling a venue stops new admissions on it but **keeps managing its open and unsettled legs** through the step-7 routing; a binary rollback requires a verified empty book on that venue |
 
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
@@ -532,7 +558,13 @@ Budget model for multi-venue:
   and settlement attribution, persisted-state version bump.
 - Step 6: `robson-exec/src/quantize.rs`, `robsond/src/position_manager.rs`, usdm adapter; before/after fixtures.
 - Step 7: `robson-exec/src/intent.rs` → store-backed journal; migration (journal tables, leg routing columns, legacy
-  mapping); process-kill tests.
+  mapping); process-kill tests. Before any caller acts on `order_by_client_id` or `replace_protection`, this step must:
+  persist each attempt durably before its request is sent and each rejection when observed, reload them on startup, treat
+  an attempt without a persisted rejection as unresolved, and keep the truncated state across restarts. It must also give
+  the permanently `Unknown` cases an explicit resolution path that never infers absence from time, including an attempt
+  whose outcome never becomes known and a successor refused locally before anything was sent (`NoRecord` →
+  `Unknown{new: None}`, old stop still live, nothing for a lookup to find); until resolved, the leg stays pending with its
+  reservation held and visible.
 - Step 8: `robson-connectors/src/binance/spot/*`; conformance suite; `ROBSON_VENUE=binance_spot`.
 - Evidence: `docs/evidence/2026-11-04-binance-exchangeinfo-btcusdt.md` (retained in this PR): timestamped verbatim
   extracts with source URLs and SHA-256 of the raw responses; spot `orderTypes` includes `STOP_LOSS`, `LOT_SIZE` step
@@ -577,3 +609,7 @@ Budget model for multi-venue:
   in §1. Both applied.
 - v7 (2026-11-05): Codex confirmed the round-6 fixes; P2: N5 (cost source) must be resolved before step 8 activation.
   Applied to the status line and N5.
+- v8 (2026-11-06): §2 aligned with step 2 as implemented, after Codex rounds 1–4 on `refactor/venue-step2-ports` (APPROVE
+  on round 4): the time-based finality wording is replaced by `EveryAttemptRejected` and `SubmitAttemptLedger`; result
+  shapes (`PlacedStop`, `reason`, `Unknown{new}`, `final_state`, `AccountOpenOrder`) and cursor-less signatures recorded;
+  step 7 obligations added. No risk number or sequencing changed.
