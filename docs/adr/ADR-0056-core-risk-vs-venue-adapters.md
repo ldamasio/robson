@@ -617,4 +617,4 @@ Budget model for multi-venue:
   shapes (`PlacedStop`, `reason`, `Unknown{new}`, `final_state`, `AccountOpenOrder`) and cursor-less signatures recorded;
   step 7 obligations added. No risk number or sequencing changed. Codex REQUEST_CHANGES on the alignment, 2 P2: the
   failure-mode table still promised resolution by lookup, and Consequences did not state that `Unknown` legs can hold
-  admission capacity indefinitely. Both applied.
+  admission capacity indefinitely. Both applied; Codex **APPROVE** on the result.
