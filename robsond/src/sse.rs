@@ -458,6 +458,9 @@ mod tests {
         .unwrap();
         assert!(position_opened.payload["position_id"].as_str().is_some());
         assert!(position_opened.payload.get("source_occurred_at").is_none());
+        // The venue position id stays internal to the daemon (ADR-0056 §4).
+        assert!(position_opened.payload.get("binance_position_id").is_none());
+        assert!(position_opened.payload.get("exchange_position_id").is_none());
     }
 
     #[test]
