@@ -768,6 +768,24 @@ mod tests {
         )
     }
 
+    /// A close belongs to its month down to the first instant, as it does in
+    /// the durable query.
+    #[tokio::test]
+    async fn a_close_exactly_at_month_start_belongs_to_that_month() {
+        let store = MemoryStore::new();
+        let mut position = create_test_position();
+        position.closed_at = Some("2027-03-01T00:00:00Z".parse().unwrap());
+        position.state = PositionState::Closed {
+            exit_price: Price::new(dec!(100)).unwrap(),
+            realized_pnl: dec!(0),
+            exit_reason: robson_domain::ExitReason::InsuranceStop,
+        };
+        store.positions().save(&position).await.unwrap();
+
+        assert_eq!(store.positions().find_closed_in_month(2027, 3).await.unwrap().len(), 1);
+        assert!(store.positions().find_closed_in_month(2027, 2).await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn append_does_not_retain_position_monitor_ticks() {
         let store = MemoryStore::new();

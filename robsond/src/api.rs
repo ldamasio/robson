@@ -2948,7 +2948,7 @@ fn position_overlaps_month(
     month_end: chrono::DateTime<chrono::Utc>,
 ) -> bool {
     position.created_at < month_end
-        && position.closed_at.map(|closed_at| closed_at > month_start).unwrap_or(true)
+        && position.closed_at.map(|closed_at| closed_at >= month_start).unwrap_or(true)
 }
 
 fn next_month(year: i32, month: u32) -> (i32, u32) {
@@ -3443,6 +3443,12 @@ mod tests {
         born_after.created_at = next + chrono::Duration::days(1);
         born_after.closed_at = None;
 
+        let mut closed_at_month_start =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        closed_at_month_start.created_at = month - chrono::Duration::days(10);
+        closed_at_month_start.closed_at = Some(month);
+
+        assert!(position_overlaps_month(&closed_at_month_start, month, next));
         assert!(position_overlaps_month(&inherited, month, next));
         assert!(position_overlaps_month(&closed_later, month, next));
         assert!(!position_overlaps_month(&closed_before, month, next));

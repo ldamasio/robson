@@ -2305,6 +2305,7 @@ mod tests {
         let event_bus = Arc::new(EventBus::new(16));
         let at = |text: &str| text.parse::<DateTime<Utc>>().unwrap();
         for (pair, closed_at) in [
+            ("XRPUSDT", "2027-03-01T00:00:00Z"),
             ("BTCUSDT", "2027-03-01T00:30:00Z"),
             ("ETHUSDT", "2027-02-28T23:00:00Z"),
             ("SOLUSDT", "2027-02-27T23:00:00Z"),
@@ -2316,7 +2317,7 @@ mod tests {
 
         let symbols = worker.recently_closed_symbols(at("2027-03-01T01:00:00Z")).await;
 
-        let expected: HashSet<Symbol> = ["BTCUSDT", "ETHUSDT"]
+        let expected: HashSet<Symbol> = ["XRPUSDT", "BTCUSDT", "ETHUSDT"]
             .into_iter()
             .map(|pair| Symbol::from_pair(pair).unwrap())
             .collect();

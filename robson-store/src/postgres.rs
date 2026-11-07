@@ -629,7 +629,8 @@ pub async fn find_armed_entry_policies(
 }
 
 /// Read all positions that overlapped a given month from the persisted
-/// `positions_current` projection table.
+/// `positions_current` projection table. A close exactly at month start belongs
+/// to that month, as it does in `MemoryStore`.
 pub async fn find_positions_overlapping_month(
     pool: &PgPool,
     tenant_id: Uuid,
@@ -686,7 +687,7 @@ pub async fn find_positions_overlapping_month(
         FROM positions_current
         WHERE tenant_id = $1
           AND created_at < $3
-          AND COALESCE(closed_at, $3) > $2
+          AND COALESCE(closed_at, $3) >= $2
         ORDER BY created_at ASC, position_id ASC
         "#,
     )
@@ -825,6 +826,53 @@ mod tests {
         );
         assert_eq!(tech_stop.distance, dec!(1500));
         assert_eq!(tech_stop.distance_pct.round_dp(2), dec!(1.58));
+    }
+
+    /// Excluding this row dropped the close from every month, since the month
+    /// before filters it out by its own `closed_at`.
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_close_exactly_at_month_start_overlaps_that_month(pool: PgPool) {
+        let tenant_id = Uuid::now_v7();
+        let month_start = "2027-03-01T00:00:00Z".parse::<chrono::DateTime<Utc>>().unwrap();
+        let at_start = Uuid::now_v7();
+        let just_before = Uuid::now_v7();
+        for (position_id, closed_at) in [
+            (at_start, month_start),
+            (just_before, month_start - chrono::Duration::milliseconds(1)),
+        ] {
+            sqlx::query(
+                r#"
+                INSERT INTO positions_current (
+                    position_id, tenant_id, account_id, strategy_id,
+                    symbol, side, state,
+                    entry_price, entry_quantity, current_quantity, current_price,
+                    last_event_id, last_seq, created_at, updated_at, closed_at
+                ) VALUES (
+                    $1, $2, $3, $4,
+                    'BTCUSDT', 'long', 'closed',
+                    100, 0.01, 0.01, 99,
+                    $5, 1, $6, $7, $7
+                )
+                "#,
+            )
+            .bind(position_id)
+            .bind(tenant_id)
+            .bind(Uuid::now_v7())
+            .bind(Uuid::now_v7())
+            .bind(Uuid::now_v7())
+            .bind(month_start - chrono::Duration::days(3))
+            .bind(closed_at)
+            .execute(&pool)
+            .await
+            .unwrap();
+        }
+
+        let positions =
+            find_positions_overlapping_month(&pool, tenant_id, month_start).await.unwrap();
+
+        let ids: Vec<Uuid> = positions.iter().map(|position| position.id).collect();
+        assert_eq!(ids, vec![at_start]);
     }
 
     #[sqlx::test(migrations = "../migrations")]
