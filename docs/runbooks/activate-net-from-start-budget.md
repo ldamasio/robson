@@ -209,9 +209,10 @@ Run from a shell with the production kubeconfig.
    row is already switched or does not exist; investigate before retrying.
 
    Later months inherit the model: every `monthly_state` insert path
-   (`MonthBoundaryReset` projector, `CapitalBaseRecalibrated`, entry/close
-   counters, the daemon's peak upsert) copies the most recent earlier row's
-   `monthly_budget_model`, and no `ON CONFLICT` clause overwrites it.
+   (`MonthBoundaryReset` projector, `CapitalBaseRecalibrated`, the daemon's peak
+   upsert) copies the most recent earlier row's `monthly_budget_model`, and no
+   `ON CONFLICT` clause overwrites it. The entry and close counters only update
+   an existing row.
 
 3. No restart. The next `/status` snapshot (and the next admission or halt
    evaluation) reads the new model.
