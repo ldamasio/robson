@@ -1279,13 +1279,22 @@ impl venue::PositionAccountPort for StubExchange {
             return Err(error);
         }
 
+        // Takes what was submitted: what rounding left stays for the next scan.
         let key = Self::position_key(symbol, side);
-        let removed = {
+        let held = {
             let mut positions = self.open_positions.write().unwrap();
-            positions.remove(&key)
+            match positions.get_mut(&key) {
+                Some(position) if position.quantity.as_decimal() > quantity.as_decimal() => {
+                    let rest = position.quantity.as_decimal() - quantity.as_decimal();
+                    position.quantity = Quantity::new(rest).unwrap();
+                    true
+                },
+                Some(_) => positions.remove(&key).is_some(),
+                None => false,
+            }
         };
 
-        if removed.is_none() {
+        if !held {
             attempt.rejected();
             return Err(ExecError::OrderRejected(format!(
                 "No simulated open position found for {} {:?}",

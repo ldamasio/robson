@@ -2084,6 +2084,16 @@ mod tests {
 
         assert_eq!(exchange.position_close_call_count(), 2, "one resubmission");
         assert_eq!(exchange.rules_refresh_call_count(), 1, "one refresh");
+
+        // 0.100 went out of 0.105. The rest survives for the next scan, where the
+        // venue refuses it for being under a lot, and the scan says so.
+        let held = exchange.get_all_open_positions().await.unwrap();
+        assert_eq!(held.len(), 1);
+        assert_eq!(held[0].quantity.as_decimal(), dec!(0.005));
+        assert!(worker.scan_and_reconcile().await.is_err());
+        assert_eq!(exchange.position_close_call_count(), 3, "one attempt, refused");
+        let held = exchange.get_all_open_positions().await.unwrap();
+        assert_eq!(held[0].quantity.as_decimal(), dec!(0.005));
     }
 
     #[tokio::test]
