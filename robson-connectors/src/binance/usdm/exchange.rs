@@ -2218,6 +2218,21 @@ mod submit_attempt_evidence {
         assert_eq!(info.load(Ordering::SeqCst), 2);
     }
 
+    /// The attempt noted before a fetch goes when it succeeds: the next refresh
+    /// is due when the rules age, not when a floor runs out.
+    #[tokio::test]
+    async fn a_refresh_that_succeeded_leaves_nothing_against_the_floor() {
+        let (venue, info, _) = metadata_venue(Some((200, BTC_RULES.to_string())), None).await;
+        let symbol = btcusdt();
+        TradingPort::trading_rules(&*venue, &symbol).await.unwrap();
+        assert_eq!(info.load(Ordering::SeqCst), 1);
+
+        age_cached_rules(&venue, TRADING_RULES_TTL + Duration::from_secs(1));
+        TradingPort::trading_rules(&*venue, &symbol).await.unwrap();
+
+        assert_eq!(info.load(Ordering::SeqCst), 2);
+    }
+
     /// The steady-state ceiling of §10 while stale rules are being served and
     /// exchangeInfo keeps failing: one attempt per symbol per five minutes.
     #[tokio::test]
@@ -2323,9 +2338,13 @@ mod submit_attempt_evidence {
             let symbol = btcusdt();
             let _ = TradingPort::trading_rules(&*refreshing, &symbol).await;
         });
-        while venue.rules_refresh_gate.try_lock().is_ok() {
-            tokio::task::yield_now().await;
-        }
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while venue.rules_refresh_gate.try_lock().is_ok() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("the refresh must take the gate");
 
         assert!(TradingPort::last_validated_rules(&*venue, &symbol).is_some());
         let reduced = tokio::time::timeout(Duration::from_secs(2), reduce(&venue, "exit-1")).await;
