@@ -13,8 +13,8 @@
 use std::sync::Arc;
 
 use robson_domain::{
-    Event, ExitReason, OrderSide, PositionId, Price, Quantity, ReductionKind, RiskConfig,
-    StopPolicy, Symbol, SymbolTradingRules,
+    Event, ExitReason, OrderSide, PositionId, PositionState, Price, Quantity, ReductionKind,
+    RiskConfig, StopPolicy, Symbol, SymbolTradingRules,
 };
 use robson_engine::EngineAction;
 use robson_store::Store;
@@ -64,6 +64,10 @@ pub enum ActionResult {
     /// below the lot minimum, which no prompt retry will change. Returned on
     /// every attempt; the audit events come only when the residual is new.
     ProtectionNotExecutable { position_id: PositionId },
+    /// The exit failed after earlier actions of its batch ran. Returned as a
+    /// result so their events are persisted, the stop's cancel first of all;
+    /// the caller surfaces `error` after that.
+    ExitFailed { error: ExecError },
     /// Action was already processed (idempotent skip)
     AlreadyProcessed(Uuid),
     /// Event emitted (no exchange interaction)
@@ -119,7 +123,15 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         let mut results = Vec::with_capacity(actions.len());
 
         for action in actions {
-            let action_results = self.execute_action(action).await?;
+            let is_exit = matches!(action, EngineAction::PlaceExitOrder { .. });
+            let action_results = match self.execute_action(action).await {
+                Ok(action_results) => action_results,
+                Err(error) if is_exit && !results.is_empty() => {
+                    results.push(ActionResult::ExitFailed { error });
+                    break;
+                },
+                Err(error) => return Err(error),
+            };
 
             let mut should_stop = false;
             for result in action_results {
@@ -620,6 +632,45 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
         Some(event)
     }
 
+    /// Whether the leg left `Active` while a stop was on its way to the venue
+    /// (ADR-0056 §5): closed by reconciliation, say. A leg not in the store has
+    /// nothing to say about it.
+    async fn leg_left_active(&self, position_id: PositionId) -> bool {
+        self.leg(position_id).await.is_some_and(|leg| {
+            matches!(
+                leg.state,
+                PositionState::Exiting { .. }
+                    | PositionState::Closed { .. }
+                    | PositionState::Error { .. }
+                    | PositionState::Cancelled
+            )
+        })
+    }
+
+    /// Take back a stop the venue accepted for a leg that has left `Active`.
+    /// Nothing is recorded on the leg, and no sweep visits a flat symbol with
+    /// no open leg, so this is the only thing that keeps the stop off a
+    /// later entry. Best-effort and logged.
+    async fn withdraw_stop(
+        &self,
+        position_id: PositionId,
+        intent_id: Uuid,
+        symbol: &robson_domain::Symbol,
+        order_ids: &[&str],
+    ) -> ExecResult<Vec<ActionResult>> {
+        warn!(%position_id, "Leg left Active while its stop was being placed; withdrawing the stop");
+        for order_id in order_ids {
+            if let Err(error) = self.exchange.cancel_stop_market_order(symbol, order_id).await {
+                warn!(%position_id, %order_id, %error, "Failed to withdraw the stop");
+            }
+        }
+        self.journal.complete(
+            intent_id,
+            IntentResult::Failed("leg left Active during the placement".to_string()),
+        )?;
+        Ok(vec![ActionResult::StateUpdated])
+    }
+
     /// Place a reduce-only protective insurance stop on the exchange
     /// (ADR-0039).
     ///
@@ -667,6 +718,13 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             Ok(ReductionOutcome::Submitted {
                 accepted: order_result, residual, rules, ..
             }) => {
+                if self.leg_left_active(position_id).await {
+                    return self
+                        .withdraw_stop(position_id, intent_id, &symbol, &[order_result
+                            .exchange_order_id
+                            .as_str()])
+                        .await;
+                }
                 info!(
                     %position_id,
                     exchange_order_id = %order_result.exchange_order_id,
@@ -878,6 +936,15 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                 ]);
             },
         };
+
+        if self.leg_left_active(position_id).await {
+            return self
+                .withdraw_stop(position_id, intent_id, &symbol, &[
+                    order_result.exchange_order_id.as_str(),
+                    previous_order_id.as_str(),
+                ])
+                .await;
+        }
 
         // 2. Cancel the previous stop. "Unknown order"/already-gone is expected (it may
         //    have just filled); any other failure is logged and tolerated — the
@@ -1129,6 +1196,29 @@ mod tests {
         }
     }
 
+    fn cancel_action(position_id: PositionId, order_id: &str) -> EngineAction {
+        EngineAction::CancelInsuranceStop {
+            position_id,
+            symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+            order_id: order_id.to_string(),
+        }
+    }
+
+    async fn live_stop(executor: &Executor<StubExchange, MemoryStore>) -> String {
+        executor
+            .exchange
+            .place_stop_market_order(
+                &Symbol::from_pair("BTCUSDT").unwrap(),
+                robson_domain::OrderSide::Sell,
+                Quantity::new(dec!(0.1)).unwrap(),
+                robson_domain::Price::new(dec!(90000)).unwrap(),
+                "ins-test",
+            )
+            .await
+            .unwrap()
+            .exchange_order_id
+    }
+
     async fn saved_leg(executor: &Executor<StubExchange, MemoryStore>, side: Side) -> Position {
         let mut leg = Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), side);
         leg.entry_price = Some(robson_domain::Price::new(dec!(96000)).unwrap());
@@ -1309,6 +1399,82 @@ mod tests {
         assert_eq!(after.residual_quantity, Some(dec!(0.005)));
     }
 
+    /// A stop accepted after its leg left Active is taken back and recorded
+    /// nowhere, whichever way it was placed. A replacement takes its
+    /// predecessor with it.
+    #[tokio::test]
+    async fn a_stop_accepted_after_its_leg_closed_is_withdrawn() {
+        for replacing in [false, true] {
+            let executor = create_test_executor().await;
+            let mut leg = saved_leg(&executor, Side::Long).await;
+            leg.state = PositionState::Active {
+                current_price: robson_domain::Price::new(dec!(96000)).unwrap(),
+                trailing_stop: robson_domain::Price::new(dec!(90000)).unwrap(),
+                favorable_extreme: robson_domain::Price::new(dec!(96000)).unwrap(),
+                extreme_at: chrono::Utc::now(),
+                insurance_stop_id: None,
+                invalidation_guard_level: None,
+                last_emitted_stop: None,
+            };
+            executor.store.positions().save(&leg).await.unwrap();
+            let previous = live_stop(&executor).await;
+            let stops_before = executor.exchange.stop_order_count();
+
+            let store = Arc::clone(&executor.store);
+            let position_id = leg.id;
+            executor.exchange.set_after_next_stop_accepted(move || {
+                let price = robson_domain::Price::new(dec!(90000)).unwrap();
+                store
+                    .apply_event(&Event::PositionClosed {
+                        position_id,
+                        exit_reason: ExitReason::InsuranceStop,
+                        entry_price: price,
+                        exit_price: price,
+                        realized_pnl: Decimal::ZERO,
+                        total_fees: Decimal::ZERO,
+                        closure_evidence: robson_domain::ClosureEvidence::real_exit_fill(None),
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .unwrap();
+            });
+
+            let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+            let quantity = Quantity::new(dec!(1)).unwrap();
+            let stop_price = robson_domain::Price::new(dec!(90000)).unwrap();
+            let action = if replacing {
+                EngineAction::ReplaceInsuranceStop {
+                    position_id: leg.id,
+                    symbol,
+                    side: robson_domain::OrderSide::Sell,
+                    quantity,
+                    previous_order_id: previous.clone(),
+                    new_stop_price: stop_price,
+                }
+            } else {
+                EngineAction::PlaceInsuranceStop {
+                    position_id: leg.id,
+                    symbol,
+                    side: robson_domain::OrderSide::Sell,
+                    quantity,
+                    stop_price,
+                }
+            };
+
+            let results = executor.execute(vec![action]).await.unwrap();
+
+            assert!(matches!(results.as_slice(), [ActionResult::StateUpdated]), "{results:?}");
+            let expected = if replacing {
+                stops_before - 1
+            } else {
+                stops_before
+            };
+            assert_eq!(executor.exchange.stop_order_count(), expected, "nothing new stays live");
+            assert_eq!(executor.exchange.has_stop_order(&previous), !replacing);
+            let events = executor.store.events().find_by_position(leg.id).await.unwrap();
+            assert!(events.is_empty(), "{events:?}");
+        }
+    }
+
     #[tokio::test]
     async fn a_reduce_only_refusal_is_returned_as_it_is() {
         let executor = create_test_executor().await;
@@ -1318,6 +1484,32 @@ mod tests {
 
         assert!(matches!(result, Err(ExecError::ReduceOnlyRejected(_))));
         assert_eq!(executor.exchange.market_order_call_count(), 1);
+    }
+
+    /// Cancel-first: the stop goes, then the exit fails. The cancel happened,
+    /// so its event must reach the caller to be persisted, and the failure
+    /// with it.
+    #[tokio::test]
+    async fn an_exit_that_fails_behind_a_cancel_keeps_the_cancel_on_the_record() {
+        let executor = create_test_executor().await;
+        let position_id = Uuid::now_v7();
+        let stop = live_stop(&executor).await;
+        executor.exchange.set_order_fail_next(true);
+
+        let results = executor
+            .execute(vec![
+                cancel_action(position_id, &stop),
+                exit_action(position_id, dec!(0.1)),
+            ])
+            .await
+            .unwrap();
+
+        assert!(!executor.exchange.has_stop_order(&stop));
+        assert!(matches!(
+            results[0],
+            ActionResult::EventEmitted(Event::InsuranceStopCancelled { .. })
+        ));
+        assert!(matches!(results[1], ActionResult::ExitFailed { error: ExecError::Exchange(_) }));
     }
 
     /// Held rules say nothing is executable. They may be stale, so the venue is

@@ -5,7 +5,7 @@
 
 use std::{
     collections::{HashMap, HashSet, VecDeque},
-    sync::RwLock,
+    sync::{Mutex, RwLock},
     time::Duration,
 };
 
@@ -164,6 +164,9 @@ pub struct StubExchange {
     short_fill_next: RwLock<Option<Decimal>>,
     /// The next protective stop cancel fails.
     cancel_fails_next: RwLock<bool>,
+    /// Runs once, right after the next protective stop is accepted: whatever
+    /// happened on the leg while the placement was on its way.
+    after_next_stop_accepted: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// The client id of every market order submitted, accepted or not.
     market_order_client_ids: RwLock<Vec<String>>,
     /// When set, the next market order or protective stop is authoritatively
@@ -242,6 +245,7 @@ impl StubExchange {
             reduce_only_rejections_next: RwLock::new(0),
             short_fill_next: RwLock::new(None),
             cancel_fails_next: RwLock::new(false),
+            after_next_stop_accepted: Mutex::new(None),
             market_order_client_ids: RwLock::new(Vec::new()),
             reject_order_next: RwLock::new(false),
             market_order_calls: RwLock::new(0),
@@ -410,6 +414,11 @@ impl StubExchange {
 
     pub fn market_order_client_ids(&self) -> Vec<String> {
         self.market_order_client_ids.read().unwrap().clone()
+    }
+
+    /// Run `hook` once, right after the next protective stop is accepted.
+    pub fn set_after_next_stop_accepted(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.after_next_stop_accepted.lock().unwrap() = Some(Box::new(hook));
     }
 
     /// Configure the next market order or protective stop to be authoritatively
@@ -777,6 +786,10 @@ impl venue::TradingPort for StubExchange {
             stop_price = %stop_price.as_decimal(),
             "Stub: protective stop order placed (accepted, unfilled)"
         );
+
+        if let Some(hook) = self.after_next_stop_accepted.lock().unwrap().take() {
+            hook();
+        }
 
         // Accepted but not filled: protective price recorded, zero fill/fee.
         Ok(PlacedStop {

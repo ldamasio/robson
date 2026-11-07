@@ -1308,9 +1308,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         &self,
         actions: Vec<EngineAction>,
     ) -> DaemonResult<Vec<ActionResult>> {
-        let results = self.execute_and_persist_inner(actions).await?;
+        let mut results = self.execute_and_persist_inner(actions).await?;
         self.note_insurance_stop_results(&results).await;
         self.broadcast_mark_advances(&results);
+        // An exit that failed behind its batch's earlier actions: what came before
+        // it is persisted now, so this can be the batch's error.
+        if matches!(results.last(), Some(ActionResult::ExitFailed { .. })) {
+            if let Some(ActionResult::ExitFailed { error }) = results.pop() {
+                return Err(DaemonError::Exec(error));
+            }
+        }
         Ok(results)
     }
 
@@ -1445,14 +1452,43 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
     }
 
+    /// The one place that notices an Active leg with no stop, whatever left it
+    /// so: an exit that failed behind its cancel-first batch, on any caller and
+    /// with any error. Its first attempt waits the usual window. A leg
+    /// suspected closed by the venue has nothing to protect until it
+    /// reappears.
+    async fn schedule_stop_heal_if_gone(&self, position: &Position) {
+        let PositionState::Active { insurance_stop_id, .. } = &position.state else {
+            return;
+        };
+        if insurance_stop_id.is_some()
+            || position.insurance_stop_id.is_some()
+            || self.exit_overtaken_suspects.read().await.contains(&position.id)
+        {
+            return;
+        }
+        let mut stale = self.insurance_stop_stale.write().await;
+        stale.insert(position.id, std::time::Instant::now() + INSURANCE_STOP_RETRY_BACKOFF);
+        crate::metrics::INSURANCE_STOP_STALE_POSITIONS.set(stale.len() as f64);
+        warn!(
+            position_id = %position.id,
+            retry_in_secs = INSURANCE_STOP_RETRY_BACKOFF.as_secs(),
+            "Active leg has no exchange stop; re-placement scheduled (ADR-0039)"
+        );
+    }
+
     /// Re-place the exchange insurance stop of a stale position at the
     /// current software trigger (ADR-0039), if its retry window is due.
     /// Returns whether an attempt was made; success and failure bookkeeping
     /// happens in `note_insurance_stop_results` through the executor path.
     async fn retry_stale_insurance_stop(&self, position: &Position) -> bool {
-        let due = match self.insurance_stop_stale.read().await.get(&position.id) {
-            Some(retry_at) => std::time::Instant::now() >= *retry_at,
-            None => return false,
+        let retry_at = self.insurance_stop_stale.read().await.get(&position.id).copied();
+        let due = match retry_at {
+            Some(retry_at) => std::time::Instant::now() >= retry_at,
+            None => {
+                self.schedule_stop_heal_if_gone(position).await;
+                return false;
+            },
         };
         if !due {
             return false;
@@ -2352,7 +2388,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     self.record_query_failure(query).await?;
                     return Err(DaemonError::Exec(ExecError::InvalidState(error)));
                 },
-                ActionResult::ExitNotExecutable { .. } => {
+                ActionResult::ExitNotExecutable { .. } | ActionResult::ExitFailed { .. } => {
                     warn!(%position_id, "Unexpected exit outcome in an entry flow");
                 },
                 ActionResult::ProtectionNotExecutable { .. } => {},
@@ -5782,6 +5818,60 @@ mod tests {
         );
     }
 
+    /// Cancel-first: the stop's cancel happened, so it must reach the event log
+    /// even though the exit behind it failed, or a restart would restore a stop
+    /// that is gone.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn a_cancel_before_a_failed_exit_reaches_the_event_log(pool: sqlx::PgPool) {
+        let manager = create_postgres_test_manager(pool.clone());
+        let position_id = Uuid::now_v7();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let exchange = manager.exchange();
+        let stop = exchange
+            .place_stop_market_order(
+                &symbol,
+                Side::Long.exit_action(),
+                Quantity::new(dec!(0.01)).unwrap(),
+                Price::new(dec!(94000)).unwrap(),
+                "ins-db-test",
+            )
+            .await
+            .unwrap();
+        exchange.set_order_fail_next(true);
+
+        let error = manager
+            .execute_and_persist(vec![
+                EngineAction::CancelInsuranceStop {
+                    position_id,
+                    symbol: symbol.clone(),
+                    order_id: stop.exchange_order_id.clone(),
+                },
+                EngineAction::PlaceExitOrder {
+                    position_id,
+                    cycle_id: Some(Uuid::now_v7()),
+                    symbol,
+                    side: Side::Long.exit_action(),
+                    quantity: Quantity::new(dec!(0.01)).unwrap(),
+                    reason: robson_domain::ExitReason::TrailingStop,
+                },
+            ])
+            .await
+            .unwrap_err();
+        assert!(matches!(error, DaemonError::Exec(ExecError::Exchange(_))), "{error:?}");
+
+        let cancels: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event_log WHERE event_type = 'insurance_stop_cancelled' \
+             AND stream_key = $1",
+        )
+        .bind(format!("position:{position_id}"))
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(cancels, 1);
+    }
+
     #[cfg(feature = "postgres")]
     #[sqlx::test(migrations = "../migrations")]
     #[ignore = "requires DATABASE_URL"]
@@ -6757,6 +6847,109 @@ mod tests {
         assert!(matches!(leg.state, PositionState::Closed { .. }), "{:?}", leg.state);
     }
 
+    fn venue_still_holds(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        position: &Position,
+        quantity: Decimal,
+    ) {
+        manager.exchange().set_open_position(
+            position.symbol.clone(),
+            position.side,
+            Quantity::new(quantity).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+    }
+
+    /// A tick above the stop: nothing crosses, so only the heal path acts.
+    async fn quiet_tick(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        position: &Position,
+    ) {
+        manager
+            .process_market_data(MarketData {
+                venue: test_venue(),
+                symbol: position.symbol.clone(),
+                price: Price::new(dec!(95)).unwrap(),
+                timestamp: chrono::Utc::now(),
+                source: crate::event_bus::MarketDataSource::Ws,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Whatever stops the exit behind its cancel, the leg gets a stop back,
+    /// once the usual window passes, and with nothing crossing it again.
+    #[tokio::test]
+    async fn a_failed_exit_gets_its_stop_back_whatever_the_error() {
+        let failures: [(&str, fn(&StubExchange)); 4] = [
+            ("rules rejection", |exchange| exchange.set_rules_rejections_next(2)),
+            ("reduce-only refusal", |exchange| exchange.set_reduce_only_rejections_next(1)),
+            ("exchange failure", |exchange| exchange.set_order_fail_next(true)),
+            ("venue rejection", |exchange| exchange.set_reject_order_next(true)),
+        ];
+        for (name, fail) in failures {
+            let manager = create_test_manager().await;
+            let (position, stop_id) = active_leg_with_live_stop(&manager).await;
+            let exchange = manager.exchange();
+            venue_still_holds(&manager, &position, dec!(1));
+            fail(&exchange);
+
+            assert!(stop_crossing_tick(&manager, &position).await.is_err(), "{name}");
+
+            let leg = manager.get_position(position.id).await.unwrap().unwrap();
+            assert!(matches!(leg.state, PositionState::Active { .. }), "{name}");
+            assert_eq!(leg.insurance_stop_id, None, "{name}: cancel-first took it");
+
+            // The price recovers: no exit, no trailing advance, only the heal path.
+            quiet_tick(&manager, &position).await;
+            let scheduled = manager.insurance_stop_stale.read().await.get(&position.id).copied();
+            assert!(scheduled.is_some(), "{name}: the heal path must notice");
+            assert!(
+                manager
+                    .get_position(position.id)
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .insurance_stop_id
+                    .is_none(),
+                "{name}: the first attempt waits its window"
+            );
+
+            manager
+                .insurance_stop_stale
+                .write()
+                .await
+                .insert(position.id, std::time::Instant::now());
+            quiet_tick(&manager, &position).await;
+
+            let leg = manager.get_position(position.id).await.unwrap().unwrap();
+            let healed = leg.insurance_stop_id.expect("a stop again");
+            assert_ne!(healed, stop_id, "{name}");
+            assert!(exchange.has_stop_order(&healed), "{name}");
+            assert!(
+                !manager.insurance_stop_stale.read().await.contains_key(&position.id),
+                "{name}"
+            );
+        }
+    }
+
+    /// A leg the venue closed by itself has nothing to protect: no stop
+    /// attempts while it is suspected, or each would fail and write an
+    /// event.
+    #[tokio::test]
+    async fn a_leg_suspected_closed_on_the_venue_is_not_healed() {
+        let manager = create_test_manager().await;
+        let (position, _) = active_leg_with_live_stop(&manager).await;
+        let exchange = manager.exchange();
+        exchange.set_reduce_only_rejections_next(1);
+
+        assert!(stop_crossing_tick(&manager, &position).await.is_ok(), "overtaken, flat");
+        assert!(manager.exit_overtaken_suspects.read().await.contains(&position.id));
+
+        quiet_tick(&manager, &position).await;
+        assert!(!manager.insurance_stop_stale.read().await.contains_key(&position.id));
+    }
+
     /// The whole leg rounds below the lot: nothing executed, the residual on
     /// record, the long window. The stop its batch took cannot come back while
     /// the leg stays there: that is the accepted limit of cancel-first.
@@ -6928,6 +7121,62 @@ mod tests {
         manager.store.positions().save(&position).await.unwrap();
         manager.exchange().clear_cached_rules();
         position
+    }
+
+    /// The heal races a close: the venue accepts the stop while reconciliation
+    /// closes the leg. Nothing is recorded on the closed leg, and the stop
+    /// is taken back, since no sweep would ever visit it on a flat symbol.
+    #[tokio::test]
+    async fn a_heal_that_races_a_close_withdraws_its_stop_and_records_nothing() {
+        let manager = create_test_manager().await;
+        let (mut position, stop_id) = active_leg_with_live_stop(&manager).await;
+        let exchange = manager.exchange();
+        exchange.cancel_stop_market_order(&position.symbol, &stop_id).await.unwrap();
+        position.insurance_stop_id = None;
+        if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
+            *insurance_stop_id = None;
+        }
+        manager.store.positions().save(&position).await.unwrap();
+        let stops_before = exchange.stop_order_count();
+
+        let store = manager.store.clone();
+        let position_id = position.id;
+        exchange.set_after_next_stop_accepted(move || {
+            let price = Price::new(dec!(95)).unwrap();
+            store
+                .apply_event(&Event::PositionClosed {
+                    position_id,
+                    exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
+                    entry_price: price,
+                    exit_price: price,
+                    realized_pnl: Decimal::ZERO,
+                    total_fees: Decimal::ZERO,
+                    closure_evidence: robson_domain::ClosureEvidence::real_exit_fill(None),
+                    timestamp: chrono::Utc::now(),
+                })
+                .unwrap();
+        });
+        manager
+            .insurance_stop_stale
+            .write()
+            .await
+            .insert(position.id, std::time::Instant::now());
+
+        assert!(manager.retry_stale_insurance_stop(&position).await);
+
+        assert_eq!(exchange.protection_call_count(), 2, "the placement did go out");
+        assert_eq!(exchange.stop_order_count(), stops_before, "and was taken back");
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(leg.state, PositionState::Closed { .. }), "{:?}", leg.state);
+        assert_eq!(leg.insurance_stop_id, None);
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert!(
+            !events.iter().any(|e| matches!(
+                e,
+                Event::InsuranceStopPlaced { .. } | Event::InsuranceStopFailed { .. }
+            )),
+            "{events:?}"
+        );
     }
 
     /// The lookup a leg with nothing held does is bounded end to end: a hung
