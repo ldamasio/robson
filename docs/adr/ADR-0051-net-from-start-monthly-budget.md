@@ -492,11 +492,15 @@ merging this change. A rule with no series stays silent. After the deploy, confi
 no schema or event-format change. The worker opens one more database connection.
 
 The rollback target is the image running before this deploy: record its `sha-*` tag
-from the `rbx-infra` pin before merging and confirm it is in the registry
-(`docs/runbooks/ci-cd-image-tagging.md`). Rolling back restores the automatic
-liquidation on an invalid basis, so first confirm the basis is valid or the exchange
-book is flat, in-flight entries included. Afterwards, check the pod's health and
-`/status`.
+from the `rbx-infra` pin before merging, confirm it is in the registry
+(`docs/runbooks/ci-cd-image-tagging.md`), and confirm it is running and includes
+PR #298 (`sha-aee83b1b` or later). #298 added migration 30, and once that is applied
+the sync's migration hook refuses an image without it, which leaves the daemon on
+this one. To go back past #298, roll forward instead: revert on `main` and keep the
+migration file, as that runbook says. Either way, undoing this change restores the
+automatic liquidation on an invalid basis, so first confirm the basis is valid or the
+exchange book is flat, in-flight entries included. Afterwards, check the pod's health
+and `/status`.
 
 **Failure modes.** Database down: the snapshot fails, admission fails closed, the
 halt is not evaluated, and the gauge keeps its last value. Daemon down: the row
