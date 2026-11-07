@@ -78,6 +78,11 @@ fn spot_order_from_response(
     })
 }
 
+/// An order status after which nothing more executes.
+fn is_terminal_order_status(status: &str) -> bool {
+    matches!(status, "FILLED" | "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" | "REJECTED")
+}
+
 /// Fee-grade fill evidence from a `/fapi/v1/order` response: `None` when
 /// nothing executed or the response carries no per-fill records (callers fall
 /// back to user trades, Policy 11).
@@ -141,7 +146,7 @@ fn order_lookup_from_response(response: BinanceOrderResponse) -> Result<OrderLoo
     match response.status.as_str() {
         "NEW" => Ok(OrderLookup::Open { filled_qty }),
         "PARTIALLY_FILLED" => Ok(OrderLookup::PartiallyFilled { filled_qty }),
-        "FILLED" | "CANCELED" | "EXPIRED" | "EXPIRED_IN_MATCH" | "REJECTED" => {
+        status if is_terminal_order_status(status) => {
             let cancelled_qty = (response.orig_qty - filled_qty).max(Decimal::ZERO);
             Ok(OrderLookup::Terminal {
                 filled_qty,
@@ -1187,23 +1192,29 @@ impl TradingPort for BinanceExchangeAdapter {
         })?;
         match self.client.get_order_status(&symbol.as_pair(), order_id).await {
             Ok(response) => {
-                // A triggered order still executing is no fill yet: its trades so far
-                // would pass for the whole of it. Not found says nothing either way,
-                // and falls through to the trades as well.
-                if matches!(response.status.as_str(), "NEW" | "PARTIALLY_FILLED") {
+                // Only a terminal order's trades are its fill: an order still executing,
+                // or in a state this code has never seen, could have more to come.
+                if !is_terminal_order_status(&response.status) {
                     return Ok(None);
                 }
+                let executed = response.executed_qty;
                 if response.status == "FILLED" {
                     if let Some(result) = fill_evidence(response)? {
                         return Ok(Some(result));
                     }
                 }
+                // Trades can lag the order. Short of what it executed, they are not
+                // the fill yet, and the caller comes back on a later pass.
+                let fill = self.triggered_trade_fill(symbol, &detail).await?;
+                Ok(fill.filter(|fill| fill.filled_quantity.as_decimal() == executed))
             },
-            Err(BinanceRestError::ApiError { code: -2013, .. }) => {},
-            Err(error) => return Err(Self::map_error(error)),
+            // Not found says nothing either way: the trades are all there is, and
+            // nothing to check them against.
+            Err(BinanceRestError::ApiError { code: -2013, .. }) => {
+                self.triggered_trade_fill(symbol, &detail).await
+            },
+            Err(error) => Err(Self::map_error(error)),
         }
-
-        self.triggered_trade_fill(symbol, &detail).await
     }
 
     async fn user_trades_since(
@@ -1576,63 +1587,95 @@ mod submit_attempt_evidence {
         });
     }
 
+    const TRIGGERED_ALGO: &str = r#"{"algoId":42,"clientAlgoId":"ins-1","algoType":"CONDITIONAL",
+        "orderType":"STOP_MARKET","symbol":"BTCUSDT","side":"SELL","quantity":"0.1",
+        "algoStatus":"TRIGGERED","triggerPrice":"58888","reduceOnly":true,"createTime":1,
+        "updateTime":2,"actualOrderId":"7","triggerTime":1700000000000}"#;
+    const TRIGGERED_TRADES: &str = r#"[{"symbol":"BTCUSDT","id":1,"orderId":7,"side":"SELL",
+        "price":"58888","qty":"0.04","quoteQty":"2355.52","commission":"1",
+        "commissionAsset":"USDT","realizedPnl":"0","time":1700000000500}]"#;
+
+    fn triggered_order(status: &str, executed: &str) -> String {
+        format!(
+            r#"{{"symbol":"BTCUSDT","orderId":7,"clientOrderId":"ins-1",
+            "updateTime":1700000000000,"price":"0","avgPrice":"58888","origQty":"0.1",
+            "executedQty":"{executed}","cumQuote":"2355.52","status":"{status}",
+            "side":"SELL","type":"MARKET","fills":[]}}"#
+        )
+    }
+
+    /// The stop's fill, and how many times the trades were asked for, with the
+    /// triggered order answering `reply` and its trades summing to 0.04.
+    async fn triggered_fill_on(reply: Reply) -> (Option<OrderResult>, usize) {
+        let (listener, venue) = bound_venue().await;
+        let trade_requests = Arc::new(AtomicUsize::new(0));
+        let counted = trade_requests.clone();
+        serve(listener, move |request| match request {
+            "GET /fapi/v1/algoOrder" => Some((200, TRIGGERED_ALGO.to_string())),
+            "GET /fapi/v1/order" => reply.clone(),
+            "GET /fapi/v1/userTrades" => {
+                counted.fetch_add(1, Ordering::SeqCst);
+                Some((200, TRIGGERED_TRADES.to_string()))
+            },
+            _ => Some((404, String::new())),
+        });
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let result = TradingPort::protection_fill(&*venue, &symbol, &StopRef::new("42"))
+            .await
+            .unwrap();
+        (result, trade_requests.load(Ordering::SeqCst))
+    }
+
     /// A triggered order still executing is no fill, however many of its trades
-    /// are visible; once terminal its trades are the fill. No extra request
-    /// either way.
+    /// are visible; once terminal, trades matching what it executed are the
+    /// fill. No extra request either way.
     #[tokio::test]
     async fn only_a_terminal_triggered_order_is_a_stop_fill() {
-        const ALGO: &str = r#"{"algoId":42,"clientAlgoId":"ins-1","algoType":"CONDITIONAL",
-            "orderType":"STOP_MARKET","symbol":"BTCUSDT","side":"SELL","quantity":"0.1",
-            "algoStatus":"TRIGGERED","triggerPrice":"58888","reduceOnly":true,"createTime":1,
-            "updateTime":2,"actualOrderId":"7","triggerTime":1700000000000}"#;
-        const TRADES: &str = r#"[{"symbol":"BTCUSDT","id":1,"orderId":7,"side":"SELL",
-            "price":"58888","qty":"0.04","quoteQty":"2355.52","commission":"1",
-            "commissionAsset":"USDT","realizedPnl":"0","time":1700000000500}]"#;
-        let order = |status: &str| {
-            format!(
-                r#"{{"symbol":"BTCUSDT","orderId":7,"clientOrderId":"ins-1",
-                "updateTime":1700000000000,"price":"0","avgPrice":"58888","origQty":"0.1",
-                "executedQty":"0.04","cumQuote":"2355.52","status":"{status}",
-                "side":"SELL","type":"MARKET","fills":[]}}"#
-            )
-        };
-        let fill_on = |reply: Reply| async move {
-            let (listener, venue) = bound_venue().await;
-            let trade_requests = Arc::new(AtomicUsize::new(0));
-            let counted = trade_requests.clone();
-            serve(listener, move |request| match request {
-                "GET /fapi/v1/algoOrder" => Some((200, ALGO.to_string())),
-                "GET /fapi/v1/order" => reply.clone(),
-                "GET /fapi/v1/userTrades" => {
-                    counted.fetch_add(1, Ordering::SeqCst);
-                    Some((200, TRADES.to_string()))
-                },
-                _ => Some((404, String::new())),
-            });
-            let symbol = Symbol::from_pair("BTCUSDT").unwrap();
-            let result = TradingPort::protection_fill(&*venue, &symbol, &StopRef::new("42"))
-                .await
-                .unwrap();
-            (result, trade_requests.load(Ordering::SeqCst))
-        };
-
         for status in ["NEW", "PARTIALLY_FILLED"] {
-            let (result, trades) = fill_on(Some((200, order(status)))).await;
+            let (result, trades) =
+                triggered_fill_on(Some((200, triggered_order(status, "0.04")))).await;
             assert!(result.is_none(), "{status}: {result:?}");
             assert_eq!(trades, 0, "{status}: nothing more to ask");
         }
         // Terminal, with fills only in the trades, as on USD-M; and an order the venue
         // no longer finds, which stays the gap this cannot close.
         for reply in [
-            Some((200, order("FILLED"))),
-            Some((200, order("EXPIRED"))),
-            Some((200, order("CANCELED"))),
+            Some((200, triggered_order("FILLED", "0.04"))),
+            Some((200, triggered_order("EXPIRED", "0.04"))),
+            Some((200, triggered_order("CANCELED", "0.04"))),
             Some((400, api_error(-2013))),
         ] {
-            let (result, trades) = fill_on(reply.clone()).await;
+            let (result, trades) = triggered_fill_on(reply.clone()).await;
             let fill = result.unwrap_or_else(|| panic!("{reply:?}"));
             assert_eq!(fill.filled_quantity.as_decimal(), dec!(0.04), "{reply:?}");
             assert_eq!(trades, 1, "{reply:?}");
+        }
+    }
+
+    /// A status this code has never seen says nothing about whether the order
+    /// is done, so no trades are read as its fill.
+    #[tokio::test]
+    async fn an_unknown_order_status_is_no_stop_fill() {
+        let (result, trades) =
+            triggered_fill_on(Some((200, triggered_order("NEW_INSURANCE", "0.04")))).await;
+        assert!(result.is_none(), "{result:?}");
+        assert_eq!(trades, 0);
+    }
+
+    /// Trades that have not caught up with a terminal order are not its fill,
+    /// and neither are more than it executed. A later pass asks again.
+    #[tokio::test]
+    async fn trades_that_differ_from_a_terminal_order_are_no_stop_fill() {
+        for (status, executed) in [
+            ("FILLED", "0.1"),
+            ("EXPIRED", "0.1"),
+            ("CANCELED", "0.1"),
+            ("EXPIRED", "0.01"),
+        ] {
+            let (result, trades) =
+                triggered_fill_on(Some((200, triggered_order(status, executed)))).await;
+            assert!(result.is_none(), "{status} {executed}: {result:?}");
+            assert_eq!(trades, 1, "{status} {executed}");
         }
     }
 
