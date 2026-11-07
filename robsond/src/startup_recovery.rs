@@ -1311,6 +1311,58 @@ mod tests {
         assert_eq!(recovery_check_outcome(&events, position_id), Some("filled_reconciled_closed"));
     }
 
+    /// A protective stop filled during the gap, for less than the leg.
+    async fn leg_whose_stop_filled_short(
+        pm: &Arc<PositionManager<StubExchange, MemoryStore>>,
+    ) -> Position {
+        let symbol = btcusdt();
+        let stop = pm
+            .exchange()
+            .place_stop_market_order(
+                &symbol,
+                OrderSide::Sell,
+                Quantity::new(dec!(0.008)).unwrap(),
+                Price::new(dec!(76158.25)).unwrap(),
+                "ins-short",
+            )
+            .await
+            .unwrap();
+        let stop_id = stop.exchange_order_id.clone();
+        pm.exchange().fill_stop_order(&stop_id);
+        let mut position = btcusdt_long_position(Uuid::now_v7());
+        position.quantity = Quantity::new(dec!(0.01)).unwrap();
+        position = with_insurance_stop(position, &stop_id);
+        pm.store().positions().save(&position).await.unwrap();
+        position
+    }
+
+    /// A stop's fill closes the leg however short of it and whatever the venue
+    /// still holds, and the close books the whole leg at that fill. No
+    /// venue read decides it (ADR-0056 §5).
+    #[tokio::test]
+    async fn heal_closes_on_a_short_stop_fill_with_the_venue_holding_the_rest() {
+        let pm = heal_manager().await;
+        let position = leg_whose_stop_filled_short(&pm).await;
+        pm.exchange().set_open_position(
+            btcusdt(),
+            Side::Long,
+            Quantity::new(dec!(0.002)).unwrap(),
+            Price::new(dec!(78000)).unwrap(),
+        );
+
+        let trailing_stop = Price::new(dec!(76158.25)).unwrap();
+        assert!(heal_insurance_stop(&pm, &position, trailing_stop).await);
+
+        let loaded = pm.store().positions().find_by_id(position.id).await.unwrap().unwrap();
+        match loaded.state {
+            PositionState::Closed { realized_pnl, exit_price, .. } => {
+                let entry = position.entry_price.unwrap().as_decimal();
+                assert_eq!(realized_pnl, (exit_price.as_decimal() - entry) * dec!(0.01));
+            },
+            other => panic!("expected Closed, got {other:?}"),
+        }
+    }
+
     /// Issue #154 deliverable 7: healing is idempotent. After a heal placed
     /// or kept a stop, a second heal with the same state is a no-op
     /// (already_protected), never a cancel-replace loop.

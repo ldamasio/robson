@@ -490,7 +490,7 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
 
         // 4. Record result
         match outcome {
-            Ok(ReductionOutcome::Submitted { accepted: order_result, .. }) => {
+            Ok(ReductionOutcome::Submitted { accepted: order_result, rules, .. }) => {
                 info!(
                     %position_id,
                     exchange_order_id = %order_result.exchange_order_id,
@@ -500,6 +500,32 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                     "Exit order filled"
                 );
                 self.journal.complete(intent_id, IntentResult::Success(order_result.clone()))?;
+
+                // A fill closes the leg, whatever it left: what the venue still holds
+                // is unauthored inventory for the reconciliation worker (ADR-0056 §5).
+                // Nothing else durable says what this order filled, so this is
+                // written every time, whatever residual the leg stands at.
+                let mut results = Vec::with_capacity(2);
+                let residual = quantity.as_decimal() - order_result.filled_quantity.as_decimal();
+                if residual > rust_decimal::Decimal::ZERO {
+                    warn!(
+                        %position_id,
+                        symbol = %symbol.as_pair(),
+                        %residual,
+                        "Exit executed less than the leg holds; closing the leg (ADR-0056 §5)"
+                    );
+                    let evidence = Self::residual_event(
+                        position_id,
+                        ReductionKind::Exit,
+                        quantity,
+                        residual,
+                        ResidualEvidence::of_fill(&order_result),
+                        rules.as_ref(),
+                    );
+                    results.extend(
+                        self.append_residual(evidence).await.map(ActionResult::EventEmitted),
+                    );
+                }
 
                 // Create ExitOrderPlaced event (will be returned and persisted by caller)
                 let exit_event = Event::ExitOrderPlaced {
@@ -515,10 +541,11 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
                 self.store.events().append(&exit_event).await?;
                 self.store.apply_event(&exit_event)?;
 
-                Ok(vec![ActionResult::OrderPlaced {
+                results.push(ActionResult::OrderPlaced {
                     order: order_result,
                     event: Some(exit_event),
-                }])
+                });
+                Ok(results)
             },
             Ok(ReductionOutcome::NotExecutable { residual, rules }) => {
                 error!(
@@ -1127,6 +1154,16 @@ struct ResidualEvidence {
 }
 
 impl ResidualEvidence {
+    /// An exit that executed: its fill, stamped when the venue filled it.
+    fn of_fill(order: &OrderResult) -> Self {
+        Self {
+            exchange_order_id: Some(order.exchange_order_id.clone()),
+            fill_price: Some(order.fill_price),
+            fee: Some(order.fee),
+            timestamp: order.filled_at,
+        }
+    }
+
     /// A stop the venue accepted: nothing has executed.
     fn of_stop(order: &OrderResult) -> Self {
         Self {
@@ -1369,6 +1406,88 @@ mod tests {
         let results =
             executor.execute(vec![exit_action(Uuid::now_v7(), dec!(0.1055))]).await.unwrap();
         assert_eq!(filled(&results), dec!(0.1055));
+    }
+
+    /// A fill closes the leg, whatever it left. The fill goes on the record
+    /// first, stamped when the venue filled it, and nothing moves on the
+    /// leg before the close: this is the only durable record of the filled
+    /// quantity.
+    #[tokio::test]
+    async fn a_short_exit_records_its_fill_and_is_an_exit() {
+        let executor = create_test_executor().await;
+        let leg = saved_leg(&executor, Side::Long).await;
+        executor.exchange.set_short_fill_next(dec!(0.3));
+
+        let results = executor.execute(vec![exit_action(leg.id, dec!(1))]).await.unwrap();
+
+        let order = match &results[1] {
+            ActionResult::OrderPlaced {
+                order,
+                event: Some(Event::ExitOrderPlaced { .. }),
+            } => order,
+            other => panic!("a fill is an exit, got {other:?}"),
+        };
+        match &results[0] {
+            ActionResult::EventEmitted(Event::ResidualInventoryRecorded {
+                order_kind,
+                requested_quantity,
+                accepted_quantity,
+                residual_quantity,
+                exchange_order_id,
+                fill_price,
+                fee,
+                timestamp,
+                ..
+            }) => {
+                assert_eq!(*order_kind, ReductionKind::Exit);
+                assert_eq!(*requested_quantity, dec!(1));
+                assert_eq!(*accepted_quantity, dec!(0.3));
+                assert_eq!(*residual_quantity, dec!(0.7));
+                assert_eq!(exchange_order_id.as_ref(), Some(&order.exchange_order_id));
+                assert_eq!(*fill_price, Some(order.fill_price));
+                assert_eq!(*fee, Some(order.fee));
+                assert_eq!(*timestamp, order.filled_at);
+            },
+            other => panic!("expected the fill on record, got {other:?}"),
+        }
+        let after = executor.store.positions().find_by_id(leg.id).await.unwrap().unwrap();
+        assert_eq!(after.quantity.as_decimal(), dec!(1));
+        assert_eq!(after.residual_quantity, None, "evidence of a fill leaves nothing standing");
+        assert_eq!(after.realized_pnl, leg.realized_pnl);
+        assert_eq!(after.fees_paid, leg.fees_paid);
+    }
+
+    /// A residual that happens to equal the one the leg stands at does not
+    /// suppress the record of a fill.
+    #[tokio::test]
+    async fn a_short_exit_records_its_fill_whatever_the_leg_stands_at() {
+        let executor = create_test_executor().await;
+        let mut leg = saved_leg(&executor, Side::Long).await;
+        leg.residual_quantity = Some(dec!(0.7));
+        executor.store.positions().save(&leg).await.unwrap();
+        executor.exchange.set_short_fill_next(dec!(0.3));
+
+        let results = executor.execute(vec![exit_action(leg.id, dec!(1))]).await.unwrap();
+
+        assert!(matches!(
+            &results[0],
+            ActionResult::EventEmitted(Event::ResidualInventoryRecorded { .. })
+        ));
+    }
+
+    /// A full exit has nothing to record.
+    #[tokio::test]
+    async fn a_full_exit_records_no_residual() {
+        let executor = create_test_executor().await;
+        let leg = saved_leg(&executor, Side::Long).await;
+
+        let results = executor.execute(vec![exit_action(leg.id, dec!(1))]).await.unwrap();
+
+        assert_eq!(results.len(), 1);
+        assert!(matches!(results[0], ActionResult::OrderPlaced {
+            event: Some(Event::ExitOrderPlaced { .. }),
+            ..
+        }));
     }
 
     /// An unchanged residual on a leg that stays open writes nothing.

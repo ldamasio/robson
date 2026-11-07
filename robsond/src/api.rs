@@ -3790,6 +3790,61 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
     }
 
+    /// ADR-0056 §5: a fill closes the position, however short of it, and the
+    /// routes answer as they always have.
+    #[tokio::test]
+    async fn a_close_that_fills_short_answers_204_and_panic_lists_what_it_closed() {
+        for panic in [false, true] {
+            let (app, _, position_manager, exchange) = create_test_app_with_event_bus_and_exchange(
+                100,
+                Arc::new(StubExchange::new(dec!(95000))),
+            )
+            .await;
+            let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+            let mut position = Position::new(Uuid::now_v7(), symbol.clone(), Side::Long);
+            position.entry_price = Some(Price::new(dec!(95000)).unwrap());
+            position.quantity = Quantity::new(dec!(1)).unwrap();
+            position.state = PositionState::Active {
+                current_price: Price::new(dec!(95000)).unwrap(),
+                trailing_stop: Price::new(dec!(90000)).unwrap(),
+                favorable_extreme: Price::new(dec!(95000)).unwrap(),
+                extreme_at: Utc::now(),
+                insurance_stop_id: None,
+                invalidation_guard_level: None,
+                last_emitted_stop: None,
+            };
+            position_manager.read().await.store().positions().save(&position).await.unwrap();
+            exchange.set_open_position(
+                symbol,
+                Side::Long,
+                Quantity::new(dec!(0.4)).unwrap(),
+                Price::new(dec!(95000)).unwrap(),
+            );
+            exchange.set_short_fill_next(dec!(0.6));
+
+            let request = if panic {
+                Request::builder().method("POST").uri("/panic").body(Body::empty()).unwrap()
+            } else {
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/positions/{}", position.id))
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            let response = app.oneshot(request).await.unwrap();
+
+            if panic {
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let body: PanicResponse = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body.count, 1);
+                assert_eq!(body.closed_positions, [position.id]);
+            } else {
+                assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            }
+        }
+    }
+
     /// A venue refusal on a live route. Closing answers 502; `/panic` reports
     /// per leg, so it answers 200 and does not claim the leg. Both as
     /// before ADR-0056 step 6.

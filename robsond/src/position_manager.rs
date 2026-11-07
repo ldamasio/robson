@@ -4582,7 +4582,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 expected: "Active with entry_price set".to_string(),
                 actual: format!("Active with entry_price=None for position {}", input.position_id),
             })?;
-        let qty = input.filled_quantity.as_decimal();
+        // A close books the leg's whole quantity at the last order's fill, as
+        // handle_exit_fill and panic close do. Where earlier fills went at other
+        // prices this is an estimate, but no quantity drops out of month net. A fill
+        // above the leg prices what filled. The evidence keeps the real quantity.
+        let qty = input.filled_quantity.as_decimal().max(position.quantity.as_decimal());
         let pnl = match position.side {
             Side::Long => (input.exit_price.as_decimal() - entry_price.as_decimal()) * qty,
             Side::Short => (entry_price.as_decimal() - input.exit_price.as_decimal()) * qty,
@@ -6596,6 +6600,8 @@ mod tests {
     }
 
     /// ADR-0056 step 6: the leg-level outcomes of the exit path.
+    /// `testdata/adr0056_step6_leg_before.json` was written by this function on
+    /// the old code (commit 2da94feb) and stays unchanged.
     async fn exit_leg_scenarios() -> serde_json::Value {
         let manager = create_test_manager().await;
         let (position, stop_id) = active_leg_with_live_stop(&manager).await;
@@ -6608,8 +6614,11 @@ mod tests {
         assert!(stop_crossing_tick(&manager, &position).await.is_err());
         let exit_order_fails = leg_outcome(&manager, &position, &stop_id).await;
 
+        // The old code could only hear of a short fill through its handler; the same
+        // fill now comes through the executor, which puts it on the record.
         let manager = create_test_manager().await;
         let (position, stop_id) = active_leg_with_live_stop(&manager).await;
+        manager.executor.exchange().set_short_fill_next(dec!(0.9));
         manager
             .execute_and_persist(vec![EngineAction::PlaceExitOrder {
                 position_id: position.id,
@@ -6641,11 +6650,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn exit_leg_outcomes_match_the_before_fixture() {
+    async fn exit_leg_outcomes_match_the_after_fixture_and_say_why_they_moved() {
         let observed = exit_leg_scenarios().await;
-        let expected: serde_json::Value =
+        let before: serde_json::Value =
             serde_json::from_str(include_str!("testdata/adr0056_step6_leg_before.json")).unwrap();
-        assert_eq!(observed, expected);
+        let after: serde_json::Value =
+            serde_json::from_str(include_str!("testdata/adr0056_step6_leg_after.json")).unwrap();
+
+        for scenario in [
+            "clean_exit",
+            "exit_order_fails",
+            "exit_fill_below_leg_quantity",
+        ] {
+            assert_eq!(observed[scenario], after[scenario]["outcome"], "{scenario}");
+            let why = after[scenario]["why"].as_str().unwrap_or_default();
+            assert_eq!(before[scenario] != observed[scenario], !why.is_empty(), "{scenario}");
+        }
     }
 
     // ---- ADR-0056 §5: the two rules -------------------------------------------
@@ -6894,6 +6914,96 @@ mod tests {
             .unwrap();
     }
 
+    fn short_fill_records(events: &[Event]) -> Vec<(Decimal, Decimal, Option<String>)> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                Event::ResidualInventoryRecorded {
+                    order_kind: robson_domain::ReductionKind::Exit,
+                    accepted_quantity,
+                    residual_quantity,
+                    exchange_order_id,
+                    ..
+                } => Some((*accepted_quantity, *residual_quantity, exchange_order_id.clone())),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// A fill closes the leg, whatever the venue still holds, and no venue read
+    /// decides it. The whole leg is booked at the fill, the fill is on the
+    /// record, and the closed leg blocks nothing.
+    #[tokio::test]
+    async fn a_short_exit_closes_the_leg_whatever_the_venue_still_holds() {
+        let manager = create_test_manager().await;
+        let (position, stop_id) = active_leg_with_live_stop(&manager).await;
+        let exchange = manager.exchange();
+        exchange.set_price("BTCUSDT", dec!(90));
+        exchange.set_short_fill_next(dec!(0.9));
+        venue_still_holds(&manager, &position, dec!(0.1));
+
+        assert!(stop_crossing_tick(&manager, &position).await.is_ok());
+
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        match leg.state {
+            PositionState::Closed { realized_pnl, .. } => {
+                assert_eq!(realized_pnl, dec!(-10), "(90 - 100) x 1, the whole leg");
+            },
+            other => panic!("a fill closes the leg, got {other:?}"),
+        }
+        assert!(!exchange.has_stop_order(&stop_id));
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        let records = short_fill_records(&events);
+        assert_eq!(records.len(), 1, "{events:?}");
+        assert_eq!((records[0].0, records[0].1), (dec!(0.9), dec!(0.1)));
+        assert_eq!(leg.residual_quantity, None);
+    }
+
+    /// The same through a close and through panic: closed, reported closed, and
+    /// the fill on the record.
+    #[tokio::test]
+    async fn a_close_or_a_panic_that_fills_short_closes_with_the_fill_on_record() {
+        for panic in [false, true] {
+            let manager = create_test_manager().await;
+            let (position, _) = active_leg_with_live_stop(&manager).await;
+            manager.exchange().set_short_fill_next(dec!(0.9));
+            venue_still_holds(&manager, &position, dec!(0.1));
+
+            if panic {
+                assert_eq!(manager.panic_close_all().await.unwrap(), [position.id]);
+            } else {
+                manager.close_position(position.id).await.unwrap();
+            }
+
+            let leg = manager.get_position(position.id).await.unwrap().unwrap();
+            assert!(matches!(leg.state, PositionState::Closed { .. }), "{:?}", leg.state);
+            let events = manager.store.events().find_by_position(position.id).await.unwrap();
+            assert_eq!(short_fill_records(&events).len(), 1, "{events:?}");
+        }
+    }
+
+    /// Rules widened after admission: the refresh lets the exit through at the
+    /// new lot, the fill closes the leg, and what the grid leaves is the
+    /// worker's.
+    #[tokio::test]
+    async fn a_rounded_exit_closes_the_leg() {
+        let manager = create_test_manager().await;
+        let (mut position, _) = active_leg_with_live_stop(&manager).await;
+        position.quantity = Quantity::new(dec!(0.105)).unwrap();
+        manager.store.positions().save(&position).await.unwrap();
+        let exchange = manager.exchange();
+        exchange.set_venue_rules(lot_rules(dec!(0.01)));
+
+        assert!(stop_crossing_tick(&manager, &position).await.is_ok());
+
+        assert_eq!(exchange.market_order_call_count(), 2, "one resubmission on the new lot");
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(leg.state, PositionState::Closed { .. }), "{:?}", leg.state);
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        let records = short_fill_records(&events);
+        assert_eq!((records[0].0, records[0].1), (dec!(0.10), dec!(0.005)));
+    }
+
     /// Whatever stops the exit behind its cancel, the leg gets a stop back,
     /// once the usual window passes, and with nothing crossing it again.
     #[tokio::test]
@@ -7123,6 +7233,104 @@ mod tests {
         manager.close_position(position.id).await.unwrap();
         let leg = manager.get_position(position.id).await.unwrap().unwrap();
         assert!(matches!(leg.state, PositionState::Closed { .. }), "{:?}", leg.state);
+    }
+
+    /// The stop's own fill, as `get_stop_order_fill` reports it.
+    async fn stop_fill_of(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        position: &Position,
+        stop_id: &str,
+        filled: Decimal,
+    ) -> ReconciledCloseInput {
+        let exchange = manager.exchange();
+        exchange.fill_stop_order_for(stop_id, Quantity::new(filled).unwrap()).unwrap();
+        crate::reconciliation_worker::gather_order_fill_evidence(
+            &exchange,
+            &manager.store,
+            position,
+        )
+        .await
+        .unwrap()
+        .expect("the fill is visible")
+    }
+
+    /// A short fill closes the leg, whatever the venue still holds, and the
+    /// close books the whole leg at that fill. The fee is this order's, and
+    /// the evidence keeps what filled.
+    #[tokio::test]
+    async fn reconcile_closes_on_a_short_stop_fill_whatever_the_venue_holds() {
+        let manager = create_test_manager().await;
+        let (mut position, stop_id) = active_leg_with_live_stop(&manager).await;
+        position.quantity = Quantity::new(dec!(0.105)).unwrap();
+        position.fees_paid = dec!(1);
+        manager.store.positions().save(&position).await.unwrap();
+        manager.exchange().set_price("BTCUSDT", dec!(90));
+        venue_still_holds(&manager, &position, dec!(0.005));
+        let input = stop_fill_of(&manager, &position, &stop_id, dec!(0.1)).await;
+        let fee = input.fee;
+        assert!(fee > Decimal::ZERO);
+
+        let outcome = manager.reconcile_close(input).await.unwrap();
+
+        assert!(matches!(outcome, ReconcileCloseOutcome::Closed), "{outcome:?}");
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        match leg.state {
+            PositionState::Closed { realized_pnl, .. } => {
+                assert_eq!(realized_pnl, dec!(-1.05), "(90 - 100) x 0.105, not x 0.1");
+            },
+            other => panic!("expected Closed, got {other:?}"),
+        }
+        assert_eq!(leg.fees_paid, dec!(1) + fee, "this order's fee, for what it executed");
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        let evidence = events
+            .iter()
+            .find_map(|event| match event {
+                Event::PositionClosed { closure_evidence, .. } => Some(closure_evidence),
+                _ => None,
+            })
+            .expect("the close is on record");
+        match evidence {
+            ClosureEvidence::Reconciled(ReconciliationEvidence::OrderFillRecord(fill)) => {
+                assert_eq!(fill.filled_quantity.as_decimal(), dec!(0.1));
+            },
+            other => panic!("expected the stop's fill, got {other:?}"),
+        }
+    }
+
+    /// A fill of the whole leg books what filled.
+    #[tokio::test]
+    async fn reconcile_closes_on_a_full_stop_fill() {
+        let manager = create_test_manager().await;
+        let (position, stop_id) = active_leg_with_live_stop(&manager).await;
+        manager.exchange().set_price("BTCUSDT", dec!(90));
+        let input = stop_fill_of(&manager, &position, &stop_id, dec!(1)).await;
+
+        let outcome = manager.reconcile_close(input).await.unwrap();
+
+        assert!(matches!(outcome, ReconcileCloseOutcome::Closed), "{outcome:?}");
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        match leg.state {
+            PositionState::Closed { realized_pnl, .. } => assert_eq!(realized_pnl, dec!(-10)),
+            other => panic!("expected Closed, got {other:?}"),
+        }
+    }
+
+    /// A fill above the leg prices what filled, as it always has.
+    #[tokio::test]
+    async fn reconcile_prices_a_fill_above_the_leg_at_what_filled() {
+        let manager = create_test_manager().await;
+        let (position, stop_id) = active_leg_with_live_stop(&manager).await;
+        manager.exchange().set_price("BTCUSDT", dec!(90));
+        let input = stop_fill_of(&manager, &position, &stop_id, dec!(1.2)).await;
+
+        let outcome = manager.reconcile_close(input).await.unwrap();
+
+        assert!(matches!(outcome, ReconcileCloseOutcome::Closed), "{outcome:?}");
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        match leg.state {
+            PositionState::Closed { realized_pnl, .. } => assert_eq!(realized_pnl, dec!(-12)),
+            other => panic!("expected Closed, got {other:?}"),
+        }
     }
 
     /// An `ExecutableSpan` leg with no snapshot and an empty cache.
