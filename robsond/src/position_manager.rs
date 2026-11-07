@@ -1944,8 +1944,15 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // positions.
         let monthly_unrealized_pnl = budget.month_equity_net - budget.governed_realized_net;
 
-        Ok(RiskContext::with_month_equity(
+        // The gate decides next, on this value: it must see a basis that went
+        // invalid during the snapshot.
+        let capital = Self::capital_for_the_gate(
             budget.capital_base,
+            self.budget_basis_is_invalid_now().await,
+        );
+
+        Ok(RiskContext::with_month_equity(
+            capital,
             summaries,
             budget.governed_realized_net,
             monthly_unrealized_pnl,
@@ -2926,7 +2933,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// Evaluate MonthlyHalt from the persisted model in the canonical
     /// ADR-0051 budget snapshot.
     ///
-    /// Trigger condition: `remaining_budget <= 0`
+    /// Trigger condition: `remaining_budget <= 0` on a valid basis. With
+    /// `capital_base <= 0` nothing fires (ADR-0051 §1).
     /// where:
     ///   remaining_budget = (capital_base × max_monthly_drawdown_pct) −
     /// consumed − latent_risk
@@ -2947,7 +2955,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             return false;
         }
 
-        let (snapshot, _, _, latent_risk_failures) = match self
+        let (snapshot, local_risk_open, _, latent_risk_failures) = match self
             .canonical_budget_snapshot_with_positions(chrono::Utc::now())
             .await
         {
@@ -2959,6 +2967,19 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         };
 
         self.emit_latent_risk_resolution_warnings(&latent_risk_failures).await;
+
+        // ADR-0051 §1: an invalid basis says nothing about the budget, so it never
+        // reads as exhaustion. Admission already fails closed on it, and open
+        // positions keep their stops and the reservations made at admission.
+        if snapshot.capital_base_invalid {
+            error!(
+                capital_base = %snapshot.capital_base,
+                risk_open_positions = local_risk_open.len(),
+                "MonthlyHalt not evaluated: the monthly budget basis is invalid (ADR-0051 §1); open positions are kept"
+            );
+            return false;
+        }
+
         if snapshot.latent_risk_invalid && !Self::realized_losses_exhaust_budget(&snapshot) {
             warn!(
                 "Latent risk unresolved; MonthlyHalt evaluation deferred (admission already blocked, insurance stops remain authoritative)"
@@ -2973,6 +2994,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let remaining_budget = snapshot.remaining_active;
 
         if remaining_budget <= Decimal::ZERO {
+            match self.budget_basis_is_invalid_now().await {
+                Ok(false) => {},
+                Ok(true) => {
+                    error!(
+                        "MonthlyHalt not triggered: the monthly budget basis went invalid during the evaluation (ADR-0051 §1); open positions are kept"
+                    );
+                    return false;
+                },
+                Err(e) => {
+                    warn!(error = %e, "Failed to re-read the monthly budget basis for MonthlyHalt evaluation");
+                    return false;
+                },
+            }
+
             let reason = format!(
                 "Monthly budget exhausted: remaining={:.2} <= 0 \
                  (model={}, budget={:.2}, consumed={:.2}, month_equity_net={:.2}, month_peak_net={:.2}, latent_risk={:.2})",
@@ -3007,14 +3042,34 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
     }
 
-    /// With latent risk unresolved, what can still decide the halt on its own:
-    /// realized losses that exhaust a valid budget under either way of
-    /// counting. A give-back from the peak also needs a mark, which may not
-    /// be current then, and a capital base that is not valid says nothing
-    /// about the budget.
+    /// ADR-0051 §1 at a decision point. A snapshot's reads can take seconds
+    /// when trading rules must be fetched, so the basis it read may no
+    /// longer stand.
+    async fn budget_basis_is_invalid_now(&self) -> DaemonResult<bool> {
+        let monthly = self.load_monthly_state(chrono::Utc::now()).await?;
+        Ok(monthly.capital_base <= Decimal::ZERO)
+    }
+
+    /// A re-read that fails is a governed denial like any other, which re-arms
+    /// the detector if its audit write succeeds, and not an operational error,
+    /// which would leave it dead.
+    fn capital_for_the_gate(snapshot_capital: Decimal, reread: DaemonResult<bool>) -> Decimal {
+        match reread {
+            Ok(false) => snapshot_capital,
+            Ok(true) => Decimal::ZERO,
+            Err(e) => {
+                warn!(error = %e, "Failed to re-read the monthly budget basis; denying the entry");
+                Decimal::ZERO
+            },
+        }
+    }
+
+    /// With latent risk unresolved on a valid basis, what can still decide the
+    /// halt on its own: realized losses that exhaust the budget under either
+    /// way of counting. A give-back from the peak also needs a mark, which may
+    /// not be current then.
     fn realized_losses_exhaust_budget(snapshot: &MonthlyBudgetSnapshot) -> bool {
-        !snapshot.capital_base_invalid
-            && snapshot.consumed_active.min(snapshot.consumed_nfs) >= snapshot.budget_amount
+        snapshot.consumed_active.min(snapshot.consumed_nfs) >= snapshot.budget_amount
     }
 
     /// Disarm (cancel) an armed position.
@@ -5307,7 +5362,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 capital_base = %monthly.capital_base,
                 year = now.year(),
                 month = now.month(),
-                "ADR-0051 §1: monthly budget snapshot is invalid because capital_base <= 0; high-severity accounting alarm required"
+                "ADR-0051 §1: monthly budget snapshot is invalid because capital_base <= 0; new entries denied, open positions kept"
             );
         }
         let budget_amount = self.trading_policy.monthly_budget(monthly.capital_base);
@@ -7421,10 +7476,9 @@ mod tests {
         }
     }
 
-    /// With latent risk unresolved only realized losses on a valid budget
-    /// decide.
+    /// With latent risk unresolved only realized losses decide.
     #[test]
-    fn only_realized_losses_on_a_valid_base_exhaust_the_budget_with_latent_risk_unresolved() {
+    fn only_realized_losses_exhaust_the_budget_with_latent_risk_unresolved() {
         type Manager = PositionManager<StubExchange, MemoryStore>;
         let nfs = MonthlyBudgetModel::NetFromStartNonExpandingV1;
         let hwm = MonthlyBudgetModel::HwmV1;
@@ -7434,10 +7488,6 @@ mod tests {
         assert!(!exhausted(budget_snapshot(nfs, dec!(10000), dec!(399), dec!(399))));
         assert!(exhausted(budget_snapshot(nfs, dec!(10000), dec!(400), dec!(400))));
         assert!(exhausted(budget_snapshot(hwm, dec!(10000), dec!(400), dec!(400))));
-
-        // A base that is not valid: its "budget" of zero is exhausted by nothing.
-        assert!(!exhausted(budget_snapshot(nfs, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO)));
-        assert!(!exhausted(budget_snapshot(nfs, Decimal::ZERO, dec!(500), dec!(500))));
 
         // A give-back from a peak, with no realized loss.
         assert!(!exhausted(budget_snapshot(hwm, dec!(10000), dec!(500), Decimal::ZERO)));
@@ -7488,6 +7538,343 @@ mod tests {
         save_closed_position_with_pnl(&manager, dec!(-1)).await;
         assert!(manager.evaluate_monthly_halt().await, "known losses exhaust the budget");
         assert!(manager.circuit_breaker.blocks_new_entries().await);
+    }
+
+    /// The basis a broken `monthly_state` row gives. Constructors refuse it, so
+    /// it comes in the way a stored config would. In-memory managers read their
+    /// basis from the engine's config; `update_engine_capital` restores it.
+    fn set_capital_base_to_zero(manager: &Arc<PositionManager<StubExchange, MemoryStore>>) {
+        let config: RiskConfig =
+            serde_json::from_value(serde_json::json!({ "capital": "0" })).unwrap();
+        manager.engine.lock().unwrap().update_risk_config(config);
+    }
+
+    async fn is_still_active(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        position: &Position,
+    ) -> bool {
+        let stored = manager.get_position(position.id).await.unwrap().unwrap();
+        matches!(stored.state, PositionState::Active { .. })
+    }
+
+    /// ADR-0051 §1: a basis of zero is not an exhausted budget. Nothing latches
+    /// and the open position keeps running on its stop, even though the
+    /// arithmetic reads below zero.
+    #[tokio::test]
+    async fn an_invalid_basis_neither_halts_nor_closes_open_positions() {
+        let manager = create_test_manager().await;
+        let leg = save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+        set_capital_base_to_zero(&manager);
+
+        let snapshot = manager.canonical_budget_snapshot(chrono::Utc::now()).await.unwrap();
+        assert!(snapshot.capital_base_invalid);
+        assert!(!snapshot.latent_risk_invalid, "the path with latent risk resolved");
+        assert!(snapshot.remaining_active < Decimal::ZERO, "{}", snapshot.remaining_active);
+        assert_eq!(snapshot.slots_active, 0);
+
+        assert!(!manager.evaluate_monthly_halt().await);
+        assert!(!manager.circuit_breaker.blocks_new_entries().await);
+        assert!(is_still_active(&manager, &leg).await);
+    }
+
+    /// The same with latent risk unresolved and losses that would exhaust any
+    /// budget.
+    #[tokio::test]
+    async fn an_invalid_basis_does_not_halt_with_latent_risk_unresolved_either() {
+        let manager = create_test_manager().await;
+        let leg = leg_with_unresolved_latent_risk(&manager).await;
+        save_closed_position_with_pnl(&manager, dec!(-500)).await;
+        set_capital_base_to_zero(&manager);
+
+        assert!(!manager.evaluate_monthly_halt().await);
+        assert!(!manager.circuit_breaker.blocks_new_entries().await);
+        assert!(is_still_active(&manager, &leg).await);
+    }
+
+    /// Nothing is latched by the invalid basis, so a real exhaustion still
+    /// fires once the basis is valid again.
+    #[tokio::test]
+    async fn the_halt_decides_normally_once_the_basis_is_valid_again() {
+        let manager = create_test_manager().await;
+        let leg = save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+        save_closed_position_with_pnl(&manager, dec!(-400)).await;
+        set_capital_base_to_zero(&manager);
+        assert!(!manager.evaluate_monthly_halt().await);
+        assert!(!manager.circuit_breaker.blocks_new_entries().await);
+
+        manager.update_engine_capital(dec!(10000));
+
+        assert!(manager.evaluate_monthly_halt().await);
+        assert!(manager.circuit_breaker.blocks_new_entries().await);
+        assert!(!is_still_active(&manager, &leg).await);
+    }
+
+    #[test]
+    fn the_gate_sees_no_capital_unless_the_basis_still_stands() {
+        type Manager = PositionManager<StubExchange, MemoryStore>;
+
+        assert_eq!(Manager::capital_for_the_gate(dec!(10000), Ok(false)), dec!(10000));
+        assert_eq!(Manager::capital_for_the_gate(dec!(10000), Ok(true)), Decimal::ZERO);
+        assert_eq!(
+            Manager::capital_for_the_gate(
+                dec!(10000),
+                Err(DaemonError::Config("database gone".to_string()))
+            ),
+            Decimal::ZERO
+        );
+    }
+
+    /// Automatic liquidation is what the invalid basis gave up. The operator's
+    /// own decision to flatten does not depend on the budget.
+    #[tokio::test]
+    async fn the_operator_can_still_flatten_on_an_invalid_basis() {
+        let manager = create_test_manager().await;
+        let leg = save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+        set_capital_base_to_zero(&manager);
+
+        let closed = manager.trigger_monthly_halt("operator decision".to_string()).await.unwrap();
+
+        assert_eq!(closed, [leg.id]);
+        assert!(manager.circuit_breaker.blocks_new_entries().await);
+    }
+
+    #[cfg(feature = "postgres")]
+    async fn set_month_basis(pool: &sqlx::PgPool, capital_base: Decimal) {
+        let now = chrono::Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO monthly_state (
+                year, month, capital_base, month_peak_net,
+                monthly_budget_model, created_at
+            )
+            VALUES ($1, $2, $3, 0, 'net_from_start_non_expanding_v1', $4)
+            ON CONFLICT (year, month) DO UPDATE SET capital_base = EXCLUDED.capital_base
+            "#,
+        )
+        .bind(now.year() as i16)
+        .bind(now.month() as i16)
+        .bind(capital_base)
+        .bind(now)
+        .execute(pool)
+        .await
+        .unwrap();
+    }
+
+    /// An Armed BTCUSDT position and the signal that would enter it.
+    #[cfg(feature = "postgres")]
+    async fn armed_position_and_signal(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+    ) -> (Position, DetectorSignal) {
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        manager.exchange().set_trading_rules(
+            robson_domain::SymbolTradingRules::new(
+                symbol.clone(),
+                dec!(0.01),
+                Decimal::ZERO,
+                dec!(0.000001),
+                dec!(0.000001),
+                dec!(1000000),
+                Decimal::ZERO,
+                2,
+                6,
+            )
+            .unwrap(),
+        );
+        let entry = Price::new(dec!(95000)).unwrap();
+        let stop = Price::new(dec!(91200)).unwrap();
+        let mut armed = Position::new(Uuid::now_v7(), symbol.clone(), Side::Long);
+        armed.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(entry, stop));
+        armed.state = PositionState::Armed;
+        manager.store.positions().save(&armed).await.unwrap();
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: armed.id,
+            symbol,
+            side: Side::Long,
+            entry_price: entry,
+            stop_loss: stop,
+            technical_stop_analysis: None,
+            timestamp: chrono::Utc::now(),
+        };
+        (armed, signal)
+    }
+
+    /// Denied before the exchange, with the breaker and the rest of the book
+    /// left alone.
+    #[cfg(feature = "postgres")]
+    async fn assert_denied_and_book_kept(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        armed: &Position,
+        leg: &Position,
+    ) {
+        let denied = manager.get_position(armed.id).await.unwrap().unwrap();
+        assert!(matches!(denied.state, PositionState::Armed), "{:?}", denied.state);
+        assert_eq!(manager.exchange().market_order_call_count(), 0);
+        assert!(!manager.circuit_breaker.blocks_new_entries().await);
+        assert!(is_still_active(manager, leg).await);
+    }
+
+    /// The row production would read, with the engine still holding the capital
+    /// it sized with.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn a_zero_base_row_denies_signals_and_keeps_the_book(pool: sqlx::PgPool) {
+        set_month_basis(&pool, Decimal::ZERO).await;
+        let manager = create_postgres_test_manager(pool);
+        let leg = save_active_position(&manager, "ETHUSDT", Side::Long, dec!(100), dec!(1)).await;
+
+        // A close elsewhere in the book.
+        assert!(!manager.evaluate_monthly_halt().await);
+        assert!(!manager.circuit_breaker.blocks_new_entries().await);
+
+        let (armed, signal) = armed_position_and_signal(&manager).await;
+        manager.handle_signal(signal).await.unwrap();
+
+        assert_denied_and_book_kept(&manager, &armed, &leg).await;
+    }
+
+    /// The basis goes invalid while an entry waits for the operator.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn a_zero_base_row_denies_a_pending_approval_and_keeps_the_book(pool: sqlx::PgPool) {
+        use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
+
+        set_month_basis(&pool, dec!(10000)).await;
+        let manager = create_postgres_test_manager(pool.clone());
+        let leg = save_active_position(&manager, "ETHUSDT", Side::Long, dec!(100), dec!(1)).await;
+        let (armed, signal) = armed_position_and_signal(&manager).await;
+        manager.entry_policies.write().await.insert(
+            armed.id,
+            EntryPolicyConfig::new(EntryPolicy::Immediate, DomainApprovalPolicy::HumanConfirmation),
+        );
+        manager.handle_signal(signal).await.unwrap();
+        let query_id = {
+            let pending = manager.pending_approvals.read().await;
+            *pending.keys().next().expect("the signal must wait for approval")
+        };
+
+        set_month_basis(&pool, Decimal::ZERO).await;
+        let result = manager.approve_query(query_id).await;
+
+        assert!(matches!(result, Err(DaemonError::ApprovalDenied { .. })), "{result:?}");
+        assert_denied_and_book_kept(&manager, &armed, &leg).await;
+    }
+
+    /// Holds the next snapshot on `positions_current`, which it reads after the
+    /// basis.
+    #[cfg(feature = "postgres")]
+    async fn stall_on_positions_current(
+        pool: &sqlx::PgPool,
+    ) -> sqlx::Transaction<'static, sqlx::Postgres> {
+        let mut stall = pool.begin().await.unwrap();
+        sqlx::query("LOCK TABLE positions_current IN ACCESS EXCLUSIVE MODE")
+            .execute(&mut *stall)
+            .await
+            .unwrap();
+        stall
+    }
+
+    /// Once a snapshot is held there, write the basis and let the snapshot go
+    /// on.
+    #[cfg(feature = "postgres")]
+    async fn write_the_basis_while_a_snapshot_waits(
+        pool: &sqlx::PgPool,
+        writes: &[Decimal],
+        stall: sqlx::Transaction<'_, sqlx::Postgres>,
+    ) {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let waiting: i64 = sqlx::query_scalar(
+                    r#"
+                    SELECT count(*) FROM pg_locks
+                    WHERE NOT granted
+                      AND database = (SELECT oid FROM pg_database WHERE datname = current_database())
+                      AND relation = 'positions_current'::regclass
+                    "#,
+                )
+                .fetch_one(pool)
+                .await
+                .unwrap();
+                if waiting > 0 {
+                    break;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        })
+        .await
+        .expect("the snapshot must reach the locked table");
+        for capital_base in writes {
+            set_month_basis(pool, *capital_base).await;
+        }
+        stall.rollback().await.unwrap();
+    }
+
+    /// ADR-0051 §1 over random schedules: whatever the basis goes through while
+    /// a snapshot waits, the halt and the gate decide on where it ended up.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn decisions_follow_the_basis_as_it_stands_after_the_snapshot(pool: sqlx::PgPool) {
+        use proptest::{prelude::*, strategy::ValueTree, test_runner::TestRunner};
+
+        let write = prop_oneof![Just(Decimal::ZERO), (1i64..50_000).prop_map(Decimal::from)];
+        let schedules = (1i64..50_000, 1i64..400, proptest::collection::vec(write, 0..4));
+        let mut runner = TestRunner::deterministic();
+        let (mut fired_any, mut spared_any) = (false, false);
+
+        for _ in 0..32 {
+            let (initial, quantity, writes) = schedules.new_tree(&mut runner).unwrap().current();
+            let initial = Decimal::from(initial);
+            let settled = writes.last().copied().unwrap_or(initial);
+
+            set_month_basis(&pool, initial).await;
+            let manager = create_postgres_test_manager(pool.clone());
+            let leg = save_active_position(
+                &manager,
+                "ETHUSDT",
+                Side::Long,
+                dec!(100),
+                Decimal::from(quantity),
+            )
+            .await;
+            let snapshot = manager.canonical_budget_snapshot(chrono::Utc::now()).await.unwrap();
+            assert!(!snapshot.latent_risk_invalid);
+            let exhausted = snapshot.remaining_active <= Decimal::ZERO;
+
+            let stall = stall_on_positions_current(&pool).await;
+            let (fired, ()) = tokio::join!(
+                manager.evaluate_monthly_halt(),
+                write_the_basis_while_a_snapshot_waits(&pool, &writes, stall)
+            );
+
+            let case = format!("initial {initial}, {quantity} units, writes {writes:?}");
+            assert_eq!(fired, exhausted && settled > Decimal::ZERO, "halt: {case}");
+            assert_eq!(manager.circuit_breaker.blocks_new_entries().await, fired, "{case}");
+            if !fired {
+                assert!(is_still_active(&manager, &leg).await, "{case}");
+            }
+            fired_any |= fired;
+            spared_any |= exhausted && !fired;
+
+            set_month_basis(&pool, initial).await;
+            let manager = create_postgres_test_manager(pool.clone());
+            let stall = stall_on_positions_current(&pool).await;
+            let (context, ()) = tokio::join!(
+                manager.build_risk_context(),
+                write_the_basis_while_a_snapshot_waits(&pool, &writes, stall)
+            );
+
+            let expected = if settled > Decimal::ZERO {
+                initial
+            } else {
+                Decimal::ZERO
+            };
+            assert_eq!(context.unwrap().capital, expected, "gate: {case}");
+        }
+
+        assert!(fired_any && spared_any, "the schedules must reach both outcomes");
     }
 
     /// Reconciliation passes, with the manager held the way the daemon holds

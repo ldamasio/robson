@@ -62,6 +62,8 @@ pub mod startup_recovery;
 pub mod venue;
 
 #[cfg(feature = "postgres")]
+pub mod budget_basis_alarm;
+#[cfg(feature = "postgres")]
 pub mod income_ledger;
 
 #[cfg(feature = "postgres")]

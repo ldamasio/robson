@@ -135,6 +135,10 @@
   let budgetModel = $derived(budget.model);
   let budgetUsedPct = $derived(budget.usedPct);
   let monthlyDrawdownPct = $derived(budget.drawdownPct);
+  // A latched MonthlyHalt outranks it: correcting the basis does not lift a halt.
+  let monthlyBudgetBasisInvalid = $derived(
+    budget.basisInvalid && haltState !== "monthly_halt",
+  );
   let monthlyBudgetExhausted = $derived(budget.exhausted);
   let monthlyBudgetLow = $derived(budget.low);
 
@@ -521,7 +525,13 @@
       </Stack>
     </Card>
   {:else}
-    {#if monthlyBudgetExhausted}
+    {#if monthlyBudgetBasisInvalid}
+      <div class="capital-banner">
+        <Row justify="between" align="center">
+          <span>{$_("dashboard.monthlyBudgetBasisInvalidBanner")}</span>
+        </Row>
+      </div>
+    {:else if monthlyBudgetExhausted}
       <div class="capital-banner">
         <Row justify="between" align="center">
           <span>{$_("dashboard.monthlyBudgetExhaustedBanner")}</span>

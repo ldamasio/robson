@@ -36,6 +36,11 @@ export type BudgetView = {
    * in, so "X% of a 4.0% limit" compares like with like.
    */
   drawdownPct: number;
+  /**
+   * Capital base not positive: entries are denied until it is corrected, which
+   * needs no rollover (ADR-0051 §1). Not an exhausted budget.
+   */
+  basisInvalid: boolean;
   /** Nothing left: the daemon blocks every new entry until the rollover. */
   exhausted: boolean;
   /** No full-cap slot fits, but a smaller entry still can. */
@@ -87,14 +92,15 @@ export function deriveBudgetView(
   // fires MonthlyHalt (ADR-0043: remaining_budget <= 0). Above zero, entries
   // whose planned risk fits are still admitted, so it must not be reported as
   // a hard block until the month rollover.
+  const basisInvalid = status != null && status.capital_base <= 0;
   const exhausted =
-    status?.monthly_budget_remaining != null
+    !basisInvalid && status?.monthly_budget_remaining != null
       ? status.monthly_budget_remaining <= 0
       : false;
 
   // `new_slots_available === 0` is the guaranteed-full-cap floor, never a
   // ceiling (ADR-0043), so it alone does not mean Robson cannot operate.
-  const low = insufficientCapital && !exhausted && usedPct > 0;
+  const low = insufficientCapital && !basisInvalid && !exhausted && usedPct > 0;
 
-  return { model, usedPct, drawdownPct, exhausted, low };
+  return { model, usedPct, drawdownPct, basisInvalid, exhausted, low };
 }
