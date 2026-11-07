@@ -86,6 +86,15 @@ jobs:
       - name: Run tests (no postgres feature - uses MemoryStore)
         run: cargo test --all --no-fail-fast
 
+      # The image ships with this feature (see Dockerfile). A test it gates
+      # without #[ignore] runs nowhere else: the step above compiles it out and
+      # the DATABASE_URL step below selects only --ignored tests. DATABASE_URL
+      # stays unset here on purpose: these tests need no database, and
+      # Config::from_env requires PROJECTION_TENANT_ID once it is set, which
+      # fails the config tests. robson-connectors has no such tests.
+      - name: Run tests with the postgres feature (no database)
+        run: cargo test --workspace --exclude robson-connectors --features postgres --no-fail-fast
+
       - name: Reject duplicate migration versions
         # SQLx identifies migrations solely by the numeric prefix; two files
         # sharing one version fail at runtime with VersionMismatch. Catch it
