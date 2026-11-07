@@ -442,8 +442,8 @@ The domain stop resolver's adverse tick rounding is reused; ADR-0052's persisted
 - **Admission block.** A residual on any open leg refuses new admissions through its own check and reason (409). It never fails
   the budget snapshot and is no input to the budget, latent risk or MonthlyHalt. It does not cover a remainder after a close.
 - **MonthlyHalt.** With latent risk unresolved, the halt fires only on a valid capital base with realized losses alone exhausting the
-  budget (`min(consumed_active, consumed_nfs)`). Below that, or with an invalid base, it defers as before this step. The path with
-  latent risk resolved is unchanged, including ADR-0051 §1: on `capital_base ≤ 0` the halt latches and closes risk-bearing positions.
+  budget (`min(consumed_active, consumed_nfs)`). Below that it defers as before this step. An invalid base never fires it, with latent
+  risk resolved or not (ADR-0051 §1, amended 2026-11-07, after this step).
 - **Stop healing.** Any `Active` leg with no stop on record is re-placed through the existing heal path, whichever caller or error
   left it so. The first attempt waits the 30 s window and needs a tick, so the exposure after a failed tick exit is at least 30 s and
   has no upper bound without ticks on the symbol. A leg with nothing held and a failed lookup waits for metadata; a leg below the lot
@@ -837,7 +837,7 @@ Budget model for multi-venue:
   live stop charged at the mark (7 P1 + 4 P2, then 10 P1 + 2 P2). Round 3: a leg kept `Active` after a short fill and closed only on
   a flat venue read (7 P1 + 3 P2; five in that lifecycle, one not fixable on today's port, because a position read carries no evidence
   that it follows the fill). Round 4 on the current rule: 5 P1 + 3 P2 on stop evidence, the withdrawal race and request accounting,
-  applied except for two ownership races staged to step 7, and an invalid base's halt, which stays as ADR-0051 §1 decided. Round 5:
+  applied except for two ownership races staged to step 7, and an invalid base's halt, which stayed as ADR-0051 §1 then decided (since amended, 2026-11-07). Round 5:
   1 P1 + 2 P2 + 2 P3, mostly on a worker lookup that closed a leg on its dead stop, whose coverage check could not be tied to the stop;
   the lookup was withdrawn. Round 6: 1 P1 + 2 P3, rejecting a dead recorded stop as a stated limit; the sweep now re-places a recorded stop
   gone from the venue. Round 7: 1 P1 + 2 P3, a replaced stop's later fill leaving the budget; displaced stops now stay evidence. Round 8:
