@@ -1537,6 +1537,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if !due {
             return false;
         }
+        // Scheduled before the leg came under suspicion. It has nothing to protect
+        // unless it reappears, and the attempt waits for that.
+        if self.exit_overtaken_suspects.read().await.contains(&position.id) {
+            return false;
+        }
         let (trailing_stop, guard, insurance_stop_id) = match &position.state {
             PositionState::Active {
                 trailing_stop,
@@ -8102,6 +8107,67 @@ mod tests {
 
         let loaded = manager.get_position(leg.id).await.unwrap().unwrap();
         assert!(matches!(loaded.state, PositionState::Active { .. }), "{:?}", loaded.state);
+    }
+
+    /// The heal is scheduled, then a refused exit marks the leg suspected
+    /// closed by the venue. The due heal waits, and the fill closes the
+    /// leg.
+    #[tokio::test]
+    async fn a_heal_scheduled_before_the_suspicion_is_not_consumed_under_it() {
+        let manager = create_test_manager().await;
+        let exchange = manager.exchange();
+        exchange.set_price("BTCUSDT", dec!(90));
+        let (leg, stop_a) = active_leg_with_live_stop(&manager).await;
+        venue_still_holds(&manager, &leg, dec!(1));
+        exchange.trigger_stop_order(&stop_a);
+        let manager = scanned(manager).await;
+        assert!(stop_heal_scheduled(&manager, leg.id).await);
+
+        exchange.clear_open_position(&leg.symbol, leg.side);
+        manager.exit_overtaken_suspects.write().await.insert(leg.id);
+        manager
+            .insurance_stop_stale
+            .write()
+            .await
+            .insert(leg.id, std::time::Instant::now());
+        let placements = exchange.protection_call_count();
+        quiet_tick(&manager, &leg).await;
+
+        assert_eq!(exchange.protection_call_count(), placements);
+        let waiting = manager.get_position(leg.id).await.unwrap().unwrap();
+        assert_eq!(waiting.insurance_stop_id.as_ref(), Some(&stop_a));
+        assert!(stop_heal_scheduled(&manager, leg.id).await);
+
+        exchange.fill_stop_order_for(&stop_a, Quantity::new(dec!(1)).unwrap()).unwrap();
+        quiet_tick(&manager, &leg).await;
+
+        the_stop_loss_is_in_the_budget(&manager, &leg).await;
+    }
+
+    /// The suspicion was wrong: the venue shows the leg again, and the heal
+    /// that waited runs on the next tick.
+    #[tokio::test]
+    async fn a_heal_that_waited_runs_once_the_suspicion_is_dropped() {
+        let manager = create_test_manager().await;
+        let exchange = manager.exchange();
+        let (leg, stop_a) = active_leg_with_live_stop(&manager).await;
+        venue_still_holds(&manager, &leg, dec!(1));
+        exchange.trigger_stop_order(&stop_a);
+        let manager = scanned(manager).await;
+        manager.exit_overtaken_suspects.write().await.insert(leg.id);
+        manager
+            .insurance_stop_stale
+            .write()
+            .await
+            .insert(leg.id, std::time::Instant::now());
+        let placements = exchange.protection_call_count();
+
+        quiet_tick(&manager, &leg).await;
+        assert_eq!(exchange.protection_call_count(), placements);
+        assert!(!manager.exit_overtaken_suspects.read().await.contains(&leg.id));
+
+        quiet_tick(&manager, &leg).await;
+        assert_eq!(exchange.protection_call_count(), placements + 1);
     }
 
     /// A residual has no say in the halt either way.
