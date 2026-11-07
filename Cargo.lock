@@ -2205,6 +2205,7 @@ version = "2.5.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "proptest",
  "robson-eventlog",
  "robson-testkit",
  "rust_decimal",

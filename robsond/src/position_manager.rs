@@ -11226,9 +11226,9 @@ mod tests {
         let target = chrono::Utc.with_ymd_and_hms(2027, 4, 15, 12, 0, 0).unwrap();
         let nfs = MonthlyBudgetModel::NetFromStartNonExpandingV1;
 
-        // Future months avoid migration 000011's current-month backfill, so
-        // every case exercises the INSERT inheritance path rather than an
-        // ON CONFLICT update that intentionally preserves the existing model.
+        // Each case starts without the target month's row, so it exercises the
+        // INSERT inheritance path rather than an ON CONFLICT update that
+        // intentionally preserves the existing model.
         sqlx::query(
             r#"
             INSERT INTO monthly_state (
@@ -11269,33 +11269,6 @@ mod tests {
                     "evidence": "test",
                     "month": 4,
                     "year": 2027,
-                    "timestamp": target,
-                }),
-            },
-            WriterCase::Projector {
-                name: "entry_filled",
-                event_type: "entry_filled",
-                payload: serde_json::json!({
-                    "position_id": Uuid::new_v4(),
-                    "order_id": Uuid::new_v4(),
-                    "fill_price": "100",
-                    "filled_quantity": "1",
-                    "fee": "0.1",
-                    "initial_stop": "90",
-                    "invalidation_guard_level": null,
-                    "timestamp": target,
-                }),
-            },
-            WriterCase::Projector {
-                name: "position_closed",
-                event_type: "position_closed",
-                payload: serde_json::json!({
-                    "position_id": Uuid::new_v4(),
-                    "exit_reason": "TrailingStop",
-                    "entry_price": "100",
-                    "exit_price": "90",
-                    "realized_pnl": "-10",
-                    "total_fees": "1",
                     "timestamp": target,
                 }),
             },
@@ -11363,6 +11336,36 @@ mod tests {
         assert!(invalid_snapshot.capital_base_invalid);
         assert_eq!(invalid_snapshot.budget_amount(), Decimal::ZERO);
         assert_eq!(invalid_snapshot.slots_active, 0);
+    }
+
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn test_losing_close_before_first_boundary_poll_keeps_a_valid_base(pool: sqlx::PgPool) {
+        let manager = create_postgres_test_manager(pool.clone());
+        let now = chrono::Utc::now();
+
+        let envelope = projector_test_envelope(
+            "position_closed",
+            serde_json::json!({
+                "position_id": Uuid::new_v4(),
+                "exit_reason": "TrailingStop",
+                "entry_price": "100",
+                "exit_price": "90",
+                "realized_pnl": "-10",
+                "total_fees": "1",
+                "timestamp": now,
+            }),
+            now,
+            1,
+        );
+        apply_event_to_projections(&pool, &envelope).await.unwrap();
+
+        let snapshot = manager.canonical_budget_snapshot(now).await.unwrap();
+        assert!(!snapshot.capital_base_invalid);
+        assert_eq!(snapshot.capital_base, dec!(10000));
+        assert!(!manager.evaluate_monthly_halt().await);
+        assert!(!manager.circuit_breaker().blocks_new_entries().await);
     }
 
     #[tokio::test]
