@@ -16,21 +16,12 @@ on:
       - "robsond/**"
       - "rust-toolchain.toml"
       - "rustfmt.toml"
+  # No paths filter here, unlike push, so Rust Tests can be a required check on
+  # main: a workflow skipped by a filter reports nothing, and a PR touching none
+  # of the paths above would wait for the check forever. push keeps its filter
+  # because a run on main deploys: a docs merge must not restart the daemon.
   pull_request:
     branches: ["main"]
-    paths:
-      - ".cargo/**"
-      - ".dockerignore"
-      - ".github/workflows/robsond.yml"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "Dockerfile"
-      - "clippy.toml"
-      - "migrations/**"
-      - "robson-*/**"
-      - "robsond/**"
-      - "rust-toolchain.toml"
-      - "rustfmt.toml"
   workflow_dispatch:
 
 # Least privilege (RBX guardrails): neither job writes to this repository
