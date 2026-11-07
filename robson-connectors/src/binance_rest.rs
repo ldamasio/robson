@@ -1598,8 +1598,43 @@ mod tests {
 
     #[tokio::test]
     async fn test_get_price_requires_no_signature() {
-        let client = BinanceRestClient::new("key".to_string(), "secret".to_string());
-        let _ = client.get_price("BTCUSDT");
+        use tokio::{
+            io::{AsyncReadExt, AsyncWriteExt},
+            net::TcpListener,
+        };
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let client = BinanceRestClient::with_local_base_url(url);
+
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            let mut head = Vec::new();
+            let mut buf = [0u8; 4096];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = stream.read(&mut buf).await.unwrap();
+                assert!(n > 0, "client closed the connection mid-request");
+                head.extend_from_slice(&buf[..n]);
+            }
+            let body = r#"{"symbol":"BTCUSDT","price":"95000.5"}"#;
+            let response = format!(
+                "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{}",
+                body.len(),
+                body
+            );
+            stream.write_all(response.as_bytes()).await.unwrap();
+            String::from_utf8(head).unwrap()
+        });
+
+        let price = client.get_price("BTCUSDT").await.unwrap();
+        let head = server.await.unwrap();
+
+        assert_eq!(price.as_decimal(), dec!(95000.5));
+        assert_eq!(
+            head.lines().next().unwrap(),
+            "GET /fapi/v1/ticker/price?symbol=BTCUSDT HTTP/1.1"
+        );
+        assert!(!head.to_lowercase().contains("x-mbx-apikey"), "API key sent: {head}");
     }
 
     #[test]

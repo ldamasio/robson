@@ -34,8 +34,6 @@
 //! let results = executor.execute(actions).await?;
 //! ```
 
-#![warn(clippy::all)]
-
 mod compat;
 pub mod error;
 pub mod executor;
