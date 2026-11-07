@@ -43,6 +43,8 @@ use tokio::{net::TcpListener, sync::RwLock};
 use tracing::{debug, error, info, warn};
 
 #[cfg(feature = "postgres")]
+use crate::budget_basis_alarm::BudgetBasisAlarm;
+#[cfg(feature = "postgres")]
 use crate::funding::{worker::FundingWorker, FundingService};
 #[cfg(feature = "postgres")]
 use crate::income_ledger::IncomeLedgerWorker;
@@ -608,14 +610,17 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     ///
     /// This method blocks until shutdown is requested (SIGINT/SIGTERM).
     pub async fn run(self) -> DaemonResult<()> {
+        self.run_until(tokio_util::sync::CancellationToken::new()).await
+    }
+
+    async fn run_until(self, shutdown: tokio_util::sync::CancellationToken) -> DaemonResult<()> {
         info!(
             version = env!("CARGO_PKG_VERSION"),
             environment = %self.config.environment,
             "Starting Robson daemon"
         );
 
-        // Create shutdown token for coordinating graceful shutdown
-        let shutdown = tokio_util::sync::CancellationToken::new();
+        // Shutdown token for coordinating graceful shutdown
         let shutdown_sig = shutdown.clone();
 
         // 0. Initialize capital from exchange (best-effort)
@@ -786,6 +791,16 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         #[cfg(not(feature = "postgres"))]
         let funding_handle: Option<tokio::task::JoinHandle<()>> = None;
 
+        // 8a. Spawn the invalid-basis alarm (ADR-0051 §1 — if pg_pool configured).
+        #[cfg(feature = "postgres")]
+        let budget_basis_alarm_handle = self
+            .pg_pool
+            .as_ref()
+            .map(|pool| tokio::spawn(BudgetBasisAlarm::new(pool).run(shutdown.clone())));
+
+        #[cfg(not(feature = "postgres"))]
+        let budget_basis_alarm_handle: Option<tokio::task::JoinHandle<()>> = None;
+
         // 8b. Spawn income ledger worker (ADR-0045 §1 — if pg_pool configured).
         #[cfg(feature = "postgres")]
         let income_ledger_handle = if let Some(pool) = &self.pg_pool {
@@ -880,6 +895,11 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
 
         if let Some(handle) = funding_handle {
             info!("Waiting for funding worker to finish...");
+            let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), handle).await;
+        }
+
+        if let Some(handle) = budget_basis_alarm_handle {
+            info!("Waiting for budget basis alarm to finish...");
             let _ = tokio::time::timeout(tokio::time::Duration::from_secs(10), handle).await;
         }
 
@@ -2614,6 +2634,55 @@ mod tests {
         daemon.restore_leg_evidence(tenant_id, &mut reread).await.unwrap();
         assert!(reread.residual_unknown);
         assert_eq!(reread.residual_quantity, Some(dec!(0.005)));
+    }
+
+    /// The daemon itself starts the ADR-0051 §1 alarm: a zero basis on an idle
+    /// system raises the exported metric with nothing else asking.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn the_daemon_raises_the_budget_basis_alarm_on_its_own(pool: sqlx::PgPool) {
+        let now = Utc::now();
+        sqlx::query(
+            r#"
+            INSERT INTO monthly_state (
+                year, month, capital_base, month_peak_net, boundary_reset_at, created_at
+            )
+            VALUES ($1, $2, 0, 0, $3, $3)
+            ON CONFLICT (year, month) DO UPDATE SET
+                capital_base = 0,
+                boundary_reset_at = EXCLUDED.boundary_reset_at
+            "#,
+        )
+        .bind(now.year() as i16)
+        .bind(now.month() as i16)
+        .bind(now)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(uuid::Uuid::from_u128(0x13203));
+        let daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool)));
+
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        let raised = async {
+            let mut raised = false;
+            for _ in 0..1000 {
+                if crate::metrics::MONTHLY_BUDGET_BASIS_INVALID.get() == 1.0 {
+                    raised = true;
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            shutdown.cancel();
+            raised
+        };
+
+        let (result, raised) = tokio::join!(daemon.run_until(shutdown.clone()), raised);
+
+        assert!(raised, "the alarm must rise with no traffic");
+        result.unwrap();
     }
 
     #[cfg(feature = "postgres")]

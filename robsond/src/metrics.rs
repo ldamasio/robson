@@ -17,6 +17,10 @@
 //! - `robsond_reconciliation_last_completed_timestamp_seconds` — last completed
 //!   scan time
 //! - `robsond_monthly_halt_active` — MonthlyHalt circuit breaker (0 or 1)
+//! - `robsond_monthly_budget_basis_invalid` — ADR-0051 §1 accounting alarm (0
+//!   or 1)
+//! - `robsond_monthly_budget_basis_last_read_timestamp_seconds` — last time
+//!   that alarm read the persisted basis
 //! - `robsond_budget_model_shadow_slots_delta` — dormant ADR-0051 NFS slots
 //!   minus HWM slots
 //! - `robsond_market_data_ws_failures_total` — failed WS attempts by endpoint
@@ -284,6 +288,29 @@ pub static MONTHLY_HALT_ACTIVE: LazyLock<Gauge> = LazyLock::new(|| {
     .expect("failed to register robsond_monthly_halt_active")
 });
 
+/// ADR-0051 §1 accounting alarm: the current month's persisted budget basis is
+/// not positive. Refreshed from `monthly_state` every minute, so a restart does
+/// not lose it. MonthlyHalt does not fire on this state, so this is its signal.
+pub static MONTHLY_BUDGET_BASIS_INVALID: LazyLock<Gauge> = LazyLock::new(|| {
+    register_gauge!(
+        "robsond_monthly_budget_basis_invalid",
+        "Whether the current month's budget basis is invalid, capital_base <= 0 (0 or 1)"
+    )
+    .expect("failed to register robsond_monthly_budget_basis_invalid")
+});
+
+/// Unix timestamp of the alarm's last successful read of the budget basis. Zero
+/// until the first one: `MONTHLY_BUDGET_BASIS_INVALID` also reads 0 then, so
+/// this is what tells a process that never read the basis from a valid one.
+pub static MONTHLY_BUDGET_BASIS_LAST_READ_TIMESTAMP_SECONDS: LazyLock<Gauge> =
+    LazyLock::new(|| {
+        register_gauge!(
+            "robsond_monthly_budget_basis_last_read_timestamp_seconds",
+            "Unix timestamp of the last successful read of the monthly budget basis"
+        )
+        .expect("failed to register robsond_monthly_budget_basis_last_read_timestamp_seconds")
+    });
+
 /// Dormant ADR-0051 shadow comparison: net-from-start slots minus HWM slots.
 pub static BUDGET_MODEL_SHADOW_SLOTS_DELTA: LazyLock<Gauge> = LazyLock::new(|| {
     register_gauge!(
@@ -418,6 +445,17 @@ pub fn render() -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The alert rules in rbx-infra match these exact names.
+    #[test]
+    fn budget_basis_metrics_keep_the_names_the_alert_rules_select() {
+        LazyLock::force(&MONTHLY_BUDGET_BASIS_INVALID);
+        LazyLock::force(&MONTHLY_BUDGET_BASIS_LAST_READ_TIMESTAMP_SECONDS);
+
+        let rendered = render();
+        assert!(rendered.contains("robsond_monthly_budget_basis_invalid"));
+        assert!(rendered.contains("robsond_monthly_budget_basis_last_read_timestamp_seconds"));
+    }
 
     #[test]
     fn reconciliation_metric_family_is_registered() {
