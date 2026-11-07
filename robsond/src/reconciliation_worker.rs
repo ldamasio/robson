@@ -483,6 +483,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     /// position that has since been reconciled away. It is cancelled so it
     /// cannot interfere with future entries on the same symbol.
     ///
+    /// The same read shows the opposite case, with no further request: an
+    /// `Active` leg the venue still holds whose recorded stop is not open.
+    ///
     /// Every step is best-effort: exchange query errors, cancel errors, and
     /// store read errors are logged and the scan continues. This method never
     /// returns an error and never aborts `scan_and_reconcile`.
@@ -543,6 +546,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                 },
             };
 
+            self.schedule_heal_of_dead_stops(
+                symbol,
+                &active_positions,
+                exchange_positions,
+                &open_orders,
+            )
+            .await;
+
             for order in open_orders {
                 if !Self::is_orphan_insurance_order(&order) {
                     continue;
@@ -596,6 +607,37 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                         );
                     },
                 }
+            }
+        }
+    }
+
+    /// Ask for a heal for each `Active` leg on `symbol` that the venue holds
+    /// and whose recorded stop is not among `open_orders`, from a read that
+    /// succeeded. A leg the venue does not hold is not one: that is an
+    /// ordinary stop fill on its way to the missing-position path, which
+    /// needs the id it has on record.
+    async fn schedule_heal_of_dead_stops(
+        &self,
+        symbol: &Symbol,
+        active_positions: &[Position],
+        exchange_positions: &[ExchangePosition],
+        open_orders: &[OpenOrderRecord],
+    ) {
+        for position in active_positions.iter().filter(|leg| leg.symbol == *symbol) {
+            let PositionState::Active { insurance_stop_id, .. } = &position.state else {
+                continue;
+            };
+            let Some(recorded) = insurance_stop_id.as_ref().or(position.insurance_stop_id.as_ref())
+            else {
+                continue;
+            };
+            let open = open_orders.iter().any(|order| order.exchange_order_id == *recorded);
+            let held = exchange_positions
+                .iter()
+                .any(|held| held.symbol == *symbol && held.side == position.side);
+            if held && !open {
+                let manager = self.position_manager.read().await;
+                manager.schedule_stop_heal_if_dead(position.id, recorded).await;
             }
         }
     }

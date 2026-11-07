@@ -181,7 +181,8 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     last_market_price: PriceCache,
     /// Active positions whose exchange-side insurance stop is known to sit
     /// behind the software stop plan because a placement or re-placement
-    /// failed (ADR-0039). Value: earliest instant the next attempt may run.
+    /// failed, or to be gone from the venue (ADR-0039). Value: earliest instant
+    /// the next attempt may run.
     insurance_stop_stale: Arc<RwLock<HashMap<PositionId, std::time::Instant>>>,
     /// Active positions whose exit found nothing executable or was refused by
     /// the venue (ADR-0056 §5). Value: earliest instant the next attempt
@@ -1474,6 +1475,49 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             position_id = %position.id,
             retry_in_secs = INSURANCE_STOP_RETRY_BACKOFF.as_secs(),
             "Active leg has no exchange stop; re-placement scheduled (ADR-0039)"
+        );
+    }
+
+    /// The orphan sweep found this leg's recorded stop gone from the venue's
+    /// open orders with the venue still holding the leg. Filled short of
+    /// the leg, expired or cancelled, the id on record hides it from the
+    /// heal above, and with no crossing tick nothing else would notice. The
+    /// leg is read again, as the stop may have been replaced since the
+    /// sweep read it. An attempt already scheduled keeps its window.
+    pub(crate) async fn schedule_stop_heal_if_dead(
+        &self,
+        position_id: PositionId,
+        missing_stop_id: &str,
+    ) {
+        let position = match self.get_position(position_id).await {
+            Ok(Some(position)) => position,
+            Ok(None) => return,
+            Err(error) => {
+                warn!(%position_id, %error, "Could not read a leg whose stop is gone from the venue");
+                return;
+            },
+        };
+        let PositionState::Active { insurance_stop_id, .. } = &position.state else {
+            return;
+        };
+        let recorded = insurance_stop_id.as_deref().or(position.insurance_stop_id.as_deref());
+        if recorded != Some(missing_stop_id)
+            || self.exit_overtaken_suspects.read().await.contains(&position_id)
+        {
+            return;
+        }
+        let mut stale = self.insurance_stop_stale.write().await;
+        if stale.contains_key(&position_id) {
+            return;
+        }
+        stale.insert(position_id, std::time::Instant::now() + INSURANCE_STOP_RETRY_BACKOFF);
+        crate::metrics::INSURANCE_STOP_STALE_POSITIONS.set(stale.len() as f64);
+        warn!(
+            %position_id,
+            %missing_stop_id,
+            retry_in_secs = INSURANCE_STOP_RETRY_BACKOFF.as_secs(),
+            "Recorded exchange stop is gone from the venue's open orders with the leg still \
+             held; re-placement scheduled (ADR-0039)"
         );
     }
 
@@ -7439,6 +7483,225 @@ mod tests {
         save_closed_position_with_pnl(&manager, dec!(-1)).await;
         assert!(manager.evaluate_monthly_halt().await, "known losses exhaust the budget");
         assert!(manager.circuit_breaker.blocks_new_entries().await);
+    }
+
+    /// One reconciliation pass, with the manager held the way the daemon holds
+    /// it.
+    async fn scanned(
+        manager: Arc<PositionManager<StubExchange, MemoryStore>>,
+    ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
+        let exchange = manager.exchange();
+        let store = manager.store();
+        let event_bus = manager.event_bus.clone();
+        let held = Arc::new(RwLock::new(Arc::try_unwrap(manager).ok().expect("sole owner")));
+        let worker = crate::reconciliation_worker::ReconciliationWorker::new(
+            exchange,
+            held.clone(),
+            store,
+            event_bus,
+            std::time::Duration::from_secs(60),
+            CancellationToken::new(),
+        );
+        worker.scan_and_reconcile().await.unwrap();
+        drop(worker);
+        Arc::new(Arc::try_unwrap(held).ok().expect("sole owner").into_inner())
+    }
+
+    /// A leg of 0.105 and a residual of 0.005 whose rounded stop of 0.1 filled
+    /// with no tick crossing it: the venue holds the 0.005, and no stop.
+    async fn leg_with_a_dead_stop(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+    ) -> (Position, String) {
+        let exchange = manager.exchange();
+        exchange.set_trading_rules(lot_rules(dec!(0.01)));
+        exchange.set_venue_rules(lot_rules(dec!(0.01)));
+        let (mut leg, stop_id) = active_leg_with_live_stop(manager).await;
+        leg.quantity = Quantity::new(dec!(0.105)).unwrap();
+        leg.residual_quantity = Some(dec!(0.005));
+        manager.store.positions().save(&leg).await.unwrap();
+        exchange
+            .fill_stop_order_for(&stop_id, Quantity::new(dec!(0.1)).unwrap())
+            .unwrap();
+        venue_still_holds(manager, &leg, dec!(0.005));
+        (leg, stop_id)
+    }
+
+    async fn stop_heal_scheduled(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        position_id: PositionId,
+    ) -> bool {
+        manager.insurance_stop_stale.read().await.contains_key(&position_id)
+    }
+
+    /// The whole way: the scan notices with no request of its own, the heal
+    /// re-places at tick cadence and the leg records the new stop, whose
+    /// predecessor is already gone. The residual goes on blocking admissions.
+    #[tokio::test]
+    async fn a_dead_stop_on_a_held_leg_is_re_placed_and_the_new_one_recorded() {
+        let manager = create_test_manager().await;
+        let (leg, dead_stop) = leg_with_a_dead_stop(&manager).await;
+        let exchange = manager.exchange();
+        let placements = exchange.protection_call_count();
+
+        let manager = scanned(manager).await;
+
+        assert!(stop_heal_scheduled(&manager, leg.id).await);
+        assert!(stop_retry_in(&manager, leg.id).await <= INSURANCE_STOP_RETRY_BACKOFF);
+        assert_eq!(exchange.protection_call_count(), placements, "the heal places, not the scan");
+
+        manager
+            .insurance_stop_stale
+            .write()
+            .await
+            .insert(leg.id, std::time::Instant::now());
+        quiet_tick(&manager, &leg).await;
+
+        let healed = manager.get_position(leg.id).await.unwrap().unwrap();
+        let new_stop = healed.insurance_stop_id.clone().unwrap();
+        assert_ne!(new_stop, dead_stop);
+        let PositionState::Active { insurance_stop_id, .. } = &healed.state else {
+            panic!("{:?}", healed.state);
+        };
+        assert_eq!(insurance_stop_id.as_deref(), Some(new_stop.as_str()));
+        assert_eq!(exchange.stop_order(&new_stop).unwrap().quantity.as_decimal(), dec!(0.1));
+        assert!(!stop_heal_scheduled(&manager, leg.id).await);
+        let events = manager.store.events().find_by_position(leg.id).await.unwrap();
+        assert!(
+            events.iter().any(|event| matches!(
+                event,
+                Event::InsuranceStopReplaced { previous_order_id, order_id, .. }
+                    if *previous_order_id == dead_stop && *order_id == new_stop
+            )),
+            "{events:?}"
+        );
+        assert_eq!(healed.residual_quantity, Some(dec!(0.005)));
+        assert!(matches!(
+            manager.check_no_unresolved_residual().await,
+            Err(DaemonError::ResidualInventoryUnresolved { .. })
+        ));
+
+        // Open and on record: the next scan has nothing to ask for.
+        let manager = scanned(manager).await;
+        assert!(!stop_heal_scheduled(&manager, leg.id).await);
+    }
+
+    /// Replaced after the sweep read its legs: the read does not show the old
+    /// stop, and the leg no longer records it.
+    #[tokio::test]
+    async fn a_stop_replaced_during_the_read_schedules_nothing() {
+        let manager = create_test_manager().await;
+        let (leg, dead_stop) = leg_with_a_dead_stop(&manager).await;
+        let store = manager.store();
+        let position_id = leg.id;
+        manager.exchange().set_after_next_open_orders_read(move || {
+            store
+                .apply_event(&Event::InsuranceStopReplaced {
+                    position_id,
+                    previous_order_id: dead_stop,
+                    order_id: "successor".to_string(),
+                    stop_price: Price::new(dec!(90)).unwrap(),
+                    timestamp: chrono::Utc::now(),
+                })
+                .unwrap();
+        });
+
+        let manager = scanned(manager).await;
+
+        assert!(!stop_heal_scheduled(&manager, leg.id).await);
+    }
+
+    #[tokio::test]
+    async fn a_failed_open_orders_read_schedules_nothing() {
+        let manager = create_test_manager().await;
+        let (leg, _) = leg_with_a_dead_stop(&manager).await;
+        manager.exchange().set_open_orders_fail(true);
+
+        let manager = scanned(manager).await;
+
+        assert!(!stop_heal_scheduled(&manager, leg.id).await);
+    }
+
+    #[tokio::test]
+    async fn a_leg_suspected_closed_by_the_venue_schedules_nothing() {
+        let manager = create_test_manager().await;
+        let (leg, _) = leg_with_a_dead_stop(&manager).await;
+        manager.exit_overtaken_suspects.write().await.insert(leg.id);
+
+        let manager = scanned(manager).await;
+
+        assert!(!stop_heal_scheduled(&manager, leg.id).await);
+    }
+
+    /// An ordinary stop fill: the venue is flat and the leg is on its way to
+    /// the missing-position path, which reads the fill through the id on
+    /// record.
+    #[tokio::test]
+    async fn a_leg_the_venue_does_not_hold_schedules_nothing() {
+        let manager = create_test_manager().await;
+        let (leg, dead_stop) = leg_with_a_dead_stop(&manager).await;
+        let one_lot = Quantity::new(dec!(0.01)).unwrap();
+        manager
+            .exchange()
+            .close_position_market(&leg.symbol, leg.side, one_lot, "flat")
+            .await
+            .unwrap();
+
+        let manager = scanned(manager).await;
+
+        assert!(!stop_heal_scheduled(&manager, leg.id).await);
+        let loaded = manager.get_position(leg.id).await.unwrap().unwrap();
+        assert_eq!(loaded.insurance_stop_id, Some(dead_stop));
+    }
+
+    #[tokio::test]
+    async fn a_stop_that_is_open_schedules_nothing() {
+        let manager = create_test_manager().await;
+        let (leg, _) = active_leg_with_live_stop(&manager).await;
+        venue_still_holds(&manager, &leg, dec!(1));
+
+        let manager = scanned(manager).await;
+
+        assert!(!stop_heal_scheduled(&manager, leg.id).await);
+    }
+
+    /// An attempt already waiting keeps its window: a stop with nothing
+    /// executable retries on the long one, and must not come back every
+    /// scan.
+    #[tokio::test]
+    async fn a_heal_already_scheduled_keeps_its_window() {
+        let manager = create_test_manager().await;
+        let (leg, _) = leg_with_a_dead_stop(&manager).await;
+        manager
+            .insurance_stop_stale
+            .write()
+            .await
+            .insert(leg.id, std::time::Instant::now() + NOT_EXECUTABLE_BACKOFF);
+
+        let manager = scanned(manager).await;
+
+        assert!(stop_retry_in(&manager, leg.id).await > INSURANCE_STOP_RETRY_BACKOFF);
+    }
+
+    /// Only an `Active` leg with an id on record has anything to compare: one
+    /// that is exiting does not, and the `uncovered_symbols` case has no id
+    /// at all.
+    #[tokio::test]
+    async fn an_exiting_leg_or_one_with_no_id_schedules_nothing() {
+        let manager = create_test_manager().await;
+        let (mut exiting, dead_stop) = leg_with_a_dead_stop(&manager).await;
+        exiting.state = PositionState::Exiting {
+            exit_order_id: Uuid::now_v7(),
+            exit_reason: robson_domain::ExitReason::TrailingStop,
+        };
+        manager.store.positions().save(&exiting).await.unwrap();
+        let no_id = save_active_position(&manager, "ETHUSDT", Side::Long, dec!(100), dec!(1)).await;
+        venue_still_holds(&manager, &no_id, dec!(1));
+
+        manager.schedule_stop_heal_if_dead(exiting.id, &dead_stop).await;
+        let manager = scanned(manager).await;
+
+        assert!(!stop_heal_scheduled(&manager, exiting.id).await);
+        assert!(!stop_heal_scheduled(&manager, no_id.id).await);
     }
 
     /// A residual has no say in the halt either way.

@@ -169,6 +169,10 @@ pub struct StubExchange {
     after_next_stop_accepted: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs once, right after the next stop cancel has taken effect.
     after_next_stop_cancel: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once, after the next open-orders read has what it will return.
+    after_next_open_orders_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Open-orders reads fail, and nothing else does.
+    open_orders_fail: RwLock<bool>,
     /// The client id of every market order submitted, accepted or not.
     market_order_client_ids: RwLock<Vec<String>>,
     /// When set, the next market order or protective stop is authoritatively
@@ -249,6 +253,8 @@ impl StubExchange {
             cancel_fails_next: RwLock::new(false),
             after_next_stop_accepted: Mutex::new(None),
             after_next_stop_cancel: Mutex::new(None),
+            after_next_open_orders_read: Mutex::new(None),
+            open_orders_fail: RwLock::new(false),
             market_order_client_ids: RwLock::new(Vec::new()),
             reject_order_next: RwLock::new(false),
             market_order_calls: RwLock::new(0),
@@ -428,6 +434,17 @@ impl StubExchange {
     pub fn set_after_next_stop_cancel(&self, hook: impl FnOnce() + Send + 'static) {
         *self.after_next_stop_cancel.lock().unwrap() = Some(Box::new(hook));
     }
+    /// Run `hook` once, after the next open-orders read has what it will
+    /// return.
+    pub fn set_after_next_open_orders_read(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.after_next_open_orders_read.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    /// Fail open-orders reads, and nothing else.
+    pub fn set_open_orders_fail(&self, fail: bool) {
+        *self.open_orders_fail.write().unwrap() = fail;
+    }
+
     /// Configure the next market order or protective stop to be authoritatively
     /// rejected by the venue (the only failure that can lead to `Absent`).
     pub fn set_reject_order_next(&self, reject: bool) {
@@ -935,7 +952,7 @@ impl venue::TradingPort for StubExchange {
         &self,
         symbol: &Symbol,
     ) -> Result<Vec<OpenOrderRecord>, ExecError> {
-        if self.should_fail() {
+        if self.should_fail() || *self.open_orders_fail.read().unwrap() {
             return Err(ExecError::Exchange("Simulated open-orders query failure".to_string()));
         }
 
@@ -958,6 +975,9 @@ impl venue::TradingPort for StubExchange {
             })
             .collect();
 
+        if let Some(hook) = self.after_next_open_orders_read.lock().unwrap().take() {
+            hook();
+        }
         Ok(orders)
     }
 

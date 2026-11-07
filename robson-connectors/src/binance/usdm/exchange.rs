@@ -2358,6 +2358,43 @@ mod submit_attempt_evidence {
         "createTime":1,"updateTime":2}"#;
     const STOP_CANCELLED: &str = r#"{"algoId":77,"clientAlgoId":"ins-1","code":"200","msg":"OK"}"#;
 
+    /// What the leg records from a placement is what the open-orders read
+    /// reports for that stop: both are the algo id, whatever the client id
+    /// or status.
+    #[tokio::test]
+    async fn a_placed_stop_and_its_open_order_carry_the_same_id() {
+        let (listener, venue) = bound_venue().await;
+        serve(listener, |request| match request {
+            "POST /fapi/v1/algoOrder" => Some((200, STOP_ACCEPTED.to_string())),
+            "GET /fapi/v1/openAlgoOrders" => Some((
+                200,
+                r#"[{"algoId":998877,"clientAlgoId":"ins-2","side":"SELL",
+                "orderType":"STOP_MARKET","algoType":"CONDITIONAL","algoStatus":"NEW",
+                "reduceOnly":true,"triggerPrice":"91000","quantity":"0.01",
+                "createTime":1,"updateTime":2}]"#
+                    .to_string(),
+            )),
+            _ => Some((404, String::new())),
+        });
+        let symbol = btcusdt();
+
+        let placed = venue
+            .place_protection(
+                &symbol,
+                OrderSide::Sell,
+                Quantity::new(dec!(0.01)).unwrap(),
+                Price::new(dec!(91000)).unwrap(),
+                "ins-2",
+            )
+            .await
+            .unwrap();
+        let open = TradingPort::open_protective_orders(&*venue, &symbol).await.unwrap();
+
+        assert_eq!(open.len(), 1);
+        assert_eq!(placed.acceptance.exchange_order_id, open[0].exchange_order_id);
+        assert_eq!(placed.stop.exchange_order_id, open[0].exchange_order_id);
+    }
+
     /// A venue scripting the successor's placements as [`scripted_venue`] does,
     /// counting the cancel requests that reach it.
     async fn replacement_venue(
