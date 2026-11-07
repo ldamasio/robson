@@ -349,6 +349,10 @@ pub struct PositionSummary {
     /// The terminal rejection behind `needs_operator_rearm` (ADR-0050 §7).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_rejection: Option<LastRejectionSummary>,
+    /// The latest residual recorded on this position (ADR-0056 §5). It blocks
+    /// new admissions until the position closes, and is not priced anywhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residual_quantity: Option<Decimal>,
 }
 
 /// Terminal entry rejection surfaced with an Armed position (ADR-0050 §7).
@@ -2354,6 +2358,7 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
         DaemonError::ApprovalExpired(_) => StatusCode::GONE,
         DaemonError::ApprovalDenied { .. } => StatusCode::CONFLICT,
         DaemonError::MonthlyHaltActive { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        DaemonError::ResidualInventoryUnresolved { .. } => StatusCode::CONFLICT,
         DaemonError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // Exchange transport failures are upstream errors, not client errors.
         // Immediate-mode arm calls handle_signal synchronously; a connection or
@@ -2376,6 +2381,18 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
     };
 
     (status, Json(ErrorResponse { error: error.to_string() }))
+}
+
+#[cfg(test)]
+pub(crate) async fn position_summary_for_test<E, S>(
+    manager: &PositionManager<E, S>,
+    position: &Position,
+) -> PositionSummary
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    position_to_summary_with_live_price(manager, position).await
 }
 
 async fn position_to_summary_with_live_price<E, S>(
@@ -2734,6 +2751,7 @@ fn position_to_summary(
                             variation_pct,
                             entry_status: None,
                             last_rejection: None,
+                            residual_quantity: position.residual_quantity,
                         };
                     },
                 };
@@ -2798,6 +2816,7 @@ fn position_to_summary(
         variation_pct,
         entry_status: None,
         last_rejection: None,
+        residual_quantity: position.residual_quantity,
     }
 }
 

@@ -2452,6 +2452,21 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         })
     }
 
+    /// A residual on any open leg blocks new admissions until that leg closes
+    /// (ADR-0056 §5). A check of its own: a residual never enters the budget or
+    /// latent risk, so it can neither fail the snapshot nor defer MonthlyHalt.
+    async fn check_no_unresolved_residual(&self) -> DaemonResult<()> {
+        let open = self.store.positions().find_active().await?;
+        let Some(leg) = open.iter().find(|leg| leg.has_unresolved_residual()) else {
+            return Ok(());
+        };
+        let residual = leg
+            .residual_quantity
+            .map_or_else(|| "unreadable".to_string(), |quantity| quantity.to_string());
+        warn!(position_id = %leg.id, %residual, "Admission blocked by residual inventory");
+        Err(DaemonError::ResidualInventoryUnresolved { position_id: leg.id, residual })
+    }
+
     /// The admission check before any exchange submission (ADR-0056 §5): fresh
     /// validated metadata, then lot bounds and minimum notional. Unavailable
     /// metadata refuses the entry, under every stop policy.
@@ -2605,6 +2620,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             let snap = self.circuit_breaker.snapshot().await;
             return Err(DaemonError::MonthlyHaltActive { reason: snap.reason.unwrap_or_default() });
         }
+        self.check_no_unresolved_residual().await?;
 
         // Generate position ID upfront (used in event and returned to caller)
         let position_id = Uuid::now_v7();
@@ -3342,6 +3358,26 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         // Kill detector (it's single-shot)
         self.kill_detector(position_id).await;
 
+        if let Err(blocked) = self.check_no_unresolved_residual().await {
+            let reason = blocked.to_string();
+            query.fail(reason.clone(), "processing".to_string());
+            self.record_query_failure(&query).await?;
+            self.event_bus.send(DaemonEvent::EntryRejected {
+                position_id,
+                reason_code: "residual_inventory_unresolved".to_string(),
+                reason,
+                terminal: false,
+                rejected_at: chrono::Utc::now(),
+            });
+            self.rearm_detector_after_governed_block(
+                position_id,
+                &position,
+                "residual inventory blocks admission",
+            )
+            .await;
+            return Err(blocked);
+        }
+
         // Cache the entry-time invalidation guard level (ADR-0042) for the fill
         // handler. Overwrite on each signal so a re-arm without a guard clears
         // any stale level for this position.
@@ -3684,6 +3720,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             let snap = self.circuit_breaker.snapshot().await;
             return Err(DaemonError::MonthlyHaltActive { reason: snap.reason.unwrap_or_default() });
         }
+        self.check_no_unresolved_residual().await?;
 
         let mut record = {
             let mut pending_approvals = self.pending_approvals.write().await;
@@ -6957,6 +6994,7 @@ mod tests {
         assert_eq!(records.len(), 1, "{events:?}");
         assert_eq!((records[0].0, records[0].1), (dec!(0.9), dec!(0.1)));
         assert_eq!(leg.residual_quantity, None);
+        assert!(manager.check_no_unresolved_residual().await.is_ok());
     }
 
     /// The same through a close and through panic: closed, reported closed, and
@@ -7165,6 +7203,8 @@ mod tests {
         manager.execute_and_persist(vec![replace(current)]).await.unwrap();
         let leg = manager.get_position(position.id).await.unwrap().unwrap();
         assert_eq!(leg.residual_quantity, Some(dec!(0.005)));
+        let summary = crate::api::position_summary_for_test(&manager, &leg).await;
+        assert_eq!(summary.residual_quantity, Some(dec!(0.005)));
     }
 
     /// A residual is priced nowhere, whichever way the leg's risk is priced.
@@ -7203,6 +7243,93 @@ mod tests {
             assert_eq!(after.remaining_active, before.remaining_active);
             assert_eq!(after.slots_active, before.slots_active);
         }
+    }
+
+    /// A residual on any open leg, known or unreadable, blocks new admissions
+    /// at every door with its own reason, until that leg closes.
+    #[tokio::test]
+    async fn a_residual_on_any_open_leg_blocks_new_admissions_until_it_closes() {
+        let blocked = |result: Option<DaemonError>| {
+            assert!(
+                matches!(result, Some(DaemonError::ResidualInventoryUnresolved { .. })),
+                "{result:?}"
+            );
+        };
+        for unknown in [false, true] {
+            let manager = create_test_manager().await;
+            let (position, _) = active_leg_with_live_stop(&manager).await;
+            let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+            let entry = Price::new(dec!(100)).unwrap();
+            let stop = Price::new(dec!(98)).unwrap();
+            let arm = || {
+                manager.arm_position(
+                    symbol.clone(),
+                    Side::Long,
+                    create_test_risk_config(),
+                    Some(TechnicalStopDistance::from_entry_and_stop(entry, stop)),
+                    Uuid::now_v7(),
+                )
+            };
+            // Armed before the residual: the signal is the door it comes to.
+            let armed = arm().await.unwrap();
+
+            let mut leg = manager.get_position(position.id).await.unwrap().unwrap();
+            if unknown {
+                leg.residual_unknown = true;
+            } else {
+                leg.residual_quantity = Some(dec!(0.005));
+            }
+            manager.store.positions().save(&leg).await.unwrap();
+            let orders = manager.exchange().market_order_call_count();
+
+            blocked(arm().await.err());
+            blocked(manager.approve_query(Uuid::now_v7()).await.err());
+            blocked(
+                manager
+                    .handle_signal(DetectorSignal {
+                        signal_id: Uuid::now_v7(),
+                        position_id: armed.id,
+                        symbol: symbol.clone(),
+                        side: Side::Long,
+                        entry_price: entry,
+                        stop_loss: stop,
+                        technical_stop_analysis: None,
+                        timestamp: chrono::Utc::now(),
+                    })
+                    .await
+                    .err(),
+            );
+            assert_eq!(manager.exchange().market_order_call_count(), orders);
+            let armed = manager.get_position(armed.id).await.unwrap().unwrap();
+            assert!(matches!(armed.state, PositionState::Armed), "{:?}", armed.state);
+
+            // It is not the budget saying no.
+            let (snapshot, _, _, failures) = manager
+                .canonical_budget_snapshot_with_positions(chrono::Utc::now())
+                .await
+                .unwrap();
+            assert!(failures.is_empty(), "{failures:?}");
+            assert!(!snapshot.latent_risk_invalid);
+
+            // Closing the leg resolves it.
+            manager.close_position(position.id).await.unwrap();
+            assert!(arm().await.is_ok());
+        }
+    }
+
+    /// A residual has no say in the halt either way.
+    #[tokio::test]
+    async fn a_residual_does_not_defer_the_halt() {
+        let manager = create_test_manager().await;
+        let (position, _) = active_leg_with_live_stop(&manager).await;
+        let mut leg = manager.get_position(position.id).await.unwrap().unwrap();
+        leg.residual_quantity = Some(dec!(0.5));
+        leg.residual_unknown = true;
+        manager.store.positions().save(&leg).await.unwrap();
+        save_closed_position_with_pnl(&manager, dec!(-400)).await;
+
+        assert!(manager.evaluate_monthly_halt().await);
+        assert!(manager.circuit_breaker.blocks_new_entries().await);
     }
 
     #[tokio::test]
