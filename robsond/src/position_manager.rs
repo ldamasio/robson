@@ -2910,7 +2910,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         };
 
         self.emit_latent_risk_resolution_warnings(&latent_risk_failures).await;
-        if snapshot.latent_risk_invalid {
+        if snapshot.latent_risk_invalid && !Self::realized_losses_exhaust_budget(&snapshot) {
             warn!(
                 "Latent risk unresolved; MonthlyHalt evaluation deferred (admission already blocked, insurance stops remain authoritative)"
             );
@@ -2956,6 +2956,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         } else {
             false
         }
+    }
+
+    /// With latent risk unresolved, what can still decide the halt on its own:
+    /// realized losses that exhaust a valid budget under either way of
+    /// counting. A give-back from the peak also needs a mark, which may not
+    /// be current then, and a capital base that is not valid says nothing
+    /// about the budget.
+    fn realized_losses_exhaust_budget(snapshot: &MonthlyBudgetSnapshot) -> bool {
+        !snapshot.capital_base_invalid
+            && snapshot.consumed_active.min(snapshot.consumed_nfs) >= snapshot.budget_amount
     }
 
     /// Disarm (cancel) an armed position.
@@ -7315,6 +7325,120 @@ mod tests {
             manager.close_position(position.id).await.unwrap();
             assert!(arm().await.is_ok());
         }
+    }
+
+    /// An Active leg whose stop cannot be derived, so latent risk fails.
+    async fn leg_with_unresolved_latent_risk(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+    ) -> Position {
+        let mut position =
+            save_active_position(manager, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+        position.stop_policy = StopPolicy::ExecutableSpan;
+        position.cap_basis_distance = None;
+        manager.store.positions().save(&position).await.unwrap();
+        let (snapshot, _, _, _) = manager
+            .canonical_budget_snapshot_with_positions(chrono::Utc::now())
+            .await
+            .unwrap();
+        assert!(snapshot.latent_risk_invalid, "the test needs an unresolved latent risk");
+        position
+    }
+
+    fn budget_snapshot(
+        model: MonthlyBudgetModel,
+        capital_base: Decimal,
+        consumed_active: Decimal,
+        consumed_nfs: Decimal,
+    ) -> MonthlyBudgetSnapshot {
+        MonthlyBudgetSnapshot {
+            model,
+            capital_base,
+            capital_base_invalid: capital_base <= Decimal::ZERO,
+            latent_risk_invalid: true,
+            budget_amount: TradingPolicy::default().monthly_budget(capital_base),
+            governed_realized_net: -consumed_nfs,
+            month_equity_net: -consumed_active,
+            month_peak_net: Decimal::ZERO,
+            latent_risk: Decimal::ZERO,
+            consumed_active,
+            consumed_hwm: consumed_active,
+            consumed_nfs,
+            remaining_active: Decimal::ZERO,
+            remaining_hwm: Decimal::ZERO,
+            remaining_nfs: Decimal::ZERO,
+            slots_active: 0,
+            slots_hwm: 0,
+            slots_nfs: 0,
+        }
+    }
+
+    /// With latent risk unresolved only realized losses on a valid budget
+    /// decide.
+    #[test]
+    fn only_realized_losses_on_a_valid_base_exhaust_the_budget_with_latent_risk_unresolved() {
+        type Manager = PositionManager<StubExchange, MemoryStore>;
+        let nfs = MonthlyBudgetModel::NetFromStartNonExpandingV1;
+        let hwm = MonthlyBudgetModel::HwmV1;
+        let exhausted = |snapshot| Manager::realized_losses_exhaust_budget(&snapshot);
+
+        // Production's model: a budget of 400 on 10000.
+        assert!(!exhausted(budget_snapshot(nfs, dec!(10000), dec!(399), dec!(399))));
+        assert!(exhausted(budget_snapshot(nfs, dec!(10000), dec!(400), dec!(400))));
+        assert!(exhausted(budget_snapshot(hwm, dec!(10000), dec!(400), dec!(400))));
+
+        // A base that is not valid: its "budget" of zero is exhausted by nothing.
+        assert!(!exhausted(budget_snapshot(nfs, Decimal::ZERO, Decimal::ZERO, Decimal::ZERO)));
+        assert!(!exhausted(budget_snapshot(nfs, Decimal::ZERO, dec!(500), dec!(500))));
+
+        // A give-back from a peak, with no realized loss.
+        assert!(!exhausted(budget_snapshot(hwm, dec!(10000), dec!(500), Decimal::ZERO)));
+    }
+
+    /// The whole way through a halt evaluation: a persisted peak above the
+    /// budget, no realized loss and latent risk unresolved. The give-back
+    /// needs a mark that may not be current, so this defers as it always
+    /// has.
+    #[tokio::test]
+    async fn a_give_back_with_no_realized_loss_defers_the_halt_with_latent_risk_unresolved() {
+        let manager = create_test_manager().await;
+        leg_with_unresolved_latent_risk(&manager).await;
+        let now = chrono::Utc::now();
+        manager
+            .month_peak_net_cache
+            .lock()
+            .await
+            .insert((now.year(), now.month()), dec!(500));
+
+        let (snapshot, _, _, _) =
+            manager.canonical_budget_snapshot_with_positions(now).await.unwrap();
+        assert!(snapshot.latent_risk_invalid);
+        assert!(
+            snapshot.consumed_active >= snapshot.budget_amount,
+            "{}",
+            snapshot.consumed_active
+        );
+        assert_eq!(snapshot.consumed_nfs, Decimal::ZERO);
+
+        assert!(!manager.evaluate_monthly_halt().await);
+        assert!(!manager.circuit_breaker.blocks_new_entries().await);
+    }
+
+    /// Unpriced risk defers a decision that depends on it. It does not defer
+    /// one that known losses have already made.
+    #[tokio::test]
+    async fn known_losses_fire_the_halt_even_with_latent_risk_unresolved() {
+        let manager = create_test_manager().await;
+        leg_with_unresolved_latent_risk(&manager).await;
+        assert!(!manager.evaluate_monthly_halt().await, "nothing known exhausts the budget");
+        assert!(!manager.circuit_breaker.blocks_new_entries().await);
+
+        // Just under the budget of 400: still deferred.
+        save_closed_position_with_pnl(&manager, dec!(-399)).await;
+        assert!(!manager.evaluate_monthly_halt().await);
+
+        save_closed_position_with_pnl(&manager, dec!(-1)).await;
+        assert!(manager.evaluate_monthly_halt().await, "known losses exhaust the budget");
+        assert!(manager.circuit_breaker.blocks_new_entries().await);
     }
 
     /// A residual has no say in the halt either way.
