@@ -167,6 +167,8 @@ pub struct StubExchange {
     /// Runs once, right after the next protective stop is accepted: whatever
     /// happened on the leg while the placement was on its way.
     after_next_stop_accepted: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once, right after the next stop cancel has taken effect.
+    after_next_stop_cancel: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// The client id of every market order submitted, accepted or not.
     market_order_client_ids: RwLock<Vec<String>>,
     /// When set, the next market order or protective stop is authoritatively
@@ -246,6 +248,7 @@ impl StubExchange {
             short_fill_next: RwLock::new(None),
             cancel_fails_next: RwLock::new(false),
             after_next_stop_accepted: Mutex::new(None),
+            after_next_stop_cancel: Mutex::new(None),
             market_order_client_ids: RwLock::new(Vec::new()),
             reject_order_next: RwLock::new(false),
             market_order_calls: RwLock::new(0),
@@ -421,6 +424,10 @@ impl StubExchange {
         *self.after_next_stop_accepted.lock().unwrap() = Some(Box::new(hook));
     }
 
+    /// Run `hook` once, right after the next stop cancel takes effect.
+    pub fn set_after_next_stop_cancel(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.after_next_stop_cancel.lock().unwrap() = Some(Box::new(hook));
+    }
     /// Configure the next market order or protective stop to be authoritatively
     /// rejected by the venue (the only failure that can lead to `Absent`).
     pub fn set_reject_order_next(&self, reject: bool) {
@@ -841,6 +848,9 @@ impl venue::TradingPort for StubExchange {
         }
 
         tracing::debug!(algo_id, existed, "Stub: stop algo order cancel");
+        if let Some(hook) = self.after_next_stop_cancel.lock().unwrap().take() {
+            hook();
+        }
         Ok(if existed {
             StopCancelOutcome::Cancelled {
                 filled_before_cancel: Decimal::ZERO,

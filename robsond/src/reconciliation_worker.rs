@@ -35,6 +35,9 @@ use crate::{
     position_manager::{PositionManager, ReconcileCloseOutcome, ReconciledCloseInput},
 };
 
+/// How long after a leg closes the orphan sweep keeps visiting its symbol.
+const CLOSED_LEG_SWEEP_WINDOW_HOURS: i64 = 24;
+
 /// Background worker that reconciles exchange state with Robson state.
 pub struct ReconciliationWorker<E: ExchangePort + 'static, S: Store + 'static> {
     exchange: Arc<E>,
@@ -521,6 +524,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                 }
             }
         }
+        symbols.extend(self.recently_closed_symbols(Utc::now()).await);
 
         for symbol in &symbols {
             let open_orders = match self.exchange.get_open_orders(symbol).await {
@@ -590,6 +594,40 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                 }
             }
         }
+    }
+
+    /// Symbols of the legs closed in the last 24 h. A stop that outlives its
+    /// leg can sit on a symbol with no position and no open leg, where
+    /// nothing else brings the sweep. One read of the month's closes, two
+    /// when the window crosses into the month before. A failed read only
+    /// narrows this pass.
+    async fn recently_closed_symbols(&self, now: DateTime<Utc>) -> HashSet<Symbol> {
+        let since = now - chrono::Duration::hours(CLOSED_LEG_SWEEP_WINDOW_HOURS);
+        let mut months = vec![now];
+        if (since.year(), since.month()) != (now.year(), now.month()) {
+            months.push(since);
+        }
+
+        let manager = self.position_manager.read().await;
+        let mut symbols = HashSet::new();
+        for month in months {
+            match manager.closed_positions_in_month(month).await {
+                Ok(closed) => symbols.extend(
+                    closed
+                        .into_iter()
+                        .filter(|leg| leg.closed_at.is_some_and(|at| at >= since))
+                        .map(|leg| leg.symbol),
+                ),
+                Err(error) => {
+                    warn!(
+                        error = %error,
+                        "Orphan insurance-order sweep: failed to read closed legs; \
+                         skipping their symbols"
+                    );
+                },
+            }
+        }
+        symbols
     }
 
     /// True for an open order that is a robsond-authored insurance stop
@@ -2194,6 +2232,91 @@ mod tests {
             failed |= matches!(event, DaemonEvent::SafetyExitFailed { .. });
         }
         assert!(failed, "and it is reported");
+    }
+
+    fn leg_closed_at(symbol: Symbol, closed_at: DateTime<Utc>) -> Position {
+        let mut leg = tracked_active_position(symbol, Side::Long);
+        leg.closed_at = Some(closed_at);
+        leg.state = PositionState::Closed {
+            exit_price: Price::new(dec!(99)).unwrap(),
+            realized_pnl: Decimal::ZERO,
+            exit_reason: robson_domain::ExitReason::InsuranceStop,
+        };
+        leg
+    }
+
+    /// A stop that outlives its leg on a symbol the venue shows flat, whichever
+    /// race or panic path left it, goes within a scan. A day later the symbol
+    /// is no longer visited.
+    #[tokio::test]
+    async fn test_a_stop_left_on_a_flat_symbol_goes_while_its_leg_closed_recently() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let stop_on = |symbol: Symbol, client_id: &'static str| {
+            let exchange = exchange.clone();
+            async move {
+                exchange
+                    .place_stop_market_order(
+                        &symbol,
+                        OrderSide::Sell,
+                        Quantity::new(dec!(0.010)).unwrap(),
+                        Price::new(dec!(99)).unwrap(),
+                        client_id,
+                    )
+                    .await
+                    .unwrap()
+                    .exchange_order_id
+            }
+        };
+        let recent = Symbol::from_pair("BTCUSDT").unwrap();
+        let old = Symbol::from_pair("ETHUSDT").unwrap();
+        let recent_stop = stop_on(recent.clone(), "ins-left-recent").await;
+        let old_stop = stop_on(old.clone(), "ins-left-old").await;
+        let now = Utc::now();
+        store
+            .positions()
+            .save(&leg_closed_at(recent, now - chrono::Duration::hours(23)))
+            .await
+            .unwrap();
+        store
+            .positions()
+            .save(&leg_closed_at(old, now - chrono::Duration::hours(25)))
+            .await
+            .unwrap();
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        assert!(!exchange.has_stop_order(&recent_stop));
+        assert!(exchange.has_stop_order(&old_stop));
+    }
+
+    /// The window reaches into the month before, and no further than 24 h.
+    #[tokio::test]
+    async fn test_the_closed_leg_window_crosses_a_month_boundary() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let at = |text: &str| text.parse::<DateTime<Utc>>().unwrap();
+        for (pair, closed_at) in [
+            ("BTCUSDT", "2027-03-01T00:30:00Z"),
+            ("ETHUSDT", "2027-02-28T23:00:00Z"),
+            ("SOLUSDT", "2027-02-27T23:00:00Z"),
+        ] {
+            let symbol = Symbol::from_pair(pair).unwrap();
+            store.positions().save(&leg_closed_at(symbol, at(closed_at))).await.unwrap();
+        }
+        let worker = create_worker(exchange, store, event_bus, Duration::from_secs(0));
+
+        let symbols = worker.recently_closed_symbols(at("2027-03-01T01:00:00Z")).await;
+
+        let expected: HashSet<Symbol> = ["BTCUSDT", "ETHUSDT"]
+            .into_iter()
+            .map(|pair| Symbol::from_pair(pair).unwrap())
+            .collect();
+        assert_eq!(symbols, expected);
     }
 
     #[tokio::test]

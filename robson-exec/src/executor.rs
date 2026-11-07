@@ -997,6 +997,15 @@ impl<E: ExchangePort, S: Store> Executor<E, S> {
             },
         }
 
+        // The leg can close while that cancel is out, past the check above.
+        if self.leg_left_active(position_id).await {
+            return self
+                .withdraw_stop(position_id, intent_id, &symbol, &[order_result
+                    .exchange_order_id
+                    .as_str()])
+                .await;
+        }
+
         info!(
             %position_id,
             previous_order_id = %previous_order_id,
@@ -1592,6 +1601,60 @@ mod tests {
             let events = executor.store.events().find_by_position(leg.id).await.unwrap();
             assert!(events.is_empty(), "{events:?}");
         }
+    }
+
+    /// The same race, one await later: the leg closes while the predecessor's
+    /// cancel is out, and only the successor is left to withdraw.
+    #[tokio::test]
+    async fn a_leg_that_closes_during_the_predecessor_cancel_gets_its_successor_withdrawn() {
+        let executor = create_test_executor().await;
+        let mut leg = saved_leg(&executor, Side::Long).await;
+        leg.state = PositionState::Active {
+            current_price: robson_domain::Price::new(dec!(96000)).unwrap(),
+            trailing_stop: robson_domain::Price::new(dec!(90000)).unwrap(),
+            favorable_extreme: robson_domain::Price::new(dec!(96000)).unwrap(),
+            extreme_at: chrono::Utc::now(),
+            insurance_stop_id: None,
+            invalidation_guard_level: None,
+            last_emitted_stop: None,
+        };
+        executor.store.positions().save(&leg).await.unwrap();
+        let previous = live_stop(&executor).await;
+
+        let store = Arc::clone(&executor.store);
+        let position_id = leg.id;
+        executor.exchange.set_after_next_stop_cancel(move || {
+            let price = robson_domain::Price::new(dec!(90000)).unwrap();
+            store
+                .apply_event(&Event::PositionClosed {
+                    position_id,
+                    exit_reason: ExitReason::InsuranceStop,
+                    entry_price: price,
+                    exit_price: price,
+                    realized_pnl: Decimal::ZERO,
+                    total_fees: Decimal::ZERO,
+                    closure_evidence: robson_domain::ClosureEvidence::real_exit_fill(None),
+                    timestamp: chrono::Utc::now(),
+                })
+                .unwrap();
+        });
+
+        let results = executor
+            .execute(vec![EngineAction::ReplaceInsuranceStop {
+                position_id: leg.id,
+                symbol: Symbol::from_pair("BTCUSDT").unwrap(),
+                side: robson_domain::OrderSide::Sell,
+                quantity: Quantity::new(dec!(1)).unwrap(),
+                previous_order_id: previous.clone(),
+                new_stop_price: robson_domain::Price::new(dec!(90000)).unwrap(),
+            }])
+            .await
+            .unwrap();
+
+        assert!(matches!(results.as_slice(), [ActionResult::StateUpdated]), "{results:?}");
+        assert_eq!(executor.exchange.stop_order_count(), 0, "neither stop stays live");
+        let events = executor.store.events().find_by_position(leg.id).await.unwrap();
+        assert!(events.is_empty(), "{events:?}");
     }
 
     #[tokio::test]
