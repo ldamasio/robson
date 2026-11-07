@@ -391,7 +391,9 @@ what that text had not weighed:
   reset would correct the basis and clear the latch, leaving a flat book with no
   visible cause. This is from reading the code; no such event is on record. The
   boundary and both recalibration paths can also write zero through their
-  `.max(0)` clamp.
+  `.max(0)` clamp. PR #298 then closed the window above, since the counters now
+  only update an existing row; those three paths remain, and the decision stands
+  on them and on the reasons below.
 - Only a close reached the halt. A signal or an approval was refused earlier, on
   margin, so the "denies and halt-latches" in the test invariants was only half
   true, and no test pinned it.
