@@ -427,9 +427,13 @@ impl MemoryStore {
             | Event::InsuranceStopReplaced { position_id, order_id, .. } => {
                 let mut positions = self.positions.write().unwrap();
                 if let Some(mut position) = positions.get(position_id).cloned() {
+                    let displaced = position.recorded_stop_id().map(str::to_string);
                     position.insurance_stop_id = Some(order_id.clone());
                     if let PositionState::Active { insurance_stop_id, .. } = &mut position.state {
                         *insurance_stop_id = Some(order_id.clone());
+                    }
+                    if let Some(displaced) = displaced {
+                        position.record_superseded_stop(&displaced);
                     }
                     position.updated_at = chrono::Utc::now();
                     positions.insert(*position_id, position);

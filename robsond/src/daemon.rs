@@ -1474,8 +1474,8 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
     }
 
     /// Read back what `positions_current` does not carry (ADR-0056 §5): the
-    /// leg's rules snapshot and its latest residual, from the event log, in
-    /// stream order. One query per recovered leg.
+    /// leg's rules snapshot, its latest residual and the stops it displaced,
+    /// from the event log, in stream order. One query per recovered leg.
     ///
     /// A query that fails aborts startup: the database is needed anyway, the
     /// pod restarts and retries, and exchange stops stay live meanwhile. A
@@ -1489,7 +1489,12 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
         tenant_id: uuid::Uuid,
         position: &mut Position,
     ) -> DaemonResult<()> {
-        const LEG_EVIDENCE: [&str; 2] = ["entry_signal_received", "residual_inventory_recorded"];
+        const LEG_EVIDENCE: [&str; 4] = [
+            "entry_signal_received",
+            "residual_inventory_recorded",
+            "insurance_stop_placed",
+            "insurance_stop_replaced",
+        ];
         let Some(pool) = &self.pg_pool else {
             return Ok(());
         };
@@ -2486,6 +2491,12 @@ mod tests {
             min_qty: Some(dec!(0.01)),
             timestamp: Utc::now(),
         };
+        let placed = |order: &str| robson_domain::Event::InsuranceStopPlaced {
+            position_id: position.id,
+            order_id: order.to_string(),
+            stop_price: Price::new(dec!(76000)).unwrap(),
+            timestamp: Utc::now(),
+        };
         let stop = |previous: &str, order: &str| robson_domain::Event::InsuranceStopReplaced {
             position_id: position.id,
             previous_order_id: previous.to_string(),
@@ -2500,7 +2511,8 @@ mod tests {
             signal(Some(rules(dec!(0.01)))),
             residual(dec!(0.001)),
             residual(dec!(0.005)),
-            stop("ins-1", "ins-2"),
+            placed("ins-1"),
+            placed("ins-2"),
             stop("ins-2", "ins-3"),
         ];
         for (index, event) in events.iter().enumerate() {
@@ -2517,6 +2529,7 @@ mod tests {
         assert_eq!(position.rules_snapshot, Some(rules(dec!(0.001))));
         assert_eq!(position.residual_quantity, Some(dec!(0.005)));
         assert!(!position.residual_unknown);
+        assert_eq!(position.superseded_stop_ids, ["ins-2", "ins-1"]);
     }
 
     /// A residual row that cannot be read blocks admissions without aborting

@@ -77,11 +77,52 @@ where
     E: ExchangePort + 'static,
     S: Store + 'static,
 {
-    if let Some(input) = gather_order_fill_evidence(exchange, store, position).await? {
+    if let Some(input) = gather_stop_fill_evidence(exchange, store, position).await? {
         return Ok(Some(input));
     }
 
     gather_user_trade_evidence::<E>(exchange, position, expected_quantity, observed_at_floor).await
+}
+
+/// The recorded stop's fill, or failing that a fill of the whole leg by a stop
+/// it displaced. A stop displaced while it was executing still fills as this
+/// leg's stop, and its `ins-` authorship is what keeps the close in the
+/// governed month net. A displaced stop's partial does not count: it can be
+/// older than the close still waiting for its evidence, and would finalize that
+/// at its own price and month.
+///
+/// For the scan's paths, which act on a leg the venue does not show. Only when
+/// the recorded stop has no fill does it ask further: at most three more stops,
+/// of up to three requests each. The tick reads the recorded stop alone.
+pub(crate) async fn gather_stop_fill_evidence<E, S>(
+    exchange: &Arc<E>,
+    store: &Arc<S>,
+    position: &Position,
+) -> DaemonResult<Option<ReconciledCloseInput>>
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    if let Some(input) = gather_order_fill_evidence(exchange, store, position).await? {
+        return Ok(Some(input));
+    }
+
+    for order_id in &position.superseded_stop_ids {
+        let Some(result) = exchange.get_stop_order_fill(&position.symbol, order_id).await? else {
+            continue;
+        };
+        if result.filled_quantity == position.quantity {
+            return Ok(Some(input_from_order_result(position.id, result)));
+        }
+        warn!(
+            position_id = %position.id,
+            %order_id,
+            filled = %result.filled_quantity.as_decimal(),
+            "A displaced stop filled part of the leg; that does not close it"
+        );
+    }
+
+    Ok(None)
 }
 
 pub(crate) async fn gather_order_fill_evidence<E, S>(

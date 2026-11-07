@@ -317,3 +317,67 @@ fn an_unreadable_residual_row_blocks_admissions_on_an_open_leg() {
     armed.restore_leg_evidence_record(event_type, poison(event_type)).unwrap_err();
     assert!(!armed.has_unresolved_residual());
 }
+
+fn replaced_stop_event(previous: &str, order: &str) -> Event {
+    Event::InsuranceStopReplaced {
+        position_id: POSITION_ID.parse().unwrap(),
+        previous_order_id: previous.to_string(),
+        order_id: order.to_string(),
+        stop_price: Price::new(dec!(76000)).unwrap(),
+        timestamp: Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap(),
+    }
+}
+
+fn leg_recording(stop_id: &str) -> Position {
+    let mut leg = active_leg();
+    if let PositionState::Active { insurance_stop_id, .. } = &mut leg.state {
+        *insurance_stop_id = Some(stop_id.to_string());
+    }
+    leg
+}
+
+#[test]
+fn a_restart_keeps_the_last_three_replaced_stops_newest_first() {
+    let mut leg = leg_recording("e");
+    let events: Vec<Event> = [("a", "b"), ("b", "c"), ("c", "d"), ("d", "e")]
+        .iter()
+        .map(|(previous, order)| replaced_stop_event(previous, order))
+        .collect();
+
+    for event in &events {
+        leg.restore_leg_evidence_record(event.event_type(), serde_json::to_value(event).unwrap())
+            .unwrap();
+    }
+
+    assert_eq!(leg.superseded_stop_ids, ["d", "c", "b"]);
+}
+
+/// A placement over a stop on record displaces it as a replacement does.
+#[test]
+fn a_restart_keeps_a_stop_a_placement_displaced() {
+    let mut leg = leg_recording("b");
+    let placed = |order: &str| Event::InsuranceStopPlaced {
+        position_id: POSITION_ID.parse().unwrap(),
+        order_id: order.to_string(),
+        stop_price: Price::new(dec!(76000)).unwrap(),
+        timestamp: Utc.with_ymd_and_hms(2026, 11, 7, 12, 0, 0).unwrap(),
+    };
+
+    leg.restore_leg_evidence(&[placed("a"), placed("b")]);
+
+    assert_eq!(leg.superseded_stop_ids, ["a"]);
+}
+
+/// Not a residual: an unreadable one costs its evidence, and blocks nothing.
+#[test]
+fn an_unreadable_replaced_stop_row_blocks_nothing() {
+    let mut leg = active_leg();
+    let event = replaced_stop_event("a", "b");
+    let mut poison = serde_json::to_value(&event).unwrap();
+    poison["previous_order_id"] = json!(42);
+
+    assert!(leg.restore_leg_evidence_record(event.event_type(), poison).is_err());
+
+    assert!(leg.superseded_stop_ids.is_empty());
+    assert!(!leg.has_unresolved_residual());
+}

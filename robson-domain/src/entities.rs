@@ -126,6 +126,13 @@ pub struct Position {
     /// admissions the same way, until the leg closes.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub residual_unknown: bool,
+    /// The stops this leg's recorded stop displaced, newest first, at most
+    /// [`Self::SUPERSEDED_STOPS_KEPT`] (ADR-0056 §5). A stop can trigger as it
+    /// is displaced and fill afterwards, and the fill is still this leg's. Not
+    /// a `positions_current` column: a restart reads it back from the event
+    /// log.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub superseded_stop_ids: Vec<String>,
 
     // Audit
     pub created_at: DateTime<Utc>,
@@ -180,10 +187,34 @@ impl Position {
             rules_snapshot: None,
             residual_quantity: None,
             residual_unknown: false,
+            superseded_stop_ids: Vec::new(),
             created_at: now,
             updated_at: now,
             closed_at: None,
         }
+    }
+
+    /// How many superseded stops a leg keeps as fill evidence.
+    pub const SUPERSEDED_STOPS_KEPT: usize = 3;
+
+    /// The stop on record for this leg.
+    pub fn recorded_stop_id(&self) -> Option<&str> {
+        match &self.state {
+            PositionState::Active { insurance_stop_id, .. } => {
+                insurance_stop_id.as_deref().or(self.insurance_stop_id.as_deref())
+            },
+            _ => self.insurance_stop_id.as_deref(),
+        }
+    }
+
+    /// Keep a stop this leg has had as fill evidence, newest first. The stop on
+    /// record is not one of them, and comes out if it was.
+    pub fn record_superseded_stop(&mut self, stop_id: &str) {
+        self.superseded_stop_ids.retain(|id| id != stop_id);
+        if self.recorded_stop_id() != Some(stop_id) {
+            self.superseded_stop_ids.insert(0, stop_id.to_string());
+        }
+        self.superseded_stop_ids.truncate(Self::SUPERSEDED_STOPS_KEPT);
     }
 
     /// Whether this leg holds a residual, known or unreadable, that blocks new
@@ -194,8 +225,9 @@ impl Position {
 
     /// Restore the leg evidence only the event log carries (ADR-0056 §5) after
     /// a restart from `positions_current`, with the semantics of replay: given
-    /// events in stream order, the first rules snapshot wins and the latest
-    /// standing residual stands. Other events are ignored.
+    /// events in stream order, the first rules snapshot wins, the latest
+    /// standing residual stands, and each stop the stream shows, other than the
+    /// one on record, is kept as evidence. Other events are ignored.
     pub fn restore_leg_evidence<'a>(
         &mut self,
         events: impl IntoIterator<Item = &'a crate::events::Event>,
@@ -209,6 +241,16 @@ impl Position {
             }
             if let Some(residual) = event.standing_residual() {
                 self.residual_quantity = Some(residual);
+            }
+            match event {
+                Event::InsuranceStopPlaced { order_id, .. } => {
+                    self.record_superseded_stop(order_id);
+                },
+                Event::InsuranceStopReplaced { previous_order_id, order_id, .. } => {
+                    self.record_superseded_stop(previous_order_id);
+                    self.record_superseded_stop(order_id);
+                },
+                _ => {},
             }
         }
     }

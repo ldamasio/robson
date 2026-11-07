@@ -171,6 +171,13 @@ pub struct StubExchange {
     after_next_stop_cancel: Mutex<Option<Box<dyn FnOnce() + Send>>>,
     /// Runs once, after the next open-orders read has what it will return.
     after_next_open_orders_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Runs once, after the next positions read has what it will return.
+    after_next_positions_read: Mutex<Option<Box<dyn FnOnce() + Send>>>,
+    /// Stops that triggered, whose market order is still working: no longer
+    /// open and not filled yet.
+    triggered_stop_orders: RwLock<HashMap<String, StubStopOrder>>,
+    /// The stops `protection_fill` was asked about, in order.
+    protection_fill_lookups: RwLock<Vec<String>>,
     /// Open-orders reads fail, and nothing else does.
     open_orders_fail: RwLock<bool>,
     /// The client id of every market order submitted, accepted or not.
@@ -254,6 +261,9 @@ impl StubExchange {
             after_next_stop_accepted: Mutex::new(None),
             after_next_stop_cancel: Mutex::new(None),
             after_next_open_orders_read: Mutex::new(None),
+            after_next_positions_read: Mutex::new(None),
+            protection_fill_lookups: RwLock::new(Vec::new()),
+            triggered_stop_orders: RwLock::new(HashMap::new()),
             open_orders_fail: RwLock::new(false),
             market_order_client_ids: RwLock::new(Vec::new()),
             reject_order_next: RwLock::new(false),
@@ -440,6 +450,34 @@ impl StubExchange {
         *self.after_next_open_orders_read.lock().unwrap() = Some(Box::new(hook));
     }
 
+    /// Run `hook` once, after the next positions read has what it will return.
+    pub fn set_after_next_positions_read(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.after_next_positions_read.lock().unwrap() = Some(Box::new(hook));
+    }
+
+    /// The stop triggered and its market order is working: it leaves the open
+    /// orders, and `fill_stop_order_for` can still fill it.
+    pub fn trigger_stop_order(&self, exchange_order_id: &str) {
+        let order = self.stop_orders.write().unwrap().remove(exchange_order_id);
+        if let Some(order) = order {
+            self.triggered_stop_orders
+                .write()
+                .unwrap()
+                .insert(exchange_order_id.to_string(), order);
+        }
+    }
+
+    /// The venue no longer holds this symbol and side.
+    pub fn clear_open_position(&self, symbol: &Symbol, side: robson_domain::Side) {
+        let key = Self::position_key(symbol, side);
+        self.open_positions.write().unwrap().remove(&key);
+    }
+
+    /// The stops `protection_fill` was asked about, in order.
+    pub fn protection_fill_lookups(&self) -> Vec<String> {
+        self.protection_fill_lookups.read().unwrap().clone()
+    }
+
     /// Fail open-orders reads, and nothing else.
     pub fn set_open_orders_fail(&self, fail: bool) {
         *self.open_orders_fail.write().unwrap() = fail;
@@ -596,7 +634,19 @@ impl StubExchange {
         exchange_order_id: &str,
         filled_quantity: Quantity,
     ) -> Option<StubStopOrder> {
-        let order = self.stop_orders.write().unwrap().remove(exchange_order_id)?;
+        self.fill_stop_order_at(exchange_order_id, filled_quantity, Utc::now())
+    }
+
+    /// [`Self::fill_stop_order_for`], with the fill at `filled_at`.
+    pub fn fill_stop_order_at(
+        &self,
+        exchange_order_id: &str,
+        filled_quantity: Quantity,
+        filled_at: DateTime<Utc>,
+    ) -> Option<StubStopOrder> {
+        let open = self.stop_orders.write().unwrap().remove(exchange_order_id);
+        let order =
+            open.or_else(|| self.triggered_stop_orders.write().unwrap().remove(exchange_order_id))?;
         let fill_price = self.get_price_decimal(&order.symbol.as_pair());
         let fee = fill_price * filled_quantity.as_decimal() * self.fee_rate;
         let triggered_order_id = format!("TRIGGERED-{}", order.exchange_order_id);
@@ -607,7 +657,7 @@ impl StubExchange {
             filled_quantity,
             fee,
             fee_asset: "USDT".to_string(),
-            filled_at: Utc::now(),
+            filled_at,
         };
         self.filled_stop_orders
             .write()
@@ -1017,6 +1067,10 @@ impl venue::TradingPort for StubExchange {
         _symbol: &Symbol,
         stop: &StopRef,
     ) -> Result<Option<OrderResult>, ExecError> {
+        self.protection_fill_lookups
+            .write()
+            .unwrap()
+            .push(stop.exchange_order_id.clone());
         if self.should_fail() {
             return Err(ExecError::Exchange("Simulated get_stop_order_fill failure".to_string()));
         }
@@ -1279,8 +1333,12 @@ impl venue::PositionAccountPort for StubExchange {
             return Err(ExecError::Exchange("Simulated reconciliation scan failure".to_string()));
         }
 
-        let positions = self.open_positions.read().unwrap();
-        Ok(positions.values().cloned().collect())
+        let held: Vec<ExchangePosition> =
+            self.open_positions.read().unwrap().values().cloned().collect();
+        if let Some(hook) = self.after_next_positions_read.lock().unwrap().take() {
+            hook();
+        }
+        Ok(held)
     }
 
     async fn close_position_market(

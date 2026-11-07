@@ -7485,26 +7485,46 @@ mod tests {
         assert!(manager.circuit_breaker.blocks_new_entries().await);
     }
 
-    /// One reconciliation pass, with the manager held the way the daemon holds
+    /// Reconciliation passes, with the manager held the way the daemon holds
     /// it.
-    async fn scanned(
+    async fn passes(
         manager: Arc<PositionManager<StubExchange, MemoryStore>>,
+        missing_grace: std::time::Duration,
+        count: usize,
     ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
         let exchange = manager.exchange();
         let store = manager.store();
         let event_bus = manager.event_bus.clone();
         let held = Arc::new(RwLock::new(Arc::try_unwrap(manager).ok().expect("sole owner")));
-        let worker = crate::reconciliation_worker::ReconciliationWorker::new(
+        let worker = crate::reconciliation_worker::ReconciliationWorker::new_with_missing_grace(
             exchange,
             held.clone(),
             store,
             event_bus,
             std::time::Duration::from_secs(60),
+            missing_grace,
             CancellationToken::new(),
         );
-        worker.scan_and_reconcile().await.unwrap();
+        for _ in 0..count {
+            worker.scan_and_reconcile().await.unwrap();
+        }
         drop(worker);
         Arc::new(Arc::try_unwrap(held).ok().expect("sole owner").into_inner())
+    }
+
+    /// One pass.
+    async fn scanned(
+        manager: Arc<PositionManager<StubExchange, MemoryStore>>,
+    ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
+        passes(manager, std::time::Duration::from_secs(60), 1).await
+    }
+
+    /// The missing-position path, all the way: the first pass observes the leg
+    /// missing and the second, with no grace, resolves it.
+    async fn missing_path_ran(
+        manager: Arc<PositionManager<StubExchange, MemoryStore>>,
+    ) -> Arc<PositionManager<StubExchange, MemoryStore>> {
+        passes(manager, std::time::Duration::ZERO, 2).await
     }
 
     /// A leg of 0.105 and a residual of 0.005 whose rounded stop of 0.1 filled
@@ -7702,6 +7722,386 @@ mod tests {
 
         assert!(!stop_heal_scheduled(&manager, exiting.id).await);
         assert!(!stop_heal_scheduled(&manager, no_id.id).await);
+    }
+
+    /// The heal, due now, through a tick that crosses nothing.
+    async fn heal_ran(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        leg: &Position,
+    ) -> String {
+        let before = manager.get_position(leg.id).await.unwrap().unwrap().insurance_stop_id;
+        manager
+            .insurance_stop_stale
+            .write()
+            .await
+            .insert(leg.id, std::time::Instant::now());
+        quiet_tick(manager, leg).await;
+        let healed = manager.get_position(leg.id).await.unwrap().unwrap();
+        let recorded = healed.insurance_stop_id.clone().unwrap();
+        assert_ne!(Some(recorded.clone()), before);
+        assert_eq!(Some(&before.unwrap()), healed.superseded_stop_ids.first());
+        recorded
+    }
+
+    /// The trades of the triggered order, which the path falls back to when it
+    /// cannot place the fill on a stop.
+    fn stop_trades_on_the_venue(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        leg: &Position,
+        stop_id: &str,
+    ) {
+        manager.exchange().set_user_trades(&leg.symbol.as_pair(), vec![
+            robson_exec::UserTradeRecord {
+                exchange_order_id: format!("TRIGGERED-{stop_id}"),
+                exchange_trade_id: format!("TRADE-{stop_id}"),
+                fill_price: Price::new(dec!(90)).unwrap(),
+                filled_quantity: leg.quantity,
+                fee: dec!(0.1),
+                fee_asset: "USDT".to_string(),
+                filled_at: chrono::Utc::now(),
+            },
+        ]);
+    }
+
+    /// A close the budget sees: `InsuranceStop`, with the whole loss in the
+    /// month net and in what the budget has consumed.
+    async fn the_stop_loss_is_in_the_budget(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        leg: &Position,
+    ) {
+        let closed = manager.get_position(leg.id).await.unwrap().unwrap();
+        assert!(
+            matches!(closed.state, PositionState::Closed {
+                exit_reason: robson_domain::ExitReason::InsuranceStop,
+                ..
+            }),
+            "{:?}",
+            closed.state
+        );
+        assert_eq!(closed.realized_pnl, dec!(-10), "(90 - 100) x 1");
+        let loss = dec!(10) + closed.fees_paid;
+        let now = chrono::Utc::now();
+        assert_eq!(manager.robson_month_net(now).await.unwrap(), -loss);
+        let (snapshot, _, _, _) =
+            manager.canonical_budget_snapshot_with_positions(now).await.unwrap();
+        assert_eq!(snapshot.consumed_nfs, loss);
+    }
+
+    /// A triggered while being replaced: its market order is working, the venue
+    /// still holds the leg, and the heal accepts B and finds A already gone. A
+    /// then fills the whole leg. That close is still its stop's, and the budget
+    /// has to see it.
+    #[tokio::test]
+    async fn a_stop_replaced_while_it_executes_keeps_its_loss_in_the_budget() {
+        let manager = create_test_manager().await;
+        let exchange = manager.exchange();
+        exchange.set_price("BTCUSDT", dec!(90));
+        let (leg, stop_a) = active_leg_with_live_stop(&manager).await;
+        venue_still_holds(&manager, &leg, dec!(1));
+        exchange.trigger_stop_order(&stop_a);
+
+        let manager = scanned(manager).await;
+        assert!(stop_heal_scheduled(&manager, leg.id).await);
+        let stop_b = heal_ran(&manager, &leg).await;
+
+        exchange.fill_stop_order_for(&stop_a, Quantity::new(dec!(1)).unwrap()).unwrap();
+        exchange.clear_open_position(&leg.symbol, leg.side);
+        stop_trades_on_the_venue(&manager, &leg, &stop_a);
+        let manager = missing_path_ran(manager).await;
+
+        the_stop_loss_is_in_the_budget(&manager, &leg).await;
+        assert!(!exchange.has_stop_order(&stop_b), "and the sweep takes B");
+    }
+
+    /// The scan's two reads are not one: an ordinary stop fill between them
+    /// shows a held leg with its stop gone, and schedules a heal on a leg about
+    /// to be flat. The fill keeps its provenance.
+    #[tokio::test]
+    async fn a_stop_filled_between_the_scans_reads_keeps_its_loss_in_the_budget() {
+        let manager = create_test_manager().await;
+        let exchange = manager.exchange();
+        exchange.set_price("BTCUSDT", dec!(90));
+        let (leg, stop_a) = active_leg_with_live_stop(&manager).await;
+        venue_still_holds(&manager, &leg, dec!(1));
+        let venue = exchange.clone();
+        let (filled, symbol, side) = (stop_a.clone(), leg.symbol.clone(), leg.side);
+        exchange.set_after_next_positions_read(move || {
+            venue.fill_stop_order_for(&filled, Quantity::new(dec!(1)).unwrap()).unwrap();
+            venue.clear_open_position(&symbol, side);
+        });
+
+        let manager = scanned(manager).await;
+        assert!(stop_heal_scheduled(&manager, leg.id).await, "the reads disagree");
+        let stop_b = heal_ran(&manager, &leg).await;
+
+        stop_trades_on_the_venue(&manager, &leg, &stop_a);
+        let manager = missing_path_ran(manager).await;
+
+        the_stop_loss_is_in_the_budget(&manager, &leg).await;
+        assert!(!exchange.has_stop_order(&stop_b), "and the sweep takes B");
+    }
+
+    /// `positions_current` carries no superseded stops: a restart between B's
+    /// recording and the close gets them back from the stream.
+    #[tokio::test]
+    async fn a_restart_before_the_close_still_finds_the_fill_of_a_superseded_stop() {
+        let manager = create_test_manager().await;
+        let exchange = manager.exchange();
+        exchange.set_price("BTCUSDT", dec!(90));
+        let (leg, stop_a) = active_leg_with_live_stop(&manager).await;
+        venue_still_holds(&manager, &leg, dec!(1));
+        exchange.trigger_stop_order(&stop_a);
+        let manager = scanned(manager).await;
+        heal_ran(&manager, &leg).await;
+
+        let mut restored = manager.get_position(leg.id).await.unwrap().unwrap();
+        restored.superseded_stop_ids.clear();
+        for event in manager.store.events().find_by_position(leg.id).await.unwrap() {
+            restored
+                .restore_leg_evidence_record(
+                    event.event_type(),
+                    serde_json::to_value(&event).unwrap(),
+                )
+                .unwrap();
+        }
+        assert_eq!(restored.superseded_stop_ids, [stop_a.clone()]);
+        manager.store.positions().save(&restored).await.unwrap();
+
+        exchange.fill_stop_order_for(&stop_a, Quantity::new(dec!(1)).unwrap()).unwrap();
+        exchange.clear_open_position(&leg.symbol, leg.side);
+        let manager = missing_path_ran(manager).await;
+
+        the_stop_loss_is_in_the_budget(&manager, &leg).await;
+    }
+
+    /// The recorded stop first, then the last three replaced, newest first. The
+    /// one before those is gone from the evidence.
+    #[tokio::test]
+    async fn fill_evidence_reads_the_recorded_stop_then_the_last_three_newest_first() {
+        let manager = create_test_manager().await;
+        let exchange = manager.exchange();
+        let (leg, first) = active_leg_with_live_stop(&manager).await;
+        let mut stops = vec![first];
+        for n in 0..4 {
+            let stop = exchange
+                .place_stop_market_order(
+                    &leg.symbol,
+                    leg.side.exit_action(),
+                    leg.quantity,
+                    Price::new(dec!(90)).unwrap(),
+                    &format!("ins-{n}"),
+                )
+                .await
+                .unwrap()
+                .exchange_order_id;
+            manager
+                .store
+                .apply_event(&Event::InsuranceStopReplaced {
+                    position_id: leg.id,
+                    previous_order_id: stops.last().unwrap().clone(),
+                    order_id: stop.clone(),
+                    stop_price: Price::new(dec!(90)).unwrap(),
+                    timestamp: chrono::Utc::now(),
+                })
+                .unwrap();
+            stops.push(stop);
+        }
+        let leg = manager.get_position(leg.id).await.unwrap().unwrap();
+        assert_eq!(leg.insurance_stop_id.as_ref(), Some(&stops[4]));
+        assert_eq!(leg.superseded_stop_ids, [stops[3].clone(), stops[2].clone(), stops[1].clone()]);
+        let one = Quantity::new(dec!(1)).unwrap();
+
+        let evidence = || async {
+            let input = crate::reconciliation_worker::gather_stop_fill_evidence(
+                &manager.exchange(),
+                &manager.store,
+                &leg,
+            )
+            .await
+            .unwrap()?;
+            match input.evidence {
+                ReconciliationEvidence::OrderFillRecord(fill) => Some(fill.exchange_order_id),
+                other => panic!("{other:?}"),
+            }
+        };
+
+        exchange.fill_stop_order_for(&stops[0], one).unwrap();
+        assert_eq!(evidence().await, None, "past the last three");
+        exchange.fill_stop_order_for(&stops[1], one).unwrap();
+        assert_eq!(evidence().await, Some(format!("TRIGGERED-{}", stops[1])));
+        exchange.fill_stop_order_for(&stops[2], one).unwrap();
+        assert_eq!(evidence().await, Some(format!("TRIGGERED-{}", stops[2])), "newest first");
+        exchange.fill_stop_order_for(&stops[4], one).unwrap();
+        assert_eq!(evidence().await, Some(format!("TRIGGERED-{}", stops[4])), "recorded first");
+    }
+
+    /// A superseded stop with no fill changes nothing: the path falls through
+    /// to user trades, and such a close stays out of the governed month
+    /// net.
+    #[tokio::test]
+    async fn a_superseded_stop_with_no_fill_falls_through_to_user_trades() {
+        let manager = create_test_manager().await;
+        let exchange = manager.exchange();
+        let (leg, stop_a) = active_leg_with_live_stop(&manager).await;
+        venue_still_holds(&manager, &leg, dec!(1));
+        manager
+            .insurance_stop_stale
+            .write()
+            .await
+            .insert(leg.id, std::time::Instant::now());
+        quiet_tick(&manager, &leg).await;
+        assert_eq!(manager.get_position(leg.id).await.unwrap().unwrap().superseded_stop_ids, [
+            stop_a
+        ]);
+
+        exchange.clear_open_position(&leg.symbol, leg.side);
+        stop_trades_on_the_venue(&manager, &leg, "manual");
+        let manager = missing_path_ran(manager).await;
+
+        let closed = manager.get_position(leg.id).await.unwrap().unwrap();
+        assert!(
+            matches!(closed.state, PositionState::Closed {
+                exit_reason: robson_domain::ExitReason::ReconciledMissingOnExchange,
+                ..
+            }),
+            "{:?}",
+            closed.state
+        );
+        assert_eq!(manager.robson_month_net(chrono::Utc::now()).await.unwrap(), Decimal::ZERO);
+    }
+
+    /// A failed lookup of a superseded stop is what a failed lookup of the
+    /// recorded one is: an error, not an absent fill.
+    #[tokio::test]
+    async fn a_failed_lookup_of_a_superseded_stop_is_an_error() {
+        let manager = create_test_manager().await;
+        let mut leg =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+        leg.record_superseded_stop("superseded");
+        manager.exchange().set_fail_next(true);
+
+        let lookup = crate::reconciliation_worker::gather_stop_fill_evidence(
+            &manager.exchange(),
+            &manager.store,
+            &leg,
+        )
+        .await;
+
+        assert!(lookup.is_err());
+    }
+
+    /// A partial, then B closes the rest and its trades are not visible yet.
+    /// The partial does not close the leg at its own price and in its own
+    /// month: the leg stays unresolved until B's evidence appears.
+    #[tokio::test]
+    async fn an_older_partial_of_a_displaced_stop_does_not_finalize_a_later_close() {
+        let manager = create_test_manager().await;
+        let exchange = manager.exchange();
+        let (leg, stop_a) = active_leg_with_live_stop(&manager).await;
+        venue_still_holds(&manager, &leg, dec!(0.6));
+        exchange.set_price("BTCUSDT", dec!(80));
+        let partial = Quantity::new(dec!(0.4)).unwrap();
+        let last_month = chrono::Utc::now() - Duration::days(40);
+        exchange.fill_stop_order_at(&stop_a, partial, last_month).unwrap();
+        let stop_b = heal_ran(&manager, &leg).await;
+
+        exchange.clear_open_position(&leg.symbol, leg.side);
+        let manager = missing_path_ran(manager).await;
+
+        let waiting = manager.get_position(leg.id).await.unwrap().unwrap();
+        assert!(matches!(waiting.state, PositionState::Active { .. }), "{:?}", waiting.state);
+
+        exchange.set_price("BTCUSDT", dec!(90));
+        exchange
+            .fill_stop_order_for(&stop_b, Quantity::new(dec!(0.6)).unwrap())
+            .unwrap();
+        let manager = missing_path_ran(manager).await;
+
+        the_stop_loss_is_in_the_budget(&manager, &leg).await;
+        let closed = manager.get_position(leg.id).await.unwrap().unwrap();
+        assert_eq!(
+            closed.closed_at.map(|at| (at.year(), at.month())),
+            Some((chrono::Utc::now().year(), chrono::Utc::now().month()))
+        );
+    }
+
+    /// From a displaced stop, the leg's whole quantity and nothing else.
+    #[tokio::test]
+    async fn only_a_fill_of_the_whole_leg_counts_from_a_displaced_stop() {
+        for (filled, counts) in [(dec!(0.4), false), (dec!(1.5), false), (dec!(1), true)] {
+            let manager = create_test_manager().await;
+            let exchange = manager.exchange();
+            let (leg, stop_a) = active_leg_with_live_stop(&manager).await;
+            exchange.fill_stop_order_for(&stop_a, Quantity::new(filled).unwrap()).unwrap();
+            manager
+                .store
+                .apply_event(&Event::InsuranceStopReplaced {
+                    position_id: leg.id,
+                    previous_order_id: stop_a,
+                    order_id: "stop-b".to_string(),
+                    stop_price: Price::new(dec!(90)).unwrap(),
+                    timestamp: chrono::Utc::now(),
+                })
+                .unwrap();
+            let leg = manager.get_position(leg.id).await.unwrap().unwrap();
+
+            let input = crate::reconciliation_worker::gather_stop_fill_evidence(
+                &exchange,
+                &manager.store,
+                &leg,
+            )
+            .await
+            .unwrap();
+
+            assert_eq!(input.is_some(), counts, "{filled}");
+        }
+    }
+
+    /// The tick reads the recorded stop alone, at what it always cost: a fill
+    /// on a superseded stop waits for the scan, and counts all the same.
+    #[tokio::test]
+    async fn the_tick_asks_nothing_about_a_superseded_stop() {
+        let manager = create_test_manager().await;
+        let exchange = manager.exchange();
+        exchange.set_price("BTCUSDT", dec!(90));
+        let (leg, stop_a) = active_leg_with_live_stop(&manager).await;
+        venue_still_holds(&manager, &leg, dec!(1));
+        exchange.trigger_stop_order(&stop_a);
+        let manager = scanned(manager).await;
+        let stop_b = heal_ran(&manager, &leg).await;
+        exchange.fill_stop_order_for(&stop_a, Quantity::new(dec!(1)).unwrap()).unwrap();
+        exchange.clear_open_position(&leg.symbol, leg.side);
+        manager.exit_overtaken_suspects.write().await.insert(leg.id);
+        assert!(exchange.protection_fill_lookups().is_empty());
+
+        quiet_tick(&manager, &leg).await;
+
+        assert_eq!(exchange.protection_fill_lookups(), [stop_b]);
+        let waiting = manager.get_position(leg.id).await.unwrap().unwrap();
+        assert!(matches!(waiting.state, PositionState::Active { .. }), "{:?}", waiting.state);
+
+        let manager = missing_path_ran(manager).await;
+
+        the_stop_loss_is_in_the_budget(&manager, &leg).await;
+    }
+
+    /// What a superseded stop executed says nothing while the venue shows the
+    /// leg: no path that reads it runs on a leg the venue holds.
+    #[tokio::test]
+    async fn a_superseded_fill_does_not_close_a_leg_the_venue_holds() {
+        let manager = create_test_manager().await;
+        let exchange = manager.exchange();
+        let (leg, stop_a) = active_leg_with_live_stop(&manager).await;
+        venue_still_holds(&manager, &leg, dec!(0.6));
+        exchange.trigger_stop_order(&stop_a);
+        let manager = scanned(manager).await;
+        heal_ran(&manager, &leg).await;
+        exchange.fill_stop_order_for(&stop_a, Quantity::new(dec!(1)).unwrap()).unwrap();
+
+        let manager = missing_path_ran(manager).await;
+
+        let loaded = manager.get_position(leg.id).await.unwrap().unwrap();
+        assert!(matches!(loaded.state, PositionState::Active { .. }), "{:?}", loaded.state);
     }
 
     /// A residual has no say in the halt either way.
