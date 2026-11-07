@@ -584,7 +584,41 @@ pub trait TradingPort: Send + Sync {
         self.trading_rules(symbol).await
     }
 
+    /// Rules for admission (ADR-0056 §5): validated within the TTL or
+    /// refreshed now, never a stale snapshot. An error fails admission closed.
+    /// Default: `trading_rules`.
+    async fn trading_rules_fresh(&self, symbol: &Symbol) -> Result<SymbolTradingRules, ExecError> {
+        self.trading_rules(symbol).await
+    }
+
+    /// The last validated rules of any age, for risk reduction (ADR-0056 §5):
+    /// no venue request and no wait on a refresh in flight. Default: `None`.
+    fn last_validated_rules(&self, _symbol: &Symbol) -> Option<SymbolTradingRules> {
+        None
+    }
+
+    /// Whether the last validated rules are missing or past their TTL, so a
+    /// caller that must not wait can ask for a refresh on the side.
+    /// Default: `false`.
+    fn rules_refresh_due(&self, _symbol: &Symbol) -> bool {
+        false
+    }
+
+    /// Re-read the rules after a rules rejection, updating what
+    /// `last_validated_rules` serves. Never serves a stale snapshot. Bounded by
+    /// the venue under the ADR-0056 §10 ceiling. Default: `trading_rules`.
+    async fn refresh_trading_rules(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<SymbolTradingRules, ExecError> {
+        self.trading_rules(symbol).await
+    }
+
     /// Place a market order. `intent = Reduce` must only reduce exposure.
+    ///
+    /// `Entry` validates against fresh rules and fails closed; `Reduce` sends
+    /// `quantity` as given, with no metadata lookup here: [`crate::quantize`]
+    /// decides it (ADR-0056 §5).
     async fn place_market_order(
         &self,
         symbol: &Symbol,
@@ -596,7 +630,9 @@ pub trait TradingPort: Send + Sync {
 
     /// Place exchange-resident protection of kind
     /// `capabilities().protection` (ADR-0039). `trigger` is chart-derived
-    /// (ADR-0021), never a percentage of entry.
+    /// (ADR-0021), never a percentage of entry. `quantity` and `trigger` are
+    /// sent as given, with no metadata lookup: [`crate::quantize`] decides
+    /// them.
     async fn place_protection(
         &self,
         symbol: &Symbol,

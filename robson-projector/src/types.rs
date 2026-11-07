@@ -479,6 +479,40 @@ pub struct PositionClosedDomain {
 }
 
 #[cfg(test)]
+mod adr0056_step6_contract {
+    use super::EntrySignalReceived;
+
+    /// The projector ignores the rules snapshot: `positions_current` does not
+    /// carry it (ADR-0056 §5, §8), and a payload with it still projects.
+    #[test]
+    fn entry_signal_payload_with_a_rules_snapshot_still_parses() {
+        let payload = serde_json::json!({
+            "type": "entry_signal_received",
+            "position_id": "01940000-0000-7000-8000-000000000001",
+            "signal_id": "01940000-0000-7000-8000-000000000002",
+            "entry_price": "77500",
+            "stop_loss": "76000",
+            "quantity": "0.105",
+            "tick_size": "0.10",
+            "rules_snapshot": {
+                "symbol": {"base": "BTC", "quote": "USDT"},
+                "tick_size": "0.10",
+                "min_price": "556.80",
+                "step_size": "0.001",
+                "min_qty": "0.001",
+                "max_qty": "120",
+                "min_notional": "50",
+                "price_precision": 2,
+                "quantity_precision": 3
+            },
+            "timestamp": "2026-11-06T12:00:00Z"
+        });
+        let parsed: EntrySignalReceived = serde_json::from_value(payload).unwrap();
+        assert_eq!(parsed.quantity.to_string(), "0.105");
+    }
+}
+
+#[cfg(test)]
 mod adr0056_step4_contract {
     use super::EntryFilled;
 

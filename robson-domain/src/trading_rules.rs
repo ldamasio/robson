@@ -15,7 +15,12 @@ use serde::{Deserialize, Serialize};
 use crate::value_objects::{DomainError, OrderSide, Price, Symbol};
 
 /// Validated per-symbol trading rules loaded from exchange metadata.
+///
+/// Deserialization runs the same validation as [`Self::new`]: a rules snapshot
+/// read back from the event log drives order quantization, and a zero step or
+/// tick would otherwise reach a decimal division.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "SymbolTradingRulesWire")]
 pub struct SymbolTradingRules {
     symbol: Symbol,
     tick_size: Decimal,
@@ -26,6 +31,38 @@ pub struct SymbolTradingRules {
     min_notional: Decimal,
     price_precision: u32,
     quantity_precision: u32,
+}
+
+/// Unvalidated wire shape of [`SymbolTradingRules`].
+#[derive(Deserialize)]
+struct SymbolTradingRulesWire {
+    symbol: Symbol,
+    tick_size: Decimal,
+    min_price: Decimal,
+    step_size: Decimal,
+    min_qty: Decimal,
+    max_qty: Decimal,
+    min_notional: Decimal,
+    price_precision: u32,
+    quantity_precision: u32,
+}
+
+impl TryFrom<SymbolTradingRulesWire> for SymbolTradingRules {
+    type Error = DomainError;
+
+    fn try_from(wire: SymbolTradingRulesWire) -> Result<Self, Self::Error> {
+        Self::new(
+            wire.symbol,
+            wire.tick_size,
+            wire.min_price,
+            wire.step_size,
+            wire.min_qty,
+            wire.max_qty,
+            wire.min_notional,
+            wire.price_precision,
+            wire.quantity_precision,
+        )
+    }
 }
 
 impl SymbolTradingRules {
@@ -263,6 +300,17 @@ mod tests {
         assert!(build(dec!(0.10), dec!(0.001), dec!(0), dec!(1000)).is_err());
         assert!(build(dec!(0.10), dec!(0.001), dec!(1), dec!(0.5)).is_err());
         assert!(build(dec!(0.10), dec!(0.001), dec!(0.001), dec!(1000)).is_ok());
+    }
+
+    #[test]
+    fn deserialization_applies_the_constructor_validation() {
+        let rules = btcusdt_rules();
+        let wire = serde_json::to_value(&rules).unwrap();
+        assert_eq!(serde_json::from_value::<SymbolTradingRules>(wire.clone()).unwrap(), rules);
+
+        let mut zero_step = wire;
+        zero_step["step_size"] = serde_json::json!("0");
+        assert!(serde_json::from_value::<SymbolTradingRules>(zero_step).is_err());
     }
 
     #[test]

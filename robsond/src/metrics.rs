@@ -153,6 +153,16 @@ pub static RECONCILIATION_LAST_COMPLETED_TIMESTAMP_SECONDS: LazyLock<Gauge> = La
     .expect("failed to register robsond_reconciliation_last_completed_timestamp_seconds")
 });
 
+/// Symbols the orphan sweep visited only because a leg closed there recently,
+/// each one open-orders request (AGENTS.md guardrail on request counts).
+pub static RECONCILIATION_CLOSED_SYMBOL_VISITS: LazyLock<Counter> = LazyLock::new(|| {
+    register_counter!(
+        "robsond_reconciliation_closed_symbol_visits_total",
+        "Symbols the orphan sweep visited only because a leg closed there recently"
+    )
+    .expect("failed to register robsond_reconciliation_closed_symbol_visits_total")
+});
+
 /// Metric handles used by one reconciliation worker.
 ///
 /// Production instances clone the registered global collectors. Tests inject
@@ -161,6 +171,7 @@ pub static RECONCILIATION_LAST_COMPLETED_TIMESTAMP_SECONDS: LazyLock<Gauge> = La
 #[derive(Clone)]
 pub(crate) struct ReconciliationMetrics {
     scans: CounterVec,
+    closed_symbol_visits: Counter,
     scan_in_progress: Gauge,
     last_attempt_timestamp_seconds: Gauge,
     last_completed_timestamp_seconds: Gauge,
@@ -170,12 +181,17 @@ impl ReconciliationMetrics {
     pub(crate) fn global() -> Self {
         Self {
             scans: (*RECONCILIATION_SCANS).clone(),
+            closed_symbol_visits: (*RECONCILIATION_CLOSED_SYMBOL_VISITS).clone(),
             scan_in_progress: (*RECONCILIATION_SCAN_IN_PROGRESS).clone(),
             last_attempt_timestamp_seconds: (*RECONCILIATION_LAST_ATTEMPT_TIMESTAMP_SECONDS)
                 .clone(),
             last_completed_timestamp_seconds: (*RECONCILIATION_LAST_COMPLETED_TIMESTAMP_SECONDS)
                 .clone(),
         }
+    }
+
+    pub(crate) fn closed_symbol_visit(&self) {
+        self.closed_symbol_visits.inc();
     }
 
     pub(crate) fn scan_started(&self, timestamp_seconds: i64) {
@@ -205,6 +221,11 @@ impl ReconciliationMetrics {
                 &["result"],
             )
             .expect("test reconciliation counter must be valid"),
+            closed_symbol_visits: Counter::new(
+                "test_reconciliation_closed_symbol_visits_total",
+                "Test reconciliation closed-symbol visits",
+            )
+            .expect("test reconciliation closed-symbol counter must be valid"),
             scan_in_progress: Gauge::new(
                 "test_reconciliation_scan_in_progress",
                 "Test reconciliation scan in progress",
@@ -221,6 +242,11 @@ impl ReconciliationMetrics {
             )
             .expect("test reconciliation last-completed gauge must be valid"),
         }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn closed_symbol_visit_count(&self) -> f64 {
+        self.closed_symbol_visits.get()
     }
 
     #[cfg(test)]

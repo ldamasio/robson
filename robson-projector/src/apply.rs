@@ -55,6 +55,7 @@ enum ProjectionRoute {
     ExecutableStopPlanDriftDetected,
     EntryFillProtectionFallback,
     ExecutableStopRiskResolutionFailed,
+    ResidualInventoryRecorded,
 }
 
 fn projection_route(event_type: &str) -> Option<ProjectionRoute> {
@@ -108,6 +109,7 @@ fn projection_route(event_type: &str) -> Option<ProjectionRoute> {
         "executable_stop_risk_resolution_failed" => {
             Some(ProjectionRoute::ExecutableStopRiskResolutionFailed)
         },
+        "residual_inventory_recorded" => Some(ProjectionRoute::ResidualInventoryRecorded),
 
         // Balance events
         "BALANCE_SAMPLED" => Some(ProjectionRoute::BalanceSampled),
@@ -222,7 +224,8 @@ pub async fn apply_event_to_projections(pool: &PgPool, envelope: &EventEnvelope)
         | Some(ProjectionRoute::StartupRecoveryInsuranceStopChecked)
         | Some(ProjectionRoute::ExecutableStopPlanDriftDetected)
         | Some(ProjectionRoute::EntryFillProtectionFallback)
-        | Some(ProjectionRoute::ExecutableStopRiskResolutionFailed) => {
+        | Some(ProjectionRoute::ExecutableStopRiskResolutionFailed)
+        | Some(ProjectionRoute::ResidualInventoryRecorded) => {
             // Audit-only: no position projection mutation.
         },
         Some(ProjectionRoute::BalanceSampled) => {
@@ -301,6 +304,7 @@ mod tests {
             "position_monitor_tick",
             "exit_triggered",
             "exit_order_placed",
+            "residual_inventory_recorded",
             "position_closed",
             // ADR-0039 insurance-stop lifecycle events.
             "insurance_stop_placed",

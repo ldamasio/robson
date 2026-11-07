@@ -82,6 +82,25 @@ impl<V: Venue> ExchangePort for V {
         TradingPort::trading_rules_preview(self, symbol).await
     }
 
+    async fn trading_rules_fresh(&self, symbol: &Symbol) -> Result<SymbolTradingRules, ExecError> {
+        TradingPort::trading_rules_fresh(self, symbol).await
+    }
+
+    fn last_validated_rules(&self, symbol: &Symbol) -> Option<SymbolTradingRules> {
+        TradingPort::last_validated_rules(self, symbol)
+    }
+
+    fn rules_refresh_due(&self, symbol: &Symbol) -> bool {
+        TradingPort::rules_refresh_due(self, symbol)
+    }
+
+    async fn refresh_trading_rules(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<SymbolTradingRules, ExecError> {
+        TradingPort::refresh_trading_rules(self, symbol).await
+    }
+
     async fn place_market_order(
         &self,
         symbol: &Symbol,
