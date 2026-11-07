@@ -2,8 +2,6 @@
 //!
 //! Backtesting and simulation tools.
 
-#![warn(clippy::all)]
-
 // Module declarations will be added as we implement
 
 #[cfg(test)]
