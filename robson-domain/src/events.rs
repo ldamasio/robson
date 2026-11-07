@@ -13,8 +13,20 @@ use crate::{
     },
     policy::{ApprovalPolicy, EntryPolicy, SignalEvaluationOutcome, StrategyId},
     stop_policy::StopPolicy,
+    trading_rules::SymbolTradingRules,
     value_objects::{Price, Quantity, Side, Symbol, TechnicalStopDistance},
 };
+
+/// Which risk-reducing order left inventory it could not execute
+/// ([`Event::ResidualInventoryRecorded`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReductionKind {
+    /// The market exit of the leg.
+    Exit,
+    /// The exchange-resident protective stop of the leg.
+    Protection,
+}
 
 /// Domain events for position lifecycle
 ///
@@ -147,6 +159,11 @@ pub enum Event {
         /// Exchange tick size used for admission-time adverse quantization.
         #[serde(default, skip_serializing_if = "Option::is_none")]
         tick_size: Option<Decimal>,
+        /// Validated trading rules this admission was priced with (ADR-0056
+        /// §5): what risk reduction falls back on when no newer validated
+        /// rules are cached. Absent on legacy-policy and historical events.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        rules_snapshot: Option<SymbolTradingRules>,
         /// When the signal was received
         timestamp: DateTime<Utc>,
     },
@@ -416,6 +433,40 @@ pub enum Event {
         timestamp: DateTime<Utc>,
     },
 
+    /// A risk-reducing order handled less than it was asked to (ADR-0056 §5).
+    /// An exit that executed closes its leg all the same, and this is the
+    /// only durable record of what it filled. On a leg that stays open (a
+    /// stop short of it or below the lot, an exit with nothing executable)
+    /// the latest one stands as its residual, see
+    /// [`Event::standing_residual`]. It never changes a quantity and never
+    /// enters the budget or latent risk.
+    ResidualInventoryRecorded {
+        /// Position identifier
+        position_id: PositionId,
+        /// Which order left the residual
+        order_kind: ReductionKind,
+        /// Quantity the order was asked to handle
+        requested_quantity: Decimal,
+        /// Quantity the venue took: filled for an exit, covered for a stop,
+        /// zero when nothing could be submitted
+        accepted_quantity: Decimal,
+        /// `requested_quantity - accepted_quantity`
+        residual_quantity: Decimal,
+        /// Venue order that took `accepted_quantity`, if any
+        exchange_order_id: Option<String>,
+        /// Fill price of an exit that executed. Audit evidence: nothing reads
+        /// it.
+        fill_price: Option<Price>,
+        /// Fee of an exit that executed. Audit evidence: nothing reads it.
+        fee: Option<Decimal>,
+        /// Lot step of the rules that produced the residual, when known
+        step_size: Option<Decimal>,
+        /// Lot minimum of the rules that produced the residual, when known
+        min_qty: Option<Decimal>,
+        /// When the venue filled the order, or else when this was recorded
+        timestamp: DateTime<Utc>,
+    },
+
     /// Position closed with final P&L
     PositionClosed {
         /// Position identifier
@@ -609,6 +660,20 @@ pub enum Event {
 }
 
 impl Event {
+    /// The residual this event leaves standing on its leg, if any. An exit that
+    /// executed closes the leg, so its record is evidence and nothing more.
+    pub fn standing_residual(&self) -> Option<Decimal> {
+        match self {
+            Event::ResidualInventoryRecorded {
+                order_kind: ReductionKind::Exit,
+                accepted_quantity,
+                ..
+            } if !accepted_quantity.is_zero() => None,
+            Event::ResidualInventoryRecorded { residual_quantity, .. } => Some(*residual_quantity),
+            _ => None,
+        }
+    }
+
     /// Get the associated position ID for an event.
     ///
     /// System-scoped events that are not tied to a concrete position return
@@ -636,6 +701,7 @@ impl Event {
             | Event::ExitTriggered { position_id, .. }
             | Event::ExitOrderPlaced { position_id, .. }
             | Event::ExitFilled { position_id, .. }
+            | Event::ResidualInventoryRecorded { position_id, .. }
             | Event::PositionClosed { position_id, .. }
             | Event::EntryApprovalPending { position_id, .. }
             | Event::PositionDisarmed { position_id, .. }
@@ -675,6 +741,7 @@ impl Event {
             | Event::ExitTriggered { timestamp, .. }
             | Event::ExitOrderPlaced { timestamp, .. }
             | Event::ExitFilled { timestamp, .. }
+            | Event::ResidualInventoryRecorded { timestamp, .. }
             | Event::PositionClosed { timestamp, .. }
             | Event::MonthBoundaryReset { timestamp, .. }
             | Event::CapitalBaseRecalibrated { timestamp, .. }
@@ -715,6 +782,7 @@ impl Event {
             Event::ExitTriggered { .. } => "exit_triggered",
             Event::ExitOrderPlaced { .. } => "exit_order_placed",
             Event::ExitFilled { .. } => "exit_filled",
+            Event::ResidualInventoryRecorded { .. } => "residual_inventory_recorded",
             Event::PositionClosed { .. } => "position_closed",
             Event::MonthBoundaryReset { .. } => "month_boundary_reset",
             Event::CapitalBaseRecalibrated { .. } => "capital_base_recalibrated",
@@ -1017,6 +1085,7 @@ mod tests {
             executable_span: Some(dec!(1061)),
             cap_basis_distance: Some(dec!(1000)),
             tick_size: Some(dec!(0.1)),
+            rules_snapshot: None,
             timestamp: Utc::now(),
         };
 
@@ -1675,6 +1744,7 @@ mod tests {
             executable_span: None,
             cap_basis_distance: None,
             tick_size: None,
+            rules_snapshot: None,
             timestamp: Utc::now(),
         }
     }

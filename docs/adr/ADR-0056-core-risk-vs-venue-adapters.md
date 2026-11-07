@@ -10,7 +10,8 @@ enforcement claim do **not** hold on balance accounts during a protection transi
 those two *guarantees* are qualified.
 **Preserves**: ADR-0021 (level selection), ADR-0022 (unauthored inventory on the operated account is closed, account-wide; no
 exception), ADR-0050 (valid-level selection, no-valid-stop semantics, executable risk costing), ADR-0051 (net-from-start
-monthly budget, atomic reservation, cost-priced boundary downside), ADR-0049 (event payloads do not change)
+monthly budget, atomic reservation, cost-priced boundary downside), ADR-0049 (the event log stays an audit trail; existing
+payloads do not change, except step 6's optional `rules_snapshot` and its new audit-only `residual_inventory_recorded`, §5)
 **Related**: issue #154, TD-2026-05-05-001, docs/policies/UNTRACKED-POSITION-RECONCILIATION.md, 2026-10-30 security assessment
 
 ---
@@ -106,7 +107,8 @@ release as a **forwarding compatibility layer** (same method names, implemented 
 
 ```text
 TradingPort                      required
-  trading_rules / trading_rules_preview                      (issue #154 contracts unchanged)
+  trading_rules / trading_rules_preview                      (issue #154 contracts, qualified by step 6: §5)
+  trading_rules_fresh / last_validated_rules / rules_refresh_due / refresh_trading_rules     (step 6: §5)
   place_market_order(symbol, side, qty, client_id, intent: EntryOrReduce) -> OrderResult
   place_protection(symbol, close_side, qty, trigger, client_id) -> PlacedStop { stop: StopRef, acceptance: OrderResult }
   cancel_protection(symbol, StopRef) -> StopCancelOutcome
@@ -243,6 +245,16 @@ unexecutable residuals stay visibly unresolved. Reusing a
 `Unknown`. A `Terminal` outcome releases only the liabilities
 proven extinguished: filled inventory and unsettled costs stay charged until settlement evidence arrives.
 
+**Exit order on position accounts (step 6).** `binance:usdm` keeps the order it runs in production. The tick's exit cancels the
+protective stop, then submits the market exit (the 2026-07-02 ADR-0039 implementation guide). `DELETE` and `/panic` submit only
+the exit and never cancel: a failed one keeps the stop, and a successful one leaves it live until the next sweep. So §5's "protection is retained until the successor is accepted" holds for
+stop replacement, which is place-then-cancel, and **not** for the tick's market exit, and this qualifies ADR-0039 and ADR-0052's
+availability language for that window. Nothing has shown that Binance accepts a reduce-only market exit beside an open reduce-only
+stop, and an exit-first design with a cancel-then-resubmit fallback was tried and withdrawn (Review trail, v11). The cost: a tick
+exit that fails leaves the leg with no exchange stop until the heal re-places it, and §5 states that window. On this venue the
+remainder is not computed from the stop's final state as above: the reduce-only bound caps the order and its fill closes the leg
+(§5). Balance accounts also cancel first, for their own reason: the stop locks the inventory the exit sells.
+
 **2.3 Reconciliation is never optional.** The reconciliation worker, startup recovery, the live-risk filter, orphan-stop
 recognition and `/status` sync consume an `AccountObservation` produced by the venue: `Positions(snapshot)` for position
 accounts, `Inventory(account_observation)` for balance accounts, in both cases **account-wide** (every symbol, every
@@ -252,6 +264,17 @@ A residual that cannot be executed (below the lot or notional minimum) is a visi
 evidence, priced conservatively at the venue mark, never declared closed. A discrepancy between governed inventory and
 Robson's leg quantity blocks new legs on that venue and surfaces in `/status`. The existing gap (matching by symbol/side
 rather than order-level authorship) stays a follow-up.
+
+**What step 6 delivers on `binance:usdm`, narrower than the above.** A fill for a leg's exit or stop closes the leg, as it did
+before this step, and what the venue still holds is unauthored inventory, closed under ADR-0022 on the next scan. So on this venue
+a leg can be declared closed with a remainder on the account; the remainder itself is never declared closed, and one below the
+lot fails every scan visibly until the operator clears it. There is no operator API. ADR-0022's definition of authored inventory
+rests on entry traceability and this remainder is traceable, so this is an extension of the sweep, recorded in the UNTRACKED policy's
+implementation boundary. A residual on a leg that stays open (a rounded
+stop, a stop below the lot, an exit that is not executable) is durable evidence and blocks new admissions, but it is **not priced at
+the mark in this step**: neither the budget nor latent risk reads it. It surfaces as `residual_quantity` on the position summary and
+as the admission refusal, not in the `/status` slots, and `/positions?month=` under PostgreSQL reads the projection and omits it. Pricing it, and what a remainder means on a balance account, are step 8
+obligations (Implementation Notes).
 
 **2.4 Capital quantities.** `AccountPort`/`PositionAccountPort` expose **wallet balance and unrealized P&L
 separately** (the connector's `wallet_balance` mapping is left as is; a new field is added). The core derives once:
@@ -310,8 +333,9 @@ commission.
   wallet: `current_spot_usdt()` transfers all free spot USDT, which there is quote cash. **Owner: step 8, before
   activation**, covering recovery work too; refusing recovery while spot is selected is the acceptable alternative.
 - **`eligible`.** `/readyz.venue` computes only valuation freshness today and reports `rules`, `costs` and
-  `account_observation` freshness as untracked reasons, so it reads `false`. **Owner: the steps producing that evidence, and
-  step 8 activation requires all of it.**
+  `account_observation` freshness as untracked reasons, so it reads `false`. Step 6 adds `rules_refresh_due`, which can
+  supply the rules input; `/readyz` does not read it yet. **Owner: the steps producing that evidence, and step 8 activation
+  requires all of it.**
 - **Reconnect resync and feed properties.** Today a reconnect takes no snapshot; REST polling starts only after the
   watchdog's 90 s of silence with a risk-open position, and subscriptions follow the configured symbols rather than the
   active `(venue, symbol)` set. Step 8 inherits this behaviour. **Owner: a separate reviewed change, before a second
@@ -357,6 +381,115 @@ step and validates min, max and alignment; they differ. Step 6 replaces the help
   minimum is recorded as residual inventory, never declared closed. Today's fallback quantity path
   (`binance_exchange.rs:391`) is replaced by this rule, not removed silently.
 The domain stop resolver's adverse tick rounding is reused; ADR-0052's persisted span is never recomputed.
+
+**What step 6 delivers, and where it reads this section narrowly:**
+- **Snapshot.** Taken at admission (the entry signal), not at arm, and under `ExecutableSpan` only: `LegacyUncapped`
+  admissions need fresh metadata but persist none. It is an optional `rules_snapshot` on `entry_signal_received`, read back
+  from `event_log` at restart as the first non-null one by stream sequence. No migration.
+- **Source order for risk reduction.** Last validated cache, then the snapshot. The cache goes first because it is never older
+  than the snapshot taken from it. Holding either never waits: a refresh past the TTL goes on the side, one in flight per
+  symbol.
+- **The one exception to "never waits".** A leg holding neither, which after this step means one admitted before it or one whose
+  snapshot could not be read, does the rules lookup on whatever path it is on, including the tick, as before this step. The lookup
+  and the rejection refresh are each bounded end to end at 15 s. If the lookup fails, a decided exit (close, panic, recovery, or a
+  tick that already had rules) goes out with the quantity as given. A tick cannot decide without rules, because the `ExecutableSpan`
+  trigger derives from them: that leg fails closed for that tick, the other legs are processed, and the tick returns the first error.
+  After an attempted fetch that did not succeed, a symbol with nothing cached retries after 30 s instead of 5 minutes, counted from
+  the attempt's start even if the bound dropped it, so such a leg cannot evaluate its software stop for up to 30 s after the venue
+  recovers (§10 states the request cost).
+- **Not executable under held rules.** Those rules may be stale, so the order is submitted raw and the venue decides. Only a
+  venue refusal confirmed by rules that also say so ends as not executable.
+- **Maximum.** Not checked locally on risk reduction, so stale rules cannot stop an order reaching the venue; a venue refusal
+  is a rules rejection like any other.
+- **Rules rejection on USDⓈ-M.** HTTP 400 with `-1111`, `-4004`, `-4005`, `-4013`, `-4014`, `-4023` or `-4164`. This is a
+  reading of Binance's error table, not a guarantee, and only `-1111` has repository evidence (2026-07-04). It is separate
+  from the step 2 finality list: a rejected attempt stays unresolved in the ledger. It takes at most one `exchangeInfo`,
+  skipped within 30 s of the last refresh, and one resubmit under the same client id; the reduce-only flag bounds what a
+  misreading can do. A second rejection returns to the caller, and the leg retries after 30 s.
+- **A fill closes its leg, and a remainder is unauthored inventory.** An exit fill, or a stop fill the daemon reaches through an
+  exit, startup recovery, reverse reconciliation or the tick's overtaken path, closes the leg whatever quantity it executed, and no venue
+  read decides it. A stop fill reached by none of these leaves the leg `Active` (see "A stop gone from the venue"). For a market exit this rests on a reading with no venue evidence: a `FILLED` reduce-only
+  order short of its request means the venue capped it because the position was smaller, or rounding after a lot rule rose, leaving
+  under one lot. `PARTIALLY_FILLED` and `EXPIRED` on a market reduce return the error they returned before this step, and the exit
+  retries. A stop is different: one that executes part and then expires or is cancelled counts as terminal, and startup recovery and
+  `/reconcile-close` (on operator evidence) can close a leg on it while the venue still holds most of the leg; that remainder is not
+  dust and goes to the sweep at market. The worker, the startup gate and the tick's overtaken path do not close on it while the venue
+  shows the position.
+- **How long a remainder sits.** The worker closes it under ADR-0022 with no grace period, normally on its next scan
+  (`ROBSON_RECONCILIATION_INTERVAL_SECS`, default 60 s), and it has no stop until then. **There is no upper bound**: a failed positions
+  read skips the pass for as long as it fails, passes are serial and a slow request delays them, a venue refusal or a remainder below
+  the lot retries every scan until the operator clears it, and downtime extends it. Nothing blocks a new entry meanwhile: a new
+  `Entering`, `Active` or `Exiting` leg on the same symbol and side makes the remainder count as tracked (§2.3's symbol/side gap), so it
+  is not swept until that leg closes. A failed UNTRACKED close no longer ends the rest of the scan.
+- **Evidence of a short exit.** An exit fill short of the leg always writes `residual_inventory_recorded` first, on the tick, close
+  and panic paths, because `ExitOrderPlaced` carries the requested quantity and this is the only durable record of what filled.
+- **A triggered stop counts as filled only with terminal, complete evidence.** `NEW`, `PARTIALLY_FILLED` and unknown statuses are not
+  fills, and a terminal order's summed trades must equal its cumulative executed quantity; otherwise the caller retries on a later
+  pass. This also tightens startup recovery, the tick's overtaken path and the worker's missing-position path. There is no bound if
+  they never match: the lookup reads one page of 1000 trades, so an order beyond it, or past the venue's trade history, stays unresolved
+  on a flat venue where the previous code accepted the partial evidence, until user-trade evidence or `/reconcile-close` resolves it.
+  **Remaining gap:** an order not found (`-2013`) still falls through to its trades, which cannot prove it terminal or complete.
+- **What a close books.** Every close books the leg's recorded quantity at the last order's fill, and that order's fee. This is an
+  estimate when a leg closes through more than one order: the earlier fill is priced at the later fill's price and its fee is not
+  counted. It is kept over pricing only what the last order executed, which would drop the earlier quantity from the month's net and
+  understate a loss. If the recorded quantity really was larger than the venue held, the difference is booked at the last fill too,
+  as the exit and panic paths did before this step. Only reverse reconciliation prices a fill above the leg at what filled, and its
+  evidence keeps the real filled quantity. Per-fill accounting is a step 8 obligation.
+- **Residual on an open leg.** `residual_inventory_recorded` is audit-only: the projector ignores it, and its `fill_price` and `fee`
+  are evidence nobody reads yet. On a leg that stays open (a rounded stop, a stop below the lot, an exit that is not executable) the
+  latest residual stands and only closing the leg resolves it: an accepted stop does not clear it, even one covering the whole leg. An
+  unchanged value writes nothing. A stop below the lot minimum retries every 5 minutes and writes durable events once.
+- **Admission block.** A residual on any open leg refuses new admissions through its own check and reason (409). It never fails
+  the budget snapshot and is no input to the budget, latent risk or MonthlyHalt. It does not cover a remainder after a close.
+- **MonthlyHalt.** With latent risk unresolved, the halt fires only on a valid capital base with realized losses alone exhausting the
+  budget (`min(consumed_active, consumed_nfs)`). Below that, or with an invalid base, it defers as before this step. The path with
+  latent risk resolved is unchanged, including ADR-0051 §1: on `capital_base ≤ 0` the halt latches and closes risk-bearing positions.
+- **Stop healing.** Any `Active` leg with no stop on record is re-placed through the existing heal path, whichever caller or error
+  left it so. The first attempt waits the 30 s window and needs a tick, so the exposure after a failed tick exit is at least 30 s and
+  has no upper bound without ticks on the symbol. A leg with nothing held and a failed lookup waits for metadata; a leg below the lot
+  retries every 5 minutes; a leg suspected closed on the venue is not healed, rechecked when a heal comes due. After placement, and again after a replacement cancels its
+  predecessor, a leg no longer `Active` gets nothing recorded and the new stop is withdrawn, best-effort. A window remains between the
+  last check and applying the event; a stop that survives it is an orphan for the next sweep and, until then, could reduce a new entry
+  on that symbol and side if it triggers. The sweep also visits the symbols of legs closed in the last 24 h by `closed_at`, so such a stop,
+  or the one a successful `DELETE` or `/panic` leaves, normally goes within a scan. It does not on a flat symbol with no open leg when
+  `get_open_orders` keeps failing past those 24 h, when the close is backdated past them (`closed_at` is the fill's time, so a restart
+  can reconcile an old fill), or for a leg in `Error`. Untyped exit failures retry at tick cadence as before this step; only `RulesRejected`
+  and `ReduceOnlyRejected` have a 30 s window. **Known corner:** a persistent untyped refusal while price stays past the stop submits
+  at tick cadence and alternates heal and cancel, about 2 stop events per 30 s, until the operator acts.
+- **A stop gone from the venue.** A stop can stop being live on a leg the venue still holds: a rounded stop fills and leaves a remainder
+  with no crossing tick, a stop executes part and expires, the operator cancels it, or the sweep cancels a successor not yet recorded.
+  The leg stays `Active`, so nothing closes it, and a recorded id would keep the heal from noticing. The orphan sweep already reads the
+  open protective orders of every symbol with an `Active` leg, so no request is added: on a successful read, a leg the venue holds whose
+  recorded stop is not among them, and whose id is unchanged on a re-read, is scheduled for the heal, with a warning and the stale gauge.
+  Exposure lasts up to one scan, plus the 30 s window, plus the next tick, and with no feed nothing is re-placed. Not verified on a venue:
+  that a reduce-only stop larger than what is held is accepted (if refused, `InsuranceStopFailed` repeats every 30 s and only the software
+  stop protects the leg), and that the read returns every live conditional stop (if it hid one, the cost is one replacement per leg per
+  scan, which stacks only if a predecessor's cancel also fails). The scan's two reads are not atomic, so a stop filling between them
+  schedules a heal on a leg about to be flat; the venue may refuse the new stop, and then it retries every 30 s until the leg closes. A
+  worker lookup that closed the leg on the dead stop was built and withdrawn (Review trail, v11).
+- **A superseded stop stays evidence of a whole fill.** A leg remembers its last 3 displaced stop ids, restored at restart from the stream
+  it already reads, because a stop can fill after being displaced, by this heal, by startup recovery or by a trailing advance. The
+  missing-position worker and the startup gate try the recorded id, then those; a displaced stop counts only if it filled the leg's whole
+  quantity, and it keeps its `ins-` authorship, so the close is `InsuranceStop` and counts in the budget. An older partial is ignored, so it
+  cannot finalize a later close at its own price and month, and the path falls through to user trades. That costs up to 3 ids × 3 requests,
+  only when the recorded id has no fill. The tick's overtaken path looks up the recorded stop only, so it costs per mark what it did before
+  this step. Three further displacements before the fill push an id off the list and the close falls to user trades, outside the budget; a
+  failed append of the event loses the id at restart (step 7). A fill that left the leg open stays out of the month's net until the leg
+  closes and the whole leg is booked at the later fill.
+- **Restart.** An event-log query error aborts startup with a retryable exit; exchange stops stay live meanwhile. A residual row that
+  cannot be read, or is not the variant its type says for this leg, sets `residual_unknown`, which blocks admissions the same way until
+  the leg closes; such a rules row counts as no snapshot. A residual going A→B→A without an order id hits event-log idempotency, so a
+  restart shows B instead of A; both block.
+- **The old fallback.** The path cited above now lives in `usdm/exchange.rs` and is gone, together with its 2-decimal
+  trigger rounding. With no cache, no snapshot and `exchangeInfo` down, a legacy trigger whose 2-decimal result happened to
+  be tick-aligned is no longer placed and retries at 30 s. New `ExecutableSpan` legs cannot reach this.
+- **Accepted limit: a real partial is not in the month's net while the leg stays open**, and the close only approximates it, as above.
+  The income ledger is a conditional safety net: a `REALIZED_PNL` or `COMMISSION` row matches when exactly one position on the symbol
+  has `entry_filled_at` or `closed_at` within 120 s of it, so a partial near the entry or the close raises nothing. Otherwise it stays
+  unmatched, alarms after the grace period and makes `transfer_explains_delta` return `None`, which stops transfer-confirmed
+  `capital_base` recalibration for that window; acknowledging the row does not lift that (ADR-0045 §2). Trading is unaffected.
+- **Crash between a fill and its events, or a failed durable append** (reasoned, not tested; **owner: step 7**). A residual's admission
+  block can be lost at restart. The leg keeps its recorded quantity and stays managed.
 
 ### 6. Long-only readiness
 
@@ -469,12 +602,14 @@ account exists.
 | 3 | `VenueFactory`, `with_venue`, `TradeFeedPort` and the WS wiring relocation, feed injection with `(VenueId, Symbol)` keys, additive `/readyz.venue`, funding route modes (§3 lists what is staged) | preserving for execution with `ROBSON_VENUE` unset and usable credentials; additive for readiness consumers; stub paths lose their funding surface | revert alone |
 | 4 | Rust naming and endpoint cleanup with stable event, `Position` and credential encodings; fixtures | preserving | revert alone |
 | 5 | Accounting: governed equity derived once; month-boundary basis uses ADR-0051 §3 cost-priced downside; **migration** for persisted carried bases with compatible settlement attribution and replay handling; atomic reset | **changing** (basis, persisted state version) | once new accounting state is written, rollback needs demonstrated reader/writer compatibility of the older binary with that state, or a verified book free of risk-bearing and unsettled liabilities; keeping `capital_base` alone is insufficient |
-| 6 | Quantisation and metadata rules (§5) with before/after fixtures per order kind | **changing** | revert alone only with a verified empty book (the old helper is incompatible with spot lots) |
+| 6 | Quantisation and metadata rules (§5) with before/after fixtures per order kind | **changing** | revert alone only with a verified empty book (the old helper is incompatible with spot lots) **and no `residual_inventory_recorded` row in `event_log`**, since an older binary's projector returns `MissingHandler` on it and its event enum cannot read it; the additive `rules_snapshot` needs no such condition |
 | 7 | Durable intent journal in the store (migration): intents and results persisted in order relative to reservations, stable venue-scoped client ids, durable attempt evidence (§2), explicit unresolved states, transition intents (§2.2); **durable venue/account routing on every risk-bearing and unsettled leg**, with the legacy mapping of every existing position to `binance:usdm`; process-kill tests at every external-call/persistence boundary | preserving (adds evidence and identity) | revert alone with an empty book; after step 8 only together with step 8 |
 | 8 | Spot venue acceptance behind `ROBSON_VENUE=binance_spot`: `InventoryPort`, protection protocol per N1, settlement from fills, conformance suite green; the long-only entry gate is a separate ADR | new venue | disabling a venue stops new admissions on it but **keeps managing its open and unsettled legs** through the step-7 routing; a binary rollback requires a verified empty book on that venue |
 
 Migrations: none in steps 1–4 and 6; step 5 (carried bases) and step 7 (intent journal, leg routing) ship with explicit
-migrations and persisted-state versions. Every rollback names its transitive dependency prefix: a step is reverted only
+migrations and persisted-state versions. Step 6 adds one optional event field and one event type, registered in bronze
+contract 1.2.0; `rbx-data` vendors its own registry copy (1.1.3) and must re-vendor before any export runs. Every rollback
+names its transitive dependency prefix: a step is reverted only
 together with every later merged step that imports it, and only at a persisted-state version its binary can read.
 
 ### 9. Not decided here
@@ -506,7 +641,13 @@ only).
   account observation ≤ 6 per minute; order lookups ≤ pending intents per minute; no REST call on a market tick. An
   aggregate weighted-request budget across venues and symbols respects each exchange's shared limits; protective
   operations (re-protect, flatten, reconciliation of an `Unknown`) have priority and an explicit emergency budget over
-  the steady-state ceilings, recorded per incident. Degraded mode (feed silent) keeps the same ceilings.
+  the steady-state ceilings, recorded per incident. Degraded mode (feed silent) keeps the same ceilings. Step 6 bounds
+  its own requests (§5) by construction and tests, but apart from the counter below delivers no `/metrics` instrumentation and no
+  aggregate or protective-priority budget, so it does not establish this criterion. During an outage a symbol with nothing cached costs up to
+  2 `exchangeInfo` per minute, above the rules ceiling here for those symbols only. The wider sweep (§5) adds 1 open-orders request per
+  symbol with a leg closed in the last 24 h and nothing else to visit it, plus one store read (two in the first 24 h of a month), counted
+  by `robsond_reconciliation_closed_symbol_visits_total`, a logical total: the guardrail's measure per handled operation and its
+  threshold alert are not met. **Owner of both: before step 8 activation.**
 - **Concurrency and memory bounds**: financial admission depends **only** on the monetary constraints of §7 (slots
   report guaranteed full-cap opportunities, `policy.rs:253`, and never cap legs or admissions). Execution is bounded by
   worker concurrency (one in-flight transition per leg, `ROBSON_EXEC_WORKERS` proposed 4) and bounded queues; recovery
@@ -530,15 +671,18 @@ only).
 | Dependency / event | What happens | Degraded mode | Visibility |
 |---|---|---|---|
 | Database dies | no admission, no new legs; already-installed protection remains on the exchange; inventory in an N1-a transition may remain unprotected without a duration or loss bound; no cancellation starts without a durable intent, and unfinished transitions retain liabilities and alerts and resume from that intent on recovery; intent results cannot be persisted → in-flight operations enter `Unknown`; recovery looks them up, a lookup may stay `Unknown`, and then the reservation stays held until step 7's explicit resolution path | read-only `/status` from memory; arms refused | `/readyz.database=false`; `unprotected_inventory` gauge; recovery events |
-| Venue REST dies | rules/costs/valuation stale → basis invalid, admission fails closed; risk reduction proceeds on the persisted rules snapshot with retries | reads from cache until TTL; protection on the venue | per-venue `eligible=false` + reasons; alert |
+| Venue REST dies | rules/costs/valuation stale → basis invalid, admission fails closed; risk reduction proceeds on the last validated rules or the persisted snapshot, with one refresh and resubmit per rejection; a leg holding neither waits for the lookup, then a decided exit goes out as given and a tick fails closed (§5) | reads from cache until TTL; protection on the venue, except a leg whose exit failed, until the heal | per-venue `eligible=false` + reasons; alert |
 | Venue feed silent | watchdog after `ROBSON_FEED_SILENCE_MAX`; REST snapshot resync; trailing advances continue on REST ticks within the request budget | bounded REST polling | silent-feed metric, event |
 | Daemon dies mid fan-out | accepted legs are protected on their venues except for a leg killed between entry fill and protection placement, which recovery protects or flattens first | startup recovery reads the durable journal and each venue's observation; completes, protects or releases per evidence | recovery events per leg |
 | Daemon dies, venue unreachable or placement rejected inside a balance-account transition (N1-a) | the leg is unprotected for the whole interval, with no maximum duration; loss can exceed the priced envelope and every cap | retry, flatten, then re-protect-or-flatten as the first recovery action; admission on the venue blocked | `unprotected_inventory` gauge and alert while nonzero; transition event with duration; recovery event |
 | Daemon dies mid replacement (position account) | old stop still live (place-then-cancel) | recovery heals from `open_protective_orders` | recovery event |
 | Unknown order outcome (timeout) | reservation held; `order_by_client_id` before any retry; `Unknown` keeps the leg pending, possibly indefinitely (time does not resolve it) | no blind retry | event, `/status` pending count |
-| Stale fees / rules / valuation | admission fails closed; risk reduction unaffected (persisted snapshot) | — | `/status` per-venue staleness |
+| Stale fees / rules / valuation | admission fails closed; risk reduction does not wait while it holds rules (§5) | — | `/status` per-venue staleness |
+| Tick exit fails (position account) | the stop was cancelled first, so the leg has no exchange stop until the heal: at least 30 s, longer without ticks or held rules (§5); the software stop keeps evaluating | heal re-places the stop | `robsond_insurance_stop_stale_positions` gauge |
+| Fill leaves a remainder on the account (position account) | the leg closes; the remainder is unauthored, without a stop, until a scan closes it, normally the next, with no upper bound (§5) | a remainder below the lot fails each scan until the operator clears it | UNTRACKED warning and rogue-position event each scan; `residual_inventory_recorded` for a short market exit only |
+| Event log unreadable at restart | query error: startup aborts with a retryable exit, exchange stops stay live | unreadable or mismatched residual row: admissions blocked until the leg closes (§5) | warning or error in the logs, no durable event |
 | Incomplete settlement | commission/pnl missing → month accounting flagged invalid, new legs blocked (ADR-0051) | — | `unmatched_income_count`, event |
-| Unauthored inventory or position on an execution account | closed (ADR-0022); new legs blocked until the account is clean | — | `/status` per-venue discrepancy, event |
+| Unauthored inventory or position on an execution account | closed (ADR-0022); new legs blocked until the account is clean, a block `binance:usdm` does not have yet (§5) | — | `/status` per-venue discrepancy, event |
 
 ## Consequences
 
@@ -547,7 +691,8 @@ only).
   are written down per venue.
 - Negative / trade-offs: eight refactor PRs with no operator-visible feature before step 8; optional ports add branching;
   the consolidated basis needs every venue reachable and valued at month start; spot inventory accounting is new surface;
-  N1-a accepts an unprotected interval without a guaranteed maximum duration that position accounts do not have, and
+  N1-a accepts an unprotected interval without a guaranteed maximum duration, which position accounts did not have before step 6 (§5:
+  a failed tick exit, a remainder and a stop gone from the venue can each go unprotected with no upper bound), and
   qualifies the ADR-0039 and ADR-0052 guarantees on balance accounts. A leg whose order outcome stays `Unknown` holds its
   global and per-venue admission capacity indefinitely: elapsed time, a restart or a month rollover does not release the
   reservation, only evidence or step 7's explicit resolution path does. During Fase S, a book that cannot be verified as
@@ -600,7 +745,11 @@ Budget model for multi-venue:
   `robsond/src/{config,event_bus,position_manager,sse}.rs`, `robson-projector/src/types.rs`, golden fixtures.
 - Step 5: `robsond/src/daemon.rs` (boundary), `robson-domain` (carried basis), migration for persisted carried bases
   and settlement attribution, persisted-state version bump.
-- Step 6: `robson-exec/src/quantize.rs`, `robsond/src/position_manager.rs`, usdm adapter; before/after fixtures.
+- Step 6: `robson-exec/src/{quantize,executor,error,ports,venue,compat,stub}.rs`, `robson-engine/src/lib.rs`,
+  `robson-domain/src/{entities,events,trading_rules}.rs`, `robson-store/src/memory.rs`, `robson-eventlog`, `robson-projector`,
+  `robson-store/src/postgres.rs` (a close exactly at month start belongs to that month),
+  `robsond/src/{position_manager,daemon,api,error,metrics,reconciliation_worker,startup_recovery,venue}.rs`, usdm adapter; bronze
+  contract 1.2.0; before/after fixtures.
 - Step 7: `robson-exec/src/intent.rs` → store-backed journal; migration (journal tables, leg routing columns, legacy
   mapping); process-kill tests. Before any caller acts on `order_by_client_id` or `replace_protection`, this step must:
   persist each attempt durably before its request is sent and each rejection when observed, reload them on startup, treat
@@ -608,9 +757,21 @@ Budget model for multi-venue:
   the permanently `Unknown` cases an explicit resolution path that never infers absence from time, including an attempt
   whose outcome never becomes known and a successor refused locally before anything was sent (`NoRecord` →
   `Unknown{new: None}`, old stop still live, nothing for a lookup to find); until resolved, the leg stays pending with its
-  reservation held and visible.
+  reservation held and visible. Step 6 removed that local refusal from USDⓈ-M `place_protection`; the rule stands for any
+  venue that keeps one. This step also owns a crash between a fill and its events, a failed durable append of a
+  residual event (§5), and two ownership races that exist before step 6 and need the per-leg transition coordination of §2.2: the worker
+  classifies a remainder as UNTRACKED, a new entry on that symbol and side fills, and the worker reduces inventory the new leg owns; and
+  the orphan sweep, working from a stale covered set, cancels a stop accepted after that set was read, recorded or not, including an initial
+  stop on a new leg, so the leg can record a cancelled stop until the next sweep schedules the heal (§5). This step must revalidate ownership
+  in coordination with cancellation and test a stop recorded before the cancel. Step 6's wider sweep adds some exposure to the second, and its
+  refresh and resubmit lengthen the first's window.
 - Step 8: `robson-connectors/src/binance/spot/*`; conformance suite; `ROBSON_VENUE=binance_spot`; executor's
-  `validate_futures_settings` gated to position accounts (§4).
+  `validate_futures_settings` gated to position accounts (§4). It must also, before activation: replace the same-id resubmit, since
+  spot has no reduce-only bound (§5); decide what a fill short of the leg and a remainder mean on a balance account, because step 6's
+  answer on position accounts relies on a reduce-only bound and on ADR-0022 closing the rest; price a residual at the mark (§2.3);
+  account per fill, so that a partial counts in the month's net and a close stops booking the whole leg at its last fill (§5); and
+  design for dust. A fee charged in the base asset can leave inventory below the lot; how often has not been measured. Review trail
+  v11 records the two USDⓈ-M designs withdrawn in step 6 and why.
 - Evidence: `docs/evidence/2026-11-04-binance-exchangeinfo-btcusdt.md` (retained in this PR): timestamped verbatim
   extracts with source URLs and SHA-256 of the raw responses; spot `orderTypes` includes `STOP_LOSS`, `LOT_SIZE` step
   0.00001, `NOTIONAL` min 5 USDT (applyMinToMarket, avgPriceMins 5); futures `LOT_SIZE` step 0.001, `MIN_NOTIONAL` 50
@@ -670,3 +831,20 @@ Budget model for multi-venue:
   `validate_futures_settings` to position accounts. No risk number or operator decision changed. Codex **APPROVE** on
   round 1, with four P3s applied (the `/events/history` exposure above, a missing-versus-null assertion, fixture provenance
   and the stale DB-gated count).
+- v11 (2026-11-07): the header, §2, §2.2, §2.3, §3, §5, §8, §10, the failure modes and the Implementation Notes aligned with
+  step 6 as implemented on `refactor/venue-step6-quantize`. Codex rejected two wider USDⓈ-M designs. Rounds 1 and 2: exit-first with
+  a cancel-then-resubmit fallback, a partial exit reducing the leg's quantity with P&L accumulated while open, and inventory with no
+  live stop charged at the mark (7 P1 + 4 P2, then 10 P1 + 2 P2). Round 3: a leg kept `Active` after a short fill and closed only on
+  a flat venue read (7 P1 + 3 P2; five in that lifecycle, one not fixable on today's port, because a position read carries no evidence
+  that it follows the fill). Round 4 on the current rule: 5 P1 + 3 P2 on stop evidence, the withdrawal race and request accounting,
+  applied except for two ownership races staged to step 7, and an invalid base's halt, which stays as ADR-0051 §1 decided. Round 5:
+  1 P1 + 2 P2 + 2 P3, mostly on a worker lookup that closed a leg on its dead stop, whose coverage check could not be tied to the stop;
+  the lookup was withdrawn. Round 6: 1 P1 + 2 P3, rejecting a dead recorded stop as a stated limit; the sweep now re-places a recorded stop
+  gone from the venue. Round 7: 1 P1 + 2 P3, a replaced stop's later fill leaving the budget; displaced stops now stay evidence. Round 8:
+  2 P1 + 2 P3 on that evidence; it now covers every displacement and counts only a whole fill. Round 9: **APPROVE**, with two P3 on
+  documentation applied after the verdict, with no new round. **Operator decisions (2026-11-06 and 2026-11-07): narrow the step twice**, since the operator cannot trade
+  that venue and spot needs a different model. So this version moves three promises: §2.3's residual priced at the mark goes to step 8;
+  "never declared closed" no longer covers a leg with a remainder on a position account, only the remainder; and §5's retained
+  protection does not cover the tick's market exit, which stays cancel-first. Per-fill accounting also goes to step 8. No risk constant
+  changed. MonthlyHalt changed in one direction: realized losses exhausting the budget on a valid base now fire it with latent risk
+  unresolved.
