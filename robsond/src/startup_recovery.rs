@@ -402,12 +402,14 @@ where
         PositionState::Active { invalidation_guard_level, .. } => *invalidation_guard_level,
         _ => None,
     };
-    // Trading rules are fetched best-effort for EVERY policy here: the
-    // healing comparison quantizes both sides on the tick grid, otherwise
+    // Trading rules are read best-effort for EVERY policy here (what is held,
+    // ADR-0056 §5, looked up only when nothing is): the healing comparison
+    // quantizes both sides on the tick grid, otherwise
     // the sub-tick difference between a raw legacy derivation and the
     // adapter-aligned placed price would cancel-replace a correct stop on
     // every restart.
-    let comparison_rules = pm.exchange().trading_rules(&position.symbol).await.ok();
+    let comparison_rules =
+        pm.rules_for_managing(&position.symbol, position.rules_snapshot.as_ref()).await;
     let plan_rules = pm.trading_rules_for(position).await;
     let executable_stop = match pm.engine().stop_plan(
         position,

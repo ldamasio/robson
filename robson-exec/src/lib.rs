@@ -41,6 +41,7 @@ pub mod error;
 pub mod executor;
 pub mod intent;
 pub mod ports;
+pub mod quantize;
 pub mod stub;
 pub mod venue;
 

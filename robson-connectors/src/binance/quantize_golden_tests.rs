@@ -1,25 +1,27 @@
 //! ADR-0056 step 6: what each order kind sends, observed on the wire.
 //!
 //! `testdata/adr0056_step6_before.json` was written by this harness on the
-//! code before the quantisation change. The requests go through the real
-//! adapter and REST client to a local listener standing in for Binance, which
-//! accepts every order, so a row shows what Robson itself decided to send, and
-//! which requests it made to get there.
+//! code before the quantisation change (commit 2da94feb) and is kept unchanged
+//! as the record of the old behaviour. `testdata/adr0056_step6_after.json` is
+//! what the code does now, and says why on every row that differs. The requests
+//! go through the real adapter and REST client to a local listener standing in
+//! for Binance, which accepts every order, so a row shows what Robson itself
+//! decided to send, and which requests it made to get there.
 
 use std::sync::{Arc, Mutex};
 
 use robson_domain::{OrderSide, Price, Quantity, Side, Symbol};
-use robson_exec::venue::{EntryOrReduce, PositionAccountPort, TradingPort};
+use robson_exec::{
+    quantize,
+    venue::{EntryOrReduce, PositionAccountPort, TradingPort},
+};
 use serde_json::{json, Value};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpListener,
 };
 
-use crate::{
-    binance::usdm::{normalize_market_quantity, BinanceExchangeAdapter},
-    binance_rest::BinanceRestClient,
-};
+use crate::{binance::usdm::BinanceExchangeAdapter, binance_rest::BinanceRestClient};
 
 const QUANTITIES: [&str; 9] = [
     "0.0005", "0.001", "0.0015", "0.0219", "0.105", "120", "120.001", "1000", "1000.001",
@@ -209,12 +211,56 @@ where
     row(kind, state, quantity, extra, requests, outcome)
 }
 
+/// A reduction outcome as a row outcome: what did not go out is named, because
+/// the executor records it as residual inventory.
+fn reduction_result<T>(
+    outcome: quantize::ReductionOutcome<T>,
+) -> Result<(), robson_exec::ExecError> {
+    match outcome {
+        quantize::ReductionOutcome::Submitted { residual, .. } if residual.is_zero() => Ok(()),
+        quantize::ReductionOutcome::Submitted { residual, .. } => {
+            Err(robson_exec::ExecError::InvalidState(format!("accepted, residual {residual}")))
+        },
+        quantize::ReductionOutcome::NotExecutable { residual, .. } => Err(
+            robson_exec::ExecError::InvalidState(format!("not submitted, residual {residual}")),
+        ),
+    }
+}
+
+async fn place_stop(
+    venue: Arc<BinanceExchangeAdapter>,
+    quantity: Quantity,
+    trigger: Price,
+    client_id: &str,
+) -> Result<(), robson_exec::ExecError> {
+    let symbol = symbol();
+    let outcome = quantize::submit_reduction(
+        &*venue,
+        &symbol,
+        quantity,
+        None,
+        quantize::METADATA_WAIT_BOUND,
+        |submitted, rules| {
+            let trigger = quantize::protective_trigger(rules.as_ref(), OrderSide::Sell, trigger);
+            let venue = venue.clone();
+            let symbol = symbol.clone();
+            let client_id = client_id.to_string();
+            async move {
+                venue
+                    .place_protection(&symbol, OrderSide::Sell, submitted, trigger, &client_id)
+                    .await
+            }
+        },
+    )
+    .await?;
+    reduction_result(outcome)
+}
+
 async fn observe_all_rows() -> Vec<Value> {
     let mut rows = Vec::new();
     for state in STATES {
         for quantity in QUANTITIES {
-            // The position manager's check before any exchange submission. It
-            // consults no rules and no price on the old code.
+            // The position manager's check before any exchange submission.
             for reference_price in ["77500", "30000"] {
                 rows.push(
                     observe(
@@ -222,8 +268,15 @@ async fn observe_all_rows() -> Vec<Value> {
                         state,
                         quantity,
                         json!({ "reference_price": reference_price }),
-                        |_venue| async move {
-                            normalize_market_quantity(&symbol(), qty(quantity)).map(|_| ())
+                        |venue| async move {
+                            let rules =
+                                TradingPort::trading_rules_fresh(&*venue, &symbol()).await?;
+                            quantize::admission_quantity(
+                                &rules,
+                                qty(quantity),
+                                reference_price.parse().unwrap(),
+                            )
+                            .map(|_| ())
                         },
                     )
                     .await,
@@ -246,30 +299,50 @@ async fn observe_all_rows() -> Vec<Value> {
             );
             rows.push(
                 observe("exit", state, quantity, Value::Null, |venue| async move {
-                    TradingPort::place_market_order(
+                    let symbol = symbol();
+                    let outcome = quantize::submit_reduction(
                         &*venue,
-                        &symbol(),
-                        OrderSide::Sell,
+                        &symbol,
                         qty(quantity),
-                        "exit-1",
-                        EntryOrReduce::Reduce,
+                        None,
+                        quantize::METADATA_WAIT_BOUND,
+                        |submitted, _rules| {
+                            TradingPort::place_market_order(
+                                &*venue,
+                                &symbol,
+                                OrderSide::Sell,
+                                submitted,
+                                "exit-1",
+                                EntryOrReduce::Reduce,
+                            )
+                        },
                     )
-                    .await
-                    .map(|_| ())
+                    .await?;
+                    reduction_result(outcome)
                 })
                 .await,
             );
             rows.push(
                 observe("untracked_close", state, quantity, Value::Null, |venue| async move {
-                    PositionAccountPort::close_position_market(
+                    let symbol = symbol();
+                    let outcome = quantize::submit_reduction(
                         &*venue,
-                        &symbol(),
-                        Side::Long,
+                        &symbol,
                         qty(quantity),
-                        "close-1",
+                        None,
+                        quantize::METADATA_WAIT_BOUND,
+                        |submitted, _rules| {
+                            PositionAccountPort::close_position_market(
+                                &*venue,
+                                &symbol,
+                                Side::Long,
+                                submitted,
+                                "close-1",
+                            )
+                        },
                     )
-                    .await
-                    .map(|_| ())
+                    .await?;
+                    reduction_result(outcome)
                 })
                 .await,
             );
@@ -280,16 +353,7 @@ async fn observe_all_rows() -> Vec<Value> {
                     quantity,
                     json!({ "trigger": ALIGNED_TRIGGER }),
                     |venue| async move {
-                        venue
-                            .place_protection(
-                                &symbol(),
-                                OrderSide::Sell,
-                                qty(quantity),
-                                px(ALIGNED_TRIGGER),
-                                "ins-1",
-                            )
-                            .await
-                            .map(|_| ())
+                        place_stop(venue, qty(quantity), px(ALIGNED_TRIGGER), "ins-1").await
                     },
                 )
                 .await,
@@ -303,16 +367,7 @@ async fn observe_all_rows() -> Vec<Value> {
                 "0.105",
                 json!({ "trigger": UNALIGNED_TRIGGER }),
                 |venue| async move {
-                    venue
-                        .place_protection(
-                            &symbol(),
-                            OrderSide::Sell,
-                            qty("0.105"),
-                            px(UNALIGNED_TRIGGER),
-                            "ins-2",
-                        )
-                        .await
-                        .map(|_| ())
+                    place_stop(venue, qty("0.105"), px(UNALIGNED_TRIGGER), "ins-2").await
                 },
             )
             .await,
@@ -327,12 +382,31 @@ fn fixture_rows(fixture: &str) -> Vec<Value> {
 }
 
 #[tokio::test]
-async fn order_kinds_on_the_wire_match_the_before_fixture() {
+async fn order_kinds_on_the_wire_match_the_after_fixture() {
     let observed = observe_all_rows().await;
-    let expected = fixture_rows(include_str!("testdata/adr0056_step6_before.json"));
+    let expected = fixture_rows(include_str!("testdata/adr0056_step6_after.json"));
 
     assert_eq!(observed.len(), expected.len());
     for (observed, expected) in observed.iter().zip(&expected) {
-        assert_eq!(observed, expected);
+        let mut expected = expected.clone();
+        expected.as_object_mut().unwrap().remove("why");
+        assert_eq!(observed, &expected);
+    }
+}
+
+/// Every number that moved says why; nothing that did not move claims to have.
+#[test]
+fn every_row_that_differs_from_the_old_code_says_why() {
+    let before = fixture_rows(include_str!("testdata/adr0056_step6_before.json"));
+    let after = fixture_rows(include_str!("testdata/adr0056_step6_after.json"));
+    assert_eq!(before.len(), after.len());
+
+    for (old, new) in before.iter().zip(&after) {
+        for key in ["kind", "rules", "qty", "extra"] {
+            assert_eq!(old[key], new[key], "the fixtures must describe the same input");
+        }
+        let changed = old["requests"] != new["requests"] || old["outcome"] != new["outcome"];
+        let why = new.get("why").and_then(Value::as_str).unwrap_or_default();
+        assert_eq!(changed, !why.is_empty(), "row {new}");
     }
 }

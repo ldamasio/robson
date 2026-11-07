@@ -25,7 +25,6 @@ use std::{
 };
 
 use chrono::Datelike;
-use robson_connectors::binance::usdm::normalize_market_quantity;
 use robson_domain::{
     latent_risk_per_unit_at_trigger, ClosureEvidence, DetectorSignal, EntryPolicy,
     EntryPolicyConfig, Event, MonthlyBudgetModel, Position, PositionId, PositionState, Price,
@@ -39,8 +38,8 @@ use robson_engine::{
 #[cfg(feature = "postgres")]
 use robson_eventlog::{append_event, ActorType as EventlogActorType, Event as EventlogEvent};
 use robson_exec::{
-    venue::VenueId, ActionResult, ExchangePort, ExchangePosition, ExecError, Executor, OhlcvPort,
-    StubOhlcv,
+    quantize, venue::VenueId, ActionResult, ExchangePort, ExchangePosition, ExecError, Executor,
+    OhlcvPort, StubOhlcv,
 };
 #[cfg(feature = "postgres")]
 use robson_projector::apply_event_to_projections;
@@ -184,6 +183,13 @@ pub struct PositionManager<E: ExchangePort + 'static, S: Store + 'static> {
     /// behind the software stop plan because a placement or re-placement
     /// failed (ADR-0039). Value: earliest instant the next attempt may run.
     insurance_stop_stale: Arc<RwLock<HashMap<PositionId, std::time::Instant>>>,
+    /// Active positions whose exit found nothing executable or was refused by
+    /// the venue (ADR-0056 §5). Value: earliest instant the next attempt
+    /// may run. Pruned with the active set.
+    exit_retry_after: Arc<RwLock<HashMap<PositionId, std::time::Instant>>>,
+    /// Metadata refreshes requested on the side, per symbol. At most one is in
+    /// flight per symbol; entries are pruned to the symbols of open positions.
+    rules_refresh_requests: Arc<std::sync::Mutex<HashMap<Symbol, RulesRefreshRequest>>>,
     /// How each position's technical stop was derived (method, confidence),
     /// taken from the `TechnicalStopAnalyzed` audit at signal time and
     /// re-read from the durable event log after a restart. Operator-facing
@@ -340,6 +346,19 @@ impl TechStopAuditSummary {
 /// a transient exchange error is not hammered at tick cadence.
 const INSURANCE_STOP_RETRY_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// How soon a leg tries its exit again after the venue refused it (ADR-0056
+/// §5). Without this a persistent refusal would cost requests at tick cadence.
+const EXIT_RULES_REJECTION_BACKOFF: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How soon a leg with nothing executable tries its exit or its stop again:
+/// each attempt costs requests, and only a change in the leg or the rules can
+/// help.
+const NOT_EXECUTABLE_BACKOFF: std::time::Duration = std::time::Duration::from_secs(5 * 60);
+
+/// Minimum spacing of the refresh requests made on the side per symbol. The
+/// adapter holds the ADR-0056 §10 ceiling; this only spares the spawns.
+const RULES_REFRESH_REQUEST_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 /// Pure throttle rule for audit-only monitor ticks (ADR-0049): drop the
 /// tick when one was emitted for the position less than `interval` ago.
 fn should_drop_monitor_tick(
@@ -397,6 +416,12 @@ pub(crate) struct MonthlyBudgetSnapshot {
     pub(crate) slots_active: u32,
     pub(crate) slots_hwm: u32,
     pub(crate) slots_nfs: u32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RulesRefreshRequest {
+    requested_at: std::time::Instant,
+    in_flight: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -957,6 +982,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             last_monitor_tick_at: Arc::new(RwLock::new(HashMap::new())),
             last_market_price: Arc::new(RwLock::new(HashMap::new())),
             insurance_stop_stale: Arc::new(RwLock::new(HashMap::new())),
+            exit_retry_after: Arc::new(RwLock::new(HashMap::new())),
+            rules_refresh_requests: Arc::new(std::sync::Mutex::new(HashMap::new())),
             tech_stop_audits: Arc::new(RwLock::new(HashMap::new())),
             entry_exhausted: Arc::new(RwLock::new(HashMap::new())),
             pending_approvals: Arc::new(RwLock::new(HashMap::new())),
@@ -1019,10 +1046,34 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         Arc::clone(&self.last_market_price)
     }
 
-    /// Cached symbol trading rules for a position whose stop policy needs
-    /// them (ADR-0052). Legacy positions derive without rules (zero
-    /// overhead on the historical path); for `ExecutableSpan` a fetch failure
-    /// returns `None` and the engine fails closed.
+    /// Fresh validated trading rules for admitting a position whose stop
+    /// policy needs them (ADR-0052, ADR-0056 §5). Legacy positions derive
+    /// without rules; for `ExecutableSpan` a stale or missing snapshot returns
+    /// `None` and the engine fails closed.
+    pub(crate) async fn trading_rules_for_admission(
+        &self,
+        position: &Position,
+    ) -> Option<robson_domain::SymbolTradingRules> {
+        if position.stop_policy != StopPolicy::ExecutableSpan {
+            return None;
+        }
+        match self.exchange().trading_rules_fresh(&position.symbol).await {
+            Ok(rules) => Some(rules),
+            Err(error) => {
+                warn!(
+                    position_id = %position.id,
+                    symbol = %position.symbol.as_pair(),
+                    %error,
+                    "Fresh trading rules unavailable for admission; engine will fail closed"
+                );
+                None
+            },
+        }
+    }
+
+    /// Trading rules for managing a position already admitted, whose stop
+    /// policy needs them (ADR-0052). Legacy positions derive without rules
+    /// (zero overhead on the historical path).
     pub(crate) async fn trading_rules_for(
         &self,
         position: &Position,
@@ -1030,18 +1081,79 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         if position.stop_policy != StopPolicy::ExecutableSpan {
             return None;
         }
-        match self.exchange().trading_rules(&position.symbol).await {
-            Ok(rules) => Some(rules),
-            Err(error) => {
-                warn!(
-                    position_id = %position.id,
-                    symbol = %position.symbol.as_pair(),
-                    %error,
-                    "Trading rules unavailable for ExecutableSpan position; engine will fail closed"
-                );
-                None
-            },
+        self.rules_for_managing(&position.symbol, position.rules_snapshot.as_ref())
+            .await
+    }
+
+    /// The newest rules held for `symbol` (ADR-0056 §5), asking for a refresh
+    /// on the side when they are past their TTL: holding rules never waits.
+    /// With nothing held this is the lookup itself, on whatever path it is
+    /// on, for at most [`quantize::METADATA_WAIT_BOUND`]. `None` means that
+    /// failed too, and an `ExecutableSpan` leg cannot derive its stop: the
+    /// engine fails closed.
+    pub(crate) async fn rules_for_managing(
+        &self,
+        symbol: &Symbol,
+        snapshot: Option<&SymbolTradingRules>,
+    ) -> Option<SymbolTradingRules> {
+        self.rules_for_managing_within(symbol, snapshot, quantize::METADATA_WAIT_BOUND)
+            .await
+    }
+
+    async fn rules_for_managing_within(
+        &self,
+        symbol: &Symbol,
+        snapshot: Option<&SymbolTradingRules>,
+        metadata_limit: std::time::Duration,
+    ) -> Option<SymbolTradingRules> {
+        let exchange = self.exchange();
+        let Some(held) = exchange.last_validated_rules(symbol).or_else(|| snapshot.cloned()) else {
+            return match quantize::bounded_metadata(metadata_limit, exchange.trading_rules(symbol))
+                .await
+            {
+                Ok(rules) => Some(rules),
+                Err(error) => {
+                    warn!(symbol = %symbol.as_pair(), %error, "Trading rules unavailable");
+                    None
+                },
+            };
+        };
+        if exchange.rules_refresh_due(symbol) {
+            self.request_rules_refresh(symbol);
         }
+        Some(held)
+    }
+
+    /// Refresh on the side so a refresh never delays the caller: at most one
+    /// per symbol in flight, spaced apart. The venue's own bound holds the
+    /// ADR-0056 §10 ceiling, a failure included.
+    fn request_rules_refresh(&self, symbol: &Symbol) {
+        {
+            let mut requests =
+                self.rules_refresh_requests.lock().unwrap_or_else(|e| e.into_inner());
+            let now = std::time::Instant::now();
+            if requests.get(symbol).is_some_and(|request| {
+                request.in_flight
+                    || now.duration_since(request.requested_at) < RULES_REFRESH_REQUEST_INTERVAL
+            }) {
+                return;
+            }
+            requests
+                .insert(symbol.clone(), RulesRefreshRequest { requested_at: now, in_flight: true });
+        }
+        let exchange = self.exchange();
+        let requests = Arc::clone(&self.rules_refresh_requests);
+        let symbol = symbol.clone();
+        tokio::spawn(async move {
+            if let Err(error) = exchange.trading_rules(&symbol).await {
+                warn!(symbol = %symbol.as_pair(), %error, "Trading-rules refresh failed");
+            }
+            if let Some(request) =
+                requests.lock().unwrap_or_else(|e| e.into_inner()).get_mut(&symbol)
+            {
+                request.in_flight = false;
+            }
+        });
     }
 
     /// Configure eventlog persistence for domain events (MIG-v2.5#2).
@@ -1260,6 +1372,17 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         "Exchange insurance stop is behind the software stop plan; re-placement scheduled (ADR-0039)"
                     );
                 },
+                // Later in its batch than its `InsuranceStopFailed`, when it has one:
+                // this window is the one that holds.
+                ActionResult::ProtectionNotExecutable { position_id } => {
+                    stale.insert(*position_id, std::time::Instant::now() + NOT_EXECUTABLE_BACKOFF);
+                    changed = true;
+                    warn!(
+                        %position_id,
+                        retry_in_secs = NOT_EXECUTABLE_BACKOFF.as_secs(),
+                        "Exchange insurance stop has nothing executable; retrying on the long window (ADR-0056 §5)"
+                    );
+                },
                 ActionResult::OrderPlaced {
                     event:
                         Some(
@@ -1281,9 +1404,21 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
     }
 
-    /// Forget stale-insurance bookkeeping for positions that are no longer
-    /// Active (closed, errored, reconciled away).
+    /// Forget stale-insurance and exit-retry bookkeeping for positions that
+    /// are no longer Active (closed, errored, reconciled away).
     async fn prune_insurance_stop_stale(&self, active: &[Position]) {
+        {
+            let mut requests =
+                self.rules_refresh_requests.lock().unwrap_or_else(|e| e.into_inner());
+            if !requests.is_empty() {
+                let symbols: HashSet<&Symbol> = active.iter().map(|p| &p.symbol).collect();
+                requests.retain(|symbol, request| request.in_flight || symbols.contains(symbol));
+            }
+        }
+        if !self.exit_retry_after.read().await.is_empty() {
+            let active_ids: HashSet<PositionId> = active.iter().map(|p| p.id).collect();
+            self.exit_retry_after.write().await.retain(|id, _| active_ids.contains(id));
+        }
         if self.insurance_stop_stale.read().await.is_empty() {
             return;
         }
@@ -1293,6 +1428,20 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         stale.retain(|id, _| active_ids.contains(id));
         if stale.len() != before {
             crate::metrics::INSURANCE_STOP_STALE_POSITIONS.set(stale.len() as f64);
+        }
+    }
+
+    /// True while a leg waits out an exit retry window (ADR-0056 §5). The
+    /// engine is consulted again afterwards.
+    async fn exit_retry_pending(&self, position_id: PositionId) -> bool {
+        let retry_at = self.exit_retry_after.read().await.get(&position_id).copied();
+        match retry_at {
+            Some(retry_at) if std::time::Instant::now() < retry_at => true,
+            Some(_) => {
+                self.exit_retry_after.write().await.remove(&position_id);
+                false
+            },
+            None => false,
         }
     }
 
@@ -1434,6 +1583,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             },
             ActionResult::OrderFailed { event, .. } => self.persist_event_to_log(event).await,
             ActionResult::EntryExecutionRejected { event, .. } => {
+                self.persist_event_to_log(event).await
+            },
+            ActionResult::ExitNotExecutable { event: Some(event), .. } => {
                 self.persist_event_to_log(event).await
             },
             _ => Ok(()),
@@ -2200,6 +2352,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     self.record_query_failure(query).await?;
                     return Err(DaemonError::Exec(ExecError::InvalidState(error)));
                 },
+                ActionResult::ExitNotExecutable { .. } => {
+                    warn!(%position_id, "Unexpected exit outcome in an entry flow");
+                },
+                ActionResult::ProtectionNotExecutable { .. } => {},
                 ActionResult::AlreadyProcessed(id) => {
                     warn!(%position_id, %id, "Signal already processed (idempotent skip)");
                 },
@@ -2260,13 +2416,18 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         })
     }
 
-    fn validate_entry_quantity_for_exchange(
+    /// The admission check before any exchange submission (ADR-0056 §5): fresh
+    /// validated metadata, then lot bounds and minimum notional. Unavailable
+    /// metadata refuses the entry, under every stop policy.
+    async fn validate_entry_quantity_for_exchange(
+        &self,
         symbol: &Symbol,
         proposed: &ProposedTrade,
     ) -> Result<(), ExecError> {
         let quantity = Quantity::new(proposed.quantity)
             .map_err(|e| ExecError::Config(format!("Invalid proposed quantity: {}", e)))?;
-        normalize_market_quantity(symbol, quantity).map(|_| ())
+        let rules = self.exchange().trading_rules_fresh(symbol).await?;
+        quantize::admission_quantity(&rules, quantity, proposed.entry_price).map(|_| ())
     }
 
     /// Start background task to listen for detector signals.
@@ -3203,9 +3364,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             },
         };
 
-        // Runtime trading rules for the plan (issue #154): fetched from the
-        // adapter's TTL cache only when the position's policy needs them.
-        let trading_rules = self.trading_rules_for(&position).await;
+        // Runtime trading rules for the plan (issue #154): fresh validated
+        // metadata only (ADR-0056 §5), and only when the position's policy needs
+        // them.
+        let trading_rules = self.trading_rules_for_admission(&position).await;
 
         // Use engine to decide entry (pure: State+Signal → Decision)
         let decision = {
@@ -3286,7 +3448,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             },
         };
 
-        if let Err(error) = Self::validate_entry_quantity_for_exchange(&signal.symbol, &proposed) {
+        if let Err(error) =
+            self.validate_entry_quantity_for_exchange(&signal.symbol, &proposed).await
+        {
             let error_message = error.to_string();
             query.fail(error_message.clone(), "processing".to_string());
             self.record_query_failure(&query).await?;
@@ -3550,8 +3714,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         }
 
         let risk_context = self.build_risk_context().await?;
-        if let Err(error) =
-            Self::validate_entry_quantity_for_exchange(&current_position.symbol, &record.proposed)
+        if let Err(error) = self
+            .validate_entry_quantity_for_exchange(&current_position.symbol, &record.proposed)
+            .await
         {
             let error_message = error.to_string();
             record.query.fail(error_message.clone(), "awaiting_approval".to_string());
@@ -3737,13 +3902,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     /// → Projection.apply(Event) (async)
     /// ```
     /// True when an execution error is the exchange refusing a reduce-only
-    /// order because there is no position left to reduce (Binance -2022).
-    /// The daemon surfaces it either as `ExecError::Exchange` (prod shape,
-    /// 2026-08-02 incident) or `ExecError::OrderRejected`, so classification
-    /// is by message.
+    /// order (Binance -2022). Whether nothing is left to reduce takes an
+    /// account observation.
     fn is_reduce_only_rejection(error: &DaemonError) -> bool {
-        let message = error.to_string().to_lowercase();
-        message.contains("-2022") || (message.contains("reduceonly") && message.contains("reject"))
+        matches!(error, DaemonError::Exec(ExecError::ReduceOnlyRejected(_)))
     }
 
     /// True when the exchange no longer reports an open position matching
@@ -3868,6 +4030,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             if !matches!(position.state, PositionState::Active { .. }) {
                 continue;
             }
+            if self.exit_retry_pending(position.id).await {
+                continue;
+            }
 
             // Create one ExecutionQuery PER POSITION processed
             let mut query = ExecutionQuery::new(
@@ -3933,8 +4098,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             }
 
             // Use engine to process (pure: State+Tick → Decision). Trading
-            // rules come from the adapter's TTL cache (issue #154): no
-            // exchange call on the tick path; legacy positions skip the
+            // rules are what is already held (ADR-0056 §5): no exchange call
+            // on the tick path unless nothing is; legacy positions skip the
             // lookup entirely.
             let trading_rules = self.trading_rules_for(&position).await;
             let symbol_clone = data.symbol.clone();
@@ -4041,6 +4206,26 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                         self.record_query_transition(&query, "completed").await?;
                         continue;
                     }
+                    // The venue refused this exit: on its rules after one refresh
+                    // and resubmission, or as reduce-only with the account not flat.
+                    // The leg tries again after a window, not at tick cadence.
+                    if matches!(
+                        e,
+                        DaemonError::Exec(
+                            ExecError::RulesRejected(_) | ExecError::ReduceOnlyRejected(_)
+                        )
+                    ) {
+                        warn!(
+                            position_id = %position.id,
+                            error = %e,
+                            retry_in_secs = EXIT_RULES_REJECTION_BACKOFF.as_secs(),
+                            "Exit refused by the venue; retrying after a window (ADR-0056 §5)"
+                        );
+                        self.exit_retry_after.write().await.insert(
+                            position.id,
+                            std::time::Instant::now() + EXIT_RULES_REJECTION_BACKOFF,
+                        );
+                    }
                     let err_str = format!("{}", e);
                     query.fail(err_str.clone(), "acting".to_string());
                     self.record_query_failure(&query).await?;
@@ -4052,6 +4237,18 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             // actions_count represents ALL ActionResult variants
             let actions_count = results.len();
             for result in results {
+                if let ActionResult::ExitNotExecutable { residual, .. } = &result {
+                    warn!(
+                        position_id = %position.id,
+                        %residual,
+                        retry_in_secs = NOT_EXECUTABLE_BACKOFF.as_secs(),
+                        "Exit has nothing executable; the leg stays Active"
+                    );
+                    self.exit_retry_after
+                        .write()
+                        .await
+                        .insert(position.id, std::time::Instant::now() + NOT_EXECUTABLE_BACKOFF);
+                }
                 if let ActionResult::OrderPlaced {
                     order,
                     event: Some(Event::ExitOrderPlaced { .. }),
@@ -4559,6 +4756,17 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             }])
             .await?;
 
+        // The leg rounds below the lot minimum: no order went out and the residual
+        // is on record.
+        if let Some(residual) = results.iter().find_map(|r| match r {
+            ActionResult::ExitNotExecutable { residual, .. } => Some(*residual),
+            _ => None,
+        }) {
+            return Err(DaemonError::Exec(ExecError::OrderRejected(format!(
+                "Panic close: {residual} rounds below the lot minimum; nothing can be submitted"
+            ))));
+        }
+
         // Extract actual fill details from exchange result
         let (fill_price, exit_fee, filled_at) = match results.into_iter().find_map(|r| {
             if let ActionResult::OrderPlaced { order, .. } = r {
@@ -4740,26 +4948,26 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         &self,
         positions: &[Position],
     ) -> HashMap<Symbol, SymbolTradingRules> {
-        let symbols: HashSet<Symbol> = positions
-            .iter()
-            .filter(|position| {
-                position.stop_policy == StopPolicy::ExecutableSpan
-                    && matches!(&position.state, PositionState::Active { .. })
-            })
-            .map(|position| position.symbol.clone())
-            .collect();
-        let exchange = self.exchange();
+        let mut symbols: HashMap<Symbol, Option<&SymbolTradingRules>> = HashMap::new();
+        for position in positions.iter().filter(|position| {
+            position.stop_policy == StopPolicy::ExecutableSpan
+                && matches!(&position.state, PositionState::Active { .. })
+        }) {
+            let snapshot = symbols.entry(position.symbol.clone()).or_default();
+            *snapshot = snapshot.or(position.rules_snapshot.as_ref());
+        }
         let mut rules_by_symbol = HashMap::with_capacity(symbols.len());
 
-        for symbol in symbols {
-            match exchange.trading_rules(&symbol).await {
-                Ok(rules) => {
+        // What is held: this runs on the tick path (ADR-0056 §5). Admission checks
+        // its own symbol against fresh metadata before it gets here.
+        for (symbol, snapshot) in symbols {
+            match self.rules_for_managing(&symbol, snapshot).await {
+                Some(rules) => {
                     rules_by_symbol.insert(symbol, rules);
                 },
-                Err(error) => {
+                None => {
                     warn!(
                         symbol = %symbol.as_pair(),
-                        %error,
                         "Trading rules unavailable for ExecutableSpan positions; canonical latent-risk pricing will fail closed for this symbol"
                     );
                 },
@@ -6333,6 +6541,723 @@ mod tests {
         assert_eq!(observed, expected);
     }
 
+    // ---- ADR-0056 §5: the two rules -------------------------------------------
+
+    /// Rules of the lot grid `step` on the test symbol, permissive elsewhere.
+    fn lot_rules(step: Decimal) -> SymbolTradingRules {
+        SymbolTradingRules::new(
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            dec!(0.01),
+            Decimal::ZERO,
+            step,
+            step,
+            dec!(1000000),
+            Decimal::ZERO,
+            2,
+            6,
+        )
+        .unwrap()
+    }
+
+    /// A due or hanging metadata fetch must not hold up the exit.
+    #[tokio::test]
+    async fn risk_reduction_does_not_wait_for_metadata() {
+        let manager = create_test_manager().await;
+        let (mut position, stop_id) = active_leg_with_live_stop(&manager).await;
+        position.stop_policy = StopPolicy::ExecutableSpan;
+        position.executable_span = Some(dec!(10));
+        position.cap_basis_distance = Some(dec!(10));
+        position.stop_plan_entry_reference = Some(Price::new(dec!(100)).unwrap());
+        position.stop_buffer_bps_at_arm = Some(Decimal::ZERO);
+        manager.store.positions().save(&position).await.unwrap();
+        let exchange = manager.exchange();
+        exchange.set_rules_fetch_hangs(true);
+        exchange.set_rules_refresh_due(true);
+
+        let tick = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stop_crossing_tick(&manager, &position),
+        )
+        .await
+        .expect("the tick must not wait for a metadata fetch");
+        assert!(tick.is_ok(), "{tick:?}");
+
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(leg.state, PositionState::Closed { .. }), "{:?}", leg.state);
+        assert!(!exchange.has_stop_order(&stop_id));
+    }
+
+    /// After a restart: nothing cached, the venue's metadata unreachable, only
+    /// the leg's persisted snapshot. The exit still rounds by it and goes out.
+    #[tokio::test]
+    async fn risk_reduction_runs_on_the_persisted_snapshot_alone() {
+        let manager = create_test_manager().await;
+        let (mut position, _) = active_leg_with_live_stop(&manager).await;
+        position.stop_policy = StopPolicy::ExecutableSpan;
+        position.executable_span = Some(dec!(10));
+        position.cap_basis_distance = Some(dec!(10));
+        position.stop_plan_entry_reference = Some(Price::new(dec!(100)).unwrap());
+        position.stop_buffer_bps_at_arm = Some(Decimal::ZERO);
+        position.rules_snapshot = Some(lot_rules(dec!(0.001)));
+        manager.store.positions().save(&position).await.unwrap();
+        let exchange = manager.exchange();
+        exchange.clear_cached_rules();
+        exchange.set_rules_fetch_hangs(true);
+
+        let tick = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            stop_crossing_tick(&manager, &position),
+        )
+        .await
+        .expect("a persisted snapshot means there is nothing to wait for");
+        assert!(tick.is_ok(), "{tick:?}");
+
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(leg.state, PositionState::Closed { .. }), "{:?}", leg.state);
+        assert_eq!(exchange.rules_refresh_call_count(), 0);
+    }
+
+    /// A TTL refresh that is due happens on the side, bounded.
+    #[tokio::test]
+    async fn a_due_refresh_is_requested_on_the_side_and_bounded() {
+        let manager = create_test_manager().await;
+        let exchange = manager.exchange();
+        exchange.set_rules_refresh_due(true);
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let calls_before = exchange.trading_rules_call_count("BTCUSDT");
+
+        for _ in 0..5 {
+            assert!(manager.rules_for_managing(&symbol, None).await.is_some());
+        }
+        for _ in 0..50 {
+            if exchange.trading_rules_call_count("BTCUSDT") > calls_before {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(exchange.trading_rules_call_count("BTCUSDT"), calls_before + 1);
+    }
+
+    /// Admission needs fresh metadata even while stale rules still serve risk
+    /// reduction, and it stops before anything reaches the venue.
+    #[tokio::test]
+    async fn admission_fails_closed_without_fresh_metadata() {
+        let manager = create_test_manager().await;
+        let exchange = manager.exchange();
+        exchange.set_fresh_rules_unavailable(true);
+
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let proposed = ProposedTrade {
+            symbol: symbol.as_pair(),
+            side: "long".to_string(),
+            quantity: dec!(0.01),
+            entry_price: dec!(95000),
+            notional_value: dec!(950),
+            initial_margin: dec!(950),
+            planned_risk: dec!(10),
+        };
+        assert!(manager.validate_entry_quantity_for_exchange(&symbol, &proposed).await.is_err());
+        let position = Position::new_with_stop_policy(
+            Uuid::now_v7(),
+            symbol.clone(),
+            Side::Long,
+            StopPolicy::ExecutableSpan,
+            Some(Decimal::ZERO),
+        );
+        assert!(manager.trading_rules_for_admission(&position).await.is_none());
+        assert!(manager.trading_rules_for(&position).await.is_some(), "stale still serves");
+        assert_eq!(exchange.market_order_call_count(), 0);
+
+        exchange.set_fresh_rules_unavailable(false);
+        assert!(manager.validate_entry_quantity_for_exchange(&symbol, &proposed).await.is_ok());
+    }
+
+    #[tokio::test]
+    async fn admission_applies_max_quantity_and_minimum_notional() {
+        let manager = create_test_manager().await;
+        let exchange = manager.exchange();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        exchange.set_trading_rules(
+            SymbolTradingRules::new(
+                symbol.clone(),
+                dec!(0.10),
+                dec!(556.80),
+                dec!(0.001),
+                dec!(0.001),
+                dec!(120),
+                dec!(50),
+                2,
+                3,
+            )
+            .unwrap(),
+        );
+        let trade = |quantity: Decimal, entry_price: Decimal| ProposedTrade {
+            symbol: symbol.as_pair(),
+            side: "long".to_string(),
+            quantity,
+            entry_price,
+            notional_value: quantity * entry_price,
+            initial_margin: quantity * entry_price,
+            planned_risk: dec!(10),
+        };
+        for (quantity, price, accepted) in [
+            (dec!(0.001), dec!(77500), true),
+            (dec!(0.001), dec!(30000), false), // notional 30 under 50
+            (dec!(120), dec!(77500), true),
+            (dec!(120.001), dec!(77500), false), // MARKET_LOT_SIZE maximum
+            (dec!(0.0005), dec!(77500), false),  // lot minimum
+        ] {
+            let result = manager
+                .validate_entry_quantity_for_exchange(&symbol, &trade(quantity, price))
+                .await;
+            assert_eq!(result.is_ok(), accepted, "{quantity} at {price}: {result:?}");
+        }
+    }
+
+    /// The venue refuses the exit on its rules, also after the refresh. The leg
+    /// stays Active with nothing recorded as closed, and the next ticks do not
+    /// hit the venue until the retry window ends.
+    #[tokio::test]
+    async fn a_failed_resubmit_does_not_loop() {
+        let manager = create_test_manager().await;
+        let (position, stop_id) = active_leg_with_live_stop(&manager).await;
+        let exchange = manager.exchange();
+        exchange.set_rules_rejections_next(100);
+
+        let error = stop_crossing_tick(&manager, &position).await.unwrap_err();
+        assert!(matches!(error, DaemonError::Exec(ExecError::RulesRejected(_))), "{error:?}");
+
+        assert_eq!(exchange.market_order_call_count(), 2, "one resubmission");
+        assert_eq!(exchange.rules_refresh_call_count(), 1, "one refresh");
+        assert!(
+            !exchange.has_stop_order(&stop_id),
+            "cancel-first: the stop went before the exit"
+        );
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(leg.state, PositionState::Active { .. }));
+        assert_eq!(leg.insurance_stop_id, None);
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert!(events.iter().any(|e| matches!(e, Event::InsuranceStopCancelled { .. })));
+        assert!(events
+            .iter()
+            .all(|e| !matches!(e, Event::ExitOrderPlaced { .. } | Event::PositionClosed { .. })));
+
+        // The retry window: more ticks, no more requests.
+        for _ in 0..3 {
+            assert!(stop_crossing_tick(&manager, &position).await.is_ok());
+        }
+        assert_eq!(exchange.market_order_call_count(), 2);
+        assert_eq!(exchange.rules_refresh_call_count(), 1);
+
+        // When the window ends the leg tries again, and the venue may accept.
+        manager.exit_retry_after.write().await.clear();
+        exchange.set_rules_rejections_next(0);
+        assert!(stop_crossing_tick(&manager, &position).await.is_ok());
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(leg.state, PositionState::Closed { .. }), "{:?}", leg.state);
+    }
+
+    /// The whole leg rounds below the lot: nothing executed, the residual on
+    /// record, the long window. The stop its batch took cannot come back while
+    /// the leg stays there: that is the accepted limit of cancel-first.
+    #[tokio::test]
+    async fn an_unexecutable_leg_stays_active_with_a_recorded_residual() {
+        let manager = create_test_manager().await;
+        let (mut position, _) = active_leg_with_live_stop(&manager).await;
+        position.quantity = Quantity::new(dec!(0.0005)).unwrap();
+        manager.store.positions().save(&position).await.unwrap();
+        let exchange = manager.exchange();
+        exchange.set_trading_rules(lot_rules(dec!(0.001)));
+        exchange.set_venue_rules(lot_rules(dec!(0.001)));
+        let orders = exchange.market_order_call_count();
+
+        assert!(stop_crossing_tick(&manager, &position).await.is_ok());
+
+        assert_eq!(exchange.market_order_call_count() - orders, 1, "submitted raw, refused");
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(leg.state, PositionState::Active { .. }), "{:?}", leg.state);
+        assert_eq!(leg.residual_quantity, Some(dec!(0.0005)));
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert!(events
+            .iter()
+            .all(|e| !matches!(e, Event::ExitOrderPlaced { .. } | Event::PositionClosed { .. })));
+
+        // Five minutes, not thirty seconds.
+        let retry_at = manager.exit_retry_after.read().await[&position.id];
+        let wait = retry_at.saturating_duration_since(std::time::Instant::now());
+        assert!(wait > EXIT_RULES_REJECTION_BACKOFF, "{wait:?}");
+        let orders = exchange.market_order_call_count();
+        for _ in 0..3 {
+            assert!(stop_crossing_tick(&manager, &position).await.is_ok());
+        }
+        assert_eq!(exchange.market_order_call_count(), orders);
+    }
+
+    /// A rounded replacement: the residual is on record once and later stops do
+    /// not clear it, not even one covering the whole leg. A failed cancel of
+    /// the predecessor changes none of that.
+    #[tokio::test]
+    async fn a_residual_outlives_later_stops() {
+        let manager = create_test_manager().await;
+        let (mut position, stop_id) = active_leg_with_live_stop(&manager).await;
+        position.quantity = Quantity::new(dec!(0.105)).unwrap();
+        manager.store.positions().save(&position).await.unwrap();
+        let exchange = manager.exchange();
+        exchange.set_trading_rules(lot_rules(dec!(0.01)));
+        let replace = |previous: String| EngineAction::ReplaceInsuranceStop {
+            position_id: position.id,
+            symbol: position.symbol.clone(),
+            side: position.side.exit_action(),
+            quantity: position.quantity,
+            previous_order_id: previous,
+            new_stop_price: Price::new(dec!(90)).unwrap(),
+        };
+        let residuals = |events: &[Event]| {
+            events
+                .iter()
+                .filter(|e| matches!(e, Event::ResidualInventoryRecorded { .. }))
+                .count()
+        };
+
+        exchange.set_cancel_fails_next(true);
+        manager.execute_and_persist(vec![replace(stop_id)]).await.unwrap();
+
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert_eq!(leg.residual_quantity, Some(dec!(0.005)));
+        assert_eq!(leg.quantity.as_decimal(), dec!(0.105));
+        assert!(matches!(leg.state, PositionState::Active { .. }));
+
+        // The next stop is short by the same amount: nothing new on the log.
+        let current = leg.insurance_stop_id.clone().unwrap();
+        manager.execute_and_persist(vec![replace(current)]).await.unwrap();
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert_eq!(residuals(&events), 1);
+
+        // A stop for the whole leg does not clear it.
+        exchange.set_trading_rules(lot_rules(dec!(0.001)));
+        let current = manager
+            .get_position(position.id)
+            .await
+            .unwrap()
+            .unwrap()
+            .insurance_stop_id
+            .unwrap();
+        manager.execute_and_persist(vec![replace(current)]).await.unwrap();
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert_eq!(leg.residual_quantity, Some(dec!(0.005)));
+    }
+
+    /// A residual is priced nowhere, whichever way the leg's risk is priced.
+    #[tokio::test]
+    async fn a_residual_stays_out_of_the_budget_under_either_stop_policy() {
+        for executable_span in [false, true] {
+            let manager = create_test_manager().await;
+            let (mut position, _) = active_leg_with_live_stop(&manager).await;
+            if executable_span {
+                position.stop_policy = StopPolicy::ExecutableSpan;
+                position.executable_span = Some(dec!(10));
+                position.cap_basis_distance = Some(dec!(10));
+                position.stop_plan_entry_reference = Some(Price::new(dec!(100)).unwrap());
+                position.stop_buffer_bps_at_arm = Some(Decimal::ZERO);
+            }
+            manager.store.positions().save(&position).await.unwrap();
+            let (before, _, _, failures) = manager
+                .canonical_budget_snapshot_with_positions(chrono::Utc::now())
+                .await
+                .unwrap();
+            assert!(failures.is_empty(), "{failures:?}");
+            assert!(before.latent_risk > Decimal::ZERO, "the leg must carry some risk");
+
+            position.residual_quantity = Some(dec!(0.5));
+            position.residual_unknown = true;
+            manager.store.positions().save(&position).await.unwrap();
+            let (after, _, resolved, failures) = manager
+                .canonical_budget_snapshot_with_positions(chrono::Utc::now())
+                .await
+                .unwrap();
+
+            assert!(failures.is_empty(), "{failures:?}");
+            assert!(!after.latent_risk_invalid);
+            assert_eq!(after.latent_risk, before.latent_risk);
+            assert_eq!(resolved[&position.id].risk, before.latent_risk);
+            assert_eq!(after.remaining_active, before.remaining_active);
+            assert_eq!(after.slots_active, before.slots_active);
+        }
+    }
+
+    #[tokio::test]
+    async fn panic_close_of_an_unexecutable_leg_reports_it_and_keeps_the_leg_active() {
+        let manager = create_test_manager().await;
+        let (mut position, _) = active_leg_with_live_stop(&manager).await;
+        position.quantity = Quantity::new(dec!(0.0005)).unwrap();
+        manager.store.positions().save(&position).await.unwrap();
+        manager.exchange().set_trading_rules(lot_rules(dec!(0.001)));
+        manager.exchange().set_venue_rules(lot_rules(dec!(0.001)));
+
+        let error = manager.close_position(position.id).await.unwrap_err();
+        assert!(error.to_string().contains("below the lot minimum"), "{error}");
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(leg.state, PositionState::Active { .. }));
+    }
+
+    /// Nothing held and the lookup fails: a decided exit still goes out as
+    /// given.
+    #[tokio::test]
+    async fn a_close_with_no_rules_to_be_had_goes_out_raw() {
+        let manager = create_test_manager().await;
+        let (mut position, _) = active_leg_with_live_stop(&manager).await;
+        position.quantity = Quantity::new(dec!(0.1055)).unwrap();
+        manager.store.positions().save(&position).await.unwrap();
+        manager.exchange().clear_cached_rules();
+
+        manager.close_position(position.id).await.unwrap();
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(leg.state, PositionState::Closed { .. }), "{:?}", leg.state);
+    }
+
+    /// An `ExecutableSpan` leg with no snapshot and an empty cache.
+    async fn leg_with_nothing_held(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+    ) -> Position {
+        let (mut position, _) = active_leg_with_live_stop(manager).await;
+        position.stop_policy = StopPolicy::ExecutableSpan;
+        position.executable_span = Some(dec!(10));
+        position.cap_basis_distance = Some(dec!(10));
+        position.stop_plan_entry_reference = Some(Price::new(dec!(100)).unwrap());
+        position.stop_buffer_bps_at_arm = Some(Decimal::ZERO);
+        manager.store.positions().save(&position).await.unwrap();
+        manager.exchange().clear_cached_rules();
+        position
+    }
+
+    /// The lookup a leg with nothing held does is bounded end to end: a hung
+    /// one is a failed one. The tick and the budget snapshot both come
+    /// through here.
+    #[tokio::test]
+    async fn a_hung_lookup_for_a_leg_with_nothing_held_runs_out_of_time() {
+        let manager = create_test_manager().await;
+        let exchange = manager.exchange();
+        exchange.clear_cached_rules();
+        exchange.set_rules_fetch_hangs(true);
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+
+        let rules = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            manager.rules_for_managing_within(&symbol, None, std::time::Duration::from_millis(10)),
+        )
+        .await
+        .expect("the bound must hold");
+
+        assert!(rules.is_none());
+    }
+
+    /// Nothing held: the tick looks the rules up on the way and acts on the
+    /// crossing it was given. No tick is discarded on the assumption of an
+    /// exchange stop that may not be there.
+    #[tokio::test]
+    async fn a_leg_with_nothing_held_looks_the_rules_up_and_exits_on_the_crossing_tick() {
+        let manager = create_test_manager().await;
+        let position = leg_with_nothing_held(&manager).await;
+        let exchange = manager.exchange();
+        exchange.set_venue_rules(lot_rules(dec!(0.001)));
+        let lookups = exchange.trading_rules_call_count("BTCUSDT");
+
+        assert!(stop_crossing_tick(&manager, &position).await.is_ok());
+
+        assert!(exchange.trading_rules_call_count("BTCUSDT") > lookups);
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(leg.state, PositionState::Closed { .. }), "{:?}", leg.state);
+    }
+
+    /// The lookup fails too: the engine cannot derive this leg's stop and fails
+    /// closed, loudly, as it always has. The next crossing tick tries again.
+    #[tokio::test]
+    async fn a_leg_with_no_rules_to_be_had_fails_the_tick_and_tries_again() {
+        let manager = create_test_manager().await;
+        let position = leg_with_nothing_held(&manager).await;
+        let exchange = manager.exchange();
+
+        let error = stop_crossing_tick(&manager, &position).await.unwrap_err();
+        assert!(error.to_string().contains("trading rules"), "{error}");
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(leg.state, PositionState::Active { .. }), "{:?}", leg.state);
+
+        exchange.set_venue_rules(lot_rules(dec!(0.001)));
+        assert!(stop_crossing_tick(&manager, &position).await.is_ok());
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert!(matches!(leg.state, PositionState::Closed { .. }), "{:?}", leg.state);
+    }
+
+    /// At most one refresh in flight per symbol, whatever the spacing allows,
+    /// and bookkeeping only for symbols still open.
+    #[tokio::test]
+    async fn refreshes_on_the_side_are_one_per_symbol_and_pruned() {
+        let manager = create_test_manager().await;
+        let exchange = manager.exchange();
+        exchange.set_rules_refresh_due(true);
+        exchange.set_rules_fetch_hangs(true);
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+
+        assert!(manager.rules_for_managing(&symbol, None).await.is_some());
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(exchange.trading_rules_call_count("BTCUSDT"), 1);
+
+        // The spacing has passed; the first one is still in flight.
+        {
+            let mut requests = manager.rules_refresh_requests.lock().unwrap();
+            let request = requests.get_mut(&symbol).unwrap();
+            request.requested_at = std::time::Instant::now()
+                .checked_sub(RULES_REFRESH_REQUEST_INTERVAL * 2)
+                .unwrap();
+        }
+        assert!(manager.rules_for_managing(&symbol, None).await.is_some());
+        for _ in 0..50 {
+            tokio::task::yield_now().await;
+        }
+        assert_eq!(exchange.trading_rules_call_count("BTCUSDT"), 1, "one in flight");
+
+        // Pruned to open symbols, an in-flight entry excepted.
+        let other = Symbol::from_pair("ETHUSDT").unwrap();
+        manager
+            .rules_refresh_requests
+            .lock()
+            .unwrap()
+            .insert(other.clone(), RulesRefreshRequest {
+                requested_at: std::time::Instant::now(),
+                in_flight: false,
+            });
+        manager
+            .exit_retry_after
+            .write()
+            .await
+            .insert(Uuid::now_v7(), std::time::Instant::now());
+        manager.prune_insurance_stop_stale(&[]).await;
+        assert!(manager.exit_retry_after.read().await.is_empty(), "bounded by the open legs");
+        let requests = manager.rules_refresh_requests.lock().unwrap();
+        assert!(!requests.contains_key(&other));
+        assert!(requests.contains_key(&symbol));
+    }
+
+    /// A stop that cannot be replaced on the venue's rules stays where it is.
+    #[tokio::test]
+    async fn a_refused_stop_replacement_keeps_the_old_stop_and_refreshes_once() {
+        let manager = create_test_manager().await;
+        let (position, stop_id) = active_leg_with_live_stop(&manager).await;
+        let exchange = manager.exchange();
+        let calls_before = exchange.protection_call_count();
+        exchange.set_rules_rejections_next(100);
+
+        let results = manager
+            .execute_and_persist(vec![EngineAction::ReplaceInsuranceStop {
+                position_id: position.id,
+                symbol: position.symbol.clone(),
+                side: position.side.exit_action(),
+                quantity: position.quantity,
+                previous_order_id: stop_id.clone(),
+                new_stop_price: Price::new(dec!(95)).unwrap(),
+            }])
+            .await
+            .unwrap();
+
+        assert_eq!(exchange.protection_call_count() - calls_before, 2);
+        assert_eq!(exchange.rules_refresh_call_count(), 1);
+        assert!(exchange.has_stop_order(&stop_id), "the old stop stays until a successor exists");
+        assert!(results
+            .iter()
+            .any(|r| matches!(r, ActionResult::EventEmitted(Event::InsuranceStopFailed { .. }))));
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert_eq!(leg.insurance_stop_id.as_deref(), Some(stop_id.as_str()));
+        // The existing heal path owns the next attempt, 30 s out.
+        assert!(manager.insurance_stop_stale.read().await.contains_key(&position.id));
+    }
+
+    /// How long until this leg's next stop attempt.
+    async fn stop_retry_in(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        position_id: PositionId,
+    ) -> std::time::Duration {
+        let retry_at = manager.insurance_stop_stale.read().await[&position_id];
+        retry_at.saturating_duration_since(std::time::Instant::now())
+    }
+
+    /// Run the heal path now, with its window already due.
+    async fn retry_stop_now(
+        manager: &Arc<PositionManager<StubExchange, MemoryStore>>,
+        position_id: PositionId,
+    ) {
+        manager
+            .insurance_stop_stale
+            .write()
+            .await
+            .insert(position_id, std::time::Instant::now());
+        let leg = manager.get_position(position_id).await.unwrap().unwrap();
+        assert!(manager.retry_stale_insurance_stop(&leg).await);
+    }
+
+    async fn below_lot_leg(manager: &Arc<PositionManager<StubExchange, MemoryStore>>) -> Position {
+        let mut position =
+            save_active_position(manager, "BTCUSDT", Side::Long, dec!(100), dec!(0.0005)).await;
+        position.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(
+            Price::new(dec!(100)).unwrap(),
+            Price::new(dec!(90)).unwrap(),
+        ));
+        manager.store.positions().save(&position).await.unwrap();
+        let exchange = manager.exchange();
+        exchange.set_trading_rules(lot_rules(dec!(0.001)));
+        exchange.set_venue_rules(lot_rules(dec!(0.001)));
+        position
+    }
+
+    /// A stop below the lot minimum stays there until the leg or the rules
+    /// change: the long window, and nothing new on the log after the first
+    /// attempt, whatever retries it.
+    #[tokio::test]
+    async fn a_stop_below_the_lot_retries_on_the_long_window_and_writes_once() {
+        let manager = create_test_manager().await;
+        let position = below_lot_leg(&manager).await;
+        let exchange = manager.exchange();
+
+        let first = manager
+            .execute_and_persist(vec![EngineAction::PlaceInsuranceStop {
+                position_id: position.id,
+                symbol: position.symbol.clone(),
+                side: position.side.exit_action(),
+                quantity: position.quantity,
+                stop_price: Price::new(dec!(90)).unwrap(),
+            }])
+            .await
+            .unwrap();
+        assert!(first
+            .iter()
+            .any(|r| matches!(r, ActionResult::EventEmitted(Event::InsuranceStopFailed { .. }))));
+        assert!(stop_retry_in(&manager, position.id).await > INSURANCE_STOP_RETRY_BACKOFF);
+        let logged = manager.store.events().find_by_position(position.id).await.unwrap().len();
+        let attempts = exchange.protection_call_count();
+
+        for _ in 0..3 {
+            retry_stop_now(&manager, position.id).await;
+            assert!(stop_retry_in(&manager, position.id).await > INSURANCE_STOP_RETRY_BACKOFF);
+        }
+
+        assert_eq!(exchange.protection_call_count() - attempts, 3, "it does keep trying");
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert_eq!(events.len(), logged, "{events:?}");
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert_eq!(leg.residual_quantity, Some(dec!(0.0005)), "and it still stands");
+
+        // What the executor hands over to persist on a repeat: nothing.
+        let repeat = manager
+            .execute_and_persist(vec![EngineAction::PlaceInsuranceStop {
+                position_id: position.id,
+                symbol: position.symbol.clone(),
+                side: position.side.exit_action(),
+                quantity: position.quantity,
+                stop_price: Price::new(dec!(90)).unwrap(),
+            }])
+            .await
+            .unwrap();
+        assert!(matches!(repeat.as_slice(), [ActionResult::ProtectionNotExecutable { .. }]));
+    }
+
+    /// The exit and the stop of one leg retry in turns. Neither makes the
+    /// other's record look new.
+    #[tokio::test]
+    async fn a_below_lot_leg_retrying_its_exit_and_its_stop_does_not_grow_the_log() {
+        let manager = create_test_manager().await;
+        let position = below_lot_leg(&manager).await;
+
+        manager.close_position(position.id).await.unwrap_err();
+        retry_stop_now(&manager, position.id).await;
+        let logged = manager.store.events().find_by_position(position.id).await.unwrap().len();
+
+        for _ in 0..3 {
+            manager.close_position(position.id).await.unwrap_err();
+            retry_stop_now(&manager, position.id).await;
+        }
+
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert_eq!(events.len(), logged, "{events:?}");
+    }
+
+    /// A transient failure is not that: it keeps its short window and its event
+    /// on every attempt.
+    #[tokio::test]
+    async fn a_transient_stop_failure_keeps_its_short_window_and_its_event() {
+        let manager = create_test_manager().await;
+        let mut position =
+            save_active_position(&manager, "BTCUSDT", Side::Long, dec!(100), dec!(1)).await;
+        position.tech_stop_distance = Some(TechnicalStopDistance::from_entry_and_stop(
+            Price::new(dec!(100)).unwrap(),
+            Price::new(dec!(90)).unwrap(),
+        ));
+        manager.store.positions().save(&position).await.unwrap();
+        let exchange = manager.exchange();
+
+        exchange.set_order_fail_next(true);
+        manager
+            .execute_and_persist(vec![EngineAction::PlaceInsuranceStop {
+                position_id: position.id,
+                symbol: position.symbol.clone(),
+                side: position.side.exit_action(),
+                quantity: position.quantity,
+                stop_price: Price::new(dec!(90)).unwrap(),
+            }])
+            .await
+            .unwrap();
+        assert!(stop_retry_in(&manager, position.id).await <= INSURANCE_STOP_RETRY_BACKOFF);
+
+        exchange.set_order_fail_next(true);
+        retry_stop_now(&manager, position.id).await;
+        assert!(stop_retry_in(&manager, position.id).await <= INSURANCE_STOP_RETRY_BACKOFF);
+
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        let failures =
+            events.iter().filter(|e| matches!(e, Event::InsuranceStopFailed { .. })).count();
+        assert_eq!(failures, 2);
+    }
+
+    /// Admission writes the rules it used on the event, and the leg keeps them.
+    #[tokio::test]
+    async fn admission_persists_the_rules_it_used_with_the_leg() {
+        let manager = create_test_manager().await;
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let entry = Price::new(dec!(100)).unwrap();
+        let stop = Price::new(dec!(98)).unwrap();
+        let position = manager
+            .arm_position(
+                symbol.clone(),
+                Side::Long,
+                create_test_risk_config(),
+                Some(TechnicalStopDistance::from_entry_and_stop(entry, stop)),
+                Uuid::now_v7(),
+            )
+            .await
+            .unwrap();
+        let signal = DetectorSignal {
+            signal_id: Uuid::now_v7(),
+            position_id: position.id,
+            symbol: symbol.clone(),
+            side: Side::Long,
+            entry_price: entry,
+            stop_loss: stop,
+            technical_stop_analysis: None,
+            timestamp: chrono::Utc::now(),
+        };
+        manager.handle_signal(signal).await.unwrap();
+
+        let rules = manager.exchange().last_validated_rules(&symbol).unwrap();
+        let leg = manager.get_position(position.id).await.unwrap().unwrap();
+        assert_eq!(leg.rules_snapshot.as_ref(), Some(&rules));
+        let events = manager.store.events().find_by_position(position.id).await.unwrap();
+        assert!(events.iter().any(|e| matches!(
+            e,
+            Event::EntrySignalReceived { rules_snapshot: Some(persisted), .. }
+                if persisted == &rules
+        )));
+    }
+
     /// Regression for #142: when the exchange-side insurance stop already
     /// closed the position and the reduce-only exit is rejected (-2022), the
     /// tick must hand off to reverse reconciliation and close the position
@@ -7301,7 +8226,7 @@ mod tests {
         // quantized and rejected as a governed domain outcome before any
         // exchange submission rather than relying on an adapter rejection.
         manager.handle_signal(signal).await.unwrap();
-        assert!(manager.exchange().get_all_open_positions().await.unwrap().is_empty());
+        assert_eq!(manager.exchange().market_order_call_count(), 0, "nothing reaches the venue");
 
         let updated = manager.get_position(position.id).await.unwrap().unwrap();
         assert!(
@@ -8951,7 +9876,10 @@ mod tests {
         assert_eq!(failures.len(), 1);
         assert_eq!(failures[0].position_id, eth_unpriced.id);
         assert!(failures[0].reason.contains("Trading rules unavailable"));
-        assert_eq!(manager.exchange().trading_rules_call_count("BTCUSDT"), 1);
+        // ADR-0056 §5: this runs on the tick path, so rules already held cost no
+        // fetch at all (was one per symbol), and a symbol with none costs one
+        // lookup, however many positions it has.
+        assert_eq!(manager.exchange().trading_rules_call_count("BTCUSDT"), 0);
         assert_eq!(manager.exchange().trading_rules_call_count("ETHUSDT"), 1);
 
         let events = manager.store.events().find_by_position(eth_unpriced.id).await.unwrap();

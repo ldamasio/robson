@@ -14,7 +14,10 @@ use robson_domain::{
     Event, OrderFillEvidence, Position, PositionId, PositionState, Price, Quantity,
     ReconciliationEvidence, Side, Symbol, UserTradeEvidence,
 };
-use robson_exec::{ExchangePort, ExchangePosition, OpenOrderRecord, OrderResult, UserTradeRecord};
+use robson_exec::{
+    quantize::{self, ReductionOutcome},
+    ExchangePort, ExchangePosition, ExecError, OpenOrderRecord, OrderResult, UserTradeRecord,
+};
 use robson_store::Store;
 use rust_decimal::Decimal;
 use tokio::{
@@ -378,7 +381,6 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     async fn scan_and_reconcile_inner(&self) -> DaemonResult<usize> {
         let exchange_positions = self.exchange.get_all_open_positions().await?;
         let mut reconciled = 0usize;
-
         for exchange_position in &exchange_positions {
             if self.is_tracked(&exchange_position).await? {
                 continue;
@@ -778,16 +780,33 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         });
 
         let client_order_id = Uuid::now_v7().to_string();
-        match self
-            .exchange
-            .close_position_market(
-                &exchange_position.symbol,
-                exchange_position.side,
-                exchange_position.quantity,
-                &client_order_id,
-            )
-            .await
-        {
+        // The same rule as any reduction (ADR-0056 §5): a reported quantity can
+        // be off the grid after a lot-rule change, so it rounds on the rules held
+        // and a rules rejection earns one refresh and one resubmission. Whatever
+        // rounding leaves is reported by the next scan.
+        let outcome = quantize::submit_reduction(
+            &*self.exchange,
+            &exchange_position.symbol,
+            exchange_position.quantity,
+            None,
+            quantize::METADATA_WAIT_BOUND,
+            |quantity, _rules| {
+                self.exchange.close_position_market(
+                    &exchange_position.symbol,
+                    exchange_position.side,
+                    quantity,
+                    &client_order_id,
+                )
+            },
+        )
+        .await
+        .and_then(|outcome| match outcome {
+            ReductionOutcome::Submitted { accepted, .. } => Ok(accepted),
+            ReductionOutcome::NotExecutable { residual, .. } => Err(ExecError::OrderRejected(
+                format!("{residual} rounds below the lot minimum; nothing can be submitted"),
+            )),
+        });
+        match outcome {
             Ok(order) => {
                 info!(
                     symbol = %exchange_position.symbol.as_pair(),
@@ -1969,6 +1988,81 @@ mod tests {
             }
         }
         assert!(orphan_event_seen, "expected InsuranceStopOrphanCancelled audit event");
+    }
+
+    /// ADR-0056 §5: an UNTRACKED position whose quantity went off the grid
+    /// rounds on the rules held, and a rules rejection earns one refresh
+    /// and resubmission.
+    #[tokio::test]
+    async fn test_untracked_close_follows_the_refresh_once_rule() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let rules = |step| {
+            robson_domain::SymbolTradingRules::new(
+                symbol.clone(),
+                dec!(0.1),
+                dec!(0),
+                step,
+                step,
+                dec!(120),
+                dec!(0),
+                2,
+                3,
+            )
+            .unwrap()
+        };
+        // The cache says 0.001; the venue has moved to 0.01.
+        exchange.set_trading_rules(rules(dec!(0.001)));
+        exchange.set_venue_rules(rules(dec!(0.01)));
+        exchange.set_open_position(
+            symbol.clone(),
+            Side::Long,
+            Quantity::new(dec!(0.105)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        assert_eq!(exchange.position_close_call_count(), 2, "one resubmission");
+        assert_eq!(exchange.rules_refresh_call_count(), 1, "one refresh");
+    }
+
+    #[tokio::test]
+    async fn test_untracked_close_second_rules_rejection_does_not_loop() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        exchange.set_open_position(
+            symbol.clone(),
+            Side::Long,
+            Quantity::new(dec!(0.105)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        exchange.set_trading_rules(
+            robson_domain::SymbolTradingRules::new(
+                symbol.clone(),
+                dec!(0.1),
+                dec!(0),
+                dec!(0.001),
+                dec!(0.001),
+                dec!(120),
+                dec!(0),
+                2,
+                3,
+            )
+            .unwrap(),
+        );
+        exchange.set_rules_rejections_next(100);
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+
+        assert!(worker.scan_and_reconcile().await.is_err());
+        assert_eq!(exchange.position_close_call_count(), 2);
     }
 
     #[tokio::test]

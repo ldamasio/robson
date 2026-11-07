@@ -14,7 +14,7 @@
 
 use std::{
     collections::HashMap,
-    sync::Arc,
+    sync::{Arc, Mutex, MutexGuard},
     time::{Duration, Instant},
 };
 
@@ -27,6 +27,7 @@ use robson_exec::{
         OpenOrderRecord, SpotBalance, SpotOrder, SpotOrderQuantity, SpotOrderRequest,
         SpotOrderSide, Transfer, TransferId, UniversalTransferType, UserTradeRecord,
     },
+    quantize,
     venue::{
         self, AccountKind, AccountPort, Cash, EntryOrReduce, ExecutionCostEnvelope, FundingPort,
         InventoryPort, Mark, MarketKind, OrderLookup, PlacedStop, PositionAccountPort,
@@ -46,81 +47,6 @@ use crate::{
         BinanceRestError,
     },
 };
-
-/// Truncate a quantity to a given number of decimal places (round down).
-fn trunc_to_scale(value: Decimal, scale: u32) -> Decimal {
-    let factor = Decimal::from(10i64.pow(scale));
-    (value * factor).floor() / factor
-}
-
-fn configured_step_size(symbol: &Symbol) -> Decimal {
-    match symbol.as_pair().as_str() {
-        "BTCUSDT" => Decimal::new(1, 3),
-        _ => Decimal::new(1, 3),
-    }
-}
-
-fn configured_step_scale(symbol: &Symbol) -> u32 {
-    configured_step_size(symbol).scale()
-}
-
-/// FALLBACK price scale for when exchange metadata is unavailable (issue
-/// #154: the primary path validates against `tickSize` from exchangeInfo;
-/// precision-based rounding does NOT produce tick-aligned prices on symbols
-/// where `tickSize != 10^-pricePrecision`, e.g. BTCUSDT futures with tick
-/// 0.10 and precision 2).
-fn configured_price_scale(symbol: &Symbol) -> u32 {
-    match symbol.as_pair().as_str() {
-        "BTCUSDT" => 2,
-        _ => 2,
-    }
-}
-
-/// Normalize a protective stop trigger price to the symbol's price precision,
-/// rounding AWAY from the position — up for a Buy stop (closing a short),
-/// down for a Sell stop (closing a long) — so the stop never lands tighter
-/// than the derived executable level. The sub-precision widening (< one unit
-/// of the last decimal) sits well inside the sizing gap allowance (ADR-0039).
-///
-/// Derived stop prices are not precision-aligned in general: the ADR-0041
-/// buffer is a bps offset (2026-07-04 prod incident: 62811.05 + 10 bps =
-/// 62873.86105 → Binance -1111 "Precision is over the maximum").
-pub(crate) fn normalize_stop_trigger_price(
-    symbol: &Symbol,
-    side: OrderSide,
-    stop_price: Price,
-) -> Decimal {
-    let scale = configured_price_scale(symbol);
-    let factor = Decimal::from(10i64.pow(scale));
-    let scaled = stop_price.as_decimal() * factor;
-    let rounded = match side {
-        OrderSide::Buy => scaled.ceil(),
-        OrderSide::Sell => scaled.floor(),
-    };
-    rounded / factor
-}
-
-pub fn normalize_market_quantity(
-    symbol: &Symbol,
-    quantity: Quantity,
-) -> Result<Decimal, ExecError> {
-    let raw_qty = quantity.as_decimal();
-    let step_size = configured_step_size(symbol);
-    let qty = trunc_to_scale(raw_qty, configured_step_scale(symbol));
-
-    if qty < step_size {
-        return Err(ExecError::OrderRejected(format!(
-            "Quantity {} for {} rounds down to {} at Binance step size {} and falls below the minimum quantity {}. Increase capital or widen the stop distance; Robson will not round up.",
-            raw_qty,
-            symbol.as_pair(),
-            qty,
-            step_size,
-            step_size
-        )));
-    }
-
-    Ok(qty)
-}
 
 // =============================================================================
 fn spot_order_from_response(
@@ -265,12 +191,59 @@ fn is_authoritative_rejection(error: &BinanceRestError) -> bool {
     })
 }
 
+/// Whether a failed placement is the venue refusing a value in its trading
+/// rules, which is what makes refreshing the rules worth a resubmission
+/// (ADR-0056 §5). HTTP 400 with an allow-listed code; anything else is not
+/// retried by the quantisation rule.
+///
+/// This is a different question from [`is_authoritative_rejection`]: that list
+/// decides whether an order can no longer surface, this one whether newer
+/// metadata could change the answer. A rules rejection does not resolve the
+/// attempt in the ledger, so a not-found on its client id stays `Unknown`.
+///
+/// The codes, each the violation of one value [`SymbolTradingRules`] holds, are
+/// a reading of the USDⓈ-M error code table
+/// (<https://developers.binance.com/docs/derivatives/usds-margined-futures/error-code>,
+/// read 2026-11-06), not a guarantee from Binance:
+/// `-1111` `BAD_PRECISION` (precisions; also seen on a trigger in production,
+/// 2026-07-04), `-4004` `QTY_LESS_THAN_MIN_QTY` (`min_qty`), `-4005`
+/// `QTY_GREATER_THAN_MAX_QTY` (`max_qty`), `-4013` `PRICE_LESS_THAN_MIN_PRICE`
+/// (`min_price`), `-4014` `PRICE_NOT_INCREASED_BY_TICK_SIZE` (`tick_size`),
+/// `-4023` `QTY_NOT_INCREASED_BY_STEP_SIZE` (`step_size`), `-4164`
+/// `MIN_NOTIONAL` (`min_notional`; its text exempts reduce-only orders).
+/// Deliberately out: `-1013` (documented only as `INVALID_MESSAGE` here; on
+/// spot it is the filter failure, which step 8's own list answers), `-2010`
+/// (generic), `-2019`, `-2021`, `-2022` (not metadata), `-4002`, `-4007` (a
+/// maximum price the rules do not carry, so a refresh changes nothing), `-4131`
+/// (market conditions).
+fn is_rules_rejection(error: &BinanceRestError) -> bool {
+    matches!(error, BinanceRestError::ApiError {
+        http_status: 400,
+        code: -1111 | -4004 | -4005 | -4013 | -4014 | -4023 | -4164,
+        ..
+    })
+}
+
 // Adapter
 // =============================================================================
 
 /// TTL for cached symbol trading rules (issue #154). Exchange filters change
 /// rarely; six hours keeps the metadata fresh without any per-tick calls.
 const TRADING_RULES_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+
+/// A failed TTL refresh is not retried sooner than this per symbol: the
+/// ADR-0056 §10 ceiling of one refresh per symbol per five minutes also holds
+/// while `exchangeInfo` keeps failing and ticks keep asking.
+const RULES_REFRESH_RETRY_INTERVAL: Duration = Duration::from_secs(5 * 60);
+
+/// A refresh after a rules rejection serves rules this recent, or repeats a
+/// failure this recent, without another request. §10 allows one refresh per
+/// rejection; a rejection that persists at the retry cadence needs fewer.
+const RULES_REJECTION_REFRESH_MIN_INTERVAL: Duration = Duration::from_secs(30);
+
+/// The same floor as [`RULES_REFRESH_RETRY_INTERVAL`] for a symbol with no
+/// rules cached at all: there is nothing stale to serve meanwhile.
+const RULES_LOOKUP_RETRY_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Bound on the trading-rules cache (symbols actually traded; a runaway
 /// symbol set is a defect, not a workload).
@@ -298,11 +271,11 @@ fn evict_lru_trading_rules(cache: &mut HashMap<String, CachedTradingRules>) {
     }
 }
 
-/// Serve the stale snapshot for `pair` after a failed refresh and mark it as
-/// used now (keeping `fetched_at`, so the next lookup still tries to refresh).
-/// An actively traded symbol living on its stale fallback must stay out of the
-/// LRU eviction candidates exactly like one served fresh.
-fn touch_stale_trading_rules(
+/// Serve the last validated snapshot for `pair`, whatever its age, and mark it
+/// as used now (keeping `fetched_at`, so the next lookup still tries to
+/// refresh). An actively traded symbol living on its stale fallback must stay
+/// out of the LRU eviction candidates exactly like one served fresh.
+fn touch_cached_trading_rules(
     cache: &mut HashMap<String, CachedTradingRules>,
     pair: &str,
 ) -> Option<SymbolTradingRules> {
@@ -318,11 +291,17 @@ fn touch_stale_trading_rules(
 pub struct BinanceExchangeAdapter {
     venue_id: VenueId,
     client: Arc<BinanceRestClient>,
-    /// Bounded TTL cache of per-symbol trading rules (issue #154). The
-    /// tokio Mutex held across the refresh gives single-flight semantics:
-    /// concurrent callers wait for one fetch instead of stampeding the
-    /// exchange. Market ticks read the cached entry; zero HTTP per tick.
-    trading_rules: tokio::sync::Mutex<HashMap<String, CachedTradingRules>>,
+    /// Bounded TTL cache of per-symbol trading rules (issue #154). Its lock is
+    /// never held across a request, so risk reduction can read it while a
+    /// refresh is in flight (ADR-0056 §5).
+    trading_rules: Mutex<HashMap<String, CachedTradingRules>>,
+    /// Held across a refresh: single-flight, concurrent callers wait for one
+    /// fetch instead of stampeding the exchange. Readers of the cache never
+    /// take it. Market ticks read the cached entry; zero HTTP per tick.
+    rules_refresh_gate: tokio::sync::Mutex<()>,
+    /// When the last refresh failed, per symbol; cleared by a success. Bounded
+    /// like the cache.
+    rules_refresh_failed_at: Mutex<HashMap<String, Instant>>,
     /// Placement attempts by client id (finality evidence for
     /// `order_by_client_id`). In memory: see its restart limitation.
     submit_attempts: SubmitAttemptLedger,
@@ -334,7 +313,9 @@ impl BinanceExchangeAdapter {
         Self {
             venue_id: VenueId::new(VenueId::BINANCE_USDM),
             client,
-            trading_rules: tokio::sync::Mutex::new(HashMap::new()),
+            trading_rules: Mutex::new(HashMap::new()),
+            rules_refresh_gate: tokio::sync::Mutex::new(()),
+            rules_refresh_failed_at: Mutex::new(HashMap::new()),
             submit_attempts: SubmitAttemptLedger::new(SUBMIT_ATTEMPTS_CAPACITY),
         }
     }
@@ -359,21 +340,37 @@ impl BinanceExchangeAdapter {
         .map_err(|e| ExecError::Exchange(format!("Invalid exchangeInfo filters: {e}")))
     }
 
-    /// Serve trading rules from the bounded TTL cache. On a refresh failure
-    /// the STALE snapshot is served with a warning (policy for exchange-side
-    /// filter changes: an existing order remains valid until a replacement
-    /// exists, so stale metadata beats no metadata).
-    async fn trading_rules_cached(&self, symbol: &Symbol) -> Result<SymbolTradingRules, ExecError> {
+    fn rules_cache(&self) -> MutexGuard<'_, HashMap<String, CachedTradingRules>> {
+        self.trading_rules.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn refresh_failures(&self) -> MutexGuard<'_, HashMap<String, Instant>> {
+        self.rules_refresh_failed_at.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// The cached rules when fetched within `max_age`, marked as used.
+    fn cached_rules_within(&self, pair: &str, max_age: Duration) -> Option<SymbolTradingRules> {
+        let mut cache = self.rules_cache();
+        let cached = cache.get_mut(pair).filter(|c| c.fetched_at.elapsed() < max_age)?;
+        cached.last_used_at = Instant::now();
+        Some(cached.rules.clone())
+    }
+
+    fn refresh_failed_within(&self, pair: &str, window: Duration) -> bool {
+        self.refresh_failures().get(pair).is_some_and(|at| at.elapsed() < window)
+    }
+
+    /// Fetch and store. The caller holds `rules_refresh_gate`; the cache lock
+    /// is only taken once the response is in.
+    async fn fetch_and_cache_rules(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<SymbolTradingRules, ExecError> {
         let pair = symbol.as_pair();
-        let mut cache = self.trading_rules.lock().await;
-        if let Some(cached) = cache.get_mut(&pair) {
-            if cached.fetched_at.elapsed() < TRADING_RULES_TTL {
-                cached.last_used_at = Instant::now();
-                return Ok(cached.rules.clone());
-            }
-        }
         match self.fetch_trading_rules(symbol).await {
             Ok(rules) => {
+                self.refresh_failures().remove(&pair);
+                let mut cache = self.rules_cache();
                 if cache.len() >= TRADING_RULES_CACHE_CAPACITY && !cache.contains_key(&pair) {
                     // Bounded, never fail-closed: evicting the LRU entry
                     // costs one exchangeInfo call on that symbol's next use,
@@ -389,16 +386,80 @@ impl BinanceExchangeAdapter {
                 });
                 Ok(rules)
             },
-            Err(error) => match touch_stale_trading_rules(&mut cache, &pair) {
-                Some(stale) => {
-                    warn!(target: "robsond::binance_exchange",
-                        symbol = %pair,
-                        %error,
-                        "Trading-rules refresh failed; serving stale snapshot"
-                    );
-                    Ok(stale)
-                },
-                None => Err(error),
+            Err(error) => {
+                let mut failures = self.refresh_failures();
+                if failures.len() >= TRADING_RULES_CACHE_CAPACITY && !failures.contains_key(&pair) {
+                    // Entries past the longest window throttle nothing. With 64
+                    // symbols failing inside it, dropping the oldest can allow
+                    // one early refresh of that symbol, behind the same
+                    // single-flight gate; more than 64 traded symbols is a defect
+                    // by this cache's own bound.
+                    failures.retain(|_, at| at.elapsed() < RULES_REFRESH_RETRY_INTERVAL);
+                    if failures.len() >= TRADING_RULES_CACHE_CAPACITY {
+                        let oldest =
+                            failures.iter().min_by_key(|(_, at)| **at).map(|(p, _)| p.clone());
+                        if let Some(oldest) = oldest {
+                            failures.remove(&oldest);
+                        }
+                    }
+                }
+                failures.insert(pair, Instant::now());
+                Err(error)
+            },
+        }
+    }
+
+    /// Rules validated within the TTL, refreshed now when older, never stale
+    /// (ADR-0056 §5 admission). A failed refresh is not retried for
+    /// [`RULES_REFRESH_RETRY_INTERVAL`].
+    async fn trading_rules_within_ttl(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<SymbolTradingRules, ExecError> {
+        let pair = symbol.as_pair();
+        if let Some(rules) = self.cached_rules_within(&pair, TRADING_RULES_TTL) {
+            return Ok(rules);
+        }
+        let _gate = self.rules_refresh_gate.lock().await;
+        if let Some(rules) = self.cached_rules_within(&pair, TRADING_RULES_TTL) {
+            return Ok(rules);
+        }
+        // Stale rules keep serving while a refresh keeps failing, so they can wait.
+        // With nothing to serve, a leg cannot even derive its stop.
+        let retry_floor = if self.rules_cache().contains_key(&pair) {
+            RULES_REFRESH_RETRY_INTERVAL
+        } else {
+            RULES_LOOKUP_RETRY_INTERVAL
+        };
+        if self.refresh_failed_within(&pair, retry_floor) {
+            return Err(ExecError::Exchange(format!(
+                "Trading rules for {pair} unavailable: the last refresh failed less than {} s ago",
+                retry_floor.as_secs()
+            )));
+        }
+        self.fetch_and_cache_rules(symbol).await
+    }
+
+    /// Serve trading rules from the bounded TTL cache. On a refresh failure
+    /// the STALE snapshot is served with a warning (policy for exchange-side
+    /// filter changes: an existing order remains valid until a replacement
+    /// exists, so stale metadata beats no metadata).
+    async fn trading_rules_cached(&self, symbol: &Symbol) -> Result<SymbolTradingRules, ExecError> {
+        match self.trading_rules_within_ttl(symbol).await {
+            Ok(rules) => Ok(rules),
+            Err(error) => {
+                let pair = symbol.as_pair();
+                match touch_cached_trading_rules(&mut self.rules_cache(), &pair) {
+                    Some(stale) => {
+                        warn!(target: "robsond::binance_exchange",
+                            symbol = %pair,
+                            %error,
+                            "Trading-rules refresh failed; serving stale snapshot"
+                        );
+                        Ok(stale)
+                    },
+                    None => Err(error),
+                }
             },
         }
     }
@@ -413,16 +474,26 @@ impl BinanceExchangeAdapter {
         symbol: &Symbol,
     ) -> Result<SymbolTradingRules, ExecError> {
         let pair = symbol.as_pair();
-        let cached = {
-            let cache = self.trading_rules.lock().await;
-            cache
-                .get(&pair)
-                .filter(|cached| cached.fetched_at.elapsed() < TRADING_RULES_TTL)
-                .map(|cached| cached.rules.clone())
-        };
+        let cached = self
+            .rules_cache()
+            .get(&pair)
+            .filter(|cached| cached.fetched_at.elapsed() < TRADING_RULES_TTL)
+            .map(|cached| cached.rules.clone());
         match cached {
             Some(rules) => Ok(rules),
             None => self.fetch_trading_rules(symbol).await,
+        }
+    }
+
+    /// Map a failed placement: rules and reduce-only rejections are typed, so
+    /// callers can apply ADR-0056 §5 without knowing the venue's codes.
+    fn map_placement_error(error: BinanceRestError) -> ExecError {
+        if is_rules_rejection(&error) {
+            ExecError::RulesRejected(error.to_string())
+        } else if matches!(error, BinanceRestError::ApiError { code: -2022, .. }) {
+            ExecError::ReduceOnlyRejected(error.to_string())
+        } else {
+            Self::map_error(error)
         }
     }
 
@@ -657,6 +728,38 @@ impl TradingPort for BinanceExchangeAdapter {
         self.trading_rules_peek_or_fetch(symbol).await
     }
 
+    async fn trading_rules_fresh(&self, symbol: &Symbol) -> Result<SymbolTradingRules, ExecError> {
+        self.trading_rules_within_ttl(symbol).await
+    }
+
+    fn last_validated_rules(&self, symbol: &Symbol) -> Option<SymbolTradingRules> {
+        touch_cached_trading_rules(&mut self.rules_cache(), &symbol.as_pair())
+    }
+
+    fn rules_refresh_due(&self, symbol: &Symbol) -> bool {
+        self.rules_cache()
+            .get(&symbol.as_pair())
+            .is_none_or(|cached| cached.fetched_at.elapsed() >= TRADING_RULES_TTL)
+    }
+
+    async fn refresh_trading_rules(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<SymbolTradingRules, ExecError> {
+        let pair = symbol.as_pair();
+        let _gate = self.rules_refresh_gate.lock().await;
+        if let Some(rules) = self.cached_rules_within(&pair, RULES_REJECTION_REFRESH_MIN_INTERVAL) {
+            return Ok(rules);
+        }
+        if self.refresh_failed_within(&pair, RULES_REJECTION_REFRESH_MIN_INTERVAL) {
+            return Err(ExecError::Exchange(format!(
+                "Trading rules for {pair} unavailable: the last refresh failed less than {} s ago",
+                RULES_REJECTION_REFRESH_MIN_INTERVAL.as_secs()
+            )));
+        }
+        self.fetch_and_cache_rules(symbol).await
+    }
+
     async fn place_market_order(
         &self,
         symbol: &Symbol,
@@ -672,29 +775,17 @@ impl TradingPort for BinanceExchangeAdapter {
             OrderSide::Sell => Side::Short,
         };
 
-        // Lot filters from exchange metadata when available (issue #154);
-        // the sizing already quantized down by stepSize, so this is a
-        // validation in the expected case. Falls back to the configured
-        // table when metadata is unavailable.
-        let qty = match self.trading_rules_cached(symbol).await {
-            Ok(rules) => {
-                let qty = rules.quantize_qty_down(quantity.as_decimal());
-                rules.validate_order_qty(qty).map_err(|e| {
-                    ExecError::OrderRejected(format!(
-                        "{e}. Increase capital or widen the stop distance; Robson will not \
-                         round up."
-                    ))
-                })?;
-                qty
+        // An entry needs fresh validated metadata and fails closed without it;
+        // the sizing already quantized down by stepSize, so this is a validation
+        // in the expected case. A reduction is decided by `quantize` before it
+        // gets here and looks nothing up here (ADR-0056 §5, which replaces the
+        // fallback table that lived here).
+        let qty = match intent {
+            EntryOrReduce::Entry => {
+                let rules = self.trading_rules_within_ttl(symbol).await?;
+                quantize::market_quantity(&rules, quantity)?.as_decimal()
             },
-            Err(error) => {
-                warn!(target: "robsond::binance_exchange",
-                    symbol = %symbol.as_pair(),
-                    %error,
-                    "Trading rules unavailable; falling back to configured lot filters"
-                );
-                normalize_market_quantity(symbol, quantity)?
-            },
+            EntryOrReduce::Reduce => quantity.as_decimal(),
         };
 
         let response = self
@@ -711,7 +802,7 @@ impl TradingPort for BinanceExchangeAdapter {
                 ),
             )
             .await
-            .map_err(Self::map_error)?;
+            .map_err(Self::map_placement_error)?;
 
         match response.status.as_str() {
             "FILLED" => {},
@@ -845,44 +936,12 @@ impl TradingPort for BinanceExchangeAdapter {
             OrderSide::Sell => Side::Short,
         };
 
-        let qty = normalize_market_quantity(symbol, quantity)?;
-        // Metadata-driven trigger validation (issue #154 deliverable 1): the
-        // domain quantizes ExecutableSpan triggers on the tickSize grid, so the
-        // expected case here is a pure pass-through validation. A misaligned
-        // trigger can only come from a legacy-policy derivation (unquantized
-        // by design); it is aligned adversely per tickSize and logged,
-        // because a slightly wider stop beats an order the exchange may
-        // reject under PRICE_FILTER (the empirical Binance leniency for
-        // off-grid algo triggers is undocumented and must not be relied on).
-        // Only when exchange metadata is unavailable does the legacy
-        // precision-table fallback apply.
-        let trigger_price = match self.trading_rules_cached(symbol).await {
-            Ok(rules) => {
-                if rules.is_tick_aligned(stop_price.as_decimal()) {
-                    stop_price.as_decimal()
-                } else {
-                    let aligned = rules
-                        .quantize_stop_trigger(side, stop_price)
-                        .map_err(|e| ExecError::Exchange(format!("Invalid stop trigger: {e}")))?;
-                    warn!(target: "robsond::binance_exchange",
-                        symbol = %symbol.as_pair(),
-                        requested = %stop_price.as_decimal(),
-                        aligned = %aligned.as_decimal(),
-                        tick_size = %rules.tick_size(),
-                        "Stop trigger not tick-aligned (legacy derivation); aligned adversely"
-                    );
-                    aligned.as_decimal()
-                }
-            },
-            Err(error) => {
-                warn!(target: "robsond::binance_exchange",
-                    symbol = %symbol.as_pair(),
-                    %error,
-                    "Trading rules unavailable; falling back to precision-based trigger rounding"
-                );
-                normalize_stop_trigger_price(symbol, side, stop_price)
-            },
-        };
+        // Quantity and trigger are decided by `quantize` before they get here
+        // (lot grid and adverse tick rounding, ADR-0056 §5) and go out as given.
+        // A misaligned trigger reaches this point only when no rules are known
+        // at all; the venue's rejection then earns the one refresh.
+        let qty = quantity.as_decimal();
+        let trigger_price = stop_price.as_decimal();
 
         let response = self
             .submit_attempts
@@ -898,7 +957,7 @@ impl TradingPort for BinanceExchangeAdapter {
                 ),
             )
             .await
-            .map_err(Self::map_error)?;
+            .map_err(Self::map_placement_error)?;
 
         // A protective STOP_MARKET is accepted, not filled: only `NEW` is the
         // clean success. Any other status (triggered, expired, rejected) is
@@ -1453,7 +1512,7 @@ mod submit_attempt_evidence {
 
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    use robson_exec::venue::AttemptEvidence;
+    use robson_exec::{quantize, venue::AttemptEvidence};
     use rust_decimal_macros::dec;
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
@@ -1581,8 +1640,7 @@ mod submit_attempt_evidence {
         format!(r#"{{"code":{code},"msg":"refused"}}"#)
     }
 
-    /// Both lookups answer not-found; anything else (exchangeInfo) is a 404,
-    /// so placements fall back to the configured lot filters.
+    /// Both lookups answer not-found; anything else is a 404.
     fn not_found(request: &str) -> Reply {
         match request {
             "GET /fapi/v1/order" | "GET /fapi/v1/algoOrder" => Some((400, api_error(-2013))),
@@ -1610,13 +1668,14 @@ mod submit_attempt_evidence {
             let symbol = Symbol::from_pair("BTCUSDT").unwrap();
             let qty = Quantity::new(dec!(0.01)).unwrap();
             match self {
+                // A reduction: it reaches the wire without any rules lookup.
                 Self::Market => TradingPort::place_market_order(
                     venue,
                     &symbol,
-                    OrderSide::Buy,
+                    OrderSide::Sell,
                     qty,
                     id,
-                    EntryOrReduce::Entry,
+                    EntryOrReduce::Reduce,
                 )
                 .await
                 .map(|_| ()),
@@ -1816,6 +1875,393 @@ mod submit_attempt_evidence {
         }
     }
 
+    // ---- ADR-0056 §5 and §10 -------------------------------------------------
+
+    const BTC_RULES: &str = r#"{"symbols":[{"symbol":"BTCUSDT","pricePrecision":2,
+        "quantityPrecision":3,"filters":[
+        {"filterType":"PRICE_FILTER","minPrice":"556.80","maxPrice":"4529764","tickSize":"0.10"},
+        {"filterType":"LOT_SIZE","minQty":"0.001","maxQty":"1000","stepSize":"0.001"},
+        {"filterType":"MARKET_LOT_SIZE","minQty":"0.001","maxQty":"120","stepSize":"0.001"},
+        {"filterType":"MIN_NOTIONAL","notional":"50"}]}]}"#;
+
+    fn btcusdt() -> Symbol {
+        Symbol::from_pair("BTCUSDT").unwrap()
+    }
+
+    /// Serve `orders` to every market order and `info` to every exchangeInfo,
+    /// counting both.
+    async fn metadata_venue(
+        info: Reply,
+        orders: Reply,
+    ) -> (Arc<BinanceExchangeAdapter>, Arc<AtomicUsize>, Arc<AtomicUsize>) {
+        let (listener, venue) = bound_venue().await;
+        let info_requests = Arc::new(AtomicUsize::new(0));
+        let order_requests = Arc::new(AtomicUsize::new(0));
+        let (info_counter, order_counter) = (info_requests.clone(), order_requests.clone());
+        serve(listener, move |request| match request {
+            "GET /fapi/v1/exchangeInfo" => {
+                info_counter.fetch_add(1, Ordering::SeqCst);
+                info.clone()
+            },
+            "POST /fapi/v1/order" => {
+                order_counter.fetch_add(1, Ordering::SeqCst);
+                orders.clone()
+            },
+            _ => Some((404, String::new())),
+        });
+        (venue, info_requests, order_requests)
+    }
+
+    fn age_cached_rules(venue: &BinanceExchangeAdapter, by: Duration) {
+        let mut cache = venue.rules_cache();
+        let cached = cache.get_mut("BTCUSDT").unwrap();
+        cached.fetched_at = Instant::now().checked_sub(by).unwrap();
+    }
+
+    fn age_refresh_failure(venue: &BinanceExchangeAdapter, by: Duration) {
+        let mut failures = venue.refresh_failures();
+        *failures.get_mut("BTCUSDT").unwrap() = Instant::now().checked_sub(by).unwrap();
+    }
+
+    async fn reduce(venue: &BinanceExchangeAdapter, id: &str) -> Result<OrderResult, ExecError> {
+        TradingPort::place_market_order(
+            venue,
+            &btcusdt(),
+            OrderSide::Sell,
+            Quantity::new(dec!(0.01)).unwrap(),
+            id,
+            EntryOrReduce::Reduce,
+        )
+        .await
+    }
+
+    /// The allow-list answers its own question: each code is refused only with
+    /// HTTP 400, and none of them proves finality (the step 2 list answers
+    /// that).
+    #[test]
+    fn rules_rejections_are_a_narrow_allow_list_separate_from_finality() {
+        let error = |code: i64, http_status: u16| BinanceRestError::ApiError {
+            code,
+            msg: "x".to_string(),
+            http_status,
+        };
+        for code in [-1111, -4004, -4005, -4013, -4014, -4023, -4164] {
+            assert!(is_rules_rejection(&error(code, 400)), "{code}");
+            assert!(!is_authoritative_rejection(&error(code, 400)), "{code}");
+            for status in [403, 418, 429, 500, 503] {
+                assert!(!is_rules_rejection(&error(code, status)), "{code} {status}");
+            }
+        }
+        for code in [
+            -1000, -1001, -1006, -1007, -1013, -2010, -2019, -2021, -2022, -4131, -4002,
+        ] {
+            assert!(!is_rules_rejection(&error(code, 400)), "{code}");
+        }
+        assert!(!is_rules_rejection(&BinanceRestError::Timeout));
+    }
+
+    #[tokio::test]
+    async fn a_rules_rejection_is_typed_and_leaves_the_attempt_unresolved() {
+        for placement in [Placement::Market, Placement::Protection] {
+            let reply = Some((400, api_error(-4023)));
+            let (venue, _) = scripted_venue(placement, reply.clone(), reply).await;
+
+            let error = placement.place(&venue, "c1").await.unwrap_err();
+            assert!(matches!(error, ExecError::RulesRejected(_)), "{placement:?}: {error}");
+            // The code stays in the message: logs and audit keep reading it. It reads
+            // as the `Exchange` error it was before it was typed.
+            assert!(error.to_string().starts_with("Exchange error: "), "{error}");
+            assert!(error.to_string().contains("-4023"), "{error}");
+            assert_eq!(venue.submit_attempts.evidence("c1"), IN_FLIGHT, "{placement:?}");
+            assert!(is_unknown(&venue, "c1").await, "{placement:?}");
+        }
+    }
+
+    /// Refresh-once, against the real adapter and a venue that keeps refusing:
+    /// two orders and one exchangeInfo, whatever the venue answers.
+    #[tokio::test]
+    async fn a_second_rules_rejection_does_not_loop_on_the_wire() {
+        let (venue, info, orders) =
+            metadata_venue(Some((200, BTC_RULES.to_string())), Some((400, api_error(-4023)))).await;
+        let symbol = btcusdt();
+
+        let outcome = quantize::submit_reduction(
+            &*venue,
+            &symbol,
+            Quantity::new(dec!(0.0015)).unwrap(),
+            None,
+            quantize::METADATA_WAIT_BOUND,
+            |submitted, _| {
+                TradingPort::place_market_order(
+                    &*venue,
+                    &symbol,
+                    OrderSide::Sell,
+                    submitted,
+                    "exit-1",
+                    EntryOrReduce::Reduce,
+                )
+            },
+        )
+        .await;
+
+        assert!(matches!(outcome, Err(ExecError::RulesRejected(_))));
+        assert_eq!(orders.load(Ordering::SeqCst), 2, "one resubmission, not a loop");
+        assert_eq!(info.load(Ordering::SeqCst), 1, "one refresh, not a loop");
+        assert_eq!(
+            venue.submit_attempts.evidence("exit-1"),
+            AttemptEvidence::Unresolved { unresolved: 2, rejected: 0 },
+            "the same client id both times"
+        );
+    }
+
+    /// The whole quantity is below the lot on the rules held: the raw quantity
+    /// goes out with no metadata request first, the venue refuses, and the
+    /// refreshed rules agree. One order, one exchangeInfo, in that order.
+    #[tokio::test]
+    async fn a_quantity_below_the_lot_is_decided_by_the_venue() {
+        let (venue, info, orders) =
+            metadata_venue(Some((200, BTC_RULES.to_string())), Some((400, api_error(-4004)))).await;
+        let symbol = btcusdt();
+        let held = TradingPort::trading_rules(&*venue, &symbol).await.unwrap();
+        age_cached_rules(&venue, RULES_REJECTION_REFRESH_MIN_INTERVAL + Duration::from_secs(1));
+        assert_eq!(info.load(Ordering::SeqCst), 1);
+
+        let outcome = quantize::submit_reduction(
+            &*venue,
+            &symbol,
+            Quantity::new(dec!(0.0005)).unwrap(),
+            Some(&held),
+            quantize::METADATA_WAIT_BOUND,
+            |submitted, _| {
+                assert_eq!(submitted.as_decimal(), dec!(0.0005), "raw, not refused locally");
+                TradingPort::place_market_order(
+                    &*venue,
+                    &symbol,
+                    OrderSide::Sell,
+                    submitted,
+                    "exit-1",
+                    EntryOrReduce::Reduce,
+                )
+            },
+        )
+        .await
+        .unwrap();
+
+        assert!(matches!(outcome, quantize::ReductionOutcome::NotExecutable { .. }));
+        assert_eq!(orders.load(Ordering::SeqCst), 1);
+        assert_eq!(info.load(Ordering::SeqCst), 2, "one refresh after the refusal");
+    }
+
+    /// `-2022` is typed, so nothing has to read its message.
+    #[tokio::test]
+    async fn a_reduce_only_refusal_is_typed() {
+        let reply = Some((400, api_error(-2022)));
+        let (venue, _) = scripted_venue(Placement::Market, reply.clone(), reply).await;
+
+        let error = Placement::Market.place(&venue, "c1").await.unwrap_err();
+        assert!(matches!(error, ExecError::ReduceOnlyRejected(_)), "{error}");
+        assert!(error.to_string().starts_with("Exchange error: "), "{error}");
+        assert!(error.to_string().contains("-2022"), "{error}");
+    }
+
+    /// Only a FILLED order is a fill. A reduction the venue reports short of
+    /// its request returns what it executed, so the executor can compare;
+    /// any other status is an error, on an entry and on a reduction.
+    #[tokio::test]
+    async fn only_a_filled_reduction_returns_a_fill() {
+        let order = |status: &str| {
+            format!(
+                r#"{{"symbol":"BTCUSDT","orderId":7,"clientOrderId":"c1",
+                "updateTime":1700000000000,"price":"0","avgPrice":"90000","origQty":"1",
+                "executedQty":"0.4","cumQuote":"36000","status":"{status}",
+                "side":"SELL","type":"MARKET","fills":[]}}"#
+            )
+        };
+        let symbol = btcusdt();
+
+        let (venue, _, _) = metadata_venue(None, Some((200, order("FILLED")))).await;
+        let result = TradingPort::place_market_order(
+            &*venue,
+            &symbol,
+            OrderSide::Sell,
+            Quantity::new(dec!(1)).unwrap(),
+            "exit-1",
+            EntryOrReduce::Reduce,
+        )
+        .await
+        .unwrap();
+        assert_eq!(result.filled_quantity.as_decimal(), dec!(0.4));
+        assert_eq!(result.fill_price.as_decimal(), dec!(90000));
+
+        for status in ["EXPIRED", "PARTIALLY_FILLED"] {
+            let (venue, _, _) = metadata_venue(None, Some((200, order(status)))).await;
+            assert!(reduce(&venue, "exit-2").await.is_err(), "{status}");
+        }
+    }
+
+    /// A later attempt on a persistent rejection does not refresh again within
+    /// the window, and does after it.
+    #[tokio::test]
+    async fn the_refresh_after_a_rejection_is_bounded_per_symbol() {
+        let (venue, info, _) = metadata_venue(Some((200, BTC_RULES.to_string())), None).await;
+        let symbol = btcusdt();
+
+        TradingPort::refresh_trading_rules(&*venue, &symbol).await.unwrap();
+        TradingPort::refresh_trading_rules(&*venue, &symbol).await.unwrap();
+        assert_eq!(info.load(Ordering::SeqCst), 1);
+
+        age_cached_rules(&venue, RULES_REJECTION_REFRESH_MIN_INTERVAL + Duration::from_secs(1));
+        TradingPort::refresh_trading_rules(&*venue, &symbol).await.unwrap();
+        assert_eq!(info.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn a_failing_refresh_after_a_rejection_is_bounded_too() {
+        let (venue, info, _) = metadata_venue(Some((500, String::new())), None).await;
+        let symbol = btcusdt();
+
+        assert!(TradingPort::refresh_trading_rules(&*venue, &symbol).await.is_err());
+        assert!(TradingPort::refresh_trading_rules(&*venue, &symbol).await.is_err());
+        assert_eq!(info.load(Ordering::SeqCst), 1);
+    }
+
+    /// Nothing cached and exchangeInfo failing: one attempt per symbol per 30
+    /// seconds, however often callers ask.
+    #[tokio::test]
+    async fn a_failed_lookup_with_nothing_cached_is_retried_after_thirty_seconds() {
+        let (venue, info, _) = metadata_venue(Some((500, String::new())), None).await;
+        let symbol = btcusdt();
+
+        for _ in 0..3 {
+            assert!(TradingPort::trading_rules(&*venue, &symbol).await.is_err());
+            assert!(TradingPort::trading_rules_fresh(&*venue, &symbol).await.is_err());
+        }
+        assert_eq!(info.load(Ordering::SeqCst), 1);
+
+        age_refresh_failure(&venue, RULES_LOOKUP_RETRY_INTERVAL - Duration::from_secs(1));
+        assert!(TradingPort::trading_rules(&*venue, &symbol).await.is_err());
+        assert_eq!(info.load(Ordering::SeqCst), 1);
+
+        age_refresh_failure(&venue, RULES_LOOKUP_RETRY_INTERVAL + Duration::from_secs(1));
+        assert!(TradingPort::trading_rules(&*venue, &symbol).await.is_err());
+        assert_eq!(info.load(Ordering::SeqCst), 2);
+    }
+
+    /// The steady-state ceiling of §10 while stale rules are being served and
+    /// exchangeInfo keeps failing: one attempt per symbol per five minutes.
+    #[tokio::test]
+    async fn a_failed_ttl_refresh_with_stale_rules_is_not_retried_for_five_minutes() {
+        let (listener, venue) = bound_venue().await;
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let info = Arc::new(AtomicUsize::new(0));
+        let (is_up, requests) = (up.clone(), info.clone());
+        serve(listener, move |request| match request {
+            "GET /fapi/v1/exchangeInfo" => {
+                requests.fetch_add(1, Ordering::SeqCst);
+                if is_up.load(Ordering::SeqCst) {
+                    Some((200, BTC_RULES.to_string()))
+                } else {
+                    Some((500, String::new()))
+                }
+            },
+            _ => Some((404, String::new())),
+        });
+        let symbol = btcusdt();
+        TradingPort::trading_rules(&*venue, &symbol).await.unwrap();
+        up.store(false, Ordering::SeqCst);
+        age_cached_rules(&venue, TRADING_RULES_TTL + Duration::from_secs(1));
+        info.store(0, Ordering::SeqCst);
+
+        for _ in 0..3 {
+            assert!(TradingPort::trading_rules(&*venue, &symbol).await.is_ok(), "stale serves");
+            assert!(TradingPort::trading_rules_fresh(&*venue, &symbol).await.is_err());
+        }
+        assert_eq!(info.load(Ordering::SeqCst), 1);
+
+        age_refresh_failure(&venue, RULES_LOOKUP_RETRY_INTERVAL + Duration::from_secs(1));
+        assert!(TradingPort::trading_rules(&*venue, &symbol).await.is_ok());
+        assert_eq!(info.load(Ordering::SeqCst), 1, "still inside the five minutes");
+
+        age_refresh_failure(&venue, RULES_REFRESH_RETRY_INTERVAL + Duration::from_secs(1));
+        assert!(TradingPort::trading_rules(&*venue, &symbol).await.is_ok());
+        assert_eq!(info.load(Ordering::SeqCst), 2);
+    }
+
+    /// Admission refuses what risk reduction accepts: a snapshot past its TTL
+    /// with the refresh failing.
+    #[tokio::test]
+    async fn stale_rules_serve_risk_reduction_and_not_admission() {
+        let (listener, venue) = bound_venue().await;
+        let up = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let is_up = up.clone();
+        serve(listener, move |request| match request {
+            "GET /fapi/v1/exchangeInfo" if is_up.load(Ordering::SeqCst) => {
+                Some((200, BTC_RULES.to_string()))
+            },
+            "GET /fapi/v1/exchangeInfo" => Some((500, String::new())),
+            _ => Some((404, String::new())),
+        });
+        let symbol = btcusdt();
+        TradingPort::trading_rules(&*venue, &symbol).await.unwrap();
+        assert!(!TradingPort::rules_refresh_due(&*venue, &symbol));
+
+        up.store(false, Ordering::SeqCst);
+        age_cached_rules(&venue, TRADING_RULES_TTL + Duration::from_secs(1));
+
+        assert!(TradingPort::rules_refresh_due(&*venue, &symbol));
+        assert!(TradingPort::trading_rules_fresh(&*venue, &symbol).await.is_err());
+        assert!(
+            TradingPort::place_market_order(
+                &*venue,
+                &symbol,
+                OrderSide::Buy,
+                Quantity::new(dec!(0.01)).unwrap(),
+                "entry-1",
+                EntryOrReduce::Entry,
+            )
+            .await
+            .is_err(),
+            "an entry fails closed on stale rules"
+        );
+        assert!(TradingPort::last_validated_rules(&*venue, &symbol).is_some());
+        // The issue #154 contract of `trading_rules` is unchanged.
+        assert!(TradingPort::trading_rules(&*venue, &symbol).await.is_ok());
+    }
+
+    /// The point of splitting the cache lock from the refresh gate: with a
+    /// refresh hanging on the venue, reading the rules and sending a reduction
+    /// both go through.
+    #[tokio::test]
+    async fn a_refresh_in_flight_does_not_hold_up_risk_reduction() {
+        let (listener, venue) = bound_venue().await;
+        let hanging = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let is_hanging = hanging.clone();
+        serve(listener, move |request| match request {
+            "GET /fapi/v1/exchangeInfo" if is_hanging.load(Ordering::SeqCst) => None,
+            "GET /fapi/v1/exchangeInfo" => Some((200, BTC_RULES.to_string())),
+            "POST /fapi/v1/order" => Some((200, FILLED.to_string())),
+            _ => Some((404, String::new())),
+        });
+        let symbol = btcusdt();
+        TradingPort::trading_rules(&*venue, &symbol).await.unwrap();
+        age_cached_rules(&venue, TRADING_RULES_TTL + Duration::from_secs(1));
+        hanging.store(true, Ordering::SeqCst);
+
+        let refreshing = venue.clone();
+        let refresh = tokio::spawn(async move {
+            let symbol = btcusdt();
+            let _ = TradingPort::trading_rules(&*refreshing, &symbol).await;
+        });
+        while venue.rules_refresh_gate.try_lock().is_ok() {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(TradingPort::last_validated_rules(&*venue, &symbol).is_some());
+        let reduced = tokio::time::timeout(Duration::from_secs(2), reduce(&venue, "exit-1")).await;
+        assert!(reduced.expect("a reduction must not wait for the refresh").is_ok());
+        refresh.abort();
+    }
+
     const STOP_ACCEPTED: &str = r#"{"algoId":998877,"clientAlgoId":"ins-2",
         "algoType":"CONDITIONAL","orderType":"STOP_MARKET","symbol":"BTCUSDT","side":"SELL",
         "quantity":"0.01","algoStatus":"NEW","triggerPrice":"91000","reduceOnly":true,
@@ -1942,14 +2388,16 @@ mod submit_attempt_evidence {
     }
 
     #[tokio::test]
-    async fn successor_refused_before_sending_stays_unknown() {
-        // Below the lot step: `OrderRejected` with nothing sent, so no evidence.
-        let accepted = Some((200, STOP_ACCEPTED.to_string()));
-        let (venue, cancels) = replacement_venue(accepted.clone(), accepted).await;
+    async fn a_successor_refused_on_rules_stays_unknown_and_the_old_stop_stays() {
+        // A rules rejection is no finality evidence: the attempt stays unresolved.
+        // Below the lot step is the venue's call here: this adapter refuses
+        // nothing locally any more (ADR-0056 §5).
+        let refused = Some((400, api_error(-4023)));
+        let (venue, cancels) = replacement_venue(refused.clone(), refused).await;
 
         let outcome = replace_with(&venue, dec!(0.0001), "ins-2").await;
         assert!(matches!(outcome, ReplaceOutcome::Unknown { new: None }), "{outcome:?}");
-        assert_eq!(venue.submit_attempts.evidence("ins-2"), AttemptEvidence::NoRecord);
+        assert_eq!(venue.submit_attempts.evidence("ins-2"), IN_FLIGHT);
         assert_eq!(cancels.load(Ordering::SeqCst), 0);
     }
 
@@ -2049,6 +2497,9 @@ mod tests {
     use robson_exec::venue::{
         capability_mismatches, AccountKind, MarketKind, ProtectionKind, ReplacementProtocol,
     };
+    use rust_decimal_macros::dec;
+
+    use super::*;
 
     fn order(status: &str, executed: &str, fills: &str) -> BinanceOrderResponse {
         serde_json::from_str(&format!(
@@ -2150,10 +2601,6 @@ mod tests {
 
     #[test]
     fn trading_rules_cache_evicts_the_least_recently_used_entry_when_full() {
-        use std::collections::HashMap;
-
-        use rust_decimal_macros::dec;
-
         let rules = |pair: &str| {
             robson_domain::SymbolTradingRules::new(
                 robson_domain::Symbol::from_pair(pair).unwrap(),
@@ -2194,60 +2641,12 @@ mod tests {
         // refresh counts as used too: S02 is now the LRU candidate, S00 is
         // not, and S00's fetched_at is untouched so the next lookup retries.
         let before = cache.get("S02USDT").unwrap().fetched_at;
-        let served = super::touch_stale_trading_rules(&mut cache, "S02USDT");
+        let served = super::touch_cached_trading_rules(&mut cache, "S02USDT");
         assert!(served.is_some());
         assert_eq!(cache.get("S02USDT").unwrap().fetched_at, before);
-        assert!(super::touch_stale_trading_rules(&mut cache, "NOPEUSDT").is_none());
+        assert!(super::touch_cached_trading_rules(&mut cache, "NOPEUSDT").is_none());
         super::evict_lru_trading_rules(&mut cache);
         assert!(cache.contains_key("S02USDT"), "a stale fallback in use is not evicted");
         assert!(!cache.contains_key("S03USDT"));
-    }
-
-    use rust_decimal_macros::dec;
-
-    use super::*;
-
-    #[test]
-    fn normalize_market_quantity_rejects_below_btc_step_size() {
-        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
-        let quantity = Quantity::new(dec!(0.0004211005040573033565921178)).unwrap();
-
-        let err = normalize_market_quantity(&symbol, quantity).unwrap_err();
-
-        match err {
-            ExecError::OrderRejected(message) => {
-                assert!(message.contains("BTCUSDT"), "message: {message}");
-                assert!(message.contains("step size 0.001"), "message: {message}");
-                assert!(message.contains("minimum quantity 0.001"), "message: {message}");
-                assert!(message.contains("will not round up"), "message: {message}");
-            },
-            other => panic!("expected OrderRejected, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn stop_trigger_price_rounds_away_from_the_position() {
-        // Regression: 2026-07-04 prod. The ADR-0041 buffered stop
-        // 62811.05 + 10 bps = 62873.86105 exceeded BTCUSDT's 2-decimal price
-        // precision and Binance rejected the insurance stop (-1111).
-        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
-        let buffered = Price::new(dec!(62873.86105)).unwrap();
-
-        // Short protection (Buy stop above): never round DOWN toward entry.
-        assert_eq!(normalize_stop_trigger_price(&symbol, OrderSide::Buy, buffered), dec!(62873.87));
-        // Long protection (Sell stop below): never round UP toward entry.
-        assert_eq!(
-            normalize_stop_trigger_price(&symbol, OrderSide::Sell, buffered),
-            dec!(62873.86)
-        );
-    }
-
-    #[test]
-    fn stop_trigger_price_already_aligned_is_unchanged() {
-        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
-        let aligned = Price::new(dec!(62811.05)).unwrap();
-
-        assert_eq!(normalize_stop_trigger_price(&symbol, OrderSide::Buy, aligned), dec!(62811.05));
-        assert_eq!(normalize_stop_trigger_price(&symbol, OrderSide::Sell, aligned), dec!(62811.05));
     }
 }

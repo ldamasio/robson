@@ -151,6 +151,31 @@ pub trait ExchangePort: Send + Sync {
         self.trading_rules(symbol).await
     }
 
+    /// Rules for admission (ADR-0056 §5): validated within the TTL or
+    /// refreshed now, never a stale snapshot. An error fails admission closed.
+    async fn trading_rules_fresh(&self, symbol: &Symbol) -> Result<SymbolTradingRules, ExecError> {
+        self.trading_rules(symbol).await
+    }
+
+    /// The last validated rules of any age, for risk reduction: no venue
+    /// request and no wait on a refresh in flight.
+    fn last_validated_rules(&self, _symbol: &Symbol) -> Option<SymbolTradingRules> {
+        None
+    }
+
+    /// Whether the last validated rules are missing or past their TTL.
+    fn rules_refresh_due(&self, _symbol: &Symbol) -> bool {
+        false
+    }
+
+    /// Re-read the rules after a rules rejection (ADR-0056 §5 and §10).
+    async fn refresh_trading_rules(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<SymbolTradingRules, ExecError> {
+        self.trading_rules(symbol).await
+    }
+
     /// Place a market order.
     ///
     /// # Arguments
