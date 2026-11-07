@@ -381,13 +381,22 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
     async fn scan_and_reconcile_inner(&self) -> DaemonResult<usize> {
         let exchange_positions = self.exchange.get_all_open_positions().await?;
         let mut reconciled = 0usize;
+        // One inventory that cannot be closed (a remainder below the lot minimum,
+        // say) must not stop the rest of the pass, scan after scan. The scan still
+        // fails at the end, so it stays visible.
+        let mut first_untracked_failure = None;
+
         for exchange_position in &exchange_positions {
             if self.is_tracked(&exchange_position).await? {
                 continue;
             }
 
-            self.handle_untracked_position(exchange_position.clone()).await?;
-            reconciled += 1;
+            match self.handle_untracked_position(exchange_position.clone()).await {
+                Ok(()) => reconciled += 1,
+                Err(error) => {
+                    first_untracked_failure.get_or_insert(error);
+                },
+            }
         }
 
         reconciled += self.reconcile_local_missing_positions(&exchange_positions).await?;
@@ -397,6 +406,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
         // and never aborts the scan (invariant: insurance-stop maintenance
         // failures must not break reconciliation).
         self.sweep_orphan_insurance_orders(&exchange_positions).await;
+
+        if let Some(error) = first_untracked_failure {
+            return Err(error);
+        }
 
         if reconciled > 0 {
             self.recalibrate_capital_base_after_manual_drift(reconciled).await?;
@@ -2063,6 +2076,124 @@ mod tests {
 
         assert!(worker.scan_and_reconcile().await.is_err());
         assert_eq!(exchange.position_close_call_count(), 2);
+    }
+
+    /// ADR-0056 §5: a short manual final trade is not evidence of a close,
+    /// whatever residual the leg stands at. It stays unresolved, and
+    /// `/reconcile-close` is the recourse.
+    #[tokio::test]
+    async fn test_a_short_manual_trade_leaves_a_leg_with_a_residual_unresolved() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+
+        let mut position = tracked_active_position(symbol.clone(), Side::Long);
+        position.quantity = Quantity::new(dec!(0.01)).unwrap();
+        position.residual_quantity = Some(dec!(0.004));
+        position.entry_filled_at = Some(Utc::now() - chrono::Duration::hours(1));
+        store.positions().save(&position).await.unwrap();
+
+        exchange.set_user_trades(&symbol.as_pair(), vec![UserTradeRecord {
+            exchange_order_id: "manual-1".to_string(),
+            exchange_trade_id: "trade-1".to_string(),
+            fill_price: Price::new(dec!(90)).unwrap(),
+            filled_quantity: Quantity::new(dec!(0.004)).unwrap(),
+            fee: dec!(0.1),
+            fee_asset: "USDT".to_string(),
+            filled_at: Utc::now() - chrono::Duration::minutes(5),
+        }]);
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+
+        worker.scan_and_reconcile().await.unwrap();
+        worker.scan_and_reconcile().await.unwrap();
+
+        let loaded = store.positions().find_by_id(position.id).await.unwrap().unwrap();
+        assert!(matches!(loaded.state, PositionState::Active { .. }), "{:?}", loaded.state);
+    }
+
+    /// ADR-0056 §5, the whole way: a short exit closes the leg, and the next
+    /// scan finds what the venue still holds with no leg, and closes it as
+    /// UNTRACKED.
+    #[tokio::test]
+    async fn test_a_short_exit_closes_the_leg_and_the_next_scan_sweeps_the_rest() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let position = tracked_active_position(symbol.clone(), Side::Long);
+        store.positions().save(&position).await.unwrap();
+        exchange.set_short_fill_next(dec!(0.006));
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+
+        worker.position_manager.read().await.close_position(position.id).await.unwrap();
+
+        let loaded = store.positions().find_by_id(position.id).await.unwrap().unwrap();
+        assert!(matches!(loaded.state, PositionState::Closed { .. }), "{:?}", loaded.state);
+
+        exchange.set_open_position(
+            symbol,
+            Side::Long,
+            Quantity::new(dec!(0.004)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        worker.scan_and_reconcile().await.unwrap();
+
+        assert_eq!(exchange.position_close_call_count(), 1);
+        assert_eq!(exchange.open_positions_len(), 0);
+    }
+
+    /// The below-lot variant: the rest cannot be closed, the scan says so and
+    /// it stays on the venue, visibly. It does not stop the pass for
+    /// everything else.
+    #[tokio::test]
+    async fn test_a_remainder_below_the_lot_stays_visible_and_does_not_stop_the_scan() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let mut events = event_bus.subscribe();
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let rules = robson_domain::SymbolTradingRules::new(
+            symbol.clone(),
+            dec!(0.1),
+            dec!(0),
+            dec!(0.01),
+            dec!(0.01),
+            dec!(120),
+            dec!(0),
+            2,
+            2,
+        )
+        .unwrap();
+        exchange.set_trading_rules(rules.clone());
+        exchange.set_venue_rules(rules);
+        exchange.set_open_position(
+            symbol.clone(),
+            Side::Long,
+            Quantity::new(dec!(0.004)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        // Another leg, missing from the venue: the pass must still get to it.
+        let other_symbol = Symbol::from_pair("ETHUSDT").unwrap();
+        let other = tracked_active_position(other_symbol, Side::Long);
+        store.positions().save(&other).await.unwrap();
+        let worker =
+            create_worker(exchange.clone(), store.clone(), event_bus, Duration::from_secs(0));
+
+        assert!(worker.scan_and_reconcile().await.is_err());
+
+        assert_eq!(exchange.open_positions_len(), 1, "it stays on the venue");
+        assert!(
+            worker.missing_observations.lock().await.contains_key(&other.id),
+            "the rest of the pass still ran"
+        );
+        let mut failed = false;
+        while let Some(Ok(event)) = events.try_recv() {
+            failed |= matches!(event, DaemonEvent::SafetyExitFailed { .. });
+        }
+        assert!(failed, "and it is reported");
     }
 
     #[tokio::test]
