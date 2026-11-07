@@ -304,8 +304,8 @@ pub struct BinanceExchangeAdapter {
     /// fetch instead of stampeding the exchange. Readers of the cache never
     /// take it. Market ticks read the cached entry; zero HTTP per tick.
     rules_refresh_gate: tokio::sync::Mutex<()>,
-    /// When the last refresh failed, per symbol; cleared by a success. Bounded
-    /// like the cache.
+    /// When the last refresh that has not succeeded began, per symbol; cleared
+    /// by a success. Bounded like the cache.
     rules_refresh_failed_at: Mutex<HashMap<String, Instant>>,
     /// Placement attempts by client id (finality evidence for
     /// `order_by_client_id`). In memory: see its restart limitation.
@@ -365,53 +365,53 @@ impl BinanceExchangeAdapter {
         self.refresh_failures().get(pair).is_some_and(|at| at.elapsed() < window)
     }
 
+    /// Note an attempt for `pair`, bounded like the cache it throttles.
+    fn record_refresh_attempt(&self, pair: &str) {
+        let mut failures = self.refresh_failures();
+        if failures.len() >= TRADING_RULES_CACHE_CAPACITY && !failures.contains_key(pair) {
+            // Entries past the longest window throttle nothing. With 64
+            // symbols failing inside it, dropping the oldest can allow
+            // one early refresh of that symbol, behind the same
+            // single-flight gate; more than 64 traded symbols is a defect
+            // by this cache's own bound.
+            failures.retain(|_, at| at.elapsed() < RULES_REFRESH_RETRY_INTERVAL);
+            if failures.len() >= TRADING_RULES_CACHE_CAPACITY {
+                let oldest = failures.iter().min_by_key(|(_, at)| **at).map(|(p, _)| p.clone());
+                if let Some(oldest) = oldest {
+                    failures.remove(&oldest);
+                }
+            }
+        }
+        failures.insert(pair.to_string(), Instant::now());
+    }
+
     /// Fetch and store. The caller holds `rules_refresh_gate`; the cache lock
-    /// is only taken once the response is in.
+    /// is only taken once the response is in. The attempt is noted before the
+    /// request and cleared on success, so a bound that drops this future
+    /// counts against the floor as a failure does.
     async fn fetch_and_cache_rules(
         &self,
         symbol: &Symbol,
     ) -> Result<SymbolTradingRules, ExecError> {
         let pair = symbol.as_pair();
-        match self.fetch_trading_rules(symbol).await {
-            Ok(rules) => {
-                self.refresh_failures().remove(&pair);
-                let mut cache = self.rules_cache();
-                if cache.len() >= TRADING_RULES_CACHE_CAPACITY && !cache.contains_key(&pair) {
-                    // Bounded, never fail-closed: evicting the LRU entry
-                    // costs one exchangeInfo call on that symbol's next use,
-                    // whereas refusing would make a real arm on a new symbol
-                    // fail once 64 distinct symbols have been seen.
-                    evict_lru_trading_rules(&mut cache);
-                }
-                let now = Instant::now();
-                cache.insert(pair, CachedTradingRules {
-                    rules: rules.clone(),
-                    fetched_at: now,
-                    last_used_at: now,
-                });
-                Ok(rules)
-            },
-            Err(error) => {
-                let mut failures = self.refresh_failures();
-                if failures.len() >= TRADING_RULES_CACHE_CAPACITY && !failures.contains_key(&pair) {
-                    // Entries past the longest window throttle nothing. With 64
-                    // symbols failing inside it, dropping the oldest can allow
-                    // one early refresh of that symbol, behind the same
-                    // single-flight gate; more than 64 traded symbols is a defect
-                    // by this cache's own bound.
-                    failures.retain(|_, at| at.elapsed() < RULES_REFRESH_RETRY_INTERVAL);
-                    if failures.len() >= TRADING_RULES_CACHE_CAPACITY {
-                        let oldest =
-                            failures.iter().min_by_key(|(_, at)| **at).map(|(p, _)| p.clone());
-                        if let Some(oldest) = oldest {
-                            failures.remove(&oldest);
-                        }
-                    }
-                }
-                failures.insert(pair, Instant::now());
-                Err(error)
-            },
+        self.record_refresh_attempt(&pair);
+        let rules = self.fetch_trading_rules(symbol).await?;
+        self.refresh_failures().remove(&pair);
+        let mut cache = self.rules_cache();
+        if cache.len() >= TRADING_RULES_CACHE_CAPACITY && !cache.contains_key(&pair) {
+            // Bounded, never fail-closed: evicting the LRU entry
+            // costs one exchangeInfo call on that symbol's next use,
+            // whereas refusing would make a real arm on a new symbol
+            // fail once 64 distinct symbols have been seen.
+            evict_lru_trading_rules(&mut cache);
         }
+        let now = Instant::now();
+        cache.insert(pair, CachedTradingRules {
+            rules: rules.clone(),
+            fetched_at: now,
+            last_used_at: now,
+        });
+        Ok(rules)
     }
 
     /// Rules validated within the TTL, refreshed now when older, never stale
@@ -438,7 +438,7 @@ impl BinanceExchangeAdapter {
         };
         if self.refresh_failed_within(&pair, retry_floor) {
             return Err(ExecError::Exchange(format!(
-                "Trading rules for {pair} unavailable: the last refresh failed less than {} s ago",
+                "Trading rules for {pair} unavailable: a refresh less than {} s ago did not succeed",
                 retry_floor.as_secs()
             )));
         }
@@ -758,7 +758,7 @@ impl TradingPort for BinanceExchangeAdapter {
         }
         if self.refresh_failed_within(&pair, RULES_REJECTION_REFRESH_MIN_INTERVAL) {
             return Err(ExecError::Exchange(format!(
-                "Trading rules for {pair} unavailable: the last refresh failed less than {} s ago",
+                "Trading rules for {pair} unavailable: a refresh less than {} s ago did not succeed",
                 RULES_REJECTION_REFRESH_MIN_INTERVAL.as_secs()
             )));
         }
@@ -2187,6 +2187,34 @@ mod submit_attempt_evidence {
 
         age_refresh_failure(&venue, RULES_LOOKUP_RETRY_INTERVAL + Duration::from_secs(1));
         assert!(TradingPort::trading_rules(&*venue, &symbol).await.is_err());
+        assert_eq!(info.load(Ordering::SeqCst), 2);
+    }
+
+    /// A hung request is not a failure until something fails it, and the bound
+    /// drops the future instead. The floor holds all the same, on both paths.
+    #[tokio::test]
+    async fn a_refresh_the_bound_dropped_counts_against_the_floor() {
+        const SHORT_BOUND: Duration = Duration::from_millis(300);
+        let (venue, info, _) = metadata_venue(None, None).await;
+        let symbol = btcusdt();
+        let bounded_lookup = || {
+            quantize::bounded_metadata(SHORT_BOUND, TradingPort::trading_rules(&*venue, &symbol))
+        };
+        let bounded_refresh =
+            || quantize::bounded_metadata(SHORT_BOUND, venue.refresh_trading_rules(&symbol));
+
+        assert!(matches!(bounded_lookup().await, Err(ExecError::Timeout(_))));
+        assert_eq!(info.load(Ordering::SeqCst), 1);
+
+        // Inside the floor: refused at once, with no request.
+        assert!(matches!(bounded_lookup().await, Err(ExecError::Exchange(_))));
+        assert!(matches!(bounded_refresh().await, Err(ExecError::Exchange(_))));
+        assert_eq!(info.load(Ordering::SeqCst), 1);
+
+        age_refresh_failure(&venue, RULES_LOOKUP_RETRY_INTERVAL + Duration::from_secs(1));
+        assert!(matches!(bounded_refresh().await, Err(ExecError::Timeout(_))));
+        assert_eq!(info.load(Ordering::SeqCst), 2);
+        assert!(matches!(bounded_lookup().await, Err(ExecError::Exchange(_))));
         assert_eq!(info.load(Ordering::SeqCst), 2);
     }
 
