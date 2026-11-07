@@ -38,7 +38,7 @@ pub type AccountId = Uuid;
 /// - NO stop_gain: Exit happens when trailing stop is hit
 /// - Trailing stop uses 1x technical stop distance technique
 /// - USD-M Futures trading with fixed 1x leverage
-/// - Margin availability is the physical bound for stop-derived sizing
+/// - Available capital is the physical bound for stop-derived sizing
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Position {
     pub id: PositionId,
@@ -69,8 +69,11 @@ pub struct Position {
     /// held in `PositionState::Active` so the reconciliation worker can read it
     /// without a state match.
     pub insurance_stop_id: Option<String>,
-    /// Binance exchange identifier captured on entry fill for reconciliation.
-    pub binance_position_id: Option<String>,
+    /// Exchange-assigned position identifier captured on entry fill for
+    /// reconciliation. Serialized as `binance_position_id`, the stable wire
+    /// name (ADR-0056 §4).
+    #[serde(rename = "binance_position_id")]
+    pub exchange_position_id: Option<String>,
 
     /// Stop-policy version pinned at arm time (issue #154). Missing on wire
     /// data written before versioning = `LegacyUncapped`; the policy never
@@ -148,7 +151,7 @@ impl Position {
             entry_order_id: None,
             exit_order_id: None,
             insurance_stop_id: None,
-            binance_position_id: None,
+            exchange_position_id: None,
             stop_policy,
             stop_buffer_bps_at_arm,
             stop_plan_entry_reference: None,
@@ -239,7 +242,7 @@ impl Position {
 /// against the monthly budget (ADR-0043) instead of re-deriving it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SizedEntry {
-    /// Final quantity: risk-sized, margin-capped, and lot-step quantized
+    /// Final quantity: risk-sized, capital-capped, and lot-step quantized
     /// down when trading rules are available.
     pub quantity: Quantity,
     /// Worst expected realized loss per unit (adverse-fill costing from the
@@ -265,9 +268,9 @@ pub struct SizedEntry {
 /// worst_loss/unit  = directional_distance(entry, adverse_fill)
 ///                  + taker_fee x entry + taker_fee x adverse_fill
 /// Risk-sized qty   = Max Risk Amount / worst_loss_per_unit   (truncated)
-/// Margin basis     = min(Capital, Available Margin)
-/// Margin-sized qty = Margin basis x (1 - margin_headroom) / Entry Price
-/// qty              = quantize_down(min(risk qty, margin qty), lot step)
+/// Capital basis    = min(Capital, Available Quote)
+/// Capital cap qty  = Capital basis x (1 - margin_headroom) / Entry Price
+/// qty              = quantize_down(min(risk qty, capital cap qty), lot step)
 /// planned_risk     = qty x worst_loss_per_unit               (<= ceiling)
 /// ```
 ///
@@ -287,7 +290,7 @@ pub fn size_entry(
     entry_price: &Price,
     tech_stop: &TechnicalStopDistance,
     plan: &crate::executable_stop::ExecutableStopPlan,
-    available_margin: Option<rust_decimal::Decimal>,
+    available_quote: Option<rust_decimal::Decimal>,
     rules: Option<&crate::trading_rules::SymbolTradingRules>,
 ) -> Result<SizedEntry, DomainError> {
     let bounds = risk_config.stop_distance_bounds();
@@ -313,7 +316,7 @@ pub fn size_entry(
     // cap, which used to be masked by clamping the reported risk.
     let risk_sized_qty = (max_risk / worst_loss_per_unit)
         .round_dp_with_strategy(12, rust_decimal::RoundingStrategy::ToZero);
-    // The margin cap is a PHYSICAL bound, distinct from the policy capital
+    // The capital cap is a PHYSICAL bound, distinct from the policy capital
     // that anchors the 1% risk budget (ADR-0024 §6: capital_base stays at the
     // month-start snapshot while governed losses accrue). Its basis is the
     // LIVE exchange balance when known — mid-month drawdown makes the wallet
@@ -326,22 +329,22 @@ pub fn size_entry(
     // and the cap is truncated to 8 decimal places (finer than any exchange
     // quantity step) so the risk gate's qty × entry round-trip is exact in
     // Decimal and provably within the basis at 1x.
-    let margin_basis = match available_margin {
+    let capital_basis = match available_quote {
         Some(available) => risk_config.capital().min(available),
         None => risk_config.capital(),
     };
-    if margin_basis <= rust_decimal::Decimal::ZERO {
+    if capital_basis <= rust_decimal::Decimal::ZERO {
         return Err(DomainError::PositionSizingError(
             "Available margin must be positive".to_string(),
         ));
     }
     let headroom_factor = (rust_decimal::Decimal::from(10_000) - risk_config.margin_headroom_bps())
         / rust_decimal::Decimal::from(10_000);
-    let margin_sized_qty =
-        ((margin_basis * headroom_factor * rust_decimal::Decimal::from(RiskConfig::LEVERAGE))
+    let capital_capped_qty =
+        ((capital_basis * headroom_factor * rust_decimal::Decimal::from(RiskConfig::LEVERAGE))
             / entry)
             .round_dp_with_strategy(8, rust_decimal::RoundingStrategy::ToZero);
-    let mut position_size = risk_sized_qty.min(margin_sized_qty);
+    let mut position_size = risk_sized_qty.min(capital_capped_qty);
 
     // Lot-step quantization DOWN before submission (ADR-0050 §3): the
     // quantity the risk gate prices is the quantity the exchange executes.
@@ -1375,8 +1378,9 @@ mod tests {
     }
 
     #[test]
-    fn test_size_entry_tighter_stop_is_margin_capped() {
-        // Tighter stop would allow a larger position, but 1x margin caps it.
+    fn test_size_entry_tighter_stop_is_capital_capped() {
+        // Tighter stop would allow a larger position, but the 1x capital cap
+        // bounds it.
         let config = RiskConfig::new(dec!(10000)).unwrap();
         let entry = Price::new(dec!(95000)).unwrap();
         let stop = Price::new(dec!(94500)).unwrap();
@@ -1506,7 +1510,7 @@ mod tests {
     }
 
     #[test]
-    fn test_size_entry_caps_by_margin() {
+    fn test_size_entry_caps_by_capital() {
         let config = RiskConfig::new(dec!(351.92170492)).unwrap();
         let entry = Price::new(dec!(59623.10)).unwrap();
         let stop = Price::new(dec!(59295.60)).unwrap();
@@ -1515,16 +1519,16 @@ mod tests {
 
         let sized = size_entry(&config, &entry, &tech_stop, &plan, None, None).unwrap();
         let qty = sized.quantity.as_decimal();
-        let margin_cap = (config.capital() * dec!(0.99) / entry.as_decimal())
+        let capital_cap = (config.capital() * dec!(0.99) / entry.as_decimal())
             .round_dp_with_strategy(8, rust_decimal::RoundingStrategy::ToZero);
 
-        assert_eq!(qty, margin_cap);
+        assert_eq!(qty, capital_cap);
         assert!(sized.planned_risk < config.max_risk_amount());
     }
 
     #[test]
-    fn test_margin_capped_size_survives_gate_round_trip() {
-        // Regression: 2026-07-04 prod entry denial. The margin cap must
+    fn test_capital_capped_size_survives_gate_round_trip() {
+        // Regression: 2026-07-04 prod entry denial. The capital cap must
         // reserve the 100 bps headroom so the gate's qty x entry round-trip
         // stays below capital.
         let config = RiskConfig::new(dec!(1643.18373001)).unwrap();
@@ -1540,7 +1544,7 @@ mod tests {
         assert!(qty * entry.as_decimal() > config.capital() * dec!(0.989));
         assert!(
             qty * entry.as_decimal() <= config.capital() * dec!(0.99),
-            "margin round-trip {} exceeds headroom-adjusted capital {}",
+            "capital round-trip {} exceeds headroom-adjusted capital {}",
             qty * entry.as_decimal(),
             config.capital() * dec!(0.99)
         );
@@ -1550,7 +1554,7 @@ mod tests {
     fn test_margin_headroom_is_configurable_and_validated() {
         let base = RiskConfig::new(dec!(1000)).unwrap();
         let entry = Price::new(dec!(50000)).unwrap();
-        let stop = Price::new(dec!(49900)).unwrap(); // tight -> margin cap binds
+        let stop = Price::new(dec!(49900)).unwrap(); // tight -> capital cap binds
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
         let plan = legacy_plan(Side::Long, dec!(49900), Decimal::ZERO, None);
 
@@ -1568,12 +1572,12 @@ mod tests {
     }
 
     #[test]
-    fn test_margin_cap_bounded_by_live_available_balance() {
+    fn test_capital_cap_bounded_by_live_available_balance() {
         // Regression: 2026-07-04 prod entry rejection (third act). The
-        // physical margin cap must bind to the LIVE balance when known.
+        // physical capital cap must bind to the LIVE balance when known.
         let config = RiskConfig::new(dec!(1643.18373001)).unwrap();
         let entry = Price::new(dec!(62440.30)).unwrap();
-        let stop = Price::new(dec!(62811.05)).unwrap(); // tight -> margin cap binds
+        let stop = Price::new(dec!(62811.05)).unwrap(); // tight -> capital cap binds
         let tech_stop = TechnicalStopDistance::from_entry_and_stop(entry, stop);
         let plan = legacy_plan(Side::Short, dec!(62811.05), Decimal::ZERO, None);
         let available = dec!(1617.67600541);
@@ -1583,7 +1587,7 @@ mod tests {
         assert!(notional <= available * dec!(0.99), "notional {} exceeds wallet cap", notional);
         assert!(
             notional > available * dec!(0.989),
-            "margin cap must engage, notional {}",
+            "capital cap must engage, notional {}",
             notional
         );
 

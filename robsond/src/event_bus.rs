@@ -78,7 +78,7 @@ pub enum DaemonEvent {
         position_id: PositionId,
         symbol: Symbol,
         side: robson_domain::Side,
-        binance_position_id: String,
+        exchange_position_id: String,
     },
 
     /// Core Trading position closed (for reconciliation coordination)

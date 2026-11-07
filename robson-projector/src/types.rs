@@ -477,3 +477,37 @@ pub struct PositionClosedDomain {
     pub total_fees: Decimal,
     pub timestamp: chrono::DateTime<chrono::Utc>,
 }
+
+#[cfg(test)]
+mod adr0056_step4_contract {
+    use super::EntryFilled;
+
+    /// The active projector's `EntryFilled` payload does not carry the venue
+    /// position id (ADR-0056 §4). Inputs are the golden fixtures captured
+    /// before the naming cleanup.
+    #[test]
+    fn entry_filled_payload_ignores_the_venue_position_id() {
+        for payload in [
+            include_str!(
+                "../../robson-domain/tests/fixtures/adr0056_step4/event_entry_filled_null.json"
+            ),
+            include_str!(
+                "../../robson-domain/tests/fixtures/adr0056_step4/event_entry_filled_value.json"
+            ),
+            include_str!(
+                "../../robson-domain/tests/fixtures/adr0056_step4/\
+                 event_entry_filled_missing.input.json"
+            ),
+            include_str!(
+                "../../robson-domain/tests/fixtures/adr0056_step4/\
+                 event_entry_filled_historical.input.json"
+            ),
+        ] {
+            let filled: EntryFilled = serde_json::from_str(payload).unwrap();
+            let projected = serde_json::to_value(&filled).unwrap();
+            assert_eq!(projected["position_id"], "01940000-0000-7000-8000-000000000001");
+            assert!(projected.get("binance_position_id").is_none());
+            assert!(projected.get("exchange_position_id").is_none());
+        }
+    }
+}

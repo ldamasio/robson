@@ -1,0 +1,17 @@
+{
+  "candle_interval": {
+    "FifteenMinutes": "15m",
+    "FiveMinutes": "5m",
+    "FourHours": "4h",
+    "OneDay": "1d",
+    "OneHour": "1h",
+    "OneMinute": "1m"
+  },
+  "rest_base_url": {
+    "binance": "https://api.binance.com",
+    "binance_testnet": "https://testnet.binancefuture.com"
+  },
+  "universal_transfer_type": {
+    "MainUmfuture": "MAIN_UMFUTURE"
+  }
+}

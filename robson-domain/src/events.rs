@@ -247,8 +247,10 @@ pub enum Event {
         /// Entry-time invalidation guard level, if active.
         #[serde(default)]
         invalidation_guard_level: Option<Price>,
-        /// Binance USD-M Futures position ID used by reconciliation
-        binance_position_id: Option<String>,
+        /// Exchange-assigned position ID used by reconciliation. Persisted as
+        /// `binance_position_id`, the stable wire name (ADR-0056 §4).
+        #[serde(rename = "binance_position_id")]
+        exchange_position_id: Option<String>,
         /// When the fill occurred
         timestamp: DateTime<Utc>,
     },
@@ -798,7 +800,7 @@ mod tests {
             fee: dec!(0.001),
             initial_stop: Price::new(dec!(93500)).unwrap(),
             invalidation_guard_level: None,
-            binance_position_id: None,
+            exchange_position_id: None,
             timestamp: Utc::now(),
         }
     }
@@ -1707,7 +1709,7 @@ mod tests {
             fee: dec!(0.001),
             initial_stop: Price::new(dec!(93500)).unwrap(),
             invalidation_guard_level: None,
-            binance_position_id: None,
+            exchange_position_id: None,
             timestamp: Utc::now(),
         }
     }

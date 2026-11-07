@@ -144,14 +144,6 @@ impl Exchange {
             _ => None,
         }
     }
-
-    /// Get the base URL for API calls.
-    pub fn base_url(&self) -> &'static str {
-        match self {
-            Exchange::Binance => "https://api.binance.com",
-            Exchange::BinanceTestnet => "https://testnet.binancefuture.com",
-        }
-    }
 }
 
 // =============================================================================
@@ -408,12 +400,6 @@ mod tests {
         let aad_str = String::from_utf8(id.aad()).unwrap();
 
         assert_eq!(aad_str, "default|local|default|binance");
-    }
-
-    #[test]
-    fn test_exchange_base_url() {
-        assert_eq!(Exchange::Binance.base_url(), "https://api.binance.com");
-        assert_eq!(Exchange::BinanceTestnet.base_url(), "https://testnet.binancefuture.com");
     }
 
     #[test]
