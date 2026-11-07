@@ -402,12 +402,14 @@ where
         PositionState::Active { invalidation_guard_level, .. } => *invalidation_guard_level,
         _ => None,
     };
-    // Trading rules are fetched best-effort for EVERY policy here: the
-    // healing comparison quantizes both sides on the tick grid, otherwise
+    // Trading rules are read best-effort for EVERY policy here (what is held,
+    // ADR-0056 §5, looked up only when nothing is): the healing comparison
+    // quantizes both sides on the tick grid, otherwise
     // the sub-tick difference between a raw legacy derivation and the
     // adapter-aligned placed price would cancel-replace a correct stop on
     // every restart.
-    let comparison_rules = pm.exchange().trading_rules(&position.symbol).await.ok();
+    let comparison_rules =
+        pm.rules_for_managing(&position.symbol, position.rules_snapshot.as_ref()).await;
     let plan_rules = pm.trading_rules_for(position).await;
     let executable_stop = match pm.engine().stop_plan(
         position,
@@ -1100,6 +1102,124 @@ mod tests {
         );
     }
 
+    /// A triggered with its market order still working: recovery finds no fill
+    /// and no open order, so it places B. The venue still holds the leg.
+    async fn startup_placed_a_successor_over_a_triggered_stop(
+        pm: &Arc<PositionManager<StubExchange, MemoryStore>>,
+    ) -> (Position, String) {
+        let exchange = pm.exchange();
+        let stop_a = exchange
+            .place_stop_market_order(
+                &btcusdt(),
+                OrderSide::Sell,
+                Quantity::new(dec!(0.01)).unwrap(),
+                Price::new(dec!(76158.25)).unwrap(),
+                "ins-a",
+            )
+            .await
+            .unwrap()
+            .exchange_order_id;
+        let position = with_insurance_stop(btcusdt_long_position(Uuid::now_v7()), &stop_a);
+        pm.store().positions().save(&position).await.unwrap();
+        pm.store()
+            .events()
+            .append(&Event::InsuranceStopPlaced {
+                position_id: position.id,
+                order_id: stop_a.clone(),
+                stop_price: Price::new(dec!(76158.25)).unwrap(),
+                timestamp: Utc::now(),
+            })
+            .await
+            .unwrap();
+        exchange.set_open_position(
+            btcusdt(),
+            Side::Long,
+            position.quantity,
+            position.entry_price.unwrap(),
+        );
+        exchange.trigger_stop_order(&stop_a);
+
+        let closed = heal_insurance_stop(pm, &position, Price::new(dec!(76158.25)).unwrap()).await;
+
+        assert!(!closed);
+        let loaded = pm.store().positions().find_by_id(position.id).await.unwrap().unwrap();
+        assert_ne!(loaded.insurance_stop_id.as_deref(), Some(stop_a.as_str()));
+        (position, stop_a)
+    }
+
+    /// A fills the whole leg and the venue goes flat. The missing-position path
+    /// closes it as the stop it was, and the loss counts.
+    async fn the_displaced_fill_closes_the_leg_in_the_budget(
+        pm: Arc<PositionManager<StubExchange, MemoryStore>>,
+        position: &Position,
+        stop_a: &str,
+    ) {
+        let exchange = pm.exchange();
+        exchange.set_price("BTCUSDT", dec!(76000));
+        exchange.fill_stop_order_for(stop_a, position.quantity).unwrap();
+        exchange.clear_open_position(&position.symbol, position.side);
+
+        let store = pm.store();
+        let event_bus = Arc::new(EventBus::new(16));
+        let held =
+            Arc::new(tokio::sync::RwLock::new(Arc::try_unwrap(pm).ok().expect("sole owner")));
+        let worker = crate::reconciliation_worker::ReconciliationWorker::new_with_missing_grace(
+            exchange,
+            held.clone(),
+            store,
+            event_bus,
+            std::time::Duration::from_secs(60),
+            std::time::Duration::ZERO,
+            tokio_util::sync::CancellationToken::new(),
+        );
+        worker.scan_and_reconcile().await.unwrap();
+        worker.scan_and_reconcile().await.unwrap();
+
+        let pm = held.read().await;
+        let closed = pm.store().positions().find_by_id(position.id).await.unwrap().unwrap();
+        assert!(
+            matches!(closed.state, PositionState::Closed {
+                exit_reason: ExitReason::InsuranceStop,
+                ..
+            }),
+            "{:?}",
+            closed.state
+        );
+        let net = pm.robson_month_net(Utc::now()).await.unwrap();
+        assert!(closed.realized_pnl < Decimal::ZERO);
+        assert_eq!(net, closed.realized_pnl - closed.fees_paid);
+    }
+
+    #[tokio::test]
+    async fn a_stop_recovery_placed_over_keeps_its_loss_in_the_budget() {
+        let pm = heal_manager().await;
+        let (position, stop_a) = startup_placed_a_successor_over_a_triggered_stop(&pm).await;
+
+        the_displaced_fill_closes_the_leg_in_the_budget(pm, &position, &stop_a).await;
+    }
+
+    /// The same with a restart before the close: the stream gives the displaced
+    /// stop back, and `insurance_stop_placed` is what says it was there.
+    #[tokio::test]
+    async fn a_restart_after_recovery_placed_over_a_stop_still_finds_its_fill() {
+        let pm = heal_manager().await;
+        let (position, stop_a) = startup_placed_a_successor_over_a_triggered_stop(&pm).await;
+        let mut restored = pm.store().positions().find_by_id(position.id).await.unwrap().unwrap();
+        restored.superseded_stop_ids.clear();
+        for event in pm.store().events().find_by_position(position.id).await.unwrap() {
+            restored
+                .restore_leg_evidence_record(
+                    event.event_type(),
+                    serde_json::to_value(&event).unwrap(),
+                )
+                .unwrap();
+        }
+        assert_eq!(restored.superseded_stop_ids, [stop_a.clone()]);
+        pm.store().positions().save(&restored).await.unwrap();
+
+        the_displaced_fill_closes_the_leg_in_the_budget(pm, &position, &stop_a).await;
+    }
+
     #[tokio::test]
     async fn heal_replaces_insurance_stop_when_open_at_a_different_price() {
         let pm = heal_manager().await;
@@ -1307,6 +1427,58 @@ mod tests {
             ClosureEvidence::Reconciled(ReconciliationEvidence::OrderFillRecord(_))
         ));
         assert_eq!(recovery_check_outcome(&events, position_id), Some("filled_reconciled_closed"));
+    }
+
+    /// A protective stop filled during the gap, for less than the leg.
+    async fn leg_whose_stop_filled_short(
+        pm: &Arc<PositionManager<StubExchange, MemoryStore>>,
+    ) -> Position {
+        let symbol = btcusdt();
+        let stop = pm
+            .exchange()
+            .place_stop_market_order(
+                &symbol,
+                OrderSide::Sell,
+                Quantity::new(dec!(0.008)).unwrap(),
+                Price::new(dec!(76158.25)).unwrap(),
+                "ins-short",
+            )
+            .await
+            .unwrap();
+        let stop_id = stop.exchange_order_id.clone();
+        pm.exchange().fill_stop_order(&stop_id);
+        let mut position = btcusdt_long_position(Uuid::now_v7());
+        position.quantity = Quantity::new(dec!(0.01)).unwrap();
+        position = with_insurance_stop(position, &stop_id);
+        pm.store().positions().save(&position).await.unwrap();
+        position
+    }
+
+    /// A stop's fill closes the leg however short of it and whatever the venue
+    /// still holds, and the close books the whole leg at that fill. No
+    /// venue read decides it (ADR-0056 §5).
+    #[tokio::test]
+    async fn heal_closes_on_a_short_stop_fill_with_the_venue_holding_the_rest() {
+        let pm = heal_manager().await;
+        let position = leg_whose_stop_filled_short(&pm).await;
+        pm.exchange().set_open_position(
+            btcusdt(),
+            Side::Long,
+            Quantity::new(dec!(0.002)).unwrap(),
+            Price::new(dec!(78000)).unwrap(),
+        );
+
+        let trailing_stop = Price::new(dec!(76158.25)).unwrap();
+        assert!(heal_insurance_stop(&pm, &position, trailing_stop).await);
+
+        let loaded = pm.store().positions().find_by_id(position.id).await.unwrap().unwrap();
+        match loaded.state {
+            PositionState::Closed { realized_pnl, exit_price, .. } => {
+                let entry = position.entry_price.unwrap().as_decimal();
+                assert_eq!(realized_pnl, (exit_price.as_decimal() - entry) * dec!(0.01));
+            },
+            other => panic!("expected Closed, got {other:?}"),
+        }
     }
 
     /// Issue #154 deliverable 7: healing is idempotent. After a heal placed

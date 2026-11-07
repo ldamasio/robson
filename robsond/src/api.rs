@@ -349,6 +349,10 @@ pub struct PositionSummary {
     /// The terminal rejection behind `needs_operator_rearm` (ADR-0050 §7).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_rejection: Option<LastRejectionSummary>,
+    /// The latest residual recorded on this position (ADR-0056 §5). It blocks
+    /// new admissions until the position closes, and is not priced anywhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residual_quantity: Option<Decimal>,
 }
 
 /// Terminal entry rejection surfaced with an Armed position (ADR-0050 §7).
@@ -2360,13 +2364,17 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
         DaemonError::ApprovalExpired(_) => StatusCode::GONE,
         DaemonError::ApprovalDenied { .. } => StatusCode::CONFLICT,
         DaemonError::MonthlyHaltActive { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        DaemonError::ResidualInventoryUnresolved { .. } => StatusCode::CONFLICT,
         DaemonError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // Exchange transport failures are upstream errors, not client errors.
         // Immediate-mode arm calls handle_signal synchronously; a connection or
         // timeout failure must not surface as 400. Other Exec variants
         // (OrderRejected, InvalidState) reflect business-rule rejections and
         // stay 400 so callers can distinguish them from infrastructure faults.
+        // A venue refusal typed for ADR-0056 §5 is still a venue refusal.
         DaemonError::Exec(robson_exec::ExecError::Exchange(_))
+        | DaemonError::Exec(robson_exec::ExecError::RulesRejected(_))
+        | DaemonError::Exec(robson_exec::ExecError::ReduceOnlyRejected(_))
         | DaemonError::Exec(robson_exec::ExecError::Timeout(_)) => StatusCode::BAD_GATEWAY,
         DaemonError::Exec(_) => StatusCode::BAD_REQUEST,
         DaemonError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -2379,6 +2387,18 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
     };
 
     (status, Json(ErrorResponse { error: error.to_string() }))
+}
+
+#[cfg(test)]
+pub(crate) async fn position_summary_for_test<E, S>(
+    manager: &PositionManager<E, S>,
+    position: &Position,
+) -> PositionSummary
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    position_to_summary_with_live_price(manager, position).await
 }
 
 async fn position_to_summary_with_live_price<E, S>(
@@ -2737,6 +2757,7 @@ fn position_to_summary(
                             variation_pct,
                             entry_status: None,
                             last_rejection: None,
+                            residual_quantity: position.residual_quantity,
                         };
                     },
                 };
@@ -2801,6 +2822,7 @@ fn position_to_summary(
         variation_pct,
         entry_status: None,
         last_rejection: None,
+        residual_quantity: position.residual_quantity,
     }
 }
 
@@ -3432,9 +3454,9 @@ mod tests {
         closed_at_month_start.created_at = month - chrono::Duration::days(10);
         closed_at_month_start.closed_at = Some(month);
 
+        assert!(position_overlaps_month(&closed_at_month_start, month, next));
         assert!(position_overlaps_month(&inherited, month, next));
         assert!(position_overlaps_month(&closed_later, month, next));
-        assert!(position_overlaps_month(&closed_at_month_start, month, next));
         assert!(!position_overlaps_month(&closed_before, month, next));
         assert!(!position_overlaps_month(&born_after, month, next));
     }
@@ -3898,6 +3920,135 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// ADR-0056 §5: a fill closes the position, however short of it, and the
+    /// routes answer as they always have.
+    #[tokio::test]
+    async fn a_close_that_fills_short_answers_204_and_panic_lists_what_it_closed() {
+        for panic in [false, true] {
+            let (app, _, position_manager, exchange) = create_test_app_with_event_bus_and_exchange(
+                100,
+                Arc::new(StubExchange::new(dec!(95000))),
+            )
+            .await;
+            let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+            let mut position = Position::new(Uuid::now_v7(), symbol.clone(), Side::Long);
+            position.entry_price = Some(Price::new(dec!(95000)).unwrap());
+            position.quantity = Quantity::new(dec!(1)).unwrap();
+            position.state = PositionState::Active {
+                current_price: Price::new(dec!(95000)).unwrap(),
+                trailing_stop: Price::new(dec!(90000)).unwrap(),
+                favorable_extreme: Price::new(dec!(95000)).unwrap(),
+                extreme_at: Utc::now(),
+                insurance_stop_id: None,
+                invalidation_guard_level: None,
+                last_emitted_stop: None,
+            };
+            position_manager.read().await.store().positions().save(&position).await.unwrap();
+            exchange.set_open_position(
+                symbol,
+                Side::Long,
+                Quantity::new(dec!(0.4)).unwrap(),
+                Price::new(dec!(95000)).unwrap(),
+            );
+            exchange.set_short_fill_next(dec!(0.6));
+
+            let request = if panic {
+                Request::builder().method("POST").uri("/panic").body(Body::empty()).unwrap()
+            } else {
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/positions/{}", position.id))
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            let response = app.oneshot(request).await.unwrap();
+
+            if panic {
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let body: PanicResponse = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body.count, 1);
+                assert_eq!(body.closed_positions, [position.id]);
+            } else {
+                assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            }
+        }
+    }
+
+    /// A venue refusal on a live route. Closing answers 502; `/panic` reports
+    /// per leg, so it answers 200 and does not claim the leg. Both as
+    /// before ADR-0056 step 6.
+    #[tokio::test]
+    async fn a_venue_refusal_answers_502_on_close_and_200_without_the_leg_on_panic() {
+        let refusals: [(fn(&StubExchange), &str); 2] = [
+            (
+                |exchange| exchange.set_rules_rejections_next(100),
+                "Execution error: Exchange error: Simulated rules rejection",
+            ),
+            (
+                |exchange| exchange.set_reduce_only_rejections_next(100),
+                "Execution error: Exchange error: Binance API error: -2022 - ReduceOnly Order is \
+                 rejected.",
+            ),
+        ];
+        for (refuse, expected_body) in refusals {
+            let (app, _, position_manager, exchange) = create_test_app_with_event_bus_and_exchange(
+                100,
+                Arc::new(StubExchange::new(dec!(95000))),
+            )
+            .await;
+            let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+            let mut position = Position::new(Uuid::now_v7(), symbol.clone(), Side::Long);
+            position.entry_price = Some(Price::new(dec!(95000)).unwrap());
+            position.quantity = Quantity::new(dec!(1)).unwrap();
+            position.state = PositionState::Active {
+                current_price: Price::new(dec!(95000)).unwrap(),
+                trailing_stop: Price::new(dec!(90000)).unwrap(),
+                favorable_extreme: Price::new(dec!(95000)).unwrap(),
+                extreme_at: Utc::now(),
+                insurance_stop_id: None,
+                invalidation_guard_level: None,
+                last_emitted_stop: None,
+            };
+            position_manager.read().await.store().positions().save(&position).await.unwrap();
+            // Still open on the venue: the refusal is not a position already gone.
+            exchange.set_open_position(
+                symbol,
+                Side::Long,
+                position.quantity,
+                Price::new(dec!(95000)).unwrap(),
+            );
+            refuse(&exchange);
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/positions/{}", position.id))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], expected_body);
+
+            let response = app
+                .oneshot(
+                    Request::builder().method("POST").uri("/panic").body(Body::empty()).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: PanicResponse = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body.count, 0);
+        }
     }
 
     #[tokio::test]
@@ -4830,6 +4981,24 @@ mod tests {
         let (status, _) =
             to_error_response(DaemonError::Exec(ExecError::Timeout("read timeout".to_string())));
         assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    /// ADR-0056 step 6 typed these venue refusals, which were `Exchange` before
+    /// it: same status, same body.
+    #[test]
+    fn to_error_response_typed_venue_refusals_answer_as_exchange_failures() {
+        use robson_exec::ExecError;
+        let message = "Binance API error: -4164 - Order's notional must be no smaller than 50";
+        let (_, exchange_body) =
+            to_error_response(DaemonError::Exec(ExecError::Exchange(message.to_string())));
+        for refusal in [
+            ExecError::RulesRejected(message.to_string()),
+            ExecError::ReduceOnlyRejected(message.to_string()),
+        ] {
+            let (status, body) = to_error_response(DaemonError::Exec(refusal));
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(body.0.error, exchange_body.0.error);
+        }
     }
 
     #[test]

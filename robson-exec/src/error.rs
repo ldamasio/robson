@@ -13,6 +13,24 @@ pub enum ExecError {
     #[error("Order rejected: {0}")]
     OrderRejected(String),
 
+    /// The venue refused an order because of a value in its trading rules
+    /// (lot step, minimum or maximum quantity, tick, minimum notional,
+    /// precision). Metadata may be stale, so risk reduction refreshes once and
+    /// resubmits (ADR-0056 §5). What counts is a narrow per-venue allow-list in
+    /// the adapter. This is not finality evidence: whether an order can still
+    /// surface is answered separately by `VenueFinalityRule`. Displays as
+    /// [`ExecError::Exchange`]: the type is for ADR-0056 §5, and to a caller of
+    /// the API a venue refusal answers what it always has.
+    #[error("Exchange error: {0}")]
+    RulesRejected(String),
+
+    /// The venue refused a reduce-only order. On a position account that means
+    /// nothing is left to reduce, or the order conflicts with others resting on
+    /// the same position; which one takes an account observation to tell.
+    /// Displays as [`ExecError::Exchange`], for the same reason.
+    #[error("Exchange error: {0}")]
+    ReduceOnlyRejected(String),
+
     /// Intent journal error
     #[error("Intent journal error: {0}")]
     IntentJournal(String),

@@ -1,6 +1,6 @@
 # bronze-event-registry — normative event_type registry for bronze-v1 §2.1
 #
-# Owned by the bronze-v1 data contract (v1.1.3). The exporter validates every
+# Owned by the bronze-v1 data contract (v1.2.0). The exporter validates every
 # event_log row against this registry and ABORTS the run (schema drift) on:
 #   - an event_type absent from this file;
 #   - a payload whose top-level key set is not (required ∪ subset-of-optional);
@@ -14,7 +14,9 @@
 # `redact` paths are replaced with "[redacted-bronze-v1]" per contract §2.3.
 #
 # Audit basis: pre-Phase-B payload field audit (2026-08-06) for the 31
-# robson-domain::Event variants; code-derived audit (2026-08-07) for
+# robson-domain::Event variants of that date (residual_inventory_recorded and
+# entry_signal_received.rules_snapshot added from code, 2026-11-06, ADR-0056
+# step 6, not yet observed in a live inventory); code-derived audit (2026-08-07) for
 # QUERY_STATE_CHANGED; live-row audit (2026-08-12 provisioning-window
 # inventory) for STRATEGY_CREATED. Leaf-level classification of nested objects lives in
 # the audit study; this registry validates top-level shape plus every redact
@@ -25,7 +27,7 @@
 # against this file in the provisioning window (gated, read-only).
 
 version: 1
-contract: bronze-v1/1.1.3
+contract: bronze-v1/1.2.0
 default_action: abort
 
 exceptions:
@@ -34,6 +36,9 @@ exceptions:
   exit_reason_enum: &exit_reason_enum
     kind: closed_enum
     values: [TrailingStop, InsuranceStop, UserPanic, DegradedMode, PositionError, DisarmedByUser, ReconciledMissingOnExchange]
+  residual_order_kind: &residual_order_kind
+    kind: closed_enum
+    values: [exit, protection]
   skipped_level_reason: &skipped_level_reason
     kind: closed_enum
     values: [below_min, above_max]
@@ -50,7 +55,7 @@ exceptions:
     known_values: [no_valid_signal, executable_stop_out_of_bounds, trading_rules_unavailable, degenerate_stop_span, admission_evidence_present, signal_domain_rejection]
 
 event_types:
-  # ---- robson-domain::Event (31 variants, audited) ----------------------
+  # ---- robson-domain::Event (32 variants, audited) ----------------------
   position_armed:
     status: audited
     has_type_discriminator: true
@@ -89,7 +94,7 @@ event_types:
     status: audited
     has_type_discriminator: true
     required: {type: string, position_id: string, signal_id: string, entry_price: string, stop_loss: string, quantity: string, timestamp: string}
-    optional: {initial_executable_stop: string, executable_span: string, cap_basis_distance: string, tick_size: string}
+    optional: {initial_executable_stop: string, executable_span: string, cap_basis_distance: string, tick_size: string, rules_snapshot: object}
     redact: []
   entry_order_placed:  # legacy variant kept for replay
     status: audited
@@ -179,6 +184,14 @@ event_types:
     required: {type: string, position_id: string, order_id: string, fill_price: string, filled_quantity: string, fee: string, timestamp: string}
     optional: {}
     redact: []
+  residual_inventory_recorded:  # ADR-0056 §5
+    status: audited
+    has_type_discriminator: true
+    required: {type: string, position_id: string, order_kind: string, requested_quantity: string, accepted_quantity: string, residual_quantity: string, exchange_order_id: "string|null", fill_price: "string|null", fee: "string|null", step_size: "string|null", min_qty: "string|null", timestamp: string}
+    optional: {}
+    redact: []
+    exceptions:
+      "$.order_kind": *residual_order_kind
   position_closed:
     status: audited
     has_type_discriminator: true

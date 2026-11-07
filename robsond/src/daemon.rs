@@ -26,7 +26,7 @@ use robson_domain::{ApprovalPolicy, EntryPolicy, EntryPolicyConfig};
 use robson_domain::{Position, PositionState, Price, Symbol, TradingPolicy};
 use robson_engine::Engine;
 #[cfg(feature = "postgres")]
-use robson_eventlog::{query_events, EventEnvelope, QueryOptions};
+use robson_eventlog::{query_events, query_stream_in_seq_order, EventEnvelope, QueryOptions};
 use robson_exec::{
     venue::Venue, ExchangePort, Executor, IntentJournal, OhlcvPort, StubExchange, StubTradeFeed,
     TradeFeedPort,
@@ -1451,7 +1451,8 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
                     // A partial reconstruction is not a safe degraded mode:
                     // every recovered risk-bearing position must enter the
                     // canonical store before startup can continue.
-                    for position in restored_positions {
+                    for mut position in restored_positions {
+                        self.restore_leg_evidence(tenant_id, &mut position).await?;
                         self.store.positions().save(&position).await?;
                     }
 
@@ -1469,6 +1470,65 @@ impl<E: Venue + 'static, S: Store + 'static> Daemon<E, S> {
             info!("No active positions to restore");
         }
 
+        Ok(())
+    }
+
+    /// Read back what `positions_current` does not carry (ADR-0056 §5): the
+    /// leg's rules snapshot, its latest residual and the stops it displaced,
+    /// from the event log, in stream order. One query per recovered leg.
+    ///
+    /// A query that fails aborts startup: the database is needed anyway, the
+    /// pod restarts and retries, and exchange stops stay live meanwhile. A
+    /// row that cannot be read does not abort, since it would crash-loop a
+    /// daemon that still has to manage the leg: a residual row blocks
+    /// admissions until the leg closes, and a rules snapshot stays
+    /// degraded.
+    #[cfg(feature = "postgres")]
+    async fn restore_leg_evidence(
+        &self,
+        tenant_id: uuid::Uuid,
+        position: &mut Position,
+    ) -> DaemonResult<()> {
+        const LEG_EVIDENCE: [&str; 4] = [
+            "entry_signal_received",
+            "residual_inventory_recorded",
+            "insurance_stop_placed",
+            "insurance_stop_replaced",
+        ];
+        let Some(pool) = &self.pg_pool else {
+            return Ok(());
+        };
+        if matches!(position.state, PositionState::Armed) {
+            return Ok(());
+        }
+        let stream_key = format!("position:{}", position.id);
+        let envelopes = query_stream_in_seq_order(pool, tenant_id, &stream_key, &LEG_EVIDENCE)
+            .await
+            .map_err(|error| {
+                DaemonError::EventLog(format!(
+                    "Reading the leg evidence of position {}: {error}",
+                    position.id
+                ))
+            })?;
+        for envelope in envelopes {
+            if let Err(error) =
+                position.restore_leg_evidence_record(&envelope.event_type, envelope.payload)
+            {
+                warn!(
+                    position_id = %position.id,
+                    event_type = %envelope.event_type,
+                    seq = envelope.seq,
+                    %error,
+                    "Unreadable leg evidence in the event log"
+                );
+            }
+        }
+        if position.residual_unknown {
+            error!(
+                position_id = %position.id,
+                "Residual row unreadable; admissions stay blocked until this leg closes (ADR-0056 §5)"
+            );
+        }
         Ok(())
     }
 
@@ -2250,6 +2310,63 @@ mod tests {
         assert!(daemon.store.positions().find_active().await.unwrap().is_empty());
     }
 
+    #[cfg(feature = "postgres")]
+    struct OneLegProjectionRecovery(Position);
+
+    #[cfg(feature = "postgres")]
+    #[async_trait::async_trait]
+    impl robson_store::ProjectionRecovery for OneLegProjectionRecovery {
+        async fn find_active_from_projection(
+            &self,
+            _tenant_id: uuid::Uuid,
+        ) -> Result<Vec<robson_domain::Position>, robson_store::StoreError> {
+            Ok(vec![self.0.clone()])
+        }
+    }
+
+    /// ADR-0056 §5: an event log that cannot be read at restart aborts startup
+    /// on the exit code that gets retried; it must not read as evidence
+    /// against the leg. The pool points at nothing, so this needs no
+    /// database. It is ignored only because the postgres-feature pass in CI
+    /// runs `--ignored`.
+    #[cfg(feature = "postgres")]
+    #[tokio::test]
+    #[ignore = "Runs in the postgres-feature pass; needs no database"]
+    async fn an_event_log_read_failure_aborts_startup_with_a_retryable_exit() {
+        let pool = sqlx::postgres::PgPoolOptions::new()
+            .acquire_timeout(Duration::from_millis(200))
+            .connect_lazy("postgres://robson@127.0.0.1:1/unreachable")
+            .unwrap();
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(uuid::Uuid::now_v7());
+        let mut position = Position::new(
+            uuid::Uuid::now_v7(),
+            Symbol::from_pair("BTCUSDT").unwrap(),
+            robson_domain::Side::Long,
+        );
+        position.quantity = robson_domain::Quantity::new(dec!(0.105)).unwrap();
+        position.state = PositionState::Active {
+            current_price: Price::new(dec!(77500)).unwrap(),
+            trailing_stop: Price::new(dec!(76000)).unwrap(),
+            favorable_extreme: Price::new(dec!(77500)).unwrap(),
+            extreme_at: Utc::now(),
+            insurance_stop_id: Some("ins-1".to_string()),
+            invalidation_guard_level: None,
+            last_emitted_stop: None,
+        };
+        let daemon = Daemon::new_stub_with_recovery(
+            config,
+            Some(Arc::new(OneLegProjectionRecovery(position))),
+            Some(Arc::new(pool)),
+        );
+
+        let error = daemon.restore_positions().await.unwrap_err();
+
+        assert!(matches!(error, DaemonError::EventLog(_)), "{error:?}");
+        assert_eq!(crate::error::exit_code_for_daemon_error(&error), 1);
+        assert!(daemon.store.positions().find_active().await.unwrap().is_empty());
+    }
+
     #[tokio::test]
     async fn test_daemon_shutdown() {
         // Test that daemon shutdown properly calls position manager shutdown
@@ -2304,6 +2421,199 @@ mod tests {
         let now = Utc.with_ymd_and_hms(2026, 7, 2, 8, 29, 4).single().unwrap();
         assert!(daemon.poll_month_boundary(now).await.unwrap());
         assert!(!daemon.poll_month_boundary(now).await.unwrap());
+    }
+
+    /// ADR-0056 §5: a restart reads the leg evidence back from `event_log`,
+    /// since `positions_current` has no column for it (§8: no migration in
+    /// step 6). In stream order: timestamps here run against the stream to
+    /// show they do not decide, and the first signal has no snapshot. Repeated
+    /// short replacements write one residual and stops after it do not clear
+    /// it.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn restart_reads_leg_evidence_back_in_stream_order(pool: sqlx::PgPool) {
+        let tenant_id = uuid::Uuid::from_u128(0x56601);
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(tenant_id);
+        let daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())));
+
+        let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+        let mut position =
+            Position::new(uuid::Uuid::now_v7(), symbol.clone(), robson_domain::Side::Long);
+        position.quantity = robson_domain::Quantity::new(dec!(0.105)).unwrap();
+        position.state = PositionState::Active {
+            current_price: Price::new(dec!(77500)).unwrap(),
+            trailing_stop: Price::new(dec!(76000)).unwrap(),
+            favorable_extreme: Price::new(dec!(77500)).unwrap(),
+            extreme_at: Utc::now(),
+            insurance_stop_id: Some("ins-3".to_string()),
+            invalidation_guard_level: None,
+            last_emitted_stop: None,
+        };
+        let rules = |step: Decimal| {
+            robson_domain::SymbolTradingRules::new(
+                symbol.clone(),
+                dec!(0.10),
+                dec!(556.80),
+                step,
+                step,
+                dec!(120),
+                dec!(50),
+                2,
+                3,
+            )
+            .unwrap()
+        };
+        let signal = |rules_snapshot| robson_domain::Event::EntrySignalReceived {
+            position_id: position.id,
+            signal_id: uuid::Uuid::now_v7(),
+            entry_price: Price::new(dec!(77500)).unwrap(),
+            stop_loss: Price::new(dec!(76000)).unwrap(),
+            quantity: robson_domain::Quantity::new(dec!(0.105)).unwrap(),
+            initial_executable_stop: None,
+            executable_span: None,
+            cap_basis_distance: None,
+            tick_size: None,
+            rules_snapshot,
+            timestamp: Utc::now(),
+        };
+        let residual = |residual_quantity| robson_domain::Event::ResidualInventoryRecorded {
+            position_id: position.id,
+            order_kind: robson_domain::ReductionKind::Protection,
+            requested_quantity: dec!(0.105),
+            accepted_quantity: dec!(0.105) - residual_quantity,
+            residual_quantity,
+            exchange_order_id: None,
+            fill_price: None,
+            fee: None,
+            step_size: Some(dec!(0.01)),
+            min_qty: Some(dec!(0.01)),
+            timestamp: Utc::now(),
+        };
+        let placed = |order: &str| robson_domain::Event::InsuranceStopPlaced {
+            position_id: position.id,
+            order_id: order.to_string(),
+            stop_price: Price::new(dec!(76000)).unwrap(),
+            timestamp: Utc::now(),
+        };
+        let stop = |previous: &str, order: &str| robson_domain::Event::InsuranceStopReplaced {
+            position_id: position.id,
+            previous_order_id: previous.to_string(),
+            order_id: order.to_string(),
+            stop_price: Price::new(dec!(76000)).unwrap(),
+            timestamp: Utc::now(),
+        };
+        let stream = format!("position:{}", position.id);
+        let events = [
+            signal(None),
+            signal(Some(rules(dec!(0.001)))),
+            signal(Some(rules(dec!(0.01)))),
+            residual(dec!(0.001)),
+            residual(dec!(0.005)),
+            placed("ins-1"),
+            placed("ins-2"),
+            stop("ins-2", "ins-3"),
+        ];
+        for (index, event) in events.iter().enumerate() {
+            let payload = serde_json::to_value(event).unwrap();
+            let mut envelope =
+                robson_eventlog::Event::new(tenant_id, &stream, event.event_type(), payload);
+            // Later in the stream, earlier on the clock.
+            envelope.occurred_at -= chrono::Duration::seconds(index as i64 + 1);
+            robson_eventlog::append_event(&pool, &stream, None, envelope).await.unwrap();
+        }
+
+        daemon.restore_leg_evidence(tenant_id, &mut position).await.unwrap();
+
+        assert_eq!(position.rules_snapshot, Some(rules(dec!(0.001))));
+        assert_eq!(position.residual_quantity, Some(dec!(0.005)));
+        assert!(!position.residual_unknown);
+        assert_eq!(position.superseded_stop_ids, ["ins-2", "ins-1"]);
+    }
+
+    /// A residual row that cannot be read blocks admissions without aborting
+    /// startup, and nothing later in the stream clears that; rules that cannot
+    /// be read stay degraded.
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn an_unreadable_residual_row_blocks_admissions_and_unreadable_rules_do_not(
+        pool: sqlx::PgPool,
+    ) {
+        let tenant_id = uuid::Uuid::from_u128(0x56602);
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(tenant_id);
+        let daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())));
+        let active = || {
+            let mut position = Position::new(
+                uuid::Uuid::now_v7(),
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                robson_domain::Side::Long,
+            );
+            position.quantity = robson_domain::Quantity::new(dec!(0.105)).unwrap();
+            position.state = PositionState::Active {
+                current_price: Price::new(dec!(77500)).unwrap(),
+                trailing_stop: Price::new(dec!(76000)).unwrap(),
+                favorable_extreme: Price::new(dec!(77500)).unwrap(),
+                extreme_at: Utc::now(),
+                insurance_stop_id: Some("ins-1".to_string()),
+                invalidation_guard_level: None,
+                last_emitted_stop: None,
+            };
+            position
+        };
+
+        let mut unreadable_rules = active();
+        let stream = format!("position:{}", unreadable_rules.id);
+        let envelope = robson_eventlog::Event::new(
+            tenant_id,
+            &stream,
+            "entry_signal_received",
+            serde_json::json!({ "type": "entry_signal_received", "garbage": true }),
+        );
+        robson_eventlog::append_event(&pool, &stream, None, envelope).await.unwrap();
+        daemon.restore_leg_evidence(tenant_id, &mut unreadable_rules).await.unwrap();
+        assert!(!unreadable_rules.has_unresolved_residual());
+
+        let mut unreadable_residual = active();
+        let stream = format!("position:{}", unreadable_residual.id);
+        let envelope = robson_eventlog::Event::new(
+            tenant_id,
+            &stream,
+            "residual_inventory_recorded",
+            serde_json::json!({ "type": "residual_inventory_recorded", "garbage": true }),
+        );
+        robson_eventlog::append_event(&pool, &stream, None, envelope).await.unwrap();
+        daemon.restore_leg_evidence(tenant_id, &mut unreadable_residual).await.unwrap();
+        assert!(unreadable_residual.residual_unknown);
+        assert_eq!(unreadable_residual.residual_quantity, None);
+
+        let readable = robson_domain::Event::ResidualInventoryRecorded {
+            position_id: unreadable_residual.id,
+            order_kind: robson_domain::ReductionKind::Protection,
+            requested_quantity: dec!(0.105),
+            accepted_quantity: dec!(0.1),
+            residual_quantity: dec!(0.005),
+            exchange_order_id: None,
+            fill_price: None,
+            fee: None,
+            step_size: None,
+            min_qty: None,
+            timestamp: Utc::now(),
+        };
+        let envelope = robson_eventlog::Event::new(
+            tenant_id,
+            &stream,
+            readable.event_type(),
+            serde_json::to_value(&readable).unwrap(),
+        );
+        robson_eventlog::append_event(&pool, &stream, None, envelope).await.unwrap();
+        let mut reread = active();
+        reread.id = unreadable_residual.id;
+        daemon.restore_leg_evidence(tenant_id, &mut reread).await.unwrap();
+        assert!(reread.residual_unknown);
+        assert_eq!(reread.residual_quantity, Some(dec!(0.005)));
     }
 
     #[cfg(feature = "postgres")]

@@ -1,11 +1,11 @@
 # Data Contract: bronze-v1 (Robson · cold retention export)
 
 **Status**: Proposed (Phase A deliverable; no export runs until Phase B is explicitly approved)
-**Date**: 2026-08-12 (v1.1.3; original 2026-08-06)
+**Date**: 2026-11-06 (v1.2.0; original 2026-08-06)
 **Owner of this contract**: Robson (source schema authority)
 **Pipeline implementer/consumer**: `rbx-data` (ADR-0201)
 **Governance boundary**: rbx-governance ADR-0203 (Robson analytical data boundary)
-**Version**: 1.1.3
+**Version**: 1.2.0
 **Amendment basis**: pre-Phase-B adversarial studies (2026-08-06: payload
 field audit, window-sealing attack) plus the adversarial review of this
 amendment itself (2026-08-07), whose required changes are incorporated.
@@ -371,6 +371,15 @@ so the need is on record; each requires its own Robson PR and review:
 
 ## Changelog
 
+- 1.2.0 (2026-11-06): additive registry amendment for ADR-0056 step 6: new
+  `residual_inventory_recorded` event type (no free text; `$.order_kind` is a
+  closed enum) and optional `rules_snapshot: object` on
+  `entry_signal_received`. Both are derived from code; no live row exists yet.
+  The new event is audit-only at the source: `positions_current` does not
+  change. Its `fill_price` and `fee` are evidence of an exit that filled short of
+  its leg, which closes all the same; no reader attributes them yet.
+  The redaction matrix is unchanged. The exporter must load this registry
+  before a daemon that emits them runs, or the run aborts on schema drift.
 - 1.1.3 (2026-08-12): STRATEGY_CREATED audited and promoted out of the
   legacy abort list (additive, registry amendment). The 2026-08-12
   provisioning-window inventory proved the producer is still live and one
