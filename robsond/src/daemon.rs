@@ -2312,7 +2312,7 @@ mod tests {
     async fn test_month_boundary_row_without_reset_evidence_does_not_block(pool: sqlx::PgPool) {
         let now = Utc.with_ymd_and_hms(2026, 5, 1, 0, 0, 1).single().unwrap();
 
-        // Mirrors the auxiliary monthly_state UPSERTs: the row exists, but no
+        // Mirrors refresh_month_peak_net_from_snapshot: the row exists, but no
         // MonthBoundaryReset event has supplied durable reset evidence yet.
         sqlx::query(
             r#"
@@ -2415,6 +2415,40 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(persisted_reset_at, Some(reset_at));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "Requires DATABASE_URL to be set"]
+    async fn test_month_boundary_runs_on_a_fresh_database(pool: sqlx::PgPool) {
+        let tenant_id = uuid::Uuid::from_u128(0x13203);
+        let mut config = Config::test();
+        config.projection.tenant_id = Some(tenant_id);
+        let daemon = Daemon::new_stub_with_recovery(config, None, Some(Arc::new(pool.clone())));
+        let now = Utc::now();
+
+        daemon.handle_month_boundary(now).await.unwrap();
+
+        let event_count: i64 = sqlx::query_scalar(
+            "SELECT COUNT(*) FROM event_log WHERE tenant_id = $1 AND event_type = 'month_boundary_reset'",
+        )
+        .bind(tenant_id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(event_count, 1);
+
+        // Same text as load_capital_base_for_month, so same parameter types: SQLx
+        // caches the prepared statement per connection.
+        let capital_base: Decimal = sqlx::query_scalar(
+            "SELECT capital_base FROM monthly_state WHERE year = $1 AND month = $2",
+        )
+        .bind(now.year())
+        .bind(now.month() as i16)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert!(capital_base > Decimal::ZERO, "capital_base = {capital_base}");
     }
 
     #[tokio::test]

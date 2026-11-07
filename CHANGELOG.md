@@ -7,6 +7,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed - A month row no longer gets a zero capital base without account evidence
+
+- The entry and close counters inserted `capital_base = 0` when the month's row
+  was missing, so a fill or a losing close before the first boundary poll of a
+  month left a zero base visible until the reset overwrote it. A close in that
+  window evaluated MonthlyHalt against it. They now only update an existing row:
+  a missing row keeps falling back to configured capital, and the reset already
+  zeroes both counters.
+- `GET /positions?month=` now charges closes from `positions_current`, the source
+  `/status` and the budget already use, instead of the `realized_loss` counter,
+  which misses closes from before the month's row and reset. A past month's
+  `slot_cells_total` can differ where the two sources disagreed, for example on
+  a losing close that is not governed. A close stamped exactly at a month's
+  start now counts in that month, for the budget as well.
+- On a fresh database, migrations 11 and 21 left a current-month row with a zero
+  base and `boundary_reset_at` set, so the month's reset was skipped and arm
+  stayed blocked. Migration 30 removes such a row when it records nothing and
+  has no event on the month's boundary stream. Production's current row has a
+  real base, so it does not match.
+
 ### Added - Model-aware monthly budget gauge and ADR-0051 activation runbook
 
 - On 2026-10-15 a net +83.50 USDT October with an empty book showed 2 of 4

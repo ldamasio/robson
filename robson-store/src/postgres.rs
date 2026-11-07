@@ -686,7 +686,7 @@ pub async fn find_positions_overlapping_month(
         FROM positions_current
         WHERE tenant_id = $1
           AND created_at < $3
-          AND COALESCE(closed_at, $3) > $2
+          AND COALESCE(closed_at, $3) >= $2
         ORDER BY created_at ASC, position_id ASC
         "#,
     )
