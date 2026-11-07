@@ -145,6 +145,16 @@ jobs:
       - name: Clippy
         run: cargo clippy --all-targets -- -D clippy::correctness -D clippy::suspicious
 
+      # The image ships with this feature (see Dockerfile), but the step above
+      # compiles out everything behind it. That step stays: code behind
+      # #[cfg(not(feature = "postgres"))] is linted only there.
+      #
+      # Known gap in both steps: #![warn(clippy::all)] at a crate root overrides
+      # -D, so these lints only warn in the library targets, and their unit tests,
+      # of robsond and robson-{connectors,domain,engine,exec,sim,store}.
+      - name: Clippy with the postgres feature
+        run: cargo clippy --workspace --all-targets --features postgres -- -D clippy::correctness -D clippy::suspicious
+
   build-and-push:
     name: Build & Push Image
     runs-on: ubuntu-latest
