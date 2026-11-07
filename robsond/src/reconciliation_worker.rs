@@ -524,7 +524,11 @@ impl<E: ExchangePort + 'static, S: Store + 'static> ReconciliationWorker<E, S> {
                 }
             }
         }
-        symbols.extend(self.recently_closed_symbols(Utc::now()).await);
+        for symbol in self.recently_closed_symbols(Utc::now()).await {
+            if symbols.insert(symbol) {
+                self.metrics.closed_symbol_visit();
+            }
+        }
 
         for symbol in &symbols {
             let open_orders = match self.exchange.get_open_orders(symbol).await {
@@ -2317,6 +2321,41 @@ mod tests {
             .map(|pair| Symbol::from_pair(pair).unwrap())
             .collect();
         assert_eq!(symbols, expected);
+    }
+
+    /// The sweep's added cost: one per symbol it would otherwise not have
+    /// visited.
+    #[tokio::test]
+    async fn test_the_sweep_counts_only_the_symbols_it_would_not_have_visited() {
+        let exchange = Arc::new(StubExchange::new(dec!(100)));
+        let store = Arc::new(MemoryStore::new());
+        let event_bus = Arc::new(EventBus::new(16));
+        let held = Symbol::from_pair("BTCUSDT").unwrap();
+        store
+            .positions()
+            .save(&tracked_active_position(held.clone(), Side::Long))
+            .await
+            .unwrap();
+        exchange.set_open_position(
+            held,
+            Side::Long,
+            Quantity::new(dec!(0.010)).unwrap(),
+            Price::new(dec!(100)).unwrap(),
+        );
+        for pair in ["BTCUSDT", "ETHUSDT"] {
+            let symbol = Symbol::from_pair(pair).unwrap();
+            store.positions().save(&leg_closed_at(symbol, Utc::now())).await.unwrap();
+        }
+        let (worker, metrics) = create_worker_with_metrics(
+            exchange.clone(),
+            store.clone(),
+            event_bus,
+            Duration::from_secs(0),
+        );
+
+        worker.scan_and_reconcile().await.unwrap();
+
+        assert_eq!(metrics.closed_symbol_visit_count(), 1.0, "BTCUSDT is visited anyway");
     }
 
     #[tokio::test]
