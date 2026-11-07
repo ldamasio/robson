@@ -3051,7 +3051,8 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
     }
 
     /// A re-read that fails is a governed denial like any other, which re-arms
-    /// the detector, and not an operational error, which would leave it dead.
+    /// the detector if its audit write succeeds, and not an operational error,
+    /// which would leave it dead.
     fn capital_for_the_gate(snapshot_capital: Decimal, reread: DaemonResult<bool>) -> Decimal {
         match reread {
             Ok(false) => snapshot_capital,

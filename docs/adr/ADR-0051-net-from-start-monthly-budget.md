@@ -429,7 +429,10 @@ not a new guarantee for an unknown basis:
   rules must be fetched, so the halt and admission each re-read the basis at their
   decision point. A write after that read is after the decision: a halt or an entry
   decided on a valid basis a moment earlier stands. A re-read that fails defers the
-  halt and denies the entry, which re-arms like any other denial.
+  halt and denies the entry. That denial re-arms only if its audit write succeeds on
+  the same database; otherwise the signal or approval returns an error and the Armed
+  position has no detector, as after any database failure once the detector is
+  killed. This path predates the amendment and enters nothing.
 
 Admission stays closed without the latch: the gate, `can_admit`, `slots_available`
 and `with_capital` each refuse the basis, and they survive a restart, which the
@@ -457,7 +460,9 @@ corrects the row with evidence. Admission reads the basis on every attempt, so
 entries resume with no restart and no reset. A position already Armed re-arms
 after a denied signal or approval and may then enter through the normal gate. The
 exception is a signal on an `Immediate` position, which is cancelled as on any
-margin refusal.
+margin refusal. Database recovery alone does not restore a detector lost to a
+database failure during admission: restart the daemon, which respawns detectors for
+Armed positions, or disarm and arm again.
 
 | Option | On an invalid basis | Gain | Cost | Decision |
 | --- | --- | --- | --- | --- |
@@ -503,7 +508,8 @@ exchange book is flat, in-flight entries included. Afterwards, check the pod's h
 and `/status`.
 
 **Failure modes.** Database down: the snapshot fails, admission fails closed, the
-halt is not evaluated, and the gauge keeps its last value. Daemon down: the row
+halt is not evaluated, the gauge keeps its last value, and a signal that fires in
+that window leaves its position without a detector (see Recovery). Daemon down: the row
 persists and the alarm returns on the first tick after restart. Exchange down:
 the rule reads no exchange data; exchange-side stops are unaffected. Alertmanager
 or Prometheus down: the `/status` flag and logs remain.
