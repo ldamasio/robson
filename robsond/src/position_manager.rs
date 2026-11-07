@@ -4044,6 +4044,9 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let active_positions = self.store.positions().find_active().await?;
         let active_positions_count = active_positions.len();
         self.prune_insurance_stop_stale(&active_positions).await;
+        // A leg that cannot derive its stop for want of rules fails on its own: the
+        // others are still processed, and the tick then reports the first failure.
+        let mut first_missing_rules = None;
 
         for position in active_positions {
             if position.symbol != data.symbol {
@@ -4154,6 +4157,16 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                     let err_str = format!("{}", e);
                     query.fail(err_str.clone(), "processing".to_string());
                     self.record_query_failure(&query).await?;
+                    if matches!(
+                        e,
+                        robson_engine::EngineError::DomainError(
+                            robson_domain::DomainError::TradingRulesUnavailable(_)
+                        )
+                    ) {
+                        warn!(position_id = %position.id, %err_str, "Leg cannot derive its stop");
+                        first_missing_rules.get_or_insert(e);
+                        continue;
+                    }
                     return Err(e.into());
                 },
             };
@@ -4322,6 +4335,10 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
                 return Err(DaemonError::Config(format!("Query completion error: {}", e)));
             }
             self.record_query_transition(&query, "completed").await?;
+        }
+
+        if let Some(error) = first_missing_rules {
+            return Err(error.into());
         }
 
         // ADR-0046 §3: observe the equity peak at the 20 s monitor cadence,
@@ -7177,6 +7194,31 @@ mod tests {
             )),
             "{events:?}"
         );
+    }
+
+    /// A leg failing for want of rules fails alone: the others on the symbol
+    /// are processed, and the tick then reports it. In a few stores,
+    /// because the order of the legs is the order of a hash map.
+    #[tokio::test]
+    async fn a_leg_with_no_rules_to_be_had_does_not_stop_the_others_in_its_tick() {
+        for _ in 0..8 {
+            let manager = create_test_manager().await;
+            let mut others = Vec::new();
+            for _ in 0..3 {
+                others.push(active_leg_with_live_stop(&manager).await.0);
+            }
+            let blind = leg_with_nothing_held(&manager).await;
+
+            let error = stop_crossing_tick(&manager, &blind).await.unwrap_err();
+
+            assert!(error.to_string().contains("trading rules"), "{error}");
+            let leg = manager.get_position(blind.id).await.unwrap().unwrap();
+            assert!(matches!(leg.state, PositionState::Active { .. }), "{:?}", leg.state);
+            for other in &others {
+                let leg = manager.get_position(other.id).await.unwrap().unwrap();
+                assert!(matches!(leg.state, PositionState::Closed { .. }), "{:?}", leg.state);
+            }
+        }
     }
 
     /// The lookup a leg with nothing held does is bounded end to end: a hung
