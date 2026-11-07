@@ -288,7 +288,7 @@ impl MemoryStore {
                 fee,
                 initial_stop,
                 invalidation_guard_level,
-                binance_position_id,
+                exchange_position_id,
                 timestamp,
                 ..
             } => {
@@ -299,8 +299,8 @@ impl MemoryStore {
                     position.quantity = *filled_quantity;
                     position.fees_paid = *fee;
                     position.entry_order_id = Some(*order_id);
-                    if binance_position_id.is_some() {
-                        position.binance_position_id = binance_position_id.clone();
+                    if exchange_position_id.is_some() {
+                        position.exchange_position_id = exchange_position_id.clone();
                     }
                     position.state = PositionState::Active {
                         current_price: *fill_price,

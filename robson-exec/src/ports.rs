@@ -76,14 +76,6 @@ pub enum UniversalTransferType {
     MainUmfuture,
 }
 
-impl UniversalTransferType {
-    pub fn as_binance_str(&self) -> &'static str {
-        match self {
-            Self::MainUmfuture => "MAIN_UMFUTURE",
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct TransferId(pub String);
 
@@ -640,8 +632,6 @@ pub trait TradeFeedPort: Send + Sync {
 // =============================================================================
 
 /// Candlestick interval for OHLCV requests.
-///
-/// Values map directly to Binance kline interval strings.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum CandleInterval {
     /// 1-minute candles
@@ -657,20 +647,6 @@ pub enum CandleInterval {
     FourHours,
     /// 1-day candles
     OneDay,
-}
-
-impl CandleInterval {
-    /// Binance REST API interval string for this interval.
-    pub fn as_binance_str(&self) -> &'static str {
-        match self {
-            CandleInterval::OneMinute => "1m",
-            CandleInterval::FiveMinutes => "5m",
-            CandleInterval::FifteenMinutes => "15m",
-            CandleInterval::OneHour => "1h",
-            CandleInterval::FourHours => "4h",
-            CandleInterval::OneDay => "1d",
-        }
-    }
 }
 
 /// Port for fetching historical OHLCV (candlestick) data.

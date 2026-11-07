@@ -3184,7 +3184,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             }
         }
 
-        // Fetch the live available balance so the physical margin cap sizes
+        // Fetch the live available balance so the physical capital cap sizes
         // against the actual wallet, not the month-start policy capital —
         // mid-month drawdown makes the wallet smaller than capital_base and
         // the exchange rejects orders sized past it (2026-07-04 incident,
@@ -3652,7 +3652,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         filled_quantity: Quantity,
         fee: Decimal,
         filled_at: chrono::DateTime<chrono::Utc>,
-        binance_position_id: Option<String>,
+        exchange_position_id: Option<String>,
     ) -> DaemonResult<()> {
         // Load position
         let position = self
@@ -3677,14 +3677,14 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
         let trading_rules = self.trading_rules_for(&position).await;
 
         // Use engine to process fill (pure: State+Fill → Decision)
-        // binance_position_id is passed through to EntryFilled event
+        // exchange_position_id is passed through to EntryFilled event
         let decision = self.engine.lock().unwrap().process_entry_fill_with_rules(
             &position,
             fill_price,
             filled_quantity,
             fee,
             filled_at,
-            binance_position_id.clone(),
+            exchange_position_id.clone(),
             invalidation_guard_level,
             trading_rules.as_ref(),
         )?;
@@ -3707,7 +3707,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             timestamp: chrono::Utc::now(),
         });
 
-        let core_exchange_id = binance_position_id.unwrap_or_else(|| {
+        let core_exchange_id = exchange_position_id.unwrap_or_else(|| {
             warn!(
                 %position_id,
                 "Missing binance_position_id on Core open; using position_id fallback"
@@ -3719,7 +3719,7 @@ impl<E: ExchangePort + 'static, S: Store + 'static> PositionManager<E, S> {
             position_id,
             symbol: position.symbol.clone(),
             side: position.side,
-            binance_position_id: core_exchange_id,
+            exchange_position_id: core_exchange_id,
         });
 
         Ok(())
@@ -7862,10 +7862,10 @@ mod tests {
         assert!(events.iter().any(|event| matches!(event, Event::EntrySignalReceived { .. })));
     }
 
-    /// A margin-capped immediate entry must ACTIVATE, not be denied by the
+    /// A capital-capped immediate entry must ACTIVATE, not be denied by the
     /// risk gate's qty × entry round-trip (2026-07-04 prod incident: the
     /// Decimal round-trip exceeded capital by ~1e-22 and the gate rejected
-    /// the margin cap sizing itself chose, cancelling the position).
+    /// the capital cap sizing itself chose, cancelling the position).
     ///
     /// With sizing and the gate reading the same in-memory capital, a genuine
     /// insufficient-margin denial is no longer constructible here; that gate
@@ -7873,7 +7873,7 @@ mod tests {
     /// reachable in production only when the persisted monthly ledger capital
     /// diverges from the engine's configured capital.
     #[tokio::test(flavor = "current_thread")]
-    async fn test_arm_immediate_margin_capped_entry_activates_within_capital() {
+    async fn test_arm_immediate_capital_capped_entry_activates_within_capital() {
         use robson_domain::{ApprovalPolicy as DomainApprovalPolicy, EntryPolicy};
 
         let manager = create_test_manager().await;
@@ -7912,16 +7912,16 @@ mod tests {
         let position = manager.get_position(position.id).await.unwrap().unwrap();
         assert!(
             matches!(position.state, PositionState::Active { .. }),
-            "Margin-capped immediate entry must activate, got {:?}",
+            "Capital-capped immediate entry must activate, got {:?}",
             position.state
         );
 
-        // The tight stop makes the risk-sized quantity exceed 1x margin, so
-        // the margin cap engages: notional fits the $100 capital minus the
+        // The tight stop makes the risk-sized quantity exceed 1x capital, so
+        // the capital cap engages: notional fits the $100 capital minus the
         // default 100 bps headroom (exchange fee + mark-price cushion), with
         // no round-trip excess for the gate to reject.
         let notional = position.quantity.as_decimal() * dec!(95000);
-        assert!(notional > dec!(98.9), "margin cap must engage, notional {}", notional);
+        assert!(notional > dec!(98.9), "capital cap must engage, notional {}", notional);
         assert!(notional <= dec!(99), "notional {} must fit capital minus headroom", notional);
     }
 

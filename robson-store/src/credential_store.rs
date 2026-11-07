@@ -747,4 +747,126 @@ mod tests {
         let result = key.decrypt(&ciphertext, &nonce, aad2);
         assert!(result.is_err());
     }
+
+    // =========================================================================
+    // Old-ciphertext compatibility (ADR-0056 §10, step 4)
+    // =========================================================================
+    //
+    // `testdata/credentials_sealed_pre_adr0056_step4.json` was sealed by the
+    // code of commit 93a3bb76 under this test-only key, with fake plaintexts.
+    // `first_*` is the api key column pair, `second_*` the secret column pair.
+    // The AAD binds each ciphertext to the identity, so any change to the
+    // serialized `Exchange` values or to the AAD format fails these tests.
+
+    const SEALED_BEFORE_STEP_4: &str =
+        include_str!("testdata/credentials_sealed_pre_adr0056_step4.json");
+    const FIXTURE_ONLY_BYTES: [u8; 32] = [42u8; 32];
+    const FIXTURE_ONLY_ID: &str = "adr0056-step4";
+
+    fn sealed_cases() -> Vec<serde_json::Value> {
+        let cases: Vec<serde_json::Value> = serde_json::from_str(SEALED_BEFORE_STEP_4).unwrap();
+        assert_eq!(cases.len(), 4);
+        cases
+    }
+
+    fn sealed_identity(case: &serde_json::Value) -> CredentialId {
+        let text = |field: &str| case[field].as_str().unwrap();
+        let exchange = match text("exchange") {
+            "binance" => Exchange::Binance,
+            "binance_testnet" => Exchange::BinanceTestnet,
+            other => panic!("unexpected exchange {other}"),
+        };
+        CredentialId::from_scope(
+            IdentityScope::new(text("tenant"), text("user"), text("profile")),
+            exchange,
+        )
+    }
+
+    fn sealed_bytes(case: &serde_json::Value, field: &str) -> Vec<u8> {
+        hex::decode(case[field].as_str().unwrap()).unwrap()
+    }
+
+    #[test]
+    fn test_ciphertext_sealed_before_step_4_decrypts_under_the_identity_aad() {
+        let key = crypto::EncryptionKey::from_bytes(&FIXTURE_ONLY_BYTES, FIXTURE_ONLY_ID).unwrap();
+
+        for case in sealed_cases() {
+            let id = sealed_identity(&case);
+            let aad = id.aad();
+            assert_eq!(
+                String::from_utf8(aad.clone()).unwrap(),
+                format!(
+                    "{}|{}|{}|{}",
+                    case["tenant"].as_str().unwrap(),
+                    case["user"].as_str().unwrap(),
+                    case["profile"].as_str().unwrap(),
+                    case["exchange"].as_str().unwrap()
+                )
+            );
+
+            let first = key
+                .decrypt(
+                    &sealed_bytes(&case, "first_sealed"),
+                    &sealed_bytes(&case, "first_nonce"),
+                    &aad,
+                )
+                .unwrap();
+            assert_eq!(&*first, b"fake-value-one");
+            let second = key
+                .decrypt(
+                    &sealed_bytes(&case, "second_sealed"),
+                    &sealed_bytes(&case, "second_nonce"),
+                    &aad,
+                )
+                .unwrap();
+            assert_eq!(&*second, b"fake-value-two");
+
+            // A renamed exchange encoding must not open the old ciphertext.
+            let renamed = format!("{}x", String::from_utf8(aad).unwrap());
+            assert!(key
+                .decrypt(
+                    &sealed_bytes(&case, "first_sealed"),
+                    &sealed_bytes(&case, "first_nonce"),
+                    renamed.as_bytes(),
+                )
+                .is_err());
+        }
+    }
+
+    #[tokio::test]
+    async fn test_ciphertext_sealed_before_step_4_opens_through_the_store() {
+        let store = MemoryCredentialStore::with_key(&FIXTURE_ONLY_BYTES, FIXTURE_ONLY_ID).unwrap();
+
+        for case in sealed_cases() {
+            let id = sealed_identity(&case);
+            let now = Utc::now();
+            // The store query key is spelled from the fixture's strings, not
+            // from `Exchange::as_str`, so it pins the stored value too.
+            let query = format!(
+                "{}:{}:{}:{}",
+                case["tenant"].as_str().unwrap(),
+                case["user"].as_str().unwrap(),
+                case["exchange"].as_str().unwrap(),
+                case["profile"].as_str().unwrap()
+            );
+            store.credentials.write().unwrap().insert(query, StoredCredential {
+                id: id.clone(),
+                api_key_ciphertext: sealed_bytes(&case, "first_sealed"),
+                api_key_nonce: sealed_bytes(&case, "first_nonce"),
+                api_secret_ciphertext: sealed_bytes(&case, "second_sealed"),
+                api_secret_nonce: sealed_bytes(&case, "second_nonce"),
+                crypto_version: 1,
+                key_id: FIXTURE_ONLY_ID.to_string(),
+                status: CredentialStatus::Active,
+                label: None,
+                last_used_at: None,
+                created_at: now,
+                updated_at: now,
+            });
+
+            let opened = store.get(&id).await.unwrap();
+            assert_eq!(opened.api_key, "fake-value-one");
+            assert_eq!(*opened.api_secret, "fake-value-two");
+        }
+    }
 }

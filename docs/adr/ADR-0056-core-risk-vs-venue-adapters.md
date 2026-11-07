@@ -323,15 +323,26 @@ commission.
   `"binance_testnet"`): they are the AES-GCM AAD, the store query key and the SQL CHECK. A venue is `(Exchange,
   MarketKind, profile)`; `binance:spot` reuses the `"binance"` credential. `base_url()` leaves the domain for
   `robson_connectors::binance::Endpoints`. A new exchange adds a credential value through an explicit migration with
-  old-ciphertext compatibility tests.
-- `as_binance_str` leaves `ports.rs`; wire encodings belong to adapters.
+  old-ciphertext compatibility tests. `Endpoints::base_url` moved unchanged and still has no production caller: live hosts
+  come from `BinanceRestClient`, `BinanceWebSocketClient` and the trade feed. Its mapping is asymmetric (`Binance` → spot
+  host, `BinanceTestnet` → USDⓈ-M testnet host), so it is not a host table and step 8 must not use it as one.
+- `as_binance_str` leaves `ports.rs`; wire encodings belong to adapters (private `robson_connectors::binance::wire`).
 - `binance_position_id` → `exchange_position_id` in Rust only, on **both** the event payload and the independently
   serialized `Position`, each with `#[serde(rename = "binance_position_id")]`. Compatibility contract: canonical
   serialization before and after the refactor is equal (fixtures with null and non-null values; a missing optional field
   reserializes as `null` before and after, which is the existing behaviour); historical payloads deserialize; the legacy
   SQL column, the active projector payload (which does not carry the field) and the API/frontend field are unchanged.
+  The position-summary API does not serve this field today (`PositionSummary` has none, so the frontend normalizer yields
+  null). The event payload reaches the event log and `/events/history`, which returns raw payloads, so the wire name stays
+  observable there. The log text naming the field also stays, because log output is observable.
 - Sizing vocabulary: the "margin cap" in `size_entry` is named the **capital cap** (`notional ≤ available_quote × (1 −
   headroom)`, leverage constant 1); numbers unchanged. `RiskConfig::leverage()` is validated only by position accounts.
+  As implemented, the rename covers `size_entry` and its engine caller. Configured and observable names stay:
+  `margin_headroom_bps`, `ROBSON_MARGIN_HEADROOM_BPS`, the rejection text pinned by the fixtures and the log text. So do
+  the RiskGate initial-margin check and `calculate_margin_required`, which are not this cap, and prose docs that describe
+  USDⓈ-M sizing. `RiskConfig::leverage()` has no production caller, but the executor passes `RiskConfig::LEVERAGE` to
+  `validate_futures_settings` at entry and exit unconditionally, and a venue without a position account gets
+  `ExecError::Config`. **Owner: step 8 gates that call to position accounts.**
 
 ### 5. Quantisation and metadata rules (behaviour-changing step)
 
@@ -509,7 +520,7 @@ only).
   discrepancies (mandatory, not optional).
 - **Failure tests**: process kill at each external-call/persistence boundary (step 7), database loss during result
   persistence, concurrent settlement/admission, reordered feed delivery, unresolved order outcome; old-ciphertext
-  decryption after step 4; replay fixtures; the 68 DB-gated tests; security gates unchanged (gitleaks, osv-scanner,
+  decryption after step 4; replay fixtures; the DB-gated tests; security gates unchanged (gitleaks, osv-scanner,
   cargo-audit, SHA-pinned actions); allocation and arming mutations frozen during a request (guardrails §4).
 
 ---
@@ -584,7 +595,9 @@ Budget model for multi-venue:
 - Step 2: `robson-exec/src/{ports,executor,stub}.rs`, `robson-connectors/src/binance/usdm/exchange.rs`, `robson-testkit`.
 - Step 3: `robsond/src/{venue,daemon,main,config,api,market_data,event_bus,position_manager}.rs`, `robsond/src/funding/`,
   `robson-connectors/src/binance/usdm/market_data.rs`, `robson-exec/src/ports.rs` (`TradeFeedPort`).
-- Step 4: `robson-domain/src/{credentials,entities,events,lib}.rs`, `robson-engine/src/lib.rs`, `robson-store/src/memory.rs`, fixtures.
+- Step 4: `robson-domain/src/{credentials,entities,events,value_objects}.rs`, `robson-engine/src/lib.rs`,
+  `robson-store/src/{credential_store,memory}.rs`, `robson-connectors/src/binance/*`, `robson-exec/src/ports.rs`,
+  `robsond/src/{config,event_bus,position_manager,sse}.rs`, `robson-projector/src/types.rs`, golden fixtures.
 - Step 5: `robsond/src/daemon.rs` (boundary), `robson-domain` (carried basis), migration for persisted carried bases
   and settlement attribution, persisted-state version bump.
 - Step 6: `robson-exec/src/quantize.rs`, `robsond/src/position_manager.rs`, usdm adapter; before/after fixtures.
@@ -596,12 +609,13 @@ Budget model for multi-venue:
   whose outcome never becomes known and a successor refused locally before anything was sent (`NoRecord` →
   `Unknown{new: None}`, old stop still live, nothing for a lookup to find); until resolved, the leg stays pending with its
   reservation held and visible.
-- Step 8: `robson-connectors/src/binance/spot/*`; conformance suite; `ROBSON_VENUE=binance_spot`.
+- Step 8: `robson-connectors/src/binance/spot/*`; conformance suite; `ROBSON_VENUE=binance_spot`; executor's
+  `validate_futures_settings` gated to position accounts (§4).
 - Evidence: `docs/evidence/2026-11-04-binance-exchangeinfo-btcusdt.md` (retained in this PR): timestamped verbatim
   extracts with source URLs and SHA-256 of the raw responses; spot `orderTypes` includes `STOP_LOSS`, `LOT_SIZE` step
   0.00001, `NOTIONAL` min 5 USDT (applyMinToMarket, avgPriceMins 5); futures `LOT_SIZE` step 0.001, `MIN_NOTIONAL` 50
   USDT, `orderTypes` includes `STOP_MARKET`. Symbol availability only; account authorisation per order type is an
-  activation gate (§2.1). The 68 DB-gated test annotations reproduce from source; security workflows are unchanged.
+  activation gate (§2.1). The DB-gated test annotations reproduce from source (68 when written, 76 after step 3); security workflows are unchanged.
 
 ## Review trail
 
@@ -651,3 +665,8 @@ Budget model for multi-venue:
   staged with an owner: durable saga routing (step 7), conversion exclusion and `eligible` inputs (step 8), reconnect resync
   and feed properties (separate change before a second venue). No risk number or operator decision changed. Codex
   **APPROVE** with one P3 (§1 wording) applied.
+- v10 (2026-11-06): §4 and the Implementation Notes aligned with step 4 as implemented on `refactor/venue-step4-naming`:
+  `Endpoints::base_url` is not a host table, what keeps the old names and why, and step 8 owns gating
+  `validate_futures_settings` to position accounts. No risk number or operator decision changed. Codex **APPROVE** on
+  round 1, with four P3s applied (the `/events/history` exposure above, a missing-versus-null assertion, fixture provenance
+  and the stale DB-gated count).

@@ -138,9 +138,9 @@ pub struct EngineConfig {
     /// (env: ROBSON_STOP_BUFFER_BPS, default 0 = execute at the technical
     /// level). ADR-0041.
     pub stop_buffer_bps: Decimal,
-    /// Headroom reserved when the 1x margin cap binds, in basis points of
+    /// Headroom reserved when the 1x capital cap binds, in basis points of
     /// capital (env: ROBSON_MARGIN_HEADROOM_BPS, default 100). Covers the
-    /// taker fee and the exchange's mark-price cushion so margin-capped
+    /// taker fee and the exchange's mark-price cushion so capital-capped
     /// orders are executable on the exchange.
     pub margin_headroom_bps: Decimal,
     /// Whether the entry-time invalidation guard clamps the effective stop
@@ -416,7 +416,7 @@ impl Config {
                 taker_fee_rate: Decimal::new(5, 4),         // 0.05% per fill
                 stop_gap_bps: Decimal::from(10),            // 10 bps
                 stop_buffer_bps: Decimal::ZERO,             // execute at technical stop
-                margin_headroom_bps: Decimal::from(100),    // 1% margin-cap headroom
+                margin_headroom_bps: Decimal::from(100),    // 1% capital-cap headroom
                 stop_invalidation_guard_enabled: false,
                 stop_invalidation_lookback_candles: 20,
                 position_monitor_tick_interval_secs: 20,
@@ -554,8 +554,8 @@ impl Config {
         // technical stop. Default 0 keeps the historical behavior.
         let stop_buffer_bps = Self::load_decimal_env("ROBSON_STOP_BUFFER_BPS", Decimal::ZERO)?;
 
-        // Margin-cap headroom: fraction of capital (bps) reserved when the 1x
-        // margin cap binds, so the exchange's taker fee and mark-price cushion
+        // Capital-cap headroom: fraction of capital (bps) reserved when the 1x
+        // capital cap binds, so the exchange's taker fee and mark-price cushion
         // fit inside the wallet (2026-07-04 prod incident, Binance -2019).
         let margin_headroom_bps =
             Self::load_decimal_env("ROBSON_MARGIN_HEADROOM_BPS", Decimal::from(100))?;
@@ -853,7 +853,7 @@ impl Default for Config {
                 taker_fee_rate: Decimal::new(5, 4),         // 0.05% per fill
                 stop_gap_bps: Decimal::from(10),            // 10 bps
                 stop_buffer_bps: Decimal::ZERO,             // execute at technical stop
-                margin_headroom_bps: Decimal::from(100),    // 1% margin-cap headroom
+                margin_headroom_bps: Decimal::from(100),    // 1% capital-cap headroom
                 stop_invalidation_guard_enabled: false,
                 stop_invalidation_lookback_candles: 20,
                 position_monitor_tick_interval_secs: 20,

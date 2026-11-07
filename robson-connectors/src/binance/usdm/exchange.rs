@@ -39,9 +39,12 @@ use robson_exec::{
 use rust_decimal::Decimal;
 use tracing::{info, warn};
 
-use crate::binance_rest::{
-    BinanceAlgoOrderDetail, BinanceFuturesBalance, BinanceOrderResponse, BinanceRestClient,
-    BinanceRestError,
+use crate::{
+    binance::wire,
+    binance_rest::{
+        BinanceAlgoOrderDetail, BinanceFuturesBalance, BinanceOrderResponse, BinanceRestClient,
+        BinanceRestError,
+    },
 };
 
 /// Truncate a quantity to a given number of decimal places (round down).
@@ -1242,7 +1245,12 @@ impl FundingPort for BinanceExchangeAdapter {
     ) -> Result<TransferId, ExecError> {
         let response = self
             .client
-            .universal_transfer(asset, amount, transfer_type.as_binance_str(), client_tran_key)
+            .universal_transfer(
+                asset,
+                amount,
+                wire::universal_transfer_type(transfer_type),
+                client_tran_key,
+            )
             .await
             .map_err(Self::map_error)?;
         Ok(TransferId(response.tran_id.to_string()))
@@ -1255,7 +1263,10 @@ impl FundingPort for BinanceExchangeAdapter {
     ) -> Result<Vec<Transfer>, ExecError> {
         let transfers = self
             .client
-            .get_transfer_history(transfer_type.as_binance_str(), start_time.timestamp_millis())
+            .get_transfer_history(
+                wire::universal_transfer_type(transfer_type),
+                start_time.timestamp_millis(),
+            )
             .await
             .map_err(Self::map_error)?;
 
