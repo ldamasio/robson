@@ -45,24 +45,15 @@ on:
       - "rustfmt.toml"
   pull_request:
     branches: ["main"]
-    paths:
-      - ".cargo/**"
-      - ".dockerignore"
-      - ".github/workflows/robsond.yml"
-      - "Cargo.lock"
-      - "Cargo.toml"
-      - "Dockerfile"
-      - "clippy.toml"
-      - "migrations/**"
-      - "robson-*/**"
-      - "robsond/**"
-      - "rust-toolchain.toml"
-      - "rustfmt.toml"
   workflow_dispatch:
 ```
 
-> **Important**: Changes exclusively in `.github/workflows/` do **not** trigger the
-> workflow automatically due to the Rust workspace path filter. Use `workflow_dispatch` manually:
+`pull_request` has no path filter so that `Rust Tests` can be a required check on `main`,
+which needs a report on every PR. `push` keeps the filter because a run on `main` deploys.
+
+> **Important**: Of the files in `.github/workflows/`, only `robsond.yml` triggers this
+> workflow on `push`, so merging a change to it publishes an image and restarts the daemon.
+> For a deploy with no change to any of these paths, use `workflow_dispatch` manually:
 > ```bash
 > gh workflow run robsond.yml --repo ldamasio/robson --ref main
 > ```
@@ -179,8 +170,8 @@ cargo +nightly fmt --all --check
 
 ### CI not triggered after workflow file change
 
-The workflow only triggers on Rust workspace and Docker build input path changes. For workflow-only changes,
-dispatch manually:
+On `push`, the workflow only triggers on Rust workspace and Docker build input path changes, and on
+`robsond.yml` itself. For a change to any other workflow file, dispatch manually:
 ```bash
 gh workflow run robsond.yml --repo ldamasio/robson --ref main
 ```
