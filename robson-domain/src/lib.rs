@@ -33,7 +33,7 @@ pub use entities::{
     TechnicalStopAnalysisAudit, TechnicalStopConfidenceSnapshot, TechnicalStopConfigSnapshot,
     TechnicalStopMethodSnapshot, UserTradeEvidence,
 };
-pub use events::{entry_lifecycle_stage, Event};
+pub use events::{entry_lifecycle_stage, Event, ReductionKind};
 pub use executable_stop::{
     build_executable_stop_plan, latent_risk_per_unit_at_trigger,
     worst_case_loss_per_unit_at_trigger, worst_case_loss_per_unit_planned, ExecutableSpanSource,

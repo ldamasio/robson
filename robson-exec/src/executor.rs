@@ -1002,6 +1002,7 @@ mod tests {
                 executable_span: None,
                 cap_basis_distance: None,
                 tick_size: None,
+                rules_snapshot: None,
                 timestamp: chrono::Utc::now(),
             }),
             EngineAction::PlaceEntryOrder {

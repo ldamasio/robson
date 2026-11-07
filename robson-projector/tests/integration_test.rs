@@ -67,6 +67,77 @@ fn make_envelope(
 // SQLX-TEST: Integration tests require DATABASE_URL
 // =============================================================================
 
+/// ADR-0056 §5: a residual is audit-only, routed with no effect on the row,
+/// whatever its kind. A restart reads it from the event log.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn test_residual_inventory_is_audit_only(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let position_id = Uuid::new_v4();
+    let stream_key = format!("position:{position_id}");
+    let armed = make_envelope(
+        &stream_key,
+        "position_armed",
+        serde_json::json!({
+            "position_id": position_id,
+            "account_id": Uuid::new_v4(),
+            "symbol": {"base": "BTC", "quote": "USDT"},
+            "side": "Long",
+            "tech_stop_distance": null,
+            "stop_policy": "executable_span",
+            "stop_buffer_bps_at_arm": "10",
+            "timestamp": Utc::now().to_rfc3339(),
+        }),
+        1,
+    );
+    apply_event_to_projections(&pool, &armed).await.unwrap();
+    sqlx::query(
+        "UPDATE positions_current SET state = 'active', current_quantity = 0.105, \
+         total_fees = 1 WHERE position_id = $1",
+    )
+    .bind(position_id)
+    .execute(&pool)
+    .await?;
+    let row = || async {
+        sqlx::query_as::<_, (String, Decimal, Option<Decimal>, Option<Decimal>, i64)>(
+            "SELECT state, current_quantity, realized_pnl, total_fees, last_seq \
+             FROM positions_current WHERE position_id = $1",
+        )
+        .bind(position_id)
+        .fetch_one(&pool)
+        .await
+    };
+    let before = row().await?;
+
+    for (seq, kind, fill_price, fee) in [
+        (2, "protection", None, None),
+        (3, "exit", Some("93500"), Some("2")),
+    ] {
+        let residual = make_envelope(
+            &stream_key,
+            "residual_inventory_recorded",
+            serde_json::json!({
+                "type": "residual_inventory_recorded",
+                "position_id": position_id,
+                "order_kind": kind,
+                "requested_quantity": "0.105",
+                "accepted_quantity": "0.1",
+                "residual_quantity": "0.005",
+                "exchange_order_id": null,
+                "fill_price": fill_price,
+                "fee": fee,
+                "step_size": null,
+                "min_qty": null,
+                "timestamp": Utc::now().to_rfc3339(),
+            }),
+            seq,
+        );
+        apply_event_to_projections(&pool, &residual).await.unwrap();
+    }
+
+    assert_eq!(row().await?, before);
+    Ok(())
+}
+
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
 async fn test_entry_signal_projects_executable_span_admission_payload(

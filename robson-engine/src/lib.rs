@@ -581,6 +581,12 @@ impl Engine {
                     plan.tick_size,
                 ),
             };
+        // The rules that priced this admission, persisted with the leg for
+        // risk reduction (ADR-0056 §5). Legacy positions derive without rules.
+        let rules_snapshot = match plan.policy {
+            StopPolicy::LegacyUncapped => None,
+            StopPolicy::ExecutableSpan => rules.cloned(),
+        };
 
         debug!(
             position_id = %position.id,
@@ -608,6 +614,7 @@ impl Engine {
                 executable_span,
                 cap_basis_distance,
                 tick_size,
+                rules_snapshot,
                 timestamp: Utc::now(),
             }),
             // Emit governed intent (pre-exchange, cycle_id stamped by GovernedAction)

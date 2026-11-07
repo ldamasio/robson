@@ -5599,6 +5599,7 @@ mod tests {
                 executable_span: Some(dec!(1000)),
                 cap_basis_distance: Some(dec!(1000)),
                 tick_size: Some(dec!(0.01)),
+                rules_snapshot: None,
                 timestamp: chrono::Utc::now(),
             }),
             EngineAction::EmitEvent(Event::EntryOrderRequested {

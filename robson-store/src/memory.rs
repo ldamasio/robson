@@ -127,6 +127,7 @@ impl MemoryStore {
                 executable_span,
                 cap_basis_distance,
                 tick_size,
+                rules_snapshot,
                 timestamp,
                 ..
             } => {
@@ -161,6 +162,9 @@ impl MemoryStore {
                     }
                     if position.tick_size_at_admission.is_none() {
                         position.tick_size_at_admission = *tick_size;
+                    }
+                    if position.rules_snapshot.is_none() {
+                        position.rules_snapshot.clone_from(rules_snapshot);
                     }
                     position.updated_at = *timestamp;
                     positions.insert(*position_id, position);
@@ -363,6 +367,19 @@ impl MemoryStore {
                     position.exit_order_id = Some(*order_id);
                     position.updated_at = chrono::Utc::now();
                     positions.insert(*position_id, position);
+                }
+            },
+
+            // ResidualInventoryRecorded: never a lifecycle or quantity change
+            // (ADR-0056 §5). The latest that stands stays on the leg until it closes.
+            Event::ResidualInventoryRecorded { position_id, timestamp, .. } => {
+                if let Some(residual) = event.standing_residual() {
+                    let mut positions = self.positions.write().unwrap();
+                    if let Some(mut position) = positions.get(position_id).cloned() {
+                        position.residual_quantity = Some(residual);
+                        position.updated_at = *timestamp;
+                        positions.insert(*position_id, position);
+                    }
                 }
             },
 
@@ -732,7 +749,7 @@ impl Store for MemoryStore {
 #[cfg(test)]
 mod tests {
     use chrono::Utc;
-    use robson_domain::{OrderSide, PositionState, Price, Quantity, Side, Symbol};
+    use robson_domain::{OrderSide, PositionState, Price, Quantity, ReductionKind, Side, Symbol};
     use rust_decimal_macros::dec;
 
     use super::*;
@@ -1153,6 +1170,7 @@ mod tests {
             executable_span: None,
             cap_basis_distance: None,
             tick_size: None,
+            rules_snapshot: None,
             timestamp: Utc::now(),
         };
         EventRepository::append(&store, &signal_event).await.unwrap();
@@ -1214,6 +1232,7 @@ mod tests {
             executable_span: None,
             cap_basis_distance: None,
             tick_size: None,
+            rules_snapshot: None,
             timestamp: Utc::now(),
         };
         EventRepository::append(&store, &signal_event).await.unwrap();
@@ -1275,6 +1294,7 @@ mod tests {
             executable_span: None,
             cap_basis_distance: None,
             tick_size: None,
+            rules_snapshot: None,
             timestamp: Utc::now(),
         };
         EventRepository::append(&store, &signal_event).await.unwrap();
@@ -1382,6 +1402,7 @@ mod tests {
             executable_span: None,
             cap_basis_distance: None,
             tick_size: None,
+            rules_snapshot: None,
             timestamp: Utc::now(),
         };
         EventRepository::append(&store, &signal_event).await.unwrap();
@@ -1464,6 +1485,116 @@ mod tests {
         assert_eq!(executable.stop_policy, StopPolicy::ExecutableSpan);
     }
 
+    /// ADR-0056 §5: replay keeps the first rules snapshot of a leg and its
+    /// latest residual. Nothing else moves: not the quantity, P&L, fees or
+    /// state, and an accepted stop does not clear the residual.
+    #[tokio::test]
+    async fn test_replay_keeps_the_first_snapshot_and_the_latest_residual() {
+        let store = MemoryStore::new();
+        let mut position =
+            Position::new(uuid::Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        position.quantity = Quantity::new(dec!(0.105)).unwrap();
+        position.fees_paid = dec!(1);
+        let position_id = position.id;
+        store.positions().save(&position).await.unwrap();
+
+        let rules = |step: rust_decimal::Decimal| {
+            robson_domain::SymbolTradingRules::new(
+                Symbol::from_pair("BTCUSDT").unwrap(),
+                dec!(0.1),
+                dec!(0),
+                step,
+                step,
+                dec!(120),
+                dec!(50),
+                2,
+                3,
+            )
+            .unwrap()
+        };
+        for step in [dec!(0.001), dec!(0.01)] {
+            store
+                .apply_event(&Event::EntrySignalReceived {
+                    position_id,
+                    signal_id: uuid::Uuid::now_v7(),
+                    entry_price: Price::new(dec!(95000)).unwrap(),
+                    stop_loss: Price::new(dec!(93500)).unwrap(),
+                    quantity: Quantity::new(dec!(0.1)).unwrap(),
+                    initial_executable_stop: None,
+                    executable_span: None,
+                    cap_basis_distance: None,
+                    tick_size: None,
+                    rules_snapshot: Some(rules(step)),
+                    timestamp: chrono::Utc::now(),
+                })
+                .unwrap();
+        }
+        // An exit that executed: evidence of its fill, and nothing stands on the leg.
+        store
+            .apply_event(&Event::ResidualInventoryRecorded {
+                position_id,
+                order_kind: ReductionKind::Exit,
+                requested_quantity: dec!(0.105),
+                accepted_quantity: dec!(0.1),
+                residual_quantity: dec!(0.005),
+                exchange_order_id: Some("7".to_string()),
+                fill_price: Some(Price::new(dec!(93500)).unwrap()),
+                fee: Some(dec!(2)),
+                step_size: None,
+                min_qty: None,
+                timestamp: chrono::Utc::now(),
+            })
+            .unwrap();
+        let leg = store.positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert_eq!(leg.residual_quantity, None);
+
+        // A stop short of the leg stands.
+        store
+            .apply_event(&Event::ResidualInventoryRecorded {
+                position_id,
+                order_kind: ReductionKind::Protection,
+                requested_quantity: dec!(0.105),
+                accepted_quantity: dec!(0.1),
+                residual_quantity: dec!(0.005),
+                exchange_order_id: Some("8".to_string()),
+                fill_price: None,
+                fee: None,
+                step_size: None,
+                min_qty: None,
+                timestamp: chrono::Utc::now(),
+            })
+            .unwrap();
+        let leg = store.positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert_eq!(leg.rules_snapshot, Some(rules(dec!(0.001))));
+        assert_eq!(leg.residual_quantity, Some(dec!(0.005)));
+        assert_eq!(leg.quantity.as_decimal(), dec!(0.105), "the quantity does not move");
+        assert_eq!(leg.realized_pnl, dec!(0), "nothing accumulates while open");
+        assert_eq!(leg.fees_paid, dec!(1), "nothing accumulates while open");
+        assert!(matches!(leg.state, PositionState::Armed), "no lifecycle change");
+        assert!(leg.closed_at.is_none());
+
+        // An accepted stop does not clear it.
+        store
+            .apply_event(&Event::InsuranceStopPlaced {
+                position_id,
+                order_id: "ins-1".to_string(),
+                stop_price: Price::new(dec!(93500)).unwrap(),
+                timestamp: chrono::Utc::now(),
+            })
+            .unwrap();
+        store
+            .apply_event(&Event::InsuranceStopReplaced {
+                position_id,
+                previous_order_id: "ins-1".to_string(),
+                order_id: "ins-2".to_string(),
+                stop_price: Price::new(dec!(93600)).unwrap(),
+                timestamp: chrono::Utc::now(),
+            })
+            .unwrap();
+        let leg = store.positions().find_by_id(position_id).await.unwrap().unwrap();
+        assert_eq!(leg.residual_quantity, Some(dec!(0.005)));
+    }
+
     #[tokio::test]
     async fn test_replay_keeps_first_executable_span_admission_evidence() {
         let store = MemoryStore::new();
@@ -1496,6 +1627,7 @@ mod tests {
                     executable_span: Some(span),
                     cap_basis_distance: Some(basis),
                     tick_size: Some(tick),
+                    rules_snapshot: None,
                     timestamp: Utc::now(),
                 })
                 .unwrap();
