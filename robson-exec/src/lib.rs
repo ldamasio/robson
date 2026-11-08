@@ -37,10 +37,13 @@
 #![warn(clippy::all)]
 
 mod compat;
+#[cfg(feature = "crash-points")]
+pub mod crash_points;
 pub mod error;
 pub mod executor;
 pub mod intent;
 pub mod ports;
+pub mod quantize;
 pub mod stub;
 pub mod venue;
 
@@ -55,3 +58,22 @@ pub use ports::{
     TransferId, UniversalTransferType, UserTradeRecord,
 };
 pub use stub::{StubExchange, StubMarketData, StubOhlcv, StubTradeFeed};
+
+/// A named place where the crash harness can SIGKILL the real process.
+/// Expands to nothing unless the `crash-points` feature is on; see
+/// [`crash_points`].
+#[cfg(feature = "crash-points")]
+#[macro_export]
+macro_rules! crash_point {
+    ($point:ident) => {
+        $crate::crash_points::hit($crate::crash_points::$point)
+    };
+}
+
+/// A named place where the crash harness can SIGKILL the real process.
+/// Expands to nothing unless the `crash-points` feature is on.
+#[cfg(not(feature = "crash-points"))]
+#[macro_export]
+macro_rules! crash_point {
+    ($point:ident) => {};
+}

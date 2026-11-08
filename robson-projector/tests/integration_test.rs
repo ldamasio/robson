@@ -18,10 +18,17 @@
 //!   cargo test -p robson-projector --test integration_test -- --ignored
 //! ```
 
-use chrono::Utc;
+use chrono::{DateTime, Datelike, TimeZone, Utc};
+use proptest::{
+    prelude::{prop, Just, Strategy},
+    prop_oneof,
+    strategy::ValueTree,
+    test_runner::TestRunner,
+};
 use robson_eventlog::{ActorType, EventEnvelope};
 use robson_projector::apply_event_to_projections;
 use rust_decimal::Decimal;
+use rust_decimal_macros::dec;
 use uuid::Uuid;
 
 type ExecutableSpanProjectionRow = (
@@ -66,6 +73,77 @@ fn make_envelope(
 // =============================================================================
 // SQLX-TEST: Integration tests require DATABASE_URL
 // =============================================================================
+
+/// ADR-0056 §5: a residual is audit-only, routed with no effect on the row,
+/// whatever its kind. A restart reads it from the event log.
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL"]
+async fn test_residual_inventory_is_audit_only(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let position_id = Uuid::new_v4();
+    let stream_key = format!("position:{position_id}");
+    let armed = make_envelope(
+        &stream_key,
+        "position_armed",
+        serde_json::json!({
+            "position_id": position_id,
+            "account_id": Uuid::new_v4(),
+            "symbol": {"base": "BTC", "quote": "USDT"},
+            "side": "Long",
+            "tech_stop_distance": null,
+            "stop_policy": "executable_span",
+            "stop_buffer_bps_at_arm": "10",
+            "timestamp": Utc::now().to_rfc3339(),
+        }),
+        1,
+    );
+    apply_event_to_projections(&pool, &armed).await.unwrap();
+    sqlx::query(
+        "UPDATE positions_current SET state = 'active', current_quantity = 0.105, \
+         total_fees = 1 WHERE position_id = $1",
+    )
+    .bind(position_id)
+    .execute(&pool)
+    .await?;
+    let row = || async {
+        sqlx::query_as::<_, (String, Decimal, Option<Decimal>, Option<Decimal>, i64)>(
+            "SELECT state, current_quantity, realized_pnl, total_fees, last_seq \
+             FROM positions_current WHERE position_id = $1",
+        )
+        .bind(position_id)
+        .fetch_one(&pool)
+        .await
+    };
+    let before = row().await?;
+
+    for (seq, kind, fill_price, fee) in [
+        (2, "protection", None, None),
+        (3, "exit", Some("93500"), Some("2")),
+    ] {
+        let residual = make_envelope(
+            &stream_key,
+            "residual_inventory_recorded",
+            serde_json::json!({
+                "type": "residual_inventory_recorded",
+                "position_id": position_id,
+                "order_kind": kind,
+                "requested_quantity": "0.105",
+                "accepted_quantity": "0.1",
+                "residual_quantity": "0.005",
+                "exchange_order_id": null,
+                "fill_price": fill_price,
+                "fee": fee,
+                "step_size": null,
+                "min_qty": null,
+                "timestamp": Utc::now().to_rfc3339(),
+            }),
+            seq,
+        );
+        apply_event_to_projections(&pool, &residual).await.unwrap();
+    }
+
+    assert_eq!(row().await?, before);
+    Ok(())
+}
 
 #[sqlx::test(migrations = "../migrations")]
 #[ignore = "requires DATABASE_URL"]
@@ -299,6 +377,528 @@ async fn test_month_boundary_reset_upserts_monthly_state(pool: sqlx::PgPool) -> 
     assert_eq!(capital_base, Decimal::from(9800));
     assert_eq!(carried_risk, Decimal::from(200));
 
+    Ok(())
+}
+
+// =============================================================================
+// monthly_state: a capital_base needs account evidence
+// =============================================================================
+
+type MonthRow = (Decimal, Decimal, i32, Option<DateTime<Utc>>);
+
+const CURRENT_MONTH_BACKFILL: &str =
+    include_str!("../../migrations/20240101000011_backfill_current_month_state.sql");
+const ZERO_BASE_CLEANUP: &str =
+    include_str!("../../migrations/20240101000030_remove_unevidenced_zero_base_month_row.sql");
+
+/// Envelope dated `at`, so a test picks the month the handlers write to.
+fn month_event(
+    event_type: &str,
+    payload: serde_json::Value,
+    at: DateTime<Utc>,
+    seq: i64,
+) -> EventEnvelope {
+    let mut envelope =
+        make_envelope(&format!("test:monthly-state:{seq}"), event_type, payload, seq);
+    envelope.occurred_at = at;
+    envelope.ingested_at = at;
+    envelope
+}
+
+fn entry_filled_event(at: DateTime<Utc>, seq: i64) -> EventEnvelope {
+    let payload = serde_json::json!({
+        "position_id": Uuid::new_v4(),
+        "order_id": Uuid::new_v4(),
+        "fill_price": "100",
+        "filled_quantity": "1",
+        "fee": "0.1",
+        "initial_stop": "90",
+        "invalidation_guard_level": null,
+        "timestamp": at,
+    });
+    month_event("entry_filled", payload, at, seq)
+}
+
+/// Close with a net loss of 11.
+fn losing_close_event(at: DateTime<Utc>, seq: i64) -> EventEnvelope {
+    let payload = serde_json::json!({
+        "position_id": Uuid::new_v4(),
+        "exit_reason": "TrailingStop",
+        "entry_price": "100",
+        "exit_price": "90",
+        "realized_pnl": "-10",
+        "total_fees": "1",
+        "timestamp": at,
+    });
+    month_event("position_closed", payload, at, seq)
+}
+
+fn boundary_reset_event(at: DateTime<Utc>, capital_base: Decimal, seq: i64) -> EventEnvelope {
+    let payload = serde_json::json!({
+        "capital_base": capital_base,
+        "carried_positions_risk": "0",
+        "month": at.month(),
+        "year": at.year(),
+        "timestamp": at,
+    });
+    month_event("month_boundary_reset", payload, at, seq)
+}
+
+async fn month_row(pool: &sqlx::PgPool, at: DateTime<Utc>) -> sqlx::Result<Option<MonthRow>> {
+    sqlx::query_as(
+        "SELECT capital_base, realized_loss, trades_opened, boundary_reset_at \
+         FROM monthly_state WHERE year = $1 AND month = $2",
+    )
+    .bind(at.year() as i16)
+    .bind(at.month() as i16)
+    .fetch_optional(pool)
+    .await
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
+async fn test_fill_and_losing_close_create_no_month_row(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    // Domain events project inline, and the first boundary poll of the month
+    // has not run yet: nothing in the account has supplied a base.
+    let at = Utc.with_ymd_and_hms(2027, 4, 1, 0, 0, 10).unwrap();
+
+    apply_event_to_projections(&pool, &entry_filled_event(at, 1)).await.unwrap();
+    apply_event_to_projections(&pool, &losing_close_event(at, 2)).await.unwrap();
+
+    assert_eq!(month_row(&pool, at).await?, None);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
+async fn test_no_event_order_shows_a_zero_capital_base(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let at = Utc.with_ymd_and_hms(2027, 4, 1, 0, 0, 10).unwrap();
+    let orders = [
+        ["fill", "close", "reset"],
+        ["fill", "reset", "close"],
+        ["close", "fill", "reset"],
+        ["close", "reset", "fill"],
+        ["reset", "fill", "close"],
+        ["reset", "close", "fill"],
+    ];
+
+    for order in orders {
+        sqlx::query("DELETE FROM monthly_state").execute(&pool).await?;
+        let mut after_reset = None;
+
+        for (index, step) in order.into_iter().enumerate() {
+            let seq = index as i64 + 1;
+            let envelope = match step {
+                "fill" => entry_filled_event(at, seq),
+                "close" => losing_close_event(at, seq),
+                _ => boundary_reset_event(at, dec!(9750), seq),
+            };
+            apply_event_to_projections(&pool, &envelope).await.unwrap();
+
+            match (month_row(&pool, at).await?, step) {
+                (Some(row), "reset") => {
+                    assert_eq!(row, (dec!(9750), Decimal::ZERO, 0, Some(at)), "{order:?}");
+                    after_reset = Some((Decimal::ZERO, 0));
+                },
+                (Some((base, ..)), _) => assert_eq!(base, dec!(9750), "{order:?} after {step}"),
+                (None, _) => assert!(after_reset.is_none(), "{order:?} lost the row at {step}"),
+            }
+            after_reset = after_reset.map(|(loss, trades)| match step {
+                "fill" => (loss, trades + 1),
+                "close" => (loss + dec!(11), trades),
+                _ => (loss, trades),
+            });
+        }
+
+        // The reset discards what came before it; what follows it is counted.
+        let (loss, trades) = after_reset.unwrap();
+        assert_eq!(month_row(&pool, at).await?, Some((dec!(9750), loss, trades, Some(at))));
+    }
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
+async fn test_replay_through_the_reset_converges_on_the_same_month_row(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    let window = Utc.with_ymd_and_hms(2027, 4, 1, 0, 0, 10).unwrap();
+    let reset = Utc.with_ymd_and_hms(2027, 4, 1, 0, 0, 49).unwrap();
+    let later = Utc.with_ymd_and_hms(2027, 4, 2, 9, 0, 0).unwrap();
+    let events = [
+        entry_filled_event(window, 1),
+        losing_close_event(window, 2),
+        boundary_reset_event(reset, dec!(9750), 3),
+        entry_filled_event(later, 4),
+        losing_close_event(later, 5),
+    ];
+
+    for event in &events {
+        apply_event_to_projections(&pool, event).await.unwrap();
+    }
+    let first = month_row(&pool, reset).await?;
+    assert_eq!(first, Some((dec!(9750), dec!(11), 1, Some(reset))));
+
+    for event in &events {
+        apply_event_to_projections(&pool, event).await.unwrap();
+    }
+    assert_eq!(month_row(&pool, reset).await?, first);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
+async fn test_close_during_an_uncommitted_reset_is_counted(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let at = Utc.with_ymd_and_hms(2027, 4, 1, 0, 0, 49).unwrap();
+
+    let mut reset = pool.begin().await?;
+    sqlx::query(
+        "INSERT INTO monthly_state (year, month, capital_base, boundary_reset_at, created_at) \
+         VALUES ($1, $2, 9750, $3, $3)",
+    )
+    .bind(at.year() as i16)
+    .bind(at.month() as i16)
+    .bind(at)
+    .execute(&mut *reset)
+    .await?;
+
+    let close = {
+        let pool = pool.clone();
+        tokio::spawn(
+            async move { apply_event_to_projections(&pool, &losing_close_event(at, 1)).await },
+        )
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    assert!(!close.is_finished(), "the close must wait for the row being inserted");
+
+    reset.commit().await?;
+    close.await.unwrap().unwrap();
+
+    assert_eq!(month_row(&pool, at).await?, Some((dec!(9750), dec!(11), 0, Some(at))));
+    Ok(())
+}
+
+/// Every writer of a month's row.
+#[derive(Clone, Copy, Debug, PartialEq)]
+enum MonthWriter {
+    Fill,
+    Close,
+    Reset,
+    Recalibrate,
+    PeakRefresh,
+}
+
+fn month_writer() -> impl Strategy<Value = MonthWriter> {
+    prop_oneof![
+        Just(MonthWriter::Fill),
+        Just(MonthWriter::Close),
+        Just(MonthWriter::Reset),
+        Just(MonthWriter::Recalibrate),
+        Just(MonthWriter::PeakRefresh),
+    ]
+}
+
+async fn run_month_writer(pool: sqlx::PgPool, writer: MonthWriter, at: DateTime<Utc>, seq: i64) {
+    let event = match writer {
+        MonthWriter::Fill => entry_filled_event(at, seq),
+        MonthWriter::Close => losing_close_event(at, seq),
+        MonthWriter::Reset => boundary_reset_event(at, dec!(9750), seq),
+        MonthWriter::Recalibrate => month_event(
+            "capital_base_recalibrated",
+            serde_json::json!({
+                "previous_capital_base": "9750",
+                "new_capital_base": "9900",
+                "wallet_balance": "9900",
+                "carried_risk": "0",
+                "reason": "test",
+                "evidence": "test",
+                "month": at.month(),
+                "year": at.year(),
+                "timestamp": at,
+            }),
+            at,
+            seq,
+        ),
+        MonthWriter::PeakRefresh => {
+            // Mirrors refresh_month_peak_net_from_snapshot in robsond, which
+            // passes the base load_monthly_state resolved.
+            sqlx::query(
+                "INSERT INTO monthly_state (year, month, capital_base, month_peak_net, created_at) \
+                 VALUES ($1, $2, 10000, 10, $3) \
+                 ON CONFLICT (year, month) DO UPDATE SET month_peak_net = \
+                 GREATEST(monthly_state.month_peak_net, EXCLUDED.month_peak_net)",
+            )
+            .bind(at.year() as i16)
+            .bind(at.month() as i16)
+            .bind(at)
+            .execute(&pool)
+            .await
+            .unwrap();
+            return;
+        },
+    };
+    apply_event_to_projections(&pool, &event).await.unwrap();
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
+async fn test_generated_schedules_keep_the_month_row_invariants(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    // Writers in one batch race; batches run one after the other. The proptest
+    // macro cannot await, so this samples its strategy without shrinking. The
+    // failure message prints the schedule.
+    let at = Utc.with_ymd_and_hms(2027, 4, 1, 0, 0, 10).unwrap();
+    let schedules = prop::collection::vec(prop::collection::vec(month_writer(), 1..6), 1..6);
+    let mut runner = TestRunner::deterministic();
+
+    for _ in 0..64 {
+        let schedule = schedules.new_tree(&mut runner).unwrap().current();
+        sqlx::query("DELETE FROM monthly_state").execute(&pool).await?;
+
+        let mut seq = 0;
+        for batch in &schedule {
+            let writers: Vec<_> = batch
+                .iter()
+                .map(|writer| {
+                    seq += 1;
+                    tokio::spawn(run_month_writer(pool.clone(), *writer, at, seq))
+                })
+                .collect();
+            while !writers.iter().all(|writer| writer.is_finished()) {
+                let zero_bases: i64 =
+                    sqlx::query_scalar("SELECT COUNT(*) FROM monthly_state WHERE capital_base = 0")
+                        .fetch_one(&pool)
+                        .await?;
+                assert_eq!(zero_bases, 0, "{schedule:?}");
+            }
+            for writer in writers {
+                writer.await.unwrap();
+            }
+        }
+
+        // From this batch on, nothing zeroes the counters: the last reset, or
+        // without a reset the first writer that creates the row. A counter in a
+        // later batch must survive. One racing in this batch may land on either
+        // side of it, and one in an earlier batch must not count.
+        let anchor = schedule
+            .iter()
+            .rposition(|batch| batch.contains(&MonthWriter::Reset))
+            .or_else(|| {
+                schedule.iter().position(|batch| {
+                    batch.contains(&MonthWriter::Recalibrate)
+                        || batch.contains(&MonthWriter::PeakRefresh)
+                })
+            });
+        let row = month_row(&pool, at).await?;
+        let Some(anchor) = anchor else {
+            assert_eq!(row, None, "{schedule:?}");
+            continue;
+        };
+        let (base, loss, trades, _) = row.unwrap_or_else(|| panic!("no row: {schedule:?}"));
+        assert!(base > Decimal::ZERO, "{schedule:?}");
+
+        let count = |batches: &[Vec<MonthWriter>], writer| {
+            batches.iter().flatten().filter(|candidate| **candidate == writer).count()
+        };
+        let fills = count(&schedule[anchor + 1..], MonthWriter::Fill)
+            ..=count(&schedule[anchor..], MonthWriter::Fill);
+        assert!(fills.contains(&(trades as usize)), "trades {trades} of {fills:?}: {schedule:?}");
+
+        let closes = count(&schedule[anchor + 1..], MonthWriter::Close)
+            ..=count(&schedule[anchor..], MonthWriter::Close);
+        assert_eq!(loss % dec!(11), Decimal::ZERO, "{schedule:?}");
+        assert!(
+            closes.contains(&((loss / dec!(11)).trunc().to_string().parse::<usize>().unwrap())),
+            "loss {loss} of {closes:?}: {schedule:?}",
+        );
+    }
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
+async fn test_fresh_database_has_no_month_row(pool: sqlx::PgPool) -> sqlx::Result<()> {
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM monthly_state")
+        .fetch_one(&pool)
+        .await?;
+    assert_eq!(rows, 0);
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
+async fn test_zero_base_cleanup_removes_only_rows_that_record_nothing(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    struct Case {
+        name: &'static str,
+        months_from_now: i32,
+        capital_base: Decimal,
+        carried_risk: Decimal,
+        realized_loss: Decimal,
+        trades_opened: i32,
+        month_peak_net: Decimal,
+        model: &'static str,
+        boundary_event: bool,
+        removed: bool,
+    }
+    let empty = Case {
+        name: "",
+        months_from_now: 0,
+        capital_base: Decimal::ZERO,
+        carried_risk: Decimal::ZERO,
+        realized_loss: Decimal::ZERO,
+        trades_opened: 0,
+        month_peak_net: Decimal::ZERO,
+        model: "hwm_v1",
+        boundary_event: false,
+        removed: false,
+    };
+    let cases = [
+        Case {
+            name: "current month",
+            removed: true,
+            ..empty
+        },
+        Case {
+            name: "later month",
+            months_from_now: 1,
+            removed: true,
+            ..empty
+        },
+        Case {
+            name: "history",
+            months_from_now: -1,
+            ..empty
+        },
+        Case {
+            name: "boundary event",
+            months_from_now: 2,
+            boundary_event: true,
+            ..empty
+        },
+        Case {
+            name: "real base",
+            months_from_now: 3,
+            capital_base: dec!(100),
+            ..empty
+        },
+        Case {
+            name: "carried risk",
+            months_from_now: 4,
+            carried_risk: dec!(5),
+            ..empty
+        },
+        Case {
+            name: "realized loss",
+            months_from_now: 5,
+            realized_loss: dec!(5),
+            ..empty
+        },
+        Case {
+            name: "trades opened",
+            months_from_now: 6,
+            trades_opened: 1,
+            ..empty
+        },
+        Case {
+            name: "peak",
+            months_from_now: 7,
+            month_peak_net: dec!(5),
+            ..empty
+        },
+        Case {
+            name: "budget model",
+            months_from_now: 8,
+            model: "net_from_start_non_expanding_v1",
+            ..empty
+        },
+    ];
+
+    let now = Utc::now();
+    let year_month = |months_from_now: i32| {
+        let index = now.year() * 12 + now.month0() as i32 + months_from_now;
+        (index.div_euclid(12) as i16, index.rem_euclid(12) as i16 + 1)
+    };
+
+    for case in &cases {
+        let (year, month) = year_month(case.months_from_now);
+        sqlx::query(
+            "INSERT INTO monthly_state (year, month, capital_base, carried_risk, realized_loss, \
+             trades_opened, month_peak_net, monthly_budget_model, boundary_reset_at, created_at) \
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $9)",
+        )
+        .bind(year)
+        .bind(month)
+        .bind(case.capital_base)
+        .bind(case.carried_risk)
+        .bind(case.realized_loss)
+        .bind(case.trades_opened)
+        .bind(case.month_peak_net)
+        .bind(case.model)
+        .bind(now)
+        .execute(&pool)
+        .await?;
+
+        if case.boundary_event {
+            let stream_key = format!("system:month_boundary:{year:04}-{month:02}");
+            let event = robson_eventlog::Event::new(
+                Uuid::new_v4(),
+                stream_key.clone(),
+                "month_boundary_reset",
+                serde_json::json!({}),
+            );
+            robson_eventlog::append_event(&pool, &stream_key, None, event).await.unwrap();
+        }
+    }
+
+    sqlx::query(ZERO_BASE_CLEANUP).execute(&pool).await?;
+
+    for case in &cases {
+        let (year, month) = year_month(case.months_from_now);
+        let rows: i64 =
+            sqlx::query_scalar("SELECT COUNT(*) FROM monthly_state WHERE year = $1 AND month = $2")
+                .bind(year)
+                .bind(month)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(rows == 0, case.removed, "{}", case.name);
+    }
+    Ok(())
+}
+
+#[sqlx::test(migrations = "../migrations")]
+#[ignore = "requires DATABASE_URL (see file header for setup)"]
+async fn test_zero_base_cleanup_covers_a_bootstrap_west_of_utc(
+    pool: sqlx::PgPool,
+) -> sqlx::Result<()> {
+    // At 00:30 UTC on December 1 a session at UTC-3 is still in November, so the
+    // backfill writes November's row. NOW() is unqualified in both migrations,
+    // so a function earlier on the search path sets their clock.
+    let mut conn = pool.acquire().await?;
+    for statement in [
+        "CREATE SCHEMA fake_clock",
+        "CREATE FUNCTION fake_clock.now() RETURNS TIMESTAMPTZ LANGUAGE SQL \
+         AS $$ SELECT TIMESTAMPTZ '2026-12-01 00:30:00+00' $$",
+        "SET search_path = fake_clock, pg_catalog, public",
+        "SET TIME ZONE INTERVAL '-03:00' HOUR TO MINUTE",
+        CURRENT_MONTH_BACKFILL,
+        "UPDATE monthly_state SET boundary_reset_at = created_at",
+    ] {
+        sqlx::query(statement).execute(&mut *conn).await?;
+    }
+    let bootstrapped: (i16, i16) = sqlx::query_as("SELECT year, month FROM monthly_state")
+        .fetch_one(&mut *conn)
+        .await?;
+    assert_eq!(bootstrapped, (2026, 11));
+
+    sqlx::query(ZERO_BASE_CLEANUP).execute(&mut *conn).await?;
+
+    let rows: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM monthly_state")
+        .fetch_one(&mut *conn)
+        .await?;
+    assert_eq!(rows, 0);
     Ok(())
 }
 

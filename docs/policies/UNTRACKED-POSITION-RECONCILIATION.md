@@ -150,7 +150,10 @@ priority order**:
    `exchange_order_id` is known to the daemon) was confirmed `FILLED` via
    `GET /fapi/v1/order`. Captures fill price, filled quantity, fee, fee
    asset, filled timestamp, exchange order id. Highest fidelity — used
-   whenever obtainable.
+   whenever obtainable. Since ADR-0056 step 6 (§5), a triggered stop also
+   qualifies when terminally cancelled or expired, if its summed trades equal
+   its executed quantity, and a stop the leg no longer records counts only
+   when it filled the leg's whole quantity.
 2. **`UserTradeRecord`** — Per-symbol user trade history from
    `GET /fapi/v1/userTrades`. Used when no specific candidate
    `exchange_order_id` is known (e.g. operator closed the position
@@ -376,6 +379,12 @@ endpoint remain follow-up work. The current close path broadcasts
 in-process event bus and SSE surface; the daemon logs them, but does not persist
 the required `position_untracked_detected` or `untracked_position_closed`
 events in `event_log`.
+
+Since ADR-0056 step 6 (§5), when an exit or stop fill closes a leg whatever
+quantity executed, inventory the venue still holds is swept here as UNTRACKED even
+though it is traceable to a closed Robson leg. This is the approved rule for
+position accounts, not a change to the definition above. A stop fill the daemon
+does not reach leaves the leg open and tracked, so this sweep does not apply to it.
 
 The fixed-percentage legacy `PositionMonitor` is not this worker. Its module,
 `DetectedPosition` model, storage adapters, monitor configuration, frontend

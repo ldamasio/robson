@@ -349,6 +349,10 @@ pub struct PositionSummary {
     /// The terminal rejection behind `needs_operator_rearm` (ADR-0050 §7).
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_rejection: Option<LastRejectionSummary>,
+    /// The latest residual recorded on this position (ADR-0056 §5). It blocks
+    /// new admissions until the position closes, and is not priced anywhere.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub residual_quantity: Option<Decimal>,
 }
 
 /// Terminal entry rejection surfaced with an Armed position (ADR-0050 §7).
@@ -1630,12 +1634,18 @@ where
         .await
         .map_err(|e| to_error_response(e))?;
     let monthly = manager.load_monthly_state(requested).await.map_err(|e| to_error_response(e))?;
+    // Same source as `/status` and the budget. The `realized_loss` counter misses
+    // closes from before the month's row and reset.
+    let realized_loss = manager
+        .governed_monthly_realized_loss(requested)
+        .await
+        .map_err(|e| to_error_response(e))?;
     let occupied_slots = positions.len();
     let inherited_slots =
         positions.iter().filter(|position| position.created_at < requested).count();
     let base_slots_available = TradingPolicy::default().slots_available(
         monthly.capital_base,
-        monthly.realized_loss,
+        realized_loss,
         Decimal::ZERO,
     ) as usize;
     let slot_cells_total = base_slots_available.saturating_add(inherited_slots);
@@ -2354,13 +2364,17 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
         DaemonError::ApprovalExpired(_) => StatusCode::GONE,
         DaemonError::ApprovalDenied { .. } => StatusCode::CONFLICT,
         DaemonError::MonthlyHaltActive { .. } => StatusCode::SERVICE_UNAVAILABLE,
+        DaemonError::ResidualInventoryUnresolved { .. } => StatusCode::CONFLICT,
         DaemonError::Config(_) => StatusCode::INTERNAL_SERVER_ERROR,
         // Exchange transport failures are upstream errors, not client errors.
         // Immediate-mode arm calls handle_signal synchronously; a connection or
         // timeout failure must not surface as 400. Other Exec variants
         // (OrderRejected, InvalidState) reflect business-rule rejections and
         // stay 400 so callers can distinguish them from infrastructure faults.
+        // A venue refusal typed for ADR-0056 §5 is still a venue refusal.
         DaemonError::Exec(robson_exec::ExecError::Exchange(_))
+        | DaemonError::Exec(robson_exec::ExecError::RulesRejected(_))
+        | DaemonError::Exec(robson_exec::ExecError::ReduceOnlyRejected(_))
         | DaemonError::Exec(robson_exec::ExecError::Timeout(_)) => StatusCode::BAD_GATEWAY,
         DaemonError::Exec(_) => StatusCode::BAD_REQUEST,
         DaemonError::Store(_) => StatusCode::INTERNAL_SERVER_ERROR,
@@ -2373,6 +2387,18 @@ fn to_error_response(error: DaemonError) -> (StatusCode, Json<ErrorResponse>) {
     };
 
     (status, Json(ErrorResponse { error: error.to_string() }))
+}
+
+#[cfg(test)]
+pub(crate) async fn position_summary_for_test<E, S>(
+    manager: &PositionManager<E, S>,
+    position: &Position,
+) -> PositionSummary
+where
+    E: ExchangePort + 'static,
+    S: Store + 'static,
+{
+    position_to_summary_with_live_price(manager, position).await
 }
 
 async fn position_to_summary_with_live_price<E, S>(
@@ -2731,6 +2757,7 @@ fn position_to_summary(
                             variation_pct,
                             entry_status: None,
                             last_rejection: None,
+                            residual_quantity: position.residual_quantity,
                         };
                     },
                 };
@@ -2795,6 +2822,7 @@ fn position_to_summary(
         variation_pct,
         entry_status: None,
         last_rejection: None,
+        residual_quantity: position.residual_quantity,
     }
 }
 
@@ -2926,7 +2954,7 @@ fn position_overlaps_month(
     month_end: chrono::DateTime<chrono::Utc>,
 ) -> bool {
     position.created_at < month_end
-        && position.closed_at.map(|closed_at| closed_at > month_start).unwrap_or(true)
+        && position.closed_at.map(|closed_at| closed_at >= month_start).unwrap_or(true)
 }
 
 fn next_month(year: i32, month: u32) -> (i32, u32) {
@@ -3421,6 +3449,12 @@ mod tests {
         born_after.created_at = next + chrono::Duration::days(1);
         born_after.closed_at = None;
 
+        let mut closed_at_month_start =
+            Position::new(Uuid::now_v7(), Symbol::from_pair("BTCUSDT").unwrap(), Side::Long);
+        closed_at_month_start.created_at = month - chrono::Duration::days(10);
+        closed_at_month_start.closed_at = Some(month);
+
+        assert!(position_overlaps_month(&closed_at_month_start, month, next));
         assert!(position_overlaps_month(&inherited, month, next));
         assert!(position_overlaps_month(&closed_later, month, next));
         assert!(!position_overlaps_month(&closed_before, month, next));
@@ -3431,6 +3465,107 @@ mod tests {
     fn next_month_handles_year_boundary() {
         assert_eq!(next_month(2026, 12), (2027, 1));
         assert_eq!(next_month(2026, 4), (2026, 5));
+    }
+
+    #[cfg(feature = "postgres")]
+    #[sqlx::test(migrations = "../migrations")]
+    #[ignore = "requires DATABASE_URL"]
+    async fn test_month_view_charges_a_close_the_counter_did_not_see(pool: sqlx::PgPool) {
+        let tenant_id = Uuid::now_v7();
+        let exchange = Arc::new(StubExchange::new(dec!(95000)));
+        let store = Arc::new(MemoryStore::new());
+        let executor = Arc::new(Executor::new(
+            Arc::clone(&exchange),
+            Arc::new(IntentJournal::new()),
+            store.clone(),
+        ));
+        let event_bus = Arc::new(crate::event_bus::EventBus::new(100));
+        let manager = PositionManager::new(
+            Engine::new(RiskConfig::new(dec!(10000)).unwrap()),
+            executor,
+            store,
+            Arc::clone(&event_bus),
+            Arc::new(TracingQueryRecorder),
+            TradingPolicy::default(),
+        )
+        .with_event_log(pool.clone(), tenant_id);
+        let circuit_breaker = manager.circuit_breaker();
+        let app = create_router(Arc::new(ApiState {
+            exchange,
+            position_manager: Arc::new(RwLock::new(manager)),
+            event_bus,
+            circuit_breaker,
+            wallet_balance_cache: Mutex::new(None),
+            pg_pool: Some(Arc::new(pool.clone())),
+            tenant_id: Some(tenant_id),
+            google_auth: None,
+            legacy_api_token: None,
+            funding: FundingConfig::default(),
+            funding_route_mode: FundingRouteMode::Selected,
+            venue_feed: VenueFeedView::default(),
+        }));
+
+        // Each close is a net loss of 100 on a base of 10000: budget 400, one
+        // full-cap unit 100.
+        let seed_close = |closed_at: chrono::DateTime<chrono::Utc>| {
+            let pool = pool.clone();
+            async move {
+                sqlx::query(
+                    r#"
+                    INSERT INTO positions_current (
+                        position_id, tenant_id, account_id, symbol, side,
+                        entry_price, entry_quantity, entry_filled_at,
+                        technical_stop_price, technical_stop_distance, current_quantity,
+                        trailing_stop_price, current_price, realized_pnl, total_fees, exit_reason,
+                        state, last_event_id, last_seq, created_at, updated_at, closed_at
+                    ) VALUES (
+                        $1, $2, $3, 'BTCUSDT', 'long',
+                        100, 1, $4,
+                        90, 10, 1,
+                        90, 90, -90, 10, 'TrailingStop',
+                        'closed', $5, 1, $4, $4, $4
+                    )
+                    "#,
+                )
+                .bind(Uuid::now_v7())
+                .bind(tenant_id)
+                .bind(Uuid::now_v7())
+                .bind(closed_at)
+                .bind(Uuid::now_v7())
+                .execute(&pool)
+                .await
+                .unwrap();
+            }
+        };
+        let view = || async {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder().uri("/positions?month=2027-04").body(Body::empty()).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = response.into_body().collect().await.unwrap().to_bytes();
+            let month: MonthlyPositionsResponse = serde_json::from_slice(&body).unwrap();
+            (month.occupied_slots, month.slot_cells_total)
+        };
+
+        seed_close(month_start(2027, 4) + chrono::Duration::seconds(10)).await;
+        assert_eq!(view().await, (1, 3), "no month row yet");
+
+        // Recalibration and the peak refresh create the row with zero counters,
+        // and so does the reset.
+        sqlx::query(
+            "INSERT INTO monthly_state (year, month, capital_base) VALUES (2027, 4, 10000)",
+        )
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(view().await, (1, 3), "row with a zero counter");
+
+        seed_close(month_start(2027, 4)).await;
+        assert_eq!(view().await, (2, 2), "close exactly at the month's start");
     }
 
     #[tokio::test]
@@ -3785,6 +3920,135 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    /// ADR-0056 §5: a fill closes the position, however short of it, and the
+    /// routes answer as they always have.
+    #[tokio::test]
+    async fn a_close_that_fills_short_answers_204_and_panic_lists_what_it_closed() {
+        for panic in [false, true] {
+            let (app, _, position_manager, exchange) = create_test_app_with_event_bus_and_exchange(
+                100,
+                Arc::new(StubExchange::new(dec!(95000))),
+            )
+            .await;
+            let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+            let mut position = Position::new(Uuid::now_v7(), symbol.clone(), Side::Long);
+            position.entry_price = Some(Price::new(dec!(95000)).unwrap());
+            position.quantity = Quantity::new(dec!(1)).unwrap();
+            position.state = PositionState::Active {
+                current_price: Price::new(dec!(95000)).unwrap(),
+                trailing_stop: Price::new(dec!(90000)).unwrap(),
+                favorable_extreme: Price::new(dec!(95000)).unwrap(),
+                extreme_at: Utc::now(),
+                insurance_stop_id: None,
+                invalidation_guard_level: None,
+                last_emitted_stop: None,
+            };
+            position_manager.read().await.store().positions().save(&position).await.unwrap();
+            exchange.set_open_position(
+                symbol,
+                Side::Long,
+                Quantity::new(dec!(0.4)).unwrap(),
+                Price::new(dec!(95000)).unwrap(),
+            );
+            exchange.set_short_fill_next(dec!(0.6));
+
+            let request = if panic {
+                Request::builder().method("POST").uri("/panic").body(Body::empty()).unwrap()
+            } else {
+                Request::builder()
+                    .method("DELETE")
+                    .uri(format!("/positions/{}", position.id))
+                    .body(Body::empty())
+                    .unwrap()
+            };
+            let response = app.oneshot(request).await.unwrap();
+
+            if panic {
+                assert_eq!(response.status(), StatusCode::OK);
+                let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+                let body: PanicResponse = serde_json::from_slice(&body).unwrap();
+                assert_eq!(body.count, 1);
+                assert_eq!(body.closed_positions, [position.id]);
+            } else {
+                assert_eq!(response.status(), StatusCode::NO_CONTENT);
+            }
+        }
+    }
+
+    /// A venue refusal on a live route. Closing answers 502; `/panic` reports
+    /// per leg, so it answers 200 and does not claim the leg. Both as
+    /// before ADR-0056 step 6.
+    #[tokio::test]
+    async fn a_venue_refusal_answers_502_on_close_and_200_without_the_leg_on_panic() {
+        let refusals: [(fn(&StubExchange), &str); 2] = [
+            (
+                |exchange| exchange.set_rules_rejections_next(100),
+                "Execution error: Exchange error: Simulated rules rejection",
+            ),
+            (
+                |exchange| exchange.set_reduce_only_rejections_next(100),
+                "Execution error: Exchange error: Binance API error: -2022 - ReduceOnly Order is \
+                 rejected.",
+            ),
+        ];
+        for (refuse, expected_body) in refusals {
+            let (app, _, position_manager, exchange) = create_test_app_with_event_bus_and_exchange(
+                100,
+                Arc::new(StubExchange::new(dec!(95000))),
+            )
+            .await;
+            let symbol = Symbol::from_pair("BTCUSDT").unwrap();
+            let mut position = Position::new(Uuid::now_v7(), symbol.clone(), Side::Long);
+            position.entry_price = Some(Price::new(dec!(95000)).unwrap());
+            position.quantity = Quantity::new(dec!(1)).unwrap();
+            position.state = PositionState::Active {
+                current_price: Price::new(dec!(95000)).unwrap(),
+                trailing_stop: Price::new(dec!(90000)).unwrap(),
+                favorable_extreme: Price::new(dec!(95000)).unwrap(),
+                extreme_at: Utc::now(),
+                insurance_stop_id: None,
+                invalidation_guard_level: None,
+                last_emitted_stop: None,
+            };
+            position_manager.read().await.store().positions().save(&position).await.unwrap();
+            // Still open on the venue: the refusal is not a position already gone.
+            exchange.set_open_position(
+                symbol,
+                Side::Long,
+                position.quantity,
+                Price::new(dec!(95000)).unwrap(),
+            );
+            refuse(&exchange);
+
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .method("DELETE")
+                        .uri(format!("/positions/{}", position.id))
+                        .body(Body::empty())
+                        .unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: serde_json::Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body["error"], expected_body);
+
+            let response = app
+                .oneshot(
+                    Request::builder().method("POST").uri("/panic").body(Body::empty()).unwrap(),
+                )
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+            let body: PanicResponse = serde_json::from_slice(&body).unwrap();
+            assert_eq!(body.count, 0);
+        }
     }
 
     #[tokio::test]
@@ -4717,6 +4981,24 @@ mod tests {
         let (status, _) =
             to_error_response(DaemonError::Exec(ExecError::Timeout("read timeout".to_string())));
         assert_eq!(status, StatusCode::BAD_GATEWAY);
+    }
+
+    /// ADR-0056 step 6 typed these venue refusals, which were `Exchange` before
+    /// it: same status, same body.
+    #[test]
+    fn to_error_response_typed_venue_refusals_answer_as_exchange_failures() {
+        use robson_exec::ExecError;
+        let message = "Binance API error: -4164 - Order's notional must be no smaller than 50";
+        let (_, exchange_body) =
+            to_error_response(DaemonError::Exec(ExecError::Exchange(message.to_string())));
+        for refusal in [
+            ExecError::RulesRejected(message.to_string()),
+            ExecError::ReduceOnlyRejected(message.to_string()),
+        ] {
+            let (status, body) = to_error_response(DaemonError::Exec(refusal));
+            assert_eq!(status, StatusCode::BAD_GATEWAY);
+            assert_eq!(body.0.error, exchange_body.0.error);
+        }
     }
 
     #[test]

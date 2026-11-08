@@ -3,6 +3,9 @@
 //! Provides seeding helpers for tenant/account, event appending, and projection
 //! state.
 
+pub mod daemon_process;
+pub mod db_proxy;
+pub mod fake_venue;
 mod helpers;
 
 use anyhow::Result;

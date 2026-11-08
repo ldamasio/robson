@@ -103,6 +103,34 @@ describe("budgetModelKind", () => {
 });
 
 describe("deriveBudgetView", () => {
+  it("reports an invalid basis as its own state, not as an exhausted budget", () => {
+    const view = deriveBudgetView(
+      makeStatus({
+        capital_base: 0,
+        monthly_budget_remaining: -10,
+        monthly_budget_utilization_pct: 100,
+      }),
+      true,
+    );
+
+    expect(view.basisInvalid).toBe(true);
+    expect(view.exhausted).toBe(false);
+    expect(view.low).toBe(false);
+  });
+
+  it("still reports an exhausted budget on a valid basis", () => {
+    const view = deriveBudgetView(
+      makeStatus({
+        capital_base: 1000,
+        monthly_budget_remaining: 0,
+      }),
+      false,
+    );
+
+    expect(view.basisInvalid).toBe(false);
+    expect(view.exhausted).toBe(true);
+  });
+
   it("reads the active model's utilization: HWM charges the give-back from peak", () => {
     const view = deriveBudgetView(PROD_2026_10_15_HWM, false);
 

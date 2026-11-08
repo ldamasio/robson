@@ -4,11 +4,18 @@
 //!
 //! INVARIANT: `monthly_state` is a ledger (historical accounting only).
 //! It does NOT store live execution state — that lives in `positions_current`.
+//!
+//! INVARIANT: only an event that carries a `capital_base` creates a month row
+//! here. The fill and close counters update an existing row and never create
+//! one, because a missing row means the base is still unknown:
+//! `load_monthly_state` falls back to configured capital until the reset writes
+//! the month's base, and a zero would read as an invalid budget basis.
 
 use std::convert::TryFrom;
 
-use chrono::Datelike;
+use chrono::{DateTime, Datelike, Utc};
 use robson_eventlog::EventEnvelope;
+use rust_decimal::Decimal;
 use sqlx::PgPool;
 
 use crate::{
@@ -125,10 +132,59 @@ pub(crate) async fn handle_capital_base_recalibrated(
     Ok(())
 }
 
+/// Add to the counters of the month's row, if it has one.
+///
+/// A fill or close before the row exists is not counted. The reset zeroes these
+/// counters anyway, and neither the budget nor the API reads them: both charge
+/// closes from `positions_current`. A replay from before the reset converges on
+/// the same row, but a duplicate of one event after it counts twice.
+///
+/// A writer may be inserting the row right now, where the first UPDATE cannot
+/// see it. Wait for it and look again, so the counter is not lost to a row that
+/// commits a moment later. Only events before the month's first row take this
+/// path.
+async fn add_to_month_counters(
+    pool: &PgPool,
+    occurred_at: DateTime<Utc>,
+    trades_opened: i32,
+    realized_loss: Decimal,
+) -> Result<()> {
+    const ADD: &str = "UPDATE monthly_state \
+         SET trades_opened = trades_opened + $3, realized_loss = realized_loss + $4 \
+         WHERE year = $1 AND month = $2";
+    let year = occurred_at.year() as i16;
+    let month = occurred_at.month() as i16;
+
+    let updated = sqlx::query(ADD)
+        .bind(year)
+        .bind(month)
+        .bind(trades_opened)
+        .bind(realized_loss)
+        .execute(pool)
+        .await?;
+    if updated.rows_affected() > 0 {
+        return Ok(());
+    }
+
+    let mut tx = pool.begin().await?;
+    sqlx::query("LOCK TABLE monthly_state IN SHARE ROW EXCLUSIVE MODE")
+        .execute(&mut *tx)
+        .await?;
+    sqlx::query(ADD)
+        .bind(year)
+        .bind(month)
+        .bind(trades_opened)
+        .bind(realized_loss)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+
+    Ok(())
+}
+
 /// Increment `trades_opened` for the month when an entry is filled.
 ///
-/// Extracts year/month from the event timestamp. UPSERT ensures idempotent
-/// replay.
+/// Extracts year/month from the event timestamp.
 pub(crate) async fn handle_entry_filled_monthly(
     pool: &PgPool,
     envelope: &EventEnvelope,
@@ -140,38 +196,13 @@ pub(crate) async fn handle_entry_filled_monthly(
         }
     })?;
 
-    let year = envelope.occurred_at.year() as i16;
-    let month = envelope.occurred_at.month() as i16;
-
-    let statement = format!(
-        r#"
-        INSERT INTO monthly_state (
-            year, month, capital_base, realized_loss, trades_opened,
-            month_peak_net, monthly_budget_model, created_at
-        )
-        VALUES (
-            $1, $2, 0, 0, 1, 0,
-            {INHERIT_BUDGET_MODEL},
-            $3
-        )
-        ON CONFLICT (year, month) DO UPDATE SET
-            trades_opened = monthly_state.trades_opened + 1
-        "#,
-    );
-    sqlx::query(&statement)
-        .bind(year)
-        .bind(month)
-        .bind(envelope.occurred_at)
-        .execute(pool)
-        .await?;
-
-    Ok(())
+    add_to_month_counters(pool, envelope.occurred_at, 1, Decimal::ZERO).await
 }
 
 /// Add realized loss from a closed position to `monthly_state`.
 ///
 /// Only net losses (realized_pnl - total_fees < 0) are counted, matching
-/// ADR-0024. Wins do NOT offset losses for slot calculation.
+/// ADR-0024. Wins do NOT offset losses.
 pub(crate) async fn handle_position_closed_monthly(
     pool: &PgPool,
     envelope: &EventEnvelope,
@@ -186,36 +217,9 @@ pub(crate) async fn handle_position_closed_monthly(
 
     // ADR-0024: only count losses. Wins do NOT offset losses.
     let net = payload.realized_pnl - payload.total_fees;
-    if net >= rust_decimal::Decimal::ZERO {
+    if net >= Decimal::ZERO {
         return Ok(());
     }
-    let loss = net.abs();
 
-    let year = envelope.occurred_at.year() as i16;
-    let month = envelope.occurred_at.month() as i16;
-
-    let statement = format!(
-        r#"
-        INSERT INTO monthly_state (
-            year, month, capital_base, realized_loss, trades_opened,
-            month_peak_net, monthly_budget_model, created_at
-        )
-        VALUES (
-            $1, $2, 0, $3, 0, 0,
-            {INHERIT_BUDGET_MODEL},
-            $4
-        )
-        ON CONFLICT (year, month) DO UPDATE SET
-            realized_loss = monthly_state.realized_loss + $3
-        "#,
-    );
-    sqlx::query(&statement)
-        .bind(year)
-        .bind(month)
-        .bind(loss)
-        .bind(envelope.occurred_at)
-        .execute(pool)
-        .await?;
-
-    Ok(())
+    add_to_month_counters(pool, envelope.occurred_at, 0, net.abs()).await
 }

@@ -228,6 +228,28 @@ pub async fn query_events(pool: &PgPool, options: QueryOptions) -> Result<Vec<Ev
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+/// Events of `event_types` on one stream, in stream order. `seq` is what orders
+/// a stream; [`query_events`] sorts by `occurred_at` first, which a clock
+/// adjustment can invert.
+pub async fn query_stream_in_seq_order(
+    pool: &PgPool,
+    tenant_id: Uuid,
+    stream_key: &str,
+    event_types: &[&str],
+) -> Result<Vec<EventEnvelope>> {
+    let rows = sqlx::query_as::<_, EventEnvelopeRow>(
+        "SELECT * FROM event_log WHERE tenant_id = $1 AND stream_key = $2 \
+         AND event_type = ANY($3) ORDER BY seq ASC",
+    )
+    .bind(tenant_id)
+    .bind(stream_key)
+    .bind(event_types)
+    .fetch_all(pool)
+    .await?;
+
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
 /// Database row mapping
 #[derive(sqlx::FromRow)]
 struct EventEnvelopeRow {

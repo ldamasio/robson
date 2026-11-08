@@ -77,6 +77,25 @@ impl TradingPort for VenueRuntime {
         forward!(self, venue => venue.trading_rules_preview(symbol).await)
     }
 
+    async fn trading_rules_fresh(&self, symbol: &Symbol) -> Result<SymbolTradingRules, ExecError> {
+        forward!(self, venue => venue.trading_rules_fresh(symbol).await)
+    }
+
+    fn last_validated_rules(&self, symbol: &Symbol) -> Option<SymbolTradingRules> {
+        forward!(self, venue => venue.last_validated_rules(symbol))
+    }
+
+    fn rules_refresh_due(&self, symbol: &Symbol) -> bool {
+        forward!(self, venue => venue.rules_refresh_due(symbol))
+    }
+
+    async fn refresh_trading_rules(
+        &self,
+        symbol: &Symbol,
+    ) -> Result<SymbolTradingRules, ExecError> {
+        forward!(self, venue => venue.refresh_trading_rules(symbol).await)
+    }
+
     async fn place_market_order(
         &self,
         symbol: &Symbol,
@@ -310,6 +329,12 @@ fn usdm_credential(config: &Config) -> Option<Exchange> {
 fn usdm_client(config: &Config, credential: Exchange) -> Option<Arc<BinanceRestClient>> {
     let api_key = config.binance.api_key.clone()?;
     let api_secret = config.binance.api_secret.clone()?;
+    #[cfg(feature = "crash-points")]
+    if let Ok(base_url) = std::env::var(robson_exec::crash_points::VENUE_URL_ENV) {
+        return Some(Arc::new(BinanceRestClient::with_harness_base_url(
+            base_url, api_key, api_secret,
+        )));
+    }
     Some(Arc::new(match credential {
         Exchange::Binance => BinanceRestClient::new(api_key, api_secret),
         Exchange::BinanceTestnet => BinanceRestClient::testnet(api_key, api_secret),
@@ -535,11 +560,22 @@ mod tests {
             )
             .unwrap(),
         );
+        stub.set_rules_refresh_due(true);
         let runtime = VenueRuntime::Stub(Box::new(stub));
         assert_eq!(runtime.id().as_str(), "stub");
         assert_eq!(runtime.price(&symbol).await.unwrap().as_decimal(), dec!(95000));
         assert!(runtime.trading_rules(&symbol).await.is_ok());
         assert!(runtime.trading_rules_preview(&symbol).await.is_ok());
+        // ADR-0056 §5: each default differs from what the stub answers here.
+        assert!(runtime.last_validated_rules(&symbol).is_some());
+        assert!(runtime.rules_refresh_due(&symbol));
+        assert!(runtime.refresh_trading_rules(&symbol).await.is_ok());
+        let VenueRuntime::Stub(held) = &runtime else {
+            panic!("the runtime holds the stub");
+        };
+        assert_eq!(held.rules_refresh_call_count(), 1);
+        held.set_fresh_rules_unavailable(true);
+        assert!(runtime.trading_rules_fresh(&symbol).await.is_err());
         assert!(capability_mismatches(&runtime).is_empty());
 
         let without_funding =

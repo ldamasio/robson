@@ -110,6 +110,14 @@ pub enum DaemonError {
     #[error("Shutdown requested")]
     Shutdown,
 
+    /// A residual on an open leg blocks new admissions until that leg closes
+    /// (ADR-0056 §5). A rejection of its own: the budget knows nothing of it.
+    #[error(
+        "Admission blocked: position {position_id} holds unresolved residual inventory \
+         ({residual}); it resolves when that leg closes"
+    )]
+    ResidualInventoryUnresolved { position_id: Uuid, residual: String },
+
     /// One or more Robson-Active positions are absent from the exchange at
     /// startup.
     ///

@@ -6,7 +6,7 @@ pub mod exchange;
 pub mod market_data;
 pub mod ohlcv;
 
-pub use exchange::{normalize_market_quantity, BinanceExchangeAdapter};
+pub use exchange::BinanceExchangeAdapter;
 pub use market_data::{
     BinanceUsdmTradeFeed, MAINNET_MARKET_WS_ENDPOINT, TESTNET_MARKET_WS_ENDPOINT,
 };
